@@ -281,3 +281,232 @@ test("a shaped but wrong Operation is unknown ACK, never accepted as this mutati
     client().deleteResource(org, resource.uid, 1, "console-delete-0001"),
   ).rejects.toMatchObject({ code: "invalid_response", status: 202 });
 });
+
+const hostedPlanTable = {
+  scope: "hosted",
+  products: ["takosumi-hosted", "takoserver"],
+  balanceScope: "organization",
+  plans: [
+    {
+      planId: "free-configured",
+      tier: "free",
+      resourceScope: "edge",
+      configuredMonthlyCreditMinor: 0,
+      edgeAllowance: "pending-owner-runtime-policy",
+    },
+    {
+      planId: "subscription-configured",
+      tier: "subscription",
+      monthlyAmountMinor: 1250,
+      includedCreditMinor: 0,
+      stripePriceId: "price_configured",
+    },
+    {
+      planId: "usage-configured",
+      tier: "usage",
+      checkoutMinimumMinor: 500,
+      checkoutMaximumMinor: 10000,
+      meters: {},
+    },
+  ],
+  consumptionOrder: ["free", "subscription", "purchased", "postpaid"],
+} as const;
+
+const subscription = {
+  organizationId: org,
+  subscriptionId: "sub_private_processor_id",
+  subscriptionRef: `sra_${"a".repeat(64)}`,
+  planKey: "subscription-configured",
+  pricingRevision: "revision-1",
+  status: "active",
+  cancelAtPeriodEnd: false,
+  periodStart: "2026-10-01T00:00:00.000Z",
+  periodEnd: "2026-11-01T00:00:00.000Z",
+  paidThrough: "2026-11-01T00:00:00.000Z",
+  paidFeatures: true,
+  updatedAt: "2026-10-01T00:00:00.000Z",
+} as const;
+
+test("canonical subscription read returns its plan table and organization projection", async () => {
+  const seen = transport(() => Response.json({ subscription, planTable: hostedPlanTable }));
+  expect(await client().subscription(org)).toEqual({
+    subscription,
+    planTable: hostedPlanTable,
+  });
+  expect(new URL(seen[0]?.url ?? origin).pathname).toBe(
+    `/v1/organizations/${encodeURIComponent(org)}/payments/subscription`,
+  );
+  expect(seen[0]?.method).toBe("GET");
+});
+
+test("subscription Checkout uses the selected configured key and preserves status semantics", async () => {
+  const seen = transport(() =>
+    Response.json(
+      {
+        checkout: {
+          state: "open",
+          id: "cs_test_console_1",
+          url: "https://checkout.stripe.com/c/pay/test",
+        },
+      },
+      { status: 201 },
+    ),
+  );
+  expect(
+    await client().beginSubscription(org, "checkout-ref-1", "configured-subscription"),
+  ).toEqual({
+    status: 201,
+    checkout: {
+      state: "open",
+      id: "cs_test_console_1",
+      url: "https://checkout.stripe.com/c/pay/test",
+    },
+  });
+  expect(await seen[0]?.json()).toEqual({
+    reference: "checkout-ref-1",
+    planKey: "configured-subscription",
+  });
+});
+
+test("pending, associated, and expired Checkout receipts are bound to their HTTP status", async () => {
+  let next = Response.json(
+    { checkout: { state: "pending", id: "sci_00000000-0000-4000-8000-000000000001" } },
+    { status: 202 },
+  );
+  transport(() => next);
+  expect(
+    await client().beginSubscription(org, "checkout-ref-1", "configured-subscription"),
+  ).toMatchObject({
+    status: 202,
+    checkout: { state: "pending" },
+  });
+  next = Response.json(
+    {
+      checkout: {
+        state: "associated",
+        id: "cs_test_console_1",
+        subscriptionRef: subscription.subscriptionRef,
+      },
+    },
+    { status: 200 },
+  );
+  expect(
+    await client().beginSubscription(org, "checkout-ref-1", "configured-subscription"),
+  ).toMatchObject({
+    status: 200,
+    checkout: { state: "associated" },
+  });
+  next = Response.json(
+    { checkout: { state: "expired", id: "cs_test_console_1" } },
+    { status: 200 },
+  );
+  expect(
+    await client().beginSubscription(org, "checkout-ref-1", "configured-subscription"),
+  ).toMatchObject({
+    status: 200,
+    checkout: { state: "expired" },
+  });
+});
+
+test("cancellation sends the exact expected subscription target and accepts only matching receipts", async () => {
+  const target = `sra_${"c".repeat(64)}`;
+  const seen = transport(() =>
+    Response.json(
+      {
+        cancellation: {
+          state: "verified",
+          subscriptionRef: target,
+          effectiveAt: "2026-11-01T00:00:00.000Z",
+        },
+      },
+      { status: 200 },
+    ),
+  );
+  expect(await client().cancelSubscription(org, "cancel-ref-1", target)).toEqual({
+    state: "verified",
+    subscriptionRef: target,
+    effectiveAt: "2026-11-01T00:00:00.000Z",
+  });
+  expect(await seen[0]?.json()).toEqual({
+    reference: "cancel-ref-1",
+    cancelAtPeriodEnd: true,
+    expectedSubscriptionRef: target,
+  });
+});
+
+test("subscription API refuses mismatched projections, payment status, and cancellation target", async () => {
+  transport(() =>
+    Response.json({
+      subscription: { ...subscription, organizationId: "other-org" },
+      planTable: hostedPlanTable,
+    }),
+  );
+  await expect(client().subscription(org)).rejects.toMatchObject({ code: "invalid_response" });
+
+  transport(() =>
+    Response.json(
+      { checkout: { state: "open", id: "cs_test_open", url: "https://checkout.stripe.com/pay/1" } },
+      { status: 200 },
+    ),
+  );
+  await expect(
+    client().beginSubscription(org, "checkout-ref-1", "configured-subscription"),
+  ).rejects.toMatchObject({ code: "invalid_response", status: 200 });
+
+  transport(() =>
+    Response.json(
+      {
+        checkout: {
+          state: "open",
+          id: "cs_test_open",
+          url: "https://checkout.stripe.com:8443/pay/1",
+        },
+      },
+      { status: 201 },
+    ),
+  );
+  await expect(
+    client().beginSubscription(org, "checkout-ref-1", "configured-subscription"),
+  ).rejects.toMatchObject({ code: "invalid_response", status: 201 });
+
+  transport(() =>
+    Response.json(
+      {
+        cancellation: {
+          state: "verified",
+          subscriptionRef: `sra_${"d".repeat(64)}`,
+          effectiveAt: "2026-11-01T00:00:00.000Z",
+        },
+      },
+      { status: 200 },
+    ),
+  );
+  await expect(
+    client().cancelSubscription(org, "cancel-ref-1", `sra_${"c".repeat(64)}`),
+  ).rejects.toMatchObject({ code: "invalid_response", status: 200 });
+});
+
+test("associated subscription Checkout requires a canonical persisted target reference", async () => {
+  transport(() =>
+    Response.json({ checkout: { state: "associated", id: "cs_test_console_1" } }, { status: 200 }),
+  );
+  await expect(
+    client().beginSubscription(org, "checkout-ref-1", "configured-subscription"),
+  ).rejects.toMatchObject({ code: "invalid_response", status: 200 });
+
+  transport(() =>
+    Response.json(
+      {
+        checkout: {
+          state: "associated",
+          id: "cs_test_console_1",
+          subscriptionRef: `sra_${"A".repeat(64)}`,
+        },
+      },
+      { status: 200 },
+    ),
+  );
+  await expect(
+    client().beginSubscription(org, "checkout-ref-1", "configured-subscription"),
+  ).rejects.toMatchObject({ code: "invalid_response", status: 200 });
+});

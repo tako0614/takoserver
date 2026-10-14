@@ -53,6 +53,30 @@ const BILLING_REFERENCE_SCHEMA = {
   description:
     "Opaque, non-reusable Organization billing reference; URL-encode it as one path component.",
 } as const;
+const SUBSCRIPTION_REF_SCHEMA = {
+  type: "string",
+  minLength: 68,
+  maxLength: 68,
+  pattern: "^sra_[0-9a-f]{64}$",
+  description: "Opaque expected subscription target; not an authorization credential.",
+} as const;
+function subscriptionReceiptResponseSchema(
+  component: "SubscriptionCheckoutResponse" | "SubscriptionCancellationResponse",
+  field: "checkout" | "cancellation",
+  states: readonly string[],
+) {
+  return {
+    allOf: [
+      { $ref: `#/components/schemas/${component}` },
+      {
+        type: "object",
+        properties: {
+          [field]: { type: "object", properties: { state: { enum: states } } },
+        },
+      },
+    ],
+  };
+}
 const ORGANIZATION_ID_PARAMETER = {
   name: "organizationId",
   in: "path",
@@ -786,13 +810,13 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
         },
         "401": errorResponse("Authentication required"),
         "403": errorResponse("Wrong Organization or scope"),
-        "404": errorResponse("Hosted test-mode billing is disabled"),
+        "404": errorResponse("Hosted billing is disabled"),
         "503": errorResponse("Billing schema or processor unavailable"),
       },
     },
   ),
   beginSubscription: described(
-    "Begin test-mode monthly subscription Checkout using a configured plan key",
+    "Begin monthly subscription Checkout in the configured Stripe realm using a plan key",
     {
       "x-required-scopes": ["payments:write"],
       parameters: [ORGANIZATION_ID_PARAMETER],
@@ -800,56 +824,81 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
         "Host sets Stripe Price, Organization/customer binding, tariff revision and return URLs. This operation grants no credit. Replay the same reference; an unresolved processor acknowledgement must retain that reference.",
       requestBody: billingRequest("BeginSubscriptionRequest"),
       responses: {
-        "201": {
-          description: "Stripe Checkout redirect",
+        "200": {
+          description: "Verified associated or expired Checkout for this reference",
           content: {
             "application/json": {
-              schema: {
-                type: "object",
-                required: ["checkout"],
-                additionalProperties: false,
-                properties: {
-                  checkout: {
-                    type: "object",
-                    required: ["url"],
-                    additionalProperties: false,
-                    properties: { url: { type: "string", format: "uri" } },
-                  },
-                },
-              },
+              schema: subscriptionReceiptResponseSchema(
+                "SubscriptionCheckoutResponse",
+                "checkout",
+                ["associated", "expired"],
+              ),
+            },
+          },
+        },
+        "201": {
+          description: "Verified open Stripe Checkout redirect",
+          content: {
+            "application/json": {
+              schema: subscriptionReceiptResponseSchema(
+                "SubscriptionCheckoutResponse",
+                "checkout",
+                ["open"],
+              ),
+            },
+          },
+        },
+        "202": {
+          description: "Checkout outcome pending; retry this reference without another payment",
+          content: {
+            "application/json": {
+              schema: subscriptionReceiptResponseSchema(
+                "SubscriptionCheckoutResponse",
+                "checkout",
+                ["pending"],
+              ),
             },
           },
         },
         "400": errorResponse("Invalid reference or configured plan key"),
         "401": errorResponse("Authentication required"),
         "403": errorResponse("Wrong Organization or payments:write scope"),
-        "404": errorResponse("Hosted test-mode billing is disabled"),
+        "404": errorResponse("Hosted billing is disabled"),
         "409": errorResponse("Subscription exists or payment command needs reconciliation"),
         "503": errorResponse("Processor unavailable"),
       },
     },
   ),
   changeSubscription: described(
-    "Schedule or withdraw cancellation at the current paid period end",
+    "Schedule cancellation at the expected subscription's paid period end",
     {
       "x-required-scopes": ["payments:write"],
       parameters: [ORGANIZATION_ID_PARAMETER],
       description:
-        "Does not grant/revoke wallet credit or prorate a period. The configured catalog currently has one monthly plan; changing prices/plan versions is an operator tariff rollout.",
+        "Requires the opaque subscriptionRef returned by readSubscription as expectedSubscriptionRef. A changed target refuses the request before any payment effect. Does not grant/revoke wallet credit or prorate a period. Pending outcomes retain their reference and recover by readback rather than another Stripe POST.",
       requestBody: billingRequest("ChangeSubscriptionRequest"),
       responses: {
         "200": {
-          description: "Updated subscription projection",
+          description: "Verified cancellation receipt for the expected target",
           content: {
             "application/json": {
-              schema: {
-                type: "object",
-                required: ["subscription"],
-                additionalProperties: false,
-                properties: {
-                  subscription: { $ref: "#/components/schemas/SubscriptionProjection" },
-                },
-              },
+              schema: subscriptionReceiptResponseSchema(
+                "SubscriptionCancellationResponse",
+                "cancellation",
+                ["verified"],
+              ),
+            },
+          },
+        },
+        "202": {
+          description: "Cancellation pending; no effective date is confirmed",
+          content: {
+            "application/json": {
+              schema: subscriptionReceiptResponseSchema(
+                "SubscriptionCancellationResponse",
+                "cancellation",
+                ["pending"],
+              ),
             },
           },
         },
@@ -857,7 +906,7 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
         "401": errorResponse("Authentication required"),
         "403": errorResponse("Wrong Organization or payments:write scope"),
         "404": errorResponse("Subscription or capability absent"),
-        "409": errorResponse("Conflicting or unresolved command"),
+        "409": errorResponse("Expected subscription changed or reference conflicts"),
         "503": errorResponse("Processor unavailable"),
       },
     },
@@ -1343,15 +1392,97 @@ export const openApiDocument = {
       },
       ChangeSubscriptionRequest: {
         type: "object",
-        required: ["reference", "cancelAtPeriodEnd"],
+        required: ["reference", "cancelAtPeriodEnd", "expectedSubscriptionRef"],
         additionalProperties: false,
-        properties: { reference: BILLING_REFERENCE_SCHEMA, cancelAtPeriodEnd: { type: "boolean" } },
+        properties: {
+          reference: BILLING_REFERENCE_SCHEMA,
+          cancelAtPeriodEnd: { type: "boolean", const: true },
+          expectedSubscriptionRef: SUBSCRIPTION_REF_SCHEMA,
+        },
+      },
+      SubscriptionCheckoutReceipt: {
+        oneOf: [
+          {
+            type: "object",
+            required: ["state", "id", "url"],
+            additionalProperties: false,
+            properties: {
+              state: { const: "open" },
+              id: { type: "string", pattern: "^cs_[A-Za-z0-9_]{1,240}$" },
+              url: { type: "string", format: "uri", pattern: "^https://checkout\\.stripe\\.com/" },
+            },
+          },
+          {
+            type: "object",
+            required: ["state", "id", "subscriptionRef"],
+            additionalProperties: false,
+            properties: {
+              state: { const: "associated" },
+              id: { type: "string", pattern: "^cs_[A-Za-z0-9_]{1,240}$" },
+              subscriptionRef: SUBSCRIPTION_REF_SCHEMA,
+              url: { type: "string", format: "uri", pattern: "^https://checkout\\.stripe\\.com/" },
+            },
+          },
+          {
+            type: "object",
+            required: ["state", "id"],
+            additionalProperties: false,
+            properties: {
+              state: { const: "expired" },
+              id: { type: "string", pattern: "^cs_[A-Za-z0-9_]{1,240}$" },
+            },
+          },
+          {
+            type: "object",
+            required: ["state", "id"],
+            additionalProperties: false,
+            properties: {
+              state: { const: "pending" },
+              id: { type: "string", pattern: "^sci_" },
+            },
+          },
+        ],
+      },
+      SubscriptionCheckoutResponse: {
+        type: "object",
+        required: ["checkout"],
+        additionalProperties: false,
+        properties: { checkout: { $ref: "#/components/schemas/SubscriptionCheckoutReceipt" } },
+      },
+      SubscriptionCancellationReceipt: {
+        oneOf: [
+          {
+            type: "object",
+            required: ["state", "subscriptionRef"],
+            additionalProperties: false,
+            properties: { state: { const: "pending" }, subscriptionRef: SUBSCRIPTION_REF_SCHEMA },
+          },
+          {
+            type: "object",
+            required: ["state", "subscriptionRef", "effectiveAt"],
+            additionalProperties: false,
+            properties: {
+              state: { const: "verified" },
+              subscriptionRef: SUBSCRIPTION_REF_SCHEMA,
+              effectiveAt: { $ref: "#/components/schemas/BillingUtcDateTime" },
+            },
+          },
+        ],
+      },
+      SubscriptionCancellationResponse: {
+        type: "object",
+        required: ["cancellation"],
+        additionalProperties: false,
+        properties: {
+          cancellation: { $ref: "#/components/schemas/SubscriptionCancellationReceipt" },
+        },
       },
       SubscriptionProjection: {
         type: "object",
         required: [
           "organizationId",
           "subscriptionId",
+          "subscriptionRef",
           "planKey",
           "pricingRevision",
           "status",
@@ -1366,6 +1497,7 @@ export const openApiDocument = {
         properties: {
           organizationId: IDENTIFIER_SCHEMA,
           subscriptionId: { type: "string" },
+          subscriptionRef: SUBSCRIPTION_REF_SCHEMA,
           planKey: { type: "string" },
           pricingRevision: { type: "string" },
           status: {
@@ -1926,7 +2058,6 @@ export const openApiDocument = {
         ],
         additionalProperties: false,
         properties: {
-          billing: { $ref: "#/components/schemas/StripeBillingReconcileReport" },
           examined: { type: "integer", minimum: 0 },
           credited: { type: "integer", minimum: 0 },
           alreadyCredited: { type: "integer", minimum: 0 },
@@ -1957,20 +2088,29 @@ export const openApiDocument = {
               },
             },
           },
+          billing: {
+            $ref: "#/components/schemas/BillingReconcileReport",
+            description: "Hosted billing progress, present only when Hosted billing is configured",
+          },
         },
       },
-      StripeBillingReconcileReport: {
+      BillingReconcileReport: {
         type: "object",
-        description:
-          "Optional hosted subscription/refund reconciliation summary; no monetary or customer data",
         required: ["examined", "applied", "unresolved", "truncated", "handlerVersion"],
         additionalProperties: false,
         properties: {
           examined: { type: "integer", minimum: 0 },
           applied: { type: "integer", minimum: 0 },
-          unresolved: { type: "integer", minimum: 0 },
-          truncated: { type: "boolean" },
-          handlerVersion: { type: "integer", const: 1 },
+          unresolved: {
+            type: "integer",
+            minimum: 0,
+            description: "Billing objects or streams still unresolved after this pass",
+          },
+          truncated: {
+            type: "boolean",
+            description: "At least one billing stream was not completely scanned in this pass",
+          },
+          handlerVersion: { const: 1 },
         },
       },
       IntegrationOrganizationBootstrapStatusRequest: {

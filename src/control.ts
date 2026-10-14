@@ -855,26 +855,31 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       const body = await jsonObject(request);
       if (request.method === "POST") {
         exactKeys(body, ["reference", "planKey"]);
-        return Response.json(
-          {
-            checkout: await options.subscriptions.begin({
-              organizationId,
-              reference: text(body.reference),
-              planKey: text(body.planKey),
-            }),
-          },
-          { status: 201 },
-        );
-      }
-      exactKeys(body, ["reference", "cancelAtPeriodEnd"]);
-      if (typeof body.cancelAtPeriodEnd !== "boolean") controlError("invalid_argument", 400);
-      return Response.json({
-        subscription: await options.subscriptions.change({
+        const started = await options.subscriptions.begin({
           organizationId,
           reference: text(body.reference),
-          cancelAtPeriodEnd: body.cancelAtPeriodEnd,
-        }),
+          planKey: text(body.planKey),
+        });
+        return Response.json(
+          { checkout: started },
+          { status: started.state === "pending" ? 202 : started.state === "open" ? 201 : 200 },
+        );
+      }
+      exactKeys(body, ["reference", "cancelAtPeriodEnd", "expectedSubscriptionRef"]);
+      const expectedSubscriptionRef = text(body.expectedSubscriptionRef);
+      if (body.cancelAtPeriodEnd !== true || !/^sra_[0-9a-f]{64}$/u.test(expectedSubscriptionRef)) {
+        controlError("invalid_argument", 400);
+      }
+      const cancellation = await options.subscriptions.change({
+        organizationId,
+        reference: text(body.reference),
+        cancelAtPeriodEnd: true,
+        expectedSubscriptionRef,
       });
+      return Response.json(
+        { cancellation },
+        { status: cancellation.state === "pending" ? 202 : 200 },
+      );
     }
 
     if (request.method === "GET" && url.pathname === "/v1/catalog") {

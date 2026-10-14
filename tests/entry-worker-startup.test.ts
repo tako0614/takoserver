@@ -20,7 +20,10 @@ import {
 } from "./helpers/hosted-supply-fixtures.ts";
 
 const ORIGIN = "https://api.integration.example.test";
-const readyDatabase = databaseThrough(94);
+const readyDatabase = databaseThrough(98);
+readyDatabase.exec(
+  "INSERT INTO stripe_mode_realm (singleton, mode, pinned_at) VALUES (1, 'test', '2026-10-14T00:00:00.000Z')",
+);
 afterAll(() => readyDatabase.close());
 
 function databaseThrough(count: number): Database {
@@ -150,7 +153,35 @@ describe("Worker startup diagnostics", () => {
       bare.close();
     }
   });
-  test("normal serving refuses 0092 with no billing configuration", async () => {
+
+  test("normal serving refuses a configured Stripe mode that disagrees with the pinned realm", async () => {
+    const response = await worker.fetch(
+      new Request(`${ORIGIN}/healthz`),
+      workerEnv({ TAKOSERVER_STRIPE_MODE: "live" }),
+    );
+    expect(response.status).toBe(503);
+    expect((await envelope(response)).error.details?.reason).toBe("runtime-configuration");
+  });
+
+  test("normal serving refuses a Stripe pin whose immutability trigger is missing", async () => {
+    const database = databaseThrough(98);
+    try {
+      database.exec(
+        "INSERT INTO stripe_mode_realm (singleton, mode, pinned_at) VALUES (1, 'test', '2026-10-14T00:00:00.000Z')",
+      );
+      database.exec("DROP TRIGGER stripe_mode_realm_no_update");
+      const response = await worker.fetch(
+        new Request(`${ORIGIN}/healthz`),
+        workerEnv({ STATE_DB: d1(database) }),
+      );
+      expect(response.status).toBe(503);
+      expect((await envelope(response)).error.details?.reason).toBe("runtime-configuration");
+    } finally {
+      database.close();
+    }
+  });
+
+  test("normal serving refuses an unqualified pre-realm D1 with no billing configuration", async () => {
     const oldDatabase = databaseThrough(92);
     try {
       const env = workerEnv({ STATE_DB: d1(oldDatabase) });
@@ -164,8 +195,11 @@ describe("Worker startup diagnostics", () => {
   });
 
   test("normal serving refuses a tampered USD-micros money-unit policy", async () => {
-    const database = databaseThrough(94);
+    const database = databaseThrough(98);
     try {
+      database.exec(
+        "INSERT INTO stripe_mode_realm (singleton, mode, pinned_at) VALUES (1, 'test', '2026-10-14T00:00:00.000Z')",
+      );
       database.exec("DROP TRIGGER money_unit_policy_no_delete");
       database.exec("DELETE FROM money_unit_policy");
       const response = await worker.fetch(

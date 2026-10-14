@@ -15,6 +15,7 @@ import {
 } from "../src/stripe-billing.ts";
 
 const ORG = "org_subscriptions";
+const EXPECTED_REF = `sra_${"a".repeat(64)}`;
 const pricing = compilePricingAuthoring({
   authoringVersion: 1,
   billingConfig: {
@@ -33,7 +34,13 @@ const pricing = compilePricingAuthoring({
     configured: { expectedAmountMinor: 1200, currency: "USD", interval: "month" },
   },
 });
-function fixture(enabled = true) {
+function fixture(
+  enabled = true,
+  receipts: {
+    checkout?: "open" | "pending" | "associated" | "expired";
+    cancellation?: "pending" | "verified";
+  } = {},
+) {
   const calls: string[] = [];
   const scopes: Record<string, readonly ApiKeyScope[]> = {
     reader: ["wallet:read"],
@@ -49,11 +56,25 @@ function fixture(enabled = true) {
     },
     async begin(input) {
       calls.push(`begin:${input.organizationId}:${input.reference}:${input.planKey}`);
-      return { url: "https://checkout.stripe.com/c/pay/test" };
+      if (receipts.checkout === "pending") return { id: "sci_test", state: "pending" };
+      if (receipts.checkout === "associated")
+        return { id: "cs_test", state: "associated", subscriptionRef: EXPECTED_REF };
+      if (receipts.checkout === "expired") return { id: "cs_test", state: "expired" };
+      return { id: "cs_test", state: "open", url: "https://checkout.stripe.com/c/pay/test" };
     },
     async change(input) {
-      calls.push(`change:${input.organizationId}:${input.reference}:${input.cancelAtPeriodEnd}`);
-      return null;
+      calls.push(
+        `change:${input.organizationId}:${input.reference}:${input.cancelAtPeriodEnd}:${input.expectedSubscriptionRef}`,
+      );
+      if (input.expectedSubscriptionRef !== EXPECTED_REF)
+        throw new StripeBillingError("subscription_management_conflict", 409);
+      if (receipts.cancellation === "pending")
+        return { state: "pending", subscriptionRef: EXPECTED_REF };
+      return {
+        state: "verified",
+        subscriptionRef: EXPECTED_REF,
+        effectiveAt: "2026-11-01T00:00:00.000Z",
+      };
     },
   };
   const route = createControlRoutes({
@@ -135,9 +156,75 @@ test("subscription routes enforce distinct read/payment authority and Organizati
     (await f.request("POST", "payer", { reference: "one", planKey: "configured" }))?.status,
   ).toBe(201);
   expect(
-    (await f.request("PATCH", "payer", { reference: "two", cancelAtPeriodEnd: true }))?.status,
+    (
+      await f.request("PATCH", "payer", {
+        reference: "two",
+        cancelAtPeriodEnd: true,
+        expectedSubscriptionRef: EXPECTED_REF,
+      })
+    )?.status,
   ).toBe(200);
-  expect(f.calls).toEqual([`read:${ORG}`, `begin:${ORG}:one:configured`, `change:${ORG}:two:true`]);
+  expect(f.calls).toEqual([
+    `read:${ORG}`,
+    `begin:${ORG}:one:configured`,
+    `change:${ORG}:two:true:${EXPECTED_REF}`,
+  ]);
+});
+
+test("cancellation requires an exact current target and true-only period-end intent", async () => {
+  const f = fixture();
+  for (const body of [
+    { reference: "missing", cancelAtPeriodEnd: true },
+    { reference: "malformed", cancelAtPeriodEnd: true, expectedSubscriptionRef: "sra_expected" },
+    { reference: "false", cancelAtPeriodEnd: false, expectedSubscriptionRef: EXPECTED_REF },
+    { reference: "string", cancelAtPeriodEnd: "true", expectedSubscriptionRef: EXPECTED_REF },
+  ]) {
+    expect((await f.request("PATCH", "payer", body))?.status).toBe(400);
+  }
+  expect(f.calls).toEqual([]);
+  const stale = await f.request("PATCH", "payer", {
+    reference: "stale",
+    cancelAtPeriodEnd: true,
+    expectedSubscriptionRef: `sra_${"b".repeat(64)}`,
+  });
+  expect(stale?.status).toBe(409);
+  expect(f.calls).toEqual([`change:${ORG}:stale:true:sra_${"b".repeat(64)}`]);
+});
+
+test("subscription routes distinguish pending, open, associated, expired, and verified receipts", async () => {
+  for (const [state, status] of [
+    ["pending", 202],
+    ["open", 201],
+    ["associated", 200],
+    ["expired", 200],
+  ] as const) {
+    const f = fixture(true, { checkout: state });
+    const response = await f.request("POST", "payer", { reference: state, planKey: "configured" });
+    expect(response?.status).toBe(status);
+    const body = await response?.json();
+    expect(body).toMatchObject({ checkout: { state } });
+    if (state === "associated") {
+      expect(body).toEqual({
+        checkout: { state: "associated", id: "cs_test", subscriptionRef: EXPECTED_REF },
+      });
+    }
+  }
+  for (const [state, status] of [
+    ["pending", 202],
+    ["verified", 200],
+  ] as const) {
+    const f = fixture(true, { cancellation: state });
+    const response = await f.request("PATCH", "payer", {
+      reference: state,
+      cancelAtPeriodEnd: true,
+      expectedSubscriptionRef: EXPECTED_REF,
+    });
+    expect(response?.status).toBe(status);
+    expect(await response?.json()).toMatchObject({
+      cancellation: { state, subscriptionRef: EXPECTED_REF },
+    });
+    expect(f.calls).toEqual([`change:${ORG}:${state}:true:${EXPECTED_REF}`]);
+  }
 });
 
 test("owner access works, request amounts are refused and disabled feature exposes no subscription operation", async () => {
@@ -170,15 +257,22 @@ test("owner access works, request amounts are refused and disabled feature expos
   expect(controlErrorResponse(new StripeBillingError("payment_unavailable")).status).toBe(503);
 });
 
-test("hosted activation requires explicit test-mode credentials", () => {
+test("hosted activation requires credentials matching the selected Stripe mode", () => {
   expect(() => resolvePayment({ hostedPricing: pricing })).toThrow(
-    "Hosted billing requires Stripe test mode",
+    "Hosted billing requires a Stripe key",
   );
   expect(() => resolvePayment({ hostedPricing: pricing, stripeSecretKey: "sk_live_fake" })).toThrow(
     "Invalid Stripe billing client configuration",
   );
+  expect(() =>
+    resolvePayment({ hostedPricing: pricing, stripeMode: "live", stripeSecretKey: "sk_test_fake" }),
+  ).toThrow("Invalid Stripe billing client configuration");
   expect(
     resolvePayment({ hostedPricing: pricing, stripeSecretKey: "sk_test_fake" }).events,
+  ).toBeFunction();
+  expect(
+    resolvePayment({ hostedPricing: pricing, stripeMode: "live", stripeSecretKey: "sk_live_fake" })
+      .events,
   ).toBeFunction();
   expect(resolvePayment({})).toEqual({});
 });
@@ -203,7 +297,6 @@ test("hosted startup rejects a complete table inventory with obsolete Stripe cre
     database.close();
   }
 });
-
 test("OpenAPI publishes subscription scope, request and refund projection contracts", () => {
   const document = openApiDocument;
   const path = document.paths["/v1/organizations/{organizationId}/payments/subscription"] as Record<

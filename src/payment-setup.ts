@@ -15,6 +15,7 @@ import {
   DEFAULT_STRIPE_RECONCILE_LOOKBACK_SECONDS,
   DEFAULT_STRIPE_WEBHOOK_TOLERANCE_SECONDS,
 } from "./stripe-events.ts";
+import { parseStripeMode, type StripeMode } from "./stripe-mode-realm.ts";
 import { createStripeClient, createStripeSettlement } from "./stripe-settlement.ts";
 
 /**
@@ -40,6 +41,8 @@ import { createStripeClient, createStripeSettlement } from "./stripe-settlement.
 
 export interface PaymentSetupOptions {
   readonly hostedPricing?: HostedPricing | undefined;
+  /** Deployment-wide financial realm; absence selects TEST, never the key prefix. */
+  readonly stripeMode?: StripeMode | undefined;
   /** Stripe secret key. Its presence is what turns payment on. */
   readonly stripeSecretKey?: string | undefined;
   /** Signing secret of this deployment's Stripe webhook endpoint. */
@@ -62,19 +65,25 @@ export function resolvePayment(options: PaymentSetupOptions): PaymentSetup {
   // Settings are checked even where payment is off, so a typo surfaces at
   // startup instead of on the day Stripe is turned on.
   const settings = validatePaymentSettings(options.settings ?? {});
+  const mode = parseStripeMode(options.stripeMode);
   const key = options.stripeSecretKey;
   if (!key) {
-    if (options.hostedPricing) throw new TypeError("Hosted billing requires Stripe test mode");
+    if (options.hostedPricing) throw new TypeError("Hosted billing requires a Stripe key");
     return {};
   }
   const billingClient = options.hostedPricing
     ? createStripeBillingClient({
         secretKey: key,
+        mode,
         ...(options.fetch ? { fetch: options.fetch } : {}),
       })
     : undefined;
 
-  const stripeOptions = { secretKey: key, ...(options.fetch ? { fetch: options.fetch } : {}) };
+  const stripeOptions = {
+    secretKey: key,
+    mode,
+    ...(options.fetch ? { fetch: options.fetch } : {}),
+  };
   const client = createStripeClient(stripeOptions);
   const consoleOrigin = options.consoleOrigin;
   const webhookSecret = options.stripeWebhookSecret?.trim();
@@ -91,12 +100,14 @@ export function resolvePayment(options: PaymentSetupOptions): PaymentSetup {
               client: billingClient,
               context,
               pricing: options.hostedPricing,
+              mode,
               consoleOrigin,
             })
           : undefined;
       const events = createStripeEvents(
         {
           client,
+          mode,
           ...(hosted ? { handlers: hosted.handlers, handlerVersion: 1 } : {}),
           reconcileLookbackSeconds:
             settings.reconcileLookbackSeconds ?? DEFAULT_STRIPE_RECONCILE_LOOKBACK_SECONDS,

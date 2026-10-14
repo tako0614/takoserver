@@ -155,6 +155,7 @@ import {
   resolveStandaloneProviderMode,
 } from "./standalone-provider-composition.ts";
 import { assertStripeBillingSchema } from "./stripe-billing.ts";
+import { assertStripeModeRealm, parseStripeMode } from "./stripe-mode-realm.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { parseTakoformV2ApplicationConfig } from "./takoform-v2/config.ts";
 import { selectClosedGraphWorkerd } from "./workerd-artifact.ts";
@@ -385,6 +386,9 @@ const providerMode = resolveStandaloneProviderMode({
   workerdPort: process.env.TAKOSERVER_WORKERD_PORT,
 });
 const currentCandidates = selectPublicHostFormSource(process.env.TAKOSERVER_FORM_SOURCE_CANDIDATE);
+// Reject an invalid financial realm before creating a data root or opening
+// SQLite; no invalid configuration may record a forward migration.
+const stripeMode = parseStripeMode(process.env.TAKOSERVER_STRIPE_MODE);
 
 // Organizations, keys, and the ledger are as durable as the files are: a
 // machine that forgets who its customers are, and what they are owed, on
@@ -467,7 +471,7 @@ controlDatabase.exec(`PRAGMA busy_timeout = ${SQLITE_CONTROL_BUSY_TIMEOUT_MS}`);
 // rather than repaired.
 const migrated = (() => {
   try {
-    return migrateSqlite(controlDatabase, controlInstallation);
+    return migrateSqlite(controlDatabase, { ...controlInstallation, stripeMode });
   } catch (error) {
     if (!(error instanceof UsedV1InstallationError)) throw error;
     controlDatabase.close();
@@ -480,6 +484,9 @@ if (migrated.applied.length > 0) {
   );
 }
 const sql = createSqliteSql(controlDatabase);
+// The sole migration writer has already committed the checked realm claim
+// atomically with any forward schema change; this is read-only verification.
+await assertStripeModeRealm(sql, stripeMode);
 // Wallet reads use the micros ledger even when optional billing is disabled.
 await assertOrgBillingSchema(sql, billingConfig);
 if (hostedPricing) await assertStripeBillingSchema(sql);
@@ -1194,6 +1201,7 @@ const identityPublicKeyJwk = identityOnlyPublicKeyJwk ?? legacyPublicKeyJwk;
 
 const payment = resolvePayment({
   hostedPricing,
+  stripeMode,
   stripeSecretKey: process.env.STRIPE_SECRET_KEY,
   stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
   consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN,
