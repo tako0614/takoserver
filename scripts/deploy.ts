@@ -39,6 +39,10 @@ import {
   type SchemaWaveBoundary,
 } from "./deploy/schema.ts";
 import { runD1Schema0058Rehearsal } from "./deploy/schema-0058-rehearsal.ts";
+import {
+  type MoneyRehearsalDeclaration,
+  runMoneyUnitRehearsal,
+} from "./deploy/schema-money-unit-rehearsal.ts";
 import { runSigning } from "./deploy/signing.ts";
 import { runSponsorshipAuthority } from "./deploy/sponsorship-authority.ts";
 import { runStaticSite } from "./deploy/static.ts";
@@ -92,6 +96,8 @@ const USAGE = `takoserver deploy
     writer-drain plus target-bound volume/import qualification are implemented; apply refuses.
   takoserver-rehearsal-d1-create creates one empty rehearsal D1 from a separate owned declaration;
     no target descriptor, schema import, binding change, or production mode is accepted.
+  takoserver-d1-money-cutover-rehearsal exercises synthetic 0092/0093/0094 imports on that
+    explicit rehearsal D1 only; each reviewed phase uses protected no-overwrite custody.
   takoserver-d1-snapshot-restore restores one pinned export dump into one declared empty
     rehearsal D1; the dump is NUL-normalized and the result is verified by readback, so a partial
     application is never reported as success.
@@ -141,6 +147,7 @@ type StorageGenerationSurface = "takoserver-integration-storage-generation";
 type StorageDisposalSurface = "takoserver-integration-storage-disposal";
 type HostRetirementSurface = "takoserver-integration-host-retirement";
 type RehearsalD1CreateSurface = "takoserver-rehearsal-d1-create";
+type MoneyRehearsalSurface = "takoserver-d1-money-cutover-rehearsal";
 type ProductionD1FreshInitSurface = "takoserver-production-d1-fresh-init";
 type D1SnapshotRestoreSurface = "takoserver-d1-snapshot-restore";
 type StandardSurface = Exclude<
@@ -151,6 +158,7 @@ type StandardSurface = Exclude<
   | StorageDisposalSurface
   | HostRetirementSurface
   | RehearsalD1CreateSurface
+  | MoneyRehearsalSurface
   | ProductionD1FreshInitSurface
   | D1SnapshotRestoreSurface
 >;
@@ -174,6 +182,11 @@ interface InvocationBase {
 }
 
 type Invocation =
+  | (InvocationBase & {
+      readonly surface: MoneyRehearsalSurface;
+      readonly action: "status" | "apply";
+      readonly environment: "rehearsal";
+    })
   | (InvocationBase & {
       readonly surface: RehearsalD1CreateSurface;
       readonly action: "status" | "apply";
@@ -762,6 +775,13 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       ? { surface: surfaceValue, action, environment, commit }
       : null;
   }
+  if (surfaceValue === "takoserver-d1-money-cutover-rehearsal") {
+    return environment === "rehearsal" &&
+      (action === "status" || action === "apply") &&
+      args.length === 4
+      ? { surface: surfaceValue, action, environment, commit }
+      : null;
+  }
   if (surfaceValue === "takoserver-d1-snapshot-restore") {
     return environment === "rehearsal" &&
       (action === "status" || action === "apply") &&
@@ -1070,7 +1090,17 @@ function loadD1SnapshotRestoreDeclaration(): D1SnapshotRestoreDeclaration {
   );
 }
 
+function loadMoneyRehearsalDeclaration(): MoneyRehearsalDeclaration {
+  return loadOwnedDeclaration<MoneyRehearsalDeclaration>(
+    "TAKOSERVER_D1_MONEY_REHEARSAL_DECLARATION_PATH",
+    "money cutover rehearsal declaration",
+  );
+}
+
 async function dispatch(invocation: Invocation): Promise<Record<string, unknown>> {
+  if (invocation.surface === "takoserver-d1-money-cutover-rehearsal") {
+    return await runMoneyUnitRehearsal(loadMoneyRehearsalDeclaration(), invocation);
+  }
   if (invocation.surface === "takoserver-rehearsal-d1-create") {
     return await runRehearsalD1Create(loadRehearsalD1CreateDeclaration(), invocation);
   }

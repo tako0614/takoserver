@@ -1272,6 +1272,33 @@ export const DEPLOY_CONTRACT = {
       },
     },
     {
+      surface: "takoserver-d1-money-cutover-rehearsal",
+      target: "cloudflare-d1:one-explicit-created-synthetic-rehearsal-database",
+      covers: [
+        "scripts/deploy/schema-money-unit-rehearsal.ts",
+        "scripts/deploy/schema-money-unit-cutover.ts",
+        "migrations/0093_wallet_credit_classification_proofs.sql",
+        "migrations/0094_wallet_usd_micros.sql",
+      ],
+      requiresScripts: [],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["TAKOSERVER_D1_MONEY_REHEARSAL_DECLARATION_PATH", "CLOUDFLARE_API_TOKEN"],
+      triggers: ["irreversible", "authority", "published-identity"],
+      obligations: {
+        provenance: `${exactSource} The owned 0600 declaration binds the terminal one-D1 rehearsal-create receipt, original create declaration, exact account/name/UUID, audited 0092-0094 source, pinned Wrangler 4.123.0 launcher and executable dist-module digests, sealed SQL, exact account/D1 import endpoint and phase-specific protected independent review evidence. Synthetic rows only; no ordinary target descriptor or production/staging resource is read.`,
+        "post-conditions":
+          "Each phase reads exact native migration lineage/schema, all application table typed-byte digest, financial preimage/aggregate and foreign-key state. The failure probe appends a late missing-table fault after the exact 0094 conversion and replacement fences; only the structured authenticated D1 import error with that exact fault plus unchanged 0093-fenced native state produces terminal backend rollback evidence. Its dedicated observer follows pinned Wrangler's same init/upload/ingest/poll protocol but does not claim a Wrangler CLI failure observation; the terminal receipt records a value-free Cloudflare R2 host class and presigned-URI digest. Successful 0094 uses the unchanged conversion SQL in one Wrangler --file import and verifies 0094-fenced conservation. These receipts grant no integration or production apply authority.",
+        reversal:
+          "No reset, delete or cents rollback is offered. An unknown ACK, partial schema, changed typed rows or foreign-key error quarantines the rehearsal D1 for separate forward repair.",
+        "failure-handling": `${highRiskFailure} No import is retried after no-overwrite dispatch. Status is GET/readback only and cannot infer a failed-probe acknowledgement from unchanged data alone. Source, target, review and transport mismatches refuse before a D1 write; post-import verification failures retain the D1 and custody for investigation.`,
+        "pre-mutation-proof":
+          "The terminal create receipt and native D1 identity select a generated rehearsal-only D1. First seed requires an empty application schema. Each later phase requires its predecessor terminal receipt, exact fenced schema and complete synthetic application-row digest, with zero pending financial work before the 0094 probe and conversion. The reviewed import bytes and target are rechecked immediately before dispatch.",
+        "independent-review": review,
+        "no-overwrite":
+          "Each phase writes one immutable protected dispatch binding before the single D1 import and one terminal receipt only after exact readback; a dispatched phase cannot be replayed, even when acknowledgement is unknown. The failure probe's authenticated structured import observer and the other phases' Wrangler --file transport are identified separately in the binding.",
+      },
+    },
+    {
       surface: "takoserver-rehearsal-d1-create",
       target: "cloudflare-d1:one-explicit-new-rehearsal-database",
       covers: [
