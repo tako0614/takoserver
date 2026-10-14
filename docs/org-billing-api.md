@@ -43,7 +43,7 @@ neither read access nor funding, owner administration, or another write scope.
 | `POST /wallet/holds` | `wallet:write` | Durable admission receipt; final integer `amountMinor`, original tariff revision and measurement fingerprint |
 | `GET /wallet/holds/{reference}` | `wallet:read` | Original amount, deadline and terminal receipt |
 | `POST /wallet/holds/{reference}/capture` | `wallet:write` | Final cents, full `actualMicros` and immutable measurement fingerprint; capture and remainder release commit together |
-| `POST /wallet/holds/{reference}/release` | `wallet:write` | Empty request body; terminal receipt or durable cancellation tombstone |
+| `POST /wallet/holds/{reference}/release` | `wallet:write` | No request body (absent or zero bytes; any byte is 400); terminal receipt or durable cancellation tombstone |
 | `POST /wallet/usage-records` | `usage:write` | Closed measurement and its pinned price; `pending` if available prepaid credit cannot pay |
 | `GET /wallet/usage-records` | `usage:read` | Stable descending cursor pages, at most 100 receipts per page |
 

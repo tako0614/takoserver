@@ -677,7 +677,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
         const organizationId = segment(release[1]);
         await scoped(request, organizationId, "wallet:write");
         const reference = billingPathReference(release[2]);
-        if (request.body !== null) controlError("invalid_argument", 400);
+        await emptyBody(request);
         return Response.json({ hold: await options.billing.release(organizationId, reference) });
       }
 
@@ -1671,7 +1671,31 @@ async function rawBody(request: Request, limit: number): Promise<Uint8Array> {
   if (declared !== null && (!/^[0-9]{1,12}$/u.test(declared) || Number(declared) > limit)) {
     throw new PaymentEventError("payload_too_large");
   }
-  if (!request.body) controlError("invalid_argument", 400);
+  const bytes = await boundedBody(request, limit);
+  if (bytes === null) throw new PaymentEventError("payload_too_large");
+  if (bytes.byteLength === 0) controlError("invalid_argument", 400);
+  return bytes;
+}
+
+/**
+ * A route whose contract is "no request body" accepts zero bytes however they
+ * arrive and refuses the first byte of anything else without reading on.
+ */
+async function emptyBody(request: Request): Promise<void> {
+  const declared = request.headers.get("content-length");
+  if (declared !== null && declared !== "0") controlError("invalid_argument", 400);
+  if ((await boundedBody(request, 0)) === null) controlError("invalid_argument", 400);
+}
+
+/**
+ * The request bytes, or `null` as soon as they would pass `limit`; the rest is
+ * cancelled, never buffered. An absent body and an empty stream are the same
+ * zero bytes: Bun presents a bodiless POST as `null`, but workerd presents it
+ * as a stream that ends at once, so `request.body !== null` never means "has
+ * a body" on a Worker.
+ */
+async function boundedBody(request: Request, limit: number): Promise<Uint8Array | null> {
+  if (request.body === null) return new Uint8Array(0);
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -1681,7 +1705,7 @@ async function rawBody(request: Request, limit: number): Promise<Uint8Array> {
       if (part.done) break;
       if (!(part.value instanceof Uint8Array) || part.value.byteLength > limit - total) {
         await reader.cancel().catch(() => undefined);
-        throw new PaymentEventError("payload_too_large");
+        return null;
       }
       chunks.push(part.value);
       total += part.value.byteLength;
@@ -1689,7 +1713,6 @@ async function rawBody(request: Request, limit: number): Promise<Uint8Array> {
   } finally {
     reader.releaseLock();
   }
-  if (total === 0) controlError("invalid_argument", 400);
   const bytes = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) {

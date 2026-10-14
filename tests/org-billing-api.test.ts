@@ -56,7 +56,7 @@ function fixture() {
     async release(organizationId: string, reference: string) {
       seen.push(`release:${organizationId}:${reference}`);
       if (nextError) throw nextError;
-      return {};
+      return { status: "released" };
     },
     async usage(input: { reference: string; quantity: string; quantityUnit: string }) {
       seen.push(`usage:${input.reference}:${input.quantityUnit}:${input.quantity}`);
@@ -229,6 +229,85 @@ test("zero-cost capture is accepted and returns the service's closed receipt", a
   expect(response.status).toBe(200);
   expect(await response.json()).toMatchObject({ hold: { status: "released" } });
   expect(seen).toEqual(["capture:run:zero:0:0"]);
+});
+
+test("hold release accepts an empty body whether the runtime presents it as null or as a stream", async () => {
+  const { request, seen } = fixture();
+  // Bun presents a bodiless POST as `body === null`; workerd presents every
+  // POST, bodiless or not, as a stream. All of these are the documented
+  // "no request body" and must release.
+  const bodies: Record<string, () => RequestInit> = {
+    absent: () => ({ method: "POST" }),
+    "empty string": () => ({ method: "POST", body: "" }),
+    "empty stream": () => ({
+      method: "POST",
+      body: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.close();
+        },
+      }),
+    }),
+    "empty chunk then end": () => ({
+      method: "POST",
+      body: new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new Uint8Array(0));
+          controller.close();
+        },
+      }),
+    }),
+    "declared zero": () => ({ method: "POST", headers: { "content-length": "0" }, body: "" }),
+  };
+  for (const [name, init] of Object.entries(bodies)) {
+    const response = await request(
+      `/v1/organizations/${ORG}/wallet/holds/run:${name.replaceAll(" ", "-")}/release`,
+      "writer",
+      init(),
+    );
+    expect({ name, status: response.status }).toEqual({ name, status: 200 });
+    expect(await response.json()).toEqual({ hold: { status: "released" } });
+  }
+  expect(seen).toEqual(
+    Object.keys(bodies).map((name) => `release:${ORG}:run:${name.replaceAll(" ", "-")}`),
+  );
+});
+
+test("hold release refuses any request byte before releasing and never buffers a long body", async () => {
+  const { request, seen } = fixture();
+  const json = await request(`/v1/organizations/${ORG}/wallet/holds/run:json/release`, "writer", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{}",
+  });
+  expect(json.status).toBe(400);
+  expect(((await json.json()) as { error: { code: string } }).error.code).toBe("invalid_argument");
+  const declared = await request(
+    `/v1/organizations/${ORG}/wallet/holds/run:declared/release`,
+    "writer",
+    { method: "POST", headers: { "content-length": "1" }, body: "x" },
+  );
+  expect(declared.status).toBe(400);
+
+  // 4 MiB with no declared length: the route must stop at the first byte.
+  let pulls = 0;
+  let cancelled = false;
+  const long = await request(`/v1/organizations/${ORG}/wallet/holds/run:long/release`, "writer", {
+    method: "POST",
+    body: new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulls += 1;
+        if (pulls > 64) controller.close();
+        else controller.enqueue(new Uint8Array(64 * 1_024));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    }),
+  });
+  expect(long.status).toBe(400);
+  expect(cancelled).toBe(true);
+  expect(pulls).toBeLessThanOrEqual(2);
+  expect(seen).toEqual([]);
 });
 
 test("usage quantity is passed as canonical decimal text and API scope schemas are published", async () => {
