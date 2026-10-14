@@ -227,6 +227,7 @@ export function deploymentVariables(
     vars.TAKOS_ID_CLIENT_ID = target.takosId.clientId;
   }
   if (target.stripeCheckout === true) vars.TAKOSERVER_STRIPE_CHECKOUT_ENABLED = "1";
+  if (target.stripeMode !== undefined) vars.TAKOSERVER_STRIPE_MODE = target.stripeMode;
   if (target.stripeWebhook === true) vars.TAKOSERVER_STRIPE_WEBHOOK_ENABLED = "1";
   if (target.billingConfig !== undefined) {
     vars.TAKOSERVER_BILLING_CONFIG = JSON.stringify(target.billingConfig);

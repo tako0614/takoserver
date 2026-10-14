@@ -105,6 +105,35 @@ describe("realized Worker configuration", () => {
     }
   });
 
+  test("pre-0098 Host maintenance realizes only its mode over the exact applied-0092 v2 config", () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-config-v2-0098-maintenance-"));
+    try {
+      const config =
+        '{"documentation":"https://docs.example.test/v2","authenticationDocumentation":"https://docs.example.test/v2/authentication"}';
+      const selected = {
+        ...target,
+        environment: "integration" as const,
+        takoformV2: {
+          config,
+          storageLineage: "v2-0088" as const,
+          appliedSchemaLineage: "v2-0092" as const,
+        },
+        schemaMaintenanceMode: "pre-v2-0098-quiesced" as const,
+      } satisfies DeployTarget;
+      const path = writeWorkerConfig(selected, {
+        path: join(root, "wrangler.jsonc"),
+        main: "worker.js",
+        commit: "a".repeat(40),
+      });
+      const actual = JSON.parse(readFileSync(path, "utf8")) as { vars: Record<string, string> };
+      expect(actual.vars.TAKOSERVER_SCHEMA_MAINTENANCE_MODE).toBe("pre-v2-0098-quiesced");
+      expect(actual.vars.TAKOSERVER_TAKOFORM_V2_CONFIG).toBe(config);
+      expect(actual.vars.TAKOSERVER_ARTIFACT_BLOB_IO_MODE).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("omits only the executor service while retaining the maintenance target inputs", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-config-artifact-quiescence-executor-"));
     const cloudflareProviderExecutor = cloudflareProviderExecutorTarget();

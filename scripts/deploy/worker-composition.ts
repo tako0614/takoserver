@@ -50,7 +50,11 @@ export function workerCompositionEnv(target: DeployTarget): WorkerProductionComp
     const value = vars[name];
     if (value !== undefined) env[name] = value;
   }
-  if (target.cloudflareProviderExecutor !== undefined && !isArtifactBlobIoQuiescedTarget(target)) {
+  if (
+    target.cloudflareProviderExecutor !== undefined &&
+    !isArtifactBlobIoQuiescedTarget(target) &&
+    target.schemaMaintenanceMode !== "pre-v2-0098-quiesced"
+  ) {
     // Composition never invokes the binding. Its exact presence is the
     // credential-free capability fact the runtime requires before it exposes
     // any Cloudflare recovery/provider surface.
@@ -74,6 +78,17 @@ export async function assertTargetComposes(
 ): Promise<void> {
   if (isArtifactBlobIoQuiescedTarget(target)) return;
   const env = workerCompositionEnv(target);
+  if (target.schemaMaintenanceMode === "pre-v2-0098-quiesced") {
+    // Every request exits before application composition while the selected D1
+    // retains the old 0092 shape. Still bind the exact selected startup bytes.
+    if (
+      (env as WorkerProductionCompositionEnv & { readonly TAKOSERVER_TAKOFORM_V2_CONFIG?: string })
+        .TAKOSERVER_TAKOFORM_V2_CONFIG !== target.takoformV2?.config
+    ) {
+      throw phaseError(phase, "realized v2 startup configuration differs from the selected target");
+    }
+    return;
+  }
   const current = currentTakoformCandidates();
   const retained = await buildEdgeForms();
   try {

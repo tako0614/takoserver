@@ -362,6 +362,42 @@ describe("environment-exact deploy target", () => {
       appliedSchemaLineage: "v2-0092",
     });
     expect(takoformV2StorageLineage(chosen)).toBe("v2-0088");
+    const quiesced = parseDeployTarget(
+      descriptor({
+        environment: "integration",
+        takoformV2: { config, storageLineage: "v2-0088", appliedSchemaLineage: "v2-0092" },
+        schemaMaintenanceMode: "pre-v2-0098-quiesced",
+      }),
+      "pre-0098 maintenance target",
+      "integration",
+    );
+    expect(quiesced.schemaMaintenanceMode).toBe("pre-v2-0098-quiesced");
+    expect(quiesced.takoformV2).toEqual(chosen.takoformV2);
+    for (const invalid of [
+      { environment: "production" },
+      { environment: "rehearsal" },
+      { takoformV2: { config, storageLineage: "v2-0088" } },
+      { takoformV2: { config, storageLineage: "v2-0092" } },
+      { takoformV2: { config, storageLineage: "v2-0088", appliedSchemaLineage: "v2-0091" } },
+      { artifactBlobIoMode: "pre-0043-quiesced" },
+    ]) {
+      const environment =
+        "environment" in invalid
+          ? (invalid.environment as "integration" | "rehearsal" | "production")
+          : "integration";
+      expect(() =>
+        parseDeployTarget(
+          descriptor({
+            environment,
+            takoformV2: quiesced.takoformV2,
+            schemaMaintenanceMode: "pre-v2-0098-quiesced",
+            ...invalid,
+          }),
+          "invalid pre-0098 maintenance target",
+          environment,
+        ),
+      ).toThrow();
+    }
     for (const storageLineage of [undefined, "v2-0089", "v2-0091"]) {
       expect(() =>
         parseDeployTarget(

@@ -79,7 +79,8 @@ export interface DeployTarget {
   readonly schemaMaintenanceMode?:
     | "pre-0058-quiesced"
     | "pre-v2-0088-quiesced"
-    | "pre-wallet-usd-micros-quiesced";
+    | "pre-wallet-usd-micros-quiesced"
+    | "pre-v2-0098-quiesced";
   /** Explicit selected-Host D1 transaction containment, retained after resume. */
   readonly moneyCutoverWriterPolicy?: "transaction-fenced-usd-micros-v1";
   /** Reviewed nonsecret Writer generation; new source generations require a separate rotation. */
@@ -117,6 +118,8 @@ export interface DeployTarget {
   readonly takosId?: { readonly issuer: string; readonly clientId: string };
   /** Requires the deployed Worker to offer customer Stripe Checkout funding. */
   readonly stripeCheckout?: boolean;
+  /** Explicit single Stripe financial realm; absent means TEST. */
+  readonly stripeMode?: "test" | "live";
   /**
    * Requires the deployed Worker to receive Stripe webhooks, and the Worker to
    * hold a `STRIPE_WEBHOOK_SECRET`. Only with `stripeCheckout`.
@@ -362,6 +365,7 @@ const DEPLOY_TARGET_OPTIONAL_KEYS: readonly string[] = [
   "googleClientId",
   "takosId",
   "stripeCheckout",
+  "stripeMode",
   "stripeWebhook",
   "stripeSettings",
   "billingConfig",
@@ -556,6 +560,7 @@ export function parseDeployTarget(
     ...(value.stripeCheckout === undefined
       ? {}
       : { stripeCheckout: boolean(value.stripeCheckout, "stripeCheckout") }),
+    ...(value.stripeMode === undefined ? {} : { stripeMode: deployStripeMode(value.stripeMode) }),
     ...(value.stripeWebhook === undefined
       ? {}
       : { stripeWebhook: boolean(value.stripeWebhook, "stripeWebhook") }),
@@ -649,6 +654,9 @@ export function parseDeployTarget(
   ) {
     throw preflightError("wallet USD-micros maintenance requires transaction writer policy");
   }
+  if (target.schemaMaintenanceMode === "pre-v2-0098-quiesced" && environment !== "integration") {
+    throw preflightError("v2 0098 schema maintenance is integration-only");
+  }
   if (target.schemaMaintenanceMode === "pre-v2-0088-quiesced" && target.takoformV2 === undefined) {
     throw preflightError("v2 0088 schema maintenance must retain the exact v2 Worker config");
   }
@@ -676,13 +684,23 @@ export function parseDeployTarget(
     if (
       target.takoformV2.storageLineage !== "v2-0088" ||
       (target.schemaMaintenanceMode !== undefined &&
-        target.schemaMaintenanceMode !== "pre-wallet-usd-micros-quiesced") ||
+        target.schemaMaintenanceMode !== "pre-wallet-usd-micros-quiesced" &&
+        target.schemaMaintenanceMode !== "pre-v2-0098-quiesced") ||
       target.artifactBlobIoMode !== undefined
     ) {
       throw preflightError(
         "applied v2-0092 requires the original fresh v2-0088 integration target without maintenance selectors",
       );
     }
+  }
+  if (
+    target.schemaMaintenanceMode === "pre-v2-0098-quiesced" &&
+    (target.takoformV2?.storageLineage !== "v2-0088" ||
+      target.takoformV2.appliedSchemaLineage !== "v2-0092")
+  ) {
+    throw preflightError(
+      "v2 0098 maintenance requires the exact original v2-0088 integration target with applied v2-0092",
+    );
   }
   const cloudflareSupplies = [
     ...(target.objectBucketSupplies?.supplies.filter(
@@ -1394,6 +1412,13 @@ function hostnames(value: unknown): readonly string[] {
   });
 }
 
+function deployStripeMode(value: unknown): "test" | "live" {
+  if (value !== "test" && value !== "live") {
+    throw preflightError("deploy target `stripeMode` must be exactly test or live");
+  }
+  return value;
+}
+
 /** Zones, checked only for the shape the provider will read. */
 function zoneList(value: unknown): readonly Record<string, unknown>[] {
   if (!Array.isArray(value)) throw preflightError("deploy target `zones` must be an array");
@@ -1592,16 +1617,14 @@ function moneyCutoverWriterEpoch(value: unknown): string {
 }
 
 function schemaMaintenanceMode(value: unknown): {
-  readonly schemaMaintenanceMode?:
-    | "pre-0058-quiesced"
-    | "pre-v2-0088-quiesced"
-    | "pre-wallet-usd-micros-quiesced";
+  readonly schemaMaintenanceMode?: NonNullable<DeployTarget["schemaMaintenanceMode"]>;
 } {
   if (value === undefined) return {};
   if (
     value !== "pre-0058-quiesced" &&
     value !== "pre-v2-0088-quiesced" &&
-    value !== "pre-wallet-usd-micros-quiesced"
+    value !== "pre-wallet-usd-micros-quiesced" &&
+    value !== "pre-v2-0098-quiesced"
   ) {
     throw preflightError(
       "deploy target `schemaMaintenanceMode` is not a supported maintenance profile",

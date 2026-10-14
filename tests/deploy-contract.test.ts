@@ -94,6 +94,25 @@ const SURFACES = [
 ] as const;
 
 describe("Takoserver split deploy entrypoint", () => {
+  test("pre-0098 Host publication belongs to the reviewed authority surface, not routine apply", () => {
+    const routine = DEPLOY_CONTRACT.surfaces.find((entry) => entry.surface === "takoserver-worker");
+    const authority = DEPLOY_CONTRACT.surfaces.find(
+      (entry) => entry.surface === "takoserver-worker-authority-cutover",
+    );
+    expect(routine?.triggers).toEqual([]);
+    expect(routine?.obligations["failure-handling"]).toContain(
+      "An exact pre-v2-0098 apply on this routine surface is refused",
+    );
+    expect(authority?.triggers).toContain("authority");
+    expect(authority?.requiresEnv).toContain("TAKOSERVER_INDEPENDENT_REVIEW");
+    expect(authority?.obligations["post-conditions"]).toContain(
+      "non-serving reviewed Version via topology-neutral versions upload",
+    );
+    expect(authority?.obligations["failure-handling"]).toContain(
+      "Pre-v2-0098 authority publication requires the existing independent reviewer",
+    );
+  });
+
   test("money rehearsal contract names the post-resume guard probes and Worker batch limit", () => {
     for (const surface of [
       "takoserver-integration-money-shadow-rehearsal",

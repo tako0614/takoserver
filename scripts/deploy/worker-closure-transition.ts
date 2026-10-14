@@ -44,8 +44,12 @@ import {
   probeSchemaMaintenance,
   providerExecutorAllowsPublication,
   providerExecutorQualificationReader,
+  readStripeModeRealmProof,
+  remoteStripeModeRealmReader,
+  sameStripeModeRealm,
   type WorkerMigrationReader,
   type WorkerProviderExecutorQualification,
+  type WorkerStripeModeRealmReader,
   withProviderExecutorQualification,
   workerMoneyUnitSchemaReady,
   workerSchemaAllowsPending,
@@ -111,6 +115,8 @@ export interface WorkerClosureTransitionOptions {
   readonly run?: ClosureTransitionProcess;
   readonly state?: WorkerState;
   readonly migrations?: WorkerMigrationReader;
+  /** Read-only selected-D1 realm proof; injectable only for portable tests. */
+  readonly stripeModeRealm?: WorkerStripeModeRealmReader;
   readonly outputDirectory?: string;
   /** Checkout whose source and migration bytes define the publication. */
   readonly sourceRepositoryRoot?: string;
@@ -162,6 +168,11 @@ export async function runWorkerClosureTransition(
 ): Promise<Record<string, unknown>> {
   if (target.environment !== invocation.environment) {
     throw preflightError("Worker invocation and target environments differ");
+  }
+  if (target.schemaMaintenanceMode === "pre-v2-0098-quiesced") {
+    throw preflightError(
+      "pre-0098 Host maintenance publication and GET-only recovery belong only to takoserver-worker",
+    );
   }
   if (target.artifactBlobIoMode !== undefined && target.schemaMaintenanceMode !== undefined) {
     throw preflightError("Worker maintenance selectors conflict");
@@ -302,19 +313,42 @@ export async function runWorkerClosureTransition(
         sourceRepositoryRoot,
         options.wranglerPath,
       );
+    const servingTarget = closureRequiresMoneyUnitSchema(target);
+    const stripeModeRealmReader = servingTarget
+      ? (options.stripeModeRealm ??
+        remoteStripeModeRealmReader(inspectionConfig, environment, run, options.wranglerPath))
+      : undefined;
+    const selectedStripeMode = target.stripeMode ?? "test";
+    const stripeModeRealmBefore =
+      stripeModeRealmReader === undefined
+        ? null
+        : await readStripeModeRealmProof(stripeModeRealmReader, selectedStripeMode);
+    if (invocation.action === "apply" && stripeModeRealmBefore?.ready === false) {
+      throw preflightError(
+        "serving Worker closure transition requires the selected D1 immutable Stripe mode realm pin",
+        stripeModeRealmBefore.reason ?? "realm proof unavailable",
+      );
+    }
     const history = await currentHistory("preflight", target, state);
     const selector = invocation.closurePredecessorVersionId;
 
     if (invocation.action === "status" && history.versionId !== selector) {
+      const applied = await appliedClosureTransitionStatus(
+        invocation,
+        target,
+        state,
+        migrations,
+        history,
+        sourceRepositoryRoot,
+      );
       return withProviderExecutorQualification(
-        await appliedClosureTransitionStatus(
-          invocation,
-          target,
-          state,
-          migrations,
-          history,
-          sourceRepositoryRoot,
-        ),
+        {
+          ...applied,
+          ...(stripeModeRealmBefore === null ? {} : { stripeModeRealm: stripeModeRealmBefore }),
+          ready:
+            applied.ready === true &&
+            (stripeModeRealmBefore === null || stripeModeRealmBefore.ready),
+        },
         providerExecutorBefore,
       );
     }
@@ -361,6 +395,7 @@ export async function runWorkerClosureTransition(
           secretInputsRequired: [...delta.addedSecrets, ...delta.rotatedSecrets].sort(),
           appliedMigrations: migrationState.applied,
           pendingMigrations: pending,
+          ...(stripeModeRealmBefore === null ? {} : { stripeModeRealm: stripeModeRealmBefore }),
           ...(target.schemaMaintenanceMode === undefined
             ? {}
             : { maintenance: target.schemaMaintenanceMode }),
@@ -370,7 +405,8 @@ export async function runWorkerClosureTransition(
             workerSchemaAllowsPending(target, migrationState, sourceRepositoryRoot) &&
             (!closureRequiresMoneyUnitSchema(target) ||
               workerMoneyUnitSchemaReady(migrationState, sourceRepositoryRoot)) &&
-            (providerExecutorBefore === null || providerExecutorBefore.ready),
+            (providerExecutorBefore === null || providerExecutorBefore.ready) &&
+            (stripeModeRealmBefore === null || stripeModeRealmBefore.ready),
         },
         providerExecutorBefore,
       );
@@ -577,6 +613,12 @@ export async function runWorkerClosureTransition(
         },
       );
       assertIntegrationStorageProofUnchanged(initialStorageProof, finalStorageProof);
+    }
+    if (stripeModeRealmReader !== undefined && stripeModeRealmBefore !== null) {
+      const current = await readStripeModeRealmProof(stripeModeRealmReader, selectedStripeMode);
+      if (!current.ready || !sameStripeModeRealm(stripeModeRealmBefore, current)) {
+        throw preflightError("selected D1 Stripe mode realm proof changed before closure upload");
+      }
     }
     const message = `takoserver-worker:${source.commit}:${prepared.bundleDigestHex}`;
     const upload = await run(
@@ -793,7 +835,11 @@ async function appliedClosureTransitionStatus(
     target.schemaMaintenanceMode !== undefined &&
     !workerSchemaAllowsPending(target, migrationState, sourceRepositoryRoot)
   ) {
-    throw preflightError("0058 Worker maintenance requires exact applied 0057 and 0058 next");
+    throw preflightError(
+      target.schemaMaintenanceMode === "pre-v2-0098-quiesced"
+        ? "Worker maintenance requires its exact audited predecessor schema"
+        : "0058 Worker maintenance requires exact applied 0057 and 0058 next",
+    );
   }
   return {
     kind: "takoserver.worker-closure-transition-status@v1",

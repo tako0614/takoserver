@@ -600,6 +600,46 @@ describe("Worker startup diagnostics", () => {
     expect(lifetimes).toBe(0);
   });
 
+  test("the pre-v2-0098 mode blocks every Host route and cron before storage, payment, and v2 composition", async () => {
+    const env = {
+      TAKOSERVER_SCHEMA_MAINTENANCE_MODE: "pre-v2-0098-quiesced",
+      get STATE_DB(): never {
+        throw new Error("maintenance read storage");
+      },
+      get PUBLIC_ORIGIN(): never {
+        throw new Error("maintenance read origin");
+      },
+      get TAKOSERVER_TAKOFORM_V2_CONFIG(): never {
+        throw new Error("maintenance read v2 config");
+      },
+      get STRIPE_SECRET_KEY(): never {
+        throw new Error("maintenance read payment credential");
+      },
+      get CLOUDFLARE_PROVIDER_EXECUTOR(): never {
+        throw new Error("maintenance read provider binding");
+      },
+    } as unknown as Parameters<typeof worker.fetch>[1];
+    for (const [method, path] of [
+      ["GET", "/healthz"],
+      ["GET", "/.well-known/takoserver"],
+      ["GET", "/openapi.json"],
+      ["POST", "/v1/operator/payments/reconcile"],
+      ["POST", "/v1/organizations/current/wallet/funding"],
+      ["PUT", "/v1/resources"],
+      ["DELETE", "/anything"],
+    ] as const) {
+      const response = await worker.fetch(new Request(`${ORIGIN}${path}`, { method }), env);
+      expect(response.status).toBe(503);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      expect(response.headers.get("retry-after")).toBe("60");
+      const body = await envelope(response);
+      expect(body.error.code).toBe("backend_unavailable");
+      expect(body.error.details?.reason).toBe("runtime-configuration");
+      expect(body.error.message).toContain("0098");
+    }
+    await expect(worker.scheduled({}, env)).resolves.toBeUndefined();
+  });
+
   test("invalid or conflicting maintenance selectors refuse before composition", async () => {
     for (const selected of ["", "pre-0058", "PRE-0058-QUIESCED", null, 7]) {
       const response = await worker.fetch(
