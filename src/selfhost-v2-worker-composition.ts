@@ -170,6 +170,8 @@ export interface SelfhostV2WorkerCompositionOptions {
    * other user can write it (or it is sticky).
    */
   readonly moduleInspectionRoot?: string;
+  /** Explicit Host-owned wall budget; omission preserves the inspector's two-second default. */
+  readonly moduleInspectionWallTimeoutMs?: number;
   readonly targetKey: string;
   /** Already selected and pinned by the normal Bun entry. */
   readonly workerdBinary: string | null;
@@ -526,6 +528,9 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   });
   const moduleInspector = createWorkerdWorkerModuleInspector({
     binary: options.workerdBinary,
+    ...(options.moduleInspectionWallTimeoutMs === undefined
+      ? {}
+      : { wallTimeoutMs: options.moduleInspectionWallTimeoutMs }),
     ...(options.moduleInspectionRoot === undefined
       ? {}
       : { temporaryRoot: options.moduleInspectionRoot }),

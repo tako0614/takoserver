@@ -207,6 +207,15 @@ The complete local Worker profile additionally needs all of these:
 `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING` is optional: with it, WorkerVersion
 accepts `privateInputs` (see the setup guide).
 
+The operator may also set `TAKOSERVER_V2_MODULE_INSPECTION_WALL_TIMEOUT_MS` to a
+canonical decimal integer from 25 to 30000. It bounds the complete lifetime of
+each fresh semantic-inspection child, including native startup and tenant module
+evaluation. Omission keeps the two-second default. A slow Linux host or QEMU TCG
+VM may need a larger budget even for a small valid module; select it as part of
+the Host's execution capacity policy. Tenant Resource specs cannot set it. A
+timeout still kills the child and leaves inspection unavailable, and invalid
+configuration refuses startup before control state opens.
+
 For example, prepare the private files once as the `takoserver` user. The last
 command prints a cursor key:
 

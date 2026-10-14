@@ -161,6 +161,10 @@ import { selectClosedGraphWorkerd } from "./workerd-artifact.ts";
 import { spawnWorkerdWithParentDeath, workerPortOwnership } from "./workerd-linux-process.ts";
 import { createWorkerdRuntime } from "./workerd-runtime.ts";
 import { createWorkerdSupervisor } from "./workerd-supervisor.ts";
+import {
+  parseSelfhostModuleInspectionWallTimeout,
+  SELFHOST_MODULE_INSPECTION_WALL_TIMEOUT_VARIABLE,
+} from "./workerd-worker-module-inspector.ts";
 
 /**
  * The self-hosted entry and its local or account-backed provisioners.
@@ -252,6 +256,9 @@ const hostedPricing = parseHostedPricing(process.env.TAKOSERVER_HOSTED_PRICING);
 if (hostedPricing) assertHostedPricingMatchesBilling(hostedPricing, billingConfig);
 const v2RuntimeSelection = parseSelfhostV2RuntimeBoot(
   process.env.TAKOSERVER_V2_WORKER_RUNTIME_BOOT,
+);
+const moduleInspectionWallTimeoutMs = parseSelfhostModuleInspectionWallTimeout(
+  process.env[SELFHOST_MODULE_INSPECTION_WALL_TIMEOUT_VARIABLE],
 );
 const publicOrigin = process.env.TAKOSERVER_PUBLIC_ORIGIN;
 if (!publicOrigin || !runtimeInputCanonicalOriginSupported(publicOrigin)) {
@@ -958,6 +965,7 @@ try {
     rootDirectory: join(durableRoot, "v2-worker-owners"),
     // Not below `v2-worker-owners`: boot refuses a namespace SQL cannot explain.
     moduleInspectionRoot: join(durableRoot, "selfhost", "module-inspection"),
+    ...(moduleInspectionWallTimeoutMs === undefined ? {} : { moduleInspectionWallTimeoutMs }),
     targetKey: v2WorkerTargetKey,
     workerdBinary,
     ...(v2RuntimeBoot?.v2Actor ? { v2Actor: v2RuntimeBoot.v2Actor } : {}),
