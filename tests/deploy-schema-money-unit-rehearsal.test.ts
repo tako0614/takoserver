@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   canonicalSchemaShape,
@@ -110,7 +111,7 @@ function localSql(database: Database): Sql {
 
 describe("money-unit native rehearsal source", () => {
   test("protected shadow snapshot restores every 0093 row byte and rejects same-schema value drift", async () => {
-    const root = mkdtempSync("/dev/shm/t/money-shadow-snapshot-test-");
+    const root = mkdtempSync(join(tmpdir(), "money-shadow-snapshot-test-"));
     try {
       const plan = await buildMoneyRehearsalSyntheticPlan(files, declaration(root));
       const full = `${plan.sql.seed}\n${(["freeze", "prepare", "classify"] as const)
@@ -135,7 +136,7 @@ describe("money-unit native rehearsal source", () => {
     }
   });
   test("sealed synthetic 94 failure after reinstall rolls back to complete 93 fenced state", async () => {
-    const root = mkdtempSync("/dev/shm/t/money-rehearsal-test-");
+    const root = mkdtempSync(join(tmpdir(), "money-rehearsal-test-"));
     const database = new Database(":memory:");
     try {
       const plan = await buildMoneyRehearsalSyntheticPlan(files, declaration(root));
@@ -171,7 +172,7 @@ describe("money-unit native rehearsal source", () => {
   }, 20_000);
 
   test("false resume CHECK rolls back prior mutation; permanent guard admits only pinned batch permits", async () => {
-    const root = mkdtempSync("/dev/shm/t/money-rehearsal-epoch-");
+    const root = mkdtempSync(join(tmpdir(), "money-rehearsal-epoch-"));
     const database = new Database(":memory:");
     try {
       const plan = await buildMoneyRehearsalSyntheticPlan(files, declaration(root));
@@ -271,7 +272,7 @@ describe("money-unit native rehearsal source", () => {
   }, 20_000);
 
   test("production invocation and forged creation evidence refuse before provider read", async () => {
-    const root = mkdtempSync("/dev/shm/t/money-rehearsal-trap-");
+    const root = mkdtempSync(join(tmpdir(), "money-rehearsal-trap-"));
     const custody = join(root, "custody");
     mkdirSync(custody, { mode: 0o700 });
     const selected = declaration(root);
@@ -311,7 +312,7 @@ describe("money-unit native rehearsal source", () => {
   });
 
   test("a retained dispatch blocks apply before any Wrangler import or qualification", async () => {
-    const root = mkdtempSync("/dev/shm/t/money-rehearsal-dispatched-");
+    const root = mkdtempSync(join(tmpdir(), "money-rehearsal-dispatched-"));
     mkdirSync(join(root, "custody"), { mode: 0o700 });
     try {
       const base = declaration(root);
@@ -447,7 +448,7 @@ describe("money-unit native rehearsal source", () => {
     expect(installed.wranglerModuleDigest).toBe(
       sha(readFileSync(join(import.meta.dir, "../node_modules/wrangler/wrangler-dist/cli.js"))),
     );
-    const root = mkdtempSync("/dev/shm/t/money-rehearsal-wrangler-");
+    const root = mkdtempSync(join(tmpdir(), "money-rehearsal-wrangler-"));
     try {
       mkdirSync(join(root, "bin"));
       mkdirSync(join(root, "wrangler-dist"));
