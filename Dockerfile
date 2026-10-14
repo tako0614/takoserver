@@ -13,7 +13,7 @@ COPY scripts/operator-key.ts ./scripts/operator-key.ts
 COPY scripts/selfhost-artifact.ts ./scripts/selfhost-artifact.ts
 
 RUN mkdir -p /var/lib/takoserver \
-    && chmod -R a+rX /opt/takoserver \
+    && chmod -R u=rwX,go=rX /opt/takoserver \
     && chown bun:bun /var/lib/takoserver \
     && chmod 0700 /var/lib/takoserver
 ENV TAKOSERVER_DATA_ROOT=/var/lib/takoserver \
