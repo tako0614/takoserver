@@ -1,7 +1,25 @@
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  copyFileSync,
+  existsSync,
+  fchmodSync,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import {
   applicationSchemaMatches,
   canonicalApplicationShape,
@@ -130,6 +148,76 @@ export interface ProductionD1Identity {
  */
 const PRODUCTION_D1_NAME = /^takoserver-(?:runtime(?:$|-)|p-)/u;
 const GENERATED_D1_NAME = /^takoserver-i-[0-9a-f]{32}$/u;
+const PREFIXED_D1_NAME = /^integration-ts-([0-9a-f]{32})$/u;
+
+/** Explicit new-generation selector; omitted always retains the historical namespace. */
+export type IntegrationStorageGenerationNamespace = "integration-ts";
+
+/** A formatter, not creation or storage authority. No arbitrary prefix is accepted. */
+export function integrationStorageGenerationName(
+  generation: string,
+  namespace?: IntegrationStorageGenerationNamespace,
+): string {
+  if (
+    typeof generation !== "string" ||
+    !GENERATION.test(generation) ||
+    (namespace !== undefined && namespace !== "integration-ts")
+  ) {
+    throw preflightError(
+      "integration generation requires one closed namespace and 32 lowercase hex",
+    );
+  }
+  return namespace === "integration-ts"
+    ? `integration-ts-${generation}`
+    : `takoserver-i-${generation}`;
+}
+
+export interface IntegrationStorageOriginalCreateOptions {
+  readonly kind: "positive-fresh-0092";
+  /** Existing, owned 0700 directory outside every checkout. Never replace or rotate it to retry. */
+  readonly custodyDirectory: string;
+  /** Pin at operator provisioning, retain unchanged on reopen; never infer a new pin on load. */
+  readonly custodyIdentity: { readonly device: string; readonly inode: string };
+}
+
+/**
+ * Original-operation evidence, not a money origin certificate or runtime readiness.
+ * Even provider-native evidence requires independent review of original protected custody.
+ * A composing command/redaction port is source-owned execution, not authority to supply rows,
+ * identities or post-fact certificates. All explicit read/provider/source test seams issue only
+ * the distinct component-simulation result below; neither form is accepted by the money owner yet.
+ */
+export interface IntegrationStorageOriginalCreateEvidence {
+  readonly kind:
+    | "takoserver.integration-fresh-0092-original-create@v1"
+    | "takoserver.integration-fresh-0092-component-result@v1";
+  readonly authority: "provider-native" | "component-simulation";
+  readonly qualification: "independent-origin-review-required" | "component-simulation-only";
+  readonly commandPort: "owner-default" | "composing-source-owned";
+  readonly namespace: "integration-ts";
+  readonly generation: string;
+  readonly accountId: string;
+  readonly databaseName: string;
+  readonly databaseId: string;
+  readonly bucketName: string;
+  readonly sourceCommit: string;
+  readonly migrationDigest: string;
+  readonly migrationImportDigest: string;
+  readonly schemaShapeDigest: string;
+  readonly createDispatchDigest: string;
+  readonly identifiedDigest: string;
+  readonly importDispatchDigest: string;
+  readonly r2DispatchDigest: string;
+  readonly originalBindingDigest: string;
+  readonly d1IdentityReadbackDigest: string;
+  readonly r2IdentityReadbackDigest: string;
+  readonly freshDataPolicyDigest: string;
+}
+
+export interface IntegrationStorageOriginalCreateReceipt
+  extends IntegrationStorageOriginalCreateEvidence {
+  readonly terminalCustodyDigest: string;
+}
 
 /**
  * An operator-provisioned staging pair: one D1 and one R2 bucket sharing the
@@ -184,6 +272,7 @@ export interface IntegrationStorageGenerationInvocation {
   readonly environment: DeployEnvironment;
   readonly commit: string;
   readonly generation: string;
+  readonly namespace?: IntegrationStorageGenerationNamespace;
   /** Exact fresh-only payload; omitted means the historical 0066 payload. */
   readonly freshLineage?: IntegrationFreshLineage;
 }
@@ -257,10 +346,13 @@ export interface IntegrationStorageGenerationOptions {
    * Optional in general, required to apply a staging-only profile (`v2-0091`, `v2-0092`).
    */
   readonly productionD1?: ProductionD1Identity;
+  /** Dedicated new integration-ts/fresh92 path, mutually exclusive with productionD1. */
+  readonly originalCreate?: IntegrationStorageOriginalCreateOptions;
 }
 
 export interface IntegrationStorageGenerationTargetProof {
   readonly generation: string;
+  readonly namespace?: IntegrationStorageGenerationNamespace;
   readonly d1: { readonly databaseId: string; readonly databaseName: string };
   readonly r2: { readonly bucketName: string };
   readonly migrationDigest: string;
@@ -331,8 +423,13 @@ export async function runIntegrationStorageGeneration(
   options: IntegrationStorageGenerationOptions = {},
 ): Promise<Record<string, unknown>> {
   const names = validateInvocation(invocation, target);
-  assertStagingD1NotProduction({ databaseName: names.databaseName }, options.productionD1);
+  // Capture caller-owned fields before any await. The new selector never relaxes a legacy guard.
+  const original = prepareOriginalCreate(invocation, target, names, options);
+  if (original === null) {
+    assertStagingD1NotProduction({ databaseName: names.databaseName }, options.productionD1);
+  }
   if (
+    original === null &&
     invocation.action === "apply" &&
     invocation.freshLineage !== undefined &&
     STAGING_ONLY_LINEAGES.has(invocation.freshLineage) &&
@@ -345,9 +442,10 @@ export async function runIntegrationStorageGeneration(
   }
   if (invocation.action === "status") {
     const provider = await resolveProvider(target, options);
-    return await statusStorageGeneration(invocation, target, names, provider, options);
+    original?.assertUnchanged();
+    return await statusStorageGeneration(invocation, target, names, provider, options, original);
   }
-  return await applyStorageGeneration(invocation, target, names, options);
+  return await applyStorageGeneration(invocation, target, names, options, original);
 }
 
 /**
@@ -607,6 +705,7 @@ async function verifyGeneratedStorageTarget(
     );
     return {
       generation: generated.generation,
+      ...(generated.namespace === undefined ? {} : { namespace: generated.namespace }),
       d1: { databaseId: generated.databaseId, databaseName: generated.databaseName },
       r2: { bucketName: generated.bucketName },
       migrationDigest: observedSource.digest,
@@ -618,6 +717,670 @@ async function verifyGeneratedStorageTarget(
   }
 }
 
+// This is the existing creator's original-operation custody, not a generic deploy controller.
+const ORIGINAL_STAGES = [
+  "create-dispatched",
+  "identified",
+  "import-dispatched",
+  "r2-dispatched",
+  "terminal",
+] as const;
+type OriginalCreateStage = (typeof ORIGINAL_STAGES)[number];
+const ORIGINAL_RECORD_LIMIT = 32 * 1024;
+const ORIGINAL_IMPORT_LIMIT = 16 * 1024 * 1024;
+const ORIGINAL_SOURCE_0092 =
+  "sha256:6f7c1016b7ffeeb7c02006cdb8e55dc7919bfc2aeaf04c090001dcf423454be2";
+
+interface OriginalCreateBinding {
+  readonly kind: "takoserver.integration-fresh-0092-create-binding@v1";
+  readonly environment: "integration";
+  readonly namespace: "integration-ts";
+  readonly accountId: string;
+  readonly generation: string;
+  readonly databaseName: string;
+  readonly bucketName: string;
+  readonly selectedTargetDigest: string;
+  readonly custodyRootIdentityDigest: string;
+  readonly sourceCommit: string;
+  readonly migrationDigest: string;
+  readonly migrationBytes: number;
+  readonly importDigest: string;
+  readonly importBytes: number;
+  readonly applicationShapeDigest: string;
+  readonly reviewer: string;
+  readonly authority: "provider-native" | "component-simulation";
+  readonly commandPort: "owner-default" | "composing-source-owned";
+}
+
+interface OriginalCreateRecord {
+  readonly kind: "takoserver.integration-fresh-0092-create-custody@v1";
+  readonly stage: OriginalCreateStage | "unknown";
+  readonly binding: OriginalCreateBinding;
+  readonly previousDigest: string | null;
+  readonly evidence: Readonly<Record<string, unknown>>;
+  readonly digest: string;
+}
+
+interface OriginalCreateContext {
+  readonly artifactRoot: string;
+  assertUnchanged(): void;
+  assertUnused(): void;
+  binding(
+    source: ReturnType<typeof selectedSourceArtifact>,
+    migrationImport: ReturnType<typeof buildD1MigrationImport>,
+    expectedShape: string,
+    reviewer: string,
+  ): OriginalCreateBinding;
+  append(
+    stage: OriginalCreateStage,
+    binding: OriginalCreateBinding,
+    evidence: Readonly<Record<string, unknown>>,
+  ): OriginalCreateRecord;
+  evidence(
+    binding: OriginalCreateBinding,
+    databaseId: string,
+  ): IntegrationStorageOriginalCreateEvidence;
+  retainUnknown(binding: OriginalCreateBinding, databaseId: string | null): void;
+  status(): {
+    readonly state: "absent" | "unknown" | "terminal";
+    readonly qualification: "diagnostic-only";
+    readonly lastStage: string | null;
+    readonly terminalCustodyDigest: string | null;
+  };
+}
+
+function originalDigest(value: unknown): string {
+  return `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
+}
+
+function originalRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function originalKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  return JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...keys].sort());
+}
+
+function originalRootIdentity(root: string): { readonly device: bigint; readonly inode: bigint } {
+  try {
+    if (!isAbsolute(root) || root === "/" || root.endsWith("/") || realpathSync(root) !== root)
+      throw new Error("alias");
+    const state = lstatSync(root, { bigint: true });
+    if (
+      !state.isDirectory() ||
+      state.isSymbolicLink() ||
+      (state.mode & 0o777n) !== 0o700n ||
+      process.getuid === undefined ||
+      state.uid !== BigInt(process.getuid())
+    )
+      throw new Error("unsafe root");
+    const inside = relative(realpathSync(REPOSITORY), root);
+    if (inside === "" || (!inside.startsWith("..") && !isAbsolute(inside)))
+      throw new Error("repository");
+    for (let cursor = root; ; cursor = dirname(cursor)) {
+      if (lstatSync(join(cursor, ".git"), { throwIfNoEntry: false }) !== undefined)
+        throw new Error("checkout");
+      if (dirname(cursor) === cursor) break;
+    }
+    return { device: state.dev, inode: state.ino };
+  } catch {
+    throw preflightError(
+      "original integration creation requires an existing owned link-free 0700 custody root outside every checkout",
+    );
+  }
+}
+
+function readOriginalBytes(path: string, limit: number, sealed = false): Uint8Array | null {
+  if (lstatSync(path, { throwIfNoEntry: false }) === undefined) return null;
+  let fd = -1;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = fstatSync(fd);
+    if (
+      !stat.isFile() ||
+      stat.nlink !== 1 ||
+      stat.uid !== process.getuid?.() ||
+      ![0o600, ...(sealed ? [0o400] : [])].includes(stat.mode & 0o777) ||
+      stat.size < 1 ||
+      stat.size > limit
+    )
+      throw new Error("unsafe bytes");
+    const bytes = readFileSync(fd);
+    if (bytes.byteLength !== stat.size || fstatSync(fd).size !== stat.size)
+      throw new Error("changed bytes");
+    return bytes;
+  } catch {
+    throw mutationError(
+      "original integration custody is unsafe or unreadable; retain UNKNOWN and do not retry",
+    );
+  } finally {
+    if (fd >= 0) closeSync(fd);
+  }
+}
+
+/** Retain original sealed SQL/config bytes durably before dispatch/terminal, never as a cache. */
+function syncOriginalArtifact(root: string): void {
+  for (const name of readdirSync(root).sort()) {
+    const path = join(root, name);
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink() || stat.uid !== process.getuid?.()) {
+      throw mutationError("original creation artifact is not owner-controlled; retain UNKNOWN");
+    }
+    if (stat.isDirectory()) {
+      syncOriginalArtifact(path);
+    } else {
+      let fd = -1;
+      try {
+        fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+        const opened = fstatSync(fd);
+        if (
+          !opened.isFile() ||
+          opened.nlink !== 1 ||
+          opened.dev !== stat.dev ||
+          opened.ino !== stat.ino
+        )
+          throw new Error("unsafe artifact");
+        fsyncSync(fd);
+      } finally {
+        if (fd >= 0) closeSync(fd);
+      }
+    }
+  }
+  const fd = openSync(root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function prepareOriginalCreate(
+  invocation: IntegrationStorageGenerationInvocation,
+  target: DeployTarget,
+  names: StorageNames,
+  options: IntegrationStorageGenerationOptions,
+): OriginalCreateContext | null {
+  if (invocation.namespace === undefined && options.originalCreate === undefined) return null;
+  if (
+    invocation.namespace !== "integration-ts" ||
+    invocation.freshLineage !== "v2-0092" ||
+    options.originalCreate?.kind !== "positive-fresh-0092" ||
+    options.productionD1 !== undefined ||
+    options.outputDirectory !== undefined ||
+    !originalKeys(invocation as unknown as Record<string, unknown>, [
+      "action",
+      "environment",
+      "commit",
+      "generation",
+      "namespace",
+      "freshLineage",
+    ]) ||
+    !originalKeys(options.originalCreate as unknown as Record<string, unknown>, [
+      "kind",
+      "custodyDirectory",
+      "custodyIdentity",
+    ])
+  ) {
+    throw preflightError(
+      "original creation requires only the explicit integration-ts fresh92 selector and protected custody; no production guard, output override, caller UUID or proof input",
+    );
+  }
+  if (
+    typeof invocation.commit !== "string" ||
+    typeof target.accountId !== "string" ||
+    typeof target.d1.databaseId !== "string" ||
+    !UUID.test(target.d1.databaseId) ||
+    typeof target.d1.databaseName !== "string" ||
+    typeof target.r2.bucketName !== "string"
+  ) {
+    throw preflightError(
+      "original creation requires exact integration account and incumbent collision identities",
+    );
+  }
+  const root = options.originalCreate.custodyDirectory;
+  if (typeof root !== "string") throw preflightError("original creation custody path is required");
+  const identity = originalRootIdentity(root);
+  const pinnedIdentity = options.originalCreate.custodyIdentity;
+  if (
+    !originalRecord(pinnedIdentity) ||
+    !originalKeys(pinnedIdentity, ["device", "inode"]) ||
+    typeof pinnedIdentity.device !== "string" ||
+    !/^(?:0|[1-9][0-9]*)$/u.test(pinnedIdentity.device) ||
+    typeof pinnedIdentity.inode !== "string" ||
+    !/^[1-9][0-9]*$/u.test(pinnedIdentity.inode) ||
+    pinnedIdentity.device !== String(identity.device) ||
+    pinnedIdentity.inode !== String(identity.inode)
+  ) {
+    throw preflightError(
+      "original creation custody differs from its provisioning-time device/inode pin; do not repin or retry",
+    );
+  }
+  const custodyRootIdentityDigest = originalDigest({
+    root,
+    device: pinnedIdentity.device,
+    inode: pinnedIdentity.inode,
+  });
+  const accountId = target.accountId;
+  const generation = invocation.generation;
+  const sourceCommit = invocation.commit;
+  const stem = `integration-create-${originalDigest({ accountId, namespace: "integration-ts", generation }).slice(7)}`;
+  const artifactRoot = join(root, `${stem}.artifact`);
+  const path = (stage: OriginalCreateStage | "unknown") => join(root, `${stem}.${stage}.json`);
+  const selectedTarget = () => ({
+    environment: target.environment,
+    accountId: target.accountId,
+    workerName: target.workerName,
+    d1: { ...target.d1 },
+    r2: { ...target.r2 },
+  });
+  const callerSnapshot = () =>
+    JSON.stringify({
+      invocation,
+      selectedTarget: selectedTarget(),
+      originalCreate: options.originalCreate,
+      productionD1: options.productionD1,
+      migrationDirectory: options.migrationDirectory,
+      outputDirectory: options.outputDirectory,
+    });
+  const callerIdentity = callerSnapshot();
+  const ports = [
+    options.run,
+    options.provider,
+    options.fetcher,
+    options.reader,
+    options.readD1State,
+    options.freshV2DataReader,
+    options.wranglerCommand,
+    options.cloudflareEnvironment,
+  ] as const;
+  const authority = [
+    options.provider,
+    options.fetcher,
+    options.reader,
+    options.readD1State,
+    options.freshV2DataReader,
+    options.migrationDirectory,
+    options.wranglerCommand,
+  ].some((value) => value !== undefined)
+    ? ("component-simulation" as const)
+    : ("provider-native" as const);
+  const commandPort =
+    options.run === undefined ? ("owner-default" as const) : ("composing-source-owned" as const);
+  let expectedBinding: OriginalCreateBinding | null = null;
+  const assertContinuity = (): void => {
+    const current = originalRootIdentity(root);
+    if (
+      current.device !== identity.device ||
+      current.inode !== identity.inode ||
+      callerSnapshot() !== callerIdentity ||
+      [
+        options.run,
+        options.provider,
+        options.fetcher,
+        options.reader,
+        options.readD1State,
+        options.freshV2DataReader,
+        options.wranglerCommand,
+        options.cloudflareEnvironment,
+      ].some((value, index) => value !== ports[index])
+    ) {
+      throw mutationError(
+        "original integration creation binding or custody root changed; retain UNKNOWN",
+      );
+    }
+  };
+  const parseBinding = (value: unknown): OriginalCreateBinding => {
+    if (
+      !originalRecord(value) ||
+      !originalKeys(value, [
+        "kind",
+        "environment",
+        "namespace",
+        "accountId",
+        "generation",
+        "databaseName",
+        "bucketName",
+        "selectedTargetDigest",
+        "custodyRootIdentityDigest",
+        "sourceCommit",
+        "migrationDigest",
+        "migrationBytes",
+        "importDigest",
+        "importBytes",
+        "applicationShapeDigest",
+        "reviewer",
+        "authority",
+        "commandPort",
+      ]) ||
+      value.kind !== "takoserver.integration-fresh-0092-create-binding@v1" ||
+      value.environment !== "integration" ||
+      value.namespace !== "integration-ts" ||
+      value.accountId !== accountId ||
+      value.generation !== generation ||
+      value.databaseName !== names.databaseName ||
+      value.bucketName !== names.bucketName ||
+      value.sourceCommit !== sourceCommit ||
+      value.custodyRootIdentityDigest !== custodyRootIdentityDigest ||
+      value.migrationDigest !== ORIGINAL_SOURCE_0092 ||
+      value.authority !== authority ||
+      value.commandPort !== commandPort ||
+      !["selectedTargetDigest", "importDigest", "applicationShapeDigest"].every(
+        (key) => typeof value[key] === "string" && SHA256.test(value[key]),
+      ) ||
+      !["migrationBytes", "importBytes"].every(
+        (key) =>
+          typeof value[key] === "number" &&
+          Number.isSafeInteger(value[key]) &&
+          value[key] > 0 &&
+          value[key] <= ORIGINAL_IMPORT_LIMIT,
+      ) ||
+      typeof value.reviewer !== "string" ||
+      exactReviewer(value.reviewer) !== value.reviewer ||
+      (expectedBinding !== null && JSON.stringify(value) !== JSON.stringify(expectedBinding))
+    ) {
+      throw mutationError(
+        "original integration binding differs from retained operation; retain UNKNOWN",
+      );
+    }
+    return value as unknown as OriginalCreateBinding;
+  };
+  const read = (): OriginalCreateRecord[] => {
+    assertContinuity();
+    const records: OriginalCreateRecord[] = [];
+    let gap = false;
+    for (const stage of [...ORIGINAL_STAGES, "unknown"] as const) {
+      const bytes = readOriginalBytes(path(stage), ORIGINAL_RECORD_LIMIT);
+      if (bytes === null) {
+        if (stage !== "unknown") gap = true;
+        continue;
+      }
+      let value: unknown;
+      try {
+        value = JSON.parse(Buffer.from(bytes).toString("utf8"));
+      } catch {
+        throw mutationError("original integration custody is malformed; retain UNKNOWN");
+      }
+      if (
+        !originalRecord(value) ||
+        !originalKeys(value, [
+          "kind",
+          "stage",
+          "binding",
+          "previousDigest",
+          "evidence",
+          "digest",
+        ]) ||
+        value.kind !== "takoserver.integration-fresh-0092-create-custody@v1" ||
+        value.stage !== stage ||
+        !originalRecord(value.evidence) ||
+        typeof value.digest !== "string" ||
+        !SHA256.test(value.digest)
+      ) {
+        throw mutationError("original integration custody envelope is malformed; retain UNKNOWN");
+      }
+      const binding = parseBinding(value.binding);
+      const { digest, ...body } = value;
+      if (
+        originalDigest(body) !== digest ||
+        value.previousDigest !== (records.at(-1)?.digest ?? null) ||
+        (stage !== "unknown" && gap) ||
+        (stage === "unknown" && (records.length === 0 || records.at(-1)?.stage === "terminal")) ||
+        (records.length > 0 && JSON.stringify(binding) !== JSON.stringify(records[0]?.binding))
+      ) {
+        throw mutationError(
+          "original integration custody chain is partial or changed; retain UNKNOWN",
+        );
+      }
+      const evidence = value.evidence;
+      const expectedFields =
+        stage === "create-dispatched"
+          ? []
+          : stage === "identified"
+            ? ["databaseId", "createResponseDigest", "identityReadbackDigest"]
+            : stage === "import-dispatched"
+              ? ["databaseId", "emptySchemaDigest"]
+              : stage === "r2-dispatched"
+                ? [
+                    "databaseId",
+                    "schemaShapeDigest",
+                    "appliedMigrationsDigest",
+                    "freshDataPolicyDigest",
+                  ]
+                : stage === "terminal"
+                  ? ["databaseId", "proof"]
+                  : ["databaseId", "reason"];
+      if (
+        !originalKeys(evidence, expectedFields) ||
+        (stage !== "create-dispatched" &&
+          stage !== "unknown" &&
+          (typeof evidence.databaseId !== "string" || !UUID.test(evidence.databaseId))) ||
+        (stage === "unknown" &&
+          (evidence.reason !== "original-create-incomplete" ||
+            (evidence.databaseId !== null &&
+              (typeof evidence.databaseId !== "string" || !UUID.test(evidence.databaseId))))) ||
+        Object.entries(evidence).some(
+          ([key, val]) => key.endsWith("Digest") && (typeof val !== "string" || !SHA256.test(val)),
+        ) ||
+        (stage === "identified" &&
+          evidence.createResponseDigest !== evidence.identityReadbackDigest) ||
+        (stage !== "create-dispatched" &&
+          stage !== "identified" &&
+          stage !== "unknown" &&
+          evidence.databaseId !== records[1]?.evidence.databaseId)
+      ) {
+        throw mutationError(
+          "original integration native evidence differs from its chain; retain UNKNOWN",
+        );
+      }
+      if (
+        stage === "terminal" &&
+        JSON.stringify(evidence.proof) !==
+          JSON.stringify(makeEvidence(binding, records, String(evidence.databaseId)))
+      ) {
+        throw mutationError(
+          "original integration terminal proof does not follow its original dispatch",
+        );
+      }
+      records.push(value as unknown as OriginalCreateRecord);
+    }
+    if (records.length > 0) {
+      const first = records[0];
+      const payload = join(artifactRoot, "release", "payload");
+      const bytes = readOriginalBytes(
+        join(payload, "migration-import.sql"),
+        ORIGINAL_IMPORT_LIMIT,
+        true,
+      );
+      const source = readSealedSelectedArtifact(join(payload, "migrations"), "v2-0092");
+      if (
+        first === undefined ||
+        bytes === null ||
+        `sha256:${createHash("sha256").update(bytes).digest("hex")}` !==
+          first.binding.importDigest ||
+        bytes.byteLength !== first.binding.importBytes ||
+        source.digest !== first.binding.migrationDigest ||
+        source.bytes !== first.binding.migrationBytes
+      ) {
+        throw mutationError(
+          "original integration sealed source/import is unavailable or changed; retain UNKNOWN",
+        );
+      }
+    }
+    return records;
+  };
+  const makeEvidence = (
+    binding: OriginalCreateBinding,
+    records: readonly OriginalCreateRecord[],
+    databaseId: string,
+  ): IntegrationStorageOriginalCreateEvidence => {
+    if (
+      records.length !== 4 ||
+      records.some((record, index) => record.stage !== ORIGINAL_STAGES[index]) ||
+      records[1]?.evidence.databaseId !== databaseId
+    ) {
+      throw mutationError(
+        "original integration proof lacks sole original create/import/R2 dispatch chain",
+      );
+    }
+    const digests = records.map((record) => record.digest);
+    return {
+      kind:
+        authority === "provider-native"
+          ? "takoserver.integration-fresh-0092-original-create@v1"
+          : "takoserver.integration-fresh-0092-component-result@v1",
+      authority,
+      qualification:
+        authority === "provider-native"
+          ? "independent-origin-review-required"
+          : "component-simulation-only",
+      commandPort,
+      namespace: "integration-ts",
+      generation,
+      accountId,
+      databaseName: names.databaseName,
+      databaseId,
+      bucketName: names.bucketName,
+      sourceCommit,
+      migrationDigest: binding.migrationDigest,
+      migrationImportDigest: binding.importDigest,
+      schemaShapeDigest: String(records[3]?.evidence.schemaShapeDigest),
+      createDispatchDigest: String(digests[0]),
+      identifiedDigest: String(digests[1]),
+      importDispatchDigest: String(digests[2]),
+      r2DispatchDigest: String(digests[3]),
+      originalBindingDigest: originalDigest(binding),
+      d1IdentityReadbackDigest: originalDigest({ name: names.databaseName, uuid: databaseId }),
+      r2IdentityReadbackDigest: originalDigest({ name: names.bucketName }),
+      freshDataPolicyDigest: String(records[3]?.evidence.freshDataPolicyDigest),
+    };
+  };
+  const write = (
+    stage: OriginalCreateStage | "unknown",
+    binding: OriginalCreateBinding,
+    evidence: Readonly<Record<string, unknown>>,
+  ): OriginalCreateRecord => {
+    const prior = read();
+    if (
+      stage === "unknown"
+        ? prior.length === 0 || ["terminal", "unknown"].includes(prior.at(-1)?.stage ?? "")
+        : prior.length !== ORIGINAL_STAGES.indexOf(stage)
+    ) {
+      throw mutationError(
+        "original integration attempt already exists or lacks its sole predecessor; do not retry",
+      );
+    }
+    parseBinding(binding);
+    const body = {
+      kind: "takoserver.integration-fresh-0092-create-custody@v1" as const,
+      stage,
+      binding,
+      previousDigest: prior.at(-1)?.digest ?? null,
+      evidence,
+    };
+    const record = { ...body, digest: originalDigest(body) };
+    const bytes = Buffer.from(`${JSON.stringify(record)}\n`);
+    if (bytes.byteLength > ORIGINAL_RECORD_LIMIT)
+      throw mutationError("original integration record exceeds its bound");
+    let fd = -1;
+    let directory = -1;
+    try {
+      directory = openSync(root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      const current = fstatSync(directory, { bigint: true });
+      if (current.dev !== identity.device || current.ino !== identity.inode)
+        throw new Error("replaced root");
+      fd = openSync(
+        path(stage),
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600,
+      );
+      fchmodSync(fd, 0o600);
+      let offset = 0;
+      while (offset < bytes.byteLength) {
+        const size = writeSync(fd, bytes, offset, bytes.byteLength - offset);
+        if (size < 1) throw new Error("short write");
+        offset += size;
+      }
+      fsyncSync(fd);
+      fsyncSync(directory);
+      assertContinuity();
+    } catch {
+      throw mutationError(
+        "original integration dispatch could not be durably retained; preserve UNKNOWN and do not retry",
+      );
+    } finally {
+      if (fd >= 0) closeSync(fd);
+      if (directory >= 0) closeSync(directory);
+    }
+    read();
+    return record;
+  };
+  return {
+    artifactRoot,
+    assertUnchanged() {
+      read();
+    },
+    assertUnused() {
+      if (read().length > 0 || lstatSync(artifactRoot, { throwIfNoEntry: false }) !== undefined) {
+        throw mutationError(
+          "original integration generation has prior or uncertain custody; do not retry or adopt",
+        );
+      }
+    },
+    binding(source, migrationImport, expectedShape, reviewer) {
+      if (source.digest !== ORIGINAL_SOURCE_0092 || source.names.length !== 92)
+        throw preflightError("original creation requires only the fixed audited0092 source");
+      expectedBinding = Object.freeze({
+        kind: "takoserver.integration-fresh-0092-create-binding@v1",
+        environment: "integration",
+        namespace: "integration-ts",
+        accountId,
+        generation,
+        databaseName: names.databaseName,
+        bucketName: names.bucketName,
+        selectedTargetDigest: originalDigest(selectedTarget()),
+        custodyRootIdentityDigest,
+        sourceCommit,
+        migrationDigest: source.digest,
+        migrationBytes: source.bytes,
+        importDigest: migrationImport.digest,
+        importBytes: migrationImport.bytes,
+        applicationShapeDigest: `sha256:${createHash("sha256").update(expectedShape).digest("hex")}`,
+        reviewer,
+        authority,
+        commandPort,
+      });
+      return expectedBinding;
+    },
+    append: write,
+    evidence(binding, databaseId) {
+      return makeEvidence(binding, read(), databaseId);
+    },
+    retainUnknown(binding, databaseId) {
+      try {
+        if (read().length > 0)
+          write("unknown", binding, { databaseId, reason: "original-create-incomplete" });
+      } catch {
+        /* retained dispatch/partial bytes are already UNKNOWN; never remove or overwrite them */
+      }
+    },
+    status() {
+      const records = read();
+      const last = records.at(-1);
+      return {
+        state:
+          last?.stage === "terminal"
+            ? "terminal"
+            : last !== undefined || lstatSync(artifactRoot, { throwIfNoEntry: false }) !== undefined
+              ? "unknown"
+              : "absent",
+        qualification: "diagnostic-only",
+        lastStage: last?.stage ?? null,
+        terminalCustodyDigest: last?.stage === "terminal" ? last.digest : null,
+      };
+    },
+  };
+}
+
 interface StorageNames {
   readonly databaseName: string;
   readonly bucketName: string;
@@ -627,6 +1390,7 @@ interface StorageNames {
 
 interface GeneratedStorageTarget {
   readonly generation: string;
+  readonly namespace?: IntegrationStorageGenerationNamespace;
   readonly accountId: string;
   readonly databaseName: string;
   readonly databaseId: string;
@@ -646,6 +1410,10 @@ function generatedStorageTarget(
   const databaseName = target.d1.databaseName;
   const bucketName = target.r2.bucketName;
   const generated = /^takoserver-i-([0-9a-f]{32})$/u.exec(databaseName);
+  const prefixed = PREFIXED_D1_NAME.exec(databaseName);
+  if (prefixed !== null && target.takoformV2?.storageLineage !== "v2-0092") {
+    throw preflightError("integration-ts readback requires its explicit fresh v2-0092 origin");
+  }
   const stagingPair =
     generated === null &&
     target.takoformV2?.storageLineage !== undefined &&
@@ -653,7 +1421,7 @@ function generatedStorageTarget(
     STAGING_PAIR_NAME.test(databaseName) &&
     !PRODUCTION_D1_NAME.test(databaseName);
   if (
-    (generated === null && !stagingPair) ||
+    (generated === null && prefixed === null && !stagingPair) ||
     bucketName !== databaseName ||
     !UUID.test(target.d1.databaseId)
   ) {
@@ -663,7 +1431,8 @@ function generatedStorageTarget(
   }
   return {
     // A staging pair has no generation; its exact name is its identity.
-    generation: generated?.[1] ?? databaseName,
+    generation: generated?.[1] ?? prefixed?.[1] ?? databaseName,
+    ...(prefixed === null ? {} : { namespace: "integration-ts" as const }),
     accountId: target.accountId,
     databaseName,
     databaseId: target.d1.databaseId,
@@ -736,8 +1505,11 @@ function validateInvocation(
   if (!ACCOUNT_ID.test(target.accountId)) {
     throw preflightError("integration storage generation requires one exact account id");
   }
-  const databaseName = `takoserver-i-${invocation.generation}`;
-  const bucketName = `takoserver-i-${invocation.generation}`;
+  const databaseName = integrationStorageGenerationName(
+    invocation.generation,
+    invocation.namespace,
+  );
+  const bucketName = databaseName;
   if (!RESOURCE_NAME.test(databaseName) || !RESOURCE_NAME.test(bucketName)) {
     throw preflightError("integration storage generation derived an invalid provider name");
   }
@@ -763,7 +1535,9 @@ async function statusStorageGeneration(
   names: StorageNames,
   provider: ProviderContext,
   options: IntegrationStorageGenerationOptions,
+  original: OriginalCreateContext | null,
 ): Promise<Record<string, unknown>> {
+  original?.assertUnchanged();
   const sourceArtifact =
     invocation.freshLineage === undefined
       ? null
@@ -788,6 +1562,7 @@ async function statusStorageGeneration(
     environment: "integration",
     selectedCommit: invocation.commit,
     generation: invocation.generation,
+    ...(original === null ? {} : { namespace: "integration-ts" }),
     d1: {
       databaseName: names.databaseName,
       databaseId: d1?.uuid ?? null,
@@ -809,9 +1584,16 @@ async function statusStorageGeneration(
     },
     readyForApply:
       d1 === null && r2 === null && !names.selectedByTarget.d1 && !names.selectedByTarget.r2,
-    productionD1Guard: productionD1GuardRecord(options.productionD1),
+    ...(original === null
+      ? { productionD1Guard: productionD1GuardRecord(options.productionD1) }
+      : { originalCreateCustody: original.status() }),
     rollback: "old active target remains unchanged; repair forward from any known aftermath",
   };
+  if (original !== null) {
+    original.assertUnchanged();
+    // Complete native state is diagnosis only: status never finishes or issues original custody.
+    result.readyForApply = result.readyForApply === true && original.status().state === "absent";
+  }
   if (invocation.freshLineage === undefined) return result;
   result.freshLineage = invocation.freshLineage;
   result.migrationDigest = sourceArtifact?.digest;
@@ -881,6 +1663,7 @@ async function statusStorageGeneration(
       }
       result.dataReadback = dataEmpty ? "empty-seeded" : "present";
     }
+    original?.assertUnchanged();
     result.resume = !complete
       ? "Quarantine this generation and plan separate owner-reviewed forward repair; no SQL re-import or new generation retry."
       : dataEmpty === false
@@ -1037,7 +1820,9 @@ async function applyStorageGeneration(
   target: DeployTarget,
   names: StorageNames,
   options: IntegrationStorageGenerationOptions,
+  original: OriginalCreateContext | null,
 ): Promise<Record<string, unknown>> {
+  original?.assertUnused();
   const run = options.run ?? runCommand;
   const reviewer = exactReviewer(
     options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
@@ -1051,9 +1836,12 @@ async function applyStorageGeneration(
   await checkedMigrationGate(run);
   const expectedApplicationShape = deriveExpectedApplicationShape(sourceArtifact.files);
 
-  const temporary = options.outputDirectory === undefined;
+  original?.assertUnchanged();
+  const temporary = original === null && options.outputDirectory === undefined;
   const root =
-    options.outputDirectory ?? mkdtempSync(join(tmpdir(), "takoserver-integration-storage-"));
+    original?.artifactRoot ??
+    options.outputDirectory ??
+    mkdtempSync(join(tmpdir(), "takoserver-integration-storage-"));
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const release = join(root, "release");
   if (existsSync(release)) {
@@ -1069,6 +1857,8 @@ async function applyStorageGeneration(
   let result: Record<string, unknown> | undefined;
   let operationFailed = false;
   let operationFailure: unknown;
+  let originalBinding: OriginalCreateBinding | null = null;
+  let originalEvidence: IntegrationStorageOriginalCreateEvidence | null = null;
   try {
     for (const file of sourceArtifact.files) {
       copyFileSync(file.path, join(migrationOutput, file.name));
@@ -1094,12 +1884,29 @@ async function applyStorageGeneration(
     ]);
     const configPath = join(release, "wrangler.jsonc");
 
+    if (original !== null) {
+      originalBinding = original.binding(
+        sourceArtifact,
+        migrationImport,
+        expectedApplicationShape,
+        reviewer,
+      );
+    }
     const provider = await resolveProvider(target, options);
+    original?.assertUnchanged();
     const initial = await readInventory(provider.provider, names, "preflight");
+    original?.assertUnchanged();
     assertAbsent(initial, "initial integration storage name inventory");
     const fenced = await readInventory(provider.provider, names, "preflight");
     assertAbsent(fenced, "immediate precreate integration storage absence fence");
+    original?.assertUnchanged();
     migrationSeal.assertUnchanged();
+    if (original !== null && originalBinding !== null) {
+      syncOriginalArtifact(original.artifactRoot);
+      original.append("create-dispatched", originalBinding, {});
+      original.assertUnchanged();
+      migrationSeal.assertUnchanged();
+    }
 
     // Set this before entering the provider boundary: a lost acknowledgement
     // can mean Cloudflare created the database even when no identity returned.
@@ -1108,7 +1915,14 @@ async function applyStorageGeneration(
       provider.provider.createD1(names.databaseName),
     );
     const databaseId = validateCreatedD1(created, names.databaseName);
+    const originalCreateResponse = { name: names.databaseName, uuid: databaseId };
     knownDatabaseId = databaseId;
+    original?.assertUnchanged();
+    if (original !== null && databaseId === target.d1.databaseId) {
+      throw mutationError(
+        "original creation returned the selected incumbent D1 identity; retain UNKNOWN",
+      );
+    }
     const createdReadback = await providerCall(
       "mutation",
       "new D1 identity readback failed; do not retry",
@@ -1120,12 +1934,24 @@ async function applyStorageGeneration(
         `databaseId=${databaseId}`,
       );
     }
-    // Before any SQL reaches it: the new id is not the production D1's either.
-    assertStagingD1NotProduction(
-      { databaseName: createdReadback.name, databaseId },
-      options.productionD1,
-      "mutation",
-    );
+    original?.assertUnchanged();
+    if (original !== null && originalBinding !== null) {
+      original.append("identified", originalBinding, {
+        databaseId,
+        createResponseDigest: originalDigest(originalCreateResponse),
+        identityReadbackDigest: originalDigest({
+          name: createdReadback.name,
+          uuid: createdReadback.uuid,
+        }),
+      });
+    } else {
+      // Preserve the historical exact-production comparison before any SQL.
+      assertStagingD1NotProduction(
+        { databaseName: createdReadback.name, databaseId },
+        options.productionD1,
+        "mutation",
+      );
+    }
 
     const generatedTarget = {
       accountId: target.accountId,
@@ -1164,6 +1990,14 @@ async function applyStorageGeneration(
       );
     }
     assertEmptyDatabase(preMigration, databaseId);
+    original?.assertUnchanged();
+    if (original !== null && originalBinding !== null) {
+      original.append("import-dispatched", originalBinding, {
+        databaseId,
+        emptySchemaDigest: preMigration.shapeDigest,
+      });
+      original.assertUnchanged();
+    }
 
     const migration = await applySealedMigrations(
       configPath,
@@ -1177,6 +2011,7 @@ async function applyStorageGeneration(
       sourceArtifact.names,
     );
     const postMigration = migration.state;
+    original?.assertUnchanged();
     assertCompleteDatabase(
       postMigration,
       sourceArtifact.names,
@@ -1198,6 +2033,7 @@ async function applyStorageGeneration(
       );
     }
 
+    original?.assertUnchanged();
     const finalD1 = await providerCall(
       "verification",
       "new D1 final identity readback failed",
@@ -1217,7 +2053,22 @@ async function applyStorageGeneration(
         `databaseId=${databaseId} bucketName=${names.bucketName}`,
       );
     }
+    original?.assertUnchanged();
     sealed.assertUnchanged();
+    if (original !== null && originalBinding !== null) {
+      original.append("r2-dispatched", originalBinding, {
+        databaseId,
+        schemaShapeDigest: postMigration.shapeDigest,
+        appliedMigrationsDigest: originalDigest(postMigration.applied),
+        freshDataPolicyDigest: originalDigest({
+          lineage: "v2-0092",
+          schema: expectedApplicationShape,
+          policy: "empty-seeded@v1",
+        }),
+      });
+      original.assertUnchanged();
+      sealed.assertUnchanged();
+    }
     const createdBucket = await providerCall("mutation", "new R2 create failed; do not retry", () =>
       provider.provider.createR2(names.bucketName),
     );
@@ -1234,6 +2085,10 @@ async function applyStorageGeneration(
       );
     }
 
+    original?.assertUnchanged();
+    if (original !== null && originalBinding !== null) {
+      originalEvidence = original.evidence(originalBinding, databaseId);
+    }
     result = {
       kind: "takoserver.integration-storage-generation-apply@v1",
       surface: "takoserver-integration-storage-generation",
@@ -1241,13 +2096,16 @@ async function applyStorageGeneration(
       commit: invocation.commit,
       reviewer,
       generation: invocation.generation,
+      ...(original === null ? {} : { namespace: "integration-ts" }),
       ...(invocation.freshLineage === undefined ? {} : { freshLineage: invocation.freshLineage }),
       d1: {
         databaseName: names.databaseName,
         databaseId,
       },
       r2: { bucketName: names.bucketName },
-      productionD1Guard: productionD1GuardRecord(options.productionD1),
+      ...(original === null
+        ? { productionD1Guard: productionD1GuardRecord(options.productionD1) }
+        : {}),
       migrationDigest: sourceArtifact.digest,
       migrationBytes: sourceArtifact.bytes,
       migrationImportDigest: migrationImport.digest,
@@ -1259,14 +2117,19 @@ async function applyStorageGeneration(
   } catch (error) {
     operationFailed = true;
     operationFailure = error;
+    // A crash has the same semantics even if this best-effort UNKNOWN append cannot finish.
+    if (originalBinding !== null) original?.retainUnknown(originalBinding, knownDatabaseId);
   }
 
   let cleanupFailed = false;
   let cleanupFailure: unknown;
   try {
-    if (sealed !== null) unsealDirectory(sealed.root);
-    else if (migrationSeal !== null) unsealDirectory(migrationSeal.root);
-    if (temporary) rmSync(root, { recursive: true, force: true });
+    if (original === null) {
+      if (sealed !== null) unsealDirectory(sealed.root);
+      else if (migrationSeal !== null) unsealDirectory(migrationSeal.root);
+      if (temporary) rmSync(root, { recursive: true, force: true });
+    }
+    // The new path retains the original sealed artifact outside Git, including UNKNOWN.
   } catch (error) {
     cleanupFailed = true;
     cleanupFailure = error;
@@ -1296,6 +2159,16 @@ async function applyStorageGeneration(
   }
   if (result === undefined) {
     throw preflightError("integration storage generation produced no result");
+  }
+  if (original !== null && originalBinding !== null && originalEvidence !== null) {
+    original.assertUnchanged();
+    sealed?.assertUnchanged();
+    syncOriginalArtifact(original.artifactRoot);
+    const terminal = original.append("terminal", originalBinding, {
+      databaseId: knownDatabaseId,
+      proof: originalEvidence,
+    });
+    result.originalCreate = { ...originalEvidence, terminalCustodyDigest: terminal.digest };
   }
   return result;
 }
