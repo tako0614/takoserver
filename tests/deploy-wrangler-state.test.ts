@@ -648,6 +648,29 @@ describe("Wrangler version publication output", () => {
         lockInode: String(lockIdentity.ino),
       });
 
+      // The kernel lock goes with the flock holder's descriptor, but the holder
+      // process (a grandchild, reparented when the child exits) can still show
+      // in /proc with the same start ticks until it is reaped. Until then the
+      // inspector correctly refuses to call the owner stale, so wait for the
+      // exact holder identity to disappear rather than racing the reaper.
+      const holderStillPresent = () => {
+        try {
+          const stat = readFileSync(`/proc/${String(owner.holderPid)}/stat`, "utf8");
+          return (
+            stat
+              .slice(stat.lastIndexOf(")") + 2)
+              .trim()
+              .split(/\s+/u)[19] === owner.holderStartTicks
+          );
+        } catch {
+          return false;
+        }
+      };
+      for (let attempt = 0; holderStillPresent() && attempt < 1_000; attempt += 1) {
+        await Bun.sleep(10);
+      }
+      expect(holderStillPresent()).toBe(false);
+
       let status = inspectWranglerVersionPublicationLease({
         accountId: target.accountId,
         workerName: target.workerName,
