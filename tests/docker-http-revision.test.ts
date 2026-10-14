@@ -165,6 +165,9 @@ function engineFixture(recordRequestBodies = true) {
 }
 
 function trustedFixture(fixture: ReturnType<typeof engineFixture>, internet = true) {
+  // The trusted Internet-capable Host fixture chooses an explicit numeric DNS
+  // override; the product has no default resolver or implicit opt-in.
+  if (internet) fixture.options = { ...fixture.options, dnsServers: ["192.0.2.53"] };
   fixture.setNetwork({
     Id: "b".repeat(64),
     Name: "installation-net",
@@ -256,6 +259,256 @@ function trustedFixture(fixture: ReturnType<typeof engineFixture>, internet = tr
     },
   };
 }
+
+test("Host DNS pins exact ordered Engine keys and changes the immutable revision fingerprint", async () => {
+  const fixture = engineFixture();
+  const trusted = trustedFixture(fixture);
+  const dnsServers = ["192.0.2.53", "2001:db8::53"];
+  const configuration = {
+    ...fixture.options,
+    runtimePreparation: trusted.createPreparation(),
+    dnsServers,
+  };
+  const runtime = createDockerHttpRevisionRuntime(configuration);
+  dnsServers.reverse();
+  configuration.dnsServers = ["203.0.113.53"];
+  expect(await runtime.reconcile(revision)).toMatchObject({ state: "ready" });
+  const body = fixture.calls.find((call) => call.path.startsWith("/containers/create"))?.body;
+  expect(body?.HostConfig).toMatchObject({
+    Dns: ["192.0.2.53", "2001:db8::53"],
+    DnsOptions: [],
+    DnsSearch: [],
+  });
+  expect(await runtime.observe(revision)).toMatchObject({ state: "ready" });
+  const starts = fixture.calls.filter((call) => call.path.endsWith("/start")).length;
+  await expect(
+    createDockerHttpRevisionRuntime({
+      ...fixture.options,
+      runtimePreparation: trusted.createPreparation(),
+      dnsServers: ["2001:db8::53", "192.0.2.53"],
+    }).reconcile(revision),
+  ).rejects.toMatchObject({ code: "conflict" });
+  expect(fixture.calls.filter((call) => call.path.endsWith("/start"))).toHaveLength(starts);
+});
+
+test("Internet preparation requires bounded explicit numeric DNS before any Engine access", () => {
+  const fixture = engineFixture();
+  const trusted = trustedFixture(fixture);
+  const { dnsServers, ...withoutDns } = fixture.options;
+  expect(dnsServers).toEqual(["192.0.2.53"]);
+  expect(() =>
+    createDockerHttpRevisionRuntime({
+      ...withoutDns,
+      runtimePreparation: trusted.createPreparation(),
+    }),
+  ).toThrow("invalid_request");
+  const invalid: unknown[] = [
+    [],
+    [""],
+    ["resolver.example"],
+    ["https://192.0.2.53"],
+    ["[2001:db8::53]"],
+    ["fe80::53%eth0"],
+    ["192.0.2.53", "192.0.2.53"],
+    ["192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4"],
+    ["192.000.2.53"],
+    ["192.0.2.53:53"],
+    [" 192.0.2.53"],
+    ["192.0.2.53\n"],
+    ["2001:db8::53/64"],
+    [null],
+    new Array(1),
+    "192.0.2.53",
+    null,
+  ];
+  for (const value of invalid)
+    expect(() =>
+      createDockerHttpRevisionRuntime({
+        ...withoutDns,
+        runtimePreparation: trusted.createPreparation(),
+        dnsServers: value as readonly string[],
+      }),
+    ).toThrow("invalid_request");
+  expect(fixture.calls).toHaveLength(0);
+});
+
+test("DNS pin remains a numeric configuration choice while legacy unpinned profiles retain their body", async () => {
+  for (const preparation of [false, true]) {
+    const fixture = engineFixture();
+    const runtimePreparation = preparation
+      ? trustedFixture(fixture, false).createPreparation()
+      : undefined;
+    const runtime = createDockerHttpRevisionRuntime({
+      ...fixture.options,
+      ...(runtimePreparation ? { runtimePreparation } : {}),
+    });
+    expect(await runtime.reconcile(revision)).toMatchObject({ state: "ready" });
+    const body = fixture.calls.find((call) => call.path.startsWith("/containers/create"))?.body;
+    expect(isJsonObject(body?.HostConfig) ? Object.hasOwn(body.HostConfig, "Dns") : null).toBe(
+      false,
+    );
+    expect(
+      isJsonObject(body?.HostConfig) ? Object.hasOwn(body.HostConfig, "DnsOptions") : null,
+    ).toBe(false);
+    expect(
+      isJsonObject(body?.HostConfig) ? Object.hasOwn(body.HostConfig, "DnsSearch") : null,
+    ).toBe(false);
+  }
+  const fixture = engineFixture();
+  const runtime = createDockerHttpRevisionRuntime({
+    ...fixture.options,
+    dnsServers: ["127.0.0.53", "10.0.0.53", "fd00::53"],
+  });
+  expect(await runtime.reconcile(revision)).toMatchObject({ state: "ready" });
+  expect(
+    fixture.calls.find((call) => call.path.startsWith("/containers/create"))?.body?.HostConfig,
+  ).toMatchObject({ Dns: ["127.0.0.53", "10.0.0.53", "fd00::53"] });
+  // Physical destination permission is the enforcer's responsibility; numeric
+  // resolver validation does not duplicate or certify its address policy.
+});
+
+test("pinned DNS rejects drift and malformed readback before adoption or another native effect", async () => {
+  for (const patch of [
+    { Dns: undefined },
+    { Dns: null },
+    { Dns: [] },
+    { Dns: ["203.0.113.53", "2001:db8::53"] },
+    { Dns: ["2001:db8::53", "192.0.2.53"] },
+    { Dns: ["192.0.2.53", "2001:db8::53", "203.0.113.53"] },
+    { Dns: ["192.0.2.53", null] },
+    { Dns: "192.0.2.53" },
+    { Dns: ["192.0.2.53", "192.0.2.53"] },
+    { Dns: undefined, DNS: ["192.0.2.53", "2001:db8::53"] },
+    { DnsOptions: ["rotate"] },
+    { DnsSearch: ["foreign.example"] },
+    { DnsOptions: {} },
+    { DnsSearch: "" },
+  ]) {
+    const fixture = engineFixture();
+    const trusted = trustedFixture(fixture);
+    const runtime = createDockerHttpRevisionRuntime({
+      ...fixture.options,
+      dnsServers: ["192.0.2.53", "2001:db8::53"],
+      runtimePreparation: trusted.createPreparation(),
+    });
+    await runtime.reconcile(revision);
+    const [name, container] = [...fixture.containers.entries()][0] ?? [];
+    if (!name || !container || !isJsonObject(container.HostConfig))
+      throw new Error("Missing fixture");
+    fixture.containers.set(name, {
+      ...container,
+      State: { Running: false },
+      HostConfig: JSON.parse(JSON.stringify({ ...container.HostConfig, ...patch })) as JsonObject,
+    });
+    const before = fixture.calls.length;
+    await expect(runtime.observe(revision)).rejects.toMatchObject({ code: "conflict" });
+    await expect(runtime.reconcile(revision)).rejects.toMatchObject({ code: "conflict" });
+    expect(fixture.calls.slice(before).every((call) => call.method === "GET")).toBe(true);
+    expect(trusted.preparedNative).toHaveLength(1);
+  }
+});
+
+test("DNS empty option/search arrays tolerate Docker null or omitted serialization", async () => {
+  for (const empty of [[], null, undefined]) {
+    const fixture = engineFixture();
+    const trusted = trustedFixture(fixture);
+    const runtime = createDockerHttpRevisionRuntime({
+      ...fixture.options,
+      runtimePreparation: trusted.createPreparation(),
+    });
+    await runtime.reconcile(revision);
+    const [name, container] = [...fixture.containers.entries()][0] ?? [];
+    if (!name || !container || !isJsonObject(container.HostConfig))
+      throw new Error("Missing fixture");
+    fixture.containers.set(name, {
+      ...container,
+      HostConfig: JSON.parse(
+        JSON.stringify({ ...container.HostConfig, DnsOptions: empty, DnsSearch: empty }),
+      ) as JsonObject,
+    });
+    const before = fixture.calls.length;
+    expect(await runtime.observe(revision)).toMatchObject({ state: "ready" });
+    expect(fixture.calls.slice(before).every((call) => call.method === "GET")).toBe(true);
+  }
+});
+
+test("a mutable Engine request body cannot replace the captured DNS expectation before adoption", async () => {
+  const fixture = engineFixture();
+  const trusted = trustedFixture(fixture);
+  const runtime = createDockerHttpRevisionRuntime({
+    ...fixture.options,
+    runtimePreparation: trusted.createPreparation(),
+    engine: async (method, path, body, signal) => {
+      if (method === "POST" && path.startsWith("/containers/create")) {
+        const hostConfig = body?.HostConfig;
+        if (isJsonObject(hostConfig) && Array.isArray(hostConfig.Dns))
+          hostConfig.Dns[0] = "203.0.113.53";
+      }
+      return fixture.engine(method, path, body, signal);
+    },
+  });
+  await expect(runtime.reconcile(revision)).rejects.toMatchObject({ code: "conflict" });
+  expect(trusted.preparedNative).toHaveLength(0);
+  expect(fixture.calls.some((call) => call.path.endsWith("/start"))).toBe(false);
+});
+
+test("DNS drift during preparation and an unknown CREATE ACK cannot authorize START or replay CREATE", async () => {
+  const fixture = engineFixture();
+  const trusted = trustedFixture(fixture);
+  trusted.setBeforePrepare(() => {
+    const [name, container] = [...fixture.containers.entries()][0] ?? [];
+    if (!name || !container || !isJsonObject(container.HostConfig))
+      throw new Error("Missing fixture");
+    fixture.containers.set(name, {
+      ...container,
+      HostConfig: { ...container.HostConfig, Dns: ["203.0.113.53"] },
+    });
+  });
+  const runtime = createDockerHttpRevisionRuntime({
+    ...fixture.options,
+    runtimePreparation: trusted.createPreparation(),
+  });
+  await expect(runtime.reconcile(revision)).rejects.toMatchObject({ code: "conflict" });
+  expect(fixture.calls.some((call) => call.path.endsWith("/start"))).toBe(false);
+
+  const unknown = engineFixture(false);
+  const creation = creationFixture(unknown);
+  const engine: NonNullable<DockerHttpRevisionOptions["engine"]> = async (
+    method,
+    path,
+    body,
+    signal,
+  ) => {
+    const response = await unknown.engine(method, path, body, signal);
+    if (method === "POST" && path.startsWith("/containers/create")) {
+      const [name, container] = [...unknown.containers.entries()][0] ?? [];
+      if (!name || !container || !isJsonObject(container.HostConfig))
+        throw new Error("Missing fixture");
+      unknown.containers.set(name, {
+        ...container,
+        HostConfig: { ...container.HostConfig, Dns: ["203.0.113.53"] },
+      });
+      throw new Error("synthetic CREATE acknowledgement lost");
+    }
+    return response;
+  };
+  const recover = () =>
+    createDockerHttpRevisionRuntime({
+      ...unknown.options,
+      engine,
+      dnsServers: ["192.0.2.53"],
+      runtimePreparation: creation.preparation(),
+    });
+  await expect(recover().reconcile(revision)).rejects.toBeInstanceOf(DockerHttpRevisionError);
+  const before = unknown.calls.length;
+  await expect(recover().reconcile(revision)).rejects.toBeInstanceOf(DockerHttpRevisionError);
+  expect(unknown.calls.slice(before).every((call) => call.method === "GET")).toBe(true);
+  expect(unknown.calls.filter((call) => call.path.startsWith("/containers/create"))).toHaveLength(
+    1,
+  );
+  expect(unknown.calls.some((call) => call.path.endsWith("/start"))).toBe(false);
+  expect(creation.claims()).toBe(1);
+});
 
 /** Synthetic owner only: its Map/current bit is not a production custody/grant. */
 function creationFixture(

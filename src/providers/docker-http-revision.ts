@@ -57,6 +57,10 @@ export interface DockerHttpRevisionOptions {
   readonly healthFetch?: (request: Request) => Promise<Response>;
   /** Host-only opt-in; absent keeps the existing owned internal network profile. */
   readonly runtimePreparation?: DockerContainerRuntimePreparation;
+  /** Host-owned ordered numeric resolver override, required for Internet-capable
+   * preparation. This pins Engine configuration, not destination permission.
+   */
+  readonly dnsServers?: readonly string[];
 }
 
 export class DockerHttpRevisionError extends Error {
@@ -78,6 +82,7 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
   const timeoutMs = options.timeoutMs ?? 30_000;
   const preparation = options.runtimePreparation;
   const custody = preparation?.createCustody;
+  const dnsServers = dnsSnapshot(options.dnsServers);
   if (
     !options.socketPath.startsWith("/") ||
     !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(options.installationId) ||
@@ -87,7 +92,8 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
     !positive(options.maxNanoCpus) ||
     !positive(options.pidsLimit) ||
     !positive(timeoutMs) ||
-    (preparation !== undefined && !(preparation instanceof DockerContainerRuntimePreparation))
+    (preparation !== undefined && !(preparation instanceof DockerContainerRuntimePreparation)) ||
+    (preparation?.policy.outboundInternet === true && dnsServers === undefined)
   )
     throw new DockerHttpRevisionError("invalid_request");
   const engine = options.engine ?? dockerEngine(options.socketPath, timeoutMs);
@@ -145,6 +151,8 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
         SecurityOpt: ["no-new-privileges:true"],
         Privileged: false,
         PublishAllPorts: false,
+        // Moby's Go DNS/DNSOptions/DNSSearch fields use these exact JSON keys.
+        ...(dnsServers ? { Dns: [...dnsServers], DnsOptions: [], DnsSearch: [] } : {}),
         ...(preparation ? { RestartPolicy: { Name: "no", MaximumRetryCount: 0 } } : {}),
       },
     };
@@ -248,6 +256,7 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
       hostConfig.PublishAllPorts !== expectedHostConfig.PublishAllPorts ||
       !sameStringSet(hostConfig.CapDrop, expectedHostConfig.CapDrop) ||
       !sameStringSet(hostConfig.SecurityOpt, expectedHostConfig.SecurityOpt) ||
+      !matchesPinnedDns(hostConfig, dnsServers) ||
       !envContainsExpected(config.Env, target.body.Env) ||
       !exposesPort(config.ExposedPorts, target.input.port) ||
       !mountsAreEmpty(value.Mounts, hostConfig) ||
@@ -774,6 +783,36 @@ function exposesPort(actual: unknown, port: number): boolean {
 
 function emptyOptionalList(value: unknown): boolean {
   return value === undefined || value === null || (Array.isArray(value) && value.length === 0);
+}
+
+function dnsSnapshot(value: readonly string[] | undefined): readonly string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length === 0 || value.length > 3)
+    throw new DockerHttpRevisionError("invalid_request");
+  const copy = [...value];
+  if (
+    copy.some(
+      (server) => typeof server !== "string" || server.includes("%") || isIP(server) === 0,
+    ) ||
+    new Set(copy).size !== copy.length
+  )
+    throw new DockerHttpRevisionError("invalid_request");
+  return Object.freeze(copy);
+}
+
+function matchesPinnedDns(
+  hostConfig: JsonObject,
+  expected: readonly string[] | undefined,
+): boolean {
+  if (expected === undefined) return true;
+  const actual = hostConfig.Dns;
+  return (
+    Array.isArray(actual) &&
+    actual.length === expected.length &&
+    actual.every((server, index) => server === expected[index]) &&
+    emptyOptionalList(hostConfig.DnsOptions) &&
+    emptyOptionalList(hostConfig.DnsSearch)
+  );
 }
 
 function emptyOptionalObject(value: unknown): boolean {
