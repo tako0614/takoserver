@@ -1176,6 +1176,16 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
     case "takoserver-worker":
     case "takoserver-worker-authority-cutover":
       if (
+        target.schemaMaintenanceMode === "pre-v2-0098-quiesced" &&
+        (invocation.closurePredecessorVersionId !== undefined ||
+          invocation.closureDelta !== undefined)
+      ) {
+        throw new DeployError(
+          "preflight",
+          "pre-0098 Host publication refuses the generic closure-transition selector",
+        );
+      }
+      if (
         invocation.surface === "takoserver-worker-authority-cutover" &&
         invocation.closurePredecessorVersionId !== undefined &&
         invocation.closureDelta !== undefined

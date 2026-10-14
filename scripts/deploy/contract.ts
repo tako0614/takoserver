@@ -197,7 +197,10 @@ export const DEPLOY_CONTRACT = {
           "is the prerequisite for reconciling current support/activation heads; Host publication alone leaves those " +
           "durable heads unchanged. A Host code publication with unchanged `I` does not itself require reconvergence; " +
           "other existing drift follows its owning workflow. `I` follows the canonicalized actual emitted Worker " +
-          "bundle/import closure and derived inputs, not every docs/test/deploy-only or otherwise unrelated source diff.",
+          "bundle/import closure and derived inputs, not every docs/test/deploy-only or otherwise unrelated source diff. " +
+          "The exact pre-v2-0098 target is status-only here: local selected-source dry-run and native GET/readback " +
+          "of the non-serving Version, settings, schedules, topology and 503 response never query D1 or upload. " +
+          "Its apply belongs to the reviewed authority-cutover surface.",
         reversal:
           "The immediately previous Cloudflare Worker version is printed as the provider-history rollback target.",
         "failure-handling":
@@ -210,6 +213,7 @@ export const DEPLOY_CONTRACT = {
           "failed public probe over a Host that is already down. A plain-text value difference names " +
           "--refresh-var as its remedy. A diff that changes authentication, " +
           "authorization or the deploy mechanism is refused and routed to the authority cutover surface. " +
+          "An exact pre-v2-0098 apply on this routine surface is refused before credential, D1 or provider effects. " +
           "Wrangler JSON framing, the upload-to-deploy predecessor re-fence, publication identities and " +
           "final public smoke are strict; any drift or readback mismatch fails closed. The host-local " +
           "lease does not fence dashboard, direct-API, other owning deploy surfaces, or other-host actors; " +
@@ -393,7 +397,11 @@ export const DEPLOY_CONTRACT = {
           "is the prerequisite for reconciling current support/activation heads; Host publication alone leaves those " +
           "durable heads unchanged. A Host code publication with unchanged `I` does not itself require reconvergence; " +
           "other existing drift follows its owning workflow. `I` follows the canonicalized actual emitted Worker " +
-          "bundle/import closure and derived inputs, not every docs/test/deploy-only or otherwise unrelated source diff.",
+          "bundle/import closure and derived inputs, not every docs/test/deploy-only or otherwise unrelated source diff. " +
+          "For the exact original v2-0088/applied-v2-0092 pre-v2-0098 Host, this authority surface publishes one " +
+          "non-serving reviewed Version via topology-neutral versions upload and explicit traffic deployment under " +
+          "the shared publication lease. After an uncertain acknowledgment, authority status performs local dry-run " +
+          "and native GET-only closure/503 readback without D1 or a second upload; it never reports schema readiness.",
         reversal:
           "The immediately previous Cloudflare Worker version is printed as the provider-history rollback target.",
         "failure-handling":
@@ -403,6 +411,10 @@ export const DEPLOY_CONTRACT = {
           "Any other configuration, secret, signing or Hosted topology drift is still refused. Integration alone may bridge exact absence to the complete JIT " +
           "credential-authority profile; partial fields, wrong organization, reused keys and provenance " +
           "mismatch are refused. " +
+          "Pre-v2-0098 authority publication requires the existing independent reviewer before credential, D1 or " +
+          "provider effects, exact selected 0092 D1/readback on apply, and distinct private non-serving CPE proof " +
+          "when the target carries that executor. It refuses legacy, reverse and generic closure-transition " +
+          "selectors, and a status observation does not prove all old writers stopped or authorize migration. " +
           "The separate takoserver-sponsorship-public-route-retirement surface is the only " +
           "path that may carry the observed legacy service binding and Hosted secret into the " +
           "route-removing candidate; this generic authority surface rejects that selector. " +

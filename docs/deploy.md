@@ -219,12 +219,16 @@ publication or recovery entrypoint.
 
 The selected predecessor-to-source diff is still classified normally. If it
 touches authority-sensitive files (including the Host entrypoint or deploy
-mechanism), this one pre-0098 routine publication requires an explicitly named
-independent reviewer and records both the changed and authority paths. The
-ordinary serving routine lane still refuses such a diff; the authority-cutover
-surface is not a second pre-0098 publication route.
+mechanism), the existing `takoserver-worker-authority-cutover` surface requires
+its independent reviewer and records both the changed and authority paths.
+This exact pre-0098 authority path uses the same versioned `runWorker` uploader,
+shared publication lease and native readback as the Host maintenance path; it
+does not use the generic closure-transition selector. `takoserver-worker`
+apply refuses this target before credential, D1 or provider effects, and its
+ordinary authority-sensitive diff refusal remains unchanged.
 
-After publication, this target's existing `takoserver-worker --status` requires
+After publication, `takoserver-worker-authority-cutover --status` (or the
+routine surface's observation-only `--status`) requires
 the exact clean selected source checkout and performs a local, non-uploading
 Wrangler dry-run to derive its expected bundle digest and native compatibility,
 observability and behavioral settings from the selected source config. The

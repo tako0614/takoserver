@@ -1224,7 +1224,7 @@ describe("split Takoserver Worker surfaces", () => {
       let reads = 0;
       const result = await runWorker(
         {
-          surface: "takoserver-worker",
+          surface: "takoserver-worker-authority-cutover",
           action: "apply",
           environment: "integration",
           commit: COMMIT,
@@ -1232,6 +1232,7 @@ describe("split Takoserver Worker surfaces", () => {
         selected,
         {
           ...current,
+          review: "independent@example.test",
           outputDirectory: root,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
           integrationStorageVerification: integrationStorageVerificationOptions(selected, {
@@ -1335,7 +1336,7 @@ describe("split Takoserver Worker surfaces", () => {
             ? { exitCode: 0, stdout: realDiff, stderr: "" }
             : base.run(command, options);
       const invocation = {
-        surface: "takoserver-worker" as const,
+        surface: "takoserver-worker-authority-cutover" as const,
         action: "apply" as const,
         environment: "integration" as const,
         commit: COMMIT,
@@ -1350,14 +1351,58 @@ describe("split Takoserver Worker surfaces", () => {
         }),
         fetcher: maintenanceFetcher,
       });
+      const wrongSurface = fixture({
+        selectedTarget: selected,
+        applied: exact.applied,
+        auditedShape: exact.shape,
+      });
+      let wrongSurfaceD1Reads = 0;
+      await expect(
+        runWorker({ ...invocation, surface: "takoserver-worker" }, selected, {
+          ...baseOptions(wrongSurface),
+          review: "independent@example.test",
+          migrations: {
+            read: async () => {
+              wrongSurfaceD1Reads++;
+              throw new Error("wrong surface read D1");
+            },
+          },
+          integrationStorageVerification: integrationStorageVerificationOptions(selected, {
+            readState: async () => {
+              wrongSurfaceD1Reads++;
+              throw new Error("wrong surface read generated D1");
+            },
+          }),
+        }),
+      ).rejects.toThrow("requires takoserver-worker-authority-cutover");
+      expect(wrongSurfaceD1Reads).toBe(0);
+      expect(wrongSurface.calls).toEqual([]);
       const absentReviewer = fixture({
         selectedTarget: selected,
         applied: exact.applied,
         auditedShape: exact.shape,
       });
+      let unreviewedD1Reads = 0;
       await expect(
-        runWorker(invocation, selected, { ...baseOptions(absentReviewer), review: "" }),
+        runWorker(invocation, selected, {
+          ...baseOptions(absentReviewer),
+          review: "",
+          migrations: {
+            read: async () => {
+              unreviewedD1Reads++;
+              throw new Error("unreviewed read D1");
+            },
+          },
+          integrationStorageVerification: integrationStorageVerificationOptions(selected, {
+            readState: async () => {
+              unreviewedD1Reads++;
+              throw new Error("unreviewed read generated D1");
+            },
+          }),
+        }),
       ).rejects.toThrow("INDEPENDENT_REVIEW");
+      expect(unreviewedD1Reads).toBe(0);
+      expect(absentReviewer.calls).toEqual([]);
       expect(absentReviewer.calls.some((command) => command.join(" ") === "bun run check")).toBe(
         false,
       );
@@ -1521,7 +1566,7 @@ describe("split Takoserver Worker surfaces", () => {
         );
       const result = await runWorker(
         {
-          surface: "takoserver-worker",
+          surface: "takoserver-worker-authority-cutover",
           action: "apply",
           environment: "integration",
           commit: COMMIT,
@@ -1529,6 +1574,7 @@ describe("split Takoserver Worker surfaces", () => {
         selected,
         {
           ...current,
+          review: "independent@example.test",
           outputDirectory: root,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
           providerExecutorQualification: {
@@ -1588,7 +1634,7 @@ describe("split Takoserver Worker surfaces", () => {
         },
       };
       const statusInvocation = {
-        surface: "takoserver-worker" as const,
+        surface: "takoserver-worker-authority-cutover" as const,
         action: "status" as const,
         environment: "integration" as const,
         commit: COMMIT,
@@ -1685,7 +1731,7 @@ describe("split Takoserver Worker surfaces", () => {
       await expect(
         runWorker(
           {
-            surface: "takoserver-worker",
+            surface: "takoserver-worker-authority-cutover",
             action: "apply",
             environment: "integration",
             commit: COMMIT,
@@ -1701,7 +1747,7 @@ describe("split Takoserver Worker surfaces", () => {
             }),
           },
         ),
-      ).rejects.toThrow("pre-0098 CPE proof permits only routine Host maintenance publication");
+      ).rejects.toThrow("pre-0098 Host maintenance refuses legacy or reverse selectors");
       await expect(
         runWorker(
           {
@@ -1713,10 +1759,14 @@ describe("split Takoserver Worker surfaces", () => {
           selected,
           {
             ...current,
+            review: "independent@example.test",
             cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+            integrationStorageVerification: integrationStorageVerificationOptions(selected, {
+              readState: async () => exact,
+            }),
           },
         ),
-      ).rejects.toThrow("pre-0098 CPE proof permits only routine Host maintenance publication");
+      ).rejects.toThrow("provider executor");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -1775,7 +1825,7 @@ describe("split Takoserver Worker surfaces", () => {
         let proofReads = 0;
         const result = await runWorker(
           {
-            surface: "takoserver-worker",
+            surface: "takoserver-worker-authority-cutover",
             action: "apply",
             environment: "integration",
             commit: COMMIT,
@@ -1783,6 +1833,7 @@ describe("split Takoserver Worker surfaces", () => {
           selected,
           {
             ...current,
+            review: "independent@example.test",
             outputDirectory: root,
             cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
             run: async (command, options) => {

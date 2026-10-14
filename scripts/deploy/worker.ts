@@ -1092,6 +1092,25 @@ export async function runWorker(
   if (target.artifactBlobIoMode !== undefined && target.schemaMaintenanceMode !== undefined) {
     throw preflightError("Worker maintenance selectors conflict");
   }
+  if (target.schemaMaintenanceMode === "pre-v2-0098-quiesced") {
+    if (
+      invocation.legacyPredecessorVersionId !== undefined ||
+      invocation.legacyHostRuntimePredecessorVersionId !== undefined ||
+      invocation.reverse === true
+    ) {
+      throw preflightError("pre-0098 Host maintenance refuses legacy or reverse selectors");
+    }
+    if (invocation.action === "apply") {
+      if (invocation.surface !== "takoserver-worker-authority-cutover") {
+        throw preflightError(
+          "pre-0098 Host publication requires takoserver-worker-authority-cutover",
+        );
+      }
+      // This authority lane must reject a missing review before credential,
+      // selected-D1 proof or any provider read, even for a non-serving Version.
+      exactReviewer(options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"));
+    }
+  }
   if (invocation.legacyPredecessorVersionId !== undefined) {
     if (invocation.surface !== "takoserver-worker-authority-cutover") {
       throw preflightError(
@@ -1125,7 +1144,8 @@ export async function runWorker(
   await assertTargetComposes("preflight", target);
   if (invocation.action === "status" && target.schemaMaintenanceMode === "pre-v2-0098-quiesced") {
     if (
-      invocation.surface !== "takoserver-worker" ||
+      (invocation.surface !== "takoserver-worker" &&
+        invocation.surface !== "takoserver-worker-authority-cutover") ||
       invocation.legacyPredecessorVersionId !== undefined ||
       invocation.legacyHostRuntimePredecessorVersionId !== undefined ||
       invocation.reverse === true
@@ -1146,16 +1166,6 @@ export async function runWorker(
       options.providerExecutorQualification,
       options.wranglerPath,
     );
-  }
-  if (
-    invocation.action === "apply" &&
-    target.schemaMaintenanceMode === "pre-v2-0098-quiesced" &&
-    (invocation.surface !== "takoserver-worker" ||
-      invocation.legacyPredecessorVersionId !== undefined ||
-      invocation.legacyHostRuntimePredecessorVersionId !== undefined ||
-      invocation.reverse === true)
-  ) {
-    throw preflightError("pre-0098 CPE proof permits only routine Host maintenance publication");
   }
   const v2StorageBefore =
     target.takoformV2 === undefined || target.schemaMaintenanceMode === "pre-v2-0088-quiesced"
@@ -1318,7 +1328,10 @@ export async function runWorker(
       ...(beforeAuthorityProfile === undefined ? {} : { authorityProfile: beforeAuthorityProfile }),
     });
     const versionPublication =
-      invocation.surface === "takoserver-worker" && invocation.environment !== "production";
+      invocation.environment !== "production" &&
+      (invocation.surface === "takoserver-worker" ||
+        (invocation.surface === "takoserver-worker-authority-cutover" &&
+          target.schemaMaintenanceMode === "pre-v2-0098-quiesced"));
 
     if (
       target.schemaMaintenanceMode !== undefined &&
@@ -1458,14 +1471,9 @@ export async function runWorker(
       authorityPaths !== null &&
       authorityPaths.length > 0
     ) {
-      if (target.schemaMaintenanceMode !== "pre-v2-0098-quiesced") {
-        throw preflightError(
-          "authority-sensitive Worker diff requires takoserver-worker-authority-cutover",
-          JSON.stringify(authorityPaths),
-        );
-      }
-      reviewer = exactReviewer(
-        options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
+      throw preflightError(
+        "authority-sensitive Worker diff requires takoserver-worker-authority-cutover",
+        JSON.stringify(authorityPaths),
       );
     }
     if (invocation.surface === "takoserver-worker-authority-cutover") {
