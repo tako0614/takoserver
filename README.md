@@ -198,6 +198,11 @@ the part that owns accounts, money, and the machines.
 
 ## Self-hosting
 
+[Docker and Compose self-host](docs/self-host-docker.md) packages the
+artifact/control API profile with persistent local state and a loopback-only
+host port. Build it from a reviewed checkout; the complete Worker runtime
+requires the additional native setup below.
+
 [Self-host operations](docs/self-host-operations.md#first-install-and-first-use)
 is the install path, step by step, from a reviewed checkout to a Worker served
 over HTTPS. This section summarises it and lists the settings.

@@ -7,6 +7,10 @@ release channel. Select a reviewed source commit and retain its exact source
 and artifact provenance; this guide does not identify a latest release or
 claim GA status.
 
+For the artifact/control API profile in Docker or Compose, use
+[Docker self-host](self-host-docker.md). The complete local Worker profile
+still requires all native prerequisites below.
+
 ## First install and first use
 
 This is the install path for a Bun self-host, from a reviewed checkout to a
