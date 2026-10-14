@@ -592,6 +592,13 @@ const LAYERS: readonly Layer[] = [
     match: /^src\/shared-hosted-pricing\.ts$/u,
     may: ["core", "domain", "release-data"],
   },
+  {
+    // Shared app name policy belongs to the existing origin reservation domain.
+    // Its pure helpers do not gain adapter or composition import authority.
+    name: "domain",
+    match: /^src\/shared-app-name\.ts$/u,
+    may: ["core", "domain", "release-data"],
+  },
 ];
 
 function layerOf(path: string): Layer | undefined {
