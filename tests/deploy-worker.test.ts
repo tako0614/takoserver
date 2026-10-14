@@ -12,6 +12,7 @@ import type { DeployTarget } from "../scripts/deploy/target.ts";
 import type { ProviderExecutorInspection } from "../scripts/deploy/worker.ts";
 import {
   authoritySensitiveWorkerPaths,
+  probeMoneyCutoverProductOrFrozen,
   probeProduct,
   probeSchemaMaintenance,
   providerExecutorAllowsPublication,
@@ -312,6 +313,54 @@ function fixture(
 }
 
 describe("split Takoserver Worker surfaces", () => {
+  test("qualified 0094 publication distinguishes exact frozen refusal from readiness", async () => {
+    const origin = "https://money.example.workers.dev";
+    const frozen = async (_url: string) =>
+      Response.json(
+        {
+          error: {
+            code: "backend_unavailable",
+            message: "Host is frozen for the wallet USD-micros writer transition",
+            details: { reason: "money-cutover-freeze" },
+          },
+        },
+        { status: 503, headers: { "cache-control": "no-store", "retry-after": "60" } },
+      );
+    expect(await probeMoneyCutoverProductOrFrozen(origin, frozen)).toMatchObject({
+      status: 503,
+      traffic: "money-frozen",
+    });
+    await expect(
+      probeMoneyCutoverProductOrFrozen(origin, async () =>
+        Response.json(
+          {
+            error: {
+              code: "backend_unavailable",
+              message: "wrong refusal",
+              details: { reason: "money-cutover-freeze" },
+            },
+          },
+          { status: 503, headers: { "cache-control": "no-store", "retry-after": "60" } },
+        ),
+      ),
+    ).rejects.toThrow("exact guarded refusal");
+  });
+  test("transaction-fenced selected Host refuses 0095 until its trigger-restoring suffix", () => {
+    const selected = {
+      ...v2Target,
+      takoformV2: { ...v2Target.takoformV2, storageLineage: "v2-0092" as const },
+      moneyCutoverWriterPolicy: "transaction-fenced-usd-micros-v1" as const,
+      moneyCutoverWriterEpoch: `sha256:${"a".repeat(64)}`,
+    };
+    expect(
+      workerSchemaAllowsPending(selected, {
+        local: canonicalMigrations,
+        applied: canonicalMigrations,
+        shape: canonicalMoneyShape,
+        shapeDigest: canonicalMoneyShapeDigest,
+      }),
+    ).toBe(false);
+  });
   test("0092 without billingConfig refuses before Worker upload and reports not ready", async () => {
     const current = fixture({ applied: canonicalMigrations.slice(0, 92) });
     const status = await runWorker(

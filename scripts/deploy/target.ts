@@ -76,7 +76,14 @@ export interface DeployTarget {
   /** Temporary pre-0043 runtime used only by the 0043 cutover protocol. */
   readonly artifactBlobIoMode?: "pre-0043-quiesced";
   /** Optional whole-Host source-only maintenance profile for an exact pending schema wave. */
-  readonly schemaMaintenanceMode?: "pre-0058-quiesced" | "pre-v2-0088-quiesced";
+  readonly schemaMaintenanceMode?:
+    | "pre-0058-quiesced"
+    | "pre-v2-0088-quiesced"
+    | "pre-wallet-usd-micros-quiesced";
+  /** Explicit selected-Host D1 transaction containment, retained after resume. */
+  readonly moneyCutoverWriterPolicy?: "transaction-fenced-usd-micros-v1";
+  /** Reviewed nonsecret Writer generation; new source generations require a separate rotation. */
+  readonly moneyCutoverWriterEpoch?: string;
   /** Operator-selected, preprovisioned single-host custody for protected 0058 attempts. */
   readonly protected0058Custody?: {
     readonly root: string;
@@ -371,6 +378,8 @@ const DEPLOY_TARGET_OPTIONAL_KEYS: readonly string[] = [
   "integrationE2eCredentialAuthority",
   "artifactBlobIoMode",
   "schemaMaintenanceMode",
+  "moneyCutoverWriterPolicy",
+  "moneyCutoverWriterEpoch",
   "protected0058Custody",
   "takoformV2",
 ];
@@ -527,6 +536,12 @@ export function parseDeployTarget(
     ...(value.takoformV2 === undefined ? {} : { takoformV2: takoformV2(value.takoformV2) }),
     ...artifactBlobIoMode(value.artifactBlobIoMode),
     ...schemaMaintenanceMode(value.schemaMaintenanceMode),
+    ...(value.moneyCutoverWriterPolicy === undefined
+      ? {}
+      : { moneyCutoverWriterPolicy: moneyCutoverWriterPolicy(value.moneyCutoverWriterPolicy) }),
+    ...(value.moneyCutoverWriterEpoch === undefined
+      ? {}
+      : { moneyCutoverWriterEpoch: moneyCutoverWriterEpoch(value.moneyCutoverWriterEpoch) }),
     ...(value.protected0058Custody === undefined
       ? {}
       : { protected0058Custody: protected0058Custody(value.protected0058Custody) }),
@@ -599,6 +614,41 @@ export function parseDeployTarget(
   if (target.schemaMaintenanceMode === "pre-v2-0088-quiesced" && environment !== "integration") {
     throw preflightError("v2 0088 schema maintenance is integration-only");
   }
+  if (
+    target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced" &&
+    (environment !== "integration" ||
+      target.artifactBlobIoMode !== undefined ||
+      (target.takoformV2?.storageLineage !== "v2-0092" &&
+        target.takoformV2?.appliedSchemaLineage !== "v2-0092") ||
+      !/^takoserver-i-[0-9a-f]{32}$/u.test(target.d1.databaseName) ||
+      target.r2.bucketName !== target.d1.databaseName)
+  ) {
+    throw preflightError(
+      "wallet USD-micros maintenance requires an existing integration v2-0092 generated D1/R2 pair",
+    );
+  }
+  if (
+    target.moneyCutoverWriterPolicy !== undefined &&
+    (environment !== "integration" ||
+      (target.takoformV2?.storageLineage !== "v2-0092" &&
+        target.takoformV2?.appliedSchemaLineage !== "v2-0092") ||
+      !/^takoserver-i-[0-9a-f]{32}$/u.test(target.d1.databaseName) ||
+      target.r2.bucketName !== target.d1.databaseName)
+  ) {
+    throw preflightError("money cutover writer policy requires selected integration 0092 storage");
+  }
+  if (
+    (target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1") !==
+    (target.moneyCutoverWriterEpoch !== undefined)
+  ) {
+    throw preflightError("money cutover writer policy requires an exact pinned Writer epoch");
+  }
+  if (
+    target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced" &&
+    target.moneyCutoverWriterPolicy !== "transaction-fenced-usd-micros-v1"
+  ) {
+    throw preflightError("wallet USD-micros maintenance requires transaction writer policy");
+  }
   if (target.schemaMaintenanceMode === "pre-v2-0088-quiesced" && target.takoformV2 === undefined) {
     throw preflightError("v2 0088 schema maintenance must retain the exact v2 Worker config");
   }
@@ -625,7 +675,8 @@ export function parseDeployTarget(
   if (target.takoformV2?.appliedSchemaLineage === "v2-0092") {
     if (
       target.takoformV2.storageLineage !== "v2-0088" ||
-      target.schemaMaintenanceMode !== undefined ||
+      (target.schemaMaintenanceMode !== undefined &&
+        target.schemaMaintenanceMode !== "pre-wallet-usd-micros-quiesced") ||
       target.artifactBlobIoMode !== undefined
     ) {
       throw preflightError(
@@ -1529,11 +1580,29 @@ function artifactBlobIoMode(value: unknown): { readonly artifactBlobIoMode?: "pr
   return { artifactBlobIoMode: value };
 }
 
+function moneyCutoverWriterPolicy(value: unknown): "transaction-fenced-usd-micros-v1" {
+  if (value !== "transaction-fenced-usd-micros-v1") {
+    throw preflightError("deploy target money cutover writer policy is invalid");
+  }
+  return value;
+}
+
+function moneyCutoverWriterEpoch(value: unknown): string {
+  return pattern(value, /^sha256:[0-9a-f]{64}$/u, "moneyCutoverWriterEpoch");
+}
+
 function schemaMaintenanceMode(value: unknown): {
-  readonly schemaMaintenanceMode?: "pre-0058-quiesced" | "pre-v2-0088-quiesced";
+  readonly schemaMaintenanceMode?:
+    | "pre-0058-quiesced"
+    | "pre-v2-0088-quiesced"
+    | "pre-wallet-usd-micros-quiesced";
 } {
   if (value === undefined) return {};
-  if (value !== "pre-0058-quiesced" && value !== "pre-v2-0088-quiesced") {
+  if (
+    value !== "pre-0058-quiesced" &&
+    value !== "pre-v2-0088-quiesced" &&
+    value !== "pre-wallet-usd-micros-quiesced"
+  ) {
     throw preflightError(
       "deploy target `schemaMaintenanceMode` is not a supported maintenance profile",
     );

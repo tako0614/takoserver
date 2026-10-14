@@ -81,6 +81,75 @@ function withTarget(value: unknown, run: (path: string) => void): void {
 }
 
 describe("environment-exact deploy target", () => {
+  test("money transaction writer policy is explicit and scoped to generated integration storage", () => {
+    const generated = {
+      environment: "integration",
+      d1: {
+        databaseName: `takoserver-i-${"b".repeat(32)}`,
+        databaseId: "11111111-1111-4111-8111-111111111111",
+      },
+      r2: { bucketName: `takoserver-i-${"b".repeat(32)}` },
+      takoformV2: {
+        config: JSON.stringify({
+          documentation: "https://docs.example.test",
+          authenticationDocumentation: "https://auth.example.test",
+        }),
+        storageLineage: "v2-0092",
+      },
+    };
+    const policy = "transaction-fenced-usd-micros-v1";
+    const writerEpoch = `sha256:${"a".repeat(64)}`;
+    expect(
+      parseDeployTarget(
+        descriptor({
+          ...generated,
+          moneyCutoverWriterPolicy: policy,
+          moneyCutoverWriterEpoch: writerEpoch,
+        }),
+        "money target",
+        "integration",
+      ).moneyCutoverWriterPolicy,
+    ).toBe(policy);
+    expect(() =>
+      parseDeployTarget(
+        descriptor({ ...generated, moneyCutoverWriterPolicy: policy }),
+        "missing epoch",
+        "integration",
+      ),
+    ).toThrow("pinned Writer epoch");
+    expect(() =>
+      parseDeployTarget(
+        descriptor({ ...generated, moneyCutoverWriterEpoch: writerEpoch }),
+        "missing policy",
+        "integration",
+      ),
+    ).toThrow("pinned Writer epoch");
+    expect(() =>
+      parseDeployTarget(
+        descriptor({ ...generated, schemaMaintenanceMode: "pre-wallet-usd-micros-quiesced" }),
+        "missing policy",
+        "integration",
+      ),
+    ).toThrow("transaction writer policy");
+    expect(() =>
+      parseDeployTarget(
+        descriptor({
+          ...generated,
+          moneyCutoverWriterPolicy: "typo",
+          moneyCutoverWriterEpoch: writerEpoch,
+        }),
+        "invalid policy",
+        "integration",
+      ),
+    ).toThrow("writer policy");
+    expect(() =>
+      parseDeployTarget(
+        descriptor({ moneyCutoverWriterPolicy: policy, moneyCutoverWriterEpoch: writerEpoch }),
+        "foreign policy",
+        "rehearsal",
+      ),
+    ).toThrow("selected integration");
+  });
   test("loads the selected environment and product-owned sponsorship state", () => {
     withTarget(descriptor(), (path) => {
       expect(loadTarget(path, "rehearsal")).toMatchObject({

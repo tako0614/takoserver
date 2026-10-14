@@ -14,6 +14,11 @@ import {
   type IntegrationOrganizationBootstrapConfig,
   resolveIntegrationOrganizationBootstrapConfig,
 } from "./integration-organization-bootstrap.ts";
+import {
+  createMoneyCutoverSql,
+  inspectMoneyCutoverGuard,
+  MONEY_CUTOVER_WRITER_POLICY,
+} from "./money-cutover-sql.ts";
 import { createR2ObjectStore } from "./objects-r2.ts";
 import {
   createOperatorPaymentsReconcileVerifier,
@@ -84,6 +89,8 @@ export interface WorkerEnv {
   readonly TAKOSERVER_ARTIFACT_BLOB_IO_MODE?: string;
   /** Whole-Host schema maintenance; never a serving runtime mode. */
   readonly TAKOSERVER_SCHEMA_MAINTENANCE_MODE?: string;
+  readonly TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY?: string;
+  readonly TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH?: string;
   /** Where this deployment's console is served, if it has one. */
   readonly TAKOSERVER_CONSOLE_ORIGIN?: string;
   /** Versioned JSON Organization billing tariff; absent disables the new wallet API. */
@@ -409,10 +416,14 @@ function artifactBlobIoMode(
 
 function schemaMaintenanceMode(
   env: Pick<WorkerEnv, "TAKOSERVER_SCHEMA_MAINTENANCE_MODE" | "TAKOSERVER_ARTIFACT_BLOB_IO_MODE">,
-): "normal" | "pre-0058-quiesced" | "pre-v2-0088-quiesced" {
+): "normal" | "pre-0058-quiesced" | "pre-v2-0088-quiesced" | "pre-wallet-usd-micros-quiesced" {
   const value = env.TAKOSERVER_SCHEMA_MAINTENANCE_MODE;
   if (value === undefined) return "normal";
-  if (value !== "pre-0058-quiesced" && value !== "pre-v2-0088-quiesced") {
+  if (
+    value !== "pre-0058-quiesced" &&
+    value !== "pre-v2-0088-quiesced" &&
+    value !== "pre-wallet-usd-micros-quiesced"
+  ) {
     throw new TypeError("TAKOSERVER_SCHEMA_MAINTENANCE_MODE is invalid");
   }
   if (env.TAKOSERVER_ARTIFACT_BLOB_IO_MODE !== undefined) {
@@ -421,15 +432,42 @@ function schemaMaintenanceMode(
   return value;
 }
 
-function schemaMaintenanceResponse(mode: "pre-0058-quiesced" | "pre-v2-0088-quiesced"): Response {
+function moneyCutoverWriterPolicy(env: WorkerEnv): string | null {
+  const value = env.TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY;
+  const epoch = env.TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH;
+  if (value === undefined && epoch === undefined) return null;
+  if (value !== MONEY_CUTOVER_WRITER_POLICY || env.TAKOSERVER_ENVIRONMENT !== "integration") {
+    throw new TypeError("money cutover writer policy is invalid");
+  }
+  if (typeof epoch !== "string" || !/^sha256:[0-9a-f]{64}$/u.test(epoch)) {
+    throw new TypeError("money cutover Writer epoch is invalid");
+  }
+  return epoch;
+}
+
+function moneyCutoverFrozenResponse(): Response {
+  return errorEnvelopeResponse(
+    "backend_unavailable",
+    503,
+    { reason: "money-cutover-freeze" },
+    { headers: { "cache-control": "no-store", "retry-after": "60" } },
+    "Host is frozen for the wallet USD-micros writer transition",
+  );
+}
+
+function schemaMaintenanceResponse(
+  mode: "pre-0058-quiesced" | "pre-v2-0088-quiesced" | "pre-wallet-usd-micros-quiesced",
+): Response {
   return errorEnvelopeResponse(
     "backend_unavailable",
     503,
     { reason: "runtime-configuration" },
     { headers: { "cache-control": "no-store", "retry-after": "60" } },
-    mode === "pre-0058-quiesced"
-      ? "Host is quiesced for the 0058 schema maintenance transition"
-      : "Host is quiesced for the v2 0088 schema maintenance transition",
+    mode === "pre-wallet-usd-micros-quiesced"
+      ? "Host is quiesced for the wallet USD-micros schema maintenance transition"
+      : mode === "pre-0058-quiesced"
+        ? "Host is quiesced for the 0058 schema maintenance transition"
+        : "Host is quiesced for the v2 0088 schema maintenance transition",
   );
 }
 
@@ -834,7 +872,9 @@ async function composeApp(
     origin,
     integrationE2eCredentialAuthority,
   );
-  const sql = createD1Sql(env.STATE_DB);
+  const rawSql = createD1Sql(env.STATE_DB);
+  const writerEpoch = moneyCutoverWriterPolicy(env);
+  const sql = writerEpoch === null ? rawSql : createMoneyCutoverSql(rawSql, writerEpoch);
   try {
     // The wallet and ledger use USD micros even when tariff billing is disabled.
     // This read-only proof precedes every normal serving composition and tariff write.
@@ -1064,9 +1104,16 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
       try {
         const schemaMode = startupStage("runtime-configuration", () => schemaMaintenanceMode(env));
         const mode = startupStage("runtime-configuration", () => artifactBlobIoMode(env));
+        const moneyPolicy = startupStage("runtime-configuration", () =>
+          moneyCutoverWriterPolicy(env),
+        );
         if (schemaMode !== "normal") return schemaMaintenanceResponse(schemaMode);
         if (mode === "pre-0043-quiesced") {
           return artifactBlobIoQuiescenceResponse();
+        }
+        if (moneyPolicy !== null) {
+          const guard = await inspectMoneyCutoverGuard(createD1Sql(env.STATE_DB), moneyPolicy);
+          if (guard === "frozen") return moneyCutoverFrozenResponse();
         }
         app = await appFor(
           env,
@@ -1103,6 +1150,11 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
     async scheduled(_event: unknown, env: WorkerEnv): Promise<void> {
       if (schemaMaintenanceMode(env) !== "normal") return;
       if (artifactBlobIoMode(env) === "pre-0043-quiesced") return;
+      const writerEpoch = moneyCutoverWriterPolicy(env);
+      if (writerEpoch !== null) {
+        if ((await inspectMoneyCutoverGuard(createD1Sql(env.STATE_DB), writerEpoch)) === "frozen")
+          return;
+      }
       const app = await appFor(env, requirePublicOrigin(env));
       const results = await Promise.allSettled([
         Promise.resolve().then(() => app.tick()),

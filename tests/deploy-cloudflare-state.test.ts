@@ -35,6 +35,65 @@ function envelope(
 }
 
 describe("strict paginated Cloudflare state", () => {
+  test("scoped Worker domain proof retains the service filter on every page", async () => {
+    const requests: URL[] = [];
+    const service = "takoserver-api-integration-money";
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "operator-token",
+      workerDomainServiceScope: service,
+      fetcher: async (request) => {
+        const url = new URL(request.url);
+        requests.push(url);
+        expect(url.pathname).toBe(`/client/v4/accounts/${ACCOUNT}/workers/domains`);
+        expect(url.searchParams.get("service")).toBe(service);
+        const page = Number(url.searchParams.get("page"));
+        return envelope(
+          Array.from({ length: page === 1 ? 100 : 1 }, (_, index) => ({
+            hostname: `staging-${page}-${index}.example.test`,
+            service,
+          })),
+          page,
+          2,
+          101,
+        );
+      },
+    });
+    expect(await state.workerDomains()).toHaveLength(101);
+    expect(requests).toHaveLength(2);
+  });
+
+  test("a scoped domain reader rejects foreign services and unfiltered totals without a global retry", async () => {
+    const service = "takoserver-api-integration-money";
+    for (const inconsistentTotals of [false, true]) {
+      const requests: URL[] = [];
+      const state = new CloudflareState({
+        accountId: ACCOUNT,
+        token: "operator-token",
+        workerDomainServiceScope: service,
+        fetcher: async (request) => {
+          requests.push(new URL(request.url));
+          return envelope(
+            [
+              {
+                hostname: "staging.example.test",
+                service: inconsistentTotals ? service : "other-service",
+              },
+            ],
+            1,
+            1,
+            inconsistentTotals ? 2 : 1,
+          );
+        },
+      });
+      await expect(state.workerDomains()).rejects.toThrow(
+        inconsistentTotals ? "pagination total" : "foreign service",
+      );
+      expect(requests).toHaveLength(1);
+      expect(requests.every((url) => url.searchParams.get("service") === service)).toBe(true);
+    }
+  });
+
   test("retries one transient header transport failure with a fresh bounded GET", async () => {
     const requests: Request[] = [];
     const state = new CloudflareState({

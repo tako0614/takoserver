@@ -53,6 +53,12 @@ import {
   readSealedFreshV2ArtifactMigrationArtifact,
   type SchemaReader,
 } from "./schema.ts";
+import {
+  type MoneySchemaPhase,
+  moneyUnitCutoverExpectedShape,
+  moneyUnitCutoverSchemaMatches,
+  moneyUnitCutoverSourcePrefixDigest,
+} from "./schema-money-unit-cutover.ts";
 import type { DeployTarget } from "./target.ts";
 
 const CLOUDFLARE_API = "https://api.cloudflare.com/client/v4";
@@ -303,6 +309,8 @@ export interface IntegrationStorageGenerationTargetVerificationOptions {
   readonly wranglerCommand?: IntegrationStorageGenerationOptions["wranglerCommand"];
   /** Read-only Worker proof after an independently qualified 0094 cutover. */
   readonly allowCurrentAuditedSuccessor?: boolean;
+  /** Read-side only for the dedicated non-serving 0092/0093/0094 money maintenance campaign. */
+  readonly allowMoneyUnitMaintenance?: boolean;
 }
 
 export type IntegrationStorageGeneratedStateOptions = Pick<
@@ -505,8 +513,12 @@ async function verifyGeneratedStorageTarget(
 
   const migrationDirectory = options.migrationDirectory ?? resolve(REPOSITORY, "migrations");
   const sourceArtifact = selectedSourceArtifact(migrationDirectory, lineage);
+  const moneyMaintenance =
+    options.allowMoneyUnitMaintenance === true &&
+    target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced" &&
+    (lineage === "v2-0092" || lineage === "applied-v2-0092");
   const currentSource =
-    options.allowCurrentAuditedSuccessor === true && lineage !== "apply-0066"
+    (options.allowCurrentAuditedSuccessor === true || moneyMaintenance) && lineage !== "apply-0066"
       ? readCurrentAuditedMigrationSourceArtifact(migrationDirectory)
       : null;
   const temporary = options.outputDirectory === undefined;
@@ -548,15 +560,48 @@ async function verifyGeneratedStorageTarget(
     // never a new generation payload. Both alternatives are exact audited
     // ledgers; partial states and foreign migration tails match neither.
     const currentAudited =
-      currentSource !== null &&
-      currentSource.names.includes(MONEY_UNIT_MIGRATION) &&
-      JSON.stringify(migrationState.applied) === JSON.stringify(currentSource.names);
-    const observedSource = currentAudited ? currentSource : sourceArtifact;
+      currentSource === null
+        ? false
+        : currentSource.names.includes(MONEY_UNIT_MIGRATION) &&
+          JSON.stringify(migrationState.applied) === JSON.stringify(currentSource.names);
+    const moneyPhase =
+      currentSource === null
+        ? undefined
+        : (
+            [
+              ...(moneyMaintenance ? ["0092", "0092-fenced", "0093", "0093-fenced"] : []),
+              ...(options.allowCurrentAuditedSuccessor === true || moneyMaintenance
+                ? ["0094", "0094-fenced"]
+                : []),
+            ] as MoneySchemaPhase[]
+          ).find((phase) =>
+            moneyUnitCutoverSchemaMatches(migrationState, currentSource.files, phase),
+          );
+    const moneyCount = moneyPhase === undefined ? undefined : Number(moneyPhase.slice(0, 4));
+    const observedSource =
+      moneyCount !== undefined && currentSource !== null
+        ? {
+            ...currentSource,
+            files: currentSource.files.slice(0, moneyCount),
+            names: currentSource.names.slice(0, moneyCount),
+            bytes: currentSource.files
+              .slice(0, moneyCount)
+              .reduce((sum, file) => sum + file.bytes, 0),
+            digest: moneyUnitCutoverSourcePrefixDigest(
+              currentSource.files,
+              moneyCount as 92 | 93 | 94,
+            ),
+          }
+        : currentAudited && currentSource !== null
+          ? currentSource
+          : sourceArtifact;
     assertCompleteDatabase(
       migrationState,
       observedSource.names,
       observedSource.digest,
-      deriveExpectedApplicationShape(observedSource.files),
+      moneyPhase === undefined
+        ? deriveExpectedApplicationShape(observedSource.files)
+        : moneyUnitCutoverExpectedShape(currentSource?.files ?? [], moneyPhase),
       generated.databaseId,
       "preflight",
     );

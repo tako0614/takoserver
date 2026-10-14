@@ -214,6 +214,12 @@ export function deploymentVariables(
   if (target.schemaMaintenanceMode !== undefined) {
     vars.TAKOSERVER_SCHEMA_MAINTENANCE_MODE = target.schemaMaintenanceMode;
   }
+  if (target.moneyCutoverWriterPolicy !== undefined) {
+    if (target.moneyCutoverWriterEpoch === undefined)
+      throw preflightError("selected money Writer epoch is missing");
+    vars.TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY = target.moneyCutoverWriterPolicy;
+    vars.TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH = target.moneyCutoverWriterEpoch;
+  }
   if (target.consoleOrigin !== undefined) vars.TAKOSERVER_CONSOLE_ORIGIN = target.consoleOrigin;
   if (target.googleClientId !== undefined) vars.GOOGLE_CLIENT_ID = target.googleClientId;
   if (target.takosId !== undefined) {

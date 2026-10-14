@@ -67,6 +67,7 @@ import {
   reconcileDispatchedProtected0058Transition,
   runProtected0058Transition,
 } from "./schema-0058-transition.ts";
+import type { MoneyUnitCutoverOptions } from "./schema-money-unit-cutover.ts";
 import {
   assertSchemaV20092PostProof,
   assertSchemaV20092PreProof,
@@ -473,6 +474,8 @@ export const SCHEMA_WAVE_BOUNDARIES = [
   "0058",
   "0088",
   "0092",
+  "0093",
+  "0094",
 ] as const;
 export type SchemaWaveBoundary = (typeof SCHEMA_WAVE_BOUNDARIES)[number];
 const SCHEMA_WAVES: Readonly<
@@ -618,6 +621,18 @@ const SCHEMA_WAVES: Readonly<
     throughCount: 92,
     throughMigration: "0092_org_wallet_lifecycle.sql",
   },
+  "0093": {
+    fromCount: 92,
+    fromMigration: "0092_org_wallet_lifecycle.sql",
+    throughCount: 93,
+    throughMigration: "0093_wallet_credit_classification_proofs.sql",
+  },
+  "0094": {
+    fromCount: 93,
+    fromMigration: "0093_wallet_credit_classification_proofs.sql",
+    throughCount: 94,
+    throughMigration: "0094_wallet_usd_micros.sql",
+  },
 };
 const RECEIPT_CHAIN_BOUNDARIES = SCHEMA_WAVE_BOUNDARIES.filter(
   (boundary): boundary is Exclude<SchemaWaveBoundary, "0022"> =>
@@ -718,6 +733,8 @@ export interface SchemaInvocation {
 }
 
 export interface SchemaOptions {
+  /** Dedicated staging-only monetary qualification; never widens the legacy/fresh lanes. */
+  readonly moneyUnitCutover?: MoneyUnitCutoverOptions;
   readonly run?: SchemaProcess;
   readonly reader?: SchemaReader;
   readonly migrationDirectory?: string;
@@ -1081,6 +1098,25 @@ export async function runD1Schema(
 ): Promise<Record<string, unknown>> {
   if (target.environment !== invocation.environment) {
     throw preflightError("D1 schema invocation and target environments differ");
+  }
+  if (invocation.throughMigration === "0093" || invocation.throughMigration === "0094") {
+    if (invocation.environment !== "integration" || options.moneyUnitCutover === undefined) {
+      throw preflightError(
+        "0093/0094 require the dedicated integration money-unit owner qualification",
+      );
+    }
+    const { runIntegrationMoneyUnitCutover } = await import("./schema-money-unit-cutover.ts");
+    return await runIntegrationMoneyUnitCutover(
+      { ...invocation, environment: "integration", throughMigration: invocation.throughMigration },
+      target,
+      options.moneyUnitCutover,
+    );
+  }
+  if (target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1") {
+    // The ordinary lane would apply 0095 without reinstalling the permanent
+    // stripe_events trigger dropped by its table rebuild. Keep the selected
+    // DB on the reviewed 0093/0094 route until a separate suffix owns that.
+    throw preflightError("transaction-fenced money target requires a reviewed 0095 suffix route");
   }
   if (
     invocation.throughMigration !== undefined &&

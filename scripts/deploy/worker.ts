@@ -51,6 +51,7 @@ import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualif
 import { writeWorkerConfig } from "./realized-config.ts";
 import { runAuthorityTransition } from "./retirement.ts";
 import { readCurrentAuditedMigrationSourceArtifact } from "./schema.ts";
+import { moneyUnitCutoverSchemaMatches } from "./schema-money-unit-cutover.ts";
 import {
   activePublicJwk,
   createRemoteSigningDatabase,
@@ -239,6 +240,37 @@ export function workerSchemaAllowsPending(
   },
   sourceRepositoryRoot = REPOSITORY,
 ): boolean {
+  if (target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced") {
+    if (
+      target.moneyCutoverWriterPolicy !== "transaction-fenced-usd-micros-v1" ||
+      !/^sha256:[0-9a-f]{64}$/u.test(target.moneyCutoverWriterEpoch ?? "") ||
+      target.environment !== "integration" ||
+      target.artifactBlobIoMode !== undefined ||
+      (target.takoformV2?.storageLineage !== "v2-0092" &&
+        target.takoformV2?.appliedSchemaLineage !== "v2-0092") ||
+      migrations.shape === undefined ||
+      migrations.shapeDigest === undefined
+    ) {
+      return false;
+    }
+    const source = readCurrentAuditedMigrationSourceArtifact(
+      resolve(sourceRepositoryRoot, "migrations"),
+    );
+    if (JSON.stringify(migrations.local) !== JSON.stringify(source.names)) return false;
+    const state = {
+      applied: migrations.applied,
+      shape: migrations.shape,
+      shapeDigest: migrations.shapeDigest,
+    };
+    return (
+      moneyUnitCutoverSchemaMatches(state, source.files, "0092") ||
+      moneyUnitCutoverSchemaMatches(state, source.files, "0092-fenced") ||
+      moneyUnitCutoverSchemaMatches(state, source.files, "0093") ||
+      moneyUnitCutoverSchemaMatches(state, source.files, "0093-fenced") ||
+      moneyUnitCutoverSchemaMatches(state, source.files, "0094") ||
+      moneyUnitCutoverSchemaMatches(state, source.files, "0094-fenced")
+    );
+  }
   if (target.schemaMaintenanceMode === "pre-v2-0088-quiesced") {
     if (target.environment !== "integration" || target.artifactBlobIoMode !== undefined) {
       return false;
@@ -275,16 +307,42 @@ export function workerSchemaAllowsPending(
     target.schemaMaintenanceMode === undefined &&
     target.artifactBlobIoMode === undefined &&
     target.environment === "integration" &&
-    target.takoformV2?.storageLineage !== undefined
+    (target.takoformV2?.storageLineage !== undefined ||
+      target.takoformV2?.appliedSchemaLineage !== undefined)
   ) {
     // The selected storage lineage remains the immutable generation origin;
     // it never authorizes this USD-micros Worker on the old money unit.
     const source = readCurrentAuditedMigrationSourceArtifact(
       resolve(sourceRepositoryRoot, "migrations"),
     );
+    if (JSON.stringify(migrations.local) !== JSON.stringify(source.names)) return false;
+    // 0095 rebuilds stripe_events and drops its permanent writer trigger.
+    // A separate reviewed suffix must restore the guard in the same import.
+    if (target.moneyCutoverWriterPolicy !== undefined && migrations.applied.length > 94)
+      return false;
+    if (JSON.stringify(migrations.applied) === JSON.stringify(source.names)) return true;
+    // The selected 0092 generation may serve the exact reviewed 0094 cutover
+    // prefix while 0095 remains an audited source-only successor. Hosted
+    // subscriptions need the complete 0095 schema and cannot use this prefix.
+    if (
+      target.moneyCutoverWriterPolicy !== "transaction-fenced-usd-micros-v1" ||
+      !/^sha256:[0-9a-f]{64}$/u.test(target.moneyCutoverWriterEpoch ?? "") ||
+      target.hostedPricing !== undefined ||
+      (target.takoformV2?.storageLineage !== "v2-0092" &&
+        target.takoformV2?.appliedSchemaLineage !== "v2-0092") ||
+      migrations.shape === undefined ||
+      migrations.shapeDigest === undefined
+    ) {
+      return false;
+    }
+    const state = {
+      applied: migrations.applied,
+      shape: migrations.shape,
+      shapeDigest: migrations.shapeDigest,
+    };
     return (
-      JSON.stringify(migrations.local) === JSON.stringify(source.names) &&
-      JSON.stringify(migrations.applied) === JSON.stringify(source.names)
+      moneyUnitCutoverSchemaMatches(state, source.files, "0094") ||
+      moneyUnitCutoverSchemaMatches(state, source.files, "0094-fenced")
     );
   }
   if (target.schemaMaintenanceMode !== "pre-0058-quiesced") {
@@ -321,14 +379,23 @@ export function workerMoneyUnitSchemaReady(
     if (expectedMoneyShapes.size >= 4) expectedMoneyShapes.clear();
     expectedMoneyShapes.set(source.digest, expectedShape);
   }
+  if (
+    !source.names.includes(MONEY_UNIT_MIGRATION) ||
+    JSON.stringify(migrations.local) !== JSON.stringify(source.names)
+  ) {
+    return false;
+  }
+  const state = {
+    applied: migrations.applied,
+    shape: migrations.shape,
+    shapeDigest: migrations.shapeDigest,
+  };
+  if (JSON.stringify(migrations.applied) === JSON.stringify(source.names)) {
+    return applicationSchemaMatches(state, expectedShape);
+  }
   return (
-    source.names.includes(MONEY_UNIT_MIGRATION) &&
-    JSON.stringify(migrations.local) === JSON.stringify(source.names) &&
-    JSON.stringify(migrations.applied) === JSON.stringify(source.names) &&
-    applicationSchemaMatches(
-      { applied: migrations.applied, shape: migrations.shape, shapeDigest: migrations.shapeDigest },
-      expectedShape,
-    )
+    moneyUnitCutoverSchemaMatches(state, source.files, "0094") ||
+    moneyUnitCutoverSchemaMatches(state, source.files, "0094-fenced")
   );
 }
 
@@ -379,9 +446,11 @@ export async function probeSchemaMaintenance(
     body.error.code !== "backend_unavailable" ||
     !("message" in body.error) ||
     body.error.message !==
-      (mode === "pre-0058-quiesced"
-        ? "Host is quiesced for the 0058 schema maintenance transition"
-        : "Host is quiesced for the v2 0088 schema maintenance transition") ||
+      (mode === "pre-wallet-usd-micros-quiesced"
+        ? "Host is quiesced for the wallet USD-micros schema maintenance transition"
+        : mode === "pre-0058-quiesced"
+          ? "Host is quiesced for the 0058 schema maintenance transition"
+          : "Host is quiesced for the v2 0088 schema maintenance transition") ||
     !("details" in body.error) ||
     typeof body.error.details !== "object" ||
     body.error.details === null ||
@@ -394,6 +463,52 @@ export async function probeSchemaMaintenance(
     );
   }
   return { url, status: 503, traffic: "maintenance" };
+}
+
+/** Exact staged normal Worker refusal while the reviewed 0094 freeze row remains. */
+export async function probeMoneyCutoverFrozen(
+  origin: string,
+  fetcher: (input: string, init?: RequestInit) => Promise<Response>,
+): Promise<{ readonly url: string; readonly status: 503; readonly traffic: "money-frozen" }> {
+  const url = `${origin}/healthz`;
+  const response = await fetcher(url, {
+    method: "GET",
+    headers: { "cache-control": "no-cache" },
+    redirect: "error",
+  }).catch(() => {
+    throw verificationError("money cutover frozen Worker probe failed");
+  });
+  const body = (await response.json().catch(() => null)) as unknown;
+  if (
+    response.status !== 503 ||
+    response.headers.get("cache-control") !== "no-store" ||
+    response.headers.get("retry-after") !== "60" ||
+    !isRecord(body) ||
+    !isRecord(body.error) ||
+    body.error.code !== "backend_unavailable" ||
+    body.error.message !== "Host is frozen for the wallet USD-micros writer transition" ||
+    !isRecord(body.error.details) ||
+    body.error.details.reason !== "money-cutover-freeze"
+  )
+    throw verificationError("money cutover Worker did not prove exact guarded refusal");
+  return { url, status: 503, traffic: "money-frozen" };
+}
+
+/** A 0094 normal Version can be published before the reviewed freeze-row deletion. */
+export async function probeMoneyCutoverProductOrFrozen(
+  origin: string,
+  fetcher: (input: string, init?: RequestInit) => Promise<Response>,
+) {
+  const response = await fetcher(`${origin}/healthz`, {
+    method: "GET",
+    headers: { "cache-control": "no-cache" },
+    redirect: "error",
+  }).catch(() => {
+    throw verificationError("money cutover Worker health state is unavailable");
+  });
+  if (response.status === 503) return probeMoneyCutoverFrozen(origin, fetcher);
+  if (response.status === 200) return probeProduct(origin, fetcher);
+  throw verificationError("money cutover Worker health state is divergent");
 }
 
 export { authoritySensitiveWorkerPaths } from "./worker-authority-paths.ts";
@@ -453,7 +568,14 @@ export async function runWorker(
           sourceRepositoryRoot,
         );
   const createCloudflareState = (token: string | undefined): CloudflareState =>
-    new CloudflareState({ accountId: target.accountId, token: token ?? exactToken(environment) });
+    new CloudflareState({
+      accountId: target.accountId,
+      token: token ?? exactToken(environment),
+      ...(target.environment === "integration" &&
+      new URL(target.publicOrigin).hostname.endsWith(".workers.dev")
+        ? { workerDomainServiceScope: target.workerName }
+        : {}),
+    });
   const cloudflareState =
     options.state === undefined ? createCloudflareState(credential?.token) : null;
   const initialState = options.state ?? cloudflareState;
@@ -584,6 +706,19 @@ export async function runWorker(
     }
 
     if (invocation.action === "status") {
+      const moneyServingProbe =
+        target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1" &&
+        target.schemaMaintenanceMode === undefined &&
+        before.migrations.applied.length === 94 &&
+        workerSchemaAllowsPending(target, before.migrations, sourceRepositoryRoot)
+          ? await probeMoneyCutoverProductOrFrozen(
+              target.publicOrigin,
+              options.fetcher ?? ((input, init) => fetch(input, init)),
+            )
+          : null;
+      const moneyServingReady =
+        moneyServingProbe === null ||
+        !("traffic" in moneyServingProbe && moneyServingProbe.traffic === "money-frozen");
       const advancedFromSelector =
         invocation.legacyPredecessorVersionId !== undefined &&
         before.history.versionId !== invocation.legacyPredecessorVersionId;
@@ -607,6 +742,9 @@ export async function runWorker(
         pendingMigrations: before.pending,
         moneyUnitSchemaReady: moneySchemaReady,
         billingSchemaReady: orgBillingSchemaReady(target, before.migrations.applied),
+        ...(moneyServingProbe === null
+          ? {}
+          : { servingReady: moneyServingReady, probe: moneyServingProbe }),
         ...(target.schemaMaintenanceMode === undefined
           ? {}
           : { maintenance: target.schemaMaintenanceMode }),
@@ -626,6 +764,7 @@ export async function runWorker(
           : {}),
         ready:
           target.schemaMaintenanceMode === undefined &&
+          moneyServingReady &&
           workerSchemaAllowsPending(target, before.migrations, sourceRepositoryRoot) &&
           (target.artifactBlobIoMode !== undefined || moneySchemaReady) &&
           stripeWebhookSchemaReady(target, before.migrations.applied) &&
@@ -976,10 +1115,16 @@ export async function runWorker(
               target.publicOrigin,
               options.fetcher ?? ((input, init) => fetch(input, init)),
             )
-          : await probeProduct(
-              target.publicOrigin,
-              options.fetcher ?? ((input, init) => fetch(input, init)),
-            );
+          : target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1" &&
+              after.migrations.applied.length === 94
+            ? await probeMoneyCutoverProductOrFrozen(
+                target.publicOrigin,
+                options.fetcher ?? ((input, init) => fetch(input, init)),
+              )
+            : await probeProduct(
+                target.publicOrigin,
+                options.fetcher ?? ((input, init) => fetch(input, init)),
+              );
     return {
       kind: "takoserver.worker-apply@v2",
       surface: invocation.surface,
@@ -1000,6 +1145,7 @@ export async function runWorker(
       deploymentId: after.history.deploymentId,
       versionId: after.history.versionId,
       probe,
+      servingReady: !("traffic" in probe),
       ...(target.schemaMaintenanceMode === undefined
         ? {}
         : { maintenance: target.schemaMaintenanceMode }),
@@ -1049,6 +1195,8 @@ async function readFreshV2StorageProof(
         ...options.integrationStorageVerification,
         allowCurrentAuditedSuccessor:
           target.schemaMaintenanceMode === undefined && target.artifactBlobIoMode === undefined,
+        allowMoneyUnitMaintenance:
+          target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced",
         run,
         ...(options.cloudflareEnvironment === undefined
           ? {}

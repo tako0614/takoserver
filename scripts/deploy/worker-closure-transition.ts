@@ -39,6 +39,7 @@ import {
 import {
   assertProviderExecutorUnchanged,
   assertWorkerMoneyUnitSchema,
+  probeMoneyCutoverProductOrFrozen,
   probeProduct,
   probeSchemaMaintenance,
   providerExecutorAllowsPublication,
@@ -231,6 +232,8 @@ export async function runWorkerClosureTransition(
       : await selectedStorageVerifier(target)(target, invocation.environment, {
           ...options.integrationStorageVerification,
           allowCurrentAuditedSuccessor: closureRequiresMoneyUnitSchema(target),
+          allowMoneyUnitMaintenance:
+            target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced",
           run,
           ...(options.cloudflareEnvironment === undefined
             ? {}
@@ -248,7 +251,14 @@ export async function runWorkerClosureTransition(
     null;
   try {
     const createCloudflareState = (token: string | undefined): CloudflareState =>
-      new CloudflareState({ accountId: target.accountId, token: token ?? exactToken(environment) });
+      new CloudflareState({
+        accountId: target.accountId,
+        token: token ?? exactToken(environment),
+        ...(target.environment === "integration" &&
+        new URL(target.publicOrigin).hostname.endsWith(".workers.dev")
+          ? { workerDomainServiceScope: target.workerName }
+          : {}),
+      });
     const cloudflareState =
       options.state === undefined ? createCloudflareState(credential?.token) : null;
     const initialState = options.state ?? cloudflareState;
@@ -554,6 +564,8 @@ export async function runWorkerClosureTransition(
         {
           ...options.integrationStorageVerification,
           allowCurrentAuditedSuccessor: closureRequiresMoneyUnitSchema(target),
+          allowMoneyUnitMaintenance:
+            target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced",
           run,
           ...(options.cloudflareEnvironment === undefined
             ? {}
@@ -638,6 +650,8 @@ export async function runWorkerClosureTransition(
         {
           ...options.integrationStorageVerification,
           allowCurrentAuditedSuccessor: closureRequiresMoneyUnitSchema(target),
+          allowMoneyUnitMaintenance:
+            target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced",
           run,
           ...(options.cloudflareEnvironment === undefined
             ? {}
@@ -670,10 +684,16 @@ export async function runWorkerClosureTransition(
               target.publicOrigin,
               options.fetcher ?? ((input, init) => fetch(input, init)),
             )
-          : await probeProduct(
-              target.publicOrigin,
-              options.fetcher ?? ((input, init) => fetch(input, init)),
-            );
+          : target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1" &&
+              afterMigrations.applied.length === 94
+            ? await probeMoneyCutoverProductOrFrozen(
+                target.publicOrigin,
+                options.fetcher ?? ((input, init) => fetch(input, init)),
+              )
+            : await probeProduct(
+                target.publicOrigin,
+                options.fetcher ?? ((input, init) => fetch(input, init)),
+              );
     const rollbackVersionId = after.history.previousVersionId;
     if (rollbackVersionId === null) {
       throw verificationError(
@@ -707,6 +727,7 @@ export async function runWorkerClosureTransition(
           ? {}
           : { maintenance: target.schemaMaintenanceMode }),
         probe,
+        servingReady: !("traffic" in probe),
         mutationApplied: true,
         rollback:
           `wrangler versions deploy ${rollbackVersionId}@100% --yes ` +

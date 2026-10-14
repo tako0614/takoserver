@@ -76,7 +76,7 @@ const USAGE = `takoserver deploy
   bun run deploy -- takoserver-org-api-key --<mint|status|revoke> --environment=<env> --commit=<sha>
     --organization=org_... [--key-name=<name> --scope=<scope> --expires-in-days=<n>] [--key-id=key_...]
   D1 schema status/apply may select one fixed next-wave boundary:
-    --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057|0058|0088|0092>
+    --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057|0058|0088|0092|0093|0094>
   Integration without a selector keeps its disposable suffix path; selected integration applies
   only the audited wave and emits integration-protected-wave evidence, never a rehearsal receipt.
   Rehearsal and production still require the selector and their receipt chain.
@@ -819,6 +819,12 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     return null;
   }
   if (
+    (throughMigration === "0093" || throughMigration === "0094") &&
+    environment !== "integration"
+  ) {
+    return null;
+  }
+  if (
     surfaceValue !== "takoserver-d1-schema" &&
     surfaceValue !== "takoserver-d1-schema-rehearsal-baseline" &&
     surfaceValue !== "takoserver-d1-schema-0058-rehearsal" &&
@@ -1189,6 +1195,26 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
         target,
       );
     case "takoserver-d1-schema": {
+      if (invocation.throughMigration === "0093" || invocation.throughMigration === "0094") {
+        if (invocation.environment !== "integration") {
+          throw new DeployError("preflight", "0093/0094 monetary waves are integration-only");
+        }
+        const { loadMoneyUnitCutoverOptions } = await import("./deploy/schema-money-unit-owner.ts");
+        const options = await loadMoneyUnitCutoverOptions(
+          requireEnvironment("TAKOSERVER_D1_MONEY_CUTOVER_DECLARATION_PATH"),
+          target,
+        );
+        return await runD1Schema(
+          {
+            action: invocation.action,
+            environment: "integration",
+            commit: invocation.commit,
+            throughMigration: invocation.throughMigration,
+          },
+          target,
+          { moneyUnitCutover: options },
+        );
+      }
       const productionPath = process.env.TAKOSERVER_DEPLOY_TARGET_PRODUCTION?.trim();
       if (
         invocation.throughMigration === "0092" &&

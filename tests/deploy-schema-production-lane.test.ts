@@ -1167,7 +1167,8 @@ describe("production-shaped D1 migration lane", () => {
         pendingMigrations: ["0057_cloudflare_managed_worker_version_execution_material.sql"],
       });
       expect(SCHEMA_WAVE_BOUNDARIES).toContain("0088");
-      expect(SCHEMA_WAVE_BOUNDARIES.at(-1)).toBe("0092");
+      expect(SCHEMA_WAVE_BOUNDARIES.at(-1)).toBe("0094");
+      expect(SCHEMA_WAVE_BOUNDARIES).toContain("0093");
       expect(SCHEMA_WAVE_BOUNDARIES.map(String)).not.toContain("0067");
 
       const integrationTail = await runD1Schema(

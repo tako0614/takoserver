@@ -41,12 +41,15 @@ export class CloudflareState {
   readonly #token: string;
   readonly #fetcher: StateFetcher;
   readonly #topologyAuditCredentialPath: string;
+  readonly #workerDomainServiceScope: string | undefined;
 
   constructor(input: {
     readonly accountId: string;
     readonly token: string;
     readonly fetcher?: StateFetcher;
     readonly topologyAuditCredentialPath?: string;
+    /** Exact integration Workers.dev service; keeps other Workers' domains out of readback. */
+    readonly workerDomainServiceScope?: string;
   }) {
     if (!/^[0-9a-f]{32}$/u.test(input.accountId)) {
       throw preflightError("Cloudflare state requires one exact account id");
@@ -55,6 +58,13 @@ export class CloudflareState {
       throw preflightError("Cloudflare state requires one exact API token");
     }
     this.#accountId = input.accountId;
+    if (
+      input.workerDomainServiceScope !== undefined &&
+      !/^[a-z0-9][a-z0-9-]{1,62}$/u.test(input.workerDomainServiceScope)
+    ) {
+      throw preflightError("Cloudflare domain scope requires one exact Worker service name");
+    }
+    this.#workerDomainServiceScope = input.workerDomainServiceScope;
     this.#token = input.token;
     this.#fetcher = input.fetcher ?? ((request) => fetch(request));
     this.#topologyAuditCredentialPath =
@@ -184,7 +194,14 @@ export class CloudflareState {
   async workerDomains(): Promise<
     readonly { readonly hostname: string; readonly service: string }[]
   > {
-    const entries = await this.list("/workers/domains", "Cloudflare Worker domain inventory");
+    // Keep the same exhaustive pagination/count guard. A provider that reports
+    // unfiltered totals, drops the filter, or returns ambiguous closure fails
+    // closed; this reader never retries with an account-wide domain query.
+    const path =
+      this.#workerDomainServiceScope === undefined
+        ? "/workers/domains"
+        : `/workers/domains?service=${encodeURIComponent(this.#workerDomainServiceScope)}`;
+    const entries = await this.list(path, "Cloudflare Worker domain inventory");
     return entries.map((entry) => {
       if (
         !isRecord(entry) ||
@@ -192,6 +209,12 @@ export class CloudflareState {
         typeof entry.service !== "string"
       ) {
         throw preflightError("Cloudflare Worker domain inventory returned a malformed entry");
+      }
+      if (
+        this.#workerDomainServiceScope !== undefined &&
+        entry.service !== this.#workerDomainServiceScope
+      ) {
+        throw preflightError("Cloudflare scoped domain inventory returned a foreign service");
       }
       return { hostname: entry.hostname, service: entry.service };
     });
