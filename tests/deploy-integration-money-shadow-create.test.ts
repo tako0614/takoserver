@@ -21,6 +21,10 @@ const COMMIT = "c".repeat(40);
 const SOURCE = moneyUnitCutoverSourcePrefixDigest(readMigrationArtifact().files, 92);
 const ok = (stdout = ""): CommandResult => ({ exitCode: 0, stdout, stderr: "" });
 
+function moneyShadowTestRoot(prefix: string): string {
+  return mkdtempSync(join(tmpdir(), prefix));
+}
+
 function fixture(): {
   root: string;
   declaration: IntegrationMoneyShadowCreateDeclaration;
@@ -28,7 +32,7 @@ function fixture(): {
   calls: string[];
   run: (command: readonly string[]) => Promise<CommandResult>;
 } {
-  const root = mkdtempSync(join(tmpdir(), "money-shadow-create-"));
+  const root = moneyShadowTestRoot("money-shadow-create-");
   const custodyDirectory = join(root, "custody");
   mkdirSync(custodyDirectory, { mode: 0o700 });
   const stageOriginReceiptPath = join(root, "stage-origin.json");
