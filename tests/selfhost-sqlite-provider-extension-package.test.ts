@@ -34,6 +34,7 @@ test("Node selfhost extension exposes the existing SQLite store and guarded brok
       "createDockerHttpRevisionRuntime",
       "createSelfhostContainerRuntime",
       "createSelfhostV2SQLiteStore",
+      "createSQLiteMigrationApplicationNativePort",
       "createSelfhostV2SqliteBindingBroker",
       "createSelfhostV2SqliteQueueBindingBroker",
       "createWorkerdWorkerModuleInspector",

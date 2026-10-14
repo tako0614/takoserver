@@ -12,9 +12,15 @@ import type { V2ArtifactSource } from "../src/takoform-v2/forms/artifact-source.
 import { SQLITE_DATABASE_FORM_URL } from "../src/takoform-v2/forms/sqlite-database.ts";
 import { createSQLiteDatabaseForm } from "../src/takoform-v2/forms/sqlite-database-backend.ts";
 import { SQLITE_MIGRATION_APPLICATION_FORM_URL } from "../src/takoform-v2/forms/sqlite-migration-application.ts";
-import { createSQLiteMigrationApplicationForm } from "../src/takoform-v2/forms/sqlite-migration-application-backend.ts";
+import {
+  createSQLiteMigrationApplicationForm,
+  runSQLiteMigrationApplication,
+} from "../src/takoform-v2/forms/sqlite-migration-application-backend.ts";
 import { createSQLiteMigrationApplicationNativePort } from "../src/takoform-v2/forms/sqlite-migration-application-native.ts";
-import type { SQLiteMigrationApplicationPort } from "../src/takoform-v2/forms/sqlite-migration-application-port.ts";
+import type {
+  SQLiteMigrationApplicationBatchPort,
+  SQLiteMigrationApplicationPort,
+} from "../src/takoform-v2/forms/sqlite-migration-application-port.ts";
 import { SQLITE_MIGRATION_SET_FORM_URL } from "../src/takoform-v2/forms/sqlite-migration-set.ts";
 import {
   createSQLiteMigrationSetCustody,
@@ -35,7 +41,9 @@ interface NativeAuthorizedSQLiteStore {
 
 async function fixture(
   sqlText: string | readonly string[],
-  portFactory?: (native: SQLiteMigrationApplicationPort) => SQLiteMigrationApplicationPort,
+  portFactory?: (
+    native: SQLiteMigrationApplicationPort,
+  ) => SQLiteMigrationApplicationPort | SQLiteMigrationApplicationBatchPort,
 ) {
   const root = mkdtempSync(join(tmpdir(), "v2-sqlite-app-"));
   const database = new Database(join(root, "control.sqlite"));
@@ -823,6 +831,118 @@ test("MigrationSet held-byte reader refuses missing, deleted, and unconfirmed au
     });
     expect((await f.drive(deletion.id)).status).toBe("succeeded");
     await expect(f.custody.readHeldVerified(request)).rejects.toThrow();
+  } finally {
+    f.close();
+  }
+});
+
+test("batch realization retains partial history and rolls back a failing file", async () => {
+  let calls = 0;
+  const f = await fixture(
+    [
+      "CREATE TABLE item (value TEXT); INSERT INTO item VALUES ('committed');",
+      "INSERT INTO item VALUES ('rolled-back'); INSERT INTO missing VALUES (1);",
+    ],
+    (native) => ({
+      async applyAuthorizedMigration(input) {
+        calls += 1;
+        return runSQLiteMigrationApplication(native, input);
+      },
+    }),
+  );
+  try {
+    const { databaseUid, setUid } = await f.prepare();
+    const application = await f.createApplication(databaseUid, setUid);
+    expect(await f.drive(application.id)).toMatchObject({
+      status: "failed",
+      effect: "partial",
+      error: { code: "migration_sql_error" },
+    });
+    expect(calls).toBe(1);
+    const readback = await f.store.withAuthorizedDatabase({
+      resourceUid: databaseUid,
+      stillAuthorized: async () => true,
+      use(db) {
+        return {
+          rows: db.prepare("SELECT value FROM item").all(),
+          ledger: db.prepare("SELECT count(*) AS count FROM _takoform_sqlite_migrations").get(),
+        };
+      },
+    });
+    expect(readback).toEqual({ rows: [{ value: "committed" }], ledger: { count: 1 } });
+  } finally {
+    f.close();
+  }
+});
+
+test("lost batch response reconciles the durable prefix without executing the SQL again", async () => {
+  let calls = 0;
+  const f = await fixture(
+    "CREATE TABLE item (value TEXT); INSERT INTO item VALUES ('once');",
+    (native) => ({
+      async applyAuthorizedMigration(input) {
+        const result = await runSQLiteMigrationApplication(native, input);
+        calls += 1;
+        if (calls === 1) throw new Error("lost batch response");
+        return result;
+      },
+    }),
+  );
+  try {
+    const { databaseUid, setUid } = await f.prepare();
+    const application = await f.createApplication(databaseUid, setUid);
+    expect((await f.drive(application.id)).status).toBe("succeeded");
+    expect(calls).toBe(2);
+    expect(
+      await f.store.withAuthorizedDatabase({
+        resourceUid: databaseUid,
+        stillAuthorized: async () => true,
+        use(db) {
+          return {
+            rows: db.prepare("SELECT count(*) AS count FROM item").get(),
+            ledger: db.prepare("SELECT count(*) AS count FROM _takoform_sqlite_migrations").get(),
+          };
+        },
+      }),
+    ).toEqual({ rows: { count: 1 }, ledger: { count: 1 } });
+  } finally {
+    f.close();
+  }
+});
+
+test("batch runner refuses changed payload bytes before acquiring the database", async () => {
+  let opened = 0;
+  const f = await fixture("CREATE TABLE item (value TEXT);", (native) => ({
+    async applyAuthorizedMigration(input) {
+      return runSQLiteMigrationApplication(
+        {
+          withAuthorizedMigrationSession(session) {
+            opened += 1;
+            return native.withAuthorizedMigrationSession(session);
+          },
+        },
+        { ...input, files: [new TextEncoder().encode("CREATE TABLE forged (value TEXT);")] },
+      );
+    },
+  }));
+  try {
+    const { databaseUid, setUid } = await f.prepare();
+    const application = await f.createApplication(databaseUid, setUid);
+    expect(await f.drive(application.id)).toMatchObject({
+      status: "failed",
+      effect: "none",
+      error: { code: "artifact_invalid" },
+    });
+    expect(opened).toBe(0);
+    expect(
+      await f.store.withAuthorizedDatabase({
+        resourceUid: databaseUid,
+        stillAuthorized: async () => true,
+        use(db) {
+          return db.prepare("SELECT name FROM sqlite_master WHERE name IN ('item','forged')").all();
+        },
+      }),
+    ).toEqual([]);
   } finally {
     f.close();
   }

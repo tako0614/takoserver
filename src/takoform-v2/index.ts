@@ -109,17 +109,32 @@ export {
 } from "./forms/sqlite-database.ts";
 export { createSQLiteDatabaseForm } from "./forms/sqlite-database-backend.ts";
 export {
+  parseSQLiteMigrationApplicationSpec,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL,
+} from "./forms/sqlite-migration-application.ts";
+export {
   createSQLiteMigrationApplicationForm,
+  runSQLiteMigrationApplication,
   SQLITE_MIGRATION_APPLICATION_BACKEND_ID,
 } from "./forms/sqlite-migration-application-backend.ts";
 export type {
+  SQLiteMigrationApplicationBatchPort,
+  SQLiteMigrationApplicationInput,
   SQLiteMigrationApplicationPort,
+  SQLiteMigrationApplicationResult,
   SQLiteMigrationEntry,
   SQLiteMigrationFileResult,
   SQLiteMigrationLedgerResult,
   SQLiteMigrationRecord,
   SQLiteMigrationSession,
 } from "./forms/sqlite-migration-application-port.ts";
+export {
+  parseSQLiteMigrationManifest,
+  parseSQLiteMigrationSetSpec,
+  SQLITE_MIGRATION_SET_FORM_URL,
+  SQLITE_MIGRATION_SET_LIMITS,
+} from "./forms/sqlite-migration-set.ts";
+export { createSQLiteMigrationSetCustody } from "./forms/sqlite-migration-set-backend.ts";
 export type { SQLiteDatabaseNativePort } from "./forms/sqlite-native-store-port.ts";
 export {
   createSQLiteWorkerBindingAuthority,
