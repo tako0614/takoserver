@@ -2994,3 +2994,8 @@ reverse the append-only activation event; use the normal activation surface
 for explicit reactivation. When a transition descriptor selected the
 predecessor, repeat status with that same descriptor; it never converts a mixed
 or already-advanced Worker topology into permission to sign another mutation.
+
+
+## Existing integration money-unit qualification
+
+The separate [0093/0094 owner campaign](deploy-wallet-micros-cutover.md) uses the schema surface with explicit integration-only selectors and a protected money-cutover declaration. It preserves the 0088/0092 and fresh/production ceilings, never reads production-target settings, and requires phase-specific review, backup, exact staging origin/native identity, source-bound maintenance plus persistent D1 money fences, conservation and no-overwrite custody. A source entrypoint is not evidence that a particular staging D1 has been converted.

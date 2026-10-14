@@ -70,6 +70,8 @@ retired. Legacy pending/staged receipts cannot enter the new writer epoch.
 Stripe Checkout amounts, immutable reseller quotes and settlement receipts
 retain their original cents contracts; checked adapters convert at ledger calls.
 
+Qualified integration existing-D1 execution is documented in [the money-unit cutover owner](deploy-wallet-micros-cutover.md). It does not widen legacy, fresh or production apply authority.
+
 ## Two forward migrations and the publication boundary
 
 [0093](../migrations/0093_wallet_credit_classification_proofs.sql) creates only

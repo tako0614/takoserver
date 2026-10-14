@@ -467,6 +467,44 @@ describe("Worker startup diagnostics", () => {
     await expect(worker.scheduled({}, env)).resolves.toBeUndefined();
   });
 
+  test("wallet unit maintenance closes payment/deploy/webhook admission and every scheduled money pass", async () => {
+    let compositions = 0;
+    let lifetimes = 0;
+    const env = {
+      TAKOSERVER_SCHEMA_MAINTENANCE_MODE: "pre-wallet-usd-micros-quiesced",
+      get STATE_DB(): never {
+        compositions++;
+        throw new Error("money maintenance reached storage");
+      },
+      get STRIPE_SECRET_KEY(): never {
+        compositions++;
+        throw new Error("money maintenance reached payment credentials");
+      },
+    } as unknown as Parameters<typeof worker.fetch>[1];
+    for (const path of [
+      "/v1/resources",
+      "/v1/organizations/org/wallet/holds",
+      "/v1/payments/checkout",
+      "/v1/stripe/webhook",
+      "/healthz",
+    ]) {
+      const response = await worker.fetch(
+        new Request(`${ORIGIN}${path}`, { method: "POST" }),
+        env,
+        {
+          waitUntil() {
+            lifetimes++;
+          },
+        },
+      );
+      expect(response.status).toBe(503);
+      expect((await envelope(response)).error.message).toContain("wallet USD-micros");
+    }
+    await worker.scheduled({}, env);
+    expect(compositions).toBe(0);
+    expect(lifetimes).toBe(0);
+  });
+
   test("invalid or conflicting maintenance selectors refuse before composition", async () => {
     for (const selected of ["", "pre-0058", "PRE-0058-QUIESCED", null, 7]) {
       const response = await worker.fetch(

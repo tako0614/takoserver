@@ -51,6 +51,7 @@ import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualif
 import { writeWorkerConfig } from "./realized-config.ts";
 import { runAuthorityTransition } from "./retirement.ts";
 import { readCurrentAuditedMigrationSourceArtifact } from "./schema.ts";
+import { moneyUnitCutoverSchemaMatches } from "./schema-money-unit-cutover.ts";
 import {
   activePublicJwk,
   createRemoteSigningDatabase,
@@ -239,6 +240,35 @@ export function workerSchemaAllowsPending(
   },
   sourceRepositoryRoot = REPOSITORY,
 ): boolean {
+  if (target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced") {
+    if (
+      target.environment !== "integration" ||
+      target.artifactBlobIoMode !== undefined ||
+      (target.takoformV2?.storageLineage !== "v2-0092" &&
+        target.takoformV2?.appliedSchemaLineage !== "v2-0092") ||
+      migrations.shape === undefined ||
+      migrations.shapeDigest === undefined
+    ) {
+      return false;
+    }
+    const source = readCurrentAuditedMigrationSourceArtifact(
+      resolve(sourceRepositoryRoot, "migrations"),
+    );
+    if (JSON.stringify(migrations.local) !== JSON.stringify(source.names)) return false;
+    const state = {
+      applied: migrations.applied,
+      shape: migrations.shape,
+      shapeDigest: migrations.shapeDigest,
+    };
+    return (
+      moneyUnitCutoverSchemaMatches(state, source.files, "0092") ||
+      moneyUnitCutoverSchemaMatches(state, source.files, "0092-fenced") ||
+      moneyUnitCutoverSchemaMatches(state, source.files, "0093") ||
+      moneyUnitCutoverSchemaMatches(state, source.files, "0093-fenced") ||
+      moneyUnitCutoverSchemaMatches(state, source.files, "0094") ||
+      moneyUnitCutoverSchemaMatches(state, source.files, "0094-fenced")
+    );
+  }
   if (target.schemaMaintenanceMode === "pre-v2-0088-quiesced") {
     if (target.environment !== "integration" || target.artifactBlobIoMode !== undefined) {
       return false;
@@ -325,10 +355,19 @@ export function workerMoneyUnitSchemaReady(
     source.names.at(-1) === MONEY_UNIT_MIGRATION &&
     JSON.stringify(migrations.local) === JSON.stringify(source.names) &&
     JSON.stringify(migrations.applied) === JSON.stringify(source.names) &&
-    applicationSchemaMatches(
+    (applicationSchemaMatches(
       { applied: migrations.applied, shape: migrations.shape, shapeDigest: migrations.shapeDigest },
       expectedShape,
-    )
+    ) ||
+      moneyUnitCutoverSchemaMatches(
+        {
+          applied: migrations.applied,
+          shape: migrations.shape,
+          shapeDigest: migrations.shapeDigest,
+        },
+        source.files,
+        "0094-fenced",
+      ))
   );
 }
 
@@ -378,9 +417,11 @@ export async function probeSchemaMaintenance(
     body.error.code !== "backend_unavailable" ||
     !("message" in body.error) ||
     body.error.message !==
-      (mode === "pre-0058-quiesced"
-        ? "Host is quiesced for the 0058 schema maintenance transition"
-        : "Host is quiesced for the v2 0088 schema maintenance transition") ||
+      (mode === "pre-wallet-usd-micros-quiesced"
+        ? "Host is quiesced for the wallet USD-micros schema maintenance transition"
+        : mode === "pre-0058-quiesced"
+          ? "Host is quiesced for the 0058 schema maintenance transition"
+          : "Host is quiesced for the v2 0088 schema maintenance transition") ||
     !("details" in body.error) ||
     typeof body.error.details !== "object" ||
     body.error.details === null ||
@@ -452,7 +493,14 @@ export async function runWorker(
           sourceRepositoryRoot,
         );
   const createCloudflareState = (token: string | undefined): CloudflareState =>
-    new CloudflareState({ accountId: target.accountId, token: token ?? exactToken(environment) });
+    new CloudflareState({
+      accountId: target.accountId,
+      token: token ?? exactToken(environment),
+      ...(target.environment === "integration" &&
+      new URL(target.publicOrigin).hostname.endsWith(".workers.dev")
+        ? { workerDomainServiceScope: target.workerName }
+        : {}),
+    });
   const cloudflareState =
     options.state === undefined ? createCloudflareState(credential?.token) : null;
   const initialState = options.state ?? cloudflareState;
@@ -1048,6 +1096,8 @@ async function readFreshV2StorageProof(
         ...options.integrationStorageVerification,
         allowCurrentAuditedSuccessor:
           target.schemaMaintenanceMode === undefined && target.artifactBlobIoMode === undefined,
+        allowMoneyUnitMaintenance:
+          target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced",
         run,
         ...(options.cloudflareEnvironment === undefined
           ? {}

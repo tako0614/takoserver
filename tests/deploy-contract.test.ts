@@ -72,7 +72,7 @@ const SURFACES = [
   ["takoserver-d1-snapshot-restore", ["irreversible", "authority"]],
   ["takoserver-d1-schema-0058-rehearsal", ["irreversible"]],
   ["takoserver-d1-schema-rehearsal-baseline", ["irreversible"]],
-  ["takoserver-d1-schema", ["irreversible"]],
+  ["takoserver-d1-schema", ["irreversible", "authority"]],
   ["takoserver-signing-key-register", ["irreversible", "authority", "published-identity"]],
   ["takoserver-signing-repair", ["authority"]],
   ["takoserver-signing-rotation", ["authority", "published-identity"]],

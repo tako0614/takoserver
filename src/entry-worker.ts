@@ -402,10 +402,14 @@ function artifactBlobIoMode(
 
 function schemaMaintenanceMode(
   env: Pick<WorkerEnv, "TAKOSERVER_SCHEMA_MAINTENANCE_MODE" | "TAKOSERVER_ARTIFACT_BLOB_IO_MODE">,
-): "normal" | "pre-0058-quiesced" | "pre-v2-0088-quiesced" {
+): "normal" | "pre-0058-quiesced" | "pre-v2-0088-quiesced" | "pre-wallet-usd-micros-quiesced" {
   const value = env.TAKOSERVER_SCHEMA_MAINTENANCE_MODE;
   if (value === undefined) return "normal";
-  if (value !== "pre-0058-quiesced" && value !== "pre-v2-0088-quiesced") {
+  if (
+    value !== "pre-0058-quiesced" &&
+    value !== "pre-v2-0088-quiesced" &&
+    value !== "pre-wallet-usd-micros-quiesced"
+  ) {
     throw new TypeError("TAKOSERVER_SCHEMA_MAINTENANCE_MODE is invalid");
   }
   if (env.TAKOSERVER_ARTIFACT_BLOB_IO_MODE !== undefined) {
@@ -414,15 +418,19 @@ function schemaMaintenanceMode(
   return value;
 }
 
-function schemaMaintenanceResponse(mode: "pre-0058-quiesced" | "pre-v2-0088-quiesced"): Response {
+function schemaMaintenanceResponse(
+  mode: "pre-0058-quiesced" | "pre-v2-0088-quiesced" | "pre-wallet-usd-micros-quiesced",
+): Response {
   return errorEnvelopeResponse(
     "backend_unavailable",
     503,
     { reason: "runtime-configuration" },
     { headers: { "cache-control": "no-store", "retry-after": "60" } },
-    mode === "pre-0058-quiesced"
-      ? "Host is quiesced for the 0058 schema maintenance transition"
-      : "Host is quiesced for the v2 0088 schema maintenance transition",
+    mode === "pre-wallet-usd-micros-quiesced"
+      ? "Host is quiesced for the wallet USD-micros schema maintenance transition"
+      : mode === "pre-0058-quiesced"
+        ? "Host is quiesced for the 0058 schema maintenance transition"
+        : "Host is quiesced for the v2 0088 schema maintenance transition",
   );
 }
 
