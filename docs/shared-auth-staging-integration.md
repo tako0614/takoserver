@@ -1,0 +1,127 @@
+# Shared Accounts login: staged Takoserver consumer
+
+Status: prepared protocol client. No login route, schema migration, Console
+button, deployment configuration or traffic cutover is enabled by this change.
+Task 0109 coordinates the remaining owner changes and their release evidence.
+
+## Implemented protocol boundary
+
+`src/shared-auth-oidc-client.ts` consumes the Accounts-owned first-party OIDC
+HTTP contract. It does not import Accounts or another product's source, and it
+does not use the existing `takos-id` Organization projection.
+
+The client requires explicit `environment: "staging"`, the registered client
+`takoserver-console-staging-v1`, distinct exact HTTPS issuer and Console
+origins, and a server-only client secret. Production origins and DNS trailing
+dot aliases are refused. Realized staging origins and credentials belong in
+operator configuration outside this repository; this document does not choose
+them. The registered redirect must exactly equal
+`<console-origin>/auth/oidc/callback`.
+
+The code flow uses S256, state, nonce, explicit consent and `offline_access`.
+Token exchange, rotating refresh, introspection and revocation authenticate
+with form-encoded HTTP Basic. All HTTP requests refuse redirects and bound
+headers-plus-body handling to five seconds. JSON bodies are limited to 64 KiB
+and reject duplicate members. JWKS are read from the issuer's `/oauth/jwks`.
+The fixed endpoint paths are an explicit first-party contract rather than
+dynamic discovery of unrelated destinations.
+
+The ID token must have an ES256 signature against exactly one matching public
+P-256 signing key, the exact issuer and single client audience, an initial
+nonce, `sub`, `sid`, `auth_time`, `iat` and `exp`. Its lifetime is at most five
+minutes. A refresh ID token must retain the subject, Accounts session and
+authentication time. Refresh success without a new ID token retains the prior
+identity; successful rotation must return a different refresh token. Activity
+is checked with the Accounts owner's authenticated introspection endpoint.
+`canonicalAccount` confirms the exact subject and audience with Bearer-authenticated
+`/oauth/userinfo`, whose first-party contract resolves only a live canonical
+account root under an enabled client and a current account/session fence.
+Its response's `sub` and `aud` must match the grant; `scope` must be identity-only
+and include `openid` and `offline_access`. The consumer returns only
+`{ accountId }` and refuses product authority fields.
+
+The registered shared-account profile gives both first-party clients the same
+canonical Accounts account ID in `sub`. The client returns that opaque identity
+without an email lookup or a role/membership projection. ID tokens carrying
+Organizations, Workspace roles or other product authority are refused. Access
+tokens obtained here are identity-only credentials for the issuer's own
+endpoints, never Takoserver business API keys.
+
+## Existing behavior that requires a separate owner change
+
+The audit base is Takoserver commit
+`b7649192cb901fbcbd1b60c4192d294d33a84f84`. `src/auth.ts` currently accepts
+`google`, `github` and `takos-id`; migration 0016 permits those same providers.
+The `takos-id` branch deletes/reprojects local Organization memberships from
+token claims and rejects local Organization creation. That behavior is a
+different contract and must not receive the shared-account profile.
+
+Existing `/v1/sessions` accepts a provider assertion and can return a bearer
+token to API clients. The new server code flow must not pass refresh tokens
+through this route or the browser's existing `console/src/takos-id.ts` flow.
+`resolveIdentity` currently makes legacy Takos ID and direct Google mutually
+exclusive. This preparation does not change those self-host and operator
+recovery paths.
+
+## Required integration order
+
+1. Accounts owner publishes the registered staging client, canonical account
+   profile and the current-account/Workspace directory contract. Token
+   introspection must reject a disabled or merged-away account and revoked
+   session/family. Confirm the canonical subject with that owner's authenticated
+   UserInfo/introspection contract; do not invent a parallel account registry.
+2. Agree with Takoserver's protected-path owner on the source integration,
+   schema and exact realized staging surfaces. Add the protocol module to the
+   domain classification in `scripts/check-imports.ts` only after that owner
+   agrees. The prepared hunk adds one exact module name, without exempting a
+   directory or changing permitted dependency directions.
+3. Implement a dedicated trusted server session adapter, with a durable
+   single-use login attempt and a host-only `__Host-` HttpOnly Secure cookie.
+   Validate exact request origin, duplicate callback parameters, state, optional
+   response issuer and the attempt's nonce/verifier. Atomically consume the
+   attempt before exchange. Never accept caller-supplied claims, an incoming
+   identity header or the email as a login binding.
+4. Implement a durable local session store and explicit account-to-principal
+   binding. One canonical Accounts ID can bind at most one local actor; preserve
+   existing local principal, Organization, API-key and billing references when
+   adopting a proved legacy account. Newly provisioned product actors require
+   an agreed new provider/projection contract, not a fake `google` or `takos-id`
+   value. A migration that expands `principals.provider` and adds binding,
+   attempt and session state must preserve prior rows and the migration
+   lineage. Do not reserve or author a migration number here: the schema owner
+   must allocate it after the billing and dispatch migrations.
+5. Keep grants encrypted under an operator-managed local session key, with
+   associated data binding the environment, issuer, client and Console origin.
+   Cookie secrets are random; only their digests are indexed. Keep idle and
+   absolute expiry, current grant activity and revocation local to the RP.
+   Serialize refresh through durable version/compare-and-set ownership. Lost
+   acknowledgement or a crashed refresh claimant requires login; never retry
+   the old refresh token. Logout revokes the local session before upstream
+   revocation. Confirm recovery and key rotation before enabling this adapter.
+6. Wire `src/auth.ts`/`src/app.ts` and the protected `src/control.ts` and owning
+   `src/entry-*` composition only after review of the above schema and ports.
+   Advertise the route in the owning OpenAPI and Console contracts. The Console
+   starts a server redirect and never receives client secrets, access tokens or
+   refresh tokens. Its normal APIs use the product's local session. Preserve
+   direct Google and operator sign-in until staging proves the new path.
+7. Resolve Workspace membership live from the Accounts-owned directory for
+   authenticated operations. Bind each canonical Workspace to its intended
+   Takoserver Organization with a durable, immutable product-context pin.
+   Do not authorize from token roles, email equality, a browser Workspace ID,
+   or the old `takos-id` Organization projection. Revocation and cross-Workspace
+   attempts must fail before business or billing access.
+8. Run local complete CI at the final candidate, obtain QA's exact-head
+   approval, merge that exact head and publish only the coordinated staging
+   surfaces. Staging E2E must use the actual issuer, local session store and
+   live membership checks, including replay, wrong client, disabled/merged
+   account, refresh race, logout, revoked membership and legacy recovery.
+   Production deployment and login/route cutover remain awaiting approval.
+
+The protocol tests use real generated ES256 signatures and actual Request and
+Response bodies through an in-process HTTP transport. They verify cryptography
+and client behavior; they are not evidence that the staged login routes, durable
+stores or real issuer have been deployed.
+
+Protocol references: [OpenID Connect Core ID Token validation](https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation),
+[OAuth client authentication](https://www.rfc-editor.org/rfc/rfc6749.html#section-2.3.1),
+and [OAuth security best current practice](https://www.rfc-editor.org/rfc/rfc9700.html).
