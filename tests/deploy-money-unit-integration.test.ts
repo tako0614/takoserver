@@ -21,6 +21,8 @@ const target: DeployTarget = {
   r2: { bucketName: stageName },
   signing: { currentKeyId: "current" },
   takoformV2: { config: "{}", storageLineage: "v2-0092" },
+  moneyCutoverWriterPolicy: "transaction-fenced-usd-micros-v1",
+  moneyCutoverWriterEpoch: `sha256:${"d".repeat(64)}`,
 };
 
 function state(phase: MoneySchemaPhase) {
@@ -65,6 +67,8 @@ describe("integration money maintenance publication", () => {
       const observed = state(phase);
       expect(workerMoneyUnitSchemaReady(observed, `${import.meta.dir}/..`)).toBe(true);
       expect(workerSchemaAllowsPending(target, observed)).toBe(true);
+      const { moneyCutoverWriterEpoch: _epoch, ...withoutEpoch } = target;
+      expect(workerSchemaAllowsPending(withoutEpoch, observed)).toBe(false);
       expect(workerSchemaAllowsPending({ ...target, hostedPricing: "{}" }, observed)).toBe(false);
       expect(
         workerSchemaAllowsPending(

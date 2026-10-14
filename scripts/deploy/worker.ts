@@ -243,6 +243,7 @@ export function workerSchemaAllowsPending(
   if (target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced") {
     if (
       target.moneyCutoverWriterPolicy !== "transaction-fenced-usd-micros-v1" ||
+      !/^sha256:[0-9a-f]{64}$/u.test(target.moneyCutoverWriterEpoch ?? "") ||
       target.environment !== "integration" ||
       target.artifactBlobIoMode !== undefined ||
       (target.takoformV2?.storageLineage !== "v2-0092" &&
@@ -325,6 +326,7 @@ export function workerSchemaAllowsPending(
     // subscriptions need the complete 0095 schema and cannot use this prefix.
     if (
       target.moneyCutoverWriterPolicy !== "transaction-fenced-usd-micros-v1" ||
+      !/^sha256:[0-9a-f]{64}$/u.test(target.moneyCutoverWriterEpoch ?? "") ||
       target.hostedPricing !== undefined ||
       (target.takoformV2?.storageLineage !== "v2-0092" &&
         target.takoformV2?.appliedSchemaLineage !== "v2-0092") ||
