@@ -7,11 +7,13 @@ import {
   type NativeActorExecutionOptions,
 } from "../src/actor-native-class-execution.ts";
 import {
+  createActorNativeAlarmPort,
   createActorNativeOwner,
   createActorNativeSocketPort,
 } from "../src/actor-native-owner-worker.ts";
 
 const profile = resolveActorAbiProfile(ACTOR_ABI_INTERFACE_REFS.v2);
+const legacyProfile = resolveActorAbiProfile(ACTOR_ABI_INTERFACE_REFS.legacy);
 type Socket = {
   readonly id: string;
   send(value: string): Promise<void>;
@@ -38,6 +40,35 @@ function actorStorage(database: Database): NativeActorExecutionOptions["storage"
   };
 }
 
+test("late private port creation never passes authority to an ambient freeze override", () => {
+  const nativeFreeze = Object.freeze;
+  let observed = 0;
+  Object.freeze = ((value: unknown) => {
+    observed += 1;
+    return nativeFreeze(value);
+  }) as typeof Object.freeze;
+  try {
+    const service = {
+      async fetch() {
+        return new Response(null, { status: 204 });
+      },
+    };
+    const alarm = createActorNativeAlarmPort(service, "a".repeat(64), "owner-one");
+    const sockets = createActorNativeSocketPort(
+      service,
+      "a".repeat(64),
+      "owner-one",
+      "nonce",
+      profile,
+    );
+    expect(observed).toBe(0);
+    expect(Object.isFrozen(alarm)).toBe(true);
+    expect(Object.isFrozen(sockets)).toBe(true);
+  } finally {
+    Object.freeze = nativeFreeze;
+  }
+});
+
 test("v2 alarm gets one exact-profile socket turn and leaves no usable detached handle", async () => {
   const db = new Database(":memory:");
   const calls: string[] = [];
@@ -62,7 +93,7 @@ test("v2 alarm gets one exact-profile socket turn and leaves no usable detached 
         this.context.sockets.accept(
           new Request("http://actor.invalid/", { headers: { upgrade: "websocket" } }),
         ),
-      ).rejects.toMatchObject({ code: "backend_unavailable" });
+      ).rejects.toMatchObject({ code: "invalid_upgrade" });
     }
     socketMessage() {}
     socketClose() {}
@@ -174,140 +205,143 @@ for (const nonce of [undefined, "mismatched-port"])
     }
   });
 
-test("admitted native alarm carries a fresh callback nonce and retires its socket authority", async () => {
-  const db = new Database(":memory:");
-  const id = "alarm-owner";
-  const socketId = "00000000-0000-4000-8000-000000000001";
-  type NativeSocket = Parameters<
-    InstanceType<ReturnType<typeof createActorNativeOwner>>["webSocketMessage"]
-  >[0];
-  let metadata = { socketId, actorId: id, attachment: btoa("original") };
-  const sent: (string | ArrayBuffer)[] = [];
-  const socket = {
-    deserializeAttachment: () => metadata,
-    serializeAttachment(value: typeof metadata) {
-      metadata = value;
-    },
-    send(value: string | ArrayBuffer) {
-      sent.push(value);
-    },
-    close() {},
-  } as NativeSocket;
-  const kv = new Map<string, unknown>();
-  const nonces: string[] = [];
-  const admissions: string[] = [];
-  const completions: string[] = [];
-  let retired = 0;
-  const Owner = createActorNativeOwner(
-    "a".repeat(64),
-    "c".repeat(64),
-    {
-      generationKey: "d".repeat(64),
-      epoch: "epoch-1",
-      variantKeys: ["one"],
-    },
-    undefined,
-    undefined,
-    undefined,
-    profile,
-  );
-  const owner = new Owner(
-    {
-      storage: {
-        sql: {
-          exec(sql, ...params) {
-            return db.query(sql).all(...params) as Record<string, unknown>[];
-          },
-        },
-        kv: {
-          get: (key) => kv.get(key),
-          put: (key, value) => {
-            kv.set(key, structuredClone(value));
-          },
-          delete: (key) => kv.delete(key),
-          list: () => kv.entries(),
-        },
-        setAlarm() {},
-        deleteAlarm() {},
+for (const selectedProfile of [profile, legacyProfile])
+  test(`${selectedProfile.kind} admitted native alarm carries a fresh nonce and preserves its accept error contract`, async () => {
+    const db = new Database(":memory:");
+    const id = "alarm-owner";
+    const socketId = "00000000-0000-4000-8000-000000000001";
+    type NativeSocket = Parameters<
+      InstanceType<ReturnType<typeof createActorNativeOwner>>["webSocketMessage"]
+    >[0];
+    let metadata = { socketId, actorId: id, attachment: btoa("original") };
+    const sent: (string | ArrayBuffer)[] = [];
+    const socket = {
+      deserializeAttachment: () => metadata,
+      serializeAttachment(value: typeof metadata) {
+        metadata = value;
       },
-      getWebSockets: () => [socket],
-      waitUntil() {},
-      facets: {
-        get: () => ({
-          async fetch(request) {
-            const nonce = request.headers.get("x-takoserver-private-actor-socket-nonce");
-            if (!nonce) throw new Error("admitted alarm nonce missing");
-            nonces.push(nonce);
-            const port = createActorNativeSocketPort(
-              { fetch: (request) => owner.fetch(request) },
-              "a".repeat(64),
-              id,
-              nonce,
-              profile,
-            );
-            expect(await port.list()).toEqual([socketId]);
-            expect(await port.get(socketId)).toBe(true);
-            await port.send(socketId, "from alarm");
-            const attachment = new Uint8Array(16_384).fill(8);
-            await port.setAttachment(socketId, attachment);
-            expect(await port.getAttachment(socketId)).toEqual(attachment);
-            await expect(port.accept()).rejects.toMatchObject({ code: "backend_unavailable" });
-            return new Response(null, { status: 204 });
-          },
-        }),
-        abort() {
-          retired += 1;
-        },
+      send(value: string | ArrayBuffer) {
+        sent.push(value);
       },
-    },
-    {
-      CLASS: {},
-      CLASS_0: {},
-      ADMISSION: {
-        async fetch(request) {
-          const body = (await request.json()) as Record<string, unknown>;
-          if (body.action === "complete") {
-            completions.push(body.attemptNonce as string);
-            return new Response(null, { status: 204 });
-          }
-          admissions.push(body.attemptNonce as string);
-          return Response.json({
-            id,
-            attemptNonce: body.attemptNonce,
-            generationKey: "d".repeat(64),
-            epoch: "epoch-1",
-            variantKey: "one",
-            leaseId: "lease-one",
-          });
-        },
-      },
-    },
-  );
-  try {
-    for (let index = 0; index < 2; index += 1) {
-      db.query("UPDATE actor_alarm_state SET actor_id = ?, pending_at = ? WHERE id = 1").run(
-        id,
-        Date.now() - 1,
-      );
-      await owner.alarm();
-    }
-    expect(nonces).toHaveLength(2);
-    expect(nonces[0]).not.toBe(nonces[1]);
-    expect(sent).toEqual(["from alarm", "from alarm"]);
-    expect(retired).toBe(2);
-    expect(completions).toEqual(admissions);
-    expect(db.query("SELECT obligation FROM actor_alarm_state WHERE id = 1").get()).toEqual({
-      obligation: 0,
-    });
-    const stale = createActorNativeSocketPort(
-      { fetch: (request) => owner.fetch(request) },
+      close() {},
+    } as NativeSocket;
+    const kv = new Map<string, unknown>();
+    const nonces: string[] = [];
+    const admissions: string[] = [];
+    const completions: string[] = [];
+    let retired = 0;
+    const Owner = createActorNativeOwner(
       "a".repeat(64),
-      id,
-      nonces[0] as string,
-      profile,
+      "c".repeat(64),
+      {
+        generationKey: "d".repeat(64),
+        epoch: "epoch-1",
+        variantKeys: ["one"],
+      },
+      undefined,
+      undefined,
+      undefined,
+      selectedProfile,
     );
-    await expect(stale.list()).rejects.toMatchObject({ code: "socket_closed" });
-  } finally {
-    db.close();
-  }
-});
+    const owner = new Owner(
+      {
+        storage: {
+          sql: {
+            exec(sql, ...params) {
+              return db.query(sql).all(...params) as Record<string, unknown>[];
+            },
+          },
+          kv: {
+            get: (key) => kv.get(key),
+            put: (key, value) => {
+              kv.set(key, structuredClone(value));
+            },
+            delete: (key) => kv.delete(key),
+            list: () => kv.entries(),
+          },
+          setAlarm() {},
+          deleteAlarm() {},
+        },
+        getWebSockets: () => [socket],
+        waitUntil() {},
+        facets: {
+          get: () => ({
+            async fetch(request) {
+              const nonce = request.headers.get("x-takoserver-private-actor-socket-nonce");
+              if (!nonce) throw new Error("admitted alarm nonce missing");
+              nonces.push(nonce);
+              const port = createActorNativeSocketPort(
+                { fetch: (request) => owner.fetch(request) },
+                "a".repeat(64),
+                id,
+                nonce,
+                selectedProfile,
+              );
+              expect(await port.list()).toEqual([socketId]);
+              expect(await port.get(socketId)).toBe(true);
+              await port.send(socketId, "from alarm");
+              const attachment = new Uint8Array(selectedProfile.socketAttachmentBytes).fill(8);
+              await port.setAttachment(socketId, attachment);
+              expect(await port.getAttachment(socketId)).toEqual(attachment);
+              await expect(port.accept()).rejects.toMatchObject({
+                code: selectedProfile.kind === "v2" ? "invalid_upgrade" : "backend_unavailable",
+              });
+              return new Response(null, { status: 204 });
+            },
+          }),
+          abort() {
+            retired += 1;
+          },
+        },
+      },
+      {
+        CLASS: {},
+        CLASS_0: {},
+        ADMISSION: {
+          async fetch(request) {
+            const body = (await request.json()) as Record<string, unknown>;
+            if (body.action === "complete") {
+              completions.push(body.attemptNonce as string);
+              return new Response(null, { status: 204 });
+            }
+            admissions.push(body.attemptNonce as string);
+            return Response.json({
+              id,
+              attemptNonce: body.attemptNonce,
+              generationKey: "d".repeat(64),
+              epoch: "epoch-1",
+              variantKey: "one",
+              leaseId: "lease-one",
+            });
+          },
+        },
+      },
+    );
+    try {
+      for (let index = 0; index < 2; index += 1) {
+        db.query("UPDATE actor_alarm_state SET actor_id = ?, pending_at = ? WHERE id = 1").run(
+          id,
+          Date.now() - 1,
+        );
+        await owner.alarm();
+      }
+      expect(nonces).toHaveLength(2);
+      expect(nonces[0]).not.toBe(nonces[1]);
+      expect(sent).toEqual(["from alarm", "from alarm"]);
+      expect(retired).toBe(2);
+      expect(completions).toEqual(admissions);
+      expect(db.query("SELECT obligation FROM actor_alarm_state WHERE id = 1").get()).toEqual({
+        obligation: 0,
+      });
+      const stale = createActorNativeSocketPort(
+        { fetch: (request) => owner.fetch(request) },
+        "a".repeat(64),
+        id,
+        nonces[0] as string,
+        selectedProfile,
+      );
+      await expect(stale.list()).rejects.toMatchObject({ code: "socket_closed" });
+    } finally {
+      db.close();
+    }
+  });

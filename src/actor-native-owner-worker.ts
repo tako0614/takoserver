@@ -409,7 +409,7 @@ export function createActorNativeAlarmPort(
     if (result !== null && !alarmTime(result)) throw new Error("Actor alarm owner unavailable");
     return result;
   };
-  return Object.freeze({
+  return SafeObjectFreeze({
     async set(at: number): Promise<void> {
       await call("set", at);
     },
@@ -480,7 +480,7 @@ export function createActorNativeSocketPort(
     }
     return response;
   };
-  const port = Object.freeze({
+  const port = SafeObjectFreeze({
     async accept(protocol?: string, attachment?: Uint8Array): Promise<string> {
       if (attachment && attachment.byteLength > profile.socketAttachmentBytes)
         throw socketPortError("attachment_too_large");
@@ -1364,7 +1364,7 @@ export function createActorNativeOwner(
       const socketId = request.headers.get(SOCKET_ID_HEADER);
       if (action === "accept") {
         if (active.kind !== "fetch" || !active.accepting || !active.request)
-          return new Response(null, { status: 409 });
+          return new Response(null, { status: profile.kind === "v2" ? 400 : 409 });
         const handshake = active.request.headers;
         if (
           active.request.method !== "GET" ||

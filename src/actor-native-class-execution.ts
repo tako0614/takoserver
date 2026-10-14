@@ -547,6 +547,8 @@ export function createNativeActorExecution(
           acceptedOptions?: { readonly protocol?: string; readonly attachment?: Uint8Array },
         ): Promise<{ readonly response: Response; readonly socket: object }> {
           const turn = socketTurn;
+          if (profile.kind === "v2" && turn !== undefined && turn.kind !== "fetch")
+            throw new ActorRuntimeError("invalid_upgrade");
           if (turn?.kind !== "fetch" || !SafeRequestMethod || !SafeRequestHeaders)
             return socketUnavailable();
           let method: string;
