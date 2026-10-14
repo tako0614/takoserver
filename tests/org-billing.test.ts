@@ -52,6 +52,32 @@ function fixture(tariff = config()) {
     },
   };
 }
+/**
+ * A second billing service over the fixture whose clock jumps once, right after
+ * the next bounded expiry sweep has read its rows: a deadline then passes
+ * between the sweep and the rest of the same request.
+ */
+function sweepClock(f: ReturnType<typeof fixture>) {
+  let next: string | undefined;
+  const sql: Sql = {
+    async query(query, params) {
+      const rows = await f.sql.query(query, params);
+      if (next !== undefined && query.includes("ORDER BY expires_at, org_id, ref")) {
+        f.setTime(next);
+        next = undefined;
+      }
+      return rows;
+    },
+    run: (query, params) => f.sql.run(query, params),
+    batch: (statements) => f.sql.batch(statements),
+  };
+  return {
+    billing: createOrgBilling({ sql, clock: f.clock, ledger: f.ledger, config: config() }),
+    advanceAfterSweep(value: string) {
+      next = value;
+    },
+  };
+}
 const hold = {
   organizationId: "org_a",
   reference: "run_1",
@@ -421,6 +447,91 @@ describe("Organization wallet lifecycle", () => {
     expect(await restarted.expireDue(3)).toBe(3);
     expect(await restarted.expireDue(3)).toBe(1);
     expect(await restarted.wallet("org_a")).toMatchObject({ heldMicros: 0 });
+  });
+
+  test("the request sweep and its backlog check read one instant", async () => {
+    // Staging ttl-c013: H1 was swept, then H2's deadline passed before the
+    // backlog check, and a two-hold Organization was refused with 503.
+    const f = fixture();
+    const swept = sweepClock(f);
+    await f.ledger.fund({ organizationId: "org_a", fundingRef: "pay", amountMinor: 10 });
+    await f.billing.hold({ ...hold, reference: "h1", amountMinor: 4 });
+    f.setTime("2026-10-13T00:00:00.500Z");
+    await f.billing.hold({ ...hold, reference: "h2", amountMinor: 3 });
+    f.setTime("2026-10-13T00:01:00.200Z");
+    swept.advanceAfterSweep("2026-10-13T00:01:00.600Z");
+    await swept.billing.wallet("org_a");
+    const states = async () =>
+      (await f.sql.query("SELECT ref, state FROM org_wallet_holds ORDER BY ref")).map(
+        (row) => `${row.ref}:${row.state}`,
+      );
+    expect(await states()).toEqual(["h1:expired", "h2:live"]);
+    expect(await f.billing.readHold("org_a", "h2")).toMatchObject({
+      status: "expired",
+      releasedMinor: 3,
+    });
+    expect(await f.billing.wallet("org_a")).toMatchObject({ heldMinor: 0, availableMinor: 10 });
+
+    // A backlog that already exists at the request instant still refuses, and
+    // a deadline equal to that instant is part of it.
+    const g = fixture();
+    const backlog = sweepClock(g);
+    for (let n = 0; n < 8; n++)
+      await g.billing.hold({ ...hold, reference: `zero_${n}`, amountMinor: 0 });
+    g.setTime("2026-10-13T00:00:00.200Z");
+    await g.billing.hold({ ...hold, reference: "zero_8", amountMinor: 0 });
+    g.setTime("2026-10-13T00:01:00.200Z");
+    backlog.advanceAfterSweep("2026-10-13T00:01:01.000Z");
+    await errorCode(backlog.billing.wallet("org_a"), "billing_maintenance_pending", 503);
+    expect(
+      await g.sql.query(
+        "SELECT state, COUNT(*) AS n FROM org_wallet_holds GROUP BY state ORDER BY state",
+      ),
+    ).toEqual([
+      { state: "expired", n: 8 },
+      { state: "live", n: 1 },
+    ]);
+  });
+
+  test("a deadline passing mid-request is never captured or reported live", async () => {
+    const f = fixture();
+    const swept = sweepClock(f);
+    await f.ledger.fund({ organizationId: "org_a", fundingRef: "pay", amountMinor: 10 });
+    await f.billing.hold(hold);
+    f.setTime("2026-10-13T00:00:59.999Z");
+    swept.advanceAfterSweep("2026-10-13T00:01:00.000Z");
+    await errorCode(swept.billing.capture(capture), "hold_closed", 409);
+    expect(await f.billing.readHold("org_a", "run_1")).toMatchObject({
+      status: "expired",
+      capturedMinor: 0,
+      releasedMinor: 10,
+    });
+    expect((await f.sql.query("SELECT 1 FROM ledger WHERE type = 'capture'")).length).toBe(0);
+    expect(
+      await f.sql.query("SELECT 1 FROM wallet_credit_allocations WHERE debit_type = 'capture'"),
+    ).toEqual([]);
+
+    // An exact replay or a release in the same window answers the expiry.
+    await f.billing.hold({ ...hold, reference: "run_2" });
+    f.setTime("2026-10-13T00:01:59.999Z");
+    swept.advanceAfterSweep("2026-10-13T00:02:00.000Z");
+    expect(await swept.billing.hold({ ...hold, reference: "run_2" })).toMatchObject({
+      status: "expired",
+      releasedMinor: 10,
+    });
+    await f.billing.hold({ ...hold, reference: "run_3" });
+    f.setTime("2026-10-13T00:02:59.999Z");
+    swept.advanceAfterSweep("2026-10-13T00:03:00.000Z");
+    expect(await swept.billing.release("org_a", "run_3")).toMatchObject({
+      status: "expired",
+      releasedMinor: 10,
+    });
+    expect(await f.billing.wallet("org_a")).toMatchObject({
+      settledMinor: 10,
+      heldMinor: 0,
+      availableMinor: 10,
+    });
+    expect((await f.sql.query("SELECT 1 FROM wallet_allocation_guards")).length).toBe(0);
   });
 });
 
