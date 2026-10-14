@@ -1,0 +1,34 @@
+{
+  "id": "080-private-list-auth-absent",
+  "category": "registry-auth",
+  "description": "A private manifest list requires authentication before platform selection.",
+  "input": {
+    "imageRef": "registry.example.test/workload@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    },
+    "registry": {
+      "visibility": "private"
+    },
+    "manifest": {
+      "kind": "list",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "manifests": [
+        {
+          "kind": "image",
+          "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "platform": {
+            "os": "linux",
+            "architecture": "amd64"
+          },
+          "sizeBytes": 4096
+        }
+      ]
+    }
+  },
+  "expected": {
+    "decision": "reject",
+    "reason": "registry_auth_required"
+  }
+}

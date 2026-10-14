@@ -77,6 +77,26 @@ export {
   createInMemoryTakoformHost,
   createTakoformHost,
 } from "./compat.ts";
+export {
+  type ContainerEgressEvaluation,
+  type ContainerEgressPolicy,
+  type ContainerEgressRequest,
+  type ContainerEgressUsage,
+  type ContainerEgressVerdictReason,
+  type ContainerTenantEgressPolicy,
+  type ContainerTenantEgressUsage,
+  evaluateContainerEgress,
+} from "./container-egress-policy.ts";
+export {
+  type ContainerImageAdmissionInput,
+  type ContainerImageAdmissionRejectionReason,
+  type ContainerImageAdmissionResult,
+  type ContainerImageManifest,
+  type ContainerImageManifestList,
+  type ContainerImagePlatform,
+  DEFAULT_CONTAINER_MAX_IMAGE_SIZE_BYTES,
+  evaluateContainerImageAdmission,
+} from "./container-image-admission.ts";
 export { ControlError, createControlRoutes } from "./control.ts";
 export { createDataAiRoutes, type DataAiRoutes } from "./data-ai.ts";
 export { edgeProviderOffering, objectBucketProviderOffering } from "./edge-forms.ts";

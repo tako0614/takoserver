@@ -1,0 +1,33 @@
+{
+  "id": "086-uppercase-reference-canonical-descriptor",
+  "category": "reference",
+  "description": "Uppercase caller pin hex is canonicalized before matching a lowercase OCI descriptor.",
+  "input": {
+    "imageRef": "registry.example.test/workload@sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    },
+    "registry": {
+      "visibility": "public"
+    },
+    "manifest": {
+      "kind": "image",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "platform": {
+        "os": "linux",
+        "architecture": "amd64"
+      },
+      "sizeBytes": 4096
+    }
+  },
+  "expected": {
+    "decision": "accept",
+    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sizeBytes": 4096,
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    }
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "id": "068-list-selected-unknown-size",
+  "category": "manifest-list",
+  "description": "A matching list image with unknown payload size is rejected.",
+  "input": {
+    "imageRef": "registry.example.test/workload@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    },
+    "registry": {
+      "visibility": "public"
+    },
+    "manifest": {
+      "kind": "list",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "manifests": [
+        {
+          "kind": "image",
+          "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "platform": {
+            "os": "linux",
+            "architecture": "amd64"
+          },
+          "sizeBytes": null
+        }
+      ]
+    }
+  },
+  "expected": {
+    "decision": "reject",
+    "reason": "image_size_unknown"
+  }
+}

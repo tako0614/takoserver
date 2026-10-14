@@ -1,0 +1,43 @@
+{
+  "id": "059-list-duplicate-platform",
+  "category": "manifest-list",
+  "description": "Duplicate matching descriptors fail closed instead of relying on ordering.",
+  "input": {
+    "imageRef": "registry.example.test/workload@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    },
+    "registry": {
+      "visibility": "public"
+    },
+    "manifest": {
+      "kind": "list",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "manifests": [
+        {
+          "kind": "image",
+          "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "platform": {
+            "os": "linux",
+            "architecture": "amd64"
+          },
+          "sizeBytes": 4096
+        },
+        {
+          "kind": "image",
+          "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "platform": {
+            "os": "linux",
+            "architecture": "amd64"
+          },
+          "sizeBytes": 4096
+        }
+      ]
+    }
+  },
+  "expected": {
+    "decision": "reject",
+    "reason": "platform_ambiguous"
+  }
+}

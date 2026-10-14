@@ -1,0 +1,38 @@
+{
+  "id": "082-private-list-auth-invalid",
+  "category": "registry-auth",
+  "description": "Invalid authentication cannot be bypassed by a manifest list.",
+  "input": {
+    "imageRef": "registry.example.test/workload@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    },
+    "registry": {
+      "visibility": "private",
+      "auth": {
+        "present": true,
+        "authorized": false
+      }
+    },
+    "manifest": {
+      "kind": "list",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "manifests": [
+        {
+          "kind": "image",
+          "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "platform": {
+            "os": "linux",
+            "architecture": "amd64"
+          },
+          "sizeBytes": 4096
+        }
+      ]
+    }
+  },
+  "expected": {
+    "decision": "reject",
+    "reason": "registry_auth_failed"
+  }
+}

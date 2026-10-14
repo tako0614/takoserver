@@ -1,0 +1,28 @@
+{
+  "id": "008-digest-nonhex",
+  "category": "reference",
+  "description": "A 64-character nonhex digest is rejected.",
+  "input": {
+    "imageRef": "registry.example.test/workload@sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    },
+    "registry": {
+      "visibility": "public"
+    },
+    "manifest": {
+      "kind": "image",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "platform": {
+        "os": "linux",
+        "architecture": "amd64"
+      },
+      "sizeBytes": 4096
+    }
+  },
+  "expected": {
+    "decision": "reject",
+    "reason": "digest_pin_required"
+  }
+}

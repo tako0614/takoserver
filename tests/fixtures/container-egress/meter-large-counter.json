@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "id": "meter-large-counter",
+  "description": "Lifetime egress accounting preserves integers above 32-bit range",
+  "coverage": ["egress-accounting"],
+  "initialUsage": {
+    "tenant-a": {
+      "activeConnections": 1,
+      "bandwidthUsedBytes": 7,
+      "egressBytes": 4294967296
+    },
+    "tenant-b": {
+      "activeConnections": 3,
+      "bandwidthUsedBytes": 700,
+      "egressBytes": 9000
+    }
+  },
+  "steps": [
+    {
+      "policy": {
+        "killSwitch": false,
+        "tenants": {
+          "tenant-a": {
+            "outboundInternet": true,
+            "maxConnections": 4,
+            "bandwidthLimitBytes": 1024
+          },
+          "tenant-b": {
+            "outboundInternet": true,
+            "maxConnections": 5,
+            "bandwidthLimitBytes": 2048
+          }
+        }
+      },
+      "request": {
+        "tenantId": "tenant-a",
+        "operation": "send",
+        "destinationIp": "1.1.1.1",
+        "destinationPort": 443,
+        "transport": "tcp",
+        "bytes": 3
+      },
+      "expected": {
+        "allowed": true,
+        "reason": "allowed",
+        "billableEgressBytes": 3,
+        "usage": {
+          "tenant-a": {
+            "activeConnections": 1,
+            "bandwidthUsedBytes": 10,
+            "egressBytes": 4294967299
+          },
+          "tenant-b": {
+            "activeConnections": 3,
+            "bandwidthUsedBytes": 700,
+            "egressBytes": 9000
+          }
+        }
+      }
+    }
+  ]
+}

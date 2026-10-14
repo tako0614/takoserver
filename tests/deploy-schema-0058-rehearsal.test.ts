@@ -1722,9 +1722,12 @@ describe("0058 selected-reference volume producer", () => {
   });
 
   test("FIFO and oversize custody are refused by the full status seam", () => {
+    // The child runner does not inherit the parent's test timeout. Allow its
+    // fixture 12s, leaving 3s below the existing process watchdog. The separate
+    // 3s watchdog above still bounds nonblocking receipt-reader refusal.
     const child = spawnSync(
       process.execPath,
-      ["test", import.meta.path, "--test-name-pattern", "FIFO child status"],
+      ["test", import.meta.path, "--timeout", "12000", "--test-name-pattern", "FIFO child status"],
       {
         env: {
           PATH: process.env.PATH ?? "",
@@ -1738,6 +1741,7 @@ describe("0058 selected-reference volume producer", () => {
         timeout: 15_000,
       },
     );
+    if (child.status !== 0) process.stderr.write(child.stderr);
     const phases = child.stdout.match(/0058-fifo-phase:[a-z-]+/gu) ?? [];
     expect({
       status: child.status,

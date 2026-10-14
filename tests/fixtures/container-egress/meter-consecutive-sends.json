@@ -1,0 +1,188 @@
+{
+  "schemaVersion": 1,
+  "id": "meter-consecutive-sends",
+  "description": "Accepted outbound chunks accumulate once; a refused chunk leaves all counters unchanged",
+  "coverage": ["egress-accounting", "bandwidth-limit"],
+  "initialUsage": {
+    "tenant-a": {
+      "activeConnections": 1,
+      "bandwidthUsedBytes": 0,
+      "egressBytes": 900
+    },
+    "tenant-b": {
+      "activeConnections": 3,
+      "bandwidthUsedBytes": 700,
+      "egressBytes": 9000
+    }
+  },
+  "steps": [
+    {
+      "policy": {
+        "killSwitch": false,
+        "tenants": {
+          "tenant-a": {
+            "outboundInternet": true,
+            "maxConnections": 4,
+            "bandwidthLimitBytes": 1024
+          },
+          "tenant-b": {
+            "outboundInternet": true,
+            "maxConnections": 5,
+            "bandwidthLimitBytes": 2048
+          }
+        }
+      },
+      "request": {
+        "tenantId": "tenant-a",
+        "operation": "send",
+        "destinationIp": "1.1.1.1",
+        "destinationPort": 443,
+        "transport": "tcp",
+        "bytes": 512
+      },
+      "expected": {
+        "allowed": true,
+        "reason": "allowed",
+        "billableEgressBytes": 512,
+        "usage": {
+          "tenant-a": {
+            "activeConnections": 1,
+            "bandwidthUsedBytes": 512,
+            "egressBytes": 1412
+          },
+          "tenant-b": {
+            "activeConnections": 3,
+            "bandwidthUsedBytes": 700,
+            "egressBytes": 9000
+          }
+        }
+      }
+    },
+    {
+      "policy": {
+        "killSwitch": false,
+        "tenants": {
+          "tenant-a": {
+            "outboundInternet": true,
+            "maxConnections": 4,
+            "bandwidthLimitBytes": 1024
+          },
+          "tenant-b": {
+            "outboundInternet": true,
+            "maxConnections": 5,
+            "bandwidthLimitBytes": 2048
+          }
+        }
+      },
+      "request": {
+        "tenantId": "tenant-a",
+        "operation": "send",
+        "destinationIp": "1.1.1.1",
+        "destinationPort": 443,
+        "transport": "tcp",
+        "bytes": 511
+      },
+      "expected": {
+        "allowed": true,
+        "reason": "allowed",
+        "billableEgressBytes": 511,
+        "usage": {
+          "tenant-a": {
+            "activeConnections": 1,
+            "bandwidthUsedBytes": 1023,
+            "egressBytes": 1923
+          },
+          "tenant-b": {
+            "activeConnections": 3,
+            "bandwidthUsedBytes": 700,
+            "egressBytes": 9000
+          }
+        }
+      }
+    },
+    {
+      "policy": {
+        "killSwitch": false,
+        "tenants": {
+          "tenant-a": {
+            "outboundInternet": true,
+            "maxConnections": 4,
+            "bandwidthLimitBytes": 1024
+          },
+          "tenant-b": {
+            "outboundInternet": true,
+            "maxConnections": 5,
+            "bandwidthLimitBytes": 2048
+          }
+        }
+      },
+      "request": {
+        "tenantId": "tenant-a",
+        "operation": "send",
+        "destinationIp": "1.1.1.1",
+        "destinationPort": 443,
+        "transport": "tcp",
+        "bytes": 2
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "bandwidth_limit",
+        "billableEgressBytes": 0,
+        "usage": {
+          "tenant-a": {
+            "activeConnections": 1,
+            "bandwidthUsedBytes": 1023,
+            "egressBytes": 1923
+          },
+          "tenant-b": {
+            "activeConnections": 3,
+            "bandwidthUsedBytes": 700,
+            "egressBytes": 9000
+          }
+        }
+      }
+    },
+    {
+      "policy": {
+        "killSwitch": false,
+        "tenants": {
+          "tenant-a": {
+            "outboundInternet": true,
+            "maxConnections": 4,
+            "bandwidthLimitBytes": 1024
+          },
+          "tenant-b": {
+            "outboundInternet": true,
+            "maxConnections": 5,
+            "bandwidthLimitBytes": 2048
+          }
+        }
+      },
+      "request": {
+        "tenantId": "tenant-a",
+        "operation": "send",
+        "destinationIp": "1.1.1.1",
+        "destinationPort": 443,
+        "transport": "tcp",
+        "bytes": 1
+      },
+      "expected": {
+        "allowed": true,
+        "reason": "allowed",
+        "billableEgressBytes": 1,
+        "usage": {
+          "tenant-a": {
+            "activeConnections": 1,
+            "bandwidthUsedBytes": 1024,
+            "egressBytes": 1924
+          },
+          "tenant-b": {
+            "activeConnections": 3,
+            "bandwidthUsedBytes": 700,
+            "egressBytes": 9000
+          }
+        }
+      }
+    }
+  ]
+}
