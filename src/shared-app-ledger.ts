@@ -696,12 +696,19 @@ function routeOriginal(
     deploymentGeneration: routeGeneration(accepted.deploymentGeneration),
     sourceOperationId: opaque(accepted.sourceOperationId),
     providerId: opaque(accepted.providerId),
-    targetKey: opaque(accepted.targetKey),
+    targetKey: routeTargetKey(accepted.targetKey),
   });
 }
 
 function routeGeneration(value: number): number {
   if (!Number.isSafeInteger(value) || value < 1 || value >= Number.MAX_SAFE_INTEGER)
+    fail("invalid_argument");
+  return value;
+}
+
+function routeTargetKey(value: unknown): string {
+  // Preserve the existing v2 owner token contract exactly; qualified target keys are not legacy128 IDs.
+  if (typeof value !== "string" || value.length === 0 || value.length > 255)
     fail("invalid_argument");
   return value;
 }
