@@ -1,6 +1,6 @@
 # Bun single-host crash recovery VM qualification — 2026-10-14
 
-Status: **INCOMPLETE / postponed by operator priority switch**. The earlier EXTRA artifact passed two resets and two kills. The final artifact passed two resets and one kill; its second kill hit a QEMU io_uring allocation failure before reboot. Infrastructure recovery is underway. Full repository gate is still running; no overall PASS is claimed.
+Status: **INCOMPLETE / postponed by operator priority switch**. The earlier EXTRA artifact passed two resets and two kills. The final artifact passed two resets and one kill; its second kill hit a QEMU io_uring allocation failure before reboot. The VM recovered, its guest clock was restored and it was shut down normally. Full repository gate ended FAIL (exit 1): the normal-entry regression exceeded its 20-second readiness budget under shared load. Further fix/rerun is postponed; no overall PASS is claimed.
 
 Scope: Bun self-host control/artifact profile with real authenticated AI HTTP
 requests to a VM-only TLS upstream. This VM has no native workerd binary;
@@ -120,7 +120,7 @@ integrity_check=ok
   Covers killed lease takeover, peer exclusion, epoch/machine cross-checks,
   aliases, external-DB exclusion, scoped boot proof, normal entry reopen,
   AI expiry races and rollback, and DELETE/WAL durability settings.
-- Full `bun run check` with pinned Bun 1.4.0: **RUNNING**.
+- Full `bun run check` with pinned Bun 1.4.0: **FAIL**, exit 1 after 5248 tests across 529 files / 3185.81s. The normal-entry regression timed out at its 20-second startup budget; earlier focused run passed. Remaining test/build stages were not reached.
 - Installed host Bun 1.4.2 produced different generated bootstrap bytes;
   using the pinned toolchain resolved that mismatch without regenerating source.
 - Baseline main CI is RED due to the existing money rehearsal fixture's missing
@@ -132,7 +132,7 @@ integrity_check=ok
   retained alongside the final PASS evidence.
 - These repetitions qualify this VM/profile and the exercised boundaries;
   they do not establish exhaustive crash-window coverage or native execution
-  qualification. The VM will be stopped normally before the Linux Tier 1 install task reuses it.
+  qualification. The VM was stopped normally before the Linux Tier 1 install task reused it.
 
 Raw scripts, logs, full JSON snapshots, task ledger and RESULTS.md are retained
 in `/root/hdd/takos-dev/operator-runs/crash-recovery-vm-20261014/`.
@@ -154,3 +154,5 @@ Per BB6A-2230 and the revised 22:40 coverage addendum, preserve this branch and 
 | kill-final-2 | `0dcd1e61-87b9-4850-bd0c-8114cad1ae8a` | `588b23f5-6dd7-4b30-8d3d-35f16b5f6dd2` | 14→15 | 770.18 | INTERRUPTED; recovered after operator I/O change; not unattended PASS |
 
 Recovery completed: final two dispatched records survived; epoch 15; fixed lock inode 264297. Automatic deadline expiry released both holds. Final dataset: 42 holds and 42 releases, zero held/allocated funds, 26 expiry terminals (410), 16 earlier completed (502), integrity_check=ok, no FK violations/duplicate ledger references, unchanged schema hash. Guest clock restored. Host and synthetic upstream are being stopped cleanly and VM ACPI shutdown requested. No further crash/negative repetitions under the priority switch.
+
+Saved checkpoint: 0be1f7fd on test/crash-recovery-vm-20261014. Final VM held/allocated balances were zero; private stopped crash disk was retained outside the repository. Final-artifact negative probes and an unattended fourth repetition remain postponed.
