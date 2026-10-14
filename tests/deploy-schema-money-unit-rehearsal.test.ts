@@ -10,6 +10,8 @@ import {
 } from "../scripts/deploy/migrations.ts";
 import {
   moneyUnitCutoverSchemaMatches,
+  readMoneyAggregateDigest,
+  readMoneyFrozenDataDigest,
   readMoneyPreimageDigest,
   readWholeDatabaseDataDigest,
 } from "../scripts/deploy/schema-money-unit-cutover.ts";
@@ -226,6 +228,39 @@ describe("money-unit native rehearsal source", () => {
         ]),
       ).rejects.toThrow("no such table");
       expect(await allApplicationDigest(database)).toBe(readyDigest);
+      expect(database.query("SELECT COUNT(*) AS n FROM money_cutover_writer_permit").get()).toEqual(
+        { n: 0 },
+      );
+      for (const skippedUpdate of [
+        plan.sql["permit-success"].replace(
+          "event_id = 'evt_rehearsal' AND outcome = 'ignored'",
+          "event_id = 'evt_missing' AND outcome = 'ignored'",
+        ),
+        plan.sql["permit-success"].replace("SET outcome = 'deferred'", "SET outcome = outcome"),
+      ]) {
+        expect(skippedUpdate).not.toBe(plan.sql["permit-success"]);
+        database.exec(`BEGIN TRANSACTION;\n${skippedUpdate}\nCOMMIT;`);
+        expect(await allApplicationDigest(database)).toBe(plan.application.resume);
+        expect(await allApplicationDigest(database)).not.toBe(plan.application["permit-success"]);
+        expect(
+          database.query("SELECT COUNT(*) AS n FROM money_cutover_writer_permit").get(),
+        ).toEqual({ n: 0 });
+      }
+      database.exec(`BEGIN TRANSACTION;\n${plan.sql["permit-success"]}\nCOMMIT;`);
+      expect(
+        database.query("SELECT outcome FROM stripe_events WHERE event_id = 'evt_rehearsal'").get(),
+      ).toEqual({ outcome: "deferred" });
+      expect(await allApplicationDigest(database)).toBe(plan.application["permit-success"]);
+      expect(await readMoneyFrozenDataDigest(reader(database), "verification")).toBe(
+        plan.financial["permit-success"],
+      );
+      expect(plan.financial["permit-success"]).not.toBe(plan.financial.resume);
+      expect(await readMoneyPreimageDigest(reader(database), "verification", true)).toBe(
+        plan.preimageDigest,
+      );
+      expect(await readMoneyAggregateDigest(reader(database), "verification", true)).toBe(
+        plan.aggregateDigest,
+      );
       expect(database.query("SELECT COUNT(*) AS n FROM money_cutover_writer_permit").get()).toEqual(
         { n: 0 },
       );

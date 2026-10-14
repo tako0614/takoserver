@@ -134,8 +134,12 @@ after resume and require the exact guard fault. The stale-epoch probe requires
 the authorized-epoch trigger fault. The permit-failure probe mutates a
 synthetic Stripe event under a correct permit, then faults late; native import
 must roll back both the event and permit. The permit-success import exercises
-one correct permit, a matching-row guarded UPDATE, and permit deletion; the
-full typed-byte readback remains unchanged and permit is empty. Each phase
+one correct permit, a guarded UPDATE changing the pre-seeded Stripe event from
+`ignored` to `deferred`, and permit deletion. Its exact full application and
+financial typed-byte digests must change to the independently reviewed expected
+values, while the amount preimage and aggregate digests stay unchanged and the
+permit is empty. A skipped or matching-row no-op UPDATE fails the expected
+readback. Each phase
 has its own independently reviewed SQL digest, native structured fault or
 success observation, protected dispatch and terminal receipt. No reset,
 delete, replay or old-cents rollback is implemented here.

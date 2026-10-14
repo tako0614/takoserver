@@ -1005,18 +1005,37 @@ export async function buildMoneyRehearsalSyntheticPlan(
     sql["permit-failure-probe"] =
       `${permitInsert}\nUPDATE stripe_events SET outcome = 'deferred' WHERE event_id = 'evt_rehearsal';\nINSERT INTO ${MISSING_TABLE} VALUES (1);\n`;
     sql["permit-success"] =
-      `${permitInsert}\nUPDATE stripe_events SET outcome = outcome WHERE event_id = 'evt_rehearsal';\n${permitDelete}\n`;
+      `${permitInsert}\nUPDATE stripe_events SET outcome = 'deferred' WHERE event_id = 'evt_rehearsal' AND outcome = 'ignored';\n${permitDelete}\n`;
     for (const phase of [
       "legacy-insert-probe",
       "legacy-update-probe",
       "legacy-delete-probe",
       "stale-epoch-probe",
       "permit-failure-probe",
-      "permit-success",
     ] as const) {
       financial[phase] = financial.resume;
       application[phase] = application.resume;
     }
+    database.exec(`BEGIN TRANSACTION;\n${sql["permit-success"]}\nCOMMIT;`);
+    const event = database
+      .query("SELECT outcome FROM stripe_events WHERE event_id = 'evt_rehearsal'")
+      .get() as { outcome: unknown } | null;
+    if (event?.outcome !== "deferred")
+      throw preflightError("synthetic permitted Stripe UPDATE did not change the seeded row");
+    const permit = database
+      .query("SELECT COUNT(*) AS n FROM money_cutover_writer_permit")
+      .get() as {
+      n: number;
+    };
+    if (permit.n !== 0)
+      throw preflightError("synthetic permitted Stripe UPDATE left a writer permit");
+    financial["permit-success"] = await readMoneyFrozenDataDigest(reader, "preflight");
+    application["permit-success"] = await applicationDigest(reader, "preflight");
+    if (
+      financial["permit-success"] === financial.resume ||
+      application["permit-success"] === application.resume
+    )
+      throw preflightError("synthetic permitted Stripe UPDATE has no observable native readback");
     return { sql, financial, application, preimageDigest, aggregateDigest, writerEpoch };
   } finally {
     database.close();

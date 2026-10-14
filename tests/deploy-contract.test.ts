@@ -94,6 +94,22 @@ const SURFACES = [
 ] as const;
 
 describe("Takoserver split deploy entrypoint", () => {
+  test("money rehearsal contract names the post-resume guard probes and Worker batch limit", () => {
+    for (const surface of [
+      "takoserver-integration-money-shadow-rehearsal",
+      "takoserver-d1-money-cutover-rehearsal",
+    ]) {
+      const postConditions = DEPLOY_CONTRACT.surfaces.find((entry) => entry.surface === surface)
+        ?.obligations["post-conditions"];
+      expect(postConditions).toContain("14-phase");
+      expect(postConditions).toContain("false-CHECK resume probe");
+      expect(postConditions).toContain("raw legacy Stripe INSERT, UPDATE and DELETE");
+      expect(postConditions).toContain("stale writer epoch");
+      expect(postConditions).toContain("permitted success");
+      expect(postConditions).toContain("native Worker D1.batch");
+    }
+  });
+
   test("flushes the complete contract before exiting through a piped stdout", async () => {
     const probe = await deployThroughPipe();
     expect(probe.exitCode).toBe(0);
