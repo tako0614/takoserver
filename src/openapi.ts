@@ -742,6 +742,45 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
       },
     },
   ),
+  runOperatorPaymentsReconcile: described(
+    "Run the payment reconcile pass now, on the operator's single-use assertion",
+    {
+      description:
+        "Runs the same pass as the scheduled reconcile and returns its report. Served only where Stripe funding is configured and an operator identity key is present. " +
+        "The credential is a `payments-reconcile` assertion signed by the operator identity key: it names this Host's public origin as `aud`, carries a `jti` nonce and exactly the claims `purpose`, `aud`, `jti`, `iat` and `exp`, lives at most sixty seconds and is spent before the pass runs. " +
+        "No session or API key can run it. A repeat credits nothing twice, because every path credits through the same `stripe:<session id>` funding reference. On a Bun Host a request arriving while a pass is running joins that pass; a Worker runs one pass per request.",
+      security: [],
+      requestBody: {
+        required: true,
+        content: {
+          "application/json": {
+            schema: { $ref: "#/components/schemas/OperatorPaymentsReconcileRequest" },
+          },
+        },
+      },
+      responses: {
+        "200": {
+          description: "The pass ran; its report",
+          content: {
+            "application/json": {
+              schema: { $ref: "#/components/schemas/OperatorPaymentsReconcileResponse" },
+            },
+          },
+        },
+        "400": errorResponse("Malformed body"),
+        "401": errorResponse(
+          "Missing, expired, replayed, wrongly signed, wrong-purpose or wrong-audience operator assertion",
+        ),
+        "404": errorResponse("Payment reconcile or an operator identity key is not configured"),
+        "500": errorResponse(
+          "Internal failure, for example the assertion could not be recorded as spent; the pass did not run",
+        ),
+        "503": errorResponse(
+          "Stripe could not be read; retryable with a fresh assertion, because this one is spent",
+        ),
+      },
+    },
+  ),
   listOfferings: described("List purchasable offerings"),
   createResellerQuote: described("Price an offering for a tenant"),
   createResellerReservation: described("Reserve a quote, holding funds"),
@@ -1395,6 +1434,72 @@ export const openApiDocument = {
           subject: { type: "string", minLength: 1, maxLength: 256 },
           email: { type: "string", minLength: 1, maxLength: 256 },
           displayName: { type: "string", minLength: 1, maxLength: 256 },
+        },
+      },
+      OperatorPaymentsReconcileRequest: {
+        type: "object",
+        required: ["assertion"],
+        additionalProperties: false,
+        properties: {
+          assertion: {
+            type: "string",
+            minLength: 1,
+            maxLength: 8_192,
+            description:
+              "Operator assertion for purpose `payments-reconcile`; `bun scripts/operator-key.ts payments-reconcile` prints one.",
+          },
+        },
+      },
+      OperatorPaymentsReconcileResponse: {
+        type: "object",
+        required: ["report"],
+        additionalProperties: false,
+        properties: { report: { $ref: "#/components/schemas/FundingReconcileReport" } },
+      },
+      FundingReconcileReport: {
+        type: "object",
+        required: [
+          "examined",
+          "credited",
+          "alreadyCredited",
+          "unknownOrganization",
+          "skipped",
+          "truncated",
+          "creditedFundingRefs",
+          "uncredited",
+        ],
+        additionalProperties: false,
+        properties: {
+          examined: { type: "integer", minimum: 0 },
+          credited: { type: "integer", minimum: 0 },
+          alreadyCredited: { type: "integer", minimum: 0 },
+          unknownOrganization: { type: "integer", minimum: 0 },
+          skipped: {
+            type: "object",
+            description: "Sessions that do not credit, counted by machine reason",
+            additionalProperties: { type: "integer", minimum: 1 },
+          },
+          truncated: {
+            type: "boolean",
+            description: "The lookback window held more sessions than one pass reads",
+          },
+          creditedFundingRefs: {
+            type: "array",
+            items: { type: "string", minLength: 1 },
+          },
+          uncredited: {
+            type: "array",
+            description: "Paid sessions this pass could not credit",
+            items: {
+              type: "object",
+              required: ["fundingRef", "reason"],
+              additionalProperties: false,
+              properties: {
+                fundingRef: { type: "string", minLength: 1 },
+                reason: { type: "string", minLength: 1 },
+              },
+            },
+          },
         },
       },
       IntegrationOrganizationBootstrapStatusRequest: {

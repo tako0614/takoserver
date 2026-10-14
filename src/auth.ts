@@ -204,9 +204,11 @@ const SINGLE_USE_PRUNE_SKEW_SECONDS = 300;
  * cache: every key is `<namespace>:<rest>`, where the namespace matches
  * `[a-z][a-z0-9-]{0,63}` and names the one writer that owns that key space.
  * A writer prunes only its own namespace's range. `operator-sign-in` holds
- * spent operator sign-in assertions keyed by their signed-payload digest.
- * Runtime grants use a pluggable in-memory replay store today; if they are
- * ever persisted here, they need a namespace of their own as well.
+ * spent operator sign-in assertions keyed by their signed-payload digest;
+ * `operator-payments-reconcile` holds spent operator payment reconcile
+ * assertions the same way. Runtime grants use a pluggable in-memory replay
+ * store today; if they are ever persisted here, they need a namespace of their
+ * own as well.
  */
 const SINGLE_USE_NAMESPACE = /^[a-z][a-z0-9-]{0,63}$/u;
 const SINGLE_USE_DIGEST = /^sha256:[0-9a-f]{64}$/u;
@@ -692,6 +694,60 @@ export function createApiKeyAdministration(
   };
 }
 
+/** Spends and reads single-use credentials in the shared replay cache. */
+export interface SingleUseCredentials {
+  /** Records the credential, refusing (`unauthenticated`) one already spent. */
+  spend(credential: SingleUseCredential): Promise<void>;
+  /** Read-only: whether the credential has already been spent. */
+  spent(credential: SingleUseCredential): Promise<boolean>;
+}
+
+/**
+ * Remembers single-use credentials until they expire, refusing a second
+ * presentation.
+ *
+ * The rows live in `runtime_grant_replays` (see `singleUseKey` for the key
+ * convention), which every Host database (D1 and SQLite) already has, so no
+ * schema change is needed. The primary key makes concurrent presentations
+ * race to exactly one winner.
+ *
+ * Expiry is the verifier's decision, made on its own clock. An entry is kept
+ * until its credential's expiry, and at least one second from now, and is
+ * pruned only `SINGLE_USE_PRUNE_SKEW_SECONDS` after that, within its own
+ * namespace.
+ */
+export function createSingleUseCredentials(sql: Sql, clock: Clock): SingleUseCredentials {
+  return {
+    async spend(credential) {
+      const nowSeconds = Math.floor(clock().getTime() / 1_000);
+      const key = singleUseKey(credential);
+      const namespace = credential.namespace;
+      // `;` sorts immediately after `:`, so this is the namespace's key range.
+      await sql.run(
+        `DELETE FROM runtime_grant_replays
+         WHERE grant_id > ? AND grant_id < ? AND expires_at_epoch_seconds <= ?`,
+        [`${namespace}:`, `${namespace};`, nowSeconds - SINGLE_USE_PRUNE_SKEW_SECONDS],
+      );
+      const spent = await sql.run(
+        `INSERT INTO runtime_grant_replays
+           (grant_id, expires_at_epoch_seconds, consumed_at_epoch_seconds)
+         VALUES (?, ?, ?)
+         ON CONFLICT(grant_id) DO NOTHING`,
+        [key, Math.max(credential.expiresAtEpochSeconds, nowSeconds + 1), nowSeconds],
+      );
+      if (spent.changes !== 1) throw new AuthError("unauthenticated");
+    },
+
+    async spent(credential) {
+      const rows = await sql.query(
+        "SELECT 1 AS spent FROM runtime_grant_replays WHERE grant_id = ? LIMIT 1",
+        [singleUseKey(credential)],
+      );
+      return rows.length > 0;
+    },
+  };
+}
+
 export function createAccounts(options: CreateAccountsOptions): Accounts {
   const { sql, identity } = options;
   const clock = options.clock ?? (() => new Date());
@@ -735,48 +791,7 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
     return { id, secret, createdAt, expiresAt };
   };
 
-  /**
-   * Remembers a single-use credential until it expires, refusing a second
-   * presentation.
-   *
-   * The rows live in `runtime_grant_replays` (see `singleUseKey` for the key
-   * convention), which every Host database (D1 and SQLite) already has, so no
-   * schema change is needed. The primary key makes concurrent presentations
-   * race to exactly one winner.
-   *
-   * Expiry is the verifier's decision, made on its own clock. An entry is kept
-   * until its credential's expiry, and at least one second from now, and is
-   * pruned only `SINGLE_USE_PRUNE_SKEW_SECONDS` after that, within its own
-   * namespace.
-   */
-  const spendSingleUse = async (credential: SingleUseCredential): Promise<void> => {
-    const nowSeconds = Math.floor(clock().getTime() / 1_000);
-    const key = singleUseKey(credential);
-    const namespace = credential.namespace;
-    // `;` sorts immediately after `:`, so this is the namespace's key range.
-    await sql.run(
-      `DELETE FROM runtime_grant_replays
-       WHERE grant_id > ? AND grant_id < ? AND expires_at_epoch_seconds <= ?`,
-      [`${namespace}:`, `${namespace};`, nowSeconds - SINGLE_USE_PRUNE_SKEW_SECONDS],
-    );
-    const spent = await sql.run(
-      `INSERT INTO runtime_grant_replays
-         (grant_id, expires_at_epoch_seconds, consumed_at_epoch_seconds)
-       VALUES (?, ?, ?)
-       ON CONFLICT(grant_id) DO NOTHING`,
-      [key, Math.max(credential.expiresAtEpochSeconds, nowSeconds + 1), nowSeconds],
-    );
-    if (spent.changes !== 1) throw new AuthError("unauthenticated");
-  };
-
-  /** Read-only: whether a single-use credential has already been spent. */
-  const singleUseSpent = async (credential: SingleUseCredential): Promise<boolean> => {
-    const rows = await sql.query(
-      "SELECT 1 AS spent FROM runtime_grant_replays WHERE grant_id = ? LIMIT 1",
-      [singleUseKey(credential)],
-    );
-    return rows.length > 0;
-  };
+  const singleUse = createSingleUseCredentials(sql, clock);
 
   const accounts: Accounts = {
     async signIn({ provider, assertion, method, nonce, audience, sessionTtlSeconds }) {
@@ -793,7 +808,7 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
       // Spent before anything is written or issued: a replayed credential opens
       // nothing, and a crash after this point burns it rather than leaving it
       // usable twice.
-      if (verified.singleUse) await spendSingleUse(verified.singleUse);
+      if (verified.singleUse) await singleUse.spend(verified.singleUse);
       const rows = await sql.query(
         "SELECT id, email, display_name FROM principals WHERE provider = ? AND provider_subject = ?",
         [provider, verified.providerSubject],
@@ -864,7 +879,7 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
       // assertion its session exchange then redeems. A credential already
       // spent proves nothing either: a copy leaked after use must not keep
       // answering ownership questions until it expires.
-      if (verified.singleUse && (await singleUseSpent(verified.singleUse))) {
+      if (verified.singleUse && (await singleUse.spent(verified.singleUse))) {
         throw new AuthError("unauthenticated");
       }
       const rows = await sql.query(
