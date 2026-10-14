@@ -58,10 +58,24 @@ describe("integration money maintenance publication", () => {
       expect(workerSchemaAllowsPending(maintenance, observed)).toBe(true);
       if (!phase.startsWith("0094")) {
         expect(workerSchemaAllowsPending(target, observed)).toBe(false);
-        expect(workerMoneyUnitSchemaReady(observed, import.meta.dir + "/..")).toBe(false);
+        expect(workerMoneyUnitSchemaReady(observed, `${import.meta.dir}/..`)).toBe(false);
       }
     }
-    expect(workerMoneyUnitSchemaReady(state("0094-fenced"), import.meta.dir + "/..")).toBe(true);
+    for (const phase of ["0094", "0094-fenced"] as const) {
+      const observed = state(phase);
+      expect(workerMoneyUnitSchemaReady(observed, `${import.meta.dir}/..`)).toBe(true);
+      expect(workerSchemaAllowsPending(target, observed)).toBe(true);
+      expect(workerSchemaAllowsPending({ ...target, hostedPricing: "{}" }, observed)).toBe(false);
+      expect(
+        workerSchemaAllowsPending(
+          {
+            ...target,
+            takoformV2: { config: "{}", storageLineage: "v2-0088" },
+          },
+          observed,
+        ),
+      ).toBe(false);
+    }
     expect(
       workerSchemaAllowsPending({ ...maintenance, environment: "production" }, state("0092")),
     ).toBe(false);
@@ -86,7 +100,7 @@ describe("integration money maintenance publication", () => {
           shape,
           shapeDigest: `sha256:${createHash("sha256").update(shape).digest("hex")}`,
         },
-        import.meta.dir + "/..",
+        `${import.meta.dir}/..`,
       ),
     ).toBe(false);
   });

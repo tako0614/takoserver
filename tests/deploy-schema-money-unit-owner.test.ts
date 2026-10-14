@@ -432,6 +432,29 @@ function standaloneFixture(operatorIdentity?: NonNullable<DeployTarget["operator
 }
 
 describe("money unit owner adapter", () => {
+  test("accepts the qualified authority closure receipt and rejects other publication kinds", async () => {
+    const f = standaloneFixture();
+    const receipt = JSON.parse(readFileSync(f.paths.maintenancePublication, "utf8"));
+    const maintenancePublicationReceiptDigest = f.write(f.paths.maintenancePublication, {
+      ...receipt,
+      resultKind: "takoserver.worker-closure-transition-apply@v1",
+    });
+    f.write(f.paths.declaration, { ...f.declaration, maintenancePublicationReceiptDigest });
+    const options = await loadMoneyUnitCutoverOptions(f.paths.declaration, f.target, f);
+    expect(await options.maintenanceProof()).toMatchObject({ privateMoneyWriters: 0 });
+    const unknownDigest = f.write(f.paths.maintenancePublication, {
+      ...receipt,
+      resultKind: "takoserver.unqualified-publication@v1",
+    });
+    f.write(f.paths.declaration, {
+      ...f.declaration,
+      maintenancePublicationReceiptDigest: unknownDigest,
+    });
+    await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, f.target, f)).rejects.toThrow(
+      "terminal publication",
+    );
+  });
+
   test("qualifies standalone public-key identity without adding a private writer", async () => {
     const f = standaloneFixture({
       publicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
@@ -740,7 +763,7 @@ describe("money unit owner adapter", () => {
       deploymentId: id(45),
       versionId: id(44),
       surface: "takoserver-worker-authority-cutover",
-      resultKind: "takoserver.worker-apply@v2",
+      resultKind: "takoserver.worker-closure-transition-apply@v1",
       resultDigest: sha("resume-result"),
       ownerGateDigest: sha("resume-gate"),
       reviewer: "publication-reviewer",

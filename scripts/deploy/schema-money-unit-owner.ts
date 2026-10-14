@@ -680,7 +680,10 @@ interface PublicPublicationReceipt {
   readonly deploymentId: string;
   readonly versionId: string;
   readonly surface: "takoserver-worker-authority-cutover";
-  readonly resultKind: "takoserver.worker-apply@v2";
+  /** Normal authority publication adds maintenance; closure transition retires its mode on resume. */
+  readonly resultKind:
+    | "takoserver.worker-apply@v2"
+    | "takoserver.worker-closure-transition-apply@v1";
   readonly resultDigest: string;
   readonly ownerGateDigest: string;
   readonly reviewer: string;
@@ -736,7 +739,9 @@ function parsePublicPublicationReceipt(
     !Number.isSafeInteger(value.artifactFiles) ||
     Number(value.artifactFiles) < 2 ||
     value.surface !== "takoserver-worker-authority-cutover" ||
-    value.resultKind !== "takoserver.worker-apply@v2" ||
+    !["takoserver.worker-apply@v2", "takoserver.worker-closure-transition-apply@v1"].includes(
+      String(value.resultKind),
+    ) ||
     !UUID.test(String(value.deploymentId)) ||
     !UUID.test(String(value.versionId)) ||
     !requireSha(value.resultDigest) ||

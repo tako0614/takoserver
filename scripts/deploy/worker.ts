@@ -305,16 +305,36 @@ export function workerSchemaAllowsPending(
     target.schemaMaintenanceMode === undefined &&
     target.artifactBlobIoMode === undefined &&
     target.environment === "integration" &&
-    target.takoformV2?.storageLineage !== undefined
+    (target.takoformV2?.storageLineage !== undefined ||
+      target.takoformV2?.appliedSchemaLineage !== undefined)
   ) {
     // The selected storage lineage remains the immutable generation origin;
     // it never authorizes this USD-micros Worker on the old money unit.
     const source = readCurrentAuditedMigrationSourceArtifact(
       resolve(sourceRepositoryRoot, "migrations"),
     );
+    if (JSON.stringify(migrations.local) !== JSON.stringify(source.names)) return false;
+    if (JSON.stringify(migrations.applied) === JSON.stringify(source.names)) return true;
+    // The selected 0092 generation may serve the exact reviewed 0094 cutover
+    // prefix while 0095 remains an audited source-only successor. Hosted
+    // subscriptions need the complete 0095 schema and cannot use this prefix.
+    if (
+      target.hostedPricing !== undefined ||
+      (target.takoformV2?.storageLineage !== "v2-0092" &&
+        target.takoformV2?.appliedSchemaLineage !== "v2-0092") ||
+      migrations.shape === undefined ||
+      migrations.shapeDigest === undefined
+    ) {
+      return false;
+    }
+    const state = {
+      applied: migrations.applied,
+      shape: migrations.shape,
+      shapeDigest: migrations.shapeDigest,
+    };
     return (
-      JSON.stringify(migrations.local) === JSON.stringify(source.names) &&
-      JSON.stringify(migrations.applied) === JSON.stringify(source.names)
+      moneyUnitCutoverSchemaMatches(state, source.files, "0094") ||
+      moneyUnitCutoverSchemaMatches(state, source.files, "0094-fenced")
     );
   }
   if (target.schemaMaintenanceMode !== "pre-0058-quiesced") {
@@ -351,23 +371,23 @@ export function workerMoneyUnitSchemaReady(
     if (expectedMoneyShapes.size >= 4) expectedMoneyShapes.clear();
     expectedMoneyShapes.set(source.digest, expectedShape);
   }
+  if (
+    !source.names.includes(MONEY_UNIT_MIGRATION) ||
+    JSON.stringify(migrations.local) !== JSON.stringify(source.names)
+  ) {
+    return false;
+  }
+  const state = {
+    applied: migrations.applied,
+    shape: migrations.shape,
+    shapeDigest: migrations.shapeDigest,
+  };
+  if (JSON.stringify(migrations.applied) === JSON.stringify(source.names)) {
+    return applicationSchemaMatches(state, expectedShape);
+  }
   return (
-    source.names.includes(MONEY_UNIT_MIGRATION) &&
-    JSON.stringify(migrations.local) === JSON.stringify(source.names) &&
-    JSON.stringify(migrations.applied) === JSON.stringify(source.names) &&
-    (applicationSchemaMatches(
-      { applied: migrations.applied, shape: migrations.shape, shapeDigest: migrations.shapeDigest },
-      expectedShape,
-    ) ||
-      moneyUnitCutoverSchemaMatches(
-        {
-          applied: migrations.applied,
-          shape: migrations.shape,
-          shapeDigest: migrations.shapeDigest,
-        },
-        source.files,
-        "0094-fenced",
-      ))
+    moneyUnitCutoverSchemaMatches(state, source.files, "0094") ||
+    moneyUnitCutoverSchemaMatches(state, source.files, "0094-fenced")
   );
 }
 
