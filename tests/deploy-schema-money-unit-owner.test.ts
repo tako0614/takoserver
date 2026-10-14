@@ -403,8 +403,12 @@ function fixture(selectedTarget: DeployTarget = target) {
   };
 }
 
-function standaloneFixture() {
-  const { cloudflareProviderExecutor: _managedExecutor, ...standaloneTarget } = target;
+function standaloneFixture(operatorIdentity?: NonNullable<DeployTarget["operatorIdentity"]>) {
+  const { cloudflareProviderExecutor: _managedExecutor, ...baseTarget } = target;
+  const standaloneTarget: DeployTarget = {
+    ...baseTarget,
+    ...(operatorIdentity === undefined ? {} : { operatorIdentity }),
+  };
   const f = fixture(standaloneTarget);
   const standaloneScope = {
     ...f.scope,
@@ -428,6 +432,20 @@ function standaloneFixture() {
 }
 
 describe("money unit owner adapter", () => {
+  test("qualifies standalone public-key identity without adding a private writer", async () => {
+    const f = standaloneFixture({
+      publicJwk: { kty: "OKP", crv: "Ed25519", x: "A".repeat(43) },
+    });
+    const options = await loadMoneyUnitCutoverOptions(f.paths.declaration, f.target, f);
+    expect(await options.maintenanceProof()).toMatchObject({
+      privateMoneyWriters: 0,
+      privateDeploymentsDigest: sha("[]"),
+    });
+    expect(f.requests.some((item) => item.includes("private-"))).toBe(false);
+    f.setExtraPublicBinding(true);
+    await expect(options.maintenanceProof()).rejects.toThrow();
+  });
+
   test("qualifies reviewed standalone Host without private Git or private native inventory", async () => {
     const f = standaloneFixture();
     const options = await loadMoneyUnitCutoverOptions(f.paths.declaration, f.target, f);
