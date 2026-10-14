@@ -12,6 +12,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 const [verb, watch, configPath] = process.argv.slice(-3);
 if (verb !== "serve" || watch !== "--watch" || !configPath) throw new Error("unexpected child command");
 const { port, label, signalledPath, releasePath, dropListenerPath } = JSON.parse(readFileSync(configPath, "utf8"));
+if (label === "delayed-start") await Bun.sleep(1_500);
 const server = Bun.serve({ hostname: "127.0.0.1", port, fetch: () => new Response(JSON.parse(readFileSync(configPath, "utf8")).label ?? label) });
 let listenerDropped = false;
 process.on("SIGTERM", () =>
@@ -160,6 +161,23 @@ async function signalled(path: string, pid: number | undefined): Promise<boolean
     throw error;
   }
 }
+
+test("a delayed native bootstrap is admitted only after its exact child owns the listener", async () => {
+  const owned = await fixture();
+  const port = await unusedPort();
+  try {
+    const group = await owned.open({ workerUid: "delayed", port, label: "delayed-start" });
+    await group.start();
+    expect(owned.children).toHaveLength(1);
+    expect(await workerPortOwnership(port, owned.children[0]?.pid)).toBe("owned");
+    expect(group.isReady()).toBe(true);
+    expect(await (await group.fetch(new Request("https://delayed.example/"))).text()).toBe(
+      "delayed-start",
+    );
+  } finally {
+    await cleanup(owned);
+  }
+});
 
 test("retiring one Worker group freezes it, reaps only its child, and replays its durable receipt", async () => {
   const owned = await fixture();

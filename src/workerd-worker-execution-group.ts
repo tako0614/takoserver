@@ -342,7 +342,9 @@ function makeGroup(input: {
             spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "ignore" })),
         ...(options.onSpawned === undefined ? {} : { onSpawned: options.onSpawned }),
         readiness: async (_configPath, child, mode) => {
-          const attempts = mode === "startup" ? 20 : 1;
+          // Native startup on a loaded Linux TCG target can exceed one second.
+          // Admission still requires two observations of this child's owned port.
+          const attempts = mode === "startup" ? 200 : 1;
           for (let attempt = 0; attempt < attempts; attempt += 1) {
             try {
               const before = await workerPortOwnership(options.listenerPort, child.pid);
