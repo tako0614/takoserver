@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { SelfhostObjectError } from "../selfhost-object-store.ts";
+import { decodeSelfhostObjectBodyFrames, SelfhostObjectError } from "../selfhost-object-store.ts";
 import type {
   SelfhostV2ObjectBucketAccess,
   SelfhostV2ObjectBucketIdentity,
@@ -10,6 +10,7 @@ import {
   MAX_SELFHOST_OBJECT_DOCUMENT_BYTES,
   SELFHOST_DATA_PLANE_CONTENT_TYPE,
   SELFHOST_DATA_PLANE_MAX_RESPONSE_BYTES,
+  SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT,
   SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE,
   SELFHOST_DATA_PLANE_OBJECT_PROTOCOL,
   SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER,
@@ -27,11 +28,11 @@ const MAX_MULTIPART_PARTS = 10_000;
 const OBJECT_OPERATION_FIELDS: Readonly<Record<string, readonly string[]>> = {
   head: ["key"],
   get: ["key", "range", "ifMatch", "ifNoneMatch"],
-  put: ["key", "contentLength", "contentType", "ifMatch", "ifNoneMatch"],
+  put: ["key", "contentLength", "contentType", "ifMatch", "ifNoneMatch", "bodyFormat"],
   delete: ["key"],
   list: ["prefix", "delimiter", "cursor", "limit"],
   createMultipartUpload: ["key", "contentType"],
-  uploadPart: ["key", "uploadId", "partNumber", "contentLength"],
+  uploadPart: ["key", "uploadId", "partNumber", "contentLength", "bodyFormat"],
   completeMultipartUpload: ["key", "uploadId", "parts"],
   abortMultipartUpload: ["key", "uploadId"],
 };
@@ -397,9 +398,11 @@ async function operate(
       });
     }
     case "put": {
-      const body = guardedRequestBody(request.body ?? new Blob([]).stream(), valid);
+      const body = objectRequestBody(request, fields, valid);
       const result = await bucket.put(stringField(fields.key), body, {
-        contentLength: lengthField(fields.contentLength),
+        ...(Object.hasOwn(fields, "contentLength")
+          ? { contentLength: lengthField(fields.contentLength) }
+          : {}),
         ...(fields.contentType === undefined
           ? {}
           : { contentType: stringField(fields.contentType) }),
@@ -429,14 +432,16 @@ async function operate(
         }),
       );
     case "uploadPart": {
-      const body = guardedRequestBody(request.body ?? new Blob([]).stream(), valid);
+      const body = objectRequestBody(request, fields, valid);
       return answer(
         await bucket.uploadPart(
           stringField(fields.key),
           stringField(fields.uploadId),
           lengthField(fields.partNumber),
           body,
-          { contentLength: lengthField(fields.contentLength) },
+          Object.hasOwn(fields, "contentLength")
+            ? { contentLength: lengthField(fields.contentLength) }
+            : {},
         ),
       );
     }
@@ -463,40 +468,66 @@ function guardedRequestBody(source: ReadableStream<Uint8Array>, valid: () => Pro
   return guardStream(source, valid);
 }
 
+function objectRequestBody(
+  request: Request,
+  fields: Readonly<Record<string, unknown>>,
+  valid: () => Promise<boolean>,
+): ReadableStream<Uint8Array> {
+  if (
+    fields.bodyFormat !== undefined &&
+    fields.bodyFormat !== SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT
+  ) {
+    throw new SelfhostObjectError("backend_unavailable");
+  }
+  const source = guardedRequestBody(request.body ?? new Blob([]).stream(), valid);
+  return fields.bodyFormat === SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT
+    ? decodeSelfhostObjectBodyFrames(source)
+    : source;
+}
+
 function guardStream(
   source: ReadableStream<Uint8Array>,
   valid: () => Promise<boolean>,
 ): ReadableStream<Uint8Array> {
   const reader = source.getReader();
-  return new ReadableStream<Uint8Array>({
-    async pull(controller) {
-      if (!(await valid())) {
-        cancelReader(reader);
-        controller.error(new SelfhostObjectError("backend_unavailable"));
-        return;
-      }
-      try {
-        const next = await reader.read();
-        if (next.done) {
-          if (!(await valid())) {
-            controller.error(new SelfhostObjectError("backend_unavailable"));
-          } else controller.close();
-          return;
-        }
+  return new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
         if (!(await valid())) {
           cancelReader(reader);
+          reader.releaseLock();
           controller.error(new SelfhostObjectError("backend_unavailable"));
           return;
         }
-        controller.enqueue(next.value);
-      } catch {
-        controller.error(new SelfhostObjectError("backend_unavailable"));
-      }
+        try {
+          const next = await reader.read();
+          if (next.done) {
+            reader.releaseLock();
+            if (!(await valid())) {
+              controller.error(new SelfhostObjectError("backend_unavailable"));
+            } else controller.close();
+            return;
+          }
+          if (!(await valid())) {
+            cancelReader(reader);
+            reader.releaseLock();
+            controller.error(new SelfhostObjectError("backend_unavailable"));
+            return;
+          }
+          controller.enqueue(next.value);
+        } catch {
+          cancelReader(reader);
+          reader.releaseLock();
+          controller.error(new SelfhostObjectError("backend_unavailable"));
+        }
+      },
+      cancel(reason) {
+        cancelReader(reader, reason);
+        reader.releaseLock();
+      },
     },
-    cancel(reason) {
-      cancelReader(reader, reason);
-    },
-  });
+    { highWaterMark: 0 },
+  );
 }
 
 function cancelReader(reader: ReadableStreamDefaultReader<Uint8Array>, reason?: unknown): void {

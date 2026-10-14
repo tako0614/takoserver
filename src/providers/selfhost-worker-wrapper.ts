@@ -119,6 +119,8 @@ export const SELFHOST_WORKER_EDGE_VECTOR_BINDING_KIND = EDGE_VECTOR_WORKER_FACAD
  * Binding facade to hide.
  */
 export const SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND = "edge.objects@1.0.0" as const;
+/** Host-private body framing; payload length excludes frame records. */
+export const SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT = "byte-chunks-v1" as const;
 /** The published fetch-only logical Worker binding. */
 export const SELFHOST_WORKER_SERVICE_BINDING_KIND = "worker.service@1.0.0" as const;
 /** Host-private signal used only between the service router and this wrapper. */
@@ -532,8 +534,13 @@ export const ${SELFHOST_WORKER_EVENT_ENTRYPOINT} = SafeApply(SafeObjectFreeze, S
   SafeRegExpTest,
   SafeReadableStream,
   SafeReadableStreamLockedGet,
+  SafeReadableStreamGetReader,
+  SafeReadableStreamReaderRead,
+  SafeReadableStreamReaderCancel,
+  SafeReadableStreamReaderReleaseLock,
   SafeReadableStreamControllerClose,
   SafeReadableStreamControllerEnqueue,
+  SafeReadableStreamControllerError,
   SafeResponse,
   SafeResponseText,
   SafeResponseBodyGet,
@@ -565,6 +572,7 @@ export const ${SELFHOST_WORKER_EVENT_ENTRYPOINT} = SafeApply(SafeObjectFreeze, S
   SafeTypedArrayBufferGet,
   SafeTypedArrayByteLengthGet,
   SafeTypedArrayByteOffsetGet,
+  SafeTypedArrayNameGet,
 } from ${JSON.stringify(preludeSpecifier)};
 import * as TenantWorkerModule from ${JSON.stringify(moduleSpecifier)};
 
@@ -592,6 +600,7 @@ const OBJECT_PROTOCOL = ${JSON.stringify(SELFHOST_DATA_PLANE_OBJECT_PROTOCOL)};
 const OBJECT_REQUEST_HEADER = ${JSON.stringify(SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER)};
 const OBJECT_RESULT_HEADER = ${JSON.stringify(SELFHOST_DATA_PLANE_OBJECT_RESULT_HEADER)};
 const OBJECT_CONTENT_TYPE = ${JSON.stringify(SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE)};
+const OBJECT_BODY_FORMAT = ${JSON.stringify(SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT)};
 const OBJECTS_KIND = ${JSON.stringify(SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND)};
 const SERVICE_KIND = ${JSON.stringify(SELFHOST_WORKER_SERVICE_BINDING_KIND)};
 const SERVICE_UNAVAILABLE_HEADER = ${JSON.stringify(SELFHOST_WORKER_SERVICE_UNAVAILABLE_HEADER)};
@@ -1633,18 +1642,33 @@ function createObjectsAdapter(call, binding, v2PrivateObject) {
     const options = objectPutOptions(rawOptions);
     const source = objectBodySource(body, MAX_OBJECT_SINGLE_PUT_BYTES, options.contentLength);
     const document = objectDocument(binding, "put", key);
-    document.contentLength = source.length;
+    if (source.length !== undefined) document.contentLength = source.length;
     if (options.contentType !== undefined) document.contentType = options.contentType;
     if (options.ifMatch !== undefined) document.ifMatch = options.ifMatch;
     if (options.ifNoneMatch !== undefined) document.ifNoneMatch = options.ifNoneMatch;
-    const value = objectJson(await call(document, source.body));
+    const wire = objectRequestBody(source, document);
+    let value;
+    try {
+      value = objectJson(await call(document, wire.body));
+      if (source.failure() !== undefined) throw portableError(source.failure());
+      if (objectSize(value.size) !== source.size()) throw portableError("invalid_body");
+    } catch (error) {
+      if (source.failure() !== undefined) throw portableError(source.failure());
+      throw error;
+    } finally {
+      wire.abort();
+      source.abort();
+    }
     const result = SafeObjectCreate(null);
     result.etag = objectEtag(value.etag);
     result.size = objectSize(value.size);
     // The managed adapter's answer to the same disagreement: a stored size that
     // is not the length the caller declared is the body's problem, not the
     // backend's.
-    if (result.size !== source.length) throw portableError("invalid_body");
+    if (source.length !== undefined && result.size !== source.length) {
+      throw portableError("invalid_body");
+    }
+    if (result.size > MAX_OBJECT_SINGLE_PUT_BYTES) throw portableError("backend_unavailable");
     return freezeObject(result);
   };
   portable.delete = async function (key) {
@@ -1726,15 +1750,36 @@ function createObjectsAdapter(call, binding, v2PrivateObject) {
     const document = objectDocument(binding, "uploadPart", key);
     document.uploadId = uploadId;
     document.partNumber = partNumber;
-    document.contentLength = source.length;
-    const value = objectJson(await call(document, source.body));
+    if (source.length !== undefined) document.contentLength = source.length;
+    const wire = objectRequestBody(source, document);
+    let value;
+    let size;
+    try {
+      value = objectJson(await call(document, wire.body));
+      if (source.failure() !== undefined) throw portableError(source.failure());
+      size = source.size();
+      if (source.length === undefined && value.size === undefined) {
+        throw portableError("backend_unavailable");
+      }
+      if (value.size !== undefined && objectSize(value.size) !== size) {
+        throw portableError("backend_unavailable");
+      }
+    } catch (error) {
+      if (source.failure() !== undefined) throw portableError(source.failure());
+      throw error;
+    } finally {
+      wire.abort();
+      source.abort();
+    }
     const etag = objectEtag(value.etag);
     if (value.partNumber !== partNumber) throw portableError("backend_unavailable");
+    // Actual size comes from the trusted EOF-counted stage. It is private wire
+    // metadata; the tenant still receives only the portable part receipt.
     const known = SafeApply(SafeMapGet, multipart, [objectUploadIdentity(key, uploadId)]);
     if (known) {
       const recorded = SafeObjectCreate(null);
       recorded.etag = etag;
-      recorded.size = source.length;
+      recorded.size = size;
       SafeApply(SafeMapSet, known, [partNumber, freezeObject(recorded)]);
     }
     const result = SafeObjectCreate(null);
@@ -2048,13 +2093,8 @@ function objectOptions(value, allowed) {
 }
 
 /**
- * The body, its exact length, and nothing discovered by buffering it.
- *
- * A stream must declare its length because the ceiling has to be decided before
- * the bytes cross, and because the plane needs the count to refuse a body that
- * ran long. A string or an ArrayBuffer already knows its own, and a declared
- * length that disagrees with it is the caller's mistake rather than a silent
- * truncation.
+ * Intrinsic or supplied lengths stay exact. An undeclared stream is counted by
+ * the trusted data-plane stage under the same operation ceiling until EOF.
  */
 function objectBodySource(value, maximum, declaredLength, intrinsicTooLargeError) {
   const tooLarge =
@@ -2086,14 +2126,186 @@ function objectBodySource(value, maximum, declaredLength, intrinsicTooLargeError
   }
   if (declaredLength !== undefined) objectContentLength(declaredLength);
   const length = declaredLength === undefined ? known : declaredLength;
-  if (length === undefined || (known !== undefined && length !== known)) {
+  if (known !== undefined && length !== known) {
     throw portableError("invalid_body");
   }
-  if (length > maximum) throw portableError(known === undefined ? "value_too_large" : tooLarge);
+  if (length !== undefined && length > maximum) {
+    throw portableError(known === undefined ? "value_too_large" : tooLarge);
+  }
   const result = SafeObjectCreate(null);
-  result.body = body;
+  const checked = objectByteStream(body, length, maximum, tooLarge);
+  result.body = checked.body;
   result.length = length;
+  result.framed = known === undefined;
+  result.size = checked.size;
+  result.failure = checked.failure;
+  result.abort = checked.abort;
   return freezeObject(result);
+}
+
+/** Framing proves validated source EOF independently of the HTTP body's EOF. */
+function objectRequestBody(source, document) {
+  if (!source.framed) return { body: source.body, abort() {} };
+  document.bodyFormat = OBJECT_BODY_FORMAT;
+  const reader = SafeApply(SafeReadableStreamGetReader, source.body, []);
+  let chunk;
+  let offset = 0;
+  let pending;
+  let markerSent = false;
+  let closed = false;
+  function release() {
+    try { SafeApply(SafeReadableStreamReaderReleaseLock, reader, []); } catch {}
+  }
+  function abort() {
+    if (closed) return;
+    closed = true;
+    try {
+      const cancelled = SafeApply(SafeReadableStreamReaderCancel, reader, []);
+      SafeApply(SafePromiseThen, cancelled, [undefined, () => undefined]);
+    } catch {}
+    release();
+  }
+  const body = new SafeReadableStream({
+    async pull(controller) {
+      try {
+        if (pending !== undefined) {
+          const data = pending;
+          pending = undefined;
+          SafeApply(SafeReadableStreamControllerEnqueue, controller, [data]);
+          return;
+        }
+        if (markerSent) {
+          closed = true;
+          SafeApply(SafeReadableStreamControllerClose, controller, []);
+          return;
+        }
+        while (chunk === undefined) {
+          const next = await SafeApply(SafeReadableStreamReaderRead, reader, []);
+          if (closed) return;
+          if (next.done) {
+            // source.size refuses cancellation or an unvalidated EOF.
+            source.size();
+            markerSent = true;
+            release();
+            const terminal = new SafeUint8Array(4);
+            for (let at = 0; at < 4; at += 1) terminal[at] = 255;
+            SafeApply(SafeReadableStreamControllerEnqueue, controller, [terminal]);
+            return;
+          }
+          // Empty producer chunks carry no logical bytes or wire record. This
+          // makes the number of data frames bounded by the payload byte count.
+          if (viewByteLength(next.value) === 0) continue;
+          chunk = next.value;
+          offset = 0;
+        }
+        const length = viewByteLength(chunk);
+        const size = SafeMathMin(65536, length - offset);
+        const header = new SafeUint8Array(4);
+        header[0] = (size >>> 24) & 255;
+        header[1] = (size >>> 16) & 255;
+        header[2] = (size >>> 8) & 255;
+        header[3] = size & 255;
+        if (size > 0) {
+          pending = new SafeUint8Array(
+            SafeApply(SafeTypedArrayBufferGet, chunk, []),
+            SafeApply(SafeTypedArrayByteOffsetGet, chunk, []) + offset,
+            size,
+          );
+        }
+        offset += size;
+        if (offset === length) chunk = undefined;
+        SafeApply(SafeReadableStreamControllerEnqueue, controller, [header]);
+      } catch {
+        abort();
+        SafeApply(SafeReadableStreamControllerError, controller, [
+          portableError(source.failure() || "backend_unavailable"),
+        ]);
+      }
+    },
+    cancel() { abort(); },
+  }, { highWaterMark: 0 });
+  return { body, abort };
+}
+
+/** Validate before HTTP can coerce a non-byte producer chunk into bytes. */
+function objectByteStream(body, expected, maximum, overflow) {
+  let reader;
+  try { reader = SafeApply(SafeReadableStreamGetReader, body, []); }
+  catch { throw portableError("invalid_body"); }
+  let observed = 0;
+  let complete = false;
+  let terminated = false;
+  let failure;
+  function release() {
+    try { SafeApply(SafeReadableStreamReaderReleaseLock, reader, []); } catch {}
+  }
+  function abort() {
+    if (terminated) return;
+    terminated = true;
+    try {
+      const cancelled = SafeApply(SafeReadableStreamReaderCancel, reader, []);
+      SafeApply(SafePromiseThen, cancelled, [undefined, () => undefined]);
+    } catch {}
+    release();
+  }
+  function refuse(controller, code) {
+    if (failure === undefined) failure = code;
+    abort();
+    SafeApply(SafeReadableStreamControllerError, controller, [portableError(failure)]);
+  }
+  const stream = new SafeReadableStream({
+    async pull(controller) {
+      let next;
+      try { next = await SafeApply(SafeReadableStreamReaderRead, reader, []); }
+      catch {
+        if (!terminated) refuse(controller, "backend_unavailable");
+        return;
+      }
+      if (terminated) return;
+      if (next.done) {
+        if (expected !== undefined && observed !== expected) {
+          refuse(controller, "invalid_body");
+          return;
+        }
+        complete = true;
+        terminated = true;
+        release();
+        SafeApply(SafeReadableStreamControllerClose, controller, []);
+        return;
+      }
+      let length;
+      try {
+        if (SafeApply(SafeTypedArrayNameGet, next.value, []) !== "Uint8Array") {
+          refuse(controller, "invalid_body");
+          return;
+        }
+        length = SafeApply(SafeTypedArrayByteLengthGet, next.value, []);
+      } catch {
+        refuse(controller, "invalid_body");
+        return;
+      }
+      if (expected !== undefined && length > expected - observed) {
+        refuse(controller, "invalid_body");
+        return;
+      }
+      if (length > maximum - observed) {
+        refuse(controller, overflow);
+        return;
+      }
+      observed += length;
+      SafeApply(SafeReadableStreamControllerEnqueue, controller, [next.value]);
+    },
+    cancel() { abort(); },
+  }, { highWaterMark: 0 });
+  return {
+    body: stream,
+    size() {
+      if (!complete) throw portableError(failure || "backend_unavailable");
+      return observed;
+    },
+    failure() { return failure; },
+    abort,
+  };
 }
 
 function readableObjectBytes(bytes) {
