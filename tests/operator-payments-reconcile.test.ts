@@ -244,6 +244,34 @@ function errorCode(text: string): string | undefined {
 }
 
 describe("operator payment reconcile route", () => {
+  test("the operator report preserves the optional hosted billing summary in its published contract", async () => {
+    const report: FundingReconcileReport = {
+      examined: 0,
+      credited: 0,
+      alreadyCredited: 0,
+      unknownOrganization: 0,
+      skipped: {},
+      truncated: false,
+      creditedFundingRefs: [],
+      uncredited: [],
+      billing: { examined: 3, applied: 2, unresolved: 1, truncated: false, handlerVersion: 1 },
+    };
+    const h = await host({ paymentEvents: () => ({ reconcile: async () => report }) });
+    const response = await h.reconcile(await sign());
+    expect(response.status).toBe(200);
+    expect(JSON.parse(response.text)).toEqual({ report });
+    expect(response.headers.get("cache-control")).toBe("private, no-store");
+    const schemas = openApiDocument.components.schemas as unknown as Record<string, unknown>;
+    expect(schemas.FundingReconcileReport).toMatchObject({
+      properties: { billing: { $ref: "#/components/schemas/StripeBillingReconcileReport" } },
+    });
+    expect(schemas.StripeBillingReconcileReport).toMatchObject({
+      type: "object",
+      additionalProperties: false,
+      required: ["examined", "applied", "unresolved", "truncated", "handlerVersion"],
+    });
+  });
+
   test("an operator assertion runs the scheduled pass and returns its report", async () => {
     const h = await host({
       sessions: [

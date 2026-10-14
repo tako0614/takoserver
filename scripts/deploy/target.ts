@@ -11,9 +11,12 @@ import {
   type HostedObjectBucketSupplies,
   parseHostedObjectBucketSupplies,
 } from "../../src/hosted-object-bucket-supplies.ts";
+import { assertHostedPricingMatchesBilling, parseHostedPricing } from "../../src/hosted-pricing.ts";
 import { INTEGRATION_E2E_ORGANIZATION_ID } from "../../src/integration-e2e-credential-authority.ts";
 import { canonicalJson } from "../../src/json.ts";
 import {
+  DEFAULT_CHECKOUT_MAXIMUM_MINOR,
+  DEFAULT_CHECKOUT_MINIMUM_MINOR,
   PAYMENT_SETTING_VARIABLES,
   type PaymentSettings,
   PaymentSettingsError,
@@ -119,6 +122,8 @@ export interface DeployTarget {
   readonly stripeSettings?: PaymentSettings;
   /** Optional versioned, non-secret Organization billing tariff. */
   readonly billingConfig?: BillingConfig;
+  /** Exact bounded authoring JSON emitted as TAKOSERVER_HOSTED_PRICING. */
+  readonly hostedPricing?: string;
   /**
    * DNS zones this deployment may attach customer Workers to.
    *
@@ -356,6 +361,7 @@ const DEPLOY_TARGET_OPTIONAL_KEYS: readonly string[] = [
   "stripeWebhook",
   "stripeSettings",
   "billingConfig",
+  "hostedPricing",
   "zones",
   "aiModels",
   "objectBucketSupplies",
@@ -873,7 +879,36 @@ export function parseDeployTarget(
       );
     }
   }
-  return target;
+  if (value.hostedPricing === undefined) return target;
+  return { ...target, hostedPricing: deployHostedPricing(value.hostedPricing, target) };
+}
+
+function deployHostedPricing(
+  value: unknown,
+  target: Pick<DeployTarget, "billingConfig" | "stripeCheckout" | "stripeSettings">,
+): string {
+  try {
+    if (typeof value !== "string" || target.stripeCheckout !== true) throw new Error();
+    const pricing = parseHostedPricing(value);
+    if (!pricing) throw new Error();
+    assertHostedPricingMatchesBilling(pricing, target.billingConfig);
+    const usagePlan = pricing.hostedPlanTable.plans[2];
+    if (
+      usagePlan.checkoutMinimumMinor !==
+        (target.stripeSettings?.checkoutMinimumMinor ?? DEFAULT_CHECKOUT_MINIMUM_MINOR) ||
+      usagePlan.checkoutMaximumMinor !==
+        (target.stripeSettings?.checkoutMaximumMinor ?? DEFAULT_CHECKOUT_MAXIMUM_MINOR)
+    ) {
+      throw new Error();
+    }
+    return value;
+  } catch {
+    // Do not expose operator-authored plan or Stripe Price identities in a
+    // preflight diagnostic.
+    throw preflightError(
+      "deploy target hostedPricing is invalid or does not match enabled billing and Checkout settings",
+    );
+  }
 }
 
 function exactArtifactRecovery(value: unknown): NonNullable<DeployTarget["exactArtifactRecovery"]> {

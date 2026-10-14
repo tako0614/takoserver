@@ -762,6 +762,8 @@ export function buildApp(ports: AppPorts): App {
     ...(ports.checkout ? { checkout: ports.checkout } : {}),
     ...(paymentEvents?.receive ? { paymentNotifications: paymentEvents.receive } : {}),
     ...(operatorPaymentsReconcile ? { operatorPaymentsReconcile } : {}),
+    ...(paymentEvents?.subscriptions ? { subscriptions: paymentEvents.subscriptions } : {}),
+    ...(paymentEvents?.creditFunding ? { creditFunding: paymentEvents.creditFunding } : {}),
     ledger,
     ...(orgBilling ? { billing: orgBilling } : {}),
     catalog,

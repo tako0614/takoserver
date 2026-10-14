@@ -558,18 +558,21 @@ async function verifyGeneratedStorageTarget(
     );
     // A full current schema is a read-side successor of the selected origin,
     // never a new generation payload. Both alternatives are exact audited
-    // ledgers; partial 0092/0093 states and foreign 0094 markers match neither.
-    const current94 =
-      currentSource !== null &&
-      currentSource.names.at(-1) === MONEY_UNIT_MIGRATION &&
-      JSON.stringify(migrationState.applied) === JSON.stringify(currentSource.names);
+    // ledgers; partial states and foreign migration tails match neither.
+    const currentAudited =
+      currentSource === null
+        ? false
+        : currentSource.names.includes(MONEY_UNIT_MIGRATION) &&
+          JSON.stringify(migrationState.applied) === JSON.stringify(currentSource.names);
     const moneyPhase =
       currentSource === null
         ? undefined
         : (
             [
               ...(moneyMaintenance ? ["0092", "0092-fenced", "0093", "0093-fenced"] : []),
-              ...(current94 ? ["0094", "0094-fenced"] : []),
+              ...(options.allowCurrentAuditedSuccessor === true || moneyMaintenance
+                ? ["0094", "0094-fenced"]
+                : []),
             ] as MoneySchemaPhase[]
           ).find((phase) =>
             moneyUnitCutoverSchemaMatches(migrationState, currentSource.files, phase),
@@ -589,7 +592,7 @@ async function verifyGeneratedStorageTarget(
               moneyCount as 92 | 93 | 94,
             ),
           }
-        : current94
+        : currentAudited && currentSource !== null
           ? currentSource
           : sourceArtifact;
     assertCompleteDatabase(

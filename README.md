@@ -443,16 +443,18 @@ API begins answering; a machine that has published nothing starts no runtime.
 
 An accepted workerd child that crashes is restarted automatically with backoff
 from 100 ms up to 5 seconds. If a replacement fails readiness, or cannot be
-recorded because another process holds its listener or the replacement has
-already exited, recovery waits for that exact child to exit and its listener to
-become vacant before spawning again. A delayed exit, temporary port occupancy,
-or a failed listener observation while waiting for vacancy keeps the retry
-pending; recovery never stops or replaces a foreign process. Serving is
-reported only after recovery passes readiness, and health requests only observe
-recovery. Deliberate shutdown cancels it. A failed first start, an
-unconfirmable child exit, or child-identity persistence that fails for any
-other reason, including unreadable process state, requires operator
-intervention rather than automatic retries.
+recorded because the crashed child is gone but the replacement is not proven to
+hold its listener (another process holds it, or the replacement's own process
+state cannot be read because it is already exiting), recovery waits for that
+exact child to exit and its listener to become vacant before spawning again.
+A delayed exit, temporary port occupancy, or a failed listener observation
+while waiting for vacancy keeps the retry pending; recovery never stops or
+replaces a foreign process. Serving is reported only after recovery passes
+readiness, and health requests only observe recovery. Deliberate shutdown
+cancels it. A failed first start, an unconfirmable child exit, or
+child-identity persistence that fails for any other reason, such as a crashed
+child that is not proven gone, an unreadable listener table, or a failed write,
+requires operator intervention rather than automatic retries.
 
 SIGINT, SIGTERM and SIGHUP fence new work and drain accepted requests and
 background passes before stopping owned resources in order. A proved clean

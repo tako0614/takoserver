@@ -352,7 +352,7 @@ export function workerMoneyUnitSchemaReady(
     expectedMoneyShapes.set(source.digest, expectedShape);
   }
   return (
-    source.names.at(-1) === MONEY_UNIT_MIGRATION &&
+    source.names.includes(MONEY_UNIT_MIGRATION) &&
     JSON.stringify(migrations.local) === JSON.stringify(source.names) &&
     JSON.stringify(migrations.applied) === JSON.stringify(source.names) &&
     (applicationSchemaMatches(
@@ -378,7 +378,8 @@ export function assertWorkerMoneyUnitSchema(
 ): void {
   if (phase === "preflight") assertMoneyUnitSchema(migrations.applied);
   if (!workerMoneyUnitSchemaReady(migrations, sourceRepositoryRoot)) {
-    const message = "Worker requires the exact complete 0094 D1 schema and USD-micros policy";
+    const message =
+      "Worker requires the exact current audited D1 schema with 0094 USD-micros policy";
     if (phase === "verification") throw verificationError(message);
     throw preflightError(message);
   }
