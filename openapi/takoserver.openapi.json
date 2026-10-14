@@ -826,7 +826,68 @@
           "plans": {
             "type": "array",
             "minItems": 3,
-            "maxItems": 3,
+            "maxItems": 4,
+            "oneOf": [
+              {
+                "maxItems": 3,
+                "prefixItems": [
+                  {
+                    "properties": {
+                      "tier": {
+                        "const": "free"
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "tier": {
+                        "const": "subscription"
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "tier": {
+                        "const": "usage"
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "minItems": 4,
+                "prefixItems": [
+                  {
+                    "properties": {
+                      "tier": {
+                        "const": "free"
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "tier": {
+                        "const": "subscription"
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "tier": {
+                        "const": "subscription"
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "tier": {
+                        "const": "usage"
+                      }
+                    }
+                  }
+                ]
+              }
+            ],
             "items": {
               "oneOf": [
                 {

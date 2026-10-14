@@ -775,38 +775,38 @@ function decodeHostedPlanTable(value: unknown): HostedPlanTable | null {
     value.products[0] !== "takosumi-hosted" ||
     value.products[1] !== "takoserver" ||
     !Array.isArray(value.plans) ||
-    value.plans.length !== 3 ||
-    !Array.isArray(value.consumptionOrder) ||
-    value.consumptionOrder.join(",") !== "free,subscription,purchased,postpaid"
+    (value.plans.length !== 3 && value.plans.length !== 4)
   )
     return null;
-  const [free, subscription, usage] = value.plans;
+  const free = value.plans[0];
+  const subscriptions = value.plans.slice(1, -1);
+  const usage = value.plans.at(-1);
   if (
     !isRecord(free) ||
-    typeof free.planId !== "string" ||
-    free.planId.length === 0 ||
+    !isPlanKey(free.planId) ||
     free.tier !== "free" ||
     free.resourceScope !== "edge" ||
-    !isSafeIntegerAtLeast(free.configuredMonthlyCreditMinor, 0) ||
     free.edgeAllowance !== "pending-owner-runtime-policy" ||
-    !isRecord(subscription) ||
-    typeof subscription.planId !== "string" ||
-    subscription.planId.length === 0 ||
-    subscription.tier !== "subscription" ||
-    !isSafeIntegerAtLeast(subscription.monthlyAmountMinor, 1) ||
-    !isSafeIntegerAtLeast(subscription.includedCreditMinor, 0) ||
-    typeof subscription.stripePriceId !== "string" ||
-    !/^price_[A-Za-z0-9_]{1,240}$/u.test(subscription.stripePriceId) ||
     !isRecord(usage) ||
-    typeof usage.planId !== "string" ||
-    usage.planId.length === 0 ||
+    !isPlanKey(usage.planId) ||
     usage.tier !== "usage" ||
     !isSafeIntegerAtLeast(usage.checkoutMinimumMinor, 1) ||
     !isSafeIntegerAtLeast(usage.checkoutMaximumMinor, 1) ||
-    !isRecord(usage.meters)
+    !isRecord(usage.meters) ||
+    usage.checkoutMinimumMinor > usage.checkoutMaximumMinor ||
+    !subscriptions.every(
+      (plan) =>
+        isRecord(plan) &&
+        isPlanKey(plan.planId) &&
+        plan.tier === "subscription" &&
+        isSafeIntegerAtLeast(plan.monthlyAmountMinor, 1) &&
+        isSafeIntegerAtLeast(plan.includedCreditMinor, 0) &&
+        typeof plan.stripePriceId === "string" &&
+        /^price_[A-Za-z0-9_]{1,240}$/u.test(plan.stripePriceId),
+    )
   )
     return null;
-  if (new Set([free.planId, subscription.planId, usage.planId]).size !== 3) return null;
+  if (new Set(value.plans.map((plan) => plan.planId)).size !== value.plans.length) return null;
   return value as unknown as HostedPlanTable;
 }
 

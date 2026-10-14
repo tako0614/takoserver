@@ -14,6 +14,8 @@ import {
   createSubscriptionIntentStore,
   type SubscriptionIntentStorage,
 } from "../console/src/subscription-intent.ts";
+import { subscriptionPlanOptions } from "../console/src/subscription-plan-options.ts";
+import { finalizedHostedPlanTable } from "./helpers/finalized-hosted-plan-table.ts";
 
 const organizationId = "org-example";
 const ownerPrincipalId = "principal-owner";
@@ -162,6 +164,31 @@ function checkoutHarness(input?: {
 }
 
 describe("canonical organization subscription checkout", () => {
+  test("finalized paid choices render both exact allowances without stacking Free and retain tier selection", async () => {
+    const choices = subscriptionPlanOptions(finalizedHostedPlanTable(), "en-US");
+    expect(choices).toEqual([
+      {
+        planId: "hosted-10",
+        monthlyAmountMinor: 1000,
+        includedCreditMinor: 2000,
+        monthlyAmount: "$10",
+        monthlyAllowance: "$20",
+      },
+      {
+        planId: "hosted-50",
+        monthlyAmountMinor: 5000,
+        includedCreditMinor: 10000,
+        monthlyAmount: "$50",
+        monthlyAllowance: "$100",
+      },
+    ]);
+    for (const choice of choices) {
+      const page = checkoutHarness();
+      await page.controller.start(choice.planId);
+      expect(page.calls.map((call) => call.planKey)).toEqual([choice.planId]);
+    }
+  });
+
   test("pending Checkout retains one durable reference across controller reload", async () => {
     const first = checkoutHarness();
     await first.controller.start("host-configured-plan");

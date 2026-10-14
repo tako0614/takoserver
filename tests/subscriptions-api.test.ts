@@ -307,6 +307,15 @@ test("OpenAPI publishes subscription scope, request and refund projection contra
   expect(path.post?.["x-required-scopes"]).toEqual(["payments:write"]);
   expect(path.patch?.["x-required-scopes"]).toEqual(["payments:write"]);
   expect(document.components.schemas).toHaveProperty("HostedPlanTable");
+  const planRows = document.components.schemas.HostedPlanTable.properties.plans;
+  expect(planRows.minItems).toBe(3);
+  expect(planRows.maxItems).toBe(4);
+  expect(
+    planRows.oneOf.map((shape) => shape.prefixItems.map((item) => item.properties.tier.const)),
+  ).toEqual([
+    ["free", "subscription", "usage"],
+    ["free", "subscription", "subscription", "usage"],
+  ]);
   expect(document.components.schemas).toHaveProperty("SubscriptionProjection");
   expect(JSON.stringify(document.components.schemas.WalletResponse)).toContain("refund_receivable");
   expect(JSON.stringify(document.components.schemas.WalletHoldReceipt)).toContain("closureReason");

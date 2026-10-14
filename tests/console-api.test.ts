@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { createApi, formatMicrosCurrency } from "../console/src/api.ts";
+import { finalizedHostedPlanTable } from "./helpers/finalized-hosted-plan-table.ts";
 
 const origin = "https://api.example.test";
 const org = "org/example?x=1#%";
@@ -337,6 +338,58 @@ test("canonical subscription read returns its plan table and organization projec
     `/v1/organizations/${encodeURIComponent(org)}/payments/subscription`,
   );
   expect(seen[0]?.method).toBe("GET");
+});
+
+test("canonical subscription read accepts the finalized two-tier hosted plan table", async () => {
+  const planTable = finalizedHostedPlanTable();
+  expect(planTable.plans.map((plan) => plan.planId)).toEqual([
+    "free",
+    "hosted-10",
+    "hosted-50",
+    "usage",
+  ]);
+  expect(planTable.plans.filter((plan) => plan.tier === "subscription")).toMatchObject([
+    { monthlyAmountMinor: 1000, includedCreditMinor: 2000 },
+    { monthlyAmountMinor: 5000, includedCreditMinor: 10000 },
+  ]);
+  transport(() => Response.json({ subscription: null, planTable }));
+  expect(await client().subscription(org)).toEqual({ subscription: null, planTable });
+});
+
+test("canonical subscription read validates every paid row and rejects extra tiers", async () => {
+  const planTable = finalizedHostedPlanTable();
+  const invalidRows = [
+    {
+      ...planTable,
+      plans: [
+        ...planTable.plans.slice(0, 2),
+        { ...planTable.plans[2], stripePriceId: "bad" },
+        planTable.plans[3],
+      ],
+    },
+    {
+      ...planTable,
+      plans: [
+        ...planTable.plans.slice(0, 2),
+        { ...planTable.plans[2], planId: "hosted-10" },
+        planTable.plans[3],
+      ],
+    },
+    {
+      ...planTable,
+      plans: [
+        planTable.plans[0],
+        planTable.plans[1],
+        planTable.plans[2],
+        planTable.plans[2],
+        planTable.plans[3],
+      ],
+    },
+  ];
+  for (const invalid of invalidRows) {
+    transport(() => Response.json({ subscription: null, planTable: invalid }));
+    await expect(client().subscription(org)).rejects.toMatchObject({ code: "invalid_response" });
+  }
 });
 
 test("subscription Checkout uses the selected configured key and preserves status semantics", async () => {

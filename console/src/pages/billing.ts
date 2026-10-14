@@ -21,6 +21,7 @@ import {
   browserSubscriptionIntentLock,
   createSubscriptionIntentStore,
 } from "../subscription-intent.ts";
+import { subscriptionPlanOptions } from "../subscription-plan-options.ts";
 import {
   badge,
   card,
@@ -454,15 +455,6 @@ function settleReturn(organizationId: string, reload: () => void): void {
   );
 }
 
-/** Configured price-table values are cents; wallet balances are already USD micros. */
-function configuredSubscriptionMoney(amountMinor: number): string {
-  return formatMicrosCurrency(
-    (BigInt(amountMinor) * 10_000n).toString(),
-    "USD",
-    consoleLocale() === "ja" ? "ja-JP" : "en-US",
-  );
-}
-
 function hostedSubscriptionCard(
   subscription: Resource<OrganizationSubscription>,
   checkout: ReturnType<typeof createSubscriptionCheckoutController>,
@@ -478,8 +470,9 @@ function hostedSubscriptionCard(
       return whenReady(
         subscription.get(),
         (loaded) => {
-          const configuredPlans = loaded.planTable.plans.filter(
-            (plan) => plan.tier === "subscription",
+          const configuredPlans = subscriptionPlanOptions(
+            loaded.planTable,
+            consoleLocale() === "ja" ? "ja-JP" : "en-US",
           );
           const current = loaded.subscription;
           const owner = ownerCanManage();
@@ -505,8 +498,8 @@ function hostedSubscriptionCard(
                           "p",
                           { class: "dim billing-plan__coverage" },
                           tr(
-                            `設定済みプラン ${plan.planId} · 月額 ${configuredSubscriptionMoney(plan.monthlyAmountMinor)} · 月間枠 ${configuredSubscriptionMoney(plan.includedCreditMinor)}`,
-                            `Configured plan ${plan.planId} · ${configuredSubscriptionMoney(plan.monthlyAmountMinor)} per month · ${configuredSubscriptionMoney(plan.includedCreditMinor)} monthly allowance`,
+                            `設定済みプラン ${plan.planId} · 月額 ${plan.monthlyAmount} · 月間枠 ${plan.monthlyAllowance}`,
+                            `Configured plan ${plan.planId} · ${plan.monthlyAmount} per month · ${plan.monthlyAllowance} monthly allowance`,
                           ),
                         ),
                       )
