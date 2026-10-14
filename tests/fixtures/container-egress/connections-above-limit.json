@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "id": "connections-above-limit",
+  "description": "Opening while already over a lowered connection cap is refused",
+  "coverage": ["connection-limit"],
+  "initialUsage": {
+    "tenant-a": {
+      "activeConnections": 5,
+      "bandwidthUsedBytes": 0,
+      "egressBytes": 0
+    },
+    "tenant-b": {
+      "activeConnections": 3,
+      "bandwidthUsedBytes": 700,
+      "egressBytes": 9000
+    }
+  },
+  "steps": [
+    {
+      "policy": {
+        "killSwitch": false,
+        "tenants": {
+          "tenant-a": {
+            "outboundInternet": true,
+            "maxConnections": 4,
+            "bandwidthLimitBytes": 1024
+          },
+          "tenant-b": {
+            "outboundInternet": true,
+            "maxConnections": 5,
+            "bandwidthLimitBytes": 2048
+          }
+        }
+      },
+      "request": {
+        "tenantId": "tenant-a",
+        "operation": "open",
+        "destinationIp": "1.1.1.1",
+        "destinationPort": 443,
+        "transport": "tcp",
+        "bytes": 0
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "connection_limit",
+        "billableEgressBytes": 0,
+        "usage": {
+          "tenant-a": {
+            "activeConnections": 5,
+            "bandwidthUsedBytes": 0,
+            "egressBytes": 0
+          },
+          "tenant-b": {
+            "activeConnections": 3,
+            "bandwidthUsedBytes": 700,
+            "egressBytes": 9000
+          }
+        }
+      }
+    }
+  ]
+}

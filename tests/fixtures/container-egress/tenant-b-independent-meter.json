@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "id": "tenant-b-independent-meter",
+  "description": "Tenant B uses its own byte cap and increments only its own billing counters",
+  "coverage": ["tenant-isolation", "egress-accounting", "bandwidth-limit"],
+  "initialUsage": {
+    "tenant-a": {
+      "activeConnections": 4,
+      "bandwidthUsedBytes": 1024,
+      "egressBytes": 123
+    },
+    "tenant-b": {
+      "activeConnections": 3,
+      "bandwidthUsedBytes": 1024,
+      "egressBytes": 9000
+    }
+  },
+  "steps": [
+    {
+      "policy": {
+        "killSwitch": false,
+        "tenants": {
+          "tenant-a": {
+            "outboundInternet": true,
+            "maxConnections": 4,
+            "bandwidthLimitBytes": 1024
+          },
+          "tenant-b": {
+            "outboundInternet": true,
+            "maxConnections": 5,
+            "bandwidthLimitBytes": 2048
+          }
+        }
+      },
+      "request": {
+        "tenantId": "tenant-b",
+        "operation": "send",
+        "destinationIp": "1.1.1.1",
+        "destinationPort": 443,
+        "transport": "tcp",
+        "bytes": 1024
+      },
+      "expected": {
+        "allowed": true,
+        "reason": "allowed",
+        "billableEgressBytes": 1024,
+        "usage": {
+          "tenant-a": {
+            "activeConnections": 4,
+            "bandwidthUsedBytes": 1024,
+            "egressBytes": 123
+          },
+          "tenant-b": {
+            "activeConnections": 3,
+            "bandwidthUsedBytes": 2048,
+            "egressBytes": 10024
+          }
+        }
+      }
+    }
+  ]
+}

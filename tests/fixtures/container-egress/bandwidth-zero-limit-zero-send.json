@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "id": "bandwidth-zero-limit-zero-send",
+  "description": "Zero-byte sends fit the zero-byte cap and are unbilled",
+  "coverage": ["bandwidth-limit", "egress-accounting"],
+  "initialUsage": {
+    "tenant-a": {
+      "activeConnections": 1,
+      "bandwidthUsedBytes": 0,
+      "egressBytes": 4000
+    },
+    "tenant-b": {
+      "activeConnections": 3,
+      "bandwidthUsedBytes": 700,
+      "egressBytes": 9000
+    }
+  },
+  "steps": [
+    {
+      "policy": {
+        "killSwitch": false,
+        "tenants": {
+          "tenant-a": {
+            "outboundInternet": true,
+            "maxConnections": 4,
+            "bandwidthLimitBytes": 0
+          },
+          "tenant-b": {
+            "outboundInternet": true,
+            "maxConnections": 5,
+            "bandwidthLimitBytes": 2048
+          }
+        }
+      },
+      "request": {
+        "tenantId": "tenant-a",
+        "operation": "send",
+        "destinationIp": "1.1.1.1",
+        "destinationPort": 443,
+        "transport": "tcp",
+        "bytes": 0
+      },
+      "expected": {
+        "allowed": true,
+        "reason": "allowed",
+        "billableEgressBytes": 0,
+        "usage": {
+          "tenant-a": {
+            "activeConnections": 1,
+            "bandwidthUsedBytes": 0,
+            "egressBytes": 4000
+          },
+          "tenant-b": {
+            "activeConnections": 3,
+            "bandwidthUsedBytes": 700,
+            "egressBytes": 9000
+          }
+        }
+      }
+    }
+  ]
+}
