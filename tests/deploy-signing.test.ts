@@ -829,11 +829,15 @@ describe("split signing authority surfaces", () => {
       database.rows.set("key-next", row("key-next", next.publicJwk));
       const process = processFixture();
       const local = readMigrationArtifact().names;
+      const moneyUnitMigrationIndex = local.indexOf("0094_wallet_usd_micros.sql");
+      expect(moneyUnitMigrationIndex).toBeGreaterThanOrEqual(0);
+      const applied = local.slice(0, moneyUnitMigrationIndex);
+      expect(applied).not.toContain("0094_wallet_usd_micros.sql");
       let migrationReads = 0;
       const migrations: SigningMigrationReader = {
         async read() {
           migrationReads += 1;
-          return { local, applied: local.slice(0, -2) };
+          return { local, applied };
         },
       };
 
@@ -884,9 +888,14 @@ describe("split signing authority surfaces", () => {
       database.rows.set("key-next", row("key-next", next.publicJwk));
       const process = processFixture();
       const local = readMigrationArtifact().names;
+      const realmMigrationIndex = local.indexOf("0098_stripe_mode_realm.sql");
+      expect(realmMigrationIndex).toBe(local.length - 1);
+      const incompleteCurrentSchema = local.slice(0, realmMigrationIndex);
+      expect(incompleteCurrentSchema).toContain("0094_wallet_usd_micros.sql");
+      expect(incompleteCurrentSchema).not.toContain("0098_stripe_mode_realm.sql");
       for (const [applied, message] of [
-        [local.slice(0, -1), "exact current audited D1 schema with 0094 USD-micros policy"],
-        [[...local, "0096_foreign.sql"], "D1 has more applied migrations"],
+        [incompleteCurrentSchema, "exact current audited D1 schema with 0094 USD-micros policy"],
+        [[...local, "0099_foreign.sql"], "D1 has more applied migrations"],
       ] as const) {
         const migrations: SigningMigrationReader = { read: async () => ({ local, applied }) };
         await expect(
@@ -979,9 +988,13 @@ describe("split signing authority surfaces", () => {
       database.rows.set("key-next", row("key-next", next.publicJwk));
       const process = processFixture();
       const local = readMigrationArtifact().names;
+      const moneyUnitMigrationIndex = local.indexOf("0094_wallet_usd_micros.sql");
+      expect(moneyUnitMigrationIndex).toBeGreaterThanOrEqual(0);
+      const applied = local.slice(0, moneyUnitMigrationIndex);
+      expect(applied).not.toContain("0094_wallet_usd_micros.sql");
       const migrations: SigningMigrationReader = {
         async read() {
-          return { local, applied: local.slice(0, -2) };
+          return { local, applied };
         },
       };
 
