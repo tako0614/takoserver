@@ -139,6 +139,17 @@ export interface BillingReconcileReport {
   readonly handlerVersion: 1;
 }
 
+type PaidPlan = Extract<
+  HostedPricing["hostedPlanTable"]["plans"][number],
+  { readonly tier: "subscription" }
+>;
+
+function paidPlan(table: HostedPricing, planKey: unknown): PaidPlan | undefined {
+  return table.hostedPlanTable.plans.find(
+    (plan): plan is PaidPlan => plan.tier === "subscription" && plan.planId === planKey,
+  );
+}
+
 /** Explicitly opted-in hosted test-mode billing, using processor identities only. */
 export function createStripeBilling(options: {
   readonly client: StripeBillingClient;
@@ -226,17 +237,20 @@ export function createStripeBilling(options: {
       ).length > 0
     );
   }
-  async function price(id: string, table: HostedPricing): Promise<void> {
-    const plan = table.hostedPlanTable.plans[1];
-    if (plan.stripePriceId !== id) refuse("wrong_price");
-    const object = await client.get("prices", id);
+  async function price(plan: PaidPlan, requireActive = false): Promise<void> {
+    const object = await client.get("prices", plan.stripePriceId);
     if (!object) refuse("unknown_price");
     const recurring = record(object.recurring);
     usd(object);
     if (
+      object.livemode !== false ||
+      (requireActive && object.active !== true) ||
       object.type !== "recurring" ||
       object.billing_scheme !== "per_unit" ||
       object.transform_quantity != null ||
+      object.custom_unit_amount != null ||
+      object.tiers != null ||
+      object.tiers_mode != null ||
       object.unit_amount !== plan.monthlyAmountMinor ||
       recurring.interval !== "month" ||
       recurring.interval_count !== 1 ||
@@ -252,15 +266,15 @@ export function createStripeBilling(options: {
     const customer = identifier(object.customer, "cus");
     await boundCustomer(org, customer);
     const snapshot = table ?? (await tariff(meta.pricingRevision));
-    const plan = snapshot.hostedPlanTable.plans[1];
-    if (meta.planKey !== plan.planId) refuse("wrong_plan");
+    const plan = paidPlan(snapshot, meta.planKey);
+    if (!plan) refuse("wrong_plan");
     const items = record(object.items);
     if (items.has_more !== false || !Array.isArray(items.data) || items.data.length !== 1)
       refuse("unsupported_subscription_items");
     const item = record(items.data[0]);
     if (item.quantity !== 1 || identifier(item.price, "price") !== plan.stripePriceId)
       refuse("wrong_price");
-    await price(plan.stripePriceId, snapshot);
+    await price(plan);
     if (
       typeof object.status !== "string" ||
       !STATUSES.has(object.status) ||
@@ -377,11 +391,8 @@ export function createStripeBilling(options: {
     const pinned = metadata(record(invoice.subscription_details).metadata);
     if (pinned.takoserverPurpose !== PURPOSE) refuse("not_hosted_subscription");
     const snapshot = await tariff(pinned.pricingRevision);
-    const plan = snapshot.hostedPlanTable.plans[1];
-    if (
-      pinned.planKey !== plan.planId ||
-      metadata(sub.metadata).organizationId !== pinned.organizationId
-    )
+    const plan = paidPlan(snapshot, pinned.planKey);
+    if (!plan || metadata(sub.metadata).organizationId !== pinned.organizationId)
       refuse("wrong_plan");
     const org = await exists(pinned.organizationId);
     const customer = identifier(invoice.customer, "cus");
@@ -411,13 +422,14 @@ export function createStripeBilling(options: {
       identifier(line.price, "price") !== plan.stripePriceId
     )
       refuse("unsupported_invoice_line");
-    await price(plan.stripePriceId, snapshot);
+    await price(plan);
     const period = record(line.period);
     const periodStart = timestamp(period.start),
       periodEnd = timestamp(period.end);
     if (periodEnd <= periodStart) refuse("invalid_period");
     const consideration = minor(invoice.amount_paid, true);
     if (
+      consideration !== plan.monthlyAmountMinor ||
       invoice.total !== consideration ||
       invoice.total_excluding_tax !== consideration ||
       minor(invoice.amount_shipping ?? 0) !== 0 ||
@@ -889,8 +901,8 @@ export function createStripeBilling(options: {
       await ready();
       reference(input.reference);
       if (!options.consoleOrigin) throw new StripeBillingError("not_found", 404);
-      const plan = pricing.hostedPlanTable.plans[1];
-      if (input.planKey !== plan.planId) throw new StripeBillingError("unknown_plan", 400);
+      const plan = paidPlan(pricing, input.planKey);
+      if (!plan) throw new StripeBillingError("unknown_plan", 400);
       const priorCommand = (
         await sql.query(
           "SELECT fingerprint, response_json FROM stripe_billing_commands WHERE org_id = ? AND reference = ?",
@@ -953,7 +965,7 @@ export function createStripeBilling(options: {
       )[0];
       if (reserved?.reference !== input.reference)
         throw new StripeBillingError("subscription_checkout_pending", 409);
-      await price(plan.stripePriceId, pricing);
+      await price(plan, true);
       const customerId = await customer(input.organizationId);
       const result = await command(
         input.organizationId,

@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { createHmac } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { compilePricingAuthoring } from "../scripts/pricing/compile.ts";
 import { buildApp } from "../src/app.ts";
 import type { ExternalIdentityVerifier } from "../src/auth.ts";
@@ -79,6 +80,53 @@ function pricing(includedMinor = INCLUDED_MINOR, monthlyMinor = MONTHLY_MINOR) {
     },
   };
   return compilePricingAuthoring(authored);
+}
+
+function twoPlanPricing() {
+  const shared = JSON.parse(
+    readFileSync(new URL("../config/shared-hosted-pricing.json", import.meta.url), "utf8"),
+  );
+  shared.plans[0].stripePriceId = "price_final10";
+  shared.plans[1].stripePriceId = "price_final50";
+  const meters = Object.fromEntries(
+    Object.entries(
+      shared.meters as Record<
+        string,
+        { unit: string; cloudflareCostMicros: string; quantity: string }
+      >,
+    )
+      .filter(([, meter]) => meter.cloudflareCostMicros !== "0")
+      .map(([key, meter]) => [
+        key,
+        {
+          unit: meter.unit,
+          rate: {
+            numeratorMicros: (BigInt(meter.cloudflareCostMicros) * 3n).toString(),
+            denominator: meter.quantity,
+          },
+        },
+      ]),
+  );
+  return compilePricingAuthoring({
+    authoringVersion: 2,
+    sharedPricing: shared,
+    planIds: { free: "free", usage: "usage" },
+    billingConfig: {
+      schemaVersion: 1,
+      revision: shared.revision,
+      effectiveAt: "2026-10-01T00:00:00.000Z",
+      currency: "USD",
+      holdTtlSeconds: 86400,
+      freeIncludedMinor: 150,
+      purchaseCreditExpiry: { kind: "none" },
+      plans: {
+        "hosted-10": { includedMinor: 2000, stripePriceId: "price_final10" },
+        "hosted-50": { includedMinor: 10000, stripePriceId: "price_final50" },
+      },
+      meters,
+    },
+    checkout: { minimumMinor: 50, maximumMinor: 99_999_999 },
+  });
 }
 
 function subscription(overrides: ObjectRecord = {}): ObjectRecord {
@@ -178,6 +226,7 @@ function initialState(): State {
       [
         PRICE,
         object(PRICE, "price", {
+          active: true,
           currency: "usd",
           type: "recurring",
           billing_scheme: "per_unit",
@@ -445,6 +494,138 @@ async function errorCode(response: Response): Promise<string | undefined> {
 }
 
 describe("Hosted Stripe billing service", () => {
+  test("selects the requested paid tier, verifies its TEST Price, and grants only the pinned invoice tier", async () => {
+    const h = await fixture(twoPlanPricing());
+    h.state.prices.set(
+      "price_final50",
+      object("price_final50", "price", {
+        active: true,
+        currency: "usd",
+        type: "recurring",
+        billing_scheme: "per_unit",
+        unit_amount: 5000,
+        recurring: { interval: "month", interval_count: 1, usage_type: "licensed" },
+      }),
+    );
+    h.state.prices.set(
+      "price_final10",
+      object("price_final10", "price", {
+        active: true,
+        currency: "usd",
+        type: "recurring",
+        billing_scheme: "per_unit",
+        unit_amount: 1000,
+        recurring: { interval: "month", interval_count: 1, usage_type: "licensed" },
+      }),
+    );
+    h.state.prices.set("price_final50", {
+      ...h.state.prices.get("price_final50"),
+      unit_amount: 4999,
+    });
+    await expect(
+      h.subscriptions.begin({ organizationId: ORG, reference: "final50", planKey: "hosted-50" }),
+    ).rejects.toThrow("unsupported_plan");
+    h.state.prices.set("price_final50", {
+      ...h.state.prices.get("price_final50"),
+      unit_amount: 5000,
+    });
+    const checkout = await h.subscriptions.begin({
+      organizationId: ORG,
+      reference: "final50",
+      planKey: "hosted-50",
+    });
+    expect(checkout.url).toContain("checkout.stripe.com");
+    const post = h.state.requests.find(
+      (request) =>
+        request.method === "POST" && new URL(request.url).pathname === "/v1/checkout/sessions",
+    );
+    expect(await post?.text()).toContain("price_final50");
+    const revision = "hosted-20261014-final-v1";
+    h.state.subscriptions.set(
+      SUBSCRIPTION,
+      subscription({
+        metadata: {
+          organizationId: ORG,
+          takoserverPurpose: "hosted_subscription",
+          planKey: "hosted-50",
+          pricingRevision: revision,
+        },
+        items: {
+          has_more: false,
+          data: [
+            { id: "si_test", object: "subscription_item", quantity: 1, price: "price_final50" },
+          ],
+        },
+      }),
+    );
+    const pinned = {
+      organizationId: ORG,
+      takoserverPurpose: "hosted_subscription",
+      planKey: "hosted-50",
+      pricingRevision: revision,
+    };
+    h.state.invoices.set(
+      "in_billing_test",
+      invoice("in_billing_test", {
+        subscription_details: { metadata: pinned },
+        lines: {
+          has_more: false,
+          data: [
+            {
+              id: "il_billing_test",
+              object: "line_item",
+              type: "subscription",
+              proration: false,
+              quantity: 1,
+              subscription: SUBSCRIPTION,
+              price: "price_final50",
+              period: { start: PERIOD_START, end: PERIOD_END },
+            },
+          ],
+        },
+        amount_paid: 5000,
+        total: 5000,
+        total_excluding_tax: 5000,
+      }),
+    );
+    h.state.charges.set("ch_billing_test", charge({ amount: 5000 }));
+    expect((await deliver(h.app, event("invoice.paid", "in_billing_test", "invoice"))).status).toBe(
+      200,
+    );
+    expect((await h.ledger.wallet(ORG)).settledMicros).toBe(100_000_000);
+    const grant = await h.sql.query(
+      "SELECT amount_micros, plan_key, stripe_price_id FROM stripe_billing_grants WHERE org_id = ?",
+      [ORG],
+    );
+    expect(grant).toMatchObject([
+      { amount_micros: 100_000_000, plan_key: "hosted-50", stripe_price_id: "price_final50" },
+    ]);
+    h.state.prices.set("price_final50", {
+      ...h.state.prices.get("price_final50"),
+      active: false,
+    });
+    h.state.refunds.set(
+      "re_final50",
+      object("re_final50", "refund", {
+        charge: "ch_billing_test",
+        currency: "usd",
+        amount: 5000,
+        created: 1_791_871_200,
+        status: "succeeded",
+      }),
+    );
+    h.state.charges.set("ch_billing_test", charge({ amount: 5000, amount_refunded: 5000 }));
+    expect((await deliver(h.app, event("refund.updated", "re_final50", "refund"))).status).toBe(
+      200,
+    );
+    expect(
+      await h.sql.query(
+        "SELECT target_revoked_micros FROM stripe_billing_refunds WHERE refund_id = ?",
+        ["re_final50"],
+      ),
+    ).toEqual([{ target_revoked_micros: 100_000_000 }]);
+    expect((await h.ledger.wallet(ORG)).settledMicros).toBe(0);
+  });
   test("ignores unrelated paid manual invoices and refunds without leaving reconciliation failures", async () => {
     const h = await fixture();
     const manualInvoice = "in_manual_other";

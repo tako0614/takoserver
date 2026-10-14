@@ -3,7 +3,7 @@
 `config/shared-hosted-pricing.json` records the operator's 2026-10-14 pricing
 decision for Takoserver and Takosumi Hosted. It uses integer USD-micros strings,
 not a separate credit currency. The monthly Free allowance is USD 1.50. The
-USD 10 and USD 50 subscriptions include USD 12 and USD 70 respectively. Free
+USD 10 and USD 50 subscriptions include USD 20 and USD 100 respectively. Free
 is not added to a paid allowance, and additional prepaid funding grants its
 face value.
 
@@ -29,8 +29,14 @@ unresolved subscription plan IDs and reports `pending-stripe-price-ids`.
 It emits no environment or deployment artifact. Supplying syntactically valid
 Price IDs only makes the price preview qualified; it does not prove Stripe
 prices exist, match the selected cash amount, or activate the subscriptions.
-Runtime activation additionally needs the strict operator tariff, verified
-TEST-mode Stripe bindings, and both-plan consumer support.
+Runtime activation additionally needs the strict operator tariff and verified
+TEST-mode Stripe bindings. An authoring version 2 document binds a copy of this
+source, with both actual Price IDs filled in, to the tariff; a null Price ID
+fails closed. The activated runtime resolves Checkout requests and pinned paid
+invoices by plan ID, checks the remote TEST Price and amount, and grants the
+matching included USD-micros. The committed source remains a preview with null
+Price IDs; syntactic IDs in a private authoring file are not proof of Stripe
+ownership or activation.
 
 The source does not set Checkout purchase bounds, grant clocks, provider
 credentials, or deployment targets. Those remain separately supplied operator

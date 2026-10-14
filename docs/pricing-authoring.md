@@ -1,8 +1,30 @@
 # Pricing authoring preview
 
-This preview takes operator-selected plan identifiers and tariff values and produces one shared hosted plan table for Takosumi Hosted and Takoserver. The free, subscription, and usage plan IDs are mandatory authoring inputs. The CTO has not chosen their common identifiers; Shouta chooses the final prices. This tool has no plan-ID or price defaults and does not activate billing, write configuration, call Stripe, or change a ledger.
+Authoring version 2 binds the finalized shared USD-micros source to the Host
+tariff. Its top-level fields are `authoringVersion: 2`, `sharedPricing` (a copy of
+`config/shared-hosted-pricing.json`), `planIds` (`free` and `usage`),
+`billingConfig`, and `checkout`. The committed shared source keeps null Stripe
+Price IDs for preview. For a private runtime candidate, supply both real TEST
+Price IDs in `sharedPricing.plans` and the same IDs in
+`billingConfig.plans.hosted-10` and `.hosted-50`. The parser rejects null or
+duplicate Price IDs, a plan or Free amount different from the shared source,
+and any nonzero meter missing or priced differently from the source's exact 3x
+Cloudflare rate. The zero-rated egress entry is omitted from the strict tariff
+because its meter parser accepts positive rates only. Set the tariff revision
+to the shared source revision; preserve historical tariff revisions intact.
+The monthly amounts and included allowances are converted from USD-micros to
+Stripe cents only when exactly representable. The resulting table contains Free,
+both paid plans, and usage. The two monthly review rows remain a checklist;
+Checkout and invoice processing retrieve the referenced Price from Stripe in
+TEST mode and verify the USD monthly amount. The preview never calls Stripe or
+proves an ID belongs to this operator.
 
-The strict JSON input has top-level `authoringVersion`, `planIds`, `billingConfig`, `checkout`, and `stripeMonthlyReview` fields. `planIds` requires three distinct, lowercase IDs: `free`, `subscription`, and `usage`. The Host `billingConfig.plans` object must contain exactly one key, equal to `planIds.subscription`; its monthly Stripe review row must use that same key. The free and usage rows come from the same authoring input: the free row carries `billingConfig.freeIncludedMinor`, and the usage row carries the configured meters and Checkout bounds. No product-specific price or plan override is accepted.
+The version 1 authoring format below remains available for historical tariff
+snapshots and existing one-plan configurations.
+
+Version 1 takes operator-selected plan identifiers and tariff values and produces one shared hosted plan table for Takosumi Hosted and Takoserver. The free, subscription, and usage plan IDs are mandatory authoring inputs. The tool has no plan-ID or price defaults and does not activate billing, write configuration, call Stripe, or change a ledger.
+
+The version 1 strict JSON input has top-level `authoringVersion`, `planIds`, `billingConfig`, `checkout`, and `stripeMonthlyReview` fields. `planIds` requires three distinct, lowercase IDs: `free`, `subscription`, and `usage`. The Host `billingConfig.plans` object must contain exactly one key, equal to `planIds.subscription`; its monthly Stripe review row must use that same key. The free and usage rows come from the same authoring input: the free row carries `billingConfig.freeIncludedMinor`, and the usage row carries the configured meters and Checkout bounds. No product-specific price or plan override is accepted.
 
 Use the intentionally non-compilable [`examples/pricing.placeholder.json`](../examples/pricing.placeholder.json) as a field checklist. Replace all null and `REPLACE_ME` values. Choose all three IDs, then change the example's `subscription-plan-key` object key under both `billingConfig.plans` and `stripeMonthlyReview` to exactly the chosen `planIds.subscription`. The CLI rejects duplicate JSON members, invalid or duplicate IDs, plan/review mismatches, unresolved placeholders, and unknown authoring fields. It validates the full `billingConfig` with the canonical `src/billing-config.ts` parser and uses `src/payment-settings.ts` for Checkout bounds. Billing parser errors are sanitized so arbitrary input keys and values are not printed.
 
@@ -14,7 +36,7 @@ Run the read-only preview with one private input file:
 bun --no-env-file scripts/pricing/preview.ts /private/path/pricing.json
 ```
 
-The input file is limited to 1 MiB and read with a bounded stream. Keep it out of source control if it contains operator pricing or unreleased Stripe IDs. Successful stdout contains `mode: "preview"`, `validation: "host-billing-config-valid"`, `activation: "pending-unified-billing-runtime-alignment"`, the canonical billing environment string, the Checkout environment strings, a Stripe review manifest, and one `hostedPlanTable`. The table names both products and a shared Organization balance, and emits the fixed consumption order free, subscription, purchased, then postpaid. The order is not configurable. Purchased credit remains the existing verified-payment 1:1 amount; the preview does not create purchased-credit packages or grant postpaid service.
+The input file is limited to 1 MiB and read with a bounded stream. Keep it out of source control if it contains operator pricing or unreleased Stripe IDs. Version 1 stdout contains `activation: "pending-unified-billing-runtime-alignment"`; version 2 reports `stripe-test-price-verification-required`. Both include the canonical billing environment string, Checkout environment strings, a Stripe review manifest, and one `hostedPlanTable`. The table names both products and a shared Organization balance, and emits the fixed class order free, subscription, purchased, then postpaid. Under version 2, Free is eligible only for a Free organization and never stacks on a paid allowance. The class order is not configurable. Purchased credit remains the existing verified-payment 1:1 amount; the preview does not create purchased-credit packages or grant postpaid service.
 
 The compiler also emits `TAKOSERVER_HOSTED_PRICING`. Its runtime parser in `src/hosted-pricing.ts` accepts the same authoring document, limited to 262,144 bytes. The runtime's `assertHostedPricingMatchesBilling` check requires the embedded billing configuration, shared plan table, meters, and prices to match the active `TAKOSERVER_BILLING_CONFIG`; mismatch fails startup with a fixed safe error. Explicit hosted configuration enables [test-mode subscriptions and refunds](subscriptions-refunds.md) only with a Stripe test key and complete 0095 schema after #326's 0093/0094 cutover. A configured console origin enables subscription Checkout. The CLI itself remains read-only and activates nothing.
 
