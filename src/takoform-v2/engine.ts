@@ -187,6 +187,11 @@ function replayBodyWithoutPrivateValues(body: Readonly<Record<string, unknown>>)
 }
 
 export function createTakoformV2Engine(options: V2EngineOptions) {
+  const configuredFreshAdmission = options.allowFreshCreateAndUpdate;
+  if (configuredFreshAdmission !== undefined && typeof configuredFreshAdmission !== "boolean") {
+    throw new TypeError("allowFreshCreateAndUpdate must be a boolean");
+  }
+  const allowFreshCreateAndUpdate = configuredFreshAdmission !== false;
   if (options.privateInputCustody) validatePrivateInputCustody(options.privateInputCustody);
   if (!Number.isSafeInteger(options.replayWindowSeconds) || options.replayWindowSeconds < 1) {
     throw new TypeError("replayWindowSeconds must be a positive safe integer");
@@ -309,7 +314,11 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
 
   function form(formUrl: string) {
     const found = Object.hasOwn(options.forms, formUrl) ? options.forms[formUrl] : undefined;
-    if (!found || (!privateInputsCapability && found.privateInputs?.requiredForEveryInstance)) {
+    if (
+      !allowFreshCreateAndUpdate ||
+      !found ||
+      (!privateInputsCapability && found.privateInputs?.requiredForEveryInstance)
+    ) {
       fail("unsupported_form", 422);
     }
     return found;
@@ -318,6 +327,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
   function supportsCompleteForm(formUrl: string): boolean {
     const selected = Object.hasOwn(options.forms, formUrl) ? options.forms[formUrl] : undefined;
     return (
+      allowFreshCreateAndUpdate &&
       selected !== undefined &&
       (privateInputsCapability || selected.privateInputs?.requiredForEveryInstance !== true)
     );
@@ -423,7 +433,11 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       return supportsCompleteForm(formUrl);
     },
     supportsPrivateInputs(formUrl: string): boolean {
-      return privateInputsCapability && options.forms[formUrl]?.privateInputs !== undefined;
+      return (
+        allowFreshCreateAndUpdate &&
+        privateInputsCapability &&
+        options.forms[formUrl]?.privateInputs !== undefined
+      );
     },
     async supportsPrivateInputsForUpdate(principal: string, uid: string): Promise<boolean> {
       const target = await ownedResource(principal, uid, "write");

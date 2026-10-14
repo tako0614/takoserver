@@ -159,6 +159,8 @@ export interface AppPorts {
   readonly v2FormFactory?: V2OperatorFormFactory;
   /** Code-selected full and retained-only maps; exclusive with v2FormFactory. */
   readonly v2FormSelectionFactory?: V2OperatorFormSelectionFactory;
+  /** Code-selected fresh CREATE/UPDATE policy; absent preserves normal admission. */
+  readonly v2AllowFreshCreateAndUpdate?: boolean;
   /** Code-selected source for configured v2 artifact Forms; absent remains held-only. */
   readonly v2ArtifactSourceFactory?: V2OperatorArtifactSourceFactory;
   /** Explicit operator-private v2 keyring; absent disables privateInputs. */
@@ -354,6 +356,7 @@ export function buildApp(ports: AppPorts): App {
     randomId,
     apiKeyAdministration,
   });
+  const v2AllowFreshCreateAndUpdate = ports.v2AllowFreshCreateAndUpdate;
   const takoformV2Host = createTakoformV2Application({
     sql: ports.sql,
     objects: ports.objects,
@@ -361,6 +364,9 @@ export function buildApp(ports: AppPorts): App {
     publicOrigin: ports.publicOrigin,
     config: ports.v2,
     clock,
+    ...(v2AllowFreshCreateAndUpdate === undefined
+      ? {}
+      : { allowFreshCreateAndUpdate: v2AllowFreshCreateAndUpdate }),
     ...(ports.v2FormFactory === undefined ? {} : { formFactory: ports.v2FormFactory }),
     ...(ports.v2FormSelectionFactory === undefined
       ? {}
