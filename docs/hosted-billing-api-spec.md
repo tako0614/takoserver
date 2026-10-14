@@ -109,6 +109,13 @@ and is excluded from new allocation. Previously pinned Free holds and history
 survive. A partial refund leaves remaining paid coverage; a full settled refund
 or coverage end restores eligibility only under the existing refund/fence rules.
 No `active` subscription status alone funds a lot or establishes paid features.
+Included credit becomes available at the verified invoice period's start.
+A paid future-period invoice remains deferred until that boundary; replay or
+reconciliation then grants its original period once. Historical future-funded
+lots retain their original rows and amount, but cannot fund a new allocation
+before their period starts. Existing reserved captures and releases retain
+their original allocation. Advancing a Stripe TEST clock does not advance the
+application clock or authorize an early allowance.
 
 Consumption uses eligible Free, then subscription, then explicitly eligible
 purchased credit. Within each class use earliest expiry, then stable creation
@@ -274,6 +281,54 @@ commands per Org and return the committed original command result on replay.
 At renewal verify the actual invoice/Price and grant that period's selected
 included credit exactly once. Failed renewal grants no new allowance.
 Cancellation preserves paid lots until their original expiry/refund.
+
+### Original subscription command receipts
+
+The qualified Hosted lane supplies
+`GET .../payments/subscription/commands/{kind}/{reference}` with `wallet:read`
+for the exact Organization. `kind` is `start`, `cancel` or `plan-change`;
+references follow the existing 1–128 character command syntax. Query parameters
+are rejected. The response is `{receipt: ...}` with
+`contractVersion: "hosted-subscription-command-v1"`. This separate receipt
+version does not add fields to `hosted-billing-v1` capabilities.
+
+The closed receipt contains `organizationId`, `reference`, `kind`, `state`,
+`subscriptionRef`, `planKey`, `pricingRevision`, `checkout`, `effectiveAt`,
+`pendingChange` and `lifecycle`. It retains the original opaque target and
+selected terms even after another subscription becomes current. Processor
+object IDs, customer IDs and internal custody keys are omitted. Nullable fields
+are explicit; OpenAPI defines the allowed combinations.
+
+| Kind | State | Lifecycle and retained result |
+| --- | --- | --- |
+| `start` | `pending`, `open`, `associated`, `expired`, `invalidated` | Lifecycle equals state; open has its recorded Checkout URL, associated retains its original opaque target |
+| `cancel` | `pending`, `verified` | `pending` or `scheduled`; a verified result records the original cancellation boundary and never asserts termination |
+| `plan-change` | `pending`, `verified` | `pending`, `scheduled`, `activated`, `revoked`; verified retains its original `pendingChange` tuple in every lifecycle |
+
+This GET reads local retained custody and immutable workflow evidence. It does
+not call Stripe, register pricing, advance commands, reconcile, consult the
+current management gate or write SQL. Pending includes an accepted processor
+effect whose acknowledgement was lost. Activation and revocation require the
+original command's immutable verified workflow and term evidence; elapsed time,
+the current projection or a missing pending slot cannot establish either.
+For example, a late cancellation that lacks a recorded activation step can
+leave the original plan receipt `scheduled` even after its boundary passes.
+
+Missing receipts and unavailable/legacy lanes return 404; corrupt or unreadable
+proof returns `503 billing_unavailable`. Neither is proof that no effect occurred
+or permission to invent another reference. Persist the original qualified
+source binding, reference, requested plan and opaque target across retries.
+Do not derive a legacy command's missing reference or source epoch from current
+configuration. A reviewed legacy adoption resolver remains a separate consumer
+activation requirement.
+
+An original `associated` start receipt plus an authenticated subscription
+projection for the same source, Organization and `subscriptionRef` with status
+`canceled` or `incomplete_expired` supports archiving that target before an
+explicit new purchase intent is submitted to the current server admission gate.
+The projection is a retained writer observation. This does not clear other
+unknown commands. Associated alone, a scheduled cancellation, its timestamp,
+`pendingChange: null`, or an absent projection does not establish termination.
 
 ## Idempotent top-up
 

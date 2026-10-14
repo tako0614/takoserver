@@ -9,7 +9,7 @@ import { type BillingGrant, createStripeBillingStore } from "../src/stripe-billi
 const start = "2026-10-14T00:00:00.000Z";
 const clock = () => new Date(start);
 
-async function fixture() {
+async function fixture(now = clock) {
   const db = new Database(":memory:");
   const billingMigration = await Bun.file(
     new URL("../migrations/0095_stripe_billing.sql", import.meta.url),
@@ -19,8 +19,8 @@ async function fixture() {
     db.exec(migration.name === "0095_stripe_billing.sql" ? billingMigration : migration.sql);
   }
   const sql = createSqliteSql(db);
-  const ledger = createLedger(sql, clock);
-  const store = createStripeBillingStore({ sql, clock });
+  const ledger = createLedger(sql, now);
+  const store = createStripeBillingStore({ sql, clock: now });
   const grant: BillingGrant = {
     organizationId: "org_test",
     fundingRef: "stripe:cs_test",
@@ -43,6 +43,60 @@ async function fixture() {
 }
 
 describe("Stripe billing store", () => {
+  test("direct invoice grants wait for the original service start and preserve exact historical replay", async () => {
+    let instant = start;
+    const { store, grant, sql } = await fixture(() => new Date(instant));
+    const periodStart = "2026-11-01T00:00:00.000Z";
+    const included: BillingGrant = {
+      ...grant,
+      fundingRef: "stripe:invoice:in_future",
+      sourceType: "invoice",
+      sourceId: "in_future",
+      chargeId: "ch_future",
+      kind: "plan-included",
+      amountMicros: 20_000_000,
+      considerationMicros: 10_000_000,
+      subscriptionId: "sub_future",
+      planKey: "hosted-10",
+      pricingRevision: "original-revision",
+      stripePriceId: "price_final10",
+      periodStart,
+      periodEnd: "2026-12-01T00:00:00.000Z",
+      expiresAt: "2026-12-01T00:00:00.000Z",
+    };
+    await expect(store.grant(included)).rejects.toMatchObject({
+      code: "invoice_period_not_started",
+    });
+    expect(await store.grantForSource("invoice", included.sourceId)).toBeNull();
+    expect(await sql.query("SELECT * FROM wallet_credit_lots")).toEqual([]);
+    expect(await sql.query("SELECT * FROM ledger")).toEqual([]);
+    expect(await sql.query("SELECT * FROM wallet_allocation_guards")).toEqual([]);
+    instant = periodStart;
+    await store.grant(included);
+    await store.grant(included);
+    expect(await store.grantForSource("invoice", included.sourceId)).toEqual(included);
+    expect(
+      await sql.query("SELECT period_start, period_end, created_at FROM stripe_billing_grants"),
+    ).toEqual([
+      {
+        period_start: included.periodStart,
+        period_end: included.periodEnd,
+        created_at: instant,
+      },
+    ]);
+    instant = start;
+    await store.grant(included);
+    await expect(store.grant({ ...included, amountMicros: 20_000_001 })).rejects.toMatchObject({
+      code: "grant_conflict",
+    });
+    expect(await sql.query("SELECT COUNT(*) AS count FROM ledger WHERE type = 'funding'")).toEqual([
+      { count: 1 },
+    ]);
+    expect(await sql.query("SELECT COUNT(*) AS count FROM wallet_credit_lots")).toEqual([
+      { count: 1 },
+    ]);
+  });
+
   test("forward migration retains deferred Stripe event evidence for versioned replay", async () => {
     const db = new Database(":memory:");
     for (const migration of MIGRATIONS) {

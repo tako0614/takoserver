@@ -176,8 +176,8 @@ async function fixture(
           },
           phases: [
             {
-              start_date: Date.parse(calendar.start) / 1000,
-              end_date: Date.parse(calendar.end) / 1000,
+              start_date: subscription.current_period_start,
+              end_date: subscription.current_period_end,
               currency: "usd",
               add_invoice_items: [],
               application_fee_percent: null,
@@ -198,8 +198,8 @@ async function fixture(
               proration_behavior: "create_prorations",
               items: [
                 {
-                  price: OLD.priceId,
-                  plan: OLD.priceId,
+                  price: (subscription.items as { data: { price: string }[] }).data[0]?.price,
+                  plan: (subscription.items as { data: { price: string }[] }).data[0]?.price,
                   quantity: 1,
                   metadata: { retainedItem: "item" },
                   tax_rates: [],
@@ -334,7 +334,7 @@ async function fixture(
       return input.qualifiedRecovery ? clone(schedule) : null;
     },
   };
-  const make = () =>
+  const make = (qualifyPlan?: (planKey: string) => Promise<QualifiedSubscriptionPlan>) =>
     createSubscriptionPlanChanges({
       sql,
       clock: () => new Date(at),
@@ -345,10 +345,12 @@ async function fixture(
         livemode: false,
         billingAuthority: "authority_fixture",
       },
-      qualifyPlan: async (planKey) => {
-        expect(planKey).toBe(PLAN.planKey);
-        return PLAN;
-      },
+      qualifyPlan:
+        qualifyPlan ??
+        (async (planKey) => {
+          expect(planKey).toBe(PLAN.planKey);
+          return PLAN;
+        }),
     });
   return {
     db,
@@ -370,6 +372,346 @@ async function fixture(
     },
   };
 }
+
+function retainedReader(h: Awaited<ReturnType<typeof fixture>>) {
+  const forbidden: string[] = [];
+  const refuse = (port: string): never => {
+    forbidden.push(port);
+    throw new Error(`historical read used ${port}`);
+  };
+  const service = createSubscriptionPlanChanges({
+    sql: {
+      query: (statement, params) => h.base.query(statement, params),
+      run: async () => refuse("sql.run"),
+      batch: async () => refuse("sql.batch"),
+    },
+    clock: () => refuse("clock"),
+    client: {
+      get: async () => refuse("client.get"),
+      post: async () => refuse("client.post"),
+      list: async () => refuse("client.list"),
+    },
+    custody: {
+      readTarget: async () => refuse("custody.readTarget"),
+      verifyTarget: async () => refuse("custody.verifyTarget"),
+      originalTerms: async () => refuse("custody.originalTerms"),
+      fence: () => refuse("custody.fence"),
+      cancel: async () => refuse("custody.cancel"),
+      recoverCreatedSchedule: async () => refuse("custody.recoverCreatedSchedule"),
+    },
+    realm: {
+      accountId: "acct_test_fixture",
+      livemode: false,
+      billingAuthority: "authority_fixture",
+    },
+    qualifyPlan: async () => refuse("qualifyPlan"),
+  });
+  const snapshot = async () =>
+    Object.fromEntries(
+      await Promise.all(
+        [
+          "stripe_billing_plan_changes",
+          "stripe_billing_plan_change_steps",
+          "stripe_billing_plan_change_slots",
+          "stripe_billing_subscription_terms",
+          "stripe_billing_subscription_term_revocations",
+          "stripe_billing_grants",
+        ].map(async (table) => [table, await h.base.query(`SELECT * FROM ${table}`)]),
+      ),
+    );
+  return { read: service.readCommand, forbidden, snapshot };
+}
+
+describe("retained subscription command descriptors", () => {
+  test("pending plan and lost-release cancellation are local reads without recovery or dispatch", async () => {
+    const pending = await fixture({ lostAck: "create" });
+    const cancel = await fixture({ lostAck: "release" });
+    try {
+      await pending.make().change(request);
+      await cancel.make().change(request);
+      await cancel.make().cancelPendingChange({
+        organizationId: OLD.organizationId,
+        reference: "cancel-read",
+        expectedSubscriptionRef: REF,
+      });
+      for (const [h, reference, kind] of [
+        [pending, request.reference, "plan-change"],
+        [cancel, "cancel-read", "cancel"],
+      ] as const) {
+        const reader = retainedReader(h),
+          before = await reader.snapshot(),
+          calls = h.calls.length,
+          native = h.cancelCalls.length;
+        expect(await reader.read(OLD.organizationId, reference, kind)).toMatchObject({
+          organizationId: OLD.organizationId,
+          reference,
+          kind,
+          state: "pending",
+          lifecycle: "pending",
+          subscriptionRef: REF,
+          ...(kind === "plan-change" ? { pendingChange: null } : {}),
+        });
+        expect(await reader.snapshot()).toEqual(before);
+        expect(reader.forbidden).toEqual([]);
+        expect(h.calls).toHaveLength(calls);
+        expect(h.cancelCalls).toHaveLength(native);
+      }
+    } finally {
+      pending.db.close();
+      cancel.db.close();
+    }
+  });
+
+  test("schedule acknowledgement and changed time, projection or slot do not prove activation", async () => {
+    const h = await fixture();
+    try {
+      await h.make().change(request);
+      h.activate();
+      await h.base.run("DELETE FROM stripe_billing_plan_change_slots");
+      await h.base.run(
+        "UPDATE custody_test_target SET subscription_id='sub_replacement',generation=2,ref=?",
+        [`sra_${"b".repeat(64)}`],
+      );
+      const reader = retainedReader(h),
+        before = await reader.snapshot(),
+        calls = h.calls.length;
+      expect(await reader.read(OLD.organizationId, request.reference, "plan-change")).toEqual({
+        organizationId: OLD.organizationId,
+        reference: request.reference,
+        kind: "plan-change",
+        state: "verified",
+        lifecycle: "scheduled",
+        subscriptionRef: REF,
+        planKey: PLAN.planKey,
+        pricingRevision: PLAN.pricingRevision,
+        effectiveAt: NEXT,
+        pendingChange: {
+          planKey: PLAN.planKey,
+          pricingRevision: PLAN.pricingRevision,
+          effectiveAt: NEXT,
+        },
+      });
+      expect(await reader.snapshot()).toEqual(before);
+      expect(reader.forbidden).toEqual([]);
+      expect(h.calls).toHaveLength(calls);
+    } finally {
+      h.db.close();
+    }
+  });
+
+  test("an unverified activation-release and a late cancellation release do not establish activation", async () => {
+    const lost = await fixture({ lostAck: "release" });
+    const late = await fixture();
+    try {
+      await lost.make().change(request);
+      lost.activate();
+      expect(await lost.make().reconcileActivation(OLD.organizationId, REF)).toEqual({
+        completed: false,
+      });
+      await late.make().change(request);
+      late.activate();
+      await late.make().cancelPendingChange({
+        organizationId: OLD.organizationId,
+        reference: "late-cancel",
+        expectedSubscriptionRef: REF,
+      });
+      for (const h of [lost, late]) {
+        const reader = retainedReader(h),
+          before = await reader.snapshot(),
+          calls = h.calls.length;
+        expect(
+          await reader.read(OLD.organizationId, request.reference, "plan-change"),
+        ).toMatchObject({
+          lifecycle: "scheduled",
+          pendingChange: {
+            planKey: PLAN.planKey,
+            pricingRevision: PLAN.pricingRevision,
+            effectiveAt: NEXT,
+          },
+        });
+        expect(await reader.snapshot()).toEqual(before);
+        expect(reader.forbidden).toEqual([]);
+        expect(h.calls).toHaveLength(calls);
+      }
+    } finally {
+      lost.db.close();
+      late.db.close();
+    }
+  });
+
+  test("verified activation workflow and repeated plan transitions retain the first command's exact original terms", async () => {
+    const h = await fixture();
+    try {
+      await h.make().change(request);
+      h.activate();
+      expect(await h.make().reconcileActivation(OLD.organizationId, REF)).toEqual({
+        completed: true,
+      });
+      const reader = retainedReader(h);
+      const original = await reader.read(OLD.organizationId, request.reference, "plan-change");
+      expect(original).toMatchObject({
+        state: "verified",
+        lifecycle: "activated",
+        effectiveAt: NEXT,
+        planKey: PLAN.planKey,
+        pendingChange: {
+          planKey: PLAN.planKey,
+          pricingRevision: PLAN.pricingRevision,
+          effectiveAt: NEXT,
+        },
+      });
+      const olderPlan = {
+        planKey: OLD.planKey,
+        pricingRevision: OLD.pricingRevision,
+        priceId: OLD.priceId,
+        priceAmountMinor: OLD.priceAmountMinor,
+        includedMinor: OLD.includedMinor,
+      };
+      expect(
+        await h
+          .make(async () => olderPlan)
+          .change({ ...request, reference: "second-transition", planKey: olderPlan.planKey }),
+      ).toMatchObject({
+        state: "verified",
+        pendingChange: { planKey: OLD.planKey, effectiveAt: AFTER },
+      });
+      await h.base.run(
+        "UPDATE custody_test_target SET subscription_id='sub_replacement',generation=2,ref=?",
+        [`sra_${"b".repeat(64)}`],
+      );
+      const before = await reader.snapshot(),
+        calls = h.calls.length;
+      expect(await reader.read(OLD.organizationId, request.reference, "plan-change")).toEqual(
+        original,
+      );
+      expect(
+        await reader.read(OLD.organizationId, "second-transition", "plan-change"),
+      ).toMatchObject({
+        lifecycle: "scheduled",
+        effectiveAt: AFTER,
+        subscriptionRef: REF,
+        planKey: OLD.planKey,
+      });
+      expect(await reader.snapshot()).toEqual(before);
+      expect(reader.forbidden).toEqual([]);
+      expect(h.calls).toHaveLength(calls);
+    } finally {
+      h.db.close();
+    }
+  });
+
+  test("matching verified release revokes the original plan while the old cancellation receipt stays scheduled after replacement", async () => {
+    const h = await fixture();
+    try {
+      await h.make().change(request);
+      await h.make().cancelPendingChange({
+        organizationId: OLD.organizationId,
+        reference: "cancel-read",
+        expectedSubscriptionRef: REF,
+      });
+      h.subscription.status = "canceled";
+      await h.make().reconcilePending();
+      await h.base.run(
+        "UPDATE custody_test_target SET subscription_id='sub_replacement',generation=2,ref=?",
+        [`sra_${"b".repeat(64)}`],
+      );
+      const reader = retainedReader(h),
+        before = await reader.snapshot(),
+        calls = h.calls.length,
+        native = h.cancelCalls.length;
+      expect(await reader.read(OLD.organizationId, request.reference, "plan-change")).toMatchObject(
+        {
+          lifecycle: "revoked",
+          pendingChange: {
+            planKey: PLAN.planKey,
+            pricingRevision: PLAN.pricingRevision,
+            effectiveAt: NEXT,
+          },
+        },
+      );
+      expect(await reader.read(OLD.organizationId, "cancel-read", "cancel")).toEqual({
+        organizationId: OLD.organizationId,
+        reference: "cancel-read",
+        kind: "cancel",
+        state: "verified",
+        lifecycle: "scheduled",
+        subscriptionRef: REF,
+        planKey: OLD.planKey,
+        pricingRevision: OLD.pricingRevision,
+        effectiveAt: NEXT,
+      });
+      expect(await reader.snapshot()).toEqual(before);
+      expect(reader.forbidden).toEqual([]);
+      expect(h.calls).toHaveLength(calls);
+      expect(h.cancelCalls).toHaveLength(native);
+    } finally {
+      h.db.close();
+    }
+  });
+
+  test("wrong kind or Organization cannot retrieve a command; malformed and corrupt pins refuse without effects", async () => {
+    const h = await fixture();
+    try {
+      await h.make().change(request);
+      const reader = retainedReader(h),
+        before = await reader.snapshot(),
+        calls = h.calls.length;
+      expect(await reader.read(OLD.organizationId, request.reference, "cancel")).toBeNull();
+      expect(await reader.read("org_foreign", request.reference, "plan-change")).toBeNull();
+      expect(await reader.read(OLD.organizationId, "missing", "plan-change")).toBeNull();
+      for (const reference of ["", "../private", "x".repeat(129)])
+        await expect(
+          reader.read(OLD.organizationId, reference, "plan-change"),
+        ).rejects.toMatchObject({ status: 400 });
+      expect(await reader.snapshot()).toEqual(before);
+      expect(reader.forbidden).toEqual([]);
+      expect(h.calls).toHaveLength(calls);
+      const query = h.base.query;
+      for (const contradiction of [
+        { fingerprint: "sha256:contradictory" },
+        { expected_subscription_ref: `sra_${"b".repeat(64)}` },
+        { subscription_id: "sub_replacement" },
+        { expected_generation: 2 },
+      ]) {
+        const corrupt: Sql = {
+          query: async (statement, params) =>
+            (await query(statement, params)).map((row) =>
+              statement.startsWith("SELECT * FROM stripe_billing_plan_changes")
+                ? { ...row, ...contradiction }
+                : row,
+            ),
+          run: async () => {
+            throw new Error("write forbidden");
+          },
+          batch: async () => {
+            throw new Error("write forbidden");
+          },
+        };
+        const service = createSubscriptionPlanChanges({
+          sql: corrupt,
+          client: h.client,
+          clock: () => {
+            throw new Error("clock forbidden");
+          },
+          custody: h.custody,
+          realm: {
+            accountId: "acct_test_fixture",
+            livemode: false,
+            billingAuthority: "authority_fixture",
+          },
+          qualifyPlan: async () => PLAN,
+        });
+        await expect(
+          service.readCommand(OLD.organizationId, request.reference, "plan-change"),
+        ).rejects.toMatchObject({ status: 503 });
+      }
+      expect(await reader.snapshot()).toEqual(before);
+      expect(h.calls).toHaveLength(calls);
+    } finally {
+      h.db.close();
+    }
+  });
+});
 
 describe("custodied next-period subscription changes", () => {
   test("freezes future Price and metadata together; exact retry preserves its receipt and no credit is granted", async () => {

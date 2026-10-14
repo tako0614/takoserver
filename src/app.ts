@@ -826,6 +826,7 @@ export function buildApp(ports: AppPorts): App {
       ? {
           subscriptionCustody: hostedPayments.subscriptionCustody,
           subscriptionPlans: hostedPayments.subscriptionPlans,
+          subscriptionCommandReceipts: hostedPayments.subscriptionCommandReceipts,
         }
       : paymentEvents?.subscriptions
         ? { subscriptions: paymentEvents.subscriptions }

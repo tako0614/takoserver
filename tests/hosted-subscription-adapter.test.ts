@@ -29,6 +29,13 @@ const unix = (at: string) => Date.parse(at) / 1000;
 const clone = <T>(value: T): T => structuredClone(value);
 
 async function fixture() {
+  let SUB = "sub_actual_phase",
+    SESSION = "cs_actual_phase",
+    START_REF = "original-start",
+    FIRST_INVOICE = "in_actual_first";
+  let START = "2026-10-01T00:00:00.000Z",
+    NEXT = "2026-11-01T00:00:00.000Z",
+    AFTER = "2026-12-01T00:00:00.000Z";
   const { db, sql } = await createHostedBillingRealmTestDatabase();
   let at = START;
   const clock = () => new Date(at);
@@ -100,7 +107,8 @@ async function fixture() {
     key: string | null;
     form: Record<string, string>;
   }[] = [];
-  let lose: "schedule" | "release" | null = null;
+  let lose: "schedule" | "release" | "native-cancel" | null = null;
+  let unknownNativeReadback = false;
   let createGate: { entered(): void; resume: Promise<void> } | null = null;
   const nested = (form: Record<string, string>, prefix: string) =>
     Object.fromEntries(
@@ -121,6 +129,8 @@ async function fixture() {
         form,
       });
       if (request.method === "GET") {
+        if (unknownNativeReadback && path === `/v1/subscriptions/${SUB}`)
+          return new Response("unknown native cancel acknowledgement", { status: 503 });
         if (path === "/v1/account")
           return Response.json({ id: "acct_actualphase", object: "account" });
         const plan = source.plans.find((item) => path === `/v1/prices/${item.stripePriceId}`);
@@ -196,7 +206,7 @@ async function fixture() {
       }
       if (path === "/v1/checkout/sessions") {
         const session: StripeBillingObject = {
-          id: "cs_actual_phase",
+          id: SESSION,
           object: "checkout.session",
           livemode: false,
           mode: "subscription",
@@ -214,7 +224,7 @@ async function fixture() {
           amount_total: 1000,
           created: unix(at),
           expires_at: unix(at) + 3600,
-          url: "https://checkout.stripe.com/c/pay/cs_actual_phase",
+          url: `https://checkout.stripe.com/c/pay/${SESSION}`,
         };
         sessions.set(session.id, session);
         return Response.json(session);
@@ -291,6 +301,11 @@ async function fixture() {
       if (path === `/v1/subscriptions/${SUB}`) {
         expect(form).toEqual({ cancel_at_period_end: "true" });
         sub.cancel_at_period_end = true;
+        if (lose === "native-cancel") {
+          lose = null;
+          unknownNativeReadback = true;
+          throw new Error("lost native cancellation acknowledgement");
+        }
         return Response.json(sub);
       }
       throw new Error(`unexpected mutation ${path}`);
@@ -436,17 +451,17 @@ async function fixture() {
   const begin = async () => {
     const open = await writer.subscriptions.begin({
       organizationId: ORG,
-      reference: "original-start",
+      reference: START_REF,
       planKey: "hosted-10",
     });
     expect(open.state).toBe("open");
     expect(customers.size).toBe(1);
-    const session = sessions.get("cs_actual_phase");
+    const session = sessions.get(SESSION);
     if (!session) throw new Error("missing genuine Checkout");
     session.status = "complete";
     session.payment_status = "paid";
     session.subscription = SUB;
-    session.invoice = "in_actual_first";
+    session.invoice = FIRST_INVOICE;
     subscriptions.set(SUB, {
       id: SUB,
       object: "subscription",
@@ -463,18 +478,18 @@ async function fixture() {
       schedule: null,
       items: { has_more: false, data: [{ id: "si_actual", price: "price_actual10", quantity: 1 }] },
     });
-    invoice("in_actual_first", "hosted-10", START, NEXT);
+    invoice(FIRST_INVOICE, "hosted-10", START, NEXT);
     expect(await deliver("checkout.session.completed", session.id)).toMatchObject({
       outcome: "applied",
     });
     const associated = await writer.subscriptions.begin({
       organizationId: ORG,
-      reference: "original-start",
+      reference: START_REF,
       planKey: "hosted-10",
     });
     if (associated.state !== "associated") throw new Error("genuine custody association missing");
-    expect(await deliver("invoice.paid", "in_actual_first")).toMatchObject({ outcome: "applied" });
-    at = "2026-10-15T00:00:00.000Z";
+    expect(await deliver("invoice.paid", FIRST_INVOICE)).toMatchObject({ outcome: "applied" });
+    at = new Date(Date.parse(START) + 14 * 86400000).toISOString();
     return associated.subscriptionRef;
   };
   const change = (expectedSubscriptionRef: string) => {
@@ -516,11 +531,24 @@ async function fixture() {
     restart() {
       writer = makeWriter();
     },
-    lose(value: "schedule" | "release") {
+    lose(value: "schedule" | "release" | "native-cancel") {
       lose = value;
+    },
+    recoverNativeCancellation() {
+      unknownNativeReadback = false;
     },
     gate(value: { entered(): void; resume: Promise<void> }) {
       createGate = value;
+    },
+    replaceSubscription() {
+      SUB = "sub_second_phase";
+      SESSION = "cs_second_phase";
+      START_REF = "second-start";
+      FIRST_INVOICE = "in_second_first";
+      START = NEXT;
+      NEXT = AFTER;
+      AFTER = "2027-01-01T00:00:00.000Z";
+      at = START;
     },
     activate() {
       at = NEXT;
@@ -538,6 +566,183 @@ async function fixture() {
 }
 
 describe("genuine Hosted subscription adapter and original grant writer", () => {
+  test("the same phase-owned native cancellation recovers its original unknown ACK and finalizes the phase command without another effect", async () => {
+    const f = await fixture();
+    try {
+      const ref = await f.begin();
+      await f.change(ref);
+      f.lose("native-cancel");
+      const request = {
+        organizationId: ORG,
+        reference: "phase-native-unknown",
+        expectedSubscriptionRef: ref,
+        cancelAtPeriodEnd: true,
+      };
+      expect(await f.writer.subscriptions.change(request)).toEqual({
+        state: "pending",
+        subscriptionRef: ref,
+      });
+      expect(await f.context.custody.readCancelCommand(ORG, request.reference)).toMatchObject({
+        state: "pending",
+        subscriptionRef: ref,
+      });
+      expect(
+        await f.writer.subscriptionPlans?.readCommand(ORG, request.reference, "cancel"),
+      ).toMatchObject({ state: "pending", subscriptionRef: ref });
+      const posts = f.calls.filter((call) => call.method === "POST").length;
+      expect(await f.writer.subscriptions.change(request)).toEqual({
+        state: "pending",
+        subscriptionRef: ref,
+      });
+      expect(f.calls.filter((call) => call.method === "POST")).toHaveLength(posts);
+      f.recoverNativeCancellation();
+      expect(await f.writer.subscriptions.change(request)).toMatchObject({
+        state: "verified",
+        subscriptionRef: ref,
+        effectiveAt: NEXT,
+      });
+      expect(
+        await f.writer.subscriptionPlans?.readCommand(ORG, request.reference, "cancel"),
+      ).toMatchObject({ state: "verified", subscriptionRef: ref, effectiveAt: NEXT });
+      expect(await f.context.custody.readCancelCommand(ORG, request.reference)).toMatchObject({
+        state: "verified",
+        subscriptionRef: ref,
+        effectiveAt: NEXT,
+      });
+      expect(f.calls.filter((call) => call.method === "POST")).toHaveLength(posts);
+    } finally {
+      f.db.close();
+    }
+  });
+  test("a native cancellation with unknown ACK retains its original pending identity without a phase command or another effect", async () => {
+    const f = await fixture();
+    try {
+      const ref = await f.begin();
+      f.lose("native-cancel");
+      const request = {
+        organizationId: ORG,
+        reference: "unknown-original",
+        expectedSubscriptionRef: ref,
+        cancelAtPeriodEnd: true,
+      };
+      expect(await f.writer.subscriptions.change(request)).toEqual({
+        state: "pending",
+        subscriptionRef: ref,
+      });
+      const saved = await f.context.custody.readCancelCommand(ORG, request.reference);
+      expect(saved).toMatchObject({
+        state: "pending",
+        lifecycle: "pending",
+        subscriptionRef: ref,
+        effectiveAt: null,
+      });
+      const posts = f.calls.filter((call) => call.method === "POST").length;
+      expect(await f.writer.subscriptions.change(request)).toEqual({
+        state: "pending",
+        subscriptionRef: ref,
+      });
+      expect(await f.writer.subscriptionPlans?.cancelPendingChange(request)).toEqual({
+        state: "pending",
+        subscriptionRef: ref,
+      });
+      await expect(
+        f.writer.subscriptions.change({
+          ...request,
+          expectedSubscriptionRef: `sra_${"b".repeat(64)}`,
+        }),
+      ).rejects.toMatchObject({ status: 409 });
+      expect(f.calls.filter((call) => call.method === "POST")).toHaveLength(posts);
+      expect(await f.sql.query("SELECT * FROM stripe_billing_plan_changes")).toEqual([]);
+      expect(await f.context.custody.readCancelCommand(ORG, request.reference)).toEqual(saved);
+    } finally {
+      f.db.close();
+    }
+  });
+  test("a retained native cancellation reference for A cannot prepare or release B's plan schedule", async () => {
+    const f = await fixture();
+    try {
+      const refA = await f.begin();
+      const original = await f.writer.subscriptions.change({
+        organizationId: ORG,
+        reference: "same-original",
+        expectedSubscriptionRef: refA,
+        cancelAtPeriodEnd: true,
+      });
+      expect(original).toMatchObject({
+        state: "verified",
+        subscriptionRef: refA,
+        effectiveAt: NEXT,
+      });
+      const saved = await f.context.custody.readCancelCommand(ORG, "same-original");
+      const subA = f.subscriptions.get(SUB);
+      if (!subA) throw new Error("original A missing");
+      subA.status = "canceled";
+      subA.ended_at = unix(NEXT);
+      subA.canceled_at = unix(NEXT);
+      f.now(NEXT);
+      expect(await f.deliver("customer.subscription.updated", SUB)).toMatchObject({
+        outcome: "applied",
+      });
+      f.replaceSubscription();
+      const refB = await f.begin();
+      expect(refB).not.toBe(refA);
+      expect(await f.change(refB)).toMatchObject({
+        state: "verified",
+        pendingChange: { effectiveAt: AFTER },
+      });
+      const tables = [
+        "stripe_billing_plan_changes",
+        "stripe_billing_plan_change_slots",
+        "stripe_billing_plan_change_steps",
+        "stripe_billing_subscription_term_revocations",
+        "stripe_subscription_cancellation_intents",
+        "stripe_billing_grants",
+      ];
+      const snapshot = async () =>
+        Object.fromEntries(
+          await Promise.all(
+            tables.map(async (table) => [table, await f.sql.query(`SELECT * FROM ${table}`)]),
+          ),
+        );
+      const before = await snapshot(),
+        posts = f.calls.filter((call) => call.method === "POST").length;
+      await expect(
+        f.writer.subscriptions.change({
+          organizationId: ORG,
+          reference: "same-original",
+          expectedSubscriptionRef: refB,
+          cancelAtPeriodEnd: true,
+        }),
+      ).rejects.toMatchObject({ status: 409 });
+      await expect(
+        f.writer.subscriptionPlans?.cancelPendingChange({
+          organizationId: ORG,
+          reference: "same-original",
+          expectedSubscriptionRef: refB,
+        }),
+      ).rejects.toMatchObject({ status: 409 });
+      expect(await snapshot()).toEqual(before);
+      expect(f.calls.filter((call) => call.method === "POST")).toHaveLength(posts);
+      expect(f.subscriptions.get("sub_second_phase")?.cancel_at_period_end).toBe(false);
+      expect(f.subscriptions.get("sub_second_phase")?.schedule).toBe("sub_sched_actual");
+      expect(await f.context.custody.readCancelCommand(ORG, "same-original")).toEqual(saved);
+      expect(
+        await f.writer.subscriptionPlans?.readCommand(ORG, "same-original", "cancel"),
+      ).toBeNull();
+      expect(
+        await f.writer.subscriptions.change({
+          organizationId: ORG,
+          reference: "fresh-B-cancel",
+          expectedSubscriptionRef: refB,
+          cancelAtPeriodEnd: true,
+        }),
+      ).toMatchObject({ state: "verified", subscriptionRef: refB, effectiveAt: AFTER });
+      expect(await f.context.custody.readCancelCommand(ORG, "same-original")).toEqual(saved);
+    } finally {
+      f.db.close();
+    }
+  });
+
   test("completed Checkout cannot mint a native association after its bound Customer realm contradicts the pin", async () => {
     const f = await fixture();
     try {

@@ -1392,6 +1392,530 @@
           }
         }
       },
+      "SubscriptionCommandReceipt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "contractVersion",
+          "organizationId",
+          "reference",
+          "kind",
+          "state",
+          "subscriptionRef",
+          "planKey",
+          "pricingRevision",
+          "checkout",
+          "effectiveAt",
+          "pendingChange",
+          "lifecycle"
+        ],
+        "properties": {
+          "contractVersion": {
+            "const": "hosted-subscription-command-v1"
+          },
+          "organizationId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "reference": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+            "description": "Opaque, non-reusable Organization billing reference; URL-encode it as one path component."
+          },
+          "kind": {
+            "enum": [
+              "start",
+              "cancel",
+              "plan-change"
+            ]
+          },
+          "state": {
+            "enum": [
+              "pending",
+              "open",
+              "associated",
+              "expired",
+              "invalidated",
+              "verified"
+            ]
+          },
+          "subscriptionRef": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 68,
+                "maxLength": 68,
+                "pattern": "^sra_[0-9a-f]{64}$",
+                "description": "Opaque expected subscription target; not an authorization credential."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "planKey": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pricingRevision": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BillingRevision"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "checkout": {
+            "anyOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "url"
+                ],
+                "properties": {
+                  "url": {
+                    "type": "string",
+                    "format": "uri"
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "effectiveAt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BillingUtcDateTime"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "pendingChange": {
+            "anyOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "planKey",
+                  "pricingRevision",
+                  "effectiveAt"
+                ],
+                "properties": {
+                  "planKey": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  },
+                  "pricingRevision": {
+                    "$ref": "#/components/schemas/BillingRevision"
+                  },
+                  "effectiveAt": {
+                    "$ref": "#/components/schemas/BillingUtcDateTime"
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "lifecycle": {
+            "enum": [
+              "pending",
+              "open",
+              "associated",
+              "expired",
+              "invalidated",
+              "scheduled",
+              "activated",
+              "revoked"
+            ]
+          }
+        },
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "start"
+              },
+              "state": {
+                "const": "pending"
+              },
+              "lifecycle": {
+                "const": "pending"
+              },
+              "subscriptionRef": {
+                "type": "null"
+              },
+              "planKey": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "pricingRevision": {
+                "$ref": "#/components/schemas/BillingRevision"
+              },
+              "checkout": {
+                "type": "null"
+              },
+              "effectiveAt": {
+                "type": "null"
+              },
+              "pendingChange": {
+                "type": "null"
+              }
+            }
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "start"
+              },
+              "state": {
+                "const": "open"
+              },
+              "lifecycle": {
+                "const": "open"
+              },
+              "subscriptionRef": {
+                "type": "null"
+              },
+              "planKey": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "pricingRevision": {
+                "$ref": "#/components/schemas/BillingRevision"
+              },
+              "checkout": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "url"
+                ],
+                "properties": {
+                  "url": {
+                    "type": "string",
+                    "format": "uri"
+                  }
+                }
+              },
+              "effectiveAt": {
+                "type": "null"
+              },
+              "pendingChange": {
+                "type": "null"
+              }
+            }
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "start"
+              },
+              "state": {
+                "const": "associated"
+              },
+              "lifecycle": {
+                "const": "associated"
+              },
+              "subscriptionRef": {
+                "type": "string",
+                "minLength": 68,
+                "maxLength": 68,
+                "pattern": "^sra_[0-9a-f]{64}$",
+                "description": "Opaque expected subscription target; not an authorization credential."
+              },
+              "planKey": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "pricingRevision": {
+                "$ref": "#/components/schemas/BillingRevision"
+              },
+              "checkout": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "url"
+                    ],
+                    "properties": {
+                      "url": {
+                        "type": "string",
+                        "format": "uri"
+                      }
+                    }
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "effectiveAt": {
+                "type": "null"
+              },
+              "pendingChange": {
+                "type": "null"
+              }
+            }
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "start"
+              },
+              "state": {
+                "const": "expired"
+              },
+              "lifecycle": {
+                "const": "expired"
+              },
+              "subscriptionRef": {
+                "type": "null"
+              },
+              "planKey": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "pricingRevision": {
+                "$ref": "#/components/schemas/BillingRevision"
+              },
+              "checkout": {
+                "type": "null"
+              },
+              "effectiveAt": {
+                "type": "null"
+              },
+              "pendingChange": {
+                "type": "null"
+              }
+            }
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "start"
+              },
+              "state": {
+                "const": "invalidated"
+              },
+              "lifecycle": {
+                "const": "invalidated"
+              },
+              "subscriptionRef": {
+                "type": "null"
+              },
+              "planKey": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "pricingRevision": {
+                "$ref": "#/components/schemas/BillingRevision"
+              },
+              "checkout": {
+                "type": "null"
+              },
+              "effectiveAt": {
+                "type": "null"
+              },
+              "pendingChange": {
+                "type": "null"
+              }
+            }
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "cancel"
+              },
+              "state": {
+                "const": "pending"
+              },
+              "lifecycle": {
+                "const": "pending"
+              },
+              "subscriptionRef": {
+                "type": "string",
+                "minLength": 68,
+                "maxLength": 68,
+                "pattern": "^sra_[0-9a-f]{64}$",
+                "description": "Opaque expected subscription target; not an authorization credential."
+              },
+              "checkout": {
+                "type": "null"
+              },
+              "effectiveAt": {
+                "type": "null"
+              },
+              "pendingChange": {
+                "type": "null"
+              }
+            }
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "cancel"
+              },
+              "state": {
+                "const": "verified"
+              },
+              "lifecycle": {
+                "const": "scheduled"
+              },
+              "subscriptionRef": {
+                "type": "string",
+                "minLength": 68,
+                "maxLength": 68,
+                "pattern": "^sra_[0-9a-f]{64}$",
+                "description": "Opaque expected subscription target; not an authorization credential."
+              },
+              "checkout": {
+                "type": "null"
+              },
+              "effectiveAt": {
+                "$ref": "#/components/schemas/BillingUtcDateTime"
+              },
+              "pendingChange": {
+                "type": "null"
+              }
+            }
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "plan-change"
+              },
+              "state": {
+                "const": "pending"
+              },
+              "lifecycle": {
+                "const": "pending"
+              },
+              "subscriptionRef": {
+                "type": "string",
+                "minLength": 68,
+                "maxLength": 68,
+                "pattern": "^sra_[0-9a-f]{64}$",
+                "description": "Opaque expected subscription target; not an authorization credential."
+              },
+              "planKey": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "pricingRevision": {
+                "$ref": "#/components/schemas/BillingRevision"
+              },
+              "checkout": {
+                "type": "null"
+              },
+              "effectiveAt": {
+                "$ref": "#/components/schemas/BillingUtcDateTime"
+              },
+              "pendingChange": {
+                "type": "null"
+              }
+            }
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "plan-change"
+              },
+              "state": {
+                "const": "verified"
+              },
+              "lifecycle": {
+                "enum": [
+                  "scheduled",
+                  "activated",
+                  "revoked"
+                ]
+              },
+              "subscriptionRef": {
+                "type": "string",
+                "minLength": 68,
+                "maxLength": 68,
+                "pattern": "^sra_[0-9a-f]{64}$",
+                "description": "Opaque expected subscription target; not an authorization credential."
+              },
+              "planKey": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 64
+              },
+              "pricingRevision": {
+                "$ref": "#/components/schemas/BillingRevision"
+              },
+              "checkout": {
+                "type": "null"
+              },
+              "effectiveAt": {
+                "$ref": "#/components/schemas/BillingUtcDateTime"
+              },
+              "pendingChange": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "planKey",
+                  "pricingRevision",
+                  "effectiveAt"
+                ],
+                "properties": {
+                  "planKey": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  },
+                  "pricingRevision": {
+                    "$ref": "#/components/schemas/BillingRevision"
+                  },
+                  "effectiveAt": {
+                    "$ref": "#/components/schemas/BillingUtcDateTime"
+                  }
+                }
+              }
+            }
+          }
+        ]
+      },
+      "SubscriptionCommandReceiptResponse": {
+        "type": "object",
+        "required": [
+          "receipt"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "receipt": {
+            "$ref": "#/components/schemas/SubscriptionCommandReceipt"
+          }
+        }
+      },
       "HostedPlanTable": {
         "type": "object",
         "required": [
@@ -7174,6 +7698,114 @@
         },
         "x-required-scopes": [
           "payments:write"
+        ]
+      }
+    },
+    "/v1/organizations/{organizationId}/payments/subscription/commands/{kind}/{reference}": {
+      "get": {
+        "summary": "Read one saved subscription command descriptor",
+        "description": "Qualified Hosted composition only. Reads the saved original command and its local workflow proof without resuming it, registering pricing, refreshing native objects or writing financial state. Start lifecycle and scheduled cancellation do not prove the target ended. A missing command is not proof of no effect or completed reconciliation. No query parameters are accepted. Source epoch and payer authority are qualified separately.",
+        "responses": {
+          "200": {
+            "description": "Saved original command descriptor",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SubscriptionCommandReceiptResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid kind, encoded reference or query parameter",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong Organization or wallet:read scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Qualified receipt capability or stored command absent; no terminal proof",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Saved command schema or proof unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "organizationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          {
+            "name": "kind",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "start",
+                "cancel",
+                "plan-change"
+              ]
+            }
+          },
+          {
+            "name": "reference",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+              "description": "Opaque, non-reusable Organization billing reference; URL-encode it as one path component."
+            }
+          }
+        ],
+        "x-required-scopes": [
+          "wallet:read"
         ]
       }
     },

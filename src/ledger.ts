@@ -81,6 +81,56 @@ export class LedgerError extends Error {
 export const WALLET_ENTRY_PAGE = 100;
 
 const stripeRefundSchemaCache = new WeakMap<Sql, Promise<boolean>>();
+const stripeInvoiceGrantSchemaCache = new WeakMap<Sql, Promise<boolean>>();
+
+/**
+ * Refund fixtures and legacy schemas can lack grant proofs independently.
+ * Never emit an invoice-period query merely because refund/fence tables exist.
+ */
+export async function stripeInvoiceGrantSchemaReady(sql: Sql): Promise<boolean> {
+  const cached = stripeInvoiceGrantSchemaCache.get(sql);
+  if (cached) return cached;
+  const ready = (async () => {
+    const tables = await sql.query(
+      "SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'stripe_billing_grants'",
+    );
+    if (tables.length === 0) return false;
+    const columns = new Set(
+      (await sql.query("PRAGMA table_info(stripe_billing_grants)")).map((row) => row.name),
+    );
+    if (
+      !["org_id", "funding_ref", "source_type", "period_start", "period_end"].every((column) =>
+        columns.has(column),
+      )
+    )
+      throw new LedgerError("conservation_violated");
+    return true;
+  })();
+  stripeInvoiceGrantSchemaCache.set(sql, ready);
+  try {
+    const present = await ready;
+    // A later additive migration on a legacy test/operator connection must be observed.
+    if (!present) stripeInvoiceGrantSchemaCache.delete(sql);
+    return present;
+  } catch (error) {
+    stripeInvoiceGrantSchemaCache.delete(sql);
+    throw error;
+  }
+}
+
+/** Canonical current service-period eligibility for a lot aliased as l. */
+export const invoiceCreditPeriodEligibleSql = `NOT EXISTS (
+  SELECT 1 FROM stripe_billing_grants g
+  WHERE g.org_id = l.org_id AND g.funding_ref = l.ref AND g.source_type = 'invoice'
+    AND (g.period_start IS NULL OR g.period_end IS NULL OR g.period_start >= g.period_end
+      OR strftime('%Y-%m-%dT%H:%M:%fZ', g.period_start) IS NOT g.period_start
+      OR strftime('%Y-%m-%dT%H:%M:%fZ', g.period_end) IS NOT g.period_end
+      OR g.period_start > ? OR g.period_end <= ?)
+)`;
+
+export function invoiceCreditPeriodEligibleParams(instant: string) {
+  return [instant, instant] as const;
+}
 
 /** A local invoice proof is paid until its consideration is fully refunded.
  * An active refund fence also blocks a Free escape while settlement is pending.
@@ -287,12 +337,14 @@ export function createLedger(
   return {
     async wallet(organizationId): Promise<Wallet> {
       const refundsReady = await stripeRefundSchemaReady(sql);
+      const invoiceGrantsReady = await stripeInvoiceGrantSchemaReady(sql);
       const instant = clock().toISOString();
       const totals = await sql.query(
         `SELECT
            COALESCE((
              SELECT SUM(CASE
                WHEN (l.expires_at IS NULL OR l.expires_at > ?)
+                 ${invoiceGrantsReady ? `AND ${invoiceCreditPeriodEligibleSql}` : ""}
                  ${hostedPaidFreeExclusion ? `AND NOT (l.consumption_class = 'free' AND ${hostedPaidFreeBlockedSql})` : ""} THEN
                  l.amount_micros - COALESCE((
                    SELECT SUM(a.amount_micros)
@@ -338,12 +390,14 @@ export function createLedger(
                          WHERE r.org_id = l.org_id AND r.funding_ref = l.ref), 0)))
              FROM wallet_credit_lots l JOIN stripe_billing_fences f
                ON f.org_id = l.org_id AND f.funding_ref = l.ref AND f.active = 1
-             WHERE l.org_id = ? AND (l.expires_at IS NULL OR l.expires_at > ?)), 0)`
+             WHERE l.org_id = ? AND (l.expires_at IS NULL OR l.expires_at > ?)
+               ${invoiceGrantsReady ? `AND ${invoiceCreditPeriodEligibleSql}` : ""}), 0)`
                : "0"
 } AS frozen`,
         refundsReady
           ? [
               instant,
+              ...(invoiceGrantsReady ? invoiceCreditPeriodEligibleParams(instant) : []),
               ...(hostedPaidFreeExclusion
                 ? hostedPaidFreeBlockedParams(organizationId, instant)
                 : []),
@@ -353,9 +407,11 @@ export function createLedger(
               organizationId,
               organizationId,
               instant,
+              ...(invoiceGrantsReady ? invoiceCreditPeriodEligibleParams(instant) : []),
             ]
           : [
               instant,
+              ...(invoiceGrantsReady ? invoiceCreditPeriodEligibleParams(instant) : []),
               ...(hostedPaidFreeExclusion
                 ? hostedPaidFreeBlockedParams(organizationId, instant)
                 : []),
@@ -479,6 +535,7 @@ export function createLedger(
       }
       const createdAt = clock().toISOString();
       const refundsReady = await stripeRefundSchemaReady(sql);
+      const invoiceGrantsReady = await stripeInvoiceGrantSchemaReady(sql);
       const guardId = `guard_${crypto.randomUUID()}`;
       const paidFreeGuard = hostedPaidFreeExclusion && consumptionClass === "free";
       const eligibilityGuardId = `${guardId}_free`;
@@ -541,6 +598,7 @@ export function createLedger(
                   SELECT
                     COALESCE((SELECT SUM(CASE
                       WHEN (l.expires_at IS NULL OR l.expires_at > ?)
+                        ${invoiceGrantsReady ? `AND ${invoiceCreditPeriodEligibleSql}` : ""}
                         ${hostedPaidFreeExclusion ? `AND NOT (l.consumption_class = 'free' AND ${hostedPaidFreeBlockedSql})` : ""} THEN
                         l.amount_micros - COALESCE((
                           SELECT SUM(a.amount_micros) FROM wallet_credit_allocations a
@@ -575,6 +633,7 @@ export function createLedger(
               fundingRef,
               amountMicros,
               createdAt,
+              ...(invoiceGrantsReady ? invoiceCreditPeriodEligibleParams(createdAt) : []),
               ...(hostedPaidFreeExclusion
                 ? hostedPaidFreeBlockedParams(organizationId, createdAt)
                 : []),
@@ -840,6 +899,7 @@ export function createLedger(
     allocationAdmission?: LedgerAllocationAdmission,
   ): Promise<number> {
     const refundsReady = await stripeRefundSchemaReady(sql);
+    const invoiceGrantsReady = await stripeInvoiceGrantSchemaReady(sql);
     const rows = await sql.query(
       `SELECT COALESCE(SUM(l.amount_micros - COALESCE((
          SELECT SUM(a.amount_micros) FROM wallet_credit_allocations a
@@ -852,6 +912,7 @@ export function createLedger(
 }), 0) AS available
        FROM wallet_credit_lots l
        WHERE l.org_id = ? AND (l.expires_at IS NULL OR l.expires_at > ?)
+       ${invoiceGrantsReady ? `AND ${invoiceCreditPeriodEligibleSql}` : ""}
        ${allocationEligibilitySql(allocationAdmission, refundsReady)}
        ${hostedPaidFreeExclusion ? `AND NOT (l.consumption_class = 'free' AND ${hostedPaidFreeBlockedSql})` : ""}
        ${
@@ -863,6 +924,7 @@ export function createLedger(
       [
         organizationId,
         now,
+        ...(invoiceGrantsReady ? invoiceCreditPeriodEligibleParams(now) : []),
         ...(hostedPaidFreeExclusion ? hostedPaidFreeBlockedParams(organizationId, now) : []),
       ],
     );
@@ -1116,6 +1178,7 @@ export async function prepareLedgerAllocation(
   },
 ): Promise<readonly SqlStatement[]> {
   const refundsReady = await stripeRefundSchemaReady(sql);
+  const invoiceGrantsReady = await stripeInvoiceGrantSchemaReady(sql);
   const {
     organizationId,
     type,
@@ -1160,6 +1223,7 @@ export async function prepareLedgerAllocation(
        LEFT JOIN wallet_credit_allocations a
          ON a.org_id = l.org_id AND a.lot_ref = l.ref
        WHERE l.org_id = ? AND (l.expires_at IS NULL OR l.expires_at > ?)
+         ${invoiceGrantsReady ? `AND ${invoiceCreditPeriodEligibleSql}` : ""}
          ${allocationEligibilitySql(allocationAdmission, refundsReady)}
          ${hostedPaidFreeExclusion ? `AND NOT (l.consumption_class = 'free' AND ${hostedPaidFreeBlockedSql})` : ""}
          ${
@@ -1176,6 +1240,7 @@ export async function prepareLedgerAllocation(
     [
       organizationId,
       now,
+      ...(invoiceGrantsReady ? invoiceCreditPeriodEligibleParams(now) : []),
       ...(hostedPaidFreeExclusion ? hostedPaidFreeBlockedParams(organizationId, now) : []),
     ],
   );
@@ -1205,6 +1270,7 @@ export async function prepareLedgerAllocation(
                   : "0"
               }
               FROM wallet_credit_lots l WHERE l.org_id = ? AND l.ref = ?
+                ${invoiceGrantsReady ? `AND ${invoiceCreditPeriodEligibleSql}` : ""}
                 ${allocationEligibilitySql(allocationAdmission, refundsReady)}
                 ${hostedPaidFreeExclusion ? `AND NOT (consumption_class = 'free' AND ${hostedPaidFreeBlockedSql})` : ""}
                 ${
@@ -1226,6 +1292,7 @@ export async function prepareLedgerAllocation(
       ...(refundsReady ? [organizationId, allocation.lotRef] : []),
       organizationId,
       allocation.lotRef,
+      ...(invoiceGrantsReady ? invoiceCreditPeriodEligibleParams(now) : []),
       ...(hostedPaidFreeExclusion ? hostedPaidFreeBlockedParams(organizationId, now) : []),
       ...(refundsReady ? [organizationId, allocation.lotRef] : []),
       allocation.amount,

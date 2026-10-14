@@ -52,6 +52,10 @@ import {
   SubscriptionPlanChangeError,
   type SubscriptionPlanChangeReceipt,
 } from "./stripe-subscription-plan-change.ts";
+import {
+  SubscriptionCommandReceiptError,
+  type SubscriptionCommandReceipts,
+} from "./subscription-command-receipts.ts";
 import { formSupportProfile } from "./takoform/forms.ts";
 import { isSpaceId } from "./takoform/space-id.ts";
 import type { OperationListing, ResourceListing } from "./takoform/store.ts";
@@ -238,6 +242,8 @@ export interface CreateControlRoutesOptions {
   readonly subscriptionCustody?: CustodiedSubscriptionPayments;
   /** Serve plan changes only when the owning custody adapter has qualified this capability. */
   readonly subscriptionPlans?: SubscriptionPlanPayments;
+  /** Saved local descriptors from the owning qualified Hosted payment composition. */
+  readonly subscriptionCommandReceipts?: SubscriptionCommandReceipts;
   readonly creditFunding?: PaymentEvents["creditFunding"];
   readonly clock: Clock;
   /** Exact browser console origin allowed to carry the HttpOnly session cookie. */
@@ -998,6 +1004,28 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       });
       if (!receipt) controlError("not_found", 404);
       return Response.json(receipt);
+    }
+
+    const subscriptionCommand =
+      /^\/v1\/organizations\/([^/]+)\/payments\/subscription\/commands\/([^/]+)\/([^/]+)$/u.exec(
+        url.pathname,
+      );
+    if (request.method === "GET" && subscriptionCommand) {
+      const organizationId = segment(subscriptionCommand[1]);
+      await scoped(request, organizationId, "wallet:read");
+      if (!options.hostedBilling || !options.subscriptionCommandReceipts)
+        controlError("not_found", 404);
+      if (url.searchParams.size !== 0) controlError("invalid_argument", 400);
+      const kind = segment(subscriptionCommand[2]);
+      if (kind !== "start" && kind !== "cancel" && kind !== "plan-change")
+        controlError("invalid_argument", 400);
+      const receipt = await options.subscriptionCommandReceipts.read({
+        organizationId,
+        kind,
+        reference: billingPathReference(subscriptionCommand[3]),
+      });
+      if (!receipt) controlError("not_found", 404);
+      return Response.json({ receipt });
     }
 
     const subscription = /^\/v1\/organizations\/([^/]+)\/payments\/subscription$/u.exec(
@@ -1834,6 +1862,10 @@ function classify(error: unknown): { code: string; status: number } {
   if (error instanceof ControlError) return { code: error.code, status: error.status };
   if (error instanceof PersonalOrganizationError)
     return { code: "billing_unavailable", status: 503 };
+  if (error instanceof SubscriptionCommandReceiptError)
+    return error.code === "invalid_argument"
+      ? { code: "invalid_argument", status: 400 }
+      : { code: "billing_unavailable", status: 503 };
   if (error instanceof OrgTopUpError) {
     return error.code === "invalid_argument"
       ? { code: "invalid_argument", status: 400 }

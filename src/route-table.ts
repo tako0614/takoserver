@@ -301,6 +301,11 @@ export const ROUTES: readonly RouteDeclaration[] = [
     operation: "readSubscription",
   },
   {
+    method: "get",
+    pattern: "/v1/organizations/{organizationId}/payments/subscription/commands/{kind}/{reference}",
+    operation: "readSubscriptionCommandReceipt",
+  },
+  {
     method: "post",
     pattern: "/v1/organizations/{organizationId}/payments/subscription",
     operation: "beginSubscription",

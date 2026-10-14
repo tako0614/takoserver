@@ -1,6 +1,10 @@
 import { bytesDigest, canonicalJson } from "./json.ts";
 import type { Clock, Row, Sql, SqlParam, SqlStatement } from "./ports.ts";
 import type { StripeBillingClient, StripeBillingObject } from "./stripe-billing-client.ts";
+import type {
+  SubscriptionCancellationCommandDescriptor,
+  SubscriptionPlanCommandDescriptor,
+} from "./subscription-command-receipts.ts";
 
 const PURPOSE = "hosted_subscription";
 const REF = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
@@ -55,6 +59,10 @@ export type SubscriptionPlanChangeReceipt =
 export type SubscriptionPlanCancellationReceipt =
   | { readonly state: "pending"; readonly subscriptionRef: string }
   | { readonly state: "verified"; readonly subscriptionRef: string; readonly effectiveAt: string };
+
+export type SubscriptionExtensionCommandDescriptor =
+  | SubscriptionCancellationCommandDescriptor
+  | SubscriptionPlanCommandDescriptor;
 
 /**
  * This seam must be composed by the owner of the existing subscription custody.
@@ -509,6 +517,256 @@ export function createSubscriptionPlanChanges(options: {
   }
   async function fingerprint(input: Record<string, unknown>): Promise<string> {
     return await bytesDigest(new TextEncoder().encode(canonicalJson([realm, input])));
+  }
+  async function retainedCommand(row: Row): Promise<Command> {
+    const command = commandFrom(row),
+      desired = object(json<unknown>(row.desired_json));
+    const target = command.frozen.target;
+    if (
+      desired.organizationId !== command.organizationId ||
+      desired.reference !== command.reference ||
+      desired.kind !== command.kind ||
+      desired.expectedSubscriptionRef !== target.subscriptionRef ||
+      row.expected_subscription_ref !== target.subscriptionRef ||
+      !TARGET_REF.test(target.subscriptionRef) ||
+      target.terms.organizationId !== command.organizationId ||
+      row.subscription_id !== target.terms.subscriptionId ||
+      Number(row.expected_generation) !== target.generation ||
+      !Number.isSafeInteger(target.generation) ||
+      target.generation < 0 ||
+      target.periodStart >= target.periodEnd ||
+      !Number.isSafeInteger(target.billingCycleAnchor) ||
+      target.billingCycleAnchor <= 0 ||
+      !/^sub_[A-Za-z0-9_]+$/u.test(target.terms.subscriptionId) ||
+      !/^cus_[A-Za-z0-9_]+$/u.test(target.terms.customerId) ||
+      typeof target.cancelAtPeriodEnd !== "boolean" ||
+      typeof target.unresolvedSettlement !== "boolean" ||
+      command.fingerprint !== (await fingerprint(desired)) ||
+      (command.state === "pending" && command.receipt !== null)
+    )
+      fail("subscription_command_unavailable", 503);
+    time(target.periodStart);
+    time(target.periodEnd);
+    time(target.originalEffectiveAt);
+    if (target.originalEffectiveAt > target.periodStart)
+      fail("subscription_command_unavailable", 503);
+    assertPlan(target.terms);
+    const original = (
+      await sql.query(
+        `SELECT terms_json FROM stripe_billing_subscription_terms t
+      WHERE subscription_id=? AND org_id=? AND effective_at<=?
+      AND NOT EXISTS(SELECT 1 FROM stripe_billing_subscription_term_revocations r WHERE r.subscription_id=t.subscription_id AND r.effective_at=t.effective_at AND r.released_at<t.effective_at)
+      ORDER BY effective_at DESC LIMIT 1`,
+        [target.terms.subscriptionId, command.organizationId, target.periodStart],
+      )
+    )[0];
+    if (original?.terms_json !== canonicalJson(target.terms))
+      fail("subscription_command_unavailable", 503);
+    if (command.kind === "plan-change") {
+      const plan = command.frozen.plan;
+      if (
+        !plan ||
+        plan.planKey !== desired.planKey ||
+        command.frozen.effectiveAt !== target.periodEnd
+      )
+        fail("subscription_command_unavailable", 503);
+      assertPlan(plan);
+      if (command.state === "verified") {
+        const receipt = command.receipt as SubscriptionPlanChangeReceipt | null;
+        if (
+          receipt?.state !== "verified" ||
+          receipt.subscriptionRef !== target.subscriptionRef ||
+          !("pendingChange" in receipt) ||
+          canonicalJson(receipt.pendingChange) !==
+            canonicalJson({
+              planKey: plan.planKey,
+              pricingRevision: plan.pricingRevision,
+              effectiveAt: target.periodEnd,
+            })
+        )
+          fail("subscription_command_unavailable", 503);
+      }
+    } else {
+      if (
+        !command.frozen.pendingReference ||
+        !REF.test(command.frozen.pendingReference) ||
+        !command.frozen.scheduleId ||
+        !command.frozen.effectiveAt ||
+        command.frozen.custodyRequestKeyDigest !==
+          (
+            await bytesDigest(
+              new TextEncoder().encode(canonicalJson([command.organizationId, command.reference])),
+            )
+          ).slice("sha256:".length)
+      )
+        fail("subscription_command_unavailable", 503);
+      time(command.frozen.effectiveAt);
+      if (command.state === "verified") {
+        const receipt = command.receipt as SubscriptionPlanCancellationReceipt | null;
+        if (
+          receipt?.state !== "verified" ||
+          receipt.subscriptionRef !== target.subscriptionRef ||
+          !("effectiveAt" in receipt)
+        )
+          fail("subscription_command_unavailable", 503);
+        time(receipt.effectiveAt);
+      }
+    }
+    return command;
+  }
+  async function readCommand(
+    organizationId: string,
+    reference: string,
+    kind: "cancel" | "plan-change",
+  ): Promise<SubscriptionExtensionCommandDescriptor | null> {
+    if (
+      typeof organizationId !== "string" ||
+      !REF.test(organizationId) ||
+      typeof reference !== "string" ||
+      !REF.test(reference) ||
+      (kind !== "cancel" && kind !== "plan-change")
+    )
+      fail("invalid_argument", 400);
+    const row = (
+      await sql.query(
+        "SELECT * FROM stripe_billing_plan_changes WHERE org_id=? AND reference=? AND kind=?",
+        [organizationId, reference, kind],
+      )
+    )[0];
+    if (!row) return null;
+    try {
+      const command = await retainedCommand(row),
+        target = command.frozen.target;
+      let lifecycle: SubscriptionPlanCommandDescriptor["lifecycle"] =
+        command.state === "pending" ? "pending" : "scheduled";
+      const effectiveAt =
+        kind === "plan-change"
+          ? (command.frozen.effectiveAt ?? null)
+          : command.state === "verified"
+            ? (
+                command.receipt as Extract<
+                  SubscriptionPlanCancellationReceipt,
+                  { state: "verified" }
+                >
+              ).effectiveAt
+            : null;
+      if (kind === "plan-change" && command.state === "verified") {
+        const term = (
+          await sql.query(
+            "SELECT terms_json,command_reference FROM stripe_billing_subscription_terms WHERE subscription_id=? AND org_id=? AND effective_at=?",
+            [target.terms.subscriptionId, organizationId, command.frozen.effectiveAt ?? null],
+          )
+        )[0];
+        if (
+          term?.command_reference !== reference ||
+          term.terms_json !== canonicalJson({ ...target.terms, ...command.frozen.plan })
+        )
+          fail("subscription_command_unavailable", 503);
+        const created = await byStep(command, "create");
+        const expectedStep = async (owner: Command, name: string) => {
+          const proof = await byStep(owner, name);
+          if (proof?.state !== "verified") return null;
+          const key = `takos-plan-${await fingerprint({ org: owner.organizationId, reference: owner.reference, step: name })}`;
+          if (
+            !created?.remoteId ||
+            created.state !== "verified" ||
+            proof.key !== key ||
+            proof.remoteId !== created.remoteId ||
+            proof.response?.id !== created.remoteId ||
+            proof.response.livemode !== false ||
+            id(proof.response.customer) !== target.terms.customerId ||
+            canonicalJson(proof.request) !== canonicalJson({ preserve_cancel_date: "true" })
+          )
+            fail("subscription_command_unavailable", 503);
+          return proof.response;
+        };
+        const activation = await expectedStep(command, "activation-release");
+        let activated = false;
+        if (activation) {
+          if (
+            !["released", "completed"].includes(String(activation.status)) ||
+            activation.end_behavior !== "release" ||
+            (activation.status === "released" &&
+              id(activation.released_subscription) !== target.terms.subscriptionId) ||
+            (activation.subscription != null &&
+              id(activation.subscription) !== target.terms.subscriptionId)
+          )
+            fail("subscription_command_unavailable", 503);
+          activated = true;
+        }
+        let revoked = false;
+        const revocations = await sql.query(
+          "SELECT reference,released_at FROM stripe_billing_subscription_term_revocations WHERE subscription_id=? AND org_id=? AND effective_at=?",
+          [target.terms.subscriptionId, organizationId, command.frozen.effectiveAt ?? null],
+        );
+        for (const revocation of revocations) {
+          const cancelRow = (
+            await sql.query(
+              "SELECT * FROM stripe_billing_plan_changes WHERE org_id=? AND reference=? AND kind='cancel'",
+              [organizationId, String(revocation.reference)],
+            )
+          )[0];
+          if (!cancelRow) fail("subscription_command_unavailable", 503);
+          const cancel = await retainedCommand(cancelRow);
+          if (
+            cancel.frozen.pendingReference !== reference ||
+            cancel.frozen.scheduleId !== created?.remoteId ||
+            cancel.frozen.effectiveAt !== command.frozen.effectiveAt ||
+            cancel.frozen.target.subscriptionRef !== target.subscriptionRef ||
+            cancel.frozen.target.terms.subscriptionId !== target.terms.subscriptionId ||
+            cancel.frozen.target.terms.customerId !== target.terms.customerId
+          )
+            fail("subscription_command_unavailable", 503);
+          const release = await expectedStep(cancel, "release");
+          if (
+            release?.status !== "released" ||
+            release.subscription != null ||
+            id(release.released_subscription) !== target.terms.subscriptionId ||
+            !Number.isSafeInteger(release.released_at) ||
+            Number(release.released_at) <= 0 ||
+            new Date(Number(release.released_at) * 1000).toISOString() !== revocation.released_at ||
+            String(revocation.released_at) >= String(command.frozen.effectiveAt)
+          )
+            fail("subscription_command_unavailable", 503);
+          revoked = true;
+        }
+        if (activated && revoked) fail("subscription_command_unavailable", 503);
+        lifecycle = revoked ? "revoked" : activated ? "activated" : "scheduled";
+      }
+      const original = {
+        organizationId,
+        reference,
+        state: command.state,
+        subscriptionRef: target.subscriptionRef,
+      };
+      if (kind === "cancel")
+        return {
+          ...original,
+          kind,
+          planKey: target.terms.planKey,
+          pricingRevision: target.terms.pricingRevision,
+          effectiveAt,
+          lifecycle: command.state === "pending" ? "pending" : "scheduled",
+        };
+      const plan = command.frozen.plan;
+      if (!plan || !effectiveAt) fail("subscription_command_unavailable", 503);
+      return {
+        ...original,
+        kind,
+        planKey: plan.planKey,
+        pricingRevision: plan.pricingRevision,
+        effectiveAt,
+        pendingChange:
+          command.state === "verified"
+            ? (command.receipt as Extract<SubscriptionPlanChangeReceipt, { state: "verified" }>)
+                .pendingChange
+            : null,
+        lifecycle,
+      };
+    } catch (error) {
+      if (error instanceof SubscriptionPlanChangeError) throw error;
+      fail("subscription_command_unavailable", 503);
+    }
   }
   function validateInput(input: {
     organizationId: string;
@@ -1237,6 +1495,7 @@ export function createSubscriptionPlanChanges(options: {
     };
   }
   return {
+    readCommand,
     verifyPeriodTerms,
     reconcileActivation,
     reconcilePending,

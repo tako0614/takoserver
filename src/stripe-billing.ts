@@ -33,6 +33,7 @@ import {
   SubscriptionPlanChangeError,
 } from "./stripe-subscription-plan-change.ts";
 import { assertTopUpSessionCommand, frozenTopUpExpiry } from "./stripe-top-up-client.ts";
+import { createSubscriptionCommandReceipts } from "./subscription-command-receipts.ts";
 import {
   type Association,
   type CancellationReceipt,
@@ -804,6 +805,10 @@ export function createStripeBilling(options: {
     validateCharge(charge, consideration);
     if (identifier(charge.invoice, "in") !== id || identifier(charge.customer, "cus") !== customer)
       refuse("wrong_charge");
+    // Payment proves cash collection, not that this service period has begun.
+    // Keep the verified original invoice deferred so reconciliation can grant
+    // its frozen period exactly once when its start is reached.
+    if (periodStart > now()) refuse("invoice_period_not_started");
     return {
       organizationId: org,
       fundingRef: `stripe:invoice:${id}`,
@@ -1205,6 +1210,8 @@ export function createStripeBilling(options: {
       }
       return { outcome: "ignored", detail: "unsupported" };
     } catch (error) {
+      if (error instanceof StripeBillingStoreError && error.code === "invoice_period_not_started")
+        return { outcome: "deferred", detail: error.code };
       if (error instanceof SubscriptionPlanChangeError)
         return { outcome: "deferred", detail: "subscription_terms_unresolved" };
       if (error instanceof Quarantine) {
@@ -1258,6 +1265,7 @@ export function createStripeBilling(options: {
     planTable: pricing.hostedPlanTable,
     async read(org) {
       await ready();
+      const instant = now();
       const row = (
         await sql.query(
           `SELECT s.*,
@@ -1267,10 +1275,16 @@ export function createStripeBilling(options: {
                 AND NOT EXISTS (SELECT 1 FROM stripe_billing_refunds r
                   WHERE r.org_id = g.org_id AND r.funding_ref = g.funding_ref
                     AND r.cumulative_refunded_micros >= g.consideration_micros)) AS paid_coverage,
+             EXISTS (SELECT 1 FROM stripe_billing_grants g
+              WHERE g.org_id = s.org_id AND g.subscription_id = s.subscription_id
+                AND g.source_type = 'invoice' AND g.period_start <= ? AND g.period_end > ?
+                AND NOT EXISTS (SELECT 1 FROM stripe_billing_refunds r
+                  WHERE r.org_id = g.org_id AND r.funding_ref = g.funding_ref
+                    AND r.cumulative_refunded_micros >= g.consideration_micros)) AS active_paid_coverage,
              (SELECT COALESCE(SUM(r.receivable_micros), 0) FROM stripe_billing_refunds r
               WHERE r.org_id = s.org_id) AS refund_debt
            FROM stripe_billing_subscriptions s WHERE s.org_id = ?`,
-          [org],
+          [instant, instant, org],
         )
       )[0];
       if (!row) return null;
@@ -1330,6 +1344,7 @@ export function createStripeBilling(options: {
       paidThrough,
       paidFeatures:
         row.status === "active" &&
+        Number(row.active_paid_coverage) === 1 &&
         paidThrough !== null &&
         paidThrough > now() &&
         Number(row.refund_debt) === 0,
@@ -1588,6 +1603,14 @@ export function createStripeBilling(options: {
   return {
     subscriptions,
     subscriptionPlans: extensions?.plans,
+    subscriptionCommandReceipts:
+      options.realm && extensions
+        ? createSubscriptionCommandReceipts({
+            readStart: custody.readStartCommand,
+            readNativeCancel: custody.readCancelCommand,
+            readExtension: extensions.plans.readCommand,
+          })
+        : undefined,
     handlers,
     creditFunding,
     reconcile,

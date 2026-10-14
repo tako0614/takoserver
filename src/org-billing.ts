@@ -8,9 +8,12 @@ import { base64UrlDecode, base64UrlEncode, canonicalJson } from "./json.ts";
 import {
   hostedPaidFreeBlockedParams,
   hostedPaidFreeBlockedSql,
+  invoiceCreditPeriodEligibleParams,
+  invoiceCreditPeriodEligibleSql,
   type Ledger,
   LedgerError,
   prepareLedgerAllocation,
+  stripeInvoiceGrantSchemaReady,
   stripeRefundSchemaReady,
   type Wallet,
 } from "./ledger.ts";
@@ -571,6 +574,7 @@ export function createOrgBilling(options: {
     },
     async lots(org, limit = 100, cursor) {
       const refundSchema = await refundsReady();
+      const invoiceGrantsReady = await stripeInvoiceGrantSchemaReady(sql);
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)
         orgBillingFail("invalid_limit", 400);
       let after: Row | undefined;
@@ -624,7 +628,8 @@ export function createOrgBilling(options: {
               ? `EXISTS (SELECT 1 FROM stripe_billing_fences f
              WHERE f.org_id = l.org_id AND f.funding_ref = l.ref AND f.active = 1)`
               : "0"
-          } AS frozen
+          } AS frozen,
+          ${invoiceGrantsReady ? invoiceCreditPeriodEligibleSql : "1"} AS invoice_period_eligible
          FROM (SELECT * FROM wallet_credit_lots WHERE org_id = ? ${boundary}
            ORDER BY CASE consumption_class WHEN 'free' THEN 0 WHEN 'subscription' THEN 1 ELSE 2 END,
              CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END, expires_at, created_at, ref LIMIT ?) l
@@ -634,6 +639,7 @@ export function createOrgBilling(options: {
            CASE WHEN l.expires_at IS NULL THEN 1 ELSE 0 END, l.expires_at, l.created_at, l.ref`,
         after
           ? [
+              ...(invoiceGrantsReady ? invoiceCreditPeriodEligibleParams(instant) : []),
               org,
               classRank,
               nullableRank,
@@ -642,7 +648,11 @@ export function createOrgBilling(options: {
               String(after.ref),
               limit + 1,
             ]
-          : [org, limit + 1],
+          : [
+              ...(invoiceGrantsReady ? invoiceCreditPeriodEligibleParams(instant) : []),
+              org,
+              limit + 1,
+            ],
       );
       const page = rows.slice(0, limit);
       const last = page.at(-1);
@@ -664,6 +674,7 @@ export function createOrgBilling(options: {
           frozen: Number(row.frozen) === 1,
           availableMicros:
             !Number(row.frozen) &&
+            Number(row.invoice_period_eligible) === 1 &&
             !(hostedPaidFreeExclusion && row.consumption_class === "free" && paidFreeBlocked) &&
             (row.expires_at == null || String(row.expires_at) > instant)
               ? remainingMicros - heldMicros

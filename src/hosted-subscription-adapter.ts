@@ -3,7 +3,7 @@ import {
   assertHostedBillingFinancialRealm,
   type HostedBillingFinancialRealm,
 } from "./hosted-billing-realm.ts";
-import { canonicalJson } from "./json.ts";
+import { canonicalDigest, canonicalJson } from "./json.ts";
 import type { Sql } from "./ports.ts";
 import {
   assertStripeBillingSubscriptionExtensionContext,
@@ -183,6 +183,67 @@ export function createHostedSubscriptionAdapter(options: {
   qualified();
   let plans: ReturnType<typeof createSubscriptionPlanChanges>;
 
+  async function cancellationOwnership(
+    organizationId: string,
+    reference: string,
+    expectedSubscriptionRef: string,
+  ) {
+    const native = await custody.readCancelCommand(organizationId, reference);
+    const phase = await plans.readCommand(organizationId, reference, "cancel");
+    if (native && phase && native.subscriptionRef !== phase.subscriptionRef)
+      fail("subscription_command_unavailable", 503);
+    if (
+      (native && native.subscriptionRef !== expectedSubscriptionRef) ||
+      (phase && phase.subscriptionRef !== expectedSubscriptionRef)
+    )
+      fail("subscription_management_conflict");
+    if (native && phase) {
+      if (
+        phase.state === "verified" &&
+        (native.state !== "verified" || phase.effectiveAt !== native.effectiveAt)
+      )
+        fail("subscription_command_unavailable", 503);
+      const proof = (
+        await sql.query(
+          `SELECT c.frozen_json,step.remote_id,step.response_json,step.request_json,step.idempotency_key,
+          n.subscription_id,n.customer_id,n.livemode,n.request_key_digest
+        FROM stripe_billing_plan_changes c JOIN stripe_billing_plan_change_steps step ON step.org_id=c.org_id AND step.reference=c.reference
+        JOIN stripe_subscription_cancellation_intents n ON n.org_id=c.org_id AND n.request_key_digest=json_extract(c.frozen_json,'$.custodyRequestKeyDigest')
+        WHERE c.org_id=? AND c.reference=? AND c.kind='cancel' AND step.step='release' AND step.state='verified'`,
+          [organizationId, reference],
+        )
+      )[0];
+      if (!proof) fail("subscription_command_unavailable", 503);
+      const frozen = object(JSON.parse(String(proof.frozen_json))),
+        target = object(frozen.target),
+        terms = object(target.terms),
+        response = object(JSON.parse(String(proof.response_json)));
+      const key = `takos-plan-${await canonicalDigest([realm, { org: organizationId, reference, step: "release" }])}`;
+      if (
+        target.subscriptionRef !== native.subscriptionRef ||
+        terms.organizationId !== organizationId ||
+        terms.subscriptionId !== proof.subscription_id ||
+        terms.customerId !== proof.customer_id ||
+        proof.livemode !== 0 ||
+        frozen.custodyRequestKeyDigest !== proof.request_key_digest ||
+        frozen.scheduleId !== proof.remote_id ||
+        response.id !== proof.remote_id ||
+        response.livemode !== false ||
+        response.status !== "released" ||
+        response.subscription != null ||
+        id(response.customer) !== proof.customer_id ||
+        id(response.released_subscription) !== proof.subscription_id ||
+        !Number.isSafeInteger(response.released_at) ||
+        Number(response.released_at) <= 0 ||
+        proof.request_json !== canonicalJson({ preserve_cancel_date: "true" }) ||
+        proof.idempotency_key !== key
+      )
+        fail("subscription_command_unavailable", 503);
+      noConnect(response);
+    }
+    return { native, phase };
+  }
+
   async function ownership(subscriptionId: string): Promise<Association> {
     qualified();
     const bound = await custody.association(subscriptionId);
@@ -311,6 +372,18 @@ export function createHostedSubscriptionAdapter(options: {
         (await custody.subscriptionRef(bound)) !== target.subscriptionRef
       )
         fail("subscription_target_changed", 503);
+      const cancellation = (
+        await sql.query(
+          `SELECT c.reference FROM stripe_billing_plan_change_slots s JOIN stripe_billing_plan_changes c ON c.org_id=s.org_id AND c.reference=s.reference WHERE s.org_id=? AND c.kind='cancel'`,
+          [target.terms.organizationId],
+        )
+      )[0];
+      if (cancellation)
+        await cancellationOwnership(
+          target.terms.organizationId,
+          String(cancellation.reference),
+          target.subscriptionRef,
+        );
     },
     originalTerms,
     async readTarget(organizationId, expectedSubscriptionRef) {
@@ -401,6 +474,11 @@ export function createHostedSubscriptionAdapter(options: {
       };
     },
     async cancel(input) {
+      await cancellationOwnership(
+        input.organizationId,
+        input.reference,
+        input.expectedSubscriptionRef,
+      );
       return await custody.cancel(
         input.organizationId,
         input.reference,
@@ -424,6 +502,21 @@ export function createHostedSubscriptionAdapter(options: {
   });
   const readyPlans = {
     ...plans,
+    async cancelPendingChange(input: Parameters<typeof plans.cancelPendingChange>[0]) {
+      await context.ready();
+      const ownership = await cancellationOwnership(
+        input.organizationId,
+        input.reference,
+        input.expectedSubscriptionRef,
+      );
+      if (ownership.native && !ownership.phase)
+        return await custody.cancel(
+          input.organizationId,
+          input.reference,
+          input.expectedSubscriptionRef,
+        );
+      return await plans.cancelPendingChange(input);
+    },
     async change(input: Parameters<typeof plans.change>[0]) {
       await context.ready();
       return await plans.change(input);
@@ -446,6 +539,17 @@ export function createHostedSubscriptionAdapter(options: {
       await context.ready();
       qualified();
       if (input.cancelAtPeriodEnd !== true) fail("subscription_management_conflict");
+      const ownership = await cancellationOwnership(
+        input.organizationId,
+        input.reference,
+        input.expectedSubscriptionRef,
+      );
+      if (ownership.native && !ownership.phase)
+        return await custody.cancel(
+          input.organizationId,
+          input.reference,
+          input.expectedSubscriptionRef,
+        );
       const existing = (
         await sql.query(
           "SELECT kind,desired_json FROM stripe_billing_plan_changes WHERE org_id=? AND reference=?",

@@ -5,6 +5,7 @@ import {
 } from "./artifact-consumer-repair.ts";
 import { RESOURCE_EXECUTION_EVIDENCE_FORMAT } from "./resource-execution-evidence.ts";
 import { ROUTES, TAKOFORM_LANES, TAKOFORM_ROUTES, takoformRoutePattern } from "./route-table.ts";
+import { SUBSCRIPTION_COMMAND_RECEIPT_VERSION } from "./subscription-command-receipts.ts";
 import { SPACE_ID_MAX_CODE_POINTS, SPACE_ID_PATTERN_SOURCE } from "./takoform/space-id.ts";
 import { TAKOFORM_V2_OPERATIONS, TAKOFORM_V2_SCHEMAS } from "./takoform-v2/openapi.ts";
 
@@ -99,6 +100,113 @@ const PENDING_CHANGE_SCHEMA = {
     pricingRevision: { $ref: "#/components/schemas/BillingRevision" },
     effectiveAt: { $ref: "#/components/schemas/BillingUtcDateTime" },
   },
+} as const;
+const SUBSCRIPTION_COMMAND_NULL_SCHEMA = { type: "null" } as const;
+const SUBSCRIPTION_COMMAND_PLAN_KEY_SCHEMA = {
+  type: "string",
+  minLength: 1,
+  maxLength: 64,
+} as const;
+const SUBSCRIPTION_COMMAND_REVISION_SCHEMA = {
+  $ref: "#/components/schemas/BillingRevision",
+} as const;
+const SUBSCRIPTION_COMMAND_TIME_SCHEMA = {
+  $ref: "#/components/schemas/BillingUtcDateTime",
+} as const;
+const SUBSCRIPTION_COMMAND_RECEIPT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "contractVersion",
+    "organizationId",
+    "reference",
+    "kind",
+    "state",
+    "subscriptionRef",
+    "planKey",
+    "pricingRevision",
+    "checkout",
+    "effectiveAt",
+    "pendingChange",
+    "lifecycle",
+  ],
+  properties: {
+    contractVersion: { const: SUBSCRIPTION_COMMAND_RECEIPT_VERSION },
+    organizationId: IDENTIFIER_SCHEMA,
+    reference: BILLING_REFERENCE_SCHEMA,
+    kind: { enum: ["start", "cancel", "plan-change"] },
+    state: { enum: ["pending", "open", "associated", "expired", "invalidated", "verified"] },
+    subscriptionRef: { anyOf: [SUBSCRIPTION_REF_SCHEMA, SUBSCRIPTION_COMMAND_NULL_SCHEMA] },
+    planKey: { anyOf: [SUBSCRIPTION_COMMAND_PLAN_KEY_SCHEMA, SUBSCRIPTION_COMMAND_NULL_SCHEMA] },
+    pricingRevision: {
+      anyOf: [SUBSCRIPTION_COMMAND_REVISION_SCHEMA, SUBSCRIPTION_COMMAND_NULL_SCHEMA],
+    },
+    checkout: { anyOf: [CHECKOUT_URL_SCHEMA, SUBSCRIPTION_COMMAND_NULL_SCHEMA] },
+    effectiveAt: { anyOf: [SUBSCRIPTION_COMMAND_TIME_SCHEMA, SUBSCRIPTION_COMMAND_NULL_SCHEMA] },
+    pendingChange: { anyOf: [PENDING_CHANGE_SCHEMA, SUBSCRIPTION_COMMAND_NULL_SCHEMA] },
+    lifecycle: {
+      enum: [
+        "pending",
+        "open",
+        "associated",
+        "expired",
+        "invalidated",
+        "scheduled",
+        "activated",
+        "revoked",
+      ],
+    },
+  },
+  oneOf: [
+    ...(["pending", "open", "associated", "expired", "invalidated"] as const).map((state) => ({
+      properties: {
+        kind: { const: "start" },
+        state: { const: state },
+        lifecycle: { const: state },
+        subscriptionRef:
+          state === "associated" ? SUBSCRIPTION_REF_SCHEMA : SUBSCRIPTION_COMMAND_NULL_SCHEMA,
+        planKey: SUBSCRIPTION_COMMAND_PLAN_KEY_SCHEMA,
+        pricingRevision: SUBSCRIPTION_COMMAND_REVISION_SCHEMA,
+        checkout:
+          state === "open"
+            ? CHECKOUT_URL_SCHEMA
+            : state === "associated"
+              ? { anyOf: [CHECKOUT_URL_SCHEMA, SUBSCRIPTION_COMMAND_NULL_SCHEMA] }
+              : SUBSCRIPTION_COMMAND_NULL_SCHEMA,
+        effectiveAt: SUBSCRIPTION_COMMAND_NULL_SCHEMA,
+        pendingChange: SUBSCRIPTION_COMMAND_NULL_SCHEMA,
+      },
+    })),
+    ...(["pending", "verified"] as const).map((state) => ({
+      properties: {
+        kind: { const: "cancel" },
+        state: { const: state },
+        lifecycle: { const: state === "pending" ? "pending" : "scheduled" },
+        subscriptionRef: SUBSCRIPTION_REF_SCHEMA,
+        checkout: SUBSCRIPTION_COMMAND_NULL_SCHEMA,
+        effectiveAt:
+          state === "pending" ? SUBSCRIPTION_COMMAND_NULL_SCHEMA : SUBSCRIPTION_COMMAND_TIME_SCHEMA,
+        pendingChange: SUBSCRIPTION_COMMAND_NULL_SCHEMA,
+      },
+    })),
+    ...(["pending", "verified"] as const).map((state) => ({
+      properties: {
+        kind: { const: "plan-change" },
+        state: { const: state },
+        lifecycle:
+          state === "pending"
+            ? { const: "pending" }
+            : { enum: ["scheduled", "activated", "revoked"] },
+        subscriptionRef: SUBSCRIPTION_REF_SCHEMA,
+        planKey: SUBSCRIPTION_COMMAND_PLAN_KEY_SCHEMA,
+        pricingRevision: SUBSCRIPTION_COMMAND_REVISION_SCHEMA,
+        checkout: SUBSCRIPTION_COMMAND_NULL_SCHEMA,
+        effectiveAt: SUBSCRIPTION_COMMAND_TIME_SCHEMA,
+        pendingChange:
+          state === "pending" ? SUBSCRIPTION_COMMAND_NULL_SCHEMA : PENDING_CHANGE_SCHEMA,
+      },
+    })),
+  ],
 } as const;
 const PENDING_SUBSCRIPTION_RECEIPT_SCHEMA = {
   type: "object",
@@ -1182,6 +1290,39 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
       "503": errorResponse("Processor or durable receipt unavailable"),
     },
   }),
+  readSubscriptionCommandReceipt: described("Read one saved subscription command descriptor", {
+    "x-required-scopes": ["wallet:read"],
+    parameters: [
+      ORGANIZATION_ID_PARAMETER,
+      {
+        name: "kind",
+        in: "path",
+        required: true,
+        schema: { type: "string", enum: ["start", "cancel", "plan-change"] },
+      },
+      {
+        name: "reference",
+        in: "path",
+        required: true,
+        schema: BILLING_REFERENCE_SCHEMA,
+      },
+    ],
+    description:
+      "Qualified Hosted composition only. Reads the saved original command and its local workflow proof without resuming it, registering pricing, refreshing native objects or writing financial state. Start lifecycle and scheduled cancellation do not prove the target ended. A missing command is not proof of no effect or completed reconciliation. No query parameters are accepted. Source epoch and payer authority are qualified separately.",
+    responses: {
+      "200": billingResponse(
+        "Saved original command descriptor",
+        "SubscriptionCommandReceiptResponse",
+      ),
+      "400": errorResponse("Invalid kind, encoded reference or query parameter"),
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("Wrong Organization or wallet:read scope"),
+      "404": errorResponse(
+        "Qualified receipt capability or stored command absent; no terminal proof",
+      ),
+      "503": errorResponse("Saved command schema or proof unavailable"),
+    },
+  }),
   readSubscription: described(
     "Read hosted subscription coverage and the shared configured plan table",
     {
@@ -1969,6 +2110,15 @@ export const openApiDocument = {
           subscriptionStart: { type: "boolean" },
           subscriptionCancellation: { type: "boolean" },
           subscriptionPlanChange: { type: "boolean" },
+        },
+      },
+      SubscriptionCommandReceipt: SUBSCRIPTION_COMMAND_RECEIPT_SCHEMA,
+      SubscriptionCommandReceiptResponse: {
+        type: "object",
+        required: ["receipt"],
+        additionalProperties: false,
+        properties: {
+          receipt: { $ref: "#/components/schemas/SubscriptionCommandReceipt" },
         },
       },
       HostedPlanTable: {

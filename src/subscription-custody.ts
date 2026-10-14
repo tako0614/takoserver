@@ -6,6 +6,10 @@ import {
   type StripeBillingObject,
 } from "./stripe-billing-client.ts";
 import type { StripeMode } from "./stripe-mode-realm.ts";
+import type {
+  SubscriptionCancellationCommandDescriptor,
+  SubscriptionStartCommandDescriptor,
+} from "./subscription-command-receipts.ts";
 
 const PURPOSE = "hosted_subscription";
 const SESSION = /^cs_[A-Za-z0-9_]{1,240}$/u;
@@ -675,7 +679,7 @@ export function createSubscriptionCustody(options: {
     }
     return fail("subscription_checkout_unresolved");
   }
-  async function checkoutReceipt(intent: CheckoutIntent): Promise<CheckoutReceipt> {
+  async function assertCheckoutFingerprint(intent: CheckoutIntent): Promise<void> {
     if (
       intent.fingerprint !==
       (await hash([
@@ -690,25 +694,154 @@ export function createSubscriptionCustody(options: {
       ]))
     )
       fail("subscription_checkout_mismatch");
+  }
+  async function retainedStartAssociation(intent: CheckoutIntent): Promise<Association> {
+    if (!intent.sessionId || !SESSION.test(intent.sessionId) || !intent.subscriptionId)
+      fail("subscription_checkout_unresolved");
+    const bound = await association(intent.subscriptionId);
+    if (
+      !bound ||
+      bound.organizationId !== intent.org ||
+      bound.sessionId !== intent.sessionId ||
+      bound.customerId !== intent.customerId ||
+      bound.livemode !== intent.livemode ||
+      bound.planKey !== intent.planKey ||
+      bound.pricingRevision !== intent.revision ||
+      bound.priceId !== intent.priceId ||
+      bound.priceAmountMinor !== intent.amount ||
+      bound.includedMinor !== intent.included
+    )
+      fail("subscription_checkout_unresolved");
+    return bound;
+  }
+  function originalCommandKey(org: string, reference: string): Promise<string> {
+    const valid = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+    if (
+      typeof org !== "string" ||
+      typeof reference !== "string" ||
+      !valid.test(org) ||
+      !valid.test(reference)
+    )
+      fail("invalid_argument");
+    return hash([org, reference]);
+  }
+  /** Retained local proof only: never advance custody or call the processor. */
+  async function readStartCommand(
+    org: string,
+    reference: string,
+  ): Promise<SubscriptionStartCommandDescriptor | null> {
+    const key = await originalCommandKey(org, reference);
+    const intent = await byCheckoutKey(org, key);
+    if (!intent) return null;
+    if (intent.org !== org || intent.key !== key) fail("subscription_checkout_mismatch");
+    await assertCheckoutFingerprint(intent);
+    const base = {
+      organizationId: org,
+      reference,
+      kind: "start" as const,
+      planKey: intent.planKey,
+      pricingRevision: intent.revision,
+    };
+    const url = intent.sessionUrl?.startsWith("https://checkout.stripe.com/")
+      ? intent.sessionUrl
+      : null;
     if (intent.state === "associated") {
-      if (!intent.sessionId || !SESSION.test(intent.sessionId) || !intent.subscriptionId)
-        fail("subscription_checkout_unresolved");
-      const bound = await association(intent.subscriptionId);
+      const bound = await retainedStartAssociation(intent);
+      return {
+        ...base,
+        state: "associated" as const,
+        subscriptionRef: await subscriptionRef(bound),
+        checkout: url ? { url } : null,
+      };
+    }
+    if (intent.state === "expired") {
       if (
-        !bound ||
-        bound.organizationId !== intent.org ||
-        bound.sessionId !== intent.sessionId ||
-        bound.customerId !== intent.customerId ||
-        bound.livemode !== intent.livemode ||
-        bound.planKey !== intent.planKey ||
-        bound.pricingRevision !== intent.revision ||
-        bound.priceId !== intent.priceId ||
-        bound.priceAmountMinor !== intent.amount ||
-        bound.includedMinor !== intent.included
+        !intent.sessionId ||
+        !SESSION.test(intent.sessionId) ||
+        intent.subscriptionId ||
+        intent.conflict
       )
         fail("subscription_checkout_unresolved");
+      return { ...base, state: "expired" as const, subscriptionRef: null, checkout: null };
+    }
+    if (intent.state === "invalidated")
+      return { ...base, state: "invalidated" as const, subscriptionRef: null, checkout: null };
+    if (
+      intent.state === "session_known" &&
+      intent.sessionId &&
+      SESSION.test(intent.sessionId) &&
+      url &&
+      !intent.conflict
+    )
+      return { ...base, state: "open" as const, subscriptionRef: null, checkout: { url } };
+    if (!["prepared", "dispatched", "session_known"].includes(intent.state))
+      fail("subscription_checkout_unresolved");
+    return { ...base, state: "pending" as const, subscriptionRef: null, checkout: null };
+  }
+  /** A historical verified cancellation means scheduled, never target ended. */
+  async function readCancelCommand(
+    org: string,
+    reference: string,
+  ): Promise<SubscriptionCancellationCommandDescriptor | null> {
+    const key = await originalCommandKey(org, reference);
+    const intent = await byCancelKey(org, key);
+    if (!intent) return null;
+    const bound = await association(intent.subscriptionId);
+    if (
+      intent.org !== org ||
+      intent.key !== key ||
+      !bound ||
+      bound.organizationId !== intent.org ||
+      bound.customerId !== intent.customerId ||
+      bound.livemode !== intent.livemode ||
+      bound.planKey !== intent.planKey ||
+      bound.pricingRevision !== intent.revision ||
+      bound.priceId !== intent.priceId ||
+      bound.priceAmountMinor !== intent.amount ||
+      bound.includedMinor !== intent.included ||
+      intent.fingerprint !==
+        (await hash([
+          intent.org,
+          intent.subscriptionId,
+          intent.customerId,
+          intent.livemode,
+          intent.planKey,
+          intent.revision,
+          intent.priceId,
+          intent.amount,
+          intent.included,
+          intent.prePeriodEnd,
+          "cancel_at_period_end",
+        ]))
+    )
+      fail("subscription_management_conflict");
+    const base = {
+      organizationId: org,
+      reference,
+      kind: "cancel" as const,
+      subscriptionRef: await subscriptionRef(bound),
+      planKey: intent.planKey,
+      pricingRevision: intent.revision,
+    };
+    if (intent.state === "verified") {
+      if (!intent.effectiveAt) fail("subscription_management_unavailable");
       return {
-        id: intent.sessionId,
+        ...base,
+        state: "verified" as const,
+        effectiveAt: intent.effectiveAt,
+        lifecycle: "scheduled" as const,
+      };
+    }
+    if (!["prepared", "dispatched"].includes(intent.state) || intent.effectiveAt !== null)
+      fail("subscription_management_unavailable");
+    return { ...base, state: "pending" as const, effectiveAt: null, lifecycle: "pending" as const };
+  }
+  async function checkoutReceipt(intent: CheckoutIntent): Promise<CheckoutReceipt> {
+    await assertCheckoutFingerprint(intent);
+    if (intent.state === "associated") {
+      const bound = await retainedStartAssociation(intent);
+      return {
+        id: bound.sessionId,
         state: "associated",
         subscriptionRef: await subscriptionRef(bound),
         ...(intent.sessionUrl?.startsWith("https://checkout.stripe.com/")
@@ -1367,5 +1500,14 @@ export function createSubscriptionCustody(options: {
     unresolved = Number(outstanding?.count ?? 0);
     return { examined, applied, unresolved, truncated };
   }
-  return { begin, cancel, association, associateSession, subscriptionRef, reconcilePending };
+  return {
+    begin,
+    cancel,
+    association,
+    associateSession,
+    subscriptionRef,
+    reconcilePending,
+    readStartCommand,
+    readCancelCommand,
+  };
 }

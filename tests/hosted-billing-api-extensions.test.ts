@@ -28,8 +28,14 @@ import {
   type TopUpSession,
 } from "../src/org-top-up.ts";
 import { OrgWorkspaceUsageError } from "../src/org-workspace-usage.ts";
+import type { Sql } from "../src/ports.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
 import { SubscriptionPlanChangeError } from "../src/stripe-subscription-plan-change.ts";
+import {
+  SUBSCRIPTION_COMMAND_RECEIPT_VERSION,
+  type SubscriptionCommandReceipt,
+  SubscriptionCommandReceiptError,
+} from "../src/subscription-command-receipts.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
@@ -887,6 +893,13 @@ test("only the qualified app publishes Hosted billing capabilities and reuses it
   );
   expect(walletResponse.status).toBe(404);
   expect(await walletResponse.json()).not.toHaveProperty("billingCapabilities");
+  expect(
+    (
+      await f.request("GET", `${path}/commands/start/original`, "reader", undefined, (request) =>
+        walletApp.fetch(request),
+      )
+    ).status,
+  ).toBe(404);
 
   const legacyPayments: CustodiedSubscriptionPayments = {
     planTable: PRICING.hostedPlanTable,
@@ -917,6 +930,13 @@ test("only the qualified app publishes Hosted billing capabilities and reuses it
     subscription: null,
     planTable: PRICING.hostedPlanTable,
   });
+  expect(
+    (
+      await f.request("GET", `${path}/commands/start/original`, "reader", undefined, (request) =>
+        legacyApp.fetch(request),
+      )
+    ).status,
+  ).toBe(404);
 
   await f.sql.run("INSERT INTO stripe_mode_realm VALUES (1, 'test', ?)", [START]);
   await f.sql.run(
@@ -997,6 +1017,436 @@ test("only the qualified app publishes Hosted billing capabilities and reuses it
   expect(JSON.stringify(body)).not.toContain("launchReady");
   expect(JSON.stringify(body)).not.toContain("paymentPrerequisites");
   expect(remoteRequests.map((request) => request.method)).toEqual(["GET", "GET"]);
+});
+
+test("subscription command receipt reads authorize before lookup and reject malformed path fields", async () => {
+  const f = await fixture();
+  const calls: unknown[] = [];
+  const receiptPort = {
+    async read(input: {
+      organizationId: string;
+      kind: "start" | "cancel" | "plan-change";
+      reference: string;
+    }) {
+      calls.push(input);
+      return null;
+    },
+  };
+  const route = f.makeRoute({ subscriptionCommandReceipts: receiptPort });
+  const prefix = `/v1/organizations/${f.org}/payments/subscription/commands`;
+  for (const [token, status] of [
+    [undefined, 401],
+    ["payer", 403],
+    ["foreign", 403],
+  ] as const) {
+    const response = await f.request("GET", `${prefix}/invalid/%`, token, undefined, route);
+    expect(response.status).toBe(status);
+  }
+  expect(calls).toEqual([]);
+  for (const suffix of [
+    "invalid/original",
+    "START/original",
+    "%73tart/original",
+    "start/%",
+    "start/%2Foriginal",
+    "start/%252F",
+    "start/%00",
+    `start/${"a".repeat(129)}`,
+    "start/original?resume=true",
+  ])
+    expect((await f.request("GET", `${prefix}/${suffix}`, "reader", undefined, route)).status).toBe(
+      400,
+    );
+  expect(calls).toEqual([]);
+  for (const kind of ["start", "cancel", "plan-change"] as const) {
+    const missing = await f.request(
+      "GET",
+      `${prefix}/${kind}/original%3Acommand`,
+      "reader",
+      undefined,
+      route,
+    );
+    expect(missing.status).toBe(404);
+    expect((await missing.json()).error.code).toBe("not_found");
+    expect(calls.at(-1)).toEqual({ organizationId: f.org, kind, reference: "original:command" });
+  }
+  const before = calls.length;
+  const standalone = { ...f.base, subscriptionCommandReceipts: receiptPort };
+  delete standalone.hostedBilling;
+  for (const handler of [f.makeRoute(), createControlRoutes(standalone)])
+    expect(
+      (await f.request("GET", `${prefix}/start/original`, "reader", undefined, handler)).status,
+    ).toBe(404);
+  expect(calls).toHaveLength(before);
+  const owner = await f.request("GET", `${prefix}/start/original`, "owner", undefined, route);
+  expect(owner.status).toBe(404);
+  expect(calls).toHaveLength(before + 1);
+});
+
+test("saved command receipt HTTP preserves closed nullable fields and original lifecycle facts", async () => {
+  const f = await fixture();
+  const effectiveAt = "2026-11-01T00:00:00.000Z";
+  const pendingChange = {
+    planKey: "configured",
+    pricingRevision: BILLING_CONFIG.revision,
+    effectiveAt,
+  };
+  const base: SubscriptionCommandReceipt = {
+    contractVersion: SUBSCRIPTION_COMMAND_RECEIPT_VERSION,
+    organizationId: f.org,
+    reference: "original",
+    kind: "start",
+    state: "pending",
+    subscriptionRef: null,
+    planKey: "configured",
+    pricingRevision: BILLING_CONFIG.revision,
+    checkout: null,
+    effectiveAt: null,
+    pendingChange: null,
+    lifecycle: "pending",
+  };
+  const receipts: SubscriptionCommandReceipt[] = [
+    ...(["pending", "open", "associated", "expired", "invalidated"] as const).map((state) => ({
+      ...base,
+      reference: `start-${state}`,
+      state,
+      lifecycle: state,
+      subscriptionRef: state === "associated" ? TARGET : null,
+      checkout: state === "open" || state === "associated" ? { url: URL } : null,
+    })),
+    ...(["pending", "verified"] as const).map((state) => ({
+      ...base,
+      reference: `cancel-${state}`,
+      kind: "cancel" as const,
+      state,
+      subscriptionRef: TARGET,
+      planKey: null,
+      pricingRevision: null,
+      effectiveAt: state === "pending" ? null : effectiveAt,
+      lifecycle: state === "pending" ? ("pending" as const) : ("scheduled" as const),
+    })),
+    ...(["pending", "scheduled", "activated", "revoked"] as const).map((lifecycle) => ({
+      ...base,
+      reference: `plan-${lifecycle}`,
+      kind: "plan-change" as const,
+      state: lifecycle === "pending" ? ("pending" as const) : ("verified" as const),
+      subscriptionRef: TARGET,
+      effectiveAt,
+      lifecycle,
+      pendingChange: lifecycle === "pending" ? null : pendingChange,
+    })),
+  ];
+  let lookups = 0;
+  const route = f.makeRoute({
+    subscriptionCommandReceipts: {
+      async read(input) {
+        lookups++;
+        return (
+          receipts.find(
+            (receipt) =>
+              receipt.organizationId === input.organizationId &&
+              receipt.kind === input.kind &&
+              receipt.reference === input.reference,
+          ) ?? null
+        );
+      },
+    },
+    subscriptionCustody: {
+      planTable: PRICING.hostedPlanTable,
+      async read() {
+        throw new Error("saved receipt GET attempted current subscription read/registration");
+      },
+      async begin() {
+        throw new Error("saved receipt GET attempted start resume");
+      },
+      async change() {
+        throw new Error("saved receipt GET attempted cancellation");
+      },
+    },
+    subscriptionPlans: {
+      async pending() {
+        throw new Error("saved receipt GET attempted plan reconciliation");
+      },
+      async change() {
+        throw new Error("saved receipt GET attempted plan mutation");
+      },
+    },
+  });
+  for (const receipt of receipts) {
+    const response = await f.request(
+      "GET",
+      `/v1/organizations/${f.org}/payments/subscription/commands/${receipt.kind}/${receipt.reference}`,
+      "reader",
+      undefined,
+      route,
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ receipt });
+    expect(Object.keys(receipt).sort()).toEqual([
+      "checkout",
+      "contractVersion",
+      "effectiveAt",
+      "kind",
+      "lifecycle",
+      "organizationId",
+      "pendingChange",
+      "planKey",
+      "pricingRevision",
+      "reference",
+      "state",
+      "subscriptionRef",
+    ]);
+  }
+  expect(lookups).toBe(receipts.length);
+  expect(f.remoteCalls).toEqual([]);
+  expect(await f.sql.query("SELECT * FROM ledger")).toEqual([]);
+  const unavailable = f.makeRoute({
+    subscriptionCommandReceipts: {
+      async read() {
+        throw new SubscriptionCommandReceiptError("unavailable");
+      },
+    },
+  });
+  const refused = await f.request(
+    "GET",
+    `/v1/organizations/${f.org}/payments/subscription/commands/start/original`,
+    "reader",
+    undefined,
+    unavailable,
+  );
+  expect(refused.status).toBe(503);
+  expect((await refused.json()).error.code).toBe("billing_unavailable");
+});
+
+test("actual composed saved start receipt survives lost acknowledgement without native or SQL writes", async () => {
+  const f = await fixture();
+  await f.sql.run("INSERT INTO stripe_mode_realm VALUES (1, 'test', ?)", [START]);
+  await f.sql.run(
+    "INSERT INTO stripe_billing_account_realms VALUES (1, 'acct_apiExtensions', 'test', 'api-extensions-test', ?)",
+    [START],
+  );
+  let readOnly = false;
+  let attemptedWrites = 0;
+  const sql: Sql = {
+    async query(statement, params) {
+      if (readOnly && !/^(SELECT|PRAGMA)\b/iu.test(statement.trim())) {
+        attemptedWrites++;
+        throw new Error("saved command GET attempted write through SQL.query");
+      }
+      return await f.sql.query(statement, params);
+    },
+    async run(statement, params) {
+      if (readOnly) {
+        attemptedWrites++;
+        throw new Error("saved command GET attempted SQL.run");
+      }
+      return await f.sql.run(statement, params);
+    },
+    async batch(statements) {
+      if (readOnly) {
+        attemptedWrites++;
+        throw new Error("saved command GET attempted SQL.batch");
+      }
+      return await f.sql.batch(statements);
+    },
+  };
+  const remoteRequests: Request[] = [];
+  let attemptedNative = 0;
+  let customer: Record<string, unknown> | undefined;
+  const client = createStripeBillingClient({
+    secretKey: "sk_test_api_extensions_fixture",
+    mode: "test",
+    async fetch(request) {
+      if (readOnly) {
+        attemptedNative++;
+        throw new Error("saved command GET attempted processor read or mutation");
+      }
+      remoteRequests.push(request);
+      const url = new globalThis.URL(request.url);
+      if (request.method === "GET" && url.pathname === "/v1/account")
+        return Response.json({ id: "acct_apiExtensions", object: "account" });
+      if (request.method === "GET" && url.pathname === "/v1/prices/price_apiExtensions")
+        return Response.json({
+          id: "price_apiExtensions",
+          object: "price",
+          livemode: false,
+          active: true,
+          currency: "usd",
+          unit_amount: 1000,
+          type: "recurring",
+          billing_scheme: "per_unit",
+          recurring: { interval: "month", interval_count: 1, usage_type: "licensed" },
+        });
+      if (request.method === "POST" && url.pathname === "/v1/customers") {
+        const form = new URLSearchParams(await request.clone().text());
+        customer = {
+          id: "cus_apiExtensionsCommand",
+          object: "customer",
+          livemode: false,
+          metadata: Object.fromEntries(
+            [...form.entries()]
+              .filter(([key]) => key.startsWith("metadata["))
+              .map(([key, value]) => [key.slice(9, -1), value]),
+          ),
+        };
+        return Response.json(customer);
+      }
+      if (request.method === "GET" && url.pathname === "/v1/customers/cus_apiExtensionsCommand")
+        return Response.json(customer);
+      if (request.method === "POST" && url.pathname === "/v1/checkout/sessions")
+        throw new Error("local processor accepted request but acknowledgement was lost");
+      throw new Error(`unexpected native request: ${request.method} ${url.pathname}`);
+    },
+  });
+  const billingConfig = parseBillingConfig(PRICING.environment.TAKOSERVER_BILLING_CONFIG);
+  if (!billingConfig) throw new Error("fixture billing config unavailable");
+  const realm = await verifyHostedBillingFinancialRealm({
+    sql,
+    reader: { client },
+    expected: {
+      accountId: "acct_apiExtensions",
+      mode: "test",
+      billingAuthority: "api-extensions-test",
+    },
+    prices: [{ priceId: "price_apiExtensions", monthlyAmountMinor: 1000 }],
+  });
+  const hostedBilling = await createCanonicalHostedBillingComposition({
+    sql,
+    clock: f.base.clock,
+    billingConfig,
+    pricing: PRICING,
+    client,
+    realm,
+    consoleOrigin: "https://console.test",
+    webhookSecret: "whsec_api_extensions_fixture",
+    warnings: { state: "unavailable", reason: "transport-not-composed" },
+  });
+  const ports: AppPorts = {
+    sql,
+    clock: f.base.clock,
+    billingConfig,
+    hostedBilling,
+    objects: createMemoryObjectStore(),
+    identity: {
+      async verify() {
+        throw new Error("existing local session only");
+      },
+    },
+    settlement: f.base.settlement,
+    publicOrigin: "https://api.test",
+    consoleOrigin: "https://console.test",
+    v2: TEST_TAKOFORM_V2_CONFIG,
+    forms: [],
+    hostForms: [],
+    offerings: [],
+    driver: new InMemoryTakoformResourceDriver(),
+  };
+  const original = buildApp(ports);
+  const subscriptionPath = `/v1/organizations/${f.org}/payments/subscription`;
+  const command = { reference: "lost-ack-original", planKey: "configured" };
+  const started = await f.request("POST", subscriptionPath, "payer", command, (request) =>
+    original.fetch(request),
+  );
+  expect(started.status).toBe(202);
+  expect((await started.json()).checkout.state).toBe("pending");
+  expect(
+    remoteRequests.filter(
+      (request) =>
+        request.method === "POST" &&
+        new globalThis.URL(request.url).pathname === "/v1/checkout/sessions",
+    ),
+  ).toHaveLength(1);
+  const originalRows = await f.sql.query(
+    "SELECT * FROM stripe_subscription_checkout_intents WHERE org_id = ?",
+    [f.org],
+  );
+  const originalCatalog = await f.sql.query("SELECT * FROM stripe_billing_pricing");
+  expect(originalRows).toHaveLength(1);
+  expect(originalRows[0]?.state).toBe("dispatched");
+  const other = await f.accounts.createOrganization({ actor: f.owner, name: "Receipt isolation" });
+  const otherReader = await f.accounts.createApiKey({
+    actor: f.owner,
+    organizationId: other.id,
+    name: "Receipt reader",
+    scopes: ["wallet:read"],
+    expiresInSeconds: 3600,
+  });
+  const restarted = buildApp(ports);
+  const before = remoteRequests.length;
+  readOnly = true;
+  const read = await f.request(
+    "GET",
+    `${subscriptionPath}/commands/start/${command.reference}`,
+    "reader",
+    undefined,
+    (request) => restarted.fetch(request),
+  );
+  expect(read.status).toBe(200);
+  expect(await read.json()).toEqual({
+    receipt: {
+      contractVersion: SUBSCRIPTION_COMMAND_RECEIPT_VERSION,
+      organizationId: f.org,
+      reference: command.reference,
+      kind: "start",
+      state: "pending",
+      subscriptionRef: null,
+      planKey: command.planKey,
+      pricingRevision: BILLING_CONFIG.revision,
+      checkout: null,
+      effectiveAt: null,
+      pendingChange: null,
+      lifecycle: "pending",
+    },
+  });
+  const originalReceiptPath = `${subscriptionPath}/commands/start/${command.reference}`;
+  for (const [token, status] of [
+    [undefined, 401],
+    ["payer", 403],
+    ["foreign", 403],
+  ] as const)
+    expect(
+      (
+        await f.request("GET", originalReceiptPath, token, undefined, (request) =>
+          restarted.fetch(request),
+        )
+      ).status,
+    ).toBe(status);
+  const ownerRead = await f.request("GET", originalReceiptPath, "owner", undefined, (request) =>
+    restarted.fetch(request),
+  );
+  expect(ownerRead.status).toBe(200);
+  expect((await ownerRead.json()).receipt.reference).toBe(command.reference);
+  const otherRead = await f.request(
+    "GET",
+    `/v1/organizations/${other.id}/payments/subscription/commands/start/${command.reference}`,
+    otherReader.secret,
+    undefined,
+    (request) => restarted.fetch(request),
+  );
+  expect(otherRead.status).toBe(404);
+  expect(await otherRead.json()).not.toHaveProperty("receipt");
+  for (const kind of ["start", "cancel", "plan-change"] as const)
+    expect(
+      (
+        await f.request(
+          "GET",
+          `${subscriptionPath}/commands/${kind}/never-recorded`,
+          "reader",
+          undefined,
+          (request) => restarted.fetch(request),
+        )
+      ).status,
+    ).toBe(404);
+  expect(attemptedWrites).toBe(0);
+  expect(attemptedNative).toBe(0);
+  expect(remoteRequests).toHaveLength(before);
+  expect(
+    await f.sql.query("SELECT * FROM stripe_subscription_checkout_intents WHERE org_id = ?", [
+      f.org,
+    ]),
+  ).toEqual(originalRows);
+  expect(await f.sql.query("SELECT * FROM stripe_billing_pricing")).toEqual(originalCatalog);
+  expect(await f.sql.query("SELECT * FROM ledger")).toEqual([]);
 });
 
 test("qualified subscription custody retains its actual start and cancellation HTTP receipts", async () => {
@@ -1219,6 +1669,7 @@ test("new service refusals use the existing closed canonical error envelope", as
     [new OrgTopUpError("unavailable"), 503, "billing_unavailable"],
     [new OrgWorkspaceUsageError("workspace_snapshot_expired", 409), 409, "expired"],
     [new OrgLimitPolicyError("limit_mode_unavailable", 409), 409, "conflict"],
+    [new SubscriptionCommandReceiptError("unavailable"), 503, "billing_unavailable"],
     [new SubscriptionPlanChangeError("subscription_plan_unavailable", 409), 409, "conflict"],
     [new SubscriptionPlanChangeError("subscription_target_changed", 409), 409, "conflict"],
     [
@@ -1243,6 +1694,7 @@ test("OpenAPI publishes actual optional Hosted DTOs and exclusive receipt states
     "/v1/organizations/{organizationId}/wallet/usage-summary/workspaces",
     "/v1/organizations/{organizationId}/wallet/limit-policy",
     "/v1/organizations/{organizationId}/wallet/checkout/{reference}",
+    "/v1/organizations/{organizationId}/payments/subscription/commands/{kind}/{reference}",
   ])
     expect(document.paths).toHaveProperty(path);
   const schemas = document.components.schemas;
@@ -1253,6 +1705,38 @@ test("OpenAPI publishes actual optional Hosted DTOs and exclusive receipt states
   expect(schemas.HostedBillingCapabilities.properties.contractVersion.const).toBe(
     "hosted-billing-v1",
   );
+  expect(Object.keys(schemas.HostedBillingCapabilities.properties).sort()).toEqual([
+    "contractVersion",
+    "subscriptionCancellation",
+    "subscriptionPlanChange",
+    "subscriptionStart",
+    "topUps",
+  ]);
+  expect(schemas.SubscriptionCommandReceipt.additionalProperties).toBe(false);
+  expect(schemas.SubscriptionCommandReceiptResponse.required).toEqual(["receipt"]);
+  expect(schemas.SubscriptionCommandReceipt.properties.contractVersion.const).toBe(
+    SUBSCRIPTION_COMMAND_RECEIPT_VERSION,
+  );
+  expect(schemas.SubscriptionCommandReceipt.oneOf).toHaveLength(9);
+  const scheduledCancel = schemas.SubscriptionCommandReceipt.oneOf.find(
+    (branch) =>
+      branch.properties.kind.const === "cancel" && branch.properties.state.const === "verified",
+  );
+  expect(scheduledCancel?.properties.lifecycle).toEqual({ const: "scheduled" });
+  expect(scheduledCancel?.properties.pendingChange).toEqual({ type: "null" });
+  const verifiedPlan = schemas.SubscriptionCommandReceipt.oneOf.find(
+    (branch) =>
+      branch.properties.kind.const === "plan-change" &&
+      branch.properties.state.const === "verified",
+  );
+  expect(verifiedPlan?.properties.lifecycle).toEqual({
+    enum: ["scheduled", "activated", "revoked"],
+  });
+  expect(verifiedPlan?.properties.pendingChange).toHaveProperty("required", [
+    "planKey",
+    "pricingRevision",
+    "effectiveAt",
+  ]);
   expect(schemas.WalletWorkspaceUsageResponse.required).toContain("usageSummary");
   expect(schemas.WalletWorkspaceUsageResponse.properties.totalsScope.const).toBe("organization");
   expect(schemas.ChangeWalletLimitPolicyRequest.oneOf).toHaveLength(2);

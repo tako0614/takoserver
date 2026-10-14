@@ -48,6 +48,7 @@ import {
   StripeSettlementError,
 } from "./stripe-settlement.ts";
 import { assertTopUpSessionCommand, createStripeTopUpClient } from "./stripe-top-up-client.ts";
+import type { SubscriptionCommandReceipts } from "./subscription-command-receipts.ts";
 
 declare const compositionBrand: unique symbol;
 
@@ -101,6 +102,7 @@ export interface HostedBillingPaymentAssembly {
   readonly events: PaymentEvents;
   readonly subscriptionCustody: CustodiedSubscriptionPayments;
   readonly subscriptionPlans: SubscriptionPlanPayments;
+  readonly subscriptionCommandReceipts: SubscriptionCommandReceipts;
 }
 
 /** Financial ports come only from a qualified factory, never an independent app override. */
@@ -374,7 +376,7 @@ export async function createCanonicalHostedBillingComposition(options: {
         ensureCustomer: customerCustody.ensure.bind(customerCustody),
         subscriptionExtensions: (context) => createHostedSubscriptionAdapter({ context, realm }),
       });
-      if (!hosted.subscriptionPlans)
+      if (!hosted.subscriptionPlans || !hosted.subscriptionCommandReceipts)
         throw new TypeError("Hosted subscription period adapter is unavailable");
       const notifications = createStripeEvents(
         {
@@ -411,6 +413,7 @@ export async function createCanonicalHostedBillingComposition(options: {
         events,
         subscriptionCustody: hosted.subscriptions,
         subscriptionPlans: hosted.subscriptionPlans,
+        subscriptionCommandReceipts: hosted.subscriptionCommandReceipts,
       };
     },
   }) as HostedBillingComposition;

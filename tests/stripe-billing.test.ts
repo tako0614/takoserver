@@ -5,9 +5,12 @@ import { readFileSync } from "node:fs";
 import { compilePricingAuthoring } from "../scripts/pricing/compile.ts";
 import { buildApp } from "../src/app.ts";
 import type { ExternalIdentityVerifier } from "../src/auth.ts";
+import { parseBillingConfig } from "../src/billing-config.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { createLedger } from "../src/ledger.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
+import { createOrgBilling } from "../src/org-billing.ts";
+import { createOrgLimitPolicy } from "../src/org-limit-policy.ts";
 import type { FundingReconcileReport, PaymentEvents } from "../src/payment-events.ts";
 import { resolvePayment } from "../src/payment-setup.ts";
 import { SqlError } from "../src/ports.ts";
@@ -648,6 +651,155 @@ async function errorCode(response: Response): Promise<string | undefined> {
 }
 
 describe("Hosted Stripe billing service", () => {
+  test("a paid invoice for a future service period is deferred until that original period starts", async () => {
+    let instant = NOW.toISOString();
+    const clock = () => new Date(instant);
+    const compiled = twoPlanPricing();
+    const h = await fixture(compiled, clock);
+    await clearHistoricalSubscription(h);
+    setTwoPlanPrices(h.state);
+    const checkout = await h.subscriptions.begin({
+      organizationId: ORG,
+      reference: "future-period",
+      planKey: "hosted-10",
+    });
+    if (checkout.state !== "open") throw new Error("genuine subscription Checkout not open");
+    const periodStart = "2026-11-01T00:00:00.000Z";
+    const periodEnd = "2026-12-01T00:00:00.000Z";
+    const start = Date.parse(periodStart) / 1000;
+    const end = Date.parse(periodEnd) / 1000;
+    const config = parseBillingConfig(compiled.environment.TAKOSERVER_BILLING_CONFIG);
+    if (!config) throw new Error("published shared tariff absent");
+    const pinned = {
+      organizationId: ORG,
+      takoserverPurpose: "hosted_subscription",
+      planKey: "hosted-10",
+      pricingRevision: config.revision,
+    };
+    h.state.subscriptions.set(
+      SUBSCRIPTION,
+      subscription({
+        metadata: pinned,
+        current_period_start: start,
+        current_period_end: end,
+        items: {
+          has_more: false,
+          data: [
+            { id: "si_test", object: "subscription_item", quantity: 1, price: "price_final10" },
+          ],
+        },
+      }),
+    );
+    const originalSession = h.state.sessions.get(checkout.id);
+    if (!originalSession) throw new Error("genuine Checkout Session absent");
+    h.state.sessions.set(checkout.id, {
+      ...originalSession,
+      status: "complete",
+      payment_status: "paid",
+      subscription: SUBSCRIPTION,
+    });
+    expect(
+      (await deliver(h.app, event("checkout.session.completed", checkout.id, "checkout.session")))
+        .status,
+    ).toBe(200);
+    const policy = createOrgLimitPolicy({ sql: h.sql, clock });
+    const ledger = createLedger(h.sql, clock, {
+      hostedPaidFreeExclusion: true,
+      allocationAdmissionResolver: policy.prepareAdmission.bind(policy),
+    });
+    const billing = createOrgBilling({
+      sql: h.sql,
+      clock,
+      ledger,
+      config,
+      hostedPaidFreeExclusion: true,
+      limitPolicy: policy,
+    });
+    expect((await billing.wallet(ORG)).availableMicros).toBe(1_500_000);
+    h.state.invoices.set(
+      "in_billing_test",
+      invoice("in_billing_test", {
+        subscription_details: { metadata: pinned },
+        lines: {
+          has_more: false,
+          data: [
+            {
+              id: "il_billing_test",
+              object: "line_item",
+              type: "subscription",
+              proration: false,
+              quantity: 1,
+              subscription: SUBSCRIPTION,
+              price: "price_final10",
+              period: { start, end },
+            },
+          ],
+        },
+        amount_paid: 1000,
+        total: 1000,
+        total_excluding_tax: 1000,
+      }),
+    );
+    h.state.charges.set("ch_billing_test", charge({ amount: 1000 }));
+    const paidEvent = event("invoice.paid", "in_billing_test", "invoice");
+    expect((await deliver(h.app, paidEvent)).status).toBe(200);
+    expect(
+      await h.sql.query("SELECT outcome, outcome_detail FROM stripe_events WHERE event_id = ?", [
+        String(paidEvent.id),
+      ]),
+    ).toEqual([{ outcome: "deferred", outcome_detail: "invoice_period_not_started" }]);
+    expect(
+      await h.sql.query("SELECT * FROM stripe_billing_grants WHERE org_id = ?", [ORG]),
+    ).toEqual([]);
+    expect((await billing.wallet(ORG)).availableMicros).toBe(1_500_000);
+    expect((await billing.usageSummary(ORG)).periodKind).toBe("free");
+    expect(
+      await ledger.hold({
+        organizationId: ORG,
+        reference: "before-period",
+        amountMicros: 1_500_001,
+      }),
+    ).toBe(false);
+    expect((await h.subscriptions.read(ORG))?.paidFeatures).toBe(false);
+    await h.reconcile();
+    expect(
+      await h.sql.query("SELECT * FROM stripe_billing_grants WHERE org_id = ?", [ORG]),
+    ).toEqual([]);
+    instant = periodStart;
+    await h.reconcile();
+    expect(
+      await h.sql.query(
+        "SELECT amount_micros, period_start, period_end, created_at FROM stripe_billing_grants WHERE org_id = ?",
+        [ORG],
+      ),
+    ).toEqual([
+      {
+        amount_micros: 20_000_000,
+        period_start: periodStart,
+        period_end: periodEnd,
+        created_at: periodStart,
+      },
+    ]);
+    expect((await billing.wallet(ORG)).availableMicros).toBe(20_000_000);
+    expect((await billing.usageSummary(ORG)).periodKind).toBe("paid");
+    expect((await h.subscriptions.read(ORG))?.paidFeatures).toBe(true);
+    await h.reconcile();
+    expect(
+      await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_grants WHERE org_id = ?", [
+        ORG,
+      ]),
+    ).toEqual([{ count: 1 }]);
+    expect(
+      await h.sql.query("SELECT outcome FROM stripe_events WHERE event_id = ?", [
+        String(paidEvent.id),
+      ]),
+    ).toEqual([{ outcome: "applied" }]);
+    instant = NOW.toISOString();
+    expect(await h.subscriptions.read(ORG)).toMatchObject({
+      paidFeatures: false,
+      paidThrough: periodEnd,
+    });
+  });
   test("a competing plan observes the original prepared intent without invalidating or replacing it", async () => {
     const h = await fixture(twoPlanPricing());
     await clearHistoricalSubscription(h);
