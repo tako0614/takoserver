@@ -4202,7 +4202,7 @@
             }
           },
           "400": {
-            "description": "Malformed hold reference",
+            "description": "Malformed hold reference, or a request body that is not empty",
             "content": {
               "application/json": {
                 "schema": {

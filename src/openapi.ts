@@ -683,7 +683,7 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
           "application/json": { schema: { $ref: "#/components/schemas/WalletHoldResponse" } },
         },
       },
-      "400": errorResponse("Malformed hold reference"),
+      "400": errorResponse("Malformed hold reference, or a request body that is not empty"),
       "401": errorResponse("Authentication required"),
       "403": errorResponse("The key lacks wallet:write or belongs to another Organization"),
       "503": errorResponse("Release result is unavailable or indeterminate"),
