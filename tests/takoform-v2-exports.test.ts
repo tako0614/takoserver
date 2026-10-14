@@ -476,3 +476,19 @@ test("v2 extension entrypoint bundles for a Worker without Node or workerd runti
     /\bBun\b|(?<![\w.])process\s*(?:\?\.|\.|\?\[|\[)|typeof\s+(?:globalThis\.)?process\b|\b(?:globalThis|self|window)\.process\b|\bnode:/u,
   );
 });
+
+test("migration native adapter has a separate Node-only package subpath", async () => {
+  const native = await import("@takoserver/core/provider-extension/sqlite-migration-native");
+  expect(Object.keys(native)).toEqual(["createSQLiteMigrationApplicationNativePort"]);
+  expect("createSQLiteMigrationApplicationNativePort" in extension).toBe(false);
+  const built = await Bun.build({
+    entrypoints: [
+      fileURLToPath(
+        import.meta.resolve("@takoserver/core/provider-extension/sqlite-migration-native"),
+      ),
+    ],
+    target: "bun",
+  });
+  expect(built.success).toBe(true);
+  expect(await built.outputs[0]?.text()).toContain('from "node:sqlite"');
+});

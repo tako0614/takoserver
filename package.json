@@ -23,7 +23,8 @@
     "./actor-resource-graph": "./src/actor-resource-graph.ts",
     "./deploy-extension": "./scripts/deploy-extension.ts",
     "./testing": "./tests/helpers/hosted-supply-fixtures.ts",
-    "./testing/cloudflare-workers": "./src/cloudflare-workers-rpc.d.ts"
+    "./testing/cloudflare-workers": "./src/cloudflare-workers-rpc.d.ts",
+    "./provider-extension/sqlite-migration-native": "./src/takoform-v2/forms/sqlite-migration-application-native.ts"
   },
   "scripts": {
     "fmt": "biome check --write .",

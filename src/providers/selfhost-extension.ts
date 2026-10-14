@@ -1,5 +1,4 @@
 /** Node/filesystem-native adapters; not part of the portable Worker extension. */
-export { createSQLiteMigrationApplicationNativePort } from "../takoform-v2/forms/sqlite-migration-application-native.ts";
 export {
   createWorkerdWorkerModuleInspector,
   type WorkerdWorkerModuleInspectorOptions,
