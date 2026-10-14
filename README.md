@@ -507,6 +507,11 @@ absent. The webhook is gated the same way: `"stripeWebhook": true` (only with
 `checkoutMinimumMinor`, `checkoutMaximumMinor`, `webhookToleranceSeconds` and
 `reconcileLookbackSeconds`, validated before deploy.
 
+The [Hosted billing API proposal](docs/hosted-billing-api-spec.md) describes
+planned idempotent top-ups, next-period subscription changes, personal
+Organizations and Workspace usage attribution. It distinguishes existing
+contracts from the extensions awaiting implementation and staging acceptance.
+
 Starting a Checkout needs a console to send the payer back to: without a
 console origin the Checkout route is not served, while the key still verifies
 a presented session and runs the webhook (where configured) and the reconcile
