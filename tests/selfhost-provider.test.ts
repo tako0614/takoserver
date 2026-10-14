@@ -5255,17 +5255,27 @@ describe("the SQLite migration ledger", () => {
       "PRAGMA foreign_keys=ON; PRAGMA user_version=42; " +
         "CREATE TABLE retained(id INTEGER PRIMARY KEY); INSERT INTO retained VALUES(1);",
     );
-    const prefix = [{ path: historical.path, digest: historical.digest }];
+    // Database apply is lazy. Let its migration owner create the private path
+    // and genuine ledger using the admitted atomic zero-byte migration.
+    const materialize = migration("staging/0000-materialize.sql", "");
+    expect(
+      await port.applySuffix({
+        operationId: "staging-materialize-database",
+        operationMode: "initial",
+        nativeId,
+        target,
+        desired: [materialize],
+        expectedPrefix: [],
+        migrations: [materialize],
+      }),
+    ).toEqual({ ok: true, value: undefined });
+    const prefix = [materialize, historical].map(({ path, digest }) => ({ path, digest }));
     const persisted = new Database(selfhostDatabasePath(root, name));
     try {
       // Native state from the historical policy, not a new admission of that SQL.
       persisted.exec(new TextDecoder().decode(historical.sql));
-      persisted.exec(`CREATE TABLE _takoform_sqlite_migrations (
-        sequence INTEGER PRIMARY KEY NOT NULL CHECK(sequence>0),
-        path TEXT NOT NULL UNIQUE, digest TEXT NOT NULL
-      )`);
       persisted
-        .query("INSERT INTO _takoform_sqlite_migrations VALUES(1,?,?)")
+        .query("INSERT INTO _takoform_sqlite_migrations VALUES(2,?,?)")
         .run(historical.path, historical.digest);
       const safe = migration(
         "staging/0002-new.sql",
@@ -5277,7 +5287,7 @@ describe("the SQLite migration ledger", () => {
         operationMode: "recovery",
         nativeId,
         target,
-        desired: [historical, safe, unsafe],
+        desired: [materialize, historical, safe, unsafe],
         expectedPrefix: prefix,
         migrations: [safe, unsafe],
       });
@@ -5293,7 +5303,7 @@ describe("the SQLite migration ledger", () => {
           operationMode: "recovery",
           nativeId,
           target,
-          desired: [historical, safe],
+          desired: [materialize, historical, safe],
           expectedPrefix: prefix,
           migrations: [safe],
         }),
