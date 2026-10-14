@@ -1,0 +1,49 @@
+{
+  "id": "054-list-match-last",
+  "category": "manifest-list",
+  "description": "Selection is independent of the matching entry position.",
+  "input": {
+    "imageRef": "registry.example.test/workload@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    },
+    "registry": {
+      "visibility": "public"
+    },
+    "manifest": {
+      "kind": "list",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "manifests": [
+        {
+          "kind": "image",
+          "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "platform": {
+            "os": "linux",
+            "architecture": "arm64",
+            "variant": "v8"
+          },
+          "sizeBytes": 8192
+        },
+        {
+          "kind": "image",
+          "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "platform": {
+            "os": "linux",
+            "architecture": "amd64"
+          },
+          "sizeBytes": 16384
+        }
+      ]
+    }
+  },
+  "expected": {
+    "decision": "accept",
+    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "sizeBytes": 16384,
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    }
+  }
+}

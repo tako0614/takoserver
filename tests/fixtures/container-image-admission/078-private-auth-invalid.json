@@ -1,0 +1,32 @@
+{
+  "id": "078-private-auth-invalid",
+  "category": "registry-auth",
+  "description": "Present but unauthorized private-registry authentication is rejected.",
+  "input": {
+    "imageRef": "registry.example.test/workload@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    },
+    "registry": {
+      "visibility": "private",
+      "auth": {
+        "present": true,
+        "authorized": false
+      }
+    },
+    "manifest": {
+      "kind": "image",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "platform": {
+        "os": "linux",
+        "architecture": "amd64"
+      },
+      "sizeBytes": 4096
+    }
+  },
+  "expected": {
+    "decision": "reject",
+    "reason": "registry_auth_failed"
+  }
+}

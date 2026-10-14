@@ -1,0 +1,49 @@
+{
+  "id": "064-list-unselected-oversize",
+  "category": "manifest-list",
+  "description": "An oversized image for another platform does not change the selected payload size.",
+  "input": {
+    "imageRef": "registry.example.test/workload@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    },
+    "registry": {
+      "visibility": "public"
+    },
+    "manifest": {
+      "kind": "list",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "manifests": [
+        {
+          "kind": "image",
+          "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "platform": {
+            "os": "linux",
+            "architecture": "amd64"
+          },
+          "sizeBytes": 4096
+        },
+        {
+          "kind": "image",
+          "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "platform": {
+            "os": "linux",
+            "architecture": "arm64",
+            "variant": "v8"
+          },
+          "sizeBytes": 3000000000
+        }
+      ]
+    }
+  },
+  "expected": {
+    "decision": "accept",
+    "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "sizeBytes": 4096,
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    }
+  }
+}

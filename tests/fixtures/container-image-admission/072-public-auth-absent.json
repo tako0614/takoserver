@@ -1,0 +1,33 @@
+{
+  "id": "072-public-auth-absent",
+  "category": "registry-auth",
+  "description": "A public registry admits a pinned image without authentication.",
+  "input": {
+    "imageRef": "registry.example.test/workload@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    },
+    "registry": {
+      "visibility": "public"
+    },
+    "manifest": {
+      "kind": "image",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "platform": {
+        "os": "linux",
+        "architecture": "amd64"
+      },
+      "sizeBytes": 4096
+    }
+  },
+  "expected": {
+    "decision": "accept",
+    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "sizeBytes": 4096,
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    }
+  }
+}

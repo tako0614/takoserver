@@ -1,0 +1,33 @@
+{
+  "id": "017-digest-uppercase-hex",
+  "category": "reference",
+  "description": "Hexadecimal digest digits may use uppercase while the algorithm remains lowercase.",
+  "input": {
+    "imageRef": "registry.example.test/workload@sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    },
+    "registry": {
+      "visibility": "public"
+    },
+    "manifest": {
+      "kind": "image",
+      "digest": "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "platform": {
+        "os": "linux",
+        "architecture": "amd64"
+      },
+      "sizeBytes": 4096
+    }
+  },
+  "expected": {
+    "decision": "accept",
+    "digest": "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "sizeBytes": 4096,
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "id": "048-single-variant-mismatch",
+  "category": "platform",
+  "description": "An ARM v7 image cannot satisfy an ARM v6 request.",
+  "input": {
+    "imageRef": "registry.example.test/workload@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "platform": {
+      "os": "linux",
+      "architecture": "arm",
+      "variant": "v6"
+    },
+    "registry": {
+      "visibility": "public"
+    },
+    "manifest": {
+      "kind": "image",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "platform": {
+        "os": "linux",
+        "architecture": "arm",
+        "variant": "v7"
+      },
+      "sizeBytes": 4096
+    }
+  },
+  "expected": {
+    "decision": "reject",
+    "reason": "platform_mismatch"
+  }
+}

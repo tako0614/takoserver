@@ -1,0 +1,24 @@
+{
+  "id": "057-list-empty",
+  "category": "manifest-list",
+  "description": "An empty list cannot supply a runnable matching manifest.",
+  "input": {
+    "imageRef": "registry.example.test/workload@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    },
+    "registry": {
+      "visibility": "public"
+    },
+    "manifest": {
+      "kind": "list",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "manifests": []
+    }
+  },
+  "expected": {
+    "decision": "reject",
+    "reason": "platform_mismatch"
+  }
+}
