@@ -45,6 +45,33 @@ const STATUSES = new Set([
 ]);
 const MAX_REFUND_PAGES = 10;
 
+type HostedPlan = HostedPricing["hostedPlanTable"]["plans"][number];
+type SubscriptionPlan = Extract<HostedPlan, { readonly tier: "subscription" }>;
+
+/** Selects one configured paid plan; array position and nonpaid rows convey no authority. */
+export function configuredSubscriptionPlanByKey(
+  plans: readonly HostedPlan[],
+  planKey: unknown,
+): SubscriptionPlan | undefined {
+  if (typeof planKey !== "string") return undefined;
+  const matches = plans.filter((plan) => plan.planId === planKey);
+  const plan = matches.length === 1 ? matches[0] : undefined;
+  return plan?.tier === "subscription" ? plan : undefined;
+}
+
+/** Price verification must resolve the same unique configured price/consideration pair. */
+export function configuredSubscriptionPlanByPrice(
+  plans: readonly HostedPlan[],
+  stripePriceId: unknown,
+): SubscriptionPlan | undefined {
+  if (typeof stripePriceId !== "string") return undefined;
+  const matches = plans.filter(
+    (plan): plan is SubscriptionPlan =>
+      plan.tier === "subscription" && plan.stripePriceId === stripePriceId,
+  );
+  return matches.length === 1 ? matches[0] : undefined;
+}
+
 export class StripeBillingError extends Error {
   constructor(
     readonly code: string,
@@ -227,8 +254,8 @@ export function createStripeBilling(options: {
     );
   }
   async function price(id: string, table: HostedPricing): Promise<void> {
-    const plan = table.hostedPlanTable.plans[1];
-    if (plan.stripePriceId !== id) refuse("wrong_price");
+    const plan = configuredSubscriptionPlanByPrice(table.hostedPlanTable.plans, id);
+    if (!plan) refuse("wrong_price");
     const object = await client.get("prices", id);
     if (!object) refuse("unknown_price");
     const recurring = record(object.recurring);
@@ -252,8 +279,8 @@ export function createStripeBilling(options: {
     const customer = identifier(object.customer, "cus");
     await boundCustomer(org, customer);
     const snapshot = table ?? (await tariff(meta.pricingRevision));
-    const plan = snapshot.hostedPlanTable.plans[1];
-    if (meta.planKey !== plan.planId) refuse("wrong_plan");
+    const plan = configuredSubscriptionPlanByKey(snapshot.hostedPlanTable.plans, meta.planKey);
+    if (!plan) refuse("wrong_plan");
     const items = record(object.items);
     if (items.has_more !== false || !Array.isArray(items.data) || items.data.length !== 1)
       refuse("unsupported_subscription_items");
@@ -377,12 +404,9 @@ export function createStripeBilling(options: {
     const pinned = metadata(record(invoice.subscription_details).metadata);
     if (pinned.takoserverPurpose !== PURPOSE) refuse("not_hosted_subscription");
     const snapshot = await tariff(pinned.pricingRevision);
-    const plan = snapshot.hostedPlanTable.plans[1];
-    if (
-      pinned.planKey !== plan.planId ||
-      metadata(sub.metadata).organizationId !== pinned.organizationId
-    )
-      refuse("wrong_plan");
+    const plan = configuredSubscriptionPlanByKey(snapshot.hostedPlanTable.plans, pinned.planKey);
+    if (!plan) refuse("wrong_plan");
+    if (metadata(sub.metadata).organizationId !== pinned.organizationId) refuse("wrong_plan");
     const org = await exists(pinned.organizationId);
     const customer = identifier(invoice.customer, "cus");
     if (identifier(sub.customer, "cus") !== customer) refuse("wrong_customer");
@@ -889,8 +913,8 @@ export function createStripeBilling(options: {
       await ready();
       reference(input.reference);
       if (!options.consoleOrigin) throw new StripeBillingError("not_found", 404);
-      const plan = pricing.hostedPlanTable.plans[1];
-      if (input.planKey !== plan.planId) throw new StripeBillingError("unknown_plan", 400);
+      const plan = configuredSubscriptionPlanByKey(pricing.hostedPlanTable.plans, input.planKey);
+      if (!plan) throw new StripeBillingError("unknown_plan", 400);
       const priorCommand = (
         await sql.query(
           "SELECT fingerprint, response_json FROM stripe_billing_commands WHERE org_id = ? AND reference = ?",
