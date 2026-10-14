@@ -24,8 +24,8 @@ The historical cents proposal is not the new settlement authority.
 | Pricing publication | Existing authoring/compiler and immutable tariff registration | Reviewed publication/readback using the same revision authority |
 | Webhooks | `POST /v1/payments/stripe/webhook` | Reuse invoice/subscription/Checkout/refund settlement and reconciliation |
 
-Runtime and generated OpenAPI now contain the canonical extension; entry
-activation, complete CI, implementation QA and staging acceptance remain
+Runtime, generated OpenAPI and opt-in entries contain the canonical extension;
+operator activation, complete CI, implementation QA and staging acceptance remain
 separate requirements. Routes and shapes are defined by the
 [route table](../src/route-table.ts), [control boundary](../src/control.ts),
 and [generated OpenAPI](../openapi/takoserver.openapi.json). The
@@ -41,6 +41,39 @@ contract and coordinate #343 without duplicating its patch or introducing a
 second subscription API.
 The runtime v2 table has Free, two monthly choices and usage; legacy v1 has
 three rows. Four rows still represent three commercial roles.
+
+## Canonical entry selection
+
+Bun and Worker select the canonical TEST composition only when
+`TAKOSERVER_HOSTED_BILLING=canonical-test`. An absent or empty selection keeps
+the existing independent lane; any other value refuses startup. Selecting this
+lane requires all of the following operator inputs and existing qualifications:
+
+| Input | Requirement |
+| --- | --- |
+| `TAKOSERVER_STRIPE_MODE` | Literal `test`; LIVE cannot be selected |
+| `TAKOSERVER_BILLING_CONFIG` and `TAKOSERVER_HOSTED_PRICING` | Matching published tariff, Checkout bounds and complete paid Price set |
+| `TAKOSERVER_HOSTED_BILLING_ACCOUNT_ID` | Explicit expected account, verified through the captured native client |
+| `TAKOSERVER_HOSTED_BILLING_AUTHORITY` | Explicit stable authority matching the existing database financial realm |
+| `STRIPE_SECRET_KEY` and `STRIPE_WEBHOOK_SECRET` | Isolated TEST credentials for the same account and signed webhook path |
+| `TAKOSERVER_CONSOLE_ORIGIN` | Canonical configured return origin |
+| Database | Qualified mode/financial-realm pins and complete canonical billing schema |
+
+The explicit canonical selection enables the complete qualified TEST payment
+lane on both entries. The Worker's legacy
+`TAKOSERVER_STRIPE_CHECKOUT_ENABLED` and `TAKOSERVER_STRIPE_WEBHOOK_ENABLED`
+flags do not additionally gate this selection. They retain their existing
+behavior when the canonical lane is unselected. Missing or mismatched credentials,
+account, Prices, schema or pins refuse startup; the resolver does not create or
+replace a financial realm or invent a Price. Bun retains its normal SQLite
+migration lifecycle; this source option does not authorize a live schema apply.
+
+Worker qualification failures retain the original diagnostic cause while
+returning the generic startup refusal. Bun's existing owned payment-reconcile
+timer and Worker's scheduled pass use the selected canonical app; the entry does
+not install a second grant writer. Postpaid remains off as described below.
+Entry source availability does not establish a configured staging target,
+qualified measurement or warning delivery, or successful Stripe TEST E2E.
 
 ## Ownership and authentication
 

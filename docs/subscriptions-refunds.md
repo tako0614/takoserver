@@ -37,6 +37,12 @@ objects; connected-account events are refused. No default commercial price
 is selected. D1 qualification/application and deployment remain separate work.
 The feature does not activate on a self-host instance without hosted config.
 
+Select the canonical TEST lane on either entry with
+`TAKOSERVER_HOSTED_BILLING=canonical-test`; see the exact
+[entry requirements](hosted-billing-api-spec.md#canonical-entry-selection).
+This explicit selection does not additionally require the Worker's legacy
+Checkout/webhook flags. Unselected entries retain their existing flag behavior.
+
 The canonical Hosted extension additionally requires the additive **0099**
 schema and an immutable database binding to the selected Stripe account, TEST
 mode and billing authority. Its startup checks are read-only. An existing
