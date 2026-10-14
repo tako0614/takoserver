@@ -16,7 +16,7 @@ function fixture() {
     reader: { organizationId: ORG, scopes: ["wallet:read"] },
     usageWriter: { organizationId: ORG, scopes: ["usage:write"] },
     usageReader: { organizationId: ORG, scopes: ["usage:read"] },
-    wrongOrg: { organizationId: OTHER_ORG, scopes: ["wallet:write"] },
+    wrongOrg: { organizationId: OTHER_ORG, scopes: ["wallet:read", "wallet:write"] },
   };
   const billing = {
     async wallet(organizationId: string) {
@@ -29,6 +29,31 @@ function fixture() {
         heldMicros: 0,
         availableMicros: 0,
         entries: [],
+      };
+    },
+    async usageSummary(organizationId: string) {
+      seen.push(`usageSummary:${organizationId}`);
+      if (nextError) throw nextError;
+      return {
+        organizationId,
+        currency: "USD",
+        unit: "USD-micros",
+        periodKind: "free",
+        periodStart: "2026-10-01T00:00:00.000Z",
+        periodEnd: "2026-11-01T00:00:00.000Z",
+        nextResetAt: "2026-11-01T00:00:00.000Z",
+        originalIncludedMicros: 1_500_000,
+        effectiveIncludedMicros: 1_500_000,
+        usedMicros: 0,
+        heldMicros: 0,
+        availableMicros: 1_500_000,
+        revokedMicros: 0,
+        utilizationBasisPoints: 0,
+        reached80Percent: false,
+        reached95Percent: false,
+        limitReached: false,
+        purchasedAvailableMicros: 0,
+        directAvailableMicros: 0,
       };
     },
     async lots(organizationId: string, limit?: number, cursor?: string) {
@@ -208,6 +233,12 @@ test("Organization and exact scopes are checked before hold body parsing or look
 test("wallet and usage write scopes do not grant read access", async () => {
   const { request, seen } = fixture();
   expect((await request(`/v1/organizations/${ORG}/wallet`, "writer")).status).toBe(403);
+  expect((await request(`/v1/organizations/${ORG}/wallet/usage-summary`, "writer")).status).toBe(
+    403,
+  );
+  expect((await request(`/v1/organizations/${ORG}/wallet/usage-summary`, "wrongOrg")).status).toBe(
+    403,
+  );
   expect((await request(`/v1/organizations/${ORG}/wallet/lots?limit=bad`, "wrongOrg")).status).toBe(
     403,
   );
@@ -216,6 +247,16 @@ test("wallet and usage write scopes do not grant read access", async () => {
     (await request(`/v1/organizations/${ORG}/wallet/usage-records`, "usageWriter")).status,
   ).toBe(403);
   expect(seen).toEqual([]);
+});
+
+test("usage summary serves only wallet:read for the same Organization", async () => {
+  const { request, seen } = fixture();
+  const response = await request(`/v1/organizations/${ORG}/wallet/usage-summary`, "reader");
+  expect(response.status).toBe(200);
+  expect(await response.json()).toMatchObject({
+    usageSummary: { organizationId: ORG, unit: "USD-micros", effectiveIncludedMicros: "1500000" },
+  });
+  expect(seen).toEqual([`usageSummary:${ORG}`]);
 });
 
 test("hold request rejects unknown keys and encoded path references cannot escape one component", async () => {
@@ -459,6 +500,10 @@ test("usage quantity is passed as canonical decimal text and API scope schemas a
   expect(schemas.CreateWalletHoldRequest).toBeDefined();
   expect(schemas.WalletHoldReceipt).toBeDefined();
   expect(schemas.WalletLotsResponse).toBeDefined();
+  expect(schemas.WalletUsageSummaryResponse).toBeDefined();
+  expect(
+    paths[`/v1/organizations/{organizationId}/wallet/usage-summary`]?.get?.["x-required-scopes"],
+  ).toEqual(["wallet:read"]);
   expect(schemas.CreateWalletUsageRecordRequest).toBeDefined();
   expect(schemas.WalletUsageReceipt).toBeDefined();
   const holdRequest = schemas.CreateWalletHoldRequest as {

@@ -26,6 +26,7 @@ import {
   OrgBillingError,
   type UsageReceipt,
 } from "./org-billing.ts";
+import type { OrgUsageSummary } from "./org-usage-summary.ts";
 import {
   type FundingReconcileReport,
   PaymentEventError,
@@ -650,6 +651,17 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     }
 
     if (options.billing) {
+      const usageSummary = /^\/v1\/organizations\/([^/]+)\/wallet\/usage-summary$/u.exec(
+        url.pathname,
+      );
+      if (request.method === "GET" && usageSummary) {
+        const organizationId = segment(usageSummary[1]);
+        await scoped(request, organizationId, "wallet:read");
+        return Response.json({
+          usageSummary: wireUsageSummary(await options.billing.usageSummary(organizationId)),
+        });
+      }
+
       const lots = /^\/v1\/organizations\/([^/]+)\/wallet\/lots$/u.exec(url.pathname);
       if (request.method === "GET" && lots) {
         const organizationId = segment(lots[1]);
@@ -1994,6 +2006,20 @@ function wireWallet(wallet: Wallet) {
       heldDeltaMicros: String(entry.heldDeltaMicros),
       createdAt: entry.createdAt,
     })),
+  };
+}
+
+function wireUsageSummary(summary: OrgUsageSummary) {
+  return {
+    ...summary,
+    originalIncludedMicros: String(summary.originalIncludedMicros),
+    effectiveIncludedMicros: String(summary.effectiveIncludedMicros),
+    usedMicros: String(summary.usedMicros),
+    heldMicros: String(summary.heldMicros),
+    availableMicros: String(summary.availableMicros),
+    revokedMicros: String(summary.revokedMicros),
+    purchasedAvailableMicros: String(summary.purchasedAvailableMicros),
+    directAvailableMicros: String(summary.directAvailableMicros),
   };
 }
 
