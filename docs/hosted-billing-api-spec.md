@@ -1,0 +1,520 @@
+# Hosted billing API specification proposal
+
+Status: proposed extension; source baseline `376afb5caecaf9b25da0e49b296cdfb714748bb2`.
+Target: API specification review by 2026-10-17, staging APIs/webhooks by
+2026-10-22, real Stripe test-mode acceptance by 2026-10-25, for the
+2026-11-15 shared Hosted launch. These dates do not establish deployed readiness.
+
+## Existing contract and change scope
+
+Takoserver already owns an integer USD-micros Organization wallet, hold/usage
+receipts, usage summary, subscription Checkout/cancellation, verified Stripe
+invoice grants/refunds and bounded reconciliation. Extend that implementation.
+The historical cents proposal is not the new settlement authority.
+
+| Capability | Existing API | Extension in this proposal |
+| --- | --- | --- |
+| Usage summary | `GET /v1/organizations/{organizationId}/wallet/usage-summary` | Opaque Workspace attribution and a same-snapshot usage breakdown |
+| Subscription | `GET`, `POST`, `PATCH /v1/organizations/{organizationId}/payments/subscription` | Next-period plan change, preserving existing start/cancellation shapes |
+| Top-up | `POST /v1/organizations/{organizationId}/wallet/checkout` | Durable reference and payment scope; this existing route is the top-up API |
+| Personal Organization | Generic `POST /v1/organizations` | Proposed session-only `POST /v1/organizations/personal`, unique per local principal |
+| Limit policy | Not implemented | Proposed `GET`/`PATCH /v1/organizations/{organizationId}/wallet/limit-policy` |
+| Pricing publication | Existing authoring/compiler and immutable tariff registration | Reviewed publication/readback using the same revision authority |
+| Webhooks | `POST /v1/payments/stripe/webhook` | Reuse invoice/subscription/Checkout/refund settlement and reconciliation |
+
+All extensions below remain proposals until the owning runtime and generated
+OpenAPI change together. Existing routes and shapes are defined by the
+[route table](../src/route-table.ts), [control boundary](../src/control.ts),
+and [generated OpenAPI](../openapi/takoserver.openapi.json).
+
+[#343](https://github.com/tako0614/takoserver/pull/343), head
+`8c0ff298a1ab560f2a66c93a341e2d7fb8c6b67a`, owns the subscription table's
+three/four-row OpenAPI correction and regression. Consume that reviewed change;
+this proposal neither copies it nor introduces a second subscription API.
+The runtime v2 table has Free, two monthly choices and usage; legacy v1 has
+three rows. Four rows still represent three commercial roles.
+
+## Ownership and authentication
+
+Takoserver owns Organization identity, billing authorization, the sole balance,
+pricing receipts and Stripe settlement. Takosumi Hosted owns its local user,
+Workspace membership, product access and immutable mapping to an Organization
+and a random opaque `workspaceRef`. It calls the authenticated API server-side.
+Neither a client-supplied billing subject nor an email proves Organization
+ownership. Shared login design does not grant cross-product authorization.
+
+One Organization balance, allowance and subscription cover both products and
+all its Workspaces. A Workspace does not create another balance or free grant.
+Literal Hosted account, Workspace and session identifiers stay in Hosted.
+Existing generated policy still assigns separate retail Stripe authority to
+Hosted: canonical governance adoption and retirement of the predecessor
+retail writer are separate prerequisites for unified live composition.
+Self-host retains its independent account/wallet and does not acquire these
+Hosted commercial defaults merely by running Takoserver OSS.
+
+| Operation | Authority |
+| --- | --- |
+| Wallet, summary, breakdown, limit-policy and subscription reads | `wallet:read` for the exact Organization, or the existing permitted owner session |
+| Holds/capture/release | `wallet:write` |
+| Closed usage submission/listing | `usage:write` / `usage:read` |
+| Subscription and top-up commands | `payments:write`, or the existing permitted owner session |
+| Limit-policy changes | Proposed `payments:write`, or permitted owner session; wallet writers cannot authorize card charges |
+| Personal Organization creation | Authenticated local Takoserver principal's session only |
+| Webhook | Signature over exact raw bytes, followed by realm/custody verification |
+
+Authenticate and check the exact Organization/scope before looking up billing
+objects or parsing the command body. Scopes do not imply other scopes.
+Current top-up is owner-session-only; accepting `payments:write` is an explicit
+extension. Personal creation does not accept an arbitrary principal ID, API
+key impersonation, Hosted session or caller-selected owner. A future delegated
+account bootstrap requires its own reviewed account contract.
+
+## Money, plans and monthly entitlements
+
+Currency is USD. Public amount fields are canonical nonnegative decimal integer
+strings in `*Micros`; ledger deltas (`settledDeltaMicros`, `heldDeltaMicros`)
+permit canonical signed integers without negative zero. One USD is 1,000,000
+micros and one cent is 10,000 micros.
+Use checked integer/BigInt arithmetic; reject unsafe values and aggregate
+overflow. Historical `microcent-v1` receipts retain their unit and original
+fingerprint. Commercial cash fields such as `amountMinor` retain integer cents.
+
+| Offer | Monthly cash | Included consumption |
+| --- | --- | --- |
+| Free | No charge and no card | `1500000` micros (USD 1.50) |
+| USD 10 plan | 1,000 cents | `20000000` micros (USD 20) |
+| USD 50 plan | 5,000 cents | `100000000` micros (USD 100) |
+| Top-up | User-selected bounded cents | Exactly `amountMinor * 10000` micros |
+
+These amounts come from the reviewed [shared pricing source](shared-hosted-pricing.md).
+Plan identifiers and TEST Price bindings remain configured values. Clients
+select a configured plan, never supply a subscription price or included grant.
+Free grants are once per Organization per frozen UTC calendar month. Paid
+allowance follows the verified monthly invoice line's service period and
+expires at its end. Top-ups do not reset monthly; retain their pinned purchase
+expiry policy. `nextResetAt` means the current grant ends, not that another
+invoice has already paid or a new allowance is guaranteed.
+
+During verified paid coverage, Free does not stack with paid included credit
+and is excluded from new allocation. Previously pinned Free holds and history
+survive. A partial refund leaves remaining paid coverage; a full settled refund
+or coverage end restores eligibility only under the existing refund/fence rules.
+No `active` subscription status alone funds a lot or establishes paid features.
+
+Consumption uses eligible Free, then subscription, then explicitly eligible
+purchased credit. Within each class use earliest expiry, then stable creation
+and reference ties. Do not silently substitute global FIFO. Unknown historical
+direct-credit provenance remains separately reported and cannot be guessed.
+
+Usage prices are exactly three times the configured Cloudflare overage price.
+Store exact rational quantities/rates; ceiling the complete closed measurement
+once to integer micros (including a sub-micro measurement such as 0.9 micros
+becoming 1 micro). Aggregate payable micros over the closed billing period
+and ceiling to cents once: `payableMinor = (payableMicros + 9999) / 10000` with
+integer division. Two payable items of 4,001 micros yield 1 cent together,
+not 2 cents. Zero payable micros yield zero cents. Paid prepaid consumption
+already debited from lots is not billed again. Invoice collection and its
+cash-versus-micros rounding difference need one durable period receipt.
+
+## Usage summary and Workspace attribution
+
+Existing response remains `{usageSummary: {...}}`. Its required fields are
+`organizationId`, `currency: "USD"`, `unit: "USD-micros"`, `periodKind:
+"free" | "paid"`, `periodStart`, `periodEnd`, `nextResetAt`,
+`originalIncludedMicros`, `effectiveIncludedMicros`, `usedMicros`, `heldMicros`,
+`availableMicros`, `revokedMicros`, `utilizationBasisPoints`,
+`reached80Percent`, `reached95Percent`, `limitReached`,
+`purchasedAvailableMicros`, and `directAvailableMicros`. Money is strings;
+utilization is an integer, warning/limit flags are booleans, times are canonical
+UTC ISO timestamps. Preserve its current one-SQL-snapshot entitlement read.
+
+Utilization is `(used + held) / effective included allowance`, capped at
+10,000 basis points. Purchased/direct availability does not enlarge that
+denominator. Zero allowance reports zero utilization, false warning flags and
+`limitReached: true`. Alerts occur at 8,000 and 9,500 basis points. Read flags
+already exist; warning delivery is a separate durable outbox with uniqueness
+on Organization, period and threshold. Repeated reads, retries and restarts
+do not send duplicates. Release can lower utilization without erasing an
+already-delivered warning. Configure notification transport before claiming
+warnings were delivered.
+
+Proposed additional route:
+`GET /v1/organizations/{organizationId}/wallet/usage-summary/workspaces`.
+Query accepts `limit` (1-100, default 50) and an opaque `cursor`; a first-page
+optional `workspaceRef` filter returns only that authenticated Org's attribution.
+Foreign references/cursors do not reveal data. Response:
+
+```json
+{
+  "organizationId": "org_example",
+  "snapshotAt": "2026-10-15T00:00:00.000Z",
+  "periodStart": "2026-10-01T00:00:00.000Z",
+  "periodEnd": "2026-11-01T00:00:00.000Z",
+  "unit": "USD-micros",
+  "totals": {"usedMicros":"12000","heldMicros":"8000","pendingMicros":"1000"},
+  "workspaces": [{"workspaceRef":"ws_opaque","usedMicros":"10000","heldMicros":"8000","pendingMicros":"1000"}],
+  "unattributed": {"usedMicros":"2000","heldMicros":"0","pendingMicros":"0"},
+  "cursor": null
+}
+```
+
+The breakdown reports all consumption classes, not just included usage; its
+`usedMicros` therefore need not equal included-summary `usedMicros`.
+`pendingMicros` is consumed-but-unpaid usage, not available balance or another
+debit. `totals` are complete Org totals for the snapshot, never a page subtotal.
+`unattributed` is one explicit historical bucket. Filtered reads still label
+`totals` as Org totals. A single Workspace has usage/holds, not spendable balance
+or allowance. UI must not sum repeated totals across cursor pages. For an
+unfiltered snapshot, complete Workspace rows plus `unattributed` equal `totals`;
+filtered rows are a subset and cannot prove that equality by themselves.
+
+The selected period is the same current entitlement interval returned by the
+included summary, frozen at snapshot creation. Persist a hold's attribution
+interval from that interval at admission; all later capture consumption belongs
+to that original interval even after reset. `heldMicros` includes only live,
+unexpired outstanding holds assigned to the selected interval at snapshot time.
+Older-period live holds remain visible through the Org wallet/hold APIs and do
+not become current-period usage. Direct closed usage is assigned by measured
+`periodStart`, with historical entitlement boundaries resolved from immutable
+period proofs; split a measurement crossing those boundaries before submission.
+Pending usage becomes paid by changing its counted state once, never by adding
+a second measured cost or counting its payment timestamp as another period.
+Release/refund changes held or revoked accounting without creating usage.
+Historical entries without structured attribution use their immutable original
+hold-admission or closed-usage period when provable, otherwise their original
+ledger settlement timestamp, within `unattributed`; never backfill a Workspace.
+This attribution convention must be tested separately from grant-source totals.
+
+Persist `workspaceRef` as a nullable, explicit attribution column on holds and
+closed usage, receipts and exact request fingerprints. Hosted new writes
+require an Org-bound random reference; independent/self-host and historical
+writes may remain unattributed. A reference has the existing opaque-reference
+grammar and is unique within an Org. Binding is immutable while live holds or
+unpaid usage remain. Capture inherits the hold's reference and cannot switch
+Workspace. Release/refund/expiry keep the same attribution. Do not derive it
+from arbitrary hold reference text. Late usage belongs to its measured period,
+not delivery time; prepaid allocations do not become new usage rows.
+
+Pagination requires a bounded durable snapshot for mutable held/pending state;
+a timestamp-only cursor cannot reproduce a historical hold projection. Pin
+snapshot identity, Org, period, filter and stable Workspace ordering in every
+continuation. Preserve rows and complete totals across pages. Use a declared
+10-minute snapshot TTL; an expired snapshot returns a nonretryable 409 requiring
+a fresh first page. Implement/readback this schema before advertising the
+route. Concurrent settlement tests must prove pages sum to the frozen totals.
+
+## Subscription start, change and cancellation
+
+GET preserves `{subscription: <projection or null>, planTable: <existing table>}`.
+Existing projection fields are `organizationId`, `subscriptionId`, `planKey`,
+`pricingRevision`, `status`, `cancelAtPeriodEnd`, `periodStart`, `periodEnd`,
+`paidThrough`, `paidFeatures`, and `updatedAt`. Return provider fields only
+where the existing public contract already admits them; never expose secrets.
+
+POST preserves `{reference, planKey}` and 201 `{checkout: {url}}`. Begin a
+monthly subscription Checkout using the bound customer and frozen revision.
+There is at most one unresolved subscription start per Org. All processor commands below use a durable per-step receipt, immutable
+parameters and a stable processor idempotency key: customer creation,
+subscription start, schedule create/update/release, cancellation and on-demand
+charges. The original selected tariff/boundary never changes on retry.
+Apply the 23-hour unknown-ACK cutoff and authoritative readback to every step;
+never mark a multi-step command complete after only its first effect. Local
+receipts survive key pruning. No grant comes
+from Checkout creation/return or a subscription-mode Checkout event; only the
+verified paid invoice funds included credit. Free requires no Stripe customer
+or card. A paid plan needs a valid payment method through Checkout.
+
+PATCH keeps `{reference, cancelAtPeriodEnd: true|false}` and adds the exclusive
+variant `{reference, planKey}`. Reject combined actions and unknown keys with
+400. A plan change schedules the configured price at the next recurring period
+boundary, without proration, immediate cash charge or another current-period
+grant. Use a processor subscription schedule or equivalent proven next-period
+mechanism; an immediate update with no proration is insufficient proof of
+next-period price activation. Return 200 `{subscription, pendingChange}`;
+`pendingChange` is null or `{planKey, pricingRevision, effectiveAt}`. Extend GET
+with the same optional field; existing fields remain compatible.
+
+Freeze the selected future revision/Price and effective boundary in the durable
+command. The future processor phase must set `planKey` and `pricingRevision`
+metadata alongside its Price so the existing invoice pin verification sees the
+same immutable tuple. Confirm the renewal invoice carries that phase's tuple;
+updating only the Price would leave grants deferred under current validation.
+Preserve all current phase settings and the billing anchor, disable proration
+on both schedule update and phase transition, and read back the exact future
+Price/metadata tuple and boundary before recording acknowledged scheduling. Reject an unavailable/unqualified revision or a subscription with
+unresolved settlement. Only one pending plan change may exist. Cancellation
+and plan change are exclusive pending intents: cancellation releases the processor
+schedule while preserving the subscription, then sets period-end cancellation
+after authoritative readback. Never cancel the schedule to remove a pending
+change: that can immediately cancel the underlying subscription. Persist and
+recover each step of the release/cancel saga; a plan change while cancellation
+is scheduled returns 409 until a separate acknowledged withdrawal. Serialize
+commands per Org and return the committed original command result on replay.
+At renewal verify the actual invoice/Price and grant that period's selected
+included credit exactly once. Failed renewal grants no new allowance.
+Cancellation preserves paid lots until their original expiry/refund.
+
+## Idempotent top-up
+
+Top-up extends the existing `POST .../wallet/checkout`; there is no parallel
+funding endpoint or payment writer. Hosted request becomes:
+`{reference, amountMinor}`. `amountMinor` is safe integer USD cents within
+configured Checkout bounds. Preserve `{checkout: {url}}` and 201 on an exact
+replay. Existing self-host `{amountMinor}` compatibility is retained only in
+its legacy lane; Hosted callers must supply a reference. Wallet write authority
+alone cannot create Checkout or fund money. A top-up requires payment through
+Checkout and grants its verified cash face value, without paid-plan bonuses.
+
+Before the remote request, atomically persist an Org-scoped command receipt
+and fingerprint covering cash, USD, purchase purpose, canonical request,
+processor realm and frozen tariff/expiry policy. Use its stable processor
+idempotency key. Exact retries return the same URL; changed payload returns
+409 without a second effect. A definitive expired Checkout closes that command;
+a new purchase needs a new reference. Lost acknowledgement remains pending and
+requires readback/reconciliation, never a fresh reference to guess success.
+
+Retain local command receipts beyond Stripe's key retention. An unknown outcome
+older than the existing 23-hour safety cutoff requires operator reconciliation;
+never blindly retry an effect after the remote idempotency guarantee expires.
+A pending/result lookup through proposed
+`GET .../wallet/checkout/{reference}` (`wallet:read`) returns
+`{reference, state: "pending" | "ready" | "paid" | "expired", checkout: <url or null>}`.
+This read is not permission to settle funds. Definitively invalid arguments
+make no command; uncertain remote responses keep the existing receipt.
+
+The existing signed webhook and settlement verifier perform actual funding
+once per Checkout/object identity. Verify paid state, USD, amount, customer,
+purpose, test realm and pinned revision. Late payment uses original purchase
+policy; expiry starts at first verified funding and is frozen for replays.
+Separate test-mode receipts from live or connected-account objects.
+
+## Idempotent personal Organization
+
+Proposed `POST /v1/organizations/personal` is session-only and accepts an empty
+JSON object. Derive owner identity and initial display name server-side from the
+local principal; reject unknown keys. First creation returns 201
+`{organization: <existing Organization>, created: true}`; later/concurrent calls
+return 200 with the same Organization and `created: false`. The uniqueness key
+is the authenticated Takoserver principal, not the caller's reference or email.
+
+An additive unique principal-to-personal-Org mapping, Org and owner membership
+commit atomically. Concurrent transactions elect one mapping; losers read it.
+Lost-response retries return the same mapping. No card, Stripe customer or paid
+subscription is created. The existing once-per-Org monthly grant applies when
+billing is enabled; creation does not mint another free lot.
+
+Generic Organizations keep their existing identities and balances. Do not
+select a principal's first generic Org or merge funded Orgs automatically.
+Existing automatically created Org adoption requires an unambiguous protected
+mapping proof; otherwise leave adoption pending operator resolution and refuse
+a second personal grant. Mapping cannot point to a deleted or foreign-owned
+Org. Account-link/merge, ownership transfer and personal-Org deletion are
+separate reviewed lifecycle changes; principal replacement cannot reset credits.
+
+## Limit modes, consent and admission
+
+The desired policy vocabulary is exactly
+`"stop" | "prepaid" | "postpaid" | "on-demand"`; default is `"stop"`.
+Existing source has no durable Org policy and explicitly advertises postpaid
+as unsupported. An enum declaration is not execution capability.
+
+| Mode | Required behavior |
+| --- | --- |
+| `stop` | Admit from eligible included credit; stop new billable work when it cannot cover the hold; preserve reads/data and existing terminal settlement |
+| `prepaid` | Explicit owner consent enables purchased credit after included credit; no card is required to spend already-paid credit; insufficient eligible credit stops |
+| `on-demand` | Explicit off-session consent, verified saved card and user-selected monthly cash cap; successful charge creates purchased credit before admission |
+| `postpaid` | Explicit consent/cap, atomic period exposure reservations, a closed-period invoice and unpaid-collection recovery; unsupported until separately implemented and qualified |
+
+Saved card alone is never consent. Failure, SCA, timeout or unknown payment
+outcome blocks fresh billable admission while preserving data and pinned holds.
+The on-demand cash cap uses a UTC calendar month, distinct from the paid
+invoice allowance period. Pin `capPeriodStart`/`capPeriodEnd` and the original
+consent/cap revision on every cash command. Month rollover creates the next
+cap bucket without replenishing or discarding historical paid/reserved exposure.
+Unresolved previous-month effects retain their original reservation and block
+fresh charging until authoritative readback; renewal does not move them to a
+new cap month. On-demand reserves cap atomically before a charge; paid cash still counts toward
+the cap even if the following hold races/fails. Recover by reading the original
+charge intent; never bill once as prepaid and again in the period invoice.
+On-demand off-session funding additionally needs a qualified immutable
+PaymentIntent/Charge source identity and one atomic purchased-lot/ledger/grant
+proof, with paid-cash consideration and original cap reservation. Duplicate
+charge events/readback cannot credit again. Reuse original-source refund fences
+and unused/held/used/expired revocation behavior. Current migration 0095's
+source types support Checkout/invoice only; extend through a reviewed forward
+schema rather than relabeling a PaymentIntent as Checkout or reusing its ID.
+Until funding, recovery and refund lookup all qualify, capability remains false.
+Specify the top-up quantum/minimum through validated operator configuration
+and disclose it before consent. Do not choose a silent default cash cap.
+
+Proposed GET returns `{onLimit, capabilities, consentRevision, cashCapMinor,
+periodStart, periodEnd}` with unavailable modes marked false. For on-demand,
+these policy periods are the UTC cap month; prepaid/stop expose that same month
+for configuration consistency, independently of usage-summary grant periods.
+Future postpaid capability must separately declare its invoice period in its
+reviewed consent terms. PATCH accepts
+`{reference, onLimit}` for stop/prepaid; on-demand/postpaid additionally require
+`cashCapMinor` and an acknowledged `consentRevision`. `cashCapMinor` is a positive
+safe integer cents and must meet separately disclosed bounds. Reject extra
+fields; replay/conflict rules match other payment commands. Consent revisions
+identify the exact displayed charge/cap terms. Authorize and record the owner
+or delegated payment principal. Modes that lack runtime capability return 409
+without persisting an active policy or charging money. Changing cap/mode does
+not cancel existing remote effects; serialize outstanding exposure and never
+lower a cap below paid/reserved exposure.
+
+The older settled pricing proposal rejects invoice-style postpaid at launch;
+this task requests the four-value vocabulary. Preserve the value and fail closed
+while unsupported. Whether to activate postpaid for launch is an explicit owner
+review decision, not a rename of on-demand. Staging acceptance must cover each
+advertised available mode; unsupported modes must be visibly rejected.
+
+## Holds and accounting invariants
+
+Reuse the existing hold state machine and ledger. Every accepted hold has an
+immutable TTL: currently default 24 hours, validated range 60 seconds to seven
+days. Capture is at most the hold, in micros, with release of the remainder
+in the same atomic batch. Exact replay returns the original receipt; conflicts
+return 409. Unknown release persists the existing cancellation tombstone.
+At `now >= expiresAt`, the hold releases; restarted sweeps and receipt access
+cannot reopen it. Held lot allocations remain pinned across lot expiry and
+paid-Free transitions; releasing expired credit does not make it spendable.
+
+Refund, capture, release and expiry serialize against original source lots.
+Keep unused revocation, used-credit receivable and expired-credit revocation
+separate. Receivables/fences block new billable work; no unrelated credits or
+saved-card charge silently clear debt. Retain immutable terminal/history rows.
+
+## Stripe delivery and reconciliation
+
+Reuse [subscriptions/refunds](subscriptions-refunds.md), `stripe-events`,
+`stripe-billing` and their store/client; no second invoice-credit writer.
+Listen for existing Checkout events, `invoice.paid`, `invoice.payment_failed`,
+`customer.subscription.created/updated/deleted`, and existing refund events.
+Verify the exact raw signature before parsing/trusting object claims. Re-fetch
+objects using the pinned Stripe API version and the isolated TEST client.
+The processor realm is the authenticated Stripe account identity,
+`livemode: false` and the deployment's billing authority. Persist a single
+immutable realm binding for a billing database before processing unqualified
+0095 object/source IDs. Startup refuses an existing database whose account or
+mode binding disagrees; key rotation in the same verified account is permitted.
+If a database must support multiple realms, first migrate every existing
+custody/grant/command/event source to reviewed realm-qualified provenance;
+changing a secret alone cannot reinterpret old receipts.
+Refuse live mode, connected accounts, wrong customer/purpose/currency, unknown
+historical revision and ambiguous/prorated/multiple-line grants.
+
+Deduplicate both event IDs and authoritative invoice/Checkout/refund identities.
+Distinct event deliveries for one object cannot duplicate money. Grant, lot,
+ledger and period/source proof commit atomically. Stale subscription deliveries
+cannot replace verified paid coverage or undo refunds. Authenticate delivery and
+persist durable deferred work before acknowledging an unresolved effect;
+transient failures retain retryable state. Bounded reconciliation must survive
+restart, scan all streams fairly and expose unresolved/truncated work.
+A webhook ACK alone is not evidence of a grant or complete reconciliation.
+
+Stripe's [webhook guidance](https://docs.stripe.com/webhooks) requires raw-body
+verification and handling duplicate/unordered delivery. Its
+[idempotency contract](https://docs.stripe.com/api/idempotent_requests) permits
+pruning after at least 24 hours. [Subscription schedules](https://docs.stripe.com/billing/subscriptions/subscription-schedules)
+provide future-phase changes. Removing a schedule uses
+[release](https://docs.stripe.com/api/subscription_schedules/release), whereas
+[cancelling a schedule](https://docs.stripe.com/api/subscription_schedules/cancel)
+cancels its subscription. [Test clocks](https://docs.stripe.com/billing/testing/test-clocks)
+cover recurring-period simulation. These provider constraints explain the
+local durable receipts, reconciliation and proposed scheduling tests; the
+application's period/grant decisions remain this product's contract.
+
+## Pricing revision publication and Container hook
+
+Retain one shared USD-micros source and the existing versioned authoring/compiler.
+Publication validates canonical bytes/digest, unique stable plan IDs, USD,
+nonnegative rational rate numerators and positive denominators (zero-priced
+egress remains valid), grant/expiry/TTL rules, actual TEST Price currency,
+monthly recurrence, configured cash and account binding. An inactive preview
+may contain unresolved IDs; an active subscription revision may not.
+
+Persist immutable revision bytes and effective time through the existing
+tariff registration boundary. Reject changed bytes for an existing ID,
+ambiguous effective times and backdating. Pin revision/rate on grant, hold,
+usage, subscription command, invoice and refund basis. Delayed usage selects
+its historical period-start revision and splits measurements across rate
+boundaries. New revisions never reprice existing holds or paid periods.
+
+The Container hook is explicitly pending owner input:
+`{component: "container", status: "pending-owner-diff", revision: null, rates: null}`
+in the publication planning manifest, outside the active runtime meter map.
+A supplied diff must contain its revision, effective time, measurement units,
+exact rational overage basis, three-times customer rate and compatibility impact.
+Review/compile it before activation. Missing input is unsupported Container
+pricing, not zero-price usage; never invent provider costs or a Stripe Price.
+Any existing Container pricing remains under its current owner until replacement.
+
+Use the owning repository's publication entrypoint with an exact reviewed
+candidate and private target. Read back the active revision and actual public
+subscription table from both product integrations. A preview, synthetic Price
+ID or docs merge is not activation. This proposal adds no secret/config writer
+and changes no Container implementation.
+
+## Schema, errors and implementation sequence
+
+All existing migration bytes and the micros epoch remain immutable. 0096-0098
+are reserved for #342. Verify the next free number after 0098 before adding
+personal mappings, command receipts, Workspace attribution/snapshots, limit
+exposure/consent or notification outbox. Add compatibility columns/tables;
+never reconstruct historical money, wipe balances or modify the separately
+owned 0093/0094 cutover or #350. Shared staging data is protected unless its
+exact owner explicitly establishes disposal authority.
+
+Use the existing error envelope/status taxonomy. 400 is invalid shape/range,
+401/403 authentication/authority, 402 insufficient eligible prepaid credit,
+409 conflicting replay/pending command/unsupported policy/expired snapshot,
+and 503 unavailable schema/revision/maintenance or transient processor failure.
+Map new machine reasons into the owning taxonomy during coordinated
+implementation; this proposal does not claim unregistered codes already exist.
+Money refusals do not encourage automatic retries with a new reference.
+
+1. Review this specification and consume #343's contract correction.
+2. Coordinate protected OpenAPI/classification files before public changes.
+   Extend existing modules and use separate focused tests; do not modify
+   unrelated Container/actor/workerd/WfP/deployment implementations.
+3. Add independently reviewed forward schema and command/admission/attribution
+   behavior; verify legacy/self-host compatibility and protected-data proof.
+4. Run the complete local owner gate on the final committed head. Record full
+   SHA/results/log digest in each PR; QA's exact-head Approve precedes merge.
+5. Publish only isolated staging code/config/schema through owning surfaces,
+   with required schema/authority review and authoritative readback.
+6. Exercise actual Stripe TEST objects and both product consumers before
+   claiming the 2026-10-25 milestone. Production is outside this task.
+
+Before money writes, source changes can be reverted independently. After money
+writes preserve receipts/proofs and repair forward; never serve an older
+artifact that ignores revoked credit, re-enable a predecessor wallet writer,
+or delete history to make a rollback appear safe.
+
+## Acceptance and unresolved dependencies
+
+| Area | Required evidence |
+| --- | --- |
+| Wire/auth | Existing shapes/scopes, #343 three/four rows, foreign Org/Workspace refusal, payment scope separation, no personal principal injection |
+| Personal Org | Concurrent and lost-ACK creation returns one Org/membership/mapping; no duplicate free grant; ambiguous existing mapping refuses |
+| Subscription | Real TEST start and paid invoice, next-period tier change, renewal failure, cancel/withdraw and duplicate/unordered event replay; no proration/double grant |
+| Top-up | Same-ref URL/readback, changed-ref payload conflict, lost remote ACK, key-age refusal, paid face-value funding and late settlement policy |
+| Accounting | 1-micro debit, overflow/unit protection, many Workspaces/one allowance, one invoice ceiling, no repeat prepaid invoice charge |
+| Holds/refunds | Exact TTL boundary/restart, capture bound/remainder, tombstone, concurrency, source expiry and held/used/expired partial/full refunds |
+| Workspace summary | Explicit attribution, historical bucket, late periods, snapshot totals across pages/concurrent settlement, expired snapshot refusal |
+| Limits/warnings | Default stop, consented prepaid, supported on-demand cap/SCA/unknown effects, rejected unavailable postpaid, delivered 80/95 warning uniqueness |
+| Price publication | Immutable/historical rates, TEST Price readback, effective-time segmentation, missing Container hook fails closed |
+| Staging consumers | Scoped server HTTP from both products, source/revision readback, real-user free journey without card, no second retail writer |
+
+Blocking inputs remain coordinated changes to the protected contract paths,
+QA exact-head approval, qualified staging schema, TEST Price/webhook/client
+bindings and actual product integration evidence. Container activation awaits
+its owner-supplied diff. Postpaid activation and on-demand consent/cap/quantum
+configuration require explicit owner qualification; unsupported modes stay
+unavailable. Warning transport and durable snapshot realization need review.
+These dependencies are not implied by a passing local source gate.
+
+Further owning references: [micros ledger/cutover](org-billing-micros.md),
+[unified billing](unified-billing.md), [shared USD pricing](shared-hosted-pricing.md)
+and [pricing authoring](pricing-authoring.md).
