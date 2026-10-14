@@ -706,13 +706,15 @@ describe("reviewed Worker closure transition", () => {
         const queryIndex = command.indexOf("--command");
         const query = queryIndex < 0 ? undefined : command[queryIndex + 1];
         const results =
-          query?.includes("WHERE type = 'table'") === true
-            ? [{ name: "d1_migrations" }]
-            : query?.startsWith("SELECT name FROM d1_migrations") === true
-              ? [{ name: "0001_first.sql" }, { name: "0002_second.sql" }]
-              : query?.includes("WHERE name NOT GLOB 'sqlite_*'") === true
-                ? []
-                : undefined;
+          query?.startsWith("SELECT type, name, sql FROM sqlite_schema") === true
+            ? []
+            : query?.includes("WHERE type = 'table'") === true
+              ? [{ name: "d1_migrations" }]
+              : query?.startsWith("SELECT name FROM d1_migrations") === true
+                ? [{ name: "0001_first.sql" }, { name: "0002_second.sql" }]
+                : query?.includes("WHERE name NOT GLOB 'sqlite_*'") === true
+                  ? []
+                  : undefined;
         if (results === undefined) throw new Error(`unexpected remote D1 query: ${query}`);
         return {
           exitCode: 0,
@@ -746,8 +748,8 @@ describe("reviewed Worker closure transition", () => {
         state: "closure-predecessor-current",
         pendingMigrations: [],
       });
-      expect(d1Commands).toHaveLength(3);
-      expect(d1Commands.map(([executable]) => executable)).toEqual(Array(3).fill(wranglerPath));
+      expect(d1Commands).toHaveLength(4);
+      expect(d1Commands.map(([executable]) => executable)).toEqual(Array(4).fill(wranglerPath));
     });
   });
 
