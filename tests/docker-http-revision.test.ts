@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { isJsonObject } from "../src/json.ts";
 import type { JsonObject } from "../src/ports.ts";
 import {
   createDockerContainerRuntimePreparation,
@@ -64,6 +65,10 @@ function engineFixture() {
       }
       if (containers.has(name)) return { status: 409, body: "" };
       const Id = (++sequence).toString(16).padStart(64, "0");
+      const endpoints = isJsonObject(body.NetworkingConfig)
+        ? body.NetworkingConfig.EndpointsConfig
+        : null;
+      const configured = isJsonObject(endpoints) ? endpoints["installation-net"] : null;
       containers.set(name, {
         Id,
         Image: String(body.Image).split("@")[1]!,
@@ -79,8 +84,12 @@ function engineFixture() {
         NetworkSettings: {
           Networks: {
             "installation-net": {
-              IPAddress: "172.22.0.2",
-              ...(typeof network.Id === "string" ? { NetworkID: network.Id } : {}),
+              IPAddress: "",
+              // Engine stopped-create records the requested binding only;
+              // a network name lookup does not materialize an endpoint ID.
+              ...(isJsonObject(configured) && typeof configured.NetworkID === "string"
+                ? { NetworkID: configured.NetworkID }
+                : {}),
             },
           },
         },
@@ -95,7 +104,21 @@ function engineFixture() {
     const [name, current] = match;
     if (operation === "json") return { status: 200, body: JSON.stringify(current) };
     if (operation === "start") {
-      containers.set(name, { ...current, State: { Running: true } });
+      const settings = current.NetworkSettings;
+      const networks = isJsonObject(settings) ? settings.Networks : null;
+      const configured = isJsonObject(networks) ? networks["installation-net"] : null;
+      containers.set(name, {
+        ...current,
+        State: { Running: true },
+        NetworkSettings: {
+          Networks: {
+            "installation-net": {
+              ...(isJsonObject(configured) ? configured : {}),
+              IPAddress: "172.22.0.2",
+            },
+          },
+        },
+      });
       return { status: 204, body: "" };
     }
     if (operation === "stop") {
@@ -240,6 +263,29 @@ test("Host opted preparation reads exact stopped Docker identity before allowing
     Privileged: false,
     PublishAllPorts: false,
   });
+});
+
+test("opted denied-egress Docker create records the owned network ID before stopped preparation readback", async () => {
+  const fixture = engineFixture();
+  const trusted = trustedFixture(fixture, false);
+  trusted.setBeforePrepare(() => {
+    const stopped = [...fixture.containers.values()][0];
+    expect(stopped?.State).toEqual({ Running: false });
+    expect(stopped?.NetworkSettings).toEqual({
+      Networks: { "installation-net": { NetworkID: "b".repeat(64), IPAddress: "" } },
+    });
+    expect(
+      fixture.calls.find((call) => call.path.startsWith("/containers/create"))?.body
+        ?.NetworkingConfig,
+    ).toEqual({ EndpointsConfig: { "installation-net": { NetworkID: "b".repeat(64) } } });
+    expect(fixture.calls.some((call) => call.path.endsWith("/start"))).toBe(false);
+  });
+  const runtime = createDockerHttpRevisionRuntime({
+    ...fixture.options,
+    runtimePreparation: trusted.createPreparation(),
+  });
+  expect(await runtime.reconcile(revision)).toMatchObject({ state: "ready" });
+  expect(trusted.preparedNative[0]?.networkId).toBe("b".repeat(64));
 });
 
 test("Docker starts zero times for missing or incomplete trusted enforcement and revoked authority", async () => {
@@ -436,6 +482,7 @@ test("Docker HTTP revisions create, recover, coexist across update and delete on
   );
   const create = fixture.calls.find((call) => call.path.startsWith("/containers/create"));
   if (!create) throw new Error("Docker revision was not created");
+  expect(create.body?.NetworkingConfig).toBeUndefined();
   expect(create.body?.Image).toBe(revision.image);
   expect(create.body?.Env).toContain("APP.MODE=production");
   expect(create.body?.Env).toContain("_TRACE=enabled");

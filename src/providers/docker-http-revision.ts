@@ -268,8 +268,9 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
       ? current.NetworkSettings.Networks
       : null;
     const attachment = isJsonObject(networks) ? networks[options.network] : null;
-    // The owned network's name/readback cannot identify this native attachment.
-    // A stopped object without authoritative attachment identity fails closed.
+    // Bind the daemon-recorded configuration to the owned immutable network ID.
+    // A stopped object's endpoint/sandbox may not exist yet; this is not proof
+    // of a physical attachment or installed filtering on that endpoint.
     if (
       !isJsonObject(attachment) ||
       typeof attachment.NetworkID !== "string" ||
@@ -374,10 +375,24 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
           }
         }
         await verifyImage(target);
+        let creationBody = target.body;
+        if (preparation) {
+          const networkId = await requireOwnedNetwork();
+          if (networkId === null) throw new DockerHttpRevisionError("unavailable");
+          // Engine CREATE otherwise records an empty NetworkID until START.
+          // Pin configuration before the trusted external bridge preparation;
+          // that driver's installed topology readback remains mandatory.
+          creationBody = {
+            ...target.body,
+            NetworkingConfig: {
+              EndpointsConfig: { [options.network]: { NetworkID: networkId } },
+            },
+          };
+        }
         const created = await engine(
           "POST",
           `/containers/create?name=${target.name}&platform=linux%2Famd64`,
-          target.body,
+          creationBody,
         );
         if (created.status !== 201 && created.status !== 409) {
           throw new DockerHttpRevisionError("unavailable");

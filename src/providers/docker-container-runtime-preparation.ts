@@ -1,6 +1,8 @@
 import { isJsonObject } from "../json.ts";
 
-/** Host-only identity copied from an inspected Docker object, never a tenant selector. */
+/** Host-only inspected object/configured network binding, never a tenant selector.
+ * A stopped binding does not establish a kernel endpoint or installed filter.
+ */
 export interface DockerContainerNativeIdentity {
   readonly backend: "docker";
   readonly installationId: string;
@@ -9,6 +11,7 @@ export interface DockerContainerNativeIdentity {
   readonly revision: string;
   readonly nativeId: string;
   readonly network: string;
+  /** Daemon-recorded immutable network configuration, also checked against owned network readback. */
   readonly networkId: string;
   readonly image: string;
   readonly imageId: string;
