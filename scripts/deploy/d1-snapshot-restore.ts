@@ -1,4 +1,3 @@
-import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import {
   closeSync,
@@ -13,6 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
+import { DatabaseSync, constants as SQLITE } from "node:sqlite";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
 import {
@@ -324,6 +324,110 @@ export function verifySnapshotRestore(
 
 export type SnapshotLocalReader = Pick<RemoteD1, "query" | "column">;
 
+const LOCAL_EXPORT_PRAGMA =
+  /^PRAGMA\s+(?:main\.)?(?:foreign_keys|defer_foreign_keys)\s*=\s*(?:TRUE|FALSE|ON|OFF|0|1)\s*$/iu;
+const LOCAL_EXPORT_TRANSACTION = /^(?:BEGIN(?:\s+TRANSACTION)?|COMMIT(?:\s+TRANSACTION)?)$/iu;
+const LOCAL_SEQUENCE_DELETE =
+  /^DELETE\s+FROM\s+(?:sqlite_sequence|"sqlite_sequence"|`sqlite_sequence`|\[sqlite_sequence\])\s*$/iu;
+const LOCAL_RESTORE_ACTIONS = new Set<number>([
+  SQLITE.SQLITE_CREATE_TABLE,
+  SQLITE.SQLITE_CREATE_INDEX,
+  SQLITE.SQLITE_CREATE_TRIGGER,
+  SQLITE.SQLITE_CREATE_VIEW,
+  SQLITE.SQLITE_INSERT,
+  SQLITE.SQLITE_UPDATE,
+  SQLITE.SQLITE_DELETE,
+  // CREATE INDEX compiles a native REINDEX action; top-level REINDEX remains refused.
+  SQLITE.SQLITE_REINDEX,
+]);
+const LOCAL_READ_PRAGMAS = new Set([
+  "foreign_key_check",
+  "integrity_check",
+  "table_info",
+  "table_xinfo",
+  "index_list",
+  "index_info",
+  "index_xinfo",
+]);
+
+/** Validate the entire dump before any native SQL runs; counts are not authorization. */
+function assertLocalSnapshotStatements(sql: string): void {
+  for (const statement of scanSnapshot(sql).statements) {
+    const bare = bareStatement(statement);
+    if (
+      bare === "" ||
+      CREATE_TABLE.test(bare) ||
+      CREATE_INDEX.test(bare) ||
+      CREATE_TRIGGER.test(bare) ||
+      CREATE_VIEW.test(bare) ||
+      INSERT_INTO.test(bare) ||
+      LOCAL_SEQUENCE_DELETE.test(bare) ||
+      LOCAL_EXPORT_PRAGMA.test(bare) ||
+      LOCAL_EXPORT_TRANSACTION.test(bare)
+    ) {
+      continue;
+    }
+    // Do not echo arbitrary SQL, paths, or values from the snapshot.
+    throw preflightError(
+      "unsupported local snapshot SQL; only the bounded export grammar is accepted",
+    );
+  }
+}
+
+/** Native authorization also covers expressions, trigger bodies and stored views. */
+function authorizeLocalSnapshot(
+  database: DatabaseSync,
+  restoring: boolean,
+  denied: () => void,
+): void {
+  database.limits.length = MAX_SNAPSHOT_BYTES;
+  database.limits.sqlLength = MAX_SNAPSHOT_BYTES;
+  database.exec(
+    `PRAGMA temp_store=MEMORY; PRAGMA page_size=4096; PRAGMA max_page_count=${MAX_SNAPSHOT_BYTES / 4096};`,
+  );
+  const functions = new Set(
+    database
+      .prepare("PRAGMA function_list")
+      .all()
+      .flatMap((row) =>
+        row.builtin === 1 &&
+        typeof row.name === "string" &&
+        row.name.toLowerCase() !== "load_extension"
+          ? [row.name.toLowerCase()]
+          : [],
+      ),
+  );
+  if (!restoring) database.exec("PRAGMA query_only=ON");
+  database.setAuthorizer((action, first, second, schema) => {
+    let allowed = schema === null || schema.toLowerCase() === "main";
+    if (allowed) {
+      if (action === SQLITE.SQLITE_FUNCTION) {
+        allowed = functions.has(second?.toLowerCase() ?? "");
+      } else if (action === SQLITE.SQLITE_PRAGMA) {
+        const pragma = first?.toLowerCase() ?? "";
+        // Bun's native serialize() reads these two main-database metadata pragmas.
+        allowed =
+          ((pragma === "page_count" || pragma === "page_size") && second === null) ||
+          (restoring
+            ? (pragma === "foreign_keys" || pragma === "defer_foreign_keys") &&
+              /^(?:true|false|on|off|0|1)$/iu.test(second ?? "")
+            : LOCAL_READ_PRAGMAS.has(pragma));
+      } else if (action === SQLITE.SQLITE_TRANSACTION) {
+        allowed = restoring && (first === "BEGIN" || first === "COMMIT");
+      } else {
+        allowed =
+          action === SQLITE.SQLITE_READ ||
+          action === SQLITE.SQLITE_SELECT ||
+          action === SQLITE.SQLITE_RECURSIVE ||
+          (restoring && LOCAL_RESTORE_ACTIONS.has(action));
+      }
+    }
+    if (allowed) return SQLITE.SQLITE_OK;
+    denied();
+    return SQLITE.SQLITE_DENY;
+  });
+}
+
 /**
  * Restore only into memory and use the same strict readback checks as the D1
  * surface. Optional source-owned inspectors can hash rows through a read-only
@@ -342,15 +446,25 @@ export async function inspectSnapshotDumpLocally<T = undefined>(
 }> {
   const normalized = normalizeSnapshotDump(bytes);
   const expected = deriveSnapshotExpectations(normalized.sql);
-  let database = new Database(":memory:");
+  assertLocalSnapshotStatements(normalized.sql);
+  let unauthorized = false;
+  const options = { allowExtension: false, enableForeignKeyConstraints: false } as const;
+  let database = new DatabaseSync(":memory:", options);
   try {
+    authorizeLocalSnapshot(database, true, () => {
+      unauthorized = true;
+    });
     database.exec(normalized.sql);
-    const readOnly = Database.deserialize(database.serialize(), true);
+    const serialized = database.serialize();
     database.close();
-    database = readOnly;
+    database = new DatabaseSync(":memory:", options);
+    database.deserialize(serialized);
+    authorizeLocalSnapshot(database, false, () => {
+      unauthorized = true;
+    });
     const reader: SnapshotLocalReader = {
       async query(_phase, _description, sql) {
-        return database.query(sql).all() as Record<string, unknown>[];
+        return database.prepare(sql).all();
       },
       async column(phase, description, sql, name) {
         return readExactStringRows(reader, phase, description, sql, name);
@@ -364,7 +478,7 @@ export async function inspectSnapshotDumpLocally<T = undefined>(
         JSON.stringify(comparison.mismatches),
       );
     }
-    const integrity = database.query("PRAGMA integrity_check").all();
+    const integrity = database.prepare("PRAGMA integrity_check").all();
     if (JSON.stringify(integrity) !== JSON.stringify([{ integrity_check: "ok" }])) {
       throw verificationError("local snapshot restore failed its integrity check");
     }
@@ -378,9 +492,13 @@ export async function inspectSnapshotDumpLocally<T = undefined>(
     };
   } catch (error) {
     if (error instanceof DeployError) throw error;
-    throw verificationError("local snapshot restore or read-only inspection failed");
+    throw verificationError(
+      unauthorized
+        ? "local snapshot restore or read-only inspection failed: unauthorized SQLite operation"
+        : "local snapshot restore or read-only inspection failed",
+    );
   } finally {
-    database.close();
+    if (database.isOpen) database.close();
   }
 }
 

@@ -383,6 +383,85 @@ describe("snapshot expectations", () => {
 });
 
 describe("snapshot restore verification", () => {
+  test("local memory-only restore refuses an attachment before native execution", async () => {
+    let inspected = false;
+    const error = await rejected(
+      inspectSnapshotDumpLocally(
+        Buffer.from(
+          `${DUMP}\nATTACH ':memory:' AS scratch; PRAGMA scratch.user_version=17; DETACH scratch;`,
+        ),
+        async () => {
+          inspected = true;
+        },
+      ),
+    );
+    expect(error.phase).toBe("preflight");
+    expect(error.message).toContain("unsupported local snapshot SQL");
+    expect(inspected).toBe(false);
+  });
+
+  test.each([
+    "VACUUM INTO NULL;",
+    "PRAGMA user_version=17;",
+    "PRAGMA temp_store=FILE;",
+    "SELECT 1;",
+    "SAVEPOINT scratch; RELEASE scratch;",
+    "CREATE VIRTUAL TABLE scratch USING fts5(note);",
+  ])("local restore refuses unsupported export SQL: %s", async (statement) => {
+    const error = await rejected(inspectSnapshotDumpLocally(Buffer.from(`${DUMP}\n${statement}`)));
+    expect(error.phase).toBe("preflight");
+    expect(error.message).toContain("unsupported local snapshot SQL");
+  });
+
+  test.each([
+    "INSERT INTO beta VALUES (3, fts5_source_id());",
+    "CREATE TRIGGER beta_external AFTER INSERT ON beta BEGIN SELECT fts5_source_id(); END; INSERT INTO beta VALUES (3, 'trigger');",
+  ])(
+    "native authorization refuses extension functions through valid export DDL/DML",
+    async (sql) => {
+      let inspected = false;
+      const error = await rejected(
+        inspectSnapshotDumpLocally(Buffer.from(`${DUMP}\n${sql}`), async () => {
+          inspected = true;
+        }),
+      );
+      expect(error.phase).toBe("verification");
+      expect(error.message).toContain("unauthorized SQLite operation");
+      expect(inspected).toBe(false);
+    },
+  );
+
+  test("read-only snapshot authorization also refuses a stored view's extension function", async () => {
+    const error = await rejected(
+      inspectSnapshotDumpLocally(
+        Buffer.from(`${DUMP}\nCREATE VIEW extension_view AS SELECT fts5_source_id() AS version;`),
+        async (reader) =>
+          reader.query("verification", "extension view", "SELECT * FROM extension_view"),
+      ),
+    );
+    expect(error.phase).toBe("verification");
+    expect(error.message).toContain("unauthorized SQLite operation");
+  });
+
+  test("source-owned inspection cannot attach even another in-memory database", async () => {
+    const error = await rejected(
+      inspectSnapshotDumpLocally(dumpBytes(), async (reader) =>
+        reader.query("verification", "attachment denied", "ATTACH ':memory:' AS scratch"),
+      ),
+    );
+    expect(error.phase).toBe("verification");
+    expect(error.message).toContain("unauthorized SQLite operation");
+  });
+
+  test("canonical export transactions, bounded pragmas and SQL-looking literals remain valid", async () => {
+    const bytes = Buffer.from(
+      `PRAGMA foreign_keys=OFF; BEGIN TRANSACTION; ${DUMP}\nINSERT INTO beta VALUES (3, 'ATTACH '':memory:'' AS scratch; VACUUM INTO NULL;'); COMMIT;`,
+    );
+    const result = await inspectSnapshotDumpLocally(bytes);
+    expect(result.readback.rowCounts).toEqual({ alpha: 2, beta: 3 });
+    expect(result.readback.foreignKeyViolations).toBe(0);
+  });
+
   test("source-owned local restore verifies a trigger-bearing NUL snapshot before row inspection", async () => {
     const dump = Buffer.from(
       `${DUMP}\nCREATE TRIGGER alpha_side_effects AFTER INSERT ON alpha BEGIN SELECT 1; INSERT INTO beta SELECT NEW.id + 10, NEW.note; END;`,
