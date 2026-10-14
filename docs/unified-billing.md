@@ -397,12 +397,19 @@ a view with its fetch time, but cannot maintain or write a second balance.
 
 | View | Shared meaning and source |
 | --- | --- |
-| Available / 利用可能残高 | `/wallet.availableMicros`: eligible credit that can fund a new hold, after existing holds and expiry |
+| Available / 利用可能残高 | `/wallet.availableMicros`: unallocated eligible credit after holds, expiry and refund freezes; a refund receivable can still block a new hold |
 | Held / 確保中 | `/wallet.heldMicros`: allocations reserved for live operations; not a completed charge or extra available credit |
-| Current credit / 現在のクレジット | `/wallet.settledMicros`: expiry-aware eligible credit including held allocations; exact `settledMicros = availableMicros + heldMicros` |
+| Current credit / 現在のクレジット | `/wallet.settledMicros`: expiry-aware eligible credit including held and frozen allocations; exact `settledMicros = availableMicros + heldMicros + frozenMicros` |
+| Frozen / 返金処理中の凍結額 | `/wallet.frozenMicros`: original-lot credit unavailable while refund settlement is pending or unresolved; never available or an extra balance |
+| Refund receivable / 返金未回収額 | `/wallet.refundReceivableMicros`: non-spendable debt from refunded credit already used; separate from current credit and blocks new billable admission even when available credit is positive |
 | Free / Subscription / Purchased | Lot `consumptionClass`, original grant/purchase, remaining, held, available and expiry; display in the fixed consumption order |
 | Edge-resource allowance | Configured quota units, period, used and remaining resources; separate from monetary credit and never added to the wallet |
 | Postpaid usage | Confirmed payable usage, pending cap reservation, cash cap and invoiced/uncollected amounts; separate from the nonnegative prepaid wallet |
+
+Show frozen credit and refund receivables separately. A positive available
+figure is not permission to create a new hold while a refund receivable remains;
+display the admission restriction and the `refund_receivable` conflict rather
+than claiming that unrelated credit clears it.
 
 Do not compute current credit from a sum of historical funding, the last 100
 ledger entries or an expired lot's `remainingMicros`. Expired unused credit is
@@ -804,7 +811,7 @@ the unregistered TASK-0100 handoff is implementation planning input only.
 | 4 | takoserver / `106603b4` | #325 configuration/subscription/refund alignment and its gate; separate capped postpaid acceptance. This revision does not modify that owner's config, compiler, pricing or runtime files |
 | 5 | takosumi-hosted | Adapt PR #54 fake/port to micros receipts, unpaid usage, real scoped HTTP client, durable local mapping, and single-writer retail retirement; retain draft isolation until wire exists |
 | 6 | takosumi / takosumi-hosted | Bridge OSS Seam B through authenticated server RPC, discard `billingSubjectId`, use measured actual cost rather than OSS's current estimate-as-capture, wire cancellation/deadline checks; keep Run authority in OSS and self-host outside Hosted billing |
-| 7 | takoserver-private / takosumi-hosted | Owner consumes reviewed schema/CPE prerequisites, composes private tariffs/Stripe settings, and snapshots/rehearses cutover; terminal `4d7bccc3` owns staging D1 apply/deploy/test, including test-mode journeys |
+| 7 | takoserver-private / takosumi-hosted | Owner consumes reviewed schema/CPE prerequisites, composes private tariffs/Stripe settings, and snapshots/rehearses cutover; operator session `04360c33` owns qualified staging 0093/0094/0095 application following the CTO 2026-10-14 12:00 JST handoff; `4d7bccc3` remains the staging target/deploy/test coordination contact |
 | 8 | takoserver / takosumi-hosted | Adopt the common Organization screen labels, cents presentation with exact sub-cent details, expiry-aware lot list, strict cent cash input and pending/error states; complete class totals require one authoritative snapshot |
 
 Minimum implementation proof includes `C > H` with no writes; zero capture;

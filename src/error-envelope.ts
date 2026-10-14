@@ -74,6 +74,7 @@ export const HOST_ERROR_HTTP_STATUS: Readonly<Record<string, readonly number[]>>
   pricing_revision_conflict: [503],
   pricing_revision_unavailable: [409],
   reference_conflict: [409],
+  refund_receivable: [409],
   usage_period_crosses_tariff: [409],
   conflict: [409],
   expired: [409],

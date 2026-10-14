@@ -82,6 +82,7 @@ const STRIPE_EVENTS = "0091_stripe_events.sql";
 const ORG_WALLET_LIFECYCLE = "0092_org_wallet_lifecycle.sql";
 const WALLET_CLASSIFICATION_PREPARATION = "0093_wallet_credit_classification_proofs.sql";
 const WALLET_USD_MICROS = "0094_wallet_usd_micros.sql";
+const STRIPE_BILLING = "0095_stripe_billing.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -145,6 +146,7 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ORG_WALLET_LIFECYCLE,
   WALLET_CLASSIFICATION_PREPARATION,
   WALLET_USD_MICROS,
+  STRIPE_BILLING,
 ] as const;
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
@@ -879,6 +881,7 @@ describe("bringing a local database up to date", () => {
       ORG_WALLET_LIFECYCLE,
       WALLET_CLASSIFICATION_PREPARATION,
       WALLET_USD_MICROS,
+      STRIPE_BILLING,
     ]);
 
     const digest = (character: string) => `sha256:${character.repeat(64)}`;
@@ -1184,6 +1187,7 @@ describe("bringing a local database up to date", () => {
         ORG_WALLET_LIFECYCLE,
         WALLET_CLASSIFICATION_PREPARATION,
         WALLET_USD_MICROS,
+        STRIPE_BILLING,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
@@ -1782,6 +1786,7 @@ describe("bringing a local database up to date", () => {
       ORG_WALLET_LIFECYCLE,
       WALLET_CLASSIFICATION_PREPARATION,
       WALLET_USD_MICROS,
+      STRIPE_BILLING,
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -1957,6 +1962,7 @@ describe("bringing a local database up to date", () => {
       ORG_WALLET_LIFECYCLE,
       WALLET_CLASSIFICATION_PREPARATION,
       WALLET_USD_MICROS,
+      STRIPE_BILLING,
     ]);
     expect(
       database
@@ -2939,6 +2945,7 @@ describe("bringing a local database up to date", () => {
       ORG_WALLET_LIFECYCLE,
       WALLET_CLASSIFICATION_PREPARATION,
       WALLET_USD_MICROS,
+      STRIPE_BILLING,
     ]);
     expect(
       database
