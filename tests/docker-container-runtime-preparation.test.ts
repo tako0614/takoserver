@@ -1,5 +1,9 @@
 import { expect, test } from "bun:test";
 import {
+  createDockerContainerCreateCustody,
+  type DockerContainerCreateCustody,
+} from "../src/providers/docker-container-create-custody.ts";
+import {
   createDockerContainerRuntimePreparation,
   type DockerContainerNativeIdentity,
   type DockerContainerRuntimePolicy,
@@ -264,6 +268,63 @@ test("running recovery only reads trusted enforcement and never prepares or clai
   expect(installs).toBe(0);
   expect(readbacks).toBe(1);
   expect(f.claims.size).toBe(1);
+});
+
+test("secret preparation cannot bypass typed custody or mix its declared names and policy", () => {
+  const f = fixture();
+  let ownerCalls = 0;
+  const custody = createDockerContainerCreateCustody({
+    policy: f.options.policy,
+    requiredSecretNames: ["TOKEN"],
+    owner: {
+      read: async () => {
+        ownerCalls++;
+        return null;
+      },
+      claim: async () => {
+        throw new Error("synthetic unreachable owner");
+      },
+      withAuthority: async () => {
+        throw new Error("synthetic unreachable owner");
+      },
+      bindNative: async () => {
+        throw new Error("synthetic unreachable owner");
+      },
+      confirmRemoved: async () => {
+        throw new Error("synthetic unreachable owner");
+      },
+    },
+  });
+  expect(() =>
+    createDockerContainerRuntimePreparation({
+      ...f.options,
+      requiredSecretNames: ["TOKEN"],
+      createCustody: custody,
+    }),
+  ).not.toThrow();
+  expect(() =>
+    createDockerContainerRuntimePreparation({
+      ...f.options,
+      requiredSecretNames: ["OTHER"],
+      createCustody: custody,
+    }),
+  ).toThrow("conflict");
+  expect(() =>
+    createDockerContainerRuntimePreparation({
+      ...f.options,
+      policy: { ...f.options.policy, generation: f.options.policy.generation + 1 },
+      requiredSecretNames: ["TOKEN"],
+      createCustody: custody,
+    }),
+  ).toThrow("conflict");
+  expect(() =>
+    createDockerContainerRuntimePreparation({
+      ...f.options,
+      requiredSecretNames: ["TOKEN"],
+      createCustody: {} as DockerContainerCreateCustody,
+    }),
+  ).toThrow("invalid_request");
+  expect(ownerCalls).toBe(0);
 });
 
 test("running native adoption without a durable Host start claim is refused", async () => {

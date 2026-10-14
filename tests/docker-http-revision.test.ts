@@ -1,6 +1,17 @@
 import { expect, test } from "bun:test";
+import { chmod, mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { Socket } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { isJsonObject } from "../src/json.ts";
 import type { JsonObject } from "../src/ports.ts";
+import {
+  createDockerContainerCreateCustody,
+  type DockerContainerCreateCustody,
+  type DockerContainerCreateOwnerPort,
+  type DockerContainerCreateRecord,
+} from "../src/providers/docker-container-create-custody.ts";
 import {
   createDockerContainerRuntimePreparation,
   type DockerContainerNativeIdentity,
@@ -25,7 +36,7 @@ const revision: DockerHttpRevision = {
   environment: { MODE: "test", "APP.MODE": "production", _TRACE: "enabled" },
 };
 
-function engineFixture() {
+function engineFixture(recordRequestBodies = true) {
   const containers = new Map<string, JsonObject>();
   const calls: { method: string; path: string; body?: JsonObject }[] = [];
   let sequence = 0;
@@ -39,7 +50,7 @@ function engineFixture() {
     Labels: { "takoserver.installation": "selfhost-one" },
   };
   const engine: NonNullable<DockerHttpRevisionOptions["engine"]> = async (method, path, body) => {
-    calls.push({ method, path, ...(body === undefined ? {} : { body }) });
+    calls.push({ method, path, ...(body === undefined || !recordRequestBodies ? {} : { body }) });
     const url = new URL(path, "http://docker.invalid");
     if (method === "GET" && url.pathname === "/networks/installation-net") {
       return { status: 200, body: JSON.stringify(network) };
@@ -214,9 +225,12 @@ function trustedFixture(fixture: ReturnType<typeof engineFixture>, internet = tr
       return "claimed" as const;
     },
   });
-  const createPreparation = () =>
+  const createPreparation = (createCustody?: DockerContainerCreateCustody) =>
     createDockerContainerRuntimePreparation({
       policy,
+      ...(createCustody
+        ? { createCustody, requiredSecretNames: createCustody.requiredSecretNames }
+        : {}),
       readStartClaim: async (native) =>
         claimed.has(native.nativeId) ? ("claimed" as const) : ("unclaimed" as const),
       prepare: async (native) => {
@@ -228,6 +242,7 @@ function trustedFixture(fixture: ReturnType<typeof engineFixture>, internet = tr
     });
   return {
     createPreparation,
+    policy,
     preparedNative,
     revocation,
     setCurrent: (value: boolean) => {
@@ -241,6 +256,414 @@ function trustedFixture(fixture: ReturnType<typeof engineFixture>, internet = tr
     },
   };
 }
+
+/** Synthetic owner only: its Map/current bit is not a production custody/grant. */
+function creationFixture(
+  fixture: ReturnType<typeof engineFixture>,
+  value = "synthetic-create-only",
+) {
+  const trusted = trustedFixture(fixture, false);
+  let saved: DockerContainerCreateRecord | null = null;
+  const revocation = new AbortController();
+  let current = true;
+  let claims = 0;
+  let transientMatch = false;
+  let authorityUses = 0;
+  let environmentUses = 0;
+  let removalFailure: "ack" | "authority" | null = null;
+  const owner: DockerContainerCreateOwnerPort = {
+    read: async () => saved,
+    claim: async (intent) => {
+      claims++;
+      if (saved) return { status: "existing", record: saved };
+      saved = {
+        claimId: crypto.randomUUID().replaceAll("-", "") + crypto.randomUUID().replaceAll("-", ""),
+        intent,
+        nativeId: null,
+        state: "pending",
+      };
+      return { status: "won", record: saved };
+    },
+    async withAuthority(record, _phase, use) {
+      authorityUses++;
+      if (record.claimId !== saved?.claimId) throw new Error("synthetic owner mismatch");
+      const result = await use({
+        revocation: revocation.signal,
+        stillCurrent: async () => current,
+        async withEnvironment(callback) {
+          environmentUses++;
+          const result = await callback(Object.freeze({ TOKEN: value }), revocation.signal);
+          // Native daemon fixture retains Env; verify only inside this callback.
+          transientMatch = [...fixture.containers.values()].some((native) => {
+            const config = native.Config;
+            return (
+              isJsonObject(config) &&
+              Array.isArray(config.Env) &&
+              config.Env.includes(`TOKEN=${value}`)
+            );
+          });
+          return result;
+        },
+      });
+      if (removalFailure === "authority" && saved?.state === "removed") {
+        removalFailure = null;
+        throw new Error("synthetic terminal authority completion lost");
+      }
+      return result;
+    },
+    async bindNative(record, nativeId) {
+      if (
+        !saved ||
+        saved.claimId !== record.claimId ||
+        (saved.nativeId && saved.nativeId !== nativeId)
+      )
+        throw new Error("synthetic immutable binding mismatch");
+      saved = { ...saved, nativeId, state: "bound" };
+    },
+    async confirmRemoved(record, nativeId) {
+      if (!saved || saved.claimId !== record.claimId || saved.nativeId !== nativeId)
+        throw new Error("synthetic removal mismatch");
+      saved = { ...saved, state: "removed" };
+      if (removalFailure === "ack") {
+        removalFailure = null;
+        throw new Error("synthetic terminal commit acknowledgement lost");
+      }
+    },
+  };
+  const custody = createDockerContainerCreateCustody({
+    policy: trusted.policy,
+    requiredSecretNames: ["TOKEN"],
+    owner,
+  });
+  return {
+    trusted,
+    custody,
+    revocation,
+    record: () => saved,
+    claims: () => claims,
+    transientMatch: () => transientMatch,
+    authorityUses: () => authorityUses,
+    environmentUses: () => environmentUses,
+    failRemovalOnce: (mode: "ack" | "authority") => {
+      removalFailure = mode;
+    },
+    setCurrent: (next: boolean) => {
+      current = next;
+    },
+    preparation: () => trusted.createPreparation(custody),
+  };
+}
+
+test("Docker CREATE receives secret overrides only through transient custody while revision and receipts stay nonsecret", async () => {
+  const fixture = engineFixture(false);
+  const creation = creationFixture(fixture);
+  const runtime = createDockerHttpRevisionRuntime({
+    ...fixture.options,
+    runtimePreparation: creation.preparation(),
+  });
+  const before = JSON.stringify(revision);
+  expect(await runtime.reconcile(revision)).toMatchObject({ state: "ready" });
+  expect(creation.transientMatch()).toBe(true);
+  expect(JSON.stringify(revision)).toBe(before);
+  expect(JSON.stringify(creation.record()).includes("synthetic-create-only")).toBe(false);
+  expect(JSON.stringify(fixture.calls).includes("synthetic-create-only")).toBe(false);
+  expect(creation.claims()).toBe(1);
+  await runtime.remove(revision);
+  expect(fixture.containers.size).toBe(0);
+  expect(creation.record()?.state).toBe("removed");
+  // A lost terminal acknowledgement can repeat this exact retirement.
+  await runtime.remove(revision);
+  expect(creation.record()?.state).toBe("removed");
+});
+
+test.each(["ack", "authority"] as const)(
+  "Docker exact retirement converges after lost terminal %s without reopening secret Env",
+  async (mode) => {
+    const fixture = engineFixture(false);
+    const creation = creationFixture(fixture);
+    const runtime = createDockerHttpRevisionRuntime({
+      ...fixture.options,
+      runtimePreparation: creation.preparation(),
+    });
+    const ready = await runtime.reconcile(revision);
+    if (ready.state !== "ready") throw new Error("synthetic candidate was not ready");
+    creation.failRemovalOnce(mode);
+    await expect(runtime.remove(revision, ready.nativeId)).rejects.toBeInstanceOf(
+      DockerHttpRevisionError,
+    );
+    expect(creation.record()?.state).toBe("removed");
+    expect(fixture.containers.size).toBe(0);
+    const previousEnvironmentUses = creation.environmentUses();
+    const previousCalls = fixture.calls.length;
+    await runtime.remove(revision, ready.nativeId);
+    expect(creation.environmentUses()).toBe(previousEnvironmentUses);
+    expect(fixture.calls.slice(previousCalls)).toEqual([
+      { method: "GET", path: `/containers/${ready.nativeId}/json` },
+    ]);
+    await expect(runtime.reconcile(revision)).rejects.toBeInstanceOf(DockerHttpRevisionError);
+    expect(creation.claims()).toBe(1);
+  },
+);
+
+test("Docker custody refuses public-env collisions before any native effect", async () => {
+  const fixture = engineFixture(false);
+  const creation = creationFixture(fixture);
+  const runtime = createDockerHttpRevisionRuntime({
+    ...fixture.options,
+    runtimePreparation: creation.preparation(),
+  });
+  await expect(
+    runtime.reconcile({ ...revision, environment: { TOKEN: "public" } }),
+  ).rejects.toBeInstanceOf(DockerHttpRevisionError);
+  expect(fixture.calls).toHaveLength(0);
+});
+
+test("secret CREATE rechecks current authority after awaited image preflight before sending native Env", async () => {
+  const fixture = engineFixture(false);
+  const creation = creationFixture(fixture);
+  const runtime = createDockerHttpRevisionRuntime({
+    ...fixture.options,
+    runtimePreparation: creation.preparation(),
+    engine: async (method, path, body) => {
+      const result = await fixture.engine(method, path, body);
+      if (method === "GET" && path.startsWith("/images/")) creation.setCurrent(false);
+      return result;
+    },
+  });
+  await expect(runtime.reconcile(revision)).rejects.toBeInstanceOf(DockerHttpRevisionError);
+  expect(creation.revocation.signal.aborted).toBe(false);
+  expect(fixture.calls.filter((call) => call.path.startsWith("/containers/create"))).toHaveLength(
+    0,
+  );
+  expect(fixture.calls.filter((call) => call.path.endsWith("/start"))).toHaveLength(0);
+  expect(creation.record()?.nativeId).toBe(null);
+});
+
+test("lost secret CREATE ACK and absent readback never replay CREATE or retire pending custody", async () => {
+  const fixture = engineFixture(false);
+  const creation = creationFixture(fixture);
+  let hidden = true;
+  let creates = 0;
+  const engine: NonNullable<DockerHttpRevisionOptions["engine"]> = async (method, path, body) => {
+    if (path.startsWith("/containers/create")) {
+      creates++;
+      await fixture.engine(method, path, body);
+      throw new Error("synthetic-private-create-ACK");
+    }
+    if (hidden && method === "GET" && path.startsWith("/containers/"))
+      return { status: 404, body: "" };
+    return fixture.engine(method, path, body);
+  };
+  const create = () =>
+    createDockerHttpRevisionRuntime({
+      ...fixture.options,
+      engine,
+      runtimePreparation: creation.preparation(),
+    });
+  await expect(create().reconcile(revision)).rejects.toBeInstanceOf(DockerHttpRevisionError);
+  await expect(create().reconcile(revision)).rejects.toBeInstanceOf(DockerHttpRevisionError);
+  await expect(create().remove(revision)).rejects.toBeInstanceOf(DockerHttpRevisionError);
+  expect(creates).toBe(1);
+  expect(creation.claims()).toBe(1);
+  expect(creation.record()?.state).toBe("pending");
+  expect(fixture.calls.filter((call) => call.path.endsWith("/start"))).toHaveLength(0);
+  hidden = false;
+  expect(await create().reconcile(revision)).toMatchObject({ state: "ready" });
+  expect(creates).toBe(1);
+  expect(creation.record()?.state).toBe("bound");
+  await create().remove(revision);
+  expect(creation.record()?.state).toBe("removed");
+});
+
+test("secret custody current-only expiration during health refuses readiness with enforcer still current", async () => {
+  const fixture = engineFixture(false);
+  const creation = creationFixture(fixture);
+  let healthEntered: () => void = () => undefined;
+  let releaseHealth: () => void = () => undefined;
+  const entered = new Promise<void>((resolve) => {
+    healthEntered = resolve;
+  });
+  const released = new Promise<void>((resolve) => {
+    releaseHealth = resolve;
+  });
+  const runtime = createDockerHttpRevisionRuntime({
+    ...fixture.options,
+    runtimePreparation: creation.preparation(),
+    healthFetch: async () => {
+      healthEntered();
+      await released;
+      return new Response("ok");
+    },
+  });
+  const pending = runtime.reconcile(revision);
+  await entered;
+  creation.setCurrent(false);
+  releaseHealth();
+  await expect(pending).rejects.toBeInstanceOf(DockerHttpRevisionError);
+  expect(creation.revocation.signal.aborted).toBe(false);
+  expect(creation.trusted.revocation.signal.aborted).toBe(false);
+});
+
+test("secret values never change revision fingerprints and custody markers cannot downgrade to secretless adoption", async () => {
+  const fingerprints: string[] = [];
+  for (const value of ["synthetic-value-a", "synthetic-value-b"]) {
+    const fixture = engineFixture(false);
+    const creation = creationFixture(fixture, value);
+    const runtime = createDockerHttpRevisionRuntime({
+      ...fixture.options,
+      runtimePreparation: creation.preparation(),
+    });
+    await runtime.reconcile(revision);
+    const config = [...fixture.containers.values()][0]?.Config;
+    const labels = isJsonObject(config) ? config.Labels : null;
+    if (!isJsonObject(labels) || typeof labels["takoserver.revision"] !== "string")
+      throw new Error("Missing safe labels");
+    fingerprints.push(labels["takoserver.revision"]);
+    await runtime.remove(revision);
+  }
+  expect(fingerprints[0] === fingerprints[1]).toBe(true);
+  const fixture = engineFixture();
+  const runtime = createDockerHttpRevisionRuntime(fixture.options);
+  await runtime.reconcile(revision);
+  const [name, native] = [...fixture.containers.entries()][0] ?? [];
+  if (!name || !native || !isJsonObject(native.Config) || !isJsonObject(native.Config.Labels))
+    throw new Error("Missing fixture");
+  fixture.containers.set(name, {
+    ...native,
+    Config: {
+      ...native.Config,
+      Labels: { ...native.Config.Labels, "takoserver.create-claim": "a".repeat(64) },
+    },
+  });
+  await expect(runtime.observe(revision)).rejects.toBeInstanceOf(DockerHttpRevisionError);
+});
+
+test("revoking a secret CREATE closes only its Unix request and leaves the durable outcome unknown without replay", async () => {
+  const fixture = engineFixture(false);
+  const creation = creationFixture(fixture);
+  const directory = await mkdtemp(join(tmpdir(), "dcs-"));
+  await chmod(directory, 0o700);
+  const socketPath = join(directory, "d.sock");
+  const sockets = new Set<Socket>();
+  let creates = 0;
+  let starts = 0;
+  let createSocketClosed = false;
+  let enteredCreate: () => void = () => undefined;
+  let closedCreate: () => void = () => undefined;
+  const entered = new Promise<void>((resolve) => {
+    enteredCreate = resolve;
+  });
+  const closed = new Promise<void>((resolve) => {
+    closedCreate = resolve;
+  });
+  const server = createServer(async (request, response) => {
+    try {
+      const path = (request.url ?? "").slice("/v1.51".length);
+      if (path.startsWith("/containers/create")) {
+        creates++;
+        request.socket.once("close", () => {
+          createSocketClosed = true;
+          closedCreate();
+        });
+        let bytes = 0;
+        request.on("data", (chunk: Buffer) => {
+          bytes += chunk.byteLength;
+          if (bytes > 65536) request.destroy();
+        });
+        enteredCreate();
+        return; // Withhold this ACK after headers; any send is now uncertain.
+      }
+      const chunks: Buffer[] = [];
+      await new Promise<void>((resolve, reject) => {
+        let size = 0;
+        request.on("data", (chunk: Buffer) => {
+          size += chunk.byteLength;
+          if (size > 65536) {
+            reject(new Error("bounded fixture body"));
+            request.destroy();
+          } else chunks.push(Buffer.from(chunk));
+        });
+        request.once("end", resolve);
+        request.once("error", reject);
+      });
+      if (path.endsWith("/start")) starts++;
+      const raw = Buffer.concat(chunks).toString();
+      const body = raw ? (JSON.parse(raw) as JsonObject) : undefined;
+      const result = await fixture.engine(request.method ?? "GET", path, body);
+      response.writeHead(result.status, {
+        connection: "close",
+        "content-type": "application/json",
+      });
+      response.end(result.body);
+    } catch {
+      if (!response.destroyed) {
+        response.writeHead(500);
+        response.end();
+      }
+    }
+  });
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  });
+  const { engine: _engine, ...httpOptions } = fixture.options;
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  let enteredDeadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, resolve);
+    });
+    const runtime = createDockerHttpRevisionRuntime({
+      ...httpOptions,
+      socketPath,
+      timeoutMs: 1500,
+      runtimePreparation: creation.preparation(),
+    });
+    const pending = runtime.reconcile(revision);
+    const outcome = pending.then(
+      () => null,
+      (error: unknown) => error,
+    );
+    await Promise.race([
+      entered,
+      new Promise<never>((_resolve, reject) => {
+        enteredDeadline = setTimeout(
+          () => reject(new Error("controlled CREATE did not begin")),
+          2000,
+        );
+      }),
+    ]);
+    if (enteredDeadline) clearTimeout(enteredDeadline);
+    expect(createSocketClosed).toBe(false);
+    const revokedAt = performance.now();
+    creation.revocation.abort();
+    const completed = await Promise.race([
+      Promise.all([outcome, closed]),
+      new Promise<never>((_resolve, reject) => {
+        deadline = setTimeout(
+          () =>
+            reject(
+              new Error("own CREATE socket did not close on revocation before transport timeout"),
+            ),
+          500,
+        );
+      }),
+    ]);
+    expect(completed[0] instanceof DockerHttpRevisionError).toBe(true);
+    expect(performance.now() - revokedAt < 500).toBe(true);
+    await expect(runtime.reconcile(revision)).rejects.toBeInstanceOf(DockerHttpRevisionError);
+    expect(creates).toBe(1);
+    expect(starts).toBe(0);
+    expect(creation.record()?.state).toBe("pending");
+  } finally {
+    if (deadline) clearTimeout(deadline);
+    if (enteredDeadline) clearTimeout(enteredDeadline);
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 test("Host opted preparation reads exact stopped Docker identity before allowing an external bridge start", async () => {
   const fixture = engineFixture();

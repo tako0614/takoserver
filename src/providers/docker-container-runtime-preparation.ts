@@ -1,4 +1,5 @@
 import { isJsonObject } from "../json.ts";
+import { DockerContainerCreateCustody } from "./docker-container-create-custody.ts";
 
 /** Host-only inspected object/configured network binding, never a tenant selector.
  * A stopped binding does not establish a kernel endpoint or installed filter.
@@ -56,8 +57,9 @@ export interface DockerContainerRuntimeLease {
 
 export interface DockerContainerRuntimePreparationOptions {
   readonly policy: DockerContainerRuntimePolicy;
-  /** Creation-time secret custody/recovery is unresolved: nonempty declarations fail closed. */
+  /** Nonempty declarations require the exact explicit Host creation-custody port. */
   readonly requiredSecretNames?: readonly string[];
+  readonly createCustody?: DockerContainerCreateCustody;
   /** Durable read-only lookup before any install/effect; uncertainty cannot authorize preparation. */
   readStartClaim(
     native: DockerContainerNativeIdentity,
@@ -182,6 +184,7 @@ function matchesReceipt(
 /** This guard wires trusted ports; it installs no firewall, quota, meter or billing itself. */
 export class DockerContainerRuntimePreparation {
   readonly policy: DockerContainerRuntimePolicy;
+  readonly createCustody: DockerContainerCreateCustody | undefined;
   readonly #prepare: DockerContainerRuntimePreparationOptions["prepare"];
   readonly #recover: DockerContainerRuntimePreparationOptions["recover"];
   readonly #readStartClaim: DockerContainerRuntimePreparationOptions["readStartClaim"];
@@ -198,12 +201,28 @@ export class DockerContainerRuntimePreparation {
       typeof options.prepare !== "function" ||
       typeof options.recover !== "function" ||
       typeof options.readStartClaim !== "function" ||
-      (options.requiredSecretNames !== undefined && !Array.isArray(options.requiredSecretNames))
+      (options.requiredSecretNames !== undefined && !Array.isArray(options.requiredSecretNames)) ||
+      (options.createCustody !== undefined &&
+        !(options.createCustody instanceof DockerContainerCreateCustody))
     )
       throw new DockerContainerRuntimePreparationError("invalid_request");
-    if (options.requiredSecretNames?.length)
+    if (options.requiredSecretNames?.length && !options.createCustody)
       throw new DockerContainerRuntimePreparationError("unavailable");
+    if (options.createCustody) {
+      const custody = options.createCustody;
+      const names = options.requiredSecretNames ?? [];
+      if (
+        !POLICY_KEYS.every((key) => policy[key] === custody.policy[key]) ||
+        names.length !== custody.requiredSecretNames.length ||
+        !names.every(
+          (name) => typeof name === "string" && custody.requiredSecretNames.includes(name),
+        ) ||
+        new Set(names).size !== names.length
+      )
+        throw new DockerContainerRuntimePreparationError("conflict");
+    }
     this.policy = Object.freeze({ ...policy });
+    this.createCustody = options.createCustody;
     this.#prepare = options.prepare.bind(options);
     this.#recover = options.recover.bind(options);
     this.#readStartClaim = options.readStartClaim.bind(options);
