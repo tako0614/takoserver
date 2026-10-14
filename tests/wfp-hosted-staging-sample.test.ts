@@ -1,0 +1,648 @@
+import { Database } from "bun:sqlite";
+import { expect, test } from "bun:test";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  assertPortableExercise,
+  assertSampleEvidence,
+  buildHostedSampleFixtureDocument,
+  buildWorkerVersionSpec,
+  checkHostedSampleFixture,
+  exactStagingOrigin,
+  hostedSampleResourceGraphSummary,
+  hostedSampleWorkerSource,
+  parseHostedSampleFixtureDocument,
+  runHostedStagingE2E,
+  SAMPLE_COUNTS,
+  scheduledSlots,
+  sqliteMigrationSource,
+  WFP_HOSTED_SAMPLE_FIXTURE_KIND,
+  writeHostedSampleFixture,
+} from "../scripts/wfp-hosted-staging-e2e.ts";
+import { EDGE_KV_NAMESPACE_FORM_URL } from "../src/takoform-v2/forms/edge-kv-namespace.ts";
+import { OBJECT_BUCKET_FORM_URL } from "../src/takoform-v2/forms/object-bucket.ts";
+import { SQLITE_DATABASE_FORM_URL } from "../src/takoform-v2/forms/sqlite-database.ts";
+import {
+  parseSQLiteMigrationManifest,
+  parseSQLiteMigrationSetSpec,
+} from "../src/takoform-v2/forms/sqlite-migration-set.ts";
+import {
+  parseStaticAssetBundleManifest,
+  STATIC_ASSET_BUNDLE_FORM_URL,
+} from "../src/takoform-v2/forms/static-asset-bundle.ts";
+import {
+  parseWorkerBundleManifest,
+  parseWorkerBundleSpec,
+} from "../src/takoform-v2/forms/worker-bundle.ts";
+import { WORKER_CRON_TRIGGER_FORM_URL } from "../src/takoform-v2/forms/worker-cron-trigger.ts";
+import {
+  parseWorkerVersionSpec,
+  WORKER_VERSION_FORM_URL,
+} from "../src/takoform-v2/forms/worker-specs.ts";
+
+test("WfP hosted sample fixture emits exact artifact specs and the current binding graph", async () => {
+  const { document, worker, migration, assets } = await buildHostedSampleFixtureDocument(
+    "https://artifacts.example.test/wfp-hosted/sample/",
+    new Date("2026-10-14T12:31:00Z"),
+  );
+
+  expect(document.kind).toBe(WFP_HOSTED_SAMPLE_FIXTURE_KIND);
+  expect(document.generatedAt).toBe("2026-10-14T12:31:00.000Z");
+  expect(
+    parseHostedSampleFixtureDocument(document).resourceGraph.map((entry) => entry.form),
+  ).toEqual(hostedSampleResourceGraphSummary().map((entry) => entry.form));
+  expect(document.resourceGraph.map((entry) => entry.form)).toContain(SQLITE_DATABASE_FORM_URL);
+  expect(document.resourceGraph.map((entry) => entry.form)).toContain(EDGE_KV_NAMESPACE_FORM_URL);
+  expect(document.resourceGraph.map((entry) => entry.form)).toContain(OBJECT_BUCKET_FORM_URL);
+  expect(document.resourceGraph.map((entry) => entry.form)).toContain(WORKER_VERSION_FORM_URL);
+  expect(document.resourceGraph.map((entry) => entry.form)).toContain(WORKER_CRON_TRIGGER_FORM_URL);
+  expect(document.resourceGraph.map((entry) => entry.form)).toContain(STATIC_ASSET_BUNDLE_FORM_URL);
+  expect(document.counts).toEqual(SAMPLE_COUNTS);
+  expect(parseStaticAssetBundleManifest(assets.manifestBytes).files[0]?.path).toBe("sample.txt");
+
+  expect(parseWorkerBundleSpec({ artifact: document.workerBundle.artifact })).toEqual({
+    artifact: document.workerBundle.artifact,
+  });
+  expect(parseSQLiteMigrationSetSpec({ artifact: document.sqliteMigrationSet.artifact })).toEqual({
+    artifact: document.sqliteMigrationSet.artifact,
+  });
+  expect(parseWorkerBundleManifest(worker.manifestBytes)).toMatchObject({
+    entrypoint: "worker.mjs",
+    files: [{ path: "worker.mjs", mediaType: "application/javascript+module" }],
+  });
+  expect(parseSQLiteMigrationManifest(migration.manifestBytes)).toMatchObject({
+    files: [{ path: "0001_wfp_hosted_sample.sql", mediaType: "application/sql" }],
+  });
+});
+
+test("WfP hosted WorkerVersion spec binds D1, R2, KV and scheduled handlers", () => {
+  const spec = buildWorkerVersionSpec({
+    runId: "wfp-sample-run-001",
+    workerUid: "worker-uid",
+    bundleUid: "bundle-uid",
+    databaseUid: "database-uid",
+    kvUid: "kv-uid",
+    bucketUid: "bucket-uid",
+    serviceWorkerUid: "service-worker-uid",
+    assetsUid: "asset-uid",
+  });
+
+  expect(parseWorkerVersionSpec(spec)).toEqual(spec);
+  expect(spec.handlers).toEqual(["fetch", "scheduled"]);
+  expect(spec.vars).toEqual({ E2E_RUN_ID: "wfp-sample-run-001", E2E_REVISION: "v1" });
+  expect(spec.serviceBindings).toEqual([
+    { name: "SERVICE", resource: { resourceUid: "service-worker-uid" } },
+  ]);
+  expect(spec.assets?.bundle.resourceUid).toBe("asset-uid");
+  expect(spec.sqliteBindings).toEqual([{ name: "DB", resource: { resourceUid: "database-uid" } }]);
+  expect(spec.kvBindings).toEqual([{ name: "KV", resource: { resourceUid: "kv-uid" } }]);
+  expect(spec.bucketBindings).toEqual([
+    { name: "BUCKET", resource: { resourceUid: "bucket-uid" } },
+  ]);
+});
+
+interface LocalWorker {
+  fetch(request: Request, env: Record<string, unknown>): Promise<Response>;
+  scheduled(
+    controller: { scheduledTime: number; cron: string },
+    env: Record<string, unknown>,
+  ): Promise<void>;
+}
+
+async function localApp() {
+  const worker = (await import(
+    `data:text/javascript;base64,${Buffer.from(hostedSampleWorkerSource()).toString("base64")}`
+  )) as { default: LocalWorker };
+  const db = new Database(":memory:");
+  db.exec(sqliteMigrationSource());
+  const execute = async (sql: string, params: (string | number | null)[] = []) => {
+    const result = db.query(sql).run(...params);
+    return { rows: [], rowsWritten: result.changes };
+  };
+  const values = new Map<string, { value: string; metadata?: Record<string, string> }>();
+  const objects = new Map<string, string>();
+  const uploads = new Map<string, string>();
+  const env = {
+    E2E_RUN_ID: "portable-sample-run",
+    E2E_REVISION: "v1",
+    DB: {
+      execute,
+      query: async (sql: string, params: (string | number | null)[] = []) => ({
+        rows: db.query(sql).all(...params),
+        rowsWritten: 0,
+      }),
+      transaction: async (statements: { sql: string; params?: (string | number | null)[] }[]) => {
+        const results = db.transaction(() =>
+          statements.map((item) => {
+            const result = db.query(item.sql).run(...(item.params ?? []));
+            return { rows: [], rowsWritten: result.changes };
+          }),
+        )();
+        return { results };
+      },
+    },
+    KV: {
+      get: async (key: string) =>
+        values.has(key) ? new TextEncoder().encode(values.get(key)?.value).buffer : null,
+      getWithMetadata: async (key: string) => {
+        const item = values.get(key);
+        return item
+          ? { value: new TextEncoder().encode(item.value).buffer, metadata: item.metadata }
+          : null;
+      },
+      put: async (key: string, value: string, options?: { metadata?: Record<string, string> }) => {
+        values.set(key, {
+          value,
+          ...(options?.metadata === undefined ? {} : { metadata: options.metadata }),
+        });
+      },
+      delete: async (key: string) => {
+        values.delete(key);
+      },
+      list: async (options: { prefix: string; limit: number }) => {
+        const keys = [...values.keys()].filter((key) => key.startsWith(options.prefix)).sort();
+        return {
+          keys: keys.slice(0, options.limit).map((name) => ({ name })),
+          listComplete: keys.length <= options.limit,
+        };
+      },
+    },
+    BUCKET: {
+      put: async (key: string, bytes: ArrayBuffer) => {
+        const value = new TextDecoder().decode(bytes);
+        objects.set(key, value);
+        return { etag: value, size: bytes.byteLength };
+      },
+      get: async (
+        key: string,
+        options?: { range?: { offset: number; length: number }; ifMatch?: string },
+      ) => {
+        const value = objects.get(key);
+        if (value === undefined) return null;
+        if (options?.ifMatch && options.ifMatch !== value) throw new Error("precondition_failed");
+        const body = options?.range
+          ? value.slice(options.range.offset, options.range.offset + options.range.length)
+          : value;
+        return { body: new Response(body).body, etag: value, size: value.length };
+      },
+      head: async (key: string) => (objects.has(key) ? { size: objects.get(key)?.length } : null),
+      delete: async (key: string) => {
+        objects.delete(key);
+      },
+      list: async (options: { prefix: string; limit: number }) => {
+        const keys = [...objects.keys()].filter((key) => key.startsWith(options.prefix)).sort();
+        return {
+          objects: keys.slice(0, options.limit).map((key) => ({ key })),
+          truncated: keys.length > options.limit,
+        };
+      },
+      createMultipartUpload: async (key: string) => {
+        uploads.set(key, "");
+        return { uploadId: key };
+      },
+      uploadPart: async (key: string, _id: string, partNumber: number, bytes: ArrayBuffer) => {
+        uploads.set(key, new TextDecoder().decode(bytes));
+        return { etag: "part-etag", partNumber };
+      },
+      completeMultipartUpload: async (key: string) => {
+        objects.set(key, uploads.get(key) ?? "");
+        uploads.delete(key);
+      },
+      abortMultipartUpload: async (key: string) => {
+        uploads.delete(key);
+      },
+    },
+    SERVICE: { fetch: async () => Response.json({ runId: "portable-sample-run", revision: "v1" }) },
+  };
+  const request = (path: string, method = "GET") =>
+    worker.default.fetch(
+      new Request(`https://sample.invalid${path}`, {
+        method,
+        headers: { "x-takoserver-e2e-run": env.E2E_RUN_ID },
+      }),
+      env,
+    );
+  return { worker: worker.default, env, request, db, objects, values, uploads };
+}
+
+test("portable fixture seeds real SQLite at community scale, exercises transactions and retains three-plane receipts", async () => {
+  const app = await localApp();
+  try {
+    assertSampleEvidence(
+      await (await app.request("/e2e/seed", "POST")).json(),
+      app.env.E2E_RUN_ID,
+      "v1",
+    );
+    assertPortableExercise(
+      await (await app.request("/e2e/exercise", "POST")).json(),
+      app.env.E2E_RUN_ID,
+    );
+    expect(await (await app.request("/e2e/feed")).json()).toMatchObject({ cache: "miss" });
+    expect(await (await app.request("/e2e/feed")).json()).toMatchObject({ cache: "hit" });
+    const now = Date.now();
+    const controller = { scheduledTime: Math.floor(now / 60_000) * 60_000, cron: "* * * * *" };
+    await app.worker.scheduled(controller, app.env);
+    await app.worker.scheduled(controller, app.env);
+    const evidence = await (await app.request("/e2e/evidence")).json();
+    assertSampleEvidence(evidence, app.env.E2E_RUN_ID, "v1");
+    expect(scheduledSlots(evidence, app.env.E2E_RUN_ID, now - 60_000, now + 70_000)).toEqual([
+      controller.scheduledTime,
+    ]);
+    expect(app.uploads.size).toBe(0);
+    app.env.E2E_REVISION = "v2";
+    assertSampleEvidence(
+      await (await app.request("/e2e/evidence")).json(),
+      app.env.E2E_RUN_ID,
+      "v2",
+    );
+    expect(
+      (
+        await app.worker.fetch(
+          new Request("https://sample.invalid/e2e/seed", { method: "POST" }),
+          app.env,
+        )
+      ).status,
+    ).toBe(403);
+    await app.request("/e2e/clear", "POST");
+    expect(app.objects.size).toBe(0);
+    expect(app.values.size).toBe(0);
+  } finally {
+    app.db.close();
+  }
+});
+
+test("scheduled acceptance excludes HTTP-woken later slots and rejects disagreement/duplicates", () => {
+  const runId = "scheduled-run";
+  const receipt = (slot: number) => {
+    const value = JSON.stringify({ runId, slot, posts: 1_000, invokedAt: slot + 1_000 });
+    return { slot, sql: value, kv: value, object: value };
+  };
+  expect(
+    scheduledSlots(
+      { runId, scheduled: [receipt(60_000), receipt(120_000), receipt(180_000)] },
+      runId,
+      0,
+      130_000,
+    ),
+  ).toEqual([60_000, 120_000]);
+  expect(() =>
+    scheduledSlots({ runId, scheduled: [{ ...receipt(60_000), kv: "wrong" }] }, runId, 0, 130_000),
+  ).toThrow("disagree");
+  expect(() =>
+    scheduledSlots({ runId, scheduled: [receipt(60_000), receipt(60_000)] }, runId, 0, 130_000),
+  ).toThrow("duplicate");
+  const late = {
+    ...receipt(120_000),
+    sql: JSON.stringify({ runId, slot: 120_000, posts: 1_000, invokedAt: 131_000 }),
+  };
+  expect(scheduledSlots({ runId, scheduled: [late] }, runId, 0, 130_000)).toEqual([]);
+  expect(() => scheduledSlots({ runId, scheduled: [] }, runId, 0, 10_000)).toThrow(
+    "quiet interval",
+  );
+  expect(() =>
+    assertSampleEvidence(
+      { runId, revision: "v1", counts: { ...SAMPLE_COUNTS, posts: 999 } },
+      runId,
+      "v1",
+    ),
+  ).toThrow("scale");
+});
+
+test("production and cross-origin discovery are refused before any mutation", async () => {
+  expect(() => exactStagingOrigin("https://api.takoserver.com")).toThrow("staging");
+  expect(() => exactStagingOrigin("https://api.integration.takoserver.com/path")).toThrow(
+    "staging",
+  );
+  expect(exactStagingOrigin("https://api.integration.takoserver.com/")).toBe(
+    "https://api.integration.takoserver.com",
+  );
+  let requests = 0;
+  await expect(
+    runHostedStagingE2E({
+      fixturePath: "missing",
+      origin: "https://api.takoserver.com",
+      writerSecretPath: "missing",
+      evidenceSecretPath: "missing",
+      outputPath: "missing",
+      journalPath: "missing",
+      sourceCommit: "a".repeat(40),
+      space: "sample",
+      runId: "sample-run",
+      pollSeconds: 1,
+      scheduleSeconds: 1,
+      now: () => new Date(),
+      fetcher: async () => {
+        requests++;
+        return Response.json({});
+      },
+    }),
+  ).rejects.toThrow("staging");
+  expect(requests).toBe(0);
+});
+
+async function harnessFixture() {
+  const root = await mkdtemp(join(tmpdir(), "wfp-hosted-harness-"));
+  await writeHostedSampleFixture({
+    artifactBaseUrl: "https://artifacts.example.test/sample/",
+    outputDirectory: join(root, "fixture"),
+  });
+  await writeFile(join(root, "writer.secret"), "synthetic-writer-secret-only", { mode: 0o600 });
+  await writeFile(join(root, "evidence.secret"), "synthetic-evidence-secret-only", { mode: 0o600 });
+  return {
+    root,
+    options: {
+      fixturePath: join(root, "fixture", "fixture.json"),
+      origin: "https://api.integration.takoserver.com",
+      writerSecretPath: join(root, "writer.secret"),
+      evidenceSecretPath: join(root, "evidence.secret"),
+      outputPath: join(root, "evidence.json"),
+      journalPath: join(root, "journal.jsonl"),
+      sourceCommit: "a".repeat(40),
+      space: "sample",
+      runId: "harness-sample-run",
+      pollSeconds: 1,
+      scheduleSeconds: 1,
+    },
+  };
+}
+
+test("harness drives v2 lifecycle, Service/Version rollback and dependency-ordered deletion with durable evidence", async () => {
+  const fixture = await harnessFixture();
+  type Resource = Record<string, unknown> & {
+    uid: string;
+    name: string;
+    form: string;
+    generation: number;
+    spec: Record<string, unknown>;
+    output: Record<string, unknown>;
+  };
+  const resources = new Map<string, Resource>();
+  const operations = new Map<string, Record<string, unknown>>();
+  let sequence = 0;
+  let now = Date.parse("2026-10-14T14:00:00Z");
+  const runId = fixture.options.runId;
+  const revision = (service: boolean) => {
+    const deployment = [...resources.values()].find(
+      (item) =>
+        item.name.endsWith(service ? "-service-deployment" : "-deployment") &&
+        (service || !item.name.endsWith("-service-deployment")),
+    );
+    if (!deployment) throw new Error("fixture deployment missing");
+    const selected = (deployment.spec.versions as { workerVersion: { resourceUid: string } }[])[0]
+      ?.workerVersion.resourceUid;
+    const version = resources.get(selected ?? "");
+    if (!version) throw new Error("fixture version missing");
+    return (version.spec.vars as { E2E_REVISION: string }).E2E_REVISION;
+  };
+  const references = (value: unknown, uid: string): boolean => {
+    if (!value || typeof value !== "object") return false;
+    if (!Array.isArray(value) && (value as Record<string, unknown>).resourceUid === uid)
+      return true;
+    return Object.values(value).some((item) => references(item, uid));
+  };
+  const fetcher = async (input: string, init?: RequestInit): Promise<Response> => {
+    const url = new URL(input);
+    const method = init?.method ?? "GET";
+    if (url.pathname === "/.well-known/takoform/v2")
+      return Response.json({ api: "forms.takoform.com/v2", baseUrl: `${url.origin}/host/v2` });
+    if (url.pathname === "/host/v2/support")
+      return Response.json({ supported: true, form: url.searchParams.get("form") });
+    if (url.pathname.startsWith("/host/v2/operations/"))
+      return Response.json(operations.get(url.pathname.split("/").at(-1) ?? ""));
+    if (url.pathname === "/host/v2/resources" && method === "GET")
+      return Response.json({ items: [], nextCursor: null });
+    if (url.pathname.startsWith("/host/v2/resources")) {
+      const uid = url.pathname.split("/").at(-1) ?? "";
+      const current = resources.get(uid);
+      if (method === "GET")
+        return current ? Response.json(current) : Response.json({ code: "gone" }, { status: 410 });
+      const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+      if (
+        method === "PUT" &&
+        current &&
+        JSON.stringify(body.spec) !== JSON.stringify(current.spec) &&
+        current.spec.artifact
+      ) {
+        return Response.json({ code: "invalid_spec" }, { status: 400 });
+      }
+      if (
+        method === "DELETE" &&
+        [...resources.values()].some((item) => item.uid !== uid && references(item.spec, uid))
+      ) {
+        return Response.json({ code: "dependency_conflict" }, { status: 409 });
+      }
+      const id = `operation-${++sequence}`;
+      const resourceUid = current?.uid ?? `resource-${sequence}`;
+      const resource: Resource = current
+        ? { ...current }
+        : {
+            uid: resourceUid,
+            form: String(body.form),
+            name: String(body.name),
+            generation: 0,
+            spec: {},
+            output: {},
+          };
+      resource.generation++;
+      resource.observedGeneration = resource.generation;
+      resource.phase = "idle";
+      resource.lastOperation = id;
+      if (body.spec) resource.spec = body.spec as Record<string, unknown>;
+      if (
+        resource.form.endsWith("/WorkerEndpoint/0.3.0/") ||
+        resource.form.includes("/WorkerEndpoint/")
+      ) {
+        resource.output = { hostname: "worker.integration.takoserver.com" };
+      }
+      operations.set(id, { id, resourceUid, status: "succeeded", effect: "complete" });
+      if (method === "DELETE") resources.delete(resourceUid);
+      else resources.set(resourceUid, resource);
+      return Response.json({ id, resourceUid }, { status: 202 });
+    }
+    if (![...resources.values()].some((item) => item.form.includes("/WorkerEndpoint/")))
+      return new Response(null, { status: 404 });
+    if (url.pathname === "/sample.txt") {
+      const asset = await readFile(
+        new URL("./fixtures/wfp-hosted-portable-sample/sample.txt", import.meta.url),
+      );
+      if (method === "HEAD")
+        return new Response(null, { headers: { "content-length": String(asset.byteLength) } });
+      if (new Headers(init?.headers).has("range"))
+        return new Response(asset.subarray(0, 10), { status: 206 });
+      return new Response(asset);
+    }
+    if (url.pathname === "/health" || url.pathname === "/e2e/service")
+      return Response.json({ runId, revision: revision(url.pathname === "/e2e/service") });
+    if (url.pathname === "/e2e/clear") return Response.json({ cleared: true });
+    if (url.pathname === "/e2e/feed") {
+      const prior = operations.has("feed");
+      operations.set("feed", {});
+      return Response.json({
+        cache: prior ? "hit" : "miss",
+        posts: Array.from({ length: 50 }, (_, id) => ({ id })),
+      });
+    }
+    if (url.pathname === "/e2e/exercise")
+      return Response.json({
+        sqlite: { updated: "after", remaining: 0, transactionRefused: true },
+        kv: { value: "portable-kv", metadata: { fixture: runId }, listed: true, deleted: true },
+        object: {
+          size: 15,
+          range: "portable",
+          conditional: "portable-object",
+          multipart: "multipart-object",
+          listed: true,
+          deleted: true,
+        },
+      });
+    const quietStart = Date.parse("2026-10-14T14:00:00Z");
+    const scheduled = [quietStart + 60_000, quietStart + 120_000].map((slot) => {
+      const value = JSON.stringify({ runId, slot, posts: 1_000, invokedAt: slot + 1_000 });
+      return { slot, sql: value, kv: value, object: value };
+    });
+    return Response.json({
+      runId,
+      revision: revision(false),
+      counts: SAMPLE_COUNTS,
+      attachments: Array.from({ length: 20 }, (_, i) => `Attachment ${i}`),
+      scheduled,
+    });
+  };
+  try {
+    const result = await runHostedStagingE2E({
+      ...fixture.options,
+      fetcher,
+      now: () => new Date(now),
+      pause: async (ms) => {
+        now += ms;
+      },
+    });
+    expect(result.status).toBe("HOSTED_STAGING_SCENARIOS_PASSED");
+    expect(resources.size).toBe(0);
+    expect(result.launchAcceptance).toContain("unqualified");
+    const journal = await readFile(fixture.options.journalPath, "utf8");
+    expect(journal).toContain("absence-confirmed");
+    expect(journal).toContain("refusal-confirmed");
+    expect(journal).not.toContain("synthetic-writer-secret-only");
+    expect(journal).not.toContain("synthetic-evidence-secret-only");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("unknown CREATE acknowledgement stops without retry and preserves intent without provider secret text", async () => {
+  const fixture = await harnessFixture();
+  let mutations = 0;
+  const fetcher = async (input: string, init?: RequestInit) => {
+    const url = new URL(input);
+    if (url.pathname === "/.well-known/takoform/v2")
+      return Response.json({ api: "forms.takoform.com/v2", baseUrl: `${url.origin}/host/v2` });
+    if (url.pathname.endsWith("/support"))
+      return Response.json({ supported: true, form: url.searchParams.get("form") });
+    if (url.pathname === "/host/v2/resources" && init?.method === "GET")
+      return Response.json({ items: [], nextCursor: null });
+    if (init?.method === "POST") {
+      mutations++;
+      throw new Error("provider diagnostic contains synthetic-writer-secret-only");
+    }
+    return Response.json({});
+  };
+  try {
+    await expect(
+      runHostedStagingE2E({ ...fixture.options, fetcher, now: () => new Date() }),
+    ).rejects.toThrow("acknowledgement unknown");
+    expect(mutations).toBe(1);
+    const journal = await readFile(fixture.options.journalPath, "utf8");
+    expect(journal).toContain("mutation-intent");
+    expect(journal).not.toContain("synthetic-writer-secret-only");
+    expect(JSON.parse(await readFile(fixture.options.outputPath, "utf8")).status).toBe(
+      "INCOMPLETE",
+    );
+    await expect(
+      runHostedStagingE2E({ ...fixture.options, fetcher, now: () => new Date() }),
+    ).rejects.toThrow();
+    expect(mutations).toBe(1);
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("foreign discovery cannot receive credentials and unsupported Form causes zero writes", async () => {
+  for (const foreign of [true, false]) {
+    const fixture = await harnessFixture();
+    let mutations = 0;
+    let foreignRequests = 0;
+    const fetcher = async (input: string, init?: RequestInit) => {
+      const url = new URL(input);
+      if (url.hostname !== "api.integration.takoserver.com") foreignRequests++;
+      if (init?.method === "POST") mutations++;
+      if (url.pathname === "/.well-known/takoform/v2")
+        return Response.json({
+          api: "forms.takoform.com/v2",
+          baseUrl: foreign ? "https://foreign.example.test/host/v2" : `${url.origin}/host/v2`,
+        });
+      return Response.json({ supported: false, form: url.searchParams.get("form") });
+    };
+    try {
+      await expect(
+        runHostedStagingE2E({ ...fixture.options, fetcher, now: () => new Date() }),
+      ).rejects.toThrow(foreign ? "origin" : "support");
+      expect(mutations).toBe(0);
+      expect(foreignRequests).toBe(0);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("read-only fixture verification detects altered bytes and emission never overwrites existing artifacts", async () => {
+  const fixture = await harnessFixture();
+  try {
+    expect((await checkHostedSampleFixture(fixture.options.fixturePath)).counts).toEqual(
+      SAMPLE_COUNTS,
+    );
+    await expect(
+      writeHostedSampleFixture({
+        artifactBaseUrl: "https://artifacts.example.test/sample/",
+        outputDirectory: join(fixture.root, "fixture"),
+      }),
+    ).rejects.toThrow();
+    await writeFile(
+      join(fixture.root, "fixture", "assets", "files", "sample.txt"),
+      "altered bytes",
+    );
+    await expect(checkHostedSampleFixture(fixture.options.fixturePath)).rejects.toThrow("digest");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("an accepted Operation survives a malformed Resource acknowledgement in the journal", async () => {
+  const fixture = await harnessFixture();
+  let mutations = 0;
+  const fetcher = async (input: string, init?: RequestInit) => {
+    const url = new URL(input);
+    if (url.pathname === "/.well-known/takoform/v2")
+      return Response.json({ api: "forms.takoform.com/v2", baseUrl: `${url.origin}/host/v2` });
+    if (url.pathname.endsWith("/support"))
+      return Response.json({ supported: true, form: url.searchParams.get("form") });
+    if (init?.method === "POST") {
+      mutations++;
+      return Response.json({ id: "accepted-op-owned", resourceUid: null });
+    }
+    return Response.json({ items: [], nextCursor: null });
+  };
+  try {
+    await expect(
+      runHostedStagingE2E({ ...fixture.options, fetcher, now: () => new Date() }),
+    ).rejects.toThrow();
+    expect(mutations).toBe(1);
+    expect(await readFile(fixture.options.journalPath, "utf8")).toContain("accepted-op-owned");
+    expect(JSON.parse(await readFile(fixture.options.outputPath, "utf8")).status).toBe(
+      "INCOMPLETE",
+    );
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
