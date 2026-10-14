@@ -24,6 +24,7 @@ function stripeService() {
   const customers = new Map<string, StripeObject>();
   const sessions = new Map<string, StripeObject>();
   const subscriptions = new Map<string, StripeObject>();
+  const originalSubscriptionMetadata = new Map<string, Readonly<Record<string, string>>>();
   const invoices = new Map<string, StripeObject>();
   const charges = new Map<string, StripeObject>();
   const calls: { method: string; path: string }[] = [];
@@ -134,6 +135,15 @@ function stripeService() {
           },
         });
         sessions.set(session.id, session);
+        const prefix = "subscription_data[metadata]";
+        originalSubscriptionMetadata.set(
+          session.id,
+          Object.fromEntries(
+            [...form.entries()]
+              .filter(([name]) => name.startsWith(`${prefix}[`) && name.endsWith("]"))
+              .map(([name, value]) => [name.slice(prefix.length + 1, -1), value]),
+          ),
+        );
         if (loseCheckoutAck) {
           loseCheckoutAck = false;
           return new Response("effect committed, acknowledgement lost", { status: 503 });
@@ -168,12 +178,10 @@ function stripeService() {
       subscription: "sub_process_1",
       invoice: "in_process_1",
     });
-    const metadata = {
-      organizationId: org,
-      takoserverPurpose: "hosted_subscription",
-      planKey: "hosted-10",
-      pricingRevision: "hosted-20261014-final-v1",
-    };
+    const originalMetadata = originalSubscriptionMetadata.get(session.id);
+    if (!originalMetadata || originalMetadata.organizationId !== org)
+      throw new Error("original Checkout subscription metadata absent or wrong Organization");
+    const metadata = { ...originalMetadata };
     subscriptions.set(
       "sub_process_1",
       object("sub_process_1", "subscription", {
@@ -268,7 +276,15 @@ function stripeService() {
       }),
     );
   }
-  return { server, complete, payInvoice, calls, sessions, subscriptions };
+  return {
+    server,
+    complete,
+    payInvoice,
+    calls,
+    sessions,
+    subscriptions,
+    originalSubscriptionMetadata,
+  };
 }
 
 async function start(root: string, stripeOrigin: string, operatorPublicJwk: string) {
@@ -497,6 +513,9 @@ test("subscription Checkout, invoice and cancellation custody survive killed hos
       emptyMoney,
     );
     stripe.complete(organization.id);
+    expect(stripe.subscriptions.get("sub_process_1")?.metadata).toEqual(
+      stripe.originalSubscriptionMetadata.get("cs_process_1"),
+    );
     const beforePayment = await requestReconcile(
       second.port,
       await reconcileAssertion(operator.privateJwk),
@@ -506,6 +525,17 @@ test("subscription Checkout, invoice and cancellation custody survive killed hos
       readonly: true,
     });
     try {
+      const original = heldBeforePayment
+        .query(
+          "SELECT plan_key,pricing_revision FROM stripe_subscription_checkout_intents WHERE id=?",
+        )
+        .get(pending.checkout.id) as { plan_key: string; pricing_revision: string };
+      expect(stripe.originalSubscriptionMetadata.get("cs_process_1")).toMatchObject({
+        organizationId: organization.id,
+        subscriptionCheckoutIntentId: pending.checkout.id,
+        planKey: original.plan_key,
+        pricingRevision: original.pricing_revision,
+      });
       expect(
         heldBeforePayment
           .query(
