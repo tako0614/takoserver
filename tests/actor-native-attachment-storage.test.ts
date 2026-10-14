@@ -1,13 +1,12 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { ACTOR_ABI_INTERFACE_REFS } from "../src/actor-abi-ref.ts";
-import { resolveActorAbiProfile } from "../src/actor-class-execution.ts";
-import {
+import type {
   createActorNativeOwner,
   createActorNativeSocketPort,
 } from "../src/actor-native-owner-worker.ts";
+import { actorNativeBundleRealm } from "./helpers/actor-native-bundle-realm.ts";
 
-const profile = resolveActorAbiProfile(ACTOR_ABI_INTERFACE_REFS.v2);
 const prefix = "__takoserver_actor_socket_attachment_v1:";
 const actorId = "attachment-owner";
 const socketId = "00000000-0000-4000-8000-000000000001";
@@ -20,7 +19,9 @@ function fixture(options: {
   readonly legacy?: Uint8Array;
   readonly payload?: unknown;
   readonly disconnected?: boolean;
+  readonly legacyProfile?: boolean;
   readonly completionStatus?: number;
+  readonly complete?: () => Promise<number>;
   readonly rejectPut?: boolean;
   readonly pending?: "valid" | "expired";
   readonly callback?: (port: ReturnType<typeof createActorNativeSocketPort>) => Promise<void>;
@@ -29,9 +30,21 @@ function fixture(options: {
   const kv = new Map<string, unknown>();
   if (options.payload !== undefined) kv.set(prefix + socketId, options.payload);
   const closes: (number | undefined)[] = [];
+  const closeCalls: { code: number | undefined; reason: string | undefined }[] = [];
   const reads: (Uint8Array | null)[] = [];
   const lists: { prefix: string; limit: number }[] = [];
   let delivered = 0;
+  let completions = 0;
+  class NativeWebSocket {
+    close(code?: number, reason?: string) {
+      closes.push(code);
+      closeCalls.push({ code, reason });
+    }
+  }
+  const realm = actorNativeBundleRealm(NativeWebSocket);
+  const selectedProfile = options.legacyProfile
+    ? undefined
+    : realm.resolveActorAbiProfile(ACTOR_ABI_INTERFACE_REFS.v2);
   let metadata: unknown = options.legacy
     ? { socketId, actorId, attachment: Buffer.from(options.legacy).toString("base64") }
     : { socketId, actorId, attachment: null, attachmentFormat: "owner-kv-v1" };
@@ -55,24 +68,21 @@ function fixture(options: {
       expiresAt,
     );
   }
-  const socket = {
+  const socket = Object.assign(new NativeWebSocket(), {
     deserializeAttachment: () => structuredClone(metadata),
     serializeAttachment(value: unknown) {
       metadata = structuredClone(value);
     },
     send(_value: string | ArrayBuffer) {},
-    close(code?: number) {
-      closes.push(code);
-    },
-  } as NativeSocket;
-  const Owner = createActorNativeOwner(
+  }) as NativeSocket;
+  const Owner = realm.createActorNativeOwner(
     "a".repeat(64),
     "c".repeat(64),
     { generationKey: "d".repeat(64), epoch: "epoch-1", variantKeys: ["one"] },
     undefined,
     undefined,
     undefined,
-    profile,
+    selectedProfile,
   );
   const owner = new Owner(
     {
@@ -110,12 +120,12 @@ function fixture(options: {
             delivered += 1;
             const nonce = request.headers.get("x-takoserver-private-actor-socket-nonce");
             if (!nonce) throw new Error("callback nonce missing");
-            const port = createActorNativeSocketPort(
+            const port = realm.createActorNativeSocketPort(
               { fetch: (request) => owner.fetch(request) },
               "a".repeat(64),
               actorId,
               nonce,
-              profile,
+              selectedProfile,
             );
             reads.push(await port.getAttachment(socketId));
             await options.callback?.(port);
@@ -131,8 +141,12 @@ function fixture(options: {
       ADMISSION: {
         async fetch(request) {
           const body = (await request.json()) as Record<string, unknown>;
-          if (body.action === "socket-complete")
-            return new Response(null, { status: options.completionStatus ?? 204 });
+          if (body.action === "socket-complete") {
+            completions += 1;
+            return new Response(null, {
+              status: (await options.complete?.()) ?? options.completionStatus ?? 204,
+            });
+          }
           return Response.json({
             id: actorId,
             attemptNonce: body.attemptNonce,
@@ -150,9 +164,12 @@ function fixture(options: {
     socket,
     kv,
     closes,
+    closeCalls,
     reads,
     lists,
     delivered: () => delivered,
+    completions: () => completions,
+    nativeWebSocket: NativeWebSocket,
     close: () => db.close(),
   };
 }
@@ -284,8 +301,111 @@ test("unknown callback completion retains custody and blocks retirement", async 
     );
     expect(f.reads).toEqual([bytes]);
     expect(f.kv.has(prefix + socketId)).toBe(true);
+    expect(f.completions()).toBe(3);
+    expect(f.closeCalls).toEqual([{ code: 1000, reason: "done" }]);
     await expect(f.owner.retireSocketAttachments()).rejects.toThrow("retirement unavailable");
     expect(f.kv.has(prefix + socketId)).toBe(true);
+  } finally {
+    f.close();
+  }
+});
+
+test("v2 terminal close waits for callback and Host completion before native acknowledgement", async () => {
+  const callbackEntered = Promise.withResolvers<void>();
+  const callbackReleased = Promise.withResolvers<void>();
+  const completionEntered = Promise.withResolvers<void>();
+  const completionReleased = Promise.withResolvers<void>();
+  const f = fixture({
+    payload: { actorId, bytes },
+    disconnected: true,
+    callback: async () => {
+      callbackEntered.resolve();
+      await callbackReleased.promise;
+    },
+    complete: async () => {
+      completionEntered.resolve();
+      await completionReleased.promise;
+      return 204;
+    },
+  });
+  try {
+    const terminal = f.owner.webSocketClose(f.socket, 1000, "done", true);
+    await callbackEntered.promise;
+    expect(f.closeCalls).toEqual([]);
+    expect(f.kv.has(prefix + socketId)).toBe(true);
+    callbackReleased.resolve();
+    await completionEntered.promise;
+    expect(f.closeCalls).toEqual([]);
+    expect(f.kv.has(prefix + socketId)).toBe(true);
+    completionReleased.resolve();
+    await terminal;
+    expect(f.completions()).toBe(1);
+    expect(f.closeCalls).toEqual([{ code: 1000, reason: "done" }]);
+    expect(f.kv.has(prefix + socketId)).toBe(false);
+  } finally {
+    callbackReleased.resolve();
+    completionReleased.resolve();
+    f.close();
+  }
+});
+
+test("v2 no-status terminal close never emits reserved code 1005", async () => {
+  const f = fixture({ payload: { actorId, bytes }, disconnected: true });
+  try {
+    await f.owner.webSocketClose(f.socket, 1005, "", true);
+    expect(f.closeCalls).toEqual([{ code: undefined, reason: undefined }]);
+    expect(f.kv.has(prefix + socketId)).toBe(false);
+  } finally {
+    f.close();
+  }
+});
+
+test("v2 terminal acknowledgement ignores a close method replaced during callback", async () => {
+  let replacementCalls = 0;
+  const f = fixture({
+    payload: { actorId, bytes },
+    disconnected: true,
+    callback: async () => {
+      f.socket.close = () => {
+        replacementCalls += 1;
+      };
+    },
+  });
+  try {
+    await f.owner.webSocketClose(f.socket, 1000, "done", true);
+    expect(replacementCalls).toBe(0);
+    expect(f.closeCalls).toEqual([{ code: 1000, reason: "done" }]);
+  } finally {
+    f.close();
+  }
+});
+
+test("v2 terminal acknowledgement survives native prototype replacement before entry", async () => {
+  const f = fixture({ payload: { actorId, bytes }, disconnected: true });
+  let replacementCalls = 0;
+  try {
+    f.nativeWebSocket.prototype.close = () => {
+      replacementCalls += 1;
+    };
+    await f.owner.webSocketClose(f.socket, 1000, "done", true);
+    expect(replacementCalls).toBe(0);
+    expect(f.closeCalls).toEqual([{ code: 1000, reason: "done" }]);
+  } finally {
+    f.close();
+  }
+});
+
+test("legacy terminal close keeps the released native acknowledgement behavior", async () => {
+  const f = fixture({
+    legacy: bytes.slice(0, 8_192),
+    disconnected: true,
+    legacyProfile: true,
+  });
+  try {
+    await f.owner.webSocketClose(f.socket, 1000, "done", true);
+    expect(f.reads).toEqual([bytes.slice(0, 8_192)]);
+    expect(f.completions()).toBe(1);
+    expect(f.closeCalls).toEqual([]);
   } finally {
     f.close();
   }
