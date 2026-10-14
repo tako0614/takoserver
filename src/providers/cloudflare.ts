@@ -3789,7 +3789,6 @@ async function validateCloudflareSqliteMigrationInput(
     if (!Number.isSafeInteger(totalBytes) || totalBytes > TAKOFORM_MAXIMUM_WORKER_BUNDLE_BYTES) {
       return providerValueFailure("invalid_spec", "the migration bundle is too large");
     }
-    sqlByIdentity.set(migrationIdentityKey(migration), decoded.value.statements);
     textByIdentity.set(migrationIdentityKey(migration), decoded.value.sql);
   }
 
@@ -3813,13 +3812,19 @@ async function validateCloudflareSqliteMigrationInput(
     if (decoded.value.sql !== textByIdentity.get(migrationIdentityKey(desired))) {
       return providerValueFailure("invalid_spec", "the migration suffix is invalid");
     }
+    // Past receipts keep their exact identities/bytes without being rejudged
+    // under today's SQL permissions. Prepare every unapplied file before the
+    // first guarded native batch; no retained prefix SQL enters that batch.
+    const prepared = prepareCloudflareMigrationSql(decoded.value.sql);
+    if (!prepared.ok) return prepared;
+    sqlByIdentity.set(migrationIdentityKey(migration), prepared.value);
   }
   return { ok: true, value: { sqlByIdentity } };
 }
 
 async function decodeCloudflareMigration(
   migration: ProviderSqliteMigration | ProviderSqliteMigrationIdentity,
-): Promise<ProviderValue<{ readonly sql: string; readonly statements: readonly string[] }>> {
+): Promise<ProviderValue<{ readonly sql: string }>> {
   if (!migrationIdentity(migration)) {
     return providerValueFailure("invalid_spec", "a migration identity is invalid");
   }
@@ -3838,9 +3843,12 @@ async function decodeCloudflareMigration(
   } catch {
     return providerValueFailure("invalid_spec", "a migration is not UTF-8 SQL");
   }
-  let statements: readonly string[];
+  return { ok: true, value: { sql } };
+}
+
+function prepareCloudflareMigrationSql(sql: string): ProviderValue<readonly string[]> {
   try {
-    statements = prepareMigrationSql(sql, CLOUDFLARE_D1_MAX_SQL_STATEMENT_BYTES);
+    return { ok: true, value: prepareMigrationSql(sql, CLOUDFLARE_D1_MAX_SQL_STATEMENT_BYTES) };
   } catch (error) {
     if (error instanceof MigrationSqlCapacityError) {
       return providerValueFailure(
@@ -3850,7 +3858,6 @@ async function decodeCloudflareMigration(
     }
     return providerValueFailure("invalid_spec", "a migration SQL statement is not permitted");
   }
-  return { ok: true, value: { sql, statements } };
 }
 
 const CLOUDFLARE_D1_MAX_SQL_STATEMENT_BYTES = 100_000;

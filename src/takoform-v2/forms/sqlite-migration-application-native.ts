@@ -1,4 +1,9 @@
 import { type DatabaseSync, constants as SQLITE } from "node:sqlite";
+import {
+  assertMigrationPragmaAssignments,
+  isMigrationDeferForeignKeysName,
+  isMigrationDeferForeignKeysValue,
+} from "../../sqlite-migration-policy.ts";
 import type {
   SQLiteMigrationApplicationPort,
   SQLiteMigrationEntry,
@@ -143,16 +148,29 @@ function runFileAndLedger(
   sequence: number,
   operationId: string,
 ): void {
+  // Use the same exact-slice grammar as D1/Docker/Linux, before any file effect.
+  // The native authorizer remains the runtime fence, including re-preparation.
+  assertMigrationPragmaAssignments(sqlText);
   let internalTransaction = false;
   let internalLedger = false;
+  let started = false;
   database.setAuthorizer((action, first, second, schema) => {
     if (action === SQLITE.SQLITE_TRANSACTION || action === SQLITE.SQLITE_SAVEPOINT) {
       return internalTransaction ? SQLITE.SQLITE_OK : SQLITE.SQLITE_DENY;
     }
+    if (action === SQLITE.SQLITE_PRAGMA) {
+      return started &&
+        !internalTransaction &&
+        !internalLedger &&
+        (schema === null || schema === "main") &&
+        isMigrationDeferForeignKeysName(first) &&
+        isMigrationDeferForeignKeysValue(second)
+        ? SQLITE.SQLITE_OK
+        : SQLITE.SQLITE_DENY;
+    }
     if (
       action === SQLITE.SQLITE_ATTACH ||
       action === SQLITE.SQLITE_DETACH ||
-      action === SQLITE.SQLITE_PRAGMA ||
       action === SQLITE.SQLITE_REINDEX ||
       action === SQLITE.SQLITE_ANALYZE ||
       action === SQLITE.SQLITE_COPY ||
@@ -170,7 +188,6 @@ function runFileAndLedger(
     }
     return SQLITE.SQLITE_OK;
   });
-  let started = false;
   try {
     internalTransaction = true;
     database.exec("BEGIN IMMEDIATE");
