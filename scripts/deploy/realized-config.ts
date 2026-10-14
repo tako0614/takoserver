@@ -225,6 +225,9 @@ export function deploymentVariables(
   if (target.billingConfig !== undefined) {
     vars.TAKOSERVER_BILLING_CONFIG = JSON.stringify(target.billingConfig);
   }
+  if (target.hostedPricing !== undefined) {
+    vars.TAKOSERVER_HOSTED_PRICING = target.hostedPricing;
+  }
   for (const [setting, variable] of Object.entries(PAYMENT_SETTING_VARIABLES)) {
     const value = target.stripeSettings?.[setting as keyof typeof PAYMENT_SETTING_VARIABLES];
     if (value !== undefined) vars[variable] = String(value);

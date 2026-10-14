@@ -1,4 +1,5 @@
 import type { Checkout } from "./control.ts";
+import type { HostedPricing } from "./hosted-pricing.ts";
 import type { FundingSettlementVerifier } from "./ledger.ts";
 import type { PaymentEventContext, PaymentEvents } from "./payment-events.ts";
 import {
@@ -7,6 +8,8 @@ import {
   type PaymentSettings,
   validatePaymentSettings,
 } from "./payment-settings.ts";
+import { createStripeBilling } from "./stripe-billing.ts";
+import { createStripeBillingClient } from "./stripe-billing-client.ts";
 import {
   createStripeEvents,
   DEFAULT_STRIPE_RECONCILE_LOOKBACK_SECONDS,
@@ -36,6 +39,7 @@ import { createStripeClient, createStripeSettlement } from "./stripe-settlement.
  */
 
 export interface PaymentSetupOptions {
+  readonly hostedPricing?: HostedPricing | undefined;
   /** Stripe secret key. Its presence is what turns payment on. */
   readonly stripeSecretKey?: string | undefined;
   /** Signing secret of this deployment's Stripe webhook endpoint. */
@@ -59,7 +63,16 @@ export function resolvePayment(options: PaymentSetupOptions): PaymentSetup {
   // startup instead of on the day Stripe is turned on.
   const settings = validatePaymentSettings(options.settings ?? {});
   const key = options.stripeSecretKey;
-  if (!key) return {};
+  if (!key) {
+    if (options.hostedPricing) throw new TypeError("Hosted billing requires Stripe test mode");
+    return {};
+  }
+  const billingClient = options.hostedPricing
+    ? createStripeBillingClient({
+        secretKey: key,
+        ...(options.fetch ? { fetch: options.fetch } : {}),
+      })
+    : undefined;
 
   const stripeOptions = { secretKey: key, ...(options.fetch ? { fetch: options.fetch } : {}) };
   const client = createStripeClient(stripeOptions);
@@ -71,10 +84,20 @@ export function resolvePayment(options: PaymentSetupOptions): PaymentSetup {
     ...(consoleOrigin === undefined || consoleOrigin === ""
       ? {}
       : { checkout: createCheckout(client, consoleOrigin, settings) }),
-    events: (context) =>
-      createStripeEvents(
+    events: (context) => {
+      const hosted =
+        billingClient && options.hostedPricing
+          ? createStripeBilling({
+              client: billingClient,
+              context,
+              pricing: options.hostedPricing,
+              consoleOrigin,
+            })
+          : undefined;
+      const events = createStripeEvents(
         {
           client,
+          ...(hosted ? { handlers: hosted.handlers, handlerVersion: 1 } : {}),
           reconcileLookbackSeconds:
             settings.reconcileLookbackSeconds ?? DEFAULT_STRIPE_RECONCILE_LOOKBACK_SECONDS,
           ...(webhookSecret
@@ -87,8 +110,27 @@ export function resolvePayment(options: PaymentSetupOptions): PaymentSetup {
               }
             : {}),
         },
-        context,
-      ),
+        hosted ? { ...context, credit: hosted.creditFunding } : context,
+      );
+      return hosted
+        ? {
+            ...events,
+            subscriptions: hosted.subscriptions,
+            creditFunding: hosted.creditFunding,
+            async reconcile() {
+              // A malformed legacy Checkout must not starve hosted refunds.
+              // Inspect both streams before surfacing either failure.
+              const [funding, billing] = await Promise.allSettled([
+                events.reconcile(),
+                hosted.reconcile(),
+              ]);
+              if (funding.status === "rejected") throw funding.reason;
+              if (billing.status === "rejected") throw billing.reason;
+              return { ...funding.value, billing: billing.value };
+            },
+          }
+        : events;
+    },
   };
 }
 

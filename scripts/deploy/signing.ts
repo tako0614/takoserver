@@ -711,7 +711,7 @@ async function assertSigningRotationSchema(
   assertMoneyUnitSchema(snapshot.applied);
   const source = readCurrentAuditedMigrationSourceArtifact(resolve(REPOSITORY, "migrations"));
   if (
-    source.names.at(-1) !== MONEY_UNIT_MIGRATION ||
+    !source.names.includes(MONEY_UNIT_MIGRATION) ||
     JSON.stringify(snapshot.local) !== JSON.stringify(source.names) ||
     JSON.stringify(snapshot.applied) !== JSON.stringify(source.names) ||
     snapshot.shape === undefined ||
@@ -723,7 +723,7 @@ async function assertSigningRotationSchema(
     )
   ) {
     throw preflightError(
-      "signing rotation requires the exact complete 0094 D1 schema and USD-micros policy",
+      "signing rotation requires the exact current audited D1 schema with 0094 USD-micros policy",
     );
   }
   assertStripeWebhookSchema(target, snapshot.applied);

@@ -424,7 +424,7 @@ const PRODUCTION_D1 = {
 for (const lineage of ["v2-0088", "v2-0089", "v2-0091", "v2-0092"] as const) {
   const count =
     lineage === "v2-0092" ? 92 : lineage === "v2-0091" ? 91 : lineage === "v2-0089" ? 89 : 88;
-  test(`fresh selected ${lineage} payload remains quiesced on the current 0094 Host`, async () => {
+  test(`fresh selected ${lineage} payload remains quiesced on the current audited Host`, async () => {
     const artifacts = await Promise.all(
       CASES.map(async ({ slug, path, mediaType, contents }) => {
         const fileBytes = new TextEncoder().encode(contents);
@@ -775,10 +775,10 @@ async function miniflareFreshV2Data(
   };
 }
 
-test("selected fresh origin permits only an exact read-only audited 0094 successor", async () => {
+test("selected fresh origin permits only the exact read-only current audited successor", async () => {
   const source = readMigrationArtifact();
   const shape = deriveExpectedApplicationShape(source.files);
-  const full94 = {
+  const fullCurrent = {
     applied: source.names,
     shape,
     shapeDigest: `sha256:${createHash("sha256").update(shape).digest("hex")}`,
@@ -805,7 +805,7 @@ test("selected fresh origin permits only an exact read-only audited 0094 success
     } satisfies DeployTarget;
     const options = {
       provider,
-      reader: { read: async () => full94 },
+      reader: { read: async () => fullCurrent },
       allowCurrentAuditedSuccessor: true,
     };
     await expect(
@@ -823,9 +823,11 @@ test("selected fresh origin permits only an exact read-only audited 0094 success
       appliedMigrations: source.names,
     });
     for (const invalid of [
-      { ...full94, applied: source.names.slice(0, 93) },
-      { ...full94, shape: "[]" },
-      { ...full94, shapeDigest: `sha256:${"0".repeat(64)}` },
+      { ...fullCurrent, applied: source.names.slice(0, 93) },
+      { ...fullCurrent, applied: source.names.slice(0, -1) },
+      { ...fullCurrent, applied: [...source.names, "0096_foreign.sql"] },
+      { ...fullCurrent, shape: "[]" },
+      { ...fullCurrent, shapeDigest: `sha256:${"0".repeat(64)}` },
     ]) {
       await expect(
         verifyFreshV2IntegrationStorageTarget(selected, "integration", lineage, {
@@ -843,7 +845,7 @@ test("selected fresh origin permits only an exact read-only audited 0094 success
       ),
     ).rejects.toThrow("target ID and name");
   }
-});
+}, 60_000);
 
 async function d1State(database: Awaited<ReturnType<Miniflare["getD1Database"]>>) {
   const tables = await database

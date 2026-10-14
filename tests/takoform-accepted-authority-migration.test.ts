@@ -40,6 +40,7 @@ const STRIPE_EVENTS = "0091_stripe_events.sql";
 const ORG_WALLET_LIFECYCLE = "0092_org_wallet_lifecycle.sql";
 const WALLET_CREDIT_CLASSIFICATION = "0093_wallet_credit_classification_proofs.sql";
 const WALLET_USD_MICROS = "0094_wallet_usd_micros.sql";
+const STRIPE_BILLING = "0095_stripe_billing.sql";
 
 const MUTATION_AUTHORITY_SUMMARY = JSON.stringify({
   formRef: {
@@ -285,6 +286,7 @@ describe("Takoform accepted-authority continuity migration", () => {
       ORG_WALLET_LIFECYCLE,
       WALLET_CREDIT_CLASSIFICATION,
       WALLET_USD_MICROS,
+      STRIPE_BILLING,
     ]);
     expect(database.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
     expect(

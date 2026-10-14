@@ -546,12 +546,12 @@ async function verifyGeneratedStorageTarget(
     );
     // A full current schema is a read-side successor of the selected origin,
     // never a new generation payload. Both alternatives are exact audited
-    // ledgers; partial 0092/0093 states and foreign 0094 markers match neither.
-    const current94 =
+    // ledgers; partial states and foreign migration tails match neither.
+    const currentAudited =
       currentSource !== null &&
-      currentSource.names.at(-1) === MONEY_UNIT_MIGRATION &&
+      currentSource.names.includes(MONEY_UNIT_MIGRATION) &&
       JSON.stringify(migrationState.applied) === JSON.stringify(currentSource.names);
-    const observedSource = current94 ? currentSource : sourceArtifact;
+    const observedSource = currentAudited ? currentSource : sourceArtifact;
     assertCompleteDatabase(
       migrationState,
       observedSource.names,

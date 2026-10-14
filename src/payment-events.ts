@@ -1,6 +1,7 @@
 import type { Ledger } from "./ledger.ts";
 import { minorToMicros } from "./money.ts";
 import type { Clock, Sql } from "./ports.ts";
+import type { BillingReconcileReport, SubscriptionPayments } from "./stripe-billing.ts";
 
 /**
  * Payments this Host learns about without the payer coming back.
@@ -40,7 +41,7 @@ export interface PaymentEventContext {
 }
 
 /** `received` never leaves the processor; a receipt states a settled outcome. */
-export type PaymentEventOutcome = "credited" | "ignored" | "deferred" | "unsupported";
+export type PaymentEventOutcome = "credited" | "applied" | "ignored" | "deferred" | "unsupported";
 
 export interface PaymentEventReceipt {
   readonly eventId: string;
@@ -53,6 +54,7 @@ export interface PaymentEventReceipt {
 }
 
 export interface FundingReconcileReport {
+  readonly billing?: BillingReconcileReport;
   readonly examined: number;
   readonly credited: number;
   readonly alreadyCredited: number;
@@ -71,6 +73,8 @@ export interface FundingReconcileReport {
 }
 
 export interface PaymentEvents {
+  readonly subscriptions?: SubscriptionPayments;
+  readonly creditFunding?: FundingCredit;
   /**
    * Authenticates and handles one processor notification. Present only where
    * the processor's signing secret is configured; absent, the route that

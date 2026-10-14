@@ -833,7 +833,7 @@ describe("split signing authority surfaces", () => {
       const migrations: SigningMigrationReader = {
         async read() {
           migrationReads += 1;
-          return { local, applied: local.slice(0, -1) };
+          return { local, applied: local.slice(0, -2) };
         },
       };
 
@@ -860,6 +860,61 @@ describe("split signing authority surfaces", () => {
       ).rejects.toThrow("needs 0094_wallet_usd_micros.sql applied");
 
       expect(migrationReads).toBe(1);
+      expect(process.calls.some(({ command }) => command.includes("--dry-run"))).toBe(false);
+      expect(process.calls.some(({ command }) => command.includes("deploy"))).toBe(false);
+      expect(process.calls.some(({ command }) => command.includes("secret"))).toBe(false);
+      expect(database.inserts).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("billing-enabled signing rotation requires exact current audited schema before publication", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-billing-current-schema-"));
+    try {
+      const current = await keyPair("key-current");
+      const next = await keyPair("key-next");
+      const target = {
+        ...baseTarget,
+        billingConfig: BILLING_CONFIG,
+        signing: { currentKeyId: "key-current", nextKeyId: "key-next" },
+      } satisfies DeployTarget;
+      const database = new FakeDatabase();
+      database.rows.set("key-current", row("key-current", current.publicJwk));
+      database.rows.set("key-next", row("key-next", next.publicJwk));
+      const process = processFixture();
+      const local = readMigrationArtifact().names;
+      for (const [applied, message] of [
+        [local.slice(0, -1), "exact current audited D1 schema with 0094 USD-micros policy"],
+        [[...local, "0096_foreign.sql"], "D1 has more applied migrations"],
+      ] as const) {
+        const migrations: SigningMigrationReader = { read: async () => ({ local, applied }) };
+        await expect(
+          runSigning(
+            {
+              surface: "takoserver-signing-rotation",
+              action: "apply",
+              environment: "integration",
+              commit: COMMIT,
+            },
+            target,
+            {
+              database,
+              state: workerState({
+                target,
+                beforeSigning: "key-current",
+                deploymentMode: "before",
+              }),
+              run: process.run,
+              migrations,
+              review: "reviewer@example.test",
+              nextPrivateJwkPath: join(root, "missing-private-key.jwk"),
+              outputDirectory: join(root, "work"),
+              cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+            },
+          ),
+        ).rejects.toThrow(message);
+      }
       expect(process.calls.some(({ command }) => command.includes("--dry-run"))).toBe(false);
       expect(process.calls.some(({ command }) => command.includes("deploy"))).toBe(false);
       expect(process.calls.some(({ command }) => command.includes("secret"))).toBe(false);
