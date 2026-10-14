@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildD1MigrationImport } from "../scripts/deploy/d1-migration-import.ts";
 import { normalizeSnapshotDump } from "../scripts/deploy/d1-snapshot-restore.ts";
@@ -118,7 +119,7 @@ describe("fixed money cutover SQL", () => {
         shapes[index] ?? "missing expected shape",
       );
     }
-    const directory = mkdtempSync("/dev/shm/t/money-source-tamper-");
+    const directory = mkdtempSync(join(tmpdir(), "money-source-tamper-"));
     try {
       const source94 = files[93];
       if (source94 === undefined) throw new Error("missing fixed 0094 source");
@@ -202,7 +203,7 @@ describe("fixed money cutover SQL", () => {
   });
 
   test("unknown ACK terminalizes only after GET readback of sealed SQL, backup, source and reviewed after-state", async () => {
-    const outputDirectory = mkdtempSync("/dev/shm/t/money-reconcile-");
+    const outputDirectory = mkdtempSync(join(tmpdir(), "money-reconcile-"));
     const importDirectory = join(outputDirectory, "money-freeze-retained");
     mkdirSync(importDirectory, { mode: 0o700 });
     const database = fixture();
@@ -651,7 +652,7 @@ describe("fixed money cutover SQL", () => {
           maintenanceCommit: "b".repeat(40),
           writerEpoch,
           backupPath: "/dev/null",
-          outputDirectory: "/dev/shm/t",
+          outputDirectory: tmpdir(),
           stageOriginProof: async () => {
             reads += 1;
             throw new Error("read");
