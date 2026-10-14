@@ -2664,7 +2664,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       ownerLock.recoveredFromStaleOwner,
     );
     if (
-      ownerLock.recoveredFromStaleOwner &&
+      (ownerLock.recoveredFromStaleOwner || state.suspended) &&
       state.incarnations.some((item) => abandonableCandidate(item, state))
     ) {
       // The previous owner is a proven-dead process and never activated these

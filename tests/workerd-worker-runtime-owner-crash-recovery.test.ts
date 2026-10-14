@@ -962,7 +962,7 @@ async function incarnations(root: string): Promise<{
  * atomic owner-state write, so the committed incumbent is still the only
  * serving incarnation and the candidate never served.
  */
-for (const residueStatus of ["candidate", "uncertain"] as const) {
+for (const residueStatus of ["candidate", "uncertain", "uncertain-suspended"] as const) {
   test(`a successor retires an unactivated ${residueStatus} update and serves the committed incarnation`, async () => {
     const owned = await fixture();
     const port = await unusedPort();
@@ -989,11 +989,15 @@ for (const residueStatus of ["candidate", "uncertain"] as const) {
       host = undefined;
       await waitForVacant(candidatePort);
       expect(await linuxProcessLiveness(candidateIdentity)).toBe("stale");
-      if (residueStatus === "uncertain") {
+      if (residueStatus !== "candidate") {
         const path = join(ownerDirectory(owned.root), "runtime-owner.json");
         const state = await ownerState(owned.root);
         const records = state.incarnations as StoredIncarnation[];
         records.find((item) => item.operationId === UPDATE_ID)!.status = "uncertain";
+        if (residueStatus === "uncertain-suspended") {
+          state.suspended = true;
+          await rm(join(ownerDirectory(owned.root), "runtime-owner.lock"));
+        }
         await writeFile(path, ownerStateText(state), { mode: 0o600 });
       }
 
@@ -1056,7 +1060,7 @@ for (const residueStatus of ["candidate", "uncertain"] as const) {
       await terminateHost(host);
       host = undefined;
       await waitForVacant(port);
-      if (residueStatus === "uncertain") {
+      if (residueStatus !== "candidate") {
         const path = join(ownerDirectory(owned.root), "runtime-owner.json");
         const state = await ownerState(owned.root);
         const records = state.incarnations as StoredIncarnation[];

@@ -855,6 +855,25 @@ export async function inspectWorkerdWorkerExecutionCopies(input: {
     const directEntries = await readdir(directPath).catch(() => {
       throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
     });
+    if (directEntries.length === 0 && activationInfo === null) {
+      // The native runtime prepares this private directory before its empty
+      // bootstrap starts. With no pointer, activation or publication tree,
+      // there are no execution copies to retire; keep every other shape strict.
+      const publications = await lstat(join(workersRoot, DEPLOYMENT_PUBLICATIONS_NAME)).catch(
+        (error: unknown) => {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+          throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+        },
+      );
+      if (
+        publications === null ||
+        (publications.isDirectory() &&
+          !publications.isSymbolicLink() &&
+          (publications.mode & 0o077) === 0 &&
+          (await readdir(join(workersRoot, DEPLOYMENT_PUBLICATIONS_NAME))).length === 0)
+      )
+        return { versionUids: [], generationKeys: [], publications: [] };
+    }
     if (directEntries.length !== 1 || directEntries[0] !== WORKER_POINTER_NAME) {
       throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
     }
