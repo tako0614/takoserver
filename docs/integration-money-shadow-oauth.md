@@ -156,9 +156,11 @@ INSERT, guarded Stripe UPDATE and permit DELETE; a failed batch with a late
 statement must leave the Stripe row and permit unchanged; a Worker pinned to
 an older epoch must be rejected before mutation. The publication must have
 native version/modules/bindings and post-condition receipts, no production
-target inventory, and its own review/custody. This diagnostic Worker lane is
-**not implemented here**; billing-D1 cutover must not treat the import receipt
-as that missing Worker-batch proof.
+target inventory, and its own review/custody. The separate
+[native Worker batch diagnostic](integration-money-shadow-native-probe.md)
+provides the source route. Its local tests and route definition are not native
+publish or probe receipts; billing-D1 cutover must require the terminal native
+Worker-batch proof.
 
 The stage-origin certificate and protected review files are operator-owned
 evidence, not cryptographic signatures from Cloudflare. The independent
