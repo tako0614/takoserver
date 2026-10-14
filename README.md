@@ -454,6 +454,13 @@ unconfirmable child exit, or child-identity persistence that fails for any
 other reason, including unreadable process state, requires operator
 intervention rather than automatic retries.
 
+SIGINT, SIGTERM and SIGHUP fence new work and drain accepted requests and
+background passes before stopping owned resources in order. A proved clean
+stop exits with status 0. A reported shutdown-stage failure prints its stage
+and exits with status 1, even when dependent listeners remain open. Shutdown
+does not close dependents below an unproved owner or discard its durable
+custody; the next Host must recover that retained ownership before serving.
+
 ### Operator sign-in and funding
 
 Sign-in and money are the two facts a server cannot determine for itself. With
@@ -525,6 +532,32 @@ before that marker existed are credited only when the console presents them.
 Paid sessions that could not be credited (another currency, an organization
 this Host lacks, an unreadable payment) are logged by funding reference as
 `takoserver.stripe.uncredited_payments`.
+
+The operator can also run the reconcile pass on demand, for example where the
+schedule has not fired: `POST /v1/operator/payments/reconcile` with
+`{"assertion":"…"}` runs the same pass and returns its report (sessions
+examined, credited and already credited, skips by reason, the funding
+references it credited, and the paid ones it could not credit with their
+reasons; never an amount or an organization). It is served only where the
+reconcile pass is (a Stripe key is configured) and an operator identity key
+is present, and is 404 otherwise. The credential is a `payments-reconcile`
+assertion signed by the key that verifies operator sign-in
+(`OPERATOR_IDENTITY_PUBLIC_JWK` on a Worker,
+`TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK` on a Bun Host, else the
+legacy/generated operator key); an identity-only key suffices, because the
+pass credits only what Stripe reports as settled. It names this Host's
+origin, lives a minute and runs one pass; no session or API key can start it.
+A repeat credits nothing twice, and on a Bun Host a pass already running is
+joined rather than repeated (a Worker runs one pass per request). If Stripe
+cannot be read the answer is 503 `unavailable`; sign a fresh assertion to
+retry:
+
+```
+assertion=$(TAKOSERVER_OPERATOR_KEY=… TAKOSERVER_PUBLIC_ORIGIN=https://api.example.com \
+  bun scripts/operator-key.ts payments-reconcile)
+curl -sS -X POST https://api.example.com/v1/operator/payments/reconcile \
+  -H 'content-type: application/json' -d "{\"assertion\":\"$assertion\"}"
+```
 
 The webhook records every delivery in `stripe_events`, so it needs migration
 `0091_stripe_events.sql` applied first. A Bun Host migrates its own SQLite. On

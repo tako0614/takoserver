@@ -1143,7 +1143,7 @@ describe("production-shaped D1 migration lane", () => {
     }
   });
 
-  test("audited 0067-0075 are source closure only and leave existing apply boundaries unchanged", async () => {
+  test("audited 0067-0075 stay source-only while default apply remains capped at 0066", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-schema-0067-source-only-"));
     try {
       const result = await runD1Schema(
@@ -1166,7 +1166,8 @@ describe("production-shaped D1 migration lane", () => {
         throughMigration: "0057_cloudflare_managed_worker_version_execution_material.sql",
         pendingMigrations: ["0057_cloudflare_managed_worker_version_execution_material.sql"],
       });
-      expect(SCHEMA_WAVE_BOUNDARIES.at(-1)).toBe("0088");
+      expect(SCHEMA_WAVE_BOUNDARIES).toContain("0088");
+      expect(SCHEMA_WAVE_BOUNDARIES.at(-1)).toBe("0092");
       expect(SCHEMA_WAVE_BOUNDARIES.map(String)).not.toContain("0067");
 
       const integrationTail = await runD1Schema(

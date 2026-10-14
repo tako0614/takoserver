@@ -19,7 +19,11 @@ import { GoogleIdentityError } from "./google-identity.ts";
 import { type FundingSettlementVerifier, type Ledger, LedgerError } from "./ledger.ts";
 import { OperatorAssertionError } from "./operator-credentials.ts";
 import { type OrgBilling, OrgBillingError } from "./org-billing.ts";
-import { PaymentEventError, type PaymentEvents } from "./payment-events.ts";
+import {
+  type FundingReconcileReport,
+  PaymentEventError,
+  type PaymentEvents,
+} from "./payment-events.ts";
 import type { Clock } from "./ports.ts";
 import { type Reseller, ResellerError } from "./reseller.ts";
 import type { ResourceDeploymentStore } from "./resource-deployments.ts";
@@ -70,6 +74,7 @@ import {
 
 const MAX_BODY_BYTES = 64 * 1_024;
 const PAYMENT_NOTIFICATION_PATH = "/v1/payments/stripe/webhook";
+const OPERATOR_PAYMENTS_RECONCILE_PATH = "/v1/operator/payments/reconcile";
 const PAYMENT_NOTIFICATION_MAX_BYTES = 256 * 1_024;
 /**
  * The runtime-input handoff carries the exact public apply body it authorizes
@@ -170,6 +175,12 @@ export interface CreateControlRoutesOptions {
    * signing secret is configured, and then the route is not served at all.
    */
   readonly paymentNotifications?: PaymentEvents["receive"];
+  /**
+   * Runs the payment reconcile pass now for one single-use operator
+   * assertion. Absent where this deployment has no pass to run or no operator
+   * key to authorize one, and then the route is not served at all.
+   */
+  readonly operatorPaymentsReconcile?: (assertion: string) => Promise<FundingReconcileReport>;
   readonly clock: Clock;
   /** Exact browser console origin allowed to carry the HttpOnly session cookie. */
   readonly consoleOrigin?: string;
@@ -212,6 +223,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     tokens,
     settlement,
     paymentNotifications,
+    operatorPaymentsReconcile,
     clock,
     consoleOrigin,
     nativeResidual,
@@ -477,6 +489,20 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       });
     }
 
+    if (url.pathname === OPERATOR_PAYMENTS_RECONCILE_PATH) {
+      if (request.method !== "POST" || !operatorPaymentsReconcile) controlError("not_found", 404);
+      const body = await jsonObject(request);
+      exactKeys(body, ["assertion"]);
+      // The assertion is the whole credential. The pass crosses every
+      // organization, so no session or API key starts it, whoever holds it;
+      // a bearer sent alongside is simply not read.
+      const report = await operatorPaymentsReconcile(bounded(body.assertion, 8 * 1_024));
+      return Response.json(
+        { report },
+        { headers: { "cache-control": "private, no-store", "x-content-type-options": "nosniff" } },
+      );
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/sessions") {
       const body = await jsonObject(request);
       // `method` is optional: a caller that knows only one way in should not
@@ -677,7 +703,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
         const organizationId = segment(release[1]);
         await scoped(request, organizationId, "wallet:write");
         const reference = billingPathReference(release[2]);
-        if (request.body !== null) controlError("invalid_argument", 400);
+        await emptyBody(request);
         return Response.json({ hold: await options.billing.release(organizationId, reference) });
       }
 
@@ -1671,7 +1697,31 @@ async function rawBody(request: Request, limit: number): Promise<Uint8Array> {
   if (declared !== null && (!/^[0-9]{1,12}$/u.test(declared) || Number(declared) > limit)) {
     throw new PaymentEventError("payload_too_large");
   }
-  if (!request.body) controlError("invalid_argument", 400);
+  const bytes = await boundedBody(request, limit);
+  if (bytes === null) throw new PaymentEventError("payload_too_large");
+  if (bytes.byteLength === 0) controlError("invalid_argument", 400);
+  return bytes;
+}
+
+/**
+ * A route whose contract is "no request body" accepts zero bytes however they
+ * arrive and refuses the first byte of anything else without reading on.
+ */
+async function emptyBody(request: Request): Promise<void> {
+  const declared = request.headers.get("content-length");
+  if (declared !== null && declared !== "0") controlError("invalid_argument", 400);
+  if ((await boundedBody(request, 0)) === null) controlError("invalid_argument", 400);
+}
+
+/**
+ * The request bytes, or `null` as soon as they would pass `limit`; the rest is
+ * cancelled, never buffered. An absent body and an empty stream are the same
+ * zero bytes: Bun presents a bodiless POST as `null`, but workerd presents it
+ * as a stream that ends at once, so `request.body !== null` never means "has
+ * a body" on a Worker.
+ */
+async function boundedBody(request: Request, limit: number): Promise<Uint8Array | null> {
+  if (request.body === null) return new Uint8Array(0);
   const reader = request.body.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
@@ -1681,7 +1731,7 @@ async function rawBody(request: Request, limit: number): Promise<Uint8Array> {
       if (part.done) break;
       if (!(part.value instanceof Uint8Array) || part.value.byteLength > limit - total) {
         await reader.cancel().catch(() => undefined);
-        throw new PaymentEventError("payload_too_large");
+        return null;
       }
       chunks.push(part.value);
       total += part.value.byteLength;
@@ -1689,7 +1739,6 @@ async function rawBody(request: Request, limit: number): Promise<Uint8Array> {
   } finally {
     reader.releaseLock();
   }
-  if (total === 0) controlError("invalid_argument", 400);
   const bytes = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) {

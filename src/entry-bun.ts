@@ -21,7 +21,10 @@ import {
 } from "./migrate-sqlite.ts";
 import { createFileObjectStore } from "./objects-fs.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
-import { createOperatorSettlement } from "./operator-credentials.ts";
+import {
+  createOperatorPaymentsReconcileVerifier,
+  createOperatorSettlement,
+} from "./operator-credentials.ts";
 import {
   ensureOperatorKey,
   parseOperatorPublicKey,
@@ -83,9 +86,9 @@ import {
   SELFHOST_DEFAULT_DATA_ROOT,
   SELFHOST_MEMORY_DATA_ROOT,
 } from "./selfhost-data-root.ts";
+import { createSelfhostEntryProcessShutdown } from "./selfhost-entry-process-shutdown.ts";
 import {
   closeSelfhostEntryOwnedResources,
-  createSelfhostEntryShutdown,
   describeBackgroundFailure,
 } from "./selfhost-entry-shutdown.ts";
 import {
@@ -1384,6 +1387,17 @@ try {
       : {}),
     ...(payment.checkout ? { checkout: payment.checkout } : {}),
     ...(payment.events ? { paymentEvents: payment.events } : {}),
+    ...(payment.events && identityPublicKeyJwk
+      ? {
+          operatorPaymentsReconcile: createOperatorPaymentsReconcileVerifier({
+            publicKeyJwk: identityPublicKeyJwk,
+            audience: publicOrigin,
+          }),
+        }
+      : {}),
+    // One process owns every pass here, and a pass outlives the request that
+    // started it, so the timer and the operator route may share one.
+    shareReconcilePass: true,
     publicOrigin,
     ...(process.env.TAKOSERVER_CONSOLE_ORIGIN
       ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }
@@ -1550,12 +1564,12 @@ const handleContainerAndWorkerdShutdown = createSelfhostContainerSignalHandler(
       })) && shutdownClean;
   },
   () => {
-    // The entry lifecycle calls process.exit only after this ordered sequence
-    // and its ingress/request/pass drain have both been proved.
+    // Only a proved ordered close and ingress/request/pass drain permit a
+    // successful exit. An unproved stop terminates the Host with status 1.
     closeSequenceFinished = true;
   },
 );
-const entryShutdown = createSelfhostEntryShutdown({
+const entryShutdown = createSelfhostEntryProcessShutdown({
   stopIngress: async () => {
     const endpointClosings: Promise<void>[] = [];
     if (selfhostContainerEndpointHttps) {
@@ -1592,11 +1606,6 @@ const entryShutdown = createSelfhostEntryShutdown({
       throw new Error("self-host owned resources did not close cleanly");
     }
   },
-  onFailure: (stage) => {
-    process.exitCode = 1;
-    process.stderr.write(`self-host shutdown incomplete at ${stage}\n`);
-  },
-  onSuccess: () => process.exit(0),
 });
 
 /**
@@ -1710,7 +1719,8 @@ observedPasses.startInterval(
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   process.on(signal, () => {
     // Until the terminal shutdown proof completes, a natural event-loop exit
-    // must not be reported as a clean stop.
+    // must not be reported as a clean stop. A reported failure explicitly
+    // exits nonzero even if retained dependent listeners are still open.
     process.exitCode = 1;
     void entryShutdown.shutdown();
   });
