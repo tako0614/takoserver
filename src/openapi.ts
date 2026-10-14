@@ -668,7 +668,7 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
       "403": errorResponse("The key lacks wallet:write or belongs to another Organization"),
       "404": errorResponse("Hold reference not found"),
       "409": errorResponse(
-        "`hold_closed`: the hold is no longer live; `capture_exceeds_hold`: amountMinor exceeds the hold; `measurement_conflict`: amountMinor is not min(round(actualMicros), hold amount); `reference_conflict`: a capture with different facts was already recorded",
+        "`hold_closed`: the hold is no longer live; `capture_exceeds_hold`: amountMicros exceeds the hold; `measurement_conflict`: amountMicros is not min(actualMicros, hold amount); `reference_conflict`: a capture with different facts was already recorded",
       ),
       "503": errorResponse("Capture result is unavailable or indeterminate"),
     },
@@ -748,7 +748,7 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
       "401": errorResponse("Authentication required"),
       "403": errorResponse("The key lacks usage:write or belongs to another Organization"),
       "409": errorResponse(
-        "`measurement_conflict`: expectedMinor differs from the amount the pinned tariff computes; `reference_conflict`: the reference was recorded with different facts; `pricing_revision_unavailable`: the revision or meter is not the tariff effective at periodStart; `usage_period_crosses_tariff`: the period spans another tariff's effective time",
+        "`measurement_conflict`: expectedMicros differs from the amount the pinned tariff computes; `reference_conflict`: the reference was recorded with different facts; `pricing_revision_unavailable`: the revision or meter is not the tariff effective at periodStart; `usage_period_crosses_tariff`: the period spans another tariff's effective time",
       ),
       "503": errorResponse("Usage settlement is unavailable or indeterminate"),
     },
