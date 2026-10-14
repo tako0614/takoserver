@@ -88,8 +88,12 @@ explicit reciprocal native Close frame. The candidate owner now replies after
 the terminal callback and Host completion attempt, inside the existing event
 tail before attachment release. Reserved no-status code1005 is never emitted.
 An unknown Host completion still rejects and retains poisoned custody even if
-the physical transport closes. The final repaired native terminal case and
-independent hosted staging remain pending.
+the physical transport closes. The focused native regression now passes the
+final cold close as well: the original client reaches CLOSED, all four socket
+callbacks complete, and native connections and owned payload keys reach zero.
+This qualifies the tested Core native path; production Host listener ownership,
+lost upgrade acknowledgement, resource DELETE, private composition and hosted
+staging remain separate work.
 
 Primary platform references:
 
