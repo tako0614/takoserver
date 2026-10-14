@@ -1,6 +1,11 @@
 import { request as httpRequest } from "node:http";
 import { isIP } from "node:net";
 import { canonicalDigest, canonicalJson, isJsonObject, type JsonObject } from "../json.ts";
+import {
+  type DockerContainerNativeIdentity,
+  DockerContainerRuntimePreparation,
+  DockerContainerRuntimePreparationError,
+} from "./docker-container-runtime-preparation.ts";
 
 /** Host-private execution input, not a new Form or an externalServices slot. */
 export interface DockerHttpRevision {
@@ -38,6 +43,8 @@ export interface DockerHttpRevisionOptions {
   /** External Docker/HTTP boundaries, injectable without replacing lifecycle logic. */
   readonly engine?: (method: string, path: string, body?: JsonObject) => Promise<EngineResponse>;
   readonly healthFetch?: (request: Request) => Promise<Response>;
+  /** Host-only opt-in; absent keeps the existing owned internal network profile. */
+  readonly runtimePreparation?: DockerContainerRuntimePreparation;
 }
 
 export class DockerHttpRevisionError extends Error {
@@ -57,6 +64,7 @@ export class DockerHttpRevisionError extends Error {
 export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisionOptions) {
   const options = { ...configuration };
   const timeoutMs = options.timeoutMs ?? 30_000;
+  const preparation = options.runtimePreparation;
   if (
     !options.socketPath.startsWith("/") ||
     !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(options.installationId) ||
@@ -65,7 +73,8 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
     !positive(options.maxMemoryBytes) ||
     !positive(options.maxNanoCpus) ||
     !positive(options.pidsLimit) ||
-    !positive(timeoutMs)
+    !positive(timeoutMs) ||
+    (preparation !== undefined && !(preparation instanceof DockerContainerRuntimePreparation))
   )
     throw new DockerHttpRevisionError("invalid_request");
   const engine = options.engine ?? dockerEngine(options.socketPath, timeoutMs);
@@ -122,9 +131,14 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
         SecurityOpt: ["no-new-privileges:true"],
         Privileged: false,
         PublishAllPorts: false,
+        ...(preparation ? { RestartPolicy: { Name: "no", MaximumRetryCount: 0 } } : {}),
       },
     };
-    const fingerprint = await canonicalDigest({ body, healthPath: input.healthPath });
+    const fingerprint = await canonicalDigest({
+      body,
+      healthPath: input.healthPath,
+      ...(preparation ? { runtimePolicy: { ...preparation.policy } } : {}),
+    });
     const labels = { "takoserver.identity": identity, "takoserver.revision": fingerprint };
     const fullBody: JsonObject = { ...body, Labels: labels };
     return { input: structuredClone(input), name, body: fullBody, labels };
@@ -201,6 +215,10 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
       !exposesPort(config.ExposedPorts, target.input.port) ||
       !mountsAreEmpty(value.Mounts, hostConfig) ||
       !hasNoAdditionalHostAuthority(hostConfig) ||
+      (preparation &&
+        (!isJsonObject(hostConfig.RestartPolicy) ||
+          hostConfig.RestartPolicy.Name !== "no" ||
+          hostConfig.RestartPolicy.MaximumRetryCount !== 0)) ||
       !attachedOnlyToNetwork(value.NetworkSettings, options.network)
     ) {
       throw new DockerHttpRevisionError("conflict");
@@ -209,7 +227,7 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
   }
 
   /** A name alone does not establish that a Docker network is private or ours. */
-  async function requireOwnedInternalNetwork(): Promise<void> {
+  async function requireOwnedNetwork(): Promise<string | null> {
     const response = await engine("GET", `/networks/${encodeURIComponent(options.network)}`);
     if (response.status !== 200) throw new DockerHttpRevisionError("unavailable");
     let value: unknown;
@@ -223,13 +241,65 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
       value.Name !== options.network ||
       value.Driver !== "bridge" ||
       value.Scope !== "local" ||
-      value.Internal !== true ||
+      value.Internal !== !(preparation?.policy.outboundInternet ?? false) ||
       value.Ingress !== false ||
       value.Attachable !== false ||
       !isJsonObject(value.Labels) ||
-      value.Labels["takoserver.installation"] !== options.installationId
+      value.Labels["takoserver.installation"] !== options.installationId ||
+      (preparation && (typeof value.Id !== "string" || !/^[a-f0-9]{64}$/u.test(value.Id)))
     ) {
       throw new DockerHttpRevisionError("conflict");
+    }
+    return typeof value.Id === "string" ? value.Id : null;
+  }
+
+  function nativeIdentity(
+    target: Desired,
+    current: JsonObject,
+    networkId: string | null,
+  ): DockerContainerNativeIdentity {
+    if (
+      networkId === null ||
+      !isJsonObject(current.State) ||
+      typeof current.State.Running !== "boolean"
+    )
+      throw new DockerHttpRevisionError("unavailable");
+    const networks = isJsonObject(current.NetworkSettings)
+      ? current.NetworkSettings.Networks
+      : null;
+    const attachment = isJsonObject(networks) ? networks[options.network] : null;
+    // The owned network's name/readback cannot identify this native attachment.
+    // A stopped object without authoritative attachment identity fails closed.
+    if (
+      !isJsonObject(attachment) ||
+      typeof attachment.NetworkID !== "string" ||
+      !/^[a-f0-9]{64}$/u.test(attachment.NetworkID) ||
+      attachment.NetworkID !== networkId
+    )
+      throw new DockerHttpRevisionError("conflict");
+    return Object.freeze({
+      backend: "docker",
+      installationId: options.installationId,
+      resourceUid: target.input.resourceUid,
+      incarnationId: target.input.incarnationId,
+      revision: target.input.revision,
+      nativeId: current.Id as string,
+      network: options.network,
+      networkId: attachment.NetworkID,
+      image: target.input.image,
+      imageId: current.Image as string,
+      identityLabel: target.labels["takoserver.identity"],
+      revisionLabel: target.labels["takoserver.revision"],
+    });
+  }
+
+  async function prepared<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      throw new DockerHttpRevisionError(
+        error instanceof DockerContainerRuntimePreparationError ? error.code : "unavailable",
+      );
     }
   }
 
@@ -241,6 +311,13 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
       throw new DockerHttpRevisionError("unavailable");
     }
     if (!current.State.Running) return { state: "stopped", nativeId };
+    let authorityGuard: (() => Promise<void>) | null = null;
+    if (preparation) {
+      const networkId = await requireOwnedNetwork();
+      authorityGuard = await prepared(() =>
+        preparation.verifyExisting(nativeIdentity(target, current, networkId)),
+      );
+    }
     const networks = isJsonObject(current.NetworkSettings)
       ? current.NetworkSettings.Networks
       : null;
@@ -248,6 +325,7 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
     const ip = isJsonObject(network) ? network.IPAddress : null;
     if (typeof ip !== "string" || isIP(ip) !== 4) return { state: "starting", nativeId };
     const endpoint = `http://${ip}:${target.input.port}`;
+    let ready = false;
     try {
       const health = await healthFetch(
         new Request(`${endpoint}${target.input.healthPath}`, {
@@ -255,12 +333,15 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
           signal: AbortSignal.timeout(timeoutMs),
         }),
       );
-      const ready = health.ok;
+      ready = health.ok;
       await health.body?.cancel();
-      return ready ? { state: "ready", nativeId, endpoint } : { state: "starting", nativeId };
     } catch {
-      return { state: "starting", nativeId };
+      ready = false;
     }
+    // Health/body cancellation can await past revocation without AbortSignal
+    // notification; authority failure must not become a ready observation.
+    if (authorityGuard) await prepared(authorityGuard);
+    return ready ? { state: "ready", nativeId, endpoint } : { state: "starting", nativeId };
   }
 
   return {
@@ -270,7 +351,7 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
         // Verify the operator-owned isolation boundary before pulling an image
         // or creating any native object. Existing exact instances remain
         // observable and removable even if network configuration later drifts.
-        await requireOwnedInternalNetwork();
+        await requireOwnedNetwork();
         const pull = await engine(
           "POST",
           `/images/create?fromImage=${encodeURIComponent(target.input.image)}&platform=linux%2Famd64`,
@@ -307,10 +388,34 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
       const current = await inspect(target);
       if (!current) throw new DockerHttpRevisionError("unavailable");
       if (!isJsonObject(current.State) || current.State.Running !== true) {
-        await requireOwnedInternalNetwork();
-        const started = await engine("POST", `/containers/${current.Id}/start`);
-        if (started.status !== 204 && started.status !== 304) {
-          throw new DockerHttpRevisionError("unavailable");
+        const networkId = await requireOwnedNetwork();
+        if (preparation) {
+          const native = nativeIdentity(target, current, networkId);
+          await prepared(() =>
+            preparation.authorizeStart({ native, state: "stopped" }, async (guard) => {
+              // Native creation is stopped/restart-disabled. Install and readback
+              // happen outside the image before this sole start claim is spent.
+              const latest = await inspect(target);
+              if (
+                !latest ||
+                latest.Id !== native.nativeId ||
+                !isJsonObject(latest.State) ||
+                latest.State.Running !== false
+              )
+                throw new DockerHttpRevisionError("conflict");
+              const latestNative = nativeIdentity(target, latest, await requireOwnedNetwork());
+              if (latestNative.networkId !== native.networkId)
+                throw new DockerHttpRevisionError("conflict");
+              await guard();
+              const started = await engine("POST", `/containers/${native.nativeId}/start`);
+              if (started.status !== 204 && started.status !== 304)
+                throw new DockerHttpRevisionError("unavailable");
+            }),
+          );
+        } else {
+          const started = await engine("POST", `/containers/${current.Id}/start`);
+          if (started.status !== 204 && started.status !== 304)
+            throw new DockerHttpRevisionError("unavailable");
         }
       }
       return await observation(target);

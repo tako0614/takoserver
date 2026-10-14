@@ -1,6 +1,11 @@
 import { expect, test } from "bun:test";
 import type { JsonObject } from "../src/ports.ts";
 import {
+  createDockerContainerRuntimePreparation,
+  type DockerContainerNativeIdentity,
+  type DockerContainerRuntimeReceipt,
+} from "../src/providers/docker-container-runtime-preparation.ts";
+import {
   createDockerHttpRevisionRuntime,
   type DockerHttpRevision,
   DockerHttpRevisionError,
@@ -71,7 +76,14 @@ function engineFixture() {
         HostConfig: body.HostConfig ?? {},
         Mounts: [],
         State: { Running: false },
-        NetworkSettings: { Networks: { "installation-net": { IPAddress: "172.22.0.2" } } },
+        NetworkSettings: {
+          Networks: {
+            "installation-net": {
+              IPAddress: "172.22.0.2",
+              ...(typeof network.Id === "string" ? { NetworkID: network.Id } : {}),
+            },
+          },
+        },
       });
       return { status: 201, body: JSON.stringify({ Id }) };
     }
@@ -117,6 +129,293 @@ function engineFixture() {
     setNetwork: (value: JsonObject) => (network = value),
   };
 }
+
+function trustedFixture(fixture: ReturnType<typeof engineFixture>, internet = true) {
+  fixture.setNetwork({
+    Id: "b".repeat(64),
+    Name: "installation-net",
+    Driver: "bridge",
+    Scope: "local",
+    Internal: !internet,
+    Ingress: false,
+    Attachable: false,
+    Labels: { "takoserver.installation": "selfhost-one" },
+  });
+  const claimed = new Set<string>();
+  const preparedNative: DockerContainerNativeIdentity[] = [];
+  const revocation = new AbortController();
+  let current = true;
+  let transform: (receipt: DockerContainerRuntimeReceipt) => unknown = (receipt) => receipt;
+  let beforePrepare: () => void = () => undefined;
+  const policy = {
+    tenantRef: "tenant-one",
+    generation: 1,
+    policyDigest: `sha256:${"c".repeat(64)}`,
+    outboundInternet: internet,
+  };
+  const lease = (native: DockerContainerNativeIdentity) => ({
+    revocation: revocation.signal,
+    stillCurrent: async () => current,
+    readback: async () =>
+      transform({
+        native,
+        policy,
+        installed: true,
+        topology: {
+          networkId: native.networkId,
+          rulesetDigest: `sha256:${"d".repeat(64)}`,
+          meterId: "meter-one",
+        },
+        coverage: {
+          ipv4: true,
+          ipv6: true,
+          tcp: true,
+          udp: true,
+          hostInput: true,
+          forwardedTraffic: true,
+          tenantIsolation: true,
+          privateAddressDeny: true,
+          metadataDeny: true,
+          tcp25Deny: true,
+          connectionLimit: true,
+          bandwidthLimit: true,
+          rawEgressMeter: true,
+          killSwitch: true,
+          denyAllOutbound: !internet,
+          publicInternet: internet,
+        },
+      }),
+    claimStart: async () => {
+      if (claimed.has(native.nativeId)) return "already-claimed" as const;
+      claimed.add(native.nativeId);
+      return "claimed" as const;
+    },
+  });
+  const createPreparation = () =>
+    createDockerContainerRuntimePreparation({
+      policy,
+      readStartClaim: async (native) =>
+        claimed.has(native.nativeId) ? ("claimed" as const) : ("unclaimed" as const),
+      prepare: async (native) => {
+        preparedNative.push(native);
+        beforePrepare();
+        return lease(native);
+      },
+      recover: async (native) => lease(native),
+    });
+  return {
+    createPreparation,
+    preparedNative,
+    revocation,
+    setCurrent: (value: boolean) => {
+      current = value;
+    },
+    setReadback: (value: typeof transform) => {
+      transform = value;
+    },
+    setBeforePrepare: (value: () => void) => {
+      beforePrepare = value;
+    },
+  };
+}
+
+test("Host opted preparation reads exact stopped Docker identity before allowing an external bridge start", async () => {
+  const fixture = engineFixture();
+  const trusted = trustedFixture(fixture);
+  trusted.setBeforePrepare(() => {
+    expect(fixture.containers.size).toBe(1);
+    expect([...fixture.containers.values()][0]?.State).toEqual({ Running: false });
+    expect(fixture.calls.some((call) => call.path.endsWith("/start"))).toBe(false);
+  });
+  const runtimePreparation = trusted.createPreparation();
+  const runtime = createDockerHttpRevisionRuntime({ ...fixture.options, runtimePreparation });
+  expect(await runtime.reconcile(revision)).toMatchObject({ state: "ready" });
+  expect(trusted.preparedNative.map((native) => native.nativeId)).toEqual(["1".padStart(64, "0")]);
+  expect(fixture.calls.filter((call) => call.path.endsWith("/start"))).toHaveLength(1);
+  expect(
+    fixture.calls.find((call) => call.path.startsWith("/containers/create"))?.body?.HostConfig,
+  ).toMatchObject({
+    RestartPolicy: { Name: "no", MaximumRetryCount: 0 },
+    CapDrop: ["ALL"],
+    Privileged: false,
+    PublishAllPorts: false,
+  });
+});
+
+test("Docker starts zero times for missing or incomplete trusted enforcement and revoked authority", async () => {
+  for (const fault of ["missing", "foreign", "partial", "false-policy", "revoked"] as const) {
+    const fixture = engineFixture();
+    const trusted = trustedFixture(fixture, fault !== "false-policy");
+    trusted.setReadback((receipt) => {
+      if (fault === "missing") return null;
+      if (fault === "foreign")
+        return { ...receipt, native: { ...receipt.native, backend: "cloudflare" } };
+      if (fault === "partial")
+        return { ...receipt, coverage: { ...receipt.coverage, ipv6: false } };
+      if (fault === "false-policy")
+        return { ...receipt, coverage: { ...receipt.coverage, denyAllOutbound: false } };
+      return receipt;
+    });
+    if (fault === "revoked") trusted.setBeforePrepare(() => trusted.revocation.abort());
+    const runtime = createDockerHttpRevisionRuntime({
+      ...fixture.options,
+      runtimePreparation: trusted.createPreparation(),
+    });
+    await expect(runtime.reconcile(revision)).rejects.toBeInstanceOf(DockerHttpRevisionError);
+    expect(fixture.calls.filter((call) => call.path.endsWith("/start"))).toHaveLength(0);
+    expect([...fixture.containers.values()][0]?.State).toEqual({ Running: false });
+  }
+});
+
+test("Docker rereads native identity after preparation and never starts a replacement", async () => {
+  const fixture = engineFixture();
+  const trusted = trustedFixture(fixture);
+  trusted.setBeforePrepare(() => {
+    const [name, value] = [...fixture.containers.entries()][0] ?? [];
+    if (!name || !value) throw new Error("Missing stopped fixture");
+    fixture.containers.set(name, { ...value, Id: "9".repeat(64) });
+  });
+  const runtime = createDockerHttpRevisionRuntime({
+    ...fixture.options,
+    runtimePreparation: trusted.createPreparation(),
+  });
+  expect(await runtime.reconcile(revision)).toMatchObject({ state: "stopped" });
+  expect(fixture.calls.filter((call) => call.path.endsWith("/start"))).toHaveLength(0);
+});
+
+test("unknown Docker start ACK recovers by readback after a Host runtime restart without replay", async () => {
+  const fixture = engineFixture();
+  const trusted = trustedFixture(fixture);
+  let starts = 0;
+  const engine: NonNullable<DockerHttpRevisionOptions["engine"]> = async (method, path, body) => {
+    if (method === "POST" && path.endsWith("/start")) {
+      starts++;
+      throw new Error("synthetic-private-engine-diagnostic");
+    }
+    return fixture.engine(method, path, body);
+  };
+  const create = () =>
+    createDockerHttpRevisionRuntime({
+      ...fixture.options,
+      engine,
+      runtimePreparation: trusted.createPreparation(),
+    });
+  expect(await create().reconcile(revision)).toMatchObject({ state: "stopped" });
+  expect(await create().reconcile(revision)).toMatchObject({ state: "stopped" });
+  expect(starts).toBe(1);
+});
+
+test("Docker rejects missing or foreign attached network IDs before trusted preparation or start", async () => {
+  for (const networkId of [undefined, "9".repeat(64), "invalid"] as const) {
+    const fixture = engineFixture();
+    const trusted = trustedFixture(fixture);
+    const engine: NonNullable<DockerHttpRevisionOptions["engine"]> = async (method, path, body) => {
+      const response = await fixture.engine(method, path, body);
+      if (path.startsWith("/containers/create")) {
+        const [name, value] = [...fixture.containers.entries()][0] ?? [];
+        if (!name || !value) throw new Error("Missing stopped fixture");
+        fixture.containers.set(name, {
+          ...value,
+          NetworkSettings: {
+            Networks: {
+              "installation-net": {
+                IPAddress: "172.22.0.2",
+                ...(networkId === undefined ? {} : { NetworkID: networkId }),
+              },
+            },
+          },
+        });
+      }
+      return response;
+    };
+    const runtime = createDockerHttpRevisionRuntime({
+      ...fixture.options,
+      engine,
+      runtimePreparation: trusted.createPreparation(),
+    });
+    await expect(runtime.reconcile(revision)).rejects.toBeInstanceOf(DockerHttpRevisionError);
+    expect(trusted.preparedNative).toHaveLength(0);
+    expect(fixture.calls.filter((call) => call.path.endsWith("/start"))).toHaveLength(0);
+    expect([...fixture.containers.values()][0]?.State).toEqual({ Running: false });
+  }
+});
+
+test("Docker refuses an attachment NetworkID that changes while trusted preparation awaits", async () => {
+  const fixture = engineFixture();
+  const trusted = trustedFixture(fixture);
+  trusted.setBeforePrepare(() => {
+    const [name, value] = [...fixture.containers.entries()][0] ?? [];
+    if (!name || !value) throw new Error("Missing stopped fixture");
+    fixture.containers.set(name, {
+      ...value,
+      NetworkSettings: {
+        Networks: { "installation-net": { IPAddress: "172.22.0.2", NetworkID: "9".repeat(64) } },
+      },
+    });
+  });
+  const runtime = createDockerHttpRevisionRuntime({
+    ...fixture.options,
+    runtimePreparation: trusted.createPreparation(),
+  });
+  expect(await runtime.reconcile(revision)).toMatchObject({ state: "stopped" });
+  expect(trusted.preparedNative[0]?.networkId).toBe("b".repeat(64));
+  expect(fixture.calls.filter((call) => call.path.endsWith("/start"))).toHaveLength(0);
+});
+
+test("Docker cannot report ready when its lease expires during awaited health without abort notification", async () => {
+  for (const notification of ["current-only", "abort"] as const) {
+    const fixture = engineFixture();
+    const trusted = trustedFixture(fixture);
+    let releaseHealth: () => void = () => undefined;
+    let healthEntered: () => void = () => undefined;
+    const entered = new Promise<void>((resolve) => {
+      healthEntered = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      releaseHealth = resolve;
+    });
+    const runtime = createDockerHttpRevisionRuntime({
+      ...fixture.options,
+      runtimePreparation: trusted.createPreparation(),
+      healthFetch: async () => {
+        healthEntered();
+        await release;
+        return new Response("ok");
+      },
+    });
+    const pending = runtime.reconcile(revision);
+    await entered;
+    if (notification === "abort") trusted.revocation.abort();
+    else trusted.setCurrent(false);
+    releaseHealth();
+    await expect(pending).rejects.toBeInstanceOf(DockerHttpRevisionError);
+    expect(trusted.revocation.signal.aborted).toBe(notification === "abort");
+    expect(fixture.calls.filter((call) => call.path.endsWith("/start"))).toHaveLength(1);
+  }
+});
+
+test("Docker running recovery keeps its lease through awaited health body cancellation", async () => {
+  const fixture = engineFixture();
+  const trusted = trustedFixture(fixture);
+  let recovering = false;
+  const runtime = createDockerHttpRevisionRuntime({
+    ...fixture.options,
+    runtimePreparation: trusted.createPreparation(),
+    healthFetch: async () =>
+      new Response(
+        new ReadableStream({
+          cancel: async () => {
+            if (recovering) trusted.setCurrent(false);
+          },
+        }),
+      ),
+  });
+  expect(await runtime.reconcile(revision)).toMatchObject({ state: "ready" });
+  recovering = true;
+  await expect(runtime.observe(revision)).rejects.toBeInstanceOf(DockerHttpRevisionError);
+  expect(trusted.revocation.signal.aborted).toBe(false);
+  expect(fixture.calls.filter((call) => call.path.endsWith("/start"))).toHaveLength(1);
+});
 
 test("Docker HTTP revisions create, recover, coexist across update and delete only the exact revision", async () => {
   const fixture = engineFixture();
