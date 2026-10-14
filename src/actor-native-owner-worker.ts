@@ -21,6 +21,15 @@ interface NativeState {
     abort?(name: string, reason: string): void;
   };
   readonly storage?: {
+    readonly kv?: {
+      get(key: string): unknown;
+      put(key: string, value: unknown): void;
+      delete(key: string): boolean;
+      list(options: {
+        readonly prefix: string;
+        readonly limit: number;
+      }): Iterable<readonly [string, unknown]>;
+    };
     readonly sql: {
       exec(sql: string, ...params: (string | number | null)[]): Iterable<Record<string, unknown>>;
     };
@@ -59,6 +68,8 @@ const OBSERVATION_REVISION_LIMIT = Number.MAX_SAFE_INTEGER;
 const SOCKET_INBOUND_COUNT = 64;
 const ACTOR_INBOUND_COUNT = 256;
 const SOCKET_ID_LIMIT = 10_000;
+const SOCKET_ATTACHMENT_PREFIX = "__takoserver_actor_socket_attachment_v1:";
+const SOCKET_ATTACHMENT_GC_PAGE = 32;
 const ALARM_RETRY_MS = 1_000;
 const ALARM_WATCHDOG_MS = 35_000;
 const ALARM_HANDLER_MS = 30_000;
@@ -275,6 +286,7 @@ interface SocketAttachment {
   readonly socketId: string;
   readonly actorId: string;
   readonly attachment: string | null;
+  readonly attachmentFormat?: "owner-kv-v1";
   readonly reservationBearer?: string | undefined;
   readonly reservationExpiresAt?: number | undefined;
   readonly reservationGenerationKey?: string | undefined;
@@ -290,6 +302,10 @@ function socketMetadata(socket: NativeActorWebSocket): SocketAttachment | null {
     typeof record.socketId !== "string" ||
     typeof record.actorId !== "string" ||
     (record.attachment !== null && typeof record.attachment !== "string") ||
+    (record.attachmentFormat !== undefined &&
+      (record.attachmentFormat !== "owner-kv-v1" ||
+        record.attachment !== null ||
+        !validSocketAttachmentId(record.socketId))) ||
     (record.reservationBearer !== undefined &&
       (typeof record.reservationBearer !== "string" ||
         !/^[a-f0-9]{64}$/u.test(record.reservationBearer))) ||
@@ -308,6 +324,15 @@ function socketMetadata(socket: NativeActorWebSocket): SocketAttachment | null {
   )
     return null;
   return record as SocketAttachment;
+}
+
+function validSocketAttachmentId(socketId: string): boolean {
+  return /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u.test(socketId);
+}
+
+function socketAttachmentKey(socketId: string): string {
+  if (!validSocketAttachmentId(socketId)) throw new Error("Actor socket identity unavailable");
+  return SOCKET_ATTACHMENT_PREFIX + socketId;
 }
 
 function encodeAttachment(bytes: Uint8Array | null): string | null {
@@ -698,6 +723,7 @@ export function createActorNativeOwner(
             "DELETE FROM actor_socket_reservations WHERE socket_id = ?",
             metadata.socketId,
           );
+          this.deleteSocketAttachment(metadata.socketId);
         }
         await this.reconcile();
       };
@@ -987,7 +1013,7 @@ export function createActorNativeOwner(
           actorId: metadata.actorId,
           nonce: "",
           protocol: "",
-          attachment: decodeAttachment(metadata.attachment),
+          attachment: this.readSocketAttachment(metadata, socket),
           queued: [],
           queuedBytes: 0,
           status:
@@ -1008,11 +1034,88 @@ export function createActorNativeOwner(
       }
       return undefined;
     }
+    private readSocketAttachment(
+      metadata: SocketAttachment,
+      socket: NativeActorWebSocket,
+    ): Uint8Array | null {
+      try {
+        if (metadata.attachmentFormat === undefined) {
+          const bytes = decodeAttachment(metadata.attachment);
+          if (bytes !== null && bytes.byteLength > profile.socketAttachmentBytes)
+            throw new Error("Actor socket attachment exceeds its ABI");
+          return bytes;
+        }
+        const kv = this.requireStorage().kv;
+        if (!kv) throw new Error("Actor socket attachment storage unavailable");
+        const value = kv.get(socketAttachmentKey(metadata.socketId));
+        if (typeof value !== "object" || value === null || SafeArrayIsArray(value))
+          throw new Error("Actor socket attachment unavailable");
+        const payload = value as { readonly actorId?: unknown; readonly bytes?: unknown };
+        if (
+          payload.actorId !== metadata.actorId ||
+          (payload.bytes !== null &&
+            (!(payload.bytes instanceof SafeUint8Array) ||
+              payload.bytes.byteLength > profile.socketAttachmentBytes))
+        )
+          throw new Error("Actor socket attachment unavailable");
+        return payload.bytes === null ? null : payload.bytes.slice();
+      } catch (error) {
+        // Never substitute empty bytes or invoke another Actor with corrupt or
+        // missing custody. There is no admitted callback at this read boundary.
+        this.suppressedCloses.add(socket);
+        this.sockets.delete(metadata.socketId);
+        this.deleteSocketAttachment(metadata.socketId);
+        this.state.storage?.sql.exec(
+          "DELETE FROM actor_socket_reservations WHERE socket_id = ?",
+          metadata.socketId,
+        );
+        try {
+          socket.close(1011, "socket attachment unavailable");
+        } catch {
+          /* peer already gone */
+        }
+        throw error;
+      }
+    }
+    private deleteSocketAttachment(socketId: string): void {
+      if (validSocketAttachmentId(socketId))
+        this.state.storage?.kv?.delete(socketAttachmentKey(socketId));
+    }
+    private cleanupTerminalAttachment(socket: NativeActorWebSocket): void {
+      if (
+        this.poisoned ||
+        this.activeContext ||
+        !this.suppressedCloses.has(socket) ||
+        (this.inbound.get(socket)?.events.size ?? 0) !== 0
+      )
+        return;
+      const metadata = socketMetadata(socket);
+      if (metadata) this.deleteSocketAttachment(metadata.socketId);
+    }
     private persistSocket(record: SocketRecord): void {
-      record.socket?.serializeAttachment({
+      if (!record.socket) return;
+      const previous = socketMetadata(record.socket);
+      if (profile.kind === "v2") {
+        const kv = this.requireStorage().kv;
+        if (!kv) throw new Error("Actor socket attachment storage unavailable");
+        if (
+          record.attachment !== null &&
+          record.attachment.byteLength > profile.socketAttachmentBytes
+        )
+          throw new Error("Actor socket attachment exceeds its ABI");
+        // The owner and the tenant Facet have separate storage namespaces.
+        // Copy the complete bytes; a 16 KiB portable payload must not compete
+        // with native identity/reservation metadata for the 16 KiB envelope.
+        kv.put(socketAttachmentKey(record.socketId), {
+          actorId: record.actorId,
+          bytes: record.attachment === null ? null : record.attachment.slice(),
+        });
+      }
+      const metadata: SocketAttachment = {
         socketId: record.socketId,
         actorId: record.actorId,
-        attachment: encodeAttachment(record.attachment),
+        attachment: profile.kind === "v2" ? null : encodeAttachment(record.attachment),
+        ...(profile.kind === "v2" ? { attachmentFormat: "owner-kv-v1" as const } : {}),
         ...(record.status === "transport-pending"
           ? {
               reservationBearer: record.reservationBearer,
@@ -1022,7 +1125,71 @@ export function createActorNativeOwner(
               reservationVariantKey: record.reservationVariantKey,
             }
           : {}),
-      } satisfies SocketAttachment);
+      };
+      if (profile.kind === "v2" && previous?.attachmentFormat === "owner-kv-v1") {
+        let unchanged = true;
+        for (const field of [
+          "socketId",
+          "actorId",
+          "reservationBearer",
+          "reservationExpiresAt",
+          "reservationGenerationKey",
+          "reservationEpoch",
+          "reservationVariantKey",
+        ] as const)
+          if (previous[field] !== metadata[field]) unchanged = false;
+        // A live replacement changes only the atomic KV value. Re-stamping
+        // identical native metadata would introduce a second failure boundary.
+        if (unchanged) return;
+      }
+      try {
+        record.socket.serializeAttachment(metadata);
+      } catch (error) {
+        if (profile.kind === "v2" && previous?.attachmentFormat === undefined)
+          this.deleteSocketAttachment(record.socketId);
+        throw error;
+      }
+    }
+    /** Host-only retirement after the caller proves its own stop barrier. */
+    retireSocketAttachments(): Promise<{ readonly deleted: number; readonly complete: boolean }> {
+      this.socketBatch = undefined;
+      const turn = this.tail.then(async () => {
+        await this.ready;
+        await this.alarmTail;
+        const storage = this.requireStorage();
+        const nativeSockets = this.state.getWebSockets?.();
+        const reservation = storage.sql
+          .exec("SELECT COUNT(*) AS count FROM actor_socket_reservations")
+          [Symbol.iterator]()
+          .next().value;
+        if (
+          this.poisoned ||
+          this.activeContext ||
+          this.inboundCount !== 0 ||
+          nativeSockets === undefined ||
+          nativeSockets.length !== 0 ||
+          reservation?.count !== 0
+        )
+          throw new Error("Actor socket attachment retirement unavailable");
+        const kv = storage.kv;
+        if (!kv) throw new Error("Actor socket attachment storage unavailable");
+        const keys: string[] = [];
+        for (const [key] of kv.list({
+          prefix: SOCKET_ATTACHMENT_PREFIX,
+          limit: SOCKET_ATTACHMENT_GC_PAGE,
+        })) {
+          if (keys.length >= SOCKET_ATTACHMENT_GC_PAGE || !key.startsWith(SOCKET_ATTACHMENT_PREFIX))
+            throw new Error("Actor socket attachment storage unavailable");
+          keys.push(key);
+        }
+        for (const key of keys) kv.delete(key);
+        return { deleted: keys.length, complete: keys.length < SOCKET_ATTACHMENT_GC_PAGE };
+      });
+      this.tail = turn.then(
+        () => {},
+        () => {},
+      );
+      return turn;
     }
     private discardProvisional(nonce: string, except?: string): void {
       for (const [socketId, record] of this.sockets) {
@@ -1038,6 +1205,7 @@ export function createActorNativeOwner(
         "DELETE FROM actor_socket_reservations WHERE socket_id = ?",
         record.socketId,
       );
+      this.deleteSocketAttachment(record.socketId);
       if (record.socket) {
         this.suppressedCloses.add(record.socket);
         try {
@@ -1068,6 +1236,7 @@ export function createActorNativeOwner(
             "DELETE FROM actor_socket_reservations WHERE socket_id = ?",
             socketId,
           );
+          if (!record) this.deleteSocketAttachment(socketId);
         }
       }
       await this.reconcile();
@@ -1311,6 +1480,7 @@ export function createActorNativeOwner(
           ? new Response(null, { status: 204 })
           : new Response(record.attachment.slice());
       if (action === "set-attachment") {
+        const previous = record.attachment;
         if (request.headers.get(SOCKET_KIND_HEADER) === "null") {
           record.attachment = null;
         } else {
@@ -1320,7 +1490,12 @@ export function createActorNativeOwner(
           if (this.activeSocketInvocation !== active) return new Response(null, { status: 404 });
           record.attachment = bytes;
         }
-        if (record.status === "live") this.persistSocket(record);
+        try {
+          if (record.status === "live") this.persistSocket(record);
+        } catch (error) {
+          record.attachment = previous;
+          throw error;
+        }
         return new Response(null, { status: 204 });
       }
       if (action === "send") {
@@ -1532,8 +1707,18 @@ export function createActorNativeOwner(
             graphBeforeDelivery.variantKeys[variantIndex] !== selected.variantKey
           )
             throw new Error("Actor alarm graph changed before delivery");
+          const socketNonce = SafeReflectApply(SafeCryptoRandomUUID, SafeCrypto, []) as string;
+          this.activeSocketInvocation = {
+            actorId: claimed,
+            nonce: socketNonce,
+            kind: "callback",
+            accepting: false,
+          };
           const request = new Request("http://actor.invalid/", {
-            headers: { [DELIVERY_HEADER]: deliveryForEvent() },
+            headers: {
+              [DELIVERY_HEADER]: deliveryForEvent(),
+              [SOCKET_NONCE_HEADER]: socketNonce,
+            },
             signal: deadline.signal,
           });
           const response = await Promise.race([
@@ -1552,6 +1737,7 @@ export function createActorNativeOwner(
           // The durable obligation survives, including any pending successor.
         } finally {
           if (timer) clearTimeout(timer);
+          this.activeSocketInvocation = undefined;
         }
         let retirementFailed = false;
         const abortFacet = this.state.facets.abort;
@@ -1727,6 +1913,7 @@ export function createActorNativeOwner(
       this.inboundBytes -= entry.bytes;
       this.inboundCount -= 1;
       if (connection.events.size === 0) this.inbound.delete(entry.socket);
+      this.cleanupTerminalAttachment(entry.socket);
     }
     private discardInbound(socket: NativeActorWebSocket): void {
       this.stoppedInbound.add(socket);
@@ -1769,6 +1956,7 @@ export function createActorNativeOwner(
             record.status = "closed";
             this.sockets.delete(socketId);
           }
+          this.cleanupTerminalAttachment(socket);
         }
         try {
           socket.close(1013, "inbound queue overloaded");
@@ -1840,7 +2028,7 @@ export function createActorNativeOwner(
           actorId,
           nonce: "",
           protocol: "",
-          attachment: decodeAttachment(metadata.attachment),
+          attachment: this.readSocketAttachment(metadata, socket),
           queued: [],
           queuedBytes: 0,
           status: profile.kind === "v2" ? "terminal" : "live",
@@ -2308,6 +2496,7 @@ export function createActorNativeOwner(
               }
             upgrade.status = "closed";
             this.sockets.delete(upgrade.socketId);
+            this.deleteSocketAttachment(upgrade.socketId);
             if (this.state.storage)
               this.requireStorage().sql.exec(
                 "DELETE FROM actor_socket_reservations WHERE socket_id = ?",
