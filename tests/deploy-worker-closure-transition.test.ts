@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -14,6 +15,7 @@ import type {
   WorkerMigrationReader,
   WorkerProviderExecutorQualification,
   WorkerState,
+  WorkerStripeModeRealmReader,
 } from "../scripts/deploy/worker.ts";
 import {
   type ClosureTransitionProcess,
@@ -26,6 +28,8 @@ import {
   type WorkerClosureDelta,
 } from "../scripts/deploy/worker-state.ts";
 import { acquireWranglerVersionPublicationLease } from "../scripts/deploy/wrangler-state.ts";
+import { MIGRATIONS } from "../src/db-schema.ts";
+import { STRIPE_MODE_REALM_SCHEMA_QUERY } from "../src/stripe-mode-realm.ts";
 import { applyQualifiedSchemaState } from "./helpers/audited-schema-fixture.ts";
 import {
   cloudflareProviderExecutorTarget,
@@ -134,6 +138,19 @@ const canonicalMoneyPolicy = [
     cash_unit: "usd-cents-v1",
   },
 ];
+const canonicalStripeModeRealmSchema = (() => {
+  const db = new Database(":memory:");
+  const migration = MIGRATIONS.find((item) => item.name === "0098_stripe_mode_realm.sql");
+  if (!migration) throw new Error("missing 0098 Stripe mode realm source migration");
+  db.exec(migration.sql);
+  const rows = db.query(STRIPE_MODE_REALM_SCHEMA_QUERY).all() as {
+    type: string;
+    name: string;
+    sql: string;
+  }[];
+  db.close();
+  return rows;
+})();
 const currentMoneyStorageState = {
   applied: schemaMigrations,
   shape: canonicalMoneyShape,
@@ -288,6 +305,7 @@ interface Fixture {
   readonly stateCalls: string[];
   readonly state: WorkerState;
   readonly migrations: WorkerMigrationReader;
+  readonly stripeModeRealm: WorkerStripeModeRealmReader;
   readonly secretDirectory: string;
   readonly providerExecutorQualification: WorkerProviderExecutorQualification;
 }
@@ -305,6 +323,8 @@ function fixture(
     readonly local?: readonly string[];
     readonly auditedShape?: string;
     readonly moneyUnitPolicy?: readonly Readonly<Record<string, unknown>>[];
+    readonly stripeModePin?: "test" | "live" | null;
+    readonly changeStripeModeAfterBuild?: "test" | "live" | null;
   } = {},
 ): Fixture {
   const selected = input.selected ?? target;
@@ -313,6 +333,7 @@ function fixture(
   let current = input.current ?? "predecessor";
   let uploaded = false;
   let uploadMessage: string | null = null;
+  let stripeModePin = input.stripeModePin === undefined ? "test" : input.stripeModePin;
   const run: ClosureTransitionProcess = async (command): Promise<CommandResult> => {
     calls.push([...command]);
     const key = command.join(" ");
@@ -328,6 +349,9 @@ function fixture(
       mkdirSync(out, { recursive: true });
       writeFileSync(join(out, "index.js"), BUNDLE);
       writeFileSync(join(out, "index.js.map"), "{}\n");
+      if (input.changeStripeModeAfterBuild !== undefined) {
+        stripeModePin = input.changeStripeModeAfterBuild;
+      }
       return ok("Total Upload: 1 KiB\n");
     }
     if (command.includes("deploy") && command.includes("--no-bundle")) {
@@ -397,6 +421,14 @@ function fixture(
     stateCalls,
     state,
     secretDirectory,
+    stripeModeRealm: {
+      async read() {
+        return {
+          schema: canonicalStripeModeRealmSchema,
+          pins: stripeModePin === null ? [] : [{ mode: stripeModePin }],
+        };
+      },
+    },
     migrations: {
       async read() {
         return {
@@ -520,9 +552,12 @@ describe("reviewed Worker closure transition", () => {
         outputDirectory: root,
         secretDirectory: parts.secretDirectory,
         cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
-        integrationStorageVerification: baseIntegrationStorageVerificationOptions(v2Target, {
-          readState: async () => currentMoneyStorageState,
-        }),
+        integrationStorageVerification: {
+          ...baseIntegrationStorageVerificationOptions(v2Target, {
+            readState: async () => currentMoneyStorageState,
+          }),
+          moneyUnitPolicyReader: async () => canonicalMoneyPolicy,
+        },
         fetcher: publishedProductFetcher(),
       };
       const status = await runWorkerClosureTransition(
@@ -618,9 +653,12 @@ describe("reviewed Worker closure transition", () => {
             outputDirectory: root,
             secretDirectory: parts.secretDirectory,
             cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
-            integrationStorageVerification: baseIntegrationStorageVerificationOptions(v2Target, {
-              readState: async () => currentMoneyStorageState,
-            }),
+            integrationStorageVerification: {
+              ...baseIntegrationStorageVerificationOptions(v2Target, {
+                readState: async () => currentMoneyStorageState,
+              }),
+              moneyUnitPolicyReader: async () => canonicalMoneyPolicy,
+            },
             fetcher: publishedProductFetcher(),
           },
         ).catch((error: unknown) => error);
@@ -759,6 +797,7 @@ describe("reviewed Worker closure transition", () => {
             },
           },
           migrations: parts.migrations,
+          stripeModeRealm: parts.stripeModeRealm,
           review: "reviewer@example.test",
           secretDirectory: parts.secretDirectory,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
@@ -815,6 +854,7 @@ describe("reviewed Worker closure transition", () => {
           run: parts.run,
           state: parts.state,
           migrations: parts.migrations,
+          stripeModeRealm: parts.stripeModeRealm,
           providerExecutorQualification: parts.providerExecutorQualification,
           review: "reviewer@example.test",
           secretDirectory: parts.secretDirectory,
@@ -898,6 +938,7 @@ describe("reviewed Worker closure transition", () => {
           run: parts.run,
           state: parts.state,
           migrations: parts.migrations,
+          stripeModeRealm: parts.stripeModeRealm,
           providerExecutorQualification: qualification(maintenanceExecutor),
           review: "reviewer@example.test",
           secretDirectory: parts.secretDirectory,
@@ -955,6 +996,7 @@ describe("reviewed Worker closure transition", () => {
           },
           state: lost.state,
           migrations: lost.migrations,
+          stripeModeRealm: lost.stripeModeRealm,
           providerExecutorQualification: qualification(maintenanceExecutor),
           review: "reviewer@example.test",
           secretDirectory: lost.secretDirectory,
@@ -967,6 +1009,94 @@ describe("reviewed Worker closure transition", () => {
       expect(lost.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
     });
   });
+
+  test("publishes only the declared maintenance var over the exact canonical 0092 Host closure", async () => {
+    await withRoot("takoserver-closure-v2-0098-maintenance-", async (root) => {
+      const {
+        edgeSupplies: _edgeSupplies,
+        objectBucketSupplies: _objectBucketSupplies,
+        cloudflareProviderExecutor: _executor,
+        ...hostOnly
+      } = v2Target;
+      const selected = {
+        ...hostOnly,
+        takoformV2: {
+          config: V2_PUBLIC_CONFIG,
+          storageLineage: "v2-0088" as const,
+          appliedSchemaLineage: "v2-0092" as const,
+        },
+        schemaMaintenanceMode: "pre-v2-0098-quiesced" as const,
+      } satisfies DeployTarget;
+      const shape = deriveExpectedApplicationShape(readMigrationArtifact().files.slice(0, 92));
+      const exact = {
+        applied: schemaMigrations.slice(0, 92),
+        shape,
+        shapeDigest: `sha256:${createHash("sha256").update(shape).digest("hex")}`,
+      };
+      const parts = fixture(root, {
+        selected,
+        local: schemaMigrations,
+        applied: exact.applied,
+        auditedShape: shape,
+        predecessor: { dropVar: SCHEMA_MODE_VAR, v2Startup: true },
+      });
+      let reads = 0;
+      const result = await runWorkerClosureTransition(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          closurePredecessorVersionId: PREDECESSOR,
+          delta: {
+            retiredVars: [],
+            addedVars: [SCHEMA_MODE_VAR],
+            refreshedVars: [],
+            addedBindings: [],
+            addedSecrets: [],
+            rotatedSecrets: [],
+          },
+        },
+        selected,
+        {
+          run: parts.run,
+          state: parts.state,
+          migrations: parts.migrations,
+          stripeModeRealm: parts.stripeModeRealm,
+          review: "reviewer@example.test",
+          secretDirectory: parts.secretDirectory,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          outputDirectory: join(root, "work"),
+          integrationStorageVerification: integrationStorageVerificationOptions(selected, {
+            readState: async () => {
+              reads++;
+              return exact;
+            },
+          }),
+          fetcher: async () =>
+            Response.json(
+              {
+                error: {
+                  code: "backend_unavailable",
+                  message: "Host is quiesced for the v2 0098 schema maintenance transition",
+                  details: { reason: "runtime-configuration" },
+                },
+              },
+              { status: 503, headers: { "cache-control": "no-store", "retry-after": "60" } },
+            ),
+        },
+      );
+      expect(result).toMatchObject({
+        maintenance: "pre-v2-0098-quiesced",
+        previousVersionId: PREDECESSOR,
+        versionId: SUCCESSOR,
+        pendingMigrations: schemaMigrations.slice(92),
+        probe: { status: 503, traffic: "maintenance" },
+      });
+      expect(reads).toBe(3);
+      expect(parts.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+    });
+  }, 20_000);
 
   test("the shared Worker publication lease blocks a concurrent maintenance closure before upload", async () => {
     await withRoot("takoserver-v2-closure-shared-lease-", async (root) => {
@@ -1026,6 +1156,7 @@ describe("reviewed Worker closure transition", () => {
         run: parts.run,
         state: parts.state,
         migrations: parts.migrations,
+        stripeModeRealm: parts.stripeModeRealm,
         providerExecutorQualification: qualification(exact),
         review: "reviewer@example.test",
         secretDirectory: parts.secretDirectory,
@@ -1088,6 +1219,7 @@ describe("reviewed Worker closure transition", () => {
           run: parts.run,
           state: parts.state,
           migrations: parts.migrations,
+          stripeModeRealm: parts.stripeModeRealm,
           providerExecutorQualification: parts.providerExecutorQualification,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
           outputDirectory: join(root, "work"),
@@ -1152,6 +1284,7 @@ describe("reviewed Worker closure transition", () => {
           state: parts.state,
           providerExecutorQualification: parts.providerExecutorQualification,
           migrations,
+          stripeModeRealm: parts.stripeModeRealm,
           review: "reviewer@example.test",
           secretDirectory: parts.secretDirectory,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
@@ -1190,6 +1323,7 @@ describe("reviewed Worker closure transition", () => {
           state: parts.state,
           providerExecutorQualification: parts.providerExecutorQualification,
           migrations: parts.migrations,
+          stripeModeRealm: parts.stripeModeRealm,
           outputDirectory: join(root, "work"),
         },
       );
@@ -1246,6 +1380,7 @@ describe("reviewed Worker closure transition", () => {
           state: parts.state,
           providerExecutorQualification: parts.providerExecutorQualification,
           migrations: parts.migrations,
+          stripeModeRealm: parts.stripeModeRealm,
           review: "reviewer@example.test",
           secretDirectory: parts.secretDirectory,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
@@ -1268,6 +1403,67 @@ describe("reviewed Worker closure transition", () => {
         expect(parts.calls.some((call) => call.includes("--no-bundle"))).toBe(false);
       });
     }
+  });
+
+  test("serving closure status observes the selected Stripe realm and apply refuses an absent pin", async () => {
+    await withRoot("takoserver-closure-stripe-realm-missing-", async (root) => {
+      const parts = fixture(root, { stripeModePin: null });
+      const invocation = {
+        surface: "takoserver-worker-authority-cutover",
+        environment: "integration",
+        commit: COMMIT,
+        closurePredecessorVersionId: PREDECESSOR,
+        delta: INTEGRATION_DELTA,
+      } as const;
+      const options = {
+        ...parts,
+        review: "reviewer@example.test",
+        outputDirectory: join(root, "work"),
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "deploy-token" },
+      };
+      const status = await runWorkerClosureTransition(
+        { ...invocation, action: "status" },
+        target,
+        options,
+      );
+      expect(status).toMatchObject({ ready: false, stripeModeRealm: { reason: "not_pinned" } });
+      const refusal = await runWorkerClosureTransition(
+        { ...invocation, action: "apply" },
+        target,
+        options,
+      ).catch((error: unknown) => error);
+      expect(refusal).toBeInstanceOf(DeployError);
+      expect((refusal as DeployError).phase).toBe("preflight");
+      expect((refusal as Error).message).toContain("immutable Stripe mode realm pin");
+      expect(parts.calls.some((call) => call.includes("--no-bundle"))).toBe(false);
+    });
+  });
+
+  test("serving closure rechecks the selected Stripe realm immediately before upload", async () => {
+    await withRoot("takoserver-closure-stripe-realm-drift-", async (root) => {
+      const parts = fixture(root, { changeStripeModeAfterBuild: "live" });
+      const refusal = await runWorkerClosureTransition(
+        {
+          surface: "takoserver-worker-authority-cutover",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+          closurePredecessorVersionId: PREDECESSOR,
+          delta: INTEGRATION_DELTA,
+        },
+        target,
+        {
+          ...parts,
+          review: "reviewer@example.test",
+          outputDirectory: join(root, "work"),
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "deploy-token" },
+        },
+      ).catch((error: unknown) => error);
+      expect(refusal).toBeInstanceOf(DeployError);
+      expect((refusal as DeployError).phase).toBe("preflight");
+      expect((refusal as Error).message).toContain("realm proof changed before closure upload");
+      expect(parts.calls.some((call) => call.includes("--no-bundle"))).toBe(false);
+    });
   });
 
   test("storage rebind keeps the exact old predecessor values and publishes target-derived successors", async () => {
@@ -1311,6 +1507,7 @@ describe("reviewed Worker closure transition", () => {
           state,
           providerExecutorQualification: parts.providerExecutorQualification,
           migrations,
+          stripeModeRealm: parts.stripeModeRealm,
           integrationStorageVerification: integrationStorageVerificationOptions(
             storageRebindTarget,
             {
@@ -1404,6 +1601,7 @@ describe("reviewed Worker closure transition", () => {
             state: parts.state,
             providerExecutorQualification: parts.providerExecutorQualification,
             migrations: parts.migrations,
+            stripeModeRealm: parts.stripeModeRealm,
             integrationStorageVerification:
               integrationStorageVerificationOptions(storageRebindTarget),
             outputDirectory: join(root, candidate.name.replaceAll(" ", "-")),
@@ -1447,6 +1645,7 @@ describe("reviewed Worker closure transition", () => {
           state: parts.base.state,
           providerExecutorQualification: parts.base.providerExecutorQualification,
           migrations: parts.base.migrations,
+          stripeModeRealm: parts.base.stripeModeRealm,
           integrationStorageVerification: integrationStorageVerificationOptions(parts.selected),
         },
       ).catch((error: unknown) => error);
@@ -1488,6 +1687,7 @@ describe("reviewed Worker closure transition", () => {
         state: parts.base.state,
         providerExecutorQualification: parts.base.providerExecutorQualification,
         migrations: parts.base.migrations,
+        stripeModeRealm: parts.base.stripeModeRealm,
         integrationStorageVerification: integrationStorageVerificationOptions(parts.selected),
       },
     ).catch((error: unknown) => error);
@@ -1528,6 +1728,7 @@ describe("reviewed Worker closure transition", () => {
           state: parts.state,
           providerExecutorQualification: parts.providerExecutorQualification,
           migrations: parts.migrations,
+          stripeModeRealm: parts.stripeModeRealm,
           integrationStorageVerification: integrationStorageVerificationOptions(
             storageRebindTarget,
             { readState: async () => (reads++ === 0 ? complete : changed) },
@@ -1580,6 +1781,7 @@ describe("reviewed Worker closure transition", () => {
           state: targetRace.state,
           providerExecutorQualification: targetRace.providerExecutorQualification,
           migrations: targetRace.migrations,
+          stripeModeRealm: targetRace.stripeModeRealm,
           integrationStorageVerification: targetRaceOptions,
           review: "reviewer@example.test",
           secretDirectory: targetRace.secretDirectory,
@@ -1621,6 +1823,7 @@ describe("reviewed Worker closure transition", () => {
           state: failedGate.state,
           providerExecutorQualification: failedGate.providerExecutorQualification,
           migrations: failedGate.migrations,
+          stripeModeRealm: failedGate.stripeModeRealm,
           integrationStorageVerification:
             integrationStorageVerificationOptions(storageRebindTarget),
           review: "reviewer@example.test",
@@ -1697,6 +1900,7 @@ describe("reviewed Worker closure transition", () => {
             state: parts.state,
             providerExecutorQualification: parts.providerExecutorQualification,
             migrations: parts.migrations,
+            stripeModeRealm: parts.stripeModeRealm,
             outputDirectory: join(root, "work"),
           },
         );
@@ -1797,6 +2001,7 @@ describe("reviewed Worker closure transition", () => {
             state: parts.state,
             providerExecutorQualification: parts.providerExecutorQualification,
             migrations: parts.migrations,
+            stripeModeRealm: parts.stripeModeRealm,
             outputDirectory: join(root, "work"),
           },
         ).catch((error: unknown) => error);
@@ -1827,6 +2032,7 @@ describe("reviewed Worker closure transition", () => {
             providerExecutorInspection({ status: "stale", ready: false, commit: LIVE_COMMIT }),
           ),
           migrations: parts.migrations,
+          stripeModeRealm: parts.stripeModeRealm,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "deploy-token" },
           outputDirectory: join(root, "work"),
         },
@@ -1863,6 +2069,7 @@ describe("reviewed Worker closure transition", () => {
           state: beforeUpload.state,
           providerExecutorQualification: qualification(providerExecutorInspection(), changed),
           migrations: beforeUpload.migrations,
+          stripeModeRealm: beforeUpload.stripeModeRealm,
           review: "reviewer@example.test",
           secretDirectory: beforeUpload.secretDirectory,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "deploy-token" },
@@ -1896,6 +2103,7 @@ describe("reviewed Worker closure transition", () => {
             changed,
           ),
           migrations: afterPublication.migrations,
+          stripeModeRealm: afterPublication.stripeModeRealm,
           review: "reviewer@example.test",
           secretDirectory: afterPublication.secretDirectory,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "deploy-token" },
@@ -1931,6 +2139,7 @@ describe("reviewed Worker closure transition", () => {
           state: extra.state,
           providerExecutorQualification: extra.providerExecutorQualification,
           migrations: extra.migrations,
+          stripeModeRealm: extra.stripeModeRealm,
           review: "reviewer@example.test",
           secretDirectory: extra.secretDirectory,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
@@ -1960,6 +2169,7 @@ describe("reviewed Worker closure transition", () => {
           state: missing.state,
           providerExecutorQualification: missing.providerExecutorQualification,
           migrations: missing.migrations,
+          stripeModeRealm: missing.stripeModeRealm,
           outputDirectory: join(root, "missing"),
         },
       ).catch((error: unknown) => error);
@@ -1982,6 +2192,7 @@ describe("reviewed Worker closure transition", () => {
           state: overdeclared.state,
           providerExecutorQualification: overdeclared.providerExecutorQualification,
           migrations: overdeclared.migrations,
+          stripeModeRealm: overdeclared.stripeModeRealm,
           outputDirectory: join(root, "overdeclared"),
         },
       ).catch((error: unknown) => error);
@@ -2008,6 +2219,7 @@ describe("reviewed Worker closure transition", () => {
           state: parts.state,
           providerExecutorQualification: parts.providerExecutorQualification,
           migrations: parts.migrations,
+          stripeModeRealm: parts.stripeModeRealm,
           review: "reviewer@example.test",
           secretDirectory: parts.secretDirectory,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
@@ -2034,6 +2246,7 @@ describe("reviewed Worker closure transition", () => {
           state: advanced.state,
           providerExecutorQualification: advanced.providerExecutorQualification,
           migrations: advanced.migrations,
+          stripeModeRealm: advanced.stripeModeRealm,
           outputDirectory: join(root, "advanced"),
         },
       ).catch((error: unknown) => error);
@@ -2069,6 +2282,7 @@ describe("reviewed Worker closure transition", () => {
           state: parts.state,
           providerExecutorQualification: parts.providerExecutorQualification,
           migrations: parts.migrations,
+          stripeModeRealm: parts.stripeModeRealm,
           outputDirectory: join(root, "work"),
         },
       ).catch((error: unknown) => error);
@@ -2096,6 +2310,7 @@ describe("reviewed Worker closure transition", () => {
           state: parts.state,
           providerExecutorQualification: parts.providerExecutorQualification,
           migrations: parts.migrations,
+          stripeModeRealm: parts.stripeModeRealm,
           review: "reviewer@example.test",
           secretDirectory: parts.secretDirectory,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
@@ -2206,6 +2421,7 @@ describe("reviewed Worker closure transition", () => {
             run,
             providerExecutorQualification: parts.providerExecutorQualification,
             migrations: parts.migrations,
+            stripeModeRealm: parts.stripeModeRealm,
             review: "reviewer@example.test",
             secretDirectory: parts.secretDirectory,
             cloudflareEnvironment: {},
@@ -2253,6 +2469,7 @@ describe("reviewed Worker closure transition", () => {
           state: pending.state,
           providerExecutorQualification: pending.providerExecutorQualification,
           migrations: pending.migrations,
+          stripeModeRealm: pending.stripeModeRealm,
           review: "reviewer@example.test",
           secretDirectory: pending.secretDirectory,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
@@ -2278,6 +2495,7 @@ describe("reviewed Worker closure transition", () => {
           state: settled.state,
           providerExecutorQualification: settled.providerExecutorQualification,
           migrations: settled.migrations,
+          stripeModeRealm: settled.stripeModeRealm,
           outputDirectory: join(root, "settled"),
         },
       );
@@ -2317,6 +2535,7 @@ describe("reviewed Worker closure transition", () => {
           state: parts.state,
           providerExecutorQualification: parts.providerExecutorQualification,
           migrations: parts.migrations,
+          stripeModeRealm: parts.stripeModeRealm,
           review: "reviewer@example.test",
           secretDirectory: parts.secretDirectory,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
@@ -2353,6 +2572,7 @@ describe("reviewed Worker closure transition", () => {
           state: parts.state,
           providerExecutorQualification: parts.providerExecutorQualification,
           migrations: parts.migrations,
+          stripeModeRealm: parts.stripeModeRealm,
           review: "reviewer@example.test",
           secretDirectory: parts.secretDirectory,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
@@ -2397,6 +2617,7 @@ describe("reviewed Worker closure transition", () => {
           state: parts.state,
           providerExecutorQualification: parts.providerExecutorQualification,
           migrations: parts.migrations,
+          stripeModeRealm: parts.stripeModeRealm,
           outputDirectory: join(root, "work"),
         },
       ).catch((error: unknown) => error);
@@ -2423,6 +2644,7 @@ describe("reviewed Worker closure transition", () => {
           state: matching.state,
           providerExecutorQualification: matching.providerExecutorQualification,
           migrations: matching.migrations,
+          stripeModeRealm: matching.stripeModeRealm,
           outputDirectory: join(root, "matching"),
         },
       ).catch((error: unknown) => error);
@@ -2485,6 +2707,7 @@ describe("reviewed Worker closure transition", () => {
           state,
           providerExecutorQualification: parts.providerExecutorQualification,
           migrations: parts.migrations,
+          stripeModeRealm: parts.stripeModeRealm,
           review: "reviewer@example.test",
           secretDirectory: parts.secretDirectory,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
@@ -2554,6 +2777,7 @@ describe("reviewed Worker closure transition", () => {
             state: candidate.state,
             providerExecutorQualification: candidate.providerExecutorQualification,
             migrations: candidate.migrations,
+            stripeModeRealm: candidate.stripeModeRealm,
             outputDirectory: join(root, refusal.name.replaceAll(" ", "-")),
           },
         ).catch((error: unknown) => error);
@@ -2637,6 +2861,7 @@ describe("reviewed Worker closure transition", () => {
           state: parts.state,
           providerExecutorQualification: parts.providerExecutorQualification,
           migrations: parts.migrations,
+          stripeModeRealm: parts.stripeModeRealm,
           review: "reviewer@example.test",
           secretDirectory: parts.secretDirectory,
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
@@ -2677,6 +2902,7 @@ describe("reviewed Worker closure transition", () => {
           state: bare.state,
           providerExecutorQualification: bare.providerExecutorQualification,
           migrations: bare.migrations,
+          stripeModeRealm: bare.stripeModeRealm,
           outputDirectory: join(root, "bare"),
         },
       ).catch((error: unknown) => error);

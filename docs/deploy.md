@@ -160,9 +160,11 @@ further: the audited 0001–0092 bytes, ending in `0092_org_wallet_lifecycle.sql
 (the Organization wallet hold, usage, grant and tariff tables), with the fixed
 digest `sha256:6f7c1016b7ffeeb7c02006cdb8e55dc7919bfc2aeaf04c090001dcf423454be2`.
 Choose it only to prepare an isolated staging D1 with the frozen 0092 schema.
-The current USD-micros Worker requires a separately qualified 0093/0094 cutover
-and the complete 0094 schema even when `billingConfig` is absent. The 0092
-payload alone cannot serve the current Worker. It behaves like `v2-0091` in
+The current USD-micros Worker requires a separately qualified 0093–0097 cutover,
+the additional qualified 0098 Stripe realm pin, and the exact full audited 0098
+schema, including the 0094 money-unit policy,
+even when `billingConfig` is absent. The 0092 payload alone cannot serve the
+current Worker. It behaves like `v2-0091` in
 every other generation respect:
 
 - Production fresh init refuses it.
@@ -185,8 +187,51 @@ either profile. For `v2-0092`, read it with these substitutions:
 - Retain `takoformV2.storageLineage: "v2-0092"` as the eventual target's
   immutable creation selector. It does not authorize serving on a 0092 D1.
 - Do not bootstrap or routinely publish the current Worker on this D1. Both
-  refuse before upload until an independently qualified 0093/0094 cutover has
-  produced the exact audited 0094 schema and money-unit policy.
+  refuse before upload until independently qualified 0093–0097 and 0098
+  transitions have produced the exact full audited 0098 schema, 0094
+  money-unit policy, and immutable selected-mode Stripe realm pin.
+
+For an original `v2-0088` integration D1 with the independently applied and
+verified `appliedSchemaLineage: "v2-0092"`, the separate
+`schemaMaintenanceMode: "pre-v2-0098-quiesced"` selects only a non-serving
+public Host successor. The exact 0092 application shape and digest must match
+the frozen source prefix of the audited 0098 inventory. Every HTTP route
+returns 503 without caching, and scheduled work returns before application,
+SQL, payment or provider composition. This is not the normal Worker readiness
+path, a D1 migration writer, a Stripe realm claim, or proof that another old
+writer has stopped. Publication with a Cloudflare provider executor accepts
+only a distinct `pre-v2-0098-quiesced` private qualification bound to the
+original 0088 / applied 0092 target, selected CPE source, active native
+Version/deployment, module bytes and non-code settings closure. The earlier
+0088 proof cannot qualify this transition. Public source checks the value-free
+injected tuple at each publication fence; its private owner has not yet
+implemented or qualified the fresh native inspection that can produce it.
+The public `--status` refuses a CPE-backed target without that explicit private
+qualification. With one, it compares fresh native CPE proof before and after
+around the Host observation; a missing, mismatched or changing proof refuses
+the result. This is GET-only recovery observation after an uncertain upload
+acknowledgment, not permission to retry publication. Protected 0092→0098
+conversion and reactivation require their own separately reviewed operator
+qualification and sole migration writer.
+
+After publication, this target's existing `takoserver-worker --status` requires
+the exact clean selected source checkout and performs a local, non-uploading
+Wrangler dry-run to derive its expected bundle digest and native compatibility
+settings from the selected source config. It then reads the active
+Host deployment, immutable Version and module bytes, script settings,
+bindings, routes, secrets and script subdomain/preview-URL state from native
+Cloudflare GETs. The script subdomain must match the selected workers.dev or
+custom-domain topology, and preview URLs must be disabled. It then checks the
+non-cacheable `/healthz` 503 response and re-reads the native closure. It does
+not query D1: `schemaUnproven: true`, `schemaReady: false` and `ready: false`
+remain true even while 0093–0098 is partially applied or its state is unknown.
+The status does not report `appliedMigrations` or `pendingMigrations`; use the
+separate schema owner for those facts. `nativeNonServing: true` proves only this
+public Host's observed non-serving Version. With a qualified CPE, the status
+also reports its `cloudflareProviderExecutorNativeNonServing` observation and
+the provider executor's non-ready status. Neither observation proves all
+writers stopped, D1 apply authority, a successful migration, or readiness to
+restore normal traffic.
 
 #### Staging D1 through 0091 (staging-only `v2-0091`)
 
@@ -278,8 +323,9 @@ production target. Expect:
 **5. Hold publication.** Generation prepares storage only. A target descriptor
 may retain `takoformV2.storageLineage: "v2-0091"` as its immutable origin, but
 the current USD-micros Worker and closure cannot serve its 0091 schema. They
-require a separately qualified complete 0094 lineage, canonical application
-shape and singleton money-unit policy before normal publication, even with no
+require a separately qualified complete 0098 lineage, canonical application
+shape, singleton money-unit policy and immutable selected-mode Stripe realm pin
+before normal publication, even with no
 billing configuration. The frozen first-Host bootstrap supports historical
 payloads only and refuses to publish the current artifact on this 0091 D1.
 Never edit the canonical WfP target to bypass this boundary.
@@ -305,7 +351,8 @@ authorize first publication of the current USD-micros artifact on a 0091 D1:
 - **Target fields:**
   - `takoformV2: { "config": "<v2 startup JSON>", "storageLineage": "v2-0091" }`
   - the signing identity registered in that D1
-  - for Stripe, `stripeCheckout`, `stripeWebhook` and `consoleOrigin`
+  - for Stripe, `stripeCheckout`, `stripeWebhook`, `stripeMode` (`test` by
+    default, or explicitly `live`) and `consoleOrigin`
 - **Files in `TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY`**, one per secret,
   named exactly as these Worker secrets:
   - `TAKOSERVER_SIGNING_KEY`: the private JWK for the target's current signing
@@ -329,11 +376,20 @@ migration seeds and the append-only signing registration in
 refused rather than adopted. The observed ledger never selects
 its own expectation: the bootstrap, routine Worker and closure-transition
 storage proofs read the selected lineage, while normal publication additionally
-requires the audited 0094 schema and money-unit policy. A normal Host whose
-`takoformV2.config` declares artifact
-Forms needs 0081 at startup; such a target on the historical 0075 lineage is
+requires the exact full audited 0098 schema, 0094 money-unit policy and
+immutable Stripe realm pin matching the selected target mode. A normal
+Host whose `takoformV2.config` declares artifact Forms needs 0081 at startup;
+such a target on the historical 0075 lineage is
 now refused by target composition before any read or upload, instead of
 failing with 503 after traffic moved.
+
+Normal serving Worker status and apply, including the closure-transition
+surface, read the **selected target D1** realm row and its 0098 update/delete
+triggers without writing them. Apply repeats that proof immediately before
+upload; an absent pin or `test` pin with a `live` target cannot publish a
+successor. The deploy reader does not claim a realm, apply
+0098, infer mode from credentials, or prove old writers quiesced. Those remain
+separate operator qualifications even when the table happens to be empty.
 
 After a lost import acknowledgement or partial failure, never rerun `--apply`
 or mint a different generation as a retry. Selected `--status` reads the exact
@@ -1716,9 +1772,10 @@ exact schema readback, the private owner may explicitly record
 `takoformV2.appliedSchemaLineage: "v2-0092"` on the original
 `storageLineage: "v2-0088"` target. This records the reviewed 0092 schema
 successor; it cannot authorize publication of the current USD-micros Worker.
-That Worker requires the complete audited 0094 schema, canonical shape and
-singleton money-unit policy independently of this selector. The 0093/0094
-conversion and publication procedure need separate qualification.
+That Worker requires the exact full audited 0098 schema, canonical shape,
+singleton 0094 money-unit policy and selected-mode immutable Stripe realm pin
+independently of this selector. The 0093–0097 conversion and 0098 realm
+transition/publication procedure need separate qualification.
 
 The public Host has a source-only, optional deploy-target profile
 `"schemaMaintenanceMode": "pre-0058-quiesced"`. It projects the non-secret

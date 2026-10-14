@@ -21,7 +21,14 @@ import {
   type FreshV2D1Lineage,
   type FreshV2DataReader,
 } from "./fresh-v2-data-readback.ts";
-import { type D1SchemaState, MONEY_UNIT_MIGRATION, readD1SchemaState } from "./migrations.ts";
+import {
+  type D1SchemaState,
+  MONEY_UNIT_MIGRATION,
+  type MoneyUnitPolicyRow,
+  moneyUnitPolicyReady,
+  readD1SchemaState,
+  readMoneyUnitPolicy,
+} from "./migrations.ts";
 import {
   type CommandResult,
   REPOSITORY,
@@ -307,10 +314,12 @@ export interface IntegrationStorageGenerationTargetVerificationOptions {
   readonly migrationDirectory?: string;
   readonly outputDirectory?: string;
   readonly wranglerCommand?: IntegrationStorageGenerationOptions["wranglerCommand"];
-  /** Read-only Worker proof after an independently qualified 0094 cutover. */
+  /** Read-only Worker proof after independently qualified full-current transitions. */
   readonly allowCurrentAuditedSuccessor?: boolean;
   /** Read-side only for the dedicated non-serving 0092/0093/0094 money maintenance campaign. */
   readonly allowMoneyUnitMaintenance?: boolean;
+  /** Test-only GET seam for the full-current successor's singleton money policy. */
+  readonly moneyUnitPolicyReader?: () => Promise<readonly MoneyUnitPolicyRow[]>;
 }
 
 export type IntegrationStorageGeneratedStateOptions = Pick<
@@ -385,7 +394,7 @@ export async function verifyFreshV2ArtifactIntegrationStorageTarget(
 /**
  * Read-only proof for one generated integration pair. The selected lineage
  * remains its immutable creation claim. An explicit caller option can also
- * prove the complete current audited 0094 schema after a separate cutover;
+ * prove the complete current audited schema after separate cutovers;
  * this does not qualify or apply that cutover. Data is not rechecked because
  * a running Host legitimately writes rows after the generation proof.
  */
@@ -537,6 +546,14 @@ async function verifyGeneratedStorageTarget(
       generated.databaseName,
       generated.databaseId,
     );
+    const generatedStateOptions = {
+      ...(options.readD1State === undefined ? {} : { readD1State: options.readD1State }),
+      ...(options.reader === undefined ? {} : { reader: options.reader }),
+      ...(options.wranglerCommand === undefined
+        ? {}
+        : { wranglerCommand: options.wranglerCommand }),
+      ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
+    };
     const migrationState = await readGeneratedState(
       "preflight",
       configPath,
@@ -547,19 +564,12 @@ async function verifyGeneratedStorageTarget(
       },
       providerContext.environment,
       options.run ?? runCommand,
-      {
-        ...(options.readD1State === undefined ? {} : { readD1State: options.readD1State }),
-        ...(options.reader === undefined ? {} : { reader: options.reader }),
-        ...(options.wranglerCommand === undefined
-          ? {}
-          : { wranglerCommand: options.wranglerCommand }),
-        ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
-      },
+      generatedStateOptions,
     );
     // A full current schema is a read-side successor of the selected origin,
     // never a new generation payload. Both alternatives are exact audited
     // ledgers; partial states and foreign migration tails match neither.
-    const currentAudited =
+    const completeCurrentSuccessor =
       currentSource === null
         ? false
         : currentSource.names.includes(MONEY_UNIT_MIGRATION) &&
@@ -592,7 +602,7 @@ async function verifyGeneratedStorageTarget(
               moneyCount as 92 | 93 | 94,
             ),
           }
-        : currentAudited && currentSource !== null
+        : completeCurrentSuccessor && currentSource !== null
           ? currentSource
           : sourceArtifact;
     assertCompleteDatabase(
@@ -605,6 +615,22 @@ async function verifyGeneratedStorageTarget(
       generated.databaseId,
       "preflight",
     );
+    if (completeCurrentSuccessor) {
+      const policy = await (options.moneyUnitPolicyReader?.() ??
+        readMoneyUnitPolicy(
+          new RemoteD1(configPath, {
+            environment: providerContext.environment,
+            run: options.run ?? runCommand,
+            wranglerCommand: generatedStateWranglerCommand(generatedStateOptions),
+          }),
+          "preflight",
+        ));
+      if (!moneyUnitPolicyReady(policy)) {
+        throw preflightError(
+          "Existing generated D1 full-current successor lacks the exact USD-micros money-unit policy",
+        );
+      }
+    }
     return {
       generation: generated.generation,
       d1: { databaseId: generated.databaseId, databaseName: generated.databaseName },

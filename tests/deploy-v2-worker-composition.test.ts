@@ -97,6 +97,24 @@ test("an artifact Form config on the historical 0075 lineage refuses to compose 
   await expect(assertTargetComposes("preflight", maintenance)).resolves.toBeUndefined();
 });
 
+test("pre-0098 Host-only maintenance retains exact applied-0092 startup bytes without composing a serving app", async () => {
+  const selected = parseDeployTarget(
+    {
+      ...descriptor(),
+      takoformV2: { config, storageLineage: "v2-0088", appliedSchemaLineage: "v2-0092" },
+      schemaMaintenanceMode: "pre-v2-0098-quiesced",
+    },
+    "pre-0098 target",
+    "integration",
+  );
+  const vars = deploymentVariables(selected).vars as Record<string, string>;
+  expect(vars.TAKOSERVER_SCHEMA_MAINTENANCE_MODE).toBe("pre-v2-0098-quiesced");
+  expect(vars.TAKOSERVER_TAKOFORM_V2_CONFIG).toBe(config);
+  expect(vars.TAKOSERVER_ARTIFACT_BLOB_IO_MODE).toBeUndefined();
+  expect(workerCompositionEnv(selected)).toMatchObject({ TAKOSERVER_TAKOFORM_V2_CONFIG: config });
+  await expect(assertTargetComposes("preflight", selected)).resolves.toBeUndefined();
+});
+
 test("invalid, secret-bearing, or non-integration v2 descriptors refuse without echoing input", () => {
   for (const invalid of [
     "not-json-private-marker",
