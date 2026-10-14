@@ -59,19 +59,18 @@ function fixture() {
     (uid,principal,form_url,space,name,backend_id,target_key,active_name,generation,
      observed_generation,observed_at,phase,spec_json,observed_json,output_json,
      last_operation,busy_operation)
-    VALUES (?,?,?,?,?,?,?,?,1,1,?,'idle','{}','{"ready":true}','{}',?,NULL)`)
-    .run(
-      TARGET,
-      "owner",
-      FORM,
-      "space",
-      "target",
-      "acceptance-fixture",
-      "sqlite-fixture",
-      "target",
-      AT,
-      "seed-operation",
-    );
+    VALUES (?,?,?,?,?,?,?,?,1,1,?,'idle','{}','{"ready":true}','{}',?,NULL)`).run(
+    TARGET,
+    "owner",
+    FORM,
+    "space",
+    "target",
+    "acceptance-fixture",
+    "sqlite-fixture",
+    "target",
+    AT,
+    "seed-operation",
+  );
   const raw = createSqliteSql(db);
   const batches: string[] = [];
   const sql: Sql = {
@@ -157,17 +156,17 @@ const CASES: readonly {
 ];
 
 const EXPECTED: Readonly<Record<string, string>> = {
-  "plain": "fa0626f5a35f76982e2939c902dfcfb1b530f42f0d3e66d6ab4e29a2cf171226",
-  "output": "0fe7c9a393126b83ee8e05cd44486928ee74360914b8411e003d4ebe27f86584",
-  "admission": "71cdea2328bfe9df7758334c4750955725f6d99f1cae4401eb3a59be66da62ca",
+  plain: "fa0626f5a35f76982e2939c902dfcfb1b530f42f0d3e66d6ab4e29a2cf171226",
+  output: "0fe7c9a393126b83ee8e05cd44486928ee74360914b8411e003d4ebe27f86584",
+  admission: "71cdea2328bfe9df7758334c4750955725f6d99f1cae4401eb3a59be66da62ca",
   "binary-admission": "cc4b8e04b5089874ce6035835caf4e8bc8653af9a2b522ee07c888cf8514e53f",
-  "refused": "e6e112910be5a84e9fbd6f9f2961163043931c0e111d1bfdaee297da3e1b2cd3",
-  "busy": "68ff4abc78c4b475ad13f2f41a9b4aba9db76110294b561896f54ca668d75be5",
+  refused: "e6e112910be5a84e9fbd6f9f2961163043931c0e111d1bfdaee297da3e1b2cd3",
+  busy: "68ff4abc78c4b475ad13f2f41a9b4aba9db76110294b561896f54ca668d75be5",
   "references-empty": "748b5b434cdc6a4871d5bfc4b85d42a4318fe7e119925d998adff9add9251aff",
   "references-target": "c4deb2c40709fdbe057dd44e485e5f51ea111d9090d8d8458cdf2303ecfca2a4",
-  "private": "54ac48dd9f4ea312c5c80998e639dbec7c536f1e52572c3afd1b6d6a2ee82ae5",
-  "configured": "efbfee775f1b14279908908d12b58b054e6873c6fec5ffc3652f6c939e26bba5",
-  "all": "17683e4ffe1ed23fb678cd7d056a827c913f5f9dda4669093b50e77bc3230035"
+  private: "54ac48dd9f4ea312c5c80998e639dbec7c536f1e52572c3afd1b6d6a2ee82ae5",
+  configured: "efbfee775f1b14279908908d12b58b054e6873c6fec5ffc3652f6c939e26bba5",
+  all: "17683e4ffe1ed23fb678cd7d056a827c913f5f9dda4669093b50e77bc3230035",
 };
 
 test("preserves exact owning Store CREATE statements and typed parameter bytes", async () => {
@@ -198,7 +197,11 @@ test("preserves exact owning Store CREATE statements and typed parameter bytes",
     }
   }
   expect(Object.keys(captured)).toEqual(Object.keys(EXPECTED));
-  for (const [name, value] of Object.entries(captured)) expect(value.sha256).toBe(EXPECTED[name]);
+  for (const [name, value] of Object.entries(captured)) {
+    const expected = EXPECTED[name];
+    if (expected === undefined) throw new Error(`Missing CREATE baseline: ${name}`);
+    expect(value.sha256).toBe(expected);
+  }
 });
 
 function heldFixture() {
@@ -270,7 +273,8 @@ test("owns admission refusal classification before its first awaited Sql.batch",
     f.release();
     expect(await pending).toBe("resource_busy");
     expect(
-      f.db.query("SELECT id FROM tf_v2_operations WHERE replay_key = ?")
+      f.db
+        .query("SELECT id FROM tf_v2_operations WHERE replay_key = ?")
         .all("replay-classification-owned"),
     ).toEqual([]);
   } finally {
@@ -315,9 +319,12 @@ test("preserves record Resource and custody across an awaited batch", async () =
     configuredPrivateInputs.ciphertext = "changed-configured";
     f.release();
     expect(await pending).toBe("accepted");
-    expect(f.db.query(`SELECT uid,principal,form_url,space,name,generation,
+    expect(
+      f.db
+        .query(`SELECT uid,principal,form_url,space,name,generation,
       spec_json,output_json,last_operation FROM tf_v2_resources WHERE uid = ?`)
-      .get("resource-aliases")).toEqual({
+        .get("resource-aliases"),
+    ).toEqual({
       uid: "resource-aliases",
       principal: "owner",
       form_url: FORM,
@@ -328,19 +335,30 @@ test("preserves record Resource and custody across an awaited batch", async () =
       output_json: '{"hostname":"original.example.invalid"}',
       last_operation: "operation-aliases",
     });
-    expect(f.db.query(`SELECT names_json,comparison_tag,transfer_ciphertext
+    expect(
+      f.db
+        .query(`SELECT names_json,comparison_tag,transfer_ciphertext
       FROM tf_v2_private_inputs WHERE operation_id = ?`)
-      .get("operation-aliases")).toEqual({
+        .get("operation-aliases"),
+    ).toEqual({
       names_json: '["password"]',
       comparison_tag: "comparison-tag",
       transfer_ciphertext: "transfer-ciphertext",
     });
-    expect(f.db.query(`SELECT ciphertext FROM tf_v2_configured_private_inputs
-      WHERE resource_uid = ?`).get("resource-aliases")).toEqual({
+    expect(
+      f.db
+        .query(`SELECT ciphertext FROM tf_v2_configured_private_inputs
+      WHERE resource_uid = ?`)
+        .get("resource-aliases"),
+    ).toEqual({
       ciphertext: "configured-ciphertext",
     });
-    expect(f.db.query(`SELECT target_uid FROM tf_v2_operation_references
-      WHERE operation_id = ?`).all("operation-aliases")).toEqual([{ target_uid: TARGET }]);
+    expect(
+      f.db
+        .query(`SELECT target_uid FROM tf_v2_operation_references
+      WHERE operation_id = ?`)
+        .all("operation-aliases"),
+    ).toEqual([{ target_uid: TARGET }]);
   } finally {
     f.release();
     f.db.close();
@@ -365,8 +383,12 @@ test("existing replay UNIQUE rolls back the preceding fresh Resource", async () 
     expect(
       f.db.query("SELECT uid FROM tf_v2_resources WHERE uid = ?").all(second.resourceUid),
     ).toEqual([]);
-    expect(f.db.query(`SELECT id FROM tf_v2_operations
-      WHERE principal = ? AND replay_key = ?`).all("owner", first.key)).toEqual([{ id: first.id }]);
+    expect(
+      f.db
+        .query(`SELECT id FROM tf_v2_operations
+      WHERE principal = ? AND replay_key = ?`)
+        .all("owner", first.key),
+    ).toEqual([{ id: first.id }]);
     expect(f.db.query("SELECT operation_id FROM tf_v2_private_inputs").all()).toEqual([]);
     expect(f.db.query("SELECT resource_uid FROM tf_v2_configured_private_inputs").all()).toEqual(
       [],
@@ -394,8 +416,12 @@ test("real 0073 reference trigger rolls back acceptance and custody without new 
     expect(
       f.db.query("SELECT uid FROM tf_v2_resources WHERE uid = ?").all(input.resourceUid),
     ).toEqual([]);
-    expect(f.db.query(`SELECT id FROM tf_v2_operations
-      WHERE principal = ? AND replay_key = ?`).all("owner", input.key)).toEqual([]);
+    expect(
+      f.db
+        .query(`SELECT id FROM tf_v2_operations
+      WHERE principal = ? AND replay_key = ?`)
+        .all("owner", input.key),
+    ).toEqual([]);
     for (const table of [
       "tf_v2_private_inputs",
       "tf_v2_configured_private_inputs",
@@ -488,21 +514,28 @@ test("core keeps its constructed Sql for lost-ACK readback and retained replay",
       retainedForms: { [FORM]: form },
     });
     expect((await retained.acceptCreate(request)).resourceUid).toBe(accepted.resourceUid);
-    await expect(retained.acceptCreate({
-      ...request,
-      key: "new-retained-preservation-key",
-      input: { ...request.input, name: "unsupported" },
-    })).rejects.toMatchObject({ code: "unsupported_form" });
+    await expect(
+      retained.acceptCreate({
+        ...request,
+        key: "new-retained-preservation-key",
+        input: { ...request.input, name: "unsupported" },
+      }),
+    ).rejects.toMatchObject({ code: "unsupported_form" });
     expect(batches).toBe(1);
     expect(assignments).toBe(1);
     expect(foreignCalls).toBe(0);
-    expect(f.db.query(`SELECT id,resource_uid FROM tf_v2_operations
-      WHERE replay_key = ?`).get(request.key)).toEqual({
+    expect(
+      f.db
+        .query(`SELECT id,resource_uid FROM tf_v2_operations
+      WHERE replay_key = ?`)
+        .get(request.key),
+    ).toEqual({
       id: accepted.id,
       resource_uid: accepted.resourceUid,
     });
-    expect((await retained.getResource({ principal: "owner", uid: accepted.resourceUid })).output)
-      .toEqual({ hostname: "same-assignment.example.invalid" });
+    expect(
+      (await retained.getResource({ principal: "owner", uid: accepted.resourceUid })).output,
+    ).toEqual({ hostname: "same-assignment.example.invalid" });
   } finally {
     f.db.close();
   }

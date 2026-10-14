@@ -130,7 +130,7 @@ test("multipart replacement receipt and part bytes survive a file-backed SQLite 
       body("new"),
       { contentLength: 3 },
     );
-    expect(retriedPart).toEqual({ etag: persistedEtag, partNumber: 1 });
+    expect(retriedPart).toEqual({ etag: persistedEtag, partNumber: 1, size: 3 });
     const retryFiles = await readdir(replacementDirectory);
     expect(retryFiles).toContain(`1-${originalPart.etag}`);
     expect(retryFiles.filter((name) => name === `1-${persistedEtag}`)).toHaveLength(1);

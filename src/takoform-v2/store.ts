@@ -219,9 +219,7 @@ function captureCreateAcceptance(
 ): CreateAcceptance {
   const capturedRecord = Object.freeze({
     ...record,
-    ...(record.privateInputs
-      ? { privateInputs: Object.freeze({ ...record.privateInputs }) }
-      : {}),
+    ...(record.privateInputs ? { privateInputs: Object.freeze({ ...record.privateInputs }) } : {}),
     ...(record.configuredPrivateInputs
       ? { configuredPrivateInputs: Object.freeze({ ...record.configuredPrivateInputs }) }
       : {}),
@@ -237,9 +235,7 @@ function captureCreateAcceptance(
     ? Object.freeze({
         sql: admission.sql,
         params: Object.freeze(
-          admission.params.map((param) =>
-            param instanceof ArrayBuffer ? param.slice(0) : param,
-          ),
+          admission.params.map((param) => (param instanceof ArrayBuffer ? param.slice(0) : param)),
         ),
         ...(admission.conflictCode === undefined ? {} : { conflictCode: admission.conflictCode }),
         ...(admission.detail === undefined ? {} : { detail: admission.detail }),

@@ -4,12 +4,7 @@ import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject, Sql, SqlStatement } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
-import type {
-  V2Backend,
-  V2EngineOptions,
-  V2Execution,
-  V2Form,
-} from "../src/takoform-v2/types.ts";
+import type { V2Backend, V2EngineOptions, V2Execution, V2Form } from "../src/takoform-v2/types.ts";
 
 const FORM = "https://fresh-admission.example.test/fixture";
 const PRINCIPAL = "org:fixture";
@@ -17,11 +12,7 @@ const SPACE = "fixture";
 const ORIGIN = "https://host.example.test";
 
 async function fixture(
-  input: {
-    admission?: boolean;
-    loseAck?: boolean;
-    privateInputs?: boolean;
-  } = {},
+  input: { admission?: boolean; loseAck?: boolean; privateInputs?: boolean } = {},
 ) {
   const database = new Database(":memory:");
   migrateSqlite(database);
