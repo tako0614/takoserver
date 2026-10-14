@@ -109,8 +109,9 @@ missing marker, unavailable response or false capability cannot enable a
 payment. This projection describes configured financial ports, without
 claiming launch or staging acceptance.
 
-Top-up amounts are USD cents, checked against the minimum and maximum in the
-usage row of the existing subscription plan table. They grant face value only
+New top-up amounts are USD cents, checked against the minimum and maximum in the
+usage row of the existing subscription plan table. Exact replays keep the
+accepted command amount even after those bounds change. They grant face value only
 after verified payment. The durable command freezes Organization, reference,
 amount, customer, financial realm, tariff, expiry policy and return URLs before
 dispatch. Reusing a reference with different terms is a conflict. A lost

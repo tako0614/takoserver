@@ -289,8 +289,9 @@ Checkout and grants its verified cash face value, without paid-plan bonuses.
 Before the remote request, atomically persist an Org-scoped command receipt
 and fingerprint covering cash, USD, purchase purpose, canonical request,
 processor realm and frozen tariff/expiry policy. Use its stable processor
-idempotency key. Exact retries return the same URL; changed payload returns
-409 without a second effect. A definitive expired Checkout closes that command;
+idempotency key. Exact retries return the same URL and accepted cash amount
+even after current purchase bounds change; changed payload returns 409 without
+a second effect. New references must satisfy the current bounds. A definitive expired Checkout closes that command;
 a new purchase needs a new reference. Lost acknowledgement remains pending and
 requires readback/reconciliation, never a fresh reference to guess success.
 
