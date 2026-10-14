@@ -1,7 +1,8 @@
 # Shared Accounts login: staged Takoserver consumer
 
-Status: prepared protocol client. No login route, schema migration, Console
-button, deployment configuration or traffic cutover is enabled by this change.
+Status: prepared protocol client and unmounted session/store runtime. No login
+route, schema migration, Console button, deployment configuration or traffic
+cutover is enabled by this change.
 Task 0109 coordinates the remaining owner changes and their release evidence.
 
 ## Implemented protocol boundary
@@ -11,12 +12,14 @@ HTTP contract. It does not import Accounts or another product's source, and it
 does not use the existing `takos-id` Organization projection.
 
 The client requires explicit `environment: "staging"`, the registered client
-`takoserver-console-staging-v1`, distinct exact HTTPS issuer and Console
+`takoserver-console-staging-v1`, distinct exact HTTPS issuer and API/RP
 origins, and a server-only client secret. Production origins and DNS trailing
 dot aliases are refused. Realized staging origins and credentials belong in
 operator configuration outside this repository; this document does not choose
 them. The registered redirect must exactly equal
-`<console-origin>/auth/oidc/callback`.
+`<api-rp-origin>/auth/oidc/callback`. The separately hosted static Console is
+only a fixed return/CORS origin. The API owns the callback and cookie: moving
+the callback to the Console would not authenticate the API's host-only session.
 
 The code flow uses S256, state, nonce, explicit consent and `offline_access`.
 Token exchange, rotating refresh, introspection and revocation authenticate
@@ -49,6 +52,58 @@ Organizations, Workspace roles or other product authority are refused. Access
 tokens obtained here are identity-only credentials for the issuer's own
 endpoints, never Takoserver business API keys.
 
+## Prepared session runtime
+
+`src/shared-auth-session.ts` supplies the unmounted login, callback, logout and
+session handlers, a server-only authenticated actor/context port, and current
+Workspace/Organization resolution. Its required principal projection is an
+owning Takoserver port that preserves proved local actor references; there is
+no email matching or alternate account registry. Organization pins require a
+separate owning port and never imply financial consent.
+
+The API issues random `__Host-` Secure/HttpOnly/SameSite=Lax cookies. Only their
+SHA-256 digests are indexed. Attempt state, nonce and verifier and upstream
+grants are encrypted with AES-GCM under the operator-supplied 32-byte local
+key, with associated data binding purpose, digest, issuer, client, API and
+Console origins. The callback atomically consumes its attempt before exchange,
+confirms the current canonical account, explicitly bootstraps its personal
+Workspace and verifies current owner membership before creating an active
+local session. It redirects only to the configured Console root, and never
+returns an upstream grant to the browser.
+
+The frozen directory contract uses the same RP Bearer grant at
+`/api/v1/account/shared-workspaces`: the current menu with a selected Workspace,
+explicit `POST /bootstrap {}`, and `GET /:id/billing-organization`. Every
+authenticated request confirms the current canonical account, current
+Workspace membership and qualified local principal. Token roles and retained
+legacy memberships provide no shared-session authority. The Organization
+context is checked again after its owning pin operation.
+
+`src/shared-auth-session-store.ts` receives fresh primary-consistent SQL for
+each request. It atomically burns attempts, serializes refresh with a version
+claim, and keeps encrypted grants in a durable revocation outbox. A competing
+request while refresh is in progress receives temporary unavailability; an
+unknown refresh or completion acknowledgement is never replayed. Newly known
+rotated grants are durably queued together with a local denial fence. The
+issuer's same-client revocation of a retained spent refresh handle revokes the
+current family when a rotation response was lost.
+
+Sessions expire after twelve idle hours or seven absolute days. Grant health
+is checked at most every four minutes and before imminent access expiry;
+canonical account and Workspace checks remain live on each authenticated
+operation. Logout immediately fences the local session and clears its cookie.
+It leaves upstream cleanup in the durable outbox instead of delaying the
+browser on an issuer outage. The owning maintenance entry must call
+`retryRevocations` with at most two grants per pass; only revocation has a
+retryable lease. A crashed refresh claimant stays denied until login/revoke,
+and is never reclaimed for another refresh.
+
+The portable native D1 tests use explicitly unadopted test-only DDL. These
+modules do not create tables or select a public migration number. Adopting the
+forward schema, principal projection, maintenance entry, Console flow and
+protected composition remains an owner-coordinated change. The current
+factory cannot enable an authentication surface by itself.
+
 ## Existing behavior that requires a separate owner change
 
 The audit base is Takoserver commit
@@ -77,13 +132,13 @@ recovery paths.
    domain classification in `scripts/check-imports.ts` only after that owner
    agrees. The prepared hunk adds one exact module name, without exempting a
    directory or changing permitted dependency directions.
-3. Implement a dedicated trusted server session adapter, with a durable
+3. Adopt the prepared trusted server session adapter, with a durable
    single-use login attempt and a host-only `__Host-` HttpOnly Secure cookie.
    Validate exact request origin, duplicate callback parameters, state, optional
    response issuer and the attempt's nonce/verifier. Atomically consume the
    attempt before exchange. Never accept caller-supplied claims, an incoming
    identity header or the email as a login binding.
-4. Implement a durable local session store and explicit account-to-principal
+4. Adopt the prepared durable local session store and explicit account-to-principal
    binding. One canonical Accounts ID can bind at most one local actor; preserve
    existing local principal, Organization, API-key and billing references when
    adopting a proved legacy account. Newly provisioned product actors require
@@ -93,7 +148,7 @@ recovery paths.
    lineage. Do not reserve or author a migration number here: the schema owner
    must allocate it after the billing and dispatch migrations.
 5. Keep grants encrypted under an operator-managed local session key, with
-   associated data binding the environment, issuer, client and Console origin.
+   associated data binding the environment, issuer, client, API and Console origins.
    Cookie secrets are random; only their digests are indexed. Keep idle and
    absolute expiry, current grant activity and revocation local to the RP.
    Serialize refresh through durable version/compare-and-set ownership. Lost
