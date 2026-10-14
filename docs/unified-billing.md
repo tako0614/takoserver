@@ -36,7 +36,7 @@ billing GA.
 | Area | CTO target | Implementation / remaining acceptance |
 | --- | --- | --- |
 | Ledger and scoped money wire | Integer USD micros; explicit `*Micros` fields | Micros source and forward 0093/0094 migrations replace #318; live cutover remains separately qualified |
-| Allocation | Free allowance → subscription credit → purchased credit → consented capped postpaid | Prepaid allocation, settlement and pagination share class priority; postpaid remains disabled pending its separate cap reservation and invoice implementation |
+| Allocation | Eligible Free allowance → subscription credit → purchased credit; capped postpaid requires separate consent and implementation | Hosted excludes Free from new allocation during verified paid invoice coverage; otherwise prepaid allocation retains class priority. Postpaid remains disabled pending its separate cap reservation and invoice implementation |
 | Invoicing | Aggregate payable micros, then ceiling to cents once | Capture/usage retain micros; the arithmetic helper is available, while Stripe invoice settlement remains a later wave |
 | Holds and scopes | Immutable TTL, capture ≤ hold, automatic release; four routine writes with exact Organization/scopes | #330 preserves #318's transactional lifecycle and supplies the four micros commands and scoped reads |
 | Hosted plans | Edge allowance, monthly included credit, additional credit/usage; the same three configured IDs and table | #319 is a shared-table preview, not an activated catalog; configuration/subscription/refund alignment is owned by #325 / `106603b4` |
@@ -137,15 +137,28 @@ guess that they were free, subscribed or purchased. New grants use this policy:
 | Paid subscription period | `plan-included` | `stripe:invoice:<invoiceId>` | End of the paid recurring line's service period |
 | Additional credit purchase | `purchased` | `stripe:<checkoutSessionId>` | None by default; any configured expiry is disclosed and pinned at purchase |
 
-Grant the configured free amount once to each eligible Organization per UTC
-month, including eligible paid Organizations. It is not per Workspace. A monthly
-job and lazy admission backfill share that reference and the month's frozen
-configuration; neither grants past, already-expired months. A zero allowance
-records eligibility without calling the positive-amount funding operation.
-Free and paid included amounts are separate explicit entitlements; there is no
-implicit free allowance multiplied by Workspace count.
+For Hosted, the configured Free amount belongs to an eligible Organization
+once per UTC month, not to each Workspace. The month's tariff snapshot and
+Free reference remain unique. While a verified paid invoice grant covers the
+current instant (`period_start <= now < period_end`), do not fund a new Free
+lot or allocate unused Free from a lot funded earlier that month. Paid coverage
+comes from the settled invoice grant and its refund proof, not a subscription
+status string or a remote period alone. A partial refund leaves the remaining
+period paid. After its end, or after a full refund and release of its refund
+fence, Free eligibility can resume within that same UTC month using the
+original monthly snapshot. A pending invoice refund fence blocks Free for the
+Organization until resolved, even if that invoice's service period has ended;
+refund receivables separately block new billable admission. No past,
+already-expired month is backfilled, and a zero allowance records eligibility
+without calling the positive-amount funding operation. Independent self-host
+wallets keep their own Free grant policy.
 
-Consume **free allowance first, then subscription grants, then additional
+An existing Free lot, its funding history and allocations reserved before
+paid coverage remain intact. Capture or release those existing holds against
+their original lot; do not revoke or reclassify Free and do not subtract Free
+consumed before the paid period from the new paid grant. During paid coverage,
+new allocation uses eligible subscription and purchased credit. When Free is
+eligible, consume **Free first, then subscription grants, then additional
 purchased credit**. Only after eligible prepaid credit is exhausted may an
 explicitly consented capped postpaid reservation cover the remainder. Postpaid
 is a separate receivable/cap reservation, not a spendable credit lot. Within
@@ -457,8 +470,10 @@ rounding a floating-point dollar input.
 
 Display the class order free → subscription → purchased. Each lot shows source
 kind as well as class, original expiry, spendable amount and held amount; free
-and subscription can both have kind `plan-included`. A monthly allowance is
-shown once per Organization, not once per Workspace. Subscription period,
+and subscription can both have kind `plan-included`. A funded monthly Free
+allowance is shown at most once per Organization, not once per Workspace. An
+earlier Free lot may remain visible with zero available during paid coverage
+while its past holds and usage remain visible. Subscription period,
 pending plan/cancellation, and paid-through status come from the authoritative
 subscription projection, not a locally guessed billing date. Purchased credit
 expiry is disclosed before Checkout. Postpaid is shown as disabled until an
@@ -819,7 +834,9 @@ concurrent terminal writes; expiry at the exact boundary and after restart;
 release-before-delayed-hold; exact versus conflicting replays; lot expiry while
 held; many Workspaces sharing one allowance; 1-micro spending and combined
 fractional-cent items with one invoice ceiling; unit/range/aggregate overflow,
-legacy micro-cent separation, free-before-subscription-before-purchased order,
+legacy micro-cent separation, eligible-Free-before-subscription-before-purchased
+order, paid-period Free suppression with old Free holds/history retained and
+same-month eligibility restoration after coverage/refund settlement,
 zero usage and self-host exclusion; partial/full/pending refunds against
 available, held, expired, and used
 credit; subscription/Checkout double-funding prevention; old deferred-event
