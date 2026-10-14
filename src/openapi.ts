@@ -1850,6 +1850,7 @@ export const openApiDocument = {
         ],
         additionalProperties: false,
         properties: {
+          billing: { $ref: "#/components/schemas/StripeBillingReconcileReport" },
           examined: { type: "integer", minimum: 0 },
           credited: { type: "integer", minimum: 0 },
           alreadyCredited: { type: "integer", minimum: 0 },
@@ -1880,6 +1881,20 @@ export const openApiDocument = {
               },
             },
           },
+        },
+      },
+      StripeBillingReconcileReport: {
+        type: "object",
+        description:
+          "Optional hosted subscription/refund reconciliation summary; no monetary or customer data",
+        required: ["examined", "applied", "unresolved", "truncated", "handlerVersion"],
+        additionalProperties: false,
+        properties: {
+          examined: { type: "integer", minimum: 0 },
+          applied: { type: "integer", minimum: 0 },
+          unresolved: { type: "integer", minimum: 0 },
+          truncated: { type: "boolean" },
+          handlerVersion: { type: "integer", const: 1 },
         },
       },
       IntegrationOrganizationBootstrapStatusRequest: {
