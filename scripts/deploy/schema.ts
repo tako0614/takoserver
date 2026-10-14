@@ -391,8 +391,9 @@ const AUDITED_MIGRATION_SHA256: Readonly<
   "0098_stripe_mode_realm.sql":
     "sha256:5865ae1809dad2887b7786ebc5a372266521826ecbf8c2f59c308d211f08272f",
 };
-// The ordinary integration ceiling remains 0066. Only the fixed 0088-to-0092
-// selector qualifies a later in-place wave; 0093-0098 remain source-only.
+// The ordinary integration ceiling remains 0066; its later fixed wave ends at 0092.
+// The separate money-cutover owner qualifies only 0093/0094. Neither lane
+// authorizes applying the audited 0095-0098 source tail.
 const INTEGRATION_APPLY_CEILING_COUNT = 66;
 // Fresh production bootstrap is a distinct, still-frozen authority. Auditing
 // a new local source migration never silently adds it to this payload.
