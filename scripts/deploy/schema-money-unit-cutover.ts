@@ -436,6 +436,14 @@ interface PreimageReader {
   ): Promise<readonly Record<string, unknown>[]>;
 }
 
+/** Keep one snapshot while limiting each compound SELECT to two terms for D1. */
+function moneyProofUnionSql(selects: readonly string[]): string {
+  if (selects.length === 0) throw preflightError("money proof source has no SELECT terms");
+  if (selects.length === 1) return selects[0] as string;
+  const middle = Math.ceil(selects.length / 2);
+  return `SELECT * FROM (${moneyProofUnionSql(selects.slice(0, middle))}) UNION ALL SELECT * FROM (${moneyProofUnionSql(selects.slice(middle))})`;
+}
+
 /** Bounded, value-free digest of every old-unit row the 0094 SQL copies and scales. */
 export async function readMoneyPreimageDigest(
   database: PreimageReader,
@@ -453,10 +461,12 @@ export async function readMoneyPreimageDigest(
       throw proofError(phase, "0094 preimage exceeds the bounded proof volume");
     for (const row of rows) hash.update(exactPreimageRow(row, phase));
   } else {
-    const sql = PREIMAGE_COLUMNS.map(
-      (spec) =>
-        `SELECT ${sqlLiteral(spec.table)} AS source_table, ${spec.key} AS row_key, ${sqlLiteral(spec.column)} AS source_column, CAST(${spec.column} AS TEXT) AS amount FROM ${spec.table}`,
-    ).join(" UNION ALL ");
+    const sql = moneyProofUnionSql(
+      PREIMAGE_COLUMNS.map(
+        (spec) =>
+          `SELECT ${sqlLiteral(spec.table)} AS source_table, ${spec.key} AS row_key, ${sqlLiteral(spec.column)} AS source_column, CAST(${spec.column} AS TEXT) AS amount FROM ${spec.table}`,
+      ),
+    );
     const rows = await database.query(
       phase,
       "0092 conversion preimage",
@@ -477,7 +487,7 @@ export async function readMoneyAggregateDigest(
 ): Promise<string> {
   const sql = converted
     ? "SELECT source_table, org_id, source_column, CAST(total_minor AS TEXT) AS total FROM money_cutover_aggregates ORDER BY source_table, org_id, source_column LIMIT 10001"
-    : `SELECT * FROM (${PREIMAGE_COLUMNS.map((spec) => `SELECT ${sqlLiteral(spec.table)} AS source_table, ${spec.table === "org_wallet_monthly_tariffs" ? "'*'" : "org_id"} AS org_id, ${sqlLiteral(spec.column)} AS source_column, CAST(SUM(${spec.column}) AS TEXT) AS total FROM ${spec.table} GROUP BY ${spec.table === "org_wallet_monthly_tariffs" ? "'*'" : "org_id"}`).join(" UNION ALL ")}) ORDER BY source_table, org_id, source_column LIMIT 10001`;
+    : `SELECT * FROM (${moneyProofUnionSql(PREIMAGE_COLUMNS.map((spec) => `SELECT ${sqlLiteral(spec.table)} AS source_table, ${spec.table === "org_wallet_monthly_tariffs" ? "'*'" : "org_id"} AS org_id, ${sqlLiteral(spec.column)} AS source_column, CAST(SUM(${spec.column}) AS TEXT) AS total FROM ${spec.table} GROUP BY ${spec.table === "org_wallet_monthly_tariffs" ? "'*'" : "org_id"}`))}) ORDER BY source_table, org_id, source_column LIMIT 10001`;
   const rows = await database.query(phase, "money aggregate conservation", sql);
   if (rows.length > 10000) throw proofError(phase, "money aggregate proof exceeds bounded volume");
   const hash = createHash("sha256");
