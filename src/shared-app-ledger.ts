@@ -1,7 +1,6 @@
 import type { Clock, Row, Sql, SqlParam, SqlStatement } from "./ports.ts";
 import { normalizeSharedAppName } from "./shared-app-name.ts";
 
-export const SHARED_APP_COOLDOWN_MILLISECONDS = 30 * 24 * 60 * 60 * 1_000;
 export type SharedAppEnvironment = "staging" | "production";
 export type SharedAppProduct = "takoserver" | "takosumi-hosted";
 
@@ -453,44 +452,38 @@ export function createSharedAppLedger(options: {
           };
           if (existing) return replay(existing);
           const now = timestamp();
-          const cutoff = now - SHARED_APP_COOLDOWN_MILLISECONDS;
+          // A name belongs to one incarnation forever. Check retained assignment
+          // history as well as the head, and never replace a released head.
           try {
             await primary().batch([
               {
                 sql: `INSERT INTO ${assignments}
                     (incarnation, name, organization_id, product, reservation_id, generation,
                      state, script, released_at, created_at, updated_at)
-                  SELECT ?, ?, ?, ?, ?, COALESCE((SELECT generation FROM ${names}
-                      WHERE normalized_name = ?), 0) + 1, 'reserved', NULL, NULL, ?, ?
+                  SELECT ?, ?, ?, ?, ?, 1, 'reserved', NULL, NULL, ?, ?
                   WHERE NOT EXISTS (SELECT 1 FROM ${assignments}
                     WHERE organization_id = ? AND reservation_id = ?)
-                    AND NOT EXISTS (SELECT 1 FROM ${names} WHERE normalized_name = ?
-                      AND (state <> 'released' OR released_at IS NULL OR released_at > ?))`,
+                    AND NOT EXISTS (SELECT 1 FROM ${names} WHERE normalized_name = ?)
+                    AND NOT EXISTS (SELECT 1 FROM ${assignments} WHERE name = ?)`,
                 params: [
                   incarnation,
                   command.name,
                   owner.organizationId,
                   owner.product,
                   command.reservationId,
-                  command.name,
                   now,
                   now,
                   owner.organizationId,
                   command.reservationId,
                   command.name,
-                  cutoff,
+                  command.name,
                 ],
               },
               {
                 sql: `INSERT INTO ${names} (normalized_name, incarnation, generation, state, released_at, updated_at)
                   SELECT name, incarnation, generation, state, NULL, updated_at FROM ${assignments}
-                    WHERE incarnation = ?
-                  ON CONFLICT(normalized_name) DO UPDATE SET incarnation = excluded.incarnation,
-                    generation = excluded.generation, state = excluded.state, released_at = NULL,
-                    updated_at = excluded.updated_at
-                  WHERE ${names}.state = 'released' AND ${names}.released_at <= ?
-                    AND ${names}.generation + 1 = excluded.generation`,
-                params: [incarnation, cutoff],
+                    WHERE incarnation = ?`,
+                params: [incarnation],
               },
             ]);
           } catch {
