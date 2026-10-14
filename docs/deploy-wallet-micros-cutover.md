@@ -31,6 +31,8 @@ D1 mutation前と後を区別し、dispatchをno-overwriteでfsyncしてから�
 
 ## 実証の境界
 
+standalone HostのoperatorIdentityは検証済み公開Ed25519鍵だけの設定で、private backendではない。公開Workerのsource・native binding closureでその鍵も一致させる。公開鍵があることを理由に架空のprivate componentを加えず、service bindingや別writer authorityの不在検証は維持する。
+
 この文書は手順と契約を記述する。特定stagingでの適用済み・課金済みを示すものではない。実行時のschema version、source SHA、artifact/import digest、backup状態、review/custody、テスト日時・結果はoperator-runsとPR本文に記録する。本番の検証には使わない。
 
 

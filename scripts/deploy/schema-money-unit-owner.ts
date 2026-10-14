@@ -159,7 +159,11 @@ interface PrivateWriterScope {
   readonly reviewRef: string;
 }
 
-/** This scope excludes every target-declared private money writer or service authority. */
+/**
+ * Excludes target-declared private money writers and service authorities.
+ * operatorIdentity is a validated public verification key, not a private
+ * service binding; the public source and exact native closure still bind it.
+ */
 function standaloneMoneyTarget(target: DeployTarget): boolean {
   return (
     target.cloudflareProviderExecutor === undefined &&
@@ -171,7 +175,6 @@ function standaloneMoneyTarget(target: DeployTarget): boolean {
     target.exactArtifactRecovery === undefined &&
     target.zones === undefined &&
     target.aiModels === undefined &&
-    target.operatorIdentity === undefined &&
     target.protected0058Custody === undefined &&
     target.artifactBlobIoMode === undefined &&
     target.schemaMaintenanceMode === undefined
