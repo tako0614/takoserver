@@ -28,8 +28,10 @@ Related work: [Takosumi Hosted PR #54](https://github.com/tako0614/takosumi-host
 and merged [shared price authoring #319](https://github.com/tako0614/takoserver/pull/319).
 The original PR #54 review found no review/discussion comments; its body lists
 the four questions decided below. The implementation baseline for this revision
-is main `5106f2036cfedfefb19e6af377e141953c380529` (#330). Source merge does
-not establish staging or billing GA.
+is main `5106f2036cfedfefb19e6af377e141953c380529` (#330), with the subsequent
+[#328](https://github.com/tako0614/takoserver/pull/328) single-cutoff expiry and
+OpenAPI status correction included. Source merge does not establish staging or
+billing GA.
 
 | Area | CTO target | Implementation / remaining acceptance |
 | --- | --- | --- |
@@ -222,8 +224,10 @@ existing ledger and allocations. Store original amount, request fingerprint,
 7 days. The server assigns `expiresAt` at first acceptance. Replay returns that
 deadline and never extends it. This version has no renewal endpoint.
 
-At `now >= expiresAt`, read and mutation paths transactionally close the hold
-and release its entire remaining allocation. Scheduled maintenance also closes
+At `now >= expiresAt`, exact hold receipt reads and terminal mutations close
+the hold transactionally and release its entire remaining allocation. Wallet/
+lot reads and admission use the bounded request sweep at its cutoff below.
+Scheduled maintenance also closes
 expired holds in bounded batches, so abandoned plans, cancellation, and lost
 responses do not hold funds forever. The current Worker schedules maintenance
 every five minutes (up to 64 holds per pass); Bun schedules it every 30 seconds.
@@ -231,6 +235,14 @@ Backlogs may require multiple passes. These are maintenance cadences, not
 extensions to an individual deadline. API checks
 enforce expiry even if the sweeper is delayed. Exact deadline equality belongs
 to expiry, and a late capture receives `hold_closed`, never a fresh debit.
+
+The request's bounded sweep and backlog check share one cutoff instant (#328).
+A hold whose deadline passes after that cutoff can still count as held in the
+wallet/lot view, temporarily under-admit a new hold, or leave direct usage
+pending until a later sweep or exact receipt close. This conservatively reserves
+too much, never too little; it does not extend the deadline or permit capture
+after expiry. Do not present that one-response held figure as an atomic view
+of all subsequent expiry instants.
 
 `release` of an unknown reference creates a durable cancellation tombstone and
 returns a terminal `released` receipt with zero held/captured/released amounts.
@@ -763,15 +775,19 @@ work performs none of those effects and changes no production target.
 
 Ledger key: `unified-billing-hosted-contract-20261014`; status: source-reviewed
 design revision following merged #330. Current
-changed repository: **takoserver**, documentation only. This design records
+changed repository: **takoserver**, design documentation, two OpenAPI error
+descriptions/the regenerated artifact, and micros alignment of #328's two
+expiry regression fixtures. This design records
 billing/authority decisions but changes no schema, live balance, credential,
 price, or runtime behavior. The directly supplied CTO decision is authoritative;
 PR #54 and merged #313/#318/#319 are read-only baseline inputs. The required
 micros API/ledger corrections have merged in #330 and are tracked in their
 explicit [implementation ledger](org-billing-micros.md). The API audit confirms
 that the four routine writes, exact units, allocation priority, capture bound,
-TTL and release already match this decision, so this revision changes no API
-or OpenAPI source. Price configuration/subscriptions/refunds remain owned by
+TTL and release already match this decision. #328 retained old `amountMinor`,
+`expectedMinor` and rounded-actual wording in two OpenAPI error descriptions;
+this revision fixes those descriptions and regenerates the public artifact,
+without changing handlers, scopes or money math. Price configuration/subscriptions/refunds remain owned by
 `106603b4` / #325; this work edits none of their files. Shared screen adoption
 and complete same-snapshot class summaries remain explicit UI acceptance.
 This design ledger does not establish acceptance of live conversion or the
