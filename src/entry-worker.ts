@@ -330,6 +330,13 @@ export interface WorkerEntryOptions {
   readonly composeV2Forms?: WorkerEntryV2FormComposer;
   /** Operator code only; absent means every configured artifact Form remains held-only. */
   readonly composeV2ArtifactSource?: WorkerEntryV2ArtifactSourceComposer;
+  /**
+   * Operator code only, evaluated once at startup from the emitted deploy mode.
+   * No request field or ordinary Host configuration installs this composer.
+   */
+  readonly composeV2FreshAdmission?: (context: {
+    readonly environment: string | undefined;
+  }) => boolean;
 }
 
 /**
@@ -841,6 +848,7 @@ async function composeApp(
   origin: string,
   composeV2Forms: WorkerEntryV2FormComposer | undefined,
   composeV2ArtifactSource: WorkerEntryV2ArtifactSourceComposer | undefined,
+  composeV2FreshAdmission: WorkerEntryOptions["composeV2FreshAdmission"],
 ): Promise<App> {
   if (composeV2Forms !== undefined && typeof composeV2Forms !== "function") {
     throw new WorkerStartupError(
@@ -854,6 +862,23 @@ async function composeApp(
       new TypeError("v2 Worker entry artifact source composer must be a function"),
     );
   }
+  if (composeV2FreshAdmission !== undefined && typeof composeV2FreshAdmission !== "function") {
+    throw new WorkerStartupError(
+      "runtime-configuration",
+      new TypeError("v2 Worker entry fresh admission composer must be a function"),
+    );
+  }
+  const allowFreshCreateAndUpdate =
+    composeV2FreshAdmission === undefined
+      ? undefined
+      : startupStage("runtime-configuration", () => {
+          const selected = composeV2FreshAdmission(
+            Object.freeze({ environment: env.TAKOSERVER_ENVIRONMENT }),
+          );
+          if (typeof selected !== "boolean")
+            throw new TypeError("v2 Worker entry fresh admission must be a boolean");
+          return selected;
+        });
   const v2Config = startupStage("runtime-configuration", () =>
     parseTakoformV2ApplicationConfig(env),
   );
@@ -1023,6 +1048,9 @@ async function composeApp(
       ...dataServices,
       publicOrigin: origin,
       v2: v2Config,
+      ...(allowFreshCreateAndUpdate === undefined
+        ? {}
+        : { v2AllowFreshCreateAndUpdate: allowFreshCreateAndUpdate }),
       ...(selectedV2PrivateInputHooks &&
       runtimeInputKeyAuthority &&
       "privateInputCustody" in runtimeInputKeyAuthority
@@ -1075,16 +1103,21 @@ async function composeApp(
 export function createWorkerEntry(options: WorkerEntryOptions = {}) {
   const composeV2Forms = options.composeV2Forms;
   const composeV2ArtifactSource = options.composeV2ArtifactSource;
+  const composeV2FreshAdmission = options.composeV2FreshAdmission;
   const starts = new WeakMap<WorkerEnv, Promise<App>>();
   const appFor = (env: WorkerEnv, origin: string): Promise<App> => {
     const existing = starts.get(env);
     if (existing) return existing;
-    const started = composeApp(env, origin, composeV2Forms, composeV2ArtifactSource).catch(
-      (error: unknown) => {
-        if (starts.get(env) === started) starts.delete(env);
-        throw error;
-      },
-    );
+    const started = composeApp(
+      env,
+      origin,
+      composeV2Forms,
+      composeV2ArtifactSource,
+      composeV2FreshAdmission,
+    ).catch((error: unknown) => {
+      if (starts.get(env) === started) starts.delete(env);
+      throw error;
+    });
     starts.set(env, started);
     return started;
   };

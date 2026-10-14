@@ -99,7 +99,10 @@ export function createTakoformV2Application(options: {
   readonly artifactSourceFactory?: V2OperatorArtifactSourceFactory;
   /** Operator-private composition only; never parsed from public config. */
   readonly privateInputCustody?: V2PrivateInputCustody;
+  /** Code-selected at construction; covers automatic artifact Forms as well. */
+  readonly allowFreshCreateAndUpdate?: boolean;
 }) {
+  const allowFreshCreateAndUpdate = options.allowFreshCreateAndUpdate;
   if (
     (options.formFactory !== undefined && typeof options.formFactory !== "function") ||
     (options.formSelectionFactory !== undefined &&
@@ -202,6 +205,7 @@ export function createTakoformV2Application(options: {
     authorize: access.authorize,
     forms: Object.freeze(forms),
     retainedForms: Object.freeze(retainedForms),
+    ...(allowFreshCreateAndUpdate === undefined ? {} : { allowFreshCreateAndUpdate }),
     baseUrl: `${publicOrigin}/apis/forms.takoform.com/v2`,
     documentation: config.documentation,
     authenticationDocumentation: config.authenticationDocumentation,

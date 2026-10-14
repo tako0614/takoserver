@@ -206,6 +206,12 @@ export interface V2EngineOptions {
   /** Only fully implemented, exact Form URLs are entered here. */
   forms: Readonly<Record<string, V2Form>>;
   /**
+   * Code-selected construction policy; absent preserves ordinary admission.
+   * False refuses fresh CREATE/UPDATE, not original-key replay, accepted work,
+   * reads or DELETE. It does not fence serving or asynchronous delivery.
+   */
+  readonly allowFreshCreateAndUpdate?: boolean;
+  /**
    * Internal adapters for already accepted Resources/Operations only. These
    * URLs are never public Form support and cannot accept a new CREATE/UPDATE.
    * Keep exact backend identity available for replay, recovery and DELETE.
