@@ -174,7 +174,7 @@ describe("integration money shadow create authority", () => {
             ),
             reviewPath: join(f.root, "phase-review.json"),
             custodyDirectory: rehearsalCustody,
-            snapshotPath: join(f.root, "failure-probe-before.sql"),
+            snapshotPath: join(f.root, "seed-before.sql"),
             phase: "seed",
           },
           invocation,

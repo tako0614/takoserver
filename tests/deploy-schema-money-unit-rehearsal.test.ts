@@ -23,6 +23,8 @@ import {
   runMoneyUnitRehearsal,
   verifyMoneyShadowSnapshotBytes,
 } from "../scripts/deploy/schema-money-unit-rehearsal.ts";
+import { createMoneyCutoverSql, inspectMoneyCutoverGuard } from "../src/money-cutover-sql.ts";
+import type { Sql, SqlParam, SqlStatement } from "../src/ports.ts";
 
 const files = readMigrationArtifact().files;
 const sha = (value: string | Uint8Array) =>
@@ -74,6 +76,34 @@ async function allApplicationDigest(database: Database): Promise<string> {
     "preflight",
     rows.map(({ name }) => name),
   );
+}
+
+/** Local SQLite adapter exercises the public batch contract, not native Worker D1.batch. */
+function localSql(database: Database): Sql {
+  const args = (params?: readonly SqlParam[]) => (params ?? []) as never[];
+  const execute = (statement: SqlStatement) => {
+    const result = database.query(statement.sql).run(...args(statement.params));
+    return { rows: [], changes: result.changes };
+  };
+  return {
+    async query(sql, params) {
+      return database.query(sql).all(...args(params)) as Record<string, unknown>[];
+    },
+    async run(sql, params) {
+      return execute({ sql, ...(params === undefined ? {} : { params }) });
+    },
+    async batch(statements) {
+      database.exec("BEGIN TRANSACTION");
+      try {
+        const results = statements.map(execute);
+        database.exec("COMMIT");
+        return results;
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
+    },
+  };
 }
 
 describe("money-unit native rehearsal source", () => {
@@ -132,6 +162,73 @@ describe("money-unit native rehearsal source", () => {
             .get() as { n: number }
         ).n,
       ).toBe(9007199254730000);
+    } finally {
+      database.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("false resume CHECK rolls back prior mutation; permanent guard admits only pinned batch permits", async () => {
+    const root = mkdtempSync("/dev/shm/t/money-rehearsal-epoch-");
+    const database = new Database(":memory:");
+    try {
+      const plan = await buildMoneyRehearsalSyntheticPlan(files, declaration(root));
+      database.exec(plan.sql.seed);
+      for (const phase of ["freeze", "prepare", "classify", "convert"] as const)
+        database.exec(`BEGIN TRANSACTION;\n${plan.sql[phase]}\nCOMMIT;`);
+      const fencedDigest = await allApplicationDigest(database);
+      expect(fencedDigest).toBe(plan.application.convert);
+      const beforeFreeze = database.query("SELECT * FROM money_cutover_freeze").get();
+      expect(() => {
+        database.exec("BEGIN TRANSACTION");
+        try {
+          for (const statement of plan.sql["resume-failure-probe"].split(";\n")) {
+            if (statement.trim()) database.query(statement).run();
+          }
+          database.exec("COMMIT");
+        } catch (error) {
+          database.exec("ROLLBACK");
+          throw error;
+        }
+      }).toThrow("CHECK constraint failed");
+      expect(database.query("SELECT * FROM money_cutover_freeze").get()).toEqual(beforeFreeze);
+      expect(await allApplicationDigest(database)).toBe(fencedDigest);
+      expect(database.query("SELECT COUNT(*) AS n FROM money_cutover_writer_permit").get()).toEqual(
+        { n: 0 },
+      );
+      database.exec(`BEGIN TRANSACTION;\n${plan.sql.resume}\nCOMMIT;`);
+      expect(moneyUnitCutoverSchemaMatches(localState(database), files, "0094")).toBe(true);
+      expect(await allApplicationDigest(database)).toBe(plan.application.resume);
+      const raw = localSql(database);
+      expect(await inspectMoneyCutoverGuard(raw, plan.writerEpoch)).toBe("ready");
+      for (const phase of [
+        "legacy-insert-probe",
+        "legacy-update-probe",
+        "legacy-delete-probe",
+      ] as const)
+        expect(() => database.query(plan.sql[phase]).run()).toThrow(
+          "money cutover writer permit required",
+        );
+      const staleEpoch = sha(`revoked-synthetic-rehearsal:${plan.writerEpoch}`);
+      const stale = createMoneyCutoverSql(raw, staleEpoch);
+      await expect(
+        stale.run("UPDATE stripe_events SET outcome = outcome WHERE event_id = 'evt_rehearsal'"),
+      ).rejects.toThrow("epoch revoked");
+      const current = createMoneyCutoverSql(raw, plan.writerEpoch);
+      await current.run(
+        "UPDATE stripe_events SET outcome = outcome WHERE event_id = 'evt_rehearsal'",
+      );
+      const readyDigest = await allApplicationDigest(database);
+      await expect(
+        current.batch([
+          { sql: "UPDATE stripe_events SET outcome = 'deferred' WHERE event_id = 'evt_rehearsal'" },
+          { sql: "INSERT INTO money_cutover_rehearsal_missing_0094_probe VALUES (1)" },
+        ]),
+      ).rejects.toThrow("no such table");
+      expect(await allApplicationDigest(database)).toBe(readyDigest);
+      expect(database.query("SELECT COUNT(*) AS n FROM money_cutover_writer_permit").get()).toEqual(
+        { n: 0 },
+      );
     } finally {
       database.close();
       rmSync(root, { recursive: true, force: true });
@@ -271,6 +368,42 @@ describe("money-unit native rehearsal source", () => {
       },
     ]) {
       expect(() => reviewedFailureProbeResult(response)).toThrow("exact late SQL-fault");
+    }
+    const phaseErrors = [
+      [
+        "resume-failure-probe",
+        "D1_ERROR: CHECK constraint failed: epoch = 'usd-micros-v2': SQLITE_CONSTRAINT_CHECK",
+      ],
+      [
+        "legacy-insert-probe",
+        "D1_ERROR: money cutover writer permit required: SQLITE_CONSTRAINT_TRIGGER",
+      ],
+      [
+        "legacy-update-probe",
+        "D1_ERROR: money cutover writer permit required: SQLITE_CONSTRAINT_TRIGGER",
+      ],
+      [
+        "legacy-delete-probe",
+        "D1_ERROR: money cutover writer permit required: SQLITE_CONSTRAINT_TRIGGER",
+      ],
+      [
+        "stale-epoch-probe",
+        "D1_ERROR: money cutover Writer epoch revoked: SQLITE_CONSTRAINT_TRIGGER",
+      ],
+      [
+        "permit-failure-probe",
+        "D1_ERROR: no such table: money_cutover_rehearsal_missing_0094_probe: SQLITE_ERROR",
+      ],
+    ] as const;
+    for (const [phase, diagnostic] of phaseErrors) {
+      const response = { success: true, status: "error", error: diagnostic };
+      expect(reviewedFailureProbeResult(response, phase)).toBe(sha(JSON.stringify(response)));
+      expect(() =>
+        reviewedFailureProbeResult({ ...response, error: `${diagnostic}\nnetwork timeout` }, phase),
+      ).toThrow("exact late SQL-fault");
+      expect(() => reviewedFailureProbeResult({ ...response, status: "active" }, phase)).toThrow(
+        "exact late SQL-fault",
+      );
     }
   });
 

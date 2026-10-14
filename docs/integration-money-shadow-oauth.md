@@ -2,7 +2,7 @@
 
 Task ledger: `takoserver` owns this integration-only authority and data change.
 The order is source review and guard integration, clean source commit, protected
-stage-origin and independent review evidence, fresh shadow creation, six
+stage-origin and independent review evidence, fresh shadow creation, fourteen
 reviewed synthetic import phases, then native readback of the terminal state.
 No sibling repository is changed by this lane. Provider mutation begins only
 with the separately reviewed `--apply` commands; this source change, green
@@ -73,7 +73,10 @@ only dispatched custody. Inspect status; this surface never retries or adopts
 the existing name, even if the D1 appeared.
 
 For each synthetic phase (`seed`, `freeze`, `prepare`, `classify`,
-`failure-probe`, `convert`), create a distinct declaration with the same
+`failure-probe`, `convert`, `resume-failure-probe`, `resume`,
+`legacy-insert-probe`, `legacy-update-probe`, `legacy-delete-probe`,
+`stale-epoch-probe`, `permit-failure-probe`, `permit-success`), create a
+distinct declaration with the same
 account/name/UUID and an owned 0700 phase custody directory:
 
 ```json
@@ -92,7 +95,7 @@ account/name/UUID and an owned 0700 phase custody directory:
   "createReceiptDigest": "sha256:<exact create terminal file digest>",
   "reviewPath": "/protected/<phase>-independent-review.json",
   "custodyDirectory": "/protected/shadow-phase-custody",
-  "snapshotPath": "/protected/failure-probe-before.sql",
+  "snapshotPath": "/protected/<phase>-before.sql",
   "phase": "seed"
 }
 ```
@@ -108,9 +111,10 @@ complete application typed-byte digest, financial preimage/aggregate and
 foreign-key checks. The phase SQL and Wrangler module digest are sealed in
 the dispatch. Once dispatched, no phase is retried after an unknown ACK.
 
-At `failure-probe --status`, a native `wrangler d1 export` produces the
+At each `*-probe --status`, a native `wrangler d1 export` produces the
 protected normalized `snapshotPath`. It is restored locally and its exact
-0093-fenced schema and all application rows are compared with native readback.
+0093-fenced, 0094-fenced, or resumed 0094 schema and all application rows are
+compared with native readback.
 The snapshot digest enters the phase review binding. Following an
 authenticated structured D1 import response with the exact late SQL fault,
 another protected export is written to `<snapshotPath>.after.sql`; both
@@ -120,8 +124,37 @@ written. Cloudflare-owned metadata is not a customer table. A failed export,
 unknown import acknowledgement or unexpected native state retains dispatch
 custody and quarantines the shadow for separate forward repair. The final
 `convert` uses the exact reviewed SQL in a single pinned Wrangler `--file`
-import and verifies the 0094-fenced state. No reset, delete, replay or
-old-cents rollback is implemented here.
+import and verifies the 0094-fenced state. `resume-failure-probe` first changes
+the synthetic freeze-row source digest, then runs the **actual row-only resume
+SQL**; its deliberately false precondition must return the exact native CHECK
+fault and roll back the preceding change. `resume` then deletes only the exact
+freeze row, retaining the permanent guards, authorized epoch and empty permit.
+Three legacy Stripe probes each attempt one direct INSERT, UPDATE or DELETE
+after resume and require the exact guard fault. The stale-epoch probe requires
+the authorized-epoch trigger fault. The permit-failure probe mutates a
+synthetic Stripe event under a correct permit, then faults late; native import
+must roll back both the event and permit. The permit-success import exercises
+one correct permit, a matching-row guarded UPDATE, and permit deletion; the
+full typed-byte readback remains unchanged and permit is empty. Each phase
+has its own independently reviewed SQL digest, native structured fault or
+success observation, protected dispatch and terminal receipt. No reset,
+delete, replay or old-cents rollback is implemented here.
+
+These D1 `/import` and Wrangler `d1 execute --file` observations qualify the
+native SQL importer and database guards. The local `createMoneyCutoverSql`
+regression exercises the Host's `Sql.batch` contract through a local SQLite
+adapter. **Neither proves a native Worker D1 binding's `batch` behavior.**
+That separate prerequisite needs an independently reviewed, source-built
+integration-only diagnostic Worker publication on the same fresh shadow D1,
+with an exact native D1 binding and source-pinned writer epoch. Its bounded
+test route should submit a successful `env.STATE_DB.batch` containing permit
+INSERT, guarded Stripe UPDATE and permit DELETE; a failed batch with a late
+statement must leave the Stripe row and permit unchanged; a Worker pinned to
+an older epoch must be rejected before mutation. The publication must have
+native version/modules/bindings and post-condition receipts, no production
+target inventory, and its own review/custody. This diagnostic Worker lane is
+**not implemented here**; billing-D1 cutover must not treat the import receipt
+as that missing Worker-batch proof.
 
 The stage-origin certificate and protected review files are operator-owned
 evidence, not cryptographic signatures from Cloudflare. The independent

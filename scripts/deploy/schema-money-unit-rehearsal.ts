@@ -13,7 +13,8 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, isAbsolute, join, relative } from "node:path";
+import { basename, dirname, isAbsolute, join, relative } from "node:path";
+import { MONEY_CUTOVER_EPOCH } from "../../src/money-cutover-sql.ts";
 import { RemoteD1 } from "./d1.ts";
 import { buildD1MigrationImport } from "./d1-migration-import.ts";
 import { normalizeSnapshotDump } from "./d1-snapshot-restore.ts";
@@ -57,8 +58,27 @@ const COMMIT = /^[0-9a-f]{40}$/u;
 const SHA = /^sha256:[0-9a-f]{64}$/u;
 const NAME = /^takoserver-r-[0-9a-f]{32}$/u;
 const MISSING_TABLE = "money_cutover_rehearsal_missing_0094_probe";
-const PHASES = ["seed", "freeze", "prepare", "classify", "failure-probe", "convert"] as const;
+const FALSE_RESUME_CHECK = "epoch = 'usd-micros-v2'";
+const PHASES = [
+  "seed",
+  "freeze",
+  "prepare",
+  "classify",
+  "failure-probe",
+  "convert",
+  "resume-failure-probe",
+  "resume",
+  "legacy-insert-probe",
+  "legacy-update-probe",
+  "legacy-delete-probe",
+  "stale-epoch-probe",
+  "permit-failure-probe",
+  "permit-success",
+] as const;
 export type MoneyRehearsalPhase = (typeof PHASES)[number];
+type FailureProbePhase = Extract<MoneyRehearsalPhase, `${string}-probe`>;
+const isFailureProbe = (phase: MoneyRehearsalPhase): phase is FailureProbePhase =>
+  phase.endsWith("-probe");
 
 export interface MoneyRehearsalDeclaration {
   readonly kind: "takoserver.money-unit-rehearsal@v1";
@@ -144,6 +164,7 @@ interface Binding {
   readonly aggregateDigest: string;
   readonly importDigest: string;
   readonly sourceSql0094Digest: string;
+  readonly writerEpoch: string;
   readonly wranglerVersion: "4.123.0";
   readonly wranglerLauncherDigest: string;
   readonly wranglerModuleDigest: string;
@@ -270,7 +291,10 @@ async function boundedResponseText(response: Response): Promise<string> {
 }
 
 /** Parse only the structured authenticated D1 import result, never CLI stderr. */
-export function reviewedFailureProbeResult(value: unknown): string {
+export function reviewedFailureProbeResult(
+  value: unknown,
+  phase: FailureProbePhase = "failure-probe",
+): string {
   const error =
     record(value) && typeof value.error === "string" && value.errors === undefined
       ? value.error
@@ -281,13 +305,21 @@ export function reviewedFailureProbeResult(value: unknown): string {
           (value.error === undefined || value.error === value.errors[0])
         ? value.errors[0]
         : null;
+  const expectedSqlError =
+    phase === "failure-probe" || phase === "permit-failure-probe"
+      ? `no such table: ${MISSING_TABLE}`
+      : phase === "resume-failure-probe"
+        ? `CHECK constraint failed: ${FALSE_RESUME_CHECK}`
+        : phase === "stale-epoch-probe"
+          ? "money cutover Writer epoch revoked"
+          : "money cutover writer permit required";
   if (
     !record(value) ||
     value.success !== true ||
     value.status !== "error" ||
     error === null ||
     !new RegExp(
-      `^(?:D1_ERROR: |SQLITE_ERROR: )?no such table: ${MISSING_TABLE}(?:: SQLITE_ERROR)?$`,
+      `^(?:D1_ERROR: |SQLITE_ERROR: )?${expectedSqlError.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&")}(?:: SQLITE_(?:ERROR|CONSTRAINT|CONSTRAINT_CHECK|CONSTRAINT_TRIGGER))?$`,
       "u",
     ).test(error)
   ) {
@@ -305,6 +337,7 @@ export async function importFailureProbe(
   token: string,
   sql: string,
   fetcher: typeof fetch,
+  phase: FailureProbePhase = "failure-probe",
 ): Promise<{
   readonly diagnosticDigest: string;
   readonly uploadHostClass: "selected-account-r2" | "cloudflare-r2-system";
@@ -315,7 +348,14 @@ export async function importFailureProbe(
     !UUID.test(databaseId) ||
     token.length === 0 ||
     token.trim() !== token ||
-    !sql.endsWith(`INSERT INTO ${MISSING_TABLE} VALUES (1);\n`)
+    !(phase === "failure-probe" || phase === "permit-failure-probe"
+      ? sql.endsWith(`INSERT INTO ${MISSING_TABLE} VALUES (1);\n`)
+      : phase === "resume-failure-probe"
+        ? sql.includes("UPDATE money_cutover_freeze SET source_digest =") &&
+          sql.includes("'invalid-resume-epoch'")
+        : phase === "stale-epoch-probe"
+          ? sql.includes("INSERT INTO money_cutover_writer_permit")
+          : sql.includes("stripe_events"))
   ) {
     throw preflightError(
       "money rehearsal structured import requires the exact failure-probe target",
@@ -388,7 +428,7 @@ export async function importFailureProbe(
     }
     if (state.status === "error") {
       return {
-        diagnosticDigest: reviewedFailureProbeResult(state),
+        diagnosticDigest: reviewedFailureProbeResult(state, phase),
         uploadHostClass: uploadTarget.hostClass,
         presignedUriDigest: uploadTarget.presignedUriDigest,
       };
@@ -534,7 +574,8 @@ function validateDeclaration(
       !SHA.test(value.stageOriginReceiptDigest) ||
       !SHA.test(value.createDeclarationDigest) ||
       !SHA.test(value.createReceiptDigest) ||
-      !PHASES.includes(value.phase)
+      !PHASES.includes(value.phase) ||
+      basename(value.snapshotPath) !== `${value.phase}-before.sql`
     )
       throw preflightError("money shadow rehearsal requires exact integration-only declaration");
     protectedDirectory(value.custodyDirectory);
@@ -724,6 +765,22 @@ function phaseShape(phase: MoneyRehearsalPhase): {
       return { before: "0093-fenced", after: "0093-fenced", previous: "classify" };
     case "convert":
       return { before: "0093-fenced", after: "0094-fenced", previous: "failure-probe" };
+    case "resume-failure-probe":
+      return { before: "0094-fenced", after: "0094-fenced", previous: "convert" };
+    case "resume":
+      return { before: "0094-fenced", after: "0094", previous: "resume-failure-probe" };
+    case "legacy-insert-probe":
+      return { before: "0094", after: "0094", previous: "resume" };
+    case "legacy-update-probe":
+      return { before: "0094", after: "0094", previous: "legacy-insert-probe" };
+    case "legacy-delete-probe":
+      return { before: "0094", after: "0094", previous: "legacy-update-probe" };
+    case "stale-epoch-probe":
+      return { before: "0094", after: "0094", previous: "legacy-delete-probe" };
+    case "permit-failure-probe":
+      return { before: "0094", after: "0094", previous: "stale-epoch-probe" };
+    case "permit-success":
+      return { before: "0094", after: "0094", previous: "permit-failure-probe" };
   }
 }
 
@@ -742,7 +799,7 @@ const classifications = [
 
 function fixtureSeedSql(files: readonly MigrationFile[]): string {
   const base = buildD1MigrationImport(files.slice(0, 92), { freshLedger: true }).sql;
-  return `${base}\nINSERT INTO principals (id, provider, provider_subject, email, display_name, created_at) VALUES ('principal-rehearsal','github','synthetic-rehearsal','rehearsal@example.invalid','Synthetic rehearsal','2026-10-14T00:00:00Z');\nINSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES ('org-rehearsal','Synthetic rehearsal','principal-rehearsal','2026-10-14T00:00:00Z');\nINSERT INTO ledger (id, org_id, type, ref, settled_delta, held_delta, created_at) VALUES ('fund-rehearsal','org-rehearsal','funding','credit-rehearsal',900719925473,0,'2026-10-14T00:00:00Z');\nINSERT INTO wallet_credit_lots (org_id, ref, kind, amount_minor, expires_at, created_at, cursor_handle) VALUES ('org-rehearsal','credit-rehearsal','direct',900719925473,NULL,'2026-10-14T00:00:00Z','11111111111111111111111111111111');\n`;
+  return `${base}\nINSERT INTO principals (id, provider, provider_subject, email, display_name, created_at) VALUES ('principal-rehearsal','github','synthetic-rehearsal','rehearsal@example.invalid','Synthetic rehearsal','2026-10-14T00:00:00Z');\nINSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES ('org-rehearsal','Synthetic rehearsal','principal-rehearsal','2026-10-14T00:00:00Z');\nINSERT INTO ledger (id, org_id, type, ref, settled_delta, held_delta, created_at) VALUES ('fund-rehearsal','org-rehearsal','funding','credit-rehearsal',900719925473,0,'2026-10-14T00:00:00Z');\nINSERT INTO wallet_credit_lots (org_id, ref, kind, amount_minor, expires_at, created_at, cursor_handle) VALUES ('org-rehearsal','credit-rehearsal','direct',900719925473,NULL,'2026-10-14T00:00:00Z','11111111111111111111111111111111');\nINSERT INTO stripe_events (event_id,type,livemode,object_id,event_created_at,received_at,outcome,outcome_detail,settled_at) VALUES ('evt_rehearsal','checkout.session.completed',0,'cs_rehearsal','2026-10-14T00:00:00Z','2026-10-14T00:00:01Z','ignored','synthetic','2026-10-14T00:00:02Z');\n`;
 }
 
 export interface SyntheticPlan {
@@ -751,6 +808,7 @@ export interface SyntheticPlan {
   readonly application: Readonly<Record<MoneyRehearsalPhase | "empty", string>>;
   readonly preimageDigest: string;
   readonly aggregateDigest: string;
+  readonly writerEpoch: string;
 }
 
 async function applicationDigest(
@@ -785,6 +843,7 @@ async function shadowSnapshot(
   files: readonly MigrationFile[],
   run: NonNullable<MoneyRehearsalOptions["run"]>,
   childEnvironment: Readonly<Record<string, string>>,
+  expectedPhase: "0093-fenced" | "0094-fenced" | "0094",
 ): Promise<string> {
   if (!existsSync(path)) {
     const rawPath = join(root, "raw-native-export.sql");
@@ -816,13 +875,14 @@ async function shadowSnapshot(
     }
   }
   const bytes = protectedBytes(path, "money shadow full native snapshot", 16 * 1024 * 1024);
-  return verifyMoneyShadowSnapshotBytes(bytes, expectedApplicationDigest, files);
+  return verifyMoneyShadowSnapshotBytes(bytes, expectedApplicationDigest, files, expectedPhase);
 }
 
 export async function verifyMoneyShadowSnapshotBytes(
   bytes: Uint8Array,
   expectedApplicationDigest: string,
   files: readonly MigrationFile[],
+  expectedPhase: "0093-fenced" | "0094-fenced" | "0094" = "0093-fenced",
 ): Promise<string> {
   const normalized = normalizeSnapshotDump(bytes);
   if (
@@ -845,7 +905,7 @@ export async function verifyMoneyShadowSnapshotBytes(
       },
     };
     const state = await readD1SchemaState(reader as unknown as RemoteD1);
-    if (!moneyUnitCutoverSchemaMatches(state, files, "0093-fenced"))
+    if (!moneyUnitCutoverSchemaMatches(state, files, expectedPhase))
       throw preflightError("money shadow full export has unexpected schema");
     if ((await applicationDigest(reader, "preflight")) !== expectedApplicationDigest)
       throw preflightError("money shadow full export differs from all native application rows");
@@ -875,6 +935,10 @@ export async function buildMoneyRehearsalSyntheticPlan(
   const originDigest = declaration.createReceiptDigest;
   const backupDigest = hash(seed);
   const writerDigest = hash("synthetic rehearsal has no Worker writer");
+  // Synthetic-only epoch: the reviewed import proves the DB guard policy, not a deployed Worker.
+  const writerEpoch = hash(
+    `synthetic-money-rehearsal:${declaration.accountId}:${declaration.databaseId}:${declaration.createReceiptDigest}`,
+  );
   const anchor = hash(
     JSON.stringify({
       kind: "takoserver.money-rehearsal-anchor@v1",
@@ -902,6 +966,7 @@ export async function buildMoneyRehearsalSyntheticPlan(
         originDigest,
         backupDigest,
         writerDigest,
+        writerEpoch,
         classifications: phase === "classify" ? classifications : [],
       });
       database.exec(`BEGIN TRANSACTION;\n${sql[phase]}\nCOMMIT;`);
@@ -911,7 +976,48 @@ export async function buildMoneyRehearsalSyntheticPlan(
     sql["failure-probe"] = `${sql.convert}\nINSERT INTO ${MISSING_TABLE} VALUES (1);\n`;
     financial["failure-probe"] = financial.classify;
     application["failure-probe"] = application.classify;
-    return { sql, financial, application, preimageDigest, aggregateDigest };
+    sql.resume = buildMoneyCutoverImportSql({
+      phase: "resume",
+      files,
+      anchor,
+      originDigest,
+      backupDigest,
+      writerDigest,
+      writerEpoch,
+    });
+    sql["resume-failure-probe"] =
+      `UPDATE money_cutover_freeze SET source_digest = '${hash("synthetic resume false precondition")}' WHERE singleton = 1;\n${sql.resume}`;
+    financial["resume-failure-probe"] = financial.convert;
+    application["resume-failure-probe"] = application.convert;
+    database.exec(`BEGIN TRANSACTION;\n${sql.resume}\nCOMMIT;`);
+    financial.resume = await readMoneyFrozenDataDigest(reader, "preflight");
+    application.resume = await applicationDigest(reader, "preflight");
+    sql["legacy-insert-probe"] =
+      "INSERT INTO stripe_events (event_id,type,livemode,event_created_at,received_at,outcome,settled_at) VALUES ('evt_legacy_insert','synthetic',0,'2026-10-14T00:00:00Z','2026-10-14T00:00:00Z','ignored','2026-10-14T00:00:00Z');\n";
+    sql["legacy-update-probe"] =
+      "UPDATE stripe_events SET outcome = 'deferred' WHERE event_id = 'evt_rehearsal';\n";
+    sql["legacy-delete-probe"] = "DELETE FROM stripe_events WHERE event_id = 'evt_rehearsal';\n";
+    const staleEpoch = hash(`revoked-synthetic-rehearsal:${writerEpoch}`);
+    sql["stale-epoch-probe"] =
+      `INSERT INTO money_cutover_writer_permit (singleton, epoch, writer_epoch) VALUES (1, '${MONEY_CUTOVER_EPOCH}', '${staleEpoch}');\n`;
+    const permitInsert = `INSERT INTO money_cutover_writer_permit (singleton, epoch, writer_epoch) VALUES (1, '${MONEY_CUTOVER_EPOCH}', '${writerEpoch}');`;
+    const permitDelete = `DELETE FROM money_cutover_writer_permit WHERE singleton = 1 AND epoch = '${MONEY_CUTOVER_EPOCH}' AND writer_epoch = '${writerEpoch}';`;
+    sql["permit-failure-probe"] =
+      `${permitInsert}\nUPDATE stripe_events SET outcome = 'deferred' WHERE event_id = 'evt_rehearsal';\nINSERT INTO ${MISSING_TABLE} VALUES (1);\n`;
+    sql["permit-success"] =
+      `${permitInsert}\nUPDATE stripe_events SET outcome = outcome WHERE event_id = 'evt_rehearsal';\n${permitDelete}\n`;
+    for (const phase of [
+      "legacy-insert-probe",
+      "legacy-update-probe",
+      "legacy-delete-probe",
+      "stale-epoch-probe",
+      "permit-failure-probe",
+      "permit-success",
+    ] as const) {
+      financial[phase] = financial.resume;
+      application[phase] = application.resume;
+    }
+    return { sql, financial, application, preimageDigest, aggregateDigest, writerEpoch };
   } finally {
     database.close();
   }
@@ -948,7 +1054,7 @@ function readTerminal(
     !SHA.test(String(value.afterShapeDigest)) ||
     !SHA.test(String(value.afterFinancialDigest)) ||
     !SHA.test(String(value.afterApplicationDigest)) ||
-    (phase === "failure-probe"
+    (isFailureProbe(phase)
       ? value.result !== "expected-sql-failure" ||
         !SHA.test(String(value.diagnosticDigest)) ||
         (value.uploadHostClass !== "selected-account-r2" &&
@@ -1173,28 +1279,27 @@ async function runSyntheticMoneyRehearsal(
     }
     if (
       dispatched === null &&
-      (declaration.phase === "failure-probe" || declaration.phase === "convert") &&
+      (isFailureProbe(declaration.phase) || declaration.phase === "convert") &&
       (await readMoneyPendingCount(database, "preflight")) !== 0
     )
       throw preflightError("money rehearsal has pending conversion work");
     const sql = plan.sql[declaration.phase];
     const sourceDigest = moneyUnitCutoverSourcePrefixDigest(
       files,
-      declaration.phase === "convert" || declaration.phase === "failure-probe"
-        ? 94
-        : declaration.phase === "seed" || declaration.phase === "freeze"
-          ? 92
-          : 93,
+      declaration.phase === "seed" || declaration.phase === "freeze"
+        ? 92
+        : declaration.phase === "prepare" || declaration.phase === "classify"
+          ? 93
+          : 94,
     );
     const provenance = readMoneyRehearsalWranglerProvenance();
-    const transport =
-      declaration.phase === "failure-probe"
-        ? "structured-d1-import-file"
-        : "wrangler-d1-execute-remote-file";
+    const transport = isFailureProbe(declaration.phase)
+      ? "structured-d1-import-file"
+      : "wrangler-d1-execute-remote-file";
     const endpoint = importEndpoint(declaration.accountId, declaration.databaseId);
     if (
       shadow &&
-      declaration.phase === "failure-probe" &&
+      isFailureProbe(declaration.phase) &&
       dispatched !== null &&
       !existsSync(declaration.snapshotPath)
     )
@@ -1202,7 +1307,7 @@ async function runSyntheticMoneyRehearsal(
         "money shadow dispatched failure probe lost its protected before snapshot",
       );
     const beforeSnapshotDigest =
-      shadow && declaration.phase === "failure-probe" && exactBefore
+      shadow && isFailureProbe(declaration.phase) && exactBefore
         ? await shadowSnapshot(
             declaration,
             declaration.snapshotPath,
@@ -1212,8 +1317,13 @@ async function runSyntheticMoneyRehearsal(
             files,
             run,
             credential.childEnvironment,
+            declaration.phase === "failure-probe"
+              ? "0093-fenced"
+              : declaration.phase === "resume-failure-probe"
+                ? "0094-fenced"
+                : "0094",
           )
-        : shadow && declaration.phase === "failure-probe" && existsSync(declaration.snapshotPath)
+        : shadow && isFailureProbe(declaration.phase) && existsSync(declaration.snapshotPath)
           ? hash(
               protectedBytes(
                 declaration.snapshotPath,
@@ -1237,6 +1347,7 @@ async function runSyntheticMoneyRehearsal(
         retained.sourceCommit !== invocation.commit ||
         retained.sourceDigest !== sourceDigest ||
         retained.sourceSql0094Digest !== files[93]?.digest ||
+        retained.writerEpoch !== plan.writerEpoch ||
         retained.importDigest !== hash(sql) ||
         retained.wranglerVersion !== provenance.wranglerVersion ||
         retained.wranglerLauncherDigest !== provenance.wranglerLauncherDigest ||
@@ -1244,7 +1355,7 @@ async function runSyntheticMoneyRehearsal(
         retained.importTransport !== transport ||
         retained.importEndpoint !== endpoint ||
         (shadow &&
-          declaration.phase === "failure-probe" &&
+          isFailureProbe(declaration.phase) &&
           retained.beforeSnapshotDigest !== beforeSnapshotDigest) ||
         !isAbsolute(retained.sealedImportPath) ||
         !relative(declaration.custodyDirectory, retained.sealedImportPath).startsWith(
@@ -1272,7 +1383,7 @@ async function runSyntheticMoneyRehearsal(
           terminal.afterApplicationDigest !== observedApplication ||
           terminal.afterFinancialDigest !== observedFinancial ||
           (shadow &&
-            declaration.phase === "failure-probe" &&
+            isFailureProbe(declaration.phase) &&
             (terminal.beforeSnapshotDigest !== beforeSnapshotDigest ||
               terminal.afterSnapshotDigest !== beforeSnapshotDigest ||
               !existsSync(`${declaration.snapshotPath}.after.sql`) ||
@@ -1307,6 +1418,7 @@ async function runSyntheticMoneyRehearsal(
             : "next reviewed phase",
         rehearsalOnly: true,
         grantsIntegrationApply: false,
+        workerD1BatchProven: false,
       };
     }
     const reviewBinding: ReviewBinding = {
@@ -1329,6 +1441,7 @@ async function runSyntheticMoneyRehearsal(
       aggregateDigest: plan.aggregateDigest,
       importDigest: hash(sql),
       sourceSql0094Digest: files[93]?.digest ?? "",
+      writerEpoch: plan.writerEpoch,
       ...(shadow
         ? {
             authorityProfile: "integration-shadow-oauth" as const,
@@ -1358,6 +1471,7 @@ async function runSyntheticMoneyRehearsal(
       readyForApply: exactBefore && dispatched === null && reviewDigest !== null,
       rehearsalOnly: true,
       grantsIntegrationApply: false,
+      workerD1BatchProven: false,
     };
     if (invocation.action === "status") return status;
     if (!exactBefore)
@@ -1458,13 +1572,14 @@ async function runSyntheticMoneyRehearsal(
     let diagnosticDigest: string | null = null;
     let uploadHostClass: TerminalRecord["uploadHostClass"] = null;
     let presignedUriDigest: string | null = null;
-    if (declaration.phase === "failure-probe") {
+    if (isFailureProbe(declaration.phase)) {
       const observed = await importFailureProbe(
         declaration.accountId,
         declaration.databaseId,
         credential.token,
         sql,
         options.fetcher ?? fetch,
+        declaration.phase,
       );
       diagnosticDigest = observed.diagnosticDigest;
       uploadHostClass = observed.uploadHostClass;
@@ -1521,7 +1636,7 @@ async function runSyntheticMoneyRehearsal(
         "money rehearsal native complete application rows differ from sealed synthetic fixture",
       );
     const afterSnapshotDigest =
-      shadow && declaration.phase === "failure-probe"
+      shadow && isFailureProbe(declaration.phase)
         ? await shadowSnapshot(
             declaration,
             `${declaration.snapshotPath}.after.sql`,
@@ -1531,13 +1646,18 @@ async function runSyntheticMoneyRehearsal(
             files,
             run,
             credential.childEnvironment,
+            declaration.phase === "failure-probe"
+              ? "0093-fenced"
+              : declaration.phase === "resume-failure-probe"
+                ? "0094-fenced"
+                : "0094",
           )
         : null;
     if (afterSnapshotDigest !== null && afterSnapshotDigest !== beforeSnapshotDigest)
       throw verificationError(
         "money shadow full native export bytes changed after late SQL failure",
       );
-    const converted = declaration.phase === "convert";
+    const converted = PHASES.indexOf(declaration.phase) >= PHASES.indexOf("convert");
     if (
       (await readMoneyPreimageDigest(database, "verification", converted)) !==
         plan.preimageDigest ||
@@ -1549,7 +1669,7 @@ async function runSyntheticMoneyRehearsal(
     const terminalRecord: TerminalRecord = {
       kind: "takoserver.money-rehearsal-terminal@v1",
       bindingDigest,
-      result: declaration.phase === "failure-probe" ? "expected-sql-failure" : "success",
+      result: isFailureProbe(declaration.phase) ? "expected-sql-failure" : "success",
       afterShapeDigest: after.shapeDigest,
       afterFinancialDigest,
       afterApplicationDigest,
@@ -1575,6 +1695,7 @@ async function runSyntheticMoneyRehearsal(
       presignedUriDigest,
       nativeRehearsal: true,
       grantsIntegrationApply: false,
+      workerD1BatchProven: false,
     };
   } finally {
     if (invocation.action === "status") rmSync(root, { recursive: true, force: true });
