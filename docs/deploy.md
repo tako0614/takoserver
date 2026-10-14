@@ -1878,6 +1878,33 @@ surface exists so that no restore depends on that exit code:
   and prints every mismatch. A partial application is a verification failure,
   never a success.
 
+The dump scanner keeps an entire `CREATE TRIGGER ... BEGIN ... END;` as one
+statement, including its internal semicolons, quoted tokens and comments.
+Trigger-body `INSERT ... SELECT`, `VALUES`, updates and deletes define behavior;
+they do not add backup rows. An incomplete trigger is refused, and top-level
+INSERTs that cannot be counted remain refused.
+
+`inspectSnapshotDumpLocally` provides source-owned, offline backup verification:
+it restores normalized bytes only into memory, uses the same strict table,
+row-count, schema-object, lineage and foreign-key readback checks, and checks
+SQLite integrity before any optional row inspector runs. Inspectors receive a
+read-only copy for source-owned financial or typed-row digest readers. Its result
+does not prove remote import acknowledgement or writer quiescence, and grants no
+remote apply, replay or cutover authority.
+
+Before any native execution, the local helper accepts only the bounded export
+grammar: table/index/trigger/view creation, counted INSERTs, sqlite_sequence
+cleanup, BEGIN/COMMIT and boolean foreign_keys/defer_foreign_keys pragmas. Counts
+do not authorize other statements. Native SQLite authorization independently
+restricts every expression, trigger and stored-view operation to the main
+in-memory database and built-in functions other than extension loading. Unknown
+actions, attachment/detachment, virtual tables and other pragmas are denied;
+VACUUM and other unsupported top-level verbs are refused before execution.
+Temporary storage stays in memory, database/cell/SQL size is bounded, and the
+inspector's copied connection permits only read operations and bounded readback
+pragmas. Neither dump nor inspector SQL can attach another database or disable
+the read-only policy. Refusals do not print snapshot SQL or embedded paths/values.
+
 Both actions use an absolute, operator-owned 0600 JSON file at
 `TAKOSERVER_D1_SNAPSHOT_RESTORE_DECLARATION_PATH`, and the snapshot itself must
 be an owned, single-link, 0600 file:
