@@ -1,5 +1,5 @@
 import { minorToMicros } from "./money.ts";
-import type { Clock, Sql, SqlParam, SqlStatement } from "./ports.ts";
+import { type Clock, type Sql, SqlError, type SqlParam, type SqlStatement } from "./ports.ts";
 
 /**
  * The prepaid wallet.
@@ -81,6 +81,28 @@ export class LedgerError extends Error {
 export const WALLET_ENTRY_PAGE = 100;
 
 const stripeRefundSchemaCache = new WeakMap<Sql, Promise<boolean>>();
+
+/** A local invoice proof is paid until its consideration is fully refunded.
+ * An active refund fence also blocks a Free escape while settlement is pending.
+ * Its placeholders bind the organization, both period bounds, and the fence owner. */
+export const hostedPaidFreeBlockedSql = `(
+  EXISTS (SELECT 1 FROM stripe_billing_grants g
+    WHERE g.org_id = ? AND g.source_type = 'invoice'
+      AND g.period_start <= ? AND g.period_end > ?
+      AND NOT EXISTS (SELECT 1 FROM stripe_billing_refunds r
+        WHERE r.org_id = g.org_id AND r.funding_ref = g.funding_ref
+          AND r.cumulative_refunded_micros >= g.consideration_micros))
+  OR EXISTS (SELECT 1 FROM stripe_billing_fences f
+    WHERE f.org_id = ? AND f.active = 1
+      AND (f.funding_ref LIKE 'stripe:invoice:%'
+        OR EXISTS (SELECT 1 FROM stripe_billing_grants g
+          WHERE g.org_id = f.org_id AND g.funding_ref = f.funding_ref
+            AND g.source_type = 'invoice')))
+)`;
+
+export function hostedPaidFreeBlockedParams(organizationId: string, instant: string) {
+  return [organizationId, instant, instant, organizationId] as const;
+}
 
 /** Legacy self-host wallets keep serving until the additive Stripe schema exists. */
 export function stripeRefundSchemaReady(sql: Sql): Promise<boolean> {
@@ -234,15 +256,22 @@ export async function prepareLedgerHoldRelease(
   };
 }
 
-export function createLedger(sql: Sql, clock: Clock): Ledger {
+export function createLedger(
+  sql: Sql,
+  clock: Clock,
+  options: { readonly hostedPaidFreeExclusion?: boolean } = {},
+): Ledger {
+  const hostedPaidFreeExclusion = options.hostedPaidFreeExclusion === true;
   return {
     async wallet(organizationId): Promise<Wallet> {
       const refundsReady = await stripeRefundSchemaReady(sql);
+      const instant = clock().toISOString();
       const totals = await sql.query(
         `SELECT
            COALESCE((
              SELECT SUM(CASE
-               WHEN l.expires_at IS NULL OR l.expires_at > ? THEN
+               WHEN (l.expires_at IS NULL OR l.expires_at > ?)
+                 ${hostedPaidFreeExclusion ? `AND NOT (l.consumption_class = 'free' AND ${hostedPaidFreeBlockedSql})` : ""} THEN
                  l.amount_micros - COALESCE((
                    SELECT SUM(a.amount_micros)
                    FROM wallet_credit_allocations a
@@ -292,15 +321,26 @@ export function createLedger(sql: Sql, clock: Clock): Ledger {
 } AS frozen`,
         refundsReady
           ? [
-              clock().toISOString(),
+              instant,
+              ...(hostedPaidFreeExclusion
+                ? hostedPaidFreeBlockedParams(organizationId, instant)
+                : []),
               organizationId,
               organizationId,
               organizationId,
               organizationId,
               organizationId,
-              clock().toISOString(),
+              instant,
             ]
-          : [clock().toISOString(), organizationId, organizationId, organizationId],
+          : [
+              instant,
+              ...(hostedPaidFreeExclusion
+                ? hostedPaidFreeBlockedParams(organizationId, instant)
+                : []),
+              organizationId,
+              organizationId,
+              organizationId,
+            ],
       );
       const settledMicros = sqlMicros(totals[0]?.settled ?? 0);
       const heldMicros = sqlMicros(totals[0]?.held ?? 0);
@@ -418,35 +458,50 @@ export function createLedger(sql: Sql, clock: Clock): Ledger {
       const createdAt = clock().toISOString();
       const refundsReady = await stripeRefundSchemaReady(sql);
       const guardId = `guard_${crypto.randomUUID()}`;
-      await sql.batch([
-        {
-          sql: `INSERT OR IGNORE INTO wallet_credit_lots
+      const paidFreeGuard = hostedPaidFreeExclusion && consumptionClass === "free";
+      const eligibilityGuardId = `${guardId}_free`;
+      try {
+        await sql.batch([
+          ...(paidFreeGuard
+            ? [
+                {
+                  sql: `INSERT INTO wallet_allocation_guards (id, valid)
+                VALUES (?, CASE WHEN NOT ${hostedPaidFreeBlockedSql} THEN 1 ELSE 0 END)`,
+                  params: [
+                    eligibilityGuardId,
+                    ...hostedPaidFreeBlockedParams(organizationId, createdAt),
+                  ],
+                },
+              ]
+            : []),
+          {
+            sql: `INSERT OR IGNORE INTO wallet_credit_lots
                   (org_id, ref, kind, consumption_class, amount_micros, expires_at, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          params: [
-            organizationId,
-            fundingRef,
-            kind,
-            consumptionClass,
-            amountMicros,
-            expiresAt,
-            createdAt,
-          ],
-        },
-        {
-          sql: `INSERT OR IGNORE INTO ledger
+            params: [
+              organizationId,
+              fundingRef,
+              kind,
+              consumptionClass,
+              amountMicros,
+              expiresAt,
+              createdAt,
+            ],
+          },
+          {
+            sql: `INSERT OR IGNORE INTO ledger
                   (id, org_id, type, ref, settled_delta_micros, held_delta_micros, created_at)
                 VALUES (?, ?, 'funding', ?, ?, 0, ?)`,
-          params: [
-            `led_${crypto.randomUUID()}`,
-            organizationId,
-            fundingRef,
-            amountMicros,
-            createdAt,
-          ],
-        },
-        {
-          sql: `INSERT INTO wallet_allocation_guards (id, valid)
+            params: [
+              `led_${crypto.randomUUID()}`,
+              organizationId,
+              fundingRef,
+              amountMicros,
+              createdAt,
+            ],
+          },
+          {
+            sql: `INSERT INTO wallet_allocation_guards (id, valid)
                 SELECT ?, CASE WHEN
                   balance.settled BETWEEN 0 AND 9007199254740991
                   AND balance.held BETWEEN 0 AND 9007199254740991
@@ -463,7 +518,8 @@ export function createLedger(sql: Sql, clock: Clock): Ledger {
                 FROM (
                   SELECT
                     COALESCE((SELECT SUM(CASE
-                      WHEN l.expires_at IS NULL OR l.expires_at > ? THEN
+                      WHEN (l.expires_at IS NULL OR l.expires_at > ?)
+                        ${hostedPaidFreeExclusion ? `AND NOT (l.consumption_class = 'free' AND ${hostedPaidFreeBlockedSql})` : ""} THEN
                         l.amount_micros - COALESCE((
                           SELECT SUM(a.amount_micros) FROM wallet_credit_allocations a
                           WHERE a.org_id = l.org_id AND a.lot_ref = l.ref
@@ -485,25 +541,68 @@ export function createLedger(sql: Sql, clock: Clock): Ledger {
                     COALESCE((SELECT SUM(amount_micros) FROM wallet_credit_allocations
                               WHERE org_id = ? AND debit_type = 'hold'), 0) AS allocated_held
                 ) AS balance`,
-          params: [
-            guardId,
-            organizationId,
-            fundingRef,
-            kind,
-            consumptionClass,
-            amountMicros,
-            expiresAt,
-            organizationId,
-            fundingRef,
-            amountMicros,
-            createdAt,
-            organizationId,
-            organizationId,
-            organizationId,
-          ],
-        },
-        { sql: "DELETE FROM wallet_allocation_guards WHERE id = ?", params: [guardId] },
-      ]);
+            params: [
+              guardId,
+              organizationId,
+              fundingRef,
+              kind,
+              consumptionClass,
+              amountMicros,
+              expiresAt,
+              organizationId,
+              fundingRef,
+              amountMicros,
+              createdAt,
+              ...(hostedPaidFreeExclusion
+                ? hostedPaidFreeBlockedParams(organizationId, createdAt)
+                : []),
+              organizationId,
+              organizationId,
+              organizationId,
+            ],
+          },
+          { sql: "DELETE FROM wallet_allocation_guards WHERE id = ?", params: [guardId] },
+          ...(paidFreeGuard
+            ? [
+                {
+                  sql: "DELETE FROM wallet_allocation_guards WHERE id = ?",
+                  params: [eligibilityGuardId],
+                },
+              ]
+            : []),
+        ]);
+      } catch (error) {
+        if (!(paidFreeGuard && error instanceof SqlError && error.code === "constraint"))
+          throw error;
+        const blocked = await sql.query(
+          `SELECT ${hostedPaidFreeBlockedSql} AS blocked`,
+          hostedPaidFreeBlockedParams(organizationId, createdAt),
+        );
+        if (blocked.length !== 1 || Number(blocked[0]?.blocked) !== 1) throw error;
+        const [lots, fundings] = await Promise.all([
+          sql.query(
+            "SELECT kind, consumption_class, amount_micros, expires_at FROM wallet_credit_lots WHERE org_id = ? AND ref = ?",
+            [organizationId, fundingRef],
+          ),
+          sql.query(
+            "SELECT settled_delta_micros, held_delta_micros FROM ledger WHERE org_id = ? AND type = 'funding' AND ref = ?",
+            [organizationId, fundingRef],
+          ),
+        ]);
+        if (
+          (lots.length !== 0 || fundings.length !== 0) &&
+          (lots.length !== 1 ||
+            lots[0]?.kind !== kind ||
+            lots[0]?.consumption_class !== consumptionClass ||
+            sqlMicros(lots[0]?.amount_micros) !== amountMicros ||
+            (lots[0]?.expires_at ?? null) !== expiresAt ||
+            fundings.length !== 1 ||
+            sqlMicros(fundings[0]?.settled_delta_micros) !== amountMicros ||
+            sqlMicros(fundings[0]?.held_delta_micros) !== 0)
+        )
+          throw new LedgerError("conservation_violated");
+        return this.wallet(organizationId);
+      }
       const lot = await sql.query(
         `SELECT kind, consumption_class, amount_micros, expires_at FROM wallet_credit_lots
          WHERE org_id = ? AND ref = ?`,
@@ -684,6 +783,7 @@ export function createLedger(sql: Sql, clock: Clock): Ledger {
         settledDeltaMicros,
         heldDeltaMicros,
         now,
+        hostedPaidFreeExclusion,
       }),
     );
   }
@@ -713,13 +813,18 @@ export function createLedger(sql: Sql, clock: Clock): Ledger {
 }), 0) AS available
        FROM wallet_credit_lots l
        WHERE l.org_id = ? AND (l.expires_at IS NULL OR l.expires_at > ?)
+       ${hostedPaidFreeExclusion ? `AND NOT (l.consumption_class = 'free' AND ${hostedPaidFreeBlockedSql})` : ""}
        ${
          refundsReady
            ? `AND NOT EXISTS (SELECT 1 FROM stripe_billing_fences f
           WHERE f.org_id = l.org_id AND f.funding_ref = l.ref AND f.active = 1)`
            : ""
 }`,
-      [organizationId, now],
+      [
+        organizationId,
+        now,
+        ...(hostedPaidFreeExclusion ? hostedPaidFreeBlockedParams(organizationId, now) : []),
+      ],
     );
     return sqlMicros(rows[0]?.available ?? 0);
   }
@@ -919,6 +1024,7 @@ export async function prepareLedgerAllocation(
     readonly settledDeltaMicros: number;
     readonly heldDeltaMicros: number;
     readonly now: string;
+    readonly hostedPaidFreeExclusion?: boolean;
   },
 ): Promise<readonly SqlStatement[]> {
   const refundsReady = await stripeRefundSchemaReady(sql);
@@ -930,6 +1036,7 @@ export async function prepareLedgerAllocation(
     settledDeltaMicros,
     heldDeltaMicros,
     now,
+    hostedPaidFreeExclusion = false,
   } = input;
   positiveAmount(amountMicros);
   if (
@@ -964,6 +1071,7 @@ export async function prepareLedgerAllocation(
        LEFT JOIN wallet_credit_allocations a
          ON a.org_id = l.org_id AND a.lot_ref = l.ref
        WHERE l.org_id = ? AND (l.expires_at IS NULL OR l.expires_at > ?)
+         ${hostedPaidFreeExclusion ? `AND NOT (l.consumption_class = 'free' AND ${hostedPaidFreeBlockedSql})` : ""}
          ${
            refundsReady
              ? `AND NOT EXISTS (SELECT 1 FROM stripe_billing_fences f
@@ -975,7 +1083,11 @@ export async function prepareLedgerAllocation(
        ORDER BY CASE l.consumption_class WHEN 'free' THEN 0 WHEN 'subscription' THEN 1 ELSE 2 END,
                 CASE WHEN l.expires_at IS NULL THEN 1 ELSE 0 END,
                 l.expires_at, l.created_at, l.ref`,
-    [organizationId, now],
+    [
+      organizationId,
+      now,
+      ...(hostedPaidFreeExclusion ? hostedPaidFreeBlockedParams(organizationId, now) : []),
+    ],
   );
   let remaining = amountMicros;
   const allocations: Array<{ readonly lotRef: string; readonly amount: number }> = [];
@@ -1003,6 +1115,7 @@ export async function prepareLedgerAllocation(
                   : "0"
               }
               FROM wallet_credit_lots WHERE org_id = ? AND ref = ?
+                ${hostedPaidFreeExclusion ? `AND NOT (consumption_class = 'free' AND ${hostedPaidFreeBlockedSql})` : ""}
                 ${
                   refundsReady
                     ? `AND NOT EXISTS (SELECT 1 FROM stripe_billing_fences
@@ -1022,6 +1135,7 @@ export async function prepareLedgerAllocation(
       ...(refundsReady ? [organizationId, allocation.lotRef] : []),
       organizationId,
       allocation.lotRef,
+      ...(hostedPaidFreeExclusion ? hostedPaidFreeBlockedParams(organizationId, now) : []),
       ...(refundsReady ? [organizationId, allocation.lotRef] : []),
       allocation.amount,
     ],
