@@ -6,6 +6,8 @@ import {
 } from "./billing-config.ts";
 import { base64UrlDecode, base64UrlEncode, canonicalJson } from "./json.ts";
 import {
+  hostedPaidFreeBlockedParams,
+  hostedPaidFreeBlockedSql,
   type Ledger,
   LedgerError,
   prepareLedgerAllocation,
@@ -236,8 +238,10 @@ export function createOrgBilling(options: {
   readonly clock: Clock;
   readonly ledger: Ledger;
   readonly config: BillingConfig;
+  readonly hostedPaidFreeExclusion?: boolean;
 }): OrgBilling {
   const { sql, clock, ledger, config } = options;
+  const hostedPaidFreeExclusion = options.hostedPaidFreeExclusion === true;
   const refundsReady = () => stripeRefundSchemaReady(sql);
   const now = () => clock().toISOString();
   const held = async (org: string, ref: string) =>
@@ -487,6 +491,19 @@ export function createOrgBilling(options: {
         if (!after) orgBillingFail("invalid_cursor", 400);
       }
       await prepare(org);
+      const instant = now();
+      const paidRows = hostedPaidFreeExclusion
+        ? await sql.query(
+            `SELECT ${hostedPaidFreeBlockedSql} AS blocked`,
+            hostedPaidFreeBlockedParams(org, instant),
+          )
+        : [];
+      if (
+        hostedPaidFreeExclusion &&
+        (paidRows.length !== 1 || ![0, 1].includes(Number(paidRows[0]?.blocked)))
+      )
+        orgBillingFail("billing_unavailable", 503);
+      const paidFreeBlocked = Number(paidRows[0]?.blocked) === 1;
       const classRank = after ? lotClassRank(String(after.consumption_class)) : 0;
       const nullableRank = after?.expires_at == null ? 1 : 0;
       const boundary = after
@@ -550,7 +567,9 @@ export function createOrgBilling(options: {
           revokedMicros,
           frozen: Number(row.frozen) === 1,
           availableMicros:
-            !Number(row.frozen) && (row.expires_at == null || String(row.expires_at) > now())
+            !Number(row.frozen) &&
+            !(hostedPaidFreeExclusion && row.consumption_class === "free" && paidFreeBlocked) &&
+            (row.expires_at == null || String(row.expires_at) > instant)
               ? remainingMicros - heldMicros
               : 0,
           expiresAt: nullable(row.expires_at),
@@ -617,6 +636,7 @@ export function createOrgBilling(options: {
                 settledDeltaMicros: 0,
                 heldDeltaMicros: input.amountMicros,
                 now: instant,
+                hostedPaidFreeExclusion,
               });
         await sql.batch([
           {
@@ -876,6 +896,7 @@ export function createOrgBilling(options: {
                 settledDeltaMicros: -amount,
                 heldDeltaMicros: 0,
                 now: instant,
+                hostedPaidFreeExclusion,
               });
         const guardId = `guard_${crypto.randomUUID()}`;
         await sql.batch([

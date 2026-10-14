@@ -28,10 +28,11 @@ with the two configured cash/credit pairs and existing row variants preserved.
 Regenerate OpenAPI, explicitly format, run focused checks and the complete local
 `bun run check`, and record exact source/results before merge after #336.
 
-The v2 source also declares Free non-stacking, but the current monthly grant
-path lacks the corresponding atomic subscription-eligibility fence. That
-separate integration and transition policy are required before live acceptance;
-this contract correction neither enforces them nor rewrites issued lots.
+Merged #344 adds the Hosted paid-coverage Free exclusion, preserving existing
+Free holds/history and restoring eligibility after covered periods or settled
+full refunds. The latest main integration is retained unchanged here; this
+read-schema correction does not change its grant or allocation policy. Live
+TEST Price/target qualification remains separate from these source changes.
 
 Source can be reverted independently before publication. This is a read-schema
 correction with no durable money mutation. Staging D1/application and production

@@ -28,17 +28,19 @@ Related work: [Takosumi Hosted PR #54](https://github.com/tako0614/takosumi-host
 and merged [shared price authoring #319](https://github.com/tako0614/takoserver/pull/319).
 The original PR #54 review found no review/discussion comments; its body lists
 the four questions decided below. The implementation baseline for this revision
-is main `bf90a9f86e970f5fb93e24ac1765131fd6cc01f9` (#325), including #330 and
+is main `54cb1b2df70becaba46a8a470dce00e720555f9b` (#344), including #325, #330 and
 [#328](https://github.com/tako0614/takoserver/pull/328) single-cutoff expiry.
 The shared two-choice table follows [#336](https://github.com/tako0614/takoserver/pull/336)
-candidate `b18af4708c1c5b1071476975178bd76fb886f7b7`; its source qualification
-and runtime activation remain separate from this API contract correction.
+merged as `baed4994ea158b65e11a1da08025ca2840771069` from source
+`b18af4708c1c5b1071476975178bd76fb886f7b7`. #344 supplies the paid-coverage
+Free exclusion and preserves earlier holds/history. Live qualification and
+activation remain separate from this API contract correction.
 Source merge does not establish staging or billing GA.
 
 | Area | CTO target | Implementation / remaining acceptance |
 | --- | --- | --- |
 | Ledger and scoped money wire | Integer USD micros; explicit `*Micros` fields | Micros source and forward 0093/0094 migrations replace #318; live cutover remains separately qualified |
-| Allocation | Free allowance → subscription credit → purchased credit → consented capped postpaid | Prepaid allocation, settlement and pagination share class priority; postpaid remains disabled pending its separate cap reservation and invoice implementation |
+| Allocation | Eligible Free allowance → subscription credit → purchased credit; capped postpaid requires separate consent and implementation | Hosted excludes Free from new allocation during verified paid invoice coverage; otherwise prepaid allocation retains class priority. Postpaid remains disabled pending its separate cap reservation and invoice implementation |
 | Invoicing | Aggregate payable micros, then ceiling to cents once | Capture/usage retain micros; the arithmetic helper is available, while Stripe invoice settlement remains a later wave |
 | Holds and scopes | Immutable TTL, capture ≤ hold, automatic release; four routine writes with exact Organization/scopes | #330 preserves #318's transactional lifecycle and supplies the four micros commands and scoped reads |
 | Hosted plans | Edge allowance, monthly included credit, additional credit/usage; the same configured role IDs, subscription choices and table | #325 supplies subscriptions/refunds; #336 supplies the shared USD-micros source and two-choice compiler; TEST Price and live target acceptance remain required |
@@ -146,24 +148,28 @@ guess that they were free, subscribed or purchased. New grants use this policy:
 | Paid subscription period | `plan-included` | `stripe:invoice:<invoiceId>` | End of the paid recurring line's service period |
 | Additional credit purchase | `purchased` | `stripe:<checkoutSessionId>` | None by default; any configured expiry is disclosed and pinned at purchase |
 
-The #336 v2 source fixes `freePaidStacking: false`: the configured monthly
-Free grant belongs to Free-eligible Organizations, and a new Free grant must not
-be added to a paid entitlement. It is once per Organization per UTC month,
-not per Workspace. The job and lazy admission backfill share that reference
-and the month's frozen configuration; neither grants expired past months.
-A zero allowance records eligibility without positive-amount funding.
+For Hosted, the configured Free amount belongs to an eligible Organization
+once per UTC month, not to each Workspace. The month's tariff snapshot and
+Free reference remain unique. While a verified paid invoice grant covers the
+current instant (`period_start <= now < period_end`), do not fund a new Free
+lot or allocate unused Free from a lot funded earlier that month. Paid coverage
+comes from the settled invoice grant and its refund proof, not a subscription
+status string or a remote period alone. A partial refund leaves the remaining
+period paid. After its end, or after a full refund and release of its refund
+fence, Free eligibility can resume within that same UTC month using the
+original monthly snapshot. A pending invoice refund fence blocks Free for the
+Organization until resolved, even if that invoice's service period has ended;
+refund receivables separately block new billable admission. No past,
+already-expired month is backfilled, and a zero allowance records eligibility
+without calling the positive-amount funding operation. Independent self-host
+wallets keep their own Free grant policy.
 
-This source policy is not yet an implemented runtime eligibility fence:
-`org-billing.ts` currently prepares the configured Free grant without checking
-subscription eligibility. Before v2 live acceptance, separate integration must
-atomically fence that grant against paid eligibility and specify upgrades,
-cancellation, period boundaries and already-issued/held Free credit. Do not
-claim the compiler enforces this policy or silently rewrite historical grants.
-The spending priority below still applies to valid previously issued lots;
-it does not authorize another Free grant when the Organization is ineligible
-for Free.
-
-Consume **free allowance first, then subscription grants, then additional
+An existing Free lot, its funding history and allocations reserved before
+paid coverage remain intact. Capture or release those existing holds against
+their original lot; do not revoke or reclassify Free and do not subtract Free
+consumed before the paid period from the new paid grant. During paid coverage,
+new allocation uses eligible subscription and purchased credit. When Free is
+eligible, consume **Free first, then subscription grants, then additional
 purchased credit**. Only after eligible prepaid credit is exhausted may an
 explicitly consented capped postpaid reservation cover the remainder. Postpaid
 is a separate receivable/cap reservation, not a spendable credit lot. Within
@@ -475,8 +481,10 @@ rounding a floating-point dollar input.
 
 Display the class order free → subscription → purchased. Each lot shows source
 kind as well as class, original expiry, spendable amount and held amount; free
-and subscription can both have kind `plan-included`. A monthly allowance is
-shown once per Organization, not once per Workspace. Subscription period,
+and subscription can both have kind `plan-included`. A funded monthly Free
+allowance is shown at most once per Organization, not once per Workspace. An
+earlier Free lot may remain visible with zero available during paid coverage
+while its past holds and usage remain visible. Subscription period,
 pending plan/cancellation, and paid-through status come from the authoritative
 subscription projection, not a locally guessed billing date. Purchased credit
 expiry is disclosed before Checkout. Postpaid is shown as disabled until an
@@ -848,7 +856,9 @@ concurrent terminal writes; expiry at the exact boundary and after restart;
 release-before-delayed-hold; exact versus conflicting replays; lot expiry while
 held; many Workspaces sharing one allowance; 1-micro spending and combined
 fractional-cent items with one invoice ceiling; unit/range/aggregate overflow,
-legacy micro-cent separation, free-before-subscription-before-purchased order,
+legacy micro-cent separation, eligible-Free-before-subscription-before-purchased
+order, paid-period Free suppression with old Free holds/history retained and
+same-month eligibility restoration after coverage/refund settlement,
 zero usage and self-host exclusion; partial/full/pending refunds against
 available, held, expired, and used
 credit; subscription/Checkout double-funding prevention; old deferred-event
