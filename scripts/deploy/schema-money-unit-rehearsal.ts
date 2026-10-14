@@ -16,7 +16,14 @@ import {
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { RemoteD1 } from "./d1.ts";
 import { buildD1MigrationImport } from "./d1-migration-import.ts";
+import { normalizeSnapshotDump } from "./d1-snapshot-restore.ts";
 import { mutationError, preflightError, verificationError } from "./errors.ts";
+import {
+  moneyShadowHash,
+  moneyShadowProtectedBytes,
+  readMoneyShadowCreateReview,
+  readMoneyShadowOrigin,
+} from "./integration-money-shadow-create.ts";
 import {
   CloudflareIntegrationStorageProvider,
   type IntegrationStorageD1Database,
@@ -68,9 +75,35 @@ export interface MoneyRehearsalDeclaration {
   readonly phase: MoneyRehearsalPhase;
 }
 
+/** Distinct integration-only synthetic target; never an ordinary staging D1. */
+export interface IntegrationMoneyShadowRehearsalDeclaration {
+  readonly kind: "takoserver.integration-money-shadow-rehearsal@v1";
+  readonly environment: "integration";
+  readonly purpose: "synthetic-money-import-atomicity";
+  readonly accountId: string;
+  readonly databaseName: string;
+  readonly databaseId: string;
+  readonly stageOriginReceiptPath: string;
+  readonly stageOriginReceiptDigest: string;
+  readonly createDeclarationPath: string;
+  readonly createDeclarationDigest: string;
+  readonly createReceiptPath: string;
+  readonly createReceiptDigest: string;
+  readonly reviewPath: string;
+  readonly custodyDirectory: string;
+  readonly snapshotPath: string;
+  readonly phase: MoneyRehearsalPhase;
+}
+
 export interface MoneyRehearsalInvocation {
   readonly action: "status" | "apply";
   readonly environment: "rehearsal";
+  readonly commit: string;
+}
+
+export interface IntegrationMoneyShadowRehearsalInvocation {
+  readonly action: "status" | "apply";
+  readonly environment: "integration";
   readonly commit: string;
 }
 
@@ -118,6 +151,10 @@ interface Binding {
   readonly importEndpoint: string;
   readonly reviewDigest: string;
   readonly sealedImportPath: string;
+  readonly authorityProfile?: "integration-shadow-oauth";
+  readonly credentialSource?: "wrangler-oauth";
+  readonly stageOriginReceiptDigest?: string;
+  readonly beforeSnapshotDigest?: string;
 }
 
 type ReviewBinding = Omit<Binding, "kind" | "reviewDigest" | "sealedImportPath"> & {
@@ -140,6 +177,8 @@ interface TerminalRecord {
   readonly diagnosticDigest: string | null;
   readonly uploadHostClass: "selected-account-r2" | "cloudflare-r2-system" | null;
   readonly presignedUriDigest: string | null;
+  readonly beforeSnapshotDigest?: string;
+  readonly afterSnapshotDigest?: string;
 }
 
 const hash = (bytes: string | Uint8Array): string =>
@@ -422,7 +461,7 @@ function protectedDirectory(path: string): void {
   }
 }
 
-function protectedBytes(path: string, label: string): Buffer {
+function protectedBytes(path: string, label: string, maxBytes = 1024 * 1024): Buffer {
   if (!isAbsolute(path) || !relative(REPOSITORY, path).startsWith(".."))
     throw preflightError(`${label} must be outside the repository`);
   protectedDirectory(dirname(path));
@@ -433,7 +472,7 @@ function protectedBytes(path: string, label: string): Buffer {
     stat.nlink !== 1 ||
     (stat.mode & 0o077) !== 0 ||
     (typeof process.getuid === "function" && stat.uid !== process.getuid()) ||
-    stat.size > 1024 * 1024
+    stat.size > maxBytes
   ) {
     throw preflightError(`${label} must be owned 0600 regular file`);
   }
@@ -480,7 +519,37 @@ function writeOnce(path: string, value: string | Uint8Array): void {
   }
 }
 
-function validateDeclaration(value: MoneyRehearsalDeclaration): void {
+function validateDeclaration(
+  value: MoneyRehearsalDeclaration | IntegrationMoneyShadowRehearsalDeclaration,
+): void {
+  if (value.kind === "takoserver.integration-money-shadow-rehearsal@v1") {
+    if (
+      Object.keys(value).sort().join(",") !==
+        "accountId,createDeclarationDigest,createDeclarationPath,createReceiptDigest,createReceiptPath,custodyDirectory,databaseId,databaseName,environment,kind,phase,purpose,reviewPath,snapshotPath,stageOriginReceiptDigest,stageOriginReceiptPath" ||
+      value.environment !== "integration" ||
+      value.purpose !== "synthetic-money-import-atomicity" ||
+      !ACCOUNT.test(value.accountId) ||
+      !/^takoserver-ms-[0-9a-f]{32}$/u.test(value.databaseName) ||
+      !UUID.test(value.databaseId) ||
+      !SHA.test(value.stageOriginReceiptDigest) ||
+      !SHA.test(value.createDeclarationDigest) ||
+      !SHA.test(value.createReceiptDigest) ||
+      !PHASES.includes(value.phase)
+    )
+      throw preflightError("money shadow rehearsal requires exact integration-only declaration");
+    protectedDirectory(value.custodyDirectory);
+    for (const path of [
+      value.stageOriginReceiptPath,
+      value.createDeclarationPath,
+      value.createReceiptPath,
+      value.reviewPath,
+      value.snapshotPath,
+    ]) {
+      if (!isAbsolute(path) || !relative(REPOSITORY, path).startsWith(".."))
+        throw preflightError("money shadow evidence must stay outside repository");
+    }
+    return;
+  }
   if (
     !record(value) ||
     Object.keys(value).sort().join(",") !==
@@ -502,7 +571,104 @@ function validateDeclaration(value: MoneyRehearsalDeclaration): void {
   }
 }
 
-function validateCreation(value: MoneyRehearsalDeclaration): void {
+function validateCreation(
+  value: MoneyRehearsalDeclaration | IntegrationMoneyShadowRehearsalDeclaration,
+): void {
+  if (value.kind === "takoserver.integration-money-shadow-rehearsal@v1") {
+    const origin = readMoneyShadowOrigin(
+      value.stageOriginReceiptPath,
+      value.stageOriginReceiptDigest,
+      value.accountId,
+    );
+    if (value.databaseId === origin.stagingDatabaseId)
+      throw preflightError("money shadow rehearsal cannot select the staging D1 identity");
+    const original = moneyShadowProtectedBytes(
+      value.createDeclarationPath,
+      "shadow D1 create declaration",
+    );
+    const receipt = moneyShadowProtectedBytes(
+      value.createReceiptPath,
+      "shadow D1 terminal create receipt",
+    );
+    if (
+      moneyShadowHash(original) !== value.createDeclarationDigest ||
+      moneyShadowHash(receipt) !== value.createReceiptDigest
+    )
+      throw preflightError("shadow D1 creation evidence changed");
+    let originalJson: unknown;
+    let receiptJson: unknown;
+    try {
+      originalJson = JSON.parse(original.toString("utf8"));
+      receiptJson = JSON.parse(receipt.toString("utf8"));
+    } catch {
+      throw preflightError("shadow D1 creation evidence is malformed");
+    }
+    if (
+      !record(originalJson) ||
+      Object.keys(originalJson).sort().join(",") !==
+        "accountId,custodyDirectory,environment,kind,name,purpose,reviewPath,stageOriginReceiptDigest,stageOriginReceiptPath" ||
+      originalJson.kind !== "takoserver.integration-money-shadow-create@v1" ||
+      originalJson.environment !== "integration" ||
+      originalJson.purpose !== "synthetic-money-import-atomicity" ||
+      originalJson.accountId !== value.accountId ||
+      originalJson.name !== value.databaseName ||
+      originalJson.stageOriginReceiptDigest !== origin.receiptDigest ||
+      !record(receiptJson) ||
+      receiptJson.kind !== "takoserver.integration-money-shadow-create-terminal@v1" ||
+      receiptJson.surface !== "takoserver-integration-money-shadow-create" ||
+      receiptJson.environment !== "integration" ||
+      receiptJson.purpose !== "synthetic-money-import-atomicity" ||
+      receiptJson.credentialSource !== "wrangler-oauth" ||
+      receiptJson.accountId !== value.accountId ||
+      receiptJson.databaseName !== value.databaseName ||
+      receiptJson.databaseId !== value.databaseId ||
+      receiptJson.stageOriginReceiptDigest !== origin.receiptDigest ||
+      receiptJson.schemaObjectCount !== 0 ||
+      !SHA.test(String(receiptJson.bindingDigest)) ||
+      !SHA.test(String(receiptJson.reviewDigest)) ||
+      !COMMIT.test(String(receiptJson.commit))
+    )
+      throw preflightError("shadow D1 creation was not terminal, empty and exact-target");
+    if (
+      value.createReceiptPath !==
+        join(String(originalJson.custodyDirectory), "create.terminal.json") ||
+      originalJson.stageOriginReceiptPath !== value.stageOriginReceiptPath ||
+      originalJson.custodyDirectory === value.custodyDirectory
+    )
+      throw preflightError("shadow D1 create custody is not independently selected");
+    const createBinding = {
+      kind: "takoserver.integration-money-shadow-create-binding@v1",
+      purpose: "synthetic-money-import-atomicity",
+      environment: "integration",
+      credentialSource: "wrangler-oauth",
+      sourceCommit: receiptJson.commit,
+      sourceDigest: origin.sourceDigest,
+      accountId: value.accountId,
+      databaseName: value.databaseName,
+      stageOrigin: origin,
+      nativeNameAbsent: true,
+    };
+    const dispatch = protectedJson(
+      join(String(originalJson.custodyDirectory), "create.dispatched.json"),
+      "shadow D1 create immutable dispatch",
+    );
+    if (
+      dispatch.kind !== "takoserver.integration-money-shadow-create-dispatch@v1" ||
+      dispatch.bindingDigest !== jsonHash(createBinding) ||
+      JSON.stringify(dispatch.binding) !== JSON.stringify(createBinding) ||
+      dispatch.reviewDigest !== receiptJson.reviewDigest ||
+      receiptJson.bindingDigest !== dispatch.bindingDigest
+    )
+      throw preflightError("shadow D1 create terminal lacks exact immutable dispatch");
+    if (
+      readMoneyShadowCreateReview(
+        String(originalJson.reviewPath),
+        String(receiptJson.bindingDigest),
+      ) !== receiptJson.reviewDigest
+    )
+      throw preflightError("shadow D1 create independent review is not retained");
+    return;
+  }
   const original = protectedBytes(value.createDeclarationPath, "rehearsal D1 create declaration");
   const receipt = protectedBytes(value.createReceiptPath, "rehearsal D1 terminal create receipt");
   if (
@@ -609,9 +775,93 @@ async function applicationDigest(
   return readWholeDatabaseDataDigest(reader, phase, names as string[]);
 }
 
+/** Local protected export is an independent byte-complete witness for the late-fault phase. */
+async function shadowSnapshot(
+  declaration: IntegrationMoneyShadowRehearsalDeclaration,
+  path: string,
+  root: string,
+  configPath: string,
+  expectedApplicationDigest: string,
+  files: readonly MigrationFile[],
+  run: NonNullable<MoneyRehearsalOptions["run"]>,
+  childEnvironment: Readonly<Record<string, string>>,
+): Promise<string> {
+  if (!existsSync(path)) {
+    const rawPath = join(root, "raw-native-export.sql");
+    let result: CommandResult;
+    try {
+      result = await run(
+        wranglerCommand([
+          "d1",
+          "export",
+          declaration.databaseName,
+          "--remote",
+          "--yes",
+          "--config",
+          configPath,
+          "--output",
+          rawPath,
+        ]),
+        { env: childEnvironment },
+      );
+      if (result.exitCode !== 0)
+        throw preflightError("money shadow native export failed before the failure probe");
+      const normalized = normalizeSnapshotDump(readFileSync(rawPath));
+      writeOnce(path, normalized.sql);
+    } catch (error) {
+      if (error instanceof Error && error.name === "DeployError") throw error;
+      throw preflightError("money shadow native export failed before the failure probe");
+    } finally {
+      rmSync(rawPath, { force: true });
+    }
+  }
+  const bytes = protectedBytes(path, "money shadow full native snapshot", 16 * 1024 * 1024);
+  return verifyMoneyShadowSnapshotBytes(bytes, expectedApplicationDigest, files);
+}
+
+export async function verifyMoneyShadowSnapshotBytes(
+  bytes: Uint8Array,
+  expectedApplicationDigest: string,
+  files: readonly MigrationFile[],
+): Promise<string> {
+  const normalized = normalizeSnapshotDump(bytes);
+  if (
+    normalized.nulBytes !== 0 ||
+    normalized.bytes !== bytes.length ||
+    hash(bytes) !== normalized.digest
+  )
+    throw preflightError("money shadow protected snapshot lost bytes or normalization");
+  const snapshot = new Database(":memory:");
+  try {
+    snapshot.exec(normalized.sql);
+    const reader = {
+      async query(_phase: unknown, _description: unknown, sql: string) {
+        return snapshot.query(sql).all() as Record<string, unknown>[];
+      },
+      async column(_phase: unknown, _description: unknown, sql: string, name: string) {
+        return (snapshot.query(sql).all() as Record<string, unknown>[]).map((row) =>
+          String(row[name]),
+        );
+      },
+    };
+    const state = await readD1SchemaState(reader as unknown as RemoteD1);
+    if (!moneyUnitCutoverSchemaMatches(state, files, "0093-fenced"))
+      throw preflightError("money shadow full export has unexpected schema");
+    if ((await applicationDigest(reader, "preflight")) !== expectedApplicationDigest)
+      throw preflightError("money shadow full export differs from all native application rows");
+    await assertMoneyNativeForeignKeys(reader, "preflight");
+    return normalized.digest;
+  } catch (error) {
+    if (error instanceof Error && error.name === "DeployError") throw error;
+    throw preflightError("money shadow protected export cannot be fully restored and checked");
+  } finally {
+    snapshot.close();
+  }
+}
+
 export async function buildMoneyRehearsalSyntheticPlan(
   files: readonly MigrationFile[],
-  declaration: MoneyRehearsalDeclaration,
+  declaration: MoneyRehearsalDeclaration | IntegrationMoneyShadowRehearsalDeclaration,
 ): Promise<SyntheticPlan> {
   const seed = fixtureSeedSql(files);
   const database = new Database(":memory:");
@@ -714,7 +964,10 @@ function readTerminal(
   return value as unknown as TerminalRecord;
 }
 
-function reviewedDigest(value: MoneyRehearsalDeclaration, binding: ReviewBinding): string | null {
+function reviewedDigest(
+  value: MoneyRehearsalDeclaration | IntegrationMoneyShadowRehearsalDeclaration,
+  binding: ReviewBinding,
+): string | null {
   if (!existsSync(value.reviewPath)) return null;
   const review = protectedJson(value.reviewPath, "money rehearsal independent review");
   if (
@@ -743,12 +996,34 @@ export async function runMoneyUnitRehearsal(
   invocation: MoneyRehearsalInvocation,
   options: MoneyRehearsalOptions = {},
 ): Promise<Record<string, unknown>> {
+  return runSyntheticMoneyRehearsal(declaration, invocation, options);
+}
+
+export async function runIntegrationMoneyShadowRehearsal(
+  declaration: IntegrationMoneyShadowRehearsalDeclaration,
+  invocation: IntegrationMoneyShadowRehearsalInvocation,
+  options: MoneyRehearsalOptions = {},
+): Promise<Record<string, unknown>> {
+  return runSyntheticMoneyRehearsal(declaration, invocation, options);
+}
+
+async function runSyntheticMoneyRehearsal(
+  declaration: MoneyRehearsalDeclaration | IntegrationMoneyShadowRehearsalDeclaration,
+  invocation: MoneyRehearsalInvocation | IntegrationMoneyShadowRehearsalInvocation,
+  options: MoneyRehearsalOptions,
+): Promise<Record<string, unknown>> {
+  const shadow = declaration.kind === "takoserver.integration-money-shadow-rehearsal@v1";
+  const selectedEnvironment = shadow ? "integration" : "rehearsal";
   if (
-    invocation.environment !== "rehearsal" ||
+    invocation.environment !== selectedEnvironment ||
     !COMMIT.test(invocation.commit) ||
     (invocation.action !== "status" && invocation.action !== "apply")
   )
-    throw preflightError("money rehearsal accepts only exact rehearsal status/apply");
+    throw preflightError(
+      shadow
+        ? "money shadow accepts only integration status/apply"
+        : "money rehearsal accepts only exact rehearsal status/apply",
+    );
   validateDeclaration(declaration);
   validateCreation(declaration);
   const files = readMigrationArtifact(
@@ -762,14 +1037,22 @@ export async function runMoneyUnitRehearsal(
   ) {
     throw preflightError("money rehearsal apply uses only this reviewed worktree source");
   }
-  const credential = await resolveCloudflareCredential("rehearsal", {
+  const credential = await resolveCloudflareCredential(selectedEnvironment, {
     ...(options.cloudflareEnvironment === undefined
       ? {}
       : { cloudflareEnvironment: options.cloudflareEnvironment }),
     ...(options.run === undefined ? {} : { run: options.run }),
   });
-  if (credential.source !== "api-token")
-    throw preflightError("money rehearsal requires an explicit API token");
+  if (
+    shadow
+      ? credential.source !== "oauth" || "CLOUDFLARE_API_TOKEN" in credential.childEnvironment
+      : credential.source !== "api-token"
+  )
+    throw preflightError(
+      shadow
+        ? "money shadow requires Wrangler OAuth without an API token surrogate"
+        : "money rehearsal requires an explicit API token",
+    );
   const provider =
     options.provider ??
     new CloudflareIntegrationStorageProvider(declaration.accountId, credential.token);
@@ -800,7 +1083,13 @@ export async function runMoneyUnitRehearsal(
     (previousDispatch.binding.accountId !== declaration.accountId ||
       previousDispatch.binding.databaseId !== declaration.databaseId ||
       previousDispatch.binding.createReceiptDigest !== declaration.createReceiptDigest ||
-      previousDispatch.binding.sourceCommit !== invocation.commit)
+      previousDispatch.binding.sourceCommit !== invocation.commit ||
+      (shadow &&
+        (previousDispatch.binding.authorityProfile !== "integration-shadow-oauth" ||
+          previousDispatch.binding.credentialSource !== "wrangler-oauth" ||
+          previousDispatch.binding.stageOriginReceiptDigest !==
+            declaration.stageOriginReceiptDigest)) ||
+      (!shadow && previousDispatch.binding.authorityProfile !== undefined))
   ) {
     throw preflightError("money rehearsal predecessor custody belongs to another D1");
   }
@@ -816,7 +1105,7 @@ export async function runMoneyUnitRehearsal(
       configPath,
       `${JSON.stringify(
         {
-          name: "takoserver-money-rehearsal",
+          name: shadow ? "takoserver-integration-money-shadow" : "takoserver-money-rehearsal",
           account_id: declaration.accountId,
           compatibility_date: "2026-08-17",
           d1_databases: [
@@ -903,6 +1192,36 @@ export async function runMoneyUnitRehearsal(
         ? "structured-d1-import-file"
         : "wrangler-d1-execute-remote-file";
     const endpoint = importEndpoint(declaration.accountId, declaration.databaseId);
+    if (
+      shadow &&
+      declaration.phase === "failure-probe" &&
+      dispatched !== null &&
+      !existsSync(declaration.snapshotPath)
+    )
+      throw mutationError(
+        "money shadow dispatched failure probe lost its protected before snapshot",
+      );
+    const beforeSnapshotDigest =
+      shadow && declaration.phase === "failure-probe" && exactBefore
+        ? await shadowSnapshot(
+            declaration,
+            declaration.snapshotPath,
+            root,
+            configPath,
+            beforeApplicationDigest,
+            files,
+            run,
+            credential.childEnvironment,
+          )
+        : shadow && declaration.phase === "failure-probe" && existsSync(declaration.snapshotPath)
+          ? hash(
+              protectedBytes(
+                declaration.snapshotPath,
+                "money shadow before snapshot",
+                16 * 1024 * 1024,
+              ),
+            )
+          : null;
     if (dispatched !== null) {
       const retained = dispatched.binding;
       if (
@@ -910,6 +1229,11 @@ export async function runMoneyUnitRehearsal(
         retained.databaseId !== declaration.databaseId ||
         retained.databaseName !== declaration.databaseName ||
         retained.createReceiptDigest !== declaration.createReceiptDigest ||
+        (shadow &&
+          (retained.authorityProfile !== "integration-shadow-oauth" ||
+            retained.credentialSource !== "wrangler-oauth" ||
+            retained.stageOriginReceiptDigest !== declaration.stageOriginReceiptDigest)) ||
+        (!shadow && retained.authorityProfile !== undefined) ||
         retained.sourceCommit !== invocation.commit ||
         retained.sourceDigest !== sourceDigest ||
         retained.sourceSql0094Digest !== files[93]?.digest ||
@@ -919,6 +1243,9 @@ export async function runMoneyUnitRehearsal(
         retained.wranglerModuleDigest !== provenance.wranglerModuleDigest ||
         retained.importTransport !== transport ||
         retained.importEndpoint !== endpoint ||
+        (shadow &&
+          declaration.phase === "failure-probe" &&
+          retained.beforeSnapshotDigest !== beforeSnapshotDigest) ||
         !isAbsolute(retained.sealedImportPath) ||
         !relative(declaration.custodyDirectory, retained.sealedImportPath).startsWith(
           `money-${declaration.phase}-`,
@@ -943,7 +1270,19 @@ export async function runMoneyUnitRehearsal(
         (!matchesExpected ||
           terminal.afterShapeDigest !== current.shapeDigest ||
           terminal.afterApplicationDigest !== observedApplication ||
-          terminal.afterFinancialDigest !== observedFinancial)
+          terminal.afterFinancialDigest !== observedFinancial ||
+          (shadow &&
+            declaration.phase === "failure-probe" &&
+            (terminal.beforeSnapshotDigest !== beforeSnapshotDigest ||
+              terminal.afterSnapshotDigest !== beforeSnapshotDigest ||
+              !existsSync(`${declaration.snapshotPath}.after.sql`) ||
+              hash(
+                protectedBytes(
+                  `${declaration.snapshotPath}.after.sql`,
+                  "money shadow after snapshot",
+                  16 * 1024 * 1024,
+                ),
+              ) !== terminal.afterSnapshotDigest)))
       ) {
         throw verificationError(
           "money rehearsal terminal receipt differs from native exact-after readback",
@@ -951,7 +1290,7 @@ export async function runMoneyUnitRehearsal(
       }
       return {
         kind: "takoserver.money-rehearsal-dispatched-readback@v1",
-        environment: "rehearsal",
+        environment: selectedEnvironment,
         phase: declaration.phase,
         databaseId: declaration.databaseId,
         schemaShapeDigest: current.shapeDigest,
@@ -990,6 +1329,14 @@ export async function runMoneyUnitRehearsal(
       aggregateDigest: plan.aggregateDigest,
       importDigest: hash(sql),
       sourceSql0094Digest: files[93]?.digest ?? "",
+      ...(shadow
+        ? {
+            authorityProfile: "integration-shadow-oauth" as const,
+            credentialSource: "wrangler-oauth" as const,
+            stageOriginReceiptDigest: declaration.stageOriginReceiptDigest,
+          }
+        : {}),
+      ...(beforeSnapshotDigest === null ? {} : { beforeSnapshotDigest }),
       ...provenance,
       importTransport: transport,
       importEndpoint: endpoint,
@@ -997,13 +1344,14 @@ export async function runMoneyUnitRehearsal(
     const reviewDigest = reviewedDigest(declaration, reviewBinding);
     const status = {
       kind: "takoserver.money-rehearsal-status@v1",
-      environment: "rehearsal",
+      environment: selectedEnvironment,
       phase: declaration.phase,
       databaseId: declaration.databaseId,
       databaseName: declaration.databaseName,
       schemaPhase: empty ? "empty" : exactBefore ? shape.before : shape.after,
       schemaShapeDigest: current.shapeDigest,
       importDigest: reviewBinding.importDigest,
+      ...(beforeSnapshotDigest === null ? {} : { beforeSnapshotDigest }),
       reviewBinding,
       reviewBindingDigest: jsonHash(reviewBinding),
       custody: terminal === null ? (dispatched === null ? null : "dispatched") : "terminal",
@@ -1017,11 +1365,26 @@ export async function runMoneyUnitRehearsal(
     if (reviewDigest === null)
       throw preflightError("money rehearsal requires protected phase-specific independent review");
     await qualifySource({
-      environment: "rehearsal",
+      environment: selectedEnvironment,
       commit: invocation.commit,
       policy: "clean-remote",
       run,
     });
+    validateCreation(declaration);
+    if (reviewedDigest(declaration, reviewBinding) !== reviewDigest)
+      throw preflightError("money rehearsal independent review changed before dispatch");
+    if (
+      beforeSnapshotDigest !== null &&
+      (!shadow ||
+        hash(
+          protectedBytes(
+            declaration.snapshotPath,
+            "money shadow before snapshot",
+            16 * 1024 * 1024,
+          ),
+        ) !== beforeSnapshotDigest)
+    )
+      throw preflightError("money shadow protected before snapshot changed before dispatch");
     const [identityNow, inventoryNow] = await Promise.all([
       provider.getD1(declaration.databaseId),
       provider.listD1(declaration.databaseName),
@@ -1157,6 +1520,23 @@ export async function runMoneyUnitRehearsal(
       throw verificationError(
         "money rehearsal native complete application rows differ from sealed synthetic fixture",
       );
+    const afterSnapshotDigest =
+      shadow && declaration.phase === "failure-probe"
+        ? await shadowSnapshot(
+            declaration,
+            `${declaration.snapshotPath}.after.sql`,
+            root,
+            configPath,
+            afterApplicationDigest,
+            files,
+            run,
+            credential.childEnvironment,
+          )
+        : null;
+    if (afterSnapshotDigest !== null && afterSnapshotDigest !== beforeSnapshotDigest)
+      throw verificationError(
+        "money shadow full native export bytes changed after late SQL failure",
+      );
     const converted = declaration.phase === "convert";
     if (
       (await readMoneyPreimageDigest(database, "verification", converted)) !==
@@ -1176,6 +1556,8 @@ export async function runMoneyUnitRehearsal(
       diagnosticDigest,
       uploadHostClass,
       presignedUriDigest,
+      ...(beforeSnapshotDigest === null ? {} : { beforeSnapshotDigest }),
+      ...(afterSnapshotDigest === null ? {} : { afterSnapshotDigest }),
     };
     writeOnce(
       join(declaration.custodyDirectory, `${declaration.phase}.terminal.json`),

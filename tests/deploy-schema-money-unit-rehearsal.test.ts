@@ -21,6 +21,7 @@ import {
   readMoneyRehearsalWranglerProvenance,
   reviewedFailureProbeResult,
   runMoneyUnitRehearsal,
+  verifyMoneyShadowSnapshotBytes,
 } from "../scripts/deploy/schema-money-unit-rehearsal.ts";
 
 const files = readMigrationArtifact().files;
@@ -76,6 +77,31 @@ async function allApplicationDigest(database: Database): Promise<string> {
 }
 
 describe("money-unit native rehearsal source", () => {
+  test("protected shadow snapshot restores every 0093 row byte and rejects same-schema value drift", async () => {
+    const root = mkdtempSync("/dev/shm/t/money-shadow-snapshot-test-");
+    try {
+      const plan = await buildMoneyRehearsalSyntheticPlan(files, declaration(root));
+      const full = `${plan.sql.seed}\n${(["freeze", "prepare", "classify"] as const)
+        .map((phase) => `BEGIN TRANSACTION;\n${plan.sql[phase]}\nCOMMIT;`)
+        .join("\n")}`;
+      expect(
+        await verifyMoneyShadowSnapshotBytes(Buffer.from(full), plan.application.classify, files),
+      ).toBe(sha(full));
+      const drifted = full.replace("Synthetic rehearsal", "Changed rehearsal");
+      await expect(
+        verifyMoneyShadowSnapshotBytes(Buffer.from(drifted), plan.application.classify, files),
+      ).rejects.toThrow("differs from all native application rows");
+      await expect(
+        verifyMoneyShadowSnapshotBytes(
+          Buffer.from(`${full}\nCREATE TABLE foreign_table (x TEXT);`),
+          plan.application.classify,
+          files,
+        ),
+      ).rejects.toThrow("unexpected schema");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   test("sealed synthetic 94 failure after reinstall rolls back to complete 93 fenced state", async () => {
     const root = mkdtempSync("/dev/shm/t/money-rehearsal-test-");
     const database = new Database(":memory:");
