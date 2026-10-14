@@ -120,16 +120,28 @@ export type {
   SQLiteMigrationRecord,
   SQLiteMigrationSession,
 } from "./forms/sqlite-migration-application-port.ts";
+export {
+  parseSQLiteMigrationManifest,
+  validateSQLiteMigrationPayload,
+} from "./forms/sqlite-migration-set.ts";
 export type { SQLiteDatabaseNativePort } from "./forms/sqlite-native-store-port.ts";
 export {
   createSQLiteWorkerBindingAuthority,
   type SQLiteWorkerBindingClaim,
 } from "./forms/sqlite-worker-binding-authority.ts";
-export { STATIC_ASSET_BUNDLE_FORM_URL } from "./forms/static-asset-bundle.ts";
+export {
+  parseStaticAssetBundleManifest,
+  STATIC_ASSET_BUNDLE_FORM_URL,
+  validateStaticAssetBundlePayload,
+} from "./forms/static-asset-bundle.ts";
 export {
   createStaticAssetBundleCustody,
   type StaticAssetBundleCustody,
 } from "./forms/static-asset-bundle-backend.ts";
+export {
+  parseWorkerBundleManifest,
+  validateWorkerBundlePayload,
+} from "./forms/worker-bundle.ts";
 export {
   createWorkerBundleCustody,
   createWorkerBundleHost,

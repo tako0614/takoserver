@@ -66,9 +66,21 @@ import {
   createSQLiteMigrationApplicationForm,
   SQLITE_MIGRATION_APPLICATION_BACKEND_ID,
 } from "../src/takoform-v2/forms/sqlite-migration-application-backend.ts";
+import {
+  parseSQLiteMigrationManifest,
+  validateSQLiteMigrationPayload,
+} from "../src/takoform-v2/forms/sqlite-migration-set.ts";
 import { createSQLiteWorkerBindingAuthority } from "../src/takoform-v2/forms/sqlite-worker-binding-authority.ts";
-import { STATIC_ASSET_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/static-asset-bundle.ts";
+import {
+  parseStaticAssetBundleManifest,
+  STATIC_ASSET_BUNDLE_FORM_URL,
+  validateStaticAssetBundlePayload,
+} from "../src/takoform-v2/forms/static-asset-bundle.ts";
 import { createStaticAssetBundleCustody } from "../src/takoform-v2/forms/static-asset-bundle-backend.ts";
+import {
+  parseWorkerBundleManifest,
+  validateWorkerBundlePayload,
+} from "../src/takoform-v2/forms/worker-bundle.ts";
 import {
   createWorkerBundleCustody,
   createWorkerBundleHost,
@@ -166,7 +178,10 @@ const RUNTIME_EXPORTS = [
   "parseModuleWorkerSpec",
   "parseObjectBucketSpec",
   "parseSQLiteDatabaseSpec",
+  "parseSQLiteMigrationManifest",
+  "parseStaticAssetBundleManifest",
   "parseTakoformV2PublicConfig",
+  "parseWorkerBundleManifest",
   "parseWorkerDeploymentSpec",
   "parseWorkerEndpointSpec",
   "parseWorkerVersionSpec",
@@ -190,6 +205,9 @@ const RUNTIME_EXPORTS = [
   "validateModuleWorkerUpdate",
   "validateObjectBucketUpdate",
   "validateSQLiteDatabaseUpdate",
+  "validateSQLiteMigrationPayload",
+  "validateStaticAssetBundlePayload",
+  "validateWorkerBundlePayload",
   "validateWorkerDeploymentUpdate",
   "validateWorkerEndpointUpdate",
   "validateWorkerVersionUpdate",
@@ -197,6 +215,12 @@ const RUNTIME_EXPORTS = [
 
 test("the v2 package subpath is the existing SQL and Worker Form authority, not a second registry", async () => {
   expect(Object.keys(extension).sort()).toEqual([...RUNTIME_EXPORTS].sort());
+  expect(extension.parseSQLiteMigrationManifest).toBe(parseSQLiteMigrationManifest);
+  expect(extension.validateSQLiteMigrationPayload).toBe(validateSQLiteMigrationPayload);
+  expect(extension.parseStaticAssetBundleManifest).toBe(parseStaticAssetBundleManifest);
+  expect(extension.validateStaticAssetBundlePayload).toBe(validateStaticAssetBundlePayload);
+  expect(extension.parseWorkerBundleManifest).toBe(parseWorkerBundleManifest);
+  expect(extension.validateWorkerBundlePayload).toBe(validateWorkerBundlePayload);
   expect(extension.createV2WorkerPublicationState).toBe(createV2WorkerPublicationState);
   expect(extension.createV2WorkflowSelectedMaterials).toBe(createV2WorkflowSelectedMaterials);
   expect(extension.createWorkerBundleCustody).toBe(createWorkerBundleCustody);
