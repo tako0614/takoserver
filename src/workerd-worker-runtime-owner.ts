@@ -1362,7 +1362,10 @@ async function requireSafeStateForNewOwner(
  */
 function abandonableCandidate(record: IncarnationRecord, state: PersistedOwnerState): boolean {
   return (
-    record.status === "candidate" &&
+    // A bootstrap failure before createIncarnation returns records uncertainty
+    // without a retirement intent. The same exact unactivated shape can be
+    // abandoned only after stale-child and vacant-listener proof at boot.
+    (record.status === "candidate" || record.status === "uncertain") &&
     record.operationId !== state.activeOperationId &&
     record.processIdentity !== null &&
     record.identity === null &&
@@ -2661,7 +2664,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       ownerLock.recoveredFromStaleOwner,
     );
     if (
-      ownerLock.recoveredFromStaleOwner &&
+      (ownerLock.recoveredFromStaleOwner || state.suspended) &&
       state.incarnations.some((item) => abandonableCandidate(item, state))
     ) {
       // The previous owner is a proven-dead process and never activated these

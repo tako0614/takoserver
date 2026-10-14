@@ -342,7 +342,9 @@ function makeGroup(input: {
             spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "ignore" })),
         ...(options.onSpawned === undefined ? {} : { onSpawned: options.onSpawned }),
         readiness: async (_configPath, child, mode) => {
-          const attempts = mode === "startup" ? 20 : 1;
+          // Native startup on a loaded Linux TCG target can exceed one second.
+          // Admission still requires two observations of this child's owned port.
+          const attempts = mode === "startup" ? 200 : 1;
           for (let attempt = 0; attempt < attempts; attempt += 1) {
             try {
               const before = await workerPortOwnership(options.listenerPort, child.pid);
@@ -853,6 +855,25 @@ export async function inspectWorkerdWorkerExecutionCopies(input: {
     const directEntries = await readdir(directPath).catch(() => {
       throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
     });
+    if (directEntries.length === 0 && activationInfo === null) {
+      // The native runtime prepares this private directory before its empty
+      // bootstrap starts. With no pointer, activation or publication tree,
+      // there are no execution copies to retire; keep every other shape strict.
+      const publications = await lstat(join(workersRoot, DEPLOYMENT_PUBLICATIONS_NAME)).catch(
+        (error: unknown) => {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+          throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
+        },
+      );
+      if (
+        publications === null ||
+        (publications.isDirectory() &&
+          !publications.isSymbolicLink() &&
+          (publications.mode & 0o077) === 0 &&
+          (await readdir(join(workersRoot, DEPLOYMENT_PUBLICATIONS_NAME))).length === 0)
+      )
+        return { versionUids: [], generationKeys: [], publications: [] };
+    }
     if (directEntries.length !== 1 || directEntries[0] !== WORKER_POINTER_NAME) {
       throw new WorkerdWorkerExecutionGroupError("ownership_uncertain");
     }
