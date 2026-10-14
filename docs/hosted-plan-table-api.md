@@ -28,6 +28,11 @@ with the two configured cash/credit pairs and existing row variants preserved.
 Regenerate OpenAPI, explicitly format, run focused checks and the complete local
 `bun run check`, and record exact source/results before merge after #336.
 
+The v2 source also declares Free non-stacking, but the current monthly grant
+path lacks the corresponding atomic subscription-eligibility fence. That
+separate integration and transition policy are required before live acceptance;
+this contract correction neither enforces them nor rewrites issued lots.
+
 Source can be reverted independently before publication. This is a read-schema
 correction with no durable money mutation. Staging D1/application and production
 remain untouched; cancelled 0092 and 0093/0094 root queues stay cancelled.

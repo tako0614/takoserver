@@ -146,13 +146,22 @@ guess that they were free, subscribed or purchased. New grants use this policy:
 | Paid subscription period | `plan-included` | `stripe:invoice:<invoiceId>` | End of the paid recurring line's service period |
 | Additional credit purchase | `purchased` | `stripe:<checkoutSessionId>` | None by default; any configured expiry is disclosed and pinned at purchase |
 
-Grant the configured free amount once to each eligible Organization per UTC
-month, including eligible paid Organizations. It is not per Workspace. A monthly
-job and lazy admission backfill share that reference and the month's frozen
-configuration; neither grants past, already-expired months. A zero allowance
-records eligibility without calling the positive-amount funding operation.
-Free and paid included amounts are separate explicit entitlements; there is no
-implicit free allowance multiplied by Workspace count.
+The #336 v2 source fixes `freePaidStacking: false`: the configured monthly
+Free grant belongs to Free-eligible Organizations, and a new Free grant must not
+be added to a paid entitlement. It is once per Organization per UTC month,
+not per Workspace. The job and lazy admission backfill share that reference
+and the month's frozen configuration; neither grants expired past months.
+A zero allowance records eligibility without positive-amount funding.
+
+This source policy is not yet an implemented runtime eligibility fence:
+`org-billing.ts` currently prepares the configured Free grant without checking
+subscription eligibility. Before v2 live acceptance, separate integration must
+atomically fence that grant against paid eligibility and specify upgrades,
+cancellation, period boundaries and already-issued/held Free credit. Do not
+claim the compiler enforces this policy or silently rewrite historical grants.
+The spending priority below still applies to valid previously issued lots;
+it does not authorize another Free grant when the Organization is ineligible
+for Free.
 
 Consume **free allowance first, then subscription grants, then additional
 purchased credit**. Only after eligible prepaid credit is exhausted may an
