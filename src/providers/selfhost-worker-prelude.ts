@@ -69,8 +69,13 @@ const SafePromiseThen = Promise.prototype.then;
 const SafeRegExpTest = RegExp.prototype.test;
 const SafeReadableStream = ReadableStream;
 const SafeReadableStreamLockedGet = captureGetter(ReadableStream.prototype, "locked");
+const SafeReadableStreamGetReader = ReadableStream.prototype.getReader;
+const SafeReadableStreamReaderRead = ReadableStreamDefaultReader.prototype.read;
+const SafeReadableStreamReaderCancel = ReadableStreamDefaultReader.prototype.cancel;
+const SafeReadableStreamReaderReleaseLock = ReadableStreamDefaultReader.prototype.releaseLock;
 const SafeReadableStreamControllerClose = ReadableStreamDefaultController.prototype.close;
 const SafeReadableStreamControllerEnqueue = ReadableStreamDefaultController.prototype.enqueue;
+const SafeReadableStreamControllerError = ReadableStreamDefaultController.prototype.error;
 const SafeResponse = Response;
 const SafeResponseText = Response.prototype.text;
 const SafeResponseBodyGet = captureGetter(Response.prototype, "body");
@@ -102,6 +107,7 @@ const SafeDataViewByteOffsetGet = captureGetter(DataView.prototype, "byteOffset"
 const SafeTypedArrayBufferGet = captureGetter(Uint8Array.prototype, "buffer");
 const SafeTypedArrayByteLengthGet = captureGetter(Uint8Array.prototype, "byteLength");
 const SafeTypedArrayByteOffsetGet = captureGetter(Uint8Array.prototype, "byteOffset");
+const SafeTypedArrayNameGet = captureGetter(Uint8Array.prototype, Symbol.toStringTag);
 
 function captureGetter(prototype, name) {
   let current = prototype;
@@ -155,8 +161,13 @@ export {
   SafeRegExpTest,
   SafeReadableStream,
   SafeReadableStreamLockedGet,
+  SafeReadableStreamGetReader,
+  SafeReadableStreamReaderRead,
+  SafeReadableStreamReaderCancel,
+  SafeReadableStreamReaderReleaseLock,
   SafeReadableStreamControllerClose,
   SafeReadableStreamControllerEnqueue,
+  SafeReadableStreamControllerError,
   SafeResponse,
   SafeResponseText,
   SafeResponseBodyGet,
@@ -188,6 +199,7 @@ export {
   SafeTypedArrayBufferGet,
   SafeTypedArrayByteLengthGet,
   SafeTypedArrayByteOffsetGet,
+  SafeTypedArrayNameGet,
 };
 `;
 }

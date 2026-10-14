@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { mkdir, readdir, rename, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -54,6 +55,145 @@ function bytes(value: string): ReadableStream<Uint8Array> {
   const encoded = new TextEncoder().encode(value);
   return new Blob([encoded]).stream() as ReadableStream<Uint8Array>;
 }
+
+function byteChunks(chunks: readonly Uint8Array[]): ReadableStream<Uint8Array> {
+  let index = 0;
+  return new ReadableStream(
+    {
+      pull(controller) {
+        const next = chunks[index++];
+        if (next === undefined) controller.close();
+        else controller.enqueue(next);
+      },
+    },
+    { highWaterMark: 0 },
+  );
+}
+
+async function storedText(key: string): Promise<string> {
+  const found = await store.get(BUCKET_A, key);
+  if (!found) throw new Error("object missing");
+  return await text(found.body);
+}
+
+test("undeclared streams count EOF bytes, keep conditional visibility, and release producers", async () => {
+  const original = await put("unknown", "previous");
+  let finish!: () => void;
+  const eof = new Promise<void>((resolve) => {
+    finish = resolve;
+  });
+  let started!: () => void;
+  const staged = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  let calls = 0;
+  const source = new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        if (calls++ === 0) controller.enqueue(new TextEncoder().encode("next"));
+        else {
+          started();
+          await eof;
+          controller.close();
+        }
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  const pending = store.put(BUCKET_A, "unknown", source, { ifMatch: original.etag });
+  await staged;
+  expect(await storedText("unknown")).toBe("previous");
+  finish();
+  const written = await pending;
+  expect(written).toEqual({
+    size: 4,
+    etag: createHash("sha256").update("next").digest("hex"),
+  });
+  expect(source.locked).toBe(false);
+  expect(await storedText("unknown")).toBe("next");
+  expect(
+    await failure(store.put(BUCKET_A, "unknown", bytes("refused"), { ifMatch: original.etag })),
+  ).toBe("precondition_failed");
+  expect(await storedText("unknown")).toBe("next");
+  const empty = byteChunks([new Uint8Array(0), new Uint8Array(0)]);
+  expect((await store.put(BUCKET_A, "empty-unknown", empty)).size).toBe(0);
+  expect(empty.locked).toBe(false);
+});
+
+test("unknown producer faults and non-byte chunks leave no receipt or private stage", async () => {
+  await put("kept", "previous");
+  let calls = 0;
+  const failed = new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        if (calls++ === 0) controller.enqueue(new TextEncoder().encode("prefix"));
+        else controller.error(new Error("provider diagnostic must remain private"));
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  expect(await failure(store.put(BUCKET_A, "kept", failed))).toBe("backend_unavailable");
+  expect(failed.locked).toBe(false);
+  expect(await storedText("kept")).toBe("previous");
+  let cancelled = false;
+  const malformed = new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        controller.enqueue("not bytes" as never);
+      },
+      cancel() {
+        cancelled = true;
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  const upload = await store.createMultipartUpload(BUCKET_A, "kept");
+  expect(await failure(store.uploadPart(BUCKET_A, "kept", upload.uploadId, 1, malformed))).toBe(
+    "invalid_body",
+  );
+  expect(cancelled).toBe(true);
+  expect(malformed.locked).toBe(false);
+  expect(await sql.query("SELECT * FROM selfhost_object_upload_parts", [])).toEqual([]);
+  expect(await readdir(join(root, BUCKET_A, "tmp"))).toEqual([]);
+});
+
+test("unknown multipart receipts survive reopen and assemble unequal non-final bytes", async () => {
+  const upload = await store.createMultipartUpload(BUCKET_A, "unequal-unknown");
+  const sizes = [5 * 1024 * 1024, 6 * 1024 * 1024, 7];
+  const recorded = [];
+  const expectedHash = createHash("sha256");
+  for (const [index, size] of sizes.entries()) {
+    const chunk = new Uint8Array(size).fill(index + 41);
+    expectedHash.update(chunk);
+    const receipt = await store.uploadPart(
+      BUCKET_A,
+      "unequal-unknown",
+      upload.uploadId,
+      index + 1,
+      byteChunks([chunk.subarray(0, 3), new Uint8Array(0), chunk.subarray(3)]),
+    );
+    expect(receipt.size).toBe(size);
+    recorded.push({ etag: receipt.etag, partNumber: receipt.partNumber });
+  }
+  const reopened = createSelfhostObjectStore({ sql, root });
+  const completed = await reopened.completeMultipartUpload(
+    BUCKET_A,
+    "unequal-unknown",
+    upload.uploadId,
+    recorded,
+  );
+  expect(completed.size).toBe(sizes.reduce((a, b) => a + b, 0));
+  // A multipart etag identifies the selected part receipts, not the full-body hash.
+  expect(completed.etag).toMatch(/^[0-9a-f]{64}-3$/u);
+  const expectedDigest = expectedHash.digest("hex");
+  const found = await reopened.get(BUCKET_A, "unequal-unknown");
+  expect(found?.size).toBe(completed.size);
+  expect(found?.etag).toBe(completed.etag);
+  if (!found) throw new Error("completed multipart body missing");
+  const hash = createHash("sha256");
+  for await (const chunk of found.body) hash.update(chunk);
+  expect(hash.digest("hex")).toBe(expectedDigest);
+});
 
 function filler(size: number, seed: string): ReadableStream<Uint8Array> {
   const chunk = new Uint8Array(size);

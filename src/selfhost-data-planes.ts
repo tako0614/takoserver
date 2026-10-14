@@ -12,6 +12,7 @@ import {
 import {
   MAX_SELFHOST_OBJECT_DOCUMENT_BYTES,
   SELFHOST_DATA_PLANE_KV_PATH,
+  SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT,
   SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE,
   SELFHOST_DATA_PLANE_OBJECT_PROTOCOL,
   SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER,
@@ -25,6 +26,8 @@ import {
 import { createQueueCustody, type QueueCustody } from "./queue-custody.ts";
 import {
   createSelfhostObjectStore,
+  decodeSelfhostObjectBodyFrames,
+  MAX_SELFHOST_OBJECT_BODY_WIRE_BYTES,
   prefixCeiling,
   SELFHOST_OBJECT_RECONCILE_BATCH,
   SelfhostObjectError,
@@ -530,6 +533,9 @@ export function serveSelfhostDataPlanes(
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: options.port ?? 0,
+    // This private listener carries framed 5 GiB payloads. A one-byte frame
+    // needs four header bytes; logical operation ceilings stay in the stage.
+    maxRequestBodySize: MAX_SELFHOST_OBJECT_BODY_WIRE_BYTES,
     async fetch(request) {
       const url = new URL(request.url);
       return (
@@ -1657,11 +1663,11 @@ function decodeBase64Url(value: string, maximum: number): Uint8Array {
 const OBJECT_OPERATION_FIELDS: Readonly<Record<string, readonly string[]>> = {
   head: ["key"],
   get: ["key", "range", "ifMatch", "ifNoneMatch"],
-  put: ["key", "contentLength", "contentType", "ifMatch", "ifNoneMatch"],
+  put: ["key", "contentLength", "contentType", "ifMatch", "ifNoneMatch", "bodyFormat"],
   delete: ["key"],
   list: ["prefix", "delimiter", "cursor", "limit"],
   createMultipartUpload: ["key", "contentType"],
-  uploadPart: ["key", "uploadId", "partNumber", "contentLength"],
+  uploadPart: ["key", "uploadId", "partNumber", "contentLength", "bodyFormat"],
   completeMultipartUpload: ["key", "uploadId", "parts"],
   abortMultipartUpload: ["key", "uploadId"],
 };
@@ -1710,14 +1716,23 @@ async function objectOperation(
     }
 
     case "put": {
-      const written = await store.put(bucketId, objectKey(fields.key), objectBody(request), {
-        contentLength: objectLength(fields.contentLength),
-        ...(fields.contentType === undefined
-          ? {}
-          : { contentType: objectContentType(fields.contentType) }),
-        ...(fields.ifMatch === undefined ? {} : { ifMatch: objectEtag(fields.ifMatch) }),
-        ...(fields.ifNoneMatch === undefined ? {} : { ifNoneMatch: objectAny(fields.ifNoneMatch) }),
-      });
+      const written = await store.put(
+        bucketId,
+        objectKey(fields.key),
+        objectBody(request, fields),
+        {
+          ...(Object.hasOwn(fields, "contentLength")
+            ? { contentLength: objectLength(fields.contentLength) }
+            : {}),
+          ...(fields.contentType === undefined
+            ? {}
+            : { contentType: objectContentType(fields.contentType) }),
+          ...(fields.ifMatch === undefined ? {} : { ifMatch: objectEtag(fields.ifMatch) }),
+          ...(fields.ifNoneMatch === undefined
+            ? {}
+            : { ifNoneMatch: objectAny(fields.ifNoneMatch) }),
+        },
+      );
       return objectAnswer({ ...written });
     }
 
@@ -1756,8 +1771,10 @@ async function objectOperation(
         objectKey(fields.key),
         objectUploadId(fields.uploadId),
         objectPartNumber(fields.partNumber),
-        objectBody(request),
-        { contentLength: objectLength(fields.contentLength) },
+        objectBody(request, fields),
+        Object.hasOwn(fields, "contentLength")
+          ? { contentLength: objectLength(fields.contentLength) }
+          : {},
       );
       return objectAnswer({ ...part });
     }
@@ -1849,7 +1866,19 @@ function encodeObjectDocument(value: Record<string, unknown>): string {
 }
 
 /** An absent body is an empty one; a plane never guesses a length from it. */
-function objectBody(request: Request): ReadableStream<Uint8Array> {
+function objectBody(
+  request: Request,
+  fields: Readonly<Record<string, unknown>>,
+): ReadableStream<Uint8Array> {
+  if (
+    fields.bodyFormat !== undefined &&
+    fields.bodyFormat !== SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT
+  ) {
+    throw new SelfhostObjectError("backend_unavailable");
+  }
+  if (fields.bodyFormat === SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT) {
+    return decodeSelfhostObjectBodyFrames(request.body ?? new Blob([]).stream());
+  }
   return (request.body as ReadableStream<Uint8Array> | null) ?? new Blob([]).stream();
 }
 
