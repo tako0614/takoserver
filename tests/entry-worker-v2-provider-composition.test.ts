@@ -71,7 +71,7 @@ async function fixture(name: string): Promise<{ runtime: Miniflare; env: WorkerE
   }
   const sql = createD1Sql(database);
   const now = new Date().toISOString();
-  await claimFreshStripeModeRealm(sql, "test", now);
+  await claimFreshStripeModeRealm(sql, "test");
   await sql.run("INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)", [
     ORG,
     "Worker composition",
