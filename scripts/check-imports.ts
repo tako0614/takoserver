@@ -99,7 +99,7 @@ const LAYERS: readonly Layer[] = [
     // Portable Form orchestration and the SDK index must not import it.
     name: "v2-sqlite-migration-native",
     match: /^src\/takoform-v2\/forms\/sqlite-migration-application-native\.ts$/u,
-    may: ["v2-form"],
+    may: ["core", "v2-form"],
   },
   {
     name: "v2-form",
@@ -498,7 +498,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "core",
     match:
-      /^src\/(?:ports|json|strict-json|artifact-path|cron|selfhost-socket-layout|error-envelope|route-table|request-lifetime|public-host-identity|form-ref|interface-ref|actor-abi-ref|standard-service-port|worker-class-runtime-port|worker-module-inspection-contract|worker-invocation-port|queue-v2-batch-custody-contract|queue-v2-sqlite-contract|queue-v2-sqlite-physical-fence|workflow-v2-resource-authority|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
+      /^src\/(?:ports|json|strict-json|artifact-path|cron|selfhost-socket-layout|error-envelope|route-table|request-lifetime|public-host-identity|form-ref|interface-ref|actor-abi-ref|standard-service-port|worker-class-runtime-port|worker-module-inspection-contract|worker-invocation-port|queue-v2-batch-custody-contract|queue-v2-sqlite-contract|queue-v2-sqlite-physical-fence|workflow-v2-resource-authority|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|sqlite-migration-policy|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
     // Frozen published data sits below every layer: it is bytes a release
     // pinned, not a decision any layer here may make. The wire error taxonomy
     // this Host answers by is exactly that.
