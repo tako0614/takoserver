@@ -6,6 +6,8 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
+    "./container-egress-policy": "./src/container-egress-policy.ts",
+    "./container-image-admission": "./src/container-image-admission.ts",
     "./worker-entry": "./src/entry-worker.ts",
     "./provider-extension": "./src/provider-extension.ts",
     "./provider-extension/selfhost": "./src/providers/selfhost-extension.ts",
