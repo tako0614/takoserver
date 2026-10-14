@@ -42,13 +42,13 @@ describe("shared hosted pricing source", () => {
         {
           planId: "hosted-10",
           monthlyPriceMicros: "10000000",
-          includedMicros: "12000000",
+          includedMicros: "20000000",
           stripePriceId: null,
         },
         {
           planId: "hosted-50",
           monthlyPriceMicros: "50000000",
-          includedMicros: "70000000",
+          includedMicros: "100000000",
           stripePriceId: null,
         },
       ],
@@ -176,8 +176,8 @@ describe("shared hosted pricing source", () => {
     expect(output.kind).toBe("takoserver.shared-hosted-pricing-preview@v2");
     expect(output.mode).toBe("preview");
     expect(output.plans.map((plan: { includedMicros: string }) => plan.includedMicros)).toEqual([
-      "12000000",
-      "70000000",
+      "20000000",
+      "100000000",
     ]);
     expect(output.activation).toBe("pending-stripe-price-ids");
     expect(output).not.toHaveProperty("environment");

@@ -9,13 +9,13 @@
     {
       "planId": "hosted-10",
       "monthlyPriceMicros": "10000000",
-      "includedMicros": "12000000",
+      "includedMicros": "20000000",
       "stripePriceId": null
     },
     {
       "planId": "hosted-50",
       "monthlyPriceMicros": "50000000",
-      "includedMicros": "70000000",
+      "includedMicros": "100000000",
       "stripePriceId": null
     }
   ],
