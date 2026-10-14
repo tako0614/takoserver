@@ -37,6 +37,22 @@ const DIGEST = /^sha256:[0-9a-f]{64}$/u;
 const MAXIMUM_IMPORTABLE_MODULES = 512;
 const MAXIMUM_AUXILIARY_MODULES = 512;
 const DEFAULT_WALL_TIMEOUT_MS = 2_000;
+export const SELFHOST_MODULE_INSPECTION_WALL_TIMEOUT_VARIABLE =
+  "TAKOSERVER_V2_MODULE_INSPECTION_WALL_TIMEOUT_MS" as const;
+
+/** Host-owned capacity setting; portable Resource specs cannot select this budget. */
+export function parseSelfhostModuleInspectionWallTimeout(
+  value: string | undefined,
+): number | undefined {
+  if (value === undefined) return undefined;
+  const milliseconds = Number(value);
+  if (!/^[1-9][0-9]{0,4}$/u.test(value) || milliseconds < 25 || milliseconds > 30_000) {
+    throw new TypeError(
+      `${SELFHOST_MODULE_INSPECTION_WALL_TIMEOUT_VARIABLE} must be a canonical integer between 25 and 30000`,
+    );
+  }
+  return milliseconds;
+}
 const DEFAULT_OUTPUT_LIMIT_BYTES = 64 * 1_024;
 const CHILD_EXIT_GRACE_MS = 1_000;
 const SERVICE_NAME = "inspection";
