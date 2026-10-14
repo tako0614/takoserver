@@ -638,6 +638,15 @@ for (const path of walk("src")) {
       /import\s+type\s+\{\s*V2Execution\s*\}\s+from\s+["']\.\/takoform-v2\/types\.ts["'];/u.test(
         readFileSync(path, "utf8"),
       );
+    // This Host-only Linux adapter reuses one pure policy decision. Other
+    // domain imports remain unavailable to adapters, including this module.
+    const exactLinuxContainerEgressPolicyEdge =
+      path === "src/providers/linux-container-egress.ts" &&
+      target === "src/container-egress-policy.ts" &&
+      localImportsOf(path).filter((candidate) => candidate === target).length === 1 &&
+      /^import\s+\{\s*evaluateContainerEgress\s*\}\s+from\s+["']\.\.\/container-egress-policy\.ts["'];$/mu.test(
+        readFileSync(path, "utf8"),
+      );
     // The public operator-extension seam may name only this exact native
     // Queue authority port. Keep the dependency narrow; do not admit the
     // v2-queue-manager layer to package-surface in general.
@@ -691,6 +700,7 @@ for (const path of walk("src")) {
     if (
       !layer.may.includes(targetLayer.name) &&
       !exactExecutionTypeEdge &&
+      !exactLinuxContainerEgressPolicyEdge &&
       !exactQueueProviderExtensionEdge &&
       !exactSchedulerProviderExtensionEdge
     ) {
@@ -752,6 +762,8 @@ const HOST_ONLY = [
   "src/selfhost-workflow-serving.ts",
   "src/selfhost-workflow-http-transport.ts",
   "src/providers/docker-http-revision.ts",
+  // Applies native Linux network namespace/firewall policy, outside Workers.
+  "src/providers/linux-container-egress.ts",
   "src/providers/selfhost-container-lifecycle.ts",
   "src/providers/selfhost-container-runtime.ts",
   "src/providers/selfhost-container-endpoint.ts",
