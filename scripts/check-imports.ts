@@ -578,9 +578,19 @@ const LAYERS: readonly Layer[] = [
       /^src\/(?:index|provider-extension|workflow-runtime|workflow-runtime-transport|workflow-runtime-workerd)\.ts$|^src\/takoform\/integration-actor-(?:host|form-authority)\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "app", "package-surface"],
   },
+  {
+    // The shared monetary source is domain data; the hosted runtime pins its
+    // commercial terms while Price identities are resolved separately.
+    name: "domain",
+    match: /^src\/shared-hosted-pricing\.ts$/u,
+    may: ["core", "domain", "release-data"],
+  },
 ];
 
 function layerOf(path: string): Layer | undefined {
+  if (path === "config/shared-hosted-pricing.json") {
+    return LAYERS.find((layer) => layer.name === "domain");
+  }
   // Unpublished source projections are domain inputs, not released data or
   // authority bundles. Their presence cannot confer publisher verification.
   if (path === "src/generated/takoform-forward-candidate-catalog.ts") {

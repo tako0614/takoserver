@@ -21,9 +21,10 @@ realization passes the same string through as `TAKOSERVER_HOSTED_PRICING`; it
 does not add another secret requirement. Omitting `hostedPricing` preserves the
 existing behavior.
 
-The hosted input remains the same operator-authored table: all three
-plan IDs, the monthly Stripe Price and its expected price, included credit,
-and usage tariffs are required configuration. Both products receive that table
+The hosted input is an operator-authored table. Version 1 has one paid plan;
+version 2 binds Free, both finalized paid plans, and usage to the shared USD
+source. Monthly Stripe Price IDs and expected prices, included allowances,
+and usage tariffs are required in activated configuration. Both products receive the table
 from `GET /v1/organizations/{organizationId}/payments/subscription`.
 
 Hosted pricing is optional. Its presence requires a matching billing config,
@@ -45,9 +46,10 @@ expired Checkout or a completed, canceled subscription permits a new reference.
 
 `PATCH /payments/subscription` accepts `{reference, cancelAtPeriodEnd}` with the
 same write authority. It schedules/withdraws end-of-period cancellation without
-proration. The current configured table has one subscription tier. A plan/price
+proration. The version 2 table has USD 10 and USD 50 subscription tiers. A plan/price
 rollout is explicit configuration and processor work, never a caller-supplied
-amount. `GET` requires `wallet:read` and reports status and verified paid-through
+amount. Checkout selects the requested plan ID; invoices select their pinned
+plan ID and grant only its immutable allowance. `GET` requires `wallet:read` and reports status and verified paid-through
 coverage; an `active` status alone does not enable paid features.
 Coverage is derived from committed grants and refunds on every read; a delayed
 subscription projection cannot restore a fully refunded period. Refund debt

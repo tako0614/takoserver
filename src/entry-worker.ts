@@ -1016,6 +1016,7 @@ async function composeApp(
       identityProviders,
       settlement,
       ...(billingConfig ? { billingConfig } : {}),
+      hostedPaidFreeExclusion: Boolean(hostedPricing),
       ...(checkout ? { checkout } : {}),
       ...(paymentEvents ? { paymentEvents } : {}),
       ...(operatorPaymentsReconcile ? { operatorPaymentsReconcile } : {}),
