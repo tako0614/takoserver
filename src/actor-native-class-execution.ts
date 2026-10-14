@@ -416,7 +416,7 @@ export interface NativeActorExecutionOptions {
 export interface NativeActorExecutionResult {
   fetch(request: Request, socketNonce?: string): Promise<Response>;
   takeUpgrade(value: unknown, socketNonce: string): UpgradeRecord | null;
-  alarm(signal: AbortSignal): Promise<void>;
+  alarm(signal: AbortSignal, socketNonce?: string): Promise<void>;
   socketMessage(
     socket: object | string,
     data: string | Uint8Array,
@@ -470,7 +470,7 @@ export function createNativeActorExecution(
     },
   });
   type SocketTurn = {
-    readonly kind: "fetch" | "message" | "close" | "error";
+    readonly kind: "fetch" | "alarm" | "message" | "close" | "error";
     readonly nonce: string;
     readonly port: NativeActorSocketPort;
   };
@@ -547,6 +547,8 @@ export function createNativeActorExecution(
           acceptedOptions?: { readonly protocol?: string; readonly attachment?: Uint8Array },
         ): Promise<{ readonly response: Response; readonly socket: object }> {
           const turn = socketTurn;
+          if (profile.kind === "v2" && turn !== undefined && turn.kind !== "fetch")
+            throw new ActorRuntimeError("invalid_upgrade");
           if (turn?.kind !== "fetch" || !SafeRequestMethod || !SafeRequestHeaders)
             return socketUnavailable();
           let method: string;
@@ -698,8 +700,10 @@ export function createNativeActorExecution(
       SafeReflectApply(SafeWeakMapDelete, upgrades, [source]);
       return { ...record, headers: snapshot };
     },
-    async alarm(signal: AbortSignal): Promise<void> {
-      await execution.dispatch({ kind: "alarm" }, createActorTurn(signal));
+    async alarm(signal: AbortSignal, socketNonce?: string): Promise<void> {
+      await withSocketTurn("alarm", socketNonce, async () => {
+        await execution.dispatch({ kind: "alarm" }, createActorTurn(signal));
+      });
     },
     async socketMessage(
       socket: object | string,
