@@ -69,7 +69,7 @@ test("a never-billed 97 predecessor upgrades and pins LIVE atomically, then rest
     db.exec(`INSERT INTO principals (id, provider, provider_subject, email, display_name, created_at)
       VALUES ('principal_1', 'google', 'subject_1', 'a@example.test', 'A', '2026-10-14T00:00:00.000Z')`);
     expect(migrateSqlite(db, { stripeMode: "live" })).toEqual({
-      applied: ["0098_stripe_mode_realm.sql"],
+      applied: MIGRATIONS.slice(97).map((migration) => migration.name),
       alreadyApplied: 97,
     });
     const committed = snapshot(db);
@@ -79,7 +79,7 @@ test("a never-billed 97 predecessor upgrades and pins LIVE atomically, then rest
     const restarted = new Database(path);
     expect(migrateSqlite(restarted, { stripeMode: "live" })).toEqual({
       applied: [],
-      alreadyApplied: 98,
+      alreadyApplied: MIGRATIONS.length,
     });
     expect(() => migrateSqlite(restarted, { stripeMode: "test" })).toThrow("not pinned to 'test'");
     expect(snapshot(restarted)).toEqual(committed);
@@ -93,7 +93,7 @@ test("fresh selected TEST and LIVE boots claim the realm before any financial se
   for (const stripeMode of ["test", "live"] as const) {
     const db = new Database(":memory:");
     const report = migrateSqlite(db, { stripeMode });
-    expect(report.applied).toHaveLength(98);
+    expect(report.applied).toHaveLength(MIGRATIONS.length);
     expect(db.query("SELECT mode FROM stripe_mode_realm").all()).toEqual([{ mode: stripeMode }]);
     expect(migrateSqlite(db, { stripeMode }).applied).toEqual([]);
     db.close();
