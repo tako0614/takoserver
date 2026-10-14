@@ -63,26 +63,39 @@ remain part of that acceptance. Pending timers or unfinished I/O prevent
 hibernation; forced shutdown can disconnect a socket and is a separate case.
 
 The pinned upstream's test-only `workerd:unsafe.evict(stub, { webSockets:
-"hibernate" })` is a candidate deterministic local driver: it preserves
-storage and hibernatable sockets and rebuilds the owner on the next event.
-The same pin declares the experimental `unsafe_module` compatibility flag.
-This must be confined to a Host-private test module and never projected to
-tenant code. Its availability and behavior on the selected executable have
-not yet been executed after the repair. An `abort`, process kill, or socket
-reconnect is not an equivalent hibernation test.
+"hibernate" })` preserves storage and hibernatable sockets and rebuilds the
+owner on the next event. The fixture invokes it from an isolated test driver
+service with `unsafe_module`; the actual owner's and tenant's closed module
+graphs stay unchanged. Core settlement snapshots retain the existing HMAC,
+actor, graph and observation-stamp checks. These fixture snapshots do not
+qualify the production Host's listener ownership or a resource DELETE barrier.
+An `abort`, process kill, or socket reconnect is not an equivalent test.
 
 The source also gives an admitted alarm the existing socket context with a
 fresh owner-local nonce, current ABI profile and retained Version fences.
 Alarm list/get/send/attachment operations share that turn; an alarm has no
 original client upgrade and cannot accept a new connection. The nonce stops
 working when the turn settles. Focused source tests pass, including stale
-nonce, profile mismatch and unknown retirement refusal. Native repaired
-hibernation/alarm qualification and independent hosted staging remain pending.
+nonce, profile mismatch and unknown retirement refusal. On the pinned native
+artifact, the repaired maximum attachment survived genuine owner eviction on
+one open client/socket ID with a new constructor marker and the same digest;
+an admitted alarm listed that socket, read the bytes and sent on it.
+
+The same native regression then exposed a separate terminal transport failure:
+the close callback completed and reclaimed its payload, but the client stayed
+in `CLOSING`. The owner uses compatibility date `2026-01-01`, which requires an
+explicit reciprocal native Close frame. The candidate owner now replies after
+the terminal callback and Host completion attempt, inside the existing event
+tail before attachment release. Reserved no-status code1005 is never emitted.
+An unknown Host completion still rejects and retains poisoned custody even if
+the physical transport closes. The final repaired native terminal case and
+independent hosted staging remain pending.
 
 Primary platform references:
 
 - [WebSocket attachment API](https://developers.cloudflare.com/durable-objects/best-practices/websockets/#extended-methods)
 - [Synchronous owner KV API](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/#synchronous-kv-api)
 - [Durable Object lifecycle](https://developers.cloudflare.com/durable-objects/concepts/durable-object-lifecycle/)
+- [Native close handler and compatibility boundary](https://developers.cloudflare.com/durable-objects/api/base/#websocketclose)
 - [Facet abort and retained storage](https://developers.cloudflare.com/dynamic-workers/usage/durable-object-facets/)
 - [Pinned test-only eviction API](https://github.com/cloudflare/workerd/blob/0129b1e7aaf9afbc21cba79d215723d9839eb7a0/src/workerd/api/unsafe.h)

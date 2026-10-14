@@ -81,6 +81,7 @@ const HTTP_PRODUCER_MS = 300_000;
 const SafeHeaders = Headers;
 const SafeRequest = Request;
 const SafeReflectApply = Reflect.apply;
+const SafeWebSocketClose = WebSocket.prototype.close;
 const SafeHeadersSet = Headers.prototype.set;
 const SafeResponseJson = Response.prototype.json;
 const SafeResponseOk = Object.getOwnPropertyDescriptor(Response.prototype, "ok")?.get;
@@ -2168,6 +2169,27 @@ export function createActorNativeOwner(
           } catch {
             /* peer already gone */
           }
+        }
+      }
+      if (profile.kind === "v2" && event.kind === "close") {
+        // Older native compatibility dates require a reciprocal Close frame.
+        // Keep it inside the event tail, after callback/Host completion and
+        // before releaseInbound can reclaim terminal attachment custody.
+        try {
+          if (
+            event.code >= 1000 &&
+            event.code < 5000 &&
+            event.code !== 1004 &&
+            event.code !== 1005 &&
+            event.code !== 1006 &&
+            event.code !== 1015
+          )
+            SafeReflectApply(SafeWebSocketClose, socket, [event.code, event.reason]);
+          else SafeReflectApply(SafeWebSocketClose, socket, []);
+        } catch (error) {
+          // A physical reply cannot settle an unknown Host completion or
+          // replace its original failure; poisoned custody remains retained.
+          if (completionError === undefined) throw error;
         }
       }
       if (completionError !== undefined) throw completionError;
