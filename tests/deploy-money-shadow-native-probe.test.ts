@@ -1,13 +1,24 @@
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  assertMoneyShadowProbeNativeRefence,
   type MoneyShadowNativeProbeDeclaration,
   readExactMoneyShadowProbeWorkerPresence,
+  readMoneyShadowProbeNativeWorker,
   readMoneyShadowProbeWorkerStatus,
   runIntegrationMoneyShadowNativeProbe,
+  terminalizeMoneyShadowProbeAfterNativeRefence,
 } from "../scripts/deploy/integration-money-shadow-native-probe.ts";
 
 const digest = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
@@ -43,6 +54,39 @@ function declaration(root: string): MoneyShadowNativeProbeDeclaration {
     phase: "publish",
   };
 }
+
+function writeAuthGenesis(
+  selected: MoneyShadowNativeProbeDeclaration,
+  sourceCommit: string,
+): string {
+  const secretBytes = `${"a".repeat(64)}\n`;
+  writeFileSync(selected.authPath, secretBytes, { flag: "wx", mode: 0o600 });
+  const genesis = `${JSON.stringify({
+    kind: "takoserver.money-shadow-native-auth-genesis@v1",
+    accountId: selected.accountId,
+    databaseName: selected.databaseName,
+    databaseId: selected.databaseId,
+    workerName: `${selected.databaseName}-probe`,
+    sourceCommit,
+    sourceRemoteRef: "origin/reviewed",
+    rehearsalSourceCommit: selected.rehearsalSourceCommit,
+    rehearsalDeclarationDigest: selected.rehearsalDeclarationDigest,
+    authPath: selected.authPath,
+    authDigest: digest(secretBytes),
+    firstAbsence: "authenticated-exact-worker-get-404-code10007",
+  })}\n`;
+  writeFileSync(join(selected.custodyDirectory, "auth.genesis.json"), genesis, {
+    flag: "wx",
+    mode: 0o600,
+  });
+  return digest(genesis);
+}
+
+const oauthRun = async () => ({
+  exitCode: 0,
+  stdout: JSON.stringify({ type: "oauth", token: "test-oauth" }),
+  stderr: "",
+});
 
 describe("shadow-only native Worker owner boundary", () => {
   test("only the exact selected account and fresh Worker name are sent to provider GET", async () => {
@@ -159,9 +203,9 @@ describe("shadow-only native Worker owner boundary", () => {
             environment: "integration",
             commit: "d".repeat(40),
           },
-          { fetcher },
+          { fetcher, run: oauthRun, cloudflareEnvironment: {} },
         ),
-      ).rejects.toThrow("auth file must be generated");
+      ).rejects.toThrow("auth must originate from first publication status");
       expect(providerReads).toBe(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -172,7 +216,7 @@ describe("shadow-only native Worker owner boundary", () => {
     const root = mkdtempSync(join(tmpdir(), "money-native-retained-test-"));
     try {
       const selected = { ...declaration(root), phase: "probe" as const };
-      writeFileSync(selected.authPath, `${"a".repeat(64)}\n`, { flag: "wx", mode: 0o600 });
+      const authGenesisDigest = writeAuthGenesis(selected, "d".repeat(40));
       const binding = {
         kind: "takoserver.money-shadow-native-probe-binding@v1",
         phase: "probe",
@@ -189,6 +233,7 @@ describe("shadow-only native Worker owner boundary", () => {
         writerEpoch: digest("writer"),
         revokedEpoch: digest("revoked"),
         authDigest: digest(`${"a".repeat(64)}\n`),
+        authGenesisDigest,
         workerBindingDigest: digest("worker"),
         bundleDigest: digest("bundle"),
         configDigest: digest("config"),
@@ -214,11 +259,7 @@ describe("shadow-only native Worker owner boundary", () => {
           { action: "status", environment: "integration", commit: "d".repeat(40) },
           {
             cloudflareEnvironment: {},
-            run: async () => ({
-              exitCode: 0,
-              stdout: JSON.stringify({ type: "oauth", token: "test-oauth" }),
-              stderr: "",
-            }),
+            run: oauthRun,
             fetcher: async () => {
               providerReads += 1;
               throw new Error("unexpected provider read");
@@ -227,6 +268,241 @@ describe("shadow-only native Worker owner boundary", () => {
         ),
       ).rejects.toThrow("changed owner authority");
       expect(providerReads).toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a pre-existing shared-looking bearer without source genesis is refused", async () => {
+    const root = mkdtempSync(join(tmpdir(), "money-native-shared-auth-test-"));
+    try {
+      const selected = declaration(root);
+      writeFileSync(selected.authPath, `${"a".repeat(64)}\n`, { flag: "wx", mode: 0o600 });
+      let providerReads = 0;
+      await expect(
+        runIntegrationMoneyShadowNativeProbe(
+          selected,
+          { action: "status", environment: "integration", commit: "d".repeat(40) },
+          {
+            run: oauthRun,
+            cloudflareEnvironment: {},
+            fetcher: async () => {
+              providerReads += 1;
+              throw new Error("unexpected provider read");
+            },
+          },
+        ),
+      ).rejects.toThrow("source-generated genesis receipt is missing");
+      expect(providerReads).toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("first status generates auth genesis only after exact absence and source qualification", async () => {
+    const root = mkdtempSync(join(tmpdir(), "money-native-genesis-test-"));
+    try {
+      const selected = declaration(root);
+      const commit = "d".repeat(40);
+      const run = async (command: readonly string[]) => {
+        const suffix = command.slice(-3).join(" ");
+        const full = command.join(" ");
+        const stdout =
+          suffix === "auth token --json"
+            ? JSON.stringify({ type: "oauth", token: "test-oauth" })
+            : full === "git rev-parse HEAD"
+              ? `${commit}\n`
+              : full === "git branch --show-current"
+                ? "probe-review\n"
+                : full === "git branch -r --contains dddddddddddddddddddddddddddddddddddddddd"
+                  ? "  origin/probe-review\n"
+                  : "";
+        return { exitCode: 0, stdout, stderr: "" };
+      };
+      const present = async () => new Response("worker exists", { status: 200 });
+      await expect(
+        runIntegrationMoneyShadowNativeProbe(
+          selected,
+          { action: "status", environment: "integration", commit },
+          { run, cloudflareEnvironment: {}, fetcher: present },
+        ),
+      ).rejects.toThrow("already exists before auth genesis");
+      expect(existsSync(selected.authPath)).toBe(false);
+      const genesisPath = join(selected.custodyDirectory, "auth.genesis.json");
+      expect(existsSync(genesisPath)).toBe(false);
+      const absent = async () =>
+        Response.json(
+          { success: false, result: null, errors: [{ code: 10007 }], messages: [] },
+          { status: 404 },
+        );
+      await expect(
+        runIntegrationMoneyShadowNativeProbe(
+          selected,
+          { action: "status", environment: "integration", commit },
+          { run, cloudflareEnvironment: {}, fetcher: absent },
+        ),
+      ).rejects.toThrow("terminal synthetic rehearsal native readback");
+      expect(statSync(selected.authPath).mode & 0o777).toBe(0o600);
+      expect(statSync(genesisPath).mode & 0o777).toBe(0o600);
+      const genesis = JSON.parse(readFileSync(genesisPath, "utf8"));
+      expect(genesis).toMatchObject({
+        sourceCommit: commit,
+        sourceRemoteRef: "origin/probe-review",
+        accountId: account,
+        databaseId,
+        firstAbsence: "authenticated-exact-worker-get-404-code10007",
+      });
+      expect(genesis.authDigest).toBe(digest(readFileSync(selected.authPath, "utf8")));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("provider and malformed binding canaries cannot escape native readback", async () => {
+    const root = mkdtempSync(join(tmpdir(), "money-native-redaction-test-"));
+    try {
+      const selected = declaration(root);
+      const canary = "SECRET_NATIVE_BINDING_CANARY";
+      const versionId = "11111111-1111-4111-8111-111111111111";
+      const deploymentId = "22222222-2222-4222-8222-222222222222";
+      const bundle = "native-test-bundle";
+      const bundleDigest = digest(bundle);
+      const binding = {
+        sourceCommit: "d".repeat(40),
+        bundleDigest,
+        writerEpoch: digest("writer"),
+        revokedEpoch: digest("revoked"),
+        workerBindingDigest: digest("worker"),
+      };
+      const history = [
+        {
+          id: deploymentId,
+          created_on: "2026-10-14T00:00:00Z",
+          versions: [{ version_id: versionId, percentage: 100 }],
+        },
+      ];
+      const state = {
+        workerDeployments: async () => history,
+        workerVersion: async () => ({
+          id: versionId,
+          annotations: {
+            "workers/message": `takoserver-worker:${binding.sourceCommit}:${bundleDigest.slice(7)}`,
+          },
+          resources: {
+            bindings: [{ name: "MONEY_SHADOW_PROBE_AUTH", type: "plain_text", text: canary }],
+          },
+        }),
+        workerVersionWithModules: async () => ({
+          main_module: "worker.js",
+          modules: [
+            {
+              name: "worker.js",
+              content_type: "application/javascript+module",
+              content_base64: Buffer.from(bundle).toString("base64"),
+            },
+          ],
+        }),
+      };
+      try {
+        await readMoneyShadowProbeNativeWorker(state as never, selected, binding as never);
+        throw new Error("malformed binding was admitted");
+      } catch (error) {
+        expect(String(error)).toContain("native readback is unavailable or divergent");
+        expect(`${String(error)} ${JSON.stringify(error)}`).not.toContain(canary);
+      }
+      await expect(
+        readMoneyShadowProbeNativeWorker(
+          {
+            workerDeployments: async () => {
+              throw new Error(canary);
+            },
+          } as never,
+          selected,
+          binding as never,
+        ),
+      ).rejects.toThrow("native readback is unavailable or divergent");
+      await expect(
+        readExactMoneyShadowProbeWorkerPresence(
+          account,
+          `${databaseName}-probe`,
+          "test-oauth",
+          async () => {
+            throw new Error(canary);
+          },
+        ),
+      ).rejects.toThrow("presence GET is unavailable");
+      await expect(
+        readMoneyShadowProbeWorkerStatus(
+          "https://shadow.example.invalid",
+          "a".repeat(64),
+          async () => {
+            throw new Error(canary);
+          },
+        ),
+      ).rejects.toThrow("GET status is unavailable");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("terminal native re-fence rejects a changed Version, deployment or module", () => {
+    const expected = {
+      versionId: "11111111-1111-4111-8111-111111111111",
+      deploymentId: "22222222-2222-4222-8222-222222222222",
+      moduleDigest: digest("bundle"),
+      endpoint: "https://shadow.example.invalid",
+    };
+    expect(() => assertMoneyShadowProbeNativeRefence(expected, expected)).not.toThrow();
+    for (const changed of [
+      { ...expected, versionId: "33333333-3333-4333-8333-333333333333" },
+      { ...expected, deploymentId: "33333333-3333-4333-8333-333333333333" },
+      { ...expected, moduleDigest: digest("other-bundle") },
+      { ...expected, endpoint: "https://other.example.invalid" },
+    ])
+      expect(() => assertMoneyShadowProbeNativeRefence(expected, changed)).toThrow(
+        "changed after probe status readback",
+      );
+  });
+
+  test("probe terminal custody is never written when the post-status native re-fence drifts", async () => {
+    const root = mkdtempSync(join(tmpdir(), "money-native-refence-test-"));
+    try {
+      const selected = declaration(root);
+      const terminalPath = join(selected.custodyDirectory, "probe.terminal.json");
+      const expectedNative = {
+        versionId: databaseId,
+        deploymentId: "22222222-2222-4222-8222-222222222222",
+        moduleDigest: digest("bundle"),
+        endpoint: "https://shadow.example.invalid",
+      };
+      const input = {
+        terminalPath,
+        declaration: selected,
+        bindingDigest: digest("probe-binding"),
+        expectedNative,
+        resultDigest: digest("worker-result"),
+      };
+      await expect(
+        terminalizeMoneyShadowProbeAfterNativeRefence({
+          ...input,
+          readNative: async () => ({
+            ...expectedNative,
+            deploymentId: "33333333-3333-4333-8333-333333333333",
+          }),
+        }),
+      ).rejects.toThrow("changed after probe status readback");
+      expect(existsSync(terminalPath)).toBe(false);
+      await terminalizeMoneyShadowProbeAfterNativeRefence({
+        ...input,
+        readNative: async () => expectedNative,
+      });
+      expect(JSON.parse(readFileSync(terminalPath, "utf8"))).toMatchObject({
+        phase: "probe",
+        bindingDigest: input.bindingDigest,
+        nativeResultDigest: input.resultDigest,
+        versionId: expectedNative.versionId,
+        deploymentId: expectedNative.deploymentId,
+      });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

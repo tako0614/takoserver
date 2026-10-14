@@ -23,10 +23,17 @@ The declaration has exactly `kind: takoserver.integration-money-shadow-native-pr
 must match `takoserver-ms-<32 lowercase hex>`. The custody directory and file
 parents must already be owned `0700` directories outside the repository.
 
-Start with `phase: publish`. Publication status generates `authPath` once as
-32 random bytes encoded in lowercase hex in an owned `0600` file, then emits
-only its digest. Never reuse an existing staging, production, account, actor,
-or JWK secret. Status verifies terminal rehearsal custody and native row/schema
+Start with `phase: publish`. First publication status requires both `authPath`
+and `custodyDirectory/auth.genesis.json` to be absent. After an authenticated
+exact-name Worker absence GET and clean remote source qualification, it generates
+32 random bytes encoded in lowercase hex in an owned `0600` file and writes a
+no-overwrite `0600` genesis receipt binding the account, synthetic D1, derived
+Worker name, source commit and remote ref, rehearsal origin, first absence, auth
+path and auth digest. Subsequent status/apply requires both protected files and
+their exact match; an existing bearer without that genesis is refused. The
+genesis digest enters the publication and probe review bindings. Never reuse an
+existing staging, production, account, actor, or JWK secret. Status verifies
+terminal rehearsal custody and native row/schema
 readback, uses an exact-name Worker GET for absence, qualifies a clean remotely
 reachable source commit, builds a Wrangler dry-run bundle, seals it, and
 returns the review binding. It does not publish. An independent reviewer must
@@ -43,7 +50,9 @@ first 100% deployment, exact module bytes, D1 UUID, vars, single secret name,
 no cron, and expected Workers.dev routing. Authenticated Worker GET `/status`
 must report an absent one-use journal, the bound epoch, and an empty permit.
 Only then is `publish.terminal.json` written. Lost deploy ACK remains
-dispatched; status reconciles by native GET only, without re-upload or adoption.
+dispatched; status reconciles by native Version/binding GET and authenticated
+Worker GET `/status` only, without re-upload or adoption. Provider error bodies
+and malformed binding values are omitted from this surface's diagnostics.
 
 Next select `phase: probe` with a new phase-specific `reviewPath`. Its status
 binding includes the immutable publication terminal, exact native deployment,
@@ -54,10 +63,16 @@ target, or binding. It writes a one-use D1 journal before its fixed probes:
 the pinned current epoch changes the seeded Stripe outcome through
 `env.STATE_DB.batch`, a second-statement CHECK failure rolls back the batch,
 raw legacy Stripe INSERT/UPDATE/DELETE fail, and a revoked epoch cannot write.
-The permit must be empty. A complete journal and exact authenticated GET
-readback produce `probe.terminal.json`; unknown POST ACK allows GET-only
+The permit must be empty. After the authenticated GET status confirms the
+complete journal, the owner rereads the exact native Version, deployment,
+module and binding closure before it writes `probe.terminal.json`. Unknown
+POST ACK allows GET-only
 reconciliation, never replay. Started, failed, foreign, or partial state is
 quarantined for separately reviewed forward repair.
+
+The final native readback and terminal file write have no provider CAS between
+them. A concurrent foreign deployment in that interval remains a residual race;
+later status rereads the native identity and refuses divergent custody.
 
 The importer rehearsal and this Worker diagnostic test different native
 transports. Local SQLite source tests are not native proof. Neither synthetic
