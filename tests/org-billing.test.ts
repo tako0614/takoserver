@@ -457,12 +457,12 @@ describe("Organization wallet lifecycle", () => {
     await f.ledger.fund({
       organizationId: "org_a",
       fundingRef: "pay",
-      amountMicros: 10,
+      amountMicros: 100000,
       consumptionClass: "purchased",
     });
-    await f.billing.hold({ ...hold, reference: "h1", amountMicros: 4 });
+    await f.billing.hold({ ...hold, reference: "h1", amountMicros: 40000 });
     f.setTime("2026-10-13T00:00:00.500Z");
-    await f.billing.hold({ ...hold, reference: "h2", amountMicros: 3 });
+    await f.billing.hold({ ...hold, reference: "h2", amountMicros: 30000 });
     f.setTime("2026-10-13T00:01:00.200Z");
     swept.advanceAfterSweep("2026-10-13T00:01:00.600Z");
     await swept.billing.wallet("org_a");
@@ -473,9 +473,12 @@ describe("Organization wallet lifecycle", () => {
     expect(await states()).toEqual(["h1:expired", "h2:live"]);
     expect(await f.billing.readHold("org_a", "h2")).toMatchObject({
       status: "expired",
-      releasedMicros: 3,
+      releasedMicros: 30000,
     });
-    expect(await f.billing.wallet("org_a")).toMatchObject({ heldMicros: 0, availableMicros: 10 });
+    expect(await f.billing.wallet("org_a")).toMatchObject({
+      heldMicros: 0,
+      availableMicros: 100000,
+    });
 
     // A backlog that already exists at the request instant still refuses, and
     // a deadline equal to that instant is part of it.
@@ -504,17 +507,22 @@ describe("Organization wallet lifecycle", () => {
     await f.ledger.fund({
       organizationId: "org_a",
       fundingRef: "pay",
-      amountMicros: 10,
+      amountMicros: 100000,
       consumptionClass: "purchased",
     });
-    await f.billing.hold(hold);
+    const expiryHold = { ...hold, amountMicros: 100000 };
+    await f.billing.hold(expiryHold);
     f.setTime("2026-10-13T00:00:59.999Z");
     swept.advanceAfterSweep("2026-10-13T00:01:00.000Z");
-    await errorCode(swept.billing.capture(capture), "hold_closed", 409);
+    await errorCode(
+      swept.billing.capture({ ...capture, amountMicros: 40000, actualMicros: "40000" }),
+      "hold_closed",
+      409,
+    );
     expect(await f.billing.readHold("org_a", "run_1")).toMatchObject({
       status: "expired",
       capturedMicros: 0,
-      releasedMicros: 10,
+      releasedMicros: 100000,
     });
     expect((await f.sql.query("SELECT 1 FROM ledger WHERE type = 'capture'")).length).toBe(0);
     expect(
@@ -522,24 +530,24 @@ describe("Organization wallet lifecycle", () => {
     ).toEqual([]);
 
     // An exact replay or a release in the same window answers the expiry.
-    await f.billing.hold({ ...hold, reference: "run_2" });
+    await f.billing.hold({ ...expiryHold, reference: "run_2" });
     f.setTime("2026-10-13T00:01:59.999Z");
     swept.advanceAfterSweep("2026-10-13T00:02:00.000Z");
-    expect(await swept.billing.hold({ ...hold, reference: "run_2" })).toMatchObject({
+    expect(await swept.billing.hold({ ...expiryHold, reference: "run_2" })).toMatchObject({
       status: "expired",
-      releasedMicros: 10,
+      releasedMicros: 100000,
     });
-    await f.billing.hold({ ...hold, reference: "run_3" });
+    await f.billing.hold({ ...expiryHold, reference: "run_3" });
     f.setTime("2026-10-13T00:02:59.999Z");
     swept.advanceAfterSweep("2026-10-13T00:03:00.000Z");
     expect(await swept.billing.release("org_a", "run_3")).toMatchObject({
       status: "expired",
-      releasedMicros: 10,
+      releasedMicros: 100000,
     });
     expect(await f.billing.wallet("org_a")).toMatchObject({
-      settledMicros: 10,
+      settledMicros: 100000,
       heldMicros: 0,
-      availableMicros: 10,
+      availableMicros: 100000,
     });
     expect((await f.sql.query("SELECT 1 FROM wallet_allocation_guards")).length).toBe(0);
   });

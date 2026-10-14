@@ -4577,7 +4577,7 @@
             }
           },
           "409": {
-            "description": "`hold_closed`: the hold is no longer live; `capture_exceeds_hold`: amountMinor exceeds the hold; `measurement_conflict`: amountMinor is not min(round(actualMicros), hold amount); `reference_conflict`: a capture with different facts was already recorded",
+            "description": "`hold_closed`: the hold is no longer live; `capture_exceeds_hold`: amountMicros exceeds the hold; `measurement_conflict`: amountMicros is not the exact min(actualMicros, original held amount) in USD micros; `reference_conflict`: a capture with different facts was already recorded",
             "content": {
               "application/json": {
                 "schema": {
@@ -4858,7 +4858,7 @@
             }
           },
           "409": {
-            "description": "`measurement_conflict`: expectedMinor differs from the amount the pinned tariff computes; `reference_conflict`: the reference was recorded with different facts; `pricing_revision_unavailable`: the revision or meter is not the tariff effective at periodStart; `usage_period_crosses_tariff`: the period spans another tariff's effective time",
+            "description": "`measurement_conflict`: expectedMicros differs from the integer USD-micros amount the pinned tariff computes; `reference_conflict`: the reference was recorded with different facts; `pricing_revision_unavailable`: the revision or meter is not the tariff effective at periodStart; `usage_period_crosses_tariff`: the period spans another tariff's effective time",
             "content": {
               "application/json": {
                 "schema": {
