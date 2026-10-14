@@ -76,6 +76,10 @@ const SURFACES = [
     "takoserver-integration-money-shadow-rehearsal",
     ["irreversible", "authority", "published-identity"],
   ],
+  [
+    "takoserver-integration-money-shadow-native-probe",
+    ["irreversible", "authority", "published-identity"],
+  ],
   ["takoserver-d1-money-cutover-rehearsal", ["irreversible", "authority", "published-identity"]],
   ["takoserver-rehearsal-d1-create", ["irreversible", "authority"]],
   ["takoserver-d1-snapshot-restore", ["irreversible", "authority"]],
@@ -791,6 +795,10 @@ describe("Takoserver split deploy entrypoint", () => {
         [
           "takoserver-integration-money-shadow-rehearsal",
           "TAKOSERVER_INTEGRATION_MONEY_SHADOW_REHEARSAL_DECLARATION_PATH",
+        ],
+        [
+          "takoserver-integration-money-shadow-native-probe",
+          "TAKOSERVER_INTEGRATION_MONEY_SHADOW_NATIVE_PROBE_DECLARATION_PATH",
         ],
       ] as const) {
         const accepted = await deploy([

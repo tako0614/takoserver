@@ -20,6 +20,10 @@ import {
   type IntegrationMoneyShadowCreateDeclaration,
   runIntegrationMoneyShadowCreate,
 } from "./deploy/integration-money-shadow-create.ts";
+import {
+  type MoneyShadowNativeProbeDeclaration,
+  runIntegrationMoneyShadowNativeProbe,
+} from "./deploy/integration-money-shadow-native-probe.ts";
 import { runIntegrationOrganizationBootstrap } from "./deploy/integration-organization-bootstrap.ts";
 import { runIntegrationStorageDisposal } from "./deploy/integration-storage-disposal.ts";
 import { runIntegrationStorageGeneration } from "./deploy/integration-storage-generation.ts";
@@ -108,6 +112,8 @@ const USAGE = `takoserver deploy
     from a reviewed staging-0092 origin and canonical Wrangler OAuth, with no target adoption.
   takoserver-integration-money-shadow-rehearsal runs the same reviewed synthetic import phases
     on that exact terminal shadow D1, never on the staging D1 or ordinary rehearsal target.
+  takoserver-integration-money-shadow-native-probe publishes one fresh shadow-only diagnostic
+    Worker, then runs one fixed authenticated native D1.batch POST after separate reviews.
   takoserver-d1-snapshot-restore restores one pinned export dump into one declared empty
     rehearsal D1; the dump is NUL-normalized and the result is verified by readback, so a partial
     application is never reported as success.
@@ -160,6 +166,7 @@ type RehearsalD1CreateSurface = "takoserver-rehearsal-d1-create";
 type MoneyRehearsalSurface = "takoserver-d1-money-cutover-rehearsal";
 type MoneyShadowCreateSurface = "takoserver-integration-money-shadow-create";
 type MoneyShadowRehearsalSurface = "takoserver-integration-money-shadow-rehearsal";
+type MoneyShadowNativeProbeSurface = "takoserver-integration-money-shadow-native-probe";
 type ProductionD1FreshInitSurface = "takoserver-production-d1-fresh-init";
 type D1SnapshotRestoreSurface = "takoserver-d1-snapshot-restore";
 type StandardSurface = Exclude<
@@ -173,6 +180,7 @@ type StandardSurface = Exclude<
   | MoneyRehearsalSurface
   | MoneyShadowCreateSurface
   | MoneyShadowRehearsalSurface
+  | MoneyShadowNativeProbeSurface
   | ProductionD1FreshInitSurface
   | D1SnapshotRestoreSurface
 >;
@@ -197,7 +205,10 @@ interface InvocationBase {
 
 type Invocation =
   | (InvocationBase & {
-      readonly surface: MoneyShadowCreateSurface | MoneyShadowRehearsalSurface;
+      readonly surface:
+        | MoneyShadowCreateSurface
+        | MoneyShadowRehearsalSurface
+        | MoneyShadowNativeProbeSurface;
       readonly action: "status" | "apply";
       readonly environment: "integration";
     })
@@ -803,7 +814,8 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   }
   if (
     surfaceValue === "takoserver-integration-money-shadow-create" ||
-    surfaceValue === "takoserver-integration-money-shadow-rehearsal"
+    surfaceValue === "takoserver-integration-money-shadow-rehearsal" ||
+    surfaceValue === "takoserver-integration-money-shadow-native-probe"
   ) {
     return environment === "integration" &&
       (action === "status" || action === "apply") &&
@@ -1140,7 +1152,20 @@ function loadMoneyShadowRehearsalDeclaration(): IntegrationMoneyShadowRehearsalD
   );
 }
 
+function loadMoneyShadowNativeProbeDeclaration(): MoneyShadowNativeProbeDeclaration {
+  return loadOwnedDeclaration<MoneyShadowNativeProbeDeclaration>(
+    "TAKOSERVER_INTEGRATION_MONEY_SHADOW_NATIVE_PROBE_DECLARATION_PATH",
+    "integration money shadow native probe declaration",
+  );
+}
+
 async function dispatch(invocation: Invocation): Promise<Record<string, unknown>> {
+  if (invocation.surface === "takoserver-integration-money-shadow-native-probe") {
+    return await runIntegrationMoneyShadowNativeProbe(
+      loadMoneyShadowNativeProbeDeclaration(),
+      invocation,
+    );
+  }
   if (invocation.surface === "takoserver-integration-money-shadow-create") {
     return await runIntegrationMoneyShadowCreate(loadMoneyShadowCreateDeclaration(), invocation);
   }

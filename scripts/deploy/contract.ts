@@ -1327,6 +1327,35 @@ export const DEPLOY_CONTRACT = {
       },
     },
     {
+      surface: "takoserver-integration-money-shadow-native-probe",
+      target: "cloudflare-worker:one-fresh-integration-synthetic-money-shadow-diagnostic",
+      covers: [
+        "src/entry-money-shadow-native-probe.ts",
+        "scripts/deploy/integration-money-shadow-native-probe.ts",
+        "scripts/deploy/schema-money-unit-rehearsal.ts",
+        "src/money-cutover-sql.ts",
+        "src/sql-d1.ts",
+      ],
+      requiresScripts: [],
+      requiresTools: ["bun", "wrangler", "flock"],
+      requiresEnv: ["TAKOSERVER_INTEGRATION_MONEY_SHADOW_NATIVE_PROBE_DECLARATION_PATH"],
+      triggers: ["irreversible", "authority", "published-identity"],
+      obligations: {
+        provenance: `${exactSource} One owned 0600 TAKOSERVER_INTEGRATION_MONEY_SHADOW_NATIVE_PROBE_DECLARATION_PATH selects the terminal synthetic integration money-shadow rehearsal D1, its final permit-success receipt, a fresh derived Worker name and a new shadow-only bearer file. A clean remotely reachable commit is built through Wrangler dry-run, sealed, reviewed by exact digest and published with a source/artifact annotation. Canonical integration OAuth stays separate from Worker bearer custody; no production descriptor, ordinary staging D1 or account-wide Worker inventory is read.`,
+        "post-conditions":
+          "Publish requires exact first 100 percent native Version/deployment, module bytes, D1 UUID binding, writer and revoked epochs, one secret name, Workers.dev routing and authenticated GET status. Probe sends one fixed authenticated POST only after separate review; the Worker uses env.STATE_DB.batch to change the seeded Stripe outcome with the pinned current epoch, observe CHECK failure rollback in the second statement, reject raw legacy Stripe INSERT/UPDATE/DELETE and the revoked epoch, and leave the permit empty. GET-only journal readback must prove exact completion. This synthetic receipt grants no existing billing D1 cutover authority.",
+        reversal:
+          "No Worker adoption, D1 deletion, reset or old-cents rollback is offered. A published diagnostic Worker can be left isolated; a failed or unknown probe POST remains one-use and requires separately reviewed forward repair.",
+        "failure-handling": `${highRiskFailure} Every phase writes protected no-overwrite dispatch before its one provider mutation. An uncertain Worker deploy or POST ACK is reconciled with exact native GET or authenticated GET status only; publication and POST are never resent. Raw provider diagnostics and the bearer value are never printed.`,
+        "pre-mutation-proof":
+          "Exact terminal 14-phase rehearsal custody, native D1 identity and final financial/application typed digests precede a fresh Worker exact-name absence check. Before publish, source, sealed artifact, protected auth, review and name absence are rechecked. Before probe, the immutable native Version/bindings and absent one-use journal are rechecked.",
+        "independent-review":
+          "Separate protected 0600 review and evidence files bind the exact publish and probe phase bindings, source, artifact, D1, auth digest, native publication and prior journal status before mutation.",
+        "no-overwrite":
+          "The derived diagnostic Worker name is never adopted or reused. Publish and probe each have immutable dispatch and terminal custody; an unknown ACK never creates permission to retry.",
+      },
+    },
+    {
       surface: "takoserver-d1-money-cutover-rehearsal",
       target: "cloudflare-d1:one-explicit-created-synthetic-rehearsal-database",
       covers: [
