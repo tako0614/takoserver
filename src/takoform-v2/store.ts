@@ -1,4 +1,4 @@
-import type { Sql } from "../ports.ts";
+import type { Sql, SqlStatement } from "../ports.ts";
 import type { V2ConfiguredPrivateInputs } from "./configured-private-inputs.ts";
 import type { V2SealedPrivateInputs } from "./private-inputs.ts";
 import type { V2Action, V2AdmissionPredicate, V2Effect, V2Status } from "./types.ts";
@@ -201,6 +201,101 @@ function referenceWrites(record: AcceptRecord, referencesJson: string | null) {
   ];
 }
 
+interface CreateAcceptance {
+  readonly record: Readonly<AcceptRecord>;
+  readonly resource: Readonly<{ form: string; space: string; name: string }>;
+  readonly referencesJson: string | null;
+  readonly initialOutputJson: string;
+  readonly admission: V2AdmissionPredicate | undefined;
+}
+
+/** Own every value used by the batch and its post-await classification. */
+function captureCreateAcceptance(
+  record: AcceptRecord,
+  resource: { form: string; space: string; name: string },
+  referencesJson: string | null,
+  initialOutputJson: string,
+  admission: V2AdmissionPredicate | undefined,
+): CreateAcceptance {
+  const capturedRecord = Object.freeze({
+    ...record,
+    ...(record.privateInputs
+      ? { privateInputs: Object.freeze({ ...record.privateInputs }) }
+      : {}),
+    ...(record.configuredPrivateInputs
+      ? { configuredPrivateInputs: Object.freeze({ ...record.configuredPrivateInputs }) }
+      : {}),
+    ...(record.expectedConfiguredPrivateInputs
+      ? {
+          expectedConfiguredPrivateInputs: Object.freeze({
+            ...record.expectedConfiguredPrivateInputs,
+          }),
+        }
+      : {}),
+  });
+  const capturedAdmission = admission
+    ? Object.freeze({
+        sql: admission.sql,
+        params: Object.freeze(
+          admission.params.map((param) =>
+            param instanceof ArrayBuffer ? param.slice(0) : param,
+          ),
+        ),
+        ...(admission.conflictCode === undefined ? {} : { conflictCode: admission.conflictCode }),
+        ...(admission.detail === undefined ? {} : { detail: admission.detail }),
+      })
+    : undefined;
+  return Object.freeze({
+    record: capturedRecord,
+    resource: Object.freeze({ form: resource.form, space: resource.space, name: resource.name }),
+    referencesJson,
+    initialOutputJson,
+    admission: capturedAdmission,
+  });
+}
+
+/** Fixed Core statements only; neither the caller nor a Form supplies a batch. */
+function compileCreateAcceptance(input: CreateAcceptance): readonly SqlStatement[] {
+  const { record, resource, referencesJson, initialOutputJson, admission } = input;
+  return [
+    ...(admission
+      ? [{ sql: `SELECT 1 AS permitted WHERE (${admission.sql})`, params: admission.params }]
+      : []),
+    {
+      sql: `INSERT INTO tf_v2_resources
+            (uid, principal, form_url, space, name, backend_id, target_key,
+             active_name, generation, phase,
+             spec_json, output_json, last_operation, busy_operation)
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', ?, ?, ?, ?
+            ${admission ? `WHERE (${admission.sql})` : ""}`,
+      params: [
+        record.resourceUid,
+        record.principal,
+        resource.form,
+        resource.space,
+        resource.name,
+        record.backendId,
+        record.targetKey,
+        resource.name,
+        record.specJson,
+        initialOutputJson,
+        record.id,
+        record.id,
+        ...(admission?.params ?? []),
+      ],
+    },
+    {
+      sql: admission ? opInsertIfAccepted : opInsert,
+      params: admission
+        ? [...opParams(record), record.resourceUid, record.id, record.id, record.generation]
+        : opParams(record),
+    },
+    ...privateWrites(record),
+    ...configuredPrivateWrites(record),
+    ...referenceWrites(record, referencesJson),
+  ];
+}
+
 export function createV2Store(sql: Sql) {
   return {
     async resource(uid: string): Promise<ResourceRow | null> {
@@ -282,46 +377,21 @@ export function createV2Store(sql: Sql) {
       initialOutputJson = "{}",
       admission?: V2AdmissionPredicate,
     ): Promise<"accepted" | "dependency_conflict" | "resource_busy"> {
-      const writes = await sql.batch([
-        ...(admission
-          ? [{ sql: `SELECT 1 AS permitted WHERE (${admission.sql})`, params: admission.params }]
-          : []),
-        {
-          sql: `INSERT INTO tf_v2_resources
-            (uid, principal, form_url, space, name, backend_id, target_key,
-             active_name, generation, phase,
-             spec_json, output_json, last_operation, busy_operation)
-            SELECT ?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', ?, ?, ?, ?
-            ${admission ? `WHERE (${admission.sql})` : ""}`,
-          params: [
-            record.resourceUid,
-            record.principal,
-            resource.form,
-            resource.space,
-            resource.name,
-            record.backendId,
-            record.targetKey,
-            resource.name,
-            record.specJson,
-            initialOutputJson,
-            record.id,
-            record.id,
-            ...(admission?.params ?? []),
-          ],
-        },
-        {
-          sql: admission ? opInsertIfAccepted : opInsert,
-          params: admission
-            ? [...opParams(record), record.resourceUid, record.id, record.id, record.generation]
-            : opParams(record),
-        },
-        ...privateWrites(record),
-        ...configuredPrivateWrites(record),
-        ...referenceWrites(record, referencesJson),
-      ]);
-      if (admission && writes[0]?.rows.length !== 1)
-        return admission.conflictCode ?? "dependency_conflict";
-      if (writes[admission ? 1 : 0]?.changes !== 1 || writes[admission ? 2 : 1]?.changes !== 1) {
+      const captured = captureCreateAcceptance(
+        record,
+        resource,
+        referencesJson,
+        initialOutputJson,
+        admission,
+      );
+      const writes = await sql.batch(compileCreateAcceptance(captured));
+      const capturedAdmission = captured.admission;
+      if (capturedAdmission && writes[0]?.rows.length !== 1)
+        return capturedAdmission.conflictCode ?? "dependency_conflict";
+      if (
+        writes[capturedAdmission ? 1 : 0]?.changes !== 1 ||
+        writes[capturedAdmission ? 2 : 1]?.changes !== 1
+      ) {
         throw new Error("v2 CREATE acceptance did not persist its Resource and Operation");
       }
       return "accepted";
