@@ -24,6 +24,25 @@ const LOCAL_PRINCIPAL = "retained-local-takoserver-principal-123";
 const ATTEMPT_COOKIE = "__Host-takoserver_oidc_attempt";
 const SESSION_COOKIE = "__Host-takoserver_shared_session";
 
+const pinnedOrigins = {
+  issuer: SESSION_TEST_CONFIG.issuer,
+  publicOrigin: SESSION_TEST_CONFIG.publicOrigin,
+  consoleOrigin: SESSION_TEST_CONSOLE,
+};
+const rejectedOrigins = Object.entries(pinnedOrigins).flatMap(([field, origin]) => {
+  const hostname = new URL(origin).hostname;
+  return [
+    [`${field} arbitrary alias`, { [field]: "https://stage-alias.example.test" }],
+    [`${field} subdomain`, { [field]: `https://alias.${hostname}` }],
+    [`${field} trailing dot`, { [field]: `https://${hostname}.` }],
+    [`${field} explicit default port`, { [field]: `${origin}:443` }],
+    [`${field} alternate port`, { [field]: `${origin}:8443` }],
+    ...Object.values(pinnedOrigins)
+      .filter((other) => other !== origin)
+      .map((other) => [`${field} swapped to ${other}`, { [field]: other }]),
+  ] as [string, Record<string, string>][];
+});
+
 function cookie(response: Response, name: string): string {
   const value = response.headers
     .getSetCookie()
@@ -138,6 +157,39 @@ async function fixture(
 }
 
 describe("staging shared session against native D1 and signed issuer HTTP", () => {
+  test.each(rejectedOrigins)(
+    "refuses %s before network, store or principal side effects",
+    (_name, changes) => {
+      const calls = { fetch: 0, store: 0, principal: 0 };
+      expect(() =>
+        createSharedAuthSession({
+          config: {
+            ...SESSION_TEST_CONFIG,
+            issuer: changes.issuer ?? SESSION_TEST_CONFIG.issuer,
+            publicOrigin: changes.publicOrigin ?? SESSION_TEST_CONFIG.publicOrigin,
+          },
+          consoleOrigin: changes.consoleOrigin ?? SESSION_TEST_CONSOLE,
+          encryptionKey: new Uint8Array(32).fill(7),
+          store: () => {
+            calls.store += 1;
+            throw new Error("configuration reached store");
+          },
+          fetch: async () => {
+            calls.fetch += 1;
+            throw new Error("configuration reached network");
+          },
+          principals: {
+            async resolve() {
+              calls.principal += 1;
+              throw new Error("configuration reached principal projection");
+            },
+          },
+        }),
+      ).toThrow(TypeError);
+      expect(calls).toEqual({ fetch: 0, store: 0, principal: 0 });
+    },
+  );
+
   test("API callback owns a host cookie and bootstraps a canonical personal Workspace before ACTIVE", async () => {
     const f = await fixture();
     try {

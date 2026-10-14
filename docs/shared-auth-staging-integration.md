@@ -12,11 +12,13 @@ HTTP contract. It does not import Accounts or another product's source, and it
 does not use the existing `takos-id` Organization projection.
 
 The client requires explicit `environment: "staging"`, the registered client
-`takoserver-console-staging-v1`, distinct exact HTTPS issuer and API/RP
-origins, and a server-only client secret. Production origins and DNS trailing
-dot aliases are refused. Realized staging origins and credentials belong in
-operator configuration outside this repository; this document does not choose
-them. The registered redirect must exactly equal
+`takoserver-console-staging-v1`, the selected exact first-party staging issuer
+and API/RP origins in `SHARED_AUTH_STAGING_PROFILE`, and a server-only client
+secret. The session factory additionally requires that profile's exact Console
+origin before constructing the client or accessing storage. An arbitrary HTTPS
+origin, alias, subdomain, trailing dot, explicit port or swapped role is refused
+before any credential-bearing transport. Credentials and registration remain
+operator configuration outside this repository. The registered redirect must exactly equal
 `<api-rp-origin>/auth/oidc/callback`. The separately hosted static Console is
 only a fixed return/CORS origin. The API owns the callback and cookie: moving
 the callback to the Console would not authenticate the API's host-only session.

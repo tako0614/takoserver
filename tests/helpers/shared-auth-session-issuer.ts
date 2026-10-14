@@ -4,12 +4,13 @@ import type { SharedWorkspaceChoice } from "../../src/shared-auth-session.ts";
 
 export const SESSION_TEST_CONFIG: SharedAuthOidcConfig = {
   environment: "staging",
-  issuer: "https://auth-staging.example.test",
-  publicOrigin: "https://takoserver-api-staging.example.test",
+  issuer: "https://auth-staging.takos.jp",
+  publicOrigin: "https://takoserver-api-integration-billing-0092.shoutatomiyama0614.workers.dev",
   clientId: "takoserver-console-staging-v1",
   clientSecret: "synthetic-test-only:client+credential",
 };
-export const SESSION_TEST_CONSOLE = "https://takoserver-console-staging.example.test";
+export const SESSION_TEST_CONSOLE =
+  "https://takoserver-console-integration.shoutatomiyama0614.workers.dev";
 export const SESSION_TEST_ACCOUNT = "canonical-account-123";
 export const SESSION_TEST_PERSONAL: SharedWorkspaceChoice = {
   id: "personal-workspace-123",

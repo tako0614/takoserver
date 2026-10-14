@@ -2,6 +2,7 @@ import type { Actor } from "./auth.ts";
 import { base64UrlDecode, base64UrlEncode, bytesDigest } from "./json.ts";
 import {
   createSharedAuthOidcClient,
+  SHARED_AUTH_STAGING_PROFILE,
   type SharedAuthGrant,
   type SharedAuthIdentity,
   type SharedAuthOidcConfig,
@@ -84,6 +85,14 @@ export function createSharedAuthSession(options: {
   readonly fetch?: (request: Request) => Promise<Response>;
   readonly now?: () => number;
 }) {
+  if (
+    options.config.environment !== SHARED_AUTH_STAGING_PROFILE.environment ||
+    options.config.clientId !== SHARED_AUTH_STAGING_PROFILE.clientId ||
+    options.config.issuer !== SHARED_AUTH_STAGING_PROFILE.issuer ||
+    options.config.publicOrigin !== SHARED_AUTH_STAGING_PROFILE.publicOrigin ||
+    options.consoleOrigin !== SHARED_AUTH_STAGING_PROFILE.consoleOrigin
+  )
+    throw new TypeError("Shared RP requires the exact selected staging profile");
   const client = createSharedAuthOidcClient(options);
   const config = client.config;
   const consoleOrigin = exactConsoleOrigin(options.consoleOrigin);
