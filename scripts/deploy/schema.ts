@@ -1112,6 +1112,12 @@ export async function runD1Schema(
       options.moneyUnitCutover,
     );
   }
+  if (target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1") {
+    // The ordinary lane would apply 0095 without reinstalling the permanent
+    // stripe_events trigger dropped by its table rebuild. Keep the selected
+    // DB on the reviewed 0093/0094 route until a separate suffix owns that.
+    throw preflightError("transaction-fenced money target requires a reviewed 0095 suffix route");
+  }
   if (
     invocation.throughMigration !== undefined &&
     !SCHEMA_WAVE_BOUNDARIES.includes(invocation.throughMigration)

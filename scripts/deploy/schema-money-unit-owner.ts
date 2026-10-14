@@ -36,7 +36,7 @@ import {
 } from "./schema-money-unit-cutover.ts";
 import { exactV2MaintenanceModuleDigest } from "./schema-v2-existing-transition.ts";
 import type { DeployTarget } from "./target.ts";
-import { probeProduct } from "./worker.ts";
+import { probeMoneyCutoverFrozen, probeProduct } from "./worker.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import { inspectLiveWorkerVersion, workerVersionIdentity } from "./worker-live.ts";
 import { optionalExactPlainTextBinding, parseWorkerDeploymentHistory } from "./worker-state.ts";
@@ -99,6 +99,7 @@ interface Declaration {
   readonly databaseName: string;
   readonly bucketName: string;
   readonly workerName: string;
+  readonly writerEpoch: string;
   readonly maintenanceCommit: string;
   readonly maintenanceModuleDigest: string;
   readonly maintenanceSourceRoot: string;
@@ -388,6 +389,7 @@ function parseDeclaration(value: unknown, target: DeployTarget): Declaration {
     "workerName",
     "maintenanceCommit",
     "maintenanceModuleDigest",
+    "writerEpoch",
     "maintenanceSourceRoot",
     "maintenancePublicationReceiptPath",
     "maintenancePublicationReceiptDigest",
@@ -424,6 +426,9 @@ function parseDeclaration(value: unknown, target: DeployTarget): Declaration {
     target.d1.databaseName !== value.databaseName ||
     target.r2.bucketName !== value.bucketName ||
     target.workerName !== value.workerName ||
+    target.moneyCutoverWriterPolicy !== "transaction-fenced-usd-micros-v1" ||
+    target.moneyCutoverWriterEpoch !== value.writerEpoch ||
+    !requireSha(value.writerEpoch) ||
     !scopedWorkersDevOrigin(target) ||
     !ACCOUNT.test(target.accountId) ||
     !UUID.test(target.d1.databaseId) ||
@@ -1007,6 +1012,7 @@ function custody(directory: string): MoneyCutoverCustody {
       "classificationDigest",
       "writerDigest",
       "resumeDigest",
+      "writerEpoch",
       "reviewDigest",
       "beforeShapeDigest",
       "afterSchemaPhase",
@@ -1037,6 +1043,7 @@ function custody(directory: string): MoneyCutoverCustody {
         "classificationDigest",
         "writerDigest",
         "resumeDigest",
+        "writerEpoch",
         "reviewDigest",
         "beforeShapeDigest",
       ].every((field) => requireSha(value[field]))
@@ -1172,8 +1179,12 @@ function custody(directory: string): MoneyCutoverCustody {
 async function probe(
   origin: string,
   fetcher: NonNullable<MoneyUnitOwnerDependencies["fetcher"]>,
-  maintenance: boolean,
+  expected: "maintenance" | "guarded" | "healthy",
 ): Promise<void> {
+  if (expected === "guarded") {
+    await probeMoneyCutoverFrozen(origin, fetcher);
+    return;
+  }
   let response: Response;
   try {
     response = await fetcher(`${origin}/healthz`, {
@@ -1190,7 +1201,7 @@ async function probe(
   } catch {
     throw preflightError("money Worker health response is malformed");
   }
-  if (maintenance) {
+  if (expected === "maintenance") {
     if (
       response.status !== 503 ||
       response.headers.get("cache-control") !== "no-store" ||
@@ -1590,7 +1601,23 @@ export async function loadMoneyUnitCutoverOptions(
     );
     if (maintenance ? mode !== "pre-wallet-usd-micros-quiesced" : mode !== null)
       throw preflightError("money public Worker native mode is incorrect");
-    await probe(target.publicOrigin, fetcher, maintenance);
+    const writerPolicy = optionalExactPlainTextBinding(
+      "preflight",
+      live.history.versionId,
+      version,
+      "TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY",
+    );
+    if (writerPolicy !== "transaction-fenced-usd-micros-v1")
+      throw preflightError("money public Worker native transaction writer policy differs");
+    const writerEpoch = optionalExactPlainTextBinding(
+      "preflight",
+      live.history.versionId,
+      version,
+      "TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH",
+    );
+    if (writerEpoch !== declaration.writerEpoch || writerEpoch !== target.moneyCutoverWriterEpoch)
+      throw preflightError("money public Worker native Writer epoch differs");
+    if (maintenance) await probe(target.publicOrigin, fetcher, "maintenance");
     const after = parseWorkerDeploymentHistory(
       await selectedState.workerDeployments(target.workerName),
       "preflight",
@@ -1613,6 +1640,7 @@ export async function loadMoneyUnitCutoverOptions(
 
   return {
     phase: declaration.phase,
+    writerEpoch: declaration.writerEpoch,
     maintenanceCommit: declaration.maintenanceCommit,
     ...(declaration.resumeCommit === undefined ? {} : { resumeCommit: declaration.resumeCommit }),
     async stageOriginProof() {
@@ -1658,6 +1686,7 @@ export async function loadMoneyUnitCutoverOptions(
         moduleDigest: publicWorker.moduleDigest,
         trafficPercent: 100,
         privateMoneyWriters: 0,
+        writerEpoch: declaration.writerEpoch,
         publicPublicationDigest: publicWorker.publicPublicationDigest,
         publicSourceArtifactDigest: publicWorker.publicSourceArtifactDigest,
         ...privateProof,
@@ -1676,12 +1705,15 @@ export async function loadMoneyUnitCutoverOptions(
         deploymentId: publicWorker.deploymentId,
         versionId: publicWorker.versionId,
         trafficPercent: 100,
-        nativeHealth: "healthy",
-        oldMoneyWriters: 0,
+        writerContainmentPolicy: "transaction-fenced-usd-micros-v1",
+        writerEpoch: declaration.writerEpoch,
         publicPublicationDigest: publicWorker.publicPublicationDigest,
         publicSourceArtifactDigest: publicWorker.publicSourceArtifactDigest,
         ...privateProof,
       };
+    },
+    async resumeHealthRead(expected): Promise<void> {
+      await probe(target.publicOrigin, fetcher, expected);
     },
     async independentReview(binding: MoneyReviewBinding): Promise<MoneyReviewProof | null> {
       const value = protectedJson(

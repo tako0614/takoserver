@@ -242,6 +242,7 @@ export function workerSchemaAllowsPending(
 ): boolean {
   if (target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced") {
     if (
+      target.moneyCutoverWriterPolicy !== "transaction-fenced-usd-micros-v1" ||
       target.environment !== "integration" ||
       target.artifactBlobIoMode !== undefined ||
       (target.takoformV2?.storageLineage !== "v2-0092" &&
@@ -314,11 +315,16 @@ export function workerSchemaAllowsPending(
       resolve(sourceRepositoryRoot, "migrations"),
     );
     if (JSON.stringify(migrations.local) !== JSON.stringify(source.names)) return false;
+    // 0095 rebuilds stripe_events and drops its permanent writer trigger.
+    // A separate reviewed suffix must restore the guard in the same import.
+    if (target.moneyCutoverWriterPolicy !== undefined && migrations.applied.length > 94)
+      return false;
     if (JSON.stringify(migrations.applied) === JSON.stringify(source.names)) return true;
     // The selected 0092 generation may serve the exact reviewed 0094 cutover
     // prefix while 0095 remains an audited source-only successor. Hosted
     // subscriptions need the complete 0095 schema and cannot use this prefix.
     if (
+      target.moneyCutoverWriterPolicy !== "transaction-fenced-usd-micros-v1" ||
       target.hostedPricing !== undefined ||
       (target.takoformV2?.storageLineage !== "v2-0092" &&
         target.takoformV2?.appliedSchemaLineage !== "v2-0092") ||
@@ -455,6 +461,52 @@ export async function probeSchemaMaintenance(
     );
   }
   return { url, status: 503, traffic: "maintenance" };
+}
+
+/** Exact staged normal Worker refusal while the reviewed 0094 freeze row remains. */
+export async function probeMoneyCutoverFrozen(
+  origin: string,
+  fetcher: (input: string, init?: RequestInit) => Promise<Response>,
+): Promise<{ readonly url: string; readonly status: 503; readonly traffic: "money-frozen" }> {
+  const url = `${origin}/healthz`;
+  const response = await fetcher(url, {
+    method: "GET",
+    headers: { "cache-control": "no-cache" },
+    redirect: "error",
+  }).catch(() => {
+    throw verificationError("money cutover frozen Worker probe failed");
+  });
+  const body = (await response.json().catch(() => null)) as unknown;
+  if (
+    response.status !== 503 ||
+    response.headers.get("cache-control") !== "no-store" ||
+    response.headers.get("retry-after") !== "60" ||
+    !isRecord(body) ||
+    !isRecord(body.error) ||
+    body.error.code !== "backend_unavailable" ||
+    body.error.message !== "Host is frozen for the wallet USD-micros writer transition" ||
+    !isRecord(body.error.details) ||
+    body.error.details.reason !== "money-cutover-freeze"
+  )
+    throw verificationError("money cutover Worker did not prove exact guarded refusal");
+  return { url, status: 503, traffic: "money-frozen" };
+}
+
+/** A 0094 normal Version can be published before the reviewed freeze-row deletion. */
+export async function probeMoneyCutoverProductOrFrozen(
+  origin: string,
+  fetcher: (input: string, init?: RequestInit) => Promise<Response>,
+) {
+  const response = await fetcher(`${origin}/healthz`, {
+    method: "GET",
+    headers: { "cache-control": "no-cache" },
+    redirect: "error",
+  }).catch(() => {
+    throw verificationError("money cutover Worker health state is unavailable");
+  });
+  if (response.status === 503) return probeMoneyCutoverFrozen(origin, fetcher);
+  if (response.status === 200) return probeProduct(origin, fetcher);
+  throw verificationError("money cutover Worker health state is divergent");
 }
 
 export { authoritySensitiveWorkerPaths } from "./worker-authority-paths.ts";
@@ -652,6 +704,19 @@ export async function runWorker(
     }
 
     if (invocation.action === "status") {
+      const moneyServingProbe =
+        target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1" &&
+        target.schemaMaintenanceMode === undefined &&
+        before.migrations.applied.length === 94 &&
+        workerSchemaAllowsPending(target, before.migrations, sourceRepositoryRoot)
+          ? await probeMoneyCutoverProductOrFrozen(
+              target.publicOrigin,
+              options.fetcher ?? ((input, init) => fetch(input, init)),
+            )
+          : null;
+      const moneyServingReady =
+        moneyServingProbe === null ||
+        !("traffic" in moneyServingProbe && moneyServingProbe.traffic === "money-frozen");
       const advancedFromSelector =
         invocation.legacyPredecessorVersionId !== undefined &&
         before.history.versionId !== invocation.legacyPredecessorVersionId;
@@ -675,6 +740,9 @@ export async function runWorker(
         pendingMigrations: before.pending,
         moneyUnitSchemaReady: moneySchemaReady,
         billingSchemaReady: orgBillingSchemaReady(target, before.migrations.applied),
+        ...(moneyServingProbe === null
+          ? {}
+          : { servingReady: moneyServingReady, probe: moneyServingProbe }),
         ...(target.schemaMaintenanceMode === undefined
           ? {}
           : { maintenance: target.schemaMaintenanceMode }),
@@ -694,6 +762,7 @@ export async function runWorker(
           : {}),
         ready:
           target.schemaMaintenanceMode === undefined &&
+          moneyServingReady &&
           workerSchemaAllowsPending(target, before.migrations, sourceRepositoryRoot) &&
           (target.artifactBlobIoMode !== undefined || moneySchemaReady) &&
           stripeWebhookSchemaReady(target, before.migrations.applied) &&
@@ -1044,10 +1113,16 @@ export async function runWorker(
               target.publicOrigin,
               options.fetcher ?? ((input, init) => fetch(input, init)),
             )
-          : await probeProduct(
-              target.publicOrigin,
-              options.fetcher ?? ((input, init) => fetch(input, init)),
-            );
+          : target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1" &&
+              after.migrations.applied.length === 94
+            ? await probeMoneyCutoverProductOrFrozen(
+                target.publicOrigin,
+                options.fetcher ?? ((input, init) => fetch(input, init)),
+              )
+            : await probeProduct(
+                target.publicOrigin,
+                options.fetcher ?? ((input, init) => fetch(input, init)),
+              );
     return {
       kind: "takoserver.worker-apply@v2",
       surface: invocation.surface,
@@ -1068,6 +1143,7 @@ export async function runWorker(
       deploymentId: after.history.deploymentId,
       versionId: after.history.versionId,
       probe,
+      servingReady: !("traffic" in probe),
       ...(target.schemaMaintenanceMode === undefined
         ? {}
         : { maintenance: target.schemaMaintenanceMode }),

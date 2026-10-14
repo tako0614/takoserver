@@ -51,6 +51,8 @@ function id(index: number): string {
   return `${String(index).padStart(8, "0")}-0000-4000-8000-000000000000`;
 }
 
+const writerEpoch = sha("reviewed writer generation");
+
 const target: DeployTarget = {
   kind: "takoserver.deploy-target@v2",
   environment: "integration",
@@ -59,6 +61,8 @@ const target: DeployTarget = {
   d1: { databaseName: name, databaseId },
   r2: { bucketName: name },
   publicOrigin: "https://takoserver-api-integration.test.workers.dev",
+  moneyCutoverWriterPolicy: "transaction-fenced-usd-micros-v1",
+  moneyCutoverWriterEpoch: writerEpoch,
   signing: { currentKeyId: "key-current" },
   cloudflareProviderExecutor: {
     workerName: "private-cpe",
@@ -173,6 +177,7 @@ function fixture(selectedTarget: DeployTarget = target) {
     databaseName: name,
     bucketName: name,
     workerName: target.workerName,
+    writerEpoch,
     maintenanceCommit: source,
     maintenanceModuleDigest: sha(nativeBytes),
     maintenanceSourceRoot: root,
@@ -215,8 +220,10 @@ function fixture(selectedTarget: DeployTarget = target) {
   const requests: string[] = [];
   let deploymentPercentage = 100;
   let publicMode = true;
+  let resumeFrozen = false;
   let privateDigest = sha(nativeBytes);
   let extraPublicBinding = false;
+  let publicEpochBinding = writerEpoch;
   const state = {
     async workerDeployments(workerName: string) {
       requests.push(`deployment:${workerName}`);
@@ -267,7 +274,16 @@ function fixture(selectedTarget: DeployTarget = target) {
                   .flatMap(([binding, requirement]) =>
                     requirement === null
                       ? []
-                      : [{ name: binding, type: requirement.type, ...requirement.fields }],
+                      : [
+                          {
+                            name: binding,
+                            type: requirement.type,
+                            ...requirement.fields,
+                            ...(binding === "TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH"
+                              ? { text: publicEpochBinding }
+                              : {}),
+                          },
+                        ],
                   )
                   .concat(
                     extraPublicBinding
@@ -328,6 +344,17 @@ function fixture(selectedTarget: DeployTarget = target) {
             code: "backend_unavailable",
             message: "Host is quiesced for the wallet USD-micros schema maintenance transition",
             details: { reason: "runtime-configuration" },
+          },
+        },
+        { status: 503, headers: { "cache-control": "no-store", "retry-after": "60" } },
+      );
+    if (resumeFrozen && url.endsWith("/healthz"))
+      return Response.json(
+        {
+          error: {
+            code: "backend_unavailable",
+            message: "Host is frozen for the wallet USD-micros writer transition",
+            details: { reason: "money-cutover-freeze" },
           },
         },
         { status: 503, headers: { "cache-control": "no-store", "retry-after": "60" } },
@@ -397,8 +424,14 @@ function fixture(selectedTarget: DeployTarget = target) {
     setExtraPublicBinding(value: boolean) {
       extraPublicBinding = value;
     },
+    setPublicEpochBinding(value: string) {
+      publicEpochBinding = value;
+    },
     setPublicMode(value: boolean) {
       publicMode = value;
+    },
+    setResumeFrozen(value: boolean) {
+      resumeFrozen = value;
     },
   };
 }
@@ -631,6 +664,25 @@ describe("money unit owner adapter", () => {
     expect(f.requests.some((item) => item.includes("production"))).toBe(false);
   });
 
+  test("refuses a different native or declaration Writer epoch before cutover proof", async () => {
+    const f = fixture();
+    const options = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+    f.setPublicEpochBinding(sha("different native Writer generation"));
+    await expect(options.maintenanceProof()).rejects.toThrow();
+    const other = fixture();
+    await expect(
+      loadMoneyUnitCutoverOptions(
+        other.paths.declaration,
+        {
+          ...target,
+          moneyCutoverWriterEpoch: sha("different target Writer generation"),
+        },
+        other,
+      ),
+    ).rejects.toThrow("declaration");
+    expect(other.requests).toEqual([]);
+  });
+
   test("rejects cross-target and production before any provider read", async () => {
     const f = fixture();
     await expect(
@@ -779,12 +831,15 @@ describe("money unit owner adapter", () => {
       resumePublicationReceiptDigest,
     });
     const options = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+    f.setResumeFrozen(true);
     expect(await options.resumeProof?.()).toMatchObject({
       sourceCommit: resumeSource,
       moduleDigest: sha(resumeBytes),
-      nativeHealth: "healthy",
-      oldMoneyWriters: 0,
+      writerContainmentPolicy: "transaction-fenced-usd-micros-v1",
     });
+    await options.resumeHealthRead?.("guarded");
+    f.setResumeFrozen(false);
+    await options.resumeHealthRead?.("healthy");
     expect(f.requests).toContain(`http:${target.publicOrigin}/.well-known/takoserver`);
     f.setPublicMode(true);
     await expect(options.resumeProof?.()).rejects.toThrow();
@@ -811,6 +866,7 @@ describe("money unit owner adapter", () => {
       aggregateDigest: sha("aggregate"),
       classificationDigest: sha("classifications"),
       writerDigest: sha("writer"),
+      writerEpoch,
       reviewDigest: sha("review"),
       beforeShapeDigest: sha("shape"),
       resumeDigest: sha("none"),
@@ -848,6 +904,7 @@ describe("money unit owner adapter", () => {
         preimageDigest: sha("preimage"),
         classificationDigest: sha("classifications"),
         writerDigest: sha("writer"),
+        writerEpoch,
         resumeDigest: sha("none"),
       }),
     ).toBeNull();
@@ -871,6 +928,7 @@ describe("money unit owner adapter", () => {
       aggregateDigest: sha("aggregate"),
       classificationDigest: sha("classification"),
       writerDigest: sha("writer"),
+      writerEpoch,
       resumeDigest: sha("none"),
     } as const;
     const evidenceDigest = sha("review-evidence");
