@@ -179,6 +179,59 @@ describe("Hosted wallet composition", () => {
     ).rejects.toThrow("resolved at startup");
   });
 
+  test("postpaid launch opt-in refuses before reading any financial startup inputs", async () => {
+    let inputsRead = 0;
+    const unavailable = () => {
+      inputsRead++;
+      throw new Error("financial startup inputs must not be accessed");
+    };
+    for (const [flag, code] of [
+      [true, "postpaid_not_qualified"],
+      ["true", "invalid_postpaid_enabled"],
+      ["false", "invalid_postpaid_enabled"],
+      [null, "invalid_postpaid_enabled"],
+      [1, "invalid_postpaid_enabled"],
+    ] as const) {
+      const options = Object.defineProperties(
+        { postpaidEnabled: flag },
+        Object.fromEntries(
+          ["sql", "clock", "billingConfig", "pricing", "client", "realm"].map((key) => [
+            key,
+            { get: unavailable },
+          ]),
+        ),
+      );
+      await expect(
+        createHostedBillingComposition(
+          options as unknown as Parameters<typeof createHostedBillingComposition>[0],
+        ),
+      ).rejects.toMatchObject({ code, status: 503 });
+      await expect(
+        createCanonicalHostedBillingComposition(
+          options as unknown as Parameters<typeof createCanonicalHostedBillingComposition>[0],
+        ),
+      ).rejects.toMatchObject({ code, status: 503 });
+    }
+    expect(inputsRead).toBe(0);
+  });
+
+  test("omitted and explicit-off flags preserve the default stop policy", async () => {
+    for (const postpaidEnabled of [undefined, false]) {
+      const f = fixture();
+      const composition = await createHostedBillingComposition({
+        ...f.config,
+        warnings: warningsUnavailable,
+        postpaidEnabled,
+      });
+      expect(await composition.limitPolicy.read(ORG)).toMatchObject({
+        onLimit: "stop",
+        capabilities: { postpaid: false },
+      });
+      expect(await f.sql.query("SELECT * FROM org_wallet_limit_policy_commands")).toEqual([]);
+      expect(await f.sql.query("SELECT * FROM org_wallet_cash_exposures")).toEqual([]);
+    }
+  });
+
   test("missing durable policy guards fail startup even when the tables exist", async () => {
     const f = fixture();
     await f.sql.run("DROP TRIGGER org_wallet_limit_policy_version");
@@ -715,7 +768,13 @@ async function financialFixture() {
 describe("canonical Hosted financial composition", () => {
   test("uses one customer and the existing signed-webhook writer for first free-org top-up", async () => {
     const f = await financialFixture();
-    const composition = await createCanonicalHostedBillingComposition(f.options);
+    const composition = await createCanonicalHostedBillingComposition({
+      ...f.options,
+      postpaidEnabled: false,
+    });
+    expect((await composition.limitPolicy.read(f.organization.id)).capabilities.postpaid).toBe(
+      false,
+    );
     const app = buildApp({
       ...f.ports,
       billingConfig: f.options.billingConfig,

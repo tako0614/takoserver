@@ -392,8 +392,8 @@ separate reviewed lifecycle changes; principal replacement cannot reset credits.
 
 The desired policy vocabulary is exactly
 `"stop" | "prepaid" | "postpaid" | "on-demand"`; default is `"stop"`.
-Existing source has no durable Org policy and explicitly advertises postpaid
-as unsupported. An enum declaration is not execution capability.
+The canonical Hosted extension persists the Organization policy and advertises
+postpaid as unsupported. An enum declaration is not execution capability.
 
 | Mode | Required behavior |
 | --- | --- |
@@ -442,9 +442,18 @@ not cancel existing remote effects; serialize outstanding exposure and never
 lower a cap below paid/reserved exposure.
 
 The older settled pricing proposal rejects invoice-style postpaid at launch;
-this task requests the four-value vocabulary. Preserve the value and fail closed
-while unsupported. Whether to activate postpaid for launch is an explicit owner
-review decision, not a rename of on-demand. Staging acceptance must cover each
+this task retains the four-value vocabulary. The launch decision remains with
+Shouta. The operator-only `postpaidEnabled` composition flag defaults to `false`;
+omitting it keeps postpaid off. It is not an Organization policy field and is
+never inferred from a saved card, a paid plan, API scopes or environment mode.
+Both Hosted startup factories and the policy factory reject `true` with
+`503 postpaid_not_qualified` before accessing SQL, the clock or Stripe: postpaid
+execution and settlement have not been implemented and qualified. Invalid flag
+types are also rejected. Setting the flag alone cannot establish that capability
+or customer consent. Future activation requires Shouta's launch decision and
+separately reviewed execution, exposure and collection behavior; until then
+`capabilities.postpaid` remains `false` and postpaid commands are rejected,
+including an original command replay. Staging acceptance must cover each
 advertised available mode; unsupported modes must be visibly rejected.
 
 ## Holds and accounting invariants

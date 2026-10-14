@@ -22,6 +22,7 @@ import type { FundingSettlementVerifier } from "./ledger.ts";
 import { assertOrgBillingSchema } from "./org-billing.ts";
 import {
   assertOrgLimitPolicySchema,
+  assertOrgPostpaidLaunchGate,
   createOrgLimitPolicy,
   type OrgLimitPolicy,
   type OrgUsageWarningTransport,
@@ -138,7 +139,11 @@ export async function createHostedBillingComposition(options: {
   readonly billingConfig: BillingConfig;
   readonly paymentActivation: false;
   readonly warnings: HostedWarningDelivery;
+  /** Operator launch flag; defaults off until owner approval and qualified execution. */
+  readonly postpaidEnabled?: boolean | undefined;
 }): Promise<HostedBillingComposition> {
+  const postpaidEnabled = options.postpaidEnabled;
+  assertOrgPostpaidLaunchGate(postpaidEnabled);
   if (options.paymentActivation !== false)
     throw new TypeError("Hosted financial capabilities have not been composed");
   const config = parseBillingConfig(canonicalJson(options.billingConfig));
@@ -166,6 +171,7 @@ export async function createHostedBillingComposition(options: {
     createOrgLimitPolicy({
       sql: options.sql,
       clock: options.clock,
+      postpaidEnabled,
     }),
   );
   const status: HostedBillingStatus = Object.freeze({
@@ -231,7 +237,11 @@ export async function createCanonicalHostedBillingComposition(options: {
   readonly warnings: HostedWarningDelivery;
   readonly webhookSecret: string;
   readonly settings?: PaymentSettings;
+  /** Operator launch flag; defaults off until owner approval and qualified execution. */
+  readonly postpaidEnabled?: boolean | undefined;
 }): Promise<HostedBillingComposition> {
+  const postpaidEnabled = options.postpaidEnabled;
+  assertOrgPostpaidLaunchGate(postpaidEnabled);
   assertHostedPricingMatchesBilling(options.pricing, options.billingConfig);
   const { sql, clock, client, realm, consoleOrigin } = options;
   const pricing = parseHostedPricing(options.pricing.environment.TAKOSERVER_HOSTED_PRICING);
@@ -273,6 +283,7 @@ export async function createCanonicalHostedBillingComposition(options: {
     billingConfig,
     paymentActivation: false,
     warnings: options.warnings,
+    postpaidEnabled,
   });
   await assertStripeBillingSchema(sql);
   await assertHostedSubscriptionAdapterSchema(sql);

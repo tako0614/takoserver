@@ -31,6 +31,17 @@ export class OrgLimitPolicyError extends Error {
   }
 }
 
+/**
+ * Operator-only launch gate. Shouta's launch decision is still open and no
+ * postpaid execution has qualified; a flag alone never supplies that proof.
+ * Composition calls this before constructing SQL/clock/payment dependencies.
+ */
+export function assertOrgPostpaidLaunchGate(postpaidEnabled: unknown): void {
+  if (postpaidEnabled !== undefined && typeof postpaidEnabled !== "boolean")
+    fail("invalid_postpaid_enabled", 503);
+  if (postpaidEnabled === true) fail("postpaid_not_qualified", 503);
+}
+
 export interface OrgLimitPolicyView {
   readonly onLimit: OrgOnLimit;
   readonly capabilities: typeof ORG_LIMIT_CAPABILITIES;
@@ -264,7 +275,9 @@ function validateCommand(input: ChangeOrgLimitPolicy): void {
 export function createOrgLimitPolicy(input: {
   readonly sql: Sql;
   readonly clock?: Clock;
+  readonly postpaidEnabled?: boolean | undefined;
 }): OrgLimitPolicy {
+  assertOrgPostpaidLaunchGate(input.postpaidEnabled);
   const { sql, clock = () => new Date() } = input;
   const now = () => {
     const value = clock().toISOString();
@@ -282,11 +295,20 @@ export function createOrgLimitPolicy(input: {
     )[0];
     if (!row) return null;
     if (row.fingerprint !== fingerprint) fail("reference_conflict", 409);
+    let result: OrgLimitPolicyView;
     try {
-      return JSON.parse(String(row.result_json)) as OrgLimitPolicyView;
+      result = JSON.parse(String(row.result_json)) as OrgLimitPolicyView;
     } catch {
       return fail("billing_policy_unavailable", 503);
     }
+    if (!result || typeof result !== "object") fail("billing_policy_unavailable", 503);
+    if (
+      (result.onLimit !== "stop" && result.onLimit !== "prepaid") ||
+      result.capabilities?.postpaid !== false ||
+      result.capabilities?.["on-demand"] !== false
+    )
+      fail("limit_mode_unavailable", 409);
+    return result;
   };
 
   return {
@@ -296,11 +318,12 @@ export function createOrgLimitPolicy(input: {
     },
     async change(change) {
       validateCommand(change);
+      // Unsupported execution stays unavailable even if an old command exists.
+      if (!ORG_LIMIT_CAPABILITIES[change.onLimit]) fail("limit_mode_unavailable", 409);
       const org = change.organizationId;
       const fingerprint = canonicalJson(change);
       const replay = await command(org, change.reference, fingerprint);
       if (replay) return replay;
-      if (!ORG_LIMIT_CAPABILITIES[change.onLimit]) fail("limit_mode_unavailable", 409);
       // No card lookup: the prepaid command itself records explicit spending consent.
       const at = now();
       const original = await policy(org);

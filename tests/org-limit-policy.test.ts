@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import { createEphemeralSql } from "../src/compat.ts";
+import { canonicalJson } from "../src/json.ts";
 import {
   assertOrgLimitPolicySchema,
+  assertOrgPostpaidLaunchGate,
   createOrgCashExposureReservations,
   createOrgLimitPolicy,
   OrgLimitPolicyError,
@@ -139,6 +141,146 @@ function atomicWarnings(f: ReturnType<typeof fixture>) {
 }
 
 describe("Hosted Organization limit consent", () => {
+  test("operator postpaid gate defaults off and synchronously refuses unqualified or invalid flags before dependencies", () => {
+    const calls = { query: 0, run: 0, batch: 0, clock: 0 };
+    const sql: Sql = {
+      async query() {
+        calls.query += 1;
+        throw new Error("SQL must not run");
+      },
+      async run() {
+        calls.run += 1;
+        throw new Error("SQL must not run");
+      },
+      async batch() {
+        calls.batch += 1;
+        throw new Error("SQL must not run");
+      },
+    };
+    const clock = () => {
+      calls.clock += 1;
+      throw new Error("clock must not run");
+    };
+    expect(typeof createOrgLimitPolicy({ sql, clock }).change).toBe("function");
+    expect(typeof createOrgLimitPolicy({ sql, clock, postpaidEnabled: false }).change).toBe(
+      "function",
+    );
+    expect(() => assertOrgPostpaidLaunchGate(undefined)).not.toThrow();
+    expect(() => assertOrgPostpaidLaunchGate(false)).not.toThrow();
+    for (const value of [true, null, 0, 1, "true", "false", {}, []]) {
+      const expected = value === true ? "postpaid_not_qualified" : "invalid_postpaid_enabled";
+      for (const invoke of [
+        () => assertOrgPostpaidLaunchGate(value),
+        () => createOrgLimitPolicy({ sql, clock, postpaidEnabled: value as boolean }),
+      ]) {
+        try {
+          invoke();
+          throw new Error("expected synchronous launch refusal");
+        } catch (error) {
+          expect(error).toBeInstanceOf(OrgLimitPolicyError);
+          expect(error).toMatchObject({ code: expected, status: 503 });
+        }
+      }
+    }
+    expect(calls).toEqual({ query: 0, run: 0, batch: 0, clock: 0 });
+  });
+
+  test("explicit flag off preserves stop/prepaid behavior and cannot replay unsupported mode activation", async () => {
+    const f = fixture();
+    const policy = createOrgLimitPolicy({ sql: f.sql, clock: f.clock, postpaidEnabled: false });
+    expect(await policy.read("org_a")).toMatchObject({
+      onLimit: "stop",
+      capabilities: { postpaid: false, "on-demand": false },
+    });
+    const original = await policy.change(prepaid);
+    await policy.change({ ...prepaid, reference: "policy_2", onLimit: "stop" });
+    expect(await policy.change(prepaid)).toEqual(original);
+    for (const onLimit of ["postpaid", "on-demand"] as const) {
+      const change = {
+        ...prepaid,
+        reference: `old_${onLimit}`,
+        onLimit,
+        cashCapMinor: 1000,
+        consentRevision: "historical-charge-terms",
+      };
+      const result = {
+        ...original,
+        onLimit,
+        cashCapMinor: 1000,
+        consentRevision: change.consentRevision,
+        capabilities: { ...original.capabilities, [onLimit]: true },
+      };
+      await f.sql.run(
+        "INSERT INTO org_wallet_limit_policy_commands (org_id, ref, authorized_principal, fingerprint, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        [
+          change.organizationId,
+          change.reference,
+          change.authorizedPrincipal,
+          canonicalJson(change),
+          canonicalJson(result),
+          f.clock().toISOString(),
+        ],
+      );
+      let queried = 0;
+      const noLookup: Sql = {
+        async query() {
+          queried += 1;
+          throw new Error("unsupported replay must not consult a receipt");
+        },
+        run: (statement, params) => f.sql.run(statement, params),
+        batch: (statements) => f.sql.batch(statements),
+      };
+      await errorCode(
+        createOrgLimitPolicy({ sql: noLookup, clock: f.clock, postpaidEnabled: false }).change(
+          change,
+        ),
+        "limit_mode_unavailable",
+      );
+      expect(queried).toBe(0);
+      expect(await policy.read("org_a")).toMatchObject({
+        onLimit: "stop",
+        capabilities: { postpaid: false, "on-demand": false },
+      });
+    }
+    expect(await f.sql.query("SELECT * FROM org_wallet_cash_exposures")).toEqual([]);
+    expect(await f.sql.query("SELECT * FROM ledger")).toEqual([]);
+  });
+
+  test("flag off rejects a seeded postpaid policy and falsely active capabilities in an old supported-mode receipt", async () => {
+    const f = fixture();
+    const policy = createOrgLimitPolicy({ sql: f.sql, clock: f.clock, postpaidEnabled: false });
+    await f.sql.run(
+      "INSERT INTO org_wallet_limit_policies (org_id, on_limit, policy_version, consent_revision, cash_cap_minor, authorized_principal, updated_at) VALUES ('org_b', 'postpaid', 1, 'historical-postpaid-v1', 1000, 'session:prn_b', ?)",
+      [f.clock().toISOString()],
+    );
+    const originalRow = await f.sql.query(
+      "SELECT * FROM org_wallet_limit_policies WHERE org_id = 'org_b'",
+    );
+    await errorCode(policy.read("org_b"), "limit_mode_unavailable");
+    await errorCode(policy.prepareAdmission("org_b"), "limit_mode_unavailable");
+    const view = await policy.read("org_a");
+    await f.sql.run(
+      "INSERT INTO org_wallet_limit_policy_commands (org_id, ref, authorized_principal, fingerprint, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+      [
+        prepaid.organizationId,
+        prepaid.reference,
+        prepaid.authorizedPrincipal,
+        canonicalJson(prepaid),
+        canonicalJson({
+          ...view,
+          onLimit: "prepaid",
+          capabilities: { ...view.capabilities, postpaid: true },
+        }),
+        f.clock().toISOString(),
+      ],
+    );
+    await errorCode(policy.change(prepaid), "limit_mode_unavailable");
+    expect(
+      await f.sql.query("SELECT * FROM org_wallet_limit_policies WHERE org_id = 'org_b'"),
+    ).toEqual(originalRow);
+    expect(await f.sql.query("SELECT * FROM org_wallet_cash_exposures")).toEqual([]);
+    expect(await f.sql.query("SELECT * FROM ledger")).toEqual([]);
+  });
   test("startup refuses missing durable policy guards even when every table exists", async () => {
     const f = fixture();
     await f.sql.run("DROP TRIGGER org_wallet_limit_policy_commands_no_update");
