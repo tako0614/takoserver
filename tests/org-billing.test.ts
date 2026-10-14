@@ -454,10 +454,15 @@ describe("Organization wallet lifecycle", () => {
     // backlog check, and a two-hold Organization was refused with 503.
     const f = fixture();
     const swept = sweepClock(f);
-    await f.ledger.fund({ organizationId: "org_a", fundingRef: "pay", amountMinor: 10 });
-    await f.billing.hold({ ...hold, reference: "h1", amountMinor: 4 });
+    await f.ledger.fund({
+      organizationId: "org_a",
+      fundingRef: "pay",
+      amountMicros: 10,
+      consumptionClass: "purchased",
+    });
+    await f.billing.hold({ ...hold, reference: "h1", amountMicros: 4 });
     f.setTime("2026-10-13T00:00:00.500Z");
-    await f.billing.hold({ ...hold, reference: "h2", amountMinor: 3 });
+    await f.billing.hold({ ...hold, reference: "h2", amountMicros: 3 });
     f.setTime("2026-10-13T00:01:00.200Z");
     swept.advanceAfterSweep("2026-10-13T00:01:00.600Z");
     await swept.billing.wallet("org_a");
@@ -468,18 +473,18 @@ describe("Organization wallet lifecycle", () => {
     expect(await states()).toEqual(["h1:expired", "h2:live"]);
     expect(await f.billing.readHold("org_a", "h2")).toMatchObject({
       status: "expired",
-      releasedMinor: 3,
+      releasedMicros: 3,
     });
-    expect(await f.billing.wallet("org_a")).toMatchObject({ heldMinor: 0, availableMinor: 10 });
+    expect(await f.billing.wallet("org_a")).toMatchObject({ heldMicros: 0, availableMicros: 10 });
 
     // A backlog that already exists at the request instant still refuses, and
     // a deadline equal to that instant is part of it.
     const g = fixture();
     const backlog = sweepClock(g);
     for (let n = 0; n < 8; n++)
-      await g.billing.hold({ ...hold, reference: `zero_${n}`, amountMinor: 0 });
+      await g.billing.hold({ ...hold, reference: `zero_${n}`, amountMicros: 0 });
     g.setTime("2026-10-13T00:00:00.200Z");
-    await g.billing.hold({ ...hold, reference: "zero_8", amountMinor: 0 });
+    await g.billing.hold({ ...hold, reference: "zero_8", amountMicros: 0 });
     g.setTime("2026-10-13T00:01:00.200Z");
     backlog.advanceAfterSweep("2026-10-13T00:01:01.000Z");
     await errorCode(backlog.billing.wallet("org_a"), "billing_maintenance_pending", 503);
@@ -496,15 +501,20 @@ describe("Organization wallet lifecycle", () => {
   test("a deadline passing mid-request is never captured or reported live", async () => {
     const f = fixture();
     const swept = sweepClock(f);
-    await f.ledger.fund({ organizationId: "org_a", fundingRef: "pay", amountMinor: 10 });
+    await f.ledger.fund({
+      organizationId: "org_a",
+      fundingRef: "pay",
+      amountMicros: 10,
+      consumptionClass: "purchased",
+    });
     await f.billing.hold(hold);
     f.setTime("2026-10-13T00:00:59.999Z");
     swept.advanceAfterSweep("2026-10-13T00:01:00.000Z");
     await errorCode(swept.billing.capture(capture), "hold_closed", 409);
     expect(await f.billing.readHold("org_a", "run_1")).toMatchObject({
       status: "expired",
-      capturedMinor: 0,
-      releasedMinor: 10,
+      capturedMicros: 0,
+      releasedMicros: 10,
     });
     expect((await f.sql.query("SELECT 1 FROM ledger WHERE type = 'capture'")).length).toBe(0);
     expect(
@@ -517,19 +527,19 @@ describe("Organization wallet lifecycle", () => {
     swept.advanceAfterSweep("2026-10-13T00:02:00.000Z");
     expect(await swept.billing.hold({ ...hold, reference: "run_2" })).toMatchObject({
       status: "expired",
-      releasedMinor: 10,
+      releasedMicros: 10,
     });
     await f.billing.hold({ ...hold, reference: "run_3" });
     f.setTime("2026-10-13T00:02:59.999Z");
     swept.advanceAfterSweep("2026-10-13T00:03:00.000Z");
     expect(await swept.billing.release("org_a", "run_3")).toMatchObject({
       status: "expired",
-      releasedMinor: 10,
+      releasedMicros: 10,
     });
     expect(await f.billing.wallet("org_a")).toMatchObject({
-      settledMinor: 10,
-      heldMinor: 0,
-      availableMinor: 10,
+      settledMicros: 10,
+      heldMicros: 0,
+      availableMicros: 10,
     });
     expect((await f.sql.query("SELECT 1 FROM wallet_allocation_guards")).length).toBe(0);
   });

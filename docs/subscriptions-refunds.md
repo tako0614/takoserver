@@ -11,13 +11,25 @@ wallet money is expressed as canonical decimal strings in `*Micros` fields.
 
 The [pricing authoring compiler](pricing-authoring.md) emits
 `TAKOSERVER_HOSTED_PRICING` alongside `TAKOSERVER_BILLING_CONFIG` and Checkout
-bounds. The hosted input remains the same operator-authored table: all three
+bounds. To enable it on the owned deployment, set the optional non-secret
+`hostedPricing` string in the private `takoserver.deploy-target@v2` descriptor
+to the exact JSON text emitted for `TAKOSERVER_HOSTED_PRICING`. Target loading
+validates that bounded text against `billingConfig`, requires `stripeCheckout:
+true`, and checks the authored minimum and maximum against `stripeSettings`
+(including the runtime defaults when those settings are absent). Worker
+realization passes the same string through as `TAKOSERVER_HOSTED_PRICING`; it
+does not add another secret requirement. Omitting `hostedPricing` preserves the
+existing behavior.
+
+The hosted input remains the same operator-authored table: all three
 plan IDs, the monthly Stripe Price and its expected price, included credit,
 and usage tariffs are required configuration. Both products receive that table
 from `GET /v1/organizations/{organizationId}/payments/subscription`.
 
 Hosted pricing is optional. Its presence requires a matching billing config,
-a Stripe **test** key, and the complete additive **0095** schema after #326's 0093 classification proofs and 0094 micros cutover.
+a Stripe **test** key, and the complete additive **0095** schema after #330's
+0093 classification proofs and 0094 micros cutover. Schema lineage remains
+owned by Takoserver at commit `04360c33`.
 Live keys, live objects and connected-account events are refused. No default
 commercial price is selected. Source migrations and generated SQLite schema
 ship here; D1 qualification/application and deployment remain separate work.
@@ -112,10 +124,10 @@ streams. Deterministic source conflicts remain deferred for operator repair.
 Object-level receipts survive event-row loss and repeated scans. Transient
 processor failures retain retryable delivery state and lot fences.
 
-**STAGING PENDING (0092 → #326 0093/0094 → 0095, owned by 4d7bccc3).** This change has no
+**STAGING PENDING (0092 → #330 0093/0094 → 0095, schema owner 04360c33).** This change has no
 production/staging deployment, D1 application, configuration or credential
 mutation. Local fixtures and the local D1 migration gate verify source only.
-After #326 merges and infra qualifies/applies the schema, a staging run must exercise recurring paid
+After merged #330 and infra qualifies/applies the schema, a staging run must exercise recurring paid
 periods, failed renewal, cancellation, duplicate/refund ordering and used/held
 credit revocation with real Stripe test objects before launch validation is done.
 

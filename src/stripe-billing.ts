@@ -93,6 +93,13 @@ function timestamp(value: unknown): string {
 function metadata(value: unknown): Record<string, unknown> {
   return record(value);
 }
+function hasHostedClaim(value: unknown): boolean {
+  if (value == null) return false;
+  const meta = metadata(value);
+  return ["takoserverPurpose", "organizationId", "planKey", "pricingRevision"].some(
+    (key) => key in meta,
+  );
+}
 function usd(object: Record<string, unknown>): void {
   if (object.currency !== "usd") refuse("wrong_currency");
 }
@@ -209,6 +216,16 @@ export function createStripeBilling(options: {
       refuse("wrong_customer");
     noConnect(object);
   }
+  async function isBoundHostedCustomer(value: unknown): Promise<boolean> {
+    const customer = identifier(value, "cus");
+    return (
+      (
+        await sql.query("SELECT 1 FROM stripe_billing_customers WHERE customer_id = ? LIMIT 1", [
+          customer,
+        ])
+      ).length > 0
+    );
+  }
   async function price(id: string, table: HostedPricing): Promise<void> {
     const plan = table.hostedPlanTable.plans[1];
     if (plan.stripePriceId !== id) refuse("wrong_price");
@@ -263,6 +280,17 @@ export function createStripeBilling(options: {
     const generation = Number(claim.rows[0]?.generation);
     const object = await client.get("subscriptions", id);
     if (!object) refuse("unknown_subscription");
+    noConnect(object);
+    const known = await sql.query(
+      "SELECT 1 FROM stripe_billing_subscriptions WHERE subscription_id = ? UNION SELECT 1 FROM stripe_billing_grants WHERE subscription_id = ? LIMIT 1",
+      [id, id],
+    );
+    if (
+      !known.length &&
+      !hasHostedClaim(object.metadata) &&
+      !(await isBoundHostedCustomer(object.customer))
+    )
+      return { outcome: "ignored", detail: "not_hosted_subscription" };
     const facts = await subscriptionFacts(object);
     const paid = await sql.query(
       "SELECT MAX(period_end) AS paid_through FROM stripe_billing_grants g WHERE org_id = ? AND subscription_id = ? AND source_type = 'invoice' AND NOT EXISTS (SELECT 1 FROM stripe_billing_refunds r WHERE r.org_id = g.org_id AND r.funding_ref = g.funding_ref AND r.cumulative_refunded_micros >= g.consideration_micros)",
@@ -300,6 +328,33 @@ export function createStripeBilling(options: {
     )[0];
     if (current?.subscription_id !== id) refuse("multiple_subscriptions");
     return { outcome: "applied", detail: "subscription_updated" };
+  }
+
+  async function unrelatedInvoice(invoice: StripeBillingObject): Promise<boolean> {
+    noConnect(invoice);
+    if (await store.grantForSource("invoice", invoice.id)) return false;
+    if (hasHostedClaim(invoice.metadata)) return false;
+    const details =
+      invoice.subscription_details == null ? null : record(invoice.subscription_details);
+    if (hasHostedClaim(details?.metadata)) return false;
+    if (invoice.subscription == null)
+      return !["subscription_create", "subscription_cycle"].includes(
+        String(invoice.billing_reason),
+      );
+    const subscriptionId = identifier(invoice.subscription, "sub");
+    const known = await sql.query(
+      "SELECT 1 FROM stripe_billing_subscriptions WHERE subscription_id = ? UNION SELECT 1 FROM stripe_billing_grants WHERE subscription_id = ? LIMIT 1",
+      [subscriptionId, subscriptionId],
+    );
+    if (known.length) return false;
+    const subscription = await client.get("subscriptions", subscriptionId);
+    if (!subscription) refuse("unknown_subscription");
+    noConnect(subscription);
+    if (identifier(subscription.customer, "cus") !== identifier(invoice.customer, "cus"))
+      refuse("wrong_customer");
+    return (
+      !hasHostedClaim(subscription.metadata) && !(await isBoundHostedCustomer(invoice.customer))
+    );
   }
 
   async function invoiceGrant(id: string): Promise<BillingGrant> {
@@ -409,6 +464,15 @@ export function createStripeBilling(options: {
     )
       refuse("unverifiable_charge");
   }
+  async function freezePriorWalletFunding(sessionId: string): Promise<boolean> {
+    const fundingRef = `stripe:${sessionId}`;
+    const rows = await sql.query(
+      "SELECT org_id FROM wallet_credit_lots WHERE ref = ? AND consumption_class = 'purchased'",
+      [fundingRef],
+    );
+    for (const row of rows) await store.freezeFunding(String(row.org_id), fundingRef);
+    return rows.length > 0;
+  }
   async function checkoutGrant(id: string): Promise<BillingGrant> {
     const session = await client.get("checkout/sessions", id, {
       expand: ["payment_intent.latest_charge"],
@@ -416,9 +480,11 @@ export function createStripeBilling(options: {
     if (!session) refuse("unknown_session");
     usd(session);
     noConnect(session);
-    const meta = metadata(session.metadata);
-    if (session.mode !== "payment" || meta.takoserverPurpose !== "wallet_funding")
-      refuse("not_wallet_funding");
+    const meta = session.metadata == null ? null : metadata(session.metadata);
+    if (session.mode !== "payment" || meta?.takoserverPurpose !== "wallet_funding") {
+      if (await freezePriorWalletFunding(id)) refuse("wallet_funding_proof_missing");
+      refuse(meta && hasHostedClaim(meta) ? "invalid_wallet_funding" : "not_wallet_funding");
+    }
     if (session.payment_status !== "paid" || session.status !== "complete") refuse("not_paid");
     const org = await exists(meta.organizationId);
     const amount = minor(session.amount_total, true);
@@ -533,13 +599,25 @@ export function createStripeBilling(options: {
     noConnect(charge);
     usd(charge);
     if (!grant) {
-      if (charge.invoice != null) grant = await invoiceGrant(identifier(charge.invoice, "in"));
-      else {
+      if (hasHostedClaim(charge.metadata)) refuse("ambiguous_refund_allocation");
+      let unrelated = charge.invoice == null;
+      if (charge.invoice != null) {
+        const invoiceId = identifier(charge.invoice, "in");
+        const invoice = await client.get("invoices", invoiceId);
+        if (!invoice) refuse("unknown_invoice");
+        unrelated = await unrelatedInvoice(invoice);
+        if (!unrelated) grant = await invoiceGrant(invoiceId);
+      }
+      if (!grant) {
         const sessions = await client.list("checkout/sessions", {
           paymentIntent: identifier(charge.payment_intent, "pi"),
           limit: 100,
         });
-        if (sessions.hasMore || sessions.data.length !== 1) refuse("ambiguous_refund_allocation");
+        if (sessions.hasMore || sessions.data.length > 1) refuse("ambiguous_refund_allocation");
+        if (!sessions.data.length) {
+          if (!unrelated) refuse("ambiguous_refund_allocation");
+          return { outcome: "ignored", detail: "not_hosted_funding" };
+        }
         grant = await checkoutGrant(sessions.data[0]?.id ?? "");
       }
     }
@@ -613,6 +691,8 @@ export function createStripeBilling(options: {
         const invoice = await client.get("invoices", identifier(event.objectId, "in"));
         if (!invoice) refuse("unknown_invoice");
         if (invoice.status === "paid") {
+          if (await unrelatedInvoice(invoice))
+            return { outcome: "ignored", detail: "not_hosted_subscription" };
           const grant = await invoiceGrant(invoice.id);
           await settleGrant(grant);
           if (grant.subscriptionId) await updateSubscription(grant.subscriptionId);
@@ -633,9 +713,27 @@ export function createStripeBilling(options: {
         const session = await client.get("checkout/sessions", identifier(event.objectId, "cs"));
         if (!session) refuse("unknown_session");
         if (session.mode === "subscription") {
-          if (metadata(session.metadata).takoserverPurpose !== PURPOSE)
-            refuse("not_hosted_subscription");
-          return await updateSubscription(identifier(session.subscription, "sub"));
+          noConnect(session);
+          const meta = session.metadata == null ? null : metadata(session.metadata);
+          const subscriptionId = identifier(session.subscription, "sub");
+          if (meta?.takoserverPurpose !== PURPOSE) {
+            if (meta && hasHostedClaim(meta)) refuse("invalid_hosted_checkout");
+            const subscription = await client.get("subscriptions", subscriptionId);
+            if (!subscription) refuse("unknown_subscription");
+            noConnect(subscription);
+            const known = await sql.query(
+              "SELECT 1 FROM stripe_billing_subscriptions WHERE subscription_id = ? UNION SELECT 1 FROM stripe_billing_grants WHERE subscription_id = ? LIMIT 1",
+              [subscriptionId, subscriptionId],
+            );
+            if (
+              known.length ||
+              hasHostedClaim(subscription.metadata) ||
+              (await isBoundHostedCustomer(subscription.customer))
+            )
+              refuse("invalid_hosted_checkout");
+            return { outcome: "ignored", detail: "not_hosted_subscription" };
+          }
+          return await updateSubscription(subscriptionId);
         }
         await settleGrant(await checkoutGrant(session.id));
         return { outcome: "credited", detail: "credited" };
@@ -644,7 +742,6 @@ export function createStripeBilling(options: {
     } catch (error) {
       if (error instanceof Quarantine) {
         const ignored = new Set([
-          "not_hosted_subscription",
           "not_wallet_funding",
           "unknown_organization",
           "not_paid",

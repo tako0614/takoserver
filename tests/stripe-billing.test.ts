@@ -215,7 +215,14 @@ function listPage(
   let filtered = [...items];
   for (const filter of ["charge", "payment_intent", "customer", "subscription"] as const) {
     const value = url.searchParams.get(filter);
-    if (value !== null) filtered = filtered.filter((item) => item[filter] === value);
+    if (value !== null)
+      filtered = filtered.filter((item) =>
+        filter === "payment_intent" &&
+        item.payment_intent &&
+        typeof item.payment_intent === "object"
+          ? (item.payment_intent as ObjectRecord).id === value
+          : item[filter] === value,
+      );
   }
   const cursor = url.searchParams.get("starting_after");
   if (cursor !== null) {
@@ -438,6 +445,437 @@ async function errorCode(response: Response): Promise<string | undefined> {
 }
 
 describe("Hosted Stripe billing service", () => {
+  test("ignores unrelated paid manual invoices and refunds without leaving reconciliation failures", async () => {
+    const h = await fixture();
+    const manualInvoice = "in_manual_other";
+    const manualCharge = "ch_manual_other";
+    const manualRefund = "re_manual_other";
+    h.state.invoices.set(
+      manualInvoice,
+      invoice(manualInvoice, {
+        subscription: null,
+        subscription_details: null,
+        billing_reason: "manual",
+        charge: manualCharge,
+      }),
+    );
+    h.state.charges.set(
+      manualCharge,
+      object(manualCharge, "charge", {
+        customer: CUSTOMER,
+        invoice: manualInvoice,
+        currency: "usd",
+        paid: true,
+        status: "succeeded",
+        captured: true,
+        disputed: false,
+        amount: MONTHLY_MINOR,
+        amount_refunded: 25,
+        payment_intent: "pi_manual_other",
+      }),
+    );
+    h.state.refunds.set(
+      manualRefund,
+      object(manualRefund, "refund", {
+        charge: manualCharge,
+        currency: "usd",
+        amount: 25,
+        created: 1_791_871_200,
+        status: "succeeded",
+      }),
+    );
+
+    for (const [type, id, kind] of [
+      ["invoice.paid", manualInvoice, "invoice"],
+      ["refund.updated", manualRefund, "refund"],
+    ] as const) {
+      const payload = event(type, id, kind);
+      expect((await deliver(h.app, payload)).status).toBe(200);
+      expect(
+        await h.sql.query("SELECT outcome FROM stripe_events WHERE event_id = ?", [
+          String(payload.id),
+        ]),
+      ).toEqual([{ outcome: "ignored" }]);
+    }
+    const report = await h.reconcile();
+    expect(report.billing?.unresolved).toBe(0);
+    expect(
+      await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_reconcile_failures"),
+    ).toEqual([{ count: 0 }]);
+    expect(await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_refunds")).toEqual([
+      { count: 0 },
+    ]);
+    expect((await h.ledger.wallet(ORG)).settledMicros).toBe(INCLUDED_MICROS);
+  });
+
+  test("ignores unmarked foreign subscription invoices while retaining malformed hosted claims", async () => {
+    const h = await fixture();
+    const foreignSub = "sub_foreign_other";
+    const foreignInvoice = "in_foreign_other";
+    h.state.subscriptions.set(
+      foreignSub,
+      subscription({ id: foreignSub, customer: "cus_foreign_other", metadata: {} }),
+    );
+    h.state.invoices.set(
+      foreignInvoice,
+      invoice(foreignInvoice, {
+        customer: "cus_foreign_other",
+        subscription: foreignSub,
+        subscription_details: { metadata: {} },
+        charge: "ch_foreign_other",
+      }),
+    );
+    const unrelated = event("invoice.paid", foreignInvoice, "invoice");
+    expect((await deliver(h.app, unrelated)).status).toBe(200);
+    expect(
+      await h.sql.query("SELECT outcome FROM stripe_events WHERE event_id = ?", [
+        String(unrelated.id),
+      ]),
+    ).toEqual([{ outcome: "ignored" }]);
+    expect((await h.reconcile()).billing?.unresolved).toBe(0);
+    const ambiguousSub = "sub_ambiguous_other";
+    const ambiguousInvoice = "in_ambiguous_other";
+    h.state.subscriptions.set(ambiguousSub, subscription({ id: ambiguousSub, metadata: {} }));
+    h.state.invoices.set(
+      ambiguousInvoice,
+      invoice(ambiguousInvoice, {
+        subscription: ambiguousSub,
+        subscription_details: { metadata: {} },
+      }),
+    );
+    const ambiguousEvent = event("invoice.paid", ambiguousInvoice, "invoice");
+    expect((await deliver(h.app, ambiguousEvent)).status).toBe(200);
+    expect(
+      await h.sql.query("SELECT outcome FROM stripe_events WHERE event_id = ?", [
+        String(ambiguousEvent.id),
+      ]),
+    ).toEqual([{ outcome: "deferred" }]);
+    const malformed = "in_host_missing_pin";
+    h.state.invoices.set(malformed, invoice(malformed, { subscription_details: null }));
+    const hostEvent = event("invoice.paid", malformed, "invoice");
+    expect((await deliver(h.app, hostEvent)).status).toBe(200);
+    expect(
+      await h.sql.query("SELECT outcome FROM stripe_events WHERE event_id = ?", [
+        String(hostEvent.id),
+      ]),
+    ).toEqual([{ outcome: "deferred" }]);
+    const report = await h.reconcile();
+    expect(report.billing?.unresolved).toBeGreaterThan(0);
+    expect(
+      await h.sql.query("SELECT source_id FROM stripe_billing_grants WHERE source_id = ?", [
+        foreignInvoice,
+      ]),
+    ).toEqual([]);
+    expect(
+      await h.sql.query("SELECT source_id FROM stripe_billing_grants WHERE source_id = ?", [
+        malformed,
+      ]),
+    ).toEqual([]);
+  });
+
+  test("defers a refund before grant when the hosted invoice pin is missing", async () => {
+    const h = await fixture();
+    h.state.invoices.set(
+      "in_billing_test",
+      invoice("in_billing_test", { subscription_details: null }),
+    );
+    h.state.charges.set("ch_billing_test", charge({ amount_refunded: 25 }));
+    h.state.refunds.set(
+      "re_host_missing_pin",
+      object("re_host_missing_pin", "refund", {
+        charge: "ch_billing_test",
+        currency: "usd",
+        amount: 25,
+        created: 1_791_871_200,
+        status: "succeeded",
+      }),
+    );
+    const payload = event("refund.updated", "re_host_missing_pin", "refund");
+    expect((await deliver(h.app, payload)).status).toBe(200);
+    expect(
+      await h.sql.query("SELECT outcome FROM stripe_events WHERE event_id = ?", [
+        String(payload.id),
+      ]),
+    ).toEqual([{ outcome: "deferred" }]);
+    expect((await h.reconcile()).billing?.unresolved).toBeGreaterThan(0);
+    expect(await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_grants")).toEqual([
+      { count: 0 },
+    ]);
+    expect((await h.ledger.wallet(ORG)).settledMicros).toBe(0);
+  });
+
+  test("settles a known funded grant refund after invoice and subscription markers disappear", async () => {
+    const h = await fixture();
+    expect((await deliver(h.app, event("invoice.paid", "in_billing_test", "invoice"))).status).toBe(
+      200,
+    );
+    h.state.invoices.set(
+      "in_billing_test",
+      invoice("in_billing_test", { subscription_details: null }),
+    );
+    h.state.subscriptions.set(SUBSCRIPTION, subscription({ metadata: {} }));
+    h.state.charges.set("ch_billing_test", charge({ amount_refunded: 25 }));
+    h.state.refunds.set(
+      "re_known_grant",
+      object("re_known_grant", "refund", {
+        charge: "ch_billing_test",
+        currency: "usd",
+        amount: 25,
+        created: 1_791_871_200,
+        status: "succeeded",
+      }),
+    );
+    const payload = event("refund.updated", "re_known_grant", "refund");
+    expect((await deliver(h.app, payload)).status).toBe(200);
+    expect(await h.sql.query("SELECT refund_id FROM stripe_billing_refunds")).toEqual([
+      { refund_id: "re_known_grant" },
+    ]);
+    expect((await h.ledger.wallet(ORG)).settledMicros).toBe(INCLUDED_MICROS - micros(240));
+    expect(await h.sql.query("SELECT funding_ref FROM stripe_billing_grants")).toEqual([
+      { funding_ref: "stripe:invoice:in_billing_test" },
+    ]);
+  });
+
+  test("retains legacy wallet funding when its charge later points at an unrelated invoice", async () => {
+    const h = await fixture();
+    const sessionId = "cs_legacy_wallet";
+    const chargeId = "ch_legacy_wallet";
+    const invoiceId = "in_legacy_wallet_other";
+    h.state.sessions.set(
+      sessionId,
+      object(sessionId, "checkout.session", {
+        mode: "payment",
+        status: "complete",
+        payment_status: "paid",
+        amount_total: 500,
+        currency: "usd",
+        created: Math.floor(NOW.getTime() / 1_000),
+        customer: null,
+        metadata: { organizationId: ORG, takoserverPurpose: "wallet_funding" },
+        payment_intent: { id: "pi_legacy_wallet", status: "succeeded", latest_charge: chargeId },
+      }),
+    );
+    h.state.charges.set(
+      chargeId,
+      object(chargeId, "charge", {
+        customer: null,
+        invoice: null,
+        currency: "usd",
+        paid: true,
+        status: "succeeded",
+        captured: true,
+        disputed: false,
+        amount: 500,
+        amount_refunded: 0,
+        payment_intent: "pi_legacy_wallet",
+      }),
+    );
+    await h.sql.run(
+      "INSERT INTO wallet_credit_lots (org_id, ref, kind, consumption_class, amount_micros, expires_at, created_at) VALUES (?, ?, 'direct', 'purchased', ?, NULL, ?)",
+      [ORG, `stripe:${sessionId}`, micros(500), NOW.toISOString()],
+    );
+    await h.sql.run(
+      "INSERT INTO ledger (id, org_id, type, ref, settled_delta_micros, held_delta_micros, created_at) VALUES (?, ?, 'funding', ?, ?, 0, ?)",
+      ["led_legacy_wallet", ORG, `stripe:${sessionId}`, micros(500), NOW.toISOString()],
+    );
+    h.state.invoices.set(
+      invoiceId,
+      invoice(invoiceId, {
+        customer: null,
+        subscription: null,
+        subscription_details: null,
+        billing_reason: "manual",
+        charge: chargeId,
+      }),
+    );
+    h.state.charges.set(
+      chargeId,
+      object(chargeId, "charge", {
+        customer: null,
+        invoice: invoiceId,
+        currency: "usd",
+        paid: true,
+        status: "succeeded",
+        captured: true,
+        disputed: false,
+        amount: 500,
+        amount_refunded: 125,
+        payment_intent: "pi_legacy_wallet",
+      }),
+    );
+    h.state.refunds.set(
+      "re_legacy_wallet",
+      object("re_legacy_wallet", "refund", {
+        charge: chargeId,
+        currency: "usd",
+        amount: 125,
+        created: 1_791_871_200,
+        status: "succeeded",
+      }),
+    );
+    const payload = event("refund.updated", "re_legacy_wallet", "refund");
+    expect((await deliver(h.app, payload)).status).toBe(200);
+    expect(
+      await h.sql.query("SELECT outcome, outcome_detail FROM stripe_events WHERE event_id = ?", [
+        String(payload.id),
+      ]),
+    ).toEqual([{ outcome: "applied", outcome_detail: "refund_settled" }]);
+    expect(await h.sql.query("SELECT refund_id FROM stripe_billing_refunds")).toEqual([
+      { refund_id: "re_legacy_wallet" },
+    ]);
+    expect((await h.ledger.wallet(ORG)).settledMicros).toBe(micros(375));
+  });
+
+  test("freezes a legacy wallet lot when its Checkout marker disappears", async () => {
+    const h = await fixture();
+    const sessionId = "cs_legacy_missing_marker";
+    const chargeId = "ch_legacy_missing_marker";
+    await h.sql.run(
+      "INSERT INTO wallet_credit_lots (org_id, ref, kind, consumption_class, amount_micros, expires_at, created_at) VALUES (?, ?, 'direct', 'purchased', ?, NULL, ?)",
+      [ORG, `stripe:${sessionId}`, micros(500), NOW.toISOString()],
+    );
+    await h.sql.run(
+      "INSERT INTO ledger (id, org_id, type, ref, settled_delta_micros, held_delta_micros, created_at) VALUES (?, ?, 'funding', ?, ?, 0, ?)",
+      ["led_legacy_missing_marker", ORG, `stripe:${sessionId}`, micros(500), NOW.toISOString()],
+    );
+    h.state.sessions.set(
+      sessionId,
+      object(sessionId, "checkout.session", {
+        mode: "payment",
+        status: "complete",
+        payment_status: "paid",
+        amount_total: 500,
+        currency: "usd",
+        created: Math.floor(NOW.getTime() / 1_000),
+        customer: null,
+        metadata: {},
+        payment_intent: {
+          id: "pi_legacy_missing_marker",
+          status: "succeeded",
+          latest_charge: chargeId,
+        },
+      }),
+    );
+    h.state.charges.set(
+      chargeId,
+      object(chargeId, "charge", {
+        customer: null,
+        invoice: null,
+        currency: "usd",
+        paid: true,
+        status: "succeeded",
+        captured: true,
+        disputed: false,
+        amount: 500,
+        amount_refunded: 125,
+        payment_intent: "pi_legacy_missing_marker",
+      }),
+    );
+    h.state.refunds.set(
+      "re_legacy_missing_marker",
+      object("re_legacy_missing_marker", "refund", {
+        charge: chargeId,
+        currency: "usd",
+        amount: 125,
+        created: 1_791_871_200,
+        status: "succeeded",
+      }),
+    );
+    const payload = event("refund.updated", "re_legacy_missing_marker", "refund");
+    expect((await deliver(h.app, payload)).status).toBe(200);
+    expect(
+      await h.sql.query("SELECT outcome FROM stripe_events WHERE event_id = ?", [
+        String(payload.id),
+      ]),
+    ).toEqual([{ outcome: "deferred" }]);
+    expect(
+      await h.sql.query(
+        "SELECT active FROM stripe_billing_fences WHERE org_id = ? AND funding_ref = ?",
+        [ORG, `stripe:${sessionId}`],
+      ),
+    ).toEqual([{ active: 1 }]);
+    expect((await h.ledger.wallet(ORG)).availableMicros).toBe(0);
+    expect(await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_refunds")).toEqual([
+      { count: 0 },
+    ]);
+  });
+
+  test("ignores an unmarked payment refund when no wallet source exists", async () => {
+    const h = await fixture();
+    h.state.sessions.set(
+      "cs_other_payment",
+      object("cs_other_payment", "checkout.session", {
+        mode: "payment",
+        currency: "usd",
+        metadata: {},
+        payment_intent: {
+          id: "pi_other_payment",
+          status: "succeeded",
+          latest_charge: "ch_other_payment",
+        },
+      }),
+    );
+    h.state.charges.set(
+      "ch_other_payment",
+      object("ch_other_payment", "charge", {
+        customer: null,
+        invoice: null,
+        currency: "usd",
+        amount: 500,
+        amount_refunded: 125,
+        payment_intent: "pi_other_payment",
+      }),
+    );
+    h.state.refunds.set(
+      "re_other_payment",
+      object("re_other_payment", "refund", { charge: "ch_other_payment", currency: "usd" }),
+    );
+    const payload = event("refund.updated", "re_other_payment", "refund");
+    expect((await deliver(h.app, payload)).status).toBe(200);
+    expect(
+      await h.sql.query("SELECT outcome FROM stripe_events WHERE event_id = ?", [
+        String(payload.id),
+      ]),
+    ).toEqual([{ outcome: "ignored" }]);
+    expect(await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_fences")).toEqual([
+      { count: 0 },
+    ]);
+  });
+
+  test("ignores unrelated subscription Checkout without hiding a hosted subscription claim", async () => {
+    const h = await fixture();
+    h.state.subscriptions.set(
+      "sub_other_checkout",
+      subscription({ id: "sub_other_checkout", customer: "cus_other_checkout", metadata: {} }),
+    );
+    h.state.sessions.set(
+      "cs_other_subscription",
+      object("cs_other_subscription", "checkout.session", {
+        mode: "subscription",
+        subscription: "sub_other_checkout",
+        metadata: {},
+      }),
+    );
+    const other = event("checkout.session.completed", "cs_other_subscription", "checkout.session");
+    expect((await deliver(h.app, other)).status).toBe(200);
+    expect(
+      await h.sql.query("SELECT outcome FROM stripe_events WHERE event_id = ?", [String(other.id)]),
+    ).toEqual([{ outcome: "ignored" }]);
+    h.state.sessions.set(
+      "cs_host_missing_marker",
+      object("cs_host_missing_marker", "checkout.session", {
+        mode: "subscription",
+        subscription: SUBSCRIPTION,
+        metadata: {},
+      }),
+    );
+    const host = event("checkout.session.completed", "cs_host_missing_marker", "checkout.session");
+    expect((await deliver(h.app, host)).status).toBe(200);
+    expect(
+      await h.sql.query("SELECT outcome FROM stripe_events WHERE event_id = ?", [String(host.id)]),
+    ).toEqual([{ outcome: "deferred" }]);
+  });
+
   test("paid recurring invoice credits once by invoice identity across event IDs and reconciliation", async () => {
     const h = await fixture();
     const first = await deliver(h.app, event("invoice.paid", "in_billing_test", "invoice"));
