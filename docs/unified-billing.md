@@ -1,8 +1,10 @@
 # Unified Organization billing for Takoserver and Takosumi Hosted
 
-Status: revised by the CTO decision supplied directly in the task on
-2026-10-14 at 03:34 JST. That instruction is the decision record; there is no
-separate decision PR. It supersedes the cents ledger, ties-to-even rounding,
+Status: revised by the CTO decisions supplied directly in the task on
+2026-10-14, including the three-tier Hosted plan, four-operation client and
+shared screen specification requested after the Organization API merged.
+Those instructions are the decision record; there is no separate decision PR.
+They supersede the cents ledger, ties-to-even rounding,
 and globally expiry-first consumption decisions in
 [#314](https://github.com/tako0614/takoserver/pull/314) and
 [#318](https://github.com/tako0614/takoserver/pull/318).
@@ -10,7 +12,8 @@ All money is **USD**. The canonical ledger uses integer **USD micros**;
 `1 USD = 1,000,000 micros`, and `1 cent = 10,000 micros`. Convert payable
 micros to Stripe cents once at invoicing, rounding every positive remainder up.
 
-The design revision in #323 changed the target contract. The separate
+The design revision in #323 changed the target contract. Merged
+[#330](https://github.com/tako0614/takoserver/pull/330)'s
 [micros API/ledger implementation](org-billing-micros.md) replaces the
 [first Organization API](org-billing-api.md)'s cents and expiry-first behavior
 in source. It includes OpenAPI, class-priority allocation and forward migrations
@@ -25,15 +28,17 @@ Related work: [Takosumi Hosted PR #54](https://github.com/tako0614/takosumi-host
 and merged [shared price authoring #319](https://github.com/tako0614/takoserver/pull/319).
 The original PR #54 review found no review/discussion comments; its body lists
 the four questions decided below. The implementation baseline for this revision
-was main `b5f5a038`. Source merge does not establish staging or billing GA.
+is main `5106f2036cfedfefb19e6af377e141953c380529` (#330). Source merge does
+not establish staging or billing GA.
 
 | Area | CTO target | Implementation / remaining acceptance |
 | --- | --- | --- |
 | Ledger and scoped money wire | Integer USD micros; explicit `*Micros` fields | Micros source and forward 0093/0094 migrations replace #318; live cutover remains separately qualified |
 | Allocation | Free allowance → subscription credit → purchased credit → consented capped postpaid | Prepaid allocation, settlement and pagination share class priority; postpaid remains disabled pending its separate cap reservation and invoice implementation |
 | Invoicing | Aggregate payable micros, then ceiling to cents once | Capture/usage retain micros; the arithmetic helper is available, while Stripe invoice settlement remains a later wave |
-| Holds and scopes | Immutable TTL, capture ≤ hold, automatic release; exact Organization/scopes | #318 supplies this lifecycle; preserve its transactional fences when changing units |
-| Hosted plans | Three shared configurable tiers and one Organization wallet | #319 emits free/subscription/usage plan configuration; subscription/refund handlers and Hosted cutover remain GA-required |
+| Holds and scopes | Immutable TTL, capture ≤ hold, automatic release; four routine writes with exact Organization/scopes | #330 preserves #318's transactional lifecycle and supplies the four micros commands and scoped reads |
+| Hosted plans | Edge allowance, monthly included credit, additional credit/usage; the same three configured IDs and table | #319 is a shared-table preview, not an activated catalog; configuration/subscription/refund alignment is owned by #325 / `106603b4` |
+| Screens | USD cents presentation, exact micros details; shared balance/held/lot semantics | Common contract below; current Console shows exact micros and no lot breakdown, so screen adoption remains an explicit acceptance step |
 
 ## One wallet authority, separate product identities
 
@@ -55,15 +60,45 @@ and provision tokens. There are no source imports or shared databases between
 the products. Takosumi OSS continues to own Run/state/output/audit authority;
 its default billing extension remains disabled.
 
-The three tiers are shared by Takoserver and Takosumi Hosted, rather than one
-subscription per product: free, subscription, and usage, with their stable plan
-ids and prices supplied by configuration. This follows the authoring contract
-in #319; its output remains owned by that pricing change. A product switch or
-additional Workspace does not create another balance, subscription allowance,
-or free grant. A usage tier may spend purchased prepaid credit; postpaid still
-requires separate explicit consent and a cap. Self-hosted installations are
-outside this shared Hosted balance, plan, free-grant and Stripe policy. An
-independent self-host operator's own wallet is not enrolled into it.
+The three commercial tiers are shared by Takoserver and Takosumi Hosted,
+rather than one subscription per product. The labels below are roles, not new
+literal plan IDs or another price table:
+
+| Shared role | ID from the one configuration | Entitlement and charging |
+| --- | --- | --- |
+| Free | `planIds.free` | Configured edge-resource free allowance; optional monthly free-credit entitlement is separate from the resource quota |
+| Monthly subscription | `planIds.subscription` | One monthly Organization subscription with configured included credit; grants follow verified paid invoice periods |
+| Additional credit / metered usage | `planIds.usage` | Purchased prepaid credit, then optional explicitly consented, capped postpaid usage; no implicit second subscription or credit line |
+
+Both products consume the same configured IDs, revision, display labels,
+entitlements and price rows. Neither adds a product prefix, hardcodes a local
+price, nor mints a second subscription or allowance when the user switches
+products or adds a Workspace. These are three plan roles, not two independent
+product catalogs. A subscription customer can also buy additional credit;
+credit sources and the consumption classes below do not become extra plans.
+
+All advertised amounts are provisional configuration, including monthly price,
+included/free credit, edge-resource allowance and metered rates. The same
+validated table supplies both product screens and server admission. An edge
+quota is a resource entitlement, not dollars or a spendable credit lot: its
+configured units, period and exhaustion behavior must be shown separately.
+Do not advertise an unimplemented quota as available merely because a preview
+contains a free-credit amount. A missing entitlement or plan ID stays pending
+activation; the client does not invent it.
+
+#319's authoring/preview supplies the shared-table contract but is not runtime
+activation. The inactive decision input
+[`config/shared-hosted-pricing.json`](../config/shared-hosted-pricing.json)
+contains provisional USD amounts and unresolved IDs/allowances; it is not a
+second active tariff. Configuration/runtime alignment and final placeholders
+are owned by `106603b4` in [#325](https://github.com/tako0614/takoserver/pull/325).
+This revision changes none of those configuration or compiler files. Configured
+IDs stay stable across price revisions; changing an ID requires a separately
+reviewed binding migration, not a product-specific alias.
+
+Self-hosted installations are outside this shared Hosted balance, plan,
+free-grant and Stripe policy. An independent self-host operator's own wallet
+is not enrolled into it, and its local screen is not evidence of a Hosted plan.
 
 This is an intentional replacement of the current **two retail wallet**
 arrangement, not a description of today's production composition. Hosted's
@@ -188,9 +223,12 @@ existing ledger and allocations. Store original amount, request fingerprint,
 deadline and never extends it. This version has no renewal endpoint.
 
 At `now >= expiresAt`, read and mutation paths transactionally close the hold
-and release its entire remaining allocation. A bounded, durable cursor-based
-sweeper runs at least every minute and resumes after restart, so abandoned
-plans, cancellation, and lost responses do not hold funds forever. API checks
+and release its entire remaining allocation. Scheduled maintenance also closes
+expired holds in bounded batches, so abandoned plans, cancellation, and lost
+responses do not hold funds forever. The current Worker schedules maintenance
+every five minutes (up to 64 holds per pass); Bun schedules it every 30 seconds.
+Backlogs may require multiple passes. These are maintenance cadences, not
+extensions to an individual deadline. API checks
 enforce expiry even if the sweeper is delayed. Exact deadline equality belongs
 to expiry, and a late capture receives `hold_closed`, never a fresh debit.
 
@@ -265,6 +303,23 @@ wallet/read/hold/usage operations together with generated
 Checkout/payment scopes and subscription operations below remain
 later GA implementation work. They are not exposed by the micros source wave.
 
+Takosumi's routine billing adapter has exactly four money commands: **hold,
+capture, release, and usage-record**. They use the existing public paths below;
+there is no second Hosted-only protocol or private funding bypass. Hold/capture/
+release require `wallet:write`, and usage-record requires `usage:write`.
+Repeated requests keep their original opaque reference and fingerprint.
+An unknown outcome uses the same operation's idempotent replay or its scoped
+receipt read, never a new charge/reference.
+
+The wallet/lot/receipt/history GETs are read-only presentation and reconciliation
+views, not additional charging commands. Checkout, subscriptions, verified
+funding, Stripe webhook and operator reconciliation belong to the separate
+Takoserver payment authority, not this four-command adapter. Hosted screens
+may navigate to that authority for an explicit owner payment action; the
+routine adapter does not call its mutation routes or hold a `payments:write`
+credential. Do not remove customer/operator routes from the public product API
+to describe a narrower client contract.
+
 All paths below begin `/v1/organizations/{organizationId}`. Hold references are
 URL-encoded as one path component, with bounded length and namespace validation.
 
@@ -292,8 +347,10 @@ policy/fingerprint and are read as explicit history; new references cannot
 reuse them or silently replace their original cents decision.
 
 Hosted's routine Run/storage key needs only `wallet:read`, `wallet:write`,
-`usage:read`, and `usage:write`. Use a separate delegated `payments:write` key
-for explicit customer payment actions. Neither write scope implies a read or
+`usage:read`, and `usage:write`. Read scopes support screens and receipt
+reconciliation; the only charging calls are the four commands above. Owner
+payment navigation remains outside that key and adapter; do not install a
+second Hosted payment writer alongside them. Neither write scope implies a read or
 other write scope. None authorizes funding, refunds, key minting, reseller
 provisioning, or arbitrary postpaid policy changes. Existing owner-only
 `POST /wallet/funding` remains a verified-proof path; never expose caller-chosen
@@ -317,12 +374,113 @@ readback and exact-reference replay, not a new reference. Publish request,
 receipt, expiry/tombstone, pagination, replay, and error schemas and contract
 tests before Hosted implements HTTP; a private binding obeys the same checks.
 
+## Common Hosted billing screens
+
+Takoserver and Takosumi Hosted use these same labels, money semantics and
+disclosures for the selected **Organization**, irrespective of which Workspace
+opened the screen. Show the Organization identity, USD, shared plan ID and
+pricing revision; changing products or Workspaces does not reset any figure.
+All monetary data comes from the scoped Takoserver authority. Hosted may cache
+a view with its fetch time, but cannot maintain or write a second balance.
+
+| View | Shared meaning and source |
+| --- | --- |
+| Available / 利用可能残高 | `/wallet.availableMicros`: eligible credit that can fund a new hold, after existing holds and expiry |
+| Held / 確保中 | `/wallet.heldMicros`: allocations reserved for live operations; not a completed charge or extra available credit |
+| Current credit / 現在のクレジット | `/wallet.settledMicros`: expiry-aware eligible credit including held allocations; exact `settledMicros = availableMicros + heldMicros` |
+| Free / Subscription / Purchased | Lot `consumptionClass`, original grant/purchase, remaining, held, available and expiry; display in the fixed consumption order |
+| Edge-resource allowance | Configured quota units, period, used and remaining resources; separate from monetary credit and never added to the wallet |
+| Postpaid usage | Confirmed payable usage, pending cap reservation, cash cap and invoiced/uncollected amounts; separate from the nonnegative prepaid wallet |
+
+Do not compute current credit from a sum of historical funding, the last 100
+ledger entries or an expired lot's `remainingMicros`. Expired unused credit is
+unavailable; an allocation already pinned by a still-live hold can remain held
+after its originating lot expires. Release of that allocation does not revive
+expired spendable credit. Show original expiry and this held status explicitly.
+
+### Cents presentation is not a money settlement
+
+The common primary display is USD with cent precision. Cash prices, Checkout,
+invoice and refund amounts are exact integer cents rendered with two decimal
+places. Usage, credit, holds and lot amounts still travel and remain stored as
+canonical micros; a screen must never submit its formatted amount as an API
+money input or change a receipt to make it match the display.
+
+For nonnegative wallet or lot amount `M`, the presentation uses complete cents
+`M div 10,000` and retains remainder `M mod 10,000`. Render exact cent multiples
+normally. If the remainder is nonzero, mark the displayed amount approximate
+and make the exact USD-micros amount available in accessible details; truncate
+the display toward zero, rather than rounding up spendable credit. A positive
+amount smaller than one cent displays **less than $0.01**, not a zero balance.
+Signed ledger deltas retain their debit/credit sign and use the same magnitude
+rule. These view-only digits are not an additional conversion of payable money,
+a rounded ledger entry, or the abolished bank-rounding rule.
+
+Examples: 0 micros displays `$0.00`; 1 micro displays `< $0.01` with exact detail
+`$0.000001`; 10,000 displays `$0.01`; 14,999 displays approximately `$0.01`
+with exact detail `$0.014999`. Its invoice, if those micros are actually payable,
+would separately freeze 2 cents under the invoice ceiling rule. A prepaid
+balance is not itself an amount to invoice. Do not apply invoice ceiling to
+each displayed wallet, usage row or class subtotal. Cent summaries need not
+add up visually when residues differ; the conserved identity and authoritative
+totals are checked in micros, with the approximation disclosed.
+
+Both screens aggregate exact micros before formatting a total. For example,
+two payable 5,000-micro records remain two exact measurements, have a 10,000-
+micro total, and produce one 1-cent invoice. They do not become two 1-cent
+usage records. Keep invoice rounding adjustments and tax/refund cash accounting
+separate from credit consumption, so neither product displays a second charge.
+An entered cash purchase amount must have at most two decimal USD digits and
+parse exactly to integer cents; reject extra digits rather than silently
+rounding a floating-point dollar input.
+
+### Breakdown, receipts and incomplete data
+
+Display the class order free → subscription → purchased. Each lot shows source
+kind as well as class, original expiry, spendable amount and held amount; free
+and subscription can both have kind `plan-included`. A monthly allowance is
+shown once per Organization, not once per Workspace. Subscription period,
+pending plan/cancellation, and paid-through status come from the authoritative
+subscription projection, not a locally guessed billing date. Purchased credit
+expiry is disclosed before Checkout. Postpaid is shown as disabled until an
+implemented, explicitly consented cap exists; its unused cap is never a wallet
+credit or part of the available/held identity.
+
+The existing `/wallet/lots` API is paged and its pages are independent reads.
+Show a loaded-lot list as partial until all relevant pages are fetched; do not
+call a first-page sum the complete class balance. Even a complete traversal
+can race a new hold, expiry or funding, so do not present it as an atomic
+class summary or override the authoritative `/wallet` total. A future complete
+class-summary UI requires an authoritative same-snapshot projection. Until
+that exists, expose per-lot details and a refresh time instead of inventing
+reconciled totals from unrelated reads.
+
+Hold details include opaque operation reference, original micros, immutable
+deadline, terminal state and captured/released micros. Expired is distinct
+from captured. Usage details include measurement period, meter/price revision,
+full actual cost, captured amount and unpaid/shortfall status. Preserve exact
+receipt references for replay and show indeterminate results as pending
+reconciliation. A failed read displays unavailable/stale data, never a newly
+zeroed balance or a fabricated successful release. Do not reveal provider
+credentials, Hosted user/session IDs, or billing keys in these views.
+
+Current source acceptance is intentionally explicit: #330 supplies the four
+commands, micros wallet totals and paged per-lot class/expiry data. The Console
+currently formats exact micros (up to six decimal places), and has no class
+breakdown; its old explanation of a balance as an append-only-entry sum also
+needs the expiry-aware wording above. This document specifies the common
+Hosted screens, not a claim that both product UIs already implement them.
+Console/Hosted screen adoption, strict cash-input parsing and any complete
+class-summary projection are separate UI acceptance work. They must preserve
+the existing API's exact micros and do not require a cents ledger or a fifth
+Hosted charging command.
+
 ## Subscriptions and the generic Stripe router
 
 Extend the merged #313 router's `STRIPE_EVENT_HANDLERS`, not a second webhook.
 That router verifies the raw signature, records `stripe_events` with
 `event_id` as primary key, and credits one-time Checkout through the common
-settlement function and `stripe:<sessionId>` ledger reference. It currently
+settlement function and `stripe:<sessionId>` ledger reference. At the #330 baseline it
 records `invoice.paid`, `invoice.payment_failed`, `customer.subscription.updated`,
 `customer.subscription.deleted`, and `charge.refunded` as **deferred** and
 returns 2xx without applying them. `received` is retryable; `credited` and
@@ -555,7 +713,7 @@ wave with classification preparation 0093 and guarded unit conversion 0094.
 Frozen migrations
 0003, 0017, 0018, 0091 and 0092 retain their original bytes. Add a forward
 migration after the independently reviewed, applied and qualified 0092 baseline;
-do not mix that new migration into #322's exact 0001–0092 source inventory or
+do not mix that new migration into #327's exact 0001–0092 source inventory or
 reuse its 92-row qualification for a different schema. A source implementation
 or draft PR does not authorize applying that migration.
 
@@ -603,14 +761,22 @@ work performs none of those effects and changes no production target.
 
 ## Task ledger and implementation order
 
-Ledger key: `unified-billing-cto-revision-20261014`; status: design review. Current
+Ledger key: `unified-billing-hosted-contract-20261014`; status: source-reviewed
+design revision following merged #330. Current
 changed repository: **takoserver**, documentation only. This design records
 billing/authority decisions but changes no schema, live balance, credential,
 price, or runtime behavior. The directly supplied CTO decision is authoritative;
 PR #54 and merged #313/#318/#319 are read-only baseline inputs. The required
-micros API/ledger corrections are tracked in their explicit, separate
-[implementation ledger](org-billing-micros.md). This historical design ledger
-does not establish acceptance of live conversion or the remaining GA waves.
+micros API/ledger corrections have merged in #330 and are tracked in their
+explicit [implementation ledger](org-billing-micros.md). The API audit confirms
+that the four routine writes, exact units, allocation priority, capture bound,
+TTL and release already match this decision, so this revision changes no API
+or OpenAPI source. Price configuration/subscriptions/refunds remain owned by
+`106603b4` / #325; this work edits none of their files. Shared screen adoption
+and complete same-snapshot class summaries remain explicit UI acceptance.
+This design ledger does not establish acceptance of live conversion or the
+remaining GA waves. The previous #323 documentation and #320/#327 0092 work
+are complete and are not reopened; staging v2-0092 is already running.
 No numbered cross-repository task is claimed;
 the unregistered TASK-0100 handoff is implementation planning input only.
 
@@ -618,11 +784,12 @@ the unregistered TASK-0100 handoff is implementation planning input only.
 | --- | --- | --- |
 | 1 | takoserver | This reviewed CTO revision, local `bun run check`, PR publication/merge; documentation publication changes no live money |
 | 2 | takos-control | Register implementation ledger, amend wallet ownership policy, regenerate instructions; no shared identity grant |
-| 3 | takoserver | Separate canonical-micros API/ledger PR, class-priority allocation, checked cash adapters, forward unit migration after qualified 0092, generated OpenAPI and contract/conservation tests; preserve #318 lifecycle fences |
-| 4 | takoserver | GA-required subscription/refund handlers, deferred-event replay/reconciliation, payment scopes and consented capped postpaid; extend merged #313 and configured tariffs without editing #319's price-authoring files |
+| 3 | takoserver | Completed in merged #330: canonical-micros API/ledger, class-priority allocation, checked cash adapters, forward unit migration, generated OpenAPI and contract/conservation tests; live 0093/0094 qualification remains separate |
+| 4 | takoserver / `106603b4` | #325 configuration/subscription/refund alignment and its gate; separate capped postpaid acceptance. This revision does not modify that owner's config, compiler, pricing or runtime files |
 | 5 | takosumi-hosted | Adapt PR #54 fake/port to micros receipts, unpaid usage, real scoped HTTP client, durable local mapping, and single-writer retail retirement; retain draft isolation until wire exists |
 | 6 | takosumi / takosumi-hosted | Bridge OSS Seam B through authenticated server RPC, discard `billingSubjectId`, use measured actual cost rather than OSS's current estimate-as-capture, wire cancellation/deadline checks; keep Run authority in OSS and self-host outside Hosted billing |
 | 7 | takoserver-private / takosumi-hosted | Owner consumes reviewed schema/CPE prerequisites, composes private tariffs/Stripe settings, and snapshots/rehearses cutover; terminal `4d7bccc3` owns staging D1 apply/deploy/test, including test-mode journeys |
+| 8 | takoserver / takosumi-hosted | Adopt the common Organization screen labels, cents presentation with exact sub-cent details, expiry-aware lot list, strict cent cash input and pending/error states; complete class totals require one authoritative snapshot |
 
 Minimum implementation proof includes `C > H` with no writes; zero capture;
 concurrent terminal writes; expiry at the exact boundary and after restart;
