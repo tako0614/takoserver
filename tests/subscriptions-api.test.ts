@@ -33,7 +33,10 @@ const pricing = compilePricingAuthoring({
     configured: { expectedAmountMinor: 1200, currency: "USD", interval: "month" },
   },
 });
-function fixture(enabled = true) {
+function fixture(
+  enabled = true,
+  planTable: SubscriptionPayments["planTable"] = pricing.hostedPlanTable,
+) {
   const calls: string[] = [];
   const scopes: Record<string, readonly ApiKeyScope[]> = {
     reader: ["wallet:read"],
@@ -42,7 +45,7 @@ function fixture(enabled = true) {
     wrongOrg: ["payments:write", "wallet:read"],
   };
   const service: SubscriptionPayments = {
-    planTable: pricing.hostedPlanTable,
+    planTable,
     async read(org) {
       calls.push(`read:${org}`);
       return null;
@@ -217,4 +220,78 @@ test("OpenAPI publishes subscription scope, request and refund projection contra
   expect(document.components.schemas).toHaveProperty("SubscriptionProjection");
   expect(JSON.stringify(document.components.schemas.WalletResponse)).toContain("refund_receivable");
   expect(JSON.stringify(document.components.schemas.WalletHoldReceipt)).toContain("closureReason");
+});
+
+test("subscription HTTP publishes legacy and two-choice tables within the OpenAPI row contract", async () => {
+  const source = await Bun.file(
+    new URL("../config/shared-hosted-pricing.json", import.meta.url),
+  ).json();
+  source.plans[0].stripePriceId = "price_api10";
+  source.plans[1].stripePriceId = "price_api50";
+  const meters = Object.fromEntries(
+    Object.entries(
+      source.meters as Record<
+        string,
+        { unit: string; cloudflareCostMicros: string; quantity: string }
+      >,
+    )
+      .filter(([, meter]) => meter.cloudflareCostMicros !== "0")
+      .map(([key, meter]) => [
+        key,
+        {
+          unit: meter.unit,
+          rate: {
+            numeratorMicros: (BigInt(meter.cloudflareCostMicros) * 3n).toString(),
+            denominator: meter.quantity,
+          },
+        },
+      ]),
+  );
+  const shared = compilePricingAuthoring({
+    authoringVersion: 2,
+    sharedPricing: source,
+    planIds: { free: "free", usage: "usage" },
+    billingConfig: {
+      schemaVersion: 1,
+      revision: source.revision,
+      effectiveAt: "2026-10-14T00:00:00.000Z",
+      currency: "USD",
+      freeIncludedMinor: 150,
+      purchaseCreditExpiry: { kind: "none" },
+      plans: {
+        "hosted-10": { includedMinor: 2000, stripePriceId: "price_api10" },
+        "hosted-50": { includedMinor: 10000, stripePriceId: "price_api50" },
+      },
+      meters,
+    },
+    checkout: { minimumMinor: 50, maximumMinor: 5000 },
+  });
+  const schema = openApiDocument.components.schemas.HostedPlanTable.properties.plans;
+  for (const table of [pricing.hostedPlanTable, shared.hostedPlanTable]) {
+    const response = await fixture(true, table).request("GET", "reader");
+    expect(response?.status).toBe(200);
+    const body = await response?.json();
+    expect(body).toEqual({ subscription: null, planTable: table });
+    expect(table.plans.length).toBeGreaterThanOrEqual(schema.minItems);
+    expect(table.plans.length).toBeLessThanOrEqual(schema.maxItems);
+    for (const plan of table.plans) {
+      const variant = schema.items.oneOf.find((row) => row.properties.tier.const === plan.tier);
+      expect(variant).toBeDefined();
+      expect(Object.keys(plan).sort()).toEqual([...(variant?.required ?? [])].sort());
+    }
+  }
+  expect(shared.hostedPlanTable.plans.map((plan) => plan.tier)).toEqual([
+    "free",
+    "subscription",
+    "subscription",
+    "usage",
+  ]);
+  expect(
+    shared.hostedPlanTable.plans
+      .filter((plan) => plan.tier === "subscription")
+      .map((plan) => [plan.planId, plan.monthlyAmountMinor, plan.includedCreditMinor]),
+  ).toEqual([
+    ["hosted-10", 1000, 2000],
+    ["hosted-50", 5000, 10000],
+  ]);
 });

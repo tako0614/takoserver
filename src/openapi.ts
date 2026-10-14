@@ -1425,9 +1425,11 @@ export const openApiDocument = {
             maxItems: 4,
           },
           plans: {
+            description:
+              "Shared commercial roles: one Free row, one legacy or two configured subscription choices, and one usage row.",
             type: "array",
             minItems: 3,
-            maxItems: 3,
+            maxItems: 4,
             items: {
               oneOf: [
                 {
