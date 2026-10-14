@@ -596,8 +596,14 @@ const LAYERS: readonly Layer[] = [
     // Shared app name policy belongs to the existing origin reservation domain.
     // Its pure helpers do not gain adapter or composition import authority.
     name: "domain",
-    match: /^src\/shared-app-name\.ts$/u,
+    match: /^src\/shared-app-(?:name|ledger)\.ts$/u,
     may: ["core", "domain", "release-data"],
+  },
+  {
+    // This unmounted composition alone supplies the fresh primary-D1 capability.
+    name: "shared-app-ledger-d1-composition",
+    match: /^src\/shared-app-ledger-d1\.ts$/u,
+    may: ["core", "adapter", "domain"],
   },
 ];
 
