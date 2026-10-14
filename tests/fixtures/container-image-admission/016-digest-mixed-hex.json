@@ -1,0 +1,33 @@
+{
+  "id": "016-digest-mixed-hex",
+  "category": "reference",
+  "description": "All hexadecimal digits are accepted in an exact SHA-256 pin.",
+  "input": {
+    "imageRef": "registry.example.test/workload@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    },
+    "registry": {
+      "visibility": "public"
+    },
+    "manifest": {
+      "kind": "image",
+      "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "platform": {
+        "os": "linux",
+        "architecture": "amd64"
+      },
+      "sizeBytes": 4096
+    }
+  },
+  "expected": {
+    "decision": "accept",
+    "digest": "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "sizeBytes": 4096,
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    }
+  }
+}

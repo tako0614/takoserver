@@ -579,6 +579,13 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "adapter", "domain", "routes", "app", "package-surface"],
   },
   {
+    // Host policy decisions are neutral domain functions; native enforcement
+    // and image registry adapters stay behind their owning composition ports.
+    name: "domain",
+    match: /^src\/container-(?:egress-policy|image-admission)\.ts$/u,
+    may: ["core", "domain"],
+  },
+  {
     // The shared monetary source is domain data; the hosted runtime pins its
     // commercial terms while Price identities are resolved separately.
     name: "domain",
