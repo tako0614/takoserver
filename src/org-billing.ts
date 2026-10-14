@@ -250,14 +250,27 @@ export function createOrgBilling(options: {
     return row ? parseBillingConfig(String(row.config_json)) : undefined;
   }
 
+  async function sweep(limit: number, cutoff: string, org?: string): Promise<number> {
+    const rows = await sql.query(
+      `SELECT * FROM org_wallet_holds WHERE state = 'live' AND expires_at <= ? ${org === undefined ? "" : "AND org_id = ?"} ORDER BY expires_at, org_id, ref LIMIT ?`,
+      org === undefined ? [cutoff, limit] : [cutoff, org, limit],
+    );
+    for (const row of rows) await close(row, "expired", 0);
+    return rows.length;
+  }
+
   async function prepare(org: string): Promise<void> {
     await registerTariffs(sql, config, now());
-    await service.expireDue(8, org);
+    // The bounded sweep and its backlog check read one instant. A deadline that
+    // passes after it is not backlog: every terminal write fences on its own
+    // deadline, and `current` closes such a row as expired before reporting it.
+    const cutoff = now();
+    await sweep(8, cutoff, org);
     if (
       (
         await sql.query(
           "SELECT 1 FROM org_wallet_holds WHERE org_id = ? AND state = 'live' AND expires_at <= ? LIMIT 1",
-          [org, now()],
+          [org, cutoff],
         )
       ).length
     )
@@ -419,6 +432,13 @@ export function createOrgBilling(options: {
     return holdReceipt(receipt);
   }
 
+  /** A live row past its deadline closes as expired; it is never reported live. */
+  async function current(row: Row): Promise<HoldReceipt> {
+    return row.state === "live" && String(row.expires_at) <= now()
+      ? close(row, "expired", 0)
+      : holdReceipt(row);
+  }
+
   const service: OrgBilling = {
     async wallet(org) {
       await prepare(org);
@@ -515,7 +535,7 @@ export function createOrgBilling(options: {
       if (prior) {
         if (prior.money_policy !== "usd-micros-v2") orgBillingFail("reference_conflict", 409);
         if (prior.fingerprint !== signature) orgBillingFail("reference_conflict", 409);
-        return holdReceipt(prior);
+        return current(prior);
       }
       const tariff = await tariffAt(now());
       if (!tariff || input.pricingRevision !== tariff.revision)
@@ -602,8 +622,7 @@ export function createOrgBilling(options: {
       await prepare(org);
       const row = await held(org, ref);
       if (!row) orgBillingFail("hold_not_found", 404);
-      if (row.state === "live" && String(row.expires_at) <= now()) return close(row, "expired", 0);
-      return holdReceipt(row);
+      return current(row);
     },
     async capture(input) {
       reference(input.reference);
@@ -844,12 +863,7 @@ export function createOrgBilling(options: {
     async expireDue(limit, org) {
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)
         orgBillingFail("invalid_limit", 400);
-      const rows = await sql.query(
-        `SELECT * FROM org_wallet_holds WHERE state = 'live' AND expires_at <= ? ${org === undefined ? "" : "AND org_id = ?"} ORDER BY expires_at, org_id, ref LIMIT ?`,
-        org === undefined ? [now(), limit] : [now(), org, limit],
-      );
-      for (const row of rows) await close(row, "expired", 0);
-      return rows.length;
+      return sweep(limit, now(), org);
     },
   };
   return service;
