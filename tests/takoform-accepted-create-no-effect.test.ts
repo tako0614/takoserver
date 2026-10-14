@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { createLedger } from "../src/ledger.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
+import { minorToMicros } from "../src/money.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import type { Sql } from "../src/ports.ts";
 import {
@@ -791,13 +792,15 @@ test("recognizes an atomically committed compensation after its Host acknowledge
   await fixture.ledger.fund({
     organizationId: "tenant-a",
     fundingRef: "funding:compensation-readback",
-    amountMinor: 1_000,
+    amountMicros: minorToMicros(1_000),
+    kind: "purchased",
+    consumptionClass: "purchased",
   });
   expect(
     await fixture.ledger.hold({
       organizationId: "tenant-a",
       reference: fixture.operationId,
-      amountMinor: 500,
+      amountMicros: minorToMicros(500),
     }),
   ).toBe(true);
   fixture.database
@@ -812,13 +815,17 @@ test("recognizes an atomically committed compensation after its Host acknowledge
   });
   expect(fixture.settlementObservation.faults).toBe(1);
   const wallet = await fixture.ledger.wallet("tenant-a");
-  expect(wallet).toMatchObject({ settledMinor: 1_000, heldMinor: 0, availableMinor: 1_000 });
+  expect(wallet).toMatchObject({
+    settledMicros: 10_000_000,
+    heldMicros: 0,
+    availableMicros: 10_000_000,
+  });
   expect(wallet.entries).toEqual(
     expect.arrayContaining([
       expect.objectContaining({
         type: "release",
         reference: fixture.operationId,
-        heldDeltaMinor: -500,
+        heldDeltaMicros: -5_000_000,
       }),
     ]),
   );
@@ -832,13 +839,15 @@ test("rolls back compensation history and wallet release when its exact lease fe
   await fixture.ledger.fund({
     organizationId: "tenant-a",
     fundingRef: "funding:compensation-rollback",
-    amountMinor: 1_000,
+    amountMicros: minorToMicros(1_000),
+    kind: "purchased",
+    consumptionClass: "purchased",
   });
   expect(
     await fixture.ledger.hold({
       organizationId: "tenant-a",
       reference: fixture.operationId,
-      amountMinor: 500,
+      amountMicros: minorToMicros(500),
     }),
   ).toBe(true);
   fixture.database
@@ -849,7 +858,11 @@ test("rolls back compensation history and wallet release when its exact lease fe
   expect(await held?.json()).toMatchObject({ id: fixture.operationId, done: false });
   expect(fixture.settlementObservation.faults).toBe(1);
   const wallet = await fixture.ledger.wallet("tenant-a");
-  expect(wallet).toMatchObject({ settledMinor: 1_000, heldMinor: 500, availableMinor: 500 });
+  expect(wallet).toMatchObject({
+    settledMicros: 10_000_000,
+    heldMicros: 5_000_000,
+    availableMicros: 5_000_000,
+  });
   expect(wallet.entries).not.toEqual(
     expect.arrayContaining([
       expect.objectContaining({ type: "release", reference: fixture.operationId }),

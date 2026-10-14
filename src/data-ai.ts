@@ -1,7 +1,8 @@
 import type { AiGateway, AiModel, AiUsage } from "./ai-port.ts";
 import {
+  type AiLegacySettledRequest,
   type AiPendingRequest,
-  type AiRequestRecord,
+  type AiRejectedRequest,
   AiRequestStoreError,
   type AiSettledRequest,
   type ClaimedAiRequest,
@@ -10,6 +11,7 @@ import {
 import type { Accounts } from "./auth.ts";
 import { canonicalDigest, canonicalJson, isJsonObject, type JsonObject } from "./json.ts";
 import type { Ledger } from "./ledger.ts";
+import { safeMicros } from "./money.ts";
 import type { Clock, Sql } from "./ports.ts";
 import { parseStrictJson, StrictJsonError } from "./strict-json.ts";
 
@@ -76,26 +78,12 @@ export function createDataAiRoutes(options: DataAiOptions): DataAiRoutes {
         throw error;
       }
 
-      const model = requestedModel(body, models);
-      if (!model) return openAiFailure("model_not_found", 404, "model");
-      const expectedPricingRevision = request.headers.get("x-takoserver-ai-pricing-revision");
-      if (
-        expectedPricingRevision !== null &&
-        expectedPricingRevision !== (await commercialModels.get(model.id))?.pricing_revision
-      ) {
-        return openAiFailure("pricing_revision_conflict", 409, "model");
-      }
       if (!validMessages(body.messages)) {
         return openAiFailure("invalid_messages", 400, "messages");
       }
       if (body.stream !== undefined && body.stream !== false) {
         return openAiFailure("stream_not_supported", 400, "stream");
       }
-      const maxOutputTokens = outputLimit(body.max_tokens, model);
-      if (maxOutputTokens === null) {
-        return openAiFailure("invalid_max_tokens", 400, "max_tokens");
-      }
-
       const idempotencyKey = request.headers.get("idempotency-key");
       if (idempotencyKey === null) {
         return openAiFailure("idempotency_key_required", 400);
@@ -104,22 +92,55 @@ export function createDataAiRoutes(options: DataAiOptions): DataAiRoutes {
         return openAiFailure("invalid_idempotency_key", 400);
       }
 
+      const fingerprint = await canonicalDigest(body);
+      try {
+        const legacy = await requests.lookupCompletedLegacy({
+          organizationId: actor.organizationId,
+          idempotencyKey,
+          fingerprint,
+        });
+        if (legacy) return legacyResultResponse(legacy);
+      } catch (error) {
+        return requestStoreFailure(error);
+      }
+
+      const model = requestedModel(body, models);
+      if (!model) return openAiFailure("model_not_found", 404, "model");
+      const maxOutputTokens = outputLimit(body.max_tokens, model);
+      if (maxOutputTokens === null) {
+        return openAiFailure("invalid_max_tokens", 400, "max_tokens");
+      }
+      const expectedPricingRevision = request.headers.get("x-takoserver-ai-pricing-revision");
+      if (
+        expectedPricingRevision !== null &&
+        expectedPricingRevision !== (await commercialModels.get(model.id))?.pricing_revision
+      ) {
+        return openAiFailure("pricing_revision_conflict", 409, "model");
+      }
+
       const requestId = `ai_${options.randomId()}`;
-      const ceiling = tokenCharge(model.limits.maxInputTokens, maxOutputTokens, model);
+      const ceilingMicros = tokenCharge(model.limits.maxInputTokens, maxOutputTokens, model);
       let claim: ClaimedAiRequest;
       try {
         claim = await requests.claim({
           organizationId: actor.organizationId,
           idempotencyKey,
-          fingerprint: await canonicalDigest(body),
+          fingerprint,
           requestId,
-          ceilingMinor: ceiling,
+          ceilingMicros,
         });
       } catch (error) {
         return requestStoreFailure(error);
       }
 
       if (!claim.created) {
+        if (
+          claim.record.kind === "result" &&
+          claim.record.phase === "completed" &&
+          claim.record.moneyPolicy === "usd-cents-v1"
+        ) {
+          return legacyResultResponse(claim.record);
+        }
         return await resumeAiRequest({
           claim,
           record: claim.record,
@@ -135,11 +156,11 @@ export function createDataAiRoutes(options: DataAiOptions): DataAiRoutes {
       }
 
       if (
-        ceiling > 0 &&
+        ceilingMicros > 0 &&
         !(await options.ledger.hold({
           organizationId: actor.organizationId,
           reference: requestId,
-          amountMinor: ceiling,
+          amountMicros: ceilingMicros,
         }))
       ) {
         const responseBody = openAiFailureBody("insufficient_quota", 402);
@@ -153,6 +174,13 @@ export function createDataAiRoutes(options: DataAiOptions): DataAiRoutes {
 
       try {
         const ready = await requests.ready(claim);
+        if (
+          ready.kind !== "pending" ||
+          ready.phase !== "ready" ||
+          ready.moneyPolicy !== "usd-micros-v2"
+        ) {
+          return openAiFailure("request_state_unavailable", 503);
+        }
         return await resumeAiRequest({
           claim,
           record: ready,
@@ -181,7 +209,7 @@ type AiRequestStore = ReturnType<typeof createAiRequestStore>;
 
 async function resumeAiRequest(input: {
   readonly claim: Awaited<ReturnType<AiRequestStore["claim"]>>;
-  readonly record: AiRequestRecord;
+  readonly record: AiPendingRequest | AiSettledRequest | AiRejectedRequest;
   readonly body: JsonObject;
   readonly model: AiModel;
   readonly idempotencyKey: string;
@@ -223,7 +251,15 @@ async function resumeAiRequest(input: {
   }
 
   try {
-    record = await requests.dispatched(claim, record);
+    const dispatched = await requests.dispatched(claim, record);
+    if (
+      dispatched.kind !== "pending" ||
+      dispatched.phase !== "dispatched" ||
+      dispatched.moneyPolicy !== "usd-micros-v2"
+    ) {
+      return openAiFailure("request_state_unavailable", 503);
+    }
+    record = dispatched;
   } catch (error) {
     return requestStoreFailure(error);
   }
@@ -243,16 +279,17 @@ async function resumeAiRequest(input: {
       const withinLimits =
         completion.usage.inputTokens <= model.limits.maxInputTokens &&
         completion.usage.outputTokens <= model.limits.maxOutputTokens;
-      const actual = withinLimits
+      const actualMicros = withinLimits
         ? tokenCharge(completion.usage.inputTokens, completion.usage.outputTokens, model)
-        : record.ceilingMinor + 1;
+        : record.ceilingMicros;
       outcome =
-        actual <= record.ceilingMinor
+        withinLimits && actualMicros <= record.ceilingMicros
           ? {
               kind: "result",
               requestId: record.requestId,
-              ceilingMinor: record.ceilingMinor,
-              actualMinor: actual,
+              moneyPolicy: "usd-micros-v2",
+              ceilingMicros: record.ceilingMicros,
+              actualMicros,
               responseStatus: 200,
               responseBody: completion.body,
               usageModel: model.id,
@@ -267,7 +304,9 @@ async function resumeAiRequest(input: {
 
   try {
     const staged = await requests.stage(claim, outcome);
-    if (staged.kind !== "result") return openAiFailure("request_state_unavailable", 503);
+    if (staged.kind !== "result" || staged.moneyPolicy !== "usd-micros-v2") {
+      return openAiFailure("request_state_unavailable", 503);
+    }
     return await settleAiRequest({
       claim,
       record: staged,
@@ -291,18 +330,18 @@ async function settleAiRequest(input: {
 }): Promise<Response> {
   const { claim, record, organizationId, ledger, recordUsage, requests } = input;
   try {
-    if (record.actualMinor > 0) {
+    if (record.actualMicros > 0) {
       await ledger.capture({
         organizationId,
         reference: record.requestId,
-        amountMinor: record.actualMinor,
+        amountMicros: record.actualMicros,
       });
     }
     await release(
       ledger,
       organizationId,
       record.requestId,
-      record.ceilingMinor - record.actualMinor,
+      record.ceilingMicros - record.actualMicros,
     );
     if (record.usageModel !== null) {
       await recordUsage({
@@ -314,7 +353,9 @@ async function settleAiRequest(input: {
       });
     }
     const completed = await requests.finish(claim, record);
-    if (completed.kind !== "result") throw new AiRequestStoreError("state_conflict");
+    if (completed.kind !== "result" || completed.moneyPolicy !== "usd-micros-v2") {
+      throw new AiRequestStoreError("state_conflict");
+    }
     return resultResponse(completed);
   } catch {
     return openAiFailure("settlement_pending", 503);
@@ -325,8 +366,9 @@ function failedOutcome(record: AiPendingRequest, code: string): Omit<AiSettledRe
   return {
     kind: "result",
     requestId: record.requestId,
-    ceilingMinor: record.ceilingMinor,
-    actualMinor: 0,
+    moneyPolicy: "usd-micros-v2",
+    ceilingMicros: record.ceilingMicros,
+    actualMicros: 0,
     responseStatus: 502,
     responseBody: openAiFailureBody(code, 502),
     usageModel: null,
@@ -338,7 +380,17 @@ function failedOutcome(record: AiPendingRequest, code: string): Omit<AiSettledRe
 function resultResponse(record: AiSettledRequest): Response {
   return jsonResponse(record.responseBody, record.responseStatus, {
     "x-request-id": record.requestId,
+    "x-takoserver-billed-micros": String(record.actualMicros),
+    "x-takoserver-money-policy": "usd-micros-v2",
+  });
+}
+
+function legacyResultResponse(record: AiLegacySettledRequest): Response {
+  return jsonResponse(record.responseBody, record.responseStatus, {
+    "x-request-id": record.requestId,
     "x-takoserver-billed-minor": String(record.actualMinor),
+    "x-takoserver-billed-micros": String(record.actualMicros),
+    "x-takoserver-money-policy": "usd-cents-v1",
   });
 }
 
@@ -363,10 +415,7 @@ function validateModels(input: readonly AiModel[]): readonly AiModel[] {
       !positiveInteger(model.limits.maxOutputTokens) ||
       !nonNegativeInteger(model.price.inputMinorPerMillionTokens) ||
       !nonNegativeInteger(model.price.outputMinorPerMillionTokens) ||
-      !Number.isSafeInteger(
-        model.limits.maxInputTokens * model.price.inputMinorPerMillionTokens +
-          model.limits.maxOutputTokens * model.price.outputMinorPerMillionTokens,
-      )
+      !withinMicrosRange(model.limits, model.price)
     ) {
       throw new TypeError("invalid AI model catalog");
     }
@@ -467,27 +516,29 @@ function parseCompletion(
 }
 
 function tokenCharge(inputTokens: number, outputTokens: number, model: AiModel): number {
-  const micros =
-    inputTokens * model.price.inputMinorPerMillionTokens +
-    outputTokens * model.price.outputMinorPerMillionTokens;
-  return Math.ceil(micros / 1_000_000);
+  const centsRate =
+    BigInt(inputTokens) * BigInt(model.price.inputMinorPerMillionTokens) +
+    BigInt(outputTokens) * BigInt(model.price.outputMinorPerMillionTokens);
+  const micros = (centsRate * 10_000n + 999_999n) / 1_000_000n;
+  return safeMicros(micros);
 }
 
 async function modelCommercialTerms(model: AiModel): Promise<{
   readonly pricing_revision: `sha256:${string}`;
-  readonly maximum_charge_minor: number;
+  readonly maximum_charge_micros: string;
+  readonly money_policy: "usd-micros-v2";
 }> {
   return {
     pricing_revision: await canonicalDigest({
       id: model.id,
       limits: model.limits,
       price: model.price,
+      money_policy: "usd-micros-v2",
     }),
-    maximum_charge_minor: tokenCharge(
-      model.limits.maxInputTokens,
-      model.limits.maxOutputTokens,
-      model,
+    maximum_charge_micros: String(
+      tokenCharge(model.limits.maxInputTokens, model.limits.maxOutputTokens, model),
     ),
+    money_policy: "usd-micros-v2",
   };
 }
 
@@ -499,10 +550,22 @@ async function release(
   ledger: Ledger,
   organizationId: string,
   reference: string,
-  amountMinor: number,
+  amountMicros: number,
 ): Promise<void> {
-  if (amountMinor <= 0) return;
-  await ledger.release({ organizationId, reference, amountMinor });
+  if (amountMicros <= 0) return;
+  await ledger.release({ organizationId, reference, amountMicros });
+}
+
+function withinMicrosRange(limits: AiModel["limits"], price: AiModel["price"]): boolean {
+  try {
+    const centsRate =
+      BigInt(limits.maxInputTokens) * BigInt(price.inputMinorPerMillionTokens) +
+      BigInt(limits.maxOutputTokens) * BigInt(price.outputMinorPerMillionTokens);
+    safeMicros((centsRate * 10_000n + 999_999n) / 1_000_000n);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function positiveInteger(value: unknown): value is number {

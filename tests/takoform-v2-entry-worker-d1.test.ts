@@ -372,6 +372,12 @@ test("configured artifact Forms refuse incomplete 0075 or 0081 before accepting 
       await refuseBeforeAcceptance();
       await database.prepare(definition).run();
     }
+    await refuseBeforeAcceptance();
+    for (const migration of MIGRATIONS.slice(privateIndex + 1)) {
+      for (const statement of splitMigration(migration.sql)) {
+        await database.prepare(statement).run();
+      }
+    }
     const qualified = await runtime.dispatchFetch(
       `${BASE}/support?form=${encodeURIComponent(SQLITE_MIGRATION_SET_FORM_URL)}`,
       { headers: { authorization: `Bearer ${TOKEN}` } },

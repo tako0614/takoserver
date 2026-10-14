@@ -8,6 +8,7 @@ import {
   InMemoryTakoformResourceDriver,
 } from "../src/index.ts";
 import { createLedger } from "../src/ledger.ts";
+import { minorToMicros } from "../src/money.ts";
 import type { PaymentEventContext } from "../src/payment-events.ts";
 import {
   DEFAULT_CHECKOUT_MAXIMUM_MINOR,
@@ -184,11 +185,20 @@ async function host(
     queries,
     stripe,
     payment,
-    balance: async (organizationId: string) => (await ledger.wallet(organizationId)).settledMinor,
+    balance: async (organizationId: string) =>
+      (await ledger.wallet(organizationId)).settledMicros / 10_000,
     fund: async (organizationId: string, fundingRef: string, amountMinor: number) =>
-      await ledger.fund({ organizationId, fundingRef, amountMinor }),
+      await ledger.fund({
+        organizationId,
+        fundingRef,
+        amountMicros: minorToMicros(amountMinor),
+        kind: "purchased",
+        consumptionClass: "purchased",
+      }),
     fundingRows: async () =>
-      await sql.query("SELECT org_id, ref, settled_delta FROM ledger WHERE type = 'funding'"),
+      await sql.query(
+        "SELECT org_id, ref, settled_delta_micros FROM ledger WHERE type = 'funding'",
+      ),
     events: async () =>
       await sql.query(
         "SELECT event_id, type, outcome, outcome_detail, object_id FROM stripe_events ORDER BY event_id",
@@ -315,7 +325,7 @@ describe("Stripe webhook route", () => {
     expect(await h.balance(ORG)).toBe(5_000);
     expect(await h.balance(OTHER_ORG)).toBe(0);
     expect(await h.fundingRows()).toEqual([
-      { org_id: ORG, ref: "stripe:cs_test_paid", settled_delta: 5_000 },
+      { org_id: ORG, ref: "stripe:cs_test_paid", settled_delta_micros: 50_000_000 },
     ]);
     expect(await h.events()).toEqual([
       {

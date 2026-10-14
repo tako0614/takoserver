@@ -1,7 +1,9 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, lstatSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { deriveExpectedApplicationShape } from "../scripts/deploy/application-schema-shape.ts";
 import { DeployError, deployFailureAftermath, preflightError } from "../scripts/deploy/errors.ts";
+import { readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import { expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
@@ -35,6 +37,9 @@ const BEFORE_VERSION = "00000000-0000-4000-8000-000000000005";
 const BEFORE_DEPLOYMENT = "00000000-0000-4000-8000-000000000004";
 const CONCURRENT_VERSION = "00000000-0000-4000-8000-000000000006";
 const CONCURRENT_DEPLOYMENT = "00000000-0000-4000-8000-000000000007";
+const canonicalMigrations = readMigrationArtifact();
+const canonicalMoneyShape = deriveExpectedApplicationShape(canonicalMigrations.files);
+const canonicalMoneyShapeDigest = `sha256:${createHash("sha256").update(canonicalMoneyShape).digest("hex")}`;
 
 const VERSION_BODY = {
   id: VERSION,
@@ -1425,7 +1430,19 @@ async function routineVersionPublication(
   };
   const migrations: WorkerMigrationReader = {
     async read() {
-      return { local: ["0001_first.sql"], applied: ["0001_first.sql"] };
+      return {
+        local: canonicalMigrations.names,
+        applied: canonicalMigrations.names,
+        shape: canonicalMoneyShape,
+        shapeDigest: canonicalMoneyShapeDigest,
+        moneyUnitPolicy: [
+          {
+            ledger_unit: "usd-micros-v2",
+            historical_usage_unit: "microcent-v1",
+            cash_unit: "usd-cents-v1",
+          },
+        ],
+      };
     },
   };
   try {

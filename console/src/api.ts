@@ -49,17 +49,17 @@ export interface LedgerEntry {
   readonly organizationId: string;
   readonly type: string;
   readonly reference: string;
-  readonly settledDeltaMinor: number;
-  readonly heldDeltaMinor: number;
+  readonly settledDeltaMicros: string;
+  readonly heldDeltaMicros: string;
   readonly createdAt: string;
 }
 
 export interface Wallet {
   readonly organizationId: string;
   readonly currency: string;
-  readonly settledMinor: number;
-  readonly heldMinor: number;
-  readonly availableMinor: number;
+  readonly settledMicros: string;
+  readonly heldMicros: string;
+  readonly availableMicros: string;
   readonly entries: readonly LedgerEntry[];
 }
 
@@ -145,6 +145,133 @@ export interface ApiOptions {
   readonly origin: string;
   readonly token: () => string | null;
   readonly onSessionLost: () => void;
+}
+
+const MAX_SAFE_MICROS = BigInt(Number.MAX_SAFE_INTEGER);
+
+/** Format canonical signed USD micros without converting money through cents. */
+export function formatMicrosCurrency(
+  value: string,
+  currency = "USD",
+  locale: "en-US" | "ja-JP" = "en-US",
+): string {
+  if (!/^-?(0|[1-9][0-9]*)$/u.test(value) || value === "-0") {
+    throw new TypeError("invalid micros value");
+  }
+  const signed = BigInt(value);
+  const absolute = signed < 0n ? -signed : signed;
+  if (absolute > MAX_SAFE_MICROS || !/^[A-Z]{3}$/u.test(currency)) {
+    throw new TypeError("micros value out of range");
+  }
+
+  const whole = absolute / 1_000_000n;
+  const remainder = absolute % 1_000_000n;
+  const fraction =
+    remainder === 0n ? "" : remainder.toString().padStart(6, "0").replace(/0+$/u, "");
+  const currencyFormatter = new Intl.NumberFormat(locale, {
+    style: "currency",
+    currency,
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 0,
+  });
+  // Use -1 for a negative sub-dollar value so locale-specific sign/currency
+  // placement survives while the integer digits are replaced with zero.
+  const parts = currencyFormatter.formatToParts(
+    signed < 0n ? (whole === 0n ? -1n : -whole) : whole,
+  );
+  const digits = new Intl.NumberFormat(locale, {
+    useGrouping: false,
+    maximumFractionDigits: 0,
+  });
+  const decimal = new Intl.NumberFormat(locale, { minimumFractionDigits: 1 })
+    .formatToParts(1.1)
+    .find((part) => part.type === "decimal")?.value;
+  const fractionText = [...fraction].map((digit) => digits.format(Number(digit))).join("");
+  const lastInteger = parts.reduce(
+    (last, part, index) => (part.type === "integer" ? index : last),
+    -1,
+  );
+  if (lastInteger < 0) throw new TypeError("currency formatter omitted integer");
+
+  const output: string[] = [];
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (!part) continue;
+    output.push(
+      signed < 0n && whole === 0n && part.type === "integer" ? digits.format(0) : part.value,
+    );
+    if (index === lastInteger && fraction !== "") {
+      if (decimal === undefined)
+        throw new TypeError("currency formatter omitted decimal separator");
+      output.push(decimal, fractionText);
+    }
+  }
+  return output.join("");
+}
+
+function decodeWallet(payload: unknown, organizationId: string): Wallet {
+  if (!isRecord(payload) || !isRecord(payload.wallet)) throw new TypeError("invalid wallet");
+  const wallet = payload.wallet;
+  if (
+    wallet.organizationId !== organizationId ||
+    wallet.currency !== "USD" ||
+    !Array.isArray(wallet.entries)
+  ) {
+    throw new TypeError("invalid wallet identity");
+  }
+  const settledMicros = unsignedMicros(wallet.settledMicros);
+  const heldMicros = unsignedMicros(wallet.heldMicros);
+  const availableMicros = unsignedMicros(wallet.availableMicros);
+  if (BigInt(settledMicros) - BigInt(heldMicros) !== BigInt(availableMicros)) {
+    throw new TypeError("invalid wallet conservation");
+  }
+  const entries = wallet.entries.map((entry): LedgerEntry => {
+    if (
+      !isRecord(entry) ||
+      typeof entry.id !== "string" ||
+      typeof entry.organizationId !== "string" ||
+      entry.organizationId !== organizationId ||
+      typeof entry.type !== "string" ||
+      typeof entry.reference !== "string" ||
+      typeof entry.createdAt !== "string"
+    ) {
+      throw new TypeError("invalid wallet entry");
+    }
+    return {
+      id: entry.id,
+      organizationId,
+      type: entry.type,
+      reference: entry.reference,
+      settledDeltaMicros: signedMicros(entry.settledDeltaMicros),
+      heldDeltaMicros: signedMicros(entry.heldDeltaMicros),
+      createdAt: entry.createdAt,
+    };
+  });
+  return { organizationId, currency: "USD", settledMicros, heldMicros, availableMicros, entries };
+}
+
+function unsignedMicros(value: unknown): string {
+  if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/u.test(value)) {
+    throw new TypeError("invalid unsigned micros");
+  }
+  const amount = BigInt(value);
+  if (amount > MAX_SAFE_MICROS) throw new TypeError("micros out of range");
+  return value;
+}
+
+function signedMicros(value: unknown): string {
+  if (typeof value !== "string" || !/^-?(0|[1-9][0-9]*)$/u.test(value) || value === "-0") {
+    throw new TypeError("invalid signed micros");
+  }
+  const amount = BigInt(value);
+  if (amount < -MAX_SAFE_MICROS || amount > MAX_SAFE_MICROS) {
+    throw new TypeError("micros out of range");
+  }
+  return value;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 export function createApi(options: ApiOptions) {
@@ -283,11 +410,15 @@ export function createApi(options: ApiOptions) {
         `/v1/organizations/${encodeURIComponent(organizationId)}/api-keys/${encodeURIComponent(apiKeyId)}`,
       ),
 
-    wallet: (organizationId: string) =>
-      call<{ wallet: Wallet }>(
-        "GET",
-        `/v1/organizations/${encodeURIComponent(organizationId)}/wallet`,
-      ),
+    wallet: async (organizationId: string) => {
+      const path = `/v1/organizations/${encodeURIComponent(organizationId)}/wallet`;
+      const result = await request<unknown>("GET", path);
+      try {
+        return { wallet: decodeWallet(result.payload, organizationId) };
+      } catch {
+        throw new ApiError("invalid_response", result.status, path);
+      }
+    },
 
     /**
      * Starts a payment. Answers 404 where this deployment cannot take one,
@@ -463,10 +594,6 @@ export function createApi(options: ApiOptions) {
         `/v1/organizations/${encodeURIComponent(organizationId)}/operations`,
       ),
   };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isV2Operation(value: unknown): value is ResourceOperation {

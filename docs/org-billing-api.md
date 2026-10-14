@@ -3,9 +3,11 @@
 This file records the cents implementation merged in #318. The CTO revision
 in [unified billing](unified-billing.md) supersedes its cents, ties-to-even and
 global expiry-order decisions with a micros ledger, one invoice ceiling and
-free/subscription/purchased priority. Those changes require the separate
-API/ledger implementation PR and forward migration described there; this
-documentation revision does not change the current runtime.
+free/subscription/purchased priority. The separate
+[micros API/ledger implementation](org-billing-micros.md) now describes the
+replacement source, public wire and guarded forward migrations 0093/0094.
+The cents contracts below are retained as historical #318 documentation and
+must not be used to drive the new writer epoch. No live cutover is claimed.
 
 Ledger key: `org-billing-api-20261014`; status: implementation and local review.
 This is the first implementation wave of [unified billing](unified-billing.md),

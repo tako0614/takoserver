@@ -16,9 +16,16 @@ import {
 import type { Catalog } from "./catalog.ts";
 import { errorEnvelope } from "./error-envelope.ts";
 import { GoogleIdentityError } from "./google-identity.ts";
-import { type FundingSettlementVerifier, type Ledger, LedgerError } from "./ledger.ts";
+import { type FundingSettlementVerifier, type Ledger, LedgerError, type Wallet } from "./ledger.ts";
+import { MoneyError, minorToMicros, parseUnsignedMicros } from "./money.ts";
 import { OperatorAssertionError } from "./operator-credentials.ts";
-import { type OrgBilling, OrgBillingError } from "./org-billing.ts";
+import {
+  type CreditLot,
+  type HoldReceipt,
+  type OrgBilling,
+  OrgBillingError,
+  type UsageReceipt,
+} from "./org-billing.ts";
 import {
   type FundingReconcileReport,
   PaymentEventError,
@@ -631,9 +638,11 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       const organizationId = segment(wallet[1]);
       await scoped(request, organizationId, "wallet:read");
       return Response.json({
-        wallet: options.billing
-          ? await options.billing.wallet(organizationId)
-          : await ledger.wallet(organizationId),
+        wallet: wireWallet(
+          options.billing
+            ? await options.billing.wallet(organizationId)
+            : await ledger.wallet(organizationId),
+        ),
       });
     }
 
@@ -644,7 +653,8 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
         await scoped(request, organizationId, "wallet:read");
         const limit = billingPageSize(url);
         const cursor = billingCursor(url);
-        return Response.json(await options.billing.lots(organizationId, limit, cursor));
+        const page = await options.billing.lots(organizationId, limit, cursor);
+        return Response.json({ ...page, lots: page.lots.map(wireLot) });
       }
 
       const hold = /^\/v1\/organizations\/([^/]+)\/wallet\/holds\/([^/]+)$/u.exec(url.pathname);
@@ -652,7 +662,9 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
         const organizationId = segment(hold[1]);
         await scoped(request, organizationId, "wallet:read");
         return Response.json({
-          hold: await options.billing.readHold(organizationId, billingPathReference(hold[2])),
+          hold: wireHold(
+            await options.billing.readHold(organizationId, billingPathReference(hold[2])),
+          ),
         });
       }
 
@@ -661,16 +673,18 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
         const organizationId = segment(holds[1]);
         await scoped(request, organizationId, "wallet:write");
         const body = await jsonObject(request);
-        exactKeys(body, ["reference", "amountMinor", "pricingRevision", "measurementFingerprint"]);
+        exactKeys(body, ["reference", "amountMicros", "pricingRevision", "measurementFingerprint"]);
         return Response.json(
           {
-            hold: await options.billing.hold({
-              organizationId,
-              reference: billingReference(text(body.reference)),
-              amountMinor: integer(body.amountMinor),
-              pricingRevision: billingRevision(body.pricingRevision),
-              measurementFingerprint: billingFingerprint(body.measurementFingerprint),
-            }),
+            hold: wireHold(
+              await options.billing.hold({
+                organizationId,
+                reference: billingReference(text(body.reference)),
+                amountMicros: billingMicros(body.amountMicros),
+                pricingRevision: billingRevision(body.pricingRevision),
+                measurementFingerprint: billingFingerprint(body.measurementFingerprint),
+              }),
+            ),
           },
           { status: 201 },
         );
@@ -684,15 +698,17 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
         await scoped(request, organizationId, "wallet:write");
         const reference = billingPathReference(capture[2]);
         const body = await jsonObject(request);
-        exactKeys(body, ["amountMinor", "actualMicros", "measurementFingerprint"]);
+        exactKeys(body, ["amountMicros", "actualMicros", "measurementFingerprint"]);
         return Response.json({
-          hold: await options.billing.capture({
-            organizationId,
-            reference,
-            amountMinor: integer(body.amountMinor),
-            actualMicros: unsignedIntegerText(body.actualMicros),
-            measurementFingerprint: billingFingerprint(body.measurementFingerprint),
-          }),
+          hold: wireHold(
+            await options.billing.capture({
+              organizationId,
+              reference,
+              amountMicros: billingMicros(body.amountMicros),
+              actualMicros: unsignedIntegerText(body.actualMicros),
+              measurementFingerprint: billingFingerprint(body.measurementFingerprint),
+            }),
+          ),
         });
       }
 
@@ -704,7 +720,9 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
         await scoped(request, organizationId, "wallet:write");
         const reference = billingPathReference(release[2]);
         await emptyBody(request);
-        return Response.json({ hold: await options.billing.release(organizationId, reference) });
+        return Response.json({
+          hold: wireHold(await options.billing.release(organizationId, reference)),
+        });
       }
 
       const usageRecords = /^\/v1\/organizations\/([^/]+)\/wallet\/usage-records$/u.exec(
@@ -715,7 +733,8 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
         await scoped(request, organizationId, "usage:read");
         const limit = billingPageSize(url);
         const cursor = billingCursor(url);
-        return Response.json(await options.billing.listUsage(organizationId, limit, cursor));
+        const page = await options.billing.listUsage(organizationId, limit, cursor);
+        return Response.json({ ...page, usageRecords: page.usageRecords.map(wireUsage) });
       }
       if (usageRecords && request.method === "POST") {
         const organizationId = segment(usageRecords[1]);
@@ -729,23 +748,25 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
           "periodStart",
           "periodEnd",
           "pricingRevision",
-          "expectedMinor",
+          "expectedMicros",
           "measurementFingerprint",
         ]);
         return Response.json(
           {
-            usageRecord: await options.billing.usage({
-              organizationId,
-              reference: billingReference(text(body.reference)),
-              meter: billingMeter(body.meter),
-              quantityUnit: billingUnit(body.quantityUnit),
-              quantity: unsignedDecimal(body.quantity),
-              periodStart: canonicalDateTime(body.periodStart),
-              periodEnd: canonicalDateTime(body.periodEnd),
-              pricingRevision: billingRevision(body.pricingRevision),
-              expectedMinor: integer(body.expectedMinor),
-              measurementFingerprint: billingFingerprint(body.measurementFingerprint),
-            }),
+            usageRecord: wireUsage(
+              await options.billing.usage({
+                organizationId,
+                reference: billingReference(text(body.reference)),
+                meter: billingMeter(body.meter),
+                quantityUnit: billingUnit(body.quantityUnit),
+                quantity: unsignedDecimal(body.quantity),
+                periodStart: canonicalDateTime(body.periodStart),
+                periodEnd: canonicalDateTime(body.periodEnd),
+                pricingRevision: billingRevision(body.pricingRevision),
+                expectedMicros: billingMicros(body.expectedMicros),
+                measurementFingerprint: billingFingerprint(body.measurementFingerprint),
+              }),
+            ),
           },
           { status: 201 },
         );
@@ -766,9 +787,11 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       const credited = await ledger.fund({
         organizationId,
         fundingRef: settled.fundingRef,
-        amountMinor: settled.amountMinor,
+        amountMicros: checkedMinorToMicros(settled.amountMinor),
+        kind: "purchased",
+        consumptionClass: "purchased",
       });
-      return Response.json({ wallet: credited });
+      return Response.json({ wallet: wireWallet(credited) });
     }
 
     const checkout = /^\/v1\/organizations\/([^/]+)\/wallet\/checkout$/u.exec(url.pathname);
@@ -1880,6 +1903,74 @@ function unsignedIntegerText(value: unknown): string {
   const parsed = bounded(value, 256);
   if (!/^(?:0|[1-9][0-9]*)$/u.test(parsed)) controlError("invalid_argument", 400);
   return parsed;
+}
+
+function billingMicros(value: unknown): number {
+  if (typeof value !== "string" || value.length > 16) controlError("invalid_argument", 400);
+  try {
+    return parseUnsignedMicros(value);
+  } catch (error) {
+    if (error instanceof MoneyError) controlError("invalid_argument", 400);
+    throw error;
+  }
+}
+
+function checkedMinorToMicros(value: number): number {
+  try {
+    return minorToMicros(value);
+  } catch (error) {
+    if (error instanceof MoneyError) controlError("invalid_argument", 400);
+    throw error;
+  }
+}
+
+function wireWallet(wallet: Wallet) {
+  return {
+    organizationId: wallet.organizationId,
+    currency: "USD" as const,
+    unit: "USD-micros" as const,
+    moneyPolicy: "usd-micros-v2" as const,
+    settledMicros: String(wallet.settledMicros),
+    heldMicros: String(wallet.heldMicros),
+    availableMicros: String(wallet.availableMicros),
+    entries: wallet.entries.map((entry) => ({
+      id: entry.id,
+      organizationId: entry.organizationId,
+      type: entry.type,
+      reference: entry.reference,
+      settledDeltaMicros: String(entry.settledDeltaMicros),
+      heldDeltaMicros: String(entry.heldDeltaMicros),
+      createdAt: entry.createdAt,
+    })),
+  };
+}
+
+function wireLot(lot: CreditLot) {
+  return {
+    reference: lot.reference,
+    kind: lot.kind,
+    consumptionClass: lot.consumptionClass,
+    amountMicros: String(lot.amountMicros),
+    spentMicros: String(lot.spentMicros),
+    remainingMicros: String(lot.remainingMicros),
+    heldMicros: String(lot.heldMicros),
+    availableMicros: String(lot.availableMicros),
+    expiresAt: lot.expiresAt,
+    createdAt: lot.createdAt,
+  };
+}
+
+function wireHold(hold: HoldReceipt) {
+  return {
+    ...hold,
+    amountMicros: String(hold.amountMicros),
+    capturedMicros: String(hold.capturedMicros),
+    releasedMicros: String(hold.releasedMicros),
+  };
+}
+
+function wireUsage(usage: UsageReceipt) {
+  return { ...usage, amountMicros: String(usage.amountMicros) };
 }
 
 function canonicalDateTime(value: unknown): string {

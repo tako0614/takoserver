@@ -366,7 +366,22 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
     },
   },
   readPrincipal: described("Read the signed-in principal and the organizations it owns"),
-  listAiModels: described("List configured OpenAI-compatible models"),
+  listAiModels: described(
+    "List configured OpenAI-compatible models with canonical USD-micros pricing ceilings",
+    {
+      description:
+        "Each Takoserver commercial ceiling is a canonical decimal string in USD micros (`1 USD = 1,000,000 micros`).",
+      responses: {
+        "200": {
+          description:
+            "Configured models and their immutable Takoserver USD-micros commercial terms",
+          content: {
+            "application/json": { schema: { $ref: "#/components/schemas/AiModelsResponse" } },
+          },
+        },
+      },
+    },
+  ),
   createAiChatCompletion: described("Create a prepaid OpenAI-compatible chat completion", {
     parameters: [
       {
@@ -382,9 +397,34 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
         required: false,
         schema: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" },
         description:
-          "Optional exact model pricing revision from /v1/ai/models; drift is rejected before inference.",
+          "Optional exact model pricing revision from /v1/ai/models; drift is rejected before inference. Model ceilings and billed charges use USD micros.",
       },
     ],
+    responses: {
+      "200": {
+        description:
+          "OpenAI-compatible completion; monetary headers identify the unit and historical policy used",
+        headers: {
+          "x-request-id": { schema: { type: "string" } },
+          "x-takoserver-billed-micros": {
+            description: "Canonical integer USD micros billed for this completion.",
+            schema: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+          },
+          "x-takoserver-money-policy": {
+            description:
+              "usd-cents-v1 identifies a historical cents-based replay; usd-micros-v2 identifies a current USD-micros charge.",
+            schema: { type: "string", enum: ["usd-cents-v1", "usd-micros-v2"] },
+          },
+          "x-takoserver-billed-minor": {
+            description: "Legacy cents amount emitted only for historical usd-cents-v1 replays.",
+            schema: { type: "string", pattern: "^(?:0|[1-9][0-9]*)$" },
+          },
+        },
+        content: {
+          "application/json": { schema: { $ref: "#/components/schemas/AiCompletionResponse" } },
+        },
+      },
+    },
   }),
   listHostForms: described("List the published Form definitions and this Host's answer for each", {
     security: [],
@@ -617,7 +657,7 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
     requestBody: billingRequest("CaptureWalletHoldRequest"),
     responses: {
       "200": {
-        description: "Captured receipt; the unused amount is released atomically",
+        description: "Captured receipt in USD micros; the unused amount is released atomically",
         content: {
           "application/json": { schema: { $ref: "#/components/schemas/WalletHoldResponse" } },
         },
@@ -690,7 +730,7 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
     "x-required-scopes": ["usage:write"],
     parameters: [ORGANIZATION_ID_PARAMETER],
     description:
-      "Takoserver reprices the immutable quantity using the selected tariff. For a configured `byte-hour` meter, send `quantityUnit=byte-millisecond` and an integral byte-millisecond quantity; the server converts the exact total to byte-hours before rounding the final USD cents once. Other meters require the configured unit.",
+      "Takoserver reprices the immutable quantity using the selected tariff. For a configured `byte-hour` meter, send `quantityUnit=byte-millisecond` and an integral byte-millisecond quantity; the server converts the exact total to byte-hours before rounding the final USD micros once. Other meters require the configured unit.",
     requestBody: billingRequest("CreateWalletUsageRecordRequest"),
     responses: {
       "201": {
@@ -1041,6 +1081,43 @@ export const openApiDocument = {
     },
     schemas: {
       ...TAKOFORM_V2_SCHEMAS,
+      AiModelsResponse: {
+        type: "object",
+        required: ["object", "data"],
+        additionalProperties: false,
+        properties: {
+          object: { const: "list" },
+          data: {
+            type: "array",
+            items: {
+              type: "object",
+              required: ["id", "object", "created", "owned_by", "takoserver"],
+              additionalProperties: false,
+              properties: {
+                id: { type: "string", minLength: 1, maxLength: 128 },
+                object: { const: "model" },
+                created: { type: "integer", minimum: 0 },
+                owned_by: { type: "string" },
+                takoserver: {
+                  type: "object",
+                  required: ["pricing_revision", "maximum_charge_micros", "money_policy"],
+                  additionalProperties: false,
+                  properties: {
+                    pricing_revision: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" },
+                    maximum_charge_micros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+                    money_policy: { const: "usd-micros-v2" },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      AiCompletionResponse: {
+        type: "object",
+        description: "OpenAI-compatible chat completion JSON body.",
+        additionalProperties: true,
+      },
       BillingReference: BILLING_REFERENCE_SCHEMA,
       BillingRevision: {
         type: "string",
@@ -1049,7 +1126,28 @@ export const openApiDocument = {
         pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
       },
       BillingFingerprint: { type: "string", minLength: 1, maxLength: 256 },
-      BillingAmountMinor: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+      BillingUnsignedMicros: {
+        type: "string",
+        minLength: 1,
+        maxLength: 16,
+        pattern: "^(?:0|[1-9][0-9]*)$",
+        description:
+          "Canonical nonnegative integer amount in USD micros; bounded to the safe integer range.",
+      },
+      BillingActualMicros: {
+        type: "string",
+        minLength: 1,
+        maxLength: 256,
+        pattern: "^(?:0|[1-9][0-9]*)$",
+        description:
+          "Full measured USD micros, retained exactly even when larger than the hold; capture is capped at the held amount.",
+      },
+      BillingSignedMicros: {
+        type: "string",
+        minLength: 1,
+        maxLength: 17,
+        pattern: "^(?:0|-?[1-9][0-9]*)$",
+      },
       BillingUnsignedDecimal: {
         type: "string",
         minLength: 1,
@@ -1063,27 +1161,22 @@ export const openApiDocument = {
       },
       CreateWalletHoldRequest: {
         type: "object",
-        required: ["reference", "amountMinor", "pricingRevision", "measurementFingerprint"],
+        required: ["reference", "amountMicros", "pricingRevision", "measurementFingerprint"],
         additionalProperties: false,
         properties: {
           reference: { $ref: "#/components/schemas/BillingReference" },
-          amountMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
+          amountMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
           pricingRevision: { $ref: "#/components/schemas/BillingRevision" },
           measurementFingerprint: { $ref: "#/components/schemas/BillingFingerprint" },
         },
       },
       CaptureWalletHoldRequest: {
         type: "object",
-        required: ["amountMinor", "actualMicros", "measurementFingerprint"],
+        required: ["amountMicros", "actualMicros", "measurementFingerprint"],
         additionalProperties: false,
         properties: {
-          amountMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
-          actualMicros: {
-            type: "string",
-            minLength: 1,
-            maxLength: 256,
-            pattern: "^(?:0|[1-9][0-9]*)$",
-          },
+          amountMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+          actualMicros: { $ref: "#/components/schemas/BillingActualMicros" },
           measurementFingerprint: { $ref: "#/components/schemas/BillingFingerprint" },
         },
       },
@@ -1097,7 +1190,7 @@ export const openApiDocument = {
           "periodStart",
           "periodEnd",
           "pricingRevision",
-          "expectedMinor",
+          "expectedMicros",
           "measurementFingerprint",
         ],
         additionalProperties: false,
@@ -1119,7 +1212,7 @@ export const openApiDocument = {
           periodStart: { $ref: "#/components/schemas/BillingUtcDateTime" },
           periodEnd: { $ref: "#/components/schemas/BillingUtcDateTime" },
           pricingRevision: { $ref: "#/components/schemas/BillingRevision" },
-          expectedMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
+          expectedMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
           measurementFingerprint: { $ref: "#/components/schemas/BillingFingerprint" },
         },
       },
@@ -1133,18 +1226,22 @@ export const openApiDocument = {
             required: [
               "organizationId",
               "currency",
-              "settledMinor",
-              "heldMinor",
-              "availableMinor",
+              "unit",
+              "moneyPolicy",
+              "settledMicros",
+              "heldMicros",
+              "availableMicros",
               "entries",
             ],
             additionalProperties: false,
             properties: {
               organizationId: IDENTIFIER_SCHEMA,
               currency: { const: "USD" },
-              settledMinor: { type: "integer", minimum: 0 },
-              heldMinor: { type: "integer", minimum: 0 },
-              availableMinor: { type: "integer", minimum: 0 },
+              unit: { const: "USD-micros" },
+              moneyPolicy: { const: "usd-micros-v2" },
+              settledMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+              heldMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+              availableMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
               entries: {
                 type: "array",
                 items: {
@@ -1154,8 +1251,8 @@ export const openApiDocument = {
                     "organizationId",
                     "type",
                     "reference",
-                    "settledDeltaMinor",
-                    "heldDeltaMinor",
+                    "settledDeltaMicros",
+                    "heldDeltaMicros",
                     "createdAt",
                   ],
                   additionalProperties: false,
@@ -1167,8 +1264,8 @@ export const openApiDocument = {
                       enum: ["funding", "hold", "capture", "release", "usage_debit"],
                     },
                     reference: { type: "string", minLength: 1 },
-                    settledDeltaMinor: { type: "integer" },
-                    heldDeltaMinor: { type: "integer" },
+                    settledDeltaMicros: { $ref: "#/components/schemas/BillingSignedMicros" },
+                    heldDeltaMicros: { $ref: "#/components/schemas/BillingSignedMicros" },
                     createdAt: { $ref: "#/components/schemas/BillingUtcDateTime" },
                   },
                 },
@@ -1189,11 +1286,12 @@ export const openApiDocument = {
               required: [
                 "reference",
                 "kind",
-                "amountMinor",
-                "spentMinor",
-                "remainingMinor",
-                "heldMinor",
-                "availableMinor",
+                "consumptionClass",
+                "amountMicros",
+                "spentMicros",
+                "remainingMicros",
+                "heldMicros",
+                "availableMicros",
                 "expiresAt",
                 "createdAt",
               ],
@@ -1201,11 +1299,12 @@ export const openApiDocument = {
               properties: {
                 reference: { type: "string", minLength: 1 },
                 kind: { type: "string", enum: ["direct", "plan-included", "purchased"] },
-                amountMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
-                spentMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
-                remainingMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
-                heldMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
-                availableMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
+                consumptionClass: { type: "string", enum: ["free", "subscription", "purchased"] },
+                amountMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+                spentMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+                remainingMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+                heldMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+                availableMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
                 expiresAt: {
                   anyOf: [{ $ref: "#/components/schemas/BillingUtcDateTime" }, { type: "null" }],
                 },
@@ -1227,11 +1326,12 @@ export const openApiDocument = {
         required: [
           "organizationId",
           "reference",
-          "amountMinor",
+          "moneyPolicy",
+          "amountMicros",
           "pricingRevision",
           "status",
-          "capturedMinor",
-          "releasedMinor",
+          "capturedMicros",
+          "releasedMicros",
           "actualMicros",
           "createdAt",
           "expiresAt",
@@ -1241,13 +1341,14 @@ export const openApiDocument = {
         properties: {
           organizationId: IDENTIFIER_SCHEMA,
           reference: { $ref: "#/components/schemas/BillingReference" },
-          amountMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
+          moneyPolicy: { type: "string", enum: ["usd-cents-v1", "usd-micros-v2"] },
+          amountMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
           pricingRevision: {
             anyOf: [{ $ref: "#/components/schemas/BillingRevision" }, { type: "null" }],
           },
           status: { type: "string", enum: ["live", "captured", "released", "expired"] },
-          capturedMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
-          releasedMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
+          capturedMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+          releasedMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
           actualMicros: {
             anyOf: [
               { type: "string", minLength: 1, maxLength: 256, pattern: "^(?:0|[1-9][0-9]*)$" },
@@ -1286,6 +1387,7 @@ export const openApiDocument = {
         required: [
           "organizationId",
           "reference",
+          "moneyPolicy",
           "pricingRevision",
           "meter",
           "quantityUnit",
@@ -1293,7 +1395,7 @@ export const openApiDocument = {
           "periodStart",
           "periodEnd",
           "rate",
-          "amountMinor",
+          "amountMicros",
           "status",
           "createdAt",
           "paidAt",
@@ -1302,6 +1404,7 @@ export const openApiDocument = {
         properties: {
           organizationId: IDENTIFIER_SCHEMA,
           reference: { $ref: "#/components/schemas/BillingReference" },
+          moneyPolicy: { type: "string", enum: ["usd-cents-v1", "usd-micros-v2"] },
           meter: { type: "string", minLength: 1, maxLength: 128 },
           quantityUnit: { type: "string", minLength: 1, maxLength: 64 },
           quantity: { $ref: "#/components/schemas/BillingUnsignedDecimal" },
@@ -1327,7 +1430,7 @@ export const openApiDocument = {
               },
             },
           },
-          amountMinor: { $ref: "#/components/schemas/BillingAmountMinor" },
+          amountMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
           status: { type: "string", enum: ["pending", "paid"] },
           createdAt: { $ref: "#/components/schemas/BillingUtcDateTime" },
           paidAt: {

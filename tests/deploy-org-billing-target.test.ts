@@ -3,7 +3,10 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  assertMoneyUnitSchema,
   assertOrgBillingSchema,
+  MONEY_UNIT_MIGRATION,
+  moneyUnitSchemaReady,
   ORG_BILLING_MIGRATION,
   orgBillingSchemaReady,
 } from "../scripts/deploy/migrations.ts";
@@ -53,6 +56,18 @@ function withTarget<T>(descriptor: Record<string, unknown>, read: (path: string)
 }
 
 describe("deploy target Organization billing config", () => {
+  test("requires 0094 for every serving Worker, independent of billing opt-in", () => {
+    const through0092 = [ORG_BILLING_MIGRATION];
+    for (const applied of [[], through0092]) {
+      expect(moneyUnitSchemaReady(applied)).toBe(false);
+      expect(() => assertMoneyUnitSchema(applied)).toThrow(
+        "needs 0094_wallet_usd_micros.sql applied",
+      );
+    }
+    expect(moneyUnitSchemaReady([...through0092, MONEY_UNIT_MIGRATION])).toBe(true);
+    expect(() => assertMoneyUnitSchema([...through0092, MONEY_UNIT_MIGRATION])).not.toThrow();
+  });
+
   test("validates and realizes the exact tariff as a public runtime variable", () => {
     withTarget({ billingConfig: BILLING_CONFIG }, (path) => {
       const target = loadTarget(path, "production");

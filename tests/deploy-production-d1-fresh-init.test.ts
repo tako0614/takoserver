@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import {
   chmodSync,
   cpSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -55,6 +56,13 @@ const V2_0089_MIGRATIONS = MIGRATIONS.slice(0, 89);
 const expectedApplicationShape = applicationShape(currentMigrations);
 const expectedV2ApplicationShape = applicationShape(currentMigrations, V2_MIGRATIONS);
 const expectedV2_0089ApplicationShape = applicationShape(currentMigrations, V2_0089_MIGRATIONS);
+
+function copyMigrationFiles(files: readonly { name: string; path: string }[], directory: string) {
+  mkdirSync(directory, { recursive: true });
+  for (const file of files) cpSync(file.path, join(directory, file.name));
+  return directory;
+}
+
 const COMMIT = "a".repeat(40);
 const GENERATION = "b".repeat(32);
 const ACCOUNT_ID = "a10162d23653f1ad1193dabf520a5dd0";
@@ -318,11 +326,7 @@ describe("production D1 fresh init", () => {
     );
     expect(projected.files).toHaveLength(88);
     const sealed88 = join(fixtureRoot, "sealed-v2-0088");
-    cpSync(currentMigrations, sealed88, { recursive: true });
-    rmSync(join(sealed88, "0089_v2_worker_cron_match_guard_depth.sql"));
-    rmSync(join(sealed88, "0090_v2_queue_sqlite_external_drain.sql"));
-    rmSync(join(sealed88, "0091_stripe_events.sql"));
-    rmSync(join(sealed88, "0092_org_wallet_lifecycle.sql"));
+    copyMigrationFiles(projected.files, sealed88);
     expect(readSealedFreshProductionV2MigrationArtifact(sealed88).digest).toBe(projected.digest);
     expect(() => readSealedFreshProductionV2MigrationArtifact(currentMigrations)).toThrow(
       "exactly 0001-0088",
@@ -331,11 +335,10 @@ describe("production D1 fresh init", () => {
 
   test("v2-0088 projection and sealed reader reject a short or byte-drifted prefix", () => {
     const missing = join(fixtureRoot, "missing-v2-tail");
-    cpSync(currentMigrations, missing, { recursive: true });
-    rmSync(join(missing, "0089_v2_worker_cron_match_guard_depth.sql"));
-    rmSync(join(missing, "0090_v2_queue_sqlite_external_drain.sql"));
-    rmSync(join(missing, "0091_stripe_events.sql"));
-    rmSync(join(missing, "0092_org_wallet_lifecycle.sql"));
+    copyMigrationFiles(
+      projectFreshProductionV2MigrationArtifact(readMigrationArtifact(currentMigrations)).files,
+      missing,
+    );
     rmSync(join(missing, "0088_v2_worker_sqlite_external_drain.sql"));
     expect(() => projectFreshProductionV2MigrationArtifact(readMigrationArtifact(missing))).toThrow(
       "fixed audited 0001-0088 prefix",
@@ -345,11 +348,10 @@ describe("production D1 fresh init", () => {
     );
 
     const drifted = join(fixtureRoot, "drifted-v2-tail");
-    cpSync(currentMigrations, drifted, { recursive: true });
-    rmSync(join(drifted, "0089_v2_worker_cron_match_guard_depth.sql"));
-    rmSync(join(drifted, "0090_v2_queue_sqlite_external_drain.sql"));
-    rmSync(join(drifted, "0091_stripe_events.sql"));
-    rmSync(join(drifted, "0092_org_wallet_lifecycle.sql"));
+    copyMigrationFiles(
+      projectFreshProductionV2MigrationArtifact(readMigrationArtifact(currentMigrations)).files,
+      drifted,
+    );
     const tail = join(drifted, "0088_v2_worker_sqlite_external_drain.sql");
     writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- synthetic drift\n`);
     expect(() => projectFreshProductionV2MigrationArtifact(readMigrationArtifact(drifted))).toThrow(
@@ -368,17 +370,11 @@ describe("production D1 fresh init", () => {
       "sha256:44d5cd59a772c51877d32f2f448ff929b7a50e0792ac99dea3522b1cb01545fa",
     );
     const sealed89 = join(fixtureRoot, "sealed-v2-0089");
-    cpSync(currentMigrations, sealed89, { recursive: true });
-    rmSync(join(sealed89, "0090_v2_queue_sqlite_external_drain.sql"));
-    rmSync(join(sealed89, "0091_stripe_events.sql"));
-    rmSync(join(sealed89, "0092_org_wallet_lifecycle.sql"));
+    copyMigrationFiles(selected.files, sealed89);
     expect(readSealedFreshProductionV2MigrationArtifact0089(sealed89).digest).toBe(selected.digest);
 
     const future = join(fixtureRoot, "future-v2-0090");
-    cpSync(currentMigrations, future, { recursive: true });
-    rmSync(join(future, "0090_v2_queue_sqlite_external_drain.sql"));
-    rmSync(join(future, "0091_stripe_events.sql"));
-    rmSync(join(future, "0092_org_wallet_lifecycle.sql"));
+    copyMigrationFiles(selected.files, future);
     writeFileSync(join(future, "0090_future.sql"), "CREATE TABLE future_only (id TEXT);\n");
     expect(
       projectFreshProductionV2MigrationArtifact0089(readMigrationArtifact(future)).digest,
@@ -388,11 +384,8 @@ describe("production D1 fresh init", () => {
     );
 
     const missing = join(fixtureRoot, "missing-v2-0089-tail");
-    cpSync(currentMigrations, missing, { recursive: true });
+    copyMigrationFiles(selected.files, missing);
     rmSync(join(missing, "0089_v2_worker_cron_match_guard_depth.sql"));
-    rmSync(join(missing, "0090_v2_queue_sqlite_external_drain.sql"));
-    rmSync(join(missing, "0091_stripe_events.sql"));
-    rmSync(join(missing, "0092_org_wallet_lifecycle.sql"));
     expect(() =>
       projectFreshProductionV2MigrationArtifact0089(readMigrationArtifact(missing)),
     ).toThrow("fixed audited 0001-0089 prefix");
@@ -401,10 +394,7 @@ describe("production D1 fresh init", () => {
     );
 
     const drifted = join(fixtureRoot, "drifted-v2-0089-tail");
-    cpSync(currentMigrations, drifted, { recursive: true });
-    rmSync(join(drifted, "0090_v2_queue_sqlite_external_drain.sql"));
-    rmSync(join(drifted, "0091_stripe_events.sql"));
-    rmSync(join(drifted, "0092_org_wallet_lifecycle.sql"));
+    copyMigrationFiles(selected.files, drifted);
     const tail = join(drifted, "0089_v2_worker_cron_match_guard_depth.sql");
     writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- synthetic drift\n`);
     expect(() =>
@@ -1290,13 +1280,13 @@ describe("production D1 fresh init", () => {
       try {
         const migrationDirectory = join(root, "migrations");
         cpSync(currentMigrations, migrationDirectory, { recursive: true });
-        const tail = join(migrationDirectory, "0092_org_wallet_lifecycle.sql");
+        const tail = join(migrationDirectory, "0094_wallet_usd_micros.sql");
         if (drift === "missing") rmSync(tail);
         else if (drift === "changed") {
           writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- changed\n`);
         } else {
           writeFileSync(
-            join(migrationDirectory, "0093_unreviewed.sql"),
+            join(migrationDirectory, "0095_unreviewed.sql"),
             "CREATE TABLE unreviewed (id TEXT);\n",
           );
         }
@@ -1309,7 +1299,7 @@ describe("production D1 fresh init", () => {
         ).rejects.toThrow(
           drift === "changed"
             ? "exact audited migration SHA-256"
-            : "audited migration lineage must contain exactly",
+            : "audited migration lineage must contain exactly 0001-0094",
         );
         expect(fixture.calls).toEqual([]);
       } finally {

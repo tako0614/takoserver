@@ -1,6 +1,15 @@
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import type { TakoformBindingRef, TakoformInterfaceRef } from "./interface-ref.ts";
 import { canonicalDigest } from "./json.ts";
+import {
+  addRational,
+  ceilPricedMicros,
+  decimalRational,
+  floorPricedMicros,
+  type RationalMicros,
+  rational,
+} from "./meter-pricing.ts";
+import { minorToMicros } from "./money.ts";
 
 const OFFERING_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{2,254}$/u;
 
@@ -42,12 +51,15 @@ export interface PricePlan {
 }
 
 export interface PricedUsage {
-  /** Millionths of one currency minor unit. Rounded to cents only by the ledger roll-up. */
+  readonly amountUnit: "usd-micros-v2";
+  /** Whole-window USD micros, quantized once; exact line ratios are retained. */
   readonly amountMicros: number;
   readonly lines: readonly {
     readonly meter: string;
     readonly quantity: number;
     readonly amountMicros: number;
+    readonly amountNumeratorMicros: string;
+    readonly amountDenominator: string;
   }[];
 }
 
@@ -63,29 +75,44 @@ export function priceMeteredUsage(
   plan: PricePlan,
   usage: readonly { readonly meter: string; readonly quantity: number }[],
 ): PricedUsage {
-  const quantities = new Map<string, number>();
+  const quantities = new Map<string, RationalMicros>();
   for (const item of usage) {
     if (!Number.isFinite(item.quantity) || item.quantity < 0)
       throw new TypeError("invalid quantity");
-    quantities.set(item.meter, (quantities.get(item.meter) ?? 0) + item.quantity);
+    quantities.set(
+      item.meter,
+      addRational(quantities.get(item.meter) ?? rational(0n), decimalRational(item.quantity)),
+    );
   }
   const rates = new Map(plan.meters.map((charge) => [charge.meter, charge]));
   const lines = [...quantities]
     .sort(([left], [right]) => left.localeCompare(right))
-    .map(([meter, quantity]) => {
+    .map(([meter, exactQuantity]) => {
       const rate = rates.get(meter);
       if (!rate) throw new TypeError(`unknown meter: ${meter}`);
-      const amountMicros = Math.round(
-        (quantity * rate.amountMinor * 1_000_000) / (rate.quantity ?? 1),
+      const divisor = decimalRational(rate.quantity ?? 1);
+      if (divisor.numerator === 0n) throw new TypeError("invalid rate quantity");
+      const exact = rational(
+        exactQuantity.numerator * BigInt(minorToMicros(rate.amountMinor)) * divisor.denominator,
+        exactQuantity.denominator * divisor.numerator,
       );
-      if (!Number.isSafeInteger(amountMicros) || amountMicros < 0) {
-        throw new TypeError("price overflow");
-      }
-      return { meter, quantity, amountMicros };
+      return {
+        meter,
+        quantity: Number(exactQuantity.numerator) / Number(exactQuantity.denominator),
+        amountMicros: floorPricedMicros(exact),
+        amountNumeratorMicros: String(exact.numerator),
+        amountDenominator: String(exact.denominator),
+      };
     });
-  const amountMicros = lines.reduce((sum, line) => sum + line.amountMicros, 0);
-  if (!Number.isSafeInteger(amountMicros)) throw new TypeError("price overflow");
-  return { amountMicros, lines };
+  const exactTotal = lines.reduce(
+    (sum, line) =>
+      addRational(
+        sum,
+        rational(BigInt(line.amountNumeratorMicros), BigInt(line.amountDenominator)),
+      ),
+    rational(0n),
+  );
+  return { amountUnit: "usd-micros-v2", amountMicros: ceilPricedMicros(exactTotal), lines };
 }
 
 export interface Offering {

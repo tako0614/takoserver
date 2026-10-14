@@ -2,12 +2,12 @@ import { describe, expect, test } from "bun:test";
 import {
   type BillingConfig,
   BillingConfigError,
-  ceilHoldMinor,
-  computeMeterAmountMinor,
+  ceilHoldMicros,
+  computeMeterAmountMicros,
   parseBillingConfig,
-  roundMicrosToMinor,
   selectCurrentBillingConfig,
 } from "../src/billing-config.ts";
+import { invoiceCents, minorToMicros, parseUnsignedMicros } from "../src/money.ts";
 
 const validConfig = {
   schemaVersion: 1,
@@ -143,49 +143,53 @@ describe("billing config", () => {
 });
 
 describe("integer billing arithmetic", () => {
-  test("rounds summed micros to cents using ties-to-even", () => {
-    expect(roundMicrosToMinor("4999")).toBe(0);
-    expect(roundMicrosToMinor("5000")).toBe(0);
-    expect(roundMicrosToMinor("5001")).toBe(1);
-    expect(roundMicrosToMinor("15000")).toBe(2);
-    expect(roundMicrosToMinor("25000")).toBe(2);
-    expect(roundMicrosToMinor("35000")).toBe(4);
+  test("converts verified cents exactly and ceilings the whole invoice once", () => {
+    expect(minorToMicros(1)).toBe(10_000);
+    expect(parseUnsignedMicros("1")).toBe(1);
+    expect(invoiceCents("0")).toBe(0);
+    expect(invoiceCents("1")).toBe(1);
+    expect(invoiceCents("4999")).toBe(1);
+    expect(invoiceCents("5000")).toBe(1);
+    expect(invoiceCents("10000")).toBe(1);
+    expect(invoiceCents("10001")).toBe(2);
+    expect(invoiceCents("25000")).toBe(3);
+    expect(invoiceCents(String(5000 + 5000))).toBe(1);
   });
 
   test("applies headroom once before ceiling the final hold", () => {
-    expect(ceilHoldMinor("0", 10_000)).toBe(0);
-    expect(ceilHoldMinor("5000", 10_000)).toBe(1);
-    expect(ceilHoldMinor("10000", 5_000)).toBe(2);
-    expect(ceilHoldMinor("10001", 0)).toBe(2);
-    expect(() => ceilHoldMinor("10000", -1)).toThrow(BillingConfigError);
+    expect(ceilHoldMicros("0", 10_000)).toBe(0);
+    expect(ceilHoldMicros("1", 1)).toBe(2);
+    expect(ceilHoldMicros("5000", 10_000)).toBe(10_000);
+    expect(ceilHoldMicros("10000", 5_000)).toBe(15_000);
+    expect(ceilHoldMicros("10001", 0)).toBe(10_001);
+    expect(() => ceilHoldMicros("10000", -1)).toThrow(BillingConfigError);
   });
 
-  test("prices rational quantities directly to cents without rounding micros first", () => {
+  test("quantizes an aggregate rational amount upward once to USD micros", () => {
     const rate = { numeratorMicros: "1", denominator: "2" };
-    expect(computeMeterAmountMinor(9_999n, rate)).toBe(0);
-    expect(computeMeterAmountMinor(10_000n, rate)).toBe(0);
-    expect(computeMeterAmountMinor(10_001n, rate)).toBe(1);
-    expect(computeMeterAmountMinor(30_000n, rate)).toBe(2);
-    expect(computeMeterAmountMinor(50_000n, rate)).toBe(2);
-    expect(computeMeterAmountMinor(1n, { numeratorMicros: "10000", denominator: "1" }, 2n)).toBe(0);
-    expect(computeMeterAmountMinor(10_002n, { numeratorMicros: "1", denominator: "1" }, 2n)).toBe(
-      1,
+    expect(computeMeterAmountMicros(0n, rate)).toBe(0);
+    expect(computeMeterAmountMicros(1n, rate)).toBe(1);
+    expect(computeMeterAmountMicros(2n, rate)).toBe(1);
+    expect(computeMeterAmountMicros(3n, rate)).toBe(2);
+    expect(computeMeterAmountMicros(10_001n, rate)).toBe(5_001);
+    expect(computeMeterAmountMicros(1n, { numeratorMicros: "10000", denominator: "1" }, 2n)).toBe(
+      5_000,
     );
-    expect(() => computeMeterAmountMinor(1n, rate, 0n)).toThrow(BillingConfigError);
+    expect(() => computeMeterAmountMicros(1n, rate, 0n)).toThrow(BillingConfigError);
   });
 
   test("rejects noncanonical amounts, negatives, and unsafe integer results", () => {
-    expect(() => roundMicrosToMinor("01")).toThrow(BillingConfigError);
-    expect(() => ceilHoldMinor("-1", 0)).toThrow(BillingConfigError);
-    expect(() => ceilHoldMinor("999999999999999999999999999999", 0)).toThrow(BillingConfigError);
-    expect(() => roundMicrosToMinor("999999999999999999999999999999999999")).toThrow(
-      BillingConfigError,
-    );
-    expect(() => computeMeterAmountMinor(-1n, { numeratorMicros: "1", denominator: "1" })).toThrow(
+    expect(() => parseUnsignedMicros("01")).toThrow();
+    expect(() => parseUnsignedMicros("9007199254740992")).toThrow();
+    expect(() => minorToMicros(900_719_925_475)).toThrow();
+    expect(() => minorToMicros(1.5)).toThrow();
+    expect(() => ceilHoldMicros("-1", 0)).toThrow(BillingConfigError);
+    expect(() => ceilHoldMicros("999999999999999999999999999999", 0)).toThrow(BillingConfigError);
+    expect(() => computeMeterAmountMicros(-1n, { numeratorMicros: "1", denominator: "1" })).toThrow(
       BillingConfigError,
     );
     expect(() =>
-      computeMeterAmountMinor(9_007_199_254_740_992n, {
+      computeMeterAmountMicros(9_007_199_254_740_992n, {
         numeratorMicros: "10000",
         denominator: "1",
       }),

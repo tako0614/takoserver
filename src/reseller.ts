@@ -1,5 +1,6 @@
 import { type Catalog, priceProvisioning } from "./catalog.ts";
 import { type Ledger, LedgerError } from "./ledger.ts";
+import { minorToMicros } from "./money.ts";
 import type { Clock, Row, Sql } from "./ports.ts";
 
 /**
@@ -667,7 +668,7 @@ export function createReseller(options: CreateResellerOptions): Reseller {
           await ledger.capture({
             organizationId: intent.organizationId,
             reference: intent.reservationId,
-            amountMinor: intent.amountMinor,
+            amountMicros: minorToMicros(intent.amountMinor),
           });
         }
         await markLedgerCaptured(intent.organizationId, intent.idempotencyKey, leaseToken);
@@ -892,7 +893,7 @@ export function createReseller(options: CreateResellerOptions): Reseller {
           await ledger.release({
             organizationId: intent.organizationId,
             reference: releaseReference,
-            amountMinor: reservation.amountMinor,
+            amountMicros: minorToMicros(reservation.amountMinor),
           });
         }
       } catch (error) {
@@ -1055,7 +1056,12 @@ export function createReseller(options: CreateResellerOptions): Reseller {
       // The hold is taken before the reservation exists, so a reservation is
       // never visible without the funds behind it.
       const held =
-        amountMinor === 0 || (await ledger.hold({ organizationId, reference: id, amountMinor }));
+        amountMinor === 0 ||
+        (await ledger.hold({
+          organizationId,
+          reference: id,
+          amountMicros: minorToMicros(amountMinor),
+        }));
       if (!held) throw new ResellerError("insufficient_funds", 402);
 
       const expiresAt = after(RESERVATION_TTL_SECONDS);
@@ -1081,7 +1087,11 @@ export function createReseller(options: CreateResellerOptions): Reseller {
       } catch (error) {
         // The row could not be written, so the money must not stay earmarked.
         if (amountMinor > 0) {
-          await ledger.release({ organizationId, reference: id, amountMinor });
+          await ledger.release({
+            organizationId,
+            reference: id,
+            amountMicros: minorToMicros(amountMinor),
+          });
         }
         throw error;
       }

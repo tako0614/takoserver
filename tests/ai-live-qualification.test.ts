@@ -8,6 +8,7 @@ import {
   runAiLiveQualificationCli,
   safeReadApiKeyFile,
 } from "../scripts/ai-live-qualification.ts";
+import { minorToMicros } from "../src/money.ts";
 
 const ORIGIN = "https://api.example.test";
 const ORGANIZATION_ID = "org_qualification";
@@ -77,7 +78,8 @@ function modelsResponse(maximumChargeMinor = 5): Response {
         object: "model",
         takoserver: {
           pricing_revision: PRICING_REVISION,
-          maximum_charge_minor: maximumChargeMinor,
+          maximum_charge_micros: String(minorToMicros(maximumChargeMinor)),
+          money_policy: "usd-micros-v2",
         },
       },
     ],
@@ -86,7 +88,11 @@ function modelsResponse(maximumChargeMinor = 5): Response {
 
 function walletResponse(availableMinor = 5): Response {
   return Response.json({
-    wallet: { organizationId: ORGANIZATION_ID, currency: "USD", availableMinor },
+    wallet: {
+      organizationId: ORGANIZATION_ID,
+      currency: "USD",
+      availableMicros: minorToMicros(availableMinor),
+    },
   });
 }
 
@@ -109,7 +115,8 @@ function completionResponse(
       headers: {
         "content-type": "application/json",
         "x-request-id": requestId,
-        "x-takoserver-billed-minor": String(billedMinor),
+        "x-takoserver-billed-micros": String(minorToMicros(billedMinor)),
+        "x-takoserver-money-policy": "usd-micros-v2",
       },
     },
   );
@@ -130,7 +137,8 @@ function malformedCompletionResponse(choice: unknown): Response {
       headers: {
         "content-type": "application/json",
         "x-request-id": "ai_qualification_request",
-        "x-takoserver-billed-minor": "1",
+        "x-takoserver-billed-micros": "10000",
+        "x-takoserver-money-policy": "usd-micros-v2",
       },
     },
   );
@@ -215,7 +223,10 @@ describe("AI live qualification client", () => {
       stage: "wallet",
       reason: "wallet_insufficient",
     });
-    expect(result.wallet).toMatchObject({ availableMinor: 4, source: "preflight_observation" });
+    expect(result.wallet).toMatchObject({
+      availableMicros: "40000",
+      source: "preflight_observation",
+    });
     expect(fixtureState.calls.map(({ init }) => init.method ?? "GET")).toEqual([
       "GET",
       "GET",
@@ -311,7 +322,7 @@ describe("AI live qualification client", () => {
     const result = await fixtureState.run();
 
     expect(result).toMatchObject({ status: "failed", stage: "replay", reason: "replay_mismatch" });
-    expect(result.response).toMatchObject({ billedMinor: 1 });
+    expect(result.response).toMatchObject({ billedMicros: "10000" });
     expect(fixtureState.calls).toHaveLength(5);
   });
 

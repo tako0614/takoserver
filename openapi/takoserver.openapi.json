@@ -240,6 +240,76 @@
           }
         }
       },
+      "AiModelsResponse": {
+        "type": "object",
+        "required": [
+          "object",
+          "data"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "object": {
+            "const": "list"
+          },
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "object",
+                "created",
+                "owned_by",
+                "takoserver"
+              ],
+              "additionalProperties": false,
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 128
+                },
+                "object": {
+                  "const": "model"
+                },
+                "created": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "owned_by": {
+                  "type": "string"
+                },
+                "takoserver": {
+                  "type": "object",
+                  "required": [
+                    "pricing_revision",
+                    "maximum_charge_micros",
+                    "money_policy"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "pricing_revision": {
+                      "type": "string",
+                      "pattern": "^sha256:[a-f0-9]{64}$"
+                    },
+                    "maximum_charge_micros": {
+                      "$ref": "#/components/schemas/BillingUnsignedMicros"
+                    },
+                    "money_policy": {
+                      "const": "usd-micros-v2"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "AiCompletionResponse": {
+        "type": "object",
+        "description": "OpenAI-compatible chat completion JSON body.",
+        "additionalProperties": true
+      },
       "BillingReference": {
         "type": "string",
         "minLength": 1,
@@ -258,10 +328,25 @@
         "minLength": 1,
         "maxLength": 256
       },
-      "BillingAmountMinor": {
-        "type": "integer",
-        "minimum": 0,
-        "maximum": 9007199254740991
+      "BillingUnsignedMicros": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 16,
+        "pattern": "^(?:0|[1-9][0-9]*)$",
+        "description": "Canonical nonnegative integer amount in USD micros; bounded to the safe integer range."
+      },
+      "BillingActualMicros": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
+        "pattern": "^(?:0|[1-9][0-9]*)$",
+        "description": "Full measured USD micros, retained exactly even when larger than the hold; capture is capped at the held amount."
+      },
+      "BillingSignedMicros": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 17,
+        "pattern": "^(?:0|-?[1-9][0-9]*)$"
       },
       "BillingUnsignedDecimal": {
         "type": "string",
@@ -278,7 +363,7 @@
         "type": "object",
         "required": [
           "reference",
-          "amountMinor",
+          "amountMicros",
           "pricingRevision",
           "measurementFingerprint"
         ],
@@ -287,8 +372,8 @@
           "reference": {
             "$ref": "#/components/schemas/BillingReference"
           },
-          "amountMinor": {
-            "$ref": "#/components/schemas/BillingAmountMinor"
+          "amountMicros": {
+            "$ref": "#/components/schemas/BillingUnsignedMicros"
           },
           "pricingRevision": {
             "$ref": "#/components/schemas/BillingRevision"
@@ -301,20 +386,17 @@
       "CaptureWalletHoldRequest": {
         "type": "object",
         "required": [
-          "amountMinor",
+          "amountMicros",
           "actualMicros",
           "measurementFingerprint"
         ],
         "additionalProperties": false,
         "properties": {
-          "amountMinor": {
-            "$ref": "#/components/schemas/BillingAmountMinor"
+          "amountMicros": {
+            "$ref": "#/components/schemas/BillingUnsignedMicros"
           },
           "actualMicros": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 256,
-            "pattern": "^(?:0|[1-9][0-9]*)$"
+            "$ref": "#/components/schemas/BillingActualMicros"
           },
           "measurementFingerprint": {
             "$ref": "#/components/schemas/BillingFingerprint"
@@ -331,7 +413,7 @@
           "periodStart",
           "periodEnd",
           "pricingRevision",
-          "expectedMinor",
+          "expectedMicros",
           "measurementFingerprint"
         ],
         "additionalProperties": false,
@@ -363,8 +445,8 @@
           "pricingRevision": {
             "$ref": "#/components/schemas/BillingRevision"
           },
-          "expectedMinor": {
-            "$ref": "#/components/schemas/BillingAmountMinor"
+          "expectedMicros": {
+            "$ref": "#/components/schemas/BillingUnsignedMicros"
           },
           "measurementFingerprint": {
             "$ref": "#/components/schemas/BillingFingerprint"
@@ -383,9 +465,11 @@
             "required": [
               "organizationId",
               "currency",
-              "settledMinor",
-              "heldMinor",
-              "availableMinor",
+              "unit",
+              "moneyPolicy",
+              "settledMicros",
+              "heldMicros",
+              "availableMicros",
               "entries"
             ],
             "additionalProperties": false,
@@ -398,17 +482,20 @@
               "currency": {
                 "const": "USD"
               },
-              "settledMinor": {
-                "type": "integer",
-                "minimum": 0
+              "unit": {
+                "const": "USD-micros"
               },
-              "heldMinor": {
-                "type": "integer",
-                "minimum": 0
+              "moneyPolicy": {
+                "const": "usd-micros-v2"
               },
-              "availableMinor": {
-                "type": "integer",
-                "minimum": 0
+              "settledMicros": {
+                "$ref": "#/components/schemas/BillingUnsignedMicros"
+              },
+              "heldMicros": {
+                "$ref": "#/components/schemas/BillingUnsignedMicros"
+              },
+              "availableMicros": {
+                "$ref": "#/components/schemas/BillingUnsignedMicros"
               },
               "entries": {
                 "type": "array",
@@ -419,8 +506,8 @@
                     "organizationId",
                     "type",
                     "reference",
-                    "settledDeltaMinor",
-                    "heldDeltaMinor",
+                    "settledDeltaMicros",
+                    "heldDeltaMicros",
                     "createdAt"
                   ],
                   "additionalProperties": false,
@@ -449,11 +536,11 @@
                       "type": "string",
                       "minLength": 1
                     },
-                    "settledDeltaMinor": {
-                      "type": "integer"
+                    "settledDeltaMicros": {
+                      "$ref": "#/components/schemas/BillingSignedMicros"
                     },
-                    "heldDeltaMinor": {
-                      "type": "integer"
+                    "heldDeltaMicros": {
+                      "$ref": "#/components/schemas/BillingSignedMicros"
                     },
                     "createdAt": {
                       "$ref": "#/components/schemas/BillingUtcDateTime"
@@ -480,11 +567,12 @@
               "required": [
                 "reference",
                 "kind",
-                "amountMinor",
-                "spentMinor",
-                "remainingMinor",
-                "heldMinor",
-                "availableMinor",
+                "consumptionClass",
+                "amountMicros",
+                "spentMicros",
+                "remainingMicros",
+                "heldMicros",
+                "availableMicros",
                 "expiresAt",
                 "createdAt"
               ],
@@ -502,20 +590,28 @@
                     "purchased"
                   ]
                 },
-                "amountMinor": {
-                  "$ref": "#/components/schemas/BillingAmountMinor"
+                "consumptionClass": {
+                  "type": "string",
+                  "enum": [
+                    "free",
+                    "subscription",
+                    "purchased"
+                  ]
                 },
-                "spentMinor": {
-                  "$ref": "#/components/schemas/BillingAmountMinor"
+                "amountMicros": {
+                  "$ref": "#/components/schemas/BillingUnsignedMicros"
                 },
-                "remainingMinor": {
-                  "$ref": "#/components/schemas/BillingAmountMinor"
+                "spentMicros": {
+                  "$ref": "#/components/schemas/BillingUnsignedMicros"
                 },
-                "heldMinor": {
-                  "$ref": "#/components/schemas/BillingAmountMinor"
+                "remainingMicros": {
+                  "$ref": "#/components/schemas/BillingUnsignedMicros"
                 },
-                "availableMinor": {
-                  "$ref": "#/components/schemas/BillingAmountMinor"
+                "heldMicros": {
+                  "$ref": "#/components/schemas/BillingUnsignedMicros"
+                },
+                "availableMicros": {
+                  "$ref": "#/components/schemas/BillingUnsignedMicros"
                 },
                 "expiresAt": {
                   "anyOf": [
@@ -564,11 +660,12 @@
         "required": [
           "organizationId",
           "reference",
-          "amountMinor",
+          "moneyPolicy",
+          "amountMicros",
           "pricingRevision",
           "status",
-          "capturedMinor",
-          "releasedMinor",
+          "capturedMicros",
+          "releasedMicros",
           "actualMicros",
           "createdAt",
           "expiresAt",
@@ -584,8 +681,15 @@
           "reference": {
             "$ref": "#/components/schemas/BillingReference"
           },
-          "amountMinor": {
-            "$ref": "#/components/schemas/BillingAmountMinor"
+          "moneyPolicy": {
+            "type": "string",
+            "enum": [
+              "usd-cents-v1",
+              "usd-micros-v2"
+            ]
+          },
+          "amountMicros": {
+            "$ref": "#/components/schemas/BillingUnsignedMicros"
           },
           "pricingRevision": {
             "anyOf": [
@@ -606,11 +710,11 @@
               "expired"
             ]
           },
-          "capturedMinor": {
-            "$ref": "#/components/schemas/BillingAmountMinor"
+          "capturedMicros": {
+            "$ref": "#/components/schemas/BillingUnsignedMicros"
           },
-          "releasedMinor": {
-            "$ref": "#/components/schemas/BillingAmountMinor"
+          "releasedMicros": {
+            "$ref": "#/components/schemas/BillingUnsignedMicros"
           },
           "actualMicros": {
             "anyOf": [
@@ -695,6 +799,7 @@
         "required": [
           "organizationId",
           "reference",
+          "moneyPolicy",
           "pricingRevision",
           "meter",
           "quantityUnit",
@@ -702,7 +807,7 @@
           "periodStart",
           "periodEnd",
           "rate",
-          "amountMinor",
+          "amountMicros",
           "status",
           "createdAt",
           "paidAt"
@@ -716,6 +821,13 @@
           },
           "reference": {
             "$ref": "#/components/schemas/BillingReference"
+          },
+          "moneyPolicy": {
+            "type": "string",
+            "enum": [
+              "usd-cents-v1",
+              "usd-micros-v2"
+            ]
           },
           "meter": {
             "type": "string",
@@ -761,8 +873,8 @@
               }
             }
           },
-          "amountMinor": {
-            "$ref": "#/components/schemas/BillingAmountMinor"
+          "amountMicros": {
+            "$ref": "#/components/schemas/BillingUnsignedMicros"
           },
           "status": {
             "type": "string",
@@ -2286,10 +2398,18 @@
     },
     "/v1/ai/models": {
       "get": {
-        "summary": "List configured OpenAI-compatible models",
+        "summary": "List configured OpenAI-compatible models with canonical USD-micros pricing ceilings",
+        "description": "Each Takoserver commercial ceiling is a canonical decimal string in USD micros (`1 USD = 1,000,000 micros`).",
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "Configured models and their immutable Takoserver USD-micros commercial terms",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiModelsResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -2299,7 +2419,44 @@
         "summary": "Create a prepaid OpenAI-compatible chat completion",
         "responses": {
           "200": {
-            "description": "Success"
+            "description": "OpenAI-compatible completion; monetary headers identify the unit and historical policy used",
+            "headers": {
+              "x-request-id": {
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-takoserver-billed-micros": {
+                "description": "Canonical integer USD micros billed for this completion.",
+                "schema": {
+                  "$ref": "#/components/schemas/BillingUnsignedMicros"
+                }
+              },
+              "x-takoserver-money-policy": {
+                "description": "usd-cents-v1 identifies a historical cents-based replay; usd-micros-v2 identifies a current USD-micros charge.",
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "usd-cents-v1",
+                    "usd-micros-v2"
+                  ]
+                }
+              },
+              "x-takoserver-billed-minor": {
+                "description": "Legacy cents amount emitted only for historical usd-cents-v1 replays.",
+                "schema": {
+                  "type": "string",
+                  "pattern": "^(?:0|[1-9][0-9]*)$"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AiCompletionResponse"
+                }
+              }
+            }
           }
         },
         "parameters": [
@@ -2322,7 +2479,7 @@
               "type": "string",
               "pattern": "^sha256:[a-f0-9]{64}$"
             },
-            "description": "Optional exact model pricing revision from /v1/ai/models; drift is rejected before inference."
+            "description": "Optional exact model pricing revision from /v1/ai/models; drift is rejected before inference. Model ceilings and billed charges use USD micros."
           }
         ]
       }
@@ -4021,7 +4178,7 @@
         "summary": "Capture measured credit and release the unused hold",
         "responses": {
           "200": {
-            "description": "Captured receipt; the unused amount is released atomically",
+            "description": "Captured receipt in USD micros; the unused amount is released atomically",
             "content": {
               "application/json": {
                 "schema": {
@@ -4309,7 +4466,7 @@
       },
       "post": {
         "summary": "Price and settle one closed usage period",
-        "description": "Takoserver reprices the immutable quantity using the selected tariff. For a configured `byte-hour` meter, send `quantityUnit=byte-millisecond` and an integral byte-millisecond quantity; the server converts the exact total to byte-hours before rounding the final USD cents once. Other meters require the configured unit.",
+        "description": "Takoserver reprices the immutable quantity using the selected tariff. For a configured `byte-hour` meter, send `quantityUnit=byte-millisecond` and an integral byte-millisecond quantity; the server converts the exact total to byte-hours before rounding the final USD micros once. Other meters require the configured unit.",
         "responses": {
           "201": {
             "description": "Usage receipt, including durable unpaid usage after insufficient funds",

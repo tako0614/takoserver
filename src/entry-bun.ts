@@ -476,7 +476,8 @@ if (migrated.applied.length > 0) {
   );
 }
 const sql = createSqliteSql(controlDatabase);
-if (billingConfig) await assertOrgBillingSchema(sql, billingConfig);
+// Wallet reads use the micros ledger even when optional billing is disabled.
+await assertOrgBillingSchema(sql, billingConfig);
 /**
  * The port a published Worker endpoint address carries.
  *

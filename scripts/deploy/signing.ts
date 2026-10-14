@@ -2,15 +2,24 @@ import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import {
+  applicationSchemaMatches,
+  deriveExpectedApplicationShape,
+} from "./application-schema-shape.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1, sqlLiteral } from "./d1.ts";
 import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
 import {
+  assertMoneyUnitSchema,
   assertOrgBillingSchema,
   assertStripeWebhookSchema,
+  MONEY_UNIT_MIGRATION,
+  type MoneyUnitPolicyRow,
+  moneyUnitPolicyReady,
   pendingMigrations,
   readD1SchemaState,
   readMigrationArtifact,
+  readMoneyUnitPolicy,
 } from "./migrations.ts";
 import {
   type CommandResult,
@@ -22,6 +31,7 @@ import {
 } from "./process.ts";
 import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
 import { expectedWorkerSecrets, writeWorkerConfig } from "./realized-config.ts";
+import { readCurrentAuditedMigrationSourceArtifact } from "./schema.ts";
 import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import {
@@ -94,7 +104,13 @@ export interface SigningOptions {
 }
 
 export interface SigningMigrationReader {
-  read(): Promise<{ readonly local: readonly string[]; readonly applied: readonly string[] }>;
+  read(): Promise<{
+    readonly local: readonly string[];
+    readonly applied: readonly string[];
+    readonly shape?: string;
+    readonly shapeDigest?: string;
+    readonly moneyUnitPolicy?: readonly MoneyUnitPolicyRow[];
+  }>;
 }
 
 interface PrivateKeyInput {
@@ -599,6 +615,7 @@ async function rotateSigningKey(
   ) {
     throw preflightError("authoritative current Worker changed while rotation was prepared");
   }
+  await assertSigningRotationSchema(target, configPath, environment, run, options.migrations);
   sealed.assertUnchanged();
   const message = `takoserver-worker:${source.commit}:${prepared.bundleDigestHex}`;
   const upload = await run(
@@ -646,6 +663,13 @@ async function rotateSigningKey(
   ) {
     throw verificationError("signing rotation changed more than the explicit key id and secret");
   }
+  try {
+    await assertSigningRotationSchema(target, configPath, environment, run, options.migrations);
+  } catch {
+    throw verificationError(
+      "signing rotation left the exact 0094 D1 schema or USD-micros policy unavailable",
+    );
+  }
   requiredExactExclusiveRow(
     await database.readKey(currentKeyId, "verification"),
     current,
@@ -682,9 +706,26 @@ async function assertSigningRotationSchema(
   run: SigningProcess,
   injected?: SigningMigrationReader,
 ): Promise<void> {
-  if (target.billingConfig === undefined && target.stripeWebhook !== true) return;
   const snapshot = await (injected ?? signingMigrationReader(configPath, environment, run)).read();
   pendingMigrations(snapshot.local, snapshot.applied);
+  assertMoneyUnitSchema(snapshot.applied);
+  const source = readCurrentAuditedMigrationSourceArtifact(resolve(REPOSITORY, "migrations"));
+  if (
+    source.names.at(-1) !== MONEY_UNIT_MIGRATION ||
+    JSON.stringify(snapshot.local) !== JSON.stringify(source.names) ||
+    JSON.stringify(snapshot.applied) !== JSON.stringify(source.names) ||
+    snapshot.shape === undefined ||
+    snapshot.shapeDigest === undefined ||
+    !moneyUnitPolicyReady(snapshot.moneyUnitPolicy) ||
+    !applicationSchemaMatches(
+      { applied: snapshot.applied, shape: snapshot.shape, shapeDigest: snapshot.shapeDigest },
+      deriveExpectedApplicationShape(source.files),
+    )
+  ) {
+    throw preflightError(
+      "signing rotation requires the exact complete 0094 D1 schema and USD-micros policy",
+    );
+  }
   assertStripeWebhookSchema(target, snapshot.applied);
   assertOrgBillingSchema(target, snapshot.applied);
 }
@@ -697,8 +738,17 @@ function signingMigrationReader(
   return {
     async read() {
       const local = readMigrationArtifact();
-      const remote = await readD1SchemaState(new RemoteD1(configPath, { environment, run }));
-      return { local: local.names, applied: remote.applied };
+      const database = new RemoteD1(configPath, { environment, run });
+      const remote = await readD1SchemaState(database);
+      return {
+        local: local.names,
+        applied: remote.applied,
+        shape: remote.shape,
+        shapeDigest: remote.shapeDigest,
+        ...(remote.applied.includes(MONEY_UNIT_MIGRATION)
+          ? { moneyUnitPolicy: await readMoneyUnitPolicy(database) }
+          : {}),
+      };
     },
   };
 }

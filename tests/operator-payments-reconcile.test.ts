@@ -234,7 +234,7 @@ async function host(
     stripe,
     call,
     reconcile: (assertion: string) => call(PATH, { body: { assertion } }),
-    balance: async (organizationId: string) => (await ledger.wallet(organizationId)).settledMinor,
+    balance: async (organizationId: string) => (await ledger.wallet(organizationId)).settledMicros,
     fundingRows: async () => await sql.query("SELECT ref FROM ledger WHERE type = 'funding'"),
   };
 }
@@ -271,7 +271,7 @@ describe("operator payment reconcile route", () => {
     expect(response.text).not.toContain(UNKNOWN_ORG);
     expect(response.text).not.toContain(ORG);
     expect(response.text).not.toContain("77777");
-    expect(await h.balance(ORG)).toBe(2_500);
+    expect(await h.balance(ORG)).toBe(25_000_000);
     expect(h.stripe.listings).toHaveLength(1);
 
     // The published response schema names exactly the fields the pass reports.
@@ -300,7 +300,7 @@ describe("operator payment reconcile route", () => {
     // The scheduled pass meets the same reference and credits nothing either.
     expect(await h.app.reconcilePayments()).toMatchObject({ credited: 0, alreadyCredited: 1 });
     expect(await h.fundingRows()).toEqual([{ ref: "stripe:cs_route_once" }]);
-    expect(await h.balance(ORG)).toBe(1_200);
+    expect(await h.balance(ORG)).toBe(12_000_000);
   });
 
   test("an assertion runs one pass; its replay is refused before Stripe is read", async () => {
@@ -333,7 +333,7 @@ describe("operator payment reconcile route", () => {
     expect((await h.reconcile(assertion)).status).toBe(401);
     // A fresh assertion runs the next pass, which credits the payment once.
     expect((await h.reconcile(await sign())).status).toBe(200);
-    expect(await h.balance(ORG)).toBe(600);
+    expect(await h.balance(ORG)).toBe(6_000_000);
   });
 
   test("refuses every assertion that is not exactly a fresh reconcile one from the operator", async () => {
@@ -468,7 +468,7 @@ describe("operator payment reconcile route", () => {
     expect(JSON.parse(one.text).report).toEqual(JSON.parse(two.text).report);
     expect(cron).toEqual(JSON.parse(one.text).report);
     expect(h.stripe.listings).toHaveLength(1);
-    expect(await h.balance(ORG)).toBe(800);
+    expect(await h.balance(ORG)).toBe(8_000_000);
     // Once that pass has finished, the next request starts a new one.
     expect((await h.reconcile(await sign())).status).toBe(200);
     expect(h.stripe.listings).toHaveLength(2);

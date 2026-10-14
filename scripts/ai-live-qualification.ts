@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { minorToMicros, parseUnsignedMicros } from "../src/money.ts";
 
 const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/u;
 const ORGANIZATION_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
@@ -63,7 +64,7 @@ export type AiLiveQualificationFetcher = (
 ) => Promise<Response>;
 
 export interface AiLiveQualificationWalletProjection {
-  readonly availableMinor: number;
+  readonly availableMicros: string;
   readonly currency: "USD";
   /** This is an observation before inference, never exclusive billing proof. */
   readonly source: "preflight_observation";
@@ -72,7 +73,7 @@ export interface AiLiveQualificationWalletProjection {
 export interface AiLiveQualificationResponseProjection {
   readonly completionBodyDigest: `sha256:${string}`;
   readonly requestIdDigest: `sha256:${string}`;
-  readonly billedMinor: number;
+  readonly billedMicros: string;
 }
 
 export interface AiLiveQualificationResult {
@@ -85,6 +86,7 @@ export interface AiLiveQualificationResult {
   readonly publicModelId: string;
   readonly exactPricingRevision: string;
   readonly maximumChargeMinor: number;
+  readonly maximumChargeMicros: string;
   readonly reason?: AiLiveQualificationFailureCode | "execution_not_requested";
   readonly wallet?: AiLiveQualificationWalletProjection;
   readonly response?: AiLiveQualificationResponseProjection;
@@ -103,6 +105,7 @@ interface NormalizedInput {
   readonly publicModelId: string;
   readonly exactPricingRevision: `sha256:${string}`;
   readonly maximumChargeMinor: number;
+  readonly maximumChargeMicros: number;
   readonly idempotencyKey: string;
   readonly apiKeyFile: string | undefined;
   readonly executeLive: boolean;
@@ -131,7 +134,7 @@ interface JsonResponse {
 
 interface MatchingModel {
   readonly id: string;
-  readonly maximumChargeMinor: number;
+  readonly maximumChargeMicros: number;
 }
 
 interface ValidCompletion {
@@ -139,7 +142,7 @@ interface ValidCompletion {
   readonly bodyDigest: `sha256:${string}`;
   readonly requestId: string;
   readonly requestIdDigest: `sha256:${string}`;
-  readonly billedMinor: number;
+  readonly billedMicros: number;
 }
 
 /**
@@ -250,7 +253,7 @@ export async function runAiLiveQualification(
       reason: "wallet_malformed",
     };
   }
-  if (walletProjection.availableMinor < model.maximumChargeMinor) {
+  if (BigInt(walletProjection.availableMicros) < BigInt(model.maximumChargeMicros)) {
     return {
       ...baseFromInput(input),
       stage: "wallet",
@@ -304,7 +307,7 @@ export async function runAiLiveQualification(
     firstCompletion = await parseCompletionResponse(
       first,
       input.publicModelId,
-      model.maximumChargeMinor,
+      model.maximumChargeMicros,
       input.timeoutMs,
     );
   } catch (error) {
@@ -356,7 +359,7 @@ export async function runAiLiveQualification(
     replayCompletion = await parseCompletionResponse(
       replay,
       input.publicModelId,
-      model.maximumChargeMinor,
+      model.maximumChargeMicros,
       input.timeoutMs,
     );
   } catch (error) {
@@ -428,6 +431,7 @@ export async function runAiLiveQualificationCli(
         publicModelId: "",
         exactPricingRevision: "",
         maximumChargeMinor: 0,
+        maximumChargeMicros: "0",
         reason: "invalid_input",
       }),
     );
@@ -615,6 +619,7 @@ function normalizeOptions(options: AiLiveQualificationOptions): NormalizedInput 
   if (!Number.isSafeInteger(options.maximumChargeMinor) || options.maximumChargeMinor < 0) {
     throw new Error("charge");
   }
+  const maximumChargeMicros = minorToMicros(options.maximumChargeMinor);
   if (!IDEMPOTENCY_KEY.test(options.idempotencyKey)) throw new Error("idempotency");
   if (options.executeLive === true && !options.apiKeyFile) throw new Error("credential");
   if (
@@ -632,6 +637,7 @@ function normalizeOptions(options: AiLiveQualificationOptions): NormalizedInput 
     publicModelId: options.publicModelId,
     exactPricingRevision: options.exactPricingRevision as `sha256:${string}`,
     maximumChargeMinor: options.maximumChargeMinor,
+    maximumChargeMicros,
     idempotencyKey: options.idempotencyKey,
     apiKeyFile: options.apiKeyFile,
     executeLive: options.executeLive === true,
@@ -674,6 +680,12 @@ function resultBase(options: AiLiveQualificationOptions): AiLiveQualificationRes
       Number.isSafeInteger(options.maximumChargeMinor)
         ? options.maximumChargeMinor
         : 0,
+    maximumChargeMicros:
+      typeof options.maximumChargeMinor === "number" &&
+      Number.isSafeInteger(options.maximumChargeMinor) &&
+      options.maximumChargeMinor >= 0
+        ? safeMinorMicros(options.maximumChargeMinor)
+        : "0",
   };
 }
 
@@ -682,6 +694,14 @@ function safeOriginProjection(value: string): string {
     return normalizeOrigin(value);
   } catch {
     return "";
+  }
+}
+
+function safeMinorMicros(value: number): string {
+  try {
+    return String(minorToMicros(value));
+  } catch {
+    return "0";
   }
 }
 
@@ -696,6 +716,7 @@ function baseFromInput(input: NormalizedInput): AiLiveQualificationResult {
     publicModelId: input.publicModelId,
     exactPricingRevision: input.exactPricingRevision,
     maximumChargeMinor: input.maximumChargeMinor,
+    maximumChargeMicros: String(input.maximumChargeMicros),
   };
 }
 
@@ -833,13 +854,20 @@ function matchingModel(value: unknown, input: NormalizedInput): "budget" | Match
     model.object !== "model" ||
     !isRecord(model.takoserver) ||
     model.takoserver.pricing_revision !== input.exactPricingRevision ||
-    !nonNegativeInteger(model.takoserver.maximum_charge_minor)
+    model.takoserver.money_policy !== "usd-micros-v2" ||
+    typeof model.takoserver.maximum_charge_micros !== "string"
   ) {
     return null;
   }
-  return model.takoserver.maximum_charge_minor > input.maximumChargeMinor
+  let maximumChargeMicros: number;
+  try {
+    maximumChargeMicros = parseUnsignedMicros(model.takoserver.maximum_charge_micros);
+  } catch {
+    return null;
+  }
+  return BigInt(maximumChargeMicros) > BigInt(input.maximumChargeMicros)
     ? "budget"
-    : { id: input.publicModelId, maximumChargeMinor: model.takoserver.maximum_charge_minor };
+    : { id: input.publicModelId, maximumChargeMicros };
 }
 
 function parseWallet(
@@ -851,12 +879,12 @@ function parseWallet(
   if (
     wallet.organizationId !== input.organizationId ||
     wallet.currency !== "USD" ||
-    !nonNegativeInteger(wallet.availableMinor)
+    !nonNegativeInteger(wallet.availableMicros)
   ) {
     return null;
   }
   return {
-    availableMinor: wallet.availableMinor,
+    availableMicros: String(wallet.availableMicros),
     currency: "USD",
     source: "preflight_observation",
   };
@@ -865,7 +893,7 @@ function parseWallet(
 async function parseCompletionResponse(
   response: Response,
   modelId: string,
-  maximumChargeMinor: number,
+  maximumChargeMicros: number,
   timeoutMs: number,
 ): Promise<ValidCompletion> {
   const body = await readResponseBody(response, timeoutMs);
@@ -877,13 +905,20 @@ async function parseCompletionResponse(
   }
   if (!validCompletion(value, modelId)) throw new MalformedResponseError();
   const requestId = response.headers.get("x-request-id");
-  const billedRaw = response.headers.get("x-takoserver-billed-minor");
+  const billedRaw = response.headers.get("x-takoserver-billed-micros");
+  const moneyPolicy = response.headers.get("x-takoserver-money-policy");
   if (requestId === null || !SAFE_HEADER.test(requestId)) throw new MalformedResponseError();
+  if (moneyPolicy !== "usd-micros-v2") throw new MalformedResponseError();
   if (billedRaw === null || !/^(?:0|[1-9][0-9]*)$/u.test(billedRaw)) {
     throw new MalformedResponseError();
   }
-  const billedMinor = Number(billedRaw);
-  if (!Number.isSafeInteger(billedMinor) || billedMinor > maximumChargeMinor) {
+  let billedMicros: number;
+  try {
+    billedMicros = parseUnsignedMicros(billedRaw);
+  } catch {
+    throw new MalformedResponseError();
+  }
+  if (billedMicros > maximumChargeMicros) {
     throw new MalformedResponseError();
   }
   return {
@@ -891,7 +926,7 @@ async function parseCompletionResponse(
     bodyDigest: digest(body),
     requestId,
     requestIdDigest: digest(new TextEncoder().encode(requestId)),
-    billedMinor,
+    billedMicros,
   };
 }
 
@@ -936,7 +971,7 @@ function sameCompletion(left: ValidCompletion, right: ValidCompletion): boolean 
   return (
     equalBytes(left.body, right.body) &&
     left.requestId === right.requestId &&
-    left.billedMinor === right.billedMinor
+    left.billedMicros === right.billedMicros
   );
 }
 
@@ -944,7 +979,7 @@ function responseProjection(value: ValidCompletion): AiLiveQualificationResponse
   return {
     completionBodyDigest: value.bodyDigest,
     requestIdDigest: value.requestIdDigest,
-    billedMinor: value.billedMinor,
+    billedMicros: String(value.billedMicros),
   };
 }
 
