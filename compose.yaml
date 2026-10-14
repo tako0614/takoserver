@@ -1,0 +1,17 @@
+services:
+  takoserver:
+    build: .
+    image: ${TAKOSERVER_DOCKER_IMAGE:-takoserver-selfhost:local}
+    init: true
+    env_file:
+      - path: ${TAKOSERVER_ENV_FILE:?Set TAKOSERVER_ENV_FILE to a private absolute env-file path}
+        format: raw
+    ports:
+      - "127.0.0.1:${TAKOSERVER_HTTP_PORT:-8787}:8787"
+    volumes:
+      - takoserver-data:/var/lib/takoserver
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  takoserver-data:
