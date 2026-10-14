@@ -32,13 +32,19 @@ type MigrationRunResult = SQLiteMigrationApplicationResult;
 export function createSQLiteMigrationApplicationForm(options: {
   readonly sql: Sql;
   readonly migrationPort: SQLiteMigrationApplicationPort | SQLiteMigrationApplicationBatchPort;
-  readonly custody: Pick<SqlArtifactCustody<SQLiteMigrationManifest>, "readVerified">;
+  readonly custody: Pick<SqlArtifactCustody<SQLiteMigrationManifest>, "readVerified"> &
+    Partial<Pick<SqlArtifactCustody<SQLiteMigrationManifest>, "openAcceptedUnverified">>;
   readonly targetKey: string;
   readonly now?: Clock;
 }): V2Form {
   if (!options.targetKey || !options.migrationPort || !options.custody) {
     throw new TypeError("SQLiteMigrationApplication backend is incomplete");
   }
+  if (
+    "applyAuthorizedMigration" in options.migrationPort &&
+    typeof options.custody.openAcceptedUnverified !== "function"
+  )
+    throw new TypeError("SQLite remote migration requires bounded accepted artifact custody");
   const now = options.now ?? (() => new Date());
 
   async function stillAuthorized(input: V2Execution, databaseUid: string): Promise<boolean> {
@@ -120,9 +126,18 @@ export function createSQLiteMigrationApplicationForm(options: {
         message: "Database authority is unconfirmed",
       };
     }
-    let held: Awaited<ReturnType<typeof options.custody.readVerified>>;
+    const batchPort =
+      "applyAuthorizedMigration" in options.migrationPort ? options.migrationPort : undefined;
+    let held:
+      | Awaited<ReturnType<typeof options.custody.readVerified>>
+      | Awaited<ReturnType<NonNullable<typeof options.custody.openAcceptedUnverified>>>;
     try {
-      held = await options.custody.readVerified({ execution: input, targetResourceUid: setUid });
+      held = batchPort
+        ? await options.custody.openAcceptedUnverified!({
+            execution: input,
+            targetResourceUid: setUid,
+          })
+        : await options.custody.readVerified({ execution: input, targetResourceUid: setUid });
     } catch {
       return {
         kind: "unknown",
@@ -134,7 +149,8 @@ export function createSQLiteMigrationApplicationForm(options: {
       path: file.path,
       sha256: file.sha256,
     }));
-    if (held.files.length !== targetEntries.length || targetEntries.length === 0) {
+    const fileCount = "files" in held ? held.files.length : held.fileSizes.length;
+    if (fileCount !== targetEntries.length || targetEntries.length === 0) {
       return {
         kind: "no_effect",
         code: "artifact_invalid",
@@ -142,7 +158,7 @@ export function createSQLiteMigrationApplicationForm(options: {
       };
     }
     try {
-      const migrationInput: SQLiteMigrationApplicationInput = {
+      const migrationInput: Omit<SQLiteMigrationApplicationInput, "files"> = {
         resourceUid: databaseUid,
         execution: {
           operationId: input.operationId,
@@ -161,12 +177,19 @@ export function createSQLiteMigrationApplicationForm(options: {
         },
         stillAuthorized: () => stillAuthorized(input, databaseUid),
         targetEntries,
-        files: held.files,
       };
       const result =
-        "applyAuthorizedMigration" in options.migrationPort
-          ? await options.migrationPort.applyAuthorizedMigration(migrationInput)
-          : await runSQLiteMigrationApplication(options.migrationPort, migrationInput);
+        batchPort && "fileSizes" in held
+          ? await batchPort.applyAuthorizedMigration({
+              ...migrationInput,
+              fileSizes: held.fileSizes,
+            })
+          : "withAuthorizedMigrationSession" in options.migrationPort && "files" in held
+            ? await runSQLiteMigrationApplication(options.migrationPort, {
+                ...migrationInput,
+                files: held.files,
+              })
+            : ({ kind: "unknown", code: "backend_unavailable" } as const);
       if (result.kind === "unknown") {
         return {
           kind: "unknown",

@@ -77,9 +77,16 @@ export interface SQLiteMigrationApplicationInput {
  * unknown; reconciliation reads the durable prefix rather than replaying SQL.
  * Neither this port nor the session port is a tenant SQL capability.
  */
+export type SQLiteMigrationApplicationBatchInput = Omit<
+  SQLiteMigrationApplicationInput,
+  "files"
+> & {
+  readonly fileSizes: readonly number[];
+};
+
 export interface SQLiteMigrationApplicationBatchPort {
   applyAuthorizedMigration(
-    input: SQLiteMigrationApplicationInput,
+    input: SQLiteMigrationApplicationBatchInput,
   ): Promise<SQLiteMigrationApplicationResult>;
 }
 

@@ -1134,7 +1134,11 @@ production activation receipt.
 
 The Host-private SQLiteMigrationApplication extension accepts either the
 existing authorized session port or a batch port. A remote batch realization
-runs `runSQLiteMigrationApplication` on the native owner, holding the same UID
+receives only the pinned manifest entries and file sizes from
+`openAcceptedUnverified`, without loading the aggregate SQL bytes in the Host
+Worker. The native owner acquires each held file through fixed private accepted
+reference authority and verifies its digest, then runs
+`runSQLiteMigrationApplication`, holding the same UID
 exclusion across ledger readback and every file. It independently verifies the
 accepted Operation, current lease, both references and held manifest identity;
 it does not expose SQL, a SQLite handle or a session to tenant Workers. The

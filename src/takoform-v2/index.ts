@@ -118,6 +118,7 @@ export {
   SQLITE_MIGRATION_APPLICATION_BACKEND_ID,
 } from "./forms/sqlite-migration-application-backend.ts";
 export type {
+  SQLiteMigrationApplicationBatchInput,
   SQLiteMigrationApplicationBatchPort,
   SQLiteMigrationApplicationInput,
   SQLiteMigrationApplicationPort,

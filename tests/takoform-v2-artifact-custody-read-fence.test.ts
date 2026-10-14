@@ -17,6 +17,7 @@ interface Probe {
   readSucceeded: boolean;
   readError?: unknown;
   graphAuthorizationCalls: number;
+  metadataReadWithoutBytes?: boolean;
 }
 
 async function fixture(
@@ -35,7 +36,7 @@ async function fixture(
       call: number;
       advance: (ms: number) => void;
     }) => Promise<void>;
-    readMode?: "reference" | "graph";
+    readMode?: "reference" | "graph" | "accepted";
     graphAuthorized?: (call: number) => boolean;
     graphExpectedSpec?: JsonObject;
     mutateExecution?: (execution: V2Execution) => V2Execution;
@@ -62,7 +63,11 @@ async function fixture(
     };
     const sql: Sql = {
       async query(statement, params) {
-        if (chunkReadArmed && statement.includes("SELECT chunk_index, bytes")) {
+        if (
+          chunkReadArmed &&
+          (statement.includes("SELECT chunk_index, bytes") ||
+            statement.includes("SELECT chunk.chunk_index, chunk.bytes"))
+        ) {
           chunkReadArmed = false;
           await input.onChunkRead?.({ advance, db, targetUid });
         }
@@ -88,8 +93,26 @@ async function fixture(
       [MANIFEST_URL, manifest],
       [FILE_URL, payload],
     ]);
+    const observed =
+      input.readMode === "accepted"
+        ? { ready: true, files: [{ byteSize: payload.byteLength }] }
+        : { ready: true };
+    let consumerReading = false;
+    let chunkQueries = 0;
+    const observedSql: Sql = {
+      ...sql,
+      async query(statement, params) {
+        if (
+          consumerReading &&
+          (statement.includes("SELECT chunk_index, bytes") ||
+            statement.includes("SELECT chunk.chunk_index, chunk.bytes"))
+        )
+          chunkQueries += 1;
+        return sql.query(statement, params);
+      },
+    };
     const custody = createSqlArtifactCustody({
-      sql,
+      sql: observedSql,
       now: () => new Date(nowMs),
       source: {
         async read({ url }) {
@@ -110,10 +133,10 @@ async function fixture(
         };
       },
       async validatePayload() {
-        return { observed: { ready: true }, output: {} };
+        return { observed, output: {} };
       },
       async projectVerified() {
-        return { observed: { ready: true }, output: {} };
+        return { observed, output: {} };
       },
       invalidArtifact: () => new Error("invalid artifact"),
       invalidManifest: () => new Error("invalid manifest"),
@@ -144,23 +167,49 @@ async function fixture(
           input.beforeRead?.({ db, execution, advance });
           chunkReadArmed = input.onChunkRead !== undefined;
           try {
+            consumerReading = true;
             const read =
-              input.readMode === "graph"
-                ? await custody.readHeldVerified({
-                    targetResourceUid: targetUid,
-                    principal: execution.principal,
-                    space: execution.space,
-                    expectedSpec: input.graphExpectedSpec ?? targetSpec,
-                    expectedObserved: { ready: true },
-                    stillAuthorized: async () => {
-                      probe.graphAuthorizationCalls += 1;
-                      return input.graphAuthorized?.(probe.graphAuthorizationCalls) ?? true;
-                    },
-                  })
-                : await custody.readVerified({
-                    execution: input.mutateExecution?.(execution) ?? execution,
-                    targetResourceUid: targetUid,
-                  });
+              input.readMode === "accepted"
+                ? await (async () => {
+                    const before = chunkQueries;
+                    const opened = await custody.openAcceptedUnverified({
+                      execution: input.mutateExecution?.(execution) ?? execution,
+                      targetResourceUid: targetUid,
+                    });
+                    probe.metadataReadWithoutBytes = chunkQueries === before;
+                    const chunks: Uint8Array[] = [];
+                    await opened.stageVerifiedFile({
+                      fileIndex: 0,
+                      async write(chunk) {
+                        chunks.push(chunk);
+                      },
+                    });
+                    const bytes = new Uint8Array(
+                      chunks.reduce((total, chunk) => total + chunk.byteLength, 0),
+                    );
+                    let offset = 0;
+                    for (const chunk of chunks) {
+                      bytes.set(chunk, offset);
+                      offset += chunk.byteLength;
+                    }
+                    return { files: [bytes] };
+                  })()
+                : input.readMode === "graph"
+                  ? await custody.readHeldVerified({
+                      targetResourceUid: targetUid,
+                      principal: execution.principal,
+                      space: execution.space,
+                      expectedSpec: input.graphExpectedSpec ?? targetSpec,
+                      expectedObserved: { ready: true },
+                      stillAuthorized: async () => {
+                        probe.graphAuthorizationCalls += 1;
+                        return input.graphAuthorized?.(probe.graphAuthorizationCalls) ?? true;
+                      },
+                    })
+                  : await custody.readVerified({
+                      execution: input.mutateExecution?.(execution) ?? execution,
+                      targetResourceUid: targetUid,
+                    });
             probe.readSucceeded =
               read.files.length === 1 &&
               new TextDecoder().decode(read.files[0]) === "immutable artifact bytes";
@@ -311,4 +360,51 @@ test("the internal graph read fences a graph that changes while bytes are awaite
   expect(probe.readSucceeded).toBe(false);
   expect(probe.readError).toBeDefined();
   expect(probe.graphAuthorizationCalls).toBe(2);
+});
+
+test("accepted bounded staging opens metadata without loading SQL files and verifies one selected file", async () => {
+  const probe = await fixture({ readMode: "accepted" });
+  expect(probe.readSucceeded).toBe(true);
+  expect(probe.metadataReadWithoutBytes).toBe(true);
+  expect(probe.readError).toBeUndefined();
+});
+
+test("accepted bounded staging refuses an action or accepted spec mismatch", async () => {
+  for (const mutateExecution of [
+    (execution: V2Execution): V2Execution => ({ ...execution, action: "update" }),
+    (execution: V2Execution): V2Execution => ({ ...execution, spec: { tampered: true } }),
+  ]) {
+    const probe = await fixture({ readMode: "accepted", mutateExecution });
+    expect(probe.readSucceeded).toBe(false);
+    expect(probe.readError).toBeDefined();
+  }
+});
+
+test("accepted bounded staging fences a lease expiring while chunk SQL is awaited", async () => {
+  const probe = await fixture({
+    readMode: "accepted",
+    async onChunkRead({ advance }) {
+      await Promise.resolve();
+      advance(60_001);
+    },
+  });
+  expect(probe.metadataReadWithoutBytes).toBe(true);
+  expect(probe.readSucceeded).toBe(false);
+  expect(probe.readError).toBeDefined();
+});
+
+test("accepted bounded staging fences a target change after metadata was read", async () => {
+  const probe = await fixture({
+    readMode: "accepted",
+    async onChunkRead({ db, targetUid }) {
+      await Promise.resolve();
+      db.query("UPDATE tf_v2_resources SET spec_json = ? WHERE uid = ?").run(
+        '{"tampered":true}',
+        targetUid,
+      );
+    },
+  });
+  expect(probe.metadataReadWithoutBytes).toBe(true);
+  expect(probe.readSucceeded).toBe(false);
+  expect(probe.readError).toBeDefined();
 });

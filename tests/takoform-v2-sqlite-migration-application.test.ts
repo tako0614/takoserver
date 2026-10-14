@@ -846,7 +846,7 @@ test("batch realization retains partial history and rolls back a failing file", 
     (native) => ({
       async applyAuthorizedMigration(input) {
         calls += 1;
-        return runSQLiteMigrationApplication(native, input);
+        return runSQLiteMigrationApplication(native, { ...input, files: f.fileBytes });
       },
     }),
   );
@@ -881,7 +881,10 @@ test("lost batch response reconciles the durable prefix without executing the SQ
     "CREATE TABLE item (value TEXT); INSERT INTO item VALUES ('once');",
     (native) => ({
       async applyAuthorizedMigration(input) {
-        const result = await runSQLiteMigrationApplication(native, input);
+        const result = await runSQLiteMigrationApplication(native, {
+          ...input,
+          files: f.fileBytes,
+        });
         calls += 1;
         if (calls === 1) throw new Error("lost batch response");
         return result;
