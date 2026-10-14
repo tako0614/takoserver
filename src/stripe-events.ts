@@ -214,7 +214,7 @@ export function parseStripeEventEnvelope(payload: Uint8Array): StripeEventEnvelo
 
 /** What a handler may use. The event body is not in it beyond the envelope. */
 export interface StripeEventHandlerContext {
-  readonly client: StripeClient;
+  readonly client: Pick<StripeClient, "checkoutSession" | "listCheckoutSessions">;
   readonly currency: "USD";
   readonly mode: StripeMode;
   readonly credit: FundingCredit;
@@ -308,7 +308,7 @@ export const STRIPE_DEFERRED_EVENT_TYPES: ReadonlySet<string> = Object.freeze(
 );
 
 export interface StripeEventsOptions {
-  readonly client: StripeClient;
+  readonly client: Pick<StripeClient, "checkoutSession" | "listCheckoutSessions">;
   readonly mode?: StripeMode;
   readonly currency?: "USD";
   /** Absent: notifications are not received, and only the reconcile pass runs. */

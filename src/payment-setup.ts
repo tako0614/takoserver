@@ -1,6 +1,7 @@
 import type { Checkout } from "./control.ts";
 import type { HostedPricing } from "./hosted-pricing.ts";
 import type { FundingSettlementVerifier } from "./ledger.ts";
+import { OrgTopUpError, type OrgTopUps } from "./org-top-up.ts";
 import type { PaymentEventContext, PaymentEvents } from "./payment-events.ts";
 import {
   DEFAULT_CHECKOUT_MAXIMUM_MINOR,
@@ -43,6 +44,8 @@ export interface PaymentSetupOptions {
   readonly hostedPricing?: HostedPricing | undefined;
   /** Deployment-wide financial realm; absence selects TEST, never the key prefix. */
   readonly stripeMode?: StripeMode | undefined;
+  /** Hosted Checkout requires the owning durable customer/realm custody capability. */
+  readonly topUps?: OrgTopUps | undefined;
   /** Stripe secret key. Its presence is what turns payment on. */
   readonly stripeSecretKey?: string | undefined;
   /** Signing secret of this deployment's Stripe webhook endpoint. */
@@ -92,7 +95,11 @@ export function resolvePayment(options: PaymentSetupOptions): PaymentSetup {
     settlement: createStripeSettlement(stripeOptions),
     ...(consoleOrigin === undefined || consoleOrigin === ""
       ? {}
-      : { checkout: createCheckout(client, consoleOrigin, settings) }),
+      : options.hostedPricing
+        ? options.topUps
+          ? { checkout: createHostedCheckout(options.topUps) }
+          : {}
+        : { checkout: createCheckout(client, consoleOrigin, settings) }),
     events: (context) => {
       const hosted =
         billingClient && options.hostedPricing
@@ -141,6 +148,18 @@ export function resolvePayment(options: PaymentSetupOptions): PaymentSetup {
             },
           }
         : events;
+    },
+  };
+}
+
+function createHostedCheckout(topUps: OrgTopUps): Checkout {
+  return {
+    bounds: topUps.bounds,
+    referenceRequired: true,
+    receipt: topUps.receipt.bind(topUps),
+    async begin({ organizationId, amountMinor, reference }) {
+      if (reference === undefined) throw new OrgTopUpError("invalid_argument");
+      return await topUps.begin({ organizationId, amountMinor, reference });
     },
   };
 }

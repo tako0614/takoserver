@@ -3,9 +3,10 @@ import {
   hasImmutableStripeModeRealmSchema,
   parseStripeMode,
   STRIPE_MODE_REALM_SCHEMA_QUERY,
-  STRIPE_REALM_AMBIGUOUS_HISTORY_TABLES,
+  STRIPE_REALM_FINANCIAL_HISTORY_QUERY,
   type StripeMode,
   StripeModeRealmError,
+  stripeRealmFinancialHistoryTables,
 } from "./stripe-mode-realm.ts";
 
 /**
@@ -338,11 +339,11 @@ function inspectStripeRealmPrecondition(database: MigratableDatabase, mode: Stri
       return true;
     }
   }
-  for (const table of STRIPE_REALM_AMBIGUOUS_HISTORY_TABLES) {
-    if (
-      hasTable(database, table) &&
-      database.query(`SELECT 1 FROM ${table} LIMIT 1`).all().length > 0
-    ) {
+  const tables = stripeRealmFinancialHistoryTables(
+    database.query(STRIPE_REALM_FINANCIAL_HISTORY_QUERY).all() as { name: unknown }[],
+  );
+  for (const table of tables) {
+    if (database.query(`SELECT 1 FROM ${table} LIMIT 1`).all().length > 0) {
       throw new StripeModeRealmError(
         "legacy_history",
         "Cannot pin Stripe mode because existing wallet, money, or Stripe history has no realm",

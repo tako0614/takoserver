@@ -1,5 +1,5 @@
 import { canonicalJson } from "./json.ts";
-import type { Clock, Row, Sql } from "./ports.ts";
+import type { Clock, Row, Sql, SqlParam } from "./ports.ts";
 import {
   type StripeBillingClient,
   StripeBillingClientError,
@@ -58,6 +58,17 @@ export interface Association {
   readonly priceAmountMinor: number;
   readonly includedMinor: number;
   readonly sessionId: string;
+}
+export interface SubscriptionManagementContext {
+  readonly organizationId: string;
+  readonly operation: "begin" | "cancel";
+  readonly requestKeyDigest: string;
+  readonly intentId?: string;
+  readonly subscriptionId?: string;
+}
+export interface SubscriptionManagementPredicate {
+  readonly condition: string;
+  readonly params: readonly SqlParam[];
 }
 interface CheckoutIntent {
   readonly id: string;
@@ -206,12 +217,45 @@ export function createSubscriptionCustody(options: {
   ) => Promise<void>;
   readonly validateCustomer: (org: string, customerId: string) => Promise<void>;
   readonly isConclusivePreflightFailure: (error: unknown) => boolean;
+  readonly ensureCustomer?: (organizationId: string) => Promise<string>;
+  readonly requireBoundCustomer?: boolean;
+  readonly managementGuard?: (
+    context: SubscriptionManagementContext,
+  ) => SubscriptionManagementPredicate;
+  readonly resolveCurrentTerms?: (input: {
+    readonly association: Association;
+    readonly subscription: StripeBillingObject;
+    readonly periodStart: string;
+    readonly periodEnd: string;
+  }) => Promise<
+    Pick<
+      Association,
+      "planKey" | "pricingRevision" | "priceId" | "priceAmountMinor" | "includedMinor"
+    >
+  >;
 }) {
   const { sql, client, clock } = options;
   const plans = new Map(options.plans.map((plan) => [plan.planId, plan] as const));
   if (plans.size !== options.plans.length || plans.size === 0) fail("invalid_plan_configuration");
   const livemode = (options.mode ?? "test") === "live";
   const now = () => clock().toISOString();
+  const managementGuard = (
+    input: SubscriptionManagementContext,
+  ): SubscriptionManagementPredicate => {
+    const predicate = options.managementGuard?.(input) ?? { condition: "1", params: [] };
+    if (!predicate.condition) fail("subscription_management_unavailable");
+    return predicate;
+  };
+  async function managementPreflight(input: SubscriptionManagementContext): Promise<void> {
+    const predicate = managementGuard(input);
+    const row = (
+      await sql.query(
+        `SELECT CASE WHEN ${predicate.condition} THEN 1 ELSE 0 END AS allowed`,
+        predicate.params,
+      )
+    )[0];
+    if (row?.allowed !== 1) fail("subscription_management_conflict");
+  }
   const byCheckoutId = async (value: string) => {
     const row = checkoutRow(
       (
@@ -313,6 +357,7 @@ export function createSubscriptionCustody(options: {
     );
   }
   async function exactLines(intent: CheckoutIntent, sessionId: string): Promise<void> {
+    if (typeof client.sessionLineItems !== "function") fail("subscription_checkout_unresolved");
     const lines = await client.sessionLineItems(sessionId);
     if (
       lines.hasMore ||
@@ -428,6 +473,8 @@ export function createSubscriptionCustody(options: {
     )[0];
     if (priorCustomer && priorCustomer.customer_id !== binding.customerId)
       fail("subscription_customer_conflict");
+    if (options.requireBoundCustomer && !priorCustomer) fail("subscription_customer_conflict");
+    if (priorCustomer) await options.validateCustomer(binding.organizationId, binding.customerId);
     const priorAssociation = await association(binding.subscriptionId);
     if (priorAssociation && canonicalJson(priorAssociation) !== canonicalJson(binding))
       fail("subscription_association_conflict");
@@ -742,6 +789,12 @@ export function createSubscriptionCustody(options: {
         [intent.org, intent.org, intent.org],
       );
       if (competingState.length) return await invalidate();
+      const shared = managementGuard({
+        organizationId: intent.org,
+        operation: "begin",
+        requestKeyDigest: intent.key,
+        intentId: intent.id,
+      });
       const claim = await sql.run(
         `UPDATE stripe_subscription_checkout_intents SET state = 'dispatched', updated_at = ?
          WHERE id = ? AND state = 'prepared' AND org_id = ? AND pricing_revision = ? AND price_id = ?
@@ -750,7 +803,8 @@ export function createSubscriptionCustody(options: {
            AND NOT EXISTS (SELECT 1 FROM stripe_billing_subscriptions WHERE org_id = ? AND status NOT IN ('canceled','incomplete_expired'))
            AND NOT EXISTS (SELECT 1 FROM stripe_billing_associations a WHERE a.org_id = ?
              AND a.association_generation = (SELECT MAX(association_generation) FROM stripe_billing_associations WHERE org_id = ?)
-             AND NOT EXISTS (SELECT 1 FROM stripe_billing_subscriptions s WHERE s.org_id = a.org_id AND s.subscription_id = a.subscription_id))`,
+             AND NOT EXISTS (SELECT 1 FROM stripe_billing_subscriptions s WHERE s.org_id = a.org_id AND s.subscription_id = a.subscription_id))
+           AND (${shared.condition})`,
         [
           now(),
           intent.id,
@@ -765,6 +819,7 @@ export function createSubscriptionCustody(options: {
           intent.org,
           intent.org,
           intent.org,
+          ...shared.params,
         ],
       );
       if (claim.changes !== 1) {
@@ -859,6 +914,7 @@ export function createSubscriptionCustody(options: {
     if (existing) return await replay(existing);
     const plan = plans.get(planKey);
     if (!plan) fail("unknown_plan");
+    if (typeof client.sessionLineItems !== "function") fail("subscription_checkout_unresolved");
     if (options.effectiveAt > now()) fail("pricing_not_effective");
     const active = checkoutRow(
       (
@@ -882,11 +938,15 @@ export function createSubscriptionCustody(options: {
           throw error;
       }
     }
+    await managementPreflight({ organizationId: org, operation: "begin", requestKeyDigest: key });
     await options.validatePrice(plan.stripePriceId, options.pricingRevision, true);
+    const ensuredCustomer = options.ensureCustomer ? await options.ensureCustomer(org) : null;
     const customer = (
       await sql.query("SELECT customer_id FROM stripe_billing_customers WHERE org_id = ?", [org])
     )[0];
     const customerId = customer ? String(customer.customer_id) : null;
+    if (ensuredCustomer !== null && ensuredCustomer !== customerId)
+      fail("subscription_checkout_mismatch");
     if (customerId) await options.validateCustomer(org, customerId);
     const intentId = `sci_${crypto.randomUUID()}`;
     const terms = [
@@ -899,6 +959,12 @@ export function createSubscriptionCustody(options: {
       livemode,
       "subscription",
     ];
+    const shared = managementGuard({
+      organizationId: org,
+      operation: "begin",
+      requestKeyDigest: key,
+      intentId,
+    });
     const inserted = await sql.run(
       `INSERT OR IGNORE INTO stripe_subscription_checkout_intents
        (id,org_id,request_key_digest,fingerprint,plan_key,pricing_revision,price_id,price_amount_minor,included_minor,livemode,customer_id,state,created_at,updated_at)
@@ -908,7 +974,8 @@ export function createSubscriptionCustody(options: {
          AND NOT EXISTS (SELECT 1 FROM stripe_billing_associations a
            WHERE a.org_id = ? AND a.association_generation =
              (SELECT MAX(association_generation) FROM stripe_billing_associations WHERE org_id = ?)
-             AND NOT EXISTS (SELECT 1 FROM stripe_billing_subscriptions s WHERE s.org_id = a.org_id AND s.subscription_id = a.subscription_id))`,
+             AND NOT EXISTS (SELECT 1 FROM stripe_billing_subscriptions s WHERE s.org_id = a.org_id AND s.subscription_id = a.subscription_id))
+         AND (${shared.condition})`,
       [
         intentId,
         org,
@@ -927,6 +994,7 @@ export function createSubscriptionCustody(options: {
         org,
         org,
         org,
+        ...shared.params,
       ],
     );
     if (inserted.changes !== 1) {
@@ -955,13 +1023,10 @@ export function createSubscriptionCustody(options: {
       id(sub.customer, CUSTOMER) !== bound.customerId ||
       meta?.organizationId !== bound.organizationId ||
       meta.takoserverPurpose !== PURPOSE ||
-      meta.planKey !== bound.planKey ||
-      meta.pricingRevision !== bound.pricingRevision ||
       sub.currency !== "usd" ||
       items?.has_more !== false ||
       !item ||
       item.quantity !== 1 ||
-      id(item.price, PRICE) !== bound.priceId ||
       !start ||
       !end ||
       start >= end ||
@@ -972,7 +1037,21 @@ export function createSubscriptionCustody(options: {
       (sub.schedule !== null && sub.schedule !== undefined)
     )
       fail("subscription_management_unavailable");
-    await options.validatePrice(bound.priceId, bound.pricingRevision, false);
+    const terms = options.resolveCurrentTerms
+      ? await options.resolveCurrentTerms({
+          association: bound,
+          subscription: sub,
+          periodStart: start,
+          periodEnd: end,
+        })
+      : bound;
+    if (
+      meta.planKey !== terms.planKey ||
+      meta.pricingRevision !== terms.pricingRevision ||
+      id(item.price, PRICE) !== terms.priceId
+    )
+      fail("subscription_management_unavailable");
+    await options.validatePrice(terms.priceId, terms.pricingRevision, false);
     if (intent && end < intent.prePeriodEnd) fail("subscription_management_unavailable");
     if (sub.status === "canceled") {
       const ended = instant(sub.ended_at),
@@ -1072,12 +1151,20 @@ export function createSubscriptionCustody(options: {
       fail("subscription_management_conflict");
     const fresh = await readVerifiedSubscription(bound, intent);
     if (fresh.cancelAtPeriodEnd) fail("subscription_management_conflict");
+    const shared = managementGuard({
+      organizationId: intent.org,
+      operation: "cancel",
+      requestKeyDigest: intent.key,
+      intentId: intent.id,
+      subscriptionId: intent.subscriptionId,
+    });
     const claimed = await sql.run(
       `UPDATE stripe_subscription_cancellation_intents SET state = 'dispatched', updated_at = ?
        WHERE id = ? AND state = 'prepared' AND EXISTS
          (SELECT 1 FROM stripe_billing_subscriptions WHERE org_id = ? AND subscription_id = ?
-            AND customer_id = ? AND cancel_at_period_end = 0 AND status NOT IN ('canceled','incomplete_expired'))`,
-      [now(), intent.id, intent.org, intent.subscriptionId, intent.customerId],
+            AND customer_id = ? AND cancel_at_period_end = 0 AND status NOT IN ('canceled','incomplete_expired'))
+         AND (${shared.condition})`,
+      [now(), intent.id, intent.org, intent.subscriptionId, intent.customerId, ...shared.params],
     );
     if (claimed.changes !== 1) {
       const latest = await byCancelId(intent.id);
@@ -1139,6 +1226,12 @@ export function createSubscriptionCustody(options: {
       ["canceled", "incomplete_expired"].includes(String(current.status))
     )
       fail("subscription_management_conflict");
+    await managementPreflight({
+      organizationId: org,
+      operation: "cancel",
+      requestKeyDigest: key,
+      subscriptionId: bound.subscriptionId,
+    });
     const verified = await readVerifiedSubscription(bound);
     if (verified.cancelAtPeriodEnd) fail("subscription_management_conflict");
     const intentId = `smc_${crypto.randomUUID()}`;
@@ -1155,6 +1248,13 @@ export function createSubscriptionCustody(options: {
       verified.periodEnd,
       "cancel_at_period_end",
     ];
+    const shared = managementGuard({
+      organizationId: org,
+      operation: "cancel",
+      requestKeyDigest: key,
+      intentId,
+      subscriptionId: bound.subscriptionId,
+    });
     const inserted = await sql.run(
       `INSERT OR IGNORE INTO stripe_subscription_cancellation_intents
        (id,org_id,request_key_digest,fingerprint,subscription_id,customer_id,livemode,plan_key,
@@ -1162,7 +1262,8 @@ export function createSubscriptionCustody(options: {
        SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,'prepared',?,?
        WHERE EXISTS (SELECT 1 FROM stripe_billing_subscriptions WHERE org_id = ? AND subscription_id = ?
          AND customer_id = ? AND cancel_at_period_end = 0 AND status NOT IN ('canceled','incomplete_expired'))
-       AND NOT EXISTS (SELECT 1 FROM stripe_subscription_cancellation_intents WHERE subscription_id = ? AND state IN ('prepared','dispatched'))`,
+       AND NOT EXISTS (SELECT 1 FROM stripe_subscription_cancellation_intents WHERE subscription_id = ? AND state IN ('prepared','dispatched'))
+       AND (${shared.condition})`,
       [
         intentId,
         org,
@@ -1183,6 +1284,7 @@ export function createSubscriptionCustody(options: {
         bound.subscriptionId,
         bound.customerId,
         bound.subscriptionId,
+        ...shared.params,
       ],
     );
     if (inserted.changes !== 1) {

@@ -1,6 +1,9 @@
 import committedSharedHostedPricing from "../config/shared-hosted-pricing.json" with {
   type: "json",
 };
+import retainedSharedHostedPricingV1 from "../config/shared-hosted-pricing-revisions/hosted-20261014-final-v1.json" with {
+  type: "json",
+};
 import { type BillingConfig, BillingConfigError, parseBillingConfig } from "./billing-config.ts";
 import { canonicalJson } from "./json.ts";
 import { MoneyError, minorToMicros } from "./money.ts";
@@ -14,6 +17,16 @@ import { parseStrictJson } from "./strict-json.ts";
 
 const committedSharedPricing = parseSharedHostedPricing(committedSharedHostedPricing);
 const committedSharedTerms = sharedTermsWithoutStripeIds(committedSharedPricing);
+const retainedSharedTerms = new Map<string, string>();
+for (const source of [retainedSharedHostedPricingV1, committedSharedHostedPricing]) {
+  const reviewed = parseSharedHostedPricing(source);
+  if (
+    reviewed.plans.some((plan) => plan.stripePriceId !== null) ||
+    retainedSharedTerms.has(reviewed.revision)
+  )
+    throw new Error("Reviewed pricing revision registry is invalid");
+  retainedSharedTerms.set(reviewed.revision, sharedTermsWithoutStripeIds(reviewed));
+}
 
 function sharedTermsWithoutStripeIds(pricing: ReturnType<typeof parseSharedHostedPricing>): string {
   return canonicalJson({
@@ -231,7 +244,10 @@ export function compilePricingAuthoring(input: unknown): PricingPreview {
 }
 
 /** Binds the final shared USD source to a strict two-plan Host tariff. */
-function compileSharedRuntimePricing(root: Record<string, unknown>): PricingPreview {
+function compileSharedRuntimePricing(
+  root: Record<string, unknown>,
+  reviewedTerms = committedSharedTerms,
+): PricingPreview {
   exactKeys(
     root,
     ["authoringVersion", "sharedPricing", "billingConfig", "checkout", "planIds"],
@@ -246,7 +262,7 @@ function compileSharedRuntimePricing(root: Record<string, unknown>): PricingPrev
   }
   if (
     committedSharedPricing.plans.some((plan) => plan.stripePriceId !== null) ||
-    sharedTermsWithoutStripeIds(shared) !== committedSharedTerms
+    sharedTermsWithoutStripeIds(shared) !== reviewedTerms
   )
     fail("sharedPricing differs from the reviewed source");
   const plans = shared.plans.map((plan) => {
@@ -399,6 +415,41 @@ export function parseHostedPricing(raw?: string): HostedPricing | undefined {
   try {
     const parsed = parseStrictJson(new TextEncoder().encode(raw), HOSTED_PRICING_MAX_BYTES);
     return compilePricingAuthoring(parsed);
+  } catch {
+    throw new HostedPricingError();
+  }
+}
+
+/**
+ * Reads an already persisted immutable pricing snapshot against the explicit
+ * reviewed revision registry. Never use this for admission/configuration or to
+ * register caller-supplied history. The caller must still compare the complete
+ * compiled snapshot with its persisted bytes and preserve its original custody.
+ */
+export function parsePersistedHostedPricing(
+  raw: string | undefined,
+  expectedRevision: string,
+): HostedPricing | undefined {
+  if (raw === undefined) return undefined;
+  try {
+    const root = objectAt(
+      parseStrictJson(new TextEncoder().encode(raw), HOSTED_PRICING_MAX_BYTES),
+      "$",
+    );
+    let pricing: HostedPricing;
+    if (root.authoringVersion === 2) {
+      const source = objectAt(root.sharedPricing, "sharedPricing");
+      if (source.revision !== expectedRevision) throw new HostedPricingError();
+      const terms = retainedSharedTerms.get(expectedRevision);
+      if (!terms) throw new HostedPricingError();
+      pricing = compileSharedRuntimePricing(root, terms);
+    } else {
+      // Preserve the original strict v1 contract; only v2 has a shared-source registry.
+      pricing = compilePricingAuthoring(root);
+    }
+    const tariff = parseBillingConfig(pricing.environment.TAKOSERVER_BILLING_CONFIG);
+    if (!tariff || tariff.revision !== expectedRevision) throw new HostedPricingError();
+    return pricing;
   } catch {
     throw new HostedPricingError();
   }

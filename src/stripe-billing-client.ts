@@ -21,16 +21,22 @@ export type StripeBillingGetKind =
   | "prices"
   | "customers"
   | "events"
+  | "subscription_schedules"
   | "checkout/sessions";
 
 export type StripeBillingListKind =
+  | "customers"
   | "invoices"
   | "subscriptions"
   | "refunds"
   | "events"
   | "checkout/sessions";
 
-export type StripeBillingPostKind = "customers" | "checkout/sessions" | "subscriptions";
+export type StripeBillingPostKind =
+  | "customers"
+  | "checkout/sessions"
+  | "subscriptions"
+  | "subscription_schedules";
 
 export type StripeBillingClientErrorCode =
   | "invalid_configuration"
@@ -55,6 +61,10 @@ export class StripeBillingClientError extends Error {
 }
 
 export interface StripeBillingClient {
+  /** Account associated with this same authentication, without Connect headers. */
+  authenticAccount?(): Promise<StripeBillingObject>;
+  /** Mode evidence for this same authenticated account; no money mutation. */
+  authenticBalance?(): Promise<Readonly<Record<string, unknown>>>;
   get(
     kind: StripeBillingGetKind,
     id: string,
@@ -68,15 +78,18 @@ export interface StripeBillingClient {
       readonly paymentIntent?: string;
       readonly customer?: string;
       readonly subscription?: string;
+      readonly createdGte?: number;
+      readonly status?: "open" | "complete" | "expired";
       readonly limit?: number;
     },
   ): Promise<StripeBillingPage>;
   /** Complete only when hasMore is false; callers must reject extra lines. */
-  sessionLineItems(sessionId: string): Promise<StripeBillingPage>;
+  sessionLineItems?(sessionId: string): Promise<StripeBillingPage>;
   post(
     kind: StripeBillingPostKind,
     input: {
       readonly id?: string;
+      readonly action?: "release";
       readonly form: Readonly<Record<string, string>>;
       readonly idempotencyKey: string;
     },
@@ -92,12 +105,14 @@ export interface StripeBillingClientOptions {
 const ID_PREFIXES: Readonly<Record<string, string>> = {
   invoices: "in_",
   subscriptions: "sub_",
+  subscription_schedules: "sub_sched_",
   charges: "ch_",
   refunds: "re_",
   prices: "price_",
   customers: "cus_",
   "checkout/sessions": "cs_",
   events: "evt_",
+  accounts: "acct_",
   payment_intents: "pi_",
 };
 
@@ -236,16 +251,17 @@ function formRecord(form: Readonly<Record<string, string>>): Record<string, stri
 
 export function createStripeBillingClient(
   options: StripeBillingClientOptions,
-): StripeBillingClient {
+): StripeBillingClient & Required<Pick<StripeBillingClient, "sessionLineItems">> {
   const mode = options.mode ?? "test";
+  const secretKey = options.secretKey;
   if (mode !== "test" && mode !== "live") {
     throw new StripeBillingClientError("invalid_configuration");
   }
   const keyPrefix = mode === "live" ? /^(?:sk|rk)_live_/u : /^(?:sk|rk)_test_/u;
   if (
-    typeof options.secretKey !== "string" ||
-    !keyPrefix.test(options.secretKey) ||
-    options.secretKey.length <= options.secretKey.indexOf("_") + 6
+    typeof secretKey !== "string" ||
+    !keyPrefix.test(secretKey) ||
+    secretKey.length <= secretKey.indexOf("_") + 6
   ) {
     throw new StripeBillingClientError("invalid_configuration");
   }
@@ -267,7 +283,7 @@ export function createStripeBillingClient(
         new Request(`${STRIPE_API}${path}`, {
           method,
           headers: {
-            authorization: `Bearer ${options.secretKey}`,
+            authorization: `Bearer ${secretKey}`,
             "stripe-version": STRIPE_API_VERSION,
             ...(form === undefined ? {} : { "content-type": "application/x-www-form-urlencoded" }),
             ...(input?.idempotencyKey === undefined
@@ -287,7 +303,30 @@ export function createStripeBillingClient(
     return await parseResponse(response);
   }
 
-  return {
+  const client: StripeBillingClient & Required<Pick<StripeBillingClient, "sessionLineItems">> = {
+    async authenticAccount() {
+      const account = record(await request("GET", "/account"));
+      if (
+        account.object !== "account" ||
+        account.deleted === true ||
+        typeof account.id !== "string"
+      )
+        return invalidObject();
+      validateId("accounts", account.id);
+      return account as StripeBillingObject;
+    },
+    async authenticBalance() {
+      const balance = record(await request("GET", "/balance"));
+      if (balance.livemode === true) throw new StripeBillingClientError("test_mode_required");
+      if (
+        balance.object !== "balance" ||
+        balance.livemode !== false ||
+        !Array.isArray(balance.available) ||
+        !Array.isArray(balance.pending)
+      )
+        return invalidObject();
+      return balance;
+    },
     async get(kind, id, options = {}) {
       validateId(kind, id);
       const expand = options.expand ?? [];
@@ -319,6 +358,19 @@ export function createStripeBillingClient(
       if (input.paymentIntent !== undefined) validateId("payment_intents", input.paymentIntent);
       if (input.customer !== undefined) validateId("customers", input.customer);
       if (input.subscription !== undefined) validateId("subscriptions", input.subscription);
+      if (
+        input.createdGte !== undefined &&
+        (!Number.isSafeInteger(input.createdGte) ||
+          input.createdGte < 0 ||
+          input.createdGte > 253402300799 ||
+          !["checkout/sessions", "customers"].includes(kind))
+      )
+        return invalidObject();
+      if (
+        input.status !== undefined &&
+        (kind !== "checkout/sessions" || !["open", "complete", "expired"].includes(input.status))
+      )
+        return invalidObject();
 
       const query = new URLSearchParams({ limit: String(limit) });
       if (input.startingAfter !== undefined) query.set("starting_after", input.startingAfter);
@@ -326,6 +378,8 @@ export function createStripeBillingClient(
       if (input.paymentIntent !== undefined) query.set("payment_intent", input.paymentIntent);
       if (input.customer !== undefined) query.set("customer", input.customer);
       if (input.subscription !== undefined) query.set("subscription", input.subscription);
+      if (input.createdGte !== undefined) query.set("created[gte]", String(input.createdGte));
+      if (input.status !== undefined) query.set("status", input.status);
 
       const raw = record(await request("GET", `/${kind}?${query.toString()}`));
       if (
@@ -379,10 +433,15 @@ export function createStripeBillingClient(
         return invalidObject();
       }
       if (input.id !== undefined) validateId(kind, input.id);
+      if (
+        input.action !== undefined &&
+        (input.action !== "release" || kind !== "subscription_schedules" || input.id === undefined)
+      )
+        return invalidObject();
       const object = asObject(
         await request(
           "POST",
-          `/${kind}${input.id === undefined ? "" : `/${encodeURIComponent(input.id)}`}`,
+          `/${kind}${input.id === undefined ? "" : `/${encodeURIComponent(input.id)}`}${input.action === undefined ? "" : `/${input.action}`}`,
           {
             form: input.form,
             idempotencyKey: input.idempotencyKey,
@@ -396,4 +455,5 @@ export function createStripeBillingClient(
       return object;
     },
   };
+  return Object.freeze(client);
 }

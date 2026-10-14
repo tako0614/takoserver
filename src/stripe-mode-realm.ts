@@ -151,26 +151,64 @@ export const STRIPE_REALM_AMBIGUOUS_HISTORY_TABLES = [
   "stripe_subscription_cancellation_intents",
 ] as const;
 
-const FRESH_HISTORY_PREDICATE = STRIPE_REALM_AMBIGUOUS_HISTORY_TABLES.map(
-  (table) => `NOT EXISTS (SELECT 1 FROM ${table} LIMIT 1)`,
-).join("\n    AND ");
+// The immutable 0098 table vocabulary is retained above. A later source may
+// add financial state without changing those migration bytes; fresh claiming
+// must include that state and future unknown financial-prefixed tables too.
+const FINANCIAL_HISTORY_PREFIXES = [
+  "stripe_",
+  "wallet_",
+  "org_wallet_",
+  "money_",
+  "usage_",
+  "reseller_settlement_",
+  "provider_meter_",
+  "sponsorship_",
+] as const;
+const FINANCIAL_HISTORY_PREDICATE = `type = 'table' AND (${FINANCIAL_HISTORY_PREFIXES.map(
+  (prefix) => `substr(lower(name), 1, ${prefix.length}) = '${prefix}'`,
+).join(" OR ")} OR lower(name) IN ('ledger', 'quotes', 'reservations', 'idempotency'))
+  AND lower(name) NOT IN ('stripe_mode_realm', 'money_unit_policy')`;
+
+/** Read-only discovery also works before all pending migration tables exist. */
+export const STRIPE_REALM_FINANCIAL_HISTORY_QUERY = `SELECT name FROM sqlite_schema WHERE ${FINANCIAL_HISTORY_PREDICATE} ORDER BY name`;
+
+/** Only safe observed identifiers may enter the no-history SQL predicate. */
+export function stripeRealmFinancialHistoryTables(rows: readonly Row[]): readonly string[] {
+  const names = rows.map((row) => row.name);
+  if (names.some((name) => typeof name !== "string" || !/^[A-Za-z_][A-Za-z0-9_]*$/u.test(name)))
+    throw new StripeModeRealmError("unsafe_schema", "Stripe financial history inventory is unsafe");
+  return names as readonly string[];
+}
 
 /**
  * Atomically establish the mode only on a fresh source database. Existing
  * Organization/principal rows are permitted; any wallet, usage-money, or
  * Stripe fact/config row makes an absent pin ambiguous and is preserved.
- * Missing tables fail in SQLite/D1 while preparing the statement, never being
- * treated as empty. Old writers are not fenced by this pin and must be drained
- * separately before activation.
+ * Missing required tables fail before a claim; concurrent inventory changes
+ * are checked by the guarded statement and never treated as empty. Old writers
+ * are not fenced by this pin and must be drained separately before activation.
  */
 export async function claimFreshStripeModeRealm(sql: Sql, mode: StripeMode): Promise<void> {
   await assertImmutableStripeModeSchema(sql);
+  const tables = stripeRealmFinancialHistoryTables(
+    await sql.query(STRIPE_REALM_FINANCIAL_HISTORY_QUERY),
+  );
+  const present = new Set(tables);
+  if (STRIPE_REALM_AMBIGUOUS_HISTORY_TABLES.some((table) => !present.has(table)))
+    throw new StripeModeRealmError(
+      "unsafe_schema",
+      "Stripe financial history schema is incomplete",
+    );
+  const empty = tables
+    .map((table) => `NOT EXISTS (SELECT 1 FROM ${table} LIMIT 1)`)
+    .join("\n    AND ");
   await sql.run(
     `INSERT INTO stripe_mode_realm (singleton, mode, pinned_at)
      SELECT 1, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-     WHERE ${FRESH_HISTORY_PREDICATE}
+     WHERE (SELECT json_group_array(name) FROM (${STRIPE_REALM_FINANCIAL_HISTORY_QUERY})) = ?
+       AND ${empty}
      ON CONFLICT(singleton) DO NOTHING`,
-    [mode],
+    [mode, JSON.stringify(tables)],
   );
 
   const rows = await sql.query("SELECT mode FROM stripe_mode_realm WHERE singleton = 1");

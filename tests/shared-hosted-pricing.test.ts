@@ -4,6 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { previewFile } from "../scripts/pricing/preview.ts";
+import { computeMeterAmountMicros } from "../src/billing-config.ts";
 import {
   compileSharedHostedPricing,
   parseSharedHostedPricing,
@@ -36,7 +37,7 @@ describe("shared hosted pricing source", () => {
       products: ["takoserver", "takosumi-hosted"],
       currency: "USD",
       moneyUnit: "USD-micros",
-      revision: "hosted-20261014-final-v1",
+      revision: "hosted-20261015-container-proposed-v1",
       freeIncludedMicros: "1500000",
       plans: [
         {
@@ -68,7 +69,7 @@ describe("shared hosted pricing source", () => {
     expect(compiled.unresolvedStripePricePlanIds).toEqual(["hosted-10", "hosted-50"]);
     expect(compiled.organizationAllowance).toEqual({
       freeIncludedMicros: "1500000",
-      sourceRevision: "hosted-20261014-final-v1",
+      sourceRevision: "hosted-20261015-container-proposed-v1",
       stripePriceId: null,
     });
     expect(
@@ -97,7 +98,22 @@ describe("shared hosted pricing source", () => {
       ["kv.list", "request", "5000000", "1000000", "15000000", "1000000"],
       ["kv.storage", "GB-month", "500000", "1", "1500000", "1"],
       ["egress", "byte", "0", "1", "0", "1"],
+      ["container.cpu", "vCPU-second", "20", "1", "60", "1"],
+      ["container.memory", "GiB-second", "2500", "1000", "7500", "1000"],
+      ["container.egress", "GB", "50000", "1", "150000", "1"],
+      ["container.image-storage", "GB-month", "15000", "1", "45000", "1"],
     ]);
+  });
+
+  test("ceilings exact Container memory consumption once per aggregate", () => {
+    const memory = compileSharedHostedPricing(parsedSource()).usageRates["container.memory"];
+    if (!memory) throw new Error("missing Container memory rate");
+    expect(computeMeterAmountMicros(1n, memory)).toBe(8);
+    expect(computeMeterAmountMicros(2n, memory)).toBe(15);
+    expect(computeMeterAmountMicros(1000n, memory)).toBe(7500);
+    expect(computeMeterAmountMicros(1n, memory, 100n)).toBe(1);
+    expect(computeMeterAmountMicros(100n, memory, 100n)).toBe(8);
+    expect(computeMeterAmountMicros(0n, memory)).toBe(0);
   });
 
   test("allows null Stripe identities in source and qualifies a resolved fixture only as preview", () => {
@@ -181,9 +197,30 @@ describe("shared hosted pricing source", () => {
     ]);
     expect(output.activation).toBe("pending-stripe-price-ids");
     expect(output).not.toHaveProperty("environment");
+    expect(output.revision).toBe("hosted-20261015-container-proposed-v1");
     expect(output.usageRates["wfp.requests"]).toMatchObject({
       numeratorMicros: "900000",
       denominator: "1000000",
+    });
+    expect(output.usageRates["container.cpu"]).toMatchObject({
+      unit: "vCPU-second",
+      numeratorMicros: "60",
+      denominator: "1",
+    });
+    expect(output.usageRates["container.memory"]).toMatchObject({
+      unit: "GiB-second",
+      numeratorMicros: "7500",
+      denominator: "1000",
+    });
+    expect(output.usageRates["container.egress"]).toMatchObject({
+      unit: "GB",
+      numeratorMicros: "150000",
+      denominator: "1",
+    });
+    expect(output.usageRates["container.image-storage"]).toMatchObject({
+      unit: "GB-month",
+      numeratorMicros: "45000",
+      denominator: "1",
     });
   });
 

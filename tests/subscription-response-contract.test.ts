@@ -58,8 +58,14 @@ test("subscription cancellation schemas cannot describe a pending result as veri
     ["200", ["verified"]],
     ["202", ["pending"]],
   ] as const) {
-    expect(path.patch.responses[status]?.content["application/json"].schema).toEqual(
+    const response = path.patch.responses[status]?.content["application/json"].schema as {
+      oneOf: unknown[];
+    };
+    expect(response.oneOf).toContainEqual(
       responseContract("SubscriptionCancellationResponse", "cancellation", states),
     );
+    expect(response.oneOf).toContainEqual({
+      $ref: `#/components/schemas/SubscriptionPlan${status === "200" ? "Verified" : "Pending"}Response`,
+    });
   }
 });

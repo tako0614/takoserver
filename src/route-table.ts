@@ -62,6 +62,11 @@ export const ROUTES: readonly RouteDeclaration[] = [
   { method: "post", pattern: "/v1/organizations", operation: "createOrganization" },
   {
     method: "post",
+    pattern: "/v1/organizations/personal",
+    operation: "createPersonalOrganization",
+  },
+  {
+    method: "post",
     pattern: "/v1/organizations/{organizationId}/api-keys",
     operation: "createApiKey",
   },
@@ -226,6 +231,21 @@ export const ROUTES: readonly RouteDeclaration[] = [
   },
   {
     method: "get",
+    pattern: "/v1/organizations/{organizationId}/wallet/usage-summary/workspaces",
+    operation: "readWalletWorkspaceUsage",
+  },
+  {
+    method: "get",
+    pattern: "/v1/organizations/{organizationId}/wallet/limit-policy",
+    operation: "readWalletLimitPolicy",
+  },
+  {
+    method: "patch",
+    pattern: "/v1/organizations/{organizationId}/wallet/limit-policy",
+    operation: "changeWalletLimitPolicy",
+  },
+  {
+    method: "get",
     pattern: "/v1/organizations/{organizationId}/wallet/holds/{reference}",
     operation: "readWalletHold",
   },
@@ -258,6 +278,11 @@ export const ROUTES: readonly RouteDeclaration[] = [
     method: "post",
     pattern: "/v1/organizations/{organizationId}/wallet/checkout",
     operation: "beginWalletCheckout",
+  },
+  {
+    method: "get",
+    pattern: "/v1/organizations/{organizationId}/wallet/checkout/{reference}",
+    operation: "readWalletCheckoutReceipt",
   },
   {
     method: "post",

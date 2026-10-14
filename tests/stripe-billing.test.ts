@@ -487,6 +487,18 @@ async function fixture(
   const database = new Database(":memory:");
   for (const migration of MIGRATIONS) database.exec(migration.sql);
   const sql = createSqliteSql(database);
+  const originalPricing = hostedPricing.hostedPlanTable.plans.some(
+    (plan) => plan.planId === PLAN_KEY,
+  )
+    ? hostedPricing
+    : pricing();
+  const originalPlan = originalPricing.hostedPlanTable.plans.find(
+    (plan) => plan.planId === PLAN_KEY,
+  );
+  const originalBillingJson = originalPricing.environment.TAKOSERVER_BILLING_CONFIG;
+  if (!originalBillingJson) throw new Error("missing original fixture billing config");
+  const originalBilling = JSON.parse(originalBillingJson);
+  if (originalPlan?.tier !== "subscription") throw new Error("missing original fixture plan");
   await claimFreshStripeModeRealm(sql, mode);
   await sql.run("INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)", [
     ORG,
@@ -506,10 +518,10 @@ async function fixture(
     [
       ORG,
       PLAN_KEY,
-      REVISION,
-      PRICE,
-      MONTHLY_MINOR,
-      INCLUDED_MINOR,
+      originalBilling.revision,
+      originalPlan.stripePriceId,
+      originalPlan.monthlyAmountMinor,
+      originalPlan.includedCreditMinor,
       Number(mode === "live"),
       CUSTOMER,
       SUBSCRIPTION,
@@ -528,10 +540,10 @@ async function fixture(
       CUSTOMER,
       Number(mode === "live"),
       PLAN_KEY,
-      REVISION,
-      PRICE,
-      MONTHLY_MINOR,
-      INCLUDED_MINOR,
+      originalBilling.revision,
+      originalPlan.stripePriceId,
+      originalPlan.monthlyAmountMinor,
+      originalPlan.includedCreditMinor,
       NOW.toISOString(),
     ],
   );
@@ -882,7 +894,7 @@ describe("Hosted Stripe billing service", () => {
         request.method === "POST" && new URL(request.url).pathname === "/v1/checkout/sessions",
     );
     expect(await post?.text()).toContain("price_final50");
-    const revision = "hosted-20261014-final-v1";
+    const revision = "hosted-20261015-container-proposed-v1";
     h.state.subscriptions.set(
       SUBSCRIPTION,
       subscription({

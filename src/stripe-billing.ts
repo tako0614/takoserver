@@ -1,9 +1,14 @@
 import { parseBillingConfig } from "./billing-config.ts";
-import { type HostedPricing, parseHostedPricing } from "./hosted-pricing.ts";
+import {
+  assertHostedBillingFinancialRealm,
+  type HostedBillingFinancialRealm,
+} from "./hosted-billing-realm.ts";
+import { type HostedPricing, parsePersistedHostedPricing } from "./hosted-pricing.ts";
 import { canonicalJson } from "./json.ts";
 import { MoneyError, minorToMicros } from "./money.ts";
+import { OrgTopUpError, type OrgTopUps } from "./org-top-up.ts";
 import type { FundingCredit, PaymentEventContext } from "./payment-events.ts";
-import { type Row, type Sql, SqlError } from "./ports.ts";
+import { type Clock, type Row, type Sql, SqlError } from "./ports.ts";
 import {
   type StripeBillingClient,
   StripeBillingClientError,
@@ -14,6 +19,7 @@ import {
   createStripeBillingStore,
   StripeBillingStoreError,
 } from "./stripe-billing-store.ts";
+import { verifyStripeCustomerBinding } from "./stripe-customer-custody.ts";
 import type {
   StripeEventEnvelope,
   StripeEventHandler,
@@ -21,10 +27,20 @@ import type {
 } from "./stripe-events.ts";
 import { assertStripeModeRealm, type StripeMode } from "./stripe-mode-realm.ts";
 import {
+  type createSubscriptionPlanChanges,
+  type QualifiedSubscriptionPlan,
+  type SubscriptionPeriodTerms,
+  SubscriptionPlanChangeError,
+} from "./stripe-subscription-plan-change.ts";
+import { assertTopUpSessionCommand, frozenTopUpExpiry } from "./stripe-top-up-client.ts";
+import {
+  type Association,
   type CancellationReceipt,
   type CheckoutReceipt,
   createSubscriptionCustody,
   SubscriptionCustodyError,
+  type SubscriptionManagementContext,
+  type SubscriptionManagementPredicate,
 } from "./subscription-custody.ts";
 
 const PURPOSE = "hosted_subscription";
@@ -143,6 +159,59 @@ export interface SubscriptionPayments {
     expectedSubscriptionRef: string;
   }): Promise<CancellationReceipt>;
 }
+export interface StripeBillingSubscriptionExtensionContext {
+  readonly sql: Sql;
+  readonly clock: Clock;
+  readonly client: StripeBillingClient;
+  readonly custody: ReturnType<typeof createSubscriptionCustody>;
+  readonly realm: HostedBillingFinancialRealm;
+  ready(): Promise<void>;
+  boundCustomer(organizationId: string, customerId: string): Promise<void>;
+  qualifyPlan(planKey: string): Promise<QualifiedSubscriptionPlan>;
+  planForRevision(planKey: string, pricingRevision: string): Promise<QualifiedSubscriptionPlan>;
+}
+export interface StripeBillingSubscriptionExtensions {
+  readonly plans: ReturnType<typeof createSubscriptionPlanChanges>;
+  readonly verifyPeriodTerms: ReturnType<typeof createSubscriptionPlanChanges>["verifyPeriodTerms"];
+  resolveCurrentTerms(input: {
+    readonly association: Association;
+    readonly subscription: StripeBillingObject;
+    readonly periodStart: string;
+    readonly periodEnd: string;
+  }): Promise<SubscriptionPeriodTerms>;
+  managementGuard(input: SubscriptionManagementContext): SubscriptionManagementPredicate;
+  cancel(input: Parameters<SubscriptionPayments["change"]>[0]): Promise<CancellationReceipt>;
+}
+const extensionOrigins = new WeakMap<
+  StripeBillingSubscriptionExtensionContext,
+  {
+    readonly sql: Sql;
+    readonly clock: Clock;
+    readonly client: StripeBillingClient;
+    readonly custody: ReturnType<typeof createSubscriptionCustody>;
+    readonly realm: HostedBillingFinancialRealm;
+  }
+>();
+/** Only the existing writer constructs custody and its SQL/client-bound extension context. */
+export function assertStripeBillingSubscriptionExtensionContext(
+  context: StripeBillingSubscriptionExtensionContext,
+): void {
+  const origin = extensionOrigins.get(context);
+  if (
+    !origin ||
+    origin.sql !== context.sql ||
+    origin.clock !== context.clock ||
+    origin.client !== context.client ||
+    origin.custody !== context.custody ||
+    origin.realm !== context.realm
+  )
+    throw new StripeBillingError("subscription_extension_unqualified");
+  assertHostedBillingFinancialRealm(context.realm, {
+    sql: context.sql,
+    client: context.client,
+    billingAuthority: context.realm.billingAuthority,
+  });
+}
 export interface BillingReconcileReport {
   readonly examined: number;
   readonly applied: number;
@@ -169,6 +238,12 @@ export function createStripeBilling(options: {
   readonly pricing: HostedPricing;
   readonly mode?: StripeMode;
   readonly consoleOrigin?: string | undefined;
+  readonly realm?: HostedBillingFinancialRealm;
+  readonly ensureCustomer?: (organizationId: string) => Promise<string>;
+  readonly topUpCommandForSession?: OrgTopUps["commandForSession"];
+  readonly subscriptionExtensions?: (
+    context: StripeBillingSubscriptionExtensionContext,
+  ) => StripeBillingSubscriptionExtensions;
 }) {
   const { client, context, pricing } = options;
   const livemode = (options.mode ?? "test") === "live";
@@ -178,6 +253,22 @@ export function createStripeBilling(options: {
   if (!parsedBilling) throw new StripeBillingError("billing_configuration_invalid");
   const billing = parsedBilling;
   const now = () => clock().toISOString();
+  if ((options.subscriptionExtensions || options.topUpCommandForSession) && !options.realm)
+    throw new StripeBillingError("financial_realm_unqualified");
+  if (options.realm) {
+    if (livemode) throw new StripeBillingError("financial_realm_unqualified");
+    assertHostedBillingFinancialRealm(options.realm, {
+      sql,
+      client,
+      billingAuthority: options.realm.billingAuthority,
+      prices: pricing.hostedPlanTable.plans
+        .filter((plan): plan is PaidPlan => plan.tier === "subscription")
+        .map((plan) => ({
+          priceId: plan.stripePriceId,
+          monthlyAmountMinor: plan.monthlyAmountMinor,
+        })),
+    });
+  }
   let initialization: Promise<void> | undefined;
   const ready = async () => {
     if (initialization === undefined) initialization = initialize();
@@ -194,7 +285,7 @@ export function createStripeBilling(options: {
     await assertStripeModeRealm(sql, options.mode ?? "test");
     await assertStripeBillingSchema(sql);
     const json = canonicalJson(pricing);
-    const snapshots = await sql.query("SELECT config_json FROM stripe_billing_pricing");
+    const snapshots = await sql.query("SELECT revision, config_json FROM stripe_billing_pricing");
     const statements: { sql: string; params: readonly (string | number | null)[] }[] = [];
     const register = (
       snapshot: HostedPricing,
@@ -245,7 +336,10 @@ export function createStripeBilling(options: {
     };
     for (const row of snapshots) {
       const snapshot = JSON.parse(String(row.config_json)) as HostedPricing;
-      const parsed = parseHostedPricing(snapshot.environment.TAKOSERVER_HOSTED_PRICING);
+      const parsed = parsePersistedHostedPricing(
+        snapshot.environment.TAKOSERVER_HOSTED_PRICING,
+        String(row.revision),
+      );
       if (!parsed || canonicalJson(parsed) !== canonicalJson(snapshot))
         throw new StripeBillingError("pricing_revision_conflict");
       const historicalRevision = String(
@@ -271,7 +365,10 @@ export function createStripeBilling(options: {
     );
     if (!rows[0]) refuse("pricing_revision_unavailable");
     const snapshot = JSON.parse(String(rows[0].config_json)) as HostedPricing;
-    const parsed = parseHostedPricing(snapshot.environment.TAKOSERVER_HOSTED_PRICING);
+    const parsed = parsePersistedHostedPricing(
+      snapshot.environment.TAKOSERVER_HOSTED_PRICING,
+      revision,
+    );
     if (!parsed || canonicalJson(parsed) !== canonicalJson(snapshot))
       refuse("pricing_revision_conflict");
     return parsed;
@@ -287,6 +384,16 @@ export function createStripeBilling(options: {
     return org;
   }
   async function boundCustomer(org: string, customer: string): Promise<void> {
+    if (options.realm) {
+      try {
+        await verifyStripeCustomerBinding({ sql, client, realm: options.realm }, org, customer);
+      } catch (error) {
+        if (error instanceof OrgTopUpError)
+          throw new SubscriptionPlanChangeError("customer_binding_unresolved", 503);
+        throw error;
+      }
+      return;
+    }
     const rows = await sql.query(
       "SELECT customer_id FROM stripe_billing_customers WHERE org_id = ?",
       [org],
@@ -343,6 +450,7 @@ export function createStripeBilling(options: {
   const paidPlans = pricing.hostedPlanTable.plans.filter(
     (plan): plan is PaidPlan => plan.tier === "subscription",
   );
+  let extensions: StripeBillingSubscriptionExtensions | undefined;
   const custody = createSubscriptionCustody({
     sql,
     client,
@@ -370,7 +478,63 @@ export function createStripeBilling(options: {
         "invalid_object",
       ].includes(error.reason),
     mode: options.mode ?? "test",
+    requireBoundCustomer: options.realm !== undefined,
+    ...(options.ensureCustomer ? { ensureCustomer: options.ensureCustomer } : {}),
+    ...(options.subscriptionExtensions
+      ? {
+          managementGuard: (input: SubscriptionManagementContext) => {
+            if (!extensions) throw new StripeBillingError("subscription_extension_unqualified");
+            return extensions.managementGuard(input);
+          },
+          resolveCurrentTerms: async (input: {
+            readonly association: Association;
+            readonly subscription: StripeBillingObject;
+            readonly periodStart: string;
+            readonly periodEnd: string;
+          }) => {
+            if (!extensions) throw new StripeBillingError("subscription_extension_unqualified");
+            return await extensions.resolveCurrentTerms(input);
+          },
+        }
+      : {}),
   });
+  if (options.subscriptionExtensions && options.realm) {
+    async function planForRevision(
+      planKey: string,
+      revision: string,
+    ): Promise<QualifiedSubscriptionPlan> {
+      await ready();
+      const snapshot = revision === billing.revision ? pricing : await tariff(revision);
+      const plan = paidPlan(snapshot, planKey);
+      if (!plan) throw new StripeBillingError("pricing_revision_unavailable");
+      await price(plan.stripePriceId, snapshot);
+      return {
+        planKey: plan.planId,
+        pricingRevision: revision,
+        priceId: plan.stripePriceId,
+        priceAmountMinor: plan.monthlyAmountMinor,
+        includedMinor: plan.includedCreditMinor,
+      };
+    }
+    const extensionContext: StripeBillingSubscriptionExtensionContext = Object.freeze({
+      sql,
+      clock,
+      client,
+      custody,
+      realm: options.realm,
+      ready,
+      boundCustomer,
+      planForRevision,
+      async qualifyPlan(planKey: string) {
+        if (billing.effectiveAt > now()) throw new StripeBillingError("pricing_not_effective", 409);
+        const plan = await planForRevision(planKey, billing.revision);
+        await price(plan.priceId, pricing, true);
+        return plan;
+      },
+    });
+    extensionOrigins.set(extensionContext, { sql, clock, client, custody, realm: options.realm });
+    extensions = options.subscriptionExtensions(extensionContext);
+  }
   async function historicalAssociation(
     subscriptionId: string,
     org: string,
@@ -378,16 +542,40 @@ export function createStripeBilling(options: {
     planKey: string,
     revision: string,
     priceId: string,
+    priceAmountMinor: number,
+    includedMinor: number,
+    periodStart: string,
+    periodEnd: string,
   ): Promise<void> {
     const bound = await custody.association(subscriptionId);
     if (
       !bound ||
       bound.organizationId !== org ||
       bound.customerId !== customer ||
+      bound.livemode !== livemode
+    )
+      refuse("unbound_subscription");
+    if (extensions) {
+      await extensions.verifyPeriodTerms({
+        terms: {
+          organizationId: org,
+          subscriptionId,
+          customerId: customer,
+          planKey,
+          pricingRevision: revision,
+          priceId,
+          priceAmountMinor,
+          includedMinor,
+        },
+        periodStart,
+        periodEnd,
+      });
+    } else if (
       bound.planKey !== planKey ||
       bound.pricingRevision !== revision ||
       bound.priceId !== priceId ||
-      bound.livemode !== livemode
+      bound.priceAmountMinor !== priceAmountMinor ||
+      bound.includedMinor !== includedMinor
     )
       refuse("unbound_subscription");
   }
@@ -407,14 +595,6 @@ export function createStripeBilling(options: {
     const item = record(items.data[0]);
     if (item.quantity !== 1 || identifier(item.price, "price") !== plan.stripePriceId)
       refuse("wrong_price");
-    await historicalAssociation(
-      identifier(object.id, "sub"),
-      org,
-      customer,
-      plan.planId,
-      String(meta.pricingRevision),
-      plan.stripePriceId,
-    );
     await price(plan.stripePriceId, snapshot);
     if (
       typeof object.status !== "string" ||
@@ -425,6 +605,18 @@ export function createStripeBilling(options: {
     const periodStart = timestamp(object.current_period_start);
     const periodEnd = timestamp(object.current_period_end);
     if (periodEnd <= periodStart) refuse("invalid_period");
+    await historicalAssociation(
+      identifier(object.id, "sub"),
+      org,
+      customer,
+      plan.planId,
+      String(meta.pricingRevision),
+      plan.stripePriceId,
+      plan.monthlyAmountMinor,
+      plan.includedCreditMinor,
+      periodStart,
+      periodEnd,
+    );
     return { org, customer, snapshot, plan, periodStart, periodEnd };
   }
   async function updateSubscription(id: string): Promise<StripeEventHandling> {
@@ -562,14 +754,6 @@ export function createStripeBilling(options: {
     const customer = identifier(invoice.customer, "cus");
     if (identifier(sub.customer, "cus") !== customer) refuse("wrong_customer");
     await boundCustomer(org, customer);
-    await historicalAssociation(
-      subscriptionId,
-      org,
-      customer,
-      plan.planId,
-      String(pinned.pricingRevision),
-      plan.stripePriceId,
-    );
     // The invoice's historical association, not today's one-row projection,
     // owns its Organization and terms. A delayed old invoice cannot inherit a
     // newer current subscription or its current Price.
@@ -590,6 +774,18 @@ export function createStripeBilling(options: {
     const periodStart = timestamp(period.start),
       periodEnd = timestamp(period.end);
     if (periodEnd <= periodStart) refuse("invalid_period");
+    await historicalAssociation(
+      subscriptionId,
+      org,
+      customer,
+      plan.planId,
+      String(pinned.pricingRevision),
+      plan.stripePriceId,
+      plan.monthlyAmountMinor,
+      plan.includedCreditMinor,
+      periodStart,
+      periodEnd,
+    );
     const consideration = minor(invoice.amount_paid, true);
     if (
       consideration !== plan.monthlyAmountMinor ||
@@ -665,6 +861,30 @@ export function createStripeBilling(options: {
     if (session.payment_status !== "paid" || session.status !== "complete") refuse("not_paid");
     const org = await exists(meta.organizationId);
     const amount = minor(session.amount_total, true);
+    const prior = await store.grantForSource("checkout", id);
+    const command = options.topUpCommandForSession
+      ? await options.topUpCommandForSession(id)
+      : null;
+    const commandClaim = [
+      "topUpReference",
+      "topUpCommandDigest",
+      "stripeAccountId",
+      "financialRealm",
+      "purchaseCreditExpiry",
+    ].some((key) => key in meta);
+    if ((options.realm && !prior) || command || commandClaim) {
+      if (!command || !options.realm) refuse("top_up_custody_required");
+      await assertTopUpSessionCommand({ sql, client, realm: options.realm }, session, command);
+      if (
+        command.organizationId !== org ||
+        command.amountMinor !== amount ||
+        (prior &&
+          (prior.pricingRevision !== command.pricingRevision ||
+            prior.amountMicros !== command.amountMicros ||
+            prior.customerId !== command.customerId))
+      )
+        refuse("top_up_command_conflict");
+    }
     const intent = record(session.payment_intent);
     if (intent.status !== "succeeded") refuse("unverifiable_payment");
     const chargeId = identifier(intent.latest_charge, "ch");
@@ -676,7 +896,6 @@ export function createStripeBilling(options: {
     const customer = session.customer == null ? null : identifier(session.customer, "cus");
     if ((charge.customer == null ? null : identifier(charge.customer, "cus")) !== customer)
       refuse("wrong_customer");
-    const prior = await store.grantForSource("checkout", id);
     const legacy = (
       await sql.query(
         "SELECT kind, expires_at FROM wallet_credit_lots WHERE org_id = ? AND ref = ?",
@@ -689,7 +908,7 @@ export function createStripeBilling(options: {
     const snapshot = [billing, ...(billing.history ?? [])]
       .filter((candidate) => candidate.effectiveAt <= createdAt)
       .sort((left, right) => right.effectiveAt.localeCompare(left.effectiveAt))[0];
-    if (!prior && !legacy && !snapshot) refuse("pricing_history_missing");
+    if (!command && !prior && !legacy && !snapshot) refuse("pricing_history_missing");
     const expiry = snapshot?.purchaseCreditExpiry;
     const expiresAt = prior
       ? prior.expiresAt
@@ -697,14 +916,16 @@ export function createStripeBilling(options: {
         ? legacy.expires_at == null
           ? null
           : String(legacy.expires_at)
-        : expiry?.kind === "fixed-duration"
-          ? new Date(Date.parse(now()) + expiry.seconds * 1000).toISOString()
-          : null;
+        : command
+          ? frozenTopUpExpiry(command, now())
+          : expiry?.kind === "fixed-duration"
+            ? new Date(Date.parse(now()) + expiry.seconds * 1000).toISOString()
+            : null;
     return {
       organizationId: org,
       fundingRef: `stripe:${id}`,
       kind: "purchased",
-      amountMicros: cashMicros(amount),
+      amountMicros: command ? command.amountMicros : cashMicros(amount),
       expiresAt,
       sourceType: "checkout",
       sourceId: id,
@@ -712,7 +933,13 @@ export function createStripeBilling(options: {
       customerId: customer,
       subscriptionId: null,
       planKey: null,
-      pricingRevision: prior ? prior.pricingRevision : legacy ? null : (snapshot?.revision ?? null),
+      pricingRevision: prior
+        ? prior.pricingRevision
+        : command
+          ? command.pricingRevision
+          : legacy
+            ? null
+            : (snapshot?.revision ?? null),
       stripePriceId: null,
       periodStart: null,
       periodEnd: null,
@@ -723,6 +950,8 @@ export function createStripeBilling(options: {
   async function settleGrant(grant: BillingGrant): Promise<void> {
     const charge = await client.get("charges", grant.chargeId);
     if (!charge) refuse("unknown_charge");
+    if (options.realm && grant.customerId)
+      await boundCustomer(grant.organizationId, grant.customerId);
     if (minor(charge.amount_refunded) > 0) await refundCharge(grant.chargeId, grant);
     else await store.grant(grant);
   }
@@ -818,6 +1047,8 @@ export function createStripeBilling(options: {
     const cumulative = successful.reduce((sum, item) => minor(sum + minor(item.amount, true)), 0);
     if (cumulative !== minor(charge.amount_refunded) || cumulative > minor(charge.amount, true))
       refuse("refund_total_unresolved");
+    if (options.realm && grant.customerId)
+      await boundCustomer(grant.organizationId, grant.customerId);
     await store.grant(grant);
     if (!successful.length) {
       if (pending) return { outcome: "deferred", detail: "refund_pending" };
@@ -846,6 +1077,8 @@ export function createStripeBilling(options: {
       const refund = successful[i];
       if (!refund) continue;
       amount = minor(amount + minor(refund.amount, true));
+      if (options.realm && grant.customerId)
+        await boundCustomer(grant.organizationId, grant.customerId);
       await store.refund({
         refundId: refund.id,
         grant,
@@ -887,9 +1120,43 @@ export function createStripeBilling(options: {
         if (identifier(invoice.customer, "cus") !== facts.customer) refuse("wrong_customer");
         const pinned = metadata(record(invoice.subscription_details).metadata);
         const native = metadata(subscription.metadata);
-        if (
-          pinned.takoserverPurpose !== PURPOSE ||
-          pinned.organizationId !== facts.org ||
+        if (pinned.takoserverPurpose !== PURPOSE || pinned.organizationId !== facts.org)
+          refuse("wrong_invoice_subscription");
+        if (extensions) {
+          usd(invoice);
+          const snapshot = await tariff(pinned.pricingRevision),
+            plan = paidPlan(snapshot, pinned.planKey);
+          const lines = record(invoice.lines);
+          if (
+            !plan ||
+            lines.has_more !== false ||
+            !Array.isArray(lines.data) ||
+            lines.data.length !== 1
+          )
+            refuse("unsupported_invoice_lines");
+          const line = record(lines.data[0]),
+            period = record(line.period);
+          if (
+            line.type !== "subscription" ||
+            line.proration !== false ||
+            line.quantity !== 1 ||
+            identifier(line.subscription, "sub") !== subscriptionId ||
+            identifier(line.price, "price") !== plan.stripePriceId
+          )
+            refuse("unsupported_invoice_line");
+          await historicalAssociation(
+            subscriptionId,
+            facts.org,
+            facts.customer,
+            plan.planId,
+            String(pinned.pricingRevision),
+            plan.stripePriceId,
+            plan.monthlyAmountMinor,
+            plan.includedCreditMinor,
+            timestamp(period.start),
+            timestamp(period.end),
+          );
+        } else if (
           pinned.planKey !== native.planKey ||
           pinned.pricingRevision !== native.pricingRevision
         )
@@ -938,6 +1205,8 @@ export function createStripeBilling(options: {
       }
       return { outcome: "ignored", detail: "unsupported" };
     } catch (error) {
+      if (error instanceof SubscriptionPlanChangeError)
+        return { outcome: "deferred", detail: "subscription_terms_unresolved" };
       if (error instanceof Quarantine) {
         const ignored = new Set([
           "not_wallet_funding",
@@ -1031,6 +1300,7 @@ export function createStripeBilling(options: {
       if (input.cancelAtPeriodEnd !== true || !input.expectedSubscriptionRef)
         throw new StripeBillingError("subscription_management_conflict", 409);
       try {
+        if (extensions) return await extensions.cancel(input);
         return await custody.cancel(
           input.organizationId,
           input.reference,
@@ -1087,6 +1357,18 @@ export function createStripeBilling(options: {
     } catch {
       failedStreams++;
       truncated = true;
+    }
+    if (extensions) {
+      try {
+        const recovered = await extensions.plans.reconcilePending();
+        examined += recovered.examined;
+        applied += recovered.applied;
+        custodyUnresolved += recovered.unresolved;
+        truncated ||= recovered.truncated;
+      } catch {
+        failedStreams++;
+        truncated = true;
+      }
     }
     async function attempt(event: StripeEventEnvelope): Promise<StripeEventHandling> {
       let result: StripeEventHandling;
@@ -1303,7 +1585,13 @@ export function createStripeBilling(options: {
       );
     return report;
   }
-  return { subscriptions, handlers, creditFunding, reconcile };
+  return {
+    subscriptions,
+    subscriptionPlans: extensions?.plans,
+    handlers,
+    creditFunding,
+    reconcile,
+  };
 }
 
 export async function assertStripeBillingSchema(sql: Sql): Promise<void> {

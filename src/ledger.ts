@@ -122,6 +122,23 @@ export function stripeRefundSchemaReady(sql: Sql): Promise<boolean> {
   return ready;
 }
 
+/**
+ * Explicit Hosted admission for a new allocation. The caller freezes consent
+ * and supplies a policy-version or durable-receipt witness. Both statements
+ * run in the allocation batch; existing held allocations need no new consent.
+ * Omission preserves independent/self-host wallet allocation behavior.
+ */
+export interface LedgerAllocationAdmission {
+  readonly allowPurchasedCredit: boolean;
+  readonly guard: SqlStatement;
+  readonly cleanup: SqlStatement;
+}
+
+/** Injected only by a qualified Hosted composition, after exact replay checks. */
+export type LedgerAllocationAdmissionResolver = (
+  organizationId: string,
+) => Promise<LedgerAllocationAdmission>;
+
 export interface Ledger {
   wallet(organizationId: string): Promise<Wallet>;
   /** Credits settled funds. Repeating a funding reference credits once. */
@@ -155,6 +172,7 @@ export interface Ledger {
     readonly organizationId: string;
     readonly reference: string;
     readonly amountMicros: number;
+    readonly allocationAdmission?: LedgerAllocationAdmission;
   }): Promise<boolean>;
   capture(input: {
     readonly organizationId: string;
@@ -175,6 +193,7 @@ export interface Ledger {
     readonly organizationId: string;
     readonly reference: string;
     readonly amountMicros: number;
+    readonly allocationAdmission?: LedgerAllocationAdmission;
   }): Promise<boolean>;
 }
 
@@ -259,7 +278,10 @@ export async function prepareLedgerHoldRelease(
 export function createLedger(
   sql: Sql,
   clock: Clock,
-  options: { readonly hostedPaidFreeExclusion?: boolean } = {},
+  options: {
+    readonly hostedPaidFreeExclusion?: boolean;
+    readonly allocationAdmissionResolver?: LedgerAllocationAdmissionResolver;
+  } = {},
 ): Ledger {
   const hostedPaidFreeExclusion = options.hostedPaidFreeExclusion === true;
   return {
@@ -656,7 +678,7 @@ export function createLedger(
       return new Set(rows.map((row) => String(row.ref)));
     },
 
-    async hold({ organizationId, reference, amountMicros }): Promise<boolean> {
+    async hold({ organizationId, reference, amountMicros, allocationAdmission }): Promise<boolean> {
       positiveAmount(amountMicros);
       const existing = await sql.query(
         `SELECT held_delta_micros FROM ledger
@@ -670,6 +692,8 @@ export function createLedger(
         return true;
       }
       const now = clock().toISOString();
+      const admission =
+        allocationAdmission ?? (await options.allocationAdmissionResolver?.(organizationId));
       try {
         await allocateAndRecord(
           organizationId,
@@ -679,6 +703,7 @@ export function createLedger(
           0,
           amountMicros,
           now,
+          admission,
         );
         return true;
       } catch (error) {
@@ -690,7 +715,7 @@ export function createLedger(
         );
         if (replay.length === 1 && sqlMicros(replay[0]?.held_delta_micros) === amountMicros)
           return true;
-        const available = await availableAt(organizationId, now);
+        const available = await availableAt(organizationId, now, admission);
         if (available < amountMicros) return false;
         throw error;
       }
@@ -734,7 +759,12 @@ export function createLedger(
       await settleHold(organizationId, "release", reference, amountMicros);
     },
 
-    async debitUsage({ organizationId, reference, amountMicros }): Promise<boolean> {
+    async debitUsage({
+      organizationId,
+      reference,
+      amountMicros,
+      allocationAdmission,
+    }): Promise<boolean> {
       positiveAmount(amountMicros);
       const existing = await sql.query(
         `SELECT settled_delta_micros, held_delta_micros FROM ledger
@@ -747,6 +777,8 @@ export function createLedger(
           sqlMicros(existing[0]?.held_delta_micros) === 0
         );
       }
+      const admission =
+        allocationAdmission ?? (await options.allocationAdmissionResolver?.(organizationId));
       try {
         await allocateAndRecord(
           organizationId,
@@ -756,6 +788,7 @@ export function createLedger(
           -amountMicros,
           0,
           clock().toISOString(),
+          admission,
         );
         return true;
       } catch (error) {
@@ -773,6 +806,7 @@ export function createLedger(
     settledDeltaMicros: number,
     heldDeltaMicros: number,
     now: string,
+    allocationAdmission?: LedgerAllocationAdmission,
   ): Promise<void> {
     await sql.batch(
       await prepareLedgerAllocation(sql, {
@@ -784,6 +818,7 @@ export function createLedger(
         heldDeltaMicros,
         now,
         hostedPaidFreeExclusion,
+        ...(allocationAdmission ? { allocationAdmission } : {}),
       }),
     );
   }
@@ -799,7 +834,11 @@ export function createLedger(
     );
   }
 
-  async function availableAt(organizationId: string, now: string): Promise<number> {
+  async function availableAt(
+    organizationId: string,
+    now: string,
+    allocationAdmission?: LedgerAllocationAdmission,
+  ): Promise<number> {
     const refundsReady = await stripeRefundSchemaReady(sql);
     const rows = await sql.query(
       `SELECT COALESCE(SUM(l.amount_micros - COALESCE((
@@ -813,6 +852,7 @@ export function createLedger(
 }), 0) AS available
        FROM wallet_credit_lots l
        WHERE l.org_id = ? AND (l.expires_at IS NULL OR l.expires_at > ?)
+       ${allocationEligibilitySql(allocationAdmission, refundsReady)}
        ${hostedPaidFreeExclusion ? `AND NOT (l.consumption_class = 'free' AND ${hostedPaidFreeBlockedSql})` : ""}
        ${
          refundsReady
@@ -828,6 +868,53 @@ export function createLedger(
     );
     return sqlMicros(rows[0]?.available ?? 0);
   }
+}
+
+/**
+ * Shared Hosted eligibility predicate; its enclosing lot query uses alias l.
+ * Direct-origin credit needs an exact preserved disposition or verified legacy
+ * Checkout proof. A reference prefix or caller-chosen class is insufficient.
+ */
+export function hostedCreditLotProvenanceSql(stripeSchemaReady: boolean): string {
+  return `(l.kind IN ('plan-included', 'purchased') OR (
+    l.kind = 'direct'
+    AND EXISTS (SELECT 1 FROM ledger e
+      WHERE e.org_id = l.org_id AND e.ref = l.ref AND e.type = 'funding'
+        AND e.settled_delta_micros = l.amount_micros AND e.held_delta_micros = 0)
+    AND (
+      EXISTS (SELECT 1 FROM wallet_credit_lot_classification_proofs p
+        JOIN money_cutover_preimage original
+          ON original.source_table = 'wallet_credit_lots'
+            AND original.row_key = json_array(p.org_id, p.ref)
+            AND original.source_column = 'amount_minor'
+            AND original.amount_minor = p.original_amount_minor
+        WHERE p.org_id = l.org_id AND p.ref = l.ref AND p.original_kind = l.kind
+          AND p.consumption_class = l.consumption_class
+          AND typeof(p.original_amount_minor) = 'integer'
+          AND p.original_amount_minor BETWEEN 1 AND 900719925474
+          AND p.original_amount_minor * 10000 = l.amount_micros
+          AND p.original_expires_at IS l.expires_at)
+      ${
+        stripeSchemaReady
+          ? `OR EXISTS (SELECT 1 FROM stripe_billing_grants g
+          WHERE g.org_id = l.org_id AND g.funding_ref = l.ref
+            AND g.legacy_lot = 1 AND g.kind = 'purchased'
+            AND g.source_type = 'checkout' AND g.funding_ref = 'stripe:' || g.source_id
+            AND g.consumption_class = l.consumption_class
+            AND g.amount_micros = l.amount_micros AND g.expires_at IS l.expires_at)`
+          : ""
+      }
+    )
+  ))`;
+}
+
+function allocationEligibilitySql(
+  admission: LedgerAllocationAdmission | undefined,
+  stripeSchemaReady: boolean,
+): string {
+  if (!admission) return "";
+  return `AND l.consumption_class IN ('free', 'subscription'${admission.allowPurchasedCredit === true ? ", 'purchased'" : ""})
+    AND ${hostedCreditLotProvenanceSql(stripeSchemaReady)}`;
 }
 
 async function planHoldSettlement(
@@ -1025,6 +1112,7 @@ export async function prepareLedgerAllocation(
     readonly heldDeltaMicros: number;
     readonly now: string;
     readonly hostedPaidFreeExclusion?: boolean;
+    readonly allocationAdmission?: LedgerAllocationAdmission;
   },
 ): Promise<readonly SqlStatement[]> {
   const refundsReady = await stripeRefundSchemaReady(sql);
@@ -1037,6 +1125,7 @@ export async function prepareLedgerAllocation(
     heldDeltaMicros,
     now,
     hostedPaidFreeExclusion = false,
+    allocationAdmission,
   } = input;
   positiveAmount(amountMicros);
   if (
@@ -1071,6 +1160,7 @@ export async function prepareLedgerAllocation(
        LEFT JOIN wallet_credit_allocations a
          ON a.org_id = l.org_id AND a.lot_ref = l.ref
        WHERE l.org_id = ? AND (l.expires_at IS NULL OR l.expires_at > ?)
+         ${allocationEligibilitySql(allocationAdmission, refundsReady)}
          ${hostedPaidFreeExclusion ? `AND NOT (l.consumption_class = 'free' AND ${hostedPaidFreeBlockedSql})` : ""}
          ${
            refundsReady
@@ -1114,7 +1204,8 @@ export async function prepareLedgerAllocation(
                    FROM stripe_billing_refunds WHERE org_id = ? AND funding_ref = ?), 0)`
                   : "0"
               }
-              FROM wallet_credit_lots WHERE org_id = ? AND ref = ?
+              FROM wallet_credit_lots l WHERE l.org_id = ? AND l.ref = ?
+                ${allocationEligibilitySql(allocationAdmission, refundsReady)}
                 ${hostedPaidFreeExclusion ? `AND NOT (consumption_class = 'free' AND ${hostedPaidFreeBlockedSql})` : ""}
                 ${
                   refundsReady
@@ -1141,6 +1232,7 @@ export async function prepareLedgerAllocation(
     ],
   }));
   return [
+    ...(allocationAdmission ? [allocationAdmission.guard] : []),
     ...(refundsReady
       ? [
           {
@@ -1180,5 +1272,6 @@ export async function prepareLedgerAllocation(
       sql: "DELETE FROM wallet_allocation_guards WHERE id IN (?, ?)",
       params: [guardId, debtGuardId],
     },
+    ...(allocationAdmission ? [allocationAdmission.cleanup] : []),
   ];
 }

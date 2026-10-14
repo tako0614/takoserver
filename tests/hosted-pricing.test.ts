@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { parseBillingConfig } from "../src/billing-config.ts";
 import {
@@ -6,12 +7,11 @@ import {
   compilePricingAuthoring,
   HostedPricingError,
   parseHostedPricing,
+  parsePersistedHostedPricing,
 } from "../src/hosted-pricing.ts";
 
-function sharedAuthoring() {
-  const sharedPricing = JSON.parse(
-    readFileSync(new URL("../config/shared-hosted-pricing.json", import.meta.url), "utf8"),
-  );
+function sharedAuthoring(sourcePath = "../config/shared-hosted-pricing.json") {
+  const sharedPricing = JSON.parse(readFileSync(new URL(sourcePath, import.meta.url), "utf8"));
   sharedPricing.plans[0].stripePriceId = "price_final10";
   sharedPricing.plans[1].stripePriceId = "price_final50";
   const meters = Object.fromEntries(
@@ -84,6 +84,18 @@ function authoring() {
 }
 
 describe("hosted pricing runtime policy", () => {
+  test("pins the retained reviewed v2 source bytes to their original publication", () => {
+    const bytes = readFileSync(
+      new URL(
+        "../config/shared-hosted-pricing-revisions/hosted-20261014-final-v1.json",
+        import.meta.url,
+      ),
+    );
+    expect(createHash("sha256").update(bytes).digest("hex")).toBe(
+      "ada89b3dd815a9e2d24d166f99a64f47b74a249ead5ae884fb019952d8d1b31d",
+    );
+  });
+
   test("rejects self-consistent v2 cash, allowance, identity, markup, meter, and warning drift", () => {
     const changedCash = sharedAuthoring();
     changedCash.sharedPricing.plans[0].monthlyPriceMicros = "1000000";
@@ -163,6 +175,206 @@ describe("hosted pricing runtime policy", () => {
     requestMeter.rate.numeratorMicros = "1";
     expect(() => compilePricingAuthoring(authored)).toThrow(/meters disagree/u);
   });
+
+  test("requires the reviewed Container units and exact rational rates at runtime", () => {
+    const authored = sharedAuthoring();
+    const pricing = compilePricingAuthoring(authored);
+    const billing = parseBillingConfig(pricing.environment.TAKOSERVER_BILLING_CONFIG);
+    expect(billing?.meters["container.cpu"]).toEqual({
+      unit: "vCPU-second",
+      rate: { numeratorMicros: "60", denominator: "1" },
+    });
+    expect(billing?.meters["container.memory"]).toEqual({
+      unit: "GiB-second",
+      rate: { numeratorMicros: "7500", denominator: "1000" },
+    });
+    expect(billing?.meters["container.egress"]).toEqual({
+      unit: "GB",
+      rate: { numeratorMicros: "150000", denominator: "1" },
+    });
+    expect(billing?.meters["container.image-storage"]).toEqual({
+      unit: "GB-month",
+      rate: { numeratorMicros: "45000", denominator: "1" },
+    });
+
+    for (const key of [
+      "container.cpu",
+      "container.memory",
+      "container.egress",
+      "container.image-storage",
+    ]) {
+      const missing = sharedAuthoring();
+      delete missing.billingConfig.meters[key];
+      expect(() => compilePricingAuthoring(missing)).toThrow(/meters disagree/u);
+    }
+
+    for (const [field, value] of [
+      ["unit", "GB-second"],
+      ["numeratorMicros", "8"],
+      ["denominator", "1"],
+    ] as const) {
+      const changed = sharedAuthoring();
+      const memory = changed.billingConfig.meters["container.memory"];
+      if (!memory) throw new Error("missing Container memory fixture");
+      if (field === "unit") memory.unit = value;
+      else memory.rate[field] = value;
+      expect(() => compilePricingAuthoring(changed)).toThrow(/meters disagree/u);
+    }
+  });
+
+  test("rejects self-consistent Container source drift rather than authorizing another tariff", () => {
+    for (const field of ["cost", "quantity", "unit"] as const) {
+      const changed = sharedAuthoring();
+      const sourceMemory = changed.sharedPricing.meters["container.memory"];
+      const runtimeMemory = changed.billingConfig.meters["container.memory"];
+      if (!sourceMemory || !runtimeMemory) throw new Error("missing Container memory fixture");
+      if (field === "cost") {
+        sourceMemory.cloudflareCostMicros = "2600";
+        runtimeMemory.rate.numeratorMicros = "7800";
+      } else if (field === "quantity") {
+        sourceMemory.quantity = "100";
+        runtimeMemory.rate.denominator = "100";
+      } else {
+        sourceMemory.unit = "GB-second";
+        runtimeMemory.unit = "GB-second";
+      }
+      expect(() => compilePricingAuthoring(changed)).toThrow(/reviewed source/u);
+      expect(() => parseHostedPricing(JSON.stringify(changed))).toThrow(HostedPricingError);
+    }
+  });
+
+  test("retains original meter tuples in a prior tariff when the Container revision is authored", () => {
+    const authored = sharedAuthoring();
+    const historical = {
+      ...structuredClone(authored.billingConfig),
+      revision: "hosted-20261014-final-v1",
+      meters: Object.fromEntries(
+        Object.entries(authored.billingConfig.meters).filter(
+          ([key]) => !key.startsWith("container."),
+        ),
+      ),
+    };
+    const pricing = compilePricingAuthoring({
+      ...authored,
+      billingConfig: {
+        ...authored.billingConfig,
+        effectiveAt: "2026-10-15T00:00:00.000Z",
+        history: [historical],
+      },
+    });
+    const billing = parseBillingConfig(pricing.environment.TAKOSERVER_BILLING_CONFIG);
+    expect(billing?.revision).toBe("hosted-20261015-container-proposed-v1");
+    expect(billing?.history?.[0]?.revision).toBe("hosted-20261014-final-v1");
+    expect(billing?.history?.[0]?.meters).toEqual(historical.meters);
+    expect(billing?.history?.[0]?.meters["container.memory"]).toBeUndefined();
+    expect(billing?.history?.[0]?.meters["r2.storage"]).toEqual({
+      unit: "GB-month",
+      rate: { numeratorMicros: "45000", denominator: "1" },
+    });
+  });
+
+  test("reads retained v2 invoice and phase terms after a new source publication without admitting the old source", () => {
+    const old = sharedAuthoring(
+      "../config/shared-hosted-pricing-revisions/hosted-20261014-final-v1.json",
+    );
+    old.sharedPricing.plans[0].stripePriceId = "price_retained10";
+    old.billingConfig.plans["hosted-10"].stripePriceId = "price_retained10";
+    const historical = {
+      ...old,
+      billingConfig: {
+        ...old.billingConfig,
+        holdTtlSeconds: 7200,
+        purchaseCreditExpiry: { kind: "fixed-duration", seconds: 86400 },
+      },
+    };
+    const originalBytes = JSON.stringify(historical);
+    const current = compilePricingAuthoring(sharedAuthoring());
+    expect(
+      parseBillingConfig(current.environment.TAKOSERVER_BILLING_CONFIG)?.meters["container.memory"],
+    ).toBeDefined();
+    const retained = parsePersistedHostedPricing(originalBytes, "hosted-20261014-final-v1");
+    expect(retained?.environment.TAKOSERVER_HOSTED_PRICING).toBe(originalBytes);
+    expect(retained?.stripeMonthlyReview[0]).toEqual({
+      planKey: "hosted-10",
+      stripePriceId: "price_retained10",
+      expectedAmountMinor: 1000,
+      currency: "USD",
+      interval: "month",
+    });
+    const tariff = parseBillingConfig(retained?.environment.TAKOSERVER_BILLING_CONFIG);
+    expect(tariff?.plans["hosted-10"]).toEqual({
+      includedMinor: 2000,
+      stripePriceId: "price_retained10",
+    });
+    expect(tariff?.plans["hosted-50"]?.includedMinor).toBe(10000);
+    expect(tariff?.meters["r2.storage"]).toEqual({
+      unit: "GB-month",
+      rate: { numeratorMicros: "45000", denominator: "1" },
+    });
+    expect(tariff?.meters["container.memory"]).toBeUndefined();
+    expect(tariff?.holdTtlSeconds).toBe(7200);
+    expect(tariff?.purchaseCreditExpiry).toEqual({ kind: "fixed-duration", seconds: 86400 });
+    expect(() => compilePricingAuthoring(historical)).toThrow(/reviewed source/u);
+    expect(() => parseHostedPricing(originalBytes)).toThrow(HostedPricingError);
+    expect(() =>
+      assertHostedPricingMatchesBilling(retained as NonNullable<typeof retained>, tariff),
+    ).toThrow(HostedPricingError);
+  });
+
+  test("historical v2 reading rejects unknown revisions, transplanted terms and self-consistent price drift", () => {
+    const sourcePath = "../config/shared-hosted-pricing-revisions/hosted-20261014-final-v1.json";
+    const old = sharedAuthoring(sourcePath);
+    const bytes = JSON.stringify(old);
+    expect(() => parsePersistedHostedPricing(bytes, "other-revision")).toThrow(HostedPricingError);
+    const unknown = sharedAuthoring(sourcePath);
+    unknown.sharedPricing.revision = "unreviewed-r1";
+    unknown.billingConfig.revision = "unreviewed-r1";
+    expect(() => parsePersistedHostedPricing(JSON.stringify(unknown), "unreviewed-r1")).toThrow(
+      HostedPricingError,
+    );
+    const transplant = sharedAuthoring(sourcePath);
+    transplant.sharedPricing.revision = "hosted-20261015-container-proposed-v1";
+    transplant.billingConfig.revision = transplant.sharedPricing.revision;
+    expect(() =>
+      parsePersistedHostedPricing(JSON.stringify(transplant), transplant.sharedPricing.revision),
+    ).toThrow(HostedPricingError);
+    const cash = sharedAuthoring(sourcePath);
+    cash.sharedPricing.plans[0].monthlyPriceMicros = "1000000";
+    expect(() =>
+      parsePersistedHostedPricing(JSON.stringify(cash), cash.sharedPricing.revision),
+    ).toThrow(HostedPricingError);
+    const included = sharedAuthoring(sourcePath);
+    included.sharedPricing.plans[0].includedMicros = "21000000";
+    included.billingConfig.plans["hosted-10"].includedMinor = 2100;
+    expect(() =>
+      parsePersistedHostedPricing(JSON.stringify(included), included.sharedPricing.revision),
+    ).toThrow(HostedPricingError);
+    const meter = sharedAuthoring(sourcePath);
+    meter.sharedPricing.meters["r2.storage"].cloudflareCostMicros = "16000";
+    const runtimeMeter = meter.billingConfig.meters["r2.storage"];
+    if (!runtimeMeter) throw new Error("missing retained meter fixture");
+    runtimeMeter.rate.numeratorMicros = "48000";
+    expect(() =>
+      parsePersistedHostedPricing(JSON.stringify(meter), meter.sharedPricing.revision),
+    ).toThrow(HostedPricingError);
+  });
+
+  test("persisted reader preserves strict legacy/current parsing and binds its expected revision", () => {
+    const current = sharedAuthoring();
+    const legacy = authoring();
+    for (const authored of [current, legacy]) {
+      const raw = JSON.stringify(authored);
+      expect(parsePersistedHostedPricing(raw, authored.billingConfig.revision)).toEqual(
+        parseHostedPricing(raw),
+      );
+      expect(() => parsePersistedHostedPricing(raw, "wrong-revision")).toThrow(HostedPricingError);
+    }
+    expect(parsePersistedHostedPricing(undefined, "absent")).toBeUndefined();
+    expect(() =>
+      parsePersistedHostedPricing('{"authoringVersion":2,"authoringVersion":2}', "absent"),
+    ).toThrow(HostedPricingError);
+  });
+
   test("rejects unrepresentable current and historical grants before activating Checkout", () => {
     const tooLarge = Math.floor(Number.MAX_SAFE_INTEGER / 10_000) + 1;
     const current = authoring();
