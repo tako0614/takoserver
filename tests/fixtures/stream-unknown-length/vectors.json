@@ -1,0 +1,955 @@
+{
+  "schema": "takoserver.stream-unknown-length-vectors@proposed-1",
+  "limits": {
+    "singlePutBytes": 314572800,
+    "objectBytes": 5368709120,
+    "minimumNonFinalPartBytes": 5242880,
+    "maximumParts": 10000
+  },
+  "vectors": [
+    {
+      "id": "put-chunked-zero-byte-eof",
+      "operation": "put",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 0
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "put-chunked-zero-byte-chunks",
+      "operation": "put",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [0, 0],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 0
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "put-chunked-uneven-chunks-with-empty",
+      "operation": "put",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [1, 7, 0, 9],
+          "chunkBytes": 5
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 17
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "put-chunked-limit-exact",
+      "operation": "put",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [314572800],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 314572800
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "put-chunked-limit-exact-split-final-byte",
+      "operation": "put",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [314572799, 1],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 314572800
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "put-chunked-limit-plus-one-final-byte",
+      "operation": "put",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [314572800, 1],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "error": {
+          "name": "value_too_large",
+          "message": "value_too_large"
+        }
+      },
+      "expectCancellation": true
+    },
+    {
+      "id": "put-chunked-limit-plus-one-crossing-chunk",
+      "operation": "put",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [314572797, 4],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "error": {
+          "name": "value_too_large",
+          "message": "value_too_large"
+        }
+      },
+      "expectCancellation": true
+    },
+    {
+      "id": "put-chunked-slow-producer-backpressure",
+      "operation": "put",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [0, 3, 7, 2],
+          "chunkBytes": 4,
+          "producerDelayMs": 1
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 12
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "put-chunked-slow-sink-backpressure",
+      "operation": "put",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [1, 3, 7, 2],
+          "chunkBytes": 4
+        }
+      ],
+      "sinkDelayMs": 1,
+      "expected": {
+        "size": 13
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "put-chunked-mid-stream-disconnect",
+      "operation": "put",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [7, 9, 4],
+          "chunkBytes": 8,
+          "disconnectAfterBytes": 10
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "error": {
+          "name": "backend_unavailable",
+          "message": "backend_unavailable"
+        }
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "put-chunked-non-byte-chunk",
+      "operation": "put",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [3, 8],
+          "chunkBytes": 4,
+          "invalidChunkAfterBytes": 5
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "error": {
+          "name": "invalid_body",
+          "message": "invalid_body"
+        }
+      },
+      "expectCancellation": true
+    },
+    {
+      "id": "upload-chunked-zero-byte-eof",
+      "operation": "upload",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 0
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-chunked-zero-byte-chunks",
+      "operation": "upload",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [0, 0],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 0
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-chunked-uneven-chunks-with-empty",
+      "operation": "upload",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [1, 7, 0, 9],
+          "chunkBytes": 5
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 17
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-chunked-limit-exact",
+      "operation": "upload",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [5368709120],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 5368709120
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-chunked-limit-exact-split-final-byte",
+      "operation": "upload",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [5368709119, 1],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 5368709120
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-chunked-limit-plus-one-final-byte",
+      "operation": "upload",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [5368709120, 1],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "error": {
+          "name": "invalid_body",
+          "message": "invalid_body"
+        }
+      },
+      "expectCancellation": true
+    },
+    {
+      "id": "upload-chunked-limit-plus-one-crossing-chunk",
+      "operation": "upload",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [5368709117, 4],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "error": {
+          "name": "invalid_body",
+          "message": "invalid_body"
+        }
+      },
+      "expectCancellation": true
+    },
+    {
+      "id": "upload-chunked-slow-producer-backpressure",
+      "operation": "upload",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [0, 3, 7, 2],
+          "chunkBytes": 4,
+          "producerDelayMs": 1
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 12
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-chunked-slow-sink-backpressure",
+      "operation": "upload",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [1, 3, 7, 2],
+          "chunkBytes": 4
+        }
+      ],
+      "sinkDelayMs": 1,
+      "expected": {
+        "size": 13
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-chunked-mid-stream-disconnect",
+      "operation": "upload",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [7, 9, 4],
+          "chunkBytes": 8,
+          "disconnectAfterBytes": 10
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "error": {
+          "name": "backend_unavailable",
+          "message": "backend_unavailable"
+        }
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-chunked-non-byte-chunk",
+      "operation": "upload",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [3, 8],
+          "chunkBytes": 4,
+          "invalidChunkAfterBytes": 5
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "error": {
+          "name": "invalid_body",
+          "message": "invalid_body"
+        }
+      },
+      "expectCancellation": true
+    },
+    {
+      "id": "upload-chunked-d05-unequal-non-final-parts",
+      "operation": "upload",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [5242880],
+          "chunkBytes": 1048576
+        },
+        {
+          "segments": [6291456],
+          "chunkBytes": 1048576
+        },
+        {
+          "segments": [7],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 11534343
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-chunked-d05-undersized-non-final-part",
+      "operation": "upload",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [5242879],
+          "chunkBytes": 1048576
+        },
+        {
+          "segments": [1],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "error": {
+          "name": "invalid_part",
+          "message": "invalid_part"
+        }
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-chunked-d05-unequal-parts-total-exact",
+      "operation": "upload",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [5242880],
+          "chunkBytes": 1048576
+        },
+        {
+          "segments": [5363466240],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 5368709120
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-chunked-d05-unequal-parts-total-plus-one",
+      "operation": "upload",
+      "transport": "chunked",
+      "sources": [
+        {
+          "segments": [5242880],
+          "chunkBytes": 1048576
+        },
+        {
+          "segments": [5363466241],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "error": {
+          "name": "value_too_large",
+          "message": "value_too_large"
+        }
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "put-readable-stream-zero-byte-eof",
+      "operation": "put",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 0
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "put-readable-stream-zero-byte-chunks",
+      "operation": "put",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [0, 0],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 0
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "put-readable-stream-uneven-chunks-with-empty",
+      "operation": "put",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [1, 7, 0, 9],
+          "chunkBytes": 5
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 17
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "put-readable-stream-limit-exact",
+      "operation": "put",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [314572800],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 314572800
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "put-readable-stream-limit-exact-split-final-byte",
+      "operation": "put",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [314572799, 1],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 314572800
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "put-readable-stream-limit-plus-one-final-byte",
+      "operation": "put",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [314572800, 1],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "error": {
+          "name": "value_too_large",
+          "message": "value_too_large"
+        }
+      },
+      "expectCancellation": true
+    },
+    {
+      "id": "put-readable-stream-limit-plus-one-crossing-chunk",
+      "operation": "put",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [314572797, 4],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "error": {
+          "name": "value_too_large",
+          "message": "value_too_large"
+        }
+      },
+      "expectCancellation": true
+    },
+    {
+      "id": "put-readable-stream-slow-producer-backpressure",
+      "operation": "put",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [0, 3, 7, 2],
+          "chunkBytes": 4,
+          "producerDelayMs": 1
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 12
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "put-readable-stream-slow-sink-backpressure",
+      "operation": "put",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [1, 3, 7, 2],
+          "chunkBytes": 4
+        }
+      ],
+      "sinkDelayMs": 1,
+      "expected": {
+        "size": 13
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "put-readable-stream-mid-stream-disconnect",
+      "operation": "put",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [7, 9, 4],
+          "chunkBytes": 8,
+          "disconnectAfterBytes": 10
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "error": {
+          "name": "backend_unavailable",
+          "message": "backend_unavailable"
+        }
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "put-readable-stream-non-byte-chunk",
+      "operation": "put",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [3, 8],
+          "chunkBytes": 4,
+          "invalidChunkAfterBytes": 5
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "error": {
+          "name": "invalid_body",
+          "message": "invalid_body"
+        }
+      },
+      "expectCancellation": true
+    },
+    {
+      "id": "upload-readable-stream-zero-byte-eof",
+      "operation": "upload",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 0
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-readable-stream-zero-byte-chunks",
+      "operation": "upload",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [0, 0],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 0
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-readable-stream-uneven-chunks-with-empty",
+      "operation": "upload",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [1, 7, 0, 9],
+          "chunkBytes": 5
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 17
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-readable-stream-limit-exact",
+      "operation": "upload",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [5368709120],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 5368709120
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-readable-stream-limit-exact-split-final-byte",
+      "operation": "upload",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [5368709119, 1],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 5368709120
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-readable-stream-limit-plus-one-final-byte",
+      "operation": "upload",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [5368709120, 1],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "error": {
+          "name": "invalid_body",
+          "message": "invalid_body"
+        }
+      },
+      "expectCancellation": true
+    },
+    {
+      "id": "upload-readable-stream-limit-plus-one-crossing-chunk",
+      "operation": "upload",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [5368709117, 4],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "error": {
+          "name": "invalid_body",
+          "message": "invalid_body"
+        }
+      },
+      "expectCancellation": true
+    },
+    {
+      "id": "upload-readable-stream-slow-producer-backpressure",
+      "operation": "upload",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [0, 3, 7, 2],
+          "chunkBytes": 4,
+          "producerDelayMs": 1
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 12
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-readable-stream-slow-sink-backpressure",
+      "operation": "upload",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [1, 3, 7, 2],
+          "chunkBytes": 4
+        }
+      ],
+      "sinkDelayMs": 1,
+      "expected": {
+        "size": 13
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-readable-stream-mid-stream-disconnect",
+      "operation": "upload",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [7, 9, 4],
+          "chunkBytes": 8,
+          "disconnectAfterBytes": 10
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "error": {
+          "name": "backend_unavailable",
+          "message": "backend_unavailable"
+        }
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-readable-stream-non-byte-chunk",
+      "operation": "upload",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [3, 8],
+          "chunkBytes": 4,
+          "invalidChunkAfterBytes": 5
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "error": {
+          "name": "invalid_body",
+          "message": "invalid_body"
+        }
+      },
+      "expectCancellation": true
+    },
+    {
+      "id": "upload-readable-stream-d05-unequal-non-final-parts",
+      "operation": "upload",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [5242880],
+          "chunkBytes": 1048576
+        },
+        {
+          "segments": [6291456],
+          "chunkBytes": 1048576
+        },
+        {
+          "segments": [7],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 11534343
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-readable-stream-d05-undersized-non-final-part",
+      "operation": "upload",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [5242879],
+          "chunkBytes": 1048576
+        },
+        {
+          "segments": [1],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "error": {
+          "name": "invalid_part",
+          "message": "invalid_part"
+        }
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-readable-stream-d05-unequal-parts-total-exact",
+      "operation": "upload",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [5242880],
+          "chunkBytes": 1048576
+        },
+        {
+          "segments": [5363466240],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "size": 5368709120
+      },
+      "expectCancellation": false
+    },
+    {
+      "id": "upload-readable-stream-d05-unequal-parts-total-plus-one",
+      "operation": "upload",
+      "transport": "readable-stream",
+      "sources": [
+        {
+          "segments": [5242880],
+          "chunkBytes": 1048576
+        },
+        {
+          "segments": [5363466241],
+          "chunkBytes": 1048576
+        }
+      ],
+      "sinkDelayMs": 0,
+      "expected": {
+        "error": {
+          "name": "value_too_large",
+          "message": "value_too_large"
+        }
+      },
+      "expectCancellation": false
+    }
+  ]
+}
