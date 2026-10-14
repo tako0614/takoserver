@@ -11,7 +11,6 @@ import {
   assertStorageRebindNotOperatorStagingPair,
   type IntegrationStorageGenerationTargetProof,
   type IntegrationStorageGenerationTargetVerificationOptions,
-  verifyCanonicalV20092IntegrationStorageTarget,
   verifyFreshV2IntegrationStorageTarget,
   verifyIntegrationStorageGenerationTarget,
 } from "./integration-storage-generation.ts";
@@ -170,6 +169,11 @@ export async function runWorkerClosureTransition(
   if (target.environment !== invocation.environment) {
     throw preflightError("Worker invocation and target environments differ");
   }
+  if (target.schemaMaintenanceMode === "pre-v2-0098-quiesced") {
+    throw preflightError(
+      "pre-0098 Host maintenance publication and GET-only recovery belong only to takoserver-worker",
+    );
+  }
   if (target.artifactBlobIoMode !== undefined && target.schemaMaintenanceMode !== undefined) {
     throw preflightError("Worker maintenance selectors conflict");
   }
@@ -180,10 +184,7 @@ export async function runWorkerClosureTransition(
     throw preflightError("closure predecessor Version ID must be one exact UUID");
   }
   const delta = normalizedWorkerClosureDelta(invocation.delta);
-  if (
-    target.schemaMaintenanceMode === "pre-v2-0088-quiesced" ||
-    target.schemaMaintenanceMode === "pre-v2-0098-quiesced"
-  ) {
+  if (target.schemaMaintenanceMode === "pre-v2-0088-quiesced") {
     if (
       JSON.stringify(delta.addedVars) !== JSON.stringify(["TAKOSERVER_SCHEMA_MAINTENANCE_MODE"]) ||
       delta.retiredVars.length !== 0 ||
@@ -194,11 +195,7 @@ export async function runWorkerClosureTransition(
       delta.rotatedSecrets.length !== 0 ||
       delta.storageRebind !== undefined
     ) {
-      throw preflightError(
-        target.schemaMaintenanceMode === "pre-v2-0098-quiesced"
-          ? "v2 schema maintenance transition may add only its maintenance variable"
-          : "v2 0088 maintenance transition may add only its maintenance variable",
-      );
+      throw preflightError("v2 0088 maintenance transition may add only its maintenance variable");
     }
   }
   if (target.takoformV2 !== undefined) {
@@ -375,11 +372,7 @@ export async function runWorkerClosureTransition(
       target.schemaMaintenanceMode !== undefined &&
       !workerSchemaAllowsPending(target, migrationState, sourceRepositoryRoot)
     ) {
-      throw preflightError(
-        target.schemaMaintenanceMode === "pre-v2-0098-quiesced"
-          ? "Worker maintenance requires its exact audited predecessor schema"
-          : "0058 Worker maintenance requires exact applied 0057 and 0058 next",
-      );
+      throw preflightError("0058 Worker maintenance requires exact applied 0057 and 0058 next");
     }
 
     if (invocation.action === "status") {
@@ -984,11 +977,6 @@ function closureRequiresMoneyUnitSchema(target: DeployTarget): boolean {
 
 function selectedStorageVerifier(target: DeployTarget) {
   if (target.takoformV2 === undefined) return verifyIntegrationStorageGenerationTarget;
-  if (
-    target.schemaMaintenanceMode === "pre-v2-0098-quiesced" &&
-    target.takoformV2.appliedSchemaLineage === "v2-0092"
-  )
-    return verifyCanonicalV20092IntegrationStorageTarget;
   const lineage = takoformV2StorageLineage(target);
   return (
     selected: DeployTarget,

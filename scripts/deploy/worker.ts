@@ -113,6 +113,7 @@ import {
 type MaintenanceNativeState = WorkerState & {
   workerVersionWithModules?(workerName: string, versionId: string): Promise<unknown>;
   workerSettings?(workerName: string): Promise<unknown>;
+  workerSchedules?(workerName: string): Promise<readonly string[]>;
   workerRoutes?(): Promise<readonly unknown[]>;
 };
 
@@ -678,15 +679,17 @@ async function observePreV20098HostMaintenance(
   if (
     state.workerVersionWithModules === undefined ||
     state.workerSettings === undefined ||
+    state.workerSchedules === undefined ||
     state.workerRoutes === undefined ||
     state.workerSubdomain === undefined
   ) {
     throw preflightError(
-      "pre-0098 native status requires Version modules, settings, route and subdomain readers",
+      "pre-0098 native status requires Version modules, settings, schedules, route and subdomain readers",
     );
   }
   const moduleReader = state.workerVersionWithModules.bind(state);
   const settingsReader = state.workerSettings.bind(state);
+  const schedulesReader = state.workerSchedules.bind(state);
   const routesReader = state.workerRoutes.bind(state);
   const subdomainReader = state.workerSubdomain.bind(state);
   const root = mkdtempSync(join(tmpdir(), "takoserver-pre98-status-"));
@@ -694,6 +697,9 @@ async function observePreV20098HostMaintenance(
   let expectedNativeSettings: {
     readonly compatibilityDate: string;
     readonly compatibilityFlags: readonly string[];
+    readonly observability: unknown;
+    readonly schedules: readonly string[];
+    readonly behavior: Readonly<Record<string, unknown>>;
   };
   try {
     const prepared = await prepareWorkerArtifact({
@@ -737,7 +743,8 @@ async function observePreV20098HostMaintenance(
       !isRecord(sourceSettings) ||
       typeof sourceSettings.compatibility_date !== "string" ||
       !Array.isArray(sourceSettings.compatibility_flags) ||
-      !sourceSettings.compatibility_flags.every((flag) => typeof flag === "string")
+      !sourceSettings.compatibility_flags.every((flag) => typeof flag === "string") ||
+      !isRecord(sourceSettings.observability)
     ) {
       throw preflightError(
         "selected source does not define exact native Worker compatibility settings",
@@ -746,6 +753,9 @@ async function observePreV20098HostMaintenance(
     expectedNativeSettings = {
       compatibilityDate: sourceSettings.compatibility_date,
       compatibilityFlags: [...sourceSettings.compatibility_flags],
+      observability: sourceSettings.observability,
+      schedules: selectedSourceSchedules(sourceRepositoryRoot),
+      behavior: Object.fromEntries(NATIVE_BEHAVIOR_KEYS.map((key) => [key, sourceSettings[key]])),
     };
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -761,10 +771,11 @@ async function observePreV20098HostMaintenance(
     if (live.bundleDigestHex !== expectedBundleDigestHex) {
       throw preflightError("pre-0098 active Host Version differs from the selected source bundle");
     }
-    const [version, moduleVersion, settings, routes, subdomain] = await Promise.all([
+    const [version, moduleVersion, settings, schedules, routes, subdomain] = await Promise.all([
       state.workerVersion(target.workerName, live.history.versionId),
       moduleReader(target.workerName, live.history.versionId),
       settingsReader(target.workerName),
+      schedulesReader(target.workerName),
       routesReader(),
       subdomainReader(target.workerName),
     ]);
@@ -776,6 +787,7 @@ async function observePreV20098HostMaintenance(
       version,
       moduleVersion,
       settings,
+      schedules,
       routes,
       subdomain,
       expectedNativeSettings,
@@ -834,11 +846,15 @@ function inspectPreV20098NativeClosure(
   version: unknown,
   moduleVersion: unknown,
   settings: unknown,
+  schedules: readonly string[],
   routes: readonly unknown[],
   subdomain: unknown,
   expectedNativeSettings: {
     readonly compatibilityDate: string;
     readonly compatibilityFlags: readonly string[];
+    readonly observability: unknown;
+    readonly schedules: readonly string[];
+    readonly behavior: Readonly<Record<string, unknown>>;
   },
 ): string {
   if (
@@ -898,12 +914,68 @@ function inspectPreV20098NativeClosure(
       settings.compatibility_date !== compatibilityDate) ||
     (settings.compatibility_flags !== undefined &&
       canonicalJson(settings.compatibility_flags) !== canonicalJson(compatibilityFlags)) ||
+    canonicalJson(settings.observability) !== canonicalJson(expectedNativeSettings.observability) ||
     (moduleVersion.compatibility_date !== undefined &&
       moduleVersion.compatibility_date !== compatibilityDate) ||
     (moduleVersion.compatibility_flags !== undefined &&
       canonicalJson(moduleVersion.compatibility_flags) !== canonicalJson(compatibilityFlags))
   ) {
     throw preflightError("pre-0098 active Host native settings differ from the selected profile");
+  }
+  if (
+    !Array.isArray(schedules) ||
+    schedules.some((cron) => typeof cron !== "string" || cron.length === 0) ||
+    canonicalJson([...schedules].sort()) !== canonicalJson(expectedNativeSettings.schedules)
+  ) {
+    throw preflightError("pre-0098 active Host schedules differ from the selected source");
+  }
+  assertSelectedNativeBehavior(version, expectedNativeSettings.behavior, "Version");
+  assertSelectedNativeBehavior(moduleVersion, expectedNativeSettings.behavior, "module");
+  assertSelectedNativeBehavior(settings, expectedNativeSettings.behavior, "settings");
+  for (const [label, native] of [
+    ["Version", version],
+    ["module", moduleVersion],
+  ] as const) {
+    if (
+      (native.observability !== undefined &&
+        canonicalJson(native.observability) !==
+          canonicalJson(expectedNativeSettings.observability)) ||
+      (native.triggers !== undefined &&
+        canonicalJson(native.triggers) !==
+          canonicalJson({ crons: expectedNativeSettings.schedules }))
+    ) {
+      throw preflightError(
+        `pre-0098 active Host ${label} observability or triggers differ from selected source`,
+      );
+    }
+  }
+  const allowedSettings = new Set([
+    "bindings",
+    "compatibility_date",
+    "compatibility_flags",
+    "workers_dev",
+    "preview_urls",
+    "observability",
+    "triggers",
+    "routes",
+    "custom_domains",
+    "domains",
+    ...NATIVE_BEHAVIOR_KEYS,
+  ]);
+  if (Object.keys(settings).some((key) => !allowedSettings.has(key))) {
+    throw preflightError("pre-0098 active Host settings contain unqualified provider metadata");
+  }
+  if (
+    (settings.triggers !== undefined &&
+      canonicalJson(settings.triggers) !==
+        canonicalJson({ crons: expectedNativeSettings.schedules })) ||
+    ["routes", "custom_domains", "domains"].some(
+      (key) =>
+        settings[key] !== undefined &&
+        (!Array.isArray(settings[key]) || settings[key].length !== 0),
+    )
+  ) {
+    throw preflightError("pre-0098 active Host native settings declare foreign topology");
   }
   const bindings = (value: unknown): string => {
     if (!Array.isArray(value) || !value.every(isRecord)) {
@@ -942,7 +1014,68 @@ function inspectPreV20098NativeClosure(
   ) {
     throw preflightError("pre-0098 active Host has an unexpected native route");
   }
-  return canonicalJson({ moduleDigestHex: bundleDigestHex, settings, routes, subdomain });
+  return canonicalJson({
+    moduleDigestHex: bundleDigestHex,
+    settings,
+    schedules,
+    routes,
+    subdomain,
+  });
+}
+
+const NATIVE_BEHAVIOR_KEYS = [
+  "placement",
+  "tail_consumers",
+  "logpush",
+  "limits",
+  "assets",
+  "migrations",
+  "usage_model",
+] as const;
+
+function assertSelectedNativeBehavior(
+  native: Record<string, unknown>,
+  selected: Readonly<Record<string, unknown>>,
+  label: string,
+): void {
+  for (const key of NATIVE_BEHAVIOR_KEYS) {
+    const actual = native[key];
+    const expected = selected[key];
+    if (expected === undefined) {
+      // These exact neutral provider projections do not add behavior. Any
+      // nonempty or nondefault value is foreign even when it remains stable.
+      const neutral =
+        actual === undefined ||
+        (key === "logpush" && actual === false) ||
+        (key === "tail_consumers" && canonicalJson(actual) === "[]") ||
+        (["placement", "limits", "assets", "migrations"].includes(key) &&
+          canonicalJson(actual) === "{}");
+      if (!neutral) {
+        throw preflightError(`pre-0098 active Host ${label} ${key} differs from selected source`);
+      }
+    } else if (canonicalJson(actual) !== canonicalJson(expected)) {
+      throw preflightError(`pre-0098 active Host ${label} ${key} differs from selected source`);
+    }
+  }
+}
+
+function selectedSourceSchedules(sourceRepositoryRoot: string): readonly string[] {
+  const source: unknown = JSON.parse(
+    readFileSync(resolve(sourceRepositoryRoot, "wrangler.jsonc"), "utf8"),
+  );
+  if (!isRecord(source) || !isRecord(source.triggers) || !Array.isArray(source.triggers.crons)) {
+    throw preflightError("selected source does not define exact Worker schedules");
+  }
+  const schedules = source.triggers.crons;
+  if (
+    !schedules.every(
+      (cron) => typeof cron === "string" && cron.length > 0 && cron.trim() === cron,
+    ) ||
+    new Set(schedules).size !== schedules.length
+  ) {
+    throw preflightError("selected source Worker schedules are malformed");
+  }
+  return [...schedules].sort();
 }
 
 export { authoritySensitiveWorkerPaths } from "./worker-authority-paths.ts";
@@ -1325,9 +1458,14 @@ export async function runWorker(
       authorityPaths !== null &&
       authorityPaths.length > 0
     ) {
-      throw preflightError(
-        "authority-sensitive Worker diff requires takoserver-worker-authority-cutover",
-        JSON.stringify(authorityPaths),
+      if (target.schemaMaintenanceMode !== "pre-v2-0098-quiesced") {
+        throw preflightError(
+          "authority-sensitive Worker diff requires takoserver-worker-authority-cutover",
+          JSON.stringify(authorityPaths),
+        );
+      }
+      reviewer = exactReviewer(
+        options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
       );
     }
     if (invocation.surface === "takoserver-worker-authority-cutover") {

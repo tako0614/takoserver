@@ -1012,8 +1012,8 @@ describe("reviewed Worker closure transition", () => {
     });
   });
 
-  test("publishes only the declared maintenance var over the exact canonical 0092 Host closure", async () => {
-    await withRoot("takoserver-closure-v2-0098-maintenance-", async (root) => {
+  test("pre-0098 Host maintenance cannot use the generic closure transition for status or apply", async () => {
+    await withRoot("takoserver-closure-v2-0098-refusal-", async (root) => {
       const {
         edgeSupplies: _edgeSupplies,
         objectBucketSupplies: _objectBucketSupplies,
@@ -1029,76 +1029,74 @@ describe("reviewed Worker closure transition", () => {
         },
         schemaMaintenanceMode: "pre-v2-0098-quiesced" as const,
       } satisfies DeployTarget;
-      const shape = deriveExpectedApplicationShape(readMigrationArtifact().files.slice(0, 92));
-      const exact = {
-        applied: schemaMigrations.slice(0, 92),
-        shape,
-        shapeDigest: `sha256:${createHash("sha256").update(shape).digest("hex")}`,
-      };
-      const parts = fixture(root, {
-        selected,
-        local: schemaMigrations,
-        applied: exact.applied,
-        auditedShape: shape,
-        predecessor: { dropVar: SCHEMA_MODE_VAR, v2Startup: true },
-      });
-      let reads = 0;
-      const result = await runWorkerClosureTransition(
-        {
-          surface: "takoserver-worker-authority-cutover",
-          action: "apply",
-          environment: "integration",
-          commit: COMMIT,
-          closurePredecessorVersionId: PREDECESSOR,
-          delta: {
-            retiredVars: [],
-            addedVars: [SCHEMA_MODE_VAR],
-            refreshedVars: [],
-            addedBindings: [],
-            addedSecrets: [],
-            rotatedSecrets: [],
-          },
-        },
-        selected,
-        {
-          run: parts.run,
-          state: parts.state,
-          migrations: parts.migrations,
-          stripeModeRealm: parts.stripeModeRealm,
-          review: "reviewer@example.test",
-          secretDirectory: parts.secretDirectory,
-          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
-          outputDirectory: join(root, "work"),
-          integrationStorageVerification: integrationStorageVerificationOptions(selected, {
-            readState: async () => {
-              reads++;
-              return exact;
+      const parts = fixture(root, { selected });
+      let d1Reads = 0;
+      let realmReads = 0;
+      let storageReads = 0;
+      let probeReads = 0;
+      for (const action of ["status", "apply"] as const) {
+        const refusal = await runWorkerClosureTransition(
+          {
+            surface: "takoserver-worker-authority-cutover",
+            action,
+            environment: "integration",
+            commit: COMMIT,
+            closurePredecessorVersionId: PREDECESSOR,
+            delta: {
+              retiredVars: [],
+              addedVars: [SCHEMA_MODE_VAR],
+              refreshedVars: [],
+              addedBindings: [],
+              addedSecrets: [],
+              rotatedSecrets: [],
             },
-          }),
-          fetcher: async () =>
-            Response.json(
-              {
-                error: {
-                  code: "backend_unavailable",
-                  message: "Host is quiesced for the v2 0098 schema maintenance transition",
-                  details: { reason: "runtime-configuration" },
-                },
+          },
+          selected,
+          {
+            run: parts.run,
+            state: parts.state,
+            migrations: {
+              async read() {
+                d1Reads++;
+                return await parts.migrations.read();
               },
-              { status: 503, headers: { "cache-control": "no-store", "retry-after": "60" } },
-            ),
-        },
-      );
-      expect(result).toMatchObject({
-        maintenance: "pre-v2-0098-quiesced",
-        previousVersionId: PREDECESSOR,
-        versionId: SUCCESSOR,
-        pendingMigrations: schemaMigrations.slice(92),
-        probe: { status: 503, traffic: "maintenance" },
+            },
+            stripeModeRealm: {
+              async read() {
+                realmReads++;
+                return await parts.stripeModeRealm.read();
+              },
+            },
+            integrationStorageVerification: integrationStorageVerificationOptions(selected, {
+              readState: async () => {
+                storageReads++;
+                return applyQualifiedSchemaState();
+              },
+            }),
+            fetcher: async () => {
+              probeReads++;
+              throw new Error("unexpected Host probe");
+            },
+            providerExecutorQualification: parts.providerExecutorQualification,
+            review: "reviewer@example.test",
+            cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+            outputDirectory: join(root, "work"),
+          },
+        ).catch((error: unknown) => error);
+        expect(refusal).toBeInstanceOf(DeployError);
+        expect((refusal as DeployError).phase).toBe("preflight");
+        expect((refusal as Error).message).toContain("belong only to takoserver-worker");
+      }
+      expect({ d1Reads, realmReads, storageReads, probeReads }).toEqual({
+        d1Reads: 0,
+        realmReads: 0,
+        storageReads: 0,
+        probeReads: 0,
       });
-      expect(reads).toBe(3);
-      expect(parts.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(1);
+      expect(parts.stateCalls).toEqual([]);
+      expect(parts.calls).toEqual([]);
     });
-  }, 20_000);
+  });
 
   test("the shared Worker publication lease blocks a concurrent maintenance closure before upload", async () => {
     await withRoot("takoserver-v2-closure-shared-lease-", async (root) => {

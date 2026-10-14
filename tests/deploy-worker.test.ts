@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -45,6 +46,9 @@ import {
 const COMMIT = "a".repeat(40);
 const LIVE_COMMIT = "b".repeat(40);
 const BUNDLE = "export default {fetch(){return new Response('ok')}};\n";
+const SELECTED_NATIVE_CONFIG = JSON.parse(
+  readFileSync(join(import.meta.dir, "../wrangler.jsonc"), "utf8"),
+) as { observability: unknown; triggers: { crons: string[] } };
 const VERSION_BEFORE = "00000000-0000-4000-8000-000000000001";
 const VERSION_AFTER = "00000000-0000-4000-8000-000000000002";
 const V2_DEPLOYMENT_AFTER = "00000000-0000-4000-8000-000000000012";
@@ -162,6 +166,7 @@ function fixture(
     readonly stripeModePin?: "test" | "live" | null;
     readonly corruptStripeModeTriggers?: boolean;
     readonly changeStripeModeAfterBuild?: "test" | "live" | null;
+    readonly loseVersionDeployAcknowledgment?: boolean;
   } = {},
 ): {
   readonly run: WorkerProcess;
@@ -237,7 +242,9 @@ function fixture(
         }),
       );
       current = "after";
-      return ok("Deployed\n");
+      return input.loseVersionDeployAcknowledgment === true
+        ? { exitCode: 1, stdout: "", stderr: "deployment acknowledgment lost" }
+        : ok("Deployed\n");
     }
     if (command.includes("deploy") && command.includes("--no-bundle")) {
       uploadMessage = command[command.indexOf("--message") + 1] ?? null;
@@ -447,7 +454,11 @@ describe("split Takoserver Worker surfaces", () => {
       },
       async workerSettings() {
         nativeReads.push("settings");
-        return { bindings: nativeBindings };
+        return { bindings: nativeBindings, observability: SELECTED_NATIVE_CONFIG.observability };
+      },
+      async workerSchedules() {
+        nativeReads.push("schedules");
+        return SELECTED_NATIVE_CONFIG.triggers.crons;
       },
       async workerRoutes() {
         nativeReads.push("routes");
@@ -508,10 +519,12 @@ describe("split Takoserver Worker surfaces", () => {
     expect(nativeReads).toEqual([
       "module",
       "settings",
+      "schedules",
       "routes",
       "subdomain",
       "module",
       "settings",
+      "schedules",
       "routes",
       "subdomain",
     ]);
@@ -522,6 +535,80 @@ describe("split Takoserver Worker surfaces", () => {
       [expect.any(String), "versions", "upload"],
     ]);
     expect(current.calls[3]).toContain("--dry-run");
+    for (const [label, state] of [
+      [
+        "observability",
+        {
+          ...nativeState,
+          async workerSettings() {
+            return { bindings: nativeBindings, observability: { enabled: false } };
+          },
+        },
+      ],
+      [
+        "schedules",
+        {
+          ...nativeState,
+          async workerSchedules() {
+            return ["0 0 * * *"];
+          },
+        },
+      ],
+      [
+        "placement",
+        {
+          ...nativeState,
+          async workerSettings() {
+            return {
+              bindings: nativeBindings,
+              observability: SELECTED_NATIVE_CONFIG.observability,
+              placement: { mode: "smart" },
+            };
+          },
+        },
+      ],
+      [
+        "foreign metadata",
+        {
+          ...nativeState,
+          async workerSettings() {
+            return {
+              bindings: nativeBindings,
+              observability: SELECTED_NATIVE_CONFIG.observability,
+              foreign_behavior: true,
+            };
+          },
+        },
+      ],
+    ] as const) {
+      let probed = false;
+      await expect(
+        runWorker(
+          {
+            surface: "takoserver-worker",
+            action: "status",
+            environment: "integration",
+            commit: COMMIT,
+          },
+          selected,
+          {
+            ...current,
+            state,
+            fetcher: async () => {
+              probed = true;
+              throw new Error("foreign native closure must not be probed");
+            },
+          },
+        ),
+      ).rejects.toThrow(
+        label === "foreign metadata"
+          ? "unqualified provider metadata"
+          : label === "observability"
+            ? "selected profile"
+            : label,
+      );
+      expect(probed).toBe(false);
+    }
     await expect(
       runWorker(
         {
@@ -685,7 +772,10 @@ describe("split Takoserver Worker surfaces", () => {
             };
           },
           async workerSettings() {
-            return { bindings };
+            return { bindings, observability: SELECTED_NATIVE_CONFIG.observability };
+          },
+          async workerSchedules() {
+            return SELECTED_NATIVE_CONFIG.triggers.crons;
           },
           async workerRoutes() {
             return [];
@@ -773,7 +863,11 @@ describe("split Takoserver Worker surfaces", () => {
                 compatibility_date: "2026-08-17",
                 compatibility_flags: ["nodejs_compat"],
                 bindings: driftedBindings,
+                observability: SELECTED_NATIVE_CONFIG.observability,
               };
+            },
+            async workerSchedules() {
+              return SELECTED_NATIVE_CONFIG.triggers.crons;
             },
             async workerRoutes() {
               return [];
@@ -849,6 +943,9 @@ describe("split Takoserver Worker surfaces", () => {
             },
             async workerSettings() {
               return {};
+            },
+            async workerSchedules() {
+              return SELECTED_NATIVE_CONFIG.triggers.crons;
             },
             async workerRoutes() {
               return [];
@@ -1168,6 +1265,205 @@ describe("split Takoserver Worker surfaces", () => {
     }
   }, 20_000);
 
+  test("real predecessor diff requires review for pre-0098 Host publication and lost-ACK status never reuploads", async () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-pre98-reviewed-diff-"));
+    const git = (...args: string[]): string => {
+      const result = spawnSync("git", ["-C", root, ...args], {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          GIT_AUTHOR_NAME: "Portable Test",
+          GIT_AUTHOR_EMAIL: "portable@example.test",
+          GIT_COMMITTER_NAME: "Portable Test",
+          GIT_COMMITTER_EMAIL: "portable@example.test",
+        },
+      });
+      if (result.status !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr}`);
+      return result.stdout;
+    };
+    try {
+      mkdirSync(join(root, "src"));
+      mkdirSync(join(root, "scripts/deploy"), { recursive: true });
+      git("init", "-q");
+      writeFileSync(join(root, "src/entry-worker.ts"), "export const mode = 'serving';\n");
+      writeFileSync(join(root, "scripts/deploy/worker.ts"), "export const fence = 'old';\n");
+      git("add", ".");
+      git("-c", "commit.gpgsign=false", "commit", "-qm", "predecessor");
+      const predecessor = git("rev-parse", "HEAD").trim();
+      writeFileSync(
+        join(root, "src/entry-worker.ts"),
+        "export const mode = 'pre-v2-0098-quiesced';\n",
+      );
+      writeFileSync(join(root, "scripts/deploy/worker.ts"), "export const fence = 'reviewed';\n");
+      git("add", ".");
+      git("-c", "commit.gpgsign=false", "commit", "-qm", "selected");
+      const selectedCommit = git("rev-parse", "HEAD").trim();
+      const realDiff = git("diff", "--name-only", `${predecessor}..${selectedCommit}`, "--");
+      expect(realDiff.trim().split("\n")).toEqual([
+        "scripts/deploy/worker.ts",
+        "src/entry-worker.ts",
+      ]);
+      const selected = {
+        ...v2Target,
+        takoformV2: {
+          ...v2Target.takoformV2,
+          storageLineage: "v2-0088" as const,
+          appliedSchemaLineage: "v2-0092" as const,
+        },
+        schemaMaintenanceMode: "pre-v2-0098-quiesced" as const,
+      };
+      const exact = {
+        applied: canonicalMigrations.slice(0, 92),
+        shape: canonical0092Shape,
+        shapeDigest: canonical0092ShapeDigest,
+      };
+      const maintenanceFetcher = async () =>
+        Response.json(
+          {
+            error: {
+              code: "backend_unavailable",
+              message: "Host is quiesced for the v2 0098 schema maintenance transition",
+              details: { reason: "runtime-configuration" },
+            },
+          },
+          { status: 503, headers: { "cache-control": "no-store", "retry-after": "60" } },
+        );
+      const withRealDiff =
+        (base: ReturnType<typeof fixture>): WorkerProcess =>
+        async (command, options) =>
+          command[0] === "git" && command[1] === "diff"
+            ? { exitCode: 0, stdout: realDiff, stderr: "" }
+            : base.run(command, options);
+      const invocation = {
+        surface: "takoserver-worker" as const,
+        action: "apply" as const,
+        environment: "integration" as const,
+        commit: COMMIT,
+      };
+      const baseOptions = (current: ReturnType<typeof fixture>) => ({
+        ...current,
+        run: withRealDiff(current),
+        outputDirectory: root,
+        cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
+        integrationStorageVerification: integrationStorageVerificationOptions(selected, {
+          readState: async () => exact,
+        }),
+        fetcher: maintenanceFetcher,
+      });
+      const absentReviewer = fixture({
+        selectedTarget: selected,
+        applied: exact.applied,
+        auditedShape: exact.shape,
+      });
+      await expect(
+        runWorker(invocation, selected, { ...baseOptions(absentReviewer), review: "" }),
+      ).rejects.toThrow("INDEPENDENT_REVIEW");
+      expect(absentReviewer.calls.some((command) => command.join(" ") === "bun run check")).toBe(
+        false,
+      );
+      expect(absentReviewer.calls.filter((command) => command.includes("upload"))).toHaveLength(0);
+      const reviewed = fixture({
+        selectedTarget: selected,
+        applied: exact.applied,
+        auditedShape: exact.shape,
+      });
+      const applied = await runWorker(invocation, selected, {
+        ...baseOptions(reviewed),
+        review: "independent@example.test",
+      });
+      expect(applied).toMatchObject({
+        reviewer: "independent@example.test",
+        changedPaths: ["scripts/deploy/worker.ts", "src/entry-worker.ts"],
+        authorityPaths: ["scripts/deploy/worker.ts", "src/entry-worker.ts"],
+        maintenance: "pre-v2-0098-quiesced",
+      });
+      expect(
+        reviewed.calls.filter(
+          (command) => command.includes("upload") && !command.includes("--dry-run"),
+        ),
+      ).toHaveLength(1);
+      const lostAck = fixture({
+        selectedTarget: selected,
+        applied: exact.applied,
+        auditedShape: exact.shape,
+        loseVersionDeployAcknowledgment: true,
+      });
+      await expect(
+        runWorker(invocation, selected, {
+          ...baseOptions(lostAck),
+          review: "independent@example.test",
+        }),
+      ).rejects.toThrow("acknowledgement is indeterminate");
+      const nativeBindings = versionForTarget(
+        VERSION_AFTER,
+        `takoserver-worker:${COMMIT}:${createHash("sha256").update(BUNDLE).digest("hex")}`,
+        selected,
+      ).resources.bindings;
+      let d1Reads = 0;
+      const status = await runWorker({ ...invocation, action: "status" }, selected, {
+        ...baseOptions(lostAck),
+        state: {
+          ...lostAck.state,
+          async workerVersionWithModules(_worker, versionId) {
+            return {
+              id: versionId,
+              main_module: "worker.js",
+              modules: [
+                {
+                  name: "worker.js",
+                  content_type: "application/javascript+module",
+                  content_base64: Buffer.from(BUNDLE).toString("base64"),
+                },
+              ],
+              compatibility_date: "2026-08-17",
+              compatibility_flags: ["nodejs_compat"],
+            };
+          },
+          async workerSettings() {
+            return {
+              bindings: nativeBindings,
+              observability: SELECTED_NATIVE_CONFIG.observability,
+            };
+          },
+          async workerSchedules() {
+            return SELECTED_NATIVE_CONFIG.triggers.crons;
+          },
+          async workerRoutes() {
+            return [];
+          },
+          async workerSubdomain() {
+            return { enabled: false, previewsEnabled: false };
+          },
+        },
+        migrations: {
+          read: async () => {
+            d1Reads++;
+            throw new Error("status must not read D1");
+          },
+        },
+        integrationStorageVerification: integrationStorageVerificationOptions(selected, {
+          readState: async () => {
+            d1Reads++;
+            throw new Error("status must not read D1");
+          },
+        }),
+      });
+      expect(status).toMatchObject({
+        maintenance: "pre-v2-0098-quiesced",
+        schemaUnproven: true,
+        ready: false,
+      });
+      expect(d1Reads).toBe(0);
+      expect(
+        lostAck.calls.filter(
+          (command) => command.includes("upload") && !command.includes("--dry-run"),
+        ),
+      ).toHaveLength(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("publishes one pre-0098 Host maintenance successor with an exact injected CPE native proof", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-pre-v2-0098-cpe-"));
     try {
@@ -1279,7 +1575,10 @@ describe("split Takoserver Worker surfaces", () => {
           };
         },
         async workerSettings() {
-          return { bindings: nativeBindings };
+          return { bindings: nativeBindings, observability: SELECTED_NATIVE_CONFIG.observability };
+        },
+        async workerSchedules() {
+          return SELECTED_NATIVE_CONFIG.triggers.crons;
         },
         async workerRoutes() {
           return [];

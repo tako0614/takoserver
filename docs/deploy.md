@@ -213,13 +213,25 @@ the result. This is GET-only recovery observation after an uncertain upload
 acknowledgment, not permission to retry publication. Protected 0092→0098
 conversion and reactivation require their own separately reviewed operator
 qualification and sole migration writer.
+The generic Worker closure-transition surface refuses this pre-0098 target on
+both status and apply before any D1 or provider read; it is not an alternate
+publication or recovery entrypoint.
+
+The selected predecessor-to-source diff is still classified normally. If it
+touches authority-sensitive files (including the Host entrypoint or deploy
+mechanism), this one pre-0098 routine publication requires an explicitly named
+independent reviewer and records both the changed and authority paths. The
+ordinary serving routine lane still refuses such a diff; the authority-cutover
+surface is not a second pre-0098 publication route.
 
 After publication, this target's existing `takoserver-worker --status` requires
 the exact clean selected source checkout and performs a local, non-uploading
-Wrangler dry-run to derive its expected bundle digest and native compatibility
-settings from the selected source config. It then reads the active
+Wrangler dry-run to derive its expected bundle digest and native compatibility,
+observability and behavioral settings from the selected source config. The
+selected source's cron declarations independently determine expected schedules.
+It then reads the active
 Host deployment, immutable Version and module bytes, script settings,
-bindings, routes, secrets and script subdomain/preview-URL state from native
+bindings, schedules, routes, secrets and script subdomain/preview-URL state from native
 Cloudflare GETs. The script subdomain must match the selected workers.dev or
 custom-domain topology, and preview URLs must be disabled. It then checks the
 non-cacheable `/healthz` 503 response and re-reads the native closure. It does
