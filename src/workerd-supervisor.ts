@@ -68,11 +68,11 @@ class ChildIdentityPersistenceError extends Error {
 }
 
 /**
- * An `onSpawned` hook reports, before it has persisted anything, that another
- * process holds the listener or that the child already exited without
- * recording an identity, as one that cannot bind does. This is temporary
- * occupancy, not a failed identity write, so automatic recovery keeps its
- * retry pending.
+ * An `onSpawned` hook reports, before it has persisted anything, that its
+ * just-spawned child is not proven to hold the listener: another process
+ * holds it, or the child cannot be read because it is already exiting, as one
+ * that cannot bind does. This is temporary occupancy, not a failed identity
+ * write, so automatic recovery keeps its retry pending.
  */
 export class WorkerdListenerOccupiedError extends Error {
   constructor() {
@@ -387,8 +387,9 @@ export function createWorkerdSupervisor(options: {
         await options.onSpawned?.(child);
       } catch (error) {
         // Occupancy is not a failed write. The catch below retires this exact
-        // child, so a recovery retry still waits for its exit and a vacant
-        // listener; a first start still schedules no retry.
+        // child, even one that is still alive but unreadable, so a recovery
+        // retry still waits for its exit and a vacant listener; a first start
+        // still schedules no retry.
         if (error instanceof WorkerdListenerOccupiedError) throw new WorkerdListenerOccupiedError();
         throw new ChildIdentityPersistenceError();
       }
