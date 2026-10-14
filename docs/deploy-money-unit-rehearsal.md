@@ -50,3 +50,7 @@ bun run deploy -- takoserver-d1-money-cutover-rehearsal --apply --environment=re
 ```
 
 If an import acknowledgement is unknown, the diagnostic marker is absent, or readback is partial/divergent, **do not retry apply**. Status reads the retained dispatch and current native state without sending another import; a dispatched phase remains quarantined. There is no D1 reset/delete, old-cents rollback or automatic target adoption. Record the native failure-probe and successful-conversion terminal receipts as rehearsal evidence for a separate independent review of the actual integration 0094 cutover. Local SQLite tests and source code alone do not prove native D1 `/import` atomicity.
+
+## 公開Workerの正規transition記録
+
+maintenance変数の追加・解除は通常authority-cutoverのclosure transitionとして行う。money ownerの公開receiptには実際の`takoserver.worker-closure-transition-apply@v1`を保存し、routine更新の`takoserver.worker-apply@v2`へ書き換えない。両形式とも同じauthority surface、review済みsource/artifact、native100%Version・module bytes・binding closureへの束縛を要求し、他のpublication kindは拒否する。
