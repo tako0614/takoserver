@@ -875,8 +875,9 @@ function deployHostedPricing(
     const pricing = parseHostedPricing(value);
     if (!pricing) throw new Error();
     assertHostedPricingMatchesBilling(pricing, target.billingConfig);
-    const usagePlan = pricing.hostedPlanTable.plans[2];
+    const usagePlan = pricing.hostedPlanTable.plans.find((plan) => plan.tier === "usage");
     if (
+      !usagePlan ||
       usagePlan.checkoutMinimumMinor !==
         (target.stripeSettings?.checkoutMinimumMinor ?? DEFAULT_CHECKOUT_MINIMUM_MINOR) ||
       usagePlan.checkoutMaximumMinor !==

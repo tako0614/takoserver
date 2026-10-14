@@ -1,3 +1,8 @@
+import {
+  compileSharedHostedPricing,
+  parseSharedHostedPricing,
+  SharedHostedPricingError,
+} from "../../src/shared-hosted-pricing.ts";
 import { parseStrictJson, StrictJsonError } from "../../src/strict-json.ts";
 import {
   compilePricingAuthoring,
@@ -47,6 +52,21 @@ export async function previewFile(path: string): Promise<string> {
       );
     }
     throw error;
+  }
+  if (
+    typeof input === "object" &&
+    input !== null &&
+    "schemaVersion" in input &&
+    input.schemaVersion === 2
+  ) {
+    try {
+      return `${JSON.stringify(compileSharedHostedPricing(parseSharedHostedPricing(input)), null, 2)}\n`;
+    } catch (error) {
+      if (error instanceof SharedHostedPricingError) {
+        throw new PricingAuthoringError("Shared hosted pricing configuration is invalid");
+      }
+      throw error;
+    }
   }
   return `${JSON.stringify(compilePricingAuthoring(input), null, 2)}\n`;
 }
