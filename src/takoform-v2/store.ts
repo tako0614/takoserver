@@ -80,7 +80,7 @@ export interface AcceptRecord {
   specJson: string;
   privateInputs?: V2SealedPrivateInputs;
   configuredPrivateInputs?: V2ConfiguredPrivateInputs;
-  expectedConfiguredPrivateInputs?: V2ConfiguredPrivateInputs;
+  expectedConfiguredPrivateInputs?: V2ConfiguredPrivateInputs | null;
 }
 
 const opInsert = `INSERT INTO tf_v2_operations
@@ -155,6 +155,26 @@ function privateWrites(record: AcceptRecord) {
 function configuredPrivateWrites(record: AcceptRecord) {
   const sealed = record.configuredPrivateInputs;
   if (!sealed) return [];
+  if (record.action === "update") {
+    return [
+      {
+        sql: `INSERT INTO tf_v2_operation_configured_private_inputs
+        (operation_id, resource_uid, generation, key_id, nonce, ciphertext)
+        SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (
+          SELECT 1 FROM tf_v2_operations WHERE id = ?)`,
+        params: [
+          record.id,
+          record.resourceUid,
+          record.generation,
+          sealed.keyId,
+          sealed.nonce,
+          sealed.ciphertext,
+          record.id,
+        ],
+      },
+    ];
+  }
+  if (record.action !== "create") throw new TypeError("invalid configured custody action");
   return [
     {
       sql: `INSERT INTO tf_v2_configured_private_inputs
@@ -353,11 +373,14 @@ export function createV2Store(sql: Sql) {
               ${serialize ? `AND NOT EXISTS (${pendingReferrersSql})` : ""}
               ${admission ? `AND (${admission.sql})` : ""}
               ${
-                record.expectedConfiguredPrivateInputs
-                  ? `AND EXISTS (
+                record.expectedConfiguredPrivateInputs === null
+                  ? `AND NOT EXISTS (
+                    SELECT 1 FROM tf_v2_configured_private_inputs WHERE resource_uid = ?)`
+                  : record.expectedConfiguredPrivateInputs
+                    ? `AND EXISTS (
                 SELECT 1 FROM tf_v2_configured_private_inputs
                 WHERE resource_uid = ? AND key_id = ? AND nonce = ? AND ciphertext = ?)`
-                  : ""
+                    : ""
               }`,
           params: [
             record.generation,
@@ -371,14 +394,16 @@ export function createV2Store(sql: Sql) {
             ...(record.action === "delete" ? [record.resourceUid] : []),
             ...(serialize ? [record.resourceUid] : []),
             ...(admission?.params ?? []),
-            ...(record.expectedConfiguredPrivateInputs
-              ? [
-                  record.resourceUid,
-                  record.expectedConfiguredPrivateInputs.keyId,
-                  record.expectedConfiguredPrivateInputs.nonce,
-                  record.expectedConfiguredPrivateInputs.ciphertext,
-                ]
-              : []),
+            ...(record.expectedConfiguredPrivateInputs === null
+              ? [record.resourceUid]
+              : record.expectedConfiguredPrivateInputs
+                ? [
+                    record.resourceUid,
+                    record.expectedConfiguredPrivateInputs.keyId,
+                    record.expectedConfiguredPrivateInputs.nonce,
+                    record.expectedConfiguredPrivateInputs.ciphertext,
+                  ]
+                : []),
           ],
         },
         {
@@ -392,6 +417,7 @@ export function createV2Store(sql: Sql) {
           ],
         },
         ...privateWrites(record),
+        ...configuredPrivateWrites(record),
         ...referenceWrites(record, referencesJson),
         ...(serialize
           ? [
