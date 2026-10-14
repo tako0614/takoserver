@@ -28,6 +28,16 @@ import {
  */
 export const SQLITE_CONTROL_BUSY_TIMEOUT_MS = 5_000;
 
+/** Set before migration: DELETE journals need their commit unlink fsynced too. */
+export function configureSelfhostControlDurability(database: Database): void {
+  database.exec(`PRAGMA busy_timeout = ${SQLITE_CONTROL_BUSY_TIMEOUT_MS}`);
+  database.exec("PRAGMA synchronous = EXTRA");
+  const configured = database.query("PRAGMA synchronous").get() as { synchronous?: unknown };
+  if (configured?.synchronous !== 3) {
+    throw new Error("self-host control database requires synchronous=EXTRA for crash durability");
+  }
+}
+
 export function createSqliteSql(database: Database): Sql {
   if (!database || typeof database.query !== "function") {
     throw new TypeError("a bun:sqlite Database is required");

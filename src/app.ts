@@ -1,4 +1,5 @@
 import type { AiGateway } from "./ai-port.ts";
+import { expirePendingAiRequests } from "./ai-requests.ts";
 import {
   type ArtifactConsumerProviderReader,
   createArtifactConsumerRepair,
@@ -880,6 +881,7 @@ export function buildApp(ports: AppPorts): App {
       });
       const expiredReservations = await reseller.expireDue(64);
       const expiredWalletHolds = await orgBilling?.expireDue(64);
+      await expirePendingAiRequests(ports.sql, clock, 64);
       const expiredRuntimeInputPreparations = await ports.runtimeInputs?.maintenance.expireDue(64);
       const store = inventory;
       const installed = ports.forms.map((form) => form.identity.formRef.schemaDigest);

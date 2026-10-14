@@ -194,6 +194,50 @@ any state:
 every backup and restore. `PORT` (default 8787) is the control API listener.
 The README lists the other optional settings.
 
+For automatic recovery after a machine reboot, explicitly select single-host
+custody with `TAKOSERVER_SINGLE_HOST='{"hostId":"my-stable-host-name"}'`. This
+is the operator's assertion that the data root, control database and runtime
+state stay on one physical machine. Use a stable name chosen by the operator;
+machine-id is only a cross-check, never takeover authority. A copied data root
+on another machine or a changed hostId is refused. Do not share or clone live
+state, and do not use network-backed overlay storage.
+
+Before opening writable control state, the Linux Bun entry acquires an
+exclusive, nonblocking kernel `flock` through `bun:ffi`. It keeps the private
+`.host.lock` inode permanently and holds its descriptor until process exit;
+SIGKILL and a machine reboot release the kernel lock without cleanup. A peer
+using another HTTP port is refused too. Every control database, including the
+default and an external `TAKOSERVER_DB`, has an additional permanent lock next
+to its canonical path, preventing two roots from opening the same database.
+Its parent directories must also obey the existing safe-ancestor rule. The private `.host-epoch.json` advances on
+each acquisition through fsync, atomic rename and a directory fsync, before
+any database migration or public listener. Never remove either custody file
+to bypass a refusal. Back up and restore the epoch with the data root.
+
+The selected profile accepts ext2/3/4, XFS, Btrfs, ZFS, F2FS and local overlay.
+Network filesystems (including NFS, CIFS, Ceph, 9p and FUSE), tmpfs and unknown
+filesystem types are refused. Existing private-directory requirements apply.
+Only a held, machine-cross-checked lease permits Actor and Worker ownership
+checks beneath that root to treat a previous boot's process as absent;
+same-boot namespace uncertainty and foreign listeners still refuse recovery.
+Without this explicit setting, existing conservative ownership checks apply.
+
+Install the service manager unit with `WantedBy=multi-user.target`, enable it,
+and use `Restart=on-failure` as in the security guide. The process cannot
+restart a powered-off machine; the service manager starts it after OS boot.
+Pending AI request holds expire at their durable 24-hour idempotency deadline.
+The settlement pass atomically records their ledger release and terminal
+request status, including calls left dispatched by a killed Host. It does
+not resend inference, release a staged billable result, or require a client
+retry. Retained terminal records prevent replay of the abandoned request.
+
+The Bun entry sets and verifies SQLite `synchronous=EXTRA` before migration
+and every writable open. With the default DELETE journal, this also syncs the
+directory after removing the commit journal. `FULL` alone can retain database
+integrity while losing the last committed transaction after power loss; an AI
+dispatch fence must remain durable too. Existing WAL databases use EXTRA's
+FULL-equivalent WAL durability. No journal-mode or schema migration is needed.
+
 The complete local Worker profile additionally needs all of these:
 
 | Setting | Value |

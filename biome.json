@@ -8,6 +8,7 @@
       "!!console/dist",
       "!!site/dist",
       "!!.git",
+      "!!.test-host-*",
       "!!openapi/takoserver.openapi.json",
       "!!worker-configuration.d.ts",
       "!!sponsorship-authority-worker-configuration.d.ts",

@@ -1,4 +1,5 @@
 import { readdir, readFile, readlink, stat } from "node:fs/promises";
+import { singleHostPreviousBootIsGone } from "./selfhost-single-host-lease.ts";
 
 // setpriv registers the kernel signal before this shell inspects its parent.
 // The shell then execs the accepted binary in the same PID. All paths and
@@ -84,9 +85,18 @@ export async function readLinuxProcessIdentity(pid: number): Promise<LinuxProces
 export async function linuxProcessLiveness(
   identity: LinuxProcessIdentity,
 ): Promise<LinuxProcessLiveness> {
+  return linuxProcessLivenessInSingleHost(identity);
+}
+
+/** A root-scoped, held kernel lease can prove previous-boot process absence. */
+export async function linuxProcessLivenessInSingleHost(
+  identity: LinuxProcessIdentity,
+  storageRoot?: string,
+): Promise<LinuxProcessLiveness> {
   if (process.platform !== "linux" || !identity || !validLinuxProcessIdentity(identity))
     return "unknown";
   try {
+    if (storageRoot && singleHostPreviousBootIsGone(identity.bootId, storageRoot)) return "stale";
     const [bootIdText, namespace] = await Promise.all([
       readFile("/proc/sys/kernel/random/boot_id", "utf8"),
       stat("/proc/self/ns/pid", { bigint: true }),

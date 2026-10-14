@@ -101,10 +101,14 @@ test("accepted Deployment create, update, replay and delete settle only through 
       },
     },
   });
-  const publicationState = createV2WorkerPublicationState({ sql, assetCustody: assets.custody });
+  let clockMs = Date.now();
+  const publicationState = createV2WorkerPublicationState({
+    sql,
+    assetCustody: assets.custody,
+    now: () => new Date(clockMs),
+  });
   let owner: WorkerdWorkerRuntimeOwner | undefined;
   let loseNextOwnerAcknowledgement = false;
-  let clockMs = Date.now();
   const children: ReturnType<typeof spawnWorkerdWithParentDeath>[] = [];
   const deploymentForm = createWorkerDeploymentForm({
     targetKey: TARGET_KEY,

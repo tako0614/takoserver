@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { canonicalJson } from "./json.ts";
 import {
   type LinuxProcessIdentity,
-  linuxProcessLiveness,
+  linuxProcessLivenessInSingleHost as linuxProcessLiveness,
   readLinuxProcessIdentity,
 } from "./workerd-linux-process.ts";
 
@@ -208,7 +208,7 @@ export async function acquireActorNativeLease(input: {
   } else {
     if (
       !sameScope(previous.value.scope, input.scope) ||
-      (await linuxProcessLiveness(previous.value.host)) !== "stale"
+      (await linuxProcessLiveness(previous.value.host, input.storageRoot)) !== "stale"
     )
       throw unavailable();
     const oldChild = await readRecord(child, childRecord);
@@ -216,7 +216,7 @@ export async function acquireActorNativeLease(input: {
       oldChild &&
       (!sameScope(oldChild.value.scope, input.scope) ||
         oldChild.value.nonce !== previous.value.nonce ||
-        (await linuxProcessLiveness(oldChild.value.child)) !== "stale")
+        (await linuxProcessLiveness(oldChild.value.child, input.storageRoot)) !== "stale")
     )
       throw unavailable();
     // One fixed hardlink pins the old inode. A peer cannot create another
@@ -234,11 +234,11 @@ export async function acquireActorNativeLease(input: {
       !sameInode(previous, current) ||
       current.links !== 2n ||
       !sameScope(current.value.scope, input.scope) ||
-      (await linuxProcessLiveness(current.value.host)) !== "stale" ||
+      (await linuxProcessLiveness(current.value.host, input.storageRoot)) !== "stale" ||
       (childAgain &&
         (!sameScope(childAgain.value.scope, input.scope) ||
           childAgain.value.nonce !== current.value.nonce ||
-          (await linuxProcessLiveness(childAgain.value.child)) !== "stale"))
+          (await linuxProcessLiveness(childAgain.value.child, input.storageRoot)) !== "stale"))
     )
       throw unavailable();
     // Keep the fixed claim if this transition has an unknown outcome. A
@@ -270,7 +270,7 @@ export async function acquireActorNativeLease(input: {
     if (oldChild) {
       if (
         oldChild.value.nonce !== previous.value.nonce ||
-        (await linuxProcessLiveness(oldChild.value.child)) !== "stale"
+        (await linuxProcessLiveness(oldChild.value.child, input.storageRoot)) !== "stale"
       )
         throw unavailable();
       await unlink(child);
@@ -286,7 +286,7 @@ export async function acquireActorNativeLease(input: {
   let released = false;
   return {
     async recordNative(identity) {
-      if ((await linuxProcessLiveness(host)) !== "live") throw unavailable();
+      if ((await linuxProcessLiveness(host, input.storageRoot)) !== "live") throw unavailable();
       const current = await readRecord(lock, ownerRecord);
       if (
         !current ||
@@ -300,7 +300,7 @@ export async function acquireActorNativeLease(input: {
         prior &&
         (prior.value.nonce !== record.nonce ||
           !sameScope(prior.value.scope, input.scope) ||
-          (await linuxProcessLiveness(prior.value.child)) !== "stale")
+          (await linuxProcessLiveness(prior.value.child, input.storageRoot)) !== "stale")
       )
         throw unavailable();
       const temporary = join(directory, `.actor-child-${randomUUID()}`);
@@ -350,7 +350,7 @@ export async function acquireActorNativeLease(input: {
         if (
           native &&
           (native.value.nonce !== record.nonce ||
-            (await linuxProcessLiveness(native.value.child)) !== "stale")
+            (await linuxProcessLiveness(native.value.child, input.storageRoot)) !== "stale")
         )
           throw unavailable();
         await rm(marker, { recursive: true, force: true });

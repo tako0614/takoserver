@@ -36,6 +36,7 @@ import {
   type V2QueueDispatchGrant,
 } from "./providers/selfhost-v2-queue-transport.ts";
 import type { V2SqliteBindingGrant } from "./providers/selfhost-v2-sqlite-binding-broker.ts";
+import { singleHostPreviousBootIsGone } from "./selfhost-single-host-lease.ts";
 import {
   openSelfhostV2ServiceBindingBroker,
   type SelfhostV2ServiceBindingTargetOwner,
@@ -79,7 +80,7 @@ import {
 } from "./takoform-v2/worker-static-publication.ts";
 import {
   type LinuxProcessIdentity,
-  linuxProcessLiveness,
+  linuxProcessLivenessInSingleHost as linuxProcessLiveness,
   readLinuxProcessIdentity,
   workerPortOwnership,
 } from "./workerd-linux-process.ts";
@@ -903,8 +904,10 @@ async function currentOwnerFingerprint(): Promise<OwnerProcessFingerprint | null
 async function processLiveness(
   pid: number,
   expected: OwnerProcessFingerprint | null,
+  directory: string,
 ): Promise<ProcessLiveness> {
   if (expected === null) return "unknown";
+  if (singleHostPreviousBootIsGone(expected.bootId, directory)) return "stale";
   const namespace = await stat("/proc/self/ns/pid", { bigint: true }).catch(() => null);
   if (!namespace || `${namespace.dev}:${namespace.ino}` !== expected.pidNamespace) return "unknown";
   let currentBootId: string | null = null;
@@ -1265,13 +1268,13 @@ async function cleanStaleRecoveryClaims(directory: string): Promise<number> {
     if (count > 64) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     const parsed = parseRecoveryClaimName(name);
     if (!parsed) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
-    if ((await processLiveness(parsed.pid, parsed.fingerprint)) !== "stale") continue;
+    if ((await processLiveness(parsed.pid, parsed.fingerprint, directory)) !== "stale") continue;
     const path = join(directory, name);
     const stat = await lstat(path, { bigint: true }).catch(() => null);
     if (stat === null) continue;
     if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077n) !== 0n)
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
-    if ((await processLiveness(parsed.pid, parsed.fingerprint)) !== "stale") continue;
+    if ((await processLiveness(parsed.pid, parsed.fingerprint, directory)) !== "stale") continue;
     await unlink(path).catch(() => {
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     });
@@ -1320,6 +1323,7 @@ async function createOwnerLock(path: string, directory: string): Promise<OpenedO
 
 async function requireSafeStateForNewOwner(
   snapshot: OwnerStateSnapshot,
+  directory: string,
   allowDeleteReplayOnly: boolean,
   allowProcessRecovery = false,
 ): Promise<void> {
@@ -1328,7 +1332,7 @@ async function requireSafeStateForNewOwner(
       // An earlier boot already abandoned these candidates (possibly killed
       // before it finished their retirement). This is not a DELETE replay:
       // nothing was ever activated, so nothing can be serving.
-      await requireNeverActivatedChildrenGone(snapshot.state);
+      await requireNeverActivatedChildrenGone(snapshot.state, directory);
       await requireVacantOwnerListeners(snapshot.state);
       return;
     }
@@ -1342,14 +1346,14 @@ async function requireSafeStateForNewOwner(
     return;
   }
   if (allowProcessRecovery && neverServedResidue(snapshot.state)) {
-    await requireStaleIncarnationChildrenAndVacantListeners(snapshot.state);
+    await requireStaleIncarnationChildrenAndVacantListeners(snapshot.state, directory);
     await requireVacantOwnerListeners(snapshot.state);
     return;
   }
   if (!allowProcessRecovery || !recoverableIncarnationSet(snapshot.state)) {
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   }
-  await requireStaleIncarnationChildrenAndVacantListeners(snapshot.state);
+  await requireStaleIncarnationChildrenAndVacantListeners(snapshot.state, directory);
 }
 
 /**
@@ -1451,13 +1455,16 @@ function neverActivatedResidue(state: PersistedOwnerState): boolean {
 }
 
 /** A never-activated record without a retirement receipt needs its own child-death proof. */
-async function requireNeverActivatedChildrenGone(state: PersistedOwnerState): Promise<void> {
+async function requireNeverActivatedChildrenGone(
+  state: PersistedOwnerState,
+  directory: string,
+): Promise<void> {
   for (const record of state.incarnations) {
     if (record.status === "retired") continue;
     if (
       !neverActivatedRetirement(record) ||
       !record.processIdentity ||
-      (await linuxProcessLiveness(record.processIdentity)) !== "stale"
+      (await linuxProcessLiveness(record.processIdentity, directory)) !== "stale"
     )
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
   }
@@ -1499,6 +1506,7 @@ function recoverableIncarnationSet(state: PersistedOwnerState): boolean {
 
 async function requireStaleIncarnationChildrenAndVacantListeners(
   state: PersistedOwnerState,
+  directory: string,
 ): Promise<void> {
   const ports = new Set<number>();
   for (const record of state.incarnations) {
@@ -1511,7 +1519,7 @@ async function requireStaleIncarnationChildrenAndVacantListeners(
       continue;
     if (
       !record.processIdentity ||
-      (await linuxProcessLiveness(record.processIdentity)) !== "stale" ||
+      (await linuxProcessLiveness(record.processIdentity, directory)) !== "stale" ||
       ports.has(record.listenerPort)
     ) {
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
@@ -1593,16 +1601,20 @@ async function acquireOwnerLock(
     if (previous === null) {
       if (remainingClaims !== 0) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       const snapshot = await readOwnerStateSnapshot(statePath, workerResourceUid);
-      await requireSafeStateForNewOwner(snapshot, false, snapshot.state.suspended);
+      await requireSafeStateForNewOwner(snapshot, directory, false, snapshot.state.suspended);
       const created = await createOwnerLock(lockPath, directory);
       if (created) return created;
       continue;
     }
 
-    const priorLiveness = await processLiveness(previous.record.pid, previous.record.process);
+    const priorLiveness = await processLiveness(
+      previous.record.pid,
+      previous.record.process,
+      directory,
+    );
     if (priorLiveness !== "stale") throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     const stateSnapshot = await readOwnerStateSnapshot(statePath, workerResourceUid);
-    await requireSafeStateForNewOwner(stateSnapshot, true, true);
+    await requireSafeStateForNewOwner(stateSnapshot, directory, true, true);
     const fingerprint = await currentOwnerFingerprint();
     if (!fingerprint) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     const claimPath = join(directory, recoveryClaimName(fingerprint, randomUUID()));
@@ -1624,12 +1636,13 @@ async function acquireOwnerLock(
       if (pinnedIdentity.links !== 2n) continue;
       if (
         pinned.record.ownerId !== previous.record.ownerId ||
-        (await processLiveness(previous.record.pid, previous.record.process)) !== "stale" ||
+        (await processLiveness(previous.record.pid, previous.record.process, directory)) !==
+          "stale" ||
         !(await sameOwnerStateSnapshot(statePath, workerResourceUid, stateSnapshot))
       ) {
         throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       }
-      await requireSafeStateForNewOwner(stateSnapshot, true, true);
+      await requireSafeStateForNewOwner(stateSnapshot, directory, true, true);
       const finalLock = await readOwnerLock(lockPath);
       const finalClaim = await lstat(claimPath, { bigint: true }).catch(() => null);
       if (
@@ -1638,7 +1651,8 @@ async function acquireOwnerLock(
         !sameOwnerFile(previous.identity, finalLock.identity) ||
         !sameOwnerFile(previous.identity, ownerFileIdentity(finalClaim)) ||
         finalLock.identity.links !== 2n ||
-        (await processLiveness(previous.record.pid, previous.record.process)) !== "stale" ||
+        (await processLiveness(previous.record.pid, previous.record.process, directory)) !==
+          "stale" ||
         !(await sameOwnerStateSnapshot(statePath, workerResourceUid, stateSnapshot))
       ) {
         continue;
@@ -2669,7 +2683,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       // before taking any decision, then durably record the retirement intent
       // under the candidate's own Operation ID (exactly what an in-process
       // candidate failure records). The physical retirement is finished below.
-      await requireStaleIncarnationChildrenAndVacantListeners(state);
+      await requireStaleIncarnationChildrenAndVacantListeners(state, directory);
       const abandoning = state;
       const converted: PersistedOwnerState = {
         ...abandoning,
@@ -2711,7 +2725,8 @@ export async function openWorkerdWorkerRuntimeOwner(
     ) {
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     }
-    if (hasServingIncarnations) await requireStaleIncarnationChildrenAndVacantListeners(state);
+    if (hasServingIncarnations)
+      await requireStaleIncarnationChildrenAndVacantListeners(state, directory);
   } catch (error) {
     if (ownerLock.recoveredFromStaleOwner) await retainOwnerLockAfterFailure(ownerLock);
     else await releaseOwnerLock(lockPath, directory, ownerLock).catch(() => undefined);
@@ -2744,7 +2759,10 @@ export async function openWorkerdWorkerRuntimeOwner(
     record: IncarnationRecord,
     successorIdentity?: LinuxProcessIdentity,
   ): Promise<void> => {
-    if (!record.processIdentity || (await linuxProcessLiveness(record.processIdentity)) !== "stale")
+    if (
+      !record.processIdentity ||
+      (await linuxProcessLiveness(record.processIdentity, directory)) !== "stale"
+    )
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     const listener = await workerPortOwnership(record.listenerPort, undefined);
     if (listener !== "vacant") {
@@ -2782,7 +2800,7 @@ export async function openWorkerdWorkerRuntimeOwner(
   const persistPhysicalAbsences = async (suspended: boolean): Promise<void> => {
     if (!recoverableIncarnationSet(state))
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
-    await requireStaleIncarnationChildrenAndVacantListeners(state);
+    await requireStaleIncarnationChildrenAndVacantListeners(state, directory);
     const nextAbsences = [...state.physicalAbsences];
     for (const record of state.incarnations) {
       if (
@@ -2815,7 +2833,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     if (record.processIdentity === null || record.retirementOperationId === null)
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     if (
-      (await linuxProcessLiveness(record.processIdentity)) !== "stale" ||
+      (await linuxProcessLiveness(record.processIdentity, directory)) !== "stale" ||
       (await workerPortOwnership(record.listenerPort, undefined)) !== "vacant"
     )
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
@@ -3098,7 +3116,8 @@ export async function openWorkerdWorkerRuntimeOwner(
           // candidate the same way).
           if (
             !incarnation.record.processIdentity ||
-            (await linuxProcessLiveness(incarnation.record.processIdentity)) !== "stale" ||
+            (await linuxProcessLiveness(incarnation.record.processIdentity, directory)) !==
+              "stale" ||
             (await workerPortOwnership(incarnation.record.listenerPort, undefined)) !== "vacant"
           )
             throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
@@ -3470,7 +3489,7 @@ export async function openWorkerdWorkerRuntimeOwner(
   ): Promise<boolean> => {
     const record = recordFor(operationId);
     if (!record?.processIdentity || !child.exited) return false;
-    if ((await linuxProcessLiveness(record.processIdentity)) !== "stale") return false;
+    if ((await linuxProcessLiveness(record.processIdentity, directory)) !== "stale") return false;
     await workerPortOwnership(record.listenerPort, undefined);
     return true;
   };
@@ -3673,7 +3692,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       (record.status !== "draining" && record.status !== "retiring") ||
       !record.retirementOperationId ||
       !record.processIdentity ||
-      (await linuxProcessLiveness(record.processIdentity)) !== "stale" ||
+      (await linuxProcessLiveness(record.processIdentity, directory)) !== "stale" ||
       (await workerPortOwnership(record.listenerPort, undefined)) !== "vacant"
     ) {
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
@@ -4596,11 +4615,12 @@ export async function openWorkerdWorkerRuntimeOwner(
           scriptName(target.workerResourceUid),
           captured.identity,
         )) !== "matches" ||
-        (await linuxProcessLiveness(processIdentity).catch(() => "unknown")) !== "live" ||
+        (await linuxProcessLiveness(processIdentity, directory).catch(() => "unknown")) !==
+          "live" ||
         (await workerPortOwnership(record.listenerPort, processIdentity.pid).catch(
           () => "foreign",
         )) !== "owned" ||
-        (await linuxProcessLiveness(processIdentity).catch(() => "unknown")) !== "live"
+        (await linuxProcessLiveness(processIdentity, directory).catch(() => "unknown")) !== "live"
       )
         return null;
       const native = await readWorkerdActiveActorGraph(
@@ -4637,11 +4657,13 @@ export async function openWorkerdWorkerRuntimeOwner(
           scriptName(target.workerResourceUid),
           captured.identity,
         )) === "matches" &&
-        (await linuxProcessLiveness(processIdentity).catch(() => "unknown")) === "live" &&
+        (await linuxProcessLiveness(processIdentity, directory).catch(() => "unknown")) ===
+          "live" &&
         (await workerPortOwnership(current.record.listenerPort, processIdentity.pid).catch(
           () => "foreign",
         )) === "owned" &&
-        (await linuxProcessLiveness(processIdentity).catch(() => "unknown")) === "live" &&
+        (await linuxProcessLiveness(processIdentity, directory).catch(() => "unknown")) ===
+          "live" &&
         canonicalJson(current.incarnation.actorForward?.actorForwardSockets() ?? []) ===
           canonicalJson(graph.actorForwardSockets) &&
         currentOwner() !== null
@@ -4929,7 +4951,8 @@ export async function openWorkerdWorkerRuntimeOwner(
         !copies.versionUids.includes(version.uid) ||
         (await current.incarnation.runtime.observeExactPublication?.(script, captured.identity)) !==
           "matches" ||
-        (await linuxProcessLiveness(processIdentity).catch(() => "unknown")) !== "live" ||
+        (await linuxProcessLiveness(processIdentity, directory).catch(() => "unknown")) !==
+          "live" ||
         (await workerPortOwnership(current.record.listenerPort, processIdentity.pid).catch(
           () => "foreign",
         )) !== "owned"
@@ -5139,11 +5162,11 @@ export async function openWorkerdWorkerRuntimeOwner(
       const config = await readPinnedGroupConfiguration(record).catch(() => null);
       if (!config) return unknown;
       if (
-        (await linuxProcessLiveness(record.processIdentity)) !== "live" ||
+        (await linuxProcessLiveness(record.processIdentity, directory)) !== "live" ||
         (await workerPortOwnership(record.listenerPort, record.processIdentity.pid).catch(
           () => "foreign",
         )) !== "owned" ||
-        (await linuxProcessLiveness(record.processIdentity)) !== "live"
+        (await linuxProcessLiveness(record.processIdentity, directory)) !== "live"
       ) {
         return unknown;
       }
@@ -5283,7 +5306,7 @@ export async function openWorkerdWorkerRuntimeOwner(
           item.incarnationId === input.incarnationId &&
           item.operationId === input.servingSourceOperationId,
       );
-      if (!receipt || (await linuxProcessLiveness(receipt.processIdentity)) !== "stale")
+      if (!receipt || (await linuxProcessLiveness(receipt.processIdentity, directory)) !== "stale")
         return unknown;
       return {
         kind: "confirmed_absent",
@@ -5997,7 +6020,7 @@ export async function openWorkerdWorkerRuntimeOwner(
             scriptName(requested.workerUid),
             identity,
           )) !== "matches" ||
-          (await linuxProcessLiveness(processIdentity)) !== "live" ||
+          (await linuxProcessLiveness(processIdentity, directory)) !== "live" ||
           (await workerPortOwnership(record.listenerPort, processIdentity.pid).catch(
             () => "foreign",
           )) !== "owned" ||
@@ -6040,7 +6063,7 @@ export async function openWorkerdWorkerRuntimeOwner(
                 scriptName(requested.workerUid),
                 identity,
               )) === "matches" &&
-              (await linuxProcessLiveness(processIdentity)) === "live" &&
+              (await linuxProcessLiveness(processIdentity, directory)) === "live" &&
               (await workerPortOwnership(record.listenerPort, processIdentity.pid).catch(
                 () => "foreign",
               )) === "owned" &&

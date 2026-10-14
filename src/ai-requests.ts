@@ -1,8 +1,107 @@
 import { canonicalJson, isJsonObject, type JsonObject } from "./json.ts";
+import { prepareLedgerMicrosHoldRelease } from "./ledger.ts";
 import { minorToMicros } from "./money.ts";
 import type { Clock, Sql } from "./ports.ts";
 
 const RETENTION_MS = 24 * 60 * 60 * 1_000;
+
+/** Expired pending calls cannot be retried or billed; return their exact hold. */
+export async function expirePendingAiRequests(
+  sql: Sql,
+  clock: Clock,
+  limit: number,
+): Promise<number> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)
+    throw new RangeError("invalid AI expiry limit");
+  const now = clock().getTime();
+  const rows = await sql.query(
+    `SELECT scope_key, fingerprint, status, body_json, expires_at FROM idempotency
+     WHERE scope_key LIKE 'ai:%' AND status IN (100, 101, 102) AND expires_at <= ?
+     ORDER BY expires_at, scope_key LIMIT ?`,
+    [now, limit],
+  );
+  let expired = 0;
+  for (const row of rows) {
+    if (
+      typeof row.scope_key !== "string" ||
+      typeof row.fingerprint !== "string" ||
+      typeof row.body_json !== "string"
+    ) {
+      throw new AiRequestStoreError("state_unavailable");
+    }
+    const record = parseRecord(Number(row.status), row.body_json);
+    if (record.kind !== "pending") throw new AiRequestStoreError("state_conflict");
+    try {
+      const holds = await sql.query(
+        `SELECT org_id, held_delta_micros FROM ledger WHERE type = 'hold' AND ref = ?
+       AND substr(?, 1, length(org_id) + 4) = 'ai:' || org_id || ':'`,
+        [record.requestId, row.scope_key],
+      );
+      if (
+        holds.length > 1 ||
+        (holds.length === 0 && record.phase !== "claimed" && record.ceilingMicros > 0)
+      ) {
+        throw new AiRequestStoreError("state_unavailable");
+      }
+      const hold = holds[0];
+      if (
+        hold &&
+        (typeof hold.org_id !== "string" || hold.held_delta_micros !== record.ceilingMicros)
+      ) {
+        throw new AiRequestStoreError("state_conflict");
+      }
+      const release = hold
+        ? await prepareLedgerMicrosHoldRelease(sql, clock, {
+            organizationId: String(hold.org_id),
+            reference: record.requestId,
+            amountMicros: record.ceilingMicros,
+          })
+        : [];
+      const guardId = `ai_expiry_${crypto.randomUUID()}`;
+      const terminal: AiRejectedRequest = {
+        kind: "rejected",
+        phase: "completed",
+        responseStatus: 410,
+        responseBody: {
+          error: { code: "request_expired", message: "Request expired", type: "request_error" },
+          request_id: record.requestId,
+        },
+      };
+      await sql.batch([
+        {
+          sql: `INSERT INTO wallet_allocation_guards (id, valid) VALUES (?, CASE WHEN EXISTS (
+            SELECT 1 FROM idempotency WHERE scope_key = ? AND fingerprint = ? AND status = ?
+            AND body_json = ? AND expires_at = ? AND expires_at <= ?) THEN 1 ELSE 0 END)`,
+          params: [
+            guardId,
+            row.scope_key,
+            row.fingerprint,
+            Number(row.status),
+            row.body_json,
+            Number(row.expires_at),
+            now,
+          ],
+        },
+        ...release,
+        {
+          sql: "UPDATE idempotency SET status = 410, body_json = ? WHERE scope_key = ?",
+          params: [canonicalJson(terminal), row.scope_key],
+        },
+        { sql: "DELETE FROM wallet_allocation_guards WHERE id = ?", params: [guardId] },
+      ]);
+      expired += 1;
+    } catch (error) {
+      const current = await sql.query(
+        "SELECT status, body_json FROM idempotency WHERE scope_key = ?",
+        [row.scope_key],
+      );
+      // A completion or another expiry won the transaction. Never release a
+      // staged result's hold: it has exact billable usage awaiting settlement.
+      if (current[0]?.status === row.status && current[0]?.body_json === row.body_json) throw error;
+    }
+  }
+  return expired;
+}
 
 export interface AiPendingRequest {
   readonly kind: "pending";

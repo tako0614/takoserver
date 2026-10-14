@@ -256,6 +256,27 @@ export async function prepareLedgerHoldRelease(
   };
 }
 
+/** Micros participant for the AI request owner's atomic expiry transaction. */
+export async function prepareLedgerMicrosHoldRelease(
+  sql: Sql,
+  clock: Clock,
+  input: {
+    readonly organizationId: string;
+    readonly reference: string;
+    readonly amountMicros: number;
+  },
+): Promise<readonly SqlStatement[]> {
+  positiveAmount(input.amountMicros);
+  return planHoldSettlement(
+    sql,
+    clock,
+    input.organizationId,
+    "release",
+    input.reference,
+    input.amountMicros,
+  );
+}
+
 export function createLedger(
   sql: Sql,
   clock: Clock,

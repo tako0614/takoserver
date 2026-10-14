@@ -114,6 +114,10 @@ import { createSelfhostPublicArtifactSource } from "./selfhost-public-artifact-s
 import { createSelfhostQueuePump } from "./selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "./selfhost-scheduler.ts";
 import {
+  acquireSingleHostLease,
+  parseSingleHostConfiguration,
+} from "./selfhost-single-host-lease.ts";
+import {
   selfhostImplicitActorRuntime,
   selfhostPrivateSocketRoot,
 } from "./selfhost-socket-layout.ts";
@@ -147,7 +151,11 @@ import {
   type SelfhostV2WorkerEndpointBoot,
 } from "./selfhost-v2-worker-endpoint-boot.ts";
 import { ensureSigningKey } from "./signing-key.ts";
-import { createSqliteSql, SQLITE_CONTROL_BUSY_TIMEOUT_MS } from "./sql-sqlite.ts";
+import {
+  configureSelfhostControlDurability,
+  createSqliteSql,
+  SQLITE_CONTROL_BUSY_TIMEOUT_MS,
+} from "./sql-sqlite.ts";
 import {
   createSelfhostCronOwnerReader,
   createStandaloneProviderComposition,
@@ -272,7 +280,11 @@ const forceOperatorAssertionPrint = parseSelfhostOperatorAssertionPrint(
  * and the Actor, Workflow and private-plane owners accept nothing else.
  */
 const configuredDataRoot = process.env[SELFHOST_DATA_ROOT_VARIABLE];
+const singleHostId = parseSingleHostConfiguration(process.env.TAKOSERVER_SINGLE_HOST);
 const dataRoot = resolveSelfhostDataRoot(configuredDataRoot);
+if (singleHostId && dataRoot === SELFHOST_MEMORY_DATA_ROOT) {
+  throw new Error("TAKOSERVER_SINGLE_HOST requires a durable filesystem data root");
+}
 if (dataRoot !== (configuredDataRoot ?? SELFHOST_DEFAULT_DATA_ROOT)) {
   process.stdout.write(
     `${SELFHOST_DATA_ROOT_VARIABLE} ${configuredDataRoot === undefined ? `(default ${SELFHOST_DEFAULT_DATA_ROOT})` : JSON.stringify(configuredDataRoot)} resolved to ${dataRoot}\n`,
@@ -454,13 +466,30 @@ const selfhostContainer = createSelfhostContainerBootstrap({
 
 if (databasePath !== ":memory:") mkdirSync(dirname(databasePath), { recursive: true });
 
+const singleHostLease =
+  singleHostId === undefined
+    ? undefined
+    : acquireSingleHostLease({
+        dataRoot: durableRoot,
+        hostId: singleHostId,
+        databasePath,
+      });
+if (singleHostLease) {
+  // Keep the kernel descriptor until process exit, including failed shutdown.
+  process.on("exit", () => singleHostLease.release());
+  console.log(
+    `single-host lease acquired epoch=${singleHostLease.epoch} boot_id=${singleHostLease.bootId}`,
+  );
+}
+
 // The Bun control plane always uses local SQLite. Shared D1 is not accepted
 // here because its HTTP API cannot provide the atomic batch capability the app
 // requires; the guard above runs before this database is opened or migrated.
 const controlDatabase = new Database(databasePath);
 // Before migration, which is the first writer: an operator's `sqlite3` or a
 // backup tool reading this file must delay a Host write, not fail it.
-controlDatabase.exec(`PRAGMA busy_timeout = ${SQLITE_CONTROL_BUSY_TIMEOUT_MS}`);
+configureSelfhostControlDurability(controlDatabase);
+console.log("self-host control database synchronous=EXTRA (commit directory sync)");
 // A self-hosted deployment starts with an empty file, so it is brought up
 // to this build's schema here. Forward only and recorded, so running it
 // again applies nothing and a database from a newer build is refused
