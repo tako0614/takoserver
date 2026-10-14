@@ -1,6 +1,8 @@
-# Hosted billing API specification proposal
+# Hosted billing API specification
 
-Status: proposed extension; source baseline `376afb5caecaf9b25da0e49b296cdfb714748bb2`.
+Status: specification and source implementation; staging acceptance pending.
+The original proposal used baseline `376afb5caecaf9b25da0e49b296cdfb714748bb2`.
+The implementation preserves #342's subsequent subscription custody contract.
 Target: API specification review by 2026-10-17, staging APIs/webhooks by
 2026-10-22, real Stripe test-mode acceptance by 2026-10-25, for the
 2026-11-15 shared Hosted launch. These dates do not establish deployed readiness.
@@ -22,24 +24,31 @@ The historical cents proposal is not the new settlement authority.
 | Pricing publication | Existing authoring/compiler and immutable tariff registration | Reviewed publication/readback using the same revision authority |
 | Webhooks | `POST /v1/payments/stripe/webhook` | Reuse invoice/subscription/Checkout/refund settlement and reconciliation |
 
-All extensions below remain proposals until the owning runtime and generated
-OpenAPI change together. Existing routes and shapes are defined by the
+Runtime and generated OpenAPI now contain the canonical extension; entry
+activation, complete CI, implementation QA and staging acceptance remain
+separate requirements. Routes and shapes are defined by the
 [route table](../src/route-table.ts), [control boundary](../src/control.ts),
-and [generated OpenAPI](../openapi/takoserver.openapi.json).
+and [generated OpenAPI](../openapi/takoserver.openapi.json). The
+[implementation guide](subscriptions-refunds.md) describes actual receipt and
+availability behavior. Unavailable future payment modes below are design
+requirements, not implemented capabilities.
 
 [#343](https://github.com/tako0614/takoserver/pull/343), head
 `8c0ff298a1ab560f2a66c93a341e2d7fb8c6b67a`, owns the subscription table's
-three/four-row OpenAPI correction and regression. Consume that reviewed change;
-this proposal neither copies it nor introduces a second subscription API.
+three/four-row OpenAPI correction and regression. The genuine #342 dependency
+already contains the legacy three-row/current four-row bounds. Preserve that
+contract and coordinate #343 without duplicating its patch or introducing a
+second subscription API.
 The runtime v2 table has Free, two monthly choices and usage; legacy v1 has
 three rows. Four rows still represent three commercial roles.
 
 ## Ownership and authentication
 
 Takoserver owns Organization identity, billing authorization, the sole balance,
-pricing receipts and Stripe settlement. Takosumi Hosted owns its local user,
-Workspace membership, product access and immutable mapping to an Organization
-and a random opaque `workspaceRef`. It calls the authenticated API server-side.
+pricing receipts and Stripe settlement. Accounts owns common identity; Control
+owns Workspaces, membership and the set-once billing binding. Takosumi Hosted
+owns its product access and a projection of that binding with a random opaque
+`workspaceRef`. It calls the authenticated API server-side.
 Neither a client-supplied billing subject nor an email proves Organization
 ownership. Shared login design does not grant cross-product authorization.
 
@@ -64,8 +73,8 @@ Hosted commercial defaults merely by running Takoserver OSS.
 
 Authenticate and check the exact Organization/scope before looking up billing
 objects or parsing the command body. Scopes do not imply other scopes.
-Current top-up is owner-session-only; accepting `payments:write` is an explicit
-extension. Personal creation does not accept an arbitrary principal ID, API
+Legacy top-up is owner-session-only; the canonical reference-based extension
+also accepts `payments:write`. Personal creation does not accept an arbitrary principal ID, API
 key impersonation, Hosted session or caller-selected owner. A future delegated
 account bootstrap requires its own reviewed account contract.
 
@@ -208,11 +217,14 @@ route. Concurrent settlement tests must prove pages sum to the frozen totals.
 GET preserves `{subscription: <projection or null>, planTable: <existing table>}`.
 Existing projection fields are `organizationId`, `subscriptionId`, `planKey`,
 `pricingRevision`, `status`, `cancelAtPeriodEnd`, `periodStart`, `periodEnd`,
-`paidThrough`, `paidFeatures`, and `updatedAt`. Return provider fields only
+`paidThrough`, `paidFeatures`, `updatedAt` and the opaque `subscriptionRef`. Return provider fields only
 where the existing public contract already admits them; never expose secrets.
 
-POST preserves `{reference, planKey}` and 201 `{checkout: {url}}`. Begin a
-monthly subscription Checkout using the bound customer and frozen revision.
+POST accepts `{reference, planKey}` with #342's durable `checkout` receipt:
+`201` for an open Checkout, `202` for an unknown pending outcome and `200` for
+an associated or expired original Checkout. An open receipt includes its
+`state`, `id` and `url`; an associated receipt carries `subscriptionRef`.
+Begin a monthly subscription Checkout using the bound customer and frozen revision.
 There is at most one unresolved subscription start per Org. All processor commands below use a durable per-step receipt, immutable
 parameters and a stable processor idempotency key: customer creation,
 subscription start, schedule create/update/release, cancellation and on-demand
@@ -224,15 +236,24 @@ from Checkout creation/return or a subscription-mode Checkout event; only the
 verified paid invoice funds included credit. Free requires no Stripe customer
 or card. A paid plan needs a valid payment method through Checkout.
 
-PATCH keeps `{reference, cancelAtPeriodEnd: true|false}` and adds the exclusive
-variant `{reference, planKey}`. Reject combined actions and unknown keys with
-400. A plan change schedules the configured price at the next recurring period
+PATCH accepts `{reference, cancelAtPeriodEnd: true, expectedSubscriptionRef}`
+or the exclusive variant `{reference, planKey, expectedSubscriptionRef}`.
+The opaque target comes from the verified subscription read; a changed target
+is refused before a processor effect. `false` cancellation, combined actions
+and unknown keys are rejected with 400. A plan change schedules the configured price at the next recurring period
 boundary, without proration, immediate cash charge or another current-period
 grant. Use a processor subscription schedule or equivalent proven next-period
 mechanism; an immediate update with no proration is insufficient proof of
-next-period price activation. Return 200 `{subscription, pendingChange}`;
-`pendingChange` is null or `{planKey, pricingRevision, effectiveAt}`. Extend GET
-with the same optional field; existing fields remain compatible.
+next-period price activation. Return `202 {planChange: <pending receipt>}` or
+`200 {planChange: <verified receipt>}`. The verified receipt contains
+`subscriptionRef` and `pendingChange`; its exact fields are owned by OpenAPI.
+Cancellation returns its separate pending/verified `cancellation` receipt.
+GET includes `pendingChange` when the phase adapter is composed. Qualified
+Hosted GET also includes `billingCapabilities` with
+`contractVersion: "hosted-billing-v1"` and booleans for `topUps`,
+`subscriptionStart`, `subscriptionCancellation` and `subscriptionPlanChange`.
+Missing/false capabilities do not authorize a command. The existing usage
+plan row supplies the authoritative Checkout minimum and maximum.
 
 Freeze the selected future revision/Price and effective boundary in the durable
 command. The future processor phase must set `planKey` and `pricingRevision`
@@ -248,7 +269,7 @@ schedule while preserving the subscription, then sets period-end cancellation
 after authoritative readback. Never cancel the schedule to remove a pending
 change: that can immediately cancel the underlying subscription. Persist and
 recover each step of the release/cancel saga; a plan change while cancellation
-is scheduled returns 409 until a separate acknowledged withdrawal. Serialize
+is scheduled returns 409. Reversing cancellation is not implemented. Serialize
 commands per Org and return the committed original command result on replay.
 At renewal verify the actual invoice/Price and grant that period's selected
 included credit exactly once. Failed renewal grants no new allowance.
@@ -276,9 +297,9 @@ requires readback/reconciliation, never a fresh reference to guess success.
 Retain local command receipts beyond Stripe's key retention. An unknown outcome
 older than the existing 23-hour safety cutoff requires operator reconciliation;
 never blindly retry an effect after the remote idempotency guarantee expires.
-A pending/result lookup through proposed
+A pending/result lookup through
 `GET .../wallet/checkout/{reference}` (`wallet:read`) returns
-`{reference, state: "pending" | "ready" | "paid" | "expired", checkout: <url or null>}`.
+`{reference, state: "pending" | "ready" | "paid" | "expired", checkout: {url} | null}`.
 This read is not permission to settle funds. Definitively invalid arguments
 make no command; uncertain remote responses keep the existing receipt.
 
@@ -290,7 +311,7 @@ Separate test-mode receipts from live or connected-account objects.
 
 ## Idempotent personal Organization
 
-Proposed `POST /v1/organizations/personal` is session-only and accepts an empty
+`POST /v1/organizations/personal` is session-only and accepts an empty
 JSON object. Derive owner identity and initial display name server-side from the
 local principal; reject unknown keys. First creation returns 201
 `{organization: <existing Organization>, created: true}`; later/concurrent calls
@@ -358,7 +379,8 @@ reviewed consent terms. PATCH accepts
 safe integer cents and must meet separately disclosed bounds. Reject extra
 fields; replay/conflict rules match other payment commands. Consent revisions
 identify the exact displayed charge/cap terms. Authorize and record the owner
-or delegated payment principal. Modes that lack runtime capability return 409
+or delegated payment principal. Modes that lack runtime capability return
+`503 billing_unavailable`
 without persisting an active policy or charging money. Changing cap/mode does
 not cancel existing remote effects; serialize outstanding exposure and never
 lower a cap below paid/reserved exposure.
@@ -468,13 +490,15 @@ exact owner explicitly establishes disposal authority.
 
 Use the existing error envelope/status taxonomy. 400 is invalid shape/range,
 401/403 authentication/authority, 402 insufficient eligible prepaid credit,
-409 conflicting replay/pending command/unsupported policy/expired snapshot,
+409 conflicting replay/pending command/expired snapshot,
 and 503 unavailable schema/revision/maintenance or transient processor failure.
-Map new machine reasons into the owning taxonomy during coordinated
-implementation; this proposal does not claim unregistered codes already exist.
+Unavailable policy modes use `503 billing_unavailable`. Extension refusals
+use the registered owning error taxonomy; native adapter reason strings do
+not become unregistered public error codes.
 Money refusals do not encourage automatic retries with a new reference.
 
-1. Review this specification and consume #343's contract correction.
+1. Review the current implementation and preserve the genuine subscription
+   custody/table contract while coordinating #343.
 2. Coordinate protected OpenAPI/classification files before public changes.
    Extend existing modules and use separate focused tests; do not modify
    unrelated Container/actor/workerd/WfP/deployment implementations.
@@ -498,21 +522,22 @@ or delete history to make a rollback appear safe.
 | --- | --- |
 | Wire/auth | Existing shapes/scopes, #343 three/four rows, foreign Org/Workspace refusal, payment scope separation, no personal principal injection |
 | Personal Org | Concurrent and lost-ACK creation returns one Org/membership/mapping; no duplicate free grant; ambiguous existing mapping refuses |
-| Subscription | Real TEST start and paid invoice, next-period tier change, renewal failure, cancel/withdraw and duplicate/unordered event replay; no proration/double grant |
+| Subscription | Real TEST start and paid invoice, next-period tier change, renewal failure, schedule release followed by cancellation, unsupported cancellation reversal refusal and duplicate/unordered event replay; no proration/double grant |
 | Top-up | Same-ref URL/readback, changed-ref payload conflict, lost remote ACK, key-age refusal, paid face-value funding and late settlement policy |
 | Accounting | 1-micro debit, overflow/unit protection, many Workspaces/one allowance, one invoice ceiling, no repeat prepaid invoice charge |
 | Holds/refunds | Exact TTL boundary/restart, capture bound/remainder, tombstone, concurrency, source expiry and held/used/expired partial/full refunds |
 | Workspace summary | Explicit attribution, historical bucket, late periods, snapshot totals across pages/concurrent settlement, expired snapshot refusal |
-| Limits/warnings | Default stop, consented prepaid, supported on-demand cap/SCA/unknown effects, rejected unavailable postpaid, delivered 80/95 warning uniqueness |
+| Limits/warnings | Default stop, consented prepaid, rejected unavailable on-demand/postpaid, durable 80/95 warning uniqueness and separately qualified delivery |
 | Price publication | Immutable/historical rates, TEST Price readback, effective-time segmentation, missing Container hook fails closed |
 | Staging consumers | Scoped server HTTP from both products, source/revision readback, real-user free journey without card, no second retail writer |
 
 Blocking inputs remain coordinated changes to the protected contract paths,
 QA exact-head approval, qualified staging schema, TEST Price/webhook/client
 bindings and actual product integration evidence. Container activation awaits
-its owner-supplied diff. Postpaid activation and on-demand consent/cap/quantum
+its owner-supplied measurement/attribution closure; the supplied four tariff
+rows are now in the source revision. Postpaid activation and on-demand consent/cap/quantum
 configuration require explicit owner qualification; unsupported modes stay
-unavailable. Warning transport and durable snapshot realization need review.
+unavailable. Warning transport and staging snapshot readback remain unqualified.
 These dependencies are not implied by a passing local source gate.
 
 Further owning references: [micros ledger/cutover](org-billing-micros.md),
