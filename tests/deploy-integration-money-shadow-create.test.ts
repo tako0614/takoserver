@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   type IntegrationMoneyShadowCreateDeclaration,
@@ -27,7 +28,7 @@ function fixture(): {
   calls: string[];
   run: (command: readonly string[]) => Promise<CommandResult>;
 } {
-  const root = mkdtempSync("/dev/shm/t/money-shadow-create-");
+  const root = mkdtempSync(join(tmpdir(), "money-shadow-create-"));
   const custodyDirectory = join(root, "custody");
   mkdirSync(custodyDirectory, { mode: 0o700 });
   const stageOriginReceiptPath = join(root, "stage-origin.json");
