@@ -45,6 +45,7 @@ import {
 import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
 import { assertStripeBillingSchema } from "./stripe-billing.ts";
+import { assertStripeModeRealm, parseStripeMode } from "./stripe-mode-realm.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { createTakoformStore } from "./takoform/store.ts";
 import { parseTakoformV2ApplicationConfig } from "./takoform-v2/config.ts";
@@ -95,7 +96,9 @@ export interface WorkerEnv {
   readonly TAKOSERVER_CONSOLE_ORIGIN?: string;
   /** Versioned JSON Organization billing tariff; absent disables the new wallet API. */
   readonly TAKOSERVER_BILLING_CONFIG?: string;
-  /** Explicit hosted-only pricing authoring JSON; subscriptions require Stripe test mode. */
+  /** Explicit deployment-wide financial realm; absent means TEST. */
+  readonly TAKOSERVER_STRIPE_MODE?: string;
+  /** Explicit hosted-only pricing JSON; its native Price must match the selected Stripe realm. */
   readonly TAKOSERVER_HOSTED_PRICING?: string;
   /** Public half of the operator key, as an Ed25519 JWK. */
   readonly OPERATOR_PUBLIC_JWK?: string;
@@ -185,6 +188,7 @@ export function workerCredentials(
     | "TAKOS_ID_CLIENT_ID"
     | "GOOGLE_CLIENT_ID"
     | "STRIPE_SECRET_KEY"
+    | "TAKOSERVER_STRIPE_MODE"
     | "TAKOSERVER_STRIPE_CHECKOUT_ENABLED"
     | "STRIPE_WEBHOOK_SECRET"
     | "TAKOSERVER_STRIPE_WEBHOOK_ENABLED"
@@ -214,6 +218,7 @@ export function workerCredentials(
   });
   const payment = resolvePayment({
     hostedPricing: parseHostedPricing(env.TAKOSERVER_HOSTED_PRICING),
+    stripeMode: parseStripeMode(env.TAKOSERVER_STRIPE_MODE),
     stripeSecretKey:
       env.TAKOSERVER_STRIPE_CHECKOUT_ENABLED === "1" ? env.STRIPE_SECRET_KEY : undefined,
     // Like Checkout, a lingering secret alone never exposes the webhook.
@@ -883,6 +888,16 @@ async function composeApp(
     throw new WorkerStartupError(
       "runtime-configuration",
       new TypeError("Worker requires the complete 0094 USD-micros D1 schema and money-unit policy"),
+    );
+  }
+  try {
+    // D1 activation is an operator-qualified transition. Serving code only
+    // reads its immutable pin; it never claims a realm on behalf of D1.
+    await assertStripeModeRealm(sql, parseStripeMode(env.TAKOSERVER_STRIPE_MODE));
+  } catch {
+    throw new WorkerStartupError(
+      "runtime-configuration",
+      new TypeError("Worker requires the qualified 0098 Stripe realm pin"),
     );
   }
   const signingKey = await loadSigningKey(

@@ -9,6 +9,7 @@ import {
   type PaymentEvents,
 } from "./payment-events.ts";
 import type { Clock, Sql } from "./ports.ts";
+import { assertStripeModeRealm, type StripeMode } from "./stripe-mode-realm.ts";
 import {
   type CheckoutSession,
   type CheckoutSessionFunding,
@@ -215,6 +216,7 @@ export function parseStripeEventEnvelope(payload: Uint8Array): StripeEventEnvelo
 export interface StripeEventHandlerContext {
   readonly client: StripeClient;
   readonly currency: "USD";
+  readonly mode: StripeMode;
   readonly credit: FundingCredit;
 }
 
@@ -249,12 +251,13 @@ export const creditCheckoutSessionEvent: StripeEventHandler = async (event, cont
 
 async function creditSession(
   session: CheckoutSession,
-  context: Pick<StripeEventHandlerContext, "currency" | "credit">,
+  context: Pick<StripeEventHandlerContext, "currency" | "mode" | "credit">,
 ): Promise<StripeEventHandling> {
   let funding: CheckoutSessionFunding;
   try {
     funding = checkoutSessionFunding(session, {
       currency: context.currency,
+      mode: context.mode,
       requireHostMarker: true,
     });
   } catch (error) {
@@ -306,6 +309,7 @@ export const STRIPE_DEFERRED_EVENT_TYPES: ReadonlySet<string> = Object.freeze(
 
 export interface StripeEventsOptions {
   readonly client: StripeClient;
+  readonly mode?: StripeMode;
   readonly currency?: "USD";
   /** Absent: notifications are not received, and only the reconcile pass runs. */
   readonly webhook?: {
@@ -324,11 +328,13 @@ export function createStripeEvents(
   context: PaymentEventContext,
 ): PaymentEvents {
   const currency = options.currency ?? "USD";
+  const mode = options.mode ?? "test";
   const handlers = options.handlers ?? STRIPE_EVENT_HANDLERS;
   const deferredTypes = options.deferredTypes ?? STRIPE_DEFERRED_EVENT_TYPES;
   const handlerContext: StripeEventHandlerContext = {
     client: options.client,
     currency,
+    mode,
     credit: context.credit,
   };
   const ledger = createStripeEventLedger(context.sql, context.clock);
@@ -374,6 +380,12 @@ export function createStripeEvents(
               throw error;
             }
             const event = parseStripeEventEnvelope(payload);
+            // An event from the other financial realm must not occupy this
+            // deployment's globally keyed event id, even as a terminal ignore.
+            if (event.livemode !== (mode === "live")) {
+              throw new PaymentEventError("malformed_event");
+            }
+            await assertStripeModeRealm(context.sql, mode);
             const settled = await ledger.settled(event.id);
             const nowHandled =
               settled !== null &&
@@ -409,6 +421,7 @@ export function createStripeEvents(
       : {}),
 
     async reconcile(): Promise<FundingReconcileReport> {
+      await assertStripeModeRealm(context.sql, mode);
       const cutoff = Math.floor(context.clock().getTime() / 1_000) - lookbackSeconds;
       let examined = 0;
       let credited = 0;
@@ -452,7 +465,9 @@ export function createStripeEvents(
           }
           examined += 1;
           try {
-            fundable.push(checkoutSessionFunding(session, { currency, requireHostMarker: true }));
+            fundable.push(
+              checkoutSessionFunding(session, { currency, mode, requireHostMarker: true }),
+            );
           } catch (error) {
             if (!(error instanceof StripeSettlementError)) throw error;
             skipped[error.code] = (skipped[error.code] ?? 0) + 1;

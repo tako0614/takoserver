@@ -1,3 +1,4 @@
+import type { StripeMode } from "./stripe-mode-realm.ts";
 import { STRIPE_API_VERSION } from "./stripe-settlement.ts";
 
 const STRIPE_API = "https://api.stripe.com/v1";
@@ -35,13 +36,15 @@ export type StripeBillingClientErrorCode =
   | "invalid_configuration"
   | "invalid_object"
   | "unavailable"
-  | "test_mode_required";
+  | "test_mode_required"
+  | "wrong_mode";
 
 const ERROR_MESSAGES: Readonly<Record<StripeBillingClientErrorCode, string>> = {
   invalid_configuration: "Invalid Stripe billing client configuration",
   invalid_object: "Invalid Stripe billing object",
   unavailable: "Stripe billing service is unavailable",
   test_mode_required: "Stripe test mode is required",
+  wrong_mode: "Stripe object does not match the configured mode",
 };
 
 export class StripeBillingClientError extends Error {
@@ -68,6 +71,8 @@ export interface StripeBillingClient {
       readonly limit?: number;
     },
   ): Promise<StripeBillingPage>;
+  /** Complete only when hasMore is false; callers must reject extra lines. */
+  sessionLineItems(sessionId: string): Promise<StripeBillingPage>;
   post(
     kind: StripeBillingPostKind,
     input: {
@@ -80,6 +85,7 @@ export interface StripeBillingClient {
 
 export interface StripeBillingClientOptions {
   readonly secretKey: string;
+  readonly mode?: StripeMode;
   readonly fetch?: (request: Request) => Promise<Response>;
 }
 
@@ -113,7 +119,7 @@ function validateId(kind: string, id: string): void {
   }
 }
 
-function asObject(value: unknown, kind: string): StripeBillingObject {
+function asObject(value: unknown, kind: string, mode: StripeMode): StripeBillingObject {
   if (
     typeof value !== "object" ||
     value === null ||
@@ -123,12 +129,44 @@ function asObject(value: unknown, kind: string): StripeBillingObject {
     return invalidObject();
   }
   const object = value as StripeBillingObject;
-  if (object.livemode === true) throw new StripeBillingClientError("test_mode_required");
-  if (kind !== "refunds" && object.livemode !== false) {
+  const expectedLivemode = mode === "live";
+  if (object.livemode !== undefined && typeof object.livemode !== "boolean") {
     return invalidObject();
   }
-  if (kind === "refunds" && object.livemode !== undefined && object.livemode !== false)
+  if (kind !== "refunds" && typeof object.livemode !== "boolean") {
     return invalidObject();
+  }
+  if (object.livemode !== undefined && object.livemode !== expectedLivemode) {
+    throw new StripeBillingClientError(mode === "test" ? "test_mode_required" : "wrong_mode");
+  }
+  if (
+    kind === "checkout/sessions" &&
+    typeof object.payment_intent === "object" &&
+    object.payment_intent !== null
+  ) {
+    const intent = asObject(object.payment_intent, "payment_intents", mode);
+    if (typeof intent.latest_charge === "object" && intent.latest_charge !== null) {
+      asObject(intent.latest_charge, "charges", mode);
+    }
+  }
+  if (kind === "events") {
+    const eventData = object.data;
+    if (typeof eventData === "object" && eventData !== null && !Array.isArray(eventData)) {
+      const eventObject = (eventData as Record<string, unknown>).object;
+      if (
+        typeof eventObject === "object" &&
+        eventObject !== null &&
+        !Array.isArray(eventObject) &&
+        !(
+          (eventObject as Record<string, unknown>).object === "refund" &&
+          (eventObject as Record<string, unknown>).livemode === undefined
+        ) &&
+        (eventObject as Record<string, unknown>).livemode !== expectedLivemode
+      ) {
+        throw new StripeBillingClientError(mode === "test" ? "test_mode_required" : "wrong_mode");
+      }
+    }
+  }
   return object;
 }
 
@@ -199,10 +237,15 @@ function formRecord(form: Readonly<Record<string, string>>): Record<string, stri
 export function createStripeBillingClient(
   options: StripeBillingClientOptions,
 ): StripeBillingClient {
+  const mode = options.mode ?? "test";
+  if (mode !== "test" && mode !== "live") {
+    throw new StripeBillingClientError("invalid_configuration");
+  }
+  const keyPrefix = mode === "live" ? /^(?:sk|rk)_live_/u : /^(?:sk|rk)_test_/u;
   if (
     typeof options.secretKey !== "string" ||
-    !(options.secretKey.startsWith("sk_test_") || options.secretKey.startsWith("rk_test_")) ||
-    options.secretKey.length <= "sk_test_".length
+    !keyPrefix.test(options.secretKey) ||
+    options.secretKey.length <= options.secretKey.indexOf("_") + 6
   ) {
     throw new StripeBillingClientError("invalid_configuration");
   }
@@ -262,7 +305,7 @@ export function createStripeBillingClient(
         notFoundIsNull: true,
       });
       if (result === null) return null;
-      const object = asObject(result, kind);
+      const object = asObject(result, kind, mode);
       if (object.id !== id) return invalidObject();
       return object;
     },
@@ -294,13 +337,39 @@ export function createStripeBillingClient(
         return invalidObject();
       }
       const data = raw.data.map((item) => {
-        const object = asObject(item, kind);
+        const object = asObject(item, kind, mode);
         validateId(kind, object.id);
         return object;
       });
       return { data, hasMore: raw.has_more };
     },
 
+    async sessionLineItems(sessionId) {
+      validateId("checkout/sessions", sessionId);
+      // Two items are enough to disprove the only supported one-line shape.
+      // The dedicated endpoint is complete when has_more is false; the
+      // includable Session field contains only a first handful.
+      const raw = record(
+        await request(
+          "GET",
+          `/checkout/sessions/${encodeURIComponent(sessionId)}/line_items?limit=2`,
+        ),
+      );
+      if (
+        !Array.isArray(raw.data) ||
+        raw.data.length > 2 ||
+        typeof raw.has_more !== "boolean" ||
+        (raw.has_more && raw.data.length === 0)
+      )
+        return invalidObject();
+      const data = raw.data.map((item) => {
+        const line = record(item);
+        if (typeof line.id !== "string" || !/^li_[A-Za-z0-9_]{1,240}$/u.test(line.id))
+          return invalidObject();
+        return line as StripeBillingObject;
+      });
+      return { data, hasMore: raw.has_more };
+    },
     async post(kind, input) {
       if (
         typeof input.idempotencyKey !== "string" ||
@@ -320,6 +389,7 @@ export function createStripeBillingClient(
           },
         ),
         kind,
+        mode,
       );
       validateId(kind, object.id);
       if (input.id !== undefined && object.id !== input.id) return invalidObject();

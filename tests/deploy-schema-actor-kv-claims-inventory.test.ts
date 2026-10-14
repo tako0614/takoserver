@@ -10,7 +10,7 @@ import {
 
 const MIGRATION = "0066_cloudflare_managed_actor_kv_capability_claims.sql";
 const MICROS_MIGRATION = "0094_wallet_usd_micros.sql";
-const CURRENT_SOURCE_TAIL = "0095_stripe_billing.sql";
+const CURRENT_SOURCE_TAIL = "0098_stripe_mode_realm.sql";
 const ROOT = mkdtempSync(
   join(process.env.TMPDIR ?? "/tmp", "takoserver-actor-kv-schema-inventory-"),
 );
@@ -60,10 +60,13 @@ test("the current source closure projects to an explicit 0066 apply artifact", (
     digest: "sha256:e32149261d1025e4fa375c944fb4299ab3bc140fade37832f8e0d3a394f96b6e",
   });
   // New source is audited without changing any frozen apply-qualified prefix.
-  expect(source.names).toHaveLength(95);
+  expect(source.names).toHaveLength(98);
   expect(source.names.slice(92)).toEqual([
     "0093_wallet_credit_classification_proofs.sql",
     MICROS_MIGRATION,
+    "0095_stripe_billing.sql",
+    "0096_subscription_checkout_custody.sql",
+    "0097_subscription_cancellation_custody.sql",
     CURRENT_SOURCE_TAIL,
   ]);
   expect(source.files[92]).toMatchObject({
@@ -75,8 +78,12 @@ test("the current source closure projects to an explicit 0066 apply artifact", (
     digest: "sha256:7ce85b52626f6cbef6e06484e9cddb5052fab76f9718fea279108e2db6da8e44",
   });
   expect(source.files[94]).toMatchObject({
-    name: CURRENT_SOURCE_TAIL,
+    name: "0095_stripe_billing.sql",
     digest: "sha256:54f27fccaaa1d624505b333cf21ee0e7d59a798830a3c083b16065fa8f65a826",
+  });
+  expect(source.files[97]).toMatchObject({
+    name: CURRENT_SOURCE_TAIL,
+    digest: "sha256:5865ae1809dad2887b7786ebc5a372266521826ecbf8c2f59c308d211f08272f",
   });
   expect(artifact.names).toHaveLength(66);
   expect(artifact.names.at(-1)).toBe(MIGRATION);
@@ -119,12 +126,12 @@ test("the current source closure projects to an explicit 0066 apply artifact", (
     cpSync(resolve(import.meta.dir, "../migrations"), directory, { recursive: true });
     if (drift === "missing") rmSync(join(directory, CURRENT_SOURCE_TAIL));
     else
-      writeFileSync(join(directory, "0096_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
+      writeFileSync(join(directory, "0099_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
     expect(() => readCurrentAuditedMigrationSourceArtifact(directory)).toThrow(
-      "audited migration lineage must contain exactly 0001-0095",
+      "audited migration lineage must contain exactly 0001-0098",
     );
     expect(() => readAuditedMigrationArtifact(directory)).toThrow(
-      "audited migration lineage must contain exactly 0001-0095",
+      "audited migration lineage must contain exactly 0001-0098",
     );
   }
 });

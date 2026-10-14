@@ -11,12 +11,13 @@ const clock = () => new Date(start);
 
 async function fixture() {
   const db = new Database(":memory:");
+  const billingMigration = await Bun.file(
+    new URL("../migrations/0095_stripe_billing.sql", import.meta.url),
+  ).text();
   for (const migration of MIGRATIONS) {
-    if (migration.name !== "0095_stripe_billing.sql") db.exec(migration.sql);
+    // Exercise the on-disk billing SQL in its canonical dependency position.
+    db.exec(migration.name === "0095_stripe_billing.sql" ? billingMigration : migration.sql);
   }
-  // Exercise the migration source even while another agent regenerates the
-  // embedded schema from this file.
-  db.exec(await Bun.file(new URL("../migrations/0095_stripe_billing.sql", import.meta.url)).text());
   const sql = createSqliteSql(db);
   const ledger = createLedger(sql, clock);
   const store = createStripeBillingStore({ sql, clock });

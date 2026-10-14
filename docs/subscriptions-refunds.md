@@ -1,4 +1,4 @@
-# Hosted subscriptions and refunds in Stripe test mode
+# Hosted subscriptions and refunds
 
 This is the implementation guide for the monthly invoice and refund handlers
 specified in [unified-billing.md](unified-billing.md). It builds on #330's Organization wallet with integer USD micros and free →
@@ -28,12 +28,12 @@ and usage tariffs are required in activated configuration. Both products receive
 from `GET /v1/organizations/{organizationId}/payments/subscription`.
 
 Hosted pricing is optional. Its presence requires a matching billing config,
-a Stripe **test** key, and the complete additive **0095** schema after #330's
-0093 classification proofs and 0094 micros cutover. Staging schema qualification and
-application are owned by operator session `04360c33`.
-Live keys, live objects and connected-account events are refused. No default
-commercial price is selected. Source migrations and generated SQLite schema
-ship here; D1 qualification/application and deployment remain separate work.
+a Stripe key matching the explicit deployment-wide `test` or `live` mode,
+and the complete additive **0095–0098** source schema after the separately
+qualified 0093 classification proofs and 0094 micros cutover. The immutable
+[Stripe realm pin](stripe-mode-realm.md) must agree with the key and native
+objects; connected-account events are refused. No default commercial price
+is selected. D1 qualification/application and deployment remain separate work.
 The feature does not activate on a self-host instance without hosted config.
 
 `POST /payments/subscription` requires `payments:write` or an owner session and
@@ -44,12 +44,16 @@ allowed per Organization. Reuse the reference after a lost response. After
 because Stripe may expire its idempotency key after 24 hours. An authoritative
 expired Checkout or a completed, canceled subscription permits a new reference.
 
-`PATCH /payments/subscription` accepts `{reference, cancelAtPeriodEnd}` with the
-same write authority. It schedules/withdraws end-of-period cancellation without
-proration. The version 2 table has USD 10 and USD 50 subscription tiers. A plan/price
+`PATCH /payments/subscription` accepts
+`{reference, cancelAtPeriodEnd: true, expectedSubscriptionRef}` with the same
+write authority. The opaque expected target comes from `GET`; a changed target
+is refused before any processor effect. Cancellation is scheduled for Stripe's
+verified period end without proration. The version 2 table has USD 10 and USD 50 subscription tiers. A plan/price
 rollout is explicit configuration and processor work, never a caller-supplied
 amount. Checkout selects the requested plan ID; invoices select their pinned
-plan ID and grant only its immutable allowance. `GET` requires `wallet:read` and reports status and verified paid-through
+plan ID and grant only its immutable allowance. The $10 and $50 prices carry
+$20 and $100 monthly included credit respectively; Free credit does not stack
+during paid coverage. `GET` requires `wallet:read` and reports status and verified paid-through
 coverage; an `active` status alone does not enable paid features.
 Coverage is derived from committed grants and refunds on every read; a delayed
 subscription projection cannot restore a fully refunded period. Refund debt
@@ -116,7 +120,7 @@ rotation. Safe object IDs and machine reasons identify operator repair, while
 one failed object does not hold later pages behind it. A
 handler-version receipt marks historical events only after settlement. Past
 Stripe's event retention window, the stored authenticated object identity is
-re-fetched with the deployment's test key and revalidated against account/mode,
+re-fetched with the deployment's mode-matched key and revalidated against account/mode,
 customer binding, purpose and pinned tariff. Unavailable or ambiguous original
 objects remain unresolved. Logs/report expose
 unresolved/truncated counts, which prevent declaring reconciliation complete.
@@ -126,7 +130,7 @@ streams. Deterministic source conflicts remain deferred for operator repair.
 Object-level receipts survive event-row loss and repeated scans. Transient
 processor failures retain retryable delivery state and lot fences.
 
-**STAGING PENDING (0092 → #330 0093/0094 → 0095, schema owner 04360c33).** This change has no
+**STAGING PENDING (0092 → qualified 0093/0094 → 0095–0098).** This change has no
 production/staging deployment, D1 application, configuration or credential
 mutation. Local fixtures and the local D1 migration gate verify source only.
 After merged #330 and infra qualifies/applies the schema, a staging run must exercise recurring paid
