@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "id": "unique-local-v6-uppercase",
+  "description": "Equivalent IPv6 representations retain the blocked-address verdict",
+  "coverage": ["blocked-ipv6"],
+  "initialUsage": {
+    "tenant-a": {
+      "activeConnections": 0,
+      "bandwidthUsedBytes": 0,
+      "egressBytes": 0
+    },
+    "tenant-b": {
+      "activeConnections": 3,
+      "bandwidthUsedBytes": 700,
+      "egressBytes": 9000
+    }
+  },
+  "steps": [
+    {
+      "policy": {
+        "killSwitch": false,
+        "tenants": {
+          "tenant-a": {
+            "outboundInternet": true,
+            "maxConnections": 4,
+            "bandwidthLimitBytes": 1024
+          },
+          "tenant-b": {
+            "outboundInternet": true,
+            "maxConnections": 5,
+            "bandwidthLimitBytes": 2048
+          }
+        }
+      },
+      "request": {
+        "tenantId": "tenant-a",
+        "operation": "open",
+        "destinationIp": "FD12:3456:789A:0000:0000:0000:0000:0001",
+        "destinationPort": 443,
+        "transport": "tcp",
+        "bytes": 0
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "blocked_address",
+        "billableEgressBytes": 0,
+        "usage": {
+          "tenant-a": {
+            "activeConnections": 0,
+            "bandwidthUsedBytes": 0,
+            "egressBytes": 0
+          },
+          "tenant-b": {
+            "activeConnections": 3,
+            "bandwidthUsedBytes": 700,
+            "egressBytes": 9000
+          }
+        }
+      }
+    }
+  ]
+}

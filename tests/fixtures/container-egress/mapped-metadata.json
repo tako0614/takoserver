@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "id": "mapped-metadata",
+  "description": "IPv4-mapped IPv6 cannot bypass the embedded IPv4 blocked range",
+  "coverage": ["blocked-ipv4", "blocked-ipv6"],
+  "initialUsage": {
+    "tenant-a": {
+      "activeConnections": 0,
+      "bandwidthUsedBytes": 0,
+      "egressBytes": 0
+    },
+    "tenant-b": {
+      "activeConnections": 3,
+      "bandwidthUsedBytes": 700,
+      "egressBytes": 9000
+    }
+  },
+  "steps": [
+    {
+      "policy": {
+        "killSwitch": false,
+        "tenants": {
+          "tenant-a": {
+            "outboundInternet": true,
+            "maxConnections": 4,
+            "bandwidthLimitBytes": 1024
+          },
+          "tenant-b": {
+            "outboundInternet": true,
+            "maxConnections": 5,
+            "bandwidthLimitBytes": 2048
+          }
+        }
+      },
+      "request": {
+        "tenantId": "tenant-a",
+        "operation": "open",
+        "destinationIp": "::ffff:169.254.169.254",
+        "destinationPort": 443,
+        "transport": "tcp",
+        "bytes": 0
+      },
+      "expected": {
+        "allowed": false,
+        "reason": "blocked_address",
+        "billableEgressBytes": 0,
+        "usage": {
+          "tenant-a": {
+            "activeConnections": 0,
+            "bandwidthUsedBytes": 0,
+            "egressBytes": 0
+          },
+          "tenant-b": {
+            "activeConnections": 3,
+            "bandwidthUsedBytes": 700,
+            "egressBytes": 9000
+          }
+        }
+      }
+    }
+  ]
+}
