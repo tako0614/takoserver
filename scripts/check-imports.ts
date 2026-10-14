@@ -52,6 +52,12 @@ interface Layer {
 }
 
 const LAYERS: readonly Layer[] = [
+  {
+    // Candidate SQL grants use portable Form/reference evidence, never Docker.
+    name: "v2-container-binding-authority",
+    match: /^src\/takoform-v2\/container-binding-authority\.ts$/u,
+    may: ["core", "v2-form"],
+  },
   // v2 shares neutral primitives, not the v1 package/admission domain. The
   // Queue and Durable Workflow Resource/Operation managers are exposed as
   // source-extension factories, but this does not register them in the normal
@@ -498,7 +504,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "core",
     match:
-      /^src\/(?:ports|json|strict-json|artifact-path|cron|selfhost-socket-layout|error-envelope|route-table|request-lifetime|public-host-identity|form-ref|interface-ref|actor-abi-ref|standard-service-port|worker-class-runtime-port|worker-module-inspection-contract|worker-invocation-port|queue-v2-batch-custody-contract|queue-v2-sqlite-contract|queue-v2-sqlite-physical-fence|workflow-v2-resource-authority|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
+      /^src\/(?:ports|json|strict-json|container-contract|container-http|artifact-path|cron|selfhost-socket-layout|error-envelope|route-table|request-lifetime|public-host-identity|form-ref|interface-ref|actor-abi-ref|standard-service-port|worker-class-runtime-port|worker-module-inspection-contract|worker-invocation-port|queue-v2-batch-custody-contract|queue-v2-sqlite-contract|queue-v2-sqlite-physical-fence|workflow-v2-resource-authority|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
     // Frozen published data sits below every layer: it is bytes a release
     // pinned, not a decision any layer here may make. The wire error taxonomy
     // this Host answers by is exactly that.

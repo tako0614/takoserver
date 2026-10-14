@@ -132,6 +132,34 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
 
   type Desired = Awaited<ReturnType<typeof desired>>;
 
+  /** The image reference names one manifest, never a mutable tag or an index. */
+  async function verifyImage(target: Desired): Promise<string> {
+    const response = await engine("GET", `/images/${encodeURIComponent(target.input.image)}/json`);
+    if (response.status !== 200) throw new DockerHttpRevisionError("unavailable");
+    let image: unknown;
+    try {
+      image = JSON.parse(response.body);
+    } catch {
+      throw new DockerHttpRevisionError("unavailable");
+    }
+    const digest = target.input.image.slice(target.input.image.lastIndexOf("@") + 1);
+    if (
+      !isJsonObject(image) ||
+      typeof image.Id !== "string" ||
+      !/^sha256:[a-f0-9]{64}$/u.test(image.Id) ||
+      image.Os !== "linux" ||
+      image.Architecture !== "amd64" ||
+      !isJsonObject(image.Descriptor) ||
+      image.Descriptor.digest !== digest ||
+      ![
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.docker.distribution.manifest.v2+json",
+      ].includes(String(image.Descriptor.mediaType))
+    )
+      throw new DockerHttpRevisionError("conflict");
+    return image.Id;
+  }
+
   async function inspect(target: Desired): Promise<JsonObject | null> {
     const response = await engine("GET", `/containers/${target.name}/json`);
     if (response.status === 404) return null;
@@ -154,6 +182,7 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
       Object.entries(target.labels).some(([key, label]) => labels[key] !== label)
     )
       throw new DockerHttpRevisionError("conflict");
+    if (value.Image !== (await verifyImage(target))) throw new DockerHttpRevisionError("conflict");
     const hostConfig = value.HostConfig;
     const expectedHostConfig = target.body.HostConfig;
     if (
@@ -244,7 +273,7 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
         await requireOwnedInternalNetwork();
         const pull = await engine(
           "POST",
-          `/images/create?fromImage=${encodeURIComponent(target.input.image)}`,
+          `/images/create?fromImage=${encodeURIComponent(target.input.image)}&platform=linux%2Famd64`,
         );
         if (pull.status !== 200) throw new DockerHttpRevisionError("unavailable");
         for (const line of pull.body.split("\n")) {
@@ -263,7 +292,12 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
             throw new DockerHttpRevisionError("unavailable");
           }
         }
-        const created = await engine("POST", `/containers/create?name=${target.name}`, target.body);
+        await verifyImage(target);
+        const created = await engine(
+          "POST",
+          `/containers/create?name=${target.name}&platform=linux%2Famd64`,
+          target.body,
+        );
         if (created.status !== 201 && created.status !== 409) {
           throw new DockerHttpRevisionError("unavailable");
         }
@@ -299,7 +333,7 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
       if (expectedNativeId !== undefined && current.Id !== expectedNativeId) {
         throw new DockerHttpRevisionError("conflict");
       }
-      const stopped = await engine("POST", `/containers/${current.Id}/stop?t=10`);
+      const stopped = await engine("POST", `/containers/${current.Id}/stop?t=0`);
       if (![204, 304, 404].includes(stopped.status))
         throw new DockerHttpRevisionError("unavailable");
       const removed = await engine("DELETE", `/containers/${current.Id}?v=true`);

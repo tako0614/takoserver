@@ -326,6 +326,19 @@ function dockerFixture() {
     if (method === "GET" && url.pathname === "/networks/host-test-net") {
       return { status: 200, body: JSON.stringify(network) };
     }
+    if (method === "GET" && url.pathname.startsWith("/images/") && url.pathname.endsWith("/json")) {
+      const image = decodeURIComponent(url.pathname.slice(8, -5));
+      const digest = image.slice(image.lastIndexOf("@") + 1);
+      return {
+        status: 200,
+        body: JSON.stringify({
+          Id: digest,
+          Os: "linux",
+          Architecture: "amd64",
+          Descriptor: { digest, mediaType: "application/vnd.oci.image.manifest.v1+json" },
+        }),
+      };
+    }
     if (url.pathname === "/images/create") {
       return { status: 200, body: `${JSON.stringify({ status: "done" })}\n` };
     }
@@ -338,6 +351,7 @@ function dockerFixture() {
       const Id = (++sequence).toString(16).padStart(64, "0");
       containers.set(name, {
         Id,
+        Image: String(body.Image).split("@")[1]!,
         Config: {
           Image: body.Image,
           Labels: body.Labels,

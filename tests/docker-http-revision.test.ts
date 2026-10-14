@@ -38,6 +38,19 @@ function engineFixture() {
     if (method === "GET" && url.pathname === "/networks/installation-net") {
       return { status: 200, body: JSON.stringify(network) };
     }
+    if (method === "GET" && url.pathname.startsWith("/images/") && url.pathname.endsWith("/json")) {
+      const image = decodeURIComponent(url.pathname.slice(8, -5));
+      const digest = image.slice(image.lastIndexOf("@") + 1);
+      return {
+        status: 200,
+        body: JSON.stringify({
+          Id: digest,
+          Os: "linux",
+          Architecture: "amd64",
+          Descriptor: { digest, mediaType: "application/vnd.oci.image.manifest.v1+json" },
+        }),
+      };
+    }
     if (url.pathname === "/images/create") return { status: 200, body: '{"status":"done"}\n' };
     if (url.pathname === "/containers/create" && body) {
       const name = url.searchParams.get("name");
@@ -48,6 +61,7 @@ function engineFixture() {
       const Id = (++sequence).toString(16).padStart(64, "0");
       containers.set(name, {
         Id,
+        Image: String(body.Image).split("@")[1]!,
         Config: {
           Image: body.Image,
           Labels: body.Labels,
@@ -313,7 +327,7 @@ test("Docker HTTP retirement never follows a replacement appearing after inspect
   const retiring = createDockerHttpRevisionRuntime({
     ...fixture.options,
     engine: async (method, path, body) => {
-      if (method === "POST" && path === `/containers/${first.nativeId}/stop?t=10`) {
+      if (method === "POST" && path === `/containers/${first.nativeId}/stop?t=0`) {
         const [name, original] = [...fixture.containers.entries()][0] ?? [];
         if (!name || !original) throw new Error("Missing native container");
         fixture.containers.set(name, { ...original, Id: replacementId });
@@ -448,4 +462,36 @@ test("Docker HTTP revision pull errors cannot create a container or leak daemon 
   expect(error).toBeInstanceOf(DockerHttpRevisionError);
   expect(String(error)).toBe("DockerHttpRevisionError: unavailable");
   expect(fixture.containers.size).toBe(0);
+});
+
+test("Docker verifies a single linux/amd64 manifest and digest before any container creation", async () => {
+  for (const patch of [
+    { Os: "windows" },
+    { Architecture: "arm64" },
+    {
+      Descriptor: {
+        digest: `sha256:${"b".repeat(64)}`,
+        mediaType: "application/vnd.oci.image.manifest.v1+json",
+      },
+    },
+    {
+      Descriptor: {
+        digest: revision.image.split("@")[1],
+        mediaType: "application/vnd.oci.image.index.v1+json",
+      },
+    },
+  ]) {
+    const fixture = engineFixture();
+    const runtime = createDockerHttpRevisionRuntime({
+      ...fixture.options,
+      engine: async (method, path, body) => {
+        const result = await fixture.engine(method, path, body);
+        return path.startsWith("/images/") && path.endsWith("/json")
+          ? { ...result, body: JSON.stringify({ ...JSON.parse(result.body), ...patch }) }
+          : result;
+      },
+    });
+    await expect(runtime.reconcile(revision)).rejects.toMatchObject({ code: "conflict" });
+    expect(fixture.calls.some((call) => call.path.startsWith("/containers/create"))).toBe(false);
+  }
 });

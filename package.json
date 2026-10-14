@@ -38,6 +38,7 @@
     "qualify:actor-cold-alarm": "bun --no-env-file scripts/qualify-actor-cold-alarm.ts",
     "test:selfhost-opentofu": "bun --no-env-file scripts/selfhost-opentofu-e2e.ts",
     "test:selfhost-docker": "bun --no-env-file scripts/selfhost-docker-smoke.ts",
+    "test:container-docker": "bun --no-env-file scripts/container-docker-acceptance.ts",
     "check:provider": "cd provider && test -z \"$(gofmt -l .)\" && go test ./... && go vet ./... && go build ./...",
     "check:core-verifier": "cd services/takoform-core-verifier && test -z \"$(gofmt -l .)\" && go test ./... && go vet ./... && go build ./...",
     "check:workflow-execution-guard": "cd services/workflow-execution-guard && test -z \"$(gofmt -l .)\" && go test ./... && go vet ./... && go build ./...",

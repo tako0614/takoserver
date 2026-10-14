@@ -1,4 +1,5 @@
 import { isAbsolute, join } from "node:path";
+import { CONTAINER_CONTRACT } from "./container-contract.ts";
 import { createDockerHttpRevisionRuntime } from "./providers/docker-http-revision.ts";
 import type {
   SelfhostContainerCapacityProfile,
@@ -174,7 +175,7 @@ export function createSelfhostContainerBootstrap(input: {
     runtimePromise ??= factories.createSelfhostRuntime({
       root: join(input.dataRoot, "container-runtime"),
       backend,
-      drainTimeoutMs: 5_000,
+      drainTimeoutMs: CONTAINER_CONTRACT.limits.retirementMs,
     });
     return runtimePromise;
   };
