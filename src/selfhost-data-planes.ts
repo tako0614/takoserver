@@ -1850,6 +1850,17 @@ function parseObjectDocument(raw: string | null): ObjectDocument {
   if (allowed.includes("key") && fields.key === undefined) {
     throw new SelfhostObjectError("backend_unavailable");
   }
+  if (op === "put" || op === "uploadPart") {
+    const framed = fields.bodyFormat === SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT;
+    // Only the framed transport proves producer EOF independently of HTTP EOF.
+    // A legacy raw body still requires its exact length, including zero.
+    if (
+      (Object.hasOwn(fields, "bodyFormat") && !framed) ||
+      (!framed && !Object.hasOwn(fields, "contentLength"))
+    ) {
+      throw new SelfhostObjectError("backend_unavailable");
+    }
+  }
   return { binding, op, fields };
 }
 

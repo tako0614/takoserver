@@ -211,6 +211,106 @@ function fragmentedObjectWire(chunks: readonly (readonly number[])[]): ReadableS
   );
 }
 
+test("signed ObjectBucket raw writes require a declared length before reading a body", async () => {
+  const host = await fixture();
+  try {
+    const empty = await host.request({
+      binding: "MEDIA",
+      op: "put",
+      key: "legacy-empty",
+      contentLength: 0,
+    });
+    expect(await empty.json()).toMatchObject({ ok: true, value: { size: 0 } });
+    const prior = await host.request(
+      { binding: "MEDIA", op: "put", key: "previous-raw", contentLength: 6 },
+      "stable",
+    );
+    expect(await prior.json()).toMatchObject({ ok: true, value: { size: 6 } });
+    const upload = await host.request({
+      binding: "MEDIA",
+      op: "createMultipartUpload",
+      key: "part-raw",
+    });
+    const { uploadId } = ((await upload.json()) as { value: { uploadId: string } }).value;
+    const part = await host.request(
+      {
+        binding: "MEDIA",
+        op: "uploadPart",
+        key: "part-raw",
+        uploadId,
+        partNumber: 1,
+        contentLength: 7,
+      },
+      "receipt",
+    );
+    const { etag } = ((await part.json()) as { value: { etag: string } }).value;
+    for (const document of [
+      { op: "put", key: "previous-raw" },
+      { op: "uploadPart", key: "part-raw", uploadId, partNumber: 1 },
+    ]) {
+      let reads = 0;
+      let bodyAccesses = 0;
+      const body = new ReadableStream<Uint8Array>(
+        {
+          pull(controller) {
+            reads += 1;
+            controller.enqueue(new TextEncoder().encode("replacement"));
+            controller.close();
+          },
+        },
+        { highWaterMark: 0 },
+      );
+      const request = new Request(`${ORIGIN}${SELFHOST_DATA_PLANE_OBJECTS_PATH}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${host.token}`,
+          [SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER]: Buffer.from(
+            JSON.stringify({
+              protocol: SELFHOST_DATA_PLANE_OBJECT_PROTOCOL,
+              binding: "MEDIA",
+              ...document,
+            }),
+          ).toString("base64url"),
+        },
+        body,
+      });
+      Object.defineProperty(request, "body", {
+        get() {
+          bodyAccesses += 1;
+          return body;
+        },
+      });
+      try {
+        const response = await host.broker.handle(request);
+        expect(await response?.json()).toEqual({
+          ok: false,
+          error: { code: "backend_unavailable" },
+        });
+        expect(bodyAccesses).toBe(0);
+        expect(reads).toBe(0);
+        expect(body.locked).toBe(false);
+        const old = await host.request({ binding: "MEDIA", op: "get", key: "previous-raw" });
+        expect(await old.text()).toBe("stable");
+      } finally {
+        await body.cancel().catch(() => undefined);
+      }
+    }
+    host.reopen();
+    const completed = await host.request({
+      binding: "MEDIA",
+      op: "completeMultipartUpload",
+      key: "part-raw",
+      uploadId,
+      parts: [{ etag, partNumber: 1 }],
+    });
+    expect(await completed.json()).toMatchObject({ ok: true, value: { size: 7 } });
+    const oldPart = await host.request({ binding: "MEDIA", op: "get", key: "part-raw" });
+    expect(await oldPart.text()).toBe("receipt");
+  } finally {
+    host.close();
+  }
+});
+
 test("signed ObjectBucket framed receiver assembles fragmented records and validated zero-byte EOF", async () => {
   const host = await fixture();
   try {
@@ -287,7 +387,7 @@ test("signed ObjectBucket framed receiver refuses malformed EOF without changing
   const host = await fixture();
   try {
     const prior = await host.request(
-      { binding: "MEDIA", op: "put", key: "previous-frame" },
+      { binding: "MEDIA", op: "put", key: "previous-frame", contentLength: 6 },
       "stable",
     );
     expect(await prior.json()).toMatchObject({ ok: true, value: { size: 6 } });
@@ -304,6 +404,7 @@ test("signed ObjectBucket framed receiver refuses malformed EOF without changing
         key: "part-frame-recovery",
         uploadId,
         partNumber: 1,
+        contentLength: 8,
       },
       "original",
     );

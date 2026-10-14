@@ -19,6 +19,7 @@ import type { Sql } from "../src/ports.ts";
 import { selfhostDatabasePath } from "../src/providers/selfhost.ts";
 import {
   SELFHOST_DATA_PLANE_KV_PATH,
+  SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT,
   SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE,
   SELFHOST_DATA_PLANE_OBJECT_PROTOCOL,
   SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER,
@@ -1755,6 +1756,102 @@ test("the object route refuses an unauthenticated caller before it reads a byte"
     method: "GET",
   });
   expect((await planes.routes(wrongMethod, new URL(wrongMethod.url)))?.status).toBe(405);
+});
+
+test("unframed ObjectBucket writes require a declared length before touching the body", async () => {
+  await objectValue({ op: "put", key: "previous", contentLength: 6 }, "stable");
+  const upload = await objectValue({ op: "createMultipartUpload", key: "previous-part" });
+  const priorPart = await objectValue(
+    {
+      op: "uploadPart",
+      key: "previous-part",
+      uploadId: upload.uploadId,
+      partNumber: 1,
+      contentLength: 7,
+    },
+    "receipt",
+  );
+  for (const document of [
+    { op: "put", key: "previous" },
+    { op: "uploadPart", key: "previous-part", uploadId: upload.uploadId, partNumber: 1 },
+  ]) {
+    let reads = 0;
+    let bodyAccesses = 0;
+    const body = new ReadableStream<Uint8Array>(
+      {
+        pull(controller) {
+          reads += 1;
+          controller.enqueue(new TextEncoder().encode("replacement"));
+          controller.close();
+        },
+      },
+      { highWaterMark: 0 },
+    );
+    const request = objectRequest({ binding: "MEDIA", ...document }, body);
+    Object.defineProperty(request, "body", {
+      get() {
+        bodyAccesses += 1;
+        return body;
+      },
+    });
+    try {
+      const response = await planes.routes(request, new URL(request.url));
+      expect(await response?.json()).toEqual({
+        ok: false,
+        error: { code: "backend_unavailable" },
+      });
+      expect(bodyAccesses).toBe(0);
+      expect(reads).toBe(0);
+      expect(body.locked).toBe(false);
+      expect(await (await objects({ op: "get", key: "previous" })).text()).toBe("stable");
+    } finally {
+      await body.cancel().catch(() => undefined);
+    }
+  }
+  await objectValue({
+    op: "completeMultipartUpload",
+    key: "previous-part",
+    uploadId: upload.uploadId,
+    parts: [{ etag: priorPart.etag, partNumber: 1 }],
+  });
+  expect(await (await objects({ op: "get", key: "previous-part" })).text()).toBe("receipt");
+});
+
+test("framed ObjectBucket EOF supports unknown lengths while legacy declared lengths stay exact", async () => {
+  const wire = new Uint8Array([0, 0, 0, 3, 97, 98, 99, 255, 255, 255, 255]);
+  const framed = { bodyFormat: SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT };
+  expect(await objectValue({ op: "put", key: "legacy-empty", contentLength: 0 })).toMatchObject({
+    size: 0,
+  });
+  expect(await objectValue({ op: "put", key: "mixed", contentLength: 6 }, "legacy")).toMatchObject({
+    size: 6,
+  });
+  expect(await objectValue({ op: "put", key: "mixed", ...framed }, wire)).toMatchObject({
+    size: 3,
+  });
+  expect(await (await objects({ op: "get", key: "mixed" })).text()).toBe("abc");
+  expect(
+    await objectValue({ op: "put", key: "mixed", contentLength: 3, ...framed }, wire),
+  ).toMatchObject({ size: 3 });
+  const mismatch = await objects({ op: "put", key: "mixed", contentLength: 4, ...framed }, wire);
+  expect(await mismatch.json()).toEqual({ ok: false, error: { code: "invalid_body" } });
+  expect(await (await objects({ op: "get", key: "mixed" })).text()).toBe("abc");
+  expect(
+    await objectValue({ op: "put", key: "empty", ...framed }, new Uint8Array([255, 255, 255, 255])),
+  ).toMatchObject({ size: 0 });
+
+  const upload = await objectValue({ op: "createMultipartUpload", key: "mixed-parts" });
+  const part = { op: "uploadPart", key: "mixed-parts", uploadId: upload.uploadId, partNumber: 1 };
+  expect(await objectValue({ ...part, contentLength: 6 }, "legacy")).toMatchObject({ size: 6 });
+  const replacement = await objectValue({ ...part, ...framed }, wire);
+  expect(replacement).toMatchObject({ size: 3, partNumber: 1 });
+  await objectValue({
+    op: "completeMultipartUpload",
+    key: "mixed-parts",
+    uploadId: upload.uploadId,
+    parts: [{ etag: replacement.etag, partNumber: 1 }],
+  });
+  expect(await (await objects({ op: "get", key: "mixed-parts" })).text()).toBe("abc");
 });
 
 test("an operation document this Host did not write is refused whole", async () => {
