@@ -21,7 +21,9 @@ them. The registered redirect must exactly equal
 The code flow uses S256, state, nonce, explicit consent and `offline_access`.
 Token exchange, rotating refresh, introspection and revocation authenticate
 with form-encoded HTTP Basic. All HTTP requests refuse redirects and bound
-headers-plus-body handling to five seconds. JSON bodies are limited to 64 KiB
+headers-plus-body handling to five seconds. Requests use `manual` redirect mode
+and reject/cancel all non-success responses before consuming credentials or
+parsing bodies; no credential is sent to a redirect target. JSON bodies are limited to 64 KiB
 and reject duplicate members. JWKS are read from the issuer's `/oauth/jwks`.
 The fixed endpoint paths are an explicit first-party contract rather than
 dynamic discovery of unrelated destinations.
@@ -121,6 +123,10 @@ The protocol tests use real generated ES256 signatures and actual Request and
 Response bodies through an in-process HTTP transport. They verify cryptography
 and client behavior; they are not evidence that the staged login routes, durable
 stores or real issuer have been deployed.
+The workerd tests execute the actual bundled client with a local synthetic
+issuer for signed exchange, refresh, introspection, UserInfo and revocation.
+They catch Request-constructor/runtime differences that a Bun transport alone
+does not exercise and reject redirects for every authenticated operation.
 
 Protocol references: [OpenID Connect Core ID Token validation](https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation),
 [OAuth client authentication](https://www.rfc-editor.org/rfc/rfc6749.html#section-2.3.1),

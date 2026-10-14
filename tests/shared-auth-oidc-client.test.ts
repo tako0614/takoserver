@@ -189,7 +189,7 @@ describe("first-party staging OIDC protocol", () => {
       .map((part) => new URLSearchParams(`v=${part}`).get("v"));
     expect([clientId, secret]).toEqual([config.clientId, config.clientSecret]);
     expect(requests[1]?.headers.has("authorization")).toBe(false);
-    expect(requests.every((request) => request.redirect === "error")).toBe(true);
+    expect(requests.every((request) => request.redirect === "manual")).toBe(true);
   });
 
   test.each([

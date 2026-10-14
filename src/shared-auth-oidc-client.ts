@@ -114,7 +114,9 @@ export function createSharedAuthOidcClient(options: {
             response = await send(
               new Request(`${config.issuer}${path}`, {
                 method: form ? "POST" : "GET",
-                redirect: "error",
+                // workerd's Request rejects "error" on the pinned runtime.
+                // Manual leaves 3xx visible for the !ok refusal below.
+                redirect: "manual",
                 signal: controller.signal,
                 headers: {
                   accept: "application/json",
@@ -265,7 +267,7 @@ export function createSharedAuthOidcClient(options: {
         !(await crypto.subtle.verify(
           { name: "ECDSA", hash: "SHA-256" },
           imported,
-          signature as unknown as BufferSource,
+          new Uint8Array(signature).buffer,
           new TextEncoder().encode(`${encodedHeader}.${encodedClaims}`),
         ))
       )
