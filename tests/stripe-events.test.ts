@@ -570,6 +570,11 @@ describe("Stripe reconcile pass", () => {
       unknownOrganization: 1,
       skipped: { not_paid: 1, wrong_currency: 1 },
       truncated: false,
+      creditedFundingRefs: ["stripe:cs_recon_paid", "stripe:cs_recon_other"],
+      uncredited: [
+        { fundingRef: "stripe:cs_recon_yen", reason: "wrong_currency" },
+        { fundingRef: "stripe:cs_recon_foreign", reason: "unknown_organization" },
+      ],
     });
     expect(await h.balance(ORG)).toBe(2_500 + 700);
     expect(await h.balance(OTHER_ORG)).toBe(900);

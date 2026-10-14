@@ -1,7 +1,11 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { normalizeGeneratedEd25519PrivateJwk } from "../src/ed25519-private-jwk.ts";
-import { canonicalOperatorAudience } from "../src/operator-credentials.ts";
+import {
+  canonicalOperatorAudience,
+  OPERATOR_PAYMENTS_RECONCILE_MAX_LIFETIME_SECONDS,
+  OPERATOR_PAYMENTS_RECONCILE_PURPOSE,
+} from "../src/operator-credentials.ts";
 
 /**
  * The operator's own key, and the assertions it signs.
@@ -13,6 +17,7 @@ import { canonicalOperatorAudience } from "../src/operator-credentials.ts";
  *   bun scripts/operator-key.ts init
  *   bun scripts/operator-key.ts sign-in  <provider> <subject> <email> <name>
  *   bun scripts/operator-key.ts funding  <organizationId> <fundingRef> <amountMinor>
+ *   bun scripts/operator-key.ts payments-reconcile
  *
  * The private half never leaves `.deploy/private/`, which is gitignored. `init`
  * prints the public JWK to configure as `OPERATOR_PUBLIC_JWK`.
@@ -43,10 +48,16 @@ if (command === "init") {
 } else if (command === "sign-in" || command === "funding") {
   const claims = command === "sign-in" ? signInClaims(args) : fundingClaims(args);
   process.stdout.write(`${await sign(claims)}\n`);
+} else if (command === "payments-reconcile" && args.length === 0) {
+  // Presented at once to POST /v1/operator/payments/reconcile, so it lives a
+  // minute and is good for one pass.
+  process.stdout.write(
+    `${await sign(paymentsReconcileClaims(), OPERATOR_PAYMENTS_RECONCILE_MAX_LIFETIME_SECONDS)}\n`,
+  );
 } else {
   process.stderr.write(
     "usage: operator-key.ts init | sign-in <provider> <subject> <email> <name> |" +
-      " funding <organizationId> <fundingRef> <amountMinor>\n",
+      " funding <organizationId> <fundingRef> <amountMinor> | payments-reconcile\n",
   );
   process.exit(2);
 }
@@ -81,13 +92,26 @@ function fundingClaims(input: readonly string[]): Record<string, unknown> {
   return { purpose: "funding", organizationId, fundingRef, amountMinor, currency: "USD" };
 }
 
-async function sign(claims: Record<string, unknown>): Promise<string> {
+function paymentsReconcileClaims(): Record<string, unknown> {
+  return {
+    purpose: OPERATOR_PAYMENTS_RECONCILE_PURPOSE,
+    aud: canonicalOperatorAudience(process.env.TAKOSERVER_PUBLIC_ORIGIN ?? "http://localhost:8787"),
+    // Single-use: two passes requested in the same second must not sign
+    // identical bytes, or the second would be refused as a replay.
+    jti: crypto.randomUUID(),
+  };
+}
+
+async function sign(
+  claims: Record<string, unknown>,
+  lifetimeSeconds = LIFETIME_SECONDS,
+): Promise<string> {
   const jwk = JSON.parse(readFileSync(PRIVATE_PATH, "utf8")) as JsonWebKey;
   const key = await crypto.subtle.importKey("jwk", jwk, "Ed25519", false, ["sign"]);
   const issuedAt = Math.floor(Date.now() / 1_000);
   const payload = base64Url(
     new TextEncoder().encode(
-      JSON.stringify({ ...claims, iat: issuedAt, exp: issuedAt + LIFETIME_SECONDS }),
+      JSON.stringify({ ...claims, iat: issuedAt, exp: issuedAt + lifetimeSeconds }),
     ),
   );
   const signature = await crypto.subtle.sign("Ed25519", key, new TextEncoder().encode(payload));

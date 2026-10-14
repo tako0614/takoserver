@@ -61,6 +61,13 @@ export interface FundingReconcileReport {
   readonly skipped: Readonly<Record<string, number>>;
   /** The window held more payments than one pass reads. */
   readonly truncated: boolean;
+  /** Funding references this pass credited. Never an amount or an organization. */
+  readonly creditedFundingRefs: readonly string[];
+  /**
+   * Paid payments this pass could not credit, by funding reference and short
+   * machine reason; the same list the pass logs as uncredited.
+   */
+  readonly uncredited: readonly { readonly fundingRef: string; readonly reason: string }[];
 }
 
 export interface PaymentEvents {

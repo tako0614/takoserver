@@ -26,7 +26,11 @@ import {
   OrgBillingError,
   type UsageReceipt,
 } from "./org-billing.ts";
-import { PaymentEventError, type PaymentEvents } from "./payment-events.ts";
+import {
+  type FundingReconcileReport,
+  PaymentEventError,
+  type PaymentEvents,
+} from "./payment-events.ts";
 import type { Clock } from "./ports.ts";
 import { type Reseller, ResellerError } from "./reseller.ts";
 import type { ResourceDeploymentStore } from "./resource-deployments.ts";
@@ -77,6 +81,7 @@ import {
 
 const MAX_BODY_BYTES = 64 * 1_024;
 const PAYMENT_NOTIFICATION_PATH = "/v1/payments/stripe/webhook";
+const OPERATOR_PAYMENTS_RECONCILE_PATH = "/v1/operator/payments/reconcile";
 const PAYMENT_NOTIFICATION_MAX_BYTES = 256 * 1_024;
 /**
  * The runtime-input handoff carries the exact public apply body it authorizes
@@ -177,6 +182,12 @@ export interface CreateControlRoutesOptions {
    * signing secret is configured, and then the route is not served at all.
    */
   readonly paymentNotifications?: PaymentEvents["receive"];
+  /**
+   * Runs the payment reconcile pass now for one single-use operator
+   * assertion. Absent where this deployment has no pass to run or no operator
+   * key to authorize one, and then the route is not served at all.
+   */
+  readonly operatorPaymentsReconcile?: (assertion: string) => Promise<FundingReconcileReport>;
   readonly clock: Clock;
   /** Exact browser console origin allowed to carry the HttpOnly session cookie. */
   readonly consoleOrigin?: string;
@@ -219,6 +230,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     tokens,
     settlement,
     paymentNotifications,
+    operatorPaymentsReconcile,
     clock,
     consoleOrigin,
     nativeResidual,
@@ -482,6 +494,20 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       return Response.json(proved, {
         headers: { "cache-control": "private, no-store", "x-content-type-options": "nosniff" },
       });
+    }
+
+    if (url.pathname === OPERATOR_PAYMENTS_RECONCILE_PATH) {
+      if (request.method !== "POST" || !operatorPaymentsReconcile) controlError("not_found", 404);
+      const body = await jsonObject(request);
+      exactKeys(body, ["assertion"]);
+      // The assertion is the whole credential. The pass crosses every
+      // organization, so no session or API key starts it, whoever holds it;
+      // a bearer sent alongside is simply not read.
+      const report = await operatorPaymentsReconcile(bounded(body.assertion, 8 * 1_024));
+      return Response.json(
+        { report },
+        { headers: { "cache-control": "private, no-store", "x-content-type-options": "nosniff" } },
+      );
     }
 
     if (request.method === "POST" && url.pathname === "/v1/sessions") {

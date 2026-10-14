@@ -1,4 +1,4 @@
-import type { ExternalIdentityVerifier, IdentityProvider } from "./auth.ts";
+import type { ExternalIdentityVerifier, IdentityProvider, SingleUseCredential } from "./auth.ts";
 import { base64UrlDecode } from "./json.ts";
 import type { FundingSettlementVerifier } from "./ledger.ts";
 import type { Clock } from "./ports.ts";
@@ -194,6 +194,74 @@ export function createOperatorIdentity(
           digest: await sha256Hex(signedPayload),
           expiresAtEpochSeconds,
         },
+      };
+    },
+  };
+}
+
+/** The one purpose an operator signs to run the payment reconcile pass now. */
+export const OPERATOR_PAYMENTS_RECONCILE_PURPOSE = "payments-reconcile";
+
+/** Where spent reconcile assertions are remembered, apart from sign-in's. */
+export const OPERATOR_PAYMENTS_RECONCILE_SINGLE_USE_NAMESPACE = "operator-payments-reconcile";
+
+/**
+ * The assertion is signed immediately before it is presented, so it lives a
+ * minute, like the integration bootstrap proof signed by the same key.
+ */
+export const OPERATOR_PAYMENTS_RECONCILE_MAX_LIFETIME_SECONDS = 60;
+
+const OPERATOR_PAYMENTS_RECONCILE_CLAIMS = ["aud", "exp", "iat", "jti", "purpose"] as const;
+const OPERATOR_ASSERTION_NONCE = /^[A-Za-z0-9_-]{16,128}$/u;
+
+export interface OperatorPaymentsReconcileVerifier {
+  /** The verified assertion's single-use key; the caller spends it before acting. */
+  verify(assertion: string): Promise<SingleUseCredential>;
+}
+
+/**
+ * Accepts the operator's request to run the payment reconcile pass now.
+ *
+ * The pass is the scheduled one, run on demand. It credits only what the
+ * processor itself reports as settled, through the same funding reference
+ * every other path uses, so it needs no funding authority: the caller names
+ * no organization, amount or reference. It does cross every organization,
+ * which is why no session or API key may start it. The operator identity key
+ * signs it, because that key already vouches for anyone's sign-in here; this
+ * purpose adds no reach that key lacks.
+ *
+ * The assertion names this Host as its audience, carries a nonce and exactly
+ * these claims, lives at most a minute, and is single-use: the verifier names
+ * its signed payload as the key the route spends before the pass runs.
+ */
+export function createOperatorPaymentsReconcileVerifier(
+  options: Omit<OperatorIdentityCredentialOptions, "maxLifetimeSeconds">,
+): OperatorPaymentsReconcileVerifier {
+  const verify = createVerifier({
+    ...options,
+    maxLifetimeSeconds: OPERATOR_PAYMENTS_RECONCILE_MAX_LIFETIME_SECONDS,
+  });
+  const audience = canonicalOperatorAudience(options.audience);
+  return {
+    async verify(assertion) {
+      const { claims, signedPayload, expiresAtEpochSeconds } = await verify(
+        assertion,
+        OPERATOR_PAYMENTS_RECONCILE_PURPOSE,
+      );
+      if (claims.aud !== audience) throw new OperatorAssertionError("wrong_audience");
+      const keys = Object.keys(claims).sort();
+      if (
+        keys.length !== OPERATOR_PAYMENTS_RECONCILE_CLAIMS.length ||
+        keys.some((key, index) => key !== OPERATOR_PAYMENTS_RECONCILE_CLAIMS[index]) ||
+        typeof claims.jti !== "string" ||
+        !OPERATOR_ASSERTION_NONCE.test(claims.jti)
+      ) {
+        throw new OperatorAssertionError("malformed");
+      }
+      return {
+        namespace: OPERATOR_PAYMENTS_RECONCILE_SINGLE_USE_NAMESPACE,
+        digest: await sha256Hex(signedPayload),
+        expiresAtEpochSeconds,
       };
     },
   };

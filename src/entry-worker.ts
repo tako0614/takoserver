@@ -14,7 +14,10 @@ import {
   resolveIntegrationOrganizationBootstrapConfig,
 } from "./integration-organization-bootstrap.ts";
 import { createR2ObjectStore } from "./objects-r2.ts";
-import { createOperatorSettlement } from "./operator-credentials.ts";
+import {
+  createOperatorPaymentsReconcileVerifier,
+  createOperatorSettlement,
+} from "./operator-credentials.ts";
 import { assertOrgBillingSchema } from "./org-billing.ts";
 import { paymentSettingsFromEnvironment } from "./payment-settings.ts";
 import { resolvePayment } from "./payment-setup.ts";
@@ -217,6 +220,16 @@ export function workerCredentials(
     identityProviders: identity.providers,
     ...(payment.checkout ? { checkout: payment.checkout } : {}),
     ...(payment.events ? { paymentEvents: payment.events } : {}),
+    // The operator identity key, never a session or API key, may run the
+    // reconcile pass on demand; the route exists only beside the pass.
+    ...(payment.events && operatorKeys.identity
+      ? {
+          operatorPaymentsReconcile: createOperatorPaymentsReconcileVerifier({
+            publicKeyJwk: operatorKeys.identity,
+            audience: operatorAudience,
+          }),
+        }
+      : {}),
     // Stripe where a customer can pay; the operator's signature where they
     // cannot; and a refusal where neither exists, because a stub that said yes
     // would credit any amount while looking exactly like a finished product.
@@ -837,10 +850,14 @@ async function composeApp(
   const formSource = startupStage("runtime-configuration", () =>
     selectPublicHostFormSource(env.TAKOSERVER_FORM_SOURCE_CANDIDATE, implementationIdentity),
   );
-  const { identity, identityProviders, settlement, checkout, paymentEvents } = workerCredentials(
-    env,
-    origin,
-  );
+  const {
+    identity,
+    identityProviders,
+    settlement,
+    checkout,
+    paymentEvents,
+    operatorPaymentsReconcile,
+  } = workerCredentials(env, origin);
   if (
     v2Config.sqliteMigrationSet !== undefined ||
     v2Config.workerBundle !== undefined ||
@@ -939,6 +956,7 @@ async function composeApp(
       ...(billingConfig ? { billingConfig } : {}),
       ...(checkout ? { checkout } : {}),
       ...(paymentEvents ? { paymentEvents } : {}),
+      ...(operatorPaymentsReconcile ? { operatorPaymentsReconcile } : {}),
       ...dataServices,
       publicOrigin: origin,
       v2: v2Config,

@@ -21,7 +21,10 @@ import {
 } from "./migrate-sqlite.ts";
 import { createFileObjectStore } from "./objects-fs.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
-import { createOperatorSettlement } from "./operator-credentials.ts";
+import {
+  createOperatorPaymentsReconcileVerifier,
+  createOperatorSettlement,
+} from "./operator-credentials.ts";
 import {
   ensureOperatorKey,
   parseOperatorPublicKey,
@@ -1385,6 +1388,17 @@ try {
       : {}),
     ...(payment.checkout ? { checkout: payment.checkout } : {}),
     ...(payment.events ? { paymentEvents: payment.events } : {}),
+    ...(payment.events && identityPublicKeyJwk
+      ? {
+          operatorPaymentsReconcile: createOperatorPaymentsReconcileVerifier({
+            publicKeyJwk: identityPublicKeyJwk,
+            audience: publicOrigin,
+          }),
+        }
+      : {}),
+    // One process owns every pass here, and a pass outlives the request that
+    // started it, so the timer and the operator route may share one.
+    shareReconcilePass: true,
     publicOrigin,
     ...(process.env.TAKOSERVER_CONSOLE_ORIGIN
       ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }
