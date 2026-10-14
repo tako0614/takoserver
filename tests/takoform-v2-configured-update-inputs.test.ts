@@ -79,6 +79,11 @@ async function fixture(
     "verify",
   ]);
   const prepared = new Map<string, V2ConfiguredPrivateInputs>();
+  const preparedFor = (operationId: string): V2ConfiguredPrivateInputs => {
+    const material = prepared.get(operationId);
+    if (material === undefined) throw new Error("missing prepared fixture material");
+    return material;
+  };
   const seenConfigured: Array<V2ConfiguredPrivateInputs | null> = [];
   const state: {
     mode: "rotate" | "void" | "invalid";
@@ -207,7 +212,18 @@ async function fixture(
       spec: {},
       ...(privateInputs === undefined ? {} : { privateInputs }),
     });
-  return { database, sql, engine, created, identity, update, prepared, seenConfigured, state };
+  return {
+    database,
+    sql,
+    engine,
+    created,
+    identity,
+    update,
+    prepared,
+    preparedFor,
+    seenConfigured,
+    state,
+  };
 }
 
 test("accepted UPDATE retains exact operation ciphertext without replacing stable CREATE custody", async () => {
@@ -219,9 +235,9 @@ test("accepted UPDATE retains exact operation ciphertext without replacing stabl
         operationId: updated.id,
         generation: 2,
       }),
-    ).toEqual(f.prepared.get(updated.id));
+    ).toEqual(f.preparedFor(updated.id));
     expect(await readV2ConfiguredPrivateInputs(f.sql, f.identity)).toEqual(
-      f.prepared.get(f.created.id),
+      f.preparedFor(f.created.id),
     );
     expect(f.database.query(`SELECT COUNT(*) AS n FROM ${TABLE}`).get()).toEqual({ n: 1 });
     const publicValues = JSON.stringify([
@@ -230,7 +246,7 @@ test("accepted UPDATE retains exact operation ciphertext without replacing stabl
       await f.engine.getResource({ principal: PRINCIPAL, uid: f.created.resourceUid }),
     ]);
     expect(publicValues).not.toContain("synthetic-rotated");
-    expect(publicValues).not.toContain(f.prepared.get(updated.id)?.ciphertext ?? "missing");
+    expect(publicValues).not.toContain(f.preparedFor(updated.id).ciphertext);
     expect(publicValues).not.toContain("fixture-key");
   } finally {
     f.database.close();
@@ -260,10 +276,10 @@ test("void hooks work on the old schema without any UPDATE-history access", asyn
     f.state.mode = "void";
     const updated = await f.update();
     expect(await f.engine.runNext()).toMatchObject({ id: updated.id, status: "succeeded" });
-    expect(f.seenConfigured).toEqual([f.prepared.get(f.created.id)]);
+    expect(f.seenConfigured).toEqual([f.preparedFor(f.created.id)]);
     expect(statements.some((sql) => sql.includes(TABLE))).toBe(false);
     expect(await readV2ConfiguredPrivateInputs(f.sql, f.identity)).toEqual(
-      f.prepared.get(f.created.id),
+      f.preparedFor(f.created.id),
     );
   } finally {
     f.database.close();
@@ -336,7 +352,7 @@ for (const adapter of ["sqlite", "d1-batch-shape"] as const) {
           operationId: winner.id,
           generation: 2,
         }),
-      ).toEqual(f.prepared.get(winner.id));
+      ).toEqual(f.preparedFor(winner.id));
       expect(f.database.query(`SELECT COUNT(*) AS n FROM ${TABLE}`).get()).toEqual({ n: 1 });
     } finally {
       f.database.close();
@@ -373,7 +389,7 @@ test("concurrent prepared candidates commit only the accepted winner's material"
             operationId: id,
             generation: 2,
           }),
-        ).toEqual(id === winner.id ? f.prepared.get(id) : null);
+        ).toEqual(id === winner.id ? f.preparedFor(id) : null);
     }
   } finally {
     f.database.close();
@@ -397,6 +413,7 @@ test("configured CREATE CAS, failed admission, and mutable hook results cannot s
       (returned as { ciphertext: string }).ciphertext = "mutated-after-hook";
     };
     const winner = await f.update("snapshot-update-000001");
+    if (expected === undefined) throw new Error("missing prepared fixture snapshot");
     expect(
       await readV2ConfiguredPrivateInputs(f.sql, f.identity, {
         operationId: winner.id,
@@ -503,7 +520,7 @@ test("markDispatch erases only transfer; exact UPDATE history survives recovery 
         operationId: updated.id,
         generation: 2,
       }),
-    ).toEqual(f.prepared.get(updated.id));
+    ).toEqual(f.preparedFor(updated.id));
     f.state.nowMs += 20_000;
     expect(await f.engine.runNext()).toMatchObject({ status: "succeeded" });
     const later = await f.update("later-generation-00001", 2);
@@ -516,8 +533,8 @@ test("markDispatch erases only transfer; exact UPDATE history survives recovery 
     ] as const)
       expect(
         await readV2ConfiguredPrivateInputs(f.sql, f.identity, { operationId: id, generation }),
-      ).toEqual(f.prepared.get(id));
-    expect(f.seenConfigured).toEqual([f.prepared.get(f.created.id), f.prepared.get(f.created.id)]);
+      ).toEqual(f.preparedFor(id));
+    expect(f.seenConfigured).toEqual([f.preparedFor(f.created.id), f.preparedFor(f.created.id)]);
   } finally {
     f.database.close();
   }
@@ -553,7 +570,7 @@ test("immutable history rejects UPDATE/DELETE/REPLACE and survives actual soft d
         operationId: updated.id,
         generation: 2,
       }),
-    ).toEqual(f.prepared.get(updated.id));
+    ).toEqual(f.preparedFor(updated.id));
     const replacement = await f.engine.acceptCreate({
       principal: PRINCIPAL,
       key: "recreate-retain-000001",
@@ -619,7 +636,7 @@ test("0096 expands a populated protected predecessor without changing its existi
         operationId: updated.id,
         generation: 2,
       }),
-    ).toEqual(f.prepared.get(updated.id));
+    ).toEqual(f.preparedFor(updated.id));
   } finally {
     f.database.close();
   }
@@ -653,9 +670,9 @@ test("insert guards bind actual accepted identity; later void UPDATE has no hist
         operationId: first.id,
         generation: 2,
       }),
-    ).toEqual(f.prepared.get(first.id));
+    ).toEqual(f.preparedFor(first.id));
     expect(f.database.query(`SELECT COUNT(*) AS n FROM ${TABLE}`).get()).toEqual({ n: 1 });
-    expect(f.seenConfigured).toEqual([f.prepared.get(f.created.id), f.prepared.get(f.created.id)]);
+    expect(f.seenConfigured).toEqual([f.preparedFor(f.created.id), f.preparedFor(f.created.id)]);
   } finally {
     f.database.close();
   }
