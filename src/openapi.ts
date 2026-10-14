@@ -1144,7 +1144,7 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
     "x-required-scopes": ["payments:write"],
     parameters: [ORGANIZATION_ID_PARAMETER],
     description:
-      "Hosted composition requires reference and amountMinor, payments:write or an owner session, and a qualified durable customer/realm adapter. The independent legacy lane accepts amountMinor only and remains owner-session-only. Bounds and return URLs are operator-configured; the request does not fund credit. Exact Hosted retries return the same URL; an unknown outcome beyond the idempotency safety window requires reconciliation.",
+      "Hosted composition requires reference and amountMinor, payments:write or an owner session, and a qualified durable customer/realm adapter. The independent legacy lane accepts amountMinor only and remains owner-session-only. Current operator bounds govern new purchases; exact Hosted retries preserve the original command and URL even after bounds change. Return URLs are operator-configured; the request does not fund credit. An unknown outcome beyond the idempotency safety window requires reconciliation.",
     requestBody: billingRequest("BeginWalletCheckoutRequest"),
     responses: {
       "201": billingResponse(

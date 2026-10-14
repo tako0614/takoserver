@@ -6390,7 +6390,7 @@
     "/v1/organizations/{organizationId}/wallet/checkout": {
       "post": {
         "summary": "Begin an idempotent purchased-credit Checkout",
-        "description": "Hosted composition requires reference and amountMinor, payments:write or an owner session, and a qualified durable customer/realm adapter. The independent legacy lane accepts amountMinor only and remains owner-session-only. Bounds and return URLs are operator-configured; the request does not fund credit. Exact Hosted retries return the same URL; an unknown outcome beyond the idempotency safety window requires reconciliation.",
+        "description": "Hosted composition requires reference and amountMinor, payments:write or an owner session, and a qualified durable customer/realm adapter. The independent legacy lane accepts amountMinor only and remains owner-session-only. Current operator bounds govern new purchases; exact Hosted retries preserve the original command and URL even after bounds change. Return URLs are operator-configured; the request does not fund credit. An unknown outcome beyond the idempotency safety window requires reconciliation.",
         "responses": {
           "201": {
             "description": "Original Checkout URL, including an exact Hosted replay",

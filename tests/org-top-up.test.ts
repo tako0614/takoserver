@@ -78,7 +78,7 @@ function fixture() {
       return hideRecovery ? null : (sessions.get(key) ?? null);
     },
   };
-  const make = () =>
+  const make = (bounds: OrgTopUps["bounds"] = { minimumMinor: 50, maximumMinor: 100_000 }) =>
     createOrgTopUps({
       sql,
       clock: () => new Date(time),
@@ -87,7 +87,7 @@ function fixture() {
         pinReads++;
         return pin;
       },
-      bounds: { minimumMinor: 50, maximumMinor: 100_000 },
+      bounds,
       consoleOrigin: "https://console.test",
     });
   return {
@@ -134,6 +134,91 @@ function fixture() {
 }
 
 describe("durable Organization top-ups", () => {
+  test("ready purchases replay their frozen Checkout after restart with different bounds", async () => {
+    for (const bounds of [
+      { minimumMinor: 200, maximumMinor: 200_000 },
+      { minimumMinor: 50, maximumMinor: 100 },
+    ]) {
+      const f = fixture();
+      const accepted = await f.make().begin(REQUEST);
+      const original = f.creates[0];
+      if (!original) throw new Error("Missing original accepted command");
+      f.setPin({ ...PIN, pricingRevision: "revision-2", purchaseCreditExpiry: { kind: "none" } });
+      const restarted = f.make(bounds);
+      expect(await restarted.begin(REQUEST)).toEqual(accepted);
+      expect(await restarted.commandForSession("cs_topup_1")).toEqual(original.command);
+      expect(f.creates).toHaveLength(1);
+      expect(f.pinReads()).toBe(1);
+      await expect(restarted.begin({ ...REQUEST, amountMinor: 124 })).rejects.toMatchObject({
+        code: "conflict",
+      });
+    }
+  });
+
+  test("lost-ACK purchases reuse original command and key outside restarted purchase bounds", async () => {
+    for (const bounds of [
+      { minimumMinor: 200, maximumMinor: 200_000 },
+      { minimumMinor: 50, maximumMinor: 100 },
+    ]) {
+      const f = fixture();
+      f.loseRemoteAck();
+      f.hideRecovery();
+      await expect(f.make().begin(REQUEST)).rejects.toMatchObject({ code: "unavailable" });
+      const original = f.creates[0];
+      if (!original) throw new Error("Missing dispatched purchase command");
+      f.setPin({
+        ...PIN,
+        customerId: "cus_changed",
+        pricingRevision: "revision-2",
+        purchaseCreditExpiry: { kind: "none" },
+      });
+      f.setTime(START + TOP_UP_UNKNOWN_ACK_CUTOFF_MS - 1);
+      const restarted = f.make(bounds);
+      expect((await restarted.begin(REQUEST)).url).toContain("cs_topup_1");
+      expect(f.creates[1]).toEqual(original);
+      expect(f.sessions.size).toBe(1);
+      expect(f.pinReads()).toBe(1);
+      await expect(restarted.begin({ ...REQUEST, amountMinor: 124 })).rejects.toMatchObject({
+        code: "conflict",
+      });
+      expect(f.creates).toHaveLength(2);
+    }
+  });
+
+  test("reconfigured bounds do not reset a pending purchase's unknown-ACK cutoff", async () => {
+    const f = fixture();
+    f.loseRemoteAck();
+    f.hideRecovery();
+    await expect(f.make().begin(REQUEST)).rejects.toMatchObject({ code: "unavailable" });
+    f.setTime(START + TOP_UP_UNKNOWN_ACK_CUTOFF_MS);
+    await expect(
+      f.make({ minimumMinor: 200, maximumMinor: 1000 }).begin(REQUEST),
+    ).rejects.toMatchObject({ code: "reconciliation_required" });
+    expect(f.creates).toHaveLength(1);
+    expect(f.pinReads()).toBe(1);
+  });
+
+  test("new purchases outside current bounds fail before custody, remote effect or durable insertion", async () => {
+    const f = fixture();
+    const current = f.make({ minimumMinor: 200, maximumMinor: 1000 });
+    for (const [index, amountMinor] of [
+      123,
+      1001,
+      0,
+      -1,
+      1.5,
+      Number.MAX_SAFE_INTEGER + 1,
+    ].entries()) {
+      const request = { ...REQUEST, reference: `new-${index}`, amountMinor };
+      await expect(current.begin(request)).rejects.toMatchObject({ code: "invalid_argument" });
+      expect(await current.receipt(request)).toBeNull();
+    }
+    expect(f.pinReads()).toBe(0);
+    expect(f.creates).toHaveLength(0);
+    expect(f.db.query("SELECT COUNT(*) AS count FROM stripe_top_up_commands").get()).toEqual({
+      count: 0,
+    });
+  });
   test("concurrent retries elect the same stored command, key and Checkout", async () => {
     const f = fixture();
     const first = f.make();

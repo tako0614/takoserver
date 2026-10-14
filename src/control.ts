@@ -148,13 +148,13 @@ export interface Checkout {
     readonly amountMinor: number;
     readonly reference?: string;
   }): Promise<{ readonly url: string }>;
-  /** Hosted composition requires durable references and payment-scoped authority. */
+  /** Durable begin preserves original replays and checks current bounds only for new references. */
   readonly referenceRequired?: true;
   receipt?(input: {
     readonly organizationId: string;
     readonly reference: string;
   }): Promise<TopUpReceipt | null>;
-  /** Smallest and largest a single payment may be, in minor units. */
+  /** Current bounds for new payments, in minor units; original durable commands keep their amount. */
   readonly bounds: { readonly minimumMinor: number; readonly maximumMinor: number };
 }
 
@@ -966,9 +966,12 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
         ? billingReference(text(body.reference))
         : undefined;
       const amountMinor = integer(body.amountMinor);
-      const { minimumMinor, maximumMinor } = options.checkout.bounds;
-      if (amountMinor < minimumMinor || amountMinor > maximumMinor) {
-        controlError("invalid_argument", 400);
+      if (amountMinor <= 0) controlError("invalid_argument", 400);
+      // Durable begin owns original-command replay and current bounds for new references.
+      if (!options.checkout.referenceRequired) {
+        const { minimumMinor, maximumMinor } = options.checkout.bounds;
+        if (amountMinor < minimumMinor || amountMinor > maximumMinor)
+          controlError("invalid_argument", 400);
       }
       // Where the payment returns to is configured, not requested. An address
       // taken from the caller is an open redirect wearing a payment's clothes,

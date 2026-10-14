@@ -335,6 +335,10 @@ test("independent legacy top-up keeps its owner-only body and response while Hos
   );
   expect(response.status).toBe(201);
   expect(await response.json()).toEqual({ checkout: { url: URL } });
+  for (const amountMinor of [49, 5001])
+    expect(
+      (await f.request("POST", `${f.wallet}/checkout`, "owner", { amountMinor }, route)).status,
+    ).toBe(400);
   expect(
     (
       await f.request(
@@ -361,6 +365,255 @@ test("independent legacy top-up keeps its owner-only body and response while Hos
     ).status,
   ).toBe(404);
   expect((await f.request("POST", `${f.wallet}/funding`, "owner", "{")).status).toBe(404);
+});
+
+test("canonical top-up HTTP replay keeps its original command after current bounds narrow", async () => {
+  const f = await fixture();
+  await f.sql.run("INSERT INTO stripe_mode_realm VALUES (1, 'test', ?)", [START]);
+  await f.sql.run(
+    "INSERT INTO stripe_billing_account_realms VALUES (1, 'acct_apiExtensions', 'test', 'api-extensions-test', ?)",
+    [START],
+  );
+  const remoteRequests: Request[] = [];
+  const customers = new Map<string, Record<string, unknown>>();
+  const sessions = new Map<string, Record<string, unknown>>();
+  const metadata = (form: URLSearchParams) =>
+    Object.fromEntries(
+      [...form.entries()]
+        .filter(([name]) => name.startsWith("metadata["))
+        .map(([name, value]) => [name.slice("metadata[".length, -1), value]),
+    );
+  const nativeFetch = async (request: Request) => {
+    remoteRequests.push(request);
+    const url = new globalThis.URL(request.url);
+    if (request.method === "GET" && url.pathname === "/v1/account")
+      return Response.json({ id: "acct_apiExtensions", object: "account" });
+    if (request.method === "GET" && url.pathname === "/v1/prices/price_apiExtensions")
+      return Response.json({
+        id: "price_apiExtensions",
+        object: "price",
+        livemode: false,
+        active: true,
+        currency: "usd",
+        unit_amount: 1000,
+        type: "recurring",
+        billing_scheme: "per_unit",
+        recurring: { interval: "month", interval_count: 1, usage_type: "licensed" },
+      });
+    if (request.method === "POST" && url.pathname === "/v1/customers") {
+      const form = new URLSearchParams(await request.clone().text());
+      const customer = {
+        id: "cus_apiExtensionsReplay",
+        object: "customer",
+        livemode: false,
+        metadata: metadata(form),
+      };
+      customers.set(customer.id, customer);
+      return Response.json(customer);
+    }
+    if (request.method === "GET" && url.pathname === "/v1/customers/cus_apiExtensionsReplay")
+      return Response.json(customers.get("cus_apiExtensionsReplay"));
+    if (request.method === "POST" && url.pathname === "/v1/checkout/sessions") {
+      const form = new URLSearchParams(await request.clone().text());
+      const session = {
+        id: "cs_apiExtensionsReplay",
+        object: "checkout.session",
+        livemode: false,
+        mode: form.get("mode"),
+        customer: form.get("customer"),
+        amount_total: Number(form.get("line_items[0][price_data][unit_amount]")),
+        currency: "usd",
+        metadata: metadata(form),
+        status: "open",
+        payment_status: "unpaid",
+        payment_intent: null,
+        url: URL,
+      };
+      sessions.set(session.id, session);
+      return Response.json(session);
+    }
+    if (request.method === "GET" && url.pathname === "/v1/checkout/sessions/cs_apiExtensionsReplay")
+      return Response.json(sessions.get("cs_apiExtensionsReplay"));
+    throw new Error(`unexpected native request: ${request.method} ${url.pathname}`);
+  };
+  const client = createStripeBillingClient({
+    secretKey: "sk_test_api_extensions_fixture",
+    mode: "test",
+    fetch: nativeFetch,
+  });
+  const assemble = async (
+    minimumMinor: number,
+    maximumMinor: number,
+    revision: string = BILLING_CONFIG.revision,
+  ) => {
+    const pricing = compilePricingAuthoring({
+      authoringVersion: 1,
+      billingConfig:
+        revision === BILLING_CONFIG.revision
+          ? BILLING_CONFIG
+          : {
+              ...BILLING_CONFIG,
+              revision,
+              effectiveAt: START,
+              history: [BILLING_CONFIG],
+            },
+      checkout: { minimumMinor, maximumMinor },
+      planIds: { free: "free", subscription: "configured", usage: "usage" },
+      stripeMonthlyReview: {
+        configured: { expectedAmountMinor: 1000, currency: "USD", interval: "month" },
+      },
+    });
+    const billingConfig = parseBillingConfig(pricing.environment.TAKOSERVER_BILLING_CONFIG);
+    if (!billingConfig) throw new Error("fixture billing config unavailable");
+    const realm = await verifyHostedBillingFinancialRealm({
+      sql: f.sql,
+      reader: { client },
+      expected: {
+        accountId: "acct_apiExtensions",
+        mode: "test",
+        billingAuthority: "api-extensions-test",
+      },
+      prices: [{ priceId: "price_apiExtensions", monthlyAmountMinor: 1000 }],
+    });
+    const hostedBilling = await createCanonicalHostedBillingComposition({
+      sql: f.sql,
+      clock: f.base.clock,
+      billingConfig,
+      pricing,
+      client,
+      realm,
+      consoleOrigin: "https://console.test",
+      warnings: { state: "unavailable", reason: "transport-not-composed" },
+      webhookSecret: "whsec_api_extensions_fixture",
+    });
+    return buildApp({
+      sql: f.sql,
+      clock: f.base.clock,
+      billingConfig,
+      hostedBilling,
+      publicOrigin: "https://api.test",
+      consoleOrigin: "https://console.test",
+      objects: createMemoryObjectStore(),
+      identity: {
+        async verify() {
+          throw new Error("existing local session only");
+        },
+      },
+      settlement: f.base.settlement,
+      v2: TEST_TAKOFORM_V2_CONFIG,
+      forms: [],
+      hostForms: [],
+      offerings: [],
+      driver: new InMemoryTakoformResourceDriver(),
+    });
+  };
+  const original = await assemble(50, 5000);
+  const subscriptionPath = `/v1/organizations/${f.org}/payments/subscription`;
+  const originalPlan = await f.request("GET", subscriptionPath, "reader", undefined, (request) =>
+    original.fetch(request),
+  );
+  expect(originalPlan.status).toBe(200);
+  expect(
+    (await originalPlan.json()).planTable.plans.find(
+      (plan: { tier: string }) => plan.tier === "usage",
+    ),
+  ).toMatchObject({
+    checkoutMinimumMinor: 50,
+    checkoutMaximumMinor: 5000,
+  });
+  const originalCatalog = await f.sql.query(
+    "SELECT revision, config_json FROM stripe_billing_pricing WHERE revision = ?",
+    [BILLING_CONFIG.revision],
+  );
+  expect(originalCatalog).toHaveLength(1);
+  const path = `${f.wallet}/checkout`;
+  const purchase = { reference: "original-purchase", amountMinor: 500 };
+  const first = await f.request("POST", path, "payer", purchase, (request) =>
+    original.fetch(request),
+  );
+  expect(first.status).toBe(201);
+  expect(await first.json()).toEqual({ checkout: { url: URL } });
+  const storedBefore = await f.sql.query(
+    "SELECT reference, command_json, fingerprint, stripe_key, session_id FROM stripe_top_up_commands WHERE org_id = ?",
+    [f.org],
+  );
+  expect(storedBefore).toHaveLength(1);
+  const effectsBefore = remoteRequests.filter((request) => request.method === "POST");
+  expect(effectsBefore.map((request) => new globalThis.URL(request.url).pathname)).toEqual([
+    "/v1/customers",
+    "/v1/checkout/sessions",
+  ]);
+  expect(effectsBefore.every((request) => request.headers.has("idempotency-key"))).toBe(true);
+
+  const restarted = await assemble(50, 100, "api-extension-r2");
+  const currentPlan = await f.request("GET", subscriptionPath, "reader", undefined, (request) =>
+    restarted.fetch(request),
+  );
+  expect(currentPlan.status).toBe(200);
+  expect(
+    (await currentPlan.json()).planTable.plans.find(
+      (plan: { tier: string }) => plan.tier === "usage",
+    ),
+  ).toMatchObject({
+    checkoutMinimumMinor: 50,
+    checkoutMaximumMinor: 100,
+  });
+  expect(
+    await f.sql.query(
+      "SELECT revision, config_json FROM stripe_billing_pricing WHERE revision = ?",
+      [BILLING_CONFIG.revision],
+    ),
+  ).toEqual(originalCatalog);
+  expect(
+    await f.sql.query("SELECT revision FROM stripe_billing_pricing ORDER BY revision"),
+  ).toEqual([{ revision: BILLING_CONFIG.revision }, { revision: "api-extension-r2" }]);
+  const replay = await f.request("POST", path, "payer", purchase, (request) =>
+    restarted.fetch(request),
+  );
+  expect(replay.status).toBe(201);
+  expect(await replay.json()).toEqual({ checkout: { url: URL } });
+  expect(
+    await f.sql.query(
+      "SELECT reference, command_json, fingerprint, stripe_key, session_id FROM stripe_top_up_commands WHERE org_id = ?",
+      [f.org],
+    ),
+  ).toEqual(storedBefore);
+  expect(remoteRequests.filter((request) => request.method === "POST")).toEqual(effectsBefore);
+
+  const beforeRefusals = remoteRequests.length;
+  const changed = await f.request(
+    "POST",
+    path,
+    "payer",
+    { ...purchase, amountMinor: 600 },
+    (request) => restarted.fetch(request),
+  );
+  expect(changed.status).toBe(409);
+  expect((await changed.json()).error.code).toBe("conflict");
+  const fresh = await f.accounts.createOrganization({
+    actor: f.owner,
+    name: "Fresh customer boundary",
+  });
+  const freshPath = `/v1/organizations/${fresh.id}/wallet/checkout`;
+  for (const amountMinor of [500, 0, -1, 1.5, "500", Number.MAX_SAFE_INTEGER + 1]) {
+    const refused = await f.request(
+      "POST",
+      freshPath,
+      "owner",
+      { reference: "new-purchase", amountMinor },
+      (request) => restarted.fetch(request),
+    );
+    expect(refused.status).toBe(400);
+    expect((await refused.json()).error.code).toBe("invalid_argument");
+  }
+  expect(remoteRequests).toHaveLength(beforeRefusals);
+  for (const table of [
+    "stripe_top_up_commands",
+    "stripe_billing_customer_commands",
+    "stripe_billing_customers",
+  ])
+    expect(await f.sql.query(`SELECT * FROM ${table} WHERE org_id = ?`, [fresh.id])).toEqual([]);
+  expect(await f.sql.query("SELECT * FROM ledger")).toEqual([]);
 });
 
 test("limit policy HTTP commands audit the exact API key and preserve the original replay", async () => {

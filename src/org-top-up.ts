@@ -368,17 +368,16 @@ export function createOrgTopUps(options: {
     bounds,
     async begin({ organizationId, reference, amountMinor }) {
       identity(organizationId, reference);
-      if (
-        !Number.isSafeInteger(amountMinor) ||
-        amountMinor < bounds.minimumMinor ||
-        amountMinor > bounds.maximumMinor
-      )
-        fail("invalid_argument");
+      if (!Number.isSafeInteger(amountMinor) || amountMinor <= 0) fail("invalid_argument");
       const existing = await byReference(organizationId, reference);
       if (existing) {
         if (existing.command.amountMinor !== amountMinor) fail("conflict");
         return await resume(existing);
       }
+      // Current purchase bounds apply only to a new command. An accepted
+      // reference retains its original cash amount across configuration changes.
+      if (amountMinor < bounds.minimumMinor || amountMinor > bounds.maximumMinor)
+        fail("invalid_argument");
       // A new reference may proceed only after authoritative recovery of an
       // earlier unknown Checkout. A null read never clears its pending Org slot.
       const unresolved = stored(
