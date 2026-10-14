@@ -201,7 +201,7 @@ function targetSnapshot(value: DockerContainerCreateTarget): DockerContainerCrea
   if (
     !closed(value, TARGET_KEYS) ||
     !TARGET_KEYS.every((key) => text(value[key])) ||
-    !/^takoserver-[A-Za-z0-9_.-]+$/u.test(value.nativeName) ||
+    !/^(?:(?:integration|staging)-)?takoserver-[A-Za-z0-9_.-]+$/u.test(value.nativeName) ||
     !SHA256.test(value.identityLabel) ||
     !SHA256.test(value.revisionLabel)
   )

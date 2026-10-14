@@ -617,3 +617,63 @@ test("terminal cleanup can reacquire current authority after final guard failure
   expect(f.counts().creates).toBe(1);
   expect(f.counts().deletes).toBe(1);
 });
+
+test("canonical integration and staging native names preserve once-only creation custody", async () => {
+  for (const nativeName of [
+    "takoserver-owned-one",
+    "integration-takoserver-secret-stopped-e329",
+    "staging-takoserver-secret-stopped-e329",
+  ]) {
+    const f = fixture();
+    const scopedTarget = { ...target, nativeName };
+    const create = () =>
+      createDockerContainerCreateCustody(f.options).withAuthority(
+        scopedTarget,
+        "reconcile",
+        f.driver,
+        (session) => session.ensureCreated(),
+      );
+    expect(await create()).toEqual({ native, state: "stopped" });
+    expect(await create()).toEqual({ native, state: "stopped" });
+    expect(f.record()?.intent.nativeName).toBe(nativeName);
+    expect(f.counts().creates).toBe(1);
+  }
+});
+
+test("foreign and lookalike staging names reject before custody or native effects", async () => {
+  for (const nativeName of [
+    "integration-foreign-secret-stopped-e329",
+    "staging-foreign-secret-stopped-e329",
+    "preintegration-takoserver-one",
+    "integrationtakoserver-one",
+    "integration--takoserver-one",
+    "integration-staging-takoserver-one",
+    "integration-takoserver",
+    "integration-takoserver-",
+    "staging-takoserver-",
+    "Integration-takoserver-one",
+    "staging-takoserver-one/foreign",
+    "integration-takoserver-one?foreign",
+    "integration-takoserver-one\n",
+    "staging-takoserver-\0foreign",
+  ]) {
+    const f = fixture();
+    let ownerReads = 0;
+    const read = f.owner.read;
+    f.owner.read = async (intent) => {
+      ownerReads++;
+      return read(intent);
+    };
+    await expect(
+      createDockerContainerCreateCustody(f.options).withAuthority(
+        { ...target, nativeName },
+        "reconcile",
+        f.driver,
+        (session) => session.ensureCreated(),
+      ),
+    ).rejects.toMatchObject({ code: "invalid_request" });
+    expect(ownerReads).toBe(0);
+    expect(f.record()).toBeNull();
+    expect(f.counts()).toEqual({ creates: 0, deletes: 0, environmentLoans: 0 });
+  }
+});
