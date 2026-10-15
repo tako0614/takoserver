@@ -55,7 +55,8 @@ export const WFP_HOSTED_SAMPLE_E2E_FORMS = [
   STATIC_ASSET_BUNDLE_FORM_URL,
 ] as const;
 
-const DEFAULT_SPACE = "integration-wfp-hosted-e2e";
+const ORIGIN_RESERVATION_FORMAT = "takoserver.worker-endpoint-origin-reservation.v2";
+const ORIGIN_RESERVATION_TTL_SECONDS = 86_400;
 const DEFAULT_POLL_SECONDS = 300;
 const DEFAULT_SCHEDULE_SECONDS = 240;
 const RUN_HEADER = "x-takoserver-e2e-run";
@@ -152,6 +153,7 @@ interface RunOptions {
   readonly journalPath: string;
   readonly sourceCommit: string;
   readonly space: string;
+  readonly reservationOfferingId?: string;
   readonly runId: string;
   readonly pollSeconds: number;
   readonly scheduleSeconds: number;
@@ -375,6 +377,13 @@ export function parseHostedSampleFixtureDocument(input: unknown): HostedSampleFi
 export async function runHostedStagingE2E(options: RunOptions): Promise<JsonRecord> {
   exactStagingOrigin(options.origin);
   resourcePrefix(options.runId);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(options.space))
+    throw new HostedSampleError("space must be the explicit organization ID");
+  if (
+    options.reservationOfferingId !== undefined &&
+    !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(options.reservationOfferingId)
+  )
+    throw new HostedSampleError("reservation Offering ID is invalid");
   if (!/^[a-f0-9]{40}$/u.test(options.sourceCommit))
     throw new HostedSampleError("source commit must be a full SHA");
   const fixture = await checkHostedSampleFixture(options.fixturePath);
@@ -391,6 +400,8 @@ export async function runHostedStagingE2E(options: RunOptions): Promise<JsonReco
     await journal({ kind: "start", runId: options.runId, sourceCommit: options.sourceCommit });
     const client = await prepareClient(options, journal);
     await assertSupportedForms(client);
+    await assertOrganizationSpace(client, options.space);
+    const endpointName = hostedSampleEndpointName(options.runId);
     for (const name of [
       "worker",
       "service-worker",
@@ -425,14 +436,41 @@ export async function runHostedStagingE2E(options: RunOptions): Promise<JsonReco
           throw new HostedSampleError("fixture name already exists; use its journal for readback");
       }
     }
+    const endpointExisting = record(
+      await requestJson(
+        client,
+        "evidence",
+        `/resources?space=${encodeURIComponent(options.space)}&name=${encodeURIComponent(endpointName)}`,
+        { method: "GET" },
+      ),
+      "Endpoint name preflight invalid",
+    );
+    if (!Array.isArray(endpointExisting.items) || endpointExisting.items.length !== 0)
+      throw new HostedSampleError("fixture name already exists; use its journal for readback");
+    const reservation = await prepareOriginalReservation(client, options, endpointName);
     const graph = await createGraph({
       client,
+      endpointName,
       fixture,
       space: options.space,
       runId: options.runId,
       pollSeconds: options.pollSeconds,
     });
-    const endpointUrl = endpointUrlFromResource(graph.endpoint.resource, graph.endpoint.uid);
+    const endpointUrl = typedEndpointUrlFromResource({
+      endpoint: graph.endpoint,
+      name: endpointName,
+      space: options.space,
+      workerUid: graph.worker.uid,
+      reservedOrigin: reservation.canonicalPublicOrigin,
+    });
+    await journal({
+      kind: "endpoint-binding-confirmed",
+      name: endpointName,
+      uid: graph.endpoint.uid,
+      operationId: graph.endpoint.operationId,
+      reservationId: reservation.reservationId,
+      origin: endpointUrl,
+    });
     const probe = async (path: string, method = "GET") => {
       await journal({ kind: "endpoint-request-intent", path, method });
       return await callEndpointJson({
@@ -629,7 +667,13 @@ export async function runHostedStagingE2E(options: RunOptions): Promise<JsonReco
         version2: version2.uid,
         serviceVersion2: serviceVersion2.uid,
       },
-      endpoint: { url: endpointUrl },
+      endpoint: {
+        url: endpointUrl,
+        name: endpointName,
+        uid: graph.endpoint.uid,
+        operationId: graph.endpoint.operationId,
+      },
+      originalReservation: { ...reservation, retained: true, globalNameReusable: false },
       counts: SAMPLE_COUNTS,
       quiet: { start: quietStart, end: quietEnd, slots: scheduled },
       journeys: [
@@ -645,6 +689,11 @@ export async function runHostedStagingE2E(options: RunOptions): Promise<JsonReco
         "unqualified: self-host Linux/Docker and independent target qualification are separate evidence",
       rollback: { caller: callerRollback.operationId, service: serviceRollback.operationId },
     };
+    await journal({
+      kind: "original-reservation-retained",
+      reservationId: reservation.reservationId,
+      globalNameReusable: false,
+    });
     await journal({ kind: "finished", status: "HOSTED_STAGING_SCENARIOS_PASSED" });
     await outputFile.writeFile(`${canonicalJson(evidence)}\n`);
     await outputFile.sync();
@@ -874,6 +923,7 @@ async function buildMigrationArtifact(baseUrl: string): Promise<BuiltArtifact> {
 
 async function createGraph(input: {
   readonly client: PreparedClient;
+  readonly endpointName: string;
   readonly fixture: HostedSampleFixtureDocument;
   readonly space: string;
   readonly runId: string;
@@ -883,7 +933,7 @@ async function createGraph(input: {
   const create = (name: string, form: string, spec: JsonRecord) =>
     createResource(input.client, {
       space: input.space,
-      name: `${prefix}-${name}`,
+      name: name === "endpoint" ? input.endpointName : `${prefix}-${name}`,
       form,
       spec,
       idempotencyKey: `${prefix}-${name}-create`,
@@ -1011,6 +1061,120 @@ async function assertSupportedForms(client: PreparedClient): Promise<void> {
       throw new HostedSampleError(`staging Host does not support required Form ${form}`);
     }
   }
+}
+
+async function assertOrganizationSpace(client: PreparedClient, space: string): Promise<void> {
+  // The owning v2 account adapter authorizes an organization key only when
+  // space === its authenticated organization ID, including an empty list.
+  for (const role of ["writer", "evidence"] as const) {
+    const result = record(
+      await requestJson(client, role, `/resources?space=${encodeURIComponent(space)}&limit=1`, {
+        method: "GET",
+      }),
+      "organization Space proof must be an object",
+    );
+    if (
+      !Array.isArray(result.items) ||
+      result.items.length > 1 ||
+      result.items.some((item) => record(item, "organization Space item invalid").space !== space)
+    )
+      throw new HostedSampleError("organization Space proof is invalid");
+    await client.journal({ kind: "organization-space-confirmed", space, role });
+  }
+}
+
+interface OriginalReservation {
+  readonly format: typeof ORIGIN_RESERVATION_FORMAT;
+  readonly reservationId: string;
+  readonly requestedSubdomain: string;
+  readonly canonicalPublicOrigin: string;
+  readonly revision: string;
+  readonly expiresAt: string;
+  readonly status: "prepared";
+}
+
+async function prepareOriginalReservation(
+  client: PreparedClient,
+  options: RunOptions,
+  name: string,
+): Promise<OriginalReservation> {
+  const reservationId = `${resourcePrefix(options.runId)}-origin`;
+  const url = `${client.origin}/v1/worker-endpoint-origin-reservations/${encodeURIComponent(reservationId)}`;
+  const headers = { authorization: `Bearer ${client.writerToken}` };
+  const existing = await guardedFetch(client.fetcher, url, { method: "GET", headers });
+  const existingBody = record(
+    JSON.parse(await boundedText(existing)),
+    "reservation preflight invalid",
+  );
+  if (
+    existing.status !== 404 ||
+    record(existingBody.error, "reservation absence invalid").code !== "not_found"
+  )
+    throw new HostedSampleError(
+      "original reservation is present or absence is unknown; retain its journal",
+    );
+  const body = {
+    format: ORIGIN_RESERVATION_FORMAT,
+    requestedSubdomain: name,
+    expiresInSeconds: ORIGIN_RESERVATION_TTL_SECONDS,
+    ...(options.reservationOfferingId === undefined
+      ? {}
+      : { offeringId: options.reservationOfferingId }),
+  };
+  await client.journal({ kind: "original-reservation-intent", reservationId, ...body });
+  const response = await guardedFetch(client.fetcher, url, {
+    method: "PUT",
+    headers: { ...headers, "content-type": "application/json" },
+    body: canonicalJson(body),
+  });
+  const value: unknown = JSON.parse(await boundedText(response));
+  if (response.status !== 201)
+    throw new HostedSampleError(
+      `HTTP ${response.status} refused original reservation; retain its intent`,
+    );
+  const reservation = originalReservation(value, reservationId, name, options.now());
+  await client.journal({ kind: "original-reservation-acknowledged", ...reservation });
+  const readback = await fetchJson(client.fetcher, url, { method: "GET", headers });
+  const current = originalReservation(readback, reservationId, name, options.now());
+  if (canonicalJson(current) !== canonicalJson(reservation))
+    throw new HostedSampleError("original reservation changed during readback; retain its journal");
+  await client.journal({ kind: "original-reservation-confirmed", ...reservation });
+  return reservation;
+}
+
+function originalReservation(
+  input: unknown,
+  reservationId: string,
+  name: string,
+  now: Date,
+): OriginalReservation {
+  const value = record(input, "original reservation projection invalid");
+  if (
+    Object.keys(value).sort().join(",") !==
+      "canonicalPublicOrigin,expiresAt,format,requestedSubdomain,reservationId,revision,status" ||
+    value.format !== ORIGIN_RESERVATION_FORMAT ||
+    value.reservationId !== reservationId ||
+    value.requestedSubdomain !== name ||
+    value.canonicalPublicOrigin !== `https://${name}.app-staging.takos.jp` ||
+    typeof value.revision !== "string" ||
+    !/^[1-9][0-9]*$/u.test(value.revision) ||
+    typeof value.expiresAt !== "string" ||
+    !Number.isFinite(Date.parse(value.expiresAt)) ||
+    Date.parse(value.expiresAt) <= now.getTime() ||
+    value.status !== "prepared"
+  )
+    throw new HostedSampleError(
+      "original reservation does not match the exact prepared staging intent",
+    );
+  return {
+    format: ORIGIN_RESERVATION_FORMAT,
+    reservationId,
+    requestedSubdomain: name,
+    canonicalPublicOrigin: `https://${name}.app-staging.takos.jp`,
+    revision: value.revision,
+    expiresAt: value.expiresAt,
+    status: "prepared",
+  };
 }
 
 async function createResource(
@@ -1403,6 +1567,53 @@ async function waitForScheduledEvidence(input: {
   );
 }
 
+export function hostedSampleEndpointName(runId: string): string {
+  resourcePrefix(runId);
+  return `integration-${sha256Hex(new TextEncoder().encode(runId)).slice(0, 16)}-ep`;
+}
+
+export function typedEndpointUrlFromResource(input: {
+  readonly endpoint: ResourceResult;
+  readonly name: string;
+  readonly space: string;
+  readonly workerUid: string;
+  readonly reservedOrigin: string;
+}): string {
+  const { endpoint, name, space, workerUid, reservedOrigin } = input;
+  const resource = endpoint.resource;
+  const operation = endpoint.operation;
+  const spec = record(resource.spec, "Endpoint spec is invalid");
+  const worker = record(spec.worker, "Endpoint Worker binding is invalid");
+  const hostname = `${name}.app-staging.takos.jp`;
+  const output = record(resource.output, "Endpoint output is invalid");
+  if (
+    !/^integration-[a-f0-9]{16}-ep$/u.test(name) ||
+    !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u.test(endpoint.uid) ||
+    resource.uid !== endpoint.uid ||
+    resource.form !== WORKER_ENDPOINT_FORM_URL ||
+    resource.name !== name ||
+    resource.space !== space ||
+    resource.generation !== 1 ||
+    resource.observedGeneration !== 1 ||
+    resource.phase !== "idle" ||
+    resource.lastOperation !== endpoint.operationId ||
+    operation.id !== endpoint.operationId ||
+    operation.resourceUid !== endpoint.uid ||
+    operation.action !== "create" ||
+    operation.generation !== 1 ||
+    operation.status !== "succeeded" ||
+    operation.effect !== "complete" ||
+    worker.resourceUid !== workerUid ||
+    reservedOrigin !== `https://${hostname}` ||
+    output.hostname !== hostname ||
+    output.url !== `${reservedOrigin}/`
+  )
+    throw new HostedSampleError(
+      "Endpoint readback does not match its accepted name, UID, Operation and reserved staging origin",
+    );
+  return reservedOrigin;
+}
+
 export function endpointUrlFromResource(resource: JsonRecord, acceptedResourceUid: string): string {
   if (
     typeof acceptedResourceUid !== "string" ||
@@ -1635,7 +1846,7 @@ function usage(): string {
     "usage:",
     "  bun scripts/wfp-hosted-staging-e2e.ts --emit-fixture --artifact-base-url=https://.../ --output-dir=/tmp/wfp-fixture",
     "  bun scripts/wfp-hosted-staging-e2e.ts --check-fixture --fixture=/tmp/wfp-fixture/fixture.json",
-    "  bun scripts/wfp-hosted-staging-e2e.ts --run --fixture=/tmp/wfp-fixture/fixture.json --origin=https://integration-api.takoserver.com --writer-secret=/path/writer.secret --evidence-secret=/path/evidence.secret --source-commit=<full-sha> --journal=/tmp/run.jsonl --output=/tmp/evidence.json",
+    "  bun scripts/wfp-hosted-staging-e2e.ts --run --fixture=/tmp/wfp-fixture/fixture.json --origin=https://integration-api.takoserver.com --writer-secret=/path/writer.secret --evidence-secret=/path/evidence.secret --source-commit=<full-sha> --space=<actual-organization-id> [--reservation-offering-id=<eligible-offering-id>] --journal=/tmp/run.jsonl --output=/tmp/evidence.json",
   ].join("\n");
 }
 
@@ -1660,6 +1871,8 @@ async function main(argv: readonly string[]): Promise<number> {
     return 0;
   }
   if (flags.has("run")) {
+    const space = flags.get("space");
+    if (!space) throw new HostedSampleError("missing --space=<actual-organization-id>");
     const sourceCommit = requireFlag(flags, "source-commit");
     const repository = join(dirname(fileURLToPath(import.meta.url)), "..");
     const head = execFileSync("git", ["rev-parse", "HEAD"], {
@@ -1678,7 +1891,10 @@ async function main(argv: readonly string[]): Promise<number> {
       origin: requireFlag(flags, "origin"),
       writerSecretPath: requireFlag(flags, "writer-secret"),
       evidenceSecretPath: requireFlag(flags, "evidence-secret"),
-      space: flags.get("space") ?? DEFAULT_SPACE,
+      space,
+      ...(flags.has("reservation-offering-id")
+        ? { reservationOfferingId: requireFlag(flags, "reservation-offering-id") }
+        : {}),
       runId,
       pollSeconds: optionalInteger(flags, "poll-seconds", DEFAULT_POLL_SECONDS),
       scheduleSeconds: optionalInteger(flags, "schedule-timeout-seconds", DEFAULT_SCHEDULE_SECONDS),
