@@ -14,6 +14,7 @@ import {
 import { assertHostedPricingMatchesBilling, parseHostedPricing } from "../../src/hosted-pricing.ts";
 import { INTEGRATION_E2E_ORGANIZATION_ID } from "../../src/integration-e2e-credential-authority.ts";
 import { canonicalJson } from "../../src/json.ts";
+import { type OrgOnDemandTerms, parseOrgOnDemandTerms } from "../../src/org-on-demand-terms.ts";
 import {
   DEFAULT_CHECKOUT_MAXIMUM_MINOR,
   DEFAULT_CHECKOUT_MINIMUM_MINOR,
@@ -51,6 +52,18 @@ export function takoformV2StorageLineage(
   target: Pick<DeployTarget, "takoformV2">,
 ): "v2-artifacts-0075" | TakoformV2StorageLineage {
   return target.takoformV2?.storageLineage ?? "v2-artifacts-0075";
+}
+
+export interface DeployHostedBilling {
+  readonly selector: "canonical-test";
+  readonly stripeMode: "test";
+  readonly accountId: string;
+  readonly billingAuthority: string;
+  readonly onDemand?: {
+    readonly terms: OrgOnDemandTerms;
+    readonly cardSetupReturnUrls: { readonly successUrl: string; readonly cancelUrl: string };
+    readonly setupDisclosureRevision: string;
+  };
 }
 
 export interface DeployTarget {
@@ -122,12 +135,14 @@ export interface DeployTarget {
    * hold a `STRIPE_WEBHOOK_SECRET`. Only with `stripeCheckout`.
    */
   readonly stripeWebhook?: boolean;
-  /** Non-secret Stripe amounts and windows; each absent one takes its default. */
+  /** Non-secret Stripe settings; canonical Checkout uses its published bounds when absent. */
   readonly stripeSettings?: PaymentSettings;
   /** Optional versioned, non-secret Organization billing tariff. */
   readonly billingConfig?: BillingConfig;
   /** Exact bounded authoring JSON emitted as TAKOSERVER_HOSTED_PRICING. */
   readonly hostedPricing?: string;
+  /** Explicit Hosted TEST startup inputs; absence preserves the existing payment lane. */
+  readonly hostedBilling?: DeployHostedBilling;
   /**
    * DNS zones this deployment may attach customer Workers to.
    *
@@ -366,6 +381,7 @@ const DEPLOY_TARGET_OPTIONAL_KEYS: readonly string[] = [
   "stripeSettings",
   "billingConfig",
   "hostedPricing",
+  "hostedBilling",
   "zones",
   "aiModels",
   "objectBucketSupplies",
@@ -565,6 +581,9 @@ export function parseDeployTarget(
     ...(value.billingConfig === undefined
       ? {}
       : { billingConfig: deployBillingConfig(value.billingConfig) }),
+    ...(value.hostedBilling === undefined
+      ? {}
+      : { hostedBilling: deployHostedBilling(value.hostedBilling) }),
     ...(value.zones === undefined ? {} : { zones: zoneList(value.zones) }),
     ...(value.aiModels === undefined ? {} : { aiModels: modelList(value.aiModels) }),
     ...(value.objectBucketSupplies === undefined
@@ -603,7 +622,18 @@ export function parseDeployTarget(
         }),
     signing: signing(value.signing),
   };
+  if (target.hostedBilling !== undefined) {
+    if (target.stripeCheckout !== undefined || target.stripeWebhook !== undefined) {
+      throw preflightError("deploy target hostedBilling cannot mix legacy Stripe flags");
+    }
+    if (!target.billingConfig || value.hostedPricing === undefined || !target.consoleOrigin) {
+      throw preflightError(
+        "deploy target hostedBilling requires billingConfig, hostedPricing and consoleOrigin",
+      );
+    }
+  }
   if (
+    target.hostedBilling === undefined &&
     (target.stripeWebhook === true || target.stripeSettings !== undefined) &&
     target.stripeCheckout !== true
   ) {
@@ -919,20 +949,31 @@ export function parseDeployTarget(
 
 function deployHostedPricing(
   value: unknown,
-  target: Pick<DeployTarget, "billingConfig" | "stripeCheckout" | "stripeSettings">,
+  target: Pick<
+    DeployTarget,
+    "billingConfig" | "stripeCheckout" | "stripeSettings" | "hostedBilling"
+  >,
 ): string {
   try {
-    if (typeof value !== "string" || target.stripeCheckout !== true) throw new Error();
+    const canonical = target.hostedBilling !== undefined;
+    if (typeof value !== "string" || (!canonical && target.stripeCheckout !== true))
+      throw new Error();
     const pricing = parseHostedPricing(value);
     if (!pricing) throw new Error();
     assertHostedPricingMatchesBilling(pricing, target.billingConfig);
     const usagePlan = pricing.hostedPlanTable.plans.find((plan) => plan.tier === "usage");
+    // Canonical startup uses the explicitly published bounds unless a setting
+    // is also declared. Legacy Checkout keeps its existing default comparison.
+    const minimum =
+      target.stripeSettings?.checkoutMinimumMinor ??
+      (canonical ? usagePlan?.checkoutMinimumMinor : DEFAULT_CHECKOUT_MINIMUM_MINOR);
+    const maximum =
+      target.stripeSettings?.checkoutMaximumMinor ??
+      (canonical ? usagePlan?.checkoutMaximumMinor : DEFAULT_CHECKOUT_MAXIMUM_MINOR);
     if (
       !usagePlan ||
-      usagePlan.checkoutMinimumMinor !==
-        (target.stripeSettings?.checkoutMinimumMinor ?? DEFAULT_CHECKOUT_MINIMUM_MINOR) ||
-      usagePlan.checkoutMaximumMinor !==
-        (target.stripeSettings?.checkoutMaximumMinor ?? DEFAULT_CHECKOUT_MAXIMUM_MINOR)
+      usagePlan.checkoutMinimumMinor !== minimum ||
+      usagePlan.checkoutMaximumMinor !== maximum
     ) {
       throw new Error();
     }
@@ -944,6 +985,73 @@ function deployHostedPricing(
       "deploy target hostedPricing is invalid or does not match enabled billing and Checkout settings",
     );
   }
+}
+
+function deployHostedBilling(value: unknown): DeployHostedBilling {
+  if (!isRecord(value)) throw preflightError("deploy target hostedBilling must be an object");
+  assertExactKeys(value, ["selector", "stripeMode", "accountId", "billingAuthority"], ["onDemand"]);
+  if (value.selector !== "canonical-test" || value.stripeMode !== "test") {
+    throw preflightError(
+      "deploy target hostedBilling requires canonical-test and explicit TEST mode",
+    );
+  }
+  const accountId = pattern(
+    value.accountId,
+    /^acct_[A-Za-z0-9]{1,250}$/u,
+    "hostedBilling.accountId",
+  );
+  const billingAuthority = pattern(
+    value.billingAuthority,
+    /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u,
+    "hostedBilling.billingAuthority",
+  );
+  let onDemand: DeployHostedBilling["onDemand"];
+  if (value.onDemand !== undefined) {
+    try {
+      if (!isRecord(value.onDemand)) throw new TypeError();
+      assertExactKeys(value.onDemand, ["terms", "cardSetupReturnUrls", "setupDisclosureRevision"]);
+      const terms = parseOrgOnDemandTerms(value.onDemand.terms);
+      const urls = value.onDemand.cardSetupReturnUrls;
+      if (!isRecord(urls)) throw new TypeError();
+      assertExactKeys(urls, ["successUrl", "cancelUrl"]);
+      const returnUrl = (input: unknown): string => {
+        if (typeof input !== "string" || input.length > 2048) throw new TypeError();
+        const url = new URL(input);
+        if (
+          url.protocol !== "https:" ||
+          url.username ||
+          url.password ||
+          url.hash ||
+          [...url.searchParams.keys()].some((key) => /secret|token/iu.test(key))
+        )
+          throw new TypeError();
+        return input;
+      };
+      const successUrl = returnUrl(urls.successUrl),
+        cancelUrl = returnUrl(urls.cancelUrl);
+      if (new URL(successUrl).origin !== new URL(cancelUrl).origin) throw new TypeError();
+      onDemand = {
+        terms,
+        cardSetupReturnUrls: { successUrl, cancelUrl },
+        setupDisclosureRevision: pattern(
+          value.onDemand.setupDisclosureRevision,
+          /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u,
+          "hostedBilling.onDemand.setupDisclosureRevision",
+        ),
+      };
+    } catch {
+      throw preflightError(
+        "deploy target hostedBilling.onDemand must be complete valid configuration",
+      );
+    }
+  }
+  return {
+    selector: "canonical-test",
+    stripeMode: "test",
+    accountId,
+    billingAuthority,
+    ...(onDemand === undefined ? {} : { onDemand }),
+  };
 }
 
 function exactArtifactRecovery(value: unknown): NonNullable<DeployTarget["exactArtifactRecovery"]> {
