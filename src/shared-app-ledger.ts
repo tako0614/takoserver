@@ -1,4 +1,4 @@
-import type { Clock, Row, Sql, SqlStatement } from "./ports.ts";
+import type { Clock, Row, Sql, SqlParam, SqlStatement } from "./ports.ts";
 import { normalizeSharedAppName } from "./shared-app-name.ts";
 
 export const SHARED_APP_COOLDOWN_MILLISECONDS = 30 * 24 * 60 * 60 * 1_000;
@@ -27,6 +27,72 @@ export interface SharedAppAssignment extends SharedAppPin {
 
 export interface SharedAppSelection extends SharedAppPin {
   readonly script: string;
+}
+
+/** Actual accepted v2 pins supplied only by the owning business/publication composition. */
+export interface TrustedSharedAppRouteInput {
+  readonly commandRef: string;
+  readonly expected: SharedAppAssignment;
+  readonly accepted: {
+    readonly principal: string;
+    readonly space: string;
+    readonly endpointUid: string;
+    readonly endpointGeneration: number;
+    readonly workerUid: string;
+    readonly deploymentUid: string;
+    readonly deploymentGeneration: number;
+    readonly sourceOperationId: string;
+    readonly providerId: string;
+    readonly targetKey: string;
+    readonly script: string | null;
+  };
+}
+
+/** Trusted parameterized SQL from the existing owner acceptance/publication predicates, never HTTP input. */
+export interface TrustedSharedAppRouteGuards {
+  readonly admission: {
+    readonly sql: string;
+    readonly params: readonly (string | number | null)[];
+  };
+  readonly publication: {
+    readonly sql: string;
+    readonly params: readonly (string | number | null)[];
+  };
+}
+
+export interface SharedAppRouteOriginal extends TrustedSharedAppOwner {
+  readonly environment: SharedAppEnvironment;
+  readonly reservationId: string;
+  readonly name: string;
+  readonly action: "activate" | "advance" | "retire";
+  readonly incarnation: string;
+  readonly expectedGeneration: number;
+  readonly expectedState: "reserved" | "active";
+  readonly expectedScript: string | null;
+  readonly acceptedScript: string | null;
+  readonly commandRef: string;
+  readonly endpointUid: string;
+  readonly endpointGeneration: number;
+  readonly workerUid: string;
+  readonly deploymentUid: string;
+  readonly deploymentGeneration: number;
+  readonly sourceOperationId: string;
+  readonly providerId: string;
+  readonly targetKey: string;
+}
+
+export interface SharedAppRouteReceipt {
+  readonly original: SharedAppRouteOriginal;
+  /** Historical command outcome; use fresh readCurrent for current serving authority. */
+  readonly assignment: SharedAppAssignment;
+}
+
+export interface SharedAppRouteEffects {
+  readonly original: SharedAppRouteOriginal;
+  readonly before: readonly SqlStatement[];
+  /** AND this predicate into the ACTUAL owner route mutation, between before and after. */
+  readonly publicationGuard: SqlStatement;
+  readonly after: readonly SqlStatement[];
 }
 
 export interface SharedAppLegacyProjection {
@@ -95,16 +161,18 @@ export class SharedAppLedgerError extends Error {
   constructor(
     readonly code: "invalid_argument" | "conflict" | "unavailable" | "indeterminate",
     /** Retain this original command after an unknown write ACK; never mint a replacement. */
-    readonly original?: Readonly<
-      TrustedSharedAppOwner & {
-        readonly reservationId: string;
-        readonly name: string;
-        readonly action: "reserve" | "activate" | "release";
-        readonly incarnation: string;
-        readonly expectedGeneration: number | null;
-        readonly acceptedScript: string | null;
-      }
-    >,
+    readonly original?:
+      | SharedAppRouteOriginal
+      | Readonly<
+          TrustedSharedAppOwner & {
+            readonly reservationId: string;
+            readonly name: string;
+            readonly action: "reserve" | "activate" | "release";
+            readonly incarnation: string;
+            readonly expectedGeneration: number | null;
+            readonly acceptedScript: string | null;
+          }
+        >,
   ) {
     super(code);
     this.name = "SharedAppLedgerError";
@@ -120,6 +188,25 @@ export interface SharedAppLedger {
     }): Promise<SharedAppAssignment>;
     /** Script pins come from authoritative accepted resource/Provider readback, never a public body. */
     activate(expected: SharedAppPin, acceptedScript: string): Promise<SharedAppAssignment>;
+    /** These pure preparations NEVER commit. Compose before + actual guarded owner SQL + after in ONE batch. */
+    prepareActivate(
+      input: TrustedSharedAppRouteInput,
+      guards: TrustedSharedAppRouteGuards,
+    ): SharedAppRouteEffects;
+    prepareAdvance(
+      input: TrustedSharedAppRouteInput,
+      guards: TrustedSharedAppRouteGuards,
+    ): SharedAppRouteEffects;
+    prepareRetire(
+      input: TrustedSharedAppRouteInput,
+      guards: TrustedSharedAppRouteGuards,
+    ): SharedAppRouteEffects;
+    readRouteCommand(commandRef: string): Promise<SharedAppRouteReceipt | null>;
+    /** Readback only; unknown ACK never causes another write or native invocation. */
+    settleRoute(
+      original: SharedAppRouteOriginal,
+      acknowledgment: "acknowledged" | "unknown",
+    ): Promise<SharedAppRouteReceipt>;
     release(expected: SharedAppPin): Promise<SharedAppAssignment>;
     readOriginal(reservationId: string): Promise<SharedAppAssignment | null>;
   };
@@ -204,6 +291,30 @@ export function createSharedAppLedger(options: {
         return expected;
       };
       const read = (reservationId: string) => original(owner, opaque(reservationId));
+      const routeHistory = `${prefix}_route_commands`;
+      const readRouteCommand = async (
+        commandRef: string,
+      ): Promise<SharedAppRouteReceipt | null> => {
+        const reference = opaque(commandRef);
+        const rows = await primary().query(
+          `SELECT * FROM ${routeHistory} WHERE organization_id = ? AND command_ref = ? LIMIT 2`,
+          [owner.organizationId, reference],
+        );
+        if (rows.length > 1) fail("unavailable");
+        if (!rows[0]) return null;
+        const receipt = routeReceipt(rows[0], environment);
+        if (receipt.original.product !== owner.product) fail("conflict");
+        return receipt;
+      };
+      const prepareRoute = (
+        action: SharedAppRouteOriginal["action"],
+        input: TrustedSharedAppRouteInput,
+        guards: TrustedSharedAppRouteGuards,
+      ): SharedAppRouteEffects => {
+        // Capture every caller/owner pin, predicate and parameter synchronously, before any await.
+        const command = routeOriginal(action, input, owner, environment);
+        return routeEffects(command, guards, timestamp());
+      };
       const mutate = async (
         expected: SharedAppPin,
         state: "active" | "released",
@@ -300,6 +411,29 @@ export function createSharedAppLedger(options: {
       };
       return {
         readOriginal: read,
+        prepareActivate: (input, guards) => prepareRoute("activate", input, guards),
+        prepareAdvance: (input, guards) => prepareRoute("advance", input, guards),
+        prepareRetire: (input, guards) => prepareRoute("retire", input, guards),
+        readRouteCommand,
+        async settleRoute(input, acknowledgment) {
+          const command = captureRouteOriginal(input, owner, environment);
+          if (acknowledgment !== "acknowledged" && acknowledgment !== "unknown")
+            fail("invalid_argument");
+          let receipt: SharedAppRouteReceipt | null;
+          try {
+            receipt = await readRouteCommand(command.commandRef);
+          } catch (error) {
+            if (error instanceof SharedAppLedgerError && error.code === "conflict") throw error;
+            throw new SharedAppLedgerError("indeterminate", command);
+          }
+          if (receipt) {
+            if (!sameRouteOriginal(receipt.original, command)) fail("conflict");
+            return receipt;
+          }
+          if (acknowledgment === "unknown")
+            throw new SharedAppLedgerError("indeterminate", command);
+          return fail("conflict");
+        },
         async reserve(input) {
           // Snapshot all mutable caller objects before the first await.
           const incarnation = crypto.randomUUID().replaceAll("-", "");
@@ -491,4 +625,340 @@ function assignment(row: Row, environment: SharedAppEnvironment): SharedAppAssig
   } catch {
     return fail("unavailable");
   }
+}
+
+const ROUTE_COLUMNS = [
+  ["organizationId", "organization_id"],
+  ["product", "product"],
+  ["reservationId", "reservation_id"],
+  ["name", "name"],
+  ["incarnation", "incarnation"],
+  ["action", "action"],
+  ["commandRef", "command_ref"],
+  ["expectedGeneration", "prior_generation"],
+  ["expectedState", "prior_state"],
+  ["expectedScript", "prior_script"],
+  ["acceptedScript", "next_script"],
+  ["endpointUid", "endpoint_uid"],
+  ["endpointGeneration", "endpoint_generation"],
+  ["workerUid", "worker_uid"],
+  ["deploymentUid", "deployment_uid"],
+  ["deploymentGeneration", "deployment_generation"],
+  ["sourceOperationId", "source_operation_id"],
+  ["providerId", "provider_id"],
+  ["targetKey", "target_key"],
+] as const;
+
+function routeOriginal(
+  action: SharedAppRouteOriginal["action"],
+  input: TrustedSharedAppRouteInput,
+  owner: TrustedSharedAppOwner,
+  environment: SharedAppEnvironment,
+): SharedAppRouteOriginal {
+  const expected = selectedPin(input.expected, environment);
+  const state = input.expected.state;
+  const previousScript = input.expected.script === null ? null : opaque(input.expected.script);
+  const accepted = input.accepted;
+  const script = accepted.script === null ? null : opaque(accepted.script);
+  if (
+    expected.organizationId !== owner.organizationId ||
+    expected.product !== owner.product ||
+    accepted.principal !== `org:${owner.organizationId}` ||
+    accepted.space !== owner.organizationId
+  )
+    fail("conflict");
+  if (
+    !["activate", "advance", "retire"].includes(action) ||
+    expected.generation >= Number.MAX_SAFE_INTEGER - 1 ||
+    input.expected.releasedAt !== null ||
+    (action === "activate"
+      ? state !== "reserved" || previousScript !== null
+      : state !== "active" || previousScript === null) ||
+    (action === "retire" ? script !== null : script === null)
+  )
+    fail("invalid_argument");
+  return Object.freeze({
+    ...owner,
+    environment,
+    reservationId: expected.reservationId,
+    name: expected.name,
+    action,
+    incarnation: expected.incarnation,
+    expectedGeneration: expected.generation,
+    expectedState: state as "reserved" | "active",
+    expectedScript: previousScript,
+    acceptedScript: script,
+    commandRef: opaque(input.commandRef),
+    endpointUid: opaque(accepted.endpointUid),
+    endpointGeneration: routeGeneration(accepted.endpointGeneration),
+    workerUid: opaque(accepted.workerUid),
+    deploymentUid: opaque(accepted.deploymentUid),
+    deploymentGeneration: routeGeneration(accepted.deploymentGeneration),
+    sourceOperationId: opaque(accepted.sourceOperationId),
+    providerId: opaque(accepted.providerId),
+    targetKey: routeTargetKey(accepted.targetKey),
+  });
+}
+
+function routeGeneration(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 1 || value >= Number.MAX_SAFE_INTEGER)
+    fail("invalid_argument");
+  return value;
+}
+
+function routeTargetKey(value: unknown): string {
+  // Preserve the existing v2 owner token contract exactly; qualified target keys are not legacy128 IDs.
+  if (typeof value !== "string" || value.length === 0 || value.length > 255)
+    fail("invalid_argument");
+  return value;
+}
+
+function captureRouteOriginal(
+  command: SharedAppRouteOriginal,
+  owner: TrustedSharedAppOwner,
+  environment: SharedAppEnvironment,
+): SharedAppRouteOriginal {
+  return routeOriginal(
+    command.action,
+    {
+      commandRef: command.commandRef,
+      expected: {
+        ...command,
+        generation: command.expectedGeneration,
+        state: command.expectedState,
+        script: command.expectedScript,
+        releasedAt: null,
+      },
+      accepted: {
+        principal: `org:${command.organizationId}`,
+        space: command.organizationId,
+        endpointUid: command.endpointUid,
+        endpointGeneration: command.endpointGeneration,
+        workerUid: command.workerUid,
+        deploymentUid: command.deploymentUid,
+        deploymentGeneration: command.deploymentGeneration,
+        sourceOperationId: command.sourceOperationId,
+        providerId: command.providerId,
+        targetKey: command.targetKey,
+        script: command.acceptedScript,
+      },
+    },
+    owner,
+    environment,
+  );
+}
+
+function sameRouteOriginal(left: SharedAppRouteOriginal, right: SharedAppRouteOriginal): boolean {
+  return (
+    left.environment === right.environment &&
+    ROUTE_COLUMNS.every(([key]) => left[key] === right[key])
+  );
+}
+
+function routeReceipt(row: Row, environment: SharedAppEnvironment): SharedAppRouteReceipt {
+  try {
+    const raw: Record<string, unknown> = { environment };
+    for (const [key, column] of ROUTE_COLUMNS) raw[key] = row[column];
+    const owner = {
+      organizationId: opaque(row.organization_id),
+      product: productValue(row.product),
+    };
+    const original = captureRouteOriginal(
+      raw as unknown as SharedAppRouteOriginal,
+      owner,
+      environment,
+    );
+    const state = original.action === "retire" ? "reserved" : "active";
+    if (
+      row.next_generation !== original.expectedGeneration + 1 ||
+      row.next_state !== state ||
+      !Number.isSafeInteger(row.created_at) ||
+      Number(row.created_at) < 0
+    )
+      fail("unavailable");
+    return Object.freeze({
+      original,
+      assignment: Object.freeze({
+        environment,
+        organizationId: original.organizationId,
+        product: original.product,
+        reservationId: original.reservationId,
+        name: original.name,
+        incarnation: original.incarnation,
+        generation: original.expectedGeneration + 1,
+        state,
+        script: original.acceptedScript,
+        releasedAt: null,
+      }),
+    });
+  } catch {
+    return fail("unavailable");
+  }
+}
+
+function routeStatement(sql: string, params: readonly SqlParam[]): SqlStatement {
+  // Leave room below D1's100 bound-parameter limit; owner composition must also check its full route SQL.
+  if (params.length > 90) fail("invalid_argument");
+  return Object.freeze({ sql, params: Object.freeze([...params]) });
+}
+
+function routeEffects(
+  command: SharedAppRouteOriginal,
+  inputGuards: TrustedSharedAppRouteGuards,
+  now: number,
+): SharedAppRouteEffects {
+  const captureGuard = (input: TrustedSharedAppRouteGuards["admission"]): SqlStatement => {
+    const sql = input.sql;
+    if (typeof sql !== "string" || sql.trim().length === 0) fail("invalid_argument");
+    const params = input.params.map((value) => {
+      if (
+        value !== null &&
+        typeof value !== "string" &&
+        (typeof value !== "number" || !Number.isFinite(value))
+      )
+        fail("invalid_argument");
+      return value;
+    });
+    return routeStatement(sql, params);
+  };
+  const admission = captureGuard(inputGuards.admission);
+  const publication = captureGuard(inputGuards.publication);
+  // Literal table selection only. No public environment/table identifier is interpolated.
+  const prefix = command.environment === "staging" ? "shared_app_staging" : "shared_app_production";
+  const names = `${prefix}_names`;
+  const assignments = `${prefix}_assignments`;
+  const history = `${prefix}_route_commands`;
+  const assertions = `${prefix}_batch_assertions`;
+  const witness = crypto.randomUUID().replaceAll("-", "");
+  const nextGeneration = command.expectedGeneration + 1;
+  const nextState = command.action === "retire" ? "reserved" : "active";
+  const historyColumns = [
+    ...ROUTE_COLUMNS.map(([, column]) => column),
+    "next_generation",
+    "next_state",
+  ];
+  const historyParams: readonly SqlParam[] = [
+    ...ROUTE_COLUMNS.map(([key]) => command[key]),
+    nextGeneration,
+    nextState,
+  ];
+  const historyMatch = historyColumns.map((column) => `h.${column} IS ?`).join(" AND ");
+  const sameHistory = `EXISTS (SELECT 1 FROM ${history} AS h WHERE ${historyMatch})`;
+  const originalKey = `SELECT 1 FROM ${history} WHERE organization_id = ? AND command_ref = ?`;
+  const ownerParams = [command.organizationId, command.commandRef];
+  const tuple = (
+    generation: number,
+    state: string,
+    script: string | null,
+    joinName: boolean,
+  ): SqlStatement => {
+    const join = joinName
+      ? ` JOIN ${names} AS n ON n.normalized_name = a.name
+      AND n.incarnation = a.incarnation AND n.generation = a.generation AND n.state = a.state
+      AND n.released_at IS NULL`
+      : "";
+    return routeStatement(
+      `SELECT 1 FROM ${assignments} AS a${join}
+      WHERE a.organization_id = ? AND a.product = ? AND a.reservation_id = ? AND a.name = ?
+      AND a.incarnation = ? AND a.generation = ? AND a.state = ? AND a.script IS ? AND a.released_at IS NULL`,
+      [
+        command.organizationId,
+        command.product,
+        command.reservationId,
+        command.name,
+        command.incarnation,
+        generation,
+        state,
+        script,
+      ],
+    );
+  };
+  const prior = tuple(
+    command.expectedGeneration,
+    command.expectedState,
+    command.expectedScript,
+    true,
+  );
+  const nextAssignment = tuple(nextGeneration, nextState, command.acceptedScript, false);
+  const next = tuple(nextGeneration, nextState, command.acceptedScript, true);
+  const fresh = `EXISTS (SELECT 1 FROM ${assertions} WHERE witness = ? AND apply_effects = 1)`;
+  const before = [
+    routeStatement(
+      `INSERT INTO ${assertions} (witness, ok, apply_effects)
+      SELECT ?, CASE WHEN ${sameHistory} OR (NOT EXISTS (${originalKey})
+        AND EXISTS (${prior.sql}) AND (${admission.sql})) THEN 1 ELSE 0 END,
+        CASE WHEN EXISTS (${originalKey}) THEN 0 ELSE 1 END`,
+      [
+        witness,
+        ...historyParams,
+        ...ownerParams,
+        ...(prior.params ?? []),
+        ...(admission.params ?? []),
+        ...ownerParams,
+      ],
+    ),
+    routeStatement(
+      `INSERT INTO ${history} (${historyColumns.join(", ")}, created_at)
+      SELECT ${[...historyParams, now].map(() => "?").join(", ")} WHERE ${fresh}`,
+      [...historyParams, now, witness],
+    ),
+    routeStatement(
+      `UPDATE ${assignments} SET generation = ?, state = ?, script = ?, updated_at = ?
+      WHERE incarnation = ? AND EXISTS (${prior.sql}) AND ${fresh}`,
+      [
+        nextGeneration,
+        nextState,
+        command.acceptedScript,
+        now,
+        command.incarnation,
+        ...(prior.params ?? []),
+        witness,
+      ],
+    ),
+    routeStatement(
+      `UPDATE ${names} SET generation = ?, state = ?, released_at = NULL, updated_at = ?
+      WHERE normalized_name = ? AND incarnation = ? AND generation = ? AND state = ?
+        AND EXISTS (${nextAssignment.sql}) AND ${fresh}`,
+      [
+        nextGeneration,
+        nextState,
+        now,
+        command.name,
+        command.incarnation,
+        command.expectedGeneration,
+        command.expectedState,
+        ...(nextAssignment.params ?? []),
+        witness,
+      ],
+    ),
+  ];
+  const publicationGuard = routeStatement(
+    `${fresh} AND EXISTS (${next.sql}) AND EXISTS (${originalKey})`,
+    [witness, ...(next.params ?? []), ...ownerParams],
+  );
+  const after = [
+    routeStatement(
+      `INSERT INTO ${assertions} (witness, ok, apply_effects)
+      SELECT ?, CASE WHEN ${sameHistory} AND EXISTS (SELECT 1 FROM ${assertions}
+        WHERE witness = ? AND (apply_effects = 0 OR (apply_effects = 1
+          AND EXISTS (${next.sql}) AND (${publication.sql})))) THEN 1 ELSE 0 END, 0`,
+      [
+        `${witness}:result`,
+        ...historyParams,
+        witness,
+        ...(next.params ?? []),
+        ...(publication.params ?? []),
+      ],
+    ),
+    routeStatement(`DELETE FROM ${assertions} WHERE witness IN (?, ?)`, [
+      witness,
+      `${witness}:result`,
+    ]),
+  ];
+  return Object.freeze({
+    original: command,
+    before: Object.freeze(before),
+    publicationGuard,
+    after: Object.freeze(after),
+  });
 }
