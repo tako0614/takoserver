@@ -214,6 +214,9 @@ export {
 } from "./providers/http-revision-serving.ts";
 export { ProviderMeterError } from "./providers/provider-meter.ts";
 export {
+  SELFHOST_DATA_PLANE_CONTENT_TYPE,
+  SELFHOST_DATA_PLANE_PROTOCOL,
+  SELFHOST_DATA_PLANE_SQL_PATH,
   type SelfhostWorkerForwardObjectBucketSourceInput,
   selfhostWorkerForwardObjectBucketEntrypointSource,
 } from "./providers/selfhost-worker-wrapper.ts";
