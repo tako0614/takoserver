@@ -2,7 +2,7 @@ import { formatMicrosCurrency, type Organization } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
 import { consoleLocale, tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
-import { byForm, health } from "../resource-state.ts";
+import { byForm, health, phaseLabel } from "../resource-state.ts";
 import { linkProps, resourcePath } from "../router.ts";
 import { api } from "../state.ts";
 import { ago, badge, card, copyable, empty, ICON, icon, stat, whenReady } from "../ui.ts";
@@ -310,16 +310,4 @@ export function overviewPage(organization: Organization): Child {
 
 function uiLocale(): "en-US" | "ja-JP" {
   return consoleLocale() === "ja" ? "ja-JP" : "en-US";
-}
-
-function phaseLabel(phase: ReturnType<typeof health>["phase"]): string {
-  const japanese = {
-    Ready: "稼働中",
-    NotReady: "非稼働",
-    Pending: "処理中",
-    Failed: "失敗",
-    Deleting: "削除中",
-    Unknown: "不明",
-  } as const;
-  return tr(japanese[phase], phase);
 }

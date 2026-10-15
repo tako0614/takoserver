@@ -102,8 +102,10 @@ const written = await sql.run(
   "UPDATE orgs SET owner_principal_id = ? WHERE id = ? AND owner_principal_id = ?",
   [ownerId, organizationId, String(org.owner_principal_id)],
 );
-if (written.changes !== 1) {
-  process.stderr.write("the organization moved while this was running; nothing was written\n");
+if (!Number.isSafeInteger(written.changes) || written.changes <= 0) {
+  process.stderr.write(
+    "transfer could not be confirmed; inspect the organization before retrying\n",
+  );
   process.exit(1);
 }
 
