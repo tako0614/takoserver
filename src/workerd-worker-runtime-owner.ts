@@ -55,6 +55,9 @@ import type {
 } from "./takoform-v2/forms/queue-worker-binding-authority.ts";
 import type { SQLiteWorkerBindingClaim } from "./takoform-v2/forms/sqlite-worker-binding-authority.ts";
 import {
+  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+  FORWARD_WORKER_VERSION_FORM_URL,
+  parseForwardWorkerVersionSpec,
   parseWorkerEndpointSpec,
   parseWorkerVersionSpec,
   WORKER_DEPLOYMENT_FORM_URL,
@@ -150,6 +153,10 @@ const ENDPOINT_HOSTNAME =
 const PRIVATE_SOCKET_NAME = /^[0-9a-f]{64}\.sock$/u;
 
 type PublicationState = {
+  resolveForward?(input: {
+    execution: V2Execution;
+    incumbentSourceOperationId?: string;
+  }): Promise<V2WorkerPublicationResolution>;
   resolve(input: {
     execution: V2Execution;
     incumbentSourceOperationId?: string;
@@ -186,6 +193,21 @@ type PublicationState = {
     | { readonly kind: "unresolved"; readonly code: string; readonly message: string }
   >;
 };
+
+function parseHeldVersion(
+  version: NonNullable<V2WorkerPublicationSnapshot["deployment"]>["versions"][number],
+) {
+  if (version.form !== undefined && version.form !== FORWARD_WORKER_VERSION_FORM_URL)
+    throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+  return version.form === FORWARD_WORKER_VERSION_FORM_URL
+    ? parseForwardWorkerVersionSpec(version.spec)
+    : parseWorkerVersionSpec(version.spec);
+}
+function isDeploymentForm(form: string, forward: boolean): boolean {
+  return (
+    form === WORKER_DEPLOYMENT_FORM_URL || (forward && form === FORWARD_WORKER_DEPLOYMENT_FORM_URL)
+  );
+}
 
 type IncarnationStatus = "candidate" | "active" | "draining" | "retiring" | "retired" | "uncertain";
 
@@ -2428,7 +2450,19 @@ export function workerdWorkerPrivateSocketDirectory(
 }
 
 export async function openWorkerdWorkerRuntimeOwner(
+  options: OpenWorkerdWorkerRuntimeOwnerOptions,
+): Promise<WorkerdWorkerRuntimeOwner> {
+  return await openRuntimeOwner(options, false);
+}
+/** Named forward boot; same durable owner, lock, execution and retirement authority. */
+export async function openForwardWorkerdWorkerRuntimeOwner(
+  options: OpenWorkerdWorkerRuntimeOwnerOptions,
+): Promise<WorkerdWorkerRuntimeOwner> {
+  return await openRuntimeOwner(options, true);
+}
+async function openRuntimeOwner(
   inputOptions: OpenWorkerdWorkerRuntimeOwnerOptions,
+  forwardFamily: boolean,
 ): Promise<WorkerdWorkerRuntimeOwner> {
   const options = Object.freeze({ ...inputOptions });
   validateOperationId("00000000-0000-4000-8000-000000000000");
@@ -3777,6 +3811,7 @@ export async function openWorkerdWorkerRuntimeOwner(
     record: IncarnationRecord,
     snapshot: V2WorkerPublicationSnapshot,
     phase: "pinned" | "active",
+    stillCurrent: () => Promise<boolean>,
   ): Promise<void> => {
     const deployment = snapshot.deployment;
     if (!deployment || !record.identity) {
@@ -3822,7 +3857,40 @@ export async function openWorkerdWorkerRuntimeOwner(
       ) {
         throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       }
-      const declared = parseWorkerVersionSpec(version.spec).serviceBindings;
+      const spec = parseHeldVersion(version);
+      if (version.form === FORWARD_WORKER_VERSION_FORM_URL && selected.site.kind !== "static") {
+        const configured =
+          spec.requiredSensitiveVars.length > 0
+            ? await options.configuredInputs?.read({
+                resourceUid: version.uid,
+                principal: snapshot.worker.principal,
+                space: snapshot.worker.space,
+                targetKey: options.targetKey,
+                spec,
+                stillCurrent,
+              })
+            : undefined;
+        if (spec.requiredSensitiveVars.length > 0 && !configured)
+          throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+        const expected = [
+          ...Object.entries(spec.vars).map(([name, value]) => ({
+            name,
+            value: canonicalJson(value),
+            kind: "json",
+          })),
+          ...Object.entries(configured ?? {}).map(([name, value]) => ({
+            name,
+            value,
+            kind: "text",
+          })),
+        ].sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+        if (
+          canonicalJson(selected.site.vars ?? []) !== canonicalJson(expected) ||
+          !(await stillCurrent())
+        )
+          throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      }
+      const declared = spec.serviceBindings;
       const persisted =
         selected.site.kind === "static" ? [] : (selected.site.serviceBindings ?? []);
       const hasExactPrivateOrdinals = persisted.every(
@@ -3982,13 +4050,25 @@ export async function openWorkerdWorkerRuntimeOwner(
     // Recovery removed only the previously proved-dead child's config-declared
     // sockets above. Pin the now-empty directory before recreating its brokers.
     await handle.runtime.preparePrivateServiceBindingSockets();
-    await restoreServiceBindingBrokers(handle, activeRecord, resolution.snapshot, "pinned");
+    await restoreServiceBindingBrokers(
+      handle,
+      activeRecord,
+      resolution.snapshot,
+      "pinned",
+      resolution.stillCurrent,
+    );
     await updateRecord(activeRecord.operationId, (current) => ({
       ...current,
       configurationRefreshPending: true,
     }));
     const restoredNames = await handle.runtime.restore();
-    await restoreServiceBindingBrokers(handle, activeRecord, resolution.snapshot, "active");
+    await restoreServiceBindingBrokers(
+      handle,
+      activeRecord,
+      resolution.snapshot,
+      "active",
+      resolution.stillCurrent,
+    );
     const nativeProof = await handle.runtime.observeExactPublication?.(
       scriptName(options.workerResourceUid),
       activeRecord.identity,
@@ -4230,7 +4310,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       return { kind: "not_dispatched", code: "worker_operation_invalid" };
     }
     if (
-      captured.form === WORKER_DEPLOYMENT_FORM_URL &&
+      isDeploymentForm(captured.form, forwardFamily) &&
       captured.action === "delete" &&
       captured.targetKey === options.targetKey &&
       workerFromExecution(captured) === options.workerResourceUid &&
@@ -4260,7 +4340,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       if (closed || suspending) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
       validateOperationId(execution.operationId);
       if (
-        (execution.form !== WORKER_DEPLOYMENT_FORM_URL &&
+        (!isDeploymentForm(execution.form, forwardFamily) &&
           execution.form !== WORKER_ENDPOINT_FORM_URL) ||
         execution.targetKey !== options.targetKey ||
         workerFromExecution(execution) !== options.workerResourceUid
@@ -4275,7 +4355,7 @@ export async function openWorkerdWorkerRuntimeOwner(
           return { kind: "unknown" };
         }
       }
-      if (execution.form === WORKER_DEPLOYMENT_FORM_URL && execution.action === "delete") {
+      if (isDeploymentForm(execution.form, forwardFamily) && execution.action === "delete") {
         try {
           return await deleteDeployment(execution);
         } catch {
@@ -5771,7 +5851,7 @@ export async function openWorkerdWorkerRuntimeOwner(
       try {
         if (
           snapshot.deployment.versions.some(
-            (version) => !parseWorkerVersionSpec(version.spec).handlers.includes("scheduled"),
+            (version) => !parseHeldVersion(version).handlers.includes("scheduled"),
           )
         ) {
           return unknown;
@@ -5935,7 +6015,7 @@ export async function openWorkerdWorkerRuntimeOwner(
                 `v2-${createHash("sha256")
                   .update(`${version.workerVersionUid}\u0000${version.generation}`)
                   .digest("hex")}` ||
-              !parseWorkerVersionSpec(version.spec).handlers.includes("queue")
+              !parseHeldVersion(version).handlers.includes("queue")
             );
           })
         )
@@ -6202,7 +6282,7 @@ export async function openWorkerdWorkerRuntimeOwner(
             .sort((a, b) => a.workerVersionUid.localeCompare(b.workerVersionUid)),
         ) !== canonicalJson(selectedCore) ||
         snapshot.deployment.versions.some(
-          (version) => !parseWorkerVersionSpec(version.spec).handlers.includes("queue"),
+          (version) => !parseHeldVersion(version).handlers.includes("queue"),
         ) ||
         !(await resolution.stillCurrent().catch(() => false)) ||
         (await incarnation.runtime.observeExactPublication?.(
