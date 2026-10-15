@@ -132,25 +132,57 @@ test("invalid mode and a raced legacy write both refuse without recording 98", (
 });
 
 test("a late 98 execution failure rolls back every pending migration in the same writer", () => {
-  for (const failingStatement of [
-    "CREATE TABLE stripe_mode_realm",
-    "INSERT INTO stripe_mode_realm",
-  ]) {
+  for (const failurePhase of ["0098_stripe_mode_realm.sql", "Stripe realm claim"]) {
     const db = new Database(":memory:");
-    oldThrough(db, 96);
-    const before = snapshot(db);
-    const failing: MigratableDatabase = {
-      query: (sql) => db.query(sql),
-      exec(sql) {
-        if (sql.startsWith(failingStatement)) throw new Error("injected 98 failure");
-        return db.exec(sql);
-      },
-    };
-    expect(() => migrateSqlite(failing, { stripeMode: "live" })).toThrow(
-      `migration ${failingStatement.startsWith("CREATE") ? "0098_stripe_mode_realm.sql" : "Stripe realm claim"} failed`,
-    );
-    expect(snapshot(db)).toEqual(before);
-    db.close();
+    try {
+      oldThrough(db, 96);
+      const before = snapshot(db);
+      const faults: { inTransaction: boolean; realm: unknown[]; applied: unknown[] }[] = [];
+      const failing: MigratableDatabase = {
+        query: (sql) => db.query(sql),
+        exec(sql) {
+          const result = db.exec(sql);
+          if (
+            faults.length > 0 ||
+            !db
+              .query("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='stripe_mode_realm'")
+              .get()
+          ) {
+            return result;
+          }
+          const realm = db.query("SELECT singleton, mode FROM stripe_mode_realm").all();
+          // Observe completed DDL/DML, independent of the frame's leading comments or whitespace.
+          if (failurePhase === "0098_stripe_mode_realm.sql" || realm.length > 0) {
+            faults.push({
+              inTransaction: db.inTransaction,
+              realm,
+              applied: db.query("SELECT name FROM applied_migrations ORDER BY rowid").all(),
+            });
+            throw new Error("injected 98 failure");
+          }
+          return result;
+        },
+      };
+      expect(() => migrateSqlite(failing, { stripeMode: "live" })).toThrow(
+        `migration ${failurePhase} failed: Error: injected 98 failure`,
+      );
+      expect(faults).toHaveLength(1);
+      expect(faults).toEqual([
+        {
+          inTransaction: true,
+          realm:
+            failurePhase === "0098_stripe_mode_realm.sql" ? [] : [{ singleton: 1, mode: "live" }],
+          applied: MIGRATIONS.slice(
+            0,
+            failurePhase === "0098_stripe_mode_realm.sql" ? 97 : MIGRATIONS.length,
+          ).map(({ name }) => ({ name })),
+        },
+      ]);
+      expect(db.inTransaction).toBe(false);
+      expect(snapshot(db)).toEqual(before);
+    } finally {
+      db.close();
+    }
   }
 });
 
