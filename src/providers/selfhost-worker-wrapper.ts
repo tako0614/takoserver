@@ -2402,7 +2402,7 @@ function objectParts(value) {
     const part = value[index];
     if (!isPlainRecord(part) || !exactKeys(part, ["etag", "partNumber"])) objectBindingTypeError();
     objectPartNumber(part.partNumber);
-    if (part.partNumber <= previous) throw portableError("invalid_part");
+    if (part.partNumber <= previous) ${forwardBindings === undefined ? 'throw portableError("invalid_part")' : "objectBindingTypeError()"};
     previous = part.partNumber;
     const projected = SafeObjectCreate(null);
     projected.etag = objectPartEtag(part.etag);

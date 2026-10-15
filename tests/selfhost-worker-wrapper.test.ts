@@ -2172,6 +2172,117 @@ test("forward ObjectBucket renderer owns ArrayBuffer and options before the firs
   }
 });
 
+test("forward ObjectBucket renderer rejects completion JS shape and order before transport", async () => {
+  const { service, calls } = objectPlane([]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+      const results={};
+      const cases=()=>[
+        [{partNumber:1,etag:"a"},{partNumber:1,etag:"b"}],
+        [{partNumber:2,etag:"b"},{partNumber:1,etag:"a"}],
+        null, [], new Array(10001), new Array(1),
+        [null], [{partNumber:1}], [{etag:"a"}],
+        [{partNumber:"1",etag:"a"}], [{partNumber:1,etag:1}],
+        [{partNumber:1,etag:"a",extra:true}],
+      ];
+      for(const name of ["OLD","NEW"]){
+        results[name]=[];
+        for(const parts of cases()){
+          try{await env[name].completeMultipartUpload("key","upload",parts);results[name].push("unexpected success")}
+          catch(e){results[name].push(e.name)}
+        }
+      }
+      return Response.json(results);
+    } }`,
+    FORWARD_OBJECT_INPUT,
+    FORWARD_OBJECT_FORMS,
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://example.com"),
+      rawEnv(service),
+      {},
+    );
+    expect(await response.json()).toEqual({
+      OLD: Array(12).fill("TypeError"),
+      NEW: Array(12).fill("TypeError"),
+    });
+    expect(calls).toHaveLength(0);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("forward ObjectBucket renderer retains invalid_part for well-shaped stored part mismatches", async () => {
+  const { service, calls } = objectPlane([
+    { ok: true, value: { uploadId: "owned-upload" } },
+    { ok: true, value: { etag: "stored-part", partNumber: 1, size: 1 } },
+    { ok: false, error: { code: "invalid_part" } },
+  ]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+      const upload=await env.NEW.createMultipartUpload("key");
+      await env.NEW.uploadPart("key",upload.uploadId,1,"x");
+      const result={};
+      try{await env.NEW.completeMultipartUpload("key",upload.uploadId,[{partNumber:1,etag:"wrong-etag"}])}
+      catch(e){result.knownEtagMismatch=e.name}
+      try{await env.NEW.completeMultipartUpload("key","untracked-upload",[{partNumber:1,etag:"not-stored"}])}
+      catch(e){result.backendPartMismatch=e.name}
+      return Response.json(result);
+    } }`,
+    FORWARD_OBJECT_INPUT,
+    FORWARD_OBJECT_FORMS,
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://example.com"),
+      rawEnv(service),
+      {},
+    );
+    expect(await response.json()).toEqual({
+      knownEtagMismatch: "invalid_part",
+      backendPartMismatch: "invalid_part",
+    });
+    expect(calls.map((call) => call.document.op)).toEqual([
+      "createMultipartUpload",
+      "uploadPart",
+      "completeMultipartUpload",
+    ]);
+    expect(calls[2]?.document.uploadId).toBe("untracked-upload");
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("forward ObjectBucket renderer correction leaves legacy completion behavior intact", async () => {
+  const { service, calls } = objectPlane([]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+      const result=[];
+      for(const parts of [
+        [{partNumber:1,etag:"a"},{partNumber:1,etag:"b"}],
+        [{partNumber:2,etag:"b"},{partNumber:1,etag:"a"}],
+      ]){
+        try{await env.MEDIA.completeMultipartUpload("key","upload",parts);result.push("unexpected success")}
+        catch(e){result.push(e.name)}
+      }
+      return Response.json(result);
+    } }`,
+    OBJECTS_ONLY,
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://example.com"),
+      rawEnv(service),
+      {},
+    );
+    expect(await response.json()).toEqual(["invalid_part", "invalid_part"]);
+    expect(calls).toHaveLength(0);
+  } finally {
+    await generated.dispose();
+  }
+});
+
 test("forward ObjectBucket renderer preserves validated nonbyte and late-producer failures", async () => {
   const { service, calls } = objectPlane([]);
   const generated = await loadGenerated(
