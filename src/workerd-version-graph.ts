@@ -353,8 +353,10 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
     ...(eventToken === undefined ? {} : { events: true }),
     ...(v2QueueSettlement === undefined ? {} : { v2Queue: true }),
   };
+  // The exact profile was validated against every declared bucket above.
+  // An empty accepted profile introduces no forward bucket semantics.
   const wrapperSource =
-    forwardObjectBucketBindings === undefined
+    forwardObjectBucketBindings === undefined || forwardObjectBucketBindings.length === 0
       ? selfhostWorkerEntrypointSource(wrapperInput, v2PrivateNames)
       : selfhostWorkerForwardObjectBucketEntrypointSource(
           { source: wrapperInput, objectBucketBindings: forwardObjectBucketBindings },

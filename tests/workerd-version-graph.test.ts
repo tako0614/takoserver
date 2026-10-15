@@ -1223,3 +1223,75 @@ test("forward actual graph retains six old renderer byte outputs and selects exa
   ).toThrow();
   expect(() => compileWorkerdVersionGraph({ ...input, generation: "legacy-graph" })).toThrow();
 });
+
+test("forward empty accepted bucket profile preserves exact omitted-profile graph bytes", () => {
+  for (const environment of [
+    [],
+    [{ name: "LABEL", value: "held", type: "plain_text" as const }],
+    [{ name: "FLAG", value: "true", type: "json" as const }],
+    [{ name: "PRIVATE", value: "synthetic-secret", type: "secret_text" as const }],
+  ]) {
+    const input = graphInput({
+      generation: "takoserver-v2-operation:11111111-1111-4111-8111-111111111111",
+      environment,
+    });
+    const omitted = compileWorkerdVersionGraph(input);
+    const empty = compileWorkerdVersionGraph({ ...input, forwardObjectBucketBindings: [] });
+    expect(empty.site).toEqual(omitted.site);
+    expect([...empty.modules.entries()]).toEqual([...omitted.modules.entries()]);
+    expect(empty.assets).toEqual(omitted.assets);
+    expect([...empty.hostModules.entries()]).toEqual([...omitted.hostModules.entries()]);
+    expect(empty.hostModules.get(WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE)).toEqual(
+      omitted.hostModules.get(WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE),
+    );
+  }
+});
+
+test("forward empty bucket profile still refuses declarations and malformed profiles", () => {
+  const input = graphInput({
+    generation: "takoserver-v2-operation:11111111-1111-4111-8111-111111111111",
+    environment: [],
+  });
+  expect(() =>
+    compileWorkerdVersionGraph({
+      ...input,
+      forwardObjectBucketBindings: [],
+      v2ObjectBucketBinding: {
+        address: "127.0.0.1:4777",
+        token: `e30.${"a".repeat(43)}`,
+        bindings: [{ publicName: "BUCKET" }],
+      },
+    }),
+  ).toThrow(TypeError);
+  expect(() =>
+    compileWorkerdVersionGraph({
+      ...input,
+      forwardObjectBucketBindings: new Array(1),
+    }),
+  ).toThrow(TypeError);
+  const accessor = [
+    {
+      publicName: "BUCKET",
+      resourceUid: "bucket-001",
+      formUrl: "https://edge.forms.takoform.com/forms/ObjectBucket/0.3.0/" as const,
+    },
+  ];
+  let getterCalls = 0;
+  Object.defineProperty(accessor[0], "formUrl", {
+    get() {
+      getterCalls += 1;
+      return "https://edge.forms.takoform.com/forms/ObjectBucket/0.3.0/";
+    },
+  });
+  expect(() =>
+    compileWorkerdVersionGraph({ ...input, forwardObjectBucketBindings: accessor }),
+  ).toThrow(TypeError);
+  expect(getterCalls).toBe(0);
+  expect(() =>
+    compileWorkerdVersionGraph({
+      ...input,
+      generation: "legacy-graph",
+      forwardObjectBucketBindings: [],
+    }),
+  ).toThrow(TypeError);
+});
