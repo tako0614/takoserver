@@ -746,6 +746,11 @@ tbody tr.is-clickable:hover {
   font-size: 13px;
 }
 
+/* The alert mark keeps its size beside text long enough to wrap. */
+.notice > svg:first-child {
+  flex: none;
+}
+
 .notice--bad {
   border-color: color-mix(in srgb, var(--bad) 35%, transparent);
   background: var(--bad-soft);
