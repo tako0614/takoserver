@@ -3,14 +3,14 @@ import { createHash } from "node:crypto";
 import { copyFileSync, mkdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { canonicalSchemaShape, type D1SchemaState } from "../../scripts/deploy/migrations.ts";
-import { readCurrentAuditedMigrationSourceArtifact } from "../../scripts/deploy/schema.ts";
+import { readCurrentMigrationSourceArtifact } from "../../scripts/deploy/schema.ts";
 import { MIGRATIONS, type Migration } from "../../src/db-schema.ts";
 
 const APPLY_QUALIFIED_MIGRATION_END = "0066_cloudflare_managed_actor_kv_capability_claims.sql";
 
 /** The source auditor owns the current tail; this independently checks generated SQL bytes. */
 export function currentAuditedSchemaMigrations(): readonly Migration[] {
-  const source = readCurrentAuditedMigrationSourceArtifact();
+  const source = readCurrentMigrationSourceArtifact();
   if (
     MIGRATIONS.length !== source.files.length ||
     MIGRATIONS.some(

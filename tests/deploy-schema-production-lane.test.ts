@@ -47,16 +47,16 @@ afterAll(() => rmSync(auditedFixtureRoot, { recursive: true, force: true }));
 // of relying on untracked migrations in the ambient worktree.
 const INVENTED_UNAUDITED_TAIL = [
   [
-    "0096_container_runtime_input_custody.sql",
-    "CREATE TABLE synthetic_0096_container_runtime_input_custody (id TEXT);\n",
+    "0097_container_runtime_input_custody.sql",
+    "CREATE TABLE synthetic_0097_container_runtime_input_custody (id TEXT);\n",
   ],
   [
-    "0097_container_runtime_input_rewrap.sql",
-    "CREATE TABLE synthetic_0097_container_runtime_input_rewrap (id TEXT);\n",
+    "0098_container_runtime_input_rewrap.sql",
+    "CREATE TABLE synthetic_0098_container_runtime_input_rewrap (id TEXT);\n",
   ],
   [
-    "0098_container_runtime_input_acceptance.sql",
-    "CREATE TABLE synthetic_0098_container_runtime_input_acceptance (id TEXT);\n",
+    "0099_container_runtime_input_acceptance.sql",
+    "CREATE TABLE synthetic_0099_container_runtime_input_acceptance (id TEXT);\n",
   ],
 ] as const;
 
@@ -702,7 +702,9 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0095");
+      expect(String(failure)).toContain(
+        "audited migration lineage must contain exactly 0001-0095 or the known 0001-0096 source inventory",
+      );
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1084,7 +1086,9 @@ describe("production-shaped D1 migration lane", () => {
           cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
         },
       ).catch((error) => error);
-      expect(failure.message).toContain("exact audited source inventory");
+      expect(failure.message).toContain(
+        "audited migration lineage must contain exactly 0001-0095 or the known 0001-0096 source inventory",
+      );
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -1136,7 +1140,9 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0095");
+      expect(String(failure)).toContain(
+        "audited migration lineage must contain exactly 0001-0095 or the known 0001-0096 source inventory",
+      );
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1254,7 +1260,7 @@ describe("production-shaped D1 migration lane", () => {
       expected: "selected D1 wave requires the exact audited source inventory 0001-0095",
     },
     { name: "changed", expected: "exact audited migration SHA-256" },
-    { name: "extra", expected: "exact audited source inventory 0001-0095" },
+    { name: "extra", expected: "audited migration lineage must contain exactly 0001-0095" },
   ] as const) {
     test(`current 0095 source closure refuses ${drift.name} bytes without provider command calls`, async () => {
       const root = mkdtempSync(join(tmpdir(), `takoserver-schema-0089-${drift.name}-`));
@@ -1263,6 +1269,7 @@ describe("production-shaped D1 migration lane", () => {
         cpSync(currentMigrations, migrationDirectory, { recursive: true });
         const migration0092 = join(migrationDirectory, "0092_org_wallet_lifecycle.sql");
         if (drift.name === "missing") {
+          rmSync(join(migrationDirectory, "0096_v2_configured_update_inputs.sql"));
           rmSync(join(migrationDirectory, "0095_stripe_billing.sql"));
         } else if (drift.name === "changed") {
           writeFileSync(
@@ -1271,8 +1278,8 @@ describe("production-shaped D1 migration lane", () => {
           );
         } else {
           writeFileSync(
-            join(migrationDirectory, "0096_unreviewed_extension.sql"),
-            "CREATE TABLE synthetic_0096_unreviewed_extension (id TEXT);\n",
+            join(migrationDirectory, "0097_unreviewed_extension.sql"),
+            "CREATE TABLE synthetic_0097_unreviewed_extension (id TEXT);\n",
             { mode: 0o600 },
           );
         }

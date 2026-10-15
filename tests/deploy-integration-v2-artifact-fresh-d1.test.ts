@@ -12,6 +12,7 @@ import {
   verifyFreshV2IntegrationStorageTarget,
 } from "../scripts/deploy/integration-storage-generation.ts";
 import { canonicalSchemaShape, readMigrationArtifact } from "../scripts/deploy/migrations.ts";
+import { readCurrentAuditedMigrationSourceArtifact } from "../scripts/deploy/schema.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { bytesDigest } from "../src/json.ts";
@@ -776,7 +777,9 @@ async function miniflareFreshV2Data(
 }
 
 test("selected fresh origin permits only the exact read-only current audited successor", async () => {
-  const source = readMigrationArtifact();
+  const source = readCurrentAuditedMigrationSourceArtifact();
+  const unqualified = readMigrationArtifact();
+  const unqualifiedShape = deriveExpectedApplicationShape(unqualified.files);
   const shape = deriveExpectedApplicationShape(source.files);
   const fullCurrent = {
     applied: source.names,
@@ -823,6 +826,11 @@ test("selected fresh origin permits only the exact read-only current audited suc
       appliedMigrations: source.names,
     });
     for (const invalid of [
+      {
+        applied: unqualified.names,
+        shape: unqualifiedShape,
+        shapeDigest: `sha256:${createHash("sha256").update(unqualifiedShape).digest("hex")}`,
+      },
       { ...fullCurrent, applied: source.names.slice(0, 93) },
       { ...fullCurrent, applied: source.names.slice(0, -1) },
       { ...fullCurrent, applied: [...source.names, "0096_foreign.sql"] },

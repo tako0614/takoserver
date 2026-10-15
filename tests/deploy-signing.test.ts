@@ -7,6 +7,7 @@ import { deriveExpectedApplicationShape } from "../scripts/deploy/application-sc
 import { DeployError } from "../scripts/deploy/errors.ts";
 import { readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
+import { readCurrentAuditedMigrationSourceArtifact } from "../scripts/deploy/schema.ts";
 import {
   activePublicJwk,
   createRemoteSigningDatabase,
@@ -26,7 +27,8 @@ import { expectPublicationLeaseHeld } from "./helpers/publication-lease.ts";
 const COMMIT = "a".repeat(40);
 const BUNDLE = "export default {fetch(){return new Response('ok')}};\n";
 const BUNDLE_DIGEST = createHash("sha256").update(BUNDLE).digest("hex");
-const moneyShape = deriveExpectedApplicationShape(readMigrationArtifact().files);
+const qualifiedMigrations = readCurrentAuditedMigrationSourceArtifact();
+const moneyShape = deriveExpectedApplicationShape(qualifiedMigrations.files);
 const moneyShapeRows = (
   JSON.parse(moneyShape) as Array<{
     type: string;
@@ -148,7 +150,7 @@ function processFixture(input: { readonly afterMessage?: () => string | null } =
       const results = sql?.includes("type = 'table'")
         ? [{ name: "d1_migrations" }]
         : sql?.includes("FROM d1_migrations")
-          ? readMigrationArtifact().names.map((name) => ({ name }))
+          ? qualifiedMigrations.names.map((name) => ({ name }))
           : sql?.includes("FROM money_unit_policy")
             ? [
                 {
@@ -833,7 +835,7 @@ describe("split signing authority surfaces", () => {
       const migrations: SigningMigrationReader = {
         async read() {
           migrationReads += 1;
-          return { local, applied: local.slice(0, -2) };
+          return { local, applied: local.slice(0, 93) };
         },
       };
 
@@ -884,11 +886,38 @@ describe("split signing authority surfaces", () => {
       database.rows.set("key-next", row("key-next", next.publicJwk));
       const process = processFixture();
       const local = readMigrationArtifact().names;
-      for (const [applied, message] of [
-        [local.slice(0, -1), "exact current audited D1 schema with 0094 USD-micros policy"],
-        [[...local, "0096_foreign.sql"], "D1 has more applied migrations"],
+      for (const [observedLocal, applied, message] of [
+        [
+          local,
+          qualifiedMigrations.names.slice(0, -1),
+          "exact current audited D1 schema with 0094 USD-micros policy",
+        ],
+        [local, local, "exact current audited D1 schema with 0094 USD-micros policy"],
+        [local, [...local, "0097_foreign.sql"], "D1 has more applied migrations"],
+        [
+          [...local, "0097_foreign.sql"],
+          qualifiedMigrations.names,
+          "exact current audited D1 schema with 0094 USD-micros policy",
+        ],
       ] as const) {
-        const migrations: SigningMigrationReader = { read: async () => ({ local, applied }) };
+        const shape = deriveExpectedApplicationShape(
+          readMigrationArtifact().files.slice(0, applied.length),
+        );
+        const migrations: SigningMigrationReader = {
+          read: async () => ({
+            local: observedLocal,
+            applied,
+            shape,
+            shapeDigest: `sha256:${createHash("sha256").update(shape).digest("hex")}`,
+            moneyUnitPolicy: [
+              {
+                ledger_unit: "usd-micros-v2",
+                historical_usage_unit: "microcent-v1",
+                cash_unit: "usd-cents-v1",
+              },
+            ],
+          }),
+        };
         await expect(
           runSigning(
             {
@@ -981,7 +1010,7 @@ describe("split signing authority surfaces", () => {
       const local = readMigrationArtifact().names;
       const migrations: SigningMigrationReader = {
         async read() {
-          return { local, applied: local.slice(0, -2) };
+          return { local, applied: local.slice(0, 93) };
         },
       };
 
