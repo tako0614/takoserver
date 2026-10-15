@@ -201,7 +201,7 @@ function topbar(): Child {
           "aria-label": label,
           onClick: signOut,
         },
-        icon(ICON.out, 15),
+        icon(ICON.signOut, 15),
         h("span", { class: "topbar__who" }, who ? who.displayName : tr("サインアウト", "Sign out")),
       );
     }),
@@ -221,7 +221,7 @@ function organizationPicker(): Child {
   }
   return h(
     "div",
-    { style: { display: "flex", alignItems: "center", gap: "8px" } },
+    { class: "topbar__picker", style: { display: "flex", alignItems: "center", gap: "8px" } },
     h(
       "select",
       {
