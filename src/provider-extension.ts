@@ -260,6 +260,15 @@ export type {
 } from "./queue-v2-sqlite-contract.ts";
 export { createRuntimeInputAuthority } from "./runtime-input-preparations.ts";
 export { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
+export {
+  createSharedAppLedger,
+  type SharedAppLedger,
+  type SharedAppSelection,
+} from "./shared-app-ledger.ts";
+export {
+  SHARED_APP_STAGING_SUFFIX,
+  sharedAppStagingNameFromHost,
+} from "./shared-app-name.ts";
 export { createD1Sql } from "./sql-d1.ts";
 export { createTakoformArtifacts } from "./takoform/artifacts.ts";
 export { currentTakoformCandidates } from "./takoform/current-candidates.ts";
