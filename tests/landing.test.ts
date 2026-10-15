@@ -79,6 +79,22 @@ describe("Takoserver public site", () => {
     expect(html.indexOf('id="start"')).toBeLessThan(html.indexOf('data-i18n="products"'));
   });
 
+  test("starts a Japanese visitor with the same two lanes", () => {
+    const html = landingHtml({
+      consoleOrigin: "https://console.takoserver.example",
+      apiOrigin: "https://api.takoserver.example",
+      locale: "ja",
+    });
+    expect(html).toContain('<h2 class="shead" id="start-title" data-i18n="start">はじめる</h2>');
+    expect(html).toContain(
+      '<a href="https://console.takoserver.example" data-i18n="useStep1">コンソールにサインイン</a>',
+    );
+    expect(html).toContain(
+      "使う予定の厳密なForm URL（版を含む）に、このHostが対応しているか確認します。",
+    );
+    expect(html).toContain('<h3 data-i18n="ownTitle">自分のHostを動かす</h3>');
+  });
+
   test("offers only the self-host lane where there is no console", () => {
     const html = landingHtml({ consoleOrigin: null, apiOrigin: "https://api.takoserver.example" });
     expect(html).not.toContain('data-i18n="useTitle"');

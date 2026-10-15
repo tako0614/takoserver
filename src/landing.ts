@@ -29,10 +29,10 @@ const landingMessages = {
     useStep3: "Issue an organization API key that can read or write resources.",
     useStep4: "Ask whether this Host supports the exact Form URL you plan to use.",
     ownTitle: "Run your own Host",
-    ownStep1: "Get the open-source code and install its locked dependencies.",
+    ownStep1: "With Bun installed, get the open-source code and install its locked dependencies.",
     ownStep2: "Set the public HTTPS origin, the v2 configuration and a persistent cursor key.",
     ownStep3:
-      "Start it. Without an identity provider, the first boot prints a single-use operator sign-in.",
+      "Start it. Without an identity provider, the first boot prints a single-use operator sign-in assertion.",
     ownNote:
       "Serve it through your own HTTPS front end; do not expose the listener directly. The guide covers the Worker runtime and each setting.",
     guide: "First install guide",
@@ -72,13 +72,14 @@ const landingMessages = {
     useTitle: "このHostを使う",
     useStep1: "コンソールにサインイン",
     useStep2: "組織を作成します。資源・APIキー・残高は組織が所有します。",
-    useStep3: "資源を読み取り・書き込みできる組織APIキーを発行します。",
-    useStep4: "使う予定のForm URLにこのHostが対応しているか確認します。",
+    useStep3: "資源の読み取りまたは書き込みができる組織APIキーを発行します。",
+    useStep4: "使う予定の厳密なForm URL（版を含む）に、このHostが対応しているか確認します。",
     ownTitle: "自分のHostを動かす",
-    ownStep1: "オープンソースのコードを取得し、固定された依存関係をインストールします。",
+    ownStep1:
+      "Bunを用意し、オープンソースのコードを取得して、lockfileで固定された依存関係をインストールします。",
     ownStep2: "公開HTTPS origin、v2設定、永続するcursor鍵を設定します。",
     ownStep3:
-      "起動します。IDプロバイダーが未設定なら、初回起動時に一度だけ使える運営者サインインが表示されます。",
+      "起動します。IDプロバイダーが未設定なら、初回起動時に一度だけ使える運営者サインイン用のassertionが表示されます。",
     ownNote:
       "公開時は自分で用意したHTTPSフロントエンドの背後に置き、listenerを直接公開しないでください。Worker実行環境と各設定は手順書で説明しています。",
     guide: "初回インストール手順",
@@ -186,7 +187,6 @@ export function landingHtml(options: LandingOptions): string {
  * (DotGothic16, inlined so the API's root response stays self-contained).
  * No radii, no shadows-as-glow, no light scheme — the Host is always in
  * its machine room.
- * Hallmark · section: Get started, numbered two-lane steps · tone: technical · anchor hue: tako red
  */
 @font-face {
   font-family: 'DotGothic16';
@@ -269,7 +269,7 @@ p.get code { font: 13px var(--mono); color: var(--ink-1); overflow-wrap: anywher
 p.get b { color: var(--accent); font-weight: 600; }
 pre {
   margin: 12px 0 0; padding: 14px 16px; border: 2px solid var(--line-1);
-  background: var(--term); color: var(--ink-2); position: relative;
+  background: var(--term); color: var(--ink-2);
   font: 12.5px/1.65 var(--mono); overflow-x: auto;
   box-shadow: 6px 6px 0 var(--drop);
 }
