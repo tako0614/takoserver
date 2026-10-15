@@ -1139,8 +1139,20 @@ async function composeApp(
       const selected = await composeV2WorkerEndpointOrigin(Object.freeze({ env, clock }));
       if (selected !== undefined) {
         // Capture returned inputs now, before later startup awaits. Core owns its Sql and issuer.
-        const { formUrl, backendId, targetKey, ledger } = selected;
-        selectedV2WorkerEndpointOrigin = Object.freeze({ formUrl, backendId, targetKey, ledger });
+        const { kind, formUrl, backendId, targetKey, ledger } = selected;
+        if (kind === undefined) {
+          selectedV2WorkerEndpointOrigin = Object.freeze({ formUrl, backendId, targetKey, ledger });
+        } else if (kind === "form-v2@1") {
+          selectedV2WorkerEndpointOrigin = Object.freeze({
+            kind,
+            formUrl,
+            backendId,
+            targetKey,
+            ledger,
+          });
+        } else {
+          throw new TypeError("unsupported Worker Endpoint origin construction kind");
+        }
       }
     } catch {
       throw new WorkerStartupError(

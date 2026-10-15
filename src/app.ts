@@ -105,7 +105,10 @@ import {
   createWorkerEndpointOriginReservations,
   type WorkerEndpointOriginReservations,
 } from "./worker-endpoint-origin-reservations.ts";
-import { createWorkerEndpointOriginV2Acceptance } from "./worker-endpoint-origin-v2-acceptance.ts";
+import {
+  createWorkerEndpointOriginV2Acceptance,
+  createWorkerEndpointOriginV2FormRouteAcceptance,
+} from "./worker-endpoint-origin-v2-acceptance.ts";
 
 /**
  * The composition root.
@@ -167,11 +170,14 @@ export interface AppPorts {
   readonly v2FormFactory?: V2OperatorFormFactory;
   /** Code-selected full and retained-only maps; exclusive with v2FormFactory. */
   readonly v2FormSelectionFactory?: V2OperatorFormSelectionFactory;
-  /** Code-only inputs for the fixed staging/direct-Organization origin compiler. */
-  readonly v2WorkerEndpointOrigin?: Omit<
-    Parameters<typeof createWorkerEndpointOriginV2Acceptance>[0],
-    "sql"
-  >;
+  /** Code-only fixed staging/direct-Organization compiler selection; omission retains scalar. */
+  readonly v2WorkerEndpointOrigin?:
+    | (Omit<Parameters<typeof createWorkerEndpointOriginV2Acceptance>[0], "sql"> & {
+        readonly kind?: undefined;
+      })
+    | (Omit<Parameters<typeof createWorkerEndpointOriginV2FormRouteAcceptance>[0], "sql"> & {
+        readonly kind: "form-v2@1";
+      });
   /** Code-selected fresh CREATE/UPDATE policy; absent preserves normal admission. */
   readonly v2AllowFreshCreateAndUpdate?: boolean;
   /** Code-selected source for configured v2 artifact Forms; absent remains held-only. */
@@ -351,16 +357,16 @@ export function buildApp(ports: AppPorts): App {
       ? undefined
       : (() => {
           const sql = ports.sql;
-          const { formUrl, backendId, targetKey, ledger } = selectedWorkerEndpointOrigin;
+          const { kind, formUrl, backendId, targetKey, ledger } = selectedWorkerEndpointOrigin;
+          if (kind !== undefined && kind !== "form-v2@1")
+            throw new TypeError("unsupported Worker Endpoint origin construction kind");
+          const inputs = { sql, formUrl, backendId, targetKey, ledger };
           return Object.freeze({
             sql,
-            acceptance: createWorkerEndpointOriginV2Acceptance({
-              sql,
-              formUrl,
-              backendId,
-              targetKey,
-              ledger,
-            }),
+            acceptance:
+              kind === "form-v2@1"
+                ? createWorkerEndpointOriginV2FormRouteAcceptance(inputs)
+                : createWorkerEndpointOriginV2Acceptance(inputs),
           });
         })();
   if (ports.hostedBilling) {

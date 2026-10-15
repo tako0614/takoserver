@@ -30,10 +30,21 @@ type Composer = NonNullable<WorkerEntryOptions["composeV2WorkerEndpointOrigin"]>
 type Selection = Exclude<Awaited<ReturnType<Composer>>, undefined>;
 
 // Same unchanged SQL fixture constraints, collected for actual D1 execution.
-function sharedSchema(db: { exec(source: string): void }, includeBindings: boolean): void {
+function sharedSchema(
+  db: { exec(source: string): void },
+  includeBindings: boolean,
+  typed = false,
+): void {
   // Preserve the stronger original ledger fixture checks, not the relaxed route fixture.
   for (const realm of ["staging", "production"]) {
     const prefix = `shared_app_${realm}`;
+    const variantChecks = typed
+      ? `CHECK((binding_kind IS NULL AND binding_json IS NULL
+          AND (state<>'reserved' OR script IS NULL) AND (state<>'active' OR script IS NOT NULL))
+        OR (binding_kind IS 'form-v2@1' AND script IS NULL AND
+          ((state IN ('reserved','released') AND binding_json IS NULL)
+            OR (state='active' AND binding_json IS NOT NULL AND json_valid(binding_json)=1))))`
+      : `CHECK(state<>'reserved' OR script IS NULL), CHECK(state<>'active' OR script IS NOT NULL)`;
     db.exec(`CREATE TABLE ${prefix}_assignments (
       incarnation TEXT PRIMARY KEY
         CHECK(length(incarnation)=32 AND incarnation NOT GLOB '*[^0-9a-f]*'),
@@ -44,11 +55,11 @@ function sharedSchema(db: { exec(source: string): void }, includeBindings: boole
       reservation_id TEXT NOT NULL,
       generation INTEGER NOT NULL CHECK(generation BETWEEN 1 AND 9007199254740990),
       state TEXT NOT NULL CHECK(state IN ('reserved','active','released')),
-      script TEXT, released_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      script TEXT, released_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL${typed ? ", binding_kind TEXT, binding_json TEXT" : ""},
       UNIQUE(organization_id,reservation_id), CHECK(updated_at>=created_at),
       CHECK((state='released')=(released_at IS NOT NULL)),
       CHECK(released_at IS NULL OR released_at>=created_at),
-      CHECK(state<>'reserved' OR script IS NULL), CHECK(state<>'active' OR script IS NOT NULL))`);
+      ${variantChecks})`);
     db.exec(`CREATE TABLE ${prefix}_names (
       normalized_name TEXT PRIMARY KEY
         CHECK(length(normalized_name) BETWEEN 3 AND 32
@@ -99,7 +110,7 @@ function splitMigration(source: string): readonly string[] {
   return statements;
 }
 
-async function fixture(name: string, shared = true) {
+async function fixture(name: string, shared = true, typed = false) {
   const runtime = new Miniflare({
     workers: [
       {
@@ -186,6 +197,7 @@ async function fixture(name: string, shared = true) {
           },
         },
         true,
+        typed,
       );
       for (const statement of statements) await sql.run(statement);
     }
@@ -302,6 +314,93 @@ function deferred() {
   });
   return { promise, release: () => release() };
 }
+
+test("Worker forwards a captured typed route selection through its actual App and D1", async () => {
+  const f = await fixture("entry-typed-origin-construction", true, true);
+  try {
+    const claim = await f.reserve("typed-worker-name");
+    // Reserved tagged fixture only; no serving/native publication is asserted.
+    await f.sql.run(
+      "UPDATE shared_app_staging_assignments SET binding_kind='form-v2@1' WHERE incarnation=?",
+      [claim.incarnation],
+    );
+    let compositions = 0;
+    let kindReads = 0;
+    let ledgerReads = 0;
+    const selected: Selection = {
+      get kind(): "form-v2@1" {
+        kindReads++;
+        return "form-v2@1";
+      },
+      formUrl: FORM,
+      backendId: BACKEND,
+      targetKey: TARGET,
+      get ledger() {
+        ledgerReads++;
+        return f.ledger;
+      },
+    };
+    const entry = createWorkerEntry({
+      composeV2Forms: () => ({ [FORM]: f.form }),
+      composeV2WorkerEndpointOrigin(context) {
+        compositions++;
+        expect(Object.keys(context).sort()).toEqual(["clock", "env"]);
+        return selected;
+      },
+    });
+    expect((await request(entry, f.env, `/support?form=${encodeURIComponent(FORM)}`)).status).toBe(
+      200,
+    );
+    expect(compositions).toBe(1);
+    expect(kindReads).toBe(1);
+    expect(ledgerReads).toBe(1);
+    for (const field of ["kind", "ledger"])
+      Object.defineProperty(selected, field, {
+        get() {
+          throw new Error("Worker typed selection must remain captured");
+        },
+      });
+    Object.defineProperty(selected, "formUrl", { value: "https://foreign.example.test/form" });
+    const created = await create(entry, f.env, claim.name, "worker-typed-create-0001");
+    expect(created.status).toBe(202);
+    const operation = (await created.json()) as { id: string; resourceUid: string };
+    expect(await f.sql.query(`SELECT * FROM ${BINDINGS}`)).toEqual([
+      {
+        incarnation: claim.incarnation,
+        organization_id: ORG,
+        product: "takoserver",
+        reservation_id: claim.reservationId,
+        name: claim.name,
+        endpoint_uid: operation.resourceUid,
+        endpoint_generation: 1,
+        form_url: FORM,
+        backend_id: BACKEND,
+        target_key: TARGET,
+        create_operation_id: operation.id,
+        current_operation_id: operation.id,
+      },
+    ]);
+    const replay = await create(entry, f.env, claim.name, "worker-typed-create-0001");
+    expect(replay.status).toBe(202);
+    expect(await replay.json()).toMatchObject({
+      id: operation.id,
+      resourceUid: operation.resourceUid,
+    });
+    expect(compositions).toBe(1);
+    expect(
+      await f.sql.query(
+        "SELECT generation,state,binding_kind,binding_json FROM shared_app_staging_assignments",
+      ),
+    ).toEqual([
+      { generation: 1, state: "reserved", binding_kind: "form-v2@1", binding_json: null },
+    ]);
+    expect(await f.ledger.readCurrentRoute(claim.name)).toBeNull();
+    expect(f.effects()).toBe(0);
+    expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_operations")).toEqual([{ n: 1 }]);
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 60_000);
 
 test("Worker captures code-only composer once and binds through real D1 on concurrent startup", async () => {
   const f = await fixture("entry-origin-construction");
@@ -539,6 +638,14 @@ test("Worker refuses malformed composition with safe diagnostics and zero real a
           },
         }) as unknown as Selection,
       () => ({}) as Selection,
+      () => ({ ...f.selection, kind: "form-v2@unknown" }) as unknown as Selection,
+      () =>
+        ({
+          ...f.selection,
+          get kind() {
+            throw new TypeError(secretSentinel);
+          },
+        }) as Selection,
       () =>
         ({
           ...f.selection,

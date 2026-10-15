@@ -25,10 +25,17 @@ const AT = "2026-10-15T00:00:00.000Z";
 type Selection = NonNullable<AppPorts["v2WorkerEndpointOrigin"]>;
 
 // Exact existing fixture constraints; still test-owned, UNALLOCATED DDL.
-function sharedSchema(db: Database, includeBindings: boolean): void {
+function sharedSchema(db: Database, includeBindings: boolean, typed = false): void {
   // Preserve the stronger original ledger fixture checks, not the relaxed route fixture.
   for (const realm of ["staging", "production"]) {
     const prefix = `shared_app_${realm}`;
+    const variantChecks = typed
+      ? `CHECK((binding_kind IS NULL AND binding_json IS NULL
+          AND (state<>'reserved' OR script IS NULL) AND (state<>'active' OR script IS NOT NULL))
+        OR (binding_kind IS 'form-v2@1' AND script IS NULL AND
+          ((state IN ('reserved','released') AND binding_json IS NULL)
+            OR (state='active' AND binding_json IS NOT NULL AND json_valid(binding_json)=1))))`
+      : `CHECK(state<>'reserved' OR script IS NULL), CHECK(state<>'active' OR script IS NOT NULL)`;
     db.exec(`CREATE TABLE ${prefix}_assignments (
       incarnation TEXT PRIMARY KEY
         CHECK(length(incarnation)=32 AND incarnation NOT GLOB '*[^0-9a-f]*'),
@@ -39,11 +46,11 @@ function sharedSchema(db: Database, includeBindings: boolean): void {
       reservation_id TEXT NOT NULL,
       generation INTEGER NOT NULL CHECK(generation BETWEEN 1 AND 9007199254740990),
       state TEXT NOT NULL CHECK(state IN ('reserved','active','released')),
-      script TEXT, released_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      script TEXT, released_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL${typed ? ", binding_kind TEXT, binding_json TEXT" : ""},
       UNIQUE(organization_id,reservation_id), CHECK(updated_at>=created_at),
       CHECK((state='released')=(released_at IS NOT NULL)),
       CHECK(released_at IS NULL OR released_at>=created_at),
-      CHECK(state<>'reserved' OR script IS NULL), CHECK(state<>'active' OR script IS NOT NULL))`);
+      ${variantChecks})`);
     db.exec(`CREATE TABLE ${prefix}_names (
       normalized_name TEXT PRIMARY KEY
         CHECK(length(normalized_name) BETWEEN 3 AND 32
@@ -68,11 +75,12 @@ function sharedSchema(db: Database, includeBindings: boolean): void {
     current_operation_id TEXT NOT NULL REFERENCES tf_v2_operations(id))`);
 }
 
-async function fixture(options: { shared?: boolean; bindings?: boolean } = {}) {
+async function fixture(options: { shared?: boolean; bindings?: boolean; typed?: boolean } = {}) {
   const db = new Database(":memory:");
   migrateSqlite(db);
   const raw = createSqliteSql(db);
-  if (options.shared !== false) sharedSchema(db, options.bindings !== false);
+  if (options.shared !== false)
+    sharedSchema(db, options.bindings !== false, options.typed === true);
   const statements: SqlStatement[] = [];
   const batches: (readonly SqlStatement[])[] = [];
   let lastBatchError: unknown;
@@ -127,6 +135,7 @@ async function fixture(options: { shared?: boolean; bindings?: boolean } = {}) {
   const owner = { organizationId: organization.id, product: "takoserver" as const };
   const ledger = createSharedAppLedger({ environment: "staging", primary: () => sql, clock });
   let originalReads = 0;
+  let typedOriginalReads = 0;
   let refuseOriginalRead = false;
   const actualForOwner = ledger.forTrustedOwner.bind(ledger);
   ledger.forTrustedOwner = (trustedOwner) => {
@@ -137,6 +146,11 @@ async function fixture(options: { shared?: boolean; bindings?: boolean } = {}) {
         originalReads++;
         if (refuseOriginalRead) throw new SqlError("unavailable", "component read unavailable");
         return actual.readOriginal(id);
+      },
+      async readOriginalRoute(id) {
+        typedOriginalReads++;
+        if (refuseOriginalRead) throw new SqlError("unavailable", "component read unavailable");
+        return actual.readOriginalRoute(id);
       },
     };
   };
@@ -222,6 +236,7 @@ async function fixture(options: { shared?: boolean; bindings?: boolean } = {}) {
       ledger.forTrustedOwner(owner).reserve({ reservationId: `claim-${name}`, name }),
     lastBatchError: () => lastBatchError,
     originalReads: () => originalReads,
+    typedOriginalReads: () => typedOriginalReads,
     refuseOriginalReads() {
       refuseOriginalRead = true;
     },
@@ -264,6 +279,156 @@ function emptyAcceptance(f: Fixture, includeBindings = true): void {
   ])
     expect(f.db.query(`SELECT count(*) AS n FROM ${table}`).get()).toEqual({ n: 0 });
 }
+
+test("App forwards the typed route compiler with one captured ledger and retained original replay", async () => {
+  const f = await fixture({ typed: true });
+  try {
+    const claim = await f.reserve("typed-app-name");
+    // Non-serving fixture tag; publication/native authority is not fabricated here.
+    await f.sql.run(
+      "UPDATE shared_app_staging_assignments SET binding_kind='form-v2@1' WHERE incarnation=?",
+      [claim.incarnation],
+    );
+    let kindReads = 0;
+    let ledgerReads = 0;
+    const selected: Selection = {
+      get kind(): "form-v2@1" {
+        kindReads++;
+        return "form-v2@1";
+      },
+      formUrl: FORM,
+      backendId: BACKEND,
+      targetKey: TARGET,
+      get ledger() {
+        ledgerReads++;
+        return f.ledger;
+      },
+    };
+    const app = f.makeApp(selected);
+    expect(kindReads).toBe(1);
+    expect(ledgerReads).toBe(1);
+    for (const field of ["kind", "ledger"])
+      Object.defineProperty(selected, field, {
+        get() {
+          throw new Error("captured typed selection must not be reread");
+        },
+      });
+    Object.defineProperty(selected, "targetKey", { value: "changed-after-construction" });
+    const created = await f.create(app, claim.name, "app-typed-create-0001");
+    expect(created.status).toBe(202);
+    const operation = (await created.json()) as { id: string; resourceUid: string };
+    expect(f.db.query(`SELECT * FROM ${BINDINGS}`).get()).toMatchObject({
+      incarnation: claim.incarnation,
+      reservation_id: claim.reservationId,
+      endpoint_uid: operation.resourceUid,
+      endpoint_generation: 1,
+      create_operation_id: operation.id,
+      current_operation_id: operation.id,
+      form_url: FORM,
+      backend_id: BACKEND,
+      target_key: TARGET,
+    });
+    expect(f.originalReads()).toBe(0);
+    expect(f.typedOriginalReads()).toBeGreaterThan(0);
+    expect(await app.tickTakoformV2()).toMatchObject({ id: operation.id, status: "succeeded" });
+    const updated = await f.request(app, `/resources/${operation.resourceUid}`, {
+      method: "PUT",
+      headers: { "idempotency-key": "app-typed-update-0001", "takoform-expected-generation": "1" },
+      body: JSON.stringify({ spec: { value: "typed-update" } }),
+    });
+    expect(updated.status).toBe(202);
+    const update = (await updated.json()) as { id: string };
+    expect(
+      f.db
+        .query(
+          `SELECT endpoint_generation,create_operation_id,current_operation_id FROM ${BINDINGS}`,
+        )
+        .get(),
+    ).toEqual({
+      endpoint_generation: 2,
+      create_operation_id: operation.id,
+      current_operation_id: update.id,
+    });
+    expect(
+      f.db
+        .query(
+          "SELECT generation,state,binding_kind,binding_json FROM shared_app_staging_assignments",
+        )
+        .get(),
+    ).toEqual({
+      generation: 1,
+      state: "reserved",
+      binding_kind: "form-v2@1",
+      binding_json: null,
+    });
+    expect(await f.ledger.readCurrentRoute(claim.name)).toBeNull();
+    f.refuseOriginalReads();
+    const beforeReads = f.typedOriginalReads();
+    const beforeBatches = f.batches.length;
+    const replay = await f.create(
+      f.makeApp({ ...f.selection, kind: "form-v2@1" }),
+      claim.name,
+      "app-typed-create-0001",
+    );
+    expect(replay.status).toBe(200);
+    expect(await replay.json()).toMatchObject({
+      id: operation.id,
+      resourceUid: operation.resourceUid,
+    });
+    expect(f.typedOriginalReads()).toBe(beforeReads);
+    expect(f.batches).toHaveLength(beforeBatches);
+    expect(f.db.query("SELECT count(*) AS n FROM tf_v2_operations").get()).toEqual({ n: 2 });
+  } finally {
+    f.close();
+  }
+});
+
+test("App typed forwarding refuses a different physical ledger without partial acceptance", async () => {
+  const f = await fixture({ typed: true });
+  const foreign = new Database(":memory:");
+  try {
+    sharedSchema(foreign, false, true);
+    const foreignSql = createSqliteSql(foreign);
+    const ledger = createSharedAppLedger({
+      environment: "staging",
+      primary: () => foreignSql,
+      clock: () => new Date(AT),
+    });
+    const claim = await f.reserve("typed-physical-name");
+    const other = await ledger
+      .forTrustedOwner(f.owner)
+      .reserve({ reservationId: claim.reservationId, name: claim.name });
+    for (const [sql, incarnation] of [
+      [f.sql, claim.incarnation],
+      [foreignSql, other.incarnation],
+    ] as const) {
+      await sql.run(
+        "UPDATE shared_app_staging_assignments SET binding_kind='form-v2@1' WHERE incarnation=?",
+        [incarnation],
+      );
+    }
+    expect(other.incarnation).not.toBe(claim.incarnation);
+    const localBefore = f.db.query("SELECT * FROM shared_app_staging_assignments").all();
+    const foreignBefore = foreign.query("SELECT * FROM shared_app_staging_assignments").all();
+    const beforeBatches = f.batches.length;
+    const refused = await f.create(
+      f.makeApp({ ...f.selection, kind: "form-v2@1", ledger }),
+      claim.name,
+      "app-typed-physical-0001",
+    );
+    expect(refused.status).toBe(500);
+    expect(await refused.json()).toMatchObject({ code: "internal_error" });
+    assertProofFailure(f, beforeBatches, "endpoint_uid");
+    emptyAcceptance(f);
+    expect(f.db.query("SELECT * FROM shared_app_staging_assignments").all()).toEqual(localBefore);
+    expect(foreign.query("SELECT * FROM shared_app_staging_assignments").all()).toEqual(
+      foreignBefore,
+    );
+  } finally {
+    foreign.close();
+    f.close();
+  }
+});
 
 test("App binds authenticated accepted UID/Operation in its actual owning atomic SQL batch", async () => {
   const f = await fixture();
@@ -467,7 +632,7 @@ test("App picks only four captured inputs, never caller SQL or general acceptanc
         genericCalls++;
       },
     };
-    for (const malformed of [null, {}, generic]) {
+    for (const malformed of [null, {}, generic, { ...f.selection, kind: "form-v2@unknown" }]) {
       expect(() => f.makeApp(malformed as unknown as Selection)).toThrow();
     }
     expect(genericCalls).toBe(0);
