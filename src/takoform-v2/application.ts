@@ -95,6 +95,8 @@ export function createTakoformV2Application(
     readonly objects: ObjectStoreAccess;
     readonly accounts: Pick<Accounts, "authenticate" | "requireOwner">;
     readonly publicOrigin: string;
+    /** Exact operator-configured Origin permitted to carry session cookies. */
+    readonly consoleOrigin?: string;
     readonly config: V2ApplicationConfig;
     readonly clock: Clock;
     /** Selected by the embedding operator, never by public configuration or a request. */
@@ -126,7 +128,7 @@ export function createTakoformV2Application(
     throw new TypeError("v2 artifact source factory must be a function");
   }
   const { sql, objects, accounts, publicOrigin, config, clock } = options;
-  const access = createTakoformV2AccountAccess(accounts);
+  const access = createTakoformV2AccountAccess(accounts, options.consoleOrigin);
   const forms: Record<string, V2Form> = Object.create(null) as Record<string, V2Form>;
   const retainedForms: Record<string, V2Form> = Object.create(null) as Record<string, V2Form>;
   const artifactSource = (formUrl: string, heldArtifacts: readonly V2HeldArtifactEntry[]) => {

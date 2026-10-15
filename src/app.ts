@@ -423,6 +423,7 @@ export function buildApp(ports: AppPorts): App {
     objects: ports.objects,
     accounts,
     publicOrigin: ports.publicOrigin,
+    ...(ports.consoleOrigin === undefined ? {} : { consoleOrigin: ports.consoleOrigin }),
     config: ports.v2,
     clock,
     ...(v2AllowFreshCreateAndUpdate === undefined
