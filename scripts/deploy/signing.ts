@@ -31,7 +31,10 @@ import {
 } from "./process.ts";
 import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
 import { expectedWorkerSecrets, writeWorkerConfig } from "./realized-config.ts";
-import { readCurrentAuditedMigrationSourceArtifact } from "./schema.ts";
+import {
+  readCurrentAuditedMigrationSourceArtifact,
+  readCurrentMigrationSourceArtifact,
+} from "./schema.ts";
 import type { DeployTarget } from "./target.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import {
@@ -710,9 +713,10 @@ async function assertSigningRotationSchema(
   pendingMigrations(snapshot.local, snapshot.applied);
   assertMoneyUnitSchema(snapshot.applied);
   const source = readCurrentAuditedMigrationSourceArtifact(resolve(REPOSITORY, "migrations"));
+  const current = readCurrentMigrationSourceArtifact(resolve(REPOSITORY, "migrations"));
   if (
     !source.names.includes(MONEY_UNIT_MIGRATION) ||
-    JSON.stringify(snapshot.local) !== JSON.stringify(source.names) ||
+    JSON.stringify(snapshot.local) !== JSON.stringify(current.names) ||
     JSON.stringify(snapshot.applied) !== JSON.stringify(source.names) ||
     snapshot.shape === undefined ||
     snapshot.shapeDigest === undefined ||

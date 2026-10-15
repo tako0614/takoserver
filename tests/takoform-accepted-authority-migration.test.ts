@@ -287,6 +287,7 @@ describe("Takoform accepted-authority continuity migration", () => {
       WALLET_CREDIT_CLASSIFICATION,
       WALLET_USD_MICROS,
       STRIPE_BILLING,
+      "0096_v2_configured_update_inputs.sql",
     ]);
     expect(database.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
     expect(

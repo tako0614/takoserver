@@ -8,6 +8,7 @@ import { DeployError } from "../scripts/deploy/errors.ts";
 import { readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import { expectedWorkerSecrets, writeWorkerConfig } from "../scripts/deploy/realized-config.ts";
+import { readCurrentAuditedMigrationSourceArtifact } from "../scripts/deploy/schema.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import type {
   ProviderExecutorInspection,
@@ -126,7 +127,8 @@ const schemaMaintenanceTarget = {
   schemaMaintenanceMode: "pre-0058-quiesced" as const,
 } satisfies DeployTarget;
 const schemaMigrations = readMigrationArtifact().names;
-const canonicalMoneyShape = deriveExpectedApplicationShape(readMigrationArtifact().files);
+const qualifiedMigrations = readCurrentAuditedMigrationSourceArtifact();
+const canonicalMoneyShape = deriveExpectedApplicationShape(qualifiedMigrations.files);
 const canonicalMoneyPolicy = [
   {
     ledger_unit: "usd-micros-v2",
@@ -135,7 +137,7 @@ const canonicalMoneyPolicy = [
   },
 ];
 const currentMoneyStorageState = {
-  applied: schemaMigrations,
+  applied: qualifiedMigrations.names,
   shape: canonicalMoneyShape,
   shapeDigest: `sha256:${createHash("sha256").update(canonicalMoneyShape).digest("hex")}`,
 };
@@ -401,7 +403,7 @@ function fixture(
       async read() {
         return {
           local: input.local ?? schemaMigrations,
-          applied: input.applied ?? schemaMigrations,
+          applied: input.applied ?? qualifiedMigrations.names,
           shape: input.auditedShape ?? canonicalMoneyShape,
           shapeDigest: `sha256:${createHash("sha256")
             .update(input.auditedShape ?? canonicalMoneyShape)
@@ -505,7 +507,7 @@ describe("reviewed Worker closure transition", () => {
         },
         storeSecrets: expectedWorkerSecrets(v2Target).filter((name) => name !== V2_CURSOR_SECRET),
         local: schemaMigrations,
-        applied: schemaMigrations,
+        applied: qualifiedMigrations.names,
       });
       const input = {
         surface: "takoserver-worker-authority-cutover",
@@ -590,7 +592,7 @@ describe("reviewed Worker closure transition", () => {
           predecessor: { selected: v2Target, v2Startup: true },
           storeSecrets: expectedWorkerSecrets(v2Target),
           local: schemaMigrations,
-          applied: schemaMigrations,
+          applied: qualifiedMigrations.names,
         });
         if (!valid) {
           writeFileSync(join(parts.secretDirectory, V2_CURSOR_SECRET), "short", { mode: 0o600 });

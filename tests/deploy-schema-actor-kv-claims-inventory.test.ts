@@ -16,7 +16,7 @@ const ROOT = mkdtempSync(
 );
 afterAll(() => rmSync(ROOT, { recursive: true, force: true }));
 
-test("the current source closure projects to an explicit 0066 apply artifact", () => {
+test("the audited 0095 view of current source projects to an explicit 0066 apply artifact", () => {
   const source = readCurrentAuditedMigrationSourceArtifact();
   const artifact = projectApplyQualifiedMigrationArtifact(source);
   expect(source.names[84]).toBe("0085_v2_edge_kv_native_custody.sql");
@@ -117,9 +117,11 @@ test("the current source closure projects to an explicit 0066 apply artifact", (
   for (const drift of ["missing", "extra"] as const) {
     const directory = join(ROOT, `${drift}-current-source`);
     cpSync(resolve(import.meta.dir, "../migrations"), directory, { recursive: true });
-    if (drift === "missing") rmSync(join(directory, CURRENT_SOURCE_TAIL));
-    else
-      writeFileSync(join(directory, "0096_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
+    if (drift === "missing") {
+      rmSync(join(directory, "0096_v2_configured_update_inputs.sql"));
+      rmSync(join(directory, CURRENT_SOURCE_TAIL));
+    } else
+      writeFileSync(join(directory, "0097_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
     expect(() => readCurrentAuditedMigrationSourceArtifact(directory)).toThrow(
       "audited migration lineage must contain exactly 0001-0095",
     );

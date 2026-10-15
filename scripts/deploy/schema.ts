@@ -1190,9 +1190,15 @@ export async function runD1Schema(
   // Child processes never carry an OAuth bearer (Wrangler refreshes its own
   // stored profile), and an explicit token resolves to the same value again.
   const environment = credential?.childEnvironment ?? {};
-  const sourceMigrations = readMigrationArtifact(
+  const currentSource = readMigrationArtifact(
     options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
   );
+  // A known source-only tail does not expand any existing apply wave. Keep
+  // historical shorter fixtures on their original fixed-prefix path.
+  const sourceMigrations =
+    currentSource.names.length >= AUDITED_MIGRATION_LINEAGE.length
+      ? projectAuditedMigrationSourceArtifact(currentSource)
+      : currentSource;
   const protected0058Custody =
     invocation.action === "apply" &&
     invocation.throughMigration === "0058" &&
@@ -3227,19 +3233,59 @@ function assertOperationGenerationMigrationHashes(
   );
 }
 
-/** Reads and validates the exact current 0001-0095 source corpus. */
-export function readCurrentAuditedMigrationSourceArtifact(
+const CURRENT_MIGRATION_SOURCE_LINEAGE = [
+  ...AUDITED_MIGRATION_LINEAGE,
+  "0096_v2_configured_update_inputs.sql",
+] as const;
+const CURRENT_MIGRATION_SOURCE_SHA256: Readonly<
+  Record<(typeof CURRENT_MIGRATION_SOURCE_LINEAGE)[number], string>
+> = {
+  ...AUDITED_MIGRATION_SHA256,
+  "0096_v2_configured_update_inputs.sql":
+    "sha256:6b214d15726f7d310bdb77f1a860e251ac43f005b771105580a47adec1ea3649",
+};
+
+/** Complete source inventory only; this does not qualify a migration for apply. */
+export function readCurrentMigrationSourceArtifact(
   directory: string = resolve(REPOSITORY, "migrations"),
-): ReturnType<typeof readMigrationArtifact> {
+): MigrationArtifact {
   const artifact = readMigrationArtifact(directory);
-  if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
+  if (JSON.stringify(artifact.names) !== JSON.stringify(CURRENT_MIGRATION_SOURCE_LINEAGE)) {
+    throw preflightError("current migration source must contain exactly 0001-0096");
+  }
+  assertMigrationHashes(
+    artifact.files,
+    CURRENT_MIGRATION_SOURCE_LINEAGE,
+    CURRENT_MIGRATION_SOURCE_SHA256,
+    CURRENT_MIGRATION_SOURCE_LINEAGE.length,
+  );
+  return artifact;
+}
+
+function projectAuditedMigrationSourceArtifact(artifact: MigrationArtifact): MigrationArtifact {
+  if (JSON.stringify(artifact.names) === JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
+    assertAuditedMigrationHashes(artifact.files);
+  } else if (JSON.stringify(artifact.names) === JSON.stringify(CURRENT_MIGRATION_SOURCE_LINEAGE)) {
+    assertMigrationHashes(
+      artifact.files,
+      CURRENT_MIGRATION_SOURCE_LINEAGE,
+      CURRENT_MIGRATION_SOURCE_SHA256,
+      CURRENT_MIGRATION_SOURCE_LINEAGE.length,
+    );
+  } else {
     throw preflightError(
-      "audited migration lineage must contain exactly 0001-0095",
+      "audited migration lineage must contain exactly 0001-0095 or the known 0001-0096 source inventory",
       `actual=${JSON.stringify(artifact.names)}`,
     );
   }
-  assertAuditedMigrationHashes(artifact.files);
-  return artifact;
+  return createMigrationArtifact(artifact.files.slice(0, AUDITED_MIGRATION_LINEAGE.length));
+}
+
+/** Frozen audited 0001-0095 view; validate any known source-only tail first. */
+export function readCurrentAuditedMigrationSourceArtifact(
+  directory: string = resolve(REPOSITORY, "migrations"),
+): ReturnType<typeof readMigrationArtifact> {
+  return projectAuditedMigrationSourceArtifact(readMigrationArtifact(directory));
 }
 
 /** Closed, post-wave canonical integration projection; never a fresh or default apply profile. */

@@ -797,12 +797,14 @@ describe("integration storage generation bootstrap", () => {
         const migrationDirectory = join(root, "migrations");
         cpSync(currentMigrations, migrationDirectory, { recursive: true });
         const tail = join(migrationDirectory, "0094_wallet_usd_micros.sql");
-        if (drift === "missing") rmSync(join(migrationDirectory, "0095_stripe_billing.sql"));
-        else if (drift === "changed") {
+        if (drift === "missing") {
+          rmSync(join(migrationDirectory, "0096_v2_configured_update_inputs.sql"));
+          rmSync(join(migrationDirectory, "0095_stripe_billing.sql"));
+        } else if (drift === "changed") {
           writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- changed\n`);
         } else {
           writeFileSync(
-            join(migrationDirectory, "0096_unreviewed.sql"),
+            join(migrationDirectory, "0097_unreviewed.sql"),
             "CREATE TABLE unreviewed (id TEXT);\n",
           );
         }
@@ -1277,7 +1279,7 @@ describe("integration storage generation bootstrap", () => {
     expect(error.stack).not.toContain("secret should not escape");
     const tail = join(fixtureRoot, "tail-migrations");
     copyCurrentSchemaFixture(tail);
-    writeFileSync(join(tail, "0096_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
+    writeFileSync(join(tail, "0097_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
     for (const migrationDirectory of [auditedMigrations, tail]) {
       const refusedProvider = providerFixture();
       await expect(

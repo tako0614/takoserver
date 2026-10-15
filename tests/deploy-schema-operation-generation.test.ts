@@ -426,7 +426,8 @@ describe("0060 operation-generation cutover", () => {
             .query("UPDATE d1_migrations SET name = '0059_rogue.sql' WHERE name = ?")
             .run(APPLY_PROVIDER_SELECTION);
         },
-        message: "integration D1 cutover requires the exact audited source inventory 0001-0095",
+        message:
+          "audited migration lineage must contain exactly 0001-0095 or the known 0001-0096 source inventory",
       },
       {
         label: "rogue predecessor shape",

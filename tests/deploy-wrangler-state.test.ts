@@ -6,6 +6,7 @@ import { DeployError, deployFailureAftermath, preflightError } from "../scripts/
 import { readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import { expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
+import { readCurrentAuditedMigrationSourceArtifact } from "../scripts/deploy/schema.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import {
   runWorker,
@@ -38,7 +39,8 @@ const BEFORE_DEPLOYMENT = "00000000-0000-4000-8000-000000000004";
 const CONCURRENT_VERSION = "00000000-0000-4000-8000-000000000006";
 const CONCURRENT_DEPLOYMENT = "00000000-0000-4000-8000-000000000007";
 const canonicalMigrations = readMigrationArtifact();
-const canonicalMoneyShape = deriveExpectedApplicationShape(canonicalMigrations.files);
+const qualifiedMigrations = readCurrentAuditedMigrationSourceArtifact();
+const canonicalMoneyShape = deriveExpectedApplicationShape(qualifiedMigrations.files);
 const canonicalMoneyShapeDigest = `sha256:${createHash("sha256").update(canonicalMoneyShape).digest("hex")}`;
 
 const VERSION_BODY = {
@@ -1432,7 +1434,7 @@ async function routineVersionPublication(
     async read() {
       return {
         local: canonicalMigrations.names,
-        applied: canonicalMigrations.names,
+        applied: qualifiedMigrations.names,
         shape: canonicalMoneyShape,
         shapeDigest: canonicalMoneyShapeDigest,
         moneyUnitPolicy: [

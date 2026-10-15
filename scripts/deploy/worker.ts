@@ -50,7 +50,10 @@ import {
 import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualification.ts";
 import { writeWorkerConfig } from "./realized-config.ts";
 import { runAuthorityTransition } from "./retirement.ts";
-import { readCurrentAuditedMigrationSourceArtifact } from "./schema.ts";
+import {
+  readCurrentAuditedMigrationSourceArtifact,
+  readCurrentMigrationSourceArtifact,
+} from "./schema.ts";
 import { moneyUnitCutoverSchemaMatches } from "./schema-money-unit-cutover.ts";
 import {
   activePublicJwk,
@@ -256,7 +259,8 @@ export function workerSchemaAllowsPending(
     const source = readCurrentAuditedMigrationSourceArtifact(
       resolve(sourceRepositoryRoot, "migrations"),
     );
-    if (JSON.stringify(migrations.local) !== JSON.stringify(source.names)) return false;
+    const current = readCurrentMigrationSourceArtifact(resolve(sourceRepositoryRoot, "migrations"));
+    if (JSON.stringify(migrations.local) !== JSON.stringify(current.names)) return false;
     const state = {
       applied: migrations.applied,
       shape: migrations.shape,
@@ -279,10 +283,11 @@ export function workerSchemaAllowsPending(
       resolve(sourceRepositoryRoot, "migrations"),
     );
     const count = migrations.applied.length;
+    const current = readCurrentMigrationSourceArtifact(resolve(sourceRepositoryRoot, "migrations"));
     if (
       count < 66 ||
       count > 88 ||
-      JSON.stringify(migrations.local) !== JSON.stringify(source.names) ||
+      JSON.stringify(migrations.local) !== JSON.stringify(current.names) ||
       migrations.applied.some((name, index) => name !== source.names[index]) ||
       migrations.shape === undefined ||
       migrations.shapeDigest === undefined
@@ -315,7 +320,8 @@ export function workerSchemaAllowsPending(
     const source = readCurrentAuditedMigrationSourceArtifact(
       resolve(sourceRepositoryRoot, "migrations"),
     );
-    if (JSON.stringify(migrations.local) !== JSON.stringify(source.names)) return false;
+    const current = readCurrentMigrationSourceArtifact(resolve(sourceRepositoryRoot, "migrations"));
+    if (JSON.stringify(migrations.local) !== JSON.stringify(current.names)) return false;
     // 0095 rebuilds stripe_events and drops its permanent writer trigger.
     // A separate reviewed suffix must restore the guard in the same import.
     if (target.moneyCutoverWriterPolicy !== undefined && migrations.applied.length > 94)
@@ -346,6 +352,19 @@ export function workerSchemaAllowsPending(
     );
   }
   if (target.schemaMaintenanceMode !== "pre-0058-quiesced") {
+    if (target.artifactBlobIoMode === undefined) {
+      const source = readCurrentAuditedMigrationSourceArtifact(
+        resolve(sourceRepositoryRoot, "migrations"),
+      );
+      if (migrations.local.length >= source.names.length) {
+        // Normal serving keeps its exact 0095 qualification while the local
+        // source inventory includes the optional, unqualified 0096 capability.
+        return (
+          JSON.stringify(migrations.applied) === JSON.stringify(source.names) &&
+          workerMoneyUnitSchemaReady(migrations, sourceRepositoryRoot)
+        );
+      }
+    }
     return artifactBlobIoSchemaAllowsPending(
       target,
       pendingMigrations(migrations.local, migrations.applied),
@@ -373,6 +392,7 @@ export function workerMoneyUnitSchemaReady(
   const source = readCurrentAuditedMigrationSourceArtifact(
     resolve(sourceRepositoryRoot, "migrations"),
   );
+  const current = readCurrentMigrationSourceArtifact(resolve(sourceRepositoryRoot, "migrations"));
   let expectedShape = expectedMoneyShapes.get(source.digest);
   if (expectedShape === undefined) {
     expectedShape = deriveExpectedApplicationShape(source.files);
@@ -381,7 +401,7 @@ export function workerMoneyUnitSchemaReady(
   }
   if (
     !source.names.includes(MONEY_UNIT_MIGRATION) ||
-    JSON.stringify(migrations.local) !== JSON.stringify(source.names)
+    JSON.stringify(migrations.local) !== JSON.stringify(current.names)
   ) {
     return false;
   }

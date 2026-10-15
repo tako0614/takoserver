@@ -6,8 +6,9 @@ import { join } from "node:path";
 import { deriveExpectedApplicationShape } from "../scripts/deploy/application-schema-shape.ts";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import { readMigrationArtifact } from "../scripts/deploy/migrations.ts";
-import type { CommandResult } from "../scripts/deploy/process.ts";
+import { type CommandResult, REPOSITORY } from "../scripts/deploy/process.ts";
 import { expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
+import { readCurrentAuditedMigrationSourceArtifact } from "../scripts/deploy/schema.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import type { ProviderExecutorInspection } from "../scripts/deploy/worker.ts";
 import {
@@ -20,6 +21,7 @@ import {
   type WorkerMigrationReader,
   type WorkerProcess,
   type WorkerState,
+  workerMoneyUnitSchemaReady,
   workerSchemaAllowsPending,
 } from "../scripts/deploy/worker.ts";
 import {
@@ -87,7 +89,8 @@ const schemaMaintenanceTarget = {
 } satisfies DeployTarget;
 
 const canonicalMigrations = readMigrationArtifact().names;
-const canonicalMoneyShape = deriveExpectedApplicationShape(readMigrationArtifact().files);
+const qualifiedMigrations = readCurrentAuditedMigrationSourceArtifact();
+const canonicalMoneyShape = deriveExpectedApplicationShape(qualifiedMigrations.files);
 const canonicalMoneyShapeDigest = `sha256:${createHash("sha256").update(canonicalMoneyShape).digest("hex")}`;
 const canonicalMoneyPolicy = [
   {
@@ -302,7 +305,7 @@ function fixture(
       async read() {
         return {
           local: input.local ?? canonicalMigrations,
-          applied: input.applied ?? canonicalMigrations,
+          applied: input.applied ?? qualifiedMigrations.names,
           shape: canonicalMoneyShape,
           shapeDigest: canonicalMoneyShapeDigest,
           moneyUnitPolicy: canonicalMoneyPolicy,
@@ -355,7 +358,7 @@ describe("split Takoserver Worker surfaces", () => {
     expect(
       workerSchemaAllowsPending(selected, {
         local: canonicalMigrations,
-        applied: canonicalMigrations,
+        applied: qualifiedMigrations.names,
         shape: canonicalMoneyShape,
         shapeDigest: canonicalMoneyShapeDigest,
       }),
@@ -433,8 +436,9 @@ describe("split Takoserver Worker surfaces", () => {
 
   test("exact current audited schema requires 0094 policy and rejects 94-only or foreign tails before upload", async () => {
     for (const applied of [
-      canonicalMigrations.slice(0, -1),
-      [...canonicalMigrations, "0096_foreign.sql"],
+      qualifiedMigrations.names.slice(0, -1),
+      canonicalMigrations,
+      [...canonicalMigrations, "0097_foreign.sql"],
     ]) {
       const current = fixture({ applied });
       const status = await runWorker(
@@ -531,7 +535,7 @@ describe("split Takoserver Worker surfaces", () => {
               read: async () => {
                 reads++;
                 return {
-                  applied: canonicalMigrations,
+                  applied: qualifiedMigrations.names,
                   shape: canonicalMoneyShape,
                   shapeDigest: canonicalMoneyShapeDigest,
                 };
@@ -714,7 +718,7 @@ describe("split Takoserver Worker surfaces", () => {
     });
   });
 
-  test("maintenance Worker status refuses a lingering mode after migrations settle", async () => {
+  test("maintenance Worker status refuses a lingering mode after qualified95 settles", async () => {
     const current = fixture({ selectedTarget: maintenanceExecutorTarget });
     const status = await runWorker(
       {
@@ -729,7 +733,7 @@ describe("split Takoserver Worker surfaces", () => {
     expect(status).toMatchObject({
       ready: false,
       cloudflareProviderExecutor: { required: false },
-      pendingMigrations: [],
+      pendingMigrations: ["0096_v2_configured_update_inputs.sql"],
     });
   });
 
@@ -1105,6 +1109,38 @@ describe("split Takoserver Worker surfaces", () => {
     }
   });
 
+  test("normal and V2 Workers keep95 qualification with source96 and reject96 applied or foreign local tails", () => {
+    const snapshot = {
+      local: canonicalMigrations,
+      applied: qualifiedMigrations.names,
+      shape: canonicalMoneyShape,
+      shapeDigest: canonicalMoneyShapeDigest,
+      moneyUnitPolicy: canonicalMoneyPolicy,
+    };
+    const unqualifiedShape = deriveExpectedApplicationShape(readMigrationArtifact().files);
+    const unqualified = {
+      ...snapshot,
+      applied: canonicalMigrations,
+      shape: unqualifiedShape,
+      shapeDigest: `sha256:${createHash("sha256").update(unqualifiedShape).digest("hex")}`,
+    };
+    for (const selected of [
+      target,
+      {
+        ...v2Target,
+        takoformV2: { ...v2Target.takoformV2, storageLineage: "v2-0088" as const },
+      },
+    ]) {
+      expect(workerSchemaAllowsPending(selected, snapshot)).toBe(true);
+      expect(workerMoneyUnitSchemaReady(snapshot, REPOSITORY)).toBe(true);
+      expect(workerSchemaAllowsPending(selected, unqualified)).toBe(false);
+      expect(workerMoneyUnitSchemaReady(unqualified, REPOSITORY)).toBe(false);
+      const foreign = { ...snapshot, local: [...canonicalMigrations, "0097_foreign.sql"] };
+      expect(workerSchemaAllowsPending(selected, foreign)).toBe(false);
+      expect(workerMoneyUnitSchemaReady(foreign, REPOSITORY)).toBe(false);
+    }
+  });
+
   test("0058 maintenance admits only exact source 0057 predecessor with 0058 next, never readiness", async () => {
     const canonical = { local: canonicalMigrations, applied: exact0057 };
     expect(workerSchemaAllowsPending(schemaMaintenanceTarget, canonical)).toBe(true);
@@ -1187,7 +1223,7 @@ describe("split Takoserver Worker surfaces", () => {
     for (const count of [66, 75, 87, 89]) {
       expect(workerSchemaAllowsPending(lineage0088, at(count))).toBe(false);
     }
-    expect(workerSchemaAllowsPending(lineage0088, at(canonicalMigrations.length))).toBe(true);
+    expect(workerSchemaAllowsPending(lineage0088, at(qualifiedMigrations.names.length))).toBe(true);
     expect(workerSchemaAllowsPending(lineage0089, at(88))).toBe(false);
     const lineage0091 = {
       ...v2Target,
@@ -1216,7 +1252,7 @@ describe("split Takoserver Worker surfaces", () => {
     expect(workerSchemaAllowsPending(applied0092, exact0092)).toBe(false);
     expect(workerSchemaAllowsPending(lineage0088, exact0092)).toBe(false);
     for (const selected of [lineage0088, lineage0089, lineage0091, lineage0092, applied0092]) {
-      expect(workerSchemaAllowsPending(selected, at(canonicalMigrations.length))).toBe(true);
+      expect(workerSchemaAllowsPending(selected, at(qualifiedMigrations.names.length))).toBe(true);
     }
     expect(
       workerSchemaAllowsPending(lineage0088, {

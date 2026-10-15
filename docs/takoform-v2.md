@@ -323,10 +323,28 @@ Before any possible backend send, expired or unavailable transfer enters
 map for replenishment and then queues again; terminal Operations refuse it.
 The dispatch marker erases transfer atomically. Once dispatch may have happened,
 the backend must reconcile the accepted identity and cannot infer unsent from a
-timeout or ask the Host to resend. A Form requiring preservation across UPDATE
-must also seal configured values for the stable Resource UID in the CREATE
-acceptance batch and validate an UPDATE against that exact retained row. The
-per-Operation transfer does not serve as permanent configured-value storage.
+timeout or ask the Host to resend. A Form keeping the same configured values
+across UPDATE seals them for the stable Resource UID in the CREATE acceptance
+batch and validates UPDATE against that retained row. Returning `void` from
+`prepareUpdate` preserves this behavior. The per-Operation transfer does not
+serve as permanent configured-value storage.
+
+An opted-in Form may instead return opaque configured material from the existing
+`prepareUpdate` hook when private inputs are present. Core appends it with that
+accepted UPDATE in the same atomic batch; it never replaces the CREATE row.
+The trusted `readV2ConfiguredPrivateInputs` reader accepts an optional third
+selector, `{operationId, generation}`, for exact UPDATE history. Missing history
+does not fall back to CREATE or the latest generation. Without a selector, the
+existing live-Resource CREATE read is unchanged. Ciphertext access is not a native
+authorization grant; the Form still owns its sealing and update semantics.
+
+Additive migration 0096 retains immutable UPDATE ciphertext through dispatch,
+later generations and Resource soft deletion. Final purge needs separate owner
+closure work; this does not establish native retention or secret delivery.
+Existing hooks need no new table access. A returning hook on an old schema fails
+acceptance atomically. An old self-host artifact rejects an unknown recorded
+migration, so rollback requires a schema-aware artifact or forward repair.
+No published Form profile is enabled by this source capability.
 
 Migration 0081 and these keys are source-only: no live D1 schema, operator key,
 or deployment has changed. Tests prove public HTTP acceptance, lost responses,
