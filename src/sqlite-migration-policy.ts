@@ -40,6 +40,20 @@ export interface MigrationSqlStatement {
   /** Actual outer command; trigger-body commands do not replace it. */
   readonly command: string | null;
   readonly pragma: "defer" | "introspection" | null;
+  /** Declarative metadata from this same token pass, not an execution grant. */
+  readonly table?: MigrationSqlTable;
+}
+
+export type MigrationSqlToken =
+  | { readonly kind: "word" | "symbol"; readonly value: string }
+  | { readonly kind: "quoted"; readonly value: string; readonly quote: "'" | '"' | "`" | "[" };
+
+export interface MigrationSqlTable {
+  readonly kind: "ordinary" | "virtual";
+  readonly schema: string | null;
+  readonly name: string;
+  readonly module: string | null;
+  readonly arguments: readonly (readonly MigrationSqlToken[])[];
 }
 
 /** Chosen by the trusted native adapter from the exact accepted Form identity. */
@@ -218,6 +232,9 @@ function scanMigrationSql(
   const statements: MigrationSqlStatement[] = [];
   let outerCommand: string | null = null;
   let statementPragma: MigrationSqlStatement["pragma"] = null;
+  let tableTokens: MigrationSqlToken[] = [];
+  let captureTable = true;
+  let tableDepth = 0;
   let capacityError: MigrationSqlCapacityError | undefined;
 
   // Policy state is advanced by the same tokens used for completeness.
@@ -239,6 +256,36 @@ function scanMigrationSql(
     commandPending = true;
     explainPrefix = 0;
     command = null;
+  };
+
+  const tableToken = (token: MigrationSqlToken): void => {
+    if (!captureTable || outerCommand === null) return;
+    if (outerCommand !== "create") {
+      captureTable = false;
+      return;
+    }
+    tableTokens.push(token);
+    const second = tableTokens[1];
+    if (
+      second &&
+      !["table", "virtual", "temp", "temporary"].some((name) => sqlKeyword(second, name))
+    ) {
+      captureTable = false;
+      tableTokens = [];
+      return;
+    }
+    if (token.kind === "symbol" && token.value === "(") {
+      // Ordinary column definitions need no metadata. Virtual arguments are
+      // retained as the very same dequoted tokens used by the policy pass.
+      if (!sqlKeyword(second, "virtual")) {
+        captureTable = false;
+        return;
+      }
+      tableDepth += 1;
+    } else if (token.kind === "symbol" && token.value === ")" && tableDepth > 0) {
+      tableDepth -= 1;
+      if (tableDepth === 0) captureTable = false;
+    }
   };
 
   const identifier = (value: string): void => {
@@ -352,11 +399,20 @@ function scanMigrationSql(
         capacityError = new MigrationSqlCapacityError(maximumStatementBytes, actualStatementBytes);
       }
     }
-    statements.push({ sql: statement, command: outerCommand, pragma: statementPragma });
+    const table = migrationTableMetadata(tableTokens);
+    statements.push({
+      sql: statement,
+      command: outerCommand,
+      pragma: statementPragma,
+      ...(table ? { table } : {}),
+    });
     sliceStart = end;
     hasExecutableToken = false;
     outerCommand = null;
     statementPragma = null;
+    tableTokens = [];
+    captureTable = true;
+    tableDepth = 0;
   };
 
   while (index < sql.length) {
@@ -411,6 +467,7 @@ function scanMigrationSql(
       const value = sql.slice(index + 1, close);
       if (pragma.state === 1 || pragma.state === 7) pragmaName(value, true);
       else identifier(value);
+      tableToken({ kind: "quoted", value, quote: "[" });
       end = close + 1;
     } else if (character === "'" || character === '"' || character === "`") {
       if (
@@ -435,6 +492,7 @@ function scanMigrationSql(
       }
       if (pragma.state === 1 || pragma.state === 7) pragmaName(value, true);
       else identifier(value);
+      tableToken({ kind: "quoted", value, quote: character });
     } else {
       const codePoint = sql.codePointAt(index);
       if (codePoint !== undefined && isSqliteIdentifierCodePoint(codePoint)) {
@@ -446,6 +504,7 @@ function scanMigrationSql(
         }
         const value = sql.slice(index, cursor);
         word(value);
+        tableToken({ kind: "word", value });
         token = completeKeyword(value);
         end = cursor;
       } else if (pragma.state === 2 && character === "=") {
@@ -455,6 +514,8 @@ function scanMigrationSql(
       } else if (pragma.state !== 0 && pragma.state !== 5) {
         refuse();
       }
+      if (codePoint === undefined || !isSqliteIdentifierCodePoint(codePoint))
+        tableToken({ kind: "symbol", value: character });
     }
 
     state = completeTransition(state, token);
@@ -496,6 +557,68 @@ function scanMigrationSql(
 
 function isPragmaWhitespace(value: string): boolean {
   return value === " " || (value >= "\t" && value <= "\r");
+}
+
+function sqlKeyword(token: MigrationSqlToken | undefined, word: string): boolean {
+  return token?.kind === "word" && token.value.toLowerCase() === word;
+}
+
+/** Consumes already-scanned tokens; it never tokenizes SQL a second time. */
+function migrationTableMetadata(
+  tokens: readonly MigrationSqlToken[],
+): MigrationSqlTable | undefined {
+  let index = 0;
+  if (!sqlKeyword(tokens[index++], "create")) return;
+  let schema: string | null = null;
+  if (sqlKeyword(tokens[index], "temp") || sqlKeyword(tokens[index], "temporary")) {
+    schema = "temp";
+    index += 1;
+  }
+  const virtual = sqlKeyword(tokens[index], "virtual");
+  if (virtual) index += 1;
+  if (!sqlKeyword(tokens[index++], "table")) return;
+  if (sqlKeyword(tokens[index], "if")) {
+    if (!sqlKeyword(tokens[index + 1], "not") || !sqlKeyword(tokens[index + 2], "exists")) return;
+    index += 3;
+  }
+  const first = tokens[index++];
+  if (!first || first.kind === "symbol") return;
+  let name = first.value;
+  if (tokens[index]?.kind === "symbol" && tokens[index]?.value === ".") {
+    schema = name;
+    const target = tokens[index + 1];
+    if (!target || target.kind === "symbol") return;
+    name = target.value;
+    index += 2;
+  }
+  if (!virtual) return { kind: "ordinary", schema, name, module: null, arguments: [] };
+  if (!sqlKeyword(tokens[index++], "using")) return;
+  const module = tokens[index++];
+  if (!module || module.kind === "symbol") return;
+  if (tokens[index]?.kind !== "symbol" || tokens[index]?.value !== "(") return;
+  index += 1;
+  const args: MigrationSqlToken[][] = [];
+  let argument: MigrationSqlToken[] = [];
+  let depth = 1;
+  for (; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (!token) return;
+    if (token.kind === "symbol") {
+      if (token.value === "(") depth += 1;
+      else if (token.value === ")") {
+        depth -= 1;
+        if (depth === 0) {
+          if (argument.length) args.push(argument);
+          return { kind: "virtual", schema, name, module: module.value, arguments: args };
+        }
+      } else if (token.value === "," && depth === 1) {
+        args.push(argument);
+        argument = [];
+        continue;
+      }
+    }
+    argument.push(token);
+  }
 }
 
 function onlyPragmaWhitespace(value: string): boolean {

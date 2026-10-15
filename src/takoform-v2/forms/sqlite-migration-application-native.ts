@@ -4,6 +4,7 @@ import {
   isMigrationDeferForeignKeysValue,
   isMigrationIntrospectionPragma,
   type MigrationSqlStatement,
+  type MigrationSqlTable,
   prepareNativeMigrationSql,
 } from "../../sqlite-migration-policy.ts";
 import {
@@ -186,12 +187,30 @@ function runFileAndLedger(
   let internalLedger = false;
   let started = false;
   let currentStatement: MigrationSqlStatement | undefined;
+  let catalogEpoch = 0;
+  let ftsAction:
+    | {
+        readonly statement: MigrationSqlStatement;
+        readonly descriptor: NativeFtsDescriptor;
+        readonly epoch: number;
+      }
+    | undefined;
+  let ftsCreate:
+    | { readonly statement: MigrationSqlStatement; readonly declaration: FtsDeclaration }
+    | undefined;
+  let createdFts: string | undefined;
   let initialIndexBuild:
     | { readonly statement: MigrationSqlStatement; readonly index: string; readonly schema: "main" }
     | undefined;
   const protectedObjects = new Set([LEDGER]);
   const mainTables = new Set(["sqlite_master", "sqlite_schema"]);
   const mainIndexes = new Set<string>();
+  const mainObjects = new Map<string, Record<string, unknown>>();
+  const mainDeclarations = new Map<string, MigrationSqlTable>();
+  const catalogDeclarations = new Map<string, MigrationSqlTable | undefined>();
+  const virtualTables = new Set<string>();
+  const ftsDescriptors = new Map<string, NativeFtsDescriptor>();
+  const ftsShadows = new Set<string>();
   const nonMainCatalogs: {
     readonly schema: string;
     readonly tables: ReadonlySet<string>;
@@ -207,23 +226,79 @@ function runFileAndLedger(
     metadataQuery = { kind: "catalog", schema: asciiLower(name) as string };
     try {
       const quoted = `"${name.replaceAll('"', '""')}"`;
-      return database.prepare(`SELECT name, type, tbl_name FROM ${quoted}.sqlite_schema`).all();
+      return database
+        .prepare(`SELECT name, type, tbl_name, sql FROM ${quoted}.sqlite_schema`)
+        .all();
     } finally {
       metadataQuery = undefined;
     }
   };
+  const ordinaryMain = (name: string): boolean => {
+    const object = mainObjects.get(name);
+    return (
+      object?.type === "table" &&
+      asciiLower(typeof object.tbl_name === "string" ? object.tbl_name : null) === name &&
+      mainDeclarations.get(name)?.kind === "ordinary" &&
+      !protectedObjects.has(name)
+    );
+  };
   const updateMainCatalog = (objects: readonly Record<string, unknown>[]): void => {
     mainTables.clear();
     mainIndexes.clear();
+    mainObjects.clear();
+    mainDeclarations.clear();
+    virtualTables.clear();
+    ftsDescriptors.clear();
+    ftsShadows.clear();
+    ftsAction = undefined;
+    catalogEpoch += 1;
     mainTables.add("sqlite_master");
     mainTables.add("sqlite_schema");
     for (const object of objects) {
       if (typeof object.name !== "string" || typeof object.tbl_name !== "string")
         throw new Error("migration_schema_unconfirmed");
       const name = asciiLower(object.name) as string;
+      mainObjects.set(name, object);
       if (object.type === "index") mainIndexes.add(name);
       else if (object.type === "table" || object.type === "view") mainTables.add(name);
       if (asciiLower(object.tbl_name) === LEDGER) protectedObjects.add(name);
+      if (object.type === "table" && typeof object.sql === "string") {
+        if (!catalogDeclarations.has(object.sql)) {
+          let declaration: MigrationSqlTable | undefined;
+          try {
+            declaration = prepareNativeMigrationSql(object.sql, "introspection")[0]?.table;
+          } catch {
+            /* Unsupported catalog SQL never acquires FTS authority. */
+          }
+          catalogDeclarations.set(object.sql, declaration);
+        }
+        const declaration = catalogDeclarations.get(object.sql);
+        if (
+          declaration &&
+          asciiLower(declaration.name) === name &&
+          (declaration.schema === null || asciiLower(declaration.schema) === "main")
+        ) {
+          mainDeclarations.set(name, declaration);
+          if (declaration.kind === "virtual") virtualTables.add(name);
+        }
+      }
+    }
+    const candidates = new Map<string, FtsDeclaration>();
+    for (const [name, table] of mainDeclarations) {
+      const declaration = ftsDeclaration(table);
+      if (!declaration || protectedObjects.has(name)) continue;
+      candidates.set(name, declaration);
+      for (const shadow of declaration.shadows) ftsShadows.add(asciiLower(shadow) as string);
+    }
+    for (const [name, declaration] of candidates) {
+      const content =
+        declaration.content === null ? null : (asciiLower(declaration.content) as string);
+      // The real catalog's fts5 declaration binds these exact builtin roles.
+      // A table merely sharing a name prefix is never an FTS descriptor.
+      if (content !== null && (!ordinaryMain(content) || ftsShadows.has(content))) continue;
+      if (!declaration.shadows.every((shadow) => ordinaryMain(asciiLower(shadow) as string)))
+        continue;
+      ftsDescriptors.set(name, { ...declaration, epoch: catalogEpoch });
     }
   };
   const outsideMain = (name: string, indexInfo: boolean): boolean => {
@@ -259,7 +334,7 @@ function runFileAndLedger(
         (action === SQLITE.SQLITE_READ &&
           db === metadataQuery.schema &&
           isSchemaCatalog(a, true) &&
-          (b === "name" || b === "type" || b === "tbl_name"))
+          (b === "name" || b === "type" || b === "tbl_name" || b === "sql"))
         ? SQLITE.SQLITE_OK
         : SQLITE.SQLITE_DENY;
     }
@@ -275,6 +350,18 @@ function runFileAndLedger(
         (schema !== null && db !== "main")
       )
         return SQLITE.SQLITE_DENY;
+      if (
+        introspection &&
+        a === "data_version" &&
+        second === null &&
+        schema === "main" &&
+        origin === null &&
+        ftsAction !== undefined &&
+        ftsAction.statement === currentStatement &&
+        ftsAction.epoch === catalogEpoch &&
+        ftsDescriptors.get(asciiLower(ftsAction.descriptor.name) as string) === ftsAction.descriptor
+      )
+        return SQLITE.SQLITE_OK;
       if (introspection && isMigrationIntrospectionPragma(first)) {
         if (
           b !== null &&
@@ -295,7 +382,6 @@ function runFileAndLedger(
       action === SQLITE.SQLITE_DETACH ||
       action === SQLITE.SQLITE_ANALYZE ||
       action === SQLITE.SQLITE_COPY ||
-      action === SQLITE.SQLITE_CREATE_VTABLE ||
       action === SQLITE.SQLITE_DROP_VTABLE
     ) {
       return SQLITE.SQLITE_DENY;
@@ -330,6 +416,49 @@ function runFileAndLedger(
         (action === SQLITE.SQLITE_INSERT || action === SQLITE.SQLITE_READ)
         ? SQLITE.SQLITE_OK
         : SQLITE.SQLITE_DENY;
+    }
+    if (
+      introspection &&
+      action === SQLITE.SQLITE_READ &&
+      a?.startsWith("pragma_") &&
+      !mainObjects.has(a) &&
+      !isMigrationIntrospectionPragma(a.slice(7))
+    ) {
+      // This is a resolved eponymous table, not a string/identifier search.
+      // Deny even if an earlier callback in this SQL has already used FTS.
+      return SQLITE.SQLITE_DENY;
+    }
+    if (action === SQLITE.SQLITE_CREATE_VTABLE) {
+      if (
+        !introspection ||
+        !started ||
+        !currentStatement ||
+        currentStatement.command !== "create" ||
+        ftsCreate === undefined ||
+        ftsCreate.statement !== currentStatement ||
+        schema !== "main" ||
+        origin !== null ||
+        b !== "fts5" ||
+        a !== asciiLower(ftsCreate.declaration.name)
+      )
+        return SQLITE.SQLITE_DENY;
+      createdFts = a;
+      return SQLITE.SQLITE_OK;
+    }
+    if (
+      introspection &&
+      a !== null &&
+      schema === "main" &&
+      (action === SQLITE.SQLITE_READ ||
+        action === SQLITE.SQLITE_INSERT ||
+        action === SQLITE.SQLITE_UPDATE ||
+        action === SQLITE.SQLITE_DELETE)
+    ) {
+      const descriptor = ftsDescriptors.get(a);
+      if (virtualTables.has(a) && !descriptor) return SQLITE.SQLITE_DENY;
+      if (descriptor && currentStatement && started && !internalLedger && !internalTransaction) {
+        ftsAction = { statement: currentStatement, descriptor, epoch: catalogEpoch };
+      }
     }
     if (action === SQLITE.SQLITE_REINDEX) {
       // SQLite authorizes an initial index population as REINDEX too. Only a
@@ -395,22 +524,47 @@ function runFileAndLedger(
       }
     }
     for (const statement of statements) {
+      const declaration = introspection ? ftsDeclaration(statement.table) : undefined;
+      if (declaration) {
+        // Refresh before creation too: its content table may have been created
+        // by an earlier canonical statement in this very migration file.
+        updateMainCatalog(readCatalog("main"));
+        const content =
+          declaration.content === null ? null : (asciiLower(declaration.content) as string);
+        if (
+          !mainObjects.has(asciiLower(declaration.name) as string) &&
+          !protectedObjects.has(asciiLower(declaration.name) as string) &&
+          declaration.shadows.every(
+            (shadow) =>
+              !mainObjects.has(asciiLower(shadow) as string) &&
+              !protectedObjects.has(asciiLower(shadow) as string),
+          ) &&
+          (content === null || (ordinaryMain(content) && !ftsShadows.has(content)))
+        ) {
+          ftsCreate = { statement, declaration };
+        }
+      }
       currentStatement = statement;
+      createdFts = undefined;
       try {
         database.exec(statement.sql);
       } finally {
+        ftsAction = undefined;
+        ftsCreate = undefined;
         initialIndexBuild = undefined;
         currentStatement = undefined;
       }
       if (
         introspection &&
-        nonMainCatalogs.length > 0 &&
         (statement.command === "create" ||
           statement.command === "alter" ||
           statement.command === "drop")
       ) {
         updateMainCatalog(readCatalog("main"));
       }
+      if (createdFts !== undefined && !ftsDescriptors.has(createdFts))
+        throw new Error("migration_fts_schema_unconfirmed");
+      createdFts = undefined;
     }
     internalLedger = true;
     database
@@ -435,10 +589,90 @@ function runFileAndLedger(
     internalTransaction = false;
     internalLedger = false;
     metadataQuery = undefined;
+    ftsAction = undefined;
+    ftsCreate = undefined;
+    createdFts = undefined;
     initialIndexBuild = undefined;
     currentStatement = undefined;
     database.setAuthorizer(null);
   }
+}
+
+interface FtsDeclaration {
+  readonly name: string;
+  readonly content: string | null;
+  readonly shadows: readonly string[];
+}
+
+interface NativeFtsDescriptor extends FtsDeclaration {
+  readonly epoch: number;
+}
+
+/** FTS module arguments are tokens from the one canonical SQL lexical pass. */
+function ftsDeclaration(table: MigrationSqlTable | undefined): FtsDeclaration | undefined {
+  if (
+    table?.kind !== "virtual" ||
+    asciiLower(table.module) !== "fts5" ||
+    (table.schema !== null && asciiLower(table.schema) !== "main")
+  )
+    return;
+  let content: string | undefined;
+  let contentSeen = false;
+  let columnsize = true;
+  let contentlessUnindexed = false;
+  let unindexed = false;
+  let columns = 0;
+  for (const argument of table.arguments) {
+    const name = argument[0];
+    if (!name || name.kind === "symbol") return;
+    if (argument[1]?.kind === "symbol" && argument[1]?.value === "=") {
+      const value = argument[2];
+      if (
+        argument.length !== 3 ||
+        !value ||
+        value.kind === "symbol" ||
+        (name.kind === "quoted" && name.quote !== "'")
+      )
+        return;
+      const key = asciiLower(name.value) as string;
+      if (!key) return;
+      // FTS5's native config parser accepts these ASCII option prefixes in
+      // this order. Interpret content/role options identically; SQLite still
+      // validates tokenizer, column and all other native option semantics.
+      if ("content".startsWith(key)) {
+        if (contentSeen) return;
+        content = value.value;
+        contentSeen = true;
+      } else if ("contentless_delete".startsWith(key)) {
+        // This changes update semantics, not the owned shadow roles.
+      } else if ("contentless_unindexed".startsWith(key)) {
+        contentlessUnindexed = value.value === "1";
+      } else if ("content_rowid".startsWith(key)) {
+        // SQLite resolves this column in the already-bound content table.
+      } else if ("columnsize".startsWith(key)) {
+        columnsize = value.value !== "0";
+      }
+    } else {
+      if (
+        argument.length > 2 ||
+        (argument[1] &&
+          (argument[1].kind !== "word" || asciiLower(argument[1].value) !== "unindexed"))
+      )
+        return;
+      columns += 1;
+      unindexed ||= argument.length === 2;
+    }
+  }
+  if (columns === 0) return;
+  const roles = ["data", "idx", "config"];
+  if (columnsize) roles.push("docsize");
+  if (content === undefined || (content === "" && contentlessUnindexed && unindexed))
+    roles.push("content");
+  return {
+    name: table.name,
+    content: content ? content : null,
+    shadows: roles.map((role) => `${table.name}_${role}`),
+  };
 }
 
 function asciiLower(value: string | null): string | null {
