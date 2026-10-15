@@ -260,7 +260,7 @@ export class DockerContainerRuntimePreparation {
     } catch {
       throw new DockerContainerRuntimePreparationError("unavailable");
     }
-    const guard = async () => {
+    const authorityGuard = async () => {
       if (revocation.aborted) throw new DockerContainerRuntimePreparationError("unavailable");
       let current: boolean;
       try {
@@ -271,16 +271,26 @@ export class DockerContainerRuntimePreparation {
       if (current !== true || revocation.aborted)
         throw new DockerContainerRuntimePreparationError("unavailable");
     };
+    let topology: string | undefined;
+    const guard = async () => {
+      await authorityGuard();
+      let receipt: unknown;
+      try {
+        // Do not retain a producer-owned mutable receipt across awaited checks.
+        receipt = structuredClone(await readback());
+      } catch {
+        throw new DockerContainerRuntimePreparationError("unavailable");
+      }
+      if (!matchesReceipt(receipt, native, this.policy))
+        throw new DockerContainerRuntimePreparationError("conflict");
+      const actual = (receipt as DockerContainerRuntimeReceipt).topology;
+      const observed = JSON.stringify([actual.networkId, actual.rulesetDigest, actual.meterId]);
+      await authorityGuard();
+      if (topology !== undefined && topology !== observed)
+        throw new DockerContainerRuntimePreparationError("conflict");
+      topology = observed;
+    };
     await guard();
-    let receipt: unknown;
-    try {
-      receipt = await readback();
-    } catch {
-      throw new DockerContainerRuntimePreparationError("unavailable");
-    }
-    await guard();
-    if (!matchesReceipt(receipt, native, this.policy))
-      throw new DockerContainerRuntimePreparationError("conflict");
     return { guard, claimStart };
   }
 

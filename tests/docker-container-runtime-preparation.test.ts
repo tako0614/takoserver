@@ -364,3 +364,102 @@ test("native identity and policy are copied before an awaited preparation can mu
   expect(await pending).toBe("started");
   expect(preparation.policy.tenantRef).toBe("tenant-one");
 });
+
+test("topology drift during the durable start claim cannot authorize start or recreate its claim", async () => {
+  const f = fixture();
+  let current = f.receipt;
+  let starts = 0;
+  f.lease.readback = async () => current;
+  const claim = f.lease.claimStart.bind(f.lease);
+  f.lease.claimStart = async (identity) => {
+    const result = await claim(identity);
+    current = {
+      ...f.receipt,
+      topology: { ...f.receipt.topology, rulesetDigest: `sha256:${"9".repeat(64)}` },
+    };
+    return result;
+  };
+  const preparation = createDockerContainerRuntimePreparation(f.options);
+  await expect(
+    preparation.authorizeStart({ native, state: "stopped" }, async () => {
+      starts++;
+    }),
+  ).rejects.toMatchObject({ code: "conflict" });
+  expect(starts).toBe(0);
+  expect(f.claims.size).toBe(1);
+  expect(
+    await preparation.authorizeStart({ native, state: "stopped" }, async () => {
+      starts++;
+    }),
+  ).toBe("readback");
+  expect([starts, f.installCount(), f.claims.size]).toEqual([0, 1, 1]);
+});
+
+test("a retained running guard reads actual enforcement again after awaited health and body cleanup", async () => {
+  for (const change of ["missing", "partial", "network", "rules", "meter"] as const) {
+    const f = fixture();
+    f.claims.add(native.nativeId);
+    let current: unknown = f.receipt;
+    const preparation = createDockerContainerRuntimePreparation({
+      ...f.options,
+      recover: async () => ({ ...f.lease, readback: async () => current }),
+    });
+    const guard = await preparation.verifyExisting(native);
+    // The caller awaits the response body/health work before publishing ready.
+    await Promise.resolve();
+    current =
+      change === "missing"
+        ? null
+        : change === "partial"
+          ? { ...f.receipt, coverage: { ...f.receipt.coverage, udp: false } }
+          : {
+              ...f.receipt,
+              topology: {
+                ...f.receipt.topology,
+                ...(change === "network"
+                  ? { networkId: "9".repeat(64) }
+                  : change === "rules"
+                    ? { rulesetDigest: `sha256:${"9".repeat(64)}` }
+                    : { meterId: "foreign-meter" }),
+              },
+            };
+    await expect(guard()).rejects.toMatchObject({ code: "conflict" });
+    expect(f.installCount()).toBe(0);
+  }
+});
+
+test("a pending fresh readback cannot publish ready after un-aborted authority loss", async () => {
+  const f = fixture();
+  f.claims.add(native.nativeId);
+  let current = true;
+  let pending = false;
+  let entered: () => void = () => undefined;
+  const reading = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  let resume: (value: DockerContainerRuntimeReceipt) => void = () => undefined;
+  const blocked = new Promise<DockerContainerRuntimeReceipt>((resolve) => {
+    resume = resolve;
+  });
+  const preparation = createDockerContainerRuntimePreparation({
+    ...f.options,
+    recover: async () => ({
+      ...f.lease,
+      stillCurrent: async () => current,
+      readback: async () => {
+        if (!pending) return f.receipt;
+        entered();
+        return blocked;
+      },
+    }),
+  });
+  const guard = await preparation.verifyExisting(native);
+  pending = true;
+  const verifying = guard();
+  await reading;
+  current = false;
+  resume(f.receipt);
+  await expect(verifying).rejects.toMatchObject({ code: "unavailable" });
+  expect(f.revocation.signal.aborted).toBe(false);
+  expect(f.installCount()).toBe(0);
+});
