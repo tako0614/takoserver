@@ -125,6 +125,7 @@ async function fixture(nativeBinary: string | null = null, workerSource?: string
     });
   }
   const config = {
+    cursorSigningKey: new Uint8Array(32).fill(0x52),
     documentation: "https://docs.example.test/v2",
     authenticationDocumentation: "https://docs.example.test/auth",
     workerBundle: { targetKey: TARGET, heldArtifacts: entries },

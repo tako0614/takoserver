@@ -843,6 +843,7 @@ test("forward Endpoint real Core capture and SQL guard close04/05 and06/05/07 wi
                 sourceOperationId: selected.last_operation,
               },
             };
+            const { forwardEndpointDeployment: _capturedDeployment, ...legacyBase } = base;
             const wrong = [
               {
                 ...base,
@@ -859,7 +860,7 @@ test("forward Endpoint real Core capture and SQL guard close04/05 and06/05/07 wi
                 },
               },
               { ...base, workerUid: "foreign-worker" },
-              { ...base, forwardEndpointDeployment: undefined, forwardDeployment: true as const },
+              { ...legacyBase, forwardDeployment: true as const },
             ];
             probe.sourceRefusals = 0;
             for (const input of wrong) {

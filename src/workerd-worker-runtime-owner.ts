@@ -195,7 +195,10 @@ type PublicationState = {
 };
 
 function parseHeldVersion(
-  version: NonNullable<V2WorkerPublicationSnapshot["deployment"]>["versions"][number],
+  version: Pick<
+    NonNullable<V2WorkerPublicationSnapshot["deployment"]>["versions"][number],
+    "form" | "spec"
+  >,
 ) {
   if (version.form !== undefined && version.form !== FORWARD_WORKER_VERSION_FORM_URL)
     throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
@@ -5977,12 +5980,15 @@ async function openRuntimeOwner(
         }).catch(() => null);
         if (resolution?.kind !== "ready") return unknown;
         const snapshot = resolution.snapshot;
-        const versions = snapshot.deployment?.versions.map(({ uid, generation, weight, spec }) => ({
-          workerVersionUid: uid,
-          generation,
-          weight,
-          spec,
-        }));
+        const versions = snapshot.deployment?.versions.map(
+          ({ uid, generation, weight, spec, form }) => ({
+            workerVersionUid: uid,
+            generation,
+            weight,
+            spec,
+            ...(form === undefined ? {} : { form }),
+          }),
+        );
         if (
           snapshot.sourceOperationId !== operationId ||
           snapshot.worker.uid !== requested.workerUid ||
