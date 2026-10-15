@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import {
+  type BigIntStats,
   closeSync,
   constants,
   copyFileSync,
@@ -13,6 +14,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  readSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -830,25 +832,75 @@ function originalRootIdentity(root: string): { readonly device: bigint; readonly
   }
 }
 
+/** Compare the held inode with both its original state and the currently named entry. */
+function assertOriginalFileCurrent(path: string, fd: number, before: BigIntStats): void {
+  const held = fstatSync(fd, { bigint: true });
+  const named = lstatSync(path, { bigint: true });
+  for (const stat of [held, named]) {
+    if (
+      stat.dev !== before.dev ||
+      stat.ino !== before.ino ||
+      stat.mode !== before.mode ||
+      stat.uid !== before.uid ||
+      stat.gid !== before.gid ||
+      stat.nlink !== before.nlink ||
+      stat.size !== before.size ||
+      stat.mtimeNs !== before.mtimeNs ||
+      stat.ctimeNs !== before.ctimeNs
+    ) {
+      throw new Error("original entry changed");
+    }
+  }
+}
+
+/** Shared only by the original creator's bounded read and artifact fsync paths. */
+function openOriginalRegularFile(
+  path: string,
+  limit: number,
+  sealed: boolean,
+): { readonly fd: number; readonly stat: BigIntStats } {
+  const named = lstatSync(path, { bigint: true });
+  const uid = process.getuid?.();
+  const valid = (stat: BigIntStats): boolean =>
+    stat.isFile() &&
+    stat.nlink === 1n &&
+    uid !== undefined &&
+    stat.uid === BigInt(uid) &&
+    ((stat.mode & 0o777n) === 0o600n || (sealed && (stat.mode & 0o777n) === 0o400n)) &&
+    stat.size > 0n &&
+    stat.size <= BigInt(limit);
+  if (!valid(named)) throw new Error("unsafe original entry");
+  // The path can change after lstat: a FIFO must never block before held-fd validation.
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+  try {
+    const stat = fstatSync(fd, { bigint: true });
+    if (!valid(stat)) throw new Error("unsafe held original entry");
+    assertOriginalFileCurrent(path, fd, named);
+    return { fd, stat };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
 function readOriginalBytes(path: string, limit: number, sealed = false): Uint8Array | null {
   if (lstatSync(path, { throwIfNoEntry: false }) === undefined) return null;
   let fd = -1;
   try {
-    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-    const stat = fstatSync(fd);
-    if (
-      !stat.isFile() ||
-      stat.nlink !== 1 ||
-      stat.uid !== process.getuid?.() ||
-      ![0o600, ...(sealed ? [0o400] : [])].includes(stat.mode & 0o777) ||
-      stat.size < 1 ||
-      stat.size > limit
-    )
-      throw new Error("unsafe bytes");
-    const bytes = readFileSync(fd);
-    if (bytes.byteLength !== stat.size || fstatSync(fd).size !== stat.size)
-      throw new Error("changed bytes");
-    return bytes;
+    const held = openOriginalRegularFile(path, limit, sealed);
+    fd = held.fd;
+    const size = Number(held.stat.size);
+    // At most max+1 bytes, even if an owner grows a formerly small regular file.
+    const bytes = Buffer.alloc(size + 1);
+    let offset = 0;
+    while (offset < size) {
+      const count = readSync(fd, bytes, offset, size - offset, offset);
+      if (count < 1) throw new Error("truncated original entry");
+      offset += count;
+    }
+    if (readSync(fd, bytes, offset, 1, offset) !== 0) throw new Error("grown original entry");
+    assertOriginalFileCurrent(path, fd, held.stat);
+    return bytes.subarray(0, size);
   } catch {
     throw mutationError(
       "original integration custody is unsafe or unreadable; retain UNKNOWN and do not retry",
@@ -860,37 +912,45 @@ function readOriginalBytes(path: string, limit: number, sealed = false): Uint8Ar
 
 /** Retain original sealed SQL/config bytes durably before dispatch/terminal, never as a cache. */
 function syncOriginalArtifact(root: string): void {
-  for (const name of readdirSync(root).sort()) {
-    const path = join(root, name);
-    const stat = lstatSync(path);
-    if (stat.isSymbolicLink() || stat.uid !== process.getuid?.()) {
-      throw mutationError("original creation artifact is not owner-controlled; retain UNKNOWN");
-    }
-    if (stat.isDirectory()) {
-      syncOriginalArtifact(path);
-    } else {
-      let fd = -1;
-      try {
-        fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-        const opened = fstatSync(fd);
-        if (
-          !opened.isFile() ||
-          opened.nlink !== 1 ||
-          opened.dev !== stat.dev ||
-          opened.ino !== stat.ino
-        )
-          throw new Error("unsafe artifact");
-        fsyncSync(fd);
-      } finally {
-        if (fd >= 0) closeSync(fd);
+  let directory = -1;
+  try {
+    const before = lstatSync(root, { bigint: true });
+    if (
+      !before.isDirectory() ||
+      before.uid !== BigInt(process.getuid?.() ?? -1) ||
+      ![0o500n, 0o700n].includes(before.mode & 0o777n)
+    )
+      throw new Error("unsafe artifact directory");
+    directory = openSync(
+      root,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NONBLOCK | constants.O_NOFOLLOW,
+    );
+    assertOriginalFileCurrent(root, directory, before);
+    for (const name of readdirSync(root).sort()) {
+      const path = join(root, name);
+      const stat = lstatSync(path);
+      if (stat.isDirectory()) {
+        syncOriginalArtifact(path);
+      } else {
+        let fd = -1;
+        try {
+          const held = openOriginalRegularFile(path, ORIGINAL_IMPORT_LIMIT, true);
+          fd = held.fd;
+          fsyncSync(fd);
+          assertOriginalFileCurrent(path, fd, held.stat);
+        } finally {
+          if (fd >= 0) closeSync(fd);
+        }
       }
     }
-  }
-  const fd = openSync(root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-  try {
-    fsyncSync(fd);
+    fsyncSync(directory);
+    assertOriginalFileCurrent(root, directory, before);
+  } catch {
+    throw mutationError(
+      "original creation artifact is unsafe or changed; retain UNKNOWN and do not retry",
+    );
   } finally {
-    closeSync(fd);
+    if (directory >= 0) closeSync(directory);
   }
 }
 
@@ -1206,6 +1266,7 @@ function prepareOriginalCreate(
         );
       }
     }
+    assertContinuity();
     return records;
   };
   const makeEvidence = (

@@ -1986,3 +1986,162 @@ describe("original integration-ts fresh0092 creator", () => {
     ).rejects.toThrow("exact matching");
   });
 });
+
+interface BoundedCustodyProbeResult {
+  readonly mode: string;
+  readonly pid: number;
+  readonly message: string;
+  readonly mutations: number;
+  readonly wholeFdReads: number;
+  readonly requestedBytes: number;
+  readonly injected: boolean;
+  readonly timedOut: boolean;
+}
+
+/** Isolated instrumentation changes real local files; it does not simulate a native race. */
+async function boundedCustodyProbe(mode: string): Promise<BoundedCustodyProbeResult> {
+  const f = originalCreationFixture();
+  const moduleUrl = new URL("../scripts/deploy/integration-storage-generation.ts", import.meta.url)
+    .href;
+  const stem = `integration-create-${createHash("sha256")
+    .update(
+      JSON.stringify({
+        accountId: f.selected.accountId,
+        namespace: "integration-ts",
+        generation: GENERATION,
+      }),
+    )
+    .digest("hex")}`;
+  const entry = join(f.custodyDirectory, `${stem}.create-dispatched.json`);
+  const artifactEntry = join(f.custodyDirectory, `${stem}.artifact`, "probe-original-entry");
+  const script = `
+    import * as nativeFs from "node:fs";
+    import { mock } from "bun:test";
+    const fs = { ...nativeFs };
+    const mode = ${JSON.stringify(mode)};
+    const entry = ${JSON.stringify(entry)};
+    const artifactEntry = ${JSON.stringify(artifactEntry)};
+    const input = ${JSON.stringify({ invocation: f.invocation, target: f.selected, originalCreate: f.options.originalCreate })};
+    let watchedFd = -1, mutations = 0, wholeFdReads = 0, requestedBytes = 0, injected = false;
+    const fifo = (path) => {
+      const result = Bun.spawnSync(["mkfifo", "--mode=600", path]);
+      if (result.exitCode !== 0) throw new Error("local FIFO creation failed");
+    };
+    if (!mode.startsWith("sync-")) {
+      if (mode === "fifo") fifo(entry);
+      else fs.writeFileSync(entry, mode === "oversize" ? Buffer.alloc(32 * 1024 + 1) : "{}", { mode: 0o600 });
+    }
+    mock.module("node:fs", () => ({
+      ...fs,
+      openSync(path, flags, ...rest) {
+        const watched = path === entry || path === artifactEntry;
+        if (watched && mode === "fifo-swap" && !injected) {
+          fs.unlinkSync(path); fifo(path); injected = true;
+        }
+        const fd = fs.openSync(path, flags, ...rest);
+        if (watched) {
+          watchedFd = fd;
+          if (mode === "sync-replaced" && !injected) {
+            fs.renameSync(path, path + ".held"); fs.writeFileSync(path, "{}", { mode: 0o600 }); injected = true;
+          }
+        }
+        return fd;
+      },
+      readFileSync(path, ...args) {
+        if (typeof path === "number" && path === watchedFd) wholeFdReads += 1;
+        return fs.readFileSync(path, ...args);
+      },
+      readSync(fd, buffer, offset, length, position) {
+        if (fd === watchedFd) {
+          requestedBytes += length;
+          if (!injected && mode === "growth") {
+            fs.appendFileSync(entry, Buffer.alloc(32 * 1024 + 1)); injected = true;
+          } else if (!injected && mode === "replaced") {
+            fs.renameSync(entry, entry + ".held"); fs.writeFileSync(entry, "{}", { mode: 0o600 }); injected = true;
+          }
+        }
+        return fs.readSync(fd, buffer, offset, length, position);
+      },
+    }));
+    const { runIntegrationStorageGeneration } = await import(${JSON.stringify(moduleUrl)});
+    let lists = 0;
+    const provider = {
+      async listD1() {
+        if (++lists === 2 && mode.startsWith("sync-")) {
+          if (mode === "sync-fifo") fifo(artifactEntry);
+          else fs.writeFileSync(artifactEntry, "{}", { mode: 0o600 });
+        }
+        return [];
+      },
+      async listR2() { return []; },
+      async createD1() { mutations += 1; throw new Error("unexpected provider mutation"); },
+      async createR2() { mutations += 1; throw new Error("unexpected provider mutation"); },
+      async getD1() { throw new Error("unexpected provider read"); },
+      async getR2() { throw new Error("unexpected provider read"); },
+    };
+    const run = async command => {
+      const key = command.join(" ");
+      if (key === "git rev-parse HEAD") return { exitCode: 0, stdout: ${JSON.stringify(COMMIT + "\n")}, stderr: "" };
+      if (key === "git branch --show-current") return { exitCode: 0, stdout: "component-local\\n", stderr: "" };
+      if (key === "git status --porcelain=v1 -z --untracked-files=all" || key === "bun run check:migrations") return { exitCode: 0, stdout: "", stderr: "" };
+      throw new Error("unexpected command");
+    };
+    let message = "";
+    try {
+      await runIntegrationStorageGeneration(input.invocation, input.target, { provider, run,
+        review: "independent-component-custody-read", originalCreate: input.originalCreate,
+        migrationDirectory: ${JSON.stringify(currentMigrations)},
+        reader: { async read() { throw new Error("unexpected schema read"); } },
+      });
+    } catch (error) { message = error.message; }
+    console.log(JSON.stringify({ mode, pid: process.pid, message, mutations, wholeFdReads, requestedBytes, injected }));
+  `;
+  const child = Bun.spawn([process.execPath, "--no-env-file", "--eval", script], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    child.kill("SIGKILL");
+  }, 1500);
+  try {
+    const [code, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    console.info(
+      `bounded-custody-child mode=${mode} pid=${child.pid} exit=${code} timedOut=${timedOut}`,
+    );
+    expect(timedOut).toBe(false);
+    expect(code).toBe(0);
+    if (code !== 0) throw new Error(stderr);
+    return { ...JSON.parse(stdout.trim()), timedOut } as BoundedCustodyProbeResult;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+describe("bounded original custody retained-file I/O", () => {
+  test("bounded custody read refuses FIFO/oversize and controlled real growth or replacement", async () => {
+    for (const mode of ["fifo", "fifo-swap", "oversize", "growth", "replaced"]) {
+      const result = await boundedCustodyProbe(mode);
+      expect(result.message).toContain("UNKNOWN");
+      expect(result.mutations).toBe(0);
+      expect(result.wholeFdReads).toBe(0);
+      expect(result.requestedBytes).toBeLessThanOrEqual(3);
+      if (["fifo-swap", "growth", "replaced"].includes(mode)) expect(result.injected).toBe(true);
+    }
+  });
+
+  test("bounded custody artifact fsync refuses FIFO and a replaced held/path entry before create", async () => {
+    for (const mode of ["sync-fifo", "sync-replaced"]) {
+      const result = await boundedCustodyProbe(mode);
+      expect(result.message).toContain("UNKNOWN");
+      expect(result.mutations).toBe(0);
+      expect(result.wholeFdReads).toBe(0);
+      if (mode === "sync-replaced") expect(result.injected).toBe(true);
+    }
+  });
+});
