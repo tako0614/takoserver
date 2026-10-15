@@ -86,7 +86,7 @@ const landingMessages = {
     consoleSite: "takoserver.com's own console",
     apiTitle: "With the API",
     apiBody:
-      "Do the same from your own tools over Host API v2. Start by asking your Host whether it supports the exact Form URL you plan to use.",
+      "Do the same from your own tools over Host API v2. Start by asking your Host whether it supports the exact Form URL you plan to use; $HOST is its public origin.",
     reference: "Host API v2 reference",
     openapi: "OpenAPI description",
     discovery: "Takoform Host discovery",
@@ -149,7 +149,7 @@ const landingMessages = {
     consoleSite: "takoserver.com自身のコンソール",
     apiTitle: "APIで",
     apiBody:
-      "同じ操作を、自分のツールからHost API v2で行えます。まず、使う予定のForm URLに自分のHostが対応しているかを確認します。",
+      "同じ操作を、自分のツールからHost API v2で行えます。まず、使う予定のForm URLに自分のHostが対応しているかを確認します。$HOSTはHostの公開originです。",
     reference: "Host API v2 リファレンス",
     openapi: "OpenAPI仕様",
     discovery: "Takoform Hostディスカバリー",

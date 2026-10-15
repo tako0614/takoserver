@@ -193,6 +193,10 @@ try {
 
   await send("Page.enable");
   await send("Runtime.enable");
+  // One warm-up load so the first capture lays out like the rest.
+  const warm = event("Page.loadEventFired");
+  await send("Page.navigate", { url: `${origin}/resources` });
+  await warm;
   for (const locale of ["en", "ja"] as const) {
     for (const [shape, width, height] of [
       ["desktop", 1200, 750],
