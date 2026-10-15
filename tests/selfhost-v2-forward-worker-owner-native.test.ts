@@ -42,6 +42,7 @@ import {
 } from "../src/takoform-v2/worker-version-configured-inputs.ts";
 import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
 import { spawnWorkerdWithParentDeath } from "../src/workerd-linux-process.ts";
+import { WorkerdWorkerRuntimeOwnerError } from "../src/workerd-worker-runtime-owner.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 const TARGET = "forward-owner-fixture";
@@ -53,7 +54,7 @@ const ASSET = "https://artifact.example.test/forward-owner/index.html";
 // Real Core, on-disk SQLite, FS held bytes and configured-input cryptography.
 // Only native-gated cases select/inspect/spawn actual pinned workerd. The
 // component cases never use a stand-in native sender or claim native readiness.
-async function fixture(nativeBinary: string | null = null) {
+async function fixture(nativeBinary: string | null = null, workerSource?: string) {
   const root = await mkdtemp(join(tmpdir(), "takoserver-forward-owner-"));
   const db = new Database(join(root, "control.sqlite"));
   migrateSqlite(db);
@@ -73,12 +74,15 @@ async function fixture(nativeBinary: string | null = null) {
     keyForDecryption: (id: string) => (id === "synthetic-forward-owner" ? key : undefined),
   };
   const forwardSealer = createV2ForwardWorkerVersionConfiguredInputSealer(keyring);
-  const source = new TextEncoder().encode(`export default {
+  const source = new TextEncoder().encode(
+    workerSource ??
+      `export default {
     fetch(request, env) {
       if (new URL(request.url).pathname === "/stream") return new Response(new ReadableStream({start(c){c.enqueue(new TextEncoder().encode("first"));}}));
       return new Response("native:" + env.TOKEN);
     }
-  };`);
+  };`,
+  );
   const asset = new TextEncoder().encode("forward-held-static");
   const manifest = new TextEncoder().encode(
     JSON.stringify({
@@ -657,7 +661,31 @@ test.skipIf(native === undefined)(
 test.skipIf(native === undefined)(
   "forward actual native owner06 DELETE cancels retained body before retirement ACK",
   async () => {
-    const f = await fixture(native);
+    const f = await fixture(
+      native,
+      `export default {
+      fetch(request, env) {
+        if (new URL(request.url).pathname === "/stream") {
+          let timer;
+          let releasePull;
+          return new Response(new ReadableStream({
+            start(controller) { controller.enqueue(new TextEncoder().encode("first")); },
+            pull(controller) {
+              return new Promise((resolve) => {
+                releasePull = resolve;
+                // A real pending runtime timer keeps this producer live. It
+                // cannot fire within the outer30s test budget and is canceled
+                // when the Host cancels this exact native response.
+                timer = setTimeout(() => { controller.close(); resolve(); }, 60000);
+              });
+            },
+            cancel() { clearTimeout(timer); releasePull?.(); },
+          }));
+        }
+        return new Response("native:" + env.TOKEN);
+      }
+    };`,
+    );
     let failed = false;
     try {
       const b = await f.basics();
@@ -674,13 +702,29 @@ test.skipIf(native === undefined)(
       if (!response.body) throw new Error("native stream has no body");
       const reader = response.body.getReader();
       expect(new TextDecoder().decode((await reader.read()).value)).toBe("first");
-      await f.nativeCheckpoint("native-response-open");
+      let tailSettled = false;
       const tail = reader.read().then(
-        (value) => ({ kind: "eof", done: value.done }),
-        () => ({ kind: "canceled" }),
+        (value) => {
+          tailSettled = true;
+          return { kind: "eof", done: value.done };
+        },
+        (error: unknown) => {
+          tailSettled = true;
+          return {
+            kind: "canceled",
+            code: error instanceof WorkerdWorkerRuntimeOwnerError ? error.code : null,
+          };
+        },
       );
-      await f.remove(deployment.resourceUid);
-      expect(await tail).toMatchObject({ kind: "canceled" });
+      // Real asynchronous state/proc readback gives the pending native pull a
+      // turn; no sleep, source cancellation or timer firing establishes this.
+      await f.nativeCheckpoint("native-response-pull-pending");
+      expect(tailSettled).toBe(false);
+      expect(f.children.some((child) => child.exitCode === null && child.signalCode === null)).toBe(
+        true,
+      );
+      const deletion = await f.remove(deployment.resourceUid);
+      expect(await tail).toMatchObject({ kind: "canceled", code: "admission_closed" });
       reader.releaseLock();
       expect(
         await owner.observeRetirement({ workerVersionUid: b.version.resourceUid }),
@@ -689,6 +733,34 @@ test.skipIf(native === undefined)(
         deployment.id,
       ]);
       expect(states).toEqual([{ status: "succeeded", effect: "complete" }]);
+      expect(
+        await f.sql.query("SELECT status,effect FROM tf_v2_operations WHERE id=?", [deletion.id]),
+      ).toEqual([{ status: "succeeded", effect: "complete" }]);
+      const ownerNames = (await readdir(f.options.rootDirectory)).filter((name) =>
+        /^[0-9a-f]{64}$/u.test(name),
+      );
+      expect(ownerNames).toHaveLength(1);
+      const ownerName = ownerNames[0];
+      if (ownerName === undefined) throw new Error("original native owner state missing");
+      expect(
+        JSON.parse(
+          await readFile(join(f.options.rootDirectory, ownerName, "runtime-owner.json"), "utf8"),
+        ),
+      ).toMatchObject({
+        workerResourceUid: b.worker.resourceUid,
+        activeOperationId: null,
+        incarnations: [
+          {
+            operationId: deployment.id,
+            retirementOperationId: deletion.id,
+            status: "retired",
+            executionCopiesReleased: true,
+            executionCopiesCleanupStarted: true,
+            receipt: { workerResourceUid: b.worker.resourceUid, operationId: deletion.id },
+          },
+        ],
+      });
+      await f.nativeCheckpoint("native-body-canceled-and-original-group-retired");
     } catch (error) {
       failed = true;
       throw error;
