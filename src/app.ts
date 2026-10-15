@@ -388,6 +388,7 @@ export function buildApp(ports: AppPorts): App {
     objects: ports.objects,
     accounts,
     publicOrigin: ports.publicOrigin,
+    ...(ports.consoleOrigin === undefined ? {} : { consoleOrigin: ports.consoleOrigin }),
     config: ports.v2,
     clock,
     ...(ports.v2FormFactory === undefined ? {} : { formFactory: ports.v2FormFactory }),
