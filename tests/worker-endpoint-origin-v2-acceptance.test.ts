@@ -13,7 +13,10 @@ import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import type { V2PrivateInputCustody } from "../src/takoform-v2/private-inputs.ts";
 import { createV2Store } from "../src/takoform-v2/store.ts";
 import type { V2EngineOptions, V2Form } from "../src/takoform-v2/types.ts";
-import { createWorkerEndpointOriginV2Acceptance } from "../src/worker-endpoint-origin-v2-acceptance.ts";
+import {
+  createWorkerEndpointOriginV2Acceptance,
+  createWorkerEndpointOriginV2FormRouteAcceptance,
+} from "../src/worker-endpoint-origin-v2-acceptance.ts";
 
 const FORM = "https://forms.example.test/BindingAcceptance/1.0.0/";
 const BACKEND = "origin-binding-fixture";
@@ -31,10 +34,17 @@ const ADMISSION_DETAIL = "The fixture Form refused this acceptance.";
 
 type OmittedWrite = "resource" | "private" | "configured" | "reference-seal";
 
-function sharedSchema(db: Database, includeBindings: boolean): void {
+function sharedSchema(db: Database, includeBindings: boolean, typed = false): void {
   // Preserve the stronger original ledger fixture checks, not the relaxed route fixture.
   for (const realm of ["staging", "production"]) {
     const prefix = `shared_app_${realm}`;
+    const variantChecks = typed
+      ? `CHECK((binding_kind IS NULL AND binding_json IS NULL
+          AND (state<>'reserved' OR script IS NULL) AND (state<>'active' OR script IS NOT NULL))
+        OR (binding_kind IS 'form-v2@1' AND script IS NULL AND
+          ((state IN ('reserved','released') AND binding_json IS NULL)
+            OR (state='active' AND binding_json IS NOT NULL AND json_valid(binding_json)=1))))`
+      : `CHECK(state<>'reserved' OR script IS NULL), CHECK(state<>'active' OR script IS NOT NULL)`;
     db.exec(`CREATE TABLE ${prefix}_assignments (
       incarnation TEXT PRIMARY KEY
         CHECK(length(incarnation)=32 AND incarnation NOT GLOB '*[^0-9a-f]*'),
@@ -45,11 +55,11 @@ function sharedSchema(db: Database, includeBindings: boolean): void {
       reservation_id TEXT NOT NULL,
       generation INTEGER NOT NULL CHECK(generation BETWEEN 1 AND 9007199254740990),
       state TEXT NOT NULL CHECK(state IN ('reserved','active','released')),
-      script TEXT, released_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      script TEXT, released_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL${typed ? ", binding_kind TEXT, binding_json TEXT" : ""},
       UNIQUE(organization_id,reservation_id), CHECK(updated_at>=created_at),
       CHECK((state='released')=(released_at IS NOT NULL)),
       CHECK(released_at IS NULL OR released_at>=created_at),
-      CHECK(state<>'reserved' OR script IS NULL), CHECK(state<>'active' OR script IS NOT NULL))`);
+      ${variantChecks})`);
     db.exec(`CREATE TABLE ${prefix}_names (
       normalized_name TEXT PRIMARY KEY
         CHECK(length(normalized_name) BETWEEN 3 AND 32
@@ -128,12 +138,13 @@ async function fixture(
     custody?: boolean;
     references?: "empty" | "missing";
     admission?: boolean;
+    typed?: boolean;
   } = {},
 ) {
   const db = new Database(":memory:");
   migrateSqlite(db);
   const raw = createSqliteSql(db);
-  sharedSchema(db, options.bindings !== false);
+  sharedSchema(db, options.bindings !== false, options.typed);
   let blocked = false;
   let loseAck = false;
   let hideAfterCommit = false;
@@ -289,7 +300,11 @@ async function fixture(
     forms: { [FORM]: form },
     ...(options.custody ? { privateInputCustody: await privateCustody() } : {}),
   };
-  const capability = createWorkerEndpointOriginV2Acceptance({
+  const capability = (
+    options.typed
+      ? createWorkerEndpointOriginV2FormRouteAcceptance
+      : createWorkerEndpointOriginV2Acceptance
+  )({
     sql,
     ledger,
     formUrl: FORM,
@@ -1139,6 +1154,114 @@ test("selected Store keeps its construction-bound batch while the issuer read is
   } finally {
     f.sql.batch = originalBatch;
     gate.release();
+    f.close();
+  }
+});
+
+test("explicit Form-v2 acceptance reads the typed owner method while scalar construction remains scalar", async () => {
+  const f = await fixture({ typed: true, references: "empty" });
+  try {
+    const original = await f.reserve();
+    const actual = f.ledger.forTrustedOwner.bind(f.ledger);
+    let scalarReads = 0;
+    let typedReads = 0;
+    f.ledger.forTrustedOwner = (owner) => {
+      const selected = actual(owner);
+      return {
+        ...selected,
+        async readOriginal() {
+          scalarReads++;
+          throw new Error("scalar decoder must not see a typed path");
+        },
+        async readOriginalRoute(id) {
+          typedReads++;
+          return selected.readOriginalRoute(id);
+        },
+      };
+    };
+    const operation = await f.engine.acceptCreate(createRequest());
+    expect(operation.generation).toBe(1);
+    expect(scalarReads).toBe(0);
+    expect(typedReads).toBeGreaterThan(0);
+    expect(bindings(f)).toHaveLength(1);
+    expect(bindingAt(f, original)).toMatchObject({
+      endpoint_uid: operation.resourceUid,
+      endpoint_generation: 1,
+      current_operation_id: operation.id,
+    });
+    expect(
+      f.db
+        .query(
+          "SELECT generation,state,binding_kind,binding_json FROM shared_app_staging_assignments",
+        )
+        .get(),
+    ).toEqual({
+      generation: 1,
+      state: "reserved",
+      binding_kind: null,
+      binding_json: null,
+    });
+    expect(f.counts().backendCalls).toBe(0);
+  } finally {
+    f.close();
+  }
+});
+
+test("explicit typed acceptance retains tags and fences the actual claim without changing route generation", async () => {
+  const f = await fixture({ typed: true, references: "empty" });
+  try {
+    const original = await f.reserve();
+    // A non-serving tagged fixture exercises the separate decoder. Actual
+    // live tagged publication and subsequent UPDATE are tested in the receiver
+    // file with real Core/0074/history/native rows, not fabricated here.
+    await f.sql.run(
+      "UPDATE shared_app_staging_assignments SET binding_kind='form-v2@1' WHERE incarnation=?",
+      [original.incarnation],
+    );
+    const created = await f.engine.acceptCreate(createRequest());
+    expect(await f.engine.runNext()).toMatchObject({ id: created.id, status: "succeeded" });
+    const before = f.db.query(`SELECT * FROM ${BINDINGS}`).all();
+    const updated = await f.engine.acceptUpdate({
+      principal: PRINCIPAL,
+      key: "explicit-typed-update",
+      uid: created.resourceUid,
+      expectedGeneration: 1,
+      spec: {},
+    });
+    expect(updated.generation).toBe(2);
+    expect(
+      f.db.query(`SELECT endpoint_generation,current_operation_id FROM ${BINDINGS}`).get(),
+    ).toEqual({
+      endpoint_generation: 2,
+      current_operation_id: updated.id,
+    });
+    expect(
+      f.db.query("SELECT generation,binding_kind FROM shared_app_staging_assignments").get(),
+    ).toEqual({ generation: 1, binding_kind: "form-v2@1" });
+    expect(before).toHaveLength(1);
+    await expect(
+      f.ledger.forTrustedOwner(OWNER).readOriginal(original.reservationId),
+    ).rejects.toMatchObject({ code: "unavailable" });
+  } finally {
+    f.close();
+  }
+});
+
+test("typed compiler never falls back on malformed tag data or a different Sql identity", async () => {
+  const f = await fixture({ typed: true, references: "empty" });
+  try {
+    await f.reserve();
+    expect(() => f.capability.assertSql({ ...f.sql })).toThrow("same atomic Sql");
+    f.capability.assertSql(f.sql);
+    // Real fixture CHECK is deliberately bypassed solely to emulate corrupt
+    // persisted data; the actual typed reader must still fail closed.
+    f.db.exec("PRAGMA ignore_check_constraints=ON");
+    f.db.exec("UPDATE shared_app_staging_assignments SET binding_kind='future@9'");
+    f.db.exec("PRAGMA ignore_check_constraints=OFF");
+    await expect(f.engine.acceptCreate(createRequest())).rejects.toBeDefined();
+    expect(f.db.query("SELECT count(*) AS n FROM tf_v2_resources").get()).toEqual({ n: 0 });
+    expect(bindings(f)).toEqual([]);
+  } finally {
     f.close();
   }
 });

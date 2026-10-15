@@ -1120,6 +1120,7 @@ for (const releaseCount of [1, 2, 8]) {
     try {
       const { owner, plan, receipt } = await startWeighted(h, releaseCount);
       const selected = await h.ledger.readCurrentRoute("route-update");
+      if (!plan.original.nextBinding) throw new Error("activation lost its full next binding");
       expect(selected).toEqual({
         kind: "form-v2@1",
         pin: receipt.assignment.pin,
@@ -1164,9 +1165,9 @@ test("native D1 tagged advance keeps every six-pin value and exact historical re
     await h.sql.batch(weightedBatch(plan));
     const current = await h.ledger.readCurrentRoute("route-update");
     expect(current?.kind).toBe("form-v2@1");
-    expect(current?.kind === "form-v2@1" ? current.binding.releases : null).toEqual(
-      command.nextBinding?.releases,
-    );
+    if (current?.kind !== "form-v2@1") throw new Error("committed full route selection is missing");
+    if (!command.nextBinding) throw new Error("advance lost its full next binding");
+    expect(current.binding.releases).toEqual(command.nextBinding.releases);
     const before = await weightedSnapshot(h.sql);
     await h.sql.batch(
       weightedBatch(

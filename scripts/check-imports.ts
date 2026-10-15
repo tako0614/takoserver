@@ -682,7 +682,14 @@ for (const path of walk("src")) {
       ) ===
         JSON.stringify(
           [
+            "createWorkerEndpointOriginV2FormRouteAcceptance",
+            "createWorkerEndpointOriginV2FormRoutePublication",
             "createWorkerEndpointOriginV2Publication",
+            "WorkerEndpointOriginV2FormRouteDeploymentResult",
+            "WorkerEndpointOriginV2FormRouteEndpointResult",
+            "WorkerEndpointOriginV2FormRouteNativeRows",
+            "WorkerEndpointOriginV2FormRoutePreparation",
+            "WorkerEndpointOriginV2FormRoutePublication",
             "WorkerEndpointOriginV2Publication",
             "WorkerEndpointOriginV2PublicationPreparation",
           ].sort(),

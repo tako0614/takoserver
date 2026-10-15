@@ -269,7 +269,10 @@ export { createRuntimeInputAuthority } from "./runtime-input-preparations.ts";
 export { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
 export {
   createSharedAppLedger,
+  type SharedAppFormV2Binding,
   type SharedAppLedger,
+  type SharedAppNativeRouteRowPin,
+  type SharedAppRouteSelection,
   type SharedAppSelection,
 } from "./shared-app-ledger.ts";
 export {
@@ -336,7 +339,14 @@ export type {
   WorkerClassRuntimeContract,
 } from "./worker-class-runtime-port.ts";
 export {
+  createWorkerEndpointOriginV2FormRouteAcceptance,
+  createWorkerEndpointOriginV2FormRoutePublication,
   createWorkerEndpointOriginV2Publication,
+  type WorkerEndpointOriginV2FormRouteDeploymentResult,
+  type WorkerEndpointOriginV2FormRouteEndpointResult,
+  type WorkerEndpointOriginV2FormRouteNativeRows,
+  type WorkerEndpointOriginV2FormRoutePreparation,
+  type WorkerEndpointOriginV2FormRoutePublication,
   type WorkerEndpointOriginV2Publication,
   type WorkerEndpointOriginV2PublicationPreparation,
 } from "./worker-endpoint-origin-v2-acceptance.ts";
