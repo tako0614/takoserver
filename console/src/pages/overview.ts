@@ -2,10 +2,11 @@ import { formatMicrosCurrency, type Organization } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
 import { consoleLocale, tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
-import { byForm, health } from "../resource-state.ts";
+import { byForm, health, phaseLabel } from "../resource-state.ts";
 import { linkProps, resourcePath } from "../router.ts";
 import { api } from "../state.ts";
 import { ago, badge, card, copyable, empty, ICON, icon, stat, whenReady } from "../ui.ts";
+import { createResource } from "./create-resource.ts";
 
 /**
  * The first screen, answering the two questions someone signs in with: is
@@ -69,20 +70,31 @@ export function overviewPage(organization: Organization): Child {
         ),
         whenReady(
           resources.get(),
-          ({ resources: all }) => {
+          ({ resources: all, cursor }) => {
             const attention = all.filter((entry) =>
               ["Failed", "NotReady"].includes(health(entry).phase),
             ).length;
+            // Only the first page is read here. When the Host has more, the
+            // count says so instead of passing a page size off as a total.
+            // The caption names what this count checks (failed or not ready);
+            // the Needs attention card below also lists undelivered changes.
+            const more = cursor !== null && all.length > 0;
             return stat(
               tr("リソース", "Resources"),
-              String(all.length),
-              attention === 0
-                ? tr("読み込み済みページの件数", "count from loaded page")
-                : h(
+              more ? `${all.length}+` : String(all.length),
+              attention > 0
+                ? h(
                     "span",
                     { style: { color: "var(--warn)" } },
-                    tr(`${attention}件に確認が必要`, `${attention} need attention`),
-                  ),
+                    more
+                      ? tr(`${attention}件以上に確認が必要`, `${attention}+ need attention`)
+                      : tr(`${attention}件に確認が必要`, `${attention} need attention`),
+                  )
+                : more
+                  ? tr("最初のページのみ集計", "first page only")
+                  : all.length === 0
+                    ? tr("まだありません", "none yet")
+                    : tr("失敗・非稼働はありません", "none failed or not ready"),
             );
           },
           { skeleton: h("div", { class: "card" }, h("div", { class: "card__body skeleton" })) },
@@ -92,20 +104,32 @@ export function overviewPage(organization: Organization): Child {
     live(() =>
       whenReady(
         resources.get(),
-        ({ resources: all }) =>
+        ({ resources: all, cursor }) =>
           all.length === 0
             ? card(
                 tr("リソース", "Resources"),
                 empty(
                   tr("リソースがありません", "Nothing declared yet"),
                   tr(
-                    "リソース画面で運用者から渡された正確なForm URLを使って作成できます。",
-                    "Open Resources to create with an exact Form URL supplied by the operator.",
+                    "運用者から渡された正確なForm URLを指定して作成します。受理されたリソースは完了前から表示されます。",
+                    "Create one with an exact Form URL supplied by the operator. An accepted resource can appear before execution completes.",
+                  ),
+                  h(
+                    "button",
+                    {
+                      class: "btn btn--primary",
+                      type: "button",
+                      onClick: () => createResource(organization.id),
+                    },
+                    icon(ICON.plus, 14),
+                    text(tr("リソースを作成", "New resource")),
                   ),
                 ),
               )
             : card(
-                tr("Form別（読み込み済み）", "By Form (loaded page)"),
+                cursor === null
+                  ? tr("Form別", "By Form")
+                  : tr("Form別（最初のページ）", "By Form (first page)"),
                 h(
                   "div",
                   { class: "card__body" },
@@ -286,16 +310,4 @@ export function overviewPage(organization: Organization): Child {
 
 function uiLocale(): "en-US" | "ja-JP" {
   return consoleLocale() === "ja" ? "ja-JP" : "en-US";
-}
-
-function phaseLabel(phase: ReturnType<typeof health>["phase"]): string {
-  const japanese = {
-    Ready: "稼働中",
-    NotReady: "非稼働",
-    Pending: "処理中",
-    Failed: "失敗",
-    Deleting: "削除中",
-    Unknown: "不明",
-  } as const;
-  return tr(japanese[phase], phase);
 }

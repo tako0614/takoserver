@@ -22,6 +22,21 @@ const landingMessages = {
     eyebrow: "Takoform Host",
     headline: "Run a Takoform Host.",
     lede: "Manage resources against published Form URLs, on infrastructure owned by the Host operator. Check this Host's support before choosing a Form.",
+    start: "Get started",
+    useTitle: "Use this Host",
+    useStep1: "Sign in to the console",
+    useStep2: "Create an organization. It owns your resources, API keys and balance.",
+    useStep3: "Issue an organization API key that can read or write resources.",
+    useStep4: "Ask whether this Host supports the exact Form URL you plan to use.",
+    ownTitle: "Run your own Host",
+    ownStep1: "With Bun installed, get the open-source code and install its locked dependencies.",
+    ownStep2: "Set the public HTTPS origin, the v2 configuration and a persistent cursor key.",
+    ownStep3:
+      "Start it. Without an identity provider, the first boot prints a single-use operator sign-in assertion.",
+    ownNote:
+      "Serve it through your own HTTPS front end; do not expose the listener directly. The guide covers the Worker runtime and each setting.",
+    guide: "First install guide",
+    reference: "Host API v2 reference",
     products: "Host primitives",
     formTitle: "Exact Form identity",
     formBody:
@@ -41,9 +56,6 @@ const landingMessages = {
       "Accounts, wallet and service billing are separate product APIs. Their presence does not mean every Form is available or that v2 resource billing is enabled.",
     onSuccess: "on success",
     onFailure: "on failure",
-    selfhostTitle: "Open source. Self-host the whole Host.",
-    selfhostBody:
-      "Configure the HTTPS origin, v2 documentation URLs and a persistent cursor key before starting. Enable only the Form backends and artifact grants you intend to provide.",
     endpoints: "Endpoints",
     source: "source",
     api: "API description",
@@ -56,6 +68,22 @@ const landingMessages = {
     eyebrow: "Takoform Host",
     headline: "Takoform Hostを、自分の基盤で動かす。",
     lede: "公開されたFormの仕様URLを指定して、Host運営者の基盤上で資源を管理します。使う前に、そのHostの対応範囲を確認できます。",
+    start: "はじめる",
+    useTitle: "このHostを使う",
+    useStep1: "コンソールにサインイン",
+    useStep2: "組織を作成します。資源・APIキー・残高は組織が所有します。",
+    useStep3: "資源の読み取りまたは書き込みができる組織APIキーを発行します。",
+    useStep4: "使う予定の厳密なForm URL（版を含む）に、このHostが対応しているか確認します。",
+    ownTitle: "自分のHostを動かす",
+    ownStep1:
+      "Bunを用意し、オープンソースのコードを取得して、lockfileで固定された依存関係をインストールします。",
+    ownStep2: "公開HTTPS origin、v2設定、永続するcursor鍵を設定します。",
+    ownStep3:
+      "起動します。IDプロバイダーが未設定なら、初回起動時に一度だけ使える運営者サインイン用のassertionが表示されます。",
+    ownNote:
+      "公開時は自分で用意したHTTPSフロントエンドの背後に置き、listenerを直接公開しないでください。Worker実行環境と各設定は手順書で説明しています。",
+    guide: "初回インストール手順",
+    reference: "Host API v2 リファレンス",
     products: "Hostの基本機能",
     formTitle: "厳密なForm同一性",
     formBody:
@@ -74,9 +102,6 @@ const landingMessages = {
       "アカウント・ウォレット・サービス課金は独立した製品APIです。これらが存在しても、全Formへの対応やv2資源への課金が有効という意味ではありません。",
     onSuccess: "成功時",
     onFailure: "失敗時",
-    selfhostTitle: "オープンソース。Hostを自分で動かす。",
-    selfhostBody:
-      "起動前にHTTPS origin、v2の案内URL、永続するcursor鍵を設定します。提供するForm backendと、artifactの取得権限を明示的に選びます。",
     endpoints: "エンドポイント",
     source: "ソース",
     api: "API仕様",
@@ -110,6 +135,22 @@ export function landingHtml(options: LandingOptions): string {
     ? `<a class="cta" href="${consoleOrigin}" data-i18n="console">${copy.console}</a>`
     : "";
   const base = options.apiOrigin ?? "";
+  // A command has to name an origin to be pasted. The API's own root does not
+  // know its public origin here, so the page fills in the one it was read from.
+  const commandOrigin = base || `<span data-origin>$HOST</span>`;
+  const useLane = consoleOrigin
+    ? `<div class="lane">
+<h3 data-i18n="useTitle">${copy.useTitle}</h3>
+<ol class="steps">
+<li><a href="${consoleOrigin}" data-i18n="useStep1">${copy.useStep1}</a></li>
+<li><span data-i18n="useStep2">${copy.useStep2}</span></li>
+<li><span data-i18n="useStep3">${copy.useStep3}</span><span class="chips"><code>resources:read</code><code>resources:write</code></span></li>
+<li><span data-i18n="useStep4">${copy.useStep4}</span><pre class="cmd">curl -sG ${commandOrigin}/apis/forms.takoform.com/v2/support \\
+  --data-urlencode "form=&lt;Form URL&gt;" \\
+  -H "authorization: Bearer $KEY"</pre></li>
+</ol>
+</div>`
+    : "";
   const noScriptLocale_ =
     options.apiOrigin !== null
       ? `<noscript><a href="/ja/">日本語</a> · <a href="/en/">English</a></noscript>`
@@ -162,6 +203,7 @@ export function landingHtml(options: LandingOptions): string {
   --line-1: #3a2c26; --line-2: #523e36;
   --accent: #e0533c; --accent-hover: #ef6349; --accent-ink: #150907;
   --mark-face: #0b0b0c;
+  --drop: rgba(0, 0, 0, 0.85);
   --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "Hiragino Sans", sans-serif;
   --mono: ui-monospace, "SF Mono", Menlo, monospace;
   --dot: 'DotGothic16', var(--mono);
@@ -197,24 +239,25 @@ main { max-width: 46rem; margin: 0 auto; padding: 72px 24px 96px; }
   opacity: 0.14; pointer-events: none; z-index: -1;
 }
 .eyebrow { margin: 0; color: var(--accent); font: 600 12px/1.3 var(--mono); letter-spacing: .08em; text-transform: uppercase; }
-h1 { margin: 20px 0 0; font-family: var(--dot); font-weight: 400; font-size: 40px; line-height: 1.25; letter-spacing: 0; overflow-wrap: anywhere; min-width: 0; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+h1 { margin: 20px 0 0; font-family: var(--dot); font-weight: 400; font-size: 40px; line-height: 1.25; letter-spacing: 0; overflow-wrap: anywhere; min-width: 0; text-wrap: balance; word-break: auto-phrase; }
 p.lede { margin: 16px 0 0; color: var(--ink-2); font-size: 16px; max-width: 34rem; }
 .actions { display: flex; align-items: center; gap: 10px 20px; flex-wrap: wrap; margin-top: 28px; }
 .cta {
   display: inline-flex; align-items: center; padding: 10px 18px;
   border: 2px solid #6e2418; background: var(--accent); color: var(--accent-ink);
   font-size: 14px; font-weight: 600; text-decoration: none;
-  box-shadow: 4px 4px 0 rgba(0, 0, 0, 0.85);
+  box-shadow: 4px 4px 0 var(--drop);
   transition: transform 80ms ease, box-shadow 80ms ease, background 120ms ease;
 }
-.cta:hover { background: var(--accent-hover); transform: translate(1px, 1px); box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.85); }
-.cta:active { transform: translate(4px, 4px); box-shadow: 0 0 0 rgba(0,0,0,0); }
+.cta:hover { background: var(--accent-hover); transform: translate(1px, 1px); box-shadow: 3px 3px 0 var(--drop); }
+.cta:active { transform: translate(4px, 4px); box-shadow: 0 0 0 transparent; }
 a.source { font: 12.5px var(--mono); color: var(--ink-3); text-decoration: none; border-bottom: 1px solid var(--line-2); padding-bottom: 1px; }
 a.source:hover { color: var(--ink-1); border-color: var(--ink-3); }
 
 section { margin-top: 68px; position: relative; }
 .shead { display: flex; align-items: center; gap: 10px; margin: 0; font-family: var(--dot); font-size: 16px; font-weight: 400; letter-spacing: .02em; }
-.shead::before { content: ""; flex: none; width: 11px; height: 11px; background: var(--accent); box-shadow: 3px 3px 0 rgba(0,0,0,0.85); }
+.shead::before { content: ""; flex: none; width: 11px; height: 11px; background: var(--accent); box-shadow: 3px 3px 0 var(--drop); }
 .spec { margin-top: 20px; border-top: 2px solid var(--line-1); }
 .spec .row { padding: 16px 0; border-bottom: 1px solid var(--line-1); }
 .spec .term { display: flex; justify-content: space-between; align-items: baseline; gap: 14px; }
@@ -225,18 +268,41 @@ p.get { margin: 18px 0 0; }
 p.get code { font: 13px var(--mono); color: var(--ink-1); overflow-wrap: anywhere; }
 p.get b { color: var(--accent); font-weight: 600; }
 pre {
-  margin: 12px 0 0; padding: 40px 16px 16px; border: 2px solid var(--line-1);
-  background: var(--term); color: var(--ink-2); position: relative;
+  margin: 12px 0 0; padding: 14px 16px; border: 2px solid var(--line-1);
+  background: var(--term); color: var(--ink-2);
   font: 12.5px/1.65 var(--mono); overflow-x: auto;
-  box-shadow: 6px 6px 0 rgba(0, 0, 0, 0.85);
-}
-pre::before {
-  content: ""; position: absolute; top: 14px; left: 16px;
-  width: 9px; height: 9px; background: var(--accent);
-  box-shadow: 16px 0 0 var(--line-2), 32px 0 0 var(--line-2);
+  box-shadow: 6px 6px 0 var(--drop);
 }
 pre b { color: var(--accent); font-weight: 500; }
 pre.cmd { color: var(--ink-1); }
+/* The first action, in two lanes: someone else's running Host, or your own. */
+.lane { margin-top: 24px; }
+.lane + .lane { padding-top: 24px; border-top: 1px dashed var(--line-2); }
+.lane h3 { margin: 0; font-size: 15px; font-weight: 600; }
+ol.steps { margin: 12px 0 0; padding: 0; list-style: none; counter-reset: step; }
+ol.steps > li {
+  counter-increment: step; display: grid; grid-template-columns: 22px minmax(0, 1fr);
+  column-gap: 12px; padding: 8px 0; color: var(--ink-2); font-size: 14px;
+}
+ol.steps > li::before {
+  content: counter(step); grid-row: 1; align-self: start; width: 22px; height: 22px;
+  display: grid; place-items: center; background: var(--accent); color: var(--accent-ink);
+  font: 13px/1 var(--dot); box-shadow: 2px 2px 0 var(--drop);
+}
+ol.steps > li > * { grid-column: 2; min-width: 0; }
+ol.steps > li > span:first-child, ol.steps > li > a:first-child { padding-top: 1px; }
+ol.steps > li > a { justify-self: start; }
+ol.steps pre { margin-top: 8px; box-shadow: 4px 4px 0 var(--drop); }
+ol.steps a { color: var(--ink-1); text-decoration: underline; text-decoration-color: var(--accent); text-underline-offset: 3px; }
+ol.steps a:hover { color: var(--accent); }
+ol.steps a:active, .more a:active { color: var(--accent-hover); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.chips code { padding: 2px 8px; border: 1px solid var(--line-2); background: var(--panel); color: var(--ink-1); font-size: 12px; overflow-wrap: anywhere; }
+p.note { margin: 12px 0 0; color: var(--ink-3); font-size: 13px; max-width: 34rem; }
+.more { display: flex; flex-wrap: wrap; gap: 8px 24px; margin: 16px 0 0; padding: 0; }
+.more a { color: var(--ink-1); font: 600 13px var(--mono); text-decoration: none; white-space: nowrap; }
+.more a::before { content: "\\2192"; margin-right: 6px; color: var(--accent); }
+.more a:hover { color: var(--accent); }
 .flow { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 18px; }
 .node {
   display: inline-flex; align-items: baseline; gap: 7px; padding: 7px 11px;
@@ -249,18 +315,18 @@ pre.cmd { color: var(--ink-1); }
 .branches { display: grid; gap: 8px; }
 .branch { display: flex; align-items: center; gap: 9px; }
 .branch::before { content: "\\2192"; color: var(--accent); font-family: var(--mono); font-size: 12px; }
-.billing p.body, .selfhost p.body { margin: 14px 0 0; color: var(--ink-2); font-size: 14px; max-width: 34rem; }
-ul { margin: 18px 0 0; padding: 0; list-style: none; border-top: 2px solid var(--line-1); }
-li { border-bottom: 1px solid var(--line-1); }
-li a {
+.billing p.body { margin: 14px 0 0; color: var(--ink-2); font-size: 14px; max-width: 34rem; }
+ul.endpoints { margin: 18px 0 0; padding: 0; list-style: none; border-top: 2px solid var(--line-1); }
+.endpoints li { border-bottom: 1px solid var(--line-1); }
+.endpoints li a {
   display: flex; justify-content: space-between; gap: 16px; align-items: baseline;
   padding: 14px 4px; color: inherit; text-decoration: none;
 }
-li a::before { content: ""; flex: none; align-self: center; width: 8px; height: 8px; background: var(--line-2); margin-right: 2px; }
-li a:hover { background: var(--panel); }
-li a:hover::before { background: var(--accent); }
-li a code { overflow-wrap: anywhere; flex: 1; }
-li span { color: var(--ink-3); font-size: 13px; white-space: nowrap; }
+.endpoints li a::before { content: ""; flex: none; align-self: center; width: 8px; height: 8px; background: var(--line-2); margin-right: 2px; }
+.endpoints li a:hover { background: var(--panel); }
+.endpoints li a:hover::before { background: var(--accent); }
+.endpoints li a code { overflow-wrap: anywhere; flex: 1; }
+.endpoints li span { color: var(--ink-3); font-size: 13px; white-space: nowrap; }
 code { font-family: var(--mono); font-size: 13px; }
 footer { margin-top: 72px; color: var(--ink-3); font: 12.5px var(--mono); }
 footer a { color: inherit; }
@@ -270,8 +336,9 @@ footer a { color: inherit; }
   h1 { font-size: 30px; }
   section { margin-top: 52px; }
   .tako-ghost { width: 220px; height: 220px; right: -60px; top: -30px; }
-  li a { flex-direction: column; align-items: flex-start; gap: 2px; }
-  li a::before { display: none; }
+  .endpoints li a { flex-direction: column; align-items: flex-start; gap: 2px; }
+  .endpoints li a::before { display: none; }
+  ol.steps > li > pre { grid-column: 1 / -1; }
 }
 </style>
 
@@ -287,6 +354,22 @@ ${takoMark(380, "tako-ghost")}
 <p class="lede" data-i18n="lede">${copy.lede}</p>
 <div class="actions">${console_}<a class="source" href="https://github.com/tako0614/takoserver">github.com/tako0614/takoserver</a></div>
 </section>
+<section class="start" id="start" aria-labelledby="start-title">
+<h2 class="shead" id="start-title" data-i18n="start">${copy.start}</h2>
+${useLane}
+<div class="lane">
+<h3 data-i18n="ownTitle">${copy.ownTitle}</h3>
+<ol class="steps">
+<li><span data-i18n="ownStep1">${copy.ownStep1}</span><pre class="cmd">git clone https://github.com/tako0614/takoserver
+cd takoserver
+bun install --frozen-lockfile</pre></li>
+<li><span data-i18n="ownStep2">${copy.ownStep2}</span><span class="chips"><code>TAKOSERVER_PUBLIC_ORIGIN</code><code>TAKOSERVER_TAKOFORM_V2_CONFIG</code><code>TAKOSERVER_TAKOFORM_V2_CURSOR_KEY</code></span></li>
+<li><span data-i18n="ownStep3">${copy.ownStep3}</span><pre class="cmd">bun src/entry-bun.ts</pre></li>
+</ol>
+<p class="note" data-i18n="ownNote">${copy.ownNote}</p>
+<p class="more"><a href="https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#first-install-and-first-use" data-i18n="guide">${copy.guide}</a><a href="https://github.com/tako0614/takoserver/blob/main/docs/takoform-v2.md" data-i18n="reference">${copy.reference}</a></p>
+</div>
+</section>
 <section aria-label="${copy.products}">
 <h2 class="shead" data-i18n="products">${copy.products}</h2>
 <div class="spec">
@@ -299,7 +382,7 @@ ${takoMark(380, "tako-ghost")}
 <section aria-label="${copy.discovery}">
 <h2 class="shead" data-i18n="discovery">${copy.discovery}</h2>
 <p class="get"><code><b>GET</b> ${base}/.well-known/takoform/v2</code></p>
-<pre>curl ${base}/.well-known/takoform/v2</pre>
+<pre>curl ${commandOrigin}/.well-known/takoform/v2</pre>
 </section>
 <section class="billing" aria-label="${copy.billingTitle}">
 <h2 class="shead" data-i18n="billingTitle">${copy.billingTitle}</h2>
@@ -312,14 +395,9 @@ ${takoMark(380, "tako-ghost")}
 </div>
 <p class="body" data-i18n="billingBody">${copy.billingBody}</p>
 </section>
-<section class="selfhost" aria-label="${copy.selfhostTitle}">
-<h2 class="shead" data-i18n="selfhostTitle">${copy.selfhostTitle}</h2>
-<p class="body"><a href="https://github.com/tako0614/takoserver/blob/main/docs/takoform-v2.md">Host API v2 — operator setup</a></p>
-<p class="body" data-i18n="selfhostBody">${copy.selfhostBody}</p>
-</section>
 <section aria-label="${copy.endpoints}">
 <h2 class="shead" data-i18n="endpoints">${copy.endpoints}</h2>
-<ul>
+<ul class="endpoints">
 <li><a href="${base}/openapi.json"><code>${base}/openapi.json</code><span data-i18n="api">${copy.api}</span></a></li>
 <li><a href="${base}/.well-known/takoserver"><code>${base}/.well-known/takoserver</code><span data-i18n="product">${copy.product}</span></a></li>
 <li><a href="${base}/.well-known/takoform/v2"><code>${base}/.well-known/takoform/v2</code><span data-i18n="host">${copy.host}</span></a></li>
@@ -333,6 +411,7 @@ const localizedPaths=${String(options.apiOrigin !== null)};
 const pathLocale=location.pathname.split("/")[1];
 const setLocale=(locale,updatePath=false)=>{const lang=locale==="ja"?"ja":"en";document.documentElement.lang=lang;document.querySelector('meta[name="description"]').content=messages[lang].description;for(const node of document.querySelectorAll("[data-i18n]")){const value=messages[lang][node.dataset.i18n];if(value)node.textContent=value}for(const button of document.querySelectorAll("[data-locale]"))button.setAttribute("aria-pressed",String(button.dataset.locale===lang));try{localStorage.setItem("takoserver.locale",lang)}catch{}if(updatePath&&localizedPaths)history.replaceState(null,"","/"+lang+"/")};
 let stored=null;try{stored=localStorage.getItem("takoserver.locale")}catch{}setLocale(pathLocale==="ja"||pathLocale==="en"?pathLocale:stored??(navigator.language.toLowerCase().startsWith("ja")?"ja":"en"));for(const button of document.querySelectorAll("[data-locale]"))button.addEventListener("click",()=>setLocale(button.dataset.locale,true));
+if(!localizedPaths)for(const node of document.querySelectorAll("[data-origin]"))node.textContent=location.origin;
 </script>
 </body>
 </html>
