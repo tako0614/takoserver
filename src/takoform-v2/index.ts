@@ -81,6 +81,7 @@ export {
 } from "./forms/object-bucket.ts";
 export {
   createObjectBucketForm,
+  createObjectBucketStreamForm,
   OBJECT_BUCKET_BACKEND_ID,
   type ObjectBucketIdentity,
   type ObjectBucketStore,
@@ -158,6 +159,12 @@ export {
 } from "./forms/worker-bundle-backend.ts";
 export { WORKER_CRON_TRIGGER_FORM_URL } from "./forms/worker-cron-trigger.ts";
 export {
+  fixedReferencesForForwardWorkerDeployment,
+  fixedReferencesForForwardWorkerVersion,
+  prepareForwardWorkerDeploymentReferences,
+  prepareForwardWorkerVersionReferences,
+  referencesForForwardWorkerDeployment,
+  referencesForForwardWorkerVersion,
   referencesForModuleWorker,
   referencesForWorkerDeployment,
   referencesForWorkerEndpoint,
@@ -165,12 +172,21 @@ export {
   referencesForWorkerVersion,
 } from "./forms/worker-references.ts";
 export {
+  CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
+  CONTAINER_WORKER_VERSION_FORM_URL,
+  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+  FORWARD_WORKER_VERSION_FORM_URL,
+  type ForwardWorkerVersionSpec,
   MODULE_WORKER_FORM_URL,
   type ModuleWorkerSpec,
+  parseForwardWorkerDeploymentSpec,
+  parseForwardWorkerVersionSpec,
   parseModuleWorkerSpec,
   parseWorkerDeploymentSpec,
   parseWorkerEndpointSpec,
   parseWorkerVersionSpec,
+  validateForwardWorkerDeploymentUpdate,
+  validateForwardWorkerVersionUpdate,
   validateModuleWorkerUpdate,
   validateWorkerDeploymentUpdate,
   validateWorkerEndpointUpdate,
@@ -225,6 +241,7 @@ export {
   type WorkerCronTriggerScanContinuation,
   type WorkerCronTriggerTickResult,
 } from "./worker-cron-trigger-scheduler.ts";
+export { createForwardWorkerDeploymentForm } from "./worker-deployment-backend.ts";
 export {
   createV2WorkerInvocationLifecycle,
   type V2WorkerCronInvocationClaim,
@@ -246,6 +263,7 @@ export {
   type V2WorkerInvocationSchema,
   v2WorkerInvocationSchemaReady,
 } from "./worker-invocation-schema.ts";
+export { createInternalV2ForwardWorkerVersionForm } from "./worker-lifecycle-backend.ts";
 export {
   createV2NativeDeletionCustody,
   type V2NativeDeletionCustody,
@@ -258,6 +276,7 @@ export {
   type V2NativeEffectIdentity,
   type V2NativeEffectInspection,
 } from "./worker-native-effects.ts";
+export type { V2ForwardWorkerFamilyProfile } from "./worker-publication-state.ts";
 export {
   createV2WorkerPublicationState,
   type V2WorkerPublicationResolution,

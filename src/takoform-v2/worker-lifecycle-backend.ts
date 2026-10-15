@@ -1175,3 +1175,56 @@ export function createInternalV2WorkerVersionForm(options: CodeWorkerVersionOpti
     },
   };
 }
+
+import {
+  fixedReferencesForForwardWorkerVersion,
+  prepareForwardWorkerVersionReferences,
+} from "./forms/worker-references.ts";
+import {
+  FORWARD_WORKER_VERSION_FORM_URL,
+  parseForwardWorkerVersionSpec,
+  validateForwardWorkerVersionUpdate,
+} from "./forms/worker-specs.ts";
+
+/** Accepted-source preparation only; the actual forward materializer is absent. */
+export function createInternalV2ForwardWorkerVersionForm(options: {
+  readonly targetKey: string;
+}): V2Form {
+  if (!options.targetKey) throw new TypeError("targetKey is required");
+  const unavailable = async (execution: V2Execution): Promise<V2BackendResult> => ({
+    kind: "unknown",
+    code:
+      execution.form === FORWARD_WORKER_VERSION_FORM_URL &&
+      execution.targetKey === options.targetKey &&
+      execution.backendId === WORKER_VERSION_UNIFIED_BACKEND_ID
+        ? "worker_forward_materializer_unavailable"
+        : "worker_forward_identity_unavailable",
+    message: "The forward Worker materializer is unavailable",
+  });
+  return {
+    validateCreate(spec) {
+      const parsed = validated(() => parseForwardWorkerVersionSpec(spec));
+      // This source-only adapter has no new private-input custody port.
+      if (parsed.requiredSensitiveVars.length !== 0)
+        throw new TakoformV2Error("capability_required", 422);
+    },
+    validateUpdate(previous, spec) {
+      const parsed = validated(() => validateForwardWorkerVersionUpdate(previous, spec));
+      if (parsed.requiredSensitiveVars.length !== 0)
+        throw new TakoformV2Error("capability_required", 422);
+    },
+    references(spec) {
+      return fixedReferencesForForwardWorkerVersion(
+        validated(() => parseForwardWorkerVersionSpec(spec)),
+      );
+    },
+    prepareAdmission: prepareForwardWorkerVersionReferences,
+    rejectDeleteWhileReferenced: true,
+    backend: {
+      id: WORKER_VERSION_UNIFIED_BACKEND_ID,
+      targetKey: options.targetKey,
+      execute: unavailable,
+      reconcile: unavailable,
+    },
+  };
+}

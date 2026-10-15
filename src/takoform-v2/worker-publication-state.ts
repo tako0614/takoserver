@@ -5,6 +5,11 @@ import type {
   SqlArtifactCustodyRead,
   SqlArtifactCustodyUnverified,
 } from "./forms/artifact-custody.ts";
+import { OBJECT_BUCKET_LIMITS, parseObjectBucketSpec } from "./forms/object-bucket.ts";
+import {
+  type ObjectBucketBindingForm,
+  snapshotObjectBucketBindingForms,
+} from "./forms/object-bucket-binding-profile.ts";
 import {
   parseStaticAssetBundleSpec,
   STATIC_ASSET_BUNDLE_FORM_URL,
@@ -18,11 +23,18 @@ import {
 } from "./forms/worker-bundle.ts";
 import type { WorkerBundleCustody } from "./forms/worker-bundle-backend.ts";
 import {
+  referencesForForwardWorkerDeployment,
+  referencesForForwardWorkerVersion,
   referencesForWorkerDeployment,
   referencesForWorkerVersion,
 } from "./forms/worker-references.ts";
 import {
+  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+  FORWARD_WORKER_VERSION_FORM_URL,
+  type ForwardWorkerVersionSpec,
   MODULE_WORKER_FORM_URL,
+  parseForwardWorkerDeploymentSpec,
+  parseForwardWorkerVersionSpec,
   parseModuleWorkerSpec,
   parseWorkerDeploymentSpec,
   parseWorkerEndpointSpec,
@@ -42,6 +54,21 @@ import {
 } from "./worker-publication-sql-guard.ts";
 
 export type { V2WorkerPublicationSqlGuard } from "./worker-publication-sql-guard.ts";
+
+/** Accepted-source metadata only; not a publication, runtime or native send grant. */
+export interface V2ForwardWorkerFamilyProfile {
+  readonly sourceOperationId: string;
+  readonly resourceUid: string;
+  readonly generation: number;
+  readonly form: typeof FORWARD_WORKER_VERSION_FORM_URL | typeof FORWARD_WORKER_DEPLOYMENT_FORM_URL;
+  readonly principal: string;
+  readonly space: string;
+  readonly targetKey: string;
+  readonly workerUid: string;
+  readonly spec: ForwardWorkerVersionSpec | WorkerDeploymentSpec;
+  readonly bucketBindings: readonly ObjectBucketBindingForm[];
+  readonly versionTargets: readonly Readonly<{ resourceUid: string; formUrl: string }>[];
+}
 
 /** A read-only SQL authority for one fenced private Worker publication. */
 export interface V2WorkerPublicationSnapshot {
@@ -782,6 +809,136 @@ export function createV2WorkerPublicationState(options: {
   async function operation(id: string): Promise<OperationRow | null> {
     return ((await sql.query("SELECT * FROM tf_v2_operations WHERE id = ?", [id]))[0] ??
       null) as OperationRow | null;
+  }
+
+  async function captureForwardFamily(execution: V2Execution): Promise<{
+    readonly profile: V2ForwardWorkerFamilyProfile;
+    readonly vector: string;
+  } | null> {
+    try {
+      const source = await resource(execution.resourceUid);
+      const op = await operation(execution.operationId);
+      if (
+        !source ||
+        !op ||
+        (source.form_url !== FORWARD_WORKER_VERSION_FORM_URL &&
+          source.form_url !== FORWARD_WORKER_DEPLOYMENT_FORM_URL) ||
+        (op.action !== "create" && op.action !== "update") ||
+        !isCurrentClaim(op, source, execution, now().getTime())
+      )
+        return null;
+      const version =
+        source.form_url === FORWARD_WORKER_VERSION_FORM_URL
+          ? parseForwardWorkerVersionSpec(JSON.parse(op.accepted_spec_json))
+          : null;
+      const deployment = version
+        ? null
+        : parseForwardWorkerDeploymentSpec(JSON.parse(op.accepted_spec_json));
+      const spec = version ?? deployment;
+      if (!spec) return null;
+      const refs = await references(op.id);
+      if (!refs) return null;
+      const targets = refs.map((row) => ({ resourceUid: row.target_uid, formUrl: row.form_url }));
+      const expected = version
+        ? referencesForForwardWorkerVersion(version, targets)
+        : deployment
+          ? referencesForForwardWorkerDeployment(deployment, targets)
+          : [];
+      const edges = await sql.query(
+        "SELECT target_uid FROM tf_v2_resource_references WHERE referrer_uid = ? ORDER BY target_uid",
+        [source.uid],
+      );
+      if (refs.length !== expected.length || edges.length !== expected.length) return null;
+      const evidence: unknown[] = [];
+      const bucketBindings: ObjectBucketBindingForm[] = [];
+      for (let index = 0; index < expected.length; index += 1) {
+        const wanted = expected[index];
+        const ref = refs[index];
+        if (
+          !wanted ||
+          !ref ||
+          edges[index]?.target_uid !== wanted.resourceUid ||
+          ref.target_uid !== wanted.resourceUid ||
+          ref.form_url !== wanted.formUrl ||
+          ref.readiness !== wanted.readiness ||
+          ref.target_spec_path !==
+            (wanted.targetSpecMatch ? `$.${wanted.targetSpecMatch.path.join(".")}` : null) ||
+          ref.target_spec_equals !== (wanted.targetSpecMatch?.equals ?? null)
+        )
+          return null;
+        const target = await resource(ref.target_uid);
+        const last = target ? await operation(target.last_operation) : null;
+        if (
+          !target ||
+          target.form_url !== ref.form_url ||
+          target.principal !== source.principal ||
+          target.space !== source.space ||
+          !settled(target, last)
+        )
+          return null;
+        if (wanted.readiness === "ready" && JSON.parse(target.observed_json).ready !== true)
+          return null;
+        if (
+          wanted.targetSpecMatch &&
+          JSON.parse(target.spec_json)?.worker?.resourceUid !== spec.worker.resourceUid
+        )
+          return null;
+        const bindings =
+          version?.bucketBindings.filter((item) => item.resource.resourceUid === target.uid) ?? [];
+        if (bindings.length) {
+          if (target.target_key !== execution.targetKey) return null;
+          parseObjectBucketSpec(JSON.parse(target.spec_json));
+          if (
+            canonicalJson(JSON.parse(target.observed_json)) !==
+              canonicalJson({ bucketExists: true, ...OBJECT_BUCKET_LIMITS }) ||
+            canonicalJson(JSON.parse(target.output_json)) !== "{}"
+          )
+            return null;
+          for (const binding of bindings) {
+            const captured = snapshotObjectBucketBindingForms([
+              { publicName: binding.name, resourceUid: target.uid, formUrl: target.form_url },
+            ])[0];
+            if (!captured) return null;
+            bucketBindings.push(captured);
+          }
+        }
+        evidence.push({ target, last });
+      }
+      const profile = freezeDeep<V2ForwardWorkerFamilyProfile>({
+        sourceOperationId: op.id,
+        resourceUid: source.uid,
+        generation: op.generation,
+        form: source.form_url,
+        principal: source.principal,
+        space: source.space,
+        targetKey: op.target_key,
+        workerUid: spec.worker.resourceUid,
+        spec,
+        bucketBindings: snapshotObjectBucketBindingForms(bucketBindings),
+        versionTargets: deployment
+          ? deployment.versions.map(({ workerVersion }) => {
+              const selected = targets.find(
+                (item) => item.resourceUid === workerVersion.resourceUid,
+              );
+              if (!selected) throw new Error("missing sealed Version");
+              return selected;
+            })
+          : [],
+      });
+      return {
+        profile,
+        vector: canonicalJson({
+          source,
+          op,
+          refs,
+          edges,
+          evidence,
+          profile,
+        } as unknown as JsonObject),
+      };
+    } catch {
+      return null;
+    }
   }
   async function currentServingFence(
     captured: CurrentServingCaptureInput,
@@ -2301,6 +2458,16 @@ export function createV2WorkerPublicationState(options: {
   }
 
   return {
+    async resolveForwardFamilyProfile(input: { readonly execution: V2Execution }) {
+      const initial = await captureForwardFamily(input.execution);
+      if (!initial) return { kind: "unknown" as const };
+      const stillCurrent = async () => {
+        const latest = await captureForwardFamily(input.execution);
+        return latest !== null && latest.vector === initial.vector;
+      };
+      if (!(await stillCurrent())) return { kind: "unknown" as const };
+      return { kind: "captured" as const, profile: initial.profile, stillCurrent };
+    },
     /** A bounded positive proof that this settled Worker currently has no serving Deployment. */
     async observeNoCurrentServing(input: {
       workerUid: string;
