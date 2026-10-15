@@ -396,9 +396,85 @@ test("forward Deployment uses the closed Version Forms and the existing single-a
     await refused(
       f.create(FORWARD_WORKER_DEPLOYMENT_FORM_URL, "duplicate-deployment", spec, false),
     );
-    await refused(f.create(WORKER_DEPLOYMENT_FORM_URL, "legacy-also-conflicts", spec, false));
   } finally {
     f.close();
+  }
+
+  // An old Deployment cannot use the mixed 0.5/0.6 selection above. Establish
+  // that this 0.5-only candidate is admissible before testing the shared owner.
+  // These targets are settled metadata fixtures, not native held artifacts.
+  for (const forwardIncumbent of [false, true]) {
+    const legacy = fixture();
+    try {
+      const worker = await legacy.create(MODULE_WORKER_FORM_URL, "worker");
+      const bundle = await legacy.create(BUNDLE, "bundle");
+      const version = await legacy.create(WORKER_VERSION_FORM_URL, "version", {
+        worker: { resourceUid: worker.resourceUid },
+        bundle: { resourceUid: bundle.resourceUid },
+        handlers: ["fetch"],
+      });
+      const candidate = {
+        form: WORKER_DEPLOYMENT_FORM_URL,
+        space: "space",
+        name: "legacy-candidate",
+        spec: {
+          worker: { resourceUid: worker.resourceUid },
+          versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10000 }],
+        },
+      };
+      if (forwardIncumbent)
+        await legacy.create(
+          FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+          "forward-incumbent",
+          candidate.spec,
+          false,
+        );
+      const snapshot = async () => {
+        const rows = [];
+        for (const table of [
+          "tf_v2_resources",
+          "tf_v2_operations",
+          "tf_v2_resource_references",
+          "tf_v2_operation_reference_sets",
+          "tf_v2_operation_references",
+          "tf_v2_migration_set_owners",
+          "tf_v2_migration_set_chunks",
+          "tf_v2_private_inputs",
+          "tf_v2_configured_private_inputs",
+        ])
+          rows.push([table, await legacy.sql.query(`SELECT * FROM ${table} ORDER BY rowid`)]);
+        return rows;
+      };
+      const before = await snapshot();
+      const accepted = legacy.engine.acceptCreate({
+        principal: "alice",
+        key: "legacy-valid-domain-control-key-0001",
+        input: candidate,
+      });
+      if (forwardIncumbent) {
+        await refused(accepted);
+        // Every fixture Core table, including all Operation/ref/custody rows,
+        // remains unchanged. Admission never reaches a native materializer.
+        expect(await snapshot()).toEqual(before);
+      } else {
+        const operation = await accepted;
+        expect(operation).toMatchObject({ action: "create", status: "pending" });
+        expect(
+          await legacy.sql.query(
+            "SELECT form_url FROM tf_v2_operation_references WHERE operation_id=? AND target_uid=?",
+            [operation.id, version.resourceUid],
+          ),
+        ).toEqual([{ form_url: WORKER_VERSION_FORM_URL }]);
+        expect(
+          await legacy.sql.query(
+            "SELECT sealed FROM tf_v2_operation_reference_sets WHERE operation_id=?",
+            [operation.id],
+          ),
+        ).toEqual([{ sealed: 1 }]);
+      }
+    } finally {
+      legacy.close();
+    }
   }
 });
 
