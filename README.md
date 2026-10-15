@@ -1,56 +1,66 @@
 # Takoserver
 
-Takoserver is an open-source cloud you run on your own machine. You deploy to it
-with [Takoform](https://takoform.com): declare a Worker and its SQLite database,
-KV namespace, object bucket or queue by an exact Form URL over Host API v2, and
-Takoserver runs them on Linux x86-64 with the pinned `workerd` and serves the
-Worker at an HTTPS hostname. An organization owns its Resources; its API keys,
-each with its own read or write permission, and the console manage them.
+Takoserver is an open-source cloud you run on your own machine. You deploy
+Workers and their SQLite databases, KV namespaces, object buckets and queues to
+it with [Takoform](https://takoform.com), by exact Form URL over Host API v2, and
+it serves each Worker at an HTTPS hostname.
+
+An organization owns its Resources. Its API keys, each with read or write
+permission, manage them over the API; a separately served console shows them in
+the browser.
 
 ## What you can deploy
 
-A Host serves exactly the Forms its configuration composes. Ask a running Host
-before relying on a Form:
-`GET /apis/forms.takoform.com/v2/support?form=<Form URL>` with an API key.
+A Host serves exactly the Forms its configuration composes. Before relying on a
+Form, ask a running Host with an API key, passing the URL-encoded Form URL,
+for example `https://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/`:
+`GET /apis/forms.takoform.com/v2/support?form=<Form URL>`.
 
-- **Artifacts, with Bun alone:** `WorkerBundle 0.2.0`, `StaticAssetBundle 0.2.0`
-  and `SQLiteMigrationSet 0.2.0`. They validate and keep bytes the operator has
-  seeded or that are publicly reachable; by themselves they do not run a Worker,
-  serve assets or apply SQL.
-- **Workers and their data, with the complete local Worker profile** (the
-  pinned `workerd`, the Workflow execution guard and all five private data
-  planes): `ModuleWorker 0.3.0`, `WorkerVersion 0.5.0`, `WorkerDeployment 0.4.0`,
-  `WorkerCronTrigger 0.3.0`, `SQLiteDatabase 0.2.0`, `EdgeKVNamespace 0.2.0`,
-  `ObjectBucket 0.2.0`, `AtLeastOnceQueue 0.2.0`, `QueueConsumer 0.3.0`,
-  `ActorNamespace 0.3.0` and `DurableWorkflow 0.3.0`, plus
-  `SQLiteMigrationApplication 0.2.0` when migrations are configured and
-  `WorkerEndpoint 0.3.0`, which publishes a Worker at an HTTPS hostname, when
-  the listener on TCP 443 is configured. A partial setup advertises none of them.
+- **Artifacts, with Bun and the Form's block in `TAKOSERVER_TAKOFORM_V2_CONFIG`:**
+  `WorkerBundle 0.2.0`, `StaticAssetBundle 0.2.0` and `SQLiteMigrationSet 0.2.0`.
+  They validate and keep bytes the operator has seeded or that are reachable
+  over public HTTPS; by themselves they do not run a Worker, serve assets, apply
+  SQL or create an endpoint.
+- **Workers and their data, with the complete local Worker profile** on Linux
+  x86-64 (the pinned `workerd`, Actor and Workflow boot with the Workflow
+  execution guard, all five private data planes, and both bundle blocks on
+  `selfhost-v2-worker-primary`; see [Settings](#settings)): `ModuleWorker 0.3.0`,
+  `WorkerVersion 0.5.0`, `WorkerDeployment 0.4.0`, `WorkerCronTrigger 0.3.0`,
+  `SQLiteDatabase 0.2.0`, `EdgeKVNamespace 0.2.0`, `ObjectBucket 0.2.0`,
+  `AtLeastOnceQueue 0.2.0`, `QueueConsumer 0.3.0`, `ActorNamespace 0.3.0` and
+  `DurableWorkflow 0.3.0`. A partial Worker profile advertises none of these.
+  `SQLiteMigrationApplication 0.2.0` is added when a `sqliteMigrationSet` block
+  is configured, and `WorkerEndpoint 0.3.0`, which publishes a Worker at an
+  HTTPS hostname, when the listener on TCP 443 is configured; without either,
+  only that Form is absent.
 
 [Takoform v2 architecture and operator setup](docs/takoform-v2.md) has the
-exact gates, Form map and limits. The normal application serves only
-`forms.takoform.com/v2`: a versioned HTTPS Form URL identifies the contract and
-Host-side code implements it; it does not install Form packages, require their
-signatures, or translate into v1.
+exact gates, Form map and limits.
 
 ## Quick start
 
-Before starting, provide the canonical external HTTPS origin, the non-secret
-`TAKOSERVER_TAKOFORM_V2_CONFIG`, and the persistent operator-secret
-`TAKOSERVER_TAKOFORM_V2_CURSOR_KEY` described in that guide. Then run:
+This starts the artifact profile. Before starting, set `TAKOSERVER_PUBLIC_ORIGIN`
+(the canonical external HTTPS origin), the non-secret
+`TAKOSERVER_TAKOFORM_V2_CONFIG` and the persistent operator secret
+`TAKOSERVER_TAKOFORM_V2_CURSOR_KEY`, as described in [Settings](#settings). Then
+run:
 
 ```sh
 bun install --frozen-lockfile
-bun src/entry-bun.ts
+bun --no-env-file src/entry-bun.ts
 ```
 
 The public v2 discovery is `/.well-known/takoform/v2`. The Bun HTTP listener
 requires an operator-controlled HTTPS front end for public use; do not expose
-that backend listener directly.
-[First install and first use](docs/self-host-operations.md#first-install-and-first-use)
-takes a reviewed checkout to a Worker served over HTTPS, step by step.
+that backend listener directly. The install guide below takes you on to the
+complete Worker profile.
+
+## Scope
 
 This repository owns the generic Host foundation and the self-host plugin. The
+normal application serves only `forms.takoform.com/v2`: a versioned HTTPS Form
+URL identifies the contract and Host-side code implements it; it does not
+install Form packages, require their signatures, or translate into v1. The
 managed Workers-for-Platforms implementation is a separately supplied,
 non-public operator backend; it is not needed to build or run the OSS self-host
 distribution, and where the control plane itself runs is an independent
@@ -337,11 +347,13 @@ The Cloudflare public Worker does not compose this route or import its signer.
 
 ### Held artifacts and Workers
 
-The v2 artifact Forms never upload or fetch bytes. A create names an exact
-HTTPS URL and SHA-256, and the Host serves it only from bytes already in its
-object store, to the organizations its configuration grants. It reads those
-grants at startup. `scripts/selfhost-artifact.ts` puts the bytes there while
-the Host is stopped:
+The v2 artifact Forms never accept uploaded bytes. A create names an exact
+HTTPS URL and SHA-256. For an unheld URL, the Bun Host fetches the manifest and
+each file over anonymous public HTTPS and keeps the verified bytes. A held URL
+is exclusive: the Host serves it only from bytes already in its object store,
+to the organizations its configuration grants, and never falls back to public
+HTTPS. It reads those grants at startup. `scripts/selfhost-artifact.ts` puts
+held bytes there while the Host is stopped:
 
 ```sh
 set -a; . /etc/takoserver/takoserver.env; set +a   # the Host's environment
