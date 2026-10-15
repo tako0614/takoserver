@@ -5,14 +5,20 @@ import { readFileSync } from "node:fs";
 import { compilePricingAuthoring } from "../scripts/pricing/compile.ts";
 import { buildApp } from "../src/app.ts";
 import type { ExternalIdentityVerifier } from "../src/auth.ts";
+import { parseBillingConfig } from "../src/billing-config.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { createLedger } from "../src/ledger.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
+import { createOrgBilling } from "../src/org-billing.ts";
+import { createOrgLimitPolicy } from "../src/org-limit-policy.ts";
 import type { FundingReconcileReport, PaymentEvents } from "../src/payment-events.ts";
 import { resolvePayment } from "../src/payment-setup.ts";
 import { SqlError } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import type { SubscriptionPayments } from "../src/stripe-billing.ts";
+import { createStripeBilling } from "../src/stripe-billing.ts";
+import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
+import { claimFreshStripeModeRealm, type StripeMode } from "../src/stripe-mode-realm.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
@@ -52,16 +58,28 @@ type State = {
   failAlways: Set<string>;
   nextCustomer: number;
   nextCheckout: number;
+  loseCheckoutAck: boolean;
+  loseCancelAck: boolean;
+  sessionLines: Map<string, ObjectRecord[]>;
+  checkoutPostGate?: { readonly entered: () => void; readonly resume: Promise<void> };
+  mode: StripeMode;
 };
 
 function object(id: string, type: string, extra: ObjectRecord = {}): ObjectRecord {
   return { id, object: type, livemode: false, ...extra };
 }
 
-function pricing(includedMinor = INCLUDED_MINOR, monthlyMinor = MONTHLY_MINOR) {
+function pricing(
+  revisionOrIncluded: string | number = REVISION,
+  includedOrMonthly = INCLUDED_MINOR,
+) {
+  const revision = typeof revisionOrIncluded === "string" ? revisionOrIncluded : REVISION;
+  const includedMinor =
+    typeof revisionOrIncluded === "string" ? includedOrMonthly : revisionOrIncluded;
+  const monthlyMinor = typeof revisionOrIncluded === "number" ? includedOrMonthly : MONTHLY_MINOR;
   const billingConfig = {
     schemaVersion: 1,
-    revision: REVISION,
+    revision,
     effectiveAt: "2026-10-01T00:00:00.000Z",
     currency: "USD",
     holdTtlSeconds: 86_400,
@@ -129,6 +147,25 @@ function twoPlanPricing() {
   });
 }
 
+function setTwoPlanPrices(state: State): void {
+  for (const [id, amount] of [
+    ["price_final10", 1000],
+    ["price_final50", 5000],
+  ] as const) {
+    state.prices.set(
+      id,
+      object(id, "price", {
+        active: true,
+        currency: "usd",
+        type: "recurring",
+        billing_scheme: "per_unit",
+        unit_amount: amount,
+        recurring: { interval: "month", interval_count: 1, usage_type: "licensed" },
+      }),
+    );
+  }
+}
+
 function subscription(overrides: ObjectRecord = {}): ObjectRecord {
   return object(SUBSCRIPTION, "subscription", {
     customer: CUSTOMER,
@@ -139,6 +176,7 @@ function subscription(overrides: ObjectRecord = {}): ObjectRecord {
       pricingRevision: REVISION,
     },
     status: "active",
+    currency: "usd",
     cancel_at_period_end: false,
     current_period_start: PERIOD_START,
     current_period_end: PERIOD_END,
@@ -212,8 +250,8 @@ function charge(overrides: ObjectRecord = {}): ObjectRecord {
   });
 }
 
-function initialState(): State {
-  return {
+function initialState(mode: StripeMode = "test"): State {
+  const state: State = {
     customers: new Map([
       [
         CUSTOMER,
@@ -247,7 +285,23 @@ function initialState(): State {
     failAlways: new Set(),
     nextCustomer: 1,
     nextCheckout: 1,
+    loseCheckoutAck: false,
+    loseCancelAck: false,
+    sessionLines: new Map(),
+    mode,
   };
+  if (mode === "live") {
+    for (const records of [
+      state.customers,
+      state.prices,
+      state.subscriptions,
+      state.invoices,
+      state.charges,
+    ]) {
+      for (const [id, record] of records) records.set(id, { ...record, livemode: true });
+    }
+  }
+  return state;
 }
 
 function idFromPath(url: URL, collection: string): string | undefined {
@@ -298,6 +352,20 @@ function fakeStripe(state: State) {
       return found ? Response.json(found) : new Response("", { status: 404 });
     };
     if (request.method === "GET") {
+      const lines = url.pathname.match(
+        /^\/v1\/checkout\/sessions\/(cs_[A-Za-z0-9_]+)\/line_items$/u,
+      );
+      if (lines?.[1]) {
+        const session = state.sessions.get(lines[1]);
+        if (!session) return new Response("", { status: 404 });
+        return Response.json({
+          object: "list",
+          has_more: false,
+          data: state.sessionLines.get(lines[1]) ?? [
+            { id: `li_${lines[1]}`, price: { id: PRICE }, quantity: 1 },
+          ],
+        });
+      }
       if (collection === "checkout" && url.pathname === "/v1/checkout/sessions") {
         return Response.json(listPage([...state.sessions.values()], url));
       }
@@ -325,6 +393,7 @@ function fakeStripe(state: State) {
       if (url.pathname === "/v1/customers") {
         const id = `cus_created_${state.nextCustomer++}`;
         const created = object(id, "customer", {
+          livemode: state.mode === "live",
           metadata: {
             organizationId: form.get("metadata[organizationId]"),
             takoserverPurpose: form.get("metadata[takoserverPurpose]"),
@@ -334,20 +403,49 @@ function fakeStripe(state: State) {
         return Response.json(created);
       }
       if (url.pathname === "/v1/checkout/sessions") {
+        state.checkoutPostGate?.entered();
+        if (state.checkoutPostGate) await state.checkoutPostGate.resume;
         const id = `cs_created_${state.nextCheckout++}`;
+        const priceId = form.get("line_items[0][price]") ?? PRICE;
+        const price = state.prices.get(priceId);
+        const amount = Number(price?.unit_amount ?? MONTHLY_MINOR);
+        let customerId = form.get("customer");
+        if (!customerId) {
+          customerId = `cus_created_${state.nextCustomer++}`;
+          state.customers.set(
+            customerId,
+            object(customerId, "customer", { livemode: state.mode === "live", metadata: {} }),
+          );
+        }
         const created = object(id, "checkout.session", {
+          livemode: state.mode === "live",
           url: `https://checkout.stripe.com/c/pay/${id}`,
           mode: form.get("mode"),
           status: "open",
-          customer: form.get("customer"),
+          payment_status: "unpaid",
+          currency: "usd",
+          amount_subtotal: amount,
+          amount_total: amount,
+          client_reference_id: form.get("client_reference_id"),
+          customer: customerId,
+          subscription: null,
+          invoice: null,
+          after_expiration: null,
+          recovered_from: null,
           metadata: {
             organizationId: form.get("metadata[organizationId]"),
+            subscriptionCheckoutIntentId: form.get("metadata[subscriptionCheckoutIntentId]"),
             planKey: form.get("metadata[planKey]"),
             pricingRevision: form.get("metadata[pricingRevision]"),
             takoserverPurpose: form.get("metadata[takoserverPurpose]"),
           },
         });
         state.sessions.set(id, created);
+        state.sessionLines.set(id, [{ id: `li_${id}`, price: { id: priceId }, quantity: 1 }]);
+        if (state.loseCheckoutAck) {
+          state.loseCheckoutAck = false;
+          return new Response("lost acknowledgement", { status: 503 });
+        }
         return Response.json(created);
       }
       const subscriptionId = idFromPath(url, "subscriptions");
@@ -361,6 +459,11 @@ function fakeStripe(state: State) {
           ...(form.get("cancel_at_period_end") === "true" ? { status: "active" } : {}),
         };
         state.subscriptions.set(subscriptionId, updated);
+        if (state.loseCancelAck) {
+          state.loseCancelAck = false;
+          state.failOnce.add(url.pathname);
+          return new Response("lost acknowledgement", { status: 503 });
+        }
         return Response.json(updated);
       }
     }
@@ -379,16 +482,27 @@ const identity: ExternalIdentityVerifier = {
   },
 };
 
-async function fixture(hostedPricing = pricing()) {
+async function fixture(
+  hostedPricing = pricing(),
+  now: () => Date = () => new Date(NOW),
+  mode: StripeMode = "test",
+) {
   const database = new Database(":memory:");
   for (const migration of MIGRATIONS) database.exec(migration.sql);
-  if (!MIGRATIONS.some((migration) => migration.name === "0095_stripe_billing.sql")) {
-    database.exec(
-      await Bun.file(new URL("../migrations/0095_stripe_billing.sql", import.meta.url)).text(),
-    );
-  }
   const sql = createSqliteSql(database);
-  const now = () => new Date(NOW);
+  const originalPricing = hostedPricing.hostedPlanTable.plans.some(
+    (plan) => plan.planId === PLAN_KEY,
+  )
+    ? hostedPricing
+    : pricing();
+  const originalPlan = originalPricing.hostedPlanTable.plans.find(
+    (plan) => plan.planId === PLAN_KEY,
+  );
+  const originalBillingJson = originalPricing.environment.TAKOSERVER_BILLING_CONFIG;
+  if (!originalBillingJson) throw new Error("missing original fixture billing config");
+  const originalBilling = JSON.parse(originalBillingJson);
+  if (originalPlan?.tier !== "subscription") throw new Error("missing original fixture plan");
+  await claimFreshStripeModeRealm(sql, mode);
   await sql.run("INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)", [
     ORG,
     "Billing Test",
@@ -399,10 +513,48 @@ async function fixture(hostedPricing = pricing()) {
     "INSERT INTO stripe_billing_customers (org_id, customer_id, created_at) VALUES (?, ?, ?)",
     [ORG, CUSTOMER, NOW.toISOString()],
   );
-  const state = initialState();
+  await sql.run(
+    `INSERT INTO stripe_subscription_checkout_intents
+     (id, org_id, request_key_digest, fingerprint, plan_key, pricing_revision, price_id, price_amount_minor,
+      included_minor, livemode, customer_id, state, session_id, subscription_id, created_at, updated_at)
+     VALUES ('sci_historical', ?, 'historical', 'historical', ?, ?, ?, ?, ?, ?, ?, 'associated', 'cs_historical', ?, ?, ?)`,
+    [
+      ORG,
+      PLAN_KEY,
+      originalBilling.revision,
+      originalPlan.stripePriceId,
+      originalPlan.monthlyAmountMinor,
+      originalPlan.includedCreditMinor,
+      Number(mode === "live"),
+      CUSTOMER,
+      SUBSCRIPTION,
+      NOW.toISOString(),
+      NOW.toISOString(),
+    ],
+  );
+  await sql.run(
+    `INSERT INTO stripe_billing_associations
+     (subscription_id, org_id, customer_id, livemode, plan_key, pricing_revision, price_id,
+      price_amount_minor, included_minor, session_id, association_generation, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'cs_historical', 1, ?)`,
+    [
+      SUBSCRIPTION,
+      ORG,
+      CUSTOMER,
+      Number(mode === "live"),
+      PLAN_KEY,
+      originalBilling.revision,
+      originalPlan.stripePriceId,
+      originalPlan.monthlyAmountMinor,
+      originalPlan.includedCreditMinor,
+      NOW.toISOString(),
+    ],
+  );
+  const state = initialState(mode);
   const setup = resolvePayment({
     hostedPricing,
-    stripeSecretKey: KEY,
+    stripeMode: mode,
+    stripeSecretKey: mode === "live" ? "sk_live_stripe_billing_test_key_12345" : KEY,
     stripeWebhookSecret: SECRET,
     consoleOrigin: "https://console.example.test",
     fetch: fakeStripe(state),
@@ -441,6 +593,10 @@ async function fixture(hostedPricing = pricing()) {
   };
 }
 
+async function clearHistoricalSubscription(h: Awaited<ReturnType<typeof fixture>>) {
+  await h.sql.run("DELETE FROM stripe_billing_associations WHERE org_id = ?", [ORG]);
+  await h.sql.run("DELETE FROM stripe_subscription_checkout_intents WHERE org_id = ?", [ORG]);
+}
 let sequence = 0;
 function event(
   type: string,
@@ -462,6 +618,7 @@ function event(
       object: {
         id: objectId,
         object: objectType,
+        livemode: envelopeOverrides.livemode ?? false,
         amount_paid: 999_999_999,
         amount: 999_999_999,
         currency: "jpy",
@@ -494,8 +651,356 @@ async function errorCode(response: Response): Promise<string | undefined> {
 }
 
 describe("Hosted Stripe billing service", () => {
+  test("a paid invoice for a future service period is deferred until that original period starts", async () => {
+    let instant = NOW.toISOString();
+    const clock = () => new Date(instant);
+    const compiled = twoPlanPricing();
+    const h = await fixture(compiled, clock);
+    await clearHistoricalSubscription(h);
+    setTwoPlanPrices(h.state);
+    const checkout = await h.subscriptions.begin({
+      organizationId: ORG,
+      reference: "future-period",
+      planKey: "hosted-10",
+    });
+    if (checkout.state !== "open") throw new Error("genuine subscription Checkout not open");
+    const periodStart = "2026-11-01T00:00:00.000Z";
+    const periodEnd = "2026-12-01T00:00:00.000Z";
+    const start = Date.parse(periodStart) / 1000;
+    const end = Date.parse(periodEnd) / 1000;
+    const config = parseBillingConfig(compiled.environment.TAKOSERVER_BILLING_CONFIG);
+    if (!config) throw new Error("published shared tariff absent");
+    const pinned = {
+      organizationId: ORG,
+      takoserverPurpose: "hosted_subscription",
+      planKey: "hosted-10",
+      pricingRevision: config.revision,
+    };
+    h.state.subscriptions.set(
+      SUBSCRIPTION,
+      subscription({
+        metadata: pinned,
+        current_period_start: start,
+        current_period_end: end,
+        items: {
+          has_more: false,
+          data: [
+            { id: "si_test", object: "subscription_item", quantity: 1, price: "price_final10" },
+          ],
+        },
+      }),
+    );
+    const originalSession = h.state.sessions.get(checkout.id);
+    if (!originalSession) throw new Error("genuine Checkout Session absent");
+    h.state.sessions.set(checkout.id, {
+      ...originalSession,
+      status: "complete",
+      payment_status: "paid",
+      subscription: SUBSCRIPTION,
+    });
+    expect(
+      (await deliver(h.app, event("checkout.session.completed", checkout.id, "checkout.session")))
+        .status,
+    ).toBe(200);
+    const policy = createOrgLimitPolicy({ sql: h.sql, clock });
+    const ledger = createLedger(h.sql, clock, {
+      hostedPaidFreeExclusion: true,
+      allocationAdmissionResolver: policy.prepareAdmission.bind(policy),
+    });
+    const billing = createOrgBilling({
+      sql: h.sql,
+      clock,
+      ledger,
+      config,
+      hostedPaidFreeExclusion: true,
+      limitPolicy: policy,
+    });
+    expect((await billing.wallet(ORG)).availableMicros).toBe(1_500_000);
+    h.state.invoices.set(
+      "in_billing_test",
+      invoice("in_billing_test", {
+        subscription_details: { metadata: pinned },
+        lines: {
+          has_more: false,
+          data: [
+            {
+              id: "il_billing_test",
+              object: "line_item",
+              type: "subscription",
+              proration: false,
+              quantity: 1,
+              subscription: SUBSCRIPTION,
+              price: "price_final10",
+              period: { start, end },
+            },
+          ],
+        },
+        amount_paid: 1000,
+        total: 1000,
+        total_excluding_tax: 1000,
+      }),
+    );
+    h.state.charges.set("ch_billing_test", charge({ amount: 1000 }));
+    const paidEvent = event("invoice.paid", "in_billing_test", "invoice");
+    expect((await deliver(h.app, paidEvent)).status).toBe(200);
+    expect(
+      await h.sql.query("SELECT outcome, outcome_detail FROM stripe_events WHERE event_id = ?", [
+        String(paidEvent.id),
+      ]),
+    ).toEqual([{ outcome: "deferred", outcome_detail: "invoice_period_not_started" }]);
+    expect(
+      await h.sql.query("SELECT * FROM stripe_billing_grants WHERE org_id = ?", [ORG]),
+    ).toEqual([]);
+    expect((await billing.wallet(ORG)).availableMicros).toBe(1_500_000);
+    expect((await billing.usageSummary(ORG)).periodKind).toBe("free");
+    expect(
+      await ledger.hold({
+        organizationId: ORG,
+        reference: "before-period",
+        amountMicros: 1_500_001,
+      }),
+    ).toBe(false);
+    expect((await h.subscriptions.read(ORG))?.paidFeatures).toBe(false);
+    await h.reconcile();
+    expect(
+      await h.sql.query("SELECT * FROM stripe_billing_grants WHERE org_id = ?", [ORG]),
+    ).toEqual([]);
+    instant = periodStart;
+    await h.reconcile();
+    expect(
+      await h.sql.query(
+        "SELECT amount_micros, period_start, period_end, created_at FROM stripe_billing_grants WHERE org_id = ?",
+        [ORG],
+      ),
+    ).toEqual([
+      {
+        amount_micros: 20_000_000,
+        period_start: periodStart,
+        period_end: periodEnd,
+        created_at: periodStart,
+      },
+    ]);
+    expect((await billing.wallet(ORG)).availableMicros).toBe(20_000_000);
+    expect((await billing.usageSummary(ORG)).periodKind).toBe("paid");
+    expect((await h.subscriptions.read(ORG))?.paidFeatures).toBe(true);
+    await h.reconcile();
+    expect(
+      await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_grants WHERE org_id = ?", [
+        ORG,
+      ]),
+    ).toEqual([{ count: 1 }]);
+    expect(
+      await h.sql.query("SELECT outcome FROM stripe_events WHERE event_id = ?", [
+        String(paidEvent.id),
+      ]),
+    ).toEqual([{ outcome: "applied" }]);
+    instant = NOW.toISOString();
+    expect(await h.subscriptions.read(ORG)).toMatchObject({
+      paidFeatures: false,
+      paidThrough: periodEnd,
+    });
+  });
+  test("a competing plan observes the original prepared intent without invalidating or replacing it", async () => {
+    const h = await fixture(twoPlanPricing());
+    await clearHistoricalSubscription(h);
+    setTwoPlanPrices(h.state);
+    const originalRun = h.sql.run.bind(h.sql);
+    let signalPersisted!: () => void;
+    const persisted = new Promise<void>((resolve) => {
+      signalPersisted = resolve;
+    });
+    let releaseInsert!: () => void;
+    const resume = new Promise<void>((resolve) => {
+      releaseInsert = resolve;
+    });
+    let pauseFirst = true;
+    h.sql.run = async (statement, params) => {
+      const result = await originalRun(statement, params);
+      if (
+        pauseFirst &&
+        statement.startsWith("INSERT OR IGNORE INTO stripe_subscription_checkout_intents")
+      ) {
+        pauseFirst = false;
+        signalPersisted();
+        await resume;
+      }
+      return result;
+    };
+    const firstInput = { organizationId: ORG, reference: "prepared10", planKey: "hosted-10" };
+    const first = h.subscriptions.begin(firstInput);
+    await persisted;
+    expect(
+      await h.sql.query(
+        "SELECT plan_key, state FROM stripe_subscription_checkout_intents WHERE org_id = ?",
+        [ORG],
+      ),
+    ).toEqual([{ plan_key: "hosted-10", state: "prepared" }]);
+    await expect(
+      h.subscriptions.begin({
+        organizationId: ORG,
+        reference: "competing50",
+        planKey: "hosted-50",
+      }),
+    ).rejects.toThrow("subscription_checkout_pending");
+    expect(
+      await h.sql.query(
+        "SELECT plan_key, state FROM stripe_subscription_checkout_intents WHERE org_id = ?",
+        [ORG],
+      ),
+    ).toEqual([{ plan_key: "hosted-10", state: "session_known" }]);
+    expect(
+      h.state.requests.filter(
+        (request) =>
+          request.method === "POST" && new URL(request.url).pathname === "/v1/checkout/sessions",
+      ),
+    ).toHaveLength(1);
+    releaseInsert();
+    const opened = await first;
+    expect(opened.state).toBe("open");
+    expect(await h.subscriptions.begin(firstInput)).toEqual(opened);
+    expect(
+      await h.sql.query(
+        "SELECT plan_key FROM stripe_subscription_checkout_intents WHERE org_id = ?",
+        [ORG],
+      ),
+    ).toEqual([{ plan_key: "hosted-10" }]);
+  });
+
+  test("same-reference insert race rejects the losing different plan without another Checkout POST", async () => {
+    const h = await fixture(twoPlanPricing());
+    await clearHistoricalSubscription(h);
+    setTwoPlanPrices(h.state);
+    const originalRun = h.sql.run.bind(h.sql);
+    const winnerInput = { organizationId: ORG, reference: "same-reference", planKey: "hosted-10" };
+    let winner: Awaited<ReturnType<SubscriptionPayments["begin"]>> | undefined;
+    let inject = true;
+    h.sql.run = async (statement, params) => {
+      if (
+        inject &&
+        statement.startsWith("INSERT OR IGNORE INTO stripe_subscription_checkout_intents")
+      ) {
+        inject = false;
+        winner = await h.subscriptions.begin(winnerInput);
+      }
+      return await originalRun(statement, params);
+    };
+    await expect(
+      h.subscriptions.begin({
+        organizationId: ORG,
+        reference: "same-reference",
+        planKey: "hosted-50",
+      }),
+    ).rejects.toThrow("reference_conflict");
+    if (!winner) throw new Error("Winning Checkout unexpectedly missing");
+    expect(winner?.state).toBe("open");
+    expect(await h.subscriptions.begin(winnerInput)).toEqual(winner);
+    expect(
+      await h.sql.query(
+        "SELECT plan_key FROM stripe_subscription_checkout_intents WHERE org_id = ?",
+        [ORG],
+      ),
+    ).toEqual([{ plan_key: "hosted-10" }]);
+    expect(
+      h.state.requests.filter(
+        (request) =>
+          request.method === "POST" && new URL(request.url).pathname === "/v1/checkout/sessions",
+      ),
+    ).toHaveLength(1);
+  });
+
+  test("keeps one cross-plan Checkout slot and replays an expired other-plan reference", async () => {
+    const h = await fixture(twoPlanPricing());
+    await clearHistoricalSubscription(h);
+    setTwoPlanPrices(h.state);
+    let signalPost!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      signalPost = resolve;
+    });
+    let releasePost!: () => void;
+    const resume = new Promise<void>((resolve) => {
+      releasePost = resolve;
+    });
+    h.state.checkoutPostGate = { entered: signalPost, resume };
+    const first = h.subscriptions.begin({
+      organizationId: ORG,
+      reference: "first10",
+      planKey: "hosted-10",
+    });
+    await entered;
+    await expect(
+      h.subscriptions.begin({ organizationId: ORG, reference: "second50", planKey: "hosted-50" }),
+    ).rejects.toThrow("subscription_checkout_pending");
+    expect(
+      h.state.requests.filter(
+        (request) =>
+          request.method === "POST" && new URL(request.url).pathname === "/v1/checkout/sessions",
+      ),
+    ).toHaveLength(1);
+    expect(
+      await h.sql.query(
+        "SELECT plan_key, state FROM stripe_subscription_checkout_intents WHERE org_id = ?",
+        [ORG],
+      ),
+    ).toMatchObject([{ plan_key: "hosted-10", state: "dispatched" }]);
+    expect(
+      await h.sql.query(
+        "SELECT plan_key, price_id FROM stripe_billing_price_identity WHERE livemode = 0 ORDER BY plan_key",
+      ),
+    ).toEqual([
+      { plan_key: "hosted-10", price_id: "price_final10" },
+      { plan_key: "hosted-50", price_id: "price_final50" },
+    ]);
+    releasePost();
+    const opened = await first;
+    expect(opened.state).toBe("open");
+    expect(
+      await h.subscriptions.begin({
+        organizationId: ORG,
+        reference: "first10",
+        planKey: "hosted-10",
+      }),
+    ).toEqual(opened);
+    await expect(
+      h.subscriptions.begin({ organizationId: ORG, reference: "first10", planKey: "hosted-50" }),
+    ).rejects.toThrow("reference_conflict");
+    const session = h.state.sessions.get(opened.id);
+    if (!session) throw new Error("Checkout session unexpectedly missing");
+    h.state.sessions.set(opened.id, { ...session, status: "expired" });
+    const expired = await h.subscriptions.begin({
+      organizationId: ORG,
+      reference: "first10",
+      planKey: "hosted-10",
+    });
+    expect(expired).toEqual({ id: opened.id, state: "expired" });
+    const second = await h.subscriptions.begin({
+      organizationId: ORG,
+      reference: "second50",
+      planKey: "hosted-50",
+    });
+    expect(second.state).toBe("open");
+    expect(
+      await h.subscriptions.begin({
+        organizationId: ORG,
+        reference: "first10",
+        planKey: "hosted-10",
+      }),
+    ).toEqual(expired);
+    expect(
+      h.state.requests.filter(
+        (request) =>
+          request.method === "POST" && new URL(request.url).pathname === "/v1/checkout/sessions",
+      ),
+    ).toHaveLength(2);
+    expect(
+      await h.sql.query(
+        "SELECT plan_key, state FROM stripe_subscription_checkout_intents WHERE org_id = ? ORDER BY created_at, id",
+        [ORG],
+      ),
+    ).toHaveLength(2);
+  });
   test("selects the requested paid tier, verifies its TEST Price, and grants only the pinned invoice tier", async () => {
     const h = await fixture(twoPlanPricing());
+    await clearHistoricalSubscription(h);
     h.state.prices.set(
       "price_final50",
       object("price_final50", "price", {
@@ -534,13 +1039,14 @@ describe("Hosted Stripe billing service", () => {
       reference: "final50",
       planKey: "hosted-50",
     });
+    if (checkout.state !== "open") throw new Error("Checkout unexpectedly not open");
     expect(checkout.url).toContain("checkout.stripe.com");
     const post = h.state.requests.find(
       (request) =>
         request.method === "POST" && new URL(request.url).pathname === "/v1/checkout/sessions",
     );
     expect(await post?.text()).toContain("price_final50");
-    const revision = "hosted-20261014-final-v1";
+    const revision = "hosted-20261015-container-proposed-v1";
     h.state.subscriptions.set(
       SUBSCRIPTION,
       subscription({
@@ -558,6 +1064,18 @@ describe("Hosted Stripe billing service", () => {
         },
       }),
     );
+    const session = h.state.sessions.get(checkout.id);
+    if (!session) throw new Error("Checkout session unexpectedly missing");
+    h.state.sessions.set(checkout.id, {
+      ...session,
+      status: "complete",
+      payment_status: "paid",
+      subscription: SUBSCRIPTION,
+    });
+    expect(
+      (await deliver(h.app, event("checkout.session.completed", checkout.id, "checkout.session")))
+        .status,
+    ).toBe(200);
     const pinned = {
       organizationId: ORG,
       takoserverPurpose: "hosted_subscription",
@@ -634,6 +1152,7 @@ describe("Hosted Stripe billing service", () => {
     h.state.invoices.set(
       manualInvoice,
       invoice(manualInvoice, {
+        customer: "cus_manual_other",
         subscription: null,
         subscription_details: null,
         billing_reason: "manual",
@@ -643,7 +1162,7 @@ describe("Hosted Stripe billing service", () => {
     h.state.charges.set(
       manualCharge,
       object(manualCharge, "charge", {
-        customer: CUSTOMER,
+        customer: "cus_manual_other",
         invoice: manualInvoice,
         currency: "usd",
         paid: true,
@@ -833,7 +1352,13 @@ describe("Hosted Stripe billing service", () => {
         created: Math.floor(NOW.getTime() / 1_000),
         customer: null,
         metadata: { organizationId: ORG, takoserverPurpose: "wallet_funding" },
-        payment_intent: { id: "pi_legacy_wallet", status: "succeeded", latest_charge: chargeId },
+        payment_intent: {
+          id: "pi_legacy_wallet",
+          object: "payment_intent",
+          livemode: false,
+          status: "succeeded",
+          latest_charge: chargeId,
+        },
       }),
     );
     h.state.charges.set(
@@ -895,7 +1420,8 @@ describe("Hosted Stripe billing service", () => {
       }),
     );
     const payload = event("refund.updated", "re_legacy_wallet", "refund");
-    expect((await deliver(h.app, payload)).status).toBe(200);
+    const response = await deliver(h.app, payload);
+    expect(response.status, await response.text()).toBe(200);
     expect(
       await h.sql.query("SELECT outcome, outcome_detail FROM stripe_events WHERE event_id = ?", [
         String(payload.id),
@@ -932,6 +1458,8 @@ describe("Hosted Stripe billing service", () => {
         metadata: {},
         payment_intent: {
           id: "pi_legacy_missing_marker",
+          object: "payment_intent",
+          livemode: false,
           status: "succeeded",
           latest_charge: chargeId,
         },
@@ -963,7 +1491,8 @@ describe("Hosted Stripe billing service", () => {
       }),
     );
     const payload = event("refund.updated", "re_legacy_missing_marker", "refund");
-    expect((await deliver(h.app, payload)).status).toBe(200);
+    const response = await deliver(h.app, payload);
+    expect(response.status, await response.text()).toBe(200);
     expect(
       await h.sql.query("SELECT outcome FROM stripe_events WHERE event_id = ?", [
         String(payload.id),
@@ -981,6 +1510,64 @@ describe("Hosted Stripe billing service", () => {
     ]);
   });
 
+  test("defers a bound-customer refund without an invoice or Checkout source", async () => {
+    const h = await fixture();
+    h.state.charges.set(
+      "ch_bound_missing_source",
+      object("ch_bound_missing_source", "charge", {
+        customer: CUSTOMER,
+        invoice: null,
+        currency: "usd",
+        amount: 500,
+        amount_refunded: 125,
+        payment_intent: "pi_bound_missing_source",
+      }),
+    );
+    h.state.refunds.set(
+      "re_bound_missing_source",
+      object("re_bound_missing_source", "refund", {
+        charge: "ch_bound_missing_source",
+        currency: "usd",
+      }),
+    );
+    const payload = event("refund.updated", "re_bound_missing_source", "refund");
+    expect((await deliver(h.app, payload)).status).toBe(200);
+    expect(
+      await h.sql.query("SELECT outcome, outcome_detail FROM stripe_events WHERE event_id = ?", [
+        String(payload.id),
+      ]),
+    ).toEqual([{ outcome: "deferred", outcome_detail: "ambiguous_refund_allocation" }]);
+    expect(await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_grants")).toEqual([
+      { count: 0 },
+    ]);
+    expect(await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_refunds")).toEqual([
+      { count: 0 },
+    ]);
+  });
+
+  test("defers a bound-customer invoice missing its subscription pointer", async () => {
+    const h = await fixture();
+    h.state.invoices.set(
+      "in_bound_missing_subscription",
+      invoice("in_bound_missing_subscription", {
+        customer: CUSTOMER,
+        subscription: null,
+        subscription_details: null,
+        billing_reason: "manual",
+      }),
+    );
+    const payload = event("invoice.paid", "in_bound_missing_subscription", "invoice");
+    expect((await deliver(h.app, payload)).status).toBe(200);
+    expect(
+      await h.sql.query("SELECT outcome FROM stripe_events WHERE event_id = ?", [
+        String(payload.id),
+      ]),
+    ).toEqual([{ outcome: "deferred" }]);
+    expect(await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_grants")).toEqual([
+      { count: 0 },
+    ]);
+  });
+
   test("ignores an unmarked payment refund when no wallet source exists", async () => {
     const h = await fixture();
     h.state.sessions.set(
@@ -991,6 +1578,8 @@ describe("Hosted Stripe billing service", () => {
         metadata: {},
         payment_intent: {
           id: "pi_other_payment",
+          object: "payment_intent",
+          livemode: false,
           status: "succeeded",
           latest_charge: "ch_other_payment",
         },
@@ -1055,6 +1644,54 @@ describe("Hosted Stripe billing service", () => {
     expect(
       await h.sql.query("SELECT outcome FROM stripe_events WHERE event_id = ?", [String(host.id)]),
     ).toEqual([{ outcome: "deferred" }]);
+  });
+
+  test("fresh LIVE realm credits a paid invoice once and revokes only its original lot", async () => {
+    const h = await fixture(pricing(), () => new Date(NOW), "live");
+    const wrong = event("invoice.paid", "in_billing_test", "invoice");
+    expect((await deliver(h.app, wrong)).status).toBe(400);
+    expect(
+      await h.sql.query("SELECT event_id FROM stripe_events WHERE event_id = ?", [
+        wrong.id as string,
+      ]),
+    ).toEqual([]);
+
+    const paid = { ...wrong, livemode: true };
+    expect((await deliver(h.app, paid)).status).toBe(200);
+    expect((await deliver(h.app, paid)).status).toBe(200);
+    expect(await h.ledger.wallet(ORG)).toMatchObject({ settledMicros: INCLUDED_MICROS });
+    expect(await h.sql.query("SELECT source_type, funding_ref FROM stripe_billing_grants")).toEqual(
+      [{ source_type: "invoice", funding_ref: "stripe:invoice:in_billing_test" }],
+    );
+    expect(await h.sql.query("SELECT mode FROM stripe_mode_realm WHERE singleton = 1")).toEqual([
+      { mode: "live" },
+    ]);
+
+    const { livemode: _ignored, ...refundWithoutMode } = object("re_live_full", "refund", {
+      charge: "ch_billing_test",
+      currency: "usd",
+      amount: MONTHLY_MINOR,
+      created: 1_791_871_100,
+      status: "succeeded",
+    });
+    h.state.refunds.set("re_live_full", refundWithoutMode);
+    h.state.charges.set("ch_billing_test", {
+      ...charge({ amount_refunded: MONTHLY_MINOR }),
+      livemode: true,
+    });
+    expect(
+      (
+        await deliver(
+          h.app,
+          event("charge.refunded", "ch_billing_test", "charge", { livemode: true }),
+        )
+      ).status,
+    ).toBe(200);
+    expect((await h.ledger.wallet(ORG)).settledMicros).toBe(0);
+    expect(await h.sql.query("SELECT funding_ref FROM stripe_billing_refunds")).toEqual([
+      { funding_ref: "stripe:invoice:in_billing_test" },
+    ]);
+    expect(h.state.requests.filter((request) => request.method === "POST")).toEqual([]);
   });
 
   test("paid recurring invoice credits once by invoice identity across event IDs and reconciliation", async () => {
@@ -1135,6 +1772,175 @@ describe("Hosted Stripe billing service", () => {
         ])
       )[0]?.expires_at,
     ).toBe("2026-11-01T00:00:00.000Z");
+  });
+
+  test("failed Hosted invoice without a subscription pointer is deferred", async () => {
+    const h = await fixture();
+    h.state.invoices.set(
+      "in_failed_missing_subscription",
+      invoice("in_failed_missing_subscription", {
+        status: "open",
+        paid: false,
+        amount_remaining: MONTHLY_MINOR,
+        subscription: null,
+      }),
+    );
+    const payload = event("invoice.payment_failed", "in_failed_missing_subscription", "invoice");
+    expect((await deliver(h.app, payload)).status).toBe(200);
+    expect(
+      await h.sql.query("SELECT outcome FROM stripe_events WHERE event_id = ?", [
+        String(payload.id),
+      ]),
+    ).toEqual([{ outcome: "deferred" }]);
+    expect(await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_grants")).toEqual([
+      { count: 0 },
+    ]);
+  });
+
+  test("failed invoice with a Hosted pin cannot project a foreign subscription", async () => {
+    const h = await fixture();
+    const foreign = "sub_failed_foreign";
+    h.state.subscriptions.set(
+      foreign,
+      subscription({ id: foreign, customer: "cus_failed_foreign", metadata: {} }),
+    );
+    h.state.invoices.set(
+      "in_failed_foreign",
+      invoice("in_failed_foreign", {
+        status: "open",
+        paid: false,
+        amount_remaining: MONTHLY_MINOR,
+        customer: "cus_failed_foreign",
+        subscription: foreign,
+      }),
+    );
+    const payload = event("invoice.payment_failed", "in_failed_foreign", "invoice");
+    expect((await deliver(h.app, payload)).status).toBe(200);
+    expect(
+      await h.sql.query("SELECT outcome FROM stripe_events WHERE event_id = ?", [
+        String(payload.id),
+      ]),
+    ).toEqual([{ outcome: "deferred" }]);
+    expect(await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_subscriptions")).toEqual(
+      [{ count: 0 }],
+    );
+  });
+
+  test("failed invoice with a known association rejects a contradictory customer", async () => {
+    const h = await fixture();
+    h.state.invoices.set(
+      "in_failed_wrong_customer",
+      invoice("in_failed_wrong_customer", {
+        status: "open",
+        paid: false,
+        amount_remaining: MONTHLY_MINOR,
+        customer: "cus_failed_wrong_customer",
+      }),
+    );
+    const payload = event("invoice.payment_failed", "in_failed_wrong_customer", "invoice");
+    expect((await deliver(h.app, payload)).status).toBe(200);
+    expect(
+      await h.sql.query("SELECT outcome FROM stripe_events WHERE event_id = ?", [
+        String(payload.id),
+      ]),
+    ).toEqual([{ outcome: "deferred" }]);
+    expect(await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_subscriptions")).toEqual(
+      [{ count: 0 }],
+    );
+  });
+
+  test("failed invoice with a known association rejects contradictory pinned terms", async () => {
+    const h = await fixture();
+    h.state.invoices.set(
+      "in_failed_wrong_terms",
+      invoice("in_failed_wrong_terms", {
+        status: "open",
+        paid: false,
+        amount_remaining: MONTHLY_MINOR,
+        subscription_details: {
+          metadata: {
+            organizationId: ORG,
+            takoserverPurpose: "hosted_subscription",
+            planKey: PLAN_KEY,
+            pricingRevision: "foreign-revision",
+          },
+        },
+      }),
+    );
+    const payload = event("invoice.payment_failed", "in_failed_wrong_terms", "invoice");
+    expect((await deliver(h.app, payload)).status).toBe(200);
+    expect(
+      await h.sql.query("SELECT outcome FROM stripe_events WHERE event_id = ?", [
+        String(payload.id),
+      ]),
+    ).toEqual([{ outcome: "deferred" }]);
+    expect(await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_subscriptions")).toEqual(
+      [{ count: 0 }],
+    );
+  });
+
+  test("failed invoice rejects an invoice metadata claim that contradicts its pin", async () => {
+    const h = await fixture();
+    h.state.invoices.set(
+      "in_failed_wrong_claim",
+      invoice("in_failed_wrong_claim", {
+        status: "open",
+        paid: false,
+        amount_remaining: MONTHLY_MINOR,
+        metadata: { organizationId: "org_foreign_claim" },
+      }),
+    );
+    const payload = event("invoice.payment_failed", "in_failed_wrong_claim", "invoice");
+    expect((await deliver(h.app, payload)).status).toBe(200);
+    expect(
+      await h.sql.query("SELECT outcome FROM stripe_events WHERE event_id = ?", [
+        String(payload.id),
+      ]),
+    ).toEqual([{ outcome: "deferred" }]);
+    expect(await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_subscriptions")).toEqual(
+      [{ count: 0 }],
+    );
+  });
+
+  test("paid invoice cannot grant credit with a contradictory invoice metadata claim", async () => {
+    const h = await fixture();
+    h.state.invoices.set(
+      "in_billing_test",
+      invoice("in_billing_test", { metadata: { organizationId: "org_foreign_claim" } }),
+    );
+    const payload = event("invoice.paid", "in_billing_test", "invoice");
+    expect((await deliver(h.app, payload)).status).toBe(200);
+    expect(
+      await h.sql.query("SELECT outcome FROM stripe_events WHERE event_id = ?", [
+        String(payload.id),
+      ]),
+    ).toEqual([{ outcome: "deferred" }]);
+    expect(await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_grants")).toEqual([
+      { count: 0 },
+    ]);
+  });
+
+  test("unrelated failed invoice remains ignored", async () => {
+    const h = await fixture();
+    h.state.invoices.set(
+      "in_unrelated_failed",
+      invoice("in_unrelated_failed", {
+        status: "open",
+        paid: false,
+        amount_remaining: MONTHLY_MINOR,
+        customer: "cus_unrelated_failed",
+        subscription: null,
+        subscription_details: null,
+        billing_reason: "manual",
+      }),
+    );
+    const payload = event("invoice.payment_failed", "in_unrelated_failed", "invoice");
+    expect((await deliver(h.app, payload)).status).toBe(200);
+    expect(
+      await h.sql.query("SELECT outcome FROM stripe_events WHERE event_id = ?", [
+        String(payload.id),
+      ]),
+    ).toEqual([{ outcome: "ignored" }]);
   });
 
   test("deferred signed event is revisited from Stripe history after its object becomes available", async () => {
@@ -1261,6 +2067,9 @@ describe("Hosted Stripe billing service", () => {
           paid_out_of_band: false,
           amount_remaining: MONTHLY_MINOR,
           subscription: null,
+          subscription_details: null,
+          customer: "cus_page_other",
+          billing_reason: "manual",
         }),
       ),
     ];
@@ -1343,6 +2152,9 @@ describe("Hosted Stripe billing service", () => {
           paid_out_of_band: false,
           amount_remaining: MONTHLY_MINOR,
           subscription: null,
+          subscription_details: null,
+          customer: "cus_page_other",
+          billing_reason: "manual",
         }),
       ),
     ];
@@ -1552,14 +2364,18 @@ describe("Hosted Stripe billing service", () => {
     { timeout: 15_000 },
   );
 
-  test("ignores signed live-mode and connected-account events before any Stripe object read", async () => {
+  test("rejects wrong-mode events before ID occupancy and ignores connected-account events", async () => {
     for (const mode of [{ livemode: true }, { account: "acct_connected" }]) {
       const h = await fixture();
       const response = await deliver(
         h.app,
         event("invoice.paid", "in_billing_test", "invoice", mode),
       );
-      expect(response.status).toBe(200);
+      expect(response.status).toBe(mode.livemode === true ? 400 : 200);
+      if (mode.livemode === true)
+        expect(await h.sql.query("SELECT COUNT(*) AS count FROM stripe_events")).toEqual([
+          { count: 0 },
+        ]);
       expect(await h.sql.query("SELECT COUNT(*) AS count FROM stripe_billing_grants")).toEqual([
         { count: 0 },
       ]);
@@ -2095,6 +2911,7 @@ describe("Hosted Stripe billing service", () => {
         metadata: { organizationId: ORG, takoserverPurpose: "wallet_funding" },
         payment_intent: {
           id: "pi_purchase_test",
+          livemode: false,
           status: "succeeded",
           latest_charge: "ch_purchase_test",
         },
@@ -2168,6 +2985,7 @@ describe("Hosted Stripe billing service", () => {
         metadata: { organizationId: ORG, takoserverPurpose: "wallet_funding" },
         payment_intent: {
           id: "pi_history_purchase",
+          livemode: false,
           status: "succeeded",
           latest_charge: "ch_history_purchase",
         },
@@ -2200,6 +3018,7 @@ describe("Hosted Stripe billing service", () => {
         metadata: { organizationId: ORG, takoserverPurpose: "wallet_funding" },
         payment_intent: {
           id: "pi_current_purchase",
+          livemode: false,
           status: "succeeded",
           latest_charge: "ch_current_purchase",
         },
@@ -2294,11 +3113,13 @@ describe("Hosted Stripe billing service", () => {
   test("creates a customer and subscription Checkout idempotently from the configured plan", async () => {
     const h = await fixture();
     expect(h.subscriptions.planTable).toEqual(pricing().hostedPlanTable);
+    await clearHistoricalSubscription(h);
     await h.sql.run("DELETE FROM stripe_billing_customers WHERE org_id = ?", [ORG]);
     const input = { organizationId: ORG, reference: "hosted-subscription-001", planKey: PLAN_KEY };
     const first = await h.subscriptions.begin(input);
     const second = await h.subscriptions.begin(input);
     expect(first).toEqual(second);
+    if (first.state !== "open") throw new Error("expected open Checkout receipt");
     expect(first.url).toMatch(/^https:\/\/checkout\.stripe\.com\//u);
     const customerPosts = h.state.requests.filter(
       (request) => request.method === "POST" && new URL(request.url).pathname === "/v1/customers",
@@ -2307,14 +3128,14 @@ describe("Hosted Stripe billing service", () => {
       (request) =>
         request.method === "POST" && new URL(request.url).pathname === "/v1/checkout/sessions",
     );
-    expect(customerPosts).toHaveLength(1);
+    expect(customerPosts).toHaveLength(0);
     expect(checkoutPosts).toHaveLength(1);
     expect((await checkoutPosts[0]?.clone().text()) ?? "").toContain("mode=subscription");
     expect(
       await h.sql.query("SELECT customer_id FROM stripe_billing_customers WHERE org_id = ?", [ORG]),
-    ).toEqual([{ customer_id: "cus_created_1" }]);
+    ).toEqual([]);
     await expect(
-      h.subscriptions.begin({ ...input, planKey: "unconfigured" }),
+      h.subscriptions.begin({ ...input, reference: "new-reference", planKey: "unconfigured" }),
     ).rejects.toMatchObject({ code: "unknown_plan" });
     await expect(
       h.subscriptions.begin({
@@ -2322,11 +3143,12 @@ describe("Hosted Stripe billing service", () => {
         reference: "hosted-subscription-001",
         planKey: "unconfigured",
       }),
-    ).rejects.toMatchObject({ code: "unknown_plan" });
+    ).rejects.toMatchObject({ code: "reference_conflict" });
   });
 
   test("allows only one pending subscription Checkout across concurrent references", async () => {
     const h = await fixture();
+    await clearHistoricalSubscription(h);
     const attempts = await Promise.allSettled([
       h.subscriptions.begin({
         organizationId: ORG,
@@ -2352,7 +3174,7 @@ describe("Hosted Stripe billing service", () => {
     ).toHaveLength(1);
     expect(
       await h.sql.query(
-        "SELECT reference, session_id FROM stripe_billing_checkouts WHERE org_id = ?",
+        "SELECT id, session_id FROM stripe_subscription_checkout_intents WHERE org_id = ? AND state = 'session_known'",
         [ORG],
       ),
     ).toHaveLength(1);
@@ -2360,12 +3182,13 @@ describe("Hosted Stripe billing service", () => {
 
   test("repairs a committed Checkout reservation after its session ID write fails without duplicating Stripe POST", async () => {
     const h = await fixture();
+    await clearHistoricalSubscription(h);
     const originalRun = h.sql.run.bind(h.sql);
     let failReservationWrite = true;
     h.sql.run = async (statement, params) => {
       if (
         failReservationWrite &&
-        statement.startsWith("UPDATE stripe_billing_checkouts SET session_id")
+        statement.startsWith("UPDATE stripe_subscription_checkout_intents SET session_id")
       ) {
         failReservationWrite = false;
         throw new SqlError("unavailable", "injected local write failure");
@@ -2377,11 +3200,11 @@ describe("Hosted Stripe billing service", () => {
       reference: "hosted-checkout-repair",
       planKey: PLAN_KEY,
     };
-    await expect(h.subscriptions.begin(input)).rejects.toBeInstanceOf(SqlError);
+    expect(await h.subscriptions.begin(input)).toMatchObject({ state: "pending" });
     expect(
       await h.sql.query(
-        "SELECT session_id FROM stripe_billing_checkouts WHERE org_id = ? AND reference = ?",
-        [ORG, input.reference],
+        "SELECT session_id FROM stripe_subscription_checkout_intents WHERE org_id = ? AND request_key_digest <> 'historical'",
+        [ORG],
       ),
     ).toEqual([{ session_id: null }]);
     const firstCheckoutPosts = h.state.requests.filter(
@@ -2391,11 +3214,14 @@ describe("Hosted Stripe billing service", () => {
     expect(firstCheckoutPosts).toHaveLength(1);
 
     const repaired = await h.subscriptions.begin(input);
-    expect(repaired.url).toBe("https://checkout.stripe.com/c/pay/cs_created_1");
+    expect(repaired).toMatchObject({
+      state: "open",
+      url: "https://checkout.stripe.com/c/pay/cs_created_1",
+    });
     expect(
       await h.sql.query(
-        "SELECT session_id FROM stripe_billing_checkouts WHERE org_id = ? AND reference = ?",
-        [ORG, input.reference],
+        "SELECT session_id FROM stripe_subscription_checkout_intents WHERE org_id = ? AND request_key_digest <> 'historical'",
+        [ORG],
       ),
     ).toEqual([{ session_id: "cs_created_1" }]);
     expect(
@@ -2421,31 +3247,9 @@ describe("Hosted Stripe billing service", () => {
     ).toHaveLength(2);
   });
 
-  test("replays a committed Checkout command after subscription activation with its original URL", async () => {
+  test("permits a new Checkout reference only after exact expired and unpaid Session proof", async () => {
     const h = await fixture();
-    const input = {
-      organizationId: ORG,
-      reference: "hosted-subscription-replay",
-      planKey: PLAN_KEY,
-    };
-    const first = await h.subscriptions.begin(input);
-    h.state.subscriptions.set(SUBSCRIPTION, subscription());
-    expect(
-      (await deliver(h.app, event("customer.subscription.updated", SUBSCRIPTION, "subscription")))
-        .status,
-    ).toBe(200);
-    const replay = await h.subscriptions.begin(input);
-    expect(replay).toEqual(first);
-    expect(
-      h.state.requests.filter(
-        (request) =>
-          request.method === "POST" && new URL(request.url).pathname === "/v1/checkout/sessions",
-      ),
-    ).toHaveLength(1);
-  });
-
-  test("permits a new Checkout reference only after Stripe confirms the prior session is expired or its subscription canceled", async () => {
-    const h = await fixture();
+    await clearHistoricalSubscription(h);
     const first = await h.subscriptions.begin({
       organizationId: ORG,
       reference: "hosted-subscription-old",
@@ -2462,7 +3266,7 @@ describe("Hosted Stripe billing service", () => {
     ).rejects.toMatchObject({ code: "subscription_checkout_pending" });
 
     h.state.sessions.set("cs_created_1", { ...oldSession, status: "complete" });
-    h.state.subscriptions.set(SUBSCRIPTION, subscription({ status: "active" }));
+
     await expect(
       h.subscriptions.begin({
         organizationId: ORG,
@@ -2471,16 +3275,18 @@ describe("Hosted Stripe billing service", () => {
       }),
     ).rejects.toMatchObject({ code: "subscription_checkout_pending" });
 
-    h.state.subscriptions.set(SUBSCRIPTION, subscription({ status: "canceled" }));
-    expect(
-      (await deliver(h.app, event("customer.subscription.deleted", SUBSCRIPTION, "subscription")))
-        .status,
-    ).toBe(200);
+    h.state.sessions.set("cs_created_1", {
+      ...oldSession,
+      status: "expired",
+      payment_status: "unpaid",
+    });
     const next = await h.subscriptions.begin({
       organizationId: ORG,
       reference: "hosted-subscription-new",
       planKey: PLAN_KEY,
     });
+    if (first.state !== "open" || next.state !== "open")
+      throw new Error("expected open Checkout receipts");
     expect(next.url).not.toBe(first.url);
     expect(
       h.state.requests.filter(
@@ -2500,17 +3306,15 @@ describe("Hosted Stripe billing service", () => {
       organizationId: ORG,
       reference: "cancel-subscription-001",
       cancelAtPeriodEnd: true,
+      expectedSubscriptionRef: String((await h.subscriptions.read(ORG))?.subscriptionRef),
     });
     const second = await h.subscriptions.change({
       organizationId: ORG,
       reference: "cancel-subscription-001",
       cancelAtPeriodEnd: true,
+      expectedSubscriptionRef: String((await h.subscriptions.read(ORG))?.subscriptionRef),
     });
-    expect(first).toMatchObject({
-      subscriptionId: SUBSCRIPTION,
-      status: "active",
-      cancelAtPeriodEnd: true,
-    });
+    expect(first).toMatchObject({ state: "verified", effectiveAt: "2026-11-01T00:00:00.000Z" });
     expect(second).toEqual(first);
     expect(
       h.state.requests.filter(
@@ -2521,6 +3325,946 @@ describe("Hosted Stripe billing service", () => {
     ).toHaveLength(1);
   });
 
+  test("Checkout lost ACK recovers the exact Session by list/readback without another POST", async () => {
+    const h = await fixture();
+    await clearHistoricalSubscription(h);
+    h.state.loseCheckoutAck = true;
+    const input = { organizationId: ORG, reference: "lost-checkout-ack", planKey: PLAN_KEY };
+    const first = await h.subscriptions.begin(input);
+    expect(first.state).toBe("pending");
+    expect(first.id).toMatch(/^sci_/u);
+    const replay = await h.subscriptions.begin(input);
+    expect(replay).toMatchObject({ state: "open", id: "cs_created_1" });
+    expect(
+      h.state.requests.filter(
+        (request) =>
+          request.method === "POST" && new URL(request.url).pathname === "/v1/checkout/sessions",
+      ),
+    ).toHaveLength(1);
+    expect(
+      await h.sql.query(
+        "SELECT state, session_id FROM stripe_subscription_checkout_intents WHERE id = ?",
+        [first.id],
+      ),
+    ).toEqual([{ state: "session_known", session_id: "cs_created_1" }]);
+  });
+
+  test("LIVE Checkout and cancellation unknown ACKs recover by GET without a second POST", async () => {
+    const checkout = await fixture(pricing(), () => new Date(NOW), "live");
+    await clearHistoricalSubscription(checkout);
+    checkout.state.loseCheckoutAck = true;
+    const begin = {
+      organizationId: ORG,
+      reference: "live-lost-checkout-ack",
+      planKey: PLAN_KEY,
+    };
+    const pending = await checkout.subscriptions.begin(begin);
+    expect(pending.state).toBe("pending");
+    expect(await checkout.subscriptions.begin(begin)).toMatchObject({
+      state: "open",
+      id: "cs_created_1",
+    });
+    expect(
+      await checkout.sql.query(
+        "SELECT livemode, state, session_id FROM stripe_subscription_checkout_intents WHERE id = ?",
+        [pending.id],
+      ),
+    ).toEqual([{ livemode: 1, state: "session_known", session_id: "cs_created_1" }]);
+    expect(
+      checkout.state.requests.filter(
+        (request) =>
+          request.method === "POST" && new URL(request.url).pathname === "/v1/checkout/sessions",
+      ),
+    ).toHaveLength(1);
+
+    const cancellation = await fixture(pricing(), () => new Date(NOW), "live");
+    expect(
+      (
+        await deliver(
+          cancellation.app,
+          event("customer.subscription.updated", SUBSCRIPTION, "subscription", { livemode: true }),
+        )
+      ).status,
+    ).toBe(200);
+    const subscriptionRef = String((await cancellation.subscriptions.read(ORG))?.subscriptionRef);
+    cancellation.state.loseCancelAck = true;
+    const change = {
+      organizationId: ORG,
+      reference: "live-lost-cancellation-ack",
+      cancelAtPeriodEnd: true,
+      expectedSubscriptionRef: subscriptionRef,
+    };
+    expect(await cancellation.subscriptions.change(change)).toMatchObject({ state: "pending" });
+    expect(await cancellation.subscriptions.change(change)).toMatchObject({ state: "verified" });
+    expect(
+      cancellation.state.requests.filter(
+        (request) =>
+          request.method === "POST" &&
+          new URL(request.url).pathname === `/v1/subscriptions/${SUBSCRIPTION}`,
+      ),
+    ).toHaveLength(1);
+  });
+
+  test("conclusively stale prepared Checkout is invalidated without POST and frees the org slot", async () => {
+    const h = await fixture();
+    await clearHistoricalSubscription(h);
+    const originalRun = h.sql.run.bind(h.sql);
+    h.sql.run = async (statement, params) =>
+      statement.startsWith("UPDATE stripe_subscription_checkout_intents SET state = 'dispatched'")
+        ? { rows: [], changes: 0 }
+        : await originalRun(statement, params);
+    const input = { organizationId: ORG, reference: "prepared-recheck", planKey: PLAN_KEY };
+    await expect(h.subscriptions.begin(input)).rejects.toMatchObject({
+      code: "subscription_checkout_pending",
+    });
+    h.sql.run = originalRun;
+    await h.reconcile();
+    expect(
+      await h.sql.query("SELECT state FROM stripe_subscription_checkout_intents WHERE org_id = ?", [
+        ORG,
+      ]),
+    ).toEqual([{ state: "prepared" }]);
+    h.state.prices.set(PRICE, { ...h.state.prices.get(PRICE), unit_amount: MONTHLY_MINOR + 1 });
+    await expect(h.subscriptions.begin(input)).rejects.toMatchObject({
+      code: "subscription_checkout_invalidated",
+    });
+    expect(
+      await h.sql.query("SELECT state FROM stripe_subscription_checkout_intents WHERE org_id = ?", [
+        ORG,
+      ]),
+    ).toEqual([{ state: "invalidated" }]);
+    expect(
+      h.state.requests.filter(
+        (request) =>
+          request.method === "POST" && new URL(request.url).pathname === "/v1/checkout/sessions",
+      ),
+    ).toHaveLength(0);
+    h.state.prices.set(PRICE, { ...h.state.prices.get(PRICE), unit_amount: MONTHLY_MINOR });
+    expect(
+      await h.subscriptions.begin({
+        organizationId: ORG,
+        reference: "fresh-after-invalidation",
+        planKey: PLAN_KEY,
+      }),
+    ).toMatchObject({ state: "open", id: "cs_created_1" });
+    await expect(h.subscriptions.begin(input)).rejects.toMatchObject({
+      code: "subscription_checkout_invalidated",
+    });
+    expect(
+      h.state.requests.filter(
+        (request) =>
+          request.method === "POST" && new URL(request.url).pathname === "/v1/checkout/sessions",
+      ),
+    ).toHaveLength(1);
+  });
+
+  test("transient Price read keeps prepared custody while changed customer conclusively invalidates it", async () => {
+    const h = await fixture();
+    await clearHistoricalSubscription(h);
+    const originalRun = h.sql.run.bind(h.sql);
+    h.sql.run = async (statement, params) =>
+      statement.startsWith("UPDATE stripe_subscription_checkout_intents SET state = 'dispatched'")
+        ? { rows: [], changes: 0 }
+        : await originalRun(statement, params);
+    const input = { organizationId: ORG, reference: "prepared-customer", planKey: PLAN_KEY };
+    await expect(h.subscriptions.begin(input)).rejects.toMatchObject({
+      code: "subscription_checkout_pending",
+    });
+    h.sql.run = originalRun;
+    h.state.failOnce.add(`/v1/prices/${PRICE}`);
+    await expect(h.subscriptions.begin(input)).rejects.toBeDefined();
+    expect(
+      await h.sql.query("SELECT state FROM stripe_subscription_checkout_intents WHERE org_id = ?", [
+        ORG,
+      ]),
+    ).toEqual([{ state: "prepared" }]);
+    await originalRun(
+      "UPDATE stripe_billing_customers SET customer_id = 'cus_other' WHERE org_id = ?",
+      [ORG],
+    );
+    h.state.customers.set(
+      "cus_other",
+      object("cus_other", "customer", {
+        metadata: { organizationId: ORG, takoserverPurpose: "hosted_subscription" },
+      }),
+    );
+    await expect(h.subscriptions.begin(input)).rejects.toMatchObject({
+      code: "subscription_checkout_invalidated",
+    });
+    expect(
+      await h.subscriptions.begin({
+        organizationId: ORG,
+        reference: "new-customer",
+        planKey: PLAN_KEY,
+      }),
+    ).toMatchObject({ state: "open", id: "cs_created_1" });
+    expect(h.state.sessions.get("cs_created_1")?.customer).toBe("cus_other");
+    expect(
+      h.state.requests.filter(
+        (request) =>
+          request.method === "POST" && new URL(request.url).pathname === "/v1/checkout/sessions",
+      ),
+    ).toHaveLength(1);
+  });
+
+  test("a Price identity cannot be reused for different registered cash or inclusion terms", async () => {
+    const h = await fixture();
+    await h.sql.run(
+      `INSERT OR IGNORE INTO stripe_billing_price_identity
+       (livemode,price_id,plan_key,amount_minor,included_minor,period_months) VALUES (0,?,?,?,?,1)`,
+      [PRICE, PLAN_KEY, MONTHLY_MINOR + 1, INCLUDED_MINOR],
+    );
+    await expect(
+      h.subscriptions.begin({
+        organizationId: ORG,
+        reference: "price-identity-conflict",
+        planKey: PLAN_KEY,
+      }),
+    ).rejects.toMatchObject({ code: "price_identity_conflict" });
+    expect(
+      h.state.requests.filter(
+        (request) =>
+          request.method === "POST" && new URL(request.url).pathname === "/v1/checkout/sessions",
+      ),
+    ).toHaveLength(0);
+  });
+
+  test("rejected later pricing revision leaves the durable R1 snapshot unchanged and R1 can restart", async () => {
+    const h = await fixture();
+    await h.subscriptions.read(ORG);
+    const before = await h.sql.query(
+      "SELECT revision,config_json FROM stripe_billing_pricing ORDER BY revision",
+    );
+    const identities = await h.sql.query(
+      "SELECT * FROM stripe_billing_price_identity ORDER BY price_id",
+    );
+    const context = {
+      sql: h.sql,
+      clock: () => new Date(NOW),
+      credit: async () => "already_credited" as const,
+      creditedFunding: async () => new Set<string>(),
+    };
+    const client = createStripeBillingClient({ secretKey: KEY, fetch: fakeStripe(h.state) });
+    const changed = createStripeBilling({
+      client,
+      context,
+      pricing: pricing("candidate-r4", INCLUDED_MINOR + 1),
+      consoleOrigin: "https://console.example.test",
+    });
+    await expect(changed.subscriptions.read(ORG)).rejects.toMatchObject({
+      code: "price_identity_conflict",
+    });
+    expect(
+      await h.sql.query(
+        "SELECT revision,config_json FROM stripe_billing_pricing ORDER BY revision",
+      ),
+    ).toEqual(before);
+    expect(
+      await h.sql.query("SELECT * FROM stripe_billing_price_identity ORDER BY price_id"),
+    ).toEqual(identities);
+    const restarted = createStripeBilling({
+      client,
+      context,
+      pricing: pricing(),
+      consoleOrigin: "https://console.example.test",
+    });
+    expect(await restarted.subscriptions.read(ORG)).toBeNull();
+  });
+
+  test("reconcile alone recovers dispatched Checkout and cancellation without another POST", async () => {
+    const h = await fixture();
+    await clearHistoricalSubscription(h);
+    h.state.loseCheckoutAck = true;
+    const started = await h.subscriptions.begin({
+      organizationId: ORG,
+      reference: "background-checkout",
+      planKey: PLAN_KEY,
+    });
+    expect(started.state).toBe("pending");
+    await h.reconcile();
+    expect(
+      await h.sql.query(
+        "SELECT state,session_id FROM stripe_subscription_checkout_intents WHERE id = ?",
+        [started.id],
+      ),
+    ).toEqual([{ state: "session_known", session_id: "cs_created_1" }]);
+    const session = h.state.sessions.get("cs_created_1");
+    h.state.sessions.set("cs_created_1", {
+      ...session,
+      status: "complete",
+      payment_status: "paid",
+      subscription: "sub_created_1",
+    });
+    h.state.subscriptions.set("sub_created_1", subscription({ id: "sub_created_1" }));
+    await h.reconcile();
+    expect(
+      await h.sql.query("SELECT state FROM stripe_subscription_checkout_intents WHERE id = ?", [
+        started.id,
+      ]),
+    ).toEqual([{ state: "associated" }]);
+    expect(
+      h.state.requests.filter(
+        (request) =>
+          request.method === "POST" && new URL(request.url).pathname === "/v1/checkout/sessions",
+      ),
+    ).toHaveLength(1);
+    const cancellation = await fixture();
+    expect(
+      (
+        await deliver(
+          cancellation.app,
+          event("customer.subscription.updated", SUBSCRIPTION, "subscription"),
+        )
+      ).status,
+    ).toBe(200);
+    const ref = String((await cancellation.subscriptions.read(ORG))?.subscriptionRef);
+    cancellation.state.loseCancelAck = true;
+    expect(
+      await cancellation.subscriptions.change({
+        organizationId: ORG,
+        reference: "background-cancel",
+        cancelAtPeriodEnd: true,
+        expectedSubscriptionRef: ref,
+      }),
+    ).toMatchObject({ state: "pending" });
+    await cancellation.reconcile();
+    expect(
+      await cancellation.sql.query(
+        "SELECT state FROM stripe_subscription_cancellation_intents WHERE org_id = ?",
+        [ORG],
+      ),
+    ).toEqual([{ state: "verified" }]);
+    expect(
+      cancellation.state.requests.filter(
+        (request) =>
+          request.method === "POST" &&
+          new URL(request.url).pathname === `/v1/subscriptions/${SUBSCRIPTION}`,
+      ),
+    ).toHaveLength(1);
+  });
+
+  test("reconcile reports all outstanding custody rows after a fresh handle crosses its 100-row cursor", async () => {
+    const h = await fixture();
+    await h.subscriptions.read(ORG);
+    await h.sql.batch(
+      Array.from({ length: 101 }, (_, index) => ({
+        sql: `INSERT INTO stripe_subscription_checkout_intents
+          (id,org_id,request_key_digest,fingerprint,plan_key,pricing_revision,price_id,price_amount_minor,
+           included_minor,livemode,state,created_at,updated_at)
+          VALUES (?,?,'bulk','unverified',?,?,?,?,?,0,'dispatched',?,?)`,
+        params: [
+          `sci_bulk_${String(index).padStart(3, "0")}`,
+          `org_bulk_${index}`,
+          PLAN_KEY,
+          REVISION,
+          PRICE,
+          MONTHLY_MINOR,
+          INCLUDED_MINOR,
+          NOW.toISOString(),
+          NOW.toISOString(),
+        ],
+      })),
+    );
+    const first = await h.reconcile();
+    expect(first.billing?.truncated).toBe(true);
+    expect(first.billing?.unresolved).toBeGreaterThanOrEqual(101);
+    expect(
+      await h.sql.query(
+        "SELECT cursor FROM stripe_subscription_custody_reconcile WHERE stream = 'checkout'",
+      ),
+    ).toEqual([{ cursor: "sci_bulk_099" }]);
+    // Simulate a separately verified last row while the first hundred still await proof.
+    await h.sql.run(
+      "UPDATE stripe_subscription_checkout_intents SET state = 'expired', session_id = 'cs_bulk_100' WHERE id = 'sci_bulk_100'",
+    );
+    const fresh = createStripeBilling({
+      client: createStripeBillingClient({ secretKey: KEY, fetch: fakeStripe(h.state) }),
+      context: {
+        sql: h.sql,
+        clock: () => new Date(NOW),
+        credit: async () => "already_credited" as const,
+        creditedFunding: async () => new Set<string>(),
+      },
+      pricing: pricing(),
+      consoleOrigin: "https://console.example.test",
+    });
+    const second = await fresh.reconcile();
+    expect(second.truncated).toBe(false);
+    expect(second.unresolved).toBeGreaterThanOrEqual(100);
+    expect(
+      await h.sql.query(
+        "SELECT cursor FROM stripe_subscription_custody_reconcile WHERE stream = 'checkout'",
+      ),
+    ).toEqual([{ cursor: null }]);
+  });
+
+  test("lost Checkout ACK traverses every bounded page before binding a delayed visible Session", async () => {
+    const h = await fixture();
+    await clearHistoricalSubscription(h);
+    h.state.loseCheckoutAck = true;
+    const input = { organizationId: ORG, reference: "lost-ack-many-pages", planKey: PLAN_KEY };
+    const pending = await h.subscriptions.begin(input);
+    expect(pending.state).toBe("pending");
+    const exact = h.state.sessions.get("cs_created_1");
+    expect(exact).toBeDefined();
+    h.state.sessions = new Map([
+      ...Array.from(
+        { length: 101 },
+        (_, index) =>
+          [
+            `cs_noise_${index}`,
+            object(`cs_noise_${index}`, "checkout.session", {
+              metadata: {},
+              client_reference_id: "not_ours",
+            }),
+          ] as const,
+      ),
+      ["cs_created_1", exact as ObjectRecord],
+    ]);
+    const replay = await h.subscriptions.begin(input);
+    expect(replay).toMatchObject({ state: "open", id: "cs_created_1" });
+    expect(
+      h.state.requests.filter(
+        (request) =>
+          request.method === "GET" && new URL(request.url).pathname === "/v1/checkout/sessions",
+      ).length,
+    ).toBeGreaterThanOrEqual(3);
+    expect(
+      h.state.requests.filter(
+        (request) =>
+          request.method === "POST" && new URL(request.url).pathname === "/v1/checkout/sessions",
+      ),
+    ).toHaveLength(1);
+  });
+
+  test("Checkout association binds its first customer and subscription only after exact paid proof", async () => {
+    const h = await fixture();
+    await h.sql.run("DELETE FROM stripe_billing_associations WHERE org_id = ?", [ORG]);
+    await h.sql.run("DELETE FROM stripe_subscription_checkout_intents WHERE org_id = ?", [ORG]);
+    await h.sql.run("DELETE FROM stripe_billing_customers WHERE org_id = ?", [ORG]);
+    const first = await h.subscriptions.begin({
+      organizationId: ORG,
+      reference: "associate-first",
+      planKey: PLAN_KEY,
+    });
+    expect(first.state).toBe("open");
+    const session = h.state.sessions.get(first.id);
+    expect(session?.customer).toBe("cus_created_1");
+    expect(
+      await h.sql.query("SELECT * FROM stripe_billing_customers WHERE org_id = ?", [ORG]),
+    ).toEqual([]);
+    h.state.sessions.set(first.id, {
+      ...session,
+      status: "complete",
+      payment_status: "paid",
+      subscription: "sub_created_1",
+    });
+    h.state.subscriptions.set(
+      "sub_created_1",
+      subscription({ id: "sub_created_1", customer: "cus_created_1" }),
+    );
+    const immediate = await h.subscriptions.begin({
+      organizationId: ORG,
+      reference: "associate-first",
+      planKey: PLAN_KEY,
+    });
+    expect(immediate).toMatchObject({ id: first.id, state: "associated" });
+    if (immediate.state !== "associated") throw new Error("expected associated Checkout");
+    expect(immediate.subscriptionRef).toMatch(/^sra_[0-9a-f]{64}$/u);
+    const delivered = await deliver(
+      h.app,
+      event("checkout.session.completed", first.id, "checkout.session"),
+    );
+    expect(delivered.status).toBe(200);
+    expect(
+      await h.sql.query("SELECT customer_id FROM stripe_billing_customers WHERE org_id = ?", [ORG]),
+    ).toEqual([{ customer_id: "cus_created_1" }]);
+    expect(
+      await h.sql.query(
+        "SELECT org_id, customer_id, session_id FROM stripe_billing_associations WHERE subscription_id = ?",
+        ["sub_created_1"],
+      ),
+    ).toEqual([{ org_id: ORG, customer_id: "cus_created_1", session_id: first.id }]);
+    expect((await h.subscriptions.read(ORG))?.subscriptionRef).toBe(immediate.subscriptionRef);
+    expect(
+      await h.subscriptions.begin({
+        organizationId: ORG,
+        reference: "associate-first",
+        planKey: PLAN_KEY,
+      }),
+    ).toEqual(immediate);
+    await expect(
+      h.subscriptions.begin({
+        organizationId: ORG,
+        reference: "associate-second",
+        planKey: PLAN_KEY,
+      }),
+    ).rejects.toMatchObject({ code: "subscription_checkout_pending" });
+    expect(
+      h.state.requests.filter(
+        (request) =>
+          request.method === "POST" && new URL(request.url).pathname === "/v1/checkout/sessions",
+      ),
+    ).toHaveLength(1);
+    h.state.subscriptions.set(
+      "sub_created_1",
+      subscription({ id: "sub_created_1", customer: "cus_created_1", status: "canceled" }),
+    );
+    expect(
+      (
+        await deliver(
+          h.app,
+          event("customer.subscription.deleted", "sub_created_1", "subscription"),
+        )
+      ).status,
+    ).toBe(200);
+    const second = await h.subscriptions.begin({
+      organizationId: ORG,
+      reference: "associate-second",
+      planKey: PLAN_KEY,
+    });
+    expect(second).toMatchObject({ state: "open", id: "cs_created_2" });
+    const secondSession = h.state.sessions.get(second.id);
+    expect(secondSession?.customer).toBe("cus_created_1");
+    h.state.sessions.set(second.id, {
+      ...secondSession,
+      status: "complete",
+      payment_status: "paid",
+      subscription: "sub_created_2",
+    });
+    h.state.subscriptions.set(
+      "sub_created_2",
+      subscription({ id: "sub_created_2", customer: "cus_created_1" }),
+    );
+    expect(
+      (await deliver(h.app, event("checkout.session.completed", second.id, "checkout.session")))
+        .status,
+    ).toBe(200);
+    expect((await h.subscriptions.read(ORG))?.subscriptionId).toBe("sub_created_2");
+    const currentRef = (await h.subscriptions.read(ORG))?.subscriptionRef;
+    expect(currentRef).not.toBe(immediate.subscriptionRef);
+    expect(
+      await h.subscriptions.begin({
+        organizationId: ORG,
+        reference: "associate-first",
+        planKey: PLAN_KEY,
+      }),
+    ).toEqual(immediate);
+    expect(
+      h.state.requests.filter(
+        (request) =>
+          request.method === "POST" && new URL(request.url).pathname === "/v1/checkout/sessions",
+      ),
+    ).toHaveLength(2);
+    expect((await h.ledger.wallet(ORG)).settledMicros).toBe(0);
+    h.state.subscriptions.set(
+      "sub_created_2",
+      subscription({ id: "sub_created_2", customer: "cus_created_1", status: "canceled" }),
+    );
+    expect(
+      (
+        await deliver(
+          h.app,
+          event("customer.subscription.deleted", "sub_created_2", "subscription"),
+        )
+      ).status,
+    ).toBe(200);
+    const third = await h.subscriptions.begin({
+      organizationId: ORG,
+      reference: "associate-third",
+      planKey: PLAN_KEY,
+    });
+    expect(third).toMatchObject({ state: "open", id: "cs_created_3" });
+    expect(
+      await h.sql.query(
+        "SELECT subscription_id, association_generation FROM stripe_billing_associations WHERE org_id = ? ORDER BY association_generation",
+        [ORG],
+      ),
+    ).toEqual([
+      { subscription_id: "sub_created_1", association_generation: 1 },
+      { subscription_id: "sub_created_2", association_generation: 2 },
+    ]);
+    await h.sql.run(
+      "INSERT INTO stripe_billing_customers (org_id, customer_id, created_at) VALUES ('org_foreign', 'cus_foreign', ?)",
+      [NOW.toISOString()],
+    );
+    const replayA = () =>
+      h.subscriptions.begin({
+        organizationId: ORG,
+        reference: "associate-first",
+        planKey: PLAN_KEY,
+      });
+    await h.sql.run(
+      "UPDATE stripe_billing_associations SET org_id = 'org_foreign' WHERE subscription_id = 'sub_created_1'",
+    );
+    await expect(replayA()).rejects.toMatchObject({ code: "subscription_checkout_unresolved" });
+    await h.sql.run(
+      "UPDATE stripe_billing_associations SET org_id = ? WHERE subscription_id = 'sub_created_1'",
+      [ORG],
+    );
+    await h.sql.run(
+      "UPDATE stripe_billing_associations SET plan_key = 'wrong' WHERE subscription_id = 'sub_created_1'",
+    );
+    await expect(replayA()).rejects.toMatchObject({ code: "subscription_checkout_unresolved" });
+    expect(
+      h.state.requests.filter(
+        (request) =>
+          request.method === "POST" && new URL(request.url).pathname === "/v1/checkout/sessions",
+      ),
+    ).toHaveLength(3);
+    expect((await h.ledger.wallet(ORG)).settledMicros).toBe(0);
+  });
+
+  test("customer binding conflict and foreign Checkout line refuse association without money writes", async () => {
+    const h = await fixture();
+    await clearHistoricalSubscription(h);
+    const first = await h.subscriptions.begin({
+      organizationId: ORG,
+      reference: "conflicting-customer",
+      planKey: PLAN_KEY,
+    });
+    const session = h.state.sessions.get(first.id);
+    h.state.sessions.set(first.id, {
+      ...session,
+      status: "complete",
+      payment_status: "paid",
+      subscription: "sub_created_1",
+      customer: "cus_foreign",
+    });
+    h.state.subscriptions.set(
+      "sub_created_1",
+      subscription({ id: "sub_created_1", customer: "cus_foreign" }),
+    );
+    await h.sql.run(
+      "INSERT INTO stripe_billing_customers (org_id, customer_id, created_at) VALUES ('org_foreign', 'cus_foreign', ?)",
+      [NOW.toISOString()],
+    );
+    expect(
+      (await deliver(h.app, event("checkout.session.completed", first.id, "checkout.session")))
+        .status,
+    ).toBe(200);
+    expect(
+      await h.sql.query("SELECT * FROM stripe_billing_associations WHERE subscription_id = ?", [
+        "sub_created_1",
+      ]),
+    ).toEqual([]);
+    h.state.sessionLines.set(first.id, [
+      { id: "li_wrong", price: { id: "price_wrong" }, quantity: 1 },
+    ]);
+    expect(
+      (
+        await h.subscriptions.begin({
+          organizationId: ORG,
+          reference: "conflicting-customer",
+          planKey: PLAN_KEY,
+        })
+      ).state,
+    ).toBe("pending");
+    expect(
+      await h.sql.query("SELECT * FROM stripe_billing_grants WHERE source_id = ?", [first.id]),
+    ).toEqual([]);
+  });
+
+  test("first-Checkout customer binding race fails closed instead of adopting the wrong customer", async () => {
+    const h = await fixture();
+    await clearHistoricalSubscription(h);
+    await h.sql.run("DELETE FROM stripe_billing_customers WHERE org_id = ?", [ORG]);
+    const first = await h.subscriptions.begin({
+      organizationId: ORG,
+      reference: "customer-race",
+      planKey: PLAN_KEY,
+    });
+    expect(first.state).toBe("open");
+    await h.sql.run(
+      "INSERT INTO stripe_billing_customers (org_id, customer_id, created_at) VALUES (?, 'cus_conflict', ?)",
+      [ORG, NOW.toISOString()],
+    );
+    h.state.sessions.set(first.id, {
+      ...h.state.sessions.get(first.id),
+      status: "complete",
+      payment_status: "paid",
+      subscription: "sub_created_1",
+    });
+    h.state.subscriptions.set(
+      "sub_created_1",
+      subscription({ id: "sub_created_1", customer: "cus_created_1" }),
+    );
+    expect(
+      (await deliver(h.app, event("checkout.session.completed", first.id, "checkout.session")))
+        .status,
+    ).toBe(200);
+    expect(
+      await h.sql.query("SELECT customer_id FROM stripe_billing_customers WHERE org_id = ?", [ORG]),
+    ).toEqual([{ customer_id: "cus_conflict" }]);
+    expect(
+      await h.sql.query("SELECT * FROM stripe_billing_associations WHERE subscription_id = ?", [
+        "sub_created_1",
+      ]),
+    ).toEqual([]);
+  });
+
+  test("delayed invoice keeps its historical A binding after the current subscription projection becomes B", async () => {
+    const h = await fixture();
+    await h.sql.run(
+      `INSERT INTO stripe_subscription_checkout_intents
+       (id,org_id,request_key_digest,fingerprint,plan_key,pricing_revision,price_id,price_amount_minor,included_minor,livemode,customer_id,state,session_id,subscription_id,created_at,updated_at)
+       VALUES ('sci_new',?, 'new', 'new', ?, ?, ?, ?, ?, 0, ?, 'associated', 'cs_new', 'sub_new', ?, ?)`,
+      [
+        ORG,
+        PLAN_KEY,
+        REVISION,
+        PRICE,
+        MONTHLY_MINOR,
+        INCLUDED_MINOR,
+        CUSTOMER,
+        NOW.toISOString(),
+        NOW.toISOString(),
+      ],
+    );
+    await h.sql.run(
+      `INSERT INTO stripe_billing_associations
+       (subscription_id,org_id,customer_id,livemode,plan_key,pricing_revision,price_id,price_amount_minor,included_minor,session_id,association_generation,created_at)
+       VALUES ('sub_new', ?, ?, 0, ?, ?, ?, ?, ?, 'cs_new', 2, ?)`,
+      [ORG, CUSTOMER, PLAN_KEY, REVISION, PRICE, MONTHLY_MINOR, INCLUDED_MINOR, NOW.toISOString()],
+    );
+    h.state.subscriptions.set("sub_new", subscription({ id: "sub_new" }));
+    expect(
+      (await deliver(h.app, event("customer.subscription.updated", "sub_new", "subscription")))
+        .status,
+    ).toBe(200);
+    expect((await h.subscriptions.read(ORG))?.subscriptionId).toBe("sub_new");
+    h.state.subscriptions.set("sub_new", subscription({ id: "sub_new", status: "canceled" }));
+    expect(
+      (await deliver(h.app, event("customer.subscription.deleted", "sub_new", "subscription")))
+        .status,
+    ).toBe(200);
+    expect((await h.subscriptions.read(ORG))?.status).toBe("canceled");
+    // An old, valid A event must not roll the terminal B projection backward.
+    expect(
+      (await deliver(h.app, event("customer.subscription.updated", SUBSCRIPTION, "subscription")))
+        .status,
+    ).toBe(200);
+    expect((await h.subscriptions.read(ORG))?.subscriptionId).toBe("sub_new");
+    expect(
+      await h.subscriptions.begin({
+        organizationId: ORG,
+        reference: "after-terminal-b",
+        planKey: PLAN_KEY,
+      }),
+    ).toMatchObject({ state: "open" });
+    expect((await deliver(h.app, event("invoice.paid", "in_billing_test", "invoice"))).status).toBe(
+      200,
+    );
+    expect(
+      await h.sql.query(
+        "SELECT subscription_id, org_id, funding_ref FROM stripe_billing_grants WHERE source_id = 'in_billing_test'",
+      ),
+    ).toEqual([
+      { subscription_id: SUBSCRIPTION, org_id: ORG, funding_ref: "stripe:invoice:in_billing_test" },
+    ]);
+    expect((await h.subscriptions.read(ORG))?.subscriptionId).toBe("sub_new");
+  });
+
+  test("lost cancellation ACK is GET-only pending then target-bound verified; stale A to B replay is refused", async () => {
+    const h = await fixture();
+    expect(
+      (await deliver(h.app, event("customer.subscription.updated", SUBSCRIPTION, "subscription")))
+        .status,
+    ).toBe(200);
+    const ref = String((await h.subscriptions.read(ORG))?.subscriptionRef);
+    h.state.loseCancelAck = true;
+    const input = {
+      organizationId: ORG,
+      reference: "cancel-lost-ack",
+      cancelAtPeriodEnd: true,
+      expectedSubscriptionRef: ref,
+    };
+    const pending = await h.subscriptions.change(input);
+    expect(pending).toEqual({ state: "pending", subscriptionRef: ref });
+    const verified = await h.subscriptions.change(input);
+    expect(verified).toEqual({
+      state: "verified",
+      subscriptionRef: ref,
+      effectiveAt: "2026-11-01T00:00:00.000Z",
+    });
+    expect(
+      h.state.requests.filter(
+        (request) =>
+          request.method === "POST" &&
+          new URL(request.url).pathname === `/v1/subscriptions/${SUBSCRIPTION}`,
+      ),
+    ).toHaveLength(1);
+    await h.sql.run(
+      "UPDATE stripe_billing_subscriptions SET subscription_id = 'sub_new_target' WHERE org_id = ?",
+      [ORG],
+    );
+    await expect(h.subscriptions.change(input)).rejects.toMatchObject({
+      code: "subscription_management_conflict",
+    });
+    await expect(
+      h.subscriptions.change({ ...input, reference: "cancel-new-key" }),
+    ).rejects.toMatchObject({ code: "subscription_management_conflict" });
+    expect(
+      h.state.requests.filter(
+        (request) =>
+          request.method === "POST" &&
+          new URL(request.url).pathname === `/v1/subscriptions/${SUBSCRIPTION}`,
+      ),
+    ).toHaveLength(1);
+  });
+
+  test("terminal cancellation accepts Stripe's same-second proof but rejects the preceding second", async () => {
+    let observedNow = new Date("2026-10-14T12:00:00.987Z");
+    const h = await fixture(pricing(), () => observedNow);
+    expect(
+      (await deliver(h.app, event("customer.subscription.updated", SUBSCRIPTION, "subscription")))
+        .status,
+    ).toBe(200);
+    const ref = String((await h.subscriptions.read(ORG))?.subscriptionRef);
+    h.state.loseCancelAck = true;
+    const input = {
+      organizationId: ORG,
+      reference: "terminal-second",
+      cancelAtPeriodEnd: true,
+      expectedSubscriptionRef: ref,
+    };
+    expect(await h.subscriptions.change(input)).toMatchObject({ state: "pending" });
+    observedNow = new Date("2026-11-01T00:00:01.000Z");
+    h.state.subscriptions.set(
+      SUBSCRIPTION,
+      subscription({
+        status: "canceled",
+        cancel_at_period_end: true,
+        ended_at: PERIOD_END,
+        canceled_at: Math.floor(Date.parse("2026-10-14T12:00:00.987Z") / 1000) - 1,
+      }),
+    );
+    expect(await h.subscriptions.change(input)).toMatchObject({ state: "pending" });
+    h.state.subscriptions.set(
+      SUBSCRIPTION,
+      subscription({
+        status: "canceled",
+        cancel_at_period_end: true,
+        ended_at: PERIOD_END,
+        canceled_at: Math.floor(Date.parse("2026-10-14T12:00:00.987Z") / 1000),
+      }),
+    );
+    expect(await h.subscriptions.change(input)).toEqual({
+      state: "verified",
+      subscriptionRef: ref,
+      effectiveAt: "2026-11-01T00:00:00.000Z",
+    });
+    expect(
+      h.state.requests.filter(
+        (request) =>
+          request.method === "POST" &&
+          new URL(request.url).pathname === `/v1/subscriptions/${SUBSCRIPTION}`,
+      ),
+    ).toHaveLength(1);
+  });
+
+  test("cancellation permits archived exact Price but refuses changed historical amount", async () => {
+    const h = await fixture();
+    expect(
+      (await deliver(h.app, event("customer.subscription.updated", SUBSCRIPTION, "subscription")))
+        .status,
+    ).toBe(200);
+    const ref = String((await h.subscriptions.read(ORG))?.subscriptionRef);
+    h.state.prices.set(PRICE, { ...h.state.prices.get(PRICE), active: false });
+    expect(
+      await h.subscriptions.change({
+        organizationId: ORG,
+        reference: "inactive-price",
+        cancelAtPeriodEnd: true,
+        expectedSubscriptionRef: ref,
+      }),
+    ).toMatchObject({ state: "verified", subscriptionRef: ref });
+    expect(
+      h.state.requests.filter(
+        (request) =>
+          request.method === "POST" &&
+          new URL(request.url).pathname === `/v1/subscriptions/${SUBSCRIPTION}`,
+      ),
+    ).toHaveLength(1);
+    const changed = await fixture();
+    expect(
+      (
+        await deliver(
+          changed.app,
+          event("customer.subscription.updated", SUBSCRIPTION, "subscription"),
+        )
+      ).status,
+    ).toBe(200);
+    const changedRef = String((await changed.subscriptions.read(ORG))?.subscriptionRef);
+    changed.state.prices.set(PRICE, {
+      ...changed.state.prices.get(PRICE),
+      unit_amount: MONTHLY_MINOR + 1,
+    });
+    await expect(
+      changed.subscriptions.change({
+        organizationId: ORG,
+        reference: "changed-price",
+        cancelAtPeriodEnd: true,
+        expectedSubscriptionRef: changedRef,
+      }),
+    ).rejects.toMatchObject({ reason: "unsupported_plan" });
+    expect(
+      await h.sql.query("SELECT * FROM stripe_billing_grants WHERE source_type = 'invoice'"),
+    ).toEqual([]);
+  });
+
+  test("INSERT-race verified A replay rechecks the current B target before any POST", async () => {
+    const h = await fixture();
+    expect(
+      (await deliver(h.app, event("customer.subscription.updated", SUBSCRIPTION, "subscription")))
+        .status,
+    ).toBe(200);
+    const ref = String((await h.subscriptions.read(ORG))?.subscriptionRef);
+    const originalRun = h.sql.run.bind(h.sql);
+    let interleaved = false;
+    h.sql.run = async (statement, params) => {
+      if (
+        !interleaved &&
+        statement.startsWith("INSERT OR IGNORE INTO stripe_subscription_cancellation_intents")
+      ) {
+        interleaved = true;
+        const committed = await originalRun(statement, params);
+        expect(committed.changes).toBe(1);
+        await originalRun(
+          "UPDATE stripe_subscription_cancellation_intents SET state = 'verified', effective_at = ? WHERE org_id = ?",
+          ["2026-11-01T00:00:00.000Z", ORG],
+        );
+        await originalRun(
+          "UPDATE stripe_billing_subscriptions SET subscription_id = 'sub_new_target' WHERE org_id = ?",
+          [ORG],
+        );
+        return { rows: committed.rows, changes: 0 };
+      }
+      return await originalRun(statement, params);
+    };
+    await expect(
+      h.subscriptions.change({
+        organizationId: ORG,
+        reference: "cancel-race",
+        cancelAtPeriodEnd: true,
+        expectedSubscriptionRef: ref,
+      }),
+    ).rejects.toMatchObject({ code: "subscription_management_conflict" });
+    expect(interleaved).toBe(true);
+    expect(
+      h.state.requests.filter(
+        (request) =>
+          request.method === "POST" &&
+          new URL(request.url).pathname === `/v1/subscriptions/${SUBSCRIPTION}`,
+      ),
+    ).toHaveLength(0);
+    expect(
+      await h.sql.query(
+        "SELECT state, subscription_id FROM stripe_subscription_cancellation_intents WHERE org_id = ?",
+        [ORG],
+      ),
+    ).toEqual([{ state: "verified", subscription_id: SUBSCRIPTION }]);
+  });
   test("returns signed webhook errors without leaking Stripe diagnostics", async () => {
     const h = await fixture();
     const body = event("invoice.paid", "in_billing_test", "invoice");

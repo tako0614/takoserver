@@ -3,7 +3,7 @@
   "products": ["takoserver", "takosumi-hosted"],
   "currency": "USD",
   "moneyUnit": "USD-micros",
-  "revision": "hosted-20261014-final-v1",
+  "revision": "hosted-20261015-container-proposed-v1",
   "freeIncludedMicros": "1500000",
   "plans": [
     {
@@ -105,6 +105,26 @@
     "egress": {
       "unit": "byte",
       "cloudflareCostMicros": "0",
+      "quantity": "1"
+    },
+    "container.cpu": {
+      "unit": "vCPU-second",
+      "cloudflareCostMicros": "20",
+      "quantity": "1"
+    },
+    "container.memory": {
+      "unit": "GiB-second",
+      "cloudflareCostMicros": "2500",
+      "quantity": "1000"
+    },
+    "container.egress": {
+      "unit": "GB",
+      "cloudflareCostMicros": "50000",
+      "quantity": "1"
+    },
+    "container.image-storage": {
+      "unit": "GB-month",
+      "cloudflareCostMicros": "15000",
       "quantity": "1"
     }
   }

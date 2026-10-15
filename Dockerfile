@@ -7,6 +7,7 @@ COPY package.json bun.lock ./
 RUN bun install --frozen-lockfile
 COPY src ./src
 COPY config/shared-hosted-pricing.json ./config/shared-hosted-pricing.json
+COPY config/shared-hosted-pricing-revisions/hosted-20261014-final-v1.json ./config/shared-hosted-pricing-revisions/hosted-20261014-final-v1.json
 COPY vendor/takoform/v2.1.1 ./vendor/takoform/v2.1.1
 COPY LICENSE ./LICENSE
 COPY scripts/operator-key.ts ./scripts/operator-key.ts

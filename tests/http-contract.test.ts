@@ -546,13 +546,18 @@ describe("published API description", () => {
     expect(
       serialized.replace('"const":"takosumi-hosted"', '"const":"shared-hosted-product"'),
     ).not.toMatch(/takosumi/i);
-    // The reseller lane speaks only in opaque tenant references.
+    // Customer routes carry opaque references, including workspaceRef. They
+    // must not expose upstream Workspace, user, or principal identifiers.
     const customerPaths = Object.fromEntries(
       Object.entries(openApiDocument.paths).filter(
         ([path]) => !path.startsWith("/v1/operator/integration-e2e/organization-bootstrap/"),
       ),
     );
-    expect(JSON.stringify(customerPaths)).not.toMatch(/workspace|userId|principalId/);
+    expect(JSON.stringify(customerPaths)).not.toMatch(/workspaceId|userId|principalId/i);
+    expect(
+      openApiDocument.components.schemas.WalletWorkspaceUsageResponse.properties.workspaces.items
+        .properties.workspaceRef,
+    ).toEqual(openApiDocument.components.schemas.BillingReference);
   });
 
   test("serves the document it describes", async () => {

@@ -8,6 +8,8 @@
 !src/**
 !config/
 !config/shared-hosted-pricing.json
+!config/shared-hosted-pricing-revisions/
+!config/shared-hosted-pricing-revisions/hosted-20261014-final-v1.json
 !vendor/
 !vendor/takoform/
 !vendor/takoform/v2.1.1/

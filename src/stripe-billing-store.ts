@@ -184,6 +184,8 @@ export function createStripeBillingStore(options: { readonly sql: Sql; readonly 
         return;
       }
       const now = at();
+      if (input.sourceType === "invoice" && input.periodStart !== null && input.periodStart > now)
+        fail("invoice_period_not_started");
       const oldLot = (
         await sql.query(
           "SELECT kind, consumption_class, amount_micros, expires_at FROM wallet_credit_lots WHERE org_id = ? AND ref = ?",
@@ -203,6 +205,7 @@ export function createStripeBillingStore(options: { readonly sql: Sql; readonly 
       if (oldLot && !legacyLot) fail("grant_conflict");
       const legacyGuard = `guard_${crypto.randomUUID()}`;
       const moneyGuard = `guard_${crypto.randomUUID()}`;
+      const periodGuard = `guard_${crypto.randomUUID()}`;
       try {
         await sql.batch([
           ...(legacyLot
@@ -284,6 +287,17 @@ export function createStripeBillingStore(options: { readonly sql: Sql; readonly 
               now,
             ],
           },
+          ...(input.sourceType === "invoice"
+            ? [
+                guard(
+                  periodGuard,
+                  `EXISTS (SELECT 1 FROM stripe_billing_grants
+                 WHERE org_id = ? AND funding_ref = ? AND source_type = 'invoice'
+                   AND period_start <= created_at)`,
+                  [input.organizationId, input.fundingRef],
+                ),
+              ]
+            : []),
           ...(input.amountMicros > 0 && !legacyLot
             ? [
                 guard(
@@ -344,6 +358,9 @@ export function createStripeBillingStore(options: { readonly sql: Sql; readonly 
                   params: [moneyGuard],
                 },
               ]
+            : []),
+          ...(input.sourceType === "invoice"
+            ? [{ sql: "DELETE FROM wallet_allocation_guards WHERE id = ?", params: [periodGuard] }]
             : []),
         ]);
       } catch (error) {

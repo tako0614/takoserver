@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import { workerCredentials } from "../src/entry-worker.ts";
+import { compilePricingAuthoring } from "../src/hosted-pricing.ts";
 import { resolveIdentity } from "../src/identity-setup.ts";
 import {
   buildApp,
@@ -8,6 +9,7 @@ import {
   InMemoryTakoformResourceDriver,
 } from "../src/index.ts";
 import { createLedger } from "../src/ledger.ts";
+import { minorToMicros } from "../src/money.ts";
 import { openApiDocument } from "../src/openapi.ts";
 import {
   createOperatorPaymentsReconcileVerifier,
@@ -20,7 +22,9 @@ import type {
   PaymentEvents,
 } from "../src/payment-events.ts";
 import { resolvePayment } from "../src/payment-setup.ts";
-import type { Sql } from "../src/ports.ts";
+import type { JsonValue, Sql } from "../src/ports.ts";
+import { claimFreshStripeModeRealm } from "../src/stripe-mode-realm.ts";
+import { validateSchemaValue } from "../src/takoform/schema.ts";
 import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 /**
@@ -85,6 +89,7 @@ function paid(organizationId: string, id: string, amountMinor: number, age: numb
   return {
     id,
     object: "checkout.session",
+    livemode: false,
     status: "complete",
     mode: "payment",
     payment_status: "paid",
@@ -93,8 +98,15 @@ function paid(organizationId: string, id: string, amountMinor: number, age: numb
     created: nowSeconds() - age,
     payment_intent: {
       object: "payment_intent",
+      livemode: false,
       status: "succeeded",
-      latest_charge: { object: "charge", refunded: false, amount_refunded: 0, disputed: false },
+      latest_charge: {
+        object: "charge",
+        livemode: false,
+        refunded: false,
+        amount_refunded: 0,
+        disputed: false,
+      },
     },
     metadata: { organizationId, takoserverPurpose: "wallet_funding" },
   };
@@ -103,11 +115,19 @@ function paid(organizationId: string, id: string, amountMinor: number, age: numb
 /** Stripe's Checkout Session listing, newest first, optionally held until released. */
 function stripeFake(sessions: readonly Session[]) {
   const listings: string[] = [];
-  const state = { unavailable: false };
+  const state = { unavailable: false, invoicesUnavailable: false };
   let hold: Promise<void> | null = null;
   let release = () => {};
   const fetch = async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
+    if (
+      request.method === "GET" &&
+      ["/v1/invoices", "/v1/subscriptions", "/v1/refunds"].includes(url.pathname)
+    ) {
+      if (url.pathname === "/v1/invoices" && state.invoicesUnavailable)
+        return new Response("upstream down", { status: 500 });
+      return Response.json({ object: "list", data: [], has_more: false });
+    }
     if (request.method !== "GET" || url.pathname !== "/v1/checkout/sessions") {
       return new Response("unexpected", { status: 400 });
     }
@@ -140,6 +160,7 @@ async function host(
   options: {
     readonly sessions?: readonly Session[];
     readonly stripe?: boolean;
+    readonly hosted?: boolean;
     readonly operatorKey?: boolean;
     /** The Bun Host shares one pass; a Worker composition leaves this unset. */
     readonly share?: boolean;
@@ -151,6 +172,7 @@ async function host(
 ) {
   const stripe = stripeFake(options.sessions ?? []);
   const base = createEphemeralSql();
+  await claimFreshStripeModeRealm(base, "test");
   const sql: Sql = options.replayCacheDown
     ? {
         query: (statement, parameters) => base.query(statement, parameters),
@@ -169,6 +191,29 @@ async function host(
   ]);
   const payment = resolvePayment({
     ...(options.stripe === false ? {} : { stripeSecretKey: STRIPE_KEY }),
+    ...(options.hosted
+      ? {
+          hostedPricing: compilePricingAuthoring({
+            authoringVersion: 1,
+            planIds: { free: "free", subscription: "starter", usage: "usage" },
+            billingConfig: {
+              schemaVersion: 1,
+              revision: "operator-reconcile-r1",
+              effectiveAt: "2026-10-01T00:00:00.000Z",
+              currency: "USD",
+              holdTtlSeconds: 86_400,
+              freeIncludedMinor: 0,
+              purchaseCreditExpiry: { kind: "none" },
+              plans: { starter: { includedMinor: 1_500, stripePriceId: "price_Routetest" } },
+              meters: {},
+            },
+            checkout: { minimumMinor: 50, maximumMinor: 99_999_999 },
+            stripeMonthlyReview: {
+              starter: { expectedAmountMinor: 1_100, currency: "USD", interval: "month" },
+            },
+          }),
+        }
+      : {}),
     consoleOrigin: "https://console.takoserver.test",
     fetch: stripe.fetch,
   });
@@ -243,7 +288,57 @@ function errorCode(text: string): string | undefined {
   return (JSON.parse(text) as { error?: { code?: string } }).error?.code;
 }
 
+function resolveOpenApiRefs(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(resolveOpenApiRefs);
+  if (typeof value !== "object" || value === null) return value;
+  const record = value as Record<string, unknown>;
+  if (typeof record.$ref === "string") {
+    const prefix = "#/components/schemas/";
+    if (!record.$ref.startsWith(prefix)) throw new Error(`unexpected schema ref: ${record.$ref}`);
+    const name = record.$ref.slice(prefix.length);
+    const target = (openApiDocument.components.schemas as Record<string, unknown>)[name];
+    if (!target) throw new Error(`unknown OpenAPI schema: ${name}`);
+    return resolveOpenApiRefs(target);
+  }
+  return Object.fromEntries(
+    Object.entries(record).map(([key, child]) => [key, resolveOpenApiRefs(child)]),
+  );
+}
+
 describe("operator payment reconcile route", () => {
+  test("Hosted signed reconcile returns funding and billing reports under the published response schema", async () => {
+    const h = await host({ hosted: true });
+    const response = await h.reconcile(await sign());
+    expect(response.status).toBe(200);
+    const body = JSON.parse(response.text) as JsonValue;
+    const report = (body as { report: { billing?: Record<string, unknown> } }).report;
+    expect(report.billing).toEqual({
+      examined: 0,
+      applied: 0,
+      unresolved: 0,
+      truncated: false,
+      handlerVersion: 1,
+    });
+
+    const route = openApiDocument.paths[PATH] as {
+      post: { responses: { "200": { content: { "application/json": { schema: unknown } } } } };
+    };
+    const published = resolveOpenApiRefs(
+      route.post.responses["200"].content["application/json"].schema,
+    );
+    expect(validateSchemaValue(published, body, "")).toEqual([]);
+
+    h.stripe.state.invoicesUnavailable = true;
+    const degraded = await h.reconcile(await sign());
+    expect(degraded.status).toBe(200);
+    const degradedBody = JSON.parse(degraded.text) as JsonValue;
+    const degradedReport = (degradedBody as { report: { billing: Record<string, unknown> } })
+      .report;
+    expect(Number(degradedReport.billing.unresolved)).toBeGreaterThan(0);
+    expect(degradedReport.billing.truncated).toBe(true);
+    expect(validateSchemaValue(published, degradedBody, "")).toEqual([]);
+  });
+
   test("the operator report preserves the optional hosted billing summary in its published contract", async () => {
     const report: FundingReconcileReport = {
       examined: 0,
@@ -263,9 +358,14 @@ describe("operator payment reconcile route", () => {
     expect(response.headers.get("cache-control")).toBe("private, no-store");
     const schemas = openApiDocument.components.schemas as unknown as Record<string, unknown>;
     expect(schemas.FundingReconcileReport).toMatchObject({
-      properties: { billing: { $ref: "#/components/schemas/StripeBillingReconcileReport" } },
+      properties: {
+        billing: {
+          $ref: "#/components/schemas/BillingReconcileReport",
+          description: "Hosted billing progress, present only when Hosted billing is configured",
+        },
+      },
     });
-    expect(schemas.StripeBillingReconcileReport).toMatchObject({
+    expect(schemas.BillingReconcileReport).toMatchObject({
       type: "object",
       additionalProperties: false,
       required: ["examined", "applied", "unresolved", "truncated", "handlerVersion"],
@@ -299,7 +399,7 @@ describe("operator payment reconcile route", () => {
     expect(response.text).not.toContain(UNKNOWN_ORG);
     expect(response.text).not.toContain(ORG);
     expect(response.text).not.toContain("77777");
-    expect(await h.balance(ORG)).toBe(25_000_000);
+    expect(await h.balance(ORG)).toBe(minorToMicros(2_500));
     expect(h.stripe.listings).toHaveLength(1);
 
     // The published response schema names exactly the fields the pass reports.
@@ -328,7 +428,7 @@ describe("operator payment reconcile route", () => {
     // The scheduled pass meets the same reference and credits nothing either.
     expect(await h.app.reconcilePayments()).toMatchObject({ credited: 0, alreadyCredited: 1 });
     expect(await h.fundingRows()).toEqual([{ ref: "stripe:cs_route_once" }]);
-    expect(await h.balance(ORG)).toBe(12_000_000);
+    expect(await h.balance(ORG)).toBe(minorToMicros(1_200));
   });
 
   test("an assertion runs one pass; its replay is refused before Stripe is read", async () => {
@@ -361,7 +461,7 @@ describe("operator payment reconcile route", () => {
     expect((await h.reconcile(assertion)).status).toBe(401);
     // A fresh assertion runs the next pass, which credits the payment once.
     expect((await h.reconcile(await sign())).status).toBe(200);
-    expect(await h.balance(ORG)).toBe(6_000_000);
+    expect(await h.balance(ORG)).toBe(minorToMicros(600));
   });
 
   test("refuses every assertion that is not exactly a fresh reconcile one from the operator", async () => {
@@ -496,7 +596,7 @@ describe("operator payment reconcile route", () => {
     expect(JSON.parse(one.text).report).toEqual(JSON.parse(two.text).report);
     expect(cron).toEqual(JSON.parse(one.text).report);
     expect(h.stripe.listings).toHaveLength(1);
-    expect(await h.balance(ORG)).toBe(8_000_000);
+    expect(await h.balance(ORG)).toBe(minorToMicros(800));
     // Once that pass has finished, the next request starts a new one.
     expect((await h.reconcile(await sign())).status).toBe(200);
     expect(h.stripe.listings).toHaveLength(2);

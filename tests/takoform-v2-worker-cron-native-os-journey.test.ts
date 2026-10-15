@@ -2,7 +2,7 @@ import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { constants, tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAccounts } from "../src/auth.ts";
 import { bytesDigest } from "../src/json.ts";
@@ -81,19 +81,31 @@ function startHost(
   manifestSha: string,
   moduleSha: string,
   organizationId: string,
+  retainFailedStartup = false,
 ) {
+  const fixture = join(import.meta.dir, "fixtures/takoform-v2-worker-cron-host-server.ts");
+  const arguments_ = [
+    fixture,
+    root,
+    workerd,
+    workerUid ?? "-",
+    manifestSha,
+    moduleSha,
+    "native",
+    organizationId,
+  ];
   const child = Bun.spawn(
     [
       process.execPath,
       "--no-env-file",
-      join(import.meta.dir, "fixtures/takoform-v2-worker-cron-host-server.ts"),
-      root,
-      workerd,
-      workerUid ?? "-",
-      manifestSha,
-      moduleSha,
-      "native",
-      organizationId,
+      ...(retainFailedStartup
+        ? [
+            "--eval",
+            // Keep only this failed-startup regression alive until its owner
+            // kills it; normal fixtures retain their original command line.
+            `setInterval(() => {}, 1_000); process.argv = ${JSON.stringify([process.execPath, ...arguments_])}; await import(${JSON.stringify(fixture)});`,
+          ]
+        : arguments_),
     ],
     { stdin: "ignore", stdout: "pipe", stderr: "pipe" },
   );
@@ -146,6 +158,7 @@ function startHost(
   }
   return {
     child,
+    processIdentity: identityPromise,
     get origin(): string {
       if (!origin) throw new Error("native Cron Host is not listening");
       return origin;
@@ -210,6 +223,19 @@ function startHost(
   };
 }
 
+async function requireFailedStartupStopProof(host: ReturnType<typeof startHost>): Promise<void> {
+  const exitCode = await host.child.exited;
+  // Bun can retain a null exitCode after a signal exit has already been reaped.
+  // Require its resolved exit status and captured process identity as well.
+  if (host.child.signalCode === null) expect(host.child.exitCode).toBe(exitCode);
+  else {
+    expect(host.child.signalCode).toBe("SIGKILL");
+    expect(exitCode).toBe(128 + constants.signals.SIGKILL);
+  }
+  expect(exitCode).toBeGreaterThan(0);
+  expect(await linuxProcessLiveness(await host.processIdentity)).toBe("stale");
+}
+
 test("native Cron startup failure retains the spawned Host handle for owned cleanup", async () => {
   const host = startHost(
     "/dev/null/cron-os-startup",
@@ -225,7 +251,27 @@ test("native Cron startup failure retains the spawned Host handle for owned clea
     if (host.isReady) await host.stopGracefully();
     else await host.stopFailedStartup();
   }
-  expect(host.child.exitCode).not.toBeNull();
+  await requireFailedStartupStopProof(host);
+});
+
+test("native Cron startup cleanup reaps an owned SIGKILL exit after a retained startup error", async () => {
+  const host = startHost(
+    "/dev/null/cron-os-startup",
+    "/unused/workerd",
+    null,
+    "unused-manifest",
+    "unused-module",
+    "fixture-organization",
+    true,
+  );
+  try {
+    await expect(host.ready()).rejects.toThrow("startup refused");
+    expect(await linuxProcessLiveness(await host.processIdentity)).toBe("live");
+  } finally {
+    await host.stopFailedStartup();
+  }
+  expect(host.child.signalCode).toBe("SIGKILL");
+  await requireFailedStartupStopProof(host);
 });
 
 async function request(
