@@ -146,6 +146,52 @@ export async function inspectMoneyCutoverGuard(
   return "frozen";
 }
 
+const moneyCutoverSqlOrigins = new WeakMap<
+  object,
+  {
+    readonly raw: Sql;
+    readonly writerEpoch: string;
+    readonly query: Sql["query"];
+    readonly run: Sql["run"];
+    readonly batch: Sql["batch"];
+  }
+>();
+
+/**
+ * Checks an actual wrapper's captured epoch and original methods. This neither
+ * exposes its raw Sql nor replaces the current permit/freeze guards on writes.
+ */
+export function assertMoneyCutoverSqlOrigin(
+  sql: unknown,
+  context: { readonly writerEpoch: string },
+): asserts sql is Sql {
+  const origin =
+    typeof sql === "object" && sql !== null ? moneyCutoverSqlOrigins.get(sql) : undefined;
+  if (!origin || typeof context !== "object" || context === null) {
+    throw new SqlError("invalid", "money cutover Sql origin differs");
+  }
+  const writerEpoch = Object.getOwnPropertyDescriptor(context, "writerEpoch");
+  const query = Object.getOwnPropertyDescriptor(sql, "query");
+  const run = Object.getOwnPropertyDescriptor(sql, "run");
+  const batch = Object.getOwnPropertyDescriptor(sql, "batch");
+  if (
+    !writerEpoch ||
+    !("value" in writerEpoch) ||
+    writerEpoch.value !== origin.writerEpoch ||
+    !query ||
+    !("value" in query) ||
+    query.value !== origin.query ||
+    !run ||
+    !("value" in run) ||
+    run.value !== origin.run ||
+    !batch ||
+    !("value" in batch) ||
+    batch.value !== origin.batch
+  ) {
+    throw new SqlError("invalid", "money cutover Sql origin differs");
+  }
+}
+
 function assertPublicStatement(statement: SqlStatement): void {
   const source = statement.sql.trim();
   if (
@@ -183,7 +229,7 @@ export function createMoneyCutoverSql(raw: Sql, writerEpoch: string): Sql {
     }
     return result.slice(1, -1);
   }
-  return {
+  const wrapped: Sql = {
     async query(sql, params) {
       // SELECT and the one audited introspection PRAGMA cannot mutate SQLite.
       // WITH (including a mutating final statement) takes the guarded transaction.
@@ -214,4 +260,15 @@ export function createMoneyCutoverSql(raw: Sql, writerEpoch: string): Sql {
     },
     batch: guarded,
   };
+  moneyCutoverSqlOrigins.set(
+    wrapped,
+    Object.freeze({
+      raw,
+      writerEpoch,
+      query: wrapped.query,
+      run: wrapped.run,
+      batch: wrapped.batch,
+    }),
+  );
+  return wrapped;
 }

@@ -185,6 +185,49 @@ export interface AuthTokenCaptureReader {
   inspectAuthenticatedTokenCapture(capture: unknown): CapturedAuthTokenRow | null;
 }
 
+const authTokenCaptureReaderOrigins = new WeakMap<
+  object,
+  {
+    readonly sql: Sql;
+    readonly capture: AuthTokenCaptureReader["captureAuthenticatedToken"];
+    readonly inspect: AuthTokenCaptureReader["inspectAuthenticatedTokenCapture"];
+  }
+>();
+
+/**
+ * Checks the actual Accounts factory and its original capture methods without
+ * calling them. This proves local origin only, not class or Financial authority.
+ */
+export function assertAuthTokenCaptureReader(
+  reader: unknown,
+  context: { readonly sql: Sql },
+): asserts reader is AuthTokenCaptureReader {
+  const origin =
+    typeof reader === "object" && reader !== null
+      ? authTokenCaptureReaderOrigins.get(reader)
+      : undefined;
+  if (!origin || typeof context !== "object" || context === null) {
+    throw new AuthError("invalid");
+  }
+  // Own data descriptors avoid executing an alleged reader/context's getters.
+  const sql = Object.getOwnPropertyDescriptor(context, "sql");
+  const capture = Object.getOwnPropertyDescriptor(reader, "captureAuthenticatedToken");
+  const inspect = Object.getOwnPropertyDescriptor(reader, "inspectAuthenticatedTokenCapture");
+  if (
+    !sql ||
+    !("value" in sql) ||
+    sql.value !== origin.sql ||
+    !capture ||
+    !("value" in capture) ||
+    capture.value !== origin.capture ||
+    !inspect ||
+    !("value" in inspect) ||
+    inspect.value !== origin.inspect
+  ) {
+    throw new AuthError("invalid");
+  }
+}
+
 export interface ExternalIdentityVerifier {
   verify(input: {
     readonly provider: IdentityProvider;
@@ -1268,6 +1311,14 @@ export function createAccounts(options: CreateAccountsOptions): Accounts & AuthT
     },
   };
 
+  authTokenCaptureReaderOrigins.set(
+    accounts,
+    Object.freeze({
+      sql,
+      capture: accounts.captureAuthenticatedToken,
+      inspect: accounts.inspectAuthenticatedTokenCapture,
+    }),
+  );
   return accounts;
 }
 
