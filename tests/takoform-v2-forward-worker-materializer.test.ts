@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bytesDigest, canonicalJson } from "../src/json.ts";
+import { bytesDigest, canonicalJson, isJsonObject } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject } from "../src/ports.ts";
 import { WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE } from "../src/providers/workerd-v2-private-binding-names.ts";
@@ -667,6 +667,8 @@ test("forward07 CREATE seals synthetic sensitive vars and reads only the exact h
       custody: f.custody,
     });
     expect(await old.read(input)).toBeNull();
+    const deniedSpec = version.spec;
+    if (!isJsonObject(deniedSpec)) throw new Error("missing JSON version spec");
     const deniedBefore = await f.sql.query("SELECT COUNT(*) AS n FROM tf_v2_operations");
     f.denyRead();
     await expect(
@@ -677,7 +679,7 @@ test("forward07 CREATE seals synthetic sensitive vars and reads only the exact h
           form: FORWARD_WORKER_VERSION_FORM_URL,
           space: "space",
           name: "denied",
-          spec: { ...version.spec },
+          spec: deniedSpec,
           privateInputs: { TOKEN: "synthetic-forward-value" },
         },
       }),
