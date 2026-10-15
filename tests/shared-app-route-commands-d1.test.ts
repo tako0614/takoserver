@@ -496,6 +496,33 @@ test("native D1 owner collision guard refuses a foreign host projection without 
   }
 });
 
+test("native D1 preserves the existing v2 owner's qualified255-character target key exactly", async () => {
+  const h = await harness();
+  try {
+    const { owner, active } = await start(h);
+    const command = input(active, 2, "immutable-script-two");
+    const targetKey = `target/${"q".repeat(248)}`;
+    const qualified = { ...command, accepted: { ...command.accepted, targetKey } };
+    await accept(h.sql, qualified);
+    const plan = owner.prepareAdvance(qualified, guards(qualified));
+    await h.sql.batch(batch(plan));
+    expect((await owner.settleRoute(plan.original, "acknowledged")).original.targetKey).toBe(
+      targetKey,
+    );
+    expect(await h.sql.query("SELECT target_key FROM fixture_routes")).toEqual([
+      { target_key: targetKey },
+    ]);
+    expect(() =>
+      owner.prepareAdvance(
+        { ...qualified, accepted: { ...qualified.accepted, targetKey: `${targetKey}x` } },
+        guards(qualified),
+      ),
+    ).toThrow(expect.objectContaining({ code: "invalid_argument" }));
+  } finally {
+    await h.close();
+  }
+});
+
 test("native D1 snapshots trusted input/guards before await and lost ACK retains exact original command", async () => {
   const h = await harness();
   try {
