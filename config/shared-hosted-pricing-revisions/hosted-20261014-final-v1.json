@@ -1,0 +1,111 @@
+{
+  "schemaVersion": 2,
+  "products": ["takoserver", "takosumi-hosted"],
+  "currency": "USD",
+  "moneyUnit": "USD-micros",
+  "revision": "hosted-20261014-final-v1",
+  "freeIncludedMicros": "1500000",
+  "plans": [
+    {
+      "planId": "hosted-10",
+      "monthlyPriceMicros": "10000000",
+      "includedMicros": "20000000",
+      "stripePriceId": null
+    },
+    {
+      "planId": "hosted-50",
+      "monthlyPriceMicros": "50000000",
+      "includedMicros": "100000000",
+      "stripePriceId": null
+    }
+  ],
+  "purchase": "face-value",
+  "markupMultiplier": 3,
+  "warningBasisPoints": [8000, 9500],
+  "defaultOnLimit": "stop",
+  "postpaid": "unsupported",
+  "freePaidStacking": false,
+  "shortWindowLimits": null,
+  "meters": {
+    "wfp.requests": {
+      "unit": "request",
+      "cloudflareCostMicros": "300000",
+      "quantity": "1000000"
+    },
+    "workers.requests": {
+      "unit": "request",
+      "cloudflareCostMicros": "300000",
+      "quantity": "1000000"
+    },
+    "wfp.cpu-ms": {
+      "unit": "ms",
+      "cloudflareCostMicros": "20000",
+      "quantity": "1000000"
+    },
+    "workers.cpu-ms": {
+      "unit": "ms",
+      "cloudflareCostMicros": "20000",
+      "quantity": "1000000"
+    },
+    "d1.rows-read": {
+      "unit": "row",
+      "cloudflareCostMicros": "1000",
+      "quantity": "1000000"
+    },
+    "d1.rows-written": {
+      "unit": "row",
+      "cloudflareCostMicros": "1000000",
+      "quantity": "1000000"
+    },
+    "d1.storage": {
+      "unit": "GB-month",
+      "cloudflareCostMicros": "750000",
+      "quantity": "1"
+    },
+    "r2.storage": {
+      "unit": "GB-month",
+      "cloudflareCostMicros": "15000",
+      "quantity": "1"
+    },
+    "r2.class-a": {
+      "unit": "operation",
+      "cloudflareCostMicros": "4500000",
+      "quantity": "1000000"
+    },
+    "r2.class-b": {
+      "unit": "operation",
+      "cloudflareCostMicros": "360000",
+      "quantity": "1000000"
+    },
+    "kv.read": {
+      "unit": "key",
+      "cloudflareCostMicros": "500000",
+      "quantity": "1000000"
+    },
+    "kv.write": {
+      "unit": "key",
+      "cloudflareCostMicros": "5000000",
+      "quantity": "1000000"
+    },
+    "kv.delete": {
+      "unit": "key",
+      "cloudflareCostMicros": "5000000",
+      "quantity": "1000000"
+    },
+    "kv.list": {
+      "unit": "request",
+      "cloudflareCostMicros": "5000000",
+      "quantity": "1000000"
+    },
+    "kv.storage": {
+      "unit": "GB-month",
+      "cloudflareCostMicros": "500000",
+      "quantity": "1"
+    },
+    "egress": {
+      "unit": "byte",
+      "cloudflareCostMicros": "0",
+      "quantity": "1"
+    }
+  }
+}

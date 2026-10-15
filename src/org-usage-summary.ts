@@ -1,4 +1,5 @@
-import type { Row, Sql } from "./ports.ts";
+import { hostedCreditLotProvenanceSql } from "./ledger.ts";
+import type { Row, Sql, SqlStatement } from "./ports.ts";
 
 export interface OrgUsageSummary {
   readonly organizationId: string;
@@ -50,20 +51,28 @@ function canonicalTime(value: unknown): string {
  * The Hosted variant alone mentions migration 0095, so legacy self-hosted
  * wallets never resolve a table they may not have.
  */
-export async function readOrgUsageSummary(input: {
-  readonly sql: Sql;
+export interface OrgUsageSummaryReadInput {
   readonly organizationId: string;
   readonly instant: string;
   readonly hostedPaidFreeExclusion: boolean;
-}): Promise<OrgUsageSummary> {
-  const { sql, organizationId: org, instant, hostedPaidFreeExclusion: hosted } = input;
+  readonly hostedCreditProvenance?: boolean;
+}
+
+export async function readOrgUsageSummary(
+  input: OrgUsageSummaryReadInput & { readonly sql: Sql },
+): Promise<OrgUsageSummary> {
+  const statement = orgUsageSummaryReadStatement(input);
+  return parseOrgUsageSummaryRows(await input.sql.query(statement.sql, statement.params), input);
+}
+
+/** Reused inside atomic INSERT SELECT so entitlement and Workspace totals share one snapshot. */
+export function orgUsageSummaryReadStatement(input: OrgUsageSummaryReadInput): SqlStatement {
+  const { organizationId: org, instant, hostedPaidFreeExclusion: hosted } = input;
   canonicalTime(instant);
   const month = instant.slice(0, 7);
-  const monthStart = `${month}-01T00:00:00.000Z`;
-  const monthEndDate = new Date(monthStart);
-  monthEndDate.setUTCMonth(monthEndDate.getUTCMonth() + 1);
-  const monthEnd = monthEndDate.toISOString();
   const freeRef = `free:${org}:${month}`;
+  const provenance =
+    input.hostedCreditProvenance === true ? hostedCreditLotProvenanceSql(hosted) : "1";
   const paid = hosted
     ? `SELECT g.funding_ref, g.kind, g.consumption_class, g.amount_micros,
               g.period_start, g.period_end,
@@ -98,10 +107,10 @@ export async function readOrgUsageSummary(input: {
   const paidFreeExclusion = hosted
     ? "AND (l.consumption_class <> 'free' OR NOT EXISTS (SELECT 1 FROM paid))"
     : "";
-  const rows = await sql.query(
-    `WITH paid AS (${paid}),
+  return {
+    sql: `WITH paid AS (${paid}),
       additional AS (
-        SELECT l.kind, l.consumption_class,
+        SELECT l.kind, l.consumption_class, (${provenance}) AS provenance_verified,
           l.amount_micros
           - COALESCE((SELECT SUM(a.amount_micros) FROM wallet_credit_allocations a
               WHERE a.org_id = l.org_id AND a.lot_ref = l.ref
@@ -130,9 +139,9 @@ export async function readOrgUsageSummary(input: {
         WHERE a.org_id = s.org_id AND a.lot_ref = COALESCE(p.funding_ref, s.ref)
           AND a.debit_type = 'hold'), 0) AS held_micros,
       COALESCE((SELECT SUM(available_micros) FROM additional
-        WHERE consumption_class = 'purchased'), 0) AS purchased_available,
+        WHERE consumption_class = 'purchased' AND provenance_verified = 1), 0) AS purchased_available,
       COALESCE((SELECT SUM(available_micros) FROM additional
-        WHERE kind = 'direct' AND consumption_class <> 'purchased'), 0) AS direct_available,
+        WHERE kind = 'direct' AND (consumption_class <> 'purchased' OR provenance_verified = 0)), 0) AS direct_available,
       (SELECT MIN(available_micros) FROM additional) AS additional_min
     FROM org_wallet_grant_snapshots s
     LEFT JOIN org_wallet_monthly_tariffs t ON t.month = ?
@@ -140,11 +149,30 @@ export async function readOrgUsageSummary(input: {
     LEFT JOIN wallet_credit_lots l ON l.org_id = s.org_id
       AND l.ref = COALESCE(p.funding_ref, s.ref)
     WHERE s.org_id = ? AND s.ref = ?`,
-    [...(hosted ? [org, instant, instant] : []), org, instant, month, org, freeRef],
-  );
+    params: [...(hosted ? [org, instant, instant] : []), org, instant, month, org, freeRef],
+  };
+}
+
+export function parseOrgUsageSummaryRows(
+  rows: readonly Row[],
+  input: OrgUsageSummaryReadInput,
+): OrgUsageSummary {
+  const { organizationId: org, instant } = input;
+  canonicalTime(instant);
+  const month = instant.slice(0, 7);
+  const monthStart = `${month}-01T00:00:00.000Z`;
+  const monthEndDate = new Date(monthStart);
+  monthEndDate.setUTCMonth(monthEndDate.getUTCMonth() + 1);
+  const monthEnd = monthEndDate.toISOString();
+  const freeRef = `free:${org}:${month}`;
   if (rows.length !== 1) return unavailable();
   const row = rows[0];
-  if (!row || micros(row, "paid_count") > 1 || micros(row, "pending_fence") !== 0)
+  if (
+    !row ||
+    row.org_id !== org ||
+    micros(row, "paid_count") > 1 ||
+    micros(row, "pending_fence") !== 0
+  )
     return unavailable();
   const paidCurrent = micros(row, "paid_count") === 1;
   if (

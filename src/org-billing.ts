@@ -8,18 +8,39 @@ import { base64UrlDecode, base64UrlEncode, canonicalJson } from "./json.ts";
 import {
   hostedPaidFreeBlockedParams,
   hostedPaidFreeBlockedSql,
+  invoiceCreditPeriodEligibleParams,
+  invoiceCreditPeriodEligibleSql,
   type Ledger,
   LedgerError,
   prepareLedgerAllocation,
+  stripeInvoiceGrantSchemaReady,
   stripeRefundSchemaReady,
   type Wallet,
 } from "./ledger.ts";
 import { MoneyError, minorToMicros } from "./money.ts";
 import {
+  type OrgLimitAdmission,
+  type OrgLimitPolicy,
+  OrgLimitPolicyError,
+} from "./org-limit-policy.ts";
+import {
   type OrgUsageSummary,
   OrgUsageSummaryUnavailable,
+  orgUsageSummaryReadStatement,
   readOrgUsageSummary,
 } from "./org-usage-summary.ts";
+import {
+  assertWorkspaceOwner,
+  measuredAttributionInterval,
+  measuredAttributionStatement,
+  OrgWorkspaceUsageError,
+  type OrgWorkspaceUsagePage,
+  readOrgWorkspaceUsage,
+  validateWorkspaceRef,
+  type WorkspaceUsageOptions,
+  workspaceAttributionSchemaReady,
+  workspaceBindingStatement,
+} from "./org-workspace-usage.ts";
 import { type Clock, type Row, type Sql, SqlError, type SqlStatement } from "./ports.ts";
 
 export class OrgBillingError extends Error {
@@ -35,6 +56,9 @@ export class OrgBillingError extends Error {
 export interface HoldReceipt {
   readonly organizationId: string;
   readonly reference: string;
+  readonly workspaceRef: string | null;
+  readonly attributionPeriodStart: string | null;
+  readonly attributionPeriodEnd: string | null;
   readonly moneyPolicy: MoneyPolicy;
   readonly amountMicros: number;
   readonly pricingRevision: string | null;
@@ -51,6 +75,9 @@ export interface HoldReceipt {
 export interface UsageReceipt {
   readonly organizationId: string;
   readonly reference: string;
+  readonly workspaceRef: string | null;
+  readonly attributionPeriodStart: string | null;
+  readonly attributionPeriodEnd: string | null;
   readonly moneyPolicy: MoneyPolicy;
   readonly pricingRevision: string;
   readonly meter: string;
@@ -83,6 +110,7 @@ export interface CreditLot {
 export type MoneyPolicy = "usd-cents-v1" | "usd-micros-v2";
 
 export interface HoldInput {
+  readonly workspaceRef?: string;
   readonly organizationId: string;
   readonly reference: string;
   readonly amountMicros: number;
@@ -99,6 +127,7 @@ export interface CaptureInput {
 }
 
 export interface UsageInput {
+  readonly workspaceRef?: string;
   readonly organizationId: string;
   readonly reference: string;
   readonly meter: string;
@@ -124,6 +153,10 @@ export interface LotPage {
 export interface OrgBilling {
   wallet(organizationId: string): Promise<Wallet>;
   usageSummary(organizationId: string): Promise<OrgUsageSummary>;
+  workspaceUsage(
+    organizationId: string,
+    options?: WorkspaceUsageOptions,
+  ): Promise<OrgWorkspaceUsagePage>;
   lots(organizationId: string, limit?: number, cursor?: string): Promise<LotPage>;
   hold(input: HoldInput): Promise<HoldReceipt>;
   readHold(organizationId: string, reference: string): Promise<HoldReceipt>;
@@ -245,6 +278,12 @@ export function createOrgBilling(options: {
   readonly ledger: Ledger;
   readonly config: BillingConfig;
   readonly hostedPaidFreeExclusion?: boolean;
+  /** Hosted composition requires explicit attribution for new admissions; old receipts still replay. */
+  readonly requireWorkspaceAttribution?: boolean;
+  readonly limitPolicy?: Pick<
+    OrgLimitPolicy,
+    "prepareAdmission" | "observeUsageSummary" | "warningStatements"
+  >;
 }): OrgBilling {
   const { sql, clock, ledger, config } = options;
   const hostedPaidFreeExclusion = options.hostedPaidFreeExclusion === true;
@@ -347,6 +386,21 @@ export function createOrgBilling(options: {
       });
   }
 
+  function usageWarningStatements(org: string, instant: string): readonly SqlStatement[] {
+    return (
+      options.limitPolicy?.warningStatements({
+        organizationId: org,
+        instant,
+        summaryRead: orgUsageSummaryReadStatement({
+          organizationId: org,
+          instant,
+          hostedPaidFreeExclusion,
+          hostedCreditProvenance: true,
+        }),
+      }) ?? []
+    );
+  }
+
   async function close(
     row: Row,
     state: "captured" | "released" | "expired",
@@ -433,6 +487,7 @@ export function createOrgBilling(options: {
     if (captured > 0) guards.push(entry(org, "capture", ledgerRef, -captured, -captured, instant));
     if (amount > captured)
       guards.push(entry(org, "release", ledgerRef, 0, captured - amount, instant));
+    guards.push(...usageWarningStatements(org, instant));
     guards.push({
       sql: `DELETE FROM wallet_allocation_guards WHERE id IN (${captured > 0 && refundSchema ? "?, ?, ?" : "?, ?"})`,
       params:
@@ -482,12 +537,16 @@ export function createOrgBilling(options: {
     async usageSummary(org) {
       try {
         await prepare(org);
-        return await readOrgUsageSummary({
+        const summary = await readOrgUsageSummary({
           sql,
           organizationId: org,
           instant: now(),
           hostedPaidFreeExclusion,
+          hostedCreditProvenance: options.limitPolicy !== undefined,
         });
+        if (options.limitPolicy)
+          await workspaceOperation(options.limitPolicy.observeUsageSummary(summary));
+        return summary;
       } catch (error) {
         if (
           error instanceof OrgUsageSummaryUnavailable ||
@@ -499,8 +558,23 @@ export function createOrgBilling(options: {
         throw error;
       }
     },
+    async workspaceUsage(org, query) {
+      // Continuations read durable rows without sweeping or opening a new period.
+      if (query?.cursor === undefined) await prepare(org);
+      return workspaceOperation(
+        readOrgWorkspaceUsage({
+          sql,
+          organizationId: org,
+          instant: now(),
+          hostedPaidFreeExclusion,
+          hostedCreditProvenance: options.limitPolicy !== undefined,
+          ...(query === undefined ? {} : { options: query }),
+        }),
+      );
+    },
     async lots(org, limit = 100, cursor) {
       const refundSchema = await refundsReady();
+      const invoiceGrantsReady = await stripeInvoiceGrantSchemaReady(sql);
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100)
         orgBillingFail("invalid_limit", 400);
       let after: Row | undefined;
@@ -554,7 +628,8 @@ export function createOrgBilling(options: {
               ? `EXISTS (SELECT 1 FROM stripe_billing_fences f
              WHERE f.org_id = l.org_id AND f.funding_ref = l.ref AND f.active = 1)`
               : "0"
-          } AS frozen
+          } AS frozen,
+          ${invoiceGrantsReady ? invoiceCreditPeriodEligibleSql : "1"} AS invoice_period_eligible
          FROM (SELECT * FROM wallet_credit_lots WHERE org_id = ? ${boundary}
            ORDER BY CASE consumption_class WHEN 'free' THEN 0 WHEN 'subscription' THEN 1 ELSE 2 END,
              CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END, expires_at, created_at, ref LIMIT ?) l
@@ -564,6 +639,7 @@ export function createOrgBilling(options: {
            CASE WHEN l.expires_at IS NULL THEN 1 ELSE 0 END, l.expires_at, l.created_at, l.ref`,
         after
           ? [
+              ...(invoiceGrantsReady ? invoiceCreditPeriodEligibleParams(instant) : []),
               org,
               classRank,
               nullableRank,
@@ -572,7 +648,11 @@ export function createOrgBilling(options: {
               String(after.ref),
               limit + 1,
             ]
-          : [org, limit + 1],
+          : [
+              ...(invoiceGrantsReady ? invoiceCreditPeriodEligibleParams(instant) : []),
+              org,
+              limit + 1,
+            ],
       );
       const page = rows.slice(0, limit);
       const last = page.at(-1);
@@ -594,6 +674,7 @@ export function createOrgBilling(options: {
           frozen: Number(row.frozen) === 1,
           availableMicros:
             !Number(row.frozen) &&
+            Number(row.invoice_period_eligible) === 1 &&
             !(hostedPaidFreeExclusion && row.consumption_class === "free" && paidFreeBlocked) &&
             (row.expires_at == null || String(row.expires_at) > instant)
               ? remainingMicros - heldMicros
@@ -612,10 +693,12 @@ export function createOrgBilling(options: {
       reference(input.reference);
       spendableMicros(input.amountMicros);
       fingerprint(input.measurementFingerprint);
+      if (input.workspaceRef !== undefined) workspaceReference(input.workspaceRef);
       const signature = JSON.stringify([
         input.amountMicros,
         input.pricingRevision,
         input.measurementFingerprint,
+        ...(input.workspaceRef === undefined ? [] : [{ workspaceRef: input.workspaceRef }]),
       ]);
       await prepare(input.organizationId);
       const prior = await held(input.organizationId, input.reference);
@@ -623,6 +706,15 @@ export function createOrgBilling(options: {
         if (prior.money_policy !== "usd-micros-v2") orgBillingFail("reference_conflict", 409);
         if (prior.fingerprint !== signature) orgBillingFail("reference_conflict", 409);
         return current(prior);
+      }
+      if (options.requireWorkspaceAttribution === true && input.workspaceRef === undefined)
+        orgBillingFail("invalid_reference", 400);
+      const structured = await workspaceOperation(workspaceAttributionSchemaReady(sql));
+      if (input.workspaceRef !== undefined) {
+        if (!structured) orgBillingFail("billing_schema_not_ready", 503);
+        await workspaceOperation(
+          assertWorkspaceOwner(sql, input.organizationId, input.workspaceRef),
+        );
       }
       const tariff = await tariffAt(now());
       if (!tariff || input.pricingRevision !== tariff.revision)
@@ -646,6 +738,11 @@ export function createOrgBilling(options: {
         ).length
       )
         orgBillingFail("refund_receivable", 409);
+      const admission = options.limitPolicy
+        ? await workspaceOperation(options.limitPolicy.prepareAdmission(input.organizationId))
+        : undefined;
+      if (admission && !structured) orgBillingFail("billing_schema_not_ready", 503);
+      const admissionJson = admission ? admissionWitness(admission) : undefined;
       const instant = now();
       const expiresAt = new Date(Date.parse(instant) + tariff.holdTtlSeconds * 1000).toISOString();
       const ledgerRef = `org-hold:${input.reference}`;
@@ -663,12 +760,31 @@ export function createOrgBilling(options: {
                 heldDeltaMicros: input.amountMicros,
                 now: instant,
                 hostedPaidFreeExclusion,
+                ...(admission ? { allocationAdmission: admission } : {}),
               });
+        const summaryRead = structured
+          ? orgUsageSummaryReadStatement({
+              organizationId: input.organizationId,
+              instant,
+              hostedPaidFreeExclusion,
+            })
+          : undefined;
         await sql.batch([
+          ...(admission && input.amountMicros === 0 ? [admission.guard] : []),
+          ...(input.workspaceRef === undefined
+            ? []
+            : [workspaceBindingStatement(input.organizationId, input.workspaceRef, instant)]),
           {
-            sql: `INSERT INTO org_wallet_holds (org_id, ref, ledger_ref, amount_micros, fingerprint, pricing_revision, created_at, expires_at, state, money_policy)
+            sql: summaryRead
+              ? `WITH summary AS (${summaryRead.sql})
+                INSERT INTO org_wallet_holds (org_id, ref, ledger_ref, amount_micros, fingerprint, pricing_revision, created_at, expires_at, state, money_policy, workspace_ref, attribution_period_start, attribution_period_end${admissionJson === undefined ? "" : ", admission_policy_json"})
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?, 'live', 'usd-micros-v2', ?, COALESCE(paid_start, ?), COALESCE(paid_end, snapshot_end)${admissionJson === undefined ? "" : ", ?"} FROM summary
+                WHERE paid_count <= 1 AND pending_fence = 0
+                  ${input.workspaceRef === undefined ? "" : "AND EXISTS (SELECT 1 FROM org_wallet_workspace_bindings WHERE org_id = ? AND workspace_ref = ?)"}`
+              : `INSERT INTO org_wallet_holds (org_id, ref, ledger_ref, amount_micros, fingerprint, pricing_revision, created_at, expires_at, state, money_policy)
                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'live', 'usd-micros-v2')`,
             params: [
+              ...(summaryRead?.params ?? []),
               input.organizationId,
               input.reference,
               ledgerRef,
@@ -677,11 +793,21 @@ export function createOrgBilling(options: {
               input.pricingRevision,
               instant,
               expiresAt,
+              ...(summaryRead
+                ? [
+                    input.workspaceRef ?? null,
+                    `${instant.slice(0, 7)}-01T00:00:00.000Z`,
+                    ...(admissionJson === undefined ? [] : [admissionJson]),
+                    ...(input.workspaceRef === undefined
+                      ? []
+                      : [input.organizationId, input.workspaceRef]),
+                  ]
+                : []),
             ],
           },
           guard(
             admissionGuard,
-            `NOT EXISTS (SELECT 1 FROM org_wallet_usage_records WHERE org_id = ? AND state = 'pending')
+            `changes() = 1 AND NOT EXISTS (SELECT 1 FROM org_wallet_usage_records WHERE org_id = ? AND state = 'pending')
              ${refundSchema ? "AND NOT EXISTS (SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0)" : ""}
              AND NOT EXISTS (SELECT 1 FROM ledger WHERE org_id = ? AND ref = ? AND type IN ('hold', 'capture', 'release'))`,
             refundSchema
@@ -689,7 +815,9 @@ export function createOrgBilling(options: {
               : [input.organizationId, input.organizationId, ledgerRef],
           ),
           ...allocation,
+          ...usageWarningStatements(input.organizationId, instant),
           { sql: "DELETE FROM wallet_allocation_guards WHERE id = ?", params: [admissionGuard] },
+          ...(admission && input.amountMicros === 0 ? [admission.cleanup] : []),
         ]);
       } catch (error) {
         const replay = await held(input.organizationId, input.reference);
@@ -698,6 +826,11 @@ export function createOrgBilling(options: {
           if (replay.fingerprint !== signature) orgBillingFail("reference_conflict", 409);
           return service.readHold(input.organizationId, input.reference);
         }
+        if (input.workspaceRef !== undefined)
+          await workspaceOperation(
+            assertWorkspaceOwner(sql, input.organizationId, input.workspaceRef),
+          );
+        if (admission) await assertAdmissionCurrent(sql, input.organizationId, admission);
         if (
           (
             await sql.query(
@@ -795,6 +928,7 @@ export function createOrgBilling(options: {
       canonicalTime(input.periodEnd);
       if (input.periodStart >= input.periodEnd || input.periodEnd > now())
         orgBillingFail("invalid_usage_period", 400);
+      if (input.workspaceRef !== undefined) workspaceReference(input.workspaceRef);
       const signature = JSON.stringify([
         input.meter,
         input.quantity,
@@ -804,12 +938,22 @@ export function createOrgBilling(options: {
         input.pricingRevision,
         input.expectedMicros,
         input.measurementFingerprint,
+        ...(input.workspaceRef === undefined ? [] : [{ workspaceRef: input.workspaceRef }]),
       ]);
       await prepare(input.organizationId);
       let row = await usageRow(input.organizationId, input.reference);
       if (row && row.money_policy !== "usd-micros-v2") orgBillingFail("reference_conflict", 409);
       if (row && row.fingerprint !== signature) orgBillingFail("reference_conflict", 409);
       if (!row) {
+        if (options.requireWorkspaceAttribution === true && input.workspaceRef === undefined)
+          orgBillingFail("invalid_reference", 400);
+        const structured = await workspaceOperation(workspaceAttributionSchemaReady(sql));
+        if (input.workspaceRef !== undefined) {
+          if (!structured) orgBillingFail("billing_schema_not_ready", 503);
+          await workspaceOperation(
+            assertWorkspaceOwner(sql, input.organizationId, input.workspaceRef),
+          );
+        }
         if (
           refundSchema &&
           (
@@ -836,6 +980,17 @@ export function createOrgBilling(options: {
           ).length
         )
           orgBillingFail("usage_period_crosses_tariff", 409);
+        const attribution = structured
+          ? await workspaceOperation(
+              measuredAttributionInterval({
+                sql,
+                organizationId: input.organizationId,
+                periodStart: input.periodStart,
+                periodEnd: input.periodEnd,
+                hostedPaidFreeExclusion,
+              }),
+            )
+          : undefined;
         const byteHours = meter.unit === "byte-hour";
         if (
           byteHours
@@ -856,12 +1011,30 @@ export function createOrgBilling(options: {
           throw error;
         }
         if (amount !== input.expectedMicros) orgBillingFail("measurement_conflict", 409);
+        const admission = options.limitPolicy
+          ? await workspaceOperation(options.limitPolicy.prepareAdmission(input.organizationId))
+          : undefined;
+        if (admission && !structured) orgBillingFail("billing_schema_not_ready", 503);
+        const admissionJson = admission ? admissionWitness(admission) : undefined;
         try {
-          await sql.run(
-            `INSERT INTO org_wallet_usage_records (org_id, ref, fingerprint, pricing_revision, meter, quantity, quantity_unit, period_start, period_end, rate_numerator_micros, rate_denominator, amount_micros, state, created_at, money_policy)
-                         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'usd-micros-v2'
-                         ${refundSchema ? "WHERE NOT EXISTS (SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0)" : ""}`,
-            [
+          const instant = now();
+          const intervalRead = attribution
+            ? measuredAttributionStatement({
+                organizationId: input.organizationId,
+                periodStart: input.periodStart,
+                periodEnd: input.periodEnd,
+                hostedPaidFreeExclusion,
+              })
+            : undefined;
+          const insert: SqlStatement = {
+            sql: `${intervalRead ? `WITH interval AS (${intervalRead.sql})` : ""}
+                     INSERT INTO org_wallet_usage_records (org_id, ref, fingerprint, pricing_revision, meter, quantity, quantity_unit, period_start, period_end, rate_numerator_micros, rate_denominator, amount_micros, state, created_at, money_policy${attribution ? ", workspace_ref, attribution_period_start, attribution_period_end" : ""}${admissionJson === undefined ? "" : ", admission_policy_json"})
+                         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, 'usd-micros-v2'${attribution ? ", ?, interval.period_start, interval.period_end" : ""}${admissionJson === undefined ? "" : ", ?"}${attribution ? " FROM interval" : ""}
+                         WHERE 1 = 1 ${attribution ? "AND interval.period_count <= 1 AND interval.crosses = 0" : ""}
+                         ${refundSchema ? "AND NOT EXISTS (SELECT 1 FROM stripe_billing_refunds WHERE org_id = ? AND receivable_micros > 0)" : ""}
+                         ${input.workspaceRef === undefined ? "" : "AND EXISTS (SELECT 1 FROM org_wallet_workspace_bindings WHERE org_id = ? AND workspace_ref = ?)"}`,
+            params: [
+              ...(intervalRead?.params ?? []),
               input.organizationId,
               input.reference,
               signature,
@@ -874,14 +1047,37 @@ export function createOrgBilling(options: {
               meter.rate.numeratorMicros,
               meter.rate.denominator,
               amount,
-              now(),
+              instant,
+              ...(attribution ? [input.workspaceRef ?? null] : []),
+              ...(admissionJson === undefined ? [] : [admissionJson]),
               ...(refundSchema ? [input.organizationId] : []),
+              ...(input.workspaceRef === undefined
+                ? []
+                : [input.organizationId, input.workspaceRef]),
             ],
-          );
+          };
+          const pendingGuard = `guard_${crypto.randomUUID()}`;
+          await sql.batch([
+            ...(admission ? [admission.guard] : []),
+            ...(input.workspaceRef === undefined
+              ? []
+              : [workspaceBindingStatement(input.organizationId, input.workspaceRef, instant)]),
+            insert,
+            guard(pendingGuard, "changes() = 1"),
+            { sql: "DELETE FROM wallet_allocation_guards WHERE id = ?", params: [pendingGuard] },
+            ...(admission ? [admission.cleanup] : []),
+          ]);
         } catch (error) {
-          if (!(error instanceof SqlError && error.code === "constraint")) throw error;
+          // The pending row may have committed even when its batch ACK was lost.
+          // Read its immutable receipt before deciding whether insertion failed.
+          if (!(error instanceof SqlError)) throw error;
         }
         row = await usageRow(input.organizationId, input.reference);
+        if (!row && admission) await assertAdmissionCurrent(sql, input.organizationId, admission);
+        if (!row && input.workspaceRef !== undefined)
+          await workspaceOperation(
+            assertWorkspaceOwner(sql, input.organizationId, input.workspaceRef),
+          );
         if (
           !row &&
           refundSchema &&
@@ -893,6 +1089,16 @@ export function createOrgBilling(options: {
           ).length
         )
           orgBillingFail("refund_receivable", 409);
+        if (!row && attribution)
+          await workspaceOperation(
+            measuredAttributionInterval({
+              sql,
+              organizationId: input.organizationId,
+              periodStart: input.periodStart,
+              periodEnd: input.periodEnd,
+              hostedPaidFreeExclusion,
+            }),
+          );
         if (!row) orgBillingFail("billing_unavailable", 503);
         if (row.money_policy !== "usd-micros-v2") orgBillingFail("reference_conflict", 409);
         if (row.fingerprint !== signature) orgBillingFail("reference_conflict", 409);
@@ -909,6 +1115,7 @@ export function createOrgBilling(options: {
       )
         orgBillingFail("refund_receivable", 409);
       const amount = Number(row.amount_micros);
+      const pinnedAdmission = pinnedUsageAdmission(row, options.limitPolicy !== undefined);
       const instant = now();
       try {
         const allocation =
@@ -923,9 +1130,11 @@ export function createOrgBilling(options: {
                 heldDeltaMicros: 0,
                 now: instant,
                 hostedPaidFreeExclusion,
+                ...(pinnedAdmission ? { allocationAdmission: pinnedAdmission } : {}),
               });
         const guardId = `guard_${crypto.randomUUID()}`;
         await sql.batch([
+          ...(pinnedAdmission && amount === 0 ? [pinnedAdmission.guard] : []),
           {
             sql: "UPDATE org_wallet_usage_records SET state = 'paid', paid_at = ? WHERE org_id = ? AND ref = ? AND state = 'pending'",
             params: [instant, input.organizationId, input.reference],
@@ -936,7 +1145,9 @@ export function createOrgBilling(options: {
             refundSchema ? [input.organizationId] : [],
           ),
           ...allocation,
+          ...usageWarningStatements(input.organizationId, instant),
           { sql: "DELETE FROM wallet_allocation_guards WHERE id = ?", params: [guardId] },
+          ...(pinnedAdmission && amount === 0 ? [pinnedAdmission.cleanup] : []),
         ]);
       } catch (error) {
         const replay = await usageRow(input.organizationId, input.reference);
@@ -1037,6 +1248,9 @@ function holdReceipt(row: Row): HoldReceipt {
   return {
     organizationId: String(row.org_id),
     reference: String(row.ref),
+    workspaceRef: nullable(row.workspace_ref),
+    attributionPeriodStart: nullable(row.attribution_period_start),
+    attributionPeriodEnd: nullable(row.attribution_period_end),
     moneyPolicy: row.money_policy as MoneyPolicy,
     amountMicros: Number(row.amount_micros),
     pricingRevision: nullable(row.pricing_revision),
@@ -1054,6 +1268,9 @@ function usageReceipt(row: Row): UsageReceipt {
   return {
     organizationId: String(row.org_id),
     reference: String(row.ref),
+    workspaceRef: nullable(row.workspace_ref),
+    attributionPeriodStart: nullable(row.attribution_period_start),
+    attributionPeriodEnd: nullable(row.attribution_period_end),
     moneyPolicy: row.money_policy as MoneyPolicy,
     pricingRevision: String(row.pricing_revision),
     meter: String(row.meter),
@@ -1131,4 +1348,108 @@ function canonicalTime(value: string): void {
     new Date(value).toISOString() !== value
   )
     orgBillingFail("invalid_usage_period", 400);
+}
+
+function workspaceReference(value: string): void {
+  try {
+    validateWorkspaceRef(value);
+  } catch (error) {
+    if (error instanceof OrgWorkspaceUsageError)
+      orgBillingFail(
+        error.code === "invalid_workspace_ref" ? "invalid_reference" : error.code,
+        error.status,
+      );
+    throw error;
+  }
+}
+async function workspaceOperation<T>(operation: Promise<T>): Promise<T> {
+  try {
+    return await operation;
+  } catch (error) {
+    if (error instanceof OrgWorkspaceUsageError || error instanceof OrgLimitPolicyError)
+      orgBillingFail(
+        error.code === "invalid_workspace_ref" ? "invalid_reference" : error.code,
+        error.status,
+      );
+    if (error instanceof OrgUsageSummaryUnavailable || error instanceof SqlError)
+      orgBillingFail("billing_unavailable", 503);
+    throw error;
+  }
+}
+
+function admissionWitness(admission: OrgLimitAdmission): string {
+  return canonicalJson({
+    onLimit: admission.onLimit,
+    policyVersion: admission.policyVersion,
+    consentRevision: admission.consentRevision,
+    allowPurchasedCredit: admission.allowPurchasedCredit,
+  });
+}
+async function assertAdmissionCurrent(
+  sql: Sql,
+  org: string,
+  admission: OrgLimitAdmission,
+): Promise<void> {
+  const row = (
+    await sql.query(
+      "SELECT COALESCE((SELECT policy_version FROM org_wallet_limit_policies WHERE org_id = ?), 0) AS version",
+      [org],
+    )
+  )[0];
+  if (!row || row.version !== admission.policyVersion) orgBillingFail("conflict", 409);
+}
+function pinnedUsageAdmission(
+  row: Row,
+  conservativeLegacyAdmission: boolean,
+):
+  | {
+      readonly allowPurchasedCredit: boolean;
+      readonly guard: SqlStatement;
+      readonly cleanup: SqlStatement;
+    }
+  | undefined {
+  if (row.admission_policy_json == null) {
+    if (!conservativeLegacyAdmission) return undefined;
+    // Legacy pending usage proves consumption, but has no immutable purchase
+    // consent. Hosted can settle it from included credit without inventing one.
+    const id = `guard_${crypto.randomUUID()}`;
+    return {
+      allowPurchasedCredit: false,
+      guard: guard(
+        id,
+        "EXISTS (SELECT 1 FROM org_wallet_usage_records WHERE org_id = ? AND ref = ? AND admission_policy_json IS NULL)",
+        [String(row.org_id), String(row.ref)],
+      ),
+      cleanup: { sql: "DELETE FROM wallet_allocation_guards WHERE id = ?", params: [id] },
+    };
+  }
+  let witness: unknown;
+  try {
+    witness = JSON.parse(String(row.admission_policy_json));
+  } catch {
+    orgBillingFail("billing_unavailable", 503);
+  }
+  if (!witness || typeof witness !== "object" || Array.isArray(witness))
+    orgBillingFail("billing_unavailable", 503);
+  const p = witness as Record<string, unknown>;
+  if (
+    (p.onLimit !== "stop" && p.onLimit !== "prepaid") ||
+    typeof p.policyVersion !== "number" ||
+    !Number.isSafeInteger(p.policyVersion) ||
+    p.policyVersion < 0 ||
+    (p.consentRevision !== null && typeof p.consentRevision !== "string") ||
+    typeof p.allowPurchasedCredit !== "boolean" ||
+    p.allowPurchasedCredit !== (p.onLimit === "prepaid")
+  )
+    orgBillingFail("billing_unavailable", 503);
+  const id = `guard_${crypto.randomUUID()}`;
+  return {
+    allowPurchasedCredit: p.allowPurchasedCredit,
+    guard: guard(
+      id,
+      "EXISTS (SELECT 1 FROM org_wallet_usage_records WHERE org_id = ? AND ref = ? AND admission_policy_json = ?)",
+      [String(row.org_id), String(row.ref), String(row.admission_policy_json)],
+    ),
+    cleanup: { sql: "DELETE FROM wallet_allocation_guards WHERE id = ?", params: [id] },
+  };
 }
