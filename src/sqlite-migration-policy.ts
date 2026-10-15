@@ -63,6 +63,79 @@ export interface MigrationSqlTable {
   readonly arguments: readonly (readonly MigrationSqlToken[])[];
 }
 
+export interface FtsDeclaration {
+  readonly name: string;
+  readonly content: string | null;
+  readonly shadows: readonly string[];
+}
+
+/** FTS module arguments are tokens from the one canonical SQL lexical pass. */
+export function ftsDeclaration(table: MigrationSqlTable | undefined): FtsDeclaration | undefined {
+  if (
+    table?.kind !== "virtual" ||
+    asciiLower(table.module) !== "fts5" ||
+    (table.schema !== null && asciiLower(table.schema) !== "main")
+  )
+    return;
+  let content: string | undefined;
+  let contentSeen = false;
+  let columnsize = true;
+  let contentlessUnindexed = false;
+  let unindexed = false;
+  let columns = 0;
+  for (const argument of table.arguments) {
+    const name = argument[0];
+    if (!name || name.kind === "symbol") return;
+    if (argument[1]?.kind === "symbol" && argument[1]?.value === "=") {
+      const value = argument[2];
+      if (
+        argument.length !== 3 ||
+        !value ||
+        value.kind === "symbol" ||
+        (name.kind === "quoted" && name.quote !== "'")
+      )
+        return;
+      const key = asciiLower(name.value) as string;
+      if (!key) return;
+      // FTS5's native config parser accepts these ASCII option prefixes in
+      // this order. Interpret content/role options identically; SQLite still
+      // validates tokenizer, column and all other native option semantics.
+      if ("content".startsWith(key)) {
+        if (contentSeen) return;
+        content = value.value;
+        contentSeen = true;
+      } else if ("contentless_delete".startsWith(key)) {
+        // This changes update semantics, not the owned shadow roles.
+      } else if ("contentless_unindexed".startsWith(key)) {
+        contentlessUnindexed = value.value === "1";
+      } else if ("content_rowid".startsWith(key)) {
+        // SQLite resolves this column in the already-bound content table.
+      } else if ("columnsize".startsWith(key)) {
+        columnsize = value.value !== "0";
+      }
+    } else {
+      if (
+        argument.length > 2 ||
+        (argument[1] &&
+          (argument[1].kind !== "word" || asciiLower(argument[1].value) !== "unindexed"))
+      )
+        return;
+      columns += 1;
+      unindexed ||= argument.length === 2;
+    }
+  }
+  if (columns === 0) return;
+  const roles = ["data", "idx", "config"];
+  if (columnsize) roles.push("docsize");
+  if (content === undefined || (content === "" && contentlessUnindexed && unindexed))
+    roles.push("content");
+  return {
+    name: table.name,
+    content: content ? content : null,
+    shadows: roles.map((role) => `${table.name}_${role}`),
+  };
+}
+
 /** Chosen by the trusted native adapter from the exact accepted Form identity. */
 export function prepareNativeMigrationSql(
   sql: string,
@@ -731,4 +804,8 @@ function isSqliteIdentifierCodePoint(value: number): boolean {
 
 function codePointWidth(value: number): 1 | 2 {
   return value > 0xffff ? 2 : 1;
+}
+
+function asciiLower(value: string | null): string | null {
+  return value === null ? null : value.replace(/[A-Z]/gu, (letter) => letter.toLowerCase());
 }

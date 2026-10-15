@@ -7,6 +7,12 @@ import type {
   SelfhostV2SqliteResult,
   SelfhostV2SqliteStatement,
 } from "../queue-v2-sqlite-contract.ts";
+import {
+  type FtsDeclaration,
+  ftsDeclaration,
+  type MigrationSqlTable,
+  prepareNativeMigrationSql,
+} from "../sqlite-migration-policy.ts";
 
 export type {
   EdgeSqlRow,
@@ -29,6 +35,7 @@ const UTF8 = new TextEncoder();
 
 type BoundStatement = Readonly<{ sql: string; params: readonly SQLInputValue[] }>;
 type OutputBudget = { serializedRowsBytes: number };
+type RuntimeFtsDescriptor = FtsDeclaration & { readonly epoch: number };
 
 export interface SelfhostV2SqlitePlaneOptions {
   /**
@@ -147,14 +154,47 @@ export function createSelfhostV2SqlitePlane(
   const ledgerTable = asciiLower(ledgerTableValue);
   let closed = false;
   let internalTransactionControl = false;
+  let readingMainCatalog = false;
   let statementHasWriteAction = false;
+  let catalogEpoch = 0;
+  let currentStatement: BoundStatement | undefined;
+  let ftsAction:
+    | {
+        readonly statement: BoundStatement;
+        readonly descriptor: RuntimeFtsDescriptor;
+        readonly epoch: number;
+      }
+    | undefined;
+  const mainObjects = new Map<string, Record<string, unknown>>();
+  const mainDeclarations = new Map<string, MigrationSqlTable>();
+  const catalogDeclarations = new Map<string, MigrationSqlTable | undefined>();
+  const ftsDescriptors = new Map<string, RuntimeFtsDescriptor>();
+  const protectedObjects = new Set([ledgerTable]);
+
+  const clearStatement = (): void => {
+    currentStatement = undefined;
+    ftsAction = undefined;
+  };
 
   const authorizer = (
     action: number,
     first: string | null,
     second: string | null,
     schema: string | null,
+    origin: string | null,
   ): number => {
+    // This state exists only while the fixed Host method below reads the
+    // catalog. It cannot admit user SQL, execute views, or initialize modules.
+    if (readingMainCatalog) {
+      return origin === null &&
+        (action === SQLITE.SQLITE_SELECT ||
+          (action === SQLITE.SQLITE_READ &&
+            schema === "main" &&
+            (first === "sqlite_master" || first === "sqlite_schema") &&
+            (second === "name" || second === "type" || second === "tbl_name" || second === "sql")))
+        ? SQLITE.SQLITE_OK
+        : SQLITE.SQLITE_DENY;
+    }
     if (
       action === SQLITE.SQLITE_INSERT ||
       action === SQLITE.SQLITE_UPDATE ||
@@ -167,6 +207,24 @@ export function createSelfhostV2SqlitePlane(
       (action === SQLITE.SQLITE_TRANSACTION || action === SQLITE.SQLITE_SAVEPOINT)
     ) {
       return SQLITE.SQLITE_OK;
+    }
+    if (action === SQLITE.SQLITE_PRAGMA) {
+      // FTS5 issues this exact read internally. An earlier allowed action on
+      // an actual catalog-verified FTS table must bind it to this statement,
+      // this write-locked schema epoch, and this same installed authorizer.
+      return !internalTransactionControl &&
+        database.isTransaction &&
+        currentStatement !== undefined &&
+        first === "data_version" &&
+        second === null &&
+        schema === "main" &&
+        origin === null &&
+        ftsAction !== undefined &&
+        ftsAction.statement === currentStatement &&
+        ftsAction.epoch === catalogEpoch &&
+        ftsDescriptors.get(asciiLower(ftsAction.descriptor.name)) === ftsAction.descriptor
+        ? SQLITE.SQLITE_OK
+        : SQLITE.SQLITE_DENY;
     }
     if (DENIED_ACTIONS.has(action)) return SQLITE.SQLITE_DENY;
     if (action === SQLITE.SQLITE_FUNCTION && asciiLower(second ?? "") === "load_extension") {
@@ -183,9 +241,18 @@ export function createSelfhostV2SqlitePlane(
       if (sqliteSchema !== "" && sqliteSchema !== "main") return SQLITE.SQLITE_DENY;
       if (
         SCHEMA_TABLES.has(table) ||
-        ((sqliteSchema === "" || sqliteSchema === ledgerSchema) && table === ledgerTable)
+        ((sqliteSchema === "" || sqliteSchema === ledgerSchema) && protectedObjects.has(table))
       ) {
         return SQLITE.SQLITE_DENY;
+      }
+      if (action === SQLITE.SQLITE_READ && table.startsWith("pragma_") && !mainObjects.has(table)) {
+        // This is SQLite's resolved eponymous table, not a word search. Deny
+        // before it can use a gate armed by FTS in a view, trigger, or CTE.
+        return SQLITE.SQLITE_DENY;
+      }
+      const descriptor = ftsDescriptors.get(table);
+      if (schema === "main" && descriptor && currentStatement && database.isTransaction) {
+        ftsAction = { statement: currentStatement, descriptor, epoch: catalogEpoch };
       }
       return SQLITE.SQLITE_OK;
     }
@@ -203,11 +270,80 @@ export function createSelfhostV2SqlitePlane(
   };
 
   const internalExec = (sql: "BEGIN IMMEDIATE" | "COMMIT" | "ROLLBACK"): void => {
+    clearStatement();
     internalTransactionControl = true;
     try {
       database.exec(sql);
     } finally {
       internalTransactionControl = false;
+    }
+  };
+
+  const refreshMainCatalog = (): void => {
+    clearStatement();
+    if (!database.isTransaction) throw new SelfhostV2SqliteError("backend_unavailable");
+    let objects: readonly Record<string, unknown>[];
+    readingMainCatalog = true;
+    try {
+      objects = database.prepare("SELECT name, type, tbl_name, sql FROM main.sqlite_schema").all();
+    } finally {
+      readingMainCatalog = false;
+    }
+    mainObjects.clear();
+    mainDeclarations.clear();
+    ftsDescriptors.clear();
+    protectedObjects.clear();
+    protectedObjects.add(ledgerTable);
+    catalogEpoch += 1;
+    for (const object of objects) {
+      if (typeof object.name !== "string" || typeof object.tbl_name !== "string") {
+        throw new SelfhostV2SqliteError("backend_unavailable");
+      }
+      const name = asciiLower(object.name);
+      mainObjects.set(name, object);
+      if (asciiLower(object.tbl_name) === ledgerTable) protectedObjects.add(name);
+      if (object.type !== "table" || typeof object.sql !== "string") continue;
+      if (!catalogDeclarations.has(object.sql)) {
+        let declaration: MigrationSqlTable | undefined;
+        try {
+          declaration = prepareNativeMigrationSql(object.sql, "introspection")[0]?.table;
+        } catch {
+          // An unrecognized declaration never acquires internal FTS authority.
+        }
+        catalogDeclarations.set(object.sql, declaration);
+      }
+      const declaration = catalogDeclarations.get(object.sql);
+      if (
+        declaration &&
+        asciiLower(declaration.name) === name &&
+        (declaration.schema === null || asciiLower(declaration.schema) === "main")
+      ) {
+        mainDeclarations.set(name, declaration);
+      }
+    }
+    const ordinaryMain = (name: string): boolean => {
+      const object = mainObjects.get(name);
+      return (
+        object?.type === "table" &&
+        typeof object.tbl_name === "string" &&
+        asciiLower(object.tbl_name) === name &&
+        mainDeclarations.get(name)?.kind === "ordinary" &&
+        !protectedObjects.has(name)
+      );
+    };
+    const candidates = new Map<string, FtsDeclaration>();
+    const shadows = new Set<string>();
+    for (const [name, table] of mainDeclarations) {
+      const declaration = ftsDeclaration(table);
+      if (!declaration || protectedObjects.has(name)) continue;
+      candidates.set(name, declaration);
+      for (const shadow of declaration.shadows) shadows.add(asciiLower(shadow));
+    }
+    for (const [name, declaration] of candidates) {
+      const content = declaration.content === null ? null : asciiLower(declaration.content);
+      if (content !== null && (!ordinaryMain(content) || shadows.has(content))) continue;
+      if (!declaration.shadows.every((shadow) => ordinaryMain(asciiLower(shadow)))) continue;
+      ftsDescriptors.set(name, { ...declaration, epoch: catalogEpoch });
     }
   };
 
@@ -243,6 +379,11 @@ export function createSelfhostV2SqlitePlane(
         }
       }
       throw normalizeSqliteError(error, database.isOpen);
+    } finally {
+      clearStatement();
+      readingMainCatalog = false;
+      ftsDescriptors.clear();
+      catalogDeclarations.clear();
     }
   };
 
@@ -253,55 +394,64 @@ export function createSelfhostV2SqlitePlane(
   ): SelfhostV2SqliteResult => {
     assertOpen();
     assertSingleStatement(statementInput.sql);
+    // BEGIN IMMEDIATE already excludes schema writers. Refresh before each
+    // exact input, then retain the epoch across prepare, step, and reprepare.
+    refreshMainCatalog();
+    currentStatement = statementInput;
     statementHasWriteAction = false;
-    const statement = database.prepare(statementInput.sql);
-    statement.setReadBigInts(true);
-    statement.setReturnArrays(true);
-    const columns = statement.columns();
-    if (columns.length > MAX_COLUMNS) throw new SelfhostV2SqliteError("sql_error");
-    const names = columns.map((column) => {
-      if (utf8Bytes(column.name) > MAX_COLUMN_NAME_BYTES) {
-        throw new SelfhostV2SqliteError("sql_error");
-      }
-      return column.name;
-    });
-    if (new Set(names).size !== names.length) throw new SelfhostV2SqliteError("sql_error");
-    const rows: EdgeSqlRow[] = [];
-    const iterator = statement.iterate(...(statementInput.params ?? [])) as unknown as Iterator<
-      readonly unknown[]
-    >;
     try {
-      for (;;) {
-        const next = iterator.next();
-        if (next.done) break;
-        if (rows.length >= MAX_ROWS) throw new SelfhostV2SqliteError("sql_error");
-        const values = next.value;
-        if (!Array.isArray(values) || values.length !== names.length) {
+      const statement = database.prepare(statementInput.sql);
+      statement.setReadBigInts(true);
+      statement.setReturnArrays(true);
+      const columns = statement.columns();
+      if (columns.length > MAX_COLUMNS) throw new SelfhostV2SqliteError("sql_error");
+      const names = columns.map((column) => {
+        if (utf8Bytes(column.name) > MAX_COLUMN_NAME_BYTES) {
           throw new SelfhostV2SqliteError("sql_error");
         }
-        const row = Object.create(null) as Record<string, EdgeSqlValue>;
-        for (let index = 0; index < names.length; index += 1) {
-          const name = names[index];
-          if (name === undefined) throw new SelfhostV2SqliteError("sql_error");
-          row[name] = encodeOutput(values[index]);
+        return column.name;
+      });
+      if (new Set(names).size !== names.length) throw new SelfhostV2SqliteError("sql_error");
+      const rows: EdgeSqlRow[] = [];
+      const iterator = statement.iterate(...(statementInput.params ?? [])) as unknown as Iterator<
+        readonly unknown[]
+      >;
+      try {
+        for (;;) {
+          const next = iterator.next();
+          if (next.done) break;
+          if (rows.length >= MAX_ROWS) throw new SelfhostV2SqliteError("sql_error");
+          const values = next.value;
+          if (!Array.isArray(values) || values.length !== names.length) {
+            throw new SelfhostV2SqliteError("sql_error");
+          }
+          const row = Object.create(null) as Record<string, EdgeSqlValue>;
+          for (let index = 0; index < names.length; index += 1) {
+            const name = names[index];
+            if (name === undefined) throw new SelfhostV2SqliteError("sql_error");
+            row[name] = encodeOutput(values[index]);
+          }
+          const rowBytes = utf8Bytes(canonicalJson(row));
+          if (rowBytes > MAX_ROW_BYTES) {
+            throw new SelfhostV2SqliteError("sql_error");
+          }
+          outputBudget.serializedRowsBytes += rowBytes + (rows.length > 0 ? 1 : 0);
+          if (outputBudget.serializedRowsBytes > MAX_OUTPUT_BYTES) {
+            throw new SelfhostV2SqliteError("sql_error");
+          }
+          rows.push(Object.freeze(row));
         }
-        const rowBytes = utf8Bytes(canonicalJson(row));
-        if (rowBytes > MAX_ROW_BYTES) {
-          throw new SelfhostV2SqliteError("sql_error");
-        }
-        outputBudget.serializedRowsBytes += rowBytes + (rows.length > 0 ? 1 : 0);
-        if (outputBudget.serializedRowsBytes > MAX_OUTPUT_BYTES) {
-          throw new SelfhostV2SqliteError("sql_error");
-        }
-        rows.push(Object.freeze(row));
+      } finally {
+        iterator.return?.();
       }
-    } finally {
-      iterator.return?.();
-    }
 
-    const rowsWritten =
-      rowsWrittenMode === "zero" || !statementHasWriteAction ? 0 : changesWritten(database);
-    return Object.freeze({ rows: Object.freeze(rows), rowsWritten });
+      clearStatement();
+      const rowsWritten =
+        rowsWrittenMode === "zero" || !statementHasWriteAction ? 0 : changesWritten(database);
+      return Object.freeze({ rows: Object.freeze(rows), rowsWritten });
+    } finally {
+      clearStatement();
+    }
   };
 
   const checkEnvelope = <T>(value: T): T => {
@@ -372,6 +522,10 @@ export function createSelfhostV2SqlitePlane(
       if (args.length > 0) throw new TypeError("close accepts no arguments");
       if (closed) return;
       closed = true;
+      clearStatement();
+      readingMainCatalog = false;
+      ftsDescriptors.clear();
+      catalogDeclarations.clear();
       if (database.isOpen) database.close();
     },
   };
