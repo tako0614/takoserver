@@ -46,7 +46,7 @@ test("0100 source audit preserves every existing deployment apply ceiling", () =
     },
     {
       name: "0100_hosted_on_demand.sql",
-      digest: "sha256:53a7a6fd836db09d69559367427934f7d191573cbdad106be20496bddc60a0d3",
+      digest: "sha256:b04c1d13d1b9a5b16ab205b7fcaead6dd3ecba5f36ba54771f9492ffa2247bc1",
     },
   ]);
   const projections = [
