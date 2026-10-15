@@ -3,7 +3,7 @@ import { ApiError } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
 import { tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
-import { health } from "../resource-state.ts";
+import { health, phaseLabel } from "../resource-state.ts";
 import { linkProps, route } from "../router.ts";
 import { api, currentOrganization } from "../state.ts";
 import { badge, card, copyable, empty, ICON, icon, jsonBlock, whenReady } from "../ui.ts";
@@ -79,11 +79,16 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
         h(
           "h1",
           null,
-          h("span", { class: "mono" }, found.name),
+          // The name is the page title; .mono alone would shrink it to body size.
+          h(
+            "span",
+            { class: "mono", style: { fontSize: "inherit", overflowWrap: "anywhere" } },
+            found.name,
+          ),
           text(" "),
           badge(phaseLabel(state.phase), state.tone, true),
         ),
-        h("p", { class: "mono" }, found.form),
+        h("p", { class: "mono", style: { overflowWrap: "anywhere" } }, found.form),
       ),
       h(
         "div",
@@ -174,16 +179,4 @@ function field(label: string, value: Child): Child {
     h("div", { class: "row__label" }, label),
     h("div", { class: "row__value" }, value),
   );
-}
-
-function phaseLabel(phase: ReturnType<typeof health>["phase"]): string {
-  const japanese = {
-    Ready: "稼働中",
-    NotReady: "非稼働",
-    Pending: "処理中",
-    Failed: "失敗",
-    Deleting: "削除中",
-    Unknown: "不明",
-  } as const;
-  return tr(japanese[phase], phase);
 }

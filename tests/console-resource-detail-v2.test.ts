@@ -156,6 +156,21 @@ test("confirmed ready:false is NotReady and visible in overview attention", asyn
   };
   expect(health(item)).toMatchObject({ phase: "NotReady", tone: "warn", stale: false });
   expect(health({ ...item, observedAt: null })).toMatchObject({ phase: "Unknown" });
+  // A settled Resource whose Form reports no readiness reads as applied.
+  expect(health({ ...item, observed: { fileCount: 1 } })).toMatchObject({
+    phase: "Applied",
+    tone: "ok",
+  });
+  expect(health({ ...item, observed: {}, observedGeneration: 0 })).toMatchObject({
+    phase: "Pending",
+  });
+  // An explicit negative flag, an unusable ready, or a failed operation is
+  // never presented as Applied.
+  expect(health({ ...item, observed: { databaseExists: false } })).toMatchObject({
+    phase: "Unknown",
+  });
+  expect(health({ ...item, observed: { ready: null } })).toMatchObject({ phase: "Unknown" });
+  expect(health({ ...item, phase: "error", observed: {} })).toMatchObject({ phase: "Failed" });
   expect(byForm([item])).toMatchObject([{ form: item.form, attention: 1 }]);
   consoleLocale.set("en");
   setApiOrigin("https://api.example.test");
@@ -287,4 +302,48 @@ test("overview counts only what it read and offers the first create", async () =
   const create = none.all().find((node) => node.tag === "button");
   expect(create?.className).toBe("btn btn--primary");
   expect(create?.textContent).toContain("New resource");
+});
+
+test("resource detail calls a settled artifact Resource Applied", async () => {
+  const body = installDom();
+  const { consoleLocale } = await import("../console/src/i18n.ts");
+  const { organizations, selectOrganization, setApiOrigin } = await import(
+    "../console/src/state.ts"
+  );
+  const { route } = await import("../console/src/router.ts");
+  const { resourceDetailPage } = await import("../console/src/pages/resource-detail.ts");
+  consoleLocale.set("en");
+  setApiOrigin("https://api.example.test");
+  organizations.set([
+    { id: "org-one", name: "One", ownerPrincipalId: "owner", createdAt: "2026-10-07" },
+  ]);
+  selectOrganization("org-one");
+  route.set({
+    path: "/resources/uid-bundle",
+    segments: ["resources", "uid-bundle"],
+    query: new URLSearchParams(),
+  });
+  globalThis.fetch = Object.assign(
+    async () =>
+      Response.json({
+        uid: "uid-bundle",
+        form: "https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/",
+        space: "org-one",
+        name: "hello-v1",
+        generation: 1,
+        observedGeneration: 1,
+        observedAt: "2026-10-07T00:00:00Z",
+        phase: "idle",
+        spec: {},
+        observed: { entrypoint: "worker.js", fileCount: 1, totalBytes: 80 },
+        output: {},
+        lastOperation: "op-one",
+      }),
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  body.append(resourceDetailPage("org-one", "uid-bundle") as unknown as NodeStub);
+  await settle();
+  expect(body.textContent).toContain("hello-v1");
+  expect(body.textContent).toContain("Applied");
+  expect(body.textContent).not.toContain("Unknown");
 });
