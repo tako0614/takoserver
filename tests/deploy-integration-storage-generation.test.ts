@@ -31,6 +31,7 @@ import {
   verifyFreshV2ArtifactIntegrationStorageTarget,
   verifyFreshV2IntegrationStorageTarget,
   verifyIntegrationStorageGenerationTarget,
+  verifyIntegrationStorageOriginalCreate,
 } from "../scripts/deploy/integration-storage-generation.ts";
 import { canonicalSchemaShape, type D1SchemaState } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
@@ -1989,6 +1990,305 @@ describe("original integration-ts fresh0092 creator", () => {
         { provider: f.provider },
       ),
     ).rejects.toThrow("exact matching");
+  });
+});
+
+function originalReaderFixture() {
+  const created = originalCreationFixture();
+  const selected = {
+    ...created.selected,
+    d1: { databaseName: created.prefixedName, databaseId: DATABASE_ID },
+    r2: { bucketName: created.prefixedName },
+    takoformV2: { config: "{}", storageLineage: "v2-0092" },
+  } satisfies DeployTarget;
+  const locator = created.options.originalCreate;
+  if (locator === undefined) throw new Error("original fixture locator missing");
+  const reads: string[] = [];
+  const readOptions = {
+    originalCreate: locator,
+    provider: {
+      async getD1(id: string) {
+        reads.push(`D1:${id}`);
+        return { name: created.prefixedName, uuid: DATABASE_ID };
+      },
+      async getR2(name: string) {
+        reads.push(`R2:${name}`);
+        return { name: created.prefixedName };
+      },
+    },
+  };
+  return {
+    ...created,
+    selectedNew: selected,
+    reads,
+    readOptions,
+    verify: () =>
+      verifyIntegrationStorageOriginalCreate(
+        created.invocation,
+        created.selected,
+        selected,
+        readOptions,
+      ),
+    retainedBytes: () => created.records().map(({ path }) => readFileSync(path, "utf8")),
+  };
+}
+
+function controlledCustodyObject(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("controlled custody fixture is not an object");
+  }
+  return Object.fromEntries(Object.entries(value));
+}
+
+// Controlled retained FORMAT fault injection, never evidence of a native provider creation.
+// Every observation still enters the actual held-file reader with component-only GET ports.
+function rewriteControlledOriginalChain(
+  f: ReturnType<typeof originalReaderFixture>,
+  change: (
+    stage: string,
+    binding: Record<string, unknown>,
+    evidence: Record<string, unknown>,
+  ) => void,
+) {
+  const hash = (value: unknown) =>
+    `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
+  const digests: string[] = [];
+  const stages = [
+    "create-dispatched",
+    "identified",
+    "import-dispatched",
+    "r2-dispatched",
+    "terminal",
+  ];
+  for (const entry of f
+    .records()
+    .sort(
+      (left, right) =>
+        stages.indexOf(String(left.value.stage)) - stages.indexOf(String(right.value.stage)),
+    )) {
+    const body = { ...entry.value };
+    delete body.digest;
+    const binding = controlledCustodyObject(body.binding);
+    const evidence = controlledCustodyObject(body.evidence);
+    change(String(body.stage), binding, evidence);
+    body.binding = binding;
+    body.evidence = evidence;
+    body.previousDigest = digests.at(-1) ?? null;
+    if (body.stage === "terminal") {
+      const proof = controlledCustodyObject(evidence.proof);
+      proof.kind =
+        binding.authority === "provider-native"
+          ? "takoserver.integration-fresh-0092-original-create@v1"
+          : "takoserver.integration-fresh-0092-component-result@v1";
+      proof.authority = binding.authority;
+      proof.qualification =
+        binding.authority === "provider-native"
+          ? "independent-origin-review-required"
+          : "component-simulation-only";
+      proof.commandPort = binding.commandPort;
+      proof.originalBindingDigest = hash(binding);
+      [
+        proof.createDispatchDigest,
+        proof.identifiedDigest,
+        proof.importDispatchDigest,
+        proof.r2DispatchDigest,
+      ] = digests;
+      evidence.proof = proof;
+    }
+    const digest = hash(body);
+    digests.push(digest);
+    writeFileSync(entry.path, `${JSON.stringify({ ...body, digest })}\n`);
+  }
+}
+
+describe("retained original reader", () => {
+  test("reopens actual fixed92 component custody without writes or current SQL queries", async () => {
+    const f = originalReaderFixture();
+    const applied = await f.apply();
+    // A changed current schema is not a new origin or a claim that money94 was applied.
+    f.database.exec("CREATE TABLE later_owner_state (id TEXT)");
+    const before = f.retainedBytes();
+    const commands = [...f.process.commands];
+    const proof = await f.verify();
+    expect(proof.originalCreate).toEqual(applied.originalCreate);
+    expect(proof.qualification).toBe("component-simulation-only");
+    expect(proof.nativeReadback).toEqual({
+      authority: "component-simulation",
+      accountId: f.selected.accountId,
+      d1: { databaseId: DATABASE_ID, databaseName: f.prefixedName },
+      r2: { bucketName: f.prefixedName },
+    });
+    expect(f.reads).toEqual([`D1:${DATABASE_ID}`, `R2:${f.prefixedName}`]);
+    expect(f.retainedBytes()).toEqual(before);
+    expect(f.process.commands).toEqual(commands);
+    expect(f.imports()).toBe(1);
+    expect(Object.keys(proof).sort()).toEqual([
+      "custodyRootIdentityDigest",
+      "nativeReadback",
+      "originalCreate",
+      "originalSelectedTargetDigest",
+      "qualification",
+    ]);
+  });
+
+  test("refuses changed original tuple and new identity before any GET", async () => {
+    const f = originalReaderFixture();
+    await f.apply();
+    for (const incumbent of [
+      { ...f.selected, workerName: "integration-other-host" },
+      { ...f.selected, d1: { ...f.selected.d1, databaseName: "integration-other-incumbent" } },
+      { ...f.selected, d1: { ...f.selected.d1, databaseId: DATABASE_ID } },
+      { ...f.selected, r2: { bucketName: "integration-other-incumbent" } },
+      f.selectedNew,
+    ]) {
+      await expect(
+        verifyIntegrationStorageOriginalCreate(
+          f.invocation,
+          incumbent,
+          f.selectedNew,
+          f.readOptions,
+        ),
+      ).rejects.toThrow();
+    }
+    for (const selected of [
+      { ...f.selectedNew, accountId: "d".repeat(32) },
+      { ...f.selectedNew, d1: { ...f.selectedNew.d1, databaseId: f.selected.d1.databaseId } },
+      { ...f.selectedNew, r2: { bucketName: GENERATED_NAME } },
+      { ...f.selectedNew, takoformV2: { config: "{}", storageLineage: "v2-0088" as const } },
+    ]) {
+      await expect(
+        verifyIntegrationStorageOriginalCreate(f.invocation, f.selected, selected, f.readOptions),
+      ).rejects.toThrow();
+    }
+    expect(f.reads).toEqual([]);
+  });
+
+  test("cannot promote status, extra proof ports, absent or UNKNOWN custody", async () => {
+    const f = originalReaderFixture();
+    await expect(f.verify()).rejects.toThrow("terminal chain");
+    await expect(
+      verifyIntegrationStorageOriginalCreate(
+        { ...f.invocation, action: "status" },
+        f.selected,
+        f.selectedNew,
+        f.readOptions,
+      ),
+    ).rejects.toThrow("only original selectors");
+    const extra = { ...f.readOptions };
+    Object.defineProperty(extra, "proof", { enumerable: true, value: { state: "terminal" } });
+    await expect(
+      verifyIntegrationStorageOriginalCreate(f.invocation, f.selected, f.selectedNew, extra),
+    ).rejects.toThrow("only original selectors");
+    f.provider.createD1 = async () => {
+      throw new Error("lost ACK");
+    };
+    await expect(f.apply()).rejects.toThrow();
+    const before = f.retainedBytes();
+    await expect(f.verify()).rejects.toThrow("terminal chain");
+    expect(f.retainedBytes()).toEqual(before);
+    expect(f.reads).toEqual([]);
+    expect(f.imports()).toBe(0);
+  });
+
+  test("historical native-format ports never upgrade a component GET observer", async () => {
+    const f = originalReaderFixture();
+    await f.apply();
+    for (const commandPort of ["owner-default", "composing-source-owned"]) {
+      rewriteControlledOriginalChain(f, (_stage, binding) => {
+        binding.authority = "provider-native";
+        binding.commandPort = commandPort;
+      });
+      const before = f.retainedBytes();
+      const observed = await f.verify();
+      expect(observed.originalCreate.kind).toBe(
+        "takoserver.integration-fresh-0092-original-create@v1",
+      );
+      expect(observed.originalCreate.authority).toBe("provider-native");
+      expect(observed.originalCreate.commandPort).toBe(commandPort);
+      expect(observed.originalCreate.qualification).toBe("independent-origin-review-required");
+      expect(observed.nativeReadback.authority).toBe("component-simulation");
+      expect(observed.qualification).toBe("component-simulation-only");
+      expect(f.retainedBytes()).toEqual(before);
+    }
+  });
+
+  test("checks exact ACK tuple even when the two retained GET digests agree", async () => {
+    const f = originalReaderFixture();
+    await f.apply();
+    rewriteControlledOriginalChain(f, (stage, _binding, evidence) => {
+      if (stage === "identified") {
+        evidence.createResponseDigest = `sha256:${"e".repeat(64)}`;
+        evidence.identityReadbackDigest = evidence.createResponseDigest;
+      }
+    });
+    const before = f.retainedBytes();
+    await expect(f.verify()).rejects.toThrow("exact original tuple/ACK");
+    expect(f.retainedBytes()).toEqual(before);
+    expect(f.reads).toEqual([]);
+  });
+
+  test("refuses native identity drift while retaining the valid original terminal", async () => {
+    const f = originalReaderFixture();
+    await f.apply();
+    const before = f.retainedBytes();
+    const d1 = f.readOptions.provider.getD1;
+    const r2 = f.readOptions.provider.getR2;
+    for (const mode of ["D1-id", "D1-name", "R2-name", "error"]) {
+      f.readOptions.provider.getD1 = async (id) => {
+        if (mode === "error") throw new Error("confidential GET response");
+        return {
+          name: mode === "D1-name" ? GENERATED_NAME : f.prefixedName,
+          uuid: mode === "D1-id" ? f.selected.d1.databaseId : id,
+        };
+      };
+      f.readOptions.provider.getR2 = async () => ({
+        name: mode === "R2-name" ? GENERATED_NAME : f.prefixedName,
+      });
+      const error = await rejectedError(f.verify());
+      expect(error.stack).not.toContain("confidential");
+      expect(f.retainedBytes()).toEqual(before);
+    }
+    f.readOptions.provider.getD1 = d1;
+    f.readOptions.provider.getR2 = r2;
+  });
+
+  test("repeats the selected tuple and retained chain fences after awaited GET", async () => {
+    for (const mode of ["selected", "chain"]) {
+      const f = originalReaderFixture();
+      await f.apply();
+      f.readOptions.provider.getD1 = async (id) => {
+        if (mode === "selected") f.selectedNew.d1.databaseId = f.selected.d1.databaseId;
+        else {
+          const terminal = f.records().find((entry) => entry.value.stage === "terminal");
+          if (terminal === undefined) throw new Error("terminal missing");
+          writeFileSync(terminal.path, "{}\n");
+        }
+        return { name: f.prefixedName, uuid: id };
+      };
+      await expect(f.verify()).rejects.toThrow();
+      expect(f.reads).toEqual([]);
+      expect(f.imports()).toBe(1);
+    }
+  });
+
+  test("shares actual bounded held-file and original root-pin refusal before GET", async () => {
+    for (const mode of ["oversize", "root"]) {
+      const f = originalReaderFixture();
+      await f.apply();
+      if (mode === "root") {
+        renameSync(f.custodyDirectory, `${f.custodyDirectory}-retained`);
+        mkdirSync(f.custodyDirectory, { mode: 0o700 });
+      } else {
+        const identified = f.records().find((entry) => entry.value.stage === "identified");
+        if (identified === undefined) throw new Error("identified missing");
+        writeFileSync(identified.path, "x".repeat(32 * 1024 + 1));
+      }
+      await expect(f.verify()).rejects.toThrow(
+        mode === "root" ? "device/inode pin" : "unsafe or unreadable",
+      );
+      expect(f.reads).toEqual([]);
+      expect(f.imports()).toBe(1);
+    }
   });
 });
 

@@ -50,6 +50,8 @@ export type {
   IntegrationStorageOriginalCreateEvidence,
   IntegrationStorageOriginalCreateOptions,
   IntegrationStorageOriginalCreateReceipt,
+  IntegrationStorageOriginalCreateVerification,
+  IntegrationStorageOriginalCreateVerificationOptions,
   IntegrationStorageTargetReadProvider,
 } from "./deploy/integration-storage-generation.ts";
 export {
@@ -57,6 +59,7 @@ export {
   runIntegrationStorageGeneration,
   verifyFreshV2IntegrationStorageTarget,
   verifyIntegrationStorageGenerationTarget,
+  verifyIntegrationStorageOriginalCreate,
 } from "./deploy/integration-storage-generation.ts";
 export { runIntegrationWorkerBootstrap } from "./deploy/integration-worker-bootstrap.ts";
 export type { D1SchemaState, MigrationArtifact, MigrationFile } from "./deploy/migrations.ts";

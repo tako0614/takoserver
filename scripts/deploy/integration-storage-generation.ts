@@ -220,6 +220,29 @@ export interface IntegrationStorageOriginalCreateReceipt
   readonly terminalCustodyDigest: string;
 }
 
+/** Locators and read ports only; no saved result, source override or current-schema claim. */
+export interface IntegrationStorageOriginalCreateVerificationOptions
+  extends Pick<
+    IntegrationStorageGenerationTargetVerificationOptions,
+    "provider" | "fetcher" | "run" | "cloudflareEnvironment"
+  > {
+  readonly originalCreate: IntegrationStorageOriginalCreateOptions;
+}
+
+/** Original fixed92 custody and current identity, never money or runtime readiness. */
+export interface IntegrationStorageOriginalCreateVerification {
+  readonly qualification: IntegrationStorageOriginalCreateEvidence["qualification"];
+  readonly originalCreate: IntegrationStorageOriginalCreateReceipt;
+  readonly originalSelectedTargetDigest: string;
+  readonly custodyRootIdentityDigest: string;
+  readonly nativeReadback: {
+    readonly authority: IntegrationStorageOriginalCreateEvidence["authority"];
+    readonly accountId: string;
+    readonly d1: { readonly databaseId: string; readonly databaseName: string };
+    readonly r2: { readonly bucketName: string };
+  };
+}
+
 /**
  * An operator-provisioned staging pair: one D1 and one R2 bucket sharing the
  * name `takoserver-staging-<label>`. It stands in for a generated pair only on
@@ -461,6 +484,128 @@ export async function verifyIntegrationStorageGenerationTarget(
   options: IntegrationStorageGenerationTargetVerificationOptions = {},
 ): Promise<IntegrationStorageGenerationTargetProof> {
   return await verifyGeneratedStorageTarget(target, environment, options, "apply-0066");
+}
+
+/**
+ * Reopen the original protected operation without writing, adopting or completing it.
+ * The original incumbent collision tuple remains distinct from the selected new pair.
+ * Current SQL/data may have advanced under another owner; only native identities are read.
+ */
+export async function verifyIntegrationStorageOriginalCreate(
+  originalInvocation: IntegrationStorageGenerationInvocation,
+  originalTarget: DeployTarget,
+  selectedTarget: DeployTarget,
+  options: IntegrationStorageOriginalCreateVerificationOptions,
+): Promise<IntegrationStorageOriginalCreateVerification> {
+  if (
+    originalInvocation.action !== "apply" ||
+    !originalRecord(options) ||
+    Object.keys(options).some(
+      (key) =>
+        !["originalCreate", "provider", "fetcher", "run", "cloudflareEnvironment"].includes(key),
+    )
+  ) {
+    throw preflightError(
+      "original creation verification requires only original selectors and read ports",
+    );
+  }
+  const names = validateInvocation(originalInvocation, originalTarget);
+  const original = prepareOriginalCreate(
+    originalInvocation,
+    originalTarget,
+    names,
+    { originalCreate: options.originalCreate },
+    "read-retained",
+  );
+  if (original === null) throw preflightError("original creation custody is required");
+  const selectedIdentity = () => ({
+    ...generatedStorageTarget(selectedTarget, "integration"),
+    freshLineage: selectedTarget.takoformV2?.storageLineage,
+  });
+  const selected = selectedIdentity();
+  const retained = original.readTerminal();
+  if (
+    selected.namespace !== "integration-ts" ||
+    selected.accountId !== retained.originalCreate.accountId ||
+    selected.generation !== retained.originalCreate.generation ||
+    selected.databaseName !== retained.originalCreate.databaseName ||
+    selected.databaseId !== retained.originalCreate.databaseId ||
+    selected.bucketName !== retained.originalCreate.bucketName
+  ) {
+    throw preflightError("selected storage differs from the original create ACK identity");
+  }
+  const ports = [
+    options.originalCreate,
+    options.provider,
+    options.fetcher,
+    options.run,
+    options.cloudflareEnvironment,
+  ] as const;
+  const snapshot = () =>
+    JSON.stringify({
+      selected: selectedIdentity(),
+      cloudflareEnvironment: options.cloudflareEnvironment,
+      keys: Object.keys(options).sort(),
+    });
+  const before = snapshot();
+  const assertUnchanged = () => {
+    if (
+      snapshot() !== before ||
+      [
+        options.originalCreate,
+        options.provider,
+        options.fetcher,
+        options.run,
+        options.cloudflareEnvironment,
+      ].some((port, index) => port !== ports[index]) ||
+      JSON.stringify(original.readTerminal()) !== JSON.stringify(retained)
+    ) {
+      throw preflightError(
+        "original creation custody or selected identity changed during readback",
+      );
+    }
+  };
+  // Read-port overrides do not describe how the historical creator obtained its identity.
+  const observerAuthority =
+    options.provider !== undefined || options.fetcher !== undefined
+      ? ("component-simulation" as const)
+      : ("provider-native" as const);
+  const { provider } = await resolveTargetReadProvider(selectedTarget, "integration", options);
+  assertUnchanged();
+  const d1 = validateD1Summary(
+    await providerCall("preflight", "original creation D1 identity readback failed", () =>
+      provider.getD1(selected.databaseId),
+    ),
+    "original creation D1 identity readback",
+  );
+  assertUnchanged();
+  if (d1.name !== selected.databaseName || d1.uuid !== selected.databaseId) {
+    throw preflightError("original creation D1 identity readback differs from its ACK");
+  }
+  const r2 = validateR2Summary(
+    await providerCall("preflight", "original creation R2 identity readback failed", () =>
+      provider.getR2(selected.bucketName),
+    ),
+    "original creation R2 identity readback",
+  );
+  assertUnchanged();
+  if (r2.name !== selected.bucketName) {
+    throw preflightError("original creation R2 identity readback differs from its retained name");
+  }
+  return {
+    ...retained,
+    qualification:
+      retained.originalCreate.authority === "provider-native" &&
+      observerAuthority === "provider-native"
+        ? "independent-origin-review-required"
+        : "component-simulation-only",
+    nativeReadback: {
+      authority: observerAuthority,
+      accountId: selected.accountId,
+      d1: { databaseId: d1.uuid, databaseName: d1.name },
+      r2: { bucketName: r2.name },
+    },
+  };
 }
 
 /**
@@ -782,6 +927,10 @@ interface OriginalCreateContext {
     databaseId: string,
   ): IntegrationStorageOriginalCreateEvidence;
   retainUnknown(binding: OriginalCreateBinding, databaseId: string | null): void;
+  readTerminal(): Pick<
+    IntegrationStorageOriginalCreateVerification,
+    "originalCreate" | "originalSelectedTargetDigest" | "custodyRootIdentityDigest"
+  >;
   status(): {
     readonly state: "absent" | "unknown" | "terminal";
     readonly qualification: "diagnostic-only";
@@ -958,6 +1107,7 @@ function prepareOriginalCreate(
   target: DeployTarget,
   names: StorageNames,
   options: IntegrationStorageGenerationOptions,
+  intent: "create" | "read-retained" = "create",
 ): OriginalCreateContext | null {
   if (invocation.namespace === undefined && options.originalCreate === undefined) return null;
   if (
@@ -1121,8 +1271,11 @@ function prepareOriginalCreate(
       value.sourceCommit !== sourceCommit ||
       value.custodyRootIdentityDigest !== custodyRootIdentityDigest ||
       value.migrationDigest !== ORIGINAL_SOURCE_0092 ||
-      value.authority !== authority ||
-      value.commandPort !== commandPort ||
+      (intent === "create"
+        ? value.authority !== authority || value.commandPort !== commandPort
+        : (value.authority !== "provider-native" && value.authority !== "component-simulation") ||
+          (value.commandPort !== "owner-default" &&
+            value.commandPort !== "composing-source-owned")) ||
       !["selectedTargetDigest", "importDigest", "applicationShapeDigest"].every(
         (key) => typeof value[key] === "string" && SHA256.test(value[key]),
       ) ||
@@ -1285,15 +1438,15 @@ function prepareOriginalCreate(
     const digests = records.map((record) => record.digest);
     return {
       kind:
-        authority === "provider-native"
+        binding.authority === "provider-native"
           ? "takoserver.integration-fresh-0092-original-create@v1"
           : "takoserver.integration-fresh-0092-component-result@v1",
-      authority,
+      authority: binding.authority,
       qualification:
-        authority === "provider-native"
+        binding.authority === "provider-native"
           ? "independent-origin-review-required"
           : "component-simulation-only",
-      commandPort,
+      commandPort: binding.commandPort,
       namespace: "integration-ts",
       generation,
       accountId,
@@ -1422,6 +1575,36 @@ function prepareOriginalCreate(
       } catch {
         /* retained dispatch/partial bytes are already UNKNOWN; never remove or overwrite them */
       }
+    },
+    readTerminal() {
+      const records = read();
+      const terminal = records.at(-1);
+      const binding = records[0]?.binding;
+      const databaseId = records[1]?.evidence.databaseId;
+      if (
+        records.length !== ORIGINAL_STAGES.length ||
+        terminal?.stage !== "terminal" ||
+        binding === undefined ||
+        typeof databaseId !== "string" ||
+        binding.selectedTargetDigest !== originalDigest(selectedTarget()) ||
+        databaseId === target.d1.databaseId ||
+        records[1]?.evidence.createResponseDigest !==
+          originalDigest({ name: names.databaseName, uuid: databaseId }) ||
+        records[1]?.evidence.identityReadbackDigest !==
+          originalDigest({ name: names.databaseName, uuid: databaseId })
+      ) {
+        throw preflightError(
+          "original creation requires its terminal chain and exact original tuple/ACK",
+        );
+      }
+      return {
+        originalCreate: {
+          ...makeEvidence(binding, records.slice(0, -1), databaseId),
+          terminalCustodyDigest: terminal.digest,
+        },
+        originalSelectedTargetDigest: binding.selectedTargetDigest,
+        custodyRootIdentityDigest: binding.custodyRootIdentityDigest,
+      };
     },
     status() {
       const records = read();
