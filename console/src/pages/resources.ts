@@ -386,15 +386,29 @@ function row(entry: ResourceSummary): Child {
         : null,
     ),
     // Every row is in the selected organization's Space, so the Space is
-    // not repeated per row; the Form URL wraps instead of widening the table.
+    // not repeated per row. A long name is cut with an ellipsis (the whole
+    // name is its title and the detail page heading) and the exact Form URL
+    // wraps, but never narrower than a readable column.
     h(
       "td",
-      { style: { whiteSpace: "nowrap" } },
-      h("a", { class: "mono", ...linkProps(href) }, entry.name),
+      null,
+      h(
+        "a",
+        {
+          class: "mono truncate",
+          title: entry.name,
+          style: { maxWidth: "24ch" },
+          ...linkProps(href),
+        },
+        entry.name,
+      ),
     ),
     h(
       "td",
-      { class: "dim mono", style: { fontSize: "12px", overflowWrap: "anywhere" } },
+      {
+        class: "dim mono",
+        style: { fontSize: "12px", overflowWrap: "anywhere", minWidth: "24ch" },
+      },
       entry.form,
     ),
     h(

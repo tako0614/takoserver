@@ -38,8 +38,14 @@ export function health(resource: ResourceSummary): Health {
   }
   // Idle with the latest generation observed is the Host's settled state.
   // A Form that has no notion of readiness (an artifact bundle, say) ends
-  // here, and saying "Unknown" about a finished create misleads.
-  if (resource.observedAt !== null && !("ready" in resource.observed)) {
+  // here, and saying "Unknown" about a finished create misleads. A Form
+  // that reports any top-level flag as false (a SQLiteDatabase whose
+  // database is gone reports databaseExists: false) is not called Applied.
+  if (
+    resource.observedAt !== null &&
+    !("ready" in resource.observed) &&
+    !Object.values(resource.observed).includes(false)
+  ) {
     return { phase: "Applied", tone: "ok", reason: null, message: null, stale };
   }
   return { phase: "Unknown", tone: "idle", reason: null, message: null, stale };
