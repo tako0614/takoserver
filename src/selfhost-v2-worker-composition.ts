@@ -1362,14 +1362,25 @@ function createWorkerComposition(
             : {}),
           backend: runtimeVersionForm.backend,
         };
-    const forwardVersionForm = forwardFamily
+    const forwardRuntimeVersionForm = forwardFamily
       ? createInternalV2ForwardWorkerVersionForm({
           ...versionOptions,
-          ...(allowPrivateInputs && forwardConfiguredInputSealer && configuredInputCustody
+          ...(forwardConfiguredInputSealer && configuredInputCustody
             ? { configuredInputSealer: forwardConfiguredInputSealer, configuredInputCustody }
             : {}),
         })
       : undefined;
+    const forwardAdmissionVersionForm =
+      forwardRuntimeVersionForm && !allowPrivateInputs
+        ? createInternalV2ForwardWorkerVersionForm(versionOptions)
+        : forwardRuntimeVersionForm;
+    // Public admission may refuse sensitive fresh inputs while retained runtime
+    // operations keep the same boot-captured ciphertext authority and backend.
+    // Spreading the actual admission Form preserves its Core-issued exact refs.
+    const forwardVersionForm =
+      forwardRuntimeVersionForm && forwardAdmissionVersionForm
+        ? { ...forwardAdmissionVersionForm, backend: forwardRuntimeVersionForm.backend }
+        : undefined;
     return {
       ...(forwardVersionForm
         ? {
