@@ -439,6 +439,7 @@ function runFileAndLedger(
         schema !== "main" ||
         origin !== null ||
         b !== "fts5" ||
+        a === null ||
         a !== asciiLower(ftsCreate.declaration.name)
       )
         return SQLITE.SQLITE_DENY;

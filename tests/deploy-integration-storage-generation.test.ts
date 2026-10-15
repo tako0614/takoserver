@@ -2110,7 +2110,7 @@ describe("retained original reader", () => {
     const before = f.retainedBytes();
     const commands = [...f.process.commands];
     const proof = await f.verify();
-    expect(proof.originalCreate).toEqual(applied.originalCreate);
+    expect(applied.originalCreate).toEqual(proof.originalCreate);
     expect(proof.qualification).toBe("component-simulation-only");
     expect(proof.nativeReadback).toEqual({
       authority: "component-simulation",
@@ -2193,7 +2193,7 @@ describe("retained original reader", () => {
   test("historical native-format ports never upgrade a component GET observer", async () => {
     const f = originalReaderFixture();
     await f.apply();
-    for (const commandPort of ["owner-default", "composing-source-owned"]) {
+    for (const commandPort of ["owner-default", "composing-source-owned"] as const) {
       rewriteControlledOriginalChain(f, (_stage, binding) => {
         binding.authority = "provider-native";
         binding.commandPort = commandPort;
