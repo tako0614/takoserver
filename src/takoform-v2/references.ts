@@ -1,7 +1,6 @@
 import { canonicalJson } from "../json.ts";
 import type { JsonObject, Sql } from "../ports.ts";
 import { isV2FormUrl } from "./identity.ts";
-import type { ResourceRow } from "./store.ts";
 import {
   TakoformV2Error,
   type V2AdmissionPredicate,
@@ -15,6 +14,12 @@ const pathSegment = /^[A-Za-z][A-Za-z0-9_]*$/u;
 const MAX_REFERENCES = 512;
 // Only the additive prepared path has this larger combined declaration budget.
 const MAX_COMBINED_REFERENCES = 515;
+
+// The contract captures every returned SQL field, while inspecting only these
+// identity keys. It does not depend on the persistence implementation's row type.
+type ExactReferenceTargetRow = Readonly<
+  Record<string, unknown> & { readonly uid: string; readonly form_url: string }
+>;
 
 interface PreparedReference {
   resourceUid: string;
@@ -202,7 +207,7 @@ export function createV2ExactReferencePreparation(input: {
 }) {
   const { principal, space, referencesJson, authorizeRead, snapshotAdmission } = input;
   const query = input.sql.query.bind(input.sql);
-  const targets = new Map<string, Promise<Readonly<ResourceRow> | null>>();
+  const targets = new Map<string, Promise<ExactReferenceTargetRow | null>>();
   let open = true;
   let used = false;
   let issued: V2AdmissionPredicate | undefined;
@@ -233,7 +238,7 @@ export function createV2ExactReferencePreparation(input: {
           "SELECT * FROM tf_v2_resources WHERE uid = ? AND principal = ? AND space = ?",
           [resourceUid, principal, space],
         ).then((rows) => {
-          const row = rows[0] as unknown as ResourceRow | undefined;
+          const row = rows[0] as unknown as ExactReferenceTargetRow | undefined;
           return row ? Object.freeze({ ...row }) : null;
         });
         targets.set(resourceUid, pending);
@@ -245,7 +250,7 @@ export function createV2ExactReferencePreparation(input: {
     current();
     if (declared === null) return null;
     const requirements = snapshotRequirements(declared);
-    const selected: Readonly<ResourceRow>[] = [];
+    const selected: ExactReferenceTargetRow[] = [];
     const included = new Set<string>();
     for (const requirement of requirements) {
       const pending = targets.get(requirement.resourceUid);
