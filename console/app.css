@@ -323,6 +323,25 @@ textarea {
   }
 }
 
+/* A phone keeps the top bar on one line: the signed-in name gives way to
+   its icon, and a long organization name is cut instead of pushing the
+   controls out of view. */
+@media (width < 620px) {
+  .topbar {
+    gap: 4px;
+    padding: 0 12px;
+  }
+
+  .topbar__who {
+    display: none;
+  }
+
+  .topbar__org {
+    max-width: 46vw;
+    text-overflow: ellipsis;
+  }
+}
+
 /* --------------------------------------------------------------- pieces -- */
 
 .head {
