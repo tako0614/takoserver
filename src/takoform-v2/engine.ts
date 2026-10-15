@@ -12,7 +12,7 @@ import {
   type V2PrivateInputMap,
   validatePrivateInputCustody,
 } from "./private-inputs.ts";
-import { prepareV2References } from "./references.ts";
+import { createV2ExactReferencePreparation, prepareV2References } from "./references.ts";
 import { type AcceptRecord, createV2Store, type OperationRow, type ResourceRow } from "./store.ts";
 import {
   TakoformV2Error,
@@ -21,6 +21,7 @@ import {
   type V2CreateInput,
   type V2EngineOptions,
   type V2Execution,
+  type V2Form,
   type V2Operation,
   type V2Resource,
 } from "./types.ts";
@@ -127,6 +128,8 @@ function snapshotRequest<T>(request: T): T {
   }
 }
 
+function snapshotAdmission(value: V2AdmissionPredicate): V2AdmissionPredicate;
+function snapshotAdmission(value: V2AdmissionPredicate | null): V2AdmissionPredicate | null;
 function snapshotAdmission(value: V2AdmissionPredicate | null): V2AdmissionPredicate | null {
   if (value === null) return null;
   const sql = value.sql;
@@ -272,6 +275,44 @@ export function createTakoformV2Engine(
   async function permitted(principal: string, space: string, access: "read" | "write") {
     if (!principal) fail("unauthenticated", 401);
     if (!(await options.authorize(principal, space, access))) fail("forbidden", 403);
+  }
+
+  async function prepareAdmission(
+    selected: V2Form,
+    record: AcceptRecord,
+    space: string,
+    formUrl: string,
+    referencesJson: string | null,
+  ) {
+    const prepare = selected.prepareAdmission;
+    if (!prepare) return { admission: undefined, referencesJson, referenceGuard: undefined };
+    const frame = createV2ExactReferencePreparation({
+      sql,
+      principal: record.principal,
+      space,
+      referencesJson,
+      authorizeRead: () => permitted(record.principal, space, "read"),
+      snapshotAdmission,
+    });
+    try {
+      // This frame and its issued result never escape into another request's
+      // acceptance. The spec is a copy of this exact accepted record's bytes.
+      const result = frame.finish(
+        await prepare.call(selected, {
+          action: record.action === "create" ? "create" : "update",
+          principal: record.principal,
+          space,
+          form: formUrl,
+          resourceUid: record.resourceUid,
+          spec: JSON.parse(record.specJson) as JsonObject,
+          prepareExactReferences: frame.prepareExactReferences,
+        }),
+      );
+      if (result === null) fail("dependency_conflict", 409);
+      return result;
+    } finally {
+      frame.close();
+    }
   }
 
   async function ownedResource(principal: string, uid: string, access: "read" | "write") {
@@ -587,19 +628,10 @@ export function createTakoformV2Engine(
           };
         }
       }
-      const admission = selected.prepareAdmission
-        ? snapshotAdmission(
-            await selected.prepareAdmission({
-              action: "create",
-              principal,
-              space: desired.space,
-              form: desired.form,
-              resourceUid: record.resourceUid,
-              spec: JSON.parse(record.specJson) as JsonObject,
-            }),
-          )
-        : undefined;
-      if (admission === null) fail("dependency_conflict", 409);
+      const prepared = selected.prepareAdmission
+        ? await prepareAdmission(selected, record, desired.space, desired.form, referencesJson)
+        : { admission: undefined, referencesJson, referenceGuard: undefined };
+      const admission = prepared.admission;
       const assignedOutput = acceptance?.initialOutput(
         Object.freeze({
           form: desired.form,
@@ -626,11 +658,12 @@ export function createTakoformV2Engine(
         const result = await store.insertCreate(
           record,
           desired,
-          referencesJson,
+          prepared.referencesJson,
           initialOutputJson,
           admission,
+          prepared.referenceGuard,
         );
-        // Only the Form's admission predicate refuses CREATE this way.
+        if (result === "reference_conflict") fail("dependency_conflict", 409);
         if (result === "dependency_conflict")
           fail("dependency_conflict", 409, undefined, admission?.detail);
         if (result === "resource_busy") fail("resource_busy", 409);
@@ -734,27 +767,25 @@ export function createTakoformV2Engine(
         });
         if (configured) record = { ...record, expectedConfiguredPrivateInputs: configured };
       }
-      const admission = selectedForm.prepareAdmission
-        ? snapshotAdmission(
-            await selectedForm.prepareAdmission({
-              action: "update",
-              principal: input.principal,
-              space: target.space,
-              form: target.form_url,
-              resourceUid: target.uid,
-              spec: JSON.parse(record.specJson) as JsonObject,
-            }),
+      const prepared = selectedForm.prepareAdmission
+        ? await prepareAdmission(
+            selectedForm,
+            record,
+            target.space,
+            target.form_url,
+            referencesJson,
           )
-        : undefined;
-      if (admission === null) fail("dependency_conflict", 409);
+        : { admission: undefined, referencesJson, referenceGuard: undefined };
+      const admission = prepared.admission;
       let result: Awaited<ReturnType<typeof store.insertChange>>;
       try {
         result = await store.insertChange(
           record,
-          referencesJson,
+          prepared.referencesJson,
           serializeUpdatesWithPendingReferrers,
           admission,
           acceptance ? target : undefined,
+          prepared.referenceGuard,
         );
         if (result === "accepted") {
           const acceptedOperation = operation(await storedOperation(record.id));
@@ -781,6 +812,7 @@ export function createTakoformV2Engine(
         return winner;
       }
       // The admission predicate, or the pending-referrer serialization guard.
+      if (result === "reference_conflict") fail("dependency_conflict", 409);
       if (result === "dependency_conflict")
         fail(
           "dependency_conflict",
