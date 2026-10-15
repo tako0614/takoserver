@@ -251,6 +251,8 @@ async function fixture(secrets = false) {
         return {
           kind: "ready",
           required: false,
+          // This structural fixture registers no CronTrigger Form or attachments.
+          attachmentUids: [],
           async stillCurrent() {
             return true;
           },
@@ -459,7 +461,7 @@ test("forward materializer refuses damaged held chunks before any sender despite
     const b = await f.basics();
     f.db.exec("DROP TRIGGER tf_v2_artifact_chunk_immutable");
     await f.sql.run("UPDATE tf_v2_artifact_chunks SET bytes=? WHERE resource_uid=?", [
-      new Uint8Array([120]),
+      new Uint8Array([120]).buffer,
       b.artifact.resourceUid,
     ]);
     const op = await f.create(FORWARD_WORKER_DEPLOYMENT_FORM_URL, "deployment", b.spec, false);
@@ -562,7 +564,7 @@ test("forward actual SQLite route CAS keeps the concurrent winner after accepted
     const scopes = [
       WORKER_DEPLOYMENT_FORM_URL,
       "https://edge.forms.takoform.com/forms/WorkerEndpoint/0.3.0/",
-    ];
+    ] as const;
     const expectedParams = [
       execution.operationId,
       execution.resourceUid,
@@ -675,7 +677,7 @@ test("forward07 CREATE seals synthetic sensitive vars and reads only the exact h
           form: FORWARD_WORKER_VERSION_FORM_URL,
           space: "space",
           name: "denied",
-          spec: version.spec,
+          spec: { ...version.spec },
           privateInputs: { TOKEN: "synthetic-forward-value" },
         },
       }),
