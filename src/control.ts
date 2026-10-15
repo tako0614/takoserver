@@ -49,6 +49,12 @@ import {
 import { parseStrictJson, StrictJsonError } from "./strict-json.ts";
 import { type SubscriptionPayments, stripeBillingFailure } from "./stripe-billing.ts";
 import {
+  type createStripeCardSetup,
+  StripeCardSetupError,
+  type StripeCardSetupReceipt,
+} from "./stripe-card-setup.ts";
+import { StripeOnDemandError, type StripeOnDemandService } from "./stripe-on-demand.ts";
+import {
   SubscriptionPlanChangeError,
   type SubscriptionPlanChangeReceipt,
 } from "./stripe-subscription-plan-change.ts";
@@ -217,6 +223,9 @@ export interface CreateControlRoutesOptions {
   };
   /** Hosted policy owns consent and admission; absent on independent legacy wallets. */
   readonly limitPolicy?: OrgLimitPolicy;
+  readonly onDemand?: Pick<StripeOnDemandService, "readTerms">;
+  readonly cardSetup?: ReturnType<typeof createStripeCardSetup>;
+  readonly setupDisclosureRevision?: string;
   readonly catalog: Catalog;
   readonly reseller: Reseller;
   readonly tokens: TokenService;
@@ -384,10 +393,21 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
   return async (request, url) => {
     if (!url.pathname.startsWith("/v1/")) return null;
     try {
-      return await route(request, url);
+      const response = await route(request, url);
+      if (
+        response &&
+        /^\/v1\/organizations\/[^/]+\/wallet\/on-demand(?:\/|$)/u.test(url.pathname)
+      ) {
+        response.headers.set("cache-control", "private, no-store");
+        response.headers.set("x-content-type-options", "nosniff");
+      }
+      return response;
     } catch (error) {
       const response = controlErrorResponse(error);
-      if (RESOURCE_EXECUTION_EVIDENCE_PATH.test(url.pathname)) {
+      if (
+        RESOURCE_EXECUTION_EVIDENCE_PATH.test(url.pathname) ||
+        /^\/v1\/organizations\/[^/]+\/wallet\/on-demand(?:\/|$)/u.test(url.pathname)
+      ) {
         response.headers.set("cache-control", "private, no-store");
         response.headers.set("x-content-type-options", "nosniff");
       }
@@ -891,6 +911,67 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       }
     }
 
+    const onDemandTerms = /^\/v1\/organizations\/([^/]+)\/wallet\/on-demand\/terms$/u.exec(
+      url.pathname,
+    );
+    if (onDemandTerms && request.method === "GET") {
+      const organizationId = segment(onDemandTerms[1]);
+      await scoped(request, organizationId, "wallet:read");
+      if (!options.hostedBilling || !options.onDemand || !options.setupDisclosureRevision)
+        controlError("not_found", 404);
+      return Response.json({
+        terms: await options.onDemand.readTerms(),
+        setupDisclosureRevision: options.setupDisclosureRevision,
+      });
+    }
+
+    const cardSetup = /^\/v1\/organizations\/([^/]+)\/wallet\/on-demand\/card-setup$/u.exec(
+      url.pathname,
+    );
+    if (cardSetup && request.method === "POST") {
+      const organizationId = segment(cardSetup[1]);
+      const actor = await scoped(request, organizationId, "payments:write");
+      if (!options.hostedBilling || !options.cardSetup || !options.setupDisclosureRevision)
+        controlError("not_found", 404);
+      const body = await jsonObject(request);
+      exactKeys(body, ["reference", "setupDisclosureRevision"]);
+      const reference = billingReference(text(body.reference));
+      const disclosure = onDemandRevision(body.setupDisclosureRevision);
+      const original = await options.cardSetup.read(organizationId, reference);
+      if (original === null && disclosure !== options.setupDisclosureRevision)
+        controlError("conflict", 409);
+      const result = await options.cardSetup.begin({
+        organizationId,
+        reference,
+        authorizedPrincipal: `${actor.kind}:${actor.hostPrincipalId}`,
+        setupDisclosureRevision: disclosure,
+      });
+      const selection = await options.cardSetup.readSelection(organizationId, reference);
+      return Response.json({
+        receipt: wireCardSetup(result.receipt),
+        checkout: result.checkout === null ? null : { url: result.checkout.url },
+        selection:
+          selection === null
+            ? null
+            : {
+                paymentMethodId: selection.paymentMethodId,
+                setupIntentId: selection.setupIntentId,
+              },
+      });
+    }
+
+    const cardSetupReceipt =
+      /^\/v1\/organizations\/([^/]+)\/wallet\/on-demand\/card-setup\/([^/]+)$/u.exec(url.pathname);
+    if (cardSetupReceipt && request.method === "GET") {
+      const organizationId = segment(cardSetupReceipt[1]);
+      await scoped(request, organizationId, "wallet:read");
+      if (!options.hostedBilling || !options.cardSetup) controlError("not_found", 404);
+      const reference = billingPathReference(cardSetupReceipt[2]);
+      const receipt = await options.cardSetup.read(organizationId, reference);
+      if (receipt === null) controlError("not_found", 404);
+      return Response.json({ cardSetup: wireCardSetup(receipt) });
+    }
+
     const limitPolicy = /^\/v1\/organizations\/([^/]+)\/wallet\/limit-policy$/u.exec(url.pathname);
     if (limitPolicy && ["GET", "PATCH"].includes(request.method)) {
       const organizationId = segment(limitPolicy[1]);
@@ -905,7 +986,20 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       const body = await jsonObject(request);
       const mode = text(body.onLimit);
       if (mode === "stop" || mode === "prepaid") exactKeys(body, ["reference", "onLimit"]);
-      else if (mode === "on-demand" || mode === "postpaid")
+      else if (mode === "on-demand")
+        exactKeys(
+          body,
+          [
+            "reference",
+            "onLimit",
+            "cashCapMinor",
+            "consentRevision",
+            "termsRevision",
+            "paymentMethodId",
+          ],
+          ["setupIntentId"],
+        );
+      else if (mode === "postpaid")
         exactKeys(body, ["reference", "onLimit", "cashCapMinor", "consentRevision"]);
       else controlError("invalid_argument", 400);
       return Response.json(
@@ -918,7 +1012,19 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
             ? {}
             : {
                 cashCapMinor: integer(body.cashCapMinor),
-                consentRevision: bounded(body.consentRevision, 512),
+                consentRevision:
+                  mode === "on-demand"
+                    ? onDemandRevision(body.consentRevision)
+                    : bounded(body.consentRevision, 512),
+                ...(mode === "on-demand"
+                  ? {
+                      termsRevision: onDemandRevision(body.termsRevision),
+                      paymentMethodId: bounded(body.paymentMethodId, 255),
+                      ...(body.setupIntentId === undefined
+                        ? {}
+                        : { setupIntentId: bounded(body.setupIntentId, 255) }),
+                    }
+                  : {}),
               }),
         }),
       );
@@ -1873,9 +1979,17 @@ function classify(error: unknown): { code: string; status: number } {
         ? { code: "billing_unavailable", status: 503 }
         : { code: "conflict", status: 409 };
   }
+  if (error instanceof StripeCardSetupError) {
+    return error.code === "invalid_argument"
+      ? { code: "invalid_argument", status: 400 }
+      : error.code === "conflict"
+        ? { code: "conflict", status: 409 }
+        : { code: "billing_unavailable", status: 503 };
+  }
   if (
     error instanceof OrgWorkspaceUsageError ||
     error instanceof OrgLimitPolicyError ||
+    error instanceof StripeOnDemandError ||
     error instanceof SubscriptionPlanChangeError
   ) {
     return billingExtensionFailure(error.code, error.status);
@@ -2198,6 +2312,14 @@ function billingRevision(value: unknown): string {
   return parsed;
 }
 
+function onDemandRevision(value: unknown): string {
+  const parsed = bounded(value, 128);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(parsed)) {
+    controlError("invalid_argument", 400);
+  }
+  return parsed;
+}
+
 function billingMeter(value: unknown): string {
   const parsed = bounded(value, 128);
   if (!/^[a-z][a-z0-9.-]{0,127}$/u.test(parsed) || parsed.includes("..")) {
@@ -2243,6 +2365,16 @@ function checkedMinorToMicros(value: number): number {
     if (error instanceof MoneyError) controlError("invalid_argument", 400);
     throw error;
   }
+}
+
+function wireCardSetup(receipt: StripeCardSetupReceipt): StripeCardSetupReceipt {
+  return {
+    reference: receipt.reference,
+    state: receipt.state,
+    setupDisclosureRevision: receipt.setupDisclosureRevision,
+    sessionExpired: receipt.sessionExpired,
+    observedAt: receipt.observedAt,
+  };
 }
 
 function wireWallet(wallet: Wallet) {

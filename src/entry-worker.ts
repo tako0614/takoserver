@@ -6,6 +6,7 @@ import { errorEnvelopeResponse } from "./error-envelope.ts";
 import {
   createCanonicalHostedBillingComposition,
   type HostedBillingComposition,
+  type HostedOnDemandConfiguration,
 } from "./hosted-billing-composition.ts";
 import { verifyHostedBillingFinancialRealm } from "./hosted-billing-realm.ts";
 import { assertHostedPricingMatchesBilling, parseHostedPricing } from "./hosted-pricing.ts";
@@ -30,6 +31,7 @@ import {
   createOperatorSettlement,
 } from "./operator-credentials.ts";
 import { assertOrgBillingSchema } from "./org-billing.ts";
+import { parseOrgOnDemandTerms } from "./org-on-demand-terms.ts";
 import { paymentSettingsFromEnvironment } from "./payment-settings.ts";
 import { resolvePayment } from "./payment-setup.ts";
 import type { Clock, ObjectStoreAccess, Sql } from "./ports.ts";
@@ -49,6 +51,7 @@ import {
 } from "./runtime-input-seal-keyring.ts";
 import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
+import { parseStrictJson } from "./strict-json.ts";
 import { assertStripeBillingSchema } from "./stripe-billing.ts";
 import { createStripeBillingClient } from "./stripe-billing-client.ts";
 import { assertStripeModeRealm, parseStripeMode } from "./stripe-mode-realm.ts";
@@ -108,6 +111,8 @@ export interface WorkerEnv {
   readonly TAKOSERVER_HOSTED_PRICING?: string;
   /** Exact opt-in to the separately qualified Hosted TEST payment composition. */
   readonly TAKOSERVER_HOSTED_BILLING?: string;
+  /** Explicit inline terms/card-flow JSON; accepted only with canonical-test. */
+  readonly TAKOSERVER_HOSTED_BILLING_ON_DEMAND?: string;
   /** Non-secret deployment-selected account and stable billing authority. */
   readonly TAKOSERVER_HOSTED_BILLING_ACCOUNT_ID?: string;
   readonly TAKOSERVER_HOSTED_BILLING_AUTHORITY?: string;
@@ -195,6 +200,64 @@ function canonicalHostedBillingSelected(selection: string | undefined): boolean 
     throw new TypeError("TAKOSERVER_HOSTED_BILLING must be canonical-test or absent");
   }
   return selection === "canonical-test";
+}
+
+function parseHostedOnDemandEnvironment(
+  raw: string | undefined,
+  canonicalHostedBilling: boolean,
+): HostedOnDemandConfiguration | undefined {
+  if (raw === undefined) return undefined;
+  if (!canonicalHostedBilling) {
+    throw new TypeError("TAKOSERVER_HOSTED_BILLING_ON_DEMAND requires canonical-test");
+  }
+  try {
+    if (typeof raw !== "string") throw new TypeError();
+    const bytes = new TextEncoder().encode(raw);
+    const value = parseStrictJson(bytes, bytes.byteLength);
+    if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError();
+    const fields = value as Record<string, unknown>;
+    if (
+      Object.keys(fields).length !== 3 ||
+      !["terms", "cardSetupReturnUrls", "setupDisclosureRevision"].every((key) =>
+        Object.hasOwn(fields, key),
+      ) ||
+      typeof fields.setupDisclosureRevision !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(fields.setupDisclosureRevision)
+    )
+      throw new TypeError();
+    const terms = parseOrgOnDemandTerms(fields.terms);
+    const urls = fields.cardSetupReturnUrls;
+    if (typeof urls !== "object" || urls === null || Array.isArray(urls)) throw new TypeError();
+    const returns = urls as Record<string, unknown>;
+    if (
+      Object.keys(returns).length !== 2 ||
+      !["successUrl", "cancelUrl"].every((key) => Object.hasOwn(returns, key))
+    )
+      throw new TypeError();
+    const returnUrl = (value: unknown): string => {
+      if (typeof value !== "string" || value.length > 2048) throw new TypeError();
+      const parsed = new URL(value);
+      if (
+        parsed.protocol !== "https:" ||
+        parsed.username ||
+        parsed.password ||
+        parsed.hash ||
+        [...parsed.searchParams.keys()].some((key) => /secret|token/iu.test(key))
+      )
+        throw new TypeError();
+      return value;
+    };
+    const successUrl = returnUrl(returns.successUrl);
+    const cancelUrl = returnUrl(returns.cancelUrl);
+    if (new URL(successUrl).origin !== new URL(cancelUrl).origin) throw new TypeError();
+    return Object.freeze({
+      terms,
+      cardSetupReturnUrls: Object.freeze({ successUrl, cancelUrl }),
+      setupDisclosureRevision: fields.setupDisclosureRevision,
+    });
+  } catch {
+    throw new TypeError("TAKOSERVER_HOSTED_BILLING_ON_DEMAND must be complete valid JSON");
+  }
 }
 
 export function workerCredentials(
@@ -894,7 +957,12 @@ async function composeApp(
     return pricing;
   });
   const canonicalHostedInputs = startupStage("runtime-configuration", () => {
-    if (!canonicalHostedBillingSelected(env.TAKOSERVER_HOSTED_BILLING)) return undefined;
+    const canonicalHostedBilling = canonicalHostedBillingSelected(env.TAKOSERVER_HOSTED_BILLING);
+    const onDemand = parseHostedOnDemandEnvironment(
+      env.TAKOSERVER_HOSTED_BILLING_ON_DEMAND,
+      canonicalHostedBilling,
+    );
+    if (!canonicalHostedBilling) return undefined;
     if (
       env.TAKOSERVER_STRIPE_MODE !== "test" ||
       !billingConfig ||
@@ -944,6 +1012,7 @@ async function composeApp(
       consoleOrigin,
       webhookSecret,
       settings: Object.freeze(settings),
+      ...(onDemand === undefined ? {} : { onDemand }),
     };
   });
   // File-backed tariff loading can be designed separately; this release accepts inline JSON only.
@@ -1056,6 +1125,9 @@ async function composeApp(
         consoleOrigin: canonicalHostedInputs.consoleOrigin,
         webhookSecret: canonicalHostedInputs.webhookSecret,
         settings: canonicalHostedInputs.settings,
+        ...(canonicalHostedInputs.onDemand === undefined
+          ? {}
+          : { onDemand: canonicalHostedInputs.onDemand }),
         warnings: { state: "unavailable", reason: "transport-not-composed" },
       });
     } catch (error) {

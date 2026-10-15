@@ -4,6 +4,9 @@ import committedSharedHostedPricing from "../config/shared-hosted-pricing.json" 
 import retainedSharedHostedPricingV1 from "../config/shared-hosted-pricing-revisions/hosted-20261014-final-v1.json" with {
   type: "json",
 };
+import retainedContainerPricingV1 from "../config/shared-hosted-pricing-revisions/hosted-20261015-container-proposed-v1.json" with {
+  type: "json",
+};
 import { type BillingConfig, BillingConfigError, parseBillingConfig } from "./billing-config.ts";
 import { canonicalJson } from "./json.ts";
 import { MoneyError, minorToMicros } from "./money.ts";
@@ -18,7 +21,11 @@ import { parseStrictJson } from "./strict-json.ts";
 const committedSharedPricing = parseSharedHostedPricing(committedSharedHostedPricing);
 const committedSharedTerms = sharedTermsWithoutStripeIds(committedSharedPricing);
 const retainedSharedTerms = new Map<string, string>();
-for (const source of [retainedSharedHostedPricingV1, committedSharedHostedPricing]) {
+for (const source of [
+  retainedSharedHostedPricingV1,
+  retainedContainerPricingV1,
+  committedSharedHostedPricing,
+]) {
   const reviewed = parseSharedHostedPricing(source);
   if (
     reviewed.plans.some((plan) => plan.stripePriceId !== null) ||

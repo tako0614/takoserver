@@ -96,6 +96,51 @@ describe("hosted pricing runtime policy", () => {
     );
   });
 
+  test("retains the published Container v1 bytes and original egress terms across the v2 correction", () => {
+    const sourcePath =
+      "../config/shared-hosted-pricing-revisions/hosted-20261015-container-proposed-v1.json";
+    expect(
+      createHash("sha256")
+        .update(readFileSync(new URL(sourcePath, import.meta.url)))
+        .digest("hex"),
+    ).toBe("4fc49292e0a04c8656f57b9204b26e4bbdba23316b1ef74b907e0d3e1f3d4401");
+    const original = sharedAuthoring(sourcePath);
+    const bytes = JSON.stringify(original);
+    const retained = parsePersistedHostedPricing(bytes, original.sharedPricing.revision);
+    expect(retained?.environment.TAKOSERVER_HOSTED_PRICING).toBe(bytes);
+    const historical = parseBillingConfig(retained?.environment.TAKOSERVER_BILLING_CONFIG);
+    expect(historical?.revision).toBe("hosted-20261015-container-proposed-v1");
+    expect(historical?.meters["container.egress"]).toEqual({
+      unit: "GB",
+      rate: { numeratorMicros: "150000", denominator: "1" },
+    });
+    const current = sharedAuthoring();
+    const compiled = compilePricingAuthoring({
+      ...current,
+      billingConfig: {
+        ...current.billingConfig,
+        effectiveAt: "2026-10-15T00:00:00.000Z",
+        history: [original.billingConfig],
+      },
+    });
+    const tariff = parseBillingConfig(compiled.environment.TAKOSERVER_BILLING_CONFIG);
+    expect(tariff?.revision).toBe("hosted-20261015-container-proposed-v2");
+    expect(tariff?.meters["container.egress"]).toEqual({
+      unit: "GB",
+      rate: { numeratorMicros: "75000", denominator: "1" },
+    });
+    expect(tariff?.history?.[0]?.meters).toEqual(original.billingConfig.meters);
+    expect(() => compilePricingAuthoring(original)).toThrow(/reviewed source/u);
+    expect(() => parseHostedPricing(bytes)).toThrow(HostedPricingError);
+    original.sharedPricing.meters["container.egress"].cloudflareCostMicros = "25000";
+    const changed = original.billingConfig.meters["container.egress"];
+    if (!changed) throw new Error("missing retained Container egress fixture");
+    changed.rate.numeratorMicros = "75000";
+    expect(() =>
+      parsePersistedHostedPricing(JSON.stringify(original), original.sharedPricing.revision),
+    ).toThrow(HostedPricingError);
+  });
+
   test("rejects self-consistent v2 cash, allowance, identity, markup, meter, and warning drift", () => {
     const changedCash = sharedAuthoring();
     changedCash.sharedPricing.plans[0].monthlyPriceMicros = "1000000";
@@ -190,7 +235,7 @@ describe("hosted pricing runtime policy", () => {
     });
     expect(billing?.meters["container.egress"]).toEqual({
       unit: "GB",
-      rate: { numeratorMicros: "150000", denominator: "1" },
+      rate: { numeratorMicros: "75000", denominator: "1" },
     });
     expect(billing?.meters["container.image-storage"]).toEqual({
       unit: "GB-month",
@@ -263,7 +308,7 @@ describe("hosted pricing runtime policy", () => {
       },
     });
     const billing = parseBillingConfig(pricing.environment.TAKOSERVER_BILLING_CONFIG);
-    expect(billing?.revision).toBe("hosted-20261015-container-proposed-v1");
+    expect(billing?.revision).toBe("hosted-20261015-container-proposed-v2");
     expect(billing?.history?.[0]?.revision).toBe("hosted-20261014-final-v1");
     expect(billing?.history?.[0]?.meters).toEqual(historical.meters);
     expect(billing?.history?.[0]?.meters["container.memory"]).toBeUndefined();
@@ -333,7 +378,7 @@ describe("hosted pricing runtime policy", () => {
       HostedPricingError,
     );
     const transplant = sharedAuthoring(sourcePath);
-    transplant.sharedPricing.revision = "hosted-20261015-container-proposed-v1";
+    transplant.sharedPricing.revision = "hosted-20261015-container-proposed-v2";
     transplant.billingConfig.revision = transplant.sharedPricing.revision;
     expect(() =>
       parsePersistedHostedPricing(JSON.stringify(transplant), transplant.sharedPricing.revision),

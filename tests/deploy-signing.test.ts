@@ -890,13 +890,13 @@ describe("split signing authority surfaces", () => {
       const local = readMigrationArtifact().names;
       const realmMigrationIndex = local.indexOf("0098_stripe_mode_realm.sql");
       expect(realmMigrationIndex).toBe(97);
-      expect(local.at(-1)).toBe("0099_hosted_billing_extensions.sql");
+      expect(local.at(-1)).toBe("0100_hosted_on_demand.sql");
       const incompleteCurrentSchema = local.slice(0, realmMigrationIndex);
       expect(incompleteCurrentSchema).toContain("0094_wallet_usd_micros.sql");
       expect(incompleteCurrentSchema).not.toContain("0098_stripe_mode_realm.sql");
       for (const [applied, message] of [
         [incompleteCurrentSchema, "exact current audited D1 schema with 0094 USD-micros policy"],
-        [[...local, "0100_foreign.sql"], "D1 has more applied migrations"],
+        [[...local, "0101_foreign.sql"], "D1 has more applied migrations"],
       ] as const) {
         const migrations: SigningMigrationReader = { read: async () => ({ local, applied }) };
         await expect(

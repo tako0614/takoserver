@@ -20,7 +20,7 @@ The historical cents proposal is not the new settlement authority.
 | Subscription | `GET`, `POST`, `PATCH /v1/organizations/{organizationId}/payments/subscription` | Next-period plan change, preserving existing start/cancellation shapes |
 | Top-up | `POST /v1/organizations/{organizationId}/wallet/checkout` | Durable reference and payment scope; this existing route is the top-up API |
 | Personal Organization | Generic `POST /v1/organizations` | Proposed session-only `POST /v1/organizations/personal`, unique per local principal |
-| Limit policy | Not implemented | Proposed `GET`/`PATCH /v1/organizations/{organizationId}/wallet/limit-policy` |
+| Limit policy | `GET`/`PATCH /v1/organizations/{organizationId}/wallet/limit-policy` | Explicit on-demand terms/card consent; postpaid remains disabled |
 | Pricing publication | Existing authoring/compiler and immutable tariff registration | Reviewed publication/readback using the same revision authority |
 | Webhooks | `POST /v1/payments/stripe/webhook` | Reuse invoice/subscription/Checkout/refund settlement and reconciliation |
 
@@ -30,8 +30,8 @@ separate requirements. Routes and shapes are defined by the
 [route table](../src/route-table.ts), [control boundary](../src/control.ts),
 and [generated OpenAPI](../openapi/takoserver.openapi.json). The
 [implementation guide](subscriptions-refunds.md) describes actual receipt and
-availability behavior. Unavailable future payment modes below are design
-requirements, not implemented capabilities.
+availability behavior. Postpaid remains unavailable. On-demand is an explicit optional source
+composition, with its public contract below; source availability does not qualify staging.
 
 [#343](https://github.com/tako0614/takoserver/pull/343), head
 `8c0ff298a1ab560f2a66c93a341e2d7fb8c6b67a`, owns the subscription table's
@@ -100,7 +100,7 @@ Hosted commercial defaults merely by running Takoserver OSS.
 | Holds/capture/release | `wallet:write` |
 | Closed usage submission/listing | `usage:write` / `usage:read` |
 | Subscription and top-up commands | `payments:write`, or the existing permitted owner session |
-| Limit-policy changes | Proposed `payments:write`, or permitted owner session; wallet writers cannot authorize card charges |
+| Limit-policy changes and card registration | `payments:write`, or permitted owner session; wallet writers cannot authorize card charges |
 | Personal Organization creation | Authenticated local Takoserver principal's session only |
 | Webhook | Signature over exact raw bytes, followed by realm/custody verification |
 
@@ -457,22 +457,26 @@ Until funding, recovery and refund lookup all qualify, capability remains false.
 Specify the top-up quantum/minimum through validated operator configuration
 and disclose it before consent. Do not choose a silent default cash cap.
 
-Proposed GET returns `{onLimit, capabilities, consentRevision, cashCapMinor,
+GET returns `{onLimit, capabilities, consentRevision, cashCapMinor,
 periodStart, periodEnd}` with unavailable modes marked false. For on-demand,
 these policy periods are the UTC cap month; prepaid/stop expose that same month
 for configuration consistency, independently of usage-summary grant periods.
 Future postpaid capability must separately declare its invoice period in its
-reviewed consent terms. PATCH accepts
-`{reference, onLimit}` for stop/prepaid; on-demand/postpaid additionally require
-`cashCapMinor` and an acknowledged `consentRevision`. `cashCapMinor` is a positive
-safe integer cents and must meet separately disclosed bounds. Reject extra
-fields; replay/conflict rules match other payment commands. Consent revisions
-identify the exact displayed charge/cap terms. Authorize and record the owner
-or delegated payment principal. Modes that lack runtime capability return
-`503 billing_unavailable`
-without persisting an active policy or charging money. Changing cap/mode does
-not cancel existing remote effects; serialize outstanding exposure and never
-lower a cap below paid/reserved exposure.
+reviewed consent terms. PATCH accepts `{reference, onLimit}` for stop/prepaid.
+On-demand requires `reference`, `onLimit`, `cashCapMinor`, `consentRevision`,
+`termsRevision`, `paymentMethodId` and optional `setupIntentId`; postpaid retains
+its unavailable four-field shape with cash cap and consent revision.
+`cashCapMinor` is positive safe integer USD cents within the published bounds.
+Reject extra fields; replay/conflict rules match other payment commands. An
+exact original policy replay precedes current terms/card revalidation. Changed
+original payload or payment principal conflicts. Revisions identify the exact
+displayed terms; a saved card or successful registration is never cash consent.
+Authorize and record the owner or delegated payment principal. An unavailable
+mode cannot persist an active policy or charge money. Changing cap/mode does
+not cancel remote effects. A stop transition atomically abandons never-dispatched
+commands and releases their reservations; dispatched unknown effects retain
+original exposure. Other changes serialize outstanding exposure and never lower
+a cap below paid/reserved exposure.
 
 The older settled pricing proposal rejects invoice-style postpaid at launch;
 this task retains the four-value vocabulary. The launch decision remains with
@@ -488,6 +492,65 @@ separately reviewed execution, exposure and collection behavior; until then
 `capabilities.postpaid` remains `false` and postpaid commands are rejected,
 including an original command replay. Staging acceptance must cover each
 advertised available mode; unsupported modes must be visibly rejected.
+
+## On-demand terms, card registration and funding
+
+The canonical composition accepts an optional explicit on-demand configuration.
+Without it, on-demand capability stays false. It supplies immutable terms,
+validity, USD funding quantum/minimum/maximum, user-selected cap bounds,
+purchased-credit expiry, card-setup return URLs and a disclosure revision.
+There are no default economic values, cap, consent, card or production authority.
+The mode requires the genuine TEST realm and the shared funding store.
+
+All paths below are under `/v1/organizations/{organizationId}/wallet/on-demand`
+and return `Cache-Control: private, no-store` on success and failure.
+
+| Method/path | Scope | Result |
+| --- | --- | --- |
+| `GET /terms` | `wallet:read` | `{terms, setupDisclosureRevision}` with the explicit terms |
+| `POST /card-setup` | `payments:write` | `{receipt, checkout, selection}` for `{reference, setupDisclosureRevision}` |
+| `GET /card-setup/{reference}` | `wallet:read` | `{cardSetup: receipt}` from SQL only |
+
+The setup receipt contains only `reference`, `state`, `setupDisclosureRevision`,
+`sessionExpired` and nullable `observedAt`. The POST may return a transient
+Checkout `{url}`. Repeating that same POST after verified success may return
+`selection: {paymentMethodId, setupIntentId}` for a later, separate policy PATCH.
+The GET returns neither an action URL nor a payment selector, and makes no
+processor request. No API returns full card objects or processor client secrets.
+Both scopes are bound to the exact Organization before parsing or lookup.
+
+A cardless Free Organization may register without buying a plan or top-up.
+Setup uses the original independent customer custody and `mode=setup`; it grants
+no wallet credit and creates no charge consent. A new reference must acknowledge
+the current disclosure. An exact original replay retains its original actor and
+disclosure even after publication changes. Session expiry alone does not prove
+SetupIntent cancellation or authorize another remote effect.
+
+Fresh holds or new closed usage first try eligible local credit. Only a genuine
+eligible-credit deficit may prepare one immutable original cash command and
+reserve its UTC cash cap atomically. The disclosed rule is
+`max(minimumChargeMinor, ceil(deficitMicros / (fundingQuantumMinor * 10000)) * fundingQuantumMinor)`;
+an amount above the explicit maximum is refused. First dispatch recalculates the
+quote from current deficit and the saved terms. If another funding source changes
+the quantum result, retain the prepared command/reservation and refuse dispatch;
+do not resize it, rotate the cash reference or issue a replacement charge. Zero
+deficit or accepted original admission uses the existing atomic abandonment path.
+
+First dispatch rechecks accepted receipts, capacity, debt, consent, terms, card,
+policy and original month before committing its unique dispatch marker. Only
+that winner sends one off-session card PaymentIntent request. Dispatched unknown
+outcomes, expired remote idempotency windows, SCA and processor failures block
+new charging; recovery reads the exact original through GET only. Already-paid
+credit remains usable without reauthorizing a new card charge. Capture, release,
+sweeps, metering folds and replay of accepted admission never initiate funding.
+
+Verified successful funding atomically records one purchased lot, ledger/grant
+proof, terminal and paid exposure through the existing store. Expiry starts at
+its first durable funding instant and is preserved on replay. Original refunds
+share the old/new source projection; native refund observations are monotonic,
+fenced with their receipt, and cannot be discarded by grant/refund replay.
+Refund debt or an unresolved fence blocks new billable admission. An immutable
+past terminal is not rewritten by a newer observation.
 
 ## Holds and accounting invariants
 
@@ -561,14 +624,15 @@ usage, subscription command, invoice and refund basis. Delayed usage selects
 its historical period-start revision and splits measurements across rate
 boundaries. New revisions never reprice existing holds or paid periods.
 
-The Container hook is explicitly pending owner input:
-`{component: "container", status: "pending-owner-diff", revision: null, rates: null}`
-in the publication planning manifest, outside the active runtime meter map.
-A supplied diff must contain its revision, effective time, measurement units,
-exact rational overage basis, three-times customer rate and compatibility impact.
-Review/compile it before activation. Missing input is unsupported Container
-pricing, not zero-price usage; never invent provider costs or a Stripe Price.
-Any existing Container pricing remains under its current owner until replacement.
+The reviewed Container source includes CPU, memory, image storage and egress
+rates described in [shared Hosted pricing](shared-hosted-pricing.md). The owner
+selected a USD0.025/GB Cloudflare NA/EU egress cost basis; the new source revision
+charges USD0.075/GB at three times that basis. Retain the preceding immutable
+revision and its original rates for past grants, holds, usage and invoices.
+Source registration does not activate a tariff or qualify measurement. Any
+future supplied revision must still declare effective time, units, exact rational
+overage basis, customer rate and compatibility impact. Missing measurement or
+revision input remains unsupported pricing and never becomes zero-price usage.
 
 Use the owning repository's publication entrypoint with an exact reviewed
 candidate and private target. Read back the active revision and actual public

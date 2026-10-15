@@ -117,11 +117,12 @@ describe("curated deploy extension schema readback", () => {
     const legacy = deployExtension.readAuditedMigrationArtifact();
     const current = deployExtension.readCurrentAuditedMigrationSourceArtifact();
     expect(legacy.names).toHaveLength(66);
-    expect(current.names).toHaveLength(99);
+    expect(current.names).toHaveLength(100);
     expect(current.names.slice(0, legacy.names.length)).toEqual([...legacy.names]);
-    expect(current.files.at(-3)?.name).toBe("0097_subscription_cancellation_custody.sql");
-    expect(current.files.at(-2)?.name).toBe("0098_stripe_mode_realm.sql");
-    expect(current.files.at(-1)?.name).toBe("0099_hosted_billing_extensions.sql");
+    expect(current.files.at(-4)?.name).toBe("0097_subscription_cancellation_custody.sql");
+    expect(current.files.at(-3)?.name).toBe("0098_stripe_mode_realm.sql");
+    expect(current.files.at(-2)?.name).toBe("0099_hosted_billing_extensions.sql");
+    expect(current.files.at(-1)?.name).toBe("0100_hosted_on_demand.sql");
   });
 
   test("reads a 0057 schema through the curated read-only database port", async () => {

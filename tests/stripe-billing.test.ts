@@ -1046,7 +1046,9 @@ describe("Hosted Stripe billing service", () => {
         request.method === "POST" && new URL(request.url).pathname === "/v1/checkout/sessions",
     );
     expect(await post?.text()).toContain("price_final50");
-    const revision = "hosted-20261015-container-proposed-v1";
+    const revision = parseBillingConfig(
+      twoPlanPricing().environment.TAKOSERVER_BILLING_CONFIG,
+    )?.revision;
     h.state.subscriptions.set(
       SUBSCRIPTION,
       subscription({
