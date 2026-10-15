@@ -299,6 +299,10 @@ export {
   type V2NativeEffectIdentity,
   type V2NativeEffectInspection,
 } from "./worker-native-effects.ts";
+export {
+  inspectV2WorkerNativeIdentityDomain,
+  type V2WorkerNativeIdentityDomain,
+} from "./worker-native-identity-schema.ts";
 export type { V2ForwardWorkerFamilyProfile } from "./worker-publication-state.ts";
 export {
   createV2WorkerPublicationState,
