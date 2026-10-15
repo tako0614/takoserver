@@ -860,6 +860,108 @@ test("Queue owner DELETE joins an automatically replaced child still behind its 
   }
 });
 
+test("Queue owner DELETE refuses a foreign listener and confirms after it is released", async () => {
+  const root = await mkdtemp(join(tmpdir(), "takoserver-queue-owner-foreign-"));
+  const binary = join(root, "bun-workerd-stand-in.js");
+  const publication = publicationState();
+  const children: FixtureChild[] = [];
+  let listenerPort = 0;
+  let foreign: ReturnType<typeof Bun.serve> | undefined;
+  await writeFile(binary, `#!${process.execPath}\n${CHILD_SOURCE}`, { mode: 0o700 });
+  await chmod(binary, 0o700);
+  const owner = await openWorkerdWorkerRuntimeOwner({
+    rootDirectory: join(root, "owners"),
+    workerResourceUid: WORKER_UID,
+    targetKey: TARGET_KEY,
+    publicationState: publication.source,
+    workerdBinary: binary,
+    async listenerPortForOperation() {
+      listenerPort = await unusedPort();
+      return listenerPort;
+    },
+    spawn(command): WorkerdProcess {
+      const child = spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "ignore" });
+      children.push(child);
+      return child;
+    },
+  });
+  let primaryFailure: FixtureFailure;
+  const cleanup = async () => {
+    const errors: unknown[] = [];
+    try {
+      await foreign?.stop(true);
+    } catch (error) {
+      errors.push(error);
+    }
+    try {
+      await closeFixtureOwner(owner, children, root);
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1)
+      throw new AggregateError(errors, "Queue foreign-listener cleanup failed");
+  };
+  try {
+    expect(await owner.execute(execution(CREATE_ID, "create"))).toMatchObject({
+      kind: "confirmed",
+    });
+    publication.setCurrent(CREATE_ID);
+    const child = children[0];
+    if (!child?.pid) throw new Error("native child PID missing");
+    const workerKey = createHash("sha256").update(WORKER_UID).digest("hex");
+    const state = JSON.parse(
+      await Bun.file(join(root, "owners", workerKey, "runtime-owner.json")).text(),
+    ) as {
+      incarnations: Array<{ processIdentity: Parameters<typeof linuxProcessLiveness>[0] }>;
+    };
+    const identity = state.incarnations[0]?.processIdentity;
+    if (!identity) throw new Error("persisted child birth identity missing");
+    child.kill("SIGUSR1");
+    const deadline = Date.now() + 3_000;
+    while (
+      Date.now() < deadline &&
+      (await workerPortOwnership(listenerPort, child.pid)) !== "vacant"
+    )
+      await Bun.sleep(20);
+    expect(await linuxProcessLiveness(identity)).toBe("live");
+    expect(await workerPortOwnership(listenerPort, child.pid)).toBe("vacant");
+    child.kill("SIGKILL");
+    await child.exited;
+    expect(await linuxProcessLiveness(identity)).toBe("stale");
+    expect(await workerPortOwnership(listenerPort, undefined)).toBe("vacant");
+    foreign = Bun.serve({
+      hostname: "127.0.0.1",
+      port: listenerPort,
+      fetch: () => new Response("controlled foreign listener"),
+    });
+    expect(await workerPortOwnership(listenerPort, undefined)).toBe("foreign");
+    expect(await owner.execute(execution(DELETE_ID, "delete"))).toEqual({ kind: "unknown" });
+    expect(await retirementFrontier(root, children)).toMatchObject({
+      admissionClosed: true,
+      incarnations: [
+        {
+          status: "uncertain",
+          receiptPresent: false,
+          cleanupStarted: false,
+          copiesReleased: false,
+          birthLiveness: "stale",
+          listener: "foreign",
+          groupRetirementPresent: false,
+        },
+      ],
+    });
+    await foreign.stop(true);
+    foreign = undefined;
+    expect(await workerPortOwnership(listenerPort, undefined)).toBe("vacant");
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
+  } finally {
+    await preserveFixtureFailure(primaryFailure, cleanup);
+  }
+});
+
 test("a candidate whose first child spawn fails can retry the same accepted Operation", async () => {
   const root = await mkdtemp(join(tmpdir(), "takoserver-queue-owner-candidate-retry-"));
   const binary = join(root, "bun-workerd-stand-in.js");
