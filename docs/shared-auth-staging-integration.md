@@ -106,6 +106,84 @@ forward schema, principal projection, maintenance entry, Console flow and
 protected composition remains an owner-coordinated change. The current
 factory cannot enable an authentication surface by itself.
 
+### Private final-session observation
+
+The store module provides the dedicated private
+`createSharedAuthFinalSessionStore(sql): SharedAuthFinalSessionStore` factory.
+It shares ordinary operations with `createSharedAuthSessionStore` and captures
+that same supplied Sql; it creates no connection, money wrapper, extra query
+or retry. The ordinary factory keeps its boolean touch and rejects zero-row
+results from its own selected-row method.
+
+The dedicated factory is accepted only in the owning strict-connected common
+primary composition: the actual explicit-result native driver, the existing
+money wrapper applied once, and the same final Sql/native client/realm used by
+Auth, RP and Financial under a fresh first-primary request. A generic Sql
+object, the factory name, or a configuration flag cannot supply that
+qualification. The adopted driver source contract uses
+`createD1Sql(database, { acknowledgement: "explicit-d1-result" })` and preserves
+legacy/default behavior elsewhere. Its raw success, result array and change
+metadata must survive explicit validation; unknown metadata cannot become a
+known zero. Actual driver and common-factory native qualification remain
+separate owner work.
+
+`touchSessionAndSelect` performs one guarded primary `UPDATE ... RETURNING *`
+and validates the actual count and returned image. A complete, genuinely
+strict-connected `0/[]` acknowledgement returns null. Exactly one returned
+row must conserve digest, account, local principal, stored Workspace,
+encrypted payload, creation/expiry/health times, requested touch time and the
+actual post-update version. An acknowledged first null permits one reload of
+an active compatible row with the same grant/immutable facts, strictly newer
+safe version and valid lifetime, followed by one guarded retouch. Only that
+retouch's actual returned image can be selected. A second null, changed row,
+unknown acknowledgement, exception or malformed result is unavailable with
+no additional read, touch resend or refresh.
+
+The service constructor captures an optional private
+`finalStore: () => SharedAuthFinalSessionStore` callable and receiver once.
+`observeFinalSession` and `observeFinalWorkspaceOrganization` require it;
+absence is unavailable without invoking the ordinary store as a fallback.
+Existing `authenticate`, `workspaceOrganization` and HTTP handlers retain the
+ordinary RP's bounded compatible-touch behavior and register no final
+selection. All paths share the same authentication, issuer, refresh,
+Directory and Organization-resolution core; only the lexical final-touch
+policy differs. The private observation consumer ABI is adopted as source
+contract, while actual common-factory connection and activation remain
+unqualified here.
+
+The in-process `finalSessionSelection(context)` reader accepts only the exact
+original context object produced by that factory instance. Its closure-local
+WeakMap holds an immutable selection with the real session digest, actual
+post-touch version, validated identity and observation times. The stored
+session Workspace anchor and the request's selected current Workspace remain
+separate. The final Organization result is registered after its post-pin
+authentication, including the exact new returned context object. Request
+URL/method/headers are captured before authentication awaits; this seam never
+consumes or forwards the request body. Principal and pin callables and their
+receivers are also captured once.
+
+There is no HTTP/RPC endpoint, browser response field or persistence format
+for this selection. Cloning a context or supplying the same fields does not
+preserve provenance. The explicit HTTP handler projects its existing
+response, and the Worker fixture mounts only its existing test handlers.
+The observation linearizes at the acknowledged primary update; a later
+touch or revoke can make it stale. The owning consumer must use its genuine
+in-process factory/context/selection and independently fence the actual
+selected row plus its own authority on the same primary at the effect
+boundary. Row CAS versions supply no authority class, payer, consent, realm,
+source epoch, enrollment receipt or Financial admission. Retained authority
+history belongs to its separate owner and cannot be replaced by this
+WeakMap.
+
+The authored component tests target the adopted strict-driver option and
+exercise actual native D1 one-zero/one-reload/one-retouch, real post-commit
+acknowledgement loss, second misses and malformed images. Outer response-loss
+injection is synthetic and labelled. They require the owning driver changes
+before execution; source preparation or TypeScript casts do not qualify
+native acknowledgement semantics, a fake store or a common-primary graph.
+No driver, entry, schema or Financial source change is implemented in these
+RP files.
+
 ## Existing behavior that requires a separate owner change
 
 The audit base is Takoserver commit

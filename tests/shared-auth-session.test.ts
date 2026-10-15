@@ -6,9 +6,13 @@ import {
   SharedAuthSessionError,
 } from "../src/shared-auth-session.ts";
 import {
+  createSharedAuthFinalSessionStore,
   createSharedAuthSessionStore,
+  type OidcSessionRecord,
+  type SharedAuthFinalSessionStore,
   type SharedAuthSessionStore,
 } from "../src/shared-auth-session-store.ts";
+import { createD1Sql, type D1DatabaseLike } from "../src/sql-d1.ts";
 import { createSharedAuthSessionStoreD1Fixture } from "./helpers/shared-auth-session-fixture.ts";
 import {
   createSharedSessionTestIssuer,
@@ -55,12 +59,21 @@ function cookie(response: Response, name: string): string {
 async function fixture(
   options: {
     wrapStore?: (store: SharedAuthSessionStore) => SharedAuthSessionStore;
+    wrapFinalStore?: (store: SharedAuthFinalSessionStore) => SharedAuthFinalSessionStore;
     send?: (request: Request, send: (request: Request) => Promise<Response>) => Promise<Response>;
   } = {},
 ) {
   const d1 = await createSharedAuthSessionStoreD1Fixture();
   let stamp = INITIAL_TIME;
   try {
+    // This source targets the owner's adopted strict-driver ABI. It must be
+    // integrated and genuinely verified in native D1 before these tests run.
+    const database = await d1.runtime.getD1Database("AUTH_DB");
+    d1.sql = createD1Sql(
+      database.withSession("first-primary") as unknown as D1DatabaseLike,
+      { acknowledgement: "explicit-d1-result" },
+    );
+    d1.store = createSharedAuthSessionStore(d1.sql);
     const issuer = await createSharedSessionTestIssuer(() => stamp);
     const principalInputs: Parameters<SharedAuthPrincipalProjection["resolve"]>[0][] = [];
     const pins: { workspaceId: string; workspaceRef: string; organizationId: string }[] = [];
@@ -69,7 +82,7 @@ async function fixture(
       principalId: LOCAL_PRINCIPAL,
       onPin: undefined as (() => Promise<void>) | undefined,
     };
-    const runtime = createSharedAuthSession({
+    const composition: Parameters<typeof createSharedAuthSession>[0] = {
       config: SESSION_TEST_CONFIG,
       consoleOrigin: SESSION_TEST_CONSOLE,
       encryptionKey: new Uint8Array(32).fill(7),
@@ -77,6 +90,10 @@ async function fixture(
       store: () => {
         const store = createSharedAuthSessionStore(d1.sql);
         return options.wrapStore ? options.wrapStore(store) : store;
+      },
+      finalStore: () => {
+        const store = createSharedAuthFinalSessionStore(d1.sql);
+        return options.wrapFinalStore ? options.wrapFinalStore(store) : store;
       },
       fetch: async (request) =>
         options.send ? await options.send(request, issuer.send) : await issuer.send(request),
@@ -93,7 +110,8 @@ async function fixture(
           return input;
         },
       },
-    });
+    };
+    const runtime = createSharedAuthSession(composition);
     async function request(path: string, init: RequestInit = {}): Promise<Response> {
       const response = await runtime.fetch(
         new Request(`${SESSION_TEST_CONFIG.publicOrigin}${path}`, init),
@@ -136,6 +154,7 @@ async function fixture(
       d1,
       issuer,
       runtime,
+      composition,
       request,
       login,
       callback,
@@ -744,6 +763,411 @@ describe("staging shared session against native D1 and signed issuer HTTP", () =
         ),
       ).rejects.toMatchObject({ code: "workspace_forbidden" });
       expect(f.pins).toHaveLength(2);
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("absent private finalStore is unavailable without invoking ordinary store or network", async () => {
+    const f = await fixture();
+    try {
+      const signedIn = await f.signedIn();
+      const { finalStore, ...ordinary } = f.composition;
+      expect(typeof finalStore).toBe("function");
+      let ordinaryCalls = 0;
+      let networkCalls = 0;
+      const withoutFinal = createSharedAuthSession({
+        ...ordinary,
+        store() {
+          ordinaryCalls += 1;
+          throw new Error("ordinary store cannot substitute for final observation");
+        },
+        async fetch() {
+          networkCalls += 1;
+          throw new Error("missing final store cannot start a network operation");
+        },
+      });
+      await expect(withoutFinal.observeFinalSession(f.sessionRequest(signedIn.sessionCookie)))
+        .rejects.toMatchObject({ code: "session_unavailable" });
+      await expect(withoutFinal.observeFinalWorkspaceOrganization(
+        f.sessionRequest(signedIn.sessionCookie), SESSION_TEST_ORGANIZATION.id,
+      )).rejects.toMatchObject({ code: "session_unavailable" });
+      expect(ordinaryCalls).toBe(0);
+      expect(networkCalls).toBe(0);
+      expect((await f.d1.store.readSession(signedIn.digest))?.version).toBe(0);
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("only this factory's original frozen context carries its actual final primary selection", async () => {
+    const f = await fixture();
+    try {
+      const other = createSharedAuthSession(f.composition);
+      const signedIn = await f.signedIn();
+      const context = await f.runtime.observeFinalSession(f.sessionRequest(signedIn.sessionCookie));
+      if (!context) throw new Error("missing real authenticated context");
+      const row = await f.d1.store.readSession(signedIn.digest);
+      const selected = f.runtime.finalSessionSelection(context);
+      if (!row || !selected) throw new Error("missing acknowledged final primary selection");
+      expect(selected).toEqual({
+        sessionDigest: row.digest,
+        sessionVersion: row.version,
+        accountId: row.accountId,
+        principalId: row.principalId,
+        sessionWorkspaceId: row.workspaceId,
+        selectedWorkspaceId: context.workspace.id,
+        identity: {
+          issuer: context.provenance.issuer,
+          clientId: context.provenance.clientId,
+          subject: context.provenance.subject,
+          sessionId: context.provenance.sessionId,
+          authTime: context.provenance.authTime,
+        },
+        createdAt: row.createdAt,
+        lastUsedAt: row.lastUsedAt,
+        grantCheckedAt: row.grantCheckedAt,
+        absoluteExpiresAt: row.absoluteExpiresAt,
+        observedAt: f.now(),
+      });
+      for (const value of [context, context.actor, context.actor.scopes, context.workspace,
+        context.workspace.roles, context.provenance, selected, selected.identity])
+        expect(Object.isFrozen(value)).toBe(true);
+      expect(f.runtime.finalSessionSelection(context)).toBe(selected);
+      expect(f.runtime.finalSessionSelection({ ...context })).toBeNull();
+      expect(f.runtime.finalSessionSelection(structuredClone(context))).toBeNull();
+      expect(f.runtime.finalSessionSelection(selected)).toBeNull();
+      expect(f.runtime.finalSessionSelection(null)).toBeNull();
+      expect(other.finalSessionSelection(context)).toBeNull();
+      expect(JSON.stringify(context)).not.toContain(signedIn.digest);
+      expect(JSON.stringify(selected)).not.toContain(row.payload);
+      expect(JSON.stringify(selected)).not.toContain(f.issuer.issued[0]?.accessToken ?? "missing");
+      const publicSession = await f.request("/auth/oidc/session", {
+        headers: { cookie: signedIn.sessionCookie },
+      });
+      expect(await publicSession.json()).toEqual({ authenticated: true });
+      expect(await f.runtime.fetch(new Request(
+        `${SESSION_TEST_CONFIG.publicOrigin}/auth/oidc/finalSessionSelection`,
+      ))).toBeNull();
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("strict-connected known-zero reloads once and selects its own actual guarded retouch image", async () => {
+    let touches = 0;
+    let reads = 0;
+    const images: (OidcSessionRecord | null)[] = [];
+    const f = await fixture({ wrapFinalStore: (store) => ({
+      ...store,
+      async readSession(digest) {
+        reads += 1;
+        return await store.readSession(digest);
+      },
+      async touchSessionAndSelect(digest, version, stamp) {
+        touches += 1;
+        if (touches === 1) await store.touchSession(digest, version, stamp);
+        const selected = await store.touchSessionAndSelect(digest, version, stamp);
+        images.push(selected);
+        return selected;
+      },
+    }) });
+    try {
+      const signedIn = await f.signedIn();
+      const context = await f.runtime.observeFinalSession(f.sessionRequest(signedIn.sessionCookie));
+      const selected = f.runtime.finalSessionSelection(context);
+      expect(touches).toBe(2);
+      expect(reads).toBe(2);
+      expect(images[0]).toBeNull();
+      expect(images[1]?.version).toBe(2);
+      expect(selected?.sessionVersion).toBe(images[1]?.version);
+      expect(selected?.sessionDigest).toBe(images[1]?.digest);
+      expect((await f.d1.store.readSession(signedIn.digest))?.version).toBe(2);
+      expect(f.issuer.requests.filter((r) => r.form.get("grant_type") === "refresh_token")).toEqual([]);
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("a strict-connected second known miss is unavailable without a third read or touch", async () => {
+    let touches = 0;
+    let reads = 0;
+    const f = await fixture({ wrapFinalStore: (store) => ({
+      ...store,
+      async readSession(digest) {
+        reads += 1;
+        return await store.readSession(digest);
+      },
+      async touchSessionAndSelect(digest, version, stamp) {
+        touches += 1;
+        await store.touchSession(digest, version, stamp);
+        return await store.touchSessionAndSelect(digest, version, stamp);
+      },
+    }) });
+    try {
+      const signedIn = await f.signedIn();
+      await expect(f.runtime.observeFinalSession(f.sessionRequest(signedIn.sessionCookie)))
+        .rejects.toMatchObject({ code: "session_unavailable" });
+      expect(touches).toBe(2);
+      expect(reads).toBe(2);
+      expect((await f.d1.store.readSession(signedIn.digest))?.version).toBe(2);
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("lost acknowledgement after a compatible guarded retouch never triggers a third write", async () => {
+    let touches = 0;
+    let reads = 0;
+    const f = await fixture({ wrapFinalStore: (store) => ({
+      ...store,
+      async readSession(digest) {
+        reads += 1;
+        return await store.readSession(digest);
+      },
+      async touchSessionAndSelect(digest, version, stamp) {
+        touches += 1;
+        if (touches === 1) await store.touchSession(digest, version, stamp);
+        const selected = await store.touchSessionAndSelect(digest, version, stamp);
+        if (touches === 2) throw new Error("synthetic ACK lost after real guarded retouch");
+        return selected;
+      },
+    }) });
+    try {
+      const signedIn = await f.signedIn();
+      await expect(f.runtime.observeFinalSession(f.sessionRequest(signedIn.sessionCookie)))
+        .rejects.toMatchObject({ code: "session_unavailable" });
+      expect(touches).toBe(2);
+      expect(reads).toBe(2);
+      expect((await f.d1.store.readSession(signedIn.digest))?.version).toBe(2);
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("ordinary RP preserves its existing compatible touch race without minting a final selection", async () => {
+    let touches = 0;
+    const f = await fixture({ wrapStore: (store) => ({
+      ...store,
+      async touchSession(digest, version, stamp) {
+        touches += 1;
+        if (touches === 1) await store.touchSession(digest, version, stamp);
+        return await store.touchSession(digest, version, stamp);
+      },
+    }) });
+    try {
+      const signedIn = await f.signedIn();
+      const context = await f.runtime.authenticate(f.sessionRequest(signedIn.sessionCookie));
+      expect(context?.accountId).toBe(SESSION_TEST_ACCOUNT);
+      expect(touches).toBe(2);
+      expect((await f.d1.store.readSession(signedIn.digest))?.version).toBe(2);
+      expect(f.runtime.finalSessionSelection(context)).toBeNull();
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test.each(["before", "after"] as const)(
+    "unknown %s-commit touch response yields no context, reload or resend",
+    async (phase) => {
+      let touches = 0;
+      let reads = 0;
+      const f = await fixture({ wrapFinalStore: (store) => ({
+        ...store,
+        async readSession(digest) {
+          reads += 1;
+          return await store.readSession(digest);
+        },
+        async touchSessionAndSelect(digest, version, stamp) {
+          touches += 1;
+          if (phase === "after") await store.touchSessionAndSelect(digest, version, stamp);
+          throw new Error("synthetic lost final touch acknowledgement");
+        },
+      }) });
+      try {
+        const signedIn = await f.signedIn();
+        await expect(f.runtime.observeFinalSession(f.sessionRequest(signedIn.sessionCookie)))
+          .rejects.toMatchObject({ code: "session_unavailable" });
+        expect(touches).toBe(1);
+        expect(reads).toBe(1);
+        const row = await f.d1.store.readSession(signedIn.digest);
+        expect(row?.version).toBe(phase === "after" ? 1 : 0);
+        expect(row?.status).toBe("active");
+        expect(f.runtime.finalSessionSelection(row)).toBeNull();
+        expect(f.issuer.requests.filter((r) => r.form.get("grant_type") === "refresh_token")).toEqual([]);
+      } finally {
+        await f.dispose();
+      }
+    },
+    30_000,
+  );
+
+  test("a later real primary write cannot replace this invocation's selected row image", async () => {
+    const f = await fixture({ wrapFinalStore: (store) => ({
+      ...store,
+      async touchSessionAndSelect(digest, version, stamp) {
+        const selected = await store.touchSessionAndSelect(digest, version, stamp);
+        if (selected) await store.touchSession(digest, selected.version, stamp);
+        return selected;
+      },
+    }) });
+    try {
+      const signedIn = await f.signedIn();
+      const context = await f.runtime.observeFinalSession(f.sessionRequest(signedIn.sessionCookie));
+      const selected = f.runtime.finalSessionSelection(context);
+      if (!selected) throw new Error("missing actual original post-touch row");
+      const row = await f.d1.store.readSession(signedIn.digest);
+      expect(selected.sessionVersion).toBe(1);
+      expect(row?.version).toBe(2);
+      // A local test-only CAS demonstrates staleness; it is not a Financial admission.
+      const stale = await f.d1.sql.run(
+        "UPDATE shared_auth_sessions SET last_used_at = last_used_at WHERE digest = ? AND version = ? AND status = 'active' RETURNING *",
+        [selected.sessionDigest, selected.sessionVersion],
+      );
+      expect(stale).toMatchObject({ changes: 0, rows: [] });
+      expect(f.runtime.finalSessionSelection(context)).toBe(selected);
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("malformed post-touch identity, payload, time or version images never mint a selection", async () => {
+    let alter: ((row: OidcSessionRecord) => Partial<OidcSessionRecord>) | undefined;
+    let touches = 0;
+    const f = await fixture({ wrapFinalStore: (store) => ({
+      ...store,
+      async touchSessionAndSelect(digest, version, stamp) {
+        touches += 1;
+        const selected = await store.touchSessionAndSelect(digest, version, stamp);
+        // Only this outer acknowledgement is synthetic; every write is real D1.
+        return selected && alter ? { ...selected, ...alter(selected) } : selected;
+      },
+    }) });
+    const changes: readonly ((row: OidcSessionRecord) => Partial<OidcSessionRecord>)[] = [
+      () => ({ digest: `sha256:${"d".repeat(64)}` }),
+      () => ({ accountId: "different-canonical-account" }),
+      () => ({ principalId: "different-local-principal" }),
+      () => ({ workspaceId: "different-stored-workspace" }),
+      () => ({ payload: "synthetic-different-encrypted-payload" }),
+      (row) => ({ createdAt: row.createdAt - 1 }),
+      (row) => ({ absoluteExpiresAt: row.absoluteExpiresAt - 1 }),
+      (row) => ({ grantCheckedAt: row.grantCheckedAt + 1 }),
+      (row) => ({ lastUsedAt: row.lastUsedAt - 1 }),
+      (row) => ({ version: row.version + 1 }),
+      () => ({ status: "checking" }),
+    ];
+    try {
+      for (const change of changes) {
+        const signedIn = await f.signedIn();
+        f.setTime(f.now() + 10);
+        alter = change;
+        const before = touches;
+        await expect(f.runtime.observeFinalSession(f.sessionRequest(signedIn.sessionCookie)))
+          .rejects.toMatchObject({ code: "session_unavailable" });
+        expect(touches - before).toBe(1);
+        expect((await f.d1.store.readSession(signedIn.digest))?.version).toBe(1);
+      }
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test.each(["payload", "grant_checked_at"] as const)(
+    "a real competing %s change is not a compatible acknowledged touch race",
+    async (column) => {
+      let mutate: ((digest: string) => Promise<void>) | undefined;
+      let touches = 0;
+      const f = await fixture({ wrapFinalStore: (store) => ({
+        ...store,
+        async touchSessionAndSelect(digest, version, stamp) {
+          touches += 1;
+          await store.touchSession(digest, version, stamp);
+          await mutate?.(digest);
+          return await store.touchSessionAndSelect(digest, version, stamp);
+        },
+      }) });
+      try {
+        const signedIn = await f.signedIn();
+        f.setTime(f.now() + 10);
+        mutate = async (digest) => {
+          await f.d1.sql.run(`UPDATE shared_auth_sessions SET ${column} = ? WHERE digest = ?`, [
+            column === "payload" ? "synthetic-replaced-ciphertext" : f.now(), digest,
+          ]);
+        };
+        await expect(f.runtime.observeFinalSession(f.sessionRequest(signedIn.sessionCookie)))
+          .rejects.toMatchObject({ code: "session_unavailable" });
+        expect(touches).toBe(1);
+        expect((await f.d1.store.readSession(signedIn.digest))?.version).toBe(1);
+        expect(f.issuer.requests.filter((r) => r.form.get("grant_type") === "refresh_token")).toEqual([]);
+      } finally {
+        await f.dispose();
+      }
+    },
+    30_000,
+  );
+
+  test("real issuer rotation settles before the actual final touch is selected", async () => {
+    const f = await fixture();
+    try {
+      const signedIn = await f.signedIn();
+      f.setTime(INITIAL_TIME + 5 * 60 * 1000 + 1);
+      const context = await f.runtime.observeFinalSession(f.sessionRequest(signedIn.sessionCookie));
+      const selected = f.runtime.finalSessionSelection(context);
+      const row = await f.d1.store.readSession(signedIn.digest);
+      expect(row?.version).toBe(3);
+      expect(selected?.sessionVersion).toBe(row?.version);
+      expect(selected?.lastUsedAt).toBe(row?.lastUsedAt);
+      expect(selected?.grantCheckedAt).toBe(row?.grantCheckedAt);
+      expect(f.issuer.requests.filter((r) => r.form.get("grant_type") === "refresh_token")).toHaveLength(1);
+      expect(JSON.stringify(selected)).not.toContain(f.issuer.issued[1]?.refreshToken ?? "missing");
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("final Organization result has its own provenance and cannot switch cookie or owner ports during pin", async () => {
+    const f = await fixture();
+    try {
+      const first = await f.signedIn();
+      const second = await f.signedIn();
+      const request = new Request(`${SESSION_TEST_CONFIG.publicOrigin}/control/test-resource`, {
+        method: "POST",
+        headers: { cookie: first.sessionCookie, origin: SESSION_TEST_CONSOLE },
+        body: "private test payment body",
+      });
+      f.control.onPin = async () => {
+        request.headers.set("cookie", second.sessionCookie);
+        Object.defineProperty(f.composition, "store", { value: () => {
+          throw new Error("mutable options store must not be resolved again");
+        } });
+        Object.defineProperty(f.composition, "finalStore", { value: () => {
+          throw new Error("mutable final store must not be resolved again");
+        } });
+        f.composition.principals.resolve = async () => {
+          throw new Error("mutable principal method must not be resolved again");
+        };
+        if (f.composition.organizations) f.composition.organizations.pin = async () => {
+          throw new Error("mutable pin method must not be resolved again");
+        };
+      };
+      const context = await f.runtime.observeFinalWorkspaceOrganization(request, SESSION_TEST_ORGANIZATION.id);
+      const selected = f.runtime.finalSessionSelection(context);
+      const firstRow = await f.d1.store.readSession(first.digest);
+      expect(selected?.sessionDigest).toBe(first.digest);
+      expect(selected?.sessionVersion).toBe(firstRow?.version);
+      expect(firstRow?.version).toBe(2);
+      expect(selected?.sessionWorkspaceId).toBe(SESSION_TEST_PERSONAL.id);
+      expect(selected?.selectedWorkspaceId).toBe(SESSION_TEST_ORGANIZATION.id);
+      expect((await f.d1.store.readSession(second.digest))?.version).toBe(0);
+      expect(context?.organizationId).toBe("retained-takoserver-organization-789");
+      expect(Object.isFrozen(context)).toBe(true);
+      expect(request.bodyUsed).toBe(false);
+      expect(await request.text()).toBe("private test payment body");
+      expect(f.runtime.finalSessionSelection({ ...context })).toBeNull();
+      // The original pin callable, captured once, also survives a later invocation.
+      expect(await f.runtime.observeFinalWorkspaceOrganization(
+        f.sessionRequest(first.sessionCookie), SESSION_TEST_ORGANIZATION.id,
+      )).not.toBeNull();
     } finally {
       await f.dispose();
     }

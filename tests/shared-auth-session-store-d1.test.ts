@@ -1,9 +1,11 @@
 import { expect, test } from "bun:test";
 import type { Sql } from "../src/ports.ts";
 import {
+  createSharedAuthFinalSessionStore,
   createSharedAuthSessionStore,
   type OidcSessionRecord,
 } from "../src/shared-auth-session-store.ts";
+import { createD1Sql, type D1DatabaseLike, type D1StatementLike } from "../src/sql-d1.ts";
 import { createSharedAuthSessionStoreD1Fixture as fixture } from "./helpers/shared-auth-session-fixture.ts";
 
 const NOW = 1_800_000_000_000;
@@ -24,6 +26,27 @@ function session(digest = SESSION): OidcSessionRecord {
     version: 0,
     status: "active",
   };
+}
+
+/** Component fixture for the adopted driver ABI; its actual driver/native integration is pending. */
+async function finalFixture() {
+  const original = await fixture();
+  try {
+    const database = await original.runtime.getD1Database("AUTH_DB");
+    const sql = createD1Sql(
+      database.withSession("first-primary") as unknown as D1DatabaseLike,
+      { acknowledgement: "explicit-d1-result" },
+    );
+    return {
+      ...original,
+      sql,
+      store: createSharedAuthFinalSessionStore(sql),
+      ordinary: createSharedAuthSessionStore(sql),
+    };
+  } catch (error) {
+    await original.runtime.dispose();
+    throw error;
+  }
 }
 
 test("native D1 atomically burns one callback attempt and burns an expired callback", async () => {
@@ -117,6 +140,145 @@ test("native D1 expiry and immutable identity cannot revive or reassign a sessio
     await runtime.dispose();
   }
 }, 30_000);
+
+test("native D1 touch selects its own immutable post-update row and one concurrent CAS winner", async () => {
+  const { runtime, sql, store, ordinary } = await finalFixture();
+  try {
+    const original = session();
+    await store.createSession(original);
+    const results = await Promise.all([
+      store.touchSessionAndSelect(SESSION, 0, NOW + 1),
+      store.touchSessionAndSelect(SESSION, 0, NOW + 1),
+    ]);
+    const selected = results.find((row) => row !== null);
+    expect(results.filter(Boolean)).toHaveLength(1);
+    expect(results.filter((row) => row === null)).toHaveLength(1);
+    expect(selected).toEqual({ ...original, lastUsedAt: NOW + 1, version: 1 });
+    expect(Object.isFrozen(selected)).toBe(true);
+    expect(await createSharedAuthSessionStore(sql).readSession(SESSION)).toEqual(selected);
+    expect(await store.touchSession(SESSION, 1, NOW + 2)).toBe(true);
+    expect((await store.readSession(SESSION))?.version).toBe(2);
+    expect(selected?.version).toBe(1);
+    expect(await store.touchSessionAndSelect(SESSION, 1, NOW + 3)).toBeNull();
+    await expect(ordinary.touchSessionAndSelect(SESSION, 1, NOW + 3))
+      .rejects.toThrow("no qualified known-miss acknowledgement");
+    expect(await store.touchSession(SESSION, 2, NOW + 3)).toBe(true);
+    expect((await store.readSession(SESSION))?.version).toBe(3);
+  } finally {
+    await runtime.dispose();
+  }
+}, 30_000);
+
+test.each(["before", "after"] as const)(
+  "native D1 touch with unknown %s-commit acknowledgement throws without resend or substitute read",
+  async (phase) => {
+    const { runtime, sql, store } = await finalFixture();
+    try {
+      await store.createSession(session());
+      let writes = 0;
+      let reads = 0;
+      const uncertain: Sql = {
+        async query(statement, params) {
+          reads += 1;
+          return await sql.query(statement, params);
+        },
+        batch: (statements) => sql.batch(statements),
+        async run(statement, params) {
+          writes += 1;
+          if (phase === "after") await sql.run(statement, params);
+          throw new Error("synthetic transport lost the touch acknowledgement");
+        },
+      };
+      await expect(
+        createSharedAuthFinalSessionStore(uncertain).touchSessionAndSelect(SESSION, 0, NOW + 1),
+      ).rejects.toThrow("synthetic transport lost the touch acknowledgement");
+      expect(writes).toBe(1);
+      expect(reads).toBe(0);
+      expect((await store.readSession(SESSION))?.version).toBe(phase === "after" ? 1 : 0);
+    } finally {
+      await runtime.dispose();
+    }
+  },
+  30_000,
+);
+
+test("strict native post-commit raw acknowledgement loss cannot become a known zero", async () => {
+  const { runtime, store } = await finalFixture();
+  try {
+    await store.createSession(session());
+    const database = await runtime.getD1Database("AUTH_DB");
+    const native = database.withSession("first-primary") as unknown as D1DatabaseLike;
+    let writes = 0;
+    // This is an explicitly synthetic native-response loss after the real D1
+    // update commits. It is not a qualified production driver or Root graph.
+    function loseResponse(prepared: D1StatementLike): D1StatementLike {
+      return {
+        bind(...params) {
+          return loseResponse(prepared.bind(...params));
+        },
+        async all() {
+          await prepared.all();
+          writes += 1;
+          return {};
+        },
+      };
+    }
+    const transport: D1DatabaseLike = {
+      prepare(statement) {
+        return loseResponse(native.prepare(statement));
+      },
+      async batch() {
+        throw new Error("final touch must not issue another batch or recovery command");
+      },
+    };
+    const strict = createD1Sql(transport, { acknowledgement: "explicit-d1-result" });
+    await expect(
+      createSharedAuthFinalSessionStore(strict).touchSessionAndSelect(SESSION, 0, NOW + 1),
+    ).rejects.toMatchObject({ code: "unavailable" });
+    expect(writes).toBe(1);
+    expect((await store.readSession(SESSION))?.version).toBe(1);
+  } finally {
+    await runtime.dispose();
+  }
+}, 30_000);
+
+test.each(["missing row", "zero with row", "extra rows", "wrong digest", "wrong version"])(
+  "native D1 touch rejects a synthetic malformed acknowledgement: %s",
+  async (failure) => {
+    const { runtime, sql, store } = await finalFixture();
+    try {
+      await store.createSession(session());
+      let writes = 0;
+      const malformed: Sql = {
+        query: (statement, params) => sql.query(statement, params),
+        batch: (statements) => sql.batch(statements),
+        async run(statement, params) {
+          writes += 1;
+          const result = await sql.run(statement, params);
+          const row = result.rows[0];
+          if (!row) throw new Error("missing real primary RETURNING image");
+          if (failure === "missing row") return { changes: 1, rows: [] };
+          if (failure === "zero with row") return { changes: 0, rows: [row] };
+          if (failure === "extra rows") return { changes: 1, rows: [row, row] };
+          return {
+            changes: 1,
+            rows: [{ ...row, ...(failure === "wrong digest"
+              ? { digest: `sha256:${"c".repeat(64)}` }
+              : { version: 3 }) }],
+          };
+        },
+      };
+      await expect(
+        createSharedAuthFinalSessionStore(malformed).touchSessionAndSelect(SESSION, 0, NOW + 1),
+      ).rejects.toBeInstanceOf(TypeError);
+      expect(writes).toBe(1);
+      expect((await store.readSession(SESSION))?.version).toBe(1);
+    } finally {
+      await runtime.dispose();
+    }
+  },
+  30_000,
+);
 
 test("native D1 logout denies first and preserves failed/retryable revocation across restarts", async () => {
   const { runtime, sql, store } = await fixture();

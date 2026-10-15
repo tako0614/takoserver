@@ -53,6 +53,12 @@ export interface SharedAuthSessionStore {
       readonly lastUsedAt: number;
     },
   ): Promise<boolean>;
+  /** The acknowledged post-update row from this exact primary CAS, never a later read. */
+  touchSessionAndSelect(
+    digest: string,
+    expectedVersion: number,
+    now: number,
+  ): Promise<OidcSessionRecord>;
   touchSession(digest: string, expectedVersion: number, now: number): Promise<boolean>;
   revokeSession(digest: string, now: number): Promise<boolean>;
   /** Atomically persists the grant AND fences any matching active/checking session. */
@@ -70,9 +76,63 @@ export interface SharedAuthSessionStore {
   cleanupRevokedSessions(before: number, limit: number): Promise<number>;
 }
 
+/**
+ * Dedicated private final-observation port. Its owner must connect the actual
+ * explicit-d1-result driver and the same canonical primary Sql/native client
+ * used by Auth and Financial. This structural type/factory alone qualifies
+ * neither a generic Sql adapter nor a fabricated response.
+ */
+export interface SharedAuthFinalSessionStore
+  extends Omit<SharedAuthSessionStore, "touchSessionAndSelect"> {
+  touchSessionAndSelect(
+    digest: string,
+    expectedVersion: number,
+    now: number,
+  ): Promise<OidcSessionRecord | null>;
+}
+
 const REVOCATION_LEASE_MS = 30_000;
 const DIGEST = /^sha256:[a-f0-9]{64}$/u;
 const STATUSES = new Set(["active", "checking", "revocation_pending", "revoked"]);
+
+async function touchSessionRow(
+  sql: Sql,
+  value: string,
+  expectedVersion: number,
+  now: number,
+): Promise<OidcSessionRecord | null> {
+  digest(value);
+  version(expectedVersion);
+  version(expectedVersion + 1);
+  time(now);
+  const result = await sql.run(
+    `UPDATE shared_auth_sessions SET last_used_at = ?, version = version + 1
+     WHERE digest = ? AND status = 'active' AND version = ?
+       AND created_at <= ? AND last_used_at <= ? AND grant_checked_at <= ?
+       AND absolute_expires_at > ? RETURNING *`,
+    [now, value, expectedVersion, now, now, now, now],
+  );
+  // A missing/malformed success image is an unknown acknowledgement, not a
+  // CAS miss. The caller must not reread or resend to turn it into success.
+  if (!result || !Array.isArray(result.rows)) invalid();
+  // The dedicated final factory is accepted only under the owner's actual
+  // strict-connected Sql composition. The ordinary factory rejects this null.
+  if (result.changes === 0 && result.rows.length === 0) return null;
+  if (result.changes !== 1 || result.rows.length !== 1 || !result.rows[0]) invalid();
+  const selected = sessionFrom(result.rows[0]);
+  if (
+    selected.digest !== value ||
+    selected.status !== "active" ||
+    selected.version !== expectedVersion + 1 ||
+    selected.lastUsedAt !== now ||
+    selected.createdAt > now ||
+    selected.grantCheckedAt > now ||
+    selected.absoluteExpiresAt <= now
+  )
+    invalid();
+  return Object.freeze(selected);
+}
+
 
 /**
  * Uncomposed runtime preparation. These future tables are not in the adopted
@@ -92,6 +152,17 @@ const STATUSES = new Set(["active", "checking", "revocation_pending", "revoked"]
  * in one batch, including a create/complete whose acknowledgement was lost.
  */
 export function createSharedAuthSessionStore(sql: Sql): SharedAuthSessionStore {
+  async function touchSessionAndSelect(
+    value: string,
+    expectedVersion: number,
+    now: number,
+  ): Promise<OidcSessionRecord> {
+    const selected = await touchSessionRow(sql, value, expectedVersion, now);
+    if (!selected)
+      throw new Error("Shared auth touch has no qualified known-miss acknowledgement");
+    return selected;
+  }
+
   return {
     async putAttempt(attempt) {
       checkAttempt(attempt);
@@ -222,7 +293,10 @@ export function createSharedAuthSessionStore(sql: Sql): SharedAuthSessionStore {
       return result[1]?.changes === 1;
     },
 
+    touchSessionAndSelect,
+
     async touchSession(value, expectedVersion, now) {
+      // Existing deny-only boolean callers gain no selected row or retry proof.
       digest(value);
       version(expectedVersion);
       time(now);
@@ -417,6 +491,23 @@ export function createSharedAuthSessionStore(sql: Sql): SharedAuthSessionStore {
         [before, limit],
       );
       return result.changes;
+    },
+  };
+}
+
+/**
+ * Private composition only. All ordinary operations capture the SAME supplied
+ * Sql; no connection, money wrapper, query or retry is created by this factory.
+ * A complete 0/[] acknowledgement is a known miss only when the owning entry
+ * has genuinely connected the strict native driver. Activation/native/realm
+ * qualification is external owner work, not a caller flag or this factory name.
+ */
+export function createSharedAuthFinalSessionStore(sql: Sql): SharedAuthFinalSessionStore {
+  const ordinary = createSharedAuthSessionStore(sql);
+  return {
+    ...ordinary,
+    async touchSessionAndSelect(value, expectedVersion, now) {
+      return await touchSessionRow(sql, value, expectedVersion, now);
     },
   };
 }

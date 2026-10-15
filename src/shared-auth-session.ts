@@ -8,7 +8,11 @@ import {
   type SharedAuthOidcConfig,
   SharedAuthOidcError,
 } from "./shared-auth-oidc-client.ts";
-import type { SharedAuthSessionStore } from "./shared-auth-session-store.ts";
+import type {
+  OidcSessionRecord,
+  SharedAuthFinalSessionStore,
+  SharedAuthSessionStore,
+} from "./shared-auth-session-store.ts";
 import { parseStrictJson } from "./strict-json.ts";
 
 export interface SharedWorkspaceChoice {
@@ -54,6 +58,22 @@ export interface SharedAuthSessionContext {
   readonly provenance: SharedAuthIdentity & { readonly kind: "shared-account-session" };
 }
 
+/** Private observation of this factory's own acknowledged final touch. Not an authority grant. */
+export interface SharedAuthFinalSessionSelection {
+  readonly sessionDigest: string;
+  readonly sessionVersion: number;
+  readonly accountId: string;
+  readonly principalId: string;
+  readonly sessionWorkspaceId: string;
+  readonly selectedWorkspaceId: string;
+  readonly identity: Readonly<SharedAuthIdentity>;
+  readonly createdAt: number;
+  readonly lastUsedAt: number;
+  readonly grantCheckedAt: number;
+  readonly absoluteExpiresAt: number;
+  readonly observedAt: number;
+}
+
 export class SharedAuthSessionError extends Error {
   constructor(readonly code: "session_invalid" | "session_unavailable" | "workspace_forbidden") {
     super(code);
@@ -80,6 +100,8 @@ export function createSharedAuthSession(options: {
   readonly consoleOrigin: string;
   readonly encryptionKey: Uint8Array;
   readonly store: () => SharedAuthSessionStore;
+  /** Private strict-connected common-primary composition, never a qualification flag. */
+  readonly finalStore?: () => SharedAuthFinalSessionStore;
   readonly principals: SharedAuthPrincipalProjection;
   readonly organizations?: SharedAuthOrganizationPins;
   readonly fetch?: (request: Request) => Promise<Response>;
@@ -107,6 +129,27 @@ export function createSharedAuthSession(options: {
   const keyBytes = Uint8Array.from(options.encryptionKey);
   const send = options.fetch ?? ((request: Request) => fetch(request));
   const now = options.now ?? Date.now;
+  const storeReceiver = options;
+  const storeFactory = options.store;
+  const finalStoreReceiver = options;
+  const finalStoreFactory = options.finalStore;
+  if (finalStoreFactory !== undefined && typeof finalStoreFactory !== "function")
+    throw new TypeError("Shared RP final observation requires its owning store factory");
+  const principalReceiver = options.principals;
+  const resolvePrincipal = principalReceiver.resolve;
+  const organizationReceiver = options.organizations;
+  const pinOrganization = organizationReceiver?.pin;
+  if (organizationReceiver !== undefined && typeof pinOrganization !== "function")
+    throw new TypeError("Shared RP requires its qualified Organization pin method");
+  const selections = new WeakMap<SharedAuthSessionContext, SharedAuthFinalSessionSelection>();
+
+  function createStore(): SharedAuthSessionStore {
+    return Reflect.apply(storeFactory, storeReceiver, []);
+  }
+  function createFinalStore(): SharedAuthFinalSessionStore {
+    if (!finalStoreFactory) throw new SharedAuthSessionError("session_unavailable");
+    return Reflect.apply(finalStoreFactory, finalStoreReceiver, []);
+  }
 
   function aad(purpose: "attempt" | "grant", digest: string): Uint8Array<ArrayBuffer> {
     return new TextEncoder().encode(
@@ -314,7 +357,7 @@ export function createSharedAuthSession(options: {
     return selected;
   }
   async function principal(value: SharedAuthGrant, workspaceId: string): Promise<string> {
-    const resolved = await options.principals.resolve({
+    const resolved = await Reflect.apply(resolvePrincipal, principalReceiver, [{
       issuer: value.issuer,
       clientId: value.clientId,
       subject: value.subject,
@@ -322,7 +365,7 @@ export function createSharedAuthSession(options: {
       authTime: value.authTime,
       accountId: value.subject,
       workspaceId,
-    });
+    }]);
     if (
       !resolved ||
       Object.keys(resolved).sort().join() !== "accountId,principalId" ||
@@ -347,10 +390,33 @@ export function createSharedAuthSession(options: {
     return url;
   }
 
+  function activeAt(row: OidcSessionRecord, digest: string, stamp: number): boolean {
+    return (
+      integer(stamp) && row.digest === digest && row.status === "active" &&
+      text(row.accountId, 512) && text(row.principalId, 512) && text(row.workspaceId, 512) &&
+      typeof row.payload === "string" && row.payload.length > 0 && row.payload.length <= 65536 &&
+      integer(row.version) && row.version < Number.MAX_SAFE_INTEGER &&
+      integer(row.createdAt) && integer(row.lastUsedAt) && integer(row.grantCheckedAt) &&
+      integer(row.absoluteExpiresAt) && row.createdAt <= row.grantCheckedAt &&
+      row.grantCheckedAt <= row.lastUsedAt && row.lastUsedAt <= stamp &&
+      stamp < row.absoluteExpiresAt && stamp - row.lastUsedAt < idleTtl &&
+      row.absoluteExpiresAt - row.createdAt <= absoluteTtl
+    );
+  }
+
+  function sameGrantRow(left: OidcSessionRecord, right: OidcSessionRecord): boolean {
+    return left.digest === right.digest && left.accountId === right.accountId &&
+      left.principalId === right.principalId && left.workspaceId === right.workspaceId &&
+      left.payload === right.payload && left.createdAt === right.createdAt &&
+      left.absoluteExpiresAt === right.absoluteExpiresAt &&
+      left.grantCheckedAt === right.grantCheckedAt;
+  }
+
   async function authenticateWith(
     request: Request,
-    store: SharedAuthSessionStore,
+    store: SharedAuthSessionStore | SharedAuthFinalSessionStore,
     requestedWorkspaceId?: string,
+    selectFinal = false,
   ): Promise<SharedAuthSessionContext | null> {
     requestUrl(request);
     const secret = cookie(request, sessionCookie);
@@ -370,6 +436,7 @@ export function createSharedAuthSession(options: {
       return null;
     }
     if (row.status === "checking") throw new SharedAuthSessionError("session_unavailable");
+    if (!activeAt(row, digest, stamp)) throw new SharedAuthSessionError("session_unavailable");
     let value: SharedAuthGrant;
     try {
       value = await grant(digest, row.payload);
@@ -419,40 +486,91 @@ export function createSharedAuthSession(options: {
       const workspace = await currentWorkspace(value, requestedWorkspaceId ?? row.workspaceId);
       if ((await principal(value, workspace.id)) !== row.principalId)
         throw new SharedAuthSessionError("session_invalid");
-      if (!(await store.touchSession(digest, row.version, now()))) {
-        // One acknowledged read-only race may have touched the same active
-        // grant. No unknown-ACK mutation and no refresh is retried here.
+      let selected = row;
+      let observedAt = now();
+      if (selectFinal) {
+        let candidate = row;
+        let touchedAt = now();
+        if (!activeAt(candidate, digest, touchedAt))
+          throw new SharedAuthSessionError("session_unavailable");
+        try {
+          let touched = await store.touchSessionAndSelect(digest, candidate.version, touchedAt);
+          if (touched === null) {
+            // Only the dedicated actual strict-connected producer's complete
+            // zero-row ACK permits one compatible reload and one retouch.
+            const latest = await store.readSession(digest);
+            touchedAt = now();
+            if (
+              !latest || !activeAt(latest, digest, touchedAt) ||
+              !sameGrantRow(latest, candidate) || latest.version <= candidate.version ||
+              latest.version >= Number.MAX_SAFE_INTEGER - 1 ||
+              latest.lastUsedAt < candidate.lastUsedAt
+            )
+              throw new SharedAuthSessionError("session_unavailable");
+            candidate = latest;
+            touched = await store.touchSessionAndSelect(digest, candidate.version, touchedAt);
+          }
+          if (!touched) throw new SharedAuthSessionError("session_unavailable");
+          selected = touched;
+        } catch {
+          // Unknown/malformed/error and a second miss never trigger another
+          // read, touch, refresh or substitute selected image.
+          throw new SharedAuthSessionError("session_unavailable");
+        }
+        observedAt = now();
+        if (
+          !selected || !activeAt(selected, digest, observedAt) ||
+          !sameGrantRow(selected, candidate) || selected.version !== candidate.version + 1 ||
+          selected.lastUsedAt !== touchedAt || selected.accountId !== value.subject
+        )
+          throw new SharedAuthSessionError("session_unavailable");
+      } else if (!(await store.touchSession(digest, row.version, now()))) {
+        // Preserve the existing ordinary RP compatibility path. This produces
+        // no final-row selection and cannot authorize the new consumer seam.
         const latest = await store.readSession(digest);
         if (!latest || latest.status === "revoked" || latest.status === "revocation_pending")
           return null;
         if (
-          latest.status !== "active" ||
-          latest.payload !== row.payload ||
-          latest.accountId !== row.accountId ||
-          latest.principalId !== row.principalId ||
+          latest.status !== "active" || latest.payload !== row.payload ||
+          latest.accountId !== row.accountId || latest.principalId !== row.principalId ||
           latest.workspaceId !== row.workspaceId ||
           !(await store.touchSession(digest, latest.version, now()))
         )
           throw new SharedAuthSessionError("session_unavailable");
       }
-      return {
-        actor: {
-          hostPrincipalId: row.principalId,
-          principalId: row.principalId,
-          kind: "session",
-          scopes: [],
-        },
-        accountId: row.accountId,
-        workspace,
-        provenance: {
-          kind: "shared-account-session",
-          issuer: value.issuer,
-          clientId: value.clientId,
-          subject: value.subject,
-          sessionId: value.sessionId,
-          authTime: value.authTime,
-        },
-      };
+      const identity = Object.freeze({
+        issuer: value.issuer,
+        clientId: value.clientId,
+        subject: value.subject,
+        sessionId: value.sessionId,
+        authTime: value.authTime,
+      });
+      const context: SharedAuthSessionContext = Object.freeze({
+        actor: Object.freeze({
+          hostPrincipalId: selected.principalId,
+          principalId: selected.principalId,
+          kind: "session" as const,
+          scopes: Object.freeze([]),
+        }),
+        accountId: selected.accountId,
+        workspace: Object.freeze({ ...workspace, roles: Object.freeze([...workspace.roles]) }),
+        provenance: Object.freeze({ kind: "shared-account-session" as const, ...identity }),
+      });
+      if (selectFinal) selections.set(context, Object.freeze({
+        sessionDigest: selected.digest,
+        sessionVersion: selected.version,
+        accountId: selected.accountId,
+        principalId: selected.principalId,
+        sessionWorkspaceId: selected.workspaceId,
+        selectedWorkspaceId: workspace.id,
+        identity,
+        createdAt: selected.createdAt,
+        lastUsedAt: selected.lastUsedAt,
+        grantCheckedAt: selected.grantCheckedAt,
+        absoluteExpiresAt: selected.absoluteExpiresAt,
+        observedAt,
+      }));
+      return context;
     } catch (error) {
       if (invalid(error)) {
         await store.revokeSession(digest, now());
@@ -489,65 +607,93 @@ export function createSharedAuthSession(options: {
     return { completed, pending };
   }
 
+  async function workspaceOrganizationWith(
+    request: Request,
+    workspaceId: string,
+    selectFinal: boolean,
+  ): Promise<(SharedAuthSessionContext & SharedWorkspaceOrganization) | null> {
+    const captured = snapshotRequest(request);
+    const store = selectFinal ? createFinalStore() : createStore();
+    const session = await authenticateWith(captured, store, workspaceId, selectFinal);
+    if (!session) return null;
+    if (!organizationReceiver || !pinOrganization)
+      throw new SharedAuthSessionError("session_unavailable");
+    const secret = cookie(captured, sessionCookie);
+    if (!secret) return null;
+    const row = await store.readSession(await hash(secret));
+    if (row?.status !== "active") throw new SharedAuthSessionError("session_unavailable");
+    const value = await grant(row.digest, row.payload);
+    if (value.subject !== session.accountId || row.principalId !== session.actor.principalId)
+      throw new SharedAuthSessionError("session_invalid");
+    const body = await directory(
+      value,
+      `/${encodeURIComponent(workspaceId)}/billing-organization`,
+    );
+    if (
+      Object.keys(body).sort().join() !== "organizationId,workspaceId,workspaceRef" ||
+      body.workspaceId !== workspaceId ||
+      !text(body.workspaceRef, 512) ||
+      !text(body.organizationId, 128)
+    )
+      throw new SharedAuthSessionError("session_invalid");
+    const binding = Object.freeze({
+      workspaceId,
+      workspaceRef: body.workspaceRef,
+      organizationId: body.organizationId,
+    });
+    const pinned = await Reflect.apply(pinOrganization, organizationReceiver, [binding]);
+    if (
+      !pinned ||
+      pinned.workspaceId !== workspaceId ||
+      pinned.workspaceRef !== binding.workspaceRef ||
+      pinned.organizationId !== binding.organizationId
+    )
+      throw new SharedAuthSessionError("session_invalid");
+    // Recheck after an owning pin await: a logout or membership removal must
+    // not become a usable context merely because the tuple itself is valid.
+    const current = await authenticateWith(captured, store, workspaceId, selectFinal);
+    if (
+      !current ||
+      current.accountId !== session.accountId ||
+      current.actor.principalId !== session.actor.principalId
+    )
+      return null;
+    // This tuple locates retained product records. It grants no payment consent.
+    const selection = selections.get(current);
+    if (selectFinal && !selection) throw new SharedAuthSessionError("session_unavailable");
+    const result = Object.freeze({ ...current, ...binding });
+    if (selectFinal && selection) selections.set(result, selection);
+    return result;
+  }
+
   return {
-    async authenticate(request: Request, workspaceId?: string) {
-      return await authenticateWith(request, options.store(), workspaceId);
+    /** In-process only: plain records, clones and other factory instances have no provenance. */
+    finalSessionSelection(context: unknown): SharedAuthFinalSessionSelection | null {
+      return record(context)
+        ? selections.get(context as unknown as SharedAuthSessionContext) ?? null
+        : null;
     },
-    async workspaceOrganization(
-      request: Request,
-      workspaceId: string,
-    ): Promise<(SharedAuthSessionContext & SharedWorkspaceOrganization) | null> {
-      const store = options.store();
-      const session = await authenticateWith(request, store, workspaceId);
-      if (!session) return null;
-      if (!options.organizations) throw new SharedAuthSessionError("session_unavailable");
-      const secret = cookie(request, sessionCookie);
-      if (!secret) return null;
-      const row = await store.readSession(await hash(secret));
-      if (row?.status !== "active") throw new SharedAuthSessionError("session_unavailable");
-      const value = await grant(row.digest, row.payload);
-      if (value.subject !== session.accountId || row.principalId !== session.actor.principalId)
-        throw new SharedAuthSessionError("session_invalid");
-      const body = await directory(
-        value,
-        `/${encodeURIComponent(workspaceId)}/billing-organization`,
-      );
-      if (
-        Object.keys(body).sort().join() !== "organizationId,workspaceId,workspaceRef" ||
-        body.workspaceId !== workspaceId ||
-        !text(body.workspaceRef, 512) ||
-        !text(body.organizationId, 128)
-      )
-        throw new SharedAuthSessionError("session_invalid");
-      const binding = {
-        workspaceId,
-        workspaceRef: body.workspaceRef,
-        organizationId: body.organizationId,
-      };
-      const pinned = await options.organizations.pin(binding);
-      if (
-        !pinned ||
-        pinned.workspaceId !== workspaceId ||
-        pinned.workspaceRef !== binding.workspaceRef ||
-        pinned.organizationId !== binding.organizationId
-      )
-        throw new SharedAuthSessionError("session_invalid");
-      // Recheck after an owning pin await: a logout or membership removal must
-      // not become a usable context merely because the tuple itself is valid.
-      const current = await authenticateWith(request, store, workspaceId);
-      if (
-        !current ||
-        current.accountId !== session.accountId ||
-        current.actor.principalId !== session.actor.principalId
-      )
-        return null;
-      // This tuple locates retained product records. It grants no payment consent.
-      return { ...current, ...binding };
+    async authenticate(request: Request, workspaceId?: string) {
+      const captured = snapshotRequest(request);
+      return await authenticateWith(captured, createStore(), workspaceId);
+    },
+    /** Private unmounted observation, separate from ordinary RP/HTTP authentication. */
+    async observeFinalSession(request: Request, workspaceId?: string) {
+      const captured = snapshotRequest(request);
+      return await authenticateWith(captured, createFinalStore(), workspaceId, true);
+    },
+    async workspaceOrganization(request: Request, workspaceId: string) {
+      return await workspaceOrganizationWith(request, workspaceId, false);
+    },
+    /** Adopted private source ABI; actual strict/common-primary qualification remains pending. */
+    async observeFinalWorkspaceOrganization(request: Request, workspaceId: string) {
+      return await workspaceOrganizationWith(request, workspaceId, true);
     },
     async retryRevocations(limit = 2) {
-      return await retryRevocations(options.store(), limit);
+      return await retryRevocations(createStore(), limit);
     },
     async fetch(request: Request): Promise<Response | null> {
+      request = snapshotRequest(request);
       const initial = new URL(request.url);
       if (
         ![
@@ -570,7 +716,7 @@ export function createSharedAuthSession(options: {
       }
       try {
         const url = requestUrl(request);
-        const store = options.store();
+        const store = createStore();
         if (request.method === "OPTIONS") {
           if (
             request.headers.get("origin") !== consoleOrigin ||
@@ -812,6 +958,14 @@ async function sameSecret(left: string, right: string): Promise<boolean> {
   let difference = 0;
   for (let index = 0; index < 32; index += 1) difference |= (a[index] ?? 0) ^ (b[index] ?? 0);
   return difference === 0;
+}
+function snapshotRequest(request: Request): Request {
+  // Capture only invocation metadata. Payment/request bodies are never consumed
+  // or forwarded by this private session observation seam.
+  const url = request.url;
+  const method = request.method;
+  const headers = new Headers(request.headers);
+  return new Request(url, { method, headers });
 }
 function cookie(request: Request, name: string): string | null {
   const header = request.headers.get("cookie");
