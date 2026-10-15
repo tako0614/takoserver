@@ -40,6 +40,32 @@ future caller must be the genuine Auth-owned verification/issuance operation.
 Missing remains missing, not complete-history/clear. A retained row is not a
 current authentication result or a payer grant.
 
+The unregistered additive Auth103 DDL has one source in
+`src/auth-authority-schema-plan.ts`. The fixture contains only synthetic
+pre-Auth103 Principal, token, Org and RP prerequisites; component tests append
+that exact DDL source. The candidate local anchor stores the canonical tagged
+Unit P verifier-domain tuple as JSON text and its SHA-256 digest. `readAnchor`
+checks tuple shape, exact serialization and digest before returning a frozen
+`fresh-local` anchor. Shared and proved-legacy anchors require both domain
+columns to be NULL. The historical `origin_digest` is separate from the stable
+domain digest, so a later assertion may have different bytes under the same
+issuer/client or public-key configuration.
+
+Local same-primary currentness binds the original Principal ID, provider,
+subject, creation text and the captured domain pair. Direct session/key class
+statement builders require that pair and a fresh-local anchor. Shared broker
+and RP builders use only fresh-shared or proved-legacy anchors with NULL local
+domain and current matching bindings. Candidate DDL independently fences this
+class split and keeps both domain columns immutable across retirement. A
+proved-legacy binding does not permit direct class issuance. An existing
+unanchored Principal is not silently adopted as fresh-local.
+
+This is a source-only storage component. The synthetic fresh-local SQL case
+does not prove actual Accounts enrollment: the future issuer must retain Unit P's
+factory-private capture and create a new Principal, anchor, token and mandatory
+class in one real batch. Auth103 registration, physical-target enrollment,
+native D1 qualification and Financial permission remain separate owner work.
+
 `createCredentialAuthorityClassStore({sql})` provides separate fixed
 `localSessionIssuanceStatement`, `directKeyIssuanceStatement`,
 `sharedBrokerIssuanceStatement` and `sharedRpIssuanceStatement` builders. There
