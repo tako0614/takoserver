@@ -181,8 +181,27 @@ async function sharedFixture(
         generation INTEGER NOT NULL,state TEXT NOT NULL,released_at INTEGER,updated_at INTEGER NOT NULL,
         CHECK(generation BETWEEN 1 AND 9007199254740990),CHECK((state='released')=(released_at IS NOT NULL)));
       CREATE TABLE ${prefix}_batch_assertions (witness TEXT PRIMARY KEY,ok INTEGER NOT NULL CHECK(ok=1),
-        apply_effects INTEGER NOT NULL CHECK(apply_effects IN (0,1)))`);
+        apply_effects INTEGER NOT NULL CHECK(apply_effects IN (0,1)));
+      CREATE TABLE ${prefix}_route_commands (
+        organization_id TEXT NOT NULL,product TEXT NOT NULL,reservation_id TEXT NOT NULL,name TEXT NOT NULL,
+        incarnation TEXT NOT NULL REFERENCES ${prefix}_assignments(incarnation),
+        action TEXT NOT NULL CHECK(action IN ('activate','advance','retire')),command_ref TEXT NOT NULL,
+        prior_generation INTEGER NOT NULL,prior_state TEXT NOT NULL,prior_script TEXT,next_script TEXT,
+        endpoint_uid TEXT NOT NULL,endpoint_generation INTEGER NOT NULL,worker_uid TEXT NOT NULL,
+        deployment_uid TEXT NOT NULL,deployment_generation INTEGER NOT NULL,source_operation_id TEXT NOT NULL,
+        provider_id TEXT NOT NULL,target_key TEXT NOT NULL,next_generation INTEGER NOT NULL,next_state TEXT NOT NULL,
+        created_at INTEGER NOT NULL,form_v2_original_json TEXT,
+        PRIMARY KEY(organization_id,command_ref),UNIQUE(incarnation,next_generation),
+        CHECK(next_generation=prior_generation+1),CHECK(next_generation BETWEEN 2 AND 9007199254740990))`);
     }
+  if (!options.missingSchema)
+    db.exec(`CREATE TABLE shared_app_staging_endpoint_bindings (
+      incarnation TEXT PRIMARY KEY REFERENCES shared_app_staging_assignments(incarnation),
+      organization_id TEXT NOT NULL,product TEXT NOT NULL,reservation_id TEXT NOT NULL,name TEXT NOT NULL,
+      endpoint_uid TEXT NOT NULL UNIQUE REFERENCES tf_v2_resources(uid),endpoint_generation INTEGER NOT NULL,
+      form_url TEXT NOT NULL,backend_id TEXT NOT NULL,target_key TEXT NOT NULL,
+      create_operation_id TEXT NOT NULL REFERENCES tf_v2_operations(id),
+      current_operation_id TEXT NOT NULL REFERENCES tf_v2_operations(id))`);
   let at = Date.parse("2026-10-15T00:00:00Z");
   const clock = () => new Date(at);
   const identity = {
@@ -403,12 +422,285 @@ test("shared carrier actual authenticated PUT/GET keeps the seven-key wire and o
     expect(
       (await f.call("PUT", "carrier-original", { ...f.body(), expiresInSeconds: 120 })).status,
     ).toBe(409);
-    expect((await f.call("DELETE")).status).toBe(422);
-    expect(await f.snapshot()).toEqual(before);
+    expect((await f.call("DELETE")).status).toBe(204);
+    expect((await f.snapshot()).metadata[0]).toMatchObject({ state: "released", revision: 2 });
   } finally {
     f.db.close();
   }
 });
+
+test("shared carrier cancels a never-accepted original as a permanent tombstone", async () => {
+  const f = await sharedFixture();
+  try {
+    expect((await f.call("PUT", "carrier-original", f.body())).status).toBe(201);
+    const owner = f.ledger.forTrustedOwner({
+      organizationId: f.org.id,
+      product: "takoserver",
+    });
+    const original = await owner.readOriginalRoute("carrier-original");
+    if (original?.kind !== "scalar") throw new Error("missing actual carrier original");
+    expect(original.value.state).toBe("reserved");
+    expect(original.value.generation).toBe(1);
+
+    const response = await f.call("DELETE");
+    expect(response.status).toBe(204);
+    expect(await response.text()).toBe("");
+    expect(await owner.readOriginalRoute("carrier-original")).toEqual({
+      kind: "scalar",
+      value: {
+        ...original.value,
+        generation: 2,
+        state: "released",
+        releasedAt: Date.parse("2026-10-15T00:00:00Z"),
+      },
+    });
+    expect(await f.ledger.readCurrentRoute(original.value.name)).toBeNull();
+    expect((await f.call("GET")).status).toBe(404);
+    const released = await f.snapshot();
+    f.advance(10_000);
+    expect((await f.call("DELETE")).status).toBe(204);
+    expect(await f.snapshot()).toEqual(released);
+    expect((await f.call("PUT", "replacement-original", f.body())).status).toBe(409);
+    expect(await f.snapshot()).toEqual(released);
+    expect(f.state.sideEffectCount).toBe(0);
+  } finally {
+    f.db.close();
+  }
+});
+
+test("shared carrier cancellation metadata failure rolls back its whole original", async () => {
+  const f = await sharedFixture();
+  try {
+    expect((await f.call("PUT", "carrier-original", f.body())).status).toBe(201);
+    await f.actual.run(`CREATE TRIGGER fixture_shared_cancel_metadata_failure
+      BEFORE UPDATE OF state ON worker_endpoint_origin_reservations
+      WHEN OLD.reservation_id='carrier-original' AND NEW.state='released'
+      BEGIN SELECT RAISE(ABORT,'fixture actual cancellation metadata failure'); END`);
+    const original = await f.snapshot();
+    const writes = f.batches();
+    expect((await f.call("DELETE")).status).toBe(503);
+    expect(f.batches() - writes).toBe(1);
+    expect(await f.snapshot()).toEqual(original);
+    expect((await f.call("GET")).status).toBe(200);
+    expect(f.state.sideEffectCount).toBe(0);
+  } finally {
+    f.db.close();
+  }
+});
+
+test("shared carrier cancellation lost ACK settles the first timestamp without another writer", async () => {
+  const f = await sharedFixture();
+  try {
+    expect((await f.call("PUT", "carrier-original", f.body())).status).toBe(201);
+    const owner = f.ledger.forTrustedOwner({
+      organizationId: f.org.id,
+      product: "takoserver",
+    });
+    const original = await owner.readOriginalRoute("carrier-original");
+    if (original?.kind !== "scalar") throw new Error("missing actual carrier original");
+    f.advance(2_000);
+    const writes = f.batches();
+    f.loseAck();
+    expect((await f.call("DELETE")).status).toBe(204);
+    expect(f.batches() - writes).toBe(1);
+    expect(await owner.readOriginalRoute("carrier-original")).toEqual({
+      kind: "scalar",
+      value: {
+        ...original.value,
+        generation: 2,
+        state: "released",
+        releasedAt: Date.parse("2026-10-15T00:00:02Z"),
+      },
+    });
+    const committed = await f.snapshot();
+    f.advance(20_000);
+    expect((await f.call("DELETE")).status).toBe(204);
+    expect((await f.call("GET")).status).toBe(404);
+    expect(f.batches() - writes).toBe(1);
+    expect(await f.snapshot()).toEqual(committed);
+    expect(f.state.sideEffectCount).toBe(0);
+  } finally {
+    f.db.close();
+  }
+});
+
+test("shared carrier cancellation unresolved ACK retains its original for read-only recovery", async () => {
+  const f = await sharedFixture();
+  try {
+    expect((await f.call("PUT", "carrier-original", f.body())).status).toBe(201);
+    const owner = f.ledger.forTrustedOwner({
+      organizationId: f.org.id,
+      product: "takoserver",
+    });
+    const original = await owner.readOriginalRoute("carrier-original");
+    if (original?.kind !== "scalar") throw new Error("missing actual carrier original");
+    f.advance(2_000);
+    const writes = f.batches();
+    f.loseAck(true);
+    expect((await f.call("DELETE")).status).toBe(503);
+    expect(f.batches() - writes).toBe(1);
+    const committed = await f.snapshot();
+    expect(committed.assignments).toHaveLength(1);
+    expect(committed.assignments[0]).toMatchObject({
+      reservation_id: "carrier-original",
+      incarnation: original.value.incarnation,
+      generation: 2,
+      state: "released",
+      released_at: Date.parse("2026-10-15T00:00:02Z"),
+    });
+    f.blockReads(false);
+    f.advance(20_000);
+    expect((await f.call("DELETE")).status).toBe(204);
+    expect((await f.call("GET")).status).toBe(404);
+    expect(f.batches() - writes).toBe(1);
+    expect(await f.snapshot()).toEqual(committed);
+    expect(f.state.sideEffectCount).toBe(0);
+  } finally {
+    f.db.close();
+  }
+});
+
+test("shared carrier refuses active tagged retired and ambiguous originals without a cancellation writer", async () => {
+  for (const scenario of ["active", "tagged", "retired", "ambiguous"] as const) {
+    const f = await sharedFixture();
+    try {
+      expect((await f.call("PUT", "carrier-original", f.body())).status).toBe(201);
+      const owner = f.ledger.forTrustedOwner({ organizationId: f.org.id, product: "takoserver" });
+      const original = await owner.readOriginal("carrier-original");
+      if (!original) throw new Error("missing actual original");
+      if (scenario === "active") await owner.activate(original, "accepted-script");
+      if (scenario === "tagged")
+        await f.sql.run(
+          "UPDATE shared_app_staging_assignments SET binding_kind='form-v2@1' WHERE incarnation=?",
+          [original.incarnation],
+        );
+      if (scenario === "retired") {
+        // Negative degraded fixture: a later non-serving generation is never an untouched hold.
+        await f.sql.run(
+          "UPDATE shared_app_staging_assignments SET generation=3 WHERE incarnation=?",
+          [original.incarnation],
+        );
+        await f.sql.run("UPDATE shared_app_staging_names SET generation=3 WHERE incarnation=?", [
+          original.incarnation,
+        ]);
+      }
+      if (scenario === "ambiguous")
+        await f.sql.run(
+          `INSERT INTO shared_app_staging_assignments
+          (incarnation,name,organization_id,product,reservation_id,generation,state,script,released_at,created_at,updated_at)
+          VALUES (?,?,?,'takosumi-hosted','conflicting-original',1,'reserved',NULL,NULL,?,?)`,
+          [
+            crypto.randomUUID().replaceAll("-", ""),
+            original.name,
+            "another-org",
+            Date.parse("2026-10-15T00:00:00Z"),
+            Date.parse("2026-10-15T00:00:00Z"),
+          ],
+        );
+      const before = await f.snapshot();
+      const writes = f.batches();
+      expect((await f.call("DELETE")).status).toBe(422);
+      expect(f.batches()).toBe(writes);
+      expect(await f.snapshot()).toEqual(before);
+      expect(f.state.sideEffectCount).toBe(0);
+    } finally {
+      f.db.close();
+    }
+  }
+}, 20_000);
+
+test("shared carrier refuses retained native hostname rows across providers and both route generations", async () => {
+  for (const state of ["active", "tombstone"] as const)
+    for (const version of ["v1", "v2"] as const) {
+      const f = await sharedFixture();
+      try {
+        expect((await f.call("PUT", "carrier-original", f.body())).status).toBe(201);
+        await f.sql.run(
+          `INSERT INTO cloudflare_managed_worker_routes
+          (provider_id,route_kind,route_key,owner_native_id,generation,operation_id,state,value_json)
+          VALUES ('different-provider','host',?,'retained-native-owner',1,'retained-native-operation',?,'{}')`,
+          [`host/${version}/integration-carrier.app-staging.takos.jp`, state],
+        );
+        const before = await f.snapshot();
+        const routes = await f.actual.query("SELECT * FROM cloudflare_managed_worker_routes");
+        const writes = f.batches();
+        expect((await f.call("DELETE")).status).toBe(422);
+        expect(f.batches()).toBe(writes);
+        expect(await f.snapshot()).toEqual(before);
+        expect(await f.actual.query("SELECT * FROM cloudflare_managed_worker_routes")).toEqual(
+          routes,
+        );
+      } finally {
+        f.db.close();
+      }
+    }
+}, 20_000);
+
+test("shared carrier terminal CHECK rejects an ignored metadata update and retains all original rows", async () => {
+  const f = await sharedFixture();
+  try {
+    expect((await f.call("PUT", "carrier-original", f.body())).status).toBe(201);
+    f.db.exec(`CREATE TRIGGER ignore_cancellation_metadata BEFORE UPDATE OF state ON worker_endpoint_origin_reservations
+      WHEN NEW.state='released' BEGIN SELECT RAISE(IGNORE); END`);
+    const before = await f.snapshot();
+    const writes = f.batches();
+    expect((await f.call("DELETE")).status).toBe(503);
+    expect(f.batches() - writes).toBe(1);
+    expect(await f.snapshot()).toEqual(before);
+    expect((await f.call("GET")).status).toBe(200);
+  } finally {
+    f.db.close();
+  }
+});
+
+for (const scenario of ["ambiguous", "malformed-product", "malformed-binding"] as const)
+  test(`shared carrier ${scenario} competing original stays unavailable after a refused allocation`, async () => {
+    const f = await sharedFixture();
+    try {
+      expect((await f.call("PUT", "carrier-original", f.body())).status).toBe(201);
+      const original = await f.ledger
+        .forTrustedOwner({ organizationId: f.org.id, product: "takoserver" })
+        .readOriginal("carrier-original");
+      if (!original) throw new Error("missing real competing original");
+      if (scenario === "ambiguous")
+        await f.sql.run(
+          `INSERT INTO shared_app_staging_assignments
+          (incarnation,name,organization_id,product,reservation_id,generation,state,script,released_at,created_at,updated_at)
+          VALUES (?,?,?,'takosumi-hosted','other-retained-original',1,'reserved',NULL,NULL,?,?)`,
+          [
+            crypto.randomUUID().replaceAll("-", ""),
+            original.name,
+            "another-org",
+            Date.parse("2026-10-15T00:00:00Z"),
+            Date.parse("2026-10-15T00:00:00Z"),
+          ],
+        );
+      else if (scenario === "malformed-product")
+        // Deliberately corrupt product data is not a new product/owner grant.
+        await f.sql.run(
+          "UPDATE shared_app_staging_assignments SET product='unknown-product' WHERE incarnation=?",
+          [original.incarnation],
+        );
+      else {
+        // The physical CHECK accepts valid JSON, but this is not a valid typed route binding.
+        await f.sql.run(
+          "UPDATE shared_app_staging_assignments SET state='active',binding_kind='form-v2@1',binding_json='{}' WHERE incarnation=?",
+          [original.incarnation],
+        );
+        await f.sql.run("UPDATE shared_app_staging_names SET state='active' WHERE incarnation=?", [
+          original.incarnation,
+        ]);
+      }
+      const before = await f.snapshot();
+      const writes = f.batches();
+      expect((await f.call("PUT", "replacement-original", f.body())).status).toBe(503);
+      expect(f.batches() - writes).toBe(1);
+      expect(await f.snapshot()).toEqual(before);
+      expect(f.state.sideEffectCount).toBe(0);
+    } finally {
+      f.db.close();
+    }
+  });
 
 test("shared carrier compatibility expiry retains the permanent original without reclaim or renewal", async () => {
   const f = await sharedFixture();

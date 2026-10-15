@@ -80,6 +80,16 @@ export type SharedAppRouteAssignment =
   | { readonly kind: "scalar"; readonly value: SharedAppAssignment }
   | SharedAppFormV2RouteAssignment;
 
+/** Strict retained SQL data for refusal classification, never an owner or dispatch grant. */
+export function decodeSharedAppRouteAssignmentRow(
+  row: Row,
+  environment: SharedAppEnvironment,
+): SharedAppRouteAssignment {
+  if (!Object.hasOwn(row, "binding_kind") || !Object.hasOwn(row, "binding_json"))
+    fail("unavailable");
+  return formAssignmentRow(row, environmentValue(environment));
+}
+
 export type SharedAppRouteSelection =
   | { readonly kind: "scalar"; readonly value: SharedAppSelection }
   | {
@@ -158,6 +168,15 @@ export interface SharedAppFormV2RouteEffects {
 /** Pure allocation atom. expected is a planned tuple, never a committed grant. */
 export interface SharedAppReservationEffects {
   readonly expected: SharedAppRouteAssignment;
+  readonly before: readonly SqlStatement[];
+  readonly publicationGuard: SqlStatement;
+  readonly after: readonly SqlStatement[];
+}
+
+/** Noncommitting cancellation of an untouched scalar original, not native drain. */
+export interface SharedAppUnpublishedReleaseEffects {
+  readonly original: SharedAppPin;
+  readonly releasedAt: number;
   readonly before: readonly SqlStatement[];
   readonly publicationGuard: SqlStatement;
   readonly after: readonly SqlStatement[];
@@ -325,6 +344,8 @@ export interface SharedAppLedger {
       readonly reservationId: string;
       readonly name: string;
     }): Promise<SharedAppReservationEffects>;
+    /** Join with the actual carrier mutation and its terminal CHECK in ONE batch. */
+    prepareReleaseUnpublished(expected: SharedAppPin): SharedAppUnpublishedReleaseEffects;
     /** Script pins come from authoritative accepted resource/Provider readback, never a public body. */
     activate(expected: SharedAppPin, acceptedScript: string): Promise<SharedAppAssignment>;
     /** These pure preparations NEVER commit. Compose before + actual guarded owner SQL + after in ONE batch. */
@@ -627,6 +648,93 @@ export function createSharedAppLedger(options: {
       return {
         readOriginal: read,
         readOriginalRoute: (reservationId) => originalRoute(owner, opaque(reservationId)),
+        prepareReleaseUnpublished(input) {
+          // Capture the complete original synchronously. No read/write or caller SQL here.
+          const expected = ownedPin(input);
+          if (environment !== "staging" || expected.generation !== 1) fail("conflict");
+          const releasedAt = timestamp();
+          const assertions = `${prefix}_batch_assertions`;
+          const witness = `unpublished:${crypto.randomUUID()}`;
+          const tuple = (state: "reserved" | "released"): SqlStatement =>
+            formStatement(
+              `SELECT 1 FROM ${assignments} a JOIN ${names} n
+                ON n.normalized_name=a.name AND n.incarnation=a.incarnation
+                  AND n.generation=a.generation AND n.state=a.state AND n.released_at IS a.released_at
+                WHERE a.organization_id=? AND a.product=? AND a.reservation_id=? AND a.name=?
+                  AND a.incarnation=? AND a.generation=? AND a.state=? AND a.released_at IS ?
+                  AND a.script IS NULL AND a.binding_kind IS NULL AND a.binding_json IS NULL
+                  AND NOT EXISTS (SELECT 1 FROM ${routeHistory} h WHERE h.incarnation=a.incarnation
+                    OR (h.organization_id=a.organization_id AND h.reservation_id=a.reservation_id))`,
+              [
+                expected.organizationId,
+                expected.product,
+                expected.reservationId,
+                expected.name,
+                expected.incarnation,
+                state === "reserved" ? 1 : 2,
+                state,
+                state === "reserved" ? null : releasedAt,
+              ],
+            );
+          const prior = tuple("reserved");
+          const next = tuple("released");
+          const before = [
+            formStatement(
+              `INSERT INTO ${assertions} (witness,ok,apply_effects)
+                SELECT ?,CASE WHEN EXISTS (${prior.sql}) THEN 1 ELSE 0 END,1`,
+              [witness, ...(prior.params ?? [])],
+            ),
+            formStatement(
+              `UPDATE ${assignments} SET state='released',generation=2,released_at=?,updated_at=?
+                WHERE incarnation=? AND EXISTS (${prior.sql})`,
+              [releasedAt, releasedAt, expected.incarnation, ...(prior.params ?? [])],
+            ),
+            formStatement(
+              `UPDATE ${names} SET state='released',generation=2,released_at=?,updated_at=?
+                WHERE normalized_name=? AND incarnation=? AND generation=1 AND state='reserved'
+                  AND released_at IS NULL AND EXISTS (SELECT 1 FROM ${assignments}
+                    WHERE incarnation=? AND organization_id=? AND product=? AND reservation_id=? AND name=?
+                      AND generation=2 AND state='released' AND released_at=? AND updated_at=?
+                      AND script IS NULL AND binding_kind IS NULL AND binding_json IS NULL)`,
+              [
+                releasedAt,
+                releasedAt,
+                expected.name,
+                expected.incarnation,
+                expected.incarnation,
+                expected.organizationId,
+                expected.product,
+                expected.reservationId,
+                expected.name,
+                releasedAt,
+                releasedAt,
+              ],
+            ),
+          ];
+          const publicationGuard = formStatement(
+            `EXISTS (SELECT 1 FROM ${assertions} WHERE witness=? AND apply_effects=1)
+              AND EXISTS (${next.sql})`,
+            [witness, ...(next.params ?? [])],
+          );
+          const after = [
+            formStatement(
+              `INSERT INTO ${assertions} (witness,ok,apply_effects)
+                SELECT ?,CASE WHEN (${publicationGuard.sql}) THEN 1 ELSE 0 END,0`,
+              [`${witness}:result`, ...(publicationGuard.params ?? [])],
+            ),
+            formStatement(`DELETE FROM ${assertions} WHERE witness IN (?,?)`, [
+              witness,
+              `${witness}:result`,
+            ]),
+          ];
+          return Object.freeze({
+            original: expected,
+            releasedAt,
+            before: Object.freeze(before),
+            publicationGuard,
+            after: Object.freeze(after),
+          });
+        },
         async prepareReserve(input) {
           const reservationId = opaque(input.reservationId);
           const name = normalize(input.name);

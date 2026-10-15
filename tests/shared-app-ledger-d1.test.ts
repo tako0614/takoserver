@@ -2,7 +2,9 @@ import { expect, test } from "bun:test";
 import { Miniflare } from "miniflare";
 import {
   planSharedAppLegacyAdoption,
+  type SharedAppAssignment,
   type SharedAppLegacyProjection,
+  type SharedAppPin,
 } from "../src/shared-app-ledger.ts";
 import { createSharedAppLedgerD1, type SharedAppPrimaryD1 } from "../src/shared-app-ledger-d1.ts";
 import { createD1Sql, type D1DatabaseLike } from "../src/sql-d1.ts";
@@ -12,7 +14,7 @@ const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1_000; // A refusal boundary, not a reus
 const SERVER = { organizationId: "org-server", product: "takoserver" as const };
 const HOSTED = { organizationId: "org-hosted", product: "takosumi-hosted" as const };
 
-async function harness() {
+async function harness(options: { unpublishedRelease?: boolean } = {}) {
   const id = `shared-app-${crypto.randomUUID()}`;
   const runtime = new Miniflare({
     workers: [
@@ -62,6 +64,33 @@ async function harness() {
       released_at INTEGER, updated_at INTEGER NOT NULL,
       CHECK ((state = 'released') = (released_at IS NOT NULL))
     )`);
+  }
+  if (options.unpublishedRelease) {
+    // Opt-in UNALLOCATED typed fixture; keep every old-schema test unchanged.
+    for (const realm of ["staging", "production"]) {
+      const prefix = `shared_app_${realm}`;
+      await sql.run(`ALTER TABLE ${prefix}_assignments ADD COLUMN binding_kind TEXT`);
+      await sql.run(`ALTER TABLE ${prefix}_assignments ADD COLUMN binding_json TEXT`);
+      await sql.run(`CREATE TABLE ${prefix}_route_commands (
+        organization_id TEXT NOT NULL,product TEXT NOT NULL,reservation_id TEXT NOT NULL,name TEXT NOT NULL,
+        incarnation TEXT NOT NULL REFERENCES ${prefix}_assignments(incarnation),
+        action TEXT NOT NULL CHECK(action IN ('activate','advance','retire')),command_ref TEXT NOT NULL,
+        prior_generation INTEGER NOT NULL,prior_state TEXT NOT NULL,prior_script TEXT,next_script TEXT,
+        endpoint_uid TEXT NOT NULL,endpoint_generation INTEGER NOT NULL,worker_uid TEXT NOT NULL,
+        deployment_uid TEXT NOT NULL,deployment_generation INTEGER NOT NULL,source_operation_id TEXT NOT NULL,
+        provider_id TEXT NOT NULL,target_key TEXT NOT NULL,next_generation INTEGER NOT NULL,next_state TEXT NOT NULL,
+        created_at INTEGER NOT NULL,form_v2_original_json TEXT,
+        PRIMARY KEY(organization_id,command_ref),UNIQUE(incarnation,next_generation),
+        CHECK(next_generation=prior_generation+1),CHECK(next_generation BETWEEN 2 AND 9007199254740990))`);
+      await sql.run(`CREATE TABLE ${prefix}_batch_assertions (witness TEXT PRIMARY KEY,
+        ok INTEGER NOT NULL CHECK(ok=1),apply_effects INTEGER NOT NULL CHECK(apply_effects IN (0,1)))`);
+    }
+    // This is deliberately an owner-like metadata constraint, not the HTTP carrier schema.
+    // Actual carrier/Engine qualification belongs to the authenticated composition suite.
+    await sql.run(`CREATE TABLE cancellation_metadata_fixture (
+      incarnation TEXT PRIMARY KEY REFERENCES shared_app_staging_assignments(incarnation),
+      state TEXT NOT NULL CHECK(state IN ('prepared','released')),released_at INTEGER,
+      CHECK((state='released')=(released_at IS NOT NULL)))`);
   }
   let now = START;
   const sessions: string[] = [];
@@ -140,6 +169,247 @@ async function harness() {
     },
   };
 }
+
+function cancellationBatch(
+  h: Awaited<ReturnType<typeof harness>>,
+  pin: SharedAppPin,
+  updateMatches = true,
+) {
+  const release = h.ledger.forTrustedOwner(SERVER).prepareReleaseUnpublished(pin);
+  const witness = `fixture-carrier:${crypto.randomUUID()}`;
+  return [
+    ...release.before,
+    {
+      sql: `UPDATE cancellation_metadata_fixture SET state='released',released_at=?
+        WHERE incarnation=? AND state='prepared' AND ?=1 AND (${release.publicationGuard.sql})`,
+      params: [
+        release.releasedAt,
+        pin.incarnation,
+        updateMatches ? 1 : 0,
+        ...(release.publicationGuard.params ?? []),
+      ],
+    },
+    {
+      sql: `INSERT INTO shared_app_staging_batch_assertions (witness,ok,apply_effects)
+        SELECT ?,CASE WHEN EXISTS (SELECT 1 FROM cancellation_metadata_fixture
+          WHERE incarnation=? AND state='released' AND released_at=?)
+          AND (${release.publicationGuard.sql}) THEN 1 ELSE 0 END,0`,
+      params: [
+        witness,
+        pin.incarnation,
+        release.releasedAt,
+        ...(release.publicationGuard.params ?? []),
+      ],
+    },
+    ...release.after,
+    { sql: "DELETE FROM shared_app_staging_batch_assertions WHERE witness=?", params: [witness] },
+  ];
+}
+
+test("native D1 unpublished effects share one metadata atom and retain a permanent original", async () => {
+  const h = await harness({ unpublishedRelease: true });
+  try {
+    const owner = h.ledger.forTrustedOwner(SERVER);
+    const original = await owner.reserve({
+      reservationId: "cancel-original",
+      name: "cancel-original",
+    });
+    await h.sql.run("INSERT INTO cancellation_metadata_fixture VALUES (?,'prepared',NULL)", [
+      original.incarnation,
+    ]);
+    const batch = cancellationBatch(h, original);
+    expect(await owner.readOriginalRoute(original.reservationId)).toEqual({
+      kind: "scalar",
+      value: original,
+    });
+    expect(batch.every((s) => (s.params?.length ?? 0) <= 90)).toBe(true);
+    await createD1Sql(h.binding.withSession("first-primary")).batch(batch);
+    const released = {
+      ...original,
+      generation: 2,
+      state: "released",
+      releasedAt: START,
+    } satisfies SharedAppAssignment;
+    expect(await owner.readOriginal(original.reservationId)).toEqual(released);
+    expect(await h.sql.query("SELECT * FROM cancellation_metadata_fixture")).toEqual([
+      { incarnation: original.incarnation, state: "released", released_at: START },
+    ]);
+    expect(await h.sql.query("SELECT * FROM shared_app_staging_batch_assertions")).toEqual([]);
+    for (const at of [START + THIRTY_DAYS + 1, START + 100 * 365 * 24 * 60 * 60 * 1000]) {
+      h.setNow(at);
+      for (const identity of [SERVER, HOSTED])
+        await expect(
+          h.ledger
+            .forTrustedOwner(identity)
+            .reserve({ reservationId: `new-${at}`, name: "ＣＡＮＣＥＬ-original" }),
+        ).rejects.toMatchObject({ code: "conflict" });
+      expect(await owner.readOriginal(original.reservationId)).toEqual(released);
+    }
+    expect(await h.ledger.readCurrentRoute(original.name)).toBeNull();
+    expect(h.sessions.every((s) => s === "first-primary")).toBe(true);
+  } finally {
+    await h.close();
+  }
+});
+
+test("native D1 zero metadata effect and final constraint roll back the entire cancellation", async () => {
+  const h = await harness({ unpublishedRelease: true });
+  try {
+    const owner = h.ledger.forTrustedOwner(SERVER);
+    const original = await owner.reserve({
+      reservationId: "rollback-original",
+      name: "rollback-original",
+    });
+    await h.sql.run("INSERT INTO cancellation_metadata_fixture VALUES (?,'prepared',NULL)", [
+      original.incarnation,
+    ]);
+    const snapshot = async () => ({
+      original: await owner.readOriginalRoute(original.reservationId),
+      names: await h.sql.query("SELECT * FROM shared_app_staging_names"),
+      metadata: await h.sql.query("SELECT * FROM cancellation_metadata_fixture"),
+      witnesses: await h.sql.query("SELECT * FROM shared_app_staging_batch_assertions"),
+    });
+    const before = await snapshot();
+    await expect(h.sql.batch(cancellationBatch(h, original, false))).rejects.toMatchObject({
+      code: "constraint",
+    });
+    expect(await snapshot()).toEqual(before);
+    const batch = cancellationBatch(h, original);
+    await expect(
+      h.sql.batch([
+        ...batch,
+        {
+          sql: "INSERT INTO shared_app_staging_batch_assertions VALUES ('final-failure',0,0)",
+          params: [],
+        },
+      ]),
+    ).rejects.toMatchObject({ code: "constraint" });
+    expect(await snapshot()).toEqual(before);
+    await h.sql.run(`CREATE TRIGGER cancellation_metadata_reject BEFORE UPDATE ON cancellation_metadata_fixture
+      BEGIN SELECT RAISE(ABORT,'actual metadata constraint'); END`);
+    await expect(h.sql.batch(cancellationBatch(h, original))).rejects.toMatchObject({
+      code: "constraint",
+    });
+    expect(await snapshot()).toEqual(before);
+  } finally {
+    await h.close();
+  }
+});
+
+test("native D1 cancellation never falls back to the old scalar schema", async () => {
+  const h = await harness();
+  try {
+    const owner = h.ledger.forTrustedOwner(SERVER);
+    const original = await owner.reserve({
+      reservationId: "old-schema-original",
+      name: "old-schema-original",
+    });
+    const release = owner.prepareReleaseUnpublished(original);
+    await expect(h.sql.batch([...release.before, ...release.after])).rejects.toBeDefined();
+    expect(await owner.readOriginal(original.reservationId)).toEqual(original);
+    expect(
+      await h.sql.query("SELECT generation,state,released_at FROM shared_app_staging_names"),
+    ).toEqual([{ generation: 1, state: "reserved", released_at: null }]);
+  } finally {
+    await h.close();
+  }
+});
+
+test("native D1 unpublished cancellation refuses a foreign full pin and retained route history", async () => {
+  const h = await harness({ unpublishedRelease: true });
+  try {
+    const owner = h.ledger.forTrustedOwner(SERVER);
+    const original = await owner.reserve({
+      reservationId: "history-original",
+      name: "history-original",
+    });
+    await h.sql.run("INSERT INTO cancellation_metadata_fixture VALUES (?,'prepared',NULL)", [
+      original.incarnation,
+    ]);
+    const foreign = h.ledger.forTrustedOwner(HOSTED).prepareReleaseUnpublished({
+      ...original,
+      ...HOSTED,
+    });
+    await expect(h.sql.batch([...foreign.before, ...foreign.after])).rejects.toMatchObject({
+      code: "constraint",
+    });
+    expect(await owner.readOriginal(original.reservationId)).toEqual(original);
+    // Constraints-valid retained command with a degraded old head: presence is never an untouched hold.
+    await h.sql.run(
+      `INSERT INTO shared_app_staging_route_commands
+      (organization_id,product,reservation_id,name,incarnation,action,command_ref,prior_generation,
+       prior_state,prior_script,next_script,endpoint_uid,endpoint_generation,worker_uid,deployment_uid,
+       deployment_generation,source_operation_id,provider_id,target_key,next_generation,next_state,created_at)
+      VALUES (?,?,?,?,?,'activate','retained-command',1,'reserved',NULL,'historical-script',
+        'endpoint',1,'worker','deployment',1,'operation','provider','target',2,'active',?)`,
+      [
+        SERVER.organizationId,
+        SERVER.product,
+        original.reservationId,
+        original.name,
+        original.incarnation,
+        START,
+      ],
+    );
+    const history = await h.sql.query("SELECT * FROM shared_app_staging_route_commands");
+    await expect(h.sql.batch(cancellationBatch(h, original))).rejects.toMatchObject({
+      code: "constraint",
+    });
+    expect(await owner.readOriginal(original.reservationId)).toEqual(original);
+    expect(await h.sql.query("SELECT * FROM shared_app_staging_route_commands")).toEqual(history);
+    expect(await h.sql.query("SELECT * FROM cancellation_metadata_fixture")).toEqual([
+      { incarnation: original.incarnation, state: "prepared", released_at: null },
+    ]);
+    expect(await h.sql.query("SELECT * FROM shared_app_staging_batch_assertions")).toEqual([]);
+  } finally {
+    await h.close();
+  }
+});
+
+test("native D1 cancellation lost ACK keeps the original and first timestamp for primary readback", async () => {
+  const h = await harness({ unpublishedRelease: true });
+  try {
+    const owner = h.ledger.forTrustedOwner(SERVER);
+    const original = await owner.reserve({
+      reservationId: "lost-cancel-original",
+      name: "lost-cancel-original",
+    });
+    await h.sql.run("INSERT INTO cancellation_metadata_fixture VALUES (?,'prepared',NULL)", [
+      original.incarnation,
+    ]);
+    const effects = owner.prepareReleaseUnpublished(original);
+    const batch = cancellationBatch(h, original);
+    h.loseAck();
+    await expect(
+      createD1Sql(h.binding.withSession("first-primary")).batch(batch),
+    ).rejects.toBeDefined();
+    await expect(owner.readOriginal(original.reservationId)).rejects.toBeDefined();
+    expect(effects.original).toEqual({
+      environment: original.environment,
+      organizationId: original.organizationId,
+      product: original.product,
+      reservationId: original.reservationId,
+      name: original.name,
+      incarnation: original.incarnation,
+      generation: original.generation,
+    });
+    expect(effects.releasedAt).toBe(START);
+    h.setNow(START + 10_000);
+    h.restoreReads();
+    expect(await owner.readOriginal(original.reservationId)).toEqual({
+      ...original,
+      generation: 2,
+      state: "released",
+      releasedAt: START,
+    });
+    expect(await h.sql.query("SELECT * FROM cancellation_metadata_fixture")).toEqual([
+      { incarnation: original.incarnation, state: "released", released_at: START },
+    ]);
+    expect(await h.sql.query("SELECT * FROM shared_app_staging_batch_assertions")).toEqual([]);
+  } finally {
+    await h.close();
+  }
+});
 
 test("native D1 globally serializes NFKC races across both products and Organizations", async () => {
   const h = await harness();

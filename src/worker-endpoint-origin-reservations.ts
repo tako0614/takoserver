@@ -15,7 +15,12 @@ import {
   workerEndpointPublicationRemedy,
 } from "./provider-worker-endpoint-origin.ts";
 import type { ResourceDeployment, ResourceDeploymentStore } from "./resource-deployments.ts";
-import type { SharedAppLedger, SharedAppRouteAssignment } from "./shared-app-ledger.ts";
+import {
+  decodeSharedAppRouteAssignmentRow,
+  type SharedAppLedger,
+  type SharedAppPin,
+  type SharedAppRouteAssignment,
+} from "./shared-app-ledger.ts";
 import { normalizeSharedAppName } from "./shared-app-name.ts";
 import { isSpaceId } from "./takoform/space-id.ts";
 import type { ResourceWithRelations, TakoformStore } from "./takoform/store.ts";
@@ -2110,6 +2115,106 @@ export function createWorkerEndpointOriginReservations(options: {
       if (value) assertSharedHold(value, organizationId, reservationId);
       return value;
     };
+    const noAcceptance = (pin: SharedAppPin): SqlStatement => {
+      const host = `${pin.name}.app-staging.takos.jp`;
+      // Retained history counts, including deleted resources and native tombstones.
+      // No Offering/provider filter can hide a competing publication on this origin.
+      return sharedStatement(
+        `NOT EXISTS (SELECT 1 FROM shared_app_staging_assignments WHERE name=? AND incarnation<>?)
+          AND NOT EXISTS (SELECT 1 FROM shared_app_staging_endpoint_bindings
+            WHERE incarnation=? OR (organization_id=? AND reservation_id=?))
+          AND NOT EXISTS (SELECT 1 FROM shared_app_staging_route_commands
+            WHERE incarnation=? OR (organization_id=? AND reservation_id=?))
+          AND NOT EXISTS (SELECT 1 FROM tf_v2_resources WHERE principal=? AND space=? AND name=?)
+          AND NOT EXISTS (SELECT 1 FROM tf_v2_operations o JOIN tf_v2_resources r ON r.uid=o.resource_uid
+            WHERE r.principal=? AND r.space=? AND r.name=?)
+          AND NOT EXISTS (SELECT 1 FROM tf_v2_worker_native_effects e
+            JOIN tf_v2_operations o ON o.id=e.operation_id JOIN tf_v2_resources r ON r.uid=o.resource_uid
+            WHERE r.principal=? AND r.space=? AND r.name=?)
+          AND NOT EXISTS (SELECT 1 FROM cloudflare_managed_worker_routes WHERE route_kind='host'
+            AND (route_key=? OR route_key=? OR json_extract(value_json,'$.hostname')=?))`,
+        [
+          pin.name,
+          pin.incarnation,
+          pin.incarnation,
+          pin.organizationId,
+          pin.reservationId,
+          pin.incarnation,
+          pin.organizationId,
+          pin.reservationId,
+          `org:${pin.organizationId}`,
+          pin.organizationId,
+          pin.name,
+          `org:${pin.organizationId}`,
+          pin.organizationId,
+          pin.name,
+          `org:${pin.organizationId}`,
+          pin.organizationId,
+          pin.name,
+          `host/v2/${host}`,
+          `host/v1/${host}`,
+          host,
+        ],
+      );
+    };
+    const cancellationState = async (
+      row: ReservationRow,
+      current: SharedAppRouteAssignment,
+    ): Promise<"prepared" | "released"> => {
+      const pin = sharedHoldPin(current);
+      if (
+        pin.environment !== "staging" ||
+        pin.product !== "takoserver" ||
+        pin.organizationId !== row.organization_id ||
+        pin.reservationId !== row.reservation_id ||
+        !sharedUnboundMetadata(row, current) ||
+        current.kind !== "scalar" ||
+        current.value.script !== null
+      )
+        throw new WorkerEndpointOriginReservationError("unsupported_capability", 422);
+      const prepared =
+        row.state === "prepared" &&
+        row.revision === 1 &&
+        row.released_at === null &&
+        row.updated_at === row.created_at &&
+        current.value.state === "reserved" &&
+        pin.generation === 1 &&
+        current.value.releasedAt === null;
+      const released =
+        row.state === "released" &&
+        row.revision === 2 &&
+        row.released_at !== null &&
+        row.updated_at === row.released_at &&
+        current.value.state === "released" &&
+        pin.generation === 2 &&
+        current.value.releasedAt === row.released_at;
+      if (!prepared && !released)
+        throw new WorkerEndpointOriginReservationError("unsupported_capability", 422);
+      const absence = noAcceptance(pin);
+      const rows = await sharedSql.query(
+        `SELECT CASE WHEN (${absence.sql}) AND EXISTS (SELECT 1 FROM shared_app_staging_names n
+          JOIN shared_app_staging_assignments a ON a.name=n.normalized_name AND a.incarnation=n.incarnation
+            AND a.generation=n.generation AND a.state=n.state AND a.released_at IS n.released_at
+          WHERE a.name=? AND a.incarnation=? AND a.generation=? AND a.state=? AND a.released_at IS ?
+            AND a.organization_id=? AND a.product=? AND a.reservation_id=?
+            AND a.script IS NULL AND a.binding_kind IS NULL AND a.binding_json IS NULL)
+          THEN 1 ELSE 0 END AS eligible`,
+        [
+          ...(absence.params ?? []),
+          pin.name,
+          pin.incarnation,
+          pin.generation,
+          current.value.state,
+          current.value.releasedAt,
+          pin.organizationId,
+          pin.product,
+          pin.reservationId,
+        ],
+      );
+      if (rows.length !== 1 || rows[0]?.eligible !== 1)
+        throw new WorkerEndpointOriginReservationError("unsupported_capability", 422);
+      return released ? "released" : "prepared";
+    };
     return new SharedOriginCarrier(sharedSql, selectedLedger, {
       async prepare(input) {
         const { organizationId, reservationId, requestedSubdomain, expiresInSeconds, offeringId } =
@@ -2258,6 +2363,48 @@ export function createWorkerEndpointOriginReservations(options: {
           try {
             return await settle();
           } catch {
+            // A retained, consistent competing original is a known name conflict,
+            // not an unknown commit. Only classify it after proving this reference
+            // has neither assignment nor metadata; unreadable/ambiguous results stay 503.
+            const conflicts = await sharedSql
+              .query(
+                `SELECT a.* FROM shared_app_staging_names n
+                JOIN shared_app_staging_assignments a ON a.name=n.normalized_name
+                  AND a.incarnation=n.incarnation AND a.generation=n.generation
+                  AND a.state=n.state AND a.released_at IS n.released_at
+                WHERE n.normalized_name=? AND (a.organization_id<>? OR a.product<>'takoserver'
+                  OR a.reservation_id<>?)
+                  AND NOT EXISTS (SELECT 1 FROM shared_app_staging_assignments other
+                    WHERE other.name=a.name AND other.incarnation<>a.incarnation)
+                  AND NOT EXISTS (SELECT 1 FROM shared_app_staging_assignments
+                    WHERE organization_id=? AND reservation_id=?)
+                  AND NOT EXISTS (SELECT 1 FROM worker_endpoint_origin_reservations
+                    WHERE organization_id=? AND reservation_id=?) LIMIT 2`,
+                [
+                  request.requestedSubdomain,
+                  request.organizationId,
+                  request.reservationId,
+                  request.organizationId,
+                  request.reservationId,
+                  request.organizationId,
+                  request.reservationId,
+                ],
+              )
+              .catch(() => []);
+            if (conflicts.length === 1 && conflicts[0]) {
+              try {
+                // Decode only for this refusal classification; never adopt the returned tuple as authority.
+                decodeSharedAppRouteAssignmentRow(conflicts[0], "staging");
+              } catch {
+                throw new WorkerEndpointOriginReservationError(
+                  "backend_unavailable",
+                  503,
+                  undefined,
+                  original,
+                );
+              }
+              throw new WorkerEndpointOriginReservationError("conflict", 409, undefined, original);
+            }
             throw new WorkerEndpointOriginReservationError(
               "backend_unavailable",
               503,
@@ -2281,11 +2428,148 @@ export function createWorkerEndpointOriginReservations(options: {
         normalizeIdentity(organizationId, reservationId);
         const row = await readRow(sharedSql, organizationId, reservationId);
         if (!row) return null;
-        const current = await held(organizationId, reservationId);
+        const current = await owned(organizationId)
+          .readOriginalRoute(reservationId)
+          .catch(() => {
+            throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
+          });
         if (!current) throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
+        if (row.state === "released") {
+          const state = await cancellationState(row, current).catch((error: unknown) => {
+            if (error instanceof WorkerEndpointOriginReservationError) throw error;
+            throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
+          });
+          if (state !== "released")
+            throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
+          return null;
+        }
+        assertSharedHold(current, organizationId, reservationId);
         assertSharedMetadata(row, current);
         // Compatibility expiry never expires/releases/reclaims the global original.
         return row.expires_at <= now() ? null : publicProjection(row);
+      },
+      async release(inputOrganizationId, inputReservationId) {
+        const organizationId = inputOrganizationId;
+        const reservationId = inputReservationId;
+        normalizeIdentity(organizationId, reservationId);
+        const owner = owned(organizationId);
+        const row = await readRow(sharedSql, organizationId, reservationId);
+        const expected = await owner.readOriginalRoute(reservationId).catch(() => {
+          throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
+        });
+        if (!row || !expected)
+          throw new WorkerEndpointOriginReservationError("unsupported_capability", 422);
+        let original: SharedCarrierOriginal = Object.freeze({
+          organizationId,
+          reservationId,
+          expected,
+          metadata: Object.freeze({ ...row }),
+        });
+        try {
+          if ((await cancellationState(row, expected)) === "released") return;
+          const release = owner.prepareReleaseUnpublished(sharedHoldPin(expected));
+          const timestamp = release.releasedAt;
+          if (timestamp < row.updated_at)
+            throw new WorkerEndpointOriginReservationError(
+              "backend_unavailable",
+              503,
+              undefined,
+              original,
+            );
+          const metadata = Object.freeze({
+            ...row,
+            state: "released",
+            revision: 2,
+            released_at: timestamp,
+            updated_at: timestamp,
+          });
+          original = Object.freeze({ ...original, releasedAt: timestamp });
+          const columns = Object.keys(row);
+          const values = Object.values(row);
+          const exactBefore = `EXISTS (SELECT 1 FROM worker_endpoint_origin_reservations
+            WHERE ${columns.map((column) => `${column} IS ?`).join(" AND ")})`;
+          const exactAfter = `EXISTS (SELECT 1 FROM worker_endpoint_origin_reservations
+            WHERE ${columns.map((column) => `${column} IS ?`).join(" AND ")})`;
+          const absence = noAcceptance(sharedHoldPin(expected));
+          const witness = `shared-carrier-release:${crypto.randomUUID()}`;
+          const batch = [
+            ...release.before,
+            sharedStatement(
+              `UPDATE worker_endpoint_origin_reservations SET state='released',revision=2,released_at=?,updated_at=?
+                WHERE organization_id=? AND reservation_id=? AND (${exactBefore})
+                  AND (${absence.sql}) AND (${release.publicationGuard.sql})`,
+              [
+                timestamp,
+                timestamp,
+                organizationId,
+                reservationId,
+                ...values,
+                ...(absence.params ?? []),
+                ...(release.publicationGuard.params ?? []),
+              ],
+            ),
+            sharedStatement(
+              `INSERT INTO shared_app_staging_batch_assertions (witness,ok,apply_effects)
+                SELECT ?,CASE WHEN (${exactAfter}) AND (${absence.sql})
+                  AND (${release.publicationGuard.sql}) THEN 1 ELSE 0 END,0`,
+              [
+                witness,
+                ...Object.values(metadata),
+                ...(absence.params ?? []),
+                ...(release.publicationGuard.params ?? []),
+              ],
+            ),
+            ...release.after,
+            sharedStatement("DELETE FROM shared_app_staging_batch_assertions WHERE witness=?", [
+              witness,
+            ]),
+          ];
+          const settle = async () => {
+            const observed = await readRow(sharedSql, organizationId, reservationId);
+            const held = await owner.readOriginalRoute(reservationId);
+            if (
+              !observed ||
+              !held ||
+              sharedHoldPin(held).incarnation !== sharedHoldPin(expected).incarnation
+            )
+              throw new WorkerEndpointOriginReservationError(
+                "backend_unavailable",
+                503,
+                undefined,
+                original,
+              );
+            const state = await cancellationState(observed, held);
+            const settledMetadata = {
+              ...metadata,
+              released_at: observed.released_at,
+              updated_at: observed.released_at,
+            };
+            if (state !== "released" || canonicalJson(observed) !== canonicalJson(settledMetadata))
+              throw new WorkerEndpointOriginReservationError(
+                "backend_unavailable",
+                503,
+                undefined,
+                original,
+              );
+          };
+          try {
+            await sharedSql.batch(batch);
+          } catch {
+            // A failed constraint and a lost ACK both require the same fresh original readback.
+            // Never repeat a write, choose another original, or invoke a native effect.
+            await settle();
+            return;
+          }
+          await settle();
+        } catch (error) {
+          if (error instanceof WorkerEndpointOriginReservationError) throw error;
+          throw new WorkerEndpointOriginReservationError(
+            "backend_unavailable",
+            503,
+            undefined,
+            original,
+          );
+        }
       },
     });
   }
@@ -2297,6 +2581,7 @@ interface SharedCarrierOriginal {
   readonly reservationId: string;
   readonly expected: SharedAppRouteAssignment;
   readonly metadata: Readonly<Record<string, string | number | null>>;
+  readonly releasedAt?: number;
 }
 
 function sharedHoldPin(value: SharedAppRouteAssignment) {
@@ -2331,9 +2616,13 @@ function sharedName(value: string): string {
 }
 
 function assertSharedMetadata(row: ReservationRow, held: SharedAppRouteAssignment): void {
-  if (
+  if (!sharedUnboundMetadata(row, held) || row.state !== "prepared" || row.released_at !== null)
+    throw new WorkerEndpointOriginReservationError("conflict", 409);
+}
+
+function sharedUnboundMetadata(row: ReservationRow, held: SharedAppRouteAssignment): boolean {
+  return !(
     row.reservation_format !== WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT ||
-    row.state !== "prepared" ||
     row.requested_subdomain !== sharedHoldPin(held).name ||
     row.canonical_public_origin !== `https://${sharedHoldPin(held).name}.app-staging.takos.jp` ||
     row.worker_resource_uid !== null ||
@@ -2345,10 +2634,8 @@ function assertSharedMetadata(row: ReservationRow, held: SharedAppRouteAssignmen
     row.bound_endpoint_name !== null ||
     row.legacy_space !== null ||
     row.legacy_worker_name !== null ||
-    row.legacy_endpoint_name !== null ||
-    row.released_at !== null
-  )
-    throw new WorkerEndpointOriginReservationError("conflict", 409);
+    row.legacy_endpoint_name !== null
+  );
 }
 
 function sharedStatement(sql: string, params: readonly SqlParam[]): SqlStatement {
@@ -2372,15 +2659,17 @@ class SharedOriginCarrier implements WorkerEndpointOriginReservations {
   readonly #ledger: SharedAppLedger;
   readonly prepare: WorkerEndpointOriginReservations["prepare"];
   readonly read: WorkerEndpointOriginReservations["read"];
+  readonly release: WorkerEndpointOriginReservations["release"];
   constructor(
     sql: Sql,
     ledger: SharedAppLedger,
-    ports: Pick<WorkerEndpointOriginReservations, "prepare" | "read">,
+    ports: Pick<WorkerEndpointOriginReservations, "prepare" | "read" | "release">,
   ) {
     this.#sql = sql;
     this.#ledger = ledger;
     this.prepare = ports.prepare;
     this.read = ports.read;
+    this.release = ports.release;
     Object.freeze(this);
   }
   static assert(value: WorkerEndpointOriginReservations, sql: Sql, ledger: SharedAppLedger): void {
@@ -2393,7 +2682,6 @@ class SharedOriginCarrier implements WorkerEndpointOriginReservations {
     )
       throw new TypeError("shared origin carrier requires its actual ledger and Sql construction");
   }
-  readonly release = sharedMutationRefusal;
   readonly bind = sharedMutationRefusal;
   readonly inspectBound = sharedMutationRefusal;
   readonly activate = sharedMutationRefusal;
