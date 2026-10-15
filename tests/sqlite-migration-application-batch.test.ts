@@ -3,7 +3,7 @@ import { expect, spyOn, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { bytesDigest } from "../src/json.ts";
+import { bytesDigest, isJsonObject } from "../src/json.ts";
 import { createSelfhostV2SQLiteStore } from "../src/providers/selfhost-v2-sqlite-store.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
@@ -240,7 +240,7 @@ async function readBatchFiles(
 ): Promise<readonly Uint8Array[]> {
   expect(Object.hasOwn(input, "files")).toBe(false);
   const set = input.execution.spec.migrationSet;
-  if (typeof set !== "object" || set === null || Array.isArray(set)) throw new Error("missing Set");
+  if (!isJsonObject(set)) throw new Error("missing Set");
   const setUid = set.resourceUid;
   if (typeof setUid !== "string") throw new Error("missing Set UID");
   // These observation fields are not remote authority; the custody reader
@@ -249,9 +249,9 @@ async function readBatchFiles(
     execution: { ...input.execution, previousObserved: {}, previousOutput: {} },
     targetResourceUid: setUid,
   });
-  expect(held.manifest.files.map(({ path, sha256 }) => ({ path, sha256 }))).toEqual(
-    input.targetEntries,
-  );
+  const heldEntries: SQLiteMigrationApplicationBatchInput["targetEntries"] =
+    held.manifest.files.map(({ path, sha256 }) => ({ path, sha256 }));
+  expect(heldEntries).toEqual(input.targetEntries);
   expect(held.fileSizes).toEqual(input.fileSizes);
   const files: Uint8Array[] = [];
   for (const [index, file] of held.manifest.files.entries()) {
@@ -262,7 +262,9 @@ async function readBatchFiles(
         chunks.push(chunk);
       },
     });
-    expect(verified).toEqual({ sha256: file.sha256, byteSize: input.fileSizes[index] });
+    const byteSize = input.fileSizes[index];
+    if (byteSize === undefined) throw new Error("missing expected file size");
+    expect(verified).toEqual({ sha256: file.sha256, byteSize });
     const bytes = new Uint8Array(verified.byteSize);
     let offset = 0;
     for (const chunk of chunks) {
@@ -480,12 +482,7 @@ test("accepted bounded reader rechecks its real lease before staging bytes", asy
     (_native, { custody, advance }) => ({
       async applyAuthorizedMigration(input) {
         const set = input.execution.spec.migrationSet;
-        if (
-          typeof set !== "object" ||
-          set === null ||
-          Array.isArray(set) ||
-          typeof set.resourceUid !== "string"
-        )
+        if (!isJsonObject(set) || typeof set.resourceUid !== "string")
           throw new Error("Set missing");
         const request = {
           execution: { ...input.execution, previousObserved: {}, previousOutput: {} },
