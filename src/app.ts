@@ -105,6 +105,7 @@ import {
   createWorkerEndpointOriginReservations,
   type WorkerEndpointOriginReservations,
 } from "./worker-endpoint-origin-reservations.ts";
+import { createWorkerEndpointOriginV2Acceptance } from "./worker-endpoint-origin-v2-acceptance.ts";
 
 /**
  * The composition root.
@@ -166,6 +167,11 @@ export interface AppPorts {
   readonly v2FormFactory?: V2OperatorFormFactory;
   /** Code-selected full and retained-only maps; exclusive with v2FormFactory. */
   readonly v2FormSelectionFactory?: V2OperatorFormSelectionFactory;
+  /** Code-only inputs for the fixed staging/direct-Organization origin compiler. */
+  readonly v2WorkerEndpointOrigin?: Omit<
+    Parameters<typeof createWorkerEndpointOriginV2Acceptance>[0],
+    "sql"
+  >;
   /** Code-selected fresh CREATE/UPDATE policy; absent preserves normal admission. */
   readonly v2AllowFreshCreateAndUpdate?: boolean;
   /** Code-selected source for configured v2 artifact Forms; absent remains held-only. */
@@ -339,6 +345,24 @@ export function buildApp(ports: AppPorts): App {
     );
   }
   const clock = ports.clock ?? (() => new Date());
+  const selectedWorkerEndpointOrigin = ports.v2WorkerEndpointOrigin;
+  const workerEndpointOriginConstruction =
+    selectedWorkerEndpointOrigin === undefined
+      ? undefined
+      : (() => {
+          const sql = ports.sql;
+          const { formUrl, backendId, targetKey, ledger } = selectedWorkerEndpointOrigin;
+          return Object.freeze({
+            sql,
+            acceptance: createWorkerEndpointOriginV2Acceptance({
+              sql,
+              formUrl,
+              backendId,
+              targetKey,
+              ledger,
+            }),
+          });
+        })();
   if (ports.hostedBilling) {
     assertHostedBillingComposition(ports.hostedBilling, {
       sql: ports.sql,
@@ -380,8 +404,8 @@ export function buildApp(ports: AppPorts): App {
     apiKeyAdministration,
   });
   const v2AllowFreshCreateAndUpdate = ports.v2AllowFreshCreateAndUpdate;
-  const takoformV2Host = createTakoformV2Application({
-    sql: ports.sql,
+  const v2ApplicationOptions = {
+    sql: workerEndpointOriginConstruction?.sql ?? ports.sql,
     objects: ports.objects,
     accounts,
     publicOrigin: ports.publicOrigin,
@@ -400,7 +424,14 @@ export function buildApp(ports: AppPorts): App {
     ...(ports.v2PrivateInputCustody === undefined
       ? {}
       : { privateInputCustody: ports.v2PrivateInputCustody }),
-  });
+  };
+  const takoformV2Host =
+    workerEndpointOriginConstruction === undefined
+      ? createTakoformV2Application(v2ApplicationOptions)
+      : createTakoformV2Application(
+          v2ApplicationOptions,
+          workerEndpointOriginConstruction.acceptance,
+        );
   const integrationE2eCredentialRoute = integrationE2eCredentialAuthority
     ? createIntegrationE2eCredentialAuthority({
         configuration: integrationE2eCredentialAuthority,

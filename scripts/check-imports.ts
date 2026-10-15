@@ -658,6 +658,13 @@ for (const path of walk("src")) {
         "src/takoform-v2/application.ts",
         "src/worker-endpoint-origin-v2-acceptance.ts",
       ].includes(path);
+    const exactWorkerEndpointOriginConstructionEdge =
+      path === "src/app.ts" &&
+      target === "src/worker-endpoint-origin-v2-acceptance.ts" &&
+      localImportsOf(path).filter((candidate) => candidate === target).length === 1 &&
+      /import\s*\{\s*createWorkerEndpointOriginV2Acceptance\s*\}\s*from\s+["']\.\/worker-endpoint-origin-v2-acceptance\.ts["'];/u.test(
+        readFileSync(path, "utf8"),
+      );
     // This Host-only callback carries the exact accepted execution into
     // private lifecycle readbacks. Permit only this single type-only edge;
     // do not widen the general self-host composition layer to v2-contract.
@@ -721,6 +728,7 @@ for (const path of walk("src")) {
     if (
       !layer.may.includes(targetLayer.name) &&
       !exactHostAcceptanceEdge &&
+      !exactWorkerEndpointOriginConstructionEdge &&
       !exactExecutionTypeEdge &&
       !exactQueueProviderExtensionEdge &&
       !exactSchedulerProviderExtensionEdge

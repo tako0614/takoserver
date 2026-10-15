@@ -296,6 +296,19 @@ type WorkerEntryV2FormMaps = ReturnType<
 >;
 type WorkerEntryV2FormSelection = WorkerEntryV2FormMap | WorkerEntryV2FormMaps;
 
+type WorkerEntryV2WorkerEndpointOriginSelection = NonNullable<
+  Parameters<typeof buildApp>[0]["v2WorkerEndpointOrigin"]
+>;
+
+/** Code-only fixed compiler inputs; no request, Sql, token or SQL effect is returned. */
+export type WorkerEntryV2WorkerEndpointOriginComposer = (context: {
+  readonly env: WorkerEnv;
+  readonly clock: Clock;
+}) =>
+  | WorkerEntryV2WorkerEndpointOriginSelection
+  | undefined
+  | Promise<WorkerEntryV2WorkerEndpointOriginSelection | undefined>;
+
 export type WorkerEntryV2FormComposer = (context: {
   readonly env: WorkerEnv;
   readonly sql: Sql;
@@ -356,6 +369,8 @@ function hasSelectedV2PrivateInputHooks(
 export interface WorkerEntryOptions {
   /** Operator code only; no request or environment field selects the composer. */
   readonly composeV2Forms?: WorkerEntryV2FormComposer;
+  /** Operator code only; omission or an undefined result leaves origin acceptance unselected. */
+  readonly composeV2WorkerEndpointOrigin?: WorkerEntryV2WorkerEndpointOriginComposer;
   /** Operator code only; absent means every configured artifact Form remains held-only. */
   readonly composeV2ArtifactSource?: WorkerEntryV2ArtifactSourceComposer;
   /**
@@ -877,6 +892,7 @@ async function composeApp(
   composeV2Forms: WorkerEntryV2FormComposer | undefined,
   composeV2ArtifactSource: WorkerEntryV2ArtifactSourceComposer | undefined,
   composeV2FreshAdmission: WorkerEntryOptions["composeV2FreshAdmission"],
+  composeV2WorkerEndpointOrigin: WorkerEntryOptions["composeV2WorkerEndpointOrigin"],
 ): Promise<App> {
   if (composeV2Forms !== undefined && typeof composeV2Forms !== "function") {
     throw new WorkerStartupError(
@@ -894,6 +910,15 @@ async function composeApp(
     throw new WorkerStartupError(
       "runtime-configuration",
       new TypeError("v2 Worker entry fresh admission composer must be a function"),
+    );
+  }
+  if (
+    composeV2WorkerEndpointOrigin !== undefined &&
+    typeof composeV2WorkerEndpointOrigin !== "function"
+  ) {
+    throw new WorkerStartupError(
+      "runtime-configuration",
+      new TypeError("v2 Worker entry Endpoint origin composer must be a function"),
     );
   }
   const allowFreshCreateAndUpdate =
@@ -1108,6 +1133,22 @@ async function composeApp(
       );
     }
   }
+  let selectedV2WorkerEndpointOrigin: WorkerEntryV2WorkerEndpointOriginSelection | undefined;
+  if (composeV2WorkerEndpointOrigin !== undefined) {
+    try {
+      const selected = await composeV2WorkerEndpointOrigin(Object.freeze({ env, clock }));
+      if (selected !== undefined) {
+        // Capture returned inputs now, before later startup awaits. Core owns its Sql and issuer.
+        const { formUrl, backendId, targetKey, ledger } = selected;
+        selectedV2WorkerEndpointOrigin = Object.freeze({ formUrl, backendId, targetKey, ledger });
+      }
+    } catch {
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError("operator v2 Endpoint origin composition failed"),
+      );
+    }
+  }
   const randomId = () => crypto.randomUUID();
   const originReservationBinding = createWorkerEndpointOriginReservationBindingHandle();
   const runtimeInputKeyAuthority = env.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING
@@ -1189,6 +1230,9 @@ async function composeApp(
       "privateInputCustody" in runtimeInputKeyAuthority
         ? { v2PrivateInputCustody: runtimeInputKeyAuthority.privateInputCustody }
         : {}),
+      ...(selectedV2WorkerEndpointOrigin === undefined
+        ? {}
+        : { v2WorkerEndpointOrigin: selectedV2WorkerEndpointOrigin }),
       ...(composeV2Forms === undefined
         ? {}
         : selectedV2Forms &&
@@ -1212,6 +1256,12 @@ async function composeApp(
       offerings: deployment.offerings,
     });
   } catch (error) {
+    if (selectedV2WorkerEndpointOrigin !== undefined) {
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError("operator v2 Endpoint origin application construction failed"),
+      );
+    }
     if (composeV2Forms === undefined && composeV2ArtifactSource === undefined) throw error;
     if (composeV2ArtifactSource !== undefined) {
       // A selected source constructor can throw private transport diagnostics.
@@ -1237,6 +1287,7 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
   const composeV2Forms = options.composeV2Forms;
   const composeV2ArtifactSource = options.composeV2ArtifactSource;
   const composeV2FreshAdmission = options.composeV2FreshAdmission;
+  const composeV2WorkerEndpointOrigin = options.composeV2WorkerEndpointOrigin;
   const starts = new WeakMap<WorkerEnv, Promise<App>>();
   const appFor = (env: WorkerEnv, origin: string): Promise<App> => {
     const existing = starts.get(env);
@@ -1247,6 +1298,7 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
       composeV2Forms,
       composeV2ArtifactSource,
       composeV2FreshAdmission,
+      composeV2WorkerEndpointOrigin,
     ).catch((error: unknown) => {
       if (starts.get(env) === started) starts.delete(env);
       throw error;
