@@ -1594,9 +1594,11 @@ describe("original integration-ts fresh0092 creator", () => {
         ),
       ).rejects.toThrow();
     }
-    await expect(f.apply({ originalCreate: undefined })).rejects.toThrow(
-      "original creation requires",
-    );
+    const optionsWithoutOriginalCreate = { ...f.options };
+    delete optionsWithoutOriginalCreate.originalCreate;
+    await expect(
+      runIntegrationStorageGeneration(f.invocation, f.selected, optionsWithoutOriginalCreate),
+    ).rejects.toThrow("original creation requires");
     await expect(
       f.apply({ productionD1: { databaseName: "takoserver-runtime", databaseId: DATABASE_ID } }),
     ).rejects.toThrow("original creation requires");
@@ -1619,16 +1621,19 @@ describe("original integration-ts fresh0092 creator", () => {
 
   test("legacy fresh92 still requires the production tuple and does not silently select the new namespace", async () => {
     const f = originalCreationFixture();
+    const optionsWithoutOriginalCreate = { ...f.options };
+    delete optionsWithoutOriginalCreate.originalCreate;
     await expect(
-      runIntegrationStorageGeneration({ ...invocation, freshLineage: "v2-0092" }, f.selected, {
-        ...f.options,
-        originalCreate: undefined,
-      }),
+      runIntegrationStorageGeneration(
+        { ...invocation, freshLineage: "v2-0092" },
+        f.selected,
+        optionsWithoutOriginalCreate,
+      ),
     ).rejects.toThrow("requires TAKOSERVER_DEPLOY_TARGET_PRODUCTION");
     const legacy = await runIntegrationStorageGeneration(
       { ...invocation, action: "status" },
       f.selected,
-      { ...f.options, originalCreate: undefined },
+      optionsWithoutOriginalCreate,
     );
     expect(legacy.namespace).toBeUndefined();
     expect(legacy.originalCreateCustody).toBeUndefined();
@@ -1958,7 +1963,7 @@ describe("original integration-ts fresh0092 creator", () => {
     };
     const proof = await verifyFreshV2IntegrationStorageTarget(selected, "integration", "v2-0092", {
       provider: f.provider,
-      reader: f.options.reader,
+      ...(f.options.reader === undefined ? {} : { reader: f.options.reader }),
       migrationDirectory: currentMigrations,
     });
     expect(proof).toMatchObject({

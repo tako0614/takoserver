@@ -114,8 +114,8 @@ test("SQLite 0.4 corpus is the exact 103-case owning source and version referenc
   expect(CASES).toHaveLength(103);
   expect(corpus.form).toBe(SQLITE_MIGRATION_APPLICATION_FORM_URL_0_4_0);
   expect(corpus.migrationSetForm).toBe(SQLITE_MIGRATION_SET_FORM_URL_0_4_0);
-  expect(SQLITE_MIGRATION_APPLICATION_FORM_URL).toBe(corpus.form);
-  expect(SQLITE_MIGRATION_SET_FORM_URL).toBe(corpus.migrationSetForm);
+  expect(corpus.form).toBe(SQLITE_MIGRATION_APPLICATION_FORM_URL);
+  expect(corpus.migrationSetForm).toBe(SQLITE_MIGRATION_SET_FORM_URL);
   const spec = { database: { resourceUid: "db" }, migrationSet: { resourceUid: "set" } };
   expect(sqliteMigrationApplicationReferences(spec)[1]?.formUrl).toBe(
     SQLITE_MIGRATION_SET_FORM_URL_0_4_0,

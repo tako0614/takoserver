@@ -547,7 +547,9 @@ test("unknown committed reserve ACK replays its one original assignment without 
     expect(f.batches()).toBe(batches);
     expect(f.snapshot()).toEqual(original);
     expect(original.assignments).toHaveLength(1);
-    expect(replay).toEqual(await owner.readOriginal(input.reservationId));
+    const retained = await owner.readOriginal(input.reservationId);
+    if (retained === null) throw new Error("original assignment missing after reserve replay");
+    expect(replay).toEqual(retained);
     await owner.release(replay);
     const tombstone = f.snapshot();
     f.setNow(FAR_FUTURE);
