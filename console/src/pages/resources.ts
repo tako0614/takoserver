@@ -345,7 +345,7 @@ function table(resources: readonly ResourceSummary[]): Child {
   }
   return h(
     "table",
-    null,
+    { class: "resource-table" },
     h(
       "thead",
       null,
@@ -379,7 +379,7 @@ function row(entry: ResourceSummary): Child {
     },
     h(
       "td",
-      null,
+      { class: "resource-state" },
       badge(phaseLabel(state.phase), state.tone, true),
       state.stale
         ? h("span", { style: { marginLeft: "6px" } }, badge(tr("変更あり", "changed"), "accent"))
@@ -388,32 +388,16 @@ function row(entry: ResourceSummary): Child {
     // Every row is in the selected organization's Space, so the Space is
     // not repeated per row. A long name is cut with an ellipsis (the whole
     // name is its title and the detail page heading) and the exact Form URL
-    // wraps, but never narrower than a readable column.
+    // wraps; on a phone each row stacks so the URL gets the full width.
     h(
       "td",
-      null,
-      h(
-        "a",
-        {
-          class: "mono truncate",
-          title: entry.name,
-          style: { maxWidth: "24ch" },
-          ...linkProps(href),
-        },
-        entry.name,
-      ),
+      { class: "resource-name" },
+      h("a", { class: "mono truncate", title: entry.name, ...linkProps(href) }, entry.name),
     ),
+    h("td", { class: "resource-form dim mono" }, entry.form),
     h(
       "td",
-      {
-        class: "dim mono",
-        style: { fontSize: "12px", overflowWrap: "anywhere", minWidth: "24ch" },
-      },
-      entry.form,
-    ),
-    h(
-      "td",
-      { class: "dim", title: entry.observedAt ?? "", style: { whiteSpace: "nowrap" } },
+      { class: "resource-observed dim", title: entry.observedAt ?? "" },
       entry.observedAt ? ago(entry.observedAt) : "—",
     ),
   );
