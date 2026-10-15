@@ -2463,7 +2463,7 @@ test("typed DELETE retains accepted3, binding2failed-none and confirmed1 indepen
     await f.settle(deleted, "failed");
     const repeated = await f.engine.acceptDelete({
       principal: PRINCIPAL,
-      key: "typed-delete-4",
+      key: "typed-repeated-delete-4",
       uid: f.endpoint.resourceUid,
       expectedGeneration: 3,
     });
