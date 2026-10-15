@@ -219,6 +219,20 @@ do not send duplicates. Release can lower utilization without erasing an
 already-delivered warning. Configure notification transport before claiming
 warnings were delivered.
 
+Usage settlement and internal Ledger holds, debits, captures and releases must
+retain crossed thresholds in the same atomic money batch. The warning reads
+the post-mutation entitlement using the settlement's instant; a failed warning
+write rolls back the entire batch. Opening a usage-summary page is not required.
+Retries retain the original Organization/period/threshold row and delivery key.
+
+The normal maintenance tick dispatches through the configured transport after
+legacy repair and before later money work. Warnings created by that tick's
+metering pass are available to the following tick. An unavailable transport
+leaves pending rows untouched. A delivery failure remains observable while
+other maintenance proceeds; if later work also fails, retain both causes.
+An unacknowledged delivery keeps its original claim and key for recovery after
+the claim expires. Transport qualification remains an operator responsibility.
+
 Proposed additional route:
 `GET /v1/organizations/{organizationId}/wallet/usage-summary/workspaces`.
 Query accepts `limit` (1-100, default 50) and an opaque `cursor`; a first-page

@@ -284,6 +284,12 @@ export type LedgerAllocationAdmissionResolver = (
   organizationId: string,
 ) => Promise<LedgerAllocationAdmission>;
 
+/** Trusted composition supplies post-mutation outbox SQL for the same money batch. */
+export type UsageWarningPreparer = (input: {
+  readonly organizationId: string;
+  readonly instant: string;
+}) => Promise<readonly SqlStatement[]>;
+
 export interface Ledger {
   wallet(organizationId: string): Promise<Wallet>;
   /** Credits settled funds. Repeating a funding reference credits once. */
@@ -426,9 +432,11 @@ export function createLedger(
   options: {
     readonly hostedPaidFreeExclusion?: boolean;
     readonly allocationAdmissionResolver?: LedgerAllocationAdmissionResolver;
+    readonly usageWarnings?: UsageWarningPreparer;
   } = {},
 ): Ledger {
   const hostedPaidFreeExclusion = options.hostedPaidFreeExclusion === true;
+  const usageWarnings = options.usageWarnings;
   return {
     async wallet(organizationId): Promise<Wallet> {
       const refundSource = await stripeRefundSource(sql);
@@ -970,8 +978,8 @@ export function createLedger(
     now: string,
     allocationAdmission?: LedgerAllocationAdmission,
   ): Promise<void> {
-    await sql.batch(
-      await prepareLedgerAllocation(sql, {
+    await sql.batch([
+      ...(await prepareLedgerAllocation(sql, {
         organizationId,
         type,
         reference,
@@ -981,8 +989,9 @@ export function createLedger(
         now,
         hostedPaidFreeExclusion,
         ...(allocationAdmission ? { allocationAdmission } : {}),
-      }),
-    );
+      })),
+      ...(usageWarnings ? await usageWarnings({ organizationId, instant: now }) : []),
+    ]);
   }
 
   async function settleHold(
@@ -992,7 +1001,15 @@ export function createLedger(
     amountMicros: number,
   ): Promise<void> {
     await sql.batch(
-      await planHoldSettlement(sql, clock, organizationId, type, reference, amountMicros),
+      await planHoldSettlement(
+        sql,
+        clock,
+        organizationId,
+        type,
+        reference,
+        amountMicros,
+        usageWarnings,
+      ),
     );
   }
 
@@ -1211,6 +1228,7 @@ async function planHoldSettlement(
   type: "capture" | "release",
   reference: string,
   amountMicros: number,
+  usageWarnings?: UsageWarningPreparer,
 ): Promise<readonly SqlStatement[]> {
   const refundsReady = await stripeRefundSchemaReady(sql);
   const now = clock().toISOString();
@@ -1359,6 +1377,7 @@ async function planHoldSettlement(
       sql: "DELETE FROM wallet_allocation_guards WHERE id IN (?, ?)",
       params: [guardId, `${guardId}_freeze`],
     },
+    ...(usageWarnings ? await usageWarnings({ organizationId, instant: now }) : []),
   ];
 }
 

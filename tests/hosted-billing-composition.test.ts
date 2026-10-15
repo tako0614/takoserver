@@ -14,7 +14,8 @@ import {
 } from "../src/hosted-billing-composition.ts";
 import { verifyHostedBillingFinancialRealm } from "../src/hosted-billing-realm.ts";
 import { compilePricingAuthoring } from "../src/hosted-pricing.ts";
-import { createLedger } from "../src/ledger.ts";
+import { createLedger, type Wallet } from "../src/ledger.ts";
+import { createMetering } from "../src/metering.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import type { OrgUsageWarning } from "../src/org-limit-policy.ts";
 import type { Sql } from "../src/ports.ts";
@@ -29,9 +30,8 @@ const warningsUnavailable: HostedWarningDelivery = {
   reason: "transport-not-composed",
 };
 
-function fixture() {
+function fixture(clock = () => new Date("2026-10-15T12:00:00.000Z")) {
   const sql = createEphemeralSql();
-  const clock = () => new Date("2026-10-15T12:00:00.000Z");
   const billingConfig = parseBillingConfig(
     JSON.stringify({
       schemaVersion: 1,
@@ -382,6 +382,139 @@ describe("Hosted wallet composition", () => {
     expect((await app.orgBilling?.wallet(organization.id))?.settledMicros).toBe(1_490_000);
   });
 
+  test("HTTP AI holds retain both warning thresholds before the third inference completes", async () => {
+    const f = fixture();
+    const identity: ExternalIdentityVerifier = {
+      async verify() {
+        return {
+          providerSubject: "warning-use",
+          email: "warning-use@example.test",
+          displayName: "Warning use",
+        };
+      },
+    };
+    const accounts = createAccounts({
+      sql: f.sql,
+      clock: f.config.clock,
+      identity,
+      randomId: () => crypto.randomUUID(),
+    });
+    const signedIn = await accounts.signIn({ provider: "google", assertion: "warning-use" });
+    const actor = await accounts.authenticate(`Bearer ${signedIn.sessionToken}`);
+    if (!actor) throw new Error("fixture session missing");
+    const organization = await accounts.createOrganization({ actor, name: "Warning use" });
+    const key = await accounts.createApiKey({
+      actor,
+      organizationId: organization.id,
+      name: "AI warnings",
+      scopes: ["ai:invoke"],
+      expiresInSeconds: 3600,
+    });
+    const composition = await createHostedBillingComposition({
+      ...f.config,
+      warnings: warningsUnavailable,
+    });
+    const observations: { warnings: OrgUsageWarning[]; wallet: Wallet }[] = [];
+    let calls = 0;
+    // Only the inference transport is synthetic. HTTP authentication, request
+    // custody, internal Ledger holds/capture, policy and outbox use the real App.
+    const ai: AiGateway = {
+      models: [
+        {
+          id: "test",
+          created: 1_787_054_400,
+          ownedBy: "takoserver",
+          limits: { maxInputTokens: 3, maxOutputTokens: 2 },
+          price: {
+            inputMinorPerMillionTokens: 10_000_000,
+            outputMinorPerMillionTokens: 10_000_000,
+          },
+        },
+      ],
+      async chat() {
+        calls++;
+        if (calls === 3) {
+          observations.push({
+            warnings: (
+              await f.sql.query(
+                "SELECT payload_json FROM org_wallet_usage_warnings WHERE org_id = ? ORDER BY threshold_basis_points",
+                [organization.id],
+              )
+            ).map((row) => JSON.parse(String(row.payload_json)) as OrgUsageWarning),
+            wallet: await createLedger(f.sql, f.config.clock).wallet(organization.id),
+          });
+        }
+        return {
+          id: `chat_warning_${calls}`,
+          object: "chat.completion",
+          created: 1_787_054_400,
+          model: "test",
+          choices: [
+            { index: 0, message: { role: "assistant", content: "hello" }, finish_reason: "stop" },
+          ],
+          usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+        };
+      },
+    };
+    const app = buildApp({ ...f.ports, identity, ai, hostedBilling: composition });
+    const invoke = (reference: string) =>
+      app.fetch(
+        new Request("https://api.example.test/v1/ai/chat/completions", {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${key.secret}`,
+            "content-type": "application/json",
+            "idempotency-key": reference,
+          },
+          body: JSON.stringify({
+            model: "test",
+            messages: [{ role: "user", content: "Hi" }],
+            max_tokens: 2,
+          }),
+        }),
+      );
+    const references = ["warning_one", "warning_two", "warning_three"];
+    for (const reference of references) expect((await invoke(reference)).status).toBe(200);
+    expect(observations).toHaveLength(1);
+    const inFlight = observations[0];
+    if (!inFlight) throw new Error("third inference was not observed");
+    expect(inFlight.wallet.heldMicros).toBe(500_000);
+    expect(
+      inFlight.wallet.entries
+        .filter((entry) => entry.type === "capture")
+        .reduce((sum, entry) => sum + entry.settledDeltaMicros, 0),
+    ).toBe(-1_000_000);
+    expect(inFlight.warnings).toMatchObject([
+      {
+        thresholdBasisPoints: 8000,
+        effectiveIncludedMicros: "1500000",
+        usedMicros: "1000000",
+        heldMicros: "500000",
+      },
+      {
+        thresholdBasisPoints: 9500,
+        effectiveIncludedMicros: "1500000",
+        usedMicros: "1000000",
+        heldMicros: "500000",
+      },
+    ]);
+    const retained = await f.sql.query("SELECT * FROM org_wallet_usage_warnings WHERE org_id = ?", [
+      organization.id,
+    ]);
+    expect(retained).toHaveLength(2);
+    expect((await Promise.all(references.map(invoke))).map((response) => response.status)).toEqual([
+      200, 200, 200,
+    ]);
+    expect(calls).toBe(3);
+    expect(
+      await f.sql.query("SELECT * FROM org_wallet_usage_warnings WHERE org_id = ?", [
+        organization.id,
+      ]),
+    ).toEqual(retained);
+    expect((await app.orgBilling?.wallet(organization.id))?.heldMicros).toBe(0);
+    expect((await app.orgBilling?.wallet(organization.id))?.settledMicros).toBe(0);
+  });
+
   test("first internal admission during verified paid coverage does not stack Free", async () => {
     const f = fixture();
     const composition = await createHostedBillingComposition({
@@ -420,34 +553,180 @@ describe("Hosted wallet composition", () => {
     ).toEqual([{ lot_ref: "stripe:invoice:in_paid" }]);
   });
 
-  test("the real outbox survives release and maintenance dispatches each warning once", async () => {
+  test("the real outbox survives release and normal ticks dispatch each warning once", async () => {
     const f = fixture();
     const delivered = new Map<string, OrgUsageWarning>();
+    const deliveryKeys: string[] = [];
     const composition = await createHostedBillingComposition({
       ...f.config,
       warnings: {
         state: "configured",
         transport: {
           async deliver(warning, key) {
+            deliveryKeys.push(key);
             delivered.set(key, warning);
             return { deliveryReference: `notification_${delivered.size}` };
           },
         },
       },
     });
-    const app = buildApp({ ...f.ports, hostedBilling: composition });
+    let replacementCalls = 0;
+    const replacement = await createHostedBillingComposition({
+      ...f.config,
+      warnings: {
+        state: "configured",
+        transport: {
+          async deliver() {
+            replacementCalls++;
+            throw new Error("replacement transport must not claim the original outbox");
+          },
+        },
+      },
+    });
+    const ports: Omit<AppPorts, "hostedBilling"> & { hostedBilling?: HostedBillingComposition } = {
+      ...f.ports,
+      hostedBilling: composition,
+    };
+    const app = buildApp(ports);
     await app.orgBilling?.hold(f.hold("hold_80", 1_200_000));
-    await app.orgBilling?.usageSummary(ORG);
+    delete ports.hostedBilling;
+    await Promise.all([app.tick(), app.tick()]);
+    expect([...delivered.values()].map((warning) => warning.thresholdBasisPoints)).toEqual([8000]);
     await app.orgBilling?.hold(f.hold("hold_95", 225_000));
-    await app.orgBilling?.usageSummary(ORG);
     await app.orgBilling?.release(ORG, "hold_95");
     await app.orgBilling?.release(ORG, "hold_80");
-    expect(await app.maintenance.billingWarnings?.dispatchWarnings()).toBe(2);
-    expect(await app.maintenance.billingWarnings?.dispatchWarnings()).toBe(0);
+    ports.hostedBilling = replacement;
+    await Promise.all([app.tick(), app.tick()]);
+    await app.tick();
     expect([...delivered.values()].map((warning) => warning.thresholdBasisPoints).sort()).toEqual([
       8000, 9500,
     ]);
     expect(app.hostedBilling?.warningDelivery).toBe("configured");
+    expect(replacementCalls).toBe(0);
+    expect(deliveryKeys).toHaveLength(2);
+    expect(new Set(deliveryKeys).size).toBe(2);
+    expect(
+      await f.sql.query(
+        "SELECT state FROM org_wallet_usage_warnings ORDER BY threshold_basis_points",
+      ),
+    ).toEqual([{ state: "delivered" }, { state: "delivered" }]);
+  });
+
+  test("normal ticks retain a lost warning ACK and still expire wallet holds", async () => {
+    let instant = "2026-10-15T12:00:00.000Z";
+    const f = fixture(() => new Date(instant));
+    const attempts: string[] = [];
+    const accepted = new Map<string, OrgUsageWarning>();
+    const composition = await createHostedBillingComposition({
+      ...f.config,
+      warnings: {
+        state: "configured",
+        transport: {
+          async deliver(warning, key) {
+            attempts.push(key);
+            accepted.set(key, warning);
+            if (attempts.length === 1) throw new Error("warning ACK lost");
+            return { deliveryReference: "original_notification" };
+          },
+        },
+      },
+    });
+    const app = buildApp({ ...f.ports, hostedBilling: composition });
+    await app.orgBilling?.hold(f.hold("expires_after_warning", 1_200_000));
+    instant = "2026-10-15T12:06:00.000Z";
+    await expect(app.tick()).rejects.toThrow("billing warning delivery failed");
+    expect(attempts).toHaveLength(1);
+    expect((await app.orgBilling?.wallet(ORG))?.heldMicros).toBe(0);
+    expect(await f.sql.query("SELECT state FROM org_wallet_usage_warnings")).toEqual([
+      { state: "dispatching" },
+    ]);
+    await app.tick();
+    expect(attempts).toHaveLength(1);
+    instant = "2026-10-15T12:07:00.000Z";
+    await app.tick();
+    const originalKey = attempts[0];
+    if (!originalKey) throw new Error("original warning delivery was not attempted");
+    expect(attempts).toEqual([originalKey, originalKey]);
+    expect(accepted.size).toBe(1);
+    expect(await f.sql.query("SELECT state FROM org_wallet_usage_warnings")).toEqual([
+      { state: "delivered" },
+    ]);
+  });
+
+  test("normal ticks retain both the warning transport failure and unpaid metering failure", async () => {
+    const f = fixture();
+    const transportFailure = new Error("warning ACK lost before the metering fold");
+    const attempts: { warning: OrgUsageWarning; key: string }[] = [];
+    const composition = await createHostedBillingComposition({
+      ...f.config,
+      warnings: {
+        state: "configured",
+        transport: {
+          async deliver(warning, key) {
+            attempts.push({ warning, key });
+            throw transportFailure;
+          },
+        },
+      },
+    });
+    const app = buildApp({ ...f.ports, hostedBilling: composition });
+    await app.orgBilling?.hold(f.hold("warning_before_unpaid_fold", 1_200_000));
+    await app.orgBilling?.release(ORG, "warning_before_unpaid_fold");
+    const originalWarnings = await f.sql.query("SELECT * FROM org_wallet_usage_warnings");
+    expect(originalWarnings).toHaveLength(1);
+    // One measured request costs 1,000 cents, beyond the existing Free lot.
+    // The real receiver freezes the real policy; App's own rollup must fail.
+    const receiver = createMetering({
+      sql: f.sql,
+      ledger: createLedger(f.sql, f.config.clock),
+      clock: f.config.clock,
+      randomId: () => "unpaid_warning_fold",
+      rates: { requestsMinorPerThousand: 1_000_000 },
+      hostedPaidFreeExclusion: true,
+      allocationAdmissionResolver: composition.limitPolicy.prepareAdmission.bind(
+        composition.limitPolicy,
+      ),
+    });
+    await receiver.record({
+      requestId: "unpaid_after_warning",
+      organizationId: ORG,
+      resourceUid: "resource_warning",
+      operation: "get",
+      bytes: 0,
+    });
+    const pendingUsage = await f.sql.query("SELECT * FROM usage_events");
+    expect(pendingUsage).toMatchObject([{ amount_micros: 10_000_000, rollup_id: null }]);
+    const before = await app.orgBilling?.wallet(ORG);
+    const failure: unknown = await app.tick().catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(AggregateError);
+    if (!(failure instanceof AggregateError))
+      throw new Error("both maintenance failures were lost");
+    expect(failure.errors).toHaveLength(2);
+    expect(failure.errors[0]).toBe(transportFailure);
+    expect(failure.errors[1]).toMatchObject({ code: "insufficient_funds" });
+    expect(attempts).toHaveLength(1);
+    const originalAttempt = attempts[0];
+    if (!originalAttempt) throw new Error("warning delivery was skipped before the failed rollup");
+    expect(JSON.parse(originalAttempt.key)).toEqual([
+      "org-usage-warning-v1",
+      ORG,
+      "2026-10-01T00:00:00.000Z",
+      "2026-11-01T00:00:00.000Z",
+      8000,
+    ]);
+    expect(originalAttempt.warning).toEqual(JSON.parse(String(originalWarnings[0]?.payload_json)));
+    const retained = await f.sql.query("SELECT * FROM org_wallet_usage_warnings");
+    expect(retained).toMatchObject([
+      { state: "dispatching", payload_json: originalWarnings[0]?.payload_json },
+    ]);
+    expect(retained[0]?.claim_token).toEqual(expect.any(String));
+    expect(retained[0]?.claim_until).toBe("2026-10-15T12:01:00.000Z");
+    await expect(app.tick()).rejects.toMatchObject({ code: "insufficient_funds" });
+    expect(attempts).toHaveLength(1);
+    expect(await f.sql.query("SELECT * FROM org_wallet_usage_warnings")).toEqual(retained);
+    expect(await f.sql.query("SELECT * FROM usage_events")).toEqual(pendingUsage);
+    expect(await app.orgBilling?.wallet(ORG)).toEqual(before);
+    expect(await f.sql.query("SELECT * FROM ledger WHERE type = 'usage_debit'")).toEqual([]);
   });
 
   test("declared unavailable transport preserves pending warning claims", async () => {
@@ -461,6 +740,8 @@ describe("Hosted wallet composition", () => {
     await app.orgBilling?.usageSummary(ORG);
     const pending = await f.sql.query("SELECT * FROM org_wallet_usage_warnings");
     expect(pending).toHaveLength(1);
+    await app.tick();
+    expect(await f.sql.query("SELECT * FROM org_wallet_usage_warnings")).toEqual(pending);
     await expect(app.maintenance.billingWarnings?.dispatchWarnings()).rejects.toThrow(
       "transport is unavailable",
     );
