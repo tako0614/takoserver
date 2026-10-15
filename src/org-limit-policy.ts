@@ -1,5 +1,6 @@
 import { canonicalJson } from "./json.ts";
 import { MoneyError, minorToMicros, parseUnsignedMicros } from "./money.ts";
+import { parseOrgOnDemandTerms, validateOrgOnDemandCashCap } from "./org-on-demand-terms.ts";
 import type { OrgUsageSummary } from "./org-usage-summary.ts";
 import {
   type Clock,
@@ -9,11 +10,23 @@ import {
   type SqlParam,
   type SqlStatement,
 } from "./ports.ts";
+import {
+  assertStripeOnDemandService,
+  parseStripeOnDemandConsentEnvelope,
+  type StripeOnDemandConsentEnvelope,
+  type StripeOnDemandService,
+} from "./stripe-on-demand.ts";
 
 export type OrgOnLimit = "stop" | "prepaid" | "postpaid" | "on-demand";
 
 /** The enum is broader than the qualified execution capability. */
-export const ORG_LIMIT_CAPABILITIES = Object.freeze({
+export interface OrgLimitCapabilities {
+  readonly stop: true;
+  readonly prepaid: true;
+  readonly postpaid: false;
+  readonly "on-demand": boolean;
+}
+export const ORG_LIMIT_CAPABILITIES: OrgLimitCapabilities = Object.freeze({
   stop: true,
   prepaid: true,
   postpaid: false,
@@ -44,7 +57,7 @@ export function assertOrgPostpaidLaunchGate(postpaidEnabled: unknown): void {
 
 export interface OrgLimitPolicyView {
   readonly onLimit: OrgOnLimit;
-  readonly capabilities: typeof ORG_LIMIT_CAPABILITIES;
+  readonly capabilities: OrgLimitCapabilities;
   readonly consentRevision: string | null;
   readonly cashCapMinor: number | null;
   /** UTC cash-cap month, independently of the allowance's invoice period. */
@@ -60,10 +73,28 @@ export interface ChangeOrgLimitPolicy {
   readonly onLimit: OrgOnLimit;
   readonly cashCapMinor?: number;
   readonly consentRevision?: string;
+  readonly termsRevision?: string;
+  readonly paymentMethodId?: string;
+  readonly setupIntentId?: string;
 }
 
+export interface ChangeOrgOnDemandPolicy extends ChangeOrgLimitPolicy {
+  readonly onLimit: "on-demand";
+  readonly cashCapMinor: number;
+  readonly consentRevision: string;
+  readonly termsRevision: string;
+  readonly paymentMethodId: string;
+}
+
+/** Stored original consent data; this reader never supplies native charge authority. */
+export type OrgOnDemandConsent = StripeOnDemandConsentEnvelope & {
+  readonly organizationId: string;
+  readonly reference: string;
+  readonly fingerprint: string;
+};
+
 export interface OrgLimitAdmission {
-  readonly onLimit: "stop" | "prepaid";
+  readonly onLimit: "stop" | "prepaid" | "on-demand";
   readonly policyVersion: number;
   readonly consentRevision: string | null;
   readonly allowPurchasedCredit: boolean;
@@ -226,29 +257,63 @@ function cleanup(id: string): SqlStatement {
   return { sql: "DELETE FROM wallet_allocation_guards WHERE id = ?", params: [id] };
 }
 
-function view(row: Row | undefined, at: string): OrgLimitPolicyView {
+function view(
+  row: Row | undefined,
+  at: string,
+  capabilities = ORG_LIMIT_CAPABILITIES,
+): OrgLimitPolicyView {
   if (row) {
     safeAmount(row.policy_version);
     if (row.policy_version < 1) fail("billing_policy_unavailable", 503);
     // An unsupported stored mode is a conformance gap, never a silent stop/prepaid fallback.
-    if (row.on_limit !== "stop" && row.on_limit !== "prepaid") fail("limit_mode_unavailable", 409);
     if (
-      row.cash_cap_minor !== null ||
+      row.on_limit !== "stop" &&
+      row.on_limit !== "prepaid" &&
+      !(row.on_limit === "on-demand" && capabilities["on-demand"])
+    )
+      fail("limit_mode_unavailable", 409);
+    if (
+      (row.on_limit !== "on-demand" && row.cash_cap_minor !== null) ||
       (row.on_limit === "stop" && row.consent_revision !== null) ||
       (row.on_limit === "prepaid" && row.consent_revision !== PREPAID_CONSENT_REVISION)
     )
       fail("billing_policy_unavailable", 503);
+    if (row.on_limit === "on-demand") {
+      try {
+        cashAmount(row.cash_cap_minor);
+        principal(row.consent_revision);
+      } catch {
+        fail("billing_policy_unavailable", 503);
+      }
+    }
   }
   return {
-    onLimit: row?.on_limit === "prepaid" ? "prepaid" : "stop",
-    capabilities: ORG_LIMIT_CAPABILITIES,
+    onLimit:
+      row?.on_limit === "on-demand"
+        ? "on-demand"
+        : row?.on_limit === "prepaid"
+          ? "prepaid"
+          : "stop",
+    capabilities,
     consentRevision: row ? (row.consent_revision as string | null) : null,
-    cashCapMinor: null,
+    cashCapMinor: row?.on_limit === "on-demand" ? Number(row.cash_cap_minor) : null,
     ...orgCashCapPeriod(at),
   };
 }
 
 function validateCommand(input: ChangeOrgLimitPolicy): void {
+  if (
+    !input ||
+    typeof input !== "object" ||
+    Array.isArray(input) ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(input))
+  )
+    fail("invalid_limit_policy", 400);
+  for (const key of Reflect.ownKeys(input)) {
+    const property = Object.getOwnPropertyDescriptor(input, key);
+    if (typeof key !== "string" || !property || !("value" in property) || !property.enumerable)
+      fail("invalid_limit_policy", 400);
+  }
   reference(input.organizationId);
   reference(input.reference);
   principal(input.authorizedPrincipal);
@@ -259,16 +324,109 @@ function validateCommand(input: ChangeOrgLimitPolicy): void {
     "onLimit",
     "cashCapMinor",
     "consentRevision",
+    "termsRevision",
+    "paymentMethodId",
+    "setupIntentId",
   ]);
   if (Object.keys(input).some((key) => !allowed.has(key))) fail("invalid_limit_policy", 400);
   if (!["stop", "prepaid", "postpaid", "on-demand"].includes(input.onLimit))
     fail("invalid_limit_policy", 400);
   if (input.onLimit === "stop" || input.onLimit === "prepaid") {
-    if ("cashCapMinor" in input || "consentRevision" in input) fail("invalid_limit_policy", 400);
+    if (
+      ["cashCapMinor", "consentRevision", "termsRevision", "paymentMethodId", "setupIntentId"].some(
+        (field) => field in input,
+      )
+    )
+      fail("invalid_limit_policy", 400);
   } else {
     cashAmount(input.cashCapMinor);
     principal(input.consentRevision);
   }
+  if (
+    input.onLimit === "postpaid" &&
+    ["termsRevision", "paymentMethodId", "setupIntentId"].some((field) => field in input)
+  )
+    fail("invalid_limit_policy", 400);
+}
+
+function validateOnDemandCommand(
+  input: ChangeOrgLimitPolicy,
+): asserts input is ChangeOrgOnDemandPolicy {
+  if (input.onLimit !== "on-demand") fail("invalid_limit_policy", 400);
+  reference(input.termsRevision);
+  if (
+    typeof input.paymentMethodId !== "string" ||
+    !/^pm_[A-Za-z0-9_]{1,240}$/u.test(input.paymentMethodId) ||
+    ("setupIntentId" in input &&
+      (typeof input.setupIntentId !== "string" ||
+        !/^seti_[A-Za-z0-9_]{1,240}$/u.test(input.setupIntentId)))
+  )
+    fail("invalid_limit_policy", 400);
+}
+
+function consentCommand(row: Row, organizationId: string): OrgOnDemandConsent {
+  try {
+    const envelope = parseStripeOnDemandConsentEnvelope(JSON.parse(String(row.result_json)));
+    const payload = JSON.parse(String(row.fingerprint)) as ChangeOrgLimitPolicy;
+    validateCommand(payload);
+    validateOnDemandCommand(payload);
+    const selected = envelope.selectedCardProof;
+    if (
+      payload.organizationId !== organizationId ||
+      payload.reference !== row.ref ||
+      payload.authorizedPrincipal !== row.authorized_principal ||
+      envelope.authorizedPrincipal !== payload.authorizedPrincipal ||
+      envelope.acceptedAt !== row.created_at ||
+      selected.organizationId !== organizationId ||
+      selected.paymentMethodId !== payload.paymentMethodId ||
+      selected.setupIntentId !== (payload.setupIntentId ?? null) ||
+      envelope.acceptedTerms.termsRevision !== payload.termsRevision ||
+      envelope.acceptedTerms.consentRevision !== payload.consentRevision ||
+      envelope.publicResult.cashCapMinor !== payload.cashCapMinor ||
+      canonicalJson(payload) !== row.fingerprint
+    )
+      fail("billing_policy_unavailable", 503);
+    return Object.freeze({
+      ...envelope,
+      organizationId,
+      reference: String(row.ref),
+      fingerprint: String(row.fingerprint),
+    });
+  } catch {
+    fail("billing_policy_unavailable", 503);
+  }
+}
+
+/** Pure retained consent lookup: expired terms and unavailable cards do not revoke already-paid spending. */
+export async function readOrgOnDemandConsent(input: {
+  readonly sql: Sql;
+  readonly organizationId: string;
+  readonly policyVersion?: number;
+}): Promise<OrgOnDemandConsent | null> {
+  reference(input.organizationId);
+  const policy = (
+    await input.sql.query("SELECT * FROM org_wallet_limit_policies WHERE org_id=?", [
+      input.organizationId,
+    ])
+  )[0];
+  if (policy?.on_limit !== "on-demand") return null;
+  if (input.policyVersion !== undefined && policy.policy_version !== input.policyVersion)
+    fail("limit_policy_conflict", 409);
+  const rows = await input.sql.query(
+    `SELECT * FROM org_wallet_limit_policy_commands WHERE org_id=? AND CASE WHEN json_valid(result_json) THEN json_extract(result_json,'$.kind')='org-limit-policy-consent-v1' AND json_extract(result_json,'$.version')=1 AND json_extract(result_json,'$.policyVersion')=? ELSE 0 END`,
+    [input.organizationId, Number(policy.policy_version)],
+  );
+  if (rows.length !== 1) fail("billing_policy_unavailable", 503);
+  const receipt = consentCommand(rows[0] as Row, input.organizationId);
+  if (
+    receipt.policyVersion !== policy.policy_version ||
+    receipt.authorizedPrincipal !== policy.authorized_principal ||
+    receipt.publicResult.consentRevision !== policy.consent_revision ||
+    receipt.publicResult.cashCapMinor !== policy.cash_cap_minor ||
+    receipt.acceptedAt !== policy.updated_at
+  )
+    fail("billing_policy_unavailable", 503);
+  return receipt;
 }
 
 /** Hosted composition opts into this policy; independent/self-host legacy wallets do not. */
@@ -276,9 +434,24 @@ export function createOrgLimitPolicy(input: {
   readonly sql: Sql;
   readonly clock?: Clock;
   readonly postpaidEnabled?: boolean | undefined;
+  readonly onDemand?: StripeOnDemandService;
 }): OrgLimitPolicy {
   assertOrgPostpaidLaunchGate(input.postpaidEnabled);
-  const { sql, clock = () => new Date() } = input;
+  const { sql, clock = () => new Date(), onDemand } = input;
+  const qualified = () => {
+    if (onDemand === undefined) return false;
+    try {
+      assertStripeOnDemandService(onDemand, { sql, clock });
+    } catch {
+      fail("billing_policy_unavailable", 503);
+    }
+    return true;
+  };
+  qualified();
+  const capabilities = (): OrgLimitCapabilities =>
+    qualified()
+      ? Object.freeze({ ...ORG_LIMIT_CAPABILITIES, "on-demand": true })
+      : ORG_LIMIT_CAPABILITIES;
   const now = () => {
     const value = clock().toISOString();
     instant(value);
@@ -289,7 +462,7 @@ export function createOrgLimitPolicy(input: {
   const command = async (org: string, ref: string, fingerprint: string) => {
     const row = (
       await sql.query(
-        "SELECT fingerprint, result_json FROM org_wallet_limit_policy_commands WHERE org_id = ? AND ref = ?",
+        "SELECT * FROM org_wallet_limit_policy_commands WHERE org_id = ? AND ref = ?",
         [org, ref],
       )
     )[0];
@@ -297,7 +470,12 @@ export function createOrgLimitPolicy(input: {
     if (row.fingerprint !== fingerprint) fail("reference_conflict", 409);
     let result: OrgLimitPolicyView;
     try {
-      result = JSON.parse(String(row.result_json)) as OrgLimitPolicyView;
+      const raw = JSON.parse(String(row.result_json));
+      if (raw?.kind === "org-limit-policy-consent-v1") {
+        if (!qualified()) fail("limit_mode_unavailable", 409);
+        return consentCommand(row, org).publicResult;
+      }
+      result = raw as OrgLimitPolicyView;
     } catch {
       return fail("billing_policy_unavailable", 503);
     }
@@ -305,7 +483,8 @@ export function createOrgLimitPolicy(input: {
     if (
       (result.onLimit !== "stop" && result.onLimit !== "prepaid") ||
       result.capabilities?.postpaid !== false ||
-      result.capabilities?.["on-demand"] !== false
+      (result.capabilities?.["on-demand"] !== false &&
+        !(result.capabilities?.["on-demand"] === true && qualified()))
     )
       fail("limit_mode_unavailable", 409);
     return result;
@@ -314,38 +493,125 @@ export function createOrgLimitPolicy(input: {
   return {
     async read(org) {
       reference(org);
-      return view(await policy(org), now());
+      const row = await policy(org),
+        available = capabilities();
+      if (row?.on_limit === "on-demand" && available["on-demand"])
+        await readOrgOnDemandConsent({ sql, organizationId: org });
+      return view(row, now(), available);
     },
     async change(change) {
       validateCommand(change);
+      change = Object.freeze({ ...change });
       // Unsupported execution stays unavailable even if an old command exists.
-      if (!ORG_LIMIT_CAPABILITIES[change.onLimit]) fail("limit_mode_unavailable", 409);
+      const available = capabilities();
+      if (!available[change.onLimit]) fail("limit_mode_unavailable", 409);
+      if (change.onLimit === "on-demand") validateOnDemandCommand(change);
       const org = change.organizationId;
       const fingerprint = canonicalJson(change);
       const replay = await command(org, change.reference, fingerprint);
       if (replay) return replay;
-      // No card lookup: the prepaid command itself records explicit spending consent.
-      const at = now();
+      let at = now();
       const original = await policy(org);
       const originalVersion = original ? Number(original.policy_version) : 0;
       safeAmount(originalVersion);
       if (originalVersion === Number.MAX_SAFE_INTEGER) fail("billing_policy_unavailable", 503);
       const version = originalVersion + 1;
-      const consent = change.onLimit === "prepaid" ? PREPAID_CONSENT_REVISION : null;
+      if (
+        (change.onLimit !== "stop" || !onDemand) &&
+        (
+          await sql.query(
+            "SELECT 1 FROM org_wallet_cash_exposures WHERE org_id=? AND status='reserved' LIMIT 1",
+            [org],
+          )
+        ).length
+      )
+        fail("limit_policy_conflict", 409);
+      const consent =
+        change.onLimit === "prepaid"
+          ? PREPAID_CONSENT_REVISION
+          : change.onLimit === "on-demand"
+            ? (change.consentRevision as string)
+            : null;
+      let accepted: Awaited<ReturnType<StripeOnDemandService["verifyConsent"]>> | undefined;
+      if (change.onLimit === "on-demand") {
+        validateOnDemandCommand(change);
+        if (!onDemand) fail("limit_mode_unavailable", 409);
+        if (!(await sql.query("SELECT 1 FROM orgs WHERE id=?", [org])).length)
+          fail("not_found", 404);
+        let terms: ReturnType<typeof parseOrgOnDemandTerms>;
+        try {
+          terms = parseOrgOnDemandTerms(onDemand.terms);
+        } catch {
+          fail("billing_policy_unavailable", 503);
+        }
+        try {
+          validateOrgOnDemandCashCap(terms, change.cashCapMinor);
+        } catch {
+          fail("invalid_cash_cap", 400);
+        }
+        if (
+          terms.termsRevision !== change.termsRevision ||
+          terms.consentRevision !== change.consentRevision
+        )
+          fail("invalid_limit_policy", 400);
+        try {
+          accepted = await onDemand.verifyConsent({
+            organizationId: org,
+            authorizedPrincipal: change.authorizedPrincipal,
+            termsRevision: change.termsRevision,
+            consentRevision: change.consentRevision,
+            cashCapMinor: change.cashCapMinor,
+            paymentMethodId: change.paymentMethodId,
+            ...(change.setupIntentId === undefined ? {} : { setupIntentId: change.setupIntentId }),
+          });
+        } catch {
+          fail("billing_policy_unavailable", 503);
+        }
+      }
+      at = now();
       const result: OrgLimitPolicyView = {
         onLimit: change.onLimit,
-        capabilities: ORG_LIMIT_CAPABILITIES,
+        capabilities: available,
         consentRevision: consent,
-        cashCapMinor: null,
+        cashCapMinor: change.onLimit === "on-demand" ? (change.cashCapMinor as number) : null,
         ...orgCashCapPeriod(at),
       };
+      let persisted: OrgLimitPolicyView | StripeOnDemandConsentEnvelope = result;
+      if (accepted) {
+        try {
+          persisted = parseStripeOnDemandConsentEnvelope({
+            kind: "org-limit-policy-consent-v1",
+            version: 1,
+            publicResult: result,
+            policyVersion: version,
+            authorizedPrincipal: change.authorizedPrincipal,
+            acceptedAt: at,
+            acceptedTerms: accepted.acceptedTerms,
+            selectedCardProof: accepted.selectedCardProof,
+          });
+        } catch {
+          fail("billing_policy_unavailable", 503);
+        }
+      }
+      if (accepted)
+        consentCommand(
+          {
+            org_id: org,
+            ref: change.reference,
+            authorized_principal: change.authorizedPrincipal,
+            fingerprint,
+            result_json: canonicalJson(persisted),
+            created_at: at,
+          },
+          org,
+        );
       const id = `guard_${crypto.randomUUID()}`;
       const statements: SqlStatement[] = [
         guard(
           id,
           `COALESCE((SELECT policy_version FROM org_wallet_limit_policies WHERE org_id = ?), 0) = ?
-            AND NOT EXISTS (SELECT 1 FROM org_wallet_cash_exposures WHERE org_id = ? AND status = 'reserved')`,
-          [org, originalVersion, org],
+            AND (?=1 OR NOT EXISTS (SELECT 1 FROM org_wallet_cash_exposures WHERE org_id = ? AND status = 'reserved'))`,
+          [org, originalVersion, Number(change.onLimit === "stop" && onDemand !== undefined), org],
         ),
         {
           sql: "INSERT INTO org_wallet_limit_policy_commands (org_id, ref, authorized_principal, fingerprint, result_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -354,19 +620,36 @@ export function createOrgLimitPolicy(input: {
             change.reference,
             change.authorizedPrincipal,
             fingerprint,
-            canonicalJson(result),
+            canonicalJson(persisted),
             at,
           ],
         },
         {
           sql: `INSERT INTO org_wallet_limit_policies (org_id, on_limit, policy_version, consent_revision, cash_cap_minor, authorized_principal, updated_at)
-            VALUES (?, ?, ?, ?, NULL, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT (org_id) DO UPDATE SET on_limit = excluded.on_limit,
             policy_version = excluded.policy_version, consent_revision = excluded.consent_revision,
             cash_cap_minor = excluded.cash_cap_minor, authorized_principal = excluded.authorized_principal,
             updated_at = excluded.updated_at`,
-          params: [org, change.onLimit, version, consent, change.authorizedPrincipal, at],
+          params: [
+            org,
+            change.onLimit,
+            version,
+            consent,
+            result.cashCapMinor,
+            change.authorizedPrincipal,
+            at,
+          ],
         },
+        // Version zero has no policy or prepared cash command to withdraw.
+        ...(change.onLimit === "stop" && onDemand && originalVersion > 0
+          ? onDemand.prepareWithdrawalStatements({
+              organizationId: org,
+              fromVersion: originalVersion,
+              toVersion: version,
+              instant: at,
+            })
+          : []),
         cleanup(id),
       ];
       try {
@@ -383,14 +666,17 @@ export function createOrgLimitPolicy(input: {
     async prepareAdmission(org) {
       reference(org);
       const row = await policy(org);
-      const current = view(row, now());
+      const available = capabilities();
+      if (row?.on_limit === "on-demand" && available["on-demand"])
+        await readOrgOnDemandConsent({ sql, organizationId: org });
+      const current = view(row, now(), available);
       const version = row ? Number(row.policy_version) : 0;
       const id = `guard_${crypto.randomUUID()}`;
       return {
-        onLimit: current.onLimit as "stop" | "prepaid",
+        onLimit: current.onLimit as "stop" | "prepaid" | "on-demand",
         policyVersion: version,
         consentRevision: current.consentRevision,
-        allowPurchasedCredit: current.onLimit === "prepaid",
+        allowPurchasedCredit: current.onLimit === "prepaid" || current.onLimit === "on-demand",
         guard: guard(
           id,
           "COALESCE((SELECT policy_version FROM org_wallet_limit_policies WHERE org_id = ?), 0) = ?",
@@ -646,10 +932,16 @@ export interface OrgCashExposureReceipt extends OrgCashExposureInput {
   readonly sourceReference: string | null;
 }
 
+export interface OrgCashExposureReservationPlan {
+  readonly receipt: OrgCashExposureReceipt;
+  readonly statements: readonly SqlStatement[];
+  readonly replay: boolean;
+}
+
 /**
- * Internal cash bookkeeping for a future qualified off-session funding owner.
+ * Internal cash bookkeeping for a qualified off-session funding owner.
  * This does not activate a mode, authorize a card, fund a lot, or claim capability.
- * The public policy writer cannot produce the on-demand consent this requires.
+ * A prepared plan has no effect until the common owner commits it with its command.
  */
 export function createOrgCashExposureReservations(input: {
   readonly sql: Sql;
@@ -674,71 +966,109 @@ export function createOrgCashExposureReservations(input: {
       fail("reference_conflict", 409);
     return stored;
   };
-  return {
-    async reserve(request: OrgCashExposureInput): Promise<OrgCashExposureReceipt> {
-      reference(request.organizationId);
-      reference(request.reference);
-      principal(request.consentRevision);
-      safeAmount(request.policyVersion);
-      if (request.policyVersion < 1) fail("invalid_limit_policy", 400);
-      cashAmount(request.amountMinor);
-      const stored = await find(request.organizationId, request.reference);
-      if (stored) return match(stored, request);
-      const row = (
-        await sql.query("SELECT * FROM org_wallet_limit_policies WHERE org_id = ?", [
-          request.organizationId,
-        ])
-      )[0];
-      if (
-        row?.on_limit !== "on-demand" ||
-        row.policy_version !== request.policyVersion ||
-        row.consent_revision !== request.consentRevision
-      )
-        fail("off_session_consent_required", 409);
-      cashAmount(row.cash_cap_minor);
-      const at = clock().toISOString();
-      const period = orgCashCapPeriod(at);
-      const id = `guard_${crypto.randomUUID()}`;
-      const org = request.organizationId;
-      try {
-        await sql.batch([
-          guard(
-            id,
-            `EXISTS (SELECT 1 FROM org_wallet_limit_policies WHERE org_id = ?
+  async function prepareReservation(
+    request: OrgCashExposureInput,
+    suppliedAt?: string,
+  ): Promise<OrgCashExposureReservationPlan> {
+    reference(request.organizationId);
+    reference(request.reference);
+    principal(request.consentRevision);
+    safeAmount(request.policyVersion);
+    if (request.policyVersion < 1) fail("invalid_limit_policy", 400);
+    cashAmount(request.amountMinor);
+    const stored = await find(request.organizationId, request.reference);
+    if (stored) return { receipt: match(stored, request), statements: [], replay: true };
+    const row = (
+      await sql.query("SELECT * FROM org_wallet_limit_policies WHERE org_id = ?", [
+        request.organizationId,
+      ])
+    )[0];
+    if (
+      row?.on_limit !== "on-demand" ||
+      row.policy_version !== request.policyVersion ||
+      row.consent_revision !== request.consentRevision
+    )
+      fail("off_session_consent_required", 409);
+    cashAmount(row.cash_cap_minor);
+    const at = suppliedAt ?? clock().toISOString();
+    instant(at);
+    const period = orgCashCapPeriod(at);
+    const id = `guard_${crypto.randomUUID()}`;
+    const org = request.organizationId;
+    return {
+      receipt: {
+        organizationId: org,
+        reference: request.reference,
+        policyVersion: request.policyVersion,
+        consentRevision: request.consentRevision,
+        amountMinor: request.amountMinor,
+        ...period,
+        status: "reserved",
+        sourceReference: null,
+      },
+      replay: false,
+      statements: [
+        guard(
+          id,
+          `EXISTS (SELECT 1 FROM org_wallet_limit_policies WHERE org_id = ?
             AND on_limit = 'on-demand' AND policy_version = ? AND consent_revision = ? AND cash_cap_minor = ?)
             AND NOT EXISTS (SELECT 1 FROM org_wallet_cash_exposures WHERE org_id = ? AND status = 'reserved')
             AND COALESCE((SELECT SUM(amount_minor) FROM org_wallet_cash_exposures
               WHERE org_id = ? AND period_start = ? AND status IN ('reserved', 'paid')), 0) <= ?`,
-            [
-              org,
-              request.policyVersion,
-              request.consentRevision,
-              row.cash_cap_minor,
-              org,
-              org,
-              period.periodStart,
-              row.cash_cap_minor - request.amountMinor,
-            ],
-          ),
-          {
-            sql: "INSERT INTO org_wallet_cash_cap_buckets (org_id, period_start, period_end) VALUES (?, ?, ?) ON CONFLICT (org_id, period_start) DO NOTHING",
-            params: [org, period.periodStart, period.periodEnd],
-          },
-          {
-            sql: "INSERT INTO org_wallet_cash_exposures (org_id, ref, period_start, period_end, policy_version, consent_revision, amount_minor, status, source_ref, created_at, closed_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', NULL, ?, NULL)",
-            params: [
-              org,
-              request.reference,
-              period.periodStart,
-              period.periodEnd,
-              request.policyVersion,
-              request.consentRevision,
-              request.amountMinor,
-              at,
-            ],
-          },
-          cleanup(id),
-        ]);
+          [
+            org,
+            request.policyVersion,
+            request.consentRevision,
+            row.cash_cap_minor,
+            org,
+            org,
+            period.periodStart,
+            row.cash_cap_minor - request.amountMinor,
+          ],
+        ),
+        {
+          sql: "INSERT INTO org_wallet_cash_cap_buckets (org_id, period_start, period_end) VALUES (?, ?, ?) ON CONFLICT (org_id, period_start) DO NOTHING",
+          params: [org, period.periodStart, period.periodEnd],
+        },
+        {
+          sql: "INSERT INTO org_wallet_cash_exposures (org_id, ref, period_start, period_end, policy_version, consent_revision, amount_minor, status, source_ref, created_at, closed_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', NULL, ?, NULL)",
+          params: [
+            org,
+            request.reference,
+            period.periodStart,
+            period.periodEnd,
+            request.policyVersion,
+            request.consentRevision,
+            request.amountMinor,
+            at,
+          ],
+        },
+        cleanup(id),
+      ],
+    };
+  }
+  return {
+    async read(
+      organizationId: string,
+      referenceKey: string,
+    ): Promise<OrgCashExposureReceipt | null> {
+      reference(organizationId);
+      reference(referenceKey);
+      return await find(organizationId, referenceKey);
+    },
+    async prepareReservation(
+      request: OrgCashExposureInput,
+      at: string,
+    ): Promise<OrgCashExposureReservationPlan> {
+      instant(at);
+      return await prepareReservation(request, at);
+    },
+    async reserve(request: OrgCashExposureInput): Promise<OrgCashExposureReceipt> {
+      const planned = await prepareReservation(request);
+      if (planned.replay) return planned.receipt;
+      const org = request.organizationId;
+      try {
+        await sql.batch(planned.statements);
       } catch (error) {
         if (!(error instanceof SqlError)) throw error;
         const committed = await find(org, request.reference);
