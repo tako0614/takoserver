@@ -42,6 +42,13 @@ export interface MigrationSqlStatement {
   readonly pragma: "defer" | "introspection" | null;
   /** Declarative metadata from this same token pass, not an execution grant. */
   readonly table?: MigrationSqlTable;
+  readonly alter?: MigrationSqlAlter;
+}
+
+export interface MigrationSqlAlter {
+  readonly kind: "add-column";
+  readonly schema: string | null;
+  readonly name: string;
 }
 
 export type MigrationSqlToken =
@@ -260,6 +267,12 @@ function scanMigrationSql(
 
   const tableToken = (token: MigrationSqlToken): void => {
     if (!captureTable || outerCommand === null) return;
+    if (outerCommand === "alter") {
+      // Only the ADD header is metadata; column expressions remain native SQL.
+      tableTokens.push(token);
+      if (tableTokens.length >= 8) captureTable = false;
+      return;
+    }
     if (outerCommand !== "create") {
       captureTable = false;
       return;
@@ -400,11 +413,13 @@ function scanMigrationSql(
       }
     }
     const table = migrationTableMetadata(tableTokens);
+    const alter = migrationAlterMetadata(tableTokens);
     statements.push({
       sql: statement,
       command: outerCommand,
       pragma: statementPragma,
       ...(table ? { table } : {}),
+      ...(alter ? { alter } : {}),
     });
     sliceStart = end;
     hasExecutableToken = false;
@@ -561,6 +576,30 @@ function isPragmaWhitespace(value: string): boolean {
 
 function sqlKeyword(token: MigrationSqlToken | undefined, word: string): boolean {
   return token?.kind === "word" && token.value.toLowerCase() === word;
+}
+
+/** ADD target only, from the same scanner tokens; never parses column SQL. */
+function migrationAlterMetadata(
+  tokens: readonly MigrationSqlToken[],
+): MigrationSqlAlter | undefined {
+  if (!sqlKeyword(tokens[0], "alter") || !sqlKeyword(tokens[1], "table")) return;
+  let index = 2;
+  const first = tokens[index++];
+  if (!first || first.kind === "symbol") return;
+  let schema: string | null = null;
+  let name = first.value;
+  if (tokens[index]?.kind === "symbol" && tokens[index]?.value === ".") {
+    schema = name;
+    const target = tokens[index + 1];
+    if (!target || target.kind === "symbol") return;
+    name = target.value;
+    index += 2;
+  }
+  if (!sqlKeyword(tokens[index++], "add")) return;
+  if (sqlKeyword(tokens[index], "column")) index += 1;
+  const column = tokens[index];
+  if (!column || column.kind === "symbol") return;
+  return { kind: "add-column", schema, name };
 }
 
 /** Consumes already-scanned tokens; it never tokenizes SQL a second time. */

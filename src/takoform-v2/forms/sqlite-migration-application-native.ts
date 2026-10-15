@@ -188,6 +188,13 @@ function runFileAndLedger(
   let started = false;
   let currentStatement: MigrationSqlStatement | undefined;
   let catalogEpoch = 0;
+  let alterValidation:
+    | {
+        readonly statement: MigrationSqlStatement;
+        readonly target: string;
+        readonly epoch: number;
+      }
+    | undefined;
   let ftsAction:
     | {
         readonly statement: MigrationSqlStatement;
@@ -251,6 +258,7 @@ function runFileAndLedger(
     ftsDescriptors.clear();
     ftsShadows.clear();
     ftsAction = undefined;
+    alterValidation = undefined;
     catalogEpoch += 1;
     mainTables.add("sqlite_master");
     mainTables.add("sqlite_schema");
@@ -350,6 +358,16 @@ function runFileAndLedger(
         (schema !== null && db !== "main")
       )
         return SQLITE.SQLITE_DENY;
+      if (a === "quick_check") {
+        return alterValidation !== undefined &&
+          alterValidation.statement === currentStatement &&
+          alterValidation.epoch === catalogEpoch &&
+          second === alterValidation.target &&
+          schema === "main" &&
+          origin === null
+          ? SQLITE.SQLITE_OK
+          : SQLITE.SQLITE_DENY;
+      }
       if (
         introspection &&
         a === "data_version" &&
@@ -416,6 +434,45 @@ function runFileAndLedger(
         (action === SQLITE.SQLITE_INSERT || action === SQLITE.SQLITE_READ)
         ? SQLITE.SQLITE_OK
         : SQLITE.SQLITE_DENY;
+    }
+    if (action === SQLITE.SQLITE_READ && a === "pragma_quick_check" && !mainObjects.has(a)) {
+      // SQLite prepares this fixed table-valued query for ADD constraint
+      // validation, then exposes its actual target in the step-time PRAGMA.
+      // A user SELECT/view/trigger has no admitted same-statement ALTER.
+      return started &&
+        !internalLedger &&
+        !internalTransaction &&
+        alterValidation !== undefined &&
+        alterValidation.statement === currentStatement &&
+        alterValidation.epoch === catalogEpoch &&
+        second === "quick_check" &&
+        schema === "main" &&
+        origin === null
+        ? SQLITE.SQLITE_OK
+        : SQLITE.SQLITE_DENY;
+    }
+    if (action === SQLITE.SQLITE_ALTER_TABLE) {
+      const target = currentStatement?.alter;
+      const object = b === null ? undefined : mainObjects.get(b);
+      alterValidation =
+        started &&
+        !internalLedger &&
+        !internalTransaction &&
+        currentStatement?.command === "alter" &&
+        target?.kind === "add-column" &&
+        (target.schema === null || asciiLower(target.schema) === "main") &&
+        a === "main" &&
+        schema === null &&
+        origin === null &&
+        second !== null &&
+        b !== null &&
+        asciiLower(target.name) === b &&
+        object?.name === second &&
+        ordinaryMain(b) &&
+        !b.startsWith("sqlite_") &&
+        !ftsShadows.has(b)
+          ? { statement: currentStatement, target: second, epoch: catalogEpoch }
+          : undefined;
     }
     if (
       introspection &&
@@ -523,6 +580,10 @@ function runFileAndLedger(
         }
         nonMainCatalogs.push({ schema, tables, indexes });
       }
+    } else {
+      // Older Forms gain no tenant metadata permission. This fixed Host read
+      // only resolves the ordinary target of SQLite's own ADD validation.
+      updateMainCatalog(readCatalog("main"));
     }
     for (const statement of statements) {
       const declaration = introspection ? ftsDeclaration(statement.table) : undefined;
@@ -550,16 +611,16 @@ function runFileAndLedger(
       try {
         database.exec(statement.sql);
       } finally {
+        alterValidation = undefined;
         ftsAction = undefined;
         ftsCreate = undefined;
         initialIndexBuild = undefined;
         currentStatement = undefined;
       }
       if (
-        introspection &&
-        (statement.command === "create" ||
-          statement.command === "alter" ||
-          statement.command === "drop")
+        statement.command === "create" ||
+        statement.command === "alter" ||
+        statement.command === "drop"
       ) {
         updateMainCatalog(readCatalog("main"));
       }
@@ -590,6 +651,7 @@ function runFileAndLedger(
     internalTransaction = false;
     internalLedger = false;
     metadataQuery = undefined;
+    alterValidation = undefined;
     ftsAction = undefined;
     ftsCreate = undefined;
     createdFts = undefined;
