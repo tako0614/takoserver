@@ -21,6 +21,33 @@ reference alphabet (`A–Z`, `a–z`, `0–9`, `.`, `_`, `:`, `/`, `-`). Hosted
 supply parsers retain their existing lower-case grammar for Offerings; this
 bound does not tighten price-plan or other hosted reference fields.
 
+### Hosted TEST billing target configuration
+
+The optional, closed `hostedBilling` target object selects the existing canonical
+entry with `selector: "canonical-test"`, `stripeMode: "test"`, an explicit Stripe
+`accountId` (`acct_...`) and the stable `billingAuthority` matching that database's
+financial realm. This Stripe account is separate from the target's Cloudflare
+`accountId`. The target must also declare `billingConfig`, matching `hostedPricing`
+and `consoleOrigin`. Do not combine this selection with the legacy
+`stripeCheckout` or `stripeWebhook` flags. Both `STRIPE_SECRET_KEY` and
+`STRIPE_WEBHOOK_SECRET` are required secret names; their values never belong in
+the target descriptor. Explicit `stripeSettings` Checkout bounds must agree with
+the published pricing.
+
+`hostedBilling.onDemand` is optional. When selected, it requires exactly `terms`,
+`cardSetupReturnUrls: { successUrl, cancelUrl }` and `setupDisclosureRevision`, as
+defined in the [Hosted billing contract](hosted-billing-api-spec.md). Terms must
+explicitly supply the supported USD rule, quantum, minimum/maximum, cash-cap
+bounds, validity and expiry; return URLs must be HTTPS on the same origin and
+contain no credentials, fragment or secret/token query parameters. Omitting this
+object keeps on-demand off; it supplies no consent, cash cap or postpaid mode.
+
+Deploy preflight carries these non-secret inputs through the realized Worker
+configuration and supply/Form simulation. That simulation does not qualify D1,
+the Stripe account, native Prices or financial readiness. The actual entry still
+requires its existing read-only schema/realm/native TEST qualification. An absent
+`hostedBilling` selection preserves the existing deployment behavior.
+
 The production-shaped D1 lane is deliberately narrower. Rehearsal and
 production require exactly one approved next-wave selector, while integration
 may use the same selector for one bounded audited wave:
