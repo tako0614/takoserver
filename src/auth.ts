@@ -234,6 +234,17 @@ export class AuthError extends Error {
   }
 }
 
+/** Unmapped historical ownership and damaged personal tuples require owner resolution. */
+export class PersonalOrganizationError extends Error {
+  readonly code = "personal_organization_unavailable";
+  readonly status = 503;
+
+  constructor() {
+    super("personal_organization_unavailable");
+    this.name = "PersonalOrganizationError";
+  }
+}
+
 /** Identity asserted by the integration-only organization bootstrap authority. */
 export interface IntegrationOrganizationBootstrapOwnerIdentity {
   readonly provider: "google" | "github";
@@ -497,6 +508,11 @@ export interface Accounts {
     readonly actor: Actor;
     readonly name: string;
   }): Promise<Organization>;
+  /** Creates one durable personal Organization for the local session principal. */
+  createPersonalOrganization(input: { readonly actor: Actor }): Promise<{
+    readonly organization: Organization;
+    readonly created: boolean;
+  }>;
   organization(id: string): Promise<Organization | null>;
   /** The person behind a session, for a console to greet and to audit against. */
   principal(id: string): Promise<Principal | null>;
@@ -794,6 +810,68 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
 
   const singleUse = createSingleUseCredentials(sql, clock);
 
+  const personalOrganizationState = async (
+    principalId: string,
+  ): Promise<{
+    readonly organization: Organization | null;
+    readonly unmappedOwnership: boolean;
+  }> => {
+    let rows: readonly Row[];
+    try {
+      // The mapping and all its ownership evidence come from one snapshot.
+      // An absent/foreign Organization must never be mistaken for no mapping.
+      rows = await sql.query(
+        `SELECT personal.org_id AS mapped_org_id,
+                o.id AS organization_id, o.name, o.owner_principal_id, o.created_at,
+                own.role AS owner_role,
+                EXISTS (
+                  SELECT 1 FROM org_memberships foreign_owner
+                  WHERE foreign_owner.org_id = personal.org_id
+                    AND foreign_owner.role = 'owner' AND foreign_owner.principal_id <> p.id
+                ) AS foreign_owner,
+                (EXISTS (SELECT 1 FROM orgs owned WHERE owned.owner_principal_id = p.id)
+                 OR EXISTS (
+                   SELECT 1 FROM org_memberships owned
+                   WHERE owned.principal_id = p.id AND owned.role = 'owner'
+                 )) AS existing_ownership
+         FROM principals p
+         LEFT JOIN personal_organizations personal ON personal.principal_id = p.id
+         LEFT JOIN orgs o ON o.id = personal.org_id
+         LEFT JOIN org_memberships own ON own.org_id = personal.org_id AND own.principal_id = p.id
+         WHERE p.id = ? AND p.provider IN ('google', 'github')`,
+        [principalId],
+      );
+    } catch (error) {
+      if (error instanceof SqlError) throw new PersonalOrganizationError();
+      throw error;
+    }
+    const row = rows[0];
+    if (!row || rows.length !== 1) throw new PersonalOrganizationError();
+    if (row.mapped_org_id === null) {
+      return { organization: null, unmappedOwnership: Number(row.existing_ownership) !== 0 };
+    }
+    if (
+      typeof row.mapped_org_id !== "string" ||
+      row.organization_id !== row.mapped_org_id ||
+      row.owner_principal_id !== principalId ||
+      row.owner_role !== "owner" ||
+      Number(row.foreign_owner) !== 0 ||
+      typeof row.name !== "string" ||
+      typeof row.created_at !== "string"
+    ) {
+      throw new PersonalOrganizationError();
+    }
+    return {
+      organization: {
+        id: row.mapped_org_id,
+        name: row.name,
+        ownerPrincipalId: principalId,
+        createdAt: row.created_at,
+      },
+      unmappedOwnership: false,
+    };
+  };
+
   const accounts: Accounts = {
     async signIn({ provider, assertion, method, nonce, audience, sessionTtlSeconds }) {
       if (provider !== "takos-id" && provider !== "google" && provider !== "github") {
@@ -932,6 +1010,72 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
         [id, actor.principalId, createdAt],
       );
       return { id, name, ownerPrincipalId: actor.principalId, createdAt };
+    },
+
+    async createPersonalOrganization({ actor }) {
+      if (actor.kind !== "session") throw new AuthError("permission_denied");
+      const principal = await accounts.principal(actor.principalId);
+      if (!principal) throw new AuthError("unauthenticated");
+      // Takos ID's Organization projection remains its own authority.
+      if (principal.provider === "takos-id") throw new AuthError("permission_denied");
+      const before = await personalOrganizationState(principal.id);
+      if (before.organization) return { organization: before.organization, created: false };
+      // Historical generic ownership carries no protected automatic-creation
+      // proof. Neither ordering, name nor email can justify adopting an Org or
+      // making a second Org that would receive another monthly free grant.
+      if (before.unmappedOwnership) throw new PersonalOrganizationError();
+
+      const id = `org_${randomId()}`;
+      const name = principal.displayName.trim().slice(0, 128) || "Personal organization";
+      const createdAt = stamp();
+      try {
+        await sql.batch([
+          {
+            sql: `INSERT INTO orgs (id, name, owner_principal_id, created_at)
+                  VALUES (?, CASE WHEN
+                    EXISTS (SELECT 1 FROM principals WHERE id = ? AND provider IN ('google', 'github'))
+                    AND NOT EXISTS (SELECT 1 FROM personal_organizations WHERE principal_id = ?)
+                    AND NOT EXISTS (SELECT 1 FROM orgs WHERE owner_principal_id = ?)
+                    AND NOT EXISTS (
+                      SELECT 1 FROM org_memberships WHERE principal_id = ? AND role = 'owner'
+                    ) THEN ? ELSE '' END, ?, ?)`,
+            params: [
+              id,
+              principal.id,
+              principal.id,
+              principal.id,
+              principal.id,
+              name,
+              principal.id,
+              createdAt,
+            ],
+          },
+          {
+            sql: `INSERT INTO org_memberships (org_id, principal_id, role, created_at)
+                  VALUES (?, ?, 'owner', ?)`,
+            params: [id, principal.id, createdAt],
+          },
+          {
+            sql: `INSERT INTO personal_organizations (principal_id, org_id, created_at)
+                  VALUES (?, ?, ?)`,
+            params: [principal.id, id, createdAt],
+          },
+        ]);
+      } catch (error) {
+        if (error instanceof SqlError && error.code === "constraint") {
+          const raced = await personalOrganizationState(principal.id);
+          if (raced.organization) return { organization: raced.organization, created: false };
+          throw new PersonalOrganizationError();
+        }
+        // Lost acknowledgement is indeterminate. A retry reads the durable
+        // mapping before attempting another batch; no money is written here.
+        if (error instanceof SqlError) throw new PersonalOrganizationError();
+        throw error;
+      }
+      const after = await personalOrganizationState(principal.id);
+      if (!after.organization || after.organization.id !== id)
+        throw new PersonalOrganizationError();
+      return { organization: after.organization, created: true };
     },
 
     async organization(id) {

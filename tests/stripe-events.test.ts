@@ -26,6 +26,7 @@ import {
   type StripeSignatureFailure,
   verifyStripeSignature,
 } from "../src/stripe-events.ts";
+import { claimFreshStripeModeRealm } from "../src/stripe-mode-realm.ts";
 import { createStripeClient } from "../src/stripe-settlement.ts";
 import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
@@ -58,14 +59,22 @@ type Session = Record<string, unknown>;
 /** A succeeded payment whose charge is neither refunded nor disputed. */
 const HELD_PAYMENT = {
   object: "payment_intent",
+  livemode: false,
   status: "succeeded",
-  latest_charge: { object: "charge", refunded: false, amount_refunded: 0, disputed: false },
+  latest_charge: {
+    object: "charge",
+    livemode: false,
+    refunded: false,
+    amount_refunded: 0,
+    disputed: false,
+  },
 };
 
 /** A paid wallet top-up this Host created; `metadata` overrides merge into its marker. */
 function paid(overrides: Session = {}): Session {
   const { metadata, ...rest } = overrides;
   return {
+    livemode: false,
     status: "complete",
     mode: "payment",
     payment_status: "paid",
@@ -129,6 +138,7 @@ async function host(
 ) {
   const stripe = stripeFake(options.sessions ?? {});
   const base = createEphemeralSql();
+  await claimFreshStripeModeRealm(base, "test");
   // Counts every statement, so a pass can be held to its query budget.
   const queries = { count: 0 };
   const sql: Sql = {
@@ -830,13 +840,15 @@ describe("independent review guards", () => {
     expect(await h.app.reconcilePayments()).toMatchObject({ credited: 150 });
     h.queries.count = 0;
     expect(await h.app.reconcilePayments()).toMatchObject({ credited: 0, alreadyCredited: 150 });
-    expect(h.queries.count).toBe(2);
+    // One immutable realm-pin read, then the two existing page/ledger reads.
+    expect(h.queries.count).toBe(4);
     expect(await h.balance(ORG)).toBe(150 * 500);
   });
 
   test("a deferred event is handled when it arrives again after its handler exists", async () => {
     const stripe = stripeFake({});
     const sql = createEphemeralSql();
+    await claimFreshStripeModeRealm(sql, "test");
     const handled: string[] = [];
     const context: PaymentEventContext = {
       sql,

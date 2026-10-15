@@ -9,6 +9,7 @@
  */
 
 import type { PricePlan } from "../../src/catalog.ts";
+import type { HostedPricing } from "../../src/hosted-pricing.ts";
 import type { TakoformBindingRef, TakoformInterfaceRef } from "../../src/interface-ref.ts";
 import type { V2Operation, V2Resource } from "../../src/takoform-v2/types.ts";
 
@@ -62,6 +63,61 @@ export interface Wallet {
   readonly availableMicros: string;
   readonly entries: readonly LedgerEntry[];
 }
+
+export type HostedPlanTable = HostedPricing["hostedPlanTable"];
+
+export interface HostedSubscriptionProjection {
+  readonly organizationId: string;
+  readonly subscriptionId: string;
+  readonly subscriptionRef: string;
+  readonly planKey: string;
+  readonly pricingRevision: string;
+  readonly status:
+    | "incomplete"
+    | "incomplete_expired"
+    | "trialing"
+    | "active"
+    | "past_due"
+    | "canceled"
+    | "unpaid"
+    | "paused";
+  readonly cancelAtPeriodEnd: boolean;
+  readonly periodStart: string;
+  readonly periodEnd: string;
+  readonly paidThrough: string | null;
+  readonly paidFeatures: boolean;
+  readonly updatedAt: string;
+}
+
+export interface OrganizationSubscription {
+  readonly subscription: HostedSubscriptionProjection | null;
+  readonly planTable: HostedPlanTable;
+}
+
+export type SubscriptionCheckoutStart =
+  | {
+      readonly status: 201;
+      readonly checkout: { readonly state: "open"; readonly id: string; readonly url: string };
+    }
+  | {
+      readonly status: 202;
+      readonly checkout: { readonly state: "pending"; readonly id: string };
+    }
+  | {
+      readonly status: 200;
+      readonly checkout:
+        | {
+            readonly state: "associated";
+            readonly id: string;
+            readonly subscriptionRef: string;
+            readonly url?: string;
+          }
+        | { readonly state: "expired"; readonly id: string };
+    };
+
+export type SubscriptionCancellationReceipt =
+  | { readonly state: "pending"; readonly subscriptionRef: string }
+  | { readonly state: "verified"; readonly subscriptionRef: string; readonly effectiveAt: string };
 
 export interface Offering {
   readonly id: string;
@@ -420,6 +476,119 @@ export function createApi(options: ApiOptions) {
       }
     },
 
+    /** Reads the Host-authored plan table and the Organization's current projection. */
+    async subscription(organizationId: string): Promise<OrganizationSubscription> {
+      const path = `/v1/organizations/${encodeURIComponent(organizationId)}/payments/subscription`;
+      const { payload, status } = await request<unknown>("GET", path);
+      if (
+        status !== 200 ||
+        !isRecord(payload) ||
+        !(
+          payload.subscription === null ||
+          isHostedSubscriptionProjection(payload.subscription, organizationId)
+        )
+      )
+        throw new ApiError("invalid_response", status, path);
+      const planTable = decodeHostedPlanTable(payload.planTable);
+      if (!planTable) throw new ApiError("invalid_response", status, path);
+      return { subscription: payload.subscription, planTable };
+    },
+
+    /** Replays one durable caller reference against one Host-configured plan key. */
+    async beginSubscription(
+      organizationId: string,
+      reference: string,
+      planKey: string,
+    ): Promise<SubscriptionCheckoutStart> {
+      const path = `/v1/organizations/${encodeURIComponent(organizationId)}/payments/subscription`;
+      if (!isBillingReference(reference) || !isPlanKey(planKey))
+        throw new ApiError("invalid_request", 0, path);
+      const { payload, status } = await request<unknown>("POST", path, { reference, planKey });
+      if (!isRecord(payload) || !isRecord(payload.checkout))
+        throw new ApiError("invalid_response", status, path);
+      const checkout = payload.checkout;
+      if (
+        status === 201 &&
+        checkout.state === "open" &&
+        isStripeSessionId(checkout.id) &&
+        isCheckoutUrl(checkout.url)
+      ) {
+        return {
+          status: 201,
+          checkout: { state: "open", id: checkout.id, url: checkout.url },
+        };
+      }
+      if (status === 202 && checkout.state === "pending" && isSubscriptionIntentId(checkout.id)) {
+        return { status: 202, checkout: { state: "pending", id: checkout.id } };
+      }
+      if (
+        status === 200 &&
+        checkout.state === "associated" &&
+        isStripeSessionId(checkout.id) &&
+        isSubscriptionRef(checkout.subscriptionRef) &&
+        (checkout.url === undefined || isCheckoutUrl(checkout.url))
+      ) {
+        return {
+          status: 200,
+          checkout: {
+            state: "associated",
+            id: checkout.id,
+            subscriptionRef: checkout.subscriptionRef,
+            ...(checkout.url === undefined ? {} : { url: checkout.url }),
+          },
+        };
+      }
+      if (
+        status === 200 &&
+        checkout.state === "expired" &&
+        isStripeSessionId(checkout.id) &&
+        checkout.url === undefined
+      ) {
+        return { status: 200, checkout: { state: "expired", id: checkout.id } };
+      }
+      throw new ApiError("invalid_response", status, path);
+    },
+
+    /** Requests period-end cancellation only against the exact current opaque target. */
+    async cancelSubscription(
+      organizationId: string,
+      reference: string,
+      expectedSubscriptionRef: string,
+    ): Promise<SubscriptionCancellationReceipt> {
+      const path = `/v1/organizations/${encodeURIComponent(organizationId)}/payments/subscription`;
+      if (!isBillingReference(reference) || !isSubscriptionRef(expectedSubscriptionRef))
+        throw new ApiError("invalid_request", 0, path);
+      const { payload, status } = await request<unknown>("PATCH", path, {
+        reference,
+        cancelAtPeriodEnd: true,
+        expectedSubscriptionRef,
+      });
+      if (!isRecord(payload) || !isRecord(payload.cancellation))
+        throw new ApiError("invalid_response", status, path);
+      const cancellation = payload.cancellation;
+      if (
+        status === 202 &&
+        cancellation.state === "pending" &&
+        cancellation.subscriptionRef === expectedSubscriptionRef &&
+        cancellation.effectiveAt === undefined
+      ) {
+        return { state: "pending", subscriptionRef: expectedSubscriptionRef };
+      }
+      if (
+        status === 200 &&
+        cancellation.state === "verified" &&
+        cancellation.subscriptionRef === expectedSubscriptionRef &&
+        isCanonicalIsoTimestamp(cancellation.effectiveAt)
+      ) {
+        return {
+          state: "verified",
+          subscriptionRef: expectedSubscriptionRef,
+          effectiveAt: cancellation.effectiveAt,
+        };
+      }
+      throw new ApiError("invalid_response", status, path);
+    },
+
     /**
      * Starts a payment. Answers 404 where this deployment cannot take one,
      * which is how the console knows not to offer it.
@@ -594,6 +763,126 @@ export function createApi(options: ApiOptions) {
         `/v1/organizations/${encodeURIComponent(organizationId)}/operations`,
       ),
   };
+}
+
+function decodeHostedPlanTable(value: unknown): HostedPlanTable | null {
+  if (
+    !isRecord(value) ||
+    value.scope !== "hosted" ||
+    value.balanceScope !== "organization" ||
+    !Array.isArray(value.products) ||
+    value.products.length !== 2 ||
+    value.products[0] !== "takosumi-hosted" ||
+    value.products[1] !== "takoserver" ||
+    !Array.isArray(value.plans) ||
+    (value.plans.length !== 3 && value.plans.length !== 4)
+  )
+    return null;
+  const free = value.plans[0];
+  const subscriptions = value.plans.slice(1, -1);
+  const usage = value.plans.at(-1);
+  if (
+    !isRecord(free) ||
+    !isPlanKey(free.planId) ||
+    free.tier !== "free" ||
+    free.resourceScope !== "edge" ||
+    free.edgeAllowance !== "pending-owner-runtime-policy" ||
+    !isRecord(usage) ||
+    !isPlanKey(usage.planId) ||
+    usage.tier !== "usage" ||
+    !isSafeIntegerAtLeast(usage.checkoutMinimumMinor, 1) ||
+    !isSafeIntegerAtLeast(usage.checkoutMaximumMinor, 1) ||
+    !isRecord(usage.meters) ||
+    usage.checkoutMinimumMinor > usage.checkoutMaximumMinor ||
+    !subscriptions.every(
+      (plan) =>
+        isRecord(plan) &&
+        isPlanKey(plan.planId) &&
+        plan.tier === "subscription" &&
+        isSafeIntegerAtLeast(plan.monthlyAmountMinor, 1) &&
+        isSafeIntegerAtLeast(plan.includedCreditMinor, 0) &&
+        typeof plan.stripePriceId === "string" &&
+        /^price_[A-Za-z0-9_]{1,240}$/u.test(plan.stripePriceId),
+    )
+  )
+    return null;
+  if (new Set(value.plans.map((plan) => plan.planId)).size !== value.plans.length) return null;
+  return value as unknown as HostedPlanTable;
+}
+
+function isHostedSubscriptionProjection(
+  value: unknown,
+  organizationId: string,
+): value is HostedSubscriptionProjection {
+  if (!isRecord(value)) return false;
+  return (
+    value.organizationId === organizationId &&
+    typeof value.subscriptionId === "string" &&
+    value.subscriptionId.length > 0 &&
+    isSubscriptionRef(value.subscriptionRef) &&
+    isPlanKey(value.planKey) &&
+    typeof value.pricingRevision === "string" &&
+    value.pricingRevision.length > 0 &&
+    [
+      "incomplete",
+      "incomplete_expired",
+      "trialing",
+      "active",
+      "past_due",
+      "canceled",
+      "unpaid",
+      "paused",
+    ].includes(String(value.status)) &&
+    typeof value.cancelAtPeriodEnd === "boolean" &&
+    isCanonicalIsoTimestamp(value.periodStart) &&
+    isCanonicalIsoTimestamp(value.periodEnd) &&
+    (value.paidThrough === null || isCanonicalIsoTimestamp(value.paidThrough)) &&
+    typeof value.paidFeatures === "boolean" &&
+    isCanonicalIsoTimestamp(value.updatedAt)
+  );
+}
+
+function isSafeIntegerAtLeast(value: unknown, minimum: number): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= minimum;
+}
+
+function isBillingReference(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(value);
+}
+
+function isPlanKey(value: unknown): value is string {
+  return typeof value === "string" && /^[a-z][a-z0-9_-]{0,63}$/u.test(value);
+}
+
+function isStripeSessionId(value: unknown): value is string {
+  return typeof value === "string" && /^cs_[A-Za-z0-9_]{1,240}$/u.test(value);
+}
+
+function isSubscriptionIntentId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^sci_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(value)
+  );
+}
+
+function isSubscriptionRef(value: unknown): value is string {
+  return typeof value === "string" && /^sra_[0-9a-f]{64}$/u.test(value);
+}
+
+function isCheckoutUrl(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  try {
+    const url = new URL(value);
+    return url.origin === "https://checkout.stripe.com";
+  } catch {
+    return false;
+  }
+}
+
+function isCanonicalIsoTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) && date.toISOString() === value;
 }
 
 function isV2Operation(value: unknown): value is ResourceOperation {

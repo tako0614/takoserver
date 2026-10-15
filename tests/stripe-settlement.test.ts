@@ -29,14 +29,16 @@ function stripe(session: Record<string, unknown> | null) {
 }
 
 const paid = {
+  livemode: false,
   mode: "payment",
   payment_status: "paid",
   amount_total: 5_000,
   currency: "usd",
   metadata: { organizationId: ORG },
   payment_intent: {
+    livemode: false,
     status: "succeeded",
-    latest_charge: { refunded: false, amount_refunded: 0, disputed: false },
+    latest_charge: { livemode: false, refunded: false, amount_refunded: 0, disputed: false },
   },
 };
 
@@ -100,13 +102,13 @@ describe("Stripe settlement", () => {
 
   test("refuses a payment that was refunded, partly refunded or disputed after it was paid", async () => {
     for (const charge of [
-      { refunded: true, amount_refunded: 5_000, disputed: false },
-      { refunded: false, amount_refunded: 1, disputed: false },
-      { refunded: false, amount_refunded: 0, disputed: true },
+      { livemode: false, refunded: true, amount_refunded: 5_000, disputed: false },
+      { livemode: false, refunded: false, amount_refunded: 1, disputed: false },
+      { livemode: false, refunded: false, amount_refunded: 0, disputed: true },
     ]) {
       const { verifier } = stripe({
         ...paid,
-        payment_intent: { status: "succeeded", latest_charge: charge },
+        payment_intent: { livemode: false, status: "succeeded", latest_charge: charge },
       });
       await expect(
         verifier.verify({ organizationId: ORG, settlementProof: "cs_test_123" }),
@@ -118,7 +120,10 @@ describe("Stripe settlement", () => {
     for (const [session, code] of [
       [{ ...paid, payment_intent: "pi_not_expanded" }, "unverifiable_payment"],
       [
-        { ...paid, payment_intent: { status: "processing", latest_charge: null } },
+        {
+          ...paid,
+          payment_intent: { livemode: false, status: "processing", latest_charge: null },
+        },
         "unverifiable_payment",
       ],
       [{ ...paid, mode: "subscription" }, "not_wallet_funding"],
@@ -128,6 +133,59 @@ describe("Stripe settlement", () => {
         verifier.verify({ organizationId: ORG, settlementProof: "cs_test_123" }),
       ).rejects.toMatchObject({ code });
     }
+  });
+
+  test("requires the session, PaymentIntent, and charge to match the configured mode", async () => {
+    const liveSession = stripe({ ...paid, livemode: true });
+    await expect(
+      liveSession.verifier.verify({ organizationId: ORG, settlementProof: "cs_test_123" }),
+    ).rejects.toMatchObject({ code: "wrong_mode" });
+
+    const liveIntent = stripe({
+      ...paid,
+      payment_intent: { ...paid.payment_intent, livemode: true },
+    });
+    await expect(
+      liveIntent.verifier.verify({ organizationId: ORG, settlementProof: "cs_test_123" }),
+    ).rejects.toMatchObject({ code: "wrong_mode" });
+
+    const liveCharge = stripe({
+      ...paid,
+      payment_intent: {
+        ...paid.payment_intent,
+        latest_charge: { ...paid.payment_intent.latest_charge, livemode: true },
+      },
+    });
+    await expect(
+      liveCharge.verifier.verify({ organizationId: ORG, settlementProof: "cs_test_123" }),
+    ).rejects.toMatchObject({ code: "wrong_mode" });
+  });
+
+  test("supports explicit live mode only with a live secret and matching native objects", async () => {
+    const livePaid = {
+      ...paid,
+      livemode: true,
+      payment_intent: {
+        ...paid.payment_intent,
+        livemode: true,
+        latest_charge: { ...paid.payment_intent.latest_charge, livemode: true },
+      },
+    };
+    const verifier = createStripeSettlement({
+      secretKey: "rk_live_pretend",
+      mode: "live",
+      async fetch(request) {
+        expect(request.headers.get("authorization")).toBe("Bearer rk_live_pretend");
+        return Response.json({ id: "cs_test_123", ...livePaid });
+      },
+    });
+    await expect(
+      verifier.verify({ organizationId: ORG, settlementProof: "cs_test_123" }),
+    ).resolves.toMatchObject({ amountMinor: 5_000 });
+
+    expect(() => createStripeSettlement({ secretKey: "sk_test_pretend", mode: "live" })).toThrow(
+      StripeSettlementError,
+    );
   });
 
   test("reads the session with its payment expanded", async () => {
@@ -183,6 +241,7 @@ describe("payment setup", () => {
         sent = new URLSearchParams(await request.text());
         return Response.json({
           id: "cs_test_new",
+          livemode: false,
           url: "https://checkout.stripe.com/c/pay/cs_test_new",
         });
       },

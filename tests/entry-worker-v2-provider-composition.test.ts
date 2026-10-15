@@ -4,6 +4,7 @@ import { Miniflare } from "miniflare";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { bytesDigest } from "../src/json.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
+import { claimFreshStripeModeRealm } from "../src/stripe-mode-realm.ts";
 import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.ts";
 import type { V2Form } from "../src/takoform-v2/types.ts";
 
@@ -70,6 +71,7 @@ async function fixture(name: string): Promise<{ runtime: Miniflare; env: WorkerE
   }
   const sql = createD1Sql(database);
   const now = new Date().toISOString();
+  await claimFreshStripeModeRealm(sql, "test");
   await sql.run("INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)", [
     ORG,
     "Worker composition",
