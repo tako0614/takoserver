@@ -1,6 +1,7 @@
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import { base64UrlDecode, base64UrlEncode, isSha256Digest } from "./json.ts";
 import type { Clock, Sql } from "./ports.ts";
+import { tenantRunPrincipalId } from "./tenant-run-principal.ts";
 
 /**
  * Every signed credential Takoserver issues, in one module.
@@ -178,17 +179,206 @@ export interface CreateTokenServiceOptions {
   readonly tenantRunCredentialAdmission?: TenantRunCredentialAdmission;
 }
 
-export function createTokenService(options: CreateTokenServiceOptions): TokenService {
-  const issuer = httpsOrigin(options.issuer);
-  const clock = options.clock ?? (() => new Date());
+/** Credential and issuance provenance only; this is not a business acceptance or grant. */
+export interface TakoformTenantRunOriginalView {
+  readonly issuer: string;
+  readonly principalId: string;
+  readonly claims: Readonly<TakoformTenantRunTokenClaims>;
+  readonly issuance: Readonly<{
+    readonly kind: "builtin-sponsorship-issuance";
+    readonly tokenId: string;
+    readonly organizationId: string;
+    readonly tenantRef: string;
+    readonly issuedAtEpochSeconds: number;
+    readonly expiresAtEpochSeconds: number;
+    readonly credentialKeyId: string;
+  }>;
+}
+
+export type TakoformTenantRunOriginal = OpenedTenantRunOriginal;
+
+/** Only the concrete factory has the request-local original-capture methods. */
+export interface TokenServiceWithTenantRunOriginal extends TokenService {
+  openTakoformTenantRunOriginal(rawBearer: string): Promise<TakoformTenantRunOriginal>;
+  readTakoformTenantRunOriginal(
+    handle: unknown,
+    actualSql: Sql,
+  ): Promise<Readonly<TakoformTenantRunOriginalView>>;
+  closeTakoformTenantRunOriginal(handle: unknown, actualSql: Sql): void;
+}
+
+const TENANT_RUN_ORIGINAL_MINT = Symbol("tenant-run original mint");
+
+interface TenantRunOriginalSnapshot {
+  readonly view: Readonly<TakoformTenantRunOriginalView>;
+  readonly notBeforeEpochSeconds: number;
+}
+
+type OriginalRevalidator = (
+  rawBearer: string,
+  checkpoint: () => void,
+) => Promise<TenantRunOriginalSnapshot>;
+
+class OpenedTenantRunOriginal {
+  readonly #issuer: object;
+  readonly #sql: Sql;
+  readonly #snapshot: TenantRunOriginalSnapshot;
+  readonly #revalidate: OriginalRevalidator;
+  #rawBearer: string;
+  #closed = false;
+
+  constructor(
+    mint: symbol,
+    issuer: object,
+    sql: Sql,
+    rawBearer: string,
+    snapshot: TenantRunOriginalSnapshot,
+    revalidate: OriginalRevalidator,
+  ) {
+    if (mint !== TENANT_RUN_ORIGINAL_MINT) fail("invalid_credential_authority");
+    this.#issuer = issuer;
+    this.#sql = sql;
+    this.#rawBearer = rawBearer;
+    this.#snapshot = snapshot;
+    this.#revalidate = revalidate;
+    Object.freeze(this);
+  }
+
+  static #select(mint: symbol, issuer: object, sql: Sql, value: unknown): OpenedTenantRunOriginal {
+    if (
+      mint !== TENANT_RUN_ORIGINAL_MINT ||
+      typeof value !== "object" ||
+      value === null ||
+      !(#issuer in value) ||
+      value.#issuer !== issuer ||
+      value.#sql !== sql
+    ) {
+      fail("invalid_credential_authority");
+    }
+    return value;
+  }
+
+  static async read(
+    mint: symbol,
+    issuer: object,
+    sql: Sql,
+    value: unknown,
+    checkpoint: () => void,
+    assertTime: (snapshot: TenantRunOriginalSnapshot) => void,
+  ): Promise<TenantRunOriginalSnapshot> {
+    const original = OpenedTenantRunOriginal.#select(mint, issuer, sql, value);
+    const current = () => {
+      checkpoint();
+      if (OpenedTenantRunOriginal.#select(mint, issuer, sql, value).#closed) {
+        fail("invalid_credential_authority");
+      }
+      assertTime(original.#snapshot);
+    };
+    current();
+    const snapshot = await original.#revalidate(original.#rawBearer, current);
+    current();
+    assertTime(snapshot);
+    if (JSON.stringify(snapshot) !== JSON.stringify(original.#snapshot)) {
+      fail("invalid_credential_authority");
+    }
+    return original.#snapshot;
+  }
+
+  static close(mint: symbol, issuer: object, sql: Sql, value: unknown): void {
+    const original = OpenedTenantRunOriginal.#select(mint, issuer, sql, value);
+    original.#closed = true;
+    original.#rawBearer = "";
+  }
+
+  static assertOpen(mint: symbol, issuer: object, sql: Sql, value: unknown): void {
+    if (OpenedTenantRunOriginal.#select(mint, issuer, sql, value).#closed) {
+      fail("invalid_credential_authority");
+    }
+  }
+}
+
+Object.freeze(OpenedTenantRunOriginal.prototype);
+Object.freeze(OpenedTenantRunOriginal);
+
+interface TokenDataSlot<T> {
+  readonly owner: object;
+  readonly value: T;
+  readonly writable: boolean;
+  readonly enumerable: boolean;
+  readonly configurable: boolean;
+}
+
+/** undefined is absent; null is an accessor or an uninspectable property chain. */
+function tokenDataSlot<T extends object, K extends keyof T>(
+  object: T,
+  key: K,
+): TokenDataSlot<T[K]> | null | undefined {
+  const seen = new Set<object>();
+  try {
+    let owner: object | null = object;
+    while (owner !== null) {
+      if (seen.size === 32 || seen.has(owner)) return null;
+      seen.add(owner);
+      const descriptor = Object.getOwnPropertyDescriptor(owner, key);
+      if (descriptor) {
+        if (!("value" in descriptor)) return null;
+        return {
+          owner,
+          value: descriptor.value,
+          writable: descriptor.writable === true,
+          enumerable: descriptor.enumerable === true,
+          configurable: descriptor.configurable === true,
+        };
+      }
+      owner = Object.getPrototypeOf(owner);
+    }
+    return undefined;
+  } catch {
+    return null;
+  }
+}
+
+function sameTokenDataSlot<T>(
+  left: TokenDataSlot<T> | null | undefined,
+  right: TokenDataSlot<T> | null | undefined,
+): boolean {
+  return (
+    left !== null &&
+    right !== null &&
+    (left === undefined || right === undefined
+      ? left === right
+      : left.owner === right.owner &&
+        left.value === right.value &&
+        left.writable === right.writable &&
+        left.enumerable === right.enumerable &&
+        left.configurable === right.configurable)
+  );
+}
+
+export function createTokenService(
+  options: CreateTokenServiceOptions,
+): TokenServiceWithTenantRunOriginal {
+  const originalSqlSlot = tokenDataSlot(options, "sql");
+  const originalIssuerSlot = tokenDataSlot(options, "issuer");
+  const originalClockSlot = tokenDataSlot(options, "clock");
+  const originalAdmissionSlot = tokenDataSlot(options, "tenantRunCredentialAdmission");
+  const originalSql = originalSqlSlot?.value;
+  const originalQuerySlot =
+    originalSql && typeof originalSql === "object" ? tokenDataSlot(originalSql, "query") : null;
+  const issuerInput = options.issuer;
+  const issuer = httpsOrigin(issuerInput);
+  const clockInput = options.clock;
+  const clock = clockInput ?? (() => new Date());
   const maxProvisionLifetime = positiveInteger(options.maxProvisionTokenLifetimeSeconds ?? 300);
   const maxTakoformRunLifetime = positiveInteger(
     options.maxTakoformRunTokenLifetimeSeconds ?? 3_600,
   );
   const keyCacheSeconds = options.keyCacheSeconds ?? 10;
-  const keys = createKeyCache(options.sql, clock, keyCacheSeconds);
+  const keySql = options.sql;
+  const keys = createKeyCache(keySql, clock, keyCacheSeconds);
+  const admissionInput = options.tenantRunCredentialAdmission;
   const tenantRunCredentialAdmission =
-    options.tenantRunCredentialAdmission ?? sponsorshipCredentialAdmission(options.sql);
+    admissionInput ?? sponsorshipCredentialAdmission(options.sql);
 
   const sign = async (
     audience: string,
@@ -285,7 +475,91 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
     return { payload, keyId: header.kid };
   };
 
-  return {
+  const originalIssuer = Object.freeze({});
+  const queryOriginalIssuance =
+    originalQuerySlot && typeof originalQuerySlot.value === "function"
+      ? originalQuerySlot.value.bind(originalSql)
+      : undefined;
+  const originalAdmission = originalSql ? sponsorshipCredentialAdmission(originalSql) : undefined;
+  const admitOriginal = originalAdmission?.assertAdmitted.bind(originalAdmission);
+
+  const assertOriginalTime = (
+    claims: Readonly<TakoformTenantRunTokenClaims>,
+    notBeforeEpochSeconds: number,
+  ): void => {
+    const current = Math.floor(clock().getTime() / 1_000);
+    if (!Number.isSafeInteger(current)) fail("state_unavailable");
+    if (claims.issuedAtEpochSeconds > current || notBeforeEpochSeconds > current) {
+      fail("token_not_yet_valid");
+    }
+    if (current >= claims.expiresAtEpochSeconds) fail("token_expired");
+  };
+  const assertOriginalSnapshotTime = (snapshot: TenantRunOriginalSnapshot): void => {
+    assertOriginalTime(snapshot.view.claims, snapshot.notBeforeEpochSeconds);
+  };
+
+  const verifyOriginal: OriginalRevalidator = async (rawBearer, checkpoint) => {
+    checkpoint();
+    const opened = await open(rawBearer, TAKOFORM_RUN_AUDIENCE, maxTakoformRunLifetime);
+    checkpoint();
+    const claims = Object.freeze(takoformTenantRunClaims(opened.payload));
+    const notBeforeEpochSeconds = epochSeconds(opened.payload.nbf);
+    const assertTime = () => assertOriginalTime(claims, notBeforeEpochSeconds);
+    assertTime();
+    if (!admitOriginal) fail("invalid_credential_authority");
+    await admitOriginal({ claims, keyId: opened.keyId });
+    checkpoint();
+    assertTime();
+    const principalId = await tenantRunPrincipalId(claims);
+    checkpoint();
+    assertTime();
+    if (!queryOriginalIssuance) fail("invalid_credential_authority");
+    let rows: readonly Record<string, unknown>[];
+    try {
+      rows = await queryOriginalIssuance(
+        `SELECT token_id, org_id, tenant_ref, issued_at_epoch_seconds,
+                expires_at_epoch_seconds, credential_key_id
+         FROM sponsorship_credential_issuance_operations
+         WHERE token_id = ? LIMIT 2`,
+        [claims.tokenId],
+      );
+    } catch {
+      throw new TokenError("state_unavailable");
+    }
+    checkpoint();
+    assertTime();
+    const row = rows.length === 1 ? rows[0] : undefined;
+    if (
+      !row ||
+      row.token_id !== claims.tokenId ||
+      row.org_id !== claims.organizationId ||
+      row.tenant_ref !== claims.tenantRef ||
+      row.issued_at_epoch_seconds !== claims.issuedAtEpochSeconds ||
+      row.expires_at_epoch_seconds !== claims.expiresAtEpochSeconds ||
+      row.credential_key_id !== opened.keyId
+    ) {
+      fail("invalid_credential_authority");
+    }
+    return Object.freeze({
+      notBeforeEpochSeconds,
+      view: Object.freeze({
+        issuer,
+        principalId,
+        claims,
+        issuance: Object.freeze({
+          kind: "builtin-sponsorship-issuance" as const,
+          tokenId: claims.tokenId,
+          organizationId: claims.organizationId,
+          tenantRef: claims.tenantRef,
+          issuedAtEpochSeconds: claims.issuedAtEpochSeconds,
+          expiresAtEpochSeconds: claims.expiresAtEpochSeconds,
+          credentialKeyId: opened.keyId,
+        }),
+      }),
+    });
+  };
+
+  const service: TokenServiceWithTenantRunOriginal = {
     async issueProvisionToken(input) {
       if (!isSha256Digest(input.offeringDigest)) throw new TypeError("offering digest is invalid");
       return await sign(
@@ -360,7 +634,99 @@ export function createTokenService(options: CreateTokenServiceOptions): TokenSer
       await claimReusableCreate(options.sql, clock, claims);
       return claims;
     },
+
+    async openTakoformTenantRunOriginal(rawBearer) {
+      const checkpoint = () => assertOriginalService(this);
+      checkpoint();
+      const snapshot = await verifyOriginal(rawBearer, checkpoint);
+      checkpoint();
+      assertOriginalSnapshotTime(snapshot);
+      if (!originalSql) fail("invalid_credential_authority");
+      return new OpenedTenantRunOriginal(
+        TENANT_RUN_ORIGINAL_MINT,
+        originalIssuer,
+        originalSql,
+        rawBearer,
+        snapshot,
+        verifyOriginal,
+      );
+    },
+
+    async readTakoformTenantRunOriginal(handle, actualSql) {
+      const checkpoint = () => {
+        assertOriginalService(this);
+        if (actualSql !== originalSql) fail("invalid_credential_authority");
+      };
+      checkpoint();
+      const snapshot = await OpenedTenantRunOriginal.read(
+        TENANT_RUN_ORIGINAL_MINT,
+        originalIssuer,
+        actualSql,
+        handle,
+        checkpoint,
+        assertOriginalSnapshotTime,
+      );
+      checkpoint();
+      assertOriginalSnapshotTime(snapshot);
+      OpenedTenantRunOriginal.assertOpen(
+        TENANT_RUN_ORIGINAL_MINT,
+        originalIssuer,
+        actualSql,
+        handle,
+      );
+      return snapshot.view;
+    },
+
+    closeTakoformTenantRunOriginal(handle, actualSql) {
+      assertOriginalService(this);
+      if (actualSql !== originalSql) fail("invalid_credential_authority");
+      OpenedTenantRunOriginal.close(TENANT_RUN_ORIGINAL_MINT, originalIssuer, actualSql, handle);
+    },
   };
+  const originalMethodSlots = Object.freeze({
+    openTakoformTenantRunOriginal: tokenDataSlot(service, "openTakoformTenantRunOriginal"),
+    readTakoformTenantRunOriginal: tokenDataSlot(service, "readTakoformTenantRunOriginal"),
+    closeTakoformTenantRunOriginal: tokenDataSlot(service, "closeTakoformTenantRunOriginal"),
+  });
+
+  function assertOriginalService(receiver: unknown): void {
+    if (
+      receiver !== service ||
+      !originalSql ||
+      originalSql !== keySql ||
+      !queryOriginalIssuance ||
+      !originalIssuerSlot ||
+      originalIssuerSlot.value !== issuerInput ||
+      originalClockSlot === null ||
+      originalClockSlot?.value !== clockInput ||
+      originalAdmissionSlot === null ||
+      originalAdmissionSlot?.value !== undefined ||
+      admissionInput !== undefined ||
+      !sameTokenDataSlot(originalSqlSlot, tokenDataSlot(options, "sql")) ||
+      !sameTokenDataSlot(originalIssuerSlot, tokenDataSlot(options, "issuer")) ||
+      !sameTokenDataSlot(originalClockSlot, tokenDataSlot(options, "clock")) ||
+      !sameTokenDataSlot(
+        originalAdmissionSlot,
+        tokenDataSlot(options, "tenantRunCredentialAdmission"),
+      ) ||
+      !sameTokenDataSlot(originalQuerySlot, tokenDataSlot(originalSql, "query")) ||
+      !sameTokenDataSlot(
+        originalMethodSlots.openTakoformTenantRunOriginal,
+        tokenDataSlot(service, "openTakoformTenantRunOriginal"),
+      ) ||
+      !sameTokenDataSlot(
+        originalMethodSlots.readTakoformTenantRunOriginal,
+        tokenDataSlot(service, "readTakoformTenantRunOriginal"),
+      ) ||
+      !sameTokenDataSlot(
+        originalMethodSlots.closeTakoformTenantRunOriginal,
+        tokenDataSlot(service, "closeTakoformTenantRunOriginal"),
+      )
+    ) {
+      fail("invalid_credential_authority");
+    }
+  }
+  return service;
 }
 
 /**
