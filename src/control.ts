@@ -37,6 +37,7 @@ import {
   type PaymentEvents,
 } from "./payment-events.ts";
 import type { Clock } from "./ports.ts";
+import { requestAuthorization } from "./request-authorization.ts";
 import { type Reseller, ResellerError } from "./reseller.ts";
 import type { ResourceDeploymentStore } from "./resource-deployments.ts";
 import type { ResourceExecutionEvidenceResponse } from "./resource-execution-evidence.ts";
@@ -309,13 +310,8 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
   } = options;
   const secureCookies = new URL(publicOrigin).protocol === "https:";
 
-  const authorization = (request: Request): string | null => {
-    const header = request.headers.get("authorization");
-    if (header) return header;
-    if (!consoleOrigin || request.headers.get("origin") !== consoleOrigin) return null;
-    const token = cookie(request, "takoserver_session");
-    return token ? `Bearer ${token}` : null;
-  };
+  const authorization = (request: Request): string | null =>
+    requestAuthorization(request, consoleOrigin);
 
   const owner = async (request: Request, organizationId: string): Promise<Actor> => {
     const actor = await accounts.authenticate(authorization(request));
@@ -2082,14 +2078,6 @@ function classify(error: unknown): { code: string; status: number } {
     return { code: "unauthenticated", status: 401 };
   }
   return { code: "internal_error", status: 500 };
-}
-
-function cookie(request: Request, name: string): string | null {
-  for (const part of (request.headers.get("cookie") ?? "").split(";")) {
-    const [key, ...value] = part.trim().split("=");
-    if (key === name) return value.join("=") || null;
-  }
-  return null;
 }
 
 function sessionCookie(token: string, secure: boolean): string {
