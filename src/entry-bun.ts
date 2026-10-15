@@ -1367,7 +1367,7 @@ async function closeBeforePublicIngress(): Promise<void> {
 }
 let app: ReturnType<typeof buildApp>;
 try {
-  const v2FormFactory = completeV2WorkerForms
+  const v2FormSelectionFactory = completeV2WorkerForms
     ? runtimeInputKeyAuthority
       ? v2WorkerComposition.privateInputFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
       : v2WorkerComposition.secretFreeFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
@@ -1389,8 +1389,8 @@ try {
     ...(billingConfig ? { billingConfig } : {}),
     hostedPaidFreeExclusion: Boolean(hostedPricing),
     v2ArtifactSourceFactory: createSelfhostPublicArtifactSource,
-    ...(v2FormFactory ? { v2FormFactory } : {}),
-    ...(v2FormFactory && runtimeInputKeyAuthority
+    ...(v2FormSelectionFactory ? { v2FormSelectionFactory } : {}),
+    ...(v2FormSelectionFactory && runtimeInputKeyAuthority
       ? { v2PrivateInputCustody: runtimeInputKeyAuthority.privateInputCustody }
       : {}),
     ...(payment.checkout ? { checkout: payment.checkout } : {}),

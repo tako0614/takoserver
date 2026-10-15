@@ -7,7 +7,10 @@ import {
   type V2ArtifactSource,
   type V2HeldArtifactEntry,
 } from "./forms/artifact-source.ts";
-import { SQLITE_MIGRATION_SET_FORM_URL } from "./forms/sqlite-migration-set.ts";
+import {
+  SQLITE_MIGRATION_SET_FORM_URL,
+  SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
+} from "./forms/sqlite-migration-set.ts";
 import { createSQLiteMigrationSetForm } from "./forms/sqlite-migration-set-backend.ts";
 import { STATIC_ASSET_BUNDLE_FORM_URL } from "./forms/static-asset-bundle.ts";
 import { createStaticAssetBundleForm } from "./forms/static-asset-bundle-backend.ts";
@@ -148,6 +151,15 @@ export function createTakoformV2Application(options: {
       sql,
       source,
       targetKey: config.sqliteMigrationSet.targetKey,
+    });
+    retainedForms[SQLITE_MIGRATION_SET_FORM_URL_0_2_0] = createSQLiteMigrationSetForm({
+      sql,
+      source: artifactSource(
+        SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
+        config.sqliteMigrationSet.heldArtifacts,
+      ),
+      targetKey: config.sqliteMigrationSet.targetKey,
+      formUrl: SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
     });
   }
   if (config.workerBundle) {

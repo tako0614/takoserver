@@ -8,8 +8,14 @@ import {
   isValidArtifactPath,
 } from "./artifact-validation.ts";
 
-export const SQLITE_MIGRATION_SET_FORM_URL =
+export const SQLITE_MIGRATION_SET_FORM_URL_0_2_0 =
   "https://edge.forms.takoform.com/forms/SQLiteMigrationSet/0.2.0/" as const;
+export const SQLITE_MIGRATION_SET_FORM_URL_0_3_0 =
+  "https://edge.forms.takoform.com/forms/SQLiteMigrationSet/0.3.0/" as const;
+export const SQLITE_MIGRATION_SET_FORM_URL = SQLITE_MIGRATION_SET_FORM_URL_0_3_0;
+export type SQLiteMigrationSetFormUrl =
+  | typeof SQLITE_MIGRATION_SET_FORM_URL_0_2_0
+  | typeof SQLITE_MIGRATION_SET_FORM_URL_0_3_0;
 
 export const SQLITE_MIGRATION_SET_LIMITS = {
   manifestBytes: 1_048_576,

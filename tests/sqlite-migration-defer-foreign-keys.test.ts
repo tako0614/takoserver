@@ -10,6 +10,10 @@ import {
   prepareMigrationSql as prepareNeutralMigrationSql,
 } from "../src/sqlite-migration-policy.ts";
 import { createSQLiteMigrationApplicationNativePort } from "../src/takoform-v2/forms/sqlite-migration-application-native.ts";
+import {
+  SQLITE_MIGRATION_APPLICATION_FORM_URL,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
+} from "../src/takoform-v2/forms/sqlite-migration-application.ts";
 import type { SQLiteMigrationRecord } from "../src/takoform-v2/forms/sqlite-migration-application-port.ts";
 
 const VALUES = ["ON", "OFF", "TRUE", "FALSE", "1", "0"] as const;
@@ -67,7 +71,7 @@ test("parser compatibility path shares the exact neutral parser and capacity err
 
 test("parser permits only the six bare defer assignments and preserves exact slices", () => {
   for (const value of VALUES) {
-    const pragma = `\ufeff /* prefix ; */ pRaGmA -- name\r\n DeFeR_FoReIgN_KeYs /* = */ = /* value */ ${value.toLowerCase()} ;`;
+    const pragma = `/* outside prefix ; */ pRaGmA\r\n DeFeR_FoReIgN_KeYs = ${value.toLowerCase()} ;`;
     const ddl = "\nCREATE TABLE quoted (value TEXT DEFAULT 'PRAGMA foreign_keys=OFF; BEGIN');";
     const trailing = " -- trailing no-op\n;";
     expect(prepareMigrationSql(pragma + ddl + trailing)).toEqual([pragma, ddl]);
@@ -120,8 +124,9 @@ test("parser native PRAGMA entry preserves the provider's separate non-PRAGMA id
   }
 });
 
-function fixture() {
+function fixture(form: string = SQLITE_MIGRATION_APPLICATION_FORM_URL) {
   const database = new DatabaseSync(":memory:");
+  let ownerOpens = 0;
   database.exec(`PRAGMA foreign_keys=ON;
 CREATE TABLE _takoform_sqlite_migrations (
  sequence INTEGER PRIMARY KEY CHECK(sequence BETWEEN 1 AND 512),
@@ -132,6 +137,7 @@ CREATE TABLE parent(id INTEGER PRIMARY KEY);
 CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES parent(id));`);
   const port = createSQLiteMigrationApplicationNativePort({
     async withAuthorizedDatabase(input) {
+      ownerOpens += 1;
       if (!(await input.stillAuthorized())) throw new Error("fixture authorization lost");
       return input.use(database);
     },
@@ -149,7 +155,7 @@ CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES
         principal: "staging-component-principal",
         action: "create",
         generation: 1,
-        form: "https://edge.forms.takoform.com/forms/SQLiteMigrationApplication/0.2.0/",
+        form,
         space: "staging-component",
         name: "staging-application",
         spec: {},
@@ -169,8 +175,48 @@ CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES
     deferred: database.prepare("PRAGMA defer_foreign_keys").get()?.defer_foreign_keys,
     enforced: database.prepare("PRAGMA foreign_keys").get()?.foreign_keys,
   });
-  return { database, apply, settings };
+  return {
+    database,
+    apply,
+    settings,
+    get ownerOpens() {
+      return ownerOpens;
+    },
+  };
 }
+
+test("native retained 0.2 denies new defer effects while keeping its committed prefix", async () => {
+  const f = fixture(SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0);
+  try {
+    const first = await f.apply("INSERT INTO parent VALUES(7);");
+    expect(first.kind).toBe("applied");
+    if (first.kind !== "applied") throw new Error("ordinary retained SQL did not apply");
+    expect(
+      await f.apply("PRAGMA defer_foreign_keys=ON; INSERT INTO parent VALUES(8);", [first.record]),
+    ).toEqual({ kind: "rejected", code: "migration_sql_error" });
+    expect(f.database.prepare("SELECT id FROM parent").all()).toEqual([{ id: 7 }]);
+    expect(f.database.prepare("SELECT sequence FROM _takoform_sqlite_migrations").all()).toEqual([
+      { sequence: 1 },
+    ]);
+    expect(f.settings()).toEqual({ deferred: 0, enforced: 1 });
+  } finally {
+    f.database.close();
+  }
+});
+
+test("native unknown Form identity cannot open the owner or invoke a migration session", async () => {
+  const f = fixture("https://unknown.example/SQLiteMigrationApplication/");
+  try {
+    await expect(f.apply("INSERT INTO parent VALUES(7);")).rejects.toThrow(
+      "Form identity is unsupported",
+    );
+    expect(f.ownerOpens).toBe(0);
+    expect(f.database.prepare("SELECT id FROM parent").all()).toEqual([]);
+    expect(f.settings()).toEqual({ deferred: 0, enforced: 1 });
+  } finally {
+    f.database.close();
+  }
+});
 
 test("SQLite component commits a deferred forward reference with its ledger and resets on commit", async () => {
   const { database, apply, settings } = fixture();

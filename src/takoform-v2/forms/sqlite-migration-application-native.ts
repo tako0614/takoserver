@@ -1,9 +1,15 @@
 import { type DatabaseSync, constants as SQLITE } from "node:sqlite";
 import {
   assertMigrationPragmaAssignments,
+  assertMigrationPragmasDenied,
   isMigrationDeferForeignKeysName,
   isMigrationDeferForeignKeysValue,
 } from "../../sqlite-migration-policy.ts";
+import {
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0,
+  type SQLiteMigrationApplicationFormUrl,
+} from "./sqlite-migration-application.ts";
 import type {
   SQLiteMigrationApplicationPort,
   SQLiteMigrationEntry,
@@ -28,6 +34,12 @@ export function createSQLiteMigrationApplicationNativePort(
 ): SQLiteMigrationApplicationPort {
   return {
     withAuthorizedMigrationSession(input) {
+      const formUrl = input.execution.form;
+      if (
+        formUrl !== SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0 &&
+        formUrl !== SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0
+      )
+        return Promise.reject(new Error("SQLiteMigrationApplication Form identity is unsupported"));
       return store.withAuthorizedDatabase({
         resourceUid: input.resourceUid,
         stillAuthorized: input.stillAuthorized,
@@ -79,7 +91,14 @@ export function createSQLiteMigrationApplicationNativePort(
               }
               if (sqlText.includes("\0")) return { kind: "rejected", code: "migration_sql_error" };
               try {
-                runFileAndLedger(database, sqlText, file.entry, file.sequence, file.operationId);
+                runFileAndLedger(
+                  database,
+                  sqlText,
+                  file.entry,
+                  file.sequence,
+                  file.operationId,
+                  formUrl,
+                );
               } catch (error) {
                 const message = error instanceof Error ? error.message : "";
                 if (message === "rollback_unconfirmed") {
@@ -147,10 +166,15 @@ function runFileAndLedger(
   entry: SQLiteMigrationEntry,
   sequence: number,
   operationId: string,
+  formUrl: SQLiteMigrationApplicationFormUrl,
 ): void {
   // Use the same exact-slice grammar as D1/Docker/Linux, before any file effect.
   // The native authorizer remains the runtime fence, including re-preparation.
-  assertMigrationPragmaAssignments(sqlText);
+  if (formUrl === SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0) {
+    assertMigrationPragmaAssignments(sqlText);
+  } else {
+    assertMigrationPragmasDenied(sqlText);
+  }
   let internalTransaction = false;
   let internalLedger = false;
   let started = false;
@@ -159,7 +183,8 @@ function runFileAndLedger(
       return internalTransaction ? SQLITE.SQLITE_OK : SQLITE.SQLITE_DENY;
     }
     if (action === SQLITE.SQLITE_PRAGMA) {
-      return started &&
+      return formUrl === SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0 &&
+        started &&
         !internalTransaction &&
         !internalLedger &&
         (schema === null || schema === "main") &&

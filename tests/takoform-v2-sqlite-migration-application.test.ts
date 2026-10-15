@@ -11,11 +11,18 @@ import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import type { V2ArtifactSource } from "../src/takoform-v2/forms/artifact-source.ts";
 import { SQLITE_DATABASE_FORM_URL } from "../src/takoform-v2/forms/sqlite-database.ts";
 import { createSQLiteDatabaseForm } from "../src/takoform-v2/forms/sqlite-database-backend.ts";
-import { SQLITE_MIGRATION_APPLICATION_FORM_URL } from "../src/takoform-v2/forms/sqlite-migration-application.ts";
+import {
+  SQLITE_MIGRATION_APPLICATION_FORM_URL,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
+  type SQLiteMigrationApplicationFormUrl,
+} from "../src/takoform-v2/forms/sqlite-migration-application.ts";
 import { createSQLiteMigrationApplicationForm } from "../src/takoform-v2/forms/sqlite-migration-application-backend.ts";
 import { createSQLiteMigrationApplicationNativePort } from "../src/takoform-v2/forms/sqlite-migration-application-native.ts";
 import type { SQLiteMigrationApplicationPort } from "../src/takoform-v2/forms/sqlite-migration-application-port.ts";
-import { SQLITE_MIGRATION_SET_FORM_URL } from "../src/takoform-v2/forms/sqlite-migration-set.ts";
+import {
+  SQLITE_MIGRATION_SET_FORM_URL,
+  SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
+} from "../src/takoform-v2/forms/sqlite-migration-set.ts";
 import {
   createSQLiteMigrationSetCustody,
   createSQLiteMigrationSetForm,
@@ -36,7 +43,12 @@ interface NativeAuthorizedSQLiteStore {
 async function fixture(
   sqlText: string | readonly string[],
   portFactory?: (native: SQLiteMigrationApplicationPort) => SQLiteMigrationApplicationPort,
+  applicationFormUrl: SQLiteMigrationApplicationFormUrl = SQLITE_MIGRATION_APPLICATION_FORM_URL,
 ) {
+  const setFormUrl =
+    applicationFormUrl === SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0
+      ? SQLITE_MIGRATION_SET_FORM_URL_0_2_0
+      : SQLITE_MIGRATION_SET_FORM_URL;
   const root = mkdtempSync(join(tmpdir(), "v2-sqlite-app-"));
   const database = new Database(join(root, "control.sqlite"));
   database.exec("PRAGMA foreign_keys = ON");
@@ -93,12 +105,13 @@ async function fixture(
       return bytes;
     },
   };
-  const custody = createSQLiteMigrationSetCustody({ sql, source, now: clock });
+  const custody = createSQLiteMigrationSetCustody({ sql, source, now: clock, formUrl: setFormUrl });
   const dbForm = createSQLiteDatabaseForm({ store });
   const setForm = createSQLiteMigrationSetForm({
     sql,
     source,
     targetKey: "selfhost-set-target-1",
+    formUrl: setFormUrl,
     now: clock,
   });
   const appForm = createSQLiteMigrationApplicationForm({
@@ -108,12 +121,13 @@ async function fixture(
       : createSQLiteMigrationApplicationNativePort(store),
     custody,
     targetKey: "selfhost-application-target-1",
+    formUrl: applicationFormUrl,
     now: clock,
   });
   const forms: Record<string, V2Form> = {
     [SQLITE_DATABASE_FORM_URL]: dbForm,
-    [SQLITE_MIGRATION_SET_FORM_URL]: setForm,
-    [SQLITE_MIGRATION_APPLICATION_FORM_URL]: appForm,
+    [setFormUrl]: setForm,
+    [applicationFormUrl]: appForm,
   };
   const engine = createTakoformV2Engine({
     sql,
@@ -146,7 +160,7 @@ async function fixture(
       principal: "alice",
       key: "sqlite-app-set-create-0000001",
       input: {
-        form: SQLITE_MIGRATION_SET_FORM_URL,
+        form: setFormUrl,
         space: "default",
         name: "migration-set",
         spec: setSpec,
@@ -164,7 +178,7 @@ async function fixture(
       principal: "alice",
       key,
       input: {
-        form: SQLITE_MIGRATION_APPLICATION_FORM_URL,
+        form: applicationFormUrl,
         space: "default",
         name: "application",
         spec: {
@@ -204,6 +218,123 @@ async function fixture(
     },
   };
 }
+
+test("retained 0.2 reconciles its lost ACK and deletes without fresh admission or SQL replay", async () => {
+  let loseAck = true;
+  const f = await fixture(
+    "CREATE TABLE retained_item(value TEXT); INSERT INTO retained_item VALUES('once');",
+    (native) => ({
+      async withAuthorizedMigrationSession(input) {
+        const result = await native.withAuthorizedMigrationSession(input);
+        if (loseAck) {
+          loseAck = false;
+          throw new Error("historical ACK lost after durable file/ledger commit");
+        }
+        return result;
+      },
+    }),
+    SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
+  );
+  try {
+    const { databaseUid, setUid } = await f.prepare();
+    const accepted = await f.createApplication(databaseUid, setUid);
+    expect((await f.engine.runNext())?.status).toBe("reconciling");
+    const databaseForm = f.forms[SQLITE_DATABASE_FORM_URL];
+    const setForm = f.forms[SQLITE_MIGRATION_SET_FORM_URL_0_2_0];
+    if (!databaseForm || !setForm) throw new Error("retained fixture Forms missing");
+    const retained = createTakoformV2Engine({
+      sql: f.sql,
+      now: f.clock,
+      leaseMilliseconds: 1_000,
+      replayWindowSeconds: 120,
+      authorize: async (principal, space) => principal === "alice" && space === "default",
+      forms: { [SQLITE_DATABASE_FORM_URL]: databaseForm },
+      retainedForms: {
+        [SQLITE_MIGRATION_SET_FORM_URL_0_2_0]: setForm,
+        [SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0]: f.appForm,
+      },
+    });
+    const request = {
+      principal: "alice",
+      key: "sqlite-app-create-key-000001",
+      input: {
+        form: SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
+        space: "default",
+        name: "application",
+        spec: { database: { resourceUid: databaseUid }, migrationSet: { resourceUid: setUid } },
+      },
+    };
+    expect(retained.supportsForm(SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0)).toBe(false);
+    expect(retained.supportsForm(SQLITE_MIGRATION_SET_FORM_URL_0_2_0)).toBe(false);
+    expect(await retained.acceptCreate(request)).toMatchObject({
+      id: accepted.id,
+      resourceUid: accepted.resourceUid,
+    });
+    await expect(
+      retained.acceptCreate({ ...request, key: "new-legacy-application-key-0001" }),
+    ).rejects.toMatchObject({ code: "unsupported_form" });
+    f.advance(1_001);
+    expect((await retained.runNext())?.status).toBe("succeeded");
+    const resource = await retained.getResource({ principal: "alice", uid: accepted.resourceUid });
+    expect(resource).toMatchObject({
+      form: SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
+      observed: { ready: true },
+    });
+    await expect(
+      retained.acceptUpdate({
+        principal: "alice",
+        key: "new-legacy-update-key-00000001",
+        uid: accepted.resourceUid,
+        expectedGeneration: 1,
+        spec: request.input.spec,
+      }),
+    ).rejects.toMatchObject({ code: "unsupported_form" });
+    await expect(
+      retained.acceptDelete({
+        principal: "alice",
+        key: "referenced-old-set-delete-key-0001",
+        uid: setUid,
+        expectedGeneration: 1,
+      }),
+    ).rejects.toMatchObject({ code: "dependency_conflict" });
+    const removed = await retained.acceptDelete({
+      principal: "alice",
+      key: "retained-old-app-delete-key-00001",
+      uid: accepted.resourceUid,
+      expectedGeneration: 1,
+    });
+    expect((await retained.runNext())?.status).toBe("succeeded");
+    expect(
+      await retained.acceptDelete({
+        principal: "alice",
+        key: "retained-old-app-delete-key-00001",
+        uid: accepted.resourceUid,
+        expectedGeneration: 1,
+      }),
+    ).toMatchObject({ id: removed.id });
+    await retained.acceptDelete({
+      principal: "alice",
+      key: "retained-old-set-delete-key-00001",
+      uid: setUid,
+      expectedGeneration: 1,
+    });
+    expect((await retained.runNext())?.status).toBe("succeeded");
+    expect(
+      await f.store.withAuthorizedDatabase({
+        resourceUid: databaseUid,
+        stillAuthorized: async () => true,
+        use(database) {
+          return {
+            rows: database.prepare("SELECT value FROM retained_item").all(),
+            ledger: database.prepare("SELECT operation_id FROM _takoform_sqlite_migrations").all(),
+          };
+        },
+      }),
+    ).toEqual({ rows: [{ value: "once" }], ledger: [{ operation_id: accepted.id }] });
+  } finally {
+    f.close();
+  }
+});
 
 test("held migration applies atomically with ledger and never refetches or reruns on same-spec update", async () => {
   const f = await fixture(

@@ -5,6 +5,9 @@ import { SQLITE_DATABASE_FORM_URL } from "./sqlite-database.ts";
 import {
   parseSQLiteMigrationApplicationSpec,
   SQLITE_MIGRATION_APPLICATION_FORM_URL,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0,
+  type SQLiteMigrationApplicationFormUrl,
   SQLiteMigrationApplicationValidationError,
   sqliteMigrationApplicationReferences,
   validateSQLiteMigrationApplicationUpdate,
@@ -45,11 +48,19 @@ export function createSQLiteMigrationApplicationForm(options: {
   readonly custody: Pick<SqlArtifactCustody<SQLiteMigrationManifest>, "readVerified">;
   readonly targetKey: string;
   readonly now?: Clock;
+  /** Exact code-selected contract; retained 0.2 identities are never relabelled. */
+  readonly formUrl?: SQLiteMigrationApplicationFormUrl;
 }): V2Form {
   if (!options.targetKey || !options.migrationPort || !options.custody) {
     throw new TypeError("SQLiteMigrationApplication backend is incomplete");
   }
   const now = options.now ?? (() => new Date());
+  const formUrl = options.formUrl ?? SQLITE_MIGRATION_APPLICATION_FORM_URL;
+  if (
+    formUrl !== SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0 &&
+    formUrl !== SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0
+  )
+    throw new TypeError("SQLiteMigrationApplication Form identity is unsupported");
 
   async function stillAuthorized(input: V2Execution, databaseUid: string): Promise<boolean> {
     const nowMs = now().getTime();
@@ -104,10 +115,7 @@ export function createSQLiteMigrationApplicationForm(options: {
   }
 
   async function apply(input: V2Execution): Promise<V2BackendResult> {
-    if (
-      input.form !== SQLITE_MIGRATION_APPLICATION_FORM_URL ||
-      input.targetKey !== options.targetKey
-    ) {
+    if (input.form !== formUrl || input.targetKey !== options.targetKey) {
       return { kind: "unknown", code: "backend_unavailable", message: "Backend identity changed" };
     }
     if (input.action === "delete") {
@@ -238,7 +246,10 @@ export function createSQLiteMigrationApplicationForm(options: {
       }
     },
     references(spec) {
-      return sqliteMigrationApplicationReferences(parseSQLiteMigrationApplicationSpec(spec));
+      return sqliteMigrationApplicationReferences(
+        parseSQLiteMigrationApplicationSpec(spec),
+        formUrl,
+      );
     },
     backend: {
       id: SQLITE_MIGRATION_APPLICATION_BACKEND_ID,

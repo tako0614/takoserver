@@ -1,10 +1,19 @@
 import type { JsonObject } from "../../ports.ts";
 import type { V2ReferenceRequirement } from "../types.ts";
 import { SQLITE_DATABASE_FORM_URL } from "./sqlite-database.ts";
-import { SQLITE_MIGRATION_SET_FORM_URL } from "./sqlite-migration-set.ts";
+import {
+  SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
+  SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
+} from "./sqlite-migration-set.ts";
 
-export const SQLITE_MIGRATION_APPLICATION_FORM_URL =
+export const SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0 =
   "https://edge.forms.takoform.com/forms/SQLiteMigrationApplication/0.2.0/" as const;
+export const SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0 =
+  "https://edge.forms.takoform.com/forms/SQLiteMigrationApplication/0.3.0/" as const;
+export const SQLITE_MIGRATION_APPLICATION_FORM_URL = SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0;
+export type SQLiteMigrationApplicationFormUrl =
+  | typeof SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0
+  | typeof SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0;
 
 const RESOURCE_UID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 
@@ -59,7 +68,13 @@ export function validateSQLiteMigrationApplicationUpdate(
 
 export function sqliteMigrationApplicationReferences(
   spec: SQLiteMigrationApplicationSpec,
+  formUrl: SQLiteMigrationApplicationFormUrl = SQLITE_MIGRATION_APPLICATION_FORM_URL,
 ): readonly V2ReferenceRequirement[] {
+  if (
+    formUrl !== SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0 &&
+    formUrl !== SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0
+  )
+    throw new TypeError("SQLiteMigrationApplication Form identity is unsupported");
   return [
     {
       resourceUid: spec.database.resourceUid,
@@ -68,7 +83,10 @@ export function sqliteMigrationApplicationReferences(
     },
     {
       resourceUid: spec.migrationSet.resourceUid,
-      formUrl: SQLITE_MIGRATION_SET_FORM_URL,
+      formUrl:
+        formUrl === SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0
+          ? SQLITE_MIGRATION_SET_FORM_URL_0_2_0
+          : SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
       readiness: "observed",
     },
   ];

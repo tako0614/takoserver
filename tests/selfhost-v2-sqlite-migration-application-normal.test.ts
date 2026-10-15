@@ -20,7 +20,10 @@ import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 import type { V2ApplicationConfig } from "../src/takoform-v2/config.ts";
 import { SQLITE_DATABASE_FORM_URL } from "../src/takoform-v2/forms/sqlite-database.ts";
-import { SQLITE_MIGRATION_APPLICATION_FORM_URL } from "../src/takoform-v2/forms/sqlite-migration-application.ts";
+import {
+  SQLITE_MIGRATION_APPLICATION_FORM_URL,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
+} from "../src/takoform-v2/forms/sqlite-migration-application.ts";
 import { SQLITE_MIGRATION_SET_FORM_URL } from "../src/takoform-v2/forms/sqlite-migration-set.ts";
 import type { V2Form } from "../src/takoform-v2/types.ts";
 
@@ -254,7 +257,7 @@ async function fixture(withMigrationSet: boolean) {
   });
   expect(await composition.restoreOwners()).toEqual([]);
   const factory = composition.secretFreeFormFactory();
-  const selected = factory({ sql, objects, clock });
+  const { forms: selected, retainedForms } = factory({ sql, objects, clock });
   const app = buildApp({
     sql,
     objects,
@@ -271,7 +274,7 @@ async function fixture(withMigrationSet: boolean) {
     driver: new InMemoryTakoformResourceDriver(),
     offerings: [],
     v2: config,
-    v2FormFactory: factory,
+    v2FormSelectionFactory: factory,
   });
   const request = (
     path: string,
@@ -334,6 +337,7 @@ async function fixture(withMigrationSet: boolean) {
     otherKey,
     artifacts,
     selected,
+    retainedForms,
     request,
     settled,
     create,
@@ -350,6 +354,17 @@ test("normal public Host composes SQLite Database, Set, and Application with par
   const f = await fixture(true);
   try {
     expect(f.selected[SQLITE_MIGRATION_APPLICATION_FORM_URL]).toBeDefined();
+    expect(f.selected[SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0]).toBeUndefined();
+    expect(f.retainedForms[SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0]?.backend.targetKey).toBe(
+      TARGET,
+    );
+    const oldSupport = await f.request(
+      `/support?form=${encodeURIComponent(SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0)}`,
+    );
+    expect(await oldSupport.json()).toMatchObject({
+      form: SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
+      supported: false,
+    });
     expect(f.selected[SQLITE_MIGRATION_APPLICATION_FORM_URL]?.backend.targetKey).toBe(TARGET);
     const anonymous = await f.app.fetch(new Request(`${ORIGIN}${API}/resources`));
     expect(anonymous.status).toBe(401);

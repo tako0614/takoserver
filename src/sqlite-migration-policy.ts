@@ -142,6 +142,21 @@ export function assertMigrationPragmaAssignments(sql: string): void {
   scanMigrationSql(sql);
 }
 
+/** Retained Application 0.2.0 never admitted PRAGMA effects. */
+export function assertMigrationPragmasDenied(sql: string): void {
+  scanMigrationSql(sql, undefined, undefined, true);
+}
+
+/** One parser-extracted PRAGMA statement, using the same token/grammar pass. */
+export function isMigrationPragmaAssignment(statement: string): boolean {
+  try {
+    scanMigrationSql(statement, undefined, undefined, false, true);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function refuseMigrationSql(): never {
   throw new Error("migration SQL is unsafe or incomplete");
 }
@@ -153,6 +168,8 @@ function scanMigrationSql(
     readonly identifier: (value: string) => void;
     readonly command: (value: string) => void;
   },
+  denyPragmas = false,
+  singlePragmaStatement = false,
 ): readonly string[] {
   const refuse = (): never => {
     return refuseMigrationSql();
@@ -181,6 +198,9 @@ function scanMigrationSql(
   let triggerBody = false;
   // 0: no PRAGMA; 1: bare name; 2: '='; 3: bare value; 4: statement end.
   const pragma: { state: 0 | 1 | 2 | 3 | 4 } = { state: 0 };
+  let pragmaCount = 0;
+  let pragmaStart = 0;
+  let pragmaEnd = 0;
 
   const resetCommand = (): void => {
     commandPending = true;
@@ -205,12 +225,17 @@ function scanMigrationSql(
       }
       if (pragma.state === 3 && isMigrationDeferForeignKeysValue(value)) {
         pragma.state = 4;
+        pragmaEnd = index + value.length;
         return;
       }
       refuse();
     }
 
     if (commandPending) {
+      // A BOM inside a word remains an SQLite identifier character. Refuse
+      // this invalid PRAGMA-looking command without splitting valid Unicode
+      // identifiers elsewhere or claiming it could execute a PRAGMA effect.
+      if (lower.startsWith("pragma\ufeff")) refuse();
       if (explainPrefix === 0 && lower === "explain") {
         explainPrefix = 1;
       } else if (explainPrefix === 1 && lower === "query") {
@@ -246,13 +271,16 @@ function scanMigrationSql(
     }
 
     if (lower === "pragma" && command === "pragma") {
-      if (explainPrefix !== 0) refuse();
+      if (explainPrefix !== 0 || denyPragmas) refuse();
+      pragmaCount += 1;
+      pragmaStart = index;
       pragma.state = 1;
     }
   };
 
   const semicolon = (): void => {
     if (pragma.state !== 0 && pragma.state !== 4) refuse();
+    if (pragma.state === 4) pragmaEnd = index + 1;
     pragma.state = 0;
     resetCommand();
     head = [];
@@ -280,14 +308,20 @@ function scanMigrationSql(
     if (character === ";") {
       token = COMPLETE_SEMI;
       semicolon();
+    } else if (pragma.state !== 0 && isPragmaWhitespace(character)) {
+      token = COMPLETE_WS;
     } else if (isCompleteWhitespace(character)) {
+      // Non-ASCII whitespace is never part of the permitted assignment.
+      if (pragma.state !== 0) refuse();
       token = COMPLETE_WS;
     } else if (character === "/" && sql[index + 1] === "*") {
+      if (pragma.state !== 0) refuse();
       const commentEnd = sql.indexOf("*/", index + 2);
       if (commentEnd < 0) refuse();
       end = commentEnd + 2;
       token = COMPLETE_WS;
     } else if (character === "-" && sql[index + 1] === "-") {
+      if (pragma.state !== 0) refuse();
       const newline = sql.indexOf("\n", index + 2);
       end = newline < 0 ? sql.length : newline + 1;
       token = COMPLETE_WS;
@@ -359,7 +393,25 @@ function scanMigrationSql(
   // an oversized early statement can never hide a forbidden or incomplete
   // construct later in the same file.
   if (capacityError !== undefined) throw capacityError;
+  if (
+    singlePragmaStatement &&
+    (pragmaCount !== 1 ||
+      statements.length !== 1 ||
+      !onlyPragmaWhitespace(sql.slice(0, pragmaStart)) ||
+      !onlyPragmaWhitespace(sql.slice(pragmaEnd)))
+  ) {
+    refuse();
+  }
   return statements;
+}
+
+function isPragmaWhitespace(value: string): boolean {
+  return value === " " || (value >= "\t" && value <= "\r");
+}
+
+function onlyPragmaWhitespace(value: string): boolean {
+  for (const character of value) if (!isPragmaWhitespace(character)) return false;
+  return true;
 }
 
 /** Applies the shared authority/completeness policy without an execution cap. */

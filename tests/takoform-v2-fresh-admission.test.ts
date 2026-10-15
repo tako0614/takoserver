@@ -408,7 +408,7 @@ test("fresh admission application: automatic artifact Forms honor policy", async
   const { STATIC_ASSET_BUNDLE_FORM_URL } = await import(
     "../src/takoform-v2/forms/static-asset-bundle.ts"
   );
-  const { SQLITE_MIGRATION_SET_FORM_URL } = await import(
+  const { SQLITE_MIGRATION_SET_FORM_URL, SQLITE_MIGRATION_SET_FORM_URL_0_2_0 } = await import(
     "../src/takoform-v2/forms/sqlite-migration-set.ts"
   );
   for (const admission of [undefined, true, false]) {
@@ -456,6 +456,15 @@ test("fresh admission application: automatic artifact Forms honor policy", async
         STATIC_ASSET_BUNDLE_FORM_URL,
         SQLITE_MIGRATION_SET_FORM_URL,
       ];
+      const retainedSupport = await host.fetch(
+        new Request(
+          `${ORIGIN}/apis/forms.takoform.com/v2/support?form=${encodeURIComponent(SQLITE_MIGRATION_SET_FORM_URL_0_2_0)}`,
+        ),
+      );
+      expect(await retainedSupport?.json()).toMatchObject({
+        form: SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
+        supported: false,
+      });
       for (const [index, form] of forms.entries()) {
         const support = await host.fetch(
           new Request(

@@ -21,7 +21,10 @@ import {
 } from "./providers/selfhost-worker-wrapper.ts";
 import { createSelfhostV2QueueWorkerCapability } from "./selfhost-v2-queue-worker-capability.ts";
 import { createSelfhostV2ScheduledComposition } from "./selfhost-v2-scheduled-composition.ts";
-import type { V2OperatorFormFactory } from "./takoform-v2/application.ts";
+import type {
+  V2OperatorFormFactory,
+  V2OperatorFormSelectionFactory,
+} from "./takoform-v2/application.ts";
 import type { V2ApplicationConfig } from "./takoform-v2/config.ts";
 import { readV2ConfiguredPrivateInputs } from "./takoform-v2/configured-private-inputs.ts";
 import { ACTOR_NAMESPACE_FORM_URL } from "./takoform-v2/forms/actor-namespace.ts";
@@ -41,10 +44,14 @@ import { QUEUE_CONSUMER_FORM_URL } from "./takoform-v2/forms/queue-consumer.ts";
 import { createQueueWorkerBindingAuthority } from "./takoform-v2/forms/queue-worker-binding-authority.ts";
 import { SQLITE_DATABASE_FORM_URL } from "./takoform-v2/forms/sqlite-database.ts";
 import { createSQLiteDatabaseForm } from "./takoform-v2/forms/sqlite-database-backend.ts";
-import { SQLITE_MIGRATION_APPLICATION_FORM_URL } from "./takoform-v2/forms/sqlite-migration-application.ts";
+import {
+  SQLITE_MIGRATION_APPLICATION_FORM_URL,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
+} from "./takoform-v2/forms/sqlite-migration-application.ts";
 import { createSQLiteMigrationApplicationForm } from "./takoform-v2/forms/sqlite-migration-application-backend.ts";
 import { createSQLiteMigrationApplicationNativePort } from "./takoform-v2/forms/sqlite-migration-application-native.ts";
 import { createSQLiteMigrationSetCustody } from "./takoform-v2/forms/sqlite-migration-set-backend.ts";
+import { SQLITE_MIGRATION_SET_FORM_URL_0_2_0 } from "./takoform-v2/forms/sqlite-migration-set.ts";
 import { createSQLiteWorkerBindingAuthority } from "./takoform-v2/forms/sqlite-worker-binding-authority.ts";
 import { createStaticAssetBundleCustody } from "./takoform-v2/forms/static-asset-bundle-backend.ts";
 import { createWorkerBundleCustody } from "./takoform-v2/forms/worker-bundle-backend.ts";
@@ -346,8 +353,8 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
    */
   internalFormFactoryForEndpoint(endpoint: EndpointPorts): V2OperatorFormFactory;
   /** Complete secret-free public admission; runtime ciphertext recovery remains configured. */
-  secretFreeFormFactory(endpoint?: EndpointPorts): V2OperatorFormFactory;
-  privateInputFormFactory(endpoint?: EndpointPorts): V2OperatorFormFactory;
+  secretFreeFormFactory(endpoint?: EndpointPorts): V2OperatorFormSelectionFactory;
+  privateInputFormFactory(endpoint?: EndpointPorts): V2OperatorFormSelectionFactory;
 } {
   if (!options.targetKey || !options.rootDirectory || !options.sql || !options.objects) {
     throw new TypeError("v2 Worker composition requires SQL, objects, target and private root");
@@ -1338,7 +1345,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   function completeFormFactory(
     endpoint: EndpointPorts | undefined,
     allowPrivateInputs: boolean,
-  ): V2OperatorFormFactory {
+  ): V2OperatorFormSelectionFactory {
     if (!restorationComplete || ownerAdmissionFrozen)
       throw new TypeError("v2 Worker owners must restore before Form composition");
     if (
@@ -1369,6 +1376,17 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
           now: clock,
         })
       : undefined;
+    const retainedMigrationCustody = config.sqliteMigrationSet
+      ? createSQLiteMigrationSetCustody({
+          sql,
+          source: createV2HeldArtifactSource({
+            objects,
+            entries: config.sqliteMigrationSet.heldArtifacts,
+          }),
+          now: clock,
+          formUrl: SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
+        })
+      : undefined;
     let capturedEndpoint: EndpointPorts | undefined;
     if (endpoint !== undefined) {
       const { assignHostname, observeTls, observeRouteAbsent } = endpoint;
@@ -1382,36 +1400,50 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       capturedEndpoint = Object.freeze({ assignHostname, observeTls, observeRouteAbsent });
     }
     return (context) => ({
-      ...createInternalForms(context, capturedEndpoint, allowPrivateInputs),
-      [SQLITE_DATABASE_FORM_URL]: createSQLiteDatabaseForm({ store: sqliteStore }),
-      ...(migrationCustody
+      forms: {
+        ...createInternalForms(context, capturedEndpoint, allowPrivateInputs),
+        [SQLITE_DATABASE_FORM_URL]: createSQLiteDatabaseForm({ store: sqliteStore }),
+        ...(migrationCustody
+          ? {
+              [SQLITE_MIGRATION_APPLICATION_FORM_URL]: createSQLiteMigrationApplicationForm({
+                sql,
+                migrationPort: createSQLiteMigrationApplicationNativePort(sqliteStore),
+                custody: migrationCustody,
+                targetKey,
+                now: clock,
+              }),
+            }
+          : {}),
+        [EDGE_KV_NAMESPACE_FORM_URL]: createEdgeKVNamespaceForm({
+          store: kvStore,
+          targetKey,
+        }),
+        [OBJECT_BUCKET_FORM_URL]: createObjectBucketForm({
+          store: objectBucketStore,
+          targetKey,
+          backendId: v2ObjectBucketBinding.backendId,
+        }),
+      },
+      retainedForms: retainedMigrationCustody
         ? {
-            [SQLITE_MIGRATION_APPLICATION_FORM_URL]: createSQLiteMigrationApplicationForm({
+            [SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0]: createSQLiteMigrationApplicationForm({
               sql,
               migrationPort: createSQLiteMigrationApplicationNativePort(sqliteStore),
-              custody: migrationCustody,
+              custody: retainedMigrationCustody,
               targetKey,
               now: clock,
+              formUrl: SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
             }),
           }
-        : {}),
-      [EDGE_KV_NAMESPACE_FORM_URL]: createEdgeKVNamespaceForm({
-        store: kvStore,
-        targetKey,
-      }),
-      [OBJECT_BUCKET_FORM_URL]: createObjectBucketForm({
-        store: objectBucketStore,
-        targetKey,
-        backendId: v2ObjectBucketBinding.backendId,
-      }),
+        : {},
     });
   }
 
-  function secretFreeFormFactory(endpoint?: EndpointPorts): V2OperatorFormFactory {
+  function secretFreeFormFactory(endpoint?: EndpointPorts): V2OperatorFormSelectionFactory {
     return completeFormFactory(endpoint, false);
   }
 
-  function privateInputFormFactory(endpoint?: EndpointPorts): V2OperatorFormFactory {
+  function privateInputFormFactory(endpoint?: EndpointPorts): V2OperatorFormSelectionFactory {
     if (!configuredInputSealer || !configuredInputCustody) {
       throw new TypeError("v2 Worker private input key authority is unavailable");
     }
