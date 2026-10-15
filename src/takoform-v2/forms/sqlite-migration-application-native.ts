@@ -186,6 +186,9 @@ function runFileAndLedger(
   let internalLedger = false;
   let started = false;
   let currentStatement: MigrationSqlStatement | undefined;
+  let initialIndexBuild:
+    | { readonly statement: MigrationSqlStatement; readonly index: string; readonly schema: "main" }
+    | undefined;
   const protectedObjects = new Set([LEDGER]);
   const mainTables = new Set(["sqlite_master", "sqlite_schema"]);
   const mainIndexes = new Set<string>();
@@ -290,7 +293,6 @@ function runFileAndLedger(
     if (
       action === SQLITE.SQLITE_ATTACH ||
       action === SQLITE.SQLITE_DETACH ||
-      action === SQLITE.SQLITE_REINDEX ||
       action === SQLITE.SQLITE_ANALYZE ||
       action === SQLITE.SQLITE_COPY ||
       action === SQLITE.SQLITE_CREATE_VTABLE ||
@@ -328,6 +330,32 @@ function runFileAndLedger(
         (action === SQLITE.SQLITE_INSERT || action === SQLITE.SQLITE_READ)
         ? SQLITE.SQLITE_OK
         : SQLITE.SQLITE_DENY;
+    }
+    if (action === SQLITE.SQLITE_REINDEX) {
+      // SQLite authorizes an initial index population as REINDEX too. Only a
+      // genuine CREATE_INDEX that passed every guard above can admit it, once,
+      // for the identical target in this same canonical CREATE statement.
+      const initialBuild =
+        started &&
+        currentStatement === initialIndexBuild?.statement &&
+        first === initialIndexBuild?.index &&
+        schema === initialIndexBuild?.schema &&
+        schema === "main" &&
+        second === null &&
+        origin === null;
+      initialIndexBuild = undefined;
+      return initialBuild ? SQLITE.SQLITE_OK : SQLITE.SQLITE_DENY;
+    }
+    if (action === SQLITE.SQLITE_CREATE_INDEX) {
+      initialIndexBuild =
+        started &&
+        currentStatement?.command === "create" &&
+        schema === "main" &&
+        origin === null &&
+        first !== null &&
+        second !== null
+          ? { statement: currentStatement, index: first, schema }
+          : undefined;
     }
     return SQLITE.SQLITE_OK;
   });
@@ -371,6 +399,7 @@ function runFileAndLedger(
       try {
         database.exec(statement.sql);
       } finally {
+        initialIndexBuild = undefined;
         currentStatement = undefined;
       }
       if (
@@ -406,6 +435,7 @@ function runFileAndLedger(
     internalTransaction = false;
     internalLedger = false;
     metadataQuery = undefined;
+    initialIndexBuild = undefined;
     currentStatement = undefined;
     database.setAuthorizer(null);
   }
