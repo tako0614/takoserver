@@ -2274,11 +2274,13 @@ test("recorded inventory never treats partial atoms, mixed scalar or foreign his
         history: f.db().query(`SELECT * FROM ${HISTORY} ORDER BY next_generation`).all(),
         batches: f.batches.length,
       };
-      if (corruption === "mixed-scalar")
+      if (corruption === "mixed-scalar") {
+        // Valid scalar history is a conflicting route variant. Malformed typed
+        // history has the separate unavailable classification in the ledger.
         await expect(f.receiver().readRecordedEffects(next.input)).rejects.toMatchObject({
-          code: "unavailable",
+          code: "conflict",
         });
-      else if (corruption === "missing-entire-inventory") {
+      } else if (corruption === "missing-entire-inventory") {
         // Zero actual inventory alone is absent, never a mutation grant. The
         // normal preparation independently refuses the surviving active state
         // because its mandatory latest history has been lost.
