@@ -37,7 +37,7 @@ describe("shared hosted pricing source", () => {
       products: ["takoserver", "takosumi-hosted"],
       currency: "USD",
       moneyUnit: "USD-micros",
-      revision: "hosted-20261015-container-proposed-v1",
+      revision: "hosted-20261015-container-proposed-v2",
       freeIncludedMicros: "1500000",
       plans: [
         {
@@ -69,7 +69,7 @@ describe("shared hosted pricing source", () => {
     expect(compiled.unresolvedStripePricePlanIds).toEqual(["hosted-10", "hosted-50"]);
     expect(compiled.organizationAllowance).toEqual({
       freeIncludedMicros: "1500000",
-      sourceRevision: "hosted-20261015-container-proposed-v1",
+      sourceRevision: "hosted-20261015-container-proposed-v2",
       stripePriceId: null,
     });
     expect(
@@ -100,7 +100,7 @@ describe("shared hosted pricing source", () => {
       ["egress", "byte", "0", "1", "0", "1"],
       ["container.cpu", "vCPU-second", "20", "1", "60", "1"],
       ["container.memory", "GiB-second", "2500", "1000", "7500", "1000"],
-      ["container.egress", "GB", "50000", "1", "150000", "1"],
+      ["container.egress", "GB", "25000", "1", "75000", "1"],
       ["container.image-storage", "GB-month", "15000", "1", "45000", "1"],
     ]);
   });
@@ -197,7 +197,7 @@ describe("shared hosted pricing source", () => {
     ]);
     expect(output.activation).toBe("pending-stripe-price-ids");
     expect(output).not.toHaveProperty("environment");
-    expect(output.revision).toBe("hosted-20261015-container-proposed-v1");
+    expect(output.revision).toBe("hosted-20261015-container-proposed-v2");
     expect(output.usageRates["wfp.requests"]).toMatchObject({
       numeratorMicros: "900000",
       denominator: "1000000",
@@ -214,7 +214,7 @@ describe("shared hosted pricing source", () => {
     });
     expect(output.usageRates["container.egress"]).toMatchObject({
       unit: "GB",
-      numeratorMicros: "150000",
+      numeratorMicros: "75000",
       denominator: "1",
     });
     expect(output.usageRates["container.image-storage"]).toMatchObject({

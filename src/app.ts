@@ -438,6 +438,9 @@ export function buildApp(ports: AppPorts): App {
         ...(ports.hostedBilling
           ? { limitPolicy: ports.hostedBilling.limitPolicy, requireWorkspaceAttribution: true }
           : {}),
+        ...(ports.hostedBilling?.onDemand
+          ? { admissionFunding: ports.hostedBilling.onDemand }
+          : {}),
       })
     : undefined;
   const paymentContext: PaymentEventContext = {
@@ -845,6 +848,11 @@ export function buildApp(ports: AppPorts): App {
             subscriptionCancellation: ports.hostedBilling.status.subscriptionCancellation,
             subscriptionPlanChange: ports.hostedBilling.status.subscriptionPlanChange,
           },
+          ...(ports.hostedBilling.onDemand ? { onDemand: ports.hostedBilling.onDemand } : {}),
+          ...(ports.hostedBilling.cardSetup ? { cardSetup: ports.hostedBilling.cardSetup } : {}),
+          ...(ports.hostedBilling.setupDisclosureRevision === undefined
+            ? {}
+            : { setupDisclosureRevision: ports.hostedBilling.setupDisclosureRevision }),
         }
       : {}),
     catalog,

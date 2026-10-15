@@ -5,6 +5,7 @@ import {
 } from "./hosted-billing-realm.ts";
 import { type HostedPricing, parsePersistedHostedPricing } from "./hosted-pricing.ts";
 import { canonicalJson } from "./json.ts";
+import { stripeRefundSource } from "./ledger.ts";
 import { MoneyError, minorToMicros } from "./money.ts";
 import { OrgTopUpError, type OrgTopUps } from "./org-top-up.ts";
 import type { FundingCredit, PaymentEventContext } from "./payment-events.ts";
@@ -15,10 +16,13 @@ import {
   type StripeBillingObject,
 } from "./stripe-billing-client.ts";
 import {
+  assertStripeBillingStoreOrigin,
   type BillingGrant,
   createStripeBillingStore,
+  type StripeBillingStore,
   StripeBillingStoreError,
 } from "./stripe-billing-store.ts";
+import { type createStripeCardSetup, StripeCardSetupError } from "./stripe-card-setup.ts";
 import { verifyStripeCustomerBinding } from "./stripe-customer-custody.ts";
 import type {
   StripeEventEnvelope,
@@ -26,6 +30,12 @@ import type {
   StripeEventHandling,
 } from "./stripe-events.ts";
 import { assertStripeModeRealm, type StripeMode } from "./stripe-mode-realm.ts";
+import {
+  assertStripeOnDemandService,
+  StripeOnDemandError,
+  type StripeOnDemandService,
+} from "./stripe-on-demand.ts";
+import type { StripeOnDemandFundingProof } from "./stripe-on-demand-verification.ts";
 import {
   type createSubscriptionPlanChanges,
   type QualifiedSubscriptionPlan,
@@ -242,6 +252,10 @@ export function createStripeBilling(options: {
   readonly realm?: HostedBillingFinancialRealm;
   readonly ensureCustomer?: (organizationId: string) => Promise<string>;
   readonly topUpCommandForSession?: OrgTopUps["commandForSession"];
+  /** Genuine common owner shared with the canonical on-demand service. */
+  readonly store?: StripeBillingStore;
+  readonly onDemand?: StripeOnDemandService;
+  readonly cardSetup?: ReturnType<typeof createStripeCardSetup>;
   readonly subscriptionExtensions?: (
     context: StripeBillingSubscriptionExtensionContext,
   ) => StripeBillingSubscriptionExtensions;
@@ -249,10 +263,30 @@ export function createStripeBilling(options: {
   const { client, context, pricing } = options;
   const livemode = (options.mode ?? "test") === "live";
   const { sql, clock } = context;
-  const store = createStripeBillingStore({ sql, clock });
+  const store = options.store ?? createStripeBillingStore({ sql, clock });
+  assertStripeBillingStoreOrigin(store, { sql, clock });
   const parsedBilling = parseBillingConfig(pricing.environment.TAKOSERVER_BILLING_CONFIG);
   if (!parsedBilling) throw new StripeBillingError("billing_configuration_invalid");
   const billing = parsedBilling;
+  const onDemand = options.onDemand;
+  const cardSetup = options.cardSetup;
+  if (onDemand) {
+    if (!options.realm) throw new StripeBillingError("financial_realm_unqualified");
+    assertStripeOnDemandService(onDemand, {
+      sql,
+      clock,
+      client,
+      realm: options.realm,
+      store,
+      billingConfig: billing,
+    });
+  }
+  if (cardSetup && !onDemand) throw new StripeBillingError("financial_realm_unqualified");
+  const eventTypes = [
+    ...TYPES,
+    ...(onDemand ? ["payment_intent.succeeded", "payment_intent.canceled"] : []),
+    ...(cardSetup ? ["checkout.session.expired"] : []),
+  ];
   const now = () => clock().toISOString();
   if ((options.subscriptionExtensions || options.topUpCommandForSession) && !options.realm)
     throw new StripeBillingError("financial_realm_unqualified");
@@ -1009,6 +1043,30 @@ export function createStripeBilling(options: {
     if (!charge) refuse("unknown_charge");
     noConnect(charge);
     usd(charge);
+    if (grant?.sourceType === "payment-intent" && !onDemand)
+      refuse("on_demand_original_unresolved");
+    let native: StripeOnDemandFundingProof | null = null;
+    if (
+      onDemand &&
+      (!grant || grant.sourceType === "payment-intent") &&
+      charge.payment_intent != null
+    ) {
+      native = await onDemand.readFundingProofForPaymentIntent(
+        identifier(charge.payment_intent, "pi"),
+      );
+      if (native) {
+        if (native.chargeId !== chargeId) refuse("ambiguous_refund_allocation");
+        // A refund observed before first funding cannot expose gross purchased
+        // credit. The same common owner grants under this durable source fence.
+        fenceGeneration ??= await store.freezeFunding(native.organizationId, native.fundingRef);
+        grant = await store.grantOnDemand({
+          organizationId: native.organizationId,
+          reference: native.reference,
+          expectedCommandFingerprint: native.fingerprint,
+          native,
+        });
+      } else if (grant?.sourceType === "payment-intent") refuse("on_demand_original_unresolved");
+    }
     if (!grant) {
       if (hasHostedClaim(charge.metadata)) refuse("ambiguous_refund_allocation");
       let unrelated = charge.invoice == null;
@@ -1054,7 +1112,7 @@ export function createStripeBilling(options: {
       refuse("refund_total_unresolved");
     if (options.realm && grant.customerId)
       await boundCustomer(grant.organizationId, grant.customerId);
-    await store.grant(grant);
+    if (grant.sourceType !== "payment-intent") await store.grant(grant);
     if (!successful.length) {
       if (pending) return { outcome: "deferred", detail: "refund_pending" };
       await store.unfreezeFunding({
@@ -1065,8 +1123,10 @@ export function createStripeBilling(options: {
       });
       return { outcome: "applied", detail: "refund_status_recorded" };
     }
+    const refundSource = await stripeRefundSource(sql);
+    if (!refundSource) refuse("refund_schema_unavailable");
     const recorded = await sql.query(
-      "SELECT refund_id, amount_micros, cumulative_refunded_micros FROM stripe_billing_refunds WHERE org_id = ? AND funding_ref = ? ORDER BY cumulative_refunded_micros",
+      `SELECT refund_id, amount_micros, cumulative_refunded_micros FROM ${refundSource} WHERE org_id = ? AND funding_ref = ? ORDER BY cumulative_refunded_micros`,
       [grant.organizationId, grant.fundingRef],
     );
     const recordedIds = new Set(recorded.map((row) => String(row.refund_id)));
@@ -1091,6 +1151,7 @@ export function createStripeBilling(options: {
         cumulativeRefundedMicros: cashMicros(amount),
         fenceGeneration,
         releaseFreeze: !pending && i === successful.length - 1,
+        ...(native === null ? {} : { native }),
       });
     }
     if (grant.subscriptionId) await updateSubscription(grant.subscriptionId);
@@ -1098,12 +1159,71 @@ export function createStripeBilling(options: {
       ? { outcome: "deferred", detail: "refund_pending" }
       : { outcome: "applied", detail: "refund_settled" };
   }
+  async function recoverCardSetupSession(
+    session: StripeBillingObject,
+  ): Promise<StripeEventHandling> {
+    if (!cardSetup) return { outcome: "ignored", detail: "not_hosted_card_setup" };
+    noConnect(session);
+    if (session.livemode !== livemode) refuse("wrong_account_or_mode");
+    const meta = session.metadata == null ? {} : metadata(session.metadata);
+    const candidates = await sql.query(
+      `SELECT * FROM stripe_billing_card_setup_commands
+       WHERE session_id = ? OR (session_id IS NULL AND org_id = ? AND reference = ?) LIMIT 2`,
+      [
+        session.id,
+        typeof meta.organizationId === "string" ? meta.organizationId : "",
+        typeof meta.reference === "string" ? meta.reference : "",
+      ],
+    );
+    if (!candidates.length) return { outcome: "ignored", detail: "not_hosted_card_setup" };
+    const original = candidates[0];
+    if (candidates.length !== 1 || !original) refuse("card_setup_original_unresolved");
+    const expected = {
+      organizationId: original.org_id,
+      reference: original.reference,
+      fingerprint: original.fingerprint,
+      setupDisclosureRevision: original.disclosure_revision,
+      stripeAccountId: original.account_id,
+      financialRealm: original.financial_realm,
+      billingAuthority: original.billing_authority,
+    };
+    if (
+      Object.keys(meta).length !== Object.keys(expected).length ||
+      Object.entries(expected).some(([key, value]) => meta[key] !== value)
+    )
+      refuse("card_setup_original_unresolved");
+    const receipt = await cardSetup.recoverOriginal(
+      String(original.org_id),
+      String(original.reference),
+    );
+    if (receipt?.state === "succeeded" || receipt?.state === "canceled")
+      return { outcome: "applied", detail: "card_setup_recorded" };
+    if (receipt?.sessionExpired)
+      return { outcome: "applied", detail: "card_setup_session_expired" };
+    return { outcome: "deferred", detail: "card_setup_pending" };
+  }
+  async function recoverOnDemandIntent(paymentIntentId: string): Promise<StripeEventHandling> {
+    if (!onDemand) return { outcome: "ignored", detail: "not_hosted_on_demand" };
+    const receipt = await onDemand.drainForPaymentIntent(paymentIntentId);
+    if (!receipt) return { outcome: "ignored", detail: "not_hosted_on_demand" };
+    if (receipt.state === "pending" || receipt.state === "funded") {
+      const proof = await onDemand.readFundingProofForPaymentIntent(paymentIntentId);
+      if (proof && proof.refundedAmountMinor > 0) return await refundCharge(proof.chargeId);
+    }
+    return receipt.state === "funded" ||
+      receipt.state === "canceled" ||
+      receipt.state === "abandoned"
+      ? { outcome: "applied", detail: "on_demand_original_recorded" }
+      : { outcome: "deferred", detail: "on_demand_original_pending" };
+  }
   async function apply(event: StripeEventEnvelope): Promise<StripeEventHandling> {
     await ready();
     if (event.livemode !== livemode || event.account != null)
       return { outcome: "ignored", detail: "wrong_account_or_mode" };
     if (!event.objectId) return { outcome: "ignored", detail: "unexpected_object" };
     try {
+      if (event.type === "payment_intent.succeeded" || event.type === "payment_intent.canceled")
+        return await recoverOnDemandIntent(identifier(event.objectId, "pi"));
       if (event.type.startsWith("customer.subscription."))
         return await updateSubscription(identifier(event.objectId, "sub"));
       if (event.type.startsWith("invoice.")) {
@@ -1179,6 +1299,7 @@ export function createStripeBilling(options: {
       if (event.type.startsWith("checkout.session.")) {
         const session = await client.get("checkout/sessions", identifier(event.objectId, "cs"));
         if (!session) refuse("unknown_session");
+        if (session.mode === "setup") return await recoverCardSetupSession(session);
         if (session.mode === "subscription") {
           noConnect(session);
           const meta = session.metadata == null ? null : metadata(session.metadata);
@@ -1228,6 +1349,8 @@ export function createStripeBilling(options: {
       }
       if (error instanceof SubscriptionCustodyError)
         return { outcome: "deferred", detail: "subscription_custody_unresolved" };
+      if (error instanceof StripeOnDemandError || error instanceof StripeCardSetupError)
+        return { outcome: "deferred", detail: "on_demand_original_unresolved" };
       if (
         (error instanceof SqlError && error.code === "constraint") ||
         (error instanceof StripeBillingStoreError &&
@@ -1352,9 +1475,12 @@ export function createStripeBilling(options: {
     };
   }
   const handlers: Record<string, StripeEventHandler> = Object.fromEntries(
-    [...TYPES, "checkout.session.completed", "checkout.session.async_payment_succeeded"].map(
-      (type) => [type, (event: StripeEventEnvelope) => apply(event)],
-    ),
+    [
+      ...eventTypes,
+      "checkout.session.completed",
+      "checkout.session.async_payment_succeeded",
+      ...(cardSetup ? ["checkout.session.expired"] : []),
+    ].map((type) => [type, (event: StripeEventEnvelope) => apply(event)]),
   );
   async function reconcile(): Promise<BillingReconcileReport> {
     await ready();
@@ -1380,6 +1506,94 @@ export function createStripeBilling(options: {
         applied += recovered.applied;
         custodyUnresolved += recovered.unresolved;
         truncated ||= recovered.truncated;
+      } catch {
+        failedStreams++;
+        truncated = true;
+      }
+    }
+    if (onDemand) {
+      try {
+        const recovered = await onDemand.drainPending(100);
+        examined += recovered.length;
+        applied += recovered.filter((receipt) =>
+          ["funded", "canceled", "abandoned"].includes(receipt.state),
+        ).length;
+        custodyUnresolved += recovered.filter((receipt) =>
+          ["prepared", "pending"].includes(receipt.state),
+        ).length;
+        truncated ||= recovered.length === 100;
+      } catch {
+        failedStreams++;
+        truncated = true;
+      }
+    }
+    if (cardSetup) {
+      try {
+        await sql.run(
+          "INSERT OR IGNORE INTO stripe_billing_reconcile (stream, cursor, cycle_started_at, updated_at) VALUES ('card-setup', NULL, ?, ?)",
+          [now(), now()],
+        );
+        const checkpoint = (
+          await sql.query(
+            "SELECT cursor, generation FROM stripe_billing_reconcile WHERE stream = 'card-setup'",
+          )
+        )[0];
+        const cursor = checkpoint?.cursor == null ? null : String(checkpoint.cursor);
+        const after: unknown = cursor === null ? null : JSON.parse(cursor);
+        if (
+          after !== null &&
+          (!Array.isArray(after) ||
+            after.length !== 2 ||
+            after.some((value) => typeof value !== "string"))
+        )
+          refuse("card_setup_cursor_unresolved");
+        const [afterOrg, afterReference] =
+          after === null ? [null, null] : (after as [string, string]);
+        const pending = await sql.query(
+          `SELECT org_id, reference FROM stripe_billing_card_setup_commands
+           WHERE state IN ('dispatched', 'original-known')
+             AND (? IS NULL OR org_id > ? OR (org_id = ? AND reference > ?))
+           ORDER BY org_id, reference LIMIT 100`,
+          [afterOrg, afterOrg, afterOrg, afterReference],
+        );
+        let unresolved = 0;
+        for (const original of pending) {
+          examined++;
+          try {
+            const receipt = await cardSetup.recoverOriginal(
+              String(original.org_id),
+              String(original.reference),
+            );
+            if (receipt?.state === "succeeded" || receipt?.state === "canceled") applied++;
+            else unresolved++;
+          } catch {
+            unresolved++;
+          }
+        }
+        const more = pending.length === 100;
+        const last = pending.at(-1);
+        const next =
+          more && last ? canonicalJson([String(last.org_id), String(last.reference)]) : null;
+        await sql.run(
+          `UPDATE stripe_billing_reconcile SET cursor = ?, generation = generation + 1,
+           cycle_unresolved = CASE WHEN ? THEN cycle_unresolved + ? ELSE 0 END,
+           last_unresolved = CASE WHEN ? THEN last_unresolved ELSE cycle_unresolved + ? END,
+           updated_at = ?, cycle_started_at = CASE WHEN ? THEN cycle_started_at ELSE ? END
+           WHERE stream = 'card-setup' AND cursor IS ? AND generation = ?`,
+          [
+            next,
+            more ? 1 : 0,
+            unresolved,
+            more ? 1 : 0,
+            unresolved,
+            now(),
+            more ? 1 : 0,
+            now(),
+            cursor,
+            Number(checkpoint?.generation),
+          ],
+        );
+        truncated ||= more;
       } catch {
         failedStreams++;
         truncated = true;
@@ -1474,7 +1688,7 @@ export function createStripeBilling(options: {
           if (stream === "replay") {
             const rows = await sql.query(
               "SELECT event_id, type, livemode, object_id FROM stripe_events WHERE handler_version < 1 AND type IN (SELECT value FROM json_each(?)) AND (? IS NULL OR event_id > ?) ORDER BY event_id LIMIT 100",
-              [JSON.stringify(TYPES), cursor ?? null, cursor ?? null],
+              [JSON.stringify(eventTypes), cursor ?? null, cursor ?? null],
             );
             for (const row of rows) {
               const event = await client.get("events", String(row.event_id));

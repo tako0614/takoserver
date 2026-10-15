@@ -554,11 +554,7 @@
                 "description": "Opaque, non-reusable Organization billing reference; URL-encode it as one path component."
               },
               "onLimit": {
-                "type": "string",
-                "enum": [
-                  "on-demand",
-                  "postpaid"
-                ]
+                "const": "postpaid"
               },
               "cashCapMinor": {
                 "type": "integer",
@@ -569,6 +565,57 @@
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 512
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "reference",
+              "onLimit",
+              "cashCapMinor",
+              "consentRevision",
+              "termsRevision",
+              "paymentMethodId"
+            ],
+            "properties": {
+              "reference": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+                "description": "Opaque, non-reusable Organization billing reference; URL-encode it as one path component."
+              },
+              "onLimit": {
+                "const": "on-demand"
+              },
+              "cashCapMinor": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 900719925474
+              },
+              "consentRevision": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+                "description": "Published immutable billing terms or disclosure revision."
+              },
+              "termsRevision": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+                "description": "Published immutable billing terms or disclosure revision."
+              },
+              "paymentMethodId": {
+                "type": "string",
+                "pattern": "^pm_[A-Za-z0-9_]{1,240}$"
+              },
+              "setupIntentId": {
+                "type": "string",
+                "pattern": "^seti_[A-Za-z0-9_]{1,240}$"
               }
             }
           }
@@ -615,7 +662,7 @@
                 "const": false
               },
               "on-demand": {
-                "const": false
+                "type": "boolean"
               }
             }
           },
@@ -648,6 +695,308 @@
           },
           "periodEnd": {
             "$ref": "#/components/schemas/BillingUtcDateTime"
+          }
+        }
+      },
+      "WalletOnDemandTerms": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "termsRevision",
+          "consentRevision",
+          "currency",
+          "validity",
+          "replenishment",
+          "cashCapBounds",
+          "purchaseCreditExpiry"
+        ],
+        "properties": {
+          "termsRevision": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+            "description": "Published immutable billing terms or disclosure revision."
+          },
+          "consentRevision": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+            "description": "Published immutable billing terms or disclosure revision."
+          },
+          "currency": {
+            "const": "USD"
+          },
+          "validity": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "validFrom",
+              "validUntil"
+            ],
+            "properties": {
+              "validFrom": {
+                "$ref": "#/components/schemas/BillingUtcDateTime"
+              },
+              "validUntil": {
+                "$ref": "#/components/schemas/BillingUtcDateTime"
+              }
+            }
+          },
+          "replenishment": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "trigger",
+              "rule",
+              "fundingQuantumMinor",
+              "minimumChargeMinor",
+              "maximumChargeMinor"
+            ],
+            "properties": {
+              "trigger": {
+                "const": "eligible-credit-deficit"
+              },
+              "rule": {
+                "const": "ceil-deficit-to-quantum-with-minimum"
+              },
+              "fundingQuantumMinor": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 99999999
+              },
+              "minimumChargeMinor": {
+                "type": "integer",
+                "minimum": 50,
+                "maximum": 99999999
+              },
+              "maximumChargeMinor": {
+                "type": "integer",
+                "minimum": 50,
+                "maximum": 99999999
+              }
+            }
+          },
+          "cashCapBounds": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "minimumMinor",
+              "maximumMinor"
+            ],
+            "properties": {
+              "minimumMinor": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 900719925474
+              },
+              "maximumMinor": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 900719925474
+              }
+            }
+          },
+          "purchaseCreditExpiry": {
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "none"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "kind",
+                  "seconds"
+                ],
+                "properties": {
+                  "kind": {
+                    "const": "fixed-duration"
+                  },
+                  "seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 253402300799
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "WalletOnDemandTermsResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "terms",
+          "setupDisclosureRevision"
+        ],
+        "properties": {
+          "terms": {
+            "$ref": "#/components/schemas/WalletOnDemandTerms"
+          },
+          "setupDisclosureRevision": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+            "description": "Published immutable billing terms or disclosure revision."
+          }
+        }
+      },
+      "BeginWalletCardSetupRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reference",
+          "setupDisclosureRevision"
+        ],
+        "properties": {
+          "reference": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+            "description": "Opaque, non-reusable Organization billing reference; URL-encode it as one path component."
+          },
+          "setupDisclosureRevision": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+            "description": "Published immutable billing terms or disclosure revision."
+          }
+        }
+      },
+      "WalletCardSetupReceipt": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reference",
+          "state",
+          "setupDisclosureRevision",
+          "sessionExpired",
+          "observedAt"
+        ],
+        "properties": {
+          "reference": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+            "description": "Opaque, non-reusable Organization billing reference; URL-encode it as one path component."
+          },
+          "state": {
+            "enum": [
+              "awaiting-customer",
+              "prepared",
+              "pending",
+              "original-known",
+              "succeeded",
+              "canceled",
+              "abandoned"
+            ]
+          },
+          "setupDisclosureRevision": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+            "description": "Published immutable billing terms or disclosure revision."
+          },
+          "sessionExpired": {
+            "type": "boolean"
+          },
+          "observedAt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/BillingUtcDateTime"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "BeginWalletCardSetupResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "receipt",
+          "checkout",
+          "selection"
+        ],
+        "properties": {
+          "receipt": {
+            "$ref": "#/components/schemas/WalletCardSetupReceipt"
+          },
+          "checkout": {
+            "anyOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "url"
+                ],
+                "properties": {
+                  "url": {
+                    "type": "string",
+                    "format": "uri"
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "selection": {
+            "anyOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "paymentMethodId",
+                  "setupIntentId"
+                ],
+                "properties": {
+                  "paymentMethodId": {
+                    "type": "string",
+                    "pattern": "^pm_[A-Za-z0-9_]{1,240}$"
+                  },
+                  "setupIntentId": {
+                    "type": "string",
+                    "pattern": "^seti_[A-Za-z0-9_]{1,240}$"
+                  }
+                }
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "WalletCardSetupResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "cardSetup"
+        ],
+        "properties": {
+          "cardSetup": {
+            "$ref": "#/components/schemas/WalletCardSetupReceipt"
           }
         }
       },
@@ -6151,7 +6500,7 @@
     "/v1/organizations/{organizationId}/wallet/limit-policy": {
       "get": {
         "summary": "Read the Organization's explicit usage limit policy",
-        "description": "Default stop. Capability flags describe execution support, independently of the four-value policy vocabulary. On-demand and postpaid remain unavailable until separately qualified. Period fields identify the UTC cash-cap month, not the included grant's invoice period.",
+        "description": "Default stop. On-demand execution requires the qualified financial composition and explicit Organization consent. Postpaid remains disabled pending its launch decision. Period fields identify the UTC cash-cap month, not the included grant's invoice period.",
         "responses": {
           "200": {
             "description": "Current limit mode, capability flags and frozen consent terms",
@@ -6232,7 +6581,7 @@
       },
       "patch": {
         "summary": "Record explicit Organization spending consent",
-        "description": "Stop/prepaid accepts reference and onLimit only. The prepaid command records consent to spend already-purchased credit without authorizing a new charge. On-demand/postpaid additionally require a cash cap and acknowledged consent revision, but currently return 409 without persisting an active mode. Exact retries return the original command response; the authenticated payment principal is recorded server-side.",
+        "description": "Stop/prepaid accepts reference and onLimit only. Prepaid authorizes spending purchased credit without a new charge. On-demand requires explicit published terms and consent revisions, a user-chosen monthly cash cap, and a selected attached card. An optional SetupIntent is verified when supplied; an existing saved card needs no new setup. Exact retries return the original command response before current terms or card checks, while changed input or principal conflicts. Stop withdraws fresh-charge consent atomically with never-dispatched abandonment; a dispatched unknown effect remains reserved for original recovery. Postpaid remains unavailable. The authenticated payment principal is recorded server-side.",
         "responses": {
           "200": {
             "description": "Committed original command response, including an exact replay",
@@ -6329,6 +6678,277 @@
         },
         "x-required-scopes": [
           "payments:write"
+        ]
+      }
+    },
+    "/v1/organizations/{organizationId}/wallet/on-demand/terms": {
+      "get": {
+        "summary": "Read explicit on-demand spending terms",
+        "description": "Read-only terms for explicit cash consent. Positive eligible deficits round up once to a funding quantum and then to the published minimum; zero deficit never charges. The published maximum is a single-charge bound, not an automatic charge loop. The caller must choose a monthly cash cap within the published bounds. Funding credits have face value and any duration expiry starts at first verified funding. Reading terms creates no consent or payment.",
+        "responses": {
+          "200": {
+            "description": "Published terms and card setup disclosure revision",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WalletOnDemandTermsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong Organization or wallet:read scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Qualified on-demand composition is absent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Financial terms or schema are unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "organizationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          }
+        ],
+        "x-required-scopes": [
+          "wallet:read"
+        ]
+      }
+    },
+    "/v1/organizations/{organizationId}/wallet/on-demand/card-setup": {
+      "post": {
+        "summary": "Begin or resume the original card registration",
+        "description": "Registers a card through hosted Checkout setup mode without buying credit or a plan. The server binds the original Organization, payment principal, reference, disclosure and customer. New commands must acknowledge the current setup disclosure; exact retries retain the original disclosure and command. Only this payments:write operation may return a transient Checkout action URL. After setup succeeds, replay it to obtain the paymentMethodId and setupIntentId for a separate explicit limit-policy consent. Setup success grants neither cash consent nor wallet credit. Unknown acknowledgements recover the original with reads; absence or session expiry never authorizes another create.",
+        "responses": {
+          "200": {
+            "description": "Original receipt, transient action or verified card selection",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BeginWalletCardSetupResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid fields, reference or disclosure revision",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong Organization or payments:write scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Card setup composition is absent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Reference, principal, disclosure or original native binding conflicts",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Original effect requires recovery or the processor is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "organizationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BeginWalletCardSetupRequest"
+              }
+            }
+          }
+        },
+        "x-required-scopes": [
+          "payments:write"
+        ]
+      }
+    },
+    "/v1/organizations/{organizationId}/wallet/on-demand/card-setup/{reference}": {
+      "get": {
+        "summary": "Read a local card setup receipt",
+        "description": "SQL-only read of the original setup receipt. It returns no Checkout action URL, native card selection, card details or client secret and performs no processor recovery. Session expiry is recorded separately from the native SetupIntent outcome.",
+        "responses": {
+          "200": {
+            "description": "Safe local setup receipt",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WalletCardSetupResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid reference",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Wrong Organization or wallet:read scope",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Original receipt or card setup composition is absent",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Durable original receipt is unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "organizationId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            }
+          },
+          {
+            "name": "reference",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+              "description": "Opaque, non-reusable Organization billing reference; URL-encode it as one path component."
+            }
+          }
+        ],
+        "x-required-scopes": [
+          "wallet:read"
         ]
       }
     },

@@ -47,16 +47,16 @@ afterAll(() => rmSync(auditedFixtureRoot, { recursive: true, force: true }));
 // of relying on untracked migrations in the ambient worktree.
 const INVENTED_UNAUDITED_TAIL = [
   [
-    "0100_container_runtime_input_custody.sql",
-    "CREATE TABLE synthetic_0100_container_runtime_input_custody (id TEXT);\n",
+    "0101_container_runtime_input_custody.sql",
+    "CREATE TABLE synthetic_0101_container_runtime_input_custody (id TEXT);\n",
   ],
   [
-    "0101_container_runtime_input_rewrap.sql",
-    "CREATE TABLE synthetic_0101_container_runtime_input_rewrap (id TEXT);\n",
+    "0102_container_runtime_input_rewrap.sql",
+    "CREATE TABLE synthetic_0102_container_runtime_input_rewrap (id TEXT);\n",
   ],
   [
-    "0102_container_runtime_input_acceptance.sql",
-    "CREATE TABLE synthetic_0102_container_runtime_input_acceptance (id TEXT);\n",
+    "0103_container_runtime_input_acceptance.sql",
+    "CREATE TABLE synthetic_0103_container_runtime_input_acceptance (id TEXT);\n",
   ],
 ] as const;
 
@@ -702,7 +702,7 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0099");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0100");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1136,7 +1136,7 @@ describe("production-shaped D1 migration lane", () => {
         },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(String(failure)).toContain("exact audited source inventory 0001-0099");
+      expect(String(failure)).toContain("exact audited source inventory 0001-0100");
       expect(fixture.calls).toHaveLength(0);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -1251,19 +1251,19 @@ describe("production-shaped D1 migration lane", () => {
   for (const drift of [
     {
       name: "missing",
-      expected: "selected D1 wave requires the exact audited source inventory 0001-0099",
+      expected: "selected D1 wave requires the exact audited source inventory 0001-0100",
     },
     { name: "changed", expected: "exact audited migration SHA-256" },
-    { name: "extra", expected: "exact audited source inventory 0001-0099" },
+    { name: "extra", expected: "exact audited source inventory 0001-0100" },
   ] as const) {
-    test(`current 0099 source closure refuses ${drift.name} bytes without provider command calls`, async () => {
+    test(`current 0100 source closure refuses ${drift.name} bytes without provider command calls`, async () => {
       const root = mkdtempSync(join(tmpdir(), `takoserver-schema-0089-${drift.name}-`));
       try {
         const migrationDirectory = join(root, "migrations");
         cpSync(currentMigrations, migrationDirectory, { recursive: true });
         const migration0092 = join(migrationDirectory, "0092_org_wallet_lifecycle.sql");
         if (drift.name === "missing") {
-          rmSync(join(migrationDirectory, "0099_hosted_billing_extensions.sql"));
+          rmSync(join(migrationDirectory, "0100_hosted_on_demand.sql"));
         } else if (drift.name === "changed") {
           writeFileSync(
             migration0092,
@@ -1271,8 +1271,8 @@ describe("production-shaped D1 migration lane", () => {
           );
         } else {
           writeFileSync(
-            join(migrationDirectory, "0100_unreviewed_extension.sql"),
-            "CREATE TABLE synthetic_0100_unreviewed_extension (id TEXT);\n",
+            join(migrationDirectory, "0101_unreviewed_extension.sql"),
+            "CREATE TABLE synthetic_0101_unreviewed_extension (id TEXT);\n",
             { mode: 0o600 },
           );
         }

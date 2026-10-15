@@ -201,6 +201,7 @@ test("0058 interrupted receipt rebuild rolls back with exact ciphertext and line
     "0097_subscription_cancellation_custody.sql",
     "0098_stripe_mode_realm.sql",
     "0099_hosted_billing_extensions.sql",
+    "0100_hosted_on_demand.sql",
   ]);
   expect(preservedRows(database)).toEqual(rows);
   database.close();

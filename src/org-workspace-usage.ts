@@ -1,4 +1,5 @@
 import { base64UrlDecode, base64UrlEncode } from "./json.ts";
+import type { LedgerRefundSource } from "./ledger.ts";
 import {
   type OrgUsageSummary,
   orgUsageSummaryReadStatement,
@@ -186,6 +187,7 @@ function snapshotHeader(input: {
   readonly workspaceRef?: string;
   readonly hostedPaidFreeExclusion: boolean;
   readonly hostedCreditProvenance?: boolean;
+  readonly refundSource?: LedgerRefundSource | null;
   readonly snapshotRef: string;
 }): SqlStatement {
   const summary = orgUsageSummaryReadStatement(input);
@@ -327,6 +329,7 @@ export async function readOrgWorkspaceUsage(input: {
   readonly instant: string;
   readonly hostedPaidFreeExclusion: boolean;
   readonly hostedCreditProvenance?: boolean;
+  readonly refundSource?: LedgerRefundSource | null;
   readonly options?: WorkspaceUsageOptions;
 }): Promise<OrgWorkspaceUsagePage> {
   const { sql, organizationId: org, instant } = input;
@@ -362,6 +365,7 @@ export async function readOrgWorkspaceUsage(input: {
         hostedPaidFreeExclusion: input.hostedPaidFreeExclusion,
         snapshotRef,
         hostedCreditProvenance: input.hostedCreditProvenance === true,
+        ...(input.refundSource === undefined ? {} : { refundSource: input.refundSource }),
         ...(options.workspaceRef === undefined ? {} : { workspaceRef: options.workspaceRef }),
       };
       const guardRef = `workspace_snapshot_${snapshotRef}`;
