@@ -602,7 +602,7 @@ const LAYERS: readonly Layer[] = [
     // Source-event codecs and retained receiver CAS use domain ports only.
     // A private runtime binding belongs to a separately reviewed composition.
     name: "domain",
-    match: /^src\/shared-financial-source(?:-(?:abi|contract))?\.ts$/u,
+    match: /^src\/shared-financial-source(?:-(?:abi|contract|enrollment))?\.ts$/u,
     may: ["core", "domain"],
   },
   {
