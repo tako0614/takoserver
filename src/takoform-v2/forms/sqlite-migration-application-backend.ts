@@ -280,41 +280,109 @@ export async function runSQLiteMigrationApplication(
   port: SQLiteMigrationApplicationPort,
   input: SQLiteMigrationApplicationInput,
 ): Promise<SQLiteMigrationApplicationResult> {
-  const { targetEntries, files } = input;
-  let total = 0;
-  const paths = new Set<string>();
-  if (
-    targetEntries.length === 0 ||
-    targetEntries.length > SQLITE_MIGRATION_SET_LIMITS.fileCount ||
-    files.length !== targetEntries.length
-  ) {
-    return { kind: "failure", code: "artifact_invalid", newlyApplied: 0, appliedEntries: [] };
-  }
-  for (const [index, entry] of targetEntries.entries()) {
-    const bytes = files[index];
+  const invalid = (): SQLiteMigrationApplicationResult => ({
+    kind: "failure",
+    code: "artifact_invalid",
+    newlyApplied: 0,
+    appliedEntries: [],
+  });
+  let captured: SQLiteMigrationApplicationInput;
+  try {
+    const entries = input.targetEntries;
+    const suppliedFiles = input.files;
+    if (!Array.isArray(entries) || !Array.isArray(suppliedFiles)) return invalid();
+    const count = entries.length;
     if (
-      !entry ||
-      typeof entry.path !== "string" ||
-      !isValidArtifactPath(entry.path) ||
-      paths.has(entry.path) ||
-      typeof entry.sha256 !== "string" ||
-      !/^[0-9a-f]{64}$/u.test(entry.sha256) ||
-      !(bytes instanceof Uint8Array) ||
-      bytes.byteLength > SQLITE_MIGRATION_SET_LIMITS.fileBytes ||
-      total + bytes.byteLength > SQLITE_MIGRATION_SET_LIMITS.aggregateBytes ||
-      (await bytesDigest(bytes)) !== `sha256:${entry.sha256}`
-    ) {
-      return { kind: "failure", code: "artifact_invalid", newlyApplied: 0, appliedEntries: [] };
+      count === 0 ||
+      count > SQLITE_MIGRATION_SET_LIMITS.fileCount ||
+      suppliedFiles.length !== count
+    )
+      return invalid();
+
+    const targetEntries: SQLiteMigrationEntry[] = [];
+    const sources: { readonly bytes: Uint8Array; readonly size: number }[] = [];
+    const paths = new Set<string>();
+    let total = 0;
+    for (let index = 0; index < count; index += 1) {
+      const entry = entries[index];
+      const bytes = suppliedFiles[index];
+      const path = entry?.path;
+      const sha256 = entry?.sha256;
+      if (
+        typeof path !== "string" ||
+        !isValidArtifactPath(path) ||
+        paths.has(path) ||
+        typeof sha256 !== "string" ||
+        !/^[0-9a-f]{64}$/u.test(sha256) ||
+        !(bytes instanceof Uint8Array)
+      )
+        return invalid();
+      const size = bytes.byteLength;
+      if (
+        size > SQLITE_MIGRATION_SET_LIMITS.fileBytes ||
+        total + size > SQLITE_MIGRATION_SET_LIMITS.aggregateBytes
+      )
+        return invalid();
+      total += size;
+      paths.add(path);
+      targetEntries.push({ path, sha256 });
+      sources.push({ bytes, size });
     }
-    total += bytes.byteLength;
-    paths.add(entry.path);
+
+    const offered = input.execution;
+    const refs = parseSQLiteMigrationApplicationSpec(offered.spec);
+    const execution: SQLiteMigrationApplicationInput["execution"] = {
+      operationId: offered.operationId,
+      leaseToken: offered.leaseToken,
+      backendKey: offered.backendKey,
+      backendId: offered.backendId,
+      targetKey: offered.targetKey,
+      resourceUid: offered.resourceUid,
+      principal: offered.principal,
+      action: offered.action,
+      generation: offered.generation,
+      form: offered.form,
+      space: offered.space,
+      name: offered.name,
+      spec: {
+        database: { resourceUid: refs.database.resourceUid },
+        migrationSet: { resourceUid: refs.migrationSet.resourceUid },
+      },
+    };
+    // Check the entire material budget before allocating owned file copies.
+    // No caller-owned bytes or identity survive the first hash await below.
+    const files = sources.map(({ bytes, size }) => {
+      if (bytes.byteLength !== size) throw new Error("migration material changed during capture");
+      const copy = new Uint8Array(size);
+      copy.set(bytes);
+      return copy;
+    });
+    captured = {
+      resourceUid: input.resourceUid,
+      execution,
+      targetEntries,
+      files,
+      // Preserve the live authority capability, never a captured boolean.
+      stillAuthorized: input.stillAuthorized,
+    };
+  } catch {
+    return invalid();
+  }
+  for (const [index, entry] of captured.targetEntries.entries()) {
+    const bytes = captured.files[index];
+    if (!bytes || (await bytesDigest(bytes)) !== `sha256:${entry.sha256}`) return invalid();
   }
   return port.withAuthorizedMigrationSession({
-    resourceUid: input.resourceUid,
-    execution: input.execution,
-    stillAuthorized: input.stillAuthorized,
+    resourceUid: captured.resourceUid,
+    execution: captured.execution,
+    stillAuthorized: captured.stillAuthorized,
     use: (session) =>
-      applyHeldMigrations(session, targetEntries, files, input.execution.operationId),
+      applyHeldMigrations(
+        session,
+        captured.targetEntries,
+        captured.files,
+        captured.execution.operationId,
+      ),
   });
 }
 

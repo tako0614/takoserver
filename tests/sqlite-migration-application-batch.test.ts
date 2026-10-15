@@ -11,6 +11,7 @@ import type { V2ArtifactSource } from "../src/takoform-v2/forms/artifact-source.
 import { SQLITE_DATABASE_FORM_URL } from "../src/takoform-v2/forms/sqlite-database.ts";
 import { createSQLiteDatabaseForm } from "../src/takoform-v2/forms/sqlite-database-backend.ts";
 import {
+  parseSQLiteMigrationApplicationSpec,
   SQLITE_MIGRATION_APPLICATION_FORM_URL,
   SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
   SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0,
@@ -640,6 +641,162 @@ test("batch realization requires the actual bounded accepted custody capability"
         custody: { readVerified: f.custody.readVerified },
       }),
     ).toThrow("bounded accepted artifact custody");
+  } finally {
+    f.close();
+  }
+});
+
+for (const phase of ["hash", "open", "readLedger"] as const) {
+  test(`batch runner snapshots retained caller material before ${phase} await`, async () => {
+    const original = "CREATE TABLE captured(value TEXT); INSERT INTO captured VALUES('safe');";
+    const changed = new TextEncoder().encode(original.replace("'safe'", "'evil'"));
+    let mutated = false;
+    const f = await fixture(original, (native, { custody }) => ({
+      async applyAuthorizedMigration(input) {
+        const verified = await readBatchFiles(custody, input);
+        const refs = parseSQLiteMigrationApplicationSpec(input.execution.spec);
+        const mutable = {
+          ...input,
+          execution: {
+            ...input.execution,
+            spec: {
+              database: { resourceUid: refs.database.resourceUid },
+              migrationSet: { resourceUid: refs.migrationSet.resourceUid },
+            },
+          },
+          targetEntries: input.targetEntries.map((entry) => ({ ...entry })),
+          files: verified.map((bytes) => new Uint8Array(bytes)),
+        };
+        const mutate = () => {
+          if (mutated) return;
+          mutated = true;
+          const bytes = mutable.files[0];
+          if (!bytes || bytes.byteLength !== changed.byteLength) throw new Error("fixture size");
+          bytes.set(changed);
+          if (phase !== "hash") {
+            mutable.files[0] = new Uint8Array(changed);
+            mutable.targetEntries[0] = { path: "migrations/evil.sql", sha256: "0".repeat(64) };
+            mutable.execution.operationId = "evil-operation";
+            mutable.execution.form = "https://invalid.example.test/evil/";
+            mutable.execution.spec.database.resourceUid = "evil-database";
+            mutable.execution.spec.migrationSet.resourceUid = "evil-set";
+            mutable.resourceUid = "evil-database";
+          }
+        };
+        const pending = runSQLiteMigrationApplication(
+          {
+            withAuthorizedMigrationSession(request) {
+              if (phase === "open") mutate();
+              return native.withAuthorizedMigrationSession({
+                ...request,
+                use(session) {
+                  return request.use({
+                    async readLedger() {
+                      const result = await session.readLedger();
+                      if (phase === "readLedger") mutate();
+                      return result;
+                    },
+                    applyOneHeldFile: (file) => session.applyOneHeldFile(file),
+                  });
+                },
+              });
+            },
+          },
+          mutable,
+        );
+        if (phase === "hash") mutate();
+        return pending;
+      },
+    }));
+    try {
+      const { databaseUid, setUid } = await f.prepare();
+      const accepted = await f.createApplication(databaseUid, setUid);
+      expect((await f.drive(accepted.id)).status).toBe("succeeded");
+      expect(mutated).toBe(true);
+      expect(
+        await f.store.withAuthorizedDatabase({
+          resourceUid: databaseUid,
+          stillAuthorized: async () => true,
+          use(database) {
+            return {
+              data: database.prepare("SELECT value FROM captured").all(),
+              ledger: database
+                .prepare(
+                  "SELECT sequence,path,sha256,operation_id FROM _takoform_sqlite_migrations",
+                )
+                .all(),
+            };
+          },
+        }),
+      ).toEqual({
+        data: [{ value: "safe" }],
+        ledger: [
+          {
+            sequence: 1,
+            path: "migrations/0001.sql",
+            sha256: f.fileSha256,
+            operation_id: accepted.id,
+          },
+        ],
+      });
+    } finally {
+      f.close();
+    }
+  });
+}
+
+test("batch runner retains live revocation after the owned snapshot and ledger read", async () => {
+  let allowed = true;
+  const f = await fixture("CREATE TABLE must_not_exist(value TEXT)", (native, { custody }) => ({
+    async applyAuthorizedMigration(input) {
+      const files = await readBatchFiles(custody, input);
+      return runSQLiteMigrationApplication(
+        {
+          withAuthorizedMigrationSession(request) {
+            return native.withAuthorizedMigrationSession({
+              ...request,
+              use(session) {
+                return request.use({
+                  async readLedger() {
+                    const result = await session.readLedger();
+                    allowed = false;
+                    return result;
+                  },
+                  applyOneHeldFile: (file) => session.applyOneHeldFile(file),
+                });
+              },
+            });
+          },
+        },
+        {
+          ...input,
+          files,
+          stillAuthorized: async () => allowed && (await input.stillAuthorized()),
+        },
+      );
+    },
+  }));
+  try {
+    const { databaseUid, setUid } = await f.prepare();
+    await f.createApplication(databaseUid, setUid);
+    expect((await f.engine.runNext())?.status).toBe("reconciling");
+    expect(allowed).toBe(false);
+    expect(
+      await f.store.withAuthorizedDatabase({
+        resourceUid: databaseUid,
+        stillAuthorized: async () => true,
+        use(database) {
+          return {
+            table: database
+              .prepare("SELECT name FROM sqlite_schema WHERE name='must_not_exist'")
+              .get(),
+            ledger: database
+              .prepare("SELECT count(*) AS count FROM _takoform_sqlite_migrations")
+              .get(),
+          };
+        },
+      }),
+    ).toEqual({ table: undefined, ledger: { count: 0 } });
   } finally {
     f.close();
   }
