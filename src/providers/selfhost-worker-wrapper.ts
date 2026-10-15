@@ -2,7 +2,7 @@ import {
   OBJECT_BUCKET_KNOWN_LENGTH_FORM_URL,
   type ObjectBucketBindingForm,
   snapshotObjectBucketBindingForms,
-} from "../takoform-v2/forms/object-bucket-binding-profile.ts";
+} from "../object-bucket-binding-profile.ts";
 import {
   EDGE_VECTOR_WORKER_FACADE_KIND,
   renderEdgeVectorWorkerFacadeSource,
