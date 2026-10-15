@@ -436,6 +436,39 @@ curl -sS http://127.0.0.1:8787/_takoserver/health/ready
 The readiness probe goes to the listener directly; use the address in the
 `takoserver listening on` line if `TAKOSERVER_LISTEN_HOST` names another.
 
+#### The console (optional)
+
+The console is a separate static app in `console/`; the Bun Host does not serve
+it. It signs in with the same operator assertion, then lets the operator create
+organizations and API keys and see each Resource's declared and observed state.
+Build it with the Host's public origin stamped in, as the `takoserver` user
+from the checkout:
+
+```sh
+bun scripts/build-console.ts --out /var/lib/takoserver-console \
+  --api-origin https://api.example.com:8443
+```
+
+The output is four files: `index.html`, `console.js`, `app.css` and
+`favicon.svg`. Serve them on an HTTPS origin of their own with these
+properties:
+
+- **The same site as the API**, for example `https://console.example.com`
+  next to `https://api.example.com:8443`. The session is an `HttpOnly`,
+  `SameSite=Lax` cookie (with `Secure` when the public origin is HTTPS), so a
+  console on another site cannot carry it.
+- **`--api-origin` equal to `TAKOSERVER_PUBLIC_ORIGIN`.** The v2 API answers
+  `421` to a request whose host is not the configured public authority.
+- **Every path that is not a file answers with `index.html`**, so a reload of
+  a deep link such as `/resources/<uid>` opens the console instead of a 404.
+
+Then add `TAKOSERVER_CONSOLE_ORIGIN` with that exact origin (a bare HTTPS
+origin; plain HTTP is accepted only for `localhost` and `127.0.0.1`) to the
+environment file and restart the Host. It allows that origin, with
+credentials, across the control and v2 APIs and accepts the session cookie
+only from it. A boot that prints a sign-in assertion then names the console
+origin to open; paste the assertion on its sign-in page.
+
 ### 6. Seed held artifacts
 
 The artifact Forms never accept uploaded bytes. A create names an exact HTTPS
