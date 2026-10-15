@@ -430,7 +430,7 @@ export async function runHostedStagingE2E(options: RunOptions): Promise<JsonReco
       runId: options.runId,
       pollSeconds: options.pollSeconds,
     });
-    const endpointUrl = endpointUrlFromResource(graph.endpoint.resource);
+    const endpointUrl = endpointUrlFromResource(graph.endpoint.resource, graph.endpoint.uid);
     const probe = async (path: string, method = "GET") => {
       await journal({ kind: "endpoint-request-intent", path, method });
       return await callEndpointJson({
@@ -1401,12 +1401,20 @@ async function waitForScheduledEvidence(input: {
   );
 }
 
-function endpointUrlFromResource(resource: JsonRecord): string {
+export function endpointUrlFromResource(resource: JsonRecord, acceptedResourceUid: string): string {
+  if (
+    typeof acceptedResourceUid !== "string" ||
+    !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u.test(acceptedResourceUid) ||
+    resource.uid !== acceptedResourceUid
+  ) {
+    throw new HostedSampleError("Endpoint readback does not match its accepted Resource UID");
+  }
   const output = record(resource.output, "endpoint output must be an object");
-  const url = output.url;
-  if (typeof url === "string") return exactStagingOrigin(url);
-  const hostname = stringField(output.hostname, "endpoint hostname");
-  return exactStagingOrigin(`https://${hostname}/`);
+  const hostname = `integration-v2-${acceptedResourceUid.replaceAll("-", "")}.app-staging.takos.jp`;
+  if (output.hostname !== hostname || output.url !== `https://${hostname}/`) {
+    throw new HostedSampleError("Endpoint origin does not match its accepted staging Resource UID");
+  }
+  return `https://${hostname}`;
 }
 
 function graphEvidence(graph: GraphResults): JsonRecord {

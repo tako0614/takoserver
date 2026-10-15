@@ -9,6 +9,7 @@ import {
   buildHostedSampleFixtureDocument,
   buildWorkerVersionSpec,
   checkHostedSampleFixture,
+  endpointUrlFromResource,
   exactStagingOrigin,
   hostedSampleResourceGraphSummary,
   hostedSampleWorkerSource,
@@ -341,6 +342,72 @@ test("production and cross-origin discovery are refused before any mutation", as
   expect(requests).toBe(0);
 });
 
+test("Endpoint origin binds the accepted canonical UID without widening the Host API origin guard", () => {
+  const uid = "01234567-89ab-cdef-0123-456789abcdef";
+  const hostname = "integration-v2-0123456789abcdef0123456789abcdef.app-staging.takos.jp";
+  expect(
+    endpointUrlFromResource({ uid, output: { hostname, url: `https://${hostname}/` } }, uid),
+  ).toBe(`https://${hostname}`);
+  expect(() => exactStagingOrigin(`https://${hostname}/`)).toThrow("staging");
+});
+
+test("Endpoint origin refuses UID substitution, sibling namespaces and noncanonical URL fields", () => {
+  const uid = "01234567-89ab-cdef-0123-456789abcdef";
+  const hostname = "integration-v2-0123456789abcdef0123456789abcdef.app-staging.takos.jp";
+  const output = { hostname, url: `https://${hostname}/` };
+  for (const invalidUid of [uid.toUpperCase(), uid.replaceAll("-", ""), "resource-fixture"]) {
+    expect(() => endpointUrlFromResource({ uid: invalidUid, output }, invalidUid)).toThrow(
+      "accepted Resource UID",
+    );
+  }
+  expect(() =>
+    endpointUrlFromResource({ uid: "00000000-0000-4000-8000-000000000001", output }, uid),
+  ).toThrow("accepted Resource UID");
+  for (const invalidHostname of [
+    "v2-0123456789abcdef0123456789abcdef.app-staging.takos.jp",
+    "staging-v2-0123456789abcdef0123456789abcdef.app-staging.takos.jp",
+    "integration-v2-00000000000040008000000000000001.app-staging.takos.jp",
+    "integration-v2-0123456789abcdef0123456789abcdef.app.takos.jp",
+    `${hostname}.evil.test`,
+    `${hostname}.integration.takoserver.com`,
+    "integration-v2-0123456789abcdef0123456789abcdef.sibling.app-staging.takos.jp",
+    hostname.toUpperCase(),
+    `${hostname}.`,
+    "worker.integration.takoserver.com",
+  ]) {
+    expect(() =>
+      endpointUrlFromResource(
+        { uid, output: { hostname: invalidHostname, url: `https://${invalidHostname}/` } },
+        uid,
+      ),
+    ).toThrow("accepted staging Resource UID");
+  }
+  for (const invalidUrl of [
+    `http://${hostname}/`,
+    `https://user:pass@${hostname}/`,
+    `https://${hostname}:443/`,
+    `https://${hostname}:8443/`,
+    `https://${hostname}/path`,
+    `https://${hostname}/?query=1`,
+    `https://${hostname}/?`,
+    `https://${hostname}/#fragment`,
+    `https://${hostname}/#`,
+    `https://${hostname}/./`,
+    `https://${hostname}//`,
+    `https://${hostname}`,
+    "https://integration-v2-00000000000040008000000000000001.app-staging.takos.jp/",
+  ]) {
+    expect(() =>
+      endpointUrlFromResource({ uid, output: { hostname, url: invalidUrl } }, uid),
+    ).toThrow("accepted staging Resource UID");
+  }
+  for (const incomplete of [{ hostname }, { url: output.url }, { hostname, url: null }]) {
+    expect(() => endpointUrlFromResource({ uid, output: incomplete }, uid)).toThrow(
+      "accepted staging Resource UID",
+    );
+  }
+});
+
 async function harnessFixture() {
   const root = await mkdtemp(join(tmpdir(), "wfp-hosted-harness-"));
   await writeHostedSampleFixture({
@@ -433,7 +500,11 @@ test("harness drives v2 lifecycle, Service/Version rollback and dependency-order
         return Response.json({ code: "dependency_conflict" }, { status: 409 });
       }
       const id = `operation-${++sequence}`;
-      const resourceUid = current?.uid ?? `resource-${sequence}`;
+      const resourceUid =
+        current?.uid ??
+        (String(body.form).includes("/WorkerEndpoint/")
+          ? "00000000-0000-4000-8000-000000000001"
+          : `resource-${sequence}`);
       const resource: Resource = current
         ? { ...current }
         : {
@@ -453,7 +524,8 @@ test("harness drives v2 lifecycle, Service/Version rollback and dependency-order
         resource.form.endsWith("/WorkerEndpoint/0.3.0/") ||
         resource.form.includes("/WorkerEndpoint/")
       ) {
-        resource.output = { hostname: "worker.integration.takoserver.com" };
+        const hostname = `integration-v2-${resourceUid.replaceAll("-", "")}.app-staging.takos.jp`;
+        resource.output = { hostname, url: `https://${hostname}/` };
       }
       operations.set(id, { id, resourceUid, status: "succeeded", effect: "complete" });
       if (method === "DELETE") resources.delete(resourceUid);
@@ -528,6 +600,106 @@ test("harness drives v2 lifecycle, Service/Version rollback and dependency-order
     expect(journal).not.toContain("synthetic-evidence-secret-only");
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("Endpoint probes wait for the accepted operation and exact settled Resource readback", async () => {
+  for (const fault of [
+    "hostname-uid",
+    "url",
+    "resource-uid",
+    "operation-id",
+    "operation-effect",
+    "phase",
+    "observed-generation",
+    "last-operation",
+  ]) {
+    const fixture = await harnessFixture();
+    const uid = "00000000-0000-4000-8000-000000000001";
+    const hostname = "integration-v2-00000000000040008000000000000001.app-staging.takos.jp";
+    const resources = new Map<string, Record<string, unknown>>();
+    const operations = new Map<string, Record<string, unknown>>();
+    let sequence = 0;
+    let endpointOperation = "";
+    let endpointCreates = 0;
+    let operationReads = 0;
+    let resourceReads = 0;
+    let probes = 0;
+    const fetcher = async (input: string, init?: RequestInit): Promise<Response> => {
+      const url = new URL(input);
+      if (url.origin !== fixture.options.origin) {
+        probes++;
+        throw new Error("Endpoint must not be probed after a refused readback");
+      }
+      if (url.pathname === "/.well-known/takoform/v2")
+        return Response.json({ api: "forms.takoform.com/v2", baseUrl: `${url.origin}/host/v2` });
+      if (url.pathname === "/host/v2/support")
+        return Response.json({ supported: true, form: url.searchParams.get("form") });
+      if (url.pathname === "/host/v2/resources" && init?.method === "GET")
+        return Response.json({ items: [], nextCursor: null });
+      if (url.pathname === "/host/v2/resources" && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+        const endpoint = String(body.form).includes("/WorkerEndpoint/");
+        const id = `operation-${++sequence}`;
+        const resourceUid = endpoint ? uid : `resource-${sequence}`;
+        const operation = { id, resourceUid, status: "succeeded", effect: "complete" };
+        const resource: Record<string, unknown> = {
+          uid: resourceUid,
+          ...body,
+          generation: 1,
+          observedGeneration: 1,
+          phase: "idle",
+          lastOperation: id,
+          output: endpoint ? { hostname, url: `https://${hostname}/` } : {},
+        };
+        if (endpoint) {
+          endpointCreates++;
+          endpointOperation = id;
+          if (fault === "hostname-uid") {
+            const foreign = "integration-v2-00000000000040008000000000000002.app-staging.takos.jp";
+            resource.output = { hostname: foreign, url: `https://${foreign}/` };
+          }
+          if (fault === "url") resource.output = { hostname, url: `https://${hostname}/#alias` };
+          if (fault === "resource-uid") resource.uid = "00000000-0000-4000-8000-000000000002";
+          if (fault === "operation-id") operation.id = "foreign-operation";
+          if (fault === "operation-effect") operation.effect = "none";
+          if (fault === "phase") resource.phase = "updating";
+          if (fault === "observed-generation") resource.observedGeneration = 0;
+          if (fault === "last-operation") resource.lastOperation = "foreign-operation";
+        }
+        resources.set(resourceUid, resource);
+        operations.set(id, operation);
+        return Response.json({ id, resourceUid }, { status: 202 });
+      }
+      if (url.pathname.startsWith("/host/v2/operations/")) {
+        const id = url.pathname.split("/").at(-1) ?? "";
+        if (id === endpointOperation) operationReads++;
+        return Response.json(operations.get(id));
+      }
+      if (url.pathname.startsWith("/host/v2/resources/")) {
+        const resourceUid = url.pathname.split("/").at(-1) ?? "";
+        if (resourceUid === uid) resourceReads++;
+        return Response.json(resources.get(resourceUid));
+      }
+      throw new Error("unexpected fixture request");
+    };
+    try {
+      await expect(
+        runHostedStagingE2E({ ...fixture.options, fetcher, now: () => new Date() }),
+      ).rejects.toThrow();
+      expect(endpointCreates).toBe(1);
+      expect(operationReads).toBe(1);
+      expect(resourceReads).toBe(fault.startsWith("operation-") ? 0 : 1);
+      expect(probes).toBe(0);
+      const journal = (await readFile(fixture.options.journalPath, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(journal.filter((row) => row.kind === "accepted" && row.uid === uid)).toHaveLength(1);
+      expect(journal.some((row) => row.kind === "endpoint-request-intent")).toBe(false);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
   }
 });
 
