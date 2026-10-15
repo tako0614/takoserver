@@ -86,6 +86,15 @@ export {
   type ObjectBucketStore,
 } from "./forms/object-bucket-backend.ts";
 export {
+  OBJECT_BUCKET_EOF_COUNTED_FORM_URL,
+  OBJECT_BUCKET_KNOWN_LENGTH_FORM_URL,
+  type ObjectBucketBindingForm,
+  type ObjectBucketBindingFormUrl,
+  type ObjectBucketBindingProfile,
+  selectObjectBucketBindingProfile,
+  snapshotObjectBucketBindingForms,
+} from "./forms/object-bucket-binding-profile.ts";
+export {
   createObjectBucketWorkerBindingAuthority,
   type ObjectBucketWorkerBindingClaim,
   type ObjectBucketWorkerBindingResolution,

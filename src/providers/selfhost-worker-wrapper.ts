@@ -1,4 +1,9 @@
 import {
+  OBJECT_BUCKET_KNOWN_LENGTH_FORM_URL,
+  type ObjectBucketBindingForm,
+  snapshotObjectBucketBindingForms,
+} from "../takoform-v2/forms/object-bucket-binding-profile.ts";
+import {
   EDGE_VECTOR_WORKER_FACADE_KIND,
   renderEdgeVectorWorkerFacadeSource,
 } from "./edge-vector-worker-facade-source.ts";
@@ -407,6 +412,72 @@ export function selfhostWorkerEntrypointSource(
   v2PrivateNames = false,
 ): string {
   const normalized = normalizeSourceInput(input, v2PrivateNames);
+  return renderSelfhostWorkerEntrypoint(normalized, v2PrivateNames);
+}
+
+export interface SelfhostWorkerForwardObjectBucketSourceInput {
+  readonly source: SelfhostWorkerEntrypointSourceInput;
+  /** Value projection from a separately proved accepted reference graph. */
+  readonly objectBucketBindings: readonly ObjectBucketBindingForm[];
+}
+
+/**
+ * Source preparation only: no default, support registration, or SQL authority.
+ * New snapshots select each bucket's exact Form; legacy emitted bytes stay intact.
+ * The existing edge.objects route tag is internal transport, not a Form alias.
+ */
+export function selfhostWorkerForwardObjectBucketEntrypointSource(
+  input: SelfhostWorkerForwardObjectBucketSourceInput,
+  v2PrivateNames = false,
+): string {
+  const fields = dataProperties(input, "forward ObjectBucket input");
+  exactNormalizedKeys(fields, ["source", "objectBucketBindings"], "forward ObjectBucket input");
+  const normalized = normalizeSourceInput(fields.source, v2PrivateNames);
+  const projected = snapshotObjectBucketBindingForms(fields.objectBucketBindings);
+  const declaredNames = normalized.bindings
+    .filter(
+      (binding) => "kind" in binding && binding.kind === SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
+    )
+    .map((binding) => ("publicName" in binding ? binding.publicName : ""))
+    .sort();
+  if (
+    projected.length === 0 ||
+    projected.length !== declaredNames.length ||
+    projected.some((binding, index) => binding.publicName !== declaredNames[index])
+  )
+    invalid("forward ObjectBucket bindings");
+  return renderSelfhostWorkerEntrypoint(normalized, v2PrivateNames, projected);
+}
+
+function renderSelfhostWorkerEntrypoint(
+  normalized: ReturnType<typeof normalizeSourceInput>,
+  v2PrivateNames: boolean,
+  forwardBindings?: readonly ObjectBucketBindingForm[],
+): string {
+  const forwardForms: Record<string, { resourceUid: string; formUrl: string }> =
+    Object.create(null);
+  for (const binding of forwardBindings ?? [])
+    forwardForms[binding.publicName] = {
+      resourceUid: binding.resourceUid,
+      formUrl: binding.formUrl,
+    };
+  const forwardDeclaration =
+    forwardBindings === undefined
+      ? ""
+      : `const FORWARD_OBJECT_FORMS = (() => {
+  const forms = SafeApply(SafeJSONParse, undefined, [${JSON.stringify(JSON.stringify(forwardForms))}]);
+  const names = SafeOwnKeys(forms);
+  for (let index = 0; index < names.length; index += 1) freezeObject(forms[names[index]]);
+  return freezeObject(forms);
+})();
+`;
+  const knownLengthGuard =
+    forwardBindings === undefined
+      ? ""
+      : `    if (FORWARD_OBJECT_FORMS[binding].formUrl === ${JSON.stringify(OBJECT_BUCKET_KNOWN_LENGTH_FORM_URL)} && isReadableStream(body) && !SafeObjectHasOwn(options, "contentLength")) {
+      throw portableError("invalid_body");
+    }
+`;
   const dataServiceBinding = v2PrivateNames
     ? WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING
     : SELFHOST_WORKER_DATA_SERVICE_BINDING;
@@ -577,7 +648,7 @@ export const ${SELFHOST_WORKER_EVENT_ENTRYPOINT} = SafeApply(SafeObjectFreeze, S
 import * as TenantWorkerModule from ${JSON.stringify(moduleSpecifier)};
 
 const RAW_CONFIGURATION = ${JSON.stringify(configuration)};
-const DATA_SERVICE = ${JSON.stringify(dataServiceBinding)};
+${forwardDeclaration}const DATA_SERVICE = ${JSON.stringify(dataServiceBinding)};
 const READINESS_PATH = ${JSON.stringify(SELFHOST_WORKER_READINESS_PATH)};
 const READINESS_PROTOCOL = ${JSON.stringify(SELFHOST_WORKER_READINESS_PROTOCOL)};
 const READINESS_RESULT_SCHEMA = ${JSON.stringify(SELFHOST_WORKER_READINESS_RESULT_SCHEMA)};
@@ -1583,7 +1654,7 @@ function validateQueueSendOptions(options, strictTypes) {
 }
 
 /**
- * edge.objects@1.0.0, byte for byte the surface the managed wrapper projects.
+ * ${forwardBindings === undefined ? "edge.objects@1.0.0, byte for byte the surface the managed wrapper projects." : "ObjectBucket methods selected by the exact accepted target Form URL."}
  *
  * Same nine methods, same option names, same closed error vocabulary, same
  * ceilings — 979-byte keys, 5 GiB objects, 300 MiB single put, 10 000 parts, a
@@ -1640,7 +1711,7 @@ function createObjectsAdapter(call, binding, v2PrivateObject) {
     exactObjectArgumentCount(arguments.length, 3);
     objectKey(key);
     const options = objectPutOptions(rawOptions);
-    const source = objectBodySource(body, MAX_OBJECT_SINGLE_PUT_BYTES, options.contentLength);
+${knownLengthGuard}    const source = objectBodySource(body, MAX_OBJECT_SINGLE_PUT_BYTES, options.contentLength);
     const document = objectDocument(binding, "put", key);
     if (source.length !== undefined) document.contentLength = source.length;
     if (options.contentType !== undefined) document.contentType = options.contentType;
@@ -1746,7 +1817,7 @@ function createObjectsAdapter(call, binding, v2PrivateObject) {
     objectUploadId(uploadId);
     objectPartNumber(partNumber);
     const options = objectUploadPartOptions(rawOptions);
-    const source = objectBodySource(body, MAX_OBJECT_BYTES, options.contentLength, "invalid_body");
+${knownLengthGuard}    const source = objectBodySource(body, MAX_OBJECT_BYTES, options.contentLength, "invalid_body");
     const document = objectDocument(binding, "uploadPart", key);
     document.uploadId = uploadId;
     document.partNumber = partNumber;
@@ -3363,7 +3434,7 @@ function viewByteLength(value) {
 }
 
 function normalizeSourceInput(
-  input: SelfhostWorkerEntrypointSourceInput,
+  input: unknown,
   v2PrivateNames: boolean,
 ): {
   readonly originalMainModule: string;
