@@ -27,7 +27,7 @@ import {
   V2_QUEUE_SETTLEMENT_PATH,
   V2_QUEUE_SETTLEMENT_PROTOCOL,
   V2_QUEUE_SETTLEMENT_SERVICE_BINDING,
-} from "./selfhost-v2-queue-transport.ts";
+} from "./selfhost-v2-queue-contract.ts";
 import { selfhostWorkerPreludeModuleName } from "./selfhost-worker-prelude.ts";
 import {
   WORKER_MODULE_HANDLER_NAMES,
