@@ -679,10 +679,14 @@ function assertStageTarget(
   target: DeployTarget,
   origin: MoneyStageOriginProof,
   live: MoneyStorageIdentity,
+  originalRead = false,
 ): void {
   if (
     target.environment !== "integration" ||
-    !STAGE_NAME.test(target.d1.databaseName) ||
+    !(
+      STAGE_NAME.test(target.d1.databaseName) ||
+      (originalRead && /^integration-ts-[0-9a-f]{32}$/u.test(target.d1.databaseName))
+    ) ||
     target.r2.bucketName !== target.d1.databaseName ||
     !UUID.test(target.d1.databaseId) ||
     !/^[0-9a-f]{32}$/u.test(target.accountId) ||
@@ -1113,6 +1117,7 @@ async function backupAndRead(
   root: string,
   run: NonNullable<MoneyUnitCutoverOptions["run"]>,
   environment: Readonly<Record<string, string>>,
+  allowExport = true,
 ): Promise<{
   readonly digest: string;
   readonly preimageDigest: string;
@@ -1124,6 +1129,10 @@ async function backupAndRead(
   assertProtectedDirectory(dirname(backupPath), "money backup");
   const identityPath = `${backupPath}.identity.json`;
   if (!existsSync(backupPath)) {
+    if (!allowExport)
+      throw preflightError(
+        "money resume read requires its existing protected backup; no export allowed",
+      );
     const rawPath = join(root, `export-${randomUUID()}.sql`);
     try {
       const result = await run(
@@ -1241,6 +1250,302 @@ async function backupAndRead(
   } finally {
     snapshot.close();
   }
+}
+
+/** Current fixed94 money observation. This is never a normal-Host readiness certificate. */
+export interface MoneyUnitResumeState {
+  readonly schemaPhase: "0094" | "0094-fenced";
+  readonly originDigest: string;
+  readonly convertBindingDigest: string;
+  readonly resumeBindingDigest: string | null;
+  readonly nativeResumeProof: MoneyResumeProof;
+  readonly health: "guarded" | "healthy";
+  readonly normalHostReady: false;
+  readonly nextOwner: "qualified-post0094-suffix-and0098-realm";
+}
+
+/**
+ * Shared verification over held custody and read-only SQL. The native owner constructs
+ * all ports; this lower-level function grants no provider-native eligibility itself.
+ */
+export async function inspectMoneyUnitResumeState(input: {
+  readonly target: DeployTarget;
+  readonly options: MoneyUnitCutoverOptions;
+  readonly files: readonly MigrationFile[];
+  readonly database: Pick<RemoteD1, "query">;
+  readonly readSchema: () => Promise<D1SchemaState>;
+  readonly backup: Awaited<ReturnType<typeof backupAndRead>>;
+}): Promise<MoneyUnitResumeState> {
+  const { target, options, files, database, backup } = input;
+  if (
+    options.phase !== "resume" ||
+    options.resumeProof === undefined ||
+    options.resumeCommit === undefined ||
+    options.resumeHealthRead === undefined
+  )
+    throw preflightError("money resume read requires the existing complete resume owner");
+  assertMoneyCutoverSource(files);
+  const origin = await options.stageOriginProof();
+  const identity = await options.storageIdentityRead();
+  assertStageTarget(target, origin, identity, true);
+  const originDigest = digest(JSON.stringify(origin));
+  const phases = ["freeze", "prepare", "classify", "convert", "resume"] as const;
+  const retained = [];
+  let predecessor = origin.terminalCustodyDigest;
+  const classifications = readProtectedClassifications(
+    options.classificationManifestPath ?? "",
+    options.classificationManifestDigest ?? "",
+  );
+  for (const phase of phases) {
+    const receipt = await options.custody.read(phase);
+    const binding = await options.custody.readDispatch(phase);
+    if (phase === "resume" && receipt === null && binding === null) break;
+    if (receipt === null || binding === null)
+      throw preflightError(`money resume read lacks exact ${phase} custody`);
+    assertExistingCustodyShape(receipt, phase);
+    if (receipt.state !== "terminal")
+      throw preflightError(`money resume read holds unknown ${phase} dispatch; no reconciliation`);
+    const selected = phaseSchemas(phase);
+    const classificationMatches =
+      phase === "freeze" || phase === "prepare"
+        ? binding.classificationDigest === digest("[]\n") ||
+          binding.classificationDigest === options.classificationManifestDigest
+        : binding.classificationDigest === options.classificationManifestDigest;
+    if (
+      receipt.bindingDigest !== moneyCutoverBindingDigest(binding) ||
+      binding.phase !== phase ||
+      binding.accountId !== target.accountId ||
+      binding.databaseId !== target.d1.databaseId ||
+      binding.databaseName !== target.d1.databaseName ||
+      binding.originDigest !== originDigest ||
+      binding.predecessorCustodyDigest !== predecessor ||
+      !COMMIT.test(binding.sourceCommit) ||
+      binding.sourceDigest !==
+        sourcePrefixDigest(files.slice(0, selected.through === "0093" ? 93 : 94)) ||
+      binding.afterSchemaPhase !== selected.after ||
+      binding.backupDigest !== backup.digest ||
+      binding.preimageDigest !== backup.preimageDigest ||
+      binding.aggregateDigest !== backup.aggregateDigest ||
+      !classificationMatches ||
+      !SHA256.test(binding.reviewDigest) ||
+      binding.writerEpoch !== options.writerEpoch ||
+      binding.writerEpoch !== target.moneyCutoverWriterEpoch
+    )
+      throw preflightError(
+        `money resume read ${phase} dispatch differs from original/source/backup/epoch`,
+      );
+    retained.push({ phase, receipt, binding });
+    predecessor = digest(JSON.stringify(receipt));
+  }
+  const convert = retained.find((entry) => entry.phase === "convert");
+  const resume = retained.find((entry) => entry.phase === "resume");
+  if (convert === undefined)
+    throw preflightError("money resume read requires terminal convert custody");
+  const reviewed = resume ?? convert;
+  const reviewBinding: MoneyReviewBinding = {
+    kind: "takoserver.money-review-binding@v1",
+    phase: reviewed.phase,
+    accountId: target.accountId,
+    databaseId: target.d1.databaseId,
+    originDigest,
+    predecessorCustodyDigest: reviewed.binding.predecessorCustodyDigest,
+    sourceCommit: reviewed.binding.sourceCommit,
+    sourceDigest: reviewed.binding.sourceDigest,
+    importDigest: reviewed.binding.importDigest,
+    backupDigest: backup.digest,
+    preimageDigest: backup.preimageDigest,
+    aggregateDigest: backup.aggregateDigest,
+    classificationDigest: reviewed.binding.classificationDigest,
+    writerDigest: reviewed.binding.writerDigest,
+    resumeDigest: reviewed.binding.resumeDigest,
+    writerEpoch: options.writerEpoch,
+  };
+  const assertReview = async () => {
+    if (options.independentReview === undefined)
+      throw preflightError("money resume read independent review unavailable");
+    const review = await options.independentReview(reviewBinding);
+    if (review === null || validateReview(reviewBinding, review) !== reviewed.binding.reviewDigest)
+      throw preflightError("money resume read retained independent review differs");
+  };
+  await assertReview();
+  const writerDigest = convert.binding.writerDigest;
+  const anchor = digest(
+    JSON.stringify({
+      kind: "takoserver.money-freeze-anchor@v1",
+      target: identity,
+      originDigest,
+      backupDigest: backup.digest,
+      preimageDigest: backup.preimageDigest,
+      aggregateDigest: backup.aggregateDigest,
+      financialDigest: backup.financialDigest,
+      writerDigest,
+      writerEpoch: options.writerEpoch,
+      sourceDigest: SOURCE_0092,
+    }),
+  );
+  for (const { phase, binding } of retained) {
+    const sql = buildMoneyCutoverImportSql({
+      phase,
+      files,
+      anchor,
+      originDigest,
+      backupDigest: backup.digest,
+      writerDigest,
+      writerEpoch: options.writerEpoch,
+      classifications: phase === "freeze" || phase === "prepare" ? [] : classifications,
+    });
+    if (
+      binding.writerDigest !== writerDigest ||
+      digest(sql) !== binding.importDigest ||
+      readProtectedBytes(binding.sealedImportPath, "money resume retained SQL").toString("utf8") !==
+        sql
+    )
+      throw preflightError(`money resume read ${phase} sealed import/source differs`);
+  }
+  const schema = await input.readSchema();
+  const phase = await exactStatus(database, schema, files, options.writerEpoch);
+  if (phase !== "0094" && phase !== "0094-fenced")
+    throw preflightError(
+      "money resume read requires exact current fixed94; suffix has a separate owner",
+    );
+  if (phase === "0094-fenced") {
+    if (resume !== undefined)
+      throw preflightError("money resume terminal custody disagrees with current freeze");
+    assertFreezeRow(
+      await readFreezeRow(database, "preflight"),
+      anchor,
+      originDigest,
+      backup.digest,
+      writerDigest,
+      "preflight",
+    );
+    await assertPermitEmpty(database, "preflight", options.writerEpoch);
+  } else {
+    if (resume === undefined)
+      throw preflightError("money current94 lacks terminal resume custody; no adoption");
+    await assertResumedFreezeEmpty(database, "preflight", options.writerEpoch);
+  }
+  if (
+    (await readMoneyPreimageDigest(database, "preflight", true)) !== backup.preimageDigest ||
+    (await readMoneyAggregateDigest(database, "preflight", true)) !== backup.aggregateDigest
+  )
+    throw preflightError("money resume read differs from protected financial preimages");
+  await assertClassificationsStored(database, classifications, "preflight");
+  await assertMoneyNativeForeignKeys(database, "preflight");
+  const postDigest = digest(
+    JSON.stringify({
+      applied: schema.applied,
+      shapeDigest: schema.shapeDigest,
+      preimageDigest: backup.preimageDigest,
+      aggregateDigest: backup.aggregateDigest,
+    }),
+  );
+  if (
+    convert.receipt.postDigest !== postDigest ||
+    (resume !== undefined && resume.receipt.postDigest !== postDigest)
+  )
+    throw preflightError("money resume read terminal post digest differs");
+  const nativeResumeProof = await options.resumeProof();
+  assertResumeProof(target, nativeResumeProof, options.resumeCommit);
+  const nativeDigest = digest(JSON.stringify(nativeResumeProof));
+  if (resume !== undefined && resume.binding.resumeDigest !== nativeDigest)
+    throw preflightError("money resume read current native Version differs from terminal resume");
+  await options.resumeHealthRead(phase === "0094-fenced" ? "guarded" : "healthy");
+  await assertReview();
+  if (
+    JSON.stringify(await options.stageOriginProof()) !== JSON.stringify(origin) ||
+    JSON.stringify(await options.storageIdentityRead()) !== JSON.stringify(identity) ||
+    digest(JSON.stringify(await options.resumeProof())) !== nativeDigest ||
+    JSON.stringify(await input.readSchema()) !== JSON.stringify(schema) ||
+    (await exactStatus(database, schema, files, options.writerEpoch)) !== phase
+  )
+    throw preflightError("money resume read origin/native/schema changed during observation");
+  if (
+    JSON.stringify(
+      readProtectedClassifications(
+        options.classificationManifestPath ?? "",
+        options.classificationManifestDigest ?? "",
+      ),
+    ) !== JSON.stringify(classifications)
+  )
+    throw preflightError("money resume classification changed during observation");
+  for (const { phase: retainedPhase, receipt, binding } of retained) {
+    if (
+      JSON.stringify(await options.custody.read(retainedPhase)) !== JSON.stringify(receipt) ||
+      JSON.stringify(await options.custody.readDispatch(retainedPhase)) !== JSON.stringify(binding)
+    )
+      throw preflightError("money resume read protected custody changed during observation");
+  }
+  if (
+    resume === undefined &&
+    ((await options.custody.read("resume")) !== null ||
+      (await options.custody.readDispatch("resume")) !== null)
+  )
+    throw preflightError("money resume dispatch appeared during observation");
+  return {
+    schemaPhase: phase,
+    originDigest,
+    convertBindingDigest: convert.receipt.bindingDigest,
+    resumeBindingDigest: resume?.receipt.bindingDigest ?? null,
+    nativeResumeProof,
+    health: phase === "0094-fenced" ? "guarded" : "healthy",
+    normalHostReady: false,
+    nextOwner: "qualified-post0094-suffix-and0098-realm",
+  };
+}
+
+/** Remote GET/SELECT and existing custody reads only; local source-build scratch is retained. */
+export async function readMoneyUnitResumeState(
+  target: DeployTarget,
+  options: MoneyUnitCutoverOptions,
+): Promise<MoneyUnitResumeState> {
+  if (
+    target.environment !== "integration" ||
+    options.phase !== "resume" ||
+    options.outputDirectory === undefined
+  )
+    throw preflightError("money resume read requires the selected integration resume owner");
+  const files = readMigrationArtifact(
+    options.sourceDirectory ?? resolve(REPOSITORY, "migrations"),
+  ).files;
+  assertMoneyCutoverSource(files);
+  for (const phase of ["convert", "resume"] as const) {
+    const receipt = await options.custody.read(phase);
+    if (receipt?.state === "dispatched")
+      throw preflightError("money resume read holds unknown dispatch; no reconciliation");
+  }
+  const run = options.run ?? runCommand;
+  const credential = await resolveCloudflareCredential("integration", {
+    ...(options.cloudflareEnvironment === undefined
+      ? {}
+      : { cloudflareEnvironment: options.cloudflareEnvironment }),
+    run,
+  });
+  assertProtectedDirectory(options.outputDirectory, "money resume read output");
+  const root = mkdtempSync(join(options.outputDirectory, "money-resume-read-"));
+  const configPath = join(root, "wrangler.jsonc");
+  writeFileSync(configPath, configJson(target), { flag: "wx", mode: 0o600 });
+  const database = new RemoteD1(configPath, { environment: credential.childEnvironment, run });
+  const origin = await options.stageOriginProof();
+  const backup = await backupAndRead(
+    options.backupPath,
+    configPath,
+    target,
+    files,
+    digest(JSON.stringify(origin)),
+    root,
+    run,
+    credential.childEnvironment,
+    false,
+  );
+  return inspectMoneyUnitResumeState({
+    target,
+    options,
+    files,
+    database,
+    readSchema: () => readD1SchemaState(database),
+    backup,
+  });
 }
 
 /** Protects the full existing D1 export against row-value loss, including NUL-bearing text. */
