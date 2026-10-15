@@ -17,11 +17,18 @@ processing. It accepts ASCII case differences and one DNS root dot, requires
 exactly one label before `app-staging.takos.jp`, and refuses ports. Reserved,
 malformed, production and foreign Host values all return null. The gateway must
 return its same non-cacheable 404 for those names and for names that the
-authoritative ledger marks absent, released or cooling.
+authoritative ledger marks absent or permanently released.
+
+A normalized tenant name belongs to one assignment incarnation for its entire
+lifetime in that environment. Explicit release leaves a permanent tombstone:
+the same owner, another Organization, and either product can never reserve it
+again, including after 30 days or any longer interval. The original release
+timestamp and assignment identity remain durable. Routine updates and route
+retirement/republishing of the same held incarnation are distinct from release.
 
 This source is preparatory. The reservation API and private gateway do not yet
 select this policy. Integration still requires environment-separated global
-name uniqueness, 30-day release cooldown, assignment incarnation and primary
+name uniqueness, permanent released-name tombstones, assignment incarnation and primary
 generation checks that fence predecessor scripts and stale caches. The owning
 public migration path must preserve durable data; no new schema number or
 live target is assigned by this helper.
