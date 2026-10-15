@@ -1,5 +1,8 @@
 # Docker and Compose self-host
 
+The opt-in private Docker supply wiring and unpublished portable Container
+qualification are documented in [Container Docker candidate](container-docker-candidate.md).
+
 This target packages the Bun artifact/control API profile described in
 [self-host operations](self-host-operations.md#first-install-and-first-use).
 It starts the v2 Host API, operator sign-in, organizations, and API keys with

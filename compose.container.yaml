@@ -1,0 +1,22 @@
+# Explicit Host-owned Docker capability; use with compose.yaml.
+services:
+  takoserver:
+    group_add:
+      - "${TAKOSERVER_DOCKER_GID:?Set the numeric group ID of the operator Docker socket}"
+    environment:
+      TAKOSERVER_SELFHOST_CONTAINER_DOCKER_SOCKET: /run/takoserver/docker.sock
+      TAKOSERVER_SELFHOST_CONTAINER_NETWORK: ${TAKOSERVER_CONTAINER_NETWORK:?Set the pre-created internal network name}
+    volumes:
+      - type: bind
+        source: ${TAKOSERVER_DOCKER_SOCKET:-/var/run/docker.sock}
+        target: /run/takoserver/docker.sock
+        bind:
+          create_host_path: false
+    networks:
+      - default
+      - container-supply
+
+networks:
+  container-supply:
+    external: true
+    name: ${TAKOSERVER_CONTAINER_NETWORK:?Set the pre-created internal network name}
