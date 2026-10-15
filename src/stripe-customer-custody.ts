@@ -6,6 +6,7 @@ import {
 import { canonicalDigest, canonicalJson } from "./json.ts";
 import { OrgTopUpError, TOP_UP_UNKNOWN_ACK_CUTOFF_MS } from "./org-top-up.ts";
 import type { Clock, Row, Sql } from "./ports.ts";
+import { parseStrictJson } from "./strict-json.ts";
 import type { StripeBillingClient, StripeBillingObject } from "./stripe-billing-client.ts";
 
 const ORG = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
@@ -119,18 +120,42 @@ interface Receipt {
   readonly state: "prepared" | "dispatched" | "verified";
   readonly dispatchedAt: string | null;
   readonly customerId: string | null;
+  readonly createdAt: string;
+  readonly verifiedAt: string | null;
 }
-function receipt(row: Row | undefined): Receipt | null {
-  return row === undefined
-    ? null
-    : {
-        command: JSON.parse(String(row.request_json)) as CustomerCommand,
-        key: String(row.stripe_key),
-        fingerprint: String(row.fingerprint),
-        state: row.state as Receipt["state"],
-        dispatchedAt: row.dispatched_at == null ? null : String(row.dispatched_at),
-        customerId: row.customer_id == null ? null : String(row.customer_id),
-      };
+
+/** Local observations only: null does not establish complete or clear history. */
+export interface StripeCustomerCustodyInspection {
+  readonly organizationId: string;
+  readonly command: {
+    readonly state: Receipt["state"];
+    readonly fingerprint: string;
+    readonly createdAt: string;
+    readonly dispatchedAt: string | null;
+    readonly verifiedAt: string | null;
+    readonly customerId: string | null;
+  } | null;
+  readonly binding: {
+    readonly customerId: string;
+    /** Historical SQL TEXT, observed without imposing command chronology. */
+    readonly createdAt: string;
+  } | null;
+}
+
+function instant(value: unknown): string {
+  if (typeof value !== "string") fail("conflict");
+  const ms = Date.parse(value);
+  if (!Number.isSafeInteger(ms) || new Date(ms).toISOString() !== value) fail("conflict");
+  return value;
+}
+
+function storedJson(value: unknown): unknown {
+  if (typeof value !== "string") fail("conflict");
+  try {
+    return parseStrictJson(new TextEncoder().encode(value), 64 * 1024);
+  } catch {
+    fail("conflict");
+  }
 }
 
 /** One customer authority, used before both canonical subscription and top-up Checkout. */
@@ -147,18 +172,144 @@ export function createStripeCustomerCustody(options: {
     billingAuthority: realm.billingAuthority,
   });
   const now = () => clock().toISOString();
-  const read = async (org: string) =>
-    receipt(
-      (
-        await sql.query("SELECT * FROM stripe_billing_customer_commands WHERE org_id = ?", [org])
-      )[0],
+  async function original(org: string) {
+    const frozenRealm = Object.freeze({
+      accountId: realm.accountId,
+      financialRealm: realm.financialRealm,
+      livemode: false as const,
+      billingAuthority: realm.billingAuthority,
+    });
+    const digest = await canonicalDigest({
+      organizationId: org,
+      realm: frozenRealm,
+      purpose: "hosted_subscription",
+    });
+    const key = `takoserver_customer_${digest.slice(7)}`;
+    const command: CustomerCommand = Object.freeze({
+      organizationId: org,
+      realm: frozenRealm,
+      metadata: Object.freeze({
+        organizationId: org,
+        takoserverPurpose: "hosted_subscription",
+        stripeAccountId: realm.accountId,
+        financialRealm: realm.financialRealm,
+        customerCreationCommand: digest,
+        customerCreationKey: key,
+      }),
+    });
+    return { command, key, fingerprint: await canonicalDigest(command) };
+  }
+  async function snapshot(org: string): Promise<{
+    readonly receipt: Receipt | null;
+    readonly inspection: StripeCustomerCustodyInspection;
+  }> {
+    assertHostedBillingFinancialRealm(realm, {
+      sql,
+      client,
+      billingAuthority: realm.billingAuthority,
+    });
+    if (typeof org !== "string" || !ORG.test(org)) fail("invalid_argument");
+    const rows = await sql.query(
+      `SELECT o.id AS organization_id, c.org_id AS command_org_id,
+        c.realm_json, c.request_json, c.fingerprint, c.stripe_key, c.state,
+        c.dispatched_at, c.customer_id, c.created_at, c.verified_at,
+        b.org_id AS binding_org_id, b.customer_id AS bound_customer_id,
+        b.created_at AS binding_created_at
+       FROM orgs o
+       LEFT JOIN stripe_billing_customer_commands c ON c.org_id = o.id
+       LEFT JOIN stripe_billing_customers b ON b.org_id = o.id
+       WHERE o.id = ?`,
+      [org],
     );
-  const bound = async (org: string): Promise<string | null> => {
-    const row = (
-      await sql.query("SELECT customer_id FROM stripe_billing_customers WHERE org_id = ?", [org])
-    )[0];
-    return row === undefined ? null : String(row.customer_id);
-  };
+    if (rows.length === 0) fail("invalid_argument");
+    const row: Row | undefined = rows[0];
+    if (rows.length !== 1 || !row || row.organization_id !== org) fail("conflict");
+    let binding: StripeCustomerCustodyInspection["binding"] = null;
+    if (row.binding_org_id !== null) {
+      if (
+        row.binding_org_id !== org ||
+        typeof row.bound_customer_id !== "string" ||
+        !CUSTOMER.test(row.bound_customer_id) ||
+        typeof row.binding_created_at !== "string"
+      )
+        fail("conflict");
+      binding = Object.freeze({
+        customerId: row.bound_customer_id,
+        createdAt: row.binding_created_at,
+      });
+    } else if (row.bound_customer_id !== null || row.binding_created_at !== null) fail("conflict");
+    let decoded: Receipt | null = null;
+    if (row.command_org_id !== null) {
+      const expected = await original(org);
+      if (
+        row.command_org_id !== org ||
+        canonicalJson(storedJson(row.realm_json)) !== canonicalJson(expected.command.realm) ||
+        canonicalJson(storedJson(row.request_json)) !== canonicalJson(expected.command) ||
+        row.fingerprint !== expected.fingerprint ||
+        row.stripe_key !== expected.key ||
+        (row.state !== "prepared" && row.state !== "dispatched" && row.state !== "verified")
+      )
+        fail("conflict");
+      const state = row.state as Receipt["state"];
+      const createdAt = instant(row.created_at);
+      const dispatchedAt = row.dispatched_at === null ? null : instant(row.dispatched_at);
+      const verifiedAt = row.verified_at === null ? null : instant(row.verified_at);
+      const customerId = row.customer_id;
+      if (customerId !== null && (typeof customerId !== "string" || !CUSTOMER.test(customerId)))
+        fail("conflict");
+      // These are wall-clock observations. Durable state, not timestamp order,
+      // establishes progress; the owning writer and schema permit clock rollback.
+      if (
+        (state === "prepared" &&
+          (dispatchedAt !== null || customerId !== null || verifiedAt !== null)) ||
+        (state !== "prepared" && dispatchedAt === null) ||
+        (state === "dispatched" && (customerId !== null || verifiedAt !== null)) ||
+        (state === "verified" &&
+          (customerId === null ||
+            verifiedAt === null ||
+            dispatchedAt === null ||
+            binding?.customerId !== customerId))
+      )
+        fail("conflict");
+      decoded = Object.freeze({
+        ...expected,
+        state,
+        createdAt,
+        dispatchedAt,
+        verifiedAt,
+        customerId,
+      });
+    } else if (
+      [
+        "realm_json",
+        "request_json",
+        "fingerprint",
+        "stripe_key",
+        "state",
+        "dispatched_at",
+        "customer_id",
+        "created_at",
+        "verified_at",
+      ].some((key) => row[key] !== null)
+    )
+      fail("conflict");
+    const command =
+      decoded === null
+        ? null
+        : Object.freeze({
+            state: decoded.state,
+            fingerprint: decoded.fingerprint,
+            createdAt: decoded.createdAt,
+            dispatchedAt: decoded.dispatchedAt,
+            verifiedAt: decoded.verifiedAt,
+            customerId: decoded.customerId,
+          });
+    return {
+      receipt: decoded,
+      inspection: Object.freeze({ organizationId: org, command, binding }),
+    };
+  }
+  const read = async (org: string) => (await snapshot(org)).receipt;
   function validate(
     remote: StripeBillingObject,
     org: string,
@@ -224,9 +375,10 @@ export function createStripeCustomerCustody(options: {
         params: [remote.id, now(), row.command.organizationId, row.fingerprint],
       },
     ]);
-    const current = await read(row.command.organizationId);
+    const snapshotAfter = await snapshot(row.command.organizationId);
+    const current = snapshotAfter.receipt;
     if (
-      (await bound(row.command.organizationId)) !== remote.id ||
+      snapshotAfter.inspection.binding?.customerId !== remote.id ||
       current?.state !== "verified" ||
       current.customerId !== remote.id
     )
@@ -234,19 +386,15 @@ export function createStripeCustomerCustody(options: {
     return await verifyBound(row.command.organizationId, remote.id);
   }
   return {
+    /** SQL-only, redacted local custody; never creates or proves absent history. */
+    async inspect(organizationId: string): Promise<StripeCustomerCustodyInspection> {
+      return (await snapshot(organizationId)).inspection;
+    },
     async ensure(organizationId: string): Promise<string> {
-      assertHostedBillingFinancialRealm(realm, {
-        sql,
-        client,
-        billingAuthority: realm.billingAuthority,
-      });
-      if (typeof organizationId !== "string" || !ORG.test(organizationId)) fail("invalid_argument");
-      if (!(await sql.query("SELECT 1 FROM orgs WHERE id = ?", [organizationId])).length)
-        fail("invalid_argument");
-      let row = await read(organizationId);
-      const current = await bound(organizationId);
+      const initial = await snapshot(organizationId);
+      let row = initial.receipt;
+      const current = initial.inspection.binding?.customerId ?? null;
       if (current !== null) {
-        row = await read(organizationId);
         // A pending local creation command cannot be silently abandoned in favor
         // of another writer's customer; recover its exact original effect first.
         if (row !== null && (row.state !== "verified" || row.customerId !== current))
@@ -254,35 +402,14 @@ export function createStripeCustomerCustody(options: {
         return await verifyBound(organizationId, current);
       }
       if (row === null) {
-        const frozenRealm = {
-          accountId: realm.accountId,
-          financialRealm: realm.financialRealm,
-          livemode: false as const,
-          billingAuthority: realm.billingAuthority,
-        };
-        const identity = { organizationId, realm: frozenRealm, purpose: "hosted_subscription" };
-        const digest = await canonicalDigest(identity);
-        const key = `takoserver_customer_${digest.slice(7)}`;
-        const command: CustomerCommand = {
-          organizationId,
-          realm: frozenRealm,
-          metadata: {
-            organizationId,
-            takoserverPurpose: "hosted_subscription",
-            stripeAccountId: realm.accountId,
-            financialRealm: realm.financialRealm,
-            customerCreationCommand: digest,
-            customerCreationKey: key,
-          },
-        };
-        const fingerprint = await canonicalDigest(command);
+        const { command, key, fingerprint } = await original(organizationId);
         await sql.run(
           `INSERT OR IGNORE INTO stripe_billing_customer_commands
           (org_id,realm_json,request_json,fingerprint,stripe_key,state,dispatched_at,customer_id,created_at,verified_at)
           VALUES (?,?,?,?,?,'prepared',NULL,NULL,?,NULL)`,
           [
             organizationId,
-            canonicalJson(frozenRealm),
+            canonicalJson(command.realm),
             canonicalJson(command),
             fingerprint,
             key,
@@ -291,17 +418,7 @@ export function createStripeCustomerCustody(options: {
         );
         row = await read(organizationId);
       }
-      if (
-        row === null ||
-        canonicalJson(row.command.realm) !==
-          canonicalJson({
-            accountId: realm.accountId,
-            financialRealm: realm.financialRealm,
-            livemode: false,
-            billingAuthority: realm.billingAuthority,
-          })
-      )
-        fail("conflict");
+      if (row === null) fail("conflict");
       if (row.state === "verified") {
         if (row.customerId === null) fail("conflict");
         return await verifyBound(organizationId, row.customerId);
@@ -319,6 +436,15 @@ export function createStripeCustomerCustody(options: {
         row = (await read(organizationId)) ?? fail("unavailable");
         if (row.state === "verified" && row.customerId !== null)
           return await verifyBound(organizationId, row.customerId);
+      }
+      // Recovery can await the processor. Re-read the same closed custody before
+      // another original-key effect, without deriving authority from a read.
+      const beforePost = await snapshot(organizationId);
+      row = beforePost.receipt ?? fail("conflict");
+      if (beforePost.inspection.binding !== null) {
+        if (row.state !== "verified" || row.customerId !== beforePost.inspection.binding.customerId)
+          fail("reconciliation_required");
+        return await verifyBound(organizationId, beforePost.inspection.binding.customerId);
       }
       if (row.state !== "dispatched" || row.dispatchedAt === null) fail("conflict");
       if (Date.parse(now()) - Date.parse(row.dispatchedAt) >= TOP_UP_UNKNOWN_ACK_CUTOFF_MS)

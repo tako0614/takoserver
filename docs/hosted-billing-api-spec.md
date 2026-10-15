@@ -111,6 +111,38 @@ also accepts `payments:write`. Personal creation does not accept an arbitrary pr
 key impersonation, Hosted session or caller-selected owner. A future delegated
 account bootstrap requires its own reviewed account contract.
 
+### Original Customer custody observations
+
+The internal `createStripeCustomerCustody().inspect(organizationId)` reads the
+Organization, original Customer command and sole Customer binding in one SQL
+snapshot. It returns `{organizationId, command, binding}`. The nullable command
+contains only `state`, `fingerprint`, `createdAt`, `dispatchedAt`, `verifiedAt`
+and `customerId`; the nullable binding contains `customerId` and its stored
+`createdAt`. That historical binding timestamp is SQL text, not proof of command
+chronology. Command timestamps preserve wall-clock readings; their numerical order
+does not determine command state. Returned observations are frozen. Reading does
+not consult the clock, call Stripe, create a command or expose processor keys,
+requests or realm data.
+
+The same closed decoder runs on the actual `ensure` path before effects and
+after recovery. A pending original cannot be abandoned for another Customer
+binding. Customer preparation precedes subscription/top-up intent creation, so
+an absent purchase intent does not establish absent Customer history. Null
+observations describe these local tables only; they do not certify complete
+legacy history or authorize a clear. This source API adds no public HTTP route,
+shared Financial Principal projection or current-payer admission. First-command
+admission against a genuine current payer remains a separate integration contract.
+
+### Metering and on-demand admission
+
+The provider-window metering receiver accepts the valid on-demand admission
+witness produced by the canonical limit policy. It preserves that witness and
+settles eligible existing included/purchased credit under the ledger's existing
+allocation rules. Insufficient credit leaves the original measurement pending;
+this receiver does not issue a fresh cash command. Complete Run/storage evidence,
+its trusted sender and the same-Organization/Workspace binding must still be
+supplied by their owning integration. Postpaid remains disabled.
+
 ## Money, plans and monthly entitlements
 
 Currency is USD. Public amount fields are canonical nonnegative decimal integer
