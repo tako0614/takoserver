@@ -31,8 +31,8 @@ for example `https://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/`:
   `DurableWorkflow 0.3.0`. A partial Worker profile advertises none of these.
   `SQLiteMigrationApplication 0.2.0` is added when a `sqliteMigrationSet` block
   is configured, and `WorkerEndpoint 0.3.0`, which publishes a Worker at an
-  HTTPS hostname, when the listener on TCP 443 is configured; without either,
-  only that Form is absent.
+  HTTPS hostname, when the listener on TCP 443 is configured; without one of
+  them, only that Form is absent.
 
 [Takoform v2 architecture and operator setup](docs/takoform-v2.md) has the
 exact gates, Form map and limits.
@@ -52,8 +52,9 @@ bun --no-env-file src/entry-bun.ts
 
 The public v2 discovery is `/.well-known/takoform/v2`. The Bun HTTP listener
 requires an operator-controlled HTTPS front end for public use; do not expose
-that backend listener directly. The install guide below takes you on to the
-complete Worker profile.
+that backend listener directly.
+[First install and first use](docs/self-host-operations.md#first-install-and-first-use)
+takes you on to the complete Worker profile and a Worker served over HTTPS.
 
 ## Scope
 
