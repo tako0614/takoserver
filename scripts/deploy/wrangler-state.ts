@@ -7,9 +7,11 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -286,6 +288,27 @@ export interface WranglerVersionPublicationLease {
   release(): Promise<void>;
 }
 
+const currentPublicationLeases = new WeakMap<WranglerVersionPublicationLease, () => void>();
+
+/**
+ * Revalidates this exact acquired object's own same-host kernel lease. A status
+ * of "active" can belong to another holder and is not sufficient authority.
+ * Clones/custom leases are deliberately not adopted from their target fields.
+ */
+export function assertWranglerVersionPublicationLeaseCurrent(
+  lease: WranglerVersionPublicationLease,
+): void {
+  const assertion = currentPublicationLeases.get(lease);
+  if (assertion === undefined) throw publicationLeaseLostError();
+  assertion();
+}
+
+function publicationLeaseLostError(): DeployError {
+  return preflightError(
+    "Worker Version publication lease is no longer current for this invocation",
+  );
+}
+
 export interface WranglerVersionPublicationLeaseStatus {
   readonly state: "available" | "active" | "stale-reclaimable" | "unsafe";
   readonly reason:
@@ -325,10 +348,11 @@ export async function acquireWranglerVersionPublicationLease(input: {
   /** Protected custody roots must already exist; never recreate a lost root. */
   readonly createRoot?: boolean;
 }): Promise<WranglerVersionPublicationLease> {
-  if (!ACCOUNT_ID.test(input.accountId) || !WORKER_NAME.test(input.workerName)) {
+  const target = { accountId: input.accountId, workerName: input.workerName };
+  if (!ACCOUNT_ID.test(target.accountId) || !WORKER_NAME.test(target.workerName)) {
     throw preflightError("Worker Version publication lease requires one exact target");
   }
-  const paths = publicationLeasePaths(input);
+  const paths = publicationLeasePaths({ ...input, ...target });
   ensurePrivateLeaseRoot(paths.root, input.createRoot ?? true);
   ensurePrivateLeaseFile(paths.lockPath);
   const holder = Bun.spawn(
@@ -362,9 +386,10 @@ export async function acquireWranglerVersionPublicationLease(input: {
   }
 
   let owner: WranglerVersionPublicationLeaseOwner;
+  let lockDescriptor: string | undefined;
   try {
     const lockIdentity = privateLeaseFileIdentity(paths.lockPath);
-    const previousOwner = readLeaseOwner(paths.ownerPath, lockIdentity, input);
+    const previousOwner = readLeaseOwner(paths.ownerPath, lockIdentity, target);
     if (previousOwner.kind === "unsafe") {
       throw preflightError(
         "Worker Version publication owner record is unsafe and cannot be reclaimed automatically",
@@ -389,8 +414,8 @@ export async function acquireWranglerVersionPublicationLease(input: {
     owner = {
       kind: LEASE_OWNER_KIND,
       ownerId: randomUUID(),
-      accountId: input.accountId,
-      workerName: input.workerName,
+      accountId: target.accountId,
+      workerName: target.workerName,
       bootId: hostBootId(),
       holderPid: holder.pid,
       holderStartTicks,
@@ -405,15 +430,26 @@ export async function acquireWranglerVersionPublicationLease(input: {
     throw preflightError("Worker Version publication lease owner could not be recorded");
   }
   let released = false;
-  return {
-    accountId: input.accountId,
-    workerName: input.workerName,
+  let invalidated = false;
+  let holderExited = false;
+  void holder.exited.then(
+    () => {
+      holderExited = true;
+    },
+    () => {
+      holderExited = true;
+    },
+  );
+  const lease: WranglerVersionPublicationLease = {
+    accountId: target.accountId,
+    workerName: target.workerName,
     async release() {
       if (released) return;
       released = true;
+      currentPublicationLeases.delete(lease);
       try {
         const currentIdentity = privateLeaseFileIdentity(paths.lockPath);
-        const current = readLeaseOwner(paths.ownerPath, currentIdentity, input);
+        const current = readLeaseOwner(paths.ownerPath, currentIdentity, target);
         if (current.kind === "owner" && current.value.ownerId === owner.ownerId) {
           unlinkSync(paths.ownerPath);
           fsyncDirectory(paths.root);
@@ -426,6 +462,98 @@ export async function acquireWranglerVersionPublicationLease(input: {
       await stopLeaseHolder(holder);
     },
   };
+  const assertCurrent = () => {
+    try {
+      if (released || invalidated || holderExited) throw publicationLeaseLostError();
+      if (lease.accountId !== target.accountId || lease.workerName !== target.workerName) {
+        throw publicationLeaseLostError();
+      }
+      assertCapturedLeaseOwner(paths, owner);
+      // Legacy acquire callers do not gain a new proc/fdinfo prerequisite.
+      // The strengthened consumer validates immediately after acquiring, then
+      // every later assertion stays bound to this same captured descriptor.
+      lockDescriptor ??= findOwnKernelLeaseDescriptor(owner);
+      if (!ownKernelLeaseDescriptorMatches(owner, lockDescriptor)) {
+        throw publicationLeaseLostError();
+      }
+      // Close the process/path/sidecar observation around the kernel readback.
+      assertCapturedLeaseOwner(paths, owner);
+      if (holderExited) throw publicationLeaseLostError();
+    } catch {
+      invalidated = true;
+      throw publicationLeaseLostError();
+    }
+  };
+  currentPublicationLeases.set(lease, assertCurrent);
+  return lease;
+}
+
+function assertCapturedLeaseOwner(
+  paths: { readonly root: string; readonly lockPath: string; readonly ownerPath: string },
+  owner: WranglerVersionPublicationLeaseOwner,
+): void {
+  ensurePrivateLeaseRoot(paths.root, false);
+  const identity = privateLeaseFileIdentity(paths.lockPath);
+  if (identity.device !== owner.lockDevice || identity.inode !== owner.lockInode) {
+    throw publicationLeaseLostError();
+  }
+  const current = readLeaseOwner(paths.ownerPath, identity, owner);
+  if (
+    current.kind !== "owner" ||
+    !Object.keys(owner).every((key) => {
+      const field = key as keyof WranglerVersionPublicationLeaseOwner;
+      return current.value[field] === owner[field];
+    }) ||
+    owner.bootId !== hostBootId()
+  ) {
+    throw publicationLeaseLostError();
+  }
+  const processIdentity = procProcessIdentity(owner.holderPid);
+  if (
+    processIdentity === null ||
+    processIdentity.startTicks !== owner.holderStartTicks ||
+    !["R", "S", "D", "T", "t", "W", "P", "I"].includes(processIdentity.state)
+  ) {
+    throw publicationLeaseLostError();
+  }
+}
+
+function findOwnKernelLeaseDescriptor(owner: WranglerVersionPublicationLeaseOwner): string {
+  const descriptors = readdirSync(`/proc/${owner.holderPid}/fdinfo`);
+  if (descriptors.length > 64) throw publicationLeaseLostError();
+  const matches = descriptors.filter(
+    (descriptor) => /^\d+$/u.test(descriptor) && ownKernelLeaseDescriptorMatches(owner, descriptor),
+  );
+  if (matches.length !== 1 || matches[0] === undefined) throw publicationLeaseLostError();
+  return matches[0];
+}
+
+function ownKernelLeaseDescriptorMatches(
+  owner: WranglerVersionPublicationLeaseOwner,
+  descriptor: string,
+): boolean {
+  const descriptorPath = `/proc/${owner.holderPid}/fd/${descriptor}`;
+  const before = statSync(descriptorPath, { bigint: true });
+  if (String(before.dev) !== owner.lockDevice || String(before.ino) !== owner.lockInode) {
+    return false;
+  }
+  const info = readFileSync(`/proc/${owner.holderPid}/fdinfo/${descriptor}`, "utf8");
+  if (info.length > 16_384) return false;
+  const locks = info.split("\n").filter((line) => line.startsWith("lock:"));
+  if (locks.length !== 1) return false;
+  const match =
+    /^lock:\s+\d+:\s+FLOCK\s+ADVISORY\s+WRITE\s+([1-9]\d*)\s+([0-9a-f]+):([0-9a-f]+):([1-9]\d*)\s+0\s+EOF$/u.exec(
+      locks[0] ?? "",
+    );
+  if (match === null || match[1] !== String(owner.holderPid) || match[4] !== owner.lockInode) {
+    return false;
+  }
+  const device = BigInt(owner.lockDevice);
+  const major = ((device >> 8n) & 0xfffn) | ((device >> 32n) & 0xfffff000n);
+  const minor = (device & 0xffn) | ((device >> 12n) & 0xffffff00n);
+  if (BigInt(`0x${match[2]}`) !== major || BigInt(`0x${match[3]}`) !== minor) return false;
+  const after = statSync(descriptorPath, { bigint: true });
+  return before.dev === after.dev && before.ino === after.ino && after.isFile();
 }
 
 export function inspectWranglerVersionPublicationLease(input: {
@@ -660,6 +788,12 @@ function hostBootId(): string {
 }
 
 function procProcessStartTicks(pid: number): string | null {
+  return procProcessIdentity(pid)?.startTicks ?? null;
+}
+
+function procProcessIdentity(
+  pid: number,
+): { readonly startTicks: string; readonly state: string } | null {
   let value: string;
   try {
     value = readFileSync(`/proc/${pid}/stat`, "utf8");
@@ -679,7 +813,11 @@ function procProcessStartTicks(pid: number): string | null {
   if (startTicks === undefined || !PROCESS_START_TICKS.test(startTicks)) {
     throw preflightError("Worker Version publication process identity is malformed");
   }
-  return startTicks;
+  const state = fields[0];
+  if (state === undefined || !/^[A-Za-z]$/u.test(state)) {
+    throw preflightError("Worker Version publication process state is malformed");
+  }
+  return { startTicks, state };
 }
 
 function leaseOwnerProcessState(owner: WranglerVersionPublicationLeaseOwner): "active" | "stale" {
