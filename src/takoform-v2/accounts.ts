@@ -1,4 +1,5 @@
 import { type Accounts, AuthError, grants } from "../auth.ts";
+import { requestAuthorization } from "../request-authorization.ts";
 import type { TakoformV2HttpPrincipal } from "./routes.ts";
 
 /**
@@ -8,13 +9,14 @@ import type { TakoformV2HttpPrincipal } from "./routes.ts";
  */
 export function createTakoformV2AccountAccess(
   accounts: Pick<Accounts, "authenticate" | "requireOwner">,
+  consoleOrigin?: string,
 ): {
   authenticate(request: Request): Promise<TakoformV2HttpPrincipal | null>;
   authorize(principal: string, space: string, access: "read" | "write"): Promise<boolean>;
 } {
   return {
     async authenticate(request) {
-      const actor = await accounts.authenticate(request.headers.get("authorization"));
+      const actor = await accounts.authenticate(requestAuthorization(request, consoleOrigin));
       if (!actor) return null;
 
       let organizationId: string;
