@@ -345,20 +345,22 @@ function table(resources: readonly ResourceSummary[]): Child {
   }
   return h(
     "table",
-    { class: "resource-table" },
+    // Explicit roles keep the table announced as a table where a browser
+    // drops native semantics for the stacked phone layout.
+    { class: "resource-table", role: "table" },
     h(
       "thead",
-      null,
+      { role: "rowgroup" },
       h(
         "tr",
-        null,
-        h("th", null, tr("状態", "State")),
-        h("th", null, tr("名前", "Name")),
-        h("th", null, "Form"),
-        h("th", null, tr("観測", "Observed")),
+        { role: "row" },
+        h("th", { role: "columnheader" }, tr("状態", "State")),
+        h("th", { role: "columnheader" }, tr("名前", "Name")),
+        h("th", { role: "columnheader" }, "Form"),
+        h("th", { role: "columnheader" }, tr("観測", "Observed")),
       ),
     ),
-    h("tbody", null, ...resources.map((entry) => row(entry))),
+    h("tbody", { role: "rowgroup" }, ...resources.map((entry) => row(entry))),
   );
 }
 
@@ -369,6 +371,7 @@ function row(entry: ResourceSummary): Child {
     "tr",
     {
       class: "is-clickable",
+      role: "row",
       // The row is a shortcut; the name is the link. A click that lands on a
       // control inside the row belongs to that control, not to the row.
       onClick: (event: MouseEvent) => {
@@ -379,7 +382,7 @@ function row(entry: ResourceSummary): Child {
     },
     h(
       "td",
-      { class: "resource-state" },
+      { class: "resource-state", role: "cell" },
       badge(phaseLabel(state.phase), state.tone, true),
       state.stale
         ? h("span", { style: { marginLeft: "6px" } }, badge(tr("変更あり", "changed"), "accent"))
@@ -391,13 +394,18 @@ function row(entry: ResourceSummary): Child {
     // wraps; on a phone each row stacks so the URL gets the full width.
     h(
       "td",
-      { class: "resource-name" },
+      { class: "resource-name", role: "cell" },
       h("a", { class: "mono truncate", title: entry.name, ...linkProps(href) }, entry.name),
     ),
-    h("td", { class: "resource-form dim mono" }, entry.form),
+    h("td", { class: "resource-form dim mono", role: "cell" }, entry.form),
     h(
       "td",
-      { class: "resource-observed dim", title: entry.observedAt ?? "" },
+      {
+        class: "resource-observed dim",
+        role: "cell",
+        title: entry.observedAt ?? "",
+        "data-label": tr("観測", "Observed"),
+      },
       entry.observedAt ? ago(entry.observedAt) : "—",
     ),
   );

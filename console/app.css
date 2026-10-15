@@ -543,6 +543,11 @@ tbody tr.is-clickable:hover {
     grid-area: observed;
     font-size: 12px;
   }
+
+  /* The column headers are hidden here, so the time says what it is. */
+  .resource-table .resource-observed::before {
+    content: attr(data-label) " · ";
+  }
 }
 
 .badge {
