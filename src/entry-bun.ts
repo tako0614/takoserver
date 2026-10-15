@@ -12,7 +12,10 @@ import {
   prepareSelfhostV2PrivatePlaneRoots,
 } from "./entry-v2-private-plane-boot.ts";
 import { parseSelfhostV2WorkerEndpointHttpsSelection } from "./entry-v2-worker-endpoint-boot.ts";
-import { createCanonicalHostedBillingComposition } from "./hosted-billing-composition.ts";
+import {
+  createCanonicalHostedBillingComposition,
+  type HostedOnDemandConfiguration,
+} from "./hosted-billing-composition.ts";
 import { verifyHostedBillingFinancialRealm } from "./hosted-billing-realm.ts";
 import { assertHostedPricingMatchesBilling, parseHostedPricing } from "./hosted-pricing.ts";
 import { resolveIdentity } from "./identity-setup.ts";
@@ -34,6 +37,7 @@ import {
   signOperatorAssertion,
 } from "./operator-key.ts";
 import { assertOrgBillingSchema } from "./org-billing.ts";
+import { parseOrgOnDemandTerms } from "./org-on-demand-terms.ts";
 import { paymentSettingsFromEnvironment } from "./payment-settings.ts";
 import { resolvePayment } from "./payment-setup.ts";
 import { createOpenAiGateway, parseOpenAiModelConfig } from "./providers/openai.ts";
@@ -156,6 +160,7 @@ import {
   RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN,
   resolveStandaloneProviderMode,
 } from "./standalone-provider-composition.ts";
+import { parseStrictJson } from "./strict-json.ts";
 import { assertStripeBillingSchema } from "./stripe-billing.ts";
 import { createStripeBillingClient } from "./stripe-billing-client.ts";
 import { assertStripeModeRealm, parseStripeMode } from "./stripe-mode-realm.ts";
@@ -263,6 +268,69 @@ if (
   throw new TypeError("TAKOSERVER_HOSTED_BILLING must be canonical-test or absent");
 }
 const canonicalHostedBilling = hostedBillingSelection === "canonical-test";
+
+function parseHostedOnDemandEnvironment(
+  raw: string | undefined,
+  canonicalHostedBilling: boolean,
+): HostedOnDemandConfiguration | undefined {
+  if (raw === undefined) return undefined;
+  if (!canonicalHostedBilling) {
+    throw new TypeError("TAKOSERVER_HOSTED_BILLING_ON_DEMAND requires canonical-test");
+  }
+  try {
+    if (typeof raw !== "string") throw new TypeError();
+    const bytes = new TextEncoder().encode(raw);
+    const value = parseStrictJson(bytes, bytes.byteLength);
+    if (typeof value !== "object" || value === null || Array.isArray(value)) throw new TypeError();
+    const fields = value as Record<string, unknown>;
+    if (
+      Object.keys(fields).length !== 3 ||
+      !["terms", "cardSetupReturnUrls", "setupDisclosureRevision"].every((key) =>
+        Object.hasOwn(fields, key),
+      ) ||
+      typeof fields.setupDisclosureRevision !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(fields.setupDisclosureRevision)
+    )
+      throw new TypeError();
+    const terms = parseOrgOnDemandTerms(fields.terms);
+    const urls = fields.cardSetupReturnUrls;
+    if (typeof urls !== "object" || urls === null || Array.isArray(urls)) throw new TypeError();
+    const returns = urls as Record<string, unknown>;
+    if (
+      Object.keys(returns).length !== 2 ||
+      !["successUrl", "cancelUrl"].every((key) => Object.hasOwn(returns, key))
+    )
+      throw new TypeError();
+    const returnUrl = (value: unknown): string => {
+      if (typeof value !== "string" || value.length > 2048) throw new TypeError();
+      const parsed = new URL(value);
+      if (
+        parsed.protocol !== "https:" ||
+        parsed.username ||
+        parsed.password ||
+        parsed.hash ||
+        [...parsed.searchParams.keys()].some((key) => /secret|token/iu.test(key))
+      )
+        throw new TypeError();
+      return value;
+    };
+    const successUrl = returnUrl(returns.successUrl);
+    const cancelUrl = returnUrl(returns.cancelUrl);
+    if (new URL(successUrl).origin !== new URL(cancelUrl).origin) throw new TypeError();
+    return Object.freeze({
+      terms,
+      cardSetupReturnUrls: Object.freeze({ successUrl, cancelUrl }),
+      setupDisclosureRevision: fields.setupDisclosureRevision,
+    });
+  } catch {
+    throw new TypeError("TAKOSERVER_HOSTED_BILLING_ON_DEMAND must be complete valid JSON");
+  }
+}
+
+const hostedOnDemandConfiguration = parseHostedOnDemandEnvironment(
+  process.env.TAKOSERVER_HOSTED_BILLING_ON_DEMAND,
+  canonicalHostedBilling,
+);
 const v2RuntimeSelection = parseSelfhostV2RuntimeBoot(
   process.env.TAKOSERVER_V2_WORKER_RUNTIME_BOOT,
 );
@@ -440,6 +508,9 @@ const canonicalHostedInputs = canonicalHostedBilling
         consoleOrigin,
         webhookSecret,
         settings: Object.freeze(settings),
+        ...(hostedOnDemandConfiguration === undefined
+          ? {}
+          : { onDemand: hostedOnDemandConfiguration }),
       };
     })()
   : undefined;
@@ -1457,6 +1528,9 @@ try {
         consoleOrigin: canonicalHostedInputs.consoleOrigin,
         webhookSecret: canonicalHostedInputs.webhookSecret,
         settings: canonicalHostedInputs.settings,
+        ...(canonicalHostedInputs.onDemand === undefined
+          ? {}
+          : { onDemand: canonicalHostedInputs.onDemand }),
         warnings: { state: "unavailable", reason: "transport-not-composed" },
       })
     : undefined;

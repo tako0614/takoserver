@@ -21,6 +21,7 @@ import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { openApiDocument } from "../src/openapi.ts";
 import { createOrgBilling } from "../src/org-billing.ts";
 import { createOrgLimitPolicy, OrgLimitPolicyError } from "../src/org-limit-policy.ts";
+import { parseOrgOnDemandTerms } from "../src/org-on-demand-terms.ts";
 import {
   createOrgTopUps,
   OrgTopUpError,
@@ -30,6 +31,7 @@ import {
 import { OrgWorkspaceUsageError } from "../src/org-workspace-usage.ts";
 import type { Sql } from "../src/ports.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
+import { StripeCardSetupError, type StripeCardSetupReceipt } from "../src/stripe-card-setup.ts";
 import { SubscriptionPlanChangeError } from "../src/stripe-subscription-plan-change.ts";
 import {
   SUBSCRIPTION_COMMAND_RECEIPT_VERSION,
@@ -677,6 +679,9 @@ test("limit policy denies scopes before JSON and rejects unavailable modes witho
           onLimit,
           cashCapMinor: 1000,
           consentRevision: "reviewed-v1",
+          ...(onLimit === "on-demand"
+            ? { termsRevision: "reviewed-terms-v1", paymentMethodId: "pm_existing_card" }
+            : {}),
         })
       ).status,
     ).toBe(409);
@@ -686,6 +691,247 @@ test("limit policy denies scopes before JSON and rejects unavailable modes witho
   expect(
     await f.sql.query("SELECT COUNT(*) AS count FROM org_wallet_limit_policy_commands"),
   ).toEqual([{ count: 0 }]);
+});
+
+test("on-demand HTTP routes authenticate before capability lookup or body parsing", async () => {
+  const f = await fixture();
+  for (const [method, suffix, denied] of [
+    ["GET", "terms", "payer"],
+    ["GET", "card-setup/original", "payer"],
+    ["POST", "card-setup", "reader"],
+  ] as const) {
+    const path = `${f.wallet}/on-demand/${suffix}`;
+    for (const token of [undefined, "foreign", denied]) {
+      const response = await f.request(method, path, token, method === "POST" ? "{" : undefined);
+      expect(response.status).toBe(token === undefined ? 401 : 403);
+      expect(response.headers.get("cache-control")).toBe("private, no-store");
+      expect(response.headers.get("x-content-type-options")).toBe("nosniff");
+    }
+    const response = await f.request(method, path, method === "POST" ? "payer" : "reader");
+    expect(response.status).toBe(404);
+  }
+  expect(f.remoteCalls).toEqual([]);
+});
+
+test("on-demand terms disclose the explicit rule without granting consent", async () => {
+  const f = await fixture();
+  const terms = parseOrgOnDemandTerms({
+    termsRevision: "terms-api:v1",
+    consentRevision: "consent-api:v1",
+    currency: "USD",
+    validity: { validFrom: "2026-10-01T00:00:00.000Z", validUntil: "2026-12-01T00:00:00.000Z" },
+    replenishment: {
+      trigger: "eligible-credit-deficit",
+      rule: "ceil-deficit-to-quantum-with-minimum",
+      fundingQuantumMinor: 50,
+      minimumChargeMinor: 50,
+      maximumChargeMinor: 500,
+    },
+    cashCapBounds: { minimumMinor: 50, maximumMinor: 5000 },
+    purchaseCreditExpiry: { kind: "none" },
+  });
+  let reads = 0;
+  const route = f.makeRoute({
+    setupDisclosureRevision: "setup-api:v1",
+    onDemand: {
+      readTerms() {
+        reads++;
+        return terms;
+      },
+    },
+  });
+  expect(
+    (await f.request("GET", `${f.wallet}/on-demand/terms`, "foreign", undefined, route)).status,
+  ).toBe(403);
+  expect(reads).toBe(0);
+  const response = await f.request(
+    "GET",
+    `${f.wallet}/on-demand/terms`,
+    "reader",
+    undefined,
+    route,
+  );
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ terms, setupDisclosureRevision: "setup-api:v1" });
+  expect(reads).toBe(1);
+  expect(response.headers.get("cache-control")).toBe("private, no-store");
+  expect(await f.sql.query("SELECT COUNT(*) AS n FROM org_wallet_limit_policy_commands")).toEqual([
+    { n: 0 },
+  ]);
+});
+
+test("on-demand HTTP accepts published colon revisions and binds the payment principal", async () => {
+  const f = await fixture();
+  const policy = f.base.limitPolicy;
+  if (!policy) throw new Error("fixture policy missing");
+  const changes: unknown[] = [];
+  const route = f.makeRoute({
+    limitPolicy: {
+      ...policy,
+      async change(input) {
+        changes.push(input);
+        return await policy.read(input.organizationId);
+      },
+    },
+  });
+  const body = {
+    reference: "consent:original",
+    onLimit: "on-demand",
+    cashCapMinor: 500,
+    consentRevision: "consent-api:v1",
+    termsRevision: "terms-api:v1",
+    paymentMethodId: "pm_registered",
+    setupIntentId: "seti_registered",
+  };
+  expect((await f.request("PATCH", `${f.wallet}/limit-policy`, "reader", body, route)).status).toBe(
+    403,
+  );
+  expect(changes).toEqual([]);
+  expect((await f.request("PATCH", `${f.wallet}/limit-policy`, "payer", body, route)).status).toBe(
+    200,
+  );
+  expect(changes).toEqual([
+    { ...body, organizationId: f.org, authorizedPrincipal: expect.stringMatching(/^[^:]+:.+$/u) },
+  ]);
+  expect(await f.sql.query("SELECT COUNT(*) AS n FROM org_wallet_limit_policy_commands")).toEqual([
+    { n: 0 },
+  ]);
+});
+
+test("only card setup begin exposes transient actions and the completed card selector", async () => {
+  const f = await fixture();
+  const originals = new Set<string>();
+  const calls: { operation: string; input?: unknown }[] = [];
+  let verified = false;
+  const receipt = (reference: string): StripeCardSetupReceipt => ({
+    reference,
+    state: verified ? "succeeded" : "original-known",
+    setupDisclosureRevision: "setup-api:v1",
+    sessionExpired: false,
+    observedAt: START,
+  });
+  const cardSetup: NonNullable<CreateControlRoutesOptions["cardSetup"]> = {
+    async begin(input) {
+      calls.push({ operation: "begin", input });
+      originals.add(input.reference);
+      return {
+        receipt: { ...receipt(input.reference), client_secret: "test_only_private" },
+        checkout: verified ? null : { url: URL, internal: "not_public" },
+      };
+    },
+    async read(organizationId, reference) {
+      expect(organizationId).toBe(f.org);
+      calls.push({ operation: "read" });
+      return originals.has(reference)
+        ? { ...receipt(reference), url: URL, client_secret: "test_only_private" }
+        : null;
+    },
+    async recoverOriginal() {
+      throw new Error("GET route must not invoke recovery");
+    },
+    async readSelection(organizationId) {
+      return verified
+        ? {
+            organizationId,
+            customerId: "cus_private",
+            paymentMethodId: "pm_registered",
+            setupIntentId: "seti_registered",
+          }
+        : null;
+    },
+  };
+  const route = f.makeRoute({ cardSetup, setupDisclosureRevision: "setup-api:v1" });
+  const path = `${f.wallet}/on-demand/card-setup`;
+  expect((await f.request("POST", path, "foreign", "{", route)).status).toBe(403);
+  expect((await f.request("POST", path, "reader", "{", route)).status).toBe(403);
+  expect(calls).toEqual([]);
+  expect(
+    (
+      await f.request(
+        "POST",
+        path,
+        "payer",
+        { reference: "card", setupDisclosureRevision: "stale" },
+        route,
+      )
+    ).status,
+  ).toBe(409);
+  expect(calls.filter((call) => call.operation === "begin")).toHaveLength(0);
+  calls.length = 0;
+  const body = { reference: "card", setupDisclosureRevision: "setup-api:v1" };
+  const begin = await f.request("POST", path, "payer", body, route);
+  expect(begin.status).toBe(200);
+  expect(await begin.json()).toEqual({
+    receipt: receipt("card"),
+    checkout: { url: URL },
+    selection: null,
+  });
+  expect(calls.find((call) => call.operation === "begin")?.input).toMatchObject({
+    organizationId: f.org,
+    reference: "card",
+    setupDisclosureRevision: "setup-api:v1",
+    authorizedPrincipal: expect.stringMatching(/^[^:]+:.+$/u),
+  });
+  verified = true;
+  calls.length = 0;
+  const read = await f.request("GET", `${path}/card`, "reader", undefined, route);
+  expect(await read.json()).toEqual({ cardSetup: receipt("card") });
+  expect(calls).toEqual([{ operation: "read" }]);
+  const replay = await f.request("POST", path, "payer", body, route);
+  expect(await replay.json()).toEqual({
+    receipt: receipt("card"),
+    checkout: null,
+    selection: { paymentMethodId: "pm_registered", setupIntentId: "seti_registered" },
+  });
+  expect(replay.headers.get("cache-control")).toBe("private, no-store");
+  const changed = await f.request(
+    "POST",
+    path,
+    "payer",
+    { ...body, authorizedPrincipal: "caller" },
+    route,
+  );
+  expect(changed.status).toBe(400);
+});
+
+test("original card setup disclosure survives publication of a new revision", async () => {
+  const f = await fixture();
+  const receipt: StripeCardSetupReceipt = {
+    reference: "old",
+    state: "pending",
+    setupDisclosureRevision: "old-disclosure",
+    sessionExpired: false,
+    observedAt: null,
+  };
+  const cardSetup: NonNullable<CreateControlRoutesOptions["cardSetup"]> = {
+    async read() {
+      return receipt;
+    },
+    async begin(input) {
+      expect(input.setupDisclosureRevision).toBe("old-disclosure");
+      return { receipt, checkout: null };
+    },
+    async readSelection() {
+      return null;
+    },
+    async recoverOriginal() {
+      throw new Error("unexpected recovery");
+    },
+  };
+  const route = f.makeRoute({ cardSetup, setupDisclosureRevision: "new-disclosure" });
+  const response = await f.request(
+    "POST",
+    `${f.wallet}/on-demand/card-setup`,
+    "payer",
+    { reference: "old", setupDisclosureRevision: "old-disclosure" },
+    route,
+  );
+  expect(response.status).toBe(200);
+  const failure = controlErrorResponse(new StripeCardSetupError("reconciliation_required"));
+  expect(failure.status).toBe(503);
+  expect(await failure.json()).toMatchObject({
+    error: { code: "billing_unavailable", retryable: false },
+  });
 });
 
 function hold(reference: string, workspaceRef: string, amountMicros = "100") {
@@ -1739,7 +1985,7 @@ test("OpenAPI publishes actual optional Hosted DTOs and exclusive receipt states
   ]);
   expect(schemas.WalletWorkspaceUsageResponse.required).toContain("usageSummary");
   expect(schemas.WalletWorkspaceUsageResponse.properties.totalsScope.const).toBe("organization");
-  expect(schemas.ChangeWalletLimitPolicyRequest.oneOf).toHaveLength(2);
+  expect(schemas.ChangeWalletLimitPolicyRequest.oneOf).toHaveLength(3);
   expect(schemas.ChangeSubscriptionRequest.properties.cancelAtPeriodEnd.const).toBe(true);
   expect(schemas.SubscriptionPlanChangeRequest.required).toContain("expectedSubscriptionRef");
   expect(schemas.WalletHoldReceipt.properties).toHaveProperty("workspaceRef");

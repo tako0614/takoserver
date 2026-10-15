@@ -240,6 +240,21 @@ export const ROUTES: readonly RouteDeclaration[] = [
     operation: "readWalletLimitPolicy",
   },
   {
+    method: "get",
+    pattern: "/v1/organizations/{organizationId}/wallet/on-demand/terms",
+    operation: "readWalletOnDemandTerms",
+  },
+  {
+    method: "post",
+    pattern: "/v1/organizations/{organizationId}/wallet/on-demand/card-setup",
+    operation: "beginWalletCardSetup",
+  },
+  {
+    method: "get",
+    pattern: "/v1/organizations/{organizationId}/wallet/on-demand/card-setup/{reference}",
+    operation: "readWalletCardSetup",
+  },
+  {
     method: "patch",
     pattern: "/v1/organizations/{organizationId}/wallet/limit-policy",
     operation: "changeWalletLimitPolicy",

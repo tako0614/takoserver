@@ -27,6 +27,7 @@ import {
   type OrgLimitPolicy,
   type OrgUsageWarningTransport,
 } from "./org-limit-policy.ts";
+import { type OrgOnDemandTerms, parseOrgOnDemandTerms } from "./org-on-demand-terms.ts";
 import { assertOrgTopUpSchema, createOrgTopUps, OrgTopUpError } from "./org-top-up.ts";
 import { workspaceAttributionSchemaReady } from "./org-workspace-usage.ts";
 import type { PaymentEventContext, PaymentEvents } from "./payment-events.ts";
@@ -38,11 +39,18 @@ import {
 import type { Clock, Sql } from "./ports.ts";
 import { assertStripeBillingSchema, createStripeBilling } from "./stripe-billing.ts";
 import type { StripeBillingClient } from "./stripe-billing-client.ts";
+import { createStripeBillingStore, type StripeBillingStore } from "./stripe-billing-store.ts";
+import { assertStripeCardSetupSchema, createStripeCardSetup } from "./stripe-card-setup.ts";
 import {
   assertStripeCustomerCustodySchema,
   createStripeCustomerCustody,
 } from "./stripe-customer-custody.ts";
 import { createStripeEvents } from "./stripe-events.ts";
+import {
+  assertStripeOnDemandService,
+  createStripeOnDemand,
+  type StripeOnDemandService,
+} from "./stripe-on-demand.ts";
 import {
   checkoutSessionFunding,
   type StripeClient,
@@ -68,6 +76,56 @@ const PAYMENT_PREREQUISITES = Object.freeze([
 interface HostedBillingStatusBase {
   readonly launchReady: false;
   readonly warningDelivery: "configured" | "unavailable";
+  readonly onDemand: boolean;
+  readonly cardSetup: boolean;
+  readonly postpaid: false;
+}
+
+export interface HostedOnDemandConfiguration {
+  readonly terms: unknown;
+  readonly cardSetupReturnUrls: {
+    readonly successUrl: string;
+    readonly cancelUrl: string;
+  };
+  readonly setupDisclosureRevision: string;
+}
+
+function resolveOnDemandConfiguration(value: HostedOnDemandConfiguration): {
+  readonly terms: OrgOnDemandTerms;
+  readonly cardSetupReturnUrls: HostedOnDemandConfiguration["cardSetupReturnUrls"];
+  readonly setupDisclosureRevision: string;
+} {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(value)) ||
+    Reflect.ownKeys(value).length !== 3 ||
+    ["terms", "cardSetupReturnUrls", "setupDisclosureRevision"].some((key) => {
+      const property = Object.getOwnPropertyDescriptor(value, key);
+      return !property || !("value" in property);
+    })
+  )
+    throw new TypeError("Hosted on-demand configuration must be explicit");
+  const terms = parseOrgOnDemandTerms(value.terms);
+  const urls = value.cardSetupReturnUrls;
+  if (
+    !urls ||
+    typeof urls !== "object" ||
+    ![Object.prototype, null].includes(Object.getPrototypeOf(urls)) ||
+    Reflect.ownKeys(urls).length !== 2 ||
+    ["successUrl", "cancelUrl"].some((key) => {
+      const property = Object.getOwnPropertyDescriptor(urls, key);
+      return !property || !("value" in property) || typeof property.value !== "string";
+    }) ||
+    typeof value.setupDisclosureRevision !== "string" ||
+    !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(value.setupDisclosureRevision)
+  )
+    throw new TypeError("Hosted card setup disclosure and return URLs must be explicit");
+  return Object.freeze({
+    terms,
+    cardSetupReturnUrls: Object.freeze({ successUrl: urls.successUrl, cancelUrl: urls.cancelUrl }),
+    setupDisclosureRevision: value.setupDisclosureRevision,
+  });
 }
 
 export type HostedBillingStatus = HostedBillingStatusBase &
@@ -96,6 +154,9 @@ interface HostedBillingCompositionBase {
   readonly [compositionBrand]: true;
   readonly limitPolicy: OrgLimitPolicy;
   readonly status: HostedBillingStatus;
+  readonly onDemand?: StripeOnDemandService;
+  readonly cardSetup?: ReturnType<typeof createStripeCardSetup>;
+  readonly setupDisclosureRevision?: string;
   dispatchWarnings(limit?: number): Promise<number>;
 }
 
@@ -124,6 +185,13 @@ const origins = new WeakMap<
     readonly sql: Sql;
     readonly clock: Clock;
     readonly config: string;
+    readonly onDemand?: StripeOnDemandService;
+    readonly cardSetup?: ReturnType<typeof createStripeCardSetup>;
+    readonly setupDisclosureRevision?: string;
+    readonly onDemandConfiguration?: string;
+    readonly client?: StripeBillingClient;
+    readonly realm?: HostedBillingFinancialRealm;
+    readonly store?: StripeBillingStore;
   }
 >();
 
@@ -183,6 +251,9 @@ export async function createHostedBillingComposition(options: {
     subscriptionPlanChange: false,
     paymentPrerequisites: PAYMENT_PREREQUISITES,
     warningDelivery: transport === undefined ? "unavailable" : "configured",
+    onDemand: false,
+    cardSetup: false,
+    postpaid: false,
   });
   const bundle = Object.freeze({
     paymentActivation: false,
@@ -213,11 +284,26 @@ export function assertHostedBillingComposition(
     origin.sql !== context.sql ||
     origin.clock !== context.clock ||
     context.billingConfig === undefined ||
-    origin.config !== canonicalJson(context.billingConfig)
+    origin.config !== canonicalJson(context.billingConfig) ||
+    origin.onDemand !== composition.onDemand ||
+    origin.cardSetup !== composition.cardSetup ||
+    origin.setupDisclosureRevision !== composition.setupDisclosureRevision
   ) {
     throw new TypeError(
       "Hosted billing composition does not belong to this app SQL, clock and tariff",
     );
+  }
+  if (composition.onDemand) {
+    if (!origin.client || !origin.realm || !origin.store || !origin.onDemandConfiguration)
+      throw new TypeError("Hosted on-demand origin is unavailable");
+    assertStripeOnDemandService(composition.onDemand, {
+      sql: context.sql,
+      clock: context.clock,
+      billingConfig: context.billingConfig,
+      client: origin.client,
+      realm: origin.realm,
+      store: origin.store,
+    });
   }
 }
 
@@ -239,9 +325,13 @@ export async function createCanonicalHostedBillingComposition(options: {
   readonly settings?: PaymentSettings;
   /** Operator launch flag; defaults off until owner approval and qualified execution. */
   readonly postpaidEnabled?: boolean | undefined;
+  /** Explicit operator terms and card return flow; absence keeps fresh charging disabled. */
+  readonly onDemand?: HostedOnDemandConfiguration;
 }): Promise<HostedBillingComposition> {
   const postpaidEnabled = options.postpaidEnabled;
   assertOrgPostpaidLaunchGate(postpaidEnabled);
+  const onDemandConfiguration =
+    options.onDemand === undefined ? undefined : resolveOnDemandConfiguration(options.onDemand);
   assertHostedPricingMatchesBilling(options.pricing, options.billingConfig);
   const { sql, clock, client, realm, consoleOrigin } = options;
   const pricing = parseHostedPricing(options.pricing.environment.TAKOSERVER_HOSTED_PRICING);
@@ -289,6 +379,41 @@ export async function createCanonicalHostedBillingComposition(options: {
   await assertHostedSubscriptionAdapterSchema(sql);
   await assertStripeCustomerCustodySchema(sql);
   await assertOrgTopUpSchema(sql);
+  const store = createStripeBillingStore({ sql, clock });
+  const cardSetup =
+    onDemandConfiguration === undefined
+      ? undefined
+      : createStripeCardSetup({
+          sql,
+          clock,
+          client,
+          realm,
+          explicitReturnUrls: onDemandConfiguration.cardSetupReturnUrls,
+        });
+  if (cardSetup) await assertStripeCardSetupSchema(sql);
+  const onDemand =
+    onDemandConfiguration === undefined
+      ? undefined
+      : await createStripeOnDemand({
+          sql,
+          clock,
+          client,
+          realm,
+          store,
+          billingConfig,
+          terms: onDemandConfiguration.terms,
+        });
+  const limitPolicy =
+    onDemand === undefined
+      ? local.limitPolicy
+      : Object.freeze(
+          createOrgLimitPolicy({
+            sql,
+            clock,
+            postpaidEnabled,
+            onDemand,
+          }),
+        );
   const customerCustody = createStripeCustomerCustody({ sql, clock, client, realm });
   const topUps = createOrgTopUps({
     sql,
@@ -365,10 +490,20 @@ export async function createCanonicalHostedBillingComposition(options: {
     subscriptionPlanChange: true,
     paymentPrerequisites: Object.freeze([]) as readonly [],
     warningDelivery: local.status.warningDelivery,
+    onDemand: onDemand !== undefined,
+    cardSetup: cardSetup !== undefined,
+    postpaid: false,
   });
   const bundle = Object.freeze({
-    limitPolicy: local.limitPolicy,
+    limitPolicy,
     dispatchWarnings: local.dispatchWarnings.bind(local),
+    ...(onDemand === undefined ? {} : { onDemand }),
+    ...(cardSetup === undefined ? {} : { cardSetup }),
+    ...(onDemandConfiguration === undefined
+      ? {}
+      : {
+          setupDisclosureRevision: onDemandConfiguration.setupDisclosureRevision,
+        }),
     status,
     paymentActivation: true,
     settlement,
@@ -383,6 +518,9 @@ export async function createCanonicalHostedBillingComposition(options: {
         consoleOrigin,
         mode: "test",
         realm,
+        store,
+        ...(onDemand === undefined ? {} : { onDemand }),
+        ...(cardSetup === undefined ? {} : { cardSetup }),
         topUpCommandForSession: topUps.commandForSession.bind(topUps),
         ensureCustomer: customerCustody.ensure.bind(customerCustody),
         subscriptionExtensions: (context) => createHostedSubscriptionAdapter({ context, realm }),
@@ -432,6 +570,17 @@ export async function createCanonicalHostedBillingComposition(options: {
     sql,
     clock,
     config: canonicalJson(billingConfig),
+    ...(onDemand === undefined ? {} : { onDemand }),
+    ...(cardSetup === undefined ? {} : { cardSetup }),
+    ...(onDemandConfiguration === undefined
+      ? {}
+      : {
+          setupDisclosureRevision: onDemandConfiguration.setupDisclosureRevision,
+          onDemandConfiguration: canonicalJson(onDemandConfiguration),
+        }),
+    client,
+    realm,
+    store,
   });
   return bundle;
 }

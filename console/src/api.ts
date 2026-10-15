@@ -64,6 +64,14 @@ export interface Wallet {
   readonly entries: readonly LedgerEntry[];
 }
 
+export interface WalletUsageSummary {
+  readonly organizationId: string;
+  readonly currency: "USD";
+  readonly unit: "USD-micros";
+  readonly effectiveIncludedMicros: string;
+  readonly utilizationBasisPoints: number;
+}
+
 export type HostedPlanTable = HostedPricing["hostedPlanTable"];
 
 export interface HostedSubscriptionProjection {
@@ -204,6 +212,19 @@ export interface ApiOptions {
 }
 
 const MAX_SAFE_MICROS = BigInt(Number.MAX_SAFE_INTEGER);
+
+/** The server's basis points express included usage, including outstanding holds. */
+export function formatUsagePercent(value: number, locale: "en-US" | "ja-JP" = "en-US"): string {
+  return new Intl.NumberFormat(locale, { style: "percent", maximumFractionDigits: 2 }).format(
+    usageBasisPoints(value) / 10_000,
+  );
+}
+
+function usageBasisPoints(value: unknown): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > 10_000)
+    throw new TypeError("invalid utilization basis points");
+  return value;
+}
 
 /** Format canonical signed USD micros without converting money through cents. */
 export function formatMicrosCurrency(
@@ -473,6 +494,37 @@ export function createApi(options: ApiOptions) {
         return { wallet: decodeWallet(result.payload, organizationId) };
       } catch {
         throw new ApiError("invalid_response", result.status, path);
+      }
+    },
+
+    async usageSummary(organizationId: string): Promise<{ usageSummary: WalletUsageSummary }> {
+      const path = `/v1/organizations/${encodeURIComponent(organizationId)}/wallet/usage-summary`;
+      const { payload, status } = await request<unknown>("GET", path);
+      try {
+        if (status !== 200 || !isRecord(payload) || !isRecord(payload.usageSummary))
+          throw new TypeError("invalid usage summary");
+        const summary = payload.usageSummary;
+        if (
+          summary.organizationId !== organizationId ||
+          summary.currency !== "USD" ||
+          summary.unit !== "USD-micros"
+        )
+          throw new TypeError("invalid usage summary identity");
+        const effectiveIncludedMicros = unsignedMicros(summary.effectiveIncludedMicros);
+        const utilizationBasisPoints = usageBasisPoints(summary.utilizationBasisPoints);
+        if (effectiveIncludedMicros === "0" && utilizationBasisPoints !== 0)
+          throw new TypeError("invalid zero-allowance utilization");
+        return {
+          usageSummary: {
+            organizationId,
+            currency: "USD",
+            unit: "USD-micros",
+            effectiveIncludedMicros,
+            utilizationBasisPoints,
+          },
+        };
+      } catch {
+        throw new ApiError("invalid_response", status, path);
       }
     },
 

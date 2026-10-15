@@ -15,19 +15,20 @@ the default stop policy, 80% and 95% warning thresholds, unsupported postpaid,
 and no short-window limits. Those fields describe the selected contract;
 compiling the source does not implement or activate wallet policy or quotas.
 
-The revision `hosted-20261015-container-proposed-v1` adds these supplied rates:
+The revision `hosted-20261015-container-proposed-v2` records these supplied rates:
 
 | Meter | Unit | Cloudflare cost micros / quantity | Customer rate micros / quantity |
 | --- | --- | --- | --- |
 | `container.cpu` | vCPU-second | 20 / 1 | 60 / 1 |
 | `container.memory` | GiB-second | 2500 / 1000 | 7500 / 1000 |
-| `container.egress` | GB | 50000 / 1 | 150000 / 1 |
+| `container.egress` | GB | 25000 / 1 | 75000 / 1 |
 | `container.image-storage` | GB-month | 15000 / 1 | 45000 / 1 |
 
 The same customer rates apply to hosted and executor Containers, using the
 supplied Cloudflare cost basis. CPU measures active CPU time; memory measures
-provisioned capacity while running. Container egress uses the highest published
-regional cost, USD 0.05 per GB, as the fixed cost basis. These costs and units
+provisioned capacity while running. The supplied 2026-10-15 owner correction
+selects the Cloudflare NA/EU egress cost basis of USD 0.025 per GB, giving a
+customer rate of USD 0.075 per GB at 3x. The other Container costs and units
 come from [Cloudflare Containers pricing](https://developers.cloudflare.com/containers/platform/pricing/).
 Image storage uses [R2 Standard storage pricing](https://developers.cloudflare.com/r2/pricing/)
 as its supplied cost basis; it is not a separate published Containers image
@@ -39,6 +40,11 @@ Memory remains exactly 7.5 micros per GiB-second as a rational rate. Aggregate
 the closed measurement before ceiling once to integer ledger micros: one
 GiB-second is 8 micros, while two together are 15, not 16. The source revision
 does not rewrite any prior tariff's immutable meter tuples or settlement receipts.
+
+The published `hosted-20261015-container-proposed-v1` source remains unchanged
+in the reviewed revision archive. Its original Container egress rate is
+150000 micros per GB; persisted invoice and phase snapshots continue to resolve
+those original terms. New authoring uses revision v2 and 75000 micros per GB.
 
 Measurement integration must convert byte-seconds to GiB-seconds with
 `1 GiB = 1073741824 bytes`, and egress bytes to GB with `1 GB = 1000000000 bytes`.
