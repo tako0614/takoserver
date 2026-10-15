@@ -50,6 +50,7 @@ const ORG_WALLET_LIFECYCLE = "0092_org_wallet_lifecycle.sql";
 const WALLET_CREDIT_CLASSIFICATION = "0093_wallet_credit_classification_proofs.sql";
 const WALLET_USD_MICROS = "0094_wallet_usd_micros.sql";
 const STRIPE_BILLING = "0095_stripe_billing.sql";
+const V2_CONFIGURED_UPDATE_INPUTS = "0096_v2_configured_update_inputs.sql";
 
 const DOMAIN_MIGRATION = "0058_cloudflare_managed_worker_domain_receipts.sql";
 const APPLY_PROVIDER_SELECTION_MIGRATION = "0059_takoform_apply_provider_selection.sql";
@@ -197,6 +198,7 @@ test("0058 interrupted receipt rebuild rolls back with exact ciphertext and line
     WALLET_CREDIT_CLASSIFICATION,
     WALLET_USD_MICROS,
     STRIPE_BILLING,
+    V2_CONFIGURED_UPDATE_INPUTS,
   ]);
   expect(preservedRows(database)).toEqual(rows);
   database.close();
