@@ -515,7 +515,9 @@ export function createV2WorkerPublication(options: {
             nativeVersionId: identity.versionId,
             incarnationId: execution.operationId,
             servingSourceOperationId: execution.operationId,
-            bindings: bucketBindings,
+            // Form selection is compiler metadata; the retained claim wire is
+            // exactly name/resourceUid and the authority compares it strictly.
+            bindings: bucketBindings.map(({ name, resourceUid }) => ({ name, resourceUid })),
           };
           for (const binding of bucketBindings) {
             const current = await binder.resolveCurrentBucketBinding(claim, binding.name);

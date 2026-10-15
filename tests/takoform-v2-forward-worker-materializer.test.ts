@@ -86,6 +86,7 @@ async function fixture(secrets = false) {
     sourceReads = 0,
     sendCount = 0,
     readbackUnknown = false;
+  const publicationResults: unknown[] = [];
   let identity: WorkerdPublicationIdentity | null = null;
   let sent: WorkerdDeploymentPublication<WorkerdSite | WorkerdStaticSite> | null = null;
   let beforeSend: (() => Promise<void>) | undefined;
@@ -257,7 +258,14 @@ async function fixture(secrets = false) {
       },
     },
     ownerForWorker(workerResourceUid) {
-      return { workerResourceUid, execute: (execution) => publication.publish(execution) };
+      return {
+        workerResourceUid,
+        async execute(execution) {
+          const result = await publication.publish(execution);
+          publicationResults.push(result);
+          return result;
+        },
+      };
     },
   });
   const engine = createTakoformV2Engine({
@@ -304,13 +312,21 @@ async function fixture(secrets = false) {
       },
     });
     if (settle) {
-      for (let i = 0; i < 8; i++) {
-        const result = await engine.runNext();
-        expect(result?.id).toBe(accepted.id);
-        if (result?.status === "succeeded") return accepted;
-        if (result?.status === "failed") throw new Error("fixture acceptance failed");
-      }
-      throw new Error("fixture did not settle");
+      const result = await engine.runNext();
+      expect(result?.id).toBe(accepted.id);
+      if (result?.status === "succeeded") return accepted;
+      // An uncertain Operation has a real retry backoff. Preserve its first
+      // actual result instead of asking runNext again and hiding it as null.
+      throw new Error(
+        JSON.stringify({
+          fixture: "first unconfirmed Operation",
+          form,
+          name,
+          operation: result,
+          sendCount,
+          publicationResults,
+        }),
+      );
     }
     return accepted;
   }
