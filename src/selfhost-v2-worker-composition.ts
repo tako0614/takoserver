@@ -81,7 +81,10 @@ import {
   createForwardWorkerDeploymentForm,
   createWorkerDeploymentForm,
 } from "./takoform-v2/worker-deployment-backend.ts";
-import { createWorkerEndpointForm } from "./takoform-v2/worker-endpoint-backend.ts";
+import {
+  createForwardWorkerEndpointForm,
+  createWorkerEndpointForm,
+} from "./takoform-v2/worker-endpoint-backend.ts";
 import {
   createInternalV2ForwardWorkerVersionForm,
   createInternalV2ModuleWorkerForm,
@@ -1439,7 +1442,9 @@ function createWorkerComposition(
         : {}),
       ...(endpoint
         ? {
-            [WORKER_ENDPOINT_FORM_URL]: createWorkerEndpointForm({
+            [WORKER_ENDPOINT_FORM_URL]: (forwardFamily
+              ? createForwardWorkerEndpointForm
+              : createWorkerEndpointForm)({
               targetKey,
               publicationState,
               ownerForWorker: async (uid) => {
