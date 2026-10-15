@@ -379,7 +379,8 @@ only how to mint one. [Self-host security](self-host-security.md#sign-in-and-req
 explains why. If `TAKOSERVER_CONSOLE_ORIGIN` is set, open the exact external console
 origin named by the process and paste the assertion there. It is a separate
 console; the Bun Host does not serve a `/console` page.
-[The console](#the-console-optional) below explains how to build and serve it. Treat the operator key
+[The console](#the-console-optional) below explains how to build and serve
+it. Treat the operator key
 under the data root and the printed assertion as credentials; keep them out of
 shell history, shared logs, and this repository. To create later assertions,
 run the printed command, which names the installation's key path and its
@@ -444,7 +445,8 @@ it. An operator signs in to it with an operator assertion, then creates
 organizations and API keys and creates, updates, reads and deletes Resources.
 Build it as root from the reviewed checkout, with the Host's public origin
 stamped in, into a folder used for nothing else. The build replaces `--out`
-wholesale, so never point it at the data root or any other folder:
+wholesale, so never point it at the data root or any folder that holds
+anything else:
 
 ```sh
 cd /opt/takoserver
@@ -486,7 +488,7 @@ trailing `/`. Restart the Host. It allows that origin, with credentials,
 across the control and v2 APIs and accepts the session cookie only from it;
 any other spelling falls back to plain CORS and sign-in fails. The startup
 check also accepts plain HTTP for `localhost` and `127.0.0.1`, but a console
-on HTTP cannot carry the HTTPS API's cookie.
+on HTTP may not carry the HTTPS API's cookie.
 
 The first-boot assertion is already spent by the session exchange above, so
 mint a new one with the `operator-key.ts sign-in` command from the start of
@@ -997,6 +999,9 @@ git worktree add --detach <new-checkout> <reviewed-commit>
 cd <new-checkout>
 bun install --frozen-lockfile
 ```
+
+If you serve the console, rebuild it from the new checkout as described under
+[The console](#the-console-optional) when you switch to it.
 
 Keep the previous source checkout available so a code-only return is possible
 without changing the active source before the operator has selected it. Use
