@@ -80,6 +80,49 @@ separate; source and local native evidence do not establish a deployed rollout.
 | Update, monitor, back up or restore an installation | [Self-host operations](docs/self-host-operations.md#update-and-code-rollback) |
 | Change the code | [Working on it](#working-on-it): `bun run check` is the gate |
 
+## How it works
+
+A Takoform Form is a versioned HTTPS URL, such as
+`https://edge.forms.takoform.com/forms/SQLiteDatabase/0.2.0/`, that fixes what
+a Resource's spec, observed state and output mean without naming a provider.
+Takoserver is a Host: it implements the Forms its configuration composes and
+runs them on this machine.
+
+- **Declare** a Resource with its exact Form URL, a name and a spec. Host API v2
+  accepts each create, update or delete as an Operation and applies it in the
+  background; poll `/apis/forms.takoform.com/v2/operations/{id}` until it is
+  terminal. A Form this Host does not compose is refused, never approximated,
+  so check it first as in [What you can deploy](#what-you-can-deploy).
+- **Own** Resources through an organization. Its ID is the v2 Space, and its API
+  keys and its owner's session act as one principal, so replacing a key does
+  not strand a Resource. A `resources:read` key reads; a `resources:write` key
+  reads and changes. A key cannot choose another organization; a signed-in
+  owner names one with the `takoform-organization` header.
+- **Bind** Resources into a Worker by UID. A WorkerVersion lists them in
+  `sqliteBindings`, `kvBindings`, `bucketBindings`, `queueProducerBindings`,
+  `serviceBindings`, `actorBindings` and `workflowBindings`, each entry
+  `{name, resource: {resourceUid}}`, and the Worker reaches each one by its name,
+  such as `env.DB`. The Host serves the SQLite, KV, bucket and queue Bindings
+  from private loopback services, not from its public listener. A Resource that
+  another still names cannot be deleted, so delete in reference order.
+- **Serve** a Worker with a WorkerDeployment, which weights the WorkerVersions
+  that receive its traffic, and a WorkerEndpoint, which publishes it at an
+  HTTPS hostname on the Host's TCP 443 listener.
+- **Infer** through `/v1/ai` when the operator configures an OpenAI-compatible
+  upstream ([Settings](#settings)). An API key with `ai:invoke` sees only the
+  configured public model IDs. Every chat completion needs an `Idempotency-Key`;
+  a settled result is replayed from durable state without calling the upstream
+  again. A priced model is paid from the organization's prepaid wallet: the Host
+  holds the most the request can cost, captures the reported use and releases
+  the rest. The wallet has no balance column; its figures are computed from
+  entries that are only ever appended. See
+  [qualifying one public AI inference](docs/ai-live-qualification.md) for the
+  explicit opt-in completion/replay check and its limits.
+
+Creating, running or deleting a v2 Resource places no charge on the wallet.
+[Operator sign-in and funding](#operator-sign-in-and-funding) covers how a
+wallet is funded.
+
 ## Legacy runtime and provider reference
 
 The implementation notes below describe retained pre-v2 provider, data-plane and
@@ -187,25 +230,10 @@ on an ephemeral port by default and prints one sanitized ready JSON line
 without the token. `TAKOSERVER_STABLE_LOCAL_SPACE` and
 `TAKOSERVER_STABLE_LOCAL_PORT` may override the local Space and port.
 
-## What it is
+The reseller run bearer, Attachments and Migrations below act only on records
+of the pre-v2 Host API, whose handler is not mounted; Host API v2 has none of
+them.
 
-Takoform is an infrastructure protocol: a customer declares what they want, and
-a Host accepts, prices, provisions, and reports on it. Takoserver is a Host —
-the part that owns accounts, money, and the machines.
-
-- **Declare** through the Takoform lanes. Every declaration names a Form by an
-  exact reference: group, kind, definition version, and the digest of the
-  schema itself. Two resources of the same kind are not necessarily the same
-  thing, and the digest is what says so.
-- **Pay** from a prepaid wallet. Work places a hold against the available
-  balance and captures it when it succeeds; if it fails, the hold is released
-  and nothing is charged. There is no balance column anywhere — available is
-  settled minus held, computed from entries that are only ever appended.
-- **Bind** a current ObjectBucket through `bucketBindings`. The Host resolves
-  the exact Resource relation and active Deployment, then the provider's
-  two-stage materializer hands the ordinary-workers runtime one opaque
-  capability, which becomes a native R2 binding under the declared name.
-  Native bucket identity and credentials stay private to that adapter.
 - **Run** the ordinary Takoform provider without handing a hosted runner the
   reseller's organization API key. A reseller reservation can mint a
   short-lived bearer pinned to one opaque tenant, exact Form, and exact
@@ -214,11 +242,6 @@ the part that owns accounts, money, and the machines.
   Resource UID before it may read, observe, update, or delete that incarnation.
   The first create atomically marks the reservation consumed before provider
   side effects, so a release can never leave an unpaid Resource.
-- **Scope** organization API keys by resource intent. `resources:read` may call
-  Host read routes (including validate and observe); `resources:write` retains
-  that read access and additionally permits prepare, PUT/POST mutations, and
-  DELETE. Missing scopes are refused before resource lookup, while wrong-tenant,
-  revoked, and expired credentials remain non-enumerating failures.
 - **Attach** independent resources by exact Interface reference. An Attachment
   stores only resource/deployment identity and an opaque grant, endpoint,
   secret, or native-binding reference; it never embeds a provider credential.
@@ -226,13 +249,6 @@ the part that owns accounts, money, and the machines.
   provisions a candidate Deployment, transfers and verifies the data, then
   atomically switches the active Deployment and Attachment resolutions. The
   source stays retained for the bounded rollback window.
-- **Infer** through `/v1/ai`. An organization API key with `ai:invoke` sees only
-  operator-configured public model IDs. Takoserver holds the maximum prepaid
-  charge before inference, captures reported token use, and releases the rest.
-  Paid inference requires `Idempotency-Key`; a settled result is replayed from
-  durable state without calling the upstream or charging again.
-  See [qualifying one public AI inference](docs/ai-live-qualification.md) for
-  the explicit opt-in completion/replay check and its limits.
 
 ## Self-hosting
 
