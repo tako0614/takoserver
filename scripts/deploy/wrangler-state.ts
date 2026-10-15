@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  type BigIntStats,
   closeSync,
   constants,
   existsSync,
@@ -522,7 +523,8 @@ function findOwnKernelLeaseDescriptor(owner: WranglerVersionPublicationLeaseOwne
   const descriptors = readdirSync(`/proc/${owner.holderPid}/fdinfo`);
   if (descriptors.length > 64) throw publicationLeaseLostError();
   const matches = descriptors.filter(
-    (descriptor) => /^\d+$/u.test(descriptor) && ownKernelLeaseDescriptorMatches(owner, descriptor),
+    (descriptor) =>
+      /^\d+$/u.test(descriptor) && ownKernelLeaseDescriptorMatches(owner, descriptor, "discovery"),
   );
   if (matches.length !== 1 || matches[0] === undefined) throw publicationLeaseLostError();
   return matches[0];
@@ -531,9 +533,19 @@ function findOwnKernelLeaseDescriptor(owner: WranglerVersionPublicationLeaseOwne
 function ownKernelLeaseDescriptorMatches(
   owner: WranglerVersionPublicationLeaseOwner,
   descriptor: string,
+  phase: "discovery" | "selected" = "selected",
 ): boolean {
   const descriptorPath = `/proc/${owner.holderPid}/fd/${descriptor}`;
-  const before = statSync(descriptorPath, { bigint: true });
+  let before: BigIntStats;
+  try {
+    before = statSync(descriptorPath, { bigint: true });
+  } catch (error) {
+    // Enumeration can include a descriptor closed before its first observation.
+    // Only uncaptured discovery entries may disappear; selected descriptors and
+    // all reads after target identity confirmation remain strict.
+    if (phase === "discovery" && errorCode(error) === "ENOENT") return false;
+    throw error;
+  }
   if (String(before.dev) !== owner.lockDevice || String(before.ino) !== owner.lockInode) {
     return false;
   }

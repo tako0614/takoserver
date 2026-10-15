@@ -1687,3 +1687,159 @@ describe("Core-owned current publication lease assertion", () => {
     }
   });
 });
+
+test("keeps discovery first-stat ENOENT separate from strict later reads", async () => {
+  const moduleUrl = new URL("../scripts/deploy/wrangler-state.ts", import.meta.url).href;
+  // Only this subprocess mocks directory/error scheduling. Every actual lease,
+  // owner record, WeakMap and kernel FLOCK observation uses the real Core code.
+  const childProgram = [
+    `const coreModule = ${JSON.stringify(moduleUrl)};`,
+    String.raw`
+import { mock } from "bun:test";
+import assert from "node:assert/strict";
+const fs = { ...await import("node:fs") };
+let active = null;
+const failure = (code) => Object.assign(new Error("synthetic own-fd read schedule"), { code });
+mock.module("node:fs", () => ({
+  ...fs,
+  readdirSync(path, options) {
+    const entries = fs.readdirSync(path, options);
+    if (active && path === active.directory) {
+      active.enumerations += 1;
+      if (active.enabled && ["stale", "unknown"].includes(active.mode)) {
+        return [...entries, "2147483647"];
+      }
+    }
+    return entries;
+  },
+  statSync(path, options) {
+    if (active && active.enabled) {
+      if (active.mode === "unknown" && path === active.missingPath) throw failure(active.errno);
+      if (path === active.lockDescriptorPath) {
+        active.targetStats += 1;
+        if (active.mode === "after" && active.targetStats === 2) throw failure("ENOENT");
+        if (active.mode === "cached") throw failure("ENOENT");
+      }
+    }
+    return fs.statSync(path, options);
+  },
+  readFileSync(path, options) {
+    if (active && active.enabled && active.mode === "fdinfo" && path === active.lockInfoPath) {
+      throw failure("ENOENT");
+    }
+    return fs.readFileSync(path, options);
+  },
+}));
+const api = await import(coreModule);
+const cases = [
+  { name: "stale-discovery-entry", mode: "stale", pass: true },
+  { name: "discovery-EACCES", mode: "unknown", errno: "EACCES" },
+  { name: "discovery-EIO", mode: "unknown", errno: "EIO" },
+  { name: "discovery-ESRCH", mode: "unknown", errno: "ESRCH" },
+  { name: "confirmed-fdinfo-ENOENT", mode: "fdinfo" },
+  { name: "confirmed-afterstat-ENOENT", mode: "after" },
+  { name: "cached-selected-stat-ENOENT", mode: "cached" },
+];
+const results = [];
+for (const item of cases) {
+  const root = process.env.TMPDIR + "/integration-fd-schedule-" + crypto.randomUUID();
+  assert.equal(fs.existsSync(root), false);
+  const lease = await api.acquireWranglerVersionPublicationLease({
+    accountId: "e".repeat(32), workerName: "integration-fd-schedule", root,
+  });
+  let lockPath;
+  try {
+    const ownerName = fs.readdirSync(root).find((name) => name.endsWith(".owner.json"));
+    assert.ok(ownerName);
+    const owner = JSON.parse(fs.readFileSync(root + "/" + ownerName, "utf8"));
+    lockPath = root + "/" + ownerName.slice(0, -".owner.json".length);
+    const directory = "/proc/" + owner.holderPid + "/fdinfo";
+    const sameNativeLock = (descriptor) => {
+      try {
+        const stat = fs.statSync("/proc/" + owner.holderPid + "/fd/" + descriptor, { bigint: true });
+        return String(stat.dev) === owner.lockDevice && String(stat.ino) === owner.lockInode;
+      } catch (error) {
+        if (error.code === "ENOENT") return false;
+        throw error;
+      }
+    };
+    const descriptors = fs.readdirSync(directory).filter(sameNativeLock);
+    assert.equal(descriptors.length, 1);
+    const descriptor = descriptors[0];
+    const lockInfoPath = directory + "/" + descriptor;
+    const held = () => fs.readFileSync(lockInfoPath, "utf8").split("\n").some((line) => {
+      const fields = line.trim().split(/\s+/u);
+      return fields[0] === "lock:" && fields[2] === "FLOCK" && fields[3] === "ADVISORY" &&
+        fields[4] === "WRITE" && fields[5] === String(owner.holderPid) &&
+        fields[6].endsWith(":" + owner.lockInode) && fields[7] === "0" && fields[8] === "EOF";
+    });
+    assert.equal(held(), true);
+    active = { ...item, directory, lockInfoPath,
+      missingPath: "/proc/" + owner.holderPid + "/fd/2147483647",
+      lockDescriptorPath: "/proc/" + owner.holderPid + "/fd/" + descriptor,
+      enabled: item.mode !== "cached", enumerations: 0, targetStats: 0 };
+    assert.throws(() => fs.statSync(active.missingPath), { code: "ENOENT" });
+    if (item.mode === "cached") {
+      api.assertWranglerVersionPublicationLeaseCurrent(lease);
+      active.enabled = true;
+    }
+    const before = active.enumerations;
+    if (item.pass) {
+      api.assertWranglerVersionPublicationLeaseCurrent(lease);
+      assert.equal(active.enumerations, before + 1);
+      const captured = active.enumerations;
+      api.assertWranglerVersionPublicationLeaseCurrent(lease);
+      assert.equal(active.enumerations, captured);
+    } else {
+      assert.throws(() => api.assertWranglerVersionPublicationLeaseCurrent(lease), {
+        name: "DeployError", message: "Worker Version publication lease is no longer current for this invocation",
+      });
+      if (item.mode === "cached") assert.equal(active.enumerations, before);
+      active.enabled = false;
+      const refused = active.enumerations;
+      assert.throws(() => api.assertWranglerVersionPublicationLeaseCurrent(lease), { name: "DeployError" });
+      assert.equal(active.enumerations, refused);
+    }
+    assert.equal(held(), true);
+    results.push({ name: item.name, realKernelStillHeld: true,
+      expected: item.pass ? "accepted" : "terminal-refusal" });
+  } finally {
+    active = null;
+    await lease.release();
+    const entries = fs.readdirSync(root);
+    assert.equal(entries.length, 1);
+    assert.equal(root + "/" + entries[0], lockPath);
+    const state = fs.lstatSync(lockPath);
+    assert.equal(state.isFile() && !state.isSymbolicLink() && state.nlink === 1, true);
+    fs.unlinkSync(lockPath);fs.rmdirSync(root);
+  }
+}
+console.log(JSON.stringify({ cases: results, sourceGuardMocked: false,
+  scheduleIsSyntheticNotPhysicalFdCloseProof: true }));
+`,
+  ].join("\n");
+  const child = Bun.spawn([process.execPath, "--no-env-file", "-e", childProgram], {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+  const result = JSON.parse(stdout) as {
+    cases: { name: string; realKernelStillHeld: boolean; expected: string }[];
+    sourceGuardMocked: boolean;
+    scheduleIsSyntheticNotPhysicalFdCloseProof: boolean;
+  };
+  expect(result.cases).toHaveLength(7);
+  expect(result.cases.every((item) => item.realKernelStillHeld)).toBe(true);
+  expect(result.cases.map((item) => item.expected)).toEqual([
+    "accepted",
+    ...Array<string>(6).fill("terminal-refusal"),
+  ]);
+  expect(result.sourceGuardMocked).toBe(false);
+  expect(result.scheduleIsSyntheticNotPhysicalFdCloseProof).toBe(true);
+});
