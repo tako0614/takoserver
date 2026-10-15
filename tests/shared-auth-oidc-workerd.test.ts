@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { Miniflare } from "miniflare";
+import { SHARED_AUTH_STAGING_PROFILE } from "../src/shared-auth-oidc-client.ts";
 import { miniflareServiceBinding } from "./helpers/miniflare-service-binding.ts";
 
 const stamp = 1792022400000;
@@ -25,7 +26,7 @@ export class OidcIssuer extends WorkerEntrypoint {
     if (url.pathname === "/oauth/revoke") return new Response(null, { status: 204 });
     if (url.pathname !== "/oauth/token") return new Response(null, { status: 404 });
     const form = new URLSearchParams(await request.text());
-    const claims = { iss: "https://auth-staging.example.test", aud: "takoserver-console-staging-v1", sub: "test-canonical-account", sid: "test-accounts-session", auth_time: ${stamp / 1000 - 60}, iat: ${stamp / 1000}, exp: ${stamp / 1000 + 300}, ...(form.get("grant_type") === "authorization_code" ? { nonce: "test-nonce" } : {}) };
+    const claims = { iss: ${JSON.stringify(SHARED_AUTH_STAGING_PROFILE.issuer)}, aud: "takoserver-console-staging-v1", sub: "test-canonical-account", sid: "test-accounts-session", auth_time: ${stamp / 1000 - 60}, iat: ${stamp / 1000}, exp: ${stamp / 1000 + 300}, ...(form.get("grant_type") === "authorization_code" ? { nonce: "test-nonce" } : {}) };
     const payload = encode(new TextEncoder().encode(JSON.stringify({ alg: "ES256", typ: "JWT", kid: "test-native-stage-key" }))) + "." + encode(new TextEncoder().encode(JSON.stringify(claims)));
     const key = await crypto.subtle.importKey("jwk", JSON.parse(env.PRIVATE_JWK), { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
     const signature = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, new TextEncoder().encode(payload));
