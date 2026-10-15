@@ -335,4 +335,9 @@ export type {
   WorkerClassResourceIdentity,
   WorkerClassRuntimeContract,
 } from "./worker-class-runtime-port.ts";
+export {
+  createWorkerEndpointOriginV2Publication,
+  type WorkerEndpointOriginV2Publication,
+  type WorkerEndpointOriginV2PublicationPreparation,
+} from "./worker-endpoint-origin-v2-acceptance.ts";
 export { createWorkerProductionComposition } from "./worker-production-composition.ts";

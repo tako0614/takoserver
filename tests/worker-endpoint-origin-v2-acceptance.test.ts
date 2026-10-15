@@ -394,6 +394,191 @@ function bindingAt(f: Fixture, assignment: SharedAppAssignment) {
   return f.db.query(`SELECT * FROM ${BINDINGS} WHERE incarnation=?`).get(assignment.incarnation);
 }
 
+async function failedDelete(
+  f: Fixture,
+  uid: string,
+  generation: number,
+  effect: "none" | "partial" | "unknown" = "none",
+) {
+  const accepted = await f.engine.acceptDelete({
+    principal: PRINCIPAL,
+    key: `delete-gap-${generation}-${effect}-fixture`,
+    uid,
+    expectedGeneration: generation,
+  });
+  const store = createV2Store(f.sql);
+  const token = crypto.randomUUID();
+  expect(await store.claim(accepted.id, token, Date.parse(AT), Date.parse(AT) + 120_000)).toBe(
+    true,
+  );
+  expect(await store.markDispatch(accepted.id, token, AT)).toBe(true);
+  expect(
+    await store.settle({
+      id: accepted.id,
+      token,
+      status: effect === "unknown" ? "reconciling" : "failed",
+      effect,
+      at: AT,
+      retainUntil: "2026-10-15T01:00:00.000Z",
+      ...(effect === "unknown"
+        ? {}
+        : { error: { code: "fixture_delete_failure", message: "controlled failure" } }),
+    }),
+  ).toBe(true);
+  return accepted;
+}
+
+const acceptanceTables = [
+  "tf_v2_resources",
+  "tf_v2_operations",
+  "tf_v2_private_inputs",
+  "tf_v2_configured_private_inputs",
+  "tf_v2_operation_reference_sets",
+  "tf_v2_operation_references",
+  "tf_v2_resource_references",
+  BINDINGS,
+] as const;
+
+test("selected UPDATE after one or two real no-effect DELETEs advances its actual older binding and preserves the original", async () => {
+  for (const deletes of [1, 2]) {
+    const f = await fixture({ custody: true, references: "empty" });
+    try {
+      const assignment = await f.reserve();
+      const created = await f.engine.acceptCreate({
+        ...createRequest(),
+        input: { ...createRequest().input, privateInputs: { password: "fixture-create" } },
+      });
+      expect(await f.engine.runNext()).toMatchObject({ id: created.id, status: "succeeded" });
+      for (let generation = 1; generation <= deletes; generation++)
+        await failedDelete(f, created.resourceUid, generation);
+      expect(bindingAt(f, assignment)).toMatchObject({
+        endpoint_generation: 1,
+        current_operation_id: created.id,
+      });
+      const request = {
+        principal: PRINCIPAL,
+        key: `update-after-${deletes}-deletes-fixture`,
+        uid: created.resourceUid,
+        expectedGeneration: deletes + 1,
+        spec: { value: "reapplied" },
+        privateInputs: { password: "fixture-update" },
+      };
+      const updated = await f.engine.acceptUpdate(request);
+      expect(updated.generation).toBe(deletes + 2);
+      expect(bindingAt(f, assignment)).toMatchObject({
+        incarnation: assignment.incarnation,
+        endpoint_generation: deletes + 2,
+        create_operation_id: created.id,
+        current_operation_id: updated.id,
+      });
+      expect(await createV2Store(f.sql).resource(created.resourceUid)).toMatchObject({
+        generation: deletes + 2,
+        last_operation: updated.id,
+        busy_operation: updated.id,
+        spec_json: '{"value":"reapplied"}',
+      });
+      expect(await f.ledger.forTrustedOwner(OWNER).readOriginal(assignment.reservationId)).toEqual(
+        assignment,
+      );
+      expect(
+        f.db
+          .query("SELECT count(*) AS n FROM tf_v2_private_inputs WHERE operation_id=?")
+          .get(updated.id),
+      ).toEqual({ n: 1 });
+      expect(
+        f.db
+          .query(
+            "SELECT count(*) AS n FROM tf_v2_operation_reference_sets WHERE operation_id=? AND sealed=1",
+          )
+          .get(updated.id),
+      ).toEqual({ n: 1 });
+      const writes = f.counts().acceptanceBatches;
+      expect((await f.engine.acceptUpdate(request)).id).toBe(updated.id);
+      expect(f.counts().acceptanceBatches).toBe(writes);
+      expect(await f.engine.runNext()).toMatchObject({ id: updated.id, status: "succeeded" });
+    } finally {
+      f.close();
+    }
+  }
+});
+
+test("selected UPDATE cannot cross a partial DELETE and unknown DELETE remains busy", async () => {
+  for (const effect of ["partial", "unknown"] as const) {
+    const f = await fixture();
+    try {
+      await f.reserve();
+      const created = await f.engine.acceptCreate(createRequest());
+      await f.engine.runNext();
+      await failedDelete(f, created.resourceUid, 1, effect);
+      const before = acceptanceTables.map((table) => f.db.query(`SELECT * FROM ${table}`).all());
+      const pending = f.engine.acceptUpdate({
+        principal: PRINCIPAL,
+        key: `update-after-${effect}-delete-fixture`,
+        uid: created.resourceUid,
+        expectedGeneration: 2,
+        spec: { value: "must-not-accept" },
+      });
+      if (effect === "unknown")
+        await expect(pending).rejects.toMatchObject({ code: "resource_busy", status: 409 });
+      else await expect(pending).rejects.toBeInstanceOf(SqlError);
+      for (const [index, table] of acceptanceTables.entries()) {
+        const expected = before[index];
+        if (expected === undefined) throw new Error("missing paired durable snapshot");
+        expect(f.db.query(`SELECT * FROM ${table}`).all()).toEqual(expected);
+      }
+    } finally {
+      f.close();
+    }
+  }
+});
+
+test("selected UPDATE rechecks earlier DELETE effect and exact binding inside the real accepted batch", async () => {
+  for (const race of ["earlier-effect", "binding"] as const) {
+    const f = await fixture({ custody: true, references: "empty" });
+    try {
+      await f.reserve();
+      const created = await f.engine.acceptCreate({
+        ...createRequest(),
+        input: { ...createRequest().input, privateInputs: { password: "fixture-create" } },
+      });
+      await f.engine.runNext();
+      const earlier = await failedDelete(f, created.resourceUid, 1);
+      const last = await failedDelete(f, created.resourceUid, 2);
+      const held = f.holdAcceptances();
+      const pending = f.engine.acceptUpdate({
+        principal: PRINCIPAL,
+        key: `update-delete-gap-${race}-fixture`,
+        uid: created.resourceUid,
+        expectedGeneration: 3,
+        spec: { value: "must-roll-back" },
+        privateInputs: { password: "fixture-update" },
+      });
+      try {
+        await held.entered;
+        if (race === "earlier-effect")
+          f.db.query("UPDATE tf_v2_operations SET effect='partial' WHERE id=?").run(earlier.id);
+        else f.db.query(`UPDATE ${BINDINGS} SET current_operation_id=?`).run(last.id);
+        const before = acceptanceTables.map((table) => f.db.query(`SELECT * FROM ${table}`).all());
+        held.release();
+        await expect(pending).rejects.toBeInstanceOf(SqlError);
+        expect(f.lastBatchError()).toMatchObject({
+          code: "constraint",
+          message: expect.stringContaining(`${BINDINGS}.endpoint_uid`),
+        });
+        for (const [index, table] of acceptanceTables.entries()) {
+          const expected = before[index];
+          if (expected === undefined) throw new Error("missing paired durable snapshot");
+          expect(f.db.query(`SELECT * FROM ${table}`).all()).toEqual(expected);
+        }
+      } finally {
+        held.release();
+      }
+    } finally {
+      f.close();
+    }
+  }
+});
+
 test("preclaimed CREATE binds actual Core UID without activating or allocating a name", async () => {
   const f = await fixture();
   try {

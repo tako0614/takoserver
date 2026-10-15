@@ -102,7 +102,8 @@ const LAYERS: readonly Layer[] = [
   },
   {
     name: "v2-state",
-    match: /^src\/takoform-v2\/(?:store|worker-invocation-custody|worker-invocation-schema)\.ts$/u,
+    match:
+      /^src\/takoform-v2\/(?:store|worker-invocation-custody|worker-invocation-schema|worker-native-identity-schema)\.ts$/u,
     may: ["core", "v2-contract", "v2-private", "v2-state"],
   },
   {
@@ -665,6 +666,27 @@ for (const path of walk("src")) {
       /import\s*\{\s*createWorkerEndpointOriginV2Acceptance\s*\}\s*from\s+["']\.\/worker-endpoint-origin-v2-acceptance\.ts["'];/u.test(
         readFileSync(path, "utf8"),
       );
+    const originPublicationExports = readFileSync(path, "utf8").match(
+      /export\s*\{([^}]*)\}\s*from\s+["']\.\/worker-endpoint-origin-v2-acceptance\.ts["'];/u,
+    )?.[1];
+    const exactOriginPublicationExtensionEdge =
+      path === "src/provider-extension.ts" &&
+      target === "src/worker-endpoint-origin-v2-acceptance.ts" &&
+      localImportsOf(path).filter((candidate) => candidate === target).length === 1 &&
+      JSON.stringify(
+        originPublicationExports
+          ?.split(",")
+          .map((name) => name.trim().replace(/^type\s+/u, ""))
+          .filter((name) => name !== "")
+          .sort(),
+      ) ===
+        JSON.stringify(
+          [
+            "createWorkerEndpointOriginV2Publication",
+            "WorkerEndpointOriginV2Publication",
+            "WorkerEndpointOriginV2PublicationPreparation",
+          ].sort(),
+        );
     // This Host-only callback carries the exact accepted execution into
     // private lifecycle readbacks. Permit only this single type-only edge;
     // do not widen the general self-host composition layer to v2-contract.
@@ -729,6 +751,7 @@ for (const path of walk("src")) {
       !layer.may.includes(targetLayer.name) &&
       !exactHostAcceptanceEdge &&
       !exactWorkerEndpointOriginConstructionEdge &&
+      !exactOriginPublicationExtensionEdge &&
       !exactExecutionTypeEdge &&
       !exactQueueProviderExtensionEdge &&
       !exactSchedulerProviderExtensionEdge
