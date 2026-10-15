@@ -1,4 +1,5 @@
 node_modules/
+.bun/install/cache/
 dist/
 coverage/
 .env
