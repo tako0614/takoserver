@@ -452,3 +452,520 @@ describe("Takoform run tokens", () => {
     });
   });
 });
+
+async function tenantRunOriginalFixture(withOptionalClaims = true, actualSql: Sql = sql) {
+  const key = await provisionKey("original-credential-key");
+  const input = {
+    organizationId: "org_alpha",
+    tenantRef: "tenant_original",
+    spaceRef: "tsp_original",
+    runRef: "run_original",
+    ...(withOptionalClaims
+      ? {
+          logicalPrincipalRef: "principal_original",
+          workerEndpointOriginReservationId: "rsv_original",
+        }
+      : {}),
+    ttlSeconds: 300,
+    issuedAtEpochSeconds: Math.floor(NOW / 1_000),
+    tokenId: "tok_original",
+  } as const;
+  const issued = await sponsorshipIssuer(key).issue(input);
+  await admitSponsorshipCredential(input, key.keyId);
+  const tokens = createTokenService({ sql: actualSql, issuer: ISSUER, clock, keyCacheSeconds: 0 });
+  return { key, input, issued, tokens, actualSql };
+}
+
+/** A deferred real SQLite read, never an admission or positive-verification override. */
+function deferredOriginalSql() {
+  const actualSql = sql;
+  let issuanceReads = 0;
+  let deferred:
+    | {
+        readonly at: number;
+        readonly entered: () => void;
+        readonly waiting: Promise<void>;
+      }
+    | undefined;
+  const port: Sql = {
+    async query(statement, params) {
+      const rows = await actualSql.query(statement, params);
+      if (statement.includes("FROM sponsorship_credential_issuance_operations")) {
+        issuanceReads += 1;
+        if (deferred?.at === issuanceReads) {
+          const held = deferred;
+          deferred = undefined;
+          held.entered();
+          await held.waiting;
+        }
+      }
+      return rows;
+    },
+    run: actualSql.run.bind(actualSql),
+    batch: actualSql.batch.bind(actualSql),
+  };
+  return {
+    port,
+    nextIssuanceRead(offset: 1 | 2) {
+      if (deferred) throw new Error("an issuance read is already held");
+      let entered = () => {};
+      let release = () => {};
+      const reached = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const waiting = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      deferred = { at: issuanceReads + offset, entered, waiting };
+      return { reached, release };
+    },
+  };
+}
+
+async function reachOriginalRead(reached: Promise<void>, read: Promise<unknown>): Promise<void> {
+  await Promise.race([
+    reached,
+    read.then(() => {
+      throw new Error("read completed before the expected SQLite barrier");
+    }),
+  ]);
+}
+
+describe("request-local tenant-run credential original", () => {
+  test("opens actual signed issuance into an immutable nonserializable handle and exact view", async () => {
+    const f = await tenantRunOriginalFixture();
+    const logicalPrincipalRef = f.input.logicalPrincipalRef;
+    const workerEndpointOriginReservationId = f.input.workerEndpointOriginReservationId;
+    if (
+      logicalPrincipalRef !== "principal_original" ||
+      workerEndpointOriginReservationId !== "rsv_original"
+    ) {
+      throw new Error("fixture requires both original tenant-run optional claims");
+    }
+    const original = await f.tokens.openTakoformTenantRunOriginal(f.issued.token);
+    const view = await f.tokens.readTakoformTenantRunOriginal(original, f.actualSql);
+    expect(view).toEqual({
+      issuer: ISSUER,
+      principalId: await tenantRunPrincipalId(view.claims),
+      claims: {
+        organizationId: f.input.organizationId,
+        tenantRef: f.input.tenantRef,
+        spaceRef: f.input.spaceRef,
+        runRef: f.input.runRef,
+        logicalPrincipalRef,
+        workerEndpointOriginReservationId,
+        mode: "tenant-run",
+        tokenId: f.input.tokenId,
+        issuedAtEpochSeconds: f.input.issuedAtEpochSeconds,
+        expiresAtEpochSeconds: f.input.issuedAtEpochSeconds + f.input.ttlSeconds,
+      },
+      issuance: {
+        kind: "builtin-sponsorship-issuance",
+        tokenId: f.input.tokenId,
+        organizationId: f.input.organizationId,
+        tenantRef: f.input.tenantRef,
+        issuedAtEpochSeconds: f.input.issuedAtEpochSeconds,
+        expiresAtEpochSeconds: f.input.issuedAtEpochSeconds + f.input.ttlSeconds,
+        credentialKeyId: f.key.keyId,
+      },
+    });
+    expect(Object.isFrozen(original)).toBe(true);
+    expect(Object.isFrozen(Object.getPrototypeOf(original))).toBe(true);
+    expect(Object.isFrozen(Object.getPrototypeOf(original).constructor)).toBe(true);
+    expect(Object.isFrozen(view)).toBe(true);
+    expect(Object.isFrozen(view.claims)).toBe(true);
+    expect(Object.isFrozen(view.issuance)).toBe(true);
+    expect(Object.keys(original)).toEqual([]);
+    expect(Object.getOwnPropertySymbols(original)).toEqual([]);
+    expect(JSON.stringify(original)).toBe("{}");
+    expect(JSON.stringify({ original, view })).not.toContain(f.issued.token);
+    expect(Reflect.set(view.claims, "spaceRef", "tsp_other")).toBe(false);
+    expect(Reflect.set(view.issuance, "credentialKeyId", "forged-key")).toBe(false);
+    expect(await f.tokens.readTakoformTenantRunOriginal(original, f.actualSql)).toBe(view);
+  });
+
+  test("keeps optional reservation and logical principal absent without inventing a product or grant", async () => {
+    const f = await tenantRunOriginalFixture(false);
+    const original = await f.tokens.openTakoformTenantRunOriginal(f.issued.token);
+    const view = await f.tokens.readTakoformTenantRunOriginal(original, f.actualSql);
+    expect(view.principalId).toBe(`run:${f.input.tokenId}`);
+    expect(Object.hasOwn(view.claims, "workerEndpointOriginReservationId")).toBe(false);
+    expect(Object.hasOwn(view.claims, "logicalPrincipalRef")).toBe(false);
+    expect(Object.hasOwn(view, "product")).toBe(false);
+    expect(Object.hasOwn(view, "grant")).toBe(false);
+    expect(Object.hasOwn(view, "ready")).toBe(false);
+  });
+
+  test("refuses fabricated, copied, proxied and reconstructed handles without consulting getters", async () => {
+    const f = await tenantRunOriginalFixture();
+    const original = await f.tokens.openTakoformTenantRunOriginal(f.issued.token);
+    let getterCalls = 0;
+    const getterFake = {
+      get token() {
+        getterCalls += 1;
+        return f.issued.token;
+      },
+      get claims() {
+        getterCalls += 1;
+        throw new Error("must not consult claims");
+      },
+    };
+    for (const fake of [
+      {},
+      { ...original },
+      structuredClone(original),
+      getterFake,
+      new Proxy(original, {
+        get() {
+          getterCalls += 1;
+          throw new Error("must not unwrap");
+        },
+      }),
+      Object.create(Object.getPrototypeOf(original)),
+    ]) {
+      await expect(f.tokens.readTakoformTenantRunOriginal(fake, f.actualSql)).rejects.toMatchObject(
+        {
+          code: "invalid_credential_authority",
+        },
+      );
+      expect(() => f.tokens.closeTakoformTenantRunOriginal(fake, f.actualSql)).toThrow(
+        "invalid_credential_authority",
+      );
+    }
+    expect(getterCalls).toBe(0);
+    expect(() => Reflect.construct(Object.getPrototypeOf(original).constructor, [])).toThrow(
+      "invalid_credential_authority",
+    );
+    expect(() =>
+      Reflect.construct(Object.getPrototypeOf(original).constructor, [
+        Symbol("tenant-run original mint"),
+      ]),
+    ).toThrow("invalid_credential_authority");
+    expect(
+      (await f.tokens.readTakoformTenantRunOriginal(original, f.actualSql)).claims.tokenId,
+    ).toBe(f.input.tokenId);
+  });
+
+  test("binds the genuine handle to its concrete issuer instance and actual Sql", async () => {
+    const f = await tenantRunOriginalFixture();
+    const original = await f.tokens.openTakoformTenantRunOriginal(f.issued.token);
+    const otherIssuer = createTokenService({
+      sql: f.actualSql,
+      issuer: ISSUER,
+      clock,
+      keyCacheSeconds: 0,
+    });
+    await expect(
+      otherIssuer.readTakoformTenantRunOriginal(original, f.actualSql),
+    ).rejects.toMatchObject({ code: "invalid_credential_authority" });
+    expect(() => otherIssuer.closeTakoformTenantRunOriginal(original, f.actualSql)).toThrow(
+      "invalid_credential_authority",
+    );
+    const anotherSql: Sql = {
+      query: f.actualSql.query.bind(f.actualSql),
+      run: f.actualSql.run.bind(f.actualSql),
+      batch: f.actualSql.batch.bind(f.actualSql),
+    };
+    await expect(
+      f.tokens.readTakoformTenantRunOriginal(original, anotherSql),
+    ).rejects.toMatchObject({ code: "invalid_credential_authority" });
+    expect(() => f.tokens.closeTakoformTenantRunOriginal(original, anotherSql)).toThrow(
+      "invalid_credential_authority",
+    );
+    const duplicateModuleUrl = new URL(
+      "../src/token.ts?original-capture-second-module",
+      import.meta.url,
+    ).href;
+    const duplicateModule: typeof import("../src/token.ts") = await import(duplicateModuleUrl);
+    const duplicateIssuer = duplicateModule.createTokenService({
+      sql: f.actualSql,
+      issuer: ISSUER,
+      clock,
+      keyCacheSeconds: 0,
+    });
+    await expect(
+      duplicateIssuer.readTakoformTenantRunOriginal(original, f.actualSql),
+    ).rejects.toMatchObject({ code: "invalid_credential_authority" });
+    const duplicateOriginal = await duplicateIssuer.openTakoformTenantRunOriginal(f.issued.token);
+    await expect(
+      f.tokens.readTakoformTenantRunOriginal(duplicateOriginal, f.actualSql),
+    ).rejects.toMatchObject({ code: "invalid_credential_authority" });
+  });
+
+  test("requires original callable descriptors and receiver without executing replacement getters", async () => {
+    const f = await tenantRunOriginalFixture();
+    const original = await f.tokens.openTakoformTenantRunOriginal(f.issued.token);
+    const read = f.tokens.readTakoformTenantRunOriginal;
+    const open = f.tokens.openTakoformTenantRunOriginal;
+    await expect(open(f.issued.token)).rejects.toMatchObject({
+      code: "invalid_credential_authority",
+    });
+    let getterCalls = 0;
+    for (const method of [
+      "openTakoformTenantRunOriginal",
+      "readTakoformTenantRunOriginal",
+      "closeTakoformTenantRunOriginal",
+    ] as const) {
+      const descriptor = Object.getOwnPropertyDescriptor(f.tokens, method);
+      if (!descriptor) throw new Error("missing original method");
+      Object.defineProperty(f.tokens, method, {
+        configurable: true,
+        enumerable: true,
+        get() {
+          getterCalls += 1;
+          throw new Error("must not invoke replacement");
+        },
+      });
+      await expect(read.call(f.tokens, original, f.actualSql)).rejects.toMatchObject({
+        code: "invalid_credential_authority",
+      });
+      Object.defineProperty(f.tokens, method, descriptor);
+    }
+    expect(getterCalls).toBe(0);
+    expect((await read.call(f.tokens, original, f.actualSql)).claims.tokenId).toBe(f.input.tokenId);
+  });
+
+  test("never trusts a positive replacement of the public plain-claims verifier", async () => {
+    const f = await tenantRunOriginalFixture();
+    const original = await f.tokens.openTakoformTenantRunOriginal(f.issued.token);
+    const view = await f.tokens.readTakoformTenantRunOriginal(original, f.actualSql);
+    f.tokens.verifyTakoformTenantRunToken = async () => view.claims;
+    await expect(
+      f.tokens.openTakoformTenantRunOriginal("not-a-signed-token"),
+    ).rejects.toMatchObject({ code: "malformed_token" });
+    expect(await f.tokens.readTakoformTenantRunOriginal(original, f.actualSql)).toBe(view);
+    await sql.run("DELETE FROM sponsorship_credential_issuance_operations WHERE token_id = ?", [
+      f.input.tokenId,
+    ]);
+    await expect(f.tokens.verifyTakoformTenantRunToken(f.issued.token)).resolves.toBe(view.claims);
+    await expect(
+      f.tokens.readTakoformTenantRunOriginal(original, f.actualSql),
+    ).rejects.toMatchObject({ code: "invalid_credential_authority" });
+  });
+
+  test("preserves custom admission's plain API but cannot mint built-in issuance provenance from it", async () => {
+    const f = await tenantRunOriginalFixture();
+    await sql.run("DELETE FROM sponsorship_credential_issuance_operations WHERE token_id = ?", [
+      f.input.tokenId,
+    ]);
+    let customAdmissions = 0;
+    const custom = createTokenService({
+      sql,
+      issuer: ISSUER,
+      clock,
+      keyCacheSeconds: 0,
+      tenantRunCredentialAdmission: {
+        async assertAdmitted() {
+          customAdmissions += 1;
+        },
+      },
+    });
+    expect((await custom.verifyTakoformTenantRunToken(f.issued.token)).tokenId).toBe(
+      f.input.tokenId,
+    );
+    expect(customAdmissions).toBe(1);
+    await expect(custom.openTakoformTenantRunOriginal(f.issued.token)).rejects.toMatchObject({
+      code: "invalid_credential_authority",
+    });
+    expect(customAdmissions).toBe(1);
+    await expect(f.tokens.openTakoformTenantRunOriginal(f.issued.token)).rejects.toMatchObject({
+      code: "invalid_credential_authority",
+    });
+  });
+
+  test("revalidates all six issuance columns and rejects a withdrawn original", async () => {
+    const f = await tenantRunOriginalFixture();
+    const original = await f.tokens.openTakoformTenantRunOriginal(f.issued.token);
+    for (const [column, changed, previous] of [
+      ["org_id", "org_other", f.input.organizationId],
+      ["tenant_ref", "tenant_other", f.input.tenantRef],
+      ["issued_at_epoch_seconds", f.input.issuedAtEpochSeconds - 1, f.input.issuedAtEpochSeconds],
+      [
+        "expires_at_epoch_seconds",
+        f.input.issuedAtEpochSeconds + 301,
+        f.input.issuedAtEpochSeconds + f.input.ttlSeconds,
+      ],
+      ["credential_key_id", "other-credential-key", f.key.keyId],
+    ] as const) {
+      await sql.run(
+        `UPDATE sponsorship_credential_issuance_operations SET ${column} = ? WHERE token_id = ?`,
+        [changed, f.input.tokenId],
+      );
+      await expect(
+        f.tokens.readTakoformTenantRunOriginal(original, f.actualSql),
+      ).rejects.toMatchObject({ code: "invalid_credential_authority" });
+      await sql.run(
+        `UPDATE sponsorship_credential_issuance_operations SET ${column} = ? WHERE token_id = ?`,
+        [previous, f.input.tokenId],
+      );
+    }
+    await sql.run(
+      "UPDATE sponsorship_credential_issuance_operations SET token_id = ? WHERE token_id = ?",
+      ["tok_other", f.input.tokenId],
+    );
+    await expect(
+      f.tokens.readTakoformTenantRunOriginal(original, f.actualSql),
+    ).rejects.toMatchObject({ code: "invalid_credential_authority" });
+  });
+
+  test("reopens the signature and active key on each read under the existing key-cache policy", async () => {
+    const f = await tenantRunOriginalFixture();
+    const wrongKey = await provisionKey("wrong-original-signing-key");
+    const wrong = await sponsorshipIssuer(wrongKey).issue(f.input);
+    await expect(f.tokens.openTakoformTenantRunOriginal(wrong.token)).rejects.toMatchObject({
+      code: "invalid_credential_authority",
+    });
+    const original = await f.tokens.openTakoformTenantRunOriginal(f.issued.token);
+    await sql.run("UPDATE runtime_grant_keys SET revoked_at_epoch_seconds = ? WHERE key_id = ?", [
+      Math.floor(NOW / 1_000),
+      f.key.keyId,
+    ]);
+    await expect(
+      f.tokens.readTakoformTenantRunOriginal(original, f.actualSql),
+    ).rejects.toMatchObject({ code: "unknown_key" });
+  });
+
+  test("rejects changed construction or Sql query descriptors without calling their replacements", async () => {
+    const f = await tenantRunOriginalFixture();
+    const options = { sql: f.actualSql, issuer: ISSUER, clock, keyCacheSeconds: 0 };
+    const tokens = createTokenService(options);
+    const original = await tokens.openTakoformTenantRunOriginal(f.issued.token);
+    const queryDescriptor = Object.getOwnPropertyDescriptor(f.actualSql, "query");
+    if (!queryDescriptor) throw new Error("missing original Sql query");
+    let getterCalls = 0;
+    Object.defineProperty(f.actualSql, "query", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        throw new Error("must not invoke replacement Sql");
+      },
+    });
+    await expect(tokens.readTakoformTenantRunOriginal(original, f.actualSql)).rejects.toMatchObject(
+      { code: "invalid_credential_authority" },
+    );
+    Object.defineProperty(f.actualSql, "query", queryDescriptor);
+    Object.defineProperty(options, "sql", {
+      configurable: true,
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        throw new Error("must not invoke replacement option");
+      },
+    });
+    await expect(tokens.readTakoformTenantRunOriginal(original, f.actualSql)).rejects.toMatchObject(
+      { code: "invalid_credential_authority" },
+    );
+    expect(getterCalls).toBe(0);
+  });
+
+  test("rejects issuance withdrawal, expiry, replaced methods and close after real SQLite awaits", async () => {
+    const held = deferredOriginalSql();
+    const f = await tenantRunOriginalFixture(true, held.port);
+    const original = await f.tokens.openTakoformTenantRunOriginal(f.issued.token);
+
+    const withdrawal = held.nextIssuanceRead(1);
+    const withdrawnRead = f.tokens.readTakoformTenantRunOriginal(original, f.actualSql);
+    await reachOriginalRead(withdrawal.reached, withdrawnRead);
+    await sql.run("DELETE FROM sponsorship_credential_issuance_operations WHERE token_id = ?", [
+      f.input.tokenId,
+    ]);
+    withdrawal.release();
+    await expect(withdrawnRead).rejects.toMatchObject({ code: "invalid_credential_authority" });
+    await admitSponsorshipCredential(f.input, f.key.keyId);
+
+    const expiry = held.nextIssuanceRead(2);
+    const expiredRead = f.tokens.readTakoformTenantRunOriginal(original, f.actualSql);
+    await reachOriginalRead(expiry.reached, expiredRead);
+    now += f.input.ttlSeconds * 1_000;
+    expiry.release();
+    await expect(expiredRead).rejects.toMatchObject({ code: "token_expired" });
+    now = NOW;
+
+    const replacement = held.nextIssuanceRead(2);
+    const replacedRead = f.tokens.readTakoformTenantRunOriginal(original, f.actualSql);
+    await reachOriginalRead(replacement.reached, replacedRead);
+    const originalRead = f.tokens.readTakoformTenantRunOriginal;
+    f.tokens.readTakoformTenantRunOriginal = async () => {
+      throw new Error("not the original callable");
+    };
+    replacement.release();
+    await expect(replacedRead).rejects.toMatchObject({ code: "invalid_credential_authority" });
+    f.tokens.readTakoformTenantRunOriginal = originalRead;
+
+    const closing = held.nextIssuanceRead(2);
+    const closedRead = f.tokens.readTakoformTenantRunOriginal(original, f.actualSql);
+    await reachOriginalRead(closing.reached, closedRead);
+    f.tokens.closeTakoformTenantRunOriginal(original, f.actualSql);
+    closing.release();
+    await expect(closedRead).rejects.toMatchObject({ code: "invalid_credential_authority" });
+    await expect(
+      f.tokens.readTakoformTenantRunOriginal(original, f.actualSql),
+    ).rejects.toMatchObject({ code: "invalid_credential_authority" });
+    expect(() => f.tokens.closeTakoformTenantRunOriginal(original, f.actualSql)).not.toThrow();
+  });
+});
+
+describe("tenant-run original final public continuation", () => {
+  test("refuses close between the inner read resolution and the public read continuation", async () => {
+    const actualSql = sql;
+    const events: string[] = [];
+    let armed = false;
+    let finalReadCount = 0;
+    let closeOriginal: (() => void) | undefined;
+    const port: Sql = {
+      async query(statement, params) {
+        const rows = await actualSql.query(statement, params);
+        if (armed && statement.includes("FROM sponsorship_credential_issuance_operations")) {
+          finalReadCount += 1;
+          if (finalReadCount === 2) {
+            const close = closeOriginal;
+            if (!close) throw new Error("original close is not installed");
+            events.push("final-issuance-rows");
+            // The three jobs interleave with verifyOriginal and inner read
+            // resolution, closing before the outer public continuation.
+            queueMicrotask(() => {
+              events.push("microtask-1");
+              queueMicrotask(() => {
+                events.push("microtask-2");
+                queueMicrotask(() => {
+                  events.push("close");
+                  close();
+                });
+              });
+            });
+          }
+        }
+        return rows;
+      },
+      run: actualSql.run.bind(actualSql),
+      batch: actualSql.batch.bind(actualSql),
+    };
+    const f = await tenantRunOriginalFixture(true, port);
+    const original = await f.tokens.openTakoformTenantRunOriginal(f.issued.token);
+    closeOriginal = () => f.tokens.closeTakoformTenantRunOriginal(original, port);
+    armed = true;
+    const publicRead = f.tokens.readTakoformTenantRunOriginal(original, port).then(
+      (view) => {
+        events.push("public-resolved");
+        return view;
+      },
+      (error: unknown) => {
+        events.push("public-rejected");
+        throw error;
+      },
+    );
+    await expect(publicRead).rejects.toMatchObject({ code: "invalid_credential_authority" });
+    expect(finalReadCount).toBe(2);
+    expect(events).toEqual([
+      "final-issuance-rows",
+      "microtask-1",
+      "microtask-2",
+      "close",
+      "public-rejected",
+    ]);
+    await expect(f.tokens.readTakoformTenantRunOriginal(original, port)).rejects.toMatchObject({
+      code: "invalid_credential_authority",
+    });
+  });
+});
