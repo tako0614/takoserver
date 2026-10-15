@@ -307,6 +307,12 @@ textarea {
     white-space: nowrap;
   }
 
+  /* Bold would widen the current link and move where the strip wraps, so
+     the strip's height would change between pages. */
+  .rail__link[aria-current="page"] {
+    font-weight: inherit;
+  }
+
   .topbar {
     min-height: 48px;
     overflow-x: auto;
