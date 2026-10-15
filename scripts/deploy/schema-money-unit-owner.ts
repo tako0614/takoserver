@@ -13,7 +13,12 @@ import {
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { mutationError, preflightError } from "./errors.ts";
-import { CloudflareIntegrationStorageProvider } from "./integration-storage-generation.ts";
+import {
+  CloudflareIntegrationStorageProvider,
+  type IntegrationStorageGenerationInvocation,
+  type IntegrationStorageOriginalCreateOptions,
+  verifyIntegrationStorageOriginalCreate,
+} from "./integration-storage-generation.ts";
 import {
   type CommandResult,
   REPOSITORY,
@@ -31,8 +36,10 @@ import {
   type MoneyReviewProof,
   type MoneyStageOriginProof,
   type MoneyUnitCutoverOptions,
+  type MoneyUnitResumeState,
   type MoneyWriterProof,
   moneyCutoverBindingDigest,
+  readMoneyUnitResumeState,
 } from "./schema-money-unit-cutover.ts";
 import { exactV2MaintenanceModuleDigest } from "./schema-v2-existing-transition.ts";
 import type { DeployTarget } from "./target.ts";
@@ -110,8 +117,8 @@ interface Declaration {
   readonly resumeSourceRoot?: string;
   readonly resumePublicationReceiptPath?: string;
   readonly resumePublicationReceiptDigest?: string;
-  readonly originCertificatePath: string;
-  readonly originCertificateDigest: string;
+  readonly originCertificatePath?: string;
+  readonly originCertificateDigest?: string;
   readonly privateWriterScopePath: string;
   readonly privateWriterScopeDigest: string;
   readonly privateSourceRoot?: string;
@@ -378,7 +385,7 @@ function requireReviewer(value: unknown): value is string {
   );
 }
 
-function parseDeclaration(value: unknown, target: DeployTarget): Declaration {
+function parseDeclaration(value: unknown, target: DeployTarget, originalRead = false): Declaration {
   const required = [
     "kind",
     "phase",
@@ -393,8 +400,7 @@ function parseDeclaration(value: unknown, target: DeployTarget): Declaration {
     "maintenanceSourceRoot",
     "maintenancePublicationReceiptPath",
     "maintenancePublicationReceiptDigest",
-    "originCertificatePath",
-    "originCertificateDigest",
+    ...(originalRead ? [] : ["originCertificatePath", "originCertificateDigest"]),
     "privateWriterScopePath",
     "privateWriterScopeDigest",
     "reviewEvidencePath",
@@ -432,11 +438,14 @@ function parseDeclaration(value: unknown, target: DeployTarget): Declaration {
     !scopedWorkersDevOrigin(target) ||
     !ACCOUNT.test(target.accountId) ||
     !UUID.test(target.d1.databaseId) ||
-    !STAGE.test(target.d1.databaseName) ||
+    !(
+      STAGE.test(target.d1.databaseName) ||
+      (originalRead && /^integration-ts-[0-9a-f]{32}$/u.test(target.d1.databaseName))
+    ) ||
     target.r2.bucketName !== target.d1.databaseName ||
     !requireCommit(value.maintenanceCommit) ||
     !requireSha(value.maintenanceModuleDigest) ||
-    !requireSha(value.originCertificateDigest) ||
+    (!originalRead && !requireSha(value.originCertificateDigest)) ||
     !requireSha(value.privateWriterScopeDigest) ||
     !requireSha(value.maintenancePublicationReceiptDigest) ||
     (standaloneMoneyTarget(target)
@@ -972,7 +981,7 @@ async function inspectStandalonePublicSourceArchive(
   return digest(inventory);
 }
 
-function custody(directory: string): MoneyCutoverCustody {
+function custody(directory: string, originalRead = false): MoneyCutoverCustody {
   protectedDirectory(directory, "money custody directory");
   const path = (phase: MoneyCutoverPhase, state: "dispatched" | "terminal") =>
     join(directory, `${phase}.${state}.json`);
@@ -1025,7 +1034,10 @@ function custody(directory: string): MoneyCutoverCustody {
       value.phase !== phase ||
       !ACCOUNT.test(String(value.accountId)) ||
       !UUID.test(String(value.databaseId)) ||
-      !STAGE.test(String(value.databaseName)) ||
+      !(
+        STAGE.test(String(value.databaseName)) ||
+        (originalRead && /^integration-ts-[0-9a-f]{32}$/u.test(String(value.databaseName)))
+      ) ||
       !requireCommit(value.sourceCommit) ||
       !["0092", "0092-fenced", "0093", "0093-fenced", "0094", "0094-fenced"].includes(
         String(value.afterSchemaPhase),
@@ -1229,9 +1241,89 @@ export async function loadMoneyUnitCutoverOptions(
   target: DeployTarget,
   dependencies: MoneyUnitOwnerDependencies = {},
 ): Promise<MoneyUnitCutoverOptions> {
+  // Read selection never grants the historical writer a new namespace.
+  if (!STAGE.test(target.d1.databaseName))
+    throw preflightError("money cutover writer requires its existing legacy staging origin");
+  return loadMoneyUnitOwnerOptions(declarationPath, target, dependencies);
+}
+
+export interface MoneyUnitOriginalOriginRead {
+  readonly invocation: IntegrationStorageGenerationInvocation;
+  readonly originalTarget: DeployTarget;
+  readonly custody: IntegrationStorageOriginalCreateOptions;
+}
+
+export interface MoneyUnitResumeReadRequest {
+  readonly selectedTarget: DeployTarget;
+  readonly declarationPath: string;
+  /** Original locators, never a saved original-create result or certificate. */
+  readonly original?: MoneyUnitOriginalOriginRead;
+}
+
+export interface MoneyUnitResumeReadback extends MoneyUnitResumeState {
+  readonly qualification: "provider-native-readback" | "component-simulation-only";
+  readonly originalOriginQualification:
+    | "independent-origin-review-required"
+    | "legacy-reviewed-origin";
+}
+
+/** Reads existing authority; it cannot dispatch, reconcile or terminalize a transition. */
+export async function readIntegrationMoneyUnitResumeState(
+  request: MoneyUnitResumeReadRequest,
+  dependencies: MoneyUnitOwnerDependencies = {},
+): Promise<MoneyUnitResumeReadback> {
+  const target = request.selectedTarget;
+  if (
+    Object.keys(request).some(
+      (key) => !["selectedTarget", "declarationPath", "original"].includes(key),
+    ) ||
+    target.environment !== "integration" ||
+    (request.original !== undefined &&
+      (Object.keys(request.original).sort().join(",") !== "custody,invocation,originalTarget" ||
+        !/^integration-ts-[0-9a-f]{32}$/u.test(target.d1.databaseName))) ||
+    (!STAGE.test(target.d1.databaseName) && request.original === undefined)
+  )
+    throw preflightError("money resume read requires exact target and original-origin locators");
+  const snapshot = JSON.stringify(request);
+  const assertSelection = () => {
+    if (JSON.stringify(request) !== snapshot)
+      throw preflightError("money resume read selection changed during observation");
+  };
+  const options = await loadMoneyUnitOwnerOptions(
+    request.declarationPath,
+    target,
+    dependencies,
+    request.original,
+  );
+  assertSelection();
+  const state = await readMoneyUnitResumeState(target, options);
+  assertSelection();
+  return {
+    ...state,
+    originalOriginQualification:
+      request.original === undefined
+        ? "legacy-reviewed-origin"
+        : "independent-origin-review-required",
+    qualification:
+      dependencies.state !== undefined ||
+      dependencies.storage !== undefined ||
+      dependencies.fetcher !== undefined ||
+      dependencies.publicArtifactBuilder !== undefined
+        ? "component-simulation-only"
+        : "provider-native-readback",
+  };
+}
+
+async function loadMoneyUnitOwnerOptions(
+  declarationPath: string,
+  target: DeployTarget,
+  dependencies: MoneyUnitOwnerDependencies,
+  originalRead?: MoneyUnitOriginalOriginRead,
+): Promise<MoneyUnitCutoverOptions> {
   const declaration = parseDeclaration(
     protectedJson(declarationPath, "money owner declaration"),
     target,
+    originalRead !== undefined,
   );
   for (const directory of [
     declaration.custodyDirectory,
@@ -1239,14 +1331,55 @@ export async function loadMoneyUnitCutoverOptions(
     declaration.leaseRoot,
   ])
     protectedDirectory(directory, "money owner directory");
-  parseOrigin(
-    protectedJson(
-      declaration.originCertificatePath,
-      "money 0092 origin",
-      declaration.originCertificateDigest,
-    ),
-    target,
-  );
+  const readOrigin = async (): Promise<MoneyStageOriginProof> => {
+    if (originalRead === undefined) {
+      if (
+        declaration.originCertificatePath === undefined ||
+        declaration.originCertificateDigest === undefined
+      )
+        throw preflightError("money legacy origin certificate selector is incomplete");
+      return parseOrigin(
+        protectedJson(
+          declaration.originCertificatePath,
+          "money 0092 origin",
+          declaration.originCertificateDigest,
+        ),
+        target,
+      );
+    }
+    const observed = await verifyIntegrationStorageOriginalCreate(
+      originalRead.invocation,
+      originalRead.originalTarget,
+      target,
+      {
+        originalCreate: originalRead.custody,
+        ...(dependencies.run === undefined ? {} : { run: dependencies.run }),
+        ...(dependencies.cloudflareEnvironment === undefined
+          ? {}
+          : { cloudflareEnvironment: dependencies.cloudflareEnvironment }),
+      },
+    );
+    if (
+      observed.qualification !== "independent-origin-review-required" ||
+      observed.originalCreate.kind !== "takoserver.integration-fresh-0092-original-create@v1" ||
+      observed.originalCreate.authority !== "provider-native" ||
+      observed.nativeReadback.authority !== "provider-native" ||
+      observed.originalCreate.migrationDigest !== SOURCE_0092
+    )
+      throw preflightError("money resume read requires the genuine native original 0092 custody");
+    return {
+      kind: "takoserver.money-stage-origin@v1",
+      state: "terminal",
+      accountId: observed.originalCreate.accountId,
+      databaseId: observed.originalCreate.databaseId,
+      databaseName: observed.originalCreate.databaseName,
+      bucketName: observed.originalCreate.bucketName,
+      sourceDigest: SOURCE_0092,
+      sourceCommit: observed.originalCreate.sourceCommit,
+      terminalCustodyDigest: observed.originalCreate.terminalCustodyDigest,
+    };
+  };
+  await readOrigin();
   const scope = parsePrivateScope(
     protectedJson(
       declaration.privateWriterScopePath,
@@ -1643,16 +1776,7 @@ export async function loadMoneyUnitCutoverOptions(
     writerEpoch: declaration.writerEpoch,
     maintenanceCommit: declaration.maintenanceCommit,
     ...(declaration.resumeCommit === undefined ? {} : { resumeCommit: declaration.resumeCommit }),
-    async stageOriginProof() {
-      return parseOrigin(
-        protectedJson(
-          declaration.originCertificatePath,
-          "money 0092 origin",
-          declaration.originCertificateDigest,
-        ),
-        target,
-      );
-    },
+    stageOriginProof: readOrigin,
     async storageIdentityRead() {
       const [d1, r2] = await Promise.all([
         selectedStorage.getD1(target.d1.databaseId),
@@ -1748,7 +1872,7 @@ export async function loadMoneyUnitCutoverOptions(
       }
       return value as unknown as MoneyReviewProof;
     },
-    custody: custody(declaration.custodyDirectory),
+    custody: custody(declaration.custodyDirectory, originalRead !== undefined),
     backupPath: declaration.backupPath,
     ...(declaration.classificationManifestPath === undefined
       ? {}

@@ -16,10 +16,15 @@ import {
   assertMoneyLiveBackupCompleteness,
   assertMoneyNativeForeignKeys,
   buildMoneyCutoverImportSql,
+  inspectMoneyUnitResumeState,
   MONEY_FENCE_TABLES_0092,
+  type MoneyCutoverCustodyReceipt,
   type MoneyCutoverDispatchBinding,
+  type MoneyResumeProof,
   type MoneyReviewBinding,
+  type MoneyReviewProof,
   type MoneyStageOriginProof,
+  type MoneyUnitCutoverOptions,
   moneyCutoverBindingDigest,
   moneyUnitCutoverExpectedShape,
   moneyUnitCutoverSchemaMatches,
@@ -31,6 +36,7 @@ import {
   reconcileMoneyCutoverDispatched,
   runIntegrationMoneyUnitCutover,
 } from "../scripts/deploy/schema-money-unit-cutover.ts";
+import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { createMoneyCutoverSql, inspectMoneyCutoverGuard } from "../src/money-cutover-sql.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 
@@ -90,6 +96,416 @@ const reader = (database: Database) => ({
   async query(_phase: unknown, _description: unknown, query: string) {
     return database.query(query).all() as Record<string, unknown>[];
   },
+});
+
+/** Actual fixed SQL and SQLite; native proof/health below are controlled component ports. */
+async function resumeReadFixture() {
+  const database = fixture();
+  const directory = mkdtempSync(join(tmpdir(), "money-resume-read-component-"));
+  const databaseName = `integration-ts-${"a".repeat(32)}`;
+  const target: DeployTarget = {
+    kind: "takoserver.deploy-target@v2",
+    environment: "integration",
+    accountId: "1".repeat(32),
+    workerName: "integration-money-host",
+    publicOrigin: "https://integration-money-host.test.workers.dev",
+    d1: { databaseId: "11111111-1111-4111-8111-111111111111", databaseName },
+    r2: { bucketName: databaseName },
+    signing: { currentKeyId: "test-key" },
+    moneyCutoverWriterPolicy: "transaction-fenced-usd-micros-v1",
+    moneyCutoverWriterEpoch: writerEpoch,
+  };
+  const identity = {
+    accountId: target.accountId,
+    databaseId: target.d1.databaseId,
+    databaseName,
+    bucketName: databaseName,
+  };
+  const origin: MoneyStageOriginProof = {
+    kind: "takoserver.money-stage-origin@v1",
+    state: "terminal",
+    ...identity,
+    sourceDigest: "sha256:6f7c1016b7ffeeb7c02006cdb8e55dc7919bfc2aeaf04c090001dcf423454be2",
+    sourceCommit: "a".repeat(40),
+    terminalCustodyDigest: marker,
+  };
+  const originDigest = sha(JSON.stringify(origin));
+  const cursor = database.query("SELECT cursor_handle FROM wallet_credit_lots").get() as {
+    cursor_handle: string;
+  };
+  const originalSql = `${buildD1MigrationImport(files.slice(0, 92), { freshLedger: true }).sql}\nINSERT INTO ledger (id, org_id, type, ref, settled_delta, held_delta, created_at) VALUES ('fund-1','org-1','funding','credit-1',7,0,'2026-01-01T00:00:00Z');\nINSERT INTO wallet_credit_lots (org_id, ref, kind, amount_minor, expires_at, created_at, cursor_handle) VALUES ('org-1','credit-1','direct',7,NULL,'2026-01-01T00:00:00Z','${cursor.cursor_handle}');\n`;
+  const normalized = normalizeSnapshotDump(Buffer.from(originalSql));
+  const backup = {
+    digest: normalized.digest,
+    preimageDigest: await readMoneyPreimageDigest(reader(database), "preflight"),
+    aggregateDigest: await readMoneyAggregateDigest(reader(database), "preflight"),
+    financialDigest: await readMoneyFrozenDataDigest(reader(database), "preflight"),
+    allDataDigest: marker,
+    rowCounts: {},
+  };
+  const classifications = [
+    {
+      org_id: "org-1",
+      ref: "credit-1",
+      original_kind: "direct",
+      original_amount_minor: "7",
+      original_expires_at: null,
+      consumption_class: "free",
+      evidence_ref: "review://credit-1",
+      reviewed_at: "2026-01-01T00:00:00Z",
+    },
+  ] as const;
+  const classificationPath = join(directory, "classifications.json");
+  const classificationBytes = `${JSON.stringify(classifications)}\n`;
+  writeFileSync(classificationPath, classificationBytes, { mode: 0o600 });
+  const native: MoneyResumeProof = {
+    kind: "takoserver.money-resume-worker@v1",
+    accountId: target.accountId,
+    databaseId: target.d1.databaseId,
+    workerName: target.workerName,
+    sourceCommit: "b".repeat(40),
+    moduleDigest: marker,
+    deploymentId: target.d1.databaseId,
+    versionId: target.d1.databaseId,
+    trafficPercent: 100,
+    writerContainmentPolicy: "transaction-fenced-usd-micros-v1",
+    writerEpoch,
+    privateScopeDigest: marker,
+    privateSourceInventoryDigest: marker,
+    privateDependencyClosureDigest: marker,
+    privateDeploymentsDigest: marker,
+    publicPublicationDigest: marker,
+    publicSourceArtifactDigest: marker,
+  };
+  const anchor = sha(
+    JSON.stringify({
+      kind: "takoserver.money-freeze-anchor@v1",
+      target: identity,
+      originDigest,
+      backupDigest: backup.digest,
+      preimageDigest: backup.preimageDigest,
+      aggregateDigest: backup.aggregateDigest,
+      financialDigest: backup.financialDigest,
+      writerDigest: marker,
+      writerEpoch,
+      sourceDigest: origin.sourceDigest,
+    }),
+  );
+  const receipts = new Map<string, MoneyCutoverCustodyReceipt>();
+  const bindings = new Map<string, MoneyCutoverDispatchBinding>();
+  const reviews = new Map<string, MoneyReviewProof>();
+  let previous = origin.terminalCustodyDigest;
+  const advance = (phase: "freeze" | "prepare" | "classify" | "convert" | "resume") => {
+    const beforeShapeDigest = state(database).shapeDigest;
+    const sql = buildMoneyCutoverImportSql({
+      phase,
+      files,
+      anchor,
+      originDigest,
+      backupDigest: backup.digest,
+      writerDigest: marker,
+      writerEpoch,
+      classifications: phase === "freeze" || phase === "prepare" ? [] : classifications,
+    });
+    const sealedImportPath = join(directory, `${phase}.sql`);
+    writeFileSync(sealedImportPath, sql, { mode: 0o600 });
+    apply(database, sql);
+    const post = state(database);
+    const binding: MoneyCutoverDispatchBinding = {
+      kind: "takoserver.money-cutover-dispatch@v1",
+      phase,
+      accountId: target.accountId,
+      databaseId: target.d1.databaseId,
+      databaseName,
+      originDigest,
+      predecessorCustodyDigest: previous,
+      sourceCommit: "c".repeat(40),
+      sourceDigest: moneyUnitCutoverSourcePrefixDigest(
+        files,
+        phase === "convert" || phase === "resume" ? 94 : 93,
+      ),
+      importDigest: sha(sql),
+      backupDigest: backup.digest,
+      preimageDigest: backup.preimageDigest,
+      aggregateDigest: backup.aggregateDigest,
+      classificationDigest:
+        phase === "freeze" || phase === "prepare" ? sha("[]\n") : sha(classificationBytes),
+      writerDigest: marker,
+      resumeDigest: phase === "resume" ? sha(JSON.stringify(native)) : sha("no-resume-worker"),
+      writerEpoch,
+      reviewDigest: marker,
+      beforeShapeDigest,
+      afterSchemaPhase:
+        phase === "freeze"
+          ? "0092-fenced"
+          : phase === "resume"
+            ? "0094"
+            : phase === "convert"
+              ? "0094-fenced"
+              : "0093-fenced",
+      sealedImportPath,
+    };
+    const reviewBinding: MoneyReviewBinding = {
+      kind: "takoserver.money-review-binding@v1",
+      phase,
+      accountId: binding.accountId,
+      databaseId: binding.databaseId,
+      originDigest,
+      predecessorCustodyDigest: binding.predecessorCustodyDigest,
+      sourceCommit: binding.sourceCommit,
+      sourceDigest: binding.sourceDigest,
+      importDigest: binding.importDigest,
+      backupDigest: binding.backupDigest,
+      preimageDigest: binding.preimageDigest,
+      aggregateDigest: binding.aggregateDigest,
+      classificationDigest: binding.classificationDigest,
+      writerDigest: binding.writerDigest,
+      resumeDigest: binding.resumeDigest,
+      writerEpoch,
+    };
+    const review: MoneyReviewProof = {
+      kind: "takoserver.money-independent-review@v1",
+      reviewer: "component reviewer",
+      reviewRef: "review://component-sqlite-transition",
+      bindingDigest: moneyCutoverBindingDigest(reviewBinding),
+      evidenceDigest: marker,
+    };
+    const reviewedBinding = { ...binding, reviewDigest: sha(JSON.stringify(review)) };
+    reviews.set(phase, review);
+    const receipt: MoneyCutoverCustodyReceipt = {
+      kind: "takoserver.money-cutover-custody@v1",
+      phase,
+      state: "terminal",
+      bindingDigest: moneyCutoverBindingDigest(reviewedBinding),
+      postDigest: sha(
+        JSON.stringify({
+          applied: post.applied,
+          shapeDigest: post.shapeDigest,
+          preimageDigest: backup.preimageDigest,
+          aggregateDigest: backup.aggregateDigest,
+        }),
+      ),
+    };
+    bindings.set(phase, reviewedBinding);
+    receipts.set(phase, receipt);
+    previous = sha(JSON.stringify(receipt));
+  };
+  for (const phase of ["freeze", "prepare", "classify", "convert"] as const) advance(phase);
+  let mutations = 0;
+  let health: (expected: "guarded" | "healthy") => Promise<void> = async () => {};
+  let nativeRead: () => Promise<MoneyResumeProof> = async () => native;
+  const queries: string[] = [];
+  const options: MoneyUnitCutoverOptions = {
+    phase: "resume",
+    maintenanceCommit: "d".repeat(40),
+    resumeCommit: native.sourceCommit,
+    writerEpoch,
+    backupPath: join(directory, "backup.sql"),
+    classificationManifestPath: classificationPath,
+    classificationManifestDigest: sha(classificationBytes),
+    stageOriginProof: async () => origin,
+    storageIdentityRead: async () => identity,
+    maintenanceProof: async () => {
+      throw new Error("reader must not require a stale maintenance deployment");
+    },
+    resumeProof: () => nativeRead(),
+    resumeHealthRead: (expected) => health(expected),
+    independentReview: async (binding) => reviews.get(binding.phase) ?? null,
+    custody: {
+      read: async (phase) => receipts.get(phase) ?? null,
+      readDispatch: async (phase) => bindings.get(phase) ?? null,
+      dispatch: async () => {
+        mutations++;
+        throw new Error("dispatch");
+      },
+      terminal: async () => {
+        mutations++;
+        throw new Error("terminal");
+      },
+    },
+    run: async () => {
+      mutations++;
+      throw new Error("native command");
+    },
+  };
+  const inspect = () =>
+    inspectMoneyUnitResumeState({
+      target,
+      options,
+      files,
+      backup,
+      database: {
+        query: async (_phase, _description, query) => {
+          queries.push(query);
+          if (!/^(?:SELECT\b|PRAGMA foreign_key_check\b)/u.test(query))
+            throw new Error("non-read SQL");
+          return database.query(query).all() as Record<string, unknown>[];
+        },
+      },
+      readSchema: async () => state(database),
+    });
+  return {
+    database,
+    directory,
+    target,
+    options,
+    native,
+    receipts,
+    bindings,
+    queries,
+    advance,
+    inspect,
+    mutations: () => mutations,
+    setHealth: (read: typeof health) => {
+      health = read;
+    },
+    setNative: (read: typeof nativeRead) => {
+      nativeRead = read;
+    },
+    close: () => {
+      database.close();
+      rmSync(directory, { recursive: true, force: true });
+    },
+  };
+}
+
+describe("money resume read component", () => {
+  test("money resume read distinguishes guarded94 by actual freeze rows and never grants normal Host readiness", async () => {
+    const f = await resumeReadFixture();
+    try {
+      const result = await f.inspect();
+      expect(result.schemaPhase).toBe("0094-fenced");
+      expect(result.health).toBe("guarded");
+      expect(result.normalHostReady).toBe(false);
+      expect(result.resumeBindingDigest).toBeNull();
+      expect(
+        f.database.query("SELECT CAST(settled_delta_micros AS TEXT) AS amount FROM ledger").get(),
+      ).toEqual({ amount: "70000" });
+      expect(f.queries.length).toBeGreaterThan(0);
+      expect(f.mutations()).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+  test("money resume read rereads a terminal resume without requiring its deleted freeze row", async () => {
+    const f = await resumeReadFixture();
+    try {
+      const before = state(f.database);
+      f.advance("resume");
+      expect(state(f.database).shapeDigest).toBe(before.shapeDigest);
+      expect(f.database.query("SELECT * FROM money_cutover_freeze").all()).toEqual([]);
+      const result = await f.inspect();
+      expect(result.schemaPhase).toBe("0094");
+      expect(result.health).toBe("healthy");
+      expect(result.normalHostReady).toBe(false);
+      expect(result.resumeBindingDigest).not.toBeNull();
+      expect(f.mutations()).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+  test("money resume read holds unknown and missing custody even when current schema is complete", async () => {
+    const f = await resumeReadFixture();
+    try {
+      f.advance("resume");
+      const receipt = f.receipts.get("resume");
+      if (!receipt) throw new Error("fixture resume missing");
+      f.receipts.set("resume", { ...receipt, state: "dispatched", postDigest: null });
+      await expect(f.inspect()).rejects.toThrow("unknown resume dispatch");
+      f.receipts.delete("resume");
+      f.bindings.delete("resume");
+      await expect(f.inspect()).rejects.toThrow("lacks terminal resume custody");
+      expect(f.mutations()).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+  test("money resume read refuses exact-digest custody with changed predecessor origin backup or epoch", async () => {
+    const f = await resumeReadFixture();
+    try {
+      const binding = f.bindings.get("convert");
+      const receipt = f.receipts.get("convert");
+      if (!binding || !receipt) throw new Error("fixture convert missing");
+      for (const field of [
+        "predecessorCustodyDigest",
+        "originDigest",
+        "backupDigest",
+        "writerEpoch",
+      ] as const) {
+        const changed = { ...binding, [field]: sha(`changed-${field}`) };
+        f.bindings.set("convert", changed);
+        f.receipts.set("convert", {
+          ...receipt,
+          bindingDigest: moneyCutoverBindingDigest(changed),
+        });
+        await expect(f.inspect()).rejects.toThrow("dispatch differs");
+      }
+      expect(f.mutations()).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+  test("money resume read refuses retained import bytes changed after terminal custody", async () => {
+    const f = await resumeReadFixture();
+    try {
+      const binding = f.bindings.get("convert");
+      if (!binding) throw new Error("fixture missing");
+      writeFileSync(binding.sealedImportPath, "-- changed\n", { mode: 0o600 });
+      await expect(f.inspect()).rejects.toThrow("sealed import/source differs");
+      expect(f.mutations()).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+  test("money resume read detects a deferred native Version change across health await", async () => {
+    const f = await resumeReadFixture();
+    try {
+      let observed = f.native;
+      f.setNative(async () => observed);
+      f.setHealth(async () => {
+        await Promise.resolve();
+        observed = { ...f.native, versionId: "22222222-2222-4222-8222-222222222222" };
+      });
+      await expect(f.inspect()).rejects.toThrow("changed during observation");
+      expect(f.mutations()).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+  test("money resume read detects authorized epoch drift during its health observation", async () => {
+    const f = await resumeReadFixture();
+    try {
+      f.setHealth(async () => {
+        f.database.exec(
+          `UPDATE money_cutover_authorized_epoch SET writer_epoch = '${sha("drift")}'`,
+        );
+      });
+      await expect(f.inspect()).rejects.toThrow("changed during observation");
+      expect(f.mutations()).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+  test("money resume read selector cannot give the legacy money writer a new namespace", async () => {
+    const f = await resumeReadFixture();
+    try {
+      await expect(
+        runIntegrationMoneyUnitCutover(
+          {
+            action: "status",
+            environment: "integration",
+            commit: "c".repeat(40),
+            throughMigration: "0094",
+          },
+          f.target,
+          f.options,
+        ),
+      ).rejects.toThrow("terminal 0092 staging origin");
+      expect(f.mutations()).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
 });
 
 describe("fixed money cutover SQL", () => {

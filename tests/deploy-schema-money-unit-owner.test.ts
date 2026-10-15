@@ -5,8 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
 import { moneyCutoverBindingDigest } from "../scripts/deploy/schema-money-unit-cutover.ts";
-import { loadMoneyUnitCutoverOptions } from "../scripts/deploy/schema-money-unit-owner.ts";
-import type { DeployTarget } from "../scripts/deploy/target.ts";
+import {
+  loadMoneyUnitCutoverOptions,
+  readIntegrationMoneyUnitResumeState,
+} from "../scripts/deploy/schema-money-unit-owner.ts";
+import { type DeployTarget, loadTarget, parseDeployTarget } from "../scripts/deploy/target.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
 
 const account = "a".repeat(32);
@@ -465,6 +468,72 @@ function standaloneFixture(operatorIdentity?: NonNullable<DeployTarget["operator
 }
 
 describe("money unit owner adapter", () => {
+  test("money resume read admits prefixed policy only under its explicit read selector", async () => {
+    const f = fixture();
+    const { cloudflareProviderExecutor: _private, ...standalone } = target;
+    const pair = `integration-ts-${generation}`;
+    const selected = {
+      ...standalone,
+      d1: { databaseId, databaseName: pair },
+      r2: { bucketName: pair },
+      takoformV2: {
+        storageLineage: "v2-0092",
+        config: JSON.stringify({
+          documentation: "https://docs.example.test",
+          authenticationDocumentation: "https://auth.example.test",
+        }),
+      },
+    };
+    expect(() => parseDeployTarget(selected, "component target", "integration")).toThrow(
+      "money cutover writer policy",
+    );
+    const readTarget = parseDeployTarget(
+      selected,
+      "component target",
+      "integration",
+      "money-resume-read",
+    );
+    expect(readTarget.d1.databaseName).toBe(pair);
+    const path = join(f.root, "read-target.json");
+    f.write(path, selected);
+    expect(loadTarget(path, "integration", "money-resume-read")).toEqual(readTarget);
+    expect(() => loadTarget(path, "integration")).toThrow("money cutover writer policy");
+    await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, readTarget, f)).rejects.toThrow(
+      "existing legacy staging origin",
+    );
+    expect(f.requests).toEqual([]);
+  });
+
+  test("money resume read refuses a legacy certificate as original origin for the new namespace", async () => {
+    const f = fixture();
+    const pair = `integration-ts-${generation}`;
+    const selected = {
+      ...target,
+      d1: { databaseId, databaseName: pair },
+      r2: { bucketName: pair },
+    };
+    await expect(
+      readIntegrationMoneyUnitResumeState(
+        { selectedTarget: selected, declarationPath: f.paths.declaration },
+        f,
+      ),
+    ).rejects.toThrow("original-origin locators");
+    expect(f.requests).toEqual([]);
+  });
+
+  test("money resume read refuses JSON proof promotion before touching owner inputs", async () => {
+    const f = fixture();
+    const request = {
+      selectedTarget: target,
+      declarationPath: f.paths.declaration,
+      nativeResumeProof: { ready: true, schemaPhase: "0094" },
+    };
+    await expect(readIntegrationMoneyUnitResumeState(request, f)).rejects.toThrow(
+      "original-origin locators",
+    );
+    expect(f.requests).toEqual([]);
+  });
+
   test("accepts the qualified authority closure receipt and rejects other publication kinds", async () => {
     const f = standaloneFixture();
     const receipt = JSON.parse(readFileSync(f.paths.maintenancePublication, "utf8"));

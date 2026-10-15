@@ -292,7 +292,11 @@ export function targetPath(
   return isAbsolute(candidate) ? candidate : resolve(repositoryRoot, candidate);
 }
 
-export function loadTarget(path: string, environment: DeployEnvironment): DeployTarget {
+export function loadTarget(
+  path: string,
+  environment: DeployEnvironment,
+  operation: "deploy" | "money-resume-read" = "deploy",
+): DeployTarget {
   let raw: string;
   try {
     raw = readFileSync(path, "utf8");
@@ -340,7 +344,7 @@ export function loadTarget(path: string, environment: DeployEnvironment): Deploy
   } catch {
     throw preflightError(`deploy target descriptor is not valid JSON: ${path}`);
   }
-  return parseDeployTarget(parsed, path, environment);
+  return parseDeployTarget(parsed, path, environment, operation);
 }
 
 /** Top-level keys every complete deploy target carries. */
@@ -497,7 +501,11 @@ export function parseDeployTarget(
   value: unknown,
   source: string,
   environment: DeployEnvironment,
+  operation: "deploy" | "money-resume-read" = "deploy",
 ): DeployTarget {
+  if (operation !== "deploy" && operation !== "money-resume-read") {
+    throw preflightError("deploy target operation selector is invalid");
+  }
   if (!isRecord(value)) {
     throw preflightError(`deploy target descriptor must be an object: ${source}`);
   }
@@ -620,7 +628,11 @@ export function parseDeployTarget(
       target.artifactBlobIoMode !== undefined ||
       (target.takoformV2?.storageLineage !== "v2-0092" &&
         target.takoformV2?.appliedSchemaLineage !== "v2-0092") ||
-      !/^takoserver-i-[0-9a-f]{32}$/u.test(target.d1.databaseName) ||
+      !(
+        /^takoserver-i-[0-9a-f]{32}$/u.test(target.d1.databaseName) ||
+        (operation === "money-resume-read" &&
+          /^integration-ts-[0-9a-f]{32}$/u.test(target.d1.databaseName))
+      ) ||
       target.r2.bucketName !== target.d1.databaseName)
   ) {
     throw preflightError(
@@ -632,7 +644,11 @@ export function parseDeployTarget(
     (environment !== "integration" ||
       (target.takoformV2?.storageLineage !== "v2-0092" &&
         target.takoformV2?.appliedSchemaLineage !== "v2-0092") ||
-      !/^takoserver-i-[0-9a-f]{32}$/u.test(target.d1.databaseName) ||
+      !(
+        /^takoserver-i-[0-9a-f]{32}$/u.test(target.d1.databaseName) ||
+        (operation === "money-resume-read" &&
+          /^integration-ts-[0-9a-f]{32}$/u.test(target.d1.databaseName))
+      ) ||
       target.r2.bucketName !== target.d1.databaseName)
   ) {
     throw preflightError("money cutover writer policy requires selected integration 0092 storage");
