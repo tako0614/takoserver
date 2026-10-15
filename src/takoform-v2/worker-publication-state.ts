@@ -1743,10 +1743,8 @@ function createPublicationState(options: PublicationStateOptions, forwardFamily:
   async function capture(
     input: LivePublicationCaptureInput | CurrentServingCaptureInput,
   ): Promise<Capture | CurrentCapture> {
-    const forward = "forward" in input && input.forward === true;
-    const deploymentForm = forward
-      ? FORWARD_WORKER_DEPLOYMENT_FORM_URL
-      : WORKER_DEPLOYMENT_FORM_URL;
+    let forward = "forward" in input && input.forward === true;
+    let deploymentForm = forward ? FORWARD_WORKER_DEPLOYMENT_FORM_URL : WORKER_DEPLOYMENT_FORM_URL;
     const current = "currentServing" in input ? input.currentServing : null;
     const execution = "execution" in input ? input.execution : null;
     if (
@@ -1762,6 +1760,23 @@ function createPublicationState(options: PublicationStateOptions, forwardFamily:
     const own = initialOwn ?? (op ? await resource(op.resource_uid) : null);
     if (!op || !own) {
       return unresolved("graph_unresolved", "The accepted publication source is unavailable");
+    }
+    if (forwardFamily && own.form_url === WORKER_ENDPOINT_FORM_URL) {
+      // Endpoint keeps its owning03 identity. Select the accepted Deployment
+      // family from this same SQL owner/Space, never from request metadata.
+      const endpointWorker = workerUidFromOperation(op);
+      forward =
+        endpointWorker !== null &&
+        (
+          await matchingResources(
+            FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+            endpointWorker,
+            op.principal,
+            own.space,
+            true,
+          )
+        ).length > 0;
+      deploymentForm = forward ? FORWARD_WORKER_DEPLOYMENT_FORM_URL : WORKER_DEPLOYMENT_FORM_URL;
     }
     if (current && pendingStatuses.has(op.status)) {
       return unresolved("source_unsettled", "The serving source Operation is not terminal");

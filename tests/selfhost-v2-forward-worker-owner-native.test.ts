@@ -10,6 +10,7 @@ import type { JsonObject } from "../src/ports.ts";
 import {
   createSelfhostV2ForwardWorkerComposition,
   createSelfhostV2WorkerComposition,
+  type SelfhostV2ForwardWorkerCompositionOptions,
 } from "../src/selfhost-v2-worker-composition.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { readV2ConfiguredPrivateInputs } from "../src/takoform-v2/configured-private-inputs.ts";
@@ -26,6 +27,7 @@ import {
   FORWARD_WORKER_VERSION_FORM_URL,
   MODULE_WORKER_FORM_URL,
   WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_ENDPOINT_FORM_URL,
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import { createV2Store } from "../src/takoform-v2/store.ts";
@@ -135,7 +137,8 @@ async function fixture(nativeBinary: string | null = null) {
     binary = selected.binary;
   }
   const children: ReturnType<typeof spawnWorkerdWithParentDeath>[] = [];
-  const options = {
+  let composition: ReturnType<typeof createSelfhostV2ForwardWorkerComposition>;
+  const options: SelfhostV2ForwardWorkerCompositionOptions = {
     sql,
     objects,
     clock,
@@ -145,13 +148,40 @@ async function fixture(nativeBinary: string | null = null) {
     workerdBinary: binary,
     configuredInputSealer: createV2WorkerVersionConfiguredInputSealer(keyring),
     forwardConfiguredInputSealer: forwardSealer,
+    endpoint: {
+      assignHostname({ resourceUid }) {
+        return `fw-${resourceUid.slice(0, 8)}.example.test`;
+      },
+      async observeTls(input) {
+        const owner = await composition.ownerForWorkerUid(input.workerUid);
+        const serving = await owner.observeServing({
+          workerResourceUid: input.workerUid,
+          targetKey: TARGET,
+        });
+        return {
+          ...input,
+          ready: serving.kind === "serving" && serving.hostnames.includes(input.hostname),
+        };
+      },
+      async observeRouteAbsent(input) {
+        const owner = await composition.ownerForWorkerUid(input.workerUid);
+        const serving = await owner.observeServing({
+          workerResourceUid: input.workerUid,
+          targetKey: TARGET,
+        });
+        return {
+          ...input,
+          absent: serving.kind === "serving" && !serving.hostnames.includes(input.hostname),
+        };
+      },
+    },
     spawn(command: readonly string[]) {
       const child = spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "inherit" });
       children.push(child);
       return child;
     },
   };
-  let composition = createSelfhostV2ForwardWorkerComposition(options);
+  composition = createSelfhostV2ForwardWorkerComposition(options);
   await composition.restoreOwners();
   const held = createV2HeldArtifactSource({ objects, entries });
   const bundleHost = createWorkerBundleHost({ sql, targetKey: TARGET, source: held });
@@ -532,9 +562,13 @@ test.skipIf(native === undefined)(
       expect(
         await owner.observeServing({ workerResourceUid: b.worker.resourceUid, targetKey: TARGET }),
       ).toMatchObject({ kind: "serving", sourceOperationId: deployment.id });
-      const response = owner.dispatchServiceBinding(new Request("https://fixture.example.test/"));
-      if (response.kind !== "dispatched") throw new Error("actual native request was refused");
-      expect(await (await response.response).text()).toBe("native:synthetic-forward-secret");
+      const endpoint = await f.create(WORKER_ENDPOINT_FORM_URL, "endpoint", {
+        worker: { resourceUid: b.worker.resourceUid },
+      });
+      const address = `https://fw-${endpoint.resourceUid.slice(0, 8)}.example.test/`;
+      expect(await (await owner.fetch(new Request(address))).text()).toBe(
+        "native:synthetic-forward-secret",
+      );
       const count = f.children.length;
       expect(await f.reopen()).toContain(b.worker.resourceUid);
       expect(f.children.length).toBe(count + 1);
@@ -545,9 +579,10 @@ test.skipIf(native === undefined)(
           targetKey: TARGET,
         }),
       ).toMatchObject({ kind: "serving", sourceOperationId: deployment.id });
-      const after = reopened.dispatchServiceBinding(new Request("https://fixture.example.test/"));
-      if (after.kind !== "dispatched") throw new Error("recovered native request was refused");
-      expect(await (await after.response).text()).toBe("native:synthetic-forward-secret");
+      expect(await (await reopened.fetch(new Request(address))).text()).toBe(
+        "native:synthetic-forward-secret",
+      );
+      await f.remove(endpoint.resourceUid);
       await f.remove(deployment.resourceUid);
       expect(
         await reopened.observeRetirement({ workerVersionUid: b.version.resourceUid }),
