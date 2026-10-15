@@ -30,7 +30,7 @@ afterAll(() => rmSync(ROOT, { recursive: true, force: true }));
 
 const DIGEST = "sha256:152aefa3c0577809d419d95be2bc8878aa9a390a4ee40bfbf5501c32bf058bef";
 const GENERATION = "d".repeat(32);
-const GENERATED = `takoserver-i-${GENERATION}`;
+const GENERATED = `integration-takoserver-${GENERATION}`;
 const PRODUCTION_D1 = {
   databaseName: "takoserver-runtime",
   databaseId: "85c5a15d-a80f-42fe-a907-7ec0d86e008e",
