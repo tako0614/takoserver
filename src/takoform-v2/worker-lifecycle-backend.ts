@@ -20,6 +20,7 @@ import {
   parseObjectBucketSpec,
 } from "./forms/object-bucket.ts";
 import { resolveObjectBucketBackendId } from "./forms/object-bucket-backend.ts";
+import type { ObjectBucketBindingForm } from "./forms/object-bucket-binding-profile.ts";
 import type { ObjectBucketWorkerBindingClaim } from "./forms/object-bucket-worker-binding-authority.ts";
 import type { QueueWorkerBindingClaim } from "./forms/queue-worker-binding-authority.ts";
 import { parseSQLiteDatabaseSpec, SQLITE_DATABASE_FORM_URL } from "./forms/sqlite-database.ts";
@@ -50,7 +51,10 @@ import {
 } from "./worker-code-runtime.ts";
 import type { V2WorkerVersionResolution } from "./worker-publication-state.ts";
 import { projectV2ResolvedServiceBindings } from "./worker-service-resolution.ts";
-import { projectV2StaticWorkerVersion } from "./worker-static-runtime.ts";
+import {
+  projectV2ForwardStaticWorkerVersion,
+  projectV2StaticWorkerVersion,
+} from "./worker-static-runtime.ts";
 import type {
   V2WorkflowBindingResolution,
   V2WorkflowBindingTarget,
@@ -189,6 +193,7 @@ export interface V2CodeObjectBucketBindingBoot {
       readonly resourceUid: string;
     };
     readonly vector: string;
+    readonly targetFormUrl?: ObjectBucketBindingForm["formUrl"];
   } | null>;
 }
 
@@ -363,9 +368,15 @@ async function resolvedObjectBucketBindings(
   spec: WorkerVersionSpec,
   identity: { readonly principal: string; readonly space: string; readonly targetKey: string },
   expectedBackendId: string,
+  forwardBindings?: readonly ObjectBucketBindingForm[],
 ): Promise<readonly V2ResolvedObjectBucketBinding[] | null> {
   const resolved: V2ResolvedObjectBucketBinding[] = [];
   for (const binding of spec.bucketBindings) {
+    const selected = forwardBindings?.find(
+      (item) =>
+        item.publicName === binding.name && item.resourceUid === binding.resource.resourceUid,
+    );
+    if (forwardBindings !== undefined && !selected) return null;
     const rows = await sql.query(
       `SELECT r.spec_json, r.observed_json, r.output_json, r.backend_id
        FROM tf_v2_resources r JOIN tf_v2_operations op ON op.id = r.last_operation
@@ -379,7 +390,7 @@ async function resolvedObjectBucketBindings(
          AND op.accepted_spec_json = r.spec_json`,
       [
         binding.resource.resourceUid,
-        OBJECT_BUCKET_FORM_URL,
+        selected?.formUrl ?? OBJECT_BUCKET_FORM_URL,
         identity.principal,
         identity.space,
         identity.targetKey,
@@ -407,7 +418,11 @@ async function resolvedObjectBucketBindings(
     } catch {
       return null;
     }
-    resolved.push({ name: binding.name, resourceUid: binding.resource.resourceUid });
+    resolved.push({
+      name: binding.name,
+      resourceUid: binding.resource.resourceUid,
+      ...(selected ? { formUrl: selected.formUrl } : {}),
+    });
   }
   return resolved;
 }
@@ -493,11 +508,27 @@ export interface V2CodeConfiguredInputReader {
   }): Promise<Readonly<Record<string, string>> | null>;
 }
 
-export function createV2CodeConfiguredInputReader(options: {
+type ConfiguredReaderOptions = {
   readonly sql: Sql;
   readonly sealer: ConfiguredInputSealer;
   readonly custody: V2CodeConfiguredInputCustody;
-}): V2CodeConfiguredInputReader {
+};
+export function createV2CodeConfiguredInputReader(
+  options: ConfiguredReaderOptions,
+): V2CodeConfiguredInputReader {
+  return configuredInputReader(options, false);
+}
+export function createV2ForwardCodeConfiguredInputReader(
+  options: ConfiguredReaderOptions,
+): V2CodeConfiguredInputReader {
+  return configuredInputReader(options, true);
+}
+function configuredInputReader(
+  options: ConfiguredReaderOptions,
+  forward: boolean,
+): V2CodeConfiguredInputReader {
+  const form = forward ? FORWARD_WORKER_VERSION_FORM_URL : WORKER_VERSION_FORM_URL;
+  const parseSpec = forward ? parseForwardWorkerVersionSpec : parseWorkerVersionSpec;
   if (!options.sealer?.open || !options.custody?.read)
     throw new TypeError("configured input sealer and custody reader are required");
   const { sql } = options;
@@ -512,7 +543,7 @@ export function createV2CodeConfiguredInputReader(options: {
       const targetKey = input.targetKey;
       const stillCurrent = input.stillCurrent;
       try {
-        expected = parseWorkerVersionSpec(structuredClone(input.spec));
+        expected = parseSpec(structuredClone(input.spec));
       } catch {
         return null;
       }
@@ -522,15 +553,12 @@ export function createV2CodeConfiguredInputReader(options: {
           `SELECT name, spec_json FROM tf_v2_resources
            WHERE uid = ? AND principal = ? AND space = ? AND target_key = ?
              AND form_url = ? AND deleted_at IS NULL`,
-          [resourceUid, principal, space, targetKey, WORKER_VERSION_FORM_URL],
+          [resourceUid, principal, space, targetKey, form],
         )
       )[0];
       if (typeof row?.name !== "string" || typeof row.spec_json !== "string") return null;
       try {
-        if (
-          canonicalJson(parseWorkerVersionSpec(JSON.parse(row.spec_json))) !==
-          canonicalJson(expected)
-        )
+        if (canonicalJson(parseSpec(JSON.parse(row.spec_json))) !== canonicalJson(expected))
           return null;
       } catch {
         return null;
@@ -539,7 +567,7 @@ export function createV2CodeConfiguredInputReader(options: {
         principal,
         space,
         name: row.name,
-        form: WORKER_VERSION_FORM_URL,
+        form,
         resourceUid,
         spec: expected,
       };
@@ -589,7 +617,18 @@ export function createInternalV2CodeWorkerVersionForm(options: CodeWorkerVersion
   return codeWorkerVersionForm(options, WORKER_CODE_VERSION_LIFECYCLE_BACKEND_ID);
 }
 
-function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: string): V2Form {
+function codeWorkerVersionForm(
+  options: CodeWorkerVersionOptions,
+  backendId: string,
+  forward = false,
+): V2Form {
+  const parseSpec = forward
+    ? (value: unknown) => {
+        const spec = parseForwardWorkerVersionSpec(value);
+        if (spec.containerBindings.length) throw new TakoformV2Error("capability_required", 422);
+        return spec;
+      }
+    : parseWorkerVersionSpec;
   if (
     !options.targetKey ||
     !options.publicationState?.resolveVersion ||
@@ -647,7 +686,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
     throw new TypeError("configured input custody reader is required");
   }
   const configuredInputReader = configuredInputSealer
-    ? createV2CodeConfiguredInputReader({
+    ? (forward ? createV2ForwardCodeConfiguredInputReader : createV2CodeConfiguredInputReader)({
         sql,
         sealer: configuredInputSealer,
         custody: options.configuredInputCustody as V2CodeConfiguredInputCustody,
@@ -659,7 +698,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
 
   async function manage(execution: V2Execution): Promise<V2BackendResult> {
     if (
-      execution.form !== WORKER_VERSION_FORM_URL ||
+      execution.form !== (forward ? FORWARD_WORKER_VERSION_FORM_URL : WORKER_VERSION_FORM_URL) ||
       execution.targetKey !== targetKey ||
       execution.backendId !== backendId
     ) {
@@ -668,7 +707,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
     if (execution.action === "delete") {
       try {
         const spec = codeOnly(
-          parseWorkerVersionSpec(execution.spec),
+          parseSpec(execution.spec),
           configuredInputSealer !== undefined,
           queueSettlement,
           sqliteBinding,
@@ -687,7 +726,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
     }
     try {
       const spec = codeOnly(
-        parseWorkerVersionSpec(execution.spec),
+        parseSpec(execution.spec),
         configuredInputSealer !== undefined,
         queueSettlement,
         sqliteBinding,
@@ -748,6 +787,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
                 targetKey: execution.targetKey,
               },
               expectedObjectBucketBackendId,
+              snapshot.version.bucketBindings,
             )
           : [];
       if (resolvedBuckets === null) return unresolved();
@@ -817,6 +857,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
         ...(spec.bundle ? { bundleResourceUid: spec.bundle.resourceUid } : {}),
         ...(spec.assets ? { assetResourceUid: spec.assets.bundle.resourceUid } : {}),
         spec: snapshot.version.spec,
+        ...(forward ? { sourceForm: FORWARD_WORKER_VERSION_FORM_URL } : {}),
         bundle: materials.bundle,
         assets: materials.assets,
         inspectModule,
@@ -873,7 +914,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
   return {
     validateCreate(spec) {
       codeOnly(
-        validated(() => parseWorkerVersionSpec(spec)),
+        validated(() => parseSpec(spec)),
         configuredInputSealer !== undefined,
         queueSettlement,
         sqliteBinding,
@@ -886,7 +927,11 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
     },
     validateUpdate(previous, spec) {
       codeOnly(
-        validated(() => validateWorkerVersionUpdate(previous, spec)),
+        validated(() =>
+          forward
+            ? validateForwardWorkerVersionUpdate(previous, spec)
+            : validateWorkerVersionUpdate(previous, spec),
+        ),
         configuredInputSealer !== undefined,
         queueSettlement,
         sqliteBinding,
@@ -898,9 +943,13 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
       );
     },
     references(spec) {
-      return referencesForWorkerVersion(
+      const refs = forward
+        ? (spec: WorkerVersionSpec) =>
+            fixedReferencesForForwardWorkerVersion(parseForwardWorkerVersionSpec(spec))
+        : referencesForWorkerVersion;
+      return refs(
         codeOnly(
-          validated(() => parseWorkerVersionSpec(spec)),
+          validated(() => parseSpec(spec)),
           configuredInputSealer !== undefined,
           queueSettlement,
           sqliteBinding,
@@ -916,7 +965,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
       ? {
           privateInputs: {
             validateCreate(spec: JsonObject, inputs: Readonly<Record<string, string>> | undefined) {
-              const names = parseWorkerVersionSpec(spec).requiredSensitiveVars;
+              const names = parseSpec(spec).requiredSensitiveVars;
               const owned = snapshotV2WorkerPrivateInputs(inputs);
               if (
                 owned === null ||
@@ -934,7 +983,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
               inputs: Readonly<Record<string, string>> | undefined,
             ) {
               if (inputs === undefined) return;
-              const names = parseWorkerVersionSpec(spec).requiredSensitiveVars;
+              const names = parseSpec(spec).requiredSensitiveVars;
               const owned = snapshotV2WorkerPrivateInputs(inputs);
               if (
                 !owned ||
@@ -953,7 +1002,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
               readonly spec: JsonObject;
               readonly privateInputs: Readonly<Record<string, string>> | undefined;
             }) {
-              const spec = parseWorkerVersionSpec(input.spec);
+              const spec = parseSpec(input.spec);
               if (spec.requiredSensitiveVars.length === 0) return null;
               if (!sealConfigured) throw new TypeError("configured input sealer is unavailable");
               return await sealConfigured(
@@ -982,7 +1031,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
                 readonly ciphertext: string;
               } | null;
             }) {
-              const spec = parseWorkerVersionSpec(input.spec);
+              const spec = parseSpec(input.spec);
               if (spec.requiredSensitiveVars.length === 0) {
                 const emptyInputs = snapshotV2WorkerPrivateInputs(input.privateInputs);
                 if (
@@ -1020,6 +1069,7 @@ function codeWorkerVersionForm(options: CodeWorkerVersionOptions, backendId: str
           },
         }
       : {}),
+    ...(forward ? { prepareAdmission: prepareForwardWorkerVersionReferences } : {}),
     rejectDeleteWhileReferenced: true,
     backend: {
       id: backendId,
@@ -1048,7 +1098,12 @@ export function createInternalV2StaticWorkerVersionForm(
   return staticWorkerVersionForm(options, WORKER_VERSION_LIFECYCLE_BACKEND_ID);
 }
 
-function staticWorkerVersionForm(options: StaticWorkerVersionOptions, backendId: string): V2Form {
+function staticWorkerVersionForm(
+  options: StaticWorkerVersionOptions,
+  backendId: string,
+  forward = false,
+): V2Form {
+  const parseSpec = forward ? parseForwardWorkerVersionSpec : parseWorkerVersionSpec;
   if (
     !options.targetKey ||
     !options.publicationState?.resolveVersion ||
@@ -1064,7 +1119,7 @@ function staticWorkerVersionForm(options: StaticWorkerVersionOptions, backendId:
 
   async function manage(execution: V2Execution): Promise<V2BackendResult> {
     if (
-      execution.form !== WORKER_VERSION_FORM_URL ||
+      execution.form !== (forward ? FORWARD_WORKER_VERSION_FORM_URL : WORKER_VERSION_FORM_URL) ||
       execution.targetKey !== targetKey ||
       execution.backendId !== backendId
     ) {
@@ -1072,7 +1127,7 @@ function staticWorkerVersionForm(options: StaticWorkerVersionOptions, backendId:
     }
     if (execution.action === "delete") {
       try {
-        const spec = parseWorkerVersionSpec(execution.spec);
+        const spec = parseSpec(execution.spec);
         return (await retired(sql, observeRetired, execution, spec.worker.resourceUid, "version"))
           ? { kind: "complete", observed: {}, output: {} }
           : unresolved();
@@ -1081,7 +1136,7 @@ function staticWorkerVersionForm(options: StaticWorkerVersionOptions, backendId:
       }
     }
     try {
-      const spec = staticOnly(parseWorkerVersionSpec(execution.spec));
+      const spec = staticOnly(parseSpec(execution.spec));
       const resolution = await resolveVersion({ execution });
       if (resolution.kind !== "ready") return unresolved();
       const { snapshot } = resolution;
@@ -1099,7 +1154,7 @@ function staticWorkerVersionForm(options: StaticWorkerVersionOptions, backendId:
       const readMaterials = resolution.readMaterials.bind(resolution);
       const stillCurrent = resolution.stillCurrent.bind(resolution);
       const materials = await readMaterials();
-      await projectV2StaticWorkerVersion({
+      await (forward ? projectV2ForwardStaticWorkerVersion : projectV2StaticWorkerVersion)({
         identity: {
           directory: snapshot.worker.uid,
           hostnames: [],
@@ -1125,14 +1180,25 @@ function staticWorkerVersionForm(options: StaticWorkerVersionOptions, backendId:
 
   return {
     validateCreate(spec) {
-      staticOnly(validated(() => parseWorkerVersionSpec(spec)));
+      staticOnly(validated(() => parseSpec(spec)));
     },
     validateUpdate(previous, spec) {
-      staticOnly(validated(() => validateWorkerVersionUpdate(previous, spec)));
+      staticOnly(
+        validated(() =>
+          forward
+            ? validateForwardWorkerVersionUpdate(previous, spec)
+            : validateWorkerVersionUpdate(previous, spec),
+        ),
+      );
     },
     references(spec) {
-      return referencesForWorkerVersion(staticOnly(validated(() => parseWorkerVersionSpec(spec))));
+      return forward
+        ? fixedReferencesForForwardWorkerVersion(
+            parseForwardWorkerVersionSpec(staticOnly(validated(() => parseSpec(spec)))),
+          )
+        : referencesForWorkerVersion(staticOnly(validated(() => parseSpec(spec))));
     },
+    ...(forward ? { prepareAdmission: prepareForwardWorkerVersionReferences } : {}),
     rejectDeleteWhileReferenced: true,
     backend: {
       id: backendId,
@@ -1145,8 +1211,11 @@ function staticWorkerVersionForm(options: StaticWorkerVersionOptions, backendId:
 
 /** One internal Form identity for static, code, and code-plus-assets Versions. */
 export function createInternalV2WorkerVersionForm(options: CodeWorkerVersionOptions): V2Form {
-  const staticForm = staticWorkerVersionForm(options, WORKER_VERSION_UNIFIED_BACKEND_ID);
-  const codeForm = codeWorkerVersionForm(options, WORKER_VERSION_UNIFIED_BACKEND_ID);
+  return unifiedWorkerVersionForm(options, false);
+}
+function unifiedWorkerVersionForm(options: CodeWorkerVersionOptions, forward: boolean): V2Form {
+  const staticForm = staticWorkerVersionForm(options, WORKER_VERSION_UNIFIED_BACKEND_ID, forward);
+  const codeForm = codeWorkerVersionForm(options, WORKER_VERSION_UNIFIED_BACKEND_ID, forward);
   const selected = (spec: JsonObject): V2Form =>
     Object.hasOwn(spec, "bundle") ? codeForm : staticForm;
   return {
@@ -1162,6 +1231,7 @@ export function createInternalV2WorkerVersionForm(options: CodeWorkerVersionOpti
       return form.references(spec);
     },
     ...(codeForm.privateInputs ? { privateInputs: codeForm.privateInputs } : {}),
+    ...(forward ? { prepareAdmission: prepareForwardWorkerVersionReferences } : {}),
     rejectDeleteWhileReferenced: true,
     backend: {
       id: WORKER_VERSION_UNIFIED_BACKEND_ID,
@@ -1186,11 +1256,28 @@ import {
   validateForwardWorkerVersionUpdate,
 } from "./forms/worker-specs.ts";
 
-/** Accepted-source preparation only; the actual forward materializer is absent. */
-export function createInternalV2ForwardWorkerVersionForm(options: {
-  readonly targetKey: string;
-}): V2Form {
+/** Named07 factory. Actual ports select held materialization; target-only preparation remains refused. */
+export function createInternalV2ForwardWorkerVersionForm(
+  options:
+    | { readonly targetKey: string }
+    | (Omit<CodeWorkerVersionOptions, "publicationState"> & {
+        readonly publicationState: VersionState & {
+          resolveForwardVersion(input: {
+            execution: V2Execution;
+          }): Promise<V2WorkerVersionResolution>;
+        };
+      }),
+): V2Form {
   if (!options.targetKey) throw new TypeError("targetKey is required");
+  if ("sql" in options) {
+    const resolveForwardVersion = options.publicationState.resolveForwardVersion.bind(
+      options.publicationState,
+    );
+    return unifiedWorkerVersionForm(
+      { ...options, publicationState: { resolveVersion: resolveForwardVersion } },
+      true,
+    );
+  }
   const unavailable = async (execution: V2Execution): Promise<V2BackendResult> => ({
     kind: "unknown",
     code:

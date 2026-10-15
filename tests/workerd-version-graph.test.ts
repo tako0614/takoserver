@@ -1150,3 +1150,76 @@ test("omits both scalar Worker identity fields when no UID is supplied", () => {
   expect(Object.hasOwn(graph.site, "workerResourceUid")).toBe(false);
   expect(Object.hasOwn(graph.site, "fetchHandler")).toBe(false);
 });
+
+test("forward actual graph retains six old renderer byte outputs and selects exact per-binding Forms", () => {
+  for (const privateNames of [false, true]) {
+    for (const environment of [
+      [],
+      [{ name: "LABEL", value: "held", type: "plain_text" as const }],
+      [{ name: "FLAG", value: "true", type: "json" as const }],
+    ]) {
+      const input = graphInput({
+        environment,
+        generation: privateNames
+          ? "takoserver-v2-operation:11111111-1111-4111-8111-111111111111"
+          : "legacy-graph",
+      });
+      const graph = compileWorkerdVersionGraph(input);
+      const module = privateNames
+        ? WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE
+        : SELFHOST_WORKER_ENTRYPOINT_MODULE;
+      expect(source(graph.hostModules.get(module))).toBe(
+        selfhostWorkerEntrypointSource(
+          {
+            originalMainModule: input.mainModule,
+            declaredHandlers: input.declaredHandlers,
+            bindings: environment.map((row) => ({ name: row.name, type: row.type })),
+            publication: input.readiness.publication,
+            probeHostname: input.readiness.probeHostname,
+          },
+          privateNames,
+        ),
+      );
+    }
+  }
+  const profile = [
+    {
+      publicName: "NEW",
+      resourceUid: "bucket-new-001",
+      formUrl: "https://edge.forms.takoform.com/forms/ObjectBucket/0.3.0/" as const,
+    },
+    {
+      publicName: "OLD",
+      resourceUid: "bucket-old-001",
+      formUrl: "https://edge.forms.takoform.com/forms/ObjectBucket/0.2.0/" as const,
+    },
+  ] as const;
+  const input = graphInput({
+    generation: "takoserver-v2-operation:11111111-1111-4111-8111-111111111111",
+    environment: [],
+    forwardObjectBucketBindings: profile,
+    v2ObjectBucketBinding: {
+      address: "127.0.0.1:4777",
+      token: `e30.${"a".repeat(43)}`,
+      bindings: [{ publicName: "NEW" }, { publicName: "OLD" }],
+    },
+  });
+  const wrapper = source(
+    compileWorkerdVersionGraph(input).hostModules.get(WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE),
+  );
+  expect(wrapper).toContain(profile[0]?.formUrl);
+  expect(wrapper).toContain(profile[1]?.formUrl);
+  expect(() =>
+    compileWorkerdVersionGraph({ ...input, forwardObjectBucketBindings: profile.slice(1) }),
+  ).toThrow();
+  expect(() =>
+    compileWorkerdVersionGraph({
+      ...input,
+      forwardObjectBucketBindings: [{ ...profile[0], publicName: "OTHER" }, profile[1]],
+    }),
+  ).toThrow();
+  expect(() =>
+    compileWorkerdVersionGraph({ ...input, forwardObjectBucketBindings: new Array(2) }),
+  ).toThrow();
+  expect(() => compileWorkerdVersionGraph({ ...input, generation: "legacy-graph" })).toThrow();
+});

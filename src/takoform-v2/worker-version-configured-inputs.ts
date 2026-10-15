@@ -1,5 +1,10 @@
 import { base64UrlDecode, base64UrlEncode, canonicalJson } from "../json.ts";
-import { parseWorkerVersionSpec, WORKER_VERSION_FORM_URL } from "./forms/worker-specs.ts";
+import {
+  FORWARD_WORKER_VERSION_FORM_URL,
+  parseForwardWorkerVersionSpec,
+  parseWorkerVersionSpec,
+  WORKER_VERSION_FORM_URL,
+} from "./forms/worker-specs.ts";
 
 const KEY_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const ENCODER = new TextEncoder();
@@ -42,12 +47,15 @@ function keyIsUsable(key: CryptoKey | undefined): key is CryptoKey {
   );
 }
 
-function identityParts(input: V2WorkerVersionPrivateIdentity): {
+function identityParts(
+  input: V2WorkerVersionPrivateIdentity,
+  forward = false,
+): {
   readonly names: readonly string[];
   readonly aad: Uint8Array<ArrayBuffer>;
 } {
   if (
-    input.form !== WORKER_VERSION_FORM_URL ||
+    input.form !== (forward ? FORWARD_WORKER_VERSION_FORM_URL : WORKER_VERSION_FORM_URL) ||
     !input.principal ||
     !input.space ||
     !input.name ||
@@ -55,7 +63,9 @@ function identityParts(input: V2WorkerVersionPrivateIdentity): {
   ) {
     throw new TypeError("invalid WorkerVersion configured input identity");
   }
-  const spec = parseWorkerVersionSpec(input.spec);
+  const spec = forward
+    ? parseForwardWorkerVersionSpec(input.spec)
+    : parseWorkerVersionSpec(input.spec);
   return {
     names: [...spec.requiredSensitiveVars],
     aad: ownedBytes(
@@ -105,6 +115,17 @@ function sameValue(left: string, right: string): boolean {
 export function createV2WorkerVersionConfiguredInputSealer(
   keyring: V2WorkerVersionConfiguredKeyring,
 ) {
+  return configuredInputSealer(keyring, false);
+}
+
+/** Named07 constructor; AAD binds the exact owning Form and full07 spec. */
+export function createV2ForwardWorkerVersionConfiguredInputSealer(
+  keyring: V2WorkerVersionConfiguredKeyring,
+) {
+  return configuredInputSealer(keyring, true);
+}
+
+function configuredInputSealer(keyring: V2WorkerVersionConfiguredKeyring, forward: boolean) {
   if (
     !keyring ||
     !KEY_ID.test(keyring.current?.keyId ?? "") ||
@@ -120,7 +141,7 @@ export function createV2WorkerVersionConfiguredInputSealer(
       identity: V2WorkerVersionPrivateIdentity,
       values: Readonly<Record<string, string>> | undefined,
     ): Promise<V2WorkerVersionSealedInputs | null> {
-      const { names, aad } = identityParts(identity);
+      const { names, aad } = identityParts(identity, forward);
       if (!exactValues(values, names)) {
         aad.fill(0);
         throw new TypeError("WorkerVersion private inputs must be a complete nonempty map");
@@ -155,7 +176,7 @@ export function createV2WorkerVersionConfiguredInputSealer(
       let aad: Uint8Array<ArrayBuffer> | undefined;
       let plaintext: Uint8Array | undefined;
       try {
-        const parts = identityParts(identity);
+        const parts = identityParts(identity, forward);
         aad = parts.aad;
         if (!sealed || !KEY_ID.test(sealed.keyId)) return null;
         const key = keyForDecryption(sealed.keyId);
@@ -196,7 +217,9 @@ export function createV2WorkerVersionConfiguredInputSealer(
       sealed: V2WorkerVersionSealedInputs,
       proposed: Readonly<Record<string, string>> | undefined,
     ): Promise<"matched" | "mismatched" | "unavailable"> {
-      const normalizedSpec = parseWorkerVersionSpec(identity.spec);
+      const normalizedSpec = forward
+        ? parseForwardWorkerVersionSpec(identity.spec)
+        : parseWorkerVersionSpec(identity.spec);
       const identitySnapshot: V2WorkerVersionPrivateIdentity = Object.freeze({
         principal: identity.principal,
         space: identity.space,

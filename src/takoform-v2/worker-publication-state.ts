@@ -29,6 +29,7 @@ import {
   referencesForWorkerVersion,
 } from "./forms/worker-references.ts";
 import {
+  CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
   FORWARD_WORKER_DEPLOYMENT_FORM_URL,
   FORWARD_WORKER_VERSION_FORM_URL,
   type ForwardWorkerVersionSpec,
@@ -92,6 +93,9 @@ export interface V2WorkerPublicationSnapshot {
       readonly generation: number;
       readonly weight: number;
       readonly spec: WorkerVersionSpec;
+      /** Present only for a new, exact07 snapshot. */
+      readonly form?: typeof FORWARD_WORKER_VERSION_FORM_URL;
+      readonly bucketBindings?: readonly ObjectBucketBindingForm[];
     }[];
   } | null;
   readonly endpoint: {
@@ -168,6 +172,8 @@ export interface V2WorkerVersionSnapshot {
     readonly uid: string;
     readonly generation: number;
     readonly spec: WorkerVersionSpec;
+    readonly form?: typeof FORWARD_WORKER_VERSION_FORM_URL;
+    readonly bucketBindings?: readonly ObjectBucketBindingForm[];
   };
 }
 
@@ -1219,11 +1225,17 @@ export function createV2WorkerPublicationState(options: {
   async function exactVersionReferences(
     operationId: string,
     spec: WorkerVersionSpec,
+    forward = false,
   ): Promise<ReferenceRow[] | null> {
     const rows = await references(operationId);
     let expected: ReturnType<typeof referencesForWorkerVersion>;
     try {
-      expected = referencesForWorkerVersion(spec);
+      expected = forward
+        ? referencesForForwardWorkerVersion(
+            parseForwardWorkerVersionSpec(spec),
+            (rows ?? []).map((row) => ({ resourceUid: row.target_uid, formUrl: row.form_url })),
+          )
+        : referencesForWorkerVersion(spec);
     } catch {
       return null;
     }
@@ -1294,7 +1306,21 @@ export function createV2WorkerPublicationState(options: {
       ).length !== 0
     );
   }
-  async function pendingPublication(workerUid: string): Promise<OperationRow[]> {
+  async function pendingPublication(workerUid: string, forward = false): Promise<OperationRow[]> {
+    if (forward)
+      return (await sql.query(
+        `SELECT op.* FROM tf_v2_operations op JOIN tf_v2_resources r ON r.uid=op.resource_uid
+       WHERE r.form_url IN (?, ?, ?, ?) AND r.deleted_at IS NULL
+       AND op.status IN ('queued','running','waiting_input','reconciling')
+       AND json_extract(op.accepted_spec_json, '$.worker.resourceUid')=? ORDER BY op.created_at,op.id`,
+        [
+          WORKER_DEPLOYMENT_FORM_URL,
+          CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
+          FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+          WORKER_ENDPOINT_FORM_URL,
+          workerUid,
+        ],
+      )) as unknown as OperationRow[];
     return (await sql.query(
       `SELECT op.* FROM tf_v2_operations op
        JOIN tf_v2_resources r ON r.uid = op.resource_uid
@@ -1488,9 +1514,9 @@ export function createV2WorkerPublicationState(options: {
     };
   }
 
-  async function captureVersion(execution: V2Execution): Promise<VersionCapture> {
+  async function captureVersion(execution: V2Execution, forward = false): Promise<VersionCapture> {
     if (
-      execution.form !== WORKER_VERSION_FORM_URL ||
+      execution.form !== (forward ? FORWARD_WORKER_VERSION_FORM_URL : WORKER_VERSION_FORM_URL) ||
       (execution.action !== "create" && execution.action !== "update")
     ) {
       return versionUnresolved(
@@ -1507,7 +1533,9 @@ export function createV2WorkerPublicationState(options: {
     }
     let spec: WorkerVersionSpec;
     try {
-      spec = parseWorkerVersionSpec(parseObject(op.accepted_spec_json));
+      spec = forward
+        ? parseForwardWorkerVersionSpec(parseObject(op.accepted_spec_json))
+        : parseWorkerVersionSpec(parseObject(op.accepted_spec_json));
     } catch {
       return versionUnresolved("graph_unresolved", "Accepted Worker Version spec is invalid");
     }
@@ -1530,13 +1558,16 @@ export function createV2WorkerPublicationState(options: {
     } catch {
       return versionUnresolved("graph_unresolved", "Worker identity spec is invalid");
     }
-    const refRows = await exactVersionReferences(op.id, spec);
+    const refRows = await exactVersionReferences(op.id, spec, forward);
     if (!refRows) {
       return versionUnresolved(
         "graph_unresolved",
         "Version accepted references are not sealed and exact",
       );
     }
+    if (forward && !(await activeReferences(own.uid, refRows)))
+      return versionUnresolved("graph_unresolved", "Version active references changed");
+    const bucketBindings: ObjectBucketBindingForm[] = [];
     const referenceEvidence: unknown[] = [];
     const serviceTargets = new Set(spec.serviceBindings.map((item) => item.resource.resourceUid));
     for (const ref of refRows) {
@@ -1570,6 +1601,24 @@ export function createV2WorkerPublicationState(options: {
           return versionUnresolved("graph_unresolved", "A service Worker identity spec is invalid");
         }
       }
+      if (forward)
+        for (const binding of spec.bucketBindings.filter(
+          (item) => item.resource.resourceUid === target.uid,
+        )) {
+          if (
+            target.target_key !== op.target_key ||
+            canonicalJson(parseObject(target.observed_json)) !==
+              canonicalJson({ bucketExists: true, ...OBJECT_BUCKET_LIMITS }) ||
+            canonicalJson(parseObject(target.output_json)) !== "{}"
+          )
+            return versionUnresolved("graph_unresolved", "Bucket observation unavailable");
+          parseObjectBucketSpec(parseObject(target.spec_json));
+          const selected = snapshotObjectBucketBindingForms([
+            { publicName: binding.name, resourceUid: target.uid, formUrl: target.form_url },
+          ])[0];
+          if (!selected) return versionUnresolved("graph_unresolved", "Bucket Form unavailable");
+          bucketBindings.push(selected);
+        }
       referenceEvidence.push({ target, last, edge });
     }
     const bundle = spec.bundle
@@ -1601,7 +1650,17 @@ export function createV2WorkerPublicationState(options: {
         space: worker.space,
         generation: worker.generation,
       },
-      version: { uid: own.uid, generation: op.generation, spec },
+      version: {
+        uid: own.uid,
+        generation: op.generation,
+        spec,
+        ...(forward
+          ? {
+              form: FORWARD_WORKER_VERSION_FORM_URL,
+              bucketBindings: snapshotObjectBucketBindingForms(bucketBindings),
+            }
+          : {}),
+      },
     });
     const vector = canonicalJson({
       op,
@@ -1632,6 +1691,7 @@ export function createV2WorkerPublicationState(options: {
   type LivePublicationCaptureInput = {
     execution: V2Execution;
     incumbentSourceOperationId?: string;
+    forward?: true;
   };
   type CurrentServingCaptureInput = {
     currentServing: {
@@ -1648,11 +1708,15 @@ export function createV2WorkerPublicationState(options: {
   async function capture(
     input: LivePublicationCaptureInput | CurrentServingCaptureInput,
   ): Promise<Capture | CurrentCapture> {
+    const forward = "forward" in input && input.forward === true;
+    const deploymentForm = forward
+      ? FORWARD_WORKER_DEPLOYMENT_FORM_URL
+      : WORKER_DEPLOYMENT_FORM_URL;
     const current = "currentServing" in input ? input.currentServing : null;
     const execution = "execution" in input ? input.execution : null;
     if (
       execution !== null &&
-      execution.form !== WORKER_DEPLOYMENT_FORM_URL &&
+      execution.form !== deploymentForm &&
       execution.form !== WORKER_ENDPOINT_FORM_URL
     )
       return unresolved("graph_unresolved", "This operation is not a Worker publication");
@@ -1721,7 +1785,7 @@ export function createV2WorkerPublicationState(options: {
     let workerUid: string;
     try {
       workerUid =
-        form === WORKER_DEPLOYMENT_FORM_URL
+        form === deploymentForm
           ? parseWorkerDeploymentSpec(accepted).worker.resourceUid
           : parseWorkerEndpointSpec(accepted).worker.resourceUid;
     } catch {
@@ -1768,7 +1832,8 @@ export function createV2WorkerPublicationState(options: {
         incumbentResource.principal !== op.principal ||
         incumbentResource.space !== own.space ||
         (incumbentResource.form_url !== WORKER_DEPLOYMENT_FORM_URL &&
-          incumbentResource.form_url !== WORKER_ENDPOINT_FORM_URL) ||
+          incumbentResource.form_url !== WORKER_ENDPOINT_FORM_URL &&
+          (!forward || incumbentResource.form_url !== FORWARD_WORKER_DEPLOYMENT_FORM_URL)) ||
         workerUidFromOperation(incumbent) !== workerUid ||
         (incumbentResource.deleted_at !== null &&
           !(incumbent.status === "succeeded" && incumbent.action === "delete")) ||
@@ -1780,13 +1845,13 @@ export function createV2WorkerPublicationState(options: {
       }
     }
 
-    let pending: OperationRow[] = current ? [] : await pendingPublication(workerUid);
+    let pending: OperationRow[] = current ? [] : await pendingPublication(workerUid, forward);
     // Resources whose queued successors were validated, with those Operations'
     // sealed reference targets (reserved as extra active edges at acceptance).
     const unstartedTargets = new Map<string, Set<string>>();
     if (current) {
       if (current.tolerateUnstartedSuccessors) {
-        pending = await pendingPublication(workerUid);
+        pending = await pendingPublication(workerUid, forward);
         if (pending.length > MAX_UNSTARTED_SUCCESSORS) {
           return unresolved("source_unsettled", "Too many later Worker publications are queued");
         }
@@ -1839,7 +1904,24 @@ export function createV2WorkerPublicationState(options: {
     }
 
     const [rawDeploymentRows, rawEndpointRows] = await Promise.all([
-      matchingResources(WORKER_DEPLOYMENT_FORM_URL, workerUid, op.principal, own.space, !!current),
+      forward
+        ? (async () =>
+            (
+              await Promise.all(
+                [
+                  WORKER_DEPLOYMENT_FORM_URL,
+                  CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
+                  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+                ].map((form) => matchingResources(form, workerUid, op.principal, own.space)),
+              )
+            ).flat())()
+        : matchingResources(
+            WORKER_DEPLOYMENT_FORM_URL,
+            workerUid,
+            op.principal,
+            own.space,
+            !!current,
+          ),
       matchingResources(WORKER_ENDPOINT_FORM_URL, workerUid, op.principal, own.space, !!current),
     ]);
     const committedRows = async (rows: readonly ResourceRow[]): Promise<ResourceRow[]> => {
@@ -1884,7 +1966,7 @@ export function createV2WorkerPublicationState(options: {
         confirmed.length > 1 ||
         (rows.some((row) => row.uid === own.uid) &&
           confirmedOthers.length > 0 &&
-          ((form === WORKER_DEPLOYMENT_FORM_URL && rows === deploymentRows) ||
+          ((form === deploymentForm && rows === deploymentRows) ||
             (form === WORKER_ENDPOINT_FORM_URL && rows === endpointRows)))
       ) {
         return unresolved(
@@ -1934,7 +2016,9 @@ export function createV2WorkerPublicationState(options: {
       return { row, accepted: chosenSpec, op: chosenOp };
     }
 
-    const chosenDeployment = await chosen(deploymentRows, WORKER_DEPLOYMENT_FORM_URL);
+    if (forward && deploymentRows.some((row) => row.form_url !== deploymentForm))
+      return unresolved("publication_conflict", "Another exact Deployment Form owns this Worker");
+    const chosenDeployment = await chosen(deploymentRows, deploymentForm);
     const chosenEndpoint = await chosen(endpointRows, WORKER_ENDPOINT_FORM_URL);
     if (chosenDeployment && "kind" in chosenDeployment) return chosenDeployment;
     if (chosenEndpoint && "kind" in chosenEndpoint) return chosenEndpoint;
@@ -1972,7 +2056,10 @@ export function createV2WorkerPublicationState(options: {
             !hasReference(
               refRows,
               item.workerVersion.resourceUid,
-              WORKER_VERSION_FORM_URL,
+              forward
+                ? (refRows.find((ref) => ref.target_uid === item.workerVersion.resourceUid)
+                    ?.form_url ?? "")
+                : WORKER_VERSION_FORM_URL,
               "ready",
               workerUid,
             ),
@@ -2006,7 +2093,9 @@ export function createV2WorkerPublicationState(options: {
         const observed = row ? parseObject(row.observed_json) : null;
         if (
           !row ||
-          row.form_url !== WORKER_VERSION_FORM_URL ||
+          (row.form_url !== WORKER_VERSION_FORM_URL &&
+            (!forward || row.form_url !== FORWARD_WORKER_VERSION_FORM_URL)) ||
+          !hasReference(refRows, uid, row.form_url, "ready", workerUid) ||
           row.principal !== op.principal ||
           row.space !== own.space ||
           !last ||
@@ -2018,7 +2107,15 @@ export function createV2WorkerPublicationState(options: {
         }
         let versionSpec: WorkerVersionSpec;
         try {
-          versionSpec = parseWorkerVersionSpec(parseObject(row.spec_json));
+          versionSpec =
+            row.form_url === FORWARD_WORKER_VERSION_FORM_URL
+              ? parseForwardWorkerVersionSpec(parseObject(row.spec_json))
+              : parseWorkerVersionSpec(parseObject(row.spec_json));
+          if (
+            row.form_url === FORWARD_WORKER_VERSION_FORM_URL &&
+            parseForwardWorkerVersionSpec(versionSpec).containerBindings.length
+          )
+            throw new Error("Container runtime unavailable");
         } catch {
           return unresolved("graph_unresolved", "A weighted Worker Version spec is invalid");
         }
@@ -2031,7 +2128,13 @@ export function createV2WorkerPublicationState(options: {
             "A weighted Worker Version does not match this Worker",
           );
         }
-        const versionReferences = last ? await exactVersionReferences(last.id, versionSpec) : null;
+        const versionReferences = last
+          ? await exactVersionReferences(
+              last.id,
+              versionSpec,
+              row.form_url === FORWARD_WORKER_VERSION_FORM_URL,
+            )
+          : null;
         if (!versionReferences) {
           return unresolved(
             "graph_unresolved",
@@ -2085,6 +2188,24 @@ export function createV2WorkerPublicationState(options: {
           generation: row.generation,
           weight: weighted.weight,
           spec: versionSpec,
+          ...(row.form_url === FORWARD_WORKER_VERSION_FORM_URL
+            ? {
+                form: FORWARD_WORKER_VERSION_FORM_URL,
+                bucketBindings: snapshotObjectBucketBindingForms(
+                  versionSpec.bucketBindings.map((binding) => {
+                    const ref = versionReferences.find(
+                      (ref) => ref.target_uid === binding.resource.resourceUid,
+                    );
+                    if (!ref) throw new Error("Bucket reference missing");
+                    return {
+                      publicName: binding.name,
+                      resourceUid: ref.target_uid,
+                      formUrl: ref.form_url,
+                    };
+                  }),
+                ),
+              }
+            : {}),
         });
       }
       deployment = {
@@ -2263,6 +2384,7 @@ export function createV2WorkerPublicationState(options: {
     try {
       sqlGuard = createWorkerPublicationSqlGuard({
         execution,
+        ...(forward ? { forwardDeployment: true as const } : {}),
         workerUid,
         principal: op.principal,
         space: own.space,
@@ -2454,6 +2576,150 @@ export function createV2WorkerPublicationState(options: {
       snapshot: initial.snapshot,
       stillCurrent: verifyAllMaterials,
       readVersionMaterials,
+    };
+  }
+
+  async function resolveVersionHeld(
+    input: { execution: V2Execution },
+    forward = false,
+  ): Promise<V2WorkerVersionResolution> {
+    const initial = await captureVersion(input.execution, forward);
+    if (initial.kind === "unresolved") return initial;
+    const stillAuthorized = async () => {
+      const latest = await captureVersion(input.execution, forward);
+      return latest.kind === "ready" && latest.vector === initial.vector;
+    };
+    try {
+      // "ready" must mean the held bytes themselves were verified, not only
+      // that their SQL owner claimed verification in an earlier operation.
+      await readMaterialsTargets(
+        initial.materials,
+        initial.snapshot.worker.principal,
+        initial.snapshot.worker.space,
+        stillAuthorized,
+      );
+    } catch {
+      return (await stillAuthorized())
+        ? versionUnresolved("graph_unresolved", "Version held artifact bytes are unavailable")
+        : versionUnresolved("stale_claim", "The accepted Version graph changed during byte read");
+    }
+    if (!(await stillAuthorized())) {
+      return versionUnresolved(
+        "stale_claim",
+        "The accepted Version graph changed during byte read",
+      );
+    }
+    const stillCurrent = async (): Promise<boolean> => {
+      try {
+        // SQL identity alone cannot detect damaged held chunks. The last
+        // pre-effect fence also rehashes the exact accepted byte targets.
+        await readMaterialsTargets(
+          initial.materials,
+          initial.snapshot.worker.principal,
+          initial.snapshot.worker.space,
+          stillAuthorized,
+        );
+        return await stillAuthorized();
+      } catch {
+        return false;
+      }
+    };
+    return {
+      kind: "ready",
+      snapshot: initial.snapshot,
+      stillCurrent,
+      readMaterials: () =>
+        readMaterialsTargets(
+          initial.materials,
+          initial.snapshot.worker.principal,
+          initial.snapshot.worker.space,
+          stillAuthorized,
+        ),
+    };
+  }
+
+  async function resolvePublication(
+    input: LivePublicationCaptureInput,
+  ): Promise<V2WorkerPublicationResolution> {
+    const initial = await capture(input);
+    if (initial.kind === "unresolved") return initial;
+    if (input.forward) {
+      const current = async () => {
+        const latest = await capture(input);
+        return latest.kind === "ready" && latest.vector === initial.vector;
+      };
+      try {
+        for (const target of initial.materials.values())
+          await readMaterialsTargets(
+            target,
+            initial.snapshot.worker.principal,
+            initial.snapshot.worker.space,
+            current,
+          );
+      } catch {
+        return unresolved("graph_unresolved", "Forward held bytes are unavailable");
+      }
+      if (!(await current()))
+        return unresolved("stale_claim", "Forward graph changed during held-byte verification");
+    }
+    return {
+      kind: "ready",
+      snapshot: initial.snapshot,
+      sqlGuard: initial.sqlGuard,
+      async stillCurrent(): Promise<boolean> {
+        const graphCurrent = async () => {
+          const latest = await capture(input);
+          return latest.kind === "ready" && latest.vector === initial.vector;
+        };
+        if (!input.forward) return graphCurrent();
+        if (!(await graphCurrent())) return false;
+        if (input.forward) {
+          try {
+            for (const target of initial.materials.values())
+              await readMaterialsTargets(
+                target,
+                initial.snapshot.worker.principal,
+                initial.snapshot.worker.space,
+                graphCurrent,
+              );
+          } catch {
+            return false;
+          }
+        }
+        return await graphCurrent();
+      },
+      async readVersionMaterials(versionUid: string): Promise<V2WorkerVersionMaterials> {
+        const target = initial.materials.get(versionUid);
+        const stillAuthorized = async () => {
+          const latest = await capture(input);
+          return latest.kind === "ready" && latest.vector === initial.vector;
+        };
+        if (!target)
+          throw new SqlError("unavailable", "Worker Version materials are not authorized");
+        return readMaterialsTargets(
+          target,
+          initial.snapshot.worker.principal,
+          initial.snapshot.worker.space,
+          stillAuthorized,
+        );
+      },
+      async openVersionMaterialsUnverified(
+        versionUid: string,
+      ): Promise<V2WorkerVersionMaterialScopes> {
+        const target = initial.materials.get(versionUid);
+        const stillAuthorized = async () => {
+          const latest = await capture(input);
+          return latest.kind === "ready" && latest.vector === initial.vector;
+        };
+        if (!target)
+          throw new SqlError("unavailable", "Worker Version materials are not authorized");
+        return openMaterialsTargetsUnverified(
+          target,
+          initial.snapshot.worker.principal,
+          initial.snapshot.worker.space,
+          stillAuthorized,
+        );
+      },
     };
   }
 
@@ -2665,61 +2931,8 @@ export function createV2WorkerPublicationState(options: {
           ),
       };
     },
-    async resolveVersion(input: { execution: V2Execution }): Promise<V2WorkerVersionResolution> {
-      const initial = await captureVersion(input.execution);
-      if (initial.kind === "unresolved") return initial;
-      const stillAuthorized = async () => {
-        const latest = await captureVersion(input.execution);
-        return latest.kind === "ready" && latest.vector === initial.vector;
-      };
-      try {
-        // "ready" must mean the held bytes themselves were verified, not only
-        // that their SQL owner claimed verification in an earlier operation.
-        await readMaterialsTargets(
-          initial.materials,
-          initial.snapshot.worker.principal,
-          initial.snapshot.worker.space,
-          stillAuthorized,
-        );
-      } catch {
-        return (await stillAuthorized())
-          ? versionUnresolved("graph_unresolved", "Version held artifact bytes are unavailable")
-          : versionUnresolved("stale_claim", "The accepted Version graph changed during byte read");
-      }
-      if (!(await stillAuthorized())) {
-        return versionUnresolved(
-          "stale_claim",
-          "The accepted Version graph changed during byte read",
-        );
-      }
-      const stillCurrent = async (): Promise<boolean> => {
-        try {
-          // SQL identity alone cannot detect damaged held chunks. The last
-          // pre-effect fence also rehashes the exact accepted byte targets.
-          await readMaterialsTargets(
-            initial.materials,
-            initial.snapshot.worker.principal,
-            initial.snapshot.worker.space,
-            stillAuthorized,
-          );
-          return await stillAuthorized();
-        } catch {
-          return false;
-        }
-      };
-      return {
-        kind: "ready",
-        snapshot: initial.snapshot,
-        stillCurrent,
-        readMaterials: () =>
-          readMaterialsTargets(
-            initial.materials,
-            initial.snapshot.worker.principal,
-            initial.snapshot.worker.space,
-            stillAuthorized,
-          ),
-      };
-    },
+    resolveVersion: (input: { execution: V2Execution }) => resolveVersionHeld(input),
+    resolveForwardVersion: (input: { execution: V2Execution }) => resolveVersionHeld(input, true),
     /** Strict current-serving proof: refuses while any Worker publication is pending. */
     async resolveCurrentServing(
       input: CurrentServingInput,
@@ -2743,53 +2956,20 @@ export function createV2WorkerPublicationState(options: {
           : { neverServedOperation: input.neverServedOperation },
       );
     },
-    async resolve(input: {
-      execution: V2Execution;
-      incumbentSourceOperationId?: string;
-    }): Promise<V2WorkerPublicationResolution> {
-      const initial = await capture(input);
-      if (initial.kind === "unresolved") return initial;
-      return {
-        kind: "ready",
-        snapshot: initial.snapshot,
-        sqlGuard: initial.sqlGuard,
-        async stillCurrent(): Promise<boolean> {
-          const latest = await capture(input);
-          return latest.kind === "ready" && latest.vector === initial.vector;
-        },
-        async readVersionMaterials(versionUid: string): Promise<V2WorkerVersionMaterials> {
-          const target = initial.materials.get(versionUid);
-          const stillAuthorized = async () => {
-            const latest = await capture(input);
-            return latest.kind === "ready" && latest.vector === initial.vector;
-          };
-          if (!target)
-            throw new SqlError("unavailable", "Worker Version materials are not authorized");
-          return readMaterialsTargets(
-            target,
-            initial.snapshot.worker.principal,
-            initial.snapshot.worker.space,
-            stillAuthorized,
-          );
-        },
-        async openVersionMaterialsUnverified(
-          versionUid: string,
-        ): Promise<V2WorkerVersionMaterialScopes> {
-          const target = initial.materials.get(versionUid);
-          const stillAuthorized = async () => {
-            const latest = await capture(input);
-            return latest.kind === "ready" && latest.vector === initial.vector;
-          };
-          if (!target)
-            throw new SqlError("unavailable", "Worker Version materials are not authorized");
-          return openMaterialsTargetsUnverified(
-            target,
-            initial.snapshot.worker.principal,
-            initial.snapshot.worker.space,
-            stillAuthorized,
-          );
-        },
-      };
-    },
+    resolve: (input: { execution: V2Execution; incumbentSourceOperationId?: string }) =>
+      resolvePublication({
+        execution: input.execution,
+        ...(input.incumbentSourceOperationId === undefined
+          ? {}
+          : { incumbentSourceOperationId: input.incumbentSourceOperationId }),
+      }),
+    resolveForward: (input: { execution: V2Execution; incumbentSourceOperationId?: string }) =>
+      resolvePublication({
+        execution: input.execution,
+        ...(input.incumbentSourceOperationId === undefined
+          ? {}
+          : { incumbentSourceOperationId: input.incumbentSourceOperationId }),
+        forward: true,
+      }),
   };
 }
