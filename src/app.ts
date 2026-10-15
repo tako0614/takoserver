@@ -116,6 +116,10 @@ import {
   createWorkerEndpointOriginV2Acceptance,
   createWorkerEndpointOriginV2FormRouteAcceptance,
 } from "./worker-endpoint-origin-v2-acceptance.ts";
+import {
+  createWorkerRequestConsumers,
+  type WorkerRequestAppInputs,
+} from "./worker-request-composition.ts";
 
 /**
  * The composition root.
@@ -128,6 +132,8 @@ import {
  */
 
 export interface AppPorts {
+  /** Entry-owned fresh primary request composition; absent preserves ordinary construction. */
+  readonly workerRequest?: WorkerRequestAppInputs;
   /** The exact inventory/deployment stores precomposed for native startup. */
   readonly resourceStores?: AppResourceStoreBundle;
   /** Host-only optional data-plane factory, built against these same canonical ledgers. */
@@ -405,18 +411,34 @@ export function buildApp(ports: AppPorts): App {
     randomId,
   });
 
-  const apiKeyAdministration = createApiKeyAdministration({
-    sql: ports.sql,
-    clock,
-    randomId,
-  });
-  const accounts = createAccounts({
-    sql: ports.sql,
-    identity: ports.identity,
-    clock,
-    randomId,
-    apiKeyAdministration,
-  });
+  const workerRequest =
+    ports.workerRequest === undefined
+      ? undefined
+      : createWorkerRequestConsumers({
+          ...ports.workerRequest,
+          sql: ports.sql,
+          identity: ports.identity,
+          clock,
+          randomId,
+          publicOrigin: ports.publicOrigin,
+          consoleOrigin: ports.consoleOrigin,
+        });
+  const apiKeyAdministration =
+    workerRequest?.apiKeyAdministration ??
+    createApiKeyAdministration({
+      sql: ports.sql,
+      clock,
+      randomId,
+    });
+  const accounts =
+    workerRequest?.accounts ??
+    createAccounts({
+      sql: ports.sql,
+      identity: ports.identity,
+      clock,
+      randomId,
+      apiKeyAdministration,
+    });
   const v2AllowFreshCreateAndUpdate = ports.v2AllowFreshCreateAndUpdate;
   const v2ApplicationOptions = {
     sql: workerEndpointOriginConstruction?.sql ?? ports.sql,
@@ -1002,6 +1024,7 @@ export function buildApp(ports: AppPorts): App {
       : {}),
     control,
     dataAi,
+    ...(workerRequest === undefined ? {} : { sharedAuth: workerRequest.sharedAuth }),
     aiAvailable: ports.ai !== undefined,
     takoformV2Host,
     publicOrigin: ports.publicOrigin,
