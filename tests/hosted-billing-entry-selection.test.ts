@@ -597,6 +597,15 @@ test.each(["qualified", "foreign-account"] as const)(
       },
     );
     const diagnostics = new Response(child.stderr).text();
+    let shutdown: Promise<number | null> | undefined;
+    const stopChild = () => {
+      shutdown ??= (async () => {
+        if (child.exitCode !== null) return await child.exited;
+        child.kill("SIGTERM");
+        return await Promise.race([child.exited, Bun.sleep(5000).then(() => null)]);
+      })();
+      return shutdown;
+    };
     try {
       if (scenario === "foreign-account") {
         const exit = await Promise.race([child.exited, Bun.sleep(10_000).then(() => null)]);
@@ -648,6 +657,9 @@ test.each(["qualified", "foreign-account"] as const)(
         const timer = await Bun.file(join(root, "payment-timer.log")).text();
         expect(timer.split("\n").filter((line) => line === "registered")).toHaveLength(1);
         expect(timer).toContain("tick");
+        // Normal exit drains the real owned reconcile pass and closes SQLite
+        // before the independent connection takes its final snapshot.
+        expect(await stopChild()).toBe(0);
       }
       const observed = new Database(databasePath, { readonly: true });
       try {
@@ -665,13 +677,8 @@ test.each(["qualified", "foreign-account"] as const)(
         observed.close();
       }
     } finally {
-      if (child.exitCode === null) {
-        child.kill("SIGTERM");
-        if ((await Promise.race([child.exited, Bun.sleep(5000).then(() => null)])) === null) {
-          child.kill("SIGKILL");
-          await child.exited;
-        }
-      }
+      if ((await stopChild()) === null && child.exitCode === null) child.kill("SIGKILL");
+      await child.exited;
       await diagnostics;
       await stripe.stop(true);
       rmSync(root, { recursive: true, force: true });
