@@ -458,7 +458,7 @@ test("forward Deployment uses the closed Version Forms and the existing single-a
         expect(await snapshot()).toEqual(before);
       } else {
         const operation = await accepted;
-        expect(operation).toMatchObject({ action: "create", status: "pending" });
+        expect(operation).toMatchObject({ action: "create", status: "queued" });
         expect(
           await legacy.sql.query(
             "SELECT form_url FROM tf_v2_operation_references WHERE operation_id=? AND target_uid=?",
