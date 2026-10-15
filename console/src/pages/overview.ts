@@ -76,21 +76,25 @@ export function overviewPage(organization: Organization): Child {
             ).length;
             // Only the first page is read here. When the Host has more, the
             // count says so instead of passing a page size off as a total.
-            const more = cursor !== null;
+            // The caption names what this count checks (failed or not ready);
+            // the Needs attention card below also lists undelivered changes.
+            const more = cursor !== null && all.length > 0;
             return stat(
               tr("リソース", "Resources"),
               more ? `${all.length}+` : String(all.length),
-              attention === 0
-                ? more
+              attention > 0
+                ? h(
+                    "span",
+                    { style: { color: "var(--warn)" } },
+                    more
+                      ? tr(`${attention}件以上に確認が必要`, `${attention}+ need attention`)
+                      : tr(`${attention}件に確認が必要`, `${attention} need attention`),
+                  )
+                : more
                   ? tr("最初のページのみ集計", "first page only")
                   : all.length === 0
                     ? tr("まだありません", "none yet")
-                    : tr("確認が必要なものはありません", "none need attention")
-                : h(
-                    "span",
-                    { style: { color: "var(--warn)" } },
-                    tr(`${attention}件に確認が必要`, `${attention} need attention`),
-                  ),
+                    : tr("失敗・非稼働はありません", "none failed or not ready"),
             );
           },
           { skeleton: h("div", { class: "card" }, h("div", { class: "card__body skeleton" })) },
@@ -107,8 +111,8 @@ export function overviewPage(organization: Organization): Child {
                 empty(
                   tr("リソースがありません", "Nothing declared yet"),
                   tr(
-                    "運用者から渡された正確なForm URLを指定して作成します。作成を受け付けたリソースは、完了前からここに表示されます。",
-                    "Create one with an exact Form URL supplied by the operator. Accepted resources appear here before they finish.",
+                    "運用者から渡された正確なForm URLを指定して作成します。受理されたリソースは完了前から表示されます。",
+                    "Create one with an exact Form URL supplied by the operator. An accepted resource can appear before execution completes.",
                   ),
                   h(
                     "button",

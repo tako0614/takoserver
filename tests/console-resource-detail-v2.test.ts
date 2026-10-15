@@ -195,6 +195,7 @@ test("confirmed ready:false is NotReady and visible in overview attention", asyn
 });
 
 test("overview counts only what it read and offers the first create", async () => {
+  installDom();
   const { consoleLocale } = await import("../console/src/i18n.ts");
   const { organizations, selectOrganization, setApiOrigin } = await import(
     "../console/src/state.ts"
@@ -232,12 +233,14 @@ test("overview counts only what it read and offers the first create", async () =
         if (path.endsWith("/wallet"))
           return Response.json({
             wallet: {
+              organizationId: organization.id,
               availableMicros: "0",
               heldMicros: "0",
               settledMicros: "0",
               currency: "USD",
               unit: "USD-micros",
               moneyPolicy: "usd-micros-v2",
+              entries: [],
             },
           });
         if (path.endsWith("/operations")) return Response.json({ operations: [] });
@@ -256,9 +259,27 @@ test("overview counts only what it read and offers the first create", async () =
   expect(partial.textContent).toContain("By Form (first page)");
 
   const complete = await render({ items: [item], nextCursor: null });
-  expect(complete.textContent).toContain("none need attention");
+  expect(complete.textContent).toContain("none failed or not ready");
   expect(complete.textContent).toContain("By Form");
   expect(complete.textContent).not.toContain("first page");
+  expect(complete.textContent).not.toContain("invalid");
+
+  // A just-accepted create is stale but not failed: the caption must not
+  // claim nothing needs attention while the card below lists it.
+  const pending = await render({
+    items: [{ ...item, uid: "uid-pending", name: "pending", observedGeneration: 0 }],
+    nextCursor: null,
+  });
+  expect(pending.textContent).toContain("none failed or not ready");
+  expect(pending.textContent).toContain("Needs attention");
+  expect(pending.textContent).not.toContain("none need attention");
+
+  const failing = await render({
+    items: [{ ...item, observed: { ready: false } }],
+    nextCursor: "next",
+  });
+  expect(failing.textContent).toContain("1+");
+  expect(failing.textContent).toContain("1+ need attention");
 
   const none = await render({ items: [], nextCursor: null });
   expect(none.textContent).toContain("none yet");
