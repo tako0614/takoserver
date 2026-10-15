@@ -1,10 +1,18 @@
 import { bytesDigest, canonicalJson } from "../json.ts";
 import type { WorkerdPublicationIdentity } from "../workerd-runtime.ts";
 import type { WorkerdWorkerRuntimeOwner } from "../workerd-worker-runtime-owner.ts";
-import { referencesForWorkerDeployment } from "./forms/worker-references.ts";
 import {
+  fixedReferencesForForwardWorkerDeployment,
+  prepareForwardWorkerDeploymentReferences,
+  referencesForWorkerDeployment,
+} from "./forms/worker-references.ts";
+import {
+  CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
+  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+  parseForwardWorkerDeploymentSpec,
   parseWorkerDeploymentSpec,
   parseWorkerVersionSpec,
+  validateForwardWorkerDeploymentUpdate,
   validateWorkerDeploymentUpdate,
   WORKER_DEPLOYMENT_FORM_URL,
   WorkerFormValidationError,
@@ -63,11 +71,13 @@ function deploymentAdmission(input: {
     // A deleting or failed Resource still owns its UID until DELETE settles;
     // a same-UID update excludes itself, while a deleted UID can be replaced.
     sql: `NOT EXISTS (SELECT 1 FROM tf_v2_resources other
-      WHERE other.form_url = ? AND other.principal = ? AND other.space = ?
+      WHERE other.form_url IN (?, ?, ?) AND other.principal = ? AND other.space = ?
         AND other.deleted_at IS NULL AND other.uid <> ?
         AND json_extract(other.spec_json, '$.worker.resourceUid') = ?)`,
     params: [
       WORKER_DEPLOYMENT_FORM_URL,
+      CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
+      FORWARD_WORKER_DEPLOYMENT_FORM_URL,
       input.principal,
       input.space,
       input.resourceUid,
@@ -368,4 +378,50 @@ export async function exactV2WorkerPublicationIdentity(
     versions,
   };
   return canonicalJson(identity) === canonicalJson(expected);
+}
+
+/** Exact forward admission; no legacy runtime fallback or default registration. */
+export function createForwardWorkerDeploymentForm(options: { readonly targetKey: string }): V2Form {
+  if (!options.targetKey) throw new TypeError("targetKey is required");
+  const unavailable = async (execution: V2Execution): Promise<V2BackendResult> => ({
+    kind: "unknown",
+    code:
+      execution.form === FORWARD_WORKER_DEPLOYMENT_FORM_URL &&
+      execution.targetKey === options.targetKey &&
+      execution.backendId === WORKER_DEPLOYMENT_BACKEND_ID
+        ? "worker_forward_materializer_unavailable"
+        : "worker_forward_identity_unavailable",
+    message: "The forward Worker materializer is unavailable",
+  });
+  return {
+    validateCreate(spec) {
+      try {
+        parseForwardWorkerDeploymentSpec(spec);
+      } catch (error) {
+        if (error instanceof WorkerFormValidationError) throw new TakoformV2Error(error.code, 422);
+        throw error;
+      }
+    },
+    validateUpdate(previous, spec) {
+      try {
+        validateForwardWorkerDeploymentUpdate(previous, spec);
+      } catch (error) {
+        if (error instanceof WorkerFormValidationError) throw new TakoformV2Error(error.code, 422);
+        throw error;
+      }
+    },
+    references(spec) {
+      return fixedReferencesForForwardWorkerDeployment(parseForwardWorkerDeploymentSpec(spec));
+    },
+    prepareAdmission(input) {
+      return prepareForwardWorkerDeploymentReferences(input, deploymentAdmission(input));
+    },
+    rejectDeleteWhileReferenced: true,
+    backend: {
+      id: WORKER_DEPLOYMENT_BACKEND_ID,
+      targetKey: options.targetKey,
+      execute: unavailable,
+      reconcile: unavailable,
+    },
+  };
 }

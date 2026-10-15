@@ -9,6 +9,15 @@ export const WORKER_DEPLOYMENT_FORM_URL =
   "https://edge.forms.takoform.com/forms/WorkerDeployment/0.4.0/" as const;
 export const WORKER_ENDPOINT_FORM_URL =
   "https://edge.forms.takoform.com/forms/WorkerEndpoint/0.3.0/" as const;
+export const FORWARD_WORKER_VERSION_FORM_URL =
+  "https://edge.forms.takoform.com/forms/WorkerVersion/0.7.0/" as const;
+export const FORWARD_WORKER_DEPLOYMENT_FORM_URL =
+  "https://edge.forms.takoform.com/forms/WorkerDeployment/0.6.0/" as const;
+/** Accepted reference vocabulary only; Container runtime remains separately owned. */
+export const CONTAINER_WORKER_VERSION_FORM_URL =
+  "https://edge.forms.takoform.com/forms/WorkerVersion/0.6.0/" as const;
+export const CONTAINER_WORKER_DEPLOYMENT_FORM_URL =
+  "https://edge.forms.takoform.com/forms/WorkerDeployment/0.5.0/" as const;
 
 const RESOURCE_UID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const VAR_NAME = /^[A-Za-z][A-Za-z0-9._-]{0,63}$/u;
@@ -79,6 +88,51 @@ export interface WorkerVersionSpec {
   readonly actorBindings: readonly WorkerVersionBinding[];
   readonly workflowBindings: readonly WorkerVersionBinding[];
   readonly assets?: WorkerVersionAssets;
+}
+
+export interface ForwardWorkerVersionSpec extends WorkerVersionSpec {
+  readonly containerBindings: readonly WorkerVersionBinding[];
+}
+
+/** The new owning Form adds this optional array, without changing the old parser. */
+export function parseForwardWorkerVersionSpec(input: unknown): ForwardWorkerVersionSpec {
+  const raw = record(input);
+  const base: Record<string, unknown> = Object.create(null);
+  for (const [key, value] of ownDataEntries(raw))
+    if (key !== "containerBindings") base[key] = value;
+  const spec = parseWorkerVersionSpec(base);
+  const names = new Set([
+    ...Object.keys(spec.vars),
+    ...spec.requiredSensitiveVars,
+    ...BINDING_ARRAY_KEYS.flatMap((key) => spec[key].map((binding) => binding.name)),
+  ]);
+  const containers = parseBindings(
+    Object.hasOwn(raw, "containerBindings") ? raw.containerBindings : [],
+    names,
+  );
+  if (!spec.bundle && containers.length !== 0) throw invalid();
+  return { ...spec, containerBindings: sortBindings(containers) };
+}
+
+export function validateForwardWorkerVersionUpdate(
+  previous: unknown,
+  next: unknown,
+): ForwardWorkerVersionSpec {
+  const before = parseForwardWorkerVersionSpec(previous);
+  const after = parseForwardWorkerVersionSpec(next);
+  if (canonicalJson(before) !== canonicalJson(after)) throw invalid();
+  return after;
+}
+
+export function parseForwardWorkerDeploymentSpec(input: unknown): WorkerDeploymentSpec {
+  return parseWorkerDeploymentSpec(input);
+}
+
+export function validateForwardWorkerDeploymentUpdate(
+  previous: unknown,
+  next: unknown,
+): WorkerDeploymentSpec {
+  return validateWorkerDeploymentUpdate(previous, next);
 }
 
 export function parseModuleWorkerSpec(input: unknown): ModuleWorkerSpec {
