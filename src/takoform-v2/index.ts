@@ -120,10 +120,15 @@ export {
 export { createSQLiteDatabaseForm } from "./forms/sqlite-database-backend.ts";
 export {
   createSQLiteMigrationApplicationForm,
+  runSQLiteMigrationApplication,
   SQLITE_MIGRATION_APPLICATION_BACKEND_ID,
 } from "./forms/sqlite-migration-application-backend.ts";
 export type {
+  SQLiteMigrationApplicationBatchInput,
+  SQLiteMigrationApplicationBatchPort,
+  SQLiteMigrationApplicationInput,
   SQLiteMigrationApplicationPort,
+  SQLiteMigrationApplicationResult,
   SQLiteMigrationEntry,
   SQLiteMigrationFileResult,
   SQLiteMigrationLedgerResult,
