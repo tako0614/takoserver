@@ -2,6 +2,9 @@ import { canonicalJson } from "../json.ts";
 import type { WorkerdWorkerRuntimeOwner } from "../workerd-worker-runtime-owner.ts";
 import { referencesForWorkerEndpoint } from "./forms/worker-references.ts";
 import {
+  CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
+  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+  FORWARD_WORKER_VERSION_FORM_URL,
   parseWorkerEndpointSpec,
   validateWorkerEndpointUpdate,
   WORKER_DEPLOYMENT_FORM_URL,
@@ -97,19 +100,37 @@ const admissionDetail =
  * refused request stores nothing and an Endpoint is never queued ahead of its
  * Worker's Deployment. Execution re-checks the exact graph under its claim.
  */
-function endpointAdmission(input: {
-  readonly principal: string;
-  readonly space: string;
-  readonly resourceUid: string;
-  readonly spec: unknown;
-}): V2AdmissionPredicate {
+function endpointAdmission(
+  input: {
+    readonly principal: string;
+    readonly space: string;
+    readonly resourceUid: string;
+    readonly spec: unknown;
+  },
+  forwardFamily: boolean,
+): V2AdmissionPredicate {
   const workerUid = parseWorkerEndpointSpec(input.spec).worker.resourceUid;
+  // This owner serves Deployment04 with Version05 and Deployment06 with05/07.
+  // Container Deployment05/Version06 stay unsupported; all families occupy slots.
+  const deploymentForm = forwardFamily
+    ? "deployment.form_url IN (?, ?)"
+    : "deployment.form_url = ?";
+  const versionForm = forwardFamily
+    ? "((deployment.form_url = ? AND version.form_url = ?) OR (deployment.form_url = ? AND version.form_url IN (?, ?)))"
+    : "version.form_url = ?";
+  const deploymentSlot = forwardFamily
+    ? `
+      AND (SELECT COUNT(*) FROM tf_v2_resources slot
+        WHERE slot.form_url IN (?, ?, ?) AND slot.principal = ? AND slot.space = ?
+          AND slot.deleted_at IS NULL
+          AND json_extract(slot.spec_json, '$.worker.resourceUid') = ?) = 1`
+    : "";
   return {
     sql: `EXISTS (SELECT 1 FROM tf_v2_resources deployment
         JOIN tf_v2_operations serving
           ON serving.resource_uid = deployment.uid
           AND serving.generation = deployment.observed_generation
-        WHERE deployment.form_url = ? AND deployment.principal = ? AND deployment.space = ?
+        WHERE ${deploymentForm} AND deployment.principal = ? AND deployment.space = ?
           AND deployment.deleted_at IS NULL AND deployment.phase <> 'deleting'
           AND deployment.busy_operation IS NULL
           AND deployment.observed_generation >= 1
@@ -154,21 +175,37 @@ function endpointAdmission(input: {
           AND NOT EXISTS (SELECT 1 FROM json_each(serving.accepted_spec_json, '$.versions') selected
             WHERE NOT EXISTS (SELECT 1 FROM tf_v2_resources version
               WHERE version.uid = json_extract(selected.value, '$.workerVersion.resourceUid')
-                AND version.form_url = ? AND version.principal = deployment.principal
+                AND ${versionForm} AND version.principal = deployment.principal
                 AND version.space = deployment.space AND version.deleted_at IS NULL
                 AND (EXISTS (SELECT 1 FROM json_each(version.spec_json, '$.handlers') handler
                       WHERE handler.value = 'fetch')
-                  OR json_type(version.spec_json, '$.assets') = 'object'))))
+                  OR json_type(version.spec_json, '$.assets') = 'object'))))${deploymentSlot}
       AND NOT EXISTS (SELECT 1 FROM tf_v2_resources other
         WHERE other.form_url = ? AND other.principal = ? AND other.space = ?
           AND other.deleted_at IS NULL AND other.uid <> ?
           AND json_extract(other.spec_json, '$.worker.resourceUid') = ?)`,
     params: [
-      WORKER_DEPLOYMENT_FORM_URL,
+      ...(forwardFamily
+        ? [WORKER_DEPLOYMENT_FORM_URL, FORWARD_WORKER_DEPLOYMENT_FORM_URL]
+        : [WORKER_DEPLOYMENT_FORM_URL]),
       input.principal,
       input.space,
       workerUid,
-      WORKER_VERSION_FORM_URL,
+      ...(forwardFamily
+        ? [
+            WORKER_DEPLOYMENT_FORM_URL,
+            WORKER_VERSION_FORM_URL,
+            FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+            WORKER_VERSION_FORM_URL,
+            FORWARD_WORKER_VERSION_FORM_URL,
+            WORKER_DEPLOYMENT_FORM_URL,
+            CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
+            FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+            input.principal,
+            input.space,
+            workerUid,
+          ]
+        : [WORKER_VERSION_FORM_URL]),
       WORKER_ENDPOINT_FORM_URL,
       input.principal,
       input.space,
@@ -222,7 +259,7 @@ function matchesExecution(snapshot: V2WorkerPublicationSnapshot, execution: V2Ex
  * authority called only inside the Resource/Operation acceptance batch;
  * neither caller spec nor runtime discovery can rename this Resource.
  */
-export function createWorkerEndpointForm(options: {
+type WorkerEndpointFormOptions = {
   readonly targetKey: string;
   readonly publicationState: PublicationState;
   readonly ownerForWorker: (workerUid: string) => RuntimeOwner | Promise<RuntimeOwner>;
@@ -250,7 +287,18 @@ export function createWorkerEndpointForm(options: {
     },
     execution: V2Execution,
   ) => Promise<V2EndpointRouteAbsenceObservation>;
-}): V2Form {
+};
+
+export function createWorkerEndpointForm(options: WorkerEndpointFormOptions): V2Form {
+  return createEndpointForm(options, false);
+}
+
+/** Same Endpoint identity; source-selected04/06 owner family, never a caller Form option. */
+export function createForwardWorkerEndpointForm(options: WorkerEndpointFormOptions): V2Form {
+  return createEndpointForm(options, true);
+}
+
+function createEndpointForm(options: WorkerEndpointFormOptions, forwardFamily: boolean): V2Form {
   if (!options.targetKey) throw new TypeError("targetKey is required");
 
   async function run(execution: V2Execution): Promise<V2BackendResult> {
@@ -451,7 +499,7 @@ export function createWorkerEndpointForm(options: {
     },
     async prepareAdmission(input) {
       try {
-        return endpointAdmission(input);
+        return endpointAdmission(input, forwardFamily);
       } catch (error) {
         if (error instanceof WorkerFormValidationError) throw new TakoformV2Error(error.code, 422);
         throw error;

@@ -517,9 +517,16 @@ function outputHostname(row: ResourceRow): { hostname: string; url: string } | n
     : null;
 }
 
-function confirmedServingSource(op: OperationRow, row: ResourceRow, targetKey: string): boolean {
+function confirmedServingSource(
+  op: OperationRow,
+  row: ResourceRow,
+  targetKey: string,
+  forward: boolean,
+): boolean {
   return (
-    (row.form_url === WORKER_DEPLOYMENT_FORM_URL || row.form_url === WORKER_ENDPOINT_FORM_URL) &&
+    (row.form_url === WORKER_DEPLOYMENT_FORM_URL ||
+      row.form_url === WORKER_ENDPOINT_FORM_URL ||
+      (forward && row.form_url === FORWARD_WORKER_DEPLOYMENT_FORM_URL)) &&
     op.resource_uid === row.uid &&
     op.principal === row.principal &&
     op.backend_id === row.backend_id &&
@@ -797,16 +804,36 @@ interface CurrentServingInput {
 }
 
 /** No separate desired-state ledger: every read starts from the accepted v2 Operation. */
-export function createV2WorkerPublicationState(options: {
+type PublicationStateOptions = {
   sql: Sql;
   now?: Clock;
   bundleCustody?: Pick<WorkerBundleCustody, "readHeldVerified"> &
     Partial<Pick<WorkerBundleCustody, "openHeldUnverified">>;
   assetCustody?: Pick<StaticAssetBundleCustody, "readHeldVerified"> &
     Partial<Pick<StaticAssetBundleCustody, "openHeldUnverified">>;
-}) {
+};
+export function createV2WorkerPublicationState(options: PublicationStateOptions) {
+  return createPublicationState(options, false);
+}
+/** Trusted source-owned forward composition; no tenant-selected profile. */
+export function createV2ForwardWorkerPublicationState(options: PublicationStateOptions) {
+  return createPublicationState(options, true);
+}
+function createPublicationState(options: PublicationStateOptions, forwardFamily: boolean) {
   const { sql } = options;
   const now = options.now ?? (() => new Date());
+  const publicationForms = (forward: boolean): readonly string[] =>
+    forward
+      ? [
+          WORKER_DEPLOYMENT_FORM_URL,
+          CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
+          FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+          WORKER_ENDPOINT_FORM_URL,
+        ]
+      : [WORKER_DEPLOYMENT_FORM_URL, WORKER_ENDPOINT_FORM_URL];
+  // Extend only the source-selected closed scope; retained SQL stays byte-identical.
+  const scopedSql = (query: string, forward: boolean) =>
+    forward ? query.replaceAll("IN (?, ?)", "IN (?, ?, ?, ?)") : query;
 
   async function resource(uid: string): Promise<ResourceRow | null> {
     return ((await sql.query("SELECT * FROM tf_v2_resources WHERE uid = ?", [uid]))[0] ??
@@ -964,27 +991,30 @@ export function createV2WorkerPublicationState(options: {
       ...artifactIds,
     ];
     const current = captured.currentServing;
+    const forwardScope = forwardFamily || captured.forward === true;
+    const forms = publicationForms(forwardScope);
     const rows = await sql.query(
-      current.tolerateUnstartedSuccessors ? tolerantCurrentServingFenceSql : currentServingFenceSql,
+      scopedSql(
+        current.tolerateUnstartedSuccessors
+          ? tolerantCurrentServingFenceSql
+          : currentServingFenceSql,
+        forwardScope,
+      ),
       [
         JSON.stringify(selected),
         JSON.stringify(initial.fence.referenceSetIds),
-        WORKER_DEPLOYMENT_FORM_URL,
-        WORKER_ENDPOINT_FORM_URL,
+        ...forms,
         snapshot.worker.principal,
         snapshot.worker.space,
         current.workerUid,
         current.sourceOperationId,
-        WORKER_DEPLOYMENT_FORM_URL,
-        WORKER_ENDPOINT_FORM_URL,
+        ...forms,
         JSON.stringify(selected),
         JSON.stringify(initial.fence.inboundTargetIds),
         JSON.stringify(artifactIds),
-        WORKER_DEPLOYMENT_FORM_URL,
-        WORKER_ENDPOINT_FORM_URL,
+        ...forms,
         current.workerUid,
-        WORKER_DEPLOYMENT_FORM_URL,
-        WORKER_ENDPOINT_FORM_URL,
+        ...forms,
         snapshot.worker.principal,
         snapshot.worker.space,
         current.workerUid,
@@ -1292,16 +1322,22 @@ export function createV2WorkerPublicationState(options: {
       [form, principal, space, workerUid],
     )) as unknown as ResourceRow[];
   }
-  async function hasPendingPublication(workerUid: string): Promise<boolean> {
+  async function hasPendingPublication(
+    workerUid: string,
+    forward = forwardFamily,
+  ): Promise<boolean> {
     return (
       (
         await sql.query(
-          `SELECT 1 FROM tf_v2_operations op
+          scopedSql(
+            `SELECT 1 FROM tf_v2_operations op
          JOIN tf_v2_resources r ON r.uid = op.resource_uid
          WHERE r.form_url IN (?, ?) AND r.deleted_at IS NULL
            AND op.status IN ('queued', 'running', 'waiting_input', 'reconciling')
            AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ? LIMIT 1`,
-          [WORKER_DEPLOYMENT_FORM_URL, WORKER_ENDPOINT_FORM_URL, workerUid],
+            forward,
+          ),
+          [...publicationForms(forward), workerUid],
         )
       ).length !== 0
     );
@@ -1421,10 +1457,12 @@ export function createV2WorkerPublicationState(options: {
     principal: string;
     space: string;
     tolerateUnstartedSuccessors: boolean;
+    forward: boolean;
   }): Promise<readonly { readonly id: unknown; readonly acceptance_order: unknown }[]> {
     return (await sql.query(
-      input.tolerateUnstartedSuccessors
-        ? `SELECT op.id, op.acceptance_order FROM tf_v2_resources r
+      scopedSql(
+        input.tolerateUnstartedSuccessors
+          ? `SELECT op.id, op.acceptance_order FROM tf_v2_resources r
        JOIN tf_v2_operations op ON op.resource_uid = r.uid AND op.generation = r.observed_generation
        WHERE r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
          AND op.principal = r.principal
@@ -1436,7 +1474,7 @@ export function createV2WorkerPublicationState(options: {
            OR (r.busy_operation IS NOT NULL AND op.id <> r.busy_operation))
          AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
        ORDER BY op.acceptance_order DESC, op.id DESC LIMIT 2`
-        : `SELECT op.id, op.acceptance_order FROM tf_v2_resources r
+          : `SELECT op.id, op.acceptance_order FROM tf_v2_resources r
        JOIN tf_v2_operations op ON op.resource_uid = r.uid AND op.generation = r.observed_generation
        WHERE r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
          AND op.principal = r.principal
@@ -1446,13 +1484,9 @@ export function createV2WorkerPublicationState(options: {
          AND (op.id = r.last_operation OR (${failedNoEffectTailSql}))
          AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?
        ORDER BY op.acceptance_order DESC, op.id DESC LIMIT 2`,
-      [
-        WORKER_DEPLOYMENT_FORM_URL,
-        WORKER_ENDPOINT_FORM_URL,
-        input.principal,
-        input.space,
-        input.workerUid,
-      ],
+        input.forward,
+      ),
+      [...publicationForms(input.forward), input.principal, input.space, input.workerUid],
     )) as readonly { readonly id: unknown; readonly acceptance_order: unknown }[];
   }
 
@@ -1694,6 +1728,7 @@ export function createV2WorkerPublicationState(options: {
     forward?: true;
   };
   type CurrentServingCaptureInput = {
+    readonly forward?: true;
     currentServing: {
       workerUid: string;
       targetKey: string;
@@ -1708,10 +1743,8 @@ export function createV2WorkerPublicationState(options: {
   async function capture(
     input: LivePublicationCaptureInput | CurrentServingCaptureInput,
   ): Promise<Capture | CurrentCapture> {
-    const forward = "forward" in input && input.forward === true;
-    const deploymentForm = forward
-      ? FORWARD_WORKER_DEPLOYMENT_FORM_URL
-      : WORKER_DEPLOYMENT_FORM_URL;
+    let forward = "forward" in input && input.forward === true;
+    let deploymentForm = forward ? FORWARD_WORKER_DEPLOYMENT_FORM_URL : WORKER_DEPLOYMENT_FORM_URL;
     const current = "currentServing" in input ? input.currentServing : null;
     const execution = "execution" in input ? input.execution : null;
     if (
@@ -1727,6 +1760,23 @@ export function createV2WorkerPublicationState(options: {
     const own = initialOwn ?? (op ? await resource(op.resource_uid) : null);
     if (!op || !own) {
       return unresolved("graph_unresolved", "The accepted publication source is unavailable");
+    }
+    if (forwardFamily && own.form_url === WORKER_ENDPOINT_FORM_URL) {
+      // Endpoint keeps its owning03 identity. Select the accepted Deployment
+      // family from this same SQL owner/Space, never from request metadata.
+      const endpointWorker = workerUidFromOperation(op);
+      forward =
+        endpointWorker !== null &&
+        (
+          await matchingResources(
+            FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+            endpointWorker,
+            op.principal,
+            own.space,
+            true,
+          )
+        ).length > 0;
+      deploymentForm = forward ? FORWARD_WORKER_DEPLOYMENT_FORM_URL : WORKER_DEPLOYMENT_FORM_URL;
     }
     if (current && pendingStatuses.has(op.status)) {
       return unresolved("source_unsettled", "The serving source Operation is not terminal");
@@ -1773,7 +1823,7 @@ export function createV2WorkerPublicationState(options: {
     }
     if (
       current
-        ? !confirmedServingSource(op, servingRow, current.targetKey)
+        ? !confirmedServingSource(op, servingRow, current.targetKey, forward)
         : !execution || !isCurrentClaim(op, own, execution, now().getTime())
     ) {
       return unresolved("stale_claim", "The accepted operation lease is no longer current");
@@ -1845,13 +1895,15 @@ export function createV2WorkerPublicationState(options: {
       }
     }
 
-    let pending: OperationRow[] = current ? [] : await pendingPublication(workerUid, forward);
+    let pending: OperationRow[] = current
+      ? []
+      : await pendingPublication(workerUid, forward || forwardFamily);
     // Resources whose queued successors were validated, with those Operations'
     // sealed reference targets (reserved as extra active edges at acceptance).
     const unstartedTargets = new Map<string, Set<string>>();
     if (current) {
       if (current.tolerateUnstartedSuccessors) {
-        pending = await pendingPublication(workerUid, forward);
+        pending = await pendingPublication(workerUid, forward || forwardFamily);
         if (pending.length > MAX_UNSTARTED_SUCCESSORS) {
           return unresolved("source_unsettled", "Too many later Worker publications are queued");
         }
@@ -1891,7 +1943,7 @@ export function createV2WorkerPublicationState(options: {
             new Set([...queuedReferences.map((reference) => reference.target_uid), ...gap.targets]),
           );
         }
-      } else if (await hasPendingPublication(workerUid)) {
+      } else if (await hasPendingPublication(workerUid, forward || forwardFamily)) {
         return unresolved("source_unsettled", "A later Worker publication is unresolved");
       }
     } else {
@@ -1904,7 +1956,7 @@ export function createV2WorkerPublicationState(options: {
     }
 
     const [rawDeploymentRows, rawEndpointRows] = await Promise.all([
-      forward
+      forward || forwardFamily
         ? (async () =>
             (
               await Promise.all(
@@ -1912,7 +1964,9 @@ export function createV2WorkerPublicationState(options: {
                   WORKER_DEPLOYMENT_FORM_URL,
                   CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
                   FORWARD_WORKER_DEPLOYMENT_FORM_URL,
-                ].map((form) => matchingResources(form, workerUid, op.principal, own.space)),
+                ].map((form) =>
+                  matchingResources(form, workerUid, op.principal, own.space, !!current),
+                ),
               )
             ).flat())()
         : matchingResources(
@@ -2016,7 +2070,7 @@ export function createV2WorkerPublicationState(options: {
       return { row, accepted: chosenSpec, op: chosenOp };
     }
 
-    if (forward && deploymentRows.some((row) => row.form_url !== deploymentForm))
+    if ((forward || forwardFamily) && deploymentRows.some((row) => row.form_url !== deploymentForm))
       return unresolved("publication_conflict", "Another exact Deployment Form owns this Worker");
     const chosenDeployment = await chosen(deploymentRows, deploymentForm);
     const chosenEndpoint = await chosen(endpointRows, WORKER_ENDPOINT_FORM_URL);
@@ -2315,6 +2369,7 @@ export function createV2WorkerPublicationState(options: {
           principal: op.principal,
           space: own.space,
           tolerateUnstartedSuccessors: current.tolerateUnstartedSuccessors,
+          forward: forward || forwardFamily,
         })
       : null;
     if (
@@ -2384,7 +2439,18 @@ export function createV2WorkerPublicationState(options: {
     try {
       sqlGuard = createWorkerPublicationSqlGuard({
         execution,
-        ...(forward ? { forwardDeployment: true as const } : {}),
+        ...(forward
+          ? execution.form === WORKER_ENDPOINT_FORM_URL
+            ? {
+                forwardEndpointDeployment: chosenDeployment
+                  ? {
+                      resourceUid: chosenDeployment.row.uid,
+                      sourceOperationId: chosenDeployment.op.id,
+                    }
+                  : null,
+              }
+            : { forwardDeployment: true as const }
+          : {}),
         workerUid,
         principal: op.principal,
         space: own.space,
@@ -2396,6 +2462,23 @@ export function createV2WorkerPublicationState(options: {
         referenceSetIds,
         evidence: guardEvidence,
       });
+      if (forwardFamily && !forward) {
+        sqlGuard = {
+          sql: `(${sqlGuard.sql}) AND NOT EXISTS (
+            SELECT 1 FROM tf_v2_resources foreign_family
+            WHERE foreign_family.form_url IN (?, ?) AND foreign_family.deleted_at IS NULL
+              AND foreign_family.principal = ? AND foreign_family.space = ?
+              AND json_extract(foreign_family.spec_json, '$.worker.resourceUid') = ?)`,
+          params: [
+            ...sqlGuard.params,
+            CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
+            FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+            op.principal,
+            own.space,
+            workerUid,
+          ],
+        };
+      }
     } catch {
       return unresolved("graph_unresolved", "Worker publication SQL guard is unavailable");
     }
@@ -2522,6 +2605,12 @@ export function createV2WorkerPublicationState(options: {
     } catch {
       return unresolved("graph_unresolved", "Persisted serving identity is invalid");
     }
+    if (forwardFamily) {
+      const source = await operation(captured.currentServing.sourceOperationId);
+      const owner = source ? await resource(source.resource_uid) : null;
+      if (owner?.form_url === FORWARD_WORKER_DEPLOYMENT_FORM_URL)
+        captured = { ...captured, forward: true };
+    }
     let initial: CurrentCapture;
     try {
       initial = await capture(captured);
@@ -2643,7 +2732,8 @@ export function createV2WorkerPublicationState(options: {
   ): Promise<V2WorkerPublicationResolution> {
     const initial = await capture(input);
     if (initial.kind === "unresolved") return initial;
-    if (input.forward) {
+    const verifyHeld = forwardFamily || input.forward === true;
+    if (verifyHeld) {
       const current = async () => {
         const latest = await capture(input);
         return latest.kind === "ready" && latest.vector === initial.vector;
@@ -2671,9 +2761,9 @@ export function createV2WorkerPublicationState(options: {
           const latest = await capture(input);
           return latest.kind === "ready" && latest.vector === initial.vector;
         };
-        if (!input.forward) return graphCurrent();
+        if (!verifyHeld) return graphCurrent();
         if (!(await graphCurrent())) return false;
-        if (input.forward) {
+        if (verifyHeld) {
           try {
             for (const target of initial.materials.values())
               await readMaterialsTargets(
@@ -2763,6 +2853,14 @@ export function createV2WorkerPublicationState(options: {
         parseModuleWorkerSpec(workerSpec);
         if (await hasPendingPublication(workerUid)) return { kind: "unknown" };
 
+        if (forwardFamily) {
+          for (const form of [
+            CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
+            FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+          ])
+            if ((await matchingResources(form, workerUid, principal, space, true)).length > 0)
+              return { kind: "unknown" };
+        }
         const deployments = await matchingResources(
           WORKER_DEPLOYMENT_FORM_URL,
           workerUid,
@@ -2872,6 +2970,14 @@ export function createV2WorkerPublicationState(options: {
             hasPendingPublication(workerUid),
           ],
         );
+        if (forwardFamily) {
+          for (const form of [
+            CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
+            FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+          ])
+            if ((await matchingResources(form, workerUid, principal, space, true)).length > 0)
+              return { kind: "unknown" };
+        }
         if (
           pending ||
           !latestWorker ||
@@ -2959,6 +3065,9 @@ export function createV2WorkerPublicationState(options: {
     resolve: (input: { execution: V2Execution; incumbentSourceOperationId?: string }) =>
       resolvePublication({
         execution: input.execution,
+        ...(forwardFamily && input.execution.form === FORWARD_WORKER_DEPLOYMENT_FORM_URL
+          ? { forward: true as const }
+          : {}),
         ...(input.incumbentSourceOperationId === undefined
           ? {}
           : { incumbentSourceOperationId: input.incumbentSourceOperationId }),
