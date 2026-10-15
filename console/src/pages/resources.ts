@@ -8,7 +8,7 @@ import {
   settleResourceIntent,
   uncertainResourceIntents,
 } from "../resource-intent.ts";
-import { health } from "../resource-state.ts";
+import { health, phaseLabel } from "../resource-state.ts";
 import { linkProps, navigate, resourcePath, route } from "../router.ts";
 import { api, currentOrganization } from "../state.ts";
 import { ago, badge, card, copyable, empty, explain, ICON, icon, whenReady } from "../ui.ts";
@@ -354,7 +354,6 @@ function table(resources: readonly ResourceSummary[]): Child {
         null,
         h("th", null, tr("状態", "State")),
         h("th", null, tr("名前", "Name")),
-        h("th", null, tr("スペース", "Space")),
         h("th", null, "Form"),
         h("th", null, tr("観測", "Observed")),
       ),
@@ -386,25 +385,22 @@ function row(entry: ResourceSummary): Child {
         ? h("span", { style: { marginLeft: "6px" } }, badge(tr("変更あり", "changed"), "accent"))
         : null,
     ),
-    h("td", null, h("a", { class: "mono", ...linkProps(href) }, entry.name)),
-    h("td", { class: "dim" }, entry.space),
-    h("td", { class: "dim mono", style: { fontSize: "12px" } }, entry.form),
+    // Every row is in the selected organization's Space, so the Space is
+    // not repeated per row; the Form URL wraps instead of widening the table.
     h(
       "td",
-      { class: "dim", title: entry.observedAt ?? "" },
+      { style: { whiteSpace: "nowrap" } },
+      h("a", { class: "mono", ...linkProps(href) }, entry.name),
+    ),
+    h(
+      "td",
+      { class: "dim mono", style: { fontSize: "12px", overflowWrap: "anywhere" } },
+      entry.form,
+    ),
+    h(
+      "td",
+      { class: "dim", title: entry.observedAt ?? "", style: { whiteSpace: "nowrap" } },
       entry.observedAt ? ago(entry.observedAt) : "—",
     ),
   );
-}
-
-function phaseLabel(phase: ReturnType<typeof health>["phase"]): string {
-  const japanese = {
-    Ready: "稼働中",
-    NotReady: "非稼働",
-    Pending: "処理中",
-    Failed: "失敗",
-    Deleting: "削除中",
-    Unknown: "不明",
-  } as const;
-  return tr(japanese[phase], phase);
 }

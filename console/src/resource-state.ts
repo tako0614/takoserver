@@ -1,7 +1,15 @@
 import type { ResourceSummary } from "./api.ts";
+import { tr } from "./i18n.ts";
 
 /** Display only states the v2 Resource actually reports. */
-export type Phase = "Ready" | "NotReady" | "Pending" | "Failed" | "Deleting" | "Unknown";
+export type Phase =
+  | "Ready"
+  | "Applied"
+  | "NotReady"
+  | "Pending"
+  | "Failed"
+  | "Deleting"
+  | "Unknown";
 
 export interface Health {
   readonly phase: Phase;
@@ -28,7 +36,26 @@ export function health(resource: ResourceSummary): Health {
   if (resource.observedAt !== null && resource.observed.ready === false) {
     return { phase: "NotReady", tone: "warn", reason: null, message: null, stale };
   }
+  // Idle with the latest generation observed is the Host's settled state.
+  // A Form that has no notion of readiness (an artifact bundle, say) ends
+  // here, and saying "Unknown" about a finished create misleads.
+  if (resource.observedAt !== null && !("ready" in resource.observed)) {
+    return { phase: "Applied", tone: "ok", reason: null, message: null, stale };
+  }
   return { phase: "Unknown", tone: "idle", reason: null, message: null, stale };
+}
+
+export function phaseLabel(phase: Phase): string {
+  const japanese = {
+    Ready: "稼働中",
+    Applied: "反映済み",
+    NotReady: "非稼働",
+    Pending: "処理中",
+    Failed: "失敗",
+    Deleting: "削除中",
+    Unknown: "不明",
+  } as const;
+  return tr(japanese[phase], phase);
 }
 
 /** Counts by exact Form URL; a shared noun is not a Form identity. */

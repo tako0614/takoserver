@@ -156,6 +156,14 @@ test("confirmed ready:false is NotReady and visible in overview attention", asyn
   };
   expect(health(item)).toMatchObject({ phase: "NotReady", tone: "warn", stale: false });
   expect(health({ ...item, observedAt: null })).toMatchObject({ phase: "Unknown" });
+  // A settled Resource whose Form reports no readiness reads as applied.
+  expect(health({ ...item, observed: { fileCount: 1 } })).toMatchObject({
+    phase: "Applied",
+    tone: "ok",
+  });
+  expect(health({ ...item, observed: {}, observedGeneration: 0 })).toMatchObject({
+    phase: "Pending",
+  });
   expect(byForm([item])).toMatchObject([{ form: item.form, attention: 1 }]);
   consoleLocale.set("en");
   setApiOrigin("https://api.example.test");
