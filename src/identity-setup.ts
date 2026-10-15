@@ -4,7 +4,11 @@ import {
   type IdentityProviderDescriptor,
 } from "./auth.ts";
 import { createGoogleIdentity, GOOGLE_IDENTITY_ISSUERS } from "./google-identity.ts";
-import { createOperatorIdentity, OPERATOR_PROVIDERS } from "./operator-credentials.ts";
+import {
+  createOperatorIdentity,
+  isOperatorProvider,
+  OPERATOR_PROVIDERS,
+} from "./operator-credentials.ts";
 import type { Clock } from "./ports.ts";
 import { createTakosIdIdentity } from "./takos-id-identity.ts";
 
@@ -61,11 +65,80 @@ export type IdentityVerificationAuthority =
       readonly publicKeyJwk: { readonly kty: string; readonly crv: string; readonly x: string };
     };
 
+// A closed, ordered JSON tuple makes the authority domain independent of an
+// assertion, profile, subject, clock or object-property insertion order.
+const IDENTITY_VERIFICATION_DOMAIN_TAG = "takoserver.identity-verification-domain.v1" as const;
+type IdentityVerificationDomainBody =
+  | readonly [typeof IDENTITY_VERIFICATION_DOMAIN_TAG, "takos-id", "oidc", string, string]
+  | readonly [
+      typeof IDENTITY_VERIFICATION_DOMAIN_TAG,
+      "google",
+      "oidc",
+      (typeof GOOGLE_IDENTITY_ISSUERS)[0],
+      (typeof GOOGLE_IDENTITY_ISSUERS)[1],
+      string,
+    ]
+  | readonly [
+      typeof IDENTITY_VERIFICATION_DOMAIN_TAG,
+      (typeof OPERATOR_PROVIDERS)[number],
+      "operator-assertion",
+      string,
+      string,
+      string,
+      string,
+    ];
+
+function verificationDomainBody(
+  provider: IdentityVerificationInput["provider"],
+  method: IdentityMethod,
+  authority: IdentityVerificationAuthority,
+): IdentityVerificationDomainBody {
+  switch (authority.kind) {
+    case "takos-id-oidc":
+      if (provider !== "takos-id" || method !== "oidc") throw new AuthError("invalid");
+      return Object.freeze([
+        IDENTITY_VERIFICATION_DOMAIN_TAG,
+        provider,
+        method,
+        authority.issuer,
+        authority.clientId,
+      ] as const);
+    case "google-oidc":
+      if (provider !== "google" || method !== "oidc") throw new AuthError("invalid");
+      return Object.freeze([
+        IDENTITY_VERIFICATION_DOMAIN_TAG,
+        provider,
+        method,
+        authority.acceptedIssuerPolicy[0],
+        authority.acceptedIssuerPolicy[1],
+        authority.clientId,
+      ] as const);
+    case "operator-assertion":
+      if (!isOperatorProvider(provider) || method !== "operator-assertion") {
+        throw new AuthError("invalid");
+      }
+      return Object.freeze([
+        IDENTITY_VERIFICATION_DOMAIN_TAG,
+        provider,
+        method,
+        authority.audience,
+        authority.publicKeyJwk.kty,
+        authority.publicKeyJwk.crv,
+        authority.publicKeyJwk.x,
+      ] as const);
+  }
+}
+
 /** Historical verification observation, never a human, class or payer grant. */
 export interface IdentityVerificationObservation {
   readonly provider: IdentityVerificationInput["provider"];
   readonly method: IdentityMethod;
   readonly verificationAuthority: IdentityVerificationAuthority;
+  /** Stable verifier domain only; this does not bind or enroll a Principal. */
+  readonly verificationDomain: {
+    readonly body: IdentityVerificationDomainBody;
+    readonly digest: `sha256:${string}`;
+  };
   readonly providerSubject: string;
   readonly email: string;
   readonly displayName: string;
@@ -262,6 +335,16 @@ export function resolveIdentity(options: IdentitySetupOptions): IdentitySetup {
       if (!verify) throw new AuthError("invalid");
       assertIdentityVerificationCaptureReader(verifier);
       const verified = await Reflect.apply(verify, verifier, [captured]);
+      const body = verificationDomainBody(captured.provider, method, verificationAuthority);
+      const domainHash = new Uint8Array(
+        await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(body))),
+      );
+      const verificationDomain = Object.freeze({
+        body,
+        digest: `sha256:${Array.from(domainHash, (byte) => byte.toString(16).padStart(2, "0")).join(
+          "",
+        )}` as `sha256:${string}`,
+      });
       const digest = new Uint8Array(
         await crypto.subtle.digest("SHA-256", new TextEncoder().encode(captured.assertion)),
       );
@@ -273,6 +356,7 @@ export function resolveIdentity(options: IdentitySetupOptions): IdentitySetup {
         provider: captured.provider,
         method,
         verificationAuthority,
+        verificationDomain,
         providerSubject: verified.providerSubject,
         email: verified.email,
         displayName: verified.displayName,
