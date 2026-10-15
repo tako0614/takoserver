@@ -19,18 +19,34 @@ export interface AuthAuthorityTerminal {
   readonly at: string;
   readonly ref: string;
 }
-export interface PrincipalAnchor {
+export type LocalPrincipalIdentityKind = "google" | "github" | "takos-id";
+/** Stable, selected verifier configuration. A pair is storage material, not proof. */
+export interface IdentityAuthorityDomain {
+  readonly body: readonly string[];
+  readonly digest: AuthAuthorityDigest;
+}
+interface PrincipalAnchorBase {
   readonly principalId: string;
   readonly incarnation: string;
-  readonly identityKind: PrincipalIdentityKind;
   readonly identitySubject: string;
   readonly principalCreatedAt: string;
-  readonly originKind: "fresh-local" | "fresh-shared" | "proved-legacy";
   readonly origin: AuthAuthorityEvidence;
   readonly enrolledAt: string;
   readonly state: "active" | "retired";
   readonly terminal: AuthAuthorityTerminal | null;
 }
+export type PrincipalAnchor =
+  | (PrincipalAnchorBase & {
+      readonly originKind: "fresh-local";
+      readonly identityKind: LocalPrincipalIdentityKind;
+      readonly verificationDomain: IdentityAuthorityDomain;
+    })
+  | (PrincipalAnchorBase & {
+      readonly originKind: "fresh-shared" | "proved-legacy";
+      readonly identityKind: PrincipalIdentityKind;
+      readonly verificationDomain: null;
+    });
+
 export interface SharedPrincipalBinding {
   readonly ref: string;
   readonly issuer: string;
@@ -140,7 +156,87 @@ function rowTerminal(row: Row): AuthAuthorityTerminal | null {
     ref: authAuthorityText(row.terminal_ref),
   });
 }
-function anchorFrom(row: Row): PrincipalAnchor {
+const DOMAIN_TAG = "takoserver.identity-verification-domain.v1";
+function authorityBody(value: unknown, kind: LocalPrincipalIdentityKind): readonly string[] {
+  if (!Array.isArray(value) || value.some((part) => typeof part !== "string"))
+    throw new AuthAuthorityStoreError("unavailable");
+  const parts = value as string[];
+  if (parts[0] !== DOMAIN_TAG || parts[1] !== kind)
+    throw new AuthAuthorityStoreError("unavailable");
+  const valid =
+    (kind === "takos-id" && parts.length === 5 && parts[2] === "oidc") ||
+    (kind === "google" &&
+      parts.length === 6 &&
+      parts[2] === "oidc" &&
+      parts[3] === "accounts.google.com" &&
+      parts[4] === "https://accounts.google.com") ||
+    ((kind === "google" || kind === "github") &&
+      parts.length === 7 &&
+      parts[2] === "operator-assertion" &&
+      parts[4] === "OKP" &&
+      parts[5] === "Ed25519");
+  if (!valid || parts.slice(3).some((part) => part.length === 0))
+    throw new AuthAuthorityStoreError("unavailable");
+  return Object.freeze([...parts]);
+}
+/** Rehashes and freezes exact Unit P tuple serialization; never normalizes it. */
+export async function parseIdentityAuthorityDomain(
+  bodyText: unknown,
+  digestText: unknown,
+  kind: LocalPrincipalIdentityKind,
+): Promise<IdentityAuthorityDomain> {
+  if (typeof bodyText !== "string" || bodyText.length > 8192)
+    throw new AuthAuthorityStoreError("unavailable");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bodyText);
+  } catch {
+    throw new AuthAuthorityStoreError("unavailable");
+  }
+  const body = authorityBody(parsed, kind);
+  if (JSON.stringify(body) !== bodyText) throw new AuthAuthorityStoreError("unavailable");
+  let digest: AuthAuthorityDigest;
+  try {
+    digest = authAuthorityDigest(digestText);
+  } catch {
+    throw new AuthAuthorityStoreError("unavailable");
+  }
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(bodyText));
+  const actual = `sha256:${Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("")}`;
+  if (digest !== actual) throw new AuthAuthorityStoreError("unavailable");
+  return Object.freeze({ body, digest });
+}
+/** Local same-primary predicate requires the original Principal and selected domain. */
+export async function localPrincipalCurrentness(
+  anchor: PrincipalAnchor,
+  selected: IdentityAuthorityDomain,
+): Promise<AuthCurrentnessPredicate> {
+  if (anchor.originKind !== "fresh-local") throw new AuthAuthorityStoreError("invalid");
+  const domain = await parseIdentityAuthorityDomain(
+    JSON.stringify(selected.body),
+    selected.digest,
+    anchor.identityKind,
+  );
+  const bodyText = JSON.stringify(domain.body);
+  return Object.freeze({
+    sql: `EXISTS (SELECT 1 FROM auth_principal_incarnations i JOIN principals p ON p.id=i.principal_id
+      WHERE i.principal_id=? AND i.principal_incarnation=? AND i.identity_kind=?
+        AND i.identity_subject=? AND i.principal_created_at=? AND i.origin_kind='fresh-local'
+        AND i.state='active' AND i.identity_authority_body=? AND i.identity_authority_digest=?
+        AND p.id=i.principal_id AND p.provider=i.identity_kind
+        AND p.provider_subject=i.identity_subject AND p.created_at=i.principal_created_at)`,
+    params: Object.freeze([
+      authAuthorityText(anchor.principalId),
+      authAuthorityText(anchor.incarnation, 256),
+      anchor.identityKind,
+      authAuthorityText(anchor.identitySubject),
+      authAuthorityText(anchor.principalCreatedAt),
+      bodyText,
+      domain.digest,
+    ]),
+  });
+}
+async function anchorFrom(row: Row): Promise<PrincipalAnchor> {
   const kind = row.identity_kind;
   const originKind = row.origin_kind;
   if (
@@ -150,13 +246,11 @@ function anchorFrom(row: Row): PrincipalAnchor {
       originKind !== "proved-legacy")
   )
     throw new AuthAuthorityStoreError("unavailable");
-  return Object.freeze({
+  const common = Object.freeze({
     principalId: authAuthorityText(row.principal_id),
     incarnation: authAuthorityText(row.principal_incarnation, 256),
-    identityKind: kind,
     identitySubject: authAuthorityText(row.identity_subject),
     principalCreatedAt: authAuthorityText(row.principal_created_at),
-    originKind,
     origin: evidence({
       ref: authAuthorityText(row.origin_ref),
       digest: authAuthorityDigest(row.origin_digest),
@@ -165,6 +259,27 @@ function anchorFrom(row: Row): PrincipalAnchor {
     state: state(row),
     terminal: rowTerminal(row),
   });
+  if (originKind === "fresh-local") {
+    if (kind === "shared-account") throw new AuthAuthorityStoreError("unavailable");
+    return Object.freeze({
+      ...common,
+      identityKind: kind,
+      originKind,
+      verificationDomain: await parseIdentityAuthorityDomain(
+        row.identity_authority_body,
+        row.identity_authority_digest,
+        kind,
+      ),
+    });
+  }
+  if (
+    (originKind === "fresh-shared" && kind !== "shared-account") ||
+    (originKind === "proved-legacy" && kind === "shared-account")
+  )
+    throw new AuthAuthorityStoreError("unavailable");
+  if (row.identity_authority_body !== null || row.identity_authority_digest !== null)
+    throw new AuthAuthorityStoreError("unavailable");
+  return Object.freeze({ ...common, identityKind: kind, originKind, verificationDomain: null });
 }
 function bindingFrom(row: Row): SharedPrincipalBinding {
   if (row.binding_kind !== "fresh-shared" && row.binding_kind !== "proved-legacy") {
@@ -257,6 +372,7 @@ function anchorMatch(input: {
       WHERE i.principal_id=? AND i.principal_incarnation=? AND i.identity_kind=?
         AND i.identity_subject=? AND i.principal_created_at=? AND i.origin_kind=?
         AND i.origin_ref=? AND i.origin_digest=? AND i.enrolled_at=? AND i.state='active'
+        AND i.identity_authority_body IS NULL AND i.identity_authority_digest IS NULL
         AND p.provider=i.identity_kind AND p.provider_subject=i.identity_subject
         AND p.created_at=i.principal_created_at)`,
     params: Object.freeze([
@@ -277,25 +393,33 @@ function anchorMatch(input: {
 export function sharedPrincipalCurrentness(
   selected: SharedPrincipalBinding,
 ): AuthCurrentnessPredicate {
-  const ref = authAuthorityText(selected.ref, 256);
-  const params: readonly SqlParam[] = Object.freeze([
-    ref,
-    authAuthorityText(selected.principalId),
-    authAuthorityText(selected.principalIncarnation, 256),
-    authAuthorityText(selected.issuer, 2048),
-    authAuthorityText(selected.subject),
-    authAuthorityText(selected.controllerIncarnation, 256),
-    authAuthorityText(selected.targetRef),
-    authAuthorityText(selected.evidence.ref),
-    authAuthorityDigest(selected.evidence.digest),
-  ]);
+  if (selected.kind !== "fresh-shared" && selected.kind !== "proved-legacy")
+    throw new AuthAuthorityStoreError("invalid");
   return Object.freeze({
     sql: `EXISTS (SELECT 1 FROM shared_principal_bindings b
       JOIN auth_principal_incarnations i ON i.principal_id=b.principal_id
         AND i.principal_incarnation=b.principal_incarnation
       JOIN principals p ON p.id=i.principal_id
-      WHERE (((b.binding_ref=? AND (b.principal_id=? AND b.principal_incarnation=?)) AND ((b.issuer=? AND b.subject=?) AND (b.controller_incarnation=? AND b.target_ref=?))) AND ((b.evidence_ref=? AND (b.evidence_digest=? AND b.state='active')) AND ((i.state='active' AND p.provider=i.identity_kind) AND (p.provider_subject=i.identity_subject AND p.created_at=i.principal_created_at)))))`,
-    params,
+      WHERE b.binding_ref=? AND b.principal_id=? AND b.principal_incarnation=?
+        AND b.issuer=? AND b.subject=? AND b.controller_incarnation=? AND b.target_ref=?
+        AND b.evidence_ref=? AND b.evidence_digest=? AND b.binding_kind=? AND b.state='active'
+        AND i.state='active' AND i.origin_kind=b.binding_kind
+        AND i.origin_kind IN ('fresh-shared','proved-legacy')
+        AND i.identity_authority_body IS NULL AND i.identity_authority_digest IS NULL
+        AND p.provider=i.identity_kind AND p.provider_subject=i.identity_subject
+        AND p.created_at=i.principal_created_at)`,
+    params: Object.freeze([
+      authAuthorityText(selected.ref, 256),
+      authAuthorityText(selected.principalId),
+      authAuthorityText(selected.principalIncarnation, 256),
+      authAuthorityText(selected.issuer, 2048),
+      authAuthorityText(selected.subject),
+      authAuthorityText(selected.controllerIncarnation, 256),
+      authAuthorityText(selected.targetRef),
+      authAuthorityText(selected.evidence.ref),
+      authAuthorityDigest(selected.evidence.digest),
+      selected.kind,
+    ]),
   });
 }
 
@@ -326,7 +450,7 @@ export function createSharedPrincipalAuthorityStore(options: { readonly sql: Sql
         [authAuthorityText(principalId)],
       );
       if (rows.length > 1) throw new AuthAuthorityStoreError("unavailable");
-      return rows[0] ? anchorFrom(rows[0]) : null;
+      return rows[0] ? await anchorFrom(rows[0]) : null;
     },
     async findBinding(identity: {
       readonly issuer: string;

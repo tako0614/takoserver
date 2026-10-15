@@ -1,9 +1,12 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { additiveAuthDDL } from "../src/auth-authority-schema-plan.ts";
 import {
   type CredentialAuthorityOrigin,
   createCredentialAuthorityClassStore,
+  directCredentialCurrentness,
   type RpAuthorityIdentity,
   sharedBrokerCredentialCurrentness,
   sharedRpCredentialCurrentness,
@@ -14,13 +17,17 @@ import {
   type AuthAuthorityDigest,
   createSharedPrincipalAuthorityStore,
   type FreshSharedPrincipal,
+  type IdentityAuthorityDomain,
+  localPrincipalCurrentness,
+  type PrincipalAnchor,
+  parseIdentityAuthorityDomain,
   type SharedPrincipalBinding,
   sharedPrincipalCurrentness,
 } from "../src/shared-principal-authority.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 
 // Structural component fixtures only: no genuine identity/proof/payer enrollment.
-const schema = readFileSync(
+const syntheticBase = readFileSync(
   new URL("./fixtures/auth-authority-candidate-schema.sql", import.meta.url),
   "utf8",
 );
@@ -37,7 +44,8 @@ function fixture() {
   const db = new Database(":memory:");
   opened.add(db);
   const sql = createSqliteSql(db);
-  db.exec(schema);
+  db.exec(syntheticBase);
+  db.exec(additiveAuthDDL);
   db.exec(
     "CREATE TABLE auth_guard_probe (id INTEGER PRIMARY KEY,touched INTEGER NOT NULL); INSERT INTO auth_guard_probe VALUES(1,0)",
   );
@@ -85,7 +93,10 @@ async function retiredRoot(f: ReturnType<typeof fixture>) {
   const r = await root(f);
   return await f.principals.retireBinding(r.ref, r.evidence, closure);
 }
-function credentialOrigin(binding: SharedPrincipalBinding, id = "one"): CredentialAuthorityOrigin {
+function credentialOrigin(
+  binding: Pick<SharedPrincipalBinding, "principalId" | "principalIncarnation" | "targetRef">,
+  id = "one",
+): CredentialAuthorityOrigin {
   return {
     ref: `authority_${id}`,
     incarnation: `credential_inc_${id}`,
@@ -106,7 +117,7 @@ function tokenIdentity(id = "one", secret = digest("e")): TokenAuthorityIdentity
   };
 }
 function tokenInsert(
-  binding: SharedPrincipalBinding,
+  binding: Pick<SharedPrincipalBinding, "principalId">,
   identity: TokenAuthorityIdentity,
   organization = "org_original",
   kind = "api_key",
@@ -365,20 +376,52 @@ test("Auth authority zero-row token issuance rolls earlier batch writes back", a
   expect(await f.sql.query("SELECT id FROM auth_tokens")).toEqual([]);
 });
 
-test("Auth authority class collision aborts actual token INSERT without reclassification", async () => {
+test("Auth authority retained broker ref blocks synthetic direct reclassification atomically", async () => {
   const f = fixture();
   const b = await broker(f);
+  const anchor = await syntheticLocal(f);
+  if (anchor.originKind !== "fresh-local") throw new Error("Not local");
+  const control = tokenIdentity("direct_control", digest("c"));
+  const controlOrigin = directOrigin(anchor, "direct_control");
+  await f.sql.batch([
+    tokenInsert({ principalId: anchor.principalId }, control),
+    f.classes.directKeyIssuanceStatement(
+      controlOrigin,
+      control,
+      "org_original",
+      anchor,
+      anchor.verificationDomain,
+    ),
+  ]);
+  expect((await f.classes.readRetained(controlOrigin.ref))?.class).toBe("direct-exact-org-key");
   const nextIdentity = tokenIdentity("two", digest("f"));
+  const next = { ...directOrigin(anchor, "cross_class_ref"), ref: b.origin.ref };
+  expect(nextIdentity.id).not.toBe(b.identity.id);
+  expect(nextIdentity.digest).not.toBe(b.identity.digest);
+  expect(
+    await predicateResult(
+      f.sql,
+      await localPrincipalCurrentness(anchor, anchor.verificationDomain),
+    ),
+  ).toBe(1);
   await expect(
     f.sql.batch([
-      tokenInsert(b.binding, nextIdentity),
-      f.classes.directKeyIssuanceStatement(b.origin, nextIdentity, "org_original"),
+      tokenInsert({ principalId: anchor.principalId }, nextIdentity),
+      f.classes.directKeyIssuanceStatement(
+        next,
+        nextIdentity,
+        "org_original",
+        anchor,
+        anchor.verificationDomain,
+      ),
     ]),
   ).rejects.toMatchObject({ code: "constraint" });
   expect(await f.sql.query("SELECT id FROM auth_tokens ORDER BY id")).toEqual([
+    { id: control.id },
     { id: b.identity.id },
   ]);
   expect(await f.classes.readRetained(b.origin.ref)).toEqual(b.record);
+  expect(await f.classes.readRetained(controlOrigin.ref)).not.toBeNull();
 });
 
 test("Auth authority committed unknown ACK recovers retained original without another INSERT", async () => {
@@ -457,15 +500,51 @@ test("Auth authority retired digest cannot be reissued under another class", asy
   const f = fixture();
   const b = await broker(f);
   await f.sql.run("DELETE FROM auth_tokens WHERE id=?", [b.identity.id]);
-  const next = credentialOrigin(b.binding, "replacement");
+  const retired = await f.classes.readRetained(b.origin.ref);
+  expect(retired?.state).toBe("retired");
+  const anchor = await syntheticLocal(f);
+  if (anchor.originKind !== "fresh-local") throw new Error("Not local");
+  const control = tokenIdentity("direct_control", digest("f"));
+  const controlOrigin = directOrigin(anchor, "direct_control");
+  await f.sql.batch([
+    tokenInsert({ principalId: anchor.principalId }, control),
+    f.classes.directKeyIssuanceStatement(
+      controlOrigin,
+      control,
+      "org_original",
+      anchor,
+      anchor.verificationDomain,
+    ),
+  ]);
+  expect((await f.classes.readRetained(controlOrigin.ref))?.class).toBe("direct-exact-org-key");
+  const reused = tokenIdentity("historical_digest", b.identity.digest);
+  const next = directOrigin(anchor, "historical_digest");
+  expect(reused.id).not.toBe(b.identity.id);
+  expect(next.ref).not.toBe(b.origin.ref);
+  expect(
+    await f.sql.query("SELECT id FROM auth_tokens WHERE secret_digest=?", [reused.digest]),
+  ).toEqual([]);
   await expect(
     f.sql.batch([
-      tokenInsert(b.binding, b.identity),
-      f.classes.directKeyIssuanceStatement(next, b.identity, "org_original"),
+      tokenInsert({ principalId: anchor.principalId }, reused),
+      f.classes.directKeyIssuanceStatement(
+        next,
+        reused,
+        "org_original",
+        anchor,
+        anchor.verificationDomain,
+      ),
     ]),
   ).rejects.toMatchObject({ code: "constraint" });
-  expect(await f.sql.query("SELECT id FROM auth_tokens")).toEqual([]);
-  expect((await f.classes.readRetained(b.origin.ref))?.state).toBe("retired");
+  expect(await f.sql.query("SELECT id FROM auth_tokens ORDER BY id")).toEqual([{ id: control.id }]);
+  expect(await f.classes.readRetained(next.ref)).toBeNull();
+  expect(await f.classes.readRetained(b.origin.ref)).toEqual(retired);
+  expect(
+    await f.sql.query(
+      "SELECT token_digest FROM credential_authority_classes WHERE authority_ref=?",
+      [b.origin.ref],
+    ),
+  ).toEqual([{ token_digest: b.identity.digest }]);
 });
 
 test("Auth authority Principal deletion fences classes preserves history and blocks enrolled ID reuse", async () => {
@@ -611,48 +690,342 @@ test("Auth authority missing schema is unavailable and never bootstraps itself",
   expect(await sql.query("SELECT name FROM sqlite_schema WHERE type='table'")).toEqual([]);
 });
 
-test("Auth authority fixed direct issuer statements remain distinct from shared broker", async () => {
+function domainFrom(body: readonly string[]): IdentityAuthorityDomain {
+  return {
+    body,
+    digest: `sha256:${createHash("sha256").update(JSON.stringify(body)).digest("hex")}`,
+  };
+}
+function localDomain(
+  provider: "takos-id" | "google" | "github" = "takos-id",
+  config = "https://issuer.example.test",
+): IdentityAuthorityDomain {
+  const body =
+    provider === "takos-id"
+      ? ["takoserver.identity-verification-domain.v1", "takos-id", "oidc", config, "client-1"]
+      : provider === "google"
+        ? [
+            "takoserver.identity-verification-domain.v1",
+            "google",
+            "oidc",
+            "accounts.google.com",
+            "https://accounts.google.com",
+            config,
+          ]
+        : [
+            "takoserver.identity-verification-domain.v1",
+            "github",
+            "operator-assertion",
+            config,
+            "OKP",
+            "Ed25519",
+            "public-x",
+          ];
+  return domainFrom(body);
+}
+async function syntheticLocal(
+  f: ReturnType<typeof fixture>,
+  provider: "takos-id" | "google" | "github" = "takos-id",
+  domain = localDomain(provider),
+  id = "direct",
+): Promise<PrincipalAnchor> {
+  const principalId = `prn_${id}`;
+  const incarnation = `${id}_inc`;
+  await f.sql.batch([
+    {
+      sql: "INSERT INTO principals VALUES (?,?,?,'direct@example.test','Direct',?)",
+      params: [principalId, provider, "direct-original-sub", "2026-09-01T00:00:00.000Z"],
+    },
+    {
+      sql: `INSERT INTO auth_principal_incarnations
+      (principal_id,principal_incarnation,identity_kind,identity_subject,principal_created_at,
+       origin_kind,origin_ref,origin_digest,identity_authority_body,identity_authority_digest,enrolled_at)
+      VALUES (?,?,?,?,?,'fresh-local',?,?,?,?,?)`,
+      params: [
+        principalId,
+        incarnation,
+        provider,
+        "direct-original-sub",
+        "2026-09-01T00:00:00.000Z",
+        "synthetic:local-origin",
+        digest("a"),
+        JSON.stringify(domain.body),
+        domain.digest,
+        "2026-10-15T00:00:00.000Z",
+      ],
+    },
+  ]);
+  const anchor = await f.principals.readAnchor(principalId);
+  if (!anchor || anchor.originKind !== "fresh-local")
+    throw new Error("Missing synthetic local anchor");
+  return anchor;
+}
+function directOrigin(anchor: PrincipalAnchor, id: string): CredentialAuthorityOrigin {
+  return credentialOrigin(
+    {
+      principalId: anchor.principalId,
+      principalIncarnation: anchor.incarnation,
+      targetRef: "synthetic:server-target",
+    },
+    id,
+  );
+}
+
+test("Auth authority proved legacy cannot mint direct class and token batch rolls back", async () => {
   const f = fixture();
   await f.sql.run(
-    "INSERT INTO principals VALUES ('prn_direct','google','direct-original-sub','direct@example.test','Direct',?)",
+    "INSERT INTO principals VALUES ('prn_legacy_direct','google','direct-original-sub','direct@example.test','Direct',?)",
     ["2026-09-01T00:00:00.000Z"],
   );
   const binding = await f.principals.bindLegacy({
-    principalId: "prn_direct",
-    principalIncarnation: "direct_inc",
+    principalId: "prn_legacy_direct",
+    principalIncarnation: "legacy_direct_inc",
     provider: "google",
     providerSubject: "direct-original-sub",
     createdAt: "2026-09-01T00:00:00.000Z",
     origin: { ref: "synthetic:proved-direct", digest: digest("a") },
     binding: fresh("direct").binding,
   });
+  const anchor = await f.principals.readAnchor(binding.principalId);
+  if (!anchor) throw new Error("Missing proved-legacy anchor");
+  const forged = {
+    ...anchor,
+    originKind: "fresh-local" as const,
+    identityKind: "google" as const,
+    verificationDomain: localDomain("google"),
+  };
   const session = { ...tokenIdentity("direct_session"), id: "ses_direct", scopesJson: "[]" };
-  const sessionOrigin = credentialOrigin(binding, "direct_session");
-  await f.sql.batch([
-    tokenInsert(binding, session, "org_original", "session"),
-    f.classes.localSessionIssuanceStatement(sessionOrigin, session),
-  ]);
+  const selected = credentialOrigin(binding, "direct_session");
+  await expect(
+    f.sql.batch([
+      tokenInsert(binding, session, "org_original", "session"),
+      f.classes.localSessionIssuanceStatement(selected, session, forged, forged.verificationDomain),
+    ]),
+  ).rejects.toMatchObject({ code: "constraint" });
+  expect(await f.sql.query("SELECT id FROM auth_tokens")).toEqual([]);
+  expect(await f.classes.readRetained(selected.ref)).toBeNull();
   const key = tokenIdentity("direct_key", digest("f"));
-  const keyOrigin = credentialOrigin(binding, "direct_key");
-  await f.sql.batch([
-    tokenInsert(binding, key),
-    f.classes.directKeyIssuanceStatement(keyOrigin, key, "org_original"),
-  ]);
-  const s = await f.classes.readRetained(sessionOrigin.ref);
-  const k = await f.classes.readRetained(keyOrigin.ref);
-  if (!s || s.backend !== "auth-token" || !k || k.backend !== "auth-token")
-    throw new Error("Missing direct rows");
-  expect(s.class).toBe("direct-owner-session");
-  expect(s.organizationId).toBeNull();
-  expect(k.class).toBe("direct-exact-org-key");
-  expect(k.organizationId).toBe("org_original");
-  expect(() =>
-    sharedBrokerCredentialCurrentness(
-      k,
-      new Date(Date.now() + 3600000).toISOString(),
-      "org_original",
+  await expect(
+    f.sql.batch([
+      tokenInsert(binding, key),
+      f.classes.directKeyIssuanceStatement(
+        credentialOrigin(binding, "direct_key"),
+        key,
+        "org_original",
+        forged,
+        forged.verificationDomain,
+      ),
+    ]),
+  ).rejects.toMatchObject({ code: "constraint" });
+  expect(await f.sql.query("SELECT id FROM auth_tokens")).toEqual([]);
+});
+
+test("Auth authority synthetic fresh-local component accepts exact direct domain", async () => {
+  const f = fixture();
+  const anchor = await syntheticLocal(f);
+  if (anchor.originKind !== "fresh-local") throw new Error("Not local");
+  await expect(
+    f.sql.run("UPDATE principals SET created_at='2026-09-01 00:00:00' WHERE id=?", [
+      anchor.principalId,
+    ]),
+  ).rejects.toMatchObject({ code: "constraint" });
+  expect(
+    await predicateResult(
+      f.sql,
+      await localPrincipalCurrentness(
+        { ...anchor, principalCreatedAt: "2026-09-01 00:00:00" },
+        anchor.verificationDomain,
+      ),
     ),
-  ).toThrow();
+  ).toBe(0);
+  expect(Object.isFrozen(anchor.verificationDomain.body)).toBe(true);
+  const sameDomain = localDomain();
+  const nextAssertionDigest = digest("f");
+  expect(nextAssertionDigest).not.toBe(anchor.origin.digest);
+  // A new verified assertion changes historical evidence, not the stable domain.
+  expect(await predicateResult(f.sql, await localPrincipalCurrentness(anchor, sameDomain))).toBe(1);
+  for (const changed of [
+    localDomain("takos-id", "https://issuer.other.test"),
+    localDomain("google", "other-client"),
+    localDomain("github", "other-audience"),
+  ]) {
+    if (changed.body[1] === "takos-id") {
+      expect(await predicateResult(f.sql, await localPrincipalCurrentness(anchor, changed))).toBe(
+        0,
+      );
+    } else {
+      await expect(localPrincipalCurrentness(anchor, changed)).rejects.toMatchObject({
+        code: "unavailable",
+      });
+    }
+  }
+  const session = { ...tokenIdentity("direct_session"), id: "ses_direct", scopesJson: "[]" };
+  const selected = directOrigin(anchor, "direct_session");
+  await f.sql.batch([
+    tokenInsert({ principalId: anchor.principalId }, session, "org_original", "session"),
+    f.classes.localSessionIssuanceStatement(selected, session, anchor, sameDomain),
+  ]);
+  const record = await f.classes.readRetained(selected.ref);
+  if (!record || record.backend !== "auth-token") throw new Error("Missing synthetic direct class");
+  expect(record.class).toBe("direct-owner-session");
+  const expires = (
+    await f.sql.query("SELECT expires_at FROM auth_tokens WHERE id=?", [session.id])
+  )[0]?.expires_at;
+  expect(
+    await predicateResult(
+      f.sql,
+      directCredentialCurrentness(record, anchor, sameDomain, String(expires)),
+    ),
+  ).toBe(1);
+  const key = tokenIdentity("direct_key", digest("f"));
+  const keyOrigin = directOrigin(anchor, "direct_key");
+  await f.sql.batch([
+    tokenInsert({ principalId: anchor.principalId }, key),
+    f.classes.directKeyIssuanceStatement(keyOrigin, key, "org_original", anchor, sameDomain),
+  ]);
+  const retainedKey = await f.classes.readRetained(keyOrigin.ref);
+  expect(retainedKey?.class).toBe("direct-exact-org-key");
+  const brokerKey = tokenIdentity("wrong_broker", digest("c"));
+  const brokerOrigin = directOrigin(anchor, "wrong_broker");
+  await expect(
+    f.sql.batch([
+      tokenInsert({ principalId: anchor.principalId }, brokerKey),
+      f.classes.sharedBrokerIssuanceStatement(brokerOrigin, brokerKey, "org_original"),
+    ]),
+  ).rejects.toMatchObject({ code: "constraint" });
+  expect(await f.sql.query("SELECT id FROM auth_tokens WHERE id=?", [brokerKey.id])).toEqual([]);
+  expect(
+    await f.sql.query(
+      "SELECT origin_digest, identity_authority_digest FROM auth_principal_incarnations",
+    ),
+  ).toEqual([{ origin_digest: digest("a"), identity_authority_digest: sameDomain.digest }]);
+});
+
+test("Auth authority parser rejects noncanonical, malformed, changed and unknown domain bodies", async () => {
+  const domain = localDomain();
+  const canonical = JSON.stringify(domain.body);
+  expect(await parseIdentityAuthorityDomain(canonical, domain.digest, "takos-id")).toEqual(domain);
+  const invalid = [
+    canonical.slice(0, -1),
+    ` ${canonical}`,
+    JSON.stringify([...domain.body, "extra"]),
+    JSON.stringify([domain.body[0], domain.body[2], domain.body[1], ...domain.body.slice(3)]),
+    JSON.stringify(["takoserver.identity-verification-domain.v2", ...domain.body.slice(1)]),
+    JSON.stringify({ body: domain.body }),
+  ];
+  for (const body of invalid)
+    await expect(
+      parseIdentityAuthorityDomain(body, domain.digest, "takos-id"),
+    ).rejects.toMatchObject({ code: "unavailable" });
+  for (const badDigest of [null, digest("f"), "sha256:bad"])
+    await expect(
+      parseIdentityAuthorityDomain(canonical, badDigest, "takos-id"),
+    ).rejects.toMatchObject({ code: "unavailable" });
+});
+
+test("Auth authority local currentness binds selected client, audience and public key", async () => {
+  for (const [provider, original, changed] of [
+    ["google", localDomain("google", "client-a"), localDomain("google", "client-b")],
+    ["github", localDomain("github", "audience-a"), localDomain("github", "audience-b")],
+    [
+      "github",
+      localDomain("github", "audience-a"),
+      domainFrom([
+        "takoserver.identity-verification-domain.v1",
+        "github",
+        "operator-assertion",
+        "audience-a",
+        "OKP",
+        "Ed25519",
+        "other-public-x",
+      ]),
+    ],
+  ] as const) {
+    const f = fixture();
+    const anchor = await syntheticLocal(f, provider, original);
+    expect(await predicateResult(f.sql, await localPrincipalCurrentness(anchor, original))).toBe(1);
+    expect(await predicateResult(f.sql, await localPrincipalCurrentness(anchor, changed))).toBe(0);
+  }
+});
+
+test("Auth authority candidate DDL refuses half-NULL local domains and terminal rewrite", async () => {
+  const f = fixture();
+  const good = localDomain();
+  for (const [suffix, body, domainDigest] of [
+    ["missing_body", null, good.digest],
+    ["missing_digest", JSON.stringify(good.body), null],
+    [
+      "unknown_version",
+      JSON.stringify(["takoserver.identity-verification-domain.v2", ...good.body.slice(1)]),
+      good.digest,
+    ],
+  ] as const) {
+    await expect(
+      f.sql.batch([
+        {
+          sql: "INSERT INTO principals VALUES (?,'takos-id',?,'x@example.test','X',?)",
+          params: [`prn_${suffix}`, `sub_${suffix}`, "2026-09-01T00:00:00.000Z"],
+        },
+        {
+          sql: `INSERT INTO auth_principal_incarnations
+        (principal_id,principal_incarnation,identity_kind,identity_subject,principal_created_at,
+         origin_kind,origin_ref,origin_digest,identity_authority_body,identity_authority_digest,enrolled_at)
+        VALUES (?,?,'takos-id',?,?,'fresh-local',?,?,?,?,?)`,
+          params: [
+            `prn_${suffix}`,
+            `inc_${suffix}`,
+            `sub_${suffix}`,
+            "2026-09-01T00:00:00.000Z",
+            `synthetic:${suffix}`,
+            digest("a"),
+            body,
+            domainDigest,
+            "2026-10-15T00:00:00.000Z",
+          ],
+        },
+      ]),
+    ).rejects.toMatchObject({ code: "constraint" });
+    expect(await f.sql.query("SELECT id FROM principals WHERE id=?", [`prn_${suffix}`])).toEqual(
+      [],
+    );
+  }
+  const anchor = await syntheticLocal(f);
+  if (anchor.originKind !== "fresh-local") throw new Error("Not local");
+  await expect(
+    f.sql.run(
+      "UPDATE auth_principal_incarnations SET identity_authority_digest=NULL WHERE principal_id=?",
+      [anchor.principalId],
+    ),
+  ).rejects.toMatchObject({ code: "constraint" });
+  await expect(
+    f.sql.run(
+      "UPDATE auth_principal_incarnations SET identity_authority_body=? WHERE principal_id=?",
+      [JSON.stringify(localDomain("takos-id", "other").body), anchor.principalId],
+    ),
+  ).rejects.toMatchObject({ code: "constraint" });
+  await f.sql.run(
+    `UPDATE auth_principal_incarnations SET state='retired', terminal_reason='synthetic',
+       terminal_at='2026-10-15T01:00:00.000Z', terminal_ref='synthetic:close' WHERE principal_id=?`,
+    [anchor.principalId],
+  );
+  expect(
+    await predicateResult(
+      f.sql,
+      await localPrincipalCurrentness(anchor, anchor.verificationDomain),
+    ),
+  ).toBe(0);
+  await expect(
+    f.sql.run(
+      "UPDATE auth_principal_incarnations SET identity_authority_digest=? WHERE principal_id=?",
+      [digest("f"), anchor.principalId],
+    ),
+  ).rejects.toMatchObject({ code: "constraint" });
+});
+
+test("Auth authority test schema projects only one candidate DDL source", () => {
+  expect(syntheticBase).not.toContain("CREATE TABLE auth_principal_incarnations");
+  expect(additiveAuthDDL).toContain("CREATE TABLE auth_principal_incarnations");
+  expect(additiveAuthDDL).toContain("identity_authority_body IS NOT OLD.identity_authority_body");
 });
 
 test("Auth authority broker owner cannot be relabeled as the independent human binding", async () => {

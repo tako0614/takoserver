@@ -8,6 +8,8 @@ import {
   authAuthorityInteger,
   authAuthorityText,
   authAuthorityTime,
+  type IdentityAuthorityDomain,
+  type PrincipalAnchor,
 } from "./shared-principal-authority.ts";
 
 export type CredentialAuthorityClass =
@@ -308,29 +310,63 @@ function insert(fields: readonly Field[], guard: AuthCurrentnessPredicate): SqlS
     params: Object.freeze(params),
   });
 }
-function currentAnchor(prefix: string): string {
+function currentAnchor(prefix: string, branch: "local" | "shared"): string {
   // Prefix comes only from this module's closed literal calls, never a DTO.
+  const origin =
+    branch === "local"
+      ? "i.origin_kind='fresh-local' AND i.identity_authority_body IS NOT NULL AND i.identity_authority_digest IS NOT NULL"
+      : "i.origin_kind IN ('fresh-shared','proved-legacy') AND i.identity_authority_body IS NULL AND i.identity_authority_digest IS NULL";
   return `EXISTS (SELECT 1 FROM auth_principal_incarnations i JOIN principals p ON p.id=i.principal_id
     WHERE i.principal_id=${prefix}.principal_id AND i.principal_incarnation=${prefix}.principal_incarnation
-      AND i.state='active' AND p.provider=i.identity_kind AND p.provider_subject=i.identity_subject
+      AND i.state='active' AND ${origin} AND p.provider=i.identity_kind AND p.provider_subject=i.identity_subject
       AND p.created_at=i.principal_created_at)`;
+}
+function localDomain(
+  anchor: PrincipalAnchor,
+  selected: IdentityAuthorityDomain,
+): {
+  readonly body: string;
+  readonly digest: AuthAuthorityDigest;
+} {
+  if (anchor.originKind !== "fresh-local") throw new AuthAuthorityStoreError("invalid");
+  const body = JSON.stringify(selected.body);
+  if (
+    body !== JSON.stringify(anchor.verificationDomain.body) ||
+    selected.digest !== anchor.verificationDomain.digest
+  )
+    throw new AuthAuthorityStoreError("conflict");
+  return Object.freeze({ body, digest: authAuthorityDigest(selected.digest) });
 }
 function tokenIssuance(
   input: CredentialAuthorityOrigin,
   identity: TokenAuthorityIdentity,
   kind: "direct-owner-session" | "direct-exact-org-key" | "official-shared-broker",
   organizationId: string | null,
+  direct?: { readonly anchor: PrincipalAnchor; readonly domain: IdentityAuthorityDomain },
 ): SqlStatement {
   const selected = origin(input);
   const credential = token(identity);
   const tokenKind = kind === "direct-owner-session" ? "session" : "api_key";
+  const isDirect = kind !== "official-shared-broker";
+  if (isDirect !== Boolean(direct)) throw new AuthAuthorityStoreError("invalid");
+  const domain = direct ? localDomain(direct.anchor, direct.domain) : null;
+  if (
+    direct &&
+    (direct.anchor.principalId !== selected.principalId ||
+      direct.anchor.incarnation !== selected.principalIncarnation ||
+      direct.anchor.state !== "active")
+  )
+    throw new AuthAuthorityStoreError("conflict");
+  const anchorBranch = domain
+    ? "i.origin_kind='fresh-local' AND i.identity_authority_body=? AND i.identity_authority_digest=?"
+    : "i.origin_kind IN ('fresh-shared','proved-legacy') AND i.identity_authority_body IS NULL AND i.identity_authority_digest IS NULL AND EXISTS (SELECT 1 FROM shared_principal_bindings b WHERE b.principal_id=i.principal_id AND b.principal_incarnation=i.principal_incarnation AND b.binding_kind=i.origin_kind AND b.target_ref=? AND b.state='active')";
   const guard = Object.freeze({
     sql: `EXISTS (SELECT 1 FROM auth_tokens t JOIN auth_principal_incarnations i ON i.principal_id=t.principal_id
       JOIN principals p ON p.id=i.principal_id WHERE t.id=? AND t.secret_digest=? AND t.kind=?
         AND t.principal_id=? AND t.org_id IS ? AND t.created_at=? AND t.scopes_json=?
         AND t.revoked_at IS NULL AND t.created_at<=strftime('%Y-%m-%dT%H:%M:%fZ','now')
         AND t.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')
-        AND i.principal_incarnation=? AND i.state='active' AND p.provider=i.identity_kind
+        AND i.principal_incarnation=? AND i.state='active' AND ${anchorBranch} AND p.provider=i.identity_kind
         AND p.provider_subject=i.identity_subject AND p.created_at=i.principal_created_at)`,
     params: Object.freeze([
       credential.id,
@@ -341,6 +377,7 @@ function tokenIssuance(
       credential.createdAt,
       credential.scopesJson,
       selected.principalIncarnation,
+      ...(domain ? [domain.body, domain.digest] : [selected.targetRef]),
     ]),
   });
   return insert(
@@ -368,19 +405,24 @@ export function createCredentialAuthorityClassStore(options: { readonly sql: Sql
     localSessionIssuanceStatement(
       input: CredentialAuthorityOrigin,
       credential: TokenAuthorityIdentity,
+      anchor: PrincipalAnchor,
+      domain: IdentityAuthorityDomain,
     ): SqlStatement {
-      return tokenIssuance(input, credential, "direct-owner-session", null);
+      return tokenIssuance(input, credential, "direct-owner-session", null, { anchor, domain });
     },
     directKeyIssuanceStatement(
       input: CredentialAuthorityOrigin,
       credential: TokenAuthorityIdentity,
       organizationId: string,
+      anchor: PrincipalAnchor,
+      domain: IdentityAuthorityDomain,
     ): SqlStatement {
       return tokenIssuance(
         input,
         credential,
         "direct-exact-org-key",
         authAuthorityText(organizationId),
+        { anchor, domain },
       );
     },
     sharedBrokerIssuanceStatement(
@@ -409,7 +451,12 @@ export function createCredentialAuthorityClassStore(options: { readonly sql: Sql
             AND s.account_id=? AND s.principal_id=? AND s.workspace_id=?
             AND b.principal_id=s.principal_id AND b.principal_incarnation=? AND b.target_ref=?
             AND b.issuer=? AND b.subject=? AND b.subject=s.account_id AND b.state='active'
-            AND ${currentAnchor("b")})`,
+            AND b.binding_kind IN ('fresh-shared','proved-legacy')
+            AND EXISTS (SELECT 1 FROM auth_principal_incarnations i
+              WHERE i.principal_id=b.principal_id AND i.principal_incarnation=b.principal_incarnation
+                AND i.origin_kind=b.binding_kind AND i.identity_authority_body IS NULL
+                AND i.identity_authority_digest IS NULL)
+            AND ${currentAnchor("b", "shared")})`,
         params: Object.freeze([
           session.principalBindingRef,
           session.sessionDigest,
@@ -485,6 +532,72 @@ export function createCredentialAuthorityClassStore(options: { readonly sql: Sql
   };
 }
 
+/** Local class currentness is retained storage, not a fresh authentication grant. */
+export function directCredentialCurrentness(
+  record: TokenAuthorityRecord,
+  anchor: PrincipalAnchor,
+  selectedDomain: IdentityAuthorityDomain,
+  capturedExpiresAt: string,
+): AuthCurrentnessPredicate {
+  if (record.class !== "direct-owner-session" && record.class !== "direct-exact-org-key")
+    throw new AuthAuthorityStoreError("invalid");
+  const domain = localDomain(anchor, selectedDomain);
+  if (anchor.state !== "active") throw new AuthAuthorityStoreError("conflict");
+  const selected = origin(record.origin);
+  const credential = token(record.token);
+  if (
+    anchor.principalId !== selected.principalId ||
+    anchor.incarnation !== selected.principalIncarnation
+  )
+    throw new AuthAuthorityStoreError("conflict");
+  return Object.freeze({
+    sql: `EXISTS (SELECT 1 FROM credential_authority_classes a
+      JOIN auth_tokens t ON t.id=a.token_id AND t.secret_digest=a.token_digest
+      JOIN auth_principal_incarnations i ON i.principal_id=a.principal_id
+        AND i.principal_incarnation=a.principal_incarnation
+      JOIN principals p ON p.id=i.principal_id
+      WHERE a.authority_ref=? AND a.credential_incarnation=? AND a.class=?
+        AND a.backend='auth-token' AND a.state='active' AND a.target_ref=?
+        AND a.principal_id=? AND a.principal_incarnation=?
+        AND a.issuance_ref=? AND a.issuance_digest=? AND a.issued_at=?
+        AND a.organization_id IS ? AND a.token_id=? AND a.token_digest=?
+        AND a.token_kind=? AND a.token_scopes_json=? AND a.token_created_at=?
+        AND t.kind=a.token_kind AND t.principal_id=a.principal_id
+        AND t.org_id IS a.organization_id AND t.scopes_json=a.token_scopes_json
+        AND t.created_at=a.token_created_at AND t.expires_at=? AND t.revoked_at IS NULL
+        AND t.created_at<=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        AND t.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        AND i.origin_kind='fresh-local' AND i.state='active'
+        AND i.identity_kind=? AND i.identity_subject=? AND i.principal_created_at=?
+        AND i.identity_authority_body=? AND i.identity_authority_digest=?
+        AND p.provider=i.identity_kind AND p.provider_subject=i.identity_subject
+        AND p.created_at=i.principal_created_at)`,
+    params: Object.freeze([
+      selected.ref,
+      selected.incarnation,
+      record.class,
+      selected.targetRef,
+      selected.principalId,
+      selected.principalIncarnation,
+      selected.issuanceRef,
+      selected.issuanceDigest,
+      selected.issuedAt,
+      record.organizationId,
+      credential.id,
+      credential.digest,
+      record.tokenKind,
+      credential.scopesJson,
+      credential.createdAt,
+      authAuthorityTime(capturedExpiresAt),
+      anchor.identityKind,
+      anchor.identitySubject,
+      anchor.principalCreatedAt,
+      domain.body,
+      domain.digest,
+    ]),
+  });
+}
+
 /** Only Auth/Financial's current captured transport constraints; never payer authority. */
 export function sharedBrokerCredentialCurrentness(
   record: TokenAuthorityRecord,
@@ -500,7 +613,28 @@ export function sharedBrokerCredentialCurrentness(
   return Object.freeze({
     sql: `EXISTS (SELECT 1 FROM credential_authority_classes a JOIN auth_tokens t
       ON t.id=a.token_id AND t.secret_digest=a.token_digest
-      WHERE ((((a.authority_ref=? AND (a.credential_incarnation=? AND a.target_ref=?)) AND (a.class='official-shared-broker' AND (a.backend='auth-token' AND a.state='active'))) AND ((a.organization_id=? AND (a.principal_id=? AND a.principal_incarnation=?)) AND ((a.issuance_ref=? AND a.issuance_digest=?) AND (a.token_id=? AND a.token_digest=?)))) AND (((a.token_created_at=? AND (a.token_scopes_json=? AND a.token_kind='api_key')) AND ((t.principal_id=a.principal_id AND t.org_id=a.organization_id) AND (t.kind='api_key' AND t.created_at=a.token_created_at))) AND ((t.scopes_json=a.token_scopes_json AND (t.revoked_at IS NULL AND t.expires_at=?)) AND ((t.created_at<=strftime('%Y-%m-%dT%H:%M:%fZ','now') AND t.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')) AND (EXISTS (SELECT 1 FROM json_each(t.scopes_json) WHERE type='text' AND value='payments:write') AND ${currentAnchor("a")}))))))`,
+      WHERE a.authority_ref=? AND a.credential_incarnation=? AND a.target_ref=?
+        AND a.class='official-shared-broker' AND a.backend='auth-token' AND a.state='active'
+        AND a.organization_id=? AND a.principal_id=? AND a.principal_incarnation=?
+        AND a.issuance_ref=? AND a.issuance_digest=?
+        AND a.token_id=? AND a.token_digest=? AND a.token_created_at=?
+        AND a.token_scopes_json=? AND a.token_kind='api_key'
+        AND t.principal_id=a.principal_id AND t.org_id=a.organization_id
+        AND t.kind='api_key' AND t.created_at=a.token_created_at
+        AND t.scopes_json=a.token_scopes_json AND t.revoked_at IS NULL
+        AND t.expires_at=? AND t.created_at<=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        AND t.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        AND EXISTS (SELECT 1 FROM json_each(t.scopes_json)
+          WHERE type='text' AND value='payments:write')
+        AND ${currentAnchor("a", "shared")}
+        AND EXISTS (SELECT 1 FROM shared_principal_bindings b
+          WHERE b.principal_id=a.principal_id AND b.principal_incarnation=a.principal_incarnation
+            AND b.binding_kind IN ('fresh-shared','proved-legacy')
+            AND b.target_ref=a.target_ref AND b.state='active'
+            AND EXISTS (SELECT 1 FROM auth_principal_incarnations i
+              WHERE i.principal_id=b.principal_id AND i.principal_incarnation=b.principal_incarnation
+                AND i.origin_kind=b.binding_kind AND i.identity_authority_body IS NULL
+                AND i.identity_authority_digest IS NULL)))`,
     params: Object.freeze([
       selected.ref,
       selected.incarnation,
@@ -540,10 +674,32 @@ export function sharedRpCredentialCurrentness(
   return Object.freeze({
     sql: `EXISTS (SELECT 1 FROM credential_authority_classes a JOIN shared_auth_sessions s
       ON s.digest=a.session_digest AND s.created_at=a.session_created_at
-      WHERE (((((a.authority_ref=? AND a.credential_incarnation=?) AND (a.target_ref=? AND (a.class='official-shared-rp-session' AND a.backend='shared-rp-session'))) AND ((a.state='active' AND a.organization_id=?) AND (a.principal_id=? AND (a.principal_incarnation=? AND a.issuance_ref=?)))) AND (((a.issuance_digest=? AND a.principal_binding_ref=?) AND (a.rp_registration_ref=? AND (a.rp_registration_digest=? AND a.session_digest=?))) AND ((a.session_created_at=? AND a.session_enrolled_version=?) AND (a.issuer=? AND (a.client_id=? AND a.subject=?))))) AND ((((a.issuer_session_id=? AND a.auth_time=?) AND (a.account_id=? AND (a.workspace_id=? AND a.workspace_ref=?))) AND ((s.status='active' AND s.version=?) AND (s.version>=a.session_enrolled_version AND (s.account_id=a.account_id AND s.principal_id=a.principal_id)))) AND (((s.workspace_id=a.workspace_id AND s.absolute_expires_at=?) AND (s.last_used_at=? AND (s.created_at<=${now} AND s.last_used_at<=${now}))) AND ((s.grant_checked_at<=${now} AND s.absolute_expires_at>${now}) AND (s.last_used_at+43200000>${now} AND (EXISTS (SELECT 1 FROM shared_principal_bindings b
+      WHERE a.authority_ref=? AND a.credential_incarnation=? AND a.target_ref=?
+        AND a.class='official-shared-rp-session' AND a.backend='shared-rp-session'
+        AND a.state='active' AND a.organization_id=? AND a.principal_id=?
+        AND a.principal_incarnation=? AND a.issuance_ref=? AND a.issuance_digest=?
+        AND a.principal_binding_ref=? AND a.rp_registration_ref=?
+        AND a.rp_registration_digest=? AND a.session_digest=?
+        AND a.session_created_at=? AND a.session_enrolled_version=?
+        AND a.issuer=? AND a.client_id=? AND a.subject=?
+        AND a.issuer_session_id=? AND a.auth_time=? AND a.account_id=?
+        AND a.workspace_id=? AND a.workspace_ref=?
+        AND s.status='active' AND s.version=? AND s.version>=a.session_enrolled_version
+        AND s.account_id=a.account_id AND s.principal_id=a.principal_id
+        AND s.workspace_id=a.workspace_id AND s.absolute_expires_at=?
+        AND s.last_used_at=? AND s.created_at<=${now} AND s.last_used_at<=${now}
+        AND s.grant_checked_at<=${now} AND s.absolute_expires_at>${now}
+        AND s.last_used_at+43200000>${now}
+        AND EXISTS (SELECT 1 FROM shared_principal_bindings b
+          JOIN auth_principal_incarnations i ON i.principal_id=b.principal_id
+            AND i.principal_incarnation=b.principal_incarnation
           WHERE b.binding_ref=a.principal_binding_ref AND b.principal_id=a.principal_id
             AND b.principal_incarnation=a.principal_incarnation AND b.target_ref=a.target_ref
-            AND b.issuer=a.issuer AND b.subject=a.subject AND b.subject=a.account_id AND b.state='active') AND ${currentAnchor("a")})))))))`,
+            AND b.issuer=a.issuer AND b.subject=a.subject AND b.subject=a.account_id
+            AND b.state='active' AND b.binding_kind=i.origin_kind
+            AND i.origin_kind IN ('fresh-shared','proved-legacy')
+            AND i.identity_authority_body IS NULL AND i.identity_authority_digest IS NULL)
+        AND ${currentAnchor("a", "shared")})`,
     params: Object.freeze([
       selected.ref,
       selected.incarnation,
