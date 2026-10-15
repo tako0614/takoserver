@@ -214,6 +214,18 @@ textarea {
   flex: 1;
 }
 
+/* When space runs out, the organization picker gives way first, down to a
+   few characters, so every other control in the bar stays on screen. */
+.topbar__picker {
+  min-width: 0;
+}
+
+.topbar__org {
+  flex: 0 1 auto;
+  min-width: 4em;
+  text-overflow: ellipsis;
+}
+
 .rail {
   grid-area: rail;
   border-right: 1px solid var(--line-1);
@@ -318,8 +330,34 @@ textarea {
     overflow-x: auto;
   }
 
+  .topbar__who {
+    display: inline-block;
+    max-width: 10em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .main {
     padding: 18px 16px 64px;
+  }
+}
+
+/* A phone keeps the top bar on one line: the signed-in name gives way to
+   its icon, and a long organization name is cut instead of pushing the
+   controls out of view. */
+@media (width < 620px) {
+  .topbar {
+    gap: 4px;
+    padding: 0 12px;
+  }
+
+  .topbar__who {
+    display: none;
+  }
+
+  .topbar__org {
+    max-width: 46vw;
   }
 }
 
@@ -469,6 +507,85 @@ tbody tr.is-clickable:hover {
   text-overflow: ellipsis;
   white-space: nowrap;
   vertical-align: bottom;
+}
+
+/* The Resources list. On a phone each row stacks: name and state, then the
+   exact Form URL across the whole row, then when it was observed. */
+.resource-name .truncate {
+  max-width: 24ch;
+}
+
+.resource-form {
+  min-width: 24ch;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.resource-observed {
+  white-space: nowrap;
+}
+
+@media (width < 620px) {
+  .resource-table thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+  }
+
+  .resource-table,
+  .resource-table tbody {
+    display: block;
+  }
+
+  .resource-table tr {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "name state" "form form" "observed observed";
+    gap: 4px 12px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--line-1);
+  }
+
+  .resource-table tbody tr:last-child {
+    border-bottom: 0;
+  }
+
+  .resource-table td {
+    display: block;
+    padding: 0;
+    border: 0;
+  }
+
+  .resource-table .resource-name {
+    grid-area: name;
+    min-width: 0;
+  }
+
+  .resource-table .resource-name .truncate {
+    max-width: 100%;
+  }
+
+  .resource-table .resource-state {
+    grid-area: state;
+    justify-self: end;
+  }
+
+  .resource-table .resource-form {
+    grid-area: form;
+    min-width: 0;
+  }
+
+  .resource-table .resource-observed {
+    grid-area: observed;
+    font-size: 12px;
+  }
+
+  /* The column headers are hidden here, so the time says what it is. */
+  .resource-table .resource-observed::before {
+    content: attr(data-label) " · ";
+  }
 }
 
 .badge {

@@ -9,8 +9,9 @@
  * credential or real Host is used. Requires /usr/bin/google-chrome.
  *
  * Writes site/screens/console-{desktop,mobile}-{light,dark}-{en,ja}.webp.
- * Desktop is the whole 1440 x 900 viewport; mobile is 600 x 700. Both are
- * captured at device scale 2.
+ * Desktop is the whole 1200 x 750 viewport; mobile is 390 x 780, a phone's
+ * width, so its text stays legible in the page. Both are captured at device
+ * scale 2.
  */
 import { spawn, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
@@ -36,7 +37,13 @@ const resources = [
   }),
   sample("hello-version-v1", "WorkerVersion/0.5.0", 8, {}),
   sample("hello-deployment", "WorkerDeployment/0.4.0", 8, {}),
-  sample("hello-endpoint", "WorkerEndpoint/0.3.0", 7, { hostname: "hello.apps.example.com" }),
+  sample(
+    "hello-endpoint",
+    "WorkerEndpoint/0.3.0",
+    7,
+    { hostname: "hello.apps.example.com" },
+    { hostname: "hello.apps.example.com" },
+  ),
   sample("notes", "SQLiteDatabase/0.2.0", 26, { databaseExists: true }),
 ];
 
@@ -45,6 +52,7 @@ function sample(
   form: string,
   minutesAgo: number,
   observed: Record<string, unknown>,
+  output: Record<string, unknown> = {},
 ): Record<string, unknown> {
   return {
     uid: `sample-${name}`,
@@ -57,7 +65,7 @@ function sample(
     phase: "idle",
     spec: {},
     observed,
-    output: {},
+    output,
     lastOperation: `sample-operation-${name}`,
   };
 }
@@ -185,10 +193,14 @@ try {
 
   await send("Page.enable");
   await send("Runtime.enable");
+  // One warm-up load so the first capture lays out like the rest.
+  const warm = event("Page.loadEventFired");
+  await send("Page.navigate", { url: `${origin}/resources` });
+  await warm;
   for (const locale of ["en", "ja"] as const) {
     for (const [shape, width, height] of [
-      ["desktop", 1440, 900],
-      ["mobile", 600, 700],
+      ["desktop", 1200, 750],
+      ["mobile", 390, 780],
     ] as const) {
       for (const theme of ["light", "dark"] as const) {
         await send("Emulation.setDeviceMetricsOverride", {

@@ -26,6 +26,7 @@ const DEPLOY_STEPS = `${GUIDE}#6-seed-held-artifacts`;
 const DOCKER_GUIDE = `${REPOSITORY}/blob/main/docs/self-host-docker.md`;
 const SECURITY_GUIDE = `${REPOSITORY}/blob/main/docs/self-host-security.md`;
 const V2_REFERENCE = `${REPOSITORY}/blob/main/docs/takoform-v2.md`;
+const PREREQUISITES = `${GUIDE}#1-prerequisites`;
 
 const landingMessages = {
   en: {
@@ -35,51 +36,57 @@ const landingMessages = {
     lead: "Deploy Takoform.\nRun your own cloud.",
     lede: "Takoserver is an open-source cloud that runs on your own Linux machine. Deploy Workers and their SQLite, KV, object storage and queues from Takoform definitions, and operate them yourself.",
     install: "Read the install guide",
-    console: "Open the console",
     source: "Source code",
     preview: "Resources in the Takoserver Console · public sample data",
     previewAlt:
       "The Takoserver Console listing the Resources of a Worker named hello and a SQLite database, all applied, with public sample data",
     formsTitle: "What you can deploy",
     formsBody:
-      "With the pinned workerd and the required settings on Linux x86-64, a self-host accepts these Takoform Forms. Before you rely on a Form, check its exact URL against the Host's support endpoint.",
+      "A Host serves exactly the Forms its configuration composes. Before relying on one, ask your Host's support endpoint about its exact Form URL.",
+    artifactsTitle: "Artifacts",
+    artifactsBody:
+      "Worker code, static files and SQL migrations, kept by URL and SHA-256. Each needs only Bun and that Form's block in TAKOSERVER_TAKOFORM_V2_CONFIG.",
     workersTitle: "Workers and HTTPS",
     workersBody:
-      "Bundle code and static assets, cut a version, choose which version serves, publish it at an HTTPS hostname, and run it on a schedule.",
+      "Create a Worker, cut a version, choose which version serves, run it on a schedule and publish it at an HTTPS hostname. Needs the complete local Worker profile (step 4 below); WorkerEndpoint also needs the HTTPS listener on port 443.",
     dataTitle: "Data",
     dataBody:
-      "SQLite databases, KV namespaces and object buckets that a Worker uses through Bindings, with SQL migrations applied in order.",
+      "SQLite databases, KV namespaces and object buckets that a Worker uses through Bindings. Needs the complete local Worker profile; SQLiteMigrationApplication also needs a sqliteMigrationSet block.",
     asyncTitle: "Queues, actors and workflows",
     asyncBody:
-      "At-least-once queues and their consumers, actors that keep state, and durable workflows.",
+      "At-least-once queues and their consumers, actors that keep state, and durable workflows. Needs the complete local Worker profile.",
+    hostTitle: "Run your own Host",
+    hostStep1:
+      "On Linux x86-64 with Bun, check out a reviewed commit and install its locked dependencies.",
+    hostStep2: "Set the public HTTPS origin, the v2 configuration and a persistent cursor key.",
+    hostStep3:
+      "Start it. Without an identity provider, the first boot prints a single-use operator sign-in assertion.",
+    hostStep4:
+      "For Workers, add the complete local Worker profile: the pinned workerd, Actor and Workflow boot with the Workflow execution guard, all five private data planes, and both bundle blocks on selfhost-v2-worker-primary. Publishing at a hostname also needs HTTPS on port 443.",
+    hostNote:
+      "Serve the API through your own HTTPS front end; do not expose the listener directly. To try the API, sign-in, organizations and keys without running Workers, use Docker.",
+    prerequisites: "Prerequisites",
+    docker: "Try it in Docker",
+    security: "Self-host security",
     deployTitle: "Deploy one Worker",
     deployBody:
-      "Steps 6 to 9 of the install guide, condensed. Host API v2 accepts each create as an Operation; sending it again with the same idempotency-key returns that same Operation instead of a second Resource.",
+      "Steps 6 to 9 of the install guide, condensed; $V2 and $KEY come from its step 5. Host API v2 accepts each create as an Operation; for 24 hours, sending it again with the same idempotency-key returns that Operation instead of a second Resource.",
+    workerStep: "is the Worker itself. Its versions, deployment and endpoint refer to it.",
     bundleStep: "names the bytes of worker.js held by the Host, by URL and SHA-256.",
-    workerStep: "is the Worker itself. Its versions and endpoint refer to it.",
     versionStep: "pairs that bundle with its fetch handler.",
     deploymentStep: "chooses which version serves: here one version, weight 10000.",
     endpointStep: "publishes the Worker at an HTTPS hostname.",
     resultLabel: "Then request it:",
     deployMore: "Steps 6 to 9 in the guide",
-    hostTitle: "Run your own Host",
-    hostStep1: "On Linux x86-64 with Bun, get the source and install its locked dependencies.",
-    hostStep2: "Set the public HTTPS origin, the v2 configuration and a persistent cursor key.",
-    hostStep3:
-      "Start it. Without an identity provider, the first boot prints a single-use operator sign-in assertion.",
-    hostStep4:
-      "To run Workers, add the pinned workerd, the Workflow execution guard, the five private data planes and HTTPS on port 443.",
-    hostNote:
-      "Serve the API through your own HTTPS front end; do not expose the listener directly. To try the API, sign-in, organizations and keys without running Workers, use Docker.",
-    docker: "Try it in Docker",
-    security: "Self-host security",
     afterTitle: "After you deploy",
     consoleTitle: "In the console",
     consoleBody:
-      "Sign in, create the organization that owns your Resources, issue API keys, and see each Resource's declared and observed state.",
+      "The console is a separate static app built from this repository. Serve it on its own origin next to your API and name that origin in the Host's settings. There you sign in, create the organization that owns your Resources, issue API keys, and see each Resource's declared and observed state.",
+    consoleHost: "Open this Host's console",
+    consoleSite: "takoserver.com's own console",
     apiTitle: "With the API",
     apiBody:
-      "Do the same from your own tools over Host API v2. Start by asking whether this Host supports the exact Form URL you plan to use.",
+      "Do the same from your own tools over Host API v2. Start by asking your Host whether it supports the exact Form URL you plan to use; $HOST is its public origin.",
     reference: "Host API v2 reference",
     openapi: "OpenAPI description",
     discovery: "Takoform Host discovery",
@@ -92,51 +99,57 @@ const landingMessages = {
     lead: "Takoformを、\n自分のクラウドへ。",
     lede: "Takoserverは、自分のLinuxマシンで動かすオープンソースのクラウドです。WorkerとそのSQLite・KV・オブジェクトストレージ・キューを、Takoformの定義からデプロイして運用できます。",
     install: "導入手順を読む",
-    console: "コンソールを開く",
     source: "ソースコード",
     preview: "Takoserver Consoleのリソース一覧（公開用サンプルデータ）",
     previewAlt:
       "helloというWorkerのリソース一式とSQLiteデータベースがすべて反映済みになっている、Takoserver Consoleのリソース一覧（公開用サンプルデータ）",
     formsTitle: "デプロイできるもの",
     formsBody:
-      "Linux x86-64で固定版のworkerdと必要な設定がそろうと、セルフホストは次のTakoform Formを受け付けます。使う前に、Form URLごとにHostのsupportで対応を確認できます。",
+      "Hostは、設定で組み合わせたFormだけを提供します。使う前に、HostのsupportエンドポイントでForm URLごとに対応を確認できます。",
+    artifactsTitle: "成果物",
+    artifactsBody:
+      "Workerのコード・静的ファイル・SQLのマイグレーションを、URLとSHA-256で固定して保持します。Bunと、TAKOSERVER_TAKOFORM_V2_CONFIGにあるそのFormのblockだけで使えます。",
     workersTitle: "Workerと公開",
     workersBody:
-      "コードと静的ファイルを束ね、版を作り、配信する版を決めて、HTTPSのホスト名で公開します。定期実行もできます。",
+      "Workerを作り、版を作り、配信する版を決め、定期実行し、HTTPSのホスト名で公開します。完全なlocal Worker profile（下の手順4）が必要で、WorkerEndpointには443番のHTTPS listenerも必要です。",
     dataTitle: "データ",
     dataBody:
-      "WorkerがBindingで使うSQLiteデータベース、KV、オブジェクトストレージです。SQLのマイグレーションは順に適用します。",
+      "WorkerがBindingで使うSQLiteデータベース、KV、オブジェクトストレージです。完全なlocal Worker profileが必要で、SQLiteMigrationApplicationにはsqliteMigrationSetのblockも必要です。",
     asyncTitle: "キュー・Actor・Workflow",
-    asyncBody: "少なくとも一度届くキューとその受信、状態を持つActor、永続するWorkflowです。",
+    asyncBody:
+      "少なくとも一度届くキューとその受信、状態を持つActor、永続するWorkflowです。完全なlocal Worker profileが必要です。",
+    hostTitle: "自分のHostを動かす",
+    hostStep1:
+      "Linux x86-64とBunを用意し、reviewしたcommitを取り出して、lockfileで固定された依存関係をインストールします。",
+    hostStep2: "公開HTTPS origin、v2設定、永続するcursor鍵を設定します。",
+    hostStep3:
+      "起動します。IDプロバイダーが未設定なら、初回起動時に一度だけ使える運営者サインイン用のassertionが表示されます。",
+    hostStep4:
+      "Workerには完全なlocal Worker profileを追加します。固定版のworkerd、ActorとWorkflowの起動とWorkflow execution guard、5つのprivate data plane、selfhost-v2-worker-primaryに向けた2つのbundle blockです。ホスト名で公開するには443番のHTTPSも必要です。",
+    hostNote:
+      "APIは自分で用意したHTTPSフロントエンドの背後で公開し、listenerを直接公開しないでください。Workerを動かさずにAPI・サインイン・組織・APIキーを試すならDockerを使えます。",
+    prerequisites: "前提条件",
+    docker: "Dockerで試す",
+    security: "セルフホストのセキュリティ",
     deployTitle: "Workerを1つデプロイする",
     deployBody:
-      "導入手順書のstep 6〜9を短くまとめた流れです。Host API v2は作成をOperationとして受け付けます。同じidempotency-keyで送り直すと、2つ目のリソースは作らず同じOperationを返します。",
+      "導入手順書のstep 6〜9を短くまとめた流れです。$V2と$KEYは手順書のstep 5で用意します。Host API v2は作成をOperationとして受け付けます。24時間以内に同じidempotency-keyで送り直すと、2つ目のリソースは作らず同じOperationを返します。",
+    workerStep: "Workerそのものです。版・配信・公開先はこれを参照します。",
     bundleStep: "Hostに保持したworker.jsの内容を、URLとSHA-256で指定します。",
-    workerStep: "Workerそのものです。版と公開先はこれを参照します。",
     versionStep: "そのbundleとfetchハンドラーを組み合わせた版です。",
     deploymentStep: "どの版を配信するかを決めます。ここでは1つの版を重み10000で配信します。",
     endpointStep: "WorkerをHTTPSのホスト名で公開します。",
     resultLabel: "公開したら、リクエストします。",
     deployMore: "手順書のstep 6〜9",
-    hostTitle: "自分のHostを動かす",
-    hostStep1:
-      "Linux x86-64とBunを用意し、ソースを取得して、lockfileで固定された依存関係をインストールします。",
-    hostStep2: "公開HTTPS origin、v2設定、永続するcursor鍵を設定します。",
-    hostStep3:
-      "起動します。IDプロバイダーが未設定なら、初回起動時に一度だけ使える運営者サインイン用のassertionが表示されます。",
-    hostStep4:
-      "Workerを動かすには、固定版のworkerd、Workflow execution guard、5つのprivate data plane、443番のHTTPSを追加します。",
-    hostNote:
-      "APIは自分で用意したHTTPSフロントエンドの背後で公開し、listenerを直接公開しないでください。Workerを動かさずにAPI・サインイン・組織・APIキーを試すならDockerを使えます。",
-    docker: "Dockerで試す",
-    security: "セルフホストのセキュリティ",
     afterTitle: "デプロイしたあと",
     consoleTitle: "コンソールで",
     consoleBody:
-      "サインインし、リソースを所有する組織を作り、APIキーを発行して、各リソースの宣言と観測した状態を確認します。",
+      "コンソールは、このリポジトリからbuildする独立した静的アプリです。APIと並ぶ別のoriginで配信し、そのoriginをHostの設定に指定します。そこでサインインし、リソースを所有する組織を作り、APIキーを発行して、各リソースの宣言と観測した状態を確認します。",
+    consoleHost: "このHostのコンソールを開く",
+    consoleSite: "takoserver.com自身のコンソール",
     apiTitle: "APIで",
     apiBody:
-      "同じ操作を、自分のツールからHost API v2で行えます。まず、使う予定のForm URLにこのHostが対応しているかを確認します。",
+      "同じ操作を、自分のツールからHost API v2で行えます。まず、使う予定のForm URLに自分のHostが対応しているかを確認します。$HOSTはHostの公開originです。",
     reference: "Host API v2 リファレンス",
     openapi: "OpenAPI仕様",
     discovery: "Takoform Hostディスカバリー",
@@ -144,19 +157,22 @@ const landingMessages = {
   },
 } as const;
 
-/** The Forms a complete local Worker composition registers (docs/takoform-v2.md). */
+/** The Forms a Bun self-host can compose, and what each group needs (docs/takoform-v2.md). */
 const FORM_GROUPS = [
+  {
+    title: "artifactsTitle",
+    body: "artifactsBody",
+    forms: ["WorkerBundle 0.2.0", "StaticAssetBundle 0.2.0", "SQLiteMigrationSet 0.2.0"],
+  },
   {
     title: "workersTitle",
     body: "workersBody",
     forms: [
       "ModuleWorker 0.3.0",
-      "WorkerBundle 0.2.0",
-      "StaticAssetBundle 0.2.0",
       "WorkerVersion 0.5.0",
       "WorkerDeployment 0.4.0",
-      "WorkerEndpoint 0.3.0",
       "WorkerCronTrigger 0.3.0",
+      "WorkerEndpoint 0.3.0",
     ],
   },
   {
@@ -164,7 +180,6 @@ const FORM_GROUPS = [
     body: "dataBody",
     forms: [
       "SQLiteDatabase 0.2.0",
-      "SQLiteMigrationSet 0.2.0",
       "SQLiteMigrationApplication 0.2.0",
       "EdgeKVNamespace 0.2.0",
       "ObjectBucket 0.2.0",
@@ -244,7 +259,7 @@ h1 { margin: 0; font-family: var(--display); font-size: clamp(42px, 5.5vw, 68px)
 .lede { margin: 18px auto 0; max-width: 40em; color: var(--ink-2); font-size: 15px; line-height: 1.9; }
 .actions { display: flex; justify-content: center; align-items: center; gap: 12px; margin-top: 32px; flex-wrap: wrap; }
 .pill { display: inline-flex; align-items: center; justify-content: center; gap: 12px; min-height: 48px; padding: 12px 24px; border-radius: 999px; font-size: 14px; font-weight: 500; text-decoration: none; white-space: nowrap; transition: opacity 120ms ease-out, border-color 120ms ease-out; }
-.pill::after { content: "\\2197"; }
+.pill.external::after { content: "\\2197"; }
 .pill.primary { background: var(--ink-1); color: var(--surface-0); border: 1px solid var(--ink-1); }
 .pill.secondary { background: var(--surface-2); border: 1px solid var(--line-1); }
 .pill:active { opacity: 0.72; }
@@ -254,7 +269,7 @@ h1 { margin: 0; font-family: var(--display); font-size: clamp(42px, 5.5vw, 68px)
 .frame { padding: 12px; background: var(--surface-2); border: 1px solid var(--line-1); border-radius: 22px; box-shadow: 0 24px 64px -40px var(--shadow); }
 .frame picture { display: block; overflow: hidden; border: 1px solid var(--line-1); border-radius: 12px; }
 .frame img { display: block; width: 100%; height: auto; }
-.preview figcaption { margin-top: 16px; color: var(--ink-3); font-size: 12px; text-align: center; }
+.preview figcaption { margin-top: 16px; color: var(--ink-3); font-size: 12px; text-align: center; word-break: auto-phrase; }
 
 section.block { padding: 96px 0 0; }
 h2 { margin: 0; font-family: var(--display); font-size: clamp(28px, 3.2vw, 40px); font-weight: 500; line-height: 1.3; letter-spacing: -0.045em; text-wrap: balance; word-break: auto-phrase; }
@@ -301,6 +316,7 @@ pre .out { color: var(--accent); }
 .after { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 48px; margin-top: 40px; }
 .after > div { min-width: 0; padding-top: 24px; border-top: 1px solid var(--line-1); }
 .after p { margin: 12px 0 0; color: var(--ink-2); font-size: 15px; }
+.after .chips code { font-size: 12px; border-radius: 8px; }
 .after pre { margin-top: 16px; }
 .actions.start { justify-content: flex-start; }
 .after .actions { margin-top: 20px; }
@@ -346,24 +362,21 @@ export function landingHtml(options: LandingOptions): string {
   // The public site ships its font and the Console screenshots as files; the
   // API answering its own root stays a single self-contained response.
   const siteAssets = options.apiOrigin !== null;
-  // A command has to name an origin to be pasted. The API's own root does not
-  // know its public origin here, so the page fills in the one it was read from.
-  const commandOrigin = base || `<span data-origin>$HOST</span>`;
+  // Commands target the reader's own Host. On the public site that is $HOST;
+  // the API's own root fills in the origin it was read from.
+  const commandOrigin = siteAssets ? "$HOST" : `<span data-origin>$HOST</span>`;
   const text = (key: keyof typeof copy, tag = "span", attributes = "") =>
     `<${tag}${attributes} data-i18n="${key}">${copy[key]}</${tag}>`;
-  const secondary = options.consoleOrigin
-    ? `<a class="pill secondary" href="${options.consoleOrigin}" data-i18n="console">${copy.console}</a>`
-    : `<a class="pill secondary" href="${REPOSITORY}" data-i18n="source">${copy.source}</a>`;
   const screen = (shape: "desktop" | "mobile", theme: "light" | "dark") =>
     `/screens/console-${shape}-${theme}-{lang}.webp`;
   const localized = (template: string) => template.replace("{lang}", locale);
   const preview = siteAssets
     ? `<figure class="preview">
 <div class="frame"><picture>
-<source media="(max-width: 760px) and (prefers-color-scheme: dark)" srcset="${localized(screen("mobile", "dark"))}" data-locale-srcset="${screen("mobile", "dark")}" width="1200" height="1400">
-<source media="(max-width: 760px)" srcset="${localized(screen("mobile", "light"))}" data-locale-srcset="${screen("mobile", "light")}" width="1200" height="1400">
-<source media="(prefers-color-scheme: dark)" srcset="${localized(screen("desktop", "dark"))}" data-locale-srcset="${screen("desktop", "dark")}" width="2880" height="1800">
-<img src="${localized(screen("desktop", "light"))}" data-locale-src="${screen("desktop", "light")}" width="2880" height="1800" alt="${copy.previewAlt}" data-i18n-alt="previewAlt" fetchpriority="high">
+<source media="(max-width: 760px) and (prefers-color-scheme: dark)" srcset="${localized(screen("mobile", "dark"))}" data-locale-srcset="${screen("mobile", "dark")}" width="780" height="1560">
+<source media="(max-width: 760px)" srcset="${localized(screen("mobile", "light"))}" data-locale-srcset="${screen("mobile", "light")}" width="780" height="1560">
+<source media="(prefers-color-scheme: dark)" srcset="${localized(screen("desktop", "dark"))}" data-locale-srcset="${screen("desktop", "dark")}" width="2400" height="1500">
+<img src="${localized(screen("desktop", "light"))}" data-locale-src="${screen("desktop", "light")}" width="2400" height="1500" alt="${copy.previewAlt}" data-i18n-alt="previewAlt" fetchpriority="high">
 </picture></div>
 <figcaption data-i18n="preview">${copy.preview}</figcaption>
 </figure>`
@@ -378,8 +391,20 @@ export function landingHtml(options: LandingOptions): string {
     ([kind, name, step]) =>
       `<li><strong>${kind} <span>${name}</span></strong>${text(step, "p")}</li>`,
   ).join("\n");
-  const consoleAction = options.consoleOrigin
-    ? `<div class="actions start"><a class="pill secondary" href="${options.consoleOrigin}" data-i18n="console">${copy.console}</a></div>`
+  // The API's own root links its own console. The public site's console is
+  // takoserver.com's Host, so it is named as that, never as the reader's.
+  const consoleAction = !options.consoleOrigin
+    ? ""
+    : siteAssets
+      ? `<p class="more"><a href="${options.consoleOrigin}" data-i18n="consoleSite">${copy.consoleSite}</a></p>`
+      : `<div class="actions start"><a class="pill secondary external" href="${options.consoleOrigin}" data-i18n="consoleHost">${copy.consoleHost}</a></div>`;
+  const locales = `<link rel="alternate" hreflang="en" href="https://takoserver.com/en/">
+<link rel="alternate" hreflang="ja" href="https://takoserver.com/ja/">
+<link rel="alternate" hreflang="x-default" href="https://takoserver.com/">`;
+  // At the public root a Japanese browser goes to /ja/ before anything loads,
+  // so the page and its screenshot are fetched once, in the right language.
+  const rootLanguage = siteAssets
+    ? `<script>if(location.pathname==="/"&&(navigator.languages??[navigator.language]).map(l=>String(l).toLowerCase().split("-")[0]).find(l=>l==="ja"||l==="en")==="ja")location.replace("/ja/")</script>`
     : "";
 
   return `<!doctype html>
@@ -404,6 +429,8 @@ export function landingHtml(options: LandingOptions): string {
 <meta name="twitter:description" content="${copy.description}">
 <meta name="twitter:image" content="https://takoserver.com/og.png">
 <meta name="color-scheme" content="light dark">
+${siteAssets ? locales : ""}
+${rootLanguage}
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 34 34'%3E%3Crect width='34' height='34' fill='%23b0301f'/%3E%3C/svg%3E">
 ${siteAssets ? '<link rel="preload" href="/fonts/bricolage-grotesque-latin.woff2" as="font" type="font/woff2" crossorigin>' : ""}
 <style>${pageStyles}
@@ -422,7 +449,7 @@ ${siteAssets ? '@font-face { font-family: "Bricolage Grotesque"; font-style: nor
 <div class="hero-title">${takoMark(56)}<h1 id="headline">Takoserver</h1></div>
 ${text("lead", "p", ' class="lead"')}
 ${text("lede", "p", ' class="lede"')}
-<div class="actions"><a class="pill primary" href="${INSTALL_GUIDE}" data-i18n="install">${copy.install}</a>${secondary}</div>
+<div class="actions"><a class="pill primary external" href="${INSTALL_GUIDE}" data-i18n="install">${copy.install}</a><a class="pill secondary external" href="${REPOSITORY}" data-i18n="source">${copy.source}</a></div>
 ${preview}
 </section>
 
@@ -432,6 +459,27 @@ ${text("formsBody", "p", ' class="intro"')}
 <dl class="forms">
 ${formGroups}
 </dl>
+</section>
+
+
+<section class="block" id="start" aria-labelledby="start-title">
+${text("hostTitle", "h2", ' id="start-title"')}
+<div class="host">
+<ol class="steps">
+<li>${text("hostStep1", "p")}<pre>git clone ${REPOSITORY}
+cd takoserver
+git checkout --detach &lt;reviewed-commit&gt;
+bun install --frozen-lockfile</pre></li>
+<li>${text("hostStep2", "p")}<span class="chips"><code>TAKOSERVER_PUBLIC_ORIGIN</code><code>TAKOSERVER_TAKOFORM_V2_CONFIG</code><code>TAKOSERVER_TAKOFORM_V2_CURSOR_KEY</code></span></li>
+<li>${text("hostStep3", "p")}<pre>bun --no-env-file src/entry-bun.ts</pre></li>
+<li>${text("hostStep4", "p")}</li>
+</ol>
+<aside>
+${text("hostNote", "p", ' class="note"')}
+<div class="actions start"><a class="pill primary external" href="${INSTALL_GUIDE}" data-i18n="install">${copy.install}</a></div>
+<p class="more"><a href="${PREREQUISITES}" data-i18n="prerequisites">${copy.prerequisites}</a><a href="${DOCKER_GUIDE}" data-i18n="docker">${copy.docker}</a><a href="${SECURITY_GUIDE}" data-i18n="security">${copy.security}</a></p>
+</aside>
+</div>
 </section>
 
 <section class="block" id="deploy" aria-labelledby="deploy-title">
@@ -455,30 +503,11 @@ curl -sS "https://$NAME/"
 <p class="more"><a href="${DEPLOY_STEPS}" data-i18n="deployMore">${copy.deployMore}</a></p>
 </section>
 
-<section class="block" id="start" aria-labelledby="start-title">
-${text("hostTitle", "h2", ' id="start-title"')}
-<div class="host">
-<ol class="steps">
-<li>${text("hostStep1", "p")}<pre>git clone ${REPOSITORY}
-cd takoserver
-bun install --frozen-lockfile</pre></li>
-<li>${text("hostStep2", "p")}<span class="chips"><code>TAKOSERVER_PUBLIC_ORIGIN</code><code>TAKOSERVER_TAKOFORM_V2_CONFIG</code><code>TAKOSERVER_TAKOFORM_V2_CURSOR_KEY</code></span></li>
-<li>${text("hostStep3", "p")}<pre>bun src/entry-bun.ts</pre></li>
-<li>${text("hostStep4", "p")}</li>
-</ol>
-<aside>
-${text("hostNote", "p", ' class="note"')}
-<div class="actions start"><a class="pill primary" href="${INSTALL_GUIDE}" data-i18n="install">${copy.install}</a></div>
-<p class="more"><a href="${DOCKER_GUIDE}" data-i18n="docker">${copy.docker}</a><a href="${SECURITY_GUIDE}" data-i18n="security">${copy.security}</a></p>
-</aside>
-</div>
-</section>
-
 <section class="block" id="after" aria-labelledby="after-title">
 ${text("afterTitle", "h2", ' id="after-title"')}
 <div class="after">
-<div>${text("consoleTitle", "h3")}${text("consoleBody", "p")}${consoleAction}</div>
-<div>${text("apiTitle", "h3")}${text("apiBody", "p")}<pre>curl -sG ${commandOrigin}/apis/forms.takoform.com/v2/support \\
+<div>${text("consoleTitle", "h3")}${text("consoleBody", "p")}<span class="chips"><code>bun scripts/build-console.ts --api-origin &lt;API origin&gt;</code><code>TAKOSERVER_CONSOLE_ORIGIN</code></span>${consoleAction}</div>
+<div>${text("apiTitle", "h3")}${text("apiBody", "p")}<pre>curl -sG "${commandOrigin}/apis/forms.takoform.com/v2/support" \\
   --data-urlencode "form=&lt;Form URL&gt;" \\
   -H "authorization: Bearer $KEY"</pre>
 <p class="more"><a href="${V2_REFERENCE}" data-i18n="reference">${copy.reference}</a></p></div>
