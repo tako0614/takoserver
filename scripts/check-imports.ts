@@ -599,6 +599,13 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain", "release-data"],
   },
   {
+    // Source-event codecs and retained receiver CAS use domain ports only.
+    // A private runtime binding belongs to a separately reviewed composition.
+    name: "domain",
+    match: /^src\/shared-financial-source(?:-(?:abi|contract))?\.ts$/u,
+    may: ["core", "domain"],
+  },
+  {
     // Shared app name policy belongs to the existing origin reservation domain.
     // Its pure helpers do not gain adapter or composition import authority.
     name: "domain",
