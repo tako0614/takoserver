@@ -527,3 +527,76 @@ export async function inspectV2WorkerNativeIdentityDomain(
     return null;
   }
 }
+
+/** Internal source recipe only. It neither registers a migration nor executes SQL. */
+export function createV2WorkerNativeIdentityMigrationRecipe() {
+  const holding = MARKERS[0];
+  // A distinct owner-local TEMP assertion does not invalidate the unchanged seal.
+  const assertion = "_tf_v2_native_identity_candidate_assert";
+  const columns = COLUMNS.map(([, name]) => name);
+  const names = columns.join(", ");
+  // SQLite identifiers use ASCII case-insensitive equality, unlike the unchanged
+  // legacy inspector's catalog-text comparison. A DROP could otherwise cascade
+  // into an unrelated child whose REFERENCES spelling differs only by case.
+  const noIncomingReferences = `NOT EXISTS (SELECT 1 FROM main.sqlite_schema source
+  JOIN pragma_foreign_key_list(source.name, 'main') incoming
+  WHERE source.type = 'table' AND incoming."table" COLLATE NOCASE = ${literal(TABLE)})`;
+  // A duplicate PRIMARY KEY still fails when ignore_check_constraints is ON.
+  // Unknown/NULL predicates must fail too, rather than selecting no assertion.
+  const check = (condition: string) =>
+    `INSERT OR ROLLBACK INTO temp.${assertion}(ok)
+SELECT 1 WHERE (${condition}) IS NOT 1;`;
+  const equal = (left: string, right: string, leftRowid: string, rightRowid: string) => {
+    const values = columns
+      .map((name) => `typeof(l.${name}) = typeof(r.${name}) AND l.${name} IS r.${name}`)
+      .join(" AND ");
+    return `(SELECT count(*) FROM ${left}) = (SELECT count(*) FROM ${right})
+AND NOT EXISTS (SELECT 1 FROM ${left} l LEFT JOIN ${right} r
+  ON r.${rightRowid} = l.${leftRowid}
+  WHERE r.${rightRowid} IS NULL OR NOT (${values}))
+AND NOT EXISTS (SELECT 1 FROM ${right} r LEFT JOIN ${left} l
+  ON l.${leftRowid} = r.${rightRowid}
+  WHERE l.${leftRowid} IS NULL OR NOT (${values}))`;
+  };
+  const step = (name: string, statements: readonly string[]) =>
+    Object.freeze({ name, statements: Object.freeze([...statements]) });
+  return Object.freeze({
+    transaction: "owning-single-transaction-with-rollback-on-every-error",
+    steps: Object.freeze([
+      step("precondition", [
+        `CREATE TEMP TABLE ${assertion}(ok INTEGER PRIMARY KEY);`,
+        `INSERT INTO temp.${assertion}(ok) VALUES (1);`,
+        check(`${LEGACY_READY}
+AND ${noIncomingReferences}
+AND NOT EXISTS (SELECT 1 FROM main.sqlite_schema WHERE name = ${literal(assertion)})
+AND NOT EXISTS (SELECT 1 FROM pragma_foreign_key_check(${literal(TABLE)}, 'main'))`),
+      ]),
+      step("capture", [
+        `CREATE TABLE main.${holding}(original_rowid INTEGER PRIMARY KEY, ${names});`,
+        `INSERT INTO main.${holding}(original_rowid, ${names})
+SELECT rowid, ${names} FROM main.${TABLE};`,
+        check(equal(`main.${TABLE}`, `main.${holding}`, "rowid", "original_rowid")),
+      ]),
+      step("remove", [
+        ...GUARDS.map(([name]) => `DROP TRIGGER main.${name};`),
+        `DROP TABLE main.${TABLE};`,
+      ]),
+      step("copy", [
+        `${OPAQUE_TABLE};`,
+        `INSERT INTO main.${TABLE}(rowid, ${names})
+SELECT original_rowid, ${names} FROM main.${holding};`,
+      ]),
+      step("preservation", [
+        check(equal(`main.${TABLE}`, `main.${holding}`, "rowid", "original_rowid")),
+      ]),
+      step("restore", [`${INDEX};`, ...GUARDS.map(([, sql]) => `${sql};`)]),
+      step("postcondition", [
+        `DROP TABLE main.${holding};`,
+        check(`${OPAQUE_READY}
+AND ${noIncomingReferences}
+AND NOT EXISTS (SELECT 1 FROM pragma_foreign_key_check(${literal(TABLE)}, 'main'))`),
+        `DROP TABLE temp.${assertion};`,
+      ]),
+    ]),
+  });
+}

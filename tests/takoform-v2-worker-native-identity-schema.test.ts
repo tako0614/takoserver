@@ -1,5 +1,10 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { buildUnregisteredV2WorkerNativeIdentityMigrationCandidate } from "../scripts/deploy/v2-worker-native-identity-migration-candidate.ts";
+import { executeSqliteMigrationStatements, migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { Row, Sql } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import {
@@ -768,3 +773,652 @@ test("native identity domain: MAIN incoming FK cannot be hidden by a TEMP referr
     f.close();
   }
 });
+
+// Legacy component fixtures use the real allowed 0001–0088 schema and owning
+// statement executor. Binding actual100 filename/blob metadata cannot make
+// those fixtures actual100→102 qualification. The separate current fixture
+// below uses normal owning migration machinery, not manually read protected SQL.
+// All raw rows remain synthetic: never actual final0101, native permission,
+// canonical0102 registration/application, or staging qualification.
+function candidateFixture(file = ":memory:"): Database {
+  const db = new Database(file);
+  try {
+    db.exec("PRAGMA foreign_keys = ON; PRAGMA ignore_check_constraints = OFF;");
+    const directory = join(import.meta.dir, "../migrations");
+    const names = readdirSync(directory)
+      .filter((name) => /^\d{4}_.+\.sql$/u.test(name) && Number(name.slice(0, 4)) <= 88)
+      .sort();
+    expect(names).toHaveLength(88);
+    for (const name of names)
+      executeSqliteMigrationStatements(db, readFileSync(join(directory, name), "utf8"));
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+}
+
+function candidateCurrentFixture(): Database {
+  const db = new Database(":memory:");
+  try {
+    db.exec("PRAGMA foreign_keys = ON; PRAGMA ignore_check_constraints = OFF;");
+    // Normal own machinery consumes its registered source automatically. No
+    // protected SQL is copied/read manually, and no101/102 ledger row is added.
+    const report = migrateSqlite(db, { stripeMode: "test" });
+    expect(report.applied).toHaveLength(100);
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+}
+
+function applyCandidate(
+  db: Database,
+  statements = buildUnregisteredV2WorkerNativeIdentityMigrationCandidate().statements,
+): void {
+  try {
+    executeSqliteMigrationStatements(db, "BEGIN IMMEDIATE;");
+    executeSqliteMigrationStatements(db, statements.join("\n"));
+    executeSqliteMigrationStatements(db, "COMMIT;");
+  } catch (error) {
+    // INSERT OR ROLLBACK may already have ended the transaction. Cleanup must
+    // never replace the original owning execution error or continue the unit.
+    try {
+      executeSqliteMigrationStatements(db, "ROLLBACK;");
+    } catch {
+      // The original error is rethrown below, including after an ended rollback.
+    }
+    throw error;
+  }
+}
+
+function candidateState(db: Database) {
+  const tables = db
+    .query<{ name: string }, []>(
+      "SELECT name FROM main.sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    )
+    .all();
+  const data = tables.map(({ name }) => {
+    const identifier = `"${name.replaceAll('"', '""')}"`;
+    const columns = db.query<{ name: string }, []>(`PRAGMA main.table_info(${identifier})`).all();
+    const values = columns
+      .map(({ name: column }) => {
+        const quoted = `"${column.replaceAll('"', '""')}"`;
+        return `typeof(${quoted}), quote(${quoted})`;
+      })
+      .join(", ");
+    return {
+      name,
+      rows: db.query(`SELECT ${values} FROM main.${identifier}`).values(),
+    };
+  });
+  return {
+    schema: db
+      .query<{ type: string; name: string; tbl_name: string; sql: string | null }, []>(
+        "SELECT type, name, tbl_name, sql FROM main.sqlite_schema ORDER BY type, name",
+      )
+      .all(),
+    temporary: db
+      .query<{ type: string; name: string; tbl_name: string; sql: string | null }, []>(
+        "SELECT type, name, tbl_name, sql FROM sqlite_temp_schema ORDER BY type, name",
+      )
+      .all(),
+    rows: db
+      .query(`SELECT CAST(rowid AS TEXT), * FROM main.${TABLE} ORDER BY rowid`)
+      .values()
+      .map((row) =>
+        row.map((value) =>
+          value instanceof Uint8Array
+            ? { blob: Buffer.from(value).toString("hex") }
+            : typeof value === "bigint"
+              ? { bigint: value.toString() }
+              : value,
+        ),
+      ),
+    data,
+    foreignKeys: db.query("PRAGMA main.foreign_key_check").all(),
+    foreignKeysEnabled: db.query("PRAGMA foreign_keys").all(),
+    ignoredChecks: db.query("PRAGMA ignore_check_constraints").all(),
+    inTransaction: db.inTransaction,
+  };
+}
+
+const CANDIDATE_DIGEST = `sha256:${"a".repeat(64)}`;
+const CANDIDATE_IDENTITY = `v2w-${"b".repeat(48)}`;
+const CANDIDATE_STAGE = `INSERT INTO ${TABLE}(
+  rowid, delete_operation_id, source_operation_id, resource_uid, principal,
+  space, backend_id, target_key, delete_generation, source_generation,
+  native_identity, closure_digest, upload_receipt, stage_lease_token, staged_at_ms
+) VALUES (?, ?, ?, ?, 'synthetic-org', 'integration', 'candidate-backend',
+  'integration-candidate', 2, 1, ?, ?, ?, ?, ?)`;
+
+function candidateResource(db: Database, id: string, form = "WorkerVersion/0.5.0") {
+  db.query(`INSERT INTO tf_v2_resources(
+    uid, principal, form_url, space, name, backend_id, target_key, active_name,
+    generation, phase, spec_json, last_operation, busy_operation
+  ) VALUES (?, 'synthetic-org', ?, 'integration', ?, 'candidate-backend',
+    'integration-candidate', ?, 1, 'pending', '{}', ?, ?)`).run(
+    id,
+    `https://edge.forms.takoform.com/forms/${form}/`,
+    id,
+    id,
+    `source-${id}`,
+    `source-${id}`,
+  );
+}
+
+function candidateOperation(
+  db: Database,
+  id: string,
+  resource: string,
+  action: string,
+  generation: number,
+  token: string,
+) {
+  db.query(`INSERT INTO tf_v2_operations(
+    id, resource_uid, principal, replay_key, request_fingerprint, action, generation,
+    status, effect, created_at, updated_at, retain_until, backend_id, target_key,
+    backend_key, accepted_spec_json, dispatch_possible, lease_token, lease_until_ms
+  ) VALUES (?, ?, 'synthetic-org', ?, 'candidate-fingerprint', ?, ?, 'reconciling',
+    'unknown', '2026-10-15T00:00:00Z', '2026-10-15T00:00:00Z',
+    '2026-10-16T00:00:00Z', 'candidate-backend', 'integration-candidate', ?, '{}', 1, ?, ?)`).run(
+    id,
+    resource,
+    `replay-${id}`,
+    action,
+    generation,
+    `backend-${id}`,
+    token,
+    Date.now() + 3_600_000,
+  );
+}
+
+function candidateDeletion(
+  db: Database,
+  id: string,
+  identity = CANDIDATE_IDENTITY,
+  receipt: string | null = `upload-${id}`,
+) {
+  candidateResource(db, id);
+  const source = `source-${id}`;
+  const deletion = `delete-${id}`;
+  const token = `delete-token-${id}`;
+  const sourceToken = `source-token-${id}`;
+  candidateOperation(db, source, id, "create", 1, sourceToken);
+  db.query(`INSERT INTO tf_v2_worker_native_effects(
+    operation_id, resource_uid, principal, space, backend_key, backend_id, target_key,
+    generation, native_identity, closure_digest, grant_lease_token, granted_at_ms
+  ) VALUES (?, ?, 'synthetic-org', 'integration', ?, 'candidate-backend',
+    'integration-candidate', 1, ?, ?, ?, 0)`).run(
+    source,
+    id,
+    `backend-${source}`,
+    identity,
+    CANDIDATE_DIGEST,
+    sourceToken,
+  );
+  if (receipt !== null)
+    db.query(
+      "UPDATE tf_v2_worker_native_effects SET confirmed_receipt = ? WHERE operation_id = ?",
+    ).run(receipt, source);
+  db.query(
+    "UPDATE tf_v2_operations SET status = 'succeeded', effect = 'complete' WHERE id = ?",
+  ).run(source);
+  db.query(
+    "UPDATE tf_v2_resources SET generation = 2, phase = 'deleting', last_operation = ?, busy_operation = ? WHERE uid = ?",
+  ).run(deletion, deletion, id);
+  candidateOperation(db, deletion, id, "delete", 2, token);
+  return { id, source, deletion, token, identity, receipt };
+}
+
+function candidateStage(
+  db: Database,
+  item: ReturnType<typeof candidateDeletion>,
+  rowid: bigint,
+  stagedAt = 0,
+) {
+  db.query(CANDIDATE_STAGE).run(
+    rowid,
+    item.deletion,
+    item.source,
+    item.id,
+    item.identity,
+    CANDIDATE_DIGEST,
+    item.receipt,
+    item.token,
+    stagedAt,
+  );
+}
+
+function candidateGrant(db: Database, item: ReturnType<typeof candidateDeletion>) {
+  db.query(`UPDATE ${TABLE} SET grant_lease_token = ?, granted_at_ms = 1,
+    predelete_source_receipt = ? WHERE delete_operation_id = ?`).run(
+    item.token,
+    item.receipt,
+    item.deletion,
+  );
+}
+
+function candidateHistory(db: Database) {
+  const staged = candidateDeletion(db, "candidate-staged");
+  candidateStage(db, staged, -7n, 0.5);
+  const qualified = candidateDeletion(db, "candidate-qualified", CANDIDATE_IDENTITY, null);
+  candidateStage(db, qualified, 0n);
+  db.query(`UPDATE ${TABLE} SET qualified_source_receipt = 'qualified-receipt',
+    qualification_lease_token = ? WHERE delete_operation_id = ?`).run(
+    qualified.token,
+    qualified.deletion,
+  );
+  const granted = candidateDeletion(db, "candidate-granted");
+  candidateStage(db, granted, 42n);
+  candidateGrant(db, granted);
+  const acknowledged = candidateDeletion(db, "candidate-acknowledged");
+  candidateStage(db, acknowledged, 9007199254740993n);
+  candidateGrant(db, acknowledged);
+  db.query(`UPDATE ${TABLE} SET acknowledged_receipt = X'0010ff',
+    confirmed_absence_receipt = X'01aa' WHERE delete_operation_id = ?`).run(acknowledged.deletion);
+  const absent = candidateDeletion(db, "candidate-absent");
+  candidateStage(db, absent, 77n);
+  db.query(`UPDATE ${TABLE} SET confirmed_absence_receipt = 'owned-native-absence',
+    absence_lease_token = ? WHERE delete_operation_id = ?`).run(absent.token, absent.deletion);
+  const pending = candidateDeletion(db, "candidate-pending");
+  candidateStage(db, pending, 78n);
+  candidateResource(db, "candidate-caller", "ModuleWorker/0.3.0");
+  candidateResource(db, "candidate-deployment", "WorkerDeployment/0.4.0");
+  db.query(`INSERT INTO tf_v2_worker_invocations(
+    invocation_id, custody_token, backend_id, target_key, principal, space, worker_uid,
+    deployment_uid, deployment_generation, source_operation_id, ingress_kind,
+    service_caller_worker_uid, service_caller_version_uid, service_caller_version_generation,
+    service_caller_version_operation_id, service_binding_name, service_caller_execution_ref,
+    version_uid, version_generation, version_operation_id, native_identity, closure_digest,
+    confirmed_receipt, admitted_at_ms, phase, send_authorized_at_ms
+  ) VALUES ('candidate-pending-sql', 'candidate-custody-token', 'candidate-backend',
+    'integration-candidate', 'synthetic-org', 'integration', 'candidate-caller',
+    'candidate-deployment', 1, ?, 'service', 'candidate-caller', ?, 1, ?, 'SQL',
+    'synthetic-held-context', ?, 1, ?, ?, ?, 'synthetic-native-receipt', 0, 'send_authorized', 1)`).run(
+    pending.source,
+    pending.id,
+    pending.source,
+    pending.id,
+    pending.source,
+    CANDIDATE_IDENTITY,
+    CANDIDATE_DIGEST,
+  );
+  db.query(
+    "UPDATE tf_v2_worker_invocations SET sqlite_drain_state = 'pending' WHERE invocation_id = 'candidate-pending-sql'",
+  ).run();
+  db.query("UPDATE tf_v2_operations SET lease_until_ms = 0 WHERE id = ?").run(staged.deletion);
+  db.exec(
+    "CREATE TABLE component_unrelated(value); INSERT INTO component_unrelated VALUES (NULL), (42), (1.5), ('text'), (X'00ff');",
+  );
+  return { staged, qualified, granted, acknowledged, absent, pending };
+}
+
+function assertCandidateCustody(db: Database, history: ReturnType<typeof candidateHistory>) {
+  expect(() =>
+    db
+      .query(`UPDATE ${TABLE} SET native_identity = 'forged' WHERE delete_operation_id = ?`)
+      .run(history.granted.deletion),
+  ).toThrow("immutable");
+  expect(() =>
+    db.query(`DELETE FROM ${TABLE} WHERE delete_operation_id = ?`).run(history.staged.deletion),
+  ).toThrow("immutable");
+  expect(() => candidateGrant(db, history.staged)).toThrow("unqualified");
+  expect(() => candidateGrant(db, history.pending)).toThrow("sqlite_drain_pending");
+  expect(() =>
+    db
+      .query(`UPDATE ${TABLE} SET confirmed_absence_receipt = 'unproved',
+    absence_lease_token = ? WHERE delete_operation_id = ?`)
+      .run(history.pending.token, history.pending.deletion),
+  ).toThrow("sqlite_drain_pending");
+}
+
+test("native identity candidate: only the CHECK changes while historical storage and custody survive", async () => {
+  const db = candidateFixture();
+  try {
+    const candidate = buildUnregisteredV2WorkerNativeIdentityMigrationCandidate();
+    expect(candidate.kind).toBe("unregistered-v2-worker-native-identity-candidate");
+    expect(Object.isFrozen(candidate)).toBe(true);
+    expect(
+      candidate.statements.some((statement) => /^\s*(?:BEGIN|COMMIT)\b/iu.test(statement)),
+    ).toBe(false);
+    const history = candidateHistory(db);
+    assertCandidateCustody(db, history);
+    expect(
+      db
+        .query<{ type: string }, []>(`SELECT typeof(native_identity) AS type FROM ${TABLE}
+      UNION SELECT typeof(staged_at_ms) FROM ${TABLE}
+      UNION SELECT typeof(granted_at_ms) FROM ${TABLE}
+      UNION SELECT typeof(acknowledged_receipt) FROM ${TABLE} ORDER BY type`)
+        .all(),
+    ).toEqual([
+      { type: "blob" },
+      { type: "integer" },
+      { type: "null" },
+      { type: "real" },
+      { type: "text" },
+    ]);
+    const scoped = candidateDeletion(db, "candidate-scoped", `integration-${"c".repeat(51)}`);
+    const legacyWriter = db.query(CANDIDATE_STAGE);
+    expect(() => candidateStage(db, scoped, 90n)).toThrow("CHECK");
+    const before = candidateState(db);
+    applyCandidate(db);
+    const after = candidateState(db);
+    expect(after.rows).toEqual(before.rows);
+    expect(after.data).toEqual(before.data);
+    expect(after.temporary).toEqual(before.temporary);
+    expect(after.foreignKeys).toEqual([]);
+    expect(after.inTransaction).toBe(false);
+    expect(after.schema.filter((row) => row.name !== TABLE)).toEqual(
+      before.schema.filter((row) => row.name !== TABLE),
+    );
+    const changed = db
+      .query<{ sql: string }, [string]>("SELECT sql FROM main.sqlite_schema WHERE name = ?")
+      .get(TABLE);
+    expect(changed?.sql).toBe(FIXTURE_OPAQUE_TABLE);
+    expect(await inspectV2WorkerNativeIdentityDomain(createSqliteSql(db))).toBe("opaque255");
+    assertCandidateCustody(db, history);
+    const legacy = candidateDeletion(db, "candidate-legacy-writer");
+    legacyWriter.run(
+      91n,
+      legacy.deletion,
+      legacy.source,
+      legacy.id,
+      legacy.identity,
+      CANDIDATE_DIGEST,
+      legacy.receipt,
+      legacy.token,
+      0,
+    );
+    candidateStage(db, scoped, 90n);
+    for (const [i, identity] of ["x", "x".repeat(255), "統合-prefix"].entries())
+      candidateStage(db, candidateDeletion(db, `candidate-bound-${i}`, identity), BigInt(100 + i));
+    expect(() => candidateDeletion(db, "candidate-empty", "")).toThrow("CHECK");
+    expect(() => candidateDeletion(db, "candidate-oversized", "x".repeat(256))).toThrow("CHECK");
+  } finally {
+    db.close();
+  }
+});
+
+test("native identity candidate: normal registered100 component retains every table and original ledger", async () => {
+  const db = candidateCurrentFixture();
+  try {
+    const history = candidateHistory(db);
+    const ledger = db.query("SELECT * FROM applied_migrations ORDER BY name").all();
+    expect(ledger).toHaveLength(100);
+    const before = candidateState(db);
+    expect(await inspectV2WorkerNativeIdentityDomain(createSqliteSql(db))).toBe("legacy_v2w52");
+    applyCandidate(db);
+    const after = candidateState(db);
+    expect(after.rows).toEqual(before.rows);
+    expect(after.data).toEqual(before.data);
+    expect(after.schema.filter((row) => row.name !== TABLE)).toEqual(
+      before.schema.filter((row) => row.name !== TABLE),
+    );
+    expect(after.temporary).toEqual(before.temporary);
+    expect(after.foreignKeys).toEqual([]);
+    expect(after.inTransaction).toBe(false);
+    expect(db.query("SELECT * FROM applied_migrations ORDER BY name").all()).toEqual(ledger);
+    expect(await inspectV2WorkerNativeIdentityDomain(createSqliteSql(db))).toBe("opaque255");
+    assertCandidateCustody(db, history);
+    // This remains local actual100 + unregistered recipe; never final101,
+    // registered/applied102, original native import custody or staging proof.
+  } finally {
+    db.close();
+  }
+});
+
+for (const mutation of [
+  "missing",
+  "weakened",
+  "extra",
+  "holding",
+  "temp-holding",
+  "assertion",
+  "temp-shadow",
+  "incoming",
+  "checks-off",
+  "foreign-keys-off",
+] as const)
+  test(`native identity candidate: ${mutation} predecessor refuses without losing state`, () => {
+    const db = candidateFixture();
+    try {
+      candidateHistory(db);
+      if (mutation === "missing" || mutation === "weakened") {
+        db.exec("DROP TRIGGER tf_v2_worker_native_deletion_send_guard;");
+        if (mutation === "weakened")
+          db.exec(
+            `CREATE TRIGGER tf_v2_worker_native_deletion_send_guard BEFORE UPDATE ON ${TABLE} BEGIN SELECT 1; END;`,
+          );
+      }
+      if (mutation === "extra")
+        db.exec(
+          `CREATE TRIGGER component_new_guard BEFORE INSERT ON ${TABLE} BEGIN SELECT 1; END;`,
+        );
+      if (mutation === "holding")
+        db.exec("CREATE TABLE _tf_v2_m0102_native_deletions_holding(value);");
+      if (mutation === "temp-holding")
+        db.exec("CREATE TEMP TABLE _tf_v2_m0102_native_deletions_holding(value);");
+      if (mutation === "assertion")
+        db.exec("CREATE TEMP TABLE _tf_v2_native_identity_candidate_assert(value);");
+      if (mutation === "temp-shadow") db.exec(`CREATE TEMP TABLE ${TABLE}(value);`);
+      if (mutation === "incoming")
+        db.exec(
+          `CREATE TABLE component_incoming(deletion, source, FOREIGN KEY(deletion, source) REFERENCES ${TABLE}(delete_operation_id, source_operation_id));`,
+        );
+      if (mutation === "checks-off") db.exec("PRAGMA ignore_check_constraints = ON;");
+      if (mutation === "foreign-keys-off") db.exec("PRAGMA foreign_keys = OFF;");
+      const before = candidateState(db);
+      expect(() => applyCandidate(db)).toThrow();
+      const after = candidateState(db);
+      expect(after).toEqual(before);
+      expect(after.inTransaction).toBe(false);
+    } finally {
+      db.close();
+    }
+  });
+
+for (const fault of ["after-drop", "missing-row", "storageclass"] as const)
+  test(`native identity candidate: ${fault} failure rolls back the entire owning unit`, () => {
+    const db = candidateFixture();
+    try {
+      candidateHistory(db);
+      const before = candidateState(db);
+      const candidate = buildUnregisteredV2WorkerNativeIdentityMigrationCandidate();
+      const faulted = candidate.steps.flatMap((step) => [
+        ...step.statements,
+        ...(fault === "after-drop" && step.name === "remove"
+          ? ["SELECT absent_native_identity_candidate_function();"]
+          : fault !== "after-drop" && step.name === "copy"
+            ? [
+                fault === "missing-row"
+                  ? `DELETE FROM main.${TABLE} WHERE rowid = -7;`
+                  : `UPDATE main.${TABLE} SET stage_lease_token = CAST(stage_lease_token AS BLOB) WHERE rowid = -7;`,
+              ]
+            : []),
+      ]);
+      let failure: unknown;
+      try {
+        applyCandidate(db, faulted);
+      } catch (error) {
+        failure = error;
+      }
+      // Read every surface before classifying/asserting the native error.
+      const after = candidateState(db);
+      expect(after).toEqual(before);
+      expect(after.inTransaction).toBe(false);
+      expect(failure).toBeInstanceOf(Error);
+      if (!failure || typeof failure !== "object" || !("code" in failure))
+        throw new Error("missing original owning SQLite failure");
+      expect(failure.code).toBe(
+        fault === "after-drop" ? "SQLITE_ERROR" : "SQLITE_CONSTRAINT_PRIMARYKEY",
+      );
+    } finally {
+      db.close();
+    }
+  });
+
+test("native identity candidate: WAL readers see a whole predecessor or whole replacement", () => {
+  const directory = mkdtempSync(join(tmpdir(), "native-identity-candidate-"));
+  const file = join(directory, "reader.sqlite");
+  const writer = candidateFixture(file);
+  const reader = new Database(file, { readonly: true });
+  const observer = new Database(file);
+  try {
+    for (const connection of [reader, observer]) {
+      connection.exec("PRAGMA foreign_keys = ON; PRAGMA ignore_check_constraints = OFF;");
+      expect(connection.query("PRAGMA foreign_keys").all()).toEqual([{ foreign_keys: 1 }]);
+      expect(connection.query("PRAGMA ignore_check_constraints").all()).toEqual([
+        { ignore_check_constraints: 0 },
+      ]);
+    }
+    candidateHistory(writer);
+    writer.exec("PRAGMA journal_mode = WAL;");
+    observer.exec("PRAGMA busy_timeout = 0;");
+    const before = candidateState(writer);
+    reader.exec("BEGIN;");
+    expect(candidateState(reader).rows).toEqual(before.rows);
+    const steps = buildUnregisteredV2WorkerNativeIdentityMigrationCandidate().steps;
+    const boundary = steps.findIndex((step) => step.name === "remove") + 1;
+    expect(boundary).toBeGreaterThan(0);
+    executeSqliteMigrationStatements(writer, "BEGIN IMMEDIATE;");
+    try {
+      executeSqliteMigrationStatements(
+        writer,
+        steps
+          .slice(0, boundary)
+          .flatMap((step) => step.statements)
+          .join("\n"),
+      );
+      expect(candidateState(reader).rows).toEqual(before.rows);
+      expect(candidateState(observer).rows).toEqual(before.rows);
+      expect(candidateState(observer).schema).toEqual(before.schema);
+      let busy: unknown;
+      try {
+        observer.exec("BEGIN IMMEDIATE;");
+      } catch (error) {
+        busy = error;
+      }
+      if (!busy || typeof busy !== "object" || !("code" in busy))
+        throw new Error("missing concurrent writer refusal");
+      expect(busy.code).toBe("SQLITE_BUSY");
+      executeSqliteMigrationStatements(
+        writer,
+        steps
+          .slice(boundary)
+          .flatMap((step) => step.statements)
+          .join("\n"),
+      );
+      executeSqliteMigrationStatements(writer, "COMMIT;");
+    } catch (error) {
+      try {
+        executeSqliteMigrationStatements(writer, "ROLLBACK;");
+      } catch {
+        // Preserve the original execution/assertion failure.
+      }
+      throw error;
+    }
+    expect(candidateState(reader).rows).toEqual(before.rows);
+    reader.exec("COMMIT;");
+    expect(candidateState(observer).rows).toEqual(before.rows);
+    expect(
+      observer.query(`SELECT 1 WHERE ${v2WorkerNativeIdentityDomainReady("opaque255")}`).all(),
+    ).toHaveLength(1);
+    expect(candidateState(observer).temporary).toEqual([]);
+  } finally {
+    reader.close();
+    observer.close();
+    writer.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+for (const parentSpelling of ["TF_V2_WORKER_NATIVE_DELETIONS", "Tf_V2_Worker_Native_Deletions"])
+  for (const temporaryShadow of [false, true])
+    test(`native identity candidate: populated ${parentSpelling} CASCADE child${temporaryShadow ? " with TEMP shadow" : ""} refuses before capture`, () => {
+      const db = candidateFixture();
+      try {
+        const history = candidateHistory(db);
+        const child = "component_casefold_incoming";
+        db.exec(`CREATE TABLE main.${child}(
+          deletion TEXT NOT NULL, source TEXT NOT NULL, payload BLOB NOT NULL,
+          FOREIGN KEY(deletion, source) REFERENCES "${parentSpelling}"
+            (delete_operation_id, source_operation_id) ON DELETE CASCADE
+        );`);
+        db.query(
+          `INSERT INTO main.${child}(deletion, source, payload) VALUES (?, ?, X'00ff10')`,
+        ).run(history.acknowledged.deletion, history.acknowledged.source);
+        if (temporaryShadow)
+          db.exec(`CREATE TEMP TABLE ${child}(payload TEXT);
+            INSERT INTO temp.${child}(payload) VALUES ('retained-temp-shadow');`);
+        expect(
+          db
+            .query<{ table: string; on_delete: string }, []>(
+              `SELECT "table", on_delete FROM pragma_foreign_key_list('${child}', 'main') ORDER BY id, seq`,
+            )
+            .all(),
+        ).toEqual([
+          { table: parentSpelling, on_delete: "CASCADE" },
+          { table: parentSpelling, on_delete: "CASCADE" },
+        ]);
+        const readChild = () =>
+          db
+            .query(
+              `SELECT deletion, source, typeof(payload), hex(payload) FROM main.${child} ORDER BY deletion, source`,
+            )
+            .all();
+        const readTemporary = () =>
+          temporaryShadow ? db.query(`SELECT * FROM temp.${child}`).all() : [];
+        const before = candidateState(db);
+        const childBefore = readChild();
+        const temporaryBefore = readTemporary();
+        expect(childBefore).toHaveLength(1);
+        const executed: string[] = [];
+        const observed: Parameters<typeof executeSqliteMigrationStatements>[0] = {
+          exec(statement) {
+            executed.push(statement);
+            return db.exec(statement);
+          },
+          query: db.query.bind(db),
+        };
+        let failure: unknown;
+        try {
+          executeSqliteMigrationStatements(observed, "BEGIN IMMEDIATE;");
+          executeSqliteMigrationStatements(
+            observed,
+            buildUnregisteredV2WorkerNativeIdentityMigrationCandidate().statements.join("\n"),
+          );
+          executeSqliteMigrationStatements(observed, "COMMIT;");
+        } catch (error) {
+          failure = error;
+          try {
+            executeSqliteMigrationStatements(observed, "ROLLBACK;");
+          } catch {
+            // The assertion already rolls back; keep the original failure.
+          }
+        }
+        const after = candidateState(db);
+        const childAfter = readChild();
+        const temporaryAfter = readTemporary();
+        expect(after).toEqual(before);
+        expect(childAfter).toEqual(childBefore);
+        expect(temporaryAfter).toEqual(temporaryBefore);
+        expect(after.inTransaction).toBe(false);
+        expect(
+          executed.some((statement) =>
+            /^\s*CREATE TABLE main\._tf_v2_m0102_native_deletions_holding\b/iu.test(statement),
+          ),
+        ).toBe(false);
+        expect(
+          executed.some((statement) =>
+            /^\s*DROP TABLE main\.tf_v2_worker_native_deletions\b/iu.test(statement),
+          ),
+        ).toBe(false);
+        if (!failure || typeof failure !== "object" || !("code" in failure))
+          throw new Error("missing pre-effect incoming CASCADE refusal");
+        expect(failure.code).toBe("SQLITE_CONSTRAINT_PRIMARYKEY");
+      } finally {
+        db.close();
+      }
+    });
