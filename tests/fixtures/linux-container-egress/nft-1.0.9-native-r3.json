@@ -1,0 +1,3150 @@
+{
+  "tier": "actual-native-serialization-fixture; index bindings in unit tests are synthetic, not held-session/native qualification",
+  "input": {
+    "namespace": {
+      "parent": "net:[4026531840]",
+      "selected": "net:[4026532202]"
+    },
+    "table": "takos_cx_guest_current_r1",
+    "killSwitch": false,
+    "hostHttp": [
+      {
+        "tenantRef": "a",
+        "generation": 1,
+        "networkId": "1111111111111111111111111111111111111111111111111111111111111111",
+        "bridge": "integration-a",
+        "ifindex": 2,
+        "hostMac": "02:70:00:00:00:01",
+        "hostAddresses": ["10.247.41.1", "fdc7:41::1"],
+        "tcpPorts": [8080],
+        "conntrackMark": 4101
+      },
+      {
+        "tenantRef": "b",
+        "generation": 1,
+        "networkId": "2222222222222222222222222222222222222222222222222222222222222222",
+        "bridge": "integration-b",
+        "ifindex": 3,
+        "hostMac": "02:70:00:00:00:02",
+        "hostAddresses": ["10.247.42.1", "fdc7:42::1"],
+        "tcpPorts": [8080],
+        "conntrackMark": 4102
+      }
+    ],
+    "tenants": [
+      {
+        "authority": {
+          "tenantRef": "a",
+          "generation": 1,
+          "policyDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "outboundInternet": true
+        },
+        "interfaces": ["integration-a"],
+        "maxConnections": 64,
+        "packetLimitBytes": 2097152
+      },
+      {
+        "authority": {
+          "tenantRef": "b",
+          "generation": 1,
+          "policyDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "outboundInternet": true
+        },
+        "interfaces": ["integration-b"],
+        "maxConnections": 64,
+        "packetLimitBytes": 2097152
+      }
+    ]
+  },
+  "inet": {
+    "nftables": [
+      {
+        "metainfo": {
+          "version": "1.0.9",
+          "release_name": "Old Doc Yak #3",
+          "json_schema_version": 1
+        }
+      },
+      {
+        "table": {
+          "family": "inet",
+          "name": "takos_cx_guest_current_r1",
+          "handle": 5
+        }
+      },
+      {
+        "counter": {
+          "family": "inet",
+          "name": "killed",
+          "table": "takos_cx_guest_current_r1",
+          "handle": 6,
+          "packets": 0,
+          "bytes": 0
+        }
+      },
+      {
+        "counter": {
+          "family": "inet",
+          "name": "host_denied",
+          "table": "takos_cx_guest_current_r1",
+          "handle": 7,
+          "packets": 0,
+          "bytes": 0
+        }
+      },
+      {
+        "counter": {
+          "family": "inet",
+          "name": "host_replies",
+          "table": "takos_cx_guest_current_r1",
+          "handle": 8,
+          "packets": 0,
+          "bytes": 0
+        }
+      },
+      {
+        "counter": {
+          "family": "inet",
+          "name": "accepted0",
+          "table": "takos_cx_guest_current_r1",
+          "handle": 9,
+          "packets": 0,
+          "bytes": 0
+        }
+      },
+      {
+        "counter": {
+          "family": "inet",
+          "name": "denied0",
+          "table": "takos_cx_guest_current_r1",
+          "handle": 10,
+          "packets": 0,
+          "bytes": 0
+        }
+      },
+      {
+        "counter": {
+          "family": "inet",
+          "name": "cap_denied0",
+          "table": "takos_cx_guest_current_r1",
+          "handle": 11,
+          "packets": 0,
+          "bytes": 0
+        }
+      },
+      {
+        "quota": {
+          "family": "inet",
+          "name": "q0",
+          "table": "takos_cx_guest_current_r1",
+          "handle": 12,
+          "bytes": 2097152,
+          "used": 0,
+          "inv": true
+        }
+      },
+      {
+        "counter": {
+          "family": "inet",
+          "name": "accepted1",
+          "table": "takos_cx_guest_current_r1",
+          "handle": 13,
+          "packets": 0,
+          "bytes": 0
+        }
+      },
+      {
+        "counter": {
+          "family": "inet",
+          "name": "denied1",
+          "table": "takos_cx_guest_current_r1",
+          "handle": 14,
+          "packets": 0,
+          "bytes": 0
+        }
+      },
+      {
+        "counter": {
+          "family": "inet",
+          "name": "cap_denied1",
+          "table": "takos_cx_guest_current_r1",
+          "handle": 15,
+          "packets": 0,
+          "bytes": 0
+        }
+      },
+      {
+        "quota": {
+          "family": "inet",
+          "name": "q1",
+          "table": "takos_cx_guest_current_r1",
+          "handle": 16,
+          "bytes": 2097152,
+          "used": 0,
+          "inv": true
+        }
+      },
+      {
+        "set": {
+          "family": "inet",
+          "name": "disabled",
+          "table": "takos_cx_guest_current_r1",
+          "type": "ifname",
+          "handle": 17
+        }
+      },
+      {
+        "set": {
+          "family": "inet",
+          "name": "outbound_denied",
+          "table": "takos_cx_guest_current_r1",
+          "type": "ifname",
+          "handle": 18
+        }
+      },
+      {
+        "chain": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "name": "t0",
+          "handle": 1
+        }
+      },
+      {
+        "chain": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "name": "t1",
+          "handle": 2
+        }
+      },
+      {
+        "chain": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "name": "input",
+          "handle": 3,
+          "type": "filter",
+          "hook": "input",
+          "prio": -10,
+          "policy": "accept"
+        }
+      },
+      {
+        "chain": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "name": "forward",
+          "handle": 4,
+          "type": "filter",
+          "hook": "forward",
+          "prio": -10,
+          "policy": "accept"
+        }
+      },
+      {
+        "chain": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "name": "output",
+          "handle": 5,
+          "type": "filter",
+          "hook": "output",
+          "prio": -10,
+          "policy": "accept"
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "t0",
+          "handle": 20,
+          "comment": "cx_0",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "set": [
+                    {
+                      "prefix": {
+                        "addr": "10.0.0.0",
+                        "len": 8
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "100.64.0.0",
+                        "len": 10
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "127.0.0.0",
+                        "len": 8
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "169.254.0.0",
+                        "len": 16
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "172.16.0.0",
+                        "len": 12
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "192.168.0.0",
+                        "len": 16
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "counter": "denied0"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "t0",
+          "handle": 22,
+          "comment": "cx_1",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip6",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "set": [
+                    "::1",
+                    {
+                      "prefix": {
+                        "addr": "::ffff:10.0.0.0",
+                        "len": 104
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "::ffff:100.64.0.0",
+                        "len": 106
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "::ffff:127.0.0.0",
+                        "len": 104
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "::ffff:169.254.0.0",
+                        "len": 112
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "::ffff:172.16.0.0",
+                        "len": 108
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "::ffff:192.168.0.0",
+                        "len": 112
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "fc00::",
+                        "len": 7
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "fe80::",
+                        "len": 10
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "counter": "denied0"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "t0",
+          "handle": 23,
+          "comment": "cx_2",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "tcp",
+                    "field": "dport"
+                  }
+                },
+                "right": 25
+              }
+            },
+            {
+              "counter": "denied0"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "t0",
+          "handle": 25,
+          "comment": "cx_3",
+          "expr": [
+            {
+              "match": {
+                "op": "!=",
+                "left": {
+                  "meta": {
+                    "key": "l4proto"
+                  }
+                },
+                "right": {
+                  "set": ["tcp", "udp"]
+                }
+              }
+            },
+            {
+              "counter": "denied0"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "t0",
+          "handle": 26,
+          "comment": "cx_4",
+          "expr": [
+            {
+              "ct count": {
+                "val": 64,
+                "inv": true
+              }
+            },
+            {
+              "counter": "cap_denied0"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "t0",
+          "handle": 27,
+          "comment": "cx_5",
+          "expr": [
+            {
+              "quota": "q0"
+            },
+            {
+              "counter": "cap_denied0"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "t0",
+          "handle": 28,
+          "comment": "cx_6",
+          "expr": [
+            {
+              "counter": "accepted0"
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "t1",
+          "handle": 30,
+          "comment": "cx_7",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "set": [
+                    {
+                      "prefix": {
+                        "addr": "10.0.0.0",
+                        "len": 8
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "100.64.0.0",
+                        "len": 10
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "127.0.0.0",
+                        "len": 8
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "169.254.0.0",
+                        "len": 16
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "172.16.0.0",
+                        "len": 12
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "192.168.0.0",
+                        "len": 16
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "counter": "denied1"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "t1",
+          "handle": 32,
+          "comment": "cx_8",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip6",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "set": [
+                    "::1",
+                    {
+                      "prefix": {
+                        "addr": "::ffff:10.0.0.0",
+                        "len": 104
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "::ffff:100.64.0.0",
+                        "len": 106
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "::ffff:127.0.0.0",
+                        "len": 104
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "::ffff:169.254.0.0",
+                        "len": 112
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "::ffff:172.16.0.0",
+                        "len": 108
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "::ffff:192.168.0.0",
+                        "len": 112
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "fc00::",
+                        "len": 7
+                      }
+                    },
+                    {
+                      "prefix": {
+                        "addr": "fe80::",
+                        "len": 10
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "counter": "denied1"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "t1",
+          "handle": 33,
+          "comment": "cx_9",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "tcp",
+                    "field": "dport"
+                  }
+                },
+                "right": 25
+              }
+            },
+            {
+              "counter": "denied1"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "t1",
+          "handle": 35,
+          "comment": "cx_10",
+          "expr": [
+            {
+              "match": {
+                "op": "!=",
+                "left": {
+                  "meta": {
+                    "key": "l4proto"
+                  }
+                },
+                "right": {
+                  "set": ["tcp", "udp"]
+                }
+              }
+            },
+            {
+              "counter": "denied1"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "t1",
+          "handle": 36,
+          "comment": "cx_11",
+          "expr": [
+            {
+              "ct count": {
+                "val": 64,
+                "inv": true
+              }
+            },
+            {
+              "counter": "cap_denied1"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "t1",
+          "handle": 37,
+          "comment": "cx_12",
+          "expr": [
+            {
+              "quota": "q1"
+            },
+            {
+              "counter": "cap_denied1"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "t1",
+          "handle": 38,
+          "comment": "cx_13",
+          "expr": [
+            {
+              "counter": "accepted1"
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "input",
+          "handle": 39,
+          "comment": "cx_14",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "@disabled"
+              }
+            },
+            {
+              "counter": "killed"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "input",
+          "handle": 40,
+          "comment": "cx_15",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iif"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "match": {
+                "op": "in",
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": "established"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "direction"
+                  }
+                },
+                "right": "reply"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "mark"
+                  }
+                },
+                "right": 4101
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "protocol"
+                  }
+                },
+                "right": "tcp"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "ip saddr",
+                    "dir": "original"
+                  }
+                },
+                "right": "10.247.41.1"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "proto-dst",
+                    "dir": "original"
+                  }
+                },
+                "right": 8080
+              }
+            },
+            {
+              "counter": "host_replies"
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "input",
+          "handle": 41,
+          "comment": "cx_16",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iif"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "match": {
+                "op": "in",
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": "established"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "direction"
+                  }
+                },
+                "right": "reply"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "mark"
+                  }
+                },
+                "right": 4101
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "protocol"
+                  }
+                },
+                "right": "tcp"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "ip6 saddr",
+                    "dir": "original"
+                  }
+                },
+                "right": "fdc7:41::1"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "proto-dst",
+                    "dir": "original"
+                  }
+                },
+                "right": 8080
+              }
+            },
+            {
+              "counter": "host_replies"
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "input",
+          "handle": 43,
+          "comment": "cx_17",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "icmpv6",
+                    "field": "type"
+                  }
+                },
+                "right": {
+                  "set": ["nd-neighbor-solicit", "nd-neighbor-advert"]
+                }
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip6",
+                    "field": "hoplimit"
+                  }
+                },
+                "right": 255
+              }
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "input",
+          "handle": 44,
+          "comment": "cx_18",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "counter": "host_denied"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "input",
+          "handle": 45,
+          "comment": "cx_19",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iif"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "match": {
+                "op": "in",
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": "established"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "direction"
+                  }
+                },
+                "right": "reply"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "mark"
+                  }
+                },
+                "right": 4102
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "protocol"
+                  }
+                },
+                "right": "tcp"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "ip saddr",
+                    "dir": "original"
+                  }
+                },
+                "right": "10.247.42.1"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "proto-dst",
+                    "dir": "original"
+                  }
+                },
+                "right": 8080
+              }
+            },
+            {
+              "counter": "host_replies"
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "input",
+          "handle": 46,
+          "comment": "cx_20",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iif"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "match": {
+                "op": "in",
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": "established"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "direction"
+                  }
+                },
+                "right": "reply"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "mark"
+                  }
+                },
+                "right": 4102
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "protocol"
+                  }
+                },
+                "right": "tcp"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "ip6 saddr",
+                    "dir": "original"
+                  }
+                },
+                "right": "fdc7:42::1"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "proto-dst",
+                    "dir": "original"
+                  }
+                },
+                "right": 8080
+              }
+            },
+            {
+              "counter": "host_replies"
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "input",
+          "handle": 48,
+          "comment": "cx_21",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "icmpv6",
+                    "field": "type"
+                  }
+                },
+                "right": {
+                  "set": ["nd-neighbor-solicit", "nd-neighbor-advert"]
+                }
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip6",
+                    "field": "hoplimit"
+                  }
+                },
+                "right": 255
+              }
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "input",
+          "handle": 49,
+          "comment": "cx_22",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "counter": "host_denied"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "forward",
+          "handle": 50,
+          "comment": "cx_23",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "@disabled"
+              }
+            },
+            {
+              "counter": "killed"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "forward",
+          "handle": 51,
+          "comment": "cx_24",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "@outbound_denied"
+              }
+            },
+            {
+              "counter": "denied0"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "forward",
+          "handle": 52,
+          "comment": "cx_25",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "jump": {
+                "target": "t0"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "forward",
+          "handle": 53,
+          "comment": "cx_26",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "@outbound_denied"
+              }
+            },
+            {
+              "counter": "denied1"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "forward",
+          "handle": 54,
+          "comment": "cx_27",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "iifname"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "jump": {
+                "target": "t1"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "output",
+          "handle": 55,
+          "comment": "cx_28",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "right": "@disabled"
+              }
+            },
+            {
+              "counter": "killed"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "output",
+          "handle": 56,
+          "comment": "cx_29",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "oif"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "match": {
+                "op": "in",
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": "new"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "direction"
+                  }
+                },
+                "right": "original"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "protocol"
+                  }
+                },
+                "right": "tcp"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "saddr"
+                  }
+                },
+                "right": "10.247.41.1"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "ip saddr",
+                    "dir": "original"
+                  }
+                },
+                "right": "10.247.41.1"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "tcp",
+                    "field": "dport"
+                  }
+                },
+                "right": 8080
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "proto-dst",
+                    "dir": "original"
+                  }
+                },
+                "right": 8080
+              }
+            },
+            {
+              "mangle": {
+                "key": {
+                  "ct": {
+                    "key": "mark"
+                  }
+                },
+                "value": 4101
+              }
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "output",
+          "handle": 57,
+          "comment": "cx_30",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "oif"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "match": {
+                "op": "in",
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": "new"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "direction"
+                  }
+                },
+                "right": "original"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "protocol"
+                  }
+                },
+                "right": "tcp"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip6",
+                    "field": "saddr"
+                  }
+                },
+                "right": "fdc7:41::1"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "ip6 saddr",
+                    "dir": "original"
+                  }
+                },
+                "right": "fdc7:41::1"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "tcp",
+                    "field": "dport"
+                  }
+                },
+                "right": 8080
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "proto-dst",
+                    "dir": "original"
+                  }
+                },
+                "right": 8080
+              }
+            },
+            {
+              "mangle": {
+                "key": {
+                  "ct": {
+                    "key": "mark"
+                  }
+                },
+                "value": 4101
+              }
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "output",
+          "handle": 58,
+          "comment": "cx_31",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "oif"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "match": {
+                "op": "in",
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": "new"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "direction"
+                  }
+                },
+                "right": "original"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "protocol"
+                  }
+                },
+                "right": "tcp"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "saddr"
+                  }
+                },
+                "right": "10.247.42.1"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "ip saddr",
+                    "dir": "original"
+                  }
+                },
+                "right": "10.247.42.1"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "tcp",
+                    "field": "dport"
+                  }
+                },
+                "right": 8080
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "proto-dst",
+                    "dir": "original"
+                  }
+                },
+                "right": 8080
+              }
+            },
+            {
+              "mangle": {
+                "key": {
+                  "ct": {
+                    "key": "mark"
+                  }
+                },
+                "value": 4102
+              }
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "inet",
+          "table": "takos_cx_guest_current_r1",
+          "chain": "output",
+          "handle": 59,
+          "comment": "cx_32",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "oifname"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "oif"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "match": {
+                "op": "in",
+                "left": {
+                  "ct": {
+                    "key": "state"
+                  }
+                },
+                "right": "new"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "direction"
+                  }
+                },
+                "right": "original"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "protocol"
+                  }
+                },
+                "right": "tcp"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip6",
+                    "field": "saddr"
+                  }
+                },
+                "right": "fdc7:42::1"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "ip6 saddr",
+                    "dir": "original"
+                  }
+                },
+                "right": "fdc7:42::1"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "tcp",
+                    "field": "dport"
+                  }
+                },
+                "right": 8080
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "ct": {
+                    "key": "proto-dst",
+                    "dir": "original"
+                  }
+                },
+                "right": 8080
+              }
+            },
+            {
+              "mangle": {
+                "key": {
+                  "ct": {
+                    "key": "mark"
+                  }
+                },
+                "value": 4102
+              }
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "bridge": {
+    "nftables": [
+      {
+        "metainfo": {
+          "version": "1.0.9",
+          "release_name": "Old Doc Yak #3",
+          "json_schema_version": 1
+        }
+      },
+      {
+        "table": {
+          "family": "bridge",
+          "name": "takos_cx_guest_current_r1_bridge",
+          "handle": 6
+        }
+      },
+      {
+        "counter": {
+          "family": "bridge",
+          "name": "killed",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "handle": 5,
+          "packets": 0,
+          "bytes": 0
+        }
+      },
+      {
+        "counter": {
+          "family": "bridge",
+          "name": "bridge_denied",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "handle": 6,
+          "packets": 0,
+          "bytes": 0
+        }
+      },
+      {
+        "set": {
+          "family": "bridge",
+          "name": "disabled",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "type": "ifname",
+          "handle": 7
+        }
+      },
+      {
+        "chain": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "name": "prerouting",
+          "handle": 1,
+          "type": "filter",
+          "hook": "prerouting",
+          "prio": -210,
+          "policy": "accept"
+        }
+      },
+      {
+        "chain": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "name": "input",
+          "handle": 2,
+          "type": "filter",
+          "hook": "input",
+          "prio": -210,
+          "policy": "accept"
+        }
+      },
+      {
+        "chain": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "name": "forward",
+          "handle": 3,
+          "type": "filter",
+          "hook": "forward",
+          "prio": -210,
+          "policy": "accept"
+        }
+      },
+      {
+        "chain": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "name": "output",
+          "handle": 4,
+          "type": "filter",
+          "hook": "output",
+          "prio": -210,
+          "policy": "accept"
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "prerouting",
+          "handle": 8,
+          "comment": "cxb_0",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "@disabled"
+              }
+            },
+            {
+              "counter": "killed"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "prerouting",
+          "handle": 9,
+          "comment": "cxb_1",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ether",
+                    "field": "saddr"
+                  }
+                },
+                "right": "02:70:00:00:00:01"
+              }
+            },
+            {
+              "counter": "bridge_denied"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "prerouting",
+          "handle": 10,
+          "comment": "cxb_2",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "saddr"
+                  }
+                },
+                "right": "10.247.41.1"
+              }
+            },
+            {
+              "counter": "bridge_denied"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "prerouting",
+          "handle": 11,
+          "comment": "cxb_3",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "arp",
+                    "field": "saddr ip"
+                  }
+                },
+                "right": "10.247.41.1"
+              }
+            },
+            {
+              "counter": "bridge_denied"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "prerouting",
+          "handle": 12,
+          "comment": "cxb_4",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip6",
+                    "field": "saddr"
+                  }
+                },
+                "right": "fdc7:41::1"
+              }
+            },
+            {
+              "counter": "bridge_denied"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "prerouting",
+          "handle": 14,
+          "comment": "cxb_5",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "match": {
+                "op": "!=",
+                "left": {
+                  "payload": {
+                    "protocol": "ether",
+                    "field": "type"
+                  }
+                },
+                "right": {
+                  "set": ["ip", "arp", "ip6"]
+                }
+              }
+            },
+            {
+              "counter": "bridge_denied"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "prerouting",
+          "handle": 15,
+          "comment": "cxb_6",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ether",
+                    "field": "saddr"
+                  }
+                },
+                "right": "02:70:00:00:00:02"
+              }
+            },
+            {
+              "counter": "bridge_denied"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "prerouting",
+          "handle": 16,
+          "comment": "cxb_7",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip",
+                    "field": "saddr"
+                  }
+                },
+                "right": "10.247.42.1"
+              }
+            },
+            {
+              "counter": "bridge_denied"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "prerouting",
+          "handle": 17,
+          "comment": "cxb_8",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "arp",
+                    "field": "saddr ip"
+                  }
+                },
+                "right": "10.247.42.1"
+              }
+            },
+            {
+              "counter": "bridge_denied"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "prerouting",
+          "handle": 18,
+          "comment": "cxb_9",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip6",
+                    "field": "saddr"
+                  }
+                },
+                "right": "fdc7:42::1"
+              }
+            },
+            {
+              "counter": "bridge_denied"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "prerouting",
+          "handle": 20,
+          "comment": "cxb_10",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "match": {
+                "op": "!=",
+                "left": {
+                  "payload": {
+                    "protocol": "ether",
+                    "field": "type"
+                  }
+                },
+                "right": {
+                  "set": ["ip", "arp", "ip6"]
+                }
+              }
+            },
+            {
+              "counter": "bridge_denied"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "input",
+          "handle": 21,
+          "comment": "cxb_11",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "@disabled"
+              }
+            },
+            {
+              "counter": "killed"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "input",
+          "handle": 23,
+          "comment": "cxb_12",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "arp",
+                    "field": "operation"
+                  }
+                },
+                "right": {
+                  "set": ["request", "reply"]
+                }
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "arp",
+                    "field": "daddr ip"
+                  }
+                },
+                "right": "10.247.41.1"
+              }
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "input",
+          "handle": 26,
+          "comment": "cxb_13",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "icmpv6",
+                    "field": "type"
+                  }
+                },
+                "right": {
+                  "set": ["nd-neighbor-solicit", "nd-neighbor-advert"]
+                }
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip6",
+                    "field": "hoplimit"
+                  }
+                },
+                "right": 255
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip6",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "set": ["fdc7:41::1", "ff02::1:ff00:1"]
+                }
+              }
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "input",
+          "handle": 28,
+          "comment": "cxb_14",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ether",
+                    "field": "daddr"
+                  }
+                },
+                "right": "02:70:00:00:00:01"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ether",
+                    "field": "type"
+                  }
+                },
+                "right": {
+                  "set": ["ip", "ip6"]
+                }
+              }
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "input",
+          "handle": 29,
+          "comment": "cxb_15",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "counter": "bridge_denied"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "input",
+          "handle": 31,
+          "comment": "cxb_16",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "arp",
+                    "field": "operation"
+                  }
+                },
+                "right": {
+                  "set": ["request", "reply"]
+                }
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "arp",
+                    "field": "daddr ip"
+                  }
+                },
+                "right": "10.247.42.1"
+              }
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "input",
+          "handle": 34,
+          "comment": "cxb_17",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "icmpv6",
+                    "field": "type"
+                  }
+                },
+                "right": {
+                  "set": ["nd-neighbor-solicit", "nd-neighbor-advert"]
+                }
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip6",
+                    "field": "hoplimit"
+                  }
+                },
+                "right": 255
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ip6",
+                    "field": "daddr"
+                  }
+                },
+                "right": {
+                  "set": ["fdc7:42::1", "ff02::1:ff00:1"]
+                }
+              }
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "input",
+          "handle": 36,
+          "comment": "cxb_18",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ether",
+                    "field": "daddr"
+                  }
+                },
+                "right": "02:70:00:00:00:02"
+              }
+            },
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "payload": {
+                    "protocol": "ether",
+                    "field": "type"
+                  }
+                },
+                "right": {
+                  "set": ["ip", "ip6"]
+                }
+              }
+            },
+            {
+              "accept": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "input",
+          "handle": 37,
+          "comment": "cxb_19",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "counter": "bridge_denied"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "forward",
+          "handle": 38,
+          "comment": "cxb_20",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "@disabled"
+              }
+            },
+            {
+              "counter": "killed"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "forward",
+          "handle": 39,
+          "comment": "cxb_21",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "integration-a"
+              }
+            },
+            {
+              "counter": "bridge_denied"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "forward",
+          "handle": 40,
+          "comment": "cxb_22",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "ibrname"
+                  }
+                },
+                "right": "integration-b"
+              }
+            },
+            {
+              "counter": "bridge_denied"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      },
+      {
+        "rule": {
+          "family": "bridge",
+          "table": "takos_cx_guest_current_r1_bridge",
+          "chain": "output",
+          "handle": 41,
+          "comment": "cxb_23",
+          "expr": [
+            {
+              "match": {
+                "op": "==",
+                "left": {
+                  "meta": {
+                    "key": "obrname"
+                  }
+                },
+                "right": "@disabled"
+              }
+            },
+            {
+              "counter": "killed"
+            },
+            {
+              "drop": null
+            }
+          ]
+        }
+      }
+    ]
+  }
+}
