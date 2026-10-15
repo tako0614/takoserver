@@ -50,7 +50,7 @@ credential and original Principal incarnation, and the candidate constraints
 preserve the closed backend shape. A zero-row credential INSERT or conflicting
 class must abort that batch. The helper does not generate a secret or turn a
 structural input into proof of enrollment. The real issuer/capture is a separate
-Auth/RP source change; ordinary `auth.ts` is unchanged by this component.
+Auth/RP source change; this storage component does not change ordinary issuance.
 
 `readRetained` preserves exact credential digest/ID/incarnation, issuance
 reference, class and terminal history. `retire` is a one-way CAS against the
@@ -60,6 +60,39 @@ Actual token revoke/delete and enrolled Principal deletion close retained
 records through candidate lifecycle guards. Payload cleanup cannot erase their
 history. RP revocation/outbox/cleanup hooks remain with the actual RP owner;
 the structural fixture is not an implementation of that producer.
+
+## Existing token backend capture
+
+`createAccounts` now also returns an internal `AuthTokenCaptureReader`; the
+ordinary `Accounts` and `Actor` contracts stay unchanged. Both ordinary
+authentication and `captureAuthenticatedToken` use the same private token
+lookup on that factory's actual `Sql`, with the bearer digest, unrevoked row
+and existing expiry predicate. No Auth103 table is queried or written. OAuth
+providers, sign-in, key issuance, Organization projection and public wire
+responses retain their existing behavior.
+
+The capture additionally validates the actual row's digest, current kind,
+Org/session shape, raw scope JSON and expiry after the awaited lookup. It
+retains the exact token ID, digest, kind, administrative Principal, Org, raw
+scope JSON, parsed scopes, raw creation text and expiry in a frozen private
+record. The returned frozen handle has no enumerable data and serializes to
+an empty object. `inspectAuthenticatedTokenCapture` consults only that
+`createAccounts` instance's private WeakMap: clones, serialized objects,
+ordinary Actors and another factory's handles return null. No caller supplies
+a verified/class/backend flag, proof, target, SQL or registration callback.
+
+This is an observed token record, not a credential class, live payer grant or
+reusable authorization. A previously captured record may remain inspectable
+after revocation; final currentness belongs in the real owning same-primary
+CAS. The key's Principal remains its administrative owner, not a shared human
+payer. Missing class cannot become direct classification or permission for a
+new Financial command. No Financial command path consumes this seam yet.
+
+Class issuance and App/control/RP mounting are separate. They require the real
+registered predecessor/Auth schema and owner-qualified target/composition port;
+publicOrigin, tenant JSON and ready booleans cannot provide it. Existing tokens
+are not bulk adopted. Actual RP final-row capture remains with its RP owner and
+is not inferred from an Actor or synthesized as an auth_tokens row.
 
 ## Currentness belongs inside the final owning mutation
 

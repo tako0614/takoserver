@@ -153,6 +153,38 @@ export interface Actor {
   readonly kind: "session" | "api_key";
 }
 
+const authTokenCaptureBrand: unique symbol = Symbol("Auth token capture");
+
+/** An opaque local handle. Its private owning map, not this shape, identifies it. */
+export interface AuthenticatedTokenCapture {
+  readonly [authTokenCaptureBrand]: true;
+}
+
+/**
+ * Exact observed token backend data, without the bearer. This is neither a
+ * credential class nor current Financial permission; final owning CAS is separate.
+ */
+export interface CapturedAuthTokenRow {
+  readonly tokenId: string;
+  readonly digest: `sha256:${string}`;
+  readonly kind: "session" | "api_key";
+  readonly principalId: string;
+  readonly organizationId: string | null;
+  readonly scopesJson: string;
+  readonly scopes: readonly ApiKeyScope[];
+  readonly createdAt: string;
+  readonly expiresAt: string;
+}
+
+/** Internal read-only backend seam; not a public route, issuer or enrollment API. */
+export interface AuthTokenCaptureReader {
+  captureAuthenticatedToken(
+    authorization: string | null,
+  ): Promise<AuthenticatedTokenCapture | null>;
+  /** Returns null for a clone, serialization, Actor or another factory's handle. */
+  inspectAuthenticatedTokenCapture(capture: unknown): CapturedAuthTokenRow | null;
+}
+
 export interface ExternalIdentityVerifier {
   verify(input: {
     readonly provider: IdentityProvider;
@@ -765,7 +797,7 @@ export function createSingleUseCredentials(sql: Sql, clock: Clock): SingleUseCre
   };
 }
 
-export function createAccounts(options: CreateAccountsOptions): Accounts {
+export function createAccounts(options: CreateAccountsOptions): Accounts & AuthTokenCaptureReader {
   const { sql, identity } = options;
   const clock = options.clock ?? (() => new Date());
   const randomSecret = options.randomSecret ?? defaultSecret;
@@ -774,6 +806,25 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
     options.apiKeyAdministration ??
     createApiKeyAdministration({ sql, clock, randomSecret, randomId });
   const stamp = (): string => clock().toISOString();
+  const tokenCaptures = new WeakMap<object, CapturedAuthTokenRow>();
+
+  const readCurrentToken = async (
+    authorization: string | null,
+  ): Promise<{
+    readonly row: Row;
+    readonly digest: `sha256:${string}`;
+  } | null> => {
+    const secret = bearer(authorization);
+    if (!secret) return null;
+    const digest = await bytesDigest(new TextEncoder().encode(secret));
+    const rows = await sql.query(
+      `SELECT id, kind, principal_id, org_id, scopes_json,
+              secret_digest, created_at, expires_at, revoked_at FROM auth_tokens
+       WHERE secret_digest = ? AND revoked_at IS NULL AND expires_at > ?`,
+      [digest, stamp()],
+    );
+    return rows[0] ? { row: rows[0], digest } : null;
+  };
 
   const issueSessionToken = async (input: {
     readonly principalId: string;
@@ -872,7 +923,7 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
     };
   };
 
-  const accounts: Accounts = {
+  const accounts: Accounts & AuthTokenCaptureReader = {
     async signIn({ provider, assertion, method, nonce, audience, sessionTtlSeconds }) {
       if (provider !== "takos-id" && provider !== "google" && provider !== "github") {
         throw new AuthError("invalid");
@@ -1163,15 +1214,9 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
     },
 
     async authenticate(authorization) {
-      const secret = bearer(authorization);
-      if (!secret) return null;
-      const rows = await sql.query(
-        `SELECT id, kind, principal_id, org_id, scopes_json FROM auth_tokens
-         WHERE secret_digest = ? AND revoked_at IS NULL AND expires_at > ?`,
-        [await bytesDigest(new TextEncoder().encode(secret)), stamp()],
-      );
-      const row = rows[0];
-      if (!row) return null;
+      const observed = await readCurrentToken(authorization);
+      if (!observed) return null;
+      const { row } = observed;
       const organizationId = row.org_id;
       const kind = String(row.kind) === "session" ? "session" : "api_key";
       return {
@@ -1182,6 +1227,22 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
         scopes: JSON.parse(String(row.scopes_json)) as ApiKeyScope[],
         kind,
       };
+    },
+
+    async captureAuthenticatedToken(authorization) {
+      const observed = await readCurrentToken(authorization);
+      if (!observed) return null;
+      const retained = capturedTokenRow(observed.row, observed.digest, clock().getTime());
+      if (!retained) return null;
+      const capture: AuthenticatedTokenCapture = { [authTokenCaptureBrand]: true };
+      Object.freeze(capture);
+      tokenCaptures.set(capture, retained);
+      return capture;
+    },
+
+    inspectAuthenticatedTokenCapture(capture) {
+      if (typeof capture !== "object" || capture === null) return null;
+      return tokenCaptures.get(capture) ?? null;
     },
 
     async authorize(authorization, scope) {
@@ -1208,6 +1269,64 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
   };
 
   return accounts;
+}
+
+function capturedTokenRow(
+  row: Row,
+  digest: `sha256:${string}`,
+  now: number,
+): CapturedAuthTokenRow | null {
+  if (
+    row.secret_digest !== digest ||
+    row.revoked_at !== null ||
+    (row.kind !== "session" && row.kind !== "api_key") ||
+    typeof row.id !== "string" ||
+    row.id.length === 0 ||
+    typeof row.principal_id !== "string" ||
+    row.principal_id.length === 0 ||
+    typeof row.created_at !== "string" ||
+    row.created_at.length === 0 ||
+    typeof row.expires_at !== "string" ||
+    !Number.isFinite(now) ||
+    !Number.isFinite(Date.parse(row.expires_at)) ||
+    Date.parse(row.expires_at) <= now ||
+    typeof row.scopes_json !== "string" ||
+    row.scopes_json.length < 2 ||
+    row.scopes_json.length > 1024 ||
+    (row.org_id !== null && (typeof row.org_id !== "string" || row.org_id.length === 0))
+  ) {
+    return null;
+  }
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(row.scopes_json);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(decoded)) return null;
+  const scopes: ApiKeyScope[] = [];
+  for (const value of decoded) {
+    const scope = API_KEY_SCOPES.find((candidate) => candidate === value);
+    if (scope === undefined || scopes.includes(scope)) return null;
+    scopes.push(scope);
+  }
+  if (
+    (row.kind === "session" && (row.org_id !== null || scopes.length !== 0)) ||
+    (row.kind === "api_key" && (typeof row.org_id !== "string" || scopes.length === 0))
+  ) {
+    return null;
+  }
+  return Object.freeze({
+    tokenId: row.id,
+    digest,
+    kind: row.kind,
+    principalId: row.principal_id,
+    organizationId: row.org_id,
+    scopesJson: row.scopes_json,
+    scopes: Object.freeze(scopes),
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+  });
 }
 
 function apiKeyFromRow(row: Readonly<Record<string, unknown>>): ApiKey {
