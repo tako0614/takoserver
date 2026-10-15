@@ -158,6 +158,7 @@ export {
   type SQLiteMigrationSetSpec,
   validateSQLiteMigrationPayload,
 } from "./forms/sqlite-migration-set.ts";
+export { createSQLiteMigrationSetCustody } from "./forms/sqlite-migration-set-backend.ts";
 export type { SQLiteDatabaseNativePort } from "./forms/sqlite-native-store-port.ts";
 export {
   createSQLiteWorkerBindingAuthority,
