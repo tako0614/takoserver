@@ -3,7 +3,7 @@ import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { Miniflare } from "miniflare";
 import { createLedger } from "../src/ledger.ts";
-import { type Sql, SqlError, type SqlStatement } from "../src/ports.ts";
+import type { Sql, SqlStatement } from "../src/ports.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
 import { createStripeBillingStore } from "../src/stripe-billing-store.ts";
 import {
@@ -316,7 +316,10 @@ test("native D1 dispatch and original on-demand money preserve atomic custody", 
     await sql.run(
       "CREATE TRIGGER test_on_demand_paid_failure BEFORE UPDATE OF state ON stripe_billing_on_demand_commands WHEN NEW.state='paid' BEGIN SELECT RAISE(ABORT,'constraint: injected paid closure failure'); END",
     );
-    await expect(fund()).rejects.toBeInstanceOf(SqlError);
+    await expect(fund()).rejects.toMatchObject({
+      code: "constraint",
+      message: expect.stringContaining("constraint: injected paid closure failure"),
+    });
     expect(await financialState(sql, original.expected.organizationId)).toEqual(before);
     await sql.run("DROP TRIGGER test_on_demand_paid_failure");
     const grant = await fund();
