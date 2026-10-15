@@ -108,10 +108,13 @@ function purchasedAdmission(witness: unknown): boolean {
     Number(p.policyVersion) < 0 ||
     (p.onLimit === "stop"
       ? p.allowPurchasedCredit !== false || p.consentRevision !== null
-      : p.onLimit !== "prepaid" ||
+      : (p.onLimit !== "prepaid" && p.onLimit !== "on-demand") ||
         p.allowPurchasedCredit !== true ||
         Number(p.policyVersion) < 1 ||
-        p.consentRevision !== PREPAID_CONSENT_REVISION)
+        (p.onLimit === "prepaid"
+          ? p.consentRevision !== PREPAID_CONSENT_REVISION
+          : typeof p.consentRevision !== "string" ||
+            !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(p.consentRevision)))
   )
     throw new LedgerError("conservation_violated");
   return p.allowPurchasedCredit === true;

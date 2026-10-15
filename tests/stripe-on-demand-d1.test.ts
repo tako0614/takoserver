@@ -2,10 +2,13 @@ import { expect, test } from "bun:test";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { Miniflare } from "miniflare";
+import { verifyHostedBillingFinancialRealm } from "../src/hosted-billing-realm.ts";
 import { createLedger } from "../src/ledger.ts";
 import type { Sql, SqlStatement } from "../src/ports.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
+import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
 import { createStripeBillingStore } from "../src/stripe-billing-store.ts";
+import { createStripeCustomerCustody } from "../src/stripe-customer-custody.ts";
 import {
   type StripeOnDemandFundingExpected,
   verifyStripeOnDemandFunding,
@@ -24,6 +27,103 @@ const FUNDED = "2026-10-15T12:00:03.456Z";
 const ACCOUNT = "acct_D1";
 const AUTHORITY = "native-d1.test";
 const clock = () => new Date(FUNDED);
+
+async function qualifyCustomerInspection(sql: Sql): Promise<void> {
+  const organizationId = "org_d1_customer";
+  await sql.run("INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES(?,?,?,?)", [
+    organizationId,
+    "Native customer fixture",
+    "principal_fixture",
+    PREPARED,
+  ]);
+  const requests: Request[] = [];
+  let customer: Record<string, unknown> | undefined;
+  let loseAcknowledgement = true;
+  const client = createStripeBillingClient({
+    secretKey: "sk_test_fixture",
+    async fetch(request) {
+      requests.push(request);
+      const path = new URL(request.url).pathname;
+      if (path === "/v1/account") return Response.json({ object: "account", id: ACCOUNT });
+      if (path === "/v1/prices/price_customer_d1")
+        return Response.json({
+          id: "price_customer_d1",
+          object: "price",
+          livemode: false,
+          active: true,
+          currency: "usd",
+          unit_amount: 1000,
+          type: "recurring",
+          billing_scheme: "per_unit",
+          recurring: { interval: "month", interval_count: 1, usage_type: "licensed" },
+        });
+      if (path === "/v1/customers" && request.method === "POST") {
+        const form = new URLSearchParams(await request.clone().text());
+        const metadata = Object.fromEntries(
+          [...form.entries()].map(([key, value]) => [key.slice(9, -1), value]),
+        );
+        customer = { id: "cus_native_inspection", object: "customer", livemode: false, metadata };
+        if (loseAcknowledgement) {
+          loseAcknowledgement = false;
+          throw new Error("native Customer fixture lost acknowledgement");
+        }
+        return Response.json(customer);
+      }
+      if (path === "/v1/customers")
+        return Response.json({ data: customer ? [customer] : [], has_more: false });
+      if (path === "/v1/customers/cus_native_inspection" && customer)
+        return Response.json(customer);
+      throw new Error("native Customer fixture forbids other processor requests");
+    },
+  });
+  const realm = await verifyHostedBillingFinancialRealm({
+    sql,
+    reader: { client },
+    expected: { accountId: ACCOUNT, mode: "test", billingAuthority: AUTHORITY },
+    prices: [{ priceId: "price_customer_d1", monthlyAmountMinor: 1000 }],
+  });
+  const custody = createStripeCustomerCustody({ sql, client, realm, clock });
+  const reader = createStripeCustomerCustody({
+    sql,
+    client,
+    realm,
+    clock: () => {
+      throw new Error("Customer inspection must not read the clock");
+    },
+  });
+  const initialRequests = requests.length;
+  expect(await reader.inspect(organizationId)).toEqual({
+    organizationId,
+    command: null,
+    binding: null,
+  });
+  expect(requests).toHaveLength(initialRequests);
+  await expect(custody.ensure(organizationId)).rejects.toMatchObject({ code: "unavailable" });
+  const afterUnknownRequests = requests.length;
+  const unknown = await reader.inspect(organizationId);
+  expect(unknown.command?.state).toBe("dispatched");
+  expect(unknown.command?.customerId).toBeNull();
+  expect(unknown.binding).toBeNull();
+  expect(requests).toHaveLength(afterUnknownRequests);
+  expect(await custody.ensure(organizationId)).toBe("cus_native_inspection");
+  const afterRecoveryRequests = requests.length;
+  const recovered = await reader.inspect(organizationId);
+  expect(recovered.command?.state).toBe("verified");
+  expect(recovered.command?.fingerprint).toBe(unknown.command?.fingerprint);
+  expect(recovered.binding?.customerId).toBe("cus_native_inspection");
+  expect(Object.isFrozen(recovered)).toBe(true);
+  expect(Object.isFrozen(recovered.command)).toBe(true);
+  expect(Object.keys(recovered.command ?? {}).sort()).toEqual([
+    "createdAt",
+    "customerId",
+    "dispatchedAt",
+    "fingerprint",
+    "state",
+    "verifiedAt",
+  ]);
+  expect(requests).toHaveLength(afterRecoveryRequests);
+  expect(requests.filter((request) => request.method === "POST")).toHaveLength(1);
+}
 
 function insert(table: string, row: Record<string, string | number | null>): SqlStatement {
   const columns = Object.keys(row);
@@ -267,6 +367,9 @@ test("native D1 dispatch and original on-demand money preserve atomic custody", 
       HOSTED_BILLING_REALM_TEST_INSTANT,
     ]);
     await seedHostedBillingRealmTestPin(sql, { accountId: ACCOUNT, billingAuthority: AUTHORITY });
+    // Same native adapter/schema as the money assertions below; Customer reads
+    // retain an unknown original before any subscription/top-up intent exists.
+    await qualifyCustomerInspection(sql);
     const original = await prepareCommand(sql, "original");
     const foreign = await prepareCommand(sql, "foreign");
 
