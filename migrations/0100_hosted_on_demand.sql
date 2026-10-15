@@ -155,11 +155,85 @@ CREATE TABLE stripe_billing_on_demand_attempts (
  FOREIGN KEY(org_id,reference,first_dispatch_at) REFERENCES stripe_billing_on_demand_commands(org_id,reference,dispatched_at) DEFERRABLE INITIALLY DEFERRED
 );
 CREATE UNIQUE INDEX stripe_billing_on_demand_first_dispatch ON stripe_billing_on_demand_attempts(org_id,reference) WHERE kind='first-dispatch';
+-- These closed refund-observation labels do not authenticate native Stripe data.
+-- The common owner verifies the proof and atomically activates the original fence before append.
 CREATE TRIGGER stripe_billing_on_demand_attempts_phase BEFORE INSERT ON stripe_billing_on_demand_attempts
 WHEN NOT EXISTS (SELECT 1 FROM stripe_billing_on_demand_commands c WHERE c.org_id=NEW.org_id AND c.reference=NEW.reference
  AND NOT EXISTS (SELECT 1 FROM stripe_billing_on_demand_abandonments a WHERE a.org_id=c.org_id AND a.reference=c.reference)
  AND ((NEW.kind='first-dispatch' AND c.state='prepared' AND c.created_at<=NEW.created_at AND NEW.created_at<c.terms_expires_at)
    OR (NEW.kind<>'first-dispatch' AND c.state='dispatched' AND c.dispatched_at<=NEW.created_at)))
+ AND NOT EXISTS (
+  SELECT 1 FROM stripe_billing_on_demand_commands c
+  JOIN stripe_billing_on_demand_funding f ON f.org_id=c.org_id AND f.reference=c.reference
+  JOIN stripe_billing_on_demand_terminals t ON t.org_id=c.org_id AND t.reference=c.reference
+  JOIN org_wallet_cash_exposures e ON e.org_id=c.org_id AND e.ref=c.exposure_ref
+  JOIN stripe_billing_account_realms r ON r.singleton=1 AND r.account_id=c.account_id
+    AND r.mode=c.mode AND r.billing_authority=c.billing_authority
+  JOIN stripe_mode_realm m ON m.singleton=r.singleton AND m.mode=r.mode
+  WHERE NEW.kind='readback' AND c.org_id=NEW.org_id AND c.reference=NEW.reference
+    AND c.state='paid' AND c.dispatched_at<=NEW.created_at
+    AND f.command_state='paid' AND f.cap_state='paid'
+    AND f.funding_ref=c.funding_ref AND f.exposure_ref=c.exposure_ref
+    AND f.payment_intent_id=c.payment_intent_id
+    AND typeof(c.amount_minor)='integer' AND c.amount_minor BETWEEN 1 AND 900719925474
+    AND f.amount_micros=c.amount_minor*10000
+    AND t.status='succeeded' AND t.payment_intent_id=f.payment_intent_id AND t.charge_id=f.charge_id
+    AND t.exposure_ref=c.exposure_ref AND t.account_id=c.account_id AND t.mode=c.mode
+    AND t.billing_authority=c.billing_authority AND t.customer_id=c.customer_id
+    AND t.payment_method_id=c.payment_method_id AND t.currency='usd' AND t.amount_minor=c.amount_minor
+    AND e.status='paid' AND e.source_ref=f.payment_intent_id AND e.amount_minor=c.amount_minor
+    AND e.period_start=c.period_start AND e.period_end=c.period_end
+    AND e.policy_version=c.policy_version AND e.consent_revision=c.consent_revision
+    AND NOT EXISTS (SELECT 1 FROM stripe_billing_on_demand_abandonments a WHERE a.org_id=c.org_id AND a.reference=c.reference)
+    AND EXISTS (SELECT 1 FROM stripe_billing_fences fence
+      WHERE fence.org_id=c.org_id AND fence.funding_ref=f.funding_ref AND fence.active=1
+        AND typeof(fence.generation)='integer' AND fence.generation BETWEEN 1 AND 9007199254740991
+      )
+    AND json_type(NEW.detail_json,'$.kind') IS 'text'
+    AND json_extract(NEW.detail_json,'$.kind') IS 'native-refund-observation-v1'
+    AND json_type(NEW.detail_json,'$.proof') IS 'object'
+    AND (SELECT count(*) FROM json_each(NEW.detail_json))=2
+    AND NOT EXISTS (SELECT 1 FROM json_each(NEW.detail_json) WHERE key NOT IN ('kind','proof'))
+    AND (SELECT count(*) FROM json_each(NEW.detail_json,'$.proof'))=18
+    AND NOT EXISTS (SELECT 1 FROM json_each(NEW.detail_json,'$.proof')
+      WHERE key NOT IN ('kind','sourceType','organizationId','reference','fingerprint','fundingRef','accountId','mode','financialRealm','billingAuthority','customerId','paymentMethodId','paymentIntentId','chargeId','currency','amountMinor','refundedAmountMinor','observedAt')
+        OR (key NOT IN ('amountMinor','refundedAmountMinor') AND type<>'text'))
+    AND json_extract(NEW.detail_json,'$.proof.kind') IS 'stripe-on-demand-funding'
+    AND json_extract(NEW.detail_json,'$.proof.sourceType') IS 'payment-intent'
+    AND json_extract(NEW.detail_json,'$.proof.organizationId') IS c.org_id
+    AND json_extract(NEW.detail_json,'$.proof.reference') IS c.reference
+    AND json_extract(NEW.detail_json,'$.proof.fingerprint') IS c.fingerprint
+    AND json_extract(NEW.detail_json,'$.proof.fundingRef') IS c.funding_ref
+    AND json_extract(NEW.detail_json,'$.proof.accountId') IS c.account_id
+    AND json_extract(NEW.detail_json,'$.proof.mode') IS 'test' AND c.mode='test'
+    AND json_extract(NEW.detail_json,'$.proof.billingAuthority') IS c.billing_authority
+    AND json_extract(NEW.detail_json,'$.proof.customerId') IS c.customer_id
+    AND json_extract(NEW.detail_json,'$.proof.paymentMethodId') IS c.payment_method_id
+    AND json_extract(NEW.detail_json,'$.proof.paymentIntentId') IS f.payment_intent_id
+    AND json_extract(NEW.detail_json,'$.proof.chargeId') IS f.charge_id
+    AND json_extract(NEW.detail_json,'$.proof.currency') IS 'USD'
+    AND json_type(NEW.detail_json,'$.proof.amountMinor') IS 'integer'
+    AND json_extract(NEW.detail_json,'$.proof.amountMinor') IS c.amount_minor
+    AND json_type(NEW.detail_json,'$.proof.refundedAmountMinor') IS 'integer'
+    AND json_extract(NEW.detail_json,'$.proof.refundedAmountMinor') BETWEEN 0 AND c.amount_minor
+    AND json_type(NEW.detail_json,'$.proof.observedAt') IS 'text'
+    AND strftime('%Y-%m-%dT%H:%M:%fZ',json_extract(NEW.detail_json,'$.proof.observedAt')) IS json_extract(NEW.detail_json,'$.proof.observedAt')
+    AND json_extract(NEW.detail_json,'$.proof.observedAt')>=c.dispatched_at
+    AND json_extract(NEW.detail_json,'$.proof.observedAt')<=NEW.created_at
+    AND json_type(c.request_json,'$.metadata') IS 'object'
+    AND json_extract(c.request_json,'$.currency') IS 'usd'
+    AND json_extract(c.request_json,'$.metadata.organizationId') IS c.org_id
+    AND json_extract(c.request_json,'$.metadata.reference') IS c.reference
+    AND json_extract(c.request_json,'$.metadata.fingerprint') IS c.fingerprint
+    AND json_extract(c.request_json,'$.metadata.fundingRef') IS c.funding_ref
+    AND json_extract(c.request_json,'$.metadata.stripeAccountId') IS c.account_id
+    AND json_extract(c.request_json,'$.metadata.billingAuthority') IS c.billing_authority
+    AND json_type(c.request_json,'$.metadata.financialRealm') IS 'text'
+    AND length(json_extract(c.request_json,'$.metadata.financialRealm'))=70
+    AND substr(json_extract(c.request_json,'$.metadata.financialRealm'),1,6)='realm:'
+    AND substr(json_extract(c.request_json,'$.metadata.financialRealm'),7) NOT GLOB '*[^a-f0-9]*'
+    AND json_extract(NEW.detail_json,'$.proof.financialRealm') IS json_extract(c.request_json,'$.metadata.financialRealm')
+ )
 BEGIN SELECT RAISE(ABORT,'constraint: exact durable dispatch or unresolved readback phase required');
 END;
 
