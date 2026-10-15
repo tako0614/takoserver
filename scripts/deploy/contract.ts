@@ -1067,13 +1067,13 @@ export const DEPLOY_CONTRACT = {
       obligations: {
         provenance:
           `${exactSource} Integration only. One explicit --generation=<32-lowercase-hex> derives ` +
-          "both resource names as takoserver-i-<generation>. The scoped migration gate runs once; " +
+          "both new resource names as integration-takoserver-<generation>. The scoped migration gate runs once; " +
           "the default fixed audited 0001-0066 names and bytes, or one explicit fixed " +
           "--fresh-lineage=v2-artifacts-0075, v2-0088, v2-0089, v2-0091 or v2-0092 payload (v2-0088/v2-0089 are the " +
           "same fixed-digest payloads as the production fresh-init profiles; v2-0091 (through the Stripe event table) and v2-0092 (through the Organization wallet lifecycle tables) are " +
           "staging-only and no production surface accepts them), are sealed before creation. A separately " +
           "digested import file preserves every migration byte and adds only Wrangler's migration-ledger DDL and inserts. " +
-          "Every generated D1 must be takoserver-i-<generation> and never production-named; when " +
+          "Every newly created D1 must be integration-takoserver-<generation> and never production-named; when " +
           "TAKOSERVER_DEPLOY_TARGET_PRODUCTION is set its exact D1 name and id are refused before creation and again once the new id " +
           "is known, and applying v2-0091 or v2-0092 requires that production target.",
         "post-conditions":
@@ -1090,7 +1090,10 @@ export const DEPLOY_CONTRACT = {
           "Pre-existing resources, even empty ones, are refused. After any creation attempt the command " +
           "stops on failure, reports only bounded identity/state diagnostics and never retries. Lost " +
           "acknowledgements are indeterminate; selected v2 --status can classify exact schema " +
-          "readback for separate owner review but cannot re-import, adopt or repair it." +
+          "readback for separate owner review but cannot re-import, adopt or repair it. " +
+          "A selected exact legacy takoserver-i-<generation> pair remains readable by status; " +
+          "same-generation legacy apply is refused before credentials or provider access, " +
+          "and both create fences require the new integration-prefixed pair." +
           inputContract(applyReviewInput),
         "pre-mutation-proof":
           "Both derived names must be absent at inspection and at the creation fence. The new D1 " +
