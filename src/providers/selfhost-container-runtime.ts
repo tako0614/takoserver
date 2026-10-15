@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmod, lstat, mkdir, realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { forwardContainerHttp } from "../container-http.ts";
 import { isJsonObject } from "../json.ts";
+import { containerHttpTransport } from "./container-http-transport.ts";
 import type {
   createDockerHttpRevisionRuntime,
   DockerHttpRevision,
@@ -57,7 +59,7 @@ interface Root {
 
 const roots = new Map<string, Root>();
 // A transparent proxy retains the encoded body and its original wire headers.
-const nativeFetch = (request: Request) => fetch(request, { decompress: false });
+const nativeFetch = containerHttpTransport;
 const snapshotLimit = 8 * 1024 * 1024;
 
 /**
@@ -237,59 +239,7 @@ async function invokeNative(
   endpoint: string,
   signal: AbortSignal,
 ): Promise<Response> {
-  let source: URL;
-  let target: URL;
-  try {
-    source = new URL(request.url);
-    target = new URL(endpoint);
-  } catch {
-    fail("unavailable");
-  }
-  if (
-    !["http:", "https:"].includes(target.protocol) ||
-    target.username ||
-    target.password ||
-    target.pathname !== "/" ||
-    target.search ||
-    target.hash
-  )
-    fail("unavailable");
-  target.pathname = source.pathname;
-  target.search = source.search;
-  const response = await root.transport(
-    new Request(target, {
-      method: request.method,
-      headers: endToEndHeaders(request.headers),
-      body: request.body,
-      redirect: "manual",
-      signal,
-      ...({ duplex: "half" } as { duplex: "half" }),
-    }),
-  );
-  return new Response(response.body, {
-    status: response.status,
-    statusText: response.statusText,
-    headers: endToEndHeaders(response.headers),
-  });
-}
-
-function endToEndHeaders(input: Headers): Headers {
-  const headers = new Headers(input);
-  for (const name of (headers.get("connection") ?? "").split(","))
-    if (name.trim()) headers.delete(name.trim());
-  for (const name of [
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-    "host",
-  ])
-    headers.delete(name);
-  return headers;
+  return forwardContainerHttp(request, endpoint, root.transport, signal);
 }
 
 function identityKey(identity: HttpRevisionServingIdentity): string {

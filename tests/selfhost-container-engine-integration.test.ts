@@ -95,6 +95,17 @@ test("container service composes Docker transport, durable recovery and applicat
         });
         return;
       }
+      if (path.startsWith("/images/") && path.endsWith("/json") && request.method === "GET") {
+        const image = decodeURIComponent(path.slice(8, -5));
+        const digest = image.split("@")[1];
+        reply(200, {
+          Id: digest,
+          Os: "linux",
+          Architecture: "amd64",
+          Descriptor: { digest, mediaType: "application/vnd.oci.image.manifest.v1+json" },
+        });
+        return;
+      }
       if (path === "/images/create" && request.method === "POST") {
         reply(200, { status: "fixture image present" });
         return;
@@ -117,6 +128,7 @@ test("container service composes Docker transport, durable recovery and applicat
         const id = (++created).toString(16).padStart(64, "0");
         containers.set(name, {
           Id: id,
+          Image: String(body.Image).split("@")[1]!,
           Config: {
             Image: body.Image ?? null,
             Labels: body.Labels ?? null,
@@ -203,7 +215,7 @@ test("container service composes Docker transport, durable recovery and applicat
       new Request("https://logical.example/encoded", { headers: { "accept-encoding": "gzip" } }),
     );
     expect(compressed.headers.get("content-encoding")).toBe("gzip");
-    expect(compressed.headers.get("content-length")).toBe(String(encoded.byteLength));
+    expect(compressed.headers.has("content-length")).toBe(false);
     expect(new Uint8Array(await compressed.arrayBuffer())).toEqual(new Uint8Array(encoded));
     const firstNative = [...containers.values()][0]?.Id;
     expect(created).toBe(1);

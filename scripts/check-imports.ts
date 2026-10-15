@@ -52,6 +52,12 @@ interface Layer {
 }
 
 const LAYERS: readonly Layer[] = [
+  {
+    // Candidate SQL grants use portable Form/reference evidence, never Docker.
+    name: "v2-container-binding-authority",
+    match: /^src\/takoform-v2\/container-binding-authority\.ts$/u,
+    may: ["core", "v2-form"],
+  },
   // v2 shares neutral primitives, not the v1 package/admission domain. The
   // Queue and Durable Workflow Resource/Operation managers are exposed as
   // source-extension factories, but this does not register them in the normal
@@ -498,7 +504,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "core",
     match:
-      /^src\/(?:ports|json|strict-json|artifact-path|cron|selfhost-socket-layout|error-envelope|route-table|request-lifetime|public-host-identity|form-ref|interface-ref|actor-abi-ref|standard-service-port|worker-class-runtime-port|worker-module-inspection-contract|worker-invocation-port|queue-v2-batch-custody-contract|queue-v2-sqlite-contract|queue-v2-sqlite-physical-fence|workflow-v2-resource-authority|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|stripe-mode-realm|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
+      /^src\/(?:ports|json|strict-json|container-contract|container-http|artifact-path|cron|selfhost-socket-layout|error-envelope|route-table|request-lifetime|public-host-identity|form-ref|interface-ref|actor-abi-ref|standard-service-port|worker-class-runtime-port|worker-module-inspection-contract|worker-invocation-port|queue-v2-batch-custody-contract|queue-v2-sqlite-contract|queue-v2-sqlite-physical-fence|workflow-v2-resource-authority|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|stripe-mode-realm|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
     // Frozen published data sits below every layer: it is bytes a release
     // pinned, not a decision any layer here may make. The wire error taxonomy
     // this Host answers by is exactly that.
@@ -635,6 +641,15 @@ for (const path of walk("src")) {
       /import\s+type\s+\{\s*V2Execution\s*\}\s+from\s+["']\.\/takoform-v2\/types\.ts["'];/u.test(
         readFileSync(path, "utf8"),
       );
+    // This Host-only Linux adapter reuses one pure policy decision. Other
+    // domain imports remain unavailable to adapters, including this module.
+    const exactLinuxContainerEgressPolicyEdge =
+      path === "src/providers/linux-container-egress.ts" &&
+      target === "src/container-egress-policy.ts" &&
+      localImportsOf(path).filter((candidate) => candidate === target).length === 1 &&
+      /^import\s+\{\s*evaluateContainerEgress\s*\}\s+from\s+["']\.\.\/container-egress-policy\.ts["'];$/mu.test(
+        readFileSync(path, "utf8"),
+      );
     // The public operator-extension seam may name only this exact native
     // Queue authority port. Keep the dependency narrow; do not admit the
     // v2-queue-manager layer to package-surface in general.
@@ -688,6 +703,7 @@ for (const path of walk("src")) {
     if (
       !layer.may.includes(targetLayer.name) &&
       !exactExecutionTypeEdge &&
+      !exactLinuxContainerEgressPolicyEdge &&
       !exactQueueProviderExtensionEdge &&
       !exactSchedulerProviderExtensionEdge
     ) {
@@ -749,6 +765,8 @@ const HOST_ONLY = [
   "src/selfhost-workflow-serving.ts",
   "src/selfhost-workflow-http-transport.ts",
   "src/providers/docker-http-revision.ts",
+  // Applies native Linux network namespace/firewall policy, outside Workers.
+  "src/providers/linux-container-egress.ts",
   "src/providers/selfhost-container-lifecycle.ts",
   "src/providers/selfhost-container-runtime.ts",
   "src/providers/selfhost-container-endpoint.ts",

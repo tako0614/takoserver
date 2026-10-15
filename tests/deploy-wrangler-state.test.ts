@@ -637,7 +637,8 @@ describe("Wrangler version publication output", () => {
       const lockPath = `${root}/${ownerName.slice(0, -".owner.json".length)}`;
       const owner = JSON.parse(readFileSync(ownerPath, "utf8")) as Record<string, unknown>;
       const lockIdentity = lstatSync(lockPath, { bigint: true });
-      expect(owner).toMatchObject({
+      // Bun matchers mutate their subject; preserve the raw holder identity for /proc.
+      expect({ ...owner }).toMatchObject({
         kind: "takoserver.worker-publication-lease-owner@v1",
         accountId: target.accountId,
         workerName: target.workerName,
