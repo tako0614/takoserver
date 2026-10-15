@@ -53,16 +53,20 @@ function fixture(tariff = config()) {
   };
 }
 /**
- * A second billing service over the fixture whose clock jumps once, right after
- * the next bounded expiry sweep has read its rows: a deadline then passes
- * between the sweep and the rest of the same request.
+ * A second billing service over the fixture whose clock jumps once after an
+ * awaited real read: either the next bounded sweep or the next read of any kind.
+ * This advances a deadline during the request without counting clock calls.
  */
 function sweepClock(f: ReturnType<typeof fixture>) {
   let next: string | undefined;
+  let afterNextRead = false;
   const sql: Sql = {
     async query(query, params) {
       const rows = await f.sql.query(query, params);
-      if (next !== undefined && query.includes("ORDER BY expires_at, org_id, ref")) {
+      if (
+        next !== undefined &&
+        (afterNextRead || query.includes("ORDER BY expires_at, org_id, ref"))
+      ) {
         f.setTime(next);
         next = undefined;
       }
@@ -75,6 +79,11 @@ function sweepClock(f: ReturnType<typeof fixture>) {
     billing: createOrgBilling({ sql, clock: f.clock, ledger: f.ledger, config: config() }),
     advanceAfterSweep(value: string) {
       next = value;
+      afterNextRead = false;
+    },
+    advanceAfterNextRead(value: string) {
+      next = value;
+      afterNextRead = true;
     },
   };
 }
@@ -532,11 +541,12 @@ describe("Organization wallet lifecycle", () => {
     // An exact replay or a release in the same window answers the expiry.
     await f.billing.hold({ ...expiryHold, reference: "run_2" });
     f.setTime("2026-10-13T00:01:59.999Z");
-    swept.advanceAfterSweep("2026-10-13T00:02:00.000Z");
+    swept.advanceAfterNextRead("2026-10-13T00:02:00.000Z");
     expect(await swept.billing.hold({ ...expiryHold, reference: "run_2" })).toMatchObject({
       status: "expired",
       releasedMicros: 100000,
     });
+    expect(f.clock().toISOString()).toBe("2026-10-13T00:02:00.000Z");
     await f.billing.hold({ ...expiryHold, reference: "run_3" });
     f.setTime("2026-10-13T00:02:59.999Z");
     swept.advanceAfterSweep("2026-10-13T00:03:00.000Z");
