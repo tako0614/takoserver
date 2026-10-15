@@ -379,6 +379,21 @@ test("forward owner component07 CREATE seals real custody and denies cross-owner
       target_uid: b.bundle.resourceUid,
       form_url: WORKER_BUNDLE_FORM_URL,
     });
+    const no07Options = { ...f.options, rootDirectory: join(f.root, "missing07-owners") };
+    delete no07Options.forwardConfiguredInputSealer;
+    const missing07 = createSelfhostV2ForwardWorkerComposition(no07Options);
+    try {
+      await missing07.restoreOwners();
+      const form = missing07.internalFormFactory({
+        sql: f.sql,
+        objects: f.objects,
+        clock: f.clock,
+      })[FORWARD_WORKER_VERSION_FORM_URL];
+      if (!form?.validateCreate) throw new Error("missing actual07 admission form");
+      expect(() => form.validateCreate?.(b.spec)).toThrow();
+    } finally {
+      await missing07.suspendOwnersRetainingCustody();
+    }
     f.denyRead();
     await expect(
       f.create(FORWARD_WORKER_VERSION_FORM_URL, "denied", b.spec, { TOKEN: "other" }, false),
