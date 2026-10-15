@@ -197,7 +197,7 @@ export function readOrgBillingFreshAdmissionOrigin(
     origin.clock !== context.clock ||
     origin.configJson !== canonicalJson(context.billingConfig)
   )
-    orgBillingFail("unqualified_admission", 503);
+    orgBillingFail("billing_unavailable", 503);
   return origin.admission;
 }
 

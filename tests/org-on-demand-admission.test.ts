@@ -493,7 +493,7 @@ describe("genuine OrgBilling fund-before-admit boundary", () => {
     const rows = await f.sql.query("SELECT admission_json FROM stripe_billing_on_demand_commands");
     await expect(
       f.service.beforeNewAdmission(JSON.parse(String(rows[0]?.admission_json))),
-    ).rejects.toMatchObject({ code: "unqualified_admission" });
+    ).rejects.toMatchObject({ code: "billing_unavailable" });
     expect(f.posts).toHaveLength(1);
     f.db.close();
   });
