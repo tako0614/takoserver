@@ -1,5 +1,10 @@
 import { afterEach, expect, test } from "bun:test";
-import { createApi, formatMicrosCurrency } from "../console/src/api.ts";
+import {
+  createApi,
+  formatMicrosCurrency,
+  formatUsagePercent,
+  type WalletUsageSummary,
+} from "../console/src/api.ts";
 import { finalizedHostedPlanTable } from "./helpers/finalized-hosted-plan-table.ts";
 
 const origin = "https://api.example.test";
@@ -33,6 +38,76 @@ const operation = {
 const originalFetch = globalThis.fetch;
 afterEach(() => {
   globalThis.fetch = originalFetch;
+});
+
+test("usage percent preserves the server basis points, including zero allowance and warning thresholds", async () => {
+  for (const [basisPoints, effectiveIncludedMicros, percent] of [
+    [0, "0", "0%"],
+    [0, "1500000", "0%"],
+    [8000, "1500000", "80%"],
+    [9500, "20000000", "95%"],
+    [10000, "20000000", "100%"],
+    [8001, "20000000", "80.01%"],
+  ] as const) {
+    const usageSummary: WalletUsageSummary = {
+      organizationId: org,
+      currency: "USD",
+      unit: "USD-micros",
+      effectiveIncludedMicros,
+      utilizationBasisPoints: basisPoints,
+    };
+    const seen = transport(() => Response.json({ usageSummary }));
+    const result = await client().usageSummary(org);
+    expect(result).toEqual({ usageSummary });
+    expect(formatUsagePercent(result.usageSummary.utilizationBasisPoints, "en-US")).toBe(percent);
+    expect(formatUsagePercent(result.usageSummary.utilizationBasisPoints, "ja-JP")).toBe(percent);
+    expect(new URL(seen[0]?.url ?? origin).pathname).toBe(
+      "/v1/organizations/org%2Fexample%3Fx%3D1%23%25/wallet/usage-summary",
+    );
+    expect(seen[0]?.credentials).toBe("include");
+    expect(seen[0]?.method).toBe("GET");
+    expect(seen[0]?.headers.get("authorization")).toBe("Bearer session");
+  }
+});
+
+test("usage summary refuses unknown, foreign or invalid units and utilization instead of showing zero", async () => {
+  const valid = {
+    organizationId: org,
+    currency: "USD",
+    unit: "USD-micros",
+    effectiveIncludedMicros: "1500000",
+    utilizationBasisPoints: 8000,
+  };
+  for (const change of [
+    { organizationId: "foreign-org" },
+    { currency: "JPY" },
+    { unit: "USD-cents" },
+    { effectiveIncludedMicros: 1500000 },
+    { effectiveIncludedMicros: "9007199254740992" },
+    { effectiveIncludedMicros: "0" },
+    { utilizationBasisPoints: undefined },
+    { utilizationBasisPoints: null },
+    { utilizationBasisPoints: "8000" },
+    { utilizationBasisPoints: -1 },
+    { utilizationBasisPoints: 10001 },
+    { utilizationBasisPoints: 8000.5 },
+  ]) {
+    transport(() => Response.json({ usageSummary: { ...valid, ...change } }));
+    await expect(client().usageSummary(org)).rejects.toMatchObject({ code: "invalid_response" });
+  }
+  transport(() => Response.json({}));
+  await expect(client().usageSummary(org)).rejects.toMatchObject({ code: "invalid_response" });
+  transport(() => Response.json({ error: { code: "billing_unavailable" } }, { status: 503 }));
+  await expect(client().usageSummary(org)).rejects.toMatchObject({
+    code: "billing_unavailable",
+    status: 503,
+  });
+  let sessionLost = false;
+  transport(() => Response.json({ error: { code: "unauthenticated" } }, { status: 401 }));
+  await expect(client(() => (sessionLost = true)).usageSummary(org)).rejects.toMatchObject({
+    code: "unauthenticated",
+  });
+  expect(sessionLost).toBe(true);
 });
 
 test("wallet micros decode as canonical bounded USD strings and display exact fractions", async () => {
