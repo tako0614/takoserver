@@ -8,7 +8,7 @@ import {
   settleResourceIntent,
   uncertainResourceIntents,
 } from "../resource-intent.ts";
-import { health } from "../resource-state.ts";
+import { health, phaseLabel } from "../resource-state.ts";
 import { linkProps, navigate, resourcePath, route } from "../router.ts";
 import { api, currentOrganization } from "../state.ts";
 import { ago, badge, card, copyable, empty, explain, ICON, icon, whenReady } from "../ui.ts";
@@ -345,21 +345,22 @@ function table(resources: readonly ResourceSummary[]): Child {
   }
   return h(
     "table",
-    null,
+    // Explicit roles keep the table announced as a table where a browser
+    // drops native semantics for the stacked phone layout.
+    { class: "resource-table", role: "table" },
     h(
       "thead",
-      null,
+      { role: "rowgroup" },
       h(
         "tr",
-        null,
-        h("th", null, tr("状態", "State")),
-        h("th", null, tr("名前", "Name")),
-        h("th", null, tr("スペース", "Space")),
-        h("th", null, "Form"),
-        h("th", null, tr("観測", "Observed")),
+        { role: "row" },
+        h("th", { role: "columnheader" }, tr("状態", "State")),
+        h("th", { role: "columnheader" }, tr("名前", "Name")),
+        h("th", { role: "columnheader" }, "Form"),
+        h("th", { role: "columnheader" }, tr("観測", "Observed")),
       ),
     ),
-    h("tbody", null, ...resources.map((entry) => row(entry))),
+    h("tbody", { role: "rowgroup" }, ...resources.map((entry) => row(entry))),
   );
 }
 
@@ -370,6 +371,7 @@ function row(entry: ResourceSummary): Child {
     "tr",
     {
       class: "is-clickable",
+      role: "row",
       // The row is a shortcut; the name is the link. A click that lands on a
       // control inside the row belongs to that control, not to the row.
       onClick: (event: MouseEvent) => {
@@ -380,31 +382,31 @@ function row(entry: ResourceSummary): Child {
     },
     h(
       "td",
-      null,
+      { class: "resource-state", role: "cell" },
       badge(phaseLabel(state.phase), state.tone, true),
       state.stale
         ? h("span", { style: { marginLeft: "6px" } }, badge(tr("変更あり", "changed"), "accent"))
         : null,
     ),
-    h("td", null, h("a", { class: "mono", ...linkProps(href) }, entry.name)),
-    h("td", { class: "dim" }, entry.space),
-    h("td", { class: "dim mono", style: { fontSize: "12px" } }, entry.form),
+    // Every row is in the selected organization's Space, so the Space is
+    // not repeated per row. A long name is cut with an ellipsis (the whole
+    // name is its title and the detail page heading) and the exact Form URL
+    // wraps; on a phone each row stacks so the URL gets the full width.
     h(
       "td",
-      { class: "dim", title: entry.observedAt ?? "" },
+      { class: "resource-name", role: "cell" },
+      h("a", { class: "mono truncate", title: entry.name, ...linkProps(href) }, entry.name),
+    ),
+    h("td", { class: "resource-form dim mono", role: "cell" }, entry.form),
+    h(
+      "td",
+      {
+        class: "resource-observed dim",
+        role: "cell",
+        title: entry.observedAt ?? "",
+        "data-label": tr("観測", "Observed"),
+      },
       entry.observedAt ? ago(entry.observedAt) : "—",
     ),
   );
-}
-
-function phaseLabel(phase: ReturnType<typeof health>["phase"]): string {
-  const japanese = {
-    Ready: "稼働中",
-    NotReady: "非稼働",
-    Pending: "処理中",
-    Failed: "失敗",
-    Deleting: "削除中",
-    Unknown: "不明",
-  } as const;
-  return tr(japanese[phase], phase);
 }

@@ -156,6 +156,21 @@ test("confirmed ready:false is NotReady and visible in overview attention", asyn
   };
   expect(health(item)).toMatchObject({ phase: "NotReady", tone: "warn", stale: false });
   expect(health({ ...item, observedAt: null })).toMatchObject({ phase: "Unknown" });
+  // A settled Resource whose Form reports no readiness reads as applied.
+  expect(health({ ...item, observed: { fileCount: 1 } })).toMatchObject({
+    phase: "Applied",
+    tone: "ok",
+  });
+  expect(health({ ...item, observed: {}, observedGeneration: 0 })).toMatchObject({
+    phase: "Pending",
+  });
+  // An explicit negative flag, an unusable ready, or a failed operation is
+  // never presented as Applied.
+  expect(health({ ...item, observed: { databaseExists: false } })).toMatchObject({
+    phase: "Unknown",
+  });
+  expect(health({ ...item, observed: { ready: null } })).toMatchObject({ phase: "Unknown" });
+  expect(health({ ...item, phase: "error", observed: {} })).toMatchObject({ phase: "Failed" });
   expect(byForm([item])).toMatchObject([{ form: item.form, attention: 1 }]);
   consoleLocale.set("en");
   setApiOrigin("https://api.example.test");
@@ -191,5 +206,144 @@ test("confirmed ready:false is NotReady and visible in overview attention", asyn
   expect(body.textContent).toContain("Needs attention");
   expect(body.textContent).toContain("NotReady");
   expect(body.textContent).toContain("latest observation reports not ready");
+  expect(body.textContent).not.toContain("Unknown");
+});
+
+test("overview counts only what it read and offers the first create", async () => {
+  installDom();
+  const { consoleLocale } = await import("../console/src/i18n.ts");
+  const { organizations, selectOrganization, setApiOrigin } = await import(
+    "../console/src/state.ts"
+  );
+  const { overviewPage } = await import("../console/src/pages/overview.ts");
+  const organization = {
+    id: "org-one",
+    name: "One",
+    ownerPrincipalId: "owner",
+    createdAt: "2026-10-07",
+  };
+  const item = {
+    uid: "uid-ready",
+    form: "https://forms.example.test/WorkerVersion/1.0.0",
+    space: "org-one",
+    name: "ready",
+    generation: 1,
+    observedGeneration: 1,
+    observedAt: "2026-10-07T00:00:00Z",
+    phase: "idle" as const,
+    spec: {},
+    observed: { ready: true },
+    output: {},
+    lastOperation: "op-one",
+  };
+  const render = async (page: { items: unknown[]; nextCursor: string | null }) => {
+    const body = installDom();
+    consoleLocale.set("en");
+    setApiOrigin("https://api.example.test");
+    organizations.set([organization]);
+    selectOrganization(organization.id);
+    globalThis.fetch = Object.assign(
+      async (input: RequestInfo | URL) => {
+        const path = new URL(String(input)).pathname;
+        if (path.endsWith("/wallet"))
+          return Response.json({
+            wallet: {
+              organizationId: organization.id,
+              availableMicros: "0",
+              heldMicros: "0",
+              settledMicros: "0",
+              currency: "USD",
+              unit: "USD-micros",
+              moneyPolicy: "usd-micros-v2",
+              entries: [],
+            },
+          });
+        if (path.endsWith("/operations")) return Response.json({ operations: [] });
+        return Response.json(page);
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    );
+    body.append(overviewPage(organization) as unknown as NodeStub);
+    await settle();
+    return body;
+  };
+
+  const partial = await render({ items: [item], nextCursor: "next" });
+  expect(partial.textContent).toContain("1+");
+  expect(partial.textContent).toContain("first page only");
+  expect(partial.textContent).toContain("By Form (first page)");
+
+  const complete = await render({ items: [item], nextCursor: null });
+  expect(complete.textContent).toContain("none failed or not ready");
+  expect(complete.textContent).toContain("By Form");
+  expect(complete.textContent).not.toContain("first page");
+  expect(complete.textContent).not.toContain("invalid");
+
+  // A just-accepted create is stale but not failed: the caption must not
+  // claim nothing needs attention while the card below lists it.
+  const pending = await render({
+    items: [{ ...item, uid: "uid-pending", name: "pending", observedGeneration: 0 }],
+    nextCursor: null,
+  });
+  expect(pending.textContent).toContain("none failed or not ready");
+  expect(pending.textContent).toContain("Needs attention");
+  expect(pending.textContent).not.toContain("none need attention");
+
+  const failing = await render({
+    items: [{ ...item, observed: { ready: false } }],
+    nextCursor: "next",
+  });
+  expect(failing.textContent).toContain("1+");
+  expect(failing.textContent).toContain("1+ need attention");
+
+  const none = await render({ items: [], nextCursor: null });
+  expect(none.textContent).toContain("none yet");
+  expect(none.textContent).toContain("Nothing declared yet");
+  const create = none.all().find((node) => node.tag === "button");
+  expect(create?.className).toBe("btn btn--primary");
+  expect(create?.textContent).toContain("New resource");
+});
+
+test("resource detail calls a settled artifact Resource Applied", async () => {
+  const body = installDom();
+  const { consoleLocale } = await import("../console/src/i18n.ts");
+  const { organizations, selectOrganization, setApiOrigin } = await import(
+    "../console/src/state.ts"
+  );
+  const { route } = await import("../console/src/router.ts");
+  const { resourceDetailPage } = await import("../console/src/pages/resource-detail.ts");
+  consoleLocale.set("en");
+  setApiOrigin("https://api.example.test");
+  organizations.set([
+    { id: "org-one", name: "One", ownerPrincipalId: "owner", createdAt: "2026-10-07" },
+  ]);
+  selectOrganization("org-one");
+  route.set({
+    path: "/resources/uid-bundle",
+    segments: ["resources", "uid-bundle"],
+    query: new URLSearchParams(),
+  });
+  globalThis.fetch = Object.assign(
+    async () =>
+      Response.json({
+        uid: "uid-bundle",
+        form: "https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/",
+        space: "org-one",
+        name: "hello-v1",
+        generation: 1,
+        observedGeneration: 1,
+        observedAt: "2026-10-07T00:00:00Z",
+        phase: "idle",
+        spec: {},
+        observed: { entrypoint: "worker.js", fileCount: 1, totalBytes: 80 },
+        output: {},
+        lastOperation: "op-one",
+      }),
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  body.append(resourceDetailPage("org-one", "uid-bundle") as unknown as NodeStub);
+  await settle();
+  expect(body.textContent).toContain("hello-v1");
+  expect(body.textContent).toContain("Applied");
   expect(body.textContent).not.toContain("Unknown");
 });
