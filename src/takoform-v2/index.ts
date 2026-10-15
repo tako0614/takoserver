@@ -285,6 +285,8 @@ export {
   inspectV2WorkerInvocationDrainSchema,
   inspectV2WorkerInvocationSchema,
   type V2WorkerInvocationSchema,
+  v2WorkerInvocationDrainSchemaReady,
+  v2WorkerInvocationLegacySchemaReady,
   v2WorkerInvocationSchemaReady,
 } from "./worker-invocation-schema.ts";
 export {
