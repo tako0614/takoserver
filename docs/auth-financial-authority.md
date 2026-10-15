@@ -94,6 +94,41 @@ publicOrigin, tenant JSON and ready booleans cannot provide it. Existing tokens
 are not bulk adopted. Actual RP final-row capture remains with its RP owner and
 is not inferred from an Actor or synthesized as an auth_tokens row.
 
+## Genuine local factory origins
+
+`assertAuthTokenCaptureReader(reader, {sql})` checks the actual object created
+by this module's `createAccounts`, its identical captured Sql and both original
+capture/inspection methods. Copied methods, another wrapper around the same
+database, inherited objects and an alleged reader's self-assertion do not
+establish that origin. Both methods must remain own data properties; the check
+does not invoke an inspection/capture method or an accessor. Two real Accounts
+factories on the same Sql each have genuine origins, while their opaque token
+handles remain private to their original factory. Ordinary Accounts behavior
+and token parsing are unchanged.
+
+`assertMoneyCutoverSqlOrigin(sql, {writerEpoch})` checks the actual object
+returned by `createMoneyCutoverSql`, its captured primitive epoch and original
+query/run/batch methods. It exposes no underlying Sql. Distinct real wrappers
+around one backend remain distinct Sql identities. Neither assertion accepts
+a caller's callback or branded DTO as a source of origin, and both refuse
+accessor replacements without running their getters.
+
+These checks perform no SQL and prove local construction only. They do not
+freeze the returned ports or turn a previously checked method into reusable
+permission. A real consumer must capture the original reader and receiver
+after checking its origin. Existing final currentness/permit guards still
+decide each command: a revoked token can have a retained observation, and a
+wrapper whose epoch was later revoked or whose database was frozen retains
+its construction origin while its next write fails.
+
+These helpers are source-module APIs, with no new package-barrel export or
+App/Financial mount. They do not implement `assertFinancialAuthConsumerPort`.
+That separate consumer still requires the genuine qualified Realm/client,
+writer origin, installed Auth schema/target, actual retained-class issuer and
+separate verified human/RP producer. Missing class remains missing; neither an
+ordinary token observation nor these origin assertions supplies a payer,
+credential class, enrollment or Financial permission.
+
 ## Currentness belongs inside the final owning mutation
 
 `sharedPrincipalCurrentness`, `sharedBrokerCredentialCurrentness` and
