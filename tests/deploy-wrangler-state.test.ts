@@ -1714,6 +1714,7 @@ test("keeps discovery first-stat ENOENT separate from strict later reads", async
     String.raw`
 import { mock } from "bun:test";
 import assert from "node:assert/strict";
+import { tmpdir } from "node:os";
 const fs = { ...await import("node:fs") };
 let active = null;
 const failure = (code) => Object.assign(new Error("synthetic own-fd read schedule"), { code });
@@ -1759,7 +1760,7 @@ const cases = [
 ];
 const results = [];
 for (const item of cases) {
-  const root = process.env.TMPDIR + "/integration-fd-schedule-" + crypto.randomUUID();
+  const root = tmpdir() + "/integration-fd-schedule-" + crypto.randomUUID();
   assert.equal(fs.existsSync(root), false);
   const lease = await api.acquireWranglerVersionPublicationLease({
     accountId: "e".repeat(32), workerName: "integration-fd-schedule", root,
@@ -1835,7 +1836,13 @@ console.log(JSON.stringify({ cases: results, sourceGuardMocked: false,
   scheduleIsSyntheticNotPhysicalFdCloseProof: true }));
 `,
   ].join("\n");
+  // Exercise CI environments without any temporary-directory selector.
+  const childEnv = { ...process.env };
+  delete childEnv.TMPDIR;
+  delete childEnv.TMP;
+  delete childEnv.TEMP;
   const child = Bun.spawn([process.execPath, "--no-env-file", "-e", childProgram], {
+    env: childEnv,
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
