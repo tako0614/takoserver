@@ -3,7 +3,7 @@
   "products": ["takoserver", "takosumi-hosted"],
   "currency": "USD",
   "moneyUnit": "USD-micros",
-  "revision": "hosted-20261015-container-proposed-v1",
+  "revision": "hosted-20261015-container-proposed-v2",
   "freeIncludedMicros": "1500000",
   "plans": [
     {
@@ -119,7 +119,7 @@
     },
     "container.egress": {
       "unit": "GB",
-      "cloudflareCostMicros": "50000",
+      "cloudflareCostMicros": "25000",
       "quantity": "1"
     },
     "container.image-storage": {

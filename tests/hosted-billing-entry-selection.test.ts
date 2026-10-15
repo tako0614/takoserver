@@ -68,6 +68,33 @@ const pricing = compilePricingAuthoring({
   checkout: { minimumMinor: 50, maximumMinor: 10000 },
 });
 
+// Synthetic operator inputs for entry tests only; these are not deployment defaults.
+const onDemandConfiguration = {
+  terms: {
+    termsRevision: "entry-terms:v1",
+    consentRevision: "entry-consent:v1",
+    currency: "USD",
+    validity: {
+      validFrom: "2026-01-01T00:00:00.000Z",
+      validUntil: "2030-01-01T00:00:00.000Z",
+    },
+    replenishment: {
+      trigger: "eligible-credit-deficit",
+      rule: "ceil-deficit-to-quantum-with-minimum",
+      fundingQuantumMinor: 50,
+      minimumChargeMinor: 50,
+      maximumChargeMinor: 500,
+    },
+    cashCapBounds: { minimumMinor: 50, maximumMinor: 10000 },
+    purchaseCreditExpiry: { kind: "none" },
+  },
+  cardSetupReturnUrls: {
+    successUrl: "https://console.example.test/billing/setup/success",
+    cancelUrl: "https://console.example.test/billing/setup/cancel",
+  },
+  setupDisclosureRevision: "entry-disclosure:v1",
+};
+
 function fixture(options: { accountPin?: boolean; modePin?: boolean; schemaCount?: number } = {}) {
   const db = new Database(":memory:");
   for (const migration of MIGRATIONS.slice(0, options.schemaCount)) db.exec(migration.sql);
@@ -321,6 +348,129 @@ test("selected invalid or incomplete startup refuses before durable binding acce
   }
 });
 
+test("explicit on-demand JSON refuses invalid input or an unselected lane before durable/provider access", async () => {
+  const valid = JSON.stringify(onDemandConfiguration);
+  for (const overrides of [
+    { TAKOSERVER_HOSTED_BILLING_ON_DEMAND: "" },
+    { TAKOSERVER_HOSTED_BILLING_ON_DEMAND: "{" },
+    { TAKOSERVER_HOSTED_BILLING_ON_DEMAND: "null" },
+    { TAKOSERVER_HOSTED_BILLING_ON_DEMAND: "[]" },
+    { TAKOSERVER_HOSTED_BILLING_ON_DEMAND: "{}" },
+    {
+      TAKOSERVER_HOSTED_BILLING_ON_DEMAND: JSON.stringify({
+        ...onDemandConfiguration,
+        postpaidEnabled: true,
+      }),
+    },
+    {
+      TAKOSERVER_HOSTED_BILLING_ON_DEMAND: JSON.stringify({
+        ...onDemandConfiguration,
+        terms: { ...onDemandConfiguration.terms, currency: "EUR" },
+      }),
+    },
+    {
+      TAKOSERVER_HOSTED_BILLING_ON_DEMAND: JSON.stringify({
+        ...onDemandConfiguration,
+        terms: {
+          ...onDemandConfiguration.terms,
+          replenishment: { ...onDemandConfiguration.terms.replenishment, fundingQuantumMinor: 0 },
+        },
+      }),
+    },
+    {
+      TAKOSERVER_HOSTED_BILLING_ON_DEMAND: JSON.stringify({
+        ...onDemandConfiguration,
+        cardSetupReturnUrls: {
+          ...onDemandConfiguration.cardSetupReturnUrls,
+          cancelUrl: "https://foreign.example.test/cancel",
+        },
+      }),
+    },
+    { TAKOSERVER_HOSTED_BILLING: undefined, TAKOSERVER_HOSTED_BILLING_ON_DEMAND: valid },
+    { TAKOSERVER_HOSTED_BILLING: "", TAKOSERVER_HOSTED_BILLING_ON_DEMAND: valid },
+    { TAKOSERVER_HOSTED_BILLING: "canonical-live", TAKOSERVER_HOSTED_BILLING_ON_DEMAND: valid },
+  ]) {
+    const f = fixture();
+    const remote = remoteFixture();
+    try {
+      const before = f.changes();
+      let accesses = 0;
+      const env = {
+        ...f.env,
+        ...overrides,
+        get STATE_DB(): never {
+          accesses++;
+          throw new Error("unexpected durable access");
+        },
+      } as WorkerEnv;
+      const response = await createWorkerEntry().fetch(new Request(`${ORIGIN}/healthz`), env);
+      expect(response.status).toBe(503);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      const body = await response.text();
+      expect(body).not.toContain("unexpected durable access");
+      expect(body).not.toContain(SECRET);
+      expect(accesses).toBe(0);
+      expect(f.changes()).toBe(before);
+      expect(remote.requests).toEqual([]);
+    } finally {
+      remote.restore();
+      f.db.close();
+    }
+  }
+});
+
+test.each([false, true])(
+  "canonical Worker enables on-demand terms only with explicit JSON: %s",
+  async (enabled) => {
+    const f = fixture();
+    const remote = remoteFixture();
+    try {
+      const ownerRequest = await localOwner(f);
+      const path = new URL(ownerRequest.url).pathname.replace(/payments\/subscription$/u, "wallet");
+      const env = {
+        ...f.env,
+        ...(enabled
+          ? { TAKOSERVER_HOSTED_BILLING_ON_DEMAND: JSON.stringify(onDemandConfiguration) }
+          : {}),
+      } as WorkerEnv;
+      const worker = createWorkerEntry();
+      const before = f.changes();
+      const policy = await worker.fetch(
+        new Request(`${ORIGIN}${path}/limit-policy`, { headers: ownerRequest.headers }),
+        env,
+      );
+      expect(policy.status).toBe(200);
+      expect((await policy.json()).capabilities).toMatchObject({
+        "on-demand": enabled,
+        postpaid: false,
+      });
+      const terms = await worker.fetch(
+        new Request(`${ORIGIN}${path}/on-demand/terms`, { headers: ownerRequest.headers }),
+        env,
+      );
+      expect(terms.status).toBe(enabled ? 200 : 404);
+      expect(terms.headers.get("cache-control")).toBe("private, no-store");
+      if (enabled)
+        expect(await terms.json()).toEqual({
+          terms: onDemandConfiguration.terms,
+          setupDisclosureRevision: onDemandConfiguration.setupDisclosureRevision,
+        });
+      expect(f.changes()).toBe(before);
+      expect(remote.requests.map((request) => new URL(request.url).pathname)).toEqual([
+        "/v1/account",
+        ...compiled.plans.map((plan) => `/v1/prices/${plan.stripePriceId}`),
+      ]);
+      expect(f.db.query("SELECT * FROM org_wallet_cash_exposures").all()).toEqual([]);
+      expect(f.db.query("SELECT * FROM stripe_billing_on_demand_commands").all()).toEqual([]);
+      expect(f.db.query("SELECT * FROM stripe_billing_card_setup_commands").all()).toEqual([]);
+      expect(f.db.query("SELECT * FROM ledger").all()).toEqual([]);
+    } finally {
+      remote.restore();
+      f.db.close();
+    }
+  },
+);
+
 test("selected unbound, mismatched or incomplete schema refuses read-only without creating tariff or pins", async () => {
   for (const scenario of [
     "mode-unbound",
@@ -497,7 +647,7 @@ test("failed startup is evicted so correcting the same binding object can qualif
   }
 });
 
-test.each(["qualified", "foreign-account"] as const)(
+test.each(["qualified", "qualified-on-demand", "foreign-account"] as const)(
   "the actual Bun entry cold start qualifies the selected realm or refuses %s without moving credit",
   async (scenario) => {
     const root = mkdtempSync(join(tmpdir(), "hosted-billing-entry-selection-"));
@@ -525,7 +675,7 @@ test.each(["qualified", "foreign-account"] as const)(
         expect(request.headers.get("stripe-account")).toBeNull();
         if (path === "/v1/account")
           return Response.json({
-            id: scenario === "qualified" ? ACCOUNT : "acct_foreignColdEntry",
+            id: scenario === "foreign-account" ? "acct_foreignColdEntry" : ACCOUNT,
             object: "account",
           });
         if (
@@ -583,6 +733,9 @@ test.each(["qualified", "foreign-account"] as const)(
           }),
           TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: "A".repeat(43),
           TAKOSERVER_HOSTED_BILLING: "canonical-test",
+          ...(scenario === "qualified-on-demand"
+            ? { TAKOSERVER_HOSTED_BILLING_ON_DEMAND: JSON.stringify(onDemandConfiguration) }
+            : {}),
           TAKOSERVER_HOSTED_BILLING_ACCOUNT_ID: ACCOUNT,
           TAKOSERVER_HOSTED_BILLING_AUTHORITY: AUTHORITY,
           TAKOSERVER_STRIPE_MODE: "test",
@@ -647,6 +800,22 @@ test.each(["qualified", "foreign-account"] as const)(
           subscriptionPlanChange: true,
         });
         expect(body.planTable).toEqual(pricing.hostedPlanTable);
+        if (scenario === "qualified-on-demand") {
+          const path = new URL(ownerRequest.url).pathname.replace(
+            /payments\/subscription$/u,
+            "wallet/on-demand/terms",
+          );
+          const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+            headers: ownerRequest.headers,
+            signal: AbortSignal.timeout(2000),
+          });
+          expect(response.status).toBe(200);
+          expect(response.headers.get("cache-control")).toBe("private, no-store");
+          expect(await response.json()).toEqual({
+            terms: onDemandConfiguration.terms,
+            setupDisclosureRevision: onDemandConfiguration.setupDisclosureRevision,
+          });
+        }
         expect(reads.slice(0, 1 + compiled.plans.length)).toEqual([
           "/v1/account",
           ...compiled.plans.map((plan) => `/v1/prices/${plan.stripePriceId}`),
@@ -666,7 +835,7 @@ test.each(["qualified", "foreign-account"] as const)(
         expect(observed.query("SELECT * FROM ledger").all()).toEqual([]);
         expect(observed.query("SELECT * FROM org_wallet_pricing_revisions").all()).toEqual([]);
         expect(observed.query("SELECT * FROM stripe_billing_pricing").all()).toHaveLength(
-          scenario === "qualified" ? 1 : 0,
+          scenario === "foreign-account" ? 0 : 1,
         );
         expect(
           observed

@@ -129,7 +129,8 @@ export interface ProductionD1Identity {
  * future change to that allowlist cannot silently admit one.
  */
 const PRODUCTION_D1_NAME = /^takoserver-(?:runtime(?:$|-)|p-)/u;
-const GENERATED_D1_NAME = /^takoserver-i-[0-9a-f]{32}$/u;
+const FRESH_GENERATED_NAME = /^integration-takoserver-[0-9a-f]{32}$/u;
+const GENERATED_D1_NAME = /^(?:integration-takoserver-|takoserver-i-)[0-9a-f]{32}$/u;
 
 /**
  * An operator-provisioned staging pair: one D1 and one R2 bucket sharing the
@@ -137,15 +138,16 @@ const GENERATED_D1_NAME = /^takoserver-i-[0-9a-f]{32}$/u;
  * a target that selects a staging-only lineage (`v2-0091` or `v2-0092`), and only
  * for the read-side proofs (identity readback, that lineage's exact ledger and
  * canonical schema, and the empty-data proof at first publication). This
- * surface still creates nothing but `takoserver-i-<generation>`, and a
+ * surface creates only `integration-takoserver-<generation>`, and a
  * production-named database never qualifies.
  */
 const STAGING_PAIR_NAME = /^takoserver-staging-[a-z0-9](?:[a-z0-9-]{0,50}[a-z0-9])?$/u;
 
 /**
  * Staging storage is never production storage. The generated name can only be
- * `takoserver-i-<generation>`, so a production database cannot be selected by
- * construction; this checks it anyway, against the production naming and,
+ * `integration-takoserver-<generation>`. Historical `takoserver-i-<generation>`
+ * pairs remain readable; only the fresh prefix is admitted by the creation
+ * fence. This checks both against production naming and,
  * where the operator's production target is supplied, against its exact D1
  * name and id, before creation and again once the new id is known.
  */
@@ -321,16 +323,22 @@ export type IntegrationStorageGeneratedStateOptions = Pick<
 /**
  * Read-only/status and one-way fresh-storage bootstrap for integration.
  *
- * The generated names are the complete identity of this surface.  The
- * environment-selected target contributes only the account and environment
- * guard; its current D1/R2 are never passed to a provider operation.
+ * Fresh names are derived only from the explicit generation. The selected
+ * target contributes the account and environment guard; it can also select
+ * the exact legacy generation for status alone. Apply never touches its
+ * current D1/R2 and refuses either half of a same-generation selected pair.
  */
 export async function runIntegrationStorageGeneration(
-  invocation: IntegrationStorageGenerationInvocation,
-  target: DeployTarget,
+  selectedInvocation: IntegrationStorageGenerationInvocation,
+  selectedTarget: DeployTarget,
   options: IntegrationStorageGenerationOptions = {},
 ): Promise<Record<string, unknown>> {
+  const { invocation, target } = snapshotStorageContext({
+    invocation: selectedInvocation,
+    target: selectedTarget,
+  });
   const names = validateInvocation(invocation, target);
+  if (invocation.action === "apply") assertFreshGenerationNames(names);
   assertStagingD1NotProduction({ databaseName: names.databaseName }, options.productionD1);
   if (
     invocation.action === "apply" &&
@@ -404,10 +412,11 @@ export async function verifyFreshV2IntegrationStorageTarget(
 
 /** Read-only proof selected after the reviewed in-place 0088→0092 wave. */
 export async function verifyCanonicalV20092IntegrationStorageTarget(
-  target: DeployTarget,
+  selectedTarget: DeployTarget,
   environment: DeployEnvironment,
   options: IntegrationStorageGenerationTargetVerificationOptions = {},
 ): Promise<CanonicalV20092IntegrationStorageTargetProof> {
+  const target = snapshotStorageContext(selectedTarget);
   if (
     environment !== "integration" ||
     target.takoformV2?.storageLineage !== "v2-0088" ||
@@ -423,10 +432,11 @@ export async function verifyCanonicalV20092IntegrationStorageTarget(
 
 /** Provider GET identity fence before the schema mutation, independent of its applied lineage. */
 export async function verifyCanonicalV20092IntegrationStorageIdentity(
-  target: DeployTarget,
+  selectedTarget: DeployTarget,
   productionD1: ProductionD1Identity,
   options: IntegrationStorageGenerationTargetVerificationOptions = {},
 ): Promise<CanonicalV20092IntegrationStorageIdentityProof> {
+  const target = snapshotStorageContext(selectedTarget);
   if (target.takoformV2?.storageLineage !== "v2-0088") {
     throw preflightError("canonical 0092 identity proof requires the original v2-0088 target");
   }
@@ -473,11 +483,12 @@ export async function verifyCanonicalV20092IntegrationStorageIdentity(
 }
 
 async function verifyGeneratedStorageTarget(
-  target: DeployTarget,
+  selectedTarget: DeployTarget,
   environment: DeployEnvironment,
   options: IntegrationStorageGenerationTargetVerificationOptions,
   lineage: "apply-0066" | IntegrationFreshLineage | "applied-v2-0092",
 ): Promise<IntegrationStorageGenerationTargetProof> {
+  const target = snapshotStorageContext(selectedTarget);
   const generated = generatedStorageTarget(target, environment);
   const providerContext = await resolveTargetReadProvider(target, environment, options);
   const d1 = await providerCall("preflight", "generated target D1 identity readback failed", () =>
@@ -625,6 +636,15 @@ interface StorageNames {
   readonly selectedByTarget: { readonly d1: boolean; readonly r2: boolean };
 }
 
+/** Own the complete input data before validation, callbacks or the first await. */
+function snapshotStorageContext<T>(context: T): T {
+  try {
+    return structuredClone(context);
+  } catch {
+    throw preflightError("integration storage requires cloneable invocation and target data");
+  }
+}
+
 interface GeneratedStorageTarget {
   readonly generation: string;
   readonly accountId: string;
@@ -645,7 +665,7 @@ function generatedStorageTarget(
   }
   const databaseName = target.d1.databaseName;
   const bucketName = target.r2.bucketName;
-  const generated = /^takoserver-i-([0-9a-f]{32})$/u.exec(databaseName);
+  const generated = /^(?:integration-takoserver-|takoserver-i-)([0-9a-f]{32})$/u.exec(databaseName);
   const stagingPair =
     generated === null &&
     target.takoformV2?.storageLineage !== undefined &&
@@ -736,8 +756,20 @@ function validateInvocation(
   if (!ACCOUNT_ID.test(target.accountId)) {
     throw preflightError("integration storage generation requires one exact account id");
   }
-  const databaseName = `takoserver-i-${invocation.generation}`;
-  const bucketName = `takoserver-i-${invocation.generation}`;
+  const legacyName = `takoserver-i-${invocation.generation}`;
+  const legacyD1 = target.d1.databaseName === legacyName;
+  const legacyR2 = target.r2.bucketName === legacyName;
+  if (legacyD1 || legacyR2) {
+    if (invocation.action === "apply") {
+      throw preflightError("legacy integration storage is read-only; create a new generation");
+    }
+    if (!legacyD1 || !legacyR2) {
+      throw preflightError("legacy integration status requires the exact matching pair");
+    }
+  }
+  const databaseName =
+    legacyD1 && legacyR2 ? legacyName : `integration-takoserver-${invocation.generation}`;
+  const bucketName = databaseName;
   if (!RESOURCE_NAME.test(databaseName) || !RESOURCE_NAME.test(bucketName)) {
     throw preflightError("integration storage generation derived an invalid provider name");
   }
@@ -755,6 +787,13 @@ function validateInvocation(
     );
   }
   return { databaseName, bucketName, selectedByTarget };
+}
+
+/** The generation writer alone enforces this; shared provider callers keep their own authority. */
+function assertFreshGenerationNames(names: StorageNames): void {
+  if (!FRESH_GENERATED_NAME.test(names.databaseName) || names.bucketName !== names.databaseName) {
+    throw preflightError("new integration storage requires one exact integration-prefixed pair");
+  }
 }
 
 async function statusStorageGeneration(
@@ -798,8 +837,8 @@ async function statusStorageGeneration(
       present: r2 !== null,
     },
     presence,
-    // Read-only correlation with the selected target. The target never
-    // selects, widens or adopts what this status reads.
+    // The selected target can retain an exact legacy pair for read-only
+    // diagnosis. It never widens or adopts either generation's inventory.
     targetSelection: {
       d1: names.selectedByTarget.d1,
       r2: names.selectedByTarget.r2,
@@ -1100,6 +1139,7 @@ async function applyStorageGeneration(
     const fenced = await readInventory(provider.provider, names, "preflight");
     assertAbsent(fenced, "immediate precreate integration storage absence fence");
     migrationSeal.assertUnchanged();
+    assertFreshGenerationNames(names);
 
     // Set this before entering the provider boundary: a lost acknowledgement
     // can mean Cloudflare created the database even when no identity returned.
@@ -1218,6 +1258,7 @@ async function applyStorageGeneration(
       );
     }
     sealed.assertUnchanged();
+    assertFreshGenerationNames(names);
     const createdBucket = await providerCall("mutation", "new R2 create failed; do not retry", () =>
       provider.provider.createR2(names.bucketName),
     );

@@ -23,7 +23,7 @@ import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.t
 const ORIGIN = "https://api.fresh-v2-d1.test";
 const BASE = `${ORIGIN}/apis/forms.takoform.com/v2`;
 const GENERATION = "a".repeat(32);
-const NAME = `takoserver-i-${GENERATION}`;
+const NAME = `integration-takoserver-${GENERATION}`;
 const DATABASE_ID = "00000000-0000-4000-8000-000000000075";
 const ORGANIZATION = "org-fresh-v2-d1";
 const TOKEN = "fresh-v2-d1-test-token";

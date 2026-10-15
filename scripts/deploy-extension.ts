@@ -162,6 +162,7 @@ export type {
 } from "./deploy/wrangler-state.ts";
 export {
   acquireWranglerVersionPublicationLease,
+  assertWranglerVersionPublicationLeaseCurrent,
   deployExistingWranglerVersion,
   deployWranglerLifecycleChange,
   inspectWranglerVersionPublicationLease,

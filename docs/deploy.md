@@ -21,6 +21,33 @@ reference alphabet (`A–Z`, `a–z`, `0–9`, `.`, `_`, `:`, `/`, `-`). Hosted
 supply parsers retain their existing lower-case grammar for Offerings; this
 bound does not tighten price-plan or other hosted reference fields.
 
+### Hosted TEST billing target configuration
+
+The optional, closed `hostedBilling` target object selects the existing canonical
+entry with `selector: "canonical-test"`, `stripeMode: "test"`, an explicit Stripe
+`accountId` (`acct_...`) and the stable `billingAuthority` matching that database's
+financial realm. This Stripe account is separate from the target's Cloudflare
+`accountId`. The target must also declare `billingConfig`, matching `hostedPricing`
+and `consoleOrigin`. Do not combine this selection with the legacy
+`stripeCheckout` or `stripeWebhook` flags. Both `STRIPE_SECRET_KEY` and
+`STRIPE_WEBHOOK_SECRET` are required secret names; their values never belong in
+the target descriptor. Explicit `stripeSettings` Checkout bounds must agree with
+the published pricing.
+
+`hostedBilling.onDemand` is optional. When selected, it requires exactly `terms`,
+`cardSetupReturnUrls: { successUrl, cancelUrl }` and `setupDisclosureRevision`, as
+defined in the [Hosted billing contract](hosted-billing-api-spec.md). Terms must
+explicitly supply the supported USD rule, quantum, minimum/maximum, cash-cap
+bounds, validity and expiry; return URLs must be HTTPS on the same origin and
+contain no credentials, fragment or secret/token query parameters. Omitting this
+object keeps on-demand off; it supplies no consent, cash cap or postpaid mode.
+
+Deploy preflight carries these non-secret inputs through the realized Worker
+configuration and supply/Form simulation. That simulation does not qualify D1,
+the Stripe account, native Prices or financial readiness. The actual entry still
+requires its existing read-only schema/realm/native TEST qualification. An absent
+`hostedBilling` selection preserves the existing deployment behavior.
+
 The production-shaped D1 lane is deliberately narrower. Rehearsal and
 production require exactly one approved next-wave selector, while integration
 may use the same selector for one bounded audited wave:
@@ -101,7 +128,7 @@ bun run deploy -- takoserver-integration-storage-generation --status --environme
 bun run deploy -- takoserver-integration-storage-generation --apply --environment=integration --commit=<40-hex-sha> --generation=<32-lowercase-hex>
 ```
 
-Both new resource names are `takoserver-i-<generation>`. The selected private
+Both new resource names are `integration-takoserver-<generation>`. The selected private
 target supplies the integration account; its existing database and bucket are
 never changed. Apply creates one new D1, proves it empty, applies the fixed
 audited 0001–0066 lineage and verifies its canonical schema, then creates the
@@ -113,6 +140,15 @@ generation is created. Status reads only the generated names and keeps working
 after the target is pointed at the new pair: it reports `targetSelection`
 (`d1`, `r2`, and `databaseIdExact` against the read-back UUID) and then
 `readyForApply: false`.
+
+A target selecting the exact historical `takoserver-i-<generation>` D1/R2
+pair retains read-only status and schema-proof compatibility. With that same
+generation, apply refuses before credentials or provider access; a partial or
+mixed legacy pair also refuses status. Status never falls back between old and
+new names. To create fresh storage, select a different generation: only the new
+`integration-takoserver-` names can pass either creation fence. This changes no
+migration profile or existing storage. The separate disposal surface retains
+its existing target restrictions; it does not gain new deletion authority.
 
 For a **new, empty integration generation only**, the same sole writer has one
 fixed v2 artifact payload. The selector is required on both the diagnostic
@@ -166,7 +202,7 @@ payload alone cannot serve the current Worker. It behaves like `v2-0091` in
 every other generation respect:
 
 - Production fresh init refuses it.
-- It only creates a new `takoserver-i-<generation>` D1.
+- It only creates a new `integration-takoserver-<generation>` D1.
 - Applying it requires `TAKOSERVER_DEPLOY_TARGET_PRODUCTION`.
 - The data proof reads 92 ledger rows plus the same two seeds. 0090 to 0092
   write no rows.
@@ -199,7 +235,7 @@ either profile. For `v2-0092`, read it with these substitutions:
 - The separate reviewed integration-only 0088→0092 wave does not reinterpret
   this fresh 0091 payload or make it available to production.
 - Like every lineage on this surface, it only ever creates a new
-  `takoserver-i-<generation>` D1. It cannot reach an existing database.
+  `integration-takoserver-<generation>` D1. It cannot reach an existing database.
 
 It was introduced before a qualified canonical 0092 wave existed. The canonical
 integration D1 remains at 0001–0088 until the separate owner dependency proofs
@@ -208,7 +244,7 @@ the 0092 marker alone cannot make those owners accept a changed D1.
 
 Two guards refuse a production D1:
 
-- **Naming.** A generated name must match `takoserver-i-<32 hex>` and is
+- **Naming.** A newly created name must match `integration-takoserver-<32 hex>` and is
   never `takoserver-runtime…`.
 - **Identity.** `TAKOSERVER_DEPLOY_TARGET_PRODUCTION` is read only for its
   D1 identity. The exact production D1 name and id are refused before
@@ -244,7 +280,7 @@ TAKOSERVER_DEPLOY_TARGET_PRODUCTION="$PRODUCTION_TARGET" bun run deploy -- takos
 
 Proceed only when all of these hold:
 
-- `d1.databaseName` is `takoserver-i-$GEN`.
+- `d1.databaseName` is `integration-takoserver-$GEN`.
 - `presence` is `absent` and `readyForApply` is `true`.
 - `productionD1Guard.compared` is `naming-and-production-target`.
 - Its production name and id are the production D1, and differ from the
@@ -565,7 +601,8 @@ changes use their existing lifecycle surfaces.
 
 An explicitly selected `takoformV2` integration target follows this **same**
 first-publication writer, not a second Host uploader. Its D1/R2 must be the
-exact generated `takoserver-i-<generation>` pair with the complete fixed
+exact generated `integration-takoserver-<generation>` pair (or an existing
+historical `takoserver-i-<generation>` pair) with the complete fixed
 migration ledger selected by `takoformV2.storageLineage` (0001–0075 when absent,
 0001–0088 or 0001–0089 when set) and every application schema object. That proof is
 read before upload, at the immediate upload fence, and after the acknowledged
@@ -749,7 +786,8 @@ These flags name only the predecessor's old `STATE_DB` UUID and `OBJECTS`
 bucket name. Both must be strict lowercase identities and differ from the
 successor. The successor is never a CLI operand: it comes only from the selected
 target, whose D1 and R2 names must be the same exact
-`takoserver-i-<32-lowercase-hex>` generation name. An operator-provisioned
+`integration-takoserver-<32-lowercase-hex>` generation name (or an existing
+historical `takoserver-i-<32-lowercase-hex>` pair). An operator-provisioned
 `takoserver-staging-<label>` pair is refused here: it has no creation record
 proving it empty, so it enters service only through first publication. A
 read-only fence verifies the D1 UUID-to-name mapping, R2 existence, the exact

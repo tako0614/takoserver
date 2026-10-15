@@ -54,6 +54,22 @@ const BILLING_REFERENCE_SCHEMA = {
   description:
     "Opaque, non-reusable Organization billing reference; URL-encode it as one path component.",
 } as const;
+const BILLING_REVISION_SCHEMA = {
+  type: "string",
+  minLength: 1,
+  maxLength: 128,
+  pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+  description: "Published immutable billing terms or disclosure revision.",
+} as const;
+const PAYMENT_METHOD_ID_SCHEMA = {
+  type: "string",
+  pattern: "^pm_[A-Za-z0-9_]{1,240}$",
+} as const;
+const SETUP_INTENT_ID_SCHEMA = {
+  type: "string",
+  pattern: "^seti_[A-Za-z0-9_]{1,240}$",
+} as const;
+const CASH_CAP_MINOR_SCHEMA = { type: "integer", minimum: 1, maximum: 900719925474 } as const;
 const SUBSCRIPTION_REF_SCHEMA = {
   type: "string",
   minLength: 68,
@@ -356,9 +372,30 @@ const HOSTED_BILLING_SCHEMAS = {
         required: ["reference", "onLimit", "cashCapMinor", "consentRevision"],
         properties: {
           reference: BILLING_REFERENCE_SCHEMA,
-          onLimit: { type: "string", enum: ["on-demand", "postpaid"] },
+          onLimit: { const: "postpaid" },
           cashCapMinor: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
           consentRevision: { type: "string", minLength: 1, maxLength: 512 },
+        },
+      },
+      {
+        type: "object",
+        additionalProperties: false,
+        required: [
+          "reference",
+          "onLimit",
+          "cashCapMinor",
+          "consentRevision",
+          "termsRevision",
+          "paymentMethodId",
+        ],
+        properties: {
+          reference: BILLING_REFERENCE_SCHEMA,
+          onLimit: { const: "on-demand" },
+          cashCapMinor: CASH_CAP_MINOR_SCHEMA,
+          consentRevision: BILLING_REVISION_SCHEMA,
+          termsRevision: BILLING_REVISION_SCHEMA,
+          paymentMethodId: PAYMENT_METHOD_ID_SCHEMA,
+          setupIntentId: SETUP_INTENT_ID_SCHEMA,
         },
       },
     ],
@@ -384,7 +421,7 @@ const HOSTED_BILLING_SCHEMAS = {
           stop: { const: true },
           prepaid: { const: true },
           postpaid: { const: false },
-          "on-demand": { const: false },
+          "on-demand": { type: "boolean" },
         },
       },
       consentRevision: {
@@ -399,6 +436,160 @@ const HOSTED_BILLING_SCHEMAS = {
       periodStart: { $ref: "#/components/schemas/BillingUtcDateTime" },
       periodEnd: { $ref: "#/components/schemas/BillingUtcDateTime" },
     },
+  },
+  WalletOnDemandTerms: {
+    type: "object",
+    additionalProperties: false,
+    required: [
+      "termsRevision",
+      "consentRevision",
+      "currency",
+      "validity",
+      "replenishment",
+      "cashCapBounds",
+      "purchaseCreditExpiry",
+    ],
+    properties: {
+      termsRevision: BILLING_REVISION_SCHEMA,
+      consentRevision: BILLING_REVISION_SCHEMA,
+      currency: { const: "USD" },
+      validity: {
+        type: "object",
+        additionalProperties: false,
+        required: ["validFrom", "validUntil"],
+        properties: {
+          validFrom: { $ref: "#/components/schemas/BillingUtcDateTime" },
+          validUntil: { $ref: "#/components/schemas/BillingUtcDateTime" },
+        },
+      },
+      replenishment: {
+        type: "object",
+        additionalProperties: false,
+        required: [
+          "trigger",
+          "rule",
+          "fundingQuantumMinor",
+          "minimumChargeMinor",
+          "maximumChargeMinor",
+        ],
+        properties: {
+          trigger: { const: "eligible-credit-deficit" },
+          rule: { const: "ceil-deficit-to-quantum-with-minimum" },
+          fundingQuantumMinor: { type: "integer", minimum: 1, maximum: 99999999 },
+          minimumChargeMinor: { type: "integer", minimum: 50, maximum: 99999999 },
+          maximumChargeMinor: { type: "integer", minimum: 50, maximum: 99999999 },
+        },
+      },
+      cashCapBounds: {
+        type: "object",
+        additionalProperties: false,
+        required: ["minimumMinor", "maximumMinor"],
+        properties: {
+          minimumMinor: CASH_CAP_MINOR_SCHEMA,
+          maximumMinor: CASH_CAP_MINOR_SCHEMA,
+        },
+      },
+      purchaseCreditExpiry: {
+        oneOf: [
+          {
+            type: "object",
+            additionalProperties: false,
+            required: ["kind"],
+            properties: { kind: { const: "none" } },
+          },
+          {
+            type: "object",
+            additionalProperties: false,
+            required: ["kind", "seconds"],
+            properties: {
+              kind: { const: "fixed-duration" },
+              seconds: { type: "integer", minimum: 1, maximum: 253402300799 },
+            },
+          },
+        ],
+      },
+    },
+  },
+  WalletOnDemandTermsResponse: {
+    type: "object",
+    additionalProperties: false,
+    required: ["terms", "setupDisclosureRevision"],
+    properties: {
+      terms: { $ref: "#/components/schemas/WalletOnDemandTerms" },
+      setupDisclosureRevision: BILLING_REVISION_SCHEMA,
+    },
+  },
+  BeginWalletCardSetupRequest: {
+    type: "object",
+    additionalProperties: false,
+    required: ["reference", "setupDisclosureRevision"],
+    properties: {
+      reference: BILLING_REFERENCE_SCHEMA,
+      setupDisclosureRevision: BILLING_REVISION_SCHEMA,
+    },
+  },
+  WalletCardSetupReceipt: {
+    type: "object",
+    additionalProperties: false,
+    required: ["reference", "state", "setupDisclosureRevision", "sessionExpired", "observedAt"],
+    properties: {
+      reference: BILLING_REFERENCE_SCHEMA,
+      state: {
+        enum: [
+          "awaiting-customer",
+          "prepared",
+          "pending",
+          "original-known",
+          "succeeded",
+          "canceled",
+          "abandoned",
+        ],
+      },
+      setupDisclosureRevision: BILLING_REVISION_SCHEMA,
+      sessionExpired: { type: "boolean" },
+      observedAt: {
+        anyOf: [{ $ref: "#/components/schemas/BillingUtcDateTime" }, { type: "null" }],
+      },
+    },
+  },
+  BeginWalletCardSetupResponse: {
+    type: "object",
+    additionalProperties: false,
+    required: ["receipt", "checkout", "selection"],
+    properties: {
+      receipt: { $ref: "#/components/schemas/WalletCardSetupReceipt" },
+      checkout: {
+        anyOf: [
+          {
+            type: "object",
+            additionalProperties: false,
+            required: ["url"],
+            properties: { url: { type: "string", format: "uri" } },
+          },
+          { type: "null" },
+        ],
+      },
+      selection: {
+        anyOf: [
+          {
+            type: "object",
+            additionalProperties: false,
+            required: ["paymentMethodId", "setupIntentId"],
+            properties: {
+              paymentMethodId: PAYMENT_METHOD_ID_SCHEMA,
+              setupIntentId: SETUP_INTENT_ID_SCHEMA,
+            },
+          },
+          { type: "null" },
+        ],
+      },
+    },
+  },
+  WalletCardSetupResponse: {
+    type: "object",
+    additionalProperties: false,
+    required: ["cardSetup"],
+    properties: { cardSetup: { $ref: "#/components/schemas/WalletCardSetupReceipt" } },
   },
   SubscriptionPendingChange: PENDING_CHANGE_SCHEMA,
   SubscriptionPlanChangeRequest: {
@@ -1071,7 +1262,7 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
     "x-required-scopes": ["wallet:read"],
     parameters: [ORGANIZATION_ID_PARAMETER],
     description:
-      "Default stop. Capability flags describe execution support, independently of the four-value policy vocabulary. On-demand and postpaid remain unavailable until separately qualified. Period fields identify the UTC cash-cap month, not the included grant's invoice period.",
+      "Default stop. On-demand execution requires the qualified financial composition and explicit Organization consent. Postpaid remains disabled pending its launch decision. Period fields identify the UTC cash-cap month, not the included grant's invoice period.",
     responses: {
       "200": billingResponse(
         "Current limit mode, capability flags and frozen consent terms",
@@ -1084,11 +1275,63 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
       "503": errorResponse("Durable policy schema or state is unavailable"),
     },
   }),
+  readWalletOnDemandTerms: described("Read explicit on-demand spending terms", {
+    "x-required-scopes": ["wallet:read"],
+    parameters: [ORGANIZATION_ID_PARAMETER],
+    description:
+      "Read-only terms for explicit cash consent. Positive eligible deficits round up once to a funding quantum and then to the published minimum; zero deficit never charges. The published maximum is a single-charge bound, not an automatic charge loop. The caller must choose a monthly cash cap within the published bounds. Funding credits have face value and any duration expiry starts at first verified funding. Reading terms creates no consent or payment.",
+    responses: {
+      "200": billingResponse(
+        "Published terms and card setup disclosure revision",
+        "WalletOnDemandTermsResponse",
+      ),
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("Wrong Organization or wallet:read scope"),
+      "404": errorResponse("Qualified on-demand composition is absent"),
+      "503": errorResponse("Financial terms or schema are unavailable"),
+    },
+  }),
+  beginWalletCardSetup: described("Begin or resume the original card registration", {
+    "x-required-scopes": ["payments:write"],
+    parameters: [ORGANIZATION_ID_PARAMETER],
+    description:
+      "Registers a card through hosted Checkout setup mode without buying credit or a plan. The server binds the original Organization, payment principal, reference, disclosure and customer. New commands must acknowledge the current setup disclosure; exact retries retain the original disclosure and command. Only this payments:write operation may return a transient Checkout action URL. After setup succeeds, replay it to obtain the paymentMethodId and setupIntentId for a separate explicit limit-policy consent. Setup success grants neither cash consent nor wallet credit. Unknown acknowledgements recover the original with reads; absence or session expiry never authorizes another create.",
+    requestBody: billingRequest("BeginWalletCardSetupRequest"),
+    responses: {
+      "200": billingResponse(
+        "Original receipt, transient action or verified card selection",
+        "BeginWalletCardSetupResponse",
+      ),
+      "400": errorResponse("Invalid fields, reference or disclosure revision"),
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("Wrong Organization or payments:write scope"),
+      "404": errorResponse("Card setup composition is absent"),
+      "409": errorResponse("Reference, principal, disclosure or original native binding conflicts"),
+      "503": errorResponse("Original effect requires recovery or the processor is unavailable"),
+    },
+  }),
+  readWalletCardSetup: described("Read a local card setup receipt", {
+    "x-required-scopes": ["wallet:read"],
+    parameters: [
+      ORGANIZATION_ID_PARAMETER,
+      { name: "reference", in: "path", required: true, schema: BILLING_REFERENCE_SCHEMA },
+    ],
+    description:
+      "SQL-only read of the original setup receipt. It returns no Checkout action URL, native card selection, card details or client secret and performs no processor recovery. Session expiry is recorded separately from the native SetupIntent outcome.",
+    responses: {
+      "200": billingResponse("Safe local setup receipt", "WalletCardSetupResponse"),
+      "400": errorResponse("Invalid reference"),
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("Wrong Organization or wallet:read scope"),
+      "404": errorResponse("Original receipt or card setup composition is absent"),
+      "503": errorResponse("Durable original receipt is unavailable"),
+    },
+  }),
   changeWalletLimitPolicy: described("Record explicit Organization spending consent", {
     "x-required-scopes": ["payments:write"],
     parameters: [ORGANIZATION_ID_PARAMETER],
     description:
-      "Stop/prepaid accepts reference and onLimit only. The prepaid command records consent to spend already-purchased credit without authorizing a new charge. On-demand/postpaid additionally require a cash cap and acknowledged consent revision, but currently return 409 without persisting an active mode. Exact retries return the original command response; the authenticated payment principal is recorded server-side.",
+      "Stop/prepaid accepts reference and onLimit only. Prepaid authorizes spending purchased credit without a new charge. On-demand requires explicit published terms and consent revisions, a user-chosen monthly cash cap, and a selected attached card. An optional SetupIntent is verified when supplied; an existing saved card needs no new setup. Exact retries return the original command response before current terms or card checks, while changed input or principal conflicts. Stop withdraws fresh-charge consent atomically with never-dispatched abandonment; a dispatched unknown effect remains reserved for original recovery. Postpaid remains unavailable. The authenticated payment principal is recorded server-side.",
     requestBody: billingRequest("ChangeWalletLimitPolicyRequest"),
     responses: {
       "200": billingResponse(

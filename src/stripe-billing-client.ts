@@ -13,30 +13,86 @@ export interface StripeBillingPage {
   readonly hasMore: boolean;
 }
 
-export type StripeBillingGetKind =
-  | "invoices"
-  | "subscriptions"
-  | "charges"
-  | "refunds"
-  | "prices"
-  | "customers"
-  | "events"
-  | "subscription_schedules"
-  | "checkout/sessions";
+const GET_KINDS = [
+  "invoices",
+  "subscriptions",
+  "charges",
+  "refunds",
+  "prices",
+  "customers",
+  "events",
+  "subscription_schedules",
+  "checkout/sessions",
+  "payment_intents",
+  "payment_methods",
+  "setup_intents",
+] as const;
+const LIST_KINDS = [
+  "customers",
+  "invoices",
+  "subscriptions",
+  "refunds",
+  "events",
+  "checkout/sessions",
+  "payment_intents",
+  "payment_methods",
+  "setup_intents",
+] as const;
+const POST_KINDS = [
+  "customers",
+  "checkout/sessions",
+  "subscriptions",
+  "subscription_schedules",
+  "payment_intents",
+] as const;
 
-export type StripeBillingListKind =
-  | "customers"
-  | "invoices"
-  | "subscriptions"
-  | "refunds"
-  | "events"
-  | "checkout/sessions";
+export type StripeBillingGetKind = (typeof GET_KINDS)[number];
+export type StripeBillingListKind = (typeof LIST_KINDS)[number];
+export type StripeBillingPostKind = (typeof POST_KINDS)[number];
 
-export type StripeBillingPostKind =
-  | "customers"
-  | "checkout/sessions"
-  | "subscriptions"
-  | "subscription_schedules";
+export type StripeBillingGetOptions<Kind extends StripeBillingGetKind> = {
+  readonly expand?: Kind extends "payment_intents"
+    ? readonly ["latest_charge"]
+    : Kind extends "payment_methods" | "setup_intents"
+      ? never
+      : readonly ["payment_intent.latest_charge"];
+};
+
+interface ListPageInput {
+  readonly startingAfter?: string;
+  readonly limit?: number;
+}
+interface LegacyListInput extends ListPageInput {
+  readonly charge?: string;
+  readonly paymentIntent?: string;
+  readonly customer?: string;
+  readonly subscription?: string;
+  readonly createdGte?: number;
+  readonly status?: "open" | "complete" | "expired";
+}
+export type StripeBillingListInput<Kind extends StripeBillingListKind> =
+  Kind extends "payment_methods"
+    ? ListPageInput & { readonly customer: string; readonly type: "card" }
+    : Kind extends "payment_intents" | "setup_intents"
+      ? ListPageInput & {
+          readonly customer: string;
+          readonly createdGte?: number;
+          readonly createdLte?: number;
+        }
+      : Kind extends "customers" | "checkout/sessions"
+        ? LegacyListInput & { readonly createdLte?: number }
+        : LegacyListInput;
+
+interface PostFormInput {
+  readonly form: Readonly<Record<string, string>>;
+  readonly idempotencyKey: string;
+}
+export type StripeBillingPostInput<Kind extends StripeBillingPostKind> = PostFormInput &
+  (Kind extends "payment_intents"
+    ?
+        | { readonly id?: never; readonly action?: never }
+        | { readonly id: string; readonly action: "cancel" }
+    : { readonly id?: string; readonly action?: "release" });
 
 export type StripeBillingClientErrorCode =
   | "invalid_configuration"
@@ -65,34 +121,21 @@ export interface StripeBillingClient {
   authenticAccount?(): Promise<StripeBillingObject>;
   /** Mode evidence for this same authenticated account; no money mutation. */
   authenticBalance?(): Promise<Readonly<Record<string, unknown>>>;
-  get(
-    kind: StripeBillingGetKind,
+  get<Kind extends StripeBillingGetKind>(
+    kind: Kind,
     id: string,
-    options?: { readonly expand?: readonly ["payment_intent.latest_charge"] },
+    options?: StripeBillingGetOptions<NoInfer<Kind>>,
   ): Promise<StripeBillingObject | null>;
-  list(
-    kind: StripeBillingListKind,
-    input: {
-      readonly startingAfter?: string;
-      readonly charge?: string;
-      readonly paymentIntent?: string;
-      readonly customer?: string;
-      readonly subscription?: string;
-      readonly createdGte?: number;
-      readonly status?: "open" | "complete" | "expired";
-      readonly limit?: number;
-    },
+  /** One bounded page. Empty data is not proof that an uncertain effect did not occur. */
+  list<Kind extends StripeBillingListKind>(
+    kind: Kind,
+    input: StripeBillingListInput<NoInfer<Kind>>,
   ): Promise<StripeBillingPage>;
   /** Complete only when hasMore is false; callers must reject extra lines. */
   sessionLineItems?(sessionId: string): Promise<StripeBillingPage>;
-  post(
-    kind: StripeBillingPostKind,
-    input: {
-      readonly id?: string;
-      readonly action?: "release";
-      readonly form: Readonly<Record<string, string>>;
-      readonly idempotencyKey: string;
-    },
+  post<Kind extends StripeBillingPostKind>(
+    kind: Kind,
+    input: StripeBillingPostInput<NoInfer<Kind>>,
   ): Promise<StripeBillingObject>;
 }
 
@@ -114,6 +157,8 @@ const ID_PREFIXES: Readonly<Record<string, string>> = {
   events: "evt_",
   accounts: "acct_",
   payment_intents: "pi_",
+  payment_methods: "pm_",
+  setup_intents: "seti_",
 };
 
 function invalidObject(): never {
@@ -134,7 +179,12 @@ function validateId(kind: string, id: string): void {
   }
 }
 
-function asObject(value: unknown, kind: string, mode: StripeMode): StripeBillingObject {
+function asObject(
+  value: unknown,
+  kind: string,
+  mode: StripeMode,
+  exactResourceType = false,
+): StripeBillingObject {
   if (
     typeof value !== "object" ||
     value === null ||
@@ -144,6 +194,16 @@ function asObject(value: unknown, kind: string, mode: StripeMode): StripeBilling
     return invalidObject();
   }
   const object = value as StripeBillingObject;
+  const expectedObject =
+    kind === "payment_intents"
+      ? "payment_intent"
+      : kind === "payment_methods"
+        ? "payment_method"
+        : kind === "setup_intents"
+          ? "setup_intent"
+          : undefined;
+  if (exactResourceType && expectedObject !== undefined && object.object !== expectedObject)
+    return invalidObject();
   const expectedLivemode = mode === "live";
   if (object.livemode !== undefined && typeof object.livemode !== "boolean") {
     return invalidObject();
@@ -163,6 +223,14 @@ function asObject(value: unknown, kind: string, mode: StripeMode): StripeBilling
     if (typeof intent.latest_charge === "object" && intent.latest_charge !== null) {
       asObject(intent.latest_charge, "charges", mode);
     }
+  }
+  if (
+    kind === "payment_intents" &&
+    typeof object.latest_charge === "object" &&
+    object.latest_charge !== null
+  ) {
+    const charge = asObject(object.latest_charge, "charges", mode);
+    validateId("charges", charge.id);
   }
   if (kind === "events") {
     const eventData = object.data;
@@ -224,9 +292,9 @@ async function readLimited(response: Response): Promise<Uint8Array> {
 }
 
 async function parseResponse(response: Response): Promise<unknown> {
-  const bytes = await readLimited(response);
-  if (!response.ok) throw new StripeBillingClientError("unavailable");
   try {
+    const bytes = await readLimited(response);
+    if (!response.ok) throw new StripeBillingClientError("unavailable");
     return JSON.parse(
       new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes),
     ) as unknown;
@@ -327,12 +395,25 @@ export function createStripeBillingClient(
         return invalidObject();
       return balance;
     },
-    async get(kind, id, options = {}) {
+    async get(
+      kind: StripeBillingGetKind,
+      id: string,
+      options: { readonly expand?: readonly string[] } = {},
+    ) {
+      if (!GET_KINDS.includes(kind)) return invalidObject();
       validateId(kind, id);
-      const expand = options.expand ?? [];
+      if (Object.keys(record(options)).some((key) => key !== "expand")) return invalidObject();
+      const expand = options.expand === undefined ? [] : options.expand;
       if (
-        (expand.length > 0 && kind !== "checkout/sessions") ||
-        expand.some((item) => item !== "payment_intent.latest_charge")
+        !Array.isArray(expand) ||
+        expand.length > 1 ||
+        Array.from(expand).some(
+          (item) =>
+            !(
+              (kind === "checkout/sessions" && item === "payment_intent.latest_charge") ||
+              (kind === "payment_intents" && item === "latest_charge")
+            ),
+        )
       ) {
         return invalidObject();
       }
@@ -344,13 +425,31 @@ export function createStripeBillingClient(
         notFoundIsNull: true,
       });
       if (result === null) return null;
-      const object = asObject(result, kind, mode);
+      const object = asObject(result, kind, mode, true);
       if (object.id !== id) return invalidObject();
       return object;
     },
 
-    async list(kind, input) {
-      const limit = input.limit ?? DEFAULT_PAGE_SIZE;
+    async list(
+      kind: StripeBillingListKind,
+      input: LegacyListInput & { readonly createdLte?: number; readonly type?: "card" },
+    ) {
+      if (!LIST_KINDS.includes(kind)) return invalidObject();
+      const keys = Object.keys(record(input));
+      const scoped =
+        kind === "payment_intents" || kind === "payment_methods" || kind === "setup_intents";
+      if (scoped) {
+        const allowed = ["startingAfter", "limit", "customer"];
+        allowed.push(...(kind === "payment_methods" ? ["type"] : ["createdGte", "createdLte"]));
+        if (keys.some((key) => !allowed.includes(key))) return invalidObject();
+        validateId("customers", input.customer as string);
+      }
+      if (
+        (kind === "payment_methods" && input.type !== "card") ||
+        (kind !== "payment_methods" && keys.includes("type"))
+      )
+        return invalidObject();
+      const limit = input.limit === undefined ? DEFAULT_PAGE_SIZE : input.limit;
       if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_PAGE_SIZE)
         return invalidObject();
       if (input.startingAfter !== undefined) validateId(kind, input.startingAfter);
@@ -358,12 +457,22 @@ export function createStripeBillingClient(
       if (input.paymentIntent !== undefined) validateId("payment_intents", input.paymentIntent);
       if (input.customer !== undefined) validateId("customers", input.customer);
       if (input.subscription !== undefined) validateId("subscriptions", input.subscription);
+      const createdRange = ["checkout/sessions", "customers", "payment_intents", "setup_intents"];
+      if (keys.includes("createdLte") && !createdRange.includes(kind)) return invalidObject();
+      for (const time of [input.createdGte, input.createdLte]) {
+        if (
+          time !== undefined &&
+          (!Number.isSafeInteger(time) ||
+            time < 0 ||
+            time > 253402300799 ||
+            !createdRange.includes(kind))
+        )
+          return invalidObject();
+      }
       if (
         input.createdGte !== undefined &&
-        (!Number.isSafeInteger(input.createdGte) ||
-          input.createdGte < 0 ||
-          input.createdGte > 253402300799 ||
-          !["checkout/sessions", "customers"].includes(kind))
+        input.createdLte !== undefined &&
+        input.createdGte > input.createdLte
       )
         return invalidObject();
       if (
@@ -376,12 +485,19 @@ export function createStripeBillingClient(
       if (input.startingAfter !== undefined) query.set("starting_after", input.startingAfter);
       if (input.charge !== undefined) query.set("charge", input.charge);
       if (input.paymentIntent !== undefined) query.set("payment_intent", input.paymentIntent);
-      if (input.customer !== undefined) query.set("customer", input.customer);
+      if (input.customer !== undefined && kind !== "payment_methods")
+        query.set("customer", input.customer);
       if (input.subscription !== undefined) query.set("subscription", input.subscription);
       if (input.createdGte !== undefined) query.set("created[gte]", String(input.createdGte));
+      if (input.createdLte !== undefined) query.set("created[lte]", String(input.createdLte));
       if (input.status !== undefined) query.set("status", input.status);
+      if (input.type !== undefined) query.set("type", input.type);
 
-      const raw = record(await request("GET", `/${kind}?${query.toString()}`));
+      const path =
+        kind === "payment_methods"
+          ? `/customers/${encodeURIComponent(input.customer as string)}/payment_methods`
+          : `/${kind}`;
+      const raw = record(await request("GET", `${path}?${query.toString()}`));
       if (
         !Array.isArray(raw.data) ||
         raw.data.length > limit ||
@@ -391,8 +507,10 @@ export function createStripeBillingClient(
         return invalidObject();
       }
       const data = raw.data.map((item) => {
-        const object = asObject(item, kind, mode);
+        const object = asObject(item, kind, mode, true);
         validateId(kind, object.id);
+        if (scoped && object.customer !== input.customer) return invalidObject();
+        if (kind === "payment_methods" && object.type !== "card") return invalidObject();
         return object;
       });
       return { data, hasMore: raw.has_more };
@@ -424,7 +542,12 @@ export function createStripeBillingClient(
       });
       return { data, hasMore: raw.has_more };
     },
-    async post(kind, input) {
+    async post(
+      kind: StripeBillingPostKind,
+      input: PostFormInput & { readonly id?: string; readonly action?: "release" | "cancel" },
+    ) {
+      if (!POST_KINDS.includes(kind)) return invalidObject();
+      record(input);
       if (
         typeof input.idempotencyKey !== "string" ||
         input.idempotencyKey.length === 0 ||
@@ -435,8 +558,14 @@ export function createStripeBillingClient(
       if (input.id !== undefined) validateId(kind, input.id);
       if (
         input.action !== undefined &&
-        (input.action !== "release" || kind !== "subscription_schedules" || input.id === undefined)
+        !(
+          input.id !== undefined &&
+          ((kind === "subscription_schedules" && input.action === "release") ||
+            (kind === "payment_intents" && input.action === "cancel"))
+        )
       )
+        return invalidObject();
+      if (kind === "payment_intents" && input.id !== undefined && input.action !== "cancel")
         return invalidObject();
       const object = asObject(
         await request(
@@ -449,6 +578,7 @@ export function createStripeBillingClient(
         ),
         kind,
         mode,
+        true,
       );
       validateId(kind, object.id);
       if (input.id !== undefined && object.id !== input.id) return invalidObject();

@@ -1,4 +1,8 @@
-import { hostedCreditLotProvenanceSql } from "./ledger.ts";
+import {
+  hostedCreditLotProvenanceSql,
+  type LedgerRefundSource,
+  stripeRefundSource,
+} from "./ledger.ts";
 import type { Row, Sql, SqlStatement } from "./ports.ts";
 
 export interface OrgUsageSummary {
@@ -48,20 +52,24 @@ function canonicalTime(value: unknown): string {
 
 /**
  * One SQLite/D1 read snapshot chooses the current entitlement and its own lot.
- * The Hosted variant alone mentions migration 0095, so legacy self-hosted
- * wallets never resolve a table they may not have.
+ * The runtime selects a qualified refund projection before building this read;
+ * legacy self-hosted wallets omit refund tables when they are absent.
  */
 export interface OrgUsageSummaryReadInput {
   readonly organizationId: string;
   readonly instant: string;
   readonly hostedPaidFreeExclusion: boolean;
   readonly hostedCreditProvenance?: boolean;
+  /** Qualified read source selected by the async runtime; omission preserves legacy pure callers. */
+  readonly refundSource?: LedgerRefundSource | null;
 }
 
 export async function readOrgUsageSummary(
   input: OrgUsageSummaryReadInput & { readonly sql: Sql },
 ): Promise<OrgUsageSummary> {
-  const statement = orgUsageSummaryReadStatement(input);
+  const refundSource =
+    input.refundSource === undefined ? await stripeRefundSource(input.sql) : input.refundSource;
+  const statement = orgUsageSummaryReadStatement({ ...input, refundSource });
   return parseOrgUsageSummaryRows(await input.sql.query(statement.sql, statement.params), input);
 }
 
@@ -69,6 +77,13 @@ export async function readOrgUsageSummary(
 export function orgUsageSummaryReadStatement(input: OrgUsageSummaryReadInput): SqlStatement {
   const { organizationId: org, instant, hostedPaidFreeExclusion: hosted } = input;
   canonicalTime(instant);
+  const refundSource =
+    input.refundSource === undefined
+      ? hosted
+        ? "stripe_billing_refunds"
+        : null
+      : input.refundSource;
+  if (hosted && refundSource === null) return unavailable();
   const month = instant.slice(0, 7);
   const freeRef = `free:${org}:${month}`;
   const provenance =
@@ -77,12 +92,12 @@ export function orgUsageSummaryReadStatement(input: OrgUsageSummaryReadInput): S
     ? `SELECT g.funding_ref, g.kind, g.consumption_class, g.amount_micros,
               g.period_start, g.period_end,
               COALESCE((SELECT MAX(r.target_revoked_micros)
-                FROM stripe_billing_refunds r
+                FROM ${refundSource} r
                 WHERE r.org_id = g.org_id AND r.funding_ref = g.funding_ref), 0) AS revoked_micros
        FROM stripe_billing_grants g
        WHERE g.org_id = ? AND g.source_type = 'invoice'
          AND g.period_start <= ? AND g.period_end > ?
-         AND NOT EXISTS (SELECT 1 FROM stripe_billing_refunds r
+         AND NOT EXISTS (SELECT 1 FROM ${refundSource} r
            WHERE r.org_id = g.org_id AND r.funding_ref = g.funding_ref
              AND r.cumulative_refunded_micros >= g.consideration_micros)`
     : `SELECT NULL AS funding_ref, NULL AS kind, NULL AS consumption_class,
@@ -96,14 +111,16 @@ export function orgUsageSummaryReadStatement(input: OrgUsageSummaryReadInput): S
                WHERE g.org_id = f.org_id AND g.funding_ref = f.funding_ref
                  AND g.source_type = 'invoice')))`
     : "0";
-  const refundDebit = hosted
-    ? `COALESCE((SELECT SUM(r.debit_micros + r.expired_micros)
-       FROM stripe_billing_refunds r WHERE r.org_id = l.org_id AND r.funding_ref = l.ref), 0)`
-    : "0";
-  const additionalFence = hosted
-    ? `AND NOT EXISTS (SELECT 1 FROM stripe_billing_fences f
+  const refundDebit =
+    refundSource !== null
+      ? `COALESCE((SELECT SUM(r.debit_micros + r.expired_micros)
+       FROM ${refundSource} r WHERE r.org_id = l.org_id AND r.funding_ref = l.ref), 0)`
+      : "0";
+  const additionalFence =
+    refundSource !== null
+      ? `AND NOT EXISTS (SELECT 1 FROM stripe_billing_fences f
        WHERE f.org_id = l.org_id AND f.funding_ref = l.ref AND f.active = 1)`
-    : "";
+      : "";
   const paidFreeExclusion = hosted
     ? "AND (l.consumption_class <> 'free' OR NOT EXISTS (SELECT 1 FROM paid))"
     : "";

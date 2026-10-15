@@ -1,5 +1,6 @@
 import {
   formatMicrosCurrency,
+  formatUsagePercent,
   type HostedSubscriptionProjection,
   type LedgerEntry,
   type OrganizationSubscription,
@@ -47,7 +48,16 @@ import {
  */
 export function billingPage(organizationId: string): Child {
   const wallet = resource(() => api.wallet(organizationId));
+  const usageSummary = resource(() => api.usageSummary(organizationId));
   const hostedSubscription = resource(() => api.subscription(organizationId));
+  const reloadWallet = () => {
+    wallet.reload();
+    usageSummary.reload();
+  };
+  const reloadSubscription = () => {
+    hostedSubscription.reload();
+    reloadWallet();
+  };
   const ownerCanManage = () => {
     const who = principal();
     const organization = currentOrganization();
@@ -86,7 +96,7 @@ export function billingPage(organizationId: string): Child {
       replaceLocation: (url) => window.history.replaceState({}, "", url),
       assign: (url) => window.location.assign(url),
     },
-    onSubscriptionRefresh: hostedSubscription.reload,
+    onSubscriptionRefresh: reloadSubscription,
   });
   const cancellationIntents = createSubscriptionCancelIntentStore({
     storage: {
@@ -127,7 +137,7 @@ export function billingPage(organizationId: string): Child {
       },
       intents: cancellationIntents,
       api,
-      onRefresh: hostedSubscription.reload,
+      onRefresh: reloadSubscription,
     });
     cancellationController = { subscriptionRef, controller };
     return controller;
@@ -137,7 +147,7 @@ export function billingPage(organizationId: string): Child {
   // before anything renders, so the balance a person sees already includes
   // what they just paid — otherwise the first thing the console does after
   // taking money is show the old number.
-  settleReturn(organizationId, wallet.reload);
+  settleReturn(organizationId, reloadWallet);
 
   return h(
     "div",
@@ -163,7 +173,7 @@ export function billingPage(organizationId: string): Child {
         {
           class: "btn btn--primary",
           type: "button",
-          onClick: () => addFunds(organizationId, wallet.reload),
+          onClick: () => addFunds(organizationId, reloadWallet),
         },
         icon(ICON.plus, 14),
         text(tr("残高を追加", "Add funds")),
@@ -195,6 +205,23 @@ export function billingPage(organizationId: string): Child {
                 formatMicrosCurrency(held.settledMicros, held.currency, uiLocale()),
                 tr("入金と確定済み請求", "funded and captured"),
               ),
+              live(() =>
+                whenReady(
+                  usageSummary.get(),
+                  ({ usageSummary: summary }) =>
+                    stat(
+                      tr("利用枠の使用率", "Included usage"),
+                      formatUsagePercent(summary.utilizationBasisPoints, uiLocale()),
+                      summary.effectiveIncludedMicros === "0"
+                        ? tr(
+                            "この期間の利用枠はありません",
+                            "No included allowance for this period",
+                          )
+                        : tr("使用済み＋確保中／利用枠", "used + held / included allowance"),
+                    ),
+                  { retry: usageSummary.reload },
+                ),
+              ),
             ),
             card(
               tr("取引履歴", "Ledger"),
@@ -209,7 +236,7 @@ export function billingPage(organizationId: string): Child {
                 : h("div", { class: "table-scroll" }, ledgerTable(held.entries, held.currency)),
             ),
           ),
-        { retry: wallet.reload },
+        { retry: reloadWallet },
       ),
     ),
   );
