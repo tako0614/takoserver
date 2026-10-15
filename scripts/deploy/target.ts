@@ -295,7 +295,7 @@ export function targetPath(
 export function loadTarget(
   path: string,
   environment: DeployEnvironment,
-  operation: "deploy" | "money-resume-read" = "deploy",
+  operation: "deploy" | "money-resume-read" | "money-original-cutover" = "deploy",
 ): DeployTarget {
   let raw: string;
   try {
@@ -501,9 +501,13 @@ export function parseDeployTarget(
   value: unknown,
   source: string,
   environment: DeployEnvironment,
-  operation: "deploy" | "money-resume-read" = "deploy",
+  operation: "deploy" | "money-resume-read" | "money-original-cutover" = "deploy",
 ): DeployTarget {
-  if (operation !== "deploy" && operation !== "money-resume-read") {
+  if (
+    operation !== "deploy" &&
+    operation !== "money-resume-read" &&
+    operation !== "money-original-cutover"
+  ) {
     throw preflightError("deploy target operation selector is invalid");
   }
   if (!isRecord(value)) {
@@ -630,7 +634,7 @@ export function parseDeployTarget(
         target.takoformV2?.appliedSchemaLineage !== "v2-0092") ||
       !(
         /^takoserver-i-[0-9a-f]{32}$/u.test(target.d1.databaseName) ||
-        (operation === "money-resume-read" &&
+        ((operation === "money-resume-read" || operation === "money-original-cutover") &&
           /^integration-ts-[0-9a-f]{32}$/u.test(target.d1.databaseName))
       ) ||
       target.r2.bucketName !== target.d1.databaseName)
@@ -646,7 +650,7 @@ export function parseDeployTarget(
         target.takoformV2?.appliedSchemaLineage !== "v2-0092") ||
       !(
         /^takoserver-i-[0-9a-f]{32}$/u.test(target.d1.databaseName) ||
-        (operation === "money-resume-read" &&
+        ((operation === "money-resume-read" || operation === "money-original-cutover") &&
           /^integration-ts-[0-9a-f]{32}$/u.test(target.d1.databaseName))
       ) ||
       target.r2.bucketName !== target.d1.databaseName)
@@ -659,6 +663,19 @@ export function parseDeployTarget(
   ) {
     throw preflightError("money cutover writer policy requires an exact pinned Writer epoch");
   }
+  if (
+    operation === "money-original-cutover" &&
+    (environment !== "integration" ||
+      !/^integration-ts-[0-9a-f]{32}$/u.test(target.d1.databaseName) ||
+      target.r2.bucketName !== target.d1.databaseName ||
+      target.takoformV2?.storageLineage !== "v2-0092" ||
+      target.moneyCutoverWriterPolicy !== "transaction-fenced-usd-micros-v1" ||
+      target.artifactBlobIoMode !== undefined ||
+      !/^(?:integration|staging)-[a-z0-9]/u.test(target.workerName))
+  )
+    throw preflightError(
+      "original money cutover requires exact prefixed fresh92 storage and writer policy",
+    );
   if (
     target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced" &&
     target.moneyCutoverWriterPolicy !== "transaction-fenced-usd-micros-v1"

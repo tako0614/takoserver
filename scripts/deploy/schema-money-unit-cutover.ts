@@ -32,7 +32,13 @@ import { applicationSchemaMatches } from "./application-schema-shape.ts";
 import { RemoteD1, sqlLiteral } from "./d1.ts";
 import { buildD1MigrationImport } from "./d1-migration-import.ts";
 import { normalizeSnapshotDump } from "./d1-snapshot-restore.ts";
-import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
+import {
+  DeployError,
+  type DeployPhase,
+  mutationError,
+  preflightError,
+  verificationError,
+} from "./errors.ts";
 import {
   canonicalSchemaShape,
   type D1SchemaState,
@@ -1749,7 +1755,15 @@ async function runImport(
       `money cutover import was not acknowledged (exit ${result.exitCode}); keep freeze and reconcile by GET only`,
     );
   }
-  sealed.assertUnchanged();
+  try {
+    sealed.assertUnchanged();
+  } catch (cause) {
+    const failure = verificationError(
+      "money cutover import was acknowledged but sealed input validation failed; retain custody and inspect status without replay",
+    );
+    failure.cause = cause;
+    throw failure;
+  }
 }
 
 /** Recover an unknown import acknowledgement using retained evidence and D1 reads only. */
@@ -2074,6 +2088,25 @@ export async function runIntegrationMoneyUnitCutover(
   ) {
     throw preflightError("money cutover requires an exact integration invocation and phase");
   }
+  // The adapter is already initialized before invoking this executor. This lazy
+  // assert-only edge avoids a static owner/executor initialization cycle.
+  const originalWriter = /^integration-ts-[0-9a-f]{32}$/u.test(target.d1.databaseName)
+    ? (await import("./schema-money-unit-owner.ts")).assertMoneyUnitOriginalWriterOptions
+    : undefined;
+  if (originalWriter !== undefined) target = originalWriter(options, target);
+  const assertOriginalWriter = (phase: "preflight" | "verification" = "preflight") => {
+    try {
+      return originalWriter?.(options, target);
+    } catch (cause) {
+      if (phase !== "verification") throw cause;
+      const failure = verificationError(
+        "fresh money source changed after import; retain custody and inspect status",
+      );
+      failure.cause = cause;
+      throw failure;
+    }
+  };
+  assertOriginalWriter();
   const selected = phaseSchemas(options.phase);
   if (invocation.throughMigration !== selected.through)
     throw preflightError("money cutover phase and fixed schema wave differ");
@@ -2133,7 +2166,8 @@ export async function runIntegrationMoneyUnitCutover(
   }
   const origin = await options.stageOriginProof();
   const liveIdentity = await options.storageIdentityRead();
-  assertStageTarget(target, origin, liveIdentity);
+  assertOriginalWriter();
+  assertStageTarget(target, origin, liveIdentity, originalWriter !== undefined);
   if (
     !MONEY_CUTOVER_WRITER_EPOCH_PATTERN.test(options.writerEpoch) ||
     options.writerEpoch !== target.moneyCutoverWriterEpoch
@@ -2444,7 +2478,8 @@ export async function runIntegrationMoneyUnitCutover(
     }
     const originNow = await options.stageOriginProof();
     const liveNow = await options.storageIdentityRead();
-    assertStageTarget(target, originNow, liveNow);
+    assertOriginalWriter();
+    assertStageTarget(target, originNow, liveNow, originalWriter !== undefined);
     if (digest(JSON.stringify(originNow)) !== originDigest)
       throw preflightError("money cutover origin changed before dispatch");
     const atDispatch = await readD1SchemaState(database);
@@ -2546,93 +2581,127 @@ export async function runIntegrationMoneyUnitCutover(
       "dispatched",
     );
     sealedImport.assertUnchanged();
+    assertOriginalWriter();
     await runImport(importPath, configPath, target, run, environment);
-    const post = await readD1SchemaState(database, "verification");
-    if (!moneyUnitCutoverSchemaMatches(post, files, expectedAfter)) {
-      throw verificationError(
-        "money cutover import was acknowledged but exact terminal schema failed; keep freeze and repair forward",
+    try {
+      if (originalWriter !== undefined) {
+        try {
+          const postOrigin = await options.stageOriginProof();
+          const postIdentity = await options.storageIdentityRead();
+          assertOriginalWriter();
+          assertStageTarget(target, postOrigin, postIdentity, true);
+          if (
+            digest(JSON.stringify(postOrigin)) !== originDigest ||
+            JSON.stringify(postIdentity) !== JSON.stringify(liveIdentity)
+          )
+            throw verificationError(
+              "fresh money original identity changed after import; retain custody",
+            );
+        } catch (cause) {
+          const failure = verificationError(
+            "fresh money original readback failed after import; keep freeze and inspect status without replay",
+          );
+          failure.cause = cause;
+          throw failure;
+        }
+      }
+      const post = await readD1SchemaState(database, "verification");
+      assertOriginalWriter("verification");
+      if (!moneyUnitCutoverSchemaMatches(post, files, expectedAfter)) {
+        throw verificationError(
+          "money cutover import was acknowledged but exact terminal schema failed; keep freeze and repair forward",
+        );
+      }
+      if (expectedAfter === "0094") {
+        await assertResumedFreezeEmpty(database, "verification", options.writerEpoch);
+        if (options.resumeHealthRead === undefined)
+          throw verificationError("money resume healthy native readback is unavailable");
+        await options.resumeHealthRead("healthy");
+        if (
+          options.resumeProof === undefined ||
+          digest(JSON.stringify(await options.resumeProof())) !== resumeDigest
+        )
+          throw verificationError("money resumed native Version changed after D1 transition");
+      } else if (expectedAfter.endsWith("-fenced"))
+        await assertPermitEmpty(database, "verification", options.writerEpoch);
+      if (
+        options.phase === "freeze" ||
+        options.phase === "prepare" ||
+        options.phase === "classify" ||
+        options.phase === "abandon"
+      ) {
+        if (options.phase !== "abandon")
+          assertFreezeRow(
+            await readFreezeRow(database, "verification"),
+            anchor,
+            originDigest,
+            backup.digest,
+            writerDigest,
+            "verification",
+          );
+        if (
+          (await readMoneyPreimageDigest(database, "verification")) !== backup.preimageDigest ||
+          (await readMoneyAggregateDigest(database, "verification")) !== backup.aggregateDigest ||
+          (await readMoneyFrozenDataDigest(database, "verification")) !== backup.financialDigest
+        ) {
+          throw verificationError(
+            "money freeze changed financial rows; keep freeze and repair forward",
+          );
+        }
+      }
+      if (options.phase === "convert" || options.phase === "resume") {
+        if (
+          (await readMoneyPreimageDigest(database, "verification", true)) !==
+            backup.preimageDigest ||
+          (await readMoneyAggregateDigest(database, "verification", true)) !==
+            backup.aggregateDigest
+        ) {
+          throw verificationError(
+            "money converted preimage differs from protected backup; repair forward",
+          );
+        }
+        await assertClassificationsStored(database, classifications, "verification");
+      }
+      if (options.phase === "classify")
+        await assertClassificationsStored(database, classifications, "verification");
+      await assertMoneyNativeForeignKeys(database, "verification");
+      const postDigest = digest(
+        JSON.stringify({
+          applied: post.applied,
+          shapeDigest: post.shapeDigest,
+          preimageDigest: backup.preimageDigest,
+          aggregateDigest: backup.aggregateDigest,
+        }),
       );
+      validateCustody(
+        await options.custody.terminal(binding, postDigest),
+        options.phase,
+        bindingDigest,
+        "terminal",
+        postDigest,
+      );
+      return {
+        ...status,
+        schemaPhase: expectedAfter,
+        schemaShapeDigest: post.shapeDigest,
+        custody: "terminal",
+        readyForApply: false,
+        postDigest,
+        ...(options.phase === "abandon"
+          ? {
+              writerState: "maintenance-still-quiesced",
+              nextAction: "review-qualified old-cents native recovery or forward repair",
+            }
+          : {}),
+      };
+    } catch (cause) {
+      if (cause instanceof DeployError && cause.phase === "verification") throw cause;
+      const failure = verificationError(
+        "money import was acknowledged but verification or custody settlement failed; keep freeze and inspect status without replay",
+      );
+      failure.cause = cause;
+      throw failure;
     }
-    if (expectedAfter === "0094") {
-      await assertResumedFreezeEmpty(database, "verification", options.writerEpoch);
-      if (options.resumeHealthRead === undefined)
-        throw verificationError("money resume healthy native readback is unavailable");
-      await options.resumeHealthRead("healthy");
-      if (
-        options.resumeProof === undefined ||
-        digest(JSON.stringify(await options.resumeProof())) !== resumeDigest
-      )
-        throw verificationError("money resumed native Version changed after D1 transition");
-    } else if (expectedAfter.endsWith("-fenced"))
-      await assertPermitEmpty(database, "verification", options.writerEpoch);
-    if (
-      options.phase === "freeze" ||
-      options.phase === "prepare" ||
-      options.phase === "classify" ||
-      options.phase === "abandon"
-    ) {
-      if (options.phase !== "abandon")
-        assertFreezeRow(
-          await readFreezeRow(database, "verification"),
-          anchor,
-          originDigest,
-          backup.digest,
-          writerDigest,
-          "verification",
-        );
-      if (
-        (await readMoneyPreimageDigest(database, "verification")) !== backup.preimageDigest ||
-        (await readMoneyAggregateDigest(database, "verification")) !== backup.aggregateDigest ||
-        (await readMoneyFrozenDataDigest(database, "verification")) !== backup.financialDigest
-      ) {
-        throw verificationError(
-          "money freeze changed financial rows; keep freeze and repair forward",
-        );
-      }
-    }
-    if (options.phase === "convert" || options.phase === "resume") {
-      if (
-        (await readMoneyPreimageDigest(database, "verification", true)) !== backup.preimageDigest ||
-        (await readMoneyAggregateDigest(database, "verification", true)) !== backup.aggregateDigest
-      ) {
-        throw verificationError(
-          "money converted preimage differs from protected backup; repair forward",
-        );
-      }
-      await assertClassificationsStored(database, classifications, "verification");
-    }
-    if (options.phase === "classify")
-      await assertClassificationsStored(database, classifications, "verification");
-    await assertMoneyNativeForeignKeys(database, "verification");
-    const postDigest = digest(
-      JSON.stringify({
-        applied: post.applied,
-        shapeDigest: post.shapeDigest,
-        preimageDigest: backup.preimageDigest,
-        aggregateDigest: backup.aggregateDigest,
-      }),
-    );
-    validateCustody(
-      await options.custody.terminal(binding, postDigest),
-      options.phase,
-      bindingDigest,
-      "terminal",
-      postDigest,
-    );
-    return {
-      ...status,
-      schemaPhase: expectedAfter,
-      schemaShapeDigest: post.shapeDigest,
-      custody: "terminal",
-      readyForApply: false,
-      postDigest,
-      ...(options.phase === "abandon"
-        ? {
-            writerState: "maintenance-still-quiesced",
-            nextAction: "review-qualified old-cents native recovery or forward repair",
-          }
-        : {}),
-    };
   } finally {
     if (lease !== null) await lease.release();
     if (options.outputDirectory === undefined) rmSync(root, { recursive: true, force: true });

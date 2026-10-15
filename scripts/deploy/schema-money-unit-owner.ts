@@ -1,12 +1,15 @@
 import { createHash } from "node:crypto";
 import {
+  type BigIntStats,
   closeSync,
   constants,
+  fstatSync,
   fsyncSync,
   lstatSync,
   mkdtempSync,
   openSync,
   readFileSync,
+  readSync,
   realpathSync,
   writeFileSync,
 } from "node:fs";
@@ -42,7 +45,7 @@ import {
   readMoneyUnitResumeState,
 } from "./schema-money-unit-cutover.ts";
 import { exactV2MaintenanceModuleDigest } from "./schema-v2-existing-transition.ts";
-import type { DeployTarget } from "./target.ts";
+import { type DeployTarget, parseDeployTarget } from "./target.ts";
 import { probeMoneyCutoverFrozen, probeProduct } from "./worker.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import { inspectLiveWorkerVersion, workerVersionIdentity } from "./worker-live.ts";
@@ -119,6 +122,11 @@ interface Declaration {
   readonly resumePublicationReceiptDigest?: string;
   readonly originCertificatePath?: string;
   readonly originCertificateDigest?: string;
+  /** Fresh writer locators only; native original custody remains separately held. */
+  readonly originalOrigin?: {
+    readonly invocation: IntegrationStorageGenerationInvocation;
+    readonly originalTargetPath: string;
+  };
   readonly privateWriterScopePath: string;
   readonly privateWriterScopeDigest: string;
   readonly privateSourceRoot?: string;
@@ -320,6 +328,95 @@ function protectedBytes(path: string, label: string, allowAbsent = false): Uint8
   }
 }
 
+/** The import producer seals 0500/0400; retained legacy custody used 0700/0600. */
+function sealedImportBytes(path: string, label: string): Uint8Array {
+  if (
+    !isAbsolute(path) ||
+    resolve(path) !== path ||
+    relative(REPOSITORY, path) === "" ||
+    !relative(REPOSITORY, path).startsWith(`..${sep}`)
+  )
+    throw preflightError(`${label} must be canonical, absolute and outside the repository`);
+  const directory = dirname(path);
+  const uid = typeof process.getuid === "function" ? BigInt(process.getuid()) : undefined;
+  const identity = (value: BigIntStats) =>
+    [
+      value.dev,
+      value.ino,
+      value.uid,
+      value.gid,
+      value.mode,
+      value.nlink,
+      value.size,
+      value.mtimeNs,
+      value.ctimeNs,
+    ]
+      .map(String)
+      .join(":");
+  const directoryIdentity = (value: BigIntStats) =>
+    [value.dev, value.ino, value.uid, value.gid, value.mode].map(String).join(":");
+  const inspectDirectories = () => {
+    const identities: string[] = [];
+    let leaf: BigIntStats | undefined;
+    for (let current = directory; ; current = dirname(current)) {
+      const status = lstatSync(current, { bigint: true });
+      if (!status.isDirectory() || status.isSymbolicLink())
+        throw preflightError(`${label} has an unsafe directory or ancestor`);
+      if (leaf === undefined) {
+        leaf = status;
+        if (
+          (uid !== undefined && status.uid !== uid) ||
+          ![0o500n, 0o700n].includes(status.mode & 0o777n)
+        )
+          throw preflightError(`${label} requires an owned exact 0500/0400 or 0700/0600 pair`);
+      }
+      identities.push(directoryIdentity(status));
+      if (current === dirname(current)) break;
+    }
+    if (leaf === undefined) throw preflightError(`${label} directory is unavailable`);
+    return { leaf, identity: identities.join("/") };
+  };
+  let fd: number | undefined;
+  try {
+    const parent = inspectDirectories();
+    const mode = (parent.leaf.mode & 0o777n) === 0o500n ? 0o400n : 0o600n;
+    const validate = (status: BigIntStats) => {
+      if (
+        !status.isFile() ||
+        status.isSymbolicLink() ||
+        status.nlink !== 1n ||
+        (status.mode & 0o777n) !== mode ||
+        status.size > BigInt(MAX_PROTECTED_BYTES) ||
+        (uid !== undefined && status.uid !== uid)
+      )
+        throw preflightError(`${label} requires an owned link-free bounded matched-mode import`);
+    };
+    const named = lstatSync(path, { bigint: true });
+    validate(named);
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const held = fstatSync(fd, { bigint: true });
+    validate(held);
+    if (identity(named) !== identity(held)) throw preflightError(`${label} changed while opening`);
+    const bytes = new Uint8Array(Number(held.size));
+    let count = 0;
+    while (count < bytes.length) {
+      const read = readSync(fd, bytes, count, bytes.length - count, null);
+      if (read === 0) throw preflightError(`${label} was truncated`);
+      count += read;
+    }
+    if (
+      readSync(fd, new Uint8Array(1), 0, 1, null) !== 0 ||
+      identity(fstatSync(fd, { bigint: true })) !== identity(held) ||
+      identity(lstatSync(path, { bigint: true })) !== identity(held) ||
+      inspectDirectories().identity !== parent.identity
+    )
+      throw preflightError(`${label} changed during its held read`);
+    return bytes;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
 function protectedJson(
   path: string,
   label: string,
@@ -385,7 +482,12 @@ function requireReviewer(value: unknown): value is string {
   );
 }
 
-function parseDeclaration(value: unknown, target: DeployTarget, originalRead = false): Declaration {
+function parseDeclaration(
+  value: unknown,
+  target: DeployTarget,
+  originalRead = false,
+  originalWriter = false,
+): Declaration {
   const required = [
     "kind",
     "phase",
@@ -401,6 +503,7 @@ function parseDeclaration(value: unknown, target: DeployTarget, originalRead = f
     "maintenancePublicationReceiptPath",
     "maintenancePublicationReceiptDigest",
     ...(originalRead ? [] : ["originCertificatePath", "originCertificateDigest"]),
+    ...(originalWriter ? ["originalOrigin"] : []),
     "privateWriterScopePath",
     "privateWriterScopeDigest",
     "reviewEvidencePath",
@@ -1088,7 +1191,7 @@ function custody(directory: string, originalRead = false): MoneyCutoverCustody {
     const binding = parseBinding(value.binding, phase);
     if (receipt.bindingDigest !== moneyCutoverBindingDigest(binding))
       throw preflightError("money dispatch custody binding digest differs");
-    const bytes = protectedBytes(binding.sealedImportPath, "money sealed import SQL");
+    const bytes = sealedImportBytes(binding.sealedImportPath, "money sealed import SQL");
     if (bytes === null || digest(bytes) !== binding.importDigest)
       throw preflightError("money sealed import SQL differs from immutable dispatch");
     return { receipt, binding };
@@ -1146,7 +1249,7 @@ function custody(directory: string, originalRead = false): MoneyCutoverCustody {
       if ((await this.read(binding.phase)) !== null)
         throw mutationError("money dispatch custody already exists; do not retry");
       parseBinding(binding, binding.phase);
-      const bytes = protectedBytes(binding.sealedImportPath, "money sealed import SQL");
+      const bytes = sealedImportBytes(binding.sealedImportPath, "money sealed import SQL");
       if (bytes === null || digest(bytes) !== binding.importDigest)
         throw mutationError("money sealed import SQL differs before dispatch");
       const receipt: MoneyCutoverCustodyReceipt = {
@@ -1253,6 +1356,269 @@ export interface MoneyUnitOriginalOriginRead {
   readonly custody: IntegrationStorageOriginalCreateOptions;
 }
 
+/** Locators select existing custody; no result, status or native proof port is accepted. */
+export interface MoneyUnitOriginalCutoverRequest {
+  readonly selectedTarget: DeployTarget;
+  readonly declarationPath: string;
+  readonly originalCreate: IntegrationStorageOriginalCreateOptions;
+}
+
+export interface MoneyUnitOriginalCutoverOptions extends MoneyUnitCutoverOptions {
+  readonly originalOriginQualification: "independent-origin-review-required";
+}
+
+const originalMoneyWriters = new WeakMap<
+  MoneyUnitCutoverOptions,
+  {
+    readonly target: string;
+    readonly ownedTarget: DeployTarget;
+    readonly assertUnchanged: () => void;
+  }
+>();
+
+/** Checks existing owner provenance only; no caller can register options or mint a grant. */
+export function assertMoneyUnitOriginalWriterOptions(
+  options: MoneyUnitCutoverOptions,
+  target: DeployTarget,
+): DeployTarget {
+  const selected = originalMoneyWriters.get(options);
+  if (
+    selected === undefined ||
+    selected.target !==
+      JSON.stringify(
+        parseDeployTarget(
+          target,
+          "fresh money writer target",
+          "integration",
+          "money-original-cutover",
+        ),
+      )
+  )
+    throw preflightError("fresh money writer requires the same owning original options and target");
+  selected.assertUnchanged();
+  return selected.ownedTarget;
+}
+
+function freezeOriginalMoneyData<T>(value: T): T {
+  if (typeof value === "object" && value !== null) {
+    for (const child of Object.values(value)) freezeOriginalMoneyData(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+function originalMoneyInput(path: string, label: string) {
+  protectedDirectory(dirname(path), label);
+  if (resolve(path) !== path) throw preflightError(`${label} path must be canonical`);
+  const parent = lstatSync(dirname(path), { bigint: true });
+  const identity = (value: BigIntStats) =>
+    [
+      value.dev,
+      value.ino,
+      value.uid,
+      value.gid,
+      value.mode,
+      value.nlink,
+      value.size,
+      value.mtimeNs,
+      value.ctimeNs,
+    ]
+      .map(String)
+      .join(":");
+  const parentIdentity = (value: BigIntStats) =>
+    [value.dev, value.ino, value.uid, value.gid, value.mode].map(String).join(":");
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch {
+    throw preflightError(`${label} cannot be opened safely`);
+  }
+  let bytes: Uint8Array;
+  let heldIdentity: string;
+  try {
+    const held = fstatSync(fd, { bigint: true });
+    if (
+      !held.isFile() ||
+      held.nlink !== 1n ||
+      (held.mode & 0o777n) !== 0o600n ||
+      held.size > BigInt(MAX_PROTECTED_BYTES) ||
+      (typeof process.getuid === "function" && held.uid !== BigInt(process.getuid()))
+    )
+      throw preflightError(`${label} must be an owned single-link bounded 0600 regular file`);
+    heldIdentity = identity(held);
+    if (identity(lstatSync(path, { bigint: true })) !== heldIdentity)
+      throw preflightError(`${label} named and held file differ`);
+    const buffer = new Uint8Array(Number(held.size));
+    let count = 0;
+    while (count < buffer.byteLength) {
+      const read = readSync(fd, buffer, count, buffer.byteLength - count, null);
+      if (read === 0) throw preflightError(`${label} was truncated`);
+      count += read;
+    }
+    if (
+      readSync(fd, new Uint8Array(1), 0, 1, null) !== 0 ||
+      identity(fstatSync(fd, { bigint: true })) !== heldIdentity ||
+      identity(lstatSync(path, { bigint: true })) !== heldIdentity ||
+      parentIdentity(lstatSync(dirname(path), { bigint: true })) !== parentIdentity(parent)
+    )
+      throw preflightError(`${label} changed during held read`);
+    protectedDirectory(dirname(path), label);
+    bytes = buffer;
+  } finally {
+    closeSync(fd);
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes));
+  } catch {
+    throw preflightError(`${label} is not fatal-UTF8 JSON`);
+  }
+  const seal = `${heldIdentity}:${parentIdentity(parent)}:${digest(bytes)}`;
+  return {
+    value,
+    seal,
+    assertUnchanged() {
+      if (originalMoneyInput(path, label).seal !== seal)
+        throw preflightError(`${label} changed after selection`);
+    },
+  };
+}
+
+/** Existing cutover owner, explicitly selected with the genuine fresh creator's locators. */
+export async function loadMoneyUnitOriginalCutoverOptions(
+  request: MoneyUnitOriginalCutoverRequest,
+  dependencies: MoneyUnitOwnerDependencies = {},
+): Promise<MoneyUnitOriginalCutoverOptions> {
+  if (!record(request) || !keys(request, ["selectedTarget", "declarationPath", "originalCreate"]))
+    throw preflightError("fresh money writer requires only target and original custody locators");
+  const selected = JSON.stringify(request);
+  const target = freezeOriginalMoneyData(
+    parseDeployTarget(
+      structuredClone(request.selectedTarget),
+      "fresh money writer target",
+      "integration",
+      "money-original-cutover",
+    ),
+  );
+  const declarationInput = originalMoneyInput(request.declarationPath, "fresh money declaration");
+  const declaration = parseDeclaration(declarationInput.value, target, true, true);
+  const origin = declaration.originalOrigin;
+  if (
+    !record(origin) ||
+    !keys(origin, ["invocation", "originalTargetPath"]) ||
+    !record(origin.invocation) ||
+    !keys(origin.invocation, [
+      "action",
+      "environment",
+      "commit",
+      "generation",
+      "namespace",
+      "freshLineage",
+    ]) ||
+    origin.invocation.action !== "apply" ||
+    origin.invocation.environment !== "integration" ||
+    origin.invocation.namespace !== "integration-ts" ||
+    origin.invocation.freshLineage !== "v2-0092" ||
+    !requireCommit(origin.invocation.commit) ||
+    typeof origin.invocation.generation !== "string" ||
+    !/^[0-9a-f]{32}$/u.test(origin.invocation.generation) ||
+    target.d1.databaseName !== `integration-ts-${origin.invocation.generation}` ||
+    typeof origin.originalTargetPath !== "string"
+  )
+    throw preflightError(
+      "fresh money original selection requires the exact original six-field invocation",
+    );
+  const originalTargetInput = originalMoneyInput(
+    origin.originalTargetPath,
+    "money original collision target",
+  );
+  const original: MoneyUnitOriginalOriginRead = freezeOriginalMoneyData({
+    invocation: structuredClone(origin.invocation),
+    originalTarget: parseDeployTarget(
+      originalTargetInput.value,
+      origin.originalTargetPath,
+      "integration",
+    ),
+    custody: structuredClone(request.originalCreate),
+  });
+  const assertUnchanged = () => {
+    if (JSON.stringify(request) !== selected)
+      throw preflightError("fresh money original selection changed during qualification");
+    declarationInput.assertUnchanged();
+    originalTargetInput.assertUnchanged();
+  };
+  // Capture optional ports before awaits, retaining their component provenance.
+  const { state, storage, fetcher, publicArtifactBuilder, run, cloudflareEnvironment } =
+    dependencies;
+  const capturedState =
+    state === undefined
+      ? undefined
+      : (() => {
+          const {
+            workerDeployments,
+            workerVersion,
+            workerVersionWithModules,
+            workerSecrets,
+            workerDomains,
+            workerSubdomain,
+            workerAccountSubdomain,
+          } = state;
+          return Object.freeze({
+            workerDeployments: workerDeployments.bind(state),
+            workerVersion: workerVersion.bind(state),
+            workerVersionWithModules: workerVersionWithModules.bind(state),
+            workerSecrets: workerSecrets.bind(state),
+            workerDomains: workerDomains.bind(state),
+            workerSubdomain: workerSubdomain.bind(state),
+            workerAccountSubdomain: workerAccountSubdomain.bind(state),
+          });
+        })();
+  const capturedStorage =
+    storage === undefined
+      ? undefined
+      : (() => {
+          const { getD1, getR2 } = storage;
+          return Object.freeze({ getD1: getD1.bind(storage), getR2: getR2.bind(storage) });
+        })();
+  const ownedDependencies: MoneyUnitOwnerDependencies = Object.freeze({
+    ...(capturedState === undefined ? {} : { state: capturedState }),
+    ...(capturedStorage === undefined ? {} : { storage: capturedStorage }),
+    ...(fetcher === undefined ? {} : { fetcher }),
+    ...(publicArtifactBuilder === undefined ? {} : { publicArtifactBuilder }),
+    ...(run === undefined ? {} : { run }),
+    ...(cloudflareEnvironment === undefined
+      ? {}
+      : {
+          cloudflareEnvironment: Object.freeze({ ...cloudflareEnvironment }),
+        }),
+  });
+  assertUnchanged();
+  const options = await loadMoneyUnitOwnerOptions(
+    request.declarationPath,
+    target,
+    ownedDependencies,
+    original,
+    { declaration: declarationInput.value, assertUnchanged },
+  );
+  assertUnchanged();
+  const sealed = Object.freeze({
+    ...options,
+    custody: Object.freeze({
+      read: options.custody.read.bind(options.custody),
+      readDispatch: options.custody.readDispatch.bind(options.custody),
+      dispatch: options.custody.dispatch.bind(options.custody),
+      terminal: options.custody.terminal.bind(options.custody),
+    }),
+    originalOriginQualification: "independent-origin-review-required" as const,
+  });
+  originalMoneyWriters.set(sealed, {
+    target: JSON.stringify(target),
+    ownedTarget: target,
+    assertUnchanged,
+  });
+  return sealed;
+}
+
 export interface MoneyUnitResumeReadRequest {
   readonly selectedTarget: DeployTarget;
   readonly declarationPath: string;
@@ -1332,11 +1698,15 @@ async function loadMoneyUnitOwnerOptions(
   target: DeployTarget,
   dependencies: MoneyUnitOwnerDependencies,
   originalRead?: MoneyUnitOriginalOriginRead,
+  originalWriter?: { readonly declaration: unknown; readonly assertUnchanged: () => void },
 ): Promise<MoneyUnitCutoverOptions> {
   const declaration = parseDeclaration(
-    protectedJson(declarationPath, "money owner declaration"),
+    originalWriter === undefined
+      ? protectedJson(declarationPath, "money owner declaration")
+      : originalWriter.declaration,
     target,
     originalRead !== undefined,
+    originalWriter !== undefined,
   );
   for (const directory of [
     declaration.custodyDirectory,
@@ -1345,6 +1715,7 @@ async function loadMoneyUnitOwnerOptions(
   ])
     protectedDirectory(directory, "money owner directory");
   const readOrigin = async (): Promise<MoneyStageOriginProof> => {
+    originalWriter?.assertUnchanged();
     if (originalRead === undefined) {
       if (
         declaration.originCertificatePath === undefined ||
@@ -1372,6 +1743,7 @@ async function loadMoneyUnitOwnerOptions(
           : { cloudflareEnvironment: dependencies.cloudflareEnvironment }),
       },
     );
+    originalWriter?.assertUnchanged();
     if (
       observed.qualification !== "independent-origin-review-required" ||
       observed.originalCreate.kind !== "takoserver.integration-fresh-0092-original-create@v1" ||
@@ -1380,6 +1752,19 @@ async function loadMoneyUnitOwnerOptions(
       observed.originalCreate.migrationDigest !== SOURCE_0092
     )
       throw preflightError("money resume read requires the genuine native original 0092 custody");
+    if (
+      originalWriter !== undefined &&
+      (observed.originalCreate.sourceCommit !== originalRead.invocation.commit ||
+        observed.originalCreate.accountId !== target.accountId ||
+        observed.originalCreate.databaseId !== target.d1.databaseId ||
+        observed.originalCreate.databaseName !== target.d1.databaseName ||
+        observed.originalCreate.bucketName !== target.r2.bucketName ||
+        observed.nativeReadback.accountId !== target.accountId ||
+        observed.nativeReadback.d1.databaseId !== target.d1.databaseId ||
+        observed.nativeReadback.d1.databaseName !== target.d1.databaseName ||
+        observed.nativeReadback.r2.bucketName !== target.r2.bucketName)
+    )
+      throw preflightError("fresh money original and current primary identities differ");
     return {
       kind: "takoserver.money-stage-origin@v1",
       state: "terminal",

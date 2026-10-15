@@ -1165,6 +1165,34 @@ function loadMoneyShadowNativeProbeDeclaration(): MoneyShadowNativeProbeDeclarat
 
 async function dispatch(invocation: Invocation): Promise<Record<string, unknown>> {
   const originalCreateInput = process.env.TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH;
+  if (
+    originalCreateInput !== undefined &&
+    invocation.surface === "takoserver-d1-schema" &&
+    invocation.environment === "integration" &&
+    (invocation.throughMigration === "0093" || invocation.throughMigration === "0094")
+  ) {
+    const originalCreate = loadIntegrationStorageOriginalCreateInput(originalCreateInput);
+    const target = loadTarget(targetPath("integration"), "integration", "money-original-cutover");
+    const { loadMoneyUnitOriginalCutoverOptions } = await import(
+      "./deploy/schema-money-unit-owner.ts"
+    );
+    const options = await loadMoneyUnitOriginalCutoverOptions({
+      selectedTarget: target,
+      declarationPath: requireEnvironment("TAKOSERVER_D1_MONEY_CUTOVER_DECLARATION_PATH"),
+      originalCreate,
+    });
+    const result = await runD1Schema(
+      {
+        action: invocation.action,
+        environment: "integration",
+        commit: invocation.commit,
+        throughMigration: invocation.throughMigration,
+      },
+      target,
+      { moneyUnitCutover: options },
+    );
+    return { ...result, originalOriginQualification: options.originalOriginQualification };
+  }
   if (originalCreateInput !== undefined) {
     if (
       invocation.surface !== "takoserver-integration-storage-generation" ||

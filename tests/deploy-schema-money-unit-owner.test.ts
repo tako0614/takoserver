@@ -1,12 +1,30 @@
 import { Database } from "bun:sqlite";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildD1MigrationImport } from "../scripts/deploy/d1-migration-import.ts";
 import { normalizeSnapshotDump } from "../scripts/deploy/d1-snapshot-restore.ts";
+import {
+  type IntegrationStorageGenerationInvocation,
+  runIntegrationStorageGeneration,
+} from "../scripts/deploy/integration-storage-generation.ts";
 import { canonicalSchemaShape, readMigrationArtifact } from "../scripts/deploy/migrations.ts";
+import { type CommandResult, REPOSITORY } from "../scripts/deploy/process.ts";
+import { removeArtifactTree, sealDirectory } from "../scripts/deploy/qualification.ts";
 import { expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
 import {
   buildMoneyCutoverImportSql,
@@ -17,9 +35,12 @@ import {
   readMoneyAggregateDigest,
   readMoneyFrozenDataDigest,
   readMoneyPreimageDigest,
+  runIntegrationMoneyUnitCutover,
 } from "../scripts/deploy/schema-money-unit-cutover.ts";
 import {
+  assertMoneyUnitOriginalWriterOptions,
   loadMoneyUnitCutoverOptions,
+  loadMoneyUnitOriginalCutoverOptions,
   type MoneyUnitOwnerDependencies,
   readIntegrationMoneyUnitResumeState,
 } from "../scripts/deploy/schema-money-unit-owner.ts";
@@ -1330,5 +1351,857 @@ describe("money unit owner adapter", () => {
       state: "reviewed",
       bindingDigest: moneyCutoverBindingDigest(binding),
     });
+  });
+});
+
+function freshOriginalMoneyFixture() {
+  const { cloudflareProviderExecutor: _managed, ...standalone } = target;
+  const pair = `integration-ts-${generation}`;
+  const selected: DeployTarget = {
+    ...standalone,
+    workerName: "integration-money-host",
+    publicOrigin: "https://integration-money-host.test.workers.dev",
+    d1: { databaseName: pair, databaseId },
+    r2: { bucketName: pair },
+    takoformV2: {
+      storageLineage: "v2-0092",
+      config: JSON.stringify({
+        documentation: "https://docs.example.test",
+        authenticationDocumentation: "https://auth.example.test",
+      }),
+    },
+  };
+  const f = fixture(selected);
+  const originalTarget: DeployTarget = {
+    kind: "takoserver.deploy-target@v2",
+    environment: "integration",
+    accountId: account,
+    workerName: "old-incumbent",
+    publicOrigin: "https://old-incumbent.test.workers.dev",
+    d1: { databaseName: "old-incumbent", databaseId: id(900) },
+    r2: { bucketName: "old-incumbent" },
+    signing: { currentKeyId: "key-current" },
+  };
+  const originalTargetPath = join(f.root, "original-target.json");
+  f.write(originalTargetPath, originalTarget);
+  const originalDirectory = join(f.root, "original-custody");
+  mkdirSync(originalDirectory, { mode: 0o700 });
+  const pin = lstatSync(originalDirectory, { bigint: true });
+  const originalCreate = {
+    kind: "positive-fresh-0092" as const,
+    custodyDirectory: originalDirectory,
+    custodyIdentity: { device: String(pin.dev), inode: String(pin.ino) },
+  };
+  const invocation: IntegrationStorageGenerationInvocation = {
+    action: "apply",
+    environment: "integration",
+    commit: source,
+    generation,
+    namespace: "integration-ts",
+    freshLineage: "v2-0092",
+  };
+  const {
+    originCertificatePath: _certificate,
+    originCertificateDigest: _digest,
+    privateSourceRoot: _privateSource,
+    ...base
+  } = f.declaration;
+  const declaration = {
+    ...base,
+    databaseName: pair,
+    bucketName: pair,
+    privateWriterScopeDigest: f.write(f.paths.scope, {
+      ...f.scope,
+      profile: "standalone-host",
+      publicSourceCommit: source,
+      sourceInventoryDigest: sha(f.inventory),
+      components: [],
+    }),
+    originalOrigin: { invocation, originalTargetPath },
+  };
+  f.write(f.paths.declaration, declaration);
+  const request = {
+    selectedTarget: selected,
+    declarationPath: f.paths.declaration,
+    originalCreate,
+  };
+  return {
+    ...f,
+    target: selected,
+    declaration,
+    request,
+    invocation,
+    originalTarget,
+    originalTargetPath,
+    originalDirectory,
+    pair,
+  };
+}
+
+/** Actual creator/verifier/HTTP adapter; HTTP and command protocols are local stand-ins, never native evidence. */
+async function createdOriginalMoneyFixture(lostCreateAck = false) {
+  const f = freshOriginalMoneyFixture();
+  const database = new Database(":memory:");
+  const contacts: string[] = [];
+  const commands: string[][] = [];
+  let createdD1 = false;
+  let createdR2 = false;
+  let returnedD1Id = databaseId;
+  let returnedD1Name = f.pair;
+  let imports = 0;
+  let loseIdentityAfterImport = false;
+  let retainedImportFailure: "mixed-mode" | "digest" | undefined;
+  let retainedImport: { path: string; bytes: Uint8Array } | undefined;
+  let retainedImportFaultApplied = false;
+  let driftSealedInputAfterProviderAck = false;
+  let importAckSealFaultApplied = false;
+  const snapshot = () => {
+    const quoteName = (name: string) => `"${name.replaceAll('"', '""')}"`;
+    const tables = database
+      .query(
+        "SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+      )
+      .all() as { name: string; sql: string }[];
+    const statements = ["PRAGMA foreign_keys=OFF;", "BEGIN TRANSACTION;"];
+    for (const table of tables) statements.push(`${table.sql};`);
+    for (const table of tables) {
+      const columns = database.query(`PRAGMA table_info(${quoteName(table.name)})`).all() as {
+        name: string;
+      }[];
+      const projections = columns.map(
+        (column, index) => `quote(${quoteName(column.name)}) AS v${index}`,
+      );
+      const rows = database
+        .query(`SELECT ${projections.join(",")} FROM ${quoteName(table.name)}`)
+        .all() as Record<string, string>[];
+      for (const row of rows)
+        statements.push(
+          `INSERT INTO ${quoteName(table.name)} VALUES (${columns.map((_, index) => row[`v${index}`]).join(",")});`,
+        );
+    }
+    for (const row of database
+      .query(
+        "SELECT sql FROM sqlite_schema WHERE type IN ('index','trigger','view') AND sql IS NOT NULL ORDER BY type, name",
+      )
+      .all() as { sql: string }[])
+      statements.push(`${row.sql};`);
+    statements.push("COMMIT;");
+    return statements.join("\n");
+  };
+  const protocolFetch = Object.assign(
+    async (input: Parameters<typeof globalThis.fetch>[0]) => {
+      if (!(input instanceof Request)) throw new Error("unexpected non-Request protocol");
+      const url = new URL(input.url);
+      if (
+        url.origin !== "https://api.cloudflare.com" ||
+        !url.pathname.startsWith(`/client/v4/accounts/${account}/`)
+      )
+        throw new Error("unexpected protocol destination");
+      contacts.push(`${input.method} ${url.pathname}`);
+      const path = url.pathname.slice(`/client/v4/accounts/${account}`.length);
+      let result: unknown;
+      if (path === "/d1/database" && input.method === "POST") {
+        expect(await input.json()).toEqual({ name: f.pair });
+        createdD1 = true;
+        if (lostCreateAck) throw new Error("controlled lost create ACK");
+        result = { name: f.pair, uuid: databaseId };
+      } else if (path === "/d1/database" && input.method === "GET") {
+        expect(url.searchParams.get("name")).toBe(f.pair);
+        result = createdD1 ? [{ name: f.pair, uuid: databaseId }] : [];
+      } else if (path === `/d1/database/${databaseId}` && input.method === "GET") {
+        if (!createdD1) throw new Error("D1 not created");
+        result = { name: returnedD1Name, uuid: returnedD1Id };
+      } else if (path === "/r2/buckets" && input.method === "POST") {
+        expect(await input.json()).toEqual({ name: f.pair });
+        createdR2 = true;
+        result = { name: f.pair };
+      } else if (path === "/r2/buckets" && input.method === "GET") {
+        result = { buckets: createdR2 ? [{ name: f.pair }] : [] };
+      } else if (path === `/r2/buckets/${f.pair}` && input.method === "GET") {
+        if (!createdR2) throw new Error("R2 not created");
+        result = { name: f.pair };
+      } else throw new Error("unexpected provider protocol operation");
+      return Response.json({ success: true, errors: [], messages: [], result });
+    },
+    {
+      preconnect(..._parameters: Parameters<typeof globalThis.fetch.preconnect>): never {
+        throw new Error("unexpected original money preconnect");
+      },
+    },
+  ) satisfies typeof globalThis.fetch;
+  const http = spyOn(globalThis, "fetch").mockImplementation(protocolFetch);
+  const run: NonNullable<MoneyUnitOwnerDependencies["run"]> = async (command) => {
+    commands.push([...command]);
+    const key = command.join(" ");
+    const ok = (stdout = ""): CommandResult => ({ exitCode: 0, stdout, stderr: "" });
+    if (key === "git rev-parse HEAD") return ok(`${source}\n`);
+    if (key === "git branch --show-current") return ok("component-original-money\n");
+    if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok();
+    if (key === "bun run check:migrations") return ok("controlled source gate\n");
+    if (key === "git fetch --quiet --all --prune") return ok();
+    if (key === `git branch -r --contains ${source}`)
+      return ok("origin/component-original-money\n");
+    if (command.includes("d1") && command.includes("export")) {
+      const path = command[command.indexOf("--output") + 1];
+      if (!path) throw new Error("missing controlled export path");
+      writeFileSync(path, snapshot(), { mode: 0o600 });
+      return ok("controlled export\n");
+    }
+    if (command.includes("d1") && command.includes("execute")) {
+      const file = command.indexOf("--file");
+      if (file >= 0) {
+        const path = command[file + 1];
+        if (!path) throw new Error("missing controlled import path");
+        database.exec(readFileSync(path, "utf8"));
+        imports++;
+        if (loseIdentityAfterImport && imports > 1) returnedD1Id = id(903);
+        if (retainedImportFailure !== undefined && imports > 1) {
+          retainedImport = { path, bytes: readFileSync(path) };
+        }
+        const acknowledgement = ok("controlled import ACK\n");
+        if (driftSealedInputAfterProviderAck && imports > 1) {
+          // The provider accepted the import; drift before runImport receives its success result.
+          const retained = readFileSync(path);
+          chmodSync(path, 0o600);
+          writeFileSync(
+            path,
+            Buffer.concat([retained, Buffer.from("\n-- controlled acknowledged input drift\n")]),
+          );
+          chmodSync(path, 0o400);
+          importAckSealFaultApplied = true;
+        }
+        return acknowledgement;
+      }
+      const query = command.indexOf("--command");
+      const sql = command[query + 1];
+      if (query < 0 || !sql || !/^(?:SELECT|PRAGMA)\b/u.test(sql))
+        throw new Error("unexpected D1 protocol");
+      if (
+        retainedImportFailure !== undefined &&
+        retainedImport !== undefined &&
+        !retainedImportFaultApplied
+      ) {
+        // The import command already returned its ACK; fault the retained seal on post-read.
+        chmodSync(retainedImport.path, 0o600);
+        if (retainedImportFailure === "digest") {
+          writeFileSync(
+            retainedImport.path,
+            Buffer.concat([
+              retainedImport.bytes,
+              Buffer.from("\n-- controlled retained import drift\n"),
+            ]),
+          );
+          chmodSync(retainedImport.path, 0o400);
+        }
+        retainedImportFaultApplied = true;
+      }
+      return ok(JSON.stringify([{ success: true, results: database.query(sql).all() }]));
+    }
+    return f.run(command);
+  };
+  const dependencies = {
+    ...f,
+    run,
+    cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "controlled-original-money-token" },
+    storage: {
+      async getD1() {
+        return { name: f.pair, uuid: databaseId };
+      },
+      async getR2() {
+        return { name: f.pair };
+      },
+    },
+  };
+  const create = () =>
+    runIntegrationStorageGeneration(f.invocation, f.originalTarget, {
+      originalCreate: f.request.originalCreate,
+      run,
+      cloudflareEnvironment: dependencies.cloudflareEnvironment,
+      review: "controlled-original-protocol-review",
+    });
+  try {
+    if (!lostCreateAck) await create();
+  } catch (error) {
+    http.mockRestore();
+    database.close();
+    throw error;
+  }
+  return {
+    ...f,
+    database,
+    contacts,
+    commands,
+    dependencies,
+    create,
+    load: () => loadMoneyUnitOriginalCutoverOptions(f.request, dependencies),
+    replaceNativeD1(id: string, name = f.pair) {
+      returnedD1Id = id;
+      returnedD1Name = name;
+    },
+    failPostImportIdentity() {
+      loseIdentityAfterImport = true;
+    },
+    failRetainedImportAfterAck(kind: "mixed-mode" | "digest") {
+      retainedImportFailure = kind;
+    },
+    retainedImportFaultApplied: () => retainedImportFaultApplied,
+    failImportSealAfterProviderAck() {
+      driftSealedInputAfterProviderAck = true;
+    },
+    importAckSealFaultApplied: () => importAckSealFaultApplied,
+    imports: () => imports,
+    close() {
+      http.mockRestore();
+      database.close();
+    },
+  };
+}
+
+// All positives below are component protocol fixtures, not native creation/cutover qualification.
+describe("fresh original money writer", () => {
+  test("fresh writer keeps default/read parser semantics and requires its exact source selector", () => {
+    const f = freshOriginalMoneyFixture();
+    expect(() => parseDeployTarget(f.target, "component", "integration")).toThrow("writer policy");
+    expect(
+      parseDeployTarget(f.target, "component", "integration", "money-resume-read"),
+    ).toMatchObject({ d1: { databaseName: f.pair } });
+    expect(
+      parseDeployTarget(f.target, "component", "integration", "money-original-cutover"),
+    ).toMatchObject({ d1: { databaseName: f.pair } });
+    for (const selected of [
+      target,
+      { ...f.target, environment: "production" as const },
+      { ...f.target, workerName: "host-integration" },
+      { ...f.target, r2: { bucketName: name } },
+      { ...f.target, moneyCutoverWriterEpoch: undefined },
+    ]) {
+      expect(() =>
+        parseDeployTarget(selected, "component", "integration", "money-original-cutover"),
+      ).toThrow();
+    }
+  });
+
+  test("fresh writer refuses missing original locators, legacy certificates and JSON proofs before native reads", async () => {
+    const f = freshOriginalMoneyFixture();
+    await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, f.target, f)).rejects.toThrow(
+      "legacy staging origin",
+    );
+    const { originalOrigin: _locators, ...withoutOriginal } = f.declaration;
+    f.write(f.paths.declaration, {
+      ...withoutOriginal,
+      originCertificatePath: f.paths.origin,
+      originCertificateDigest: sha(JSON.stringify(f.origin)),
+    });
+    await expect(loadMoneyUnitOriginalCutoverOptions(f.request, f)).rejects.toThrow("declaration");
+    f.write(f.paths.declaration, f.declaration);
+    const forged = { ...f.request, originalCreate: { ...f.request.originalCreate, ready: true } };
+    await expect(loadMoneyUnitOriginalCutoverOptions(forged, f)).rejects.toThrow();
+    const forgedProof = {
+      ...f.request,
+      nativeProof: { authority: "provider-native", state: "terminal" },
+    };
+    await expect(loadMoneyUnitOriginalCutoverOptions(forgedProof, f)).rejects.toThrow(
+      "only target",
+    );
+    expect(f.requests).toEqual([]);
+  });
+
+  test("fresh writer bounds and fatally decodes its held declaration before native reads", async () => {
+    const f = freshOriginalMoneyFixture();
+    for (const bytes of [new Uint8Array([0xff]), new Uint8Array(1024 * 1024 + 1)]) {
+      writeFileSync(f.paths.declaration, bytes);
+      await expect(loadMoneyUnitOriginalCutoverOptions(f.request, f)).rejects.toThrow();
+    }
+    f.write(f.paths.declaration, f.declaration);
+    chmodSync(f.paths.declaration, 0o644);
+    await expect(loadMoneyUnitOriginalCutoverOptions(f.request, f)).rejects.toThrow("0600");
+    expect(f.requests).toEqual([]);
+  });
+
+  test("fresh writer uses the actual original chain after current schema advances through 93 and 94", async () => {
+    const f = await createdOriginalMoneyFixture();
+    try {
+      const options = await f.load();
+      expect(options.originalOriginQualification).toBe("independent-origin-review-required");
+      expect(Object.isFrozen(options)).toBe(true);
+      expect(Object.isFrozen(options.custody)).toBe(true);
+      expect(() => assertMoneyUnitOriginalWriterOptions(options, f.target)).not.toThrow();
+      const origin = await options.stageOriginProof();
+      expect(origin).toMatchObject({
+        databaseName: f.pair,
+        databaseId,
+        sourceCommit: source,
+        sourceDigest,
+        state: "terminal",
+      });
+      const queries = f.commands.filter((c) => c.includes("--command")).length;
+      const files = readMigrationArtifact(join(REPOSITORY, "migrations")).files;
+      for (const index of [92, 93]) {
+        const file = files[index];
+        if (!file) throw new Error("missing audited current phase source");
+        f.database.exec(readFileSync(file.path, "utf8"));
+        expect(await options.stageOriginProof()).toEqual(origin);
+      }
+      expect(f.commands.filter((c) => c.includes("--command")).length).toBe(queries);
+      expect(await options.storageIdentityRead()).toEqual({
+        accountId: account,
+        databaseId,
+        databaseName: f.pair,
+        bucketName: f.pair,
+      });
+      const binding: MoneyReviewBinding = {
+        kind: "takoserver.money-review-binding@v1",
+        phase: "freeze",
+        accountId: account,
+        databaseId,
+        originDigest: sha(JSON.stringify(origin)),
+        predecessorCustodyDigest: origin.terminalCustodyDigest,
+        sourceCommit: source,
+        sourceDigest,
+        importDigest: sha("component sealed import"),
+        backupDigest: sha("component backup"),
+        preimageDigest: sha("component preimage"),
+        aggregateDigest: sha("component aggregates"),
+        classificationDigest: sha("component classification"),
+        writerDigest: sha("component exact writer"),
+        resumeDigest: sha("none"),
+        writerEpoch,
+      };
+      expect(await options.independentReview?.(binding)).toBeNull();
+      expect((await options.maintenanceProof()).privateMoneyWriters).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("fresh writer rejects copied options, forged proof ports and a different current target", async () => {
+    const f = await createdOriginalMoneyFixture();
+    try {
+      const options = await f.load();
+      const invocation = {
+        action: "status" as const,
+        environment: "integration" as const,
+        commit: source,
+        throughMigration: "0093" as const,
+      };
+      for (const copied of [
+        { ...options },
+        {
+          ...options,
+          stageOriginProof: async () => ({
+            ...(await options.stageOriginProof()),
+            state: "terminal" as const,
+          }),
+        },
+      ]) {
+        await expect(runIntegrationMoneyUnitCutover(invocation, f.target, copied)).rejects.toThrow(
+          "same owning original options",
+        );
+      }
+      await expect(
+        runIntegrationMoneyUnitCutover(
+          { ...invocation, throughMigration: "0094" },
+          f.target,
+          options,
+        ),
+      ).rejects.toThrow("phase and fixed schema wave differ");
+      expect(() =>
+        assertMoneyUnitOriginalWriterOptions(options, {
+          ...f.target,
+          d1: { ...f.target.d1, databaseId: id(901) },
+        }),
+      ).toThrow("same owning original options");
+      expect(() =>
+        Object.defineProperty(options, "stageOriginProof", {
+          value: async () => ({ ready: true }),
+        }),
+      ).toThrow();
+      expect(() =>
+        Object.defineProperty(options.custody, "dispatch", {
+          value: async () => ({ ready: true }),
+        }),
+      ).toThrow();
+    } finally {
+      f.close();
+    }
+  });
+
+  test("fresh writer captures original dependency ports and refuses replaced selected inputs", async () => {
+    const f = await createdOriginalMoneyFixture();
+    try {
+      const options = await f.load();
+      f.dependencies.storage.getD1 = async () => {
+        throw new Error("late storage replacement consumed");
+      };
+      f.dependencies.state.workerDeployments = async () => {
+        throw new Error("late state replacement consumed");
+      };
+      expect(await options.storageIdentityRead()).toMatchObject({ databaseName: f.pair });
+      expect((await options.maintenanceProof()).privateMoneyWriters).toBe(0);
+      const contacts = f.contacts.length;
+      f.write(f.originalTargetPath, { ...f.originalTarget, workerName: "changed-incumbent" });
+      await expect(options.stageOriginProof()).rejects.toThrow("changed after selection");
+      expect(f.contacts.length).toBe(contacts);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("fresh writer retains UNKNOWN and classifies post-import identity loss as verification", async () => {
+    const f = await createdOriginalMoneyFixture(true);
+    try {
+      await expect(f.create()).rejects.toThrow();
+      const paths = readdirSync(f.originalDirectory).filter((p) => p.endsWith(".json"));
+      const before = paths.map((p) => readFileSync(join(f.originalDirectory, p), "utf8"));
+      const contacts = f.contacts.length;
+      await expect(f.load()).rejects.toThrow("terminal chain");
+      expect(f.contacts.length).toBe(contacts);
+      expect(paths.map((p) => readFileSync(join(f.originalDirectory, p), "utf8"))).toEqual(before);
+      expect(
+        f.contacts.filter((p) => p === `POST /client/v4/accounts/${account}/d1/database`),
+      ).toHaveLength(1);
+    } finally {
+      f.close();
+    }
+    const mismatch = await createdOriginalMoneyFixture();
+    try {
+      mismatch.replaceNativeD1(id(902));
+      await expect(mismatch.load()).rejects.toThrow("ACK");
+    } finally {
+      mismatch.close();
+    }
+    const post = await createdOriginalMoneyFixture();
+    try {
+      const options = await post.load();
+      const invocation = {
+        action: "status" as const,
+        environment: "integration" as const,
+        commit: source,
+        throughMigration: "0093" as const,
+      };
+      const status = await runIntegrationMoneyUnitCutover(invocation, post.target, options);
+      if (typeof status.reviewBindingDigest !== "string")
+        throw new Error("missing actual review binding");
+      const evidenceDigest = sha("controlled post-import phase review");
+      post.write(post.paths.review, {
+        kind: "takoserver.money-independent-review@v1",
+        state: "reviewed",
+        reviewedAt,
+        reviewEvidenceDigest: evidenceDigest,
+        reviewer: "component-reviewer",
+        reviewRef: "review://controlled-post-import",
+        bindingDigest: status.reviewBindingDigest,
+        evidenceDigest,
+      });
+      post.failPostImportIdentity();
+      try {
+        await runIntegrationMoneyUnitCutover(
+          { ...invocation, action: "apply" },
+          post.target,
+          options,
+        );
+        throw new Error("expected controlled post-import failure");
+      } catch (error) {
+        expect(error).toMatchObject({ phase: "verification" });
+        if (!(error instanceof Error)) throw error;
+        expect(error.message).toContain("after import");
+        expect(error.cause).toBeInstanceOf(Error);
+      }
+      expect(post.imports()).toBe(2); // Original92 plus exactly one actual money freeze import.
+      expect(await options.custody.read("freeze")).toMatchObject({ state: "dispatched" });
+      await expect(
+        runIntegrationMoneyUnitCutover({ ...invocation, action: "apply" }, post.target, options),
+      ).rejects.toThrow("cannot resend");
+      expect(post.imports()).toBe(2);
+      expect(await options.custody.read("freeze")).toMatchObject({ state: "dispatched" });
+    } finally {
+      post.close();
+    }
+  });
+
+  test("fresh money CLI keeps original selection closed before provider or production input reads", () => {
+    const result = Bun.spawnSync(
+      [
+        process.execPath,
+        "--no-env-file",
+        "scripts/deploy.ts",
+        "takoserver-d1-schema",
+        "--status",
+        "--environment=integration",
+        `--commit=${source}`,
+        "--through-migration=0088",
+      ],
+      {
+        cwd: REPOSITORY,
+        env: {
+          PATH: "/usr/local/bin:/usr/bin:/bin",
+          TMPDIR: tmpdir(),
+          TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH: "/not-a-selected-input",
+          TAKOSERVER_DEPLOY_TARGET_PRODUCTION: "/must-not-read-production",
+        },
+        timeout: 1000,
+      },
+    );
+    expect(result.exitCode).not.toBe(0);
+    expect(new TextDecoder().decode(result.stderr)).toContain(
+      "original-create input is supported only",
+    );
+  });
+});
+
+function sealedImportCustodyFixture() {
+  const f = fixture();
+  const directory = join(f.root, "sealed-money-import");
+  mkdirSync(directory, { mode: 0o700 });
+  const sealedImportPath = join(directory, "import.sql");
+  const sql = "-- component custody bytes; never executed\n";
+  writeFileSync(sealedImportPath, sql, { mode: 0o600 });
+  const binding: MoneyCutoverDispatchBinding = {
+    kind: "takoserver.money-cutover-dispatch@v1",
+    phase: "freeze",
+    accountId: account,
+    databaseId,
+    databaseName: name,
+    originDigest: sha("origin"),
+    predecessorCustodyDigest: sha("previous"),
+    sourceCommit: source,
+    sourceDigest,
+    importDigest: sha(sql),
+    backupDigest: sha("backup"),
+    preimageDigest: sha("preimage"),
+    aggregateDigest: sha("aggregate"),
+    classificationDigest: sha("classifications"),
+    writerDigest: sha("writer"),
+    resumeDigest: sha("none"),
+    writerEpoch,
+    reviewDigest: sha("review"),
+    beforeShapeDigest: sha("shape"),
+    afterSchemaPhase: "0092-fenced",
+    sealedImportPath,
+  };
+  return { ...f, directory, sealedImportPath, sql, binding };
+}
+
+describe("money sealed import custody", () => {
+  test("reads the real readonly producer seal through dispatch, reopen and terminal custody", async () => {
+    const f = sealedImportCustodyFixture();
+    try {
+      const seal = sealDirectory(f.directory, ["import.sql"]);
+      expect(lstatSync(f.directory).mode & 0o777).toBe(0o500);
+      expect(lstatSync(f.sealedImportPath).mode & 0o777).toBe(0o400);
+      const options = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+      expect((await options.custody.dispatch(f.binding)).state).toBe("dispatched");
+      expect(await options.custody.readDispatch("freeze")).toEqual(f.binding);
+      expect(await options.custody.read("freeze")).toMatchObject({ state: "dispatched" });
+      const reopened = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+      expect(await reopened.custody.readDispatch("freeze")).toEqual(f.binding);
+      expect((await reopened.custody.terminal(f.binding, sha("post"))).state).toBe("terminal");
+      expect(await reopened.custody.read("freeze")).toMatchObject({ state: "terminal" });
+      expect(() => seal.assertUnchanged()).not.toThrow();
+      expect(lstatSync(f.directory).mode & 0o777).toBe(0o500);
+      expect(lstatSync(f.sealedImportPath).mode & 0o777).toBe(0o400);
+      await expect(reopened.custody.dispatch(f.binding)).rejects.toThrow("already exists");
+    } finally {
+      removeArtifactTree(f.directory);
+    }
+  });
+
+  test("refuses mixed or exposed import modes, links, oversize bytes and digest drift before custody writes", async () => {
+    const f = sealedImportCustodyFixture();
+    const options = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+    const directories: string[] = [];
+    let ordinal = 0;
+    const input = (directoryMode = 0o500, fileMode = 0o400, bytes = f.sql) => {
+      const directory = join(f.root, `invalid-import-${ordinal++}`);
+      directories.push(directory);
+      mkdirSync(directory, { mode: 0o700 });
+      const path = join(directory, "import.sql");
+      writeFileSync(path, bytes, { mode: 0o600 });
+      chmodSync(path, fileMode);
+      chmodSync(directory, directoryMode);
+      return {
+        directory,
+        path,
+        binding: { ...f.binding, sealedImportPath: path, importDigest: sha(bytes) },
+      };
+    };
+    const refused = async (binding: MoneyCutoverDispatchBinding) => {
+      await expect(options.custody.dispatch(binding)).rejects.toThrow();
+      expect(await options.custody.read("freeze")).toBeNull();
+      expect(await options.custody.readDispatch("freeze")).toBeNull();
+    };
+    try {
+      // Legacy 0700/0600 is deliberately still valid, as the unchanged old19 prove.
+      for (const [directoryMode, fileMode] of [
+        [0o500, 0o600],
+        [0o700, 0o400],
+        [0o755, 0o400],
+        [0o500, 0o440],
+        [0o700, 0o660],
+        [0o500, 0o200],
+      ])
+        await refused(input(directoryMode, fileMode).binding);
+      const linked = input(0o700, 0o600);
+      rmSync(linked.path);
+      symlinkSync(f.sealedImportPath, linked.path);
+      await refused(linked.binding);
+      const hard = input(0o700, 0o600);
+      rmSync(hard.path);
+      linkSync(f.sealedImportPath, hard.path);
+      await refused(hard.binding);
+      const nested = input(0o700, 0o600);
+      const alias = join(f.root, "import-directory-alias");
+      symlinkSync(nested.directory, alias);
+      await refused({ ...nested.binding, sealedImportPath: join(alias, "import.sql") });
+      await refused(input(0o500, 0o400, "x".repeat(1024 * 1024 + 1)).binding);
+      const drift = input();
+      await expect(
+        options.custody.dispatch({ ...drift.binding, importDigest: sha("other bytes") }),
+      ).rejects.toThrow("sealed import SQL differs before dispatch");
+      expect(await options.custody.read("freeze")).toBeNull();
+      await refused({ ...f.binding, sealedImportPath: join(REPOSITORY, "package.json") });
+    } finally {
+      for (const directory of directories) removeArtifactTree(directory);
+      removeArtifactTree(f.directory);
+    }
+  });
+});
+
+describe("money acknowledged custody failure", () => {
+  test("classifies retained seal drift after an import ACK as verification and never replays", async () => {
+    for (const fault of ["mixed-mode", "digest"] as const) {
+      const post = await createdOriginalMoneyFixture();
+      try {
+        const options = await post.load();
+        const invocation = {
+          action: "status" as const,
+          environment: "integration" as const,
+          commit: source,
+          throughMigration: "0093" as const,
+        };
+        const status = await runIntegrationMoneyUnitCutover(invocation, post.target, options);
+        if (typeof status.reviewBindingDigest !== "string")
+          throw new Error("missing actual review binding");
+        const evidenceDigest = sha(`controlled retained-seal phase review ${fault}`);
+        post.write(post.paths.review, {
+          kind: "takoserver.money-independent-review@v1",
+          state: "reviewed",
+          reviewedAt,
+          reviewEvidenceDigest: evidenceDigest,
+          reviewer: "component-reviewer",
+          reviewRef: "review://controlled-retained-seal",
+          bindingDigest: status.reviewBindingDigest,
+          evidenceDigest,
+        });
+        post.failRetainedImportAfterAck(fault);
+        try {
+          await runIntegrationMoneyUnitCutover(
+            { ...invocation, action: "apply" },
+            post.target,
+            options,
+          );
+          throw new Error("expected controlled post-ACK custody verification failure");
+        } catch (error) {
+          expect(error).toMatchObject({ phase: "verification" });
+          if (!(error instanceof Error) || !(error.cause instanceof Error)) throw error;
+          expect(error.message).toContain("acknowledged");
+          expect(error.cause).toMatchObject({ phase: "preflight" });
+          expect(error.cause.message).toContain("money sealed import SQL");
+          if (fault === "digest")
+            expect(error.cause.message).toContain("differs from immutable dispatch");
+        }
+        expect(post.retainedImportFaultApplied()).toBe(true);
+        expect(post.imports()).toBe(2);
+        const dispatched = join(post.declaration.custodyDirectory, "freeze.dispatched.json");
+        const retained = readFileSync(dispatched, "utf8");
+        const retainedDigest = sha(retained);
+        expect(JSON.parse(retained)).toMatchObject({ receipt: { state: "dispatched" } });
+        expect(existsSync(join(post.declaration.custodyDirectory, "freeze.terminal.json"))).toBe(
+          false,
+        );
+        await expect(options.custody.readDispatch("freeze")).rejects.toThrow(
+          "money sealed import SQL",
+        );
+        await expect(
+          runIntegrationMoneyUnitCutover({ ...invocation, action: "apply" }, post.target, options),
+        ).rejects.toThrow("money sealed import SQL");
+        expect(post.imports()).toBe(2);
+        expect(readFileSync(dispatched, "utf8")).toBe(retained);
+        expect(sha(readFileSync(dispatched, "utf8"))).toBe(retainedDigest);
+        expect(existsSync(join(post.declaration.custodyDirectory, "freeze.terminal.json"))).toBe(
+          false,
+        );
+      } finally {
+        post.close();
+      }
+    }
+  });
+});
+
+describe("money acknowledged import input failure", () => {
+  test("classifies input drift before an acknowledged import returns as verification without replay", async () => {
+    const post = await createdOriginalMoneyFixture();
+    try {
+      const options = await post.load();
+      const invocation = {
+        action: "status" as const,
+        environment: "integration" as const,
+        commit: source,
+        throughMigration: "0093" as const,
+      };
+      const status = await runIntegrationMoneyUnitCutover(invocation, post.target, options);
+      if (typeof status.reviewBindingDigest !== "string")
+        throw new Error("missing actual review binding");
+      const evidenceDigest = sha("controlled acknowledged-input phase review");
+      post.write(post.paths.review, {
+        kind: "takoserver.money-independent-review@v1",
+        state: "reviewed",
+        reviewedAt,
+        reviewEvidenceDigest: evidenceDigest,
+        reviewer: "component-reviewer",
+        reviewRef: "review://controlled-acknowledged-input",
+        bindingDigest: status.reviewBindingDigest,
+        evidenceDigest,
+      });
+      post.failImportSealAfterProviderAck();
+      try {
+        await runIntegrationMoneyUnitCutover(
+          { ...invocation, action: "apply" },
+          post.target,
+          options,
+        );
+        throw new Error("expected acknowledged import input verification failure");
+      } catch (error) {
+        expect(error).toMatchObject({ phase: "verification" });
+        if (!(error instanceof Error) || !(error.cause instanceof Error)) throw error;
+        expect(error.message).toContain("acknowledged");
+        expect(error.message).toContain("without replay");
+        expect(error.cause).toMatchObject({ phase: "preflight" });
+        expect(error.cause.message).toContain("artifact changed after it was sealed");
+      }
+      expect(post.importAckSealFaultApplied()).toBe(true);
+      expect(post.imports()).toBe(2);
+      const dispatched = join(post.declaration.custodyDirectory, "freeze.dispatched.json");
+      const retained = readFileSync(dispatched, "utf8");
+      const retainedDigest = sha(retained);
+      expect(JSON.parse(retained)).toMatchObject({ receipt: { state: "dispatched" } });
+      expect(existsSync(join(post.declaration.custodyDirectory, "freeze.terminal.json"))).toBe(
+        false,
+      );
+      await expect(options.custody.readDispatch("freeze")).rejects.toThrow(
+        "differs from immutable dispatch",
+      );
+      await expect(
+        runIntegrationMoneyUnitCutover({ ...invocation, action: "apply" }, post.target, options),
+      ).rejects.toThrow("differs from immutable dispatch");
+      expect(post.imports()).toBe(2);
+      expect(readFileSync(dispatched, "utf8")).toBe(retained);
+      expect(sha(readFileSync(dispatched, "utf8"))).toBe(retainedDigest);
+      expect(existsSync(join(post.declaration.custodyDirectory, "freeze.terminal.json"))).toBe(
+        false,
+      );
+    } finally {
+      post.close();
+    }
   });
 });

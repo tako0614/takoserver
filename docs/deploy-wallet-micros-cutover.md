@@ -1,12 +1,32 @@
 # 既存integration D1のUSD-micros cutover
 
-この経路は既存のstaging専用で、production・fresh generation・0088→0092の適用資格を広げない。D1/R2を削除・作り直さず、0093分類準備、証拠投入、0094不可逆変換を別phaseとして実行する。0095以後は独立したsuffix qualificationが必要で、この経路から自動適用しない。
+この経路は既存のstaging D1専用で、production・fresh generationの作成・0088→0092の適用資格を広げない。legacy stagingの証明経路に加え、既に元のcreatorで完成した`integration-ts`の固定92 originを明示選択できる。D1/R2を削除・作り直さず、0093分類準備、証拠投入、0094不可逆変換を別phaseとして実行する。0095以後は独立したsuffix qualificationが必要で、この経路から自動適用しない。
 
 ## 入口と資格
 
 通常の`bun run deploy -- takoserver-d1-schema --status|--apply --environment=integration --commit=<exact SHA> --through-migration=0093|0094`を使う。operator-owned 0600 declarationを`TAKOSERVER_D1_MONEY_CUTOVER_DECLARATION_PATH`で指定する。declarationは絶対パス、正のstaging identity、phase、maintenance/source、保護された起源・writer inventory・backup・分類・review・custodyの各path/digestを束縛する。schema waveのowner adapterがnative readbackを行い、停止booleanを入力として採用しない。
 
-新経路はproduction target設定やproduction D1を読まない。既存generationの正常終了記録とpost-statusの正のstaging metadataを独立reviewしたcertificate、固定0001–0092 digest、native D1 UUID/nameとR2 nameの一致を求める。名前だけでは許可しない。秘密値・snapshot内容・provider生出力をログやPRへ出さない。
+この経路はproduction target設定やproduction D1を読まない。legacy分岐は既存generationの正常終了記録とpost-statusの正のstaging metadataを独立reviewしたcertificateを使い、明示fresh-origin分岐は以下の元creator custodyを使う。どちらも固定0001–0092 digest、native D1 UUID/nameとR2 nameの一致を求める。名前だけでは許可しない。秘密値・snapshot内容・provider生出力をログやPRへ出さない。
+
+### 元のfresh92 custodyを使う明示分岐
+
+`TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH`を設定すると、同じintegration専用0093/0094 CLIだけが既存のbounded 0600 original-create locatorを読む。
+この入力の`kind: positive-fresh-0092`、`custodyDirectory`と独立に保持したdevice/inode pinは、元のcreatorの入力そのものを選択する。credentialや結果証明ではない。
+不在時は既存legacy certificate経路を維持する。一般のschema、production、別waveへこの入力を流用せず、`--contract`は入力を開かない。
+
+money declarationではlegacyの`originCertificatePath`/`originCertificateDigest`に代え、`originalOrigin`だけを持つ。
+その値は`invocation`と`originalTargetPath`の二つで、invocationは元の`action: apply`、`environment: integration`、40-hex `commit`、32-lowercase-hex `generation`、`namespace: integration-ts`、`freshLineage: v2-0092`の正確な六fieldである。
+`originalTargetPath`は元create時に衝突を避けたincumbent integration targetであり、現在のnew targetや保存statusで置換しない。
+declarationとこの元targetはprivate0700 root下のsingle-link 0600 regular fileをheld/nonblocking/no-followで有界読取し、fatal UTF-8、同一FD/pathと読取後のcurrentnessを確認する。
+
+現在のtargetは同accountの正確な`integration-ts-<generation>` D1/R2 pair、元create ACKのD1 UUID、immutable `v2-0092` origin、明示writer policy/epoch、literal integration-/staging- Worker名と対応するworkers.dev originを選ぶ。
+同じ`verifyIntegrationStorageOriginalCreate`が元のsealed92 source/import、dispatch/ACK/R2/terminal chain、現在のnative D1 UUID/nameとR2 nameを毎phaseで照合する。
+これは現在DBをexact92へ戻す要求ではない。現在の93/94 schema/shape/fencesは既存phase executorが独立に検証し、dispatch直前とimport後にも元origin/current identityを再確認する。
+originの`independent-origin-review-required`はそのまま保持し、legacy-reviewedや通常Host readinessへ昇格しない。
+
+genuine native originを通った同一ownerのfrozen optionsだけを同process内で識別する。target JSON、read selector、コピーしたoptionsや差替えproof callbackではwriter provenanceを再構成できない。
+既存のmaintenance publication、phase-specific review、backup、writer epoch、財務fence、保存則、no-overwrite custodyとUNKNOWN時の非再送はすべて必要である。
+この分岐はpost94 suffix、qualified0098 realm、通常Host起動、CPE exact88/89 guard、epoch rotationや新grantを提供しない。source実装やcomponent protocol fixtureだけで実native cutoverの資格を主張しない。
 
 ## 順序
 
