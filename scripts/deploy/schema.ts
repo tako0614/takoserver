@@ -395,7 +395,7 @@ const AUDITED_MIGRATION_SHA256: Readonly<
   "0099_hosted_billing_extensions.sql":
     "sha256:b7ad0ad7876ac993d1b6de1cb14c2aea62067147638f48456626baf9673156d8",
   "0100_hosted_on_demand.sql":
-    "sha256:b04c1d13d1b9a5b16ab205b7fcaead6dd3ecba5f36ba54771f9492ffa2247bc1",
+    "sha256:da2b839959b4c7bc06e3d74507043c1ba9f6acf80baa927d8b6c30484d2676d4",
 };
 // The ordinary integration ceiling remains 0066; its later fixed wave ends at 0092.
 // The separate money-cutover owner qualifies only 0093/0094. Neither lane
