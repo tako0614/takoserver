@@ -8,7 +8,10 @@ import {
   type HostedBillingComposition,
   type HostedOnDemandConfiguration,
 } from "./hosted-billing-composition.ts";
-import { verifyHostedBillingFinancialRealm } from "./hosted-billing-realm.ts";
+import {
+  type HostedBillingFinancialRealm,
+  verifyHostedBillingFinancialRealm,
+} from "./hosted-billing-realm.ts";
 import { assertHostedPricingMatchesBilling, parseHostedPricing } from "./hosted-pricing.ts";
 import { resolveIdentity } from "./identity-setup.ts";
 import {
@@ -65,6 +68,14 @@ import {
   createWorkerEndpointOriginReservations,
 } from "./worker-endpoint-origin-reservations.ts";
 import { createWorkerProductionComposition } from "./worker-production-composition.ts";
+import {
+  captureWorkerSharedAuthStaging,
+  createWorkerRequestSql,
+  type WorkerRequestAppInputs,
+  type WorkerRequestDatabase,
+  type WorkerRequestSql,
+  type WorkerSharedAuthStaging,
+} from "./worker-request-composition.ts";
 
 /**
  * The Cloudflare Workers entry.
@@ -78,7 +89,7 @@ import { createWorkerProductionComposition } from "./worker-production-compositi
 
 export interface WorkerEnv {
   readonly AI?: CloudflareWorkersAiBinding;
-  readonly STATE_DB: Parameters<typeof createD1Sql>[0];
+  readonly STATE_DB: WorkerRequestDatabase;
   readonly OBJECTS: Parameters<typeof createR2ObjectStore>[0];
   readonly WORKER_VERSION: { readonly id: string };
   readonly PUBLIC_ORIGIN?: string;
@@ -430,6 +441,8 @@ function hasSelectedV2PrivateInputHooks(
 }
 
 export interface WorkerEntryOptions {
+  /** Code-only isolated shared-login composition; every invocation gets one fresh primary. */
+  readonly sharedAuthStaging?: WorkerSharedAuthStaging;
   /** Operator code only; no request or environment field selects the composer. */
   readonly composeV2Forms?: WorkerEntryV2FormComposer;
   /** Operator code only; omission or an undefined result leaves origin acceptance unselected. */
@@ -956,6 +969,10 @@ async function composeApp(
   composeV2ArtifactSource: WorkerEntryV2ArtifactSourceComposer | undefined,
   composeV2FreshAdmission: WorkerEntryOptions["composeV2FreshAdmission"],
   composeV2WorkerEndpointOrigin: WorkerEntryOptions["composeV2WorkerEndpointOrigin"],
+  request?: {
+    readonly connection: WorkerRequestSql;
+    readonly sharedAuth: WorkerSharedAuthStaging;
+  },
 ): Promise<App> {
   if (composeV2Forms !== undefined && typeof composeV2Forms !== "function") {
     throw new WorkerStartupError(
@@ -1072,9 +1089,14 @@ async function composeApp(
     origin,
     integrationE2eCredentialAuthority,
   );
-  const rawSql = createD1Sql(env.STATE_DB);
-  const writerEpoch = moneyCutoverWriterPolicy(env);
-  const sql = writerEpoch === null ? rawSql : createMoneyCutoverSql(rawSql, writerEpoch);
+  const sql =
+    request === undefined
+      ? (() => {
+          const rawSql = createD1Sql(env.STATE_DB);
+          const writerEpoch = moneyCutoverWriterPolicy(env);
+          return writerEpoch === null ? rawSql : createMoneyCutoverSql(rawSql, writerEpoch);
+        })()
+      : request.connection.sql;
   try {
     // The wallet and ledger use USD micros even when tariff billing is disabled.
     // This read-only proof precedes every normal serving composition and tariff write.
@@ -1148,6 +1170,7 @@ async function composeApp(
   const objects = createR2ObjectStore(env.OBJECTS);
   const clock = () => new Date();
   let hostedBilling: HostedBillingComposition | undefined;
+  let hostedRealm: HostedBillingFinancialRealm | undefined;
   if (canonicalHostedInputs) {
     try {
       const realm = await verifyHostedBillingFinancialRealm({
@@ -1165,6 +1188,7 @@ async function composeApp(
             monthlyAmountMinor: plan.monthlyAmountMinor,
           })),
       });
+      hostedRealm = realm;
       hostedBilling = await createCanonicalHostedBillingComposition({
         sql,
         clock,
@@ -1190,6 +1214,22 @@ async function composeApp(
       );
     }
   }
+  const workerRequest: WorkerRequestAppInputs | undefined =
+    request === undefined
+      ? undefined
+      : (() => {
+          if (!canonicalHostedInputs || !hostedRealm || !hostedBilling)
+            throw new WorkerStartupError(
+              "runtime-configuration",
+              new TypeError("shared-login Worker requires its genuine canonical Hosted TEST realm"),
+            );
+          return {
+            connection: request.connection,
+            sharedAuth: request.sharedAuth,
+            client: canonicalHostedInputs.client,
+            realm: hostedRealm,
+          };
+        })();
   let selectedV2Forms: WorkerEntryV2FormSelection | undefined;
   let selectedV2PrivateInputHooks = false;
   if (composeV2Forms !== undefined) {
@@ -1285,6 +1325,7 @@ async function composeApp(
   try {
     app = buildApp({
       sql,
+      ...(workerRequest === undefined ? {} : { workerRequest }),
       objects,
       publicWorkerVersionId: env.WORKER_VERSION.id,
       ...(implementationIdentity
@@ -1377,8 +1418,25 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
   const composeV2ArtifactSource = options.composeV2ArtifactSource;
   const composeV2FreshAdmission = options.composeV2FreshAdmission;
   const composeV2WorkerEndpointOrigin = options.composeV2WorkerEndpointOrigin;
+  const sharedAuthStaging =
+    options.sharedAuthStaging === undefined
+      ? undefined
+      : captureWorkerSharedAuthStaging(options.sharedAuthStaging);
   const starts = new WeakMap<WorkerEnv, Promise<App>>();
-  const appFor = (env: WorkerEnv, origin: string): Promise<App> => {
+  const appFor = (env: WorkerEnv, origin: string, connection?: WorkerRequestSql): Promise<App> => {
+    if (sharedAuthStaging !== undefined) {
+      if (connection === undefined)
+        throw new TypeError("shared-login Worker request lacks its primary composition");
+      return composeApp(
+        env,
+        origin,
+        composeV2Forms,
+        composeV2ArtifactSource,
+        composeV2FreshAdmission,
+        composeV2WorkerEndpointOrigin,
+        { connection, sharedAuth: sharedAuthStaging },
+      );
+    }
     const existing = starts.get(env);
     if (existing) return existing;
     const started = composeApp(
@@ -1418,13 +1476,27 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
         if (mode === "pre-0043-quiesced") {
           return artifactBlobIoQuiescenceResponse();
         }
-        if (moneyPolicy !== null) {
+        let connection: WorkerRequestSql | undefined;
+        let selectedOrigin: string | undefined;
+        if (sharedAuthStaging !== undefined) {
+          selectedOrigin = startupStage("public-origin", () => requirePublicOrigin(env));
+          if (moneyPolicy === null)
+            throw new TypeError("shared-login Worker requires the selected Money writer");
+          connection = await createWorkerRequestSql({
+            database: env.STATE_DB,
+            writerEpoch: moneyPolicy,
+            publicOrigin: selectedOrigin,
+            consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN,
+          });
+          if (connection.moneyGuard === "frozen") return moneyCutoverFrozenResponse();
+        } else if (moneyPolicy !== null) {
           const guard = await inspectMoneyCutoverGuard(createD1Sql(env.STATE_DB), moneyPolicy);
           if (guard === "frozen") return moneyCutoverFrozenResponse();
         }
         app = await appFor(
           env,
-          startupStage("public-origin", () => requirePublicOrigin(env)),
+          selectedOrigin ?? startupStage("public-origin", () => requirePublicOrigin(env)),
+          connection,
         );
       } catch (error) {
         return workerStartupFailureResponse(error);
@@ -1458,11 +1530,24 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
       if (schemaMaintenanceMode(env) !== "normal") return;
       if (artifactBlobIoMode(env) === "pre-0043-quiesced") return;
       const writerEpoch = moneyCutoverWriterPolicy(env);
-      if (writerEpoch !== null) {
+      let connection: WorkerRequestSql | undefined;
+      let selectedOrigin: string | undefined;
+      if (sharedAuthStaging !== undefined) {
+        selectedOrigin = requirePublicOrigin(env);
+        if (writerEpoch === null)
+          throw new TypeError("shared-login Worker requires the selected Money writer");
+        connection = await createWorkerRequestSql({
+          database: env.STATE_DB,
+          writerEpoch,
+          publicOrigin: selectedOrigin,
+          consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN,
+        });
+        if (connection.moneyGuard === "frozen") return;
+      } else if (writerEpoch !== null) {
         if ((await inspectMoneyCutoverGuard(createD1Sql(env.STATE_DB), writerEpoch)) === "frozen")
           return;
       }
-      const app = await appFor(env, requirePublicOrigin(env));
+      const app = await appFor(env, selectedOrigin ?? requirePublicOrigin(env), connection);
       const results = await Promise.allSettled([
         Promise.resolve().then(() => app.tick()),
         Promise.resolve().then(() => drainV2Operations(() => app.tickTakoformV2())),

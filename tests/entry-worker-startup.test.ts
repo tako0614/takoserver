@@ -5,6 +5,7 @@ import { readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import { buildMoneyCutoverImportSql } from "../scripts/deploy/schema-money-unit-cutover.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import worker, {
+  createWorkerEntry,
   resolvePublicWorkerImplementationIdentity,
   workerIntegrationOrganizationBootstrap,
 } from "../src/entry-worker.ts";
@@ -13,6 +14,7 @@ import {
   type IntegrationE2eCredentialAuthorityConfig,
 } from "../src/integration-e2e-credential-authority.ts";
 import type { SqlParam } from "../src/ports.ts";
+import { SHARED_AUTH_STAGING_PROFILE } from "../src/shared-auth-oidc-client.ts";
 import {
   EDGE_ONLY_RESOURCE_CLASSES,
   edgeSuppliesFixture,
@@ -95,6 +97,39 @@ async function envelope(response: Response) {
 }
 
 describe("Worker startup diagnostics", () => {
+  test("the code-selected shared-login entry refuses foreign origins before opening a primary", async () => {
+    let sessions = 0;
+    const entry = createWorkerEntry({
+      sharedAuthStaging: {
+        kind: "shared-auth-staging-v1",
+        clientSecret: "test-only-selected-entry-secret",
+        encryptionKey: new Uint8Array(32).fill(7),
+        principals: {
+          async resolve(): Promise<never> {
+            throw new Error("no test principal authority");
+          },
+        },
+      },
+    });
+    const env = workerEnv({
+      STATE_DB: {
+        ...d1(readyDatabase),
+        withSession() {
+          sessions += 1;
+          throw new Error("foreign origin opened a primary");
+        },
+      },
+      PUBLIC_ORIGIN: "https://foreign-staging.example.test",
+      TAKOSERVER_CONSOLE_ORIGIN: SHARED_AUTH_STAGING_PROFILE.consoleOrigin,
+      TAKOSERVER_ENVIRONMENT: "integration",
+      TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY: "transaction-fenced-usd-micros-v1",
+      TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH: `sha256:${"b".repeat(64)}`,
+    });
+    const response = await entry.fetch(new Request(`${env.PUBLIC_ORIGIN}/auth/oidc/session`), env);
+    expect(response.status).toBe(503);
+    expect(sessions).toBe(0);
+  });
+
   test("selected money Worker returns exact guarded 503 and refuses missing guards", async () => {
     const policy = "transaction-fenced-usd-micros-v1";
     const writerEpoch = `sha256:${"b".repeat(64)}`;
