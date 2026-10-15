@@ -47,11 +47,15 @@ import { createSQLiteDatabaseForm } from "./takoform-v2/forms/sqlite-database-ba
 import {
   SQLITE_MIGRATION_APPLICATION_FORM_URL,
   SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0,
 } from "./takoform-v2/forms/sqlite-migration-application.ts";
 import { createSQLiteMigrationApplicationForm } from "./takoform-v2/forms/sqlite-migration-application-backend.ts";
 import { createSQLiteMigrationApplicationNativePort } from "./takoform-v2/forms/sqlite-migration-application-native.ts";
 import { createSQLiteMigrationSetCustody } from "./takoform-v2/forms/sqlite-migration-set-backend.ts";
-import { SQLITE_MIGRATION_SET_FORM_URL_0_2_0 } from "./takoform-v2/forms/sqlite-migration-set.ts";
+import {
+  SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
+  SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
+} from "./takoform-v2/forms/sqlite-migration-set.ts";
 import { createSQLiteWorkerBindingAuthority } from "./takoform-v2/forms/sqlite-worker-binding-authority.ts";
 import { createStaticAssetBundleCustody } from "./takoform-v2/forms/static-asset-bundle-backend.ts";
 import { createWorkerBundleCustody } from "./takoform-v2/forms/worker-bundle-backend.ts";
@@ -1387,6 +1391,17 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
           formUrl: SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
         })
       : undefined;
+    const retainedDeferMigrationCustody = config.sqliteMigrationSet
+      ? createSQLiteMigrationSetCustody({
+          sql,
+          source: createV2HeldArtifactSource({
+            objects,
+            entries: config.sqliteMigrationSet.heldArtifacts,
+          }),
+          now: clock,
+          formUrl: SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
+        })
+      : undefined;
     let capturedEndpoint: EndpointPorts | undefined;
     if (endpoint !== undefined) {
       const { assignHostname, observeTls, observeRouteAbsent } = endpoint;
@@ -1424,18 +1439,27 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
           backendId: v2ObjectBucketBinding.backendId,
         }),
       },
-      retainedForms: retainedMigrationCustody
-        ? {
-            [SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0]: createSQLiteMigrationApplicationForm({
-              sql,
-              migrationPort: createSQLiteMigrationApplicationNativePort(sqliteStore),
-              custody: retainedMigrationCustody,
-              targetKey,
-              now: clock,
-              formUrl: SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
-            }),
-          }
-        : {},
+      retainedForms:
+        retainedMigrationCustody && retainedDeferMigrationCustody
+          ? {
+              [SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0]: createSQLiteMigrationApplicationForm({
+                sql,
+                migrationPort: createSQLiteMigrationApplicationNativePort(sqliteStore),
+                custody: retainedMigrationCustody,
+                targetKey,
+                now: clock,
+                formUrl: SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
+              }),
+              [SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0]: createSQLiteMigrationApplicationForm({
+                sql,
+                migrationPort: createSQLiteMigrationApplicationNativePort(sqliteStore),
+                custody: retainedDeferMigrationCustody,
+                targetKey,
+                now: clock,
+                formUrl: SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0,
+              }),
+            }
+          : {},
     });
   }
 

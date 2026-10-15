@@ -16,10 +16,39 @@ const TRANSACTION_OR_EXTERNAL_COMMANDS = new Set([
   "vacuum",
 ]);
 
-// Deliberate compatibility tightening: migration SQL may only assign this
-// transaction-scoped setting. All other PRAGMAs, including inspection and
-// foreign_keys, are forbidden. Existing durable receipts are never rewritten.
+// The provider policy only assigns this transaction-scoped setting. Native
+// callers select the exact accepted Form's additional read permission below.
+// Existing durable receipts are never rewritten.
 const DEFER_FOREIGN_KEYS_VALUES = new Set(["on", "off", "true", "false", "1", "0"]);
+const READ_ONLY_MIGRATION_PRAGMAS = new Set([
+  "table_info",
+  "foreign_key_list",
+  "index_list",
+  "index_info",
+]);
+
+export function isMigrationIntrospectionPragma(value: string | null): boolean {
+  return (
+    value !== null &&
+    /^[A-Za-z_]+$/u.test(value) &&
+    READ_ONLY_MIGRATION_PRAGMAS.has(value.toLowerCase())
+  );
+}
+
+export interface MigrationSqlStatement {
+  readonly sql: string;
+  /** Actual outer command; trigger-body commands do not replace it. */
+  readonly command: string | null;
+  readonly pragma: "defer" | "introspection" | null;
+}
+
+/** Chosen by the trusted native adapter from the exact accepted Form identity. */
+export function prepareNativeMigrationSql(
+  sql: string,
+  pragmas: "deny" | "defer" | "introspection",
+): readonly MigrationSqlStatement[] {
+  return scanMigrationSql(sql, undefined, undefined, pragmas);
+}
 
 /** SQLite keyword/name case folding is ASCII; Unicode aliases are not names. */
 export function isMigrationDeferForeignKeysName(value: string | null): boolean {
@@ -130,7 +159,7 @@ export function prepareMigrationSql(
     command(value) {
       if (TRANSACTION_OR_EXTERNAL_COMMANDS.has(value)) refuseMigrationSql();
     },
-  });
+  }).map((statement) => statement.sql);
 }
 
 /**
@@ -144,13 +173,13 @@ export function assertMigrationPragmaAssignments(sql: string): void {
 
 /** Retained Application 0.2.0 never admitted PRAGMA effects. */
 export function assertMigrationPragmasDenied(sql: string): void {
-  scanMigrationSql(sql, undefined, undefined, true);
+  scanMigrationSql(sql, undefined, undefined, "deny");
 }
 
 /** One parser-extracted PRAGMA statement, using the same token/grammar pass. */
 export function isMigrationPragmaAssignment(statement: string): boolean {
   try {
-    scanMigrationSql(statement, undefined, undefined, false, true);
+    scanMigrationSql(statement, undefined, undefined, "defer", true);
     return true;
   } catch {
     return false;
@@ -168,9 +197,9 @@ function scanMigrationSql(
     readonly identifier: (value: string) => void;
     readonly command: (value: string) => void;
   },
-  denyPragmas = false,
+  pragmaPolicy: "deny" | "defer" | "introspection" = "defer",
   singlePragmaStatement = false,
-): readonly string[] {
+): readonly MigrationSqlStatement[] {
   const refuse = (): never => {
     return refuseMigrationSql();
   };
@@ -186,7 +215,9 @@ function scanMigrationSql(
   let index = 0;
   let sliceStart = 0;
   let hasExecutableToken = false;
-  const statements: string[] = [];
+  const statements: MigrationSqlStatement[] = [];
+  let outerCommand: string | null = null;
+  let statementPragma: MigrationSqlStatement["pragma"] = null;
   let capacityError: MigrationSqlCapacityError | undefined;
 
   // Policy state is advanced by the same tokens used for completeness.
@@ -196,8 +227,10 @@ function scanMigrationSql(
   let head: string[] = [];
   let triggerHeader = false;
   let triggerBody = false;
-  // 0: no PRAGMA; 1: bare name; 2: '='; 3: bare value; 4: statement end.
-  const pragma: { state: 0 | 1 | 2 | 3 | 4 } = { state: 0 };
+  // 0: none; 1: name; 2: '='; 3: value; 4: defer end;
+  // 5: read arguments (SQLite parses them); 6: schema '.'; 7: read name.
+  const pragma: { state: 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 } = { state: 0 };
+  let pragmaKeywordEnd = 0;
   let pragmaCount = 0;
   let pragmaStart = 0;
   let pragmaEnd = 0;
@@ -214,13 +247,35 @@ function scanMigrationSql(
     authority?.identifier(value);
   };
 
+  const pragmaName = (value: string, quoted = false): void => {
+    if (pragmaPolicy === "introspection") {
+      if (pragma.state === 1 && /^[Mm][Aa][Ii][Nn]$/u.test(value)) {
+        pragma.state = 6;
+        return;
+      }
+      if (isMigrationIntrospectionPragma(value)) {
+        pragma.state = 5;
+        statementPragma = "introspection";
+        return;
+      }
+    }
+    if (pragma.state === 1 && !quoted && isMigrationDeferForeignKeysName(value)) {
+      const gap = sql.slice(pragmaKeywordEnd, index);
+      if (!gap || !onlyPragmaWhitespace(gap)) refuse();
+      pragma.state = 2;
+      statementPragma = "defer";
+      return;
+    }
+    refuse();
+  };
+
   const word = (value: string): void => {
     const lower = value.toLowerCase();
     identifier(lower);
 
-    if (pragma.state !== 0) {
-      if (pragma.state === 1 && isMigrationDeferForeignKeysName(value)) {
-        pragma.state = 2;
+    if (pragma.state !== 0 && pragma.state !== 5) {
+      if (pragma.state === 1 || pragma.state === 7) {
+        pragmaName(value);
         return;
       }
       if (pragma.state === 3 && isMigrationDeferForeignKeysValue(value)) {
@@ -245,6 +300,7 @@ function scanMigrationSql(
       } else {
         commandPending = false;
         command = lower;
+        outerCommand ??= lower;
         if (triggerBody && lower === "end") {
           triggerBody = false;
           triggerHeader = false;
@@ -270,16 +326,17 @@ function scanMigrationSql(
       }
     }
 
-    if (lower === "pragma" && command === "pragma") {
-      if (explainPrefix !== 0 || denyPragmas) refuse();
+    if (lower === "pragma" && command === "pragma" && pragma.state === 0) {
+      if (explainPrefix !== 0 || pragmaPolicy === "deny") refuse();
       pragmaCount += 1;
       pragmaStart = index;
+      pragmaKeywordEnd = index + value.length;
       pragma.state = 1;
     }
   };
 
   const semicolon = (): void => {
-    if (pragma.state !== 0 && pragma.state !== 4) refuse();
+    if (pragma.state !== 0 && pragma.state !== 4 && pragma.state !== 5) refuse();
     if (pragma.state === 4) pragmaEnd = index + 1;
     pragma.state = 0;
     resetCommand();
@@ -295,9 +352,11 @@ function scanMigrationSql(
         capacityError = new MigrationSqlCapacityError(maximumStatementBytes, actualStatementBytes);
       }
     }
-    statements.push(statement);
+    statements.push({ sql: statement, command: outerCommand, pragma: statementPragma });
     sliceStart = end;
     hasExecutableToken = false;
+    outerCommand = null;
+    statementPragma = null;
   };
 
   while (index < sql.length) {
@@ -312,27 +371,54 @@ function scanMigrationSql(
       token = COMPLETE_WS;
     } else if (isCompleteWhitespace(character)) {
       // Non-ASCII whitespace is never part of the permitted assignment.
-      if (pragma.state !== 0) refuse();
+      if (
+        pragma.state !== 0 &&
+        pragma.state !== 5 &&
+        !(pragmaPolicy === "introspection" && [1, 6, 7].includes(pragma.state))
+      )
+        refuse();
       token = COMPLETE_WS;
     } else if (character === "/" && sql[index + 1] === "*") {
-      if (pragma.state !== 0) refuse();
+      if (
+        pragma.state !== 0 &&
+        pragma.state !== 5 &&
+        !(pragmaPolicy === "introspection" && [1, 6, 7].includes(pragma.state))
+      )
+        refuse();
       const commentEnd = sql.indexOf("*/", index + 2);
       if (commentEnd < 0) refuse();
       end = commentEnd + 2;
       token = COMPLETE_WS;
     } else if (character === "-" && sql[index + 1] === "-") {
-      if (pragma.state !== 0) refuse();
+      if (
+        pragma.state !== 0 &&
+        pragma.state !== 5 &&
+        !(pragmaPolicy === "introspection" && [1, 6, 7].includes(pragma.state))
+      )
+        refuse();
       const newline = sql.indexOf("\n", index + 2);
       end = newline < 0 ? sql.length : newline + 1;
       token = COMPLETE_WS;
     } else if (character === "[") {
-      if (pragma.state !== 0) refuse();
+      if (
+        pragma.state !== 0 &&
+        pragma.state !== 5 &&
+        !(pragmaPolicy === "introspection" && [1, 7].includes(pragma.state))
+      )
+        refuse();
       const close = sql.indexOf("]", index + 1);
       if (close < 0) refuse();
-      identifier(sql.slice(index + 1, close));
+      const value = sql.slice(index + 1, close);
+      if (pragma.state === 1 || pragma.state === 7) pragmaName(value, true);
+      else identifier(value);
       end = close + 1;
     } else if (character === "'" || character === '"' || character === "`") {
-      if (pragma.state !== 0) refuse();
+      if (
+        pragma.state !== 0 &&
+        pragma.state !== 5 &&
+        !(pragmaPolicy === "introspection" && [1, 7].includes(pragma.state))
+      )
+        refuse();
       let cursor = index + 1;
       let value = "";
       for (;;) {
@@ -347,7 +433,8 @@ function scanMigrationSql(
         end = close + 1;
         break;
       }
-      identifier(value);
+      if (pragma.state === 1 || pragma.state === 7) pragmaName(value, true);
+      else identifier(value);
     } else {
       const codePoint = sql.codePointAt(index);
       if (codePoint !== undefined && isSqliteIdentifierCodePoint(codePoint)) {
@@ -363,7 +450,9 @@ function scanMigrationSql(
         end = cursor;
       } else if (pragma.state === 2 && character === "=") {
         pragma.state = 3;
-      } else if (pragma.state !== 0) {
+      } else if (pragma.state === 6 && character === ".") {
+        pragma.state = 7;
+      } else if (pragma.state !== 0 && pragma.state !== 5) {
         refuse();
       }
     }
@@ -379,7 +468,7 @@ function scanMigrationSql(
     if (token === COMPLETE_SEMI && state === 1 && hasExecutableToken) emit(index);
   }
 
-  if ((pragma.state !== 0 && pragma.state !== 4) || triggerBody) refuse();
+  if ((pragma.state !== 0 && pragma.state !== 4 && pragma.state !== 5) || triggerBody) refuse();
 
   if (hasExecutableToken) {
     // sqlite3_complete() requires the terminator. The Form does not, so prove

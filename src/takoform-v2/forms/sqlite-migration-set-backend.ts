@@ -9,6 +9,7 @@ import {
   SQLITE_MIGRATION_SET_FORM_URL,
   SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
   SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
+  SQLITE_MIGRATION_SET_FORM_URL_0_4_0,
   type SQLiteMigrationSetFormUrl,
   SQLITE_MIGRATION_SET_LIMITS,
   type SQLiteMigrationManifest,
@@ -28,7 +29,8 @@ export function createSQLiteMigrationSetCustody(options: {
   const formUrl = options.formUrl ?? SQLITE_MIGRATION_SET_FORM_URL;
   if (
     formUrl !== SQLITE_MIGRATION_SET_FORM_URL_0_2_0 &&
-    formUrl !== SQLITE_MIGRATION_SET_FORM_URL_0_3_0
+    formUrl !== SQLITE_MIGRATION_SET_FORM_URL_0_3_0 &&
+    formUrl !== SQLITE_MIGRATION_SET_FORM_URL_0_4_0
   )
     throw new TypeError("SQLiteMigrationSet Form identity is unsupported");
   return createSqlArtifactCustody({

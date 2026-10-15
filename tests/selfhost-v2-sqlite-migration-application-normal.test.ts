@@ -23,6 +23,7 @@ import { SQLITE_DATABASE_FORM_URL } from "../src/takoform-v2/forms/sqlite-databa
 import {
   SQLITE_MIGRATION_APPLICATION_FORM_URL,
   SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0,
 } from "../src/takoform-v2/forms/sqlite-migration-application.ts";
 import { SQLITE_MIGRATION_SET_FORM_URL } from "../src/takoform-v2/forms/sqlite-migration-set.ts";
 import type { V2Form } from "../src/takoform-v2/types.ts";
@@ -355,6 +356,10 @@ test("normal public Host composes SQLite Database, Set, and Application with par
   try {
     expect(f.selected[SQLITE_MIGRATION_APPLICATION_FORM_URL]).toBeDefined();
     expect(f.selected[SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0]).toBeUndefined();
+    expect(f.selected[SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0]).toBeUndefined();
+    expect(f.retainedForms[SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0]?.backend.targetKey).toBe(
+      TARGET,
+    );
     expect(f.retainedForms[SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0]?.backend.targetKey).toBe(
       TARGET,
     );

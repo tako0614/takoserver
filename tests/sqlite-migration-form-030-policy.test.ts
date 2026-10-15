@@ -8,13 +8,11 @@ import {
   prepareMigrationSql,
 } from "../src/sqlite-migration-policy.ts";
 import {
-  SQLITE_MIGRATION_APPLICATION_FORM_URL,
   SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
   SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0,
   sqliteMigrationApplicationReferences,
 } from "../src/takoform-v2/forms/sqlite-migration-application.ts";
 import {
-  SQLITE_MIGRATION_SET_FORM_URL,
   SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
   SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
 } from "../src/takoform-v2/forms/sqlite-migration-set.ts";
@@ -77,10 +75,18 @@ test("retained 0.2 rejects actual PRAGMA while preserving harmless native SQL li
 });
 
 test("exact migration version constants retain old references without mixed-version aliases", () => {
-  expect(SQLITE_MIGRATION_APPLICATION_FORM_URL).toBe(SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0);
-  expect(SQLITE_MIGRATION_SET_FORM_URL).toBe(SQLITE_MIGRATION_SET_FORM_URL_0_3_0);
+  expect(SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0).toBe(
+    "https://edge.forms.takoform.com/forms/SQLiteMigrationApplication/0.3.0/",
+  );
+  expect(SQLITE_MIGRATION_SET_FORM_URL_0_3_0).toBe(
+    "https://edge.forms.takoform.com/forms/SQLiteMigrationSet/0.3.0/",
+  );
   const spec = { database: { resourceUid: "db" }, migrationSet: { resourceUid: "set" } };
-  expect(sqliteMigrationApplicationReferences(spec).map((ref) => ref.formUrl)).toEqual([
+  expect(
+    sqliteMigrationApplicationReferences(spec, SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0).map(
+      (ref) => ref.formUrl,
+    ),
+  ).toEqual([
     "https://edge.forms.takoform.com/forms/SQLiteDatabase/0.2.0/",
     SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
   ]);

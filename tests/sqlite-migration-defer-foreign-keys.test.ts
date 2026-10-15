@@ -13,6 +13,7 @@ import { createSQLiteMigrationApplicationNativePort } from "../src/takoform-v2/f
 import {
   SQLITE_MIGRATION_APPLICATION_FORM_URL,
   SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0,
 } from "../src/takoform-v2/forms/sqlite-migration-application.ts";
 import type { SQLiteMigrationRecord } from "../src/takoform-v2/forms/sqlite-migration-application-port.ts";
 
@@ -256,9 +257,9 @@ test("SQLite component rolls failed FK commit back with its ledger and next-file
   }
 });
 
-test("SQLite component permits OFF aliases only in the transaction and rejects every other PRAGMA before effects", async () => {
+test("SQLite component retained 0.3 permits OFF aliases and rejects every other PRAGMA before effects", async () => {
   for (const value of ["OFF", "FALSE", "0"]) {
-    const { database, apply, settings } = fixture();
+    const { database, apply, settings } = fixture(SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0);
     try {
       const result = await apply(
         `PRAGMA defer_foreign_keys=ON; PRAGMA defer_foreign_keys=${value}; INSERT INTO parent VALUES(7); INSERT INTO child VALUES(1,7);`,
@@ -270,7 +271,7 @@ test("SQLite component permits OFF aliases only in the transaction and rejects e
     }
   }
   for (const sql of FORBIDDEN_PRAGMAS) {
-    const { database, apply, settings } = fixture();
+    const { database, apply, settings } = fixture(SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0);
     try {
       expect(await apply(`INSERT INTO parent VALUES(7); ${sql};`), sql).toEqual({
         kind: "rejected",

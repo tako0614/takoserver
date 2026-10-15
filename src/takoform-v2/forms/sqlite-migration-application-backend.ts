@@ -7,6 +7,7 @@ import {
   SQLITE_MIGRATION_APPLICATION_FORM_URL,
   SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
   SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_4_0,
   type SQLiteMigrationApplicationFormUrl,
   SQLiteMigrationApplicationValidationError,
   sqliteMigrationApplicationReferences,
@@ -58,7 +59,8 @@ export function createSQLiteMigrationApplicationForm(options: {
   const formUrl = options.formUrl ?? SQLITE_MIGRATION_APPLICATION_FORM_URL;
   if (
     formUrl !== SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0 &&
-    formUrl !== SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0
+    formUrl !== SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0 &&
+    formUrl !== SQLITE_MIGRATION_APPLICATION_FORM_URL_0_4_0
   )
     throw new TypeError("SQLiteMigrationApplication Form identity is unsupported");
 

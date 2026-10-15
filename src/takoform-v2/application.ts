@@ -10,6 +10,7 @@ import {
 import {
   SQLITE_MIGRATION_SET_FORM_URL,
   SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
+  SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
 } from "./forms/sqlite-migration-set.ts";
 import { createSQLiteMigrationSetForm } from "./forms/sqlite-migration-set-backend.ts";
 import { STATIC_ASSET_BUNDLE_FORM_URL } from "./forms/static-asset-bundle.ts";
@@ -164,6 +165,15 @@ export function createTakoformV2Application(
       ),
       targetKey: config.sqliteMigrationSet.targetKey,
       formUrl: SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
+    });
+    retainedForms[SQLITE_MIGRATION_SET_FORM_URL_0_3_0] = createSQLiteMigrationSetForm({
+      sql,
+      source: artifactSource(
+        SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
+        config.sqliteMigrationSet.heldArtifacts,
+      ),
+      targetKey: config.sqliteMigrationSet.targetKey,
+      formUrl: SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
     });
   }
   if (config.workerBundle) {

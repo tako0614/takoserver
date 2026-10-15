@@ -4,16 +4,20 @@ import { SQLITE_DATABASE_FORM_URL } from "./sqlite-database.ts";
 import {
   SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
   SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
+  SQLITE_MIGRATION_SET_FORM_URL_0_4_0,
 } from "./sqlite-migration-set.ts";
 
 export const SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0 =
   "https://edge.forms.takoform.com/forms/SQLiteMigrationApplication/0.2.0/" as const;
 export const SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0 =
   "https://edge.forms.takoform.com/forms/SQLiteMigrationApplication/0.3.0/" as const;
-export const SQLITE_MIGRATION_APPLICATION_FORM_URL = SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0;
+export const SQLITE_MIGRATION_APPLICATION_FORM_URL_0_4_0 =
+  "https://edge.forms.takoform.com/forms/SQLiteMigrationApplication/0.4.0/" as const;
+export const SQLITE_MIGRATION_APPLICATION_FORM_URL = SQLITE_MIGRATION_APPLICATION_FORM_URL_0_4_0;
 export type SQLiteMigrationApplicationFormUrl =
   | typeof SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0
-  | typeof SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0;
+  | typeof SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0
+  | typeof SQLITE_MIGRATION_APPLICATION_FORM_URL_0_4_0;
 
 const RESOURCE_UID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 
@@ -72,7 +76,8 @@ export function sqliteMigrationApplicationReferences(
 ): readonly V2ReferenceRequirement[] {
   if (
     formUrl !== SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0 &&
-    formUrl !== SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0
+    formUrl !== SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0 &&
+    formUrl !== SQLITE_MIGRATION_APPLICATION_FORM_URL_0_4_0
   )
     throw new TypeError("SQLiteMigrationApplication Form identity is unsupported");
   return [
@@ -86,7 +91,9 @@ export function sqliteMigrationApplicationReferences(
       formUrl:
         formUrl === SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0
           ? SQLITE_MIGRATION_SET_FORM_URL_0_2_0
-          : SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
+          : formUrl === SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0
+            ? SQLITE_MIGRATION_SET_FORM_URL_0_3_0
+            : SQLITE_MIGRATION_SET_FORM_URL_0_4_0,
       readiness: "observed",
     },
   ];
