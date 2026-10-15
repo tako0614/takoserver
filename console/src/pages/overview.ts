@@ -6,6 +6,7 @@ import { byForm, health } from "../resource-state.ts";
 import { linkProps, resourcePath } from "../router.ts";
 import { api } from "../state.ts";
 import { ago, badge, card, copyable, empty, ICON, icon, stat, whenReady } from "../ui.ts";
+import { createResource } from "./create-resource.ts";
 
 /**
  * The first screen, answering the two questions someone signs in with: is
@@ -69,15 +70,22 @@ export function overviewPage(organization: Organization): Child {
         ),
         whenReady(
           resources.get(),
-          ({ resources: all }) => {
+          ({ resources: all, cursor }) => {
             const attention = all.filter((entry) =>
               ["Failed", "NotReady"].includes(health(entry).phase),
             ).length;
+            // Only the first page is read here. When the Host has more, the
+            // count says so instead of passing a page size off as a total.
+            const more = cursor !== null;
             return stat(
               tr("リソース", "Resources"),
-              String(all.length),
+              more ? `${all.length}+` : String(all.length),
               attention === 0
-                ? tr("読み込み済みページの件数", "count from loaded page")
+                ? more
+                  ? tr("最初のページのみ集計", "first page only")
+                  : all.length === 0
+                    ? tr("まだありません", "none yet")
+                    : tr("確認が必要なものはありません", "none need attention")
                 : h(
                     "span",
                     { style: { color: "var(--warn)" } },
@@ -92,20 +100,32 @@ export function overviewPage(organization: Organization): Child {
     live(() =>
       whenReady(
         resources.get(),
-        ({ resources: all }) =>
+        ({ resources: all, cursor }) =>
           all.length === 0
             ? card(
                 tr("リソース", "Resources"),
                 empty(
                   tr("リソースがありません", "Nothing declared yet"),
                   tr(
-                    "リソース画面で運用者から渡された正確なForm URLを使って作成できます。",
-                    "Open Resources to create with an exact Form URL supplied by the operator.",
+                    "運用者から渡された正確なForm URLを指定して作成します。作成を受け付けたリソースは、完了前からここに表示されます。",
+                    "Create one with an exact Form URL supplied by the operator. Accepted resources appear here before they finish.",
+                  ),
+                  h(
+                    "button",
+                    {
+                      class: "btn btn--primary",
+                      type: "button",
+                      onClick: () => createResource(organization.id),
+                    },
+                    icon(ICON.plus, 14),
+                    text(tr("リソースを作成", "New resource")),
                   ),
                 ),
               )
             : card(
-                tr("Form別（読み込み済み）", "By Form (loaded page)"),
+                cursor === null
+                  ? tr("Form別", "By Form")
+                  : tr("Form別（最初のページ）", "By Form (first page)"),
                 h(
                   "div",
                   { class: "card__body" },

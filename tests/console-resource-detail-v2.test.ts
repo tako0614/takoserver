@@ -193,3 +193,77 @@ test("confirmed ready:false is NotReady and visible in overview attention", asyn
   expect(body.textContent).toContain("latest observation reports not ready");
   expect(body.textContent).not.toContain("Unknown");
 });
+
+test("overview counts only what it read and offers the first create", async () => {
+  const { consoleLocale } = await import("../console/src/i18n.ts");
+  const { organizations, selectOrganization, setApiOrigin } = await import(
+    "../console/src/state.ts"
+  );
+  const { overviewPage } = await import("../console/src/pages/overview.ts");
+  const organization = {
+    id: "org-one",
+    name: "One",
+    ownerPrincipalId: "owner",
+    createdAt: "2026-10-07",
+  };
+  const item = {
+    uid: "uid-ready",
+    form: "https://forms.example.test/WorkerVersion/1.0.0",
+    space: "org-one",
+    name: "ready",
+    generation: 1,
+    observedGeneration: 1,
+    observedAt: "2026-10-07T00:00:00Z",
+    phase: "idle" as const,
+    spec: {},
+    observed: { ready: true },
+    output: {},
+    lastOperation: "op-one",
+  };
+  const render = async (page: { items: unknown[]; nextCursor: string | null }) => {
+    const body = installDom();
+    consoleLocale.set("en");
+    setApiOrigin("https://api.example.test");
+    organizations.set([organization]);
+    selectOrganization(organization.id);
+    globalThis.fetch = Object.assign(
+      async (input: RequestInfo | URL) => {
+        const path = new URL(String(input)).pathname;
+        if (path.endsWith("/wallet"))
+          return Response.json({
+            wallet: {
+              availableMicros: "0",
+              heldMicros: "0",
+              settledMicros: "0",
+              currency: "USD",
+              unit: "USD-micros",
+              moneyPolicy: "usd-micros-v2",
+            },
+          });
+        if (path.endsWith("/operations")) return Response.json({ operations: [] });
+        return Response.json(page);
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    );
+    body.append(overviewPage(organization) as unknown as NodeStub);
+    await settle();
+    return body;
+  };
+
+  const partial = await render({ items: [item], nextCursor: "next" });
+  expect(partial.textContent).toContain("1+");
+  expect(partial.textContent).toContain("first page only");
+  expect(partial.textContent).toContain("By Form (first page)");
+
+  const complete = await render({ items: [item], nextCursor: null });
+  expect(complete.textContent).toContain("none need attention");
+  expect(complete.textContent).toContain("By Form");
+  expect(complete.textContent).not.toContain("first page");
+
+  const none = await render({ items: [], nextCursor: null });
+  expect(none.textContent).toContain("none yet");
+  expect(none.textContent).toContain("Nothing declared yet");
+  const create = none.all().find((node) => node.tag === "button");
+  expect(create?.className).toBe("btn btn--primary");
+  expect(create?.textContent).toContain("New resource");
+});
