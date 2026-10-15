@@ -80,11 +80,15 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
           "h1",
           null,
           // The name is the page title; .mono alone would shrink it to body size.
-          h("span", { class: "mono", style: { fontSize: "inherit" } }, found.name),
+          h(
+            "span",
+            { class: "mono", style: { fontSize: "inherit", overflowWrap: "anywhere" } },
+            found.name,
+          ),
           text(" "),
           badge(phaseLabel(state.phase), state.tone, true),
         ),
-        h("p", { class: "mono" }, found.form),
+        h("p", { class: "mono", style: { overflowWrap: "anywhere" } }, found.form),
       ),
       h(
         "div",
