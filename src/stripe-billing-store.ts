@@ -234,18 +234,18 @@ const observationRows = `FROM stripe_billing_on_demand_attempts a
   LEFT JOIN stripe_billing_on_demand_terminals t ON t.org_id=c.org_id AND t.reference=c.reference
   LEFT JOIN org_wallet_cash_exposures e ON e.org_id=c.org_id AND e.ref=c.exposure_ref`;
 const taggedObservation = `json_extract(a.detail_json,'$.kind')='native-refund-observation-v1'`;
-const qualifiedObservation = `(a.kind='readback' AND c.state IN ('dispatched','paid')
+const qualifiedObservation = `((((a.kind='readback' AND c.state IN ('dispatched','paid')
   AND c.dispatched_at IS NOT NULL AND c.dispatched_at<=a.created_at
   AND NOT EXISTS (SELECT 1 FROM stripe_billing_on_demand_abandonments b WHERE b.org_id=c.org_id AND b.reference=c.reference)
   AND EXISTS (SELECT 1 FROM stripe_billing_account_realms r JOIN stripe_mode_realm m ON m.singleton=r.singleton
     WHERE r.singleton=1 AND r.account_id=c.account_id AND r.mode='test' AND m.mode=r.mode AND r.mode=c.mode AND r.billing_authority=c.billing_authority)
-  AND (c.payment_intent_id IS NULL OR json_extract(a.detail_json,'$.proof.paymentIntentId') IS c.payment_intent_id)
+  )AND( (c.payment_intent_id IS NULL OR json_extract(a.detail_json,'$.proof.paymentIntentId') IS c.payment_intent_id)
   AND length(json_extract(a.detail_json,'$.proof.paymentIntentId')) BETWEEN 4 AND 255
   AND substr(json_extract(a.detail_json,'$.proof.paymentIntentId'),1,3)='pi_'
   AND substr(json_extract(a.detail_json,'$.proof.paymentIntentId'),4) NOT GLOB '*[^A-Za-z0-9_]*'
   AND length(json_extract(a.detail_json,'$.proof.chargeId')) BETWEEN 4 AND 255
   AND substr(json_extract(a.detail_json,'$.proof.chargeId'),1,3)='ch_'
-  AND substr(json_extract(a.detail_json,'$.proof.chargeId'),4) NOT GLOB '*[^A-Za-z0-9_]*'
+  ))AND(( substr(json_extract(a.detail_json,'$.proof.chargeId'),4) NOT GLOB '*[^A-Za-z0-9_]*'
   AND length(json_extract(a.detail_json,'$.proof.observedAt'))=24
   AND json_extract(a.detail_json,'$.proof.observedAt')<='9999-12-31T23:59:59.000Z'
   AND (SELECT count(*) FROM json_each(c.request_json,'$.metadata'))=7
@@ -269,7 +269,7 @@ const qualifiedObservation = `(a.kind='readback' AND c.state IN ('dispatched','p
       AND e.period_start IS c.period_start AND e.period_end IS c.period_end
       AND e.policy_version IS c.policy_version AND e.consent_revision IS c.consent_revision))
     AND json_type(a.detail_json,'$.kind') IS 'text'
-    AND json_extract(a.detail_json,'$.kind') IS 'native-refund-observation-v1'
+    )AND(( json_extract(a.detail_json,'$.kind') IS 'native-refund-observation-v1'
     AND json_type(a.detail_json,'$.proof') IS 'object'
     AND (SELECT count(*) FROM json_each(a.detail_json))=2
     AND NOT EXISTS (SELECT 1 FROM json_each(a.detail_json) WHERE key NOT IN ('kind','proof'))
@@ -277,41 +277,41 @@ const qualifiedObservation = `(a.kind='readback' AND c.state IN ('dispatched','p
     AND NOT EXISTS (SELECT 1 FROM json_each(a.detail_json,'$.proof')
       WHERE key NOT IN ('kind','sourceType','organizationId','reference','fingerprint','fundingRef','accountId','mode','financialRealm','billingAuthority','customerId','paymentMethodId','paymentIntentId','chargeId','currency','amountMinor','refundedAmountMinor','observedAt')
         OR (key NOT IN ('amountMinor','refundedAmountMinor') AND type<>'text'))
-    AND json_extract(a.detail_json,'$.proof.kind') IS 'stripe-on-demand-funding'
+    )AND( json_extract(a.detail_json,'$.proof.kind') IS 'stripe-on-demand-funding'
     AND json_extract(a.detail_json,'$.proof.sourceType') IS 'payment-intent'
     AND json_extract(a.detail_json,'$.proof.organizationId') IS c.org_id
     AND json_extract(a.detail_json,'$.proof.reference') IS c.reference
     AND json_extract(a.detail_json,'$.proof.fingerprint') IS c.fingerprint
     AND json_extract(a.detail_json,'$.proof.fundingRef') IS c.funding_ref
-    AND json_extract(a.detail_json,'$.proof.accountId') IS c.account_id
+    ))))AND((( json_extract(a.detail_json,'$.proof.accountId') IS c.account_id
     AND json_extract(a.detail_json,'$.proof.mode') IS 'test' AND c.mode='test'
     AND json_extract(a.detail_json,'$.proof.billingAuthority') IS c.billing_authority
     AND json_extract(a.detail_json,'$.proof.customerId') IS c.customer_id
     AND json_extract(a.detail_json,'$.proof.paymentMethodId') IS c.payment_method_id
-    AND (f.payment_intent_id IS NULL OR json_extract(a.detail_json,'$.proof.paymentIntentId') IS f.payment_intent_id)
+    )AND( (f.payment_intent_id IS NULL OR json_extract(a.detail_json,'$.proof.paymentIntentId') IS f.payment_intent_id)
     AND (f.charge_id IS NULL OR json_extract(a.detail_json,'$.proof.chargeId') IS f.charge_id)
     AND json_extract(a.detail_json,'$.proof.currency') IS 'USD'
     AND json_type(a.detail_json,'$.proof.amountMinor') IS 'integer'
     AND json_extract(a.detail_json,'$.proof.amountMinor') IS c.amount_minor
     AND json_type(a.detail_json,'$.proof.refundedAmountMinor') IS 'integer'
-    AND json_extract(a.detail_json,'$.proof.refundedAmountMinor') BETWEEN 0 AND c.amount_minor
+    ))AND(( json_extract(a.detail_json,'$.proof.refundedAmountMinor') BETWEEN 0 AND c.amount_minor
     AND json_type(a.detail_json,'$.proof.observedAt') IS 'text'
     AND strftime('%Y-%m-%dT%H:%M:%fZ',json_extract(a.detail_json,'$.proof.observedAt')) IS json_extract(a.detail_json,'$.proof.observedAt')
     AND json_extract(a.detail_json,'$.proof.observedAt')>=c.dispatched_at
     AND json_extract(a.detail_json,'$.proof.observedAt')<=a.created_at
     AND json_type(c.request_json,'$.metadata') IS 'object'
-    AND json_extract(c.request_json,'$.currency') IS 'usd'
+    )AND(( json_extract(c.request_json,'$.currency') IS 'usd'
     AND json_extract(c.request_json,'$.metadata.organizationId') IS c.org_id
     AND json_extract(c.request_json,'$.metadata.reference') IS c.reference
     AND json_extract(c.request_json,'$.metadata.fingerprint') IS c.fingerprint
     AND json_extract(c.request_json,'$.metadata.fundingRef') IS c.funding_ref
     AND json_extract(c.request_json,'$.metadata.stripeAccountId') IS c.account_id
-    AND json_extract(c.request_json,'$.metadata.billingAuthority') IS c.billing_authority
+    )AND( json_extract(c.request_json,'$.metadata.billingAuthority') IS c.billing_authority
     AND json_type(c.request_json,'$.metadata.financialRealm') IS 'text'
     AND length(json_extract(c.request_json,'$.metadata.financialRealm'))=70
     AND substr(json_extract(c.request_json,'$.metadata.financialRealm'),1,6)='realm:'
     AND substr(json_extract(c.request_json,'$.metadata.financialRealm'),7) NOT GLOB '*[^a-f0-9]*'
-    AND json_extract(a.detail_json,'$.proof.financialRealm') IS json_extract(c.request_json,'$.metadata.financialRealm'))`;
+    AND json_extract(a.detail_json,'$.proof.financialRealm') IS json_extract(c.request_json,'$.metadata.financialRealm'))))))`;
 
 // An invalid tagged row is not silently skipped or used as a native MAX. The
 // unsafe sentinel fails every checked read and every atomic release guard.
