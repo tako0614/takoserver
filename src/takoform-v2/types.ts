@@ -120,7 +120,23 @@ export interface V2AdmissionPredicate {
    * this predicate: it names what the Form requires. Never request values.
    */
   readonly detail?: string;
+  /** Core-captured exact requirements; valid only on this request's issued result. */
+  readonly preparedExactReferences?: readonly V2ReferenceRequirement[];
 }
+
+/** Authorized, same-owner/Space identity only; not publication or execution authority. */
+export interface V2ExactReferenceTarget {
+  readonly resourceUid: string;
+  readonly formUrl: string;
+}
+
+/** Request-local Core preparation, available only inside prepareAdmission. */
+export type V2PrepareExactReferences = (
+  choose: (
+    lookup: (resourceUid: string) => Promise<V2ExactReferenceTarget | null>,
+  ) => readonly V2ReferenceRequirement[] | null | Promise<readonly V2ReferenceRequirement[] | null>,
+  admission?: V2AdmissionPredicate,
+) => Promise<V2AdmissionPredicate | null>;
 
 export interface V2Form {
   validateCreate(spec: JsonObject): void;
@@ -138,6 +154,8 @@ export interface V2Form {
     readonly form: string;
     readonly resourceUid: string;
     readonly spec: JsonObject;
+    /** Read authorization precedes chooser/lookup; exact-key replay never calls it. */
+    readonly prepareExactReferences?: V2PrepareExactReferences;
   }): Promise<V2AdmissionPredicate | null>;
   /** Exact Form-owned names, requiredness, and omission/update preservation semantics. */
   readonly privateInputs?: {

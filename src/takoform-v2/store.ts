@@ -214,6 +214,36 @@ interface CapturedAcceptance {
   readonly referencesJson: string | null;
   readonly initialOutputJson: string;
   readonly admission: V2AdmissionPredicate | undefined;
+  readonly referenceGuard: V2AdmissionPredicate | undefined;
+}
+
+function capturePredicate(admission: V2AdmissionPredicate | undefined) {
+  return admission
+    ? Object.freeze({
+        sql: admission.sql,
+        params: Object.freeze(
+          admission.params.map((param) => (param instanceof ArrayBuffer ? param.slice(0) : param)),
+        ),
+        ...(admission.conflictCode === undefined ? {} : { conflictCode: admission.conflictCode }),
+        ...(admission.detail === undefined ? {} : { detail: admission.detail }),
+      })
+    : undefined;
+}
+
+function withReferenceGuard(
+  admission: V2AdmissionPredicate | undefined,
+  referenceGuard: V2AdmissionPredicate,
+): V2AdmissionPredicate {
+  return Object.freeze({
+    ...admission,
+    sql: admission ? `(${admission.sql}) AND (${referenceGuard.sql})` : referenceGuard.sql,
+    params: Object.freeze([...(admission?.params ?? []), ...referenceGuard.params]),
+  });
+}
+
+/** Independently classify the Core preimage; Form predicates keep their own code/detail. */
+function referenceCheck(guard: V2AdmissionPredicate | undefined): readonly SqlStatement[] {
+  return guard ? [{ sql: `SELECT 1 AS permitted WHERE (${guard.sql})`, params: guard.params }] : [];
 }
 
 /** Own every value used by the batch and its post-await classification. */
@@ -223,6 +253,7 @@ function captureAcceptance(
   referencesJson: string | null,
   initialOutputJson: string,
   admission: V2AdmissionPredicate | undefined,
+  referenceGuard?: V2AdmissionPredicate,
 ): CapturedAcceptance {
   const capturedRecord = Object.freeze({
     ...record,
@@ -238,22 +269,13 @@ function captureAcceptance(
         }
       : {}),
   });
-  const capturedAdmission = admission
-    ? Object.freeze({
-        sql: admission.sql,
-        params: Object.freeze(
-          admission.params.map((param) => (param instanceof ArrayBuffer ? param.slice(0) : param)),
-        ),
-        ...(admission.conflictCode === undefined ? {} : { conflictCode: admission.conflictCode }),
-        ...(admission.detail === undefined ? {} : { detail: admission.detail }),
-      })
-    : undefined;
   return Object.freeze({
     record: capturedRecord,
     resource: Object.freeze({ form: resource.form, space: resource.space, name: resource.name }),
     referencesJson,
     initialOutputJson,
-    admission: capturedAdmission,
+    admission: capturePredicate(admission),
+    referenceGuard: capturePredicate(referenceGuard),
   });
 }
 
@@ -516,37 +538,49 @@ export function createV2Store(sql: Sql, hostAcceptance?: V2HostAcceptance) {
       referencesJson: string | null = null,
       initialOutputJson = "{}",
       admission?: V2AdmissionPredicate,
-    ): Promise<"accepted" | "dependency_conflict" | "resource_busy"> {
+      referenceGuard?: V2AdmissionPredicate,
+    ): Promise<"accepted" | "dependency_conflict" | "resource_busy" | "reference_conflict"> {
       const captured = captureAcceptance(
         record,
         resource,
         referencesJson,
         initialOutputJson,
         admission,
+        referenceGuard,
       );
-      let acceptedInput = captured;
+      let acceptedInput = captured.referenceGuard
+        ? {
+            ...captured,
+            admission: withReferenceGuard(captured.admission, captured.referenceGuard),
+          }
+        : captured;
       let terminal: SqlStatement | undefined;
       if (acceptance) {
         const context = acceptanceContext(captured);
         const preparing = acceptance.prepare(context);
         if (preparing !== undefined) {
-          const guarded = guardedAcceptance(await preparing, sql, context, captured.admission);
-          acceptedInput = { ...captured, admission: guarded.admission };
+          const guarded = guardedAcceptance(await preparing, sql, context, acceptedInput.admission);
+          acceptedInput = { ...acceptedInput, admission: guarded.admission };
           terminal = guarded.terminal;
         }
       }
-      const statements = compileCreateAcceptance(acceptedInput);
+      const statements = [
+        ...referenceCheck(captured.referenceGuard),
+        ...compileCreateAcceptance(acceptedInput),
+      ];
       let writes: readonly SqlWrite[];
       if (terminal) {
         if (!acceptanceBatch) throw new TypeError("missing Host acceptance executor");
         writes = await acceptanceBatch(checkedHostBatch([...statements, terminal]));
       } else writes = await sql.batch(statements);
       const capturedAdmission = acceptedInput.admission;
-      if (capturedAdmission && writes[0]?.rows.length !== 1)
+      const offset = captured.referenceGuard ? 1 : 0;
+      if (captured.referenceGuard && writes[0]?.rows.length !== 1) return "reference_conflict";
+      if (capturedAdmission && writes[offset]?.rows.length !== 1)
         return capturedAdmission.conflictCode ?? "dependency_conflict";
       if (
-        writes[capturedAdmission ? 1 : 0]?.changes !== 1 ||
-        writes[capturedAdmission ? 2 : 1]?.changes !== 1
+        writes[offset + (capturedAdmission ? 1 : 0)]?.changes !== 1 ||
+        writes[offset + (capturedAdmission ? 2 : 1)]?.changes !== 1
       ) {
         throw new Error("v2 CREATE acceptance did not persist its Resource and Operation");
       }
@@ -558,11 +592,17 @@ export function createV2Store(sql: Sql, hostAcceptance?: V2HostAcceptance) {
       serializeUpdatesWithPendingReferrers = false,
       admission?: V2AdmissionPredicate,
       hostResource?: Pick<ResourceRow, "form_url" | "space" | "name" | "output_json">,
-    ): Promise<"accepted" | "dependency_conflict" | "resource_busy" | "conflict"> {
+      referenceGuard?: V2AdmissionPredicate,
+    ): Promise<
+      "accepted" | "dependency_conflict" | "resource_busy" | "conflict" | "reference_conflict"
+    > {
       const serialize = record.action === "update" && serializeUpdatesWithPendingReferrers;
       let statements: readonly SqlStatement[];
       let terminal: SqlStatement | undefined;
-      let capturedAdmission = admission;
+      const capturedReferenceGuard = capturePredicate(referenceGuard);
+      let capturedAdmission = capturedReferenceGuard
+        ? withReferenceGuard(capturePredicate(admission), capturedReferenceGuard)
+        : admission;
       if (acceptance && record.action === "update") {
         if (!hostResource)
           throw new TypeError("Host UPDATE acceptance requires its owned Resource");
@@ -575,7 +615,7 @@ export function createV2Store(sql: Sql, hostAcceptance?: V2HostAcceptance) {
           },
           referencesJson,
           hostResource.output_json,
-          admission,
+          capturedAdmission,
         );
         record = captured.record;
         capturedAdmission = captured.admission;
@@ -587,7 +627,10 @@ export function createV2Store(sql: Sql, hostAcceptance?: V2HostAcceptance) {
           terminal = guarded.terminal;
         }
       }
-      statements = compileChangeAcceptance(record, referencesJson, serialize, capturedAdmission);
+      statements = [
+        ...referenceCheck(capturedReferenceGuard),
+        ...compileChangeAcceptance(record, referencesJson, serialize, capturedAdmission),
+      ];
       const coreResultCount = statements.length;
       let writes: readonly SqlWrite[];
       if (terminal) {
@@ -595,10 +638,12 @@ export function createV2Store(sql: Sql, hostAcceptance?: V2HostAcceptance) {
         writes = await acceptanceBatch(checkedHostBatch([...statements, terminal]));
       } else writes = await sql.batch(statements);
       admission = capturedAdmission;
-      const resourceIndex = admission ? 1 : 0;
+      const offset = capturedReferenceGuard ? 1 : 0;
+      const resourceIndex = offset + (admission ? 1 : 0);
       if (writes[resourceIndex]?.changes === 1 && writes[resourceIndex + 1]?.changes === 1)
         return "accepted";
-      if (admission && writes[0]?.rows.length !== 1)
+      if (capturedReferenceGuard && writes[0]?.rows.length !== 1) return "reference_conflict";
+      if (admission && writes[offset]?.rows.length !== 1)
         return admission.conflictCode ?? "dependency_conflict";
       if (serialize && writes[coreResultCount - 1]?.rows.length) return "dependency_conflict";
       return "conflict";
