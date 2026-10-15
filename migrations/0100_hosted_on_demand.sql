@@ -179,7 +179,7 @@ WHEN NOT EXISTS (SELECT 1 FROM stripe_billing_on_demand_commands c WHERE c.org_i
     AND f.amount_micros=c.amount_minor*10000
     AND t.status='succeeded' AND t.payment_intent_id=f.payment_intent_id AND t.charge_id=f.charge_id
     AND t.exposure_ref=c.exposure_ref AND t.account_id=c.account_id AND t.mode=c.mode
-    AND t.billing_authority=c.billing_authority AND t.customer_id=c.customer_id
+    AND (t.billing_authority=c.billing_authority AND t.customer_id=c.customer_id
     AND t.payment_method_id=c.payment_method_id AND t.currency='usd' AND t.amount_minor=c.amount_minor
     AND e.status='paid' AND e.source_ref=f.payment_intent_id AND e.amount_minor=c.amount_minor
     AND e.period_start=c.period_start AND e.period_end=c.period_end
@@ -193,8 +193,8 @@ WHEN NOT EXISTS (SELECT 1 FROM stripe_billing_on_demand_commands c WHERE c.org_i
     AND json_extract(NEW.detail_json,'$.kind') IS 'native-refund-observation-v1'
     AND json_type(NEW.detail_json,'$.proof') IS 'object'
     AND (SELECT count(*) FROM json_each(NEW.detail_json))=2
-    AND NOT EXISTS (SELECT 1 FROM json_each(NEW.detail_json) WHERE key NOT IN ('kind','proof'))
-    AND (SELECT count(*) FROM json_each(NEW.detail_json,'$.proof'))=18
+    AND NOT EXISTS (SELECT 1 FROM json_each(NEW.detail_json) WHERE key NOT IN ('kind','proof')))
+    AND ((SELECT count(*) FROM json_each(NEW.detail_json,'$.proof'))=18
     AND NOT EXISTS (SELECT 1 FROM json_each(NEW.detail_json,'$.proof')
       WHERE key NOT IN ('kind','sourceType','organizationId','reference','fingerprint','fundingRef','accountId','mode','financialRealm','billingAuthority','customerId','paymentMethodId','paymentIntentId','chargeId','currency','amountMinor','refundedAmountMinor','observedAt')
         OR (key NOT IN ('amountMinor','refundedAmountMinor') AND type<>'text'))
@@ -213,8 +213,8 @@ WHEN NOT EXISTS (SELECT 1 FROM stripe_billing_on_demand_commands c WHERE c.org_i
     AND json_extract(NEW.detail_json,'$.proof.chargeId') IS f.charge_id
     AND json_extract(NEW.detail_json,'$.proof.currency') IS 'USD'
     AND json_type(NEW.detail_json,'$.proof.amountMinor') IS 'integer'
-    AND json_extract(NEW.detail_json,'$.proof.amountMinor') IS c.amount_minor
-    AND json_type(NEW.detail_json,'$.proof.refundedAmountMinor') IS 'integer'
+    AND json_extract(NEW.detail_json,'$.proof.amountMinor') IS c.amount_minor)
+    AND (json_type(NEW.detail_json,'$.proof.refundedAmountMinor') IS 'integer'
     AND json_extract(NEW.detail_json,'$.proof.refundedAmountMinor') BETWEEN 0 AND c.amount_minor
     AND json_type(NEW.detail_json,'$.proof.observedAt') IS 'text'
     AND strftime('%Y-%m-%dT%H:%M:%fZ',json_extract(NEW.detail_json,'$.proof.observedAt')) IS json_extract(NEW.detail_json,'$.proof.observedAt')
@@ -232,7 +232,7 @@ WHEN NOT EXISTS (SELECT 1 FROM stripe_billing_on_demand_commands c WHERE c.org_i
     AND length(json_extract(c.request_json,'$.metadata.financialRealm'))=70
     AND substr(json_extract(c.request_json,'$.metadata.financialRealm'),1,6)='realm:'
     AND substr(json_extract(c.request_json,'$.metadata.financialRealm'),7) NOT GLOB '*[^a-f0-9]*'
-    AND json_extract(NEW.detail_json,'$.proof.financialRealm') IS json_extract(c.request_json,'$.metadata.financialRealm')
+    AND json_extract(NEW.detail_json,'$.proof.financialRealm') IS json_extract(c.request_json,'$.metadata.financialRealm'))
  )
 BEGIN SELECT RAISE(ABORT,'constraint: exact durable dispatch or unresolved readback phase required');
 END;
