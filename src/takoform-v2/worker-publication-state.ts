@@ -2439,7 +2439,18 @@ function createPublicationState(options: PublicationStateOptions, forwardFamily:
     try {
       sqlGuard = createWorkerPublicationSqlGuard({
         execution,
-        ...(forward ? { forwardDeployment: true as const } : {}),
+        ...(forward
+          ? execution.form === WORKER_ENDPOINT_FORM_URL
+            ? {
+                forwardEndpointDeployment: chosenDeployment
+                  ? {
+                      resourceUid: chosenDeployment.row.uid,
+                      sourceOperationId: chosenDeployment.op.id,
+                    }
+                  : null,
+              }
+            : { forwardDeployment: true as const }
+          : {}),
         workerUid,
         principal: op.principal,
         space: own.space,

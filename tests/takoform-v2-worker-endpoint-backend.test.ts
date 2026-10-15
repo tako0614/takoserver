@@ -37,7 +37,11 @@ import {
   createForwardWorkerEndpointForm,
   createWorkerEndpointForm,
 } from "../src/takoform-v2/worker-endpoint-backend.ts";
-import { createV2WorkerPublicationState } from "../src/takoform-v2/worker-publication-state.ts";
+import { createWorkerPublicationSqlGuard } from "../src/takoform-v2/worker-publication-sql-guard.ts";
+import {
+  createV2ForwardWorkerPublicationState,
+  createV2WorkerPublicationState,
+} from "../src/takoform-v2/worker-publication-state.ts";
 import type { V2WorkerRuntimeOwnerExecutionResult } from "../src/workerd-worker-runtime-owner.ts";
 
 const TARGET_KEY = "fixture-v2-worker-endpoint";
@@ -708,7 +712,7 @@ test("forward Endpoint preserves retained predicate bytes and exact parameters",
   );
 });
 
-test("forward Endpoint real Core admission closes04/05 and06/05/07 without Container serving", async () => {
+test("forward Endpoint real Core capture and SQL guard close04/05 and06/05/07 without Container serving", async () => {
   const root = mkdtempSync(join(tmpdir(), "forward-endpoint-admission-"));
   const db = new Database(join(root, "state.sqlite"));
   migrateSqlite(db);
@@ -770,13 +774,103 @@ test("forward Endpoint real Core admission closes04/05 and06/05/07 without Conta
     backend: foundation,
   };
   const endpointForm = createForwardWorkerEndpointForm(endpointAdmissionFixtureOptions());
+  const captureState = createV2ForwardWorkerPublicationState({
+    sql,
+    now,
+    assetCustody: assets.custody,
+  });
+  db.exec("CREATE TABLE endpoint_test_routes (route_id TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  db.exec("INSERT INTO endpoint_test_routes VALUES ('route', 'original')");
+  const probes: {
+    resolution: Awaited<ReturnType<typeof captureState.resolve>>;
+    liveChanges?: number;
+    wrongWorker?: string;
+    staleClaim?: string;
+    sourceRefusals?: number;
+  }[] = [];
   // This backend settles only this admission fixture with no effect. It never
   // invokes a sender, returns a serving ACK, or substitutes native evidence.
   const admissionOnlyEndpoint: V2Form = {
     ...endpointForm,
     backend: {
       ...endpointForm.backend,
-      async execute() {
+      async execute(execution) {
+        const resolution = await captureState.resolve({ execution });
+        const probe: (typeof probes)[number] = { resolution };
+        probes.push(probe);
+        if (resolution.kind === "ready") {
+          probe.liveChanges = (
+            await sql.run(
+              `UPDATE endpoint_test_routes SET value = 'captured' WHERE route_id = 'route' AND (${resolution.sqlGuard.sql})`,
+              resolution.sqlGuard.params,
+            )
+          ).changes;
+          probe.wrongWorker = (
+            await captureState.resolve({
+              execution: { ...execution, spec: { worker: { resourceUid: "foreign-worker" } } },
+            })
+          ).kind;
+          probe.staleClaim = (
+            await captureState.resolve({ execution: { ...execution, leaseToken: "foreign-lease" } })
+          ).kind;
+          const deployment = resolution.snapshot.deployment;
+          const resources = await sql.query(
+            "SELECT * FROM tf_v2_resources WHERE principal = ? AND space = ?",
+            [principal, "prod"],
+          );
+          const operations = await sql.query("SELECT * FROM tf_v2_operations WHERE principal = ?", [
+            principal,
+          ]);
+          const selected = resources.find((row) => row.uid === deployment?.uid);
+          if (selected?.form_url === FORWARD_WORKER_DEPLOYMENT_FORM_URL) {
+            if (!deployment) throw new Error("missing captured Deployment");
+            if (typeof selected.last_operation !== "string")
+              throw new Error("missing captured source Operation");
+            const base = {
+              execution,
+              workerUid: resolution.snapshot.worker.uid,
+              principal,
+              space: "prod",
+              pendingIds: [execution.operationId],
+              deploymentIds: [deployment.uid],
+              endpointIds: [execution.resourceUid],
+              inboundTargetIds: [],
+              inboundEdges: [],
+              referenceSetIds: [],
+              evidence: { resources, operations },
+              forwardEndpointDeployment: {
+                resourceUid: deployment.uid,
+                sourceOperationId: selected.last_operation,
+              },
+            };
+            const wrong = [
+              {
+                ...base,
+                forwardEndpointDeployment: {
+                  ...base.forwardEndpointDeployment,
+                  resourceUid: execution.resourceUid,
+                },
+              },
+              {
+                ...base,
+                forwardEndpointDeployment: {
+                  ...base.forwardEndpointDeployment,
+                  sourceOperationId: execution.operationId,
+                },
+              },
+              { ...base, workerUid: "foreign-worker" },
+              { ...base, forwardEndpointDeployment: undefined, forwardDeployment: true as const },
+            ];
+            probe.sourceRefusals = 0;
+            for (const input of wrong) {
+              try {
+                createWorkerPublicationSqlGuard(input);
+              } catch {
+                probe.sourceRefusals += 1;
+              }
+            }
+          }
+        }
         return {
           kind: "no_effect",
           code: "fixture_admission_only",
@@ -884,12 +978,36 @@ test("forward Endpoint real Core admission closes04/05 and06/05/07 without Conta
         ])
       )[0]?.output_json,
     ).toBe(JSON.stringify({ hostname: HOSTNAME, url: `https://${HOSTNAME}/` }));
-    expect(await engine.runNext()).toMatchObject({
+    const settled = await engine.runNext();
+    const probe = probes.at(-1);
+    if (!probe) throw new Error("actual Core Endpoint backend was not entered");
+    if (probe.resolution.kind !== "ready")
+      throw new Error(
+        `actual captured Endpoint source: ${probe.resolution.code}: ${probe.resolution.message}`,
+      );
+    expect(settled).toMatchObject({
       id: endpoint.id,
       status: "failed",
       effect: "none",
       error: { code: "fixture_admission_only" },
     });
+    expect(probe.liveChanges).toBe(1);
+    expect(probe.wrongWorker).toBe("unresolved");
+    expect(probe.staleClaim).toBe("unresolved");
+    if (probe.sourceRefusals !== undefined) expect(probe.sourceRefusals).toBe(4);
+    // The real Core terminal projection closes the original claim. Its earlier
+    // exact guard must now refuse a write and preserve the actual prior winner.
+    expect(
+      (
+        await sql.run(
+          `UPDATE endpoint_test_routes SET value = 'stale' WHERE route_id = 'route' AND (${probe.resolution.sqlGuard.sql})`,
+          probe.resolution.sqlGuard.params,
+        )
+      ).changes,
+    ).toBe(0);
+    expect(
+      await sql.query("SELECT value FROM endpoint_test_routes WHERE route_id = 'route'"),
+    ).toEqual([{ value: "captured" }]);
     return endpoint;
   };
   try {
@@ -914,14 +1032,54 @@ test("forward Endpoint real Core admission closes04/05 and06/05/07 without Conta
     ] as const) {
       const worker = await create(MODULE_WORKER_FORM_URL, {});
       const version = await create(versionForm, staticSpec(worker.resourceUid));
-      await create(deploymentForm, {
+      const selectedDeployment = await create(deploymentForm, {
         worker: { resourceUid: worker.resourceUid },
         versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10000 }],
       });
       if (supported) {
-        await accept(worker.resourceUid);
+        const acceptedEndpoint = await accept(worker.resourceUid);
         // Even a failed/no-effect Endpoint retains its same-Worker UID slot.
         await refuse(worker.resourceUid);
+        if (
+          deploymentForm === FORWARD_WORKER_DEPLOYMENT_FORM_URL &&
+          versionForm === FORWARD_WORKER_VERSION_FORM_URL
+        ) {
+          const deleteDeployment = await engine.acceptDelete({
+            principal,
+            key: `forward-source-delete-${++serial}-key`,
+            uid: selectedDeployment.resourceUid,
+            expectedGeneration: 1,
+          });
+          expect(await engine.runNext()).toMatchObject({
+            id: deleteDeployment.id,
+            status: "succeeded",
+          });
+          const deleteEndpoint = await engine.acceptDelete({
+            principal,
+            key: `forward-endpoint-delete-${++serial}-key`,
+            uid: acceptedEndpoint.resourceUid,
+            expectedGeneration: 1,
+          });
+          expect(await engine.runNext()).toMatchObject({
+            id: deleteEndpoint.id,
+            status: "failed",
+            effect: "none",
+            error: { code: "fixture_admission_only" },
+          });
+          const probe = probes.at(-1);
+          if (probe?.resolution.kind !== "ready")
+            throw new Error("captured Endpoint DELETE without Deployment was refused");
+          expect(probe.resolution.snapshot.deployment).toBe(null);
+          expect(probe.liveChanges).toBe(1);
+          expect(
+            (
+              await sql.run(
+                `UPDATE endpoint_test_routes SET value = 'stale-delete' WHERE route_id = 'route' AND (${probe.resolution.sqlGuard.sql})`,
+                probe.resolution.sqlGuard.params,
+              )
+            ).changes,
+          ).toBe(0);
+        }
       } else await refuse(worker.resourceUid);
     }
     for (const otherForm of [
