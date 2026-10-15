@@ -310,35 +310,54 @@ test("scheduled acceptance excludes HTTP-woken later slots and rejects disagreem
   ).toThrow("scale");
 });
 
-test("production and cross-origin discovery are refused before any mutation", async () => {
-  expect(() => exactStagingOrigin("https://api.takoserver.com")).toThrow("staging");
-  expect(() => exactStagingOrigin("https://api.integration.takoserver.com/path")).toThrow(
-    "staging",
-  );
-  expect(exactStagingOrigin("https://api.integration.takoserver.com/")).toBe(
-    "https://api.integration.takoserver.com",
-  );
+test("control origins require a literal staging/integration prefix before file or network access", async () => {
+  for (const origin of [
+    "https://integration-api.takoserver.com",
+    "https://staging-api.takoserver.com",
+    "https://integration-api.account.workers.dev",
+    "https://staging-api.account.workers.dev",
+  ]) {
+    expect(exactStagingOrigin(`${origin}/`)).toBe(origin);
+  }
   let requests = 0;
-  await expect(
-    runHostedStagingE2E({
-      fixturePath: "missing",
-      origin: "https://api.takoserver.com",
-      writerSecretPath: "missing",
-      evidenceSecretPath: "missing",
-      outputPath: "missing",
-      journalPath: "missing",
-      sourceCommit: "a".repeat(40),
-      space: "sample",
-      runId: "sample-run",
-      pollSeconds: 1,
-      scheduleSeconds: 1,
-      now: () => new Date(),
-      fetcher: async () => {
-        requests++;
-        return Response.json({});
-      },
-    }),
-  ).rejects.toThrow("staging");
+  for (const origin of [
+    "https://api.takoserver.com",
+    "https://api.integration.takoserver.com",
+    "https://api-staging.takoserver.com",
+    "https://production.integration.takoserver.com",
+    "https://integration.takoserver.com",
+    "https://integration-.takoserver.com",
+    "https://api.staging.account.workers.dev",
+    "https://integration-api.takoserver.com.evil.test",
+    "https://integration-api.example.test",
+    "http://integration-api.takoserver.com",
+    "https://user:pass@integration-api.takoserver.com",
+    "https://integration-api.takoserver.com:8443",
+    "https://integration-api.takoserver.com/path",
+    "https://integration-api.takoserver.com/?query=1",
+    "https://integration-api.takoserver.com/#fragment",
+  ]) {
+    await expect(
+      runHostedStagingE2E({
+        fixturePath: "missing",
+        origin,
+        writerSecretPath: "missing",
+        evidenceSecretPath: "missing",
+        outputPath: "missing",
+        journalPath: "missing",
+        sourceCommit: "a".repeat(40),
+        space: "sample",
+        runId: "sample-run",
+        pollSeconds: 1,
+        scheduleSeconds: 1,
+        now: () => new Date(),
+        fetcher: async () => {
+          requests++;
+          return Response.json({});
+        },
+      }),
+    ).rejects.toThrow("staging");
+  }
   expect(requests).toBe(0);
 });
 
@@ -420,7 +439,7 @@ async function harnessFixture() {
     root,
     options: {
       fixturePath: join(root, "fixture", "fixture.json"),
-      origin: "https://api.integration.takoserver.com",
+      origin: "https://integration-api.takoserver.com",
       writerSecretPath: join(root, "writer.secret"),
       evidenceSecretPath: join(root, "evidence.secret"),
       outputPath: join(root, "evidence.json"),
@@ -446,6 +465,9 @@ test("harness drives v2 lifecycle, Service/Version rollback and dependency-order
   };
   const resources = new Map<string, Resource>();
   const operations = new Map<string, Record<string, unknown>>();
+  const preflightNames: string[] = [];
+  const createdNames: string[] = [];
+  const mutationKeys: string[] = [];
   let sequence = 0;
   let now = Date.parse("2026-10-14T14:00:00Z");
   const runId = fixture.options.runId;
@@ -477,14 +499,22 @@ test("harness drives v2 lifecycle, Service/Version rollback and dependency-order
       return Response.json({ supported: true, form: url.searchParams.get("form") });
     if (url.pathname.startsWith("/host/v2/operations/"))
       return Response.json(operations.get(url.pathname.split("/").at(-1) ?? ""));
-    if (url.pathname === "/host/v2/resources" && method === "GET")
+    if (url.pathname === "/host/v2/resources" && method === "GET") {
+      expect(url.searchParams.get("space")).toBe("sample");
+      preflightNames.push(url.searchParams.get("name") ?? "");
       return Response.json({ items: [], nextCursor: null });
+    }
     if (url.pathname.startsWith("/host/v2/resources")) {
       const uid = url.pathname.split("/").at(-1) ?? "";
       const current = resources.get(uid);
       if (method === "GET")
         return current ? Response.json(current) : Response.json({ code: "gone" }, { status: 410 });
       const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+      mutationKeys.push(new Headers(init?.headers).get("idempotency-key") ?? "");
+      if (method === "POST") {
+        expect(body.space).toBe("sample");
+        createdNames.push(String(body.name));
+      }
       if (
         method === "PUT" &&
         current &&
@@ -593,11 +623,67 @@ test("harness drives v2 lifecycle, Service/Version rollback and dependency-order
     expect(result.status).toBe("HOSTED_STAGING_SCENARIOS_PASSED");
     expect(resources.size).toBe(0);
     expect(result.launchAcceptance).toContain("unqualified");
+    expect(preflightNames).toHaveLength(36);
+    const freshNames = preflightNames.filter((name) =>
+      name.startsWith(`integration-wfp-${runId}-`),
+    );
+    const legacyNames = preflightNames.filter((name) => name.startsWith(`wfp-${runId}-`));
+    expect(freshNames).toHaveLength(18);
+    expect(legacyNames.sort()).toEqual(
+      freshNames.map((name) => name.slice("integration-".length)).sort(),
+    );
+    expect(createdNames).toHaveLength(18);
+    expect([...createdNames].sort()).toEqual([...freshNames].sort());
+    expect(new Set(createdNames).size).toBe(createdNames.length);
+    for (const name of createdNames) expect(name).toStartWith(`integration-wfp-${runId}-`);
+    expect(mutationKeys.length).toBeGreaterThan(createdNames.length);
+    for (const key of mutationKeys) expect(key).toStartWith(`integration-wfp-${runId}-`);
     const journal = await readFile(fixture.options.journalPath, "utf8");
     expect(journal).toContain("absence-confirmed");
     expect(journal).toContain("refusal-confirmed");
     expect(journal).not.toContain("synthetic-writer-secret-only");
     expect(journal).not.toContain("synthetic-evidence-secret-only");
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("an occupied legacy run name stops before new-prefix mutations in the selected Space", async () => {
+  const fixture = await harnessFixture();
+  const lookedUp: string[] = [];
+  let mutations = 0;
+  const legacyName = `wfp-${fixture.options.runId}-worker`;
+  const fetcher = async (input: string, init?: RequestInit) => {
+    const url = new URL(input);
+    if (init?.method && init.method !== "GET") mutations++;
+    if (url.pathname === "/.well-known/takoform/v2")
+      return Response.json({ api: "forms.takoform.com/v2", baseUrl: `${url.origin}/host/v2` });
+    if (url.pathname === "/host/v2/support")
+      return Response.json({ supported: true, form: url.searchParams.get("form") });
+    if (url.pathname === "/host/v2/resources" && init?.method === "GET") {
+      expect(url.searchParams.get("space")).toBe("sample");
+      const name = url.searchParams.get("name") ?? "";
+      lookedUp.push(name);
+      return Response.json({
+        items: name === legacyName ? [{ uid: "old-resource-uid", name }] : [],
+        nextCursor: null,
+      });
+    }
+    throw new Error("unexpected fixture request");
+  };
+  try {
+    await expect(
+      runHostedStagingE2E({ ...fixture.options, fetcher, now: () => new Date() }),
+    ).rejects.toThrow("fixture name already exists");
+    expect(lookedUp).toEqual([`integration-${legacyName}`, legacyName]);
+    expect(mutations).toBe(0);
+    const journal = await readFile(fixture.options.journalPath, "utf8");
+    expect(journal).toContain("halt");
+    expect(journal).not.toContain("mutation-intent");
+    expect(journal).not.toContain("old-resource-uid");
+    expect(JSON.parse(await readFile(fixture.options.outputPath, "utf8")).status).toBe(
+      "INCOMPLETE",
+    );
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -735,6 +821,7 @@ test("unknown CREATE acknowledgement stops without retry and preserves intent wi
       runHostedStagingE2E({ ...fixture.options, fetcher, now: () => new Date() }),
     ).rejects.toThrow();
     expect(mutations).toBe(1);
+    expect(await readFile(fixture.options.journalPath, "utf8")).toBe(journal);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -747,7 +834,7 @@ test("foreign discovery cannot receive credentials and unsupported Form causes z
     let foreignRequests = 0;
     const fetcher = async (input: string, init?: RequestInit) => {
       const url = new URL(input);
-      if (url.hostname !== "api.integration.takoserver.com") foreignRequests++;
+      if (url.hostname !== "integration-api.takoserver.com") foreignRequests++;
       if (init?.method === "POST") mutations++;
       if (url.pathname === "/.well-known/takoform/v2")
         return Response.json({

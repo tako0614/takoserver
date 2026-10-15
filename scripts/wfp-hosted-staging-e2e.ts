@@ -55,7 +55,7 @@ export const WFP_HOSTED_SAMPLE_E2E_FORMS = [
   STATIC_ASSET_BUNDLE_FORM_URL,
 ] as const;
 
-const DEFAULT_SPACE = "wfp-hosted-staging-e2e";
+const DEFAULT_SPACE = "integration-wfp-hosted-e2e";
 const DEFAULT_POLL_SECONDS = 300;
 const DEFAULT_SCHEDULE_SECONDS = 240;
 const RUN_HEADER = "x-takoserver-e2e-run";
@@ -411,17 +411,19 @@ export async function runHostedStagingE2E(options: RunOptions): Promise<JsonReco
       "version-v2",
       "service-version-v2",
     ]) {
-      const existing = record(
-        await requestJson(
-          client,
-          "evidence",
-          `/resources?space=${encodeURIComponent(options.space)}&name=${encodeURIComponent(`${resourcePrefix(options.runId)}-${name}`)}`,
-          { method: "GET" },
-        ),
-        "fixture name preflight invalid",
-      );
-      if (!Array.isArray(existing.items) || existing.items.length !== 0)
-        throw new HostedSampleError("fixture name already exists; use its journal for readback");
+      for (const prefix of [resourcePrefix(options.runId), `wfp-${options.runId}`]) {
+        const existing = record(
+          await requestJson(
+            client,
+            "evidence",
+            `/resources?space=${encodeURIComponent(options.space)}&name=${encodeURIComponent(`${prefix}-${name}`)}`,
+            { method: "GET" },
+          ),
+          "fixture name preflight invalid",
+        );
+        if (!Array.isArray(existing.items) || existing.items.length !== 0)
+          throw new HostedSampleError("fixture name already exists; use its journal for readback");
+      }
     }
     const graph = await createGraph({
       client,
@@ -1492,7 +1494,7 @@ function resourcePrefix(runId: string): string {
   if (!/^[a-z0-9][a-z0-9._-]{5,63}$/u.test(runId)) {
     throw new TypeError("run id must contain 6-64 lowercase identifier characters");
   }
-  return `wfp-${runId}`;
+  return `integration-wfp-${runId}`;
 }
 
 export function exactStagingOrigin(value: string): string {
@@ -1505,7 +1507,7 @@ export function exactStagingOrigin(value: string): string {
     url.hash ||
     url.port ||
     (url.pathname !== "/" && url.pathname !== "") ||
-    !/(?:^|[.-])(?:integration|staging)(?:[.-]|$)/u.test(url.hostname) ||
+    !/^(?:integration|staging)-[a-z0-9]/u.test(url.hostname) ||
     !(url.hostname.endsWith(".takoserver.com") || url.hostname.endsWith(".workers.dev"))
   ) {
     throw new TypeError("only an explicit Takoserver integration/staging origin is allowed");
@@ -1633,7 +1635,7 @@ function usage(): string {
     "usage:",
     "  bun scripts/wfp-hosted-staging-e2e.ts --emit-fixture --artifact-base-url=https://.../ --output-dir=/tmp/wfp-fixture",
     "  bun scripts/wfp-hosted-staging-e2e.ts --check-fixture --fixture=/tmp/wfp-fixture/fixture.json",
-    "  bun scripts/wfp-hosted-staging-e2e.ts --run --fixture=/tmp/wfp-fixture/fixture.json --origin=https://api.integration.takoserver.com --writer-secret=/path/writer.secret --evidence-secret=/path/evidence.secret --source-commit=<full-sha> --journal=/tmp/run.jsonl --output=/tmp/evidence.json",
+    "  bun scripts/wfp-hosted-staging-e2e.ts --run --fixture=/tmp/wfp-fixture/fixture.json --origin=https://integration-api.takoserver.com --writer-secret=/path/writer.secret --evidence-secret=/path/evidence.secret --source-commit=<full-sha> --journal=/tmp/run.jsonl --output=/tmp/evidence.json",
   ].join("\n");
 }
 

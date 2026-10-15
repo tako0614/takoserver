@@ -19,6 +19,22 @@ this harness does not publish Forms or add v1 compatibility.
 The operator must bind the Host/gateway/native namespace to the reviewed
 staging commit and artifact receipts, and complete the deployment contract's
 independent review and pre-mutation proof. Keep these receipts outside Git.
+Select the existing fixed integration Host/executor profile and its qualified
+native publication path, including the applied schema and M domain grant.
+A recovery-only profile cannot create this fresh graph. Its owning deployment
+must validate literal `integration-` or `staging-` prefixes on the actual Host,
+executor, gateway, receipt, inspector and Tail scripts, dispatch namespace,
+D1 database, R2 bucket, service bindings and exact route hosts. Any Container
+or app dependency requires its own owner's qualified prefixed destination;
+this sample does not create or qualify Containers or apps.
+
+The control origin and logical Resource names do not prove those native
+destinations. Form discovery is not proof of the selected server's native
+profile, source, grant or storage bindings. Use the existing deployment
+owner's destination validation; the harness adds no public profile selector
+or authority claim. Endpoint readback separately binds the accepted Resource
+UID without hyphens to its exact `integration-v2-<UID>.app-staging.takos.jp`
+hostname.
 No production, billing, control-schema migration, direct provider deployment,
 Cloudflare ticket, or raw control D1 SQL is part of this harness. The SQL file
 is an artifact applied to a fresh application database through MigrationSet
@@ -39,7 +55,8 @@ through the authorized staging artifact owner, preserving paths and exact
 bytes. Manifests include file digests; the fixture records manifest digests.
 Emission refuses existing files. The live harness rebuilds the fixture from
 its pinned source and rejects a mismatched document before authentication.
-All Form identities come from this repository's v2 contracts.
+All Form identities come from this repository's v2 contracts. An artifact
+source URL does not select or authorize native write destinations.
 
 ## Run
 
@@ -50,7 +67,7 @@ Cloudflare operator token. Pass paths only; never print their contents.
 ```sh
 bun run staging:wfp-hosted-e2e --run \
   --fixture=/tmp/wfp-sample-RUN/fixture.json \
-  --origin=https://api.integration.takoserver.com \
+  --origin=https://integration-api.takoserver.com \
   --writer-secret=/operator/secrets/writer.secret \
   --evidence-secret=/operator/secrets/evidence.secret \
   --source-commit=FULL_REVIEWED_COMMIT_SHA \
@@ -59,12 +76,24 @@ bun run staging:wfp-hosted-e2e --run \
   --output=/operator/evidence/sample-unique-run.json
 ```
 
-Only HTTPS staging/integration hostnames under `takoserver.com` or
-`workers.dev` are accepted. Discovery must advertise `forms.takoform.com/v2`
+Only HTTPS control hostnames beginning literally with `integration-` or
+`staging-` under `takoserver.com` or `workers.dev` are accepted. An infix such
+as `api.integration.takoserver.com` is refused. The example above does not
+identify a deployed server; use the selected owner's exact qualified origin.
+Discovery must advertise `forms.takoform.com/v2`
 on the exact same origin. Redirects are refused, response reads are bounded,
 and requests time out. Journal and output files are created once with 0600
 permissions; an existing path prevents live mutation. Use a new unique run ID.
-Preflight refuses any existing fixture Resource name before the first CREATE.
+Preflight refuses any existing fixture Resource name before the first CREATE,
+including old `wfp-<run-id>-` names in the selected Space. These read-only
+checks never adopt or clean up the old Resource, or prove that an unknown
+old acknowledgement is absent; recover that attempt from its original journal.
+Fresh logical Resource names and idempotency keys begin with
+`integration-wfp-<run-id>-`. The default logical Space is
+`integration-wfp-hosted-e2e`; an explicit existing `--space` remains the
+authorization context, not proof of native scope. These labels do not name
+the physical script, D1 database or R2 bucket. Never rewrite old journals,
+keys or Resource IDs, or use the new prefix to adopt or clean up an old run.
 
 The journey creates the 12 Forms, checks the seeded scale and all attachment
 bytes, exercises portable data bindings and a SQL-backed KV feed, and verifies
