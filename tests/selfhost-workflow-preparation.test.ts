@@ -238,6 +238,38 @@ async function disposePrepared(prepared: Prepared) {
   await prepared.dispose();
 }
 
+function expectCurrentDataOrigin(config: string): void {
+  const addresses = Array.from(
+    config.matchAll(/\(name = "data-origin", external = \(address = "([^"]+)"/gu),
+    (match) => match[1],
+  );
+  expect(addresses).toEqual([currentDataPlaneAddress]);
+  expect(addresses).not.toContain(persistedDataPlaneAddress);
+}
+
+test("data-origin address assertions allow a companion port sharing the persisted prefix", () => {
+  // These are configuration values, never fixed ports bound by this test.
+  const config = [
+    `(name = "companion", external = (address = "${persistedDataPlaneAddress}5", http = ())),`,
+    `(name = "data-origin", external = (address = "${currentDataPlaneAddress}", http = ())),`,
+  ].join("\n");
+  expect(config).toContain(persistedDataPlaneAddress);
+  expect(() => expectCurrentDataOrigin(config)).not.toThrow();
+  const stale = config.replace(
+    `name = "data-origin", external = (address = "${currentDataPlaneAddress}"`,
+    `name = "data-origin", external = (address = "${persistedDataPlaneAddress}"`,
+  );
+  expect(() => expectCurrentDataOrigin(stale)).toThrow();
+  const wrongDataOrigin = config
+    .replace(`${persistedDataPlaneAddress}5`, currentDataPlaneAddress)
+    .replace(
+      `name = "data-origin", external = (address = "${currentDataPlaneAddress}"`,
+      `name = "data-origin", external = (address = "${currentDataPlaneAddress}6"`,
+    );
+  expect(wrongDataOrigin).toContain(`address = "${currentDataPlaneAddress}"`);
+  expect(() => expectCurrentDataOrigin(wrongDataOrigin)).toThrow();
+});
+
 test("materializes the selected graph privately without evaluating or exposing public delivery", async () => {
   await publish();
   const resolved = target();
@@ -269,8 +301,7 @@ test("materializes the selected graph privately without evaluating or exposing p
     expect(applicationSection).toContain('(name = "APP_VALUE", text = "app-a")');
     expect(applicationSection).not.toContain("DATA_TOKEN");
     expect(dataSection).toContain('(name = "DATA_TOKEN", text = "facade-only-token")');
-    expect(config).toContain(`address = "${currentDataPlaneAddress}"`);
-    expect(config).not.toContain(persistedDataPlaneAddress);
+    expectCurrentDataOrigin(config);
     for (const forbidden of [
       "public.example.invalid",
       "index.html",
