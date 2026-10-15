@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, readlink, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { bytesDigest } from "../src/json.ts";
@@ -261,8 +261,34 @@ async function fixture(nativeBinary: string | null = null) {
     });
     return op;
   }
+  async function nativeCheckpoint(phase: string) {
+    if (nativeBinary === null) return;
+    const owners = [];
+    for (const name of await readdir(options.rootDirectory)) {
+      if (!/^[0-9a-f]{64}$/u.test(name)) continue;
+      const state = await readFile(
+        join(options.rootDirectory, name, "runtime-owner.json"),
+        "utf8",
+      ).catch(() => null);
+      owners.push({ name, state });
+    }
+    const processes = await Promise.all(
+      children.map(async (child) => ({
+        pid: child.pid,
+        exitCode: child.exitCode,
+        executable: await readlink(`/proc/${child.pid}/exe`).catch(() => null),
+      })),
+    );
+    const operations = await sql.query(
+      "SELECT id,resource_uid,status,effect,dispatch_possible FROM tf_v2_operations ORDER BY acceptance_order",
+    );
+    process.stderr.write(
+      `${JSON.stringify({ fixture: "forward-native-owner", phase, root, processes, operations, owners })}\n`,
+    );
+  }
   return {
     root,
+    nativeCheckpoint,
     assetManifest,
     db,
     sql,
@@ -292,20 +318,31 @@ async function fixture(nativeBinary: string | null = null) {
       engine = makeEngine();
       return restored;
     },
-    async close(allowUnsettledWithoutNative = false) {
+    async close(allowUnsettledWithoutNative = false, preserveEvidence = false) {
       try {
         await composition.suspendOwnersRetainingCustody();
       } catch (error) {
         // SQL-only claim tests intentionally retain pending Operations. This
         // local teardown proves no native child existed; it is not a product
         // quiescence/cleanup receipt for those unsettled Operations.
-        if (!allowUnsettledWithoutNative || children.length !== 0) throw error;
+        if ((!allowUnsettledWithoutNative || children.length !== 0) && !preserveEvidence)
+          throw error;
+        if (preserveEvidence)
+          process.stderr.write("forward native cleanup retained uncertain evidence\n");
       } finally {
+        await nativeCheckpoint(
+          preserveEvidence ? "failure-before-child-cleanup" : "settled-before-child-cleanup",
+        ).catch((error) => {
+          if (!preserveEvidence) throw error;
+          process.stderr.write(
+            "forward native diagnostic read failed; original failure retained\n",
+          );
+        });
         for (const child of children)
           if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
         await Promise.all(children.map((child) => child.exited));
         db.close();
-        await rm(root, { recursive: true, force: true });
+        if (!preserveEvidence) await rm(root, { recursive: true, force: true });
       }
     },
   };
@@ -567,6 +604,7 @@ test.skipIf(native === undefined)(
   "forward actual native owner07 secret/06 ACK survives suspend and SQL-held recovery",
   async () => {
     const f = await fixture(native);
+    let failed = false;
     try {
       const b = await f.basics();
       const deployment = await f.create(FORWARD_WORKER_DEPLOYMENT_FORM_URL, "deployment", {
@@ -584,6 +622,7 @@ test.skipIf(native === undefined)(
       expect(await (await owner.fetch(new Request(address))).text()).toBe(
         "native:synthetic-forward-secret",
       );
+      await f.nativeCheckpoint("original-Endpoint-fetch-ACK");
       const count = f.children.length;
       expect(await f.reopen()).toContain(b.worker.resourceUid);
       expect(f.children.length).toBe(count + 1);
@@ -593,10 +632,11 @@ test.skipIf(native === undefined)(
           workerResourceUid: b.worker.resourceUid,
           targetKey: TARGET,
         }),
-      ).toMatchObject({ kind: "serving", sourceOperationId: deployment.id });
+      ).toMatchObject({ kind: "serving", sourceOperationId: endpoint.id });
       expect(await (await reopened.fetch(new Request(address))).text()).toBe(
         "native:synthetic-forward-secret",
       );
+      await f.nativeCheckpoint("recovered-Endpoint-fetch-ACK");
       await f.remove(endpoint.resourceUid);
       await f.remove(deployment.resourceUid);
       expect(
@@ -605,8 +645,11 @@ test.skipIf(native === undefined)(
       expect(reopened.dispatchServiceBinding(new Request("https://fixture.example.test/"))).toEqual(
         { kind: "not_dispatched" },
       );
+    } catch (error) {
+      failed = true;
+      throw error;
     } finally {
-      await f.close();
+      await f.close(false, failed);
     }
   },
 );
@@ -615,6 +658,7 @@ test.skipIf(native === undefined)(
   "forward actual native owner06 DELETE cancels retained body before retirement ACK",
   async () => {
     const f = await fixture(native);
+    let failed = false;
     try {
       const b = await f.basics();
       const deployment = await f.create(FORWARD_WORKER_DEPLOYMENT_FORM_URL, "deployment", {
@@ -630,6 +674,7 @@ test.skipIf(native === undefined)(
       if (!response.body) throw new Error("native stream has no body");
       const reader = response.body.getReader();
       expect(new TextDecoder().decode((await reader.read()).value)).toBe("first");
+      await f.nativeCheckpoint("native-response-open");
       const tail = reader.read().then(
         (value) => ({ kind: "eof", done: value.done }),
         () => ({ kind: "canceled" }),
@@ -644,8 +689,11 @@ test.skipIf(native === undefined)(
         deployment.id,
       ]);
       expect(states).toEqual([{ status: "succeeded", effect: "complete" }]);
+    } catch (error) {
+      failed = true;
+      throw error;
     } finally {
-      await f.close();
+      await f.close(false, failed);
     }
   },
 );
