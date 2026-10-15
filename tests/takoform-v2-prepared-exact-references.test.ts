@@ -616,6 +616,7 @@ test("new declarations reject sparse, accessor and inherited data without execut
 test("prepared requirements cannot replace pure requirements or exceed their combined bound", async () => {
   for (const mode of ["wrong-form", "wrong-spec", "limit"] as const) {
     let uid = "";
+    let capacityTargets: readonly string[] = [];
     const f = fixture({
       references: () =>
         mode === "limit"
@@ -637,6 +638,16 @@ test("prepared requirements cannot replace pure requirements or exceed their com
       prepare: async (input) => {
         if (!input.prepareExactReferences) throw new Error("missing preparation");
         return input.prepareExactReferences(async (lookup) => {
+          // Prepared composition permits515 total declarations;516 remains invalid.
+          if (mode === "limit") {
+            const declarations: V2ReferenceRequirement[] = [];
+            for (const targetUid of capacityTargets) {
+              const selected = await lookup(targetUid);
+              if (!selected) return null;
+              declarations.push({ ...selected, readiness: "ready" });
+            }
+            return declarations;
+          }
           const selected = await lookup(uid);
           return selected
             ? [
@@ -654,6 +665,9 @@ test("prepared requirements cannot replace pure requirements or exceed their com
     });
     try {
       uid = await f.target();
+      if (mode === "limit") {
+        capacityTargets = [uid, await f.target(), await f.target(), await f.target()];
+      }
       await expect(f.create([uid])).rejects.toMatchObject({ code: "invalid_spec", status: 422 });
       expect(f.db.query("SELECT 1 FROM tf_v2_resources WHERE form_url = ?").all(CONSUMER)).toEqual(
         [],
