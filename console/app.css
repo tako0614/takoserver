@@ -278,26 +278,44 @@ textarea {
 }
 
 @media (width < 900px) {
+  /* Narrow screens keep every section one tap away: the rail becomes a
+     wrapping strip under the top bar instead of disappearing, so the current
+     section stays visible after a route change, and only the page itself
+     takes the remaining height. */
   .shell {
     grid-template-columns: 1fr;
-    grid-template-areas: "brand" "top" "main";
+    grid-template-rows: var(--header) auto auto 1fr;
+    grid-template-areas: "brand" "top" "rail" "main";
   }
 
   .rail {
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 2px;
+    padding: 6px 12px;
+    border-right: 0;
+    border-bottom: 1px solid var(--line-1);
+    overflow: visible;
+  }
+
+  .rail__group {
     display: none;
   }
 
-  .topbar {
-    overflow-x: auto;
+  .rail__link {
+    flex: none;
+    white-space: nowrap;
   }
 
-  .rail--open {
-    display: flex;
-    position: fixed;
-    inset: var(--header) auto 0 0;
-    width: var(--rail);
-    z-index: 30;
-    background: var(--surface-1);
+  /* Bold would widen the current link and move where the strip wraps, so
+     the strip's height would change between pages. */
+  .rail__link[aria-current="page"] {
+    font-weight: inherit;
+  }
+
+  .topbar {
+    min-height: 48px;
+    overflow-x: auto;
   }
 
   .main {
@@ -728,6 +746,11 @@ tbody tr.is-clickable:hover {
   font-size: 13px;
 }
 
+/* The alert mark keeps its size beside text long enough to wrap. */
+.notice > svg:first-child {
+  flex: none;
+}
+
 .notice--bad {
   border-color: color-mix(in srgb, var(--bad) 35%, transparent);
   background: var(--bad-soft);
@@ -836,6 +859,28 @@ tbody tr.is-clickable:hover {
   gap: 8px;
   padding: 14px 18px;
   border-top: 1px solid var(--line-1);
+}
+
+/* An exact key or JSON body is longer than a dialog is wide. Without these
+   the body grows to fit it and the dialog scrolls sideways, hiding its own
+   left edge; with them the body keeps the dialog's width and the text wraps. */
+.modal__body > *,
+.modal__body > * > * {
+  min-width: 0;
+}
+
+.modal .mono {
+  overflow-wrap: anywhere;
+}
+
+.modal pre {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line-1);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* --------------------------------------------------------------- toasts -- */
