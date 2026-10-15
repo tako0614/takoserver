@@ -214,6 +214,10 @@ export {
 } from "./providers/http-revision-serving.ts";
 export { ProviderMeterError } from "./providers/provider-meter.ts";
 export {
+  type SelfhostWorkerForwardObjectBucketSourceInput,
+  selfhostWorkerForwardObjectBucketEntrypointSource,
+} from "./providers/selfhost-worker-wrapper.ts";
+export {
   assertSafeMigrationSql,
   MigrationSqlCapacityError,
   prepareMigrationSql,
