@@ -119,11 +119,25 @@ export {
 } from "./forms/sqlite-database.ts";
 export { createSQLiteDatabaseForm } from "./forms/sqlite-database-backend.ts";
 export {
+  parseSQLiteMigrationApplicationSpec,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_4_0,
+  type SQLiteMigrationApplicationFormUrl,
+  type SQLiteMigrationApplicationSpec,
+} from "./forms/sqlite-migration-application.ts";
+export {
   createSQLiteMigrationApplicationForm,
+  runSQLiteMigrationApplication,
   SQLITE_MIGRATION_APPLICATION_BACKEND_ID,
 } from "./forms/sqlite-migration-application-backend.ts";
 export type {
+  SQLiteMigrationApplicationBatchInput,
+  SQLiteMigrationApplicationBatchPort,
+  SQLiteMigrationApplicationInput,
   SQLiteMigrationApplicationPort,
+  SQLiteMigrationApplicationResult,
   SQLiteMigrationEntry,
   SQLiteMigrationFileResult,
   SQLiteMigrationLedgerResult,
@@ -132,8 +146,19 @@ export type {
 } from "./forms/sqlite-migration-application-port.ts";
 export {
   parseSQLiteMigrationManifest,
+  parseSQLiteMigrationSetSpec,
+  SQLITE_MIGRATION_SET_FORM_URL,
+  SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
+  SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
+  SQLITE_MIGRATION_SET_FORM_URL_0_4_0,
+  SQLITE_MIGRATION_SET_LIMITS,
+  type SQLiteMigrationManifest,
+  type SQLiteMigrationManifestFile,
+  type SQLiteMigrationSetFormUrl,
+  type SQLiteMigrationSetSpec,
   validateSQLiteMigrationPayload,
 } from "./forms/sqlite-migration-set.ts";
+export { createSQLiteMigrationSetCustody } from "./forms/sqlite-migration-set-backend.ts";
 export type { SQLiteDatabaseNativePort } from "./forms/sqlite-native-store-port.ts";
 export {
   createSQLiteWorkerBindingAuthority,
