@@ -14,40 +14,48 @@ describe("Takoserver public site", () => {
     expect(html).toContain(
       "Takoserver is an open-source cloud that runs on your own Linux machine.",
     );
-    // The install guide is the primary action; the console comes second.
-    const primary = html.indexOf('class="pill primary"');
+    const primary = html.indexOf('class="pill primary external"');
     expect(html.slice(primary, primary + 200)).toContain(
       "docs/self-host-operations.md#first-install-and-first-use",
     );
-    expect(html.indexOf('data-i18n="install"')).toBeLessThan(html.indexOf('data-i18n="console"'));
-    expect(html).toContain('href="https://console.takoserver.example" data-i18n="console"');
+    // The hero offers the install guide and the source, never a hosted console.
+    const hero = html.slice(html.indexOf('<section class="hero"'), html.indexOf('id="forms"'));
+    expect(hero).toContain('data-i18n="source"');
+    expect(hero).not.toContain("console.takoserver.example");
+    // Install, then deploy, then manage.
+    const sections = ["forms", "start", "deploy", "after"].map((id) => html.indexOf(`id="${id}"`));
+    expect(sections.every((index) => index > 0)).toBe(true);
+    expect([...sections].sort((a, b) => a - b)).toEqual(sections);
     expect(html).not.toMatch(/wallet|prepaid|Usage-based/u);
     expect(html).not.toMatch(/Cloudflare|Wasabi|Aiven|UpCloud|Backblaze|OpenSRS/u);
     expect(html).not.toContain("<script src=");
   });
 
-  test("lists the Forms a complete self-host composition accepts, with their versions", () => {
+  test("lists the Forms a self-host can compose, with versions and what each group needs", () => {
     const html = landingHtml(site);
     for (const form of [
+      "WorkerBundle 0.2.0",
+      "StaticAssetBundle 0.2.0",
+      "SQLiteMigrationSet 0.2.0",
       "ModuleWorker 0.3.0",
       "WorkerVersion 0.5.0",
       "WorkerDeployment 0.4.0",
-      "WorkerEndpoint 0.3.0",
       "WorkerCronTrigger 0.3.0",
+      "WorkerEndpoint 0.3.0",
       "SQLiteDatabase 0.2.0",
+      "SQLiteMigrationApplication 0.2.0",
       "EdgeKVNamespace 0.2.0",
       "ObjectBucket 0.2.0",
       "AtLeastOnceQueue 0.2.0",
       "QueueConsumer 0.3.0",
       "ActorNamespace 0.3.0",
       "DurableWorkflow 0.3.0",
-      "WorkerBundle 0.2.0",
-      "StaticAssetBundle 0.2.0",
-      "SQLiteMigrationSet 0.2.0",
-      "SQLiteMigrationApplication 0.2.0",
     ]) {
       expect(html).toContain(`<code>${form}</code>`);
     }
+    expect(html).toContain("that Form's block in TAKOSERVER_TAKOFORM_V2_CONFIG");
+    expect(html).toContain("WorkerEndpoint also needs the HTTPS listener on port 443");
+    expect(html).toContain("SQLiteMigrationApplication also needs a sqliteMigrationSet block");
   });
 
   test("walks one Worker through the guide's create chain to its response", () => {
@@ -67,16 +75,32 @@ describe("Takoserver public site", () => {
     expect(html).toContain("docs/self-host-operations.md#6-seed-held-artifacts");
   });
 
-  test("keeps the self-host steps and the support check", () => {
+  test("keeps the guide's self-host steps", () => {
     const html = landingHtml(site);
-    expect(html).toContain("bun install --frozen-lockfile");
-    expect(html).toContain("<code>TAKOSERVER_TAKOFORM_V2_CURSOR_KEY</code>");
-    expect(html).toContain("bun src/entry-bun.ts");
-    expect(html).toContain("docs/self-host-docker.md");
     expect(html).toContain(
-      "curl -sG https://api.takoserver.example/apis/forms.takoform.com/v2/support \\\n" +
+      "git checkout --detach &lt;reviewed-commit&gt;\nbun install --frozen-lockfile",
+    );
+    expect(html).toContain("<code>TAKOSERVER_TAKOFORM_V2_CURSOR_KEY</code>");
+    expect(html).toContain("bun --no-env-file src/entry-bun.ts");
+    expect(html).toContain("both bundle blocks on selfhost-v2-worker-primary");
+    expect(html).toContain("docs/self-host-operations.md#1-prerequisites");
+    expect(html).toContain("docs/self-host-docker.md");
+  });
+
+  test("manages what you deployed on your own Host, not on takoserver.com's", () => {
+    const html = landingHtml(site);
+    expect(html).not.toContain("curl -sG https://api.takoserver.example");
+    expect(html).toContain(
+      'curl -sG "$HOST/apis/forms.takoform.com/v2/support" \\\n' +
         '  --data-urlencode "form=&lt;Form URL&gt;" \\\n' +
         '  -H "authorization: Bearer $KEY"',
+    );
+    expect(html).toContain(
+      "<code>bun scripts/build-console.ts --api-origin &lt;API origin&gt;</code>",
+    );
+    expect(html).toContain("<code>TAKOSERVER_CONSOLE_ORIGIN</code>");
+    expect(html).toContain(
+      '<a href="https://console.takoserver.example" data-i18n="consoleSite">takoserver.com\'s own console</a>',
     );
     for (const path of ["/openapi.json", "/.well-known/takoform/v2", "/.well-known/takoserver"]) {
       expect(html).toContain(`href="https://api.takoserver.example${path}"`);
@@ -85,9 +109,11 @@ describe("Takoserver public site", () => {
 
   test("shows the real Console in the visitor's language, light or dark, on the public site only", () => {
     const english = landingHtml(site);
-    expect(english).toContain('srcset="/screens/console-desktop-dark-en.webp"');
+    expect(english).toContain(
+      'srcset="/screens/console-desktop-dark-en.webp" data-locale-srcset="/screens/console-desktop-dark-{lang}.webp" width="2400" height="1500"',
+    );
     expect(english).toContain('src="/screens/console-desktop-light-en.webp"');
-    expect(english).toContain('data-locale-src="/screens/console-desktop-light-{lang}.webp"');
+    expect(english).toContain('width="780" height="1560"');
     expect(english).toContain("public sample data");
     const japanese = landingHtml({ ...site, locale: "ja" });
     expect(japanese).toContain('<html lang="ja">');
@@ -109,18 +135,35 @@ describe("Takoserver public site", () => {
     expect(html).toContain(
       'setLocale(pathLocale==="ja"||pathLocale==="en"?pathLocale:browserLocale)',
     );
+    // A Japanese browser at the public root goes to /ja/ before the body loads.
+    expect(html.indexOf('location.replace("/ja/")')).toBeGreaterThan(0);
+    expect(html.indexOf('location.replace("/ja/")')).toBeLessThan(html.indexOf("<body>"));
+    expect(html).toContain(
+      '<link rel="alternate" hreflang="ja" href="https://takoserver.com/ja/">',
+    );
+    expect(html).toContain(
+      '<link rel="alternate" hreflang="x-default" href="https://takoserver.com/">',
+    );
   });
 
-  test("names a pasteable origin in commands on the API's own root", () => {
+  test("answers on the API's own root with its own origin and console", () => {
     const html = landingHtml({ consoleOrigin: null, apiOrigin: null });
     expect(html).toContain(
-      "curl -sG <span data-origin>$HOST</span>/apis/forms.takoform.com/v2/support",
+      'curl -sG "<span data-origin>$HOST</span>/apis/forms.takoform.com/v2/support"',
     );
     expect(html).toContain(
       'for(const node of document.querySelectorAll("[data-origin]"))node.textContent=location.origin;',
     );
-    expect(html).toContain('data-i18n="source"');
-    expect(html).not.toContain('data-i18n="console"');
+    expect(html).not.toContain('data-i18n="consoleHost"');
+    expect(html).not.toContain("hreflang");
+    expect(html).not.toContain('location.replace("/ja/")');
+    const withConsole = landingHtml({
+      consoleOrigin: "https://console.host.example",
+      apiOrigin: null,
+    });
+    expect(withConsole).toContain(
+      'href="https://console.host.example" data-i18n="consoleHost">Open this Host\'s console</a>',
+    );
     expect(landingHtml(site)).not.toContain("data-origin>");
   });
 
