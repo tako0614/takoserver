@@ -237,8 +237,11 @@ export function compileLinuxContainerEgress(
     }
   }
   const hostHttp = validateHostHttp(value);
+  // CREATE is exclusive; nft expands nested table bodies only for ADD.
   const lines = [
-    `create table inet ${value.table} {`,
+    `create table inet ${value.table}`,
+    ...(hostHttp ? [`create table bridge ${value.table}_bridge`] : []),
+    `table inet ${value.table} {`,
     "set disabled { type ifname; }",
     "counter killed { }",
     "counter host_denied { }",
@@ -438,7 +441,7 @@ function compileBridgeGuard(
   const ruleTags: string[] = [];
   const ruleExpressions: unknown[][] = [];
   lines.push(
-    `create table bridge ${name} {`,
+    `table bridge ${name} {`,
     "set disabled { type ifname; }",
     "counter killed { }",
     "counter bridge_denied { }",
@@ -945,6 +948,43 @@ function ownedTableObjects(readback: unknown, family: "inet" | "bridge", table: 
   return readback.nftables;
 }
 
+export async function readLinuxContainerEgress(
+  plan: LinuxContainerEgressPlan,
+  port: LinuxContainerEgressPort,
+  expectedStructureDigest?: string,
+) {
+  async function guard() {
+    if (
+      (await port.namespace()) !== plan.namespace.selected ||
+      plan.namespace.selected === plan.namespace.parent
+    )
+      fail();
+  }
+  await guard();
+  const readback: unknown = JSON.parse(
+    await port.execute({ argv: ["nft", "-j", "list", "table", "inet", plan.table] }),
+  );
+  await guard();
+  if (plan.bridgeRules) {
+    const bridge: unknown = JSON.parse(
+      await port.execute({
+        argv: ["nft", "-j", "list", "table", "bridge", plan.bridgeRules.table],
+      }),
+    );
+    await guard();
+    const inetObjects = ownedTableObjects(readback, "inet", plan.table);
+    const bridgeObjects = ownedTableObjects(bridge, "bridge", plan.bridgeRules.table);
+    return verifyLinuxContainerEgressReadback(
+      plan,
+      {
+        nftables: [...inetObjects, ...bridgeObjects],
+      },
+      expectedStructureDigest,
+    );
+  }
+  return verifyLinuxContainerEgressReadback(plan, readback, expectedStructureDigest);
+}
+
 export async function applyLinuxContainerEgress(
   plan: LinuxContainerEgressPlan,
   port: LinuxContainerEgressPort,
@@ -961,22 +1001,5 @@ export async function applyLinuxContainerEgress(
   await guard();
   await port.execute({ argv: ["nft", "-f", "-"], stdin: plan.script });
   await guard();
-  const readback: unknown = JSON.parse(
-    await port.execute({ argv: ["nft", "-j", "list", "table", "inet", plan.table] }),
-  );
-  await guard();
-  if (plan.bridgeRules) {
-    const bridge: unknown = JSON.parse(
-      await port.execute({
-        argv: ["nft", "-j", "list", "table", "bridge", plan.bridgeRules.table],
-      }),
-    );
-    await guard();
-    const inetObjects = ownedTableObjects(readback, "inet", plan.table);
-    const bridgeObjects = ownedTableObjects(bridge, "bridge", plan.bridgeRules.table);
-    return verifyLinuxContainerEgressReadback(plan, {
-      nftables: [...inetObjects, ...bridgeObjects],
-    });
-  }
-  return verifyLinuxContainerEgressReadback(plan, readback);
+  return readLinuxContainerEgress(plan, port);
 }
