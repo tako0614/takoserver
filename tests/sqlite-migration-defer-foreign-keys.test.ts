@@ -9,12 +9,12 @@ import {
   MigrationSqlCapacityError as NeutralCapacityError,
   prepareMigrationSql as prepareNeutralMigrationSql,
 } from "../src/sqlite-migration-policy.ts";
-import { createSQLiteMigrationApplicationNativePort } from "../src/takoform-v2/forms/sqlite-migration-application-native.ts";
 import {
   SQLITE_MIGRATION_APPLICATION_FORM_URL,
   SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
   SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0,
 } from "../src/takoform-v2/forms/sqlite-migration-application.ts";
+import { createSQLiteMigrationApplicationNativePort } from "../src/takoform-v2/forms/sqlite-migration-application-native.ts";
 import type { SQLiteMigrationRecord } from "../src/takoform-v2/forms/sqlite-migration-application-port.ts";
 
 const VALUES = ["ON", "OFF", "TRUE", "FALSE", "1", "0"] as const;
