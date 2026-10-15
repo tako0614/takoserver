@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,12 +9,15 @@ import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject } from "../src/ports.ts";
 import { WORKERD_V2_PRIVATE_ENTRYPOINT_MODULE } from "../src/providers/workerd-v2-private-binding-names.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { readV2ConfiguredPrivateInputs } from "../src/takoform-v2/configured-private-inputs.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { OBJECT_BUCKET_LIMITS } from "../src/takoform-v2/forms/object-bucket.ts";
 import {
   OBJECT_BUCKET_EOF_COUNTED_FORM_URL,
   OBJECT_BUCKET_KNOWN_LENGTH_FORM_URL,
 } from "../src/takoform-v2/forms/object-bucket-binding-profile.ts";
+import { STATIC_ASSET_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/static-asset-bundle.ts";
+import { createStaticAssetBundleHost } from "../src/takoform-v2/forms/static-asset-bundle-backend.ts";
 import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.ts";
 import { createWorkerBundleHost } from "../src/takoform-v2/forms/worker-bundle-backend.ts";
 import {
@@ -25,10 +29,18 @@ import {
 import { createV2Store } from "../src/takoform-v2/store.ts";
 import type { V2Execution, V2Form } from "../src/takoform-v2/types.ts";
 import { createForwardWorkerDeploymentForm } from "../src/takoform-v2/worker-deployment-backend.ts";
-import { createInternalV2ForwardWorkerVersionForm } from "../src/takoform-v2/worker-lifecycle-backend.ts";
+import {
+  createInternalV2ForwardWorkerVersionForm,
+  createV2CodeConfiguredInputReader,
+  createV2ForwardCodeConfiguredInputReader,
+} from "../src/takoform-v2/worker-lifecycle-backend.ts";
 import { createWorkerPublicationSqlGuard } from "../src/takoform-v2/worker-publication-sql-guard.ts";
 import { createV2WorkerPublicationState } from "../src/takoform-v2/worker-publication-state.ts";
 import { createV2WorkerPublication } from "../src/takoform-v2/worker-static-publication.ts";
+import {
+  createV2ForwardWorkerVersionConfiguredInputSealer,
+  createV2WorkerVersionConfiguredInputSealer,
+} from "../src/takoform-v2/worker-version-configured-inputs.ts";
 import type {
   WorkerdDeploymentPublication,
   WorkerdPublicationIdentity,
@@ -41,11 +53,35 @@ const URL = "https://artifact.example.test/manifest.json";
 const MODULE = "https://artifact.example.test/index.js";
 const bytes = new TextEncoder().encode("export default {fetch(){return new Response('held')}}");
 
-async function fixture() {
+async function fixture(secrets = false) {
   const root = mkdtempSync(join(tmpdir(), "takoserver-forward-materializer-"));
   const db = new Database(join(root, "core.sqlite"));
   migrateSqlite(db);
   const sql = createSqliteSql(db);
+  let readAllowed = true;
+  const key = secrets
+    ? await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
+        "encrypt",
+        "decrypt",
+      ])
+    : undefined;
+  const comparison = secrets
+    ? await crypto.subtle.generateKey({ name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"])
+    : undefined;
+  const keyring = key
+    ? {
+        current: { keyId: "synthetic-graph-key", key },
+        keyForDecryption: (id: string) => (id === "synthetic-graph-key" ? key : undefined),
+      }
+    : undefined;
+  const sealer = keyring ? createV2ForwardWorkerVersionConfiguredInputSealer(keyring) : undefined;
+  const custody = {
+    read: (identity: Parameters<typeof readV2ConfiguredPrivateInputs>[1]) =>
+      readV2ConfiguredPrivateInputs(sql, identity),
+  };
+  const configured = sealer
+    ? createV2ForwardCodeConfiguredInputReader({ sql, sealer, custody })
+    : undefined;
   let sourceEnabled = true,
     sourceReads = 0,
     sendCount = 0,
@@ -66,20 +102,37 @@ async function fixture() {
       ],
     }),
   );
-  const bundle = createWorkerBundleHost({
-    sql,
-    targetKey: TARGET,
-    source: {
-      async read({ url }) {
-        sourceReads++;
-        if (!sourceEnabled) throw new Error("source unavailable");
-        if (url === URL) return manifest;
-        if (url === MODULE) return bytes;
-        throw new Error("unexpected source");
-      },
+  const assetBytes = new TextEncoder().encode("<main>held forward static</main>");
+  const assetManifest = new TextEncoder().encode(
+    JSON.stringify({
+      files: [
+        {
+          path: "index.html",
+          url: "https://artifact.example.test/index.html",
+          sha256: (await bytesDigest(assetBytes)).slice(7),
+          mediaType: "text/html",
+        },
+      ],
+    }),
+  );
+  const source = {
+    async read({ url }: { url: string }) {
+      sourceReads++;
+      if (!sourceEnabled) throw new Error("source unavailable");
+      if (url === URL) return manifest;
+      if (url === MODULE) return bytes;
+      if (url === "https://artifact.example.test/assets.json") return assetManifest;
+      if (url === "https://artifact.example.test/index.html") return assetBytes;
+      throw new Error("unexpected source");
     },
+  };
+  const bundle = createWorkerBundleHost({ sql, targetKey: TARGET, source });
+  const assets = createStaticAssetBundleHost({ sql, targetKey: TARGET, source });
+  const state = createV2WorkerPublicationState({
+    sql,
+    bundleCustody: bundle.custody,
+    assetCustody: assets.custody,
   });
-  const state = createV2WorkerPublicationState({ sql, bundleCustody: bundle.custody });
   // Explicit structural runtime/inspector: held bytes, Core and compiler are real;
   // this does not qualify native workerd, a filesystem body store, or R2.
   const runtime = {
@@ -126,6 +179,7 @@ async function fixture() {
     targetKey: TARGET,
     publicationState: state,
     runtime,
+    ...(configured ? { configuredInputs: configured } : {}),
     v2ObjectBucketBinding: {
       address: "127.0.0.1:4777",
       issueGrant() {
@@ -176,6 +230,7 @@ async function fixture() {
       },
     },
     inspectModule: runtime.inspectModule,
+    ...(sealer ? { configuredInputSealer: sealer, configuredInputCustody: custody } : {}),
     v2ObjectBucketBinding: {
       address: "127.0.0.1:4777",
       expectedBackendId: "fixture-bucket",
@@ -207,12 +262,22 @@ async function fixture() {
   });
   const engine = createTakoformV2Engine({
     sql,
-    authorize: async () => true,
+    authorize: async (_principal, _space, access) => access !== "read" || readAllowed,
+    ...(key && comparison
+      ? {
+          privateInputCustody: {
+            transfer: { current: { id: "synthetic-transfer", key } },
+            comparison: { current: { id: "synthetic-comparison", key: comparison } },
+            transferTtlSeconds: 60,
+          },
+        }
+      : {}),
     replayWindowSeconds: 3600,
     leaseMilliseconds: 60000,
     forms: {
       [MODULE_WORKER_FORM_URL]: metadata,
       [WORKER_BUNDLE_FORM_URL]: bundle.form,
+      [STATIC_ASSET_BUNDLE_FORM_URL]: assets.form,
       [OBJECT_BUCKET_KNOWN_LENGTH_FORM_URL]: metadata,
       [OBJECT_BUCKET_EOF_COUNTED_FORM_URL]: metadata,
       [FORWARD_WORKER_VERSION_FORM_URL]: version,
@@ -220,11 +285,23 @@ async function fixture() {
     },
   });
   let serial = 0;
-  async function create(form: string, name: string, spec: JsonObject, settle = true) {
+  async function create(
+    form: string,
+    name: string,
+    spec: JsonObject,
+    settle = true,
+    privateInputs?: Readonly<Record<string, string>>,
+  ) {
     const accepted = await engine.acceptCreate({
       principal: "alice",
       key: `materializer-${++serial}-create-key-0001`,
-      input: { form, space: "space", name, spec },
+      input: {
+        form,
+        space: "space",
+        name,
+        spec,
+        ...(privateInputs === undefined ? {} : { privateInputs }),
+      },
     });
     if (settle) {
       for (let i = 0; i < 8; i++) {
@@ -244,15 +321,22 @@ async function fixture() {
     });
     const old = await create(OBJECT_BUCKET_KNOWN_LENGTH_FORM_URL, "old", {});
     const next = await create(OBJECT_BUCKET_EOF_COUNTED_FORM_URL, "new", {});
-    const v = await create(FORWARD_WORKER_VERSION_FORM_URL, "version", {
-      worker: { resourceUid: worker.resourceUid },
-      bundle: { resourceUid: artifact.resourceUid },
-      handlers: ["fetch"],
-      bucketBindings: [
-        { name: "NEW", resource: { resourceUid: next.resourceUid } },
-        { name: "OLD", resource: { resourceUid: old.resourceUid } },
-      ],
-    });
+    const v = await create(
+      FORWARD_WORKER_VERSION_FORM_URL,
+      "version",
+      {
+        worker: { resourceUid: worker.resourceUid },
+        bundle: { resourceUid: artifact.resourceUid },
+        handlers: ["fetch"],
+        ...(secrets ? { requiredSensitiveVars: ["TOKEN"] } : {}),
+        bucketBindings: [
+          { name: "NEW", resource: { resourceUid: next.resourceUid } },
+          { name: "OLD", resource: { resourceUid: old.resourceUid } },
+        ],
+      },
+      true,
+      secrets ? { TOKEN: "synthetic-forward-value" } : undefined,
+    );
     const spec = {
       worker: { resourceUid: worker.resourceUid },
       versions: [{ workerVersion: { resourceUid: v.resourceUid }, weight: 10000 }],
@@ -289,10 +373,19 @@ async function fixture() {
   }
   return {
     db,
+    assetBytes,
+    assetManifest,
     sql,
     engine,
     state,
     publication,
+    configured,
+    sealer,
+    keyring,
+    custody,
+    denyRead() {
+      readAllowed = false;
+    },
     create,
     basics,
     execution,
@@ -445,6 +538,56 @@ test("forward actual SQLite route CAS keeps the concurrent winner after accepted
       referenceSetIds: [],
       evidence: {},
     });
+    // Full SQL-byte golden derived statically from the frozen858 default builder;
+    // empty evidence/sets keep the output independent of generated fixture UIDs.
+    expect(createHash("sha256").update(legacy.sql).digest("hex")).toBe(
+      "9f41be59d26c0bac63896b9926c82fb398202be76bc8fca8b22f975faa815b19",
+    );
+    const scopes = [
+      WORKER_DEPLOYMENT_FORM_URL,
+      "https://edge.forms.takoform.com/forms/WorkerEndpoint/0.3.0/",
+    ];
+    const expectedParams = [
+      execution.operationId,
+      execution.resourceUid,
+      execution.principal,
+      execution.backendKey,
+      execution.backendId,
+      execution.targetKey,
+      execution.action,
+      execution.generation,
+      canonicalJson(execution.spec),
+      execution.leaseToken,
+      execution.principal,
+      WORKER_DEPLOYMENT_FORM_URL,
+      execution.space,
+      execution.name,
+      "[]",
+      "[]",
+      "[]",
+      "[]",
+      ...scopes.flatMap((form) => [
+        form,
+        "alice",
+        "space",
+        b.worker.resourceUid,
+        "[]",
+        form,
+        "alice",
+        "space",
+        b.worker.resourceUid,
+        "[]",
+      ]),
+      WORKER_DEPLOYMENT_FORM_URL,
+      scopes[1],
+      b.worker.resourceUid,
+      "[]",
+      WORKER_DEPLOYMENT_FORM_URL,
+      scopes[1],
+      b.worker.resourceUid,
+      "[]",
+    ];
+    expect(legacy.params).toEqual(expectedParams);
     expect(legacy.params).toContain(WORKER_DEPLOYMENT_FORM_URL);
     expect(legacy.params).not.toContain(FORWARD_WORKER_DEPLOYMENT_FORM_URL);
     expect(() =>
@@ -463,6 +606,101 @@ test("forward actual SQLite route CAS keeps the concurrent winner after accepted
         evidence: {},
       }),
     ).toThrow();
+  } finally {
+    f.close();
+  }
+});
+
+test("forward07 CREATE seals synthetic sensitive vars and reads only the exact held owner", async () => {
+  const f = await fixture(true);
+  try {
+    const b = await f.basics();
+    const publicVersion = await f.engine.getResource({
+      principal: "alice",
+      uid: b.version.resourceUid,
+    });
+    expect(JSON.stringify(publicVersion)).not.toContain("synthetic-forward-value");
+    const rows = await f.sql.query(
+      "SELECT key_id,nonce,ciphertext FROM tf_v2_configured_private_inputs WHERE resource_uid=?",
+      [b.version.resourceUid],
+    );
+    expect(rows).toHaveLength(1);
+    expect(JSON.stringify(rows)).not.toContain("synthetic-forward-value");
+    const op = await f.create(FORWARD_WORKER_DEPLOYMENT_FORM_URL, "deployment", b.spec, false);
+    const execution = await f.execution(op.id);
+    const resolved = await f.state.resolveForward({ execution });
+    if (resolved.kind !== "ready") throw new Error("missing genuine held graph");
+    const version = resolved.snapshot.deployment?.versions[0];
+    if (!version || !f.configured || !f.keyring) throw new Error("missing configured07 fixture");
+    const input = {
+      resourceUid: b.version.resourceUid,
+      principal: "alice",
+      space: "space",
+      targetKey: TARGET,
+      spec: version.spec,
+      stillCurrent: resolved.stillCurrent,
+    };
+    expect(await f.configured.read(input)).toEqual({ TOKEN: "synthetic-forward-value" });
+    expect(await f.configured.read({ ...input, principal: "mallory" })).toBeNull();
+    expect(await f.configured.read({ ...input, space: "other" })).toBeNull();
+    const old = createV2CodeConfiguredInputReader({
+      sql: f.sql,
+      sealer: createV2WorkerVersionConfiguredInputSealer(f.keyring),
+      custody: f.custody,
+    });
+    expect(await old.read(input)).toBeNull();
+    const deniedBefore = await f.sql.query("SELECT COUNT(*) AS n FROM tf_v2_operations");
+    f.denyRead();
+    await expect(
+      f.engine.acceptCreate({
+        principal: "alice",
+        key: "denied-forward-secret-create-key-0001",
+        input: {
+          form: FORWARD_WORKER_VERSION_FORM_URL,
+          space: "space",
+          name: "denied",
+          spec: version.spec,
+          privateInputs: { TOKEN: "synthetic-forward-value" },
+        },
+      }),
+    ).rejects.toMatchObject({ status: 403 });
+    expect(await f.sql.query("SELECT COUNT(*) AS n FROM tf_v2_operations")).toEqual(deniedBefore);
+    expect(f.sendCount).toBe(0);
+  } finally {
+    f.close();
+  }
+});
+
+test("forward07 static CREATE and06 publication use verified held assets without code material", async () => {
+  const f = await fixture();
+  try {
+    const worker = await f.create(MODULE_WORKER_FORM_URL, "static-worker", {});
+    const asset = await f.create(STATIC_ASSET_BUNDLE_FORM_URL, "assets", {
+      artifact: {
+        url: "https://artifact.example.test/assets.json",
+        sha256: (await bytesDigest(f.assetManifest)).slice(7),
+      },
+    });
+    const version = await f.create(FORWARD_WORKER_VERSION_FORM_URL, "static-version", {
+      worker: { resourceUid: worker.resourceUid },
+      handlers: [],
+      assets: {
+        bundle: { resourceUid: asset.resourceUid },
+        runWorkerFirst: false,
+        notFoundHandling: "none",
+      },
+    });
+    const reads = f.sourceReads;
+    f.disableSource();
+    await f.create(FORWARD_WORKER_DEPLOYMENT_FORM_URL, "static-deployment", {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [{ workerVersion: { resourceUid: version.resourceUid }, weight: 10000 }],
+    });
+    expect(f.sourceReads).toBe(reads);
+    expect(f.sendCount).toBe(1);
+    expect(f.sent?.versions[0]?.site.kind).toBe("static");
+    expect(f.sent?.versions[0]?.modules.size).toBe(0);
+    expect(f.sent?.versions[0]?.assets?.get("index.html")).toEqual(f.assetBytes);
   } finally {
     f.close();
   }

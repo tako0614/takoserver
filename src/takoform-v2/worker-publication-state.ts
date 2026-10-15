@@ -2957,8 +2957,19 @@ export function createV2WorkerPublicationState(options: {
       );
     },
     resolve: (input: { execution: V2Execution; incumbentSourceOperationId?: string }) =>
-      resolvePublication(input),
+      resolvePublication({
+        execution: input.execution,
+        ...(input.incumbentSourceOperationId === undefined
+          ? {}
+          : { incumbentSourceOperationId: input.incumbentSourceOperationId }),
+      }),
     resolveForward: (input: { execution: V2Execution; incumbentSourceOperationId?: string }) =>
-      resolvePublication({ ...input, forward: true }),
+      resolvePublication({
+        execution: input.execution,
+        ...(input.incumbentSourceOperationId === undefined
+          ? {}
+          : { incumbentSourceOperationId: input.incumbentSourceOperationId }),
+        forward: true,
+      }),
   };
 }

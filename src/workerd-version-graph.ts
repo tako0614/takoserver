@@ -1,5 +1,9 @@
 import { parseActorAbiRef } from "./actor-abi-ref.ts";
 import {
+  type ObjectBucketBindingForm,
+  snapshotObjectBucketBindingForms,
+} from "./object-bucket-binding-profile.ts";
+import {
   SELFHOST_WORKER_DATA_SERVICE_MODULE,
   selfhostDataServiceSource,
 } from "./providers/selfhost-data-service.ts";
@@ -62,10 +66,6 @@ import {
   SELFHOST_WORKFLOW_BINDING_RUNTIME_MODULE,
   selfhostWorkflowBindingEntrypointSource,
 } from "./selfhost-workflow-binding-worker-wrapper.ts";
-import {
-  type ObjectBucketBindingForm,
-  snapshotObjectBucketBindingForms,
-} from "./takoform-v2/forms/object-bucket-binding-profile.ts";
 import type {
   WorkerdActorForward,
   WorkerdActorForwardBinding,

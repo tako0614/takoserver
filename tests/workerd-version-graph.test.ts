@@ -1193,7 +1193,7 @@ test("forward actual graph retains six old renderer byte outputs and selects exa
       resourceUid: "bucket-old-001",
       formUrl: "https://edge.forms.takoform.com/forms/ObjectBucket/0.2.0/" as const,
     },
-  ];
+  ] as const;
   const input = graphInput({
     generation: "takoserver-v2-operation:11111111-1111-4111-8111-111111111111",
     environment: [],

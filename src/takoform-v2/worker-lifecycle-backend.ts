@@ -1256,7 +1256,7 @@ import {
   validateForwardWorkerVersionUpdate,
 } from "./forms/worker-specs.ts";
 
-/** Accepted-source preparation only; the actual forward materializer is absent. */
+/** Named07 factory. Actual ports select held materialization; target-only preparation remains refused. */
 export function createInternalV2ForwardWorkerVersionForm(
   options:
     | { readonly targetKey: string }
