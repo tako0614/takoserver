@@ -282,12 +282,29 @@ function parseNetworkHttp(bytes: Buffer): unknown {
 /** Queries actual namespace-bound link/IPAM data; labels only corroborate the
  * original allocation owner. No prefix-derived bridge or guessed stopped veth.
  */
+export interface DockerPhysicalBridgeBinding {
+  readonly bridge: LinuxContainerHostHttpBridge;
+  readonly ipam: readonly { readonly subnet: string; readonly gateway: string }[];
+}
+
 export async function readDockerPhysicalBridge(
   process: Awaited<ReturnType<typeof openDockerPhysicalProcess>>,
   native: DockerContainerNativeIdentity,
   policy: DockerContainerRuntimePolicy,
   host: { readonly tcpPorts: readonly number[]; readonly conntrackMark: number },
 ): Promise<LinuxContainerHostHttpBridge> {
+  return (await readDockerPhysicalBridgeBinding(process, native, policy, host)).bridge;
+}
+
+/** The original full allocation projection, held separately from compiler input.
+ * Never discard the subnet/prefix when pinning pre/post native readback identity.
+ */
+export async function readDockerPhysicalBridgeBinding(
+  process: Awaited<ReturnType<typeof openDockerPhysicalProcess>>,
+  native: DockerContainerNativeIdentity,
+  policy: DockerContainerRuntimePolicy,
+  host: { readonly tcpPorts: readonly number[]; readonly conntrackMark: number },
+): Promise<DockerPhysicalBridgeBinding> {
   await process.current();
   const network = await process.network();
   if (
@@ -337,6 +354,7 @@ export async function readDockerPhysicalBridge(
   )
     fail();
   const configured: string[] = [];
+  const ipam: { subnet: string; gateway: string }[] = [];
   for (const config of network.IPAM.Config) {
     if (
       !isJsonObject(config) ||
@@ -359,6 +377,10 @@ export async function readDockerPhysicalBridge(
     )
       fail();
     configured.push(`${normalizedIp(config.Gateway)}/${bits}`);
+    ipam.push({
+      subnet: `${normalizedIp(prefix[0] ?? "")}/${bits}`,
+      gateway: normalizedIp(config.Gateway),
+    });
   }
   const actual: string[] = [];
   for (const item of address.addr_info) {
@@ -386,15 +408,22 @@ export async function readDockerPhysicalBridge(
     fail();
   await process.current();
   return Object.freeze({
-    tenantRef: policy.tenantRef,
-    generation: policy.generation,
-    networkId: native.networkId,
-    bridge: name,
-    ifindex: link.ifindex as number,
-    hostMac: link.address,
-    hostAddresses: configured.map((value) => value.split("/")[0] ?? ""),
-    tcpPorts: [...host.tcpPorts],
-    conntrackMark: host.conntrackMark,
+    bridge: Object.freeze({
+      tenantRef: policy.tenantRef,
+      generation: policy.generation,
+      networkId: native.networkId,
+      bridge: name,
+      ifindex: link.ifindex as number,
+      hostMac: link.address,
+      hostAddresses: Object.freeze(configured.map((value) => value.split("/")[0] ?? "")),
+      tcpPorts: Object.freeze([...host.tcpPorts]),
+      conntrackMark: host.conntrackMark,
+    }),
+    ipam: Object.freeze(
+      ipam
+        .sort((a, b) => canonicalJson(a).localeCompare(canonicalJson(b)))
+        .map((value) => Object.freeze(value)),
+    ),
   });
 }
 function normalizedIp(value: string) {

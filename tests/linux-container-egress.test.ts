@@ -3,9 +3,11 @@ import { createHash } from "node:crypto";
 import {
   applyLinuxContainerEgress,
   compileLinuxContainerEgress,
+  type LinuxContainerEgressInput,
   type LinuxContainerEgressPlan,
   linuxContainerEgressAllows,
   linuxContainerEgressKillScript,
+  normalizeLinuxContainerEgressInterfaceReadback,
   readLinuxContainerEgress,
   verifyLinuxContainerEgressReadback,
 } from "../src/providers/linux-container-egress.ts";
@@ -443,7 +445,11 @@ function evaluateRules(
     }
     if (expr.ct) {
       const body = object(expr.ct);
-      return packet.ct[[body.dir, body.family, body.key].filter(Boolean).join(".")];
+      const key = String(body.key).replace(" ", ".");
+      // Packet fixtures retain their original tuple labels; native JSON's
+      // protocol is direction-independent and address family is in its key.
+      const direction = body.key === "protocol" ? "original" : body.dir;
+      return packet.ct[[direction, key].filter(Boolean).join(".")];
     }
     throw new Error("unsupported test value");
   }
@@ -460,9 +466,9 @@ function evaluateRules(
         const left = value(predicate.left);
         const right = value(predicate.right);
         const equal = Array.isArray(right) ? right.includes(left) : left === right;
-        if (predicate.op !== "==" && predicate.op !== "!=")
+        if (predicate.op !== "==" && predicate.op !== "!=" && predicate.op !== "in")
           throw new Error("unsupported test predicate");
-        if (predicate.op === "==" ? !equal : equal) break;
+        if (predicate.op === "!=" ? equal : !equal) break;
       } else if (expr.mangle) {
         const assignment = object(expr.mangle);
         expect(assignment.key).toEqual({ ct: { key: "mark" } });
@@ -909,5 +915,135 @@ test("recovery reader rejects an aggregate in one family and an empty other quer
           }),
       }),
     ).rejects.toThrow("linux_container_egress_unavailable");
+  }
+});
+
+/** Real nft serialization, explicit synthetic unit index bindings only.
+ * The retained r3 JSON contains no after-NFT bridge witness and grants no native coverage.
+ */
+async function actualNftFixture() {
+  return (await Bun.file(
+    new URL("./fixtures/container-egress/nft-1.0.9-native-r3.json", import.meta.url),
+  ).json()) as {
+    input: LinuxContainerEgressInput;
+    inet: { nftables: Record<string, unknown>[] };
+    bridge: { nftables: Record<string, unknown>[] };
+  };
+}
+function numericUnitFixture(fixture: Awaited<ReturnType<typeof actualNftFixture>>) {
+  const readback = structuredClone({
+    nftables: [...fixture.inet.nftables, ...fixture.bridge.nftables],
+  });
+  for (const entry of readback.nftables) {
+    const rule = entry.rule as
+      | { expr: { match?: { left?: { meta?: { key?: string } }; right?: unknown } }[] }
+      | undefined;
+    for (const node of rule?.expr ?? []) {
+      const match = node.match;
+      if (
+        match &&
+        ["iif", "oif"].includes(match.left?.meta?.key ?? "") &&
+        typeof match.right === "string"
+      ) {
+        const binding = fixture.input.hostHttp?.find((value) => value.bridge === match.right);
+        if (!binding) throw new Error("missing synthetic unit binding");
+        match.right = binding.ifindex;
+      }
+    }
+  }
+  return readback;
+}
+test("actual nft1.0.9 CT serialization agrees with strict expected rules after explicit numeric unit binding", async () => {
+  const fixture = await actualNftFixture();
+  const plan = compileLinuxContainerEgress(fixture.input);
+  expect(createHash("sha256").update(plan.script).digest("hex")).toBe(
+    "46500fbd736172e2df1d4c33c364aa67a8327e81f1878e580697dd848f9b4f70",
+  );
+  expect(verifyLinuxContainerEgressReadback(plan, numericUnitFixture(fixture))).toMatchObject({
+    fullRuntimeCoverage: false,
+    billingQualified: false,
+  });
+});
+
+test("symbolic interface JSON needs explicit unit bindings and strict comparison preserves every other rule", async () => {
+  const fixture = await actualNftFixture(),
+    plan = compileLinuxContainerEgress(fixture.input);
+  const raw = { nftables: [...fixture.inet.nftables, ...fixture.bridge.nftables] };
+  const before = JSON.stringify(raw),
+    bindings = required(fixture.input.hostHttp);
+  expect(() => verifyLinuxContainerEgressReadback(plan, raw)).toThrow();
+  const normalized = normalizeLinuxContainerEgressInterfaceReadback(raw, bindings);
+  expect(normalized).toEqual(numericUnitFixture(fixture));
+  expect(JSON.stringify(raw)).toBe(before);
+  expect(verifyLinuxContainerEgressReadback(plan, normalized)).toMatchObject({
+    fullRuntimeCoverage: false,
+    billingQualified: false,
+  });
+  for (const problem of [
+    "unknown-name",
+    "other-tenant",
+    "wrong-index",
+    "operator",
+    "extra-meta",
+    "extra-match",
+    "extra-rule",
+    "reordered-rule",
+    "unknown-object",
+    "iifname",
+  ]) {
+    const changed = structuredClone(raw);
+    const rules = changed.nftables
+      .filter((entry) => entry.rule)
+      .map((entry) => entry.rule as { expr: Record<string, unknown>[] });
+    const rule = required(
+      rules.find((rule) =>
+        rule.expr.some((node) => {
+          const comparison = node.match as { left?: { meta?: { key?: string } } } | undefined;
+          return ["iif", "oif"].includes(comparison?.left?.meta?.key ?? "");
+        }),
+      ),
+    );
+    const node = required(
+      rule.expr.find((node) => {
+        const comparison = node.match as { left?: { meta?: { key?: string } } } | undefined;
+        return ["iif", "oif"].includes(comparison?.left?.meta?.key ?? "");
+      }),
+    );
+    const comparison = node.match as {
+      op: string;
+      left: { meta: Record<string, unknown> };
+      right: unknown;
+      extra?: unknown;
+    };
+    if (problem === "unknown-name") comparison.right = "integration-foreign";
+    if (problem === "other-tenant") comparison.right = "integration-b";
+    if (problem === "wrong-index") comparison.right = 99;
+    if (problem === "operator") comparison.op = "!=";
+    if (problem === "extra-meta") comparison.left.meta.extra = true;
+    if (problem === "extra-match") comparison.extra = true;
+    if (problem === "extra-rule") rule.expr.push({ accept: null });
+    if (problem === "reordered-rule") rule.expr.reverse();
+    if (problem === "unknown-object")
+      changed.nftables.push({ unknown: { family: "inet", table: plan.table } });
+    if (problem === "iifname") comparison.left.meta.key = "iifname";
+    expect(() =>
+      verifyLinuxContainerEgressReadback(
+        plan,
+        normalizeLinuxContainerEgressInterfaceReadback(changed, bindings),
+      ),
+    ).toThrow();
+  }
+  for (const bad of [
+    [],
+    [...bindings, required(bindings[0])],
+    bindings.map((value) => ({ ...value, ifindex: 2 })),
+    bindings.map((value) => ({ ...value, ifindex: value.ifindex + 20 })),
+  ]) {
+    expect(() =>
+      verifyLinuxContainerEgressReadback(
+        plan,
+        normalizeLinuxContainerEgressInterfaceReadback(raw, bad),
+      ),
+    ).toThrow();
   }
 });

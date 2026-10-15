@@ -180,7 +180,8 @@ function validateHostHttp(
 const payload = (protocol: string, field: string) => ({ payload: { protocol, field } });
 const meta = (key: string) => ({ meta: { key } });
 const ct = (key: string, dir?: "original" | "reply", family?: "ip" | "ip6") => ({
-  ct: { key, ...(dir ? { dir } : {}), ...(family ? { family } : {}) },
+  // libnftables JSON includes the address family in the CT key token.
+  ct: { key: family ? `${family} ${key}` : key, ...(dir ? { dir } : {}) },
 });
 const match = (left: unknown, right: unknown, op = "==") => ({ match: { op, left, right } });
 const setValue = (values: readonly unknown[]) =>
@@ -321,10 +322,10 @@ export function compileLinuxContainerEgress(
                 [
                   match(meta("iifname"), name),
                   match(meta("iif"), bridge.ifindex),
-                  match(ct("state"), "established"),
+                  match(ct("state"), "established", "in"),
                   match(ct("direction"), "reply"),
                   match(ct("mark"), bridge.conntrackMark),
-                  match(ct("protocol", "original"), "tcp"),
+                  match(ct("protocol"), "tcp"),
                   match(ct("saddr", "original", family), setValue(addresses)),
                   match(ct("proto-dst", "original"), setValue(bridge.tcpPorts)),
                   { counter: "host_replies" },
@@ -386,9 +387,9 @@ export function compileLinuxContainerEgress(
           [
             match(meta("oifname"), bridge.bridge),
             match(meta("oif"), bridge.ifindex),
-            match(ct("state"), "new"),
+            match(ct("state"), "new", "in"),
             match(ct("direction"), "original"),
-            match(ct("protocol", "original"), "tcp"),
+            match(ct("protocol"), "tcp"),
             match(payload(family, "saddr"), setValue(addresses)),
             match(ct("saddr", "original", family), setValue(addresses)),
             match(payload("tcp", "dport"), setValue(bridge.tcpPorts)),
@@ -921,6 +922,66 @@ function verifyHostReadback(
     billingQualified: false as const,
     counterUnit: plan.counterUnit,
   };
+}
+
+/** Representation adapter only; callers must hold the original physical
+ * session and validate its actual complete bridge binding before AND after
+ * acquiring the JSON. A plan/label/echoed DTO is not that authority. The strict
+ * verifier itself deliberately continues refusing symbolic ifindex JSON.
+ */
+export function normalizeLinuxContainerEgressInterfaceReadback(
+  readback: unknown,
+  observedBridges: readonly LinuxContainerHostHttpBridge[],
+): unknown {
+  if (!Array.isArray(observedBridges) || observedBridges.length < 1 || observedBridges.length > 64)
+    fail();
+  const indices = new Map<string, number>();
+  const uniqueIndices = new Set<number>();
+  for (const bridge of observedBridges) {
+    if (
+      !record(bridge) ||
+      typeof bridge.bridge !== "string" ||
+      !BRIDGE_NAME.test(bridge.bridge) ||
+      typeof bridge.ifindex !== "number" ||
+      !Number.isSafeInteger(bridge.ifindex) ||
+      bridge.ifindex < 1 ||
+      bridge.ifindex > 0x7fffffff ||
+      indices.has(bridge.bridge) ||
+      uniqueIndices.has(bridge.ifindex)
+    )
+      fail();
+    indices.set(bridge.bridge, bridge.ifindex);
+    uniqueIndices.add(bridge.ifindex);
+  }
+  const value: unknown = structuredClone(readback);
+  if (!record(value) || Object.keys(value).length !== 1 || !Array.isArray(value.nftables)) fail();
+  for (const entry of value.nftables) {
+    if (!record(entry) || Object.keys(entry).length !== 1) fail();
+    if (!Object.hasOwn(entry, "rule")) continue;
+    if (!record(entry.rule) || !Array.isArray(entry.rule.expr)) fail();
+    for (const node of entry.rule.expr) {
+      if (!record(node) || !record(node.match)) continue;
+      const comparison = node.match;
+      if (!record(comparison.left) || !record(comparison.left.meta)) continue;
+      const key = comparison.left.meta.key;
+      if (key !== "iif" && key !== "oif") continue;
+      if (
+        Object.keys(node).length !== 1 ||
+        Object.keys(comparison).sort().join() !== "left,op,right" ||
+        comparison.op !== "==" ||
+        Object.keys(comparison.left).length !== 1 ||
+        Object.keys(comparison.left.meta).length !== 1
+      )
+        fail();
+      if (typeof comparison.right === "string") {
+        const index = indices.get(comparison.right);
+        if (index === undefined) fail();
+        comparison.right = index;
+      } else if (!Number.isSafeInteger(comparison.right) || (comparison.right as number) < 1)
+        fail();
+    }
+  }
+  return value;
 }
 
 /** Bind each query to its requested table before full aggregate schema checks. */

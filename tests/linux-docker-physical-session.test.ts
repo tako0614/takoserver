@@ -7,6 +7,7 @@ import { compileLinuxContainerEgress } from "../src/providers/linux-container-eg
 import {
   openDockerPhysicalProcess,
   readDockerPhysicalBridge,
+  readDockerPhysicalBridgeBinding,
 } from "../src/providers/linux-docker-physical-session.ts";
 
 let root: string;
@@ -311,12 +312,32 @@ test("mock native JSON must agree on exact NetworkID, bridge kind/index and IPAM
       tcpPorts: [8080],
       conntrackMark: 1001,
     });
-    if (change === "none")
+    if (change === "none") {
       await expect(read).resolves.toMatchObject({
         networkId: native.networkId,
         bridge: "cx_fixture",
         ifindex: 8,
       });
-    else await expect(read).rejects.toThrow("docker_physical_session_unavailable");
+      const original = await readDockerPhysicalBridgeBinding(mock, native, policy, {
+        tcpPorts: [8080],
+        conntrackMark: 1001,
+      });
+      expect(original.ipam).toEqual([{ subnet: "172.20.0.0/24", gateway: "172.20.0.1" }]);
+      // Matching changes on both sides remain individually valid, but must not
+      // disappear from the full original allocation signature.
+      const config = n.IPAM.Config[0],
+        actual = a.addr_info[0];
+      if (!config || !actual) throw new Error("missing synthetic IPAM");
+      config.Subnet = "172.20.0.0/25";
+      actual.prefixlen = 25;
+      const changed = await readDockerPhysicalBridgeBinding(mock, native, policy, {
+        tcpPorts: [8080],
+        conntrackMark: 1001,
+      });
+      expect(changed.bridge).toEqual(original.bridge);
+      expect(changed.ipam).not.toEqual(original.ipam);
+      expect(Object.isFrozen(original.ipam)).toBe(true);
+      expect(Object.isFrozen(original.ipam[0])).toBe(true);
+    } else await expect(read).rejects.toThrow("docker_physical_session_unavailable");
   }
 });

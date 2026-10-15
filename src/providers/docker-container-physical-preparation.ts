@@ -14,12 +14,13 @@ import {
 import {
   applyLinuxContainerEgress,
   compileLinuxContainerEgress,
+  normalizeLinuxContainerEgressInterfaceReadback,
   readLinuxContainerEgress,
 } from "./linux-container-egress.ts";
 import {
   type DockerPhysicalProcessOptions,
   openDockerPhysicalProcess,
-  readDockerPhysicalBridge,
+  readDockerPhysicalBridgeBinding,
 } from "./linux-docker-physical-session.ts";
 
 /** Same actual Host owner/ledger as CREATE. These are Host-internal existing
@@ -191,8 +192,9 @@ export function createDockerPhysicalRuntimePreparation(options: {
               metadata.namespaceDevice === metadata.parentDevice
             )
               return fail();
-            const bridge = await readDockerPhysicalBridge(process, native, policy, host);
-            const binding = canonicalJson(bridge);
+            const original = await readDockerPhysicalBridgeBinding(process, native, policy, host);
+            const bridge = original.bridge;
+            const binding = canonicalJson(original);
             const plan = compileLinuxContainerEgress({
               namespace: {
                 parent: `net:[${String(metadata.parentInode)}]`,
@@ -220,8 +222,25 @@ export function createDockerPhysicalRuntimePreparation(options: {
                 return selectedNamespace;
               },
               async execute(command: Parameters<typeof nativePort.execute>[0]) {
-                await guard();
+                const tableRead =
+                  command.argv.length === 6 &&
+                  command.argv[0] === "nft" &&
+                  command.argv[1] === "-j" &&
+                  command.argv[2] === "list" &&
+                  command.argv[3] === "table" &&
+                  ((command.argv[4] === "inet" && command.argv[5] === plan.table) ||
+                    (command.argv[4] === "bridge" && command.argv[5] === plan.bridgeRules?.table));
+                if (tableRead) await physicalGuard();
+                else await guard();
                 const output = await nativePort.execute(command);
+                if (tableRead) {
+                  await physicalGuard();
+                  return JSON.stringify(
+                    normalizeLinuxContainerEgressInterfaceReadback(JSON.parse(output), [
+                      original.bridge,
+                    ]),
+                  );
+                }
                 await guard();
                 return output;
               },
@@ -229,8 +248,9 @@ export function createDockerPhysicalRuntimePreparation(options: {
             const physicalGuard = async () => {
               await guard();
               if (
-                canonicalJson(await readDockerPhysicalBridge(physical, native, policy, host)) !==
-                binding
+                canonicalJson(
+                  await readDockerPhysicalBridgeBinding(physical, native, policy, host),
+                ) !== binding
               )
                 return fail();
               await guard();
