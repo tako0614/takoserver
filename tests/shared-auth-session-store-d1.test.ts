@@ -33,10 +33,9 @@ async function finalFixture() {
   const original = await fixture();
   try {
     const database = await original.runtime.getD1Database("AUTH_DB");
-    const sql = createD1Sql(
-      database.withSession("first-primary") as unknown as D1DatabaseLike,
-      { acknowledgement: "explicit-d1-result" },
-    );
+    const sql = createD1Sql(database.withSession("first-primary") as unknown as D1DatabaseLike, {
+      acknowledgement: "explicit-d1-result",
+    });
     return {
       ...original,
       sql,
@@ -161,8 +160,9 @@ test("native D1 touch selects its own immutable post-update row and one concurre
     expect((await store.readSession(SESSION))?.version).toBe(2);
     expect(selected?.version).toBe(1);
     expect(await store.touchSessionAndSelect(SESSION, 1, NOW + 3)).toBeNull();
-    await expect(ordinary.touchSessionAndSelect(SESSION, 1, NOW + 3))
-      .rejects.toThrow("no qualified known-miss acknowledgement");
+    await expect(ordinary.touchSessionAndSelect(SESSION, 1, NOW + 3)).rejects.toThrow(
+      "no qualified known-miss acknowledgement",
+    );
     expect(await store.touchSession(SESSION, 2, NOW + 3)).toBe(true);
     expect((await store.readSession(SESSION))?.version).toBe(3);
   } finally {
@@ -263,9 +263,14 @@ test.each(["missing row", "zero with row", "extra rows", "wrong digest", "wrong 
           if (failure === "extra rows") return { changes: 1, rows: [row, row] };
           return {
             changes: 1,
-            rows: [{ ...row, ...(failure === "wrong digest"
-              ? { digest: `sha256:${"c".repeat(64)}` }
-              : { version: 3 }) }],
+            rows: [
+              {
+                ...row,
+                ...(failure === "wrong digest"
+                  ? { digest: `sha256:${"c".repeat(64)}` }
+                  : { version: 3 }),
+              },
+            ],
           };
         },
       };

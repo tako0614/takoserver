@@ -133,7 +133,6 @@ async function touchSessionRow(
   return Object.freeze(selected);
 }
 
-
 /**
  * Uncomposed runtime preparation. These future tables are not in the adopted
  * migration lineage and this factory neither creates nor migrates them.
@@ -158,8 +157,7 @@ export function createSharedAuthSessionStore(sql: Sql): SharedAuthSessionStore {
     now: number,
   ): Promise<OidcSessionRecord> {
     const selected = await touchSessionRow(sql, value, expectedVersion, now);
-    if (!selected)
-      throw new Error("Shared auth touch has no qualified known-miss acknowledgement");
+    if (!selected) throw new Error("Shared auth touch has no qualified known-miss acknowledgement");
     return selected;
   }
 
