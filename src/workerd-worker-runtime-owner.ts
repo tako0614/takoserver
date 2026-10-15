@@ -112,7 +112,7 @@ import {
   workerdServiceBindingRouterName,
   workerdV2ServiceBindingBrokerSocketPath,
 } from "./workerd-runtime.ts";
-import type { WorkerdProcess } from "./workerd-supervisor.ts";
+import { WorkerdListenerOccupiedError, type WorkerdProcess } from "./workerd-supervisor.ts";
 import { workerdVersionServiceBindingName } from "./workerd-version-graph.ts";
 import {
   inspectWorkerdWorkerExecutionCopies,
@@ -723,6 +723,8 @@ export interface OpenWorkerdWorkerRuntimeOwnerOptions {
   /** Allocate a distinct private listener for each immutable Deployment incarnation. */
   readonly listenerPortForOperation: (operationId: string) => number | Promise<number>;
   readonly spawn?: (command: readonly string[]) => WorkerdProcess;
+  /** Deterministic successor observation seam for recovery tests; production callers omit it. */
+  readonly successorObservation?: WorkerdSuccessorObservation;
 }
 
 function canonicalJson(value: unknown): string {
@@ -1520,6 +1522,47 @@ async function requireStaleIncarnationChildrenAndVacantListeners(
     if ((await workerPortOwnership(port, undefined)) !== "vacant") {
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     }
+  }
+}
+
+/** Kernel observations of a just-spawned successor; injectable only at the OS boundary. */
+export interface WorkerdSuccessorObservation {
+  readonly liveness: typeof linuxProcessLiveness;
+  readonly ownership: typeof workerPortOwnership;
+}
+
+/**
+ * Whether a just-spawned successor is proven to hold a listener that is not
+ * vacant: it reads live and its own descriptors hold every listening socket.
+ * Anything less is not proof. A successor that cannot bind exits on its own
+ * within milliseconds, and while it is reaped it can read as stale or unknown
+ * and its descriptors can vanish or be refused (EACCES once it has dropped its
+ * memory under a user namespace). Nothing has been written about it, so the
+ * caller reports occupancy and the supervisor retires this exact child,
+ * proving its exit and a vacant listener before spawning again. Only an
+ * unreadable listener table is not about the successor; it stays an ownership
+ * failure.
+ */
+export async function workerdSuccessorHoldsListener(
+  port: number,
+  successor: LinuxProcessIdentity,
+  observe: WorkerdSuccessorObservation = {
+    liveness: linuxProcessLiveness,
+    ownership: workerPortOwnership,
+  },
+): Promise<boolean> {
+  if ((await observe.liveness(successor)) !== "live") return false;
+  try {
+    return (await observe.ownership(port, successor.pid)) === "owned";
+  } catch {
+    // Either the successor's descriptors or the listener table failed. Read
+    // the table alone, which never touches the successor, to tell them apart.
+    try {
+      await observe.ownership(port, undefined);
+    } catch {
+      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    }
+    return false;
   }
 }
 
@@ -2704,13 +2747,22 @@ export async function openWorkerdWorkerRuntimeOwner(
     if (!record.processIdentity || (await linuxProcessLiveness(record.processIdentity)) !== "stale")
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     const listener = await workerPortOwnership(record.listenerPort, undefined);
-    if (
-      listener !== "vacant" &&
-      (!successorIdentity ||
-        (await linuxProcessLiveness(successorIdentity)) !== "live" ||
-        (await workerPortOwnership(record.listenerPort, successorIdentity.pid)) !== "owned")
-    )
-      throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+    if (listener !== "vacant") {
+      if (!successorIdentity) throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
+      // The old child is proven stale, so a held listener its successor is not
+      // proven to hold is occupancy, whether another process holds it or the
+      // successor cannot be read while it exits. Nothing is written yet: the
+      // supervisor retires that successor and spawns again only after its exit
+      // and a vacant listener, never touching the other process.
+      if (
+        !(await workerdSuccessorHoldsListener(
+          record.listenerPort,
+          successorIdentity,
+          options.successorObservation,
+        ))
+      )
+        throw new WorkerdListenerOccupiedError();
+    }
     const receipt = physicalAbsenceFor(record);
     await transitionState((current) => {
       const exact = current.incarnations.find((item) => item.operationId === record.operationId);
@@ -3406,11 +3458,35 @@ export async function openWorkerdWorkerRuntimeOwner(
     return handle;
   };
 
+  // A replacement that cannot bind an occupied listener can exit before its
+  // identity is read. Its unreadable identity is occupancy when the recorded
+  // predecessor is proven stale and the listener table can still be read.
+  // Nothing has been written about either child, and no wall-clock window
+  // decides it: the supervisor retires this exact child and proves its exit
+  // (which needs its exit promise) and a vacant listener before spawning again.
+  const unreadableSpawnedChildIsOccupancy = async (
+    operationId: string,
+    child: WorkerdProcess,
+  ): Promise<boolean> => {
+    const record = recordFor(operationId);
+    if (!record?.processIdentity || !child.exited) return false;
+    if ((await linuxProcessLiveness(record.processIdentity)) !== "stale") return false;
+    await workerPortOwnership(record.listenerPort, undefined);
+    return true;
+  };
+
   const persistSpawnedChild = async (operationId: string, child: WorkerdProcess): Promise<void> => {
     if (!Number.isSafeInteger(child.pid) || !child.pid || child.pid <= 1) {
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     }
-    const processIdentity = await readLinuxProcessIdentity(child.pid);
+    let processIdentity: LinuxProcessIdentity;
+    try {
+      processIdentity = await readLinuxProcessIdentity(child.pid);
+    } catch (error) {
+      if (await unreadableSpawnedChildIsOccupancy(operationId, child))
+        throw new WorkerdListenerOccupiedError();
+      throw error;
+    }
     if (processIdentity.pid !== child.pid) {
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     }

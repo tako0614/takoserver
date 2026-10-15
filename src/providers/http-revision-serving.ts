@@ -721,39 +721,42 @@ function leasedResponse<
       call.finish();
     }
   };
-  const body = new ReadableStream<Uint8Array>({
-    start(controller) {
-      abortBody = () => {
-        if (complete) return;
-        controller.error(newError(options, "unavailable"));
-        finish();
-        void reader.cancel().catch(() => undefined);
-      };
-      call.abort.signal.addEventListener("abort", abortBody, { once: true });
-      if (call.abort.signal.aborted) abortBody();
-    },
-    async pull(controller) {
-      try {
-        const chunk = await reader.read();
-        if (complete) return;
-        if (chunk.done) {
+  const body = new ReadableStream<Uint8Array>(
+    {
+      start(controller) {
+        abortBody = () => {
+          if (complete) return;
+          controller.error(newError(options, "unavailable"));
           finish();
-          controller.close();
-        } else controller.enqueue(chunk.value);
-      } catch (error) {
-        if (!complete) {
-          finish();
-          controller.error(error);
+          void reader.cancel().catch(() => undefined);
+        };
+        call.abort.signal.addEventListener("abort", abortBody, { once: true });
+        if (call.abort.signal.aborted) abortBody();
+      },
+      async pull(controller) {
+        try {
+          const chunk = await reader.read();
+          if (complete) return;
+          if (chunk.done) {
+            finish();
+            controller.close();
+          } else controller.enqueue(chunk.value);
+        } catch (error) {
+          if (!complete) {
+            finish();
+            controller.error(error);
+          }
         }
-      }
+      },
+      async cancel(reason) {
+        finish();
+        const cancellation = reader.cancel(reason);
+        call.abort.abort();
+        await cancellation.catch(() => undefined);
+      },
     },
-    async cancel(reason) {
-      finish();
-      const cancellation = reader.cancel(reason);
-      call.abort.abort();
-      await cancellation.catch(() => undefined);
-    },
-  });
+    { highWaterMark: 0 },
+  );
   return new Response(body, { status: response.status, statusText: response.statusText, headers });
 }
 

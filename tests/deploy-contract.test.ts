@@ -68,11 +68,24 @@ const SURFACES = [
   ["takoserver-production-d1-fresh-init", ["irreversible", "authority"]],
   ["takoserver-integration-storage-disposal", ["irreversible", "authority"]],
   ["takoserver-integration-host-retirement", ["irreversible", "authority"]],
+  [
+    "takoserver-integration-money-shadow-create",
+    ["irreversible", "authority", "published-identity"],
+  ],
+  [
+    "takoserver-integration-money-shadow-rehearsal",
+    ["irreversible", "authority", "published-identity"],
+  ],
+  [
+    "takoserver-integration-money-shadow-native-probe",
+    ["irreversible", "authority", "published-identity"],
+  ],
+  ["takoserver-d1-money-cutover-rehearsal", ["irreversible", "authority", "published-identity"]],
   ["takoserver-rehearsal-d1-create", ["irreversible", "authority"]],
   ["takoserver-d1-snapshot-restore", ["irreversible", "authority"]],
   ["takoserver-d1-schema-0058-rehearsal", ["irreversible"]],
   ["takoserver-d1-schema-rehearsal-baseline", ["irreversible"]],
-  ["takoserver-d1-schema", ["irreversible"]],
+  ["takoserver-d1-schema", ["irreversible", "authority"]],
   ["takoserver-signing-key-register", ["irreversible", "authority", "published-identity"]],
   ["takoserver-signing-repair", ["authority"]],
   ["takoserver-signing-rotation", ["authority", "published-identity"]],
@@ -85,6 +98,22 @@ const SURFACES = [
 ] as const;
 
 describe("Takoserver split deploy entrypoint", () => {
+  test("money rehearsal contract names the post-resume guard probes and Worker batch limit", () => {
+    for (const surface of [
+      "takoserver-integration-money-shadow-rehearsal",
+      "takoserver-d1-money-cutover-rehearsal",
+    ]) {
+      const postConditions = DEPLOY_CONTRACT.surfaces.find((entry) => entry.surface === surface)
+        ?.obligations["post-conditions"];
+      expect(postConditions).toContain("14-phase");
+      expect(postConditions).toContain("false-CHECK resume probe");
+      expect(postConditions).toContain("raw legacy Stripe INSERT, UPDATE and DELETE");
+      expect(postConditions).toContain("stale writer epoch");
+      expect(postConditions).toContain("permitted success");
+      expect(postConditions).toContain("native Worker D1.batch");
+    }
+  });
+
   test("flushes the complete contract before exiting through a piped stdout", async () => {
     const probe = await deployThroughPipe();
     expect(probe.exitCode).toBe(0);
@@ -593,7 +622,7 @@ describe("Takoserver split deploy entrypoint", () => {
       expect(accepted.exitCode).toBe(2);
       expect(accepted.stderr).toContain("deploy target descriptor not found");
       expect(accepted.stderr).not.toContain("no target was touched");
-      for (const lineage of ["v2-artifacts-0075", "v2-0088", "v2-0089"]) {
+      for (const lineage of ["v2-artifacts-0075", "v2-0088", "v2-0089", "v2-0091", "v2-0092"]) {
         const selected = await deploy([
           surface,
           action,
@@ -756,6 +785,44 @@ describe("Takoserver split deploy entrypoint", () => {
 
   describe("parses only the fixed rehearsal baseline and approved schema wave boundaries", () => {
     const sha = "a".repeat(40);
+
+    test("routes only the dedicated integration shadow surfaces before target loading", async () => {
+      for (const [surface, declarationVariable] of [
+        [
+          "takoserver-integration-money-shadow-create",
+          "TAKOSERVER_INTEGRATION_MONEY_SHADOW_CREATE_DECLARATION_PATH",
+        ],
+        [
+          "takoserver-integration-money-shadow-rehearsal",
+          "TAKOSERVER_INTEGRATION_MONEY_SHADOW_REHEARSAL_DECLARATION_PATH",
+        ],
+        [
+          "takoserver-integration-money-shadow-native-probe",
+          "TAKOSERVER_INTEGRATION_MONEY_SHADOW_NATIVE_PROBE_DECLARATION_PATH",
+        ],
+      ] as const) {
+        const accepted = await deploy([
+          surface,
+          "--status",
+          "--environment=integration",
+          `--commit=${sha}`,
+        ]);
+        expect(accepted.exitCode).toBe(2);
+        expect(accepted.stderr).toContain(declarationVariable);
+        expect(accepted.stderr).not.toContain("deploy target descriptor");
+        for (const environment of ["rehearsal", "production"] as const) {
+          const refused = await deploy([
+            surface,
+            "--status",
+            `--environment=${environment}`,
+            `--commit=${sha}`,
+          ]);
+          expect(refused.exitCode).toBe(2);
+          expect(refused.stderr).toContain("no target was touched");
+          expect(refused.stderr).not.toContain("deploy target descriptor");
+        }
+      }
+    });
 
     test("routes rehearsal D1 creation without an ordinary target descriptor", async () => {
       const accepted = await deploy([

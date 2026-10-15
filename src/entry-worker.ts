@@ -1,7 +1,14 @@
 import { type App, buildApp } from "./app.ts";
+import { parseBillingConfig } from "./billing-config.ts";
 import { createCatalog } from "./catalog.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
 import { errorEnvelopeResponse } from "./error-envelope.ts";
+import {
+  createCanonicalHostedBillingComposition,
+  type HostedBillingComposition,
+} from "./hosted-billing-composition.ts";
+import { verifyHostedBillingFinancialRealm } from "./hosted-billing-realm.ts";
+import { assertHostedPricingMatchesBilling, parseHostedPricing } from "./hosted-pricing.ts";
 import { resolveIdentity } from "./identity-setup.ts";
 import {
   INTEGRATION_E2E_ORGANIZATION_ID,
@@ -12,8 +19,18 @@ import {
   type IntegrationOrganizationBootstrapConfig,
   resolveIntegrationOrganizationBootstrapConfig,
 } from "./integration-organization-bootstrap.ts";
+import {
+  createMoneyCutoverSql,
+  inspectMoneyCutoverGuard,
+  MONEY_CUTOVER_WRITER_POLICY,
+} from "./money-cutover-sql.ts";
 import { createR2ObjectStore } from "./objects-r2.ts";
-import { createOperatorSettlement } from "./operator-credentials.ts";
+import {
+  createOperatorPaymentsReconcileVerifier,
+  createOperatorSettlement,
+} from "./operator-credentials.ts";
+import { assertOrgBillingSchema } from "./org-billing.ts";
+import { paymentSettingsFromEnvironment } from "./payment-settings.ts";
 import { resolvePayment } from "./payment-setup.ts";
 import type { Clock, ObjectStoreAccess, Sql } from "./ports.ts";
 import type { CloudflareProviderExecutorRpc } from "./providers/cloudflare-provider-executor-port.ts";
@@ -32,6 +49,9 @@ import {
 } from "./runtime-input-seal-keyring.ts";
 import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
+import { assertStripeBillingSchema } from "./stripe-billing.ts";
+import { createStripeBillingClient } from "./stripe-billing-client.ts";
+import { assertStripeModeRealm, parseStripeMode } from "./stripe-mode-realm.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { createTakoformStore } from "./takoform/store.ts";
 import { parseTakoformV2ApplicationConfig } from "./takoform-v2/config.ts";
@@ -76,8 +96,21 @@ export interface WorkerEnv {
   readonly TAKOSERVER_ARTIFACT_BLOB_IO_MODE?: string;
   /** Whole-Host schema maintenance; never a serving runtime mode. */
   readonly TAKOSERVER_SCHEMA_MAINTENANCE_MODE?: string;
+  readonly TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY?: string;
+  readonly TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH?: string;
   /** Where this deployment's console is served, if it has one. */
   readonly TAKOSERVER_CONSOLE_ORIGIN?: string;
+  /** Versioned JSON Organization billing tariff; absent disables the new wallet API. */
+  readonly TAKOSERVER_BILLING_CONFIG?: string;
+  /** Explicit deployment-wide financial realm; absent means TEST. */
+  readonly TAKOSERVER_STRIPE_MODE?: string;
+  /** Explicit hosted-only pricing JSON; its native Price must match the selected Stripe realm. */
+  readonly TAKOSERVER_HOSTED_PRICING?: string;
+  /** Exact opt-in to the separately qualified Hosted TEST payment composition. */
+  readonly TAKOSERVER_HOSTED_BILLING?: string;
+  /** Non-secret deployment-selected account and stable billing authority. */
+  readonly TAKOSERVER_HOSTED_BILLING_ACCOUNT_ID?: string;
+  readonly TAKOSERVER_HOSTED_BILLING_AUTHORITY?: string;
   /** Public half of the operator key, as an Ed25519 JWK. */
   readonly OPERATOR_PUBLIC_JWK?: string;
   /**
@@ -96,6 +129,15 @@ export interface WorkerEnv {
   readonly STRIPE_SECRET_KEY?: string;
   /** Exact operator intent to expose Stripe Checkout on this deployment. */
   readonly TAKOSERVER_STRIPE_CHECKOUT_ENABLED?: string;
+  /** Signing secret of the Stripe webhook endpoint. The target must separately authorize it. */
+  readonly STRIPE_WEBHOOK_SECRET?: string;
+  /** Exact operator intent to receive Stripe webhooks on this deployment. */
+  readonly TAKOSERVER_STRIPE_WEBHOOK_ENABLED?: string;
+  /** Non-secret payment settings; absent ones take their documented defaults. */
+  readonly TAKOSERVER_STRIPE_CHECKOUT_MINIMUM_MINOR?: string;
+  readonly TAKOSERVER_STRIPE_CHECKOUT_MAXIMUM_MINOR?: string;
+  readonly TAKOSERVER_STRIPE_WEBHOOK_TOLERANCE_SECONDS?: string;
+  readonly TAKOSERVER_STRIPE_RECONCILE_LOOKBACK_SECONDS?: string;
   /** Key id whose public half is registered for verification. */
   readonly TAKOSERVER_SIGNING_KEY_ID?: string;
   /** Private half, as an Ed25519 JWK. A secret. */
@@ -148,6 +190,13 @@ export function operatorCredentialKeys(env: {
   };
 }
 
+function canonicalHostedBillingSelected(selection: string | undefined): boolean {
+  if (selection !== undefined && selection !== "" && selection !== "canonical-test") {
+    throw new TypeError("TAKOSERVER_HOSTED_BILLING must be canonical-test or absent");
+  }
+  return selection === "canonical-test";
+}
+
 export function workerCredentials(
   env: Pick<
     WorkerEnv,
@@ -157,8 +206,18 @@ export function workerCredentials(
     | "TAKOS_ID_CLIENT_ID"
     | "GOOGLE_CLIENT_ID"
     | "STRIPE_SECRET_KEY"
+    | "TAKOSERVER_STRIPE_MODE"
     | "TAKOSERVER_STRIPE_CHECKOUT_ENABLED"
+    | "STRIPE_WEBHOOK_SECRET"
+    | "TAKOSERVER_STRIPE_WEBHOOK_ENABLED"
+    | "TAKOSERVER_STRIPE_CHECKOUT_MINIMUM_MINOR"
+    | "TAKOSERVER_STRIPE_CHECKOUT_MAXIMUM_MINOR"
+    | "TAKOSERVER_STRIPE_WEBHOOK_TOLERANCE_SECONDS"
+    | "TAKOSERVER_STRIPE_RECONCILE_LOOKBACK_SECONDS"
     | "TAKOSERVER_CONSOLE_ORIGIN"
+    | "TAKOSERVER_HOSTED_PRICING"
+    | "TAKOSERVER_HOSTED_BILLING"
+    | "TAKOSERVER_BILLING_CONFIG"
   >,
   operatorAudience: string,
 ) {
@@ -176,16 +235,43 @@ export function workerCredentials(
     operatorPublicKeyJwk: operatorKeys.identity,
     operatorAudience,
   });
-  const payment = resolvePayment({
-    stripeSecretKey:
-      env.TAKOSERVER_STRIPE_CHECKOUT_ENABLED === "1" ? env.STRIPE_SECRET_KEY : undefined,
-    consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN,
-  });
+  const canonicalHostedBilling = canonicalHostedBillingSelected(env.TAKOSERVER_HOSTED_BILLING);
+  const payment: ReturnType<typeof resolvePayment> = canonicalHostedBilling
+    ? {}
+    : resolvePayment({
+        hostedPricing: parseHostedPricing(env.TAKOSERVER_HOSTED_PRICING),
+        stripeMode: parseStripeMode(env.TAKOSERVER_STRIPE_MODE),
+        stripeSecretKey:
+          env.TAKOSERVER_STRIPE_CHECKOUT_ENABLED === "1" ? env.STRIPE_SECRET_KEY : undefined,
+        // Like Checkout, a lingering secret alone never exposes the webhook.
+        stripeWebhookSecret:
+          env.TAKOSERVER_STRIPE_WEBHOOK_ENABLED === "1" ? env.STRIPE_WEBHOOK_SECRET : undefined,
+        consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN,
+        settings: paymentSettingsFromEnvironment({
+          TAKOSERVER_STRIPE_CHECKOUT_MINIMUM_MINOR: env.TAKOSERVER_STRIPE_CHECKOUT_MINIMUM_MINOR,
+          TAKOSERVER_STRIPE_CHECKOUT_MAXIMUM_MINOR: env.TAKOSERVER_STRIPE_CHECKOUT_MAXIMUM_MINOR,
+          TAKOSERVER_STRIPE_WEBHOOK_TOLERANCE_SECONDS:
+            env.TAKOSERVER_STRIPE_WEBHOOK_TOLERANCE_SECONDS,
+          TAKOSERVER_STRIPE_RECONCILE_LOOKBACK_SECONDS:
+            env.TAKOSERVER_STRIPE_RECONCILE_LOOKBACK_SECONDS,
+        }),
+      });
 
   return {
     identity: identity.verifier,
     identityProviders: identity.providers,
     ...(payment.checkout ? { checkout: payment.checkout } : {}),
+    ...(payment.events ? { paymentEvents: payment.events } : {}),
+    // The operator identity key, never a session or API key, may run the
+    // reconcile pass on demand; the route exists only beside the pass.
+    ...((canonicalHostedBilling || payment.events) && operatorKeys.identity
+      ? {
+          operatorPaymentsReconcile: createOperatorPaymentsReconcileVerifier({
+            publicKeyJwk: operatorKeys.identity,
+            audience: operatorAudience,
+          }),
+        }
+      : {}),
     // Stripe where a customer can pay; the operator's signature where they
     // cannot; and a refusal where neither exists, because a stub that said yes
     // would credit any amount while looking exactly like a finished product.
@@ -358,10 +444,14 @@ function artifactBlobIoMode(
 
 function schemaMaintenanceMode(
   env: Pick<WorkerEnv, "TAKOSERVER_SCHEMA_MAINTENANCE_MODE" | "TAKOSERVER_ARTIFACT_BLOB_IO_MODE">,
-): "normal" | "pre-0058-quiesced" | "pre-v2-0088-quiesced" {
+): "normal" | "pre-0058-quiesced" | "pre-v2-0088-quiesced" | "pre-wallet-usd-micros-quiesced" {
   const value = env.TAKOSERVER_SCHEMA_MAINTENANCE_MODE;
   if (value === undefined) return "normal";
-  if (value !== "pre-0058-quiesced" && value !== "pre-v2-0088-quiesced") {
+  if (
+    value !== "pre-0058-quiesced" &&
+    value !== "pre-v2-0088-quiesced" &&
+    value !== "pre-wallet-usd-micros-quiesced"
+  ) {
     throw new TypeError("TAKOSERVER_SCHEMA_MAINTENANCE_MODE is invalid");
   }
   if (env.TAKOSERVER_ARTIFACT_BLOB_IO_MODE !== undefined) {
@@ -370,15 +460,42 @@ function schemaMaintenanceMode(
   return value;
 }
 
-function schemaMaintenanceResponse(mode: "pre-0058-quiesced" | "pre-v2-0088-quiesced"): Response {
+function moneyCutoverWriterPolicy(env: WorkerEnv): string | null {
+  const value = env.TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY;
+  const epoch = env.TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH;
+  if (value === undefined && epoch === undefined) return null;
+  if (value !== MONEY_CUTOVER_WRITER_POLICY || env.TAKOSERVER_ENVIRONMENT !== "integration") {
+    throw new TypeError("money cutover writer policy is invalid");
+  }
+  if (typeof epoch !== "string" || !/^sha256:[0-9a-f]{64}$/u.test(epoch)) {
+    throw new TypeError("money cutover Writer epoch is invalid");
+  }
+  return epoch;
+}
+
+function moneyCutoverFrozenResponse(): Response {
+  return errorEnvelopeResponse(
+    "backend_unavailable",
+    503,
+    { reason: "money-cutover-freeze" },
+    { headers: { "cache-control": "no-store", "retry-after": "60" } },
+    "Host is frozen for the wallet USD-micros writer transition",
+  );
+}
+
+function schemaMaintenanceResponse(
+  mode: "pre-0058-quiesced" | "pre-v2-0088-quiesced" | "pre-wallet-usd-micros-quiesced",
+): Response {
   return errorEnvelopeResponse(
     "backend_unavailable",
     503,
     { reason: "runtime-configuration" },
     { headers: { "cache-control": "no-store", "retry-after": "60" } },
-    mode === "pre-0058-quiesced"
-      ? "Host is quiesced for the 0058 schema maintenance transition"
-      : "Host is quiesced for the v2 0088 schema maintenance transition",
+    mode === "pre-wallet-usd-micros-quiesced"
+      ? "Host is quiesced for the wallet USD-micros schema maintenance transition"
+      : mode === "pre-0058-quiesced"
+        ? "Host is quiesced for the 0058 schema maintenance transition"
+        : "Host is quiesced for the v2 0088 schema maintenance transition",
   );
 }
 
@@ -768,15 +885,100 @@ async function composeApp(
   const v2Config = startupStage("runtime-configuration", () =>
     parseTakoformV2ApplicationConfig(env),
   );
-  const signingKey = await loadSigningKey(
-    env.TAKOSERVER_SIGNING_KEY_ID,
-    env.TAKOSERVER_SIGNING_KEY,
+  const billingConfig = startupStage("runtime-configuration", () =>
+    parseBillingConfig(env.TAKOSERVER_BILLING_CONFIG),
   );
+  const hostedPricing = startupStage("runtime-configuration", () => {
+    const pricing = parseHostedPricing(env.TAKOSERVER_HOSTED_PRICING);
+    if (pricing) assertHostedPricingMatchesBilling(pricing, billingConfig);
+    return pricing;
+  });
+  const canonicalHostedInputs = startupStage("runtime-configuration", () => {
+    if (!canonicalHostedBillingSelected(env.TAKOSERVER_HOSTED_BILLING)) return undefined;
+    if (
+      env.TAKOSERVER_STRIPE_MODE !== "test" ||
+      !billingConfig ||
+      !hostedPricing ||
+      !env.STRIPE_SECRET_KEY ||
+      !env.STRIPE_WEBHOOK_SECRET ||
+      !env.TAKOSERVER_CONSOLE_ORIGIN ||
+      !env.TAKOSERVER_HOSTED_BILLING_ACCOUNT_ID ||
+      !env.TAKOSERVER_HOSTED_BILLING_AUTHORITY
+    ) {
+      throw new TypeError(
+        "Canonical Hosted billing requires explicit TEST intent, selected realm and complete pricing/credential capabilities",
+      );
+    }
+    const consoleOrigin = env.TAKOSERVER_CONSOLE_ORIGIN;
+    const origin = new URL(consoleOrigin);
+    const webhookSecret = env.STRIPE_WEBHOOK_SECRET.trim();
+    const settings = paymentSettingsFromEnvironment({
+      TAKOSERVER_STRIPE_CHECKOUT_MINIMUM_MINOR: env.TAKOSERVER_STRIPE_CHECKOUT_MINIMUM_MINOR,
+      TAKOSERVER_STRIPE_CHECKOUT_MAXIMUM_MINOR: env.TAKOSERVER_STRIPE_CHECKOUT_MAXIMUM_MINOR,
+      TAKOSERVER_STRIPE_WEBHOOK_TOLERANCE_SECONDS: env.TAKOSERVER_STRIPE_WEBHOOK_TOLERANCE_SECONDS,
+      TAKOSERVER_STRIPE_RECONCILE_LOOKBACK_SECONDS:
+        env.TAKOSERVER_STRIPE_RECONCILE_LOOKBACK_SECONDS,
+    });
+    const publishedSettings = paymentSettingsFromEnvironment(hostedPricing.environment);
+    if (
+      origin.origin !== consoleOrigin ||
+      origin.username ||
+      origin.password ||
+      !["https:", "http:"].includes(origin.protocol) ||
+      !webhookSecret.startsWith("whsec_") ||
+      (settings.checkoutMinimumMinor !== undefined &&
+        settings.checkoutMinimumMinor !== publishedSettings.checkoutMinimumMinor) ||
+      (settings.checkoutMaximumMinor !== undefined &&
+        settings.checkoutMaximumMinor !== publishedSettings.checkoutMaximumMinor)
+    ) {
+      throw new TypeError(
+        "Canonical Hosted billing requires a canonical origin, webhook and published Checkout bounds",
+      );
+    }
+    return {
+      billingConfig,
+      pricing: hostedPricing,
+      client: createStripeBillingClient({ secretKey: env.STRIPE_SECRET_KEY, mode: "test" }),
+      accountId: env.TAKOSERVER_HOSTED_BILLING_ACCOUNT_ID,
+      billingAuthority: env.TAKOSERVER_HOSTED_BILLING_AUTHORITY,
+      consoleOrigin,
+      webhookSecret,
+      settings: Object.freeze(settings),
+    };
+  });
+  // File-backed tariff loading can be designed separately; this release accepts inline JSON only.
   const integrationE2eCredentialAuthority = workerIntegrationE2eCredentialAuthority(env);
   const integrationOrganizationBootstrap = workerIntegrationOrganizationBootstrap(
     env,
     origin,
     integrationE2eCredentialAuthority,
+  );
+  const rawSql = createD1Sql(env.STATE_DB);
+  const writerEpoch = moneyCutoverWriterPolicy(env);
+  const sql = writerEpoch === null ? rawSql : createMoneyCutoverSql(rawSql, writerEpoch);
+  try {
+    // The wallet and ledger use USD micros even when tariff billing is disabled.
+    // This read-only proof precedes every normal serving composition and tariff write.
+    await assertOrgBillingSchema(sql, canonicalHostedInputs ? undefined : billingConfig);
+  } catch {
+    throw new WorkerStartupError(
+      "runtime-configuration",
+      new TypeError("Worker requires the complete 0094 USD-micros D1 schema and money-unit policy"),
+    );
+  }
+  try {
+    // D1 activation is an operator-qualified transition. Serving code only
+    // reads its immutable pin; it never claims a realm on behalf of D1.
+    await assertStripeModeRealm(sql, parseStripeMode(env.TAKOSERVER_STRIPE_MODE));
+  } catch {
+    throw new WorkerStartupError(
+      "runtime-configuration",
+      new TypeError("Worker requires the qualified 0098 Stripe realm pin"),
+    );
+  }
+  const signingKey = await loadSigningKey(
+    env.TAKOSERVER_SIGNING_KEY_ID,
+    env.TAKOSERVER_SIGNING_KEY,
   );
   if (integrationE2eCredentialAuthority) {
     if (!signingKey || !env.TAKOSERVER_SIGNING_KEY) {
@@ -791,8 +993,24 @@ async function composeApp(
   const formSource = startupStage("runtime-configuration", () =>
     selectPublicHostFormSource(env.TAKOSERVER_FORM_SOURCE_CANDIDATE, implementationIdentity),
   );
-  const { identity, identityProviders, settlement, checkout } = workerCredentials(env, origin);
-  const sql = createD1Sql(env.STATE_DB);
+  const {
+    identity,
+    identityProviders,
+    settlement,
+    checkout,
+    paymentEvents,
+    operatorPaymentsReconcile,
+  } = workerCredentials(env, origin);
+  if (hostedPricing) {
+    try {
+      await assertStripeBillingSchema(sql);
+    } catch {
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError("Hosted subscriptions require the complete 0095 schema"),
+      );
+    }
+  }
   if (
     v2Config.sqliteMigrationSet !== undefined ||
     v2Config.workerBundle !== undefined ||
@@ -810,6 +1028,46 @@ async function composeApp(
   }
   const objects = createR2ObjectStore(env.OBJECTS);
   const clock = () => new Date();
+  let hostedBilling: HostedBillingComposition | undefined;
+  if (canonicalHostedInputs) {
+    try {
+      const realm = await verifyHostedBillingFinancialRealm({
+        sql,
+        reader: { client: canonicalHostedInputs.client },
+        expected: {
+          accountId: canonicalHostedInputs.accountId,
+          billingAuthority: canonicalHostedInputs.billingAuthority,
+          mode: "test",
+        },
+        prices: canonicalHostedInputs.pricing.hostedPlanTable.plans
+          .filter((plan) => plan.tier === "subscription")
+          .map((plan) => ({
+            priceId: plan.stripePriceId,
+            monthlyAmountMinor: plan.monthlyAmountMinor,
+          })),
+      });
+      hostedBilling = await createCanonicalHostedBillingComposition({
+        sql,
+        clock,
+        billingConfig: canonicalHostedInputs.billingConfig,
+        pricing: canonicalHostedInputs.pricing,
+        client: canonicalHostedInputs.client,
+        realm,
+        consoleOrigin: canonicalHostedInputs.consoleOrigin,
+        webhookSecret: canonicalHostedInputs.webhookSecret,
+        settings: canonicalHostedInputs.settings,
+        warnings: { state: "unavailable", reason: "transport-not-composed" },
+      });
+    } catch (error) {
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError(
+          "Canonical Hosted billing requires the qualified TEST realm, prices and complete financial schema",
+          { cause: error },
+        ),
+      );
+    }
+  }
   let selectedV2Forms: WorkerEntryV2FormSelection | undefined;
   let selectedV2PrivateInputHooks = false;
   if (composeV2Forms !== undefined) {
@@ -888,7 +1146,13 @@ async function composeApp(
       identity,
       identityProviders,
       settlement,
-      ...(checkout ? { checkout } : {}),
+      ...(billingConfig ? { billingConfig } : {}),
+      hostedPaidFreeExclusion: Boolean(hostedPricing),
+      // The financial brand and buildApp's one PaymentEventContext share this exact clock.
+      ...(hostedBilling ? { hostedBilling, clock } : {}),
+      ...(!hostedBilling && checkout ? { checkout } : {}),
+      ...(!hostedBilling && paymentEvents ? { paymentEvents } : {}),
+      ...(operatorPaymentsReconcile ? { operatorPaymentsReconcile } : {}),
       ...dataServices,
       publicOrigin: origin,
       v2: v2Config,
@@ -973,9 +1237,16 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
       try {
         const schemaMode = startupStage("runtime-configuration", () => schemaMaintenanceMode(env));
         const mode = startupStage("runtime-configuration", () => artifactBlobIoMode(env));
+        const moneyPolicy = startupStage("runtime-configuration", () =>
+          moneyCutoverWriterPolicy(env),
+        );
         if (schemaMode !== "normal") return schemaMaintenanceResponse(schemaMode);
         if (mode === "pre-0043-quiesced") {
           return artifactBlobIoQuiescenceResponse();
+        }
+        if (moneyPolicy !== null) {
+          const guard = await inspectMoneyCutoverGuard(createD1Sql(env.STATE_DB), moneyPolicy);
+          if (guard === "frozen") return moneyCutoverFrozenResponse();
         }
         app = await appFor(
           env,
@@ -1012,10 +1283,17 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
     async scheduled(_event: unknown, env: WorkerEnv): Promise<void> {
       if (schemaMaintenanceMode(env) !== "normal") return;
       if (artifactBlobIoMode(env) === "pre-0043-quiesced") return;
+      const writerEpoch = moneyCutoverWriterPolicy(env);
+      if (writerEpoch !== null) {
+        if ((await inspectMoneyCutoverGuard(createD1Sql(env.STATE_DB), writerEpoch)) === "frozen")
+          return;
+      }
       const app = await appFor(env, requirePublicOrigin(env));
       const results = await Promise.allSettled([
         Promise.resolve().then(() => app.tick()),
         Promise.resolve().then(() => drainV2Operations(() => app.tickTakoformV2())),
+        // Every cron tick: payments nobody presented and no webhook delivered.
+        Promise.resolve().then(() => app.reconcilePayments()),
       ]);
       const failures = results.flatMap((result) =>
         result.status === "rejected" ? [result.reason] : [],

@@ -198,6 +198,11 @@ the part that owns accounts, money, and the machines.
 
 ## Self-hosting
 
+[Docker and Compose self-host](docs/self-host-docker.md) packages the
+artifact/control API profile with persistent local state and a loopback-only
+host port. Build it from a reviewed checkout; the complete Worker runtime
+requires the additional native setup below.
+
 [Self-host operations](docs/self-host-operations.md#first-install-and-first-use)
 is the install path, step by step, from a reviewed checkout to a Worker served
 over HTTPS. This section summarises it and lists the settings.
@@ -278,6 +283,10 @@ configured service dependencies may use protected files outside it.
 | `TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK` | Optional identity-only operator key. It overrides the login key without granting wallet-funding authority. |
 | `GOOGLE_CLIENT_ID` | Turns on Google sign-in. Its absence leaves the operator path. |
 | `STRIPE_SECRET_KEY` | Turns on card payment. Its absence leaves operator-signed funding. |
+| `STRIPE_WEBHOOK_SECRET` | Signing secret (`whsec_…`) of this deployment's Stripe webhook endpoint. With card payment on, it serves `POST /v1/payments/stripe/webhook`; without it the route is 404 and only the reconcile pass credits payments nobody presented. |
+| `TAKOSERVER_STRIPE_CHECKOUT_MINIMUM_MINOR` / `TAKOSERVER_STRIPE_CHECKOUT_MAXIMUM_MINOR` | Smallest and largest single Checkout payment, in cents (defaults 500 and 1000000; bounded by Stripe's 50 to 99999999). |
+| `TAKOSERVER_STRIPE_WEBHOOK_TOLERANCE_SECONDS` | How far a webhook's signed timestamp may be from this Host's clock (default 300, at most 3600). |
+| `TAKOSERVER_STRIPE_RECONCILE_LOOKBACK_SECONDS` | How far back the reconcile pass reads completed Checkout Sessions (default 604800, seven days; 3600 to 2592000). |
 | `TAKOSERVER_AI_BASE_URL` | HTTPS base path of an OpenAI-compatible upstream. |
 | `TAKOSERVER_AI_MODELS` | JSON allowlist mapping public model IDs to upstream IDs, limits, and retail token prices. |
 | `TAKOSERVER_AI_TOKEN_FILE` | Preferred rotatable upstream bearer secret file. |
@@ -437,6 +446,28 @@ A restarted deployment brings its published Workers back by itself. The runtime
 is started at boot for whatever this machine had already published, before the
 API begins answering; a machine that has published nothing starts no runtime.
 
+An accepted workerd child that crashes is restarted automatically with backoff
+from 100 ms up to 5 seconds. If a replacement fails readiness, or cannot be
+recorded because the crashed child is gone but the replacement is not proven to
+hold its listener (another process holds it, or the replacement's own process
+state cannot be read because it is already exiting), recovery waits for that
+exact child to exit and its listener to become vacant before spawning again.
+A delayed exit, temporary port occupancy, or a failed listener observation
+while waiting for vacancy keeps the retry pending; recovery never stops or
+replaces a foreign process. Serving is reported only after recovery passes
+readiness, and health requests only observe recovery. Deliberate shutdown
+cancels it. A failed first start, an unconfirmable child exit, or
+child-identity persistence that fails for any other reason, such as a crashed
+child that is not proven gone, an unreadable listener table, or a failed write,
+requires operator intervention rather than automatic retries.
+
+SIGINT, SIGTERM and SIGHUP fence new work and drain accepted requests and
+background passes before stopping owned resources in order. A proved clean
+stop exits with status 0. A reported shutdown-stage failure prints its stage
+and exits with status 1, even when dependent listeners remain open. Shutdown
+does not close dependents below an unproved owner or discard its durable
+custody; the next Host must recover that retained ownership before serving.
+
 ### Operator sign-in and funding
 
 Sign-in and money are the two facts a server cannot determine for itself. With
@@ -470,7 +501,85 @@ private deploy target explicitly sets `"stripeCheckout": true` **and** the
 Worker already has a `STRIPE_SECRET_KEY` secret. The target contains no secret
 value: the owner preflight fails if the named capability has no secret, while a
 lingering secret alone cannot expose Checkout when the target capability is
-absent.
+absent. The webhook is gated the same way: `"stripeWebhook": true` (only with
+`stripeCheckout`) requires a `STRIPE_WEBHOOK_SECRET` secret, and
+`"stripeSettings"` carries the four amounts and windows above as
+`checkoutMinimumMinor`, `checkoutMaximumMinor`, `webhookToleranceSeconds` and
+`reconcileLookbackSeconds`, validated before deploy.
+
+The [Hosted billing API proposal](docs/hosted-billing-api-spec.md) describes
+planned idempotent top-ups, next-period subscription changes, personal
+Organizations and Workspace usage attribution. It distinguishes existing
+contracts from the extensions awaiting implementation and staging acceptance.
+
+Starting a Checkout needs a console to send the payer back to: without a
+console origin the Checkout route is not served, while the key still verifies
+a presented session and runs the webhook (where configured) and the reconcile
+pass.
+
+A payment is credited however the Host learns of it, and only once. The
+console's return presents the Checkout Session id; the Stripe webhook
+(`checkout.session.completed` and `checkout.session.async_payment_succeeded`)
+names it; and a reconcile pass, every five minutes on both the Bun Host and the
+Worker cron, lists completed sessions inside the lookback window. Each path
+re-reads the session from the Stripe API — whether it is paid, the amount, the
+currency, and the organization written into its metadata at creation — and
+credits through the same `stripe:<session id>` funding reference, so the
+ledger's uniqueness makes every path and every redelivery credit once. A
+session naming an organization this deployment does not have credits nothing.
+Webhook events are deduplicated by Stripe event id in `stripe_events`; types
+reserved for subscriptions, invoices and refunds (`invoice.paid`,
+`invoice.payment_failed`, `customer.subscription.updated`,
+`customer.subscription.deleted`, `charge.refunded`) and any other type are
+recorded and acknowledged without acting on them. Point the Stripe endpoint at
+`https://<public origin>/v1/payments/stripe/webhook`; one Stripe account and
+mode should serve one deployment.
+
+No path credits a payment that is no longer there: the session is read with its
+PaymentIntent and latest charge, and a refunded (in any part) or disputed
+charge, or one that cannot be read, credits nothing. The webhook and the
+reconcile pass credit only one-off (`mode=payment`) sessions this Host created,
+which carry `metadata[takoserverPurpose]=wallet_funding`; sessions created
+before that marker existed are credited only when the console presents them.
+Paid sessions that could not be credited (another currency, an organization
+this Host lacks, an unreadable payment) are logged by funding reference as
+`takoserver.stripe.uncredited_payments`.
+
+The operator can also run the reconcile pass on demand, for example where the
+schedule has not fired: `POST /v1/operator/payments/reconcile` with
+`{"assertion":"…"}` runs the same pass and returns its report (sessions
+examined, credited and already credited, skips by reason, the funding
+references it credited, and the paid ones it could not credit with their
+reasons; never an amount or an organization). It is served only where the
+reconcile pass is (a Stripe key is configured) and an operator identity key
+is present, and is 404 otherwise. The credential is a `payments-reconcile`
+assertion signed by the key that verifies operator sign-in
+(`OPERATOR_IDENTITY_PUBLIC_JWK` on a Worker,
+`TAKOSERVER_OPERATOR_IDENTITY_PUBLIC_JWK` on a Bun Host, else the
+legacy/generated operator key); an identity-only key suffices, because the
+pass credits only what Stripe reports as settled. It names this Host's
+origin, lives a minute and runs one pass; no session or API key can start it.
+A repeat credits nothing twice, and on a Bun Host a pass already running is
+joined rather than repeated (a Worker runs one pass per request). If Stripe
+cannot be read the answer is 503 `unavailable`; sign a fresh assertion to
+retry:
+
+```
+assertion=$(TAKOSERVER_OPERATOR_KEY=… TAKOSERVER_PUBLIC_ORIGIN=https://api.example.com \
+  bun scripts/operator-key.ts payments-reconcile)
+curl -sS -X POST https://api.example.com/v1/operator/payments/reconcile \
+  -H 'content-type: application/json' -d "{\"assertion\":\"$assertion\"}"
+```
+
+The webhook records every delivery in `stripe_events`, so it needs migration
+`0091_stripe_events.sql` applied first. A Bun Host migrates its own SQLite. On
+Cloudflare, the current USD-micros Worker requires the complete audited 0098
+schema, 0094 money-unit policy, and selected-mode immutable Stripe realm pin
+even when the webhook and billing options are disabled. The
+staging-only `--fresh-lineage=v2-0091` and `v2-0092` profiles prepare fixed
+historical D1 payloads; neither can serve this Worker ([deploy guide](docs/deploy.md)).
+Source audit does not authorize applying 0098 to a protected D1; existing-data
+cutover and old-writer quiescence require separate qualification.
 
 ### Data root and backups
 
@@ -706,7 +815,7 @@ operator reconciliation rather than being reported as a successful cancellation.
 
 ## How it is built
 
-Six provider-neutral ports; the SQL port is shown at both capability levels
+Seven provider-neutral ports; the SQL port is shown at both capability levels
 below, and everything above them remains provider-neutral.
 
 | Port | Implementations |
@@ -717,6 +826,7 @@ below, and everything above them remains provider-neutral.
 | `Provider Pack` | provisioning, Attachment, transfer, credential, meter, and cost capabilities |
 | `ExternalIdentityVerifier` | Google ID tokens, operator signature |
 | `FundingSettlementVerifier` | Stripe, operator signature |
+| `PaymentEvents` | Stripe webhook and reconcile pass |
 | `AiGateway` | any OpenAI-compatible upstream; the Worker entry uses its native Workers AI binding |
 
 `scripts/check-imports.ts` enforces the layering as a gate rather than a

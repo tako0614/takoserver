@@ -4,8 +4,10 @@ import { buildApp } from "../src/app.ts";
 import { createAccounts, type ExternalIdentityVerifier } from "../src/auth.ts";
 import { createEphemeralSql } from "../src/compat.ts";
 import { createDataAiRoutes } from "../src/data-ai.ts";
+import { canonicalDigest } from "../src/json.ts";
 import { createLedger } from "../src/ledger.ts";
 import { createMetering } from "../src/metering.ts";
+import { minorToMicros } from "../src/money.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 import { createWorkerDataServices } from "../src/worker-data-services.ts";
@@ -21,7 +23,13 @@ const identity: ExternalIdentityVerifier = {
   },
 };
 
-async function fixture(funds = 1_000, failFirstUsageRecord = false, responseOverride?: unknown) {
+async function fixture(
+  funds = 1_000,
+  failFirstUsageRecord = false,
+  responseOverride?: unknown,
+  prices = { inputMinorPerMillionTokens: 1_000_000, outputMinorPerMillionTokens: 1_000_000 },
+  limits = { maxInputTokens: 100, maxOutputTokens: 10 },
+) {
   const sql = createEphemeralSql();
   const clock = () => new Date("2026-08-18T12:00:00.000Z");
   let identityCounter = 0;
@@ -38,7 +46,13 @@ async function fixture(funds = 1_000, failFirstUsageRecord = false, responseOver
   if (!owner) throw new Error("owner did not authenticate");
   const organization = await accounts.createOrganization({ actor: owner, name: "Acme" });
   if (funds > 0) {
-    await ledger.fund({ organizationId: organization.id, fundingRef: "seed", amountMinor: funds });
+    await ledger.fund({
+      organizationId: organization.id,
+      fundingRef: "seed",
+      amountMicros: minorToMicros(funds),
+      kind: "purchased",
+      consumptionClass: "purchased",
+    });
   }
   const scoped = await accounts.createApiKey({
     actor: owner,
@@ -61,8 +75,8 @@ async function fixture(funds = 1_000, failFirstUsageRecord = false, responseOver
         id: "takoserver-text",
         created: 1_787_054_400,
         ownedBy: "takoserver",
-        limits: { maxInputTokens: 100, maxOutputTokens: 10 },
-        price: { inputMinorPerMillionTokens: 1_000_000, outputMinorPerMillionTokens: 1_000_000 },
+        limits,
+        price: prices,
       },
     ],
     async chat(request) {
@@ -112,7 +126,7 @@ async function fixture(funds = 1_000, failFirstUsageRecord = false, responseOver
       url,
     );
   };
-  return { call, calls, scoped, unscoped, ledger, organization, sql };
+  return { call, calls, scoped, unscoped, ledger, organization, sql, accounts, owner };
 }
 
 const WORKER_AI_MODELS = JSON.stringify([
@@ -143,7 +157,13 @@ async function workerCompositionFixture(nativeOutput: unknown) {
   const owner = await accounts.authenticate(`Bearer ${signedIn.sessionToken}`);
   if (!owner) throw new Error("owner did not authenticate");
   const organization = await accounts.createOrganization({ actor: owner, name: "Acme" });
-  await ledger.fund({ organizationId: organization.id, fundingRef: "seed", amountMinor: 1_000 });
+  await ledger.fund({
+    organizationId: organization.id,
+    fundingRef: "seed",
+    amountMicros: minorToMicros(1_000),
+    kind: "purchased",
+    consumptionClass: "purchased",
+  });
   const scoped = await accounts.createApiKey({
     actor: owner,
     organizationId: organization.id,
@@ -224,7 +244,8 @@ describe("OpenAI-compatible AI data plane", () => {
           owned_by: "takoserver",
           takoserver: {
             pricing_revision: expect.stringMatching(/^sha256:[a-f0-9]{64}$/),
-            maximum_charge_minor: 110,
+            maximum_charge_micros: "1100000",
+            money_policy: "usd-micros-v2",
           },
         },
       ],
@@ -250,7 +271,46 @@ describe("OpenAI-compatible AI data plane", () => {
     expect(response?.status).toBe(409);
     expect(await response?.json()).toMatchObject({ error: { code: "pricing_revision_conflict" } });
     expect(calls).toEqual([]);
-    expect((await ledger.wallet(organization.id)).availableMinor).toBe(1_000);
+    expect((await ledger.wallet(organization.id)).availableMicros).toBe(10_000_000);
+  });
+
+  test("fails closed when a configured maximum AI charge exceeds safe USD-micros", async () => {
+    await expect(
+      fixture(
+        1_000,
+        false,
+        undefined,
+        {
+          inputMinorPerMillionTokens: Number.MAX_SAFE_INTEGER,
+          outputMinorPerMillionTokens: 0,
+        },
+        { maxInputTokens: Number.MAX_SAFE_INTEGER, maxOutputTokens: 1 },
+      ),
+    ).rejects.toThrow("invalid AI model catalog");
+  });
+
+  test("charges a one-micro AI completion exactly once", async () => {
+    const { call, scoped, ledger, organization } = await fixture(1, false, undefined, {
+      inputMinorPerMillionTokens: 1,
+      outputMinorPerMillionTokens: 1,
+    });
+    const response = await call("/v1/ai/chat/completions", scoped.secret, {
+      method: "POST",
+      headers: { "content-type": "application/json", "idempotency-key": "chat-one-micro" },
+      body: JSON.stringify({
+        model: "takoserver-text",
+        messages: [{ role: "user", content: "hello" }],
+        max_tokens: 10,
+      }),
+    });
+
+    expect(response?.status).toBe(200);
+    expect(response?.headers.get("x-takoserver-billed-micros")).toBe("1");
+    expect(response?.headers.get("x-takoserver-money-policy")).toBe("usd-micros-v2");
+    const wallet = await ledger.wallet(organization.id);
+    expect(wallet.availableMicros).toBe(9_999);
+    expect(wallet.entries.filter((entry) => entry.type === "capture")).toHaveLength(1);
+    expect(wallet.entries.find((entry) => entry.type === "capture")?.settledDeltaMicros).toBe(-1);
   });
 
   test("holds the maximum, captures actual tokens, and records usage", async () => {
@@ -272,7 +332,10 @@ describe("OpenAI-compatible AI data plane", () => {
       usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
     });
     expect(calls).toHaveLength(1);
-    expect((await ledger.wallet(organization.id)).availableMinor).toBe(995);
+    expect(response?.headers.get("x-takoserver-billed-micros")).toBe("50000");
+    expect(response?.headers.get("x-takoserver-money-policy")).toBe("usd-micros-v2");
+    expect(response?.headers.has("x-takoserver-billed-minor")).toBe(false);
+    expect((await ledger.wallet(organization.id)).availableMicros).toBe(9_950_000);
     expect(await sql.query("SELECT meter, quantity, amount_micros FROM usage_events")).toEqual([
       { meter: "ai.tokens.takoserver-text", quantity: 5, amount_micros: 0 },
     ]);
@@ -289,7 +352,9 @@ describe("OpenAI-compatible AI data plane", () => {
     const replay = await call();
 
     expect(response.status).toBe(200);
-    expect(response.headers.get("x-takoserver-billed-minor")).toBe("5");
+    expect(response.headers.get("x-takoserver-billed-micros")).toBe("50000");
+    expect(response.headers.get("x-takoserver-money-policy")).toBe("usd-micros-v2");
+    expect(response.headers.has("x-takoserver-billed-minor")).toBe(false);
     expect(body).toMatchObject({
       object: "chat.completion",
       model: "takoserver-text",
@@ -297,7 +362,7 @@ describe("OpenAI-compatible AI data plane", () => {
       usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
     });
     expect(await replay.json()).toEqual(body);
-    expect(replay.headers.get("x-takoserver-billed-minor")).toBe("5");
+    expect(replay.headers.get("x-takoserver-billed-micros")).toBe("50000");
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatchObject([
       "@cf/meta/llama-3.1-8b-instruct-fp8",
@@ -313,7 +378,7 @@ describe("OpenAI-compatible AI data plane", () => {
         },
       },
     ]);
-    expect((await ledger.wallet(organization.id)).availableMinor).toBe(995);
+    expect((await ledger.wallet(organization.id)).availableMicros).toBe(9_950_000);
     expect(await sql.query("SELECT meter, quantity FROM usage_events")).toEqual([
       { meter: "ai.tokens.takoserver-text", quantity: 5 },
     ]);
@@ -329,12 +394,13 @@ describe("OpenAI-compatible AI data plane", () => {
     const replay = await call();
 
     expect(response.status).toBe(502);
-    expect(response.headers.get("x-takoserver-billed-minor")).toBe("0");
+    expect(response.headers.get("x-takoserver-billed-micros")).toBe("0");
+    expect(response.headers.get("x-takoserver-money-policy")).toBe("usd-micros-v2");
     expect(body).toMatchObject({ error: { code: "upstream_unavailable" } });
     expect(await replay.json()).toEqual(body);
     expect(replay.status).toBe(502);
     expect(calls).toHaveLength(1);
-    expect((await ledger.wallet(organization.id)).availableMinor).toBe(1_000);
+    expect((await ledger.wallet(organization.id)).availableMicros).toBe(10_000_000);
     expect(await sql.query("SELECT request_id FROM usage_events")).toEqual([]);
   });
 
@@ -407,7 +473,7 @@ describe("OpenAI-compatible AI data plane", () => {
       expect(second?.status).toBe(502);
       expect(secondBody).toEqual(firstBody);
       expect(calls).toHaveLength(1);
-      expect((await ledger.wallet(organization.id)).availableMinor).toBe(1_000);
+      expect((await ledger.wallet(organization.id)).availableMicros).toBe(10_000_000);
       expect(await sql.query("SELECT request_id FROM usage_events")).toEqual([]);
     }
   });
@@ -460,7 +526,7 @@ describe("OpenAI-compatible AI data plane", () => {
     expect(response?.status).toBe(200);
     expect(await response?.json()).toEqual(responseOverride);
     expect(calls).toHaveLength(1);
-    expect((await ledger.wallet(organization.id)).availableMinor).toBe(995);
+    expect((await ledger.wallet(organization.id)).availableMicros).toBe(9_950_000);
     expect(await sql.query("SELECT request_id FROM usage_events")).toHaveLength(1);
   });
 
@@ -548,8 +614,98 @@ describe("OpenAI-compatible AI data plane", () => {
     expect(second?.status).toBe(200);
     expect(await second?.json()).toEqual(await first?.json());
     expect(calls).toHaveLength(1);
-    expect((await ledger.wallet(organization.id)).availableMinor).toBe(995);
+    expect((await ledger.wallet(organization.id)).availableMicros).toBe(9_950_000);
     expect(await sql.query("SELECT request_id FROM usage_events")).toHaveLength(1);
+    expect(
+      (await ledger.wallet(organization.id)).entries.filter((entry) => entry.type === "capture"),
+    ).toHaveLength(1);
+  });
+
+  test("replays a completed legacy cents receipt read-only before current pricing checks", async () => {
+    const { call, calls, scoped, ledger, organization, sql, accounts, owner } = await fixture();
+    const idempotencyKey = "legacy-chat-replay";
+    const body = {
+      model: "retired-public-model",
+      messages: [{ role: "user", content: "already completed" }],
+      max_tokens: 10,
+    };
+    const originalJson = JSON.stringify({
+      kind: "result",
+      phase: "completed",
+      requestId: "ai_legacy_receipt",
+      ceilingMinor: 7,
+      actualMinor: 1,
+      responseStatus: 200,
+      responseBody: { object: "chat.completion", model: "retired-public-model" },
+      usageModel: "retired-public-model",
+      inputTokens: 2,
+      outputTokens: 1,
+    });
+    await sql.run(
+      `INSERT INTO idempotency (scope_key, fingerprint, status, body_json, expires_at)
+       VALUES (?, ?, 200, ?, ?)`,
+      [
+        `ai:${organization.id}:${idempotencyKey}`,
+        await canonicalDigest(body),
+        originalJson,
+        Date.parse("2026-08-19T12:00:00.000Z"),
+      ],
+    );
+    const request = {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "idempotency-key": idempotencyKey,
+        "x-takoserver-ai-pricing-revision": `sha256:${"0".repeat(64)}`,
+      },
+      body: JSON.stringify(body),
+    } satisfies RequestInit;
+
+    const replay = await call("/v1/ai/chat/completions", scoped.secret, request);
+    expect(replay?.status).toBe(200);
+    expect(await replay?.json()).toEqual({
+      object: "chat.completion",
+      model: "retired-public-model",
+    });
+    expect(replay?.headers.get("x-takoserver-billed-minor")).toBe("1");
+    expect(replay?.headers.get("x-takoserver-billed-micros")).toBe("10000");
+    expect(replay?.headers.get("x-takoserver-money-policy")).toBe("usd-cents-v1");
+    expect(calls).toEqual([]);
+    expect((await ledger.wallet(organization.id)).availableMicros).toBe(10_000_000);
+    expect(
+      (
+        await sql.query("SELECT body_json FROM idempotency WHERE scope_key = ?", [
+          `ai:${organization.id}:${idempotencyKey}`,
+        ])
+      )[0]?.body_json,
+    ).toBe(originalJson);
+
+    const bodyConflict = await call("/v1/ai/chat/completions", scoped.secret, {
+      ...request,
+      body: JSON.stringify({ ...body, messages: [{ role: "user", content: "different" }] }),
+    });
+    expect(bodyConflict?.status).toBe(409);
+    expect(await bodyConflict?.json()).toMatchObject({
+      error: { code: "idempotency_key_conflict" },
+    });
+
+    const differentKey = await call("/v1/ai/chat/completions", scoped.secret, {
+      ...request,
+      headers: { ...request.headers, "idempotency-key": "another-legacy-key" },
+    });
+    expect(differentKey?.status).toBe(404);
+
+    const otherOrganization = await accounts.createOrganization({ actor: owner, name: "Other" });
+    const otherKey = await accounts.createApiKey({
+      actor: owner,
+      organizationId: otherOrganization.id,
+      name: "other-ai-client",
+      scopes: ["ai:invoke"],
+      expiresInSeconds: 3_600,
+    });
+    const foreignOrganization = await call("/v1/ai/chat/completions", otherKey.secret, request);
+    expect(foreignOrganization?.status).toBe(404);
+    expect(calls).toEqual([]);
   });
 
   test("rejects the same key with a different request before inference", async () => {
@@ -599,7 +755,7 @@ describe("OpenAI-compatible AI data plane", () => {
     const recovered = await call("/v1/ai/chat/completions", scoped.secret, request);
     expect(recovered?.status).toBe(200);
     expect(calls).toHaveLength(1);
-    expect((await ledger.wallet(organization.id)).availableMinor).toBe(995);
+    expect((await ledger.wallet(organization.id)).availableMicros).toBe(9_950_000);
     expect(await sql.query("SELECT request_id FROM usage_events")).toHaveLength(1);
   });
 });

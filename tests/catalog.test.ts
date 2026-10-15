@@ -122,15 +122,37 @@ describe("Offering catalog", () => {
         { meter: "compute.requests", quantity: 1_500_000 },
       ]),
     ).toEqual({
-      amountMicros: 50_000_000,
+      amountUnit: "usd-micros-v2",
+      amountMicros: 500_000,
       lines: [
-        { meter: "compute.millisecond", quantity: 5, amountMicros: 5_000_000 },
-        { meter: "compute.requests", quantity: 1_500_000, amountMicros: 45_000_000 },
+        {
+          meter: "compute.millisecond",
+          quantity: 5,
+          amountMicros: 50_000,
+          amountNumeratorMicros: "50000",
+          amountDenominator: "1",
+        },
+        {
+          meter: "compute.requests",
+          quantity: 1_500_000,
+          amountMicros: 450_000,
+          amountNumeratorMicros: "450000",
+          amountDenominator: "1",
+        },
       ],
     });
     expect(priceMeteredUsage(plan, [{ meter: "compute.requests", quantity: 1 }])).toEqual({
-      amountMicros: 30,
-      lines: [{ meter: "compute.requests", quantity: 1, amountMicros: 30 }],
+      amountUnit: "usd-micros-v2",
+      amountMicros: 1,
+      lines: [
+        {
+          meter: "compute.requests",
+          quantity: 1,
+          amountMicros: 0,
+          amountNumeratorMicros: "3",
+          amountDenominator: "10",
+        },
+      ],
     });
     expect(() => priceMeteredUsage(plan, [{ meter: "provider.invoice", quantity: 1 }])).toThrow(
       "unknown meter",

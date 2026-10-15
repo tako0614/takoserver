@@ -1,4 +1,5 @@
 import type { FundingSettlementVerifier } from "./ledger.ts";
+import type { StripeMode } from "./stripe-mode-realm.ts";
 
 /**
  * Funding a wallet with money that actually arrived.
@@ -29,13 +30,39 @@ import type { FundingSettlementVerifier } from "./ledger.ts";
  */
 
 const STRIPE_API = "https://api.stripe.com/v1";
+/**
+ * Pinned, so the fields read here (`latest_charge` and its refund and dispute
+ * state) do not depend on whatever default version the account carries.
+ */
+export const STRIPE_API_VERSION = "2024-06-20";
+
+/** Stripe Checkout Session ids; short enough that `stripe:<id>` fits a ledger reference. */
+const CHECKOUT_SESSION_ID = /^cs_[A-Za-z0-9_]{1,240}$/u;
 
 export type StripeSettlementErrorCode =
+  | "invalid_configuration"
   | "unknown_session"
   | "not_paid"
   | "wrong_organization"
   | "wrong_currency"
+  /** Paid, then refunded in whole or part, or disputed: there is nothing to credit. */
+  | "refunded"
+  /** Not a one-off wallet top-up this Host created (another mode, or no Host marker). */
+  | "not_wallet_funding"
+  /** Stripe's record did not carry the payment it must be checked against. */
+  | "unverifiable_payment"
+  | "wrong_mode"
   | "unavailable";
+
+/** Written into every Checkout Session this Host creates, and read back before crediting. */
+export const WALLET_FUNDING_PURPOSE = "wallet_funding";
+
+/**
+ * The payment behind a session is read with it. Stripe leaves a session
+ * `paid` after a refund or a dispute, so the charge is the record that says
+ * whether the money is still there.
+ */
+const SESSION_EXPANSION = "payment_intent.latest_charge";
 
 export class StripeSettlementError extends Error {
   constructor(readonly code: StripeSettlementErrorCode) {
@@ -47,53 +74,179 @@ export class StripeSettlementError extends Error {
 export interface StripeOptions {
   /** Stripe secret key. A secret, and the only credential here. */
   readonly secretKey: string;
+  readonly mode?: StripeMode;
   readonly currency?: "USD";
   readonly apiOrigin?: string;
   readonly fetch?: (request: Request) => Promise<Response>;
 }
 
-interface CheckoutSession {
+/** Stripe's record of one Checkout Session, as far as funding reads it. */
+export interface CheckoutSession {
   readonly id?: unknown;
+  readonly livemode?: unknown;
+  readonly mode?: unknown;
   readonly payment_status?: unknown;
   readonly amount_total?: unknown;
   readonly currency?: unknown;
-  readonly metadata?: { readonly organizationId?: unknown } | null;
+  /** Unix seconds; ordering for the reconcile window. */
+  readonly created?: unknown;
+  readonly metadata?: {
+    readonly organizationId?: unknown;
+    readonly takoserverPurpose?: unknown;
+  } | null;
+  /** Expanded with its latest charge by every read this client makes. */
+  readonly payment_intent?: unknown;
+}
+
+/** What a paid Checkout Session credits, decided only from Stripe's record of it. */
+export interface CheckoutSessionFunding {
+  readonly organizationId: string;
+  readonly fundingRef: string;
+  readonly amountMinor: number;
+  readonly currency: "USD";
+}
+
+/**
+ * The one decision about whether a Checkout Session credits a wallet.
+ *
+ * The console's return, the webhook and the reconcile pass all reach it with
+ * a session Stripe itself returned — never with an event body or a caller's
+ * claim — so there is one set of checks to keep correct, not three. With an
+ * expected organization the session must name exactly that one; without one
+ * (a webhook or a reconcile, where nobody presented it) it must name some
+ * organization, and the caller decides whether that organization is real.
+ */
+export function checkoutSessionFunding(
+  session: CheckoutSession,
+  options: {
+    readonly currency?: "USD";
+    /** Explicit Stripe account mode; omitted only for legacy test-mode callers. */
+    readonly mode?: StripeMode;
+    readonly expectedOrganizationId?: string;
+    /**
+     * Paths nobody presented (webhook, reconcile) credit only sessions this
+     * Host marked at creation, so a Payment Link, a dashboard session or a
+     * later subscription Checkout in the same account is never a top-up.
+     */
+    readonly requireHostMarker?: boolean;
+  } = {},
+): CheckoutSessionFunding {
+  const currency = (options.currency ?? "USD").toLowerCase();
+  if (typeof session.id !== "string" || !CHECKOUT_SESSION_ID.test(session.id)) {
+    throw new StripeSettlementError("unknown_session");
+  }
+  const mode = options.mode ?? "test";
+  if (mode !== "test" && mode !== "live") {
+    throw new StripeSettlementError("invalid_configuration");
+  }
+  assertStripeMode(session, mode);
+  // Decided first where nobody presented the session: a payment this Host did
+  // not create is not a failed top-up, and must not read as money left behind.
+  if (
+    options.requireHostMarker === true &&
+    (session.mode !== "payment" || session.metadata?.takoserverPurpose !== WALLET_FUNDING_PURPOSE)
+  ) {
+    throw new StripeSettlementError("not_wallet_funding");
+  }
+  if (session.payment_status !== "paid") throw new StripeSettlementError("not_paid");
+  const organizationId = session.metadata?.organizationId;
+  if (
+    typeof organizationId !== "string" ||
+    organizationId.length === 0 ||
+    organizationId.length > 128 ||
+    (options.expectedOrganizationId !== undefined &&
+      organizationId !== options.expectedOrganizationId)
+  ) {
+    throw new StripeSettlementError("wrong_organization");
+  }
+  if (typeof session.currency !== "string" || session.currency.toLowerCase() !== currency) {
+    throw new StripeSettlementError("wrong_currency");
+  }
+  if (
+    typeof session.amount_total !== "number" ||
+    !Number.isSafeInteger(session.amount_total) ||
+    session.amount_total <= 0
+  ) {
+    throw new StripeSettlementError("not_paid");
+  }
+  if (session.mode !== "payment") throw new StripeSettlementError("not_wallet_funding");
+  assertPaymentStillHeld(session.payment_intent, mode);
+  return {
+    organizationId,
+    // Keep the verified Stripe cash receipt in cents. Funding callers perform
+    // the checked x10,000 conversion at the USD-micros ledger boundary.
+    amountMinor: session.amount_total,
+    fundingRef: `stripe:${session.id}`,
+    currency: "USD",
+  };
+}
+
+/**
+ * The money is still there: the payment succeeded and its charge is neither
+ * refunded (in any part) nor disputed. A session whose payment cannot be read
+ * is not credited on trust.
+ */
+function assertStripeMode(value: unknown, mode: StripeMode): void {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    (value as Record<string, unknown>).livemode !== (mode === "live")
+  ) {
+    throw new StripeSettlementError("wrong_mode");
+  }
+}
+
+function assertPaymentStillHeld(intent: unknown, mode: StripeMode): void {
+  if (typeof intent !== "object" || intent === null) {
+    throw new StripeSettlementError("unverifiable_payment");
+  }
+  assertStripeMode(intent, mode);
+  const { status, latest_charge: charge } = intent as Record<string, unknown>;
+  if (status !== "succeeded" || typeof charge !== "object" || charge === null) {
+    throw new StripeSettlementError("unverifiable_payment");
+  }
+  assertStripeMode(charge, mode);
+  const { refunded, amount_refunded: amountRefunded, disputed } = charge as Record<string, unknown>;
+  if (refunded !== false || amountRefunded !== 0 || disputed !== false) {
+    throw new StripeSettlementError("refunded");
+  }
 }
 
 export function createStripeSettlement(options: StripeOptions): FundingSettlementVerifier {
   const stripe = createStripeClient(options);
-  const currency = (options.currency ?? "USD").toLowerCase();
 
   return {
     async verify({ organizationId, settlementProof }) {
       const session = await stripe.checkoutSession(settlementProof);
       if (!session) throw new StripeSettlementError("unknown_session");
-
-      if (session.payment_status !== "paid") throw new StripeSettlementError("not_paid");
-      if (session.metadata?.organizationId !== organizationId) {
-        throw new StripeSettlementError("wrong_organization");
-      }
-      if (typeof session.currency !== "string" || session.currency.toLowerCase() !== currency) {
-        throw new StripeSettlementError("wrong_currency");
-      }
-      if (typeof session.amount_total !== "number" || session.amount_total <= 0) {
-        throw new StripeSettlementError("not_paid");
-      }
-
+      const funding = checkoutSessionFunding(session, {
+        ...(options.currency ? { currency: options.currency } : {}),
+        ...(options.mode ? { mode: options.mode } : {}),
+        expectedOrganizationId: organizationId,
+      });
       return {
-        // Stripe's minor units are the ledger's minor units, so nothing is
-        // converted here — a conversion is a place for a factor of a hundred
-        // to go missing.
-        amountMinor: session.amount_total,
-        fundingRef: `stripe:${String(session.id)}`,
-        currency: "USD",
+        amountMinor: funding.amountMinor,
+        fundingRef: funding.fundingRef,
+        currency: funding.currency,
       };
     },
   };
 }
 
+export interface CheckoutSessionPage {
+  readonly sessions: readonly CheckoutSession[];
+  readonly hasMore: boolean;
+}
+
 export interface StripeClient {
   checkoutSession(id: string): Promise<CheckoutSession | null>;
+  /** Newest first, as Stripe lists them; `startingAfter` continues a listing. */
+  listCheckoutSessions(input: {
+    readonly status: "complete";
+    readonly limit: number;
+    readonly startingAfter?: string;
+  }): Promise<CheckoutSessionPage>;
   createCheckoutSession(input: {
     readonly organizationId: string;
     readonly amountMinor: number;
@@ -103,6 +256,16 @@ export interface StripeClient {
 }
 
 export function createStripeClient(options: StripeOptions): StripeClient {
+  const mode = options.mode ?? "test";
+  if (mode !== "test" && mode !== "live") throw new StripeSettlementError("wrong_mode");
+  const keyPrefix = mode === "live" ? /^(?:sk|rk)_live_/u : /^(?:sk|rk)_test_/u;
+  if (
+    typeof options.secretKey !== "string" ||
+    !keyPrefix.test(options.secretKey) ||
+    options.secretKey.length <= options.secretKey.indexOf("_") + 6
+  ) {
+    throw new StripeSettlementError("invalid_configuration");
+  }
   const origin = options.apiOrigin ?? STRIPE_API;
   const send = options.fetch ?? ((request: Request) => fetch(request));
   const currency = (options.currency ?? "USD").toLowerCase();
@@ -119,6 +282,7 @@ export function createStripeClient(options: StripeOptions): StripeClient {
           method,
           headers: {
             authorization: `Bearer ${options.secretKey}`,
+            "stripe-version": STRIPE_API_VERSION,
             ...(form ? { "content-type": "application/x-www-form-urlencoded" } : {}),
           },
           ...(form ? { body: new URLSearchParams(form).toString() } : {}),
@@ -147,8 +311,39 @@ export function createStripeClient(options: StripeOptions): StripeClient {
 
   return {
     async checkoutSession(id) {
-      if (!/^cs_[A-Za-z0-9_]{1,255}$/u.test(id)) return null;
-      return (await call("GET", `/checkout/sessions/${id}`)) as CheckoutSession | null;
+      if (!CHECKOUT_SESSION_ID.test(id)) return null;
+      const query = new URLSearchParams({ "expand[]": SESSION_EXPANSION });
+      const session = await call("GET", `/checkout/sessions/${id}?${query.toString()}`);
+      if (session !== null) assertStripeMode(session, mode);
+      return session as CheckoutSession | null;
+    },
+
+    async listCheckoutSessions({ status, limit, startingAfter }) {
+      if (
+        !Number.isSafeInteger(limit) ||
+        limit < 1 ||
+        limit > 100 ||
+        (startingAfter !== undefined && !CHECKOUT_SESSION_ID.test(startingAfter))
+      ) {
+        throw new StripeSettlementError("unavailable");
+      }
+      const query = new URLSearchParams({
+        status,
+        limit: String(limit),
+        "expand[]": `data.${SESSION_EXPANSION}`,
+      });
+      if (startingAfter !== undefined) query.set("starting_after", startingAfter);
+      const listed = await call("GET", `/checkout/sessions?${query.toString()}`);
+      if (
+        !listed ||
+        !Array.isArray(listed.data) ||
+        typeof listed.has_more !== "boolean" ||
+        !listed.data.every((item) => typeof item === "object" && item !== null)
+      ) {
+        throw new StripeSettlementError("unavailable");
+      }
+      for (const item of listed.data) assertStripeMode(item, mode);
+      return { sessions: listed.data as CheckoutSession[], hasMore: listed.has_more };
     },
 
     async createCheckoutSession({ organizationId, amountMinor, successUrl, cancelUrl }) {
@@ -164,8 +359,11 @@ export function createStripeClient(options: StripeOptions): StripeClient {
         // verification. It is what stops one customer's payment from crediting
         // another customer's wallet.
         "metadata[organizationId]": organizationId,
+        "metadata[takoserverPurpose]": WALLET_FUNDING_PURPOSE,
         "payment_intent_data[metadata][organizationId]": organizationId,
+        "payment_intent_data[metadata][takoserverPurpose]": WALLET_FUNDING_PURPOSE,
       });
+      if (created !== null) assertStripeMode(created, mode);
       const id = created?.id;
       const url = created?.url;
       if (typeof id !== "string" || typeof url !== "string") {

@@ -288,7 +288,7 @@ test("canonical bootstrap injects one bounded lazy runtime under dataRoot", asyn
     expect(runtimeOptions).toHaveLength(1);
     expect(runtimeOptions[0]?.root).toBe(join(dataRoot, "container-runtime"));
     expect(runtimeOptions[0]?.backend).toBeDefined();
-    expect(runtimeOptions[0]?.drainTimeoutMs).toBe(5_000);
+    expect(runtimeOptions[0]?.drainTimeoutMs).toBe(30_000);
 
     await bootstrap.close();
     await bootstrap.close();

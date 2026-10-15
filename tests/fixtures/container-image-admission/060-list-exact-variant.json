@@ -1,0 +1,52 @@
+{
+  "id": "060-list-exact-variant",
+  "category": "manifest-list",
+  "description": "A list selects only the requested ARM variant.",
+  "input": {
+    "imageRef": "registry.example.test/workload@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "platform": {
+      "os": "linux",
+      "architecture": "arm",
+      "variant": "v7"
+    },
+    "registry": {
+      "visibility": "public"
+    },
+    "manifest": {
+      "kind": "list",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "manifests": [
+        {
+          "kind": "image",
+          "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "platform": {
+            "os": "linux",
+            "architecture": "arm",
+            "variant": "v6"
+          },
+          "sizeBytes": 4096
+        },
+        {
+          "kind": "image",
+          "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "platform": {
+            "os": "linux",
+            "architecture": "arm",
+            "variant": "v7"
+          },
+          "sizeBytes": 16384
+        }
+      ]
+    }
+  },
+  "expected": {
+    "decision": "accept",
+    "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "sizeBytes": 16384,
+    "platform": {
+      "os": "linux",
+      "architecture": "arm",
+      "variant": "v7"
+    }
+  }
+}

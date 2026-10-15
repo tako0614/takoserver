@@ -1,0 +1,28 @@
+{
+  "id": "004-tag-with-registry-port",
+  "category": "reference",
+  "description": "A registry port and tag do not supply a digest.",
+  "input": {
+    "imageRef": "registry.example.test:5000/workload:v1",
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    },
+    "registry": {
+      "visibility": "public"
+    },
+    "manifest": {
+      "kind": "image",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "platform": {
+        "os": "linux",
+        "architecture": "amd64"
+      },
+      "sizeBytes": 4096
+    }
+  },
+  "expected": {
+    "decision": "reject",
+    "reason": "digest_pin_required"
+  }
+}

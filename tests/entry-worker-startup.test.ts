@@ -1,4 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { afterAll, describe, expect, test } from "bun:test";
+import { buildD1MigrationImport } from "../scripts/deploy/d1-migration-import.ts";
+import { readMigrationArtifact } from "../scripts/deploy/migrations.ts";
+import { buildMoneyCutoverImportSql } from "../scripts/deploy/schema-money-unit-cutover.ts";
+import { MIGRATIONS } from "../src/db-schema.ts";
 import worker, {
   resolvePublicWorkerImplementationIdentity,
   workerIntegrationOrganizationBootstrap,
@@ -7,6 +12,7 @@ import {
   INTEGRATION_E2E_ORGANIZATION_ID,
   type IntegrationE2eCredentialAuthorityConfig,
 } from "../src/integration-e2e-credential-authority.ts";
+import type { SqlParam } from "../src/ports.ts";
 import {
   EDGE_ONLY_RESOURCE_CLASSES,
   edgeSuppliesFixture,
@@ -14,6 +20,45 @@ import {
 } from "./helpers/hosted-supply-fixtures.ts";
 
 const ORIGIN = "https://api.integration.example.test";
+const readyDatabase = databaseThrough(98);
+readyDatabase.exec(
+  "INSERT INTO stripe_mode_realm (singleton, mode, pinned_at) VALUES (1, 'test', '2026-10-14T00:00:00.000Z')",
+);
+afterAll(() => readyDatabase.close());
+
+function databaseThrough(count: number): Database {
+  const database = new Database(":memory:");
+  for (const migration of MIGRATIONS.slice(0, count)) database.exec(migration.sql);
+  return database;
+}
+
+function d1(database: Database) {
+  return {
+    prepare(sql: string) {
+      let values: SqlParam[] = [];
+      return {
+        bind(...params: SqlParam[]) {
+          values = params;
+          return this;
+        },
+        async all() {
+          return {
+            results: database
+              .query(sql)
+              .all(
+                ...values.map((value) =>
+                  value instanceof ArrayBuffer ? new Uint8Array(value) : value,
+                ),
+              ),
+          };
+        },
+      };
+    },
+    async batch(statements: readonly { all(): Promise<unknown> }[]) {
+      return await Promise.all(statements.map((statement) => statement.all()));
+    },
+  };
+}
 
 /** Enough of a binding surface to reach composition, and nothing more. */
 function workerEnv(
@@ -21,7 +66,7 @@ function workerEnv(
 ): Parameters<typeof worker.fetch>[1] {
   return {
     PUBLIC_ORIGIN: ORIGIN,
-    STATE_DB: { prepare: () => ({}), batch: () => [] },
+    STATE_DB: d1(readyDatabase),
     OBJECTS: {
       put: () => null,
       get: () => null,
@@ -50,6 +95,124 @@ async function envelope(response: Response) {
 }
 
 describe("Worker startup diagnostics", () => {
+  test("selected money Worker returns exact guarded 503 and refuses missing guards", async () => {
+    const policy = "transaction-fenced-usd-micros-v1";
+    const writerEpoch = `sha256:${"b".repeat(64)}`;
+    const bare = databaseThrough(94);
+    const files = readMigrationArtifact().files;
+    const frozen = new Database(":memory:");
+    const marker = `sha256:${"a".repeat(64)}`;
+    const importSql = (phase: "freeze" | "prepare" | "convert") =>
+      buildMoneyCutoverImportSql({
+        phase,
+        files,
+        anchor: marker,
+        originDigest: marker,
+        backupDigest: marker,
+        writerDigest: marker,
+        writerEpoch,
+        classifications: [],
+      });
+    try {
+      frozen.exec(buildD1MigrationImport(files.slice(0, 92), { freshLedger: true }).sql);
+      for (const phase of ["freeze", "prepare", "convert"] as const) frozen.exec(importSql(phase));
+      const selected = workerEnv({
+        STATE_DB: d1(frozen),
+        TAKOSERVER_ENVIRONMENT: "integration",
+        TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY: policy,
+        TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH: writerEpoch,
+      });
+      for (const path of ["/healthz", "/.well-known/takoserver"]) {
+        const response = await worker.fetch(new Request(`${ORIGIN}${path}`), selected);
+        expect(response.status).toBe(503);
+        expect((await envelope(response)).error.details?.reason).toBe("money-cutover-freeze");
+      }
+      const revoked = await worker.fetch(new Request(`${ORIGIN}/healthz`), {
+        ...selected,
+        TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH: `sha256:${"c".repeat(64)}`,
+      });
+      expect(revoked.status).toBe(503);
+      expect((await envelope(revoked)).error.details?.reason).not.toBe("money-cutover-freeze");
+      frozen.exec("DROP TRIGGER money_cutover_fence_stripe_events_update");
+      const drift = await worker.fetch(new Request(`${ORIGIN}/healthz`), selected);
+      expect(drift.status).toBe(503);
+      expect((await envelope(drift)).error.details?.reason).not.toBe("money-cutover-freeze");
+      const unguarded = await worker.fetch(
+        new Request(`${ORIGIN}/healthz`),
+        workerEnv({
+          STATE_DB: d1(bare),
+          TAKOSERVER_ENVIRONMENT: "integration",
+          TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY: policy,
+          TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH: writerEpoch,
+        }),
+      );
+      expect(unguarded.status).toBe(503);
+      expect((await envelope(unguarded)).error.details?.reason).not.toBe("money-cutover-freeze");
+    } finally {
+      frozen.close();
+      bare.close();
+    }
+  });
+
+  test("normal serving refuses a configured Stripe mode that disagrees with the pinned realm", async () => {
+    const response = await worker.fetch(
+      new Request(`${ORIGIN}/healthz`),
+      workerEnv({ TAKOSERVER_STRIPE_MODE: "live" }),
+    );
+    expect(response.status).toBe(503);
+    expect((await envelope(response)).error.details?.reason).toBe("runtime-configuration");
+  });
+
+  test("normal serving refuses a Stripe pin whose immutability trigger is missing", async () => {
+    const database = databaseThrough(98);
+    try {
+      database.exec(
+        "INSERT INTO stripe_mode_realm (singleton, mode, pinned_at) VALUES (1, 'test', '2026-10-14T00:00:00.000Z')",
+      );
+      database.exec("DROP TRIGGER stripe_mode_realm_no_update");
+      const response = await worker.fetch(
+        new Request(`${ORIGIN}/healthz`),
+        workerEnv({ STATE_DB: d1(database) }),
+      );
+      expect(response.status).toBe(503);
+      expect((await envelope(response)).error.details?.reason).toBe("runtime-configuration");
+    } finally {
+      database.close();
+    }
+  });
+
+  test("normal serving refuses an unqualified pre-realm D1 with no billing configuration", async () => {
+    const oldDatabase = databaseThrough(92);
+    try {
+      const env = workerEnv({ STATE_DB: d1(oldDatabase) });
+      const response = await worker.fetch(new Request(`${ORIGIN}/healthz`), env);
+      expect(response.status).toBe(503);
+      expect((await envelope(response)).error.details?.reason).toBe("runtime-configuration");
+      await expect(worker.scheduled({}, env)).rejects.toThrow("0094 USD-micros D1 schema");
+    } finally {
+      oldDatabase.close();
+    }
+  });
+
+  test("normal serving refuses a tampered USD-micros money-unit policy", async () => {
+    const database = databaseThrough(98);
+    try {
+      database.exec(
+        "INSERT INTO stripe_mode_realm (singleton, mode, pinned_at) VALUES (1, 'test', '2026-10-14T00:00:00.000Z')",
+      );
+      database.exec("DROP TRIGGER money_unit_policy_no_delete");
+      database.exec("DELETE FROM money_unit_policy");
+      const response = await worker.fetch(
+        new Request(`${ORIGIN}/healthz`),
+        workerEnv({ STATE_DB: d1(database) }),
+      );
+      expect(response.status).toBe(503);
+      expect((await envelope(response)).error.details?.reason).toBe("runtime-configuration");
+    } finally {
+      database.close();
+    }
+  });
+
   test("requires explicit v2 startup config before touching durable bindings", async () => {
     const env = workerEnv({ TAKOSERVER_TAKOFORM_V2_CONFIG: undefined });
     let storageReads = 0;
@@ -397,6 +560,44 @@ describe("Worker startup diagnostics", () => {
     expect(response.headers.get("cache-control")).toBe("no-store");
     expect((await envelope(response)).error.message).toContain("0088");
     await expect(worker.scheduled({}, env)).resolves.toBeUndefined();
+  });
+
+  test("wallet unit maintenance closes payment/deploy/webhook admission and every scheduled money pass", async () => {
+    let compositions = 0;
+    let lifetimes = 0;
+    const env = {
+      TAKOSERVER_SCHEMA_MAINTENANCE_MODE: "pre-wallet-usd-micros-quiesced",
+      get STATE_DB(): never {
+        compositions++;
+        throw new Error("money maintenance reached storage");
+      },
+      get STRIPE_SECRET_KEY(): never {
+        compositions++;
+        throw new Error("money maintenance reached payment credentials");
+      },
+    } as unknown as Parameters<typeof worker.fetch>[1];
+    for (const path of [
+      "/v1/resources",
+      "/v1/organizations/org/wallet/holds",
+      "/v1/payments/checkout",
+      "/v1/stripe/webhook",
+      "/healthz",
+    ]) {
+      const response = await worker.fetch(
+        new Request(`${ORIGIN}${path}`, { method: "POST" }),
+        env,
+        {
+          waitUntil() {
+            lifetimes++;
+          },
+        },
+      );
+      expect(response.status).toBe(503);
+      expect((await envelope(response)).error.message).toContain("wallet USD-micros");
+    }
+    await worker.scheduled({}, env);
+    expect(compositions).toBe(0);
+    expect(lifetimes).toBe(0);
   });
 
   test("invalid or conflicting maintenance selectors refuse before composition", async () => {

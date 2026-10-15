@@ -70,6 +70,92 @@ export function readMigrationArtifact(
 }
 
 /** Applied rows must be exactly the prefix Wrangler would extend. */
+/** The migration that creates `stripe_events`, which every webhook delivery writes. */
+export const STRIPE_EVENTS_MIGRATION = "0091_stripe_events.sql";
+/** Durable Organization hold, usage, grant, and tariff lifecycle. */
+export const ORG_BILLING_MIGRATION = "0092_org_wallet_lifecycle.sql";
+/** The cash and wallet ledger stored by this Worker uses USD micros, even without billingConfig. */
+export const MONEY_UNIT_MIGRATION = "0094_wallet_usd_micros.sql";
+
+export function moneyUnitSchemaReady(applied: readonly string[]): boolean {
+  return applied.includes(MONEY_UNIT_MIGRATION);
+}
+
+export function assertMoneyUnitSchema(applied: readonly string[]): void {
+  if (!moneyUnitSchemaReady(applied)) {
+    throw preflightError(
+      `this Worker needs ${MONEY_UNIT_MIGRATION} applied to its D1 before publication`,
+      `applied=${applied.length}`,
+    );
+  }
+}
+
+export type MoneyUnitPolicyRow = Readonly<Record<string, unknown>>;
+
+export function moneyUnitPolicyReady(rows: readonly MoneyUnitPolicyRow[] | undefined): boolean {
+  return (
+    rows?.length === 1 &&
+    rows[0]?.ledger_unit === "usd-micros-v2" &&
+    rows[0]?.historical_usage_unit === "microcent-v1" &&
+    rows[0]?.cash_unit === "usd-cents-v1"
+  );
+}
+
+export async function readMoneyUnitPolicy(
+  database: RemoteD1,
+  phase: DeployPhase = "preflight",
+): Promise<readonly MoneyUnitPolicyRow[]> {
+  return await database.query(
+    phase,
+    "D1 money-unit policy",
+    "SELECT ledger_unit, historical_usage_unit, cash_unit FROM money_unit_policy WHERE singleton = 1",
+  );
+}
+
+/**
+ * A target that asks for the Stripe webhook must already hold the table the
+ * webhook records into. Without it every delivery fails until Stripe disables
+ * the endpoint, so publication is refused before anything is uploaded.
+ */
+export function stripeWebhookSchemaReady(
+  target: { readonly stripeWebhook?: boolean },
+  applied: readonly string[],
+): boolean {
+  return target.stripeWebhook !== true || applied.includes(STRIPE_EVENTS_MIGRATION);
+}
+
+export function assertStripeWebhookSchema(
+  target: { readonly stripeWebhook?: boolean },
+  applied: readonly string[],
+): void {
+  if (!stripeWebhookSchemaReady(target, applied)) {
+    throw preflightError(
+      `the Stripe webhook needs ${STRIPE_EVENTS_MIGRATION} applied to this D1 before publication`,
+      `applied=${applied.length}`,
+    );
+  }
+}
+
+/** Billing is opt-in in the realized Worker target and requires its full lineage first. */
+export function orgBillingSchemaReady(
+  target: { readonly billingConfig?: unknown },
+  applied: readonly string[],
+): boolean {
+  return target.billingConfig === undefined || applied.includes(ORG_BILLING_MIGRATION);
+}
+
+export function assertOrgBillingSchema(
+  target: { readonly billingConfig?: unknown },
+  applied: readonly string[],
+): void {
+  if (!orgBillingSchemaReady(target, applied)) {
+    throw preflightError(
+      `Organization billing needs ${ORG_BILLING_MIGRATION} applied to this D1 before publication`,
+      `applied=${applied.length}`,
+    );
+  }
+}
+
 export function pendingMigrations(
   local: readonly string[],
   applied: readonly string[],

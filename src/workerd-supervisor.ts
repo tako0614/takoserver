@@ -67,6 +67,28 @@ class ChildIdentityPersistenceError extends Error {
   }
 }
 
+/**
+ * An `onSpawned` hook reports, before it has persisted anything, that its
+ * just-spawned child is not proven to hold the listener: another process
+ * holds it, or the child cannot be read because it is already exiting, as one
+ * that cannot bind does. This is temporary occupancy, not a failed identity
+ * write, so automatic recovery keeps its retry pending.
+ */
+export class WorkerdListenerOccupiedError extends Error {
+  constructor() {
+    super("workerd listener port is occupied before child identity persistence");
+    this.name = "WorkerdListenerOccupiedError";
+  }
+}
+
+/** A missing or rejected exit promise cannot become proof on a later retry. */
+class ChildExitUnconfirmedError extends Error {
+  constructor() {
+    super("workerd runtime child exit cannot be confirmed");
+    this.name = "ChildExitUnconfirmedError";
+  }
+}
+
 type RuntimeEntry = {
   readonly process: WorkerdProcess;
   readonly configPath: string;
@@ -111,6 +133,8 @@ export function createWorkerdSupervisor(options: {
    * Persist the exact spawned child identity before readiness can admit it.
    * If this fails, startup is refused and the child remains under the
    * supervisor's retirement custody; automatic restart is not scheduled.
+   * The exception is `WorkerdListenerOccupiedError`: the child is still
+   * retired, but automatic recovery keeps its retry pending.
    */
   readonly onSpawned?: (child: WorkerdProcess) => Promise<void> | void;
   readonly listenerPort?: number;
@@ -203,6 +227,28 @@ export function createWorkerdSupervisor(options: {
     return Math.min(RESTART_MAX_DELAY_MS, RESTART_INITIAL_DELAY_MS * 2 ** exponent);
   };
 
+  const observeRecoveryFailure = (
+    promise: Promise<void>,
+    epoch: number,
+    configPath: string,
+  ): void => {
+    void promise.catch((error: unknown) => {
+      if (!isDesiredEpoch(epoch)) return;
+      const message = error instanceof Error ? error.message : String(error);
+      logRecoveryDiagnostic(`workerd runtime restart failed: ${message}`);
+      // Retirement can fail before beginStart installs its retry hook. Keep
+      // waiting with bounded backoff, without spawning until this exact
+      // child's exit and listener vacancy are proven. Terminal custody and
+      // persistence failures still require an explicit operator intervention.
+      if (
+        !(error instanceof ChildIdentityPersistenceError) &&
+        !(error instanceof ChildExitUnconfirmedError)
+      ) {
+        schedule(epoch, configPath);
+      }
+    });
+  };
+
   const schedule = (epoch: number, configPath: string): void => {
     if (!isDesiredEpoch(epoch) || running || pendingRestart) return;
     const current = desired;
@@ -232,11 +278,7 @@ export function createWorkerdSupervisor(options: {
       const promise = retiring
         ? trackCheck(replaceRetired(retiring, configPath, epoch, true))
         : beginStart(configPath, epoch, true);
-      void promise.catch((error: unknown) => {
-        if (!isDesiredEpoch(epoch)) return;
-        const message = error instanceof Error ? error.message : String(error);
-        options.log?.(`workerd runtime restart failed: ${message}`);
-      });
+      observeRecoveryFailure(promise, epoch, configPath);
     };
     const run = (): void => {
       if (fired) return;
@@ -343,7 +385,12 @@ export function createWorkerdSupervisor(options: {
       }
       try {
         await options.onSpawned?.(child);
-      } catch {
+      } catch (error) {
+        // Occupancy is not a failed write. The catch below retires this exact
+        // child, even one that is still alive but unreadable, so a recovery
+        // retry still waits for its exit and a vacant listener; a first start
+        // still schedules no retry.
+        if (error instanceof WorkerdListenerOccupiedError) throw new WorkerdListenerOccupiedError();
         throw new ChildIdentityPersistenceError();
       }
       if (running !== entry || shutdownRequested || nextEpoch !== epoch) {
@@ -416,14 +463,14 @@ export function createWorkerdSupervisor(options: {
 
   const waitForExit = async (entry: RuntimeEntry): Promise<void> => {
     const exited = entry.process.exited;
-    if (!exited) throw new Error("workerd runtime child exit cannot be confirmed");
+    if (!exited) throw new ChildExitUnconfirmedError();
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await Promise.race([
         exited.then(
           () => undefined,
           () => {
-            throw new Error("workerd runtime child exit cannot be confirmed");
+            throw new ChildExitUnconfirmedError();
           },
         ),
         new Promise<never>((_resolve, reject) => {
@@ -601,11 +648,18 @@ export function createWorkerdSupervisor(options: {
         );
       }
 
+      const wasRecovering = pendingRestart !== null;
       cancelPendingRestart();
       const epoch = desired?.epoch ?? ++nextEpoch;
       const targetConfigPath = desired?.configPath ?? configPath;
       if (retiring) {
-        return trackCheck(replaceRetired(retiring, targetConfigPath, epoch, desired !== null));
+        const promise = trackCheck(
+          replaceRetired(retiring, targetConfigPath, epoch, desired !== null),
+        );
+        // A publish may take over a pending automatic retry. Refusing that
+        // publish must not cancel recovery of the previously accepted runtime.
+        if (wasRecovering) observeRecoveryFailure(promise, epoch, targetConfigPath);
+        return promise;
       }
       return beginStart(targetConfigPath, epoch, desired !== null);
     },

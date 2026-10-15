@@ -5,7 +5,11 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import { migrateSqlite, UsedV1InstallationError } from "../src/migrate-sqlite.ts";
+import {
+  MoneyUnitCutoverRequiredError,
+  migrateSqlite,
+  UsedV1InstallationError,
+} from "../src/migrate-sqlite.ts";
 
 const ARTIFACT_LIFECYCLE = "0031_takoform_artifact_lifecycle.sql";
 const RUNTIME_INPUT_PREPARATIONS = "0032_worker_runtime_input_preparations.sql";
@@ -74,6 +78,10 @@ const V2_WORKER_CRON_INVOCATION_CUSTODY = "0087_v2_worker_cron_invocation_custod
 const V2_WORKER_SQLITE_EXTERNAL_DRAIN = "0088_v2_worker_sqlite_external_drain.sql";
 const V2_WORKER_CRON_MATCH_GUARD_DEPTH = "0089_v2_worker_cron_match_guard_depth.sql";
 const V2_QUEUE_SQLITE_EXTERNAL_DRAIN = "0090_v2_queue_sqlite_external_drain.sql";
+const STRIPE_EVENTS = "0091_stripe_events.sql";
+const ORG_WALLET_LIFECYCLE = "0092_org_wallet_lifecycle.sql";
+const WALLET_CLASSIFICATION_PREPARATION = "0093_wallet_credit_classification_proofs.sql";
+const WALLET_USD_MICROS = "0094_wallet_usd_micros.sql";
 const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   ARTIFACT_FORWARD_REPAIR,
   CLOUDFLARE_MANAGED_WORKER_STATE,
@@ -133,7 +141,14 @@ const POST_ARTIFACT_LINEAGE_MIGRATIONS = [
   V2_WORKER_SQLITE_EXTERNAL_DRAIN,
   V2_WORKER_CRON_MATCH_GUARD_DEPTH,
   V2_QUEUE_SQLITE_EXTERNAL_DRAIN,
+  STRIPE_EVENTS,
+  ORG_WALLET_LIFECYCLE,
+  WALLET_CLASSIFICATION_PREPARATION,
+  WALLET_USD_MICROS,
 ] as const;
+// Preserve the audited 0032–0094 sequence above. Later additive migrations
+// belong to the current source inventory, not to that historical window.
+const POST_0094_ADDITIVE_MIGRATIONS = MIGRATIONS.slice(94).map((migration) => migration.name);
 const MODIFIED_ARTIFACT_LIFECYCLE_SQL = readFileSync(
   new URL("./fixtures/migrations/0031_takoform_artifact_lifecycle.modified.sql", import.meta.url),
   "utf8",
@@ -653,7 +668,7 @@ describe("bringing a local database up to date", () => {
     const report = migrateSqlite(counted);
 
     expect(transactions[0]).toBe("BEGIN IMMEDIATE");
-    expect(transactions).toHaveLength(MIGRATIONS.length * 2);
+    expect(transactions).toHaveLength((MIGRATIONS.length + 1) * 2);
     expect(report.applied).toEqual(MIGRATIONS.map((migration) => migration.name));
     expect(
       database.query("SELECT name FROM sqlite_schema WHERE name = 'operator_marker'").all(),
@@ -694,7 +709,7 @@ describe("bringing a local database up to date", () => {
 
       expect(migrateSqlite(counted).applied).toEqual(MIGRATIONS.map((migration) => migration.name));
       expect(transactions[0]).toBe("BEGIN IMMEDIATE");
-      expect(transactions).toHaveLength(MIGRATIONS.length * 2);
+      expect(transactions).toHaveLength((MIGRATIONS.length + 1) * 2);
       expect(database.query(metadataCase.query).all()).toEqual([
         { [metadataCase.column]: metadataCase.value },
       ]);
@@ -725,7 +740,7 @@ describe("bringing a local database up to date", () => {
 
     expect(migrateSqlite(counted).applied).toEqual(MIGRATIONS.map((migration) => migration.name));
     expect(transactions[0]).toBe("BEGIN IMMEDIATE");
-    expect(transactions).toHaveLength(MIGRATIONS.length * 2);
+    expect(transactions).toHaveLength((MIGRATIONS.length + 1) * 2);
   });
 
   test("does not take a write transaction when reopening a fully migrated database", () => {
@@ -762,7 +777,7 @@ describe("bringing a local database up to date", () => {
     ).toBe("dda3a01d915ef5871ad5a7fb8499761bce4309243044aa0b206076e1cf9bda45");
     expect(repair).toBeDefined();
     expect(
-      MIGRATIONS.slice(-(POST_ARTIFACT_LINEAGE_MIGRATIONS.length + 1)).map(
+      MIGRATIONS.slice(31, 31 + POST_ARTIFACT_LINEAGE_MIGRATIONS.length + 1).map(
         (migration) => migration.name,
       ),
     ).toEqual([RUNTIME_INPUT_PREPARATIONS, ...POST_ARTIFACT_LINEAGE_MIGRATIONS]);
@@ -863,6 +878,11 @@ describe("bringing a local database up to date", () => {
       V2_WORKER_SQLITE_EXTERNAL_DRAIN,
       V2_WORKER_CRON_MATCH_GUARD_DEPTH,
       V2_QUEUE_SQLITE_EXTERNAL_DRAIN,
+      STRIPE_EVENTS,
+      ORG_WALLET_LIFECYCLE,
+      WALLET_CLASSIFICATION_PREPARATION,
+      WALLET_USD_MICROS,
+      ...POST_0094_ADDITIVE_MIGRATIONS,
     ]);
 
     const digest = (character: string) => `sha256:${character.repeat(64)}`;
@@ -1164,6 +1184,11 @@ describe("bringing a local database up to date", () => {
         V2_WORKER_SQLITE_EXTERNAL_DRAIN,
         V2_WORKER_CRON_MATCH_GUARD_DEPTH,
         V2_QUEUE_SQLITE_EXTERNAL_DRAIN,
+        STRIPE_EVENTS,
+        ORG_WALLET_LIFECYCLE,
+        WALLET_CLASSIFICATION_PREPARATION,
+        WALLET_USD_MICROS,
+        ...POST_0094_ADDITIVE_MIGRATIONS,
       ]);
       expect(() => database.exec(LIVE_CLAIM("tenant_b", "dep_b"))).toThrow(/UNIQUE|constraint/iu);
     });
@@ -1359,14 +1384,21 @@ describe("bringing a local database up to date", () => {
 
   test("converges fresh, original 0031, and modified 0031 lineages without losing rows", () => {
     const fresh = new Database(":memory:");
-    expect(migrateSqlite(fresh).applied.slice(-POST_ARTIFACT_LINEAGE_MIGRATIONS.length)).toEqual([
+    expect(migrateSqlite(fresh).applied.slice(32)).toEqual([
       ...POST_ARTIFACT_LINEAGE_MIGRATIONS,
+      ...POST_0094_ADDITIVE_MIGRATIONS,
     ]);
 
     const original = prepareArtifactLineage("original");
     const modified = prepareArtifactLineage("modified");
-    expect(migrateSqlite(original.database).applied).toEqual([...POST_ARTIFACT_LINEAGE_MIGRATIONS]);
-    expect(migrateSqlite(modified.database).applied).toEqual([...POST_ARTIFACT_LINEAGE_MIGRATIONS]);
+    expect(migrateSqlite(original.database).applied).toEqual([
+      ...POST_ARTIFACT_LINEAGE_MIGRATIONS,
+      ...POST_0094_ADDITIVE_MIGRATIONS,
+    ]);
+    expect(migrateSqlite(modified.database).applied).toEqual([
+      ...POST_ARTIFACT_LINEAGE_MIGRATIONS,
+      ...POST_0094_ADDITIVE_MIGRATIONS,
+    ]);
 
     expect(canonicalSqliteSchema(original.database)).toEqual(canonicalSqliteSchema(fresh));
     expect(canonicalSqliteSchema(modified.database)).toEqual(canonicalSqliteSchema(fresh));
@@ -1514,7 +1546,10 @@ describe("bringing a local database up to date", () => {
   for (const lineage of ["original", "modified"] as const) {
     test(`keeps previous and current Worker upload writes compatible after ${lineage} 0031`, () => {
       const { database } = prepareArtifactLineage(lineage);
-      expect(migrateSqlite(database).applied).toEqual([...POST_ARTIFACT_LINEAGE_MIGRATIONS]);
+      expect(migrateSqlite(database).applied).toEqual([
+        ...POST_ARTIFACT_LINEAGE_MIGRATIONS,
+        ...POST_0094_ADDITIVE_MIGRATIONS,
+      ]);
       const previousManifestDigest = `sha256:${(lineage === "original" ? "c" : "d").repeat(64)}`;
       const currentManifestDigest = `sha256:${(lineage === "original" ? "e" : "f").repeat(64)}`;
       const previousManifest = JSON.stringify({
@@ -1662,6 +1697,7 @@ describe("bringing a local database up to date", () => {
       ARTIFACT_LIFECYCLE,
       RUNTIME_INPUT_PREPARATIONS,
       ...POST_ARTIFACT_LINEAGE_MIGRATIONS,
+      ...POST_0094_ADDITIVE_MIGRATIONS,
     ]);
     expect(MIGRATIONS[pairLifecycle - 1]?.name).toBe("0029_resource_deletion_attestations.sql");
     expect(MIGRATIONS[pairLifecycle + 1]?.name).toBe("0031_takoform_artifact_lifecycle.sql");
@@ -1758,6 +1794,11 @@ describe("bringing a local database up to date", () => {
       V2_WORKER_SQLITE_EXTERNAL_DRAIN,
       V2_WORKER_CRON_MATCH_GUARD_DEPTH,
       V2_QUEUE_SQLITE_EXTERNAL_DRAIN,
+      STRIPE_EVENTS,
+      ORG_WALLET_LIFECYCLE,
+      WALLET_CLASSIFICATION_PREPARATION,
+      WALLET_USD_MICROS,
+      ...POST_0094_ADDITIVE_MIGRATIONS,
     ]);
     expect(
       database.query("SELECT * FROM auth_tokens WHERE id = 'key_ie2e_historical_single'").get(),
@@ -1784,6 +1825,7 @@ describe("bringing a local database up to date", () => {
       ARTIFACT_LIFECYCLE,
       RUNTIME_INPUT_PREPARATIONS,
       ...POST_ARTIFACT_LINEAGE_MIGRATIONS,
+      ...POST_0094_ADDITIVE_MIGRATIONS,
     ]);
     for (const migration of MIGRATIONS.slice(0, lifecycle)) {
       database.exec(migration.sql);
@@ -1929,6 +1971,11 @@ describe("bringing a local database up to date", () => {
       V2_WORKER_SQLITE_EXTERNAL_DRAIN,
       V2_WORKER_CRON_MATCH_GUARD_DEPTH,
       V2_QUEUE_SQLITE_EXTERNAL_DRAIN,
+      STRIPE_EVENTS,
+      ORG_WALLET_LIFECYCLE,
+      WALLET_CLASSIFICATION_PREPARATION,
+      WALLET_USD_MICROS,
+      ...POST_0094_ADDITIVE_MIGRATIONS,
     ]);
     expect(
       database
@@ -2907,6 +2954,11 @@ describe("bringing a local database up to date", () => {
       V2_WORKER_SQLITE_EXTERNAL_DRAIN,
       V2_WORKER_CRON_MATCH_GUARD_DEPTH,
       V2_QUEUE_SQLITE_EXTERNAL_DRAIN,
+      STRIPE_EVENTS,
+      ORG_WALLET_LIFECYCLE,
+      WALLET_CLASSIFICATION_PREPARATION,
+      WALLET_USD_MICROS,
+      ...POST_0094_ADDITIVE_MIGRATIONS,
     ]);
     expect(
       database
@@ -3091,7 +3143,13 @@ describe("bringing a local database up to date", () => {
       )
       .run();
 
-    migrateSqlite(database);
+    // Current startup refuses old money before changing it. The frozen 0018
+    // unit rename is tested directly as historical DDL, not a cutover approval.
+    expect(() => migrateSqlite(database)).toThrow(MoneyUnitCutoverRequiredError);
+    expect(database.query("SELECT amount_minor FROM usage_events").get()).toEqual({
+      amount_minor: 123456,
+    });
+    database.exec(MIGRATIONS[usageMicros]!.sql);
 
     expect(database.query("SELECT amount_micros FROM usage_events").get()).toEqual({
       amount_micros: 123456,

@@ -16,6 +16,14 @@ import { loadFormAuthorityScopeTransition } from "./deploy/form-authority-scope-
 import { runOperatorIdentity } from "./deploy/identity.ts";
 import { runIntegrationE2eCredentials } from "./deploy/integration-e2e-credentials.ts";
 import { runIntegrationHostRetirement } from "./deploy/integration-host-retirement.ts";
+import {
+  type IntegrationMoneyShadowCreateDeclaration,
+  runIntegrationMoneyShadowCreate,
+} from "./deploy/integration-money-shadow-create.ts";
+import {
+  type MoneyShadowNativeProbeDeclaration,
+  runIntegrationMoneyShadowNativeProbe,
+} from "./deploy/integration-money-shadow-native-probe.ts";
 import { runIntegrationOrganizationBootstrap } from "./deploy/integration-organization-bootstrap.ts";
 import { runIntegrationStorageDisposal } from "./deploy/integration-storage-disposal.ts";
 import { runIntegrationStorageGeneration } from "./deploy/integration-storage-generation.ts";
@@ -39,6 +47,12 @@ import {
   type SchemaWaveBoundary,
 } from "./deploy/schema.ts";
 import { runD1Schema0058Rehearsal } from "./deploy/schema-0058-rehearsal.ts";
+import {
+  type IntegrationMoneyShadowRehearsalDeclaration,
+  type MoneyRehearsalDeclaration,
+  runIntegrationMoneyShadowRehearsal,
+  runMoneyUnitRehearsal,
+} from "./deploy/schema-money-unit-rehearsal.ts";
 import { runSigning } from "./deploy/signing.ts";
 import { runSponsorshipAuthority } from "./deploy/sponsorship-authority.ts";
 import { runStaticSite } from "./deploy/static.ts";
@@ -61,7 +75,8 @@ const USAGE = `takoserver deploy
   bun run deploy -- takoserver-integration-organization-bootstrap --<status|apply> --environment=integration --commit=<sha>
   bun run deploy -- takoserver-integration-storage-generation --<status|apply> --environment=integration --commit=<sha>
     --generation=<32-lowercase-hex> (new isolated D1/R2 only; never resets an existing target)
-    [--fresh-lineage=<v2-artifacts-0075|v2-0088|v2-0089>] (fixed fresh payload; default remains 0066)
+    [--fresh-lineage=<v2-artifacts-0075|v2-0088|v2-0089|v2-0091|v2-0092>] (fixed fresh payload; default remains 0066;
+    v2-0091/v2-0092 are staging-only and their apply requires TAKOSERVER_DEPLOY_TARGET_PRODUCTION to refuse the production D1)
   bun run deploy -- takoserver-integration-storage-disposal --<status|apply> --environment=integration --commit=<sha>
     (one exact selected D1/R2 pair only; refuses current regular/dispatch Worker bindings)
   bun run deploy -- takoserver-integration-host-retirement --<status|apply> --environment=integration --commit=<sha>
@@ -75,7 +90,7 @@ const USAGE = `takoserver deploy
   bun run deploy -- takoserver-org-api-key --<mint|status|revoke> --environment=<env> --commit=<sha>
     --organization=org_... [--key-name=<name> --scope=<scope> --expires-in-days=<n>] [--key-id=key_...]
   D1 schema status/apply may select one fixed next-wave boundary:
-    --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057|0058|0088>
+    --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057|0058|0088|0092|0093|0094>
   Integration without a selector keeps its disposable suffix path; selected integration applies
   only the audited wave and emits integration-protected-wave evidence, never a rehearsal receipt.
   Rehearsal and production still require the selector and their receipt chain.
@@ -91,6 +106,14 @@ const USAGE = `takoserver deploy
     writer-drain plus target-bound volume/import qualification are implemented; apply refuses.
   takoserver-rehearsal-d1-create creates one empty rehearsal D1 from a separate owned declaration;
     no target descriptor, schema import, binding change, or production mode is accepted.
+  takoserver-d1-money-cutover-rehearsal exercises synthetic 0092/0093/0094 imports on that
+    explicit rehearsal D1 only; each reviewed phase uses protected no-overwrite custody.
+  takoserver-integration-money-shadow-create creates one fresh synthetic-only integration D1
+    from a reviewed staging-0092 origin and canonical Wrangler OAuth, with no target adoption.
+  takoserver-integration-money-shadow-rehearsal runs the same reviewed synthetic import phases
+    on that exact terminal shadow D1, never on the staging D1 or ordinary rehearsal target.
+  takoserver-integration-money-shadow-native-probe publishes one fresh shadow-only diagnostic
+    Worker, then runs one fixed authenticated native D1.batch POST after separate reviews.
   takoserver-d1-snapshot-restore restores one pinned export dump into one declared empty
     rehearsal D1; the dump is NUL-normalized and the result is verified by readback, so a partial
     application is never reported as success.
@@ -140,6 +163,10 @@ type StorageGenerationSurface = "takoserver-integration-storage-generation";
 type StorageDisposalSurface = "takoserver-integration-storage-disposal";
 type HostRetirementSurface = "takoserver-integration-host-retirement";
 type RehearsalD1CreateSurface = "takoserver-rehearsal-d1-create";
+type MoneyRehearsalSurface = "takoserver-d1-money-cutover-rehearsal";
+type MoneyShadowCreateSurface = "takoserver-integration-money-shadow-create";
+type MoneyShadowRehearsalSurface = "takoserver-integration-money-shadow-rehearsal";
+type MoneyShadowNativeProbeSurface = "takoserver-integration-money-shadow-native-probe";
 type ProductionD1FreshInitSurface = "takoserver-production-d1-fresh-init";
 type D1SnapshotRestoreSurface = "takoserver-d1-snapshot-restore";
 type StandardSurface = Exclude<
@@ -150,6 +177,10 @@ type StandardSurface = Exclude<
   | StorageDisposalSurface
   | HostRetirementSurface
   | RehearsalD1CreateSurface
+  | MoneyRehearsalSurface
+  | MoneyShadowCreateSurface
+  | MoneyShadowRehearsalSurface
+  | MoneyShadowNativeProbeSurface
   | ProductionD1FreshInitSurface
   | D1SnapshotRestoreSurface
 >;
@@ -174,6 +205,19 @@ interface InvocationBase {
 
 type Invocation =
   | (InvocationBase & {
+      readonly surface:
+        | MoneyShadowCreateSurface
+        | MoneyShadowRehearsalSurface
+        | MoneyShadowNativeProbeSurface;
+      readonly action: "status" | "apply";
+      readonly environment: "integration";
+    })
+  | (InvocationBase & {
+      readonly surface: MoneyRehearsalSurface;
+      readonly action: "status" | "apply";
+      readonly environment: "rehearsal";
+    })
+  | (InvocationBase & {
       readonly surface: RehearsalD1CreateSurface;
       readonly action: "status" | "apply";
       readonly environment: "rehearsal";
@@ -187,7 +231,7 @@ type Invocation =
       readonly surface: StorageGenerationSurface;
       readonly action: "status" | "apply";
       readonly generation: string;
-      readonly freshLineage?: "v2-artifacts-0075" | "v2-0088" | "v2-0089";
+      readonly freshLineage?: "v2-artifacts-0075" | "v2-0088" | "v2-0089" | "v2-0091" | "v2-0092";
     })
   | (InvocationBase & {
       readonly surface: ProductionD1FreshInitSurface;
@@ -239,7 +283,7 @@ interface ParsedInvocation {
   readonly bootstrapVerifierBridge?: boolean;
   readonly bootstrapProbePredecessorVersionId?: string;
   readonly throughMigration?: SchemaWaveBoundary;
-  readonly freshLineage?: "v2-artifacts-0075" | "v2-0088" | "v2-0089";
+  readonly freshLineage?: "v2-artifacts-0075" | "v2-0088" | "v2-0089" | "v2-0091" | "v2-0092";
   readonly protectedReferenceEnvironment?: "integration" | "production";
   readonly organizationId?: string;
   readonly keyName?: string;
@@ -308,7 +352,8 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let environment: DeployEnvironment | null = null;
   let commit: string | null = null;
   let generation: string | null = null;
-  let freshLineage: "v2-artifacts-0075" | "v2-0088" | "v2-0089" | null = null;
+  let freshLineage: "v2-artifacts-0075" | "v2-0088" | "v2-0089" | "v2-0091" | "v2-0092" | null =
+    null;
   let retiredTargetPath: string | null = null;
   let retiredDeploymentId: string | null = null;
   let retiredVersionId: string | null = null;
@@ -438,6 +483,8 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       if (flag === "--fresh-lineage=v2-artifacts-0075") freshLineage = "v2-artifacts-0075";
       else if (flag === "--fresh-lineage=v2-0088") freshLineage = "v2-0088";
       else if (flag === "--fresh-lineage=v2-0089") freshLineage = "v2-0089";
+      else if (flag === "--fresh-lineage=v2-0091") freshLineage = "v2-0091";
+      else if (flag === "--fresh-lineage=v2-0092") freshLineage = "v2-0092";
       else return null;
       continue;
     }
@@ -612,7 +659,12 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   const storageGeneration = surfaceValue === "takoserver-integration-storage-generation";
   const productionFreshInit = surfaceValue === "takoserver-production-d1-fresh-init";
   if (
-    (productionFreshInit && freshLineage === "v2-artifacts-0075") ||
+    // v2-0091 and v2-0092 are staging-only: production fresh init never
+    // accepts them, so they cannot fall back to its default payload either.
+    (productionFreshInit &&
+      (freshLineage === "v2-artifacts-0075" ||
+        freshLineage === "v2-0091" ||
+        freshLineage === "v2-0092")) ||
     (freshLineage !== null && !storageGeneration && !productionFreshInit)
   )
     return null;
@@ -753,6 +805,24 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       ? { surface: surfaceValue, action, environment, commit }
       : null;
   }
+  if (surfaceValue === "takoserver-d1-money-cutover-rehearsal") {
+    return environment === "rehearsal" &&
+      (action === "status" || action === "apply") &&
+      args.length === 4
+      ? { surface: surfaceValue, action, environment, commit }
+      : null;
+  }
+  if (
+    surfaceValue === "takoserver-integration-money-shadow-create" ||
+    surfaceValue === "takoserver-integration-money-shadow-rehearsal" ||
+    surfaceValue === "takoserver-integration-money-shadow-native-probe"
+  ) {
+    return environment === "integration" &&
+      (action === "status" || action === "apply") &&
+      args.length === 4
+      ? { surface: surfaceValue, action, environment, commit }
+      : null;
+  }
   if (surfaceValue === "takoserver-d1-snapshot-restore") {
     return environment === "rehearsal" &&
       (action === "status" || action === "apply") &&
@@ -806,6 +876,12 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     surfaceValue === "takoserver-d1-schema" &&
     environment !== "integration" &&
     throughMigration === null
+  ) {
+    return null;
+  }
+  if (
+    (throughMigration === "0093" || throughMigration === "0094") &&
+    environment !== "integration"
   ) {
     return null;
   }
@@ -1055,7 +1131,53 @@ function loadD1SnapshotRestoreDeclaration(): D1SnapshotRestoreDeclaration {
   );
 }
 
+function loadMoneyRehearsalDeclaration(): MoneyRehearsalDeclaration {
+  return loadOwnedDeclaration<MoneyRehearsalDeclaration>(
+    "TAKOSERVER_D1_MONEY_REHEARSAL_DECLARATION_PATH",
+    "money cutover rehearsal declaration",
+  );
+}
+
+function loadMoneyShadowCreateDeclaration(): IntegrationMoneyShadowCreateDeclaration {
+  return loadOwnedDeclaration<IntegrationMoneyShadowCreateDeclaration>(
+    "TAKOSERVER_INTEGRATION_MONEY_SHADOW_CREATE_DECLARATION_PATH",
+    "integration money shadow create declaration",
+  );
+}
+
+function loadMoneyShadowRehearsalDeclaration(): IntegrationMoneyShadowRehearsalDeclaration {
+  return loadOwnedDeclaration<IntegrationMoneyShadowRehearsalDeclaration>(
+    "TAKOSERVER_INTEGRATION_MONEY_SHADOW_REHEARSAL_DECLARATION_PATH",
+    "integration money shadow rehearsal declaration",
+  );
+}
+
+function loadMoneyShadowNativeProbeDeclaration(): MoneyShadowNativeProbeDeclaration {
+  return loadOwnedDeclaration<MoneyShadowNativeProbeDeclaration>(
+    "TAKOSERVER_INTEGRATION_MONEY_SHADOW_NATIVE_PROBE_DECLARATION_PATH",
+    "integration money shadow native probe declaration",
+  );
+}
+
 async function dispatch(invocation: Invocation): Promise<Record<string, unknown>> {
+  if (invocation.surface === "takoserver-integration-money-shadow-native-probe") {
+    return await runIntegrationMoneyShadowNativeProbe(
+      loadMoneyShadowNativeProbeDeclaration(),
+      invocation,
+    );
+  }
+  if (invocation.surface === "takoserver-integration-money-shadow-create") {
+    return await runIntegrationMoneyShadowCreate(loadMoneyShadowCreateDeclaration(), invocation);
+  }
+  if (invocation.surface === "takoserver-integration-money-shadow-rehearsal") {
+    return await runIntegrationMoneyShadowRehearsal(
+      loadMoneyShadowRehearsalDeclaration(),
+      invocation,
+    );
+  }
+  if (invocation.surface === "takoserver-d1-money-cutover-rehearsal") {
+    return await runMoneyUnitRehearsal(loadMoneyRehearsalDeclaration(), invocation);
+  }
   if (invocation.surface === "takoserver-rehearsal-d1-create") {
     return await runRehearsalD1Create(loadRehearsalD1CreateDeclaration(), invocation);
   }
@@ -1136,8 +1258,27 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
           },
         });
       }
-    case "takoserver-integration-storage-generation":
-      return await runIntegrationStorageGeneration(invocation, target);
+    case "takoserver-integration-storage-generation": {
+      // The production target is read only for its D1 identity, which the
+      // staging generation must never be. Set, it must load; unset, the
+      // staging-only v2-0091/v2-0092 apply refuses.
+      const productionPath = process.env.TAKOSERVER_DEPLOY_TARGET_PRODUCTION?.trim();
+      if (productionPath !== undefined && productionPath !== "" && !isAbsolute(productionPath)) {
+        throw new DeployError(
+          "preflight",
+          "TAKOSERVER_DEPLOY_TARGET_PRODUCTION must be an absolute path",
+        );
+      }
+      const production =
+        productionPath === undefined || productionPath === ""
+          ? undefined
+          : loadTarget(productionPath, "production");
+      return await runIntegrationStorageGeneration(
+        invocation,
+        target,
+        production === undefined ? {} : { productionD1: production.d1 },
+      );
+    }
     case "takoserver-production-d1-fresh-init":
       return await runProductionD1FreshInit(
         {
@@ -1160,7 +1301,43 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
         { ...invocation, surface: "takoserver-integration-worker-bootstrap" },
         target,
       );
-    case "takoserver-d1-schema":
+    case "takoserver-d1-schema": {
+      if (invocation.throughMigration === "0093" || invocation.throughMigration === "0094") {
+        if (invocation.environment !== "integration") {
+          throw new DeployError("preflight", "0093/0094 monetary waves are integration-only");
+        }
+        const { loadMoneyUnitCutoverOptions } = await import("./deploy/schema-money-unit-owner.ts");
+        const options = await loadMoneyUnitCutoverOptions(
+          requireEnvironment("TAKOSERVER_D1_MONEY_CUTOVER_DECLARATION_PATH"),
+          target,
+        );
+        return await runD1Schema(
+          {
+            action: invocation.action,
+            environment: "integration",
+            commit: invocation.commit,
+            throughMigration: invocation.throughMigration,
+          },
+          target,
+          { moneyUnitCutover: options },
+        );
+      }
+      const productionPath = process.env.TAKOSERVER_DEPLOY_TARGET_PRODUCTION?.trim();
+      if (
+        invocation.throughMigration === "0092" &&
+        (!productionPath || !isAbsolute(productionPath))
+      ) {
+        throw new DeployError(
+          "preflight",
+          "0092 requires an absolute TAKOSERVER_DEPLOY_TARGET_PRODUCTION for read-only D1 identity fencing",
+        );
+      }
+      const production =
+        invocation.throughMigration !== "0092" ||
+        productionPath === undefined ||
+        productionPath === ""
+          ? undefined
+          : loadTarget(productionPath, "production");
       return await runD1Schema(
         {
           action: invocation.action,
@@ -1171,7 +1348,9 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
             : { throughMigration: invocation.throughMigration }),
         },
         target,
+        production === undefined ? {} : { productionD1: production.d1 },
       );
+    }
     case "takoserver-signing-key-register":
     case "takoserver-signing-repair":
     case "takoserver-signing-rotation":

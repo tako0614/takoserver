@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { createCatalog } from "../src/catalog.ts";
 import { createEphemeralSql } from "../src/compat.ts";
 import { createLedger } from "../src/ledger.ts";
+import { minorToMicros } from "../src/money.ts";
 import * as Driver from "../src/provider-driver.ts";
 import {
   failed,
@@ -182,7 +183,13 @@ test("compensation carries the exact hold to distinct atomic settlement without 
     Object.assign(input.executionAuthority, { leaseToken: "changed-by-provider" });
     return failedAfterProviderOperationCompensation(operationId, "conflict", "compensated");
   }, 25);
-  await f.ledger.fund({ organizationId: "tenant-a", fundingRef: "fund", amountMinor: 100 });
+  await f.ledger.fund({
+    organizationId: "tenant-a",
+    fundingRef: "fund",
+    amountMicros: minorToMicros(100),
+    kind: "purchased",
+    consumptionClass: "purchased",
+  });
   const error = await f.driver.compensateApply?.(f.input).catch((value: unknown) => value);
   expect(error).toBeInstanceOf(Driver.ProviderMutationCompensatedFailureError);
   expect(error).not.toBeInstanceOf(Driver.ProviderMutationWholeOperationRefusalError);
@@ -191,9 +198,9 @@ test("compensation carries the exact hold to distinct atomic settlement without 
     heldCharge: { reference: operationId, amountMinor: 25 },
   });
   expect(await f.ledger.wallet("tenant-a")).toMatchObject({
-    settledMinor: 100,
-    heldMinor: 25,
-    availableMinor: 75,
+    settledMicros: 1_000_000,
+    heldMicros: 250_000,
+    availableMicros: 750_000,
   });
   expect(f.calls).toHaveLength(1);
   expect(Object.keys(f.calls[0] ?? {}).sort()).toEqual([
@@ -286,7 +293,7 @@ test("missing capability is unsupported before provider entry or wallet hold", a
     Driver.ProviderApplyCompensationUnsupportedError,
   );
   expect(f.calls).toHaveLength(0);
-  expect(await f.ledger.wallet("tenant-a")).toMatchObject({ heldMinor: 0 });
+  expect(await f.ledger.wallet("tenant-a")).toMatchObject({ heldMicros: 0 });
 });
 
 test("thrown compensation progress is not stored as an original apply handle", async () => {

@@ -5,12 +5,16 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createActorResourceGraphReader } from "./actor-resource-graph.ts";
 import { buildApp, createAppResourceStoreBundle } from "./app.ts";
+import { parseBillingConfig } from "./billing-config.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
 import {
   parseSelfhostV2PrivatePlaneBoot,
   prepareSelfhostV2PrivatePlaneRoots,
 } from "./entry-v2-private-plane-boot.ts";
 import { parseSelfhostV2WorkerEndpointHttpsSelection } from "./entry-v2-worker-endpoint-boot.ts";
+import { createCanonicalHostedBillingComposition } from "./hosted-billing-composition.ts";
+import { verifyHostedBillingFinancialRealm } from "./hosted-billing-realm.ts";
+import { assertHostedPricingMatchesBilling, parseHostedPricing } from "./hosted-pricing.ts";
 import { resolveIdentity } from "./identity-setup.ts";
 import {
   type MigrationOptions,
@@ -20,12 +24,17 @@ import {
 } from "./migrate-sqlite.ts";
 import { createFileObjectStore } from "./objects-fs.ts";
 import { createMemoryObjectStore } from "./objects-mem.ts";
-import { createOperatorSettlement } from "./operator-credentials.ts";
+import {
+  createOperatorPaymentsReconcileVerifier,
+  createOperatorSettlement,
+} from "./operator-credentials.ts";
 import {
   ensureOperatorKey,
   parseOperatorPublicKey,
   signOperatorAssertion,
 } from "./operator-key.ts";
+import { assertOrgBillingSchema } from "./org-billing.ts";
+import { paymentSettingsFromEnvironment } from "./payment-settings.ts";
 import { resolvePayment } from "./payment-setup.ts";
 import { createOpenAiGateway, parseOpenAiModelConfig } from "./providers/openai.ts";
 import {
@@ -80,9 +89,9 @@ import {
   SELFHOST_DEFAULT_DATA_ROOT,
   SELFHOST_MEMORY_DATA_ROOT,
 } from "./selfhost-data-root.ts";
+import { createSelfhostEntryProcessShutdown } from "./selfhost-entry-process-shutdown.ts";
 import {
   closeSelfhostEntryOwnedResources,
-  createSelfhostEntryShutdown,
   describeBackgroundFailure,
 } from "./selfhost-entry-shutdown.ts";
 import {
@@ -103,6 +112,7 @@ import {
   parseSelfhostListenHost,
   SELFHOST_LISTEN_HOST_VARIABLE,
 } from "./selfhost-listen-address.ts";
+import { createSelfhostPublicArtifactSource } from "./selfhost-public-artifact-source-composition.ts";
 import { createSelfhostQueuePump } from "./selfhost-queue-pump.ts";
 import { createSelfhostWorkerScheduler } from "./selfhost-scheduler.ts";
 import {
@@ -146,6 +156,9 @@ import {
   RETIRED_CLOUDFLARE_OBJECT_BUCKET_DRAIN,
   resolveStandaloneProviderMode,
 } from "./standalone-provider-composition.ts";
+import { assertStripeBillingSchema } from "./stripe-billing.ts";
+import { createStripeBillingClient } from "./stripe-billing-client.ts";
+import { assertStripeModeRealm, parseStripeMode } from "./stripe-mode-realm.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { parseTakoformV2ApplicationConfig } from "./takoform-v2/config.ts";
 import { selectClosedGraphWorkerd } from "./workerd-artifact.ts";
@@ -237,6 +250,19 @@ const takoformV2Config = parseTakoformV2ApplicationConfig({
   TAKOSERVER_TAKOFORM_V2_CONFIG: process.env.TAKOSERVER_TAKOFORM_V2_CONFIG,
   TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: process.env.TAKOSERVER_TAKOFORM_V2_CURSOR_KEY,
 });
+// File-backed tariff loading can be designed separately; this release accepts inline JSON only.
+const billingConfig = parseBillingConfig(process.env.TAKOSERVER_BILLING_CONFIG);
+const hostedPricing = parseHostedPricing(process.env.TAKOSERVER_HOSTED_PRICING);
+if (hostedPricing) assertHostedPricingMatchesBilling(hostedPricing, billingConfig);
+const hostedBillingSelection = process.env.TAKOSERVER_HOSTED_BILLING;
+if (
+  hostedBillingSelection !== undefined &&
+  hostedBillingSelection !== "" &&
+  hostedBillingSelection !== "canonical-test"
+) {
+  throw new TypeError("TAKOSERVER_HOSTED_BILLING must be canonical-test or absent");
+}
+const canonicalHostedBilling = hostedBillingSelection === "canonical-test";
 const v2RuntimeSelection = parseSelfhostV2RuntimeBoot(
   process.env.TAKOSERVER_V2_WORKER_RUNTIME_BOOT,
 );
@@ -372,6 +398,51 @@ const providerMode = resolveStandaloneProviderMode({
   workerdPort: process.env.TAKOSERVER_WORKERD_PORT,
 });
 const currentCandidates = selectPublicHostFormSource(process.env.TAKOSERVER_FORM_SOURCE_CANDIDATE);
+// Reject an invalid financial realm before creating a data root or opening
+// SQLite; no invalid configuration may record a forward migration.
+const stripeMode = parseStripeMode(process.env.TAKOSERVER_STRIPE_MODE);
+const canonicalHostedInputs = canonicalHostedBilling
+  ? (() => {
+      if (process.env.TAKOSERVER_STRIPE_MODE !== "test" || !billingConfig || !hostedPricing) {
+        throw new TypeError(
+          "Canonical Hosted billing requires explicit TEST mode and complete published pricing",
+        );
+      }
+      const consoleOrigin = required("TAKOSERVER_CONSOLE_ORIGIN");
+      const origin = new URL(consoleOrigin);
+      const webhookSecret = required("STRIPE_WEBHOOK_SECRET").trim();
+      const settings = paymentSettingsFromEnvironment(process.env);
+      const publishedSettings = paymentSettingsFromEnvironment(hostedPricing.environment);
+      if (
+        origin.origin !== consoleOrigin ||
+        origin.username ||
+        origin.password ||
+        !["https:", "http:"].includes(origin.protocol) ||
+        !webhookSecret.startsWith("whsec_") ||
+        (settings.checkoutMinimumMinor !== undefined &&
+          settings.checkoutMinimumMinor !== publishedSettings.checkoutMinimumMinor) ||
+        (settings.checkoutMaximumMinor !== undefined &&
+          settings.checkoutMaximumMinor !== publishedSettings.checkoutMaximumMinor)
+      ) {
+        throw new TypeError(
+          "Canonical Hosted billing requires a canonical origin, webhook and published Checkout bounds",
+        );
+      }
+      return {
+        billingConfig,
+        pricing: hostedPricing,
+        client: createStripeBillingClient({
+          secretKey: required("STRIPE_SECRET_KEY"),
+          mode: "test",
+        }),
+        accountId: required("TAKOSERVER_HOSTED_BILLING_ACCOUNT_ID"),
+        billingAuthority: required("TAKOSERVER_HOSTED_BILLING_AUTHORITY"),
+        consoleOrigin,
+        webhookSecret,
+        settings: Object.freeze(settings),
+      };
+    })()
+  : undefined;
 
 // Organizations, keys, and the ledger are as durable as the files are: a
 // machine that forgets who its customers are, and what they are owed, on
@@ -454,7 +525,7 @@ controlDatabase.exec(`PRAGMA busy_timeout = ${SQLITE_CONTROL_BUSY_TIMEOUT_MS}`);
 // rather than repaired.
 const migrated = (() => {
   try {
-    return migrateSqlite(controlDatabase, controlInstallation);
+    return migrateSqlite(controlDatabase, { ...controlInstallation, stripeMode });
   } catch (error) {
     if (!(error instanceof UsedV1InstallationError)) throw error;
     controlDatabase.close();
@@ -467,6 +538,12 @@ if (migrated.applied.length > 0) {
   );
 }
 const sql = createSqliteSql(controlDatabase);
+// The sole migration writer has already committed the checked realm claim
+// atomically with any forward schema change; this is read-only verification.
+await assertStripeModeRealm(sql, stripeMode);
+// Wallet reads use the micros ledger even when optional billing is disabled.
+await assertOrgBillingSchema(sql, canonicalHostedBilling ? undefined : billingConfig);
+if (hostedPricing) await assertStripeBillingSchema(sql);
 /**
  * The port a published Worker endpoint address carries.
  *
@@ -1176,10 +1253,23 @@ const legacyPublicKeyJwk = await ensureOperatorKey({
 });
 const identityPublicKeyJwk = identityOnlyPublicKeyJwk ?? legacyPublicKeyJwk;
 
-const payment = resolvePayment({
-  stripeSecretKey: process.env.STRIPE_SECRET_KEY,
-  consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN,
-});
+const payment: ReturnType<typeof resolvePayment> = canonicalHostedInputs
+  ? {}
+  : resolvePayment({
+      hostedPricing,
+      stripeMode,
+      stripeSecretKey: process.env.STRIPE_SECRET_KEY,
+      stripeWebhookSecret: process.env.STRIPE_WEBHOOK_SECRET,
+      consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN,
+      settings: paymentSettingsFromEnvironment(process.env),
+    });
+if (payment.settlement && !payment.checkout) {
+  // Said once at startup: a key with no console still decides funding.
+  console.warn(
+    "takoserver: Stripe funding is on without TAKOSERVER_CONSOLE_ORIGIN; Checkout is not served, " +
+      "and Stripe verification, the webhook and the reconcile pass replace operator-signed funding",
+  );
+}
 
 const identity = resolveIdentity({
   ...(process.env.TAKOS_ID_ISSUER && process.env.TAKOS_ID_CLIENT_ID
@@ -1341,6 +1431,35 @@ async function closeBeforePublicIngress(): Promise<void> {
 }
 let app: ReturnType<typeof buildApp>;
 try {
+  // Qualify the selected existing realm; startup never binds or repairs one.
+  const hostedBilling = canonicalHostedInputs
+    ? await createCanonicalHostedBillingComposition({
+        sql,
+        clock,
+        billingConfig: canonicalHostedInputs.billingConfig,
+        pricing: canonicalHostedInputs.pricing,
+        client: canonicalHostedInputs.client,
+        realm: await verifyHostedBillingFinancialRealm({
+          sql,
+          reader: { client: canonicalHostedInputs.client },
+          expected: {
+            accountId: canonicalHostedInputs.accountId,
+            billingAuthority: canonicalHostedInputs.billingAuthority,
+            mode: "test",
+          },
+          prices: canonicalHostedInputs.pricing.hostedPlanTable.plans
+            .filter((plan) => plan.tier === "subscription")
+            .map((plan) => ({
+              priceId: plan.stripePriceId,
+              monthlyAmountMinor: plan.monthlyAmountMinor,
+            })),
+        }),
+        consoleOrigin: canonicalHostedInputs.consoleOrigin,
+        webhookSecret: canonicalHostedInputs.webhookSecret,
+        settings: canonicalHostedInputs.settings,
+        warnings: { state: "unavailable", reason: "transport-not-composed" },
+      })
+    : undefined;
   const v2FormFactory = completeV2WorkerForms
     ? runtimeInputKeyAuthority
       ? v2WorkerComposition.privateInputFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
@@ -1360,11 +1479,27 @@ try {
         ? createOperatorSettlement({ publicKeyJwk: legacyPublicKeyJwk })
         : unconfigured),
     v2: takoformV2Config,
+    ...(billingConfig ? { billingConfig } : {}),
+    hostedPaidFreeExclusion: Boolean(hostedPricing),
+    ...(hostedBilling ? { hostedBilling } : {}),
+    v2ArtifactSourceFactory: createSelfhostPublicArtifactSource,
     ...(v2FormFactory ? { v2FormFactory } : {}),
     ...(v2FormFactory && runtimeInputKeyAuthority
       ? { v2PrivateInputCustody: runtimeInputKeyAuthority.privateInputCustody }
       : {}),
     ...(payment.checkout ? { checkout: payment.checkout } : {}),
+    ...(payment.events ? { paymentEvents: payment.events } : {}),
+    ...((hostedBilling || payment.events) && identityPublicKeyJwk
+      ? {
+          operatorPaymentsReconcile: createOperatorPaymentsReconcileVerifier({
+            publicKeyJwk: identityPublicKeyJwk,
+            audience: publicOrigin,
+          }),
+        }
+      : {}),
+    // One process owns every pass here, and a pass outlives the request that
+    // started it, so the timer and the operator route may share one.
+    shareReconcilePass: true,
     publicOrigin,
     ...(process.env.TAKOSERVER_CONSOLE_ORIGIN
       ? { consoleOrigin: process.env.TAKOSERVER_CONSOLE_ORIGIN }
@@ -1531,12 +1666,12 @@ const handleContainerAndWorkerdShutdown = createSelfhostContainerSignalHandler(
       })) && shutdownClean;
   },
   () => {
-    // The entry lifecycle calls process.exit only after this ordered sequence
-    // and its ingress/request/pass drain have both been proved.
+    // Only a proved ordered close and ingress/request/pass drain permit a
+    // successful exit. An unproved stop terminates the Host with status 1.
     closeSequenceFinished = true;
   },
 );
-const entryShutdown = createSelfhostEntryShutdown({
+const entryShutdown = createSelfhostEntryProcessShutdown({
   stopIngress: async () => {
     const endpointClosings: Promise<void>[] = [];
     if (selfhostContainerEndpointHttps) {
@@ -1573,11 +1708,6 @@ const entryShutdown = createSelfhostEntryShutdown({
       throw new Error("self-host owned resources did not close cleanly");
     }
   },
-  onFailure: (stage) => {
-    process.exitCode = 1;
-    process.stderr.write(`self-host shutdown incomplete at ${stage}\n`);
-  },
-  onSuccess: () => process.exit(0),
 });
 
 /**
@@ -1636,6 +1766,18 @@ observedPasses.startInterval(
   },
   reportBackgroundFailure,
 );
+if (canonicalHostedInputs || payment.events) {
+  // The same cadence as the Worker's cron: payments whose payer never came
+  // back and whose webhook never arrived are credited within minutes.
+  observedPasses.startInterval(
+    "payment-reconcile",
+    5 * 60_000,
+    async () => {
+      await app.reconcilePayments();
+    },
+    reportBackgroundFailure,
+  );
+}
 observedPasses.startInterval(
   "takoform-v2",
   1_000,
@@ -1679,7 +1821,8 @@ observedPasses.startInterval(
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
   process.on(signal, () => {
     // Until the terminal shutdown proof completes, a natural event-loop exit
-    // must not be reported as a clean stop.
+    // must not be reported as a clean stop. A reported failure explicitly
+    // exits nonzero even if retained dependent listeners are still open.
     process.exitCode = 1;
     void entryShutdown.shutdown();
   });

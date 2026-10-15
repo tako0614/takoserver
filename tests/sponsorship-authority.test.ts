@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createEphemeralSql } from "../src/compat.ts";
 import { createLedger } from "../src/ledger.ts";
+import { minorToMicros } from "../src/money.ts";
 import {
   createSponsorshipAuthority,
   SponsorshipAuthorityError,
@@ -61,7 +62,9 @@ describe("route-less Hosted sponsorship authority", () => {
     await createLedger(sql, () => now).fund({
       organizationId: "org_hosted",
       fundingRef: "funding:hosted",
-      amountMinor: 2_000,
+      amountMicros: minorToMicros(2_000),
+      kind: "purchased",
+      consumptionClass: "purchased",
     });
     const issued: Parameters<SponsorshipCredentialIssuer["issue"]>[0][] = [];
     const authority = createSponsorshipAuthority({
@@ -125,7 +128,9 @@ describe("route-less Hosted sponsorship authority", () => {
     await createLedger(sql, () => now).fund({
       organizationId: "org_hosted",
       fundingRef: "funding:reconstruct",
-      amountMinor: 2_000,
+      amountMicros: minorToMicros(2_000),
+      kind: "purchased",
+      consumptionClass: "purchased",
     });
     const credentialKeys = (await crypto.subtle.generateKey({ name: "Ed25519" }, true, [
       "sign",
@@ -225,7 +230,9 @@ describe("route-less Hosted sponsorship authority", () => {
     await createLedger(sql, () => now).fund({
       organizationId: "org_hosted",
       fundingRef: "funding:hosted",
-      amountMinor: 1_000,
+      amountMicros: minorToMicros(1_000),
+      kind: "purchased",
+      consumptionClass: "purchased",
     });
     await sql.run(
       "INSERT INTO sponsorship_tenants (tenant_ref, org_id, created_at) VALUES (?, ?, ?)",
@@ -430,7 +437,7 @@ describe("route-less Hosted sponsorship authority", () => {
           await ledger.hold({
             organizationId: "org_hosted",
             reference: "hold:after-admission",
-            amountMinor: 1_000,
+            amountMicros: minorToMicros(1_000),
           }),
         ).toBe(true);
       },
@@ -462,7 +469,7 @@ describe("route-less Hosted sponsorship authority", () => {
       await fixture.ledger.hold({
         organizationId: "org_hosted",
         reference: "hold:after-first-issuance",
-        amountMinor: 1_000,
+        amountMicros: minorToMicros(1_000),
       }),
     ).toBe(true);
     fixture.state.current = new Date("2026-09-04T00:04:00.000Z");
@@ -515,7 +522,9 @@ async function managedFixture(options: ManagedFixtureOptions = {}) {
     await ledger.fund({
       organizationId: "org_hosted",
       fundingRef: "funding:managed",
-      amountMinor: options.fundAmount ?? 1_000,
+      amountMicros: minorToMicros(options.fundAmount ?? 1_000),
+      kind: "purchased",
+      consumptionClass: "purchased",
     });
   }
   const events: string[] = [];

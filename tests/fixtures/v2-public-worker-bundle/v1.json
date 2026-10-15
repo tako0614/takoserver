@@ -1,0 +1,11 @@
+{
+  "entrypoint": "src/main.mjs",
+  "files": [
+    {
+      "path": "src/main.mjs",
+      "url": "https://raw.githubusercontent.com/tako0614/takoserver/c51bc2393d869d27e8ca8c2d735d7f39705cad8e/tests/fixtures/v2-public-worker-bundle/v1.mjs",
+      "sha256": "51119092dfdf5ce76cb28ad8db9fb3792bf043972b2661304efdac1ce2e5927f",
+      "mediaType": "application/javascript+module"
+    }
+  ]
+}

@@ -118,6 +118,12 @@ behaviour exactly.
   the assertion was used therefore opens nothing and proves nothing. A copy
   that leaks before it was used is still a credential until it is used or
   expires, so keep startup output out of shared logs.
+- `POST /v1/operator/payments/reconcile`, served where Stripe is configured,
+  runs the payment reconcile pass across every organization. Only an
+  operator-signed `payments-reconcile` assertion starts it: it names this
+  Host's origin, lives at most a minute and is spent before the pass runs, so
+  a copy that leaks afterwards runs nothing. A session or API key never
+  starts it, whoever it belongs to.
 - The Host does not rate-limit requests. Guessing does not work against its
   credentials: sessions and API keys are random bearer secrets, and operator
   assertions need the operator's private key. Request floods and slow clients

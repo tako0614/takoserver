@@ -39,7 +39,8 @@ const FRESH_V2_MIGRATIONS = MIGRATIONS.slice(0, 75);
 const DATABASE_ID = "00000000-0000-4000-8000-000000000051";
 const TARGET_DATABASE = "takoserver-runtime-integration";
 const TARGET_BUCKET = "takoserver-objects-integration";
-const GENERATED_NAME = `takoserver-i-${GENERATION}`;
+const GENERATED_NAME = `integration-takoserver-${GENERATION}`;
+const LEGACY_GENERATED_NAME = `takoserver-i-${GENERATION}`;
 
 const target = {
   kind: "takoserver.deploy-target@v2",
@@ -279,6 +280,448 @@ async function rejectedError(operation: Promise<unknown>): Promise<Error> {
 }
 
 describe("integration storage generation bootstrap", () => {
+  test("closed invocation keeps legacy status read-only when its action accessor changes", async () => {
+    let actionReads = 0;
+    let applySetupReads = 0;
+    const selected = {
+      ...invocation,
+      get action(): IntegrationStorageGenerationInvocation["action"] {
+        actionReads += 1;
+        return actionReads <= 5 ? "status" : "apply";
+      },
+    };
+    const legacyTarget = {
+      ...target,
+      d1: { databaseName: LEGACY_GENERATED_NAME, databaseId: DATABASE_ID },
+      r2: { bucketName: LEGACY_GENERATED_NAME },
+    } satisfies DeployTarget;
+    const fixture = providerFixture({
+      existingD1: { name: LEGACY_GENERATED_NAME, uuid: DATABASE_ID },
+      existingR2: { name: LEGACY_GENERATED_NAME },
+    });
+    const result = await runIntegrationStorageGeneration(selected, legacyTarget, {
+      provider: fixture.provider,
+      get run(): IntegrationStorageGenerationProcess {
+        applySetupReads += 1;
+        throw new Error("status must not reach apply-only setup");
+      },
+      get review(): string {
+        applySetupReads += 1;
+        throw new Error("status must not reach apply-only setup");
+      },
+    });
+    expect(result.kind).toBe("takoserver.integration-storage-generation-status@v1");
+    expect(actionReads).toBe(1);
+    expect(applySetupReads).toBe(0);
+    expect(fixture.calls).toEqual([
+      `listD1:${LEGACY_GENERATED_NAME}`,
+      `listR2:${LEGACY_GENERATED_NAME}`,
+    ]);
+  });
+
+  test("captured context keeps status account and generation through a credential await", async () => {
+    const selected: {
+      -readonly [K in keyof IntegrationStorageGenerationInvocation]: IntegrationStorageGenerationInvocation[K];
+    } = { ...invocation, action: "status" };
+    const selectedTarget: { -readonly [K in keyof DeployTarget]: DeployTarget[K] } =
+      structuredClone(target);
+    let changed = false;
+    const calls: Request[] = [];
+    const result = await runIntegrationStorageGeneration(selected, selectedTarget, {
+      get cloudflareEnvironment() {
+        if (!changed) {
+          changed = true;
+          queueMicrotask(() => {
+            selectedTarget.accountId = "d".repeat(32);
+            selectedTarget.environment = "production";
+            selected.generation = "e".repeat(32);
+            selected.commit = "f".repeat(40);
+            selected.freshLineage = "v2-0092";
+          });
+        }
+        return { CLOUDFLARE_API_TOKEN: "synthetic-noncredential-fixture" };
+      },
+      async fetcher(request) {
+        calls.push(request);
+        return jsonResponse({
+          success: true,
+          result: new URL(request.url).pathname.endsWith("/r2/buckets") ? { buckets: [] } : [],
+        });
+      },
+    });
+    expect(changed).toBe(true);
+    expect(selectedTarget.environment).toBe("production");
+    expect(result).toMatchObject({
+      environment: "integration",
+      selectedCommit: COMMIT,
+      generation: GENERATION,
+      d1: { databaseName: GENERATED_NAME },
+      r2: { bucketName: GENERATED_NAME },
+    });
+    expect(result.freshLineage).toBeUndefined();
+    expect(calls).toHaveLength(2);
+    for (const request of calls) {
+      const url = new URL(request.url);
+      expect(request.method).toBe("GET");
+      expect(url.pathname).toContain(`/accounts/${target.accountId}/`);
+      expect(url.searchParams.get("name") ?? url.searchParams.get("name_contains")).toBe(
+        GENERATED_NAME,
+      );
+    }
+  });
+
+  test("captured context keeps apply payload and nested target identity through qualification", async () => {
+    const selected: {
+      -readonly [K in keyof IntegrationStorageGenerationInvocation]: IntegrationStorageGenerationInvocation[K];
+    } = { ...invocation, freshLineage: "v2-artifacts-0075" };
+    const selectedD1 = { ...target.d1 };
+    const selectedR2 = { ...target.r2 };
+    const selectedTarget: { -readonly [K in keyof DeployTarget]: DeployTarget[K] } = {
+      ...target,
+      d1: selectedD1,
+      r2: selectedR2,
+    };
+    const fixture = providerFixture();
+    const process = processFixture();
+    const accounts: string[] = [];
+    const names: string[] = [];
+    let changed = false;
+    let reads = 0;
+    const result = await runIntegrationStorageGeneration(selected, selectedTarget, {
+      ...options(fixture.provider, [emptyState, completeV2ArtifactState], process),
+      async run(command) {
+        if (!changed) {
+          changed = true;
+          queueMicrotask(() => {
+            selectedTarget.accountId = "d".repeat(32);
+            selectedTarget.environment = "production";
+            selectedD1.databaseId = DATABASE_ID;
+            selectedD1.databaseName = GENERATED_NAME;
+            selectedR2.bucketName = GENERATED_NAME;
+            selected.generation = "e".repeat(32);
+            selected.commit = "f".repeat(40);
+            selected.freshLineage = "v2-0092";
+          });
+        }
+        return await process.run(command);
+      },
+      async readD1State(_phase, input) {
+        const config: { account_id: string } = JSON.parse(readFileSync(input.configPath, "utf8"));
+        accounts.push(config.account_id);
+        names.push(input.databaseName);
+        return reads++ === 0 ? emptyState : completeV2ArtifactState;
+      },
+    });
+    expect(changed).toBe(true);
+    expect(result).toMatchObject({
+      commit: COMMIT,
+      generation: GENERATION,
+      freshLineage: "v2-artifacts-0075",
+    });
+    expect(accounts).toEqual([target.accountId, target.accountId]);
+    expect(names).toEqual([GENERATED_NAME, GENERATED_NAME]);
+    expect(process.importDigests).toHaveLength(1);
+    expect(fixture.calls.filter((call) => call.startsWith("create"))).toEqual([
+      `createD1:${GENERATED_NAME}`,
+      `createR2:${GENERATED_NAME}`,
+    ]);
+  });
+
+  test("captured context keeps read-side target account and nested pair through credential await", async () => {
+    const selectedD1 = { databaseName: GENERATED_NAME, databaseId: DATABASE_ID };
+    const selectedR2 = { bucketName: GENERATED_NAME };
+    const selectedTarget: { -readonly [K in keyof DeployTarget]: DeployTarget[K] } = {
+      ...target,
+      d1: selectedD1,
+      r2: selectedR2,
+    };
+    let changed = false;
+    const calls: Request[] = [];
+    const accounts: string[] = [];
+    const proof = await verifyFreshV2ArtifactIntegrationStorageTarget(
+      selectedTarget,
+      "integration",
+      {
+        migrationDirectory: currentMigrations,
+        get cloudflareEnvironment() {
+          if (!changed) {
+            changed = true;
+            queueMicrotask(() => {
+              selectedTarget.accountId = "d".repeat(32);
+              selectedTarget.environment = "production";
+              selectedD1.databaseName = LEGACY_GENERATED_NAME;
+              selectedD1.databaseId = target.d1.databaseId;
+              selectedR2.bucketName = LEGACY_GENERATED_NAME;
+            });
+          }
+          return { CLOUDFLARE_API_TOKEN: "synthetic-noncredential-fixture" };
+        },
+        async fetcher(request) {
+          calls.push(request);
+          return jsonResponse({
+            success: true,
+            result: new URL(request.url).pathname.includes("/d1/database/")
+              ? { name: GENERATED_NAME, uuid: DATABASE_ID }
+              : { name: GENERATED_NAME },
+          });
+        },
+        async readD1State(_phase, input) {
+          const config: { account_id: string } = JSON.parse(readFileSync(input.configPath, "utf8"));
+          accounts.push(config.account_id);
+          return completeV2ArtifactState;
+        },
+      },
+    );
+    expect(changed).toBe(true);
+    expect(proof).toMatchObject({
+      generation: GENERATION,
+      d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID },
+      r2: { bucketName: GENERATED_NAME },
+    });
+    expect(accounts).toEqual([target.accountId]);
+    expect(calls).toHaveLength(2);
+    for (const request of calls) {
+      expect(request.method).toBe("GET");
+      expect(new URL(request.url).pathname).toContain(`/accounts/${target.accountId}/`);
+    }
+  });
+
+  test("legacy selected generation status and schema proof use only exact read operations", async () => {
+    const legacyTarget = {
+      ...target,
+      d1: { databaseName: LEGACY_GENERATED_NAME, databaseId: DATABASE_ID },
+      r2: { bucketName: LEGACY_GENERATED_NAME },
+    } satisfies DeployTarget;
+    const fixture = providerFixture({
+      existingD1: { name: LEGACY_GENERATED_NAME, uuid: DATABASE_ID },
+      existingR2: { name: LEGACY_GENERATED_NAME },
+      createdD1: { name: LEGACY_GENERATED_NAME, uuid: DATABASE_ID },
+    });
+    const process = processFixture();
+    const result = await runIntegrationStorageGeneration(
+      { ...invocation, action: "status", freshLineage: "v2-artifacts-0075" },
+      legacyTarget,
+      options(fixture.provider, [completeV2ArtifactState], process),
+    );
+    expect(result).toMatchObject({
+      d1: { databaseName: LEGACY_GENERATED_NAME, databaseId: DATABASE_ID },
+      r2: { bucketName: LEGACY_GENERATED_NAME },
+      targetSelection: { d1: true, r2: true, databaseIdExact: true },
+      readyForApply: false,
+      schemaReadback: "complete-0075",
+    });
+    const proof = await verifyFreshV2ArtifactIntegrationStorageTarget(
+      legacyTarget,
+      "integration",
+      options(fixture.provider, [completeV2ArtifactState], process),
+    );
+    expect(proof.generation).toBe(GENERATION);
+    expect(proof.d1.databaseName).toBe(LEGACY_GENERATED_NAME);
+    expect(fixture.calls).toEqual([
+      `listD1:${LEGACY_GENERATED_NAME}`,
+      `listR2:${LEGACY_GENERATED_NAME}`,
+      `getD1:${DATABASE_ID}`,
+      `getD1:${DATABASE_ID}`,
+      `getR2:${LEGACY_GENERATED_NAME}`,
+    ]);
+    expect(process.commands).toEqual([]);
+  });
+
+  test("legacy same-generation apply and partial legacy selections refuse before any external seam", async () => {
+    for (const selected of [
+      {
+        ...target,
+        d1: { databaseName: LEGACY_GENERATED_NAME, databaseId: DATABASE_ID },
+        r2: { bucketName: LEGACY_GENERATED_NAME },
+      },
+      { ...target, d1: { databaseName: LEGACY_GENERATED_NAME, databaseId: DATABASE_ID } },
+      { ...target, r2: { bucketName: LEGACY_GENERATED_NAME } },
+      {
+        ...target,
+        d1: { databaseName: LEGACY_GENERATED_NAME, databaseId: DATABASE_ID },
+        r2: { bucketName: GENERATED_NAME },
+      },
+    ]) {
+      const fixture = providerFixture();
+      let externalReads = 0;
+      const forbidden = (): never => {
+        externalReads += 1;
+        throw new Error("legacy selection must fail before external setup");
+      };
+      await expect(
+        runIntegrationStorageGeneration(invocation, selected, {
+          get provider() {
+            return forbidden();
+          },
+          get run() {
+            return forbidden();
+          },
+          get review() {
+            return forbidden();
+          },
+        }),
+      ).rejects.toThrow("legacy integration storage is read-only");
+      expect(externalReads).toBe(0);
+      expect(fixture.calls).toEqual([]);
+      if (selected.d1.databaseName !== selected.r2.bucketName) {
+        await expect(
+          runIntegrationStorageGeneration({ ...invocation, action: "status" }, selected, {
+            provider: fixture.provider,
+          }),
+        ).rejects.toThrow("legacy integration status requires the exact matching pair");
+        expect(fixture.calls).toEqual([]);
+      }
+    }
+  });
+
+  test("legacy exact status never falls back to a new prefixed pair or admits a foreign UUID", async () => {
+    const selected = {
+      ...target,
+      d1: { databaseName: LEGACY_GENERATED_NAME, databaseId: DATABASE_ID },
+      r2: { bucketName: LEGACY_GENERATED_NAME },
+    } satisfies DeployTarget;
+    const absent = providerFixture({
+      existingD1: { name: GENERATED_NAME, uuid: DATABASE_ID },
+      existingR2: { name: GENERATED_NAME },
+    });
+    const result = await runIntegrationStorageGeneration(
+      { ...invocation, action: "status" },
+      selected,
+      { provider: absent.provider },
+    );
+    expect(result).toMatchObject({
+      presence: "absent",
+      readyForApply: false,
+      d1: { databaseName: LEGACY_GENERATED_NAME, present: false },
+      r2: { bucketName: LEGACY_GENERATED_NAME, present: false },
+    });
+    expect(absent.calls).toEqual([
+      `listD1:${LEGACY_GENERATED_NAME}`,
+      `listR2:${LEGACY_GENERATED_NAME}`,
+    ]);
+    const foreign = providerFixture({
+      existingD1: { name: LEGACY_GENERATED_NAME, uuid: target.d1.databaseId },
+      existingR2: { name: LEGACY_GENERATED_NAME },
+    });
+    const mismatched = await runIntegrationStorageGeneration(
+      { ...invocation, action: "status" },
+      selected,
+      { provider: foreign.provider },
+    );
+    expect(mismatched).toMatchObject({
+      targetSelection: { d1: true, r2: true, databaseIdExact: false },
+      readyForApply: false,
+    });
+    const unknown = { ...selected, r2: { bucketName: `${LEGACY_GENERATED_NAME}-other` } };
+    await expect(
+      verifyIntegrationStorageGenerationTarget(unknown, "integration", {
+        provider: foreign.provider,
+      }),
+    ).rejects.toThrow("exact matching generated D1/R2 storage pair");
+    expect(foreign.calls).toEqual([
+      `listD1:${LEGACY_GENERATED_NAME}`,
+      `listR2:${LEGACY_GENERATED_NAME}`,
+    ]);
+  });
+
+  test("prefixed fresh 0089 generation keeps the fixed payload and one actual local SQL import", async () => {
+    const migrations = MIGRATIONS.slice(0, 89);
+    const shape = applicationShape(currentMigrations, 89);
+    const database = new Database(":memory:");
+    const fixture = providerFixture();
+    const process = processFixture();
+    const importPaths: string[] = [];
+    try {
+      const result = await runIntegrationStorageGeneration(
+        { ...invocation, freshLineage: "v2-0089" },
+        target,
+        {
+          ...options(
+            fixture.provider,
+            [
+              emptyState,
+              stateWithShape(
+                migrations.map(({ name }) => name),
+                shape,
+              ),
+            ],
+            process,
+          ),
+          async run(command) {
+            if (command.includes("execute") && command.includes("--file")) {
+              const path = command[command.indexOf("--file") + 1];
+              if (path === undefined) throw new Error("missing import path");
+              importPaths.push(path);
+              database.exec(readFileSync(path, "utf8"));
+            }
+            return await process.run(command);
+          },
+          freshV2DataReader: {
+            async read() {
+              const tables = database
+                .query<{ name: string }, []>(
+                  "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' " +
+                    "AND name NOT IN ('d1_migrations', '_cf_KV')",
+                )
+                .all();
+              const tableCounts: Record<string, number> = {};
+              for (const { name } of tables) {
+                const count = database
+                  .query<{ count: number }, []>(`SELECT COUNT(*) AS count FROM "${name}"`)
+                  .get();
+                if (count === null) throw new Error("missing table count");
+                tableCounts[name] = count.count;
+              }
+              const ledger = database
+                .query<{ count: number }, []>("SELECT COUNT(*) AS count FROM d1_migrations")
+                .get();
+              if (ledger === null) throw new Error("missing ledger count");
+              return {
+                tableCounts,
+                ledgerRows: ledger.count,
+                foreignKeyViolations: database.query("PRAGMA foreign_key_check").all().length,
+                invocationEpoch: database
+                  .query<Record<string, unknown>, []>(
+                    "SELECT * FROM tf_cloudflare_provider_invocation_epoch",
+                  )
+                  .all(),
+                acceptanceCounter: database
+                  .query<Record<string, unknown>, []>(
+                    "SELECT * FROM tf_v2_operation_acceptance_counter",
+                  )
+                  .all(),
+              };
+            },
+          },
+        },
+      );
+      expect(result).toMatchObject({
+        freshLineage: "v2-0089",
+        migrationDigest: "sha256:44d5cd59a772c51877d32f2f448ff929b7a50e0792ac99dea3522b1cb01545fa",
+        appliedMigrations: migrations.map(({ name }) => name),
+        d1: { databaseName: GENERATED_NAME, databaseId: DATABASE_ID },
+        r2: { bucketName: GENERATED_NAME },
+      });
+      expect(importPaths).toHaveLength(1);
+      expect(process.importDigests).toHaveLength(1);
+      expect(result.migrationImportDigest).toBe(process.importDigests[0]);
+      expect(fixture.calls).toEqual([
+        `listD1:${GENERATED_NAME}`,
+        `listR2:${GENERATED_NAME}`,
+        `listD1:${GENERATED_NAME}`,
+        `listR2:${GENERATED_NAME}`,
+        `createD1:${GENERATED_NAME}`,
+        `getD1:${DATABASE_ID}`,
+        `getD1:${DATABASE_ID}`,
+        `listR2:${GENERATED_NAME}`,
+        `createR2:${GENERATED_NAME}`,
+        `getR2:${GENERATED_NAME}`,
+      ]);
+    } finally {
+      database.close();
+    }
+  });
+
   test("storage rebind verifier proves the exact generated D1/R2 target and audited schema read-only", async () => {
     const generatedTarget = {
       ...target,
@@ -796,13 +1239,14 @@ describe("integration storage generation bootstrap", () => {
       try {
         const migrationDirectory = join(root, "migrations");
         cpSync(currentMigrations, migrationDirectory, { recursive: true });
-        const tail = join(migrationDirectory, "0090_v2_queue_sqlite_external_drain.sql");
-        if (drift === "missing") rmSync(tail);
+        const tail = join(migrationDirectory, "0094_wallet_usd_micros.sql");
+        if (drift === "missing")
+          rmSync(join(migrationDirectory, "0099_hosted_billing_extensions.sql"));
         else if (drift === "changed") {
           writeFileSync(tail, `${readFileSync(tail, "utf8")}\n-- changed\n`);
         } else {
           writeFileSync(
-            join(migrationDirectory, "0091_unreviewed.sql"),
+            join(migrationDirectory, "0100_unreviewed.sql"),
             "CREATE TABLE unreviewed (id TEXT);\n",
           );
         }
@@ -819,7 +1263,7 @@ describe("integration storage generation bootstrap", () => {
           ).rejects.toThrow(
             drift === "changed"
               ? "exact audited migration SHA-256"
-              : "audited migration lineage must contain exactly 0001-0090",
+              : "audited migration lineage must contain exactly 0001-0099",
           );
         }
         expect(fixture.calls).toEqual([]);
@@ -1277,7 +1721,7 @@ describe("integration storage generation bootstrap", () => {
     expect(error.stack).not.toContain("secret should not escape");
     const tail = join(fixtureRoot, "tail-migrations");
     copyCurrentSchemaFixture(tail);
-    writeFileSync(join(tail, "0091_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
+    writeFileSync(join(tail, "0100_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
     for (const migrationDirectory of [auditedMigrations, tail]) {
       const refusedProvider = providerFixture();
       await expect(
@@ -1285,7 +1729,7 @@ describe("integration storage generation bootstrap", () => {
           ...options(refusedProvider.provider),
           migrationDirectory,
         }),
-      ).rejects.toThrow("exactly 0001-0090");
+      ).rejects.toThrow("exactly 0001-0099");
       expect(refusedProvider.calls).toEqual([]);
     }
   });

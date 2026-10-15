@@ -1,4 +1,5 @@
 import { canonicalDigest } from "./json.ts";
+import { minorToMicros } from "./money.ts";
 import type { Clock, Sql, SqlWrite } from "./ports.ts";
 import type { SponsorshipCredentialIssuer } from "./sponsorship-credential.ts";
 import type {
@@ -276,15 +277,15 @@ const WALLET_CTE = `WITH wallet AS (
     COALESCE((
       SELECT SUM(CASE
         WHEN lot.expires_at IS NULL OR lot.expires_at > ? THEN
-          lot.amount_minor - COALESCE((
-            SELECT SUM(allocation.amount_minor)
+          lot.amount_micros - COALESCE((
+            SELECT SUM(allocation.amount_micros)
             FROM wallet_credit_allocations AS allocation
             WHERE allocation.org_id = lot.org_id
               AND allocation.lot_ref = lot.ref
               AND allocation.debit_type IN ('capture', 'usage_debit')
           ), 0)
         ELSE COALESCE((
-          SELECT SUM(allocation.amount_minor)
+          SELECT SUM(allocation.amount_micros)
           FROM wallet_credit_allocations AS allocation
           WHERE allocation.org_id = lot.org_id
             AND allocation.lot_ref = lot.ref
@@ -293,26 +294,31 @@ const WALLET_CTE = `WITH wallet AS (
       END)
       FROM wallet_credit_lots AS lot
       WHERE lot.org_id = organization.id
-    ), 0) AS settled_minor,
+    ), 0) AS settled_micros,
     COALESCE((
-      SELECT SUM(entry.held_delta)
+      SELECT SUM(entry.held_delta_micros)
       FROM ledger AS entry
       WHERE entry.org_id = organization.id
-    ), 0) AS held_minor,
+    ), 0) AS held_micros,
     COALESCE((
-      SELECT SUM(allocation.amount_minor)
+      SELECT SUM(allocation.amount_micros)
       FROM wallet_credit_allocations AS allocation
       WHERE allocation.org_id = organization.id
         AND allocation.debit_type = 'hold'
-    ), 0) AS allocated_held_minor
+    ), 0) AS allocated_held_micros
   FROM orgs AS organization
   WHERE organization.id = ?
 )`;
 
-const WALLET_ELIGIBILITY = `settled_minor >= 0
-  AND held_minor >= 0
-  AND allocated_held_minor = held_minor
-  AND settled_minor - held_minor >= ?`;
+const WALLET_ELIGIBILITY = `typeof(settled_micros) = 'integer'
+  AND typeof(held_micros) = 'integer'
+  AND typeof(allocated_held_micros) = 'integer'
+  AND settled_micros BETWEEN 0 AND 9007199254740991
+  AND held_micros BETWEEN 0 AND 9007199254740991
+  AND allocated_held_micros BETWEEN 0 AND 9007199254740991
+  AND settled_micros >= held_micros
+  AND allocated_held_micros = held_micros
+  AND settled_micros - held_micros >= ?`;
 
 function issuanceTime(now: Date): IssuanceTime {
   const issuedAtEpochSeconds = Math.floor(now.getTime() / 1_000);
@@ -447,7 +453,8 @@ async function claimManagedTenant(input: {
       input.organizationId,
       input.tenantRef,
       input.time.createdAt,
-      input.requiredAvailableMinor,
+      // The signed/legacy request slot remains external cents; compare only after checked conversion to canonical wallet micros.
+      minorToMicros(input.requiredAvailableMinor),
       input.tenantRef,
       input.tenantRef,
     ],
@@ -518,7 +525,8 @@ async function insertIssuanceOperation(input: {
       input.issuanceAuthority.sourceCommit,
       input.issuanceAuthority.artifactSha256,
       input.time.createdAt,
-      input.input.requiredAvailableMinor,
+      // Preserve the receipt/fingerprint cents boundary; only the SQL wallet threshold is USD micros.
+      minorToMicros(input.input.requiredAvailableMinor),
       ...tenantParams,
     ],
   );

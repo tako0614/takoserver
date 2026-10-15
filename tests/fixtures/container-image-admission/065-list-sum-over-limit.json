@@ -1,0 +1,49 @@
+{
+  "id": "065-list-sum-over-limit",
+  "category": "manifest-list",
+  "description": "The size limit applies to the selected image rather than the sum of every platform.",
+  "input": {
+    "imageRef": "registry.example.test/workload@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    },
+    "registry": {
+      "visibility": "public"
+    },
+    "manifest": {
+      "kind": "list",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "manifests": [
+        {
+          "kind": "image",
+          "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "platform": {
+            "os": "linux",
+            "architecture": "amd64"
+          },
+          "sizeBytes": 1100000000
+        },
+        {
+          "kind": "image",
+          "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "platform": {
+            "os": "linux",
+            "architecture": "arm64",
+            "variant": "v8"
+          },
+          "sizeBytes": 1100000000
+        }
+      ]
+    }
+  },
+  "expected": {
+    "decision": "accept",
+    "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "sizeBytes": 1100000000,
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    }
+  }
+}

@@ -39,6 +39,7 @@ import {
   type LoadedFormAuthorityScopeTransition,
 } from "./form-authority-scope-transition.ts";
 import {
+  assertStorageRebindNotOperatorStagingPair,
   type IntegrationStorageGenerationTargetVerificationOptions,
   isGeneratedIntegrationStorageTarget,
   verifyIntegrationStorageGenerationTarget,
@@ -406,6 +407,7 @@ async function runFormAuthorityWithLease(
       : normalizedWorkerClosureDelta(invocation.transition.delta);
   if (transitionDelta !== null) {
     assertStorageRebindIntegrationOnly("preflight", invocation.environment, transitionDelta);
+    assertStorageRebindNotOperatorStagingPair(target, transitionDelta.storageRebind);
     assertServiceBindingRefreshIntegrationOnly(
       "preflight",
       invocation.environment,

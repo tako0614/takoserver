@@ -5,6 +5,7 @@ import {
 } from "./artifact-consumer-repair.ts";
 import { RESOURCE_EXECUTION_EVIDENCE_FORMAT } from "./resource-execution-evidence.ts";
 import { ROUTES, TAKOFORM_LANES, TAKOFORM_ROUTES, takoformRoutePattern } from "./route-table.ts";
+import { SUBSCRIPTION_COMMAND_RECEIPT_VERSION } from "./subscription-command-receipts.ts";
 import { SPACE_ID_MAX_CODE_POINTS, SPACE_ID_PATTERN_SOURCE } from "./takoform/space-id.ts";
 import { TAKOFORM_V2_OPERATIONS, TAKOFORM_V2_SCHEMAS } from "./takoform-v2/openapi.ts";
 
@@ -44,6 +45,395 @@ const OPERATION_KEY_SCHEMA = {
   minLength: 8,
   maxLength: 128,
   pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$",
+} as const;
+const BILLING_REFERENCE_SCHEMA = {
+  type: "string",
+  minLength: 1,
+  maxLength: 128,
+  pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+  description:
+    "Opaque, non-reusable Organization billing reference; URL-encode it as one path component.",
+} as const;
+const SUBSCRIPTION_REF_SCHEMA = {
+  type: "string",
+  minLength: 68,
+  maxLength: 68,
+  pattern: "^sra_[0-9a-f]{64}$",
+  description: "Opaque expected subscription target; not an authorization credential.",
+} as const;
+function subscriptionReceiptResponseSchema(
+  component: "SubscriptionCheckoutResponse" | "SubscriptionCancellationResponse",
+  field: "checkout" | "cancellation",
+  states: readonly string[],
+) {
+  return {
+    allOf: [
+      { $ref: `#/components/schemas/${component}` },
+      {
+        type: "object",
+        properties: {
+          [field]: { type: "object", properties: { state: { enum: states } } },
+        },
+      },
+    ],
+  };
+}
+const ORGANIZATION_ID_PARAMETER = {
+  name: "organizationId",
+  in: "path",
+  required: true,
+  schema: IDENTIFIER_SCHEMA,
+} as const;
+const SUBSCRIPTION_TARGET_SCHEMA = SUBSCRIPTION_REF_SCHEMA;
+const CHECKOUT_URL_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["url"],
+  properties: { url: { type: "string", format: "uri" } },
+} as const;
+const PENDING_CHANGE_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["planKey", "pricingRevision", "effectiveAt"],
+  properties: {
+    planKey: { type: "string", minLength: 1, maxLength: 64 },
+    pricingRevision: { $ref: "#/components/schemas/BillingRevision" },
+    effectiveAt: { $ref: "#/components/schemas/BillingUtcDateTime" },
+  },
+} as const;
+const SUBSCRIPTION_COMMAND_NULL_SCHEMA = { type: "null" } as const;
+const SUBSCRIPTION_COMMAND_PLAN_KEY_SCHEMA = {
+  type: "string",
+  minLength: 1,
+  maxLength: 64,
+} as const;
+const SUBSCRIPTION_COMMAND_REVISION_SCHEMA = {
+  $ref: "#/components/schemas/BillingRevision",
+} as const;
+const SUBSCRIPTION_COMMAND_TIME_SCHEMA = {
+  $ref: "#/components/schemas/BillingUtcDateTime",
+} as const;
+const SUBSCRIPTION_COMMAND_RECEIPT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: [
+    "contractVersion",
+    "organizationId",
+    "reference",
+    "kind",
+    "state",
+    "subscriptionRef",
+    "planKey",
+    "pricingRevision",
+    "checkout",
+    "effectiveAt",
+    "pendingChange",
+    "lifecycle",
+  ],
+  properties: {
+    contractVersion: { const: SUBSCRIPTION_COMMAND_RECEIPT_VERSION },
+    organizationId: IDENTIFIER_SCHEMA,
+    reference: BILLING_REFERENCE_SCHEMA,
+    kind: { enum: ["start", "cancel", "plan-change"] },
+    state: { enum: ["pending", "open", "associated", "expired", "invalidated", "verified"] },
+    subscriptionRef: { anyOf: [SUBSCRIPTION_REF_SCHEMA, SUBSCRIPTION_COMMAND_NULL_SCHEMA] },
+    planKey: { anyOf: [SUBSCRIPTION_COMMAND_PLAN_KEY_SCHEMA, SUBSCRIPTION_COMMAND_NULL_SCHEMA] },
+    pricingRevision: {
+      anyOf: [SUBSCRIPTION_COMMAND_REVISION_SCHEMA, SUBSCRIPTION_COMMAND_NULL_SCHEMA],
+    },
+    checkout: { anyOf: [CHECKOUT_URL_SCHEMA, SUBSCRIPTION_COMMAND_NULL_SCHEMA] },
+    effectiveAt: { anyOf: [SUBSCRIPTION_COMMAND_TIME_SCHEMA, SUBSCRIPTION_COMMAND_NULL_SCHEMA] },
+    pendingChange: { anyOf: [PENDING_CHANGE_SCHEMA, SUBSCRIPTION_COMMAND_NULL_SCHEMA] },
+    lifecycle: {
+      enum: [
+        "pending",
+        "open",
+        "associated",
+        "expired",
+        "invalidated",
+        "scheduled",
+        "activated",
+        "revoked",
+      ],
+    },
+  },
+  oneOf: [
+    ...(["pending", "open", "associated", "expired", "invalidated"] as const).map((state) => ({
+      properties: {
+        kind: { const: "start" },
+        state: { const: state },
+        lifecycle: { const: state },
+        subscriptionRef:
+          state === "associated" ? SUBSCRIPTION_REF_SCHEMA : SUBSCRIPTION_COMMAND_NULL_SCHEMA,
+        planKey: SUBSCRIPTION_COMMAND_PLAN_KEY_SCHEMA,
+        pricingRevision: SUBSCRIPTION_COMMAND_REVISION_SCHEMA,
+        checkout:
+          state === "open"
+            ? CHECKOUT_URL_SCHEMA
+            : state === "associated"
+              ? { anyOf: [CHECKOUT_URL_SCHEMA, SUBSCRIPTION_COMMAND_NULL_SCHEMA] }
+              : SUBSCRIPTION_COMMAND_NULL_SCHEMA,
+        effectiveAt: SUBSCRIPTION_COMMAND_NULL_SCHEMA,
+        pendingChange: SUBSCRIPTION_COMMAND_NULL_SCHEMA,
+      },
+    })),
+    ...(["pending", "verified"] as const).map((state) => ({
+      properties: {
+        kind: { const: "cancel" },
+        state: { const: state },
+        lifecycle: { const: state === "pending" ? "pending" : "scheduled" },
+        subscriptionRef: SUBSCRIPTION_REF_SCHEMA,
+        checkout: SUBSCRIPTION_COMMAND_NULL_SCHEMA,
+        effectiveAt:
+          state === "pending" ? SUBSCRIPTION_COMMAND_NULL_SCHEMA : SUBSCRIPTION_COMMAND_TIME_SCHEMA,
+        pendingChange: SUBSCRIPTION_COMMAND_NULL_SCHEMA,
+      },
+    })),
+    ...(["pending", "verified"] as const).map((state) => ({
+      properties: {
+        kind: { const: "plan-change" },
+        state: { const: state },
+        lifecycle:
+          state === "pending"
+            ? { const: "pending" }
+            : { enum: ["scheduled", "activated", "revoked"] },
+        subscriptionRef: SUBSCRIPTION_REF_SCHEMA,
+        planKey: SUBSCRIPTION_COMMAND_PLAN_KEY_SCHEMA,
+        pricingRevision: SUBSCRIPTION_COMMAND_REVISION_SCHEMA,
+        checkout: SUBSCRIPTION_COMMAND_NULL_SCHEMA,
+        effectiveAt: SUBSCRIPTION_COMMAND_TIME_SCHEMA,
+        pendingChange:
+          state === "pending" ? SUBSCRIPTION_COMMAND_NULL_SCHEMA : PENDING_CHANGE_SCHEMA,
+      },
+    })),
+  ],
+} as const;
+const PENDING_SUBSCRIPTION_RECEIPT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["state", "subscriptionRef"],
+  properties: { state: { const: "pending" }, subscriptionRef: SUBSCRIPTION_TARGET_SCHEMA },
+} as const;
+const WORKSPACE_AMOUNTS_PROPERTIES = {
+  usedMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+  heldMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+  pendingMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+} as const;
+const BILLING_ATTRIBUTION_PROPERTIES = {
+  workspaceRef: { anyOf: [BILLING_REFERENCE_SCHEMA, { type: "null" }] },
+  attributionPeriodStart: {
+    anyOf: [{ $ref: "#/components/schemas/BillingUtcDateTime" }, { type: "null" }],
+  },
+  attributionPeriodEnd: {
+    anyOf: [{ $ref: "#/components/schemas/BillingUtcDateTime" }, { type: "null" }],
+  },
+} as const;
+
+const HOSTED_BILLING_SCHEMAS = {
+  CreatePersonalOrganizationRequest: {
+    type: "object",
+    additionalProperties: false,
+    maxProperties: 0,
+  },
+  PersonalOrganizationResponse: {
+    type: "object",
+    additionalProperties: false,
+    required: ["organization", "created"],
+    properties: {
+      created: { type: "boolean" },
+      organization: {
+        type: "object",
+        additionalProperties: false,
+        required: ["id", "name", "ownerPrincipalId", "createdAt"],
+        properties: {
+          id: IDENTIFIER_SCHEMA,
+          name: { type: "string", minLength: 1, maxLength: 128 },
+          ownerPrincipalId: IDENTIFIER_SCHEMA,
+          createdAt: { $ref: "#/components/schemas/BillingUtcDateTime" },
+        },
+      },
+    },
+  },
+  BeginWalletCheckoutRequest: {
+    oneOf: [
+      {
+        type: "object",
+        additionalProperties: false,
+        required: ["reference", "amountMinor"],
+        properties: {
+          reference: BILLING_REFERENCE_SCHEMA,
+          amountMinor: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+        },
+      },
+      {
+        type: "object",
+        additionalProperties: false,
+        required: ["amountMinor"],
+        description: "Independent legacy owner-session lane only",
+        properties: {
+          amountMinor: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+        },
+      },
+    ],
+  },
+  WalletCheckoutResponse: {
+    type: "object",
+    additionalProperties: false,
+    required: ["checkout"],
+    properties: { checkout: CHECKOUT_URL_SCHEMA },
+  },
+  WalletCheckoutReceipt: {
+    type: "object",
+    additionalProperties: false,
+    required: ["reference", "state", "checkout"],
+    properties: {
+      reference: BILLING_REFERENCE_SCHEMA,
+      state: { type: "string", enum: ["pending", "ready", "paid", "expired"] },
+      checkout: { anyOf: [CHECKOUT_URL_SCHEMA, { type: "null" }] },
+    },
+  },
+  WalletWorkspaceUsageAmounts: {
+    type: "object",
+    additionalProperties: false,
+    required: ["usedMicros", "heldMicros", "pendingMicros"],
+    properties: WORKSPACE_AMOUNTS_PROPERTIES,
+  },
+  WalletWorkspaceUsageResponse: {
+    type: "object",
+    additionalProperties: false,
+    required: [
+      "organizationId",
+      "snapshotAt",
+      "periodStart",
+      "periodEnd",
+      "unit",
+      "totalsScope",
+      "totals",
+      "usageSummary",
+      "workspaces",
+      "unattributed",
+      "cursor",
+    ],
+    properties: {
+      organizationId: IDENTIFIER_SCHEMA,
+      snapshotAt: { $ref: "#/components/schemas/BillingUtcDateTime" },
+      periodStart: { $ref: "#/components/schemas/BillingUtcDateTime" },
+      periodEnd: { $ref: "#/components/schemas/BillingUtcDateTime" },
+      unit: { const: "USD-micros" },
+      totalsScope: { const: "organization" },
+      totals: { $ref: "#/components/schemas/WalletWorkspaceUsageAmounts" },
+      usageSummary: {
+        $ref: "#/components/schemas/WalletUsageSummaryResponse/properties/usageSummary",
+      },
+      unattributed: { $ref: "#/components/schemas/WalletWorkspaceUsageAmounts" },
+      cursor: { anyOf: [{ type: "string", minLength: 1, maxLength: 1024 }, { type: "null" }] },
+      workspaces: {
+        type: "array",
+        maxItems: 100,
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["workspaceRef", "usedMicros", "heldMicros", "pendingMicros"],
+          properties: { workspaceRef: BILLING_REFERENCE_SCHEMA, ...WORKSPACE_AMOUNTS_PROPERTIES },
+        },
+      },
+    },
+  },
+  ChangeWalletLimitPolicyRequest: {
+    oneOf: [
+      {
+        type: "object",
+        additionalProperties: false,
+        required: ["reference", "onLimit"],
+        properties: {
+          reference: BILLING_REFERENCE_SCHEMA,
+          onLimit: { type: "string", enum: ["stop", "prepaid"] },
+        },
+      },
+      {
+        type: "object",
+        additionalProperties: false,
+        required: ["reference", "onLimit", "cashCapMinor", "consentRevision"],
+        properties: {
+          reference: BILLING_REFERENCE_SCHEMA,
+          onLimit: { type: "string", enum: ["on-demand", "postpaid"] },
+          cashCapMinor: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+          consentRevision: { type: "string", minLength: 1, maxLength: 512 },
+        },
+      },
+    ],
+  },
+  WalletLimitPolicy: {
+    type: "object",
+    additionalProperties: false,
+    required: [
+      "onLimit",
+      "capabilities",
+      "consentRevision",
+      "cashCapMinor",
+      "periodStart",
+      "periodEnd",
+    ],
+    properties: {
+      onLimit: { type: "string", enum: ["stop", "prepaid", "postpaid", "on-demand"] },
+      capabilities: {
+        type: "object",
+        additionalProperties: false,
+        required: ["stop", "prepaid", "postpaid", "on-demand"],
+        properties: {
+          stop: { const: true },
+          prepaid: { const: true },
+          postpaid: { const: false },
+          "on-demand": { const: false },
+        },
+      },
+      consentRevision: {
+        anyOf: [{ type: "string", minLength: 1, maxLength: 512 }, { type: "null" }],
+      },
+      cashCapMinor: {
+        anyOf: [
+          { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+          { type: "null" },
+        ],
+      },
+      periodStart: { $ref: "#/components/schemas/BillingUtcDateTime" },
+      periodEnd: { $ref: "#/components/schemas/BillingUtcDateTime" },
+    },
+  },
+  SubscriptionPendingChange: PENDING_CHANGE_SCHEMA,
+  SubscriptionPlanChangeRequest: {
+    type: "object",
+    additionalProperties: false,
+    required: ["reference", "planKey", "expectedSubscriptionRef"],
+    properties: {
+      reference: BILLING_REFERENCE_SCHEMA,
+      planKey: { type: "string", minLength: 1, maxLength: 64 },
+      expectedSubscriptionRef: SUBSCRIPTION_TARGET_SCHEMA,
+    },
+  },
+  SubscriptionPlanPendingResponse: {
+    type: "object",
+    additionalProperties: false,
+    required: ["planChange"],
+    properties: { planChange: PENDING_SUBSCRIPTION_RECEIPT_SCHEMA },
+  },
+  SubscriptionPlanVerifiedResponse: {
+    type: "object",
+    additionalProperties: false,
+    required: ["planChange"],
+    properties: {
+      planChange: {
+        type: "object",
+        additionalProperties: false,
+        required: ["state", "subscriptionRef", "pendingChange"],
+        properties: {
+          state: { const: "verified" },
+          subscriptionRef: SUBSCRIPTION_TARGET_SCHEMA,
+          pendingChange: PENDING_CHANGE_SCHEMA,
+        },
+      },
+    },
+  },
 } as const;
 const CANONICAL_HTTPS_ORIGIN_SCHEMA = {
   type: "string",
@@ -352,7 +742,22 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
     },
   },
   readPrincipal: described("Read the signed-in principal and the organizations it owns"),
-  listAiModels: described("List configured OpenAI-compatible models"),
+  listAiModels: described(
+    "List configured OpenAI-compatible models with canonical USD-micros pricing ceilings",
+    {
+      description:
+        "Each Takoserver commercial ceiling is a canonical decimal string in USD micros (`1 USD = 1,000,000 micros`).",
+      responses: {
+        "200": {
+          description:
+            "Configured models and their immutable Takoserver USD-micros commercial terms",
+          content: {
+            "application/json": { schema: { $ref: "#/components/schemas/AiModelsResponse" } },
+          },
+        },
+      },
+    },
+  ),
   createAiChatCompletion: described("Create a prepaid OpenAI-compatible chat completion", {
     parameters: [
       {
@@ -368,15 +773,62 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
         required: false,
         schema: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" },
         description:
-          "Optional exact model pricing revision from /v1/ai/models; drift is rejected before inference.",
+          "Optional exact model pricing revision from /v1/ai/models; drift is rejected before inference. Model ceilings and billed charges use USD micros.",
       },
     ],
+    responses: {
+      "200": {
+        description:
+          "OpenAI-compatible completion; monetary headers identify the unit and historical policy used",
+        headers: {
+          "x-request-id": { schema: { type: "string" } },
+          "x-takoserver-billed-micros": {
+            description: "Canonical integer USD micros billed for this completion.",
+            schema: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+          },
+          "x-takoserver-money-policy": {
+            description:
+              "usd-cents-v1 identifies a historical cents-based replay; usd-micros-v2 identifies a current USD-micros charge.",
+            schema: { type: "string", enum: ["usd-cents-v1", "usd-micros-v2"] },
+          },
+          "x-takoserver-billed-minor": {
+            description: "Legacy cents amount emitted only for historical usd-cents-v1 replays.",
+            schema: { type: "string", pattern: "^(?:0|[1-9][0-9]*)$" },
+          },
+        },
+        content: {
+          "application/json": { schema: { $ref: "#/components/schemas/AiCompletionResponse" } },
+        },
+      },
+    },
   }),
   listHostForms: described("List the published Form definitions and this Host's answer for each", {
     security: [],
     responses: { "200": hostFormCatalogueResponse() },
   }),
   createOrganization: described("Create an Organization"),
+  createPersonalOrganization: described(
+    "Create or read the local principal's personal Organization",
+    {
+      description:
+        "Session-only. Accepts an empty JSON object. The principal, owner and display name are derived server-side. No card, customer or paid subscription is created; ambiguous historical ownership requires resolution.",
+      requestBody: billingRequest("CreatePersonalOrganizationRequest"),
+      responses: {
+        "201": billingResponse(
+          "Created the atomic Organization, membership and mapping",
+          "PersonalOrganizationResponse",
+        ),
+        "200": billingResponse(
+          "Existing mapping, including retry after a lost response",
+          "PersonalOrganizationResponse",
+        ),
+        "400": errorResponse("Body must be an empty JSON object"),
+        "401": errorResponse("A local principal session is required"),
+        "403": errorResponse("The principal belongs to a separately projected account authority"),
+        "503": errorResponse("Personal mapping schema or historical ownership is unavailable"),
+      },
+    },
+  ),
   createApiKey: described("Create a scoped API key"),
   listApiKeys: described("List the organization's live API keys"),
   prepareWorkerEndpointOriginReservation: WORKER_ENDPOINT_ORIGIN_RESERVATION_OPERATIONS.put,
@@ -504,9 +956,581 @@ const OPERATIONS: Record<string, Record<string, unknown>> = {
   deleteAttachment: described("Delete one Resource Attachment"),
   listOrganizationOperations: described("List the organization's recent Takoform operations"),
   revokeApiKey: described("Revoke an API key"),
-  readWallet: described("Read the prepaid wallet"),
-  beginWalletCheckout: described("Begin a card payment for this organization"),
+  readWallet: described("Read the prepaid wallet and expire due holds", {
+    "x-required-scopes": ["wallet:read"],
+    parameters: [ORGANIZATION_ID_PARAMETER],
+    responses: {
+      "200": {
+        description: "Current Organization wallet projection and recent ledger entries",
+        content: {
+          "application/json": { schema: { $ref: "#/components/schemas/WalletResponse" } },
+        },
+      },
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("The key lacks wallet:read or belongs to another Organization"),
+      "503": errorResponse("Wallet state is unavailable"),
+    },
+  }),
+  listWalletLots: described("List Organization credit lots with expiry allocation", {
+    "x-required-scopes": ["wallet:read"],
+    parameters: [
+      ORGANIZATION_ID_PARAMETER,
+      {
+        name: "limit",
+        in: "query",
+        required: false,
+        schema: { type: "integer", minimum: 1, maximum: 100, default: 100 },
+      },
+      {
+        name: "cursor",
+        in: "query",
+        required: false,
+        schema: {
+          type: "string",
+          minLength: 1,
+          maxLength: 512,
+          description: "Opaque continuation cursor returned by the previous page.",
+        },
+      },
+    ],
+    responses: {
+      "200": {
+        description: "Organization credit lots",
+        content: {
+          "application/json": { schema: { $ref: "#/components/schemas/WalletLotsResponse" } },
+        },
+      },
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("The key lacks wallet:read or belongs to another Organization"),
+      "400": errorResponse("Malformed page size or unknown cursor"),
+      "503": errorResponse("Credit lot state is unavailable"),
+    },
+  }),
+  readWalletUsageSummary: described("Read current Organization included-credit usage", {
+    "x-required-scopes": ["wallet:read"],
+    parameters: [ORGANIZATION_ID_PARAMETER],
+    responses: {
+      "200": {
+        description: "Current verified paid service period or frozen UTC Free month",
+        content: {
+          "application/json": {
+            schema: { $ref: "#/components/schemas/WalletUsageSummaryResponse" },
+          },
+        },
+      },
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("The key lacks wallet:read or belongs to another Organization"),
+      "503": errorResponse("Entitlement, refund, or wallet snapshot is unavailable"),
+    },
+  }),
+  readWalletWorkspaceUsage: described("Read a frozen Organization usage snapshot by Workspace", {
+    "x-required-scopes": ["wallet:read"],
+    description:
+      "Complete Organization totals and included usageSummary share one durable SQL snapshot. Workspace rows page in stable reference order; totals repeat unchanged on every page. Unattributed history remains separate. The opaque cursor expires after ten minutes; start a fresh page after 409. No Workspace balance or grant is created.",
+    parameters: [
+      ORGANIZATION_ID_PARAMETER,
+      {
+        name: "limit",
+        in: "query",
+        required: false,
+        schema: { type: "integer", minimum: 1, maximum: 100, default: 50 },
+      },
+      {
+        name: "cursor",
+        in: "query",
+        required: false,
+        schema: { type: "string", minLength: 1, maxLength: 1024 },
+      },
+      {
+        name: "workspaceRef",
+        in: "query",
+        required: false,
+        description:
+          "Optional first-page filter; continuation pins this filter without repeating it.",
+        schema: BILLING_REFERENCE_SCHEMA,
+      },
+    ],
+    responses: {
+      "200": billingResponse(
+        "Frozen totals, included summary and one page of Workspace rows",
+        "WalletWorkspaceUsageResponse",
+      ),
+      "400": errorResponse("Invalid limit, query, reference, cursor or continuation filter"),
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("Wrong Organization or wallet:read scope"),
+      "404": errorResponse(
+        "The filtered Workspace is not bound to this Organization or billing is absent",
+      ),
+      "409": errorResponse("Snapshot expired; begin a fresh first page"),
+      "503": errorResponse(
+        "Attribution schema, immutable period proof or complete snapshot unavailable",
+      ),
+    },
+  }),
+  readWalletLimitPolicy: described("Read the Organization's explicit usage limit policy", {
+    "x-required-scopes": ["wallet:read"],
+    parameters: [ORGANIZATION_ID_PARAMETER],
+    description:
+      "Default stop. Capability flags describe execution support, independently of the four-value policy vocabulary. On-demand and postpaid remain unavailable until separately qualified. Period fields identify the UTC cash-cap month, not the included grant's invoice period.",
+    responses: {
+      "200": billingResponse(
+        "Current limit mode, capability flags and frozen consent terms",
+        "WalletLimitPolicy",
+      ),
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("Wrong Organization or wallet:read scope"),
+      "404": errorResponse("Hosted policy capability is absent"),
+      "409": errorResponse("Stored mode cannot be safely executed"),
+      "503": errorResponse("Durable policy schema or state is unavailable"),
+    },
+  }),
+  changeWalletLimitPolicy: described("Record explicit Organization spending consent", {
+    "x-required-scopes": ["payments:write"],
+    parameters: [ORGANIZATION_ID_PARAMETER],
+    description:
+      "Stop/prepaid accepts reference and onLimit only. The prepaid command records consent to spend already-purchased credit without authorizing a new charge. On-demand/postpaid additionally require a cash cap and acknowledged consent revision, but currently return 409 without persisting an active mode. Exact retries return the original command response; the authenticated payment principal is recorded server-side.",
+    requestBody: billingRequest("ChangeWalletLimitPolicyRequest"),
+    responses: {
+      "200": billingResponse(
+        "Committed original command response, including an exact replay",
+        "WalletLimitPolicy",
+      ),
+      "400": errorResponse("Invalid action, fields, reference, cap or consent revision"),
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("Wrong Organization or payments:write scope"),
+      "404": errorResponse("Hosted policy capability is absent"),
+      "409": errorResponse("Unsupported mode, reference conflict or concurrent policy change"),
+      "503": errorResponse("Durable policy schema or state is unavailable"),
+    },
+  }),
+  readWalletHold: described("Read one durable wallet hold receipt", {
+    "x-required-scopes": ["wallet:read"],
+    parameters: [
+      ORGANIZATION_ID_PARAMETER,
+      { name: "reference", in: "path", required: true, schema: BILLING_REFERENCE_SCHEMA },
+    ],
+    responses: {
+      "200": {
+        description: "The exact hold receipt",
+        content: {
+          "application/json": { schema: { $ref: "#/components/schemas/WalletHoldResponse" } },
+        },
+      },
+      "400": errorResponse("Malformed hold reference"),
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("The key lacks wallet:read or belongs to another Organization"),
+      "404": errorResponse("Hold reference not found"),
+      "503": errorResponse("Hold state is unavailable"),
+    },
+  }),
+  createWalletHold: described("Reserve prepaid credit for a measured operation", {
+    "x-required-scopes": ["wallet:write"],
+    parameters: [ORGANIZATION_ID_PARAMETER],
+    requestBody: billingRequest("CreateWalletHoldRequest"),
+    responses: {
+      "201": {
+        description: "Hold accepted with an immutable server-assigned expiry",
+        content: {
+          "application/json": { schema: { $ref: "#/components/schemas/WalletHoldResponse" } },
+        },
+      },
+      "400": errorResponse("Malformed amount, reference, revision, or fingerprint"),
+      "401": errorResponse("Authentication required"),
+      "402": errorResponse("Insufficient available credit"),
+      "403": errorResponse("The key lacks wallet:write or belongs to another Organization"),
+      "409": errorResponse(
+        "`reference_conflict`: the reference was already used or canceled with different facts; `pricing_revision_unavailable`: the revision is not the active admission tariff; `outstanding_usage`: an unpaid usage record blocks new admission",
+      ),
+      "503": errorResponse("Hold result is unavailable or indeterminate"),
+    },
+  }),
+  captureWalletHold: described("Capture measured credit and release the unused hold", {
+    "x-required-scopes": ["wallet:write"],
+    parameters: [
+      ORGANIZATION_ID_PARAMETER,
+      { name: "reference", in: "path", required: true, schema: BILLING_REFERENCE_SCHEMA },
+    ],
+    requestBody: billingRequest("CaptureWalletHoldRequest"),
+    responses: {
+      "200": {
+        description: "Captured receipt in USD micros; the unused amount is released atomically",
+        content: {
+          "application/json": { schema: { $ref: "#/components/schemas/WalletHoldResponse" } },
+        },
+      },
+      "400": errorResponse("Malformed amount or measurement"),
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("The key lacks wallet:write or belongs to another Organization"),
+      "404": errorResponse("Hold reference not found"),
+      "409": errorResponse(
+        "`hold_closed`: the hold is no longer live; `capture_exceeds_hold`: amountMicros exceeds the hold; `measurement_conflict`: amountMicros is not the exact min(actualMicros, original held amount) in USD micros; `reference_conflict`: a capture with different facts was already recorded",
+      ),
+      "503": errorResponse("Capture result is unavailable or indeterminate"),
+    },
+  }),
+  releaseWalletHold: described("Release a hold or durably cancel an unknown reference", {
+    "x-required-scopes": ["wallet:write"],
+    parameters: [
+      ORGANIZATION_ID_PARAMETER,
+      { name: "reference", in: "path", required: true, schema: BILLING_REFERENCE_SCHEMA },
+    ],
+    responses: {
+      "200": {
+        description: "Released or unchanged terminal receipt",
+        content: {
+          "application/json": { schema: { $ref: "#/components/schemas/WalletHoldResponse" } },
+        },
+      },
+      "400": errorResponse("Malformed hold reference, or a request body that is not empty"),
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("The key lacks wallet:write or belongs to another Organization"),
+      "503": errorResponse("Release result is unavailable or indeterminate"),
+    },
+  }),
+  listWalletUsageRecords: described("List recent settled or unpaid usage records", {
+    "x-required-scopes": ["usage:read"],
+    parameters: [
+      ORGANIZATION_ID_PARAMETER,
+      {
+        name: "limit",
+        in: "query",
+        required: false,
+        schema: { type: "integer", minimum: 1, maximum: 100, default: 100 },
+      },
+      {
+        name: "cursor",
+        in: "query",
+        required: false,
+        schema: {
+          type: "string",
+          minLength: 1,
+          maxLength: 512,
+          description: "Opaque continuation cursor returned by the previous page.",
+        },
+      },
+    ],
+    responses: {
+      "200": {
+        description: "Organization usage records",
+        content: {
+          "application/json": {
+            schema: { $ref: "#/components/schemas/WalletUsageRecordsResponse" },
+          },
+        },
+      },
+      "400": errorResponse("Malformed page size or cursor"),
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("The key lacks usage:read or belongs to another Organization"),
+      "503": errorResponse("Usage records are unavailable"),
+    },
+  }),
+  createWalletUsageRecord: described("Price and settle one closed usage period", {
+    "x-required-scopes": ["usage:write"],
+    parameters: [ORGANIZATION_ID_PARAMETER],
+    description:
+      "Takoserver reprices the immutable quantity using the selected tariff. For a configured `byte-hour` meter, send `quantityUnit=byte-millisecond` and an integral byte-millisecond quantity; the server converts the exact total to byte-hours before rounding the final USD micros once. Other meters require the configured unit.",
+    requestBody: billingRequest("CreateWalletUsageRecordRequest"),
+    responses: {
+      "201": {
+        description: "Usage receipt, including durable unpaid usage after insufficient funds",
+        content: {
+          "application/json": {
+            schema: { $ref: "#/components/schemas/WalletUsageRecordResponse" },
+          },
+        },
+      },
+      "400": errorResponse("Malformed usage facts, unit, quantity, period, or amount"),
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("The key lacks usage:write or belongs to another Organization"),
+      "409": errorResponse(
+        "`measurement_conflict`: expectedMicros differs from the integer USD-micros amount the pinned tariff computes; `reference_conflict`: the reference was recorded with different facts; `pricing_revision_unavailable`: the revision or meter is not the tariff effective at periodStart; `usage_period_crosses_tariff`: the period spans another tariff's effective time",
+      ),
+      "503": errorResponse("Usage settlement is unavailable or indeterminate"),
+    },
+  }),
+  beginWalletCheckout: described("Begin an idempotent purchased-credit Checkout", {
+    "x-required-scopes": ["payments:write"],
+    parameters: [ORGANIZATION_ID_PARAMETER],
+    description:
+      "Hosted composition requires reference and amountMinor, payments:write or an owner session, and a qualified durable customer/realm adapter. The independent legacy lane accepts amountMinor only and remains owner-session-only. Current operator bounds govern new purchases; exact Hosted retries preserve the original command and URL even after bounds change. Return URLs are operator-configured; the request does not fund credit. An unknown outcome beyond the idempotency safety window requires reconciliation.",
+    requestBody: billingRequest("BeginWalletCheckoutRequest"),
+    responses: {
+      "201": billingResponse(
+        "Original Checkout URL, including an exact Hosted replay",
+        "WalletCheckoutResponse",
+      ),
+      "400": errorResponse("Invalid amount, reference, fields or configured bounds"),
+      "401": errorResponse("Authentication required; legacy lane requires an owner session"),
+      "403": errorResponse("Wrong Organization or payments:write scope"),
+      "404": errorResponse("Qualified Checkout capability is absent"),
+      "409": errorResponse(
+        "Conflicting purchase, expired Checkout or unresolved processor outcome",
+      ),
+      "503": errorResponse("Processor, schema or readback unavailable"),
+    },
+  }),
+  readWalletCheckoutReceipt: described("Read one durable purchased-credit Checkout receipt", {
+    "x-required-scopes": ["wallet:read"],
+    parameters: [
+      ORGANIZATION_ID_PARAMETER,
+      { name: "reference", in: "path", required: true, schema: BILLING_REFERENCE_SCHEMA },
+    ],
+    description:
+      "The read can reconcile the original processor object, but it never grants credit. Checkout is null until an acknowledged original URL exists. Payment still settles through the existing verified webhook and funding authority.",
+    responses: {
+      "200": billingResponse(
+        "Original command status and acknowledged URL",
+        "WalletCheckoutReceipt",
+      ),
+      "400": errorResponse("Malformed purchase reference"),
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("Wrong Organization or wallet:read scope"),
+      "404": errorResponse("Purchase reference or durable Checkout capability absent"),
+      "409": errorResponse("Readback conflicts with the frozen purchase"),
+      "503": errorResponse("Processor or durable receipt unavailable"),
+    },
+  }),
+  readSubscriptionCommandReceipt: described("Read one saved subscription command descriptor", {
+    "x-required-scopes": ["wallet:read"],
+    parameters: [
+      ORGANIZATION_ID_PARAMETER,
+      {
+        name: "kind",
+        in: "path",
+        required: true,
+        schema: { type: "string", enum: ["start", "cancel", "plan-change"] },
+      },
+      {
+        name: "reference",
+        in: "path",
+        required: true,
+        schema: BILLING_REFERENCE_SCHEMA,
+      },
+    ],
+    description:
+      "Qualified Hosted composition only. Reads the saved original command and its local workflow proof without resuming it, registering pricing, refreshing native objects or writing financial state. Start lifecycle and scheduled cancellation do not prove the target ended. A missing command is not proof of no effect or completed reconciliation. No query parameters are accepted. Source epoch and payer authority are qualified separately.",
+    responses: {
+      "200": billingResponse(
+        "Saved original command descriptor",
+        "SubscriptionCommandReceiptResponse",
+      ),
+      "400": errorResponse("Invalid kind, encoded reference or query parameter"),
+      "401": errorResponse("Authentication required"),
+      "403": errorResponse("Wrong Organization or wallet:read scope"),
+      "404": errorResponse(
+        "Qualified receipt capability or stored command absent; no terminal proof",
+      ),
+      "503": errorResponse("Saved command schema or proof unavailable"),
+    },
+  }),
+  readSubscription: described(
+    "Read hosted subscription coverage and the shared configured plan table",
+    {
+      "x-required-scopes": ["wallet:read"],
+      parameters: [ORGANIZATION_ID_PARAMETER],
+      responses: {
+        "200": {
+          description:
+            "Subscription projection; paidFeatures requires a verified paid billing period. billingCapabilities is present only for the qualified Hosted composition; absent or false capabilities are unavailable.",
+          content: {
+            "application/json": { schema: { $ref: "#/components/schemas/SubscriptionResponse" } },
+          },
+        },
+        "401": errorResponse("Authentication required"),
+        "403": errorResponse("Wrong Organization or scope"),
+        "404": errorResponse("Hosted billing is disabled"),
+        "503": errorResponse("Billing schema or processor unavailable"),
+      },
+    },
+  ),
+  beginSubscription: described(
+    "Begin monthly subscription Checkout in the configured Stripe realm using a plan key",
+    {
+      "x-required-scopes": ["payments:write"],
+      parameters: [ORGANIZATION_ID_PARAMETER],
+      description:
+        "Host sets Stripe Price, Organization/customer binding, tariff revision and return URLs. This operation grants no credit. Replay the same reference. Custody returns open/pending/associated/expired receipts; pending is 202 and retains the original command in every deployment mode. Commercial Hosted composition additionally requires its qualified financial adapter.",
+      requestBody: billingRequest("BeginSubscriptionRequest"),
+      responses: {
+        "200": {
+          description: "Verified associated or expired Checkout for this reference",
+          content: {
+            "application/json": {
+              schema: subscriptionReceiptResponseSchema(
+                "SubscriptionCheckoutResponse",
+                "checkout",
+                ["associated", "expired"],
+              ),
+            },
+          },
+        },
+        "201": {
+          description: "Verified open Stripe Checkout redirect",
+          content: {
+            "application/json": {
+              schema: subscriptionReceiptResponseSchema(
+                "SubscriptionCheckoutResponse",
+                "checkout",
+                ["open"],
+              ),
+            },
+          },
+        },
+        "202": {
+          description: "Checkout outcome pending; retry this reference without another payment",
+          content: {
+            "application/json": {
+              schema: subscriptionReceiptResponseSchema(
+                "SubscriptionCheckoutResponse",
+                "checkout",
+                ["pending"],
+              ),
+            },
+          },
+        },
+        "400": errorResponse("Invalid reference or configured plan key"),
+        "401": errorResponse("Authentication required"),
+        "403": errorResponse("Wrong Organization or payments:write scope"),
+        "404": errorResponse("Hosted billing is disabled"),
+        "409": errorResponse("Subscription exists or payment command needs reconciliation"),
+        "503": errorResponse("Processor unavailable"),
+      },
+    },
+  ),
+  changeSubscription: described(
+    "Schedule exclusive next-period plan change or subscription cancellation",
+    {
+      "x-required-scopes": ["payments:write"],
+      parameters: [ORGANIZATION_ID_PARAMETER],
+      description:
+        "Cancellation requires cancelAtPeriodEnd=true and expectedSubscriptionRef from GET in every deployment mode, and returns a durable cancellation receipt. A qualified plan action instead requires planKey and the same expected target; it schedules next-period terms without proration or an immediate charge/grant. Actions are mutually exclusive. Missing plan qualification is refused. Pending outcomes retain their reference and recover by readback rather than another Stripe POST.",
+      requestBody: {
+        required: true,
+        content: {
+          "application/json": {
+            schema: {
+              oneOf: [
+                { $ref: "#/components/schemas/ChangeSubscriptionRequest" },
+                { $ref: "#/components/schemas/SubscriptionPlanChangeRequest" },
+              ],
+            },
+          },
+        },
+      },
+      responses: {
+        "200": {
+          description: "Verified cancellation receipt for the expected target",
+          content: {
+            "application/json": {
+              schema: {
+                oneOf: [
+                  subscriptionReceiptResponseSchema(
+                    "SubscriptionCancellationResponse",
+                    "cancellation",
+                    ["verified"],
+                  ),
+                  { $ref: "#/components/schemas/SubscriptionPlanVerifiedResponse" },
+                ],
+              },
+            },
+          },
+        },
+        "202": {
+          description: "Original cancellation or plan command remains pending",
+          content: {
+            "application/json": {
+              schema: {
+                oneOf: [
+                  subscriptionReceiptResponseSchema(
+                    "SubscriptionCancellationResponse",
+                    "cancellation",
+                    ["pending"],
+                  ),
+                  { $ref: "#/components/schemas/SubscriptionPlanPendingResponse" },
+                ],
+              },
+            },
+          },
+        },
+        "400": errorResponse("Invalid request"),
+        "401": errorResponse("Authentication required"),
+        "403": errorResponse("Wrong Organization or payments:write scope"),
+        "404": errorResponse("Subscription or capability absent"),
+        "409": errorResponse("Expected subscription changed or reference conflicts"),
+        "503": errorResponse("Processor unavailable"),
+      },
+    },
+  ),
   creditWalletFromSettlement: described("Credit the wallet from a verified settlement proof"),
+  receiveStripeWebhook: described(
+    "Receive one signed Stripe event. Served only where Stripe funding and a webhook signing secret are configured; the Stripe-Signature header over the raw body is the credential, and amounts are re-read from Stripe",
+    {
+      security: [],
+      responses: {
+        "200": {
+          description: "Verified and recorded, including an already-settled redelivery",
+          content: {
+            "application/json": {
+              schema: {
+                type: "object",
+                additionalProperties: false,
+                required: ["received", "duplicate"],
+                properties: {
+                  received: { type: "boolean", const: true },
+                  duplicate: { type: "boolean" },
+                },
+              },
+            },
+          },
+        },
+        "400": errorResponse(
+          "Missing, malformed, mismatched or out-of-tolerance signature, or a malformed event",
+        ),
+        "404": errorResponse("Stripe webhooks are not configured on this deployment"),
+        "413": errorResponse("Event body exceeds 256 KiB"),
+        "503": errorResponse("Stripe could not be read; the event stays retryable"),
+      },
+    },
+  ),
+  runOperatorPaymentsReconcile: described(
+    "Run the payment reconcile pass now, on the operator's single-use assertion",
+    {
+      description:
+        "Runs the same pass as the scheduled reconcile and returns its report. Served only where Stripe funding is configured and an operator identity key is present. " +
+        "The credential is a `payments-reconcile` assertion signed by the operator identity key: it names this Host's public origin as `aud`, carries a `jti` nonce and exactly the claims `purpose`, `aud`, `jti`, `iat` and `exp`, lives at most sixty seconds and is spent before the pass runs. " +
+        "No session or API key can run it. A repeat credits nothing twice, because every path credits through the same `stripe:<session id>` funding reference. On a Bun Host a request arriving while a pass is running joins that pass; a Worker runs one pass per request.",
+      security: [],
+      requestBody: {
+        required: true,
+        content: {
+          "application/json": {
+            schema: { $ref: "#/components/schemas/OperatorPaymentsReconcileRequest" },
+          },
+        },
+      },
+      responses: {
+        "200": {
+          description: "The pass ran; its report",
+          content: {
+            "application/json": {
+              schema: { $ref: "#/components/schemas/OperatorPaymentsReconcileResponse" },
+            },
+          },
+        },
+        "400": errorResponse("Malformed body"),
+        "401": errorResponse(
+          "Missing, expired, replayed, wrongly signed, wrong-purpose or wrong-audience operator assertion",
+        ),
+        "404": errorResponse("Payment reconcile or an operator identity key is not configured"),
+        "500": errorResponse(
+          "Internal failure, for example the assertion could not be recorded as spent; the pass did not run",
+        ),
+        "503": errorResponse(
+          "Stripe could not be read; retryable with a fresh assertion, because this one is spent",
+        ),
+      },
+    },
+  ),
   listOfferings: described("List purchasable offerings"),
   createResellerQuote: described("Price an offering for a tenant"),
   createResellerReservation: described("Reserve a quote, holding funds"),
@@ -674,16 +1698,36 @@ function hostFormCatalogueResponse() {
 function described(
   summary: string,
   extra: {
+    readonly description?: string;
     readonly security?: readonly unknown[];
     readonly parameters?: readonly unknown[];
+    readonly requestBody?: unknown;
     readonly responses?: Record<string, unknown>;
+    readonly "x-required-scopes"?: readonly string[];
   } = {},
 ): Record<string, unknown> {
   return {
     summary,
+    ...(extra.description ? { description: extra.description } : {}),
     responses: extra.responses ?? { "200": { description: "Success" } },
     ...(extra.security ? { security: extra.security } : {}),
     ...(extra.parameters ? { parameters: extra.parameters } : {}),
+    ...(extra.requestBody ? { requestBody: extra.requestBody } : {}),
+    ...(extra["x-required-scopes"] ? { "x-required-scopes": extra["x-required-scopes"] } : {}),
+  };
+}
+
+function billingRequest(schema: string): Record<string, unknown> {
+  return {
+    required: true,
+    content: { "application/json": { schema: { $ref: `#/components/schemas/${schema}` } } },
+  };
+}
+
+function billingResponse(description: string, schema: string) {
+  return {
+    description,
+    content: { "application/json": { schema: { $ref: `#/components/schemas/${schema}` } } },
   };
 }
 
@@ -754,6 +1798,741 @@ export const openApiDocument = {
     },
     schemas: {
       ...TAKOFORM_V2_SCHEMAS,
+      ...HOSTED_BILLING_SCHEMAS,
+      AiModelsResponse: {
+        type: "object",
+        required: ["object", "data"],
+        additionalProperties: false,
+        properties: {
+          object: { const: "list" },
+          data: {
+            type: "array",
+            items: {
+              type: "object",
+              required: ["id", "object", "created", "owned_by", "takoserver"],
+              additionalProperties: false,
+              properties: {
+                id: { type: "string", minLength: 1, maxLength: 128 },
+                object: { const: "model" },
+                created: { type: "integer", minimum: 0 },
+                owned_by: { type: "string" },
+                takoserver: {
+                  type: "object",
+                  required: ["pricing_revision", "maximum_charge_micros", "money_policy"],
+                  additionalProperties: false,
+                  properties: {
+                    pricing_revision: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" },
+                    maximum_charge_micros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+                    money_policy: { const: "usd-micros-v2" },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      AiCompletionResponse: {
+        type: "object",
+        description: "OpenAI-compatible chat completion JSON body.",
+        additionalProperties: true,
+      },
+      BillingReference: BILLING_REFERENCE_SCHEMA,
+      BillingRevision: {
+        type: "string",
+        minLength: 1,
+        maxLength: 128,
+        pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+      },
+      BillingFingerprint: { type: "string", minLength: 1, maxLength: 256 },
+      BillingUnsignedMicros: {
+        type: "string",
+        minLength: 1,
+        maxLength: 16,
+        pattern: "^(?:0|[1-9][0-9]*)$",
+        description:
+          "Canonical nonnegative integer amount in USD micros; bounded to the safe integer range.",
+      },
+      BillingActualMicros: {
+        type: "string",
+        minLength: 1,
+        maxLength: 256,
+        pattern: "^(?:0|[1-9][0-9]*)$",
+        description:
+          "Full measured USD micros, retained exactly even when larger than the hold; capture is capped at the held amount.",
+      },
+      BillingSignedMicros: {
+        type: "string",
+        minLength: 1,
+        maxLength: 17,
+        pattern: "^(?:0|-?[1-9][0-9]*)$",
+      },
+      BillingUnsignedDecimal: {
+        type: "string",
+        minLength: 1,
+        maxLength: 256,
+        pattern: "^(?:0|[1-9][0-9]*)(?:\\.[0-9]{0,17}[1-9])?$",
+      },
+      BillingUtcDateTime: {
+        type: "string",
+        format: "date-time",
+        pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+      },
+      CreateWalletHoldRequest: {
+        type: "object",
+        required: ["reference", "amountMicros", "pricingRevision", "measurementFingerprint"],
+        additionalProperties: false,
+        properties: {
+          workspaceRef: BILLING_REFERENCE_SCHEMA,
+          reference: { $ref: "#/components/schemas/BillingReference" },
+          amountMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+          pricingRevision: { $ref: "#/components/schemas/BillingRevision" },
+          measurementFingerprint: { $ref: "#/components/schemas/BillingFingerprint" },
+        },
+      },
+      CaptureWalletHoldRequest: {
+        type: "object",
+        required: ["amountMicros", "actualMicros", "measurementFingerprint"],
+        additionalProperties: false,
+        properties: {
+          amountMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+          actualMicros: { $ref: "#/components/schemas/BillingActualMicros" },
+          measurementFingerprint: { $ref: "#/components/schemas/BillingFingerprint" },
+        },
+      },
+      CreateWalletUsageRecordRequest: {
+        type: "object",
+        required: [
+          "reference",
+          "meter",
+          "quantityUnit",
+          "quantity",
+          "periodStart",
+          "periodEnd",
+          "pricingRevision",
+          "expectedMicros",
+          "measurementFingerprint",
+        ],
+        additionalProperties: false,
+        properties: {
+          workspaceRef: BILLING_REFERENCE_SCHEMA,
+          reference: { $ref: "#/components/schemas/BillingReference" },
+          meter: {
+            type: "string",
+            minLength: 1,
+            maxLength: 128,
+            pattern: "^[a-z][a-z0-9.-]{0,127}$",
+          },
+          quantityUnit: {
+            type: "string",
+            minLength: 1,
+            maxLength: 64,
+            pattern: "^[A-Za-z][A-Za-z0-9._-]{0,63}$",
+          },
+          quantity: { $ref: "#/components/schemas/BillingUnsignedDecimal" },
+          periodStart: { $ref: "#/components/schemas/BillingUtcDateTime" },
+          periodEnd: { $ref: "#/components/schemas/BillingUtcDateTime" },
+          pricingRevision: { $ref: "#/components/schemas/BillingRevision" },
+          expectedMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+          measurementFingerprint: { $ref: "#/components/schemas/BillingFingerprint" },
+        },
+      },
+      BeginSubscriptionRequest: {
+        type: "object",
+        required: ["reference", "planKey"],
+        additionalProperties: false,
+        properties: {
+          reference: BILLING_REFERENCE_SCHEMA,
+          planKey: {
+            type: "string",
+            minLength: 1,
+            maxLength: 64,
+            description: "Subscription tier planId from the shared configured table",
+          },
+        },
+      },
+      ChangeSubscriptionRequest: {
+        type: "object",
+        required: ["reference", "cancelAtPeriodEnd", "expectedSubscriptionRef"],
+        additionalProperties: false,
+        properties: {
+          reference: BILLING_REFERENCE_SCHEMA,
+          cancelAtPeriodEnd: { type: "boolean", const: true },
+          expectedSubscriptionRef: SUBSCRIPTION_REF_SCHEMA,
+        },
+      },
+      SubscriptionCheckoutReceipt: {
+        oneOf: [
+          {
+            type: "object",
+            required: ["state", "id", "url"],
+            additionalProperties: false,
+            properties: {
+              state: { const: "open" },
+              id: { type: "string", pattern: "^cs_[A-Za-z0-9_]{1,240}$" },
+              url: { type: "string", format: "uri", pattern: "^https://checkout\\.stripe\\.com/" },
+            },
+          },
+          {
+            type: "object",
+            required: ["state", "id", "subscriptionRef"],
+            additionalProperties: false,
+            properties: {
+              state: { const: "associated" },
+              id: { type: "string", pattern: "^cs_[A-Za-z0-9_]{1,240}$" },
+              subscriptionRef: SUBSCRIPTION_REF_SCHEMA,
+              url: { type: "string", format: "uri", pattern: "^https://checkout\\.stripe\\.com/" },
+            },
+          },
+          {
+            type: "object",
+            required: ["state", "id"],
+            additionalProperties: false,
+            properties: {
+              state: { const: "expired" },
+              id: { type: "string", pattern: "^cs_[A-Za-z0-9_]{1,240}$" },
+            },
+          },
+          {
+            type: "object",
+            required: ["state", "id"],
+            additionalProperties: false,
+            properties: {
+              state: { const: "pending" },
+              id: { type: "string", pattern: "^sci_" },
+            },
+          },
+        ],
+      },
+      SubscriptionCheckoutResponse: {
+        type: "object",
+        required: ["checkout"],
+        additionalProperties: false,
+        properties: { checkout: { $ref: "#/components/schemas/SubscriptionCheckoutReceipt" } },
+      },
+      SubscriptionCancellationReceipt: {
+        oneOf: [
+          {
+            type: "object",
+            required: ["state", "subscriptionRef"],
+            additionalProperties: false,
+            properties: { state: { const: "pending" }, subscriptionRef: SUBSCRIPTION_REF_SCHEMA },
+          },
+          {
+            type: "object",
+            required: ["state", "subscriptionRef", "effectiveAt"],
+            additionalProperties: false,
+            properties: {
+              state: { const: "verified" },
+              subscriptionRef: SUBSCRIPTION_REF_SCHEMA,
+              effectiveAt: { $ref: "#/components/schemas/BillingUtcDateTime" },
+            },
+          },
+        ],
+      },
+      SubscriptionCancellationResponse: {
+        type: "object",
+        required: ["cancellation"],
+        additionalProperties: false,
+        properties: {
+          cancellation: { $ref: "#/components/schemas/SubscriptionCancellationReceipt" },
+        },
+      },
+      SubscriptionProjection: {
+        type: "object",
+        required: [
+          "organizationId",
+          "subscriptionId",
+          "subscriptionRef",
+          "planKey",
+          "pricingRevision",
+          "status",
+          "cancelAtPeriodEnd",
+          "periodStart",
+          "periodEnd",
+          "paidThrough",
+          "paidFeatures",
+          "updatedAt",
+        ],
+        additionalProperties: false,
+        properties: {
+          organizationId: IDENTIFIER_SCHEMA,
+          subscriptionId: { type: "string" },
+          subscriptionRef: SUBSCRIPTION_REF_SCHEMA,
+          planKey: { type: "string" },
+          pricingRevision: { type: "string" },
+          status: {
+            type: "string",
+            enum: [
+              "incomplete",
+              "incomplete_expired",
+              "trialing",
+              "active",
+              "past_due",
+              "canceled",
+              "unpaid",
+              "paused",
+            ],
+          },
+          cancelAtPeriodEnd: { type: "boolean" },
+          periodStart: { type: "string", format: "date-time" },
+          periodEnd: { type: "string", format: "date-time" },
+          paidThrough: { anyOf: [{ type: "string", format: "date-time" }, { type: "null" }] },
+          paidFeatures: { type: "boolean" },
+          updatedAt: { type: "string", format: "date-time" },
+        },
+      },
+      SubscriptionResponse: {
+        type: "object",
+        required: ["subscription", "planTable"],
+        additionalProperties: false,
+        properties: {
+          billingCapabilities: { $ref: "#/components/schemas/HostedBillingCapabilities" },
+          pendingChange: { anyOf: [PENDING_CHANGE_SCHEMA, { type: "null" }] },
+          subscription: {
+            anyOf: [{ $ref: "#/components/schemas/SubscriptionProjection" }, { type: "null" }],
+          },
+          planTable: { $ref: "#/components/schemas/HostedPlanTable" },
+        },
+      },
+      HostedBillingCapabilities: {
+        type: "object",
+        required: [
+          "contractVersion",
+          "topUps",
+          "subscriptionStart",
+          "subscriptionCancellation",
+          "subscriptionPlanChange",
+        ],
+        additionalProperties: false,
+        properties: {
+          contractVersion: { const: "hosted-billing-v1" },
+          topUps: { type: "boolean" },
+          subscriptionStart: { type: "boolean" },
+          subscriptionCancellation: { type: "boolean" },
+          subscriptionPlanChange: { type: "boolean" },
+        },
+      },
+      SubscriptionCommandReceipt: SUBSCRIPTION_COMMAND_RECEIPT_SCHEMA,
+      SubscriptionCommandReceiptResponse: {
+        type: "object",
+        required: ["receipt"],
+        additionalProperties: false,
+        properties: {
+          receipt: { $ref: "#/components/schemas/SubscriptionCommandReceipt" },
+        },
+      },
+      HostedPlanTable: {
+        type: "object",
+        required: ["scope", "products", "balanceScope", "plans", "consumptionOrder"],
+        additionalProperties: false,
+        properties: {
+          scope: { const: "hosted" },
+          products: {
+            type: "array",
+            prefixItems: [{ const: "takosumi-hosted" }, { const: "takoserver" }],
+            minItems: 2,
+            maxItems: 2,
+          },
+          balanceScope: { const: "organization" },
+          consumptionOrder: {
+            type: "array",
+            prefixItems: [
+              { const: "free" },
+              { const: "subscription" },
+              { const: "purchased" },
+              { const: "postpaid" },
+            ],
+            minItems: 4,
+            maxItems: 4,
+          },
+          plans: {
+            type: "array",
+            minItems: 3,
+            maxItems: 4,
+            oneOf: [
+              {
+                maxItems: 3,
+                prefixItems: [
+                  { properties: { tier: { const: "free" } } },
+                  { properties: { tier: { const: "subscription" } } },
+                  { properties: { tier: { const: "usage" } } },
+                ],
+              },
+              {
+                minItems: 4,
+                prefixItems: [
+                  { properties: { tier: { const: "free" } } },
+                  { properties: { tier: { const: "subscription" } } },
+                  { properties: { tier: { const: "subscription" } } },
+                  { properties: { tier: { const: "usage" } } },
+                ],
+              },
+            ],
+            items: {
+              oneOf: [
+                {
+                  type: "object",
+                  required: [
+                    "planId",
+                    "tier",
+                    "resourceScope",
+                    "configuredMonthlyCreditMinor",
+                    "edgeAllowance",
+                  ],
+                  additionalProperties: false,
+                  properties: {
+                    planId: { type: "string" },
+                    tier: { const: "free" },
+                    resourceScope: { const: "edge" },
+                    configuredMonthlyCreditMinor: { type: "integer", minimum: 0 },
+                    edgeAllowance: { const: "pending-owner-runtime-policy" },
+                  },
+                },
+                {
+                  type: "object",
+                  required: [
+                    "planId",
+                    "tier",
+                    "monthlyAmountMinor",
+                    "includedCreditMinor",
+                    "stripePriceId",
+                  ],
+                  additionalProperties: false,
+                  properties: {
+                    planId: { type: "string" },
+                    tier: { const: "subscription" },
+                    monthlyAmountMinor: { type: "integer", minimum: 1 },
+                    includedCreditMinor: { type: "integer", minimum: 0 },
+                    stripePriceId: { type: "string" },
+                  },
+                },
+                {
+                  type: "object",
+                  required: [
+                    "planId",
+                    "tier",
+                    "checkoutMinimumMinor",
+                    "checkoutMaximumMinor",
+                    "meters",
+                  ],
+                  additionalProperties: false,
+                  properties: {
+                    planId: { type: "string" },
+                    tier: { const: "usage" },
+                    checkoutMinimumMinor: { type: "integer", minimum: 1 },
+                    checkoutMaximumMinor: { type: "integer", minimum: 1 },
+                    meters: { type: "object", additionalProperties: { type: "object" } },
+                  },
+                },
+              ],
+            },
+          },
+        },
+      },
+      WalletResponse: {
+        type: "object",
+        required: ["wallet"],
+        additionalProperties: false,
+        properties: {
+          wallet: {
+            type: "object",
+            required: [
+              "organizationId",
+              "currency",
+              "unit",
+              "moneyPolicy",
+              "settledMicros",
+              "heldMicros",
+              "availableMicros",
+              "entries",
+            ],
+            additionalProperties: false,
+            properties: {
+              organizationId: IDENTIFIER_SCHEMA,
+              currency: { const: "USD" },
+              unit: { const: "USD-micros" },
+              moneyPolicy: { const: "usd-micros-v2" },
+              settledMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+              heldMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+              availableMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+              refundReceivableMicros: {
+                $ref: "#/components/schemas/BillingUnsignedMicros",
+                description: "Non-spendable refund debt; blocks new billable admission",
+              },
+              frozenMicros: {
+                $ref: "#/components/schemas/BillingUnsignedMicros",
+                description:
+                  "Original-lot credit unavailable while refund settlement is pending or unresolved",
+              },
+              entries: {
+                type: "array",
+                items: {
+                  type: "object",
+                  required: [
+                    "id",
+                    "organizationId",
+                    "type",
+                    "reference",
+                    "settledDeltaMicros",
+                    "heldDeltaMicros",
+                    "createdAt",
+                  ],
+                  additionalProperties: false,
+                  properties: {
+                    id: IDENTIFIER_SCHEMA,
+                    organizationId: IDENTIFIER_SCHEMA,
+                    type: {
+                      type: "string",
+                      enum: [
+                        "funding",
+                        "hold",
+                        "capture",
+                        "release",
+                        "usage_debit",
+                        "refund_debit",
+                        "refund_receivable",
+                        "revoked_after_expiry",
+                      ],
+                    },
+                    reference: { type: "string", minLength: 1 },
+                    settledDeltaMicros: { $ref: "#/components/schemas/BillingSignedMicros" },
+                    heldDeltaMicros: { $ref: "#/components/schemas/BillingSignedMicros" },
+                    createdAt: { $ref: "#/components/schemas/BillingUtcDateTime" },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+      WalletUsageSummaryResponse: {
+        type: "object",
+        required: ["usageSummary"],
+        additionalProperties: false,
+        properties: {
+          usageSummary: {
+            type: "object",
+            required: [
+              "organizationId",
+              "currency",
+              "unit",
+              "periodKind",
+              "periodStart",
+              "periodEnd",
+              "nextResetAt",
+              "originalIncludedMicros",
+              "effectiveIncludedMicros",
+              "usedMicros",
+              "heldMicros",
+              "availableMicros",
+              "revokedMicros",
+              "utilizationBasisPoints",
+              "reached80Percent",
+              "reached95Percent",
+              "limitReached",
+              "purchasedAvailableMicros",
+              "directAvailableMicros",
+            ],
+            additionalProperties: false,
+            properties: {
+              organizationId: IDENTIFIER_SCHEMA,
+              currency: { const: "USD" },
+              unit: { const: "USD-micros" },
+              periodKind: { type: "string", enum: ["free", "paid"] },
+              periodStart: { $ref: "#/components/schemas/BillingUtcDateTime" },
+              periodEnd: { $ref: "#/components/schemas/BillingUtcDateTime" },
+              nextResetAt: {
+                $ref: "#/components/schemas/BillingUtcDateTime",
+                description: "Current grant end; the next period is not enabled by this response.",
+              },
+              originalIncludedMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+              effectiveIncludedMicros: {
+                $ref: "#/components/schemas/BillingUnsignedMicros",
+                description: "Original included allowance less verified refund revocation.",
+              },
+              usedMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+              heldMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+              availableMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+              revokedMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+              utilizationBasisPoints: { type: "integer", minimum: 0, maximum: 10_000 },
+              reached80Percent: { type: "boolean" },
+              reached95Percent: { type: "boolean" },
+              limitReached: { type: "boolean" },
+              purchasedAvailableMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+              directAvailableMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+            },
+          },
+        },
+      },
+      WalletLotsResponse: {
+        type: "object",
+        required: ["lots", "cursor"],
+        additionalProperties: false,
+        properties: {
+          lots: {
+            type: "array",
+            items: {
+              type: "object",
+              required: [
+                "reference",
+                "kind",
+                "consumptionClass",
+                "amountMicros",
+                "spentMicros",
+                "remainingMicros",
+                "heldMicros",
+                "availableMicros",
+                "expiresAt",
+                "createdAt",
+              ],
+              additionalProperties: false,
+              properties: {
+                reference: { type: "string", minLength: 1 },
+                kind: { type: "string", enum: ["direct", "plan-included", "purchased"] },
+                consumptionClass: { type: "string", enum: ["free", "subscription", "purchased"] },
+                amountMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+                spentMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+                revokedMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+                frozen: { type: "boolean" },
+                remainingMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+                heldMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+                availableMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+                expiresAt: {
+                  anyOf: [{ $ref: "#/components/schemas/BillingUtcDateTime" }, { type: "null" }],
+                },
+                createdAt: { $ref: "#/components/schemas/BillingUtcDateTime" },
+              },
+            },
+          },
+          cursor: { anyOf: [{ type: "string", minLength: 1, maxLength: 512 }, { type: "null" }] },
+        },
+      },
+      WalletHoldResponse: {
+        type: "object",
+        required: ["hold"],
+        additionalProperties: false,
+        properties: { hold: { $ref: "#/components/schemas/WalletHoldReceipt" } },
+      },
+      WalletHoldReceipt: {
+        type: "object",
+        required: [
+          "organizationId",
+          "reference",
+          "moneyPolicy",
+          "amountMicros",
+          "pricingRevision",
+          "status",
+          "capturedMicros",
+          "releasedMicros",
+          "actualMicros",
+          "createdAt",
+          "expiresAt",
+          "closedAt",
+        ],
+        additionalProperties: false,
+        properties: {
+          ...BILLING_ATTRIBUTION_PROPERTIES,
+          organizationId: IDENTIFIER_SCHEMA,
+          reference: { $ref: "#/components/schemas/BillingReference" },
+          moneyPolicy: { type: "string", enum: ["usd-cents-v1", "usd-micros-v2"] },
+          amountMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+          pricingRevision: {
+            anyOf: [{ $ref: "#/components/schemas/BillingRevision" }, { type: "null" }],
+          },
+          status: { type: "string", enum: ["live", "captured", "released", "expired"] },
+          closureReason: { anyOf: [{ type: "string", enum: ["refund"] }, { type: "null" }] },
+          capturedMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+          releasedMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+          actualMicros: {
+            anyOf: [
+              { type: "string", minLength: 1, maxLength: 256, pattern: "^(?:0|[1-9][0-9]*)$" },
+              { type: "null" },
+            ],
+          },
+          createdAt: { $ref: "#/components/schemas/BillingUtcDateTime" },
+          expiresAt: {
+            anyOf: [{ $ref: "#/components/schemas/BillingUtcDateTime" }, { type: "null" }],
+          },
+          closedAt: {
+            anyOf: [{ $ref: "#/components/schemas/BillingUtcDateTime" }, { type: "null" }],
+          },
+        },
+      },
+      WalletUsageRecordResponse: {
+        type: "object",
+        required: ["usageRecord"],
+        additionalProperties: false,
+        properties: { usageRecord: { $ref: "#/components/schemas/WalletUsageReceipt" } },
+      },
+      WalletUsageRecordsResponse: {
+        type: "object",
+        required: ["usageRecords", "cursor"],
+        additionalProperties: false,
+        properties: {
+          usageRecords: {
+            type: "array",
+            items: { $ref: "#/components/schemas/WalletUsageReceipt" },
+          },
+          cursor: { anyOf: [{ type: "string", minLength: 1, maxLength: 512 }, { type: "null" }] },
+        },
+      },
+      WalletUsageReceipt: {
+        type: "object",
+        required: [
+          "organizationId",
+          "reference",
+          "moneyPolicy",
+          "pricingRevision",
+          "meter",
+          "quantityUnit",
+          "quantity",
+          "periodStart",
+          "periodEnd",
+          "rate",
+          "amountMicros",
+          "status",
+          "createdAt",
+          "paidAt",
+        ],
+        additionalProperties: false,
+        properties: {
+          ...BILLING_ATTRIBUTION_PROPERTIES,
+          organizationId: IDENTIFIER_SCHEMA,
+          reference: { $ref: "#/components/schemas/BillingReference" },
+          moneyPolicy: { type: "string", enum: ["usd-cents-v1", "usd-micros-v2"] },
+          meter: { type: "string", minLength: 1, maxLength: 128 },
+          quantityUnit: { type: "string", minLength: 1, maxLength: 64 },
+          quantity: { $ref: "#/components/schemas/BillingUnsignedDecimal" },
+          periodStart: { $ref: "#/components/schemas/BillingUtcDateTime" },
+          periodEnd: { $ref: "#/components/schemas/BillingUtcDateTime" },
+          pricingRevision: { $ref: "#/components/schemas/BillingRevision" },
+          rate: {
+            type: "object",
+            required: ["numeratorMicros", "denominator"],
+            additionalProperties: false,
+            properties: {
+              numeratorMicros: {
+                type: "string",
+                minLength: 1,
+                maxLength: 256,
+                pattern: "^(?:0|[1-9][0-9]*)$",
+              },
+              denominator: {
+                type: "string",
+                minLength: 1,
+                maxLength: 256,
+                pattern: "^(?:0|[1-9][0-9]*)$",
+              },
+            },
+          },
+          amountMicros: { $ref: "#/components/schemas/BillingUnsignedMicros" },
+          status: { type: "string", enum: ["pending", "paid"] },
+          createdAt: { $ref: "#/components/schemas/BillingUtcDateTime" },
+          paidAt: {
+            anyOf: [{ $ref: "#/components/schemas/BillingUtcDateTime" }, { type: "null" }],
+          },
+        },
+      },
       Error: {
         type: "object",
         description:
@@ -853,6 +2632,95 @@ export const openApiDocument = {
           subject: { type: "string", minLength: 1, maxLength: 256 },
           email: { type: "string", minLength: 1, maxLength: 256 },
           displayName: { type: "string", minLength: 1, maxLength: 256 },
+        },
+      },
+      OperatorPaymentsReconcileRequest: {
+        type: "object",
+        required: ["assertion"],
+        additionalProperties: false,
+        properties: {
+          assertion: {
+            type: "string",
+            minLength: 1,
+            maxLength: 8_192,
+            description:
+              "Operator assertion for purpose `payments-reconcile`; `bun scripts/operator-key.ts payments-reconcile` prints one.",
+          },
+        },
+      },
+      OperatorPaymentsReconcileResponse: {
+        type: "object",
+        required: ["report"],
+        additionalProperties: false,
+        properties: { report: { $ref: "#/components/schemas/FundingReconcileReport" } },
+      },
+      FundingReconcileReport: {
+        type: "object",
+        required: [
+          "examined",
+          "credited",
+          "alreadyCredited",
+          "unknownOrganization",
+          "skipped",
+          "truncated",
+          "creditedFundingRefs",
+          "uncredited",
+        ],
+        additionalProperties: false,
+        properties: {
+          examined: { type: "integer", minimum: 0 },
+          credited: { type: "integer", minimum: 0 },
+          alreadyCredited: { type: "integer", minimum: 0 },
+          unknownOrganization: { type: "integer", minimum: 0 },
+          skipped: {
+            type: "object",
+            description: "Sessions that do not credit, counted by machine reason",
+            additionalProperties: { type: "integer", minimum: 1 },
+          },
+          truncated: {
+            type: "boolean",
+            description: "The lookback window held more sessions than one pass reads",
+          },
+          creditedFundingRefs: {
+            type: "array",
+            items: { type: "string", minLength: 1 },
+          },
+          uncredited: {
+            type: "array",
+            description: "Paid sessions this pass could not credit",
+            items: {
+              type: "object",
+              required: ["fundingRef", "reason"],
+              additionalProperties: false,
+              properties: {
+                fundingRef: { type: "string", minLength: 1 },
+                reason: { type: "string", minLength: 1 },
+              },
+            },
+          },
+          billing: {
+            $ref: "#/components/schemas/BillingReconcileReport",
+            description: "Hosted billing progress, present only when Hosted billing is configured",
+          },
+        },
+      },
+      BillingReconcileReport: {
+        type: "object",
+        required: ["examined", "applied", "unresolved", "truncated", "handlerVersion"],
+        additionalProperties: false,
+        properties: {
+          examined: { type: "integer", minimum: 0 },
+          applied: { type: "integer", minimum: 0 },
+          unresolved: {
+            type: "integer",
+            minimum: 0,
+            description: "Billing objects or streams still unresolved after this pass",
+          },
+          truncated: {
+            type: "boolean",
+            description: "At least one billing stream was not completely scanned in this pass",
+          },
+          handlerVersion: { const: 1 },
         },
       },
       IntegrationOrganizationBootstrapStatusRequest: {

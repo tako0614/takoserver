@@ -8,12 +8,19 @@ import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
 import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
 import {
+  assertStorageRebindNotOperatorStagingPair,
   type IntegrationStorageGenerationTargetProof,
   type IntegrationStorageGenerationTargetVerificationOptions,
   verifyFreshV2IntegrationStorageTarget,
   verifyIntegrationStorageGenerationTarget,
 } from "./integration-storage-generation.ts";
-import { pendingMigrations, readD1SchemaState, readMigrationArtifact } from "./migrations.ts";
+import {
+  moneyUnitSchemaReady,
+  pendingMigrations,
+  readD1SchemaState,
+  readMigrationArtifact,
+  readMoneyUnitPolicy,
+} from "./migrations.ts";
 import {
   type CommandResult,
   REPOSITORY,
@@ -31,6 +38,8 @@ import {
 } from "./target.ts";
 import {
   assertProviderExecutorUnchanged,
+  assertWorkerMoneyUnitSchema,
+  probeMoneyCutoverProductOrFrozen,
   probeProduct,
   probeSchemaMaintenance,
   providerExecutorAllowsPublication,
@@ -38,6 +47,7 @@ import {
   type WorkerMigrationReader,
   type WorkerProviderExecutorQualification,
   withProviderExecutorQualification,
+  workerMoneyUnitSchemaReady,
   workerSchemaAllowsPending,
 } from "./worker.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
@@ -190,6 +200,7 @@ export async function runWorkerClosureTransition(
     }
   }
   assertStorageRebindIntegrationOnly("preflight", invocation.environment, delta);
+  assertStorageRebindNotOperatorStagingPair(target, delta.storageRebind);
   assertServiceBindingRefreshIntegrationOnly("preflight", invocation.environment, delta);
   if (workerClosureDeltaIsEmpty(delta)) {
     throw preflightError(
@@ -220,6 +231,9 @@ export async function runWorkerClosureTransition(
       ? null
       : await selectedStorageVerifier(target)(target, invocation.environment, {
           ...options.integrationStorageVerification,
+          allowCurrentAuditedSuccessor: closureRequiresMoneyUnitSchema(target),
+          allowMoneyUnitMaintenance:
+            target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced",
           run,
           ...(options.cloudflareEnvironment === undefined
             ? {}
@@ -237,7 +251,14 @@ export async function runWorkerClosureTransition(
     null;
   try {
     const createCloudflareState = (token: string | undefined): CloudflareState =>
-      new CloudflareState({ accountId: target.accountId, token: token ?? exactToken(environment) });
+      new CloudflareState({
+        accountId: target.accountId,
+        token: token ?? exactToken(environment),
+        ...(target.environment === "integration" &&
+        new URL(target.publicOrigin).hostname.endsWith(".workers.dev")
+          ? { workerDomainServiceScope: target.workerName }
+          : {}),
+      });
     const cloudflareState =
       options.state === undefined ? createCloudflareState(credential?.token) : null;
     const initialState = options.state ?? cloudflareState;
@@ -347,6 +368,8 @@ export async function runWorkerClosureTransition(
           ready:
             target.schemaMaintenanceMode === undefined &&
             workerSchemaAllowsPending(target, migrationState, sourceRepositoryRoot) &&
+            (!closureRequiresMoneyUnitSchema(target) ||
+              workerMoneyUnitSchemaReady(migrationState, sourceRepositoryRoot)) &&
             (providerExecutorBefore === null || providerExecutorBefore.ready),
         },
         providerExecutorBefore,
@@ -358,6 +381,9 @@ export async function runWorkerClosureTransition(
         "closure transition refuses pending D1 migrations; apply takoserver-d1-schema first",
         JSON.stringify(pending),
       );
+    }
+    if (closureRequiresMoneyUnitSchema(target)) {
+      assertWorkerMoneyUnitSchema(migrationState, sourceRepositoryRoot, "preflight");
     }
     const reviewer = exactReviewer(
       options.review ?? requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"),
@@ -521,6 +547,9 @@ export async function runWorkerClosureTransition(
         JSON.stringify(finalPending),
       );
     }
+    if (closureRequiresMoneyUnitSchema(target)) {
+      assertWorkerMoneyUnitSchema(finalMigrationState, sourceRepositoryRoot, "preflight");
+    }
     if (
       JSON.stringify(finalMigrationState.local) !== JSON.stringify(migrationState.local) ||
       JSON.stringify(finalMigrationState.applied) !== JSON.stringify(migrationState.applied) ||
@@ -534,6 +563,9 @@ export async function runWorkerClosureTransition(
         invocation.environment,
         {
           ...options.integrationStorageVerification,
+          allowCurrentAuditedSuccessor: closureRequiresMoneyUnitSchema(target),
+          allowMoneyUnitMaintenance:
+            target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced",
           run,
           ...(options.cloudflareEnvironment === undefined
             ? {}
@@ -596,6 +628,9 @@ export async function runWorkerClosureTransition(
     if (!workerSchemaAllowsPending(target, afterMigrations, sourceRepositoryRoot)) {
       throw verificationError("closure transition left pending D1 migrations");
     }
+    if (closureRequiresMoneyUnitSchema(target)) {
+      assertWorkerMoneyUnitSchema(afterMigrations, sourceRepositoryRoot, "verification");
+    }
     const providerExecutorAfter =
       providerExecutorQualification === null
         ? null
@@ -614,6 +649,9 @@ export async function runWorkerClosureTransition(
         invocation.environment,
         {
           ...options.integrationStorageVerification,
+          allowCurrentAuditedSuccessor: closureRequiresMoneyUnitSchema(target),
+          allowMoneyUnitMaintenance:
+            target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced",
           run,
           ...(options.cloudflareEnvironment === undefined
             ? {}
@@ -646,10 +684,16 @@ export async function runWorkerClosureTransition(
               target.publicOrigin,
               options.fetcher ?? ((input, init) => fetch(input, init)),
             )
-          : await probeProduct(
-              target.publicOrigin,
-              options.fetcher ?? ((input, init) => fetch(input, init)),
-            );
+          : target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1" &&
+              afterMigrations.applied.length === 94
+            ? await probeMoneyCutoverProductOrFrozen(
+                target.publicOrigin,
+                options.fetcher ?? ((input, init) => fetch(input, init)),
+              )
+            : await probeProduct(
+                target.publicOrigin,
+                options.fetcher ?? ((input, init) => fetch(input, init)),
+              );
     const rollbackVersionId = after.history.previousVersionId;
     if (rollbackVersionId === null) {
       throw verificationError(
@@ -683,6 +727,7 @@ export async function runWorkerClosureTransition(
           ? {}
           : { maintenance: target.schemaMaintenanceMode }),
         probe,
+        servingReady: !("traffic" in probe),
         mutationApplied: true,
         rollback:
           `wrangler versions deploy ${rollbackVersionId}@100% --yes ` +
@@ -772,6 +817,8 @@ async function appliedClosureTransitionStatus(
     ready:
       target.schemaMaintenanceMode === undefined &&
       workerSchemaAllowsPending(target, migrationState) &&
+      (!closureRequiresMoneyUnitSchema(target) ||
+        workerMoneyUnitSchemaReady(migrationState, sourceRepositoryRoot)) &&
       successor.commit === invocation.commit,
   };
 }
@@ -875,6 +922,11 @@ function assertIntegrationStorageProofUnchanged(
       "generated integration storage target or schema changed before publication",
     );
   }
+}
+
+/** Both explicit modes return before app composition and never serve traffic. */
+function closureRequiresMoneyUnitSchema(target: DeployTarget): boolean {
+  return target.schemaMaintenanceMode === undefined && target.artifactBlobIoMode === undefined;
 }
 
 function selectedStorageVerifier(target: DeployTarget) {
@@ -1049,18 +1101,20 @@ function remoteMigrationReader(
   return {
     async read() {
       const local = readMigrationArtifact(resolve(sourceRepositoryRoot, "migrations"));
-      const remote = await readD1SchemaState(
-        new RemoteD1(configPath, {
-          environment,
-          run,
-          wranglerCommand: (args) => deployWranglerCommand(wranglerPath, args),
-        }),
-      );
+      const database = new RemoteD1(configPath, {
+        environment,
+        run,
+        wranglerCommand: (args) => deployWranglerCommand(wranglerPath, args),
+      });
+      const remote = await readD1SchemaState(database);
       return {
         local: local.names,
         applied: remote.applied,
         shape: remote.shape,
         shapeDigest: remote.shapeDigest,
+        ...(moneyUnitSchemaReady(remote.applied)
+          ? { moneyUnitPolicy: await readMoneyUnitPolicy(database) }
+          : {}),
       };
     },
   };

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { ARTIFACT_RECOVERY_RETENTION_FORMAT } from "../../src/artifact-recovery.ts";
+import { type BillingConfig, parseBillingConfig } from "../../src/billing-config.ts";
 import {
   type HostedEdgeSupplies,
   parseHostedEdgeSupplies,
@@ -10,8 +11,17 @@ import {
   type HostedObjectBucketSupplies,
   parseHostedObjectBucketSupplies,
 } from "../../src/hosted-object-bucket-supplies.ts";
+import { assertHostedPricingMatchesBilling, parseHostedPricing } from "../../src/hosted-pricing.ts";
 import { INTEGRATION_E2E_ORGANIZATION_ID } from "../../src/integration-e2e-credential-authority.ts";
 import { canonicalJson } from "../../src/json.ts";
+import {
+  DEFAULT_CHECKOUT_MAXIMUM_MINOR,
+  DEFAULT_CHECKOUT_MINIMUM_MINOR,
+  PAYMENT_SETTING_VARIABLES,
+  type PaymentSettings,
+  PaymentSettingsError,
+  validatePaymentSettings,
+} from "../../src/payment-settings.ts";
 import { isCloudflareWorkersAiModelReference } from "../../src/providers/cloudflare-workers-ai.ts";
 import { parseOpenAiModelConfig } from "../../src/providers/openai.ts";
 import {
@@ -28,8 +38,13 @@ import type { DeployEnvironment } from "./qualification.ts";
  * resources this repository may publish onto. It is operator-private and is
  * never committed: the repository stays account-neutral.
  */
-/** Explicit fresh integration v2 storage payloads beyond the historical 0075 default. */
-export type TakoformV2StorageLineage = "v2-0088" | "v2-0089";
+/**
+ * Explicit fresh integration v2 storage payloads beyond the historical 0075
+ * default. Every v2 Worker target is integration-only, so `v2-0091` (through the
+ * Stripe event table) and `v2-0092` (through the Organization wallet lifecycle
+ * tables) are staging-only lineages.
+ */
+export type TakoformV2StorageLineage = "v2-0088" | "v2-0089" | "v2-0091" | "v2-0092";
 
 /** The exact fresh payload a v2 target's generated storage must carry. */
 export function takoformV2StorageLineage(
@@ -55,11 +70,20 @@ export interface DeployTarget {
   readonly takoformV2?: {
     readonly config: string;
     readonly storageLineage?: TakoformV2StorageLineage;
+    /** Explicit reviewed in-place successor; never changes the fresh-origin profile. */
+    readonly appliedSchemaLineage?: "v2-0092";
   };
   /** Temporary pre-0043 runtime used only by the 0043 cutover protocol. */
   readonly artifactBlobIoMode?: "pre-0043-quiesced";
   /** Optional whole-Host source-only maintenance profile for an exact pending schema wave. */
-  readonly schemaMaintenanceMode?: "pre-0058-quiesced" | "pre-v2-0088-quiesced";
+  readonly schemaMaintenanceMode?:
+    | "pre-0058-quiesced"
+    | "pre-v2-0088-quiesced"
+    | "pre-wallet-usd-micros-quiesced";
+  /** Explicit selected-Host D1 transaction containment, retained after resume. */
+  readonly moneyCutoverWriterPolicy?: "transaction-fenced-usd-micros-v1";
+  /** Reviewed nonsecret Writer generation; new source generations require a separate rotation. */
+  readonly moneyCutoverWriterEpoch?: string;
   /** Operator-selected, preprovisioned single-host custody for protected 0058 attempts. */
   readonly protected0058Custody?: {
     readonly root: string;
@@ -93,6 +117,17 @@ export interface DeployTarget {
   readonly takosId?: { readonly issuer: string; readonly clientId: string };
   /** Requires the deployed Worker to offer customer Stripe Checkout funding. */
   readonly stripeCheckout?: boolean;
+  /**
+   * Requires the deployed Worker to receive Stripe webhooks, and the Worker to
+   * hold a `STRIPE_WEBHOOK_SECRET`. Only with `stripeCheckout`.
+   */
+  readonly stripeWebhook?: boolean;
+  /** Non-secret Stripe amounts and windows; each absent one takes its default. */
+  readonly stripeSettings?: PaymentSettings;
+  /** Optional versioned, non-secret Organization billing tariff. */
+  readonly billingConfig?: BillingConfig;
+  /** Exact bounded authoring JSON emitted as TAKOSERVER_HOSTED_PRICING. */
+  readonly hostedPricing?: string;
   /**
    * DNS zones this deployment may attach customer Workers to.
    *
@@ -327,6 +362,10 @@ const DEPLOY_TARGET_OPTIONAL_KEYS: readonly string[] = [
   "googleClientId",
   "takosId",
   "stripeCheckout",
+  "stripeWebhook",
+  "stripeSettings",
+  "billingConfig",
+  "hostedPricing",
   "zones",
   "aiModels",
   "objectBucketSupplies",
@@ -339,6 +378,8 @@ const DEPLOY_TARGET_OPTIONAL_KEYS: readonly string[] = [
   "integrationE2eCredentialAuthority",
   "artifactBlobIoMode",
   "schemaMaintenanceMode",
+  "moneyCutoverWriterPolicy",
+  "moneyCutoverWriterEpoch",
   "protected0058Custody",
   "takoformV2",
 ];
@@ -495,6 +536,12 @@ export function parseDeployTarget(
     ...(value.takoformV2 === undefined ? {} : { takoformV2: takoformV2(value.takoformV2) }),
     ...artifactBlobIoMode(value.artifactBlobIoMode),
     ...schemaMaintenanceMode(value.schemaMaintenanceMode),
+    ...(value.moneyCutoverWriterPolicy === undefined
+      ? {}
+      : { moneyCutoverWriterPolicy: moneyCutoverWriterPolicy(value.moneyCutoverWriterPolicy) }),
+    ...(value.moneyCutoverWriterEpoch === undefined
+      ? {}
+      : { moneyCutoverWriterEpoch: moneyCutoverWriterEpoch(value.moneyCutoverWriterEpoch) }),
     ...(value.protected0058Custody === undefined
       ? {}
       : { protected0058Custody: protected0058Custody(value.protected0058Custody) }),
@@ -509,6 +556,15 @@ export function parseDeployTarget(
     ...(value.stripeCheckout === undefined
       ? {}
       : { stripeCheckout: boolean(value.stripeCheckout, "stripeCheckout") }),
+    ...(value.stripeWebhook === undefined
+      ? {}
+      : { stripeWebhook: boolean(value.stripeWebhook, "stripeWebhook") }),
+    ...(value.stripeSettings === undefined
+      ? {}
+      : { stripeSettings: stripeSettings(value.stripeSettings) }),
+    ...(value.billingConfig === undefined
+      ? {}
+      : { billingConfig: deployBillingConfig(value.billingConfig) }),
     ...(value.zones === undefined ? {} : { zones: zoneList(value.zones) }),
     ...(value.aiModels === undefined ? {} : { aiModels: modelList(value.aiModels) }),
     ...(value.objectBucketSupplies === undefined
@@ -547,8 +603,51 @@ export function parseDeployTarget(
         }),
     signing: signing(value.signing),
   };
+  if (
+    (target.stripeWebhook === true || target.stripeSettings !== undefined) &&
+    target.stripeCheckout !== true
+  ) {
+    // A webhook or a payment setting on a deployment that takes no payment is
+    // a target that says something different from what it will do.
+    throw preflightError("deploy target Stripe webhook and settings require `stripeCheckout`");
+  }
   if (target.schemaMaintenanceMode === "pre-v2-0088-quiesced" && environment !== "integration") {
     throw preflightError("v2 0088 schema maintenance is integration-only");
+  }
+  if (
+    target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced" &&
+    (environment !== "integration" ||
+      target.artifactBlobIoMode !== undefined ||
+      (target.takoformV2?.storageLineage !== "v2-0092" &&
+        target.takoformV2?.appliedSchemaLineage !== "v2-0092") ||
+      !/^takoserver-i-[0-9a-f]{32}$/u.test(target.d1.databaseName) ||
+      target.r2.bucketName !== target.d1.databaseName)
+  ) {
+    throw preflightError(
+      "wallet USD-micros maintenance requires an existing integration v2-0092 generated D1/R2 pair",
+    );
+  }
+  if (
+    target.moneyCutoverWriterPolicy !== undefined &&
+    (environment !== "integration" ||
+      (target.takoformV2?.storageLineage !== "v2-0092" &&
+        target.takoformV2?.appliedSchemaLineage !== "v2-0092") ||
+      !/^takoserver-i-[0-9a-f]{32}$/u.test(target.d1.databaseName) ||
+      target.r2.bucketName !== target.d1.databaseName)
+  ) {
+    throw preflightError("money cutover writer policy requires selected integration 0092 storage");
+  }
+  if (
+    (target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1") !==
+    (target.moneyCutoverWriterEpoch !== undefined)
+  ) {
+    throw preflightError("money cutover writer policy requires an exact pinned Writer epoch");
+  }
+  if (
+    target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced" &&
+    target.moneyCutoverWriterPolicy !== "transaction-fenced-usd-micros-v1"
+  ) {
+    throw preflightError("wallet USD-micros maintenance requires transaction writer policy");
   }
   if (target.schemaMaintenanceMode === "pre-v2-0088-quiesced" && target.takoformV2 === undefined) {
     throw preflightError("v2 0088 schema maintenance must retain the exact v2 Worker config");
@@ -571,6 +670,18 @@ export function parseDeployTarget(
       target.schemaMaintenanceMode === "pre-0058-quiesced"
     ) {
       throw preflightError("v2 Worker target cannot select a maintenance profile");
+    }
+  }
+  if (target.takoformV2?.appliedSchemaLineage === "v2-0092") {
+    if (
+      target.takoformV2.storageLineage !== "v2-0088" ||
+      (target.schemaMaintenanceMode !== undefined &&
+        target.schemaMaintenanceMode !== "pre-wallet-usd-micros-quiesced") ||
+      target.artifactBlobIoMode !== undefined
+    ) {
+      throw preflightError(
+        "applied v2-0092 requires the original fresh v2-0088 integration target without maintenance selectors",
+      );
     }
   }
   const cloudflareSupplies = [
@@ -802,7 +913,37 @@ export function parseDeployTarget(
       );
     }
   }
-  return target;
+  if (value.hostedPricing === undefined) return target;
+  return { ...target, hostedPricing: deployHostedPricing(value.hostedPricing, target) };
+}
+
+function deployHostedPricing(
+  value: unknown,
+  target: Pick<DeployTarget, "billingConfig" | "stripeCheckout" | "stripeSettings">,
+): string {
+  try {
+    if (typeof value !== "string" || target.stripeCheckout !== true) throw new Error();
+    const pricing = parseHostedPricing(value);
+    if (!pricing) throw new Error();
+    assertHostedPricingMatchesBilling(pricing, target.billingConfig);
+    const usagePlan = pricing.hostedPlanTable.plans.find((plan) => plan.tier === "usage");
+    if (
+      !usagePlan ||
+      usagePlan.checkoutMinimumMinor !==
+        (target.stripeSettings?.checkoutMinimumMinor ?? DEFAULT_CHECKOUT_MINIMUM_MINOR) ||
+      usagePlan.checkoutMaximumMinor !==
+        (target.stripeSettings?.checkoutMaximumMinor ?? DEFAULT_CHECKOUT_MAXIMUM_MINOR)
+    ) {
+      throw new Error();
+    }
+    return value;
+  } catch {
+    // Do not expose operator-authored plan or Stripe Price identities in a
+    // preflight diagnostic.
+    throw preflightError(
+      "deploy target hostedPricing is invalid or does not match enabled billing and Checkout settings",
+    );
+  }
 }
 
 function exactArtifactRecovery(value: unknown): NonNullable<DeployTarget["exactArtifactRecovery"]> {
@@ -1352,6 +1493,42 @@ function pattern(value: unknown, expression: RegExp, field: string): string {
   return value;
 }
 
+function deployBillingConfig(value: unknown): BillingConfig {
+  try {
+    if (!isRecord(value)) throw new TypeError("billing config must be an object");
+    const parsed = parseBillingConfig(JSON.stringify(value));
+    if (parsed === undefined) throw new TypeError("billing config must not be empty");
+    return parsed;
+  } catch {
+    // The private target may contain operator-authored pricing details. Keep
+    // parse diagnostics bounded to a generic refusal and never echo the value.
+    throw preflightError("deploy target billingConfig is invalid");
+  }
+}
+
+function stripeSettings(value: unknown): PaymentSettings {
+  if (!isRecord(value)) throw preflightError("deploy target `stripeSettings` must be an object");
+  const names = Object.keys(PAYMENT_SETTING_VARIABLES) as (keyof PaymentSettings)[];
+  assertExactKeys(value, [], names);
+  const settings: { -readonly [Key in keyof PaymentSettings]: number } = {};
+  for (const name of names) {
+    const setting = value[name];
+    if (setting === undefined) continue;
+    if (typeof setting !== "number" || !Number.isSafeInteger(setting)) {
+      throw preflightError(`deploy target \`stripeSettings.${name}\` is invalid`);
+    }
+    settings[name] = setting;
+  }
+  try {
+    return validatePaymentSettings(settings, (name) => `stripeSettings.${name}`);
+  } catch (error) {
+    if (error instanceof PaymentSettingsError) {
+      throw preflightError(`deploy target \`${error.setting}\` is invalid`);
+    }
+    throw error;
+  }
+}
+
 function boolean(value: unknown, field: string): boolean {
   if (typeof value !== "boolean") {
     throw preflightError(`deploy target \`${field}\` is invalid`);
@@ -1361,7 +1538,7 @@ function boolean(value: unknown, field: string): boolean {
 
 function takoformV2(value: unknown): NonNullable<DeployTarget["takoformV2"]> {
   if (!isRecord(value)) throw preflightError("deploy target `takoformV2` must be an object");
-  assertExactKeys(value, ["config"], ["storageLineage"]);
+  assertExactKeys(value, ["config"], ["storageLineage", "appliedSchemaLineage"]);
   if (typeof value.config !== "string") {
     throw preflightError("deploy target `takoformV2.config` must be non-secret JSON text");
   }
@@ -1373,15 +1550,25 @@ function takoformV2(value: unknown): NonNullable<DeployTarget["takoformV2"]> {
   if (
     value.storageLineage !== undefined &&
     value.storageLineage !== "v2-0088" &&
-    value.storageLineage !== "v2-0089"
+    value.storageLineage !== "v2-0089" &&
+    value.storageLineage !== "v2-0091" &&
+    value.storageLineage !== "v2-0092"
   ) {
     throw preflightError(
-      "deploy target `takoformV2.storageLineage` must be v2-0088 or v2-0089 when set",
+      "deploy target `takoformV2.storageLineage` must be v2-0088, v2-0089, v2-0091 or v2-0092 when set",
+    );
+  }
+  if (value.appliedSchemaLineage !== undefined && value.appliedSchemaLineage !== "v2-0092") {
+    throw preflightError(
+      "deploy target `takoformV2.appliedSchemaLineage` must be v2-0092 when set",
     );
   }
   return {
     config: value.config,
     ...(value.storageLineage === undefined ? {} : { storageLineage: value.storageLineage }),
+    ...(value.appliedSchemaLineage === undefined
+      ? {}
+      : { appliedSchemaLineage: value.appliedSchemaLineage }),
   };
 }
 
@@ -1393,11 +1580,29 @@ function artifactBlobIoMode(value: unknown): { readonly artifactBlobIoMode?: "pr
   return { artifactBlobIoMode: value };
 }
 
+function moneyCutoverWriterPolicy(value: unknown): "transaction-fenced-usd-micros-v1" {
+  if (value !== "transaction-fenced-usd-micros-v1") {
+    throw preflightError("deploy target money cutover writer policy is invalid");
+  }
+  return value;
+}
+
+function moneyCutoverWriterEpoch(value: unknown): string {
+  return pattern(value, /^sha256:[0-9a-f]{64}$/u, "moneyCutoverWriterEpoch");
+}
+
 function schemaMaintenanceMode(value: unknown): {
-  readonly schemaMaintenanceMode?: "pre-0058-quiesced" | "pre-v2-0088-quiesced";
+  readonly schemaMaintenanceMode?:
+    | "pre-0058-quiesced"
+    | "pre-v2-0088-quiesced"
+    | "pre-wallet-usd-micros-quiesced";
 } {
   if (value === undefined) return {};
-  if (value !== "pre-0058-quiesced" && value !== "pre-v2-0088-quiesced") {
+  if (
+    value !== "pre-0058-quiesced" &&
+    value !== "pre-v2-0088-quiesced" &&
+    value !== "pre-wallet-usd-micros-quiesced"
+  ) {
     throw preflightError(
       "deploy target `schemaMaintenanceMode` is not a supported maintenance profile",
     );

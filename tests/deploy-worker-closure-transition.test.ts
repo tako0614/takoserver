@@ -126,6 +126,19 @@ const schemaMaintenanceTarget = {
   schemaMaintenanceMode: "pre-0058-quiesced" as const,
 } satisfies DeployTarget;
 const schemaMigrations = readMigrationArtifact().names;
+const canonicalMoneyShape = deriveExpectedApplicationShape(readMigrationArtifact().files);
+const canonicalMoneyPolicy = [
+  {
+    ledger_unit: "usd-micros-v2",
+    historical_usage_unit: "microcent-v1",
+    cash_unit: "usd-cents-v1",
+  },
+];
+const currentMoneyStorageState = {
+  applied: schemaMigrations,
+  shape: canonicalMoneyShape,
+  shapeDigest: `sha256:${createHash("sha256").update(canonicalMoneyShape).digest("hex")}`,
+};
 const schemaPredecessor = schemaMigrations.slice(0, 57);
 
 const storageRebindTarget = {
@@ -291,6 +304,7 @@ function fixture(
     readonly selected?: DeployTarget;
     readonly local?: readonly string[];
     readonly auditedShape?: string;
+    readonly moneyUnitPolicy?: readonly Readonly<Record<string, unknown>>[];
   } = {},
 ): Fixture {
   const selected = input.selected ?? target;
@@ -386,14 +400,13 @@ function fixture(
     migrations: {
       async read() {
         return {
-          local: input.local ?? ["0001_first.sql", "0002_second.sql"],
-          applied: input.applied ?? ["0001_first.sql", "0002_second.sql"],
-          ...(input.auditedShape === undefined
-            ? {}
-            : {
-                shape: input.auditedShape,
-                shapeDigest: `sha256:${createHash("sha256").update(input.auditedShape).digest("hex")}`,
-              }),
+          local: input.local ?? schemaMigrations,
+          applied: input.applied ?? schemaMigrations,
+          shape: input.auditedShape ?? canonicalMoneyShape,
+          shapeDigest: `sha256:${createHash("sha256")
+            .update(input.auditedShape ?? canonicalMoneyShape)
+            .digest("hex")}`,
+          moneyUnitPolicy: input.moneyUnitPolicy ?? canonicalMoneyPolicy,
         };
       },
     },
@@ -507,7 +520,9 @@ describe("reviewed Worker closure transition", () => {
         outputDirectory: root,
         secretDirectory: parts.secretDirectory,
         cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
-        integrationStorageVerification: baseIntegrationStorageVerificationOptions(v2Target),
+        integrationStorageVerification: baseIntegrationStorageVerificationOptions(v2Target, {
+          readState: async () => currentMoneyStorageState,
+        }),
         fetcher: publishedProductFetcher(),
       };
       const status = await runWorkerClosureTransition(
@@ -603,7 +618,9 @@ describe("reviewed Worker closure transition", () => {
             outputDirectory: root,
             secretDirectory: parts.secretDirectory,
             cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
-            integrationStorageVerification: baseIntegrationStorageVerificationOptions(v2Target),
+            integrationStorageVerification: baseIntegrationStorageVerificationOptions(v2Target, {
+              readState: async () => currentMoneyStorageState,
+            }),
             fetcher: publishedProductFetcher(),
           },
         ).catch((error: unknown) => error);
@@ -1209,6 +1226,50 @@ describe("reviewed Worker closure transition", () => {
     });
   });
 
+  test("ordinary closure refuses incomplete 0094 schema or missing unit policy before upload", async () => {
+    for (const [name, input] of [
+      ["pre-0094", { applied: schemaMigrations.slice(0, 92) }],
+      ["corrupt-shape", { auditedShape: "[]" }],
+      ["missing-policy", { moneyUnitPolicy: [] }],
+    ] as const) {
+      await withRoot(`takoserver-closure-money-${name}-`, async (root) => {
+        const parts = fixture(root, input);
+        const invocation = {
+          surface: "takoserver-worker-authority-cutover",
+          environment: "integration",
+          commit: COMMIT,
+          closurePredecessorVersionId: PREDECESSOR,
+          delta: INTEGRATION_DELTA,
+        } as const;
+        const options = {
+          run: parts.run,
+          state: parts.state,
+          providerExecutorQualification: parts.providerExecutorQualification,
+          migrations: parts.migrations,
+          review: "reviewer@example.test",
+          secretDirectory: parts.secretDirectory,
+          cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "token" },
+          outputDirectory: join(root, "work"),
+        };
+        const status = await runWorkerClosureTransition(
+          { ...invocation, action: "status" },
+          target,
+          options,
+        );
+        expect(status).toMatchObject({ ready: false, mutationApplied: false });
+        const failure = await runWorkerClosureTransition(
+          { ...invocation, action: "apply" },
+          target,
+          options,
+        ).catch((error: unknown) => error);
+        expect(failure).toBeInstanceOf(DeployError);
+        expect((failure as DeployError).phase).toBe("preflight");
+        expect(parts.calls.some((call) => call.join(" ") === "bun run check")).toBe(false);
+        expect(parts.calls.some((call) => call.includes("--no-bundle"))).toBe(false);
+      });
+    }
+  });
+
   test("storage rebind keeps the exact old predecessor values and publishes target-derived successors", async () => {
     await withRoot("takoserver-closure-storage-rebind-", async (root) => {
       const parts = fixture(root, {
@@ -1394,6 +1455,48 @@ describe("reviewed Worker closure transition", () => {
       expect(processCalls).toBe(0);
       expect(parts.base.stateCalls).toEqual([]);
     }
+  });
+
+  test("storage rebind refuses an operator staging pair before provider or Worker reads", async () => {
+    let processCalls = 0;
+    const STAGING = "takoserver-staging-throwaway-0091-example";
+    const parts = await withRoot("takoserver-closure-storage-rebind-staging-", async (root) => {
+      const selected = {
+        ...v2Target,
+        d1: { databaseName: STAGING, databaseId: STORAGE_DATABASE_ID },
+        r2: { bucketName: STAGING },
+        takoformV2: { config: V2_PUBLIC_CONFIG, storageLineage: "v2-0091" as const },
+      } satisfies DeployTarget;
+      const base = fixture(root, { selected });
+      return { selected, base };
+    });
+    const failure = await runWorkerClosureTransition(
+      {
+        surface: "takoserver-worker-authority-cutover",
+        action: "apply",
+        environment: "integration",
+        commit: COMMIT,
+        closurePredecessorVersionId: PREDECESSOR,
+        delta: { ...INTEGRATION_DELTA, storageRebind: STORAGE_REBIND },
+      },
+      parts.selected,
+      {
+        run: async () => {
+          processCalls += 1;
+          throw new Error("provider/process call must not happen");
+        },
+        state: parts.base.state,
+        providerExecutorQualification: parts.base.providerExecutorQualification,
+        migrations: parts.base.migrations,
+        integrationStorageVerification: integrationStorageVerificationOptions(parts.selected),
+      },
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(DeployError);
+    expect((failure as DeployError).message).toContain(
+      "storage rebind refuses an operator-provisioned staging pair",
+    );
+    expect(processCalls).toBe(0);
+    expect(parts.base.stateCalls).toEqual([]);
   });
 
   test("storage rebind stops at the immediate schema fence and on a failed gate before upload", async () => {

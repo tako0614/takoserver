@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { Miniflare } from "miniflare";
+import { MIGRATIONS } from "../src/db-schema.ts";
 import { canonicalDigest } from "../src/json.ts";
 import { createLedger } from "../src/ledger.ts";
+import { minorToMicros } from "../src/money.ts";
 import {
   createSponsorshipAuthority,
   SponsorshipAuthorityError,
@@ -46,9 +46,9 @@ test("D1 executes the guarded bind and preserves duplicate, conflict, and floor 
   });
   try {
     const database = await runtime.getD1Database("STATE_DB");
-    await applyMigration(database, migration("0003_control_plane.sql"));
-    await applyMigration(database, migration("0017_wallet_credit_lots.sql"));
-    await applyForwardMigration(database, migration("0047_sponsorship_cutover_consumption.sql"));
+    for (const entry of MIGRATIONS.filter(({ name }) => name <= "0094_wallet_usd_micros.sql")) {
+      await applyMigration(database, entry.sql);
+    }
     const sql = createD1Sql(database as unknown as D1DatabaseLike);
     for (const organizationId of ["org_hosted", "org_other"]) {
       await sql.run(
@@ -59,7 +59,9 @@ test("D1 executes the guarded bind and preserves duplicate, conflict, and floor 
     await createLedger(sql, () => NOW).fund({
       organizationId: "org_hosted",
       fundingRef: "funding:d1",
-      amountMinor: 1_000,
+      amountMicros: minorToMicros(1_000),
+      kind: "purchased",
+      consumptionClass: "purchased",
     });
     await sql.run(
       "INSERT INTO sponsorship_tenants (tenant_ref, org_id, created_at) VALUES (?, ?, ?)",
@@ -224,28 +226,34 @@ async function channelFor(character: string) {
   };
 }
 
-function migration(name: string): string {
-  return readFileSync(resolve(import.meta.dir, "../migrations", name), "utf8");
-}
-
-async function applyForwardMigration(
-  database: Awaited<ReturnType<Miniflare["getD1Database"]>>,
-  source: string,
-): Promise<void> {
-  const statements = source.match(/CREATE (?:TABLE[\s\S]*?\n\);|TRIGGER[\s\S]*?\nEND;)/gu);
-  if (statements?.length !== 10) throw new Error("migration fixture parse failed");
-  for (const statement of statements) await database.prepare(statement).run();
+function statements(source: string): string[] {
+  const result: string[] = [];
+  let rest = source.replace(/^\s*--.*$/gmu, "").trim();
+  while (rest) {
+    if (/^CREATE\s+TRIGGER\b/iu.test(rest)) {
+      const end = /^END\s*;/imu.exec(rest);
+      if (!end) throw new Error("migration fixture has an incomplete trigger");
+      const boundary = (end.index ?? 0) + end[0].length;
+      result.push(rest.slice(0, boundary));
+      rest = rest.slice(boundary).trim();
+      continue;
+    }
+    const boundary = rest.indexOf(";");
+    if (boundary < 0) {
+      result.push(rest);
+      break;
+    }
+    result.push(rest.slice(0, boundary).trim());
+    rest = rest.slice(boundary + 1).trim();
+  }
+  return result.filter(Boolean);
 }
 
 async function applyMigration(
   database: Awaited<ReturnType<Miniflare["getD1Database"]>>,
   source: string,
 ): Promise<void> {
-  for (const statement of source
-    .replace(/--[^\n]*(?:\n|$)/gu, " ")
-    .split(";")
-    .map((part) => part.trim())
-    .filter(Boolean)) {
+  for (const statement of statements(source)) {
     await database.prepare(statement).run();
   }
 }

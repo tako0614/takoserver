@@ -12,6 +12,7 @@ import type { DeployTarget } from "../scripts/deploy/target.ts";
 import type { ProviderExecutorInspection } from "../scripts/deploy/worker.ts";
 import {
   authoritySensitiveWorkerPaths,
+  probeMoneyCutoverProductOrFrozen,
   probeProduct,
   probeSchemaMaintenance,
   providerExecutorAllowsPublication,
@@ -86,6 +87,15 @@ const schemaMaintenanceTarget = {
 } satisfies DeployTarget;
 
 const canonicalMigrations = readMigrationArtifact().names;
+const canonicalMoneyShape = deriveExpectedApplicationShape(readMigrationArtifact().files);
+const canonicalMoneyShapeDigest = `sha256:${createHash("sha256").update(canonicalMoneyShape).digest("hex")}`;
+const canonicalMoneyPolicy = [
+  {
+    ledger_unit: "usd-micros-v2",
+    historical_usage_unit: "microcent-v1",
+    cash_unit: "usd-cents-v1",
+  },
+];
 const exact0057 = canonicalMigrations.slice(0, 57);
 
 const executorTarget = {
@@ -291,8 +301,11 @@ function fixture(
     migrations: {
       async read() {
         return {
-          local: input.local ?? ["0001_first.sql", "0002_second.sql"],
-          applied: input.applied ?? ["0001_first.sql", "0002_second.sql"],
+          local: input.local ?? canonicalMigrations,
+          applied: input.applied ?? canonicalMigrations,
+          shape: canonicalMoneyShape,
+          shapeDigest: canonicalMoneyShapeDigest,
+          moneyUnitPolicy: canonicalMoneyPolicy,
         };
       },
     },
@@ -300,6 +313,166 @@ function fixture(
 }
 
 describe("split Takoserver Worker surfaces", () => {
+  test("qualified 0094 publication distinguishes exact frozen refusal from readiness", async () => {
+    const origin = "https://money.example.workers.dev";
+    const frozen = async (_url: string) =>
+      Response.json(
+        {
+          error: {
+            code: "backend_unavailable",
+            message: "Host is frozen for the wallet USD-micros writer transition",
+            details: { reason: "money-cutover-freeze" },
+          },
+        },
+        { status: 503, headers: { "cache-control": "no-store", "retry-after": "60" } },
+      );
+    expect(await probeMoneyCutoverProductOrFrozen(origin, frozen)).toMatchObject({
+      status: 503,
+      traffic: "money-frozen",
+    });
+    await expect(
+      probeMoneyCutoverProductOrFrozen(origin, async () =>
+        Response.json(
+          {
+            error: {
+              code: "backend_unavailable",
+              message: "wrong refusal",
+              details: { reason: "money-cutover-freeze" },
+            },
+          },
+          { status: 503, headers: { "cache-control": "no-store", "retry-after": "60" } },
+        ),
+      ),
+    ).rejects.toThrow("exact guarded refusal");
+  });
+  test("transaction-fenced selected Host refuses 0095 until its trigger-restoring suffix", () => {
+    const selected = {
+      ...v2Target,
+      takoformV2: { ...v2Target.takoformV2, storageLineage: "v2-0092" as const },
+      moneyCutoverWriterPolicy: "transaction-fenced-usd-micros-v1" as const,
+      moneyCutoverWriterEpoch: `sha256:${"a".repeat(64)}`,
+    };
+    expect(
+      workerSchemaAllowsPending(selected, {
+        local: canonicalMigrations,
+        applied: canonicalMigrations,
+        shape: canonicalMoneyShape,
+        shapeDigest: canonicalMoneyShapeDigest,
+      }),
+    ).toBe(false);
+  });
+  test("0092 without billingConfig refuses before Worker upload and reports not ready", async () => {
+    const current = fixture({ applied: canonicalMigrations.slice(0, 92) });
+    const status = await runWorker(
+      {
+        surface: "takoserver-worker",
+        action: "status",
+        environment: "integration",
+        commit: COMMIT,
+      },
+      target,
+      current,
+    );
+    expect(status).toMatchObject({ ready: false, moneyUnitSchemaReady: false });
+    const failure = await runWorker(
+      { surface: "takoserver-worker", action: "apply", environment: "integration", commit: COMMIT },
+      target,
+      { ...current, cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" } },
+    ).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(DeployError);
+    expect((failure as DeployError).phase).toBe("preflight");
+    expect((failure as Error).message).toContain("0094_wallet_usd_micros.sql");
+    expect(
+      current.calls.some((call) => call.includes("upload") || call.includes("--no-bundle")),
+    ).toBe(false);
+  });
+
+  test("current audited schema with corrupt shape or missing 0094 unit policy refuses before upload", async () => {
+    for (const defect of ["shape", "policy"] as const) {
+      const current = fixture();
+      const canonical = await current.migrations.read();
+      const migrations: WorkerMigrationReader = {
+        read: async () =>
+          defect === "shape"
+            ? {
+                ...canonical,
+                shape: "[]",
+                shapeDigest: `sha256:${createHash("sha256").update("[]").digest("hex")}`,
+              }
+            : { ...canonical, moneyUnitPolicy: [] },
+      };
+      const status = await runWorker(
+        {
+          surface: "takoserver-worker",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        { ...current, migrations },
+      );
+      expect(status).toMatchObject({ ready: false, moneyUnitSchemaReady: false });
+      const failure = await runWorker(
+        {
+          surface: "takoserver-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        { ...current, migrations, cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" } },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as DeployError).phase).toBe("preflight");
+      expect((failure as Error).message).toContain("exact current audited D1 schema");
+      expect(
+        current.calls.some((call) => call.includes("upload") || call.includes("--no-bundle")),
+      ).toBe(false);
+    }
+  });
+
+  test("exact current audited schema requires 0094 policy and rejects 94-only or foreign tails before upload", async () => {
+    for (const applied of [
+      canonicalMigrations.slice(0, -1),
+      [...canonicalMigrations, "0096_foreign.sql"],
+    ]) {
+      const current = fixture({ applied });
+      const status = await runWorker(
+        {
+          surface: "takoserver-worker",
+          action: "status",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        current,
+      ).catch((error: unknown) => error);
+      if (status instanceof DeployError) {
+        expect(status.phase).toBe("preflight");
+      } else {
+        expect(status).toMatchObject({ ready: false, moneyUnitSchemaReady: false });
+      }
+      const failure = await runWorker(
+        {
+          surface: "takoserver-worker",
+          action: "apply",
+          environment: "integration",
+          commit: COMMIT,
+        },
+        target,
+        { ...current, cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" } },
+      ).catch((error: unknown) => error);
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as DeployError).phase).toBe("preflight");
+      expect((failure as Error).message).toMatch(
+        /exact current audited D1 schema|more applied migrations/,
+      );
+      expect(
+        current.calls.some((call) => call.includes("upload") || call.includes("--no-bundle")),
+      ).toBe(false);
+    }
+  });
+
   test("v2 status remains read-only and cannot report ready without fixed 0075 proof", async () => {
     const current = fixture({ selectedTarget: v2Target });
     const failure = await runWorker(
@@ -329,12 +502,16 @@ describe("split Takoserver Worker surfaces", () => {
     expect(current.calls.filter((call) => call.includes("--no-bundle"))).toHaveLength(0);
   });
 
-  test("normal integration publication re-proves fixed 0075 storage before upload and after readback", async () => {
+  test("v2-0088 lineage publishes after full 0094 without changing its origin claim", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-v2-storage-"));
     try {
-      const current = fixture({ selectedTarget: v2Target });
+      const selectedTarget = {
+        ...v2Target,
+        takoformV2: { ...v2Target.takoformV2, storageLineage: "v2-0088" as const },
+      };
+      const current = fixture({ selectedTarget });
       let reads = 0;
-      const verification = integrationStorageVerificationOptions(v2Target);
+      const verification = integrationStorageVerificationOptions(selectedTarget);
       const result = await runWorker(
         {
           surface: "takoserver-worker",
@@ -342,7 +519,7 @@ describe("split Takoserver Worker surfaces", () => {
           environment: "integration",
           commit: COMMIT,
         },
-        v2Target,
+        selectedTarget,
         {
           ...current,
           outputDirectory: root,
@@ -353,7 +530,11 @@ describe("split Takoserver Worker surfaces", () => {
             reader: {
               read: async () => {
                 reads++;
-                return completeIntegrationStorageState();
+                return {
+                  applied: canonicalMigrations,
+                  shape: canonicalMoneyShape,
+                  shapeDigest: canonicalMoneyShapeDigest,
+                };
               },
             },
           },
@@ -365,7 +546,7 @@ describe("split Takoserver Worker surfaces", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   test("fixed 0075 proof drift before upload refuses without provider mutation", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-v2-drift-"));
@@ -622,6 +803,7 @@ describe("split Takoserver Worker surfaces", () => {
     expect(authorityImplementationClosure()).toEqual([
       "src/json.ts",
       "src/ledger.ts",
+      "src/money.ts",
       "src/ports.ts",
       "src/provider-runtime-input-port.ts",
       "src/resource-execution-evidence.ts",
@@ -699,6 +881,7 @@ describe("split Takoserver Worker surfaces", () => {
       "src/generated/takoform-stable-error-taxonomy.ts",
       "src/generated/takoform-stable-v1-catalog.ts",
       "src/json.ts",
+      "src/money.ts",
       "src/ports.ts",
       "src/provider-driver.ts",
       "src/provider-placement.ts",
@@ -889,7 +1072,7 @@ describe("split Takoserver Worker surfaces", () => {
     expect(current.calls).toHaveLength(0);
   });
 
-  test("routine refuses pending 0049 before its gate or upload", async () => {
+  test("routine refuses a pre-0094 D1 before its gate or upload", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-pending-"));
     try {
       const current = fixture({
@@ -914,7 +1097,7 @@ describe("split Takoserver Worker surfaces", () => {
         },
       ).catch((error) => error);
       expect(failure).toBeInstanceOf(DeployError);
-      expect(failure.message).toContain("pending D1 migrations");
+      expect(failure.message).toContain("0094_wallet_usd_micros.sql");
       expect(current.calls.some((call) => call.join(" ") === "bun run check")).toBe(false);
       expect(current.calls.some((call) => call.includes("--no-bundle"))).toBe(false);
     } finally {
@@ -984,9 +1167,9 @@ describe("split Takoserver Worker surfaces", () => {
         local: [...canonicalMigrations.slice(0, 87), "0088_foreign.sql"],
       }),
     ).toBe(false);
-  });
+  }, 20_000);
 
-  test("explicit fresh v2 storage lineage admits exactly its closed prefix as the settled schema", () => {
+  test("fresh and canonical 0088/0089/0091/0092 lineages require exact current audited schema for serving", () => {
     const at = (count: number) => ({
       local: canonicalMigrations,
       applied: canonicalMigrations.slice(0, count),
@@ -999,12 +1182,42 @@ describe("split Takoserver Worker surfaces", () => {
       ...v2Target,
       takoformV2: { ...v2Target.takoformV2, storageLineage: "v2-0089" as const },
     };
-    expect(workerSchemaAllowsPending(lineage0088, at(88))).toBe(true);
-    expect(workerSchemaAllowsPending(lineage0089, at(89))).toBe(true);
-    for (const count of [66, 75, 87, 89, canonicalMigrations.length]) {
+    expect(workerSchemaAllowsPending(lineage0088, at(88))).toBe(false);
+    expect(workerSchemaAllowsPending(lineage0089, at(89))).toBe(false);
+    for (const count of [66, 75, 87, 89]) {
       expect(workerSchemaAllowsPending(lineage0088, at(count))).toBe(false);
     }
+    expect(workerSchemaAllowsPending(lineage0088, at(canonicalMigrations.length))).toBe(true);
     expect(workerSchemaAllowsPending(lineage0089, at(88))).toBe(false);
+    const lineage0091 = {
+      ...v2Target,
+      takoformV2: { ...v2Target.takoformV2, storageLineage: "v2-0091" as const },
+    };
+    expect(workerSchemaAllowsPending(lineage0091, at(91))).toBe(false);
+    for (const count of [88, 89, 90, 92]) {
+      expect(workerSchemaAllowsPending(lineage0091, at(count))).toBe(false);
+    }
+    const lineage0092 = {
+      ...v2Target,
+      takoformV2: { ...v2Target.takoformV2, storageLineage: "v2-0092" as const },
+    };
+    expect(workerSchemaAllowsPending(lineage0092, at(92))).toBe(false);
+    for (const count of [88, 89, 91]) {
+      expect(workerSchemaAllowsPending(lineage0092, at(count))).toBe(false);
+    }
+    const applied0092 = {
+      ...lineage0088,
+      takoformV2: { ...lineage0088.takoformV2, appliedSchemaLineage: "v2-0092" as const },
+    };
+    const exact0092 = {
+      ...at(92),
+      shape: deriveExpectedApplicationShape(readMigrationArtifact().files.slice(0, 92)),
+    };
+    expect(workerSchemaAllowsPending(applied0092, exact0092)).toBe(false);
+    expect(workerSchemaAllowsPending(lineage0088, exact0092)).toBe(false);
+    for (const selected of [lineage0088, lineage0089, lineage0091, lineage0092, applied0092]) {
+      expect(workerSchemaAllowsPending(selected, at(canonicalMigrations.length))).toBe(true);
+    }
     expect(
       workerSchemaAllowsPending(lineage0088, {
         ...at(88),
@@ -2347,7 +2560,7 @@ describe("split Takoserver Worker surfaces", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   test("legacy bootstrap refuses an unannotated predecessor without the exact selector", async () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-worker-legacy-no-selector-"));

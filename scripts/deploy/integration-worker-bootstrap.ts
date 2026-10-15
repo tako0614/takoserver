@@ -21,7 +21,16 @@ import {
   type IntegrationStorageGenerationTargetVerificationOptions,
   verifyFreshV2IntegrationStorageTarget,
 } from "./integration-storage-generation.ts";
-import { canonicalSchemaShape, type D1SchemaState, readD1SchemaState } from "./migrations.ts";
+import {
+  assertMoneyUnitSchema,
+  assertOrgBillingSchema,
+  assertStripeWebhookSchema,
+  canonicalSchemaShape,
+  type D1SchemaState,
+  moneyUnitSchemaReady,
+  orgBillingSchemaReady,
+  readD1SchemaState,
+} from "./migrations.ts";
 import {
   type CommandResult,
   REPOSITORY,
@@ -38,6 +47,8 @@ import {
 } from "./qualification.ts";
 import { expectedWorkerSecrets, writeWorkerConfig } from "./realized-config.ts";
 import {
+  projectFreshIntegrationV2MigrationArtifact0091,
+  projectFreshIntegrationV2MigrationArtifact0092,
   projectFreshProductionV2MigrationArtifact,
   projectFreshProductionV2MigrationArtifact0089,
   projectFreshV2ArtifactMigrationArtifact,
@@ -118,8 +129,19 @@ const INTEGRATION_WORKER_BOOTSTRAP_GATES = [
     command: ["bun", "run", "typecheck:worker"],
   },
   {
-    label: "Host bootstrap tests `bun test <fixed Host bootstrap test set>`",
-    command: ["bun", "test", ...INTEGRATION_WORKER_BOOTSTRAP_GATE_TESTS],
+    label:
+      "Host bootstrap tests `bun test --timeout 60000 --bail=1 <fixed Host bootstrap test set>`",
+    // The repository gate's own flags (`bun run test`): these tests pass
+    // there, and a shared, loaded operator machine must not fail the
+    // bootstrap on the 5-second default alone.
+    command: [
+      "bun",
+      "test",
+      "--timeout",
+      "60000",
+      "--bail=1",
+      ...INTEGRATION_WORKER_BOOTSTRAP_GATE_TESTS,
+    ],
   },
 ] as const;
 
@@ -313,6 +335,9 @@ export async function runIntegrationWorkerBootstrap(
     const schemaReader = resolveSchemaReader(options, inspectionConfig, target, environment, run);
     const schemaBefore = await readSchema("preflight", schemaReader);
     assertCompleteSchema(schemaBefore, artifactBefore, expectedShape);
+    assertMoneyUnitSchema(schemaBefore.applied);
+    assertStripeWebhookSchema(target, schemaBefore.applied);
+    assertOrgBillingSchema(target, schemaBefore.applied);
     const v2StorageBefore =
       target.takoformV2 === undefined ? null : await readV2StorageProof(target, options);
     // A fresh generation must still be unserved when its first Host appears:
@@ -681,6 +706,8 @@ async function statusExisting(
     await assertWorkerSchedules("preflight", target, state, expectedSchedules);
     const ready =
       identity.commit === invocation.commit &&
+      moneyUnitSchemaReady(schema.applied) &&
+      orgBillingSchemaReady(target, schema.applied) &&
       (providerInspection === null || providerInspection.ready);
     return {
       ...statusResult(invocation, target, initial),
@@ -689,6 +716,7 @@ async function statusExisting(
       artifactDigest: `sha256:${identity.bundleDigestHex}`,
       appliedMigrations: schema.applied,
       schemaShapeDigest: schema.shapeDigest,
+      moneyUnitSchemaReady: moneyUnitSchemaReady(schema.applied),
       ready,
       ...(target.takoformV2 === undefined ? {} : { storageQualified: true }),
       ...(providerInspection === null
@@ -736,7 +764,9 @@ function statusResult(
     deployedCommit: null,
     artifactDigest: null,
     signingKeyId: target.signing.currentKeyId,
-    ready: native.absent,
+    moneyUnitSchemaReady: false,
+    billingSchemaReady: orgBillingSchemaReady(target, []),
+    ready: false,
     mutationApplied: false,
   };
   return target.takoformV2 === undefined
@@ -1227,6 +1257,10 @@ function readBootstrapArtifact(sourceRoot: string, target: DeployTarget): Migrat
       return projectFreshProductionV2MigrationArtifact(source);
     case "v2-0089":
       return projectFreshProductionV2MigrationArtifact0089(source);
+    case "v2-0091":
+      return projectFreshIntegrationV2MigrationArtifact0091(source);
+    case "v2-0092":
+      return projectFreshIntegrationV2MigrationArtifact0092(source);
   }
 }
 

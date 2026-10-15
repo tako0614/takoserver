@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, test } from "bun:test";
 import { createCatalog, type Offering } from "../src/catalog.ts";
 import { createEphemeralSql } from "../src/compat.ts";
 import { createLedger, type Ledger } from "../src/ledger.ts";
+import { minorToMicros } from "../src/money.ts";
 import type { Sql } from "../src/ports.ts";
 import { createReseller, type Reseller } from "../src/reseller.ts";
 
@@ -56,7 +57,13 @@ beforeEach(() => {
 });
 
 async function funded(amountMinor: number): Promise<void> {
-  await ledger.fund({ organizationId: "org_a", fundingRef: "pay_1", amountMinor });
+  await ledger.fund({
+    organizationId: "org_a",
+    fundingRef: "pay_1",
+    amountMicros: minorToMicros(amountMinor),
+    kind: "purchased",
+    consumptionClass: "purchased",
+  });
 }
 
 async function activeReservation() {
@@ -115,9 +122,9 @@ describe("reseller lane", () => {
     expect(statement).toMatchObject({ amountMinor: 0 });
     expect(await ledger.wallet("org_a")).toMatchObject({
       currency: "USD",
-      settledMinor: 0,
-      heldMinor: 0,
-      availableMinor: 0,
+      settledMicros: 0,
+      heldMicros: 0,
+      availableMicros: 0,
     });
   });
 
@@ -126,7 +133,10 @@ describe("reseller lane", () => {
     const { quote, reservation } = await activeReservation();
     expect(quote.amountMinor).toBe(1_000);
     expect(reservation).toMatchObject({ status: "active", amountMinor: 1_000 });
-    expect(await ledger.wallet("org_a")).toMatchObject({ heldMinor: 1_000, availableMinor: 9_000 });
+    expect(await ledger.wallet("org_a")).toMatchObject({
+      heldMicros: 10_000_000,
+      availableMicros: 90_000_000,
+    });
   });
 
   test("captures once, and a repeat returns the same statement", async () => {
@@ -141,7 +151,10 @@ describe("reseller lane", () => {
       usage,
     });
     expect(statement).toMatchObject({ amountMinor: 1_000, usage });
-    expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 9_000, heldMinor: 0 });
+    expect(await ledger.wallet("org_a")).toMatchObject({
+      settledMicros: 90_000_000,
+      heldMicros: 0,
+    });
 
     const again = await reseller.capture({
       organizationId: "org_a",
@@ -151,7 +164,10 @@ describe("reseller lane", () => {
     });
     // The money must not move a second time.
     expect(again).toEqual(statement);
-    expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 9_000, heldMinor: 0 });
+    expect(await ledger.wallet("org_a")).toMatchObject({
+      settledMicros: 90_000_000,
+      heldMicros: 0,
+    });
   });
 
   test("does not expose captured state when the ledger capture acknowledgement is lost", async () => {
@@ -202,7 +218,10 @@ describe("reseller lane", () => {
         usage: { quantity: 2 },
       }),
     ).resolves.toMatchObject({ reservationId: reservation.id, amountMinor: 1_000 });
-    expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 9_000, heldMinor: 0 });
+    expect(await ledger.wallet("org_a")).toMatchObject({
+      settledMicros: 90_000_000,
+      heldMicros: 0,
+    });
   });
 
   test("keeps a failed capture recoverable and repairs it after restart", async () => {
@@ -381,7 +400,10 @@ describe("reseller lane", () => {
         reservationId: reservation.id,
       }),
     ).toMatchObject({ status: "released" });
-    expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 10_000, heldMinor: 0 });
+    expect(await ledger.wallet("org_a")).toMatchObject({
+      settledMicros: 100_000_000,
+      heldMicros: 0,
+    });
   });
 
   test("fences a pending cancellation against a concurrent ready transition", async () => {
@@ -439,7 +461,10 @@ describe("reseller lane", () => {
     ).rejects.toMatchObject({ code: "conflict" });
     unblockRelease();
     await expect(cancelling).resolves.toMatchObject({ state: "cancelled" });
-    expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 10_000, heldMinor: 0 });
+    expect(await ledger.wallet("org_a")).toMatchObject({
+      settledMicros: 100_000_000,
+      heldMicros: 0,
+    });
   });
 
   test("waits for an active cancellation lease and reclaims it after expiry", async () => {
@@ -486,7 +511,10 @@ describe("reseller lane", () => {
         idempotencyKey: key,
       }),
     ).resolves.toMatchObject({ state: "cancelled" });
-    expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 10_000, heldMinor: 0 });
+    expect(await ledger.wallet("org_a")).toMatchObject({
+      settledMicros: 100_000_000,
+      heldMicros: 0,
+    });
   });
 
   test("fences two reconcilers so one settlement performs one capture", async () => {
@@ -550,14 +578,20 @@ describe("reseller lane", () => {
       reservationId: reservation.id,
     });
     expect(released.status).toBe("released");
-    expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 10_000, heldMinor: 0 });
+    expect(await ledger.wallet("org_a")).toMatchObject({
+      settledMicros: 100_000_000,
+      heldMicros: 0,
+    });
 
     await reseller.release({
       organizationId: "org_a",
       tenantRef: "tenant_x",
       reservationId: reservation.id,
     });
-    expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 10_000, heldMinor: 0 });
+    expect(await ledger.wallet("org_a")).toMatchObject({
+      settledMicros: 100_000_000,
+      heldMicros: 0,
+    });
   });
 
   test("keeps a direct release recoverable when the ledger response is lost", async () => {
@@ -619,7 +653,10 @@ describe("reseller lane", () => {
       }),
     ).resolves.toMatchObject({ status: "released" });
     expect(releaseReferences).toEqual([reservation.id, reservation.id]);
-    expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 10_000, heldMinor: 0 });
+    expect(await ledger.wallet("org_a")).toMatchObject({
+      settledMicros: 100_000_000,
+      heldMicros: 0,
+    });
   });
 
   test("does not expire a reservation before a release retry succeeds", async () => {
@@ -674,7 +711,10 @@ describe("reseller lane", () => {
         idempotencyKey: `reservation:release:${reservation.id}`,
       }),
     ).toMatchObject({ direction: "cancel", desiredTerminalStatus: "expired" });
-    expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 10_000, heldMinor: 0 });
+    expect(await ledger.wallet("org_a")).toMatchObject({
+      settledMicros: 100_000_000,
+      heldMicros: 0,
+    });
   });
 
   test("keeps a redeemed provision reservation held until capture", async () => {
@@ -714,7 +754,10 @@ describe("reseller lane", () => {
         reservationId: reservation.id,
       }),
     ).toMatchObject({ status: "active" });
-    expect(await ledger.wallet("org_a")).toMatchObject({ heldMinor: 1_000, availableMinor: 9_000 });
+    expect(await ledger.wallet("org_a")).toMatchObject({
+      heldMicros: 10_000_000,
+      availableMicros: 90_000_000,
+    });
 
     await expect(
       reseller.capture({
@@ -755,7 +798,10 @@ describe("reseller lane", () => {
     await expect(
       reseller.reserve({ organizationId: "org_a", tenantRef: "tenant_x", quoteId: quote.id }),
     ).rejects.toMatchObject({ code: "insufficient_funds" });
-    expect(await ledger.wallet("org_a")).toMatchObject({ heldMinor: 0, availableMinor: 500 });
+    expect(await ledger.wallet("org_a")).toMatchObject({
+      heldMicros: 0,
+      availableMicros: 5_000_000,
+    });
     expect(await sql.query("SELECT COUNT(*) AS total FROM reservations")).toEqual([{ total: 0 }]);
   });
 
@@ -784,7 +830,10 @@ describe("reseller lane", () => {
 
     now += 61 * 60_000;
     expect(await reseller.expireDue(16)).toBe(1);
-    expect(await ledger.wallet("org_a")).toMatchObject({ settledMinor: 10_000, heldMinor: 0 });
+    expect(await ledger.wallet("org_a")).toMatchObject({
+      settledMicros: 100_000_000,
+      heldMicros: 0,
+    });
     // Expiry is terminal, so a late capture cannot resurrect the reservation.
     await expect(
       reseller.capture({
@@ -816,6 +865,6 @@ describe("reseller lane", () => {
       quoteId: quote.id,
     });
     expect(second.id).toBe(first.id);
-    expect(await ledger.wallet("org_a")).toMatchObject({ heldMinor: 500 });
+    expect(await ledger.wallet("org_a")).toMatchObject({ heldMicros: 5_000_000 });
   });
 });

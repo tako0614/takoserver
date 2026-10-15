@@ -81,6 +81,75 @@ function withTarget(value: unknown, run: (path: string) => void): void {
 }
 
 describe("environment-exact deploy target", () => {
+  test("money transaction writer policy is explicit and scoped to generated integration storage", () => {
+    const generated = {
+      environment: "integration",
+      d1: {
+        databaseName: `takoserver-i-${"b".repeat(32)}`,
+        databaseId: "11111111-1111-4111-8111-111111111111",
+      },
+      r2: { bucketName: `takoserver-i-${"b".repeat(32)}` },
+      takoformV2: {
+        config: JSON.stringify({
+          documentation: "https://docs.example.test",
+          authenticationDocumentation: "https://auth.example.test",
+        }),
+        storageLineage: "v2-0092",
+      },
+    };
+    const policy = "transaction-fenced-usd-micros-v1";
+    const writerEpoch = `sha256:${"a".repeat(64)}`;
+    expect(
+      parseDeployTarget(
+        descriptor({
+          ...generated,
+          moneyCutoverWriterPolicy: policy,
+          moneyCutoverWriterEpoch: writerEpoch,
+        }),
+        "money target",
+        "integration",
+      ).moneyCutoverWriterPolicy,
+    ).toBe(policy);
+    expect(() =>
+      parseDeployTarget(
+        descriptor({ ...generated, moneyCutoverWriterPolicy: policy }),
+        "missing epoch",
+        "integration",
+      ),
+    ).toThrow("pinned Writer epoch");
+    expect(() =>
+      parseDeployTarget(
+        descriptor({ ...generated, moneyCutoverWriterEpoch: writerEpoch }),
+        "missing policy",
+        "integration",
+      ),
+    ).toThrow("pinned Writer epoch");
+    expect(() =>
+      parseDeployTarget(
+        descriptor({ ...generated, schemaMaintenanceMode: "pre-wallet-usd-micros-quiesced" }),
+        "missing policy",
+        "integration",
+      ),
+    ).toThrow("transaction writer policy");
+    expect(() =>
+      parseDeployTarget(
+        descriptor({
+          ...generated,
+          moneyCutoverWriterPolicy: "typo",
+          moneyCutoverWriterEpoch: writerEpoch,
+        }),
+        "invalid policy",
+        "integration",
+      ),
+    ).toThrow("writer policy");
+    expect(() =>
+      parseDeployTarget(
+        descriptor({ moneyCutoverWriterPolicy: policy, moneyCutoverWriterEpoch: writerEpoch }),
+        "foreign policy",
+        "rehearsal",
+      ),
+    ).toThrow("selected integration");
+  });
   test("loads the selected environment and product-owned sponsorship state", () => {
     withTarget(descriptor(), (path) => {
       expect(loadTarget(path, "rehearsal")).toMatchObject({
@@ -224,12 +293,12 @@ describe("environment-exact deploy target", () => {
     ).toThrow("maintenance profile");
   });
 
-  test("selects an explicit fresh v2 storage lineage only as v2-0088 or v2-0089", () => {
+  test("selects an explicit fresh v2 storage lineage only as v2-0088, v2-0089, v2-0091 or v2-0092", () => {
     const config = JSON.stringify({
       documentation: "https://docs.example.test/v2",
       authenticationDocumentation: "https://docs.example.test/v2/authentication",
     });
-    for (const storageLineage of ["v2-0088", "v2-0089"] as const) {
+    for (const storageLineage of ["v2-0088", "v2-0089", "v2-0091", "v2-0092"] as const) {
       const selected = parseDeployTarget(
         descriptor({ environment: "integration", takoformV2: { config, storageLineage } }),
         "fresh v2 target",
@@ -272,6 +341,61 @@ describe("environment-exact deploy target", () => {
         "integration",
       ),
     ).toThrow("cannot select a fresh");
+  });
+
+  test("applied 0092 is explicit and preserves the 0088 fresh origin", () => {
+    const config = JSON.stringify({
+      documentation: "https://docs.example.test/v2",
+      authenticationDocumentation: "https://docs.example.test/v2/authentication",
+    });
+    const chosen = parseDeployTarget(
+      descriptor({
+        environment: "integration",
+        takoformV2: { config, storageLineage: "v2-0088", appliedSchemaLineage: "v2-0092" },
+      }),
+      "canonical 0092 target",
+      "integration",
+    );
+    expect(chosen.takoformV2).toEqual({
+      config,
+      storageLineage: "v2-0088",
+      appliedSchemaLineage: "v2-0092",
+    });
+    expect(takoformV2StorageLineage(chosen)).toBe("v2-0088");
+    for (const storageLineage of [undefined, "v2-0089", "v2-0091"]) {
+      expect(() =>
+        parseDeployTarget(
+          descriptor({
+            environment: "integration",
+            takoformV2: { config, storageLineage, appliedSchemaLineage: "v2-0092" },
+          }),
+          "wrong origin",
+          "integration",
+        ),
+      ).toThrow("original fresh v2-0088");
+    }
+    for (const appliedSchemaLineage of ["v2-0091", "v2-0093", true]) {
+      expect(() =>
+        parseDeployTarget(
+          descriptor({
+            environment: "integration",
+            takoformV2: { config, storageLineage: "v2-0088", appliedSchemaLineage },
+          }),
+          "wrong applied lineage",
+          "integration",
+        ),
+      ).toThrow("appliedSchemaLineage");
+    }
+    expect(() =>
+      parseDeployTarget(
+        descriptor({
+          environment: "production",
+          takoformV2: { config, storageLineage: "v2-0088", appliedSchemaLineage: "v2-0092" },
+        }),
+        "production applied lineage",
+        "production",
+      ),
+    ).toThrow("integration-only");
   });
 
   test("refuses the retired cross-product runtime topology", () => {

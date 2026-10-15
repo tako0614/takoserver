@@ -6,6 +6,7 @@ import { Miniflare } from "miniflare";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { bytesDigest } from "../src/json.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
+import { claimFreshStripeModeRealm } from "../src/stripe-mode-realm.ts";
 
 const ORIGIN = "https://api.private-entry.test";
 const BASE = `${ORIGIN}/apis/forms.takoform.com/v2`;
@@ -74,6 +75,7 @@ async function runtimeWithKey(
             STATE_DB: { type: "d1", id: name },
             OBJECTS: { type: "r2", name },
             PUBLIC_ORIGIN: { type: "text", value: ORIGIN },
+            TAKOSERVER_STRIPE_MODE: { type: "text", value: "test" },
             WORKER_VERSION: { type: "json", value: { id: "00000000-0000-4000-8000-0000000000a1" } },
             TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: { type: "text", value: "A".repeat(43) },
             TAKOSERVER_TAKOFORM_V2_CONFIG: {
@@ -103,6 +105,7 @@ async function seed(runtime: Miniflare): Promise<void> {
     for (const statement of splitMigration(migration.sql)) await database.prepare(statement).run();
   }
   const sql = createD1Sql(database);
+  await claimFreshStripeModeRealm(sql, "test");
   const now = new Date().toISOString();
   await sql.run("INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)", [
     ORG,

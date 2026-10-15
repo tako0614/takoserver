@@ -12,12 +12,30 @@ import {
   AuthError,
   grants,
   type IdentityProviderDescriptor,
+  PersonalOrganizationError,
 } from "./auth.ts";
 import type { Catalog } from "./catalog.ts";
 import { errorEnvelope } from "./error-envelope.ts";
 import { GoogleIdentityError } from "./google-identity.ts";
-import { type FundingSettlementVerifier, type Ledger, LedgerError } from "./ledger.ts";
+import { type FundingSettlementVerifier, type Ledger, LedgerError, type Wallet } from "./ledger.ts";
+import { MoneyError, minorToMicros, parseUnsignedMicros } from "./money.ts";
 import { OperatorAssertionError } from "./operator-credentials.ts";
+import {
+  type CreditLot,
+  type HoldReceipt,
+  type OrgBilling,
+  OrgBillingError,
+  type UsageReceipt,
+} from "./org-billing.ts";
+import { type OrgLimitPolicy, OrgLimitPolicyError } from "./org-limit-policy.ts";
+import { OrgTopUpError, type TopUpReceipt } from "./org-top-up.ts";
+import type { OrgUsageSummary } from "./org-usage-summary.ts";
+import { OrgWorkspaceUsageError, type OrgWorkspaceUsagePage } from "./org-workspace-usage.ts";
+import {
+  type FundingReconcileReport,
+  PaymentEventError,
+  type PaymentEvents,
+} from "./payment-events.ts";
 import type { Clock } from "./ports.ts";
 import { type Reseller, ResellerError } from "./reseller.ts";
 import type { ResourceDeploymentStore } from "./resource-deployments.ts";
@@ -29,6 +47,15 @@ import {
   RuntimeInputPreparationError,
 } from "./runtime-input-preparations.ts";
 import { parseStrictJson, StrictJsonError } from "./strict-json.ts";
+import { type SubscriptionPayments, stripeBillingFailure } from "./stripe-billing.ts";
+import {
+  SubscriptionPlanChangeError,
+  type SubscriptionPlanChangeReceipt,
+} from "./stripe-subscription-plan-change.ts";
+import {
+  SubscriptionCommandReceiptError,
+  type SubscriptionCommandReceipts,
+} from "./subscription-command-receipts.ts";
 import { formSupportProfile } from "./takoform/forms.ts";
 import { isSpaceId } from "./takoform/space-id.ts";
 import type { OperationListing, ResourceListing } from "./takoform/store.ts";
@@ -67,6 +94,9 @@ import {
  */
 
 const MAX_BODY_BYTES = 64 * 1_024;
+const PAYMENT_NOTIFICATION_PATH = "/v1/payments/stripe/webhook";
+const OPERATOR_PAYMENTS_RECONCILE_PATH = "/v1/operator/payments/reconcile";
+const PAYMENT_NOTIFICATION_MAX_BYTES = 256 * 1_024;
 /**
  * The runtime-input handoff carries the exact public apply body it authorizes
  * plus every sensitive value, so it is the one control route whose request is
@@ -120,9 +150,33 @@ export interface Checkout {
   begin(input: {
     readonly organizationId: string;
     readonly amountMinor: number;
+    readonly reference?: string;
   }): Promise<{ readonly url: string }>;
-  /** Smallest and largest a single payment may be, in minor units. */
+  /** Durable begin preserves original replays and checks current bounds only for new references. */
+  readonly referenceRequired?: true;
+  receipt?(input: {
+    readonly organizationId: string;
+    readonly reference: string;
+  }): Promise<TopUpReceipt | null>;
+  /** Current bounds for new payments, in minor units; original durable commands keep their amount. */
   readonly bounds: { readonly minimumMinor: number; readonly maximumMinor: number };
+}
+
+/** The owning runtime's canonical custody contract, composed after financial qualification. */
+export type CustodiedSubscriptionPayments = SubscriptionPayments;
+
+export interface SubscriptionPlanPayments {
+  pending(organizationId: string): Promise<{
+    readonly planKey: string;
+    readonly pricingRevision: string;
+    readonly effectiveAt: string;
+  } | null>;
+  change(input: {
+    readonly organizationId: string;
+    readonly reference: string;
+    readonly planKey: string;
+    readonly expectedSubscriptionRef: string;
+  }): Promise<SubscriptionPlanChangeReceipt>;
 }
 
 export interface CreateControlRoutesOptions {
@@ -149,6 +203,20 @@ export interface CreateControlRoutesOptions {
   /** How a caller may sign in to this deployment. */
   readonly identityProviders: readonly IdentityProviderDescriptor[];
   readonly ledger: Ledger;
+  /** Optional Organization wallet lifecycle and usage service. */
+  readonly billing?: OrgBilling;
+  /** Opt-in commercial composition must never fall back to targetless legacy payments. */
+  readonly hostedBilling?: true;
+  /** App projection of its verified Hosted composition; never inferred from independent ports. */
+  readonly billingCapabilities?: {
+    readonly contractVersion: "hosted-billing-v1";
+    readonly topUps: boolean;
+    readonly subscriptionStart: boolean;
+    readonly subscriptionCancellation: boolean;
+    readonly subscriptionPlanChange: boolean;
+  };
+  /** Hosted policy owns consent and admission; absent on independent legacy wallets. */
+  readonly limitPolicy?: OrgLimitPolicy;
   readonly catalog: Catalog;
   readonly reseller: Reseller;
   readonly tokens: TokenService;
@@ -159,6 +227,24 @@ export interface CreateControlRoutesOptions {
    * would begin a checkout is simply not served.
    */
   readonly checkout?: Checkout | undefined;
+  /**
+   * Receives the payment processor's signed notifications. Absent where no
+   * signing secret is configured, and then the route is not served at all.
+   */
+  readonly paymentNotifications?: PaymentEvents["receive"];
+  /**
+   * Runs the payment reconcile pass now for one single-use operator
+   * assertion. Absent where this deployment has no pass to run or no operator
+   * key to authorize one, and then the route is not served at all.
+   */
+  readonly operatorPaymentsReconcile?: (assertion: string) => Promise<FundingReconcileReport>;
+  readonly subscriptions?: SubscriptionPayments;
+  readonly subscriptionCustody?: CustodiedSubscriptionPayments;
+  /** Serve plan changes only when the owning custody adapter has qualified this capability. */
+  readonly subscriptionPlans?: SubscriptionPlanPayments;
+  /** Saved local descriptors from the owning qualified Hosted payment composition. */
+  readonly subscriptionCommandReceipts?: SubscriptionCommandReceipts;
+  readonly creditFunding?: PaymentEvents["creditFunding"];
   readonly clock: Clock;
   /** Exact browser console origin allowed to carry the HttpOnly session cookie. */
   readonly consoleOrigin?: string;
@@ -200,6 +286,8 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     reseller,
     tokens,
     settlement,
+    paymentNotifications,
+    operatorPaymentsReconcile,
     clock,
     consoleOrigin,
     nativeResidual,
@@ -465,6 +553,20 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       });
     }
 
+    if (url.pathname === OPERATOR_PAYMENTS_RECONCILE_PATH) {
+      if (request.method !== "POST" || !operatorPaymentsReconcile) controlError("not_found", 404);
+      const body = await jsonObject(request);
+      exactKeys(body, ["assertion"]);
+      // The assertion is the whole credential. The pass crosses every
+      // organization, so no session or API key starts it, whoever holds it;
+      // a bearer sent alongside is simply not read.
+      const report = await operatorPaymentsReconcile(bounded(body.assertion, 8 * 1_024));
+      return Response.json(
+        { report },
+        { headers: { "cache-control": "private, no-store", "x-content-type-options": "nosniff" } },
+      );
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/sessions") {
       const body = await jsonObject(request);
       // `method` is optional: a caller that knows only one way in should not
@@ -542,6 +644,14 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       return Response.json({ organization }, { status: 201 });
     }
 
+    if (request.method === "POST" && url.pathname === "/v1/organizations/personal") {
+      const actor = await accounts.authenticate(authorization(request));
+      if (actor?.kind !== "session") throw new AuthError("unauthenticated");
+      exactKeys(await jsonObject(request), []);
+      const result = await accounts.createPersonalOrganization({ actor });
+      return Response.json(result, { status: result.created ? 201 : 200 });
+    }
+
     const orgKeys = /^\/v1\/organizations\/([^/]+)\/api-keys$/u.exec(url.pathname);
     if (request.method === "POST" && orgKeys) {
       const organizationId = segment(orgKeys[1]);
@@ -577,17 +687,248 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       return Response.json({ apiKey });
     }
 
+    if (url.pathname === PAYMENT_NOTIFICATION_PATH) {
+      if (request.method !== "POST" || !paymentNotifications) controlError("not_found", 404);
+      // No session or key: the processor's signature over these exact bytes is
+      // the credential, so the body is read raw and never parsed before it.
+      const receipt = await paymentNotifications({
+        payload: await rawBody(request, PAYMENT_NOTIFICATION_MAX_BYTES),
+        signature: request.headers.get("stripe-signature"),
+      });
+      return Response.json({ received: true, duplicate: receipt.duplicate });
+    }
+
     const wallet = /^\/v1\/organizations\/([^/]+)\/wallet$/u.exec(url.pathname);
     if (request.method === "GET" && wallet) {
       const organizationId = segment(wallet[1]);
       await scoped(request, organizationId, "wallet:read");
-      return Response.json({ wallet: await ledger.wallet(organizationId) });
+      return Response.json({
+        wallet: wireWallet(
+          options.billing
+            ? await options.billing.wallet(organizationId)
+            : await ledger.wallet(organizationId),
+        ),
+      });
+    }
+
+    const workspaceUsage =
+      /^\/v1\/organizations\/([^/]+)\/wallet\/usage-summary\/workspaces$/u.exec(url.pathname);
+    if (request.method === "GET" && workspaceUsage) {
+      const organizationId = segment(workspaceUsage[1]);
+      await scoped(request, organizationId, "wallet:read");
+      if (!options.billing) controlError("not_found", 404);
+      const limit = billingPageSize(url) ?? 50;
+      if (limit < 1 || limit > 100) controlError("invalid_argument", 400);
+      const cursor = billingCursor(url, 1024);
+      for (const key of url.searchParams.keys()) {
+        if (!["limit", "cursor", "workspaceRef"].includes(key))
+          controlError("invalid_argument", 400);
+      }
+      const refs = url.searchParams.getAll("workspaceRef");
+      if (refs.length > 1 || (cursor !== undefined && refs.length > 0))
+        controlError("invalid_argument", 400);
+      const workspaceRef = refs.length === 0 ? undefined : billingReference(text(refs[0]));
+      return Response.json(
+        wireWorkspaceUsage(
+          await options.billing.workspaceUsage(organizationId, {
+            limit,
+            ...(cursor === undefined ? {} : { cursor }),
+            ...(workspaceRef === undefined ? {} : { workspaceRef }),
+          }),
+        ),
+      );
+    }
+
+    if (options.billing) {
+      const usageSummary = /^\/v1\/organizations\/([^/]+)\/wallet\/usage-summary$/u.exec(
+        url.pathname,
+      );
+      if (request.method === "GET" && usageSummary) {
+        const organizationId = segment(usageSummary[1]);
+        await scoped(request, organizationId, "wallet:read");
+        return Response.json({
+          usageSummary: wireUsageSummary(await options.billing.usageSummary(organizationId)),
+        });
+      }
+
+      const lots = /^\/v1\/organizations\/([^/]+)\/wallet\/lots$/u.exec(url.pathname);
+      if (request.method === "GET" && lots) {
+        const organizationId = segment(lots[1]);
+        await scoped(request, organizationId, "wallet:read");
+        const limit = billingPageSize(url);
+        const cursor = billingCursor(url);
+        const page = await options.billing.lots(organizationId, limit, cursor);
+        return Response.json({ ...page, lots: page.lots.map(wireLot) });
+      }
+
+      const hold = /^\/v1\/organizations\/([^/]+)\/wallet\/holds\/([^/]+)$/u.exec(url.pathname);
+      if (request.method === "GET" && hold) {
+        const organizationId = segment(hold[1]);
+        await scoped(request, organizationId, "wallet:read");
+        return Response.json({
+          hold: wireHold(
+            await options.billing.readHold(organizationId, billingPathReference(hold[2])),
+          ),
+        });
+      }
+
+      const holds = /^\/v1\/organizations\/([^/]+)\/wallet\/holds$/u.exec(url.pathname);
+      if (request.method === "POST" && holds) {
+        const organizationId = segment(holds[1]);
+        await scoped(request, organizationId, "wallet:write");
+        const body = await jsonObject(request);
+        exactKeys(
+          body,
+          ["reference", "amountMicros", "pricingRevision", "measurementFingerprint"],
+          ["workspaceRef"],
+        );
+        return Response.json(
+          {
+            hold: wireHold(
+              await options.billing.hold({
+                organizationId,
+                reference: billingReference(text(body.reference)),
+                amountMicros: billingMicros(body.amountMicros),
+                pricingRevision: billingRevision(body.pricingRevision),
+                measurementFingerprint: billingFingerprint(body.measurementFingerprint),
+                ...(body.workspaceRef === undefined
+                  ? {}
+                  : { workspaceRef: billingReference(text(body.workspaceRef)) }),
+              }),
+            ),
+          },
+          { status: 201 },
+        );
+      }
+
+      const capture = /^\/v1\/organizations\/([^/]+)\/wallet\/holds\/([^/]+)\/capture$/u.exec(
+        url.pathname,
+      );
+      if (request.method === "POST" && capture) {
+        const organizationId = segment(capture[1]);
+        await scoped(request, organizationId, "wallet:write");
+        const reference = billingPathReference(capture[2]);
+        const body = await jsonObject(request);
+        exactKeys(body, ["amountMicros", "actualMicros", "measurementFingerprint"]);
+        return Response.json({
+          hold: wireHold(
+            await options.billing.capture({
+              organizationId,
+              reference,
+              amountMicros: billingMicros(body.amountMicros),
+              actualMicros: unsignedIntegerText(body.actualMicros),
+              measurementFingerprint: billingFingerprint(body.measurementFingerprint),
+            }),
+          ),
+        });
+      }
+
+      const release = /^\/v1\/organizations\/([^/]+)\/wallet\/holds\/([^/]+)\/release$/u.exec(
+        url.pathname,
+      );
+      if (request.method === "POST" && release) {
+        const organizationId = segment(release[1]);
+        await scoped(request, organizationId, "wallet:write");
+        const reference = billingPathReference(release[2]);
+        await emptyBody(request);
+        return Response.json({
+          hold: wireHold(await options.billing.release(organizationId, reference)),
+        });
+      }
+
+      const usageRecords = /^\/v1\/organizations\/([^/]+)\/wallet\/usage-records$/u.exec(
+        url.pathname,
+      );
+      if (usageRecords && request.method === "GET") {
+        const organizationId = segment(usageRecords[1]);
+        await scoped(request, organizationId, "usage:read");
+        const limit = billingPageSize(url);
+        const cursor = billingCursor(url);
+        const page = await options.billing.listUsage(organizationId, limit, cursor);
+        return Response.json({ ...page, usageRecords: page.usageRecords.map(wireUsage) });
+      }
+      if (usageRecords && request.method === "POST") {
+        const organizationId = segment(usageRecords[1]);
+        await scoped(request, organizationId, "usage:write");
+        const body = await jsonObject(request);
+        exactKeys(
+          body,
+          [
+            "reference",
+            "meter",
+            "quantityUnit",
+            "quantity",
+            "periodStart",
+            "periodEnd",
+            "pricingRevision",
+            "expectedMicros",
+            "measurementFingerprint",
+          ],
+          ["workspaceRef"],
+        );
+        return Response.json(
+          {
+            usageRecord: wireUsage(
+              await options.billing.usage({
+                organizationId,
+                reference: billingReference(text(body.reference)),
+                meter: billingMeter(body.meter),
+                quantityUnit: billingUnit(body.quantityUnit),
+                quantity: unsignedDecimal(body.quantity),
+                periodStart: canonicalDateTime(body.periodStart),
+                periodEnd: canonicalDateTime(body.periodEnd),
+                pricingRevision: billingRevision(body.pricingRevision),
+                expectedMicros: billingMicros(body.expectedMicros),
+                measurementFingerprint: billingFingerprint(body.measurementFingerprint),
+                ...(body.workspaceRef === undefined
+                  ? {}
+                  : { workspaceRef: billingReference(text(body.workspaceRef)) }),
+              }),
+            ),
+          },
+          { status: 201 },
+        );
+      }
+    }
+
+    const limitPolicy = /^\/v1\/organizations\/([^/]+)\/wallet\/limit-policy$/u.exec(url.pathname);
+    if (limitPolicy && ["GET", "PATCH"].includes(request.method)) {
+      const organizationId = segment(limitPolicy[1]);
+      const actor = await scoped(
+        request,
+        organizationId,
+        request.method === "GET" ? "wallet:read" : "payments:write",
+      );
+      if (!options.limitPolicy) controlError("not_found", 404);
+      if (request.method === "GET")
+        return Response.json(await options.limitPolicy.read(organizationId));
+      const body = await jsonObject(request);
+      const mode = text(body.onLimit);
+      if (mode === "stop" || mode === "prepaid") exactKeys(body, ["reference", "onLimit"]);
+      else if (mode === "on-demand" || mode === "postpaid")
+        exactKeys(body, ["reference", "onLimit", "cashCapMinor", "consentRevision"]);
+      else controlError("invalid_argument", 400);
+      return Response.json(
+        await options.limitPolicy.change({
+          organizationId,
+          authorizedPrincipal: `${actor.kind}:${actor.hostPrincipalId}`,
+          reference: billingReference(text(body.reference)),
+          onLimit: mode,
+          ...(mode === "stop" || mode === "prepaid"
+            ? {}
+            : {
+                cashCapMinor: integer(body.cashCapMinor),
+                consentRevision: bounded(body.consentRevision, 512),
+              }),
+        }),
+      );
     }
 
     const funding = /^\/v1\/organizations\/([^/]+)\/wallet\/funding$/u.exec(url.pathname);
     if (request.method === "POST" && funding) {
       const organizationId = segment(funding[1]);
       await owner(request, organizationId);
+      if (options.hostedBilling && !options.creditFunding) controlError("not_found", 404);
       const body = await jsonObject(request);
       exactKeys(body, ["settlementProof"]);
       // The caller never states an amount; only the verifier does.
@@ -595,35 +936,164 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
         organizationId,
         settlementProof: text(body.settlementProof),
       });
+      if (options.creditFunding) {
+        await options.creditFunding({ ...settled, organizationId });
+        return Response.json({ wallet: wireWallet(await ledger.wallet(organizationId)) });
+      }
       const credited = await ledger.fund({
         organizationId,
         fundingRef: settled.fundingRef,
-        amountMinor: settled.amountMinor,
+        amountMicros: checkedMinorToMicros(settled.amountMinor),
+        kind: "purchased",
+        consumptionClass: "purchased",
       });
-      return Response.json({ wallet: credited });
+      return Response.json({ wallet: wireWallet(credited) });
     }
 
     const checkout = /^\/v1\/organizations\/([^/]+)\/wallet\/checkout$/u.exec(url.pathname);
     if (request.method === "POST" && checkout) {
       const organizationId = segment(checkout[1]);
-      await owner(request, organizationId);
+      if (options.hostedBilling || options.checkout?.referenceRequired)
+        await scoped(request, organizationId, "payments:write");
+      else await owner(request, organizationId);
       if (!options.checkout) {
         // Not configured is not "you may not". Saying `not_found` keeps a
         // console from offering a payment this deployment cannot take.
         controlError("not_found", 404);
       }
+      if (options.hostedBilling && !options.checkout.referenceRequired)
+        controlError("not_found", 404);
       const body = await jsonObject(request);
-      exactKeys(body, ["amountMinor"]);
+      exactKeys(
+        body,
+        options.checkout.referenceRequired ? ["reference", "amountMinor"] : ["amountMinor"],
+      );
+      const reference = options.checkout.referenceRequired
+        ? billingReference(text(body.reference))
+        : undefined;
       const amountMinor = integer(body.amountMinor);
-      const { minimumMinor, maximumMinor } = options.checkout.bounds;
-      if (amountMinor < minimumMinor || amountMinor > maximumMinor) {
-        controlError("invalid_argument", 400);
+      if (amountMinor <= 0) controlError("invalid_argument", 400);
+      // Durable begin owns original-command replay and current bounds for new references.
+      if (!options.checkout.referenceRequired) {
+        const { minimumMinor, maximumMinor } = options.checkout.bounds;
+        if (amountMinor < minimumMinor || amountMinor > maximumMinor)
+          controlError("invalid_argument", 400);
       }
       // Where the payment returns to is configured, not requested. An address
       // taken from the caller is an open redirect wearing a payment's clothes,
       // and there is nothing a caller could usefully say here anyway.
-      const started = await options.checkout.begin({ organizationId, amountMinor });
+      const started = await options.checkout.begin({
+        organizationId,
+        amountMinor,
+        ...(reference === undefined ? {} : { reference }),
+      });
       return Response.json({ checkout: started }, { status: 201 });
+    }
+
+    const checkoutReceipt = /^\/v1\/organizations\/([^/]+)\/wallet\/checkout\/([^/]+)$/u.exec(
+      url.pathname,
+    );
+    if (request.method === "GET" && checkoutReceipt) {
+      const organizationId = segment(checkoutReceipt[1]);
+      await scoped(request, organizationId, "wallet:read");
+      if (!options.checkout?.referenceRequired || !options.checkout.receipt)
+        controlError("not_found", 404);
+      const receipt = await options.checkout.receipt({
+        organizationId,
+        reference: billingPathReference(checkoutReceipt[2]),
+      });
+      if (!receipt) controlError("not_found", 404);
+      return Response.json(receipt);
+    }
+
+    const subscriptionCommand =
+      /^\/v1\/organizations\/([^/]+)\/payments\/subscription\/commands\/([^/]+)\/([^/]+)$/u.exec(
+        url.pathname,
+      );
+    if (request.method === "GET" && subscriptionCommand) {
+      const organizationId = segment(subscriptionCommand[1]);
+      await scoped(request, organizationId, "wallet:read");
+      if (!options.hostedBilling || !options.subscriptionCommandReceipts)
+        controlError("not_found", 404);
+      if (url.searchParams.size !== 0) controlError("invalid_argument", 400);
+      const kind = segment(subscriptionCommand[2]);
+      if (kind !== "start" && kind !== "cancel" && kind !== "plan-change")
+        controlError("invalid_argument", 400);
+      const receipt = await options.subscriptionCommandReceipts.read({
+        organizationId,
+        kind,
+        reference: billingPathReference(subscriptionCommand[3]),
+      });
+      if (!receipt) controlError("not_found", 404);
+      return Response.json({ receipt });
+    }
+
+    const subscription = /^\/v1\/organizations\/([^/]+)\/payments\/subscription$/u.exec(
+      url.pathname,
+    );
+    if (subscription && ["GET", "POST", "PATCH"].includes(request.method)) {
+      const organizationId = segment(subscription[1]);
+      await scoped(
+        request,
+        organizationId,
+        request.method === "GET" ? "wallet:read" : "payments:write",
+      );
+      const payments =
+        options.subscriptionCustody ?? (options.hostedBilling ? undefined : options.subscriptions);
+      if (!payments) controlError("not_found", 404);
+      if (request.method === "GET")
+        return Response.json({
+          subscription: await payments.read(organizationId),
+          planTable: payments.planTable,
+          ...(options.hostedBilling && options.billingCapabilities
+            ? { billingCapabilities: options.billingCapabilities }
+            : {}),
+          ...(options.subscriptionCustody && options.subscriptionPlans
+            ? { pendingChange: await options.subscriptionPlans.pending(organizationId) }
+            : {}),
+        });
+      const body = await jsonObject(request);
+      if (request.method === "POST") {
+        exactKeys(body, ["reference", "planKey"]);
+        const started = await payments.begin({
+          organizationId,
+          reference: text(body.reference),
+          planKey: text(body.planKey),
+        });
+        return Response.json(
+          { checkout: started },
+          { status: started.state === "pending" ? 202 : started.state === "open" ? 201 : 200 },
+        );
+      }
+      if ("planKey" in body) {
+        exactKeys(body, ["reference", "planKey", "expectedSubscriptionRef"]);
+        const expectedSubscriptionRef = subscriptionTargetReference(body.expectedSubscriptionRef);
+        if (!options.subscriptionCustody || !options.subscriptionPlans)
+          throw new SubscriptionPlanChangeError("subscription_plan_unavailable", 409);
+        const planChange = await options.subscriptionPlans.change({
+          organizationId,
+          reference: billingReference(text(body.reference)),
+          planKey: bounded(body.planKey, 64),
+          expectedSubscriptionRef,
+        });
+        return Response.json(
+          { planChange },
+          { status: planChange.state === "pending" ? 202 : 200 },
+        );
+      }
+      exactKeys(body, ["reference", "cancelAtPeriodEnd", "expectedSubscriptionRef"]);
+      const expectedSubscriptionRef = subscriptionTargetReference(body.expectedSubscriptionRef);
+      if (body.cancelAtPeriodEnd !== true) controlError("invalid_argument", 400);
+      const cancellation = await payments.change({
+        organizationId,
+        reference: billingReference(text(body.reference)),
+        cancelAtPeriodEnd: true,
+        expectedSubscriptionRef,
+      });
+      return Response.json(
+        { cancellation },
+        { status: cancellation.state === "pending" ? 202 : 200 },
+      );
     }
 
     if (request.method === "GET" && url.pathname === "/v1/catalog") {
@@ -1310,6 +1780,34 @@ function pageSize(url: URL): number {
   return Math.min(value, 200);
 }
 
+/** Preserve billing's stricter ceiling so the service can reject values above 100. */
+function billingPageSize(url: URL): number | undefined {
+  const values = url.searchParams.getAll("limit");
+  if (values.length === 0) return undefined;
+  if (values.length !== 1 || !/^(?:0|[1-9][0-9]*)$/u.test(values[0] ?? "")) {
+    controlError("invalid_argument", 400);
+  }
+  const value = Number(values[0]);
+  if (!Number.isSafeInteger(value)) controlError("invalid_argument", 400);
+  return value;
+}
+
+/** The cursor stays opaque to the route and is bounded before reaching storage. */
+function billingCursor(url: URL, maximumLength = 512): string | undefined {
+  const values = url.searchParams.getAll("cursor");
+  if (values.length === 0) return undefined;
+  const cursor = values[0];
+  if (
+    values.length !== 1 ||
+    cursor === undefined ||
+    cursor === "" ||
+    cursor.length > maximumLength
+  ) {
+    controlError("invalid_argument", 400);
+  }
+  return values[0];
+}
+
 /** Closed decimal grammar for the immutable Resource evidence contract. */
 function resourceExecutionEvidencePageSize(url: URL): number {
   const values = url.searchParams.getAll("limit");
@@ -1359,7 +1857,29 @@ export function controlErrorResponse(error: unknown): Response {
 }
 
 function classify(error: unknown): { code: string; status: number } {
+  const billingFailure = stripeBillingFailure(error);
+  if (billingFailure) return { code: billingFailure.code, status: billingFailure.status };
   if (error instanceof ControlError) return { code: error.code, status: error.status };
+  if (error instanceof PersonalOrganizationError)
+    return { code: "billing_unavailable", status: 503 };
+  if (error instanceof SubscriptionCommandReceiptError)
+    return error.code === "invalid_argument"
+      ? { code: "invalid_argument", status: 400 }
+      : { code: "billing_unavailable", status: 503 };
+  if (error instanceof OrgTopUpError) {
+    return error.code === "invalid_argument"
+      ? { code: "invalid_argument", status: 400 }
+      : error.code === "unavailable"
+        ? { code: "billing_unavailable", status: 503 }
+        : { code: "conflict", status: 409 };
+  }
+  if (
+    error instanceof OrgWorkspaceUsageError ||
+    error instanceof OrgLimitPolicyError ||
+    error instanceof SubscriptionPlanChangeError
+  ) {
+    return billingExtensionFailure(error.code, error.status);
+  }
   if (error instanceof ArtifactConsumerRepairError) {
     return { code: error.code, status: error.status };
   }
@@ -1389,7 +1909,29 @@ function classify(error: unknown): { code: string; status: number } {
         error.code === "insufficient_funds" ? 402 : error.code === "invalid_amount" ? 400 : 500,
     };
   }
+  if (error instanceof OrgBillingError) {
+    if (
+      [
+        "workspace_ref_conflict",
+        "workspace_snapshot_expired",
+        "workspace_not_found",
+        "usage_period_crosses_entitlement",
+        "limit_policy_conflict",
+        "limit_mode_unavailable",
+        "billing_policy_unavailable",
+      ].includes(error.code)
+    ) {
+      return billingExtensionFailure(error.code, error.status);
+    }
+    return { code: error.code, status: error.status };
+  }
   if (error instanceof TokenError) return { code: error.code, status: 400 };
+  if (error instanceof PaymentEventError) {
+    // `unavailable` is the one a processor should retry; the rest are final.
+    const status =
+      error.code === "unavailable" ? 503 : error.code === "payload_too_large" ? 413 : 400;
+    return { code: error.code, status };
+  }
   if (error instanceof AttachmentError) {
     const status =
       error.code === "resource_not_found"
@@ -1491,6 +2033,66 @@ async function jsonObject(
 }
 
 /**
+ * The exact request bytes, refused past `limit` without buffering the rest.
+ * A signature covers bytes, not a parsed value, so nothing here decodes them.
+ */
+async function rawBody(request: Request, limit: number): Promise<Uint8Array> {
+  const declared = request.headers.get("content-length");
+  if (declared !== null && (!/^[0-9]{1,12}$/u.test(declared) || Number(declared) > limit)) {
+    throw new PaymentEventError("payload_too_large");
+  }
+  const bytes = await boundedBody(request, limit);
+  if (bytes === null) throw new PaymentEventError("payload_too_large");
+  if (bytes.byteLength === 0) controlError("invalid_argument", 400);
+  return bytes;
+}
+
+/**
+ * A route whose contract is "no request body" accepts zero bytes however they
+ * arrive and refuses the first byte of anything else without reading on.
+ */
+async function emptyBody(request: Request): Promise<void> {
+  const declared = request.headers.get("content-length");
+  if (declared !== null && declared !== "0") controlError("invalid_argument", 400);
+  if ((await boundedBody(request, 0)) === null) controlError("invalid_argument", 400);
+}
+
+/**
+ * The request bytes, or `null` as soon as they would pass `limit`; the rest is
+ * cancelled, never buffered. An absent body and an empty stream are the same
+ * zero bytes: Bun presents a bodiless POST as `null`, but workerd presents it
+ * as a stream that ends at once, so `request.body !== null` never means "has
+ * a body" on a Worker.
+ */
+async function boundedBody(request: Request, limit: number): Promise<Uint8Array | null> {
+  if (request.body === null) return new Uint8Array(0);
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const part = await reader.read();
+      if (part.done) break;
+      if (!(part.value instanceof Uint8Array) || part.value.byteLength > limit - total) {
+        await reader.cancel().catch(() => undefined);
+        return null;
+      }
+      chunks.push(part.value);
+      total += part.value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+/**
  * Exactly the required keys, plus any of the optional ones.
  *
  * Refusing an unknown key is what keeps a typo from being silently ignored —
@@ -1551,6 +2153,211 @@ function credentialReference(value: unknown): string {
 function resourceName(value: unknown): string {
   const parsed = text(value);
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(parsed)) {
+    controlError("invalid_argument", 400);
+  }
+  return parsed;
+}
+
+function billingReference(value: unknown): string {
+  const parsed = bounded(value, 128);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(parsed)) {
+    controlError("invalid_argument", 400);
+  }
+  return parsed;
+}
+
+function billingPathReference(value: string | undefined): string {
+  if (value === undefined || value.length > 384) controlError("invalid_argument", 400);
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    controlError("invalid_argument", 400);
+  }
+  return billingReference(decoded);
+}
+
+function billingFingerprint(value: unknown): string {
+  const parsed = bounded(value, 256);
+  if (
+    Array.from(parsed).some((character) => {
+      const code = character.codePointAt(0) ?? 0;
+      return code <= 0x1f || code === 0x7f;
+    })
+  ) {
+    controlError("invalid_argument", 400);
+  }
+  return parsed;
+}
+
+function billingRevision(value: unknown): string {
+  const parsed = bounded(value, 128);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(parsed)) {
+    controlError("invalid_argument", 400);
+  }
+  return parsed;
+}
+
+function billingMeter(value: unknown): string {
+  const parsed = bounded(value, 128);
+  if (!/^[a-z][a-z0-9.-]{0,127}$/u.test(parsed) || parsed.includes("..")) {
+    controlError("invalid_argument", 400);
+  }
+  return parsed;
+}
+
+function billingUnit(value: unknown): string {
+  const parsed = bounded(value, 64);
+  if (!/^[A-Za-z][A-Za-z0-9._-]{0,63}$/u.test(parsed)) controlError("invalid_argument", 400);
+  return parsed;
+}
+
+function unsignedDecimal(value: unknown): string {
+  const parsed = bounded(value, 256);
+  if (!/^(?:0|[1-9][0-9]*)(?:\.[0-9]{0,17}[1-9])?$/u.test(parsed)) {
+    controlError("invalid_argument", 400);
+  }
+  return parsed;
+}
+
+function unsignedIntegerText(value: unknown): string {
+  const parsed = bounded(value, 256);
+  if (!/^(?:0|[1-9][0-9]*)$/u.test(parsed)) controlError("invalid_argument", 400);
+  return parsed;
+}
+
+function billingMicros(value: unknown): number {
+  if (typeof value !== "string" || value.length > 16) controlError("invalid_argument", 400);
+  try {
+    return parseUnsignedMicros(value);
+  } catch (error) {
+    if (error instanceof MoneyError) controlError("invalid_argument", 400);
+    throw error;
+  }
+}
+
+function checkedMinorToMicros(value: number): number {
+  try {
+    return minorToMicros(value);
+  } catch (error) {
+    if (error instanceof MoneyError) controlError("invalid_argument", 400);
+    throw error;
+  }
+}
+
+function wireWallet(wallet: Wallet) {
+  return {
+    organizationId: wallet.organizationId,
+    currency: "USD" as const,
+    unit: "USD-micros" as const,
+    moneyPolicy: "usd-micros-v2" as const,
+    settledMicros: String(wallet.settledMicros),
+    heldMicros: String(wallet.heldMicros),
+    availableMicros: String(wallet.availableMicros),
+    refundReceivableMicros: String(wallet.refundReceivableMicros),
+    frozenMicros: String(wallet.frozenMicros),
+    entries: wallet.entries.map((entry) => ({
+      id: entry.id,
+      organizationId: entry.organizationId,
+      type: entry.type,
+      reference: entry.reference,
+      settledDeltaMicros: String(entry.settledDeltaMicros),
+      heldDeltaMicros: String(entry.heldDeltaMicros),
+      createdAt: entry.createdAt,
+    })),
+  };
+}
+
+function wireUsageSummary(summary: OrgUsageSummary) {
+  return {
+    ...summary,
+    originalIncludedMicros: String(summary.originalIncludedMicros),
+    effectiveIncludedMicros: String(summary.effectiveIncludedMicros),
+    usedMicros: String(summary.usedMicros),
+    heldMicros: String(summary.heldMicros),
+    availableMicros: String(summary.availableMicros),
+    revokedMicros: String(summary.revokedMicros),
+    purchasedAvailableMicros: String(summary.purchasedAvailableMicros),
+    directAvailableMicros: String(summary.directAvailableMicros),
+  };
+}
+
+function wireWorkspaceUsage(page: OrgWorkspaceUsagePage) {
+  const amounts = (value: OrgWorkspaceUsagePage["totals"]) => ({
+    usedMicros: String(value.usedMicros),
+    heldMicros: String(value.heldMicros),
+    pendingMicros: String(value.pendingMicros),
+  });
+  return {
+    ...page,
+    usageSummary: wireUsageSummary(page.usageSummary),
+    totals: amounts(page.totals),
+    unattributed: amounts(page.unattributed),
+    workspaces: page.workspaces.map((workspace) => ({
+      workspaceRef: workspace.workspaceRef,
+      ...amounts(workspace),
+    })),
+  };
+}
+
+function subscriptionTargetReference(value: unknown): string {
+  const ref = bounded(value, 68);
+  if (!/^sra_[0-9a-f]{64}$/u.test(ref)) controlError("invalid_argument", 400);
+  return ref;
+}
+
+/** New billing services refine the existing canonical wire taxonomy without adding codes. */
+function billingExtensionFailure(code: string, status: number): { code: string; status: number } {
+  if (code === "workspace_snapshot_expired") return { code: "expired", status: 409 };
+  if (status === 400)
+    return {
+      code: ["invalid_cursor", "invalid_limit", "invalid_reference"].includes(code)
+        ? code
+        : "invalid_argument",
+      status,
+    };
+  if (status === 404) return { code: "not_found", status };
+  if (status === 409) return { code: code === "reference_conflict" ? code : "conflict", status };
+  return { code: "billing_unavailable", status: 503 };
+}
+
+function wireLot(lot: CreditLot) {
+  return {
+    reference: lot.reference,
+    kind: lot.kind,
+    consumptionClass: lot.consumptionClass,
+    amountMicros: String(lot.amountMicros),
+    spentMicros: String(lot.spentMicros),
+    revokedMicros: String(lot.revokedMicros ?? 0),
+    frozen: lot.frozen ?? false,
+    remainingMicros: String(lot.remainingMicros),
+    heldMicros: String(lot.heldMicros),
+    availableMicros: String(lot.availableMicros),
+    expiresAt: lot.expiresAt,
+    createdAt: lot.createdAt,
+  };
+}
+
+function wireHold(hold: HoldReceipt) {
+  return {
+    ...hold,
+    amountMicros: String(hold.amountMicros),
+    capturedMicros: String(hold.capturedMicros),
+    releasedMicros: String(hold.releasedMicros),
+  };
+}
+
+function wireUsage(usage: UsageReceipt) {
+  return { ...usage, amountMicros: String(usage.amountMicros) };
+}
+
+function canonicalDateTime(value: unknown): string {
+  const parsed = bounded(value, 32);
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(parsed)) {
+    controlError("invalid_argument", 400);
+  }
+  const timestamp = Date.parse(parsed);
+  if (!Number.isFinite(timestamp) || new Date(timestamp).toISOString() !== parsed) {
     controlError("invalid_argument", 400);
   }
   return parsed;

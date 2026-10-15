@@ -21,7 +21,7 @@ import {
   type FreshV2D1Lineage,
   type FreshV2DataReader,
 } from "./fresh-v2-data-readback.ts";
-import { type D1SchemaState, readD1SchemaState } from "./migrations.ts";
+import { type D1SchemaState, MONEY_UNIT_MIGRATION, readD1SchemaState } from "./migrations.ts";
 import {
   type CommandResult,
   REPOSITORY,
@@ -38,16 +38,27 @@ import {
 } from "./qualification.ts";
 import {
   projectApplyQualifiedMigrationArtifact,
+  projectCanonicalIntegrationV2MigrationArtifact0092,
+  projectFreshIntegrationV2MigrationArtifact0091,
+  projectFreshIntegrationV2MigrationArtifact0092,
   projectFreshProductionV2MigrationArtifact,
   projectFreshProductionV2MigrationArtifact0089,
   projectFreshV2ArtifactMigrationArtifact,
   readCurrentAuditedMigrationSourceArtifact,
   readSealedApplyQualifiedMigrationArtifact,
+  readSealedFreshIntegrationV2MigrationArtifact0091,
+  readSealedFreshIntegrationV2MigrationArtifact0092,
   readSealedFreshProductionV2MigrationArtifact,
   readSealedFreshProductionV2MigrationArtifact0089,
   readSealedFreshV2ArtifactMigrationArtifact,
   type SchemaReader,
 } from "./schema.ts";
+import {
+  type MoneySchemaPhase,
+  moneyUnitCutoverExpectedShape,
+  moneyUnitCutoverSchemaMatches,
+  moneyUnitCutoverSourcePrefixDigest,
+} from "./schema-money-unit-cutover.ts";
 import type { DeployTarget } from "./target.ts";
 
 const CLOUDFLARE_API = "https://api.cloudflare.com/client/v4";
@@ -87,6 +98,10 @@ class MigrationApplyError extends DeployError {
  * brand-new generation that already carries 0081 private inputs and the 0088
  * drain (or 0089 Cron) schema, so a freshly bootstrapped Host never needs the
  * in-place 0066→0088 wave and its historical predecessor-source proofs.
+ * `v2-0091` (through the Stripe event table) and `v2-0092` (through the
+ * Organization wallet lifecycle tables) are the staging-only profiles: no
+ * production surface offers them, and their apply also requires the
+ * production target so the production D1 identity is refused explicitly.
  */
 export type IntegrationFreshLineage = "v2-artifacts-0075" | FreshV2D1Lineage;
 
@@ -94,7 +109,71 @@ const INTEGRATION_FRESH_LINEAGES: readonly IntegrationFreshLineage[] = [
   "v2-artifacts-0075",
   "v2-0088",
   "v2-0089",
+  "v2-0091",
+  "v2-0092",
 ];
+
+/** Profiles no production surface offers; their apply requires the production target. */
+const STAGING_ONLY_LINEAGES: ReadonlySet<IntegrationFreshLineage> = new Set(["v2-0091", "v2-0092"]);
+
+/** The exact production D1 a staging generation must never be. */
+export interface ProductionD1Identity {
+  readonly databaseName: string;
+  readonly databaseId: string;
+}
+
+/**
+ * Production D1 names: the original `takoserver-runtime…` databases and the
+ * `takoserver-p-<generation>` ones production fresh init creates. The
+ * generated-name allowlist below already excludes both; this names them so a
+ * future change to that allowlist cannot silently admit one.
+ */
+const PRODUCTION_D1_NAME = /^takoserver-(?:runtime(?:$|-)|p-)/u;
+const FRESH_GENERATED_NAME = /^integration-takoserver-[0-9a-f]{32}$/u;
+const GENERATED_D1_NAME = /^(?:integration-takoserver-|takoserver-i-)[0-9a-f]{32}$/u;
+
+/**
+ * An operator-provisioned staging pair: one D1 and one R2 bucket sharing the
+ * name `takoserver-staging-<label>`. It stands in for a generated pair only on
+ * a target that selects a staging-only lineage (`v2-0091` or `v2-0092`), and only
+ * for the read-side proofs (identity readback, that lineage's exact ledger and
+ * canonical schema, and the empty-data proof at first publication). This
+ * surface creates only `integration-takoserver-<generation>`, and a
+ * production-named database never qualifies.
+ */
+const STAGING_PAIR_NAME = /^takoserver-staging-[a-z0-9](?:[a-z0-9-]{0,50}[a-z0-9])?$/u;
+
+/**
+ * Staging storage is never production storage. The generated name can only be
+ * `integration-takoserver-<generation>`. Historical `takoserver-i-<generation>`
+ * pairs remain readable; only the fresh prefix is admitted by the creation
+ * fence. This checks both against production naming and,
+ * where the operator's production target is supplied, against its exact D1
+ * name and id, before creation and again once the new id is known.
+ */
+export function assertStagingD1NotProduction(
+  candidate: { readonly databaseName: string; readonly databaseId?: string },
+  production: ProductionD1Identity | undefined,
+  phase: "preflight" | "mutation" = "preflight",
+): void {
+  const refuse = (message: string) =>
+    phase === "preflight" ? preflightError(message) : mutationError(message);
+  if (
+    !GENERATED_D1_NAME.test(candidate.databaseName) ||
+    PRODUCTION_D1_NAME.test(candidate.databaseName)
+  ) {
+    throw refuse(
+      "staging D1 generation refuses any database that is not a generated integration D1",
+    );
+  }
+  if (
+    production !== undefined &&
+    (candidate.databaseName === production.databaseName ||
+      (candidate.databaseId !== undefined && candidate.databaseId === production.databaseId))
+  ) {
+    throw refuse("staging D1 generation refuses the production target's D1");
+  }
+}
 
 export function isIntegrationFreshLineage(value: unknown): value is IntegrationFreshLineage {
   return (
@@ -173,8 +252,13 @@ export interface IntegrationStorageGenerationOptions {
     },
   ) => Promise<D1SchemaState>;
   readonly wranglerCommand?: (args: readonly string[]) => readonly string[];
-  /** Test seam for the fresh v2-0088/0089 empty-data proof; deploy uses remote D1. */
+  /** Test seam for the fresh v2-0088/0089/0091/0092 empty-data proof; deploy uses remote D1. */
   readonly freshV2DataReader?: FreshV2DataReader;
+  /**
+   * The production target's D1, read from `TAKOSERVER_DEPLOY_TARGET_PRODUCTION`.
+   * Optional in general, required to apply a staging-only profile (`v2-0091`, `v2-0092`).
+   */
+  readonly productionD1?: ProductionD1Identity;
 }
 
 export interface IntegrationStorageGenerationTargetProof {
@@ -196,6 +280,18 @@ export interface FreshV2IntegrationStorageTargetProof
   readonly freshLineage: IntegrationFreshLineage;
 }
 
+export interface CanonicalV20092IntegrationStorageTargetProof
+  extends IntegrationStorageGenerationTargetProof {
+  readonly appliedSchemaLineage: "v2-0092";
+}
+
+export interface CanonicalV20092IntegrationStorageIdentityProof {
+  readonly accountId: string;
+  readonly d1: { readonly databaseId: string; readonly databaseName: string };
+  readonly r2: { readonly bucketName: string };
+  readonly productionD1: ProductionD1Identity;
+}
+
 /**
  * Narrow read-only seam for proving that the selected integration Worker
  * target names one existing generated storage pair with the exact audited D1
@@ -213,6 +309,10 @@ export interface IntegrationStorageGenerationTargetVerificationOptions {
   readonly migrationDirectory?: string;
   readonly outputDirectory?: string;
   readonly wranglerCommand?: IntegrationStorageGenerationOptions["wranglerCommand"];
+  /** Read-only Worker proof after an independently qualified 0094 cutover. */
+  readonly allowCurrentAuditedSuccessor?: boolean;
+  /** Read-side only for the dedicated non-serving 0092/0093/0094 money maintenance campaign. */
+  readonly allowMoneyUnitMaintenance?: boolean;
 }
 
 export type IntegrationStorageGeneratedStateOptions = Pick<
@@ -223,16 +323,34 @@ export type IntegrationStorageGeneratedStateOptions = Pick<
 /**
  * Read-only/status and one-way fresh-storage bootstrap for integration.
  *
- * The generated names are the complete identity of this surface.  The
- * environment-selected target contributes only the account and environment
- * guard; its current D1/R2 are never passed to a provider operation.
+ * Fresh names are derived only from the explicit generation. The selected
+ * target contributes the account and environment guard; it can also select
+ * the exact legacy generation for status alone. Apply never touches its
+ * current D1/R2 and refuses either half of a same-generation selected pair.
  */
 export async function runIntegrationStorageGeneration(
-  invocation: IntegrationStorageGenerationInvocation,
-  target: DeployTarget,
+  selectedInvocation: IntegrationStorageGenerationInvocation,
+  selectedTarget: DeployTarget,
   options: IntegrationStorageGenerationOptions = {},
 ): Promise<Record<string, unknown>> {
+  const { invocation, target } = snapshotStorageContext({
+    invocation: selectedInvocation,
+    target: selectedTarget,
+  });
   const names = validateInvocation(invocation, target);
+  if (invocation.action === "apply") assertFreshGenerationNames(names);
+  assertStagingD1NotProduction({ databaseName: names.databaseName }, options.productionD1);
+  if (
+    invocation.action === "apply" &&
+    invocation.freshLineage !== undefined &&
+    STAGING_ONLY_LINEAGES.has(invocation.freshLineage) &&
+    options.productionD1 === undefined
+  ) {
+    throw preflightError(
+      `the staging-only ${invocation.freshLineage} profile requires TAKOSERVER_DEPLOY_TARGET_PRODUCTION, ` +
+        "so the production D1 is refused by its exact identity",
+    );
+  }
   if (invocation.action === "status") {
     const provider = await resolveProvider(target, options);
     return await statusStorageGeneration(invocation, target, names, provider, options);
@@ -273,9 +391,10 @@ export async function verifyFreshV2ArtifactIntegrationStorageTarget(
 }
 
 /**
- * Read-only proof for one generated integration pair whose ledger is exactly
- * the explicitly selected fresh lineage. The caller names the lineage; the
- * observed ledger never selects its own expectation. Data is not rechecked:
+ * Read-only proof for one generated integration pair. The selected lineage
+ * remains its immutable creation claim. An explicit caller option can also
+ * prove the complete current audited 0094 schema after a separate cutover;
+ * this does not qualify or apply that cutover. Data is not rechecked because
  * a running Host legitimately writes rows after the generation proof.
  */
 export async function verifyFreshV2IntegrationStorageTarget(
@@ -291,12 +410,85 @@ export async function verifyFreshV2IntegrationStorageTarget(
   return { ...proof, freshLineage: lineage };
 }
 
+/** Read-only proof selected after the reviewed in-place 0088→0092 wave. */
+export async function verifyCanonicalV20092IntegrationStorageTarget(
+  selectedTarget: DeployTarget,
+  environment: DeployEnvironment,
+  options: IntegrationStorageGenerationTargetVerificationOptions = {},
+): Promise<CanonicalV20092IntegrationStorageTargetProof> {
+  const target = snapshotStorageContext(selectedTarget);
+  if (
+    environment !== "integration" ||
+    target.takoformV2?.storageLineage !== "v2-0088" ||
+    target.takoformV2.appliedSchemaLineage !== "v2-0092"
+  ) {
+    throw preflightError(
+      "canonical 0092 storage proof requires explicit applied lineage on the original 0088 integration target",
+    );
+  }
+  const proof = await verifyGeneratedStorageTarget(target, environment, options, "applied-v2-0092");
+  return { ...proof, appliedSchemaLineage: "v2-0092" };
+}
+
+/** Provider GET identity fence before the schema mutation, independent of its applied lineage. */
+export async function verifyCanonicalV20092IntegrationStorageIdentity(
+  selectedTarget: DeployTarget,
+  productionD1: ProductionD1Identity,
+  options: IntegrationStorageGenerationTargetVerificationOptions = {},
+): Promise<CanonicalV20092IntegrationStorageIdentityProof> {
+  const target = snapshotStorageContext(selectedTarget);
+  if (target.takoformV2?.storageLineage !== "v2-0088") {
+    throw preflightError("canonical 0092 identity proof requires the original v2-0088 target");
+  }
+  const generated = generatedStorageTarget(target, "integration");
+  const productionDescriptor = validateD1Summary(
+    { uuid: productionD1.databaseId, name: productionD1.databaseName },
+    "canonical 0092 read-only production descriptor",
+  );
+  assertStagingD1NotProduction(
+    { databaseName: generated.databaseName, databaseId: generated.databaseId },
+    { databaseId: productionDescriptor.uuid, databaseName: productionDescriptor.name },
+  );
+  const { provider } = await resolveTargetReadProvider(target, "integration", options);
+  const selectedD1 = validateD1Summary(
+    await providerCall("preflight", "canonical 0092 D1 identity GET failed", () =>
+      provider.getD1(generated.databaseId),
+    ),
+    "canonical 0092 D1 identity GET",
+  );
+  const selectedR2 = validateR2Summary(
+    await providerCall("preflight", "canonical 0092 R2 identity GET failed", () =>
+      provider.getR2(generated.bucketName),
+    ),
+    "canonical 0092 R2 identity GET",
+  );
+  if (
+    selectedD1.uuid !== generated.databaseId ||
+    selectedD1.name !== generated.databaseName ||
+    selectedR2.name !== generated.bucketName
+  ) {
+    throw preflightError(
+      "canonical 0092 provider identity differs from the exact generated pair or production descriptor",
+    );
+  }
+  return {
+    accountId: generated.accountId,
+    d1: { databaseId: selectedD1.uuid, databaseName: selectedD1.name },
+    r2: { bucketName: selectedR2.name },
+    productionD1: {
+      databaseId: productionDescriptor.uuid,
+      databaseName: productionDescriptor.name,
+    },
+  };
+}
+
 async function verifyGeneratedStorageTarget(
-  target: DeployTarget,
+  selectedTarget: DeployTarget,
   environment: DeployEnvironment,
   options: IntegrationStorageGenerationTargetVerificationOptions,
-  lineage: "apply-0066" | IntegrationFreshLineage,
+  lineage: "apply-0066" | IntegrationFreshLineage | "applied-v2-0092",
 ): Promise<IntegrationStorageGenerationTargetProof> {
+  const target = snapshotStorageContext(selectedTarget);
   const generated = generatedStorageTarget(target, environment);
   const providerContext = await resolveTargetReadProvider(target, environment, options);
   const d1 = await providerCall("preflight", "generated target D1 identity readback failed", () =>
@@ -330,11 +522,16 @@ async function verifyGeneratedStorageTarget(
     );
   }
 
-  const sourceArtifact = selectedSourceArtifact(
-    options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
-    lineage,
-  );
-  const expectedApplicationShape = deriveExpectedApplicationShape(sourceArtifact.files);
+  const migrationDirectory = options.migrationDirectory ?? resolve(REPOSITORY, "migrations");
+  const sourceArtifact = selectedSourceArtifact(migrationDirectory, lineage);
+  const moneyMaintenance =
+    options.allowMoneyUnitMaintenance === true &&
+    target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced" &&
+    (lineage === "v2-0092" || lineage === "applied-v2-0092");
+  const currentSource =
+    (options.allowCurrentAuditedSuccessor === true || moneyMaintenance) && lineage !== "apply-0066"
+      ? readCurrentAuditedMigrationSourceArtifact(migrationDirectory)
+      : null;
   const temporary = options.outputDirectory === undefined;
   const root =
     options.outputDirectory ??
@@ -370,11 +567,52 @@ async function verifyGeneratedStorageTarget(
         ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
       },
     );
+    // A full current schema is a read-side successor of the selected origin,
+    // never a new generation payload. Both alternatives are exact audited
+    // ledgers; partial states and foreign migration tails match neither.
+    const currentAudited =
+      currentSource === null
+        ? false
+        : currentSource.names.includes(MONEY_UNIT_MIGRATION) &&
+          JSON.stringify(migrationState.applied) === JSON.stringify(currentSource.names);
+    const moneyPhase =
+      currentSource === null
+        ? undefined
+        : (
+            [
+              ...(moneyMaintenance ? ["0092", "0092-fenced", "0093", "0093-fenced"] : []),
+              ...(options.allowCurrentAuditedSuccessor === true || moneyMaintenance
+                ? ["0094", "0094-fenced"]
+                : []),
+            ] as MoneySchemaPhase[]
+          ).find((phase) =>
+            moneyUnitCutoverSchemaMatches(migrationState, currentSource.files, phase),
+          );
+    const moneyCount = moneyPhase === undefined ? undefined : Number(moneyPhase.slice(0, 4));
+    const observedSource =
+      moneyCount !== undefined && currentSource !== null
+        ? {
+            ...currentSource,
+            files: currentSource.files.slice(0, moneyCount),
+            names: currentSource.names.slice(0, moneyCount),
+            bytes: currentSource.files
+              .slice(0, moneyCount)
+              .reduce((sum, file) => sum + file.bytes, 0),
+            digest: moneyUnitCutoverSourcePrefixDigest(
+              currentSource.files,
+              moneyCount as 92 | 93 | 94,
+            ),
+          }
+        : currentAudited && currentSource !== null
+          ? currentSource
+          : sourceArtifact;
     assertCompleteDatabase(
       migrationState,
-      sourceArtifact.names,
-      sourceArtifact.digest,
-      expectedApplicationShape,
+      observedSource.names,
+      observedSource.digest,
+      moneyPhase === undefined
+        ? deriveExpectedApplicationShape(observedSource.files)
+        : moneyUnitCutoverExpectedShape(currentSource?.files ?? [], moneyPhase),
       generated.databaseId,
       "preflight",
     );
@@ -382,7 +620,7 @@ async function verifyGeneratedStorageTarget(
       generation: generated.generation,
       d1: { databaseId: generated.databaseId, databaseName: generated.databaseName },
       r2: { bucketName: generated.bucketName },
-      migrationDigest: sourceArtifact.digest,
+      migrationDigest: observedSource.digest,
       appliedMigrations: [...migrationState.applied],
       schemaShapeDigest: migrationState.shapeDigest,
     };
@@ -396,6 +634,15 @@ interface StorageNames {
   readonly bucketName: string;
   /** Whether the selected target already names this generation's D1 / R2. */
   readonly selectedByTarget: { readonly d1: boolean; readonly r2: boolean };
+}
+
+/** Own the complete input data before validation, callbacks or the first await. */
+function snapshotStorageContext<T>(context: T): T {
+  try {
+    return structuredClone(context);
+  } catch {
+    throw preflightError("integration storage requires cloneable invocation and target data");
+  }
 }
 
 interface GeneratedStorageTarget {
@@ -418,19 +665,52 @@ function generatedStorageTarget(
   }
   const databaseName = target.d1.databaseName;
   const bucketName = target.r2.bucketName;
-  const generated = /^takoserver-i-([0-9a-f]{32})$/u.exec(databaseName);
-  if (generated === null || bucketName !== databaseName || !UUID.test(target.d1.databaseId)) {
+  const generated = /^(?:integration-takoserver-|takoserver-i-)([0-9a-f]{32})$/u.exec(databaseName);
+  const stagingPair =
+    generated === null &&
+    target.takoformV2?.storageLineage !== undefined &&
+    STAGING_ONLY_LINEAGES.has(target.takoformV2.storageLineage) &&
+    STAGING_PAIR_NAME.test(databaseName) &&
+    !PRODUCTION_D1_NAME.test(databaseName);
+  if (
+    (generated === null && !stagingPair) ||
+    bucketName !== databaseName ||
+    !UUID.test(target.d1.databaseId)
+  ) {
     throw preflightError(
       "integration target must select one exact matching generated D1/R2 storage pair",
     );
   }
   return {
-    generation: generated[1] as string,
+    // A staging pair has no generation; its exact name is its identity.
+    generation: generated?.[1] ?? databaseName,
     accountId: target.accountId,
     databaseName,
     databaseId: target.d1.databaseId,
     bucketName,
   };
+}
+
+/** Whether the target names an operator-provisioned staging pair rather than a generated one. */
+export function isOperatorStagingPair(target: Pick<DeployTarget, "d1">): boolean {
+  return STAGING_PAIR_NAME.test(target.d1.databaseName);
+}
+
+/**
+ * A staging pair has no creation record proving it was empty; first
+ * publication proves that, a storage rebind does not. So a staging pair enters
+ * service only through first publication, never by rebinding a running Host.
+ */
+export function assertStorageRebindNotOperatorStagingPair(
+  target: Pick<DeployTarget, "d1">,
+  storageRebind: unknown,
+): void {
+  if (storageRebind !== undefined && isOperatorStagingPair(target)) {
+    throw preflightError(
+      "storage rebind refuses an operator-provisioned staging pair; it enters service only " +
+        "through first publication, which proves it empty",
+    );
+  }
 }
 
 /** Purely identifies whether a selected environment target is this surface's generated pair. */
@@ -476,8 +756,20 @@ function validateInvocation(
   if (!ACCOUNT_ID.test(target.accountId)) {
     throw preflightError("integration storage generation requires one exact account id");
   }
-  const databaseName = `takoserver-i-${invocation.generation}`;
-  const bucketName = `takoserver-i-${invocation.generation}`;
+  const legacyName = `takoserver-i-${invocation.generation}`;
+  const legacyD1 = target.d1.databaseName === legacyName;
+  const legacyR2 = target.r2.bucketName === legacyName;
+  if (legacyD1 || legacyR2) {
+    if (invocation.action === "apply") {
+      throw preflightError("legacy integration storage is read-only; create a new generation");
+    }
+    if (!legacyD1 || !legacyR2) {
+      throw preflightError("legacy integration status requires the exact matching pair");
+    }
+  }
+  const databaseName =
+    legacyD1 && legacyR2 ? legacyName : `integration-takoserver-${invocation.generation}`;
+  const bucketName = databaseName;
   if (!RESOURCE_NAME.test(databaseName) || !RESOURCE_NAME.test(bucketName)) {
     throw preflightError("integration storage generation derived an invalid provider name");
   }
@@ -495,6 +787,13 @@ function validateInvocation(
     );
   }
   return { databaseName, bucketName, selectedByTarget };
+}
+
+/** The generation writer alone enforces this; shared provider callers keep their own authority. */
+function assertFreshGenerationNames(names: StorageNames): void {
+  if (!FRESH_GENERATED_NAME.test(names.databaseName) || names.bucketName !== names.databaseName) {
+    throw preflightError("new integration storage requires one exact integration-prefixed pair");
+  }
 }
 
 async function statusStorageGeneration(
@@ -538,8 +837,8 @@ async function statusStorageGeneration(
       present: r2 !== null,
     },
     presence,
-    // Read-only correlation with the selected target. The target never
-    // selects, widens or adopts what this status reads.
+    // The selected target can retain an exact legacy pair for read-only
+    // diagnosis. It never widens or adopts either generation's inventory.
     targetSelection: {
       d1: names.selectedByTarget.d1,
       r2: names.selectedByTarget.r2,
@@ -549,6 +848,7 @@ async function statusStorageGeneration(
     },
     readyForApply:
       d1 === null && r2 === null && !names.selectedByTarget.d1 && !names.selectedByTarget.r2,
+    productionD1Guard: productionD1GuardRecord(options.productionD1),
     rollback: "old active target remains unchanged; repair forward from any known aftermath",
   };
   if (invocation.freshLineage === undefined) return result;
@@ -633,7 +933,7 @@ async function statusStorageGeneration(
 
 function selectedSourceArtifact(
   directory: string,
-  lineage: "apply-0066" | IntegrationFreshLineage,
+  lineage: "apply-0066" | IntegrationFreshLineage | "applied-v2-0092",
 ): ReturnType<typeof readCurrentAuditedMigrationSourceArtifact> {
   const source = readCurrentAuditedMigrationSourceArtifact(directory);
   switch (lineage) {
@@ -645,6 +945,12 @@ function selectedSourceArtifact(
       return projectFreshProductionV2MigrationArtifact(source);
     case "v2-0089":
       return projectFreshProductionV2MigrationArtifact0089(source);
+    case "v2-0091":
+      return projectFreshIntegrationV2MigrationArtifact0091(source);
+    case "v2-0092":
+      return projectFreshIntegrationV2MigrationArtifact0092(source);
+    case "applied-v2-0092":
+      return projectCanonicalIntegrationV2MigrationArtifact0092(source);
   }
 }
 
@@ -661,16 +967,25 @@ function readSealedSelectedArtifact(
       return readSealedFreshProductionV2MigrationArtifact(directory);
     case "v2-0089":
       return readSealedFreshProductionV2MigrationArtifact0089(directory);
+    case "v2-0091":
+      return readSealedFreshIntegrationV2MigrationArtifact0091(directory);
+    case "v2-0092":
+      return readSealedFreshIntegrationV2MigrationArtifact0092(directory);
   }
 }
 
 function freshV2D1Lineage(lineage: IntegrationFreshLineage | undefined): FreshV2D1Lineage | null {
-  return lineage === "v2-0088" || lineage === "v2-0089" ? lineage : null;
+  return lineage === "v2-0088" ||
+    lineage === "v2-0089" ||
+    lineage === "v2-0091" ||
+    lineage === "v2-0092"
+    ? lineage
+    : null;
 }
 
 function lineageCeiling(
   lineage: IntegrationFreshLineage | undefined,
-): "0066" | "0075" | "0088" | "0089" {
+): "0066" | "0075" | "0088" | "0089" | "0091" | "0092" {
   switch (lineage) {
     case undefined:
       return "0066";
@@ -680,7 +995,24 @@ function lineageCeiling(
       return "0088";
     case "v2-0089":
       return "0089";
+    case "v2-0091":
+      return "0091";
+    case "v2-0092":
+      return "0092";
   }
+}
+
+/** What the production guard compared, recorded in every status and apply output. */
+function productionD1GuardRecord(
+  production: ProductionD1Identity | undefined,
+): Record<string, unknown> {
+  return production === undefined
+    ? { compared: "naming-only" }
+    : {
+        compared: "naming-and-production-target",
+        productionDatabaseName: production.databaseName,
+        productionDatabaseId: production.databaseId,
+      };
 }
 
 interface ProviderContext {
@@ -807,6 +1139,7 @@ async function applyStorageGeneration(
     const fenced = await readInventory(provider.provider, names, "preflight");
     assertAbsent(fenced, "immediate precreate integration storage absence fence");
     migrationSeal.assertUnchanged();
+    assertFreshGenerationNames(names);
 
     // Set this before entering the provider boundary: a lost acknowledgement
     // can mean Cloudflare created the database even when no identity returned.
@@ -827,6 +1160,12 @@ async function applyStorageGeneration(
         `databaseId=${databaseId}`,
       );
     }
+    // Before any SQL reaches it: the new id is not the production D1's either.
+    assertStagingD1NotProduction(
+      { databaseName: createdReadback.name, databaseId },
+      options.productionD1,
+      "mutation",
+    );
 
     const generatedTarget = {
       accountId: target.accountId,
@@ -919,6 +1258,7 @@ async function applyStorageGeneration(
       );
     }
     sealed.assertUnchanged();
+    assertFreshGenerationNames(names);
     const createdBucket = await providerCall("mutation", "new R2 create failed; do not retry", () =>
       provider.provider.createR2(names.bucketName),
     );
@@ -948,6 +1288,7 @@ async function applyStorageGeneration(
         databaseId,
       },
       r2: { bucketName: names.bucketName },
+      productionD1Guard: productionD1GuardRecord(options.productionD1),
       migrationDigest: sourceArtifact.digest,
       migrationBytes: sourceArtifact.bytes,
       migrationImportDigest: migrationImport.digest,

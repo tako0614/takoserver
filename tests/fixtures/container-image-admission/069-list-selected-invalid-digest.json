@@ -1,0 +1,34 @@
+{
+  "id": "069-list-selected-invalid-digest",
+  "category": "manifest-list",
+  "description": "The selected child digest must also contain exactly 64 hexadecimal characters.",
+  "input": {
+    "imageRef": "registry.example.test/workload@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    },
+    "registry": {
+      "visibility": "public"
+    },
+    "manifest": {
+      "kind": "list",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "manifests": [
+        {
+          "kind": "image",
+          "digest": "sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+          "platform": {
+            "os": "linux",
+            "architecture": "amd64"
+          },
+          "sizeBytes": 4096
+        }
+      ]
+    }
+  },
+  "expected": {
+    "decision": "reject",
+    "reason": "manifest_digest_invalid"
+  }
+}

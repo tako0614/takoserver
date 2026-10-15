@@ -7,13 +7,20 @@ import { createAttachmentService, createAttachmentStore } from "./attachments.ts
 import {
   createAccounts,
   createApiKeyAdministration,
+  createSingleUseCredentials,
   type ExternalIdentityVerifier,
   grants,
   type IdentityProviderDescriptor,
 } from "./auth.ts";
+import type { BillingConfig } from "./billing-config.ts";
 import { createCatalog, type Offering } from "./catalog.ts";
 import { type Checkout, createControlRoutes } from "./control.ts";
 import { createDataAiRoutes } from "./data-ai.ts";
+import {
+  assertHostedBillingComposition,
+  type HostedBillingComposition,
+  type HostedBillingStatus,
+} from "./hosted-billing-composition.ts";
 import {
   createIntegrationE2eCredentialAuthority,
   type IntegrationE2eCredentialAuthorityConfig,
@@ -26,6 +33,14 @@ import {
 } from "./integration-organization-bootstrap.ts";
 import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
 import { createMetering, type MeteringRates } from "./metering.ts";
+import type { OperatorPaymentsReconcileVerifier } from "./operator-credentials.ts";
+import { createOrgBilling, type OrgBilling } from "./org-billing.ts";
+import {
+  createFundingCredit,
+  type FundingReconcileReport,
+  type PaymentEventContext,
+  type PaymentEvents,
+} from "./payment-events.ts";
 import type { Clock, ObjectStoreAccess, Sql } from "./ports.ts";
 import { createProviderDriver, createProviderFormAvailability } from "./provider-driver.ts";
 import { createProviderMetering } from "./provider-metering.ts";
@@ -113,8 +128,33 @@ export interface AppPorts {
   readonly objects: ObjectStoreAccess;
   readonly identity: ExternalIdentityVerifier;
   readonly settlement: FundingSettlementVerifier;
+  /** Frozen operator tariff; absent keeps the Organization billing API disabled. */
+  readonly billingConfig?: BillingConfig;
+  /** Set only by an entry with validated Hosted pricing and Stripe schema. */
+  readonly hostedPaidFreeExclusion?: boolean;
+  /** Prequalified local Hosted wallet policy; its missing payment authority is explicit. */
+  readonly hostedBilling?: HostedBillingComposition;
   /** Starts a payment, where this deployment can take one. */
   readonly checkout?: Checkout | undefined;
+  /**
+   * Payments learned without the payer returning: the processor's webhook and
+   * the reconcile pass. Built here because only this composition owns the
+   * ledger and the organizations they credit.
+   */
+  readonly paymentEvents?: ((context: PaymentEventContext) => PaymentEvents) | undefined;
+  /**
+   * Verifies the operator's single-use request to run the reconcile pass now.
+   * The route is served only together with `paymentEvents`; either absent, it
+   * is not served.
+   */
+  readonly operatorPaymentsReconcile?: OperatorPaymentsReconcileVerifier | undefined;
+  /**
+   * Lets concurrent callers join one in-flight reconcile pass. Only a
+   * long-lived process whose pending I/O outlives the request that started it
+   * may set this (the Bun Host). A Worker leaves it unset, so no invocation
+   * ever awaits I/O begun in another request's context.
+   */
+  readonly shareReconcilePass?: boolean | undefined;
   /** What data costs here. Absent means measured and not charged. */
   readonly meteringRates?: MeteringRates | undefined;
   /** OpenAI-compatible inference backend. Absent keeps the AI route unavailable. */
@@ -214,18 +254,30 @@ export function createAppResourceStoreBundle(sql: Sql, clock: Clock): AppResourc
 
 export interface App {
   readonly fetch: Router;
+  /** Optional lifecycle service for the Organization wallet and usage receipts. */
+  readonly orgBilling?: OrgBilling;
+  /** Startup callers must surface this declared degradation before offering payments. */
+  readonly hostedBilling?: HostedBillingStatus;
   /** Typed operator seam; no maintenance route is mounted on public HTTP. */
   readonly maintenance: {
     readonly artifacts: ArtifactReconciler;
+    /** Bounded outbox dispatch; an unavailable transport refuses before claiming delivery. */
+    readonly billingWarnings?: Pick<HostedBillingComposition, "dispatchWarnings">;
   };
   /** One pass of background settlement. Safe to call concurrently. */
   tick(): Promise<TickReport>;
   /** Independently scheduled v2 executor; one Operation at most per call. */
   tickTakoformV2(): Promise<V2Operation | null>;
+  /**
+   * Credits recently settled payments nobody presented; null where payment is
+   * off. With `shareReconcilePass`, a concurrent caller joins the pass in flight.
+   */
+  reconcilePayments(): Promise<FundingReconcileReport | null>;
 }
 
 export interface TickReport {
   readonly expiredReservations: number;
+  readonly expiredWalletHolds: number;
   readonly expiredRuntimeInputPreparations: number;
   /**
    * Declarations pointing at a Form this deployment no longer installs. Any
@@ -285,6 +337,18 @@ export function buildApp(ports: AppPorts): App {
     );
   }
   const clock = ports.clock ?? (() => new Date());
+  if (ports.hostedBilling) {
+    assertHostedBillingComposition(ports.hostedBilling, {
+      sql: ports.sql,
+      clock,
+      ...(ports.billingConfig === undefined ? {} : { billingConfig: ports.billingConfig }),
+    });
+    if (ports.checkout !== undefined || ports.paymentEvents !== undefined) {
+      throw new TypeError(
+        "Hosted financial capabilities require the canonical custody and settlement adapter",
+      );
+    }
+  }
   const origin = ports.resourceStores && resourceStoreOrigins.get(ports.resourceStores);
   if (
     ports.resourceStores &&
@@ -345,7 +409,84 @@ export function buildApp(ports: AppPorts): App {
         clock,
       })
     : null;
-  const ledger = createLedger(ports.sql, clock);
+  const prepareAdmission = ports.hostedBilling?.limitPolicy.prepareAdmission.bind(
+    ports.hostedBilling.limitPolicy,
+  );
+  const allocationAdmissionResolver = prepareAdmission
+    ? async (organizationId: string) => {
+        if (!orgBilling) throw new TypeError("Hosted wallet lifecycle is unavailable");
+        // The same lifecycle mints eligible monthly allowance before the first
+        // internal data-plane debit. Ledger.wallet does not resolve admission,
+        // and capture/replay retain their original allocations and witnesses.
+        await orgBilling.wallet(organizationId);
+        return await prepareAdmission(organizationId);
+      }
+    : undefined;
+  const ledger = createLedger(ports.sql, clock, {
+    hostedPaidFreeExclusion:
+      ports.hostedBilling !== undefined || ports.hostedPaidFreeExclusion === true,
+    ...(allocationAdmissionResolver ? { allocationAdmissionResolver } : {}),
+  });
+  const orgBilling = ports.billingConfig
+    ? createOrgBilling({
+        sql: ports.sql,
+        clock,
+        ledger,
+        config: ports.billingConfig,
+        hostedPaidFreeExclusion:
+          ports.hostedBilling !== undefined || ports.hostedPaidFreeExclusion === true,
+        ...(ports.hostedBilling
+          ? { limitPolicy: ports.hostedBilling.limitPolicy, requireWorkspaceAttribution: true }
+          : {}),
+      })
+    : undefined;
+  const paymentContext: PaymentEventContext = {
+    sql: ports.sql,
+    clock,
+    credit: createFundingCredit({
+      ledger,
+      organizationExists: async (organizationId) =>
+        (await accounts.organization(organizationId)) !== null,
+    }),
+    creditedFunding: (fundings) => ledger.fundedReferences(fundings),
+  };
+  const hostedPayments = ports.hostedBilling?.paymentActivation
+    ? ports.hostedBilling.createPayments(paymentContext)
+    : undefined;
+  const paymentEvents = hostedPayments?.events ?? ports.paymentEvents?.(paymentContext);
+  // Where the composition allows it (the Bun Host), one pass at a time: the
+  // timer and the operator route share it, and a caller arriving mid-pass
+  // joins the pass already reading the processor instead of starting a
+  // second. A Worker never shares, because I/O started in one request's
+  // context may never settle once that request is canceled, and a later
+  // invocation that joined it would hang with it. Unshared or concurrent
+  // passes stay harmless, because each funding reference credits once.
+  let reconcileInFlight: Promise<FundingReconcileReport> | null = null;
+  const reconcilePayments = async (): Promise<FundingReconcileReport | null> => {
+    if (!paymentEvents) return null;
+    if (!ports.shareReconcilePass) return await paymentEvents.reconcile();
+    if (!reconcileInFlight) {
+      const pass: Promise<FundingReconcileReport> = paymentEvents.reconcile().finally(() => {
+        if (reconcileInFlight === pass) reconcileInFlight = null;
+      });
+      reconcileInFlight = pass;
+    }
+    return await reconcileInFlight;
+  };
+  const singleUseCredentials = createSingleUseCredentials(ports.sql, clock);
+  const operatorReconcileVerifier = ports.operatorPaymentsReconcile;
+  const operatorPaymentsReconcile =
+    paymentEvents && operatorReconcileVerifier
+      ? async (assertion: string): Promise<FundingReconcileReport> => {
+          const credential = await operatorReconcileVerifier.verify(assertion);
+          // Spent before the pass: a replay runs nothing, and a pass that fails
+          // burns the assertion rather than leaving it usable twice.
+          await singleUseCredentials.spend(credential);
+          const report = await reconcilePayments();
+          if (!report) throw new Error("payment reconcile is not configured");
+          return report;
+        }
+      : undefined;
   const catalog = createCatalog(ports.offerings);
   const { deployments, inventory } = resourceStores;
   const originReservations =
@@ -674,14 +815,46 @@ export function buildApp(ports: AppPorts): App {
     forms: ports.forms,
     ...(availability?.catalogue ? { formAvailability: availability } : {}),
     identityProviders: ports.identityProviders ?? [],
-    ...(ports.checkout ? { checkout: ports.checkout } : {}),
+    ...(ports.hostedBilling?.paymentActivation
+      ? { checkout: ports.hostedBilling.checkout }
+      : ports.checkout
+        ? { checkout: ports.checkout }
+        : {}),
+    ...(paymentEvents?.receive ? { paymentNotifications: paymentEvents.receive } : {}),
+    ...(operatorPaymentsReconcile ? { operatorPaymentsReconcile } : {}),
+    ...(hostedPayments
+      ? {
+          subscriptionCustody: hostedPayments.subscriptionCustody,
+          subscriptionPlans: hostedPayments.subscriptionPlans,
+          subscriptionCommandReceipts: hostedPayments.subscriptionCommandReceipts,
+        }
+      : paymentEvents?.subscriptions
+        ? { subscriptions: paymentEvents.subscriptions }
+        : {}),
+    ...(paymentEvents?.creditFunding ? { creditFunding: paymentEvents.creditFunding } : {}),
     ledger,
+    ...(orgBilling ? { billing: orgBilling } : {}),
+    ...(ports.hostedBilling
+      ? {
+          hostedBilling: true,
+          limitPolicy: ports.hostedBilling.limitPolicy,
+          billingCapabilities: {
+            contractVersion: "hosted-billing-v1",
+            topUps: ports.hostedBilling.status.topUps,
+            subscriptionStart: ports.hostedBilling.status.subscriptionStart,
+            subscriptionCancellation: ports.hostedBilling.status.subscriptionCancellation,
+            subscriptionPlanChange: ports.hostedBilling.status.subscriptionPlanChange,
+          },
+        }
+      : {}),
     catalog,
     reseller,
     tokens,
     authenticateTenantRunCredential: async (authorization) =>
       (await authenticateTenantRunCredential(authorization))?.claims ?? null,
-    settlement: ports.settlement,
+    settlement: ports.hostedBilling?.paymentActivation
+      ? ports.hostedBilling.settlement
+      : ports.settlement,
     clock,
     ...(ports.consoleOrigin === undefined ? {} : { consoleOrigin: ports.consoleOrigin }),
     ...(verifyNativeAbsence
@@ -703,6 +876,9 @@ export function buildApp(ports: AppPorts): App {
     ledger,
     clock,
     randomId,
+    hostedPaidFreeExclusion:
+      ports.hostedBilling !== undefined || ports.hostedPaidFreeExclusion === true,
+    ...(allocationAdmissionResolver ? { allocationAdmissionResolver } : {}),
     ...(ports.meteringRates ? { rates: ports.meteringRates } : {}),
   });
   const providerMetering = createProviderMetering({
@@ -740,6 +916,8 @@ export function buildApp(ports: AppPorts): App {
     ...(ports.consoleOrigin === undefined ? {} : { consoleOrigin: ports.consoleOrigin }),
   });
   return {
+    ...(orgBilling ? { orgBilling } : {}),
+    ...(ports.hostedBilling ? { hostedBilling: ports.hostedBilling.status } : {}),
     fetch:
       integrationOrganizationBootstrapRoute || integrationE2eCredentialRoute
         ? async (request, lifetime) =>
@@ -747,8 +925,12 @@ export function buildApp(ports: AppPorts): App {
             (await integrationE2eCredentialRoute?.(request)) ??
             (await router(request, lifetime))
         : router,
-    maintenance: { artifacts: artifactReconciler },
+    maintenance: {
+      artifacts: artifactReconciler,
+      ...(ports.hostedBilling ? { billingWarnings: ports.hostedBilling } : {}),
+    },
     tickTakoformV2: () => takoformV2Host.runNext(),
+    reconcilePayments,
     async tick(): Promise<TickReport> {
       // Legacy recovery remains independent of potentially slow v2 effects.
       let drainFailed = false;
@@ -777,6 +959,7 @@ export function buildApp(ports: AppPorts): App {
         return "pending";
       });
       const expiredReservations = await reseller.expireDue(64);
+      const expiredWalletHolds = await orgBilling?.expireDue(64);
       const expiredRuntimeInputPreparations = await ports.runtimeInputs?.maintenance.expireDue(64);
       const store = inventory;
       const installed = ports.forms.map((form) => form.identity.formRef.schemaDigest);
@@ -805,6 +988,7 @@ export function buildApp(ports: AppPorts): App {
       }
       return {
         expiredReservations,
+        expiredWalletHolds: expiredWalletHolds ?? 0,
         expiredRuntimeInputPreparations: expiredRuntimeInputPreparations ?? 0,
         orphanedResources,
         meteredRows,

@@ -9,6 +9,7 @@
  */
 
 import type { PricePlan } from "../../src/catalog.ts";
+import type { HostedPricing } from "../../src/hosted-pricing.ts";
 import type { TakoformBindingRef, TakoformInterfaceRef } from "../../src/interface-ref.ts";
 import type { V2Operation, V2Resource } from "../../src/takoform-v2/types.ts";
 
@@ -49,19 +50,74 @@ export interface LedgerEntry {
   readonly organizationId: string;
   readonly type: string;
   readonly reference: string;
-  readonly settledDeltaMinor: number;
-  readonly heldDeltaMinor: number;
+  readonly settledDeltaMicros: string;
+  readonly heldDeltaMicros: string;
   readonly createdAt: string;
 }
 
 export interface Wallet {
   readonly organizationId: string;
   readonly currency: string;
-  readonly settledMinor: number;
-  readonly heldMinor: number;
-  readonly availableMinor: number;
+  readonly settledMicros: string;
+  readonly heldMicros: string;
+  readonly availableMicros: string;
   readonly entries: readonly LedgerEntry[];
 }
+
+export type HostedPlanTable = HostedPricing["hostedPlanTable"];
+
+export interface HostedSubscriptionProjection {
+  readonly organizationId: string;
+  readonly subscriptionId: string;
+  readonly subscriptionRef: string;
+  readonly planKey: string;
+  readonly pricingRevision: string;
+  readonly status:
+    | "incomplete"
+    | "incomplete_expired"
+    | "trialing"
+    | "active"
+    | "past_due"
+    | "canceled"
+    | "unpaid"
+    | "paused";
+  readonly cancelAtPeriodEnd: boolean;
+  readonly periodStart: string;
+  readonly periodEnd: string;
+  readonly paidThrough: string | null;
+  readonly paidFeatures: boolean;
+  readonly updatedAt: string;
+}
+
+export interface OrganizationSubscription {
+  readonly subscription: HostedSubscriptionProjection | null;
+  readonly planTable: HostedPlanTable;
+}
+
+export type SubscriptionCheckoutStart =
+  | {
+      readonly status: 201;
+      readonly checkout: { readonly state: "open"; readonly id: string; readonly url: string };
+    }
+  | {
+      readonly status: 202;
+      readonly checkout: { readonly state: "pending"; readonly id: string };
+    }
+  | {
+      readonly status: 200;
+      readonly checkout:
+        | {
+            readonly state: "associated";
+            readonly id: string;
+            readonly subscriptionRef: string;
+            readonly url?: string;
+          }
+        | { readonly state: "expired"; readonly id: string };
+    };
+
+export type SubscriptionCancellationReceipt =
+  | { readonly state: "pending"; readonly subscriptionRef: string }
+  | { readonly state: "verified"; readonly subscriptionRef: string; readonly effectiveAt: string };
 
 export interface Offering {
   readonly id: string;
@@ -145,6 +201,133 @@ export interface ApiOptions {
   readonly origin: string;
   readonly token: () => string | null;
   readonly onSessionLost: () => void;
+}
+
+const MAX_SAFE_MICROS = BigInt(Number.MAX_SAFE_INTEGER);
+
+/** Format canonical signed USD micros without converting money through cents. */
+export function formatMicrosCurrency(
+  value: string,
+  currency = "USD",
+  locale: "en-US" | "ja-JP" = "en-US",
+): string {
+  if (!/^-?(0|[1-9][0-9]*)$/u.test(value) || value === "-0") {
+    throw new TypeError("invalid micros value");
+  }
+  const signed = BigInt(value);
+  const absolute = signed < 0n ? -signed : signed;
+  if (absolute > MAX_SAFE_MICROS || !/^[A-Z]{3}$/u.test(currency)) {
+    throw new TypeError("micros value out of range");
+  }
+
+  const whole = absolute / 1_000_000n;
+  const remainder = absolute % 1_000_000n;
+  const fraction =
+    remainder === 0n ? "" : remainder.toString().padStart(6, "0").replace(/0+$/u, "");
+  const currencyFormatter = new Intl.NumberFormat(locale, {
+    style: "currency",
+    currency,
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 0,
+  });
+  // Use -1 for a negative sub-dollar value so locale-specific sign/currency
+  // placement survives while the integer digits are replaced with zero.
+  const parts = currencyFormatter.formatToParts(
+    signed < 0n ? (whole === 0n ? -1n : -whole) : whole,
+  );
+  const digits = new Intl.NumberFormat(locale, {
+    useGrouping: false,
+    maximumFractionDigits: 0,
+  });
+  const decimal = new Intl.NumberFormat(locale, { minimumFractionDigits: 1 })
+    .formatToParts(1.1)
+    .find((part) => part.type === "decimal")?.value;
+  const fractionText = [...fraction].map((digit) => digits.format(Number(digit))).join("");
+  const lastInteger = parts.reduce(
+    (last, part, index) => (part.type === "integer" ? index : last),
+    -1,
+  );
+  if (lastInteger < 0) throw new TypeError("currency formatter omitted integer");
+
+  const output: string[] = [];
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    if (!part) continue;
+    output.push(
+      signed < 0n && whole === 0n && part.type === "integer" ? digits.format(0) : part.value,
+    );
+    if (index === lastInteger && fraction !== "") {
+      if (decimal === undefined)
+        throw new TypeError("currency formatter omitted decimal separator");
+      output.push(decimal, fractionText);
+    }
+  }
+  return output.join("");
+}
+
+function decodeWallet(payload: unknown, organizationId: string): Wallet {
+  if (!isRecord(payload) || !isRecord(payload.wallet)) throw new TypeError("invalid wallet");
+  const wallet = payload.wallet;
+  if (
+    wallet.organizationId !== organizationId ||
+    wallet.currency !== "USD" ||
+    !Array.isArray(wallet.entries)
+  ) {
+    throw new TypeError("invalid wallet identity");
+  }
+  const settledMicros = unsignedMicros(wallet.settledMicros);
+  const heldMicros = unsignedMicros(wallet.heldMicros);
+  const availableMicros = unsignedMicros(wallet.availableMicros);
+  if (BigInt(settledMicros) - BigInt(heldMicros) !== BigInt(availableMicros)) {
+    throw new TypeError("invalid wallet conservation");
+  }
+  const entries = wallet.entries.map((entry): LedgerEntry => {
+    if (
+      !isRecord(entry) ||
+      typeof entry.id !== "string" ||
+      typeof entry.organizationId !== "string" ||
+      entry.organizationId !== organizationId ||
+      typeof entry.type !== "string" ||
+      typeof entry.reference !== "string" ||
+      typeof entry.createdAt !== "string"
+    ) {
+      throw new TypeError("invalid wallet entry");
+    }
+    return {
+      id: entry.id,
+      organizationId,
+      type: entry.type,
+      reference: entry.reference,
+      settledDeltaMicros: signedMicros(entry.settledDeltaMicros),
+      heldDeltaMicros: signedMicros(entry.heldDeltaMicros),
+      createdAt: entry.createdAt,
+    };
+  });
+  return { organizationId, currency: "USD", settledMicros, heldMicros, availableMicros, entries };
+}
+
+function unsignedMicros(value: unknown): string {
+  if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/u.test(value)) {
+    throw new TypeError("invalid unsigned micros");
+  }
+  const amount = BigInt(value);
+  if (amount > MAX_SAFE_MICROS) throw new TypeError("micros out of range");
+  return value;
+}
+
+function signedMicros(value: unknown): string {
+  if (typeof value !== "string" || !/^-?(0|[1-9][0-9]*)$/u.test(value) || value === "-0") {
+    throw new TypeError("invalid signed micros");
+  }
+  const amount = BigInt(value);
+  if (amount < -MAX_SAFE_MICROS || amount > MAX_SAFE_MICROS) {
+    throw new TypeError("micros out of range");
+  }
+  return value;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
 export function createApi(options: ApiOptions) {
@@ -283,11 +466,128 @@ export function createApi(options: ApiOptions) {
         `/v1/organizations/${encodeURIComponent(organizationId)}/api-keys/${encodeURIComponent(apiKeyId)}`,
       ),
 
-    wallet: (organizationId: string) =>
-      call<{ wallet: Wallet }>(
-        "GET",
-        `/v1/organizations/${encodeURIComponent(organizationId)}/wallet`,
-      ),
+    wallet: async (organizationId: string) => {
+      const path = `/v1/organizations/${encodeURIComponent(organizationId)}/wallet`;
+      const result = await request<unknown>("GET", path);
+      try {
+        return { wallet: decodeWallet(result.payload, organizationId) };
+      } catch {
+        throw new ApiError("invalid_response", result.status, path);
+      }
+    },
+
+    /** Reads the Host-authored plan table and the Organization's current projection. */
+    async subscription(organizationId: string): Promise<OrganizationSubscription> {
+      const path = `/v1/organizations/${encodeURIComponent(organizationId)}/payments/subscription`;
+      const { payload, status } = await request<unknown>("GET", path);
+      if (
+        status !== 200 ||
+        !isRecord(payload) ||
+        !(
+          payload.subscription === null ||
+          isHostedSubscriptionProjection(payload.subscription, organizationId)
+        )
+      )
+        throw new ApiError("invalid_response", status, path);
+      const planTable = decodeHostedPlanTable(payload.planTable);
+      if (!planTable) throw new ApiError("invalid_response", status, path);
+      return { subscription: payload.subscription, planTable };
+    },
+
+    /** Replays one durable caller reference against one Host-configured plan key. */
+    async beginSubscription(
+      organizationId: string,
+      reference: string,
+      planKey: string,
+    ): Promise<SubscriptionCheckoutStart> {
+      const path = `/v1/organizations/${encodeURIComponent(organizationId)}/payments/subscription`;
+      if (!isBillingReference(reference) || !isPlanKey(planKey))
+        throw new ApiError("invalid_request", 0, path);
+      const { payload, status } = await request<unknown>("POST", path, { reference, planKey });
+      if (!isRecord(payload) || !isRecord(payload.checkout))
+        throw new ApiError("invalid_response", status, path);
+      const checkout = payload.checkout;
+      if (
+        status === 201 &&
+        checkout.state === "open" &&
+        isStripeSessionId(checkout.id) &&
+        isCheckoutUrl(checkout.url)
+      ) {
+        return {
+          status: 201,
+          checkout: { state: "open", id: checkout.id, url: checkout.url },
+        };
+      }
+      if (status === 202 && checkout.state === "pending" && isSubscriptionIntentId(checkout.id)) {
+        return { status: 202, checkout: { state: "pending", id: checkout.id } };
+      }
+      if (
+        status === 200 &&
+        checkout.state === "associated" &&
+        isStripeSessionId(checkout.id) &&
+        isSubscriptionRef(checkout.subscriptionRef) &&
+        (checkout.url === undefined || isCheckoutUrl(checkout.url))
+      ) {
+        return {
+          status: 200,
+          checkout: {
+            state: "associated",
+            id: checkout.id,
+            subscriptionRef: checkout.subscriptionRef,
+            ...(checkout.url === undefined ? {} : { url: checkout.url }),
+          },
+        };
+      }
+      if (
+        status === 200 &&
+        checkout.state === "expired" &&
+        isStripeSessionId(checkout.id) &&
+        checkout.url === undefined
+      ) {
+        return { status: 200, checkout: { state: "expired", id: checkout.id } };
+      }
+      throw new ApiError("invalid_response", status, path);
+    },
+
+    /** Requests period-end cancellation only against the exact current opaque target. */
+    async cancelSubscription(
+      organizationId: string,
+      reference: string,
+      expectedSubscriptionRef: string,
+    ): Promise<SubscriptionCancellationReceipt> {
+      const path = `/v1/organizations/${encodeURIComponent(organizationId)}/payments/subscription`;
+      if (!isBillingReference(reference) || !isSubscriptionRef(expectedSubscriptionRef))
+        throw new ApiError("invalid_request", 0, path);
+      const { payload, status } = await request<unknown>("PATCH", path, {
+        reference,
+        cancelAtPeriodEnd: true,
+        expectedSubscriptionRef,
+      });
+      if (!isRecord(payload) || !isRecord(payload.cancellation))
+        throw new ApiError("invalid_response", status, path);
+      const cancellation = payload.cancellation;
+      if (
+        status === 202 &&
+        cancellation.state === "pending" &&
+        cancellation.subscriptionRef === expectedSubscriptionRef &&
+        cancellation.effectiveAt === undefined
+      ) {
+        return { state: "pending", subscriptionRef: expectedSubscriptionRef };
+      }
+      if (
+        status === 200 &&
+        cancellation.state === "verified" &&
+        cancellation.subscriptionRef === expectedSubscriptionRef &&
+        isCanonicalIsoTimestamp(cancellation.effectiveAt)
+      ) {
+        return {
+          state: "verified",
+          subscriptionRef: expectedSubscriptionRef,
+          effectiveAt: cancellation.effectiveAt,
+        };
+      }
+      throw new ApiError("invalid_response", status, path);
+    },
 
     /**
      * Starts a payment. Answers 404 where this deployment cannot take one,
@@ -465,8 +765,124 @@ export function createApi(options: ApiOptions) {
   };
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+function decodeHostedPlanTable(value: unknown): HostedPlanTable | null {
+  if (
+    !isRecord(value) ||
+    value.scope !== "hosted" ||
+    value.balanceScope !== "organization" ||
+    !Array.isArray(value.products) ||
+    value.products.length !== 2 ||
+    value.products[0] !== "takosumi-hosted" ||
+    value.products[1] !== "takoserver" ||
+    !Array.isArray(value.plans) ||
+    (value.plans.length !== 3 && value.plans.length !== 4)
+  )
+    return null;
+  const free = value.plans[0];
+  const subscriptions = value.plans.slice(1, -1);
+  const usage = value.plans.at(-1);
+  if (
+    !isRecord(free) ||
+    !isPlanKey(free.planId) ||
+    free.tier !== "free" ||
+    free.resourceScope !== "edge" ||
+    free.edgeAllowance !== "pending-owner-runtime-policy" ||
+    !isRecord(usage) ||
+    !isPlanKey(usage.planId) ||
+    usage.tier !== "usage" ||
+    !isSafeIntegerAtLeast(usage.checkoutMinimumMinor, 1) ||
+    !isSafeIntegerAtLeast(usage.checkoutMaximumMinor, 1) ||
+    !isRecord(usage.meters) ||
+    usage.checkoutMinimumMinor > usage.checkoutMaximumMinor ||
+    !subscriptions.every(
+      (plan) =>
+        isRecord(plan) &&
+        isPlanKey(plan.planId) &&
+        plan.tier === "subscription" &&
+        isSafeIntegerAtLeast(plan.monthlyAmountMinor, 1) &&
+        isSafeIntegerAtLeast(plan.includedCreditMinor, 0) &&
+        typeof plan.stripePriceId === "string" &&
+        /^price_[A-Za-z0-9_]{1,240}$/u.test(plan.stripePriceId),
+    )
+  )
+    return null;
+  if (new Set(value.plans.map((plan) => plan.planId)).size !== value.plans.length) return null;
+  return value as unknown as HostedPlanTable;
+}
+
+function isHostedSubscriptionProjection(
+  value: unknown,
+  organizationId: string,
+): value is HostedSubscriptionProjection {
+  if (!isRecord(value)) return false;
+  return (
+    value.organizationId === organizationId &&
+    typeof value.subscriptionId === "string" &&
+    value.subscriptionId.length > 0 &&
+    isSubscriptionRef(value.subscriptionRef) &&
+    isPlanKey(value.planKey) &&
+    typeof value.pricingRevision === "string" &&
+    value.pricingRevision.length > 0 &&
+    [
+      "incomplete",
+      "incomplete_expired",
+      "trialing",
+      "active",
+      "past_due",
+      "canceled",
+      "unpaid",
+      "paused",
+    ].includes(String(value.status)) &&
+    typeof value.cancelAtPeriodEnd === "boolean" &&
+    isCanonicalIsoTimestamp(value.periodStart) &&
+    isCanonicalIsoTimestamp(value.periodEnd) &&
+    (value.paidThrough === null || isCanonicalIsoTimestamp(value.paidThrough)) &&
+    typeof value.paidFeatures === "boolean" &&
+    isCanonicalIsoTimestamp(value.updatedAt)
+  );
+}
+
+function isSafeIntegerAtLeast(value: unknown, minimum: number): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= minimum;
+}
+
+function isBillingReference(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(value);
+}
+
+function isPlanKey(value: unknown): value is string {
+  return typeof value === "string" && /^[a-z][a-z0-9_-]{0,63}$/u.test(value);
+}
+
+function isStripeSessionId(value: unknown): value is string {
+  return typeof value === "string" && /^cs_[A-Za-z0-9_]{1,240}$/u.test(value);
+}
+
+function isSubscriptionIntentId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^sci_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(value)
+  );
+}
+
+function isSubscriptionRef(value: unknown): value is string {
+  return typeof value === "string" && /^sra_[0-9a-f]{64}$/u.test(value);
+}
+
+function isCheckoutUrl(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  try {
+    const url = new URL(value);
+    return url.origin === "https://checkout.stripe.com";
+  } catch {
+    return false;
+  }
+}
+
+function isCanonicalIsoTimestamp(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) && date.toISOString() === value;
 }
 
 function isV2Operation(value: unknown): value is ResourceOperation {

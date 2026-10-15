@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { createAccounts, type ExternalIdentityVerifier } from "../src/auth.ts";
 import { createLedger } from "../src/ledger.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
+import { minorToMicros } from "../src/money.ts";
 import { createFileObjectStore } from "../src/objects-fs.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
@@ -46,13 +47,15 @@ test("a quiescent data-root copy reopens local control, object, and Worker state
   await ledger.fund({
     organizationId: organization.id,
     fundingRef: "fixture-funding",
-    amountMinor: 1_000,
+    amountMicros: minorToMicros(1_000),
+    kind: "purchased",
+    consumptionClass: "purchased",
   });
   expect(
     await ledger.hold({
       organizationId: organization.id,
       reference: "fixture-hold",
-      amountMinor: 200,
+      amountMicros: minorToMicros(200),
     }),
   ).toBe(true);
 
@@ -89,7 +92,11 @@ test("a quiescent data-root copy reopens local control, object, and Worker state
     ]);
     expect(restoredOrganization).toHaveLength(1);
     const wallet = await createLedger(restoredSql, clock).wallet(organization.id);
-    expect(wallet).toMatchObject({ settledMinor: 1_000, heldMinor: 200, availableMinor: 800 });
+    expect(wallet).toMatchObject({
+      settledMicros: 10_000_000,
+      heldMicros: 2_000_000,
+      availableMicros: 8_000_000,
+    });
   } finally {
     restoredDatabase.close();
   }

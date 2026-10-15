@@ -1,0 +1,28 @@
+{
+  "id": "005-digest-empty",
+  "category": "reference",
+  "description": "A SHA-256 digest must contain exactly 64 hexadecimal characters.",
+  "input": {
+    "imageRef": "registry.example.test/workload@sha256:",
+    "platform": {
+      "os": "linux",
+      "architecture": "amd64"
+    },
+    "registry": {
+      "visibility": "public"
+    },
+    "manifest": {
+      "kind": "image",
+      "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "platform": {
+        "os": "linux",
+        "architecture": "amd64"
+      },
+      "sizeBytes": 4096
+    }
+  },
+  "expected": {
+    "decision": "reject",
+    "reason": "digest_pin_required"
+  }
+}

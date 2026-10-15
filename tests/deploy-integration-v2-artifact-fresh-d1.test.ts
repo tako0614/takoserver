@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { Miniflare } from "miniflare";
+import { deriveExpectedApplicationShape } from "../scripts/deploy/application-schema-shape.ts";
 import type { FreshV2DataReadback } from "../scripts/deploy/fresh-v2-data-readback.ts";
 import {
   type IntegrationStorageGenerationProcess,
@@ -10,7 +11,7 @@ import {
   verifyFreshV2ArtifactIntegrationStorageTarget,
   verifyFreshV2IntegrationStorageTarget,
 } from "../scripts/deploy/integration-storage-generation.ts";
-import { canonicalSchemaShape } from "../scripts/deploy/migrations.ts";
+import { canonicalSchemaShape, readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { bytesDigest } from "../src/json.ts";
@@ -22,7 +23,7 @@ import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.t
 const ORIGIN = "https://api.fresh-v2-d1.test";
 const BASE = `${ORIGIN}/apis/forms.takoform.com/v2`;
 const GENERATION = "a".repeat(32);
-const NAME = `takoserver-i-${GENERATION}`;
+const NAME = `integration-takoserver-${GENERATION}`;
 const DATABASE_ID = "00000000-0000-4000-8000-000000000075";
 const ORGANIZATION = "org-fresh-v2-d1";
 const TOKEN = "fresh-v2-d1-test-token";
@@ -50,7 +51,7 @@ const CASES = [
   },
 ] as const;
 
-test("fresh selected 0075 payload on real Miniflare D1 serves artifact Forms after local 0081 closure", async () => {
+test("fresh selected 0075 payload stays quiesced on the current Host even after local 0081 closure", async () => {
   const artifacts = await Promise.all(
     CASES.map(async ({ slug, path, mediaType, contents }) => {
       const fileBytes = new TextEncoder().encode(contents);
@@ -244,8 +245,9 @@ test("fresh selected 0075 payload on real Miniflare D1 serves artifact Forms aft
     expect(await sql.query("SELECT count(*) AS count FROM tf_v2_operations")).toEqual([
       { count: 0 },
     ]);
-    // The 0075 generation proof above is unchanged. The current Host needs the
-    // later source-only 0081 closure before this local D1 fixture may serve.
+    // The 0075 generation proof above remains valid for its historical source.
+    // Even after local 0081 closure, the current Host requires the separate
+    // USD-micros cutover through 0094 before it may serve any route.
     const closure = MIGRATIONS.findIndex(({ name }) => name === "0081_v2_private_inputs.sql");
     if (closure < 75) throw new Error("missing 0081 fixture closure");
     for (const migration of MIGRATIONS.slice(75, closure + 1)) {
@@ -258,6 +260,11 @@ test("fresh selected 0075 payload on real Miniflare D1 serves artifact Forms aft
       const artifact = artifacts[index];
       if (!artifact) throw new Error("missing artifact fixture");
       const authorization = `Bearer ${TOKEN}`;
+      const support = await runtime.dispatchFetch(
+        `${BASE}/support?form=${encodeURIComponent(fixture.form)}`,
+        { headers: { authorization } },
+      );
+      expect(support.status).toBe(503);
       const created = await runtime.dispatchFetch(`${BASE}/resources`, {
         method: "POST",
         headers: {
@@ -272,43 +279,11 @@ test("fresh selected 0075 payload on real Miniflare D1 serves artifact Forms aft
           spec: artifact.spec,
         }),
       });
-      expect(created.status).toBe(202);
-      const accepted = (await created.json()) as { id: string; resourceUid: string };
-      await settle(runtime, accepted.id);
-      const read = await runtime.dispatchFetch(`${BASE}/resources/${accepted.resourceUid}`, {
-        headers: { authorization },
-      });
-      expect(read.status).toBe(200);
-      expect(await read.json()).toMatchObject({ generation: 1, observedGeneration: 1 });
-      await r2.delete(artifact.manifestKey);
-      await r2.delete(artifact.fileKey);
-      const updated = await runtime.dispatchFetch(`${BASE}/resources/${accepted.resourceUid}`, {
-        method: "PUT",
-        headers: {
-          authorization,
-          "content-type": "application/json",
-          "idempotency-key": `fresh-v2-update-${index}`,
-          "takoform-expected-generation": "1",
-        },
-        body: JSON.stringify({ spec: artifact.spec }),
-      });
-      expect(updated.status).toBe(202);
-      await settle(runtime, String(((await updated.json()) as { id: string }).id));
-      const deleted = await runtime.dispatchFetch(`${BASE}/resources/${accepted.resourceUid}`, {
-        method: "DELETE",
-        headers: {
-          authorization,
-          "idempotency-key": `fresh-v2-delete-${index}`,
-          "takoform-expected-generation": "2",
-        },
-      });
-      expect(deleted.status).toBe(202);
-      await settle(runtime, String(((await deleted.json()) as { id: string }).id));
-      const gone = await runtime.dispatchFetch(`${BASE}/resources/${accepted.resourceUid}`, {
-        headers: { authorization },
-      });
-      expect(gone.status).toBe(410);
+      expect(created.status).toBe(503);
     }
+    expect(await sql.query("SELECT count(*) AS count FROM tf_v2_operations")).toEqual([
+      { count: 0 },
+    ]);
     expect(
       await sql
         .query("SELECT count(*) AS count FROM not_executed")
@@ -440,9 +415,16 @@ test("partial real D1 import remains quarantined: status diagnoses, apply cannot
   }
 }, 120_000);
 
-for (const lineage of ["v2-0088", "v2-0089"] as const) {
-  const count = lineage === "v2-0089" ? 89 : 88;
-  test(`fresh selected ${lineage} payload serves artifact Forms with no local schema closure`, async () => {
+/** A production D1 identity the staging guard compares against; never touched. */
+const PRODUCTION_D1 = {
+  databaseName: "takoserver-runtime",
+  databaseId: "85c5a15d-a80f-42fe-a907-7ec0d86e008e",
+} as const;
+
+for (const lineage of ["v2-0088", "v2-0089", "v2-0091", "v2-0092"] as const) {
+  const count =
+    lineage === "v2-0092" ? 92 : lineage === "v2-0091" ? 91 : lineage === "v2-0089" ? 89 : 88;
+  test(`fresh selected ${lineage} payload remains quiesced on the current audited Host`, async () => {
     const artifacts = await Promise.all(
       CASES.map(async ({ slug, path, mediaType, contents }) => {
         const fileBytes = new TextEncoder().encode(contents);
@@ -587,8 +569,16 @@ for (const lineage of ["v2-0088", "v2-0089"] as const) {
         review: "test-review",
         reader,
         freshV2DataReader,
+        productionD1: PRODUCTION_D1,
       });
-      expect(result).toMatchObject({ freshLineage: lineage });
+      expect(result).toMatchObject({
+        freshLineage: lineage,
+        productionD1Guard: {
+          compared: "naming-and-production-target",
+          productionDatabaseName: PRODUCTION_D1.databaseName,
+          productionDatabaseId: PRODUCTION_D1.databaseId,
+        },
+      });
       expect((result.appliedMigrations as string[]).length).toBe(count);
       expect((result.appliedMigrations as string[]).at(-1)).toBe(MIGRATIONS[count - 1]?.name);
       expect(importCount).toBe(1);
@@ -619,6 +609,42 @@ for (const lineage of ["v2-0088", "v2-0089"] as const) {
         freshLineage: lineage,
         migrationDigest: result.migrationDigest,
       });
+      // An operator-provisioned staging pair over the same exact database
+      // passes the same content proofs, but only on the staging-only lineage.
+      const STAGING = "takoserver-staging-throwaway-0091-test";
+      const stagingProvider = {
+        async getD1() {
+          return { name: STAGING, uuid: DATABASE_ID };
+        },
+        async getR2(name: string) {
+          return { name };
+        },
+      };
+      const stagingTarget = {
+        ...generatedTarget,
+        d1: { databaseName: STAGING, databaseId: DATABASE_ID },
+        r2: { bucketName: STAGING },
+      } satisfies DeployTarget;
+      if (lineage === "v2-0091" || lineage === "v2-0092") {
+        expect(
+          await verifyFreshV2IntegrationStorageTarget(stagingTarget, "integration", lineage, {
+            provider: stagingProvider as never,
+            reader,
+          }),
+        ).toMatchObject({
+          generation: STAGING,
+          freshLineage: lineage,
+          d1: { databaseName: STAGING, databaseId: DATABASE_ID },
+          migrationDigest: result.migrationDigest,
+        });
+      } else {
+        await expect(
+          verifyFreshV2IntegrationStorageTarget(stagingTarget, "integration", lineage, {
+            provider: stagingProvider as never,
+            reader,
+          }),
+        ).rejects.toThrow("generated D1/R2 storage pair");
+      }
       // The historical selectors never qualify this generation.
       await expect(
         verifyFreshV2ArtifactIntegrationStorageTarget(generatedTarget, "integration", {
@@ -671,7 +697,8 @@ for (const lineage of ["v2-0088", "v2-0089"] as const) {
         await r2.put(artifact.manifestKey, artifact.manifestBytes);
         await r2.put(artifact.fileKey, artifact.fileBytes);
       }
-      // Unlike the 0075 payload, no local 0076-0081 closure is applied here.
+      // The fresh generation's original schema proof remains valid, but this
+      // current Worker cannot serve its pre-0094 money unit.
       for (const [index, fixture] of CASES.entries()) {
         const artifact = artifacts[index];
         if (!artifact) throw new Error("missing artifact fixture");
@@ -680,7 +707,7 @@ for (const lineage of ["v2-0088", "v2-0089"] as const) {
           `${BASE}/support?form=${encodeURIComponent(fixture.form)}`,
           { headers: { authorization } },
         );
-        expect(support.status).toBe(200);
+        expect(support.status).toBe(503);
         const created = await runtime.dispatchFetch(`${BASE}/resources`, {
           method: "POST",
           headers: {
@@ -695,20 +722,11 @@ for (const lineage of ["v2-0088", "v2-0089"] as const) {
             spec: artifact.spec,
           }),
         });
-        expect(created.status).toBe(202);
-        const accepted = (await created.json()) as { id: string; resourceUid: string };
-        await settle(runtime, accepted.id);
-        const deleted = await runtime.dispatchFetch(`${BASE}/resources/${accepted.resourceUid}`, {
-          method: "DELETE",
-          headers: {
-            authorization,
-            "idempotency-key": `fresh-${lineage}-delete-${index}`,
-            "takoform-expected-generation": "1",
-          },
-        });
-        expect(deleted.status).toBe(202);
-        await settle(runtime, String(((await deleted.json()) as { id: string }).id));
+        expect(created.status).toBe(503);
       }
+      expect(await sql.query("SELECT count(*) AS count FROM tf_v2_operations")).toEqual([
+        { count: 0 },
+      ]);
     } finally {
       await runtime.dispose();
     }
@@ -757,6 +775,78 @@ async function miniflareFreshV2Data(
   };
 }
 
+test("selected fresh origin permits only the exact read-only current audited successor", async () => {
+  const source = readMigrationArtifact();
+  const shape = deriveExpectedApplicationShape(source.files);
+  const fullCurrent = {
+    applied: source.names,
+    shape,
+    shapeDigest: `sha256:${createHash("sha256").update(shape).digest("hex")}`,
+  };
+  const provider = {
+    async getD1() {
+      return { name: NAME, uuid: DATABASE_ID };
+    },
+    async getR2(name: string) {
+      return { name };
+    },
+  };
+  for (const lineage of ["v2-0088", "v2-0089", "v2-0091"] as const) {
+    const selected = {
+      kind: "takoserver.deploy-target@v2",
+      environment: "integration",
+      accountId: "b".repeat(32),
+      workerName: "takoserver-api-integration",
+      d1: { databaseName: NAME, databaseId: DATABASE_ID },
+      r2: { bucketName: NAME },
+      publicOrigin: ORIGIN,
+      signing: { currentKeyId: "integration-current" },
+      takoformV2: { config: "{}", storageLineage: lineage },
+    } satisfies DeployTarget;
+    const options = {
+      provider,
+      reader: { read: async () => fullCurrent },
+      allowCurrentAuditedSuccessor: true,
+    };
+    await expect(
+      verifyFreshV2IntegrationStorageTarget(selected, "integration", lineage, {
+        provider,
+        reader: options.reader,
+      }),
+    ).rejects.toThrow("lineage");
+    expect(
+      await verifyFreshV2IntegrationStorageTarget(selected, "integration", lineage, options),
+    ).toMatchObject({
+      freshLineage: lineage,
+      d1: { databaseId: DATABASE_ID, databaseName: NAME },
+      r2: { bucketName: NAME },
+      appliedMigrations: source.names,
+    });
+    for (const invalid of [
+      { ...fullCurrent, applied: source.names.slice(0, 93) },
+      { ...fullCurrent, applied: source.names.slice(0, -1) },
+      { ...fullCurrent, applied: [...source.names, "0096_foreign.sql"] },
+      { ...fullCurrent, shape: "[]" },
+      { ...fullCurrent, shapeDigest: `sha256:${"0".repeat(64)}` },
+    ]) {
+      await expect(
+        verifyFreshV2IntegrationStorageTarget(selected, "integration", lineage, {
+          ...options,
+          reader: { read: async () => invalid },
+        }),
+      ).rejects.toThrow();
+    }
+    await expect(
+      verifyFreshV2IntegrationStorageTarget(
+        { ...selected, d1: { ...selected.d1, databaseId: "00000000-0000-4000-8000-000000000076" } },
+        "integration",
+        lineage,
+        options,
+      ),
+    ).rejects.toThrow("target ID and name");
+  }
+}, 60_000);
+
 async function d1State(database: Awaited<ReturnType<Miniflare["getD1Database"]>>) {
   const tables = await database
     .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name")
@@ -780,23 +870,6 @@ async function d1State(database: Awaited<ReturnType<Miniflare["getD1Database"]>>
     shape,
     shapeDigest: `sha256:${createHash("sha256").update(shape).digest("hex")}`,
   };
-}
-
-async function settle(runtime: Miniflare, id: string): Promise<void> {
-  for (let pass = 0; pass < 32; pass += 1) {
-    const tick = await runtime.dispatchFetch(`${ORIGIN}/__test/run-scheduled`, { method: "POST" });
-    expect(tick.status).toBe(204);
-    const response = await runtime.dispatchFetch(`${BASE}/operations/${id}`, {
-      headers: { authorization: `Bearer ${TOKEN}` },
-    });
-    const operation = (await response.json()) as { status: string; effect?: string };
-    if (operation.status === "succeeded") {
-      expect(operation.effect).toBe("complete");
-      return;
-    }
-    if (operation.status === "failed") throw new Error(`operation ${id} failed`);
-  }
-  throw new Error(`operation ${id} did not settle`);
 }
 
 function ok(stdout: string) {

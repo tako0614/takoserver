@@ -8,6 +8,7 @@ import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import { isEdgeFormsApiVersion } from "./form-ref.ts";
 import { canonicalDigest, canonicalJson } from "./json.ts";
 import type { Ledger, LedgerHeldCharge } from "./ledger.ts";
+import { minorToMicros } from "./money.ts";
 import type { JsonObject } from "./ports.ts";
 import type { ProviderPack } from "./provider-pack.ts";
 import {
@@ -1142,7 +1143,7 @@ export function createProviderDriver(
     const held = await ledger.hold({
       organizationId,
       reference: mutation.operationId,
-      amountMinor: priceMinor,
+      amountMicros: minorToMicros(priceMinor),
     });
     if (!held) {
       if (mutation.mode === "initial") {
@@ -1167,7 +1168,7 @@ export function createProviderDriver(
       await ledger.capture({
         organizationId,
         reference: mutation.operationId,
-        amountMinor: priceMinor,
+        amountMicros: minorToMicros(priceMinor),
       });
       return ticket.result;
     }
@@ -1207,7 +1208,7 @@ export function createProviderDriver(
       await ledger.release({
         organizationId,
         reference: mutation.operationId,
-        amountMinor: priceMinor,
+        amountMicros: minorToMicros(priceMinor),
       });
       throw error;
     }
@@ -1805,7 +1806,7 @@ export function createProviderDriver(
               const held = await ledger.hold({
                 organizationId: input.tenantId,
                 reference: input.operationId,
-                amountMinor: priceMinor,
+                amountMicros: minorToMicros(priceMinor),
               });
               if (!held) {
                 throw new ProviderMutationRecoveryError(
@@ -1911,7 +1912,7 @@ export function createProviderDriver(
               const held = await ledger.hold({
                 organizationId: accepted.tenantId,
                 reference: accepted.operationId,
-                amountMinor: priceMinor,
+                amountMicros: minorToMicros(priceMinor),
               });
               if (!held) {
                 throw new ProviderMutationRecoveryError(

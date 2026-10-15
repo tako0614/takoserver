@@ -26,8 +26,8 @@ production require exactly one approved next-wave selector, while integration
 may use the same selector for one bounded audited wave:
 
 ```sh
-bun run deploy -- takoserver-d1-schema --status --environment=<integration|rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057|0058|0088>
-bun run deploy -- takoserver-d1-schema --apply --environment=<integration|rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057|0088>
+bun run deploy -- takoserver-d1-schema --status --environment=<integration|rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057|0058|0088|0092>
+bun run deploy -- takoserver-d1-schema --apply --environment=<integration|rehearsal|production> --commit=<40-hex-sha> --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057|0088|0092>
 ```
 
 The fixed order is the one-time legacy production catch-up 0017–0022, then
@@ -101,7 +101,7 @@ bun run deploy -- takoserver-integration-storage-generation --status --environme
 bun run deploy -- takoserver-integration-storage-generation --apply --environment=integration --commit=<40-hex-sha> --generation=<32-lowercase-hex>
 ```
 
-Both new resource names are `takoserver-i-<generation>`. The selected private
+Both new resource names are `integration-takoserver-<generation>`. The selected private
 target supplies the integration account; its existing database and bucket are
 never changed. Apply creates one new D1, proves it empty, applies the fixed
 audited 0001–0066 lineage and verifies its canonical schema, then creates the
@@ -113,6 +113,15 @@ generation is created. Status reads only the generated names and keeps working
 after the target is pointed at the new pair: it reports `targetSelection`
 (`d1`, `r2`, and `databaseIdExact` against the read-back UUID) and then
 `readyForApply: false`.
+
+A target selecting the exact historical `takoserver-i-<generation>` D1/R2
+pair retains read-only status and schema-proof compatibility. With that same
+generation, apply refuses before credentials or provider access; a partial or
+mixed legacy pair also refuses status. Status never falls back between old and
+new names. To create fresh storage, select a different generation: only the new
+`integration-takoserver-` names can pass either creation fence. This changes no
+migration profile or existing storage. The separate disposal surface retains
+its existing target restrictions; it does not gain new deletion authority.
 
 For a **new, empty integration generation only**, the same sole writer has one
 fixed v2 artifact payload. The selector is required on both the diagnostic
@@ -153,19 +162,184 @@ a canonical Cron profile; the canonical owners read exactly 0088 otherwise.
 bun run deploy -- takoserver-integration-storage-generation --apply --environment=integration --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-0088
 ```
 
+#### Staging D1 through 0092 (staging-only `v2-0092`)
+
+`--fresh-lineage=v2-0092` is the same staging-only profile one migration
+further: the audited 0001–0092 bytes, ending in `0092_org_wallet_lifecycle.sql`
+(the Organization wallet hold, usage, grant and tariff tables), with the fixed
+digest `sha256:6f7c1016b7ffeeb7c02006cdb8e55dc7919bfc2aeaf04c090001dcf423454be2`.
+Choose it only to prepare an isolated staging D1 with the frozen 0092 schema.
+The current USD-micros Worker requires a separately qualified 0093/0094 cutover
+and the complete 0094 schema even when `billingConfig` is absent. The 0092
+payload alone cannot serve the current Worker. It behaves like `v2-0091` in
+every other generation respect:
+
+- Production fresh init refuses it.
+- It only creates a new `integration-takoserver-<generation>` D1.
+- Applying it requires `TAKOSERVER_DEPLOY_TARGET_PRODUCTION`.
+- The data proof reads 92 ledger rows plus the same two seeds. 0090 to 0092
+  write no rows.
+- `takoformV2.storageLineage: "v2-0092"` selects it on a target.
+- An operator-provisioned staging pair is accepted on either staging-only
+  lineage, under the same conditions.
+
+The procedure in the next section is written for `v2-0091` and applies to
+either profile. For `v2-0092`, read it with these substitutions:
+
+- Pass `--fresh-lineage=v2-0092`.
+- Expect the digest above instead of the 0091 digest.
+- Expect `appliedMigrations` with 92 entries, ending in
+  `0092_org_wallet_lifecycle.sql`.
+- Expect `schemaReadback: complete-0092`.
+- Retain `takoformV2.storageLineage: "v2-0092"` as the eventual target's
+  immutable creation selector. It does not authorize serving on a 0092 D1.
+- Do not bootstrap or routinely publish the current Worker on this D1. Both
+  refuse before upload until an independently qualified 0093/0094 cutover has
+  produced the exact audited 0094 schema and money-unit policy.
+
+#### Staging D1 through 0091 (staging-only `v2-0091`)
+
+`--fresh-lineage=v2-0091` is the fourth explicit selector on this surface (its third fixed v2 D1 payload): the audited
+0001–0091 bytes, ending in `0091_stripe_events.sql`, with the fixed digest
+`sha256:152aefa3c0577809d419d95be2bc8878aa9a390a4ee40bfbf5501c32bf058bef`. It is
+**staging-only**:
+
+- `takoserver-production-d1-fresh-init` refuses the selector outright.
+- The separate reviewed integration-only 0088→0092 wave does not reinterpret
+  this fresh 0091 payload or make it available to production.
+- Like every lineage on this surface, it only ever creates a new
+  `integration-takoserver-<generation>` D1. It cannot reach an existing database.
+
+It was introduced before a qualified canonical 0092 wave existed. The canonical
+integration D1 remains at 0001–0088 until the separate owner dependency proofs
+and schema wave are reviewed and applied. Existing WfP claims bind its schema;
+the 0092 marker alone cannot make those owners accept a changed D1.
+
+Two guards refuse a production D1:
+
+- **Naming.** A newly created name must match `integration-takoserver-<32 hex>` and is
+  never `takoserver-runtime…`.
+- **Identity.** `TAKOSERVER_DEPLOY_TARGET_PRODUCTION` is read only for its
+  D1 identity. The exact production D1 name and id are refused before
+  creation, and again once the new id is known, before any SQL runs.
+
+Applying `v2-0091` without `TAKOSERVER_DEPLOY_TARGET_PRODUCTION` is refused.
+Status and apply both print `productionD1Guard` with the production name and
+id they compared. That output is the pre-apply record of which database is
+which.
+
+**1. Set up the inputs.** Use operator-private inputs, from a clean checkout of
+the exact `main` commit:
+
+```sh
+export TAKOSERVER_DEPLOY_TARGET_INTEGRATION=/abs/path/integration-target.json   # account only; never edited
+PRODUCTION_TARGET=/abs/path/production-target.json   # D1 identity only; never exported
+export TAKOSERVER_INDEPENDENT_REVIEW='<reviewer who is not the operator>'
+export CLOUDFLARE_API_TOKEN='<integration-scoped token>'   # or integration Wrangler OAuth
+COMMIT=$(git rev-parse HEAD)          # must equal the reviewed main commit
+GEN=$(openssl rand -hex 16)           # one new generation; never reuse a failed one
+```
+
+`TAKOSERVER_DEPLOY_TARGET_PRODUCTION` is also how every production surface
+selects its mutation target, so pass it on each command below only, never in
+the shell environment. Any set value must name a loadable absolute production
+descriptor; a relative or broken one refuses every lineage of this surface.
+
+**2. Run status and record it.** Status is read-only:
+
+```sh
+TAKOSERVER_DEPLOY_TARGET_PRODUCTION="$PRODUCTION_TARGET" bun run deploy -- takoserver-integration-storage-generation --status --environment=integration --commit="$COMMIT" --generation="$GEN" --fresh-lineage=v2-0091
+```
+
+Proceed only when all of these hold:
+
+- `d1.databaseName` is `integration-takoserver-$GEN`.
+- `presence` is `absent` and `readyForApply` is `true`.
+- `productionD1Guard.compared` is `naming-and-production-target`.
+- Its production name and id are the production D1, and differ from the
+  generated name.
+
+Keep the output as operator-private provenance.
+
+**3. Apply once.** Apply is one-way:
+
+```sh
+TAKOSERVER_DEPLOY_TARGET_PRODUCTION="$PRODUCTION_TARGET" bun run deploy -- takoserver-integration-storage-generation --apply --environment=integration --commit="$COMMIT" --generation="$GEN" --fresh-lineage=v2-0091
+```
+
+Record the output:
+
+- the new `d1.databaseId`
+- `migrationDigest`, which must be the fixed digest above
+- `appliedMigrations`: 91 entries, ending in `0091_stripe_events.sql`
+- `schemaShapeDigest` and `productionD1Guard`
+
+After any failure or lost acknowledgement, do not rerun `--apply` and do not
+mint a new generation as a retry. Run step 4 and repair forward under owner
+review.
+
+**4. Verify.** Run the step 2 status command again, with the same
+production target. Expect:
+
+- `schemaReadback: complete-0091`
+- `dataReadback: empty-seeded`
+
+**5. Hold publication.** Generation prepares storage only. A target descriptor
+may retain `takoformV2.storageLineage: "v2-0091"` as its immutable origin, but
+the current USD-micros Worker and closure cannot serve its 0091 schema. They
+require a separately qualified complete 0094 lineage, canonical application
+shape and singleton money-unit policy before normal publication, even with no
+billing configuration. The frozen first-Host bootstrap supports historical
+payloads only and refuses to publish the current artifact on this 0091 D1.
+Never edit the canonical WfP target to bypass this boundary.
+
+**Operator-provisioned staging pair.** A staging D1 that infra prepared some
+other way can stand in for a generated pair, under all of these conditions:
+
+- The target selects `takoformV2.storageLineage: "v2-0091"`.
+- The D1 and the R2 bucket share one name, `takoserver-staging-<label>`, where
+  the label is lowercase letters, digits and inner hyphens. Production names
+  never qualify.
+
+The historical generated-pair proof still requires:
+
+- the identity readback by exact id and name
+- the exact 0001–0091 ledger and canonical schema
+- at first publication, the empty-data proof (only migration seeds and the
+  signing registration)
+
+The historical first-publication contract names these inputs. They do not
+authorize first publication of the current USD-micros artifact on a 0091 D1:
+
+- **Target fields:**
+  - `takoformV2: { "config": "<v2 startup JSON>", "storageLineage": "v2-0091" }`
+  - the signing identity registered in that D1
+  - for Stripe, `stripeCheckout`, `stripeWebhook` and `consoleOrigin`
+- **Files in `TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY`**, one per secret,
+  named exactly as these Worker secrets:
+  - `TAKOSERVER_SIGNING_KEY`: the private JWK for the target's current signing
+    key
+  - `TAKOSERVER_TAKOFORM_V2_CURSOR_KEY`: at least 32 random bytes as unpadded
+    base64url
+  - `STRIPE_SECRET_KEY`
+  - `STRIPE_WEBHOOK_SECRET`
+
+  Secrets are never set with `wrangler secret put`.
+
 A target that uses such a generation names it explicitly with
-`takoformV2.storageLineage: "v2-0088"` (or `"v2-0089"`). Absent keeps the
+`takoformV2.storageLineage: "v2-0088"` (or `"v2-0089"`, or the staging-only
+`"v2-0091"`). Absent keeps the
 historical `v2-artifacts-0075` expectation; the lineage cannot be combined with
 `schemaMaintenanceMode: pre-v2-0088-quiesced`, because a fresh generation has
-no wave to quiesce for. The first bootstrap publication on such a target also
+no wave to quiesce for. The historical first-bootstrap proof also
 re-reads the data before upload and at the final pre-deploy fence: only the two
 migration seeds and the append-only signing registration in
 `runtime_grant_keys` may exist, so a copied or already served database is
 refused rather than adopted. The observed ledger never selects
 its own expectation: the bootstrap, routine Worker and closure-transition
-storage proofs all read the selected lineage, and the routine pending-schema
-rule accepts exactly that closed prefix (the audited tail after it has no
-in-place wave). A normal Host whose `takoformV2.config` declares artifact
+storage proofs read the selected lineage, while normal publication additionally
+requires the audited 0094 schema and money-unit policy. A normal Host whose
+`takoformV2.config` declares artifact
 Forms needs 0081 at startup; such a target on the historical 0075 lineage is
 now refused by target composition before any read or upload, instead of
 failing with 503 after traffic moved.
@@ -173,8 +347,8 @@ failing with 503 after traffic moved.
 After a lost import acknowledgement or partial failure, never rerun `--apply`
 or mint a different generation as a retry. Selected `--status` reads the exact
 generated name/UUID and reports whether its ledger and canonical schema are
-complete (`complete-0075`, `complete-0088` or `complete-0089`) or
-incomplete/divergent. For v2-0088/v2-0089 a complete schema also reports
+complete (`complete-0075`, `complete-0088`, `complete-0089` or `complete-0091`) or
+incomplete/divergent. For v2-0088/v2-0089/v2-0091 a complete schema also reports
 `dataReadback`: `empty-seeded` for an untouched generation, or `present` once
 the signing registration or a Host has written rows; the latter is a generation
 in use, not a reason to quarantine it. It is diagnosis, not proof that the
@@ -400,7 +574,8 @@ changes use their existing lifecycle surfaces.
 
 An explicitly selected `takoformV2` integration target follows this **same**
 first-publication writer, not a second Host uploader. Its D1/R2 must be the
-exact generated `takoserver-i-<generation>` pair with the complete fixed
+exact generated `integration-takoserver-<generation>` pair (or an existing
+historical `takoserver-i-<generation>` pair) with the complete fixed
 migration ledger selected by `takoformV2.storageLineage` (0001–0075 when absent,
 0001–0088 or 0001–0089 when set) and every application schema object. That proof is
 read before upload, at the immediate upload fence, and after the acknowledged
@@ -584,9 +759,14 @@ These flags name only the predecessor's old `STATE_DB` UUID and `OBJECTS`
 bucket name. Both must be strict lowercase identities and differ from the
 successor. The successor is never a CLI operand: it comes only from the selected
 target, whose D1 and R2 names must be the same exact
-`takoserver-i-<32-lowercase-hex>` generation name. A read-only fence verifies the
-D1 UUID-to-name mapping, R2 existence, exact audited 0001–0066 migration lineage,
-and canonical migrated schema before preparation and immediately before upload.
+`integration-takoserver-<32-lowercase-hex>` generation name (or an existing
+historical `takoserver-i-<32-lowercase-hex>` pair). An operator-provisioned
+`takoserver-staging-<label>` pair is refused here: it has no creation record
+proving it empty, so it enters service only through first publication. A
+read-only fence verifies the D1 UUID-to-name mapping, R2 existence, the exact
+audited migration lineage the target selects (0001–0066, or its
+`takoformV2.storageLineage`), and canonical migrated schema before preparation
+and immediately before upload.
 Every other binding name, type, and field must still match the target exactly;
 this does not alter migrations, runtime code, or the ordinary strict path.
 Production and rehearsal reject the rebind before provider effects. The
@@ -1110,8 +1290,25 @@ The routine surfaces are:
   for the canonical workflow.
 - `takoserver-site`: one Pages upload and byte-exact immutable URL readback;
   production also requires byte-exact `https://takoserver.com/` readback.
-- `takoserver-console`: one Console Worker upload. Exhaustive domain state must
-  already name `takoserver-console` as owner and must be unchanged afterward.
+- `takoserver-console`: one Console Worker upload.
+  - **Production and rehearsal:** uploads `takoserver-console`. Exhaustive domain state must
+    already name it as owner and must be unchanged afterward.
+  - **Integration:** shares the Cloudflare account with production, so it uploads its own Worker
+    named by the target's `consoleOrigin`. The origin must be exactly
+    `https://takoserver-console-<label>.<account subdomain>.workers.dev`.
+  - **Refused for integration:** the production name, a custom domain, the API Worker's name, any
+    other account's subdomain, and adopting a same-named Worker this surface did not publish. All
+    are refused before upload.
+  - **Integration checks:** no domain is read or written. The Worker must end up served on
+    workers.dev with previews off.
+  - The API Worker allows that same `consoleOrigin` (CORS, session cookie and the Checkout return
+    page), so the target names it once. The API Worker reads it only when it is published from that
+    target, so after a target's `consoleOrigin` changes, publish `takoserver-worker` too, or sign-in
+    and CORS from the Console will fail.
+  - A first integration Console has no previous version. `wrangler delete --name
+    takoserver-console-<label>` removes it, and never touches the production Console.
+  - Rehearsal still uploads `takoserver-console`, guarded by the domain-owner fence. A rehearsal
+    target in production's account must not name a domain the production Console owns.
 
 "Authority-sensitive Worker code" is not a hand-kept list of filenames.
 `scripts/deploy/worker-authority-paths.ts` answers it from three sources: the
@@ -1479,6 +1676,60 @@ lineage must be the audited canonical 0066–0088 prefix, the 0068 epoch closed,
 and affected v2 Resource data absent. Interrupted canonical prefixes may be
 resumed only with fresh proof; a provider transport exception causes readback,
 never automatic resend. No protected production or default 0066 ceiling changes.
+
+### Canonical integration 0088→0092 billing schema wave
+
+The cross-repository sequence and ownership are recorded in
+[the 0092 task ledger](schema-v2-0092-wave.md).
+
+`--through-migration=0092` names only the generated canonical integration D1
+whose target retains `takoformV2.storageLineage: "v2-0088"`. Status requires the
+absolute `TAKOSERVER_DEPLOY_TARGET_PRODUCTION` descriptor as a read-only D1
+identity fence. The selected D1 and R2 must be the same `takoserver-i-<32 hex>`
+name; either name or UUID matching production is refused. Rehearsal and
+production refuse the selector. The default 0066 path and fresh 0088, 0089,
+0091, and staging-only 0092 profiles remain fixed. Fresh
+`storageLineage: "v2-0092"` creates an empty staging pair; it does not select
+the wave on the existing 0088 pair.
+
+This wave accepts exactly 88 applied migration rows and the canonical 0088
+application schema before mutation. It pins the audited 92-file source digest
+`sha256:6f7c1016b7ffeeb7c02006cdb8e55dc7919bfc2aeaf04c090001dcf423454be2`.
+It reads up to 1,000 rows each from `ledger`, `wallet_credit_lots`, and
+`wallet_credit_allocations` in stable key order and compares a value-free
+SHA-256 snapshot before qualification, after the migration gate, and at the
+immediate dispatch fence. Larger staging data requires a separately reviewed
+bounded proof implementation. Existing foreign-key violations refuse the wave.
+The generated D1 UUID is GET-checked against its native generated name, and
+the same-name R2 is GET-checked before qualification and immediately before
+mutation. No production D1 provider read is made. The unchanged 0089–0092 SQL
+and migration-ledger inserts are sealed into one Wrangler file import. The
+private owner first persists a no-overwrite, fsynced dispatched attempt bound
+to the native target, reviewed source, sealed import and pre-mutation wallet
+proof. After an acknowledged or uncertain response, only exact
+92 applied rows, canonical 0092 schema, preserved money-row digest, valid lot
+cursor handles, empty new lifecycle/tariff/Stripe tables, and zero foreign-key
+violations complete the proof. A partial or unknown result is held for
+authoritative readback and forward repair; there is no down migration or blind
+replay. An uncertain result with the old 88-row lineage still leaves the
+dispatched record in place and cannot authorize a fresh apply; the private
+entrypoint uses GET-only reconciliation or manual forward repair.
+
+The private canonical owners must first prove all unresolved publication
+attempts terminal or GET-recovered, retain historical Version/native/claim
+identity, and qualify the current exact 88 state with owner code capable of
+checking a subsequent exact 92 readback. At verification they must independently
+prove the actual 92 dependencies through inspector, gateway, Tail, Host and CPE.
+Old dependency status calls that demand 88/89 cannot be ignored or treated as
+92 evidence. The public schema status is not that private owner proof. Do not
+apply until the owning private entrypoint can provide and recheck it. After the
+exact schema readback, the private owner may explicitly record
+`takoformV2.appliedSchemaLineage: "v2-0092"` on the original
+`storageLineage: "v2-0088"` target. This records the reviewed 0092 schema
+successor; it cannot authorize publication of the current USD-micros Worker.
+That Worker requires the complete audited 0094 schema, canonical shape and
+singleton money-unit policy independently of this selector. The 0093/0094
+conversion and publication procedure need separate qualification.
 
 The public Host has a source-only, optional deploy-target profile
 `"schemaMaintenanceMode": "pre-0058-quiesced"`. It projects the non-secret
@@ -2754,3 +3005,10 @@ reverse the append-only activation event; use the normal activation surface
 for explicit reactivation. When a transition descriptor selected the
 predecessor, repeat status with that same descriptor; it never converts a mixed
 or already-advanced Worker topology into permission to sign another mutation.
+
+
+## Existing integration money-unit qualification
+
+The separate [0093/0094 owner campaign](deploy-wallet-micros-cutover.md) uses the schema surface with explicit integration-only selectors and a protected money-cutover declaration. It preserves the 0088/0092 and fresh/production ceilings, never reads production-target settings, and requires phase-specific review, backup, exact staging origin/native identity, source-bound maintenance plus persistent D1 money fences, conservation and no-overwrite custody. A source entrypoint is not evidence that a particular staging D1 has been converted.
+
+The separate [synthetic native D1 rehearsal](deploy-money-unit-rehearsal.md) has its own rehearsal-only D1, declaration, review and no-overwrite receipts. It tests a late-failing and successful sealed 0094 `/import` without staging data; its terminal evidence does not authorize integration or production apply.

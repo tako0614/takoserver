@@ -1021,12 +1021,23 @@ export const DEPLOY_CONTRACT = {
       obligations: {
         provenance:
           `${exactSource} The scoped Console build runs once and the sealed link-free assets are ` +
-          "sent by one Worker upload whose configuration contains no route or domain mutation.",
+          "sent by one Worker upload whose configuration contains no route or domain mutation. " +
+          "Production and rehearsal upload the takoserver-console Worker served on its custom domain. " +
+          "Integration shares the account with production, so it derives its own " +
+          "takoserver-console-<label> Worker from the target's consoleOrigin, which must be exactly " +
+          "https://<that worker>.<account subdomain>.workers.dev; the production Console name, any custom " +
+          "domain, and the API Worker's name are refused before any credential or provider read.",
         "post-conditions":
-          "Exhaustive paginated domain state must name the same pre-existing Console owner before " +
-          "and after upload, and the public console.js must be byte-exact.",
+          "Production and rehearsal: exhaustive paginated domain state must name the same pre-existing " +
+          "takoserver-console owner before and after upload. Integration reads no domain at all: the " +
+          "account's workers.dev subdomain must equal the origin's before and after upload, an existing " +
+          "Worker of that name must already carry a Console publication message (a foreign Worker is " +
+          "never adopted), and the Worker must be served on workers.dev with previews off. In every " +
+          "environment the public console.js must be byte-exact.",
         reversal:
-          "The previous Console Worker version is printed; the command never changes its domain owner.",
+          "The previous Console Worker version of the selected Worker is printed; the command never " +
+          "changes a domain owner. A first integration Console has no previous version; " +
+          "`wrangler delete --name takoserver-console-<label>` removes it and never touches the production Console.",
         "failure-handling": routineFailure + inputContract(),
       },
     },
@@ -1047,20 +1058,29 @@ export const DEPLOY_CONTRACT = {
       ],
       requiresScripts: ["check:migrations"],
       requiresTools: ["bun", "wrangler"],
-      requiresEnv: ["CLOUDFLARE_API_TOKEN", "TAKOSERVER_INDEPENDENT_REVIEW"],
+      requiresEnv: [
+        "CLOUDFLARE_API_TOKEN",
+        "TAKOSERVER_INDEPENDENT_REVIEW",
+        "TAKOSERVER_DEPLOY_TARGET_PRODUCTION",
+      ],
       triggers: ["irreversible", "authority"],
       obligations: {
         provenance:
           `${exactSource} Integration only. One explicit --generation=<32-lowercase-hex> derives ` +
-          "both resource names as takoserver-i-<generation>. The scoped migration gate runs once; " +
+          "both new resource names as integration-takoserver-<generation>. The scoped migration gate runs once; " +
           "the default fixed audited 0001-0066 names and bytes, or one explicit fixed " +
-          "--fresh-lineage=v2-artifacts-0075, v2-0088 or v2-0089 payload (the latter two are the " +
-          "same fixed-digest payloads as the production fresh-init profiles), are sealed before creation. A separately " +
-          "digested import file preserves every migration byte and adds only Wrangler's migration-ledger DDL and inserts.",
+          "--fresh-lineage=v2-artifacts-0075, v2-0088, v2-0089, v2-0091 or v2-0092 payload (v2-0088/v2-0089 are the " +
+          "same fixed-digest payloads as the production fresh-init profiles; v2-0091 (through the Stripe event table) and v2-0092 (through the Organization wallet lifecycle tables) are " +
+          "staging-only and no production surface accepts them), are sealed before creation. A separately " +
+          "digested import file preserves every migration byte and adds only Wrangler's migration-ledger DDL and inserts. " +
+          "Every newly created D1 must be integration-takoserver-<generation> and never production-named; when " +
+          "TAKOSERVER_DEPLOY_TARGET_PRODUCTION is set its exact D1 name and id are refused before creation and again once the new id " +
+          "is known, and applying v2-0091 or v2-0092 requires that production target.",
         "post-conditions":
           "The invocation creates one D1 database, proves it empty, applies and reads back the exact " +
-          "selected 0001-0066, 0001-0075, 0001-0088 or 0001-0089 lineage and canonical schema after one Wrangler file import " +
-          "(v2-0088/v2-0089 also read back the exact empty seeded data and ledger count), then creates and reads back one new R2 bucket. " +
+          "selected 0001-0066, 0001-0075, 0001-0088, 0001-0089, 0001-0091 or 0001-0092 lineage and canonical schema after one Wrangler file import " +
+          "(v2-0088/v2-0089/v2-0091/v2-0092 also read back the exact empty seeded data and ledger count), then creates and reads back one new R2 bucket. " +
+          "Status and apply record which production D1 identity the guard compared. " +
           "It emits a nonsecret candidate storage projection, not an adopted target. No Worker, " +
           "route, namespace, secret or current target is changed.",
         reversal:
@@ -1070,7 +1090,10 @@ export const DEPLOY_CONTRACT = {
           "Pre-existing resources, even empty ones, are refused. After any creation attempt the command " +
           "stops on failure, reports only bounded identity/state diagnostics and never retries. Lost " +
           "acknowledgements are indeterminate; selected v2 --status can classify exact schema " +
-          "readback for separate owner review but cannot re-import, adopt or repair it." +
+          "readback for separate owner review but cannot re-import, adopt or repair it. " +
+          "A selected exact legacy takoserver-i-<generation> pair remains readable by status; " +
+          "same-generation legacy apply is refused before credentials or provider access, " +
+          "and both create fences require the new integration-prefixed pair." +
           inputContract(applyReviewInput),
         "pre-mutation-proof":
           "Both derived names must be absent at inspection and at the creation fence. The new D1 " +
@@ -1252,6 +1275,117 @@ export const DEPLOY_CONTRACT = {
       },
     },
     {
+      surface: "takoserver-integration-money-shadow-create",
+      target: "cloudflare-d1:one-fresh-integration-synthetic-money-shadow-only",
+      covers: [
+        "scripts/deploy/integration-money-shadow-create.ts",
+        "scripts/deploy/schema-money-unit-rehearsal.ts",
+      ],
+      requiresScripts: [],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["TAKOSERVER_INTEGRATION_MONEY_SHADOW_CREATE_DECLARATION_PATH"],
+      triggers: ["irreversible", "authority", "published-identity"],
+      obligations: {
+        provenance: `${exactSource} An owned 0600 TAKOSERVER_INTEGRATION_MONEY_SHADOW_CREATE_DECLARATION_PATH binds a reviewed positive staging 0092 origin certificate, exact account, fresh takoserver-ms generation name, source digest and canonical Wrangler OAuth credential provenance. No ordinary target descriptor, production descriptor or production resource is read.`,
+        "post-conditions":
+          "A native GET and exact-name list prove the newly created UUID/name; an authenticated D1 query proves zero application schema objects. Its protected terminal receipt grants only synthetic rehearsal authority.",
+        reversal:
+          "No delete, reset, adoption or automatic cleanup is offered. If creation is uncertain, retain the dispatch and inspect by status; repair forward under a separate review.",
+        "failure-handling": `${highRiskFailure} Only the canonical integration Wrangler OAuth profile is accepted; an explicit API token or OAuth-as-API_TOKEN surrogate is refused. Create is sent once after no-overwrite dispatch. Unknown acknowledgement is quarantined without retry.`,
+        "pre-mutation-proof":
+          "The reviewed staging 0092 origin is a positive account/UUID/source certificate. Native exact-name absence is checked twice, the selected source commit is clean and remotely reachable, and an independent reviewer approves the exact binding before dispatch.",
+        "independent-review":
+          "A protected 0600 review record must approve the hash of the account, fresh name, staging origin, audited source and OAuth-source binding.",
+        "no-overwrite":
+          "One owned 0600 dispatch record precedes the sole create and one terminal record follows exact empty-schema readback. Existing or dispatched names are never reused.",
+      },
+    },
+    {
+      surface: "takoserver-integration-money-shadow-rehearsal",
+      target: "cloudflare-d1:one-terminal-created-integration-synthetic-money-shadow",
+      covers: [
+        "scripts/deploy/integration-money-shadow-create.ts",
+        "scripts/deploy/schema-money-unit-rehearsal.ts",
+        "scripts/deploy/schema-money-unit-cutover.ts",
+        "migrations/0093_wallet_credit_classification_proofs.sql",
+        "migrations/0094_wallet_usd_micros.sql",
+      ],
+      requiresScripts: [],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["TAKOSERVER_INTEGRATION_MONEY_SHADOW_REHEARSAL_DECLARATION_PATH"],
+      triggers: ["irreversible", "authority", "published-identity"],
+      obligations: {
+        provenance: `${exactSource} The owned 0600 TAKOSERVER_INTEGRATION_MONEY_SHADOW_REHEARSAL_DECLARATION_PATH binds the exact integration shadow create declaration and terminal receipt, staging 0092 origin, native UUID/name, OAuth source, audited 0092-0094 SQL, pinned Wrangler executable module, sealed import bytes and account/D1 import endpoint into phase custody. No ordinary staging or production target is imported.`,
+        "post-conditions":
+          "The independently reviewed 14-phase synthetic sequence proves exact native schema, complete application typed-byte digests, financial preimage and aggregate conservation, empty writer permits and foreign keys. Its late 0094 failure probe and false-CHECK resume probe require structured authenticated D1 import faults with exact predecessor state unchanged; the successful conversion and resume require sealed one-file Wrangler imports. After resume, raw legacy Stripe INSERT, UPDATE and DELETE and a stale writer epoch must fail, a permitted late-fault import must roll back, and permitted success must change the seeded Stripe outcome with exact new financial and application typed-byte digests. This importer receipt does not prove native Worker D1.batch or authorize the real staging cutover.",
+        reversal:
+          "No old-cents rollback, reset or delete exists; an uncertain ACK or changed native state quarantines the disposable shadow and requires separately reviewed forward repair.",
+        "failure-handling": `${highRiskFailure} Canonical integration OAuth is required; an explicit API token and any ordinary rehearsal or staging D1 name are rejected. Every import has no-overwrite dispatch, no blind retry and status-only readback after an uncertain ACK.`,
+        "pre-mutation-proof":
+          "The shadow create terminal and native identity are exact; each phase requires its previous terminal, expected schema and complete synthetic application preimage. Before import, the protected independent review binds the phase, source, SQL, target and transport.",
+        "independent-review":
+          "Each phase needs its own protected binding-specific review and evidence digest before apply.",
+        "no-overwrite":
+          "Every phase dispatch and terminal receipt is an immutable protected 0600 file; no phase can be replayed after dispatch, including unknown acknowledgements.",
+      },
+    },
+    {
+      surface: "takoserver-integration-money-shadow-native-probe",
+      target: "cloudflare-worker:one-fresh-integration-synthetic-money-shadow-diagnostic",
+      covers: [
+        "src/entry-money-shadow-native-probe.ts",
+        "scripts/deploy/integration-money-shadow-native-probe.ts",
+        "scripts/deploy/schema-money-unit-rehearsal.ts",
+        "src/money-cutover-sql.ts",
+        "src/sql-d1.ts",
+      ],
+      requiresScripts: [],
+      requiresTools: ["bun", "wrangler", "flock"],
+      requiresEnv: ["TAKOSERVER_INTEGRATION_MONEY_SHADOW_NATIVE_PROBE_DECLARATION_PATH"],
+      triggers: ["irreversible", "authority", "published-identity"],
+      obligations: {
+        provenance: `${exactSource} One owned 0600 TAKOSERVER_INTEGRATION_MONEY_SHADOW_NATIVE_PROBE_DECLARATION_PATH selects the terminal synthetic integration money-shadow rehearsal D1 and its final permit-success receipt. First publication status requires an absent derived Worker and absent shadow-only bearer/genesis files, then generates a new bearer and no-overwrite 0600 genesis receipt binding the first absence, account, D1, source and auth digest. The genesis digest enters the reviewed publication and probe bindings. A clean remotely reachable commit is built through Wrangler dry-run, sealed, reviewed by exact digest and published with a source/artifact annotation. Canonical integration OAuth stays separate from Worker bearer custody; no production descriptor, ordinary staging D1 or account-wide Worker inventory is read.`,
+        "post-conditions":
+          "Publish requires exact first 100 percent native Version/deployment, module bytes, D1 UUID binding, writer and revoked epochs, one secret name, Workers.dev routing and authenticated GET status. Probe sends one fixed authenticated POST only after separate review; the Worker uses env.STATE_DB.batch to change the seeded Stripe outcome with the pinned current epoch, observe CHECK failure rollback in the second statement, reject raw legacy Stripe INSERT/UPDATE/DELETE and the revoked epoch, and leave the permit empty. GET-only journal readback and a second exact native Version/deployment/module/binding readback after POST must precede terminal custody. The final native read and receipt write have no provider CAS; later status must reject drift. This synthetic receipt grants no existing billing D1 cutover authority.",
+        reversal:
+          "No Worker adoption, D1 deletion, reset or old-cents rollback is offered. A published diagnostic Worker can be left isolated; a failed or unknown probe POST remains one-use and requires separately reviewed forward repair.",
+        "failure-handling": `${highRiskFailure} Every phase writes protected no-overwrite dispatch before its one provider mutation. An uncertain Worker deploy or POST ACK is reconciled with exact native GET or authenticated GET status only; publication and POST are never resent. Native/provider readback errors, malformed binding values and the bearer are reduced to fixed value-free diagnostics.`,
+        "pre-mutation-proof":
+          "Exact terminal 14-phase rehearsal custody, native D1 identity and final financial/application typed digests precede a fresh Worker exact-name absence check. Before publish, source, sealed artifact, protected auth, review and name absence are rechecked. Before probe, the immutable native Version/bindings and absent one-use journal are rechecked.",
+        "independent-review":
+          "Separate protected 0600 review and evidence files bind the exact publish and probe phase bindings, source, artifact, D1, auth digest, native publication and prior journal status before mutation.",
+        "no-overwrite":
+          "The derived diagnostic Worker name is never adopted or reused. Publish and probe each have immutable dispatch and terminal custody; an unknown ACK never creates permission to retry.",
+      },
+    },
+    {
+      surface: "takoserver-d1-money-cutover-rehearsal",
+      target: "cloudflare-d1:one-explicit-created-synthetic-rehearsal-database",
+      covers: [
+        "scripts/deploy/schema-money-unit-rehearsal.ts",
+        "scripts/deploy/schema-money-unit-cutover.ts",
+        "migrations/0093_wallet_credit_classification_proofs.sql",
+        "migrations/0094_wallet_usd_micros.sql",
+      ],
+      requiresScripts: [],
+      requiresTools: ["bun", "wrangler"],
+      requiresEnv: ["TAKOSERVER_D1_MONEY_REHEARSAL_DECLARATION_PATH", "CLOUDFLARE_API_TOKEN"],
+      triggers: ["irreversible", "authority", "published-identity"],
+      obligations: {
+        provenance: `${exactSource} The owned 0600 TAKOSERVER_D1_MONEY_REHEARSAL_DECLARATION_PATH binds the terminal one-D1 rehearsal-create receipt, original create declaration, exact account/name/UUID, audited 0092-0094 source, pinned Wrangler 4.123.0 launcher and executable dist-module digests, sealed SQL, exact account/D1 import endpoint and phase-specific protected independent review evidence. Synthetic rows only; no ordinary target descriptor or production/staging resource is read.`,
+        "post-conditions":
+          "Each step of the 14-phase sequence reads exact native migration lineage/schema, all application table typed-byte digests, financial preimage/aggregate and foreign-key state. The late 0094 missing-table and false-CHECK resume probes require structured authenticated D1 import faults with complete predecessor state unchanged; the observer follows pinned Wrangler's same init/upload/ingest/poll protocol but does not claim a Wrangler CLI failure observation. Successful 0094 and resume use sealed one-file Wrangler --file imports. After resume, raw legacy Stripe INSERT, UPDATE and DELETE and a stale writer epoch must fail, a permitted late-fault import must roll back its event and permit, and permitted success must visibly change the seeded Stripe outcome with exact new financial and application typed-byte digests and an empty permit. The terminal receipt records a value-free Cloudflare R2 host class and presigned-URI digest. These importer receipts do not prove native Worker D1.batch or grant integration or production apply authority.",
+        reversal:
+          "No reset, delete or cents rollback is offered. An unknown ACK, partial schema, changed typed rows or foreign-key error quarantines the rehearsal D1 for separate forward repair.",
+        "failure-handling": `${highRiskFailure} This original rehearsal route requires explicit CLOUDFLARE_API_TOKEN. No import is retried after no-overwrite dispatch. Status is GET/readback only and cannot infer a failed-probe acknowledgement from unchanged data alone. Source, target, review and transport mismatches refuse before a D1 write; post-import verification failures retain the D1 and custody for investigation.`,
+        "pre-mutation-proof":
+          "The terminal create receipt and native D1 identity select a generated rehearsal-only D1. First seed requires an empty application schema. Each later phase requires its predecessor terminal receipt, exact fenced schema and complete synthetic application-row digest, with zero pending financial work before the 0094 probe and conversion. The reviewed import bytes and target are rechecked immediately before dispatch.",
+        "independent-review": review,
+        "no-overwrite":
+          "Each phase writes one immutable protected dispatch binding before the single D1 import and one terminal receipt only after exact readback; a dispatched phase cannot be replayed, even when acknowledgement is unknown. The failure probe's authenticated structured import observer and the other phases' Wrangler --file transport are identified separately in the binding.",
+      },
+    },
+    {
       surface: "takoserver-rehearsal-d1-create",
       target: "cloudflare-d1:one-explicit-new-rehearsal-database",
       covers: [
@@ -1379,8 +1513,11 @@ export const DEPLOY_CONTRACT = {
         "migrations",
         "scripts/deploy/artifact-blob-io-compatibility.ts",
         "scripts/deploy/schema.ts",
+        "scripts/deploy/schema-money-unit-cutover.ts",
+        "scripts/deploy/schema-money-unit-owner.ts",
         "scripts/deploy/schema-0058-proof.ts",
         "scripts/deploy/schema-v2-existing-transition.ts",
+        "scripts/deploy/schema-v2-0092-proof.ts",
         "scripts/deploy/d1-migration-import.ts",
         "scripts/deploy/d1.ts",
         "scripts/deploy/wrangler-state.ts",
@@ -1393,14 +1530,16 @@ export const DEPLOY_CONTRACT = {
         "TAKOSERVER_D1_REHEARSAL_RECEIPT_PATH",
         "TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH",
         "TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH",
+        "TAKOSERVER_DEPLOY_TARGET_PRODUCTION",
+        "TAKOSERVER_D1_MONEY_CUTOVER_DECLARATION_PATH",
       ],
-      triggers: ["irreversible"],
+      triggers: ["irreversible", "authority"],
       obligations: {
         provenance:
           `${exactSource} Rehearsal and production accept only the fixed next boundaries 0022, 0028, ` +
           "0033, 0036, 0043, 0044, 0045, 0046, 0047, 0048, 0049, 0050, 0051, 0052, 0053, 0054, 0055, 0056, 0057 or status-only 0058. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
-          "forward-only apply. The current audited source inventory is exactly 0001-0088; the ordinary existing-target ceiling remains 0066, the fresh-empty production path remains 0069, and the separate fresh v2 artifact generation remains 0075. An explicit integration-only 0066-to-0088 selector requires canonical intermediate shapes, a closed 0068 invocation epoch, no affected v2 data, exact non-serving public Host and private CPE publisher proof, source-compatible historical predecessors and same-owner publication leases; no other selector inherits this authority. Separate integration-only in-place 0063 to 0064, 0064 to 0065 and 0065 to 0066 waves follow their exact predecessors. The 0065 to 0066 Actor KV capability claim transition accepts only its audited additive suffix and canonical 0065 predecessor. A fresh integration storage generation uses the apply-qualified 0001-0066 lineage. Protected mutation remains capped at 0057; 0058 inspects an exact canonical 0057 predecessor but cannot apply until real owner evidence exists. " +
+          "forward-only apply. The current audited source inventory is exactly 0001-0094; the qualified integration 0088-to-0092 wave uses only its frozen 92-file projection and does not qualify 0093 or 0094. Separate integration-only 0093 preparation and 0094 money-unit phases require an owned declaration from TAKOSERVER_D1_MONEY_CUTOVER_DECLARATION_PATH, a reviewed positive staging-origin certificate and native identity readback, a source-proved non-serving public Host, persistent financial write fences, verified protected full backup and exact money preimages, reviewed lot classifications, and phase-specific independent review. They never read production target settings and never widen a fresh or legacy apply ceiling. Exact old-fence removal, unchanged audited SQL and ledger insert, and replacement fences use one sealed D1 /import with durable no-overwrite dispatch custody. The ordinary existing-target ceiling remains 0066, the fresh-empty production path remains 0069, and the separate fresh v2 artifact generation remains 0075. An explicit integration-only 0066-to-0088 selector requires canonical intermediate shapes, a closed 0068 invocation epoch, no affected v2 data, exact non-serving public Host and private CPE publisher proof, source-compatible historical predecessors and same-owner publication leases; no other selector inherits this authority. The separate integration-only 0088-to-0092 selector requires the fixed audited 92-file digest, canonical exact 88 predecessor, an original v2-0088 generated D1/R2 target distinct from the read-only production D1 identity, and a bounded value-free preservation digest of ledger, lots and allocations. It seals 0089-0092 plus ledger inserts into one D1 file import; it does not change the fresh v2-0088 payload or enable Worker publication by marker alone. Before applying, the private canonical owner must independently prove all pending publication attempts terminal or GET-recovered, retain frozen historical Version and native settings evidence, and qualify the current 88 dependency state with 92-capable inspector, gateway, Tail, Host and CPE owner code. It must then prove actual exact 92 dependency readback after mutation. Separate integration-only in-place 0063 to 0064, 0064 to 0065 and 0065 to 0066 waves follow their exact predecessors. The 0065 to 0066 Actor KV capability claim transition accepts only its audited additive suffix and canonical 0065 predecessor. A fresh integration storage generation uses the apply-qualified 0001-0066 lineage. Protected mutation remains capped at 0057; 0058 inspects an exact canonical 0057 predecessor but cannot apply until real owner evidence exists. " +
           "Integration may select one audited wave or a separately qualified existing-data additive " +
           "transition; selected integration reports evidenceClass integration-protected-wave, " +
           "never writes rehearsal receipts, and is never production evidence. The 0022 selector is a one-time exact 0016-to-0022 " +
@@ -1408,7 +1547,7 @@ export const DEPLOY_CONTRACT = {
           "uses a separately sealed Wrangler file import containing the unchanged audited SQL plus " +
           "its migration-ledger insert; future qualified 0058 is wired for the same sealed one-file /import transport, never /query. Other selected waves keep their existing transport.",
         "post-conditions":
-          "D1 must read back the exact selected through-lineage and canonical schema shape. Status " +
+          "D1 must read back the exact selected through-lineage and canonical schema shape. The integration 0092 wave additionally requires its preserved ledger/lot/allocation row digest, valid populated lot cursor handles, empty new billing and Stripe tables, and zero foreign-key violations before an applied result is reported. The money-unit phases require row/aggregate conservation, intact classification/history and pending-zero checks, exact phase schema/fences, and USD-micros policy before publication. Status returns a review binding without D1 mutation; an unknown acknowledgement permits readback only, never replay. Status " +
           "always names lastAppliedMigration and nextPendingMigration within the selected wave. " +
           "While 0043 is pending it also names current and rollback compatibility deployment and " +
           "Version identities, drain state, and active-root/deleting-candidate repair count. The " +
@@ -1434,7 +1573,7 @@ export const DEPLOY_CONTRACT = {
           "The standalone 0022 catch-up receipt binds the canonical 0016 application shape and critical " +
           "data digest before the exact 0017-0022 transition; it is not an ordinary receipt-chain predecessor.",
         reversal:
-          "There is no down migration. Failure is repaired forward from the authoritative D1 lineage and schema shape.",
+          "There is no down migration. A separately reviewed preconversion abandon can remove only the owned freeze while retaining non-serving Host admission; it cannot run after 0094 or an indeterminate conversion dispatch and never automatically reactivates old cents code. Failure is repaired forward from authoritative D1 lineage, schema shape and protected wallet-row readback. The original 0088 artifact is not qualified as the 0092 successor; hold current USD-micros Worker publication until a separately qualified 0093/0094 cutover produces complete canonical 0094 schema and money-unit policy with matching private dependencies.",
         "failure-handling":
           highRiskFailure +
           inputContract(applyReviewInput, rehearsalReceiptInput) +
@@ -1445,7 +1584,7 @@ export const DEPLOY_CONTRACT = {
           "A failed provider acknowledgement performs an immediate authoritative lineage/shape " +
           "readback. A partial result can resume only under the same through selector and exact " +
           "rehearsal/attempt evidence; a boundary already reached under that attempt is reconciled " +
-          "without a second provider apply, and a later boundary cannot be skipped to. Pending 0043 " +
+          "without a second provider apply, and a later boundary cannot be skipped to. The 0092 integration wave is stricter: the private owner persists a no-overwrite dispatched record bound to the native generated D1/R2 identity, source, sealed import and pre-wallet proof before execute; an uncertain ACK with even an unchanged 88-row readback never permits a fresh apply. Only GET-only exact92 schema, wallet and native reconciliation may terminalize it; a partial 89-91 state requires manual forward repair without replay. Pending 0043 " +
           "requires the operator-private TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH; the " +
           "repository never manufactures the external drained-or-cancelled assertion. The no-selector " +
           "integration lane permits only exact audited 0058 to 0059+0060 or 0059 to 0060: canonical " +
@@ -1477,7 +1616,7 @@ export const DEPLOY_CONTRACT = {
           "A separate exact 0062 to 0063 integration transition requires the audited 0062 predecessor and canonical 0062 application shape from exact current 0001-0066 source. It needs no quiescence or data backfill because 0063 creates only new retirement objects. The migration and ledger insert remain one atomic D1 transaction, and exact all-0063 lineage plus canonical post-shape must read back before release proceeds. Roll out schema, then the matching CPE, then the Host authority cutover, and finally Form; a missing acknowledgement is reconciled only by authoritative lineage and shape readback and never by blind replay. Historical no-marker Queue state is not repaired or adopted by this schema transition. " +
           "The following exact 0063 to 0064 integration transition requires canonical all-0063 shape and only the audited 0064 suffix. It preserves existing Worker receipts, adds no Actor admission, and has no data backfill or generic quiescence claim. Its migration and ledger insert are atomic, exact all-0064 lineage and shape must read back, and unknown acknowledgement cannot authorize replay. The next exact 0064 to 0065 integration transition requires canonical all-0064 shape and only the audited 0065 suffix. Its backfill retains the nonce for live prepared/claimed rows; historical dispatched/terminal NULL remains closed. The migration and ledger insert are atomic, exact all-0065 lineage and shape must read back, and unknown acknowledgement cannot authorize replay. Both remain protected non-disposable D1 migrations, not resets or raw SQL workarounds; independent source and live-state review precedes any real release.",
         "pre-mutation-proof":
-          "Status, post-qualification recheck and the final mutation fence all run named zero-count " +
+          "For 0092 the absolute TAKOSERVER_DEPLOY_TARGET_PRODUCTION path supplies a distinct read-only production D1 descriptor. The exact 0088 predecessor shape, native GET of the generated integration D1 UUID/name and same-name R2, and bounded digest of unchanged ledger, lot and allocation rows are checked before qualification, after qualification and immediately before dispatch. Production D1 receives no provider GET. The private canonical owner must separately prove all unresolved publication attempts terminal or GET-recovered and exact 92-capable inspector, gateway, Tail, Host and CPE dependencies without rewriting frozen historical claims. Status, post-qualification recheck and the final mutation fence all run named zero-count " +
           "checks for 0029 malformed FormRef and duplicate live Resource UID, 0036 unmatched " +
           "dispatched repair saga, 0037 nonempty replaced predecessor, and 0039 duplicate live " +
           "native claim, plus the 0043 active-root/deleting-candidate conflict count. The additive " +

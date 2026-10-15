@@ -17,7 +17,7 @@
  * the remaining half and lands with the resource-lifecycle consolidation.
  */
 
-export type RouteMethod = "get" | "post" | "put" | "delete" | "head";
+export type RouteMethod = "get" | "post" | "patch" | "put" | "delete" | "head";
 
 export interface RouteDeclaration {
   readonly method: RouteMethod;
@@ -60,6 +60,11 @@ export const ROUTES: readonly RouteDeclaration[] = [
   { method: "post", pattern: "/v1/ai/chat/completions", operation: "createAiChatCompletion" },
   { method: "get", pattern: "/v1/forms", operation: "listHostForms" },
   { method: "post", pattern: "/v1/organizations", operation: "createOrganization" },
+  {
+    method: "post",
+    pattern: "/v1/organizations/personal",
+    operation: "createPersonalOrganization",
+  },
   {
     method: "post",
     pattern: "/v1/organizations/{organizationId}/api-keys",
@@ -215,14 +220,100 @@ export const ROUTES: readonly RouteDeclaration[] = [
     operation: "readWallet",
   },
   {
+    method: "get",
+    pattern: "/v1/organizations/{organizationId}/wallet/lots",
+    operation: "listWalletLots",
+  },
+  {
+    method: "get",
+    pattern: "/v1/organizations/{organizationId}/wallet/usage-summary",
+    operation: "readWalletUsageSummary",
+  },
+  {
+    method: "get",
+    pattern: "/v1/organizations/{organizationId}/wallet/usage-summary/workspaces",
+    operation: "readWalletWorkspaceUsage",
+  },
+  {
+    method: "get",
+    pattern: "/v1/organizations/{organizationId}/wallet/limit-policy",
+    operation: "readWalletLimitPolicy",
+  },
+  {
+    method: "patch",
+    pattern: "/v1/organizations/{organizationId}/wallet/limit-policy",
+    operation: "changeWalletLimitPolicy",
+  },
+  {
+    method: "get",
+    pattern: "/v1/organizations/{organizationId}/wallet/holds/{reference}",
+    operation: "readWalletHold",
+  },
+  {
+    method: "post",
+    pattern: "/v1/organizations/{organizationId}/wallet/holds",
+    operation: "createWalletHold",
+  },
+  {
+    method: "post",
+    pattern: "/v1/organizations/{organizationId}/wallet/holds/{reference}/capture",
+    operation: "captureWalletHold",
+  },
+  {
+    method: "post",
+    pattern: "/v1/organizations/{organizationId}/wallet/holds/{reference}/release",
+    operation: "releaseWalletHold",
+  },
+  {
+    method: "get",
+    pattern: "/v1/organizations/{organizationId}/wallet/usage-records",
+    operation: "listWalletUsageRecords",
+  },
+  {
+    method: "post",
+    pattern: "/v1/organizations/{organizationId}/wallet/usage-records",
+    operation: "createWalletUsageRecord",
+  },
+  {
     method: "post",
     pattern: "/v1/organizations/{organizationId}/wallet/checkout",
     operation: "beginWalletCheckout",
   },
   {
+    method: "get",
+    pattern: "/v1/organizations/{organizationId}/wallet/checkout/{reference}",
+    operation: "readWalletCheckoutReceipt",
+  },
+  {
     method: "post",
     pattern: "/v1/organizations/{organizationId}/wallet/funding",
     operation: "creditWalletFromSettlement",
+  },
+  { method: "post", pattern: "/v1/payments/stripe/webhook", operation: "receiveStripeWebhook" },
+  {
+    method: "post",
+    pattern: "/v1/operator/payments/reconcile",
+    operation: "runOperatorPaymentsReconcile",
+  },
+  {
+    method: "get",
+    pattern: "/v1/organizations/{organizationId}/payments/subscription",
+    operation: "readSubscription",
+  },
+  {
+    method: "get",
+    pattern: "/v1/organizations/{organizationId}/payments/subscription/commands/{kind}/{reference}",
+    operation: "readSubscriptionCommandReceipt",
+  },
+  {
+    method: "post",
+    pattern: "/v1/organizations/{organizationId}/payments/subscription",
+    operation: "beginSubscription",
+  },
+  {
+    method: "patch",
+    pattern: "/v1/organizations/{organizationId}/payments/subscription",
+    operation: "changeSubscription",
   },
   { method: "get", pattern: "/v1/catalog", operation: "listOfferings" },
   { method: "post", pattern: "/v1/reseller/quotes", operation: "createResellerQuote" },

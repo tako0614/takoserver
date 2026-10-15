@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { parseBillingConfig } from "../src/billing-config.ts";
 import {
   buildApp,
   createEphemeralSql,
@@ -91,7 +92,39 @@ function reservationStub(): WorkerEndpointOriginReservations {
 }
 
 /** The whole surface composed, so no route is missing merely for want of a port. */
+/**
+ * The payment notification route is served only where a processor's signing
+ * secret is configured, so the stub mounts it. A body-less probe is refused
+ * before the processor is ever asked.
+ */
+function paymentEventsStub() {
+  const refuse = async (): Promise<never> => {
+    throw new Error("not reached by a surface probe");
+  };
+  return { receive: refuse, reconcile: refuse };
+}
+
+/** The operator reconcile route is served only beside the pass and an operator key. */
+const operatorPaymentsReconcileStub = {
+  async verify(): Promise<never> {
+    throw new Error("not reached by a surface probe");
+  },
+};
+
 function completeHandler() {
+  const billingConfig = parseBillingConfig(
+    JSON.stringify({
+      schemaVersion: 1,
+      revision: "surface-probe.1",
+      effectiveAt: "2026-10-01T00:00:00.000Z",
+      currency: "USD",
+      freeIncludedMinor: 0,
+      purchaseCreditExpiry: { kind: "none" },
+      plans: {},
+      meters: {},
+    }),
+  );
+  if (!billingConfig) throw new Error("missing surface-probe billing configuration");
   const publicWorkerVersionId = "00000000-0000-4000-8000-000000000001";
   return buildApp({
     v2: TEST_TAKOFORM_V2_CONFIG,
@@ -113,12 +146,16 @@ function completeHandler() {
     hostForms: [],
     driver: new InMemoryTakoformResourceDriver(),
     offerings: [],
+    billingConfig,
     originReservations: reservationStub(),
+    paymentEvents: paymentEventsStub,
+    operatorPaymentsReconcile: operatorPaymentsReconcileStub,
   }).fetch;
 }
 
 const PATH_SAMPLES: Readonly<Record<string, string>> = {
   organizationId: "org_probe",
+  reference: "run:probe",
   deploymentId: "dep_probe",
   resourceUid: "uid_probe",
   uid: "uid_probe",
@@ -225,6 +262,15 @@ describe("published API description", () => {
       }
     }
     expect(unknown).toEqual([]);
+  });
+
+  test("billing routes require explicit tariff configuration", async () => {
+    const fetch = handler();
+    const response = await fetch(
+      new Request("https://api.takoserver.com/v1/organizations/org_probe/wallet/holds/run:probe"),
+    );
+    expect(response.status).toBe(404);
+    expect(await response.json()).toMatchObject({ error: { code: "not_found" } });
   });
 
   test("names one server and one bearer scheme", () => {
@@ -490,16 +536,28 @@ describe("published API description", () => {
     );
   });
 
-  test("mentions no other product and keeps upstream identity vocabulary off customer routes", () => {
+  test("bounds shared product metadata and keeps upstream identity vocabulary off customer routes", () => {
     const serialized = JSON.stringify(openApiDocument);
-    expect(serialized).not.toMatch(/takosumi/i);
-    // The reseller lane speaks only in opaque tenant references.
+    expect(
+      openApiDocument.components.schemas.HostedPlanTable.properties.products.prefixItems,
+    ).toEqual([{ const: "takosumi-hosted" }, { const: "takoserver" }]);
+    // The shared plan table identifies its two products. Only that exact
+    // product tag is allowed; other surfaces cannot import Hosted identity.
+    expect(
+      serialized.replace('"const":"takosumi-hosted"', '"const":"shared-hosted-product"'),
+    ).not.toMatch(/takosumi/i);
+    // Customer routes carry opaque references, including workspaceRef. They
+    // must not expose upstream Workspace, user, or principal identifiers.
     const customerPaths = Object.fromEntries(
       Object.entries(openApiDocument.paths).filter(
         ([path]) => !path.startsWith("/v1/operator/integration-e2e/organization-bootstrap/"),
       ),
     );
-    expect(JSON.stringify(customerPaths)).not.toMatch(/workspace|userId|principalId/);
+    expect(JSON.stringify(customerPaths)).not.toMatch(/workspaceId|userId|principalId/i);
+    expect(
+      openApiDocument.components.schemas.WalletWorkspaceUsageResponse.properties.workspaces.items
+        .properties.workspaceRef,
+    ).toEqual(openApiDocument.components.schemas.BillingReference);
   });
 
   test("serves the document it describes", async () => {

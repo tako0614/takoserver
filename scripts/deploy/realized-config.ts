@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { PAYMENT_SETTING_VARIABLES } from "../../src/payment-settings.ts";
 import type { PublicFormImplementationIdentity } from "../../src/public-worker-implementation.ts";
 import { preflightError } from "./errors.ts";
 import { REPOSITORY } from "./process.ts";
@@ -213,6 +214,12 @@ export function deploymentVariables(
   if (target.schemaMaintenanceMode !== undefined) {
     vars.TAKOSERVER_SCHEMA_MAINTENANCE_MODE = target.schemaMaintenanceMode;
   }
+  if (target.moneyCutoverWriterPolicy !== undefined) {
+    if (target.moneyCutoverWriterEpoch === undefined)
+      throw preflightError("selected money Writer epoch is missing");
+    vars.TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY = target.moneyCutoverWriterPolicy;
+    vars.TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH = target.moneyCutoverWriterEpoch;
+  }
   if (target.consoleOrigin !== undefined) vars.TAKOSERVER_CONSOLE_ORIGIN = target.consoleOrigin;
   if (target.googleClientId !== undefined) vars.GOOGLE_CLIENT_ID = target.googleClientId;
   if (target.takosId !== undefined) {
@@ -220,6 +227,17 @@ export function deploymentVariables(
     vars.TAKOS_ID_CLIENT_ID = target.takosId.clientId;
   }
   if (target.stripeCheckout === true) vars.TAKOSERVER_STRIPE_CHECKOUT_ENABLED = "1";
+  if (target.stripeWebhook === true) vars.TAKOSERVER_STRIPE_WEBHOOK_ENABLED = "1";
+  if (target.billingConfig !== undefined) {
+    vars.TAKOSERVER_BILLING_CONFIG = JSON.stringify(target.billingConfig);
+  }
+  if (target.hostedPricing !== undefined) {
+    vars.TAKOSERVER_HOSTED_PRICING = target.hostedPricing;
+  }
+  for (const [setting, variable] of Object.entries(PAYMENT_SETTING_VARIABLES)) {
+    const value = target.stripeSettings?.[setting as keyof typeof PAYMENT_SETTING_VARIABLES];
+    if (value !== undefined) vars[variable] = String(value);
+  }
   if (target.aiModels !== undefined) vars.TAKOSERVER_AI_MODELS = JSON.stringify(target.aiModels);
   if (target.objectBucketSupplies !== undefined) {
     vars.TAKOSERVER_OBJECT_BUCKET_SUPPLIES = JSON.stringify(target.objectBucketSupplies);
@@ -287,6 +305,7 @@ export function expectedWorkerSecrets(target: DeployTarget): readonly string[] {
     names.add("TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING");
   }
   if (target.stripeCheckout === true) names.add("STRIPE_SECRET_KEY");
+  if (target.stripeWebhook === true) names.add("STRIPE_WEBHOOK_SECRET");
   return [...names].sort();
 }
 

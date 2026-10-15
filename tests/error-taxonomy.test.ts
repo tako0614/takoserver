@@ -30,6 +30,8 @@ const WIRE_REFUSAL_SOURCES = [
   "RuntimeInputPreparationError",
   "WorkerEndpointOriginReservationError",
   "ResellerError",
+  "OrgBillingError",
+  "orgBillingFail",
 ];
 
 interface EmittedPair {
@@ -147,5 +149,14 @@ describe("error taxonomy", () => {
     );
     expect(errorEnvelopeResponse("not_found", 404).status).toBe(404);
     expect(errorEnvelopeResponse("resource_not_found", 404).status).toBe(404);
+  });
+
+  test("refund receivable renders a non-retryable Host conflict", async () => {
+    expect(classifyRefusal("refund_receivable", 409)).toBe("host");
+    const response = errorEnvelopeResponse("refund_receivable", 409);
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      error: { code: "refund_receivable", retryable: false },
+    });
   });
 });

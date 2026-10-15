@@ -9,8 +9,10 @@ import {
   type ExternalIdentityVerifier,
   type FundingSettlementVerifier,
   type InstalledTakoformForm,
+  type Ledger,
   type Offering,
 } from "../src/index.ts";
+import { minorToMicros } from "../src/money.ts";
 import { type Sql, SqlError } from "../src/ports.ts";
 import { createProviderDriver, ProviderMutationRecoveryError } from "../src/provider-driver.ts";
 import {
@@ -31,6 +33,21 @@ import {
   createStaticStableTestTakoformHost,
 } from "./helpers/historical-takoform-host.ts";
 import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
+
+async function fundPurchased(
+  ledger: Ledger,
+  organizationId: string,
+  fundingRef: string,
+  amountMinor: number,
+): Promise<void> {
+  await ledger.fund({
+    organizationId,
+    fundingRef,
+    amountMicros: minorToMicros(amountMinor),
+    kind: "purchased",
+    consumptionClass: "purchased",
+  });
+}
 
 const fakeReadback = {
   createNativeReadbackDescriptor(input: {
@@ -287,7 +304,7 @@ describe("Takoform apply on a real backend", () => {
     const sql = createEphemeralSql();
     const clock = () => new Date("2026-08-24T00:00:00.000Z");
     const ledger = createLedger(sql, clock);
-    await ledger.fund({ organizationId: "org_priced", fundingRef: "paid", amountMinor: 2_000 });
+    await fundPurchased(ledger, "org_priced", "paid", 2_000);
     const state = createFakeProviderState();
     const provider = new FakeProvider({
       offerings: [PROVIDER_OFFERING],
@@ -332,9 +349,9 @@ describe("Takoform apply on a real backend", () => {
     expect(providerHandle).toBe("handle_op_priced_running");
     if (!providerHandle) throw new Error("expected a provider recovery handle");
     expect(await ledger.wallet("org_priced")).toMatchObject({
-      settledMinor: 2_000,
-      heldMinor: 500,
-      availableMinor: 1_500,
+      settledMicros: 20_000_000,
+      heldMicros: 5_000_000,
+      availableMicros: 15_000_000,
     });
     expect(provider.sideEffectCount).toBe(1);
 
@@ -347,9 +364,9 @@ describe("Takoform apply on a real backend", () => {
     expect(settled.observed).toEqual({ location: "apac" });
     expect(provider.sideEffectCount).toBe(1);
     expect(await ledger.wallet("org_priced")).toMatchObject({
-      settledMinor: 1_500,
-      heldMinor: 0,
-      availableMinor: 1_500,
+      settledMicros: 15_000_000,
+      heldMicros: 0,
+      availableMicros: 15_000_000,
     });
   });
 
@@ -357,7 +374,7 @@ describe("Takoform apply on a real backend", () => {
     const sql = createEphemeralSql();
     const clock = () => new Date("2026-08-24T00:00:00.000Z");
     const ledger = createLedger(sql, clock);
-    await ledger.fund({ organizationId: "org_poll_lost", fundingRef: "paid", amountMinor: 2_000 });
+    await fundPurchased(ledger, "org_poll_lost", "paid", 2_000);
     const state = createFakeProviderState();
     const fake = new FakeProvider({
       offerings: [PROVIDER_OFFERING],
@@ -427,11 +444,7 @@ describe("Takoform apply on a real backend", () => {
     const sql = createEphemeralSql();
     const clock = () => new Date("2026-08-24T00:00:00.000Z");
     const ledger = createLedger(sql, clock);
-    await ledger.fund({
-      organizationId: "org_indeterminate",
-      fundingRef: "paid",
-      amountMinor: 2_000,
-    });
+    await fundPurchased(ledger, "org_indeterminate", "paid", 2_000);
     let attempts = 0;
     const provider: Provider = {
       id: "fake",
@@ -481,9 +494,9 @@ describe("Takoform apply on a real backend", () => {
       providerOutcome: "indeterminate",
     });
     expect(await ledger.wallet("org_indeterminate")).toMatchObject({
-      settledMinor: 2_000,
-      heldMinor: 500,
-      availableMinor: 1_500,
+      settledMicros: 20_000_000,
+      heldMicros: 5_000_000,
+      availableMicros: 15_000_000,
     });
     await expect(
       applyWithSelection(makeDriver(), { ...input, operationMode: "recovery" }),
@@ -492,9 +505,9 @@ describe("Takoform apply on a real backend", () => {
     });
     expect(attempts).toBe(1);
     expect(await ledger.wallet("org_indeterminate")).toMatchObject({
-      settledMinor: 2_000,
-      heldMinor: 500,
-      availableMinor: 1_500,
+      settledMicros: 20_000_000,
+      heldMicros: 5_000_000,
+      availableMicros: 15_000_000,
     });
   });
 
@@ -502,11 +515,7 @@ describe("Takoform apply on a real backend", () => {
     const sql = createEphemeralSql();
     const clock = () => new Date("2026-08-24T00:00:00.000Z");
     const ledger = createLedger(sql, clock);
-    await ledger.fund({
-      organizationId: "org_recover_apply",
-      fundingRef: "paid",
-      amountMinor: 2_000,
-    });
+    await fundPurchased(ledger, "org_recover_apply", "paid", 2_000);
     let applyCalls = 0;
     let readOnlyRecoverCalls = 0;
     let convergeCalls = 0;
@@ -576,8 +585,8 @@ describe("Takoform apply on a real backend", () => {
     expect(readOnlyRecoverCalls).toBe(0);
     expect(convergeCalls).toBe(1);
     expect(await ledger.wallet("org_recover_apply")).toMatchObject({
-      settledMinor: 1_500,
-      heldMinor: 0,
+      settledMicros: 15_000_000,
+      heldMicros: 0,
     });
   });
 
@@ -768,7 +777,7 @@ describe("Takoform apply on a real backend", () => {
       expect(initial.body).toMatchObject({ operation: { id: operationId, done: false } });
       expect(applyCalls).toBe(1);
       expect(await createLedger(sql, () => new Date()).wallet(organizationId)).toMatchObject({
-        heldMinor: 500,
+        heldMicros: 5_000_000,
       });
       expect(
         await sql.query(
@@ -806,7 +815,7 @@ describe("Takoform apply on a real backend", () => {
           },
         ]);
         expect(await createLedger(sql, () => new Date()).wallet(organizationId)).toMatchObject({
-          heldMinor: 500,
+          heldMicros: 5_000_000,
         });
         expect((await app.tick()).providerRepairs).toEqual({
           candidates: 1,
@@ -966,13 +975,13 @@ describe("Takoform apply on a real backend", () => {
       expect(initial.status).toBe(202);
       const operationId = String((initial.body.operation as { id?: string }).id);
       expect(await createLedger(sql, clock).wallet(organizationId)).toMatchObject({
-        heldMinor: amountMinor,
+        heldMicros: amountMinor * 10_000,
       });
       const firstRecovery = (await app.tick()).providerRepairs;
       if (scenario === "stale" || scenario === "rollback") {
         expect(firstRecovery).toMatchObject({ settled: 0, pending: 1 });
         expect(await createLedger(sql, clock).wallet(organizationId)).toMatchObject({
-          heldMinor: amountMinor,
+          heldMicros: amountMinor * 10_000,
         });
         expect(
           await sql.query("SELECT id FROM ledger WHERE org_id = ? AND type = 'release'", [
@@ -994,8 +1003,8 @@ describe("Takoform apply on a real backend", () => {
         expect(injected).toBe(true);
       }
       expect(await createLedger(sql, clock).wallet(organizationId)).toMatchObject({
-        heldMinor: 0,
-        settledMinor: 2_000,
+        heldMicros: 0,
+        settledMicros: 20_000_000,
       });
       expect(
         await sql.query(
@@ -1097,7 +1106,7 @@ describe("Takoform apply on a real backend", () => {
     expect(applyCalls).toBe(1);
     expect(convergeCalls).toBe(0);
     expect(await createLedger(sql, () => new Date()).wallet(organizationId)).toMatchObject({
-      heldMinor: 500,
+      heldMicros: 5_000_000,
     });
 
     expect((await app.tick()).providerRepairs).toEqual({
@@ -1124,7 +1133,7 @@ describe("Takoform apply on a real backend", () => {
       ),
     ).toEqual([{ phase: "planned" }, { phase: "dispatched" }]);
     expect(await createLedger(sql, () => new Date()).wallet(organizationId)).toMatchObject({
-      heldMinor: 500,
+      heldMicros: 5_000_000,
     });
   });
 
@@ -1511,8 +1520,8 @@ describe("Takoform apply on a real backend", () => {
       providerInstallationRef: "cloudflare.primary",
     });
     expect(await createLedger(sql, clock).wallet("org_inherited")).toMatchObject({
-      settledMinor: 0,
-      heldMinor: 0,
+      settledMicros: 0,
+      heldMicros: 0,
     });
   });
 
@@ -1648,7 +1657,7 @@ describe("Takoform apply on a real backend", () => {
       ledger,
       deployments: createResourceDeploymentStore(sql, clock),
     });
-    await ledger.fund({ organizationId: "org_reseller", fundingRef: "paid", amountMinor: 2_000 });
+    await fundPurchased(ledger, "org_reseller", "paid", 2_000);
 
     await applyWithSelection(driver, {
       operationId: "op_reseller_create",
@@ -1673,8 +1682,8 @@ describe("Takoform apply on a real backend", () => {
     });
 
     expect(await ledger.wallet("org_reseller")).toMatchObject({
-      settledMinor: 2_000,
-      heldMinor: 0,
+      settledMicros: 20_000_000,
+      heldMicros: 0,
     });
     expect(provider.listResources()).toEqual(["org_reseller/opaque-tenant/media"]);
   });
@@ -1898,12 +1907,12 @@ describe("Takoform apply on a real backend", () => {
     expect(provider.listResources()).toEqual([`${organizationId}/default/assets`]);
 
     const wallet = await ledger.wallet(organizationId);
-    expect(wallet).toMatchObject({ settledMinor: 1_500, heldMinor: 0 });
+    expect(wallet).toMatchObject({ settledMicros: 15_000_000, heldMicros: 0 });
 
     // Replaying the same idempotency key must not provision or charge again.
     const replayed = await created.replay();
     expect(replayed.status).toBe(201);
-    expect(await ledger.wallet(organizationId)).toMatchObject({ settledMinor: 1_500 });
+    expect(await ledger.wallet(organizationId)).toMatchObject({ settledMicros: 15_000_000 });
   });
 
   test("abandons a planned apply when its durable dispatch marker fails", async () => {
@@ -2214,11 +2223,7 @@ describe("Takoform apply on a real backend", () => {
     const sql = createEphemeralSql();
     const clock = () => new Date("2026-08-24T00:00:00.000Z");
     const ledger = createLedger(sql, clock);
-    await ledger.fund({
-      organizationId: "org_residual_present",
-      fundingRef: "paid",
-      amountMinor: 2_000,
-    });
+    await fundPurchased(ledger, "org_residual_present", "paid", 2_000);
     const provider: Provider = {
       id: "fake",
       offerings: [PROVIDER_OFFERING],
@@ -3351,9 +3356,9 @@ describe("Takoform apply on a real backend", () => {
     expect(created.status).toBe(201);
     expect(provider.listResources()).toEqual([`${organizationId}/default/metered`]);
     expect(await ledger.wallet(organizationId)).toMatchObject({
-      settledMinor: 2_000,
-      heldMinor: 0,
-      availableMinor: 2_000,
+      settledMicros: 20_000_000,
+      heldMicros: 0,
+      availableMicros: 20_000_000,
     });
   });
 
@@ -3367,9 +3372,9 @@ describe("Takoform apply on a real backend", () => {
     expect(provider.sideEffectCount).toBe(0);
     // The customer keeps their money, and nothing is recorded as provisioned.
     expect(await ledger.wallet(organizationId)).toMatchObject({
-      settledMinor: 2_000,
-      heldMinor: 0,
-      availableMinor: 2_000,
+      settledMicros: 20_000_000,
+      heldMicros: 0,
+      availableMicros: 20_000_000,
     });
     const read = await call(
       app.fetch,
@@ -3532,9 +3537,9 @@ describe("Takoform apply on a real backend", () => {
         ),
       ).toEqual([{ operation_id: operationId, phase: "planned", provider_outcome: "running" }]);
       expect(await createLedger(sql, clock).wallet(organizationId)).toMatchObject({
-        settledMinor: 2_000,
-        heldMinor: 500,
-        availableMinor: 1_500,
+        settledMicros: 20_000_000,
+        heldMicros: 5_000_000,
+        availableMicros: 15_000_000,
       });
       expect(
         await sql.query("SELECT id FROM ledger WHERE org_id = ? AND type = 'release'", [
@@ -3558,9 +3563,9 @@ describe("Takoform apply on a real backend", () => {
       expect(convergeCalls).toBe(1);
       expect(await initial.replay()).toMatchObject({ status: 201 });
       expect(await createLedger(sql, clock).wallet(organizationId)).toMatchObject({
-        settledMinor: 1_500,
-        heldMinor: 0,
-        availableMinor: 1_500,
+        settledMicros: 15_000_000,
+        heldMicros: 0,
+        availableMicros: 15_000_000,
       });
     }
   });
@@ -3646,17 +3651,17 @@ describe("Takoform apply on a real backend", () => {
       ]),
     ).toEqual([{ state: "failed" }]);
     expect(await createLedger(sql, clock).wallet(organizationId)).toMatchObject({
-      settledMinor: 2_000,
-      heldMinor: 0,
-      availableMinor: 2_000,
+      settledMicros: 20_000_000,
+      heldMicros: 0,
+      availableMicros: 20_000_000,
     });
     expect(
       await sql.query(
-        `SELECT ref, settled_delta, held_delta FROM ledger
+        `SELECT ref, settled_delta_micros, held_delta_micros FROM ledger
          WHERE org_id = ? AND type = 'release'`,
         [organizationId],
       ),
-    ).toEqual([{ ref: operationId, settled_delta: 0, held_delta: -500 }]);
+    ).toEqual([{ ref: operationId, settled_delta_micros: 0, held_delta_micros: -5_000_000 }]);
     for (const [table, identityColumn] of [
       ["tf_provider_mutation_sagas_selection_v1", "operation_id"],
       ["tf_resource_claims", "holder_uid"],
@@ -3689,7 +3694,7 @@ describe("Takoform apply on a real backend", () => {
     for (const name of ["one", "two", "three", "four"]) {
       expect((await applyBucket(app.fetch, auth, name, {}, `apply-${name}`)).status).toBe(201);
     }
-    expect(await ledger.wallet(organizationId)).toMatchObject({ availableMinor: 0 });
+    expect(await ledger.wallet(organizationId)).toMatchObject({ availableMicros: 0 });
 
     const denied = await applyBucket(app.fetch, auth, "five", {}, "apply-five");
     expect(denied.status).toBe(402);
@@ -3732,11 +3737,7 @@ describe("Takoform apply on a real backend", () => {
       ),
     ).toEqual([]);
 
-    await ledger.fund({
-      organizationId,
-      fundingRef: "funding-after-insufficient-funds",
-      amountMinor: 500,
-    });
+    await fundPurchased(ledger, organizationId, "funding-after-insufficient-funds", 500);
     const fundedRetry = await denied.replay();
     expect(fundedRetry.status).toBe(201);
     expect(provider.listResources()).toHaveLength(5);
@@ -3789,7 +3790,7 @@ describe("Takoform apply on a real backend", () => {
     );
     expect(observed.status).toBe(200);
     // Observation reaches the backend by native identity and bills nothing.
-    expect(await ledger.wallet(organizationId)).toMatchObject({ settledMinor: 1_500 });
+    expect(await ledger.wallet(organizationId)).toMatchObject({ settledMicros: 15_000_000 });
   });
 
   test("deletes on the backend when the resource is deleted", async () => {

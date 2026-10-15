@@ -17,12 +17,28 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  selfhost-docker:
+    name: Docker self-host smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pinned: v6.0.2
+        with:
+          persist-credentials: false
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # pinned: v2.0.2
+        with:
+          bun-version-file: .bun-version
+      - name: Build and exercise Docker run and Compose
+        run: bun run test:selfhost-docker
+
   quality:
     name: check and test
     runs-on: ubuntu-24.04
-    # The complete gate can exceed 30 minutes on a shared runner. Keep enough
-    # room for the D1 migration and build phases after tests; do not skip them.
-    timeout-minutes: 45
+    # The complete suite exceeded 45 minutes on a shared runner. Reserve time
+    # for every test plus the D1 migration and build phases; do not skip them.
+    timeout-minutes: 75
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pinned: v6.0.2

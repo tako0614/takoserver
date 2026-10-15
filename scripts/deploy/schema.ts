@@ -32,6 +32,10 @@ import {
   preflightError,
   verificationError,
 } from "./errors.ts";
+import type {
+  CanonicalV20092IntegrationStorageIdentityProof,
+  IntegrationStorageTargetReadProvider,
+} from "./integration-storage-generation.ts";
 import {
   type D1SchemaState,
   pendingMigrations,
@@ -63,6 +67,13 @@ import {
   reconcileDispatchedProtected0058Transition,
   runProtected0058Transition,
 } from "./schema-0058-transition.ts";
+import type { MoneyUnitCutoverOptions } from "./schema-money-unit-cutover.ts";
+import {
+  assertSchemaV20092PostProof,
+  assertSchemaV20092PreProof,
+  inspectSchemaV20092WalletProof,
+  type SchemaV20092WalletProof,
+} from "./schema-v2-0092-proof.ts";
 import {
   assertSameV2ExistingMaintenanceProof,
   inspectV2ExistingMaintenancePublication,
@@ -173,6 +184,15 @@ const AUDITED_MIGRATION_LINEAGE = [
   "0088_v2_worker_sqlite_external_drain.sql",
   "0089_v2_worker_cron_match_guard_depth.sql",
   "0090_v2_queue_sqlite_external_drain.sql",
+  "0091_stripe_events.sql",
+  "0092_org_wallet_lifecycle.sql",
+  "0093_wallet_credit_classification_proofs.sql",
+  "0094_wallet_usd_micros.sql",
+  "0095_stripe_billing.sql",
+  "0096_subscription_checkout_custody.sql",
+  "0097_subscription_cancellation_custody.sql",
+  "0098_stripe_mode_realm.sql",
+  "0099_hosted_billing_extensions.sql",
 ] as const;
 const AUDITED_MIGRATION_SHA256: Readonly<
   Record<(typeof AUDITED_MIGRATION_LINEAGE)[number], string>
@@ -355,8 +375,28 @@ const AUDITED_MIGRATION_SHA256: Readonly<
     "sha256:eaed1f01e78de59c4488e5c882e984d6c5e5f9010e8e8bab51dac3a74f0fca7b",
   "0090_v2_queue_sqlite_external_drain.sql":
     "sha256:9a2590842a6986dbc9e0b906a3b0efdae2da7d1244c24a5cf2be81a8f11ab802",
+  "0091_stripe_events.sql":
+    "sha256:e32149261d1025e4fa375c944fb4299ab3bc140fade37832f8e0d3a394f96b6e",
+  "0092_org_wallet_lifecycle.sql":
+    "sha256:315fb662a48c013ed3299fb6f23e648e03bda5f4cabc0d03dcaf8777d048712f",
+  "0093_wallet_credit_classification_proofs.sql":
+    "sha256:fc0307e23ee2f80e3eb96da21db7ea065ba7a04d5c582191c34bdf9d4afc3037",
+  "0094_wallet_usd_micros.sql":
+    "sha256:7ce85b52626f6cbef6e06484e9cddb5052fab76f9718fea279108e2db6da8e44",
+  "0095_stripe_billing.sql":
+    "sha256:54f27fccaaa1d624505b333cf21ee0e7d59a798830a3c083b16065fa8f65a826",
+  "0096_subscription_checkout_custody.sql":
+    "sha256:050f0eced06d19e7503e42a6b4d9d7d529cc84d763fd55fcf0253ef5efaf712e",
+  "0097_subscription_cancellation_custody.sql":
+    "sha256:80f5572d6ae15250f2cb0202aedab692d4b68690595ca06a114ba39ee5949ca5",
+  "0098_stripe_mode_realm.sql":
+    "sha256:5865ae1809dad2887b7786ebc5a372266521826ecbf8c2f59c308d211f08272f",
+  "0099_hosted_billing_extensions.sql":
+    "sha256:b7ad0ad7876ac993d1b6de1cb14c2aea62067147638f48456626baf9673156d8",
 };
-// 0067-0090 are part of the exact source inventory only. None has an in-place apply wave.
+// The ordinary integration ceiling remains 0066; its later fixed wave ends at 0092.
+// The separate money-cutover owner qualifies only 0093/0094. Neither lane
+// authorizes applying the audited 0095-0098 source tail.
 const INTEGRATION_APPLY_CEILING_COUNT = 66;
 // Fresh production bootstrap is a distinct, still-frozen authority. Auditing
 // a new local source migration never silently adds it to this payload.
@@ -383,6 +423,31 @@ const FRESH_PRODUCTION_V2_0089_APPLY_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(
   0,
   FRESH_PRODUCTION_V2_0089_APPLY_CEILING_COUNT,
 );
+// Staging-only fresh profile through the Stripe event table. It exists only
+// for a brand-new integration generation: production fresh init, rehearsal and
+// every in-place wave refuse it, so it can never reach a production D1 or an
+// existing database. Like the others, a later audited tail never widens it.
+const FRESH_INTEGRATION_V2_0091_APPLY_CEILING_COUNT = 91;
+const FRESH_INTEGRATION_V2_0091_APPLY_END = "0091_stripe_events.sql";
+const FRESH_INTEGRATION_V2_0091_APPLY_DIGEST =
+  "sha256:152aefa3c0577809d419d95be2bc8878aa9a390a4ee40bfbf5501c32bf058bef";
+const FRESH_INTEGRATION_V2_0091_APPLY_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(
+  0,
+  FRESH_INTEGRATION_V2_0091_APPLY_CEILING_COUNT,
+);
+// The second staging-only profile prepares the Organization wallet lifecycle
+// tables (0092); serving still requires a separately qualified money cutover.
+const FRESH_INTEGRATION_V2_0092_APPLY_CEILING_COUNT = 92;
+const FRESH_INTEGRATION_V2_0092_APPLY_END = "0092_org_wallet_lifecycle.sql";
+const FRESH_INTEGRATION_V2_0092_APPLY_DIGEST =
+  "sha256:6f7c1016b7ffeeb7c02006cdb8e55dc7919bfc2aeaf04c090001dcf423454be2";
+const FRESH_INTEGRATION_V2_0092_APPLY_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(
+  0,
+  FRESH_INTEGRATION_V2_0092_APPLY_CEILING_COUNT,
+);
+const CANONICAL_INTEGRATION_V2_0092_COUNT = 92;
+const CANONICAL_INTEGRATION_V2_0092_DIGEST =
+  "sha256:6f7c1016b7ffeeb7c02006cdb8e55dc7919bfc2aeaf04c090001dcf423454be2";
 const APPLY_QUALIFIED_MIGRATION_LINEAGE = AUDITED_MIGRATION_LINEAGE.slice(
   0,
   INTEGRATION_APPLY_CEILING_COUNT,
@@ -419,6 +484,9 @@ export const SCHEMA_WAVE_BOUNDARIES = [
   "0057",
   "0058",
   "0088",
+  "0092",
+  "0093",
+  "0094",
 ] as const;
 export type SchemaWaveBoundary = (typeof SCHEMA_WAVE_BOUNDARIES)[number];
 const SCHEMA_WAVES: Readonly<
@@ -558,6 +626,24 @@ const SCHEMA_WAVES: Readonly<
     throughCount: 88,
     throughMigration: "0088_v2_worker_sqlite_external_drain.sql",
   },
+  "0092": {
+    fromCount: 88,
+    fromMigration: "0088_v2_worker_sqlite_external_drain.sql",
+    throughCount: 92,
+    throughMigration: "0092_org_wallet_lifecycle.sql",
+  },
+  "0093": {
+    fromCount: 92,
+    fromMigration: "0092_org_wallet_lifecycle.sql",
+    throughCount: 93,
+    throughMigration: "0093_wallet_credit_classification_proofs.sql",
+  },
+  "0094": {
+    fromCount: 93,
+    fromMigration: "0093_wallet_credit_classification_proofs.sql",
+    throughCount: 94,
+    throughMigration: "0094_wallet_usd_micros.sql",
+  },
 };
 const RECEIPT_CHAIN_BOUNDARIES = SCHEMA_WAVE_BOUNDARIES.filter(
   (boundary): boundary is Exclude<SchemaWaveBoundary, "0022"> =>
@@ -658,6 +744,8 @@ export interface SchemaInvocation {
 }
 
 export interface SchemaOptions {
+  /** Dedicated staging-only monetary qualification; never widens the legacy/fresh lanes. */
+  readonly moneyUnitCutover?: MoneyUnitCutoverOptions;
   readonly run?: SchemaProcess;
   readonly reader?: SchemaReader;
   readonly migrationDirectory?: string;
@@ -667,6 +755,29 @@ export interface SchemaOptions {
   readonly predecessorReceiptPath?: string;
   readonly leaseRoot?: string;
   readonly review?: string;
+  /** Read-only production identity fence for the integration 0088→0092 wave. */
+  readonly productionD1?: { readonly databaseName: string; readonly databaseId: string };
+  /** Test seam only; live 0092 identity proof uses Cloudflare native GET. */
+  readonly integrationStorageIdentityProvider?: IntegrationStorageTargetReadProvider;
+  /** Test seam; live execution reads the target D1 through RemoteD1. */
+  readonly schemaV20092WalletProof?: (
+    phase: DeployPhase,
+    count: 88 | 92,
+  ) => Promise<SchemaV20092WalletProof>;
+  /** Supplied only by the private canonical owner after native/claim/dependency readback. */
+  readonly canonicalV20092OwnerProof?: (
+    input: CanonicalV20092OwnerProofInput,
+  ) => Promise<CanonicalV20092OwnerProof>;
+  /** Private owner persists a no-overwrite dispatched record before any 0092 D1 import. */
+  readonly canonicalV20092DispatchCustody?: {
+    persistDispatched(
+      binding: CanonicalV20092DispatchBinding,
+    ): Promise<CanonicalV20092CustodyReceipt>;
+    reconcilePost(
+      binding: CanonicalV20092DispatchBinding,
+      post: CanonicalV20092DispatchedPostProof,
+    ): Promise<CanonicalV20092CustodyReceipt>;
+  };
   readonly artifactBlobIoQuiescenceReceiptPath?: string;
   readonly artifactBlobIoCompatibilityReader?: (
     phase: DeployPhase,
@@ -682,6 +793,85 @@ export interface SchemaOptions {
     /** Live provider state; omitted only when the ordinary Cloudflare credential can supply it. */
     readonly publicWorkerState?: V2ExistingMaintenanceWorkerState;
   };
+}
+
+export interface CanonicalV20092OwnerProofInput {
+  readonly phase: DeployPhase;
+  readonly target: DeployTarget;
+  readonly publicCommit: string;
+  readonly sourceDigest: string;
+  readonly applied: readonly string[];
+  readonly schemaShapeDigest: string;
+  readonly expectedPostApplied: readonly string[];
+}
+
+export interface CanonicalV20092OwnerProof {
+  readonly kind: "takoserver.canonical-v2-0092-owner-proof@v1";
+  readonly phase: DeployPhase;
+  readonly accountId: string;
+  readonly databaseId: string;
+  readonly databaseName: string;
+  readonly publicCommit: string;
+  readonly sourceDigest: string;
+  readonly applied: readonly string[];
+  readonly schemaShapeDigest: string;
+  readonly expectedPostApplied: readonly string[];
+  /** Frozen historical native Version/source/claim identity, stable across the schema wave. */
+  readonly retainedNativeClaimDigest: string;
+  /** Phase-specific exact current dependency proof; 0088 and 0092 can differ. */
+  readonly dependencyProofDigest: string;
+  readonly unresolvedAttemptCount: 0;
+}
+
+export interface CanonicalV20092DispatchBinding {
+  readonly kind: "takoserver.canonical-v2-0092-dispatch-binding@v1";
+  readonly environment: "integration";
+  readonly target: {
+    readonly accountId: string;
+    readonly databaseId: string;
+    readonly databaseName: string;
+    readonly bucketName: string;
+  };
+  readonly productionD1: { readonly databaseId: string; readonly databaseName: string };
+  readonly source: {
+    readonly publicCommit: string;
+    readonly digest: string;
+    readonly files: readonly { readonly name: string; readonly digest: string }[];
+    readonly importDigest: string;
+    readonly importBytes: number;
+  };
+  readonly before: {
+    readonly applied: readonly string[];
+    readonly shapeDigest: string;
+    readonly wallet: SchemaV20092WalletProof;
+    readonly retainedNativeClaimDigest: string;
+    readonly dependencyProofDigest: string;
+  };
+  /** Digest of the source-derived application shape; D1's raw shape includes platform metadata. */
+  readonly expectedPost: {
+    readonly applied: readonly string[];
+    readonly applicationShapeDigest: string;
+  };
+}
+
+export interface CanonicalV20092DispatchedPostProof {
+  readonly applied: readonly string[];
+  readonly shapeDigest: string;
+  readonly wallet: SchemaV20092WalletProof;
+}
+
+export interface CanonicalV20092CustodyReceipt {
+  readonly kind: "takoserver.canonical-v2-0092-custody-receipt@v1";
+  readonly state: "dispatched" | "terminal";
+  readonly bindingDigest: string;
+  readonly custodyDigest: string;
+}
+
+/** Canonical binding digest for the private owner's durable no-overwrite custody. */
+export function canonicalV20092DispatchBindingDigest(
+  binding: CanonicalV20092DispatchBinding,
+): string {
+  return `sha256:${createHash("sha256").update(JSON.stringify(binding)).digest("hex")}`;
 }
 
 export type SchemaBaselineOptions = Omit<SchemaOptions, "receiptPath" | "predecessorReceiptPath">;
@@ -920,6 +1110,25 @@ export async function runD1Schema(
   if (target.environment !== invocation.environment) {
     throw preflightError("D1 schema invocation and target environments differ");
   }
+  if (invocation.throughMigration === "0093" || invocation.throughMigration === "0094") {
+    if (invocation.environment !== "integration" || options.moneyUnitCutover === undefined) {
+      throw preflightError(
+        "0093/0094 require the dedicated integration money-unit owner qualification",
+      );
+    }
+    const { runIntegrationMoneyUnitCutover } = await import("./schema-money-unit-cutover.ts");
+    return await runIntegrationMoneyUnitCutover(
+      { ...invocation, environment: "integration", throughMigration: invocation.throughMigration },
+      target,
+      options.moneyUnitCutover,
+    );
+  }
+  if (target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1") {
+    // The ordinary lane would apply 0095 without reinstalling the permanent
+    // stripe_events trigger dropped by its table rebuild. Keep the selected
+    // DB on the reviewed 0093/0094 route until a separate suffix owns that.
+    throw preflightError("transaction-fenced money target requires a reviewed 0095 suffix route");
+  }
   if (
     invocation.throughMigration !== undefined &&
     !SCHEMA_WAVE_BOUNDARIES.includes(invocation.throughMigration)
@@ -937,12 +1146,46 @@ export async function runD1Schema(
       "0088 requires the exact integration public Host and CPE maintenance target",
     );
   }
+  if (invocation.throughMigration === "0092") {
+    if (
+      invocation.environment !== "integration" ||
+      target.takoformV2?.storageLineage !== "v2-0088" ||
+      target.schemaMaintenanceMode !== undefined ||
+      !/^takoserver-i-[0-9a-f]{32}$/u.test(target.d1.databaseName) ||
+      target.r2.bucketName !== target.d1.databaseName ||
+      options.productionD1 === undefined ||
+      options.productionD1.databaseName === target.d1.databaseName ||
+      options.productionD1.databaseId === target.d1.databaseId
+    ) {
+      throw preflightError(
+        "0092 requires an exact generated integration D1/R2 pair and a distinct read-only production D1 identity fence",
+      );
+    }
+  }
   if (invocation.environment !== "integration" && invocation.throughMigration === undefined) {
     throw preflightError(
       "rehearsal and production D1 schema invocations require one fixed --through-migration boundary",
     );
   }
   const run = options.run ?? runCommand;
+  const read0092Identity = async (): Promise<CanonicalV20092IntegrationStorageIdentityProof> => {
+    const { verifyCanonicalV20092IntegrationStorageIdentity } = await import(
+      "./integration-storage-generation.ts"
+    );
+    return verifyCanonicalV20092IntegrationStorageIdentity(
+      target,
+      options.productionD1 as NonNullable<SchemaOptions["productionD1"]>,
+      {
+        run,
+        ...(options.integrationStorageIdentityProvider === undefined
+          ? {}
+          : { provider: options.integrationStorageIdentityProvider }),
+        ...(options.cloudflareEnvironment === undefined
+          ? {}
+          : { cloudflareEnvironment: options.cloudflareEnvironment }),
+      },
+    );
+  };
   const resolveCredential = async () =>
     await resolveCloudflareCredential(invocation.environment, {
       cloudflareEnvironment: options.cloudflareEnvironment,
@@ -1030,6 +1273,8 @@ export async function runD1Schema(
       target,
       options.migrationDirectory ?? resolve(REPOSITORY, "migrations"),
     );
+    const canonicalV20092IdentityInitial =
+      invocation.throughMigration === "0092" ? await read0092Identity() : null;
     const possible0058Custody =
       invocation.action === "apply" && invocation.throughMigration === "0058"
         ? (protected0058Custody?.attemptPrefix ??
@@ -1087,6 +1332,12 @@ export async function runD1Schema(
       }
       throw error;
     }
+    // The audited 0093-0098 tail is source-only here. Bind every 0092 owner
+    // proof and dispatched attempt to the closed, immutable 0001-0092 payload.
+    const canonicalV20092Source =
+      wave.selector === "0092"
+        ? projectCanonicalIntegrationV2MigrationArtifact0092(sourceMigrations)
+        : sourceMigrations;
     if (wave.selector === "0088") {
       assertV2ExistingCanonicalState(initial, sourceMigrations.files);
       await assertV2ExistingDataSnapshot({
@@ -1097,6 +1348,42 @@ export async function runD1Schema(
         run,
         injected: options.reader,
       });
+    }
+    const read0092Proof = (phase: DeployPhase, count: 88 | 92) =>
+      options.schemaV20092WalletProof
+        ? options.schemaV20092WalletProof(phase, count)
+        : inspectSchemaV20092WalletProof(
+            new RemoteD1(inspectionConfig, { environment, run }),
+            phase,
+            count,
+          );
+    let schemaV20092PreProof: SchemaV20092WalletProof | null = null;
+    let canonicalV20092OwnerInitial: CanonicalV20092OwnerProof | null = null;
+    if (wave.selector === "0092") {
+      assertCanonicalIntegrationV20092State(initial, canonicalV20092Source.files);
+      if (initial.applied.length === 88 && target.takoformV2?.appliedSchemaLineage !== undefined) {
+        throw preflightError(
+          "0092 applied-schema target selector cannot precede its exact D1 readback",
+        );
+      }
+      if (initial.applied.length === 88) {
+        schemaV20092PreProof = await read0092Proof("preflight", 88);
+        assertSchemaV20092PreProof(schemaV20092PreProof);
+      }
+      if (options.canonicalV20092OwnerProof !== undefined) {
+        canonicalV20092OwnerInitial = await readCanonicalV20092OwnerProof(
+          options.canonicalV20092OwnerProof,
+          {
+            phase: "preflight",
+            target,
+            publicCommit: invocation.commit,
+            sourceDigest: canonicalV20092Source.digest,
+            applied: initial.applied,
+            schemaShapeDigest: initial.shapeDigest,
+            expectedPostApplied: canonicalV20092Source.names,
+          },
+        );
+      }
     }
     // Reopening a durable dispatched 0058 attempt is read-only, including when
     // an interrupted import left the lineage unchanged or the schema partial.
@@ -1320,6 +1607,18 @@ export async function runD1Schema(
                 predecessorVersionId: v2ExistingProof?.publicPredecessorVersionId ?? null,
               }
             : null,
+        schemaV20092:
+          wave.selector === "0092"
+            ? {
+                qualified: schemaV20092PreProof !== null,
+                storageIdentity: canonicalV20092IdentityInitial,
+                protectedRows: schemaV20092PreProof?.protectedRows ?? null,
+                protectedDigest: schemaV20092PreProof?.protectedDigest ?? null,
+                productionD1Guard: "distinct-exact-identity",
+                ownerQualified: canonicalV20092OwnerInitial !== null,
+                custodyConfigured: options.canonicalV20092DispatchCustody !== undefined,
+              }
+            : null,
         protected0058:
           wave.selector === "0058"
             ? {
@@ -1333,6 +1632,9 @@ export async function runD1Schema(
           wave.pending.length > 0 &&
           wave.selector !== "0058" &&
           (wave.selector !== "0088" || v2ExistingProof !== null) &&
+          (wave.selector !== "0092" ||
+            (canonicalV20092OwnerInitial !== null &&
+              options.canonicalV20092DispatchCustody !== undefined)) &&
           dataPreflights.status === "ready" &&
           (wave.selector !== LEGACY_PRODUCTION_CATCHUP_BOUNDARY ||
             (legacyCatchupIntegrity.status === "ready" &&
@@ -1359,6 +1661,14 @@ export async function runD1Schema(
     if (wave.selector === "0088" && v2ExistingProof === null) {
       throw preflightError("0088 requires exact public Host and CPE maintenance publication proof");
     }
+    if (wave.selector === "0092" && canonicalV20092OwnerInitial === null) {
+      throw preflightError(
+        "0092 apply requires owner-injected canonical dependency, native claim and terminal-attempt qualification",
+      );
+    }
+    if (wave.selector === "0092" && options.canonicalV20092DispatchCustody === undefined) {
+      throw preflightError("0092 apply requires private durable no-overwrite dispatch custody");
+    }
     assertDataPreflightsReady(dataPreflights, "before qualification");
     assertLegacyProductionCatchupReady(
       wave,
@@ -1376,6 +1686,7 @@ export async function runD1Schema(
     const source = await qualifySource({
       environment: invocation.environment === "integration" ? "integration" : "production",
       commit: invocation.commit,
+      ...(wave.selector === "0092" ? { policy: "clean-remote" as const } : {}),
       run,
     });
     const reviewer = exactReviewer(
@@ -1463,6 +1774,13 @@ export async function runD1Schema(
         "tests/deploy-schema-actor-kv-capability-cutover.test.ts",
       ]);
     }
+    if (wave.selector === "0092") {
+      await checked(run, "preflight", "canonical 0092 schema transition compatibility", [
+        "bun",
+        "test",
+        "tests/deploy-schema-v2-0092.test.ts",
+      ]);
+    }
     await checked(run, "preflight", "scoped migration gate `bun run check:migrations`", [
       "bun",
       "run",
@@ -1492,6 +1810,7 @@ export async function runD1Schema(
     const additiveCutoverPostShape =
       wave.selector === "0058" ||
       wave.selector === "0088" ||
+      wave.selector === "0092" ||
       applyProviderSelectionCutover.status === "ready" ||
       managedQueueRetirementCutover.status === "ready" ||
       managedActorOwnerCutover.status === "ready" ||
@@ -1500,7 +1819,7 @@ export async function runD1Schema(
         ? deriveExpectedApplicationShape(sealedMigrationArtifact.files)
         : null;
     const migrationImport =
-      wave.selector === "0047" || wave.selector === "0058"
+      wave.selector === "0047" || wave.selector === "0058" || wave.selector === "0092"
         ? buildD1MigrationImport(
             sealedMigrationArtifact.files.slice(
               wave.fromPrefixNames.length,
@@ -1523,6 +1842,32 @@ export async function runD1Schema(
 
     const requalified = await readState("preflight", configPath, environment, run, options.reader);
     assertSamePreState(initial, requalified);
+    if (wave.selector === "0092") {
+      assertSameCanonicalV20092IntegrationStorageIdentity(
+        canonicalV20092IdentityInitial as CanonicalV20092IntegrationStorageIdentityProof,
+        await read0092Identity(),
+      );
+      assertCanonicalIntegrationV20092State(requalified, sealedMigrationArtifact.files);
+      assertSameSchemaV20092PreProof(
+        schemaV20092PreProof as SchemaV20092WalletProof,
+        await read0092Proof("preflight", 88),
+      );
+      await assertSameCanonicalV20092OwnerProof(
+        canonicalV20092OwnerInitial as CanonicalV20092OwnerProof,
+        options.canonicalV20092OwnerProof as NonNullable<
+          SchemaOptions["canonicalV20092OwnerProof"]
+        >,
+        {
+          phase: "preflight",
+          target,
+          publicCommit: invocation.commit,
+          sourceDigest: canonicalV20092Source.digest,
+          applied: requalified.applied,
+          schemaShapeDigest: requalified.shapeDigest,
+          expectedPostApplied: canonicalV20092Source.names,
+        },
+      );
+    }
     if (wave.selector === "0088") {
       assertV2ExistingCanonicalState(requalified, sealedMigrationArtifact.files);
       await assertV2ExistingDataSnapshot({
@@ -1669,6 +2014,32 @@ export async function runD1Schema(
     artifact.assertUnchanged();
     const fenced = await readState("preflight", configPath, environment, run, options.reader);
     assertSamePreState(requalified, fenced);
+    if (wave.selector === "0092") {
+      assertSameCanonicalV20092IntegrationStorageIdentity(
+        canonicalV20092IdentityInitial as CanonicalV20092IntegrationStorageIdentityProof,
+        await read0092Identity(),
+      );
+      assertCanonicalIntegrationV20092State(fenced, sealedMigrationArtifact.files);
+      assertSameSchemaV20092PreProof(
+        schemaV20092PreProof as SchemaV20092WalletProof,
+        await read0092Proof("preflight", 88),
+      );
+      await assertSameCanonicalV20092OwnerProof(
+        canonicalV20092OwnerInitial as CanonicalV20092OwnerProof,
+        options.canonicalV20092OwnerProof as NonNullable<
+          SchemaOptions["canonicalV20092OwnerProof"]
+        >,
+        {
+          phase: "preflight",
+          target,
+          publicCommit: invocation.commit,
+          sourceDigest: canonicalV20092Source.digest,
+          applied: fenced.applied,
+          schemaShapeDigest: fenced.shapeDigest,
+          expectedPostApplied: canonicalV20092Source.names,
+        },
+      );
+    }
     if (wave.selector === "0088") {
       assertV2ExistingCanonicalState(fenced, sealedMigrationArtifact.files);
       await assertV2ExistingDataSnapshot({
@@ -1869,7 +2240,90 @@ export async function runD1Schema(
     let runtimeInputQuiescence: "not-required" | "installed-and-zero" = "not-required";
     let providerAcknowledgement = "reconciled-complete-without-second-apply";
     let post = fenced;
+    let canonicalV20092DispatchBinding: CanonicalV20092DispatchBinding | null = null;
     if (fencedWave.pending.length > 0) {
+      if (wave.selector === "0092") {
+        assertSameCanonicalV20092IntegrationStorageIdentity(
+          canonicalV20092IdentityInitial as CanonicalV20092IntegrationStorageIdentityProof,
+          await read0092Identity(),
+        );
+        const immediateState = await readState(
+          "mutation",
+          configPath,
+          environment,
+          run,
+          options.reader,
+        );
+        assertSamePreState(fenced, immediateState, "at the immediate 0092 migration fence");
+        assertCanonicalIntegrationV20092State(immediateState, sealedMigrationArtifact.files);
+        const immediateWalletProof = await read0092Proof("mutation", 88);
+        assertSameSchemaV20092PreProof(
+          schemaV20092PreProof as SchemaV20092WalletProof,
+          immediateWalletProof,
+        );
+        await assertSameCanonicalV20092OwnerProof(
+          canonicalV20092OwnerInitial as CanonicalV20092OwnerProof,
+          options.canonicalV20092OwnerProof as NonNullable<
+            SchemaOptions["canonicalV20092OwnerProof"]
+          >,
+          {
+            phase: "mutation",
+            target,
+            publicCommit: invocation.commit,
+            sourceDigest: canonicalV20092Source.digest,
+            applied: immediateState.applied,
+            schemaShapeDigest: immediateState.shapeDigest,
+            expectedPostApplied: canonicalV20092Source.names,
+          },
+        );
+        const importArtifact = migrationImport;
+        const identity = canonicalV20092IdentityInitial;
+        const owner = canonicalV20092OwnerInitial;
+        const productionD1 = options.productionD1;
+        if (
+          importArtifact === null ||
+          additiveCutoverPostShape === null ||
+          identity === null ||
+          owner === null ||
+          productionD1 === undefined
+        ) {
+          throw preflightError(
+            "0092 sealed import, identity or expected post schema is unavailable",
+          );
+        }
+        canonicalV20092DispatchBinding = {
+          kind: "takoserver.canonical-v2-0092-dispatch-binding@v1",
+          environment: "integration",
+          target: {
+            accountId: identity.accountId,
+            databaseId: identity.d1.databaseId,
+            databaseName: identity.d1.databaseName,
+            bucketName: identity.r2.bucketName,
+          },
+          productionD1: {
+            databaseId: productionD1.databaseId,
+            databaseName: productionD1.databaseName,
+          },
+          source: {
+            publicCommit: invocation.commit,
+            digest: canonicalV20092Source.digest,
+            files: sealedMigrationArtifact.files.map(({ name, digest }) => ({ name, digest })),
+            importDigest: importArtifact.digest,
+            importBytes: importArtifact.bytes,
+          },
+          before: {
+            applied: immediateState.applied,
+            shapeDigest: immediateState.shapeDigest,
+            wallet: immediateWalletProof,
+            retainedNativeClaimDigest: owner.retainedNativeClaimDigest,
+            dependencyProofDigest: owner.dependencyProofDigest,
+          },
+          expectedPost: {
+            applied: canonicalV20092Source.names,
+            applicationShapeDigest: `sha256:${createHash("sha256").update(additiveCutoverPostShape).digest("hex")}`,
+          },
+        };
+      }
       if (wave.selector === "0088") {
         const immediateState = await readState(
           "mutation",
@@ -2191,6 +2645,23 @@ export async function runD1Schema(
             "mutation",
           );
         }
+        if (wave.selector === "0092") {
+          artifact.assertUnchanged();
+          const binding = canonicalV20092DispatchBinding as CanonicalV20092DispatchBinding;
+          const custody = options.canonicalV20092DispatchCustody;
+          if (custody === undefined)
+            throw preflightError("0092 private dispatched custody is unavailable");
+          const receipt = await custody.persistDispatched(binding);
+          assertCanonicalV20092CustodyReceipt(
+            receipt as CanonicalV20092CustodyReceipt,
+            binding,
+            "dispatched",
+          );
+          // The private custody call crosses an async boundary after the first
+          // seal check. A changed file is a retained dispatched attempt, never
+          // permission to execute different SQL or retry with a fresh slot.
+          artifact.assertUnchanged();
+        }
         let apply: CommandResult;
         try {
           apply = await run(
@@ -2220,7 +2691,7 @@ export async function runD1Schema(
             { env: environment },
           );
         } catch (error) {
-          if (wave.selector !== "0088") throw error;
+          if (wave.selector !== "0088" && wave.selector !== "0092") throw error;
           // A transport exception is an uncertain ACK, not permission to resend.
           // The unchanged authoritative readback path below alone can settle it.
           apply = { exitCode: 1, stdout: "", stderr: "provider transport outcome unknown" };
@@ -2261,6 +2732,18 @@ export async function runD1Schema(
             );
           }
           if (remaining.length > 0) {
+            if (wave.selector === "0092") {
+              throw mutationError(
+                readback.applied.length === 88
+                  ? "0092 durable dispatched import is unresolved at exact 0088; GET-only recovery, no fresh apply"
+                  : "0092 durable dispatched import is partial; manual forward repair without replay",
+                JSON.stringify({
+                  appliedMigrations: readback.applied,
+                  schemaShapeDigest: readback.shapeDigest,
+                  providerDiagnostics: `${apply.stdout}${apply.stderr}`.trim(),
+                }),
+              );
+            }
             throw mutationError(
               "D1 migration wave partially applied; status and a retry must retain this exact selected wave and evidence",
               JSON.stringify({
@@ -2311,6 +2794,55 @@ export async function runD1Schema(
           phase: "verification",
         }),
         "verification",
+      );
+    }
+    if (wave.selector === "0092") {
+      // A provider success response is not a postcondition. Keep custody
+      // dispatched until the full selected lineage and schema read back; an
+      // unchanged 0088 state must never reach reconcilePost as terminal.
+      if (JSON.stringify(post.applied) !== JSON.stringify(canonicalV20092Source.names)) {
+        throw verificationError(
+          "0092 post-readback is not the exact complete lineage; repair forward",
+        );
+      }
+      assertCanonicalIntegrationV20092State(post, sealedMigrationArtifact.files, "verification");
+      const postWalletProof = await read0092Proof("verification", 92);
+      assertSchemaV20092PostProof(schemaV20092PreProof as SchemaV20092WalletProof, postWalletProof);
+      const binding = canonicalV20092DispatchBinding as CanonicalV20092DispatchBinding;
+      try {
+        const receipt = await (
+          options.canonicalV20092DispatchCustody as NonNullable<
+            SchemaOptions["canonicalV20092DispatchCustody"]
+          >
+        ).reconcilePost(binding, {
+          applied: post.applied,
+          shapeDigest: post.shapeDigest,
+          wallet: postWalletProof,
+        });
+        assertCanonicalV20092CustodyReceipt(
+          receipt as CanonicalV20092CustodyReceipt,
+          binding,
+          "terminal",
+        );
+      } catch {
+        throw verificationError(
+          "0092 durable dispatched attempt did not become terminal after exact readback; repair forward",
+        );
+      }
+      await assertSameCanonicalV20092OwnerProof(
+        canonicalV20092OwnerInitial as CanonicalV20092OwnerProof,
+        options.canonicalV20092OwnerProof as NonNullable<
+          SchemaOptions["canonicalV20092OwnerProof"]
+        >,
+        {
+          phase: "verification",
+          target,
+          publicCommit: invocation.commit,
+          sourceDigest: canonicalV20092Source.digest,
+          applied: post.applied,
+          schemaShapeDigest: post.shapeDigest,
+          expectedPostApplied: canonicalV20092Source.names,
+        },
       );
     }
     assertSameLegacyProductionCatchupIntegrity(
@@ -2575,7 +3107,7 @@ function selectSchemaWave(
     if (hasAvailabilityCutover) {
       if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
         throw preflightError(
-          "integration D1 cutover requires the exact audited source inventory 0001-0090",
+          "integration D1 cutover requires the exact audited source inventory 0001-0099",
         );
       }
       assertAuditedMigrationHashes(artifact.files);
@@ -2622,11 +3154,20 @@ function selectSchemaWave(
   const definition = SCHEMA_WAVES[invocation.throughMigration];
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "selected D1 wave requires the exact audited source inventory 0001-0090",
+      "selected D1 wave requires the exact audited source inventory 0001-0099",
       `from=${definition.fromMigration} through=${definition.throughMigration}`,
     );
   }
   assertAuditedMigrationHashes(artifact.files);
+  if (
+    invocation.throughMigration === "0092" &&
+    applied.length !== definition.fromCount &&
+    applied.length !== definition.throughCount
+  ) {
+    throw preflightError(
+      "0092 accepts only exact 0088 predecessor or complete 0092; partial lineage requires forward repair without replay",
+    );
+  }
   if (applied.length < definition.fromCount || applied.length > definition.throughCount) {
     throw preflightError(
       "selected D1 wave is not the exact current wave and cannot skip or replay a boundary",
@@ -2697,14 +3238,14 @@ function assertOperationGenerationMigrationHashes(
   );
 }
 
-/** Reads and validates the exact current 0001-0090 source corpus. */
+/** Reads and validates the exact current 0001-0099 source corpus. */
 export function readCurrentAuditedMigrationSourceArtifact(
   directory: string = resolve(REPOSITORY, "migrations"),
 ): ReturnType<typeof readMigrationArtifact> {
   const artifact = readMigrationArtifact(directory);
   if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "audited migration lineage must contain exactly 0001-0090",
+      "audited migration lineage must contain exactly 0001-0099",
       `actual=${JSON.stringify(artifact.names)}`,
     );
   }
@@ -2712,16 +3253,168 @@ export function readCurrentAuditedMigrationSourceArtifact(
   return artifact;
 }
 
+/** Closed, post-wave canonical integration projection; never a fresh or default apply profile. */
+export function projectCanonicalIntegrationV2MigrationArtifact0092(
+  source: MigrationArtifact,
+): MigrationArtifact {
+  if (
+    JSON.stringify(source.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE) ||
+    source.digest !== digestMigrationFiles(source.files)
+  ) {
+    throw preflightError(
+      "canonical integration 0092 requires the exact current audited source inventory",
+    );
+  }
+  assertAuditedMigrationHashes(source.files);
+  const projected = createMigrationArtifact(
+    source.files.slice(0, CANONICAL_INTEGRATION_V2_0092_COUNT),
+  );
+  if (projected.digest !== CANONICAL_INTEGRATION_V2_0092_DIGEST) {
+    throw preflightError(
+      "canonical integration 0092 source differs from the fixed reviewed digest",
+    );
+  }
+  return projected;
+}
+
+/** Pure validator for an explicitly selected post-wave applied schema readback. */
+export function canonicalIntegrationV2Schema0092Matches(
+  state: D1SchemaState,
+  source: MigrationArtifact,
+): boolean {
+  try {
+    const artifact = projectCanonicalIntegrationV2MigrationArtifact0092(source);
+    return (
+      JSON.stringify(state.applied) === JSON.stringify(artifact.names) &&
+      applicationSchemaMatches(state, deriveExpectedApplicationShape(artifact.files))
+    );
+  } catch {
+    return false;
+  }
+}
+
+function assertCanonicalIntegrationV20092State(
+  state: D1SchemaState,
+  files: readonly MigrationArtifactFile[],
+  phase: "preflight" | "verification" = "preflight",
+): void {
+  const count = state.applied.length;
+  if (
+    (count !== 88 && count !== 92) ||
+    !applicationSchemaMatches(state, deriveExpectedApplicationShape(files.slice(0, count)))
+  ) {
+    throw phase === "verification"
+      ? verificationError(
+          "0092 post-readback differs from the canonical complete schema; repair forward",
+        )
+      : preflightError(
+          "0092 requires canonical exact 0088 predecessor or complete 0092 schema shape",
+        );
+  }
+}
+
+function assertSameSchemaV20092PreProof(
+  expected: SchemaV20092WalletProof,
+  actual: SchemaV20092WalletProof,
+): void {
+  assertSchemaV20092PreProof(actual);
+  if (JSON.stringify(expected) !== JSON.stringify(actual)) {
+    throw preflightError("0092 protected wallet data changed before migration dispatch");
+  }
+}
+
+function assertSameCanonicalV20092IntegrationStorageIdentity(
+  expected: CanonicalV20092IntegrationStorageIdentityProof,
+  actual: CanonicalV20092IntegrationStorageIdentityProof,
+): void {
+  if (JSON.stringify(expected) !== JSON.stringify(actual)) {
+    throw preflightError("0092 native generated D1/R2 identity changed before migration dispatch");
+  }
+}
+
+function assertCanonicalV20092CustodyReceipt(
+  receipt: CanonicalV20092CustodyReceipt,
+  binding: CanonicalV20092DispatchBinding,
+  state: "dispatched" | "terminal",
+): void {
+  if (
+    typeof receipt !== "object" ||
+    receipt === null ||
+    receipt.kind !== "takoserver.canonical-v2-0092-custody-receipt@v1" ||
+    receipt.state !== state ||
+    receipt.bindingDigest !== canonicalV20092DispatchBindingDigest(binding) ||
+    !/^sha256:[0-9a-f]{64}$/u.test(receipt.custodyDigest)
+  ) {
+    throw state === "terminal"
+      ? verificationError(
+          "0092 durable attempt was not terminal after exact readback; repair forward",
+        )
+      : preflightError("0092 private durable dispatched custody did not bind the sealed migration");
+  }
+}
+
+async function readCanonicalV20092OwnerProof(
+  qualifier: NonNullable<SchemaOptions["canonicalV20092OwnerProof"]>,
+  input: CanonicalV20092OwnerProofInput,
+): Promise<CanonicalV20092OwnerProof> {
+  const proof = await qualifier(input);
+  if (
+    typeof proof !== "object" ||
+    proof === null ||
+    proof.kind !== "takoserver.canonical-v2-0092-owner-proof@v1" ||
+    proof.phase !== input.phase ||
+    proof.accountId !== input.target.accountId ||
+    proof.databaseId !== input.target.d1.databaseId ||
+    proof.databaseName !== input.target.d1.databaseName ||
+    proof.publicCommit !== input.publicCommit ||
+    proof.sourceDigest !== input.sourceDigest ||
+    JSON.stringify(proof.applied) !== JSON.stringify(input.applied) ||
+    proof.schemaShapeDigest !== input.schemaShapeDigest ||
+    JSON.stringify(proof.expectedPostApplied) !== JSON.stringify(input.expectedPostApplied) ||
+    !/^sha256:[0-9a-f]{64}$/u.test(proof.retainedNativeClaimDigest) ||
+    !/^sha256:[0-9a-f]{64}$/u.test(proof.dependencyProofDigest) ||
+    proof.unresolvedAttemptCount !== 0
+  ) {
+    throw input.phase === "verification"
+      ? verificationError("0092 private owner proof differs after D1 mutation; repair forward")
+      : preflightError(
+          "0092 private owner proof does not bind the exact target, source, schema and terminal attempts",
+        );
+  }
+  return proof;
+}
+
+async function assertSameCanonicalV20092OwnerProof(
+  expected: CanonicalV20092OwnerProof,
+  qualifier: NonNullable<SchemaOptions["canonicalV20092OwnerProof"]>,
+  input: CanonicalV20092OwnerProofInput,
+): Promise<void> {
+  const current = await readCanonicalV20092OwnerProof(qualifier, input);
+  if (current.retainedNativeClaimDigest !== expected.retainedNativeClaimDigest) {
+    throw input.phase === "verification"
+      ? verificationError(
+          "0092 retained native claim identity changed across mutation; repair forward",
+        )
+      : preflightError("0092 retained native claim identity changed before migration dispatch");
+  }
+  if (
+    input.applied.length === 88 &&
+    current.dependencyProofDigest !== expected.dependencyProofDigest
+  ) {
+    throw preflightError("0092 canonical dependency proof changed before migration dispatch");
+  }
+}
+
 /**
  * Explicitly projects the exact current source corpus to the existing 0001-0066
- * apply-qualified lineage. This does not grant 0067-0090 an apply wave or authority.
+ * apply-qualified lineage. This does not grant 0067-0091 an apply wave or authority.
  */
 export function projectApplyQualifiedMigrationArtifact(
   source: ReturnType<typeof readMigrationArtifact>,
 ): ReturnType<typeof readMigrationArtifact> {
   if (JSON.stringify(source.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "apply-qualified migration projection requires the exact audited source inventory 0001-0090",
+      "apply-qualified migration projection requires the exact audited source inventory 0001-0099",
       `actual=${JSON.stringify(source.names)}`,
     );
   }
@@ -2740,7 +3433,7 @@ export function projectFreshV2ArtifactMigrationArtifact(
 ): ReturnType<typeof readMigrationArtifact> {
   if (JSON.stringify(source.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "fresh v2 artifact projection requires the exact audited source inventory 0001-0090",
+      "fresh v2 artifact projection requires the exact audited source inventory 0001-0099",
       `actual=${JSON.stringify(source.names)}`,
     );
   }
@@ -2776,7 +3469,7 @@ export function projectFreshProductionMigrationArtifact(
 ): ReturnType<typeof readMigrationArtifact> {
   if (JSON.stringify(source.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "fresh production projection requires the exact audited source inventory 0001-0090",
+      "fresh production projection requires the exact audited source inventory 0001-0099",
       `actual=${JSON.stringify(source.names)}`,
     );
   }
@@ -2887,6 +3580,92 @@ export function readSealedFreshProductionV2MigrationArtifact0089(
   return artifact;
 }
 
+/** Closed staging-only 0091 profile for a new integration generation. */
+export function projectFreshIntegrationV2MigrationArtifact0091(
+  source: ReturnType<typeof readMigrationArtifact>,
+): ReturnType<typeof readMigrationArtifact> {
+  if (
+    FRESH_INTEGRATION_V2_0091_APPLY_LINEAGE.length !==
+      FRESH_INTEGRATION_V2_0091_APPLY_CEILING_COUNT ||
+    FRESH_INTEGRATION_V2_0091_APPLY_LINEAGE.at(-1) !== FRESH_INTEGRATION_V2_0091_APPLY_END ||
+    JSON.stringify(source.names.slice(0, FRESH_INTEGRATION_V2_0091_APPLY_CEILING_COUNT)) !==
+      JSON.stringify(FRESH_INTEGRATION_V2_0091_APPLY_LINEAGE)
+  ) {
+    throw preflightError(
+      "fresh integration v2-0091 projection requires the fixed audited 0001-0091 prefix",
+    );
+  }
+  const files = source.files.slice(0, FRESH_INTEGRATION_V2_0091_APPLY_CEILING_COUNT);
+  assertAuditedMigrationHashes(files, FRESH_INTEGRATION_V2_0091_APPLY_CEILING_COUNT);
+  const artifact = createMigrationArtifact(files);
+  if (artifact.digest !== FRESH_INTEGRATION_V2_0091_APPLY_DIGEST) {
+    throw preflightError("fresh integration v2-0091 payload differs from its fixed digest");
+  }
+  return artifact;
+}
+
+/** A sealed v2-0091 import contains exactly 91 files, never a future tail. */
+export function readSealedFreshIntegrationV2MigrationArtifact0091(
+  directory: string,
+): ReturnType<typeof readMigrationArtifact> {
+  const artifact = readMigrationArtifact(directory);
+  if (
+    JSON.stringify(artifact.names) !== JSON.stringify(FRESH_INTEGRATION_V2_0091_APPLY_LINEAGE) ||
+    artifact.names.length !== FRESH_INTEGRATION_V2_0091_APPLY_CEILING_COUNT ||
+    artifact.names.at(-1) !== FRESH_INTEGRATION_V2_0091_APPLY_END
+  ) {
+    throw preflightError("sealed fresh integration v2-0091 lineage must contain exactly 0001-0091");
+  }
+  assertAuditedMigrationHashes(artifact.files, FRESH_INTEGRATION_V2_0091_APPLY_CEILING_COUNT);
+  if (artifact.digest !== FRESH_INTEGRATION_V2_0091_APPLY_DIGEST) {
+    throw preflightError("sealed fresh integration v2-0091 payload differs from its fixed digest");
+  }
+  return artifact;
+}
+
+/** Closed staging-only 0092 profile for a new integration generation. */
+export function projectFreshIntegrationV2MigrationArtifact0092(
+  source: ReturnType<typeof readMigrationArtifact>,
+): ReturnType<typeof readMigrationArtifact> {
+  if (
+    FRESH_INTEGRATION_V2_0092_APPLY_LINEAGE.length !==
+      FRESH_INTEGRATION_V2_0092_APPLY_CEILING_COUNT ||
+    FRESH_INTEGRATION_V2_0092_APPLY_LINEAGE.at(-1) !== FRESH_INTEGRATION_V2_0092_APPLY_END ||
+    JSON.stringify(source.names.slice(0, FRESH_INTEGRATION_V2_0092_APPLY_CEILING_COUNT)) !==
+      JSON.stringify(FRESH_INTEGRATION_V2_0092_APPLY_LINEAGE)
+  ) {
+    throw preflightError(
+      "fresh integration v2-0092 projection requires the fixed audited 0001-0092 prefix",
+    );
+  }
+  const files = source.files.slice(0, FRESH_INTEGRATION_V2_0092_APPLY_CEILING_COUNT);
+  assertAuditedMigrationHashes(files, FRESH_INTEGRATION_V2_0092_APPLY_CEILING_COUNT);
+  const artifact = createMigrationArtifact(files);
+  if (artifact.digest !== FRESH_INTEGRATION_V2_0092_APPLY_DIGEST) {
+    throw preflightError("fresh integration v2-0092 payload differs from its fixed digest");
+  }
+  return artifact;
+}
+
+/** A sealed v2-0092 import contains exactly 92 files, never a future tail. */
+export function readSealedFreshIntegrationV2MigrationArtifact0092(
+  directory: string,
+): ReturnType<typeof readMigrationArtifact> {
+  const artifact = readMigrationArtifact(directory);
+  if (
+    JSON.stringify(artifact.names) !== JSON.stringify(FRESH_INTEGRATION_V2_0092_APPLY_LINEAGE) ||
+    artifact.names.length !== FRESH_INTEGRATION_V2_0092_APPLY_CEILING_COUNT ||
+    artifact.names.at(-1) !== FRESH_INTEGRATION_V2_0092_APPLY_END
+  ) {
+    throw preflightError("sealed fresh integration v2-0092 lineage must contain exactly 0001-0092");
+  }
+  assertAuditedMigrationHashes(artifact.files, FRESH_INTEGRATION_V2_0092_APPLY_CEILING_COUNT);
+  if (artifact.digest !== FRESH_INTEGRATION_V2_0092_APPLY_DIGEST) {
+    throw preflightError("sealed fresh integration v2-0092 payload differs from its fixed digest");
+  }
+  return artifact;
+}
+
 /** Reads an explicitly sealed 0001-0066 payload; a 0067 file is refused. */
 export function readSealedApplyQualifiedMigrationArtifact(
   directory: string,
@@ -2921,7 +3700,7 @@ export function readAuditedMigrationArtifact(
 
 /**
  * Reads the frozen 0001-0060 operation-generation corpus. This boundary is
- * intentionally separate from the current 0001-0090 source inventory: the
+ * intentionally separate from the current 0001-0099 source inventory: the
  * operation-generation cutover is historical evidence, not a claim about the
  * current migration tail.
  */
@@ -3337,7 +4116,7 @@ function inspectManagedQueueRetirementCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "managed Queue retirement cutover requires the exact audited source inventory 0001-0090",
+      "managed Queue retirement cutover requires the exact audited source inventory 0001-0099",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);
@@ -3377,7 +4156,7 @@ function inspectManagedActorOwnerCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "Actor owner claim cutover requires the exact audited source inventory 0001-0090",
+      "Actor owner claim cutover requires the exact audited source inventory 0001-0099",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);
@@ -3418,7 +4197,7 @@ function inspectRuntimeInputLeaseGenerationCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "runtime-input lease generation cutover requires the exact audited source inventory 0001-0089",
+      "runtime-input lease generation cutover requires the exact audited source inventory 0001-0099",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);
@@ -3460,7 +4239,7 @@ function inspectActorKvCapabilityCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "Actor KV capability claim cutover requires the exact audited source inventory 0001-0089",
+      "Actor KV capability claim cutover requires the exact audited source inventory 0001-0099",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);
@@ -3537,7 +4316,7 @@ async function inspectApplyProviderSelectionCutover(input: {
     }
     if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
       throw preflightError(
-        "accepted-authority cutover requires the exact audited source inventory 0001-0089",
+        "accepted-authority cutover requires the exact audited source inventory 0001-0099",
       );
     }
     assertAuditedMigrationHashes(input.artifact.files);
@@ -3579,7 +4358,7 @@ async function inspectApplyProviderSelectionCutover(input: {
   }
   if (JSON.stringify(input.artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
     throw preflightError(
-      "operation-generation cutover requires the exact audited source inventory 0001-0089",
+      "operation-generation cutover requires the exact audited source inventory 0001-0099",
     );
   }
   assertAuditedMigrationHashes(input.artifact.files);

@@ -1,4 +1,13 @@
 import { MIGRATIONS } from "./db-schema.ts";
+import {
+  hasImmutableStripeModeRealmSchema,
+  parseStripeMode,
+  STRIPE_MODE_REALM_SCHEMA_QUERY,
+  STRIPE_REALM_FINANCIAL_HISTORY_QUERY,
+  type StripeMode,
+  StripeModeRealmError,
+  stripeRealmFinancialHistoryTables,
+} from "./stripe-mode-realm.ts";
 
 /**
  * Bringing a local database up to the schema this build expects.
@@ -9,10 +18,12 @@ import { MIGRATIONS } from "./db-schema.ts";
  * in tests. That is the difference between software somebody can run and
  * software that runs here.
  *
- * Forward only, and recorded. Existing databases keep one transaction per
- * migration as a recovery checkpoint. A truly fresh database applies the
- * complete schema and ledger in one transaction, so a failed first boot
- * returns to an empty database rather than an arbitrary partial prefix.
+ * Forward only, and recorded. General callers keep one transaction per
+ * existing-database migration as a recovery checkpoint. Bun financial startup
+ * instead selects a Stripe mode and seals all pending migrations plus its
+ * realm claim in one write transaction; a refused 0098 upgrade cannot strand
+ * an older binary behind a recorded migration. A truly fresh database also
+ * applies the complete schema and ledger in one transaction.
  *
  * A file carrying a migration this build has never heard of is refused rather
  * than repaired. It came from a newer build, and the safe thing to do with a
@@ -35,6 +46,8 @@ export interface MigrationReport {
 }
 
 export interface MigrationOptions {
+  /** Financial serving pins this mode in the same write transaction as migration. */
+  readonly stripeMode?: StripeMode;
   /**
    * The installation this database belongs to, named in a refusal so the
    * operator can tell which files were refused. In-memory callers omit it.
@@ -60,6 +73,63 @@ const V1_RELEASE_LAST_MIGRATION = "0015_takoform_resource_relations.sql";
  * earlier migration has written, and says why.
  */
 const WALLET_CREDIT_LOTS_MIGRATION = "0017_wallet_credit_lots.sql";
+
+const WALLET_USD_MICROS_MIGRATION = "0094_wallet_usd_micros.sql";
+
+/** Existing money requires a separately reviewed, stopped-writer cutover. */
+export class MoneyUnitCutoverRequiredError extends Error {
+  constructor() {
+    super(
+      "Existing billing history requires an independently qualified 0093 classification preparation " +
+        "and 0094 USD-micros cutover. Automatic startup migration is refused before any write. " +
+        "Keep the cents artifact stopped during that owner procedure; do not reset balances, " +
+        "seed an unqualified 0092 schema, or bypass this guard. See docs/org-billing-micros.md.",
+    );
+    this.name = "MoneyUnitCutoverRequiredError";
+  }
+}
+
+function moneyCutoverAlreadyApplied(database: MigratableDatabase): boolean {
+  return (
+    hasTable(database, "applied_migrations") &&
+    (database.query("SELECT name FROM applied_migrations").all() as { name: string }[]).some(
+      (row) => row.name === WALLET_USD_MICROS_MIGRATION,
+    )
+  );
+}
+
+function refuseAutomaticMoneyCutover(database: MigratableDatabase): void {
+  if (moneyCutoverAlreadyApplied(database)) return;
+  // A partial predecessor may not have these tables yet. Schema history alone
+  // is not money history, and never permits a populated cents wallet to pass.
+  for (const table of [
+    "ledger",
+    "wallet_credit_lots",
+    "wallet_credit_allocations",
+    "org_wallet_holds",
+    "org_wallet_usage_records",
+    "org_wallet_grant_snapshots",
+    "org_wallet_monthly_tariffs",
+    "usage_events",
+    "stripe_events",
+    "reseller_settlement_intents",
+    "reservations",
+    "quotes",
+    "usage_statements",
+    "wallet_credit_lot_classification_proofs",
+  ]) {
+    if (
+      hasTable(database, table) &&
+      database.query(`SELECT 1 FROM ${table} LIMIT 1`).all().length > 0
+    )
+      throw new MoneyUnitCutoverRequiredError();
+  }
+  if (
+    hasTable(database, "idempotency") &&
+    database.query("SELECT 1 FROM idempotency WHERE scope_key LIKE 'ai:%' LIMIT 1").all().length > 0
+  )
+    throw new MoneyUnitCutoverRequiredError();
+}
 
 /** The v1 state that identifies a control database as a used installation. */
 export interface UsedV1Installation {
@@ -117,6 +187,9 @@ export function migrateSqlite(
   database: MigratableDatabase,
   options: MigrationOptions = {},
 ): MigrationReport {
+  if (options.stripeMode !== undefined) {
+    return migrateWithStripeRealm(database, parseStripeMode(options.stripeMode), options);
+  }
   // Avoid taking a write lock on the normal existing-database startup path.
   // If this read suggests a fresh file, repeat the proof after acquiring the
   // lock below so concurrent starters cannot rely on stale schema state.
@@ -144,6 +217,142 @@ export function migrateSqlite(
   return bootstrapFreshDatabase(database);
 }
 
+/**
+ * Bun financial startup is one migration writer and one SQLite write boundary.
+ * The missing-pin/history proof precedes all schema changes, repeats under the
+ * write lock, and stays protected until the final migration and pin commit.
+ * A refused 0098 upgrade therefore leaves a 0097 binary's schema and ledger
+ * untouched. Old one-off writers still require external quiescence.
+ */
+function migrateWithStripeRealm(
+  database: MigratableDatabase,
+  mode: StripeMode,
+  options: MigrationOptions,
+): MigrationReport {
+  refuseUsedV1Installation(database, options);
+  refuseAutomaticMoneyCutover(database);
+  const pinnedBefore = inspectStripeRealmPrecondition(database, mode);
+  const alreadyBefore = readAppliedMigrationNames(database);
+  assertKnownMigrationPrefix(alreadyBefore);
+  if (pinnedBefore && alreadyBefore.length === MIGRATIONS.length) {
+    return { applied: [], alreadyApplied: alreadyBefore.length };
+  }
+
+  database.exec("BEGIN IMMEDIATE");
+  let currentMigration = "Stripe realm preflight";
+  try {
+    refuseUsedV1Installation(database, options);
+    refuseAutomaticMoneyCutover(database);
+    inspectStripeRealmPrecondition(database, mode);
+    const alreadyNames = readAppliedMigrationNames(database);
+    assertKnownMigrationPrefix(alreadyNames);
+    const hasRealmMigration = alreadyNames.includes("0098_stripe_mode_realm.sql");
+    if (hasRealmMigration !== hasTable(database, "stripe_mode_realm")) {
+      throw new StripeModeRealmError(
+        "unsafe_schema",
+        "Stripe mode realm schema and recorded migration disagree",
+      );
+    }
+    const already = new Set(alreadyNames);
+    createMigrationLedger(database);
+    const applied: string[] = [];
+    for (const migration of MIGRATIONS) {
+      if (already.has(migration.name)) continue;
+      currentMigration = migration.name;
+      if (
+        migration.name === "0093_wallet_credit_classification_proofs.sql" ||
+        migration.name === WALLET_USD_MICROS_MIGRATION
+      ) {
+        refuseAutomaticMoneyCutover(database);
+      }
+      executeStatements(database, migration.sql);
+      recordMigration(database, migration.name);
+      applied.push(migration.name);
+    }
+    currentMigration = "Stripe realm claim";
+    if (!inspectStripeRealmPrecondition(database, mode)) {
+      // The selected mode is an enum checked before opening the DB. The lock
+      // spans the history check and this one claim, so a competing writer
+      // cannot introduce unclassified money in between.
+      database.exec(
+        `INSERT INTO stripe_mode_realm (singleton, mode, pinned_at) VALUES (1, '${mode}', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
+      );
+    }
+    inspectStripeRealmPrecondition(database, mode);
+    database.exec("COMMIT");
+    return { applied, alreadyApplied: alreadyNames.length };
+  } catch (error) {
+    rollbackQuietly(database);
+    if (
+      error instanceof StripeModeRealmError ||
+      error instanceof UsedV1InstallationError ||
+      error instanceof MoneyUnitCutoverRequiredError
+    ) {
+      throw error;
+    }
+    throw new Error(`migration ${currentMigration} failed: ${String(error)}`);
+  }
+}
+
+function readAppliedMigrationNames(database: MigratableDatabase): readonly string[] {
+  if (!hasTable(database, "applied_migrations")) return [];
+  return (
+    database.query("SELECT name FROM applied_migrations ORDER BY rowid").all() as {
+      name: string;
+    }[]
+  ).map((row) => row.name);
+}
+
+function assertKnownMigrationPrefix(names: readonly string[]): void {
+  for (const [index, name] of names.entries()) {
+    if (MIGRATIONS[index]?.name !== name) {
+      throw new Error(
+        `this database has an unknown or non-prefix migration ${name}; upgrade from its owning build`,
+      );
+    }
+  }
+}
+
+function inspectStripeRealmPrecondition(database: MigratableDatabase, mode: StripeMode): boolean {
+  if (hasTable(database, "stripe_mode_realm")) {
+    if (
+      !hasImmutableStripeModeRealmSchema(
+        database.query(STRIPE_MODE_REALM_SCHEMA_QUERY).all() as {
+          type: unknown;
+          name: unknown;
+          sql: unknown;
+        }[],
+      )
+    ) {
+      throw new StripeModeRealmError("unsafe_schema", "Stripe realm immutability is unavailable");
+    }
+    const rows = database.query("SELECT mode FROM stripe_mode_realm WHERE singleton = 1").all() as {
+      mode: string;
+    }[];
+    if (rows.length > 0) {
+      if (rows[0]?.mode !== mode) {
+        throw new StripeModeRealmError(
+          "mode_mismatch",
+          `Stripe mode realm is not pinned to '${mode}'`,
+        );
+      }
+      return true;
+    }
+  }
+  const tables = stripeRealmFinancialHistoryTables(
+    database.query(STRIPE_REALM_FINANCIAL_HISTORY_QUERY).all() as { name: unknown }[],
+  );
+  for (const table of tables) {
+    if (database.query(`SELECT 1 FROM ${table} LIMIT 1`).all().length > 0) {
+      throw new StripeModeRealmError(
+        "legacy_history",
+        "Cannot pin Stripe mode because existing wallet, money, or Stripe history has no realm",
+      );
+    }
+  }
+  return false;
+}
+
 function hasEmptySchemaAndZeroHeaderMetadata(database: MigratableDatabase): boolean {
   const schemaObjects = database.query("SELECT 1 FROM sqlite_schema LIMIT 1").all();
   const userVersion = database.query("PRAGMA user_version").all() as {
@@ -166,10 +375,25 @@ function migrateExistingDatabase(
   // Reads only, and first: a used v1 installation is refused while the file is
   // still byte-for-byte what v1.0.0 wrote.
   refuseUsedV1Installation(database, options);
+  refuseAutomaticMoneyCutover(database);
 
   // Existing, partial, and otherwise non-empty databases retain the historic
   // per-migration checkpoint behavior.
-  createMigrationLedger(database);
+  // The already-qualified micros restart stays read-only, including without
+  // a write lock. Before the cutover, acquire the lock and repeat the money
+  // history proof before even creating the checkpoint table.
+  if (!moneyCutoverAlreadyApplied(database)) {
+    database.exec("BEGIN IMMEDIATE");
+    try {
+      refuseUsedV1Installation(database, options);
+      refuseAutomaticMoneyCutover(database);
+      createMigrationLedger(database);
+      database.exec("COMMIT");
+    } catch (error) {
+      rollbackQuietly(database);
+      throw error;
+    }
+  }
 
   const rows = database.query("SELECT name FROM applied_migrations").all() as {
     name: string;
@@ -196,13 +420,25 @@ function migrateExistingDatabase(
       // a v1 write that landed in between is refused, not migrated over. Once
       // that migration commits, the file is no longer what v1.0.0 wrote; a v1
       // writer still running after it is outside the stopped-writers premise.
-      if (applied.length === 0) refuseUsedV1Installation(database, options);
+      if (applied.length === 0) {
+        refuseUsedV1Installation(database, options);
+        refuseAutomaticMoneyCutover(database);
+      }
+      if (
+        migration.name === "0093_wallet_credit_classification_proofs.sql" ||
+        migration.name === WALLET_USD_MICROS_MIGRATION
+      )
+        refuseAutomaticMoneyCutover(database);
       executeStatements(database, migration.sql);
       recordMigration(database, migration.name);
       database.exec("COMMIT");
     } catch (error) {
       database.exec("ROLLBACK");
-      if (error instanceof UsedV1InstallationError) throw error;
+      if (
+        error instanceof UsedV1InstallationError ||
+        error instanceof MoneyUnitCutoverRequiredError
+      )
+        throw error;
       throw new Error(`migration ${migration.name} failed: ${String(error)}`);
     }
     applied.push(migration.name);

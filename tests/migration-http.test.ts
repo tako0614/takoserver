@@ -277,7 +277,12 @@ test("the migration API binds reservation, transfer, cutover, and capture", asyn
     undefined,
     bearer,
   );
-  expect(wallet.body.wallet).toMatchObject({ settledMinor: 9_300, heldMinor: 0 });
+  expect(wallet.body.wallet).toMatchObject({
+    settledMicros: "93000000",
+    heldMicros: "0",
+    unit: "USD-micros",
+    moneyPolicy: "usd-micros-v2",
+  });
   const listed = (await request(app.fetch, "GET", path, undefined, bearer)).body.migrations as {
     id: string;
     state: string;
