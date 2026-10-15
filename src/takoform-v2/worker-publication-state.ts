@@ -2721,7 +2721,8 @@ function createPublicationState(options: PublicationStateOptions, forwardFamily:
   ): Promise<V2WorkerPublicationResolution> {
     const initial = await capture(input);
     if (initial.kind === "unresolved") return initial;
-    if (input.forward) {
+    const verifyHeld = forwardFamily || input.forward === true;
+    if (verifyHeld) {
       const current = async () => {
         const latest = await capture(input);
         return latest.kind === "ready" && latest.vector === initial.vector;
@@ -2749,9 +2750,9 @@ function createPublicationState(options: PublicationStateOptions, forwardFamily:
           const latest = await capture(input);
           return latest.kind === "ready" && latest.vector === initial.vector;
         };
-        if (!input.forward) return graphCurrent();
+        if (!verifyHeld) return graphCurrent();
         if (!(await graphCurrent())) return false;
-        if (input.forward) {
+        if (verifyHeld) {
           try {
             for (const target of initial.materials.values())
               await readMaterialsTargets(
