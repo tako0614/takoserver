@@ -923,7 +923,7 @@ test("recovery reader rejects an aggregate in one family and an empty other quer
  */
 async function actualNftFixture() {
   return (await Bun.file(
-    new URL("./fixtures/container-egress/nft-1.0.9-native-r3.json", import.meta.url),
+    new URL("./fixtures/linux-container-egress/nft-1.0.9-native-r3.json", import.meta.url),
   ).json()) as {
     input: LinuxContainerEgressInput;
     inet: { nftables: Record<string, unknown>[] };
