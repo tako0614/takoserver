@@ -145,7 +145,7 @@ test("0058 interrupted receipt rebuild rolls back with exact ciphertext and line
   expect(() =>
     migrateSqlite({
       exec(sql) {
-        if (sql.startsWith("INSERT INTO cloudflare_managed_worker_receipts SELECT")) {
+        if (sql.trimStart().startsWith("INSERT INTO cloudflare_managed_worker_receipts SELECT")) {
           throw new Error("injected rebuild interruption");
         }
         return database.exec(sql);
