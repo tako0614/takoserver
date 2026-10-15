@@ -12,7 +12,6 @@ describe("Takoserver public site", () => {
     expect(html).toContain("Each key keeps its own read and write permissions.");
     expect(html).toContain("Create, read, update and delete through Host API v2.");
     expect(html).toContain("https://api.takoserver.example/.well-known/takoform/v2");
-    expect(html).toContain("Host API v2 — operator setup");
     expect(html).toContain("https://github.com/tako0614/takoserver");
     expect(html).toContain("Takoform Hostを、自分の基盤で動かす。");
     expect(html).toContain("コンソールを開く");
@@ -54,6 +53,50 @@ describe("Takoserver public site", () => {
         expect(html).toContain(`<code>${apiOrigin}${endpoint}</code>`);
       }
     }
+  });
+
+  test("starts a visitor on this Host or on their own", () => {
+    const html = landingHtml({
+      consoleOrigin: "https://console.takoserver.example",
+      apiOrigin: "https://api.takoserver.example",
+    });
+    expect(html).toContain('<section class="start" id="start" aria-labelledby="start-title">');
+    expect(html).toContain(
+      '<a href="https://console.takoserver.example" data-i18n="useStep1">Sign in to the console</a>',
+    );
+    expect(html).toContain("<code>resources:read</code><code>resources:write</code>");
+    expect(html).toContain(
+      "curl -sG https://api.takoserver.example/apis/forms.takoform.com/v2/support \\\n" +
+        '  --data-urlencode "form=&lt;Form URL&gt;" \\\n' +
+        '  -H "authorization: Bearer $KEY"',
+    );
+    expect(html).toContain("bun install --frozen-lockfile");
+    expect(html).toContain("<code>TAKOSERVER_TAKOFORM_V2_CURSOR_KEY</code>");
+    expect(html).toContain("bun src/entry-bun.ts");
+    expect(html).toContain(
+      "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#first-install-and-first-use",
+    );
+    expect(html.indexOf('id="start"')).toBeLessThan(html.indexOf('data-i18n="products"'));
+  });
+
+  test("offers only the self-host lane where there is no console", () => {
+    const html = landingHtml({ consoleOrigin: null, apiOrigin: "https://api.takoserver.example" });
+    expect(html).not.toContain('data-i18n="useTitle"');
+    expect(html).toContain('data-i18n="ownTitle"');
+  });
+
+  test("names a pasteable origin in commands on the API's own root", () => {
+    const html = landingHtml({
+      consoleOrigin: "https://console.takoserver.example",
+      apiOrigin: null,
+    });
+    expect(html).toContain("curl <span data-origin>$HOST</span>/.well-known/takoform/v2");
+    expect(html).toContain(
+      'if(!localizedPaths)for(const node of document.querySelectorAll("[data-origin]"))node.textContent=location.origin;',
+    );
+    const site = landingHtml({ consoleOrigin: null, apiOrigin: "https://api.takoserver.example" });
+    expect(site).not.toContain("data-origin>");
+    expect(site).toContain("curl https://api.takoserver.example/.well-known/takoform/v2");
   });
 
   test("does not invent locale paths on the API-origin landing page", () => {
