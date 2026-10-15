@@ -1062,25 +1062,34 @@ export const DEPLOY_CONTRACT = {
         "CLOUDFLARE_API_TOKEN",
         "TAKOSERVER_INDEPENDENT_REVIEW",
         "TAKOSERVER_DEPLOY_TARGET_PRODUCTION",
+        "TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH",
       ],
       triggers: ["irreversible", "authority"],
       obligations: {
         provenance:
           `${exactSource} Integration only. One explicit --generation=<32-lowercase-hex> derives ` +
-          "both new resource names as integration-takoserver-<generation>. The scoped migration gate runs once; " +
+          "both new resource names as integration-takoserver-<generation> by default. The optional " +
+          "TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH selects only the existing integration-ts " +
+          "original fresh92 creator using bounded protected custody locators and the exact six-field invocation; " +
+          "it derives integration-ts-<generation> names and never reads or forwards the production target. " +
+          "The scoped migration gate runs once; " +
           "the default fixed audited 0001-0066 names and bytes, or one explicit fixed " +
           "--fresh-lineage=v2-artifacts-0075, v2-0088, v2-0089, v2-0091 or v2-0092 payload (v2-0088/v2-0089 are the " +
           "same fixed-digest payloads as the production fresh-init profiles; v2-0091 (through the Stripe event table) and v2-0092 (through the Organization wallet lifecycle tables) are " +
           "staging-only and no production surface accepts them), are sealed before creation. A separately " +
           "digested import file preserves every migration byte and adds only Wrangler's migration-ledger DDL and inserts. " +
-          "Every newly created D1 must be integration-takoserver-<generation> and never production-named; when " +
+          "Every newly created D1 must have its selected integration-prefixed name and never be production-named; in default mode, when " +
           "TAKOSERVER_DEPLOY_TARGET_PRODUCTION is set its exact D1 name and id are refused before creation and again once the new id " +
-          "is known, and applying v2-0091 or v2-0092 requires that production target.",
+          "is known, and applying v2-0091 or v2-0092 requires that production target. " +
+          "Original fresh92 mode instead retains the independently provisioned custody root device/inode pin, " +
+          "original incumbent collision identities and the existing source/review/native readback fences; no supplied receipt or ready flag is accepted.",
         "post-conditions":
           "The invocation creates one D1 database, proves it empty, applies and reads back the exact " +
           "selected 0001-0066, 0001-0075, 0001-0088, 0001-0089, 0001-0091 or 0001-0092 lineage and canonical schema after one Wrangler file import " +
           "(v2-0088/v2-0089/v2-0091/v2-0092 also read back the exact empty seeded data and ledger count), then creates and reads back one new R2 bucket. " +
-          "Status and apply record which production D1 identity the guard compared. " +
+          "Default status and apply record which production D1 identity the guard compared. " +
+          "Original fresh92 apply retains its existing dispatch/ACK/import/R2/terminal chain; its originalCreate " +
+          "result requires independent origin review, and status is diagnostic-only, never original creation evidence or money/normal Worker readiness. " +
           "It emits a nonsecret candidate storage projection, not an adopted target. No Worker, " +
           "route, namespace, secret or current target is changed.",
         reversal:
@@ -1093,7 +1102,10 @@ export const DEPLOY_CONTRACT = {
           "readback for separate owner review but cannot re-import, adopt or repair it. " +
           "A selected exact legacy takoserver-i-<generation> pair remains readable by status; " +
           "same-generation legacy apply is refused before credentials or provider access, " +
-          "and both create fences require the new integration-prefixed pair." +
+          "and both create fences require the new integration-prefixed pair. " +
+          "The optional original-create locator file is owned single-link 0600, bounded to 16 KiB under an existing " +
+          "canonical owned 0700 root outside every checkout; unsupported selectors refuse before target or provider access. " +
+          "Original mode retains uncertain custody without retry, adoption or automatic repinning; --contract opens no input." +
           inputContract(applyReviewInput),
         "pre-mutation-proof":
           "Both derived names must be absent at inspection and at the creation fence. The new D1 " +

@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import {
   chmodSync,
   cpSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -27,6 +28,7 @@ import {
   type IntegrationStorageR2Bucket,
   type IntegrationStorageTargetReadProvider,
   integrationStorageGenerationName,
+  loadIntegrationStorageOriginalCreateInput,
   runIntegrationStorageGeneration,
   verifyFreshV2ArtifactIntegrationStorageTarget,
   verifyFreshV2IntegrationStorageTarget,
@@ -1909,6 +1911,143 @@ function originalCreationFixture() {
   };
 }
 
+function originalCreateInputFixture() {
+  const root = mkdtempSync(join(fixtureRoot, "original-input-"));
+  const custodyDirectory = mkdtempSync(join(fixtureRoot, "input-custody-"));
+  const stat = lstatSync(custodyDirectory, { bigint: true });
+  const locators = {
+    kind: "positive-fresh-0092",
+    custodyDirectory,
+    custodyIdentity: { device: String(stat.dev), inode: String(stat.ino) },
+  } as const;
+  const path = join(root, "input.json");
+  writeFileSync(path, JSON.stringify(locators), { mode: 0o600 });
+  return { root, path, locators };
+}
+
+describe("original-create locator input", () => {
+  test("captures only frozen locators and accepts the exact 16 KiB boundary", () => {
+    const f = originalCreateInputFixture();
+    const json = JSON.stringify(f.locators);
+    writeFileSync(f.path, json.padEnd(16 * 1024, " "));
+    const loaded = loadIntegrationStorageOriginalCreateInput(f.path);
+    expect(loaded).toEqual(f.locators);
+    expect(Object.isFrozen(loaded)).toBe(true);
+    expect(Object.isFrozen(loaded.custodyIdentity)).toBe(true);
+    expect(readdirSync(f.locators.custodyDirectory)).toEqual([]);
+    writeFileSync(f.path, json.padEnd(16 * 1024 + 1, " "));
+    expect(() => loadIntegrationStorageOriginalCreateInput(f.path)).toThrow("16 KiB");
+  });
+
+  test("refuses claimed evidence, unknown fields, malformed UTF-8 and a changed provisioning pin", () => {
+    const f = originalCreateInputFixture();
+    for (const value of [
+      null,
+      [],
+      { ...f.locators, kind: "ready" },
+      ...[
+        "ready",
+        "authority",
+        "qualification",
+        "grants",
+        "databaseId",
+        "proof",
+        "terminalCustodyDigest",
+      ].map((key) => ({ ...f.locators, [key]: true })),
+      { ...f.locators, custodyIdentity: { ...f.locators.custodyIdentity, extra: true } },
+      { ...f.locators, custodyIdentity: { ...f.locators.custodyIdentity, inode: "0" } },
+      { ...f.locators, custodyIdentity: { ...f.locators.custodyIdentity, device: "01" } },
+    ]) {
+      writeFileSync(f.path, JSON.stringify(value));
+      expect(() => loadIntegrationStorageOriginalCreateInput(f.path)).toThrow(
+        "pinned custody locators",
+      );
+    }
+    writeFileSync(f.path, Buffer.from([0x22, 0xc3, 0x28, 0x22]));
+    expect(() => loadIntegrationStorageOriginalCreateInput(f.path)).toThrow(
+      "pinned custody locators",
+    );
+    writeFileSync(f.path, JSON.stringify(f.locators));
+    renameSync(f.locators.custodyDirectory, `${f.locators.custodyDirectory}.original`);
+    mkdirSync(f.locators.custodyDirectory, { mode: 0o700 });
+    expect(() => loadIntegrationStorageOriginalCreateInput(f.path)).toThrow("do not repin");
+  });
+
+  test("refuses unsafe file, parent, link and noncanonical path identities", () => {
+    const f = originalCreateInputFixture();
+    chmodSync(f.path, 0o644);
+    expect(() => loadIntegrationStorageOriginalCreateInput(f.path)).toThrow("0600");
+    chmodSync(f.path, 0o600);
+    chmodSync(f.root, 0o755);
+    expect(() => loadIntegrationStorageOriginalCreateInput(f.path)).toThrow("0700");
+    chmodSync(f.root, 0o700);
+    for (const path of ["relative.json", `${f.root}/../${f.root.split("/").at(-1)}/input.json`]) {
+      expect(() => loadIntegrationStorageOriginalCreateInput(path)).toThrow(
+        "pinned custody locators",
+      );
+    }
+    const alias = join(f.root, "alias.json");
+    symlinkSync(f.path, alias);
+    expect(() => loadIntegrationStorageOriginalCreateInput(alias)).toThrow("single-link");
+    linkSync(f.path, join(f.root, "hardlink.json"));
+    expect(() => loadIntegrationStorageOriginalCreateInput(f.path)).toThrow("single-link");
+  });
+
+  test("loaded locators enter the same six-field creator and retain one-effect component provenance", async () => {
+    const f = originalCreationFixture();
+    const input = originalCreateInputFixture();
+    writeFileSync(input.path, JSON.stringify(f.options.originalCreate));
+    const originalCreate = loadIntegrationStorageOriginalCreateInput(input.path);
+    const selected: IntegrationStorageGenerationInvocation = {
+      action: f.invocation.action,
+      environment: "integration",
+      commit: f.invocation.commit,
+      generation: f.invocation.generation,
+      namespace: "integration-ts",
+      freshLineage: "v2-0092",
+    };
+    const options = { ...f.options, originalCreate };
+    const result = await runIntegrationStorageGeneration(selected, f.selected, options);
+    expect(result.originalCreate).toMatchObject({
+      kind: "takoserver.integration-fresh-0092-component-result@v1",
+      authority: "component-simulation",
+    });
+    expect(result.productionD1Guard).toBeUndefined();
+    expect(f.imports()).toBe(1);
+    expect(f.calls.filter((call) => call.startsWith("createD1:"))).toHaveLength(1);
+    expect(f.calls.filter((call) => call.startsWith("createR2:"))).toHaveLength(1);
+    await expect(runIntegrationStorageGeneration(selected, f.selected, options)).rejects.toThrow(
+      "prior or uncertain custody",
+    );
+    expect(f.calls.filter((call) => call.startsWith("createD1:"))).toHaveLength(1);
+    expect(f.imports()).toBe(1);
+  });
+
+  test("loaded locators preserve lost-ACK UNKNOWN and cannot retry or mint a terminal result", async () => {
+    const f = originalCreationFixture();
+    const input = originalCreateInputFixture();
+    writeFileSync(input.path, JSON.stringify(f.options.originalCreate));
+    const originalCreate = loadIntegrationStorageOriginalCreateInput(input.path);
+    let creates = 0;
+    f.provider.createD1 = async () => {
+      creates += 1;
+      throw new Error("simulated lost original ACK");
+    };
+    const options = { ...f.options, originalCreate };
+    await expect(
+      runIntegrationStorageGeneration(f.invocation, f.selected, options),
+    ).rejects.toThrow();
+    expect(f.records().some((row) => row.value.stage === "unknown")).toBe(true);
+    expect(f.records().some((row) => row.value.stage === "terminal")).toBe(false);
+    await expect(
+      runIntegrationStorageGeneration(f.invocation, f.selected, options),
+    ).rejects.toThrow("prior or uncertain custody");
+    expect(creates).toBe(1);
+    expect(f.imports()).toBe(0);
+    expect(f.calls.some((call) => call.startsWith("createR2:"))).toBe(false);
+  });
+});
+
 describe("original integration-ts fresh0092 creator", () => {
   test("namespace is closed and the default formatter uses the fresh integration prefix", () => {
     expect(integrationStorageGenerationName(GENERATION)).toBe(GENERATED_NAME);
@@ -2787,6 +2926,8 @@ interface BoundedCustodyProbeResult {
 /** Isolated instrumentation changes real local files; it does not simulate a native race. */
 async function boundedCustodyProbe(mode: string): Promise<BoundedCustodyProbeResult> {
   const f = originalCreationFixture();
+  const inputOnly = mode.startsWith("input-");
+  const operation = inputOnly ? mode.slice("input-".length) : mode;
   const moduleUrl = new URL("../scripts/deploy/integration-storage-generation.ts", import.meta.url)
     .href;
   const stem = `integration-create-${createHash("sha256")
@@ -2798,13 +2939,17 @@ async function boundedCustodyProbe(mode: string): Promise<BoundedCustodyProbeRes
       }),
     )
     .digest("hex")}`;
-  const entry = join(f.custodyDirectory, `${stem}.create-dispatched.json`);
+  const entry = join(
+    f.custodyDirectory,
+    inputOnly ? "input.json" : `${stem}.create-dispatched.json`,
+  );
   const artifactEntry = join(f.custodyDirectory, `${stem}.artifact`, "probe-original-entry");
   const script = `
     import * as nativeFs from "node:fs";
     import { mock } from "bun:test";
     const fs = { ...nativeFs };
-    const mode = ${JSON.stringify(mode)};
+    const mode = ${JSON.stringify(operation)};
+    const inputOnly = ${JSON.stringify(inputOnly)};
     const entry = ${JSON.stringify(entry)};
     const artifactEntry = ${JSON.stringify(artifactEntry)};
     const input = ${JSON.stringify({ invocation: f.invocation, target: f.selected, originalCreate: f.options.originalCreate })};
@@ -2815,7 +2960,8 @@ async function boundedCustodyProbe(mode: string): Promise<BoundedCustodyProbeRes
     };
     if (!mode.startsWith("sync-")) {
       if (mode === "fifo") fifo(entry);
-      else fs.writeFileSync(entry, mode === "oversize" ? Buffer.alloc(32 * 1024 + 1) : "{}", { mode: 0o600 });
+      else fs.writeFileSync(entry, mode === "oversize" ? Buffer.alloc((inputOnly ? 16 : 32) * 1024 + 1)
+        : inputOnly ? JSON.stringify(input.originalCreate) : "{}", { mode: 0o600 });
     }
     mock.module("node:fs", () => ({
       ...fs,
@@ -2849,7 +2995,7 @@ async function boundedCustodyProbe(mode: string): Promise<BoundedCustodyProbeRes
         return fs.readSync(fd, buffer, offset, length, position);
       },
     }));
-    const { runIntegrationStorageGeneration } = await import(${JSON.stringify(moduleUrl)});
+    const { loadIntegrationStorageOriginalCreateInput, runIntegrationStorageGeneration } = await import(${JSON.stringify(moduleUrl)});
     let lists = 0;
     const provider = {
       async listD1() {
@@ -2874,7 +3020,8 @@ async function boundedCustodyProbe(mode: string): Promise<BoundedCustodyProbeRes
     };
     let message = "";
     try {
-      await runIntegrationStorageGeneration(input.invocation, input.target, { provider, run,
+      if (inputOnly) loadIntegrationStorageOriginalCreateInput(entry);
+      else await runIntegrationStorageGeneration(input.invocation, input.target, { provider, run,
         review: "independent-component-custody-read", originalCreate: input.originalCreate,
         migrationDirectory: ${JSON.stringify(currentMigrations)},
         reader: { async read() { throw new Error("unexpected schema read"); } },
@@ -2910,6 +3057,19 @@ async function boundedCustodyProbe(mode: string): Promise<BoundedCustodyProbeRes
 }
 
 describe("bounded original custody retained-file I/O", () => {
+  test("locator input refuses FIFO/oversize and real growth or held/path replacement without blocking", async () => {
+    for (const mode of ["fifo", "fifo-swap", "oversize", "growth", "replaced"]) {
+      const result = await boundedCustodyProbe(`input-${mode}`);
+      expect(result.message).toContain(
+        "original-create input requires only pinned custody locators",
+      );
+      expect(result.mutations).toBe(0);
+      expect(result.wholeFdReads).toBe(0);
+      expect(result.requestedBytes).toBeLessThanOrEqual(16 * 1024 + 1);
+      if (["fifo-swap", "growth", "replaced"].includes(mode)) expect(result.injected).toBe(true);
+    }
+  });
+
   test("bounded custody read refuses FIFO/oversize and controlled real growth or replacement", async () => {
     for (const mode of ["fifo", "fifo-swap", "oversize", "growth", "replaced"]) {
       const result = await boundedCustodyProbe(mode);

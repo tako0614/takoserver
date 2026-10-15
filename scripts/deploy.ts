@@ -26,7 +26,11 @@ import {
 } from "./deploy/integration-money-shadow-native-probe.ts";
 import { runIntegrationOrganizationBootstrap } from "./deploy/integration-organization-bootstrap.ts";
 import { runIntegrationStorageDisposal } from "./deploy/integration-storage-disposal.ts";
-import { runIntegrationStorageGeneration } from "./deploy/integration-storage-generation.ts";
+import {
+  type IntegrationStorageGenerationInvocation,
+  loadIntegrationStorageOriginalCreateInput,
+  runIntegrationStorageGeneration,
+} from "./deploy/integration-storage-generation.ts";
 import { runIntegrationWorkerBootstrap } from "./deploy/integration-worker-bootstrap.ts";
 import { runOrgApiKey } from "./deploy/org-api-key.ts";
 import { requireEnvironment } from "./deploy/process.ts";
@@ -1160,6 +1164,30 @@ function loadMoneyShadowNativeProbeDeclaration(): MoneyShadowNativeProbeDeclarat
 }
 
 async function dispatch(invocation: Invocation): Promise<Record<string, unknown>> {
+  const originalCreateInput = process.env.TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH;
+  if (originalCreateInput !== undefined) {
+    if (
+      invocation.surface !== "takoserver-integration-storage-generation" ||
+      invocation.environment !== "integration" ||
+      invocation.freshLineage !== "v2-0092"
+    ) {
+      throw new DeployError(
+        "preflight",
+        "original-create input is supported only for integration storage generation with --fresh-lineage=v2-0092",
+      );
+    }
+    const originalCreate = loadIntegrationStorageOriginalCreateInput(originalCreateInput);
+    const target = loadTarget(targetPath("integration"), "integration");
+    const selected: IntegrationStorageGenerationInvocation = {
+      action: invocation.action,
+      environment: "integration",
+      commit: invocation.commit,
+      generation: invocation.generation,
+      namespace: "integration-ts",
+      freshLineage: "v2-0092",
+    };
+    return await runIntegrationStorageGeneration(selected, target, { originalCreate });
+  }
   if (invocation.surface === "takoserver-integration-money-shadow-native-probe") {
     return await runIntegrationMoneyShadowNativeProbe(
       loadMoneyShadowNativeProbeDeclaration(),

@@ -1048,6 +1048,76 @@ function openOriginalRegularFile(
   }
 }
 
+/** Load locators only; the existing creator independently constructs its custody context. */
+export function loadIntegrationStorageOriginalCreateInput(
+  path: string,
+): IntegrationStorageOriginalCreateOptions {
+  let fd = -1;
+  try {
+    if (!isAbsolute(path) || resolve(path) !== path) throw new Error("noncanonical input path");
+    const parent = dirname(path);
+    const parentIdentity = originalRootIdentity(parent);
+    const held = openOriginalRegularFile(path, 16 * 1024, false);
+    fd = held.fd;
+    const size = Number(held.stat.size);
+    const bytes = Buffer.alloc(size + 1);
+    let offset = 0;
+    while (offset < size) {
+      const count = readSync(fd, bytes, offset, size - offset, offset);
+      if (count < 1) throw new Error("truncated original-create input");
+      offset += count;
+    }
+    if (readSync(fd, bytes, offset, 1, offset) !== 0)
+      throw new Error("grown original-create input");
+    const value: unknown = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, size)),
+    );
+    if (
+      !originalRecord(value) ||
+      !originalKeys(value, ["kind", "custodyDirectory", "custodyIdentity"]) ||
+      value.kind !== "positive-fresh-0092" ||
+      typeof value.custodyDirectory !== "string" ||
+      !originalRecord(value.custodyIdentity) ||
+      !originalKeys(value.custodyIdentity, ["device", "inode"]) ||
+      typeof value.custodyIdentity.device !== "string" ||
+      !/^(?:0|[1-9][0-9]*)$/u.test(value.custodyIdentity.device) ||
+      typeof value.custodyIdentity.inode !== "string" ||
+      !/^[1-9][0-9]*$/u.test(value.custodyIdentity.inode)
+    ) {
+      throw new Error("not original-create locators");
+    }
+    const custodyIdentity = originalRootIdentity(value.custodyDirectory);
+    if (
+      value.custodyIdentity.device !== String(custodyIdentity.device) ||
+      value.custodyIdentity.inode !== String(custodyIdentity.inode)
+    ) {
+      throw new Error("original provisioning pin differs");
+    }
+    assertOriginalFileCurrent(path, fd, held.stat);
+    const currentParent = originalRootIdentity(parent);
+    if (
+      currentParent.device !== parentIdentity.device ||
+      currentParent.inode !== parentIdentity.inode
+    ) {
+      throw new Error("original-create input parent changed");
+    }
+    return Object.freeze({
+      kind: "positive-fresh-0092",
+      custodyDirectory: value.custodyDirectory,
+      custodyIdentity: Object.freeze({
+        device: value.custodyIdentity.device,
+        inode: value.custodyIdentity.inode,
+      }),
+    });
+  } catch {
+    throw preflightError(
+      "original-create input requires only pinned custody locators in an unchanged owned single-link 0600 regular file, at most 16 KiB, under a canonical private 0700 root outside every checkout; do not repin or retry",
+    );
+  } finally {
+    if (fd >= 0) closeSync(fd);
+  }
+}
+
 function readOriginalBytes(path: string, limit: number, sealed = false): Uint8Array | null {
   if (lstatSync(path, { throwIfNoEntry: false }) === undefined) return null;
   let fd = -1;
