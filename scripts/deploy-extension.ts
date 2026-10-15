@@ -41,11 +41,23 @@ export {
   runExactArtifactRecoveryDeployment,
 } from "./deploy/exact-artifact-recovery.ts";
 export type {
+  FreshV2IntegrationStorageTargetProof,
+  IntegrationStorageGenerationInvocation,
+  IntegrationStorageGenerationNamespace,
+  IntegrationStorageGenerationOptions,
   IntegrationStorageGenerationTargetProof,
   IntegrationStorageGenerationTargetVerificationOptions,
+  IntegrationStorageOriginalCreateEvidence,
+  IntegrationStorageOriginalCreateOptions,
+  IntegrationStorageOriginalCreateReceipt,
   IntegrationStorageTargetReadProvider,
 } from "./deploy/integration-storage-generation.ts";
-export { verifyIntegrationStorageGenerationTarget } from "./deploy/integration-storage-generation.ts";
+export {
+  integrationStorageGenerationName,
+  runIntegrationStorageGeneration,
+  verifyFreshV2IntegrationStorageTarget,
+  verifyIntegrationStorageGenerationTarget,
+} from "./deploy/integration-storage-generation.ts";
 export { runIntegrationWorkerBootstrap } from "./deploy/integration-worker-bootstrap.ts";
 export type { D1SchemaState, MigrationArtifact, MigrationFile } from "./deploy/migrations.ts";
 export { readD1SchemaState } from "./deploy/migrations.ts";
