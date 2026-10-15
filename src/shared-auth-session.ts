@@ -357,15 +357,17 @@ export function createSharedAuthSession(options: {
     return selected;
   }
   async function principal(value: SharedAuthGrant, workspaceId: string): Promise<string> {
-    const resolved = await Reflect.apply(resolvePrincipal, principalReceiver, [{
-      issuer: value.issuer,
-      clientId: value.clientId,
-      subject: value.subject,
-      sessionId: value.sessionId,
-      authTime: value.authTime,
-      accountId: value.subject,
-      workspaceId,
-    }]);
+    const resolved = await Reflect.apply(resolvePrincipal, principalReceiver, [
+      {
+        issuer: value.issuer,
+        clientId: value.clientId,
+        subject: value.subject,
+        sessionId: value.sessionId,
+        authTime: value.authTime,
+        accountId: value.subject,
+        workspaceId,
+      },
+    ]);
     if (
       !resolved ||
       Object.keys(resolved).sort().join() !== "accountId,principalId" ||
@@ -392,24 +394,41 @@ export function createSharedAuthSession(options: {
 
   function activeAt(row: OidcSessionRecord, digest: string, stamp: number): boolean {
     return (
-      integer(stamp) && row.digest === digest && row.status === "active" &&
-      text(row.accountId, 512) && text(row.principalId, 512) && text(row.workspaceId, 512) &&
-      typeof row.payload === "string" && row.payload.length > 0 && row.payload.length <= 65536 &&
-      integer(row.version) && row.version < Number.MAX_SAFE_INTEGER &&
-      integer(row.createdAt) && integer(row.lastUsedAt) && integer(row.grantCheckedAt) &&
-      integer(row.absoluteExpiresAt) && row.createdAt <= row.grantCheckedAt &&
-      row.grantCheckedAt <= row.lastUsedAt && row.lastUsedAt <= stamp &&
-      stamp < row.absoluteExpiresAt && stamp - row.lastUsedAt < idleTtl &&
+      integer(stamp) &&
+      row.digest === digest &&
+      row.status === "active" &&
+      text(row.accountId, 512) &&
+      text(row.principalId, 512) &&
+      text(row.workspaceId, 512) &&
+      typeof row.payload === "string" &&
+      row.payload.length > 0 &&
+      row.payload.length <= 65536 &&
+      integer(row.version) &&
+      row.version < Number.MAX_SAFE_INTEGER &&
+      integer(row.createdAt) &&
+      integer(row.lastUsedAt) &&
+      integer(row.grantCheckedAt) &&
+      integer(row.absoluteExpiresAt) &&
+      row.createdAt <= row.grantCheckedAt &&
+      row.grantCheckedAt <= row.lastUsedAt &&
+      row.lastUsedAt <= stamp &&
+      stamp < row.absoluteExpiresAt &&
+      stamp - row.lastUsedAt < idleTtl &&
       row.absoluteExpiresAt - row.createdAt <= absoluteTtl
     );
   }
 
   function sameGrantRow(left: OidcSessionRecord, right: OidcSessionRecord): boolean {
-    return left.digest === right.digest && left.accountId === right.accountId &&
-      left.principalId === right.principalId && left.workspaceId === right.workspaceId &&
-      left.payload === right.payload && left.createdAt === right.createdAt &&
+    return (
+      left.digest === right.digest &&
+      left.accountId === right.accountId &&
+      left.principalId === right.principalId &&
+      left.workspaceId === right.workspaceId &&
+      left.payload === right.payload &&
+      left.createdAt === right.createdAt &&
       left.absoluteExpiresAt === right.absoluteExpiresAt &&
-      left.grantCheckedAt === right.grantCheckedAt;
+      left.grantCheckedAt === right.grantCheckedAt
+    );
   }
 
   async function authenticateWith(
@@ -501,8 +520,10 @@ export function createSharedAuthSession(options: {
             const latest = await store.readSession(digest);
             touchedAt = now();
             if (
-              !latest || !activeAt(latest, digest, touchedAt) ||
-              !sameGrantRow(latest, candidate) || latest.version <= candidate.version ||
+              !latest ||
+              !activeAt(latest, digest, touchedAt) ||
+              !sameGrantRow(latest, candidate) ||
+              latest.version <= candidate.version ||
               latest.version >= Number.MAX_SAFE_INTEGER - 1 ||
               latest.lastUsedAt < candidate.lastUsedAt
             )
@@ -519,9 +540,12 @@ export function createSharedAuthSession(options: {
         }
         observedAt = now();
         if (
-          !selected || !activeAt(selected, digest, observedAt) ||
-          !sameGrantRow(selected, candidate) || selected.version !== candidate.version + 1 ||
-          selected.lastUsedAt !== touchedAt || selected.accountId !== value.subject
+          !selected ||
+          !activeAt(selected, digest, observedAt) ||
+          !sameGrantRow(selected, candidate) ||
+          selected.version !== candidate.version + 1 ||
+          selected.lastUsedAt !== touchedAt ||
+          selected.accountId !== value.subject
         )
           throw new SharedAuthSessionError("session_unavailable");
       } else if (!(await store.touchSession(digest, row.version, now()))) {
@@ -531,8 +555,10 @@ export function createSharedAuthSession(options: {
         if (!latest || latest.status === "revoked" || latest.status === "revocation_pending")
           return null;
         if (
-          latest.status !== "active" || latest.payload !== row.payload ||
-          latest.accountId !== row.accountId || latest.principalId !== row.principalId ||
+          latest.status !== "active" ||
+          latest.payload !== row.payload ||
+          latest.accountId !== row.accountId ||
+          latest.principalId !== row.principalId ||
           latest.workspaceId !== row.workspaceId ||
           !(await store.touchSession(digest, latest.version, now()))
         )
@@ -556,20 +582,24 @@ export function createSharedAuthSession(options: {
         workspace: Object.freeze({ ...workspace, roles: Object.freeze([...workspace.roles]) }),
         provenance: Object.freeze({ kind: "shared-account-session" as const, ...identity }),
       });
-      if (selectFinal) selections.set(context, Object.freeze({
-        sessionDigest: selected.digest,
-        sessionVersion: selected.version,
-        accountId: selected.accountId,
-        principalId: selected.principalId,
-        sessionWorkspaceId: selected.workspaceId,
-        selectedWorkspaceId: workspace.id,
-        identity,
-        createdAt: selected.createdAt,
-        lastUsedAt: selected.lastUsedAt,
-        grantCheckedAt: selected.grantCheckedAt,
-        absoluteExpiresAt: selected.absoluteExpiresAt,
-        observedAt,
-      }));
+      if (selectFinal)
+        selections.set(
+          context,
+          Object.freeze({
+            sessionDigest: selected.digest,
+            sessionVersion: selected.version,
+            accountId: selected.accountId,
+            principalId: selected.principalId,
+            sessionWorkspaceId: selected.workspaceId,
+            selectedWorkspaceId: workspace.id,
+            identity,
+            createdAt: selected.createdAt,
+            lastUsedAt: selected.lastUsedAt,
+            grantCheckedAt: selected.grantCheckedAt,
+            absoluteExpiresAt: selected.absoluteExpiresAt,
+            observedAt,
+          }),
+        );
       return context;
     } catch (error) {
       if (invalid(error)) {
@@ -625,10 +655,7 @@ export function createSharedAuthSession(options: {
     const value = await grant(row.digest, row.payload);
     if (value.subject !== session.accountId || row.principalId !== session.actor.principalId)
       throw new SharedAuthSessionError("session_invalid");
-    const body = await directory(
-      value,
-      `/${encodeURIComponent(workspaceId)}/billing-organization`,
-    );
+    const body = await directory(value, `/${encodeURIComponent(workspaceId)}/billing-organization`);
     if (
       Object.keys(body).sort().join() !== "organizationId,workspaceId,workspaceRef" ||
       body.workspaceId !== workspaceId ||
@@ -670,7 +697,7 @@ export function createSharedAuthSession(options: {
     /** In-process only: plain records, clones and other factory instances have no provenance. */
     finalSessionSelection(context: unknown): SharedAuthFinalSessionSelection | null {
       return record(context)
-        ? selections.get(context as unknown as SharedAuthSessionContext) ?? null
+        ? (selections.get(context as unknown as SharedAuthSessionContext) ?? null)
         : null;
     },
     async authenticate(request: Request, workspaceId?: string) {
