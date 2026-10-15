@@ -27,10 +27,22 @@ describe("Takoserver public site build", () => {
       const japaneseHtml = readFileSync(join(root, "ja", "index.html"), "utf8");
       expect(readFileSync(join(root, "en", "index.html"), "utf8")).toBe(rootHtml);
       expect(japaneseHtml).not.toBe(rootHtml);
+      for (const asset of [
+        "og.png",
+        "fonts/bricolage-grotesque-latin.woff2",
+        "fonts/OFL.txt",
+        ...["desktop", "mobile"].flatMap((shape) =>
+          ["light", "dark"].flatMap((theme) =>
+            ["en", "ja"].map((lang) => `screens/console-${shape}-${theme}-${lang}.webp`),
+          ),
+        ),
+      ]) {
+        expect(readFileSync(join(root, asset))).toEqual(
+          readFileSync(join(import.meta.dir, "..", "site", asset)),
+        );
+      }
       expect(japaneseHtml).toContain('<html lang="ja">');
-      expect(japaneseHtml).toContain(
-        "公開されたFormの仕様URLを指定して、Host運営者の基盤上で資源を管理します。",
-      );
+      expect(japaneseHtml).toContain("Takoformを、\n自分のクラウドへ。");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
