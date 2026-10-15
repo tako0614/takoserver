@@ -13,6 +13,8 @@ import {
 const uidPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
 const pathSegment = /^[A-Za-z][A-Za-z0-9_]*$/u;
 const MAX_REFERENCES = 512;
+// Only the additive prepared path has this larger combined declaration budget.
+const MAX_COMBINED_REFERENCES = 515;
 
 interface PreparedReference {
   resourceUid: string;
@@ -32,8 +34,11 @@ export function prepareV2References(form: V2Form, spec: JsonObject): string | nu
   return normalizeReferences(form.references(spec));
 }
 
-function normalizeReferences(declared: readonly V2ReferenceRequirement[]): string {
-  if (!Array.isArray(declared) || declared.length > MAX_REFERENCES) invalid();
+function normalizeReferences(
+  declared: readonly V2ReferenceRequirement[],
+  limit = MAX_REFERENCES,
+): string {
+  if (!Array.isArray(declared) || declared.length > limit) invalid();
   const byUid = new Map<string, PreparedReference>();
   for (const item of declared) {
     if (
@@ -144,22 +149,25 @@ function snapshotRequirements(value: readonly V2ReferenceRequirement[]) {
 
 function mergeReferences(pure: string | null, prepared: readonly V2ReferenceRequirement[]) {
   const original = pure === null ? [] : (JSON.parse(pure) as PreparedReference[]);
-  return normalizeReferences([
-    ...original.map((item) => ({
-      resourceUid: item.resourceUid,
-      formUrl: item.formUrl,
-      readiness: item.readiness,
-      ...(item.targetSpecPath === null
-        ? {}
-        : {
-            targetSpecMatch: {
-              path: item.targetSpecPath.slice(2).split("."),
-              equals: item.targetSpecEquals as string,
-            },
-          }),
-    })),
-    ...prepared,
-  ]);
+  return normalizeReferences(
+    [
+      ...original.map((item) => ({
+        resourceUid: item.resourceUid,
+        formUrl: item.formUrl,
+        readiness: item.readiness,
+        ...(item.targetSpecPath === null
+          ? {}
+          : {
+              targetSpecMatch: {
+                path: item.targetSpecPath.slice(2).split("."),
+                equals: item.targetSpecEquals as string,
+              },
+            }),
+      })),
+      ...prepared,
+    ],
+    MAX_COMBINED_REFERENCES,
+  );
 }
 
 // Compare the captured target preimage, not merely its readiness at acceptance.
