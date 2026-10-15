@@ -71,6 +71,17 @@ export function prepareNativeMigrationSql(
   return scanMigrationSql(sql, undefined, undefined, pragmas);
 }
 
+/**
+ * Exact statement framing for trusted Host-owned schema files. This has no
+ * execution capability and does not select a tenant Form's PRAGMA permission.
+ * The owning caller retains transaction, ledger and SQL authority controls.
+ */
+export function frameHostMigrationSql(sql: string): readonly string[] {
+  return scanMigrationSql(sql, undefined, undefined, "defer", false, false).map(
+    (statement) => statement.sql,
+  );
+}
+
 /** SQLite keyword/name case folding is ASCII; Unicode aliases are not names. */
 export function isMigrationDeferForeignKeysName(value: string | null): boolean {
   return (
@@ -220,6 +231,7 @@ function scanMigrationSql(
   },
   pragmaPolicy: "deny" | "defer" | "introspection" = "defer",
   singlePragmaStatement = false,
+  admitMigrationPragmas = true,
 ): readonly MigrationSqlStatement[] {
   const refuse = (): never => {
     return refuseMigrationSql();
@@ -350,7 +362,7 @@ function scanMigrationSql(
       // A BOM inside a word remains an SQLite identifier character. Refuse
       // this invalid PRAGMA-looking command without splitting valid Unicode
       // identifiers elsewhere or claiming it could execute a PRAGMA effect.
-      if (lower.startsWith("pragma\ufeff")) refuse();
+      if (admitMigrationPragmas && lower.startsWith("pragma\ufeff")) refuse();
       if (explainPrefix === 0 && lower === "explain") {
         explainPrefix = 1;
       } else if (explainPrefix === 1 && lower === "query") {
@@ -386,7 +398,7 @@ function scanMigrationSql(
       }
     }
 
-    if (lower === "pragma" && command === "pragma" && pragma.state === 0) {
+    if (admitMigrationPragmas && lower === "pragma" && command === "pragma" && pragma.state === 0) {
       if (explainPrefix !== 0 || pragmaPolicy === "deny") refuse();
       pragmaCount += 1;
       pragmaStart = index;
