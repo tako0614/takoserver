@@ -659,11 +659,20 @@ for (const path of walk("src")) {
         "src/takoform-v2/application.ts",
         "src/worker-endpoint-origin-v2-acceptance.ts",
       ].includes(path);
+    // This fixed receiver reuses only the owning Deployment parser/error.
+    // No general v2-form edge, re-export, namespace or dynamic import is allowed.
+    const exactOriginDeploymentParserEdge =
+      path === "src/worker-endpoint-origin-v2-acceptance.ts" &&
+      target === "src/takoform-v2/forms/worker-specs.ts" &&
+      localImportsOf(path).filter((candidate) => candidate === target).length === 1 &&
+      /import\s*\{\s*parseWorkerDeploymentSpec\s*,\s*WorkerFormValidationError\s*,?\s*\}\s*from\s+["']\.\/takoform-v2\/forms\/worker-specs\.ts["'];/u.test(
+        readFileSync(path, "utf8"),
+      );
     const exactWorkerEndpointOriginConstructionEdge =
       path === "src/app.ts" &&
       target === "src/worker-endpoint-origin-v2-acceptance.ts" &&
       localImportsOf(path).filter((candidate) => candidate === target).length === 1 &&
-      /import\s*\{\s*createWorkerEndpointOriginV2Acceptance\s*\}\s*from\s+["']\.\/worker-endpoint-origin-v2-acceptance\.ts["'];/u.test(
+      /import\s*\{\s*createWorkerEndpointOriginV2Acceptance\s*(?:,\s*createWorkerEndpointOriginV2FormRouteAcceptance\s*,?)?\s*\}\s*from\s+["']\.\/worker-endpoint-origin-v2-acceptance\.ts["'];/u.test(
         readFileSync(path, "utf8"),
       );
     const originPublicationExports = readFileSync(path, "utf8").match(
@@ -757,6 +766,7 @@ for (const path of walk("src")) {
     if (
       !layer.may.includes(targetLayer.name) &&
       !exactHostAcceptanceEdge &&
+      !exactOriginDeploymentParserEdge &&
       !exactWorkerEndpointOriginConstructionEdge &&
       !exactOriginPublicationExtensionEdge &&
       !exactExecutionTypeEdge &&

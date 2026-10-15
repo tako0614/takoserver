@@ -19,6 +19,10 @@ import type {
 } from "./shared-app-ledger.ts";
 import { normalizeSharedAppName, sharedAppStagingNameFromHost } from "./shared-app-name.ts";
 import {
+  parseWorkerDeploymentSpec,
+  WorkerFormValidationError,
+} from "./takoform-v2/forms/worker-specs.ts";
+import {
   prepareV2HostAcceptance,
   type V2HostAcceptance,
   type V2HostAcceptanceContext,
@@ -2381,7 +2385,17 @@ class FormRoutePublication {
         ...(options.prospective === undefined ? {} : { claimed: options.prospective }),
       },
     );
-    const desired = formRecord(deployment.spec, ["worker", "versions"]);
+    // The owning parser accepts either input order and returns a UID-ordered
+    // copy. Core keeps its original accepted bytes, already captured/fenced
+    // above; canonicalize only this semantic comparison with native pins.
+    let desired: ReturnType<typeof parseWorkerDeploymentSpec>;
+    try {
+      desired = parseWorkerDeploymentSpec(deployment.spec);
+    } catch (error) {
+      if (error instanceof WorkerFormValidationError)
+        throw new TypeError("accepted Deployment vector differs");
+      throw error;
+    }
     if (
       object(desired.worker)?.resourceUid !== worker.workerUid ||
       !Array.isArray(desired.versions) ||

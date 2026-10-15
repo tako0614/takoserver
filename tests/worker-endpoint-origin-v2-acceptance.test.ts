@@ -5,17 +5,39 @@
  */
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { canonicalJson } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
-import { type Sql, SqlError, type SqlStatement } from "../src/ports.ts";
-import { createSharedAppLedger, type SharedAppAssignment } from "../src/shared-app-ledger.ts";
+import { type JsonObject, type Sql, SqlError, type SqlStatement } from "../src/ports.ts";
+import {
+  createSharedAppLedger,
+  type SharedAppAssignment,
+  type SharedAppFormV2ReleasePin,
+  type SharedAppNativeRouteRowPin,
+} from "../src/shared-app-ledger.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
+import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.ts";
+import { referencesForWorkerForm } from "../src/takoform-v2/forms/worker-references.ts";
+import {
+  MODULE_WORKER_FORM_URL,
+  parseModuleWorkerSpec,
+  parseWorkerDeploymentSpec,
+  parseWorkerEndpointSpec,
+  parseWorkerVersionSpec,
+  validateWorkerDeploymentUpdate,
+  validateWorkerEndpointUpdate,
+  WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_ENDPOINT_FORM_URL,
+  WORKER_VERSION_FORM_URL,
+} from "../src/takoform-v2/forms/worker-specs.ts";
 import type { V2PrivateInputCustody } from "../src/takoform-v2/private-inputs.ts";
 import { createV2Store } from "../src/takoform-v2/store.ts";
-import type { V2EngineOptions, V2Form } from "../src/takoform-v2/types.ts";
+import type { V2EngineOptions, V2Execution, V2Form } from "../src/takoform-v2/types.ts";
+import { createV2NativeEffectCustody } from "../src/takoform-v2/worker-native-effects.ts";
 import {
   createWorkerEndpointOriginV2Acceptance,
   createWorkerEndpointOriginV2FormRouteAcceptance,
+  createWorkerEndpointOriginV2FormRoutePublication,
 } from "../src/worker-endpoint-origin-v2-acceptance.ts";
 
 const FORM = "https://forms.example.test/BindingAcceptance/1.0.0/";
@@ -1263,5 +1285,355 @@ test("typed compiler never falls back on malformed tag data or a different Sql i
     expect(bindings(f)).toEqual([]);
   } finally {
     f.close();
+  }
+});
+
+test("accepted unsorted two-release Deployment publishes the canonical vector without changing raw Core source", async () => {
+  // Actual accepted canonical Forms/Core/Store/0074 and atomic local native
+  // rows. Artifact bytes/provider compilation are outside this fixture; native
+  // script/digest/ETag markers are recorded by real0074 custody, not a witness.
+  const nowMs = Date.now();
+  const at = new Date(nowMs).toISOString();
+  const db = new Database(":memory:");
+  migrateSqlite(db);
+  sharedSchema(db, true, true);
+  const HISTORY = "shared_app_staging_route_commands";
+  db.exec(`CREATE TABLE ${HISTORY} (
+    organization_id TEXT NOT NULL, product TEXT NOT NULL, reservation_id TEXT NOT NULL, name TEXT NOT NULL,
+    incarnation TEXT NOT NULL REFERENCES shared_app_staging_assignments(incarnation),
+    action TEXT NOT NULL CHECK(action IN ('activate','advance','retire')), command_ref TEXT NOT NULL,
+    prior_generation INTEGER NOT NULL, prior_state TEXT NOT NULL, prior_script TEXT, next_script TEXT,
+    endpoint_uid TEXT NOT NULL, endpoint_generation INTEGER NOT NULL, worker_uid TEXT NOT NULL,
+    deployment_uid TEXT NOT NULL, deployment_generation INTEGER NOT NULL, source_operation_id TEXT NOT NULL,
+    provider_id TEXT NOT NULL, target_key TEXT NOT NULL, next_generation INTEGER NOT NULL, next_state TEXT NOT NULL,
+    created_at INTEGER NOT NULL, form_v2_original_json TEXT,
+    PRIMARY KEY(organization_id,command_ref), UNIQUE(incarnation,next_generation), CHECK(next_generation=prior_generation+1),
+    CHECK((form_v2_original_json IS NULL
+      AND ((action='activate' AND prior_state='reserved' AND prior_script IS NULL)
+        OR (action<>'activate' AND prior_state='active' AND prior_script IS NOT NULL))
+      AND ((action='retire' AND next_state='reserved' AND next_script IS NULL)
+        OR (action<>'retire' AND next_state='active' AND next_script IS NOT NULL)))
+    OR (form_v2_original_json IS NOT NULL AND CASE WHEN json_valid(form_v2_original_json)=1 THEN
+      json_type(form_v2_original_json) IS 'object' AND json_extract(form_v2_original_json,'$.action') IS action
+      AND ((action='activate' AND prior_state='reserved') OR (action<>'activate' AND prior_state='active'))
+      AND ((json_extract(form_v2_original_json,'$.expected.kind') IS 'scalar'
+        AND json_extract(form_v2_original_json,'$.expected.value.script') IS prior_script)
+        OR (json_extract(form_v2_original_json,'$.expected.kind') IS 'form-v2@1' AND prior_script IS NULL))
+      AND next_script IS NULL AND ((action='retire' AND next_state='reserved') OR (action<>'retire' AND next_state='active'))
+      ELSE 0 END)))`);
+  db.exec(`CREATE TABLE shared_app_staging_batch_assertions (
+    witness TEXT PRIMARY KEY, ok INTEGER NOT NULL CHECK(ok=1), apply_effects INTEGER NOT NULL CHECK(apply_effects IN (0,1)))`);
+  const sql = createSqliteSql(db);
+  const ledger = createSharedAppLedger({
+    environment: "staging",
+    primary: () => sql,
+    clock: () => new Date(nowMs),
+  });
+  const providerId = "unsorted-own-provider";
+  const name = "unsorted-route";
+  const host = `${name}.app-staging.takos.jp`;
+  const backendIds = {
+    worker: "unsorted-worker",
+    version: "unsorted-version",
+    deployment: "unsorted-deployment",
+    endpoint: "unsorted-endpoint",
+  };
+  const backend = (id: string): V2Form["backend"] => ({
+    id,
+    targetKey: TARGET,
+    async execute(input) {
+      const selectedVersions =
+        input.form === WORKER_DEPLOYMENT_FORM_URL
+          ? parseWorkerDeploymentSpec(input.spec).versions.map((version) => ({
+              resourceUid: version.workerVersion.resourceUid,
+              weight: version.weight,
+            }))
+          : [];
+      return {
+        kind: "complete",
+        observed: {
+          ready: true,
+          active: true,
+          tlsReady: true,
+          activeDeploymentRouteReady: true,
+          selectedVersions,
+        },
+        output: input.previousOutput,
+      };
+    },
+    async reconcile() {
+      return { kind: "unknown" };
+    },
+  });
+  const declare = (
+    formUrl: string,
+    validateCreate: (input: unknown) => unknown,
+    validateUpdate: (before: unknown, after: unknown) => unknown,
+    backendId: string,
+  ): V2Form => ({
+    validateCreate,
+    validateUpdate,
+    references: (spec) => referencesForWorkerForm(formUrl, spec),
+    backend: backend(backendId),
+  });
+  const engine = createTakoformV2Engine(
+    {
+      sql,
+      now: () => new Date(nowMs),
+      replayWindowSeconds: 3600,
+      authorize: async (principal, space) => principal === `org:${space}`,
+      forms: {
+        [MODULE_WORKER_FORM_URL]: declare(
+          MODULE_WORKER_FORM_URL,
+          parseModuleWorkerSpec,
+          (_, next) => parseModuleWorkerSpec(next),
+          backendIds.worker,
+        ),
+        [WORKER_VERSION_FORM_URL]: declare(
+          WORKER_VERSION_FORM_URL,
+          parseWorkerVersionSpec,
+          (_, next) => parseWorkerVersionSpec(next),
+          backendIds.version,
+        ),
+        [WORKER_DEPLOYMENT_FORM_URL]: declare(
+          WORKER_DEPLOYMENT_FORM_URL,
+          parseWorkerDeploymentSpec,
+          validateWorkerDeploymentUpdate,
+          backendIds.deployment,
+        ),
+        [WORKER_ENDPOINT_FORM_URL]: {
+          ...declare(
+            WORKER_ENDPOINT_FORM_URL,
+            parseWorkerEndpointSpec,
+            validateWorkerEndpointUpdate,
+            backendIds.endpoint,
+          ),
+          initialOutput: () => ({
+            hostname: "ordinary.example.invalid",
+            url: "https://ordinary.example.invalid/",
+          }),
+        },
+        [WORKER_BUNDLE_FORM_URL]: {
+          validateCreate() {},
+          validateUpdate() {},
+          backend: backend("unsorted-bundle-metadata"),
+        },
+      },
+    },
+    createWorkerEndpointOriginV2FormRouteAcceptance({
+      sql,
+      ledger,
+      formUrl: WORKER_ENDPOINT_FORM_URL,
+      backendId: backendIds.endpoint,
+      targetKey: TARGET,
+    }),
+  );
+  const store = createV2Store(sql);
+  const accept = (form: string, resourceName: string, spec: JsonObject) =>
+    engine.acceptCreate({
+      principal: PRINCIPAL,
+      key: `unsorted-accepted-${resourceName}`,
+      input: { form, space: ORGANIZATION, name: resourceName, spec },
+    });
+  const claim = async (operationId: string): Promise<V2Execution> => {
+    const operation = await store.operation(operationId);
+    const resource = operation ? await store.resource(operation.resource_uid) : null;
+    if (!operation || !resource) throw new Error("missing actual accepted source");
+    const leaseToken = crypto.randomUUID();
+    expect(await store.claim(operationId, leaseToken, nowMs, nowMs + 120_000)).toBe(true);
+    expect(await store.markDispatch(operationId, leaseToken, at)).toBe(true);
+    return {
+      operationId,
+      leaseToken,
+      backendKey: operation.backend_key,
+      backendId: operation.backend_id,
+      targetKey: operation.target_key,
+      resourceUid: resource.uid,
+      principal: operation.principal,
+      action: operation.action,
+      generation: operation.generation,
+      form: resource.form_url,
+      space: resource.space,
+      name: resource.name,
+      spec: JSON.parse(operation.accepted_spec_json),
+      previousObserved: JSON.parse(resource.observed_json),
+      previousOutput: JSON.parse(resource.output_json),
+    };
+  };
+  const settle = async (execution: V2Execution) => {
+    const result = await backend(execution.backendId).execute(execution);
+    if (result.kind !== "complete") throw new Error("fixture backend did not complete");
+    expect(
+      await store.settle({
+        id: execution.operationId,
+        token: execution.leaseToken,
+        status: "succeeded",
+        effect: "complete",
+        at,
+        retainUntil: new Date(nowMs + 3_600_000).toISOString(),
+        observedJson: JSON.stringify(result.observed),
+        outputJson: JSON.stringify(result.output),
+      }),
+    ).toBe(true);
+  };
+  try {
+    const worker = await accept(MODULE_WORKER_FORM_URL, "unsorted-worker", {});
+    expect(await engine.runNext()).toMatchObject({ id: worker.id, status: "succeeded" });
+    const bundle = await accept(WORKER_BUNDLE_FORM_URL, "unsorted-bundle", {});
+    expect(await engine.runNext()).toMatchObject({ id: bundle.id, status: "succeeded" });
+    const custody = createV2NativeEffectCustody({ sql, now: () => new Date(nowMs) });
+    const versions: SharedAppFormV2ReleasePin[] = [];
+    for (let index = 0; index < 2; index++) {
+      const accepted = await accept(WORKER_VERSION_FORM_URL, `unsorted-version-${index}`, {
+        worker: { resourceUid: worker.resourceUid },
+        bundle: { resourceUid: bundle.resourceUid },
+        handlers: ["fetch"],
+      });
+      const execution = await claim(accepted.id);
+      const nativeIdentity = `integration-v2-${String(index).repeat(48)}`;
+      const closureDigest = `sha256:${String(index + 1).repeat(64)}` as const;
+      const receipt = `unsorted-etag-${index}`;
+      const identity = { execution, nativeIdentity, closureDigest };
+      expect(await custody.grant(identity)).toBe("granted");
+      expect(await custody.acknowledge({ ...identity, receipt })).toBe(true);
+      expect(await custody.confirm({ ...identity, receipt })).toBe(true);
+      await settle(execution);
+      versions.push({
+        versionUid: accepted.resourceUid,
+        versionGeneration: 1,
+        scriptName: nativeIdentity,
+        descriptorDigest: closureDigest,
+        providerEtag: receipt,
+        weight: 0,
+      });
+    }
+    const first = versions[0];
+    const second = versions[1];
+    if (!first || !second) throw new Error("missing two real accepted Versions");
+    const [low, high] = first.versionUid < second.versionUid ? [first, second] : [second, first];
+    if (!low || !high) throw new Error("missing actual UID order");
+    // Submit the genuinely reversed order, with unequal weights attached to
+    // their exact Version UIDs. Never sort/replace the accepted input bytes.
+    const rawSpec: JsonObject = {
+      worker: { resourceUid: worker.resourceUid },
+      versions: [
+        { workerVersion: { resourceUid: high.versionUid }, weight: 4_000 },
+        { workerVersion: { resourceUid: low.versionUid }, weight: 6_000 },
+      ],
+    };
+    const rawSpecJson = canonicalJson(rawSpec);
+    const parsed = parseWorkerDeploymentSpec(rawSpec);
+    expect(parsed.versions.map((version) => version.workerVersion.resourceUid)).toEqual([
+      low.versionUid,
+      high.versionUid,
+    ]);
+    expect(canonicalJson(rawSpec)).toBe(rawSpecJson);
+    const releases: readonly SharedAppFormV2ReleasePin[] = [
+      { ...low, weight: 6_000 },
+      { ...high, weight: 4_000 },
+    ];
+    const deployment = await accept(WORKER_DEPLOYMENT_FORM_URL, "unsorted-deployment", rawSpec);
+    expect((await store.operation(deployment.id))?.accepted_spec_json).toBe(rawSpecJson);
+    expect((await store.resource(deployment.resourceUid))?.spec_json).toBe(rawSpecJson);
+    expect(await engine.runNext()).toMatchObject({ id: deployment.id, status: "succeeded" });
+    expect((await store.operation(deployment.id))?.accepted_spec_json).toBe(rawSpecJson);
+    const workerRow: SharedAppNativeRouteRowPin = {
+      providerId,
+      routeKind: "worker",
+      routeKey: `worker/v2/${worker.resourceUid}`,
+      ownerNativeId: `v2-worker:${worker.resourceUid}`,
+      generation: 1,
+      operationId: `v2-worker:${deployment.id}`,
+      state: "active",
+      valueJson: JSON.stringify({
+        schema: "takoserver.v2-wfp-worker-route@v1",
+        generation: 1,
+        targetKey: TARGET,
+        workerUid: worker.resourceUid,
+        deploymentUid: deployment.resourceUid,
+        deploymentGeneration: 1,
+        sourceOperationId: deployment.id,
+        releases,
+      }),
+    };
+    const values = (row: SharedAppNativeRouteRowPin) => [
+      row.providerId,
+      row.routeKind,
+      row.routeKey,
+      row.ownerNativeId,
+      row.generation,
+      row.operationId,
+      row.state,
+      row.valueJson,
+    ];
+    await sql.run(
+      "INSERT INTO cloudflare_managed_worker_routes(provider_id,route_kind,route_key,owner_native_id,generation,operation_id,state,value_json) VALUES(?,?,?,?,?,?,?,?)",
+      values(workerRow),
+    );
+    await ledger
+      .forTrustedOwner(OWNER)
+      .reserve({ reservationId: "unsorted-genuine-original", name });
+    const endpoint = await accept(WORKER_ENDPOINT_FORM_URL, name, {
+      worker: { resourceUid: worker.resourceUid },
+    });
+    const execution = await claim(endpoint.id);
+    const hostRow: SharedAppNativeRouteRowPin = {
+      providerId,
+      routeKind: "host",
+      routeKey: `host/v2/${host}`,
+      ownerNativeId: workerRow.ownerNativeId,
+      generation: 1,
+      operationId: `v2-host:${deployment.id}:${host}`,
+      state: "active",
+      valueJson: JSON.stringify({
+        schema: "takoserver.v2-wfp-host-route@v1",
+        generation: 1,
+        targetKey: TARGET,
+        hostname: host,
+        workerUid: worker.resourceUid,
+        deploymentUid: deployment.resourceUid,
+        deploymentGeneration: 1,
+        endpointUid: endpoint.resourceUid,
+        endpointGeneration: 1,
+        sourceOperationId: deployment.id,
+      }),
+    };
+    const publication = createWorkerEndpointOriginV2FormRoutePublication({
+      sql,
+      ledger,
+      providerId,
+      targetKey: TARGET,
+      endpoint: { formUrl: WORKER_ENDPOINT_FORM_URL, backendId: backendIds.endpoint },
+      worker: { formUrl: MODULE_WORKER_FORM_URL, backendId: backendIds.worker },
+      deployment: { formUrl: WORKER_DEPLOYMENT_FORM_URL, backendId: backendIds.deployment },
+      version: { formUrl: WORKER_VERSION_FORM_URL, backendId: backendIds.version },
+    });
+    const result = await publication.prepareEndpointFormV2(execution, [hostRow]);
+    expect(result.kind).toBe("shared");
+    if (result.kind !== "shared" || !result.preparation.effects)
+      throw new Error("lawful unsorted accepted vector was refused");
+    const effects = result.preparation.effects;
+    expect(effects.original.nextBinding?.releases).toEqual(releases);
+    await sql.batch([
+      ...effects.before,
+      {
+        sql: `INSERT INTO cloudflare_managed_worker_routes(provider_id,route_kind,route_key,owner_native_id,generation,operation_id,state,value_json) SELECT ?,?,?,?,?,?,?,? WHERE (${effects.publicationGuard.sql})`,
+        params: [...values(hostRow), ...(effects.publicationGuard.params ?? [])],
+      },
+      ...effects.after,
+    ]);
+    expect((await result.preparation.settleOriginal())?.original.nextBinding?.releases).toEqual(
+      releases,
+    );
+    expect(await result.preparation.observe()).toBe("confirmed");
+    await settle(execution);
+    expect(await result.preparation.observe()).toBe("confirmed");
+    expect((await store.operation(deployment.id))?.accepted_spec_json).toBe(rawSpecJson);
+    expect((await store.resource(deployment.resourceUid))?.spec_json).toBe(rawSpecJson);
+    expect(db.query("SELECT count(*) AS n FROM shared_app_staging_batch_assertions").get()).toEqual(
+      { n: 0 },
+    );
+  } finally {
+    db.close();
   }
 });
