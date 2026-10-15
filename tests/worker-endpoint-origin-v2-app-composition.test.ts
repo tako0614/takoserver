@@ -66,6 +66,18 @@ function sharedSchema(db: Database, includeBindings: boolean, typed = false): vo
       CHECK((state='released')=(released_at IS NOT NULL)))`);
     db.exec(`CREATE TABLE ${prefix}_batch_assertions (witness TEXT PRIMARY KEY,
       ok INTEGER NOT NULL CHECK(ok=1),apply_effects INTEGER NOT NULL CHECK(apply_effects IN (0,1)))`);
+    if (typed)
+      db.exec(`CREATE TABLE ${prefix}_route_commands (
+        organization_id TEXT NOT NULL,product TEXT NOT NULL,reservation_id TEXT NOT NULL,name TEXT NOT NULL,
+        incarnation TEXT NOT NULL REFERENCES ${prefix}_assignments(incarnation),
+        action TEXT NOT NULL CHECK(action IN ('activate','advance','retire')),command_ref TEXT NOT NULL,
+        prior_generation INTEGER NOT NULL,prior_state TEXT NOT NULL,prior_script TEXT,next_script TEXT,
+        endpoint_uid TEXT NOT NULL,endpoint_generation INTEGER NOT NULL,worker_uid TEXT NOT NULL,
+        deployment_uid TEXT NOT NULL,deployment_generation INTEGER NOT NULL,source_operation_id TEXT NOT NULL,
+        provider_id TEXT NOT NULL,target_key TEXT NOT NULL,next_generation INTEGER NOT NULL,next_state TEXT NOT NULL,
+        created_at INTEGER NOT NULL,form_v2_original_json TEXT,
+        PRIMARY KEY(organization_id,command_ref),UNIQUE(incarnation,next_generation),
+        CHECK(next_generation=prior_generation+1),CHECK(next_generation BETWEEN 2 AND 9007199254740990))`);
   }
   if (!includeBindings) return;
   // Fixture-only operation FKs: current Core retains operation rows; it has no GC DELETE.
@@ -92,6 +104,13 @@ async function fixture(
   const statements: SqlStatement[] = [];
   const batches: (readonly SqlStatement[])[] = [];
   let lastBatchError: unknown;
+  let actualBatchCalls = 0;
+  let pausedBatch:
+    | {
+        readonly entered: (batch: readonly SqlStatement[]) => void;
+        readonly untilResumed: Promise<void>;
+      }
+    | undefined;
   // Observe complete typed statements, delegating every actual result/write unchanged.
   const sql: Sql = {
     async query(query, params) {
@@ -109,8 +128,15 @@ async function fixture(
       }));
       statements.push(...captured);
       batches.push(captured);
+      const paused = pausedBatch;
+      pausedBatch = undefined;
+      if (paused) {
+        paused.entered(captured);
+        await paused.untilResumed;
+      }
       lastBatchError = undefined;
       try {
+        actualBatchCalls++;
         return await raw.batch(batch);
       } catch (error) {
         lastBatchError = error;
@@ -320,6 +346,21 @@ async function fixture(
       ),
     statements,
     batches,
+    actualBatches: () => actualBatchCalls,
+    pauseNextBatch() {
+      if (pausedBatch) throw new Error("an actual owner batch is already paused");
+      let entered: ((batch: readonly SqlStatement[]) => void) | undefined;
+      let resume: (() => void) | undefined;
+      const reached = new Promise<readonly SqlStatement[]>((resolve) => {
+        entered = resolve;
+      });
+      const untilResumed = new Promise<void>((resolve) => {
+        resume = resolve;
+      });
+      if (!entered || !resume) throw new Error("actual batch pause was not constructed");
+      pausedBatch = { entered, untilResumed };
+      return Object.freeze({ reached, resume });
+    },
     reserve: (name: string) =>
       ledger.forTrustedOwner(owner).reserve({ reservationId: `claim-${name}`, name }),
     lastBatchError: () => lastBatchError,
@@ -870,6 +911,109 @@ test("actual public carrier PUT creates the original consumed by real App Engine
   }
 });
 
+test("actual Engine acceptance wins against an already prepared carrier cancellation", async () => {
+  const f = await fixture({ typed: true, carrier: true });
+  let resume = () => {};
+  let cancellation: Promise<Response> | undefined;
+  try {
+    const app = f.makeApp({ ...f.selection, kind: "form-v2@1" });
+    const name = "accept-before-cancel";
+    const id = "accept-before-cancel-original";
+    expect((await f.control(app, "PUT", id, name)).status).toBe(201);
+    const original = await f.ledger.forTrustedOwner(f.owner).readOriginalRoute(id);
+    const writes = f.actualBatches();
+    const pause = f.pauseNextBatch();
+    resume = pause.resume;
+    cancellation = f.control(app, "DELETE", id, name);
+    const cancelledBatch = await pause.reached;
+    expect(
+      cancelledBatch.some((statement) =>
+        /UPDATE worker_endpoint_origin_reservations\b/u.test(statement.sql),
+      ),
+    ).toBe(true);
+
+    const created = await f.create(app, name, "actual-accept-before-cancel-0001");
+    expect(created.status).toBe(202);
+    const operation: unknown = await created.json();
+    if (
+      operation === null ||
+      typeof operation !== "object" ||
+      !("id" in operation) ||
+      typeof operation.id !== "string" ||
+      !("resourceUid" in operation) ||
+      typeof operation.resourceUid !== "string"
+    )
+      throw new Error("actual accepted operation is missing");
+    expect(f.db.query(`SELECT endpoint_uid,create_operation_id FROM ${BINDINGS}`).get()).toEqual({
+      endpoint_uid: operation.resourceUid,
+      create_operation_id: operation.id,
+    });
+    resume();
+    expect((await cancellation).status).toBe(422);
+    expect(f.actualBatches() - writes).toBe(2);
+    expect(f.db.query("SELECT count(*) AS n FROM tf_v2_operations").get()).toEqual({ n: 1 });
+    expect(f.db.query("SELECT count(*) AS n FROM tf_v2_resources").get()).toEqual({ n: 1 });
+    expect(
+      f.db
+        .query("SELECT state,revision,released_at FROM worker_endpoint_origin_reservations")
+        .get(),
+    ).toEqual({ state: "prepared", revision: 1, released_at: null });
+    expect(await f.ledger.forTrustedOwner(f.owner).readOriginalRoute(id)).toEqual(original);
+  } finally {
+    resume();
+    await cancellation?.catch(() => undefined);
+    f.close();
+  }
+}, 10_000);
+
+test("actual carrier cancellation wins against already prepared Engine acceptance", async () => {
+  const f = await fixture({ typed: true, carrier: true });
+  let resume = () => {};
+  let acceptance: Promise<Response> | undefined;
+  try {
+    const app = f.makeApp({ ...f.selection, kind: "form-v2@1" });
+    const name = "cancel-before-accept";
+    const id = "cancel-before-accept-original";
+    expect((await f.control(app, "PUT", id, name)).status).toBe(201);
+    const writes = f.actualBatches();
+    const pause = f.pauseNextBatch();
+    resume = pause.resume;
+    acceptance = f.create(app, name, "actual-cancel-before-accept-0001");
+    const acceptedBatch = await pause.reached;
+    expect(
+      acceptedBatch.some((statement) => /INSERT INTO tf_v2_operations\b/u.test(statement.sql)),
+    ).toBe(true);
+    expect(acceptedBatch.at(-1)?.sql).toContain(`INSERT INTO ${BINDINGS}`);
+    expect((await f.control(app, "DELETE", id, name)).status).toBe(204);
+    resume();
+    const refused = await acceptance;
+    // Preserve the existing Engine constraint propagation. Durable rows and
+    // the actual constraint below establish refusal, not HTTP500 by itself.
+    expect(refused.status).toBe(500);
+    expect(await refused.json()).toMatchObject({ code: "internal_error" });
+    const error = f.lastBatchError();
+    expect(error).toBeInstanceOf(SqlError);
+    if (!(error instanceof SqlError)) throw new Error("actual acceptance constraint is missing");
+    expect(error.code).toBe("constraint");
+    expect(error.message).toContain(BINDINGS);
+    expect(f.actualBatches() - writes).toBe(2);
+    emptyAcceptance(f);
+    expect(
+      f.db
+        .query("SELECT state,revision,released_at FROM worker_endpoint_origin_reservations")
+        .get(),
+    ).toEqual({ state: "released", revision: 2, released_at: Date.parse(AT) });
+    expect(
+      f.db.query("SELECT generation,state,released_at FROM shared_app_staging_names").get(),
+    ).toEqual({ generation: 2, state: "released", released_at: Date.parse(AT) });
+    expect(await f.ledger.readCurrentRoute(name)).toBeNull();
+  } finally {
+    resume();
+    await acceptance?.catch(() => undefined);
+    f.close();
+  }
+}, 10_000);
+
 test("adding a carrier leaves valid direct permanent originals independent of legacy TTL rows", async () => {
   const f = await fixture({ typed: true, carrier: true });
   try {
@@ -885,6 +1029,56 @@ test("adding a carrier leaves valid direct permanent originals independent of le
     expect(await f.ledger.forTrustedOwner(f.owner).readOriginal(claim.reservationId)).toEqual(
       claim,
     );
+  } finally {
+    f.close();
+  }
+});
+
+test("carrier cancellation refuses actual retained ordinary v2 history even after Resource deletion", async () => {
+  const f = await fixture({ typed: true, carrier: true });
+  try {
+    const selected = f.makeApp({ ...f.selection, kind: "form-v2@1" });
+    const ordinary = f.makeApp();
+    const name = "retained-ordinary-origin";
+    const id = "retained-ordinary-original";
+    expect((await f.control(selected, "PUT", id, name)).status).toBe(201);
+    const original = await f.ledger.forTrustedOwner(f.owner).readOriginalRoute(id);
+    // Actual old/unselected writer: it creates no shared Endpoint binding.
+    const response = await f.create(ordinary, name, "ordinary-retained-create-0001");
+    expect(response.status).toBe(202);
+    const operation: unknown = await response.json();
+    if (
+      !operation ||
+      typeof operation !== "object" ||
+      !("resourceUid" in operation) ||
+      typeof operation.resourceUid !== "string"
+    )
+      throw new Error("missing real accepted Resource");
+    expect(await ordinary.tickTakoformV2()).toMatchObject({ status: "succeeded" });
+    expect(f.db.query(`SELECT count(*) AS n FROM ${BINDINGS}`).get()).toEqual({ n: 0 });
+    expect((await f.control(selected, "DELETE", id, name)).status).toBe(422);
+    const deleted = await f.request(ordinary, `/resources/${operation.resourceUid}`, {
+      method: "DELETE",
+      headers: {
+        "idempotency-key": "ordinary-retained-delete-0001",
+        "takoform-expected-generation": "1",
+      },
+    });
+    expect(deleted.status).toBe(202);
+    expect(await ordinary.tickTakoformV2()).toMatchObject({ status: "succeeded" });
+    expect(
+      f.db
+        .query("SELECT active_name,deleted_at FROM tf_v2_resources WHERE uid=?")
+        .get(operation.resourceUid),
+    ).toEqual({ active_name: null, deleted_at: AT });
+    const resources = await f.raw.query("SELECT * FROM tf_v2_resources");
+    const operations = await f.raw.query("SELECT * FROM tf_v2_operations ORDER BY id");
+    const writes = f.actualBatches();
+    expect((await f.control(selected, "DELETE", id, name)).status).toBe(422);
+    expect(f.actualBatches()).toBe(writes);
+    expect(await f.ledger.forTrustedOwner(f.owner).readOriginalRoute(id)).toEqual(original);
+    expect(await f.raw.query("SELECT * FROM tf_v2_resources")).toEqual(resources);
+    expect(await f.raw.query("SELECT * FROM tf_v2_operations ORDER BY id")).toEqual(operations);
   } finally {
     f.close();
   }

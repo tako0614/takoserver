@@ -100,18 +100,52 @@ and original incarnation, never another write. If readback is unavailable, the
 internal error retains that original tuple and the public response remains the
 existing generic refusal envelope.
 
-Selected legacy bind, activate, host mint, Endpoint assignment and release
-methods currently refuse with `unsupported_capability` (422). Their v1 Resource
-and Deployment witnesses do not establish v2 publication or drain. Even after a
-v2 Endpoint is accepted, legacy DELETE cannot report global release success.
-Actual v2 publication, native drain and retirement/release remain owning work.
+A failed allocation becomes a known 409 only when one fresh query proves a
+consistent competing name/assignment tuple, no different retained incarnation
+for that name, and neither metadata nor assignment for the requested original.
+The competing row must pass the existing strict route decoder with the selected
+typed columns present. That decoded data is used only to classify refusal;
+it is never adopted as an owner or dispatch grant. Ambiguous, malformed or
+unreadable authority remains unavailable (503).
+
+The selected carrier's DELETE can cancel an untouched, never-accepted original.
+Its closed trusted `prepareReleaseUnpublished(fullPin)` port is pure: it captures
+the staging original and first timestamp synchronously and returns SQL effects,
+never a second transaction. It requires scalar generation 1, reserved state,
+no script, no typed binding and no route-command history. The carrier joins
+these effects with its full original metadata CAS in one batch. Real terminal
+CHECK assertions reject a zero-row metadata update and roll back the whole atom.
+Successful cancellation advances both assignment and name to generation 2,
+retains the original incarnation and first timestamp, and retains the permanent
+name tombstone. The name never becomes available to another reference or owner.
+
+Cancellation also requires absence of retained Endpoint bindings, route commands,
+the canonical direct-Org v2 Resource/Operation/native-effect relation and native
+hostname routes across providers, including deleted Resources and active or
+tombstoned routes. These predicates run inside the same batch as the metadata
+mutation. An already accepted Endpoint, tagged or active/retired assignment,
+ambiguous original or retained history refuses with 422. Missing/unreadable
+authority refuses with 503. A failed batch is settled only by fresh original
+readback; an unresolved ACK retains that original and first attempted timestamp.
+Exact repeated cancellation is read-only, returns 204, and GET returns absent.
+Compatibility TTL expiry alone still does not cancel or mutate a global hold.
+
+Selected legacy bind, activate, host mint and Endpoint-assignment methods still
+refuse with `unsupported_capability` (422). Their v1 Resource and Deployment
+witnesses do not establish v2 publication or drain. Cancellation does not provide
+postacceptance release, native drain, a browser-origin reset, old-writer cutover
+or activation. Default legacy construction and its existing exclusions retain
+their behavior. Actual v2 publication/native drain/retirement remain owning work.
 
 The added fixtures prepare real account-authenticated HTTP reservations, use
 real Core Engine/Store acceptance, inject an actual transactional metadata
 failure, and distinguish lost commit ACK from unavailable readback. The Worker
 fixture uses the existing supply parser/local Provider derivation and real local
 D1; native Provider RPC is forbidden by its fixture. At this source checkpoint
-all new runtime/type checks are **UNRUN**. Fixture DDL remains unallocated, and
+the native D1 cancellation fixture composes real ledger effects with an
+explicitly owner-like metadata constraint; actual carrier and accepted graph
+behavior are exercised separately through HTTP and the real Engine/Store.
+Fixture DDL remains unallocated, and
 neither these fixtures nor the optional constructor prove private entry mounting,
 real Offering eligibility, deployed authority, staging or production behavior.
 
