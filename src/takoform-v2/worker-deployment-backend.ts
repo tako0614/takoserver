@@ -9,7 +9,9 @@ import {
 import {
   CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
   FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+  FORWARD_WORKER_VERSION_FORM_URL,
   parseForwardWorkerDeploymentSpec,
+  parseForwardWorkerVersionSpec,
   parseWorkerDeploymentSpec,
   parseWorkerVersionSpec,
   validateForwardWorkerDeploymentUpdate,
@@ -93,19 +95,23 @@ function deploymentAdmission(input: {
  * No other native sender may be installed for the same Worker UID/target.
  * The caller owns that mapping, durable owner lock, and runtime lifecycle.
  */
-export function createWorkerDeploymentForm(options: {
-  readonly targetKey: string;
-  readonly publicationState: PublicationState;
-  readonly ownerForWorker: (workerUid: string) => Promise<RuntimeOwner> | RuntimeOwner;
-  /** A missing reader is refusal, never evidence that no Cron attachment exists. */
-  readonly scheduledAttachments: V2ScheduledAttachmentRequirementReader;
-}): V2Form {
+export function createWorkerDeploymentForm(
+  options: {
+    readonly targetKey: string;
+    readonly publicationState: PublicationState;
+    readonly ownerForWorker: (workerUid: string) => Promise<RuntimeOwner> | RuntimeOwner;
+    /** A missing reader is refusal, never evidence that no Cron attachment exists. */
+    readonly scheduledAttachments: V2ScheduledAttachmentRequirementReader;
+  },
+  forward = false,
+): V2Form {
   if (!options.targetKey) throw new TypeError("targetKey is required");
   if (!options.scheduledAttachments) throw new TypeError("scheduledAttachments is required");
 
   async function run(execution: V2Execution): Promise<V2BackendResult> {
     if (
-      execution.form !== WORKER_DEPLOYMENT_FORM_URL ||
+      execution.form !==
+        (forward ? FORWARD_WORKER_DEPLOYMENT_FORM_URL : WORKER_DEPLOYMENT_FORM_URL) ||
       execution.backendId !== WORKER_DEPLOYMENT_BACKEND_ID ||
       execution.targetKey !== options.targetKey ||
       (execution.action !== "create" &&
@@ -166,7 +172,12 @@ export function createWorkerDeploymentForm(options: {
         missingScheduledHandler =
           result.required &&
           (before.snapshot.deployment?.versions.some(
-            (version) => !parseWorkerVersionSpec(version.spec).handlers.includes("scheduled"),
+            (version) =>
+              !(
+                version.form === FORWARD_WORKER_VERSION_FORM_URL
+                  ? parseForwardWorkerVersionSpec(version.spec)
+                  : parseWorkerVersionSpec(version.spec)
+              ).handlers.includes("scheduled"),
           ) ??
             true);
       } catch {
@@ -300,7 +311,9 @@ export function createWorkerDeploymentForm(options: {
     },
     async prepareAdmission(input) {
       try {
-        return deploymentAdmission(input);
+        return forward
+          ? await prepareForwardWorkerDeploymentReferences(input, deploymentAdmission(input))
+          : deploymentAdmission(input);
       } catch (error) {
         if (error instanceof WorkerFormValidationError) throw new TakoformV2Error(error.code, 422);
         throw error;
@@ -308,7 +321,9 @@ export function createWorkerDeploymentForm(options: {
     },
     references(spec) {
       try {
-        return referencesForWorkerDeployment(parseWorkerDeploymentSpec(spec));
+        return forward
+          ? fixedReferencesForForwardWorkerDeployment(parseForwardWorkerDeploymentSpec(spec))
+          : referencesForWorkerDeployment(parseWorkerDeploymentSpec(spec));
       } catch (error) {
         if (error instanceof WorkerFormValidationError) throw new TakoformV2Error(error.code, 422);
         throw error;
@@ -381,8 +396,29 @@ export async function exactV2WorkerPublicationIdentity(
 }
 
 /** Exact forward admission; no legacy runtime fallback or default registration. */
-export function createForwardWorkerDeploymentForm(options: { readonly targetKey: string }): V2Form {
+export function createForwardWorkerDeploymentForm(
+  options:
+    | { readonly targetKey: string }
+    | (Omit<Parameters<typeof createWorkerDeploymentForm>[0], "publicationState"> & {
+        readonly publicationState: PublicationState & {
+          resolveForward(input: {
+            execution: V2Execution;
+            incumbentSourceOperationId?: string;
+          }): Promise<V2WorkerPublicationResolution>;
+        };
+      }),
+): V2Form {
   if (!options.targetKey) throw new TypeError("targetKey is required");
+  if ("publicationState" in options)
+    return createWorkerDeploymentForm(
+      {
+        ...options,
+        publicationState: {
+          resolve: options.publicationState.resolveForward.bind(options.publicationState),
+        },
+      },
+      true,
+    );
   const unavailable = async (execution: V2Execution): Promise<V2BackendResult> => ({
     kind: "unknown",
     code:

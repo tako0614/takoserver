@@ -24,6 +24,9 @@ import {
 import type { ObjectBucketWorkerBindingClaim } from "./forms/object-bucket-worker-binding-authority.ts";
 import type { SQLiteWorkerBindingClaim } from "./forms/sqlite-worker-binding-authority.ts";
 import {
+  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+  FORWARD_WORKER_VERSION_FORM_URL,
+  parseForwardWorkerVersionSpec,
   parseWorkerVersionSpec,
   WORKER_DEPLOYMENT_FORM_URL,
   WORKER_ENDPOINT_FORM_URL,
@@ -37,7 +40,10 @@ import {
   projectV2ResolvedServiceBindings,
   v2ServiceTargetName,
 } from "./worker-service-resolution.ts";
-import { projectV2StaticWorkerVersion } from "./worker-static-runtime.ts";
+import {
+  projectV2ForwardStaticWorkerVersion,
+  projectV2StaticWorkerVersion,
+} from "./worker-static-runtime.ts";
 import type { V2WorkflowBindingClaim } from "./workflow-binding-authority.ts";
 import { projectV2WorkflowForward } from "./workflow-binding-projection.ts";
 
@@ -45,6 +51,10 @@ const OPERATION_MARKER = "takoserver-v2-operation:";
 const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
 type PublicationState = {
+  resolveForward?(input: {
+    execution: V2Execution;
+    incumbentSourceOperationId?: string;
+  }): Promise<V2WorkerPublicationResolution>;
   resolve(input: {
     execution: V2Execution;
     incumbentSourceOperationId?: string;
@@ -223,6 +233,7 @@ export function createV2WorkerPublication(options: {
         readonly resourceUid: string;
       };
       readonly vector: string;
+      readonly targetFormUrl?: string;
     } | null>;
   };
   /** Fixed Host-private KV broker; grants use exact selected Version provenance. */
@@ -345,7 +356,16 @@ export function createV2WorkerPublication(options: {
         hostnames: [],
       };
       let projection: WorkerdDeploymentVariant<WorkerdSite | WorkerdStaticSite>;
-      const versionSpec = parseWorkerVersionSpec(version.spec);
+      const versionSpec =
+        version.form === FORWARD_WORKER_VERSION_FORM_URL
+          ? parseForwardWorkerVersionSpec(version.spec)
+          : parseWorkerVersionSpec(version.spec);
+      if (
+        version.form &&
+        (parseForwardWorkerVersionSpec(versionSpec).containerBindings.length ||
+          !version.bucketBindings)
+      )
+        throw new Error("forward bindings unavailable");
       if (versionSpec.bundle) {
         const actorClaims = versionSpec.actorBindings.map((binding) => ({
           name: binding.name,
@@ -455,10 +475,24 @@ export function createV2WorkerPublication(options: {
           };
           sqliteBoot = { address: binder.address, token: binder.issueGrant(grant) };
         }
-        const bucketBindings = versionSpec.bucketBindings.map((binding) => ({
-          name: binding.name,
-          resourceUid: binding.resource.resourceUid,
-        }));
+        const bucketBindings = version.form
+          ? versionSpec.bucketBindings.map((binding) => {
+              const selected = version.bucketBindings?.find(
+                (item) =>
+                  item.publicName === binding.name &&
+                  item.resourceUid === binding.resource.resourceUid,
+              );
+              if (!selected) throw new Error("forward bucket profile unavailable");
+              return {
+                name: binding.name,
+                resourceUid: selected.resourceUid,
+                formUrl: selected.formUrl,
+              };
+            })
+          : versionSpec.bucketBindings.map((binding) => ({
+              name: binding.name,
+              resourceUid: binding.resource.resourceUid,
+            }));
         let objectBucketBoot:
           | {
               readonly address: string;
@@ -491,6 +525,10 @@ export function createV2WorkerPublication(options: {
               current.identity.principal !== claim.principal ||
               current.identity.space !== claim.space ||
               current.identity.resourceUid !== binding.resourceUid ||
+              (version.form !== undefined &&
+                current.targetFormUrl !==
+                  version.bucketBindings?.find((item) => item.publicName === binding.name)
+                    ?.formUrl) ||
               typeof current.vector !== "string" ||
               current.vector.length === 0
             ) {
@@ -714,6 +752,7 @@ export function createV2WorkerPublication(options: {
               : {}),
           },
           spec: versionSpec,
+          ...(version.form === undefined ? {} : { sourceForm: version.form }),
           bundle: materials.bundle,
           assets: materials.assets,
           inspectModule,
@@ -756,6 +795,9 @@ export function createV2WorkerPublication(options: {
           ...(queueSettlement === undefined ? {} : { queueSettlement }),
         });
         const graph = compileWorkerdVersionGraph({
+          ...(version.form === undefined
+            ? {}
+            : { forwardObjectBucketBindings: version.bucketBindings }),
           directory: name,
           mainModule: codeProjection.site.mainModule,
           modules: codeProjection.modules,
@@ -831,7 +873,9 @@ export function createV2WorkerPublication(options: {
         };
         deferRetirementUntilDeadline = true;
       } else {
-        projection = await projectV2StaticWorkerVersion({
+        projection = await (version.form
+          ? projectV2ForwardStaticWorkerVersion
+          : projectV2StaticWorkerVersion)({
           identity,
           spec: versionSpec,
           materials,
@@ -853,8 +897,19 @@ export function createV2WorkerPublication(options: {
     };
   }
 
+  async function resolveSelected(input: {
+    execution: V2Execution;
+    incumbentSourceOperationId?: string;
+  }): Promise<V2WorkerPublicationResolution> {
+    if (input.execution.form === FORWARD_WORKER_DEPLOYMENT_FORM_URL) {
+      const resolve = options.publicationState.resolveForward;
+      if (!resolve) throw new Error("forward publication resolver unavailable");
+      return resolve.call(options.publicationState, input);
+    }
+    return options.publicationState.resolve(input);
+  }
   async function resolveInitial(execution: V2Execution) {
-    return await options.publicationState.resolve({ execution });
+    return resolveSelected({ execution });
   }
 
   async function resultFromReadback(
@@ -883,7 +938,8 @@ export function createV2WorkerPublication(options: {
     async publish(execution) {
       if (
         (execution.form !== WORKER_DEPLOYMENT_FORM_URL &&
-          execution.form !== WORKER_ENDPOINT_FORM_URL) ||
+          execution.form !== WORKER_ENDPOINT_FORM_URL &&
+          execution.form !== FORWARD_WORKER_DEPLOYMENT_FORM_URL) ||
         execution.targetKey !== options.targetKey
       ) {
         return notDispatched("worker_publication_target_mismatch");
@@ -941,7 +997,7 @@ export function createV2WorkerPublication(options: {
                 throw new Error("current operation publication is not proven serving");
               }
             }
-            const resolved = await options.publicationState.resolve({
+            const resolved = await resolveSelected({
               execution,
               ...(incumbentSourceOperationId === undefined ? {} : { incumbentSourceOperationId }),
             });
@@ -965,7 +1021,8 @@ export function createV2WorkerPublication(options: {
     async observe(execution) {
       if (
         (execution.form !== WORKER_DEPLOYMENT_FORM_URL &&
-          execution.form !== WORKER_ENDPOINT_FORM_URL) ||
+          execution.form !== WORKER_ENDPOINT_FORM_URL &&
+          execution.form !== FORWARD_WORKER_DEPLOYMENT_FORM_URL) ||
         execution.targetKey !== options.targetKey
       ) {
         return unknownResult();
