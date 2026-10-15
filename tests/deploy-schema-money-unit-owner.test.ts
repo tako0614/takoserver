@@ -29,6 +29,7 @@ import { expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
 import {
   buildMoneyCutoverImportSql,
   type MoneyCutoverDispatchBinding,
+  type MoneyPost94DispatchBinding,
   type MoneyReviewBinding,
   moneyCutoverBindingDigest,
   moneyUnitCutoverSourcePrefixDigest,
@@ -2202,6 +2203,116 @@ describe("money acknowledged import input failure", () => {
       );
     } finally {
       post.close();
+    }
+  });
+});
+
+function post94CustodyFixture() {
+  const f = sealedImportCustodyFixture();
+  const binding: MoneyPost94DispatchBinding = {
+    ...f.binding,
+    kind: "takoserver.money-cutover-dispatch@v2",
+    phase: "suffix98",
+    previousWriterEpoch: writerEpoch,
+    nextWriterEpoch: sha("next retained writer epoch"),
+    original92BackupDigest: f.binding.backupDigest,
+    converted94BackupDigest: sha("converted full94 snapshot"),
+    convertBindingDigest: sha("original terminal convert binding"),
+    modePreparationDigest: sha("structural fixture, never real Financial mode authority"),
+    afterSchemaPhase: "0098-fenced",
+    writerEpoch,
+  };
+  return { ...f, binding };
+}
+
+describe("post94 retained custody component", () => {
+  test("post94 holds exact v2 dispatch through the existing readonly seal without authorizing apply", async () => {
+    const f = post94CustodyFixture();
+    try {
+      const seal = sealDirectory(f.directory, ["import.sql"]);
+      const options = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+      expect((await options.custody.dispatch(f.binding)).state).toBe("dispatched");
+      const reopened = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+      expect(await reopened.custody.readDispatch("suffix98")).toEqual(f.binding);
+      expect(await reopened.custody.read("suffix98")).toMatchObject({ state: "dispatched" });
+      await expect(reopened.custody.dispatch(f.binding)).rejects.toThrow("already exists");
+      const before = [...f.requests];
+      await expect(
+        runIntegrationMoneyUnitCutover(
+          { action: "apply", environment: "integration", commit: source, throughMigration: "0098" },
+          target,
+          { ...options, phase: "suffix98" },
+        ),
+      ).rejects.toThrow("Financial realm transition port");
+      expect(f.requests).toEqual(before);
+      expect(await reopened.custody.read("suffix98")).toMatchObject({ state: "dispatched" });
+      expect(() => seal.assertUnchanged()).not.toThrow();
+      expect(lstatSync(f.directory).mode & 0o777).toBe(0o500);
+      expect(lstatSync(f.sealedImportPath).mode & 0o777).toBe(0o400);
+    } finally {
+      removeArtifactTree(f.directory);
+    }
+  });
+
+  test("post94 v2 parser refuses legacy promotion, missing history, equal epochs and field drift", async () => {
+    const mutations = [
+      { kind: "takoserver.money-cutover-dispatch@v1" },
+      { phase: "freeze" },
+      { previousWriterEpoch: sha("invalid selection") },
+      { nextWriterEpoch: writerEpoch },
+      { original92BackupDigest: sha("wrong old backup") },
+      { converted94BackupDigest: null },
+      { convertBindingDigest: "not-a-digest" },
+      { modePreparationDigest: null },
+      { afterSchemaPhase: "0098" },
+      { extra: true },
+    ];
+    for (const mutation of mutations) {
+      const f = post94CustodyFixture();
+      try {
+        sealDirectory(f.directory, ["import.sql"]);
+        const options = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+        const binding = { ...f.binding, ...mutation };
+        // Raw retained record tests the real protected parser, without a type escape or writer.
+        writeFileSync(
+          join(f.root, "suffix98.dispatched.json"),
+          JSON.stringify({
+            kind: "takoserver.money-cutover-dispatch-record@v1",
+            receipt: {
+              kind: "takoserver.money-cutover-custody@v1",
+              phase: "suffix98",
+              state: "dispatched",
+              bindingDigest: sha(JSON.stringify(binding)),
+              postDigest: null,
+            },
+            binding,
+          }),
+          { mode: 0o600 },
+        );
+        await expect(options.custody.readDispatch("suffix98")).rejects.toThrow("malformed");
+        expect(existsSync(join(f.root, "suffix98.terminal.json"))).toBe(false);
+      } finally {
+        removeArtifactTree(f.directory);
+      }
+    }
+  });
+
+  test("post94 owner declaration cannot turn a retained v2 record into a native writer selection", async () => {
+    const f = post94CustodyFixture();
+    try {
+      f.write(f.paths.declaration, {
+        ...f.declaration,
+        phase: "suffix98",
+        nextWriterEpoch: f.binding.nextWriterEpoch,
+      });
+      const before = [...f.requests];
+      await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, target, f)).rejects.toThrow(
+        "declaration is malformed",
+      );
+      expect(f.requests).toEqual(before);
+      expect(existsSync(join(f.root, "suffix98.dispatched.json"))).toBe(false);
+    } finally {
+      removeArtifactTree(f.directory);
     }
   });
 });
