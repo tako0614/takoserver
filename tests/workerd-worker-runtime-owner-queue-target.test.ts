@@ -12,6 +12,7 @@ import type { V2Execution } from "../src/takoform-v2/types.ts";
 import type { V2WorkerPublicationResolution } from "../src/takoform-v2/worker-publication-state.ts";
 import {
   linuxProcessLiveness,
+  readLinuxProcessIdentity,
   spawnWorkerdWithParentDeath,
   workerPortOwnership,
 } from "../src/workerd-linux-process.ts";
@@ -908,4 +909,160 @@ test("a candidate whose first child spawn fails can retry the same accepted Oper
   } finally {
     await closeFixtureOwner(owner, children, root, primaryFailure);
   }
+});
+
+test("automatic child restart confirms its new Queue birth and preserves old-birth absence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "takoserver-queue-owner-restart-"));
+  const binary = join(root, "bun-workerd-stand-in.js");
+  const children: ReturnType<typeof spawnWorkerdWithParentDeath>[] = [];
+  const publication = publicationState();
+  await writeFile(binary, `#!${process.execPath}\n${CHILD_SOURCE}`, { mode: 0o700 });
+  await chmod(binary, 0o700);
+  const owner = await openWorkerdWorkerRuntimeOwner({
+    rootDirectory: join(root, "owners"),
+    workerResourceUid: WORKER_UID,
+    targetKey: TARGET_KEY,
+    publicationState: publication.source,
+    workerdBinary: binary,
+    listenerPortForOperation: unusedPort,
+    spawn(command): WorkerdProcess {
+      const child = spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "ignore" });
+      children.push(child);
+      return child;
+    },
+  });
+  const readPersistedChild = async () => {
+    const workerKey = createHash("sha256").update(WORKER_UID).digest("hex");
+    const state: unknown = JSON.parse(
+      await Bun.file(join(root, "owners", workerKey, "runtime-owner.json")).text(),
+    );
+    if (
+      typeof state !== "object" ||
+      state === null ||
+      !("incarnations" in state) ||
+      !Array.isArray(state.incarnations)
+    )
+      throw new Error("owner incarnation inventory missing");
+    const record: unknown = state.incarnations.find(
+      (item: unknown) =>
+        typeof item === "object" &&
+        item !== null &&
+        "operationId" in item &&
+        item.operationId === CREATE_ID,
+    );
+    if (
+      typeof record !== "object" ||
+      record === null ||
+      !("listenerPort" in record) ||
+      typeof record.listenerPort !== "number" ||
+      !("processIdentity" in record) ||
+      typeof record.processIdentity !== "object" ||
+      record.processIdentity === null ||
+      !("pid" in record.processIdentity) ||
+      typeof record.processIdentity.pid !== "number"
+    )
+      throw new Error("persisted exact child or listener missing");
+    return { listenerPort: record.listenerPort, processIdentity: record.processIdentity };
+  };
+  const failures: unknown[] = [];
+  try {
+    expect(await owner.execute(execution(CREATE_ID, "create"))).toMatchObject({
+      kind: "confirmed",
+    });
+    publication.setCurrent(CREATE_ID);
+    const oldRecord = await readPersistedChild();
+    const predecessor = children.find((child) => child.pid === oldRecord.processIdentity.pid);
+    if (!predecessor?.pid) throw new Error("owned predecessor child missing");
+    const oldBirth = await readLinuxProcessIdentity(predecessor.pid);
+    expect(oldRecord.processIdentity).toEqual(oldBirth);
+    const oldTarget = {
+      workerUid: WORKER_UID,
+      versionId: await nativeVersionId(CREATE_ID, 1),
+      incarnationId: await physicalIncarnationId(root, CREATE_ID),
+      servingSourceOperationId: CREATE_ID,
+    };
+    expect(await owner.observeQueueTarget(oldTarget)).toEqual({
+      kind: "confirmed",
+      ...oldTarget,
+      status: "active",
+    });
+    predecessor.kill("SIGKILL");
+    await predecessor.exited;
+    expect(await linuxProcessLiveness(oldBirth)).toBe("stale");
+
+    let successor: ReturnType<typeof spawnWorkerdWithParentDeath> | undefined;
+    let newBirth: Awaited<ReturnType<typeof readLinuxProcessIdentity>> | undefined;
+    let newPhysicalId: string | undefined;
+    let newRecord: Awaited<ReturnType<typeof readPersistedChild>> | undefined;
+    const nativeDeadline = Date.now() + 3_000;
+    while (Date.now() < nativeDeadline) {
+      const current = await readPersistedChild();
+      const child = children.find(
+        (item) =>
+          item !== predecessor &&
+          item.pid === current.processIdentity.pid &&
+          item.exitCode === null &&
+          item.signalCode === null,
+      );
+      if (child?.pid) {
+        const birth = await readLinuxProcessIdentity(child.pid);
+        const physicalId = await physicalIncarnationId(root, CREATE_ID);
+        if (
+          physicalId !== oldTarget.incarnationId &&
+          (await linuxProcessLiveness(birth)) === "live" &&
+          (await workerPortOwnership(current.listenerPort, child.pid)) === "owned" &&
+          owner.health() === "serving"
+        ) {
+          successor = child;
+          newBirth = birth;
+          newPhysicalId = physicalId;
+          newRecord = current;
+          break;
+        }
+      }
+      await Bun.sleep(20);
+    }
+    if (!successor?.pid || !newBirth || !newPhysicalId || !newRecord)
+      throw new Error("successor did not persist a distinct live ready listener-owning birth");
+    expect(newBirth).not.toEqual(oldBirth);
+    expect(newRecord.processIdentity).toEqual(newBirth);
+    expect(newRecord.listenerPort).toBe(oldRecord.listenerPort);
+    expect(await linuxProcessLiveness(newBirth)).toBe("live");
+    expect(await workerPortOwnership(newRecord.listenerPort, successor.pid)).toBe("owned");
+    expect(owner.health()).toBe("serving");
+    expect(await owner.observeQueueTarget(oldTarget)).toEqual({ kind: "unknown" });
+    const absence = await owner.observeQueuePhysicalAbsence(oldTarget);
+    if (absence.kind !== "confirmed_absent")
+      throw new Error("old physical birth absence was not confirmed");
+    expect(absence.receiptDigest).toMatch(/^[0-9a-f]{64}$/u);
+    expect(absence).toEqual({
+      kind: "confirmed_absent",
+      workerUid: WORKER_UID,
+      incarnationId: oldTarget.incarnationId,
+      servingSourceOperationId: CREATE_ID,
+      receiptDigest: absence.receiptDigest,
+    });
+
+    const newTarget = { ...oldTarget, incarnationId: newPhysicalId };
+    let observed = await owner.observeQueueTarget(newTarget);
+    const observationDeadline = Date.now() + 3_000;
+    while (observed.kind === "unknown" && Date.now() < observationDeadline) {
+      await Bun.sleep(20);
+      observed = await owner.observeQueueTarget(newTarget);
+    }
+    expect(await physicalIncarnationId(root, CREATE_ID)).toBe(newPhysicalId);
+    expect(await owner.observeQueueTarget(oldTarget)).toEqual({ kind: "unknown" });
+    expect(observed).toEqual({ kind: "confirmed", ...newTarget, status: "active" });
+  } catch (error) {
+    failures.push(new Error("restart target observation failed", { cause: error }));
+  }
+  // Preserve a primary observation failure even if DELETE/retirement also
+  // refuses. The existing cleanup oracle and forced-child cleanup stay intact.
+  try {
+    await closeFixtureOwner(owner, children, root);
+  } catch (error) {
+    failures.push(new Error("confirmed restart cleanup failed", { cause: error }));
+  }
+  if (failures.length > 0)
+    throw new AggregateError(failures, "restart observation and cleanup evidence");
 });

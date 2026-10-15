@@ -234,6 +234,15 @@ export function deploymentVariables(
   if (target.hostedPricing !== undefined) {
     vars.TAKOSERVER_HOSTED_PRICING = target.hostedPricing;
   }
+  if (target.hostedBilling !== undefined) {
+    vars.TAKOSERVER_HOSTED_BILLING = target.hostedBilling.selector;
+    vars.TAKOSERVER_STRIPE_MODE = target.hostedBilling.stripeMode;
+    vars.TAKOSERVER_HOSTED_BILLING_ACCOUNT_ID = target.hostedBilling.accountId;
+    vars.TAKOSERVER_HOSTED_BILLING_AUTHORITY = target.hostedBilling.billingAuthority;
+    if (target.hostedBilling.onDemand !== undefined) {
+      vars.TAKOSERVER_HOSTED_BILLING_ON_DEMAND = JSON.stringify(target.hostedBilling.onDemand);
+    }
+  }
   for (const [setting, variable] of Object.entries(PAYMENT_SETTING_VARIABLES)) {
     const value = target.stripeSettings?.[setting as keyof typeof PAYMENT_SETTING_VARIABLES];
     if (value !== undefined) vars[variable] = String(value);
@@ -304,8 +313,10 @@ export function expectedWorkerSecrets(target: DeployTarget): readonly string[] {
   if (target.edgeSupplies !== undefined) {
     names.add("TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING");
   }
-  if (target.stripeCheckout === true) names.add("STRIPE_SECRET_KEY");
-  if (target.stripeWebhook === true) names.add("STRIPE_WEBHOOK_SECRET");
+  if (target.stripeCheckout === true || target.hostedBilling !== undefined)
+    names.add("STRIPE_SECRET_KEY");
+  if (target.stripeWebhook === true || target.hostedBilling !== undefined)
+    names.add("STRIPE_WEBHOOK_SECRET");
   return [...names].sort();
 }
 

@@ -1,6 +1,14 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { deriveExpectedApplicationShape } from "../scripts/deploy/application-schema-shape.ts";
 import { DeployError, deployFailureAftermath, preflightError } from "../scripts/deploy/errors.ts";
 import { readMigrationArtifact } from "../scripts/deploy/migrations.ts";
@@ -26,8 +34,10 @@ import {
   parseWranglerVersionOutput,
   parseWranglerVersionUploadOutput,
   publishWranglerVersion,
+  type WranglerVersionPublicationLease,
   WranglerWorkerState,
 } from "../scripts/deploy/wrangler-state.ts";
+import * as deployExtension from "../scripts/deploy-extension.ts";
 import { integrationStorageVerificationOptions } from "./helpers/integration-storage-generation-verification.ts";
 
 const WORKER = "takoserver-api-integration";
@@ -1523,3 +1533,337 @@ function deployment(id: string, versionId: string, createdOn: string) {
     versions: [{ version_id: versionId, percentage: 100 }],
   };
 }
+
+function assertCurrentLeaseForTest(lease: WranglerVersionPublicationLease): void {
+  const assertion = deployExtension.assertWranglerVersionPublicationLeaseCurrent;
+  expect(assertion).toBeFunction();
+  if (typeof assertion !== "function") throw new Error("missing Core publication lease assertion");
+  assertion(lease);
+}
+
+async function withCurrentLeaseForTest(
+  use: (lease: WranglerVersionPublicationLease, root: string) => Promise<void>,
+): Promise<void> {
+  const root = `${process.env.TMPDIR ?? "/tmp"}/integration-lease-current-${crypto.randomUUID()}`;
+  const lease = await acquireWranglerVersionPublicationLease({
+    accountId: "e".repeat(32),
+    workerName: "integration-lease-current",
+    root,
+  });
+  try {
+    await use(lease, root);
+  } finally {
+    await lease.release();
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+describe("Core-owned current publication lease assertion", () => {
+  test("accepts only its real acquired object and rejects released instances", async () => {
+    await withCurrentLeaseForTest(async (lease) => {
+      expect(deployExtension.acquireWranglerVersionPublicationLease).toBe(
+        acquireWranglerVersionPublicationLease,
+      );
+      assertCurrentLeaseForTest(lease);
+      assertCurrentLeaseForTest(lease);
+      for (const impostor of [
+        { ...lease },
+        new Proxy(lease, {}),
+        { accountId: lease.accountId, workerName: lease.workerName, async release() {} },
+        JSON.parse(JSON.stringify(lease)) as WranglerVersionPublicationLease,
+      ]) {
+        expect(() => assertCurrentLeaseForTest(impostor)).toThrow(DeployError);
+      }
+      assertCurrentLeaseForTest(lease);
+      await lease.release();
+      expect(() => assertCurrentLeaseForTest(lease)).toThrow(DeployError);
+      await lease.release();
+    });
+  });
+
+  test("rejects a dead original holder even when a genuine replacement is active", async () => {
+    await withCurrentLeaseForTest(async (first, root) => {
+      assertCurrentLeaseForTest(first);
+      const ownerName = readdirSync(root).find((name) => name.endsWith(".owner.json"));
+      if (ownerName === undefined) throw new Error("missing own fixture owner");
+      const owner = JSON.parse(readFileSync(`${root}/${ownerName}`, "utf8")) as {
+        holderPid: number;
+        holderStartTicks: string;
+      };
+      // pidfd binds the signal to this exact child; no global PID or lease scan.
+      const signaler = Bun.spawn(
+        [
+          "python3",
+          "-c",
+          [
+            "import os,signal,sys",
+            "pid=int(sys.argv[1]); fd=os.pidfd_open(pid)",
+            "try:",
+            " s=open('/proc/'+str(pid)+'/stat').read(); f=s[s.rfind(')')+2:].split()",
+            " assert f[1]==sys.argv[3] and f[19]==sys.argv[2]",
+            " signal.pidfd_send_signal(fd,signal.SIGKILL)",
+            "finally: os.close(fd)",
+          ].join("\n"),
+          String(owner.holderPid),
+          owner.holderStartTicks,
+          String(process.pid),
+        ],
+        { stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+      );
+      const [exitCode, stdout, stderr] = await Promise.all([
+        signaler.exited,
+        new Response(signaler.stdout).text(),
+        new Response(signaler.stderr).text(),
+      ]);
+      expect({ exitCode, stdout, stderr }).toEqual({ exitCode: 0, stdout: "", stderr: "" });
+      for (let attempt = 0; existsSync(`/proc/${owner.holderPid}`) && attempt < 100; attempt += 1) {
+        await Bun.sleep(10);
+      }
+      expect(existsSync(`/proc/${owner.holderPid}`)).toBe(false);
+      expect(() => assertCurrentLeaseForTest(first)).toThrow(DeployError);
+      const second = await acquireWranglerVersionPublicationLease({
+        accountId: first.accountId,
+        workerName: first.workerName,
+        root,
+      });
+      try {
+        expect(
+          inspectWranglerVersionPublicationLease({
+            accountId: first.accountId,
+            workerName: first.workerName,
+            root,
+          }).state,
+        ).toBe("active");
+        expect(() => assertCurrentLeaseForTest(first)).toThrow(DeployError);
+        assertCurrentLeaseForTest(second);
+        const replacementOwner = readFileSync(`${root}/${ownerName}`, "utf8");
+        await first.release();
+        expect(readFileSync(`${root}/${ownerName}`, "utf8")).toBe(replacementOwner);
+        assertCurrentLeaseForTest(second);
+      } finally {
+        await second.release();
+      }
+    });
+  });
+
+  test("fails terminally on owner, path or target drift without deleting foreign custody", async () => {
+    for (const drift of [
+      "owner",
+      "boot",
+      "start",
+      "missing-owner",
+      "lock-inode",
+      "target",
+    ] as const) {
+      await withCurrentLeaseForTest(async (lease, root) => {
+        assertCurrentLeaseForTest(lease);
+        const ownerName = readdirSync(root).find((name) => name.endsWith(".owner.json"));
+        if (ownerName === undefined) throw new Error("missing own fixture owner");
+        const ownerPath = `${root}/${ownerName}`;
+        const lockPath = ownerPath.slice(0, -".owner.json".length);
+        const original = readFileSync(ownerPath, "utf8");
+        const workerName = lease.workerName;
+        if (drift === "owner") {
+          writeFileSync(
+            ownerPath,
+            JSON.stringify({ ...JSON.parse(original), ownerId: crypto.randomUUID() }),
+          );
+        } else if (drift === "boot") {
+          writeFileSync(
+            ownerPath,
+            JSON.stringify({ ...JSON.parse(original), bootId: crypto.randomUUID() }),
+          );
+        } else if (drift === "start") {
+          const record = JSON.parse(original) as { holderStartTicks: string };
+          writeFileSync(
+            ownerPath,
+            JSON.stringify({
+              ...record,
+              holderStartTicks: String(BigInt(record.holderStartTicks) + 1n),
+            }),
+          );
+        } else if (drift === "missing-owner") {
+          rmSync(ownerPath);
+        } else if (drift === "lock-inode") {
+          renameSync(lockPath, `${lockPath}.saved`);
+          writeFileSync(lockPath, "", { mode: 0o600 });
+        } else {
+          (lease as { workerName: string }).workerName = "integration-foreign-target";
+        }
+        expect(() => assertCurrentLeaseForTest(lease)).toThrow(DeployError);
+        if (drift === "lock-inode") {
+          rmSync(lockPath);
+          renameSync(`${lockPath}.saved`, lockPath);
+        } else if (drift === "target") {
+          (lease as { workerName: string }).workerName = workerName;
+        } else {
+          writeFileSync(ownerPath, original, { mode: 0o600 });
+        }
+        expect(() => assertCurrentLeaseForTest(lease)).toThrow(DeployError);
+      });
+    }
+  });
+});
+
+test("keeps discovery first-stat ENOENT separate from strict later reads", async () => {
+  const moduleUrl = new URL("../scripts/deploy/wrangler-state.ts", import.meta.url).href;
+  // Only this subprocess mocks directory/error scheduling. Every actual lease,
+  // owner record, WeakMap and kernel FLOCK observation uses the real Core code.
+  const childProgram = [
+    `const coreModule = ${JSON.stringify(moduleUrl)};`,
+    String.raw`
+import { mock } from "bun:test";
+import assert from "node:assert/strict";
+import { tmpdir } from "node:os";
+const fs = { ...await import("node:fs") };
+let active = null;
+const failure = (code) => Object.assign(new Error("synthetic own-fd read schedule"), { code });
+mock.module("node:fs", () => ({
+  ...fs,
+  readdirSync(path, options) {
+    const entries = fs.readdirSync(path, options);
+    if (active && path === active.directory) {
+      active.enumerations += 1;
+      if (active.enabled && ["stale", "unknown"].includes(active.mode)) {
+        return [...entries, "2147483647"];
+      }
+    }
+    return entries;
+  },
+  statSync(path, options) {
+    if (active && active.enabled) {
+      if (active.mode === "unknown" && path === active.missingPath) throw failure(active.errno);
+      if (path === active.lockDescriptorPath) {
+        active.targetStats += 1;
+        if (active.mode === "after" && active.targetStats === 2) throw failure("ENOENT");
+        if (active.mode === "cached") throw failure("ENOENT");
+      }
+    }
+    return fs.statSync(path, options);
+  },
+  readFileSync(path, options) {
+    if (active && active.enabled && active.mode === "fdinfo" && path === active.lockInfoPath) {
+      throw failure("ENOENT");
+    }
+    return fs.readFileSync(path, options);
+  },
+}));
+const api = await import(coreModule);
+const cases = [
+  { name: "stale-discovery-entry", mode: "stale", pass: true },
+  { name: "discovery-EACCES", mode: "unknown", errno: "EACCES" },
+  { name: "discovery-EIO", mode: "unknown", errno: "EIO" },
+  { name: "discovery-ESRCH", mode: "unknown", errno: "ESRCH" },
+  { name: "confirmed-fdinfo-ENOENT", mode: "fdinfo" },
+  { name: "confirmed-afterstat-ENOENT", mode: "after" },
+  { name: "cached-selected-stat-ENOENT", mode: "cached" },
+];
+const results = [];
+for (const item of cases) {
+  const root = tmpdir() + "/integration-fd-schedule-" + crypto.randomUUID();
+  assert.equal(fs.existsSync(root), false);
+  const lease = await api.acquireWranglerVersionPublicationLease({
+    accountId: "e".repeat(32), workerName: "integration-fd-schedule", root,
+  });
+  let lockPath;
+  try {
+    const ownerName = fs.readdirSync(root).find((name) => name.endsWith(".owner.json"));
+    assert.ok(ownerName);
+    const owner = JSON.parse(fs.readFileSync(root + "/" + ownerName, "utf8"));
+    lockPath = root + "/" + ownerName.slice(0, -".owner.json".length);
+    const directory = "/proc/" + owner.holderPid + "/fdinfo";
+    const sameNativeLock = (descriptor) => {
+      try {
+        const stat = fs.statSync("/proc/" + owner.holderPid + "/fd/" + descriptor, { bigint: true });
+        return String(stat.dev) === owner.lockDevice && String(stat.ino) === owner.lockInode;
+      } catch (error) {
+        if (error.code === "ENOENT") return false;
+        throw error;
+      }
+    };
+    const descriptors = fs.readdirSync(directory).filter(sameNativeLock);
+    assert.equal(descriptors.length, 1);
+    const descriptor = descriptors[0];
+    const lockInfoPath = directory + "/" + descriptor;
+    const held = () => fs.readFileSync(lockInfoPath, "utf8").split("\n").some((line) => {
+      const fields = line.trim().split(/\s+/u);
+      return fields[0] === "lock:" && fields[2] === "FLOCK" && fields[3] === "ADVISORY" &&
+        fields[4] === "WRITE" && fields[5] === String(owner.holderPid) &&
+        fields[6].endsWith(":" + owner.lockInode) && fields[7] === "0" && fields[8] === "EOF";
+    });
+    assert.equal(held(), true);
+    active = { ...item, directory, lockInfoPath,
+      missingPath: "/proc/" + owner.holderPid + "/fd/2147483647",
+      lockDescriptorPath: "/proc/" + owner.holderPid + "/fd/" + descriptor,
+      enabled: item.mode !== "cached", enumerations: 0, targetStats: 0 };
+    assert.throws(() => fs.statSync(active.missingPath), { code: "ENOENT" });
+    if (item.mode === "cached") {
+      api.assertWranglerVersionPublicationLeaseCurrent(lease);
+      active.enabled = true;
+    }
+    const before = active.enumerations;
+    if (item.pass) {
+      api.assertWranglerVersionPublicationLeaseCurrent(lease);
+      assert.equal(active.enumerations, before + 1);
+      const captured = active.enumerations;
+      api.assertWranglerVersionPublicationLeaseCurrent(lease);
+      assert.equal(active.enumerations, captured);
+    } else {
+      assert.throws(() => api.assertWranglerVersionPublicationLeaseCurrent(lease), {
+        name: "DeployError", message: "Worker Version publication lease is no longer current for this invocation",
+      });
+      if (item.mode === "cached") assert.equal(active.enumerations, before);
+      active.enabled = false;
+      const refused = active.enumerations;
+      assert.throws(() => api.assertWranglerVersionPublicationLeaseCurrent(lease), { name: "DeployError" });
+      assert.equal(active.enumerations, refused);
+    }
+    assert.equal(held(), true);
+    results.push({ name: item.name, realKernelStillHeld: true,
+      expected: item.pass ? "accepted" : "terminal-refusal" });
+  } finally {
+    active = null;
+    await lease.release();
+    const entries = fs.readdirSync(root);
+    assert.equal(entries.length, 1);
+    assert.equal(root + "/" + entries[0], lockPath);
+    const state = fs.lstatSync(lockPath);
+    assert.equal(state.isFile() && !state.isSymbolicLink() && state.nlink === 1, true);
+    fs.unlinkSync(lockPath);fs.rmdirSync(root);
+  }
+}
+console.log(JSON.stringify({ cases: results, sourceGuardMocked: false,
+  scheduleIsSyntheticNotPhysicalFdCloseProof: true }));
+`,
+  ].join("\n");
+  // Exercise CI environments without any temporary-directory selector.
+  const childEnv = { ...process.env };
+  delete childEnv.TMPDIR;
+  delete childEnv.TMP;
+  delete childEnv.TEMP;
+  const child = Bun.spawn([process.execPath, "--no-env-file", "-e", childProgram], {
+    env: childEnv,
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [exitCode, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+  const result = JSON.parse(stdout) as {
+    cases: { name: string; realKernelStillHeld: boolean; expected: string }[];
+    sourceGuardMocked: boolean;
+    scheduleIsSyntheticNotPhysicalFdCloseProof: boolean;
+  };
+  expect(result.cases).toHaveLength(7);
+  expect(result.cases.every((item) => item.realKernelStillHeld)).toBe(true);
+  expect(result.cases.map((item) => item.expected)).toEqual([
+    "accepted",
+    ...Array<string>(6).fill("terminal-refusal"),
+  ]);
+  expect(result.sourceGuardMocked).toBe(false);
+  expect(result.scheduleIsSyntheticNotPhysicalFdCloseProof).toBe(true);
+});

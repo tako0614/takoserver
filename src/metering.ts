@@ -9,6 +9,7 @@ import {
   type LedgerAllocationAdmission,
   LedgerError,
   prepareLedgerAllocation,
+  type UsageWarningPreparer,
 } from "./ledger.ts";
 import {
   addRational,
@@ -142,8 +143,10 @@ export function createMetering(options: {
   readonly hostedPaidFreeExclusion?: boolean;
   /** Qualified composition supplies the same policy resolver as its ledger. */
   readonly allocationAdmissionResolver?: (organizationId: string) => Promise<OrgLimitAdmission>;
+  /** Qualified composition supplies warnings for this settlement's atomic batch. */
+  readonly usageWarnings?: UsageWarningPreparer;
 }): Metering {
-  const { sql, clock, randomId } = options;
+  const { sql, clock, randomId, usageWarnings } = options;
   const db = createDatabase(sql);
   const bytesRate = BigInt(minorToMicros(options.rates?.bytesMinorPerGibibyte ?? 0));
   const requestRate = BigInt(minorToMicros(options.rates?.requestsMinorPerThousand ?? 0));
@@ -431,7 +434,9 @@ export function createMetering(options: {
             ],
           },
         ];
+        let instant: string | undefined;
         if (amountMicros > 0) {
+          instant = clock().toISOString();
           statements.push(
             ...(await prepareLedgerAllocation(sql, {
               organizationId,
@@ -440,7 +445,7 @@ export function createMetering(options: {
               amountMicros,
               settledDeltaMicros: -amountMicros,
               heldDeltaMicros: 0,
-              now: clock().toISOString(),
+              now: instant,
               hostedPaidFreeExclusion: options.hostedPaidFreeExclusion === true,
               ...(admission ? { allocationAdmission: admission } : {}),
             })),
@@ -450,6 +455,8 @@ export function createMetering(options: {
           sql: "DELETE FROM wallet_allocation_guards WHERE id = ?",
           params: [guardId],
         });
+        if (instant !== undefined && usageWarnings)
+          statements.push(...(await usageWarnings({ organizationId, instant })));
         await sql.batch(statements);
         moved += ids.length;
       }

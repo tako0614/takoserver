@@ -3516,6 +3516,7 @@ async function openRuntimeOwner(
     if (!Number.isSafeInteger(child.pid) || !child.pid || child.pid <= 1) {
       throw new WorkerdWorkerRuntimeOwnerError("ownership_uncertain");
     }
+    const incarnation = handles.get(operationId);
     let processIdentity: LinuxProcessIdentity;
     try {
       processIdentity = await readLinuxProcessIdentity(child.pid);
@@ -3576,6 +3577,20 @@ async function openRuntimeOwner(
           : { configurationSha256: refreshedDigest, configurationRefreshPending: false }),
       };
     });
+    // A supervised restart keeps this handle. Refresh it only after durable
+    // persistence, using the latest whole record so a concurrent retirement
+    // or configuration transition is never replaced by an older snapshot.
+    // Initial bootstrap may not have registered a handle; boot recovery also
+    // performs its own final refresh after its remaining restoration fences.
+    const current = recordFor(operationId);
+    if (
+      incarnation &&
+      handles.get(operationId) === incarnation &&
+      current &&
+      canonicalJson(current.processIdentity) === canonicalJson(processIdentity)
+    ) {
+      incarnation.record = current;
+    }
   };
 
   const createIncarnation = async (
