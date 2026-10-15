@@ -166,3 +166,48 @@ test("cancel before the response head remains a request abort through native fai
   abort.abort();
   await expect(response).rejects.toMatchObject({ code: C.errors.requestAborted });
 });
+
+test("real binding keeps caller cancellation after the response head as request_aborted", async () => {
+  const caller = new AbortController();
+  let dispatches = 0;
+  let reads = 0;
+  let sourceCancels = 0;
+  let transportAborts = 0;
+  const binding = makeContainerBinding({
+    async fetch(request) {
+      dispatches++;
+      request.signal.addEventListener("abort", () => transportAborts++);
+      return new Response(
+        new ReadableStream<Uint8Array>(
+          {
+            pull() {
+              reads++;
+            },
+            cancel() {
+              sourceCancels++;
+            },
+          },
+          { highWaterMark: 0 },
+        ),
+        {
+          headers: {
+            "x-takoserver-container-result": JSON.stringify({ status: 202, headers: [] }),
+          },
+        },
+      );
+    },
+  });
+  const response = await binding.fetch(new Request("http://a/", { signal: caller.signal }));
+  expect(response.status).toBe(202);
+  expect(reads).toBe(0);
+  const pending = response.text();
+  caller.abort();
+  await expect(pending).rejects.toMatchObject({
+    name: C.errorName,
+    code: C.errors.requestAborted,
+  });
+  expect(response.status).toBe(202);
+  expect(dispatches).toBe(1);
+  expect(sourceCancels).toBe(1);
+  expect(transportAborts).toBe(1);
+});

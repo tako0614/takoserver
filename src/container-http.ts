@@ -32,10 +32,13 @@ function headers(input: Headers, response: boolean): Headers {
     .split(",")
     .map((name) => name.trim())
     .filter(Boolean);
+  if (!response && nominated.some((name) => name.toLowerCase() === "content-length"))
+    fail(E.invalidRequest);
   try {
     for (const name of [
       ...nominated,
       "connection",
+      "content-length",
       "host",
       "keep-alive",
       "proxy-authenticate",
@@ -47,18 +50,18 @@ function headers(input: Headers, response: boolean): Headers {
     ])
       result.delete(name);
   } catch {
-    fail(response ? E.responseAborted : E.invalidRequest);
+    fail(response ? E.backendUnavailable : E.invalidRequest);
   }
   return result;
 }
 
-function length(input: Headers, response: boolean): number | undefined {
+function length(input: Headers, response: boolean, payload = true): number | undefined {
   const value = input.get("content-length");
   if (value === null) return undefined;
   if (!/^(0|[1-9][0-9]*)$/u.test(value) || !Number.isSafeInteger(Number(value)))
-    fail(response ? E.responseAborted : E.invalidRequest);
+    fail(response ? E.backendUnavailable : E.invalidRequest);
   const size = Number(value);
-  if (size > C.limits.bodyBytes) fail(response ? E.responseTooLarge : E.requestTooLarge);
+  if (payload && size > C.limits.bodyBytes) fail(response ? E.responseTooLarge : E.requestTooLarge);
   return size;
 }
 
@@ -94,7 +97,11 @@ export function containerBody(
         onAbort = () => {
           if (done) return;
           close();
-          controller.error(new ContainerError(response ? E.responseAborted : E.requestAborted));
+          controller.error(
+            new ContainerError(
+              response && signal.reason !== E.requestAborted ? E.responseAborted : E.requestAborted,
+            ),
+          );
           void reader.cancel().catch(() => {});
         };
         signal.addEventListener("abort", onAbort, { once: true });
@@ -171,7 +178,8 @@ export async function forwardContainerHttp(
   const outgoingHeaders = headers(request.headers, false);
   const expected = length(request.headers, false);
   const abort = new AbortController();
-  const cancel = () => abort.abort();
+  // The lifecycle signal also carries drain; only the original caller marks a request abort.
+  const cancel = () => abort.abort(request.signal.aborted ? E.requestAborted : undefined);
   request.signal.addEventListener("abort", cancel, { once: true });
   externalSignal?.addEventListener("abort", cancel, { once: true });
   const finish = () => {
@@ -205,7 +213,7 @@ export async function forwardContainerHttp(
     if (abort.signal.aborted) fail(E.requestAborted);
     const incomingHeaders = headers(response.headers, true);
     const bodyless = request.method === "HEAD" || [204, 205, 304].includes(response.status);
-    const responseLength = bodyless ? undefined : length(response.headers, true);
+    const responseLength = length(response.headers, true, !bodyless);
     if (bodyless) {
       await response.body?.cancel();
       finish();

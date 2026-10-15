@@ -195,7 +195,7 @@ function clientRuntime(contract: typeof C, wire: typeof CONTAINER_BINDING_WIRE) 
               abortBody = () => {
                 if (!done) {
                   close();
-                  controller.error(new Failure(errors.responseAborted));
+                  controller.error(new Failure(errors.requestAborted));
                   void input.cancel().catch(() => {});
                   cancel();
                 }
