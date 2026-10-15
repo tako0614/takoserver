@@ -15,11 +15,14 @@ import { runD1Schema } from "../scripts/deploy/schema.ts";
 import {
   assertMoneyLiveBackupCompleteness,
   assertMoneyNativeForeignKeys,
+  assertMoneyPost94Source,
   buildMoneyCutoverImportSql,
+  inspectMoneyUnitPost94State,
   inspectMoneyUnitResumeState,
   MONEY_FENCE_TABLES_0092,
   type MoneyCutoverCustodyReceipt,
   type MoneyCutoverDispatchBinding,
+  type MoneyPost94DispatchBinding,
   type MoneyResumeProof,
   type MoneyReviewBinding,
   type MoneyReviewProof,
@@ -37,7 +40,17 @@ import {
   runIntegrationMoneyUnitCutover,
 } from "../scripts/deploy/schema-money-unit-cutover.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
-import { createMoneyCutoverSql, inspectMoneyCutoverGuard } from "../src/money-cutover-sql.ts";
+import {
+  createMoneyCutoverSql,
+  inspectMoneyCutoverGuard,
+  MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL,
+  MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE,
+  MONEY_CUTOVER_FREEZE_DDL,
+  MONEY_CUTOVER_PERMIT_DDL,
+  MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
+  moneyCutoverClassificationTriggerSql,
+  moneyCutoverFinancialTriggerSql,
+} from "../src/money-cutover-sql.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 
 const files = readMigrationArtifact().files;
@@ -55,6 +68,25 @@ function fixture() {
     "INSERT INTO wallet_credit_lots (org_id, ref, kind, amount_minor, expires_at, created_at) VALUES ('org-1','credit-1','direct',7,NULL,'2026-01-01T00:00:00Z')",
   );
   return database;
+}
+
+function legacyMoneyStagingTarget(
+  accountId = "1".repeat(32),
+  databaseId = "11111111-1111-4111-8111-111111111111",
+  databaseName = `takoserver-i-${accountId}`,
+): DeployTarget {
+  return {
+    kind: "takoserver.deploy-target@v2",
+    environment: "integration",
+    accountId,
+    workerName: databaseName,
+    publicOrigin: "https://integration-money-host.test.workers.dev",
+    d1: { databaseId, databaseName },
+    r2: { bucketName: databaseName },
+    signing: { currentKeyId: "test-key" },
+    moneyCutoverWriterPolicy: "transaction-fenced-usd-micros-v1",
+    moneyCutoverWriterEpoch: writerEpoch,
+  };
 }
 
 function state(database: Database): D1SchemaState {
@@ -349,6 +381,9 @@ async function resumeReadFixture() {
     directory,
     target,
     options,
+    backup,
+    originalSql,
+    origin,
     native,
     receipts,
     bindings,
@@ -486,9 +521,13 @@ describe("money resume read component", () => {
       f.close();
     }
   });
-  test("money resume read selector cannot give the legacy money writer a new namespace", async () => {
+  test("money resume read selector cannot grant original writer provenance", async () => {
     const f = await resumeReadFixture();
     try {
+      const read = await f.inspect();
+      expect(read.schemaPhase).toBe("0094-fenced");
+      expect(read.normalHostReady).toBe(false);
+      expect(f.mutations()).toBe(0);
       await expect(
         runIntegrationMoneyUnitCutover(
           {
@@ -500,7 +539,7 @@ describe("money resume read component", () => {
           f.target,
           f.options,
         ),
-      ).rejects.toThrow("terminal 0092 staging origin");
+      ).rejects.toThrow("fresh money writer requires the same owning original options and target");
       expect(f.mutations()).toBe(0);
     } finally {
       f.close();
@@ -627,15 +666,7 @@ describe("fixed money cutover SQL", () => {
       const accountId = "1".repeat(32);
       const databaseId = "11111111-1111-4111-8111-111111111111";
       const databaseName = `takoserver-i-${accountId}`;
-      const target = {
-        environment: "integration",
-        accountId,
-        d1: { databaseId, databaseName },
-        r2: { bucketName: databaseName },
-        workerName: databaseName,
-        moneyCutoverWriterPolicy: "transaction-fenced-usd-micros-v1",
-        moneyCutoverWriterEpoch: writerEpoch,
-      } as never;
+      const target = legacyMoneyStagingTarget(accountId, databaseId, databaseName);
       const liveIdentity = { accountId, databaseId, databaseName, bucketName: databaseName };
       const origin: MoneyStageOriginProof = {
         kind: "takoserver.money-stage-origin@v1",
@@ -1053,7 +1084,7 @@ describe("fixed money cutover SQL", () => {
 
   test("dispatched custody blocks a second apply before any provider read", async () => {
     let reads = 0;
-    const target = { environment: "integration" } as never;
+    const target = legacyMoneyStagingTarget();
     await expect(
       runIntegrationMoneyUnitCutover(
         {
@@ -1152,5 +1183,359 @@ describe("fixed money cutover SQL", () => {
       ),
     ).rejects.toThrow("exact integration invocation");
     expect(reads).toBe(0);
+  });
+});
+
+/** Full local replay snapshot from the genuine fixed conversion fixture, never a native export. */
+async function post94ReadFixture() {
+  const f = await resumeReadFixture();
+  const nextWriterEpoch = sha("reviewed post94 successor generation");
+  const convert = f.receipts.get("convert");
+  if (convert === undefined) throw new Error("missing actual fixture convert custody");
+  writeFileSync(f.options.backupPath, normalizeSnapshotDump(Buffer.from(f.originalSql)).sql, {
+    mode: 0o600,
+  });
+  const convertedSql =
+    f.originalSql +
+    ["freeze", "prepare", "classify", "convert"]
+      .map((phase) => {
+        const binding = f.bindings.get(phase);
+        if (binding === undefined) throw new Error("missing actual fixture sealed SQL");
+        return readFileSync(binding.sealedImportPath, "utf8");
+      })
+      .join("\n");
+  const converted = normalizeSnapshotDump(Buffer.from(convertedSql));
+  const convertedBackupPath = join(f.directory, "converted94.sql");
+  writeFileSync(convertedBackupPath, converted.sql, { mode: 0o600 });
+  const convertedIdentity = {
+    kind: "takoserver.money-protected-backup@v2",
+    accountId: f.target.accountId,
+    databaseId: f.target.d1.databaseId,
+    databaseName: f.target.d1.databaseName,
+    originDigest: sha(JSON.stringify(f.origin)),
+    sourceDigest: moneyUnitCutoverSourcePrefixDigest(files, 94),
+    backupDigest: converted.digest,
+    schemaPhase: "0094-fenced",
+    convertBindingDigest: convert.bindingDigest,
+    writerEpoch,
+  };
+  writeFileSync(`${convertedBackupPath}.identity.json`, JSON.stringify(convertedIdentity), {
+    mode: 0o600,
+  });
+  const {
+    resumeCommit: _commit,
+    resumeProof: _proof,
+    resumeHealthRead: _health,
+    ...withoutNormal
+  } = f.options;
+  const options: MoneyUnitCutoverOptions = { ...withoutNormal, phase: "suffix98" };
+  const inspect = (
+    selectedTarget: DeployTarget = f.target,
+    selectedOptions: MoneyUnitCutoverOptions = options,
+  ) =>
+    inspectMoneyUnitPost94State({
+      target: selectedTarget,
+      options: selectedOptions,
+      files,
+      database: reader(f.database),
+      backup: f.backup,
+      readSchema: async () => state(f.database),
+      previousWriterEpoch: writerEpoch,
+      nextWriterEpoch,
+      convertedBackupPath,
+    });
+  const suffixBinding = (): MoneyPost94DispatchBinding => {
+    const original = f.bindings.get("convert");
+    if (original === undefined) throw new Error("missing converted binding");
+    const sealedImportPath = join(f.directory, "component-only-suffix.sql");
+    const bytes = "-- retained structural fixture; no Financial pin or native import\n";
+    writeFileSync(sealedImportPath, bytes, { mode: 0o600 });
+    return {
+      ...original,
+      kind: "takoserver.money-cutover-dispatch@v2",
+      phase: "suffix98",
+      sourceDigest: "sha256:9ba4b09b53f531b787f38b9b65155e12850d05345a432e7ed25ac8841b4fb1f7",
+      predecessorCustodyDigest: sha(JSON.stringify(convert)),
+      importDigest: sha(bytes),
+      writerEpoch,
+      previousWriterEpoch: writerEpoch,
+      nextWriterEpoch,
+      original92BackupDigest: f.backup.digest,
+      converted94BackupDigest: converted.digest,
+      convertBindingDigest: convert.bindingDigest,
+      modePreparationDigest: sha("component structural taint; not a Financial preparation"),
+      afterSchemaPhase: "0098-fenced",
+      sealedImportPath,
+    };
+  };
+  return {
+    ...f,
+    nextWriterEpoch,
+    convertedBackupPath,
+    convertedIdentity,
+    converted,
+    options,
+    inspectPost94: inspect,
+    suffixBinding,
+  };
+}
+
+/** Canonical suffix plus owned guard model only: deliberately no Financial pin or native proof. */
+function applyPost94SchemaModel(database: Database, nextWriterEpoch: string) {
+  const freeze = database.query("SELECT * FROM money_cutover_freeze").get() as {
+    singleton: number;
+    binding_digest: string;
+    origin_digest: string;
+    backup_digest: string;
+    writer_digest: string;
+    source_digest: string;
+  };
+  apply(database, buildD1MigrationImport(files.slice(94, 98), { freshLedger: false }).sql);
+  const definitions = [
+    ["money_cutover_freeze", MONEY_CUTOVER_FREEZE_DDL],
+    [MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE, MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL],
+    ["money_cutover_writer_permit", MONEY_CUTOVER_PERMIT_DDL],
+    ["money_cutover_permit_epoch_guard", MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL],
+    ...MONEY_FENCE_TABLES_0092.flatMap((table) =>
+      ["INSERT", "UPDATE", "DELETE"].map((verb) => {
+        if (verb !== "INSERT" && verb !== "UPDATE" && verb !== "DELETE") throw new Error("verb");
+        return [
+          `money_cutover_fence_${table}_${verb.toLowerCase()}`,
+          moneyCutoverFinancialTriggerSql(table, verb),
+        ];
+      }),
+    ),
+    ...(["INSERT", "UPDATE", "DELETE"] as const).map((verb) => [
+      `money_cutover_fence_wallet_credit_lot_classification_proofs_${verb.toLowerCase()}`,
+      moneyCutoverClassificationTriggerSql(verb),
+    ]),
+  ];
+  for (const [name, sql] of definitions) {
+    if (name === undefined || sql === undefined) throw new Error("guard model");
+    if (database.query("SELECT name FROM sqlite_schema WHERE name=?").get(name) === null)
+      database.exec(sql);
+  }
+  if (database.query("SELECT * FROM money_cutover_freeze").get() === null)
+    database
+      .query("INSERT INTO money_cutover_freeze VALUES (?,?,?,?,?,?)")
+      .run(
+        freeze.singleton,
+        freeze.binding_digest,
+        freeze.origin_digest,
+        freeze.backup_digest,
+        freeze.writer_digest,
+        freeze.source_digest,
+      );
+  database.exec("DELETE FROM money_cutover_authorized_epoch");
+  database.query("INSERT INTO money_cutover_authorized_epoch VALUES (1,?)").run(nextWriterEpoch);
+}
+
+describe("held post94 continuation component", () => {
+  test("post94 shares actual convert history without a normal Worker proof and remains blocked", async () => {
+    const f = await post94ReadFixture();
+    try {
+      const read = await f.inspectPost94();
+      expect(read).toMatchObject({
+        schemaPhase: "0094-fenced",
+        historicalWriterEpoch: writerEpoch,
+        currentWriterEpoch: writerEpoch,
+        continuation: "blocked-financial-port",
+        qualification: "component-simulation-only",
+        normalHostReady: false,
+      });
+      expect(f.options.resumeProof).toBeUndefined();
+      expect(f.mutations()).toBe(0);
+      await expect(
+        inspectMoneyUnitResumeState({
+          target: f.target,
+          options: f.options,
+          files,
+          database: reader(f.database),
+          readSchema: async () => state(f.database),
+          backup: f.backup,
+        }),
+      ).rejects.toThrow("complete resume owner");
+    } finally {
+      f.close();
+    }
+  });
+
+  test("post94 refuses a 92 backup relabelled as 94 and keeps original history untouched", async () => {
+    const f = await post94ReadFixture();
+    try {
+      const before = JSON.stringify([...f.bindings]);
+      const bytes = normalizeSnapshotDump(Buffer.from(f.originalSql));
+      writeFileSync(f.convertedBackupPath, bytes.sql);
+      writeFileSync(
+        `${f.convertedBackupPath}.identity.json`,
+        JSON.stringify({
+          ...f.convertedIdentity,
+          backupDigest: bytes.digest,
+        }),
+      );
+      await expect(f.inspectPost94()).rejects.toThrow("fixed 0094-fenced");
+      expect(JSON.stringify([...f.bindings])).toBe(before);
+      expect(f.mutations()).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("post94 preserves UNKNOWN without normal proof, terminalization or replay", async () => {
+    const f = await post94ReadFixture();
+    try {
+      const binding = f.suffixBinding();
+      f.bindings.set("suffix98", binding);
+      f.receipts.set("suffix98", {
+        kind: "takoserver.money-cutover-custody@v1",
+        phase: "suffix98",
+        state: "dispatched",
+        bindingDigest: moneyCutoverBindingDigest(binding),
+        postDigest: null,
+      });
+      expect(await f.inspectPost94()).toMatchObject({
+        continuation: "unknown-dispatch",
+        normalHostReady: false,
+      });
+      await expect(
+        runIntegrationMoneyUnitCutover(
+          {
+            action: "apply",
+            environment: "integration",
+            commit: "a".repeat(40),
+            throughMigration: "0098",
+          },
+          f.target,
+          f.options,
+        ),
+      ).rejects.toThrow("Financial realm transition port");
+      expect(f.receipts.get("suffix98")?.state).toBe("dispatched");
+      expect(f.mutations()).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("post94 checks historical old epoch separately from current model98 new epoch", async () => {
+    const f = await post94ReadFixture();
+    try {
+      const binding = f.suffixBinding();
+      f.bindings.set("suffix98", binding);
+      f.receipts.set("suffix98", {
+        kind: "takoserver.money-cutover-custody@v1",
+        phase: "suffix98",
+        state: "dispatched",
+        bindingDigest: moneyCutoverBindingDigest(binding),
+        postDigest: null,
+      });
+      const before = f.receipts.get("convert")?.postDigest;
+      applyPost94SchemaModel(f.database, f.nextWriterEpoch);
+      const currentTarget = { ...f.target, moneyCutoverWriterEpoch: f.nextWriterEpoch };
+      expect(moneyUnitCutoverSchemaMatches(state(f.database), files, "0098-fenced")).toBe(true);
+      expect(await f.inspectPost94(currentTarget)).toMatchObject({
+        schemaPhase: "0098-fenced",
+        historicalWriterEpoch: writerEpoch,
+        currentWriterEpoch: f.nextWriterEpoch,
+        qualification: "component-simulation-only",
+        normalHostReady: false,
+      });
+      expect(f.receipts.get("convert")?.postDigest).toBe(before);
+      f.database.exec("DROP TRIGGER money_cutover_fence_ledger_insert");
+      expect(moneyUnitCutoverSchemaMatches(state(f.database), files, "0098-fenced")).toBe(false);
+      await expect(f.inspectPost94(currentTarget)).rejects.toThrow("schema and old/new epoch");
+      expect(f.mutations()).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("post94 refuses legacy resume custody and historical epoch drift before effects", async () => {
+    const f = await post94ReadFixture();
+    try {
+      f.advance("resume");
+      await expect(f.inspectPost94()).rejects.toThrow("no legacy resume dispatch");
+      expect(f.mutations()).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("post94 detects late retained-history replacement and leaves the original92 backup unchanged", async () => {
+    const f = await post94ReadFixture();
+    try {
+      const originalBytes = readFileSync(f.options.backupPath);
+      let origins = 0;
+      const options: MoneyUnitCutoverOptions = {
+        ...f.options,
+        stageOriginProof: async () => {
+          const origin = await f.options.stageOriginProof();
+          if (++origins === 2) {
+            const binding = f.bindings.get("convert");
+            if (binding === undefined) throw new Error("missing history");
+            f.bindings.set("convert", { ...binding, predecessorCustodyDigest: sha("late drift") });
+          }
+          return origin;
+        },
+      };
+      await expect(f.inspectPost94(f.target, options)).rejects.toThrow("protected custody changed");
+      expect(readFileSync(f.options.backupPath)).toEqual(originalBytes);
+      expect(f.mutations()).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("post94 source validation remains exact after expected-shape cache warmup", () => {
+    const expected = moneyUnitCutoverExpectedShape(files, "0098-fenced");
+    expect(expected.length).toBeGreaterThan(0);
+    const changed = files.map((file, index) =>
+      index === 97 ? { ...file, digest: sha("drift") } : file,
+    );
+    expect(() => assertMoneyPost94Source(changed)).toThrow();
+    expect(() => moneyUnitCutoverExpectedShape(changed, "0098-fenced")).toThrow();
+  });
+
+  test("post94 native entry refuses both new phases before any custody provider or backup effects", async () => {
+    for (const phase of ["suffix98", "resume98"] as const) {
+      const f = await post94ReadFixture();
+      try {
+        let reads = 0;
+        const options: MoneyUnitCutoverOptions = {
+          ...f.options,
+          phase,
+          stageOriginProof: async () => {
+            reads++;
+            throw new Error("must not read");
+          },
+          storageIdentityRead: async () => {
+            reads++;
+            throw new Error("must not read");
+          },
+          custody: {
+            ...f.options.custody,
+            read: async () => {
+              reads++;
+              throw new Error("must not read");
+            },
+          },
+        };
+        await expect(
+          runIntegrationMoneyUnitCutover(
+            {
+              action: "apply",
+              environment: "integration",
+              commit: "a".repeat(40),
+              throughMigration: "0098",
+            },
+            f.target,
+            options,
+          ),
+        ).rejects.toThrow("no export/import/dispatch");
+        expect(reads).toBe(0);
+        expect(f.mutations()).toBe(0);
+      } finally {
+        f.close();
+      }
+    }
   });
 });

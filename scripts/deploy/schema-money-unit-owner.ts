@@ -1086,8 +1086,22 @@ async function inspectStandalonePublicSourceArchive(
 
 function custody(directory: string, originalRead = false): MoneyCutoverCustody {
   protectedDirectory(directory, "money custody directory");
-  const path = (phase: MoneyCutoverPhase, state: "dispatched" | "terminal") =>
-    join(directory, `${phase}.${state}.json`);
+  const path = (phase: MoneyCutoverPhase, state: "dispatched" | "terminal") => {
+    if (
+      ![
+        "freeze",
+        "prepare",
+        "classify",
+        "convert",
+        "resume",
+        "abandon",
+        "suffix98",
+        "resume98",
+      ].includes(phase)
+    )
+      throw preflightError("money custody phase is not a closed owning phase");
+    return join(directory, `${phase}.${state}.json`);
+  };
   const parseReceipt = (
     value: unknown,
     phase: MoneyCutoverPhase,
@@ -1107,6 +1121,17 @@ function custody(directory: string, originalRead = false): MoneyCutoverCustody {
     return value as unknown as MoneyCutoverCustodyReceipt;
   };
   const parseBinding = (value: unknown, phase: MoneyCutoverPhase): MoneyCutoverDispatchBinding => {
+    const post94 = phase === "suffix98" || phase === "resume98";
+    const post94Fields = post94
+      ? [
+          "previousWriterEpoch",
+          "nextWriterEpoch",
+          "original92BackupDigest",
+          "converted94BackupDigest",
+          "convertBindingDigest",
+          "modePreparationDigest",
+        ]
+      : [];
     const fields = [
       "kind",
       "phase",
@@ -1129,11 +1154,15 @@ function custody(directory: string, originalRead = false): MoneyCutoverCustody {
       "beforeShapeDigest",
       "afterSchemaPhase",
       "sealedImportPath",
+      ...post94Fields,
     ];
     if (
       !record(value) ||
       !keys(value, fields) ||
-      value.kind !== "takoserver.money-cutover-dispatch@v1" ||
+      value.kind !==
+        (post94
+          ? "takoserver.money-cutover-dispatch@v2"
+          : "takoserver.money-cutover-dispatch@v1") ||
       value.phase !== phase ||
       !ACCOUNT.test(String(value.accountId)) ||
       !UUID.test(String(value.databaseId)) ||
@@ -1142,9 +1171,15 @@ function custody(directory: string, originalRead = false): MoneyCutoverCustody {
         (originalRead && /^integration-ts-[0-9a-f]{32}$/u.test(String(value.databaseName)))
       ) ||
       !requireCommit(value.sourceCommit) ||
-      !["0092", "0092-fenced", "0093", "0093-fenced", "0094", "0094-fenced"].includes(
-        String(value.afterSchemaPhase),
-      ) ||
+      (post94
+        ? value.afterSchemaPhase !== (phase === "suffix98" ? "0098-fenced" : "0098") ||
+          value.previousWriterEpoch === value.nextWriterEpoch ||
+          value.writerEpoch !==
+            (phase === "suffix98" ? value.previousWriterEpoch : value.nextWriterEpoch) ||
+          value.original92BackupDigest !== value.backupDigest
+        : !["0092", "0092-fenced", "0093", "0093-fenced", "0094", "0094-fenced"].includes(
+            String(value.afterSchemaPhase),
+          )) ||
       typeof value.sealedImportPath !== "string" ||
       !isAbsolute(value.sealedImportPath) ||
       ![
@@ -1161,6 +1196,7 @@ function custody(directory: string, originalRead = false): MoneyCutoverCustody {
         "writerEpoch",
         "reviewDigest",
         "beforeShapeDigest",
+        ...post94Fields,
       ].every((field) => requireSha(value[field]))
     ) {
       throw preflightError("money dispatch binding is malformed");
