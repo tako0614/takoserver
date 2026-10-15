@@ -597,7 +597,8 @@ const LAYERS: readonly Layer[] = [
 function layerOf(path: string): Layer | undefined {
   if (
     path === "config/shared-hosted-pricing.json" ||
-    path === "config/shared-hosted-pricing-revisions/hosted-20261014-final-v1.json"
+    path === "config/shared-hosted-pricing-revisions/hosted-20261014-final-v1.json" ||
+    path === "config/shared-hosted-pricing-revisions/hosted-20261015-container-proposed-v1.json"
   ) {
     return LAYERS.find((layer) => layer.name === "domain");
   }
