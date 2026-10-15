@@ -31,10 +31,16 @@ import {
   type IntegrationOrganizationBootstrapConfig,
   resolveIntegrationOrganizationBootstrapConfig,
 } from "./integration-organization-bootstrap.ts";
-import { createLedger, type FundingSettlementVerifier } from "./ledger.ts";
+import {
+  createLedger,
+  type FundingSettlementVerifier,
+  stripeRefundSource,
+  type UsageWarningPreparer,
+} from "./ledger.ts";
 import { createMetering, type MeteringRates } from "./metering.ts";
 import type { OperatorPaymentsReconcileVerifier } from "./operator-credentials.ts";
 import { createOrgBilling, type OrgBilling } from "./org-billing.ts";
+import { orgUsageSummaryReadStatement } from "./org-usage-summary.ts";
 import {
   createFundingCredit,
   type FundingReconcileReport,
@@ -422,10 +428,31 @@ export function buildApp(ports: AppPorts): App {
         return await prepareAdmission(organizationId);
       }
     : undefined;
+  const warningPolicy = ports.hostedBilling?.limitPolicy;
+  const warningSql = ports.sql;
+  const dispatchWarnings =
+    ports.hostedBilling?.status.warningDelivery === "configured"
+      ? ports.hostedBilling.dispatchWarnings.bind(ports.hostedBilling)
+      : undefined;
+  const usageWarnings: UsageWarningPreparer | undefined = warningPolicy
+    ? async ({ organizationId, instant }) =>
+        warningPolicy.warningStatements({
+          organizationId,
+          instant,
+          summaryRead: orgUsageSummaryReadStatement({
+            organizationId,
+            instant,
+            hostedPaidFreeExclusion: true,
+            hostedCreditProvenance: true,
+            refundSource: await stripeRefundSource(warningSql),
+          }),
+        })
+    : undefined;
   const ledger = createLedger(ports.sql, clock, {
     hostedPaidFreeExclusion:
       ports.hostedBilling !== undefined || ports.hostedPaidFreeExclusion === true,
     ...(allocationAdmissionResolver ? { allocationAdmissionResolver } : {}),
+    ...(usageWarnings ? { usageWarnings } : {}),
   });
   const orgBilling = ports.billingConfig
     ? createOrgBilling({
@@ -887,6 +914,7 @@ export function buildApp(ports: AppPorts): App {
     hostedPaidFreeExclusion:
       ports.hostedBilling !== undefined || ports.hostedPaidFreeExclusion === true,
     ...(allocationAdmissionResolver ? { allocationAdmissionResolver } : {}),
+    ...(usageWarnings ? { usageWarnings } : {}),
     ...(ports.meteringRates ? { rates: ports.meteringRates } : {}),
   });
   const providerMetering = createProviderMetering({
@@ -956,55 +984,85 @@ export function buildApp(ports: AppPorts): App {
         drainFailed = true;
         drainFailure = error;
       }
-      await reseller.reconcileDue(64, async (intent) => {
-        if (!intent.authorityRef) return "ready";
-        const migration = await migrations.read(intent.organizationId, intent.authorityRef);
-        if (!migration) return "pending";
-        if (migration.state === "completed") return "ready";
-        if (migration.state === "failed" || migration.state === "rolled_back") {
-          return "cancelled";
-        }
-        return "pending";
-      });
-      const expiredReservations = await reseller.expireDue(64);
-      const expiredWalletHolds = await orgBilling?.expireDue(64);
-      const expiredRuntimeInputPreparations = await ports.runtimeInputs?.maintenance.expireDue(64);
-      const store = inventory;
-      const installed = ports.forms.map((form) => form.identity.formRef.schemaDigest);
-      const orphans = await store.orphanedResources(installed, 32);
-      const providerUsage = await providerMetering.reconcile(32);
-      const meteredRows = await metering.rollUp(500);
-      const artifactMaintenance = await artifactReconciler.reconcile({
-        limit: 32,
-        deleteObjects: false,
-      });
-      const orphanedResources = orphans.map(
-        (orphan) => `${orphan.space}/${orphan.kind}/${orphan.name}`,
-      );
-      if (orphanedResources.length > 0) {
-        console.warn(
-          JSON.stringify({
-            event: "takoserver.resources.orphaned",
-            count: orphanedResources.length,
-            resources: orphanedResources,
-            hint: "a Form schema changed without a new definitionVersion",
-          }),
+      // Deliver retained warnings before later money work can fail. A transport
+      // failure stays visible while other maintenance and custody can proceed.
+      let warningFailed = false;
+      let warningFailure: unknown;
+      try {
+        if (dispatchWarnings) await dispatchWarnings();
+      } catch (error) {
+        warningFailed = true;
+        warningFailure = error;
+      }
+      let report: TickReport;
+      try {
+        await reseller.reconcileDue(64, async (intent) => {
+          if (!intent.authorityRef) return "ready";
+          const migration = await migrations.read(intent.organizationId, intent.authorityRef);
+          if (!migration) return "pending";
+          if (migration.state === "completed") return "ready";
+          if (migration.state === "failed" || migration.state === "rolled_back") {
+            return "cancelled";
+          }
+          return "pending";
+        });
+        const expiredReservations = await reseller.expireDue(64);
+        const expiredWalletHolds = await orgBilling?.expireDue(64);
+        const expiredRuntimeInputPreparations =
+          await ports.runtimeInputs?.maintenance.expireDue(64);
+        const store = inventory;
+        const installed = ports.forms.map((form) => form.identity.formRef.schemaDigest);
+        const orphans = await store.orphanedResources(installed, 32);
+        const providerUsage = await providerMetering.reconcile(32);
+        const meteredRows = await metering.rollUp(500);
+        const artifactMaintenance = await artifactReconciler.reconcile({
+          limit: 32,
+          deleteObjects: false,
+        });
+        const orphanedResources = orphans.map(
+          (orphan) => `${orphan.space}/${orphan.kind}/${orphan.name}`,
         );
+        if (orphanedResources.length > 0) {
+          console.warn(
+            JSON.stringify({
+              event: "takoserver.resources.orphaned",
+              count: orphanedResources.length,
+              resources: orphanedResources,
+              hint: "a Form schema changed without a new definitionVersion",
+            }),
+          );
+        }
+        report = {
+          expiredReservations,
+          expiredWalletHolds: expiredWalletHolds ?? 0,
+          expiredRuntimeInputPreparations: expiredRuntimeInputPreparations ?? 0,
+          orphanedResources,
+          meteredRows,
+          providerMeterWindows: providerUsage.windows,
+          providerMeterFailures: providerUsage.failures,
+          artifactMaintenance,
+          providerRepairs,
+        };
+      } catch (error) {
+        if (drainFailed || warningFailed)
+          throw new AggregateError(
+            [
+              ...(drainFailed ? [drainFailure] : []),
+              ...(warningFailed ? [warningFailure] : []),
+              error,
+            ],
+            "app maintenance failed",
+          );
+        throw error;
       }
-      if (drainFailed) {
-        throw new AggregateError([drainFailure], "legacy Takoform repair drain failed");
-      }
-      return {
-        expiredReservations,
-        expiredWalletHolds: expiredWalletHolds ?? 0,
-        expiredRuntimeInputPreparations: expiredRuntimeInputPreparations ?? 0,
-        orphanedResources,
-        meteredRows,
-        providerMeterWindows: providerUsage.windows,
-        providerMeterFailures: providerUsage.failures,
-        artifactMaintenance,
-        providerRepairs,
-      };
+      if (drainFailed)
+        throw new AggregateError(
+          warningFailed ? [drainFailure, warningFailure] : [drainFailure],
+          "legacy Takoform repair drain failed",
+        );
+      if (warningFailed)
+        throw new AggregateError([warningFailure], "billing warning delivery failed");
+      return report;
     },
   };
 }

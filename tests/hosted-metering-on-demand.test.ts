@@ -7,9 +7,10 @@ import { createEphemeralSql } from "../src/compat.ts";
 import { createCanonicalHostedBillingComposition } from "../src/hosted-billing-composition.ts";
 import { verifyHostedBillingFinancialRealm } from "../src/hosted-billing-realm.ts";
 import { compilePricingAuthoring } from "../src/hosted-pricing.ts";
-import { createLedger } from "../src/ledger.ts";
+import { createLedger, stripeRefundSource, type UsageWarningPreparer } from "../src/ledger.ts";
 import { createMetering } from "../src/metering.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
+import { orgUsageSummaryReadStatement } from "../src/org-usage-summary.ts";
 import { createProviderPack } from "../src/provider-pack.ts";
 import { FakeProvider } from "../src/providers/fake.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
@@ -285,6 +286,16 @@ async function fixture(purchasedMicros = 1000000) {
     driver: new InMemoryTakoformResourceDriver(),
   });
   time = END;
+  const usageWarnings: UsageWarningPreparer = async (input) =>
+    composition.limitPolicy.warningStatements({
+      ...input,
+      summaryRead: orgUsageSummaryReadStatement({
+        ...input,
+        hostedPaidFreeExclusion: true,
+        hostedCreditProvenance: true,
+        refundSource: await stripeRefundSource(sql),
+      }),
+    });
   const directMetering = createMetering({
     sql,
     ledger,
@@ -294,6 +305,7 @@ async function fixture(purchasedMicros = 1000000) {
     allocationAdmissionResolver: composition.limitPolicy.prepareAdmission.bind(
       composition.limitPolicy,
     ),
+    usageWarnings,
   });
   const window = {
     organizationId: ORG,
@@ -311,6 +323,7 @@ async function fixture(purchasedMicros = 1000000) {
     ledger,
     composition,
     directMetering,
+    usageWarnings,
     window,
     calls,
     reads: () => reads,
@@ -353,6 +366,212 @@ test("buildApp settles its provider window under genuine on-demand consent witho
     { lot_ref: `free:${ORG}:2026-10`, amount_micros: 1500000 },
   ]);
   expect(await f.sql.query("SELECT * FROM stripe_billing_on_demand_commands")).toEqual([]);
+  expect(f.calls.every((call) => call.method === "GET")).toBe(true);
+});
+
+test("buildApp durably warns at 80/95 when provider usage settles without a summary GET", async () => {
+  const f = await fixture();
+  expect(await f.sql.query("SELECT * FROM org_wallet_usage_warnings")).toEqual([]);
+  expect((await f.app.tick()).meteredRows).toBe(1);
+  const rows = await f.sql.query(
+    "SELECT threshold_basis_points, payload_json, state, created_at FROM org_wallet_usage_warnings ORDER BY threshold_basis_points",
+  );
+  expect(rows.map((row) => row.threshold_basis_points)).toEqual([8000, 9500]);
+  for (const row of rows) {
+    expect(JSON.parse(String(row.payload_json))).toEqual({
+      organizationId: ORG,
+      periodKind: "free",
+      periodStart: "2026-10-01T00:00:00.000Z",
+      periodEnd: "2026-11-01T00:00:00.000Z",
+      thresholdBasisPoints: row.threshold_basis_points,
+      effectiveIncludedMicros: "1500000",
+      usedMicros: "1500000",
+      heldMicros: "0",
+      nextResetAt: "2026-11-01T00:00:00.000Z",
+    });
+    expect(row.state).toBe("pending");
+    expect(row.created_at).toBe(END);
+  }
+  expect((await f.app.tick()).meteredRows).toBe(0);
+  expect(await f.sql.query("SELECT COUNT(*) AS n FROM org_wallet_usage_warnings")).toEqual([
+    { n: 2 },
+  ]);
+  expect(f.calls.every((call) => call.method === "GET")).toBe(true);
+  expect(await f.sql.query("SELECT * FROM stripe_billing_on_demand_commands")).toEqual([]);
+});
+
+test("metering commits 80/95 warnings with its debit and exact provider replay adds neither", async () => {
+  const f = await fixture();
+  await f.app.orgBilling?.wallet(ORG);
+  await f.directMetering.recordProviderWindow(f.window);
+  expect(await f.sql.query("SELECT * FROM org_wallet_usage_warnings")).toEqual([]);
+  expect(await f.directMetering.rollUp(100)).toBe(1);
+  const warnings = await f.sql.query(
+    "SELECT threshold_basis_points, payload_json, created_at FROM org_wallet_usage_warnings ORDER BY threshold_basis_points",
+  );
+  expect(warnings.map((row) => row.threshold_basis_points)).toEqual([8000, 9500]);
+  for (const row of warnings) {
+    expect(JSON.parse(String(row.payload_json))).toMatchObject({
+      organizationId: ORG,
+      periodKind: "free",
+      thresholdBasisPoints: row.threshold_basis_points,
+      effectiveIncludedMicros: "1500000",
+      usedMicros: "1500000",
+      heldMicros: "0",
+    });
+    expect(row.created_at).toBe(END);
+  }
+  expect(
+    await f.sql.query(
+      "SELECT settled_delta_micros, created_at FROM ledger WHERE type='usage_debit'",
+    ),
+  ).toEqual([{ settled_delta_micros: -2000000, created_at: END }]);
+  expect((await f.ledger.wallet(ORG)).availableMicros).toBe(500000);
+  await f.directMetering.recordProviderWindow(f.window);
+  expect(await f.directMetering.rollUp(100)).toBe(0);
+  expect(
+    await f.sql.query(
+      "SELECT threshold_basis_points, payload_json, created_at FROM org_wallet_usage_warnings ORDER BY threshold_basis_points",
+    ),
+  ).toEqual(warnings);
+  expect(await f.sql.query("SELECT COUNT(*) AS n FROM ledger WHERE type='usage_debit'")).toEqual([
+    { n: 1 },
+  ]);
+  expect(await f.sql.query("SELECT * FROM wallet_allocation_guards")).toEqual([]);
+  expect(await f.sql.query("SELECT * FROM stripe_billing_on_demand_commands")).toEqual([]);
+  expect(f.calls.every((call) => call.method === "GET")).toBe(true);
+});
+
+test("metering retains its original warning capability when caller options are replaced", async () => {
+  const f = await fixture();
+  await f.app.orgBilling?.wallet(ORG);
+  const mutableOptions = {
+    sql: f.sql,
+    ledger: f.ledger,
+    clock: f.clock,
+    randomId: () => "captured_warning_capability",
+    hostedPaidFreeExclusion: true,
+    allocationAdmissionResolver: f.composition.limitPolicy.prepareAdmission.bind(
+      f.composition.limitPolicy,
+    ),
+    usageWarnings: f.usageWarnings,
+  };
+  const receiver = createMetering(mutableOptions);
+  await receiver.recordProviderWindow(f.window);
+  mutableOptions.usageWarnings = async () => [];
+  expect(await receiver.rollUp(100)).toBe(1);
+  expect((await f.ledger.wallet(ORG)).availableMicros).toBe(500000);
+  expect(
+    await f.sql.query(
+      "SELECT threshold_basis_points FROM org_wallet_usage_warnings ORDER BY threshold_basis_points",
+    ),
+  ).toEqual([{ threshold_basis_points: 8000 }, { threshold_basis_points: 9500 }]);
+  expect(await f.sql.query("SELECT * FROM wallet_allocation_guards")).toEqual([]);
+  expect(await f.sql.query("SELECT * FROM stripe_billing_on_demand_commands")).toEqual([]);
+  expect(f.calls.every((call) => call.method === "GET")).toBe(true);
+});
+
+test("a zero-cost standalone metering rollup retains its no-clock-read behavior", async () => {
+  const sql = createEphemeralSql();
+  let reads = 0;
+  const clock = () => {
+    reads++;
+    return new Date(END);
+  };
+  const receiver = createMetering({
+    sql,
+    ledger: createLedger(sql, clock),
+    clock,
+    randomId: () => "zero_cost_no_clock",
+  });
+  await receiver.record({
+    requestId: "zero_cost",
+    organizationId: ORG,
+    resourceUid: "resource_zero",
+    operation: "get",
+    bytes: 0,
+  });
+  const beforeRollup = reads;
+  expect(await receiver.rollUp(100)).toBe(1);
+  expect(reads).toBe(beforeRollup);
+  expect(await receiver.rollUp(100)).toBe(0);
+  expect(reads).toBe(beforeRollup);
+  expect(await sql.query("SELECT * FROM ledger")).toEqual([]);
+  expect(await sql.query("SELECT * FROM wallet_credit_allocations")).toEqual([]);
+  expect(await sql.query("SELECT * FROM org_wallet_usage_warnings")).toEqual([]);
+});
+
+test("a late warning SQL failure rolls the whole metering settlement back for a safe retry", async () => {
+  const f = await fixture();
+  await f.app.orgBilling?.wallet(ORG);
+  await f.directMetering.recordProviderWindow(f.window);
+  const beforeWallet = await f.ledger.wallet(ORG);
+  const beforeUsage = await f.sql.query("SELECT * FROM usage_events");
+  const failing = createMetering({
+    sql: f.sql,
+    ledger: f.ledger,
+    clock: f.clock,
+    randomId: () => "warning_failure",
+    hostedPaidFreeExclusion: true,
+    allocationAdmissionResolver: f.composition.limitPolicy.prepareAdmission.bind(
+      f.composition.limitPolicy,
+    ),
+    usageWarnings: async (input) => [
+      ...(await f.usageWarnings(input)),
+      { sql: "INSERT INTO wallet_allocation_guards(id,valid) VALUES ('late-warning-failure',0)" },
+    ],
+  });
+  await expect(failing.rollUp(100)).rejects.toMatchObject({ code: "constraint" });
+  expect(await f.sql.query("SELECT * FROM usage_events")).toEqual(beforeUsage);
+  expect(await f.ledger.wallet(ORG)).toEqual(beforeWallet);
+  expect(await f.sql.query("SELECT * FROM wallet_credit_allocations")).toEqual([]);
+  expect(await f.sql.query("SELECT * FROM ledger WHERE type='usage_debit'")).toEqual([]);
+  expect(await f.sql.query("SELECT * FROM org_wallet_usage_warnings")).toEqual([]);
+  expect(await f.sql.query("SELECT * FROM wallet_allocation_guards")).toEqual([]);
+  expect(await f.directMetering.rollUp(100)).toBe(1);
+  expect(await f.sql.query("SELECT COUNT(*) AS n FROM org_wallet_usage_warnings")).toEqual([
+    { n: 2 },
+  ]);
+  expect((await f.ledger.wallet(ORG)).availableMicros).toBe(500000);
+  expect(await f.sql.query("SELECT * FROM stripe_billing_on_demand_commands")).toEqual([]);
+  expect(f.calls.every((call) => call.method === "GET")).toBe(true);
+});
+
+test("insufficient metering funds leave no warning or partial settlement before frozen-consent retry", async () => {
+  const f = await fixture(0);
+  await f.app.orgBilling?.wallet(ORG);
+  await f.directMetering.recordProviderWindow(f.window);
+  const original = await f.sql.query("SELECT * FROM usage_events");
+  await expect(f.directMetering.rollUp(100)).rejects.toMatchObject({ code: "insufficient_funds" });
+  expect(await f.sql.query("SELECT * FROM usage_events")).toEqual(original);
+  expect(await f.sql.query("SELECT * FROM wallet_credit_allocations")).toEqual([]);
+  expect(await f.sql.query("SELECT * FROM ledger WHERE type='usage_debit'")).toEqual([]);
+  expect(await f.sql.query("SELECT * FROM org_wallet_usage_warnings")).toEqual([]);
+  expect(await f.sql.query("SELECT * FROM wallet_allocation_guards")).toEqual([]);
+  expect((await f.ledger.wallet(ORG)).availableMicros).toBe(1500000);
+  await f.composition.limitPolicy.change({
+    organizationId: ORG,
+    reference: "stop_before_direct_retry",
+    onLimit: "stop",
+    authorizedPrincipal: "session:prn_metering",
+  });
+  await f.ledger.fund({
+    organizationId: ORG,
+    fundingRef: "direct_retry_purchase",
+    amountMicros: 500000,
+    kind: "purchased",
+    consumptionClass: "purchased",
+  });
+  expect(await f.directMetering.rollUp(100)).toBe(1);
+  expect(await f.sql.query("SELECT admission_policy_json FROM usage_events")).toEqual([
+    { admission_policy_json: original[0]?.admission_policy_json },
+  ]);
+  expect(await f.sql.query("SELECT COUNT(*) AS n FROM org_wallet_usage_warnings")).toEqual([
+    { n: 2 },
+  ]);
+  expect((await f.ledger.wallet(ORG)).availableMicros).toBe(0);
+  expect(await f.sql.query("SELECT * FROM stripe_billing_on_demand_commands")).toEqual([]);
+  expect(await f.sql.query("SELECT * FROM org_wallet_cash_exposures")).toEqual([]);
   expect(f.calls.every((call) => call.method === "GET")).toBe(true);
 });
 

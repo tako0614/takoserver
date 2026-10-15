@@ -2,11 +2,14 @@ import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { Miniflare } from "miniflare";
+import { parseBillingConfig } from "../src/billing-config.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import { createLedger } from "../src/ledger.ts";
+import { createLedger, stripeRefundSource, type UsageWarningPreparer } from "../src/ledger.ts";
 import { createMetering } from "../src/metering.ts";
+import { createOrgBilling } from "../src/org-billing.ts";
 import { createOrgLimitPolicy } from "../src/org-limit-policy.ts";
-import type { Sql } from "../src/ports.ts";
+import { orgUsageSummaryReadStatement } from "../src/org-usage-summary.ts";
+import { type Sql, SqlError } from "../src/ports.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createStripeBillingStore } from "../src/stripe-billing-store.ts";
@@ -379,6 +382,144 @@ async function exercisePolicyRace(sql: Sql) {
   expect(await sql.query("SELECT * FROM wallet_allocation_guards")).toEqual([]);
 }
 
+async function exerciseAtomicUsageWarnings(sql: Sql) {
+  const config = parseBillingConfig(
+    JSON.stringify({
+      schemaVersion: 1,
+      revision: "native-warnings-r1",
+      effectiveAt: "2026-10-01T00:00:00.000Z",
+      currency: "USD",
+      holdTtlSeconds: 60,
+      freeIncludedMinor: 150,
+      purchaseCreditExpiry: { kind: "none" },
+      plans: {},
+      meters: {},
+    }),
+  );
+  if (!config) throw new Error("native warning tariff missing");
+  const policy = createOrgLimitPolicy({ sql, clock });
+  const allocationAdmissionResolver = policy.prepareAdmission.bind(policy);
+  const usageWarnings: UsageWarningPreparer = async (input) =>
+    policy.warningStatements({
+      ...input,
+      summaryRead: orgUsageSummaryReadStatement({
+        ...input,
+        hostedPaidFreeExclusion: true,
+        hostedCreditProvenance: true,
+        refundSource: await stripeRefundSource(sql),
+      }),
+    });
+  const ledger = createLedger(sql, clock, {
+    hostedPaidFreeExclusion: true,
+    allocationAdmissionResolver,
+    usageWarnings,
+  });
+  const billing = createOrgBilling({
+    sql,
+    clock,
+    ledger,
+    config,
+    hostedPaidFreeExclusion: true,
+    limitPolicy: policy,
+  });
+  let id = 0;
+  const metering = createMetering({
+    sql,
+    ledger,
+    clock,
+    randomId: () => `native_warning_${++id}`,
+    // One request costs 225,000 USD micros under this explicit meter rate.
+    rates: { requestsMinorPerThousand: 22_500 },
+    hostedPaidFreeExclusion: true,
+    allocationAdmissionResolver,
+    usageWarnings,
+  });
+  for (const rollback of [false, true]) {
+    const organizationId = `native_warning_${rollback ? "rollback" : "success"}`;
+    expect((await billing.wallet(organizationId)).availableMicros).toBe(1_500_000);
+    const hold = { organizationId, reference: "eighty", amountMicros: 1_200_000 };
+    expect(await ledger.hold(hold)).toBe(true);
+    const warningRows = async () =>
+      sql.query(
+        "SELECT * FROM org_wallet_usage_warnings WHERE org_id = ? ORDER BY threshold_basis_points",
+        [organizationId],
+      );
+    const eighty = await warningRows();
+    expect(eighty.map((row) => row.threshold_basis_points)).toEqual([8000]);
+    expect(JSON.parse(String(eighty[0]?.payload_json))).toMatchObject({
+      organizationId,
+      effectiveIncludedMicros: "1500000",
+      usedMicros: "0",
+      heldMicros: "1200000",
+    });
+    const measured = { ...usage(`${organizationId}:request`), organizationId };
+    await metering.record(measured);
+    const state = async () => ({
+      usage: await sql.query("SELECT * FROM usage_events WHERE org_id = ? ORDER BY request_id", [
+        organizationId,
+      ]),
+      ledger: await sql.query("SELECT * FROM ledger WHERE org_id = ? ORDER BY id", [
+        organizationId,
+      ]),
+      allocations: await sql.query(
+        "SELECT * FROM wallet_credit_allocations WHERE org_id = ? ORDER BY debit_type, debit_ref, lot_ref",
+        [organizationId],
+      ),
+      lots: await sql.query("SELECT * FROM wallet_credit_lots WHERE org_id = ? ORDER BY ref", [
+        organizationId,
+      ]),
+      warnings: await warningRows(),
+      guards: await sql.query("SELECT * FROM wallet_allocation_guards ORDER BY id"),
+      wallet: await ledger.wallet(organizationId),
+    });
+    if (rollback) {
+      const before = await state();
+      await sql.run(`CREATE TRIGGER native_warning_late_failure
+        BEFORE INSERT ON org_wallet_usage_warnings
+        WHEN NEW.org_id = 'native_warning_rollback' AND NEW.threshold_basis_points = 9500
+        BEGIN SELECT RAISE(ABORT, 'constraint: native-warning-late-failure'); END`);
+      try {
+        let failure: unknown;
+        try {
+          await metering.rollUp(100);
+        } catch (error) {
+          failure = error;
+        }
+        expect(failure).toBeInstanceOf(SqlError);
+        if (!(failure instanceof SqlError)) throw new Error("native warning failure missing");
+        expect(failure.code).toBe("constraint");
+        expect(failure.message).toContain("constraint: native-warning-late-failure");
+        console.info("native warning rollback:", failure.name, failure.code, failure.message);
+        expect(await state()).toEqual(before);
+      } finally {
+        await sql.run("DROP TRIGGER native_warning_late_failure");
+      }
+    }
+    expect(await metering.rollUp(100)).toBe(1);
+    const warnings = await warningRows();
+    expect(warnings.map((row) => row.threshold_basis_points)).toEqual([8000, 9500]);
+    expect(warnings[0]).toEqual(eighty[0]);
+    expect(JSON.parse(String(warnings[1]?.payload_json))).toMatchObject({
+      organizationId,
+      effectiveIncludedMicros: "1500000",
+      usedMicros: "225000",
+      heldMicros: "1200000",
+    });
+    expect(await ledger.wallet(organizationId)).toMatchObject({
+      settledMicros: 1_275_000,
+      heldMicros: 1_200_000,
+      availableMicros: 75_000,
+    });
+    const committed = await state();
+    expect(committed.usage[0]?.rollup_id).not.toBeNull();
+    expect(committed.guards).toEqual([]);
+    expect(await ledger.hold(hold)).toBe(true);
+    await metering.record(measured);
+    expect(await metering.rollUp(100)).toBe(0);
+    expect(await state()).toEqual(committed);
+  }
+}
+
 test("native D1 keeps Hosted default holds and frozen metering guards atomic", async () => {
   const runtime = new Miniflare({
     workers: [
@@ -418,6 +559,7 @@ test("native D1 keeps Hosted default holds and frozen metering guards atomic", a
     expect(outcomes.filter(({ status }) => status === "rejected")).toHaveLength(1);
     expect(await f.ledger.wallet(ORG)).toMatchObject({ availableMicros: 90, heldMicros: 0 });
     expect(await sql.query("SELECT * FROM wallet_allocation_guards")).toEqual([]);
+    await exerciseAtomicUsageWarnings(sql);
   } finally {
     await runtime.dispose();
   }
