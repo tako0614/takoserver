@@ -1272,6 +1272,25 @@ export async function readIntegrationMoneyUnitResumeState(
   request: MoneyUnitResumeReadRequest,
   dependencies: MoneyUnitOwnerDependencies = {},
 ): Promise<MoneyUnitResumeReadback> {
+  // Capture each port synchronously once. All awaited owners consume this owned
+  // snapshot, so later removal/addition/replacement cannot change its authority.
+  const { state, storage, fetcher, publicArtifactBuilder, run, cloudflareEnvironment } =
+    dependencies;
+  const ownedDependencies: MoneyUnitOwnerDependencies = Object.freeze({
+    ...(state === undefined ? {} : { state }),
+    ...(storage === undefined ? {} : { storage }),
+    ...(fetcher === undefined ? {} : { fetcher }),
+    ...(publicArtifactBuilder === undefined ? {} : { publicArtifactBuilder }),
+    ...(run === undefined ? {} : { run }),
+    ...(cloudflareEnvironment === undefined
+      ? {}
+      : { cloudflareEnvironment: Object.freeze({ ...cloudflareEnvironment }) }),
+  });
+  const componentObservation =
+    state !== undefined ||
+    storage !== undefined ||
+    fetcher !== undefined ||
+    publicArtifactBuilder !== undefined;
   const target = request.selectedTarget;
   if (
     Object.keys(request).some(
@@ -1292,25 +1311,19 @@ export async function readIntegrationMoneyUnitResumeState(
   const options = await loadMoneyUnitOwnerOptions(
     request.declarationPath,
     target,
-    dependencies,
+    ownedDependencies,
     request.original,
   );
   assertSelection();
-  const state = await readMoneyUnitResumeState(target, options);
+  const readback = await readMoneyUnitResumeState(target, options);
   assertSelection();
   return {
-    ...state,
+    ...readback,
     originalOriginQualification:
       request.original === undefined
         ? "legacy-reviewed-origin"
         : "independent-origin-review-required",
-    qualification:
-      dependencies.state !== undefined ||
-      dependencies.storage !== undefined ||
-      dependencies.fetcher !== undefined ||
-      dependencies.publicArtifactBuilder !== undefined
-        ? "component-simulation-only"
-        : "provider-native-readback",
+    qualification: componentObservation ? "component-simulation-only" : "provider-native-readback",
   };
 }
 

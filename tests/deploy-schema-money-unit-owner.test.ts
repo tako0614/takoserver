@@ -1,12 +1,26 @@
+import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { buildD1MigrationImport } from "../scripts/deploy/d1-migration-import.ts";
+import { normalizeSnapshotDump } from "../scripts/deploy/d1-snapshot-restore.ts";
+import { canonicalSchemaShape, readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import { expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
-import { moneyCutoverBindingDigest } from "../scripts/deploy/schema-money-unit-cutover.ts";
+import {
+  buildMoneyCutoverImportSql,
+  type MoneyCutoverDispatchBinding,
+  type MoneyReviewBinding,
+  moneyCutoverBindingDigest,
+  moneyUnitCutoverSourcePrefixDigest,
+  readMoneyAggregateDigest,
+  readMoneyFrozenDataDigest,
+  readMoneyPreimageDigest,
+} from "../scripts/deploy/schema-money-unit-cutover.ts";
 import {
   loadMoneyUnitCutoverOptions,
+  type MoneyUnitOwnerDependencies,
   readIntegrationMoneyUnitResumeState,
 } from "../scripts/deploy/schema-money-unit-owner.ts";
 import { type DeployTarget, loadTarget, parseDeployTarget } from "../scripts/deploy/target.ts";
@@ -467,7 +481,297 @@ function standaloneFixture(operatorIdentity?: NonNullable<DeployTarget["operator
   };
 }
 
+/** Full owner reader and held custody; all native ports are controlled component fixtures. */
+async function resumeDependencyFixture(mode: "clear" | "replace") {
+  const f = standaloneFixture();
+  f.setPublicMode(false);
+  f.setResumeFrozen(true);
+  const resumeRoot = join(f.root, "resume-source");
+  mkdirSync(resumeRoot, { mode: 0o700 });
+  const files = readMigrationArtifact().files;
+  const database = new Database(":memory:");
+  const original = normalizeSnapshotDump(
+    Buffer.from(buildD1MigrationImport(files.slice(0, 92), { freshLedger: true }).sql),
+  );
+  database.exec(original.sql);
+  writeFileSync(f.paths.backup, original.sql, { mode: 0o600 });
+  const manifestPath = join(f.root, "classifications.json");
+  writeFileSync(manifestPath, "[]\n", { mode: 0o600 });
+  const resumePublicationReceiptDigest = f.write(f.paths.resumePublication, {
+    kind: "takoserver.money-public-worker-publication@v1",
+    state: "reviewed",
+    reviewedAt,
+    reviewEvidenceDigest: sha("resume-publication-review-evidence"),
+    phase: "resume",
+    accountId: account,
+    databaseId,
+    workerName: f.target.workerName,
+    sourceCommit: resumeSource,
+    bundleDigest: sha(resumeBytes),
+    artifactDigest: sha("sealed-resume"),
+    artifactBytes: 100,
+    artifactFiles: 2,
+    deploymentId: id(45),
+    versionId: id(44),
+    surface: "takoserver-worker-authority-cutover",
+    resultKind: "takoserver.worker-closure-transition-apply@v1",
+    resultDigest: sha("resume-result"),
+    ownerGateDigest: sha("resume-gate"),
+    reviewer: "publication-reviewer",
+    reviewRef: "review://resume-publication",
+  });
+  f.write(f.paths.declaration, {
+    ...f.declaration,
+    phase: "resume",
+    resumeCommit: resumeSource,
+    resumeModuleDigest: sha(resumeBytes),
+    resumeSourceRoot: resumeRoot,
+    resumePublicationReceiptPath: f.paths.resumePublication,
+    resumePublicationReceiptDigest,
+    classificationManifestPath: manifestPath,
+    classificationManifestDigest: sha("[]\n"),
+  });
+  const owner = await loadMoneyUnitCutoverOptions(f.paths.declaration, f.target, f);
+  const origin = await owner.stageOriginProof();
+  const identity = await owner.storageIdentityRead();
+  const originDigest = sha(JSON.stringify(origin));
+  f.write(`${f.paths.backup}.identity.json`, {
+    kind: "takoserver.money-protected-backup@v1",
+    accountId: account,
+    databaseId,
+    databaseName: name,
+    originDigest,
+    sourceDigest,
+    backupDigest: original.digest,
+  });
+  const local = {
+    query: async (_phase: unknown, _description: unknown, sql: string) =>
+      database.query(sql).all() as Record<string, unknown>[],
+  };
+  const preimageDigest = await readMoneyPreimageDigest(local, "preflight");
+  const aggregateDigest = await readMoneyAggregateDigest(local, "preflight");
+  const financialDigest = await readMoneyFrozenDataDigest(local, "preflight");
+  const writerDigest = sha("controlled prior native maintenance proof");
+  const anchor = sha(
+    JSON.stringify({
+      kind: "takoserver.money-freeze-anchor@v1",
+      target: identity,
+      originDigest,
+      backupDigest: original.digest,
+      preimageDigest,
+      aggregateDigest,
+      financialDigest,
+      writerDigest,
+      writerEpoch,
+      sourceDigest,
+    }),
+  );
+  const schema = () => {
+    const applied = (
+      database.query("SELECT name FROM d1_migrations ORDER BY id").all() as { name: string }[]
+    ).map((row) => row.name);
+    const shape = canonicalSchemaShape(
+      database
+        .query(
+          "SELECT type, name, tbl_name, COALESCE(sql, '') AS sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name",
+        )
+        .all() as Record<string, unknown>[],
+    );
+    return { applied, shape, shapeDigest: sha(shape) };
+  };
+  let predecessor = origin.terminalCustodyDigest;
+  for (const phase of ["freeze", "prepare", "classify", "convert"] as const) {
+    const beforeShapeDigest = schema().shapeDigest;
+    const sql = buildMoneyCutoverImportSql({
+      phase,
+      files,
+      anchor,
+      originDigest,
+      backupDigest: original.digest,
+      writerDigest,
+      writerEpoch,
+      classifications: [],
+    });
+    const directory = join(f.root, `money-${phase}-fixture`);
+    mkdirSync(directory, { mode: 0o700 });
+    const sealedImportPath = join(directory, "import.sql");
+    writeFileSync(sealedImportPath, sql, { mode: 0o600 });
+    const binding: MoneyCutoverDispatchBinding = {
+      kind: "takoserver.money-cutover-dispatch@v1",
+      phase,
+      accountId: account,
+      databaseId,
+      databaseName: name,
+      originDigest,
+      predecessorCustodyDigest: predecessor,
+      sourceCommit: source,
+      sourceDigest: moneyUnitCutoverSourcePrefixDigest(files, phase === "convert" ? 94 : 93),
+      importDigest: sha(sql),
+      backupDigest: original.digest,
+      preimageDigest,
+      aggregateDigest,
+      classificationDigest: sha("[]\n"),
+      writerDigest,
+      resumeDigest: sha("no-resume-worker"),
+      writerEpoch,
+      reviewDigest: sha("temporary-review-digest"),
+      beforeShapeDigest,
+      afterSchemaPhase:
+        phase === "freeze" ? "0092-fenced" : phase === "convert" ? "0094-fenced" : "0093-fenced",
+      sealedImportPath,
+    };
+    const reviewBinding: MoneyReviewBinding = {
+      kind: "takoserver.money-review-binding@v1",
+      phase,
+      accountId: account,
+      databaseId,
+      originDigest,
+      predecessorCustodyDigest: predecessor,
+      sourceCommit: source,
+      sourceDigest: binding.sourceDigest,
+      importDigest: binding.importDigest,
+      backupDigest: binding.backupDigest,
+      preimageDigest,
+      aggregateDigest,
+      classificationDigest: binding.classificationDigest,
+      writerDigest,
+      resumeDigest: binding.resumeDigest,
+      writerEpoch,
+    };
+    const review = {
+      kind: "takoserver.money-independent-review@v1",
+      state: "reviewed",
+      reviewedAt,
+      reviewEvidenceDigest: sha("controlled component review"),
+      reviewer: "component-reviewer",
+      reviewRef: "review://controlled-component",
+      bindingDigest: moneyCutoverBindingDigest(reviewBinding),
+      evidenceDigest: sha("controlled component review"),
+    };
+    f.write(f.paths.review, review);
+    const reviewedBinding = { ...binding, reviewDigest: sha(JSON.stringify(review)) };
+    await owner.custody.dispatch(reviewedBinding);
+    database.exec(`BEGIN TRANSACTION;\n${sql}\nCOMMIT;`);
+    const post = schema();
+    const terminal = await owner.custody.terminal(
+      reviewedBinding,
+      sha(
+        JSON.stringify({
+          applied: post.applied,
+          shapeDigest: post.shapeDigest,
+          preimageDigest,
+          aggregateDigest,
+        }),
+      ),
+    );
+    predecessor = sha(JSON.stringify(terminal));
+  }
+  let builds = 0;
+  let lateCallbacks = 0;
+  let d1Reads = 0;
+  type MutableDependencies = {
+    -readonly [K in keyof MoneyUnitOwnerDependencies]: MoneyUnitOwnerDependencies[K];
+  };
+  const dependencies: MutableDependencies = {
+    state: {
+      ...f.state,
+      async workerDeployments(workerName: string) {
+        const history = await f.state.workerDeployments(workerName);
+        if (builds === 2) {
+          await Promise.resolve();
+          lateCallbacks++;
+          if (mode === "clear") {
+            delete dependencies.state;
+            delete dependencies.storage;
+            delete dependencies.fetcher;
+            delete dependencies.publicArtifactBuilder;
+          } else {
+            dependencies.state = {
+              ...f.state,
+              workerDeployments: async () => {
+                throw new Error("replacement state consumed");
+              },
+            };
+            dependencies.storage = {
+              getD1: async () => {
+                throw new Error("replacement D1 consumed");
+              },
+              getR2: async () => {
+                throw new Error("replacement R2 consumed");
+              },
+            };
+            dependencies.fetcher = async () => {
+              throw new Error("replacement fetcher consumed");
+            };
+            dependencies.publicArtifactBuilder = async () => {
+              throw new Error("replacement builder consumed");
+            };
+          }
+        }
+        return history;
+      },
+    },
+    storage: f.storage,
+    fetcher: f.fetcher,
+    publicArtifactBuilder: async (root: string, commit: string) => {
+      builds++;
+      return f.publicArtifactBuilder(root, commit);
+    },
+    cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "controlled-component-token" },
+    run: async (command) => {
+      if (command[0] === "git" && command[3] === "rev-parse") {
+        const selectedRoot = command[2];
+        return {
+          exitCode: 0,
+          stdout: `${command[4] === "HEAD" ? (selectedRoot === resumeRoot ? resumeSource : source) : selectedRoot}\n`,
+          stderr: "",
+        };
+      }
+      const commandIndex = command.indexOf("--command");
+      if (command.includes("d1") && command.includes("execute") && commandIndex >= 0) {
+        const sql = command[commandIndex + 1];
+        if (!sql || !/^(?:SELECT\b|PRAGMA\b)/u.test(sql)) throw new Error("non-read D1 command");
+        d1Reads++;
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify([{ success: true, results: database.query(sql).all() }]),
+          stderr: "",
+        };
+      }
+      return f.run(command);
+    },
+  };
+  return {
+    f,
+    dependencies,
+    reads: () => d1Reads,
+    builds: () => builds,
+    lateCallbacks: () => lateCallbacks,
+    close: () => database.close(),
+  };
+}
+
 describe("money unit owner adapter", () => {
+  for (const mode of ["clear", "replace"] as const) {
+    test(`money resume dependency snapshot preserves component taint when late ports ${mode}`, async () => {
+      const fixture = await resumeDependencyFixture(mode);
+      try {
+        const result = await readIntegrationMoneyUnitResumeState(
+          { selectedTarget: fixture.f.target, declarationPath: fixture.f.paths.declaration },
+          fixture.dependencies,
+        );
+        expect(fixture.builds()).toBe(2);
+        expect(fixture.lateCallbacks()).toBe(1);
+        expect(fixture.reads()).toBeGreaterThan(0);
+        expect(result.schemaPhase).toBe("0094-fenced");
+        expect(result.normalHostReady).toBe(false);
+        expect(result.qualification).toBe("component-simulation-only");
+      } finally {
+        fixture.close();
+      }
+    });
+  }
+
   test("money resume read admits prefixed policy only under its explicit read selector", async () => {
     const f = fixture();
     const { cloudflareProviderExecutor: _private, ...standalone } = target;
