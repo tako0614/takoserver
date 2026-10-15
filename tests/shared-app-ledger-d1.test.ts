@@ -599,3 +599,110 @@ test("invalid names refuse before D1 and trusted owner pins cannot drift across 
     await h.close();
   }
 });
+
+test("native D1 active head inconsistencies fail both fresh primary fences", async () => {
+  const corruptions = [
+    "UPDATE shared_app_staging_names SET generation = generation + 1 WHERE normalized_name = ?",
+    "UPDATE shared_app_staging_assignments SET state = 'reserved', script = NULL WHERE name = ?",
+    "UPDATE shared_app_staging_assignments SET name = 'renamed-head' WHERE name = ?",
+    `UPDATE shared_app_staging_names SET incarnation = (
+      SELECT incarnation FROM shared_app_staging_assignments WHERE name = 'other-head'
+    ) WHERE normalized_name = ?`,
+  ];
+  for (const corruption of corruptions) {
+    const h = await harness();
+    try {
+      const owner = h.ledger.forTrustedOwner(SERVER);
+      const active = await owner.activate(
+        await owner.reserve({ reservationId: "corrupt", name: "corrupt-head" }),
+        "original-script",
+      );
+      await owner.reserve({ reservationId: "other", name: "other-head" });
+      const selected = await h.ledger.readCurrent(active.name);
+      if (!selected) throw new Error("healthy active selection missing");
+      expect(await h.ledger.isCurrentBeforeDispatch(selected)).toBe(true);
+      let deliver: (() => void) | undefined;
+      const response = new Promise<void>((resolve) => {
+        deliver = resolve;
+      });
+      const lateResponse = response.then(() => h.ledger.isCurrentAfterDispatch(selected));
+
+      // Each mutation preserves every native CHECK and FK while breaking the head/assignment tuple.
+      await h.sql.run(corruption, [active.name]);
+      const rows = () =>
+        Promise.all([
+          h.sql.query("SELECT * FROM shared_app_staging_names ORDER BY normalized_name"),
+          h.sql.query("SELECT * FROM shared_app_staging_assignments ORDER BY incarnation"),
+        ]);
+      const before = await rows();
+      for (const read of [
+        () => h.ledger.readCurrent(active.name),
+        () => h.ledger.isCurrentBeforeDispatch(selected),
+        () => h.ledger.isCurrentAfterDispatch(selected),
+      ]) {
+        const sessions = h.sessions.length;
+        await expect(read()).rejects.toMatchObject({ code: "unavailable" });
+        expect(h.sessions.length).toBe(sessions + 1);
+      }
+      const sessions = h.sessions.length;
+      deliver?.();
+      await expect(lateResponse).rejects.toMatchObject({ code: "unavailable" });
+      expect(h.sessions.length).toBe(sessions + 1);
+      expect(await rows()).toEqual(before);
+      expect(h.sessions.every((constraint) => constraint === "first-primary")).toBe(true);
+    } finally {
+      await h.close();
+    }
+  }
+});
+
+test("native D1 consistent absent inactive and newer selections keep normal read results", async () => {
+  const h = await harness();
+  try {
+    const owner = h.ledger.forTrustedOwner(SERVER);
+    expect(await h.ledger.readCurrent("absent-head")).toBeNull();
+    const reserved = await owner.reserve({ reservationId: "healthy", name: "healthy-head" });
+    expect(await h.ledger.readCurrent(reserved.name)).toBeNull();
+    expect(await h.ledger.isCurrentBeforeDispatch({ ...reserved, script: "not-active" })).toBe(
+      false,
+    );
+    expect(await h.ledger.isCurrentAfterDispatch({ ...reserved, script: "not-active" })).toBe(
+      false,
+    );
+    const active = await owner.activate(reserved, "original-script");
+    const selected = await h.ledger.readCurrent(active.name);
+    if (!selected) throw new Error("healthy active selection missing");
+    expect(await h.ledger.isCurrentBeforeDispatch(selected)).toBe(true);
+    expect(await h.ledger.isCurrentAfterDispatch(selected)).toBe(true);
+
+    // Fixture setup for a consistent newer tuple, not an owner publication mount.
+    await h.sql.batch([
+      {
+        sql: `UPDATE shared_app_staging_assignments SET generation = generation + 1,
+          script = 'successor-script' WHERE name = ?`,
+        params: [active.name],
+      },
+      {
+        sql: `UPDATE shared_app_staging_names SET generation = generation + 1
+          WHERE normalized_name = ?`,
+        params: [active.name],
+      },
+    ]);
+    const current = await h.ledger.readCurrent(active.name);
+    expect(current).toMatchObject({
+      generation: active.generation + 1,
+      script: "successor-script",
+    });
+    expect(await h.ledger.isCurrentBeforeDispatch(selected)).toBe(false);
+    expect(await h.ledger.isCurrentAfterDispatch(selected)).toBe(false);
+    if (!current) throw new Error("healthy newer selection missing");
+    expect(await h.ledger.isCurrentBeforeDispatch(current)).toBe(true);
+    expect(await h.ledger.isCurrentAfterDispatch(current)).toBe(true);
+    await owner.release(current);
+    expect(await h.ledger.readCurrent(current.name)).toBeNull();
+    expect(await h.ledger.isCurrentBeforeDispatch(current)).toBe(false);
+    expect(await h.ledger.isCurrentAfterDispatch(current)).toBe(false);
+  } finally {
+    await h.close();
+  }
+});

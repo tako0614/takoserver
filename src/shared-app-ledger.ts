@@ -252,7 +252,7 @@ export function createSharedAppLedger(options: {
   };
   const current = async (name: string): Promise<SharedAppSelection | null> => {
     const rows = await primary().query(
-      `SELECT a.* FROM ${names} AS n JOIN ${assignments} AS a
+      `SELECT a.* FROM ${names} AS n LEFT JOIN ${assignments} AS a
          ON a.name = n.normalized_name AND a.incarnation = n.incarnation
         AND a.generation = n.generation AND a.state = n.state
        WHERE n.normalized_name = ? AND n.state = 'active' LIMIT 2`,
