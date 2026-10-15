@@ -241,7 +241,6 @@ export {
   type WorkerCronTriggerScanContinuation,
   type WorkerCronTriggerTickResult,
 } from "./worker-cron-trigger-scheduler.ts";
-export { createForwardWorkerDeploymentForm } from "./worker-deployment-backend.ts";
 export {
   createV2WorkerInvocationLifecycle,
   type V2WorkerCronInvocationClaim,
@@ -263,7 +262,6 @@ export {
   type V2WorkerInvocationSchema,
   v2WorkerInvocationSchemaReady,
 } from "./worker-invocation-schema.ts";
-export { createInternalV2ForwardWorkerVersionForm } from "./worker-lifecycle-backend.ts";
 export {
   createV2NativeDeletionCustody,
   type V2NativeDeletionCustody,
