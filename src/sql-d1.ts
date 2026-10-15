@@ -18,6 +18,7 @@ export interface D1StatementLike {
 }
 
 export interface D1ResultLike {
+  readonly success?: boolean;
   readonly results?: readonly Row[] | null;
   readonly meta?: { readonly changes?: number | null } | null;
 }
@@ -32,7 +33,16 @@ export interface D1DatabaseLike {
  * array commits or none of it does, which is exactly the guarantee the guarded
  * writes upstream are built on.
  */
-export function createD1Sql(database: D1DatabaseLike): Sql {
+export function createD1Sql(
+  database: D1DatabaseLike,
+  options: { readonly acknowledgement?: "explicit-d1-result" } = {},
+): Sql {
+  // Code-selected raw ACK validation, not a primary, realm or identity capability.
+  const acknowledgement = options.acknowledgement;
+  if (acknowledgement !== undefined && acknowledgement !== "explicit-d1-result") {
+    throw new TypeError("unsupported D1 acknowledgement policy");
+  }
+  const explicit = acknowledgement === "explicit-d1-result";
   if (!database || typeof database.prepare !== "function" || typeof database.batch !== "function") {
     throw new TypeError("a D1 database binding is required");
   }
@@ -50,7 +60,7 @@ export function createD1Sql(database: D1DatabaseLike): Sql {
     } catch (error) {
       throw sqlError(error);
     }
-    return write(result);
+    return explicit ? acknowledgedWrite(result) : write(result);
   };
 
   return {
@@ -63,17 +73,63 @@ export function createD1Sql(database: D1DatabaseLike): Sql {
     async batch(statements): Promise<readonly SqlWrite[]> {
       if (statements.length === 0) return [];
       let results: readonly D1ResultLike[];
+      let submittedCount = 0;
       try {
-        results = await database.batch(statements.map(prepared));
+        const submitted = statements.map(prepared);
+        submittedCount = submitted.length;
+        results = await database.batch(submitted);
       } catch (error) {
         throw sqlError(error);
       }
-      if (results.length !== statements.length) {
+      if (explicit && !Array.isArray(results)) {
+        throw new SqlError("unavailable", "D1 returned an invalid batch acknowledgement");
+      }
+      if (results.length !== (explicit ? submittedCount : statements.length)) {
         throw new SqlError("unavailable", "D1 returned a truncated batch result");
       }
-      return results.map(write);
+      if (!explicit) return results.map(write);
+      const acknowledged: SqlWrite[] = [];
+      for (let index = 0; index < results.length; index++) {
+        if (!Object.hasOwn(results, index)) {
+          throw new SqlError("unavailable", "D1 returned an incomplete batch acknowledgement");
+        }
+        acknowledged.push(acknowledgedWrite(results[index]));
+      }
+      return acknowledged;
     },
   };
+}
+
+/** Null is unknown in this mode, for every statement including permit writes. */
+function acknowledgedWrite(result: D1ResultLike | undefined): SqlWrite {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    throw new SqlError("unavailable", "D1 returned an invalid statement acknowledgement");
+  }
+  const rows = result.results;
+  const meta = result.meta;
+  if (
+    !Object.hasOwn(result, "success") ||
+    result.success !== true ||
+    !Object.hasOwn(result, "results") ||
+    !Array.isArray(rows) ||
+    !Object.hasOwn(result, "meta") ||
+    !meta ||
+    typeof meta !== "object" ||
+    Array.isArray(meta) ||
+    !Object.hasOwn(meta, "changes") ||
+    typeof meta.changes !== "number" ||
+    !Number.isSafeInteger(meta.changes) ||
+    meta.changes < 0
+  ) {
+    throw new SqlError("unavailable", "D1 returned an incomplete statement acknowledgement");
+  }
+  for (let index = 0; index < rows.length; index++) {
+    const row: unknown = rows[index];
+    if (!Object.hasOwn(rows, index) || !row || typeof row !== "object" || Array.isArray(row)) {
+      throw new SqlError("unavailable", "D1 returned an invalid result row acknowledgement");
+    }
+  }
+  return { rows, changes: meta.changes };
 }
 
 function write(result: D1ResultLike): SqlWrite {
