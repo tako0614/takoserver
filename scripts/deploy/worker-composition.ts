@@ -1,4 +1,6 @@
 import { buildEdgeForms } from "../../src/edge-forms.ts";
+import type { WorkerEnv } from "../../src/entry-worker.ts";
+import { PAYMENT_SETTING_VARIABLES } from "../../src/payment-settings.ts";
 import { currentTakoformCandidates } from "../../src/takoform/current-candidates.ts";
 import { parseTakoformV2PublicConfig } from "../../src/takoform-v2/config.ts";
 import {
@@ -38,8 +40,24 @@ const COMPOSITION_VARS = [
   "TAKOSERVER_TAKOFORM_V2_CONFIG",
 ] as const;
 
+const HOSTED_BILLING_COMPOSITION_VARS = [
+  "PUBLIC_ORIGIN",
+  "TAKOSERVER_CONSOLE_ORIGIN",
+  "TAKOSERVER_BILLING_CONFIG",
+  "TAKOSERVER_HOSTED_PRICING",
+  "TAKOSERVER_HOSTED_BILLING",
+  "TAKOSERVER_STRIPE_MODE",
+  "TAKOSERVER_HOSTED_BILLING_ACCOUNT_ID",
+  "TAKOSERVER_HOSTED_BILLING_AUTHORITY",
+  "TAKOSERVER_HOSTED_BILLING_ON_DEMAND",
+  ...Object.values(PAYMENT_SETTING_VARIABLES),
+] as const;
+
+export type WorkerCompositionEnv = WorkerProductionCompositionEnv &
+  Partial<Pick<WorkerEnv, (typeof HOSTED_BILLING_COMPOSITION_VARS)[number]>>;
+
 /** The composition inputs the Worker reads, derived exactly as the upload does. */
-export function workerCompositionEnv(target: DeployTarget): WorkerProductionCompositionEnv {
+export function workerCompositionEnv(target: DeployTarget): WorkerCompositionEnv {
   // A JIT-enabled target needs an explicit authority profile, and the historical
   // one is the profile that requires no artifact provenance. None of the five
   // JIT bindings is a composition input, so the choice cannot change the answer.
@@ -50,6 +68,12 @@ export function workerCompositionEnv(target: DeployTarget): WorkerProductionComp
     const value = vars[name];
     if (value !== undefined) env[name] = value;
   }
+  if (target.hostedBilling !== undefined) {
+    for (const name of HOSTED_BILLING_COMPOSITION_VARS) {
+      const value = vars[name];
+      if (value !== undefined) env[name] = value;
+    }
+  }
   if (target.cloudflareProviderExecutor !== undefined && !isArtifactBlobIoQuiescedTarget(target)) {
     // Composition never invokes the binding. Its exact presence is the
     // credential-free capability fact the runtime requires before it exposes
@@ -58,11 +82,13 @@ export function workerCompositionEnv(target: DeployTarget): WorkerProductionComp
       WorkerProductionCompositionEnv["CLOUDFLARE_PROVIDER_EXECUTOR"]
     >;
   }
-  return env as WorkerProductionCompositionEnv;
+  return env as WorkerCompositionEnv;
 }
 
 /**
- * Composes the selected target with the Worker's own startup path.
+ * Composes the selected target with the Worker's supply and Form composition.
+ * Financial environment inputs are retained, but SQL/Stripe realm and secret
+ * qualification remain the actual entry's separate startup responsibility.
  *
  * The refusal is the composition's own message, verbatim, because that is the
  * sentence the operator would otherwise have read from `wrangler tail` with the
