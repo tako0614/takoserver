@@ -287,6 +287,10 @@ textarea {
     display: none;
   }
 
+  .topbar {
+    overflow-x: auto;
+  }
+
   .rail--open {
     display: flex;
     position: fixed;
@@ -645,6 +649,53 @@ tbody tr.is-clickable:hover {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.billing-plan__content {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+}
+
+.billing-plan__summary {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+
+.billing-plan__heading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.billing-plan__name {
+  min-width: 0;
+  font-size: 18px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.billing-plan__coverage {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.billing-plan__actions {
+  align-items: stretch;
+}
+
+.billing-plan__action {
+  min-height: 44px;
+  white-space: nowrap;
+  text-align: center;
+}
+
+.billing-plan__action:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 /* ---------------------------------------------------------------- state -- */

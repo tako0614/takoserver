@@ -4,6 +4,7 @@ import { Miniflare } from "miniflare";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { bytesDigest } from "../src/json.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
+import { claimFreshStripeModeRealm } from "../src/stripe-mode-realm.ts";
 import { SQLITE_MIGRATION_SET_FORM_URL } from "../src/takoform-v2/forms/sqlite-migration-set.ts";
 import { STATIC_ASSET_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/static-asset-bundle.ts";
 import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.ts";
@@ -93,6 +94,7 @@ test("normal Worker entry exposes only configured artifact Forms through authent
       }
     }
     const sql = createD1Sql(database);
+    await claimFreshStripeModeRealm(sql, "test");
     const now = new Date().toISOString();
     await sql.run(
       "INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)",
@@ -378,6 +380,52 @@ test("configured artifact Forms refuse incomplete 0075 or 0081 before accepting 
         await database.prepare(statement).run();
       }
     }
+    // Only the fully restored current fixture can qualify its fresh TEST realm.
+    // The incomplete historical phases above remain unqualified and refusing.
+    await claimFreshStripeModeRealm(sql, "test");
+    // Keep the unrelated current startup prerequisites valid while damaging
+    // each target. Do not cache a successful app until all refusal cases end.
+    for (const table of [
+      "tf_v2_artifact_progress",
+      "tf_v2_private_inputs",
+      "tf_v2_configured_private_inputs",
+    ]) {
+      const definitions = await sql.query(
+        "SELECT type, sql FROM sqlite_schema WHERE tbl_name = ? AND sql IS NOT NULL ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, name",
+        [table],
+      );
+      const tableDefinition = definitions.find((row) => row.type === "table");
+      if (typeof tableDefinition?.sql !== "string") {
+        throw new Error(`missing current fixture table ${table}`);
+      }
+      await database.prepare(`DROP TABLE ${table}`).run();
+      await refuseBeforeAcceptance();
+      await database.prepare(tableDefinition.sql).run();
+      await refuseBeforeAcceptance();
+      for (const definition of definitions.filter((row) => row.type !== "table")) {
+        if (typeof definition.sql !== "string") throw new Error("missing fixture schema SQL");
+        await database.prepare(definition.sql).run();
+      }
+    }
+    for (const trigger of [
+      "tf_v2_artifact_progress_monotonic",
+      "tf_v2_artifact_progress_terminal_gc",
+      "tf_v2_artifact_chunk_lease_guard",
+      "tf_v2_private_transfer_dispatched",
+      "tf_v2_configured_private_immutable",
+      "tf_v2_operation_transition",
+    ]) {
+      const definition = await sql.query(
+        "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?",
+        [trigger],
+      );
+      if (definition.length !== 1 || typeof definition[0]?.sql !== "string") {
+        throw new Error(`missing current fixture trigger ${trigger}`);
+      }
+      await database.prepare(`DROP TRIGGER ${trigger}`).run();
+      await refuseBeforeAcceptance();
+      await database.prepare(definition[0].sql).run();
+    }
     const qualified = await runtime.dispatchFetch(
       `${BASE}/support?form=${encodeURIComponent(SQLITE_MIGRATION_SET_FORM_URL)}`,
       { headers: { authorization: `Bearer ${TOKEN}` } },
@@ -438,6 +486,7 @@ test("code-selected Worker entry source acquires a new StaticAssetBundle into D1
       }
     }
     const sql = createD1Sql(database);
+    await claimFreshStripeModeRealm(sql, "test");
     const now = new Date().toISOString();
     await sql.run(
       "INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)",
@@ -515,6 +564,7 @@ test("ordinary Worker entry does not fetch an unheld public StaticAssetBundle UR
       }
     }
     const sql = createD1Sql(database);
+    await claimFreshStripeModeRealm(sql, "test");
     const now = new Date().toISOString();
     await sql.run(
       "INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)",
@@ -591,6 +641,8 @@ test("private artifact hook failures have payload-free Worker startup refusals",
           await database.prepare(statement).run();
         }
       }
+      // Reach the artifact hook refusal, not an unrelated missing-realm refusal.
+      await claimFreshStripeModeRealm(createD1Sql(database), "test");
       const response = await runtime.dispatchFetch(
         `${BASE}/support?form=${encodeURIComponent(STATIC_ASSET_BUNDLE_FORM_URL)}`,
       );
@@ -644,6 +696,7 @@ async function entryRuntime(
             STATE_DB: { type: "d1", id: name },
             OBJECTS: { type: "r2", name },
             PUBLIC_ORIGIN: { type: "text", value: ORIGIN },
+            TAKOSERVER_STRIPE_MODE: { type: "text", value: "test" },
             WORKER_VERSION: {
               type: "json",
               value: { id: "00000000-0000-4000-8000-0000000000a1" },

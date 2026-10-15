@@ -3,6 +3,11 @@ import { parseBillingConfig } from "./billing-config.ts";
 import { createCatalog } from "./catalog.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
 import { errorEnvelopeResponse } from "./error-envelope.ts";
+import {
+  createCanonicalHostedBillingComposition,
+  type HostedBillingComposition,
+} from "./hosted-billing-composition.ts";
+import { verifyHostedBillingFinancialRealm } from "./hosted-billing-realm.ts";
 import { assertHostedPricingMatchesBilling, parseHostedPricing } from "./hosted-pricing.ts";
 import { resolveIdentity } from "./identity-setup.ts";
 import {
@@ -45,6 +50,8 @@ import {
 import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
 import { assertStripeBillingSchema } from "./stripe-billing.ts";
+import { createStripeBillingClient } from "./stripe-billing-client.ts";
+import { assertStripeModeRealm, parseStripeMode } from "./stripe-mode-realm.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { createTakoformStore } from "./takoform/store.ts";
 import { parseTakoformV2ApplicationConfig } from "./takoform-v2/config.ts";
@@ -95,8 +102,15 @@ export interface WorkerEnv {
   readonly TAKOSERVER_CONSOLE_ORIGIN?: string;
   /** Versioned JSON Organization billing tariff; absent disables the new wallet API. */
   readonly TAKOSERVER_BILLING_CONFIG?: string;
-  /** Explicit hosted-only pricing authoring JSON; subscriptions require Stripe test mode. */
+  /** Explicit deployment-wide financial realm; absent means TEST. */
+  readonly TAKOSERVER_STRIPE_MODE?: string;
+  /** Explicit hosted-only pricing JSON; its native Price must match the selected Stripe realm. */
   readonly TAKOSERVER_HOSTED_PRICING?: string;
+  /** Exact opt-in to the separately qualified Hosted TEST payment composition. */
+  readonly TAKOSERVER_HOSTED_BILLING?: string;
+  /** Non-secret deployment-selected account and stable billing authority. */
+  readonly TAKOSERVER_HOSTED_BILLING_ACCOUNT_ID?: string;
+  readonly TAKOSERVER_HOSTED_BILLING_AUTHORITY?: string;
   /** Public half of the operator key, as an Ed25519 JWK. */
   readonly OPERATOR_PUBLIC_JWK?: string;
   /**
@@ -176,6 +190,13 @@ export function operatorCredentialKeys(env: {
   };
 }
 
+function canonicalHostedBillingSelected(selection: string | undefined): boolean {
+  if (selection !== undefined && selection !== "" && selection !== "canonical-test") {
+    throw new TypeError("TAKOSERVER_HOSTED_BILLING must be canonical-test or absent");
+  }
+  return selection === "canonical-test";
+}
+
 export function workerCredentials(
   env: Pick<
     WorkerEnv,
@@ -185,6 +206,7 @@ export function workerCredentials(
     | "TAKOS_ID_CLIENT_ID"
     | "GOOGLE_CLIENT_ID"
     | "STRIPE_SECRET_KEY"
+    | "TAKOSERVER_STRIPE_MODE"
     | "TAKOSERVER_STRIPE_CHECKOUT_ENABLED"
     | "STRIPE_WEBHOOK_SECRET"
     | "TAKOSERVER_STRIPE_WEBHOOK_ENABLED"
@@ -194,6 +216,7 @@ export function workerCredentials(
     | "TAKOSERVER_STRIPE_RECONCILE_LOOKBACK_SECONDS"
     | "TAKOSERVER_CONSOLE_ORIGIN"
     | "TAKOSERVER_HOSTED_PRICING"
+    | "TAKOSERVER_HOSTED_BILLING"
     | "TAKOSERVER_BILLING_CONFIG"
   >,
   operatorAudience: string,
@@ -212,22 +235,27 @@ export function workerCredentials(
     operatorPublicKeyJwk: operatorKeys.identity,
     operatorAudience,
   });
-  const payment = resolvePayment({
-    hostedPricing: parseHostedPricing(env.TAKOSERVER_HOSTED_PRICING),
-    stripeSecretKey:
-      env.TAKOSERVER_STRIPE_CHECKOUT_ENABLED === "1" ? env.STRIPE_SECRET_KEY : undefined,
-    // Like Checkout, a lingering secret alone never exposes the webhook.
-    stripeWebhookSecret:
-      env.TAKOSERVER_STRIPE_WEBHOOK_ENABLED === "1" ? env.STRIPE_WEBHOOK_SECRET : undefined,
-    consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN,
-    settings: paymentSettingsFromEnvironment({
-      TAKOSERVER_STRIPE_CHECKOUT_MINIMUM_MINOR: env.TAKOSERVER_STRIPE_CHECKOUT_MINIMUM_MINOR,
-      TAKOSERVER_STRIPE_CHECKOUT_MAXIMUM_MINOR: env.TAKOSERVER_STRIPE_CHECKOUT_MAXIMUM_MINOR,
-      TAKOSERVER_STRIPE_WEBHOOK_TOLERANCE_SECONDS: env.TAKOSERVER_STRIPE_WEBHOOK_TOLERANCE_SECONDS,
-      TAKOSERVER_STRIPE_RECONCILE_LOOKBACK_SECONDS:
-        env.TAKOSERVER_STRIPE_RECONCILE_LOOKBACK_SECONDS,
-    }),
-  });
+  const canonicalHostedBilling = canonicalHostedBillingSelected(env.TAKOSERVER_HOSTED_BILLING);
+  const payment: ReturnType<typeof resolvePayment> = canonicalHostedBilling
+    ? {}
+    : resolvePayment({
+        hostedPricing: parseHostedPricing(env.TAKOSERVER_HOSTED_PRICING),
+        stripeMode: parseStripeMode(env.TAKOSERVER_STRIPE_MODE),
+        stripeSecretKey:
+          env.TAKOSERVER_STRIPE_CHECKOUT_ENABLED === "1" ? env.STRIPE_SECRET_KEY : undefined,
+        // Like Checkout, a lingering secret alone never exposes the webhook.
+        stripeWebhookSecret:
+          env.TAKOSERVER_STRIPE_WEBHOOK_ENABLED === "1" ? env.STRIPE_WEBHOOK_SECRET : undefined,
+        consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN,
+        settings: paymentSettingsFromEnvironment({
+          TAKOSERVER_STRIPE_CHECKOUT_MINIMUM_MINOR: env.TAKOSERVER_STRIPE_CHECKOUT_MINIMUM_MINOR,
+          TAKOSERVER_STRIPE_CHECKOUT_MAXIMUM_MINOR: env.TAKOSERVER_STRIPE_CHECKOUT_MAXIMUM_MINOR,
+          TAKOSERVER_STRIPE_WEBHOOK_TOLERANCE_SECONDS:
+            env.TAKOSERVER_STRIPE_WEBHOOK_TOLERANCE_SECONDS,
+          TAKOSERVER_STRIPE_RECONCILE_LOOKBACK_SECONDS:
+            env.TAKOSERVER_STRIPE_RECONCILE_LOOKBACK_SECONDS,
+        }),
+      });
 
   return {
     identity: identity.verifier,
@@ -236,7 +264,7 @@ export function workerCredentials(
     ...(payment.events ? { paymentEvents: payment.events } : {}),
     // The operator identity key, never a session or API key, may run the
     // reconcile pass on demand; the route exists only beside the pass.
-    ...(payment.events && operatorKeys.identity
+    ...((canonicalHostedBilling || payment.events) && operatorKeys.identity
       ? {
           operatorPaymentsReconcile: createOperatorPaymentsReconcileVerifier({
             publicKeyJwk: operatorKeys.identity,
@@ -890,6 +918,59 @@ async function composeApp(
     if (pricing) assertHostedPricingMatchesBilling(pricing, billingConfig);
     return pricing;
   });
+  const canonicalHostedInputs = startupStage("runtime-configuration", () => {
+    if (!canonicalHostedBillingSelected(env.TAKOSERVER_HOSTED_BILLING)) return undefined;
+    if (
+      env.TAKOSERVER_STRIPE_MODE !== "test" ||
+      !billingConfig ||
+      !hostedPricing ||
+      !env.STRIPE_SECRET_KEY ||
+      !env.STRIPE_WEBHOOK_SECRET ||
+      !env.TAKOSERVER_CONSOLE_ORIGIN ||
+      !env.TAKOSERVER_HOSTED_BILLING_ACCOUNT_ID ||
+      !env.TAKOSERVER_HOSTED_BILLING_AUTHORITY
+    ) {
+      throw new TypeError(
+        "Canonical Hosted billing requires explicit TEST intent, selected realm and complete pricing/credential capabilities",
+      );
+    }
+    const consoleOrigin = env.TAKOSERVER_CONSOLE_ORIGIN;
+    const origin = new URL(consoleOrigin);
+    const webhookSecret = env.STRIPE_WEBHOOK_SECRET.trim();
+    const settings = paymentSettingsFromEnvironment({
+      TAKOSERVER_STRIPE_CHECKOUT_MINIMUM_MINOR: env.TAKOSERVER_STRIPE_CHECKOUT_MINIMUM_MINOR,
+      TAKOSERVER_STRIPE_CHECKOUT_MAXIMUM_MINOR: env.TAKOSERVER_STRIPE_CHECKOUT_MAXIMUM_MINOR,
+      TAKOSERVER_STRIPE_WEBHOOK_TOLERANCE_SECONDS: env.TAKOSERVER_STRIPE_WEBHOOK_TOLERANCE_SECONDS,
+      TAKOSERVER_STRIPE_RECONCILE_LOOKBACK_SECONDS:
+        env.TAKOSERVER_STRIPE_RECONCILE_LOOKBACK_SECONDS,
+    });
+    const publishedSettings = paymentSettingsFromEnvironment(hostedPricing.environment);
+    if (
+      origin.origin !== consoleOrigin ||
+      origin.username ||
+      origin.password ||
+      !["https:", "http:"].includes(origin.protocol) ||
+      !webhookSecret.startsWith("whsec_") ||
+      (settings.checkoutMinimumMinor !== undefined &&
+        settings.checkoutMinimumMinor !== publishedSettings.checkoutMinimumMinor) ||
+      (settings.checkoutMaximumMinor !== undefined &&
+        settings.checkoutMaximumMinor !== publishedSettings.checkoutMaximumMinor)
+    ) {
+      throw new TypeError(
+        "Canonical Hosted billing requires a canonical origin, webhook and published Checkout bounds",
+      );
+    }
+    return {
+      billingConfig,
+      pricing: hostedPricing,
+      client: createStripeBillingClient({ secretKey: env.STRIPE_SECRET_KEY, mode: "test" }),
+      accountId: env.TAKOSERVER_HOSTED_BILLING_ACCOUNT_ID,
+      billingAuthority: env.TAKOSERVER_HOSTED_BILLING_AUTHORITY,
+      consoleOrigin,
+      webhookSecret,
+      settings: Object.freeze(settings),
+    };
+  });
   // File-backed tariff loading can be designed separately; this release accepts inline JSON only.
   const integrationE2eCredentialAuthority = workerIntegrationE2eCredentialAuthority(env);
   const integrationOrganizationBootstrap = workerIntegrationOrganizationBootstrap(
@@ -903,11 +984,21 @@ async function composeApp(
   try {
     // The wallet and ledger use USD micros even when tariff billing is disabled.
     // This read-only proof precedes every normal serving composition and tariff write.
-    await assertOrgBillingSchema(sql, billingConfig);
+    await assertOrgBillingSchema(sql, canonicalHostedInputs ? undefined : billingConfig);
   } catch {
     throw new WorkerStartupError(
       "runtime-configuration",
       new TypeError("Worker requires the complete 0094 USD-micros D1 schema and money-unit policy"),
+    );
+  }
+  try {
+    // D1 activation is an operator-qualified transition. Serving code only
+    // reads its immutable pin; it never claims a realm on behalf of D1.
+    await assertStripeModeRealm(sql, parseStripeMode(env.TAKOSERVER_STRIPE_MODE));
+  } catch {
+    throw new WorkerStartupError(
+      "runtime-configuration",
+      new TypeError("Worker requires the qualified 0098 Stripe realm pin"),
     );
   }
   const signingKey = await loadSigningKey(
@@ -962,6 +1053,46 @@ async function composeApp(
   }
   const objects = createR2ObjectStore(env.OBJECTS);
   const clock = () => new Date();
+  let hostedBilling: HostedBillingComposition | undefined;
+  if (canonicalHostedInputs) {
+    try {
+      const realm = await verifyHostedBillingFinancialRealm({
+        sql,
+        reader: { client: canonicalHostedInputs.client },
+        expected: {
+          accountId: canonicalHostedInputs.accountId,
+          billingAuthority: canonicalHostedInputs.billingAuthority,
+          mode: "test",
+        },
+        prices: canonicalHostedInputs.pricing.hostedPlanTable.plans
+          .filter((plan) => plan.tier === "subscription")
+          .map((plan) => ({
+            priceId: plan.stripePriceId,
+            monthlyAmountMinor: plan.monthlyAmountMinor,
+          })),
+      });
+      hostedBilling = await createCanonicalHostedBillingComposition({
+        sql,
+        clock,
+        billingConfig: canonicalHostedInputs.billingConfig,
+        pricing: canonicalHostedInputs.pricing,
+        client: canonicalHostedInputs.client,
+        realm,
+        consoleOrigin: canonicalHostedInputs.consoleOrigin,
+        webhookSecret: canonicalHostedInputs.webhookSecret,
+        settings: canonicalHostedInputs.settings,
+        warnings: { state: "unavailable", reason: "transport-not-composed" },
+      });
+    } catch (error) {
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError(
+          "Canonical Hosted billing requires the qualified TEST realm, prices and complete financial schema",
+          { cause: error },
+        ),
+      );
+    }
+  }
   let selectedV2Forms: WorkerEntryV2FormSelection | undefined;
   let selectedV2PrivateInputHooks = false;
   if (composeV2Forms !== undefined) {
@@ -1042,8 +1173,10 @@ async function composeApp(
       settlement,
       ...(billingConfig ? { billingConfig } : {}),
       hostedPaidFreeExclusion: Boolean(hostedPricing),
-      ...(checkout ? { checkout } : {}),
-      ...(paymentEvents ? { paymentEvents } : {}),
+      // The financial brand and buildApp's one PaymentEventContext share this exact clock.
+      ...(hostedBilling ? { hostedBilling, clock } : {}),
+      ...(!hostedBilling && checkout ? { checkout } : {}),
+      ...(!hostedBilling && paymentEvents ? { paymentEvents } : {}),
       ...(operatorPaymentsReconcile ? { operatorPaymentsReconcile } : {}),
       ...dataServices,
       publicOrigin: origin,

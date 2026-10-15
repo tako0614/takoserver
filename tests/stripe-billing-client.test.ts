@@ -11,6 +11,41 @@ function object(id: string, extra: Record<string, unknown> = {}) {
 }
 
 describe("Stripe billing HTTP client", () => {
+  test("reads the complete dedicated Checkout line-item page without widening generic expansions", async () => {
+    const seen: Request[] = [];
+    const client = createStripeBillingClient({
+      secretKey: KEY,
+      fetch: async (request) => {
+        seen.push(request.clone());
+        return Response.json({
+          object: "list",
+          data: [{ id: "li_one", price: { id: "price_one" }, quantity: 1 }],
+          has_more: false,
+        });
+      },
+    });
+    expect(await client.sessionLineItems("cs_one")).toMatchObject({
+      hasMore: false,
+      data: [{ id: "li_one" }],
+    });
+    expect(seen[0]?.url).toBe(
+      "https://api.stripe.com/v1/checkout/sessions/cs_one/line_items?limit=2",
+    );
+    expect(seen[0]?.headers.get("stripe-version")).toBe("2024-06-20");
+    await expect(client.sessionLineItems("bad")).rejects.toMatchObject({ code: "invalid_object" });
+    await expect(
+      client.get("checkout/sessions", "cs_one", {
+        expand: ["line_items" as "payment_intent.latest_charge"],
+      }),
+    ).rejects.toMatchObject({ code: "invalid_object" });
+    const truncated = createStripeBillingClient({
+      secretKey: KEY,
+      fetch: async () => Response.json({ object: "list", data: [], has_more: true }),
+    });
+    await expect(truncated.sessionLineItems("cs_one")).rejects.toMatchObject({
+      code: "invalid_object",
+    });
+  });
   test("requires a test-mode key and pins the API version on every request", async () => {
     for (const secretKey of ["sk_live_secret", "rk_live_secret", "", "sk_test_"]) {
       expect(() =>

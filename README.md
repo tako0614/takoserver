@@ -573,11 +573,13 @@ curl -sS -X POST https://api.example.com/v1/operator/payments/reconcile \
 
 The webhook records every delivery in `stripe_events`, so it needs migration
 `0091_stripe_events.sql` applied first. A Bun Host migrates its own SQLite. On
-Cloudflare, the current USD-micros Worker requires the complete 0094 schema and
-money-unit policy even when the webhook and billing options are disabled. The
+Cloudflare, the current USD-micros Worker requires the complete audited 0098
+schema, 0094 money-unit policy, and selected-mode immutable Stripe realm pin
+even when the webhook and billing options are disabled. The
 staging-only `--fresh-lineage=v2-0091` and `v2-0092` profiles prepare fixed
 historical D1 payloads; neither can serve this Worker ([deploy guide](docs/deploy.md)).
-No qualified staging 0094 generation or existing-D1 cutover exists yet.
+Source audit does not authorize applying 0098 to a protected D1; existing-data
+cutover and old-writer quiescence require separate qualification.
 
 ### Data root and backups
 

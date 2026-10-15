@@ -45,22 +45,28 @@ billing GA.
 ## One wallet authority, separate product identities
 
 Takoserver owns the Organization wallet, credit lots, holds, usage settlement,
-subscription credit, Stripe receipts, and refund accounting. Hosted owns its
-customer experience, Workspace membership, the local Workspace-to-Organization
-map, measurement of its own services, and the server-side wallet client. Many
-Workspaces may bill one Organization; each Workspace has one immutable billing
-Organization while holds or unpaid usage remain. Changing that binding requires
-an explicit, drained migration, not editing a live map entry.
+subscription credit, Stripe receipts, and refund accounting. Accounts owns the
+common account and OIDC identity. Control owns canonical Workspaces, membership,
+and the set-once Workspace-to-Organization binding. Hosted owns its customer
+experience, a projection of that verified binding, measurement of its own
+services, and the server-side wallet client. Many Workspaces may bill one
+Organization. The launch path does not relink an existing binding; conflicting
+first bindings fail closed. Any later transition needs an explicit, drained
+migration owned by Control.
 
 The Organization is a Takoserver-issued billing subject, not a shared user
 record. Hosted obtains an Organization owner's explicit delegation and stores
-the Organization id with a random opaque `workspaceRef`. It sends only that
+the verified Organization id with a random opaque `workspaceRef`. That reference
+is a financial attribution alias; its Server-side Organization pin does not
+create a Workspace or membership directory. Billing requests send only the
 Organization id, opaque billing references, quantities, and settlement facts.
-Takosumi user/account/session ids and literal Workspace ids stay in Hosted;
-provider requests continue to use only their existing opaque tenant references
-and provision tokens. There are no source imports or shared databases between
-the products. Takosumi OSS continues to own Run/state/output/audit authority;
-its default billing extension remains disabled.
+Literal Workspace ids and account/session identity do not enter billing DTOs.
+Shared login uses its separate authenticated Accounts contract, and membership
+alone does not authorize subscription or top-up payments. Provider requests
+continue to use only their existing opaque tenant references and provision
+tokens. There are no source imports or shared databases between the products.
+Takosumi OSS continues to own Run/state/output/audit authority; its default
+billing extension remains disabled.
 
 The three commercial tiers are shared by Takoserver and Takosumi Hosted,
 rather than one subscription per product. The labels below are roles, not new

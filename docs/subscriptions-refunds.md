@@ -1,8 +1,9 @@
-# Hosted subscriptions and refunds in Stripe test mode
+# Hosted subscriptions and refunds
 
 This is the implementation guide for the monthly invoice and refund handlers
 specified in [unified-billing.md](unified-billing.md). It builds on #330's Organization wallet with integer USD micros and free →
-subscription → purchased class priority. Stripe cash and the authored price
+subscription → purchased priority among eligible credit classes. The canonical
+Hosted lane admits purchased credit only with explicit prepaid consent. Stripe cash and the authored price
 configuration stay in cents; verified cash and configured grant amounts convert
 exactly once by multiplying by 10,000 before entering wallet accounting. Public
 wallet money is expressed as canonical decimal strings in `*Micros` fields.
@@ -28,13 +29,31 @@ and usage tariffs are required in activated configuration. Both products receive
 from `GET /v1/organizations/{organizationId}/payments/subscription`.
 
 Hosted pricing is optional. Its presence requires a matching billing config,
-a Stripe **test** key, and the complete additive **0095** schema after #330's
-0093 classification proofs and 0094 micros cutover. Staging schema qualification and
-application are owned by operator session `04360c33`.
-Live keys, live objects and connected-account events are refused. No default
-commercial price is selected. Source migrations and generated SQLite schema
-ship here; D1 qualification/application and deployment remain separate work.
+a Stripe key matching the explicit deployment-wide `test` or `live` mode,
+and the complete additive **0095–0098** source schema after the separately
+qualified 0093 classification proofs and 0094 micros cutover. The immutable
+[Stripe realm pin](stripe-mode-realm.md) must agree with the key and native
+objects; connected-account events are refused. No default commercial price
+is selected. D1 qualification/application and deployment remain separate work.
 The feature does not activate on a self-host instance without hosted config.
+
+Select the canonical TEST lane on either entry with
+`TAKOSERVER_HOSTED_BILLING=canonical-test`; see the exact
+[entry requirements](hosted-billing-api-spec.md#canonical-entry-selection).
+This explicit selection does not additionally require the Worker's legacy
+Checkout/webhook flags. Unselected entries retain their existing flag behavior.
+
+The canonical Hosted extension additionally requires the additive **0099**
+schema and an immutable database binding to the selected Stripe account, TEST
+mode and billing authority. Its startup checks are read-only. An existing
+database with financial history cannot be treated as a fresh database or
+automatically rebound to the current key. The qualified composition uses one
+authenticated Stripe client for account and configured Price verification,
+customer custody, Checkout, subscriptions and settlement. Configured Prices
+must be active, TEST-mode, USD and monthly, with the exact configured cash
+amounts. Permission to read the global Stripe balance is not required.
+This extension currently supports TEST payments; source configuration and
+local fixtures do not establish staging activation or launch readiness.
 
 `POST /payments/subscription` requires `payments:write` or an owner session and
 accepts `{reference, planKey}`. It starts Checkout with a Host-bound customer
@@ -44,16 +63,93 @@ allowed per Organization. Reuse the reference after a lost response. After
 because Stripe may expire its idempotency key after 24 hours. An authoritative
 expired Checkout or a completed, canceled subscription permits a new reference.
 
-`PATCH /payments/subscription` accepts `{reference, cancelAtPeriodEnd}` with the
-same write authority. It schedules/withdraws end-of-period cancellation without
-proration. The version 2 table has USD 10 and USD 50 subscription tiers. A plan/price
+`PATCH /payments/subscription` accepts
+`{reference, cancelAtPeriodEnd: true, expectedSubscriptionRef}` with the same
+write authority. The opaque expected target comes from `GET`; a changed target
+is refused before any processor effect. Cancellation is scheduled for Stripe's
+verified period end without proration. The version 2 table has USD 10 and USD 50 subscription tiers. A plan/price
 rollout is explicit configuration and processor work, never a caller-supplied
 amount. Checkout selects the requested plan ID; invoices select their pinned
-plan ID and grant only its immutable allowance. `GET` requires `wallet:read` and reports status and verified paid-through
+plan ID and grant only its immutable allowance. The $10 and $50 prices carry
+$20 and $100 monthly included credit respectively; Free credit does not stack
+during paid coverage. `GET` requires `wallet:read` and reports status and verified paid-through
 coverage; an `active` status alone does not enable paid features.
 Coverage is derived from committed grants and refunds on every read; a delayed
 subscription projection cannot restore a fully refunded period. Refund debt
 also disables paid features until an explicit operator resolution.
+
+In the canonical extension, `PATCH /payments/subscription` also accepts
+`{reference, planKey, expectedSubscriptionRef}`. This is a separate alternative
+to cancellation; a request cannot contain both actions. A plan change starts
+at the verified next period boundary without proration. A `202` response
+contains a pending `planChange` receipt; a `200` response contains a verified
+receipt and its `pendingChange`. Reuse the same reference and expected target
+while the outcome is unknown. A verified schedule is not paid coverage and
+does not grant credit. Before cancellation of a scheduled change, the adapter
+verifies release of that schedule and then uses the original subscription
+custody command. Historical invoices retain their original phase and period
+terms after a later plan change.
+
+## Canonical Hosted API extensions
+
+Paths below are under `/v1/organizations/{organizationId}` except personal
+Organization creation. The [OpenAPI artifact](../openapi/takoserver.openapi.json)
+owns the exact request and response schemas.
+
+| Operation | Request and result | Authority |
+| --- | --- | --- |
+| `POST /v1/organizations/personal` | Empty JSON object; `201` for the first atomic Organization/member/mapping, `200` for its replay | Local human session |
+| `GET /wallet/usage-summary` | Organization-wide current usage and 80%/95% warning flags | `wallet:read` or owner session |
+| `GET /wallet/usage-summary/workspaces` | Frozen paginated breakdown, Organization totals and an unattributed bucket | `wallet:read` or owner session |
+| `GET /wallet/limit-policy` | Current policy and available modes | `wallet:read` or owner session |
+| `PATCH /wallet/limit-policy` | `{reference,onLimit}` for stop/prepaid; idempotent consent change | `payments:write` or owner session |
+| `POST /wallet/checkout` | `{reference,amountMinor}`; `201` with `{checkout:{url}}` | `payments:write` or owner session |
+| `GET /wallet/checkout/{reference}` | `{reference,state,checkout}`; state is pending/ready/paid/expired and Checkout may be null | `wallet:read` or owner session |
+
+In the qualified composition, `GET /payments/subscription` includes
+`billingCapabilities` with `contractVersion: "hosted-billing-v1"` and booleans
+for `topUps`, `subscriptionStart`, `subscriptionCancellation` and
+`subscriptionPlanChange`. Consumers enable a command only when the matching
+version and capability are present. Legacy responses omit this marker; a
+missing marker, unavailable response or false capability cannot enable a
+payment. This projection describes configured financial ports, without
+claiming launch or staging acceptance.
+
+New top-up amounts are USD cents, checked against the minimum and maximum in the
+usage row of the existing subscription plan table. Exact replays keep the
+accepted command amount even after those bounds change. They grant face value only
+after verified payment. The durable command freezes Organization, reference,
+amount, customer, financial realm, tariff, expiry policy and return URLs before
+dispatch. Reusing a reference with different terms is a conflict. A lost
+acknowledgement remains pending while authoritative readback is unavailable;
+neither a missing HTTP response nor a `404` authorizes another reference.
+An unknown command older than 23 hours requires reconciliation without another
+Checkout POST. A known ready Checkout does not prevent a separate purchase.
+
+Default `onLimit: stop` admits only eligible included credit. Explicit `prepaid`
+consent allows purchased credit after included credit. The contract retains
+`postpaid` and `on-demand`, but their capabilities are false and changes to
+those modes fail as unavailable. There is no automatic card charge or implicit
+credit line. New holds and pending usage retain their original admission
+policy; changing consent does not reinterpret earlier usage. Existing funded
+holds and completed receipts retain their original allocations.
+
+Workspace references are opaque financial attribution aliases bound to one
+Organization. They do not establish Control membership or payment authority.
+New Hosted hold/usage commands require an alias; completed replays preserve
+their original witness. Holds retain their original billing period and usage
+capture inherits that attribution. Pagination reads one frozen snapshot,
+expires after ten minutes and returns at most 100 Workspace rows per page.
+Organization totals include unattributed historical usage and remain identical
+across every page of that snapshot.
+
+Personal Organization creation neither creates a card/customer nor grants a
+paid allowance. Ambiguous historical ownership fails as unavailable rather
+than adopting an arbitrary existing Organization. The local provider session
+path is separate from the shared Accounts/Control enrollment integration;
+common directory membership alone does not authorize financial commands.
+Warning flags and durable threshold receipts are implemented. Actual warning
+delivery requires a separately composed transport.
 
 ## Processor settlement
 
@@ -69,10 +165,13 @@ coverage. No public key scope authorizes refunding or directly granting money.
 
 Grant proofs, lots and funding entries commit atomically. Purchased top-ups
 record exact Checkout/Charge provenance.
-New top-ups resolve the historical billing revision at Checkout creation, so
-delayed settlement cannot replace their original expiry with today's tariff.
-Its duration begins at first verified settlement, and the grant proof freezes
+Canonical top-ups resolve the immutable command frozen before Checkout
+dispatch, so a later tariff or customer change cannot replace the original
+purchase terms. Legacy settlements require their original verified provenance.
+The frozen purchase duration begins at first verified settlement, and the grant proof freezes
 that expiry for retries; asynchronous payment cannot expire before funding.
+Checkout return, webhook delivery and reconciliation all use the same grant
+writer, so their races cannot credit the same purchase more than once.
 An old `direct` lot can acquire a verified source proof only when its Stripe
 reference, amount, ledger funding and
 unlimited expiry match exactly; original entries and lot fields remain intact.
@@ -116,7 +215,7 @@ rotation. Safe object IDs and machine reasons identify operator repair, while
 one failed object does not hold later pages behind it. A
 handler-version receipt marks historical events only after settlement. Past
 Stripe's event retention window, the stored authenticated object identity is
-re-fetched with the deployment's test key and revalidated against account/mode,
+re-fetched with the deployment's mode-matched key and revalidated against account/mode,
 customer binding, purpose and pinned tariff. Unavailable or ambiguous original
 objects remain unresolved. Logs/report expose
 unresolved/truncated counts, which prevent declaring reconciliation complete.
@@ -126,12 +225,16 @@ streams. Deterministic source conflicts remain deferred for operator repair.
 Object-level receipts survive event-row loss and repeated scans. Transient
 processor failures retain retryable delivery state and lot fences.
 
-**STAGING PENDING (0092 → #330 0093/0094 → 0095, schema owner 04360c33).** This change has no
+**STAGING PENDING (0092 → qualified 0093/0094 → qualified 0095–0099 and financial realm).** This change has no
 production/staging deployment, D1 application, configuration or credential
 mutation. Local fixtures and the local D1 migration gate verify source only.
-After merged #330 and infra qualifies/applies the schema, a staging run must exercise recurring paid
-periods, failed renewal, cancellation, duplicate/refund ordering and used/held
-credit revocation with real Stripe test objects before launch validation is done.
+After the reviewed source is merged and the schema owner qualifies/applies the
+preserving suffix, a staging run must exercise recurring paid periods, failed
+renewal, plan change/cancellation, customer creation, top-up recovery,
+duplicate/refund ordering, shared-Organization usage and used/held credit
+revocation with real Stripe TEST objects before launch validation is done.
+Stripe Test Clock advancement does not advance the application's wall clock;
+future processor invoices alone do not prove an application monthly reset.
 
 Rollback before money writes is a source revert with hosted pricing disabled.
 After money writes, retain all additive receipts and projections and use forward
