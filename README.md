@@ -46,14 +46,12 @@ use. Do not expose that backend listener directly.
 
 | To | Read |
 | --- | --- |
-| Run the v2 Host API, sign-in, organizations and API keys in Docker, on a loopback port | [Docker and Compose self-host](docs/self-host-docker.md) (no Worker execution) |
-| Install a self-host step by step, from an empty data root to a Worker served over HTTPS | [First install and first use](docs/self-host-operations.md#first-install-and-first-use) |
+| Run the v2 Host API, operator sign-in, organizations and API keys in Docker, on a loopback port | [Docker and Compose self-host](docs/self-host-docker.md) (no Worker execution) |
+| Install a self-host step by step on Linux x86-64, from a reviewed checkout to a Worker served over HTTPS | [First install and first use](docs/self-host-operations.md#first-install-and-first-use) |
 | Look up a v2 setting, the Forms a Bun Host supports, or how organizations own Resources | [Takoform v2 architecture and operator setup](docs/takoform-v2.md) |
 | Decide what to expose and how to harden the machine | [Self-host security](docs/self-host-security.md) |
 | Update, monitor, back up or restore an installation | [Self-host operations](docs/self-host-operations.md#update-and-code-rollback) |
 | Change the code | [Working on it](#working-on-it): `bun run check` is the gate |
-
-The next section is a reference for retained pre-v2 code, not v2 setup.
 
 ## Legacy runtime and provider reference
 
