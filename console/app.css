@@ -279,8 +279,9 @@ textarea {
 
 @media (width < 900px) {
   /* Narrow screens keep every section one tap away: the rail becomes a
-     scrolling strip under the top bar instead of disappearing, and only the
-     page itself takes the remaining height. */
+     wrapping strip under the top bar instead of disappearing, so the current
+     section stays visible after a route change, and only the page itself
+     takes the remaining height. */
   .shell {
     grid-template-columns: 1fr;
     grid-template-rows: var(--header) auto auto 1fr;
@@ -289,13 +290,12 @@ textarea {
 
   .rail {
     flex-direction: row;
+    flex-wrap: wrap;
     gap: 2px;
     padding: 6px 12px;
     border-right: 0;
     border-bottom: 1px solid var(--line-1);
-    overflow-x: auto;
-    overflow-y: hidden;
-    scrollbar-width: none;
+    overflow: visible;
   }
 
   .rail__group {
@@ -310,15 +310,6 @@ textarea {
   .topbar {
     min-height: 48px;
     overflow-x: auto;
-  }
-
-  .rail--open {
-    display: flex;
-    position: fixed;
-    inset: var(--header) auto 0 0;
-    width: var(--rail);
-    z-index: 30;
-    background: var(--surface-1);
   }
 
   .main {
