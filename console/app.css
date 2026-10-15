@@ -184,9 +184,11 @@ textarea {
 
 /* ---------------------------------------------------------------- shell -- */
 
+/* minmax(0, 1fr): the page column never grows past the window to fit the
+   top bar; the bar's own controls give way instead. */
 .shell {
   display: grid;
-  grid-template-columns: var(--rail) 1fr;
+  grid-template-columns: var(--rail) minmax(0, 1fr);
   grid-template-rows: var(--header) 1fr;
   grid-template-areas: "brand top" "rail main";
   min-height: 100vh;
@@ -295,7 +297,7 @@ textarea {
      section stays visible after a route change, and only the page itself
      takes the remaining height. */
   .shell {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
     grid-template-rows: var(--header) auto auto 1fr;
     grid-template-areas: "brand" "top" "rail" "main";
   }
