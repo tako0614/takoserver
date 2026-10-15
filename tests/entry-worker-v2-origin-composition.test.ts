@@ -11,12 +11,15 @@ import {
 } from "@takoserver/core/worker-entry";
 import { Miniflare } from "miniflare";
 import { MIGRATIONS } from "../src/db-schema.ts";
+import { HOSTED_EDGE_SUPPLIES_KIND } from "../src/hosted-edge-supplies.ts";
 import { bytesDigest } from "../src/json.ts";
 import type { SqlParam, SqlStatement } from "../src/ports.ts";
+import type { CloudflareProviderExecutorRpc } from "../src/providers/cloudflare-provider-executor-port.ts";
 import { createSharedAppLedgerD1 } from "../src/shared-app-ledger-d1.ts";
 import { createD1Sql, type D1DatabaseLike, type D1StatementLike } from "../src/sql-d1.ts";
 import { claimFreshStripeModeRealm } from "../src/stripe-mode-realm.ts";
 import type { V2Form } from "../src/takoform-v2/types.ts";
+import { WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT } from "../src/worker-endpoint-origin-reservations.ts";
 
 const ORIGIN = "https://api.worker-origin-composition.test";
 const BASE = `${ORIGIN}/apis/forms.takoform.com/v2`;
@@ -69,6 +72,9 @@ function sharedSchema(
       state TEXT NOT NULL CHECK(state IN ('reserved','active','released')),
       released_at INTEGER, updated_at INTEGER NOT NULL,
       CHECK((state='released')=(released_at IS NOT NULL)))`);
+    db.exec(`CREATE TABLE ${prefix}_batch_assertions (
+      witness TEXT PRIMARY KEY,ok INTEGER NOT NULL CHECK(ok=1),
+      apply_effects INTEGER NOT NULL CHECK(apply_effects IN (0,1)))`);
   }
   if (!includeBindings) return;
   // Fixture-only operation FKs: current Core retains operation rows; it has no GC DELETE.
@@ -110,7 +116,7 @@ function splitMigration(source: string): readonly string[] {
   return statements;
 }
 
-async function fixture(name: string, shared = true, typed = false) {
+async function fixture(name: string, shared = true, typed = false, carrier = false) {
   const runtime = new Miniflare({
     workers: [
       {
@@ -221,6 +227,79 @@ async function fixture(name: string, shared = true, typed = false) {
         new Date(Date.now() + 3_600_000).toISOString(),
       ],
     );
+    let providerCalls = 0;
+    const unexpectedProvider = async (): Promise<never> => {
+      providerCalls++;
+      throw new Error("reservation must not invoke native provider mutation or readback");
+    };
+    const executor: CloudflareProviderExecutorRpc = {
+      apply: unexpectedProvider,
+      recoverApply: unexpectedProvider,
+      convergeApply: unexpectedProvider,
+      concludeApplyNoEffect: unexpectedProvider,
+      compensateApply: unexpectedProvider,
+      poll: unexpectedProvider,
+      observe: unexpectedProvider,
+      delete: unexpectedProvider,
+      recoverDelete: unexpectedProvider,
+      convergeDelete: unexpectedProvider,
+      adopt: unexpectedProvider,
+      recoverAdopt: unexpectedProvider,
+      verifyNativeAbsence: unexpectedProvider,
+      verifyArtifactConsumption: unexpectedProvider,
+      readSqliteMigrationLedger: unexpectedProvider,
+      applySqliteMigrationSuffix: unexpectedProvider,
+      readMeterUsage: unexpectedProvider,
+    };
+    // Existing business supply parser and real local Cloudflare origin derivation;
+    // these controlled fixture terms do not stand in for deployed supply authority.
+    const supplies = {
+      kind: HOSTED_EDGE_SUPPLIES_KIND,
+      providerInstallation: {
+        id: "cloudflare.integration",
+        providerPackRef: "cloudflare",
+        supplyContractRef: "fixture:carrier-contract",
+        state: "active",
+        regions: [{ id: "global", capacity: "available" }],
+      },
+      supplyContract: {
+        id: "fixture:carrier-contract",
+        providerType: "cloudflare",
+        permittedResourceClasses: ["compute.edge"],
+        deliveryModes: ["embedded-binding"],
+        customerAccess: "operator-only",
+        whiteLabelAllowed: true,
+        endUserTermsRequired: true,
+        regions: ["global"],
+        validFrom: "2026-01-01T00:00:00.000Z",
+        evidenceRef: "fixture:carrier-contract",
+      },
+      offerings: [
+        {
+          formKind: "ModuleWorker",
+          offeringId: "carrier.worker.integration",
+          displayName: "Carrier Worker fixture",
+          pricePlan: {
+            id: "carrier.worker.integration.price",
+            currency: "USD",
+            provisioning: { meter: "resource.create", amountMinor: 0 },
+            meters: [{ meter: "compute.worker.requests.million", amountMinor: 30 }],
+          },
+          placement: {
+            deliveryMode: "embedded-binding",
+            supportPolicyRef: "fixture:support",
+            abusePolicyRef: "fixture:abuse",
+            portability: {
+              api: "portable",
+              exportFormats: [],
+              importFormats: [],
+              migrationModes: ["offline"],
+            },
+            isolation: "dedicated-resource",
+          },
+        },
+      ],
+    };
     const env = {
       STATE_DB: observedDatabase,
       OBJECTS: await runtime.getR2Bucket("OBJECTS"),
@@ -231,6 +310,13 @@ async function fixture(name: string, shared = true, typed = false) {
         authenticationDocumentation: "https://docs.example.test/v2/authentication",
       }),
       TAKOSERVER_TAKOFORM_V2_CURSOR_KEY: "A".repeat(43),
+      ...(carrier
+        ? {
+            TAKOSERVER_EDGE_SUPPLIES: JSON.stringify(supplies),
+            TAKOSERVER_MANAGED_BASE_DOMAIN: "app-staging.takos.jp",
+            CLOUDFLARE_PROVIDER_EXECUTOR: executor,
+          }
+        : {}),
     } as WorkerEnv;
     // Genuine existing ledger adapter opens first-primary sessions; no fallback.
     const ledger = createSharedAppLedgerD1({ database, environment: "staging" });
@@ -266,6 +352,7 @@ async function fixture(name: string, shared = true, typed = false) {
       coreBatches,
       coreBatchError: () => coreBatchError,
       effects: () => effects,
+      providerCalls: () => providerCalls,
       reserve: (name: string) =>
         ledger.forTrustedOwner(owner).reserve({ reservationId: `claim-${name}`, name }),
     };
@@ -715,6 +802,116 @@ test("Worker does not cache or retry failed startup; repaired code selection is 
     expect(await replay.json()).toMatchObject({ id: operation.id });
     expect(compositions).toBe(2);
     expect(await f.sql.query(`SELECT count(*) AS n FROM ${BINDINGS}`)).toEqual([{ n: 1 }]);
+    expect(f.effects()).toBe(0);
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 60_000);
+
+test("Worker public carrier uses existing supply derivation and feeds the same original into real Core acceptance", async () => {
+  const f = await fixture("entry-shared-carrier-original", true, true, true);
+  try {
+    const entry = createWorkerEntry({
+      composeV2Forms: () => ({ [FORM]: f.form }),
+      composeV2WorkerEndpointOrigin: () => ({ ...f.selection, kind: "form-v2@1" }),
+    });
+    const name = "integration-worker-carrier";
+    const reservationId = "worker-carrier-original";
+    const control = (method: string) =>
+      entry.fetch(
+        new Request(`${ORIGIN}/v1/worker-endpoint-origin-reservations/${reservationId}`, {
+          method,
+          headers: {
+            authorization: `Bearer ${TOKEN}`,
+            ...(method === "PUT" ? { "content-type": "application/json" } : {}),
+          },
+          ...(method === "PUT"
+            ? {
+                body: JSON.stringify({
+                  format: WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT,
+                  requestedSubdomain: name,
+                  expiresInSeconds: 60,
+                  offeringId: "carrier.worker.integration",
+                }),
+              }
+            : {}),
+        }),
+        f.env,
+      );
+    const prepared = await control("PUT");
+    expect(prepared.status).toBe(201);
+    const projection: unknown = await prepared.json();
+    if (
+      typeof projection !== "object" ||
+      projection === null ||
+      !("expiresAt" in projection) ||
+      typeof projection.expiresAt !== "string"
+    )
+      throw new Error("actual Worker carrier projection missing");
+    expect(Number.isFinite(Date.parse(projection.expiresAt))).toBe(true);
+    const expectedProjection = {
+      format: WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT,
+      reservationId,
+      requestedSubdomain: name,
+      canonicalPublicOrigin: `https://${name}.app-staging.takos.jp`,
+      revision: "1",
+      expiresAt: projection.expiresAt,
+      status: "prepared",
+    };
+    expect(projection).toEqual(expectedProjection);
+    expect(await (await control("GET")).json()).toEqual(projection);
+    const original = await f.ledger.forTrustedOwner(f.owner).readOriginalRoute(reservationId);
+    if (original?.kind !== "scalar") throw new Error("Worker carrier original absent");
+    expect(original.value.name).toBe(name);
+    expect(original.value.organizationId).toBe(ORG);
+    const allocation = f.coreBatches.find((batch) =>
+      batch.some((statement) =>
+        statement.sql.includes("INSERT INTO worker_endpoint_origin_reservations"),
+      ),
+    );
+    if (!allocation) throw new Error("actual Worker carrier batch absent");
+    expect(
+      allocation.some((statement) =>
+        statement.sql.includes("INSERT INTO shared_app_staging_assignments"),
+      ),
+    ).toBe(true);
+    const response = await create(entry, f.env, name, "worker-carrier-accepted-0001");
+    expect(response.status).toBe(202);
+    const operation: unknown = await response.json();
+    if (
+      typeof operation !== "object" ||
+      operation === null ||
+      !("id" in operation) ||
+      typeof operation.id !== "string" ||
+      !("resourceUid" in operation) ||
+      typeof operation.resourceUid !== "string"
+    )
+      throw new Error("actual Worker Operation absent");
+    expect(
+      await f.sql.query(
+        `SELECT incarnation,reservation_id,endpoint_uid,endpoint_generation,create_operation_id,current_operation_id FROM ${BINDINGS}`,
+      ),
+    ).toEqual([
+      {
+        incarnation: original.value.incarnation,
+        reservation_id: reservationId,
+        endpoint_uid: operation.resourceUid,
+        endpoint_generation: 1,
+        create_operation_id: operation.id,
+        current_operation_id: operation.id,
+      },
+    ]);
+    expect(
+      await f.sql.query("SELECT principal,space,name FROM tf_v2_resources WHERE uid=?", [
+        operation.resourceUid,
+      ]),
+    ).toEqual([{ principal: `org:${ORG}`, space: ORG, name }]);
+    expect((await control("DELETE")).status).toBe(422);
+    expect(await f.ledger.forTrustedOwner(f.owner).readOriginalRoute(reservationId)).toEqual(
+      original,
+    );
+    expect(await f.sql.query("SELECT * FROM shared_app_staging_batch_assertions")).toEqual([]);
+    expect(f.providerCalls()).toBe(0);
     expect(f.effects()).toBe(0);
   } finally {
     await f.runtime.dispose();

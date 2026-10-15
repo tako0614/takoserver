@@ -155,6 +155,14 @@ export interface SharedAppFormV2RouteEffects {
   readonly after: readonly SqlStatement[];
 }
 
+/** Pure allocation atom. expected is a planned tuple, never a committed grant. */
+export interface SharedAppReservationEffects {
+  readonly expected: SharedAppRouteAssignment;
+  readonly before: readonly SqlStatement[];
+  readonly publicationGuard: SqlStatement;
+  readonly after: readonly SqlStatement[];
+}
+
 /** Actual accepted v2 pins supplied only by the owning business/publication composition. */
 export interface TrustedSharedAppRouteInput {
   readonly commandRef: string;
@@ -313,6 +321,10 @@ export interface SharedAppLedger {
       readonly reservationId: string;
       readonly name: string;
     }): Promise<SharedAppAssignment>;
+    prepareReserve(input: {
+      readonly reservationId: string;
+      readonly name: string;
+    }): Promise<SharedAppReservationEffects>;
     /** Script pins come from authoritative accepted resource/Provider readback, never a public body. */
     activate(expected: SharedAppPin, acceptedScript: string): Promise<SharedAppAssignment>;
     /** These pure preparations NEVER commit. Compose before + actual guarded owner SQL + after in ONE batch. */
@@ -615,6 +627,99 @@ export function createSharedAppLedger(options: {
       return {
         readOriginal: read,
         readOriginalRoute: (reservationId) => originalRoute(owner, opaque(reservationId)),
+        async prepareReserve(input) {
+          const reservationId = opaque(input.reservationId);
+          const name = normalize(input.name);
+          const incarnation = crypto.randomUUID().replaceAll("-", "");
+          const existing = await originalRoute(owner, reservationId);
+          if (
+            existing &&
+            (formAssignmentPin(existing).name !== name ||
+              formAssignmentState(existing) === "released")
+          )
+            fail("conflict");
+          const expected: SharedAppRouteAssignment =
+            existing ??
+            Object.freeze({
+              kind: "scalar",
+              value: Object.freeze({
+                ...owner,
+                environment,
+                reservationId,
+                name,
+                incarnation,
+                generation: 1,
+                state: "reserved",
+                script: null,
+                releasedAt: null,
+              }),
+            });
+          const selected = formAssignmentPin(expected);
+          const state = formAssignmentState(expected);
+          const tuple = formStatement(
+            `SELECT 1 FROM ${assignments} a JOIN ${names} n
+            ON n.normalized_name=a.name AND n.incarnation=a.incarnation AND n.generation=a.generation
+              AND n.state=a.state AND n.released_at IS NULL
+            WHERE a.organization_id=? AND a.product=? AND a.reservation_id=? AND a.name=?
+              AND a.incarnation=? AND a.generation=? AND a.state=? AND a.script IS ?
+              AND a.binding_kind IS ? AND a.binding_json IS ? AND a.released_at IS NULL`,
+            [
+              owner.organizationId,
+              owner.product,
+              reservationId,
+              name,
+              selected.incarnation,
+              selected.generation,
+              state,
+              expected.kind === "scalar" ? expected.value.script : null,
+              expected.kind === "scalar" ? null : FORM_V2_ROUTE_KIND,
+              expected.kind === FORM_V2_ROUTE_KIND && expected.binding !== null
+                ? formJson(expected.binding)
+                : null,
+            ],
+          );
+          const witness = crypto.randomUUID().replaceAll("-", "");
+          const assertions = `${prefix}_batch_assertions`;
+          const before: SqlStatement[] = existing
+            ? []
+            : reservationStatements(
+                assignments,
+                names,
+                owner,
+                { reservationId, name },
+                incarnation,
+                timestamp(),
+              ).map((value) => formStatement(value.sql, value.params ?? []));
+          before.push(
+            formStatement(
+              `INSERT INTO ${assertions} (witness,ok,apply_effects)
+            SELECT ?,CASE WHEN EXISTS (${tuple.sql}) THEN 1 ELSE 0 END,1`,
+              [witness, ...(tuple.params ?? [])],
+            ),
+          );
+          const publicationGuard = formStatement(
+            `EXISTS (SELECT 1 FROM ${assertions} WHERE witness=? AND apply_effects=1)
+            AND EXISTS (${tuple.sql})`,
+            [witness, ...(tuple.params ?? [])],
+          );
+          const after = [
+            formStatement(
+              `INSERT INTO ${assertions} (witness,ok,apply_effects)
+            SELECT ?,CASE WHEN (${publicationGuard.sql}) THEN 1 ELSE 0 END,0`,
+              [`${witness}:result`, ...(publicationGuard.params ?? [])],
+            ),
+            formStatement(`DELETE FROM ${assertions} WHERE witness IN (?,?)`, [
+              witness,
+              `${witness}:result`,
+            ]),
+          ];
+          return Object.freeze({
+            expected,
+            before: Object.freeze(before),
+            publicationGuard,
+            after: Object.freeze(after),
+          });
+        },
         prepareFormV2Route: (action, input, guards) =>
           formEffects(formOriginal(action, input, owner, environment), guards, timestamp()),
         readFormV2RouteCommand,
@@ -684,37 +789,9 @@ export function createSharedAppLedger(options: {
           // A name belongs to one incarnation forever. Check retained assignment
           // history as well as the head, and never replace a released head.
           try {
-            await primary().batch([
-              {
-                sql: `INSERT INTO ${assignments}
-                    (incarnation, name, organization_id, product, reservation_id, generation,
-                     state, script, released_at, created_at, updated_at)
-                  SELECT ?, ?, ?, ?, ?, 1, 'reserved', NULL, NULL, ?, ?
-                  WHERE NOT EXISTS (SELECT 1 FROM ${assignments}
-                    WHERE organization_id = ? AND reservation_id = ?)
-                    AND NOT EXISTS (SELECT 1 FROM ${names} WHERE normalized_name = ?)
-                    AND NOT EXISTS (SELECT 1 FROM ${assignments} WHERE name = ?)`,
-                params: [
-                  incarnation,
-                  command.name,
-                  owner.organizationId,
-                  owner.product,
-                  command.reservationId,
-                  now,
-                  now,
-                  owner.organizationId,
-                  command.reservationId,
-                  command.name,
-                  command.name,
-                ],
-              },
-              {
-                sql: `INSERT INTO ${names} (normalized_name, incarnation, generation, state, released_at, updated_at)
-                  SELECT name, incarnation, generation, state, NULL, updated_at FROM ${assignments}
-                    WHERE incarnation = ?`,
-                params: [incarnation],
-              },
-            ]);
+            await primary().batch(
+              reservationStatements(assignments, names, owner, command, incarnation, now),
+            );
           } catch {
             const observed = await original(owner, command.reservationId).catch(() => null);
             if (observed) return replay(observed);
@@ -737,6 +814,47 @@ export function createSharedAppLedger(options: {
       };
     },
   };
+}
+
+function reservationStatements(
+  assignments: string,
+  names: string,
+  owner: TrustedSharedAppOwner,
+  command: { readonly reservationId: string; readonly name: string },
+  incarnation: string,
+  now: number,
+): readonly SqlStatement[] {
+  return [
+    {
+      sql: `INSERT INTO ${assignments}
+                    (incarnation, name, organization_id, product, reservation_id, generation,
+                     state, script, released_at, created_at, updated_at)
+                  SELECT ?, ?, ?, ?, ?, 1, 'reserved', NULL, NULL, ?, ?
+                  WHERE NOT EXISTS (SELECT 1 FROM ${assignments}
+                    WHERE organization_id = ? AND reservation_id = ?)
+                    AND NOT EXISTS (SELECT 1 FROM ${names} WHERE normalized_name = ?)
+                    AND NOT EXISTS (SELECT 1 FROM ${assignments} WHERE name = ?)`,
+      params: [
+        incarnation,
+        command.name,
+        owner.organizationId,
+        owner.product,
+        command.reservationId,
+        now,
+        now,
+        owner.organizationId,
+        command.reservationId,
+        command.name,
+        command.name,
+      ],
+    },
+    {
+      sql: `INSERT INTO ${names} (normalized_name, incarnation, generation, state, released_at, updated_at)
+                  SELECT name, incarnation, generation, state, NULL, updated_at FROM ${assignments}
+                    WHERE incarnation = ?`,
+      params: [incarnation],
+    },
+  ];
 }
 
 function fail(code: SharedAppLedgerError["code"]): never {

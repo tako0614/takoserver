@@ -1,15 +1,19 @@
 /**
  * Actual authenticated App -> Application -> Engine/Store -> Bun SQLite wiring.
  * The Form and UNALLOCATED shared/binding DDL are component fixtures only.
- * This does not adopt a migration, grant, carrier, gateway or native publisher.
+ * This does not adopt a durable migration or qualify a deployed carrier,
+ * gateway, grant or native publisher.
  */
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { type AppPorts, buildApp } from "../src/app.ts";
 import { createAccounts } from "../src/auth.ts";
+import type { Offering } from "../src/catalog.ts";
+import { STABLE_PRODUCTION_TAKOFORM_CATALOG } from "../src/generated/takoform-stable-v1-catalog.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { type Sql, SqlError, type SqlStatement } from "../src/ports.ts";
+import { FakeProvider } from "../src/providers/fake.ts";
 import { createSharedAppLedger } from "../src/shared-app-ledger.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
@@ -60,6 +64,8 @@ function sharedSchema(db: Database, includeBindings: boolean, typed = false): vo
       state TEXT NOT NULL CHECK(state IN ('reserved','active','released')),
       released_at INTEGER, updated_at INTEGER NOT NULL,
       CHECK((state='released')=(released_at IS NOT NULL)))`);
+    db.exec(`CREATE TABLE ${prefix}_batch_assertions (witness TEXT PRIMARY KEY,
+      ok INTEGER NOT NULL CHECK(ok=1),apply_effects INTEGER NOT NULL CHECK(apply_effects IN (0,1)))`);
   }
   if (!includeBindings) return;
   // Fixture-only operation FKs: current Core retains operation rows; it has no GC DELETE.
@@ -75,7 +81,9 @@ function sharedSchema(db: Database, includeBindings: boolean, typed = false): vo
     current_operation_id TEXT NOT NULL REFERENCES tf_v2_operations(id))`);
 }
 
-async function fixture(options: { shared?: boolean; bindings?: boolean; typed?: boolean } = {}) {
+async function fixture(
+  options: { shared?: boolean; bindings?: boolean; typed?: boolean; carrier?: boolean } = {},
+) {
   const db = new Database(":memory:");
   migrateSqlite(db);
   const raw = createSqliteSql(db);
@@ -172,6 +180,64 @@ async function fixture(options: { shared?: boolean; bindings?: boolean; typed?: 
     },
   };
   const selection: Selection = { formUrl: FORM, backendId: BACKEND, targetKey: TARGET, ledger };
+  const stableModule = STABLE_PRODUCTION_TAKOFORM_CATALOG.forms.find(
+    (item) => item.identity.formRef.kind === "ModuleWorker",
+  )?.identity.formRef;
+  if (!stableModule) throw new Error("stable ModuleWorker missing");
+  const offering: Offering = {
+    id: "carrier.app.integration",
+    providerPackRef: "carrier-app",
+    providerInstallationRef: "carrier-app.integration",
+    supplyContractRef: "fixture:contract",
+    pricePlanRef: "carrier.app.price",
+    resourceClass: "worker.module",
+    deliveryMode: "managed-endpoint",
+    supportPolicyRef: "fixture:support",
+    abusePolicyRef: "fixture:abuse",
+    kind: "ModuleWorker",
+    displayName: "Carrier app",
+    form: stableModule,
+    pricePlan: {
+      id: "carrier.app.price",
+      currency: "USD",
+      provisioning: { meter: "resource.create", amountMinor: 0 },
+      meters: [],
+    },
+    providedInterfaces: [],
+    bindingRefs: [],
+    regions: [],
+    portability: {
+      api: "portable",
+      exportFormats: [],
+      importFormats: [],
+      migrationModes: ["offline"],
+    },
+    isolation: "shared-resource",
+    available: true,
+  };
+  const provider = Object.assign(
+    new FakeProvider({
+      id: "carrier-app",
+      offerings: [
+        {
+          id: offering.id,
+          kind: "ModuleWorker",
+          displayName: offering.displayName,
+          form: stableModule,
+          providedInterfaces: [],
+          bindingRefs: [],
+          capabilities: ["create", "delete", "observe"],
+        },
+      ],
+    }),
+    {
+      workerEndpointOriginReservations: {
+        async derive({ requestedSubdomain }: { tenantRef: string; requestedSubdomain: string }) {
+          return { canonicalPublicOrigin: `https://${requestedSubdomain}.app-staging.takos.jp` };
+        },
+      },
+    },
+  );
   const makeApp = (selected?: Selection, overrides: Partial<AppPorts> = {}) =>
     buildApp({
       sql,
@@ -188,6 +254,7 @@ async function fixture(options: { shared?: boolean; bindings?: boolean; typed?: 
       hostForms: [],
       driver: new InMemoryTakoformResourceDriver(),
       offerings: [],
+      ...(options.carrier ? { offerings: [offering], providers: [provider] } : {}),
       v2: {
         cursorSigningKey: new Uint8Array(32).fill(0x5a),
         documentation: "https://docs.example.test/v2",
@@ -230,6 +297,27 @@ async function fixture(options: { shared?: boolean; bindings?: boolean; typed?: 
     makeApp,
     request,
     create,
+    control: (
+      app: ReturnType<typeof buildApp>,
+      method: string,
+      reservationId: string,
+      name: string,
+    ) =>
+      app.fetch(
+        new Request(`${ORIGIN}/v1/worker-endpoint-origin-reservations/${reservationId}`, {
+          method,
+          headers: { authorization: `Bearer ${writer.secret}`, "content-type": "application/json" },
+          ...(method === "PUT"
+            ? {
+                body: JSON.stringify({
+                  format: "takoserver.worker-endpoint-origin-reservation.v2",
+                  requestedSubdomain: name,
+                  expiresInSeconds: 60,
+                }),
+              }
+            : {}),
+        }),
+      ),
     statements,
     batches,
     reserve: (name: string) =>
@@ -693,6 +781,107 @@ test("missing unallocated binding schema is not silent OFF or partial Core accep
     expect(result.status).toBe(500);
     expect(await result.json()).toMatchObject({ code: "internal_error" });
     emptyAcceptance(f, false);
+    expect(await f.ledger.forTrustedOwner(f.owner).readOriginal(claim.reservationId)).toEqual(
+      claim,
+    );
+  } finally {
+    f.close();
+  }
+});
+
+test("actual public carrier PUT creates the original consumed by real App Engine Store acceptance", async () => {
+  const f = await fixture({ typed: true, carrier: true });
+  try {
+    const app = f.makeApp({ ...f.selection, kind: "form-v2@1" });
+    const name = "integration-carrier-app";
+    const reservationId = "actual-carrier-original";
+    const prepared = await f.control(app, "PUT", reservationId, name);
+    expect(prepared.status).toBe(201);
+    const original = await f.ledger.forTrustedOwner(f.owner).readOriginalRoute(reservationId);
+    if (original?.kind !== "scalar")
+      throw new Error("actual public prepare did not allocate its original");
+    expect(original.value.incarnation).toMatch(/^[0-9a-f]{32}$/u);
+    expect(original.value).toEqual({
+      environment: "staging",
+      organizationId: f.owner.organizationId,
+      product: "takoserver",
+      reservationId,
+      name,
+      incarnation: original.value.incarnation,
+      generation: 1,
+      state: "reserved",
+      script: null,
+      releasedAt: null,
+    });
+    const allocated = f.batches.at(-1);
+    if (!allocated) throw new Error("actual allocation atom missing");
+    expect(
+      allocated.some((value) => value.sql.includes("INSERT INTO shared_app_staging_assignments")),
+    ).toBe(true);
+    expect(
+      allocated.some((value) =>
+        value.sql.includes("INSERT INTO worker_endpoint_origin_reservations"),
+      ),
+    ).toBe(true);
+    const created = await f.create(app, name, "actual-carrier-engine-0001");
+    expect(created.status).toBe(202);
+    const operation: unknown = await created.json();
+    if (
+      typeof operation !== "object" ||
+      operation === null ||
+      !("id" in operation) ||
+      typeof operation.id !== "string" ||
+      !("resourceUid" in operation) ||
+      typeof operation.resourceUid !== "string"
+    )
+      throw new Error("actual accepted Operation missing");
+    expect(
+      f.db
+        .query(
+          `SELECT incarnation,reservation_id,endpoint_uid,endpoint_generation,create_operation_id,current_operation_id FROM ${BINDINGS}`,
+        )
+        .get(),
+    ).toEqual({
+      incarnation: original.value.incarnation,
+      reservation_id: reservationId,
+      endpoint_uid: operation.resourceUid,
+      endpoint_generation: 1,
+      create_operation_id: operation.id,
+      current_operation_id: operation.id,
+    });
+    expect(
+      f.db
+        .query("SELECT principal,space,name FROM tf_v2_resources WHERE uid=?")
+        .get(operation.resourceUid),
+    ).toEqual({ principal: `org:${f.owner.organizationId}`, space: f.owner.organizationId, name });
+    const settled = await app.tickTakoformV2();
+    if (!settled) throw new Error("actual accepted Operation was not executed");
+    expect(settled.id).toBe(operation.id);
+    expect(settled.status).toBe("succeeded");
+    expect(await f.ledger.forTrustedOwner(f.owner).readOriginalRoute(reservationId)).toEqual(
+      original,
+    );
+    expect((await f.control(app, "DELETE", reservationId, name)).status).toBe(422);
+    expect(await f.ledger.forTrustedOwner(f.owner).readOriginalRoute(reservationId)).toEqual(
+      original,
+    );
+  } finally {
+    f.close();
+  }
+});
+
+test("adding a carrier leaves valid direct permanent originals independent of legacy TTL rows", async () => {
+  const f = await fixture({ typed: true, carrier: true });
+  try {
+    const claim = await f.reserve("integration-direct-hold");
+    const app = f.makeApp({ ...f.selection, kind: "form-v2@1" });
+    expect(
+      f.db.query("SELECT count(*) AS n FROM worker_endpoint_origin_reservations").get(),
+    ).toEqual({ n: 0 });
+    expect((await f.create(app, claim.name, "direct-hold-still-valid-0001")).status).toBe(202);
+    expect(
+      f.db.query("SELECT count(*) AS n FROM worker_endpoint_origin_reservations").get(),
+    ).toEqual({ n: 0 });
     expect(await f.ledger.forTrustedOwner(f.owner).readOriginal(claim.reservationId)).toEqual(
       claim,
     );

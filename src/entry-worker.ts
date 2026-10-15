@@ -1202,6 +1202,11 @@ async function composeApp(
     providers: deployment.providers,
     resources: createTakoformStore(sql, clock),
     deployments: createResourceDeploymentStore(sql, clock),
+    ...(selectedV2WorkerEndpointOrigin?.kind === "form-v2@1"
+      ? {
+          shared: { kind: "form-v2@1" as const, ledger: selectedV2WorkerEndpointOrigin.ledger },
+        }
+      : {}),
   });
   originReservationBinding.connect(originReservations);
   let app: App;

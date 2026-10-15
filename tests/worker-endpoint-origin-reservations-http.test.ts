@@ -1,7 +1,20 @@
+import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { buildApp } from "../src/app.ts";
 import type { Accounts } from "../src/auth.ts";
+import { createAccounts } from "../src/auth.ts";
+import type { Offering } from "../src/catalog.ts";
 import { createControlRoutes } from "../src/control.ts";
+import { STABLE_PRODUCTION_TAKOFORM_CATALOG } from "../src/generated/takoform-stable-v1-catalog.ts";
+import { migrateSqlite } from "../src/migrate-sqlite.ts";
+import { createMemoryObjectStore } from "../src/objects-mem.ts";
+import { type Sql, SqlError } from "../src/ports.ts";
+import type { ProviderOffering } from "../src/provider-port.ts";
+import { createFakeProviderState, FakeProvider } from "../src/providers/fake.ts";
 import { createRouter } from "../src/router.ts";
+import { createSharedAppLedger } from "../src/shared-app-ledger.ts";
+import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 import {
   WORKER_ENDPOINT_ORIGIN_RESERVATION_ACTIVATION_FORMAT,
   WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT,
@@ -122,6 +135,413 @@ function request(body: unknown, suffix = ""): Request {
     },
   );
 }
+
+async function sharedFixture(
+  options: { missingSchema?: boolean; wrongOrigin?: boolean; ambiguous?: boolean } = {},
+) {
+  const db = new Database(":memory:");
+  migrateSqlite(db);
+  const actual = createSqliteSql(db);
+  let loseAck = false;
+  let blockAfterCommit = false;
+  let blockRead = false;
+  let batches = 0;
+  const sql: Sql = {
+    ...actual,
+    async query(query, params) {
+      if (blockRead) throw new SqlError("unavailable", "fixture primary loss");
+      return actual.query(query, params);
+    },
+    async batch(statements) {
+      batches++;
+      const result = await actual.batch(statements);
+      if (loseAck) {
+        loseAck = false;
+        blockRead = blockAfterCommit;
+        throw new SqlError("unavailable", "fixture lost ACK after actual commit");
+      }
+      return result;
+    },
+  };
+  // UNALLOCATED shared fixture only. The original carrier table above is real canonical schema.
+  if (!options.missingSchema)
+    for (const realm of ["staging", "production"]) {
+      const prefix = `shared_app_${realm}`;
+      db.exec(`CREATE TABLE ${prefix}_assignments (
+      incarnation TEXT PRIMARY KEY,name TEXT NOT NULL,organization_id TEXT NOT NULL,product TEXT NOT NULL,
+      reservation_id TEXT NOT NULL,generation INTEGER NOT NULL,state TEXT NOT NULL,script TEXT,released_at INTEGER,
+      created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,binding_kind TEXT,binding_json TEXT,
+      UNIQUE(organization_id,reservation_id),CHECK(generation BETWEEN 1 AND 9007199254740990),
+      CHECK(state IN ('reserved','active','released')),CHECK((state='released')=(released_at IS NOT NULL)),
+      CHECK(updated_at>=created_at),CHECK((binding_kind IS NULL AND binding_json IS NULL
+        AND (state<>'reserved' OR script IS NULL) AND (state<>'active' OR script IS NOT NULL))
+        OR (binding_kind IS 'form-v2@1' AND script IS NULL AND ((state IN ('reserved','released') AND binding_json IS NULL)
+          OR (state='active' AND binding_json IS NOT NULL AND json_valid(binding_json)=1)))));
+      CREATE TABLE ${prefix}_names (normalized_name TEXT PRIMARY KEY,incarnation TEXT NOT NULL REFERENCES ${prefix}_assignments(incarnation),
+        generation INTEGER NOT NULL,state TEXT NOT NULL,released_at INTEGER,updated_at INTEGER NOT NULL,
+        CHECK(generation BETWEEN 1 AND 9007199254740990),CHECK((state='released')=(released_at IS NOT NULL)));
+      CREATE TABLE ${prefix}_batch_assertions (witness TEXT PRIMARY KEY,ok INTEGER NOT NULL CHECK(ok=1),
+        apply_effects INTEGER NOT NULL CHECK(apply_effects IN (0,1)))`);
+    }
+  let at = Date.parse("2026-10-15T00:00:00Z");
+  const clock = () => new Date(at);
+  const identity = {
+    async verify({ assertion }: { assertion: string }) {
+      return {
+        providerSubject: assertion,
+        email: `${assertion}@example.test`,
+        displayName: assertion,
+      };
+    },
+  };
+  const accounts = createAccounts({ sql, clock, identity });
+  const session = await accounts.signIn({ provider: "google", assertion: "shared-carrier-owner" });
+  const actor = await accounts.authenticate(`Bearer ${session.sessionToken}`);
+  if (!actor) throw new Error("missing actual account");
+  const org = await accounts.createOrganization({ actor, name: "Carrier owner" });
+  const key = await accounts.createApiKey({
+    actor,
+    organizationId: org.id,
+    name: "actual carrier writer",
+    scopes: ["resources:write"],
+    expiresInSeconds: 3600,
+  });
+  const moduleForm = STABLE_PRODUCTION_TAKOFORM_CATALOG.forms.find(
+    (form) => form.identity.formRef.kind === "ModuleWorker",
+  )?.identity.formRef;
+  if (!moduleForm) throw new Error("missing actual stable ModuleWorker Form");
+  const sold = (id: string): Offering => ({
+    id,
+    providerPackRef: "carrier-fixture",
+    providerInstallationRef: "carrier-fixture.integration",
+    supplyContractRef: "fixture:contract",
+    pricePlanRef: `${id}.price`,
+    resourceClass: "worker.module",
+    deliveryMode: "managed-endpoint",
+    supportPolicyRef: "fixture:support",
+    abusePolicyRef: "fixture:abuse",
+    kind: "ModuleWorker",
+    displayName: "Carrier fixture",
+    form: moduleForm,
+    pricePlan: {
+      id: `${id}.price`,
+      currency: "USD",
+      provisioning: { meter: "resource.create", amountMinor: 0 },
+      meters: [],
+    },
+    providedInterfaces: [],
+    bindingRefs: [],
+    regions: [],
+    portability: {
+      api: "portable",
+      exportFormats: [],
+      importFormats: [],
+      migrationModes: ["offline"],
+    },
+    isolation: "shared-resource",
+    available: true,
+  });
+  const offerings = [
+    sold("carrier.worker.integration"),
+    ...(options.ambiguous ? [sold("carrier.worker.other")] : []),
+  ];
+  const state = createFakeProviderState();
+  let derives = 0;
+  const provider = Object.assign(
+    new FakeProvider({
+      id: "carrier-fixture",
+      state,
+      offerings: offerings.map(
+        (item): ProviderOffering => ({
+          id: item.id,
+          kind: "ModuleWorker",
+          displayName: item.displayName,
+          form: moduleForm,
+          providedInterfaces: [],
+          bindingRefs: [],
+          capabilities: ["create", "delete", "observe"],
+        }),
+      ),
+    }),
+    {
+      workerEndpointOriginReservations: {
+        async derive({ requestedSubdomain }: { tenantRef: string; requestedSubdomain: string }) {
+          derives++;
+          return {
+            canonicalPublicOrigin: `https://${requestedSubdomain}.${options.wrongOrigin ? "wrong.example.test" : "app-staging.takos.jp"}`,
+          };
+        },
+      },
+    },
+  );
+  const ledger = createSharedAppLedger({ environment: "staging", primary: () => sql, clock });
+  const app = buildApp({
+    sql,
+    clock,
+    identity,
+    objects: createMemoryObjectStore(),
+    publicOrigin: "https://carrier-api.example.test",
+    settlement: {
+      async verify() {
+        throw new Error("not configured");
+      },
+    },
+    forms: [],
+    hostForms: [],
+    driver: new InMemoryTakoformResourceDriver(),
+    offerings,
+    providers: [provider],
+    v2: {
+      cursorSigningKey: new Uint8Array(32).fill(0x61),
+      documentation: "https://docs.example.test/v2",
+      authenticationDocumentation: "https://docs.example.test/v2/auth",
+    },
+    v2WorkerEndpointOrigin: {
+      kind: "form-v2@1",
+      ledger,
+      formUrl: "https://forms.example.test/fixture/Carrier/1.0.0",
+      backendId: "carrier-endpoint",
+      targetKey: "carrier-integration",
+    },
+  });
+  const call = (method: string, id = "carrier-original", body?: unknown, token = key.secret) =>
+    app.fetch(
+      new Request(`https://carrier-api.example.test/v1/worker-endpoint-origin-reservations/${id}`, {
+        method,
+        headers: {
+          authorization: `Bearer ${token}`,
+          ...(body === undefined ? {} : { "content-type": "application/json" }),
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      }),
+    );
+  const body = (name = "integration-carrier") => ({
+    format: WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT,
+    requestedSubdomain: name,
+    expiresInSeconds: 60,
+  });
+  const snapshot = async () => ({
+    metadata: await actual.query(
+      "SELECT * FROM worker_endpoint_origin_reservations ORDER BY reservation_id",
+    ),
+    names: await actual.query("SELECT * FROM shared_app_staging_names ORDER BY normalized_name"),
+    assignments: await actual.query(
+      "SELECT * FROM shared_app_staging_assignments ORDER BY incarnation",
+    ),
+    witnesses: await actual.query(
+      "SELECT * FROM shared_app_staging_batch_assertions ORDER BY witness",
+    ),
+  });
+  return {
+    db,
+    sql,
+    actual,
+    app,
+    accounts,
+    actor,
+    org,
+    key,
+    ledger,
+    call,
+    body,
+    snapshot,
+    state,
+    derives: () => derives,
+    batches: () => batches,
+    advance(ms: number) {
+      at += ms;
+    },
+    loseAck(unavailableReadback = false) {
+      loseAck = true;
+      blockAfterCommit = unavailableReadback;
+    },
+    blockReads(value: boolean) {
+      blockRead = value;
+    },
+  };
+}
+
+test("shared carrier actual authenticated PUT/GET keeps the seven-key wire and one original allocator", async () => {
+  const f = await sharedFixture();
+  try {
+    const response = await f.call("PUT", "carrier-original", f.body());
+    expect(response.status).toBe(201);
+    const projection = await response.json();
+    expect(Object.keys(projection).sort()).toEqual(
+      [
+        "format",
+        "reservationId",
+        "requestedSubdomain",
+        "canonicalPublicOrigin",
+        "revision",
+        "expiresAt",
+        "status",
+      ].sort(),
+    );
+    expect(projection).toEqual({
+      format: WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT,
+      reservationId: "carrier-original",
+      requestedSubdomain: "integration-carrier",
+      canonicalPublicOrigin: "https://integration-carrier.app-staging.takos.jp",
+      revision: "1",
+      expiresAt: "2026-10-15T00:01:00.000Z",
+      status: "prepared",
+    });
+    const original = await f.ledger
+      .forTrustedOwner({ organizationId: f.org.id, product: "takoserver" })
+      .readOriginalRoute("carrier-original");
+    expect(original?.kind).toBe("scalar");
+    expect(original?.kind === "scalar" ? original.value.name : null).toBe("integration-carrier");
+    const before = await f.snapshot();
+    expect(before.names).toHaveLength(1);
+    expect(before.metadata).toHaveLength(1);
+    expect(before.witnesses).toEqual([]);
+    expect(await (await f.call("GET")).json()).toEqual(projection);
+    expect(await (await f.call("PUT", "carrier-original", f.body())).json()).toEqual(projection);
+    expect(await f.snapshot()).toEqual(before);
+    expect(f.state.sideEffectCount).toBe(0);
+    expect(
+      (await f.call("PUT", "carrier-original", { ...f.body(), expiresInSeconds: 120 })).status,
+    ).toBe(409);
+    expect((await f.call("DELETE")).status).toBe(422);
+    expect(await f.snapshot()).toEqual(before);
+  } finally {
+    f.db.close();
+  }
+});
+
+test("shared carrier compatibility expiry retains the permanent original without reclaim or renewal", async () => {
+  const f = await sharedFixture();
+  try {
+    expect((await f.call("PUT", "carrier-original", f.body())).status).toBe(201);
+    const before = await f.snapshot();
+    f.advance(61000);
+    expect((await f.call("GET")).status).toBe(404);
+    expect((await f.call("PUT", "carrier-original", f.body())).status).toBe(409);
+    expect((await f.call("PUT", "another-reference", f.body())).status).not.toBe(201);
+    expect(await f.snapshot()).toEqual(before);
+  } finally {
+    f.db.close();
+  }
+});
+
+test("shared carrier normalizes one global name without allocating it to another authenticated Organization", async () => {
+  const f = await sharedFixture();
+  try {
+    const other = await f.accounts.createOrganization({
+      actor: f.actor,
+      name: "Other actual carrier owner",
+    });
+    const otherKey = await f.accounts.createApiKey({
+      actor: f.actor,
+      organizationId: other.id,
+      name: "other actual writer",
+      scopes: ["resources:write"],
+      expiresInSeconds: 3600,
+    });
+    const first = await f.call("PUT", "carrier-original", f.body("ｉｎｔｅｇｒａｔｉｏｎ-carrier"));
+    expect(first.status).toBe(201);
+    const projection: unknown = await first.json();
+    if (
+      typeof projection !== "object" ||
+      projection === null ||
+      !("requestedSubdomain" in projection)
+    )
+      throw new Error("missing actual projection");
+    expect(projection.requestedSubdomain).toBe("integration-carrier");
+    const before = await f.snapshot();
+    expect((await f.call("PUT", "other-original", f.body(), otherKey.secret)).status).not.toBe(201);
+    expect(await f.snapshot()).toEqual(before);
+    expect(
+      await f.ledger
+        .forTrustedOwner({ organizationId: other.id, product: "takoserver" })
+        .readOriginalRoute("other-original"),
+    ).toBeNull();
+  } finally {
+    f.db.close();
+  }
+});
+
+test("shared carrier real metadata failure rolls back name, assignment and witness in the same writer", async () => {
+  const f = await sharedFixture();
+  try {
+    await f.sql.run(`CREATE TRIGGER fixture_shared_metadata_failure BEFORE INSERT ON worker_endpoint_origin_reservations
+      WHEN NEW.requested_subdomain='integration-carrier' AND EXISTS (SELECT 1 FROM shared_app_staging_names WHERE normalized_name=NEW.requested_subdomain)
+      BEGIN SELECT RAISE(ABORT,'fixture real metadata fault after owning allocation'); END`);
+    const before = await f.snapshot();
+    expect((await f.call("PUT", "carrier-original", f.body())).status).toBe(503);
+    expect(await f.snapshot()).toEqual(before);
+    expect(f.state.sideEffectCount).toBe(0);
+  } finally {
+    f.db.close();
+  }
+});
+
+test("shared carrier lost actual commit ACK settles the same original without another write", async () => {
+  const f = await sharedFixture();
+  try {
+    const before = f.batches();
+    f.loseAck();
+    expect((await f.call("PUT", "carrier-original", f.body())).status).toBe(201);
+    expect(f.batches() - before).toBe(1);
+    const committed = await f.snapshot();
+    expect((await f.call("PUT", "carrier-original", f.body())).status).toBe(201);
+    expect(f.batches() - before).toBe(1);
+    expect(await f.snapshot()).toEqual(committed);
+  } finally {
+    f.db.close();
+  }
+});
+
+test("shared carrier unresolved commit ACK retains the actual original and never repeats its allocation", async () => {
+  const f = await sharedFixture();
+  try {
+    const before = f.batches();
+    f.loseAck(true);
+    expect((await f.call("PUT", "carrier-original", f.body())).status).toBe(503);
+    expect(f.batches() - before).toBe(1);
+    const committed = await f.snapshot();
+    expect(committed.assignments.length).toBe(1);
+    expect(committed.metadata.length).toBe(1);
+    f.blockReads(false);
+    const read = await f.call("GET");
+    expect(read.status).toBe(200);
+    const projection = await read.json();
+    expect(projection.reservationId).toBe("carrier-original");
+    expect((await f.call("PUT", "carrier-original", f.body())).status).toBe(201);
+    expect(f.batches() - before).toBe(1);
+    expect(await f.snapshot()).toEqual(committed);
+  } finally {
+    f.db.close();
+  }
+});
+
+test("shared carrier refuses absent schema, wrong derive, ambiguous Offering and insufficient real credential", async () => {
+  for (const options of [{ missingSchema: true }, { wrongOrigin: true }, { ambiguous: true }]) {
+    const f = await sharedFixture(options);
+    try {
+      expect((await f.call("PUT", "carrier-original", f.body())).status).not.toBe(201);
+      expect(await f.actual.query("SELECT * FROM worker_endpoint_origin_reservations")).toEqual([]);
+      expect(f.state.sideEffectCount).toBe(0);
+    } finally {
+      f.db.close();
+    }
+  }
+  const f = await sharedFixture();
+  try {
+    const reader = await f.accounts.createApiKey({
+      actor: f.actor,
+      organizationId: f.org.id,
+      name: "actual reader",
+      scopes: ["resources:read"],
+      expiresInSeconds: 3600,
+    });
+    expect((await f.call("PUT", "carrier-original", f.body(), reader.secret)).status).toBe(403);
+    expect((await f.snapshot()).assignments).toEqual([]);
+  } finally {
+    f.db.close();
+  }
+});
 
 test("HTTP prepare accepts only a requested subdomain and derives organization authority from auth", async () => {
   const { fetch, prepareCalls } = fixture();

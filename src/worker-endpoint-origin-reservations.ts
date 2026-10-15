@@ -2,7 +2,7 @@ import type { Catalog } from "./catalog.ts";
 import type { TakoformV1Alpha3FormRef } from "./form-ref.ts";
 import { STABLE_PRODUCTION_TAKOFORM_CATALOG } from "./generated/takoform-stable-v1-catalog.ts";
 import { canonicalDigest, canonicalJson } from "./json.ts";
-import type { Clock, JsonObject, Row, Sql, SqlWrite } from "./ports.ts";
+import type { Clock, JsonObject, Row, Sql, SqlParam, SqlStatement, SqlWrite } from "./ports.ts";
 import {
   createNoncommercialProviderPlacementSelector,
   createSoldProviderPlacementSelector,
@@ -15,6 +15,8 @@ import {
   workerEndpointPublicationRemedy,
 } from "./provider-worker-endpoint-origin.ts";
 import type { ResourceDeployment, ResourceDeploymentStore } from "./resource-deployments.ts";
+import type { SharedAppLedger, SharedAppRouteAssignment } from "./shared-app-ledger.ts";
+import { normalizeSharedAppName } from "./shared-app-name.ts";
 import { isSpaceId } from "./takoform/space-id.ts";
 import type { ResourceWithRelations, TakoformStore } from "./takoform/store.ts";
 import type { InstalledTakoformForm } from "./takoform/types.ts";
@@ -170,6 +172,8 @@ export class WorkerEndpointOriginReservationError extends Error {
      * nothing they can use. Only text this module composes reaches here.
      */
     readonly publicMessage?: string,
+    /** Internal readback custody after an uncertain shared carrier batch, never public wire. */
+    readonly original?: SharedCarrierOriginal,
   ) {
     super(code);
     this.name = "WorkerEndpointOriginReservationError";
@@ -328,12 +332,23 @@ export function createWorkerEndpointOriginReservations(options: {
     "resourceWithRelationsByUid" | "resourcesByRelation" | "readResource"
   >;
   readonly deployments: Pick<ResourceDeploymentStore, "active">;
+  /** Existing code-selected fixed staging/direct-Organization composition only. */
+  readonly shared?: { readonly kind: "form-v2@1"; readonly ledger: SharedAppLedger };
   /** Exact operator composition shared with the driver; only Host-minted Worker origins use it. */
   readonly noncommercialPlacement?: {
     readonly composition: NoncommercialPlacementComposition;
     readonly installedForms: readonly InstalledTakoformForm[];
   };
 }): WorkerEndpointOriginReservations {
+  const selectedShared = options.shared;
+  const selectedLedger = selectedShared?.ledger;
+  if (
+    selectedShared !== undefined &&
+    (selectedShared?.kind !== "form-v2@1" ||
+      !selectedLedger ||
+      typeof selectedLedger.forTrustedOwner !== "function")
+  )
+    throw new TypeError("invalid shared origin carrier construction");
   const placements = createSoldProviderPlacementSelector({
     providers: options.providers,
     catalog: options.catalog,
@@ -2086,7 +2101,323 @@ export function createWorkerEndpointOriginReservations(options: {
     },
   };
 
+  if (selectedLedger) {
+    const sharedSql = options.sql;
+    const forOwner = selectedLedger.forTrustedOwner.bind(selectedLedger);
+    const owned = (organizationId: string) => forOwner({ organizationId, product: "takoserver" });
+    const held = async (organizationId: string, reservationId: string) => {
+      const value = await owned(organizationId).readOriginalRoute(reservationId);
+      if (value) assertSharedHold(value, organizationId, reservationId);
+      return value;
+    };
+    return new SharedOriginCarrier(sharedSql, selectedLedger, {
+      async prepare(input) {
+        const { organizationId, reservationId, requestedSubdomain, expiresInSeconds, offeringId } =
+          input;
+        const request = Object.freeze({
+          organizationId,
+          reservationId,
+          requestedSubdomain: sharedName(requestedSubdomain),
+          expiresInSeconds: ttl(expiresInSeconds),
+          ...(offeringId === undefined ? {} : { offeringId }),
+        });
+        normalizeIdentity(request.organizationId, request.reservationId);
+        if (request.offeringId !== undefined) validateOpaque(request.offeringId);
+        const plan = Object.freeze(await planned(request));
+        if (
+          plan.canonicalPublicOrigin !==
+          `https://${request.requestedSubdomain}.app-staging.takos.jp`
+        )
+          throw new WorkerEndpointOriginReservationError("unsupported_capability", 422);
+        const prior = await readRow(sharedSql, request.organizationId, request.reservationId);
+        const originalHold = await held(request.organizationId, request.reservationId);
+        if (prior) {
+          if (!originalHold)
+            throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
+          assertSharedMetadata(prior, originalHold);
+          if (prior.expires_at <= now())
+            throw new WorkerEndpointOriginReservationError("conflict", 409);
+          return exactReplay(prior, request.requestedSubdomain, plan, request.expiresInSeconds);
+        }
+        const allocation = await owned(request.organizationId).prepareReserve({
+          reservationId: request.reservationId,
+          name: request.requestedSubdomain,
+        });
+        assertSharedHold(
+          allocation.expected,
+          request.organizationId,
+          request.reservationId,
+          request.requestedSubdomain,
+        );
+        const timestamp = now();
+        const expiresAt = timestamp + request.expiresInSeconds * 1000;
+        if (
+          !Number.isSafeInteger(timestamp) ||
+          timestamp < 0 ||
+          !Number.isSafeInteger(expiresAt) ||
+          expiresAt > MAXIMUM_DATE_EPOCH_MILLISECONDS
+        )
+          throw new WorkerEndpointOriginReservationError("invalid_argument", 400);
+        const metadata = Object.freeze({
+          organization_id: request.organizationId,
+          reservation_id: request.reservationId,
+          reservation_format: WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT,
+          legacy_space: null,
+          legacy_worker_name: null,
+          legacy_endpoint_name: null,
+          requested_subdomain: request.requestedSubdomain,
+          canonical_public_origin: plan.canonicalPublicOrigin,
+          provider_pack_ref: plan.providerPackRef,
+          provider_installation_ref: plan.providerInstallationRef,
+          offering_id: plan.offeringId,
+          offering_digest: plan.offeringDigest,
+          requested_ttl_seconds: request.expiresInSeconds,
+          expires_at: expiresAt,
+          state: "prepared",
+          revision: 1,
+          bound_space: null,
+          bound_worker_name: null,
+          worker_resource_uid: null,
+          worker_resource_revision: null,
+          bound_endpoint_name: null,
+          endpoint_resource_uid: null,
+          endpoint_resource_revision: null,
+          created_at: timestamp,
+          updated_at: timestamp,
+          released_at: null,
+        });
+        const original = Object.freeze({
+          organizationId: request.organizationId,
+          reservationId: request.reservationId,
+          expected: allocation.expected,
+          metadata,
+        });
+        const columns = Object.keys(metadata);
+        const values = Object.values(metadata);
+        if (
+          values.reduce<number>(
+            (bytes, value) =>
+              bytes +
+              (typeof value === "string"
+                ? new TextEncoder().encode(value).byteLength
+                : typeof value === "number"
+                  ? 8
+                  : 0),
+            0,
+          ) > 2000000
+        )
+          throw new WorkerEndpointOriginReservationError("invalid_argument", 400);
+        const exact = `EXISTS (SELECT 1 FROM worker_endpoint_origin_reservations WHERE ${columns.map((column) => `${column} IS ?`).join(" AND ")})`;
+        const witness = `shared-carrier:${crypto.randomUUID()}`;
+        const statements = [
+          ...allocation.before,
+          sharedStatement(
+            `INSERT INTO worker_endpoint_origin_reservations (${columns.join(",")})
+            SELECT ${values.map(() => "?").join(",")} WHERE NOT EXISTS (SELECT 1 FROM worker_endpoint_origin_reservations
+              WHERE organization_id=? AND reservation_id=?) AND (${allocation.publicationGuard.sql})`,
+            [
+              ...values,
+              request.organizationId,
+              request.reservationId,
+              ...(allocation.publicationGuard.params ?? []),
+            ],
+          ),
+          sharedStatement(
+            `INSERT INTO shared_app_staging_batch_assertions (witness,ok,apply_effects)
+            SELECT ?,CASE WHEN (${exact}) AND (${allocation.publicationGuard.sql}) THEN 1 ELSE 0 END,0`,
+            [witness, ...values, ...(allocation.publicationGuard.params ?? [])],
+          ),
+          ...allocation.after,
+          sharedStatement("DELETE FROM shared_app_staging_batch_assertions WHERE witness=?", [
+            witness,
+          ]),
+        ];
+        const settle = async () => {
+          const row = await readRow(sharedSql, request.organizationId, request.reservationId);
+          const current = await held(request.organizationId, request.reservationId);
+          if (
+            !row ||
+            !current ||
+            sharedHoldPin(current).incarnation !== sharedHoldPin(allocation.expected).incarnation ||
+            canonicalJson(row) !== canonicalJson(metadata)
+          )
+            throw new WorkerEndpointOriginReservationError(
+              "backend_unavailable",
+              503,
+              undefined,
+              original,
+            );
+          assertSharedMetadata(row, current);
+          if (row.expires_at <= now())
+            throw new WorkerEndpointOriginReservationError("conflict", 409, undefined, original);
+          return publicProjection(row);
+        };
+        try {
+          await sharedSql.batch(statements);
+        } catch {
+          try {
+            return await settle();
+          } catch {
+            throw new WorkerEndpointOriginReservationError(
+              "backend_unavailable",
+              503,
+              undefined,
+              original,
+            );
+          }
+        }
+        try {
+          return await settle();
+        } catch {
+          throw new WorkerEndpointOriginReservationError(
+            "backend_unavailable",
+            503,
+            undefined,
+            original,
+          );
+        }
+      },
+      async read(organizationId, reservationId) {
+        normalizeIdentity(organizationId, reservationId);
+        const row = await readRow(sharedSql, organizationId, reservationId);
+        if (!row) return null;
+        const current = await held(organizationId, reservationId);
+        if (!current) throw new WorkerEndpointOriginReservationError("backend_unavailable", 503);
+        assertSharedMetadata(row, current);
+        // Compatibility expiry never expires/releases/reclaims the global original.
+        return row.expires_at <= now() ? null : publicProjection(row);
+      },
+    });
+  }
   return authority;
+}
+
+interface SharedCarrierOriginal {
+  readonly organizationId: string;
+  readonly reservationId: string;
+  readonly expected: SharedAppRouteAssignment;
+  readonly metadata: Readonly<Record<string, string | number | null>>;
+}
+
+function sharedHoldPin(value: SharedAppRouteAssignment) {
+  return value.kind === "scalar" ? value.value : value.pin;
+}
+
+function assertSharedHold(
+  value: SharedAppRouteAssignment,
+  organizationId: string,
+  reservationId: string,
+  name?: string,
+): void {
+  const pin = sharedHoldPin(value);
+  const state = value.kind === "scalar" ? value.value.state : value.state;
+  if (
+    pin.environment !== "staging" ||
+    pin.product !== "takoserver" ||
+    pin.organizationId !== organizationId ||
+    pin.reservationId !== reservationId ||
+    (name !== undefined && pin.name !== name) ||
+    state === "released"
+  )
+    throw new WorkerEndpointOriginReservationError("conflict", 409);
+}
+
+function sharedName(value: string): string {
+  try {
+    return normalizeSharedAppName(value);
+  } catch {
+    throw new WorkerEndpointOriginReservationError("invalid_argument", 400);
+  }
+}
+
+function assertSharedMetadata(row: ReservationRow, held: SharedAppRouteAssignment): void {
+  if (
+    row.reservation_format !== WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT ||
+    row.state !== "prepared" ||
+    row.requested_subdomain !== sharedHoldPin(held).name ||
+    row.canonical_public_origin !== `https://${sharedHoldPin(held).name}.app-staging.takos.jp` ||
+    row.worker_resource_uid !== null ||
+    row.worker_resource_revision !== null ||
+    row.endpoint_resource_uid !== null ||
+    row.endpoint_resource_revision !== null ||
+    row.bound_space !== null ||
+    row.bound_worker_name !== null ||
+    row.bound_endpoint_name !== null ||
+    row.legacy_space !== null ||
+    row.legacy_worker_name !== null ||
+    row.legacy_endpoint_name !== null ||
+    row.released_at !== null
+  )
+    throw new WorkerEndpointOriginReservationError("conflict", 409);
+}
+
+function sharedStatement(sql: string, params: readonly SqlParam[]): SqlStatement {
+  const encoder = new TextEncoder();
+  if (
+    params.length > 90 ||
+    encoder.encode(sql).byteLength > 100000 ||
+    params.some(
+      (value) =>
+        (typeof value === "string" && encoder.encode(value).byteLength > 2000000) ||
+        value instanceof ArrayBuffer ||
+        (typeof value === "number" && !Number.isFinite(value)),
+    )
+  )
+    throw new WorkerEndpointOriginReservationError("invalid_argument", 400);
+  return Object.freeze({ sql, params: Object.freeze([...params]) });
+}
+
+class SharedOriginCarrier implements WorkerEndpointOriginReservations {
+  readonly #sql: Sql;
+  readonly #ledger: SharedAppLedger;
+  readonly prepare: WorkerEndpointOriginReservations["prepare"];
+  readonly read: WorkerEndpointOriginReservations["read"];
+  constructor(
+    sql: Sql,
+    ledger: SharedAppLedger,
+    ports: Pick<WorkerEndpointOriginReservations, "prepare" | "read">,
+  ) {
+    this.#sql = sql;
+    this.#ledger = ledger;
+    this.prepare = ports.prepare;
+    this.read = ports.read;
+    Object.freeze(this);
+  }
+  static assert(value: WorkerEndpointOriginReservations, sql: Sql, ledger: SharedAppLedger): void {
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      !(#sql in value) ||
+      value.#sql !== sql ||
+      value.#ledger !== ledger
+    )
+      throw new TypeError("shared origin carrier requires its actual ledger and Sql construction");
+  }
+  readonly release = sharedMutationRefusal;
+  readonly bind = sharedMutationRefusal;
+  readonly inspectBound = sharedMutationRefusal;
+  readonly activate = sharedMutationRefusal;
+  readonly deactivate = sharedMutationRefusal;
+  readonly mintForWorker = sharedMutationRefusal;
+  readonly assignEndpoint = sharedMutationRefusal;
+  readonly cancelEndpointAssignment = sharedMutationRefusal;
+  readonly releaseEndpointAssignment = sharedMutationRefusal;
+  readonly activateEndpointAssignment = sharedMutationRefusal;
+  readonly endpointAssignment = sharedMutationRefusal;
+  readonly deactivateEndpointAssignment = sharedMutationRefusal;
+}
+
+async function sharedMutationRefusal(): Promise<never> {
+  throw new WorkerEndpointOriginReservationError("unsupported_capability", 422);
+}
+
+/** Internal construction identity, not a public credential or native grant. */
+export function assertSharedOriginCarrier(
+  value: WorkerEndpointOriginReservations,
+  sql: Sql,
+  ledger: SharedAppLedger,
+): void {
+  SharedOriginCarrier.assert(value, sql, ledger);
 }
 
 interface PlannedPlacement {

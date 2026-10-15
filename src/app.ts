@@ -102,6 +102,7 @@ import {
   TokenError,
 } from "./token.ts";
 import {
+  assertSharedOriginCarrier,
   createWorkerEndpointOriginReservations,
   type WorkerEndpointOriginReservations,
 } from "./worker-endpoint-origin-reservations.ts";
@@ -363,6 +364,7 @@ export function buildApp(ports: AppPorts): App {
           const inputs = { sql, formUrl, backendId, targetKey, ledger };
           return Object.freeze({
             sql,
+            shared: kind === "form-v2@1" ? Object.freeze({ kind, ledger }) : undefined,
             acceptance:
               kind === "form-v2@1"
                 ? createWorkerEndpointOriginV2FormRouteAcceptance(inputs)
@@ -542,8 +544,18 @@ export function buildApp(ports: AppPorts): App {
           providers: ports.providers ?? [],
           resources: inventory,
           deployments,
+          ...(workerEndpointOriginConstruction?.shared === undefined
+            ? {}
+            : { shared: workerEndpointOriginConstruction.shared }),
         })
       : undefined);
+  if (workerEndpointOriginConstruction?.shared !== undefined && originReservations !== undefined) {
+    assertSharedOriginCarrier(
+      originReservations,
+      ports.sql,
+      workerEndpointOriginConstruction.shared.ledger,
+    );
+  }
   if (ports.selfhostTenantRunCredentialAuthority && !originReservations) {
     throw new TypeError(
       "self-host tenant-run credentials require an endpoint reservation authority",
