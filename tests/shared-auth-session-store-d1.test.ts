@@ -151,6 +151,7 @@ test("native D1 touch selects its own immutable post-update row and one concurre
       store.touchSessionAndSelect(SESSION, 0, NOW + 1),
     ]);
     const selected = results.find((row) => row !== null);
+    if (selected === undefined) throw new Error("expected one selected final session row");
     expect(results.filter(Boolean)).toHaveLength(1);
     expect(results.filter((row) => row === null)).toHaveLength(1);
     expect(selected).toEqual({ ...original, lastUsedAt: NOW + 1, version: 1 });
