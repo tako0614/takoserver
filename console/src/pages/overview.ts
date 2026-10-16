@@ -5,6 +5,7 @@ import {
   type Wallet,
 } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
+import { firstRunNote } from "../first-run.ts";
 import { formName } from "../forms.ts";
 import { consoleLocale, tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
@@ -122,10 +123,7 @@ export function overviewPage(organization: Organization): Child {
                 tr("リソース", "Resources"),
                 empty(
                   tr("リソースがありません", "Nothing declared yet"),
-                  tr(
-                    "運用者から渡された正確なForm URLを指定して作成します。受理されたリソースは完了前から表示されます。",
-                    "Create one with an exact Form URL supplied by the operator. An accepted resource can appear before execution completes.",
-                  ),
+                  firstRunNote(),
                   h(
                     "button",
                     {

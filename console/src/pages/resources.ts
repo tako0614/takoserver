@@ -1,5 +1,6 @@
 import type { ResourceSummary } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
+import { firstRunNote } from "../first-run.ts";
 import { formName } from "../forms.ts";
 import { tr } from "../i18n.ts";
 import { resource, signal } from "../reactive.ts";
@@ -276,13 +277,7 @@ export function resourcesPage(organizationId: string): Child {
               h(
                 "div",
                 { style: { display: "grid", gap: "12px" } },
-                empty(
-                  tr("リソースがありません", "Nothing declared yet"),
-                  tr(
-                    "運用者から渡された正確なForm URLでここから作成できます。受理されたリソースも完了前から表示されます。",
-                    "Create one here with an exact Form URL supplied by the operator. An accepted resource can appear before execution completes.",
-                  ),
-                ),
+                empty(tr("リソースがありません", "Nothing declared yet"), firstRunNote()),
                 pagingError(),
                 nextCursor ? moreButton(nextCursor) : null,
               ),

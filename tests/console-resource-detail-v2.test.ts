@@ -303,6 +303,15 @@ test("overview counts only what it read and offers the first create", async () =
   const none = await render({ items: [], nextCursor: null });
   expect(none.textContent).toContain("none yet");
   expect(none.textContent).toContain("Nothing declared yet");
+  // A new organization is told how a Worker comes to be served, not to ask for a URL.
+  expect(none.textContent).toContain(
+    "five Resources are created in this order: ModuleWorker, WorkerBundle, WorkerVersion, WorkerDeployment and WorkerEndpoint",
+  );
+  expect(none.textContent).not.toContain("supplied by the operator");
+  const guide = none.all().find((node) => node.tag === "a");
+  expect(guide?.attributes.get("href")).toBe(
+    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#8-create-and-serve-a-worker",
+  );
   const create = none.all().find((node) => node.tag === "button");
   expect(create?.className).toBe("btn btn--primary");
   expect(create?.textContent).toContain("New resource");
