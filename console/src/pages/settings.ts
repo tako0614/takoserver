@@ -58,8 +58,8 @@ export function settingsPage(organization: Organization): Child {
               "span",
               { class: "dim" },
               tr(
-                "Host API v2ではこの識別子がSpaceです。リソースは組織ごとに分かれ、APIキーとサインイン中のセッションは同じ組織として操作します。",
-                "In Host API v2 this identifier is the Space. Resources belong to one organization, and its API keys and your signed-in session act as that organization.",
+                "Host API v2では、この識別子がスペース（Space）になります。リソースは組織ごとに分かれ、この組織のAPIキーとサインイン中のセッションは、どちらもこの組織として操作します。",
+                "In Host API v2 this identifier is the Space. Each resource belongs to one organization, and its API keys (within their scopes) and your signed-in session act as that organization.",
               ),
             ),
           ),
