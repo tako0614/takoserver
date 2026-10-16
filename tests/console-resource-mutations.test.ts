@@ -208,13 +208,93 @@ test("accepted create is not shown as complete and checking it never re-sends", 
   expect(route().query.get("operation")).toBe(op.id);
   body.append(resourcesPage("org-console") as unknown as TestNode);
   await settle();
-  expect(body.textContent).toContain("queued · none");
+  expect(body.textContent).toContain("In progress. Checking automatically.");
+  expect(body.textContent).toContain("(queued)");
   expect(body.textContent).not.toContain("View resource");
   button(body, "Reload").click();
   await settle();
   expect(body.textContent).toContain("View resource");
   expect(seen.filter((request) => request.method === "POST")).toHaveLength(1);
   expect(checks).toBe(2);
+});
+
+/** The Resources page of an accepted operation whose checks answer from `answers`, in turn. */
+async function operationPage(answers: Array<Record<string, unknown>>) {
+  const { body, route } = await setup();
+  const { resourcesPage } = await import("../console/src/pages/resources.ts");
+  let checks = 0;
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname.includes("/operations/")) {
+        const answer = answers[Math.min(checks, answers.length - 1)];
+        checks += 1;
+        return Response.json(answer);
+      }
+      return Response.json({ items: [one], nextCursor: null });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  route.set({
+    path: "/resources",
+    segments: ["resources"],
+    query: new URLSearchParams(`operation=${op.id}`),
+  });
+  body.append(resourcesPage("org-console") as unknown as TestNode);
+  return { body, checks: () => checks };
+}
+
+test("an accepted operation is followed until it settles, without pressing Reload", async () => {
+  const { OPERATION_FOLLOW } = await import("../console/src/pages/resources.ts");
+  const saved = { ...OPERATION_FOLLOW };
+  OPERATION_FOLLOW.intervalMs = 5;
+  try {
+    const { body, checks } = await operationPage([
+      op,
+      { ...op, status: "running" },
+      { ...op, status: "succeeded", effect: "complete" },
+    ]);
+    for (let i = 0; i < 20 && checks() < 3; i += 1) await new Promise((r) => setTimeout(r, 10));
+    await settle();
+    expect(checks()).toBe(3);
+    expect(body.textContent).toContain("Done");
+    expect(body.textContent).toContain("View resource");
+    expect(body.textContent).not.toContain("In progress");
+  } finally {
+    Object.assign(OPERATION_FOLLOW, saved);
+  }
+});
+
+test("following stops after its budget and then asks for Reload", async () => {
+  const { OPERATION_FOLLOW } = await import("../console/src/pages/resources.ts");
+  const saved = { ...OPERATION_FOLLOW };
+  OPERATION_FOLLOW.budgetMs = 0;
+  try {
+    const { body, checks } = await operationPage([op]);
+    await settle();
+    expect(checks()).toBe(1);
+    expect(body.textContent).toContain("Not complete yet. Use Reload to check again.");
+  } finally {
+    Object.assign(OPERATION_FOLLOW, saved);
+  }
+});
+
+test("a failed operation says so with the Host's message", async () => {
+  const { body } = await operationPage([
+    {
+      ...op,
+      status: "failed",
+      effect: "none",
+      error: {
+        code: "dependency_conflict",
+        message: "WorkerDeployment for this Worker is missing",
+      },
+    },
+  ]);
+  await settle();
+  expect(body.textContent).toContain(
+    "Failed: WorkerDeployment for this Worker is missing (dependency_conflict)",
+  );
 });
 
 test.each(["connection lost", "malformed accepted reply"] as const)(
