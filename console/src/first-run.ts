@@ -26,7 +26,18 @@ function supports(organizationId: string, form: string): Promise<boolean | null>
   });
 }
 
-function guideLink(anchor: string, label: string): Child {
+/** Whether this Host runs Workers and whether it publishes them, each null when it did not say. */
+export function workerSupport(
+  organizationId: string,
+): Promise<[worker: boolean | null, endpoint: boolean | null]> {
+  return Promise.all([
+    supports(organizationId, MODULE_WORKER),
+    supports(organizationId, WORKER_ENDPOINT),
+  ]);
+}
+
+/** A link to one section of the install guide, which opens in a new tab. */
+export function guideLink(anchor: string, label: string): Child {
   return h(
     "a",
     { href: `${GUIDE}#${anchor}`, target: "_blank", rel: "noopener noreferrer" },
@@ -48,12 +59,7 @@ function guideLink(anchor: string, label: string): Child {
  * publishes Workers.
  */
 export function firstRunNote(organizationId: string): Child {
-  const answers = resource(() =>
-    Promise.all([
-      supports(organizationId, MODULE_WORKER),
-      supports(organizationId, WORKER_ENDPOINT),
-    ]),
-  );
+  const answers = resource(() => workerSupport(organizationId));
   const dialog = (): string =>
     tr(
       "作成ダイアログでFormを選ぶと、そのFormの最小の設定が入ります。",
