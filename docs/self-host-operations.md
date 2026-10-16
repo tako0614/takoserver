@@ -537,11 +537,14 @@ shell, so that this one keeps them. Keep their working files in a directory outs
 `/v1` session, organization and API-key routes are Takoserver product APIs, not
 the Takoform Host API. Use `resources:read` for read-only checks or
 `resources:write` for Resource operations; write includes read. The key secret
-is shown only once; keep it with the installation's other credentials:
+is shown only once; keep it with the installation's other credentials. It
+expires after 90 days, as the console's keys do by default; create its
+replacement before then:
 
 ```sh
 HOST=https://api.example.com:8443
 V2=$HOST/apis/forms.takoform.com/v2
+F=https://edge.forms.takoform.com/forms
 read -r ASSERTION   # paste the printed assertion; it stays out of shell history
 SESSION=$(jq -n --arg assertion "$ASSERTION" \
     '{provider: "google", method: "operator-assertion", $assertion}' |
@@ -552,7 +555,7 @@ ORG=$(curl -sS --fail-with-body "$HOST/v1/organizations" \
     --data '{"name":"My organization"}' | jq -r .organization.id)
 KEY=$(curl -sS --fail-with-body "$HOST/v1/organizations/$ORG/api-keys" \
     -H "authorization: Bearer $SESSION" -H 'content-type: application/json' \
-    --data '{"name":"operator writer","scopes":["resources:write"],"expiresInSeconds":86400}' |
+    --data '{"name":"operator writer","scopes":["resources:write"],"expiresInSeconds":7776000}' |
   jq -r .secret)
 ```
 
@@ -642,9 +645,13 @@ without public fallback. The Host reads held grants only at startup, so each
 new held bundle takes the same three steps: stop the Host, seed the bundle,
 start the Host again.
 
-`scripts/selfhost-artifact.ts seed` is that operator step. Stop the Host
-first (`systemctl stop takoserver.service`). Then run the command from the checkout as the
-`takoserver` user with the Host's environment, because it resolves the data
+If you are not sure the complete Worker profile registered, check support as
+in step 7 before seeding: seeding costs a stop and a start, and the Host does
+not log which complete-profile setting is missing.
+
+`scripts/selfhost-artifact.ts seed` is that operator step. Stop the Host first
+(`systemctl stop takoserver.service`). Then run the command from the checkout as
+the `takoserver` user with the Host's environment, because it resolves the data
 root and `TAKOSERVER_DB` exactly as the Host does:
 
 ```sh
@@ -751,7 +758,6 @@ Host. If the Worker Forms are unsupported, read the startup diagnostics
 complete-profile table in step 3, then restart.
 
 ```sh
-F=https://edge.forms.takoform.com/forms
 for form in ModuleWorker/0.3.0 WorkerBundle/0.2.0 WorkerVersion/0.5.0 \
   WorkerDeployment/0.4.0 WorkerEndpoint/0.3.0; do
   curl -sS --fail-with-body -G "$V2/support" --data-urlencode "form=$F/$form/" \
@@ -998,8 +1004,16 @@ bun --no-env-file scripts/selfhost-artifact.ts seed worker-bundle "$WORK/hello/v
   --config /etc/takoserver/v2/takoform-v2.json > "$WORK/hello-v3.json"
 ```
 
-Start the Host and check support for `SQLiteDatabase/0.2.0`,
-`SQLiteMigrationSet/0.2.0` and `SQLiteMigrationApplication/0.2.0` as in step 7.
+Start the Host and check support for the three SQLite Forms:
+
+```sh
+for form in SQLiteDatabase/0.2.0 SQLiteMigrationSet/0.2.0 \
+  SQLiteMigrationApplication/0.2.0; do
+  curl -sS --fail-with-body -G "$V2/support" --data-urlencode "form=$F/$form/" \
+    -H "authorization: Bearer $KEY" | jq -c --arg form "$form" '{$form, supported}'
+done
+```
+
 Then create the database, apply the migrations, and ship the bundle as in
 step 9 with the Binding in the new Version's spec:
 
