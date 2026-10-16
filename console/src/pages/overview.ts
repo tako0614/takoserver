@@ -8,7 +8,7 @@ import { type Child, h, live, text } from "../dom.ts";
 import { formName } from "../forms.ts";
 import { consoleLocale, tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
-import { servedWorkers } from "../references.ts";
+import { publishedUrl, servedWorkers } from "../references.ts";
 import { byForm, health, phaseLabel } from "../resource-state.ts";
 import { linkProps, resourcePath } from "../router.ts";
 import { api } from "../state.ts";
@@ -41,8 +41,8 @@ export function overviewPage(organization: Organization): Child {
           "p",
           null,
           tr(
-            "Takoformで宣言したリソースの状態と、公開中のWorkerを確認できます。",
-            "The state of the resources you declared with Takoform, and the Workers you serve.",
+            "Takoformで宣言したリソースの状態と、Workerとその公開先を確認できます。",
+            "The state of the resources you declared with Takoform, and your Workers and where they are served.",
           ),
         ),
       ),
@@ -343,7 +343,7 @@ function workersCard(all: readonly ResourceSummary[], partial: boolean): Child {
     h(
       "div",
       { class: "card__body rows" },
-      ...workers.map(({ worker, deployment, urls }) => {
+      ...workers.map(({ worker, deployment, endpoints }) => {
         const state = health(deployment ?? worker);
         return h(
           "div",
@@ -357,20 +357,47 @@ function workersCard(all: readonly ResourceSummary[], partial: boolean): Child {
             "div",
             { class: "row__value ref" },
             badge(phaseLabel(state.phase), state.tone, true),
-            ...(urls.length > 0
-              ? urls.map((url) =>
+            ...(endpoints.length > 0
+              ? endpoints.map((endpoint) => address(endpoint))
+              : [
                   h(
-                    "a",
-                    { href: url, target: "_blank", rel: "noopener noreferrer" },
-                    url,
-                    h("span", { "aria-hidden": "true" }, " ↗"),
+                    "span",
+                    { class: "dim" },
+                    !deployment
+                      ? tr("配信中の版はありません", "No deployment yet")
+                      : partial
+                        ? tr("このページには公開先がありません", "No address on this page")
+                        : tr("公開先はまだありません", "Not published yet"),
                   ),
-                )
-              : [h("span", { class: "dim" }, tr("公開先はまだありません", "Not published yet"))]),
+                ]),
           ),
         );
       }),
     ),
+  );
+}
+
+/**
+ * An Endpoint's address: a link once the Endpoint is Ready, and plain text
+ * with the Endpoint's own state while it is still settling or has failed,
+ * since its address is reported before it answers.
+ */
+function address(endpoint: ResourceSummary): Child {
+  const url = publishedUrl(endpoint.output) ?? "";
+  const state = health(endpoint);
+  if (state.phase === "Ready") {
+    return h(
+      "a",
+      { href: url, target: "_blank", rel: "noopener noreferrer" },
+      url,
+      h("span", { "aria-hidden": "true" }, " ↗"),
+    );
+  }
+  return h(
+    "span",
+    { class: "ref" },
+    h("span", { class: "mono dim" }, url),
+    badge(phaseLabel(state.phase), state.tone, true),
   );
 }
 

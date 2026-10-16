@@ -774,6 +774,24 @@ test("the overview shows each Worker with its state and address", async () => {
     lastOperation: `op-${uid}`,
   });
   const items = [
+    item("draft", "ModuleWorker/0.3.0", {}, {}, { ready: true }),
+    item(
+      "draft-deployment",
+      "WorkerDeployment/0.4.0",
+      { worker: { resourceUid: "draft" } },
+      {},
+      { ready: true },
+    ),
+    {
+      ...item(
+        "draft-endpoint",
+        "WorkerEndpoint/0.3.0",
+        { worker: { resourceUid: "draft" } },
+        { url: "https://draft.apps.example.com/" },
+      ),
+      observedGeneration: 0,
+      phase: "pending" as const,
+    },
     item("hello", "ModuleWorker/0.3.0", {}, {}, { ready: true }),
     item(
       "hello-deployment",
@@ -814,7 +832,7 @@ test("the overview shows each Worker with its state and address", async () => {
   body.append(overviewPage(organization) as unknown as NodeStub);
   await settle();
   expect(body.textContent).toContain("Workers");
-  expect(body.textContent).toContain("the Workers you serve");
+  expect(body.textContent).toContain("your Workers and where they are served");
   expect(body.textContent).not.toContain("what changed recently");
   const links = body.all().filter((node) => node.tag === "a");
   expect(links.find((node) => node.textContent === "hello")?.attributes.get("href")).toBe(
@@ -823,4 +841,10 @@ test("the overview shows each Worker with its state and address", async () => {
   expect(
     links.some((node) => node.attributes.get("href") === "https://hello.apps.example.com/"),
   ).toBe(true);
+  // An Endpoint still settling shows its address as text with its own state.
+  expect(
+    links.some((node) => node.attributes.get("href") === "https://draft.apps.example.com/"),
+  ).toBe(false);
+  expect(body.textContent).toContain("https://draft.apps.example.com/");
+  expect(body.textContent).toContain("Pending");
 });

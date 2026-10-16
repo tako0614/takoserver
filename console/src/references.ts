@@ -64,13 +64,14 @@ export interface ServedWorker {
   readonly worker: ResourceSummary;
   /** The WorkerDeployment that names this Worker, if the page holds one. */
   readonly deployment: ResourceSummary | undefined;
-  /** The https addresses its WorkerEndpoints publish. */
-  readonly urls: readonly string[];
+  /** The WorkerEndpoints that name this Worker and report an https address. */
+  readonly endpoints: readonly ResourceSummary[];
 }
 
 const FORM_KIND = (kind: string) => new RegExp(`/forms/${kind}/[^/]+/$`, "u");
 const MODULE_WORKER = FORM_KIND("ModuleWorker");
 const WORKER_DEPLOYMENT = FORM_KIND("WorkerDeployment");
+export const WORKER_ENDPOINT = FORM_KIND("WorkerEndpoint");
 
 /**
  * Each ModuleWorker among these Resources with what serves it: the
@@ -89,10 +90,9 @@ export function servedWorkers(resources: readonly ResourceSummary[]): readonly S
       return {
         worker,
         deployment: naming.find((resource) => WORKER_DEPLOYMENT.test(resource.form)),
-        urls: naming.flatMap((resource) => {
-          const url = publishedUrl(resource.output);
-          return url ? [url] : [];
-        }),
+        endpoints: naming.filter(
+          (resource) => WORKER_ENDPOINT.test(resource.form) && publishedUrl(resource.output),
+        ),
       };
     });
 }

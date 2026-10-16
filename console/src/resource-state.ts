@@ -2,6 +2,8 @@ import type { ResourceSummary } from "./api.ts";
 import { formName } from "./forms.ts";
 import { tr } from "./i18n.ts";
 
+const WORKER_ENDPOINT = /\/forms\/WorkerEndpoint\/[^/]+\/$/u;
+
 /** Display only states the v2 Resource actually reports. */
 export type Phase =
   | "Ready"
@@ -36,7 +38,9 @@ export function health(resource: ResourceSummary): Health {
   const ready =
     "ready" in resource.observed
       ? resource.observed.ready
-      : resource.observed.activeDeploymentRouteReady;
+      : WORKER_ENDPOINT.test(resource.form)
+        ? resource.observed.activeDeploymentRouteReady
+        : undefined;
   if (resource.observedAt !== null && ready === true) {
     return { phase: "Ready", tone: "ok", reason: null, message: null, stale };
   }

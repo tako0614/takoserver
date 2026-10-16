@@ -48,9 +48,9 @@ test("finds each Worker's Deployment and published addresses", () => {
   const served = servedWorkers([worker, version, deployment, endpoint, quiet]);
   expect(served.map((entry) => entry.worker.uid)).toEqual(["hello", "quiet"]);
   expect(served[0]?.deployment?.uid).toBe("hello-deployment");
-  expect(served[0]?.urls).toEqual(["https://hello.apps.example.com/"]);
+  expect(served[0]?.endpoints.map((entry) => entry.uid)).toEqual(["hello-endpoint"]);
   expect(served[1]?.deployment).toBeUndefined();
-  expect(served[1]?.urls).toEqual([]);
+  expect(served[1]?.endpoints).toEqual([]);
 });
 
 test("a WorkerEndpoint is ready when its active Deployment's route is", () => {
@@ -58,4 +58,9 @@ test("a WorkerEndpoint is ready when its active Deployment's route is", () => {
     resource("e", "WorkerEndpoint/0.3.0", {}, {}, { activeDeploymentRouteReady: routeReady });
   expect(health(endpoint(true)).phase).toBe("Ready");
   expect(health(endpoint(false)).phase).toBe("NotReady");
+  // Only an Endpoint's route flag counts as its readiness.
+  expect(
+    health(resource("x", "SQLiteDatabase/0.2.0", {}, {}, { activeDeploymentRouteReady: true }))
+      .phase,
+  ).toBe("Applied");
 });
