@@ -31,7 +31,7 @@ describe("Takoserver public site build", () => {
         "og.png",
         "fonts/bricolage-grotesque-latin.woff2",
         "fonts/OFL.txt",
-        ...["desktop", "mobile"].flatMap((shape) =>
+        ...["desktop", "tablet", "mobile"].flatMap((shape) =>
           ["light", "dark"].flatMap((theme) =>
             ["en", "ja"].map((lang) => `screens/console-${shape}-${theme}-${lang}.webp`),
           ),

@@ -1,6 +1,7 @@
 import type { ApiKey } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
 import { tr } from "../i18n.ts";
+import { DEFAULT_KEY_SCOPES, keyScopeGroups } from "../key-scopes.ts";
 import { resource } from "../reactive.ts";
 import { api } from "../state.ts";
 import {
@@ -17,35 +18,6 @@ import {
   whenReady,
 } from "../ui.ts";
 
-const SCOPES: readonly { readonly id: string; readonly blurb: () => string }[] = [
-  {
-    id: "catalog:read",
-    blurb: () => tr("販売中の商品と料金を表示します。", "See what is for sale and at what price."),
-  },
-  {
-    id: "resources:read",
-    blurb: () => tr("宣言済みリソースを表示します。", "List and inspect declared resources."),
-  },
-  {
-    id: "resources:write",
-    blurb: () =>
-      tr("Takoformでリソースを作成・削除します。", "Apply and delete resources through Takoform."),
-  },
-  {
-    id: "wallet:read",
-    blurb: () => tr("残高と取引履歴を表示します。", "Read the balance and the ledger."),
-  },
-  { id: "usage:read", blurb: () => tr("使用量明細を表示します。", "Read usage statements.") },
-  {
-    id: "reseller:write",
-    blurb: () =>
-      tr(
-        "テナントに代わって見積・予約・作成します。",
-        "Quote, reserve, and provision on behalf of tenants.",
-      ),
-  },
-];
-
 const LIFETIMES: readonly { readonly label: () => string; readonly seconds: number }[] = [
   { label: () => tr("30日", "30 days"), seconds: 30 * 86_400 },
   { label: () => tr("90日", "90 days"), seconds: 90 * 86_400 },
@@ -61,6 +33,13 @@ const LIFETIMES: readonly { readonly label: () => string; readonly seconds: numb
  */
 export function keysPage(organizationId: string): Child {
   const keys = resource(() => api.apiKeys(organizationId));
+  // Asked once per page, so the dialog opens at once; until the answer comes
+  // back, or if it never does, ai:invoke is simply not offered.
+  const ai = resource(() => api.aiAvailable());
+  const aiAvailable = (): boolean => {
+    const state = ai.get();
+    return state.state === "ready" && state.value;
+  };
 
   return h(
     "div",
@@ -86,7 +65,7 @@ export function keysPage(organizationId: string): Child {
         {
           class: "btn btn--primary",
           type: "button",
-          onClick: () => createKey(organizationId, keys.reload),
+          onClick: () => createKey(organizationId, keys.reload, aiAvailable()),
         },
         icon(ICON.plus, 14),
         text(tr("キーを作成", "Create key")),
@@ -151,7 +130,7 @@ function table(apiKeys: readonly ApiKey[], organizationId: string, reload: () =>
             h(
               "div",
               { style: { display: "flex", gap: "4px", flexWrap: "wrap" } },
-              ...key.scopes.map((scope) => badge(scope, "accent")),
+              ...key.scopes.map((scope) => badge(scope)),
             ),
           ),
           h("td", { class: "dim" }, when(key.createdAt)),
@@ -212,12 +191,17 @@ function revoke(organizationId: string, key: ApiKey, reload: () => void): void {
   });
 }
 
-function createKey(organizationId: string, reload: () => void): void {
-  const name = h("input", { class: "input", placeholder: "deploy pipeline" });
-  const chosen = new Set<string>(["catalog:read", "resources:read", "resources:write"]);
+function createKey(organizationId: string, reload: () => void, aiAvailable: boolean): void {
+  const name = h("input", {
+    class: "input",
+    id: "create-key-name",
+    placeholder: "deploy pipeline",
+    autocomplete: "off",
+  });
+  const chosen = new Set<string>(DEFAULT_KEY_SCOPES);
   const lifetime = h(
     "select",
-    { class: "select" },
+    { class: "select", id: "create-key-lifetime" },
     ...LIFETIMES.map((option, index) =>
       h(
         "option",
@@ -236,7 +220,7 @@ function createKey(organizationId: string, reload: () => void): void {
       h(
         "div",
         { class: "field" },
-        h("label", null, tr("名前", "Name")),
+        h("label", { for: "create-key-name" }, tr("名前", "Name")),
         name,
         h(
           "small",
@@ -250,26 +234,34 @@ function createKey(organizationId: string, reload: () => void): void {
       h(
         "div",
         { class: "field" },
-        h("label", null, tr("スコープ", "Scopes")),
-        h(
-          "div",
-          { class: "checks" },
-          ...SCOPES.map((scope) => {
-            const box = h("input", {
-              type: "checkbox",
-              ...(chosen.has(scope.id) ? { checked: true } : {}),
-              onChange: (event: Event) => {
-                if ((event.target as HTMLInputElement).checked) chosen.add(scope.id);
-                else chosen.delete(scope.id);
-              },
-            });
-            return h(
-              "label",
-              { class: "check", title: scope.blurb() },
-              box,
-              h("span", { class: "mono", style: { fontSize: "12px" } }, scope.id),
-            );
-          }),
+        h("span", { class: "field__label" }, tr("スコープ", "Scopes")),
+        ...keyScopeGroups(aiAvailable).map((group) =>
+          h(
+            "fieldset",
+            { class: "checks" },
+            h("legend", null, group.label()),
+            ...group.scopes.map((scope) => {
+              const box = h("input", {
+                type: "checkbox",
+                ...(chosen.has(scope.id) ? { checked: true } : {}),
+                onChange: (event: Event) => {
+                  if ((event.target as HTMLInputElement).checked) chosen.add(scope.id);
+                  else chosen.delete(scope.id);
+                },
+              });
+              return h(
+                "label",
+                { class: "check" },
+                box,
+                h(
+                  "span",
+                  { class: "check__text" },
+                  h("span", { class: "mono check__id" }, scope.id),
+                  h("small", null, scope.blurb()),
+                ),
+              );
+            }),
+          ),
         ),
         h(
           "small",
@@ -280,7 +272,12 @@ function createKey(organizationId: string, reload: () => void): void {
           ),
         ),
       ),
-      h("div", { class: "field" }, h("label", null, tr("有効期間", "Expires in")), lifetime),
+      h(
+        "div",
+        { class: "field" },
+        h("label", { for: "create-key-lifetime" }, tr("有効期間", "Expires in")),
+        lifetime,
+      ),
     ),
     onConfirm: async () => {
       if (name.value.trim() === "") {
