@@ -3,7 +3,7 @@ import { type Child, h, live, text } from "../dom.ts";
 import { tr } from "../i18n.ts";
 import { DEFAULT_KEY_SCOPES, keyScopeGroups, keyUsage } from "../key-scopes.ts";
 import { resource } from "../reactive.ts";
-import { api, apiOrigin } from "../state.ts";
+import { api, hostV2Base } from "../state.ts";
 import {
   badge,
   card,
@@ -40,14 +40,9 @@ export function keysPage(organizationId: string): Child {
     const state = discovery.get();
     return state.state === "ready" && state.value.ai;
   };
-  // The Host names its v2 base from its public origin, the only authority v2
-  // answers; the console's own API origin may be a tunnel or an override.
   const v2Endpoint = (): string => {
     const state = discovery.get();
-    return (
-      (state.state === "ready" ? state.value.takoform : null) ??
-      `${apiOrigin()}/apis/forms.takoform.com/v2`
-    );
+    return hostV2Base(state.state === "ready" ? state.value : null);
   };
 
   return h(

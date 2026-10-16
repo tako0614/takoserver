@@ -8,6 +8,7 @@ import {
   api,
   apiOrigin,
   applyTheme,
+  hostV2Base,
   principal,
   setApiOrigin,
   signOut,
@@ -207,11 +208,7 @@ export function hostCard(organizationId: string): Child {
   const address = (): Child => {
     const state = discovery.get();
     if (state.state === "loading") return checking();
-    // The Host names its v2 base from its public origin, the only authority
-    // v2 answers; the console's own API origin may be a tunnel or an override.
-    const v2 =
-      (state.state === "ready" ? state.value.takoform : null) ??
-      `${apiOrigin()}/apis/forms.takoform.com/v2`;
+    const v2 = hostV2Base(state.state === "ready" ? state.value : null);
     return h(
       "div",
       { style: { display: "grid", gap: "6px" } },
@@ -230,11 +227,11 @@ export function hostCard(organizationId: string): Child {
         "small",
         null,
         tr(
-          "Takoformやcurlからは、このURL・スペース（上の組織の識別子）・",
-          "Takoform and curl use this URL, the organization identifier above as the Space, and ",
+          "Takoformやcurlからは、このURL、スペース（上の「識別子」）、",
+          "Takoform and curl use this URL, the Identifier above as the Space, and ",
         ),
         h("a", { ...linkProps("/keys") }, tr("APIキー", "an API key")),
-        tr("で操作します。", "."),
+        tr("を使って操作します。", "."),
       ),
     );
   };
@@ -261,11 +258,11 @@ export function hostCard(organizationId: string): Child {
                       "span",
                       null,
                       tr(
-                        "実行しません。保持できるのは成果物だけです。Workerを動かすには、Worker実行環境とその設定が必要です（",
-                        "Does not run Workers; it keeps artifacts only. Running them needs the Worker runtime and its settings (",
+                        "実行しません。保持できるのは成果物だけです。Workerを動かすには、",
+                        "Does not run Workers; it keeps artifacts only. Running them needs the Worker runtime and its settings from ",
                       ),
                       guideStep("3-configuration", "手順3", "step 3"),
-                      tr("）。", ")."),
+                      tr("にあるWorker実行環境とその設定が必要です。", "."),
                     )
                   : unchecked(),
           ),
@@ -285,11 +282,11 @@ export function hostCard(organizationId: string): Child {
                       "span",
                       null,
                       tr(
-                        "まだ公開できません。HTTPS（TCP 443）の待ち受け設定が必要です（",
-                        "Not yet: it needs the HTTPS listener on TCP 443 (",
+                        "まだ公開できません。",
+                        "Not yet: it needs the HTTPS listener on TCP 443 from ",
                       ),
                       guideStep("4-https-and-tcp-443", "手順4", "step 4"),
-                      tr("）。", ")."),
+                      tr("にあるHTTPS（TCP 443）の待ち受け設定が必要です。", "."),
                     )
                   : unchecked(),
             ),

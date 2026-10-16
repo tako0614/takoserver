@@ -131,7 +131,7 @@ test("names the Host's own v2 address and that it runs and publishes Workers", a
   expect(body.textContent).toContain("This Host");
   // The address is the one the Host names, not the console's API origin.
   expect(body.textContent).toContain(PUBLIC_V2);
-  expect(body.textContent).toContain("the organization identifier above as the Space");
+  expect(body.textContent).toContain("the Identifier above as the Space");
   expect(link(body, "an API key")?.attributes.get("href")).toBe("/keys");
   expect(body.textContent).toContain("Runs Workers");
   expect(body.textContent).toContain("WorkerEndpoint publishes Workers at HTTPS hostnames");
@@ -140,7 +140,7 @@ test("names the Host's own v2 address and that it runs and publishes Workers", a
   expect(asked.filter((path) => path.endsWith("/support"))).toHaveLength(2);
 });
 
-test("an artifact-only Host says it does not run Workers and asks nothing about publishing", async () => {
+test("an artifact-only Host says it does not run Workers and nothing about publishing", async () => {
   const { body } = await hostCard({
     discovery: { endpoints: { takoform: PUBLIC_V2 } },
     support: { [MODULE_WORKER]: false, [WORKER_ENDPOINT]: false },
@@ -162,6 +162,18 @@ test("a Host that runs Workers without the HTTPS listener says what publishing n
   expect(link(body, "step 4 of the install guide")?.attributes.get("href")).toEndWith(
     "/docs/self-host-operations.md#4-https-and-tcp-443",
   );
+});
+
+test("a Host that runs Workers but does not say whether it publishes them is not guessed about", async () => {
+  const { body } = await hostCard({
+    discovery: { endpoints: { takoform: PUBLIC_V2 } },
+    support: { [MODULE_WORKER]: true, [WORKER_ENDPOINT]: null },
+  });
+  expect(body.textContent).toContain("Runs Workers");
+  expect(body.textContent).toContain("HTTPS publishing");
+  expect(body.textContent).toContain("Couldn't check");
+  expect(body.textContent).not.toContain("WorkerEndpoint publishes");
+  expect(body.textContent).not.toContain("Not yet");
 });
 
 test("a Host that does not answer is not guessed about", async () => {
