@@ -879,20 +879,24 @@ Read any Resource back with
 `GET /apis/forms.takoform.com/v2/resources/{resourceUid}` using the same key.
 
 **In the console.** If you serve the console (step 5), it can create the same
-Worker once step 6 has seeded the bundle. Choose **New resource** and a Form:
-the dialog fills in the smallest spec this Host accepts for that Form, and each
-place that names another Resource lists the organization's Resources of the
-Form the Host requires, by name. Nothing is sent until you accept, and
-**Request to send** shows the exact request first.
+Worker in the organization `$ORG` once step 6 has seeded the bundle. Choose
+**New resource** and a Form: the dialog fills in the smallest spec this Host
+accepts for that Form, and each place that names another Resource lists the
+organization's Resources of the Form the Host requires, by name. Nothing is
+sent until you accept; **Request to send**, folded below the spec, holds the
+exact request. After each accept, the Resources page shows the **Accepted
+operation**. The Host refuses a reference to a Resource whose create has not
+finished, so create anything that names a Resource only once that card offers
+**View resource**. `hello` shows NotReady until a Deployment serves it.
 
 1. Create the `ModuleWorker` `hello`.
 2. Create the `WorkerBundle` `hello-bundle-v1`, with `artifact.url` and
    `artifact.sha256` from `$WORK/hello-v1.json`.
-3. Create the `WorkerVersion` `hello-version-v1`, choosing `hello` and
-   `hello-bundle-v1`.
+3. Once both creates have finished, create the `WorkerVersion`
+   `hello-version-v1`, choosing `hello` and `hello-bundle-v1`.
 4. Once the version is Ready, open its page and choose **Serve this version**.
-   It creates the Worker's `WorkerDeployment` with that version at weight
-   10000; name it `hello-deployment`.
+   It opens the create of the Worker's `WorkerDeployment` with that version at
+   weight 10000; name it `hello-deployment` and accept.
 5. Once the Deployment is Ready, create the `WorkerEndpoint` `hello-endpoint`,
    choosing `hello`. Once it is published, the overview shows the Worker's
    address, and the Endpoint page's **Output** has its `hostname`.
@@ -942,10 +946,11 @@ updated=$(jq -nc --arg w "$WORKER" --arg v "$VERSION_V2" \
 wait_operation "$(printf '%s' "$updated" | jq -r .id)" hello-deployment-v2
 ```
 
-In the console, create the new `WorkerBundle` and `WorkerVersion` as in step 8,
-then open `hello-version-v2` and choose **Serve this version**. It opens the
-update of `hello-deployment` with that version alone at weight 10000, under the
-generation it read, and sends it when you accept.
+In the console, create `hello-bundle-v2` from `$WORK/hello-v2.json` and
+`hello-version-v2` as in step 8. Once the version is Ready, open it and choose
+**Serve this version**. It opens the update of `hello-deployment` with that
+version alone at weight 10000, naming the Deployment generation the page read,
+and sends it when you accept.
 
 `tests/selfhost-v2-ordinary-journey-native.test.ts`
 runs this path with real Host and workerd processes and seeds through the same

@@ -92,12 +92,12 @@ const landingMessages = {
     afterTitle: "After you deploy",
     consoleTitle: "Use the console",
     consoleBody:
-      "The console creates the same Resources in the browser. Choose a Form and it fills in the smallest spec this Host accepts; each Resource the spec refers to is chosen by name, and nothing is sent until you accept. It shows each Worker with the address it is served at and whether it is Ready. It is a static app built from this repository and served on its own origin next to the API.",
+      "The console can also create these Resources in the browser. Choose a Form and it fills in the smallest spec this Host accepts; you can pick each Resource it refers to by name, and nothing is sent until you accept. It shows each Worker with the address it is served at and whether it is Ready. It is a static app built from this repository and served on its own origin next to the API.",
     consoleSetup: "Set up the console (install guide, step 5)",
     consoleHost: "Open this Host's console",
     shipTitle: "Ship a new version",
     shipBody:
-      "Code never changes in place. Create the new code and a version for it, then point the Deployment at that version; the Endpoint keeps its address. In the console, choose “Serve this version” on the new version's page; it prepares this update for you to accept.",
+      "Code never changes in place. Create the new code and a version for it, then point the Deployment at that version; the Endpoint keeps its address. In the console, once the new version is Ready, choose “Serve this version” on its page; it prepares this update for you to accept.",
     shipBundle:
       "holds the new worker.js, by the URL and SHA-256 of its manifest (a seeded bundle needs a Host restart first).",
     shipVersion: "pairs the new WorkerBundle with its fetch handler.",
@@ -167,12 +167,12 @@ const landingMessages = {
     afterTitle: "デプロイしたあと",
     consoleTitle: "コンソールを使う",
     consoleBody:
-      "コンソールでも、同じリソースをブラウザーから作成できます。Formを選ぶとこのHostが受け付ける最小の設定が入り、設定が参照するリソースは名前で選べます。受け付けるまでは何も送信されません。各Workerの公開先と稼働中かどうかも表示されます。コンソールはこのリポジトリからビルドする静的アプリで、APIと並ぶ別のオリジンで配信します。",
+      "コンソールでも、同じリソースをブラウザーから作成できます。Formを選ぶとこのHostが受け付ける最小の設定が入り、設定が参照するリソースは名前で選べます。「受け付ける」を押すまで、何も送信されません。各Workerの公開先と稼働中かどうかも表示されます。コンソールはこのリポジトリからビルドする静的アプリで、APIと並ぶ別のオリジンで配信します。",
     consoleSetup: "コンソールを用意する（導入手順書の手順5）",
     consoleHost: "このHostのコンソールを開く",
     shipTitle: "新しい版を出す",
     shipBody:
-      "動いているコードは書き換えられません。新しいコードと版を作り、Deploymentをその版に切り替えます。Endpointの公開先はそのままです。コンソールでは、新しい版のページの「この版を配信する」がこの更新を用意し、受け付けると送信されます。",
+      "動いているコードは書き換えられません。新しいコードと版を作り、Deploymentをその版に切り替えます。Endpointの公開先はそのままです。コンソールでは、新しい版が稼働中になったら、そのページで「この版を配信する」を押すとこの更新が用意され、「更新を受け付ける」を押すと送信されます。",
     shipBundle:
       "新しいworker.jsを、そのmanifestのURLとSHA-256で指定します（Hostに保持させた場合は、先にHostを再起動します）。",
     shipVersion: "新しいWorkerBundleとfetchハンドラーを組み合わせた版です。",
