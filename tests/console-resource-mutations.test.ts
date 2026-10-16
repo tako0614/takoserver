@@ -1077,6 +1077,19 @@ test("a WorkerCronTrigger stuck on the Worker is not something to wait for", asy
       .all()
       .some((node) => node.tag === "button" && node.textContent === "Record the Deployment"),
   ).toBe(false);
+  // Its delete does not read the Worker, so that one is worth waiting for.
+  const deleting = await detailPage(
+    () => unrecordedWorker,
+    [servingDeployment],
+    [servingDeployment, publishedEndpoint, { ...trigger, phase: "deleting" }],
+  );
+  expect(deleting.body.textContent).toContain("hello-cron is in progress. Wait until it finishes");
+  expect(deleting.body.textContent).not.toContain("cannot finish until this Worker records");
+  expect(
+    deleting.body
+      .all()
+      .some((node) => node.tag === "button" && node.textContent === "Record the Deployment"),
+  ).toBe(false);
 });
 
 test("a Worker that still names an earlier Deployment is out of date too", async () => {

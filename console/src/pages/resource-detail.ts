@@ -349,9 +349,12 @@ function recordDeploymentNotice(organizationId: string, worker: ResourceSummary)
     const inProgress = referrers.filter((entry) =>
       ["Pending", "Deleting"].includes(health(entry).phase),
     );
-    // A WorkerCronTrigger cannot settle while its Worker has not recorded the
-    // Deployment, so it is not something to wait for.
-    const stuck = inProgress.filter((entry) => WORKER_CRON_TRIGGER.test(entry.form));
+    // A WorkerCronTrigger's create or update cannot settle while its Worker
+    // has not recorded the Deployment, so it is not something to wait for. Its
+    // delete does not read the Worker, and finishes.
+    const stuck = inProgress.filter(
+      (entry) => WORKER_CRON_TRIGGER.test(entry.form) && health(entry).phase === "Pending",
+    );
     const busy = inProgress.filter((entry) => !stuck.includes(entry));
     const unpublished = referrers.filter(
       (entry) =>
