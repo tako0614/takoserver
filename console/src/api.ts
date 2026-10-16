@@ -185,13 +185,6 @@ export interface FormRef {
 
 export type ResourceSummary = V2Resource;
 
-export interface Operation {
-  readonly id: string;
-  readonly operation: string;
-  readonly state: string;
-  readonly createdAt: string;
-}
-
 /** Durable accepted v2 Operation, distinct from control-plane history. */
 export type ResourceOperation = V2Operation;
 
@@ -858,12 +851,6 @@ export function createApi(options: ApiOptions) {
         throw new ApiError("invalid_response", status, path);
       return payload;
     },
-
-    operations: (organizationId: string) =>
-      call<{ operations: readonly Operation[] }>(
-        "GET",
-        `/v1/organizations/${encodeURIComponent(organizationId)}/operations`,
-      ),
   };
 }
 
