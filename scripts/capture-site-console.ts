@@ -9,7 +9,7 @@
  * credential or real Host is used. Requires /usr/bin/google-chrome.
  *
  * Writes site/screens/console-{desktop,tablet,mobile}-{light,dark}-{en,ja}.webp.
- * Desktop is the whole 1200 x 750 viewport; tablet is 820 x 700, a tablet's
+ * Desktop is the whole 1200 x 750 viewport; tablet is 820 x 740, a tablet's
  * portrait width, which the page shows between phone and desktop widths so
  * the Console is not shrunk to two thirds there; mobile is 390 x 780, a
  * phone's width, so its text stays legible in the page. All are captured at
@@ -202,7 +202,7 @@ try {
   for (const locale of ["en", "ja"] as const) {
     for (const [shape, width, height] of [
       ["desktop", 1200, 750],
-      ["tablet", 820, 700],
+      ["tablet", 820, 740],
       ["mobile", 390, 780],
     ] as const) {
       for (const theme of ["light", "dark"] as const) {

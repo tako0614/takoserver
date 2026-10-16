@@ -117,7 +117,7 @@ describe("Takoserver public site", () => {
     // Between phone and desktop widths the page shows the Console at a tablet's
     // width rather than shrinking the desktop capture.
     expect(english).toContain(
-      '<source media="(max-width: 1100px) and (prefers-color-scheme: dark)" srcset="/screens/console-tablet-dark-en.webp" data-locale-srcset="/screens/console-tablet-dark-{lang}.webp" width="1640" height="1400">',
+      '<source media="(max-width: 1100px) and (prefers-color-scheme: dark)" srcset="/screens/console-tablet-dark-en.webp" data-locale-srcset="/screens/console-tablet-dark-{lang}.webp" width="1640" height="1480">',
     );
     expect(english.indexOf("console-mobile-light")).toBeLessThan(
       english.indexOf("console-tablet-dark"),
