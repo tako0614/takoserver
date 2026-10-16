@@ -291,7 +291,7 @@ chmod 0755 /usr/local/bin/takoserver-run
 
 Then install the systemd unit that runs the wrapper. Its `[Service]` section
 is the one [Self-host security](self-host-security.md#recommended-os-hardening)
-explains, option by option. The repository's tests do not run this unit, so
+explains, option by option; keep the two the same. The repository's tests do not run this unit, so
 check `systemctl status takoserver.service` after the first start. As root:
 
 ```sh
@@ -308,6 +308,8 @@ Group=takoserver
 WorkingDirectory=/opt/takoserver
 # Sources /etc/takoserver/takoserver.env and passes the v2 config file.
 ExecStart=/usr/local/bin/takoserver-run
+# Stop signals the Host alone; it stops its own workerd children in order.
+KillMode=mixed
 StateDirectory=takoserver
 StateDirectoryMode=0700
 Environment=TAKOSERVER_DATA_ROOT=/var/lib/takoserver
@@ -339,9 +341,9 @@ EOF
 systemctl daemon-reload
 ```
 
-Do not start it yet: step 4 gets the certificate first. From here on, stopping
-and starting the Host means `systemctl stop takoserver.service` and
-`systemctl start takoserver.service`, run as root in an administrator shell.
+Do not start it yet: step 4 gets the certificate first. From here on,
+stopping, starting and restarting the Host mean `systemctl stop`, `start` and
+`restart takoserver.service`, run as root in an administrator shell.
 
 Linux passes at most 131,072 bytes in one environment variable, including its
 name. Each held file adds about 370 bytes to the config, so a config holds
@@ -491,7 +493,7 @@ As root, start the Host and follow its log:
 
 ```sh
 systemctl enable --now takoserver.service
-journalctl -u takoserver.service -f
+journalctl -u takoserver.service -n 200 -f
 ```
 
 The first boot creates the control database and signing keys under the data

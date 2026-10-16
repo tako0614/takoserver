@@ -139,7 +139,9 @@ behaviour exactly.
    services. That user should own the data root (mode 0700) and nothing else
    of value. Keep credentials of unrelated systems off the machine.
 2. **Run it under systemd with hardening options.** The unit below is a
-   starting point. The repository's tests do not run it, so check it against
+   starting point; [Self-host operations step 3](self-host-operations.md#3-configuration)
+   installs it with `[Unit]` and `[Install]` sections, and the two copies should
+   stay the same. The repository's tests do not run it, so check it against
    your own configuration before relying on it:
 
    ```ini
@@ -150,6 +152,8 @@ behaviour exactly.
    WorkingDirectory=/opt/takoserver
    # Sources /etc/takoserver/takoserver.env and passes the v2 config file.
    ExecStart=/usr/local/bin/takoserver-run
+   # Stop signals the Host alone; it stops its own workerd children in order.
+   KillMode=mixed
    StateDirectory=takoserver
    StateDirectoryMode=0700
    Environment=TAKOSERVER_DATA_ROOT=/var/lib/takoserver
