@@ -1,35 +1,43 @@
 # Docker and Compose self-host
 
-The opt-in private Docker supply wiring and unpublished portable Container
-qualification are documented in [Container Docker candidate](container-docker-candidate.md).
+This runs the Host's API, operator sign-in, organizations and API keys in one
+container on `127.0.0.1:8787`, with its SQLite state in a Docker volume. It also
+serves the artifact Forms that keep Worker code, static files and SQL
+migrations. It runs no Workers: the image has no workerd or Workflow execution
+guard. For those, follow
+[First install and first use](self-host-operations.md#first-install-and-first-use).
 
-This target packages the Bun artifact/control API profile described in
-[self-host operations](self-host-operations.md#first-install-and-first-use).
-It starts the v2 Host API, operator sign-in, organizations, and API keys with
-local SQLite state. Configured artifact Forms retain bytes. The image does not
-include the pinned closed-graph workerd or the Workflow execution guard, so it
-does not advertise Worker execution or Worker endpoints. Follow the complete
-local Worker profile in that guide if you need those capabilities.
+You need git, Docker Engine with Compose 2.30 or later (`docker compose
+version`; the Compose file uses raw env-file values), python3, curl and jq. Get
+the source, check out a reviewed commit or release tag, and run every command
+below from that directory:
 
-Use a reviewed source commit, Docker Engine, and Docker Compose 2.30 or later
-(the Compose file uses raw env-file values). The base image pins Bun 1.4.0,
-matching `.bun-version`, and its registry digest. Dependencies come from the
-frozen lockfile. Only source, its committed pricing configuration and frozen
-provider reference corpus, the lockfile/package manifest, the license, and
-the operator/artifact CLIs enter the build context; local credentials and data
-are excluded. The image runs as UID/GID 1000 and keeps its data root mode 0700.
+```sh
+git clone https://github.com/tako0614/takoserver
+cd takoserver
+git checkout --detach <reviewed-commit>
+```
 
 ## Configure and start
 
-Build from the reviewed checkout:
+Build the image:
 
 ```sh
 docker build -t takoserver-selfhost:local .
 ```
 
-Keep all three required settings in a private file outside the checkout. This
-Python example creates a new file without overwriting an existing cursor key;
-replace the example HTTPS origin and documentation URLs before running it:
+The base image pins Bun 1.4.0, matching `.bun-version`, by its registry digest,
+and dependencies come from the frozen lockfile. Only the source, its committed
+pricing configuration, the vendored Takoform v2.1.1 reference files, the
+lockfile and package manifest, the licence and the operator and artifact CLIs
+enter the build context; local credentials and data stay out. The image runs as
+UID/GID 1000 and keeps its data root at mode 0700.
+
+Keep the three required settings in a private file outside the checkout. This
+Python example creates a new file without overwriting an existing cursor key.
+For a local look the example origin works as it is; for real use, replace it and
+the documentation URLs with your own, and use your host in the `Host` headers
+below:
 
 ```sh
 export TAKOSERVER_ENV_FILE="$HOME/.config/takoserver/docker.env"
@@ -49,20 +57,30 @@ with os.fdopen(fd, "w") as out:
     out.write("TAKOSERVER_TAKOFORM_V2_CONFIG=" + json.dumps(config, separators=(",", ":")) + "\n")
     out.write("TAKOSERVER_TAKOFORM_V2_CURSOR_KEY=" + secrets.token_urlsafe(32) + "\n")
 PY
+printf 'TAKOSERVER_ENV_FILE=%s\n' "$TAKOSERVER_ENV_FILE" > .env
 docker compose up -d --no-build
 ```
 
+Every `docker compose` command reads `TAKOSERVER_ENV_FILE`. The `.env` file in
+the checkout, which git and the image build both ignore, keeps it set for new
+shells.
+
 The image listens on `0.0.0.0:8787` inside the container. Compose publishes
 only `127.0.0.1:8787` on the host; `TAKOSERVER_HTTP_PORT` changes that host port.
-Place an operator-controlled HTTPS proxy in front of it using the configured
-public origin, as described in
-[control API ingress](self-host-operations.md#4-https-and-tcp-443). A proxy on the
+For real use, place an operator-controlled HTTPS proxy in front of it for the
+configured public origin, as in
+[control API ingress](self-host-operations.md#4-https-and-tcp-443) (in Docker,
+nothing holds TCP 443 for Workers, so the proxy may use it). A proxy on the
 same host can reach the loopback port. A proxy in another container needs an
 explicit private network connecting it to this service. Do not publish the
 plaintext backend on a public interface.
 
-The named `takoserver-data` volume persists `/var/lib/takoserver`, including
-SQLite, operator/signing keys, and stored artifacts. Keep the env file and its
+Compose keeps `/var/lib/takoserver` (SQLite, the operator and signing keys and
+stored artifacts) in a volume named `<project>_takoserver-data`, where
+`<project>` is the checkout directory's name: `takoserver_takoserver-data` for a
+clone named `takoserver`. Run every `docker compose` command from that directory,
+or pass the same `-p <project>`; from another directory Compose starts a new,
+empty installation. Keep the env file and its
 cursor key stable across restarts and updates. Do not set `TAKOSERVER_DB` or
 `TAKOSERVER_DATA_ROOT` outside that mount. A bind mount is also possible if its
 short absolute path and ancestry satisfy the operations guide, and its data
@@ -70,10 +88,11 @@ directory is owned by UID/GID 1000 with mode 0700. Run only one Host per data
 volume.
 
 To use Docker directly instead of Compose, choose a fresh dedicated name and
-volume:
+volume. The rest of this guide uses Compose; with `docker run`, use
+`docker exec takoserver-selfhost` where it says `docker compose exec takoserver`.
 
 ```sh
-docker run -d --init --name takoserver-selfhost \
+docker run -d --init --stop-timeout 30 --name takoserver-selfhost \
   --env-file "$TAKOSERVER_ENV_FILE" \
   -p 127.0.0.1:8787:8787 \
   --mount type=volume,source=takoserver-selfhost-data,target=/var/lib/takoserver \
@@ -82,58 +101,101 @@ docker run -d --init --name takoserver-selfhost \
 
 ## Health and first use
 
+Wait until `docker compose ps` shows the service as `healthy` (the first start
+can take up to 30 seconds), then check it:
+
 ```sh
+docker compose ps
 curl --fail --silent --show-error http://127.0.0.1:8787/_takoserver/health/live
 curl --fail --silent --show-error http://127.0.0.1:8787/_takoserver/health/ready
 curl --fail --silent --show-error -H 'Host: api.example.com' \
   http://127.0.0.1:8787/.well-known/takoform/v2
-docker compose ps
 ```
 
-The Docker health check uses the read-only readiness probe. A healthy control
-API does not prove Worker execution, public HTTPS, or application readiness.
-See [health and readiness](self-host-operations.md#9-verify).
-Discovery and product API requests must carry the configured public-origin
-Host header; a direct request using the loopback Host is refused with 421.
+The health check uses the read-only readiness probe; a healthy API does not
+prove public HTTPS or application readiness. See
+[Monitoring](self-host-operations.md#monitoring). Host API v2 requests must carry
+the configured public origin's host in the `Host` header; on the loopback port
+without it, v2 answers 421.
 
-On first boot without an identity provider, the Host writes a single-use
-operator assertion to container logs. Treat those logs as credentials and
-inspect them only in a private operator session. Later, mint an assertion with
-the bundled CLI and this installation's operator key:
+Then sign in, create an organization and a read-only API key, and ask the Host
+which Forms it serves. The first boot created the operator key, so you can mint
+a single-use sign-in assertion with it at once (the first boot also writes one
+to the container logs, which you do not need). These requests use the loopback
+port with the public origin's host as the `Host` header, as
+`bun run test:selfhost-docker` does; for real use, send them through your HTTPS
+origin.
 
 ```sh
-docker compose exec -T \
-  -e TAKOSERVER_OPERATOR_KEY=/var/lib/takoserver/operator-key.jwk \
-  takoserver bun --no-env-file scripts/operator-key.ts \
-  sign-in google operator operator@localhost Operator
+B=http://127.0.0.1:8787
+H='Host: api.example.com'   # the host of TAKOSERVER_PUBLIC_ORIGIN
+ASSERTION=$(docker compose exec -T \
+    -e TAKOSERVER_OPERATOR_KEY=/var/lib/takoserver/operator-key.jwk takoserver \
+    bun --no-env-file scripts/operator-key.ts sign-in google operator operator@localhost Operator)
+SESSION=$(jq -n --arg assertion "$ASSERTION" \
+    '{provider: "google", method: "operator-assertion", $assertion}' |
+  curl -sS --fail-with-body -H "$H" -H 'content-type: application/json' \
+    --data @- "$B/v1/sessions" | jq -r .sessionToken)
+ORG=$(curl -sS --fail-with-body -H "$H" -H "authorization: Bearer $SESSION" \
+    -H 'content-type: application/json' --data '{"name":"My organization"}' \
+    "$B/v1/organizations" | jq -r .organization.id)
+KEY=$(curl -sS --fail-with-body -H "$H" -H "authorization: Bearer $SESSION" \
+    -H 'content-type: application/json' \
+    --data '{"name":"look around","scopes":["resources:read"],"expiresInSeconds":86400}' \
+    "$B/v1/organizations/$ORG/api-keys" | jq -r .secret)
+for form in WorkerBundle/0.2.0 ModuleWorker/0.3.0; do
+  curl -sS --fail-with-body -G -H "$H" -H "authorization: Bearer $KEY" \
+    --data-urlencode "form=https://edge.forms.takoform.com/forms/$form/" \
+    "$B/apis/forms.takoform.com/v2/support" | jq -c '{form, supported}'
+done
 ```
 
-This command prints a credential. Use it in the session exchange, organization,
-and API-key steps of
-[first boot and operator sign-in](self-host-operations.md#5-first-boot-and-operator-sign-in),
-through your external HTTPS origin. Keep assertions and API keys out of shared
-logs and shell history. Do not dump `docker inspect` or `docker compose config`:
-the container environment contains the cursor key. There is no `/console` page
-in this image; use a separately configured console or the documented API steps.
+`WorkerBundle` reports `supported: true` and `ModuleWorker` `false`: this image
+keeps artifacts and runs no Workers. Keep the assertion, session and key out of
+shared logs and shell history, and treat the container logs as credentials. Do
+not dump `docker inspect` or `docker compose config`: the container environment
+holds the cursor key. This image serves no console page; a console needs the API
+behind HTTPS on the same site (see
+[step 5 of the install guide](self-host-operations.md#5-first-boot-and-operator-sign-in)).
 
-The artifact CLI is included too. Stop the service before seeding held bytes,
-then run `bun --no-env-file scripts/selfhost-artifact.ts` in a one-off container
-with the same volume and private configuration. Follow the operations guide's
-stopped-Host proof and artifact/configuration procedure; the image's working
-directory is `/opt/takoserver`.
+An artifact Form create names an exact HTTPS URL and SHA-256 of a manifest, and
+the Host fetches a public HTTPS URL itself; a key with `resources:write` sends
+it as in [step 8 of the install guide](self-host-operations.md#8-create-and-serve-a-worker).
+Seeding held artifacts from local files
+([step 6](self-host-operations.md#6-seed-held-artifacts)) needs the stopped-Host
+check that guide describes, and is not covered for Docker yet.
 
 ## Stop, update, and verify
 
 `docker compose stop` sends the Host a graceful shutdown signal, with 30
-seconds before Docker's deadline. It preserves the container and data volume.
-Before updating, follow the operations guide's cold backup procedure for the
-whole stopped data volume and external env file. Retain the previous image ID
-and record the new source commit and `docker image inspect --format '{{.Id}}'
-result. Startup can apply forward SQLite migrations: reverting only the image
-is not a safe rollback after a schema change. Restore the matching cold backup
-and its configuration as described in
-[update and recovery](self-host-operations.md#update-and-code-rollback). Never use `down -v` or
-Docker pruning against an installation you intend to keep.
+seconds before Docker's deadline. It keeps the container and the data volume.
+Never use `docker compose down -v` or Docker pruning on an installation you
+keep.
+
+To update, in the same checkout directory:
+
+1. Stop the Host and copy the stopped volume and the env file somewhere
+   private. Startup can apply forward SQLite migrations, so this copy is the
+   way back. For example:
+
+   ```sh
+   docker compose stop
+   docker run --rm --entrypoint tar \
+     -v takoserver_takoserver-data:/var/lib/takoserver:ro takoserver-selfhost:local \
+     -C /var/lib/takoserver -cpf - . > "takoserver-data-$(date +%F).tar"
+   cp "$TAKOSERVER_ENV_FILE" "takoserver-env-$(date +%F)"
+   docker image inspect --format '{{.Id}}' takoserver-selfhost:local
+   ```
+
+   Use your own `<project>_takoserver-data` name, and keep both copies private.
+   Note the image ID the last command prints: it is the image to go back to.
+2. Check out the new reviewed commit, rebuild with
+   `docker build -t takoserver-selfhost:local .`, and start it with
+   `docker compose up -d --no-build`.
+3. Rerun the health, discovery and support checks above.
+
+Going back means restoring that copy into a fresh volume and starting the
+previous image with it, not reverting only the image.
 
 Run the explicit local regression check from the checkout with Bun installed:
 
@@ -150,3 +212,8 @@ It prints no credentials or container logs. The check stops its own containers
 and retains them, their volumes, and its image for inspection; it does not
 remove or touch existing resources. The canonical quality workflow runs this
 check separately from the portable `bun run check` gate.
+
+## Related
+
+The opt-in private Docker supply wiring and unpublished portable Container
+qualification are documented in [Container Docker candidate](container-docker-candidate.md).
