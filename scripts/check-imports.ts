@@ -59,6 +59,12 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "v2-private"],
   },
   {
+    // Fixed Container SQL compiler; its acceptance edge is pinned below.
+    name: "v2-container-owner-schema",
+    match: /^src\/takoform-v2\/container-owner-schema\.ts$/u,
+    may: ["core"],
+  },
+  {
     name: "worker-endpoint-origin-v2-acceptance-composition",
     match: /^src\/worker-endpoint-origin-v2-acceptance\.ts$/u,
     may: ["core", "domain", "v2-contract"],
@@ -673,6 +679,13 @@ for (const path of walk("src")) {
         "src/takoform-v2/application.ts",
         "src/worker-endpoint-origin-v2-acceptance.ts",
       ].includes(path);
+    const exactContainerHostAcceptanceEdge =
+      path === "src/takoform-v2/container-owner-schema.ts" &&
+      target === "src/takoform-v2/host-acceptance.ts" &&
+      localImportsOf(path).filter((candidate) => candidate === target).length === 1 &&
+      /^import\s*\{\s*prepareV2HostAcceptance\s*,\s*type\s+V2HostAcceptance\s*,\s*type\s+V2HostAcceptanceContext\s*,?\s*\}\s*from\s+["']\.\/host-acceptance\.ts["'];$/mu.test(
+        readFileSync(path, "utf8"),
+      );
     // This fixed receiver reuses only the owning Deployment parser/error.
     // No general v2-form edge, re-export, namespace or dynamic import is allowed.
     const exactOriginDeploymentParserEdge =
@@ -789,6 +802,7 @@ for (const path of walk("src")) {
     if (
       !layer.may.includes(targetLayer.name) &&
       !exactHostAcceptanceEdge &&
+      !exactContainerHostAcceptanceEdge &&
       !exactOriginDeploymentParserEdge &&
       !exactWorkerEndpointOriginConstructionEdge &&
       !exactOriginPublicationExtensionEdge &&
@@ -1146,12 +1160,13 @@ function importsOf(path: string): readonly string[] {
     .filter((specifier): specifier is string => specifier !== undefined);
 }
 
-/** The SQL mint has one concrete source owner; it is not a Host/Form writer hook. */
+/** Only fixed SQL compilers may mint; Host/Form hooks cannot supply statements. */
 function checkHostAcceptanceImports(path: string): void {
   const source = readFileSync(path, "utf8");
   const owners = [
     "src/takoform-v2/host-acceptance.ts",
     "src/worker-endpoint-origin-v2-acceptance.ts",
+    "src/takoform-v2/container-owner-schema.ts",
   ];
   if (
     path !== "scripts/check-imports.ts" &&
@@ -1159,7 +1174,7 @@ function checkHostAcceptanceImports(path: string): void {
     !owners.includes(path)
   ) {
     violations.push(
-      `${path}: prepared Host acceptance mint belongs only to the fixed origin compiler`,
+      `${path}: prepared Host acceptance mint belongs only to fixed source compilers`,
     );
   }
   const target = "src/takoform-v2/host-acceptance.ts";
@@ -1175,7 +1190,7 @@ function checkHostAcceptanceImports(path: string): void {
     named.some((value) => /\bprepareV2HostAcceptance\b/u.test(value[1] ?? ""))
   )
     violations.push(
-      `${path}: prepared Host acceptance mint import is private to its fixed compiler`,
+      `${path}: prepared Host acceptance mint import is private to fixed source compilers`,
     );
   if (named.length !== references.length) {
     violations.push(
