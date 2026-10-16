@@ -98,7 +98,8 @@ const landingMessages = {
     shipTitle: "Ship a new version",
     shipBody:
       "Code never changes in place. Create the new code and a version for it, then point the Deployment at that version; the Endpoint keeps its address.",
-    shipBundle: "holds the new worker.js, by the URL and SHA-256 of its manifest.",
+    shipBundle:
+      "holds the new worker.js, by the URL and SHA-256 of its manifest (a seeded bundle needs a Host restart first).",
     shipVersion: "pairs the new WorkerBundle with its fetch handler.",
     shipDeploy:
       "is updated to serve hello-version-v2 at weight 10000. The update names the generation it read, so a change made in between is not overwritten.",
@@ -166,13 +167,14 @@ const landingMessages = {
     afterTitle: "デプロイしたあと",
     consoleTitle: "コンソールで確かめる",
     consoleBody:
-      "コンソールには、各Workerの公開先と稼働中かどうか、各リソースの宣言した内容とHostが最後に観測した状態が表示されます。コンソールはこのリポジトリからビルドする静的アプリで、APIと並ぶ別のoriginで配信します。",
+      "コンソールには、各Workerの公開先と稼働中かどうか、各リソースの宣言した内容とHostが最後に観測した状態が表示されます。コンソールはこのリポジトリからビルドする静的アプリで、APIと並ぶ別のオリジンで配信します。",
     consoleSetup: "コンソールを用意する（導入手順書の手順5）",
     consoleHost: "このHostのコンソールを開く",
     shipTitle: "新しい版を出す",
     shipBody:
-      "コードはその場では変わりません。新しいコードとその版を作り、Deploymentをその版に向けます。Endpointの公開先はそのままです。",
-    shipBundle: "新しいworker.jsを、そのmanifestのURLとSHA-256で指定します。",
+      "動いているコードは書き換えられません。新しいコードと版を作り、Deploymentをその版に切り替えます。Endpointの公開先はそのままです。",
+    shipBundle:
+      "新しいworker.jsを、そのmanifestのURLとSHA-256で指定します（Hostに保持させた場合は、先にHostを再起動します）。",
     shipVersion: "新しいWorkerBundleとfetchハンドラーを組み合わせた版です。",
     shipDeploy:
       "hello-version-v2を重み10000で配信するよう更新します。更新は読み取った世代を指定するので、その間に入った別の変更を上書きしません。",
@@ -347,6 +349,7 @@ pre .out { color: var(--accent); }
 .after .chips code { font-size: 12px; border-radius: 8px; }
 .after pre { margin-top: 16px; }
 .after .chain { margin-top: 16px; }
+.after .chain p { margin: 2px 0 0; font-size: 14px; }
 .actions.start { justify-content: flex-start; }
 .after .actions { margin-top: 20px; }
 
@@ -365,7 +368,7 @@ footer { display: flex; align-items: center; justify-content: space-between; fle
 
 @media (min-width: 761px) and (max-width: 1100px) { .preview .frame { max-width: 848px; margin-inline: auto; } }
 /* Below desktop width the code beside each list would scroll sideways, so the columns stack. */
-@media (max-width: 1200px) { .deploy, .host { grid-template-columns: minmax(0, 1fr); gap: 24px; } }
+@media (max-width: 1200px) { .deploy, .host, .after { grid-template-columns: minmax(0, 1fr); gap: 24px; } }
 @media (max-width: 760px) {
   .shell { width: calc(100% - 32px); }
   .top { height: 72px; }
@@ -398,7 +401,11 @@ export function landingHtml(options: LandingOptions): string {
   const siteAssets = options.apiOrigin !== null;
   // Commands target the reader's own Host. On the public site that is $HOST;
   // the API's own root fills in the origin it was read from.
-  const commandOrigin = siteAssets ? "$HOST" : `<span data-origin>$HOST</span>`;
+  // On the public site the request uses the guide's $V2; a Host's own root
+  // page fills in the origin it was read from.
+  const shipTarget = siteAssets
+    ? "$V2/resources"
+    : `<span data-origin>$HOST</span>/apis/forms.takoform.com/v2/resources`;
   const text = (key: keyof typeof copy, tag = "span", attributes = "") =>
     `<${tag}${attributes} data-i18n="${key}">${copy[key]}</${tag}>`;
   const screen = (shape: "desktop" | "tablet" | "mobile", theme: "light" | "dark") =>
@@ -558,10 +565,16 @@ ${text("afterTitle", "h2", ' id="after-title"')}
 <ol class="chain">
 <li><strong>WorkerBundle 0.2.0 <span>hello-bundle-v2</span></strong>${text("shipBundle", "p")}</li>
 <li><strong>WorkerVersion 0.5.0 <span>hello-version-v2</span></strong>${text("shipVersion", "p")}</li>
-<li><strong>WorkerDeployment <span>hello-deployment</span></strong>${text("shipDeploy", "p")}</li>
+<li><strong>WorkerDeployment 0.4.0 <span>hello-deployment</span></strong>${text("shipDeploy", "p")}</li>
 </ol>
-<pre>PUT ${commandOrigin}/apis/forms.takoform.com/v2/resources/&lt;Deployment UID&gt;
-takoform-expected-generation: &lt;the generation it read&gt;</pre>
+<pre>PUT ${shipTarget}/&lt;Deployment UID&gt;
+idempotency-key: &lt;a new key&gt;
+takoform-expected-generation: &lt;the generation it read&gt;
+
+{"spec": {
+  "worker": {"resourceUid": "&lt;hello UID&gt;"},
+  "versions": [{"workerVersion": {"resourceUid": "&lt;hello-version-v2 UID&gt;"},
+                "weight": 10000}]}}</pre>
 <p class="more"><a href="${SHIP_STEPS}" data-i18n="shipMore">${copy.shipMore}</a><a href="${V2_REFERENCE}" data-i18n="reference">${copy.reference}</a></p></div>
 </div>
 </section>

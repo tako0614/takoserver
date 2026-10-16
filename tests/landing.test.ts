@@ -121,13 +121,16 @@ describe("Takoserver public site", () => {
     const order = [
       "WorkerBundle 0.2.0 <span>hello-bundle-v2",
       "WorkerVersion 0.5.0 <span>hello-version-v2",
-      "WorkerDeployment <span>hello-deployment",
+      "WorkerDeployment 0.4.0 <span>hello-deployment",
     ].map((step) => after.indexOf(step));
     expect(order.every((index) => index > 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
+    // The request uses the guide's $V2 and carries both headers an update needs.
     expect(after).toContain(
-      "PUT $HOST/apis/forms.takoform.com/v2/resources/&lt;Deployment UID&gt;\ntakoform-expected-generation:",
+      "PUT $V2/resources/&lt;Deployment UID&gt;\nidempotency-key: &lt;a new key&gt;\ntakoform-expected-generation:",
     );
+    expect(after).toContain('"weight": 10000');
+    expect(after).not.toContain("$HOST");
     expect(after).toContain("docs/self-host-operations.md#9-verify");
     for (const path of ["/openapi.json", "/.well-known/takoform/v2", "/.well-known/takoserver"]) {
       expect(html).toContain(`href="https://api.takoserver.example${path}"`);
