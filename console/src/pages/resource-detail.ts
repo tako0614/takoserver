@@ -1,7 +1,13 @@
 import type { ResourceSummary } from "../api.ts";
 import { ApiError } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
-import { valueAt, WORKER_DEPLOYMENT, WORKER_VERSION } from "../form-specs.ts";
+import {
+  acceptsChanges,
+  valueAt,
+  WORKER_DEPLOYMENT,
+  WORKER_VERSION,
+  withValueAt,
+} from "../form-specs.ts";
 import { formLabel } from "../forms.ts";
 import { tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
@@ -34,7 +40,13 @@ export function resourceDetailPage(organizationId: string, uid: string): Child {
         for: found,
         action:
           found.form === WORKER_VERSION
-            ? { toolbar: serveVersionAction(organizationId, found), notice: null }
+            ? {
+                toolbar: [
+                  serveVersionAction(organizationId, found),
+                  newVersionAction(organizationId, found),
+                ],
+                notice: null,
+              }
             : MODULE_WORKER.test(found.form)
               ? { toolbar: null, notice: recordDeploymentNotice(organizationId, found) }
               : { toolbar: null, notice: null },
@@ -173,11 +185,19 @@ function body(
           icon(ICON.refresh, 14),
           text(tr("再読み込み", "Reload")),
         ),
-        h(
-          "button",
-          { class: "btn", type: "button", onClick: () => updateResource(organizationId, found) },
-          tr("更新", "Update"),
-        ),
+        // The Host refuses every change to a version or an artifact, so
+        // there is nothing to update; a new one is created instead.
+        acceptsChanges(found.form)
+          ? h(
+              "button",
+              {
+                class: "btn",
+                type: "button",
+                onClick: () => updateResource(organizationId, found),
+              },
+              tr("更新", "Update"),
+            )
+          : null,
         h(
           "button",
           {
@@ -410,6 +430,42 @@ function recordDeploymentNotice(organizationId: string, worker: ResourceSummary)
       next,
     );
   });
+}
+
+/** Where a WorkerVersion names its code: a bundle, static assets, or both. */
+const CODE_PATHS: readonly (readonly string[])[] = [
+  ["bundle", "resourceUid"],
+  ["assets", "bundle", "resourceUid"],
+];
+
+/**
+ * On a WorkerVersion's page: start the next version from this one. A version
+ * cannot be changed, so shipping new code means a new version; it keeps this
+ * one's handlers, vars and Bindings, and leaves its code to be chosen.
+ */
+function newVersionAction(organizationId: string, version: ResourceSummary): Child {
+  const spec = CODE_PATHS.reduce<Record<string, unknown>>(
+    (next, path) =>
+      valueAt(next, path) === undefined ? next : (withValueAt(next, path, "") ?? next),
+    structuredClone(version.spec),
+  );
+  return h(
+    "button",
+    {
+      class: "btn",
+      type: "button",
+      onClick: () =>
+        createResource(organizationId, {
+          form: version.form,
+          spec,
+          note: tr(
+            `版は変更できないため、${version.name}の設定（ハンドラー・変数・バインディングを含む）から新しい版を作成します。新しいコードを選び、名前を付けて受け付けてください。その後、新しい版のページから配信できます。`,
+            `A version cannot be changed, so this creates a new one from ${version.name}'s spec, with its handlers, vars and Bindings. Choose its new code, name it, then accept; you can then serve it from its page.`,
+          ),
+        }),
+    },
+    tr("この版から新しい版を作る", "New version from this one"),
+  );
 }
 
 /** Whether a Deployment's versions are exactly this one version at weight 10000. */

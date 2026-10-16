@@ -1110,6 +1110,48 @@ test("a Worker that still names an earlier Deployment is out of date too", async
   button(body, "Record the Deployment");
 });
 
+test("a version's page starts the next version from it, with its code left to choose", async () => {
+  const withCode: ResourceSummary = {
+    ...helloV2,
+    spec: {
+      worker: { resourceUid: "uid-worker" },
+      bundle: { resourceUid: "uid-bundle" },
+      handlers: ["fetch"],
+      sqliteBindings: [{ name: "DB", resource: { resourceUid: "uid-db" } }],
+    },
+  };
+  const { body, writes } = await versionPage([], withCode);
+  // A version cannot be changed, so there is nothing to update.
+  expect(body.all().some((node) => node.tag === "button" && node.textContent === "Update")).toBe(
+    false,
+  );
+  button(body, "New version from this one").click();
+  await settle();
+  expect(body.textContent).toContain(
+    "A version cannot be changed, so this creates a new one from hello-v2's spec, with its handlers, vars and Bindings.",
+  );
+  const [form] = body.all().filter((node) => node.tag === "select");
+  expect(form?.value).toBe(versionForm);
+  const spec = body.all().find((node) => node.tag === "textarea");
+  expect(JSON.parse(spec?.value ?? "{}")).toEqual({
+    worker: { resourceUid: "uid-worker" },
+    bundle: { resourceUid: "" },
+    handlers: ["fetch"],
+    sqliteBindings: [{ name: "DB", resource: { resourceUid: "uid-db" } }],
+  });
+  expect(writes).toHaveLength(0);
+});
+
+test("a Resource that can change keeps its Update", async () => {
+  const { body } = await detailPage(() => servingDeployment, [servingDeployment]);
+  button(body, "Update");
+  expect(
+    body
+      .all()
+      .some((node) => node.tag === "button" && node.textContent === "New version from this one"),
+  ).toBe(false);
+});
+
 test("a Deployment serves one version only when its single entry is that version at 10000", async () => {
   const { servesOnly } = await import("../console/src/pages/resource-detail.ts");
   expect(servesOnly([{ weight: 10000, workerVersion: { resourceUid: "v" } }], "v")).toBe(true);
