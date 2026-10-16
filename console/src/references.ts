@@ -1,13 +1,32 @@
 import type { ResourceSummary } from "./api.ts";
 
 export interface SpecReference {
-  /** Where the spec names it: `bundle`, `sqliteBindings · DB`, `versions[0] · workerVersion`. */
+  /**
+   * Where the spec names it, as the spec reads: `bundle`,
+   * `versions[0].workerVersion`, or for a Binding its list and the name the
+   * Worker reaches it by, `sqliteBindings · DB`.
+   */
   readonly path: string;
   readonly uid: string;
 }
 
 /** Spec fields that hold the person's own data, never references. */
 const OPAQUE_SPEC_FIELDS = new Set(["vars"]);
+
+/** One step into a spec: a key, or a Binding's own name. */
+type Step = { readonly key: string } | { readonly name: string };
+
+function pathText(steps: readonly Step[]): string {
+  return steps
+    .map((step, index) =>
+      "name" in step
+        ? ` · ${step.name}`
+        : index === 0 || step.key.startsWith("[")
+          ? step.key
+          : `.${step.key}`,
+    )
+    .join("");
+}
 
 /**
  * Every Resource a spec names, in the order it names them. A v2 reference is
@@ -17,16 +36,14 @@ const OPAQUE_SPEC_FIELDS = new Set(["vars"]);
  */
 export function specReferences(spec: unknown): SpecReference[] {
   const found: SpecReference[] = [];
-  const walk = (value: unknown, path: readonly string[]): void => {
+  const walk = (value: unknown, path: readonly Step[]): void => {
     if (Array.isArray(value)) {
       value.forEach((entry, index) => {
         const name =
           entry && typeof entry === "object" ? (entry as { name?: unknown }).name : undefined;
         walk(
           entry,
-          typeof name === "string"
-            ? [...path, name]
-            : [...path.slice(0, -1), `${path.at(-1) ?? ""}[${index}]`],
+          typeof name === "string" ? [...path, { name }] : [...path, { key: `[${index}]` }],
         );
       });
       return;
@@ -36,13 +53,17 @@ export function specReferences(spec: unknown): SpecReference[] {
     const keys = Object.keys(record);
     if (keys.length === 1 && keys[0] === "resourceUid" && typeof record.resourceUid === "string") {
       // A Binding's `resource` key adds nothing its name has not said.
-      const shown = path.at(-1) === "resource" && path.length > 1 ? path.slice(0, -1) : path;
-      found.push({ path: shown.join(" · "), uid: record.resourceUid });
+      const last = path.at(-1);
+      const shown =
+        last && "key" in last && last.key === "resource" && path.length > 1
+          ? path.slice(0, -1)
+          : path;
+      found.push({ path: pathText(shown), uid: record.resourceUid });
       return;
     }
     for (const key of keys) {
       if (path.length === 0 && OPAQUE_SPEC_FIELDS.has(key)) continue;
-      walk(record[key], [...path, key]);
+      walk(record[key], [...path, { key }]);
     }
   };
   walk(spec, []);

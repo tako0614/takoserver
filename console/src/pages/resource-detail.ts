@@ -132,7 +132,26 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
           text(" "),
           badge(phaseLabel(state.phase), state.tone, true),
         ),
-        h("p", { class: "mono", style: { overflowWrap: "anywhere" } }, found.form),
+        h(
+          "p",
+          { class: "published" },
+          httpsUrl(found.form)
+            ? h(
+                "a",
+                { href: found.form, target: "_blank", rel: "noopener noreferrer" },
+                formLabel(found.form),
+                h("span", { "aria-hidden": "true" }, " ↗"),
+                h(
+                  "span",
+                  { class: "visually-hidden" },
+                  tr(
+                    "（公開仕様、新しいタブで開きます）",
+                    " (published contract, opens in a new tab)",
+                  ),
+                ),
+              )
+            : formLabel(found.form),
+        ),
         url
           ? h(
               "p",
@@ -142,6 +161,7 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
                 { href: url, target: "_blank", rel: "noopener noreferrer" },
                 url,
                 h("span", { "aria-hidden": "true" }, " ↗"),
+                newTab(),
               ),
             )
           : null,
@@ -200,7 +220,15 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
         field("Form", copyable(found.form)),
         field(tr("世代", "Generation"), String(found.generation)),
         field(tr("観測世代", "Observed generation"), String(found.observedGeneration)),
-        field(tr("段階", "Phase"), found.phase),
+        field(
+          tr("Hostの処理", "Host work"),
+          h(
+            "span",
+            null,
+            hostWork(found.phase),
+            h("span", { class: "mono dim" }, ` · ${found.phase}`),
+          ),
+        ),
         field(
           tr("最終操作", "Last operation"),
           found.lastOperation
@@ -256,7 +284,7 @@ function referencesCard(organizationId: string, references: readonly SpecReferen
       { class: "card__body rows" },
       ...references.map((reference) =>
         field(
-          reference.path,
+          h("span", { class: "mono" }, reference.path),
           live(() => {
             const state = named.get();
             const target = state.state === "ready" ? state.value.get(reference.uid) : undefined;
@@ -306,7 +334,7 @@ function referrersCard(organizationId: string, uid: string): Child {
         ...referrers.map(({ resource: referrer, paths }) => {
           const url = publishedUrl(referrer.output);
           return field(
-            tr(`${paths.join("、")} として`, `as ${paths.join(", ")}`),
+            h("span", { class: "mono" }, paths.join(", ")),
             h(
               "span",
               { class: "ref" },
@@ -318,6 +346,7 @@ function referrersCard(organizationId: string, uid: string): Child {
                     { href: url, target: "_blank", rel: "noopener noreferrer" },
                     url,
                     h("span", { "aria-hidden": "true" }, " ↗"),
+                    newTab(),
                   )
                 : null,
             ),
@@ -328,7 +357,38 @@ function referrersCard(organizationId: string, uid: string): Child {
   });
 }
 
-function field(label: string, value: Child): Child {
+/** What the Host is doing with a Resource, for each v2 phase, as [Japanese, English]. */
+export const HOST_WORK: Readonly<Record<string, readonly [string, string]>> = {
+  pending: ["処理中", "In progress"],
+  deleting: ["削除中", "Deleting"],
+  error: ["失敗", "Failed"],
+  // Set only when the last Operation succeeded and nothing is running.
+  idle: ["なし（完了）", "None (settled)"],
+};
+
+/** A phase this Console does not know is shown as the Host wrote it, never as settled. */
+export function hostWork(phase: string): string {
+  const words = Object.hasOwn(HOST_WORK, phase) ? HOST_WORK[phase] : undefined;
+  return words ? tr(...words) : phase;
+}
+
+function newTab(): Child {
+  return h(
+    "span",
+    { class: "visually-hidden" },
+    tr("（新しいタブで開きます）", " (opens in a new tab)"),
+  );
+}
+
+function httpsUrl(value: string): boolean {
+  try {
+    return new URL(value).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function field(label: Child, value: Child): Child {
   return h(
     "div",
     { class: "row" },

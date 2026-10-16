@@ -102,27 +102,44 @@ describe("Takoserver public site", () => {
       "the pinned workerd from a GitHub Release, checked against its SHA256SUMS",
     );
     expect(html).toContain("the Workflow execution guard, a small Go program");
+    // The site describes main; the only release is older than the docs it links.
+    expect(html).toContain(
+      "Check out a reviewed commit of main, which the install guide describes",
+    );
+    expect(html).not.toContain("a release tag keeps it matched");
+    // Where a WorkerBundle's two values come from.
+    expect(html).toContain("the URL and SHA-256 of a manifest that lists it");
+    expect(html).toContain("scripts/selfhost-artifact.ts, which prints both values");
     expect(html).toContain("a wildcard DNS name and certificate, such as *.apps.example.com");
     expect(html).toContain('href="https://github.com/tako0614/takoserver/releases"');
     expect(html).toContain("docs/self-host-operations.md#1-prerequisites");
     expect(html).toContain("docs/self-host-docker.md");
   });
 
-  test("manages what you deployed on your own Host, not on takoserver.com's", () => {
+  test("after deploying, shows the console and how to ship a new version on your own Host", () => {
     const html = landingHtml(site);
-    expect(html).not.toContain("curl -sG https://api.takoserver.example");
+    expect(html).toContain("See it in the console");
     expect(html).toContain(
-      'curl -sG "$HOST/apis/forms.takoform.com/v2/support" \\\n' +
-        '  --data-urlencode "form=&lt;Form URL&gt;" \\\n' +
-        '  -H "authorization: Bearer $KEY"',
+      'href="https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#the-console-optional"',
     );
-    expect(html).toContain(
-      "<code>bun scripts/build-console.ts --api-origin &lt;API origin&gt;</code>",
+    // The public site never sends a self-host reader to takoserver.com's console.
+    expect(html).not.toContain("console.takoserver.example");
+    // Shipping new code: a new bundle and version, then the Deployment repointed.
+    const after = html.slice(html.indexOf('id="after"'));
+    const order = [
+      "WorkerBundle 0.2.0 <span>hello-bundle-v2",
+      "WorkerVersion 0.5.0 <span>hello-version-v2",
+      "WorkerDeployment 0.4.0 <span>hello-deployment",
+    ].map((step) => after.indexOf(step));
+    expect(order.every((index) => index > 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    // The request uses the guide's $V2 and carries both headers an update needs.
+    expect(after).toContain(
+      "PUT $V2/resources/&lt;Deployment UID&gt;\nidempotency-key: &lt;a new key&gt;\ntakoform-expected-generation:",
     );
-    expect(html).toContain("<code>TAKOSERVER_CONSOLE_ORIGIN</code>");
-    expect(html).toContain(
-      '<a href="https://console.takoserver.example" data-i18n="consoleSite">takoserver.com\'s own console</a>',
-    );
+    expect(after).toContain('"weight": 10000');
+    expect(after).not.toContain("$HOST");
+    expect(after).toContain("docs/self-host-operations.md#9-verify");
     for (const path of ["/openapi.json", "/.well-known/takoform/v2", "/.well-known/takoserver"]) {
       expect(html).toContain(`href="https://api.takoserver.example${path}"`);
     }
@@ -181,7 +198,7 @@ describe("Takoserver public site", () => {
   test("answers on the API's own root with its own origin and console", () => {
     const html = landingHtml({ consoleOrigin: null, apiOrigin: null });
     expect(html).toContain(
-      'curl -sG "<span data-origin>$HOST</span>/apis/forms.takoform.com/v2/support"',
+      "PUT <span data-origin>$HOST</span>/apis/forms.takoform.com/v2/resources/",
     );
     expect(html).toContain(
       'for(const node of document.querySelectorAll("[data-origin]"))node.textContent=location.origin;',
