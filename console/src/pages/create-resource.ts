@@ -443,6 +443,7 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
     class: "textarea",
     id: "create-resource-spec",
     spellcheck: "false",
+    ...(preset?.note ? { "aria-describedby": "create-resource-note" } : {}),
   });
   spec.value = "{}";
   const specHint = h("small");
@@ -618,7 +619,7 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
     body: h(
       "div",
       { style: { display: "grid", gap: "14px" } },
-      preset?.note ? h("div", { class: "notice" }, preset.note) : null,
+      preset?.note ? h("div", { class: "notice", id: "create-resource-note" }, preset.note) : null,
       form.element,
       h(
         "div",
@@ -734,7 +735,12 @@ export function updateResource(
 ): void {
   const key = `console-update-${crypto.randomUUID()}`;
   const path = `/apis/forms.takoform.com/v2/resources/${encodeURIComponent(resource.uid)}`;
-  const spec = h("textarea", { class: "textarea", spellcheck: "false" });
+  const spec = h("textarea", {
+    class: "textarea",
+    spellcheck: "false",
+    // The proposal's note is read out with the spec it explains.
+    ...(proposal ? { "aria-describedby": "update-resource-note" } : {}),
+  });
   spec.value = JSON.stringify(proposal?.spec ?? resource.spec, null, 2);
   spec.rows = Math.min(12, spec.value.split("\n").length + 1);
   const details = h("div");
@@ -759,7 +765,7 @@ export function updateResource(
     body: h(
       "div",
       { class: "field" },
-      proposal ? h("div", { class: "notice" }, proposal.note) : null,
+      proposal ? h("div", { class: "notice", id: "update-resource-note" }, proposal.note) : null,
       h("label", null, tr("設定 (JSON)", "Spec (JSON)")),
       spec,
       requestDisclosure(details),

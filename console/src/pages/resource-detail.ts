@@ -292,11 +292,22 @@ async function deploymentOf(
   return null;
 }
 
+/** Whether a Deployment's versions are exactly this one version at weight 10000. */
+export function servesOnly(versions: unknown, versionUid: string): boolean {
+  if (!Array.isArray(versions) || versions.length !== 1) return false;
+  const [entry] = versions;
+  return (
+    valueAt(entry, ["workerVersion", "resourceUid"]) === versionUid &&
+    valueAt(entry, ["weight"]) === 10000
+  );
+}
+
 /**
  * On a WorkerVersion's page: serve this version. It opens the update of the
- * Worker's Deployment with this version at weight 10000, or a new Deployment
- * when the Worker has none; nothing is sent until the person accepts it. A
- * version already served alone says so instead.
+ * Worker's Deployment with this version alone at weight 10000, or a new
+ * Deployment when the Worker has none; nothing is sent until the person
+ * accepts it. A Deployment that already names this version alone says how
+ * that change stands, from its own state, rather than claiming it serves.
  */
 function serveVersionAction(organizationId: string, version: ResourceSummary): Child {
   const workerUid = valueAt(version.spec, ["worker", "resourceUid"]);
@@ -308,8 +319,34 @@ function serveVersionAction(organizationId: string, version: ResourceSummary): C
     if (state.state !== "ready") return null;
     const deployment = state.value;
     const current = deployment ? valueAt(deployment.spec, ["versions"]) : undefined;
-    if (JSON.stringify(current) === JSON.stringify(versions))
-      return h("span", { class: "dim" }, tr("このVersionを配信中です", "Serving this version"));
+    if (deployment && servesOnly(current, version.uid)) {
+      const link = h("a", { ...linkProps(resourcePath(deployment.uid)) }, deployment.name);
+      const settled = health(deployment);
+      const words =
+        settled.phase === "Failed"
+          ? tr("配信の更新に失敗しました：", "The Deployment's update failed: ")
+          : settled.stale || settled.phase === "Pending"
+            ? tr("配信を更新中です：", "The Deployment is updating: ")
+            : settled.phase === "NotReady"
+              ? tr("配信の準備ができていません：", "The Deployment is not ready: ")
+              : tr("この版を配信中です：", "Serving this version: ");
+      return h("span", { class: "dim" }, words, link);
+    }
+    // The Host refuses a Deployment of a version that is not ready.
+    const readiness = health(version).phase;
+    if (readiness !== "Ready" && readiness !== "Applied")
+      return h(
+        "span",
+        { class: "dim" },
+        tr("この版の準備ができると配信できます", "This version can be served once it is Ready"),
+      );
+    const split =
+      Array.isArray(current) && current.length > 1
+        ? tr(
+            `現在は${current.length}つの版を配信しています。この更新で${version.name}だけになります。`,
+            `It serves ${current.length} versions now; after this update it serves only ${version.name}. `,
+          )
+        : "";
     return h(
       "button",
       {
@@ -319,21 +356,23 @@ function serveVersionAction(organizationId: string, version: ResourceSummary): C
           deployment
             ? updateResource(organizationId, deployment, {
                 spec: { ...deployment.spec, versions },
-                note: tr(
-                  `${deployment.name}を、${version.name}だけを重み10000で配信するよう更新します。内容を確認して受け付けてください。`,
-                  `This updates ${deployment.name} to serve only ${version.name}, at weight 10000. Check it, then accept.`,
-                ),
+                note:
+                  split +
+                  tr(
+                    `${deployment.name}を更新し、${version.name}だけを重み10000で配信します。内容を確認して受け付けてください。`,
+                    `This updates ${deployment.name} to serve only ${version.name}, at weight 10000. Check it, then accept.`,
+                  ),
               })
             : createResource(organizationId, {
                 form: WORKER_DEPLOYMENT,
                 spec: { worker: { resourceUid: workerUid }, versions },
                 note: tr(
-                  `このWorkerにはまだDeploymentがありません。${version.name}を配信するDeploymentを作成します。名前を付けて受け付けてください。`,
+                  `このWorkerにはまだ配信（WorkerDeployment）がありません。${version.name}を配信するWorkerDeploymentを作成します。名前を付けて受け付けてください。`,
                   `This Worker has no Deployment yet. This creates one that serves ${version.name}. Name it, then accept.`,
                 ),
               }),
       },
-      tr("このVersionを配信する", "Serve this version"),
+      tr("この版を配信する", "Serve this version"),
     );
   });
 }

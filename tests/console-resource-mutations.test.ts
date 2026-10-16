@@ -629,13 +629,27 @@ const resourceAt = (
   phase: "idle" as const,
   spec,
 });
-const helloV2 = resourceAt("uid-version", "hello-v2", versionForm, {
-  worker: { resourceUid: "uid-worker" },
-  handlers: ["fetch"],
+const helloV2: ResourceSummary = {
+  ...resourceAt("uid-version", "hello-v2", versionForm, {
+    worker: { resourceUid: "uid-worker" },
+    handlers: ["fetch"],
+  }),
+  observed: { ready: true },
+};
+/** A Deployment of uid-worker as the Host returns it: keys sorted, as canonical JSON stores them. */
+const deploymentOf = (
+  versions: ResourceSummary["spec"][],
+  change: Partial<ResourceSummary> = {},
+) => ({
+  ...resourceAt("uid-deployment", "hello-deployment", deploymentForm, {
+    versions,
+    worker: { resourceUid: "uid-worker" },
+  }),
+  ...change,
 });
 
 /** A WorkerVersion's page against a Host whose Deployments are `deployments`. */
-async function versionPage(deployments: ResourceSummary[]) {
+async function versionPage(deployments: ResourceSummary[], version: ResourceSummary = helloV2) {
   const { body } = await setup("/resources/uid-version");
   const { resourceDetailPage } = await import("../console/src/pages/resource-detail.ts");
   const writes: Request[] = [];
@@ -652,7 +666,7 @@ async function versionPage(deployments: ResourceSummary[]) {
         writes.push(request.clone());
         return Response.json(op, { status: 202 });
       }
-      if (url.pathname.endsWith("/resources/uid-version")) return Response.json(helloV2);
+      if (url.pathname.endsWith("/resources/uid-version")) return Response.json(version);
       if (url.pathname.endsWith("/resources")) {
         const items = url.searchParams.get("form") === deploymentForm ? deployments : [];
         return Response.json({ items, nextCursor: null });
@@ -667,10 +681,7 @@ async function versionPage(deployments: ResourceSummary[]) {
 }
 
 test("a WorkerVersion's page serves it by updating the Worker's Deployment", async () => {
-  const deployment = resourceAt("uid-deployment", "hello-deployment", deploymentForm, {
-    worker: { resourceUid: "uid-worker" },
-    versions: [{ workerVersion: { resourceUid: "uid-v1" }, weight: 10000 }],
-  });
+  const deployment = deploymentOf([{ weight: 10000, workerVersion: { resourceUid: "uid-v1" } }]);
   const { body, writes } = await versionPage([deployment]);
   button(body, "Serve this version").click();
   await settle();
@@ -694,16 +705,53 @@ test("a WorkerVersion's page serves it by updating the Worker's Deployment", asy
   });
 });
 
-test("a WorkerVersion already served alone says so instead of offering to serve it", async () => {
-  const deployment = resourceAt("uid-deployment", "hello-deployment", deploymentForm, {
-    worker: { resourceUid: "uid-worker" },
-    versions: [{ workerVersion: { resourceUid: "uid-version" }, weight: 10000 }],
-  });
-  const { body } = await versionPage([deployment]);
-  expect(body.textContent).toContain("Serving this version");
+test("a version a Deployment already names alone reports how that change stands", async () => {
+  const only = [{ weight: 10000, workerVersion: { resourceUid: "uid-version" } }];
+  const served = await versionPage([deploymentOf(only)]);
+  expect(served.body.textContent).toContain("Serving this version: hello-deployment");
+  expect(
+    served.body
+      .all()
+      .some((node) => node.tag === "button" && node.textContent === "Serve this version"),
+  ).toBe(false);
+  // The spec names it, but the Host has not applied that yet, or failed to.
+  const pending = await versionPage([deploymentOf(only, { observedGeneration: 2 })]);
+  expect(pending.body.textContent).toContain("The Deployment is updating: hello-deployment");
+  expect(pending.body.textContent).not.toContain("Serving this version");
+  const failed = await versionPage([deploymentOf(only, { phase: "error" })]);
+  expect(failed.body.textContent).toContain("The Deployment's update failed: hello-deployment");
+});
+
+test("serving one version says when it replaces a split", async () => {
+  const { body } = await versionPage([
+    deploymentOf([
+      { weight: 9000, workerVersion: { resourceUid: "uid-v1" } },
+      { weight: 1000, workerVersion: { resourceUid: "uid-version" } },
+    ]),
+  ]);
+  button(body, "Serve this version").click();
+  await settle();
+  expect(body.textContent).toContain(
+    "It serves 2 versions now; after this update it serves only hello-v2. This updates hello-deployment",
+  );
+});
+
+test("a version that is not ready is not offered for serving", async () => {
+  const { body } = await versionPage([], { ...helloV2, observed: { ready: false } });
+  expect(body.textContent).toContain("This version can be served once it is Ready");
   expect(
     body.all().some((node) => node.tag === "button" && node.textContent === "Serve this version"),
   ).toBe(false);
+});
+
+test("a Deployment serves one version only when its single entry is that version at 10000", async () => {
+  const { servesOnly } = await import("../console/src/pages/resource-detail.ts");
+  expect(servesOnly([{ weight: 10000, workerVersion: { resourceUid: "v" } }], "v")).toBe(true);
+  expect(servesOnly([{ workerVersion: { resourceUid: "v" }, weight: 10000 }], "v")).toBe(true);
+  expect(servesOnly([{ weight: 5000, workerVersion: { resourceUid: "v" } }], "v")).toBe(false);
+  expect(servesOnly([{ weight: 10000, workerVersion: { resourceUid: "w" } }], "v")).toBe(false);
+  expect(servesOnly([], "v")).toBe(false);
+  expect(servesOnly(undefined, "v")).toBe(false);
 });
 
 test("a Worker without a Deployment gets one to create for the version", async () => {
