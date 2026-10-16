@@ -418,7 +418,7 @@ export function createApi(options: ApiOptions) {
         code,
         response.status,
         path,
-        typeof detail === "string" && detail.length > 0 && detail.length <= 1000 ? detail : null,
+        typeof detail === "string" && detail.length > 0 && detail.length <= 1024 ? detail : null,
       );
       if (failure.isExpiredSession) options.onSessionLost();
       throw failure;

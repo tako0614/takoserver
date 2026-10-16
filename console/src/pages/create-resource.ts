@@ -1,5 +1,5 @@
 import { ApiError, type ResourceSummary } from "../api.ts";
-import { h } from "../dom.ts";
+import { type Child, h, live } from "../dom.ts";
 import {
   blankPaths,
   pathLabel,
@@ -12,6 +12,7 @@ import {
 } from "../form-specs.ts";
 import { formLabel, KNOWN_FORM_GROUPS } from "../forms.ts";
 import { tr } from "../i18n.ts";
+import { signal } from "../reactive.ts";
 import {
   isUnknownAcceptance,
   prepareResourceIntent,
@@ -95,7 +96,51 @@ function requestDisclosure(details: HTMLElement): HTMLElement {
   );
 }
 
-async function submit(intent: ResourceIntent, close: () => void): Promise<void> {
+/**
+ * Where a dialog says why its request was refused, until the next attempt.
+ * A sent request stays as it was, so the same dialog retries it exactly;
+ * changing it takes a new dialog, and a new key.
+ */
+function refusalNotice(): {
+  readonly element: Child;
+  show(error: unknown, sent: boolean): void;
+  clear(): void;
+} {
+  const shown = signal<{ readonly message: string; readonly sent: boolean } | null>(null);
+  return {
+    element: live(() => {
+      const refusal = shown();
+      if (!refusal) return null;
+      return h(
+        "div",
+        { class: "notice notice--bad", role: "alert", style: { display: "grid", gap: "6px" } },
+        h("span", null, refusal.message),
+        refusal.sent
+          ? h(
+              "span",
+              null,
+              tr(
+                "内容を変えるには、キャンセルしてダイアログを開き直してください。",
+                "To change the request, cancel and open the dialog again.",
+              ),
+            )
+          : null,
+      );
+    }),
+    show(error, sent) {
+      shown.set({ message: explain(error as Error), sent });
+    },
+    clear() {
+      shown.set(null);
+    },
+  };
+}
+
+async function submit(
+  intent: ResourceIntent,
+  close: () => void,
+  refused: (error: unknown) => void = (error) => toast(explain(error as Error), "bad"),
+): Promise<void> {
   try {
     const accepted = await sendResourceIntent(intent.id);
     close();
@@ -113,7 +158,7 @@ async function submit(intent: ResourceIntent, close: () => void): Promise<void> 
         navigate(`/resources?acceptance=unknown&intent=${encodeURIComponent(intent.id)}`);
       return;
     }
-    toast(explain(error as Error), "bad");
+    refused(error);
   }
 }
 
@@ -613,6 +658,7 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
   }
   showDetails();
   let intent: ResourceIntent | null = null;
+  const refusal = refusalNotice();
   const close = openModal({
     title: tr("リソースを作成", "New resource"),
     confirmLabel: tr("受け付ける", "Accept create"),
@@ -643,9 +689,11 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
         artifactHint,
       ),
       requestDisclosure(details),
+      refusal.element,
     ),
     onConfirm: async () => {
       if (!sameOrganization(organizationId)) return;
+      refusal.clear();
       if (!intent) {
         const selectedForm = form.value();
         const selectedName = name.value.trim();
@@ -714,11 +762,11 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
           name.disabled = false;
           spec.disabled = false;
           picker?.setDisabled(false);
-          toast(explain(error as Error), "bad");
+          refusal.show(error, false);
           return;
         }
       }
-      await submit(intent, close);
+      await submit(intent, close, (error) => refusal.show(error, true));
     },
   });
 }
@@ -759,6 +807,7 @@ export function updateResource(
   spec.addEventListener("input", showDetails);
   showDetails();
   let intent: ResourceIntent | null = null;
+  const refusal = refusalNotice();
   const close = openModal({
     title: tr(`${resource.name}を更新`, `Update ${resource.name}`),
     confirmLabel: tr("更新を受け付ける", "Accept update"),
@@ -769,9 +818,11 @@ export function updateResource(
       h("label", null, tr("設定 (JSON)", "Spec (JSON)")),
       spec,
       requestDisclosure(details),
+      refusal.element,
     ),
     onConfirm: async () => {
       if (!sameOrganization(organizationId)) return;
+      refusal.clear();
       if (!intent) {
         const parsed = jsonSpec(spec.value);
         if (!parsed) {
@@ -800,11 +851,11 @@ export function updateResource(
           );
         } catch (error) {
           spec.disabled = false;
-          toast(explain(error as Error), "bad");
+          refusal.show(error, false);
           return;
         }
       }
-      await submit(intent, close);
+      await submit(intent, close, (error) => refusal.show(error, true));
     },
   });
 }

@@ -40,7 +40,7 @@ test("keeps the Host's own explanation of a refusal", async () => {
   // Anything but a bounded string is not shown to a person.
   expect((await refused({ ...problem, code: "resource_busy", detail: 7 })).detail).toBeNull();
   expect(
-    (await refused({ ...problem, code: "resource_busy", detail: "x".repeat(1001) })).detail,
+    (await refused({ ...problem, code: "resource_busy", detail: "x".repeat(1025) })).detail,
   ).toBeNull();
 });
 
@@ -50,12 +50,17 @@ test("says what to do for the refusals a Resource change meets", () => {
     "Another Resource in this organization already has that name, whatever its Form. Choose another name.",
   );
   expect(said("resource_busy")).toBe(
-    "This Resource is still applying an earlier change. Try again once it finishes.",
+    "This Resource, or one it depends on, is still applying an earlier change. Try again once it finishes.",
+  );
+  expect(said("idempotency_conflict")).toBe(
+    "A different request was already sent under the same key. Close this dialog and start again; a new one uses a new key.",
   );
   expect(said("generation_conflict")).toBe(
     "This Resource changed after the page read it. Reload, check it, and try again.",
   );
-  expect(said("dependency_conflict")).toStartWith("Another Resource is in the way");
+  expect(said("dependency_conflict")).toStartWith(
+    "Another Resource stands in the way of this change. For example, one it names does not exist yet",
+  );
   expect(said("invalid_spec")).toStartWith("This Host does not accept that spec for the Form.");
   expect(said("unsupported_form")).toBe("This Host does not serve that exact Form.");
   // A code the console does not know is still shown, so it can be quoted.
@@ -65,4 +70,14 @@ test("says what to do for the refusals a Resource change meets", () => {
 test("lets the Host's explanation speak for itself, with its code", () => {
   const error = new ApiError("dependency_conflict", 409, "/apis/forms.takoform.com/v2", DETAIL);
   expect(explain(error)).toBe(`${DETAIL} (dependency_conflict)`);
+});
+
+test("keeps an explanation the Host's limit allows", async () => {
+  const long = "x".repeat(1024);
+  const explained = await refused({ status: 409, code: "dependency_conflict", detail: long });
+  expect(explained.detail).toBe(long);
+  // An unknown code with a detail still names its code.
+  expect(explain(new ApiError("private_inputs_conflict", 409, "/v2", "Why."))).toBe(
+    "Why. (private_inputs_conflict)",
+  );
 });
