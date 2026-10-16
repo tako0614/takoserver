@@ -28,8 +28,9 @@ database, at a versioned URL. These are the Forms a Bun Host can serve:
   the application of a migration set to a database.
 - **Queues, actors and workflows:** `AtLeastOnceQueue 0.2.0`,
   `QueueConsumer 0.3.0`, `ActorNamespace 0.3.0` and `DurableWorkflow 0.3.0`.
-  At-least-once queues and their consumers, actors that keep state, and durable
-  workflows, which a Worker also reaches through Bindings.
+  At-least-once queues and the consumers that deliver their messages to a
+  Worker, actors that keep state, and durable workflows. A Worker reaches the
+  queues, actors and workflows through Bindings.
 
 A Host serves exactly the Forms its configuration composes:
 
