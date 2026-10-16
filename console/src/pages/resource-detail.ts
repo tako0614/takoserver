@@ -4,71 +4,14 @@ import { type Child, h, live, text } from "../dom.ts";
 import { formLabel } from "../forms.ts";
 import { tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
+import { publishedUrl, type SpecReference, specReferences } from "../references.ts";
 import { health, phaseLabel } from "../resource-state.ts";
 import { linkProps, resourcePath, route } from "../router.ts";
 import { api, currentOrganization } from "../state.ts";
 import { badge, card, copyable, empty, ICON, icon, jsonBlock, whenReady } from "../ui.ts";
 import { deleteResource, updateResource } from "./create-resource.ts";
 
-export interface SpecReference {
-  /** Where the spec names it: `bundle`, `sqliteBindings · DB`, `versions[0] · workerVersion`. */
-  readonly path: string;
-  readonly uid: string;
-}
-
-/** Spec fields that hold the person's own data, never references. */
-const OPAQUE_SPEC_FIELDS = new Set(["vars"]);
-
-/**
- * Every Resource a spec names, in the order it names them. A v2 reference is
- * an object holding exactly one `resourceUid`; a Binding entry is labelled by
- * its own `name`, which is how the Worker reaches it, and any other list
- * entry by its index as the spec below shows it.
- */
-export function specReferences(spec: unknown): SpecReference[] {
-  const found: SpecReference[] = [];
-  const walk = (value: unknown, path: readonly string[]): void => {
-    if (Array.isArray(value)) {
-      value.forEach((entry, index) => {
-        const name =
-          entry && typeof entry === "object" ? (entry as { name?: unknown }).name : undefined;
-        walk(
-          entry,
-          typeof name === "string"
-            ? [...path, name]
-            : [...path.slice(0, -1), `${path.at(-1) ?? ""}[${index}]`],
-        );
-      });
-      return;
-    }
-    if (!value || typeof value !== "object") return;
-    const record = value as Record<string, unknown>;
-    const keys = Object.keys(record);
-    if (keys.length === 1 && keys[0] === "resourceUid" && typeof record.resourceUid === "string") {
-      // A Binding's `resource` key adds nothing its name has not said.
-      const shown = path.at(-1) === "resource" && path.length > 1 ? path.slice(0, -1) : path;
-      found.push({ path: shown.join(" · "), uid: record.resourceUid });
-      return;
-    }
-    for (const key of keys) {
-      if (path.length === 0 && OPAQUE_SPEC_FIELDS.has(key)) continue;
-      walk(record[key], [...path, key]);
-    }
-  };
-  walk(spec, []);
-  return found;
-}
-
-/** The https URL a Resource reports for itself, such as a WorkerEndpoint's. */
-export function publishedUrl(output: unknown): string | null {
-  const url = output && typeof output === "object" ? (output as { url?: unknown }).url : null;
-  if (typeof url !== "string") return null;
-  try {
-    return new URL(url).protocol === "https:" ? url : null;
-  } catch {
-    return null;
-  }
-}
+export { publishedUrl, type SpecReference, specReferences } from "../references.ts";
 
 /** How many list pages are read to find what names a Resource. */
 const REFERRER_PAGES = 5;
@@ -176,8 +119,6 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
           "div",
           { class: "dim" },
           h("a", { ...linkProps("/resources") }, tr("リソース", "Resources")),
-          text(" / "),
-          found.space,
         ),
         h(
           "h1",
