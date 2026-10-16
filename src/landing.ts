@@ -61,7 +61,7 @@ const landingMessages = {
       "At-least-once queues and their consumers, actors that keep state, and durable workflows.",
     hostTitle: "Run your own Host",
     hostStep1:
-      "Use a Linux x86-64 machine with Bun. Check out a reviewed commit (a release tag keeps it matched with that release's workerd) and install its locked dependencies.",
+      "Use a Linux x86-64 machine with Bun. Check out a reviewed commit of main, which the install guide describes, and install its locked dependencies.",
     hostStep2:
       "Add the Worker runtime: the pinned workerd from a GitHub Release, checked against its SHA256SUMS, and the Workflow execution guard, a small Go program built from the same checkout.",
     hostStep3:
@@ -81,7 +81,7 @@ const landingMessages = {
       "Each create is one POST. Sent again with the same idempotency-key within 24 hours, it returns the same Operation instead of a second Worker.",
     workerStep: "is the Worker itself. Its versions, deployment and endpoint refer to it.",
     bundleStep:
-      "names the bytes of worker.js by URL and SHA-256. Publish it over public HTTPS and the Host fetches it, or seed it onto the Host beforehand.",
+      "names worker.js by the URL and SHA-256 of a manifest that lists it. Publish the manifest and its files over public HTTPS and the Host fetches them, or seed them onto the Host with scripts/selfhost-artifact.ts, which prints both values.",
     versionStep: "pairs that bundle with its fetch handler.",
     deploymentStep: "chooses which version serves: here one version, weight 10000.",
     endpointStep: "publishes the Worker at an HTTPS hostname.",
@@ -130,7 +130,7 @@ const landingMessages = {
     asyncBody: "少なくとも一度届くキューとその受信、状態を持つActor、永続するWorkflowです。",
     hostTitle: "自分のHostを動かす",
     hostStep1:
-      "Linux x86-64のマシンとBunを用意します。レビュー済みのコミットを取り出し（リリースのタグなら、そのリリースのworkerdと揃います）、ロックファイルで固定された依存関係をインストールします。",
+      "Linux x86-64のマシンとBunを用意します。導入手順書が説明しているmainから、レビュー済みのコミットを取り出し、ロックファイルで固定された依存関係をインストールします。",
     hostStep2:
       "Workerの実行環境を加えます。GitHub Releaseにある固定版のworkerdをSHA256SUMSで確認して置き、Workflow execution guard（同じチェックアウトからGoでビルドする小さなプログラム）を用意します。",
     hostStep3:
@@ -150,7 +150,7 @@ const landingMessages = {
       "作成は1回のPOSTです。24時間以内に同じidempotency-keyで送り直すと、2つ目のWorkerは作らず同じOperationを返します。",
     workerStep: "Workerそのものです。版・配信・公開先はこれを参照します。",
     bundleStep:
-      "worker.jsの内容をURLとSHA-256で指定します。公開HTTPSに置けばHostが取得し、Hostへ事前に保持させることもできます。",
+      "worker.jsを、それを列挙したmanifestのURLとSHA-256で指定します。manifestとファイルを公開HTTPSに置けばHostが取得します。scripts/selfhost-artifact.tsでHostに保持させることもでき、このコマンドが両方の値を出力します。",
     versionStep: "そのWorkerBundleとfetchハンドラーを組み合わせた版です。",
     deploymentStep: "どの版を配信するかを決めます。ここでは1つの版を重み10000で配信します。",
     endpointStep: "WorkerをHTTPSのホスト名で公開します。",
