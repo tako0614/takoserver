@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { v2Base } from "../console/src/api.ts";
 import { DEFAULT_KEY_SCOPES, keyScopeGroups, keyUsage } from "../console/src/key-scopes.ts";
 import { API_KEY_SCOPES, grants } from "../src/auth.ts";
 
@@ -62,9 +63,9 @@ test("reads AI availability and the v2 base from the Host's own discovery docume
 test("shows a first request in the install guide's names, only to a key that can read Resources", () => {
   const v2 = "https://api.example.com:8443/apis/forms.takoform.com/v2";
   const usage = [
-    `V2=${v2}`,
-    "ORG=org_1b17",
-    "printf 'API key: '; read -rs KEY; echo",
+    `V2='${v2}'`,
+    "ORG='org_1b17'",
+    "printf 'API key: ' && read -rs KEY && echo &&",
     'curl -sS -G "$V2/resources" --data-urlencode "space=$ORG" \\',
     '  -H "authorization: Bearer $KEY"',
   ].join("\n");
@@ -74,5 +75,36 @@ test("shows a first request in the install guide's names, only to a key that can
   expect(usage).not.toContain("#");
   for (const scopes of [["wallet:read"], ["usage:read", "catalog:read"], ["ai:invoke"], []]) {
     expect(keyUsage(v2, "org_1b17", scopes)).toBeNull();
+  }
+});
+
+test("passes whatever the Host sent to the shell as literal words", () => {
+  const v2 = "https://h.example/v2;echo INJECTED $(echo RAN)";
+  const organization = "org_'$(echo RAN)'";
+  const usage = keyUsage(v2, organization, ["resources:read"]) ?? "";
+  const assignments = usage.split("\n").slice(0, 2).join("\n");
+  const shell = Bun.spawnSync(["bash", "-c", `${assignments}\nprintf '%s\\n' "$V2" "$ORG"`]);
+  expect(shell.stdout.toString()).toBe(`${v2}\n${organization}\n`);
+});
+
+test("takes the v2 base from discovery only in the shape a Host builds it", () => {
+  const base = "https://api.example.com:8443/apis/forms.takoform.com/v2";
+  expect(v2Base(base)).toBe(base);
+  expect(v2Base("http://127.0.0.1:8787/apis/forms.takoform.com/v2")).toBe(
+    "http://127.0.0.1:8787/apis/forms.takoform.com/v2",
+  );
+  for (const value of [
+    `${base};echo INJECTED`,
+    `${base}?x=1`,
+    `${base}#x`,
+    `${base}/`,
+    "https://user:pass@api.example.com/apis/forms.takoform.com/v2",
+    "http://api.example.com/apis/forms.takoform.com/v2",
+    "https://api.example.com/$(id)/apis/forms.takoform.com/v2",
+    "not a url",
+    2,
+    null,
+  ]) {
+    expect(v2Base(value)).toBeNull();
   }
 });

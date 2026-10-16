@@ -36,6 +36,28 @@ export interface Organization {
   readonly createdAt: string;
 }
 
+/**
+ * The v2 base a Host names, only in the one shape a Host builds it: an HTTPS
+ * origin (plain HTTP only on this machine) and the exact v2 path. The console
+ * puts it into a command a person pastes into a shell, so anything else is
+ * dropped rather than passed on.
+ */
+export function v2Base(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && local)) return null;
+  if (url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "")
+    return null;
+  if (url.pathname !== "/apis/forms.takoform.com/v2") return null;
+  return `${url.origin}${url.pathname}`;
+}
+
 export interface HostDiscovery {
   readonly ai: boolean;
   /** The Host API v2 base, such as `https://api.example.com/apis/forms.takoform.com/v2`. */
@@ -458,10 +480,7 @@ export function createApi(options: ApiOptions) {
         const { payload, status } = await request<unknown>("GET", "/.well-known/takoserver");
         if (status !== 200 || !isRecord(payload) || !isRecord(payload.endpoints)) return unknown;
         const { ai, takoform } = payload.endpoints;
-        return {
-          ai: typeof ai === "string",
-          takoform: typeof takoform === "string" ? takoform : null,
-        };
+        return { ai: typeof ai === "string", takoform: v2Base(takoform) };
       } catch {
         return unknown;
       }

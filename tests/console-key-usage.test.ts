@@ -22,8 +22,8 @@ const identity: ExternalIdentityVerifier = {
 
 /** Runs the request the console's snippet makes, as the shell would expand it. */
 function snippetRequest(snippet: string, key: string): Request {
-  const v2 = /^V2=(\S+)$/mu.exec(snippet)?.[1];
-  const org = /^ORG=(\S+)$/mu.exec(snippet)?.[1];
+  const v2 = /^V2='([^']+)'$/mu.exec(snippet)?.[1];
+  const org = /^ORG='([^']+)'$/mu.exec(snippet)?.[1];
   const path = /curl -sS -G "\$V2(\/[^"]*)" --data-urlencode "space=\$ORG"/u.exec(snippet)?.[1];
   if (!v2 || !org || !path) throw new Error(`unexpected snippet:\n${snippet}`);
   const url = new URL(`${v2}${path}`);

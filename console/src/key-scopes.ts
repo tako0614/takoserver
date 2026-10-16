@@ -103,11 +103,18 @@ export function keyUsage(
 ): string | null {
   if (!scopes.includes("resources:read") && !scopes.includes("resources:write")) return null;
   return [
-    `V2=${v2}`,
-    `ORG=${organizationId}`,
-    // bash and zsh both read silently with -s; zsh's read -p means something else.
-    "printf 'API key: '; read -rs KEY; echo",
+    `V2=${shellQuote(v2)}`,
+    `ORG=${shellQuote(organizationId)}`,
+    // bash and zsh both read silently with -s; zsh's read -p means something
+    // else. The && chain makes the shell parse the curl before read runs, so
+    // a shell without bracketed paste cannot read the next pasted line as the key.
+    "printf 'API key: ' && read -rs KEY && echo &&",
     'curl -sS -G "$V2/resources" --data-urlencode "space=$ORG" \\',
     '  -H "authorization: Bearer $KEY"',
   ].join("\n");
+}
+
+/** One literal shell word, whatever the value holds. */
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
 }
