@@ -131,16 +131,18 @@ wallet is funded.
 
 - **This repository is the Host and its self-host plugin**: everything needed
   to build and run a Takoserver on your own machine.
-- **It serves Host API v2 only.** A Form is identified by its versioned HTTPS
-  URL and implemented by code in this repository; the Host does not install
-  Form packages, check their signatures, or translate requests into the older
-  v1 API.
-- **takoserver.com's managed backend is not here.** Its Workers for Platforms
-  backend is supplied separately by its operator and is not needed to build or
-  run a self-host. Where the control plane runs is a separate deployment choice.
+- **It serves Takoform Host API v2 only.** Code in this repository implements
+  each Form it composes; the Host does not install Form packages, check their
+  signatures, or translate requests into Takoform Host API v1. Its own `/v1`
+  account, wallet and AI APIs are separate product APIs.
+- **takoserver.com's managed backend is not here.** Its non-public Workers for
+  Platforms backend is supplied separately by its operator and is not needed to
+  build or run a self-host. Where the control plane runs is a separate
+  deployment choice.
 - **A green gate is not a rollout.** `bun run check` and local native evidence
-  say nothing about whether the hosted service (D1, Workers for Platforms,
-  public TLS, downstream Providers) has been deployed or qualified.
+  do not show that any deployment works: not a self-host's public TLS and DNS,
+  not the hosted service's D1 or Workers for Platforms, and not adoption by
+  downstream Providers. Each is qualified separately.
 
 ## Self-hosting
 
