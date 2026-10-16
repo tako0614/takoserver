@@ -114,6 +114,14 @@ describe("Takoserver public site", () => {
     );
     expect(english).toContain('src="/screens/console-desktop-light-en.webp"');
     expect(english).toContain('width="780" height="1560"');
+    // Between phone and desktop widths the page shows the Console at a tablet's
+    // width rather than shrinking the desktop capture.
+    expect(english).toContain(
+      '<source media="(max-width: 1100px) and (prefers-color-scheme: dark)" srcset="/screens/console-tablet-dark-en.webp" data-locale-srcset="/screens/console-tablet-dark-{lang}.webp" width="1640" height="1480">',
+    );
+    expect(english.indexOf("console-mobile-light")).toBeLessThan(
+      english.indexOf("console-tablet-dark"),
+    );
     expect(english).toContain("public sample data");
     const japanese = landingHtml({ ...site, locale: "ja" });
     expect(japanese).toContain('<html lang="ja">');
