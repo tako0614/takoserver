@@ -812,24 +812,27 @@ export function updateResource(
   });
 }
 
-/** Destructive delete requires a separate explicit confirmation. */
-/** A link out of a dialog: it closes the dialog, then navigates as any link does. */
+/**
+ * A link out of a dialog: it navigates as any link does, and closes the dialog
+ * only when it navigates here, not when it opens a new tab.
+ */
 function openFromDialog(href: string, close: () => void): Record<string, unknown> {
   const link = linkProps(href);
   const follow = link.onClick as (event: MouseEvent) => void;
   return {
     ...link,
     onClick: (event: MouseEvent) => {
-      close();
       follow(event);
+      if (event.defaultPrevented) close();
     },
   };
 }
 
 /**
- * Deleting: what the Host removes, and first what still names this Resource.
- * The Host refuses to delete a Resource another still names, so while any
- * does, the dialog lists them and the delete is not offered.
+ * Deleting, confirmed separately: what the Host removes, and first what still
+ * names this Resource. The Host refuses to delete a Resource another still
+ * names, so while any does, the dialog lists them and the delete is not
+ * offered.
  */
 export function deleteResource(organizationId: string, target: ResourceSummary): void {
   const key = `console-delete-${crypto.randomUUID()}`;
@@ -852,8 +855,8 @@ export function deleteResource(organizationId: string, target: ResourceSummary):
         "div",
         { class: "notice notice--bad" },
         tr(
-          "Hostからこのリソースを削除し、そのために動かしているものや保持しているものも削除します。データベースならデータが失われ、Endpointなら応答しなくなります。この操作は元に戻せません。",
-          "The Host deletes this Resource and what it runs or keeps for it: a database loses its data, and an Endpoint stops answering. This cannot be undone.",
+          "Hostはこのリソースと、そのために動かしているものを削除します。データベースならデータが失われ、Endpointのホスト名は配信を停止します。この操作は元に戻せません。",
+          "The Host deletes this Resource and what it runs for it: a database's data is deleted, and an Endpoint's hostname stops serving. This cannot be undone.",
         ),
       ),
       live(() => {
@@ -895,8 +898,8 @@ export function deleteResource(organizationId: string, target: ResourceSummary):
             "span",
             null,
             tr(
-              "次のリソースがまだこのリソースを参照しているため、Hostは削除を受け付けません。先にこれらを削除してください。",
-              "The Host refuses this delete while these still name it. Delete them first.",
+              "次のリソースがまだこのリソースを参照しているため、Hostは削除を受け付けません。参照しないよう変更するか、先に削除してください。",
+              "The Host refuses this delete while these still name it. Change them so they no longer name it, or delete them first.",
             ),
           ),
           h(
@@ -914,6 +917,16 @@ export function deleteResource(organizationId: string, target: ResourceSummary):
                 ` ${formLabel(referrer.form)}`,
                 health(referrer).phase === "Deleting" ? tr("（削除中）", " (being deleted)") : "",
               ),
+            ),
+          ),
+          // The dialog does not watch them, so a change made meanwhile is read on request.
+          h(
+            "div",
+            null,
+            h(
+              "button",
+              { class: "btn", type: "button", onClick: () => naming.reload() },
+              tr("もう一度確認する", "Check again"),
             ),
           ),
         );
