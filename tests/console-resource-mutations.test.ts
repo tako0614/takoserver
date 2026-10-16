@@ -720,6 +720,11 @@ test("a version a Deployment already names alone reports how that change stands"
   expect(pending.body.textContent).not.toContain("Serving this version");
   const failed = await versionPage([deploymentOf(only, { phase: "error" })]);
   expect(failed.body.textContent).toContain("The Deployment's update failed: hello-deployment");
+  const deleting = await versionPage([deploymentOf(only, { phase: "deleting" })]);
+  expect(deleting.body.textContent).toContain("The Deployment is being deleted: hello-deployment");
+  expect(deleting.body.textContent).not.toContain("Serving this version");
+  const unread = await versionPage([deploymentOf(only, { observedAt: null })]);
+  expect(unread.body.textContent).not.toContain("Serving this version");
 });
 
 test("serving one version says when it replaces a split", async () => {
@@ -732,7 +737,7 @@ test("serving one version says when it replaces a split", async () => {
   button(body, "Serve this version").click();
   await settle();
   expect(body.textContent).toContain(
-    "It serves 2 versions now; after this update it serves only hello-v2. This updates hello-deployment",
+    "It serves 2 versions now; after this update it serves only hello-v2. This updates hello-deployment. Check it, then accept.",
   );
 });
 

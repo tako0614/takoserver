@@ -322,15 +322,21 @@ function serveVersionAction(organizationId: string, version: ResourceSummary): C
     if (deployment && servesOnly(current, version.uid)) {
       const link = h("a", { ...linkProps(resourcePath(deployment.uid)) }, deployment.name);
       const settled = health(deployment);
+      // Only a settled, healthy Deployment is said to serve; every other state
+      // says what it is.
       const words =
-        settled.phase === "Failed"
-          ? tr("配信の更新に失敗しました：", "The Deployment's update failed: ")
-          : settled.stale || settled.phase === "Pending"
-            ? tr("配信を更新中です：", "The Deployment is updating: ")
-            : settled.phase === "NotReady"
-              ? tr("配信の準備ができていません：", "The Deployment is not ready: ")
-              : tr("この版を配信中です：", "Serving this version: ");
-      return h("span", { class: "dim" }, words, link);
+        settled.stale || settled.phase === "Pending"
+          ? tr("配信を更新中です：", "The Deployment is updating: ")
+          : settled.phase === "Ready" || settled.phase === "Applied"
+            ? tr("この版を配信中です：", "Serving this version: ")
+            : settled.phase === "Failed"
+              ? tr("配信の更新に失敗しました：", "The Deployment's update failed: ")
+              : settled.phase === "NotReady"
+                ? tr("配信の準備ができていません：", "The Deployment is not ready: ")
+                : settled.phase === "Deleting"
+                  ? tr("配信を削除中です：", "The Deployment is being deleted: ")
+                  : tr("配信の状態を確認できません：", "The Deployment's state is unknown: ");
+      return h("span", { class: "dim published" }, words, link);
     }
     // The Host refuses a Deployment of a version that is not ready.
     const readiness = health(version).phase;
@@ -358,10 +364,15 @@ function serveVersionAction(organizationId: string, version: ResourceSummary): C
                 spec: { ...deployment.spec, versions },
                 note:
                   split +
-                  tr(
-                    `${deployment.name}を更新し、${version.name}だけを重み10000で配信します。内容を確認して受け付けてください。`,
-                    `This updates ${deployment.name} to serve only ${version.name}, at weight 10000. Check it, then accept.`,
-                  ),
+                  (split
+                    ? tr(
+                        `${deployment.name}を更新します。内容を確認して受け付けてください。`,
+                        `This updates ${deployment.name}. Check it, then accept.`,
+                      )
+                    : tr(
+                        `${deployment.name}を更新し、${version.name}だけを重み10000で配信します。内容を確認して受け付けてください。`,
+                        `This updates ${deployment.name} to serve only ${version.name}, at weight 10000. Check it, then accept.`,
+                      )),
               })
             : createResource(organizationId, {
                 form: WORKER_DEPLOYMENT,
