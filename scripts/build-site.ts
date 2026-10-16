@@ -1,4 +1,4 @@
-import { copyFileSync, mkdirSync, rmSync } from "node:fs";
+import { copyFileSync, cpSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { landingHtml, notFoundHtml } from "../src/landing.ts";
 
@@ -38,6 +38,11 @@ await Bun.write(join(outDir, "index.html"), html);
 // The social card: rendered from the committed site/og.svg and carried as a
 // plain file because Pages serves the whole output directory.
 copyFileSync("site/og.png", join(outDir, "og.png"));
+// The display font (with its licence) and the Console screenshots the page
+// shows; the API root renders without them.
+for (const directory of ["fonts", "screens"]) {
+  cpSync(join("site", directory), join(outDir, directory), { recursive: true });
+}
 for (const locale of ["ja", "en"] as const) {
   const localeDirectory = join(outDir, locale);
   mkdirSync(localeDirectory, { recursive: true });
