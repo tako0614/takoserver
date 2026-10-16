@@ -573,8 +573,9 @@ takoform-expected-generation: &lt;the generation it read&gt;
 
 {"spec": {
   "worker": {"resourceUid": "&lt;hello UID&gt;"},
-  "versions": [{"workerVersion": {"resourceUid": "&lt;hello-version-v2 UID&gt;"},
-                "weight": 10000}]}}</pre>
+  "versions": [{
+    "workerVersion": {"resourceUid": "&lt;hello-version-v2 UID&gt;"},
+    "weight": 10000}]}}</pre>
 <p class="more"><a href="${SHIP_STEPS}" data-i18n="shipMore">${copy.shipMore}</a><a href="${V2_REFERENCE}" data-i18n="reference">${copy.reference}</a></p></div>
 </div>
 </section>
