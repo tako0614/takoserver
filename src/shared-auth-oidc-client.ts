@@ -186,7 +186,7 @@ export function createSharedAuthOidcClient(options: {
         })(),
       ]);
     } finally {
-      clearTimeout(timeout);
+      if (timeout !== undefined) clearTimeout(timeout);
     }
   }
 
@@ -260,7 +260,7 @@ export function createSharedAuthOidcClient(options: {
     try {
       const imported = await crypto.subtle.importKey(
         "jwk",
-        key,
+        key as unknown as JsonWebKey,
         { name: "ECDSA", namedCurve: "P-256" },
         false,
         ["verify"],
