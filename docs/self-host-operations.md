@@ -235,7 +235,7 @@ the TLS directory, then write the file with the cursor key printed above:
 install -d -m 0755 /etc/takoserver
 install -m 0640 -o root -g takoserver /dev/null /etc/takoserver/takoserver.env
 install -d -m 0750 -o root -g takoserver /etc/takoserver/tls
-# then: install -m 0640 -o root -g takoserver <certificate> <key> /etc/takoserver/tls/
+# step 4 puts the Worker Endpoint certificate pair in /etc/takoserver/tls/
 ```
 
 Single quotes keep the JSON values intact when a shell sources the file:
@@ -365,6 +365,60 @@ public DNS, CA trust or reachability. The retained
 pre-v2 Worker socket settings (`TAKOSERVER_WORKERD_PORT`,
 `TAKOSERVER_WORKER_ENDPOINT_PORT`) described in the README do not apply to
 `WorkerEndpoint 0.3.0`.
+
+#### DNS, ports and the wildcard certificate
+
+Do this before the first start: the Host refuses to start with
+`TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS=1` until both certificate files exist.
+With the example names used in this guide, the machine needs:
+
+| DNS record | Port | Serves |
+| --- | --- | --- |
+| `api.example.com` | 8443 | The control API, through the front end above |
+| `console.example.com` | 8444 | The console, if you serve it (step 5) |
+| `*.apps.example.com`, an A record only | 443 | Worker Endpoints, served by the Host itself |
+
+The Worker Endpoint listener binds IPv4 only (`0.0.0.0:443`), so do not
+publish an AAAA record for `*.apps.example.com`: IPv6 clients would try an
+address nothing answers. Because the Host holds 443, a front end that obtains
+its own certificates (Caddy does by default) needs TCP 80 open for the
+HTTP-01 challenge.
+
+The Host checks the certificate pair once, at startup. It must cover
+`*.apps.example.com` (the configured suffix), match the key and be currently
+valid, or the Host does not start. A wildcard certificate can only be issued
+through a DNS challenge (ACME DNS-01), which needs API access to the DNS zone.
+Any ACME client works. With certbot and its plugin for the zone's DNS host
+(Cloudflare here; use your provider's plugin and credentials file), as root:
+
+```sh
+apt-get install -y certbot python3-certbot-dns-cloudflare
+install -d -m 0700 /root/.secrets
+install -m 0600 /dev/null /root/.secrets/cloudflare.ini
+# Put one line in it: dns_cloudflare_api_token = <a token that may edit DNS in example.com>
+cat > /usr/local/sbin/takoserver-tls-deploy <<'EOF'
+#!/bin/sh
+# Copies a new certificate where the Host reads it, then restarts the Host
+# if it is running, because the Host reads the pair only at startup.
+set -eu
+live=/etc/letsencrypt/live/apps.example.com
+install -m 0640 -o root -g takoserver "$live/fullchain.pem" /etc/takoserver/tls/apps.example.com.crt
+install -m 0640 -o root -g takoserver "$live/privkey.pem" /etc/takoserver/tls/apps.example.com.key
+systemctl try-restart takoserver.service
+EOF
+chmod 0755 /usr/local/sbin/takoserver-tls-deploy
+certbot certonly --dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cloudflare.ini \
+  -d '*.apps.example.com' --deploy-hook /usr/local/sbin/takoserver-tls-deploy
+```
+
+`takoserver.service` stands for the unit that runs the Host; use its name.
+certbot runs the deploy hook after this first issuance, when `try-restart`
+does nothing because the Host has not started yet, and again after every
+renewal, which the package's `certbot.timer` attempts twice a day.
+`certbot renew --dry-run` tests renewal without replacing the files. A
+renewal restarts the Host, so Worker Endpoints are briefly unavailable; a
+certificate that expires without a restart keeps being served until the next
+start, which then fails.
 
 ### 5. First boot and operator sign-in
 
