@@ -1148,50 +1148,69 @@ are proven; no health GET initiates recovery.
 ## Update and code rollback
 
 Treat an update as selecting a new exact source commit, not as `git pull` on a
-live checkout or as floating to a presumed latest release. Before changing
-source, select and review the intended commit and the exact workerd artifact
-the new checkout expects. Ensure that exact commit is already available in the
-repository, then prepare a separate detached source checkout without moving the
-currently active one:
+live checkout or as floating to a presumed latest release. Review the intended
+commit first, then, as root (the checkout stays root-owned and read-only to
+`takoserver`, as in step 1):
 
-```sh
-git worktree add --detach <new-checkout> <reviewed-commit>
-cd <new-checkout>
-bun install --frozen-lockfile
-```
+1. **Prepare the new checkout beside the running one.** Fetch, check that the
+   commit is present, and add it as a separate detached worktree with its own
+   locked dependencies:
 
-If you serve the console, rebuild it from the new checkout as described under
-[The console](#the-console-optional) when you switch to it.
+   ```sh
+   git -C /opt/takoserver fetch origin
+   git -C /opt/takoserver cat-file -e '<reviewed-commit>^{commit}'
+   git -C /opt/takoserver worktree add --detach /opt/takoserver-<short-commit> <reviewed-commit>
+   cd /opt/takoserver-<short-commit> && bun install --frozen-lockfile
+   ```
 
-Keep the previous source checkout available so a code-only return is possible
-without changing the active source before the operator has selected it. The
-wrapper (`cd /opt/takoserver`) and the unit (`WorkingDirectory=/opt/takoserver`)
-from step 3 both name the checkout that runs: to switch, change that path in
-both and run `systemctl daemon-reload` while the Host is stopped. Keep the same
-protected configuration.
+   Keep the previous checkout: it is what a code-only return runs.
+2. **Check the pinned tools the new checkout expects.** Compare its workerd pin
+   and Go toolchain with what is installed:
 
-If an earlier build ran as root, check `/tmp` first, as described under
-[`/tmp` left at mode 0700](#ordinary-journey-native-test-and-known-gaps). For
-each update, first make the cold snapshot described below. Stop the Bun
-Host and all child/workload writers, deploy the selected source checkout and
-locked dependencies, then start that exact version under the existing
-protected configuration. Startup can apply forward SQLite migrations and
-resume queued work. Confirm startup diagnostics and the v2 discovery endpoint
-`GET /.well-known/takoform/v2`. With an organization API key, check each
-expected exact Form using
-`GET /apis/forms.takoform.com/v2/support?form={exact-form-url}`, then read
-back a known v2 Resource at
-`GET /apis/forms.takoform.com/v2/resources/{resourceUid}`. The legacy
-`GET /v1/forms` catalogue is not a v2 support check. Consider the update in
-service only after these current-surface checks succeed. If any post-start
-result is uncertain, stop further traffic/work through the existing supervisor
-and retain logs and the current database for diagnosis.
+   ```sh
+   grep -o 'sha256: "[0-9a-f]*"' /opt/takoserver-<short-commit>/src/workerd-artifact.ts
+   . /etc/takoserver/takoserver.env && sha256sum "$TAKOSERVER_WORKERD_BINARY"
+   grep '^toolchain' /opt/takoserver-<short-commit>/services/workflow-execution-guard/go.mod
+   ```
+
+   If the workerd digest differs, install the new binary as in step 1 under
+   its new name and change `TAKOSERVER_WORKERD_BINARY`; if the toolchain line
+   differs, install that Go release as in step 1. Either change is made in
+   step 4, while the Host is stopped.
+3. **Snapshot and stop.** If an earlier build ran as root, check `/tmp` first,
+   as described under
+   [`/tmp` left at mode 0700](#ordinary-journey-native-test-and-known-gaps).
+   Make the [cold snapshot](#cold-snapshot) below through its step 4 (its
+   step 2 stops the Host with `systemctl stop takoserver.service` and waits for
+   every writer), and keep the Host stopped instead of restarting it.
+4. **Switch.** Change `/opt/takoserver` to the new checkout's path in both the
+   wrapper (`cd /opt/takoserver`) and the unit
+   (`WorkingDirectory=/opt/takoserver`) from step 3, rebuild the Workflow
+   execution guard from the new checkout as in step 1 (with
+   `cd /opt/takoserver-<short-commit>/services/workflow-execution-guard`), make
+   any change step 2 called for, and run `systemctl daemon-reload`. Keep the
+   same protected configuration otherwise. If you serve the console, rebuild
+   it from the new checkout as described under
+   [The console](#the-console-optional).
+5. **Start and check.** `systemctl start takoserver.service`. Startup can
+   apply forward SQLite migrations and resume queued work. Read the journal
+   for startup diagnostics, then confirm the v2 discovery endpoint
+   `GET /.well-known/takoform/v2`. With an organization API key, check each
+   expected exact Form using
+   `GET /apis/forms.takoform.com/v2/support?form={exact-form-url}`, then read
+   back a known v2 Resource at
+   `GET /apis/forms.takoform.com/v2/resources/{resourceUid}`. The legacy
+   `GET /v1/forms` catalogue is not a v2 support check. Consider the update in
+   service only after these checks succeed. If any result is uncertain, stop
+   the Host and retain the journal and the current database for diagnosis.
 
 Code rollback is not database rollback. To return to the previous code, stop
 the Host and all writers, confirm that the retained previous checkout's
 migration reader recognizes the database's complete recorded history and its
-runtime is compatible with the current persisted state, then select that
-checkout in the existing supervisor and restart it. Perform the same startup,
+runtime is compatible with the current persisted state, then switch the
+wrapper and unit back to that checkout as in step 4 above (rebuilding the guard
+from it if the toolchain differs), run `systemctl daemon-reload` and start the
+Host. Perform the same startup,
 Forms, and authenticated Resource readback checks as for an update. Do not test
 an unknown older binary by starting it against the primary database. Never
 restore an older database over the current one merely to make an older binary
