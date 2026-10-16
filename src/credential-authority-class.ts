@@ -1,3 +1,4 @@
+import type { CapturedAuthTokenRow } from "./auth.ts";
 import type { Row, Sql, SqlParam, SqlStatement } from "./ports.ts";
 import {
   type AuthAuthorityDigest,
@@ -343,6 +344,7 @@ function tokenIssuance(
   kind: "direct-owner-session" | "direct-exact-org-key" | "official-shared-broker",
   organizationId: string | null,
   direct?: { readonly anchor: PrincipalAnchor; readonly domain: IdentityAuthorityDomain },
+  additionalGuard?: AuthCurrentnessPredicate,
 ): SqlStatement {
   const selected = origin(input);
   const credential = token(identity);
@@ -380,6 +382,12 @@ function tokenIssuance(
       ...(domain ? [domain.body, domain.digest] : [selected.targetRef]),
     ]),
   });
+  const mandatoryGuard = additionalGuard
+    ? Object.freeze({
+        sql: `(${guard.sql}) AND (${additionalGuard.sql})`,
+        params: Object.freeze([...guard.params, ...additionalGuard.params]),
+      })
+    : guard;
   return insert(
     [
       ...base(selected, kind, "auth-token", organizationId),
@@ -389,7 +397,7 @@ function tokenIssuance(
       ["token_scopes_json", credential.scopesJson],
       ["token_created_at", credential.createdAt],
     ],
-    guard,
+    mandatoryGuard,
   );
 }
 
@@ -423,6 +431,87 @@ export function createCredentialAuthorityClassStore(options: { readonly sql: Sql
         "direct-exact-org-key",
         authAuthorityText(organizationId),
         { anchor, domain },
+      );
+    },
+    /**
+     * Selected-key class statement with the original source and branch guard
+     * repeated at the mandatory last INSERT. The token INSERT must use a plain
+     * ID conflict (never ON CONFLICT DO NOTHING); this does not issue a key.
+     */
+    directKeyFromOwnerSessionStatement(
+      input: CredentialAuthorityOrigin,
+      credential: TokenAuthorityIdentity,
+      organizationId: string,
+      anchor: PrincipalAnchor,
+      domain: IdentityAuthorityDomain,
+      sourceRecord: TokenAuthorityRecord,
+      captured: CapturedAuthTokenRow,
+      key: { readonly name: string; readonly exclusiveUnrevokedName?: string },
+    ): SqlStatement {
+      const organization = authAuthorityText(organizationId);
+      const name = authAuthorityText(key.name, 128);
+      const issued = token(credential);
+      const source = directOwnerKeySourceCurrentness(
+        sourceRecord,
+        anchor,
+        domain,
+        captured,
+        organization,
+      );
+      const exclusive = key.exclusiveUnrevokedName;
+      if (exclusive !== undefined && exclusive !== name)
+        throw new AuthAuthorityStoreError("invalid");
+      const branch: AuthCurrentnessPredicate = Object.freeze({
+        sql: `EXISTS (SELECT 1 FROM auth_tokens issued
+          WHERE issued.id=? AND issued.secret_digest=? AND issued.kind='api_key'
+            AND issued.principal_id=? AND issued.org_id=? AND issued.name=?
+            AND issued.scopes_json=? AND issued.created_at=?
+            AND issued.revoked_at IS NULL)
+          ${
+            exclusive === undefined
+              ? ""
+              : `AND NOT EXISTS (SELECT 1 FROM auth_tokens competing
+                WHERE competing.org_id=? AND competing.kind='api_key'
+                  AND competing.name=? AND competing.revoked_at IS NULL
+                  AND NOT (competing.id IS ? AND competing.secret_digest IS ?
+                    AND competing.principal_id IS ? AND competing.org_id IS ?
+                    AND competing.scopes_json IS ? AND competing.created_at IS ?))`
+          }`,
+        params: Object.freeze([
+          issued.id,
+          issued.digest,
+          authAuthorityText(input.principalId),
+          organization,
+          name,
+          issued.scopesJson,
+          issued.createdAt,
+          ...(exclusive === undefined
+            ? []
+            : [
+                organization,
+                exclusive,
+                issued.id,
+                issued.digest,
+                input.principalId,
+                organization,
+                issued.scopesJson,
+                issued.createdAt,
+              ]),
+        ]),
+      });
+      return tokenIssuance(
+        input,
+        issued,
+        "direct-exact-org-key",
+        organization,
+        {
+          anchor,
+          domain,
+        },
+        {
+          sql: `(${source.sql}) AND (${branch.sql})`,
+          params: [...source.params, ...branch.params],
+        },
       );
     },
     sharedBrokerIssuanceStatement(
@@ -499,6 +588,35 @@ export function createCredentialAuthorityClassStore(options: { readonly sql: Sql
       );
       if (rows.length > 1) throw new AuthAuthorityStoreError("unavailable");
       return rows[0] ? fromRow(rows[0]) : null;
+    },
+    /** Exact retained source class lookup, not a grant from a token id. */
+    async readActiveDirectOwnerSessionByToken(input: {
+      readonly id: string;
+      readonly digest: AuthAuthorityDigest;
+    }): Promise<TokenAuthorityRecord | null> {
+      const id = authAuthorityText(input.id);
+      const digest = authAuthorityDigest(input.digest);
+      const rows = await sql.query(
+        `SELECT * FROM credential_authority_classes
+         WHERE backend='auth-token' AND class='direct-owner-session' AND state='active'
+           AND token_id=? AND token_digest=?`,
+        [id, digest],
+      );
+      if (rows.length > 1) throw new AuthAuthorityStoreError("unavailable");
+      if (!rows[0]) return null;
+      const record = fromRow(rows[0]);
+      if (
+        record.backend !== "auth-token" ||
+        record.class !== "direct-owner-session" ||
+        record.state !== "active" ||
+        record.tokenKind !== "session" ||
+        record.organizationId !== null ||
+        record.token.id !== id ||
+        record.token.digest !== digest
+      ) {
+        throw new AuthAuthorityStoreError("unavailable");
+      }
+      return record;
     },
     async retire(
       expected: CredentialAuthorityOrigin,
@@ -595,6 +713,51 @@ export function directCredentialCurrentness(
       domain.body,
       domain.digest,
     ]),
+  });
+}
+
+/**
+ * Fixed same-primary source-session and current Org-owner predicate for a later
+ * selected direct-key INSERT. The caller must retain an original factory-private
+ * token capture; these structural inputs and a standalone SELECT grant nothing.
+ */
+export function directOwnerKeySourceCurrentness(
+  record: TokenAuthorityRecord,
+  anchor: PrincipalAnchor,
+  selectedDomain: IdentityAuthorityDomain,
+  captured: CapturedAuthTokenRow,
+  organizationId: string,
+): AuthCurrentnessPredicate {
+  if (
+    !record ||
+    !captured ||
+    !Array.isArray(captured.scopes) ||
+    record.class !== "direct-owner-session" ||
+    record.backend !== "auth-token" ||
+    record.state !== "active" ||
+    record.tokenKind !== "session" ||
+    record.organizationId !== null ||
+    captured.kind !== "session" ||
+    captured.organizationId !== null ||
+    captured.scopesJson !== "[]" ||
+    captured.scopes.length !== 0 ||
+    record.token.id !== captured.tokenId ||
+    record.token.digest !== captured.digest ||
+    record.token.scopesJson !== captured.scopesJson ||
+    record.token.createdAt !== captured.createdAt ||
+    record.origin.principalId !== captured.principalId
+  ) {
+    throw new AuthAuthorityStoreError("conflict");
+  }
+  authAuthorityTime(captured.createdAt);
+  const organization = authAuthorityText(organizationId);
+  const source = directCredentialCurrentness(record, anchor, selectedDomain, captured.expiresAt);
+  return Object.freeze({
+    sql: `(${source.sql}) AND EXISTS (
+      SELECT 1 FROM orgs o JOIN org_memberships m
+        ON m.org_id=o.id AND m.principal_id=o.owner_principal_id AND m.role='owner'
+      WHERE o.id=? AND o.owner_principal_id=?)`,
+    params: Object.freeze([...source.params, organization, captured.principalId]),
   });
 }
 
