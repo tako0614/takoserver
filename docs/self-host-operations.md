@@ -150,8 +150,8 @@ The data root needs four things; the Host enforces the first two at startup:
   and every directory above it must be owned by root or by the Host's user, and
   no other user may be able to write to them, except a sticky root-owned one
   such as `/tmp`. A group-writable ancestor (for example under umask 002, or a
-  Kubernetes `fsGroup` volume with mode 2775) is refused; tighten it with `chmod
-  g-w`.
+  Kubernetes `fsGroup` volume with mode 2775) is refused; tighten it with
+  `chmod g-w`.
 - **One stable path on one machine.** At startup the Host resolves
   `TAKOSERVER_DATA_ROOT` once to an absolute, canonical path: a relative value,
   including the default, is relative to the working directory, and symlinks in
