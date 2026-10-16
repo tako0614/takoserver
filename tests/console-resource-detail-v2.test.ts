@@ -699,6 +699,8 @@ test("a Worker's page lists what names it, with the address an Endpoint publishe
   expect(contract?.attributes.get("href")).toBe(
     "https://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/",
   );
+  expect(contract?.attributes.get("target")).toBe("_blank");
+  expect(contract?.attributes.get("rel")).toBe("noopener noreferrer");
   expect(text).toContain("Formhttps://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/");
   // The Host's phase reads as words, with the API's own value beside it.
   expect(text).toContain("Host workNone (settled) · idle");
@@ -858,4 +860,18 @@ test("the overview shows each Worker with its state and address", async () => {
   ).toBe(false);
   expect(body.textContent).toContain("https://draft.apps.example.com/");
   expect(body.textContent).toContain("Pending");
+});
+
+test("says what the Host is doing for each v2 phase, and never calls an unknown one settled", async () => {
+  installDom();
+  const { HOST_WORK, hostWork } = await import("../console/src/pages/resource-detail.ts");
+  expect(HOST_WORK).toEqual({
+    pending: ["処理中", "In progress"],
+    deleting: ["削除中", "Deleting"],
+    error: ["失敗", "Failed"],
+    idle: ["なし（完了）", "None (settled)"],
+  });
+  // The four phases the v2 API reports, and nothing else, have words.
+  expect(Object.keys(HOST_WORK).sort()).toEqual(["deleting", "error", "idle", "pending"]);
+  expect(hostWork("migrating")).toBe("migrating");
 });

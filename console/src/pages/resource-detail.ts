@@ -134,18 +134,23 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
         ),
         h(
           "p",
-          { class: "dim" },
-          h(
-            "a",
-            { href: found.form, target: "_blank", rel: "noopener noreferrer" },
-            formLabel(found.form),
-            h("span", { "aria-hidden": "true" }, " ↗"),
-            h(
-              "span",
-              { class: "visually-hidden" },
-              tr("（公開仕様、新しいタブで開きます）", " (published contract, opens in a new tab)"),
-            ),
-          ),
+          { class: "published" },
+          httpsUrl(found.form)
+            ? h(
+                "a",
+                { href: found.form, target: "_blank", rel: "noopener noreferrer" },
+                formLabel(found.form),
+                h("span", { "aria-hidden": "true" }, " ↗"),
+                h(
+                  "span",
+                  { class: "visually-hidden" },
+                  tr(
+                    "（公開仕様、新しいタブで開きます）",
+                    " (published contract, opens in a new tab)",
+                  ),
+                ),
+              )
+            : formLabel(found.form),
         ),
         url
           ? h(
@@ -156,6 +161,7 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
                 { href: url, target: "_blank", rel: "noopener noreferrer" },
                 url,
                 h("span", { "aria-hidden": "true" }, " ↗"),
+                newTab(),
               ),
             )
           : null,
@@ -340,6 +346,7 @@ function referrersCard(organizationId: string, uid: string): Child {
                     { href: url, target: "_blank", rel: "noopener noreferrer" },
                     url,
                     h("span", { "aria-hidden": "true" }, " ↗"),
+                    newTab(),
                   )
                 : null,
             ),
@@ -350,17 +357,34 @@ function referrersCard(organizationId: string, uid: string): Child {
   });
 }
 
-/** What the Host is doing with a Resource, from its v2 phase. */
-function hostWork(phase: ResourceSummary["phase"]): string {
-  switch (phase) {
-    case "pending":
-      return tr("処理中", "In progress");
-    case "deleting":
-      return tr("削除中", "Deleting");
-    case "error":
-      return tr("失敗", "Failed");
-    default:
-      return tr("なし（完了）", "None (settled)");
+/** What the Host is doing with a Resource, for each v2 phase, as [Japanese, English]. */
+export const HOST_WORK: Readonly<Record<string, readonly [string, string]>> = {
+  pending: ["処理中", "In progress"],
+  deleting: ["削除中", "Deleting"],
+  error: ["失敗", "Failed"],
+  // Set only when the last Operation succeeded and nothing is running.
+  idle: ["なし（完了）", "None (settled)"],
+};
+
+/** A phase this Console does not know is shown as the Host wrote it, never as settled. */
+export function hostWork(phase: string): string {
+  const words = HOST_WORK[phase];
+  return words ? tr(...words) : phase;
+}
+
+function newTab(): Child {
+  return h(
+    "span",
+    { class: "visually-hidden" },
+    tr("（新しいタブで開きます）", " (opens in a new tab)"),
+  );
+}
+
+function httpsUrl(value: string): boolean {
+  try {
+    return new URL(value).protocol === "https:";
+  } catch {
+    return false;
   }
 }
 
