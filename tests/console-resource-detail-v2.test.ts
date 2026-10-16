@@ -534,7 +534,7 @@ test("a Worker's page lists what names it, with the address an Endpoint publishe
   expect(cursors).toEqual([null, "page-2"]);
   const text = body.textContent;
   expect(text).toContain("Referenced by");
-  expect(text).not.toContain("first 500 checked");
+  expect(text).not.toMatch(/first \d+ checked/);
   expect(text).toContain("hello-version-v1");
   expect(text).toContain("hello-endpoint");
   expect(text).toContain("as worker");
