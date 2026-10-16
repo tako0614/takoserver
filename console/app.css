@@ -184,9 +184,11 @@ textarea {
 
 /* ---------------------------------------------------------------- shell -- */
 
+/* minmax(0, 1fr): the page column never grows past the window to fit the
+   top bar; the bar's own controls give way instead. */
 .shell {
   display: grid;
-  grid-template-columns: var(--rail) 1fr;
+  grid-template-columns: var(--rail) minmax(0, 1fr);
   grid-template-rows: var(--header) 1fr;
   grid-template-areas: "brand top" "rail main";
   min-height: 100vh;
@@ -224,6 +226,22 @@ textarea {
   flex: 0 1 auto;
   min-width: 4em;
   text-overflow: ellipsis;
+}
+
+/* A long signed-in name is cut so it cannot crowd out the picker; a wide
+   window shows more of it. */
+.topbar__who {
+  display: inline-block;
+  max-width: 10em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (width >= 900px) {
+  .topbar__who {
+    max-width: 18em;
+  }
 }
 
 .rail {
@@ -295,7 +313,7 @@ textarea {
      section stays visible after a route change, and only the page itself
      takes the remaining height. */
   .shell {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
     grid-template-rows: var(--header) auto auto 1fr;
     grid-template-areas: "brand" "top" "rail" "main";
   }
@@ -328,14 +346,6 @@ textarea {
   .topbar {
     min-height: 48px;
     overflow-x: auto;
-  }
-
-  .topbar__who {
-    display: inline-block;
-    max-width: 10em;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
 
   .main {
@@ -425,6 +435,15 @@ textarea {
   letter-spacing: 0.05em;
   text-transform: uppercase;
   color: var(--ink-4);
+}
+
+/* An exact Form URL keeps its case and wraps inside its card. */
+.stat__form {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  letter-spacing: 0;
+  color: var(--ink-3);
+  overflow-wrap: anywhere;
 }
 
 .stat__value {
