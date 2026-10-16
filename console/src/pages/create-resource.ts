@@ -1,5 +1,5 @@
 import { ApiError, type ResourceSummary } from "../api.ts";
-import { h } from "../dom.ts";
+import { h, live } from "../dom.ts";
 import {
   blankPaths,
   pathLabel,
@@ -12,6 +12,8 @@ import {
 } from "../form-specs.ts";
 import { formLabel, KNOWN_FORM_GROUPS } from "../forms.ts";
 import { tr } from "../i18n.ts";
+import { resource } from "../reactive.ts";
+import { findReferrers } from "../referrers.ts";
 import {
   isUnknownAcceptance,
   prepareResourceIntent,
@@ -19,7 +21,8 @@ import {
   resourceIntentRequestBody,
   sendResourceIntent,
 } from "../resource-intent.ts";
-import { navigate } from "../router.ts";
+import { health } from "../resource-state.ts";
+import { linkProps, navigate, resourcePath } from "../router.ts";
 import { api, currentOrganization } from "../state.ts";
 import { copyable, explain, openModal, toast } from "../ui.ts";
 
@@ -810,14 +813,38 @@ export function updateResource(
 }
 
 /** Destructive delete requires a separate explicit confirmation. */
-export function deleteResource(organizationId: string, resource: ResourceSummary): void {
+/** A link out of a dialog: it closes the dialog, then navigates as any link does. */
+function openFromDialog(href: string, close: () => void): Record<string, unknown> {
+  const link = linkProps(href);
+  const follow = link.onClick as (event: MouseEvent) => void;
+  return {
+    ...link,
+    onClick: (event: MouseEvent) => {
+      close();
+      follow(event);
+    },
+  };
+}
+
+/**
+ * Deleting: what the Host removes, and first what still names this Resource.
+ * The Host refuses to delete a Resource another still names, so while any
+ * does, the dialog lists them and the delete is not offered.
+ */
+export function deleteResource(organizationId: string, target: ResourceSummary): void {
   const key = `console-delete-${crypto.randomUUID()}`;
-  const path = `/apis/forms.takoform.com/v2/resources/${encodeURIComponent(resource.uid)}`;
+  const path = `/apis/forms.takoform.com/v2/resources/${encodeURIComponent(target.uid)}`;
+  const naming = resource(() => findReferrers(organizationId, target.uid));
+  const blocking = (): readonly ResourceSummary[] => {
+    const state = naming.get();
+    return state.state === "ready" ? state.value.referrers.map((entry) => entry.resource) : [];
+  };
   let intent: ResourceIntent | null = null;
   const close = openModal({
-    title: tr(`${resource.name}を削除しますか？`, `Delete ${resource.name}?`),
+    title: tr(`${target.name}を削除しますか？`, `Delete ${target.name}?`),
     confirmLabel: tr("リソースを削除", "Delete resource"),
     confirmTone: "danger",
+    confirmBlocked: () => naming.get().state === "loading" || blocking().length > 0,
     body: h(
       "div",
       { style: { display: "grid", gap: "14px" } },
@@ -825,11 +852,73 @@ export function deleteResource(organizationId: string, resource: ResourceSummary
         "div",
         { class: "notice notice--bad" },
         tr(
-          "実体と保存されているデータが削除されます。この操作は元に戻せません。",
-          "The backend resource and its data may be destroyed. This cannot be undone.",
+          "Hostからこのリソースを削除し、そのために動かしているものや保持しているものも削除します。データベースならデータが失われ、Endpointなら応答しなくなります。この操作は元に戻せません。",
+          "The Host deletes this Resource and what it runs or keeps for it: a database loses its data, and an Endpoint stops answering. This cannot be undone.",
         ),
       ),
-      requestDisclosure(recoveryDetails(key, "DELETE", path, null, resource.generation)),
+      live(() => {
+        const state = naming.get();
+        if (state.state === "loading")
+          return h(
+            "small",
+            null,
+            tr(
+              "このリソースを参照しているものを確認しています…",
+              "Checking what names this Resource…",
+            ),
+          );
+        if (state.state === "error")
+          return h(
+            "small",
+            null,
+            tr(
+              "このリソースを参照しているものを確認できませんでした。まだ参照しているリソースがあれば、Hostは削除を受け付けません。",
+              "Couldn't check what names this Resource. If another still names it, the Host refuses the delete.",
+            ),
+          );
+        const { referrers, complete } = state.value;
+        if (referrers.length === 0)
+          return complete
+            ? null
+            : h(
+                "small",
+                null,
+                tr(
+                  "参照しているリソースをすべては確認できませんでした。まだ参照しているリソースがあれば、Hostは削除を受け付けません。",
+                  "Not everything that might name this Resource could be checked. If another still names it, the Host refuses the delete.",
+                ),
+              );
+        return h(
+          "div",
+          { class: "notice notice--warn", style: { display: "grid", gap: "8px" } },
+          h(
+            "span",
+            null,
+            tr(
+              "次のリソースがまだこのリソースを参照しているため、Hostは削除を受け付けません。先にこれらを削除してください。",
+              "The Host refuses this delete while these still name it. Delete them first.",
+            ),
+          ),
+          h(
+            "ul",
+            { style: { margin: "0", paddingLeft: "18px" } },
+            ...referrers.map(({ resource: referrer }) =>
+              h(
+                "li",
+                null,
+                h(
+                  "a",
+                  { class: "mono", ...openFromDialog(resourcePath(referrer.uid), () => close()) },
+                  referrer.name,
+                ),
+                ` ${formLabel(referrer.form)}`,
+                health(referrer).phase === "Deleting" ? tr("（削除中）", " (being deleted)") : "",
+              ),
+            ),
+          ),
+        );
+      }),
+      requestDisclosure(recoveryDetails(key, "DELETE", path, null, target.generation)),
     ),
     onConfirm: async () => {
       if (!sameOrganization(organizationId)) return;
@@ -839,7 +928,7 @@ export function deleteResource(organizationId: string, resource: ResourceSummary
           if (!sameOrganization(organizationId)) return;
           intent = prepareResourceIntent(
             organizationId,
-            { action: "delete", uid: resource.uid, generation: resource.generation },
+            { action: "delete", uid: target.uid, generation: target.generation },
             replayWindowSeconds,
             key,
           );

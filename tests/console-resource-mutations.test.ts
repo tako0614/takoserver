@@ -1346,13 +1346,18 @@ test("a Form the Host did not answer for is marked, and typing a URL stays a pla
   ).toBe(false);
 });
 
-test("delete requires explicit confirmation and retains the UID/generation fence", async () => {
+/** The delete dialog for `one`, against a Host whose full list is `listed`. */
+async function deleteDialog(listed: ResourceSummary[] | null) {
   const { body, route } = await setup();
   const { deleteResource } = await import("../console/src/pages/create-resource.ts");
   const seen: Request[] = [];
   globalThis.fetch = Object.assign(
     async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
+      if (request.method === "GET" && new URL(request.url).pathname.endsWith("/resources"))
+        return listed === null
+          ? Response.json({ error: { code: "unavailable" } }, { status: 503 })
+          : Response.json({ items: listed, nextCursor: null });
       if (request.method === "GET") return Response.json(discovery);
       seen.push(request);
       return Response.json({ ...op, action: "delete", generation: 2 }, { status: 202 });
@@ -1360,8 +1365,14 @@ test("delete requires explicit confirmation and retains the UID/generation fence
     { preconnect: globalThis.fetch.preconnect },
   );
   deleteResource("org-console", one);
+  return { body, route, seen };
+}
+
+test("delete requires explicit confirmation and retains the UID/generation fence", async () => {
+  const { body, route, seen } = await deleteDialog([one, two]);
   expect(seen).toHaveLength(0);
   expect(body.textContent).toContain("cannot be undone");
+  await settle();
   button(body, "Delete resource").click();
   await settle();
   expect(seen).toHaveLength(1);
@@ -1371,6 +1382,34 @@ test("delete requires explicit confirmation and retains the UID/generation fence
     "/apis/forms.takoform.com/v2/resources/uid-one",
   );
   expect(route().query.get("operation")).toBe(op.id);
+});
+
+test("delete lists what still names the Resource and is not offered until nothing does", async () => {
+  const naming = { ...two, name: "names-one", spec: { target: { resourceUid: "uid-one" } } };
+  const { body, seen } = await deleteDialog([one, naming]);
+  // Until the check answers, the delete is not offered either.
+  expect(button(body, "Delete resource").disabled).toBe(true);
+  await settle();
+  expect(body.textContent).toContain(
+    "The Host refuses this delete while these still name it. Delete them first.",
+  );
+  const link = body.all().find((node) => node.tag === "a" && node.textContent === "names-one");
+  expect(link?.attributes.get("href")).toBe("/resources/uid-two");
+  expect(button(body, "Delete resource").disabled).toBe(true);
+  button(body, "Delete resource").click();
+  await settle();
+  expect(seen).toHaveLength(0);
+});
+
+test("delete that could not check what names the Resource says so and stays offered", async () => {
+  const { body, seen } = await deleteDialog(null);
+  await settle();
+  expect(body.textContent).toContain(
+    "Couldn't check what names this Resource. If another still names it, the Host refuses the delete.",
+  );
+  button(body, "Delete resource").click();
+  await settle();
+  expect(seen).toHaveLength(1);
 });
 
 test("update uses the observed UID and generation rather than a name-based path", async () => {
