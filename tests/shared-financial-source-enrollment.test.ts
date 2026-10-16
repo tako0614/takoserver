@@ -57,6 +57,26 @@ const TABLES = [
 ] as const;
 const count = (db: Database, table: string) =>
   db.query(`SELECT count(*) AS n FROM ${table}`).get() as { n: number };
+function withGuardDisabled(db: Database, name: string, mutate: () => void) {
+  const guard = db
+    .query("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?")
+    .get(name) as { sql: string } | null;
+  if (!guard) throw Error(`missing trigger ${name}`);
+  db.exec(`DROP TRIGGER ${name}`);
+  try {
+    mutate();
+  } finally {
+    db.exec(guard.sql);
+  }
+}
+function withForeignKeysDisabled(db: Database, mutate: () => void) {
+  db.exec("PRAGMA foreign_keys=OFF");
+  try {
+    mutate();
+  } finally {
+    db.exec("PRAGMA foreign_keys=ON");
+  }
+}
 function event(affectedRef = A): FinancialSourceEvent {
   return {
     v: 1,
@@ -85,6 +105,8 @@ async function fixture() {
   const base = createSqliteSql(db);
   let clockCalls = 0,
     batchCalls = 0,
+    queryCalls = 0,
+    runCalls = 0,
     readFailure = false,
     dropAck = false;
   let fault: ((s: readonly SqlStatement[]) => readonly SqlStatement[]) | undefined;
@@ -92,13 +114,17 @@ async function fixture() {
   const failures: string[] = [];
   const sql: Sql = {
     query: async (q, p) => {
+      queryCalls++;
       if (readFailure) {
         readFailure = false;
         throw new SqlError("unavailable", "injected readback loss");
       }
       return base.query(q, p);
     },
-    run: (q, p) => base.run(q, p),
+    run: (q, p) => {
+      runCalls++;
+      return base.run(q, p);
+    },
     batch: async (s) => {
       batchCalls++;
       batches.push(s);
@@ -274,6 +300,12 @@ async function fixture() {
     },
     get batchCalls() {
       return batchCalls;
+    },
+    get queryCalls() {
+      return queryCalls;
+    },
+    get runCalls() {
+      return runCalls;
     },
     get providerRequests() {
       return providerRequests;
@@ -569,6 +601,357 @@ describe("private C0 and explicit M component", () => {
       expect(f.clockCalls).toBe(before);
       expect(f.db.query("SELECT sequence FROM financial_source_heads").get()).toEqual({
         sequence: 1,
+      });
+    } finally {
+      f.close();
+    }
+  });
+  test("GET recovery reads the exact committed M after a lost ACK without resending install", async () => {
+    const f = await fixture();
+    try {
+      const cmd = await f.command();
+      f.drop();
+      await expect(f.m().install(cmd)).rejects.toMatchObject({ code: "unavailable" });
+      expect(f.counts()).toEqual([0, 0, 1, 1]);
+      const before = {
+        batches: f.batchCalls,
+        runs: f.runCalls,
+        clock: f.clockCalls,
+        provider: f.providerRequests,
+        queries: f.queryCalls,
+        materialization: f.db.query("SELECT * FROM financial_source_materializations").get(),
+        receipt: f.db.query("SELECT * FROM financial_source_materialization_receipts").get(),
+      };
+      expect(await f.m().readOriginal(cmd)).toEqual({
+        materializationRef: cmd.materializationRef,
+        commandRef: cmd.commandRef,
+        receiptRef: cmd.receiptRef,
+      });
+      expect(f.queryCalls).toBeGreaterThan(before.queries);
+      expect(f.batchCalls).toBe(before.batches);
+      expect(f.runCalls).toBe(before.runs);
+      expect(f.clockCalls).toBe(before.clock);
+      expect(f.providerRequests).toBe(before.provider);
+      expect(f.db.query("SELECT * FROM financial_source_materializations").get()).toEqual(
+        before.materialization,
+      );
+      expect(f.db.query("SELECT * FROM financial_source_materialization_receipts").get()).toEqual(
+        before.receipt,
+      );
+    } finally {
+      f.close();
+    }
+  });
+  test("GET recovery distinguishes complete absence from a conflicting command, vector, source, receiver or genesis", async () => {
+    const f = await fixture();
+    try {
+      const cmd = await f.command();
+      expect(await f.m().readOriginal(cmd)).toBeUndefined();
+      await f.m().install(cmd);
+      const unknown = await f.command("parent:unknown", "unknown");
+      expect(await f.m("parent:unknown").readOriginal(unknown)).toBeUndefined();
+      await f.m("parent:two", "genesis:two").install(await f.command("parent:two", "two"));
+      expect(await f.m("parent:unknown").readOriginal(unknown)).toBeUndefined();
+      const alienSibling = createFinancialSourceMaterializationStore({
+        ...f.common,
+        source: { ...f.source, originRef: "origin:other" },
+        affectedRef: "parent:unknown",
+        genesisQualificationRef: GQ,
+      });
+      await expect(alienSibling.readOriginal(unknown)).rejects.toMatchObject({
+        code: "unavailable",
+      });
+      await expect(
+        f.m().readOriginal({
+          ...cmd,
+          materializationRef: "materialization:other",
+          commandRef: "command:other",
+          receiptRef: "m-receipt:other",
+        }),
+      ).rejects.toMatchObject({ code: "conflict" });
+      await expect(
+        f.m().readOriginal({
+          ...cmd,
+          materialization: { ...cmd.materialization, rawEventDigest: G },
+        }),
+      ).rejects.toMatchObject({ code: "conflict" });
+      await expect(
+        f.m().readOriginal({
+          ...cmd,
+          materialization: { ...cmd.materialization, eventDigest: G },
+        }),
+      ).rejects.toMatchObject({ code: "invalid_request" });
+      await expect(f.m(A, "genesis:other").readOriginal(cmd)).rejects.toMatchObject({
+        code: "conflict",
+      });
+      const otherOrigin = createFinancialSourceMaterializationStore({
+        ...f.common,
+        source: { ...f.source, originRef: "origin:other" },
+        affectedRef: A,
+        genesisQualificationRef: GQ,
+      });
+      await expect(otherOrigin.readOriginal(cmd)).rejects.toMatchObject({ code: "conflict" });
+      const otherReceiver = createFinancialSourceMaterializationStore({
+        ...f.common,
+        receiverRef: "receiver:other",
+        targetRef: "target:other",
+        source: {
+          ...f.source,
+          registration: {
+            ...REG,
+            receivers: [
+              ...REG.receivers,
+              { receiverRef: "receiver:other", targetRef: "target:other" },
+            ],
+          },
+        },
+        affectedRef: A,
+        genesisQualificationRef: GQ,
+      });
+      await expect(otherReceiver.readOriginal(cmd)).rejects.toMatchObject({ code: "conflict" });
+    } finally {
+      f.close();
+    }
+  });
+  test("GET recovery snapshots command input before its first await and propagates SQL errors", async () => {
+    const f = await fixture();
+    try {
+      const cmd = await f.command();
+      await f.m().install(cmd);
+      const mutable = structuredClone(cmd);
+      const read = f.m().readOriginal(mutable);
+      (mutable as { commandRef: string }).commandRef = "command:mutated";
+      (mutable.materialization.event as { affectedRef: string }).affectedRef = "parent:mutated";
+      expect(await read).toMatchObject({ commandRef: cmd.commandRef, receiptRef: cmd.receiptRef });
+      f.failRead();
+      await expect(f.m().readOriginal(cmd)).rejects.toMatchObject({ code: "unavailable" });
+    } finally {
+      f.close();
+    }
+  });
+  test("GET recovery retains the original M after receiver advance, close, retirement, payer loss, epoch rotation and freeze", async () => {
+    const f = await fixture();
+    try {
+      const cmd = await f.command();
+      const original = await f.m().install(cmd);
+      const advanced = await f.receiver().applySourceEvent(cmd.materialization.event);
+      expect(await f.m().readOriginal(cmd)).toEqual(original);
+      const closeEvent: FinancialSourceEvent = {
+        ...cmd.materialization.event,
+        eventRef: "event:close",
+        evidenceRef: "evidence:close",
+        sequence: 2,
+        previousDigest: advanced.eventDigest,
+        kind: "close",
+      };
+      const closingReceiver = createSharedFinancialSourceReceiver({
+        ...f.common,
+        registration: REG,
+        registrationDigest: D,
+        qualificationRef: Q,
+        evidence: {
+          async readImmutableEvent(ref: string) {
+            return ref === closeEvent.eventRef
+              ? {
+                  qualificationRef: Q,
+                  receiverRef: R,
+                  targetRef: T,
+                  genesisQualificationRef: GQ,
+                  registration: REG,
+                  event: closeEvent,
+                }
+              : null;
+          },
+        },
+      });
+      await closingReceiver.applySourceEvent(closeEvent);
+      expect(f.db.query("SELECT sequence,state FROM financial_source_heads").get()).toEqual({
+        sequence: 2,
+        state: "closed",
+      });
+      expect(await f.m().readOriginal(cmd)).toEqual(original);
+      await f.base.run(
+        "UPDATE financial_source_registrations SET retirement_ref='retirement:one',retired_at=? WHERE registration_ref=?",
+        [AT, REG.registrationRef],
+      );
+      await f.base.run("UPDATE money_cutover_authorized_epoch SET writer_epoch=?", [D]);
+      await f.base.run(
+        "INSERT INTO money_cutover_freeze VALUES(1,'binding','origin','backup','writer','source')",
+      );
+      withGuardDisabled(f.db, "stripe_billing_account_realms_no_delete", () => {
+        f.db.exec("DELETE FROM stripe_billing_account_realms");
+      });
+      const before = { batches: f.batchCalls, runs: f.runCalls, clock: f.clockCalls };
+      expect(await f.m().readOriginal(cmd)).toEqual(original);
+      expect(f.batchCalls).toBe(before.batches);
+      expect(f.runCalls).toBe(before.runs);
+      expect(f.clockCalls).toBe(before.clock);
+    } finally {
+      f.close();
+    }
+  });
+  for (const scenario of [
+    {
+      name: "missing receipt",
+      code: "unavailable",
+      mutate: (db: Database) =>
+        withGuardDisabled(db, "financial_source_materialization_receipts_no_delete", () => {
+          db.exec("DELETE FROM financial_source_materialization_receipts");
+        }),
+    },
+    {
+      name: "receipt tuple mismatch",
+      code: "unavailable",
+      mutate: (db: Database) =>
+        withForeignKeysDisabled(db, () =>
+          withGuardDisabled(db, "financial_source_materialization_receipts_no_update", () => {
+            db.exec(
+              "UPDATE financial_source_materialization_receipts SET registration_ref='registration:other'",
+            );
+          }),
+        ),
+    },
+    {
+      name: "receipt record mismatch",
+      code: "unavailable",
+      mutate: (db: Database) =>
+        withGuardDisabled(db, "financial_source_materialization_receipts_no_update", () => {
+          db.exec(
+            "UPDATE financial_source_materialization_receipts SET record_json=json_set(record_json,'$.receiptRef','m-receipt:other')",
+          );
+        }),
+    },
+    {
+      name: "orphan receipt without materialization",
+      code: "unavailable",
+      mutate: (db: Database) =>
+        withForeignKeysDisabled(db, () =>
+          withGuardDisabled(db, "financial_source_materializations_no_delete", () => {
+            db.exec("DELETE FROM financial_source_materializations");
+          }),
+        ),
+    },
+    {
+      name: "missing head",
+      code: "unavailable",
+      mutate: (db: Database) =>
+        withForeignKeysDisabled(db, () =>
+          withGuardDisabled(db, "financial_source_heads_no_delete", () => {
+            db.exec("DELETE FROM financial_source_heads");
+          }),
+        ),
+    },
+    {
+      name: "head genesis mismatch",
+      code: "unavailable",
+      mutate: (db: Database) =>
+        withGuardDisabled(db, "financial_source_head_advance", () => {
+          db.exec("UPDATE financial_source_heads SET genesis_qualification_ref='genesis:other'");
+        }),
+    },
+    {
+      name: "missing registration",
+      code: "unavailable",
+      mutate: (db: Database) =>
+        withForeignKeysDisabled(db, () =>
+          withGuardDisabled(db, "financial_source_registrations_no_delete", () => {
+            db.exec("DELETE FROM financial_source_registrations");
+          }),
+        ),
+    },
+    {
+      name: "registration genesis mismatch",
+      code: "unavailable",
+      mutate: (db: Database) =>
+        withGuardDisabled(db, "financial_source_registration_retire_only", () => {
+          db.exec(`UPDATE financial_source_registrations SET genesis_digest='${D}'`);
+        }),
+    },
+    {
+      name: "saved realm mismatch",
+      code: "conflict",
+      mutate: (db: Database) =>
+        withGuardDisabled(db, "financial_source_materializations_no_update", () => {
+          db.exec(
+            "UPDATE financial_source_materializations SET source_json=json_set(source_json,'$.financialRealm','realm:other')",
+          );
+        }),
+    },
+  ] as const)
+    test(`GET recovery rejects ${scenario.name} instead of reporting absence`, async () => {
+      const f = await fixture();
+      try {
+        const cmd = await f.command();
+        await f.m().install(cmd);
+        scenario.mutate(f.db);
+        await expect(f.m().readOriginal(cmd)).rejects.toMatchObject({ code: scenario.code });
+        if (scenario.name === "orphan receipt without materialization") {
+          const before = f.batchCalls;
+          await expect(f.m().install(cmd)).rejects.toMatchObject({ code: "unavailable" });
+          expect(f.batchCalls).toBe(before);
+        }
+      } finally {
+        f.close();
+      }
+    });
+  test("GET recovery does not call an orphan head complete absence", async () => {
+    const f = await fixture();
+    try {
+      const cmd = await f.command();
+      await f.m().install(cmd);
+      withForeignKeysDisabled(f.db, () => {
+        withGuardDisabled(f.db, "financial_source_materialization_receipts_no_delete", () => {
+          f.db.exec("DELETE FROM financial_source_materialization_receipts");
+        });
+        withGuardDisabled(f.db, "financial_source_materializations_no_delete", () => {
+          f.db.exec("DELETE FROM financial_source_materializations");
+        });
+      });
+      expect(f.counts()).toEqual([0, 0, 0, 0]);
+      expect(count(f.db, "financial_source_heads").n).toBe(1);
+      await expect(f.m().readOriginal(cmd)).rejects.toMatchObject({ code: "unavailable" });
+    } finally {
+      f.close();
+    }
+  });
+  test("GET recovery does not treat a manual registration as completed M provenance", async () => {
+    const f = await fixture();
+    try {
+      await f.base.run(
+        "INSERT INTO financial_source_registrations(registration_ref,incarnation,receiver_ref,target_ref,genesis_digest,registration_digest,registration_json,qualification_ref,registered_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        [
+          REG.registrationRef,
+          REG.incarnation,
+          R,
+          T,
+          G,
+          D,
+          canonicalFinancialSourceJson(REG),
+          Q,
+          AT,
+        ],
+      );
+      expect(f.counts()).toEqual([0, 0, 0, 0]);
+      await expect(f.m().readOriginal(await f.command())).rejects.toMatchObject({
+        code: "unavailable",
+      });
+    } finally {
+      f.close();
+    }
+  });
+  test("GET recovery requires a sibling M's immutable head birth before reporting absence", async () => {
+    const f = await fixture();
+    try {
+      await f.m().install(await f.command());
+      const unknown = await f.command("parent:unknown", "unknown");
+      expect(await f.m("parent:unknown").readOriginal(unknown)).toBeUndefined();
+      withGuardDisabled(f.db, "financial_source_head_advance", () => {
+        f.db.exec(
+          "UPDATE financial_source_heads SET created_at='2026-10-14T23:59:59.000Z' WHERE affected_ref='parent:one'",
+        );
+      });
+      await expect(f.m("parent:unknown").readOriginal(unknown)).rejects.toMatchObject({
+        code: "unavailable",
       });
     } finally {
       f.close();
