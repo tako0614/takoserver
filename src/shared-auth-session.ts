@@ -152,16 +152,18 @@ export function createSharedAuthSession(options: {
   }
 
   function aad(purpose: "attempt" | "grant", digest: string): Uint8Array<ArrayBuffer> {
-    return new TextEncoder().encode(
-      JSON.stringify([
-        "takoserver-shared-session-staging-v1",
-        purpose,
-        digest,
-        config.issuer,
-        config.clientId,
-        config.publicOrigin,
-        consoleOrigin,
-      ]),
+    return new Uint8Array(
+      new TextEncoder().encode(
+        JSON.stringify([
+          "takoserver-shared-session-staging-v1",
+          purpose,
+          digest,
+          config.issuer,
+          config.clientId,
+          config.publicOrigin,
+          consoleOrigin,
+        ]),
+      ),
     );
   }
   async function seal(
@@ -321,7 +323,7 @@ export function createSharedAuthSession(options: {
         })(),
       ]);
     } finally {
-      clearTimeout(timer);
+      if (timer !== undefined) clearTimeout(timer);
     }
   }
   async function currentWorkspace(
