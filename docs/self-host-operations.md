@@ -289,6 +289,60 @@ chown root:root /usr/local/bin/takoserver-run
 chmod 0755 /usr/local/bin/takoserver-run
 ```
 
+Then install the systemd unit that runs the wrapper. Its `[Service]` section
+is the one [Self-host security](self-host-security.md#recommended-os-hardening)
+explains, option by option. The repository's tests do not run this unit, so
+check `systemctl status takoserver.service` after the first start. As root:
+
+```sh
+cat > /etc/systemd/system/takoserver.service <<'EOF'
+[Unit]
+Description=Takoserver Host
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=takoserver
+Group=takoserver
+# The checkout stays read-only; all state goes to /var/lib/takoserver.
+WorkingDirectory=/opt/takoserver
+# Sources /etc/takoserver/takoserver.env and passes the v2 config file.
+ExecStart=/usr/local/bin/takoserver-run
+StateDirectory=takoserver
+StateDirectoryMode=0700
+Environment=TAKOSERVER_DATA_ROOT=/var/lib/takoserver
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# WorkerEndpoint (TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS=1) binds TCP 443.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+```
+
+Do not start it yet: step 4 gets the certificate first. From here on, stopping
+and starting the Host means `systemctl stop takoserver.service` and
+`systemctl start takoserver.service`, run as root in an administrator shell.
+
 Linux passes at most 131,072 bytes in one environment variable, including its
 name. Each held file adds about 370 bytes to the config, so a config holds
 about 350 held files in all. The CLI in step 6 refuses to write a config that
@@ -417,7 +471,7 @@ certbot certonly --dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cl
   --deploy-hook /usr/local/sbin/takoserver-tls-deploy
 ```
 
-`takoserver.service` stands for the unit that runs the Host; use its name.
+`takoserver.service` is the unit installed in step 3.
 certbot runs the deploy hook after this first issuance, when the Host has not
 started yet, and again after every renewal, which the package's
 `certbot.timer` attempts twice a day. Re-running `certbot certonly` before a
@@ -426,21 +480,30 @@ instead.
 `certbot renew --dry-run` tests renewal but skips the hook, so once the Host
 runs, test the hook by running `/usr/local/sbin/takoserver-tls-deploy` (it
 restarts the Host). A renewal restarts the whole Host, roughly every two
-months with 90-day certificates, at a random time in the timer's window: the API and the Endpoints are briefly
-down and queue and cron delivery pause. If a certificate expires without a
+months with 90-day certificates, at a random time in the timer's window: the
+API and the Endpoints are briefly down and queue and cron delivery pause. If a certificate expires without a
 restart, the listener still presents it, clients reject it, Endpoint
 Operations stay `reconciling`, and the next start fails.
 
 ### 5. First boot and operator sign-in
 
-Start the Host. The first boot creates the control database and signing keys
-under the data root and prints each applied migration. When no identity
+As root, start the Host and follow its log:
+
+```sh
+systemctl enable --now takoserver.service
+journalctl -u takoserver.service -f
+```
+
+The first boot creates the control database and signing keys under the data
+root and prints each applied migration. When no identity
 provider is configured, it prints an operator sign-in assertion valid for ten
 minutes. The assertion is single-use: the first session exchange spends it,
 and afterwards both another exchange and an owner proof refuse it. A boot
 prints a new one until the operator has signed in, or every time with
 `TAKOSERVER_PRINT_OPERATOR_ASSERTION=1`; after the first sign-in a boot prints
-only how to mint one. [Self-host security](self-host-security.md#sign-in-and-request-limits)
+only how to mint one. It appears in this journal, which the `takoserver` user
+cannot read, so copy it from this administrator shell into the operator shell
+below. [Self-host security](self-host-security.md#sign-in-and-request-limits)
 explains why. If `TAKOSERVER_CONSOLE_ORIGIN` is set, open the exact external console
 origin named by the process and paste the assertion there. It is a separate
 console; the Bun Host does not serve a `/console` page.
@@ -578,7 +641,7 @@ new held bundle takes the same three steps: stop the Host, seed the bundle,
 start the Host again.
 
 `scripts/selfhost-artifact.ts seed` is that operator step. Stop the Host
-through its supervisor first. Then run the command from the checkout as the
+first (`systemctl stop takoserver.service`). Then run the command from the checkout as the
 `takoserver` user with the Host's environment, because it resolves the data
 root and `TAKOSERVER_DB` exactly as the Host does:
 
@@ -1069,10 +1132,11 @@ If you serve the console, rebuild it from the new checkout as described under
 [The console](#the-console-optional) when you switch to it.
 
 Keep the previous source checkout available so a code-only return is possible
-without changing the active source before the operator has selected it. Use
-the same operator-controlled process supervisor and protected configuration
-when selecting which checkout to run; this guide does not prescribe a service
-manager or its unit-file layout.
+without changing the active source before the operator has selected it. The
+wrapper (`cd /opt/takoserver`) and the unit (`WorkingDirectory=/opt/takoserver`)
+from step 3 both name the checkout that runs: to switch, change that path in
+both and run `systemctl daemon-reload` while the Host is stopped. Keep the same
+protected configuration.
 
 If an earlier build ran as root, check `/tmp` first, as described under
 [`/tmp` left at mode 0700](#ordinary-journey-native-test-and-known-gaps). For
