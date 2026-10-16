@@ -23,7 +23,7 @@ for example `https://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/`:
   SQL or create an endpoint.
 - **Workers and their data, with the complete local Worker profile** (on Linux
   x86-64, the pinned `workerd`, the Workflow execution guard and the settings
-  [Settings](#settings) lists for that profile): `ModuleWorker 0.3.0`,
+  listed for that profile under [Settings](#settings)): `ModuleWorker 0.3.0`,
   `WorkerVersion 0.5.0`, `WorkerDeployment 0.4.0`, `WorkerCronTrigger 0.3.0`,
   `SQLiteDatabase 0.2.0`, `EdgeKVNamespace 0.2.0`, `ObjectBucket 0.2.0`,
   `AtLeastOnceQueue 0.2.0`, `QueueConsumer 0.3.0`, `ActorNamespace 0.3.0` and
@@ -55,8 +55,9 @@ Three ways in, from the quickest look to a served Worker:
    bun --no-env-file src/entry-bun.ts
    ```
 
-   This is the artifact profile: it keeps Worker code, static files and SQL
-   migrations, and runs no Worker. The public v2 discovery is
+   This is the artifact profile: with their blocks in
+   `TAKOSERVER_TAKOFORM_V2_CONFIG`, it keeps Worker code, static files and SQL
+   migrations, and it runs no Worker. The public v2 discovery is
    `/.well-known/takoform/v2`. The Bun HTTP listener requires an
    operator-controlled HTTPS front end for public use; do not expose that
    backend listener directly.
@@ -121,6 +122,7 @@ serves them from this machine.
   listener. Neither a bundle nor a WorkerVersion can be changed, so to
   ship new code, create a new WorkerBundle and WorkerVersion, then update the
   Deployment's versions.
+
 ## Scope
 
 - **This repository is the Host and its self-host plugin**: everything needed
