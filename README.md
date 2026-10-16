@@ -56,19 +56,6 @@ that backend listener directly.
 [First install and first use](docs/self-host-operations.md#first-install-and-first-use)
 takes you on to the complete Worker profile and a Worker served over HTTPS.
 
-## Scope
-
-This repository owns the generic Host foundation and the self-host plugin. The
-normal application serves only `forms.takoform.com/v2`: a versioned HTTPS Form
-URL identifies the contract and Host-side code implements it; it does not
-install Form packages, require their signatures, or translate into v1. The
-managed Workers-for-Platforms implementation is a separately supplied,
-non-public operator backend; it is not needed to build or run the OSS self-host
-distribution, and where the control plane itself runs is an independent
-deployment choice. Hosted D1, Workers for Platforms, downstream Provider
-adoption, public TLS/live qualification, and deployment qualification are
-separate; source and local native evidence do not establish a deployed rollout.
-
 ## Start here
 
 | To | Read |
@@ -139,6 +126,23 @@ serves them from this machine.
 Creating, running or deleting a v2 Resource places no charge on the wallet.
 [Operator sign-in and funding](#operator-sign-in-and-funding) covers how a
 wallet is funded.
+
+## Scope
+
+- **This repository is the Host and its self-host plugin**: everything needed
+  to build and run a Takoserver on your own machine.
+- **It serves Takoform Host API v2 only.** Host-side code implements each Form
+  it composes; the Host does not install Form packages, check their
+  signatures, or translate requests into Takoform Host API v1. Its own `/v1`
+  account, wallet and AI APIs are separate product APIs.
+- **takoserver.com's managed backend is not here.** Its non-public Workers for
+  Platforms backend is supplied separately by its operator and is not needed to
+  build or run a self-host. Where the control plane runs is a separate
+  deployment choice.
+- **A green gate is not a rollout.** `bun run check` and local native evidence
+  do not show that any deployment works: not a self-host's public TLS and DNS,
+  not the hosted service's D1 or Workers for Platforms, and not adoption by
+  downstream Providers. Each is qualified separately.
 
 ## Self-hosting
 
@@ -885,7 +889,7 @@ Cancelling before cutover first deletes any authoritative candidate Deployment
 and only then releases the hold. An acknowledgement gap is left open for
 operator reconciliation rather than being reported as a successful cancellation.
 
-## How it is built
+## Architecture
 
 Seven provider-neutral ports; the SQL port is shown at both capability levels
 below, and everything above them remains provider-neutral.

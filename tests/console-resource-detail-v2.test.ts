@@ -124,7 +124,11 @@ test("resource detail uses direct UID GET and shows declared versus observed gen
   );
   body.append(resourceDetailPage("org-one", "uid-one") as unknown as NodeStub);
   await settle();
-  expect(paths).toEqual(["/apis/forms.takoform.com/v2/resources/uid-one"]);
+  // The Resource itself by UID, and the list once to find what names it.
+  expect(paths).toEqual([
+    "/apis/forms.takoform.com/v2/resources/uid-one",
+    "/apis/forms.takoform.com/v2/resources",
+  ]);
   expect(body.textContent).toContain("widget");
   expect(body.textContent).toContain("new");
   expect(body.textContent).toContain("old");
@@ -348,6 +352,157 @@ test("resource detail calls a settled artifact Resource Applied", async () => {
   expect(body.textContent).not.toContain("Unknown");
 });
 
+test("overview leads with resources and shows the wallet once it is in use", async () => {
+  const { consoleLocale } = await import("../console/src/i18n.ts");
+  const { organizations, selectOrganization, setApiOrigin } = await import(
+    "../console/src/state.ts"
+  );
+  const { overviewPage } = await import("../console/src/pages/overview.ts");
+  const organization = {
+    id: "org-one",
+    name: "One",
+    ownerPrincipalId: "owner",
+    createdAt: "2026-10-07",
+  };
+  const render = async (micros: string, entries: unknown[] = []) => {
+    const body = installDom();
+    consoleLocale.set("en");
+    setApiOrigin("https://api.example.test");
+    organizations.set([organization]);
+    selectOrganization(organization.id);
+    globalThis.fetch = Object.assign(
+      async (input: RequestInfo | URL) => {
+        const path = new URL(String(input)).pathname;
+        if (path.endsWith("/wallet"))
+          return Response.json({
+            wallet: {
+              organizationId: organization.id,
+              availableMicros: micros,
+              heldMicros: "0",
+              settledMicros: micros,
+              currency: "USD",
+              unit: "USD-micros",
+              moneyPolicy: "usd-micros-v2",
+              entries,
+            },
+          });
+        if (path.endsWith("/operations")) return Response.json({ operations: [] });
+        return Response.json({ items: [], nextCursor: null });
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    );
+    body.append(overviewPage(organization) as unknown as NodeStub);
+    await settle();
+    return body.textContent;
+  };
+  const unfunded = await render("0");
+  expect(unfunded).not.toContain("prepaid");
+  expect(unfunded).not.toContain("Available");
+  expect(unfunded).not.toContain("Settled");
+  expect(unfunded).toContain("Resources");
+  const funded = await render("5000000");
+  expect(funded).toContain("Available");
+  expect(funded).toContain("Settled");
+  expect(funded.indexOf("Resources")).toBeLessThan(funded.indexOf("Available"));
+  // A wallet that has been used keeps its cards when it is back at $0.
+  const spent = await render("0", [
+    {
+      id: "entry-one",
+      organizationId: "org-one",
+      type: "funding",
+      reference: "fund-one",
+      settledDeltaMicros: "5000000",
+      heldDeltaMicros: "0",
+      createdAt: "2026-10-07T00:00:00Z",
+    },
+  ]);
+  expect(spent).toContain("Available");
+  expect(spent).toContain("$0");
+});
+
+test("a By Form tile opens the list filtered to that exact Form", async () => {
+  const body = installDom();
+  const { consoleLocale } = await import("../console/src/i18n.ts");
+  const { organizations, selectOrganization, setApiOrigin } = await import(
+    "../console/src/state.ts"
+  );
+  const { route } = await import("../console/src/router.ts");
+  const { overviewPage } = await import("../console/src/pages/overview.ts");
+  const { resourcesPage } = await import("../console/src/pages/resources.ts");
+  consoleLocale.set("en");
+  setApiOrigin("https://api.example.test");
+  const organization = {
+    id: "org-one",
+    name: "One",
+    ownerPrincipalId: "owner",
+    createdAt: "2026-10-07",
+  };
+  organizations.set([organization]);
+  selectOrganization(organization.id);
+  const forms = "https://edge.forms.takoform.com/forms";
+  const item = (uid: string, form: string) => ({
+    uid,
+    form: `${forms}/${form}/`,
+    space: "org-one",
+    name: uid,
+    generation: 1,
+    observedGeneration: 1,
+    observedAt: "2026-10-07T00:00:00Z",
+    phase: "idle" as const,
+    spec: {},
+    observed: {},
+    output: {},
+    lastOperation: `op-${uid}`,
+  });
+  const items = [
+    item("hello-version-v1", "WorkerVersion/0.5.0"),
+    item("notes", "SQLiteDatabase/0.2.0"),
+    // Same kind and version under a differently spelled host: another Form.
+    {
+      ...item("other-version", "WorkerVersion/0.5.0"),
+      form: "https://EDGE.forms.takoform.com/forms/WorkerVersion/0.5.0/",
+    },
+  ];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/wallet"))
+        return Response.json({
+          wallet: {
+            organizationId: "org-one",
+            availableMicros: "0",
+            heldMicros: "0",
+            settledMicros: "0",
+            currency: "USD",
+            unit: "USD-micros",
+            moneyPolicy: "usd-micros-v2",
+            entries: [],
+          },
+        });
+      if (path.endsWith("/operations")) return Response.json({ operations: [] });
+      return Response.json({ items, nextCursor: null });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  body.append(overviewPage(organization) as unknown as NodeStub);
+  await settle();
+  const tile = body
+    .all()
+    .find((node) => node.tag === "a" && node.textContent.startsWith("WorkerVersion 0.5.0"));
+  const href = tile?.attributes.get("href") ?? "";
+  expect(href).toBe(`/resources?form=${encodeURIComponent(`${forms}/WorkerVersion/0.5.0/`)}`);
+  const target = new URL(href, "https://console.example.test");
+  route.set({ path: target.pathname, segments: ["resources"], query: target.searchParams });
+  const list = installDom();
+  list.append(resourcesPage("org-one") as unknown as NodeStub);
+  await settle();
+  expect(list.textContent).toContain("hello-version-v1");
+  expect(list.textContent).not.toContain("notes");
+  expect(list.textContent).not.toContain("other-version");
+  // The page says what it is narrowed to, and how to see everything.
+  expect(list.textContent).toContain("Form: WorkerVersion 0.5.0 · Show all");
+});
+
 test("names each referenced Resource where the spec names it", async () => {
   const { specReferences, publishedUrl } = await import("../console/src/pages/resource-detail.ts");
   expect(
@@ -442,11 +597,12 @@ test("resource detail links the Resources a spec names and its published URL", a
   body.append(resourceDetailPage("org-one", "uid-version") as unknown as NodeStub);
   await settle();
   expect(new Set(paths)).toEqual(
-    new Set(
-      ["uid-version", "uid-worker", "uid-bundle", "uid-gone", "uid-broken"].map(
+    new Set([
+      ...["uid-version", "uid-worker", "uid-bundle", "uid-gone", "uid-broken"].map(
         (uid) => `/apis/forms.takoform.com/v2/resources/${uid}`,
       ),
-    ),
+      "/apis/forms.takoform.com/v2/resources",
+    ]),
   );
   const text = body.textContent;
   expect(text).toContain("Referenced resources");
@@ -462,4 +618,125 @@ test("resource detail links the Resources a spec names and its published URL", a
   expect(published?.attributes.get("href")).toBe("https://hello.apps.example.com/");
   expect(published?.attributes.get("target")).toBe("_blank");
   expect(published?.attributes.get("rel")).toBe("noopener noreferrer");
+});
+
+test("a Worker's page lists what names it, with the address an Endpoint publishes", async () => {
+  const body = installDom();
+  const { consoleLocale } = await import("../console/src/i18n.ts");
+  const { organizations, selectOrganization, setApiOrigin } = await import(
+    "../console/src/state.ts"
+  );
+  const { route } = await import("../console/src/router.ts");
+  const { resourceDetailPage } = await import("../console/src/pages/resource-detail.ts");
+  consoleLocale.set("en");
+  setApiOrigin("https://api.example.test");
+  organizations.set([
+    { id: "org-one", name: "One", ownerPrincipalId: "owner", createdAt: "2026-10-07" },
+  ]);
+  selectOrganization("org-one");
+  route.set({
+    path: "/resources/uid-worker",
+    segments: ["resources", "uid-worker"],
+    query: new URLSearchParams(),
+  });
+  const forms = "https://edge.forms.takoform.com/forms";
+  const summary = (uid: string, name: string, form: string, spec: unknown, output = {}) => ({
+    uid,
+    form: `${forms}/${form}/`,
+    space: "org-one",
+    name,
+    generation: 1,
+    observedGeneration: 1,
+    observedAt: "2026-10-07T00:00:00Z",
+    phase: "idle",
+    spec,
+    observed: {},
+    output,
+    lastOperation: `op-${uid}`,
+  });
+  const worker = summary("uid-worker", "hello", "ModuleWorker/0.3.0", {});
+  const endpoint = summary(
+    "uid-endpoint",
+    "hello-endpoint",
+    "WorkerEndpoint/0.3.0",
+    { worker: { resourceUid: "uid-worker" } },
+    { hostname: "hello.apps.example.com", url: "https://hello.apps.example.com/" },
+  );
+  const version = summary("uid-version", "hello-version-v1", "WorkerVersion/0.5.0", {
+    worker: { resourceUid: "uid-worker" },
+    bundle: { resourceUid: "uid-bundle" },
+  });
+  const unrelated = summary("uid-notes", "notes", "SQLiteDatabase/0.2.0", {});
+  const cursors: (string | null)[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/resources/uid-worker")) return Response.json(worker);
+      cursors.push(url.searchParams.get("cursor"));
+      // Two pages: the list is followed by its cursor.
+      return url.searchParams.get("cursor") === null
+        ? Response.json({ items: [worker, version], nextCursor: "page-2" })
+        : Response.json({ items: [unrelated, endpoint], nextCursor: null });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  body.append(resourceDetailPage("org-one", "uid-worker") as unknown as NodeStub);
+  await settle();
+  expect(cursors).toEqual([null, "page-2"]);
+  const text = body.textContent;
+  expect(text).toContain("Referenced by");
+  expect(text).not.toMatch(/first \d+ checked/);
+  expect(text).toContain("hello-version-v1");
+  expect(text).toContain("hello-endpoint");
+  expect(text).toContain("as worker");
+  expect(text).not.toContain("notes");
+  const links = body.all().filter((node) => node.tag === "a");
+  expect(links.find((node) => node.textContent === "hello-endpoint")?.attributes.get("href")).toBe(
+    "/resources/uid-endpoint",
+  );
+  const published = links.find((node) => node.textContent.startsWith("https://hello.apps"));
+  expect(published?.attributes.get("target")).toBe("_blank");
+});
+
+test("what names a Resource says how many it checked when it stops early", async () => {
+  // Only the lookup itself: no page is mounted, so nothing else reads the list.
+  installDom();
+  const { findReferrers } = await import("../console/src/pages/resource-detail.ts");
+  const resource = (uid: string, spec: unknown) => ({
+    uid,
+    form: "https://edge.forms.takoform.com/forms/WorkerVersion/0.5.0/",
+    space: "org-one",
+    name: uid,
+    generation: 1,
+    observedGeneration: 1,
+    observedAt: null,
+    phase: "idle",
+    spec,
+    observed: {},
+    output: {},
+    lastOperation: `op-${uid}`,
+  });
+  let pages = 0;
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL) => {
+      if (!new URL(String(input)).pathname.endsWith("/resources"))
+        return Response.json({ error: { code: "not_found" } }, { status: 404 });
+      pages += 1;
+      // Every page has a next one; only the second names the Worker.
+      return Response.json({
+        items: [
+          resource(`uid-${pages}-a`, pages === 2 ? { worker: { resourceUid: "uid-worker" } } : {}),
+          resource(`uid-${pages}-b`, {}),
+          resource(`uid-${pages}-c`, {}),
+        ],
+        nextCursor: `page-${pages + 1}`,
+      });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  const found = await findReferrers("org-one", "uid-worker");
+  expect(pages).toBe(5);
+  expect(found.complete).toBe(false);
+  expect(found.checked).toBe(15);
+  expect(found.referrers.map((entry) => entry.resource.uid)).toEqual(["uid-2-a"]);
 });

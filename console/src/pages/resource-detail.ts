@@ -70,6 +70,46 @@ export function publishedUrl(output: unknown): string | null {
   }
 }
 
+/** How many list pages are read to find what names a Resource. */
+const REFERRER_PAGES = 5;
+
+export interface Referrer {
+  readonly resource: ResourceSummary;
+  /** Where its spec names the Resource being shown. */
+  readonly paths: readonly string[];
+}
+
+/**
+ * The Resources whose specs name `uid`, from the organization's list. Only
+ * the first pages are read, so `complete` says whether the answer covers
+ * every Resource and `checked` how many it looked at.
+ */
+export async function findReferrers(
+  organizationId: string,
+  uid: string,
+): Promise<{
+  readonly referrers: readonly Referrer[];
+  readonly complete: boolean;
+  readonly checked: number;
+}> {
+  const referrers: Referrer[] = [];
+  let cursor: string | null = null;
+  let checked = 0;
+  for (let page = 0; page < REFERRER_PAGES; page += 1) {
+    const read = await api.resources(organizationId, cursor ? { cursor } : {});
+    checked += read.resources.length;
+    for (const resource of read.resources) {
+      const paths = specReferences(resource.spec)
+        .filter((reference) => reference.uid === uid)
+        .map((reference) => reference.path);
+      if (paths.length > 0 && resource.uid !== uid) referrers.push({ resource, paths });
+    }
+    cursor = read.cursor;
+    if (cursor === null) return { referrers, complete: true, checked };
+  }
+  return { referrers, complete: false, checked };
+}
+
 /** The v2 address is the durable UID, never a reconstructed kind/name tuple. */
 export function resourceDetailPage(organizationId: string, uid: string): Child {
   const isCurrent = (): boolean =>
@@ -208,6 +248,7 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
         )
       : null,
     references.length > 0 ? referencesCard(organizationId, references) : null,
+    referrersCard(organizationId, found.uid),
     card(
       tr("識別情報", "Identity"),
       h(
@@ -268,7 +309,7 @@ function referencesCard(organizationId: string, references: readonly SpecReferen
     return new Map<string, ResourceSummary | "absent" | "unreadable">(answers);
   });
   return card(
-    tr("参照しているリソース", "Referenced resources"),
+    tr("参照先", "Referenced resources"),
     h(
       "div",
       { class: "card__body rows" },
@@ -301,6 +342,49 @@ function referencesCard(organizationId: string, references: readonly SpecReferen
       ),
     ),
   );
+}
+
+/**
+ * The Resources that name this one, so a Worker leads to its Versions,
+ * Deployment and Endpoint (with the address it publishes). Shown only once
+ * something is found.
+ */
+function referrersCard(organizationId: string, uid: string): Child {
+  const found = resource(() => findReferrers(organizationId, uid));
+  return live(() => {
+    const state = found.get();
+    if (state.state !== "ready" || state.value.referrers.length === 0) return null;
+    const { referrers, complete, checked } = state.value;
+    return card(
+      complete
+        ? tr("参照元", "Referenced by")
+        : tr(`参照元（最初の${checked}件を確認）`, `Referenced by (first ${checked} checked)`),
+      h(
+        "div",
+        { class: "card__body rows" },
+        ...referrers.map(({ resource: referrer, paths }) => {
+          const url = publishedUrl(referrer.output);
+          return field(
+            tr(`${paths.join("、")} として`, `as ${paths.join(", ")}`),
+            h(
+              "span",
+              { class: "ref" },
+              h("a", { class: "mono", ...linkProps(resourcePath(referrer.uid)) }, referrer.name),
+              h("span", { class: "dim" }, formLabel(referrer.form)),
+              url
+                ? h(
+                    "a",
+                    { href: url, target: "_blank", rel: "noopener noreferrer" },
+                    url,
+                    h("span", { "aria-hidden": "true" }, " ↗"),
+                  )
+                : null,
+            ),
+          );
+        }),
+      ),
+    );
+  });
 }
 
 function field(label: string, value: Child): Child {
