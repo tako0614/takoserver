@@ -9,8 +9,9 @@ guard. For those, follow
 
 You need git, Docker Engine with Compose 2.30 or later (`docker compose
 version`; the Compose file uses raw env-file values), python3, curl and jq. Get
-the source, check out a reviewed commit or release tag, and run every command
-below from that directory:
+the source, check out a reviewed commit of `main` (the Docker files are newer
+than the v2.0.0-rc.1 release, which has none), and run every command below from
+that directory:
 
 ```sh
 git clone https://github.com/tako0614/takoserver
@@ -29,7 +30,7 @@ docker build -t takoserver-selfhost:local .
 The base image pins Bun 1.4.0, matching `.bun-version`, by its registry digest,
 and dependencies come from the frozen lockfile. Only the source, its committed
 pricing configuration, the vendored Takoform v2.1.1 reference files, the
-lockfile and package manifest, the licence and the operator and artifact CLIs
+lockfile and package manifest, the license and the operator and artifact CLIs
 enter the build context; local credentials and data stay out. The image runs as
 UID/GID 1000 and keeps its data root at mode 0700.
 
@@ -62,8 +63,9 @@ docker compose up -d --no-build
 ```
 
 Every `docker compose` command reads `TAKOSERVER_ENV_FILE`. The `.env` file in
-the checkout, which git and the image build both ignore, keeps it set for new
-shells.
+the checkout, which git and the image build both ignore, keeps it set for
+`docker compose` in new shells; the shell variable itself is not, so the
+commands below that need the path spell it out.
 
 The image listens on `0.0.0.0:8787` inside the container. Compose publishes
 only `127.0.0.1:8787` on the host; `TAKOSERVER_HTTP_PORT` changes that host port.
@@ -80,8 +82,8 @@ stored artifacts) in a volume named `<project>_takoserver-data`, where
 `<project>` is the checkout directory's name: `takoserver_takoserver-data` for a
 clone named `takoserver`. Run every `docker compose` command from that directory,
 or pass the same `-p <project>`; from another directory Compose starts a new,
-empty installation. Keep the env file and its
-cursor key stable across restarts and updates. Do not set `TAKOSERVER_DB` or
+empty installation. Keep the env file and its cursor key stable across restarts
+and updates. Do not set `TAKOSERVER_DB` or
 `TAKOSERVER_DATA_ROOT` outside that mount. A bind mount is also possible if its
 short absolute path and ancestry satisfy the operations guide, and its data
 directory is owned by UID/GID 1000 with mode 0700. Run only one Host per data
@@ -89,7 +91,8 @@ volume.
 
 To use Docker directly instead of Compose, choose a fresh dedicated name and
 volume. The rest of this guide uses Compose; with `docker run`, use
-`docker exec takoserver-selfhost` where it says `docker compose exec takoserver`.
+`docker exec takoserver-selfhost` where it says `docker compose exec takoserver`,
+and adapt the stop, volume and backup commands of the update steps the same way.
 
 ```sh
 docker run -d --init --stop-timeout 30 --name takoserver-selfhost \
@@ -156,11 +159,13 @@ shared logs and shell history, and treat the container logs as credentials. Do
 not dump `docker inspect` or `docker compose config`: the container environment
 holds the cursor key. This image serves no console page; a console needs the API
 behind HTTPS on the same site (see
-[step 5 of the install guide](self-host-operations.md#5-first-boot-and-operator-sign-in)).
+[the console](self-host-operations.md#the-console-optional)).
 
 An artifact Form create names an exact HTTPS URL and SHA-256 of a manifest, and
-the Host fetches a public HTTPS URL itself; a key with `resources:write` sends
-it as in [step 8 of the install guide](self-host-operations.md#8-create-and-serve-a-worker).
+the Host fetches a public HTTPS URL itself. The manifest's shape is in the
+[WorkerBundle Form](https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/); the
+create needs a second key with `resources:write` and is sent as in
+[step 8 of the install guide](self-host-operations.md#8-create-and-serve-a-worker).
 Seeding held artifacts from local files
 ([step 6](self-host-operations.md#6-seed-held-artifacts)) needs the stopped-Host
 check that guide describes, and is not covered for Docker yet.
@@ -174,28 +179,32 @@ keep.
 
 To update, in the same checkout directory:
 
-1. Stop the Host and copy the stopped volume and the env file somewhere
-   private. Startup can apply forward SQLite migrations, so this copy is the
-   way back. For example:
+1. Stop the Host, copy the stopped volume and the env file into a private
+   directory, and tag the current image so it stays available. Startup can
+   apply forward SQLite migrations, so these copies are the way back:
 
    ```sh
+   install -d -m 0700 ~/takoserver-backups
    docker compose stop
-   docker run --rm --entrypoint tar \
-     -v takoserver_takoserver-data:/var/lib/takoserver:ro takoserver-selfhost:local \
-     -C /var/lib/takoserver -cpf - . > "takoserver-data-$(date +%F).tar"
-   cp "$TAKOSERVER_ENV_FILE" "takoserver-env-$(date +%F)"
-   docker image inspect --format '{{.Id}}' takoserver-selfhost:local
+   ( umask 077
+     docker compose run --rm --no-deps -T --entrypoint tar takoserver \
+       -C /var/lib/takoserver -cpf - . > ~/takoserver-backups/takoserver-data-$(date +%F).tar
+     cp ~/.config/takoserver/docker.env ~/takoserver-backups/takoserver-env-$(date +%F) )
+   docker tag takoserver-selfhost:local takoserver-selfhost:before-$(date +%F)
    ```
 
-   Use your own `<project>_takoserver-data` name, and keep both copies private.
-   Note the image ID the last command prints: it is the image to go back to.
-2. Check out the new reviewed commit, rebuild with
+   `docker compose run` mounts this project's own volume, so the copy cannot
+   come from the wrong one. The copies hold the operator and signing keys and
+   the cursor key; keep them private. Without the tag, rebuilding moves
+   `takoserver-selfhost:local` and Docker pruning may delete the old image.
+2. Fetch and check out the new reviewed commit of `main`, rebuild with
    `docker build -t takoserver-selfhost:local .`, and start it with
    `docker compose up -d --no-build`.
 3. Rerun the health, discovery and support checks above.
 
-Going back means restoring that copy into a fresh volume and starting the
-previous image with it, not reverting only the image.
+Going back means stopping this Host, restoring the copy into a fresh volume and
+starting `takoserver-selfhost:before-<date>` with it (`compose.yaml` takes its
+image from `TAKOSERVER_DOCKER_IMAGE`), not reverting only the image.
 
 Run the explicit local regression check from the checkout with Bun installed:
 
