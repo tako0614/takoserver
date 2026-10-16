@@ -465,10 +465,14 @@ export function createResource(organizationId: string): void {
     artifactHint.replaceChildren(
       ...("artifact" in starter.spec
         ? [
-            tr(
-              "url と sha256 は、scripts/selfhost-artifact.ts seed が出力する artifact（",
-              "url and sha256 are the artifact that scripts/selfhost-artifact.ts seed prints (",
-            ),
+            h("span", { class: "mono" }, "url"),
+            tr(" と ", " and "),
+            h("span", { class: "mono" }, "sha256"),
+            tr(" は、", " are the "),
+            h("span", { class: "mono" }, "artifact"),
+            tr(" として ", " that "),
+            h("span", { class: "mono" }, "scripts/selfhost-artifact.ts seed"),
+            tr(" が出力する値（その後Hostを再起動します。", " prints (then restart the Host; "),
             h(
               "a",
               { href: ARTIFACT_STEP, target: "_blank", rel: "noopener noreferrer" },
@@ -482,7 +486,7 @@ export function createResource(organizationId: string): void {
             ),
             tr(
               "）か、自分で公開HTTPSに置いたmanifestのURLとそのSHA-256です。manifestの形は上の公開仕様にあります。",
-              "), or the URL and SHA-256 of a manifest you publish over HTTPS. The manifest's shape is in the published contract above.",
+              "), or the URL and SHA-256 of a manifest you publish over public HTTPS. The manifest's shape is in the published contract above.",
             ),
           ]
         : []),

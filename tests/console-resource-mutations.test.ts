@@ -596,7 +596,7 @@ test("an artifact Form's starter says where its url and sha256 come from", async
   select.emit("change");
   await settle();
   expect(body.textContent).toContain(
-    "url and sha256 are the artifact that scripts/selfhost-artifact.ts seed prints",
+    "url and sha256 are the artifact that scripts/selfhost-artifact.ts seed prints (then restart the Host;",
   );
   const step = body
     .all()
