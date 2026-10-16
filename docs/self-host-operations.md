@@ -538,8 +538,10 @@ shell, so that this one keeps them. Keep their working files in a directory outs
 the Takoform Host API. Use `resources:read` for read-only checks or
 `resources:write` for Resource operations; write includes read. The key secret
 is shown only once; keep it with the installation's other credentials. It
-expires after 90 days, as the console's keys do by default; create its
-replacement before then:
+expires after 90 days, as the console's keys do by default. Create its
+replacement before then: a session lasts 12 hours, so mint a new assertion
+with the command above, exchange it, and repeat the api-keys request (or use
+the console's API keys page):
 
 ```sh
 HOST=https://api.example.com:8443
