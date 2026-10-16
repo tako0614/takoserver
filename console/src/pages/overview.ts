@@ -5,6 +5,7 @@ import {
   type Wallet,
 } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
+import { firstRunNote, once } from "../first-run.ts";
 import { formName } from "../forms.ts";
 import { consoleLocale, tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
@@ -23,6 +24,9 @@ import { createResource } from "./create-resource.ts";
  * the full cursor chain remains on the Resources screen.
  */
 export function overviewPage(organization: Organization): Child {
+  // Made on the first empty render and reused, so a re-render does not ask the
+  // Host again.
+  const note = once(() => firstRunNote(organization.id));
   const wallet = resource(() => api.wallet(organization.id));
   const resources = resource(() => api.resources(organization.id));
   const operations = resource(() => api.operations(organization.id));
@@ -122,10 +126,7 @@ export function overviewPage(organization: Organization): Child {
                 tr("リソース", "Resources"),
                 empty(
                   tr("リソースがありません", "Nothing declared yet"),
-                  tr(
-                    "運用者から渡された正確なForm URLを指定して作成します。受理されたリソースは完了前から表示されます。",
-                    "Create one with an exact Form URL supplied by the operator. An accepted resource can appear before execution completes.",
-                  ),
+                  note(),
                   h(
                     "button",
                     {

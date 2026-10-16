@@ -938,6 +938,12 @@ tbody tr.is-clickable:hover {
   font-size: 13px;
 }
 
+.empty__body a {
+  color: var(--ink-2);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .notice {
   display: flex;
   gap: 10px;
