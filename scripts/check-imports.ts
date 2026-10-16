@@ -624,6 +624,12 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain"],
   },
   {
+    // Retained history storage is separate from its qualified runtime issuer.
+    name: "domain",
+    match: /^src\/shared-financial-customer-history\.ts$/u,
+    may: ["core", "domain"],
+  },
+  {
     // Shared app name policy belongs to the existing origin reservation domain.
     // Its pure helpers do not gain adapter or composition import authority.
     name: "domain",

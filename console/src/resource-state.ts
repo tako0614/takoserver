@@ -1,4 +1,5 @@
 import type { ResourceSummary } from "./api.ts";
+import { formName } from "./forms.ts";
 import { tr } from "./i18n.ts";
 
 /** Display only states the v2 Resource actually reports. */
@@ -80,4 +81,19 @@ export function byForm(resources: readonly ResourceSummary[]): readonly {
   return [...counts.entries()]
     .map(([form, entry]) => ({ form, ...entry }))
     .sort((left, right) => right.total - left.total || left.form.localeCompare(right.form));
+}
+
+/** Resources whose name, exact Form URL or Form as the list shows it contain the term. */
+export function matchingResources(
+  resources: readonly ResourceSummary[],
+  needle: string,
+): readonly ResourceSummary[] {
+  const term = needle.trim().toLowerCase();
+  if (term === "") return resources;
+  return resources.filter(
+    (entry) =>
+      entry.name.toLowerCase().includes(term) ||
+      entry.form.toLowerCase().includes(term) ||
+      formName(entry.form).toLowerCase().includes(term),
+  );
 }

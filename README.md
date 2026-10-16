@@ -56,19 +56,6 @@ that backend listener directly.
 [First install and first use](docs/self-host-operations.md#first-install-and-first-use)
 takes you on to the complete Worker profile and a Worker served over HTTPS.
 
-## Scope
-
-This repository owns the generic Host foundation and the self-host plugin. The
-normal application serves only `forms.takoform.com/v2`: a versioned HTTPS Form
-URL identifies the contract and Host-side code implements it; it does not
-install Form packages, require their signatures, or translate into v1. The
-managed Workers-for-Platforms implementation is a separately supplied,
-non-public operator backend; it is not needed to build or run the OSS self-host
-distribution, and where the control plane itself runs is an independent
-deployment choice. Hosted D1, Workers for Platforms, downstream Provider
-adoption, public TLS/live qualification, and deployment qualification are
-separate; source and local native evidence do not establish a deployed rollout.
-
 ## Start here
 
 | To | Read |
@@ -80,159 +67,82 @@ separate; source and local native evidence do not establish a deployed rollout.
 | Update, monitor, back up or restore an installation | [Self-host operations](docs/self-host-operations.md#update-and-code-rollback) |
 | Change the code | [Working on it](#working-on-it): `bun run check` is the gate |
 
-## Legacy runtime and provider reference
+## How it works
 
-The implementation notes below describe retained pre-v2 provider, data-plane and
-recovery code. They are not the v2 support catalog or instructions for creating
-v2 resources. Package admission and old native Host tests must not be used as
-v2 readiness evidence. Existing v1 records are preserved and pending repair work
-continues internally; the old public Takoform HTTP handler is not mounted.
+A Takoform Form is identified by a versioned HTTPS URL, such as
+`https://edge.forms.takoform.com/forms/SQLiteDatabase/0.2.0/`, that fixes what
+a Resource's spec, observed state and output mean without naming a provider.
+Takoserver is a Host: it implements the Forms its configuration composes and
+serves them from this machine.
 
-Current managed object storage is one exact portable chain: the versionless
-`edge.forms.takoform.com/ObjectBucket` Resource provides `edge.objects`, and a
-Worker Version consumes it only through the exact
-`module-worker.object-bucket` Binding declared in `bucketBindings`. That Form is
-supported and activated by the code-owned implementation catalog
-([ADR 0007](docs/adr/0007-objectbucket-joins-the-implementation-catalog.md));
-a Host may execute it only where its deploy target realizes an ObjectBucket
-supply. Provider bucket names, regions, endpoints, credentials, and supply
-documents remain inside the selected Provider Pack and Deployment; none is
-Resource desired, observed, output, discovery, or Worker binding state.
+- **Declare** a Resource with its exact Form URL, a name, the Space and a spec.
+  Host API v2 accepts each create, update or delete as an Operation and applies
+  it in the background; poll `/apis/forms.takoform.com/v2/operations/{id}` until
+  it is `succeeded` or `failed`. Every create, update and delete carries an
+  `Idempotency-Key` of 16 to 128 characters, and an update or delete also names
+  the generation it read in `takoform-expected-generation`. A Form this Host
+  does not compose is refused, never approximated, so check it first as in
+  [What you can deploy](#what-you-can-deploy). Steps
+  [8](docs/self-host-operations.md#8-create-and-serve-a-worker),
+  [9](docs/self-host-operations.md#9-verify) and
+  [11](docs/self-host-operations.md#11-delete-resources) of the install
+  path show the exact create, update and delete requests.
+- **Own** Resources through an organization. Its ID is the v2 Space, and its API
+  keys and its owner's session act as one principal, so replacing a key does
+  not strand a Resource. A `resources:read` key reads; a `resources:write` key
+  reads and changes. A key cannot choose another organization; a signed-in
+  owner names one with the `takoform-organization` header on every request.
+- **Ship code** as a WorkerBundle, which names an exact HTTPS URL and SHA-256
+  rather than accepting an upload (see [Held artifacts](#held-artifacts-and-workers)).
+  A ModuleWorker is the Worker's identity, with an empty spec. A WorkerVersion
+  names its ModuleWorker, at most one WorkerBundle (a static-site Version names
+  only a StaticAssetBundle), its handlers, vars and Bindings, and cannot be
+  changed afterwards.
+- **Bind** Resources into a Worker by UID. A WorkerVersion lists them in
+  `sqliteBindings`, `kvBindings`, `bucketBindings`, `queueProducerBindings`,
+  `serviceBindings`, `actorBindings` and `workflowBindings`, each entry
+  `{name, resource: {resourceUid}}`, and the Worker reaches each one by its name,
+  such as `env.DB`. The Host serves the SQLite, KV, bucket and queue Bindings
+  from private loopback services, not from its public listener. A Resource that
+  another still names cannot be deleted, so delete in reference order.
+- **Serve** a Worker with a WorkerDeployment, which splits its traffic across up
+  to eight WorkerVersions by weights that add up to 10000, and a WorkerEndpoint,
+  which publishes the Worker at an HTTPS hostname on the Host's TCP 443
+  listener. Neither a bundle nor a WorkerVersion can be changed, so to
+  ship new code, create a new WorkerBundle and WorkerVersion, then update the
+  Deployment's versions.
+- **Infer** through `/v1/ai` when the operator configures an OpenAI-compatible
+  upstream ([Settings](#settings)). An API key with `ai:invoke` sees only the
+  configured public model IDs. Every chat completion needs an `Idempotency-Key`,
+  and streaming is refused. A settled result is replayed from durable state
+  without calling the upstream or charging again. A model priced at zero never
+  touches the wallet. For a priced model, the Host holds the most the request
+  can cost from the organization's prepaid wallet, refuses with `402`
+  `insufficient_quota` when the wallet cannot cover it, captures the reported
+  use and releases the rest; a failed upstream call charges nothing. See
+  [qualifying one public AI inference](docs/ai-live-qualification.md) for the
+  explicit opt-in completion/replay check and its limits.
 
-Both Cloudflare Worker backends carry that Binding. When explicitly enabled for
-development, the OSS ordinary-workers backend uploads the tenant's exact bundle
-bytes with no wrapper, so the declared name carries Cloudflare's native R2
-binding. The separately supplied managed backend exposes the same nine-method
-`edge.objects` facade while
-keeping provider-native capabilities out of the tenant environment. Its
-operator owns multipart recovery, retention, and destruction reconciliation;
-uncertain provider effects are not reported as success or retried blindly.
-No bucket name, region, endpoint, credential, or provider authority enters the
-Takoform contract. ADR 0007 records the original implementation decision and its divergence from
-[ADR 0005](docs/adr/0005-object-storage-is-an-exact-objectbucket-binding.md).
+Creating, running or deleting a v2 Resource places no charge on the wallet.
+[Operator sign-in and funding](#operator-sign-in-and-funding) covers how a
+wallet is funded.
 
-Takoserver serves no public S3-credential or managed standard-service retail
-route. Separate S3 retail is not composed by default, and provider credentials
-alone never authorize it. Private R2 and S3 transports are implementation
-adapters behind `edge.objects`, not alternate public contracts.
+## Scope
 
-The released provider-v2.1.1 Edge Family remains immutable historical input so
-Takoserver can observe and delete Deployments already recorded under it. Its
-v1beta1 ObjectBucket identity is recovery-only and is never installed as a
-current sale, authoring, or `/provision/v1` authority.
-
-Run it on your own machine and it uses your disk and [workerd](https://github.com/cloudflare/workerd),
-the runtime Cloudflare runs at the edge. A Bun process owns both local SQLite
-control state and a local exact-identity artifact store; it rejects
-`TAKOSERVER_R2_BUCKET` before opening local state. Production execution on
-Cloudflare Workers belongs to the Worker entry, not to an ambient account
-credential in the Bun entry.
-
-With the v2 configuration above, startup creates the local schema and starts
-serving. When no identity provider is configured, it generates the operator key
-and prints a 10-minute, single-use sign-in assertion until the operator has
-first signed in. Use the exact external console origin
-if `TAKOSERVER_CONSOLE_ORIGIN` is configured; otherwise the Host also prints its
-origin, API documentation URL, and manual session/API onboarding instructions.
-The Bun Host itself does not serve a `/console` page. If an identity provider is
-configured, use that provider's sign-in flow. Create or select the organization
-that will own resources; its exact ID is the v2 Space. Do not run old
-publisher-set admission as v2 setup. The v2 install path, from an empty data
-root to a served Worker, is
-[First install and first use](docs/self-host-operations.md#first-install-and-first-use);
-[v2 architecture and operator setup](docs/takoform-v2.md) defines each setting
-it uses.
-
-Ordinary Bun always keeps the stable self-host Provider3 execution pack.
-`CLOUDFLARE_ACCOUNT_ID` may separately back an explicitly reviewed ObjectBucket
-supply, but it is neither provider-selection nor resale authority and does not
-switch stable Forms off. `TAKOSERVER_D1_DATABASE_ID` and
-`TAKOSERVER_R2_BUCKET` are rejected by the Bun entry before it opens local
-state; use the Worker entry for D1/R2-bound execution.
-
-The released Cloudflare ObjectBucket provider survives only as an explicit
-recovery lane for observing and deleting its already-recorded beta
-Deployments. An operator enters it with
-`TAKOSERVER_RETIRED_PROVIDER_MODE=cloudflare-object-bucket-drain` plus the
-Cloudflare account credential and `TAKOSERVER_PROVISIONER_TOKEN`. That lane
-publishes zero current Offerings and cannot be mixed with self-host provider
-settings. `TAKOSERVER_ZONES` is rejected because an ObjectBucket drain owns no
-DNS or Worker-route authority; the old implicit `TAKOSERVER_EDGE_FORMS` switch
-is rejected too. Recovery-mode credentials are validated before local state is
-opened.
-
-For a disposable Provider v3 integration run against the production
-Cloudflare adapter and an in-process account, use the loopback-only stable Host
-launcher:
-
-```sh
-TAKOFORM_STABLE_CATALOG_ROOT=/path/to/exact/takoform-v3.0.0 \
-TAKOSERVER_STABLE_LOCAL_TOKEN=local-test-token-at-least-16-characters \
-bun run debug:stable-local-cloudflare-host
-```
-
-The catalog loader verifies the frozen 31-Form input before listening. The
-launcher installs the historical 13-Form union used by the Road to Me and
-Yurucommu local graph fixtures. Its `StaticAssetBundle` path
-uses the production Cloudflare Provider upload protocol and serves the realized
-asset manifest through the disposable workerd runtime, including Worker-first
-and single-page fallback behavior.
-
-This diagnostic profile does not support `ObjectBucket` and accepts only Worker
-Versions whose `requiredSensitiveVars` declaration is omitted or empty. It is
-therefore insufficient for the current Yurucommu Provider 4 graph, which needs
-both capabilities; a passing older fixture is not a full current-app E2E.
-This command is not a deploy path. It binds `127.0.0.1`
-on an ephemeral port by default and prints one sanitized ready JSON line
-without the token. `TAKOSERVER_STABLE_LOCAL_SPACE` and
-`TAKOSERVER_STABLE_LOCAL_PORT` may override the local Space and port.
-
-## What it is
-
-Takoform is an infrastructure protocol: a customer declares what they want, and
-a Host accepts, prices, provisions, and reports on it. Takoserver is a Host —
-the part that owns accounts, money, and the machines.
-
-- **Declare** through the Takoform lanes. Every declaration names a Form by an
-  exact reference: group, kind, definition version, and the digest of the
-  schema itself. Two resources of the same kind are not necessarily the same
-  thing, and the digest is what says so.
-- **Pay** from a prepaid wallet. Work places a hold against the available
-  balance and captures it when it succeeds; if it fails, the hold is released
-  and nothing is charged. There is no balance column anywhere — available is
-  settled minus held, computed from entries that are only ever appended.
-- **Bind** a current ObjectBucket through `bucketBindings`. The Host resolves
-  the exact Resource relation and active Deployment, then the provider's
-  two-stage materializer hands the ordinary-workers runtime one opaque
-  capability, which becomes a native R2 binding under the declared name.
-  Native bucket identity and credentials stay private to that adapter.
-- **Run** the ordinary Takoform provider without handing a hosted runner the
-  reseller's organization API key. A reseller reservation can mint a
-  short-lived bearer pinned to one opaque tenant, exact Form, and exact
-  Resource name. Before capture it can only validate, prepare, and create that
-  paid address. After capture, a new bearer additionally pins the immutable
-  Resource UID before it may read, observe, update, or delete that incarnation.
-  The first create atomically marks the reservation consumed before provider
-  side effects, so a release can never leave an unpaid Resource.
-- **Scope** organization API keys by resource intent. `resources:read` may call
-  Host read routes (including validate and observe); `resources:write` retains
-  that read access and additionally permits prepare, PUT/POST mutations, and
-  DELETE. Missing scopes are refused before resource lookup, while wrong-tenant,
-  revoked, and expired credentials remain non-enumerating failures.
-- **Attach** independent resources by exact Interface reference. An Attachment
-  stores only resource/deployment identity and an opaque grant, endpoint,
-  secret, or native-binding reference; it never embeds a provider credential.
-- **Migrate** by selecting another Offering for the same exact Form. Takoserver
-  provisions a candidate Deployment, transfers and verifies the data, then
-  atomically switches the active Deployment and Attachment resolutions. The
-  source stays retained for the bounded rollback window.
-- **Infer** through `/v1/ai`. An organization API key with `ai:invoke` sees only
-  operator-configured public model IDs. Takoserver holds the maximum prepaid
-  charge before inference, captures reported token use, and releases the rest.
-  Paid inference requires `Idempotency-Key`; a settled result is replayed from
-  durable state without calling the upstream or charging again.
-  See [qualifying one public AI inference](docs/ai-live-qualification.md) for
-  the explicit opt-in completion/replay check and its limits.
+- **This repository is the Host and its self-host plugin**: everything needed
+  to build and run a Takoserver on your own machine.
+- **It serves Takoform Host API v2 only.** Host-side code implements each Form
+  it composes; the Host does not install Form packages, check their
+  signatures, or translate requests into Takoform Host API v1. Its own `/v1`
+  account, wallet and AI APIs are separate product APIs.
+- **takoserver.com's managed backend is not here.** Its non-public Workers for
+  Platforms backend is supplied separately by its operator and is not needed to
+  build or run a self-host. Where the control plane runs is a separate
+  deployment choice.
+- **A green gate is not a rollout.** `bun run check` and local native evidence
+  do not show that any deployment works: not a self-host's public TLS and DNS,
+  not the hosted service's D1 or Workers for Platforms, and not adoption by
+  downstream Providers. Each is qualified separately.
 
 ## Self-hosting
 
@@ -265,6 +175,28 @@ Neither profile needs publisher-set admission: the v2 Host serves the Forms
 its configuration composes. `scripts/selfhost-form-admission.ts` and
 [Self-host admission](docs/form-authority.md#self-host-admission) belong to the
 retained v1 repair path and are not v2 setup.
+
+### First start
+
+A Bun Host keeps its control state in local SQLite and its artifacts in a
+local content-addressed store, by default under the data root
+([Data root and backups](#data-root-and-backups)), and it refuses
+`TAKOSERVER_D1_DATABASE_ID` and `TAKOSERVER_R2_BUCKET` before opening that
+state; D1- and R2-bound execution belongs to the Worker entry
+([Running it on Cloudflare](#running-it-on-cloudflare)). In the complete Worker
+profile it runs Workers on this machine with the pinned
+[workerd](https://github.com/cloudflare/workerd), the runtime Cloudflare runs at
+the edge.
+
+With the settings below, the first start creates the local schema and starts
+serving. With no identity provider configured, it generates the operator key and
+prints a ten-minute, single-use sign-in assertion until the operator has signed
+in ([Operator sign-in and funding](#operator-sign-in-and-funding)). If
+`TAKOSERVER_CONSOLE_ORIGIN` is set, sign in at that exact console origin;
+otherwise the Host prints its origin, API documentation URL and how to sign in
+over the API. The Bun Host does not serve a console page itself. With an
+identity provider configured, use its sign-in flow instead. Then create the
+organization that will own Resources; its ID is the v2 Space.
 
 ### Settings
 
@@ -833,6 +765,110 @@ and the runtime-input wire contract this Host now speaks in
 [docs/adr/0006-runtime-input-wire-contract-v2.md](docs/adr/0006-runtime-input-wire-contract-v2.md).
 All recorded decisions are indexed in [docs/adr/](docs/adr/README.md).
 
+## Legacy runtime and provider reference
+
+The implementation notes below describe retained pre-v2 provider, data-plane and
+recovery code. They are not the v2 support catalog or instructions for creating
+v2 resources. Package admission and old native Host tests must not be used as
+v2 readiness evidence. Existing v1 records are preserved and pending repair work
+continues internally; the old public Takoform HTTP handler is not mounted.
+
+Current managed object storage is one exact portable chain: the versionless
+`edge.forms.takoform.com/ObjectBucket` Resource provides `edge.objects`, and a
+Worker Version consumes it only through the exact
+`module-worker.object-bucket` Binding declared in `bucketBindings`. That Form is
+supported and activated by the code-owned implementation catalog
+([ADR 0007](docs/adr/0007-objectbucket-joins-the-implementation-catalog.md));
+a Host may execute it only where its deploy target realizes an ObjectBucket
+supply. Provider bucket names, regions, endpoints, credentials, and supply
+documents remain inside the selected Provider Pack and Deployment; none is
+Resource desired, observed, output, discovery, or Worker binding state.
+
+Both Cloudflare Worker backends carry that Binding. When explicitly enabled for
+development, the OSS ordinary-workers backend uploads the tenant's exact bundle
+bytes with no wrapper, so the declared name carries Cloudflare's native R2
+binding. The separately supplied managed backend exposes the same nine-method
+`edge.objects` facade while
+keeping provider-native capabilities out of the tenant environment. Its
+operator owns multipart recovery, retention, and destruction reconciliation;
+uncertain provider effects are not reported as success or retried blindly.
+No bucket name, region, endpoint, credential, or provider authority enters the
+Takoform contract. ADR 0007 records the original implementation decision and its divergence from
+[ADR 0005](docs/adr/0005-object-storage-is-an-exact-objectbucket-binding.md).
+
+Takoserver serves no public S3-credential or managed standard-service retail
+route. Separate S3 retail is not composed by default, and provider credentials
+alone never authorize it. Private R2 and S3 transports are implementation
+adapters behind `edge.objects`, not alternate public contracts.
+
+The released provider-v2.1.1 Edge Family remains immutable historical input so
+Takoserver can observe and delete Deployments already recorded under it. Its
+v1beta1 ObjectBucket identity is recovery-only and is never installed as a
+current sale, authoring, or `/provision/v1` authority.
+
+Ordinary Bun always keeps the stable self-host Provider3 execution pack.
+`CLOUDFLARE_ACCOUNT_ID` may separately back an explicitly reviewed ObjectBucket
+supply, but it is neither provider-selection nor resale authority and does not
+switch stable Forms off.
+
+The released Cloudflare ObjectBucket provider survives only as an explicit
+recovery lane for observing and deleting its already-recorded beta
+Deployments. An operator enters it with
+`TAKOSERVER_RETIRED_PROVIDER_MODE=cloudflare-object-bucket-drain` plus the
+Cloudflare account credential and `TAKOSERVER_PROVISIONER_TOKEN`. That lane
+publishes zero current Offerings and cannot be mixed with self-host provider
+settings. `TAKOSERVER_ZONES` is rejected because an ObjectBucket drain owns no
+DNS or Worker-route authority; the old implicit `TAKOSERVER_EDGE_FORMS` switch
+is rejected too. Recovery-mode credentials are validated before local state is
+opened.
+
+For a disposable Provider v3 integration run against the production
+Cloudflare adapter and an in-process account, use the loopback-only stable Host
+launcher:
+
+```sh
+TAKOFORM_STABLE_CATALOG_ROOT=/path/to/exact/takoform-v3.0.0 \
+TAKOSERVER_STABLE_LOCAL_TOKEN=local-test-token-at-least-16-characters \
+bun run debug:stable-local-cloudflare-host
+```
+
+The catalog loader verifies the frozen 31-Form input before listening. The
+launcher installs the historical 13-Form union used by the Road to Me and
+Yurucommu local graph fixtures. Its `StaticAssetBundle` path
+uses the production Cloudflare Provider upload protocol and serves the realized
+asset manifest through the disposable workerd runtime, including Worker-first
+and single-page fallback behavior.
+
+This diagnostic profile does not support `ObjectBucket` and accepts only Worker
+Versions whose `requiredSensitiveVars` declaration is omitted or empty. It is
+therefore insufficient for the current Yurucommu Provider 4 graph, which needs
+both capabilities; a passing older fixture is not a full current-app E2E.
+This command is not a deploy path. It binds `127.0.0.1`
+on an ephemeral port by default and prints one sanitized ready JSON line
+without the token. `TAKOSERVER_STABLE_LOCAL_SPACE` and
+`TAKOSERVER_STABLE_LOCAL_PORT` may override the local Space and port.
+
+The reseller run bearer, Attachments and Migrations below act only on pre-v2
+inventory records. Their `/v1` routes are still served, but the run bearer
+authenticates only to the pre-v2 Host API, whose handler is not mounted, so a
+minted bearer opens nothing. Host API v2 has none of them.
+
+- **Run** the ordinary Takoform provider without handing a hosted runner the
+  reseller's organization API key. A reseller reservation can mint a
+  short-lived bearer pinned to one opaque tenant, exact Form, and exact
+  Resource name. Before capture it can only validate, prepare, and create that
+  paid address. After capture, a new bearer additionally pins the immutable
+  Resource UID before it may read, observe, update, or delete that incarnation.
+  The first create atomically marks the reservation consumed before provider
+  side effects, so a release can never leave an unpaid Resource.
+- **Attach** independent resources by exact Interface reference. An Attachment
+  stores only resource/deployment identity and an opaque grant, endpoint,
+  secret, or native-binding reference; it never embeds a provider credential.
+- **Migrate** by selecting another Offering for the same exact Form. Takoserver
+  provisions a candidate Deployment, transfers and verifies the data, then
+  atomically switches the active Deployment and Attachment resolutions. The
+  source stays retained for the bounded rollback window.
+
 ## Resource and supply model
 
 Takoform owns the portable words: Form, Interface, Binding, Attachment, and
@@ -853,7 +889,7 @@ Cancelling before cutover first deletes any authoritative candidate Deployment
 and only then releases the hold. An acknowledgement gap is left open for
 operator reconciliation rather than being reported as a successful cancellation.
 
-## How it is built
+## Architecture
 
 Seven provider-neutral ports; the SQL port is shown at both capability levels
 below, and everything above them remains provider-neutral.

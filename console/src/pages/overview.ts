@@ -1,5 +1,6 @@
-import { formatMicrosCurrency, type Organization } from "../api.ts";
+import { formatMicrosCurrency, type Organization, type Wallet } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
+import { formName } from "../forms.ts";
 import { consoleLocale, tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
 import { byForm, health, phaseLabel } from "../resource-state.ts";
@@ -9,8 +10,8 @@ import { ago, badge, card, copyable, empty, ICON, icon, stat, whenReady } from "
 import { createResource } from "./create-resource.ts";
 
 /**
- * The first screen, answering the two questions someone signs in with: is
- * anything broken, and can I still pay for it.
+ * The first screen, answering the question someone signs in with: is
+ * anything I deployed broken.
  *
  * Resource counts and Form groups describe only the first loaded v2 page;
  * the full cursor chain remains on the Resources screen.
@@ -34,8 +35,8 @@ export function overviewPage(organization: Organization): Child {
           "p",
           null,
           tr(
-            "Takoformリソース、前払い残高、最近の変更を確認できます。",
-            "Takoform resources, prepaid balance, and what changed recently.",
+            "Takoformで宣言したリソースの状態と、最近の変更を確認できます。",
+            "The state of the resources you declared with Takoform, and what changed recently.",
           ),
         ),
       ),
@@ -43,31 +44,7 @@ export function overviewPage(organization: Organization): Child {
     live(() =>
       h(
         "div",
-        { class: "grid" },
-        whenReady(
-          wallet.get(),
-          ({ wallet: held }) =>
-            h(
-              "div",
-              { style: { display: "contents" } },
-              stat(
-                tr("利用可能", "Available"),
-                formatMicrosCurrency(held.availableMicros, held.currency, uiLocale()),
-                BigInt(held.heldMicros) > 0n
-                  ? tr(
-                      `${formatMicrosCurrency(held.heldMicros, held.currency, uiLocale())}を処理中の操作に確保中`,
-                      `${formatMicrosCurrency(held.heldMicros, held.currency, uiLocale())} held against live work`,
-                    )
-                  : tr("確保中の金額はありません", "nothing held"),
-              ),
-              stat(
-                tr("確定残高", "Settled"),
-                formatMicrosCurrency(held.settledMicros, held.currency, uiLocale()),
-                tr("入金と確定済み請求", "credited and captured"),
-              ),
-            ),
-          { skeleton: h("div", { class: "card" }, h("div", { class: "card__body skeleton" })) },
-        ),
+        { class: "grid grid--stats" },
         whenReady(
           resources.get(),
           ({ resources: all, cursor }) => {
@@ -98,6 +75,35 @@ export function overviewPage(organization: Organization): Child {
             );
           },
           { skeleton: h("div", { class: "card" }, h("div", { class: "card__body skeleton" })) },
+        ),
+        whenReady(
+          wallet.get(),
+          ({ wallet: held }) =>
+            // v2 Resources are never charged, so a self-host whose wallet has
+            // never been used has nothing to show here; Usage & billing still
+            // has the wallet. One that has been used keeps its cards at $0.
+            walletInUse(held)
+              ? h(
+                  "div",
+                  { style: { display: "contents" } },
+                  stat(
+                    tr("利用可能", "Available"),
+                    formatMicrosCurrency(held.availableMicros, held.currency, uiLocale()),
+                    BigInt(held.heldMicros) > 0n
+                      ? tr(
+                          `${formatMicrosCurrency(held.heldMicros, held.currency, uiLocale())}を処理中の操作に確保中`,
+                          `${formatMicrosCurrency(held.heldMicros, held.currency, uiLocale())} held against live work`,
+                        )
+                      : tr("確保中の金額はありません", "nothing held"),
+                  ),
+                  stat(
+                    tr("確定残高", "Settled"),
+                    formatMicrosCurrency(held.settledMicros, held.currency, uiLocale()),
+                    tr("入金と確定済み請求", "credited and captured"),
+                  ),
+                )
+              : null,
+          { skeleton: false },
         ),
       ),
     ),
@@ -142,12 +148,18 @@ export function overviewPage(organization: Organization): Child {
                         {
                           class: "card",
                           style: { display: "block" },
-                          ...linkProps("/resources"),
+                          // Narrowed by the exact URL, so no other Form that
+                          // reads alike is swept in.
+                          ...linkProps(`/resources?form=${encodeURIComponent(entry.form)}`),
                         },
                         h(
                           "div",
                           { class: "card__body" },
-                          h("div", { class: "stat__label" }, entry.form),
+                          h(
+                            "div",
+                            { class: "stat__form", title: entry.form },
+                            formName(entry.form),
+                          ),
                           h("div", { class: "stat__value" }, String(entry.total)),
                           entry.attention > 0
                             ? h(
@@ -310,4 +322,14 @@ export function overviewPage(organization: Organization): Child {
 
 function uiLocale(): "en-US" | "ja-JP" {
   return consoleLocale() === "ja" ? "ja-JP" : "en-US";
+}
+
+/** Whether the wallet holds money now or has any history at all. */
+function walletInUse(wallet: Wallet): boolean {
+  return (
+    wallet.entries.length > 0 ||
+    [wallet.availableMicros, wallet.heldMicros, wallet.settledMicros].some(
+      (micros) => BigInt(micros) !== 0n,
+    )
+  );
 }

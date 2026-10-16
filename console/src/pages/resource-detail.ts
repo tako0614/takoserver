@@ -1,13 +1,114 @@
 import type { ResourceSummary } from "../api.ts";
 import { ApiError } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
+import { formLabel } from "../forms.ts";
 import { tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
 import { health, phaseLabel } from "../resource-state.ts";
-import { linkProps, route } from "../router.ts";
+import { linkProps, resourcePath, route } from "../router.ts";
 import { api, currentOrganization } from "../state.ts";
 import { badge, card, copyable, empty, ICON, icon, jsonBlock, whenReady } from "../ui.ts";
 import { deleteResource, updateResource } from "./create-resource.ts";
+
+export interface SpecReference {
+  /** Where the spec names it: `bundle`, `sqliteBindings · DB`, `versions[0] · workerVersion`. */
+  readonly path: string;
+  readonly uid: string;
+}
+
+/** Spec fields that hold the person's own data, never references. */
+const OPAQUE_SPEC_FIELDS = new Set(["vars"]);
+
+/**
+ * Every Resource a spec names, in the order it names them. A v2 reference is
+ * an object holding exactly one `resourceUid`; a Binding entry is labelled by
+ * its own `name`, which is how the Worker reaches it, and any other list
+ * entry by its index as the spec below shows it.
+ */
+export function specReferences(spec: unknown): SpecReference[] {
+  const found: SpecReference[] = [];
+  const walk = (value: unknown, path: readonly string[]): void => {
+    if (Array.isArray(value)) {
+      value.forEach((entry, index) => {
+        const name =
+          entry && typeof entry === "object" ? (entry as { name?: unknown }).name : undefined;
+        walk(
+          entry,
+          typeof name === "string"
+            ? [...path, name]
+            : [...path.slice(0, -1), `${path.at(-1) ?? ""}[${index}]`],
+        );
+      });
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record);
+    if (keys.length === 1 && keys[0] === "resourceUid" && typeof record.resourceUid === "string") {
+      // A Binding's `resource` key adds nothing its name has not said.
+      const shown = path.at(-1) === "resource" && path.length > 1 ? path.slice(0, -1) : path;
+      found.push({ path: shown.join(" · "), uid: record.resourceUid });
+      return;
+    }
+    for (const key of keys) {
+      if (path.length === 0 && OPAQUE_SPEC_FIELDS.has(key)) continue;
+      walk(record[key], [...path, key]);
+    }
+  };
+  walk(spec, []);
+  return found;
+}
+
+/** The https URL a Resource reports for itself, such as a WorkerEndpoint's. */
+export function publishedUrl(output: unknown): string | null {
+  const url = output && typeof output === "object" ? (output as { url?: unknown }).url : null;
+  if (typeof url !== "string") return null;
+  try {
+    return new URL(url).protocol === "https:" ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+/** How many list pages are read to find what names a Resource. */
+const REFERRER_PAGES = 5;
+
+export interface Referrer {
+  readonly resource: ResourceSummary;
+  /** Where its spec names the Resource being shown. */
+  readonly paths: readonly string[];
+}
+
+/**
+ * The Resources whose specs name `uid`, from the organization's list. Only
+ * the first pages are read, so `complete` says whether the answer covers
+ * every Resource and `checked` how many it looked at.
+ */
+export async function findReferrers(
+  organizationId: string,
+  uid: string,
+): Promise<{
+  readonly referrers: readonly Referrer[];
+  readonly complete: boolean;
+  readonly checked: number;
+}> {
+  const referrers: Referrer[] = [];
+  let cursor: string | null = null;
+  let checked = 0;
+  for (let page = 0; page < REFERRER_PAGES; page += 1) {
+    const read = await api.resources(organizationId, cursor ? { cursor } : {});
+    checked += read.resources.length;
+    for (const resource of read.resources) {
+      const paths = specReferences(resource.spec)
+        .filter((reference) => reference.uid === uid)
+        .map((reference) => reference.path);
+      if (paths.length > 0 && resource.uid !== uid) referrers.push({ resource, paths });
+    }
+    cursor = read.cursor;
+    if (cursor === null) return { referrers, complete: true, checked };
+  }
+  return { referrers, complete: false, checked };
+}
 
 /** The v2 address is the durable UID, never a reconstructed kind/name tuple. */
 export function resourceDetailPage(organizationId: string, uid: string): Child {
@@ -60,6 +161,8 @@ export function resourceDetailPage(organizationId: string, uid: string): Child {
 
 function body(found: ResourceSummary, organizationId: string, reload: () => void): Child {
   const state = health(found);
+  const url = publishedUrl(found.output);
+  const references = specReferences(found.spec);
   return h(
     "div",
     { style: { display: "grid", gap: "18px" } },
@@ -89,6 +192,18 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
           badge(phaseLabel(state.phase), state.tone, true),
         ),
         h("p", { class: "mono", style: { overflowWrap: "anywhere" } }, found.form),
+        url
+          ? h(
+              "p",
+              { class: "published" },
+              h(
+                "a",
+                { href: url, target: "_blank", rel: "noopener noreferrer" },
+                url,
+                h("span", { "aria-hidden": "true" }, " ↗"),
+              ),
+            )
+          : null,
       ),
       h(
         "div",
@@ -132,6 +247,8 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
           tr("最新の観測でReadyではありません。", "The latest observation reports not ready."),
         )
       : null,
+    references.length > 0 ? referencesCard(organizationId, references) : null,
+    referrersCard(organizationId, found.uid),
     card(
       tr("識別情報", "Identity"),
       h(
@@ -170,6 +287,104 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
     ),
     card(tr("出力", "Output"), jsonBlock(found.output)),
   );
+}
+
+/** The Resources this spec names, by name, so the graph can be walked rather than read. */
+function referencesCard(organizationId: string, references: readonly SpecReference[]): Child {
+  const named = resource(async () => {
+    const uids = [...new Set(references.map((reference) => reference.uid))];
+    const answers = await Promise.all(
+      uids.map((uid) =>
+        api.resource(organizationId, uid).then(
+          (target): readonly [string, ResourceSummary | "absent" | "unreadable"] => [uid, target],
+          (error): readonly [string, ResourceSummary | "absent" | "unreadable"] => [
+            uid,
+            error instanceof ApiError && (error.status === 404 || error.status === 410)
+              ? "absent"
+              : "unreadable",
+          ],
+        ),
+      ),
+    );
+    return new Map<string, ResourceSummary | "absent" | "unreadable">(answers);
+  });
+  return card(
+    tr("参照先", "Referenced resources"),
+    h(
+      "div",
+      { class: "card__body rows" },
+      ...references.map((reference) =>
+        field(
+          reference.path,
+          live(() => {
+            const state = named.get();
+            const target = state.state === "ready" ? state.value.get(reference.uid) : undefined;
+            if (target === undefined) return h("span", { class: "mono dim" }, reference.uid);
+            if (target === "absent" || target === "unreadable")
+              return h(
+                "span",
+                { class: "dim" },
+                h("span", { class: "mono" }, reference.uid),
+                text(
+                  target === "absent"
+                    ? tr("（この組織にはありません）", " — not in this organization")
+                    : tr("（読み込めませんでした）", " — could not be read"),
+                ),
+              );
+            return h(
+              "span",
+              { class: "ref" },
+              h("a", { class: "mono", ...linkProps(resourcePath(target.uid)) }, target.name),
+              h("span", { class: "dim" }, formLabel(target.form)),
+            );
+          }),
+        ),
+      ),
+    ),
+  );
+}
+
+/**
+ * The Resources that name this one, so a Worker leads to its Versions,
+ * Deployment and Endpoint (with the address it publishes). Shown only once
+ * something is found.
+ */
+function referrersCard(organizationId: string, uid: string): Child {
+  const found = resource(() => findReferrers(organizationId, uid));
+  return live(() => {
+    const state = found.get();
+    if (state.state !== "ready" || state.value.referrers.length === 0) return null;
+    const { referrers, complete, checked } = state.value;
+    return card(
+      complete
+        ? tr("参照元", "Referenced by")
+        : tr(`参照元（最初の${checked}件を確認）`, `Referenced by (first ${checked} checked)`),
+      h(
+        "div",
+        { class: "card__body rows" },
+        ...referrers.map(({ resource: referrer, paths }) => {
+          const url = publishedUrl(referrer.output);
+          return field(
+            tr(`${paths.join("、")} として`, `as ${paths.join(", ")}`),
+            h(
+              "span",
+              { class: "ref" },
+              h("a", { class: "mono", ...linkProps(resourcePath(referrer.uid)) }, referrer.name),
+              h("span", { class: "dim" }, formLabel(referrer.form)),
+              url
+                ? h(
+                    "a",
+                    { href: url, target: "_blank", rel: "noopener noreferrer" },
+                    url,
+                    h("span", { "aria-hidden": "true" }, " ↗"),
+                  )
+                : null,
+            ),
+          );
+        }),
+      ),
+    );
+  });
 }
 
 function field(label: string, value: Child): Child {

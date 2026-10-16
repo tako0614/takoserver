@@ -269,8 +269,8 @@ function createOrganization(): void {
         "small",
         null,
         tr(
-          "組織ごとに残高、キー、リソースを所有し、ほかの組織とは共有されません。",
-          "An organization owns its own wallet, keys, and resources. Nothing is shared between them.",
+          "リソース、APIキー、残高を組織ごとに所有し、ほかの組織とは共有されません。",
+          "An organization owns its own resources, API keys and wallet. Nothing is shared between them.",
         ),
       ),
     ),
@@ -303,8 +303,8 @@ function page(): Child {
       empty(
         tr("組織がありません", "No organization yet"),
         tr(
-          "Consoleの残高、キー、リソースは組織単位で管理されます。最初の組織を作成してください。",
-          "Everything in this console belongs to an organization — a wallet, its keys, and the resources it declares. Create one to begin.",
+          "リソース、APIキー、残高は組織ごとに管理されます。最初の組織を作成してください。",
+          "Everything in this console belongs to an organization: the resources it declares, its API keys and its wallet. Create one to begin.",
         ),
         h(
           "button",
