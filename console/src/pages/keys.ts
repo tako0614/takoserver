@@ -1,9 +1,9 @@
 import type { ApiKey } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
-import { tr } from "../i18n.ts";
-import { DEFAULT_KEY_SCOPES, keyScopeGroups } from "../key-scopes.ts";
+import { consoleLocale, tr } from "../i18n.ts";
+import { DEFAULT_KEY_SCOPES, keyScopeGroups, keyUsage } from "../key-scopes.ts";
 import { resource } from "../reactive.ts";
-import { api } from "../state.ts";
+import { api, apiOrigin } from "../state.ts";
 import {
   badge,
   card,
@@ -81,8 +81,8 @@ export function keysPage(organizationId: string): Child {
               ? empty(
                   tr("APIキーがありません", "No keys"),
                   tr(
-                    "Takoform provider、CLI、または独自コードからこの組織を操作するためのキーを作成できます。",
-                    "Create one to let the Takoform provider, the CLI, or your own code act for this organization.",
+                    "curlや独自のコードから、Host API v2でこの組織のリソースを操作するためのキーを作成できます。",
+                    "Create one to manage this organization's Resources over Host API v2 with curl or your own code.",
                   ),
                 )
               : h("div", { class: "table-scroll" }, table(apiKeys, organizationId, keys.reload)),
@@ -296,7 +296,7 @@ function createKey(organizationId: string, reload: () => void, aiAvailable: bool
         });
         close();
         reload();
-        revealSecret(created.apiKey, created.secret);
+        revealSecret(organizationId, created.apiKey, created.secret);
       } catch (error) {
         toast(explain(error as Error), "bad");
       }
@@ -304,7 +304,11 @@ function createKey(organizationId: string, reload: () => void, aiAvailable: bool
   });
 }
 
-function revealSecret(key: ApiKey, secret: string): void {
+const INSTALL_GUIDE_STEPS =
+  "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#8-create-and-serve-a-worker";
+
+function revealSecret(organizationId: string, key: ApiKey, secret: string): void {
+  const usage = keyUsage(apiOrigin(), organizationId, consoleLocale());
   openModal({
     title: tr("今すぐキーをコピーしてください", "Copy this key now"),
     dismissLabel: tr("完了", "Done"),
@@ -339,8 +343,46 @@ function revealSecret(key: ApiKey, secret: string): void {
               gap: "10px",
             },
           },
-          h("span", { class: "mono", style: { wordBreak: "break-all" } }, secret),
+          // A zero basis lets the secret wrap before the copy button gives up any width.
+          h(
+            "span",
+            { class: "mono", style: { wordBreak: "break-all", flex: "1", minWidth: "0" } },
+            secret,
+          ),
           copyable(secret, tr("コピー", "copy")),
+        ),
+      ),
+      h(
+        "div",
+        { class: "field" },
+        h(
+          "div",
+          {
+            style: {
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "10px",
+            },
+          },
+          h("span", { class: "field__label" }, tr("使い方", "Use it")),
+          copyable(usage, tr("コピー", "copy")),
+        ),
+        // One command per line, as the shell reads it: scroll rather than wrap.
+        h("pre", { class: "json", style: { whiteSpace: "pre", overflowWrap: "normal" } }, usage),
+        h(
+          "small",
+          null,
+          tr(
+            "この組織のリソースを一覧します。作成と削除の手順は",
+            "This lists the organization's Resources. ",
+          ),
+          h(
+            "a",
+            { href: INSTALL_GUIDE_STEPS, target: "_blank", rel: "noopener noreferrer" },
+            tr("導入手順書の手順8〜11", "Steps 8 to 11 of the install guide"),
+          ),
+          tr("にあります。", " cover creating and deleting them."),
         ),
       ),
     ),

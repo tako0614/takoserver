@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { DEFAULT_KEY_SCOPES, keyScopeGroups } from "../console/src/key-scopes.ts";
+import { DEFAULT_KEY_SCOPES, keyScopeGroups, keyUsage } from "../console/src/key-scopes.ts";
 import { API_KEY_SCOPES, grants } from "../src/auth.ts";
 
 const offered = (aiAvailable: boolean) =>
@@ -46,4 +46,19 @@ test("reads AI availability from the Host's own discovery document", async () =>
   } finally {
     globalThis.fetch = original;
   }
+});
+
+test("shows a first request with the new key that keeps it out of shell history", () => {
+  expect(keyUsage("https://api.example.com:8443", "org_1b17", "ja")).toBe(
+    [
+      "HOST=https://api.example.com:8443",
+      "read -r KEY   # キーを貼り付けます。シェルの履歴には残りません",
+      'curl -sS -G "$HOST/apis/forms.takoform.com/v2/resources" \\',
+      "  --data-urlencode space=org_1b17 \\",
+      '  -H "authorization: Bearer $KEY"',
+    ].join("\n"),
+  );
+  expect(keyUsage("https://api.example.com:8443", "org_1b17", "en").split("\n")[1]).toBe(
+    "read -r KEY   # paste the key; it stays out of shell history",
+  );
 });

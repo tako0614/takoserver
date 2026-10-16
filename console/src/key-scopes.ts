@@ -1,4 +1,4 @@
-import { tr } from "./i18n.ts";
+import { type ConsoleLocale, tr } from "./i18n.ts";
 
 export interface ScopeOption {
   readonly id: string;
@@ -90,3 +90,18 @@ export function keyScopeGroups(aiAvailable: boolean): readonly ScopeGroup[] {
 
 /** A writer can read what it writes, so one scope covers the common case. */
 export const DEFAULT_KEY_SCOPES: readonly string[] = ["resources:write"];
+
+/** A first request with the new key, the way the install guide makes it. */
+export function keyUsage(origin: string, organizationId: string, locale: ConsoleLocale): string {
+  const comment =
+    locale === "ja"
+      ? "キーを貼り付けます。シェルの履歴には残りません"
+      : "paste the key; it stays out of shell history";
+  return [
+    `HOST=${origin}`,
+    `read -r KEY   # ${comment}`,
+    'curl -sS -G "$HOST/apis/forms.takoform.com/v2/resources" \\',
+    `  --data-urlencode space=${organizationId} \\`,
+    '  -H "authorization: Bearer $KEY"',
+  ].join("\n");
+}
