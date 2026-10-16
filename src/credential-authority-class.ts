@@ -776,20 +776,20 @@ export function sharedBrokerCredentialCurrentness(
   return Object.freeze({
     sql: `EXISTS (SELECT 1 FROM credential_authority_classes a JOIN auth_tokens t
       ON t.id=a.token_id AND t.secret_digest=a.token_digest
-      WHERE a.authority_ref=? AND a.credential_incarnation=? AND a.target_ref=?
-        AND a.class='official-shared-broker' AND a.backend='auth-token' AND a.state='active'
-        AND a.organization_id=? AND a.principal_id=? AND a.principal_incarnation=?
-        AND a.issuance_ref=? AND a.issuance_digest=?
-        AND a.token_id=? AND a.token_digest=? AND a.token_created_at=?
-        AND a.token_scopes_json=? AND a.token_kind='api_key'
-        AND t.principal_id=a.principal_id AND t.org_id=a.organization_id
-        AND t.kind='api_key' AND t.created_at=a.token_created_at
-        AND t.scopes_json=a.token_scopes_json AND t.revoked_at IS NULL
-        AND t.expires_at=? AND t.created_at<=strftime('%Y-%m-%dT%H:%M:%fZ','now')
-        AND t.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      WHERE ((((a.authority_ref=? AND (a.credential_incarnation=? AND a.target_ref=?))
+        AND ((a.class='official-shared-broker' AND a.backend='auth-token') AND (a.state='active'
+        AND a.organization_id=?))) AND ((a.principal_id=? AND (a.principal_incarnation=?
+        AND a.issuance_ref=?)) AND ((a.issuance_digest=?
+        AND a.token_id=?) AND (a.token_digest=? AND a.token_created_at=?))))
+        AND (((a.token_scopes_json=? AND (a.token_kind='api_key'
+        AND t.principal_id=a.principal_id)) AND ((t.org_id=a.organization_id
+        AND t.kind='api_key') AND (t.created_at=a.token_created_at
+        AND t.scopes_json=a.token_scopes_json))) AND ((t.revoked_at IS NULL
+        AND (t.expires_at=? AND t.created_at<=strftime('%Y-%m-%dT%H:%M:%fZ','now')))
+        AND ((t.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')
         AND EXISTS (SELECT 1 FROM json_each(t.scopes_json)
-          WHERE type='text' AND value='payments:write')
-        AND ${currentAnchor("a", "shared")}
+          WHERE type='text' AND value='payments:write'))
+        AND (${currentAnchor("a", "shared")}
         AND EXISTS (SELECT 1 FROM shared_principal_bindings b
           WHERE b.principal_id=a.principal_id AND b.principal_incarnation=a.principal_incarnation
             AND b.binding_kind IN ('fresh-shared','proved-legacy')
@@ -797,7 +797,7 @@ export function sharedBrokerCredentialCurrentness(
             AND EXISTS (SELECT 1 FROM auth_principal_incarnations i
               WHERE i.principal_id=b.principal_id AND i.principal_incarnation=b.principal_incarnation
                 AND i.origin_kind=b.binding_kind AND i.identity_authority_body IS NULL
-                AND i.identity_authority_digest IS NULL)))`,
+                AND i.identity_authority_digest IS NULL))))))))`,
     params: Object.freeze([
       selected.ref,
       selected.incarnation,
@@ -837,23 +837,23 @@ export function sharedRpCredentialCurrentness(
   return Object.freeze({
     sql: `EXISTS (SELECT 1 FROM credential_authority_classes a JOIN shared_auth_sessions s
       ON s.digest=a.session_digest AND s.created_at=a.session_created_at
-      WHERE a.authority_ref=? AND a.credential_incarnation=? AND a.target_ref=?
-        AND a.class='official-shared-rp-session' AND a.backend='shared-rp-session'
-        AND a.state='active' AND a.organization_id=? AND a.principal_id=?
-        AND a.principal_incarnation=? AND a.issuance_ref=? AND a.issuance_digest=?
-        AND a.principal_binding_ref=? AND a.rp_registration_ref=?
-        AND a.rp_registration_digest=? AND a.session_digest=?
-        AND a.session_created_at=? AND a.session_enrolled_version=?
-        AND a.issuer=? AND a.client_id=? AND a.subject=?
-        AND a.issuer_session_id=? AND a.auth_time=? AND a.account_id=?
-        AND a.workspace_id=? AND a.workspace_ref=?
-        AND s.status='active' AND s.version=? AND s.version>=a.session_enrolled_version
-        AND s.account_id=a.account_id AND s.principal_id=a.principal_id
-        AND s.workspace_id=a.workspace_id AND s.absolute_expires_at=?
-        AND s.last_used_at=? AND s.created_at<=${now} AND s.last_used_at<=${now}
-        AND s.grant_checked_at<=${now} AND s.absolute_expires_at>${now}
-        AND s.last_used_at+43200000>${now}
-        AND EXISTS (SELECT 1 FROM shared_principal_bindings b
+      WHERE (((((a.authority_ref=? AND a.credential_incarnation=?) AND (a.target_ref=?
+        AND (a.class='official-shared-rp-session' AND a.backend='shared-rp-session')))
+        AND ((a.state='active' AND a.organization_id=?) AND (a.principal_id=?
+        AND (a.principal_incarnation=? AND a.issuance_ref=?)))) AND (((a.issuance_digest=?
+        AND a.principal_binding_ref=?) AND (a.rp_registration_ref=?
+        AND (a.rp_registration_digest=? AND a.session_digest=?)))
+        AND ((a.session_created_at=? AND a.session_enrolled_version=?)
+        AND (a.issuer=? AND (a.client_id=? AND a.subject=?)))))
+        AND ((((a.issuer_session_id=? AND a.auth_time=?) AND (a.account_id=?
+        AND (a.workspace_id=? AND a.workspace_ref=?)))
+        AND ((s.status='active' AND s.version=?) AND (s.version>=a.session_enrolled_version
+        AND (s.account_id=a.account_id AND s.principal_id=a.principal_id))))
+        AND (((s.workspace_id=a.workspace_id AND s.absolute_expires_at=?)
+        AND (s.last_used_at=? AND (s.created_at<=${now} AND s.last_used_at<=${now})))
+        AND ((s.grant_checked_at<=${now} AND s.absolute_expires_at>${now})
+        AND (s.last_used_at+43200000>${now}
+        AND (EXISTS (SELECT 1 FROM shared_principal_bindings b
           JOIN auth_principal_incarnations i ON i.principal_id=b.principal_id
             AND i.principal_incarnation=b.principal_incarnation
           WHERE b.binding_ref=a.principal_binding_ref AND b.principal_id=a.principal_id
@@ -862,7 +862,7 @@ export function sharedRpCredentialCurrentness(
             AND b.state='active' AND b.binding_kind=i.origin_kind
             AND i.origin_kind IN ('fresh-shared','proved-legacy')
             AND i.identity_authority_body IS NULL AND i.identity_authority_digest IS NULL)
-        AND ${currentAnchor("a", "shared")})`,
+        AND ${currentAnchor("a", "shared")})))))))`,
     params: Object.freeze([
       selected.ref,
       selected.incarnation,

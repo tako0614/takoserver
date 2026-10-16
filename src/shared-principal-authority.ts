@@ -400,14 +400,14 @@ export function sharedPrincipalCurrentness(
       JOIN auth_principal_incarnations i ON i.principal_id=b.principal_id
         AND i.principal_incarnation=b.principal_incarnation
       JOIN principals p ON p.id=i.principal_id
-      WHERE b.binding_ref=? AND b.principal_id=? AND b.principal_incarnation=?
-        AND b.issuer=? AND b.subject=? AND b.controller_incarnation=? AND b.target_ref=?
-        AND b.evidence_ref=? AND b.evidence_digest=? AND b.binding_kind=? AND b.state='active'
-        AND i.state='active' AND i.origin_kind=b.binding_kind
-        AND i.origin_kind IN ('fresh-shared','proved-legacy')
-        AND i.identity_authority_body IS NULL AND i.identity_authority_digest IS NULL
-        AND p.provider=i.identity_kind AND p.provider_subject=i.identity_subject
-        AND p.created_at=i.principal_created_at)`,
+      WHERE ((((b.binding_ref=? AND b.principal_id=?) AND (b.principal_incarnation=?
+        AND b.issuer=?)) AND ((b.subject=? AND b.controller_incarnation=?) AND (b.target_ref=?
+        AND (b.evidence_ref=? AND b.evidence_digest=?)))) AND (((b.binding_kind=? AND b.state='active')
+        AND (i.state='active' AND (i.origin_kind=b.binding_kind
+        AND i.origin_kind IN ('fresh-shared','proved-legacy'))))
+        AND ((i.identity_authority_body IS NULL AND i.identity_authority_digest IS NULL)
+        AND (p.provider=i.identity_kind AND (p.provider_subject=i.identity_subject
+        AND p.created_at=i.principal_created_at))))))`,
     params: Object.freeze([
       authAuthorityText(selected.ref, 256),
       authAuthorityText(selected.principalId),
