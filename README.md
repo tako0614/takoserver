@@ -131,8 +131,8 @@ wallet is funded.
 
 - **This repository is the Host and its self-host plugin**: everything needed
   to build and run a Takoserver on your own machine.
-- **It serves Takoform Host API v2 only.** Code in this repository implements
-  each Form it composes; the Host does not install Form packages, check their
+- **It serves Takoform Host API v2 only.** Host-side code implements each Form
+  it composes; the Host does not install Form packages, check their
   signatures, or translate requests into Takoform Host API v1. Its own `/v1`
   account, wallet and AI APIs are separate product APIs.
 - **takoserver.com's managed backend is not here.** Its non-public Workers for
