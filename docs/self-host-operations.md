@@ -372,24 +372,27 @@ Do this before the first start: the Host refuses to start with
 `TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS=1` until both certificate files exist.
 With the example names used in this guide, the machine needs:
 
-| DNS record | Port | Serves |
+| Name | Open TCP port | Serves |
 | --- | --- | --- |
 | `api.example.com` | 8443 | The control API, through the front end above |
 | `console.example.com` | 8444 | The console, if you serve it (step 5) |
 | `*.apps.example.com`, an A record only | 443 | Worker Endpoints, served by the Host itself |
+| (the names above that the front end serves) | 80 | The front end's own certificate challenge, if it obtains certificates (Caddy does by default) |
 
 The Worker Endpoint listener binds IPv4 only (`0.0.0.0:443`), so do not
 publish an AAAA record for `*.apps.example.com`: IPv6 clients would try an
-address nothing answers. Because the Host holds 443, a front end that obtains
-its own certificates (Caddy does by default) needs TCP 80 open for the
-HTTP-01 challenge.
+address nothing answers. The front end needs TCP 80 for its challenge because
+the Host holds 443.
 
-The Host checks the certificate pair once, at startup. It must cover
-`*.apps.example.com` (the configured suffix), match the key and be currently
-valid, or the Host does not start. A wildcard certificate can only be issued
-through a DNS challenge (ACME DNS-01), which needs API access to the DNS zone.
-Any ACME client works. With certbot and its plugin for the zone's DNS host
-(Cloudflare here; use your provider's plugin and credentials file), as root:
+The Host reads the certificate pair once, at startup, and does not start
+unless it covers `*.apps.example.com` (the configured suffix), matches the key
+and is currently valid. While it runs it keeps checking that the certificate
+is current. A wildcard certificate can only be issued through a DNS challenge
+(ACME DNS-01), which needs API access to the DNS zone. Any ACME client works;
+with certbot and its plugin for the zone's DNS host (Cloudflare here; use your
+provider's plugin and credentials file, or another client such as lego or
+acme.sh if there is no plugin, since a manual DNS challenge never renews), as
+root:
 
 ```sh
 apt-get install -y certbot python3-certbot-dns-cloudflare
@@ -401,24 +404,31 @@ cat > /usr/local/sbin/takoserver-tls-deploy <<'EOF'
 # Copies a new certificate where the Host reads it, then restarts the Host
 # if it is running, because the Host reads the pair only at startup.
 set -eu
-live=/etc/letsencrypt/live/apps.example.com
+live=${RENEWED_LINEAGE:-/etc/letsencrypt/live/apps.example.com}
 install -m 0640 -o root -g takoserver "$live/fullchain.pem" /etc/takoserver/tls/apps.example.com.crt
 install -m 0640 -o root -g takoserver "$live/privkey.pem" /etc/takoserver/tls/apps.example.com.key
-systemctl try-restart takoserver.service
+if systemctl is-active --quiet takoserver.service; then
+  systemctl restart takoserver.service
+fi
 EOF
 chmod 0755 /usr/local/sbin/takoserver-tls-deploy
 certbot certonly --dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cloudflare.ini \
-  -d '*.apps.example.com' --deploy-hook /usr/local/sbin/takoserver-tls-deploy
+  -d '*.apps.example.com' --cert-name apps.example.com -m <your email> --agree-tos \
+  --deploy-hook /usr/local/sbin/takoserver-tls-deploy
 ```
 
 `takoserver.service` stands for the unit that runs the Host; use its name.
-certbot runs the deploy hook after this first issuance, when `try-restart`
-does nothing because the Host has not started yet, and again after every
-renewal, which the package's `certbot.timer` attempts twice a day.
-`certbot renew --dry-run` tests renewal without replacing the files. A
-renewal restarts the Host, so Worker Endpoints are briefly unavailable; a
-certificate that expires without a restart keeps being served until the next
-start, which then fails.
+certbot runs the deploy hook after this first issuance, when the Host has not
+started yet, and again after every renewal, which the package's
+`certbot.timer` attempts twice a day. Re-running `certbot certonly` before a
+renewal is due copies nothing; run the hook itself instead.
+`certbot renew --dry-run` tests renewal but skips the hook, so once the Host
+runs, test the hook by running `/usr/local/sbin/takoserver-tls-deploy` (it
+restarts the Host). A renewal restarts the whole Host, about every 60 days at
+a random time in the timer's window: the API and the Endpoints are briefly
+down and queue and cron delivery pause. If a certificate expires without a
+restart, the listener still presents it, clients reject it, Endpoint
+Operations stay `reconciling`, and the next start fails.
 
 ### 5. First boot and operator sign-in
 
