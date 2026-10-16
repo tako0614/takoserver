@@ -95,9 +95,11 @@ serves them from this machine.
   `Idempotency-Key` of 16 to 128 characters, and an update or delete also names
   the generation it read in `takoform-expected-generation`. A Form this Host
   does not compose is refused, never approximated, so check it first as in
-  [What you can deploy](#what-you-can-deploy).
-  [Step 8 of the install path](docs/self-host-operations.md#8-create-and-serve-a-worker)
-  has the exact requests.
+  [What you can deploy](#what-you-can-deploy). Steps
+  [8](docs/self-host-operations.md#8-create-and-serve-a-worker),
+  [9](docs/self-host-operations.md#9-verify) and
+  [11](docs/self-host-operations.md#11-delete-resources) of the install
+  path show the exact create, update and delete requests.
 - **Own** Resources through an organization. Its ID is the v2 Space, and its API
   keys and its owner's session act as one principal, so replacing a key does
   not strand a Resource. A `resources:read` key reads; a `resources:write` key
@@ -105,13 +107,10 @@ serves them from this machine.
   owner names one with the `takoform-organization` header on every request.
 - **Ship code** as a WorkerBundle, which names an exact HTTPS URL and SHA-256
   rather than accepting an upload (see [Held artifacts](#held-artifacts-and-workers)).
-  A WorkerVersion names the ModuleWorker, one WorkerBundle and its Bindings,
-  and cannot be changed afterwards.
-- **Serve** it with a WorkerDeployment, which splits the Worker's traffic across
-  up to eight WorkerVersions by weights that add up to 10000, and a
-  WorkerEndpoint, which publishes the Worker at an HTTPS hostname on the Host's
-  TCP 443 listener. To ship new code, create a new WorkerVersion and point the
-  Deployment at it.
+  A ModuleWorker is the Worker's identity, with an empty spec. A WorkerVersion
+  names its ModuleWorker, at most one WorkerBundle (a static-site Version names
+  only a StaticAssetBundle), its handlers, vars and Bindings, and cannot be
+  changed afterwards.
 - **Bind** Resources into a Worker by UID. A WorkerVersion lists them in
   `sqliteBindings`, `kvBindings`, `bucketBindings`, `queueProducerBindings`,
   `serviceBindings`, `actorBindings` and `workflowBindings`, each entry
@@ -119,6 +118,12 @@ serves them from this machine.
   such as `env.DB`. The Host serves the SQLite, KV, bucket and queue Bindings
   from private loopback services, not from its public listener. A Resource that
   another still names cannot be deleted, so delete in reference order.
+- **Serve** a Worker with a WorkerDeployment, which splits the Worker's traffic across
+  up to eight WorkerVersions by weights that add up to 10000, and a
+  WorkerEndpoint, which publishes the Worker at an HTTPS hostname on the Host's
+  TCP 443 listener. Neither a bundle nor a WorkerVersion can be changed, so to
+  ship new code, create a new WorkerBundle and WorkerVersion, then update the
+  Deployment's versions.
 - **Infer** through `/v1/ai` when the operator configures an OpenAI-compatible
   upstream ([Settings](#settings)). An API key with `ai:invoke` sees only the
   configured public model IDs. Every chat completion needs an `Idempotency-Key`,
