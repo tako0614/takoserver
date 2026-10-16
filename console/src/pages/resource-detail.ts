@@ -1,13 +1,66 @@
 import type { ResourceSummary } from "../api.ts";
 import { ApiError } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
+import { formLabel } from "../forms.ts";
 import { tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
 import { health, phaseLabel } from "../resource-state.ts";
-import { linkProps, route } from "../router.ts";
+import { linkProps, resourcePath, route } from "../router.ts";
 import { api, currentOrganization } from "../state.ts";
 import { badge, card, copyable, empty, ICON, icon, jsonBlock, whenReady } from "../ui.ts";
 import { deleteResource, updateResource } from "./create-resource.ts";
+
+export interface SpecReference {
+  /** Where the spec names it: `bundle`, `sqliteBindings · DB`, `versions #1 · workerVersion`. */
+  readonly path: string;
+  readonly uid: string;
+}
+
+/**
+ * Every Resource a spec names, in the order it names them. A v2 reference is
+ * an object holding exactly one `resourceUid`; a Binding entry is labelled by
+ * its own `name`, which is how the Worker reaches it.
+ */
+export function specReferences(spec: unknown): SpecReference[] {
+  const found: SpecReference[] = [];
+  const walk = (value: unknown, path: readonly string[]): void => {
+    if (Array.isArray(value)) {
+      value.forEach((entry, index) => {
+        const named =
+          entry &&
+          typeof entry === "object" &&
+          typeof (entry as { name?: unknown }).name === "string"
+            ? (entry as { name: string }).name
+            : `#${index + 1}`;
+        walk(entry, [...path, named]);
+      });
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record);
+    if (keys.length === 1 && keys[0] === "resourceUid" && typeof record.resourceUid === "string") {
+      // A Binding's `resource` key adds nothing its name has not said.
+      const shown = path.at(-1) === "resource" && path.length > 1 ? path.slice(0, -1) : path;
+      found.push({ path: shown.join(" · "), uid: record.resourceUid });
+      return;
+    }
+    for (const key of keys) walk(record[key], [...path, key]);
+  };
+  walk(spec, []);
+  return found;
+}
+
+/** The https URL a Resource reports for itself, such as a WorkerEndpoint's. */
+export function publishedUrl(output: unknown): string | null {
+  const url = output && typeof output === "object" ? (output as { url?: unknown }).url : null;
+  if (typeof url !== "string") return null;
+  try {
+    return new URL(url).protocol === "https:" ? url : null;
+  } catch {
+    return null;
+  }
+}
 
 /** The v2 address is the durable UID, never a reconstructed kind/name tuple. */
 export function resourceDetailPage(organizationId: string, uid: string): Child {
@@ -60,6 +113,8 @@ export function resourceDetailPage(organizationId: string, uid: string): Child {
 
 function body(found: ResourceSummary, organizationId: string, reload: () => void): Child {
   const state = health(found);
+  const url = publishedUrl(found.output);
+  const references = specReferences(found.spec);
   return h(
     "div",
     { style: { display: "grid", gap: "18px" } },
@@ -89,6 +144,18 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
           badge(phaseLabel(state.phase), state.tone, true),
         ),
         h("p", { class: "mono", style: { overflowWrap: "anywhere" } }, found.form),
+        url
+          ? h(
+              "p",
+              { class: "published" },
+              h(
+                "a",
+                { href: url, target: "_blank", rel: "noopener noreferrer" },
+                url,
+                h("span", { "aria-hidden": "true" }, " ↗"),
+              ),
+            )
+          : null,
       ),
       h(
         "div",
@@ -132,6 +199,7 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
           tr("最新の観測でReadyではありません。", "The latest observation reports not ready."),
         )
       : null,
+    references.length > 0 ? referencesCard(organizationId, references) : null,
     card(
       tr("識別情報", "Identity"),
       h(
@@ -169,6 +237,52 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
           ),
     ),
     card(tr("出力", "Output"), jsonBlock(found.output)),
+  );
+}
+
+/** The Resources this spec names, by name, so the graph can be walked rather than read. */
+function referencesCard(organizationId: string, references: readonly SpecReference[]): Child {
+  const named = resource(async () => {
+    const uids = [...new Set(references.map((reference) => reference.uid))];
+    const answers = await Promise.all(
+      uids.map((uid) =>
+        api.resource(organizationId, uid).then(
+          (target) => [uid, target] as const,
+          () => [uid, null] as const,
+        ),
+      ),
+    );
+    return new Map<string, ResourceSummary | null>(answers);
+  });
+  return card(
+    tr("参照しているリソース", "Resources it names"),
+    h(
+      "div",
+      { class: "card__body rows" },
+      ...references.map((reference) =>
+        field(
+          reference.path,
+          live(() => {
+            const state = named.get();
+            const target = state.state === "ready" ? state.value.get(reference.uid) : undefined;
+            if (target === undefined) return h("span", { class: "mono dim" }, reference.uid);
+            if (target === null)
+              return h(
+                "span",
+                { class: "dim" },
+                h("span", { class: "mono" }, reference.uid),
+                text(tr("（この組織にはありません）", " — not in this organization")),
+              );
+            return h(
+              "span",
+              { class: "ref" },
+              h("a", { class: "mono", ...linkProps(resourcePath(target.uid)) }, target.name),
+              h("span", { class: "dim" }, formLabel(target.form)),
+            );
+          }),
+        ),
+      ),
+    ),
   );
 }
 

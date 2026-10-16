@@ -1053,6 +1053,27 @@ tbody tr.is-clickable:hover {
   min-width: 0;
 }
 
+.row__value a,
+.published a {
+  color: var(--ink-1);
+  text-decoration: underline;
+  text-decoration-color: var(--line-2);
+  text-underline-offset: 3px;
+  overflow-wrap: anywhere;
+}
+
+.row__value a:hover,
+.published a:hover {
+  text-decoration-color: var(--accent);
+}
+
+.ref {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  align-items: baseline;
+}
+
 @media (width < 620px) {
   .row {
     grid-template-columns: 1fr;
