@@ -30,21 +30,35 @@ const organizationId = "org_sample";
 const now = Date.now();
 const forms = "https://edge.forms.takoform.com/forms";
 
+// Each observed and output object has the shape the Bun Host's own backend
+// reports for that Form once the Worker serves, so the Console shows the states
+// a reader will see on their own Host.
 const resources = [
-  sample("hello", "ModuleWorker/0.3.0", 9, {}),
+  sample("hello", "ModuleWorker/0.3.0", 9, {
+    activeDeploymentUid: "sample-hello-deployment",
+    ready: true,
+  }),
   sample("hello-bundle-v1", "WorkerBundle/0.2.0", 9, {
     entrypoint: "worker.js",
     fileCount: 1,
     totalBytes: 80,
   }),
-  sample("hello-version-v1", "WorkerVersion/0.5.0", 8, {}),
-  sample("hello-deployment", "WorkerDeployment/0.4.0", 8, {}),
+  sample("hello-version-v1", "WorkerVersion/0.5.0", 8, {
+    ready: true,
+    resolvedBindings: true,
+    bundleVerified: true,
+  }),
+  sample("hello-deployment", "WorkerDeployment/0.4.0", 8, {
+    ready: true,
+    active: true,
+    selectedVersions: [{ resourceUid: "sample-hello-version-v1", weight: 10000 }],
+  }),
   sample(
     "hello-endpoint",
     "WorkerEndpoint/0.3.0",
     7,
-    { hostname: "hello.apps.example.com" },
-    { hostname: "hello.apps.example.com" },
+    { tlsReady: true, activeDeploymentRouteReady: true },
+    { hostname: "hello.apps.example.com", url: "https://hello.apps.example.com/" },
   ),
   sample("notes", "SQLiteDatabase/0.2.0", 26, { databaseExists: true }),
 ];
@@ -232,16 +246,18 @@ try {
         }
         const rendered = await evaluate<{
           rows: number;
-          applied: number;
+          settled: number;
           viewport: [number, number];
           pageWidth: number;
           theme: string;
           lang: string;
         }>(
-          `({ rows: document.querySelectorAll('.table-scroll tbody tr').length, applied: [...document.querySelectorAll('.table-scroll tbody tr')].filter(row => /Applied|反映済み/.test(row.innerText)).length, viewport: [innerWidth, innerHeight], pageWidth: document.documentElement.scrollWidth, theme: document.documentElement.dataset.theme, lang: document.documentElement.lang })`,
+          `({ rows: document.querySelectorAll('.table-scroll tbody tr').length, settled: [...document.querySelectorAll('.table-scroll tbody tr')].filter(row => /\\b(Ready|Applied)\\b|稼働中|反映済み/.test(row.innerText)).length, viewport: [innerWidth, innerHeight], pageWidth: document.documentElement.scrollWidth, theme: document.documentElement.dataset.theme, lang: document.documentElement.lang })`,
         );
         if (
-          rendered.applied !== resources.length ||
+          // Every sample row shows a settled, healthy state: Ready where its Form
+          // reports readiness, Applied where it has none.
+          rendered.settled !== resources.length ||
           rendered.viewport[0] !== width ||
           rendered.viewport[1] !== height ||
           rendered.pageWidth > width ||
