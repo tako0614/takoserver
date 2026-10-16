@@ -5,7 +5,13 @@ import { valueAt, WORKER_DEPLOYMENT, WORKER_VERSION } from "../form-specs.ts";
 import { formLabel } from "../forms.ts";
 import { tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
-import { MODULE_WORKER, publishedUrl, type SpecReference, specReferences } from "../references.ts";
+import {
+  MODULE_WORKER,
+  publishedUrl,
+  type SpecReference,
+  specReferences,
+  WORKER_ENDPOINT,
+} from "../references.ts";
 import { health, phaseLabel, unrecordedDeployment } from "../resource-state.ts";
 import { linkProps, resourcePath, route } from "../router.ts";
 import { api, currentOrganization } from "../state.ts";
@@ -230,7 +236,7 @@ function body(
           ),
         )
       : null,
-    state.phase === "NotReady" ? (action.notice ?? notReadyNotice()) : null,
+    action.notice ?? (state.phase === "NotReady" ? notReadyNotice() : null),
     references.length > 0 ? referencesCard(organizationId, references) : null,
     referrersCard(organizationId, found.uid),
     card(
@@ -311,18 +317,89 @@ function notReadyNotice(): Child {
 }
 
 /**
- * On the page of a ModuleWorker that reports not ready: when its Deployment
- * serves it but the Worker has not recorded that, say so and offer the
- * same-spec update that records it. Nothing is sent until the person accepts.
+ * On a ModuleWorker's page: when its Deployment serves it but the Worker has
+ * not recorded that Deployment, say so, and offer the same-spec update that
+ * records it only where that update can finish. The Host refuses it while
+ * anything naming the Worker is in progress, and it cannot finish until every
+ * WorkerEndpoint naming the Worker is published; until then it would hold the
+ * Worker busy, and nothing could name it. Nothing is sent until the person
+ * accepts the update.
  */
 function recordDeploymentNotice(organizationId: string, worker: ResourceSummary): Child {
-  if (health(worker).phase !== "NotReady") return null;
-  const served = resource(() => deploymentOf(organizationId, worker.uid));
+  const phase = health(worker).phase;
+  if (phase !== "Ready" && phase !== "NotReady") return null;
+  const plain = (): Child => (phase === "NotReady" ? notReadyNotice() : null);
+  const graph = resource(async () => {
+    const deployment = await deploymentOf(organizationId, worker.uid);
+    if (!unrecordedDeployment(worker, deployment)) return null;
+    return { deployment, naming: await findReferrers(organizationId, worker.uid) };
+  });
+  const links = (resources: readonly ResourceSummary[]): Child[] =>
+    resources.flatMap((entry, index) => [
+      index === 0 ? null : tr("、", ", "),
+      h("a", { ...linkProps(resourcePath(entry.uid)) }, entry.name),
+    ]);
   return live(() => {
-    const state = served.get();
-    const deployment = state.state === "ready" ? state.value : null;
-    if (!unrecordedDeployment(worker, deployment)) return notReadyNotice();
-    const link = h("a", { ...linkProps(resourcePath(deployment.uid)) }, deployment.name);
+    const state = graph.get();
+    const found = state.state === "ready" ? state.value : null;
+    if (!found) return plain();
+    const { deployment, naming } = found;
+    const referrers = naming.referrers.map(({ resource }) => resource);
+    const busy = referrers.filter((entry) => ["Pending", "Deleting"].includes(health(entry).phase));
+    const unpublished = referrers.filter(
+      (entry) =>
+        WORKER_ENDPOINT.test(entry.form) &&
+        !busy.includes(entry) &&
+        !(health(entry).phase === "Ready" && entry.observed.tlsReady === true),
+    );
+    const next: Child = !naming.complete
+      ? h(
+          "span",
+          null,
+          tr(
+            "このWorkerを参照するリソースをすべては確認できなかったため、ここでは更新を提示しません。",
+            "Not everything that names this Worker could be checked here, so the update is not offered.",
+          ),
+        )
+      : busy.length > 0
+        ? h(
+            "span",
+            null,
+            ...links(busy),
+            tr(
+              "の処理が終わるまで待ってください。Workerを参照するリソースの処理中は、Hostはこの更新を受け付けません。",
+              busy.length === 1
+                ? " is in progress. Wait until it finishes: the Host refuses this update while anything that names the Worker is in progress."
+                : " are in progress. Wait until they finish: the Host refuses this update while anything that names the Worker is in progress.",
+            ),
+          )
+        : unpublished.length > 0
+          ? h(
+              "span",
+              null,
+              tr("先に", "Re-apply or delete "),
+              ...links(unpublished),
+              tr(
+                "を再適用するか削除してください。稼働中になるまでこの更新は完了せず、その間Workerを処理中のままにします。",
+                " first. Until it is Ready, this update cannot finish, and it would hold the Worker busy meanwhile.",
+              ),
+            )
+          : h(
+              "button",
+              {
+                class: "btn",
+                type: "button",
+                onClick: () =>
+                  updateResource(organizationId, worker, {
+                    spec: worker.spec,
+                    note: tr(
+                      `${worker.name}を同じ設定のまま更新し、稼働中の配信${deployment.name}を記録します。内容を確認して受け付けてください。`,
+                      `This updates ${worker.name} with the same spec, so that it records ${deployment.name}. Check it, then accept.`,
+                    ),
+                  }),
+              },
+              tr("配信を記録する", "Record the Deployment"),
+            );
     return h(
       "div",
       {
@@ -332,29 +409,18 @@ function recordDeploymentNotice(organizationId: string, worker: ResourceSummary)
       h(
         "span",
         null,
-        tr("このWorkerは、配信", "This Worker was observed before "),
-        link,
+        tr("このWorkerは、稼働中の配信", "This Worker has not recorded "),
+        ...links([deployment]),
         tr(
-          "が稼働する前に観測されたため、その配信を記録していません。記録するまでは非稼働と報告され、WorkerCronTriggerによる実行も行われません。同じ設定で更新すると記録されます。",
-          " served it, so it has not recorded that Deployment. Until it does, the Host reports it NotReady and a WorkerCronTrigger does not run it. Updating it with the same spec records it.",
+          `を記録していません。HostがWorkerの配信を記録するのは、そのWorker自体が適用されたときだけです。${
+            phase === "NotReady" ? "記録するまでは非稼働と報告され、" : "記録するまで、"
+          }このWorkerのWorkerCronTriggerは適用を完了できず、実行されません。WorkerCronTriggerを追加する前に、同じ設定で更新して記録してください。`,
+          `, which serves it: the Host records a Worker's Deployment only when the Worker itself is applied. Until it does, ${
+            phase === "NotReady" ? "the Host reports it NotReady, and " : ""
+          }a WorkerCronTrigger for it cannot finish being applied, so it never runs. Update it with the same spec to record it before you add a WorkerCronTrigger.`,
         ),
       ),
-      h(
-        "button",
-        {
-          class: "btn",
-          type: "button",
-          onClick: () =>
-            updateResource(organizationId, worker, {
-              spec: worker.spec,
-              note: tr(
-                `${worker.name}を同じ設定のまま更新し、稼働中の配信${deployment.name}を記録します。内容を確認して受け付けてください。`,
-                `This updates ${worker.name} with the same spec, so that it records ${deployment.name}. Check it, then accept.`,
-              ),
-            }),
-        },
-        tr("配信を記録する", "Record the Deployment"),
-      ),
+      next,
     );
   });
 }

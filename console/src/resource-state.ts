@@ -65,8 +65,10 @@ export function health(resource: ResourceSummary): Health {
  * Whether a ModuleWorker has not recorded the Deployment that serves it. The
  * Host writes a Worker's observation only when the Worker's own operation
  * settles, so a Worker created before its Deployment keeps reporting not
- * ready, and keeps no active Deployment for WorkerCronTrigger to run, until
- * it is updated with the same spec.
+ * ready, and one that recorded an earlier Deployment keeps naming it, until
+ * it is updated with the same spec. Until then no WorkerCronTrigger for it
+ * can finish being applied. A Worker has at most one Deployment, so a settled
+ * Worker that names another one is out of date.
  */
 export function unrecordedDeployment(
   worker: ResourceSummary,
@@ -76,7 +78,7 @@ export function unrecordedDeployment(
     MODULE_WORKER.test(worker.form) &&
     deployment !== null &&
     deployment !== undefined &&
-    health(worker).phase === "NotReady" &&
+    ["Ready", "NotReady"].includes(health(worker).phase) &&
     health(deployment).phase === "Ready" &&
     deployment.observed.active === true &&
     worker.observed.activeDeploymentUid !== deployment.uid
