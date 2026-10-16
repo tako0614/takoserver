@@ -1163,9 +1163,13 @@ commit first, then, as root (the checkout stays root-owned and read-only to
    cd /opt/takoserver-<short-commit> && bun install --frozen-lockfile
    ```
 
+   If `bun install` fails on the lockfile, the new checkout may expect another
+   Bun version; see step 2.
+
    Keep the previous checkout: it is what a code-only return runs. Never
    delete `/opt/takoserver` while other worktrees exist (their `.git` points
-   into it); remove an old worktree with `git -C /opt/takoserver worktree remove`.
+   into it); remove an old worktree with
+   `git -C /opt/takoserver worktree remove /opt/takoserver-<old-commit>`.
 2. **Check the pinned tools the new checkout expects.** Compare its Bun
    version, workerd pin and Go toolchain with what is installed; nothing checks
    the Bun version at startup:
