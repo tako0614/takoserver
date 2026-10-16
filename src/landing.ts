@@ -24,6 +24,8 @@ const GUIDE = `${REPOSITORY}/blob/main/docs/self-host-operations.md`;
 const INSTALL_GUIDE = `${GUIDE}#first-install-and-first-use`;
 const DEPLOY_STEPS = `${GUIDE}#6-seed-held-artifacts`;
 const DOCKER_GUIDE = `${REPOSITORY}/blob/main/docs/self-host-docker.md`;
+const CONSOLE_SETUP = `${GUIDE}#the-console-optional`;
+const SHIP_STEPS = `${GUIDE}#9-verify`;
 const SECURITY_GUIDE = `${REPOSITORY}/blob/main/docs/self-host-security.md`;
 const V2_REFERENCE = `${REPOSITORY}/blob/main/docs/takoform-v2.md`;
 const PREREQUISITES = `${GUIDE}#1-prerequisites`;
@@ -88,14 +90,20 @@ const landingMessages = {
     resultLabel: "Then request it, with the UID the Endpoint's create returned in $ENDPOINT:",
     deployMore: "Steps 6 to 9 in the guide",
     afterTitle: "After you deploy",
-    consoleTitle: "In the console",
+    consoleTitle: "See it in the console",
     consoleBody:
-      "The console is a separate static app built from this repository. Serve it on its own origin next to your API and name that origin in the Host's settings. There you sign in, create the organization that owns your Resources, issue API keys, and see each Resource's declared and observed state.",
+      "The console shows each Worker with the address it is served at and whether it is Ready, and every Resource with what you declared and what the Host last observed. It is a static app built from this repository and served on its own origin next to the API.",
+    consoleSetup: "Set up the console (install guide, step 5)",
     consoleHost: "Open this Host's console",
-    consoleSite: "takoserver.com's own console",
-    apiTitle: "With the API",
-    apiBody:
-      "Do the same from your own tools over Host API v2. Start by asking your Host whether it supports the exact Form URL you plan to use; $HOST is its public origin.",
+    shipTitle: "Ship a new version",
+    shipBody:
+      "Code never changes in place. Create the new code and a version for it, then point the Deployment at that version; the Endpoint keeps its address.",
+    shipBundle:
+      "holds the new worker.js, by the URL and SHA-256 of its manifest (a seeded bundle needs a Host restart first).",
+    shipVersion: "pairs the new WorkerBundle with its fetch handler.",
+    shipDeploy:
+      "is updated to serve hello-version-v2 at weight 10000. The update names the generation it read, so a change made in between is not overwritten.",
+    shipMore: "Step 9 of the install guide",
     reference: "Host API v2 reference",
     openapi: "OpenAPI description",
     discovery: "Takoform Host discovery",
@@ -157,14 +165,20 @@ const landingMessages = {
     resultLabel: "公開したら、Endpointの作成で返ったUIDを$ENDPOINTに入れてリクエストします。",
     deployMore: "手順書の手順6〜9",
     afterTitle: "デプロイしたあと",
-    consoleTitle: "コンソールで",
+    consoleTitle: "コンソールで確かめる",
     consoleBody:
-      "コンソールは、このリポジトリからbuildする独立した静的アプリです。APIと並ぶ別のoriginで配信し、そのoriginをHostの設定に指定します。そこでサインインし、リソースを所有する組織を作り、APIキーを発行して、各リソースの宣言と観測した状態を確認します。",
+      "コンソールには、各Workerの公開先と稼働中かどうか、各リソースの宣言した内容とHostが最後に観測した状態が表示されます。コンソールはこのリポジトリからビルドする静的アプリで、APIと並ぶ別のオリジンで配信します。",
+    consoleSetup: "コンソールを用意する（導入手順書の手順5）",
     consoleHost: "このHostのコンソールを開く",
-    consoleSite: "takoserver.com自身のコンソール",
-    apiTitle: "APIで",
-    apiBody:
-      "同じ操作を、自分のツールからHost API v2で行えます。まず、使う予定のForm URLに自分のHostが対応しているかを確認します。$HOSTはHostの公開originです。",
+    shipTitle: "新しい版を出す",
+    shipBody:
+      "動いているコードは書き換えられません。新しいコードと版を作り、Deploymentをその版に切り替えます。Endpointの公開先はそのままです。",
+    shipBundle:
+      "新しいworker.jsを、そのmanifestのURLとSHA-256で指定します（Hostに保持させた場合は、先にHostを再起動します）。",
+    shipVersion: "新しいWorkerBundleとfetchハンドラーを組み合わせた版です。",
+    shipDeploy:
+      "hello-version-v2を重み10000で配信するよう更新します。更新は読み取った世代を指定するので、その間に入った別の変更を上書きしません。",
+    shipMore: "手順書の手順9",
     reference: "Host API v2 リファレンス",
     openapi: "OpenAPI仕様",
     discovery: "Takoform Hostディスカバリー",
@@ -334,6 +348,8 @@ pre .out { color: var(--accent); }
 .after p { margin: 12px 0 0; color: var(--ink-2); font-size: 15px; }
 .after .chips code { font-size: 12px; border-radius: 8px; }
 .after pre { margin-top: 16px; }
+.after .chain { margin-top: 16px; }
+.after .chain p { margin: 2px 0 0; font-size: 14px; }
 .actions.start { justify-content: flex-start; }
 .after .actions { margin-top: 20px; }
 
@@ -352,7 +368,7 @@ footer { display: flex; align-items: center; justify-content: space-between; fle
 
 @media (min-width: 761px) and (max-width: 1100px) { .preview .frame { max-width: 848px; margin-inline: auto; } }
 /* Below desktop width the code beside each list would scroll sideways, so the columns stack. */
-@media (max-width: 1200px) { .deploy, .host { grid-template-columns: minmax(0, 1fr); gap: 24px; } }
+@media (max-width: 1216px) { .deploy, .host, .after { grid-template-columns: minmax(0, 1fr); gap: 24px; } }
 @media (max-width: 760px) {
   .shell { width: calc(100% - 32px); }
   .top { height: 72px; }
@@ -385,7 +401,11 @@ export function landingHtml(options: LandingOptions): string {
   const siteAssets = options.apiOrigin !== null;
   // Commands target the reader's own Host. On the public site that is $HOST;
   // the API's own root fills in the origin it was read from.
-  const commandOrigin = siteAssets ? "$HOST" : `<span data-origin>$HOST</span>`;
+  // On the public site the request uses the guide's $V2; a Host's own root
+  // page fills in the origin it was read from.
+  const shipTarget = siteAssets
+    ? "$V2/resources"
+    : `<span data-origin>$HOST</span>/apis/forms.takoform.com/v2/resources`;
   const text = (key: keyof typeof copy, tag = "span", attributes = "") =>
     `<${tag}${attributes} data-i18n="${key}">${copy[key]}</${tag}>`;
   const screen = (shape: "desktop" | "tablet" | "mobile", theme: "light" | "dark") =>
@@ -416,11 +436,12 @@ export function landingHtml(options: LandingOptions): string {
   ).join("\n");
   // The API's own root links its own console. The public site's console is
   // takoserver.com's Host, so it is named as that, never as the reader's.
-  const consoleAction = !options.consoleOrigin
-    ? ""
-    : siteAssets
-      ? `<p class="more"><a href="${options.consoleOrigin}" data-i18n="consoleSite">${copy.consoleSite}</a></p>`
-      : `<div class="actions start"><a class="pill secondary external" href="${options.consoleOrigin}" data-i18n="consoleHost">${copy.consoleHost}</a></div>`;
+  // Only a Host's own root links its console; the public site describes the
+  // reader's own Host, never takoserver.com's.
+  const consoleAction =
+    options.consoleOrigin && !siteAssets
+      ? `<div class="actions start"><a class="pill secondary external" href="${options.consoleOrigin}" data-i18n="consoleHost">${copy.consoleHost}</a></div>`
+      : "";
   const locales = `<link rel="alternate" hreflang="en" href="https://takoserver.com/en/">
 <link rel="alternate" hreflang="ja" href="https://takoserver.com/ja/">
 <link rel="alternate" hreflang="x-default" href="https://takoserver.com/">`;
@@ -538,11 +559,24 @@ curl -sS "https://$NAME/"
 <section class="block" id="after" aria-labelledby="after-title">
 ${text("afterTitle", "h2", ' id="after-title"')}
 <div class="after">
-<div>${text("consoleTitle", "h3")}${text("consoleBody", "p")}<span class="chips"><code>bun scripts/build-console.ts --api-origin &lt;API origin&gt;</code><code>TAKOSERVER_CONSOLE_ORIGIN</code></span>${consoleAction}</div>
-<div>${text("apiTitle", "h3")}${text("apiBody", "p")}<pre>curl -sG "${commandOrigin}/apis/forms.takoform.com/v2/support" \\
-  --data-urlencode "form=&lt;Form URL&gt;" \\
-  -H "authorization: Bearer $KEY"</pre>
-<p class="more"><a href="${V2_REFERENCE}" data-i18n="reference">${copy.reference}</a></p></div>
+<div>${text("consoleTitle", "h3")}${text("consoleBody", "p")}${consoleAction}
+<p class="more"><a href="${CONSOLE_SETUP}" data-i18n="consoleSetup">${copy.consoleSetup}</a></p></div>
+<div>${text("shipTitle", "h3")}${text("shipBody", "p")}
+<ol class="chain">
+<li><strong>WorkerBundle 0.2.0 <span>hello-bundle-v2</span></strong>${text("shipBundle", "p")}</li>
+<li><strong>WorkerVersion 0.5.0 <span>hello-version-v2</span></strong>${text("shipVersion", "p")}</li>
+<li><strong>WorkerDeployment 0.4.0 <span>hello-deployment</span></strong>${text("shipDeploy", "p")}</li>
+</ol>
+<pre>PUT ${shipTarget}/&lt;Deployment UID&gt;
+idempotency-key: &lt;a new key&gt;
+takoform-expected-generation: &lt;the generation it read&gt;
+
+{"spec": {
+  "worker": {"resourceUid": "&lt;hello UID&gt;"},
+  "versions": [{
+    "workerVersion": {"resourceUid": "&lt;hello-version-v2 UID&gt;"},
+    "weight": 10000}]}}</pre>
+<p class="more"><a href="${SHIP_STEPS}" data-i18n="shipMore">${copy.shipMore}</a><a href="${V2_REFERENCE}" data-i18n="reference">${copy.reference}</a></p></div>
 </div>
 </section>
 </main>
