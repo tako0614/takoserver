@@ -96,6 +96,10 @@ const landingMessages = {
       "The console can also create these Resources in the browser. Choose a Form and it fills in the smallest spec this Host accepts; you can pick each Resource it refers to by name, and nothing is sent until you accept. It shows each Worker with the address it is served at and whether it is Ready. It is a static app built from this repository and served on its own origin next to the API.",
     consoleSetup: "Set up the console (install guide, step 5)",
     consoleHost: "Open this Host's console",
+    hereTitle: "This is a Takoserver Host",
+    hereBody:
+      "You reached the API of a self-hosted Takoserver. Its operator manages the Workers and data it runs in its console, or with Host API v2 at this address:",
+    hereNoConsole: "This Host serves no console yet.",
     shipTitle: "Ship a new version",
     shipBody:
       "Code never changes in place. Create the new code and a version for it, then point the Deployment at that version; the Endpoint keeps its address. In the console, once the new version is Ready, choose “Serve this version” on its page; it prepares this update for you to accept.",
@@ -171,6 +175,10 @@ const landingMessages = {
       "コンソールでも、同じリソースをブラウザーから作成できます。Formを選ぶとこのHostが受け付ける最小の設定が入り、設定が参照するリソースは名前で選べます。「受け付ける」を押すまで、何も送信されません。各Workerの公開先と稼働中かどうかも表示されます。コンソールはこのリポジトリからビルドする静的アプリで、APIと並ぶ別のオリジンで配信します。",
     consoleSetup: "コンソールを用意する（導入手順書の手順5）",
     consoleHost: "このHostのコンソールを開く",
+    hereTitle: "ここはTakoserverのHostです",
+    hereBody:
+      "セルフホストされたTakoserverのAPIです。運用者は、ここで動くWorkerとデータを、コンソールか次のアドレスのHost API v2で管理します。",
+    hereNoConsole: "このHostにはまだコンソールがありません。",
     shipTitle: "新しい版を出す",
     shipBody:
       "動いているコードは書き換えられません。新しいコードと版を作り、Deploymentをその版に切り替えます。Endpointの公開先はそのままです。コンソールでは、新しい版が稼働中になったら、そのページで「この版を配信する」を押すとこの更新が用意され、「更新を受け付ける」を押すと送信されます。",
@@ -295,6 +303,12 @@ h1 { margin: 0; font-family: var(--display); font-size: clamp(42px, 5.5vw, 68px)
 .pill:active { opacity: 0.72; }
 @media (hover: hover) { .pill.primary:hover { opacity: 0.86; } .pill.secondary:hover { border-color: var(--ink-3); } }
 
+.here { margin: 40px auto 0; max-width: 760px; padding: 28px 32px; text-align: left; background: var(--surface-2); border: 1px solid var(--line-1); border-radius: 18px; }
+.here h2 { font-size: clamp(22px, 2.4vw, 28px); }
+.here p { margin: 12px 0 0; color: var(--ink-2); font-size: 15px; }
+.here .address { overflow-wrap: anywhere; color: var(--ink-1); }
+.here .actions { margin-top: 20px; }
+
 .preview { margin: 64px 0 0; }
 .frame { padding: 12px; background: var(--surface-2); border: 1px solid var(--line-1); border-radius: 22px; box-shadow: 0 24px 64px -40px var(--shadow); }
 .frame picture { display: block; overflow: hidden; border: 1px solid var(--line-1); border-radius: 12px; }
@@ -375,6 +389,7 @@ footer { display: flex; align-items: center; justify-content: space-between; fle
   .top { height: 72px; }
   .hero { padding: 48px 0 32px; }
   .hero-title { gap: 12px; }
+  .here { margin-top: 28px; padding: 22px 20px; }
   .hero-title svg { width: 36px; height: 36px; }
   h1 { font-size: clamp(34px, 8.7vw, 56px); }
   .lead { font-size: 19px; margin-top: 20px; }
@@ -439,6 +454,21 @@ export function landingHtml(options: LandingOptions): string {
   // takoserver.com's Host, so it is named as that, never as the reader's.
   // Only a Host's own root links its console; the public site describes the
   // reader's own Host, never takoserver.com's.
+  // A Host's own root first says where the reader is and how to manage it;
+  // the public site has no such place to point at.
+  const here = siteAssets
+    ? ""
+    : `<section class="here" aria-labelledby="here-title">
+${text("hereTitle", "h2", ' id="here-title"')}
+${text("hereBody", "p")}
+<p class="address"><code><span data-origin>$HOST</span>/apis/forms.takoform.com/v2</code></p>
+${
+  options.consoleOrigin
+    ? `<div class="actions start"><a class="pill primary external" href="${options.consoleOrigin}" data-i18n="consoleHost">${copy.consoleHost}</a></div>`
+    : `${text("hereNoConsole", "p")}<p class="more"><a href="${CONSOLE_SETUP}" data-i18n="consoleSetup">${copy.consoleSetup}</a></p>`
+}
+<p class="more"><a href="/.well-known/takoform/v2" data-i18n="discovery">${copy.discovery}</a><a href="/openapi.json" data-i18n="openapi">${copy.openapi}</a></p>
+</section>`;
   const consoleAction =
     options.consoleOrigin && !siteAssets
       ? `<div class="actions start"><a class="pill secondary external" href="${options.consoleOrigin}" data-i18n="consoleHost">${copy.consoleHost}</a></div>`
@@ -492,6 +522,7 @@ ${siteAssets ? '@font-face { font-family: "Bricolage Grotesque"; font-style: nor
 <main id="main">
 <section class="hero" aria-labelledby="headline">
 <div class="hero-title">${takoMark(56)}<h1 id="headline">Takoserver</h1></div>
+${here}
 ${text("lead", "p", ' class="lead"')}
 ${text("lede", "p", ' class="lede"')}
 <div class="actions"><a class="pill primary external" href="${INSTALL_GUIDE}" data-i18n="install">${copy.install}</a><a class="pill secondary external" href="${REPOSITORY}" data-i18n="source">${copy.source}</a></div>

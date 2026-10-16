@@ -225,6 +225,29 @@ describe("Takoserver public site", () => {
     expect(landingHtml(site)).not.toContain("data-origin>");
   });
 
+  test("says on a Host's own root where the reader is, before the product story", () => {
+    const withConsole = landingHtml({
+      consoleOrigin: "https://console.host.example",
+      apiOrigin: null,
+    });
+    const here = withConsole.indexOf('<section class="here"');
+    expect(here).toBeGreaterThan(withConsole.indexOf('<h1 id="headline">'));
+    expect(here).toBeLessThan(withConsole.indexOf('data-i18n="lead"'));
+    expect(withConsole).toContain("This is a Takoserver Host");
+    expect(withConsole).toContain(
+      "<code><span data-origin>$HOST</span>/apis/forms.takoform.com/v2</code>",
+    );
+    expect(withConsole).toContain(
+      'class="pill primary external" href="https://console.host.example" data-i18n="consoleHost"',
+    );
+    // Without a console, it says so and how to set one up.
+    const bare = landingHtml({ consoleOrigin: null, apiOrigin: null });
+    expect(bare).toContain("This Host serves no console yet.");
+    expect(bare).toContain('data-i18n="consoleSetup"');
+    // The public site describes the reader's own Host, never itself as one.
+    expect(landingHtml(site)).not.toContain('<section class="here"');
+  });
+
   test("answers unknown paths in the same visual system", () => {
     const html = notFoundHtml();
     expect(html).toContain("<title>404 | Takoserver</title>");
