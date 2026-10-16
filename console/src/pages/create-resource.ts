@@ -1,5 +1,6 @@
 import { ApiError, type ResourceSummary } from "../api.ts";
 import { h } from "../dom.ts";
+import { formLabel, KNOWN_FORM_GROUPS } from "../forms.ts";
 import { tr } from "../i18n.ts";
 import {
   isUnknownAcceptance,
@@ -71,6 +72,19 @@ function recoveryDetails(
   );
 }
 
+/**
+ * The exact request, folded away. Someone recovering an uncertain send can
+ * open it and copy the key and body; nobody else has to read them first.
+ */
+function requestDisclosure(details: HTMLElement): HTMLElement {
+  return h(
+    "details",
+    { class: "request-details" },
+    h("summary", null, tr("送信するリクエスト", "Request to send")),
+    details,
+  );
+}
+
 async function submit(intent: ResourceIntent, close: () => void): Promise<void> {
   try {
     const accepted = await sendResourceIntent(intent.id);
@@ -93,23 +107,203 @@ async function submit(intent: ResourceIntent, close: () => void): Promise<void> 
   }
 }
 
-/** Create only against the exact Form URL supplied by the operator. */
+const OTHER_FORM = "other";
+/** A Host that has not answered about one Form by now is not waited for. */
+const PROBE_TIMEOUT_MS = 5_000;
+
+interface FormChoice {
+  readonly element: HTMLElement;
+  /** The exact Form URL chosen or typed, trimmed; empty when none is. */
+  value(): string;
+  setDisabled(disabled: boolean): void;
+}
+
+/** One Form's support answer, or null when the Host did not give one in time. */
+function probeSupport(organizationId: string, form: string): Promise<boolean | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), PROBE_TIMEOUT_MS);
+    api.formSupport(organizationId, form).then(
+      (supported) => {
+        clearTimeout(timer);
+        resolve(supported);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(null);
+      },
+    );
+  });
+}
+
+/**
+ * A choice among the Forms this Host supports, so nobody has to know a Form
+ * URL by heart. The list is usable at once; each known Form is asked about
+ * when the dialog opens, and its option is marked as the answer arrives: a
+ * Form the Host does not support stays visible but cannot be chosen, and one
+ * the Host did not answer for says so. "Another exact Form URL" keeps any URL
+ * possible. If the Host answered for none, the URL field is the whole
+ * control. The create itself still asks about the exact URL before sending.
+ */
+function formChoice(organizationId: string, onChange: () => void): FormChoice {
+  const url = h("input", {
+    class: "input",
+    id: "create-resource-form-url",
+    placeholder: "https://…/forms/Kind/1.0.0/",
+    autocomplete: "off",
+    spellcheck: "false",
+    "aria-label": "Form URL",
+  });
+  url.hidden = true;
+  const options = new Map<string, HTMLOptionElement>();
+  const select = h(
+    "select",
+    { class: "select", id: "create-resource-form" },
+    h(
+      "option",
+      { value: "", disabled: true, selected: true },
+      tr("Formを選んでください", "Choose a Form"),
+    ),
+    ...KNOWN_FORM_GROUPS.map((group) =>
+      h(
+        "optgroup",
+        { label: group.label() },
+        group.forms.map((form) => {
+          const option = h("option", { value: form }, formLabel(form));
+          options.set(form, option);
+          return option;
+        }),
+      ),
+    ),
+    h("option", { value: OTHER_FORM }, tr("別のForm URLを入力…", "Another exact Form URL…")),
+  );
+  const label = h("label", { for: "create-resource-form" }, "Form");
+  const hint = h("small");
+  let pending = options.size;
+  let answered = 0;
+
+  const typed = (): boolean => select.hidden || select.value === OTHER_FORM;
+  const value = (): string =>
+    typed() ? url.value.trim() : select.value.startsWith("https://") ? select.value : "";
+  const render = (): void => {
+    url.hidden = !typed();
+    if (!typed() && select.value.startsWith("https://")) {
+      hint.replaceChildren(
+        tr(
+          "設定に書ける項目は公開仕様で確認できます：",
+          "The spec's fields are in its published contract: ",
+        ),
+        h(
+          "a",
+          { href: select.value, target: "_blank", rel: "noopener noreferrer" },
+          formLabel(select.value),
+          h("span", { "aria-hidden": "true" }, " ↗"),
+          h(
+            "span",
+            { class: "visually-hidden" },
+            tr("（新しいタブで開きます）", " (opens in a new tab)"),
+          ),
+        ),
+      );
+      return;
+    }
+    hint.replaceChildren(
+      select.hidden
+        ? tr(
+            "このHostが対応しているFormを確認できませんでした。正確なForm URLを入力してください。",
+            "Couldn't ask this Host which Forms it supports. Enter an exact Form URL.",
+          )
+        : select.value === OTHER_FORM
+          ? tr(
+              "正確なForm URLを入力してください。送信前に、このHostが対応しているかを確認します。",
+              "Enter an exact Form URL. The Host is asked whether it supports it before anything is sent.",
+            )
+          : pending > 0
+            ? tr(
+                "このHostが対応しているFormを確認しています…",
+                "Checking which Forms this Host supports…",
+              )
+            : tr(
+                "このHostが対応しているFormだけを選べます。",
+                "Only the Forms this Host supports can be chosen.",
+              ),
+    );
+  };
+  const sync = (): void => {
+    render();
+    onChange();
+  };
+  select.addEventListener("change", sync);
+  url.addEventListener("input", sync);
+
+  const settle = (form: string, supported: boolean | null): void => {
+    pending -= 1;
+    const option = options.get(form);
+    if (supported === false) {
+      if (option) {
+        option.disabled = true;
+        option.replaceChildren(
+          tr(
+            `${formLabel(form)}（このHostにはありません）`,
+            `${formLabel(form)} — not on this Host`,
+          ),
+        );
+      }
+      answered += 1;
+    } else if (supported === null) {
+      option?.replaceChildren(
+        tr(`${formLabel(form)}（確認できませんでした）`, `${formLabel(form)} — not checked`),
+      );
+    } else {
+      answered += 1;
+    }
+    // Once the create is being sent the choice is fixed; a late answer only
+    // marks its option, and the create's own check decides what is sent.
+    if (select.disabled) return;
+    if (supported === false && select.value === form) select.value = "";
+    // A Host that answered for no Form at all leaves only the exact URL,
+    // unless the person has already picked something to keep.
+    if (pending === 0 && answered === 0 && select.value === "") {
+      select.hidden = true;
+      label.setAttribute("for", "create-resource-form-url");
+    }
+    sync();
+  };
+  for (const form of options.keys()) {
+    void probeSupport(organizationId, form).then((supported) => settle(form, supported));
+  }
+  render();
+
+  return {
+    element: h("div", { class: "field" }, label, select, url, hint),
+    value,
+    setDisabled(disabled) {
+      url.disabled = disabled;
+      select.disabled = disabled;
+    },
+  };
+}
+
+/** Create one Resource of an exact Form this Host supports. */
 export function createResource(organizationId: string): void {
   const key = `console-create-${crypto.randomUUID()}`;
-  const form = h("input", {
+  const name = h("input", {
     class: "input",
-    placeholder: "https://…/forms/…/0.1.0/",
+    id: "create-resource-name",
+    placeholder: "my-resource",
     autocomplete: "off",
   });
-  const name = h("input", { class: "input", placeholder: "my-resource", autocomplete: "off" });
-  const spec = h("textarea", { class: "textarea", spellcheck: "false" });
+  const spec = h("textarea", {
+    class: "textarea",
+    id: "create-resource-spec",
+    spellcheck: "false",
+  });
   spec.value = "{}";
   const details = h("div");
   const showDetails = (): void => {
     const parsed = jsonSpec(spec.value);
     const body = parsed
       ? JSON.stringify({
-          form: form.value.trim(),
+          form: form.value(),
           space: organizationId,
           name: name.value.trim(),
           spec: parsed,
@@ -119,7 +313,8 @@ export function createResource(organizationId: string): void {
       recoveryDetails(key, "POST", "/apis/forms.takoform.com/v2/resources", body),
     );
   };
-  for (const field of [form, name, spec]) field.addEventListener("input", showDetails);
+  const form = formChoice(organizationId, showDetails);
+  for (const field of [name, spec]) field.addEventListener("input", showDetails);
   showDetails();
   let intent: ResourceIntent | null = null;
   const close = openModal({
@@ -128,42 +323,44 @@ export function createResource(organizationId: string): void {
     body: h(
       "div",
       { style: { display: "grid", gap: "14px" } },
+      form.element,
       h(
         "div",
         { class: "field" },
-        h("label", null, tr("正確なForm URL", "Exact Form URL")),
-        form,
-        h(
-          "small",
-          null,
-          tr(
-            "運用者が提供したForm URLを入力してください。",
-            "Paste the operator-provided Form URL.",
-          ),
-        ),
+        h("label", { for: "create-resource-name" }, tr("名前", "Name")),
+        name,
       ),
-      h("div", { class: "field" }, h("label", null, tr("名前", "Name")), name),
-      h("div", { class: "field" }, h("label", null, tr("スペース", "Space")), organizationId),
-      h("div", { class: "field" }, h("label", null, tr("設定 (JSON)", "Spec (JSON)")), spec),
-      details,
+      h(
+        "div",
+        { class: "field" },
+        h("label", null, tr("スペース", "Space")),
+        h("span", { class: "field__value" }, organizationId),
+      ),
+      h(
+        "div",
+        { class: "field" },
+        h("label", { for: "create-resource-spec" }, tr("設定 (JSON)", "Spec (JSON)")),
+        spec,
+      ),
+      requestDisclosure(details),
     ),
     onConfirm: async () => {
       if (!sameOrganization(organizationId)) return;
       if (!intent) {
-        const selectedForm = form.value.trim();
+        const selectedForm = form.value();
         const selectedName = name.value.trim();
         const parsed = jsonSpec(spec.value);
         if (!selectedForm || !selectedName || !parsed) {
           toast(
             tr(
-              "Form URL、名前、JSONオブジェクトを入力してください",
-              "Enter a Form URL, name, and JSON object",
+              "Formを選び、名前とJSONオブジェクトを入力してください",
+              "Choose a Form, then enter a name and a JSON object",
             ),
             "bad",
           );
           return;
         }
-        form.disabled = true;
+        form.setDisabled(true);
         name.disabled = true;
         spec.disabled = true;
         showDetails();
@@ -176,7 +373,7 @@ export function createResource(organizationId: string): void {
               ),
               "bad",
             );
-            form.disabled = false;
+            form.setDisabled(false);
             name.disabled = false;
             spec.disabled = false;
             return;
@@ -199,7 +396,7 @@ export function createResource(organizationId: string): void {
             ),
           );
         } catch (error) {
-          form.disabled = false;
+          form.setDisabled(false);
           name.disabled = false;
           spec.disabled = false;
           toast(explain(error as Error), "bad");
@@ -241,7 +438,7 @@ export function updateResource(organizationId: string, resource: ResourceSummary
       { class: "field" },
       h("label", null, tr("設定 (JSON)", "Spec (JSON)")),
       spec,
-      details,
+      requestDisclosure(details),
     ),
     onConfirm: async () => {
       if (!sameOrganization(organizationId)) return;
@@ -302,7 +499,7 @@ export function deleteResource(organizationId: string, resource: ResourceSummary
           "The backend resource and its data may be destroyed. This cannot be undone.",
         ),
       ),
-      recoveryDetails(key, "DELETE", path, null, resource.generation),
+      requestDisclosure(recoveryDetails(key, "DELETE", path, null, resource.generation)),
     ),
     onConfirm: async () => {
       if (!sameOrganization(organizationId)) return;
