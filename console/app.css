@@ -1227,8 +1227,23 @@ tbody tr.is-clickable:hover {
   color: var(--ink-2);
 }
 
-.field__value {
+.field__value,
+.field small {
   overflow-wrap: anywhere;
+}
+
+.select:disabled {
+  color: var(--ink-3);
+  cursor: default;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .field small a {

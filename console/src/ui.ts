@@ -352,7 +352,14 @@ export function openModal(options: ModalOptions): () => void {
 
   document.body.append(scrim);
   document.addEventListener("keydown", onKey);
-  scrim.querySelector<HTMLElement>("input, textarea, select, button")?.focus();
+  // The first control a person can use, not one still disabled or hidden.
+  scrim
+    .querySelector<HTMLElement>(
+      ["input", "textarea", "select", "button"]
+        .map((tag) => `${tag}:not([disabled]):not([hidden])`)
+        .join(", "),
+    )
+    ?.focus();
   return close;
 }
 
