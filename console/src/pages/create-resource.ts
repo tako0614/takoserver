@@ -248,7 +248,6 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
           ),
         );
       }
-      if (select.value === form) select.value = "";
       answered += 1;
     } else if (supported === null) {
       option?.replaceChildren(
@@ -257,6 +256,10 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
     } else {
       answered += 1;
     }
+    // Once the create is being sent the choice is fixed; a late answer only
+    // marks its option, and the create's own check decides what is sent.
+    if (select.disabled) return;
+    if (supported === false && select.value === form) select.value = "";
     // A Host that answered for no Form at all leaves only the exact URL,
     // unless the person has already picked something to keep.
     if (pending === 0 && answered === 0 && select.value === "") {
