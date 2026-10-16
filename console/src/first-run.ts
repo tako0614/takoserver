@@ -110,3 +110,12 @@ export function firstRunNote(organizationId: string): Child {
     );
   });
 }
+
+/** A value made on first use and reused after. */
+export function once<Value>(make: () => Value): () => Value {
+  let made: { readonly value: Value } | null = null;
+  return () => {
+    made ??= { value: make() };
+    return made.value;
+  };
+}

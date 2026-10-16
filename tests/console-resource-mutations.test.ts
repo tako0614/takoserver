@@ -616,6 +616,10 @@ test("after a full reload without the in-memory exact intent, warning remains re
   );
   body.append(resourcesPage("other") as unknown as TestNode);
   await settle();
+  // The empty list's note asks the Host what it serves only once the list has
+  // loaded; let those two answers land before this test hands the DOM back.
+  expect(requests.filter((request) => request.url.includes("/support"))).toHaveLength(2);
+  await settle();
   expect(body.textContent).toContain("Acceptance is unknown");
   expect(body.textContent).toContain("After a full reload without the exact request");
   expect(body.textContent).not.toContain("Retry exact request");
