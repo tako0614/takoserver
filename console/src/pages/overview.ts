@@ -151,10 +151,6 @@ export function overviewPage(organization: Organization): Child {
   );
 }
 
-/**
- * Each Worker with the state of the Deployment serving it and the addresses
- * it is published at: what someone signing in most wants to know.
- */
 /** Resources that failed, report not ready, or have a change not yet applied. */
 function attentionCard(all: readonly ResourceSummary[]): Child {
   const attention = all.filter((entry) => {
@@ -223,6 +219,8 @@ function attentionCard(all: readonly ResourceSummary[]): Child {
  * How many Resources the first page holds, by Form. Only the first page is
  * read here; when the Host has more, the count says so instead of passing a
  * page size off as a total. Each Form opens the list narrowed to its exact URL.
+ * The caption counts only failed and not-ready Resources; Needs attention also
+ * lists changes not yet applied, so the two can differ on purpose.
  */
 function resourcesCard(all: readonly ResourceSummary[], more: boolean): Child {
   const attention = all.filter((entry) =>
@@ -326,6 +324,10 @@ function walletLine(held: Wallet): Child {
   );
 }
 
+/**
+ * Each Worker with the state of the Deployment serving it and the addresses
+ * it is published at: what someone signing in most wants to know.
+ */
 function workersCard(all: readonly ResourceSummary[], partial: boolean): Child {
   const workers = servedWorkers(all);
   if (workers.length === 0) return null;
