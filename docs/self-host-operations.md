@@ -37,11 +37,13 @@ A self-host runs one of two profiles, selected by configuration:
   `WorkerEndpoint 0.3.0`, which publishes a Worker at an HTTPS hostname, also
   needs the TCP 443 listener in step 4.
 
-The guide uses two shells. An **administrator shell** as root installs tools,
-writes `/etc/takoserver`, and runs `systemctl` and `journalctl`; blocks that
-need it say "as root". An **operator shell** as the `takoserver` user
-(`runuser -u takoserver -- bash`) runs steps 5 to 11, which share shell
-variables such as `KEY` and `ORG`; keep it open between steps.
+The guide uses two shells, and each block says which: "as root" or "as the
+`takoserver` user". An **administrator shell** as root installs tools, writes
+`/etc/takoserver`, and runs `systemctl` and `journalctl`. An **operator
+shell** as the `takoserver` user (`runuser -u takoserver -- bash`, then
+`cd /opt/takoserver`) runs the `takoserver` blocks of step 3, whose key files
+must belong to that user, and steps 5 to 11, which share shell variables such
+as `KEY` and `ORG`; keep it open between steps.
 
 ### 1. Prerequisites
 
@@ -135,7 +137,7 @@ before the first start:
 install -d -m 0700 -o takoserver -g takoserver /var/lib/takoserver
 ```
 
-The Host checks four things about it at startup:
+The data root needs four things; the Host enforces the first two at startup:
 
 - **A short path.** Actor and Workflow runtimes bind private Unix sockets in
   `<data root>/s`, and a Unix socket path is limited to about 100 bytes, so the
@@ -143,12 +145,13 @@ The Host checks four things about it at startup:
   Native Actor processes, for both the v2 Actor runtime and the implied Actor
   runtime, also bind sockets below `TMPDIR`, which may be at most 73 bytes.
 - **Owned by the Host's user and closed to others.** The v2 private planes
-  require the data root to be mode 0700 and owned by the Host's user, and
-  refuse otherwise with the path, mode and owner; `s/` must be the same. The data root and every directory above it must be owned
-  by root or by the Host's user, and no other user may be able to write to
-  them, except a sticky root-owned one such as `/tmp`. A group-writable
-  ancestor (for example under umask 002, or a Kubernetes `fsGroup` volume with
-  mode 2775) is refused; tighten it with `chmod g-w`.
+  require the data root to be mode 0700 and owned by the Host's user, and refuse
+  otherwise with the path, mode and owner; `s/` must be the same. The data root
+  and every directory above it must be owned by root or by the Host's user, and
+  no other user may be able to write to them, except a sticky root-owned one
+  such as `/tmp`. A group-writable ancestor (for example under umask 002, or a
+  Kubernetes `fsGroup` volume with mode 2775) is refused; tighten it with `chmod
+  g-w`.
 - **One stable path on one machine.** At startup the Host resolves
   `TAKOSERVER_DATA_ROOT` once to an absolute, canonical path: a relative value,
   including the default, is relative to the working directory, and symlinks in
