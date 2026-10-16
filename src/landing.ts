@@ -334,6 +334,7 @@ footer { display: flex; align-items: center; justify-content: space-between; fle
 .error p { margin: 12px 0 0; color: var(--ink-2); }
 .error .pill { margin-top: 28px; }
 
+@media (min-width: 761px) and (max-width: 1100px) { .preview .frame { max-width: 844px; margin-inline: auto; } }
 @media (max-width: 760px) {
   .shell { width: calc(100% - 32px); }
   .top { height: 72px; }
@@ -367,7 +368,7 @@ export function landingHtml(options: LandingOptions): string {
   const commandOrigin = siteAssets ? "$HOST" : `<span data-origin>$HOST</span>`;
   const text = (key: keyof typeof copy, tag = "span", attributes = "") =>
     `<${tag}${attributes} data-i18n="${key}">${copy[key]}</${tag}>`;
-  const screen = (shape: "desktop" | "mobile", theme: "light" | "dark") =>
+  const screen = (shape: "desktop" | "tablet" | "mobile", theme: "light" | "dark") =>
     `/screens/console-${shape}-${theme}-{lang}.webp`;
   const localized = (template: string) => template.replace("{lang}", locale);
   const preview = siteAssets
@@ -375,6 +376,8 @@ export function landingHtml(options: LandingOptions): string {
 <div class="frame"><picture>
 <source media="(max-width: 760px) and (prefers-color-scheme: dark)" srcset="${localized(screen("mobile", "dark"))}" data-locale-srcset="${screen("mobile", "dark")}" width="780" height="1560">
 <source media="(max-width: 760px)" srcset="${localized(screen("mobile", "light"))}" data-locale-srcset="${screen("mobile", "light")}" width="780" height="1560">
+<source media="(max-width: 1100px) and (prefers-color-scheme: dark)" srcset="${localized(screen("tablet", "dark"))}" data-locale-srcset="${screen("tablet", "dark")}" width="1640" height="1400">
+<source media="(max-width: 1100px)" srcset="${localized(screen("tablet", "light"))}" data-locale-srcset="${screen("tablet", "light")}" width="1640" height="1400">
 <source media="(prefers-color-scheme: dark)" srcset="${localized(screen("desktop", "dark"))}" data-locale-srcset="${screen("desktop", "dark")}" width="2400" height="1500">
 <img src="${localized(screen("desktop", "light"))}" data-locale-src="${screen("desktop", "light")}" width="2400" height="1500" alt="${copy.previewAlt}" data-i18n-alt="previewAlt" fetchpriority="high">
 </picture></div>
