@@ -652,6 +652,7 @@ tbody tr.is-clickable:hover {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
   max-width: 100%;
   padding: 2px 5px;
   margin: -2px -5px;
@@ -1322,4 +1323,52 @@ tbody tr.is-clickable:hover {
 
 .signin__endpoint summary:hover {
   color: var(--ink-2);
+}
+
+.field__value,
+.field small {
+  overflow-wrap: anywhere;
+}
+
+.select:disabled {
+  color: var(--ink-3);
+  cursor: default;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.field small a {
+  color: var(--ink-2);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.field small a:hover {
+  color: var(--ink-1);
+}
+
+.request-details summary {
+  color: var(--ink-3);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.request-details summary:hover {
+  color: var(--ink-2);
+}
+
+.request-details[open] summary {
+  margin-bottom: 8px;
+}
+
+.request-details pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
