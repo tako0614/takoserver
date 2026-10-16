@@ -1163,32 +1163,39 @@ commit first, then, as root (the checkout stays root-owned and read-only to
    cd /opt/takoserver-<short-commit> && bun install --frozen-lockfile
    ```
 
-   Keep the previous checkout: it is what a code-only return runs.
-2. **Check the pinned tools the new checkout expects.** Compare its workerd pin
-   and Go toolchain with what is installed:
+   Keep the previous checkout: it is what a code-only return runs. Never
+   delete `/opt/takoserver` while other worktrees exist (their `.git` points
+   into it); remove an old worktree with `git -C /opt/takoserver worktree remove`.
+2. **Check the pinned tools the new checkout expects.** Compare its Bun
+   version, workerd pin and Go toolchain with what is installed; nothing checks
+   the Bun version at startup:
 
    ```sh
+   cat /opt/takoserver-<short-commit>/.bun-version; bun --version
    grep -o 'sha256: "[0-9a-f]*"' /opt/takoserver-<short-commit>/src/workerd-artifact.ts
    . /etc/takoserver/takoserver.env && sha256sum "$TAKOSERVER_WORKERD_BINARY"
    grep '^toolchain' /opt/takoserver-<short-commit>/services/workflow-execution-guard/go.mod
    ```
 
-   If the workerd digest differs, install the new binary as in step 1 under
-   its new name and change `TAKOSERVER_WORKERD_BINARY`; if the toolchain line
-   differs, install that Go release as in step 1. Either change is made in
-   step 4, while the Host is stopped.
+   If the Bun version differs, install it with step 1's installer and rerun
+   `bun install --frozen-lockfile` in the new checkout with it. If the workerd
+   digest differs, install the new binary as in step 1 under its new name and
+   change `TAKOSERVER_WORKERD_BINARY` (the old binary stays under its own
+   name). If the toolchain line differs, install that Go release as in step 1.
+   Make these changes in step 4, while the Host is stopped.
 3. **Snapshot and stop.** If an earlier build ran as root, check `/tmp` first,
    as described under
    [`/tmp` left at mode 0700](#ordinary-journey-native-test-and-known-gaps).
    Make the [cold snapshot](#cold-snapshot) below through its step 4 (its
    step 2 stops the Host with `systemctl stop takoserver.service` and waits for
    every writer), and keep the Host stopped instead of restarting it.
-4. **Switch.** Change `/opt/takoserver` to the new checkout's path in both the
-   wrapper (`cd /opt/takoserver`) and the unit
-   (`WorkingDirectory=/opt/takoserver`) from step 3, rebuild the Workflow
-   execution guard from the new checkout as in step 1 (with
-   `cd /opt/takoserver-<short-commit>/services/workflow-execution-guard`), make
-   any change step 2 called for, and run `systemctl daemon-reload`. Keep the
+4. **Switch.** Change the current checkout path (initially `/opt/takoserver`)
+   to the new checkout's path in both the wrapper (`cd …`) and the unit
+   (`WorkingDirectory=…`) from step 3, make any change step 2 called for,
+   rebuild the Workflow execution guard from the new checkout as in step 1
+   (with `export PATH=/usr/local/go/bin:$PATH` and
+   `cd /opt/takoserver-<short-commit>/services/workflow-execution-guard`), and
+   run `systemctl daemon-reload`. Keep the
    same protected configuration otherwise. If you serve the console, rebuild
    it from the new checkout as described under
    [The console](#the-console-optional).
@@ -1204,22 +1211,23 @@ commit first, then, as root (the checkout stays root-owned and read-only to
    service only after these checks succeed. If any result is uncertain, stop
    the Host and retain the journal and the current database for diagnosis.
 
-Code rollback is not database rollback. To return to the previous code, stop
-the Host and all writers, confirm that the retained previous checkout's
-migration reader recognizes the database's complete recorded history and its
-runtime is compatible with the current persisted state, then switch the
-wrapper and unit back to that checkout as in step 4 above (rebuilding the guard
-from it if the toolchain differs), run `systemctl daemon-reload` and start the
-Host. Perform the same startup,
-Forms, and authenticated Resource readback checks as for an update. Do not test
-an unknown older binary by starting it against the primary database. Never
-restore an older database over the current one merely to make an older binary
-start. SQLite schema changes are forward-only; an unknown recorded migration
-is a refusal, not permission to edit, reset, or replace the database. If
-compatibility is not established, keep the current data intact and repair
-forward with a source version that understands it. A cold backup restore is a
-separate recovery operation with source fencing and identity ownership
-requirements below, not a routine code rollback.
+Code rollback is not database rollback. To return to the previous code, stop the
+Host and all writers, confirm that the retained previous checkout's migration
+reader recognizes the database's complete recorded history and its runtime is
+compatible with the current persisted state, then switch the wrapper and unit
+back to that checkout as in step 4 above, always rebuild the guard from it (the
+guard is built from the same checkout as the Host), switch back any Bun version
+or `TAKOSERVER_WORKERD_BINARY` that step 2 changed, run `systemctl
+daemon-reload` and start the Host. Perform the same startup, Forms, and
+authenticated Resource readback checks as for an update. Do not test an unknown
+older binary by starting it against the primary database. Never restore an older
+database over the current one merely to make an older binary start. SQLite
+schema changes are forward-only; an unknown recorded migration is a refusal, not
+permission to edit, reset, or replace the database. If compatibility is not
+established, keep the current data intact and repair forward with a source
+version that understands it. A cold backup restore is a separate recovery
+operation with source fencing and identity ownership requirements below, not a
+routine code rollback.
 
 ## Upgrading from v1.0.0
 
