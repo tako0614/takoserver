@@ -245,6 +245,7 @@ async function operationPage(answers: Array<Record<string, unknown>>) {
 }
 
 test("an accepted operation is followed until it settles, without pressing Reload", async () => {
+  await setup();
   const { OPERATION_FOLLOW } = await import("../console/src/pages/resources.ts");
   const saved = { ...OPERATION_FOLLOW };
   OPERATION_FOLLOW.intervalMs = 5;
@@ -266,6 +267,7 @@ test("an accepted operation is followed until it settles, without pressing Reloa
 });
 
 test("following stops after its budget and then asks for Reload", async () => {
+  await setup();
   const { OPERATION_FOLLOW } = await import("../console/src/pages/resources.ts");
   const saved = { ...OPERATION_FOLLOW };
   OPERATION_FOLLOW.budgetMs = 0;
@@ -295,6 +297,46 @@ test("a failed operation says so with the Host's message", async () => {
   expect(body.textContent).toContain(
     "Failed: WorkerDeployment for this Worker is missing (dependency_conflict)",
   );
+  // Whether anything changed is said with the failure.
+  expect(body.textContent).toContain("Nothing was changed.");
+});
+
+test("a failed operation that changed some things says to check the Resource", async () => {
+  const { body } = await operationPage([
+    {
+      ...op,
+      status: "failed",
+      effect: "partial",
+      error: { code: "worker_unavailable", message: "workerd stopped" },
+    },
+  ]);
+  await settle();
+  expect(body.textContent).toContain("Partly applied. Check the Resource.");
+});
+
+test("a rebuilt page leaves only one loop following the operation", async () => {
+  await setup();
+  const { OPERATION_FOLLOW, resourcesPage } = await import("../console/src/pages/resources.ts");
+  const saved = { ...OPERATION_FOLLOW };
+  OPERATION_FOLLOW.intervalMs = 5;
+  try {
+    // Two builds each read once; then one loop reads the third answer and
+    // stops. Two loops would read a fourth time.
+    const { body, checks } = await operationPage([
+      op,
+      op,
+      { ...op, status: "succeeded", effect: "complete" },
+    ]);
+    body.append(resourcesPage("org-console") as unknown as TestNode);
+    let seen = -1;
+    for (let i = 0; i < 40 && seen !== checks(); i += 1) {
+      seen = checks();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(checks()).toBe(3);
+  } finally {
+    Object.assign(OPERATION_FOLLOW, saved);
+  }
 });
 
 test.each(["connection lost", "malformed accepted reply"] as const)(

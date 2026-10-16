@@ -1,4 +1,4 @@
-import type { ResourceSummary } from "../api.ts";
+import type { ResourceOperation, ResourceSummary } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
 import { firstRunNote, once } from "../first-run.ts";
 import { formName } from "../forms.ts";
@@ -18,6 +18,28 @@ import { createResource } from "./create-resource.ts";
 
 /** How an operation still in progress is followed: every 1.5 s for up to two minutes. */
 export const OPERATION_FOLLOW = { intervalMs: 1_500, budgetMs: 120_000 };
+/** Bumped by each build of the Resources page; only the newest build follows. */
+let followGeneration = 0;
+
+/** What a failed operation left behind, which decides whether a retry is safe. */
+function failedEffect(effect: string): string {
+  switch (effect) {
+    case "none":
+      return tr("変更はありません。", "Nothing was changed.");
+    case "partial":
+      return tr(
+        "一部が反映されています。リソースを確認してください。",
+        "Partly applied. Check the Resource.",
+      );
+    case "complete":
+      return tr("変更は反映されています。", "The change was applied.");
+    default:
+      return tr(
+        "反映されたか分かりません。リソースを確認してください。",
+        "Unknown whether it was applied. Check the Resource.",
+      );
+  }
+}
 
 function operationSettled(operation: { readonly status: string }): boolean {
   return operation.status === "succeeded" || operation.status === "failed";
@@ -79,10 +101,17 @@ export function resourcesPage(organizationId: string): Child {
   // the install guide's helper waits, so nobody has to keep pressing Reload.
   const followUntil = Date.now() + OPERATION_FOLLOW.budgetMs;
   const following = signal(true);
+  // The last answer stays on screen while the next check is in flight, so the
+  // card does not blink back to its loading state every 1.5 s.
+  const latest = signal<ResourceOperation | null>(null);
   let followTimer: ReturnType<typeof setTimeout> | undefined;
-  // Stop once this page has gone: another route, another organization, or no
-  // document at all (a test that has finished).
+  // Each build of this page follows on its own token. A rebuild (a language
+  // switch, say) takes a new one, so the replaced page stops checking.
+  const followToken = ++followGeneration;
+  // Stop once this page has gone: rebuilt, another route, another
+  // organization, or no document at all (a test that has finished).
   const stillShown = (): boolean =>
+    followToken === followGeneration &&
     typeof document !== "undefined" &&
     currentOrganization()?.id === organizationId &&
     route().path === "/resources" &&
@@ -93,6 +122,7 @@ export function resourcesPage(organizationId: string): Child {
         try {
           const observed = await api.resourceOperation(organizationId, operationId);
           if (intentId) settleResourceIntent(intentId, observed);
+          latest.set(observed);
           if (operationSettled(observed)) {
             following.set(false);
             reloadResources();
@@ -114,6 +144,52 @@ export function resourcesPage(organizationId: string): Child {
   const reload = (): void => {
     if (operation) operation.reload();
     else reloadResources();
+  };
+  const describeOperation = (current: ResourceOperation): Child => {
+    const raw = h("span", { class: "mono dim" }, ` (${current.status})`);
+    if (!operationSettled(current)) {
+      return h(
+        "div",
+        { class: "notice" },
+        following()
+          ? tr("処理中です。自動で確認しています。", "In progress. Checking automatically.")
+          : tr(
+              "まだ完了していません。「再読み込み」で確認してください。",
+              "Not complete yet. Use Reload to check again.",
+            ),
+        raw,
+      );
+    }
+    if (current.status === "failed") {
+      return h(
+        "div",
+        { class: "notice notice--bad" },
+        tr("失敗しました", "Failed"),
+        current.error
+          ? h(
+              "span",
+              null,
+              text(`${tr("：", ": ")}${current.error.message} `),
+              h("span", { class: "mono dim" }, `(${current.error.code})`),
+            )
+          : raw,
+        // Whether anything changed decides whether a retry is safe.
+        h("div", null, failedEffect(current.effect)),
+      );
+    }
+    if (current.action === "delete") {
+      return badge(tr("削除が完了しました", "Deletion complete"), "ok");
+    }
+    return h(
+      "div",
+      { class: "toolbar" },
+      badge(tr("完了しました", "Done"), "ok"),
+      h(
+        "a",
+        { ...linkProps(resourcePath(current.resourceUid)) },
+        tr("リソースを表示", "View resource"),
+      ),
+    );
   };
   const loadMore = async (cursor: string): Promise<void> => {
     if (loadingMore() || currentOrganization()?.id !== organizationId) return;
@@ -257,59 +333,13 @@ export function resourcesPage(organizationId: string): Child {
             "div",
             { class: "card__body", style: { display: "grid", gap: "12px" } },
             copyable(operationId),
-            live(() =>
-              whenReady(
-                operation.get(),
-                (current) => {
-                  const raw = h("span", { class: "mono dim" }, ` (${current.status})`);
-                  if (!operationSettled(current)) {
-                    return h(
-                      "div",
-                      { class: "notice" },
-                      following()
-                        ? tr(
-                            "処理中です。自動で確認しています。",
-                            "In progress. Checking automatically.",
-                          )
-                        : tr(
-                            "まだ完了していません。「再読み込み」で確認してください。",
-                            "Not complete yet. Use Reload to check again.",
-                          ),
-                      raw,
-                    );
-                  }
-                  if (current.status === "failed") {
-                    return h(
-                      "div",
-                      { class: "notice notice--bad" },
-                      tr("失敗しました", "Failed"),
-                      current.error
-                        ? h(
-                            "span",
-                            null,
-                            text(`: ${current.error.message} `),
-                            h("span", { class: "mono dim" }, `(${current.error.code})`),
-                          )
-                        : raw,
-                    );
-                  }
-                  if (current.action === "delete") {
-                    return badge(tr("削除が完了しました", "Deletion complete"), "ok");
-                  }
-                  return h(
-                    "div",
-                    { class: "toolbar" },
-                    badge(tr("完了しました", "Done"), "ok"),
-                    h(
-                      "a",
-                      { ...linkProps(resourcePath(current.resourceUid)) },
-                      tr("リソースを表示", "View resource"),
-                    ),
-                  );
-                },
-                { retry: reload },
-              ),
-            ),
+            live(() => {
+              const state = operation.get();
+              const shown = latest();
+              return state.state === "loading" && shown
+                ? describeOperation(shown)
+                : whenReady(state, describeOperation, { retry: reload });
+            }),
           ),
         )
       : null,
