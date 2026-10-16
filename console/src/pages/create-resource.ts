@@ -578,11 +578,20 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
       }
       write(JSON.stringify(next, null, 2));
     }
+    // A preset of this Form may leave out a place its starter names, such as
+    // a static-site version's code bundle; that place is not offered.
+    const slots = (starter?.references ?? []).filter(
+      (slot) =>
+        !preset || preset.form !== selected || valueAt(preset.spec, slot.path) !== undefined,
+    );
     picker =
-      starter && starter.references.length > 0
-        ? referencePicker(organizationId, starter.references, spec, (text) => {
-            // A chosen Resource is the Console's own writing, like the starter.
+      slots.length > 0
+        ? referencePicker(organizationId, slots, spec, (text) => {
+            // A chosen Resource is the Console's own writing, like the starter;
+            // a preset written so stays a preset.
+            const fromPreset = spec.value === presetText;
             write(text);
+            if (fromPreset) presetText = text;
             showDetails();
             picker?.sync();
             describeStarter();

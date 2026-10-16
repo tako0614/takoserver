@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import type { ResourceSummary } from "../console/src/api.ts";
+import { valueAt } from "../console/src/form-specs.ts";
 
 class TestNode {
   readonly children: TestNode[] = [];
@@ -829,7 +830,12 @@ async function detailPage(
       if (url.pathname.endsWith(`/resources/${uid}`)) return Response.json(shown());
       if (url.pathname.endsWith("/resources")) {
         const form = url.searchParams.get("form");
-        const items = form === deploymentForm ? deployments : form === null ? listed : [];
+        const items =
+          form === deploymentForm
+            ? deployments
+            : form === null
+              ? listed
+              : listed.filter((item) => item.form === form);
         return Response.json({ items, nextCursor: null });
       }
       return Response.json({ error: { code: "not_found" } }, { status: 404 });
@@ -1145,6 +1151,42 @@ test("a version's page starts the next version from it, with its code left to ch
   expect(writes).toHaveLength(0);
 });
 
+test("choosing the next version's code keeps it described as the copy it is", async () => {
+  const withCode: ResourceSummary = {
+    ...helloV2,
+    spec: {
+      worker: { resourceUid: "uid-worker" },
+      bundle: { resourceUid: "uid-bundle" },
+      handlers: ["fetch"],
+    },
+  };
+  const bundleV2 = resourceAt(
+    "uid-bundle-v2",
+    "hello-bundle-v2",
+    "https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/",
+    {
+      artifact: { url: "https://artifacts.example.test/v2/manifest.json", sha256: "a".repeat(64) },
+    },
+  );
+  const { body } = await detailPage(() => withCode, [], [bundleV2]);
+  button(body, "New version from this one").click();
+  await settle();
+  const choice = body
+    .all()
+    .find(
+      (node) =>
+        node.tag === "select" && node.all().some((option) => option.value === "uid-bundle-v2"),
+    );
+  if (!choice) throw new Error("no code bundle choice");
+  choice.value = "uid-bundle-v2";
+  choice.emit("change");
+  await settle();
+  const spec = body.all().find((node) => node.tag === "textarea");
+  expect(valueAt(JSON.parse(spec?.value ?? "{}"), ["bundle", "resourceUid"])).toBe("uid-bundle-v2");
+  expect(body.textContent).not.toContain("The smallest spec");
+  expect(body.textContent).not.toContain("Fill in the empty values.");
+});
+
 test("a version keeps its assets in the next one, and only its code bundle is chosen again", async () => {
   const assets = {
     bundle: { resourceUid: "uid-assets" },
@@ -1179,6 +1221,8 @@ test("a version keeps its assets in the next one, and only its code bundle is ch
   expect(site.body.textContent).toContain(
     "Write the new StaticAssetBundle's UID in assets.bundle, name it, then accept",
   );
+  // Its spec has no code bundle, so none is offered to choose.
+  expect(site.body.textContent).not.toContain("bundle — WorkerBundle");
 });
 
 test("a version that needs secret values is not copied in the console", async () => {
