@@ -58,7 +58,7 @@ describe("Takoserver public site", () => {
       '<a href="https://takoform.com" data-i18n="takoform">About Takoform</a>',
     );
     expect(html).toContain(
-      "Artifacts need only Bun and a line in the Host's settings. Everything else needs the Worker runtime of step 2 below, and publishing at a hostname also needs step 3.",
+      "Artifacts need only Bun and a short block in the Host's settings. Everything else needs the Worker runtime of step 2 below, and publishing at a hostname also needs step 3.",
     );
     // The marketing page names what an operator does, not the Host's internal profile.
     expect(html).not.toMatch(

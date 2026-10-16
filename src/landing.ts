@@ -46,7 +46,7 @@ const landingMessages = {
     formsBody:
       "Takoform describes each kind of resource, such as a Worker, a database or a queue, as a Form: a definition its publisher serves at a versioned URL, so the resource means the same on every Host that supports it. Takoserver runs these Forms.",
     formsNeeds:
-      "Artifacts need only Bun and a line in the Host's settings. Everything else needs the Worker runtime of step 2 below, and publishing at a hostname also needs step 3. A running Host answers, for each Form URL, whether it serves that Form.",
+      "Artifacts need only Bun and a short block in the Host's settings. Everything else needs the Worker runtime of step 2 below, and publishing at a hostname also needs step 3. A running Host answers, for each Form URL, whether it serves that Form.",
     takoform: "About Takoform",
     artifactsTitle: "Artifacts",
     artifactsBody: "Worker code, static files and SQL migrations, pinned by URL and SHA-256.",
@@ -116,7 +116,7 @@ const landingMessages = {
     formsBody:
       "Takoformでは、Worker・データベース・キューといったリソースの種類ごとの定義をFormと呼び、公開元がバージョン付きのURLで公開します。対応するHostであれば、どこでも同じ意味のリソースになります。Takoserverは次のFormを動かせます。",
     formsNeeds:
-      "成果物は、Bunと設定への1行の追加だけで使えます。それ以外には下の手順2のWorker実行環境が必要で、ホスト名で公開するには手順3も必要です。動いているHostには、Form URLごとに対応しているかを問い合わせられます。",
+      "成果物は、Bunと設定への短い記述の追加だけで使えます。それ以外には下の手順2のWorker実行環境が必要で、ホスト名で公開するには手順3も必要です。動いているHostには、Form URLごとに対応しているかを問い合わせられます。",
     takoform: "Takoformについて",
     artifactsTitle: "成果物",
     artifactsBody:
@@ -352,7 +352,7 @@ footer { display: flex; align-items: center; justify-content: space-between; fle
 
 @media (min-width: 761px) and (max-width: 1100px) { .preview .frame { max-width: 848px; margin-inline: auto; } }
 /* Below desktop width the code beside each list would scroll sideways, so the columns stack. */
-@media (max-width: 1100px) { .deploy, .host { grid-template-columns: minmax(0, 1fr); gap: 24px; } }
+@media (max-width: 1200px) { .deploy, .host { grid-template-columns: minmax(0, 1fr); gap: 24px; } }
 @media (max-width: 760px) {
   .shell { width: calc(100% - 32px); }
   .top { height: 72px; }
