@@ -19,11 +19,12 @@ import { createResource } from "./create-resource.ts";
  * Everything the organization has declared.
  *
  * The columns answer the questions a person actually arrives with: is it
- * working, what is it, where does it live, and when did it last move. The
- * exact Form URL is shown rather than a guessed catalog kind.
+ * working, what is it, where does it live, and when did it last move. A
+ * `?q=` in the address starts the filter, so the overview can link to one
+ * Form's Resources.
  */
 export function resourcesPage(organizationId: string): Child {
-  const filter = signal("");
+  const filter = signal(route().query.get("q") ?? "");
   const additional = signal<readonly ResourceSummary[]>([]);
   const continuation = signal<{ readonly cursor?: string } | null>(null);
   const loadingMore = signal(false);
