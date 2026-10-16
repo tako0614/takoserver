@@ -441,15 +441,22 @@ export function createApi(options: ApiOptions) {
         throw new ApiError("invalid_response", status, path);
       return seconds;
     },
-    /** Whether this Host serves `/v1/ai`, from its own discovery document. */
+    /**
+     * Whether this Host serves `/v1/ai`, from its own discovery document. An
+     * unreadable document answers false rather than guessing.
+     */
     async aiAvailable(): Promise<boolean> {
-      const { payload, status } = await request<unknown>("GET", "/.well-known/takoserver");
-      return (
-        status === 200 &&
-        isRecord(payload) &&
-        isRecord(payload.endpoints) &&
-        typeof payload.endpoints.ai === "string"
-      );
+      try {
+        const { payload, status } = await request<unknown>("GET", "/.well-known/takoserver");
+        return (
+          status === 200 &&
+          isRecord(payload) &&
+          isRecord(payload.endpoints) &&
+          typeof payload.endpoints.ai === "string"
+        );
+      } catch {
+        return false;
+      }
     },
     identityProviders: () =>
       call<{ providers: readonly IdentityProvider[] }>("GET", "/v1/identity/providers"),

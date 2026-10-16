@@ -1,6 +1,7 @@
 import type { ApiKey } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
 import { tr } from "../i18n.ts";
+import { DEFAULT_KEY_SCOPES, keyScopeGroups } from "../key-scopes.ts";
 import { resource } from "../reactive.ts";
 import { api } from "../state.ts";
 import {
@@ -17,97 +18,6 @@ import {
   whenReady,
 } from "../ui.ts";
 
-interface ScopeOption {
-  readonly id: string;
-  readonly blurb: () => string;
-}
-
-interface ScopeGroup {
-  readonly label: () => string;
-  readonly scopes: readonly ScopeOption[];
-}
-
-/**
- * What a key may be given, most common first, each saying what it opens.
- * `ai:invoke` is offered only where this Host serves `/v1/ai`.
- */
-export function keyScopeGroups(aiAvailable: boolean): readonly ScopeGroup[] {
-  return [
-    {
-      label: () => tr("リソース", "Resources"),
-      scopes: [
-        {
-          id: "resources:write",
-          blurb: () =>
-            tr(
-              "Host API v2でリソースを作成・変更・削除します。読み取りも含みます。",
-              "Create, change and delete Resources over Host API v2. Includes reading them.",
-            ),
-        },
-        {
-          id: "resources:read",
-          blurb: () =>
-            tr("リソースとその操作を読み取ります。", "Read Resources and their Operations."),
-        },
-      ],
-    },
-    ...(aiAvailable
-      ? [
-          {
-            label: () => "AI",
-            scopes: [
-              {
-                id: "ai:invoke",
-                blurb: () =>
-                  tr(
-                    "/v1/aiでチャット補完を呼び出します。料金のあるモデルはウォレットから支払います。",
-                    "Call chat completions at /v1/ai. Priced models are paid from the wallet.",
-                  ),
-              },
-            ],
-          },
-        ]
-      : []),
-    {
-      label: () => tr("ウォレットと使用量", "Wallet and usage"),
-      scopes: [
-        {
-          id: "wallet:read",
-          blurb: () => tr("残高と取引履歴を読み取ります。", "Read the balance and the ledger."),
-        },
-        {
-          id: "usage:read",
-          blurb: () => tr("使用量明細を読み取ります。", "Read usage statements."),
-        },
-      ],
-    },
-    {
-      label: () => tr("再販（/v1）", "Resale (/v1)"),
-      scopes: [
-        {
-          id: "catalog:read",
-          blurb: () =>
-            tr(
-              "/v1/catalogの商品と料金を読み取ります。",
-              "Read the Offerings and prices at /v1/catalog.",
-            ),
-        },
-        {
-          id: "reseller:write",
-          blurb: () =>
-            tr(
-              "テナントに代わって見積・予約・確定します。",
-              "Quote, reserve and capture on behalf of tenants.",
-            ),
-        },
-      ],
-    },
-  ];
-}
-
-/** A writer can read what it writes, so one scope covers the common case. */
-export const DEFAULT_KEY_SCOPES: readonly string[] = ["resources:write"];
-
 const LIFETIMES: readonly { readonly label: () => string; readonly seconds: number }[] = [
   { label: () => tr("30日", "30 days"), seconds: 30 * 86_400 },
   { label: () => tr("90日", "90 days"), seconds: 90 * 86_400 },
@@ -123,6 +33,13 @@ const LIFETIMES: readonly { readonly label: () => string; readonly seconds: numb
  */
 export function keysPage(organizationId: string): Child {
   const keys = resource(() => api.apiKeys(organizationId));
+  // Asked once per page, so the dialog opens at once; until the answer comes
+  // back, or if it never does, ai:invoke is simply not offered.
+  const ai = resource(() => api.aiAvailable());
+  const aiAvailable = (): boolean => {
+    const state = ai.get();
+    return state.state === "ready" && state.value;
+  };
 
   return h(
     "div",
@@ -148,7 +65,7 @@ export function keysPage(organizationId: string): Child {
         {
           class: "btn btn--primary",
           type: "button",
-          onClick: () => void createKey(organizationId, keys.reload),
+          onClick: () => createKey(organizationId, keys.reload, aiAvailable()),
         },
         icon(ICON.plus, 14),
         text(tr("キーを作成", "Create key")),
@@ -274,10 +191,7 @@ function revoke(organizationId: string, key: ApiKey, reload: () => void): void {
   });
 }
 
-async function createKey(organizationId: string, reload: () => void): Promise<void> {
-  // Offer ai:invoke only where it opens something; an unreadable discovery
-  // document leaves it out rather than guessing.
-  const aiAvailable = await api.aiAvailable().catch(() => false);
+function createKey(organizationId: string, reload: () => void, aiAvailable: boolean): void {
   const name = h("input", {
     class: "input",
     id: "create-key-name",
