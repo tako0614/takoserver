@@ -82,22 +82,36 @@ separate; source and local native evidence do not establish a deployed rollout.
 
 ## How it works
 
-A Takoform Form is a versioned HTTPS URL, such as
+A Takoform Form is identified by a versioned HTTPS URL, such as
 `https://edge.forms.takoform.com/forms/SQLiteDatabase/0.2.0/`, that fixes what
 a Resource's spec, observed state and output mean without naming a provider.
 Takoserver is a Host: it implements the Forms its configuration composes and
-runs them on this machine.
+serves them from this machine.
 
-- **Declare** a Resource with its exact Form URL, a name and a spec. Host API v2
-  accepts each create, update or delete as an Operation and applies it in the
-  background; poll `/apis/forms.takoform.com/v2/operations/{id}` until it is
-  terminal. A Form this Host does not compose is refused, never approximated,
-  so check it first as in [What you can deploy](#what-you-can-deploy).
+- **Declare** a Resource with its exact Form URL, a name, the Space and a spec.
+  Host API v2 accepts each create, update or delete as an Operation and applies
+  it in the background; poll `/apis/forms.takoform.com/v2/operations/{id}` until
+  it is `succeeded` or `failed`. Every create, update and delete carries an
+  `Idempotency-Key` of 16 to 128 characters, and an update or delete also names
+  the generation it read in `takoform-expected-generation`. A Form this Host
+  does not compose is refused, never approximated, so check it first as in
+  [What you can deploy](#what-you-can-deploy).
+  [Step 8 of the install path](docs/self-host-operations.md#8-create-and-serve-a-worker)
+  has the exact requests.
 - **Own** Resources through an organization. Its ID is the v2 Space, and its API
   keys and its owner's session act as one principal, so replacing a key does
   not strand a Resource. A `resources:read` key reads; a `resources:write` key
   reads and changes. A key cannot choose another organization; a signed-in
-  owner names one with the `takoform-organization` header.
+  owner names one with the `takoform-organization` header on every request.
+- **Ship code** as a WorkerBundle, which names an exact HTTPS URL and SHA-256
+  rather than accepting an upload (see [Held artifacts](#held-artifacts-and-workers)).
+  A WorkerVersion names the ModuleWorker, one WorkerBundle and its Bindings,
+  and cannot be changed afterwards.
+- **Serve** it with a WorkerDeployment, which splits the Worker's traffic across
+  up to eight WorkerVersions by weights that add up to 10000, and a
+  WorkerEndpoint, which publishes the Worker at an HTTPS hostname on the Host's
+  TCP 443 listener. To ship new code, create a new WorkerVersion and point the
+  Deployment at it.
 - **Bind** Resources into a Worker by UID. A WorkerVersion lists them in
   `sqliteBindings`, `kvBindings`, `bucketBindings`, `queueProducerBindings`,
   `serviceBindings`, `actorBindings` and `workflowBindings`, each entry
@@ -105,17 +119,15 @@ runs them on this machine.
   such as `env.DB`. The Host serves the SQLite, KV, bucket and queue Bindings
   from private loopback services, not from its public listener. A Resource that
   another still names cannot be deleted, so delete in reference order.
-- **Serve** a Worker with a WorkerDeployment, which weights the WorkerVersions
-  that receive its traffic, and a WorkerEndpoint, which publishes it at an
-  HTTPS hostname on the Host's TCP 443 listener.
 - **Infer** through `/v1/ai` when the operator configures an OpenAI-compatible
   upstream ([Settings](#settings)). An API key with `ai:invoke` sees only the
-  configured public model IDs. Every chat completion needs an `Idempotency-Key`;
-  a settled result is replayed from durable state without calling the upstream
-  again. A priced model is paid from the organization's prepaid wallet: the Host
-  holds the most the request can cost, captures the reported use and releases
-  the rest. The wallet has no balance column; its figures are computed from
-  entries that are only ever appended. See
+  configured public model IDs. Every chat completion needs an `Idempotency-Key`,
+  and streaming is refused. A settled result is replayed from durable state
+  without calling the upstream or charging again. A model priced at zero never
+  touches the wallet. For a priced model, the Host holds the most the request
+  can cost from the organization's prepaid wallet, refuses with `402`
+  `insufficient_quota` when the wallet cannot cover it, captures the reported
+  use and releases the rest; a failed upstream call charges nothing. See
   [qualifying one public AI inference](docs/ai-live-qualification.md) for the
   explicit opt-in completion/replay check and its limits.
 
@@ -230,9 +242,10 @@ on an ephemeral port by default and prints one sanitized ready JSON line
 without the token. `TAKOSERVER_STABLE_LOCAL_SPACE` and
 `TAKOSERVER_STABLE_LOCAL_PORT` may override the local Space and port.
 
-The reseller run bearer, Attachments and Migrations below act only on records
-of the pre-v2 Host API, whose handler is not mounted; Host API v2 has none of
-them.
+The reseller run bearer, Attachments and Migrations below act only on pre-v2
+inventory records. Their `/v1` routes are still served, but the run bearer
+authenticates only to the pre-v2 Host API, whose handler is not mounted, so a
+minted bearer opens nothing. Host API v2 has none of them.
 
 - **Run** the ordinary Takoform provider without handing a hosted runner the
   reseller's organization API key. A reseller reservation can mint a
