@@ -79,13 +79,13 @@ export function firstRunNote(organizationId: string): Child {
         null,
         tr(
           "このHostはWorkerを実行しますが、HTTPSのホスト名で公開するWorkerEndpointにはまだ対応していません。公開には",
-          "This Host runs Workers but does not yet publish them at an HTTPS hostname: WorkerEndpoint needs the HTTPS listener of ",
+          "This Host runs Workers but does not yet publish them at an HTTPS hostname: WorkerEndpoint needs the HTTPS listener from ",
         ),
         guideLink(
           "4-https-and-tcp-443",
           tr("導入手順書（英語）の手順4", "step 4 of the install guide"),
         ),
-        tr("のHTTPS listenerが必要です。", ". "),
+        tr("にあるHTTPS（TCP 443）の待ち受け設定が必要です。", ". "),
         dialog(),
       );
     return h(
