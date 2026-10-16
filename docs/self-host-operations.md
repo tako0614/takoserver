@@ -959,9 +959,9 @@ wait_operation "$(printf '%s' "$recorded" | jq -r .id)" hello-record
 ```
 
 `GET /resources/$WORKER` then reports `observed.ready: true`, with the
-Deployment's UID as `observed.activeDeploymentUid`. In the console, open `hello` and choose **Record the
-Deployment**; the page offers it only where the update can finish, and
-otherwise says what to do first.
+Deployment's UID as `observed.activeDeploymentUid`. In the console, open
+`hello` and choose **Record the Deployment**; the page offers it only where
+the update can finish, and otherwise says what to do first.
 
 To ship new code, seed the new bytes under a new base URL as in step 6: stop
 the Host, put the new files in `$WORK/hello/v2`, seed them, and start it again:
