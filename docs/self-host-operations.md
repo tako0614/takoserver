@@ -99,11 +99,16 @@ A self-host runs one of two profiles, selected by configuration:
     Host never falls back to the npm `workerd`.
   - The Workflow execution guard, built from the same checkout with the Go
     toolchain named on the `toolchain` line of
-    `services/workflow-execution-guard/go.mod` (currently go1.26.9, from
-    <https://go.dev/dl/>). Set `TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY` to
-    its absolute path. As root:
+    `services/workflow-execution-guard/go.mod` (currently go1.26.9). Set
+    `TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY` to its absolute path. As root,
+    install that toolchain from <https://go.dev/dl/>, comparing the printed
+    SHA-256 with the one listed there for the file, and build:
 
     ```sh
+    curl -fsSLO https://go.dev/dl/go1.26.9.linux-amd64.tar.gz
+    sha256sum go1.26.9.linux-amd64.tar.gz
+    rm -rf /usr/local/go && tar -C /usr/local -xzf go1.26.9.linux-amd64.tar.gz
+    export PATH=/usr/local/go/bin:$PATH
     cd /opt/takoserver/services/workflow-execution-guard
     go build -o /usr/local/libexec/takoserver/workflow-execution-guard ./cmd/workflow-execution-guard
     ```
@@ -397,6 +402,12 @@ api.example.com:8443 {
 }
 ```
 
+Install Caddy as root with `apt-get install caddy` (Ubuntu's universe
+repository, or Caddy's own package repository for a newer release), put the
+block in `/etc/caddy/Caddyfile` and run `systemctl reload caddy`. Caddy then
+obtains the certificate for `api.example.com` itself, which needs TCP 80 (see
+the table below).
+
 **Worker Endpoints.** `TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS=1` makes the Host
 itself listen on TCP 443 on every IPv4 address (`0.0.0.0:443`) and terminate
 TLS with `TAKOSERVER_WORKERD_TLS_CERT_FILE` and
@@ -615,6 +626,8 @@ console.example.com:8444 {
   file_server
 }
 ```
+
+Add the block to `/etc/caddy/Caddyfile` and run `systemctl reload caddy`.
 
 Then, from the administrator shell, add `TAKOSERVER_CONSOLE_ORIGIN` with that
 exact origin to the environment file, written as the browser sends it: scheme,
