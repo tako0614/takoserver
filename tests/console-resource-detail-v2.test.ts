@@ -124,7 +124,11 @@ test("resource detail uses direct UID GET and shows declared versus observed gen
   );
   body.append(resourceDetailPage("org-one", "uid-one") as unknown as NodeStub);
   await settle();
-  expect(paths).toEqual(["/apis/forms.takoform.com/v2/resources/uid-one"]);
+  // The Resource itself by UID, and the list once to find what names it.
+  expect(paths).toEqual([
+    "/apis/forms.takoform.com/v2/resources/uid-one",
+    "/apis/forms.takoform.com/v2/resources",
+  ]);
   expect(body.textContent).toContain("widget");
   expect(body.textContent).toContain("new");
   expect(body.textContent).toContain("old");
@@ -442,11 +446,12 @@ test("resource detail links the Resources a spec names and its published URL", a
   body.append(resourceDetailPage("org-one", "uid-version") as unknown as NodeStub);
   await settle();
   expect(new Set(paths)).toEqual(
-    new Set(
-      ["uid-version", "uid-worker", "uid-bundle", "uid-gone", "uid-broken"].map(
+    new Set([
+      ...["uid-version", "uid-worker", "uid-bundle", "uid-gone", "uid-broken"].map(
         (uid) => `/apis/forms.takoform.com/v2/resources/${uid}`,
       ),
-    ),
+      "/apis/forms.takoform.com/v2/resources",
+    ]),
   );
   const text = body.textContent;
   expect(text).toContain("Referenced resources");
@@ -462,4 +467,82 @@ test("resource detail links the Resources a spec names and its published URL", a
   expect(published?.attributes.get("href")).toBe("https://hello.apps.example.com/");
   expect(published?.attributes.get("target")).toBe("_blank");
   expect(published?.attributes.get("rel")).toBe("noopener noreferrer");
+});
+
+test("a Worker's page lists what names it, with the address an Endpoint publishes", async () => {
+  const body = installDom();
+  const { consoleLocale } = await import("../console/src/i18n.ts");
+  const { organizations, selectOrganization, setApiOrigin } = await import(
+    "../console/src/state.ts"
+  );
+  const { route } = await import("../console/src/router.ts");
+  const { resourceDetailPage } = await import("../console/src/pages/resource-detail.ts");
+  consoleLocale.set("en");
+  setApiOrigin("https://api.example.test");
+  organizations.set([
+    { id: "org-one", name: "One", ownerPrincipalId: "owner", createdAt: "2026-10-07" },
+  ]);
+  selectOrganization("org-one");
+  route.set({
+    path: "/resources/uid-worker",
+    segments: ["resources", "uid-worker"],
+    query: new URLSearchParams(),
+  });
+  const forms = "https://edge.forms.takoform.com/forms";
+  const summary = (uid: string, name: string, form: string, spec: unknown, output = {}) => ({
+    uid,
+    form: `${forms}/${form}/`,
+    space: "org-one",
+    name,
+    generation: 1,
+    observedGeneration: 1,
+    observedAt: "2026-10-07T00:00:00Z",
+    phase: "idle",
+    spec,
+    observed: {},
+    output,
+    lastOperation: `op-${uid}`,
+  });
+  const worker = summary("uid-worker", "hello", "ModuleWorker/0.3.0", {});
+  const endpoint = summary(
+    "uid-endpoint",
+    "hello-endpoint",
+    "WorkerEndpoint/0.3.0",
+    { worker: { resourceUid: "uid-worker" } },
+    { hostname: "hello.apps.example.com", url: "https://hello.apps.example.com/" },
+  );
+  const version = summary("uid-version", "hello-version-v1", "WorkerVersion/0.5.0", {
+    worker: { resourceUid: "uid-worker" },
+    bundle: { resourceUid: "uid-bundle" },
+  });
+  const unrelated = summary("uid-notes", "notes", "SQLiteDatabase/0.2.0", {});
+  const cursors: (string | null)[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/resources/uid-worker")) return Response.json(worker);
+      cursors.push(url.searchParams.get("cursor"));
+      // Two pages: the list is followed by its cursor.
+      return url.searchParams.get("cursor") === null
+        ? Response.json({ items: [worker, version], nextCursor: "page-2" })
+        : Response.json({ items: [unrelated, endpoint], nextCursor: null });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  body.append(resourceDetailPage("org-one", "uid-worker") as unknown as NodeStub);
+  await settle();
+  expect(cursors).toEqual([null, "page-2"]);
+  const text = body.textContent;
+  expect(text).toContain("Referenced by");
+  expect(text).not.toContain("first 500 checked");
+  expect(text).toContain("hello-version-v1");
+  expect(text).toContain("hello-endpoint");
+  expect(text).toContain("as worker");
+  expect(text).not.toContain("notes");
+  const links = body.all().filter((node) => node.tag === "a");
+  expect(links.find((node) => node.textContent === "hello-endpoint")?.attributes.get("href")).toBe(
+    "/resources/uid-endpoint",
+  );
+  const published = links.find((node) => node.textContent.startsWith("https://hello.apps"));
+  expect(published?.attributes.get("target")).toBe("_blank");
 });
