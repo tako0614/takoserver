@@ -229,13 +229,23 @@ describe("Takoserver public site", () => {
     const withConsole = landingHtml({
       consoleOrigin: "https://console.host.example",
       apiOrigin: null,
+      hostOrigin: "https://api.host.example",
     });
     const here = withConsole.indexOf('<section class="here"');
     expect(here).toBeGreaterThan(withConsole.indexOf('<h1 id="headline">'));
     expect(here).toBeLessThan(withConsole.indexOf('data-i18n="lead"'));
     expect(withConsole).toContain("This is a Takoserver Host");
     expect(withConsole).toContain(
-      "<code><span data-origin>$HOST</span>/apis/forms.takoform.com/v2</code>",
+      "People with an organization on this Host manage its Workers and data in the console",
+    );
+    // Host API v2 answers only at the public origin, so that is the one named,
+    // whatever origin the page was read from.
+    expect(withConsole).toContain(
+      "<code>https://api.host.example/apis/forms.takoform.com/v2</code>",
+    );
+    expect(withConsole).toContain('href="https://api.host.example/.well-known/takoform/v2"');
+    expect(withConsole).toContain(
+      "PUT https://api.host.example/apis/forms.takoform.com/v2/resources/",
     );
     expect(withConsole).toContain(
       'class="pill primary external" href="https://console.host.example" data-i18n="consoleHost"',

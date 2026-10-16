@@ -17,6 +17,11 @@ export interface LandingOptions {
   readonly apiOrigin: string | null;
   /** Static locale for the page body; the API root defaults to English. */
   readonly locale?: "en" | "ja";
+  /**
+   * The Host's public origin, when a Host serves the page. Host API v2 answers
+   * only there, so the page names it rather than the origin it was read from.
+   */
+  readonly hostOrigin?: string;
 }
 
 const REPOSITORY = "https://github.com/tako0614/takoserver";
@@ -98,7 +103,7 @@ const landingMessages = {
     consoleHost: "Open this Host's console",
     hereTitle: "This is a Takoserver Host",
     hereBody:
-      "You reached the API of a self-hosted Takoserver. Its operator manages the Workers and data it runs in its console, or with Host API v2 at this address:",
+      "People with an organization on this Host manage its Workers and data in the console, or over Host API v2 at this address:",
     hereNoConsole: "This Host serves no console yet.",
     shipTitle: "Ship a new version",
     shipBody:
@@ -177,7 +182,7 @@ const landingMessages = {
     consoleHost: "このHostのコンソールを開く",
     hereTitle: "ここはTakoserverのHostです",
     hereBody:
-      "セルフホストされたTakoserverのAPIです。運用者は、ここで動くWorkerとデータを、コンソールか次のアドレスのHost API v2で管理します。",
+      "このHostに組織を持つ人は、そのWorkerとデータを、コンソールか次のアドレスのHost API v2で管理します。",
     hereNoConsole: "このHostにはまだコンソールがありません。",
     shipTitle: "新しい版を出す",
     shipBody:
@@ -411,7 +416,10 @@ footer { display: flex; align-items: center; justify-content: space-between; fle
 export function landingHtml(options: LandingOptions): string {
   const locale = options.locale ?? "en";
   const copy = landingMessages[locale];
-  const base = options.apiOrigin ?? "";
+  const base = options.apiOrigin ?? options.hostOrigin ?? "";
+  // A Host names its own public origin; without one, the page fills in the
+  // origin it was read from.
+  const hostAddress = options.hostOrigin ?? "<span data-origin>$HOST</span>";
   // The public site ships its font and the Console screenshots as files; the
   // API answering its own root stays a single self-contained response.
   const siteAssets = options.apiOrigin !== null;
@@ -421,7 +429,7 @@ export function landingHtml(options: LandingOptions): string {
   // page fills in the origin it was read from.
   const shipTarget = siteAssets
     ? "$V2/resources"
-    : `<span data-origin>$HOST</span>/apis/forms.takoform.com/v2/resources`;
+    : `${hostAddress}/apis/forms.takoform.com/v2/resources`;
   const text = (key: keyof typeof copy, tag = "span", attributes = "") =>
     `<${tag}${attributes} data-i18n="${key}">${copy[key]}</${tag}>`;
   const screen = (shape: "desktop" | "tablet" | "mobile", theme: "light" | "dark") =>
@@ -461,13 +469,13 @@ export function landingHtml(options: LandingOptions): string {
     : `<section class="here" aria-labelledby="here-title">
 ${text("hereTitle", "h2", ' id="here-title"')}
 ${text("hereBody", "p")}
-<p class="address"><code><span data-origin>$HOST</span>/apis/forms.takoform.com/v2</code></p>
+<p class="address"><code>${hostAddress}/apis/forms.takoform.com/v2</code></p>
 ${
   options.consoleOrigin
     ? `<div class="actions start"><a class="pill primary external" href="${options.consoleOrigin}" data-i18n="consoleHost">${copy.consoleHost}</a></div>`
     : `${text("hereNoConsole", "p")}<p class="more"><a href="${CONSOLE_SETUP}" data-i18n="consoleSetup">${copy.consoleSetup}</a></p>`
 }
-<p class="more"><a href="/.well-known/takoform/v2" data-i18n="discovery">${copy.discovery}</a><a href="/openapi.json" data-i18n="openapi">${copy.openapi}</a></p>
+<p class="more"><a href="${base}/.well-known/takoform/v2" data-i18n="discovery">${copy.discovery}</a><a href="${base}/openapi.json" data-i18n="openapi">${copy.openapi}</a></p>
 </section>`;
   const consoleAction =
     options.consoleOrigin && !siteAssets
