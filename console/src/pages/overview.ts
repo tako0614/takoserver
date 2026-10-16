@@ -1,4 +1,4 @@
-import { formatMicrosCurrency, type Organization } from "../api.ts";
+import { formatMicrosCurrency, type Organization, type Wallet } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
 import { consoleLocale, tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
@@ -9,8 +9,8 @@ import { ago, badge, card, copyable, empty, ICON, icon, stat, whenReady } from "
 import { createResource } from "./create-resource.ts";
 
 /**
- * The first screen, answering the two questions someone signs in with: is
- * anything broken, and can I still pay for it.
+ * The first screen, answering the question someone signs in with: is
+ * anything I deployed broken.
  *
  * Resource counts and Form groups describe only the first loaded v2 page;
  * the full cursor chain remains on the Resources screen.
@@ -43,7 +43,7 @@ export function overviewPage(organization: Organization): Child {
     live(() =>
       h(
         "div",
-        { class: "grid" },
+        { class: "grid grid--stats" },
         whenReady(
           resources.get(),
           ({ resources: all, cursor }) => {
@@ -79,9 +79,9 @@ export function overviewPage(organization: Organization): Child {
           wallet.get(),
           ({ wallet: held }) =>
             // v2 Resources are never charged, so a self-host whose wallet has
-            // never held money has nothing to show here; Usage & billing
-            // still has the wallet.
-            walletHasMoney(held)
+            // never been used has nothing to show here; Usage & billing still
+            // has the wallet. One that has been used keeps its cards at $0.
+            walletInUse(held)
               ? h(
                   "div",
                   { style: { display: "contents" } },
@@ -317,13 +317,12 @@ function uiLocale(): "en-US" | "ja-JP" {
   return consoleLocale() === "ja" ? "ja-JP" : "en-US";
 }
 
-/** Whether the wallet has ever held or settled money worth showing. */
-function walletHasMoney(wallet: {
-  readonly availableMicros: string;
-  readonly heldMicros: string;
-  readonly settledMicros: string;
-}): boolean {
-  return [wallet.availableMicros, wallet.heldMicros, wallet.settledMicros].some(
-    (micros) => BigInt(micros) !== 0n,
+/** Whether the wallet holds money now or has any history at all. */
+function walletInUse(wallet: Wallet): boolean {
+  return (
+    wallet.entries.length > 0 ||
+    [wallet.availableMicros, wallet.heldMicros, wallet.settledMicros].some(
+      (micros) => BigInt(micros) !== 0n,
+    )
   );
 }

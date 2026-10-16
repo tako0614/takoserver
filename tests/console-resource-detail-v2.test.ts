@@ -360,7 +360,7 @@ test("overview leads with resources and shows the wallet only once it holds mone
     ownerPrincipalId: "owner",
     createdAt: "2026-10-07",
   };
-  const render = async (micros: string) => {
+  const render = async (micros: string, entries: unknown[] = []) => {
     const body = installDom();
     consoleLocale.set("en");
     setApiOrigin("https://api.example.test");
@@ -379,7 +379,7 @@ test("overview leads with resources and shows the wallet only once it holds mone
               currency: "USD",
               unit: "USD-micros",
               moneyPolicy: "usd-micros-v2",
-              entries: [],
+              entries,
             },
           });
         if (path.endsWith("/operations")) return Response.json({ operations: [] });
@@ -400,4 +400,17 @@ test("overview leads with resources and shows the wallet only once it holds mone
   expect(funded).toContain("Available");
   expect(funded).toContain("Settled");
   expect(funded.indexOf("Resources")).toBeLessThan(funded.indexOf("Available"));
+  // A wallet that has been used keeps its cards when it is back at $0.
+  const spent = await render("0", [
+    {
+      id: "entry-one",
+      organizationId: "org-one",
+      type: "funding",
+      reference: "fund-one",
+      settledDeltaMicros: "5000000",
+      heldDeltaMicros: "0",
+      createdAt: "2026-10-07T00:00:00Z",
+    },
+  ]);
+  expect(spent).toContain("Available");
 });
