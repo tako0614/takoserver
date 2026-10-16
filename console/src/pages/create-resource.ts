@@ -60,7 +60,7 @@ function recoveryDetails(
       "small",
       null,
       tr(
-        "送信前に正確なキーと本文を確認・コピーできます。ページ再読み込み後はConsoleから再送できません。結果が不明なら読み取りで確認してください。",
+        "送信前に正確なキーと本文を確認・コピーできます。ページ再読み込み後はコンソールから再送できません。結果が不明なら読み取りで確認してください。",
         "Review or copy the exact key and body before sending. After a full reload the Console cannot replay; reconcile by reading if acceptance is unknown.",
       ),
     ),
