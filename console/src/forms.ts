@@ -52,3 +52,18 @@ export function formLabel(form: string): string {
   const match = /\/forms\/([^/]+)\/([^/]+)\/$/u.exec(form);
   return match ? `${match[1]} ${match[2]}` : form;
 }
+
+/**
+ * A Form as people read it in a list: "WorkerBundle 0.2.0". Everything before
+ * `/forms/` is kept verbatim unless it is exactly the edge Forms host, so two
+ * different Form URLs (another host, a path prefix, a different spelling)
+ * never read the same. The exact URL stays the title and the detail.
+ */
+export function formName(form: string): string {
+  const match = /^https:\/\/(.+)\/forms\/([^/]+)\/([^/]+)\/$/u.exec(form);
+  if (!match) return form;
+  const [, where, kind, version] = match;
+  return where === "edge.forms.takoform.com"
+    ? `${kind} ${version}`
+    : `${where} · ${kind} ${version}`;
+}
