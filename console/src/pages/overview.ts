@@ -357,13 +357,15 @@ function nextStep(
         ? dim(tr("公開先を準備中です", "Its address is being prepared"))
         : phase === "Deleting"
           ? row(dim(tr("公開先を削除中です：", "Its Endpoint is being deleted: ")), link)
-          : row(dim(tr("公開に失敗しました：", "Publishing failed: ")), link);
+          : phase === "NotReady"
+            ? row(dim(tr("公開先の準備ができていません：", "Its address is not ready: ")), link)
+            : row(dim(tr("公開に失敗しました：", "Publishing failed: ")), link);
     }
     // The Host publishes only a settled, ready Deployment whose versions serve HTTP.
     const phase = health(deployment).phase;
     if (phase === "Pending")
       return dim(tr("配信の完了を待っています", "Waiting for the deployment to finish"));
-    if (phase !== "Ready") return null;
+    if (phase !== "Ready" || valueAt(deployment.observed, ["active"]) !== true) return null;
     if (!servesHttp(all, deployment)) return null;
     return row(
       dim(tr("公開先はまだありません", "Not published yet")),
