@@ -2,11 +2,13 @@ import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import type { CapturedAuthTokenRow } from "../src/auth.ts";
 import { additiveAuthDDL } from "../src/auth-authority-schema-plan.ts";
 import {
   type CredentialAuthorityOrigin,
   createCredentialAuthorityClassStore,
   directCredentialCurrentness,
+  directOwnerKeySourceCurrentness,
   type RpAuthorityIdentity,
   sharedBrokerCredentialCurrentness,
   sharedRpCredentialCurrentness,
@@ -770,6 +772,426 @@ function directOrigin(anchor: PrincipalAnchor, id: string): CredentialAuthorityO
     id,
   );
 }
+
+// A structural prerequisite only: this is not a private Accounts capture or
+// enrolled Auth103 target, and cannot be used as an issuer permission.
+async function syntheticDirectSource(f: ReturnType<typeof fixture>) {
+  const anchor = await syntheticLocal(f);
+  if (anchor.originKind !== "fresh-local") throw new Error("Not synthetic local");
+  const session = { ...tokenIdentity("source_session"), id: "ses_source", scopesJson: "[]" };
+  const selected = directOrigin(anchor, "source_session");
+  await f.sql.batch([
+    tokenInsert({ principalId: anchor.principalId }, session, "org_original", "session"),
+    f.classes.localSessionIssuanceStatement(selected, session, anchor, anchor.verificationDomain),
+  ]);
+  await f.sql.batch([
+    {
+      sql: "INSERT INTO orgs VALUES (?,'Synthetic Org',?,?)",
+      params: ["org_original", anchor.principalId, new Date().toISOString()],
+    },
+    {
+      sql: "INSERT INTO org_memberships VALUES (?,?,'owner',?)",
+      params: ["org_original", anchor.principalId, new Date().toISOString()],
+    },
+  ]);
+  const row = (
+    await f.sql.query(
+      "SELECT id,secret_digest,kind,principal_id,org_id,scopes_json,created_at,expires_at FROM auth_tokens WHERE id=?",
+      [session.id],
+    )
+  )[0];
+  if (!row) throw new Error("Missing synthetic source session");
+  const captured: CapturedAuthTokenRow = Object.freeze({
+    tokenId: String(row.id),
+    digest: String(row.secret_digest) as `sha256:${string}`,
+    kind: "session",
+    principalId: String(row.principal_id),
+    organizationId: null,
+    scopesJson: String(row.scopes_json),
+    scopes: Object.freeze([]),
+    createdAt: String(row.created_at),
+    expiresAt: String(row.expires_at),
+  });
+  const record = await f.classes.readActiveDirectOwnerSessionByToken({
+    id: captured.tokenId,
+    digest: captured.digest,
+  });
+  if (!record) throw new Error("Missing synthetic direct source class");
+  return { anchor, session, selected, captured, record };
+}
+
+function guardedSyntheticKeyInsert(
+  anchor: PrincipalAnchor,
+  key: TokenAuthorityIdentity,
+  guard: {
+    readonly sql: string;
+    readonly params: readonly (string | number | null | ArrayBuffer)[];
+  },
+  exclusive = false,
+): SqlStatement {
+  return {
+    sql: `INSERT INTO auth_tokens
+      (secret_digest,id,kind,principal_id,org_id,name,scopes_json,created_at,expires_at)
+      SELECT ?,?,'api_key',?,?,'synthetic-key',?,?,?
+      WHERE ${guard.sql}
+        ${
+          exclusive
+            ? "AND NOT EXISTS (SELECT 1 FROM auth_tokens WHERE org_id=? AND kind='api_key' AND name='synthetic-key' AND revoked_at IS NULL)"
+            : ""
+        }`,
+    params: [
+      key.digest,
+      key.id,
+      anchor.principalId,
+      "org_original",
+      key.scopesJson,
+      key.createdAt,
+      new Date(Date.now() + 3600000).toISOString(),
+      ...guard.params,
+      ...(exclusive ? ["org_original"] : []),
+    ],
+  };
+}
+
+test("Auth authority exact direct source lookup and fixed owner predicate are structural only", async () => {
+  const f = fixture();
+  const source = await syntheticDirectSource(f);
+  const { anchor, captured, record } = source;
+  expect(record.class).toBe("direct-owner-session");
+  expect(
+    await f.classes.readActiveDirectOwnerSessionByToken({
+      id: captured.tokenId,
+      digest: digest("f"),
+    }),
+  ).toBeNull();
+  expect(
+    await f.classes.readActiveDirectOwnerSessionByToken({
+      id: "ses_absent",
+      digest: captured.digest,
+    }),
+  ).toBeNull();
+  const guard = directOwnerKeySourceCurrentness(
+    record,
+    anchor,
+    anchor.verificationDomain,
+    captured,
+    "org_original",
+  );
+  expect(await predicateResult(f.sql, guard)).toBe(1);
+  expect(
+    await predicateResult(
+      f.sql,
+      directOwnerKeySourceCurrentness(
+        record,
+        anchor,
+        anchor.verificationDomain,
+        { ...captured, expiresAt: "2026-10-15T00:00:00.000Z" },
+        "org_original",
+      ),
+    ),
+  ).toBe(0);
+  for (const different of [
+    { ...captured, tokenId: "ses_other" },
+    { ...captured, digest: digest("f") },
+    { ...captured, scopesJson: '["payments:write"]' },
+    { ...captured, createdAt: "2026-10-15T00:00:00.000Z" },
+    { ...captured, principalId: "prn_other" },
+    { ...captured, organizationId: "org_original" },
+    { ...captured, kind: "api_key" as const },
+  ]) {
+    expect(() =>
+      directOwnerKeySourceCurrentness(
+        record,
+        anchor,
+        anchor.verificationDomain,
+        different,
+        "org_original",
+      ),
+    ).toThrow();
+  }
+  await f.sql.run("UPDATE org_memberships SET role='member' WHERE org_id=?", ["org_original"]);
+  expect(await predicateResult(f.sql, guard)).toBe(0);
+  await f.sql.run("UPDATE org_memberships SET role='owner' WHERE org_id=?", ["org_original"]);
+  await f.sql.run("UPDATE orgs SET owner_principal_id='prn_other' WHERE id=?", ["org_original"]);
+  expect(await predicateResult(f.sql, guard)).toBe(0);
+});
+
+test("Auth authority source lookup refuses null, duplicate and inconsistent retained rows", async () => {
+  const f = fixture();
+  const { captured } = await syntheticDirectSource(f);
+  await expect(
+    f.classes.readActiveDirectOwnerSessionByToken({
+      id: captured.tokenId,
+      digest: null as unknown as `sha256:${string}`,
+    }),
+  ).rejects.toMatchObject({ code: "invalid" });
+  const doubled: Sql = {
+    query: async (query, params) => {
+      const rows = await f.sql.query(query, params);
+      return query.includes("class='direct-owner-session' AND state='active'")
+        ? [...rows, ...rows]
+        : rows;
+    },
+    run: f.sql.run,
+    batch: f.sql.batch,
+  };
+  await expect(
+    createCredentialAuthorityClassStore({ sql: doubled }).readActiveDirectOwnerSessionByToken({
+      id: captured.tokenId,
+      digest: captured.digest,
+    }),
+  ).rejects.toMatchObject({ code: "unavailable" });
+  const inconsistent: Sql = {
+    query: async (query, params) => {
+      const rows = await f.sql.query(query, params);
+      return query.includes("class='direct-owner-session' AND state='active'")
+        ? rows.map((row) => ({ ...row, token_kind: "api_key" }))
+        : rows;
+    },
+    run: f.sql.run,
+    batch: f.sql.batch,
+  };
+  await expect(
+    createCredentialAuthorityClassStore({ sql: inconsistent }).readActiveDirectOwnerSessionByToken({
+      id: captured.tokenId,
+      digest: captured.digest,
+    }),
+  ).rejects.toMatchObject({ code: "unavailable" });
+});
+
+test("Auth authority synthetic source guard and mandatory class accept a current owner", async () => {
+  const f = fixture();
+  const { anchor, captured, record } = await syntheticDirectSource(f);
+  const guard = directOwnerKeySourceCurrentness(
+    record,
+    anchor,
+    anchor.verificationDomain,
+    captured,
+    "org_original",
+  );
+  const key = tokenIdentity("guarded_positive", digest("f"));
+  const selected = directOrigin(anchor, "guarded_positive");
+  const writes = await f.sql.batch([
+    guardedSyntheticKeyInsert(anchor, key, guard),
+    f.classes.directKeyFromOwnerSessionStatement(
+      selected,
+      key,
+      "org_original",
+      anchor,
+      anchor.verificationDomain,
+      record,
+      captured,
+      { name: "synthetic-key" },
+    ),
+  ]);
+  expect(writes.map((write) => write.changes)).toEqual([1, 1]);
+  expect((await f.classes.readRetained(selected.ref))?.class).toBe("direct-exact-org-key");
+});
+
+test("Auth authority exclusive-name zero row and exact preexisting ID cannot gain a class", async () => {
+  const f = fixture();
+  const { anchor, captured, record } = await syntheticDirectSource(f);
+  const guard = directOwnerKeySourceCurrentness(
+    record,
+    anchor,
+    anchor.verificationDomain,
+    captured,
+    "org_original",
+  );
+  const competing = tokenIdentity("competing", digest("b"));
+  await f.sql.batch([
+    {
+      sql: `INSERT INTO auth_tokens
+        (secret_digest,id,kind,principal_id,org_id,name,scopes_json,created_at,expires_at)
+        VALUES (?,?,'api_key',?,?,'synthetic-key',?,?,?)`,
+      params: [
+        competing.digest,
+        competing.id,
+        anchor.principalId,
+        "org_original",
+        competing.scopesJson,
+        competing.createdAt,
+        new Date(Date.now() + 3600000).toISOString(),
+      ],
+    },
+  ]);
+  const exclusive = tokenIdentity("exclusive_attempt", digest("f"));
+  const exclusiveOrigin = directOrigin(anchor, "exclusive_attempt");
+  await expect(
+    f.sql.batch([
+      guardedSyntheticKeyInsert(anchor, exclusive, guard, true),
+      f.classes.directKeyFromOwnerSessionStatement(
+        exclusiveOrigin,
+        exclusive,
+        "org_original",
+        anchor,
+        anchor.verificationDomain,
+        record,
+        captured,
+        { name: "synthetic-key", exclusiveUnrevokedName: "synthetic-key" },
+      ),
+    ]),
+  ).rejects.toMatchObject({ code: "constraint" });
+  expect(await f.sql.query("SELECT id FROM auth_tokens WHERE id=?", [exclusive.id])).toEqual([]);
+  expect(await f.classes.readRetained(exclusiveOrigin.ref)).toBeNull();
+  await f.sql.run("UPDATE auth_tokens SET revoked_at=? WHERE id=?", [
+    new Date().toISOString(),
+    competing.id,
+  ]);
+  const exclusiveSuccess = tokenIdentity("exclusive_positive", digest("a"));
+  const successOrigin = directOrigin(anchor, "exclusive_positive");
+  const successWrites = await f.sql.batch([
+    guardedSyntheticKeyInsert(anchor, exclusiveSuccess, guard, true),
+    f.classes.directKeyFromOwnerSessionStatement(
+      successOrigin,
+      exclusiveSuccess,
+      "org_original",
+      anchor,
+      anchor.verificationDomain,
+      record,
+      captured,
+      { name: "synthetic-key", exclusiveUnrevokedName: "synthetic-key" },
+    ),
+  ]);
+  expect(successWrites.map((write) => write.changes)).toEqual([1, 1]);
+  expect((await f.classes.readRetained(successOrigin.ref))?.class).toBe("direct-exact-org-key");
+
+  // The old ON CONFLICT DO NOTHING shape would skip this INSERT. The selected
+  // shape must use a plain ID conflict so an exact unclassified row aborts.
+  const preexisting = tokenIdentity("preexisting_exact", digest("c"));
+  const preexistingInsert = guardedSyntheticKeyInsert(anchor, preexisting, guard);
+  await f.sql.batch([preexistingInsert]);
+  const preexistingOrigin = directOrigin(anchor, "preexisting_exact");
+  await expect(
+    f.sql.batch([
+      preexistingInsert,
+      f.classes.directKeyFromOwnerSessionStatement(
+        preexistingOrigin,
+        preexisting,
+        "org_original",
+        anchor,
+        anchor.verificationDomain,
+        record,
+        captured,
+        { name: "synthetic-key" },
+      ),
+    ]),
+  ).rejects.toMatchObject({ code: "constraint" });
+  expect(await f.classes.readRetained(preexistingOrigin.ref)).toBeNull();
+  expect(await f.sql.query("SELECT id FROM auth_tokens WHERE id=?", [preexisting.id])).toEqual([
+    { id: preexisting.id },
+  ]);
+});
+
+test("Auth authority changed source owner or revoked session aborts guarded key batch", async () => {
+  const f = fixture();
+  const source = await syntheticDirectSource(f);
+  const { anchor, captured, record } = source;
+  const guard = directOwnerKeySourceCurrentness(
+    record,
+    anchor,
+    anchor.verificationDomain,
+    captured,
+    "org_original",
+  );
+  await f.sql.run("UPDATE org_memberships SET role='member' WHERE org_id=?", ["org_original"]);
+  const first = tokenIdentity("guarded_first", digest("f"));
+  const firstOrigin = directOrigin(anchor, "guarded_first");
+  await expect(
+    f.sql.batch([
+      { sql: "UPDATE auth_guard_probe SET touched=touched+1 WHERE id=1" },
+      guardedSyntheticKeyInsert(anchor, first, guard),
+      f.classes.directKeyFromOwnerSessionStatement(
+        firstOrigin,
+        first,
+        "org_original",
+        anchor,
+        anchor.verificationDomain,
+        record,
+        captured,
+        { name: "synthetic-key" },
+      ),
+    ]),
+  ).rejects.toMatchObject({ code: "constraint" });
+  expect(await f.sql.query("SELECT touched FROM auth_guard_probe")).toEqual([{ touched: 0 }]);
+  expect(await f.sql.query("SELECT id FROM auth_tokens WHERE id=?", [first.id])).toEqual([]);
+  expect(await f.classes.readRetained(firstOrigin.ref)).toBeNull();
+  await f.sql.run("UPDATE org_memberships SET role='owner' WHERE org_id=?", ["org_original"]);
+  await f.sql.run("UPDATE auth_tokens SET revoked_at=? WHERE id=?", [
+    new Date().toISOString(),
+    captured.tokenId,
+  ]);
+  expect(
+    await f.classes.readActiveDirectOwnerSessionByToken({
+      id: captured.tokenId,
+      digest: captured.digest,
+    }),
+  ).toBeNull();
+  const second = tokenIdentity("guarded_second", digest("c"));
+  const secondOrigin = directOrigin(anchor, "guarded_second");
+  await expect(
+    f.sql.batch([
+      guardedSyntheticKeyInsert(anchor, second, guard),
+      f.classes.directKeyFromOwnerSessionStatement(
+        secondOrigin,
+        second,
+        "org_original",
+        anchor,
+        anchor.verificationDomain,
+        record,
+        captured,
+        { name: "synthetic-key" },
+      ),
+    ]),
+  ).rejects.toMatchObject({ code: "constraint" });
+  expect(await f.sql.query("SELECT id FROM auth_tokens WHERE id=?", [second.id])).toEqual([]);
+  expect(await f.classes.readRetained(secondOrigin.ref)).toBeNull();
+  expect((await f.classes.readRetained(source.selected.ref))?.state).toBe("retired");
+});
+
+test("Auth authority guarded direct key unknown ACK is never resent", async () => {
+  const f = fixture();
+  const { anchor, captured, record } = await syntheticDirectSource(f);
+  const guard = directOwnerKeySourceCurrentness(
+    record,
+    anchor,
+    anchor.verificationDomain,
+    captured,
+    "org_original",
+  );
+  const key = tokenIdentity("unknown_ack", digest("f"));
+  const selected = directOrigin(anchor, "unknown_ack");
+  let batches = 0;
+  const unknownAck: Sql = {
+    query: f.sql.query,
+    run: f.sql.run,
+    async batch(statements) {
+      batches += 1;
+      await f.sql.batch(statements);
+      throw new SqlError("unavailable", "synthetic ACK lost after direct batch commit");
+    },
+  };
+  await expect(
+    unknownAck.batch([
+      guardedSyntheticKeyInsert(anchor, key, guard),
+      f.classes.directKeyFromOwnerSessionStatement(
+        selected,
+        key,
+        "org_original",
+        anchor,
+        anchor.verificationDomain,
+        record,
+        captured,
+        { name: "synthetic-key" },
+      ),
+    ]),
+  ).rejects.toMatchObject({ code: "unavailable" });
+  expect(batches).toBe(1);
+  expect(await f.sql.query("SELECT id FROM auth_tokens WHERE id=?", [key.id])).toEqual([
+    { id: key.id },
+  ]);
+  expect((await f.classes.readRetained(selected.ref))?.class).toBe("direct-exact-org-key");
+});
 
 test("Auth authority proved legacy cannot mint direct class and token batch rolls back", async () => {
   const f = fixture();
