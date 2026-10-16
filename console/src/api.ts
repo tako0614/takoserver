@@ -199,6 +199,8 @@ export class ApiError extends Error {
     readonly code: string,
     readonly status: number,
     readonly path: string,
+    /** The Host's own explanation, when its problem carries one. */
+    readonly detail: string | null = null,
   ) {
     super(code);
     this.name = "ApiError";
@@ -411,7 +413,13 @@ export function createApi(options: ApiOptions) {
           : typeof envelope?.code === "string"
             ? envelope.code
             : `http_${response.status}`;
-      const failure = new ApiError(code, response.status, path);
+      const detail = (payload as { detail?: unknown } | null)?.detail;
+      const failure = new ApiError(
+        code,
+        response.status,
+        path,
+        typeof detail === "string" && detail.length > 0 && detail.length <= 1024 ? detail : null,
+      );
       if (failure.isExpiredSession) options.onSessionLost();
       throw failure;
     }
