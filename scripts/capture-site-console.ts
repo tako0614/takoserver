@@ -246,16 +246,18 @@ try {
         }
         const rendered = await evaluate<{
           rows: number;
-          applied: number;
+          settled: number;
           viewport: [number, number];
           pageWidth: number;
           theme: string;
           lang: string;
         }>(
-          `({ rows: document.querySelectorAll('.table-scroll tbody tr').length, applied: [...document.querySelectorAll('.table-scroll tbody tr')].filter(row => /Applied|反映済み/.test(row.innerText)).length, viewport: [innerWidth, innerHeight], pageWidth: document.documentElement.scrollWidth, theme: document.documentElement.dataset.theme, lang: document.documentElement.lang })`,
+          `({ rows: document.querySelectorAll('.table-scroll tbody tr').length, settled: [...document.querySelectorAll('.table-scroll tbody tr')].filter(row => /Ready|Applied|稼働中|反映済み/.test(row.innerText)).length, viewport: [innerWidth, innerHeight], pageWidth: document.documentElement.scrollWidth, theme: document.documentElement.dataset.theme, lang: document.documentElement.lang })`,
         );
         if (
-          rendered.applied !== resources.length ||
+          // Every sample row shows a settled, healthy state: Ready where its Form
+          // reports readiness, Applied where it has none.
+          rendered.settled !== resources.length ||
           rendered.viewport[0] !== width ||
           rendered.viewport[1] !== height ||
           rendered.pageWidth > width ||
