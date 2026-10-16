@@ -546,3 +546,46 @@ test("a Worker's page lists what names it, with the address an Endpoint publishe
   const published = links.find((node) => node.textContent.startsWith("https://hello.apps"));
   expect(published?.attributes.get("target")).toBe("_blank");
 });
+
+test("what names a Resource says how many it checked when it stops early", async () => {
+  // Only the lookup itself: no page is mounted, so nothing else reads the list.
+  installDom();
+  const { findReferrers } = await import("../console/src/pages/resource-detail.ts");
+  const resource = (uid: string, spec: unknown) => ({
+    uid,
+    form: "https://edge.forms.takoform.com/forms/WorkerVersion/0.5.0/",
+    space: "org-one",
+    name: uid,
+    generation: 1,
+    observedGeneration: 1,
+    observedAt: null,
+    phase: "idle",
+    spec,
+    observed: {},
+    output: {},
+    lastOperation: `op-${uid}`,
+  });
+  let pages = 0;
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL) => {
+      if (!new URL(String(input)).pathname.endsWith("/resources"))
+        return Response.json({ error: { code: "not_found" } }, { status: 404 });
+      pages += 1;
+      // Every page has a next one; only the second names the Worker.
+      return Response.json({
+        items: [
+          resource(`uid-${pages}-a`, pages === 2 ? { worker: { resourceUid: "uid-worker" } } : {}),
+          resource(`uid-${pages}-b`, {}),
+          resource(`uid-${pages}-c`, {}),
+        ],
+        nextCursor: `page-${pages + 1}`,
+      });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  const found = await findReferrers("org-one", "uid-worker");
+  expect(pages).toBe(5);
+  expect(found.complete).toBe(false);
+  expect(found.checked).toBe(15);
+  expect(found.referrers.map((entry) => entry.resource.uid)).toEqual(["uid-2-a"]);
+});
