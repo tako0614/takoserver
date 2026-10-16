@@ -118,7 +118,10 @@ describe("Takoserver public site", () => {
 
   test("after deploying, shows the console and how to ship a new version on your own Host", () => {
     const html = landingHtml(site);
-    expect(html).toContain("See it in the console");
+    expect(html).toContain("Use the console");
+    // The console is a way to deploy and ship, not only to look.
+    expect(html).toContain("The console can also create these Resources in the browser.");
+    expect(html).toContain("choose “Serve this version” on its page");
     expect(html).toContain(
       'href="https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#the-console-optional"',
     );

@@ -6,8 +6,9 @@ it with [Takoform](https://takoform.com), by exact Form URL over Host API v2, an
 it serves each Worker at an HTTPS hostname.
 
 An organization owns its Resources. Its API keys, each with read or write
-permission, manage them over the API; a separately served console shows them in
-the browser.
+permission, manage them over the API. A separately served console does the same
+in the browser: it creates, updates and deletes Resources and shows each
+Worker's address and state.
 
 ## What you can deploy
 
@@ -82,7 +83,7 @@ Three ways in, from the quickest look to a served Worker:
    [First install and first use](docs/self-host-operations.md#first-install-and-first-use)
    takes a Linux x86-64 machine from a reviewed checkout to a Worker served over
    HTTPS: the Worker runtime, HTTPS on TCP 443, an API key, and the five
-   Resources that make up one Worker.
+   Resources that make up one Worker, created with curl or in the console.
 
 ## Start here
 
