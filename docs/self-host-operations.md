@@ -887,7 +887,7 @@ sent until you accept; **Request to send**, folded below the spec, holds the
 exact request. After each accept, the Resources page shows the **Accepted
 operation**. The Host refuses a reference to a Resource whose create has not
 finished, so create anything that names a Resource only once that card offers
-**View resource**. `hello` shows NotReady until a Deployment serves it.
+**View resource**.
 
 1. Create the `ModuleWorker` `hello`.
 2. Create the `WorkerBundle` `hello-bundle-v1`, with `artifact.url` and
