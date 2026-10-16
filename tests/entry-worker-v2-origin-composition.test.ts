@@ -75,6 +75,18 @@ function sharedSchema(
     db.exec(`CREATE TABLE ${prefix}_batch_assertions (
       witness TEXT PRIMARY KEY,ok INTEGER NOT NULL CHECK(ok=1),
       apply_effects INTEGER NOT NULL CHECK(apply_effects IN (0,1)))`);
+    if (typed)
+      db.exec(`CREATE TABLE ${prefix}_route_commands (
+        organization_id TEXT NOT NULL,product TEXT NOT NULL,reservation_id TEXT NOT NULL,name TEXT NOT NULL,
+        incarnation TEXT NOT NULL REFERENCES ${prefix}_assignments(incarnation),
+        action TEXT NOT NULL CHECK(action IN ('activate','advance','retire')),command_ref TEXT NOT NULL,
+        prior_generation INTEGER NOT NULL,prior_state TEXT NOT NULL,prior_script TEXT,next_script TEXT,
+        endpoint_uid TEXT NOT NULL,endpoint_generation INTEGER NOT NULL,worker_uid TEXT NOT NULL,
+        deployment_uid TEXT NOT NULL,deployment_generation INTEGER NOT NULL,source_operation_id TEXT NOT NULL,
+        provider_id TEXT NOT NULL,target_key TEXT NOT NULL,next_generation INTEGER NOT NULL,next_state TEXT NOT NULL,
+        created_at INTEGER NOT NULL,form_v2_original_json TEXT,
+        PRIMARY KEY(organization_id,command_ref),UNIQUE(incarnation,next_generation),
+        CHECK(next_generation=prior_generation+1),CHECK(next_generation BETWEEN 2 AND 9007199254740990))`);
   }
   if (!includeBindings) return;
   // Fixture-only operation FKs: current Core retains operation rows; it has no GC DELETE.
@@ -906,7 +918,23 @@ test("Worker public carrier uses existing supply derivation and feeds the same o
         operation.resourceUid,
       ]),
     ).toEqual([{ principal: `org:${ORG}`, space: ORG, name }]);
+    expect(
+      await f.sql.query("SELECT count(*) AS n FROM shared_app_staging_route_commands"),
+    ).toEqual([{ n: 0 }]);
+    const batches = f.coreBatches.length;
     expect((await control("DELETE")).status).toBe(422);
+    expect(f.coreBatches).toHaveLength(batches);
+    expect(await f.ledger.forTrustedOwner(f.owner).readOriginalRoute(reservationId)).toEqual(
+      original,
+    );
+    expect(await f.sql.query("SELECT * FROM shared_app_staging_batch_assertions")).toEqual([]);
+    expect(f.providerCalls()).toBe(0);
+    expect(f.effects()).toBe(0);
+    // Losing the retained route history is unavailable authority, not permission
+    // to cancel the held name, even when this Endpoint already fences release.
+    await f.sql.run("DROP TABLE shared_app_staging_route_commands");
+    expect((await control("DELETE")).status).toBe(503);
+    expect(f.coreBatches).toHaveLength(batches);
     expect(await f.ledger.forTrustedOwner(f.owner).readOriginalRoute(reservationId)).toEqual(
       original,
     );
