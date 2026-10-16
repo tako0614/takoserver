@@ -453,6 +453,11 @@ test("a By Form tile opens the list filtered to that exact Form", async () => {
   const items = [
     item("hello-version-v1", "WorkerVersion/0.5.0"),
     item("notes", "SQLiteDatabase/0.2.0"),
+    // Same kind and version under a differently spelled host: another Form.
+    {
+      ...item("other-version", "WorkerVersion/0.5.0"),
+      form: "https://EDGE.forms.takoform.com/forms/WorkerVersion/0.5.0/",
+    },
   ];
   globalThis.fetch = Object.assign(
     async (input: RequestInfo | URL) => {
@@ -481,7 +486,7 @@ test("a By Form tile opens the list filtered to that exact Form", async () => {
     .all()
     .find((node) => node.tag === "a" && node.textContent.startsWith("WorkerVersion 0.5.0"));
   const href = tile?.attributes.get("href") ?? "";
-  expect(href).toBe(`/resources?q=${encodeURIComponent(`${forms}/WorkerVersion/0.5.0/`)}`);
+  expect(href).toBe(`/resources?form=${encodeURIComponent(`${forms}/WorkerVersion/0.5.0/`)}`);
   const target = new URL(href, "https://console.example.test");
   route.set({ path: target.pathname, segments: ["resources"], query: target.searchParams });
   const list = installDom();
@@ -489,4 +494,7 @@ test("a By Form tile opens the list filtered to that exact Form", async () => {
   await settle();
   expect(list.textContent).toContain("hello-version-v1");
   expect(list.textContent).not.toContain("notes");
+  expect(list.textContent).not.toContain("other-version");
+  // The page says what it is narrowed to, and how to see everything.
+  expect(list.textContent).toContain("Form: WorkerVersion 0.5.0 · Show all");
 });
