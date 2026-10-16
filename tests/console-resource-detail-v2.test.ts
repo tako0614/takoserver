@@ -348,6 +348,74 @@ test("resource detail calls a settled artifact Resource Applied", async () => {
   expect(body.textContent).not.toContain("Unknown");
 });
 
+test("overview leads with resources and shows the wallet once it is in use", async () => {
+  const { consoleLocale } = await import("../console/src/i18n.ts");
+  const { organizations, selectOrganization, setApiOrigin } = await import(
+    "../console/src/state.ts"
+  );
+  const { overviewPage } = await import("../console/src/pages/overview.ts");
+  const organization = {
+    id: "org-one",
+    name: "One",
+    ownerPrincipalId: "owner",
+    createdAt: "2026-10-07",
+  };
+  const render = async (micros: string, entries: unknown[] = []) => {
+    const body = installDom();
+    consoleLocale.set("en");
+    setApiOrigin("https://api.example.test");
+    organizations.set([organization]);
+    selectOrganization(organization.id);
+    globalThis.fetch = Object.assign(
+      async (input: RequestInfo | URL) => {
+        const path = new URL(String(input)).pathname;
+        if (path.endsWith("/wallet"))
+          return Response.json({
+            wallet: {
+              organizationId: organization.id,
+              availableMicros: micros,
+              heldMicros: "0",
+              settledMicros: micros,
+              currency: "USD",
+              unit: "USD-micros",
+              moneyPolicy: "usd-micros-v2",
+              entries,
+            },
+          });
+        if (path.endsWith("/operations")) return Response.json({ operations: [] });
+        return Response.json({ items: [], nextCursor: null });
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    );
+    body.append(overviewPage(organization) as unknown as NodeStub);
+    await settle();
+    return body.textContent;
+  };
+  const unfunded = await render("0");
+  expect(unfunded).not.toContain("prepaid");
+  expect(unfunded).not.toContain("Available");
+  expect(unfunded).not.toContain("Settled");
+  expect(unfunded).toContain("Resources");
+  const funded = await render("5000000");
+  expect(funded).toContain("Available");
+  expect(funded).toContain("Settled");
+  expect(funded.indexOf("Resources")).toBeLessThan(funded.indexOf("Available"));
+  // A wallet that has been used keeps its cards when it is back at $0.
+  const spent = await render("0", [
+    {
+      id: "entry-one",
+      organizationId: "org-one",
+      type: "funding",
+      reference: "fund-one",
+      settledDeltaMicros: "5000000",
+      heldDeltaMicros: "0",
+      createdAt: "2026-10-07T00:00:00Z",
+    },
+  ]);
+  expect(spent).toContain("Available");
+  expect(spent).toContain("$0");
+});
+
 test("names each referenced Resource where the spec names it", async () => {
   const { specReferences, publishedUrl } = await import("../console/src/pages/resource-detail.ts");
   expect(

@@ -429,6 +429,12 @@ textarea {
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
 }
 
+/* A lone stat keeps a stat's width instead of filling the row, so the row
+   does not jump when the wallet's cards arrive. */
+.grid--stats {
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+}
+
 .stat__label {
   font-size: 11px;
   font-weight: 600;
