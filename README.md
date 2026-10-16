@@ -175,7 +175,7 @@ retained v1 repair path and are not v2 setup.
 ### First start
 
 A Bun Host keeps its control state in local SQLite and its artifacts in a
-local content-addressed store under the data root
+local content-addressed store, by default under the data root
 ([Data root and backups](#data-root-and-backups)), and it refuses
 `TAKOSERVER_D1_DATABASE_ID` and `TAKOSERVER_R2_BUCKET` before opening that
 state; D1- and R2-bound execution belongs to the Worker entry
@@ -805,9 +805,7 @@ current sale, authoring, or `/provision/v1` authority.
 Ordinary Bun always keeps the stable self-host Provider3 execution pack.
 `CLOUDFLARE_ACCOUNT_ID` may separately back an explicitly reviewed ObjectBucket
 supply, but it is neither provider-selection nor resale authority and does not
-switch stable Forms off. `TAKOSERVER_D1_DATABASE_ID` and
-`TAKOSERVER_R2_BUCKET` are rejected by the Bun entry before it opens local
-state; use the Worker entry for D1/R2-bound execution.
+switch stable Forms off.
 
 The released Cloudflare ObjectBucket provider survives only as an explicit
 recovery lane for observing and deleting its already-recorded beta
