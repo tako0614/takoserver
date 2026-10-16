@@ -289,10 +289,11 @@ chown root:root /usr/local/bin/takoserver-run
 chmod 0755 /usr/local/bin/takoserver-run
 ```
 
-Then install the systemd unit that runs the wrapper. Its `[Service]` section
-is the one [Self-host security](self-host-security.md#recommended-os-hardening)
-explains, option by option; keep the two the same. The repository's tests do not run this unit, so
-check `systemctl status takoserver.service` after the first start. As root:
+Then install the systemd unit that runs the wrapper. Its `[Service]` section is
+the one [Self-host security](self-host-security.md#recommended-os-hardening)
+explains, option by option; keep the two the same. The repository's tests do not
+run this unit, so check `systemctl status takoserver.service` after the first
+start. As root:
 
 ```sh
 cat > /etc/systemd/system/takoserver.service <<'EOF'
@@ -473,19 +474,18 @@ certbot certonly --dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cl
   --deploy-hook /usr/local/sbin/takoserver-tls-deploy
 ```
 
-`takoserver.service` is the unit installed in step 3.
-certbot runs the deploy hook after this first issuance, when the Host has not
-started yet, and again after every renewal, which the package's
-`certbot.timer` attempts twice a day. Re-running `certbot certonly` before a
-renewal is due copies nothing unless you choose to renew; run the hook itself
-instead.
-`certbot renew --dry-run` tests renewal but skips the hook, so once the Host
-runs, test the hook by running `/usr/local/sbin/takoserver-tls-deploy` (it
-restarts the Host). A renewal restarts the whole Host, roughly every two
-months with 90-day certificates, at a random time in the timer's window: the
-API and the Endpoints are briefly down and queue and cron delivery pause. If a certificate expires without a
-restart, the listener still presents it, clients reject it, Endpoint
-Operations stay `reconciling`, and the next start fails.
+`takoserver.service` is the unit installed in step 3. certbot runs the deploy
+hook after this first issuance, when the Host has not started yet, and again
+after every renewal, which the package's `certbot.timer` attempts twice a day.
+Re-running `certbot certonly` before a renewal is due copies nothing unless you
+choose to renew; run the hook itself instead. `certbot renew --dry-run` tests
+renewal but skips the hook, so once the Host runs, test the hook by running
+`/usr/local/sbin/takoserver-tls-deploy` (it restarts the Host). A renewal
+restarts the whole Host, roughly every two months with 90-day certificates, at a
+random time in the timer's window: the API and the Endpoints are briefly down
+and queue and cron delivery pause. If a certificate expires without a restart,
+the listener still presents it, clients reject it, Endpoint Operations stay
+`reconciling`, and the next start fails.
 
 ### 5. First boot and operator sign-in
 
