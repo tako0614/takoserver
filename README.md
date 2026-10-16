@@ -11,27 +11,44 @@ the browser.
 
 ## What you can deploy
 
-A Host serves exactly the Forms its configuration composes. Before relying on a
-Form, ask a running Host with an API key, passing the URL-encoded Form URL,
-for example `https://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/`:
-`GET /apis/forms.takoform.com/v2/support?form=<Form URL>`.
+A Takoform Form defines one kind of resource, such as a Worker or a SQLite
+database, at a versioned URL. These are the Forms a Bun Host can serve:
 
-- **Artifacts, with Bun and the Form's block in `TAKOSERVER_TAKOFORM_V2_CONFIG`:**
-  `WorkerBundle 0.2.0`, `StaticAssetBundle 0.2.0` and `SQLiteMigrationSet 0.2.0`.
-  They validate and keep bytes the operator has seeded or that are reachable
-  over public HTTPS; by themselves they do not run a Worker, serve assets, apply
-  SQL or create an endpoint.
-- **Workers and their data, with the complete local Worker profile** (on Linux
-  x86-64, the pinned `workerd`, the Workflow execution guard and the settings
-  listed for that profile under [Settings](#settings)): `ModuleWorker 0.3.0`,
-  `WorkerVersion 0.5.0`, `WorkerDeployment 0.4.0`, `WorkerCronTrigger 0.3.0`,
-  `SQLiteDatabase 0.2.0`, `EdgeKVNamespace 0.2.0`, `ObjectBucket 0.2.0`,
-  `AtLeastOnceQueue 0.2.0`, `QueueConsumer 0.3.0`, `ActorNamespace 0.3.0` and
-  `DurableWorkflow 0.3.0`. A partial Worker profile advertises none of these.
-  `SQLiteMigrationApplication 0.2.0` is added when a `sqliteMigrationSet` block
-  is configured, and `WorkerEndpoint 0.3.0`, which publishes a Worker at an
-  HTTPS hostname, when the listener on TCP 443 is configured; without one of
-  them, only that Form is absent.
+- **Artifacts:** `WorkerBundle 0.2.0`, `StaticAssetBundle 0.2.0` and
+  `SQLiteMigrationSet 0.2.0`. Worker code, static files and SQL migrations,
+  pinned by URL and SHA-256 and kept by the Host. By themselves they do not run
+  a Worker, serve assets, apply SQL or create an endpoint.
+- **Workers and HTTPS:** `ModuleWorker 0.3.0`, `WorkerVersion 0.5.0`,
+  `WorkerDeployment 0.4.0`, `WorkerCronTrigger 0.3.0` and `WorkerEndpoint 0.3.0`.
+  A Worker, its versions, how its traffic is split across up to eight of them,
+  a schedule, and an HTTPS hostname.
+- **Data:** `SQLiteDatabase 0.2.0`, `SQLiteMigrationApplication 0.2.0`,
+  `EdgeKVNamespace 0.2.0` and `ObjectBucket 0.2.0`. SQLite databases, KV
+  namespaces and object buckets, which a Worker reaches through Bindings, and
+  the application of a migration set to a database.
+- **Queues, actors and workflows:** `AtLeastOnceQueue 0.2.0`,
+  `QueueConsumer 0.3.0`, `ActorNamespace 0.3.0` and `DurableWorkflow 0.3.0`.
+  At-least-once queues and the consumers that deliver their messages to a
+  Worker, actors that keep state, and durable workflows. A Worker reaches the
+  queues, actors and workflows through Bindings.
+
+A Host serves exactly the Forms its configuration composes:
+
+- An artifact Form needs only Bun and its block in
+  `TAKOSERVER_TAKOFORM_V2_CONFIG`. It validates and keeps bytes the operator
+  has seeded or that are reachable over public HTTPS.
+- Everything else needs the complete local Worker profile: on Linux x86-64, the
+  pinned `workerd`, the Workflow execution guard and the settings listed for
+  that profile under [Settings](#settings). A partial Worker profile advertises
+  none of these Forms.
+- Within that profile, `SQLiteMigrationApplication 0.2.0` also needs a
+  `sqliteMigrationSet` block, and `WorkerEndpoint 0.3.0` needs the listener on
+  TCP 443; without one of them, only that Form is absent.
+
+Before relying on a Form, ask a running Host with an API key, passing the
+URL-encoded Form URL, for example
+`https://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/`:
+`GET /apis/forms.takoform.com/v2/support?form=<Form URL>`.
 
 [Takoform v2 architecture and operator setup](docs/takoform-v2.md) has the
 exact gates, Form map and limits.
