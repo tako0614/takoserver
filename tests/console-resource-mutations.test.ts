@@ -1121,7 +1121,7 @@ test("a version's page starts the next version from it, with its code left to ch
     },
   };
   const { body, writes } = await versionPage([], withCode);
-  // A version cannot be changed, so there is nothing to update.
+  // A version cannot be changed; its same spec can only be sent again.
   expect(body.all().some((node) => node.tag === "button" && node.textContent === "Update")).toBe(
     false,
   );
@@ -1139,7 +1139,80 @@ test("a version's page starts the next version from it, with its code left to ch
     handlers: ["fetch"],
     sqliteBindings: [{ name: "DB", resource: { resourceUid: "uid-db" } }],
   });
+  // The copy is the Console's own writing, not the smallest spec of the Form.
+  expect(body.textContent).toContain("Fill in the empty values.");
+  expect(body.textContent).not.toContain("The smallest spec");
   expect(writes).toHaveLength(0);
+});
+
+test("a version keeps its assets in the next one, and only its code bundle is chosen again", async () => {
+  const assets = {
+    bundle: { resourceUid: "uid-assets" },
+    runWorkerFirst: false,
+    notFoundHandling: "none",
+  };
+  const both = await versionPage([], {
+    ...helloV2,
+    spec: {
+      worker: { resourceUid: "uid-worker" },
+      bundle: { resourceUid: "uid-bundle" },
+      handlers: ["fetch"],
+      assets,
+    },
+  });
+  button(both.body, "New version from this one").click();
+  await settle();
+  const spec = both.body.all().find((node) => node.tag === "textarea");
+  expect(JSON.parse(spec?.value ?? "{}")).toEqual({
+    worker: { resourceUid: "uid-worker" },
+    bundle: { resourceUid: "" },
+    handlers: ["fetch"],
+    assets,
+  });
+  // A static-site version has no code bundle: it is told where its new files go.
+  const site = await versionPage([], {
+    ...helloV2,
+    spec: { worker: { resourceUid: "uid-worker" }, handlers: [], assets },
+  });
+  button(site.body, "New version from this one").click();
+  await settle();
+  expect(site.body.textContent).toContain(
+    "Write the new StaticAssetBundle's UID in assets.bundle, name it, then accept",
+  );
+});
+
+test("a version that needs secret values is not copied in the console", async () => {
+  const { body } = await versionPage([], {
+    ...helloV2,
+    spec: {
+      worker: { resourceUid: "uid-worker" },
+      bundle: { resourceUid: "uid-bundle" },
+      handlers: ["fetch"],
+      requiredSensitiveVars: ["API_TOKEN"],
+    },
+  });
+  expect(body.textContent).toContain(
+    "This version needs secret values, which the console cannot send; create the next version over the API with privateInputs.",
+  );
+  expect(
+    body
+      .all()
+      .some((node) => node.tag === "button" && node.textContent === "New version from this one"),
+  ).toBe(false);
+});
+
+test("a version can be sent again with its same spec, to retry it", async () => {
+  const { body, writes } = await versionPage([]);
+  button(body, "Re-apply").click();
+  await settle();
+  expect(body.textContent).toContain(
+    "A Resource of this Form cannot change. Sending the same spec again retries it, for example after its create failed.",
+  );
+  button(body, "Accept update").click();
+  await settle();
+  const [update] = writes;
+  expect(update?.method).toBe("PUT");
+  expect(JSON.parse(await (update as Request).text())).toEqual({ spec: helloV2.spec });
 });
 
 test("a Resource that can change keeps its Update", async () => {

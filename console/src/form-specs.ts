@@ -12,7 +12,8 @@ const AT_LEAST_ONCE_QUEUE = form("AtLeastOnceQueue", "0.2.0");
 
 /**
  * Forms whose Resources this Host never lets change: a version and the
- * artifacts it names are new Resources each time, not edits.
+ * artifacts it names are new Resources each time, not edits. An update of one
+ * can only send its same spec again.
  */
 const UNCHANGEABLE = new Set([
   WORKER_VERSION,
