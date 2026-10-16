@@ -368,7 +368,7 @@ export const HOST_WORK: Readonly<Record<string, readonly [string, string]>> = {
 
 /** A phase this Console does not know is shown as the Host wrote it, never as settled. */
 export function hostWork(phase: string): string {
-  const words = HOST_WORK[phase];
+  const words = Object.hasOwn(HOST_WORK, phase) ? HOST_WORK[phase] : undefined;
   return words ? tr(...words) : phase;
 }
 

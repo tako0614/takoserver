@@ -873,5 +873,8 @@ test("says what the Host is doing for each v2 phase, and never calls an unknown 
   });
   // The four phases the v2 API reports, and nothing else, have words.
   expect(Object.keys(HOST_WORK).sort()).toEqual(["deleting", "error", "idle", "pending"]);
+  // A known phase reads in the console's language, whichever it is.
+  expect(HOST_WORK.pending).toContain(hostWork("pending"));
   expect(hostWork("migrating")).toBe("migrating");
+  expect(hostWork("constructor")).toBe("constructor");
 });
