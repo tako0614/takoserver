@@ -34,8 +34,8 @@ export function overviewPage(organization: Organization): Child {
           "p",
           null,
           tr(
-            "Takoformリソース、前払い残高、最近の変更を確認できます。",
-            "Takoform resources, prepaid balance, and what changed recently.",
+            "Takoformで宣言したリソースの状態と、最近の変更を確認できます。",
+            "The state of the resources you declared with Takoform, and what changed recently.",
           ),
         ),
       ),
@@ -44,30 +44,6 @@ export function overviewPage(organization: Organization): Child {
       h(
         "div",
         { class: "grid" },
-        whenReady(
-          wallet.get(),
-          ({ wallet: held }) =>
-            h(
-              "div",
-              { style: { display: "contents" } },
-              stat(
-                tr("利用可能", "Available"),
-                formatMicrosCurrency(held.availableMicros, held.currency, uiLocale()),
-                BigInt(held.heldMicros) > 0n
-                  ? tr(
-                      `${formatMicrosCurrency(held.heldMicros, held.currency, uiLocale())}を処理中の操作に確保中`,
-                      `${formatMicrosCurrency(held.heldMicros, held.currency, uiLocale())} held against live work`,
-                    )
-                  : tr("確保中の金額はありません", "nothing held"),
-              ),
-              stat(
-                tr("確定残高", "Settled"),
-                formatMicrosCurrency(held.settledMicros, held.currency, uiLocale()),
-                tr("入金と確定済み請求", "credited and captured"),
-              ),
-            ),
-          { skeleton: h("div", { class: "card" }, h("div", { class: "card__body skeleton" })) },
-        ),
         whenReady(
           resources.get(),
           ({ resources: all, cursor }) => {
@@ -98,6 +74,35 @@ export function overviewPage(organization: Organization): Child {
             );
           },
           { skeleton: h("div", { class: "card" }, h("div", { class: "card__body skeleton" })) },
+        ),
+        whenReady(
+          wallet.get(),
+          ({ wallet: held }) =>
+            // v2 Resources are never charged, so a self-host whose wallet has
+            // never held money has nothing to show here; Usage & billing
+            // still has the wallet.
+            walletHasMoney(held)
+              ? h(
+                  "div",
+                  { style: { display: "contents" } },
+                  stat(
+                    tr("利用可能", "Available"),
+                    formatMicrosCurrency(held.availableMicros, held.currency, uiLocale()),
+                    BigInt(held.heldMicros) > 0n
+                      ? tr(
+                          `${formatMicrosCurrency(held.heldMicros, held.currency, uiLocale())}を処理中の操作に確保中`,
+                          `${formatMicrosCurrency(held.heldMicros, held.currency, uiLocale())} held against live work`,
+                        )
+                      : tr("確保中の金額はありません", "nothing held"),
+                  ),
+                  stat(
+                    tr("確定残高", "Settled"),
+                    formatMicrosCurrency(held.settledMicros, held.currency, uiLocale()),
+                    tr("入金と確定済み請求", "credited and captured"),
+                  ),
+                )
+              : null,
+          { skeleton: false },
         ),
       ),
     ),
@@ -310,4 +315,15 @@ export function overviewPage(organization: Organization): Child {
 
 function uiLocale(): "en-US" | "ja-JP" {
   return consoleLocale() === "ja" ? "ja-JP" : "en-US";
+}
+
+/** Whether the wallet has ever held or settled money worth showing. */
+function walletHasMoney(wallet: {
+  readonly availableMicros: string;
+  readonly heldMicros: string;
+  readonly settledMicros: string;
+}): boolean {
+  return [wallet.availableMicros, wallet.heldMicros, wallet.settledMicros].some(
+    (micros) => BigInt(micros) !== 0n,
+  );
 }
