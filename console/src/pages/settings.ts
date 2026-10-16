@@ -35,7 +35,7 @@ export function settingsPage(organization: Organization): Child {
           "p",
           null,
           tr(
-            "サインイン中のアカウントと、このConsoleの接続先を確認します。",
+            "サインイン中のアカウントと、このコンソールの接続先を確認します。",
             "Who you are signed in as, and what this console is talking to.",
           ),
         ),
@@ -174,7 +174,7 @@ export function settingsPage(organization: Organization): Child {
               "small",
               null,
               tr(
-                "このConsoleのすべてのリクエストがここへ送られます。変更してもデータは移動しません。",
+                "このコンソールのすべてのリクエストがここへ送られます。変更してもデータは移動しません。",
                 "Every request from this console goes here. Changing it does not move any data.",
               ),
             ),
