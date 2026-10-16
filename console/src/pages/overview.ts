@@ -11,7 +11,7 @@ import { formName } from "../forms.ts";
 import { consoleLocale, tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
 import { publishedUrl, servedWorkers } from "../references.ts";
-import { byForm, health, phaseLabel } from "../resource-state.ts";
+import { byForm, health, phaseLabel, unrecordedDeployment } from "../resource-state.ts";
 import { linkProps, resourcePath } from "../router.ts";
 import { api } from "../state.ts";
 import { badge, card, empty, ICON, icon, whenReady } from "../ui.ts";
@@ -106,6 +106,9 @@ function attentionCard(all: readonly ResourceSummary[]): Child {
     return state.phase === "Failed" || state.phase === "NotReady" || state.stale;
   });
   if (attention.length === 0) return null;
+  const deployments = new Map(
+    servedWorkers(all).map(({ worker, deployment }) => [worker.uid, deployment]),
+  );
   return card(
     tr("確認が必要", "Needs attention"),
     h(
@@ -148,12 +151,17 @@ function attentionCard(all: readonly ResourceSummary[]): Child {
                         "最新の宣言がまだ適用されていません",
                         "the latest declaration has not been applied",
                       )
-                    : state.phase === "NotReady"
+                    : unrecordedDeployment(entry, deployments.get(entry.uid))
                       ? tr(
-                          "最新の観測でReadyではありません",
-                          "latest observation reports not ready",
+                          "配信は稼働中ですが、このWorkerはまだ記録していません",
+                          "its Deployment serves it, but the Worker has not recorded it",
                         )
-                      : "—"),
+                      : state.phase === "NotReady"
+                        ? tr(
+                            "最新の観測でReadyではありません",
+                            "latest observation reports not ready",
+                          )
+                        : "—"),
               ),
             );
           }),

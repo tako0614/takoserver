@@ -971,6 +971,13 @@ tbody tr.is-clickable:hover {
   color: var(--warn);
 }
 
+/* A Resource named in a notice keeps the notice's colour and still reads as a link. */
+.notice a {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
 .skeleton {
   height: 12px;
   border-radius: 4px;
