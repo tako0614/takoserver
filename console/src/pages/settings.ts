@@ -87,7 +87,7 @@ export function settingsPage(organization: Organization): Child {
             h(
               "button",
               { class: "btn btn--danger", type: "button", onClick: signOut },
-              icon(ICON.out, 14),
+              icon(ICON.signOut, 14),
               text(tr("サインアウト", "Sign out")),
             ),
           ),
