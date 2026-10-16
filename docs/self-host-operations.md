@@ -413,7 +413,7 @@ fi
 EOF
 chmod 0755 /usr/local/sbin/takoserver-tls-deploy
 certbot certonly --dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cloudflare.ini \
-  -d '*.apps.example.com' --cert-name apps.example.com -m <your email> --agree-tos \
+  -d '*.apps.example.com' --cert-name apps.example.com -m you@example.com --agree-tos \
   --deploy-hook /usr/local/sbin/takoserver-tls-deploy
 ```
 
@@ -421,11 +421,12 @@ certbot certonly --dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cl
 certbot runs the deploy hook after this first issuance, when the Host has not
 started yet, and again after every renewal, which the package's
 `certbot.timer` attempts twice a day. Re-running `certbot certonly` before a
-renewal is due copies nothing; run the hook itself instead.
+renewal is due copies nothing unless you choose to renew; run the hook itself
+instead.
 `certbot renew --dry-run` tests renewal but skips the hook, so once the Host
 runs, test the hook by running `/usr/local/sbin/takoserver-tls-deploy` (it
-restarts the Host). A renewal restarts the whole Host, about every 60 days at
-a random time in the timer's window: the API and the Endpoints are briefly
+restarts the Host). A renewal restarts the whole Host, roughly every two
+months with 90-day certificates, at a random time in the timer's window: the API and the Endpoints are briefly
 down and queue and cron delivery pause. If a certificate expires without a
 restart, the listener still presents it, clients reject it, Endpoint
 Operations stay `reconciling`, and the next start fails.
