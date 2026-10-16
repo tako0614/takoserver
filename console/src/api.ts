@@ -729,9 +729,10 @@ export function createApi(options: ApiOptions) {
       return payload.supported && payload.operations.includes("create");
     },
 
-    resources: (organizationId: string, query: { cursor?: string } = {}) => {
+    resources: (organizationId: string, query: { cursor?: string; form?: string } = {}) => {
       const search = new URLSearchParams();
       search.set("space", organizationId);
+      if (query.form) search.set("form", query.form);
       if (query.cursor) search.set("cursor", query.cursor);
       const path = `${LANE}/resources?${search.toString()}`;
       return request<unknown>("GET", path, undefined, organizationHeader(organizationId)).then(
@@ -740,7 +741,12 @@ export function createApi(options: ApiOptions) {
             status !== 200 ||
             !isRecord(payload) ||
             !Array.isArray(payload.items) ||
-            !payload.items.every((item) => isV2Resource(item) && item.space === organizationId) ||
+            !payload.items.every(
+              (item) =>
+                isV2Resource(item) &&
+                item.space === organizationId &&
+                (!query.form || item.form === query.form),
+            ) ||
             (payload.nextCursor !== null && typeof payload.nextCursor !== "string")
           ) {
             throw new ApiError("invalid_response", status, path);
