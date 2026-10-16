@@ -235,7 +235,7 @@ the TLS directory, then write the file with the cursor key printed above:
 install -d -m 0755 /etc/takoserver
 install -m 0640 -o root -g takoserver /dev/null /etc/takoserver/takoserver.env
 install -d -m 0750 -o root -g takoserver /etc/takoserver/tls
-# then: install -m 0640 -o root -g takoserver <certificate> <key> /etc/takoserver/tls/
+# step 4 puts the Worker Endpoint certificate pair in /etc/takoserver/tls/
 ```
 
 Single quotes keep the JSON values intact when a shell sources the file:
@@ -288,6 +288,63 @@ EOF
 chown root:root /usr/local/bin/takoserver-run
 chmod 0755 /usr/local/bin/takoserver-run
 ```
+
+Then install the systemd unit that runs the wrapper. Its `[Service]` section is
+the one [Self-host security](self-host-security.md#recommended-os-hardening)
+explains, option by option; keep the two the same. The repository's tests do not
+run this unit, so check `systemctl status takoserver.service` after the first
+start. As root:
+
+```sh
+cat > /etc/systemd/system/takoserver.service <<'EOF'
+[Unit]
+Description=Takoserver Host
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=takoserver
+Group=takoserver
+# The checkout stays read-only; all state goes to /var/lib/takoserver.
+WorkingDirectory=/opt/takoserver
+# Sources /etc/takoserver/takoserver.env and passes the v2 config file.
+ExecStart=/usr/local/bin/takoserver-run
+# Stop signals the Host alone; it stops its own workerd children in order.
+KillMode=mixed
+StateDirectory=takoserver
+StateDirectoryMode=0700
+Environment=TAKOSERVER_DATA_ROOT=/var/lib/takoserver
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# WorkerEndpoint (TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS=1) binds TCP 443.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+```
+
+Do not start it yet: step 4 gets the certificate first. From here on,
+stopping, starting and restarting the Host mean `systemctl stop`, `start` and
+`restart takoserver.service`, run as root in an administrator shell.
 
 Linux passes at most 131,072 bytes in one environment variable, including its
 name. Each held file adds about 370 bytes to the config, so a config holds
@@ -366,16 +423,89 @@ pre-v2 Worker socket settings (`TAKOSERVER_WORKERD_PORT`,
 `TAKOSERVER_WORKER_ENDPOINT_PORT`) described in the README do not apply to
 `WorkerEndpoint 0.3.0`.
 
+#### DNS, ports and the wildcard certificate
+
+Do this before the first start: the Host refuses to start with
+`TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS=1` until both certificate files exist.
+With the example names used in this guide, the machine needs:
+
+| Name | Open TCP port | Serves |
+| --- | --- | --- |
+| `api.example.com` | 8443 | The control API, through the front end above |
+| `console.example.com` | 8444 | The console, if you serve it (step 5) |
+| `*.apps.example.com`, an A record only | 443 | Worker Endpoints, served by the Host itself |
+| (the names above that the front end serves) | 80 | The front end's own certificate challenge, if it obtains certificates (Caddy does by default) |
+
+The Worker Endpoint listener binds IPv4 only (`0.0.0.0:443`), so do not
+publish an AAAA record for `*.apps.example.com`: IPv6 clients would try an
+address nothing answers. The front end needs TCP 80 for its challenge because
+the Host holds 443.
+
+The Host reads the certificate pair once, at startup, and does not start
+unless it covers `*.apps.example.com` (the configured suffix), matches the key
+and is currently valid. While it runs it keeps checking that the certificate
+is current. A wildcard certificate can only be issued through a DNS challenge
+(ACME DNS-01), which needs API access to the DNS zone. Any ACME client works;
+with certbot and its plugin for the zone's DNS host (Cloudflare here; use your
+provider's plugin and credentials file, or another client such as lego or
+acme.sh if there is no plugin, since a manual DNS challenge never renews), as
+root:
+
+```sh
+apt-get install -y certbot python3-certbot-dns-cloudflare
+install -d -m 0700 /root/.secrets
+install -m 0600 /dev/null /root/.secrets/cloudflare.ini
+# Put one line in it: dns_cloudflare_api_token = <a token that may edit DNS in example.com>
+cat > /usr/local/sbin/takoserver-tls-deploy <<'EOF'
+#!/bin/sh
+# Copies a new certificate where the Host reads it, then restarts the Host
+# if it is running, because the Host reads the pair only at startup.
+set -eu
+live=${RENEWED_LINEAGE:-/etc/letsencrypt/live/apps.example.com}
+install -m 0640 -o root -g takoserver "$live/fullchain.pem" /etc/takoserver/tls/apps.example.com.crt
+install -m 0640 -o root -g takoserver "$live/privkey.pem" /etc/takoserver/tls/apps.example.com.key
+if systemctl is-active --quiet takoserver.service; then
+  systemctl restart takoserver.service
+fi
+EOF
+chmod 0755 /usr/local/sbin/takoserver-tls-deploy
+certbot certonly --dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cloudflare.ini \
+  -d '*.apps.example.com' --cert-name apps.example.com -m you@example.com --agree-tos \
+  --deploy-hook /usr/local/sbin/takoserver-tls-deploy
+```
+
+`takoserver.service` is the unit installed in step 3. certbot runs the deploy
+hook after this first issuance, when the Host has not started yet, and again
+after every renewal, which the package's `certbot.timer` attempts twice a day.
+Re-running `certbot certonly` before a renewal is due copies nothing unless you
+choose to renew; run the hook itself instead. `certbot renew --dry-run` tests
+renewal but skips the hook, so once the Host runs, test the hook by running
+`/usr/local/sbin/takoserver-tls-deploy` (it restarts the Host). A renewal
+restarts the whole Host, roughly every two months with 90-day certificates, at a
+random time in the timer's window: the API and the Endpoints are briefly down
+and queue and cron delivery pause. If a certificate expires without a restart,
+the listener still presents it, clients reject it, Endpoint Operations stay
+`reconciling`, and the next start fails.
+
 ### 5. First boot and operator sign-in
 
-Start the Host. The first boot creates the control database and signing keys
-under the data root and prints each applied migration. When no identity
+As root, start the Host and follow its log:
+
+```sh
+systemctl enable --now takoserver.service
+journalctl -u takoserver.service -n 200 -f
+```
+
+The first boot creates the control database and signing keys under the data
+root and prints each applied migration. When no identity
 provider is configured, it prints an operator sign-in assertion valid for ten
 minutes. The assertion is single-use: the first session exchange spends it,
 and afterwards both another exchange and an owner proof refuse it. A boot
 prints a new one until the operator has signed in, or every time with
 `TAKOSERVER_PRINT_OPERATOR_ASSERTION=1`; after the first sign-in a boot prints
-only how to mint one. [Self-host security](self-host-security.md#sign-in-and-request-limits)
+only how to mint one. It appears in this journal, which the `takoserver` user
+cannot read, so copy it from this administrator shell into the operator shell
+below. [Self-host security](self-host-security.md#sign-in-and-request-limits)
 explains why. If `TAKOSERVER_CONSOLE_ORIGIN` is set, open the exact external console
 origin named by the process and paste the assertion there. It is a separate
 console; the Bun Host does not serve a `/console` page.
@@ -513,7 +643,7 @@ new held bundle takes the same three steps: stop the Host, seed the bundle,
 start the Host again.
 
 `scripts/selfhost-artifact.ts seed` is that operator step. Stop the Host
-through its supervisor first. Then run the command from the checkout as the
+first (`systemctl stop takoserver.service`). Then run the command from the checkout as the
 `takoserver` user with the Host's environment, because it resolves the data
 root and `TAKOSERVER_DB` exactly as the Host does:
 
@@ -1004,10 +1134,11 @@ If you serve the console, rebuild it from the new checkout as described under
 [The console](#the-console-optional) when you switch to it.
 
 Keep the previous source checkout available so a code-only return is possible
-without changing the active source before the operator has selected it. Use
-the same operator-controlled process supervisor and protected configuration
-when selecting which checkout to run; this guide does not prescribe a service
-manager or its unit-file layout.
+without changing the active source before the operator has selected it. The
+wrapper (`cd /opt/takoserver`) and the unit (`WorkingDirectory=/opt/takoserver`)
+from step 3 both name the checkout that runs: to switch, change that path in
+both and run `systemctl daemon-reload` while the Host is stopped. Keep the same
+protected configuration.
 
 If an earlier build ran as root, check `/tmp` first, as described under
 [`/tmp` left at mode 0700](#ordinary-journey-native-test-and-known-gaps). For
