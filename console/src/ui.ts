@@ -186,6 +186,7 @@ export function whenReady<Value>(
  */
 export function explain(error: Error): string {
   const code = (error as { code?: string }).code ?? error.message;
+  const detail = (error as { detail?: unknown }).detail;
   const known: Record<string, string> = {
     unreachable: tr(
       "APIに接続できません。接続先とネットワークを確認してください。",
@@ -198,6 +199,10 @@ export function explain(error: Error): string {
     permission_denied: tr(
       "このアカウントには操作する権限がありません。",
       "This account is not allowed to do that.",
+    ),
+    forbidden: tr(
+      "このアカウントやキーには、この操作の権限がありません。",
+      "This account or key is not allowed to do that.",
     ),
     not_found: tr(
       "対象が存在しないか、所有していません。",
@@ -212,15 +217,53 @@ export function explain(error: Error): string {
       "The wallet does not hold enough available balance.",
     ),
     form_unknown: tr(
-      "指定したFormはこのホストにインストールされていません。",
-      "No installed Form matches that exact reference.",
+      "このHostは、指定したFormに対応していません。",
+      "This Host does not serve that exact Form.",
+    ),
+    unsupported_form: tr(
+      "このHostは、指定したFormに対応していません。",
+      "This Host does not serve that exact Form.",
+    ),
+    invalid_spec: tr(
+      "このFormの設定として受け付けられませんでした。Formの公開仕様と照らし合わせてください。",
+      "This Host does not accept that spec for the Form. Check it against the Form's published contract.",
+    ),
+    name_conflict: tr(
+      "この名前は、この組織の別のリソースがすでに使っています（Formを問いません）。別の名前にしてください。",
+      "Another Resource in this organization already has that name, whatever its Form. Choose another name.",
+    ),
+    dependency_conflict: tr(
+      "関係するリソースの状態により、受け付けられませんでした。参照先のリソースが処理中か必要なFormではないか、削除の場合はまだこのリソースを参照しているリソースがあります。",
+      "Another Resource is in the way: one this change names is not settled or not of the Form required, or, for a delete, another Resource still names this one.",
+    ),
+    resource_busy: tr(
+      "このリソースは前の変更を処理中です。完了してからやり直してください。",
+      "This Resource is still applying an earlier change. Try again once it finishes.",
+    ),
+    generation_conflict: tr(
+      "ページを読み込んだ後に、このリソースが変更されました。再読み込みして内容を確認し、やり直してください。",
+      "This Resource changed after the page read it. Reload, check it, and try again.",
+    ),
+    idempotency_conflict: tr(
+      "同じキーで、内容の異なるリクエストがすでに送られています。再読み込みしてからやり直してください。",
+      "A different request was already sent under the same key. Reload, then try again.",
+    ),
+    gone: tr("このリソースは削除されています。", "This Resource has been deleted."),
+    temporarily_unavailable: tr(
+      "Hostが一時的に処理できません。少し待ってからやり直してください。",
+      "The Host cannot take this right now. Try again shortly.",
     ),
     conflict: tr(
       "先に別の変更が行われました。再読み込みしてやり直してください。",
       "Something else changed this first. Reload and try again.",
     ),
   };
-  return known[code] ?? tr(`サーバーが拒否しました: ${code}`, `The server refused this: ${code}`);
+  const sentence =
+    known[code] ?? tr(`サーバーが拒否しました: ${code}`, `The server refused this: ${code}`);
+  // The Host's own explanation is a specific English sentence: in English it
+  // replaces the general one, and in Japanese it follows it.
+  if (typeof detail !== "string" || detail === "") return sentence;
+  return tr(`${sentence}Hostからの説明（英語）：${detail}`, `${detail} (${code})`);
 }
 
 /* ------------------------------------------------------------------ json -- */
