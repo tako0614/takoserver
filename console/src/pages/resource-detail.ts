@@ -132,7 +132,21 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
           text(" "),
           badge(phaseLabel(state.phase), state.tone, true),
         ),
-        h("p", { class: "mono", style: { overflowWrap: "anywhere" } }, found.form),
+        h(
+          "p",
+          { class: "dim" },
+          h(
+            "a",
+            { href: found.form, target: "_blank", rel: "noopener noreferrer" },
+            formLabel(found.form),
+            h("span", { "aria-hidden": "true" }, " ↗"),
+            h(
+              "span",
+              { class: "visually-hidden" },
+              tr("（公開仕様、新しいタブで開きます）", " (published contract, opens in a new tab)"),
+            ),
+          ),
+        ),
         url
           ? h(
               "p",
@@ -200,7 +214,15 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
         field("Form", copyable(found.form)),
         field(tr("世代", "Generation"), String(found.generation)),
         field(tr("観測世代", "Observed generation"), String(found.observedGeneration)),
-        field(tr("段階", "Phase"), found.phase),
+        field(
+          tr("Hostの処理", "Host work"),
+          h(
+            "span",
+            null,
+            hostWork(found.phase),
+            h("span", { class: "mono dim" }, ` · ${found.phase}`),
+          ),
+        ),
         field(
           tr("最終操作", "Last operation"),
           found.lastOperation
@@ -256,7 +278,7 @@ function referencesCard(organizationId: string, references: readonly SpecReferen
       { class: "card__body rows" },
       ...references.map((reference) =>
         field(
-          reference.path,
+          h("span", { class: "mono" }, reference.path),
           live(() => {
             const state = named.get();
             const target = state.state === "ready" ? state.value.get(reference.uid) : undefined;
@@ -306,7 +328,7 @@ function referrersCard(organizationId: string, uid: string): Child {
         ...referrers.map(({ resource: referrer, paths }) => {
           const url = publishedUrl(referrer.output);
           return field(
-            tr(`${paths.join("、")} として`, `as ${paths.join(", ")}`),
+            h("span", { class: "mono" }, paths.join(", ")),
             h(
               "span",
               { class: "ref" },
@@ -328,7 +350,21 @@ function referrersCard(organizationId: string, uid: string): Child {
   });
 }
 
-function field(label: string, value: Child): Child {
+/** What the Host is doing with a Resource, from its v2 phase. */
+function hostWork(phase: ResourceSummary["phase"]): string {
+  switch (phase) {
+    case "pending":
+      return tr("処理中", "In progress");
+    case "deleting":
+      return tr("削除中", "Deleting");
+    case "error":
+      return tr("失敗", "Failed");
+    default:
+      return tr("なし（完了）", "None (settled)");
+  }
+}
+
+function field(label: Child, value: Child): Child {
   return h(
     "div",
     { class: "row" },
