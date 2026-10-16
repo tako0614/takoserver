@@ -348,7 +348,7 @@ test("resource detail calls a settled artifact Resource Applied", async () => {
   expect(body.textContent).not.toContain("Unknown");
 });
 
-test("overview leads with resources and shows the wallet only once it holds money", async () => {
+test("overview leads with resources and shows the wallet once it is in use", async () => {
   const { consoleLocale } = await import("../console/src/i18n.ts");
   const { organizations, selectOrganization, setApiOrigin } = await import(
     "../console/src/state.ts"
@@ -413,4 +413,5 @@ test("overview leads with resources and shows the wallet only once it holds mone
     },
   ]);
   expect(spent).toContain("Available");
+  expect(spent).toContain("$0");
 });
