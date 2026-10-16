@@ -415,3 +415,119 @@ test("overview leads with resources and shows the wallet once it is in use", asy
   expect(spent).toContain("Available");
   expect(spent).toContain("$0");
 });
+
+test("names each referenced Resource where the spec names it", async () => {
+  const { specReferences, publishedUrl } = await import("../console/src/pages/resource-detail.ts");
+  expect(
+    specReferences({
+      worker: { resourceUid: "uid-worker" },
+      bundle: { resourceUid: "uid-bundle" },
+      handlers: ["fetch"],
+      sqliteBindings: [{ name: "DB", resource: { resourceUid: "uid-db" } }],
+      versions: [{ workerVersion: { resourceUid: "uid-version" }, weight: 10000 }],
+      vars: { note: { resourceUid: "not-a-reference", extra: true }, CONFIG: { resourceUid: "x" } },
+    }),
+  ).toEqual([
+    { path: "worker", uid: "uid-worker" },
+    { path: "bundle", uid: "uid-bundle" },
+    { path: "sqliteBindings · DB", uid: "uid-db" },
+    { path: "versions[0] · workerVersion", uid: "uid-version" },
+  ]);
+  expect(specReferences({})).toEqual([]);
+  expect(publishedUrl({ hostname: "hello.example.com", url: "https://hello.example.com/" })).toBe(
+    "https://hello.example.com/",
+  );
+  expect(publishedUrl({ url: "http://hello.example.com/" })).toBeNull();
+  expect(publishedUrl({ url: "javascript:alert(1)" })).toBeNull();
+  expect(publishedUrl({})).toBeNull();
+});
+
+test("resource detail links the Resources a spec names and its published URL", async () => {
+  const body = installDom();
+  const { consoleLocale } = await import("../console/src/i18n.ts");
+  const { organizations, selectOrganization, setApiOrigin } = await import(
+    "../console/src/state.ts"
+  );
+  const { route } = await import("../console/src/router.ts");
+  const { resourceDetailPage } = await import("../console/src/pages/resource-detail.ts");
+  consoleLocale.set("en");
+  setApiOrigin("https://api.example.test");
+  organizations.set([
+    { id: "org-one", name: "One", ownerPrincipalId: "owner", createdAt: "2026-10-07" },
+  ]);
+  selectOrganization("org-one");
+  route.set({
+    path: "/resources/uid-version",
+    segments: ["resources", "uid-version"],
+    query: new URLSearchParams(),
+  });
+  const forms = "https://edge.forms.takoform.com/forms";
+  const summary = (uid: string, name: string, form: string, spec: unknown, output = {}) => ({
+    uid,
+    form: `${forms}/${form}/`,
+    space: "org-one",
+    name,
+    generation: 1,
+    observedGeneration: 1,
+    observedAt: "2026-10-07T00:00:00Z",
+    phase: "idle",
+    spec,
+    observed: {},
+    output,
+    lastOperation: `op-${uid}`,
+  });
+  const resources: Record<string, unknown> = {
+    "uid-version": summary(
+      "uid-version",
+      "hello-version-v1",
+      "WorkerVersion/0.5.0",
+      {
+        worker: { resourceUid: "uid-worker" },
+        bundle: { resourceUid: "uid-bundle" },
+        sqliteBindings: [{ name: "DB", resource: { resourceUid: "uid-gone" } }],
+        kvBindings: [{ name: "CACHE", resource: { resourceUid: "uid-broken" } }],
+      },
+      { url: "https://hello.apps.example.com/" },
+    ),
+    "uid-worker": summary("uid-worker", "hello", "ModuleWorker/0.3.0", {}),
+    "uid-bundle": summary("uid-bundle", "hello-bundle-v1", "WorkerBundle/0.2.0", {}),
+  };
+  const paths: string[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL) => {
+      const path = new URL(String(input)).pathname;
+      paths.push(path);
+      const uid = path.split("/").at(-1) ?? "";
+      if (uid === "uid-broken")
+        return Response.json({ error: { code: "internal" } }, { status: 500 });
+      const found = resources[uid];
+      return found
+        ? Response.json(found)
+        : Response.json({ error: { code: "not_found" } }, { status: 404 });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  body.append(resourceDetailPage("org-one", "uid-version") as unknown as NodeStub);
+  await settle();
+  expect(new Set(paths)).toEqual(
+    new Set(
+      ["uid-version", "uid-worker", "uid-bundle", "uid-gone", "uid-broken"].map(
+        (uid) => `/apis/forms.takoform.com/v2/resources/${uid}`,
+      ),
+    ),
+  );
+  const text = body.textContent;
+  expect(text).toContain("Referenced resources");
+  expect(text).toContain("sqliteBindings · DB");
+  expect(text).toContain("ModuleWorker 0.3.0");
+  expect(text).toContain("WorkerBundle 0.2.0");
+  expect(text).toContain("uid-gone — not in this organization");
+  expect(text).toContain("uid-broken — could not be read");
+  const links = body.all().filter((node) => node.tag === "a");
+  const worker = links.find((node) => node.textContent === "hello");
+  expect(worker?.attributes.get("href")).toBe("/resources/uid-worker");
+  const published = links.find((node) => node.textContent.startsWith("https://hello.apps"));
+  expect(published?.attributes.get("href")).toBe("https://hello.apps.example.com/");
+  expect(published?.attributes.get("target")).toBe("_blank");
+  expect(published?.attributes.get("rel")).toBe("noopener noreferrer");
+});
