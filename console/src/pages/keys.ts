@@ -1,6 +1,6 @@
 import type { ApiKey } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
-import { consoleLocale, tr } from "../i18n.ts";
+import { tr } from "../i18n.ts";
 import { DEFAULT_KEY_SCOPES, keyScopeGroups, keyUsage } from "../key-scopes.ts";
 import { resource } from "../reactive.ts";
 import { api, apiOrigin } from "../state.ts";
@@ -35,10 +35,19 @@ export function keysPage(organizationId: string): Child {
   const keys = resource(() => api.apiKeys(organizationId));
   // Asked once per page, so the dialog opens at once; until the answer comes
   // back, or if it never does, ai:invoke is simply not offered.
-  const ai = resource(() => api.aiAvailable());
+  const discovery = resource(() => api.hostDiscovery());
   const aiAvailable = (): boolean => {
-    const state = ai.get();
-    return state.state === "ready" && state.value;
+    const state = discovery.get();
+    return state.state === "ready" && state.value.ai;
+  };
+  // The Host names its v2 base from its public origin, the only authority v2
+  // answers; the console's own API origin may be a tunnel or an override.
+  const v2Endpoint = (): string => {
+    const state = discovery.get();
+    return (
+      (state.state === "ready" ? state.value.takoform : null) ??
+      `${apiOrigin()}/apis/forms.takoform.com/v2`
+    );
   };
 
   return h(
@@ -65,7 +74,7 @@ export function keysPage(organizationId: string): Child {
         {
           class: "btn btn--primary",
           type: "button",
-          onClick: () => createKey(organizationId, keys.reload, aiAvailable()),
+          onClick: () => createKey(organizationId, keys.reload, aiAvailable(), v2Endpoint()),
         },
         icon(ICON.plus, 14),
         text(tr("キーを作成", "Create key")),
@@ -191,7 +200,12 @@ function revoke(organizationId: string, key: ApiKey, reload: () => void): void {
   });
 }
 
-function createKey(organizationId: string, reload: () => void, aiAvailable: boolean): void {
+function createKey(
+  organizationId: string,
+  reload: () => void,
+  aiAvailable: boolean,
+  v2Endpoint: string,
+): void {
   const name = h("input", {
     class: "input",
     id: "create-key-name",
@@ -296,7 +310,7 @@ function createKey(organizationId: string, reload: () => void, aiAvailable: bool
         });
         close();
         reload();
-        revealSecret(organizationId, created.apiKey, created.secret);
+        revealSecret(organizationId, created.apiKey, created.secret, v2Endpoint);
       } catch (error) {
         toast(explain(error as Error), "bad");
       }
@@ -307,8 +321,13 @@ function createKey(organizationId: string, reload: () => void, aiAvailable: bool
 const INSTALL_GUIDE_STEPS =
   "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#8-create-and-serve-a-worker";
 
-function revealSecret(organizationId: string, key: ApiKey, secret: string): void {
-  const usage = keyUsage(apiOrigin(), organizationId, consoleLocale());
+function revealSecret(
+  organizationId: string,
+  key: ApiKey,
+  secret: string,
+  v2Endpoint: string,
+): void {
+  const usage = keyUsage(v2Endpoint, organizationId, key.scopes);
   openModal({
     title: tr("今すぐキーをコピーしてください", "Copy this key now"),
     dismissLabel: tr("完了", "Done"),
@@ -349,42 +368,56 @@ function revealSecret(organizationId: string, key: ApiKey, secret: string): void
             { class: "mono", style: { wordBreak: "break-all", flex: "1", minWidth: "0" } },
             secret,
           ),
-          copyable(secret, tr("コピー", "copy")),
+          copyable(secret, tr("キーをコピー", "copy key")),
         ),
       ),
-      h(
-        "div",
-        { class: "field" },
-        h(
-          "div",
-          {
-            style: {
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "space-between",
-              gap: "10px",
-            },
-          },
-          h("span", { class: "field__label" }, tr("使い方", "Use it")),
-          copyable(usage, tr("コピー", "copy")),
-        ),
-        // One command per line, as the shell reads it: scroll rather than wrap.
-        h("pre", { class: "json", style: { whiteSpace: "pre", overflowWrap: "normal" } }, usage),
-        h(
-          "small",
-          null,
-          tr(
-            "この組織のリソースを一覧します。作成と削除の手順は",
-            "This lists the organization's Resources. ",
+      usage === null
+        ? null
+        : h(
+            "div",
+            { class: "field" },
+            h(
+              "div",
+              {
+                style: {
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  gap: "10px",
+                },
+              },
+              h("span", { class: "field__label" }, tr("使い方", "Use it")),
+              copyable(usage, tr("コマンドをコピー", "copy commands")),
+            ),
+            // One command per line, as the shell reads it: scroll rather than wrap.
+            h(
+              "pre",
+              { class: "json", style: { whiteSpace: "pre", overflowWrap: "normal" } },
+              usage,
+            ),
+            h(
+              "small",
+              null,
+              tr(
+                "実行すると「API key:」と表示されるので、キーを貼り付けてEnterを押します。キーは画面に表示されず、シェルの履歴にも残りません。このコマンドは組織のリソースを一覧表示します。",
+                "Run it, paste the key at the API key: prompt and press Enter. The key is not shown and stays out of shell history. The command lists the organization's Resources.",
+              ),
+            ),
+            h(
+              "small",
+              null,
+              tr("作成と削除は", ""),
+              h(
+                "a",
+                { href: INSTALL_GUIDE_STEPS, target: "_blank", rel: "noopener noreferrer" },
+                tr("導入手順書（英語）の手順8〜11", "Steps 8 to 11 of the install guide"),
+              ),
+              tr(
+                "にあります。手順5の変数Fと、手順6で用意した成果物も使います。",
+                " create and delete them, using F from step 5 and the artifacts seeded in step 6.",
+              ),
+            ),
           ),
-          h(
-            "a",
-            { href: INSTALL_GUIDE_STEPS, target: "_blank", rel: "noopener noreferrer" },
-            tr("導入手順書の手順8〜11", "Steps 8 to 11 of the install guide"),
-          ),
-          tr("にあります。", " cover creating and deleting them."),
-        ),
-      ),
     ),
   });
 }

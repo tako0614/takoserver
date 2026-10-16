@@ -24,7 +24,7 @@ test("a new key can manage Resources and nothing else by default", () => {
   expect(grants(["resources:write"], "resources:read")).toBe(true);
 });
 
-test("reads AI availability from the Host's own discovery document", async () => {
+test("reads AI availability and the v2 base from the Host's own discovery document", async () => {
   const { createApi } = await import("../console/src/api.ts");
   const original = globalThis.fetch;
   const api = createApi({
@@ -36,29 +36,43 @@ test("reads AI availability from the Host's own discovery document", async () =>
     globalThis.fetch = Object.assign(async () => Response.json(body, { status }), {
       preconnect: original.preconnect,
     });
-    return await api.aiAvailable();
+    return await api.hostDiscovery();
   };
+  const v2 = "https://api.example.test/apis/forms.takoform.com/v2";
   try {
-    expect(await answer({ endpoints: { ai: "https://api.example.test/v1/ai" } })).toBe(true);
-    expect(await answer({ endpoints: { api: "https://api.example.test" } })).toBe(false);
-    expect(await answer({ endpoints: { ai: true } })).toBe(false);
-    expect(await answer({ endpoints: { ai: "https://api.example.test/v1/ai" } }, 503)).toBe(false);
+    expect(
+      await answer({ endpoints: { ai: "https://api.example.test/v1/ai", takoform: v2 } }),
+    ).toEqual({ ai: true, takoform: v2 });
+    expect(await answer({ endpoints: { api: "https://api.example.test" } })).toEqual({
+      ai: false,
+      takoform: null,
+    });
+    expect(await answer({ endpoints: { ai: true, takoform: 2 } })).toEqual({
+      ai: false,
+      takoform: null,
+    });
+    expect(
+      await answer({ endpoints: { ai: "https://api.example.test/v1/ai", takoform: v2 } }, 503),
+    ).toEqual({ ai: false, takoform: null });
   } finally {
     globalThis.fetch = original;
   }
 });
 
-test("shows a first request with the new key that keeps it out of shell history", () => {
-  expect(keyUsage("https://api.example.com:8443", "org_1b17", "ja")).toBe(
-    [
-      "HOST=https://api.example.com:8443",
-      "read -r KEY   # キーを貼り付けます。シェルの履歴には残りません",
-      'curl -sS -G "$HOST/apis/forms.takoform.com/v2/resources" \\',
-      "  --data-urlencode space=org_1b17 \\",
-      '  -H "authorization: Bearer $KEY"',
-    ].join("\n"),
-  );
-  expect(keyUsage("https://api.example.com:8443", "org_1b17", "en").split("\n")[1]).toBe(
-    "read -r KEY   # paste the key; it stays out of shell history",
-  );
+test("shows a first request in the install guide's names, only to a key that can read Resources", () => {
+  const v2 = "https://api.example.com:8443/apis/forms.takoform.com/v2";
+  const usage = [
+    `V2=${v2}`,
+    "ORG=org_1b17",
+    "printf 'API key: '; read -rs KEY; echo",
+    'curl -sS -G "$V2/resources" --data-urlencode "space=$ORG" \\',
+    '  -H "authorization: Bearer $KEY"',
+  ].join("\n");
+  expect(keyUsage(v2, "org_1b17", ["resources:read"])).toBe(usage);
+  expect(keyUsage(v2, "org_1b17", ["resources:write", "wallet:read"])).toBe(usage);
+  // No comment after a command: an interactive zsh would pass "#" to read.
+  expect(usage).not.toContain("#");
+  for (const scopes of [["wallet:read"], ["usage:read", "catalog:read"], ["ai:invoke"], []]) {
+    expect(keyUsage(v2, "org_1b17", scopes)).toBeNull();
+  }
 });

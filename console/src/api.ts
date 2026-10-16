@@ -36,6 +36,12 @@ export interface Organization {
   readonly createdAt: string;
 }
 
+export interface HostDiscovery {
+  readonly ai: boolean;
+  /** The Host API v2 base, such as `https://api.example.com/apis/forms.takoform.com/v2`. */
+  readonly takoform: string | null;
+}
+
 export interface ApiKey {
   readonly id: string;
   readonly organizationId: string;
@@ -442,20 +448,22 @@ export function createApi(options: ApiOptions) {
       return seconds;
     },
     /**
-     * Whether this Host serves `/v1/ai`, from its own discovery document. An
-     * unreadable document answers false rather than guessing.
+     * What this Host's own discovery document says it serves: whether it has
+     * `/v1/ai`, and the Host API v2 base it names from its public origin. An
+     * unreadable document answers neither rather than guessing.
      */
-    async aiAvailable(): Promise<boolean> {
+    async hostDiscovery(): Promise<HostDiscovery> {
+      const unknown: HostDiscovery = { ai: false, takoform: null };
       try {
         const { payload, status } = await request<unknown>("GET", "/.well-known/takoserver");
-        return (
-          status === 200 &&
-          isRecord(payload) &&
-          isRecord(payload.endpoints) &&
-          typeof payload.endpoints.ai === "string"
-        );
+        if (status !== 200 || !isRecord(payload) || !isRecord(payload.endpoints)) return unknown;
+        const { ai, takoform } = payload.endpoints;
+        return {
+          ai: typeof ai === "string",
+          takoform: typeof takoform === "string" ? takoform : null,
+        };
       } catch {
-        return false;
+        return unknown;
       }
     },
     identityProviders: () =>
