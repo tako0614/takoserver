@@ -83,11 +83,10 @@ stored artifacts) in a volume named `<project>_takoserver-data`, where
 clone named `takoserver`. Run every `docker compose` command from that directory,
 or pass the same `-p <project>`; from another directory Compose starts a new,
 empty installation. Keep the env file and its cursor key stable across restarts
-and updates. Do not set `TAKOSERVER_DB` or
-`TAKOSERVER_DATA_ROOT` outside that mount. A bind mount is also possible if its
-short absolute path and ancestry satisfy the operations guide, and its data
-directory is owned by UID/GID 1000 with mode 0700. Run only one Host per data
-volume.
+and updates. Do not set `TAKOSERVER_DB` or `TAKOSERVER_DATA_ROOT` outside that
+mount. A bind mount is also possible if its short absolute path and ancestry
+satisfy the operations guide, and its data directory is owned by UID/GID 1000
+with mode 0700. Run only one Host per data volume.
 
 To use Docker directly instead of Compose, choose a fresh dedicated name and
 volume. The rest of this guide uses Compose; with `docker run`, use
@@ -96,7 +95,7 @@ and adapt the stop, volume and backup commands of the update steps the same way.
 
 ```sh
 docker run -d --init --stop-timeout 30 --name takoserver-selfhost \
-  --env-file "$TAKOSERVER_ENV_FILE" \
+  --env-file ~/.config/takoserver/docker.env \
   -p 127.0.0.1:8787:8787 \
   --mount type=volume,source=takoserver-selfhost-data,target=/var/lib/takoserver \
   takoserver-selfhost:local
@@ -202,9 +201,20 @@ To update, in the same checkout directory:
    `docker compose up -d --no-build`.
 3. Rerun the health, discovery and support checks above.
 
-Going back means stopping this Host, restoring the copy into a fresh volume and
-starting `takoserver-selfhost:before-<date>` with it (`compose.yaml` takes its
-image from `TAKOSERVER_DOCKER_IMAGE`), not reverting only the image.
+Going back means restoring the copy into a fresh volume and starting
+`takoserver-selfhost:before-<date>` with it (`compose.yaml` takes its image from
+`TAKOSERVER_DOCKER_IMAGE`), not reverting only the image. With this Host stopped,
+a new project name gives a fresh volume:
+
+```sh
+docker compose stop
+docker compose -p takoserver-restore run --rm --no-deps -T --entrypoint tar takoserver \
+  -C /var/lib/takoserver -xpf - < ~/takoserver-backups/takoserver-data-<date>.tar
+TAKOSERVER_DOCKER_IMAGE=takoserver-selfhost:before-<date> \
+  docker compose -p takoserver-restore up -d --no-build
+```
+
+From then on, pass `-p takoserver-restore` to every `docker compose` command.
 
 Run the explicit local regression check from the checkout with Bun installed:
 
