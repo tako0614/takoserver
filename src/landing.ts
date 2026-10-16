@@ -41,12 +41,12 @@ const landingMessages = {
     source: "Source code",
     preview: "Resources in the Takoserver Console · public sample data",
     previewAlt:
-      "The Takoserver Console's Resources page: a Worker named hello with its version, deployment and endpoint all Ready, its bundle, and a SQLite database, in public sample data",
+      "The Takoserver Console's Resources page: a Worker named hello with its version, deployment and endpoint all Ready, its WorkerBundle, and a SQLite database, in public sample data",
     formsTitle: "What you can deploy",
     formsBody:
-      "Takoform describes each kind of resource, such as a Worker, a database or a queue, as a Form: a definition published at a versioned URL, so the resource means the same on every Host that supports it. Takoserver runs these Forms.",
+      "Takoform describes each kind of resource, such as a Worker, a database or a queue, as a Form: a definition its publisher serves at a versioned URL, so the resource means the same on every Host that supports it. Takoserver runs these Forms.",
     formsNeeds:
-      "Artifacts need only Bun; everything else needs the Worker runtime of step 2 below. A running Host answers, for each Form URL, whether it serves that Form.",
+      "Artifacts need only Bun and a line in the Host's settings. Everything else needs the Worker runtime of step 2 below, and publishing at a hostname also needs step 3. A running Host answers, for each Form URL, whether it serves that Form.",
     takoform: "About Takoform",
     artifactsTitle: "Artifacts",
     artifactsBody: "Worker code, static files and SQL migrations, pinned by URL and SHA-256.",
@@ -61,13 +61,13 @@ const landingMessages = {
       "At-least-once queues and their consumers, actors that keep state, and durable workflows.",
     hostTitle: "Run your own Host",
     hostStep1:
-      "Use a Linux x86-64 machine with Bun. Check out a reviewed commit and install its locked dependencies.",
+      "Use a Linux x86-64 machine with Bun. Check out a reviewed commit (a release tag keeps it matched with that release's workerd) and install its locked dependencies.",
     hostStep2:
       "Add the Worker runtime: the pinned workerd from a GitHub Release, checked against its SHA256SUMS, and the Workflow execution guard, a small Go program built from the same checkout.",
     hostStep3:
-      "Give it HTTPS. Put the API behind a front end such as Caddy. For Workers, get a wildcard DNS name and certificate, such as *.apps.example.com, which the Host serves on port 443.",
+      "Give it HTTPS. For Workers, get a wildcard DNS name and certificate, such as *.apps.example.com; a wildcard certificate is issued through a DNS challenge, which needs your DNS provider's API. The Host serves Workers on port 443 itself, so put the API behind a front end such as Caddy on another port, such as 8443.",
     hostStep4:
-      "Write its settings and start it. Without an identity provider, the first boot prints a single-use operator sign-in assertion.",
+      "Write its settings and start it. Three are always required; the Worker runtime and HTTPS add their own (step 3 of the install guide), and a partial Worker setup offers no Worker Forms. Without an identity provider, the first boot prints a single-use operator sign-in assertion.",
     hostNote:
       "Without the Worker runtime and port 443, the Host still keeps artifacts and serves the API, sign-in, organizations and keys. To try that much quickly, use Docker.",
     releases: "GitHub Releases",
@@ -80,11 +80,12 @@ const landingMessages = {
     createLabel:
       "Each create is one POST. Sent again with the same idempotency-key within 24 hours, it returns the same Operation instead of a second Worker.",
     workerStep: "is the Worker itself. Its versions, deployment and endpoint refer to it.",
-    bundleStep: "names the bytes of worker.js held by the Host, by URL and SHA-256.",
+    bundleStep:
+      "names the bytes of worker.js by URL and SHA-256. Publish it over public HTTPS and the Host fetches it, or seed it onto the Host beforehand.",
     versionStep: "pairs that bundle with its fetch handler.",
     deploymentStep: "chooses which version serves: here one version, weight 10000.",
     endpointStep: "publishes the Worker at an HTTPS hostname.",
-    resultLabel: "Then request it:",
+    resultLabel: "Then request it, with the UID the Endpoint's create returned in $ENDPOINT:",
     deployMore: "Steps 6 to 9 in the guide",
     afterTitle: "After you deploy",
     consoleTitle: "In the console",
@@ -110,12 +111,12 @@ const landingMessages = {
     source: "ソースコード",
     preview: "Takoserver Consoleのリソース一覧（公開用サンプルデータ）",
     previewAlt:
-      "Takoserver Consoleのリソース一覧。helloというWorkerとその版・配信・公開先が稼働中で、bundleとSQLiteデータベースも並んでいます（公開用サンプルデータ）",
+      "Takoserver Consoleのリソース一覧。helloというWorkerとその版・配信・公開先が稼働中で、WorkerBundleとSQLiteデータベースも並んでいます（公開用サンプルデータ）",
     formsTitle: "デプロイできるもの",
     formsBody:
-      "Takoformは、Worker・データベース・キューといったリソースの種類ごとに、Formと呼ぶ定義をバージョン付きのURLで公開します。対応するHostであれば、どこでも同じ意味のリソースになります。Takoserverは次のFormを動かせます。",
+      "Takoformでは、Worker・データベース・キューといったリソースの種類ごとの定義をFormと呼び、公開元がバージョン付きのURLで公開します。対応するHostであれば、どこでも同じ意味のリソースになります。Takoserverは次のFormを動かせます。",
     formsNeeds:
-      "成果物はBunだけで使えます。それ以外には、下の手順2のWorker実行環境が必要です。動いているHostには、Form URLごとに対応しているかを問い合わせられます。",
+      "成果物は、Bunと設定への1行の追加だけで使えます。それ以外には下の手順2のWorker実行環境が必要で、ホスト名で公開するには手順3も必要です。動いているHostには、Form URLごとに対応しているかを問い合わせられます。",
     takoform: "Takoformについて",
     artifactsTitle: "成果物",
     artifactsBody:
@@ -129,13 +130,13 @@ const landingMessages = {
     asyncBody: "少なくとも一度届くキューとその受信、状態を持つActor、永続するWorkflowです。",
     hostTitle: "自分のHostを動かす",
     hostStep1:
-      "Linux x86-64のマシンとBunを用意します。reviewしたcommitを取り出し、lockfileで固定された依存関係をインストールします。",
+      "Linux x86-64のマシンとBunを用意します。レビュー済みのコミットを取り出し（リリースのタグなら、そのリリースのworkerdと揃います）、ロックファイルで固定された依存関係をインストールします。",
     hostStep2:
-      "Workerの実行環境を加えます。GitHub Releaseにある固定版のworkerdをSHA256SUMSで確認して置き、同じcheckoutからGoでbuildする小さなプログラム、Workflow execution guardを用意します。",
+      "Workerの実行環境を加えます。GitHub Releaseにある固定版のworkerdをSHA256SUMSで確認して置き、Workflow execution guard（同じチェックアウトからGoでビルドする小さなプログラム）を用意します。",
     hostStep3:
-      "HTTPSを用意します。APIはCaddyなどのフロントエンドの背後に置きます。Workerの公開には、*.apps.example.comのようなワイルドカードのDNS名と証明書を用意し、Hostが443番で配信します。",
+      "HTTPSを用意します。Worker用に、*.apps.example.comのようなワイルドカードのDNS名と証明書を用意します。ワイルドカード証明書はDNSチャレンジで発行するため、DNSプロバイダーのAPIが必要です。443番はHost自身がWorkerの配信に使うので、APIはCaddyなどのフロントエンドの背後に、8443番など別のポートで置きます。",
     hostStep4:
-      "設定を書いて起動します。IDプロバイダーが未設定なら、初回起動時に一度だけ使える運営者サインイン用のassertionが表示されます。",
+      "設定を書いて起動します。常に必要な設定は3つで、Worker実行環境とHTTPSにはそれぞれ追加の設定があります（導入手順書の手順3）。Worker実行環境の設定が一部でも欠けると、Worker関連のFormは提供されません。IDプロバイダーが未設定なら、初回起動時に一度だけ使える運営者サインイン用のassertionが表示されます。",
     hostNote:
       "Worker実行環境と443番がなくても、Hostは成果物を保持し、API・サインイン・組織・APIキーを提供します。そこまでを手早く試すならDockerを使えます。",
     releases: "GitHub Releases",
@@ -148,11 +149,12 @@ const landingMessages = {
     createLabel:
       "作成は1回のPOSTです。24時間以内に同じidempotency-keyで送り直すと、2つ目のWorkerは作らず同じOperationを返します。",
     workerStep: "Workerそのものです。版・配信・公開先はこれを参照します。",
-    bundleStep: "Hostに保持したworker.jsの内容を、URLとSHA-256で指定します。",
-    versionStep: "そのbundleとfetchハンドラーを組み合わせた版です。",
+    bundleStep:
+      "worker.jsの内容をURLとSHA-256で指定します。公開HTTPSに置けばHostが取得し、Hostへ事前に保持させることもできます。",
+    versionStep: "そのWorkerBundleとfetchハンドラーを組み合わせた版です。",
     deploymentStep: "どの版を配信するかを決めます。ここでは1つの版を重み10000で配信します。",
     endpointStep: "WorkerをHTTPSのホスト名で公開します。",
-    resultLabel: "公開したら、リクエストします。",
+    resultLabel: "公開したら、Endpointの作成で返ったUIDを$ENDPOINTに入れてリクエストします。",
     deployMore: "手順書の手順6〜9",
     afterTitle: "デプロイしたあと",
     consoleTitle: "コンソールで",
@@ -349,6 +351,8 @@ footer { display: flex; align-items: center; justify-content: space-between; fle
 .error .pill { margin-top: 28px; }
 
 @media (min-width: 761px) and (max-width: 1100px) { .preview .frame { max-width: 848px; margin-inline: auto; } }
+/* Below desktop width the code beside each list would scroll sideways, so the columns stack. */
+@media (max-width: 1100px) { .deploy, .host { grid-template-columns: minmax(0, 1fr); gap: 24px; } }
 @media (max-width: 760px) {
   .shell { width: calc(100% - 32px); }
   .top { height: 72px; }

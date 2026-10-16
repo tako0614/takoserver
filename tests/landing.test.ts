@@ -54,12 +54,16 @@ describe("Takoserver public site", () => {
       expect(html).toContain(`<code>${form}</code>`);
     }
     expect(html).toContain("Takoform describes each kind of resource");
-    expect(html).toContain('<a href="https://takoform.com" data-i18n="takoform">About Takoform</a>');
     expect(html).toContain(
-      "Artifacts need only Bun; everything else needs the Worker runtime of step 2 below.",
+      '<a href="https://takoform.com" data-i18n="takoform">About Takoform</a>',
+    );
+    expect(html).toContain(
+      "Artifacts need only Bun and a line in the Host's settings. Everything else needs the Worker runtime of step 2 below, and publishing at a hostname also needs step 3.",
     );
     // The marketing page names what an operator does, not the Host's internal profile.
-    expect(html).not.toMatch(/local Worker profile|data plane|bundle block|selfhost-v2-worker-primary/u);
+    expect(html).not.toMatch(
+      /local Worker profile|data plane|bundle block|selfhost-v2-worker-primary/u,
+    );
   });
 
   test("walks one Worker through the guide's create chain to its response", () => {
@@ -94,7 +98,9 @@ describe("Takoserver public site", () => {
     expect(html).toContain("<code>TAKOSERVER_TAKOFORM_V2_CURSOR_KEY</code>");
     expect(html).toContain("bun --no-env-file src/entry-bun.ts");
     // What a Worker Host needs, in plain terms: workerd, the guard, HTTPS and a wildcard name.
-    expect(html).toContain("the pinned workerd from a GitHub Release, checked against its SHA256SUMS");
+    expect(html).toContain(
+      "the pinned workerd from a GitHub Release, checked against its SHA256SUMS",
+    );
     expect(html).toContain("the Workflow execution guard, a small Go program");
     expect(html).toContain("a wildcard DNS name and certificate, such as *.apps.example.com");
     expect(html).toContain('href="https://github.com/tako0614/takoserver/releases"');
