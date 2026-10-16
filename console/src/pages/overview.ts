@@ -6,7 +6,7 @@ import {
 } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
 import { firstRunNote, once } from "../first-run.ts";
-import { valueAt, WORKER_ENDPOINT, WORKER_VERSION } from "../form-specs.ts";
+import { valueAt, WORKER_BUNDLE, WORKER_ENDPOINT, WORKER_VERSION } from "../form-specs.ts";
 import { formName } from "../forms.ts";
 import { consoleLocale, tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
@@ -346,19 +346,33 @@ function nextStep(
     );
   const step = (label: string, onClick: () => void) =>
     h("button", { class: "btn btn--sm", type: "button", onClick }, label);
+  const row = (...children: Child[]) => h("span", { class: "ref" }, ...children);
   if (deployment) {
-    if (namingWorker(all, WORKER_ENDPOINT, worker.uid).length > 0)
-      return dim(tr("公開先を準備中です", "Its address is being prepared"));
-    return h(
-      "span",
-      { class: "ref" },
+    const [endpoint] = namingWorker(all, WORKER_ENDPOINT, worker.uid);
+    if (endpoint) {
+      // An Endpoint without an address says how it stands, by its own state.
+      const phase = health(endpoint).phase;
+      const link = h("a", { ...linkProps(resourcePath(endpoint.uid)) }, endpoint.name);
+      return phase === "Pending" || phase === "Ready" || phase === "Applied"
+        ? dim(tr("公開先を準備中です", "Its address is being prepared"))
+        : phase === "Deleting"
+          ? row(dim(tr("公開先を削除中です：", "Its Endpoint is being deleted: ")), link)
+          : row(dim(tr("公開に失敗しました：", "Publishing failed: ")), link);
+    }
+    // The Host publishes only a settled, ready Deployment whose versions serve HTTP.
+    const phase = health(deployment).phase;
+    if (phase === "Pending")
+      return dim(tr("配信の完了を待っています", "Waiting for the deployment to finish"));
+    if (phase !== "Ready") return null;
+    if (!servesHttp(all, deployment)) return null;
+    return row(
       dim(tr("公開先はまだありません", "Not published yet")),
-      step(tr("公開する", "Publish"), () =>
+      step(tr(`${worker.name}を公開する`, `Publish ${worker.name}`), () =>
         createResource(organizationId, {
           form: WORKER_ENDPOINT,
           spec: { worker: { resourceUid: worker.uid } },
           note: tr(
-            `${worker.name}をHTTPSのホスト名で公開するWorkerEndpointを作成します。名前を付けて受け付けてください。`,
+            `${worker.name}をHTTPSのホスト名で公開するWorkerEndpointを作成します。名前を付けて「受け付ける」を押してください。`,
             `This creates a WorkerEndpoint that publishes ${worker.name} at an HTTPS hostname. Name it, then accept.`,
           ),
         }),
@@ -366,12 +380,25 @@ function nextStep(
     );
   }
   const versions = namingWorker(all, WORKER_VERSION, worker.uid);
-  if (versions.length === 0)
-    return h(
-      "span",
-      { class: "ref" },
+  if (versions.length === 0) {
+    // A version names its code, so code comes first.
+    if (!all.some((resource) => resource.form === WORKER_BUNDLE))
+      return row(
+        dim(tr("コードはまだありません", "No code yet")),
+        step(tr(`${worker.name}のコードを追加する`, `Add code for ${worker.name}`), () =>
+          createResource(organizationId, {
+            form: WORKER_BUNDLE,
+            spec: { artifact: { url: "", sha256: "" } },
+            note: tr(
+              `${worker.name}のコードを、manifestのURLとSHA-256でWorkerBundleとして追加します。その後、版を作ります。`,
+              `This adds the code for ${worker.name} as a WorkerBundle, by its manifest's URL and SHA-256. Then create a version.`,
+            ),
+          }),
+        ),
+      );
+    return row(
       dim(tr("版はまだありません", "No version yet")),
-      step(tr("版を作る", "Create a version"), () =>
+      step(tr(`${worker.name}の版を作る`, `Create a version of ${worker.name}`), () =>
         createResource(organizationId, {
           form: WORKER_VERSION,
           spec: {
@@ -380,17 +407,16 @@ function nextStep(
             handlers: ["fetch"],
           },
           note: tr(
-            `${worker.name}の版を作成します。コードのWorkerBundleを選び、名前を付けて受け付けてください。`,
+            `${worker.name}の版を作成します。コードのWorkerBundleを選び、名前を付けて「受け付ける」を押してください。`,
             `This creates a version of ${worker.name}. Choose its WorkerBundle, name it, then accept.`,
           ),
         }),
       ),
     );
+  }
   // Serving is decided on the version's own page, where its readiness is known.
   const [only] = versions;
-  return h(
-    "span",
-    { class: "ref" },
+  return row(
     dim(tr("配信中の版はありません", "No deployment yet")),
     versions.length === 1 && only
       ? h(
@@ -404,9 +430,29 @@ function nextStep(
             class: "btn btn--sm",
             ...linkProps(`/resources?form=${encodeURIComponent(WORKER_VERSION)}`),
           },
-          tr("版を選んで配信する", "Choose a version to serve"),
+          tr(`${worker.name}の版を選んで配信する`, `Choose a version of ${worker.name} to serve`),
         ),
   );
+}
+
+/**
+ * Whether the versions a Deployment serves answer HTTP: each declares the
+ * `fetch` handler or serves static assets. A version not on this page is not
+ * held against it.
+ */
+function servesHttp(all: readonly ResourceSummary[], deployment: ResourceSummary): boolean {
+  const served = valueAt(deployment.spec, ["versions"]);
+  if (!Array.isArray(served)) return false;
+  return served.every((entry) => {
+    const uid = valueAt(entry, ["workerVersion", "resourceUid"]);
+    const version = all.find((resource) => resource.uid === uid);
+    if (!version) return true;
+    const handlers = valueAt(version.spec, ["handlers"]);
+    return (
+      (Array.isArray(handlers) && handlers.includes("fetch")) ||
+      valueAt(version.spec, ["assets"]) !== undefined
+    );
+  });
 }
 
 /**

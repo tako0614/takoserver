@@ -2,7 +2,7 @@ const EDGE = "https://edge.forms.takoform.com/forms";
 const form = (kind: string, version: string): string => `${EDGE}/${kind}/${version}/`;
 
 const MODULE_WORKER = form("ModuleWorker", "0.3.0");
-const WORKER_BUNDLE = form("WorkerBundle", "0.2.0");
+export const WORKER_BUNDLE = form("WorkerBundle", "0.2.0");
 export const WORKER_VERSION = form("WorkerVersion", "0.5.0");
 export const WORKER_DEPLOYMENT = form("WorkerDeployment", "0.4.0");
 export const WORKER_ENDPOINT = form("WorkerEndpoint", "0.3.0");

@@ -364,11 +364,11 @@ function serveVersionAction(organizationId: string, version: ResourceSummary): C
                   split +
                   (split
                     ? tr(
-                        `${deployment.name}を更新します。内容を確認して受け付けてください。`,
+                        `${deployment.name}を更新します。内容を確認して「更新を受け付ける」を押してください。`,
                         `This updates ${deployment.name}. Check it, then accept.`,
                       )
                     : tr(
-                        `${deployment.name}を更新し、${version.name}だけを重み10000で配信します。内容を確認して受け付けてください。`,
+                        `${deployment.name}を更新し、${version.name}だけを重み10000で配信します。内容を確認して「更新を受け付ける」を押してください。`,
                         `This updates ${deployment.name} to serve only ${version.name}, at weight 10000. Check it, then accept.`,
                       )),
               })
@@ -376,7 +376,7 @@ function serveVersionAction(organizationId: string, version: ResourceSummary): C
                 form: WORKER_DEPLOYMENT,
                 spec: { worker: { resourceUid: workerUid }, versions },
                 note: tr(
-                  `このWorkerにはまだ配信（WorkerDeployment）がありません。${version.name}を配信するWorkerDeploymentを作成します。名前を付けて受け付けてください。`,
+                  `このWorkerにはまだ配信（WorkerDeployment）がありません。${version.name}を配信するWorkerDeploymentを作成します。名前を付けて「受け付ける」を押してください。`,
                   `This Worker has no Deployment yet. This creates one that serves ${version.name}. Name it, then accept.`,
                 ),
               }),

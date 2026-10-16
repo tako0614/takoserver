@@ -826,10 +826,36 @@ async function overviewWith(items: ResourceSummary[]) {
   return { body, route };
 }
 
-test("a Worker with nothing else offers to create its first version", async () => {
+const bundle = workerItem("uid-bundle", "hello-bundle", "WorkerBundle/0.2.0", {});
+const fetchVersion = workerItem("uid-v1", "hello-v1", "WorkerVersion/0.5.0", {
+  ...named,
+  handlers: ["fetch"],
+});
+const deploymentOfV1 = (change: Partial<ResourceSummary> = {}) => ({
+  ...workerItem("uid-dep", "hello-deployment", "WorkerDeployment/0.4.0", {
+    versions: [{ weight: 10000, workerVersion: { resourceUid: "uid-v1" } }],
+    ...named,
+  }),
+  observed: { active: true, ready: true },
+  ...change,
+});
+
+test("a Worker without code offers to add it first", async () => {
   const { body } = await overviewWith([hello]);
+  expect(body.textContent).toContain("No code yet");
+  button(body, "Add code for hello").click();
+  await settle();
+  const [form] = body.all().filter((node) => node.tag === "select");
+  expect(form?.value).toBe(edgeKind("WorkerBundle/0.2.0"));
+  expect(JSON.parse(body.all().find((node) => node.tag === "textarea")?.value ?? "{}")).toEqual({
+    artifact: { url: "", sha256: "" },
+  });
+});
+
+test("a Worker with code and no version offers to create its first version", async () => {
+  const { body } = await overviewWith([hello, bundle]);
   expect(body.textContent).toContain("No version yet");
-  button(body, "Create a version").click();
+  button(body, "Create a version of hello").click();
   await settle();
   expect(body.textContent).toContain("This creates a version of hello.");
   const [form] = body.all().filter((node) => node.tag === "select");
@@ -843,23 +869,17 @@ test("a Worker with nothing else offers to create its first version", async () =
 });
 
 test("a Worker with one version and no Deployment links to serving that version", async () => {
-  const version = workerItem("uid-v1", "hello-v1", "WorkerVersion/0.5.0", named);
-  const { body } = await overviewWith([hello, version]);
+  const { body } = await overviewWith([hello, bundle, fetchVersion]);
   const serve = body
     .all()
     .find((node) => node.tag === "a" && node.textContent === "Serve hello-v1");
   expect(serve?.attributes.get("href")).toBe("/resources/uid-v1");
 });
 
-test("a deployed Worker without an address offers to publish it", async () => {
-  const version = workerItem("uid-v1", "hello-v1", "WorkerVersion/0.5.0", named);
-  const deployment = workerItem("uid-dep", "hello-deployment", "WorkerDeployment/0.4.0", {
-    ...named,
-    versions: [{ weight: 10000, workerVersion: { resourceUid: "uid-v1" } }],
-  });
-  const { body } = await overviewWith([hello, version, deployment]);
+test("a ready Deployment serving HTTP without an address offers to publish it", async () => {
+  const { body } = await overviewWith([hello, bundle, fetchVersion, deploymentOfV1()]);
   expect(body.textContent).toContain("Not published yet");
-  button(body, "Publish").click();
+  button(body, "Publish hello").click();
   await settle();
   expect(body.textContent).toContain("This creates a WorkerEndpoint that publishes hello");
   const [form] = body.all().filter((node) => node.tag === "select");
@@ -868,17 +888,41 @@ test("a deployed Worker without an address offers to publish it", async () => {
   expect(JSON.parse(spec?.value ?? "{}")).toEqual(named);
 });
 
-test("an Endpoint still without an address is reported, not offered again", async () => {
-  const deployment = workerItem("uid-dep", "hello-deployment", "WorkerDeployment/0.4.0", {
+test("publishing is not offered where the Host would refuse it", async () => {
+  const hasPublish = (body: TestNode) =>
+    body.all().some((node) => node.tag === "button" && node.textContent === "Publish hello");
+  // A Deployment still being applied.
+  const pending = await overviewWith([
+    hello,
+    bundle,
+    fetchVersion,
+    deploymentOfV1({ generation: 2, observedGeneration: 1 }),
+  ]);
+  expect(pending.body.textContent).toContain("Waiting for the deployment to finish");
+  expect(hasPublish(pending.body)).toBe(false);
+  // A Worker that only runs on a schedule answers no HTTP.
+  const scheduled = workerItem("uid-v1", "hello-v1", "WorkerVersion/0.5.0", {
     ...named,
-    versions: [{ weight: 10000, workerVersion: { resourceUid: "uid-v1" } }],
+    handlers: ["scheduled"],
   });
+  const cron = await overviewWith([hello, bundle, scheduled, deploymentOfV1()]);
+  expect(hasPublish(cron.body)).toBe(false);
+});
+
+test("an Endpoint without an address says how it stands", async () => {
   const endpoint = workerItem("uid-end", "hello-endpoint", "WorkerEndpoint/0.3.0", named);
-  const { body } = await overviewWith([hello, deployment, endpoint]);
-  expect(body.textContent).toContain("Its address is being prepared");
-  expect(body.all().some((node) => node.tag === "button" && node.textContent === "Publish")).toBe(
-    false,
-  );
+  const preparing = await overviewWith([hello, deploymentOfV1(), { ...endpoint, generation: 2 }]);
+  expect(preparing.body.textContent).toContain("Its address is being prepared");
+  const failed = await overviewWith([
+    hello,
+    deploymentOfV1(),
+    { ...endpoint, phase: "error", generation: 2 },
+  ]);
+  expect(failed.body.textContent).toContain("Publishing failed: hello-endpoint");
+  const link = failed.body
+    .all()
+    .find((node) => node.tag === "a" && node.textContent === "hello-endpoint");
+  expect(link?.attributes.get("href")).toBe("/resources/uid-end");
 });
 
 test("create falls back to the exact URL field when the Host answers no Form", async () => {
