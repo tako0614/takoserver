@@ -718,9 +718,15 @@ test("a version a Deployment already names alone reports how that change stands"
   const pending = await versionPage([deploymentOf(only, { observedGeneration: 2 })]);
   expect(pending.body.textContent).toContain("The Deployment is updating: hello-deployment");
   expect(pending.body.textContent).not.toContain("Serving this version");
-  const failed = await versionPage([deploymentOf(only, { phase: "error" })]);
+  // As a real Host leaves them: a failed or deleting change raised the
+  // generation, and the Host never observed it.
+  const failed = await versionPage([
+    deploymentOf(only, { phase: "error", generation: 4, observedGeneration: 3 }),
+  ]);
   expect(failed.body.textContent).toContain("The Deployment's update failed: hello-deployment");
-  const deleting = await versionPage([deploymentOf(only, { phase: "deleting" })]);
+  const deleting = await versionPage([
+    deploymentOf(only, { phase: "deleting", generation: 4, observedGeneration: 3 }),
+  ]);
   expect(deleting.body.textContent).toContain("The Deployment is being deleted: hello-deployment");
   expect(deleting.body.textContent).not.toContain("Serving this version");
   const unread = await versionPage([deploymentOf(only, { observedAt: null })]);

@@ -323,19 +323,17 @@ function serveVersionAction(organizationId: string, version: ResourceSummary): C
       const link = h("a", { ...linkProps(resourcePath(deployment.uid)) }, deployment.name);
       const settled = health(deployment);
       // Only a settled, healthy Deployment is said to serve; every other state
-      // says what it is.
-      const words =
-        settled.stale || settled.phase === "Pending"
-          ? tr("配信を更新中です：", "The Deployment is updating: ")
-          : settled.phase === "Ready" || settled.phase === "Applied"
-            ? tr("この版を配信中です：", "Serving this version: ")
-            : settled.phase === "Failed"
-              ? tr("配信の更新に失敗しました：", "The Deployment's update failed: ")
-              : settled.phase === "NotReady"
-                ? tr("配信の準備ができていません：", "The Deployment is not ready: ")
-                : settled.phase === "Deleting"
-                  ? tr("配信を削除中です：", "The Deployment is being deleted: ")
-                  : tr("配信の状態を確認できません：", "The Deployment's state is unknown: ");
+      // says what it is. health() already puts Deleting and Failed before a
+      // change not yet observed (Pending), so the phase alone decides.
+      const words = {
+        Pending: () => tr("配信を更新中です：", "The Deployment is updating: "),
+        Ready: () => tr("この版を配信中です：", "Serving this version: "),
+        Applied: () => tr("この版を配信中です：", "Serving this version: "),
+        Failed: () => tr("配信の更新に失敗しました：", "The Deployment's update failed: "),
+        NotReady: () => tr("配信の準備ができていません：", "The Deployment is not ready: "),
+        Deleting: () => tr("配信を削除中です：", "The Deployment is being deleted: "),
+        Unknown: () => tr("配信の状態を確認できません：", "The Deployment's state is unknown: "),
+      }[settled.phase]();
       return h("span", { class: "dim published" }, words, link);
     }
     // The Host refuses a Deployment of a version that is not ready.
