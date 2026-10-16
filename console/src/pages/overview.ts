@@ -123,7 +123,7 @@ export function overviewPage(organization: Organization): Child {
                 tr("リソース", "Resources"),
                 empty(
                   tr("リソースがありません", "Nothing declared yet"),
-                  firstRunNote(),
+                  firstRunNote(organization.id),
                   h(
                     "button",
                     {

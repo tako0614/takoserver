@@ -277,7 +277,10 @@ export function resourcesPage(organizationId: string): Child {
               h(
                 "div",
                 { style: { display: "grid", gap: "12px" } },
-                empty(tr("リソースがありません", "Nothing declared yet"), firstRunNote()),
+                empty(
+                  tr("リソースがありません", "Nothing declared yet"),
+                  firstRunNote(organizationId),
+                ),
                 pagingError(),
                 nextCursor ? moreButton(nextCursor) : null,
               ),

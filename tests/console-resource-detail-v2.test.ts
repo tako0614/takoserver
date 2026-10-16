@@ -240,7 +240,10 @@ test("overview counts only what it read and offers the first create", async () =
     output: {},
     lastOperation: "op-one",
   };
-  const render = async (page: { items: unknown[]; nextCursor: string | null }) => {
+  const render = async (
+    page: { items: unknown[]; nextCursor: string | null },
+    runsWorkers?: boolean,
+  ) => {
     const body = installDom();
     consoleLocale.set("en");
     setApiOrigin("https://api.example.test");
@@ -263,6 +266,14 @@ test("overview counts only what it read and offers the first create", async () =
             },
           });
         if (path.endsWith("/operations")) return Response.json({ operations: [] });
+        if (path.endsWith("/support") && runsWorkers !== undefined) {
+          const form = new URL(String(input)).searchParams.get("form");
+          return Response.json({
+            form,
+            supported: runsWorkers,
+            operations: runsWorkers ? ["create", "read", "update", "delete"] : [],
+          });
+        }
         return Response.json(page);
       },
       { preconnect: globalThis.fetch.preconnect },
@@ -304,13 +315,33 @@ test("overview counts only what it read and offers the first create", async () =
   expect(none.textContent).toContain("none yet");
   expect(none.textContent).toContain("Nothing declared yet");
   // A new organization is told how a Worker comes to be served, not to ask for a URL.
+  // Until the Host says whether it runs Workers, the steps are qualified.
   expect(none.textContent).toContain(
-    "five Resources are created in this order: ModuleWorker, WorkerBundle, WorkerVersion, WorkerDeployment and WorkerEndpoint",
+    "On a Host that runs Workers, a Worker is served once five Resources are created in this order: ModuleWorker, WorkerBundle, WorkerVersion, WorkerDeployment and WorkerEndpoint",
   );
   expect(none.textContent).not.toContain("supplied by the operator");
   const guide = none.all().find((node) => node.tag === "a");
   expect(guide?.attributes.get("href")).toBe(
-    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#8-create-and-serve-a-worker",
+    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#6-seed-held-artifacts",
+  );
+  expect(guide?.attributes.get("target")).toBe("_blank");
+  expect(guide?.textContent).toContain("(opens in a new tab)");
+
+  const serving = await render({ items: [], nextCursor: null }, true);
+  expect(serving.textContent).toContain("A Worker is served once five Resources are created");
+  expect(serving.textContent).not.toContain("On a Host that runs Workers");
+
+  // An artifact-only Host says so instead of promising a Worker.
+  const artifacts = await render({ items: [], nextCursor: null }, false);
+  expect(artifacts.textContent).toContain("This Host does not run Workers.");
+  expect(artifacts.textContent).not.toContain("five Resources");
+  expect(
+    artifacts
+      .all()
+      .find((node) => node.tag === "a")
+      ?.attributes.get("href"),
+  ).toBe(
+    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#first-install-and-first-use",
   );
   const create = none.all().find((node) => node.tag === "button");
   expect(create?.className).toBe("btn btn--primary");
