@@ -6,6 +6,7 @@ import {
 } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
 import { firstRunNote, once } from "../first-run.ts";
+import { valueAt, WORKER_ENDPOINT, WORKER_VERSION } from "../form-specs.ts";
 import { formName } from "../forms.ts";
 import { consoleLocale, tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
@@ -13,7 +14,7 @@ import { publishedUrl, servedWorkers } from "../references.ts";
 import { byForm, health, phaseLabel } from "../resource-state.ts";
 import { linkProps, resourcePath } from "../router.ts";
 import { api } from "../state.ts";
-import { ago, badge, card, copyable, empty, ICON, icon, whenReady } from "../ui.ts";
+import { badge, card, empty, ICON, icon, whenReady } from "../ui.ts";
 import { createResource } from "./create-resource.ts";
 
 /**
@@ -29,7 +30,6 @@ export function overviewPage(organization: Organization): Child {
   const note = once(() => firstRunNote(organization.id));
   const wallet = resource(() => api.wallet(organization.id));
   const resources = resource(() => api.resources(organization.id));
-  const operations = resource(() => api.operations(organization.id));
 
   return h(
     "div",
@@ -78,7 +78,7 @@ export function overviewPage(organization: Organization): Child {
               h(
                 "div",
                 { style: { display: "grid", gap: "18px" } },
-                workersCard(all, cursor !== null),
+                workersCard(organization.id, all, cursor !== null),
                 attentionCard(all),
                 resourcesCard(all, cursor !== null),
               ),
@@ -94,58 +94,6 @@ export function overviewPage(organization: Organization): Child {
           // wallet. One that has been used keeps its line at $0.
           walletInUse(held) ? walletLine(held) : h("div", { style: { display: "none" } }),
         { skeleton: false },
-      ),
-    ),
-    live(() =>
-      whenReady(
-        operations.get(),
-        ({ operations: all }) =>
-          all.length === 0
-            ? h("div", { style: { display: "none" } })
-            : card(
-                tr("最近のアカウント操作", "Recent account activity"),
-                h(
-                  "div",
-                  { class: "table-scroll" },
-                  h(
-                    "table",
-                    null,
-                    h(
-                      "thead",
-                      null,
-                      h(
-                        "tr",
-                        null,
-                        h("th", null, tr("操作", "Operation")),
-                        h("th", null, tr("結果", "Result")),
-                        h("th", null, tr("日時", "When")),
-                        h("th", null, "Id"),
-                      ),
-                    ),
-                    h(
-                      "tbody",
-                      null,
-                      ...all
-                        .slice(0, 10)
-                        .map((entry) =>
-                          h(
-                            "tr",
-                            null,
-                            h("td", { class: "mono" }, entry.operation),
-                            h(
-                              "td",
-                              null,
-                              badge(entry.state, entry.state === "succeeded" ? "ok" : "bad"),
-                            ),
-                            h("td", { class: "dim" }, ago(entry.createdAt)),
-                            h("td", null, copyable(entry.id)),
-                          ),
-                        ),
-                    ),
-                  ),
-                ),
-              ),
-        { skeleton: h("div", { style: { display: "none" } }) },
       ),
     ),
   );
@@ -328,7 +276,11 @@ function walletLine(held: Wallet): Child {
  * Each Worker with the state of the Deployment serving it and the addresses
  * it is published at: what someone signing in most wants to know.
  */
-function workersCard(all: readonly ResourceSummary[], partial: boolean): Child {
+function workersCard(
+  organizationId: string,
+  all: readonly ResourceSummary[],
+  partial: boolean,
+): Child {
   const workers = servedWorkers(all);
   if (workers.length === 0) return null;
   return card(
@@ -352,21 +304,108 @@ function workersCard(all: readonly ResourceSummary[], partial: boolean): Child {
             badge(phaseLabel(state.phase), state.tone, true),
             ...(endpoints.length > 0
               ? endpoints.map((endpoint) => address(endpoint))
-              : [
-                  h(
-                    "span",
-                    { class: "dim" },
-                    !deployment
-                      ? tr("配信中の版はありません", "No deployment yet")
-                      : partial
-                        ? tr("このページには公開先がありません", "No address on this page")
-                        : tr("公開先はまだありません", "Not published yet"),
-                  ),
-                ]),
+              : [nextStep(organizationId, all, worker, deployment, partial)]),
           ),
         );
       }),
     ),
+  );
+}
+
+/** Resources of one kind that name this Worker as their `worker`. */
+function namingWorker(
+  all: readonly ResourceSummary[],
+  form: string,
+  workerUid: string,
+): readonly ResourceSummary[] {
+  return all.filter(
+    (resource) =>
+      resource.form === form && valueAt(resource.spec, ["worker", "resourceUid"]) === workerUid,
+  );
+}
+
+/**
+ * What a Worker without an address still needs, as the step that makes it:
+ * a version, a Deployment of one, or an Endpoint. Each opens the create dialog
+ * with the Worker already filled in; nothing is sent until the person accepts.
+ */
+function nextStep(
+  organizationId: string,
+  all: readonly ResourceSummary[],
+  worker: ResourceSummary,
+  deployment: ResourceSummary | undefined,
+  partial: boolean,
+): Child {
+  const dim = (words: string) => h("span", { class: "dim" }, words);
+  // On a partial first page, what is missing may be on a later page.
+  if (partial)
+    return dim(
+      deployment
+        ? tr("このページには公開先がありません", "No address on this page")
+        : tr("このページには配信がありません", "No deployment on this page"),
+    );
+  const step = (label: string, onClick: () => void) =>
+    h("button", { class: "btn btn--sm", type: "button", onClick }, label);
+  if (deployment) {
+    if (namingWorker(all, WORKER_ENDPOINT, worker.uid).length > 0)
+      return dim(tr("公開先を準備中です", "Its address is being prepared"));
+    return h(
+      "span",
+      { class: "ref" },
+      dim(tr("公開先はまだありません", "Not published yet")),
+      step(tr("公開する", "Publish"), () =>
+        createResource(organizationId, {
+          form: WORKER_ENDPOINT,
+          spec: { worker: { resourceUid: worker.uid } },
+          note: tr(
+            `${worker.name}をHTTPSのホスト名で公開するWorkerEndpointを作成します。名前を付けて受け付けてください。`,
+            `This creates a WorkerEndpoint that publishes ${worker.name} at an HTTPS hostname. Name it, then accept.`,
+          ),
+        }),
+      ),
+    );
+  }
+  const versions = namingWorker(all, WORKER_VERSION, worker.uid);
+  if (versions.length === 0)
+    return h(
+      "span",
+      { class: "ref" },
+      dim(tr("版はまだありません", "No version yet")),
+      step(tr("版を作る", "Create a version"), () =>
+        createResource(organizationId, {
+          form: WORKER_VERSION,
+          spec: {
+            worker: { resourceUid: worker.uid },
+            bundle: { resourceUid: "" },
+            handlers: ["fetch"],
+          },
+          note: tr(
+            `${worker.name}の版を作成します。コードのWorkerBundleを選び、名前を付けて受け付けてください。`,
+            `This creates a version of ${worker.name}. Choose its WorkerBundle, name it, then accept.`,
+          ),
+        }),
+      ),
+    );
+  // Serving is decided on the version's own page, where its readiness is known.
+  const [only] = versions;
+  return h(
+    "span",
+    { class: "ref" },
+    dim(tr("配信中の版はありません", "No deployment yet")),
+    versions.length === 1 && only
+      ? h(
+          "a",
+          { class: "btn btn--sm", ...linkProps(resourcePath(only.uid)) },
+          tr(`${only.name}を配信する`, `Serve ${only.name}`),
+        )
+      : h(
+          "a",
+          {
+            class: "btn btn--sm",
+            ...linkProps(`/resources?form=${encodeURIComponent(WORKER_VERSION)}`),
+          },
+          tr("版を選んで配信する", "Choose a version to serve"),
+        ),
   );
 }
 
