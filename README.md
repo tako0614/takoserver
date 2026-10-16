@@ -21,10 +21,9 @@ for example `https://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/`:
   They validate and keep bytes the operator has seeded or that are reachable
   over public HTTPS; by themselves they do not run a Worker, serve assets, apply
   SQL or create an endpoint.
-- **Workers and their data, with the complete local Worker profile** on Linux
-  x86-64 (the pinned `workerd`, Actor and Workflow boot with the Workflow
-  execution guard, all five private data planes, and both bundle blocks on
-  `selfhost-v2-worker-primary`; see [Settings](#settings)): `ModuleWorker 0.3.0`,
+- **Workers and their data, with the complete local Worker profile** (on Linux
+  x86-64, the pinned `workerd`, the Workflow execution guard and the settings
+  [Settings](#settings) lists for that profile): `ModuleWorker 0.3.0`,
   `WorkerVersion 0.5.0`, `WorkerDeployment 0.4.0`, `WorkerCronTrigger 0.3.0`,
   `SQLiteDatabase 0.2.0`, `EdgeKVNamespace 0.2.0`, `ObjectBucket 0.2.0`,
   `AtLeastOnceQueue 0.2.0`, `QueueConsumer 0.3.0`, `ActorNamespace 0.3.0` and
@@ -39,22 +38,33 @@ exact gates, Form map and limits.
 
 ## Quick start
 
-This starts the artifact profile. Before starting, set `TAKOSERVER_PUBLIC_ORIGIN`
-(the canonical external HTTPS origin), the non-secret
-`TAKOSERVER_TAKOFORM_V2_CONFIG` and the persistent operator secret
-`TAKOSERVER_TAKOFORM_V2_CURSOR_KEY`, as described in [Settings](#settings). Then
-run:
+Three ways in, from the quickest look to a served Worker:
 
-```sh
-bun install --frozen-lockfile
-bun --no-env-file src/entry-bun.ts
-```
+1. **Look around in Docker.**
+   [Docker and Compose self-host](docs/self-host-docker.md) runs the v2 Host
+   API, operator sign-in, organizations and API keys on a loopback port. It
+   runs no Workers.
+2. **Start the Host from a checkout.** Set `TAKOSERVER_PUBLIC_ORIGIN` (the
+   canonical external HTTPS origin), the non-secret
+   `TAKOSERVER_TAKOFORM_V2_CONFIG` and the persistent operator secret
+   `TAKOSERVER_TAKOFORM_V2_CURSOR_KEY`, as described in [Settings](#settings),
+   then run:
 
-The public v2 discovery is `/.well-known/takoform/v2`. The Bun HTTP listener
-requires an operator-controlled HTTPS front end for public use; do not expose
-that backend listener directly.
-[First install and first use](docs/self-host-operations.md#first-install-and-first-use)
-takes you on to the complete Worker profile and a Worker served over HTTPS.
+   ```sh
+   bun install --frozen-lockfile
+   bun --no-env-file src/entry-bun.ts
+   ```
+
+   This is the artifact profile: it keeps Worker code, static files and SQL
+   migrations, and runs no Worker. The public v2 discovery is
+   `/.well-known/takoform/v2`. The Bun HTTP listener requires an
+   operator-controlled HTTPS front end for public use; do not expose that
+   backend listener directly.
+3. **Deploy a Worker.**
+   [First install and first use](docs/self-host-operations.md#first-install-and-first-use)
+   takes a Linux x86-64 machine from a reviewed checkout to a Worker served over
+   HTTPS: the Worker runtime, HTTPS on TCP 443, an API key, and the five
+   Resources that make up one Worker.
 
 ## Start here
 
@@ -111,22 +121,6 @@ serves them from this machine.
   listener. Neither a bundle nor a WorkerVersion can be changed, so to
   ship new code, create a new WorkerBundle and WorkerVersion, then update the
   Deployment's versions.
-- **Infer** through `/v1/ai` when the operator configures an OpenAI-compatible
-  upstream ([Settings](#settings)). An API key with `ai:invoke` sees only the
-  configured public model IDs. Every chat completion needs an `Idempotency-Key`,
-  and streaming is refused. A settled result is replayed from durable state
-  without calling the upstream or charging again. A model priced at zero never
-  touches the wallet. For a priced model, the Host holds the most the request
-  can cost from the organization's prepaid wallet, refuses with `402`
-  `insufficient_quota` when the wallet cannot cover it, captures the reported
-  use and releases the rest; a failed upstream call charges nothing. See
-  [qualifying one public AI inference](docs/ai-live-qualification.md) for the
-  explicit opt-in completion/replay check and its limits.
-
-Creating, running or deleting a v2 Resource places no charge on the wallet.
-[Operator sign-in and funding](#operator-sign-in-and-funding) covers how a
-wallet is funded.
-
 ## Scope
 
 - **This repository is the Host and its self-host plugin**: everything needed
@@ -139,10 +133,6 @@ wallet is funded.
   Platforms backend is supplied separately by its operator and is not needed to
   build or run a self-host. Where the control plane runs is a separate
   deployment choice.
-- **A green gate is not a rollout.** `bun run check` and local native evidence
-  do not show that any deployment works: not a self-host's public TLS and DNS,
-  not the hosted service's D1 or Workers for Platforms, and not adoption by
-  downstream Providers. Each is qualified separately.
 
 ## Self-hosting
 
@@ -439,6 +429,25 @@ stop exits with status 0. A reported shutdown-stage failure prints its stage
 and exits with status 1, even when dependent listeners remain open. Shutdown
 does not close dependents below an unproved owner or discard its durable
 custody; the next Host must recover that retained ownership before serving.
+
+### AI inference
+
+The Host can also serve AI inference through `/v1/ai` when the operator
+configures an OpenAI-compatible upstream ([Settings](#settings)). An API key
+with `ai:invoke` sees only the configured public model IDs. Every chat
+completion needs an `Idempotency-Key`, and streaming is refused. A settled
+result is replayed from durable state without calling the upstream or charging
+again. A model priced at zero never touches the wallet. For a priced model, the
+Host holds the most the request can cost from the organization's prepaid
+wallet, refuses with `402` `insufficient_quota` when the wallet cannot cover
+it, captures the reported use and releases the rest; a failed upstream call
+charges nothing. See
+[qualifying one public AI inference](docs/ai-live-qualification.md) for the
+explicit opt-in completion/replay check and its limits.
+
+Creating, running or deleting a v2 Resource places no charge on the wallet.
+[Operator sign-in and funding](#operator-sign-in-and-funding) covers how a
+wallet is funded.
 
 ### Operator sign-in and funding
 
@@ -1023,6 +1032,11 @@ bun run fmt       # the only thing that rewrites source
 ```
 
 `bun run check` is the gate. It is read-only and it does not skip.
+
+A green gate is not a rollout. `bun run check` and local native evidence do not
+show that any deployment works: not a self-host's public TLS and DNS, not the
+hosted service's D1 or Workers for Platforms, and not adoption by downstream
+Providers. Each is qualified separately.
 
 ### Takoform v2 conformance
 
