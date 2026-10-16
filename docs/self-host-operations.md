@@ -19,7 +19,8 @@ each setting in full; this section is the order in which to apply them. The
 Host serves exactly the Forms its configuration composes. It needs no
 publisher-set admission: the v1 admission command in the
 [historical reference](#historical-reference-v1-signed-package-admission) is
-not part of this path.
+not part of this path. The steps deploy with curl over Host API v2, or in the
+console: no released Takoform client speaks Host API v2 yet.
 
 A self-host runs one of two profiles, selected by configuration:
 
@@ -48,8 +49,10 @@ as `KEY` and `ORG`; keep it open between steps.
 ### 1. Prerequisites
 
 - Linux x86-64 with `/proc`, `/bin/sh` and `/usr/bin/setpriv`. The Worker
-  runtime supports only this platform. The artifact CLI in step 6 also reads
-  `/proc` to prove that the Host is stopped.
+  runtime supports only this platform, and the attached `workerd` below needs
+  glibc 2.38 or newer, such as Ubuntu 24.04 (`ldd --version | head -n 1` prints
+  it). The artifact CLI in step 6 also reads `/proc` to prove that the Host is
+  stopped.
 - `git`, `curl`, `jq`, `unzip` (for the Bun installer) and `ca-certificates`.
   On Debian or Ubuntu, as root:
   `apt-get install --no-install-recommends git curl jq unzip ca-certificates`.
@@ -65,7 +68,9 @@ as `KEY` and `ORG`; keep it open between steps.
   With that login shell, run the commands this guide gives as the
   `takoserver` user in `runuser -u takoserver -- bash`.
 - The reviewed source commit, checked out where root owns it and the
-  `takoserver` user can only read it, for example as root:
+  `takoserver` user can only read it. This guide describes main, so choose a
+  commit of main you have reviewed; the `v2.0.0-rc.1` tag is older than this
+  guide. For example, as root:
 
   ```sh
   git clone https://github.com/tako0614/takoserver /opt/takoserver
@@ -86,13 +91,26 @@ as `KEY` and `ORG`; keep it open between steps.
   outside the checkout, where only an administrator can replace them, for
   example in `/usr/local/libexec/takoserver` (`install -d -m 0755
   /usr/local/libexec/takoserver` as root):
-  - The pinned closed-graph `workerd` artifact. A release that attaches it
-    (the file `workerd-closed-graph-2026-08-11-linux-x64` on the GitHub
-    Release, with `SHA256SUMS` and the notices bundle) is the easiest source:
-    download the files into an empty directory, run `sha256sum --check
-    SHA256SUMS`, and follow
-    [What an operator verifies](release-assets.md#what-an-operator-verifies).
-    Otherwise build it with `bun run build:workerd` as described in
+  - The pinned closed-graph `workerd` artifact. The GitHub pre-release
+    [Takoserver 2.0.0-rc.1](https://github.com/tako0614/takoserver/releases/tag/v2.0.0-rc.1)
+    attaches it, with `SHA256SUMS` and the notices bundle; 1.0.0, the release
+    marked Latest, does not. Its `workerd` is the build main still pins (the
+    digest below), so it is the right one for this guide. As root, in an empty
+    directory:
+
+    ```sh
+    base=https://github.com/tako0614/takoserver/releases/download/v2.0.0-rc.1
+    for file in workerd-closed-graph-2026-08-11-linux-x64 \
+      workerd-closed-graph-2026-08-11-notices.tar.gz SHA256SUMS; do
+      curl -fsSLO "$base/$file"
+    done
+    sha256sum --check SHA256SUMS &&
+      install -m 0755 -o root -g root workerd-closed-graph-2026-08-11-linux-x64 \
+        /usr/local/libexec/takoserver/workerd-c00638f195e4a9fda4bafb07bb7b1674e4d8324d0072efbf0ea57beb0ff08e52
+    ```
+
+    [What an operator verifies](release-assets.md#what-an-operator-verifies)
+    lists the remaining checks. Otherwise build it with `bun run build:workerd` as described in
     [the closed-graph workerd artifact](../workerd/README.md); the build needs
     Bazel and a pinned clang and takes hours. The manual
     `workerd-closed-graph-build` workflow can build it on GitHub, but its
@@ -870,8 +888,8 @@ A WorkerVersion, Deployment or Endpoint Operation that cannot finish stays
 Keep this order. An Endpoint requested before its Worker's Deployment has
 succeeded is refused with `409 dependency_conflict` (its `detail` names the
 missing Deployment) and nothing is stored, so run the chain again once the
-Deployment succeeded. With OpenTofu, make the Endpoint `depends_on` its
-Deployment so they are not created in parallel. An Endpoint that an earlier
+Deployment succeeded. A tool that creates Resources in parallel must create
+the Endpoint only after its Deployment succeeded. An Endpoint that an earlier
 Host accepted out of order settles `failed` (`worker_deployment_missing`)
 after the upgrade; delete it or re-apply it.
 

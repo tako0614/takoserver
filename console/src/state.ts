@@ -1,4 +1,10 @@
-import { type Api, createApi, type Organization, type Principal } from "./api.ts";
+import {
+  type Api,
+  createApi,
+  type HostDiscovery,
+  type Organization,
+  type Principal,
+} from "./api.ts";
 import { signal } from "./reactive.ts";
 
 /**
@@ -41,6 +47,15 @@ function defaultOrigin(): string {
     return `${protocol}//api.${hostname.replace(/^console\./u, "")}${port ? `:${port}` : ""}`;
   }
   return window.location.origin;
+}
+
+/**
+ * The Host API v2 base to show. The Host names it from its public origin, the
+ * only authority v2 answers; the console's own API origin may be a tunnel or
+ * an override, so it is used only when the Host named none.
+ */
+export function hostV2Base(discovery: HostDiscovery | null): string {
+  return discovery?.takoform ?? `${apiOrigin()}/apis/forms.takoform.com/v2`;
 }
 
 export function setApiOrigin(origin: string): void {

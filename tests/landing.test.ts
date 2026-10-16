@@ -99,10 +99,10 @@ describe("Takoserver public site", () => {
     expect(html).toContain("bun --no-env-file src/entry-bun.ts");
     // What a Worker Host needs, in plain terms: workerd, the guard, HTTPS and a wildcard name.
     expect(html).toContain(
-      "the pinned workerd from a GitHub Release, checked against its SHA256SUMS",
+      "the pinned workerd attached to the 2.0.0-rc.1 pre-release, checked against its SHA256SUMS",
     );
     expect(html).toContain("the Workflow execution guard, a small Go program");
-    // The site describes main; the only release is older than the docs it links.
+    // The site describes main; the release that carries workerd is older than the docs it links.
     expect(html).toContain(
       "Check out a reviewed commit of main, which the install guide describes",
     );
@@ -111,7 +111,13 @@ describe("Takoserver public site", () => {
     expect(html).toContain("the URL and SHA-256 of a manifest that lists it");
     expect(html).toContain("scripts/selfhost-artifact.ts, which prints both values");
     expect(html).toContain("a wildcard DNS name and certificate, such as *.apps.example.com");
-    expect(html).toContain('href="https://github.com/tako0614/takoserver/releases"');
+    // The release that carries workerd, not the Latest one, which has none.
+    expect(html).toContain(
+      'href="https://github.com/tako0614/takoserver/releases/tag/v2.0.0-rc.1"',
+    );
+    expect(html).toContain("That workerd needs glibc 2.38 or newer, such as Ubuntu 24.04.");
+    // Nothing promises a Takoform client that cannot talk to this Host.
+    expect(html).toContain("No released Takoform client speaks Host API v2 yet");
     expect(html).toContain("docs/self-host-operations.md#1-prerequisites");
     expect(html).toContain("docs/self-host-docker.md");
   });

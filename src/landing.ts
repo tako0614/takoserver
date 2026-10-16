@@ -29,13 +29,14 @@ const SHIP_STEPS = `${GUIDE}#9-verify`;
 const SECURITY_GUIDE = `${REPOSITORY}/blob/main/docs/self-host-security.md`;
 const V2_REFERENCE = `${REPOSITORY}/blob/main/docs/takoform-v2.md`;
 const PREREQUISITES = `${GUIDE}#1-prerequisites`;
-const RELEASES = `${REPOSITORY}/releases`;
+/** The release that attaches the pinned workerd; 1.0.0, marked Latest, has none. */
+const WORKERD_RELEASE = `${REPOSITORY}/releases/tag/v2.0.0-rc.1`;
 const TAKOFORM = "https://takoform.com";
 
 const landingMessages = {
   en: {
     description:
-      "Takoserver is an open-source cloud you host yourself. Deploy Workers and their SQLite, KV, object storage and queues to your own machine with Takoform.",
+      "Takoserver is an open-source cloud you host yourself. Deploy Workers and their SQLite, KV, object storage and queues to your own machine from Takoform definitions.",
     skip: "Skip to content",
     lead: "Deploy Takoform.\nRun your own cloud.",
     lede: "Takoserver is an open-source cloud that runs on your own Linux machine. Deploy Workers and their SQLite, KV, object storage and queues from Takoform definitions, and operate them yourself.",
@@ -65,20 +66,20 @@ const landingMessages = {
     hostStep1:
       "Use a Linux x86-64 machine with Bun. Check out a reviewed commit of main, which the install guide describes, and install its locked dependencies.",
     hostStep2:
-      "Add the Worker runtime: the pinned workerd from a GitHub Release, checked against its SHA256SUMS, and the Workflow execution guard, a small Go program built from the same checkout.",
+      "Add the Worker runtime: the pinned workerd attached to the 2.0.0-rc.1 pre-release, checked against its SHA256SUMS, and the Workflow execution guard, a small Go program built from the same checkout. That workerd needs glibc 2.38 or newer, such as Ubuntu 24.04.",
     hostStep3:
       "Give it HTTPS. For Workers, get a wildcard DNS name and certificate, such as *.apps.example.com; a wildcard certificate is issued through a DNS challenge, which needs your DNS provider's API. The Host serves Workers on port 443 itself, so put the API behind a front end such as Caddy on another port, such as 8443.",
     hostStep4:
       "Write its settings and start it. Three are always required; the Worker runtime and HTTPS add their own (step 3 of the install guide), and a partial Worker setup offers no Worker Forms. Without an identity provider, the first boot prints a single-use operator sign-in assertion.",
     hostNote:
       "Without the Worker runtime and port 443, the Host still keeps artifacts and serves the API, sign-in, organizations and keys. To try that much quickly, use Docker.",
-    releases: "GitHub Releases",
+    releases: "Takoserver 2.0.0-rc.1 (pre-release)",
     prerequisites: "Prerequisites",
     docker: "Try it in Docker",
     security: "Self-host security",
     deployTitle: "Deploy one Worker",
     deployBody:
-      "Five Resources, created in this order with curl over Host API v2. Each create is accepted as an Operation that you poll until it succeeds. $V2, $F, $ORG and $KEY come from step 5 of the install guide, which runs the whole chain with a small create function.",
+      "Five Resources, created in this order with curl over Host API v2. Each create is accepted as an Operation that you poll until it succeeds. $V2, $F, $ORG and $KEY come from step 5 of the install guide, which runs the whole chain with a small create function. No released Takoform client speaks Host API v2 yet, so today you deploy with requests like these or in the console.",
     createLabel:
       "Each create is one POST. Sent again with the same idempotency-key within 24 hours, it returns the same Operation instead of a second Worker.",
     workerStep: "is the Worker itself. Its versions, deployment and endpoint refer to it.",
@@ -111,7 +112,7 @@ const landingMessages = {
   },
   ja: {
     description:
-      "Takoserverは、自分でホストするオープンソースのクラウドです。WorkerとそのSQLite・KV・オブジェクトストレージ・キューを、Takoformで自分のマシンへデプロイできます。",
+      "Takoserverは、自分でホストするオープンソースのクラウドです。WorkerとそのSQLite・KV・オブジェクトストレージ・キューを、Takoformの定義から自分のマシンへデプロイできます。",
     skip: "本文へ移動",
     lead: "Takoformを、\n自分のクラウドへ。",
     lede: "Takoserverは、自分のLinuxマシンで動かすオープンソースのクラウドです。WorkerとそのSQLite・KV・オブジェクトストレージ・キューを、Takoformの定義からデプロイして運用できます。",
@@ -140,20 +141,20 @@ const landingMessages = {
     hostStep1:
       "Linux x86-64のマシンとBunを用意します。導入手順書が説明しているmainから、レビュー済みのコミットを取り出し、ロックファイルで固定された依存関係をインストールします。",
     hostStep2:
-      "Workerの実行環境を加えます。GitHub Releaseにある固定版のworkerdをSHA256SUMSで確認して置き、Workflow execution guard（同じチェックアウトからGoでビルドする小さなプログラム）を用意します。",
+      "Workerの実行環境を加えます。プレリリース2.0.0-rc.1に添付された固定版のworkerdをSHA256SUMSで確認して置き、Workflow execution guard（同じチェックアウトからGoでビルドする小さなプログラム）を用意します。このworkerdには、Ubuntu 24.04などglibc 2.38以降の環境が必要です。",
     hostStep3:
       "HTTPSを用意します。Worker用に、*.apps.example.comのようなワイルドカードのDNS名と証明書を用意します。ワイルドカード証明書はDNSチャレンジで発行するため、DNSプロバイダーのAPIが必要です。443番はHost自身がWorkerの配信に使うので、APIはCaddyなどのフロントエンドの背後に、8443番など別のポートで置きます。",
     hostStep4:
       "設定を書いて起動します。常に必要な設定は3つで、Worker実行環境とHTTPSにはそれぞれ追加の設定があります（導入手順書の手順3）。Worker実行環境の設定が一部でも欠けると、Worker関連のFormは提供されません。IDプロバイダーが未設定なら、初回起動時に一度だけ使える運営者サインイン用のassertionが表示されます。",
     hostNote:
       "Worker実行環境と443番がなくても、Hostは成果物を保持し、API・サインイン・組織・APIキーを提供します。そこまでを手早く試すならDockerを使えます。",
-    releases: "GitHub Releases",
+    releases: "Takoserver 2.0.0-rc.1（プレリリース）",
     prerequisites: "前提条件",
     docker: "Dockerで試す",
     security: "セルフホストのセキュリティ",
     deployTitle: "Workerを1つデプロイする",
     deployBody:
-      "5つのリソースを、この順にcurlとHost API v2で作成します。作成はOperationとして受け付けられ、成功するまで状態を確認します。$V2・$F・$ORG・$KEYは導入手順書の手順5で用意します。手順書では、小さなcreate関数でこの流れ全体を実行します。",
+      "5つのリソースを、この順にcurlとHost API v2で作成します。作成はOperationとして受け付けられ、成功するまで状態を確認します。$V2・$F・$ORG・$KEYは導入手順書の手順5で用意します。手順書では、小さなcreate関数でこの流れ全体を実行します。Host API v2に対応したTakoformのクライアントはまだリリースされていないため、現在はこのようなリクエストかコンソールでデプロイします。",
     createLabel:
       "作成は1回のPOSTです。24時間以内に同じidempotency-keyで送り直すと、2つ目のWorkerは作らず同じOperationを返します。",
     workerStep: "Workerそのものです。版・配信・公開先はこれを参照します。",
@@ -516,7 +517,7 @@ ${text("hostTitle", "h2", ' id="start-title"')}
 cd takoserver
 git checkout --detach &lt;reviewed-commit&gt;
 bun install --frozen-lockfile</pre></li>
-<li>${text("hostStep2", "p")}<p class="more"><a href="${RELEASES}" data-i18n="releases">${copy.releases}</a></p></li>
+<li>${text("hostStep2", "p")}<p class="more"><a href="${WORKERD_RELEASE}" data-i18n="releases">${copy.releases}</a></p></li>
 <li>${text("hostStep3", "p")}</li>
 <li>${text("hostStep4", "p")}<span class="chips"><code>TAKOSERVER_PUBLIC_ORIGIN</code><code>TAKOSERVER_TAKOFORM_V2_CONFIG</code><code>TAKOSERVER_TAKOFORM_V2_CURSOR_KEY</code></span><pre>bun --no-env-file src/entry-bun.ts</pre></li>
 </ol>
