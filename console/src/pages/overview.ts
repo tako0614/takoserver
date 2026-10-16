@@ -147,7 +147,7 @@ export function overviewPage(organization: Organization): Child {
                         h(
                           "div",
                           { class: "card__body" },
-                          h("div", { class: "stat__label" }, entry.form),
+                          h("div", { class: "stat__form" }, entry.form),
                           h("div", { class: "stat__value" }, String(entry.total)),
                           entry.attention > 0
                             ? h(
