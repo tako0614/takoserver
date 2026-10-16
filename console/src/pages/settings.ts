@@ -53,13 +53,13 @@ export function settingsPage(organization: Organization): Child {
           row(tr("識別子", "Identifier"), copyable(organization.id)),
           row(tr("作成日時", "Created"), when(organization.createdAt)),
           row(
-            tr("テナント", "Tenant"),
+            tr("スペース", "Space"),
             h(
               "span",
               { class: "dim" },
               tr(
-                "リソースは組織単位で分離され、この識別子がTakoformホストのテナントキーになります。",
-                "Resources are isolated by this organization; its identifier is the tenant key the Takoform Host uses.",
+                "Host API v2ではこの識別子がSpaceです。リソースは組織ごとに分かれ、APIキーとサインイン中のセッションは同じ組織として操作します。",
+                "In Host API v2 this identifier is the Space. Resources belong to one organization, and its API keys and your signed-in session act as that organization.",
               ),
             ),
           ),
