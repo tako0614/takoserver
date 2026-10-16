@@ -409,6 +409,9 @@ function referencePicker(
   };
 }
 
+const ARTIFACT_STEP =
+  "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#6-seed-held-artifacts";
+
 /** Create one Resource of an exact Form this Host supports. */
 export function createResource(organizationId: string): void {
   const key = `console-create-${crypto.randomUUID()}`;
@@ -425,6 +428,7 @@ export function createResource(organizationId: string): void {
   });
   spec.value = "{}";
   const specHint = h("small");
+  const artifactHint = h("small");
   const references = h("div");
   let picker: ReturnType<typeof referencePicker> | null = null;
   // The starter for the chosen Form, and the exact text the spec held when the
@@ -454,9 +458,35 @@ export function createResource(organizationId: string): void {
   const describeStarter = (): void => {
     if (!starter) {
       specHint.replaceChildren();
+      artifactHint.replaceChildren();
       return;
     }
     const label = formLabel(chosen);
+    artifactHint.replaceChildren(
+      ...("artifact" in starter.spec
+        ? [
+            tr(
+              "url と sha256 は、scripts/selfhost-artifact.ts seed が出力する artifact（",
+              "url and sha256 are the artifact that scripts/selfhost-artifact.ts seed prints (",
+            ),
+            h(
+              "a",
+              { href: ARTIFACT_STEP, target: "_blank", rel: "noopener noreferrer" },
+              tr("導入手順書（英語）の手順6", "step 6 of the install guide"),
+              h("span", { "aria-hidden": "true" }, " ↗"),
+              h(
+                "span",
+                { class: "visually-hidden" },
+                tr("（新しいタブで開きます）", " (opens in a new tab)"),
+              ),
+            ),
+            tr(
+              "）か、自分で公開HTTPSに置いたmanifestのURLとそのSHA-256です。manifestの形は上の公開仕様にあります。",
+              "), or the URL and SHA-256 of a manifest you publish over HTTPS. The manifest's shape is in the published contract above.",
+            ),
+          ]
+        : []),
+    );
     if (spec.value !== untouched) {
       specHint.replaceChildren(
         remainingBlanks(jsonSpec(spec.value)).length > 0
@@ -577,6 +607,7 @@ export function createResource(organizationId: string): void {
         h("label", { for: "create-resource-spec" }, tr("設定 (JSON)", "Spec (JSON)")),
         spec,
         specHint,
+        artifactHint,
       ),
       requestDisclosure(details),
     ),

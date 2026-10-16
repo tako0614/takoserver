@@ -102,6 +102,14 @@ describe("Takoserver public site", () => {
       "the pinned workerd from a GitHub Release, checked against its SHA256SUMS",
     );
     expect(html).toContain("the Workflow execution guard, a small Go program");
+    // The site describes main; the only release is older than the docs it links.
+    expect(html).toContain(
+      "Check out a reviewed commit of main, which the install guide describes",
+    );
+    expect(html).not.toContain("a release tag keeps it matched");
+    // Where a WorkerBundle's two values come from.
+    expect(html).toContain("the URL and SHA-256 of a manifest that lists it");
+    expect(html).toContain("scripts/selfhost-artifact.ts, which prints both values");
     expect(html).toContain("a wildcard DNS name and certificate, such as *.apps.example.com");
     expect(html).toContain('href="https://github.com/tako0614/takoserver/releases"');
     expect(html).toContain("docs/self-host-operations.md#1-prerequisites");

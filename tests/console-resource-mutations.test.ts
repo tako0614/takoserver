@@ -572,6 +572,45 @@ test("reference choices say when a list failed, is empty or goes on, and lock wh
   expect(choices.map((node) => node.disabled)).toEqual([false, false]);
 });
 
+test("an artifact Form's starter says where its url and sha256 come from", async () => {
+  const { body } = await setup();
+  const { createResource } = await import("../console/src/pages/create-resource.ts");
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(new Request(input, init).url);
+      if (url.pathname.endsWith("/support")) {
+        const asking = url.searchParams.get("form") ?? "";
+        return Response.json({ form: asking, supported: true, operations: ["create"] });
+      }
+      if (url.pathname.endsWith("/resources"))
+        return Response.json({ items: [], nextCursor: null });
+      return Response.json(discovery);
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  createResource("org-console");
+  await settle();
+  const [select] = body.all().filter((node) => node.tag === "select");
+  if (!select) throw new Error("Form choice missing");
+  select.value = `${edgeForms}/WorkerBundle/0.2.0/`;
+  select.emit("change");
+  await settle();
+  expect(body.textContent).toContain(
+    "url and sha256 are the artifact that scripts/selfhost-artifact.ts seed prints",
+  );
+  const step = body
+    .all()
+    .find((node) => node.tag === "a" && node.textContent.startsWith("step 6 of the install guide"));
+  expect(step?.attributes.get("href")).toBe(
+    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#6-seed-held-artifacts",
+  );
+  // A Form without an artifact says nothing about one.
+  select.value = `${edgeForms}/ModuleWorker/0.3.0/`;
+  select.emit("change");
+  await settle();
+  expect(body.textContent).not.toContain("url and sha256 are the artifact");
+});
+
 test("create falls back to the exact URL field when the Host answers no Form", async () => {
   const { body } = await setup();
   const { createResource } = await import("../console/src/pages/create-resource.ts");
