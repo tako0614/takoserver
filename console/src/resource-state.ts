@@ -1,6 +1,7 @@
 import type { ResourceSummary } from "./api.ts";
 import { formName } from "./forms.ts";
 import { tr } from "./i18n.ts";
+import { WORKER_ENDPOINT } from "./references.ts";
 
 /** Display only states the v2 Resource actually reports. */
 export type Phase =
@@ -31,10 +32,18 @@ export function health(resource: ResourceSummary): Health {
   if (resource.phase === "pending" || stale) {
     return { phase: "Pending", tone: "warn", reason: null, message: null, stale };
   }
-  if (resource.observedAt !== null && resource.observed.ready === true) {
+  // A Form names its readiness `ready`; a WorkerEndpoint reports whether its
+  // active Deployment's route is ready.
+  const ready =
+    "ready" in resource.observed
+      ? resource.observed.ready
+      : WORKER_ENDPOINT.test(resource.form)
+        ? resource.observed.activeDeploymentRouteReady
+        : undefined;
+  if (resource.observedAt !== null && ready === true) {
     return { phase: "Ready", tone: "ok", reason: null, message: null, stale };
   }
-  if (resource.observedAt !== null && resource.observed.ready === false) {
+  if (resource.observedAt !== null && ready === false) {
     return { phase: "NotReady", tone: "warn", reason: null, message: null, stale };
   }
   // Idle with the latest generation observed is the Host's settled state.

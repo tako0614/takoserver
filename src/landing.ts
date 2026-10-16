@@ -27,6 +27,8 @@ const DOCKER_GUIDE = `${REPOSITORY}/blob/main/docs/self-host-docker.md`;
 const SECURITY_GUIDE = `${REPOSITORY}/blob/main/docs/self-host-security.md`;
 const V2_REFERENCE = `${REPOSITORY}/blob/main/docs/takoform-v2.md`;
 const PREREQUISITES = `${GUIDE}#1-prerequisites`;
+const RELEASES = `${REPOSITORY}/releases`;
+const TAKOFORM = "https://takoform.com";
 
 const landingMessages = {
   en: {
@@ -39,44 +41,51 @@ const landingMessages = {
     source: "Source code",
     preview: "Resources in the Takoserver Console · public sample data",
     previewAlt:
-      "The Takoserver Console listing the Resources of a Worker named hello and a SQLite database, all applied, with public sample data",
+      "The Takoserver Console's Resources page: a Worker named hello with its version, deployment and endpoint all Ready, its WorkerBundle, and a SQLite database, in public sample data",
     formsTitle: "What you can deploy",
     formsBody:
-      "A Host serves exactly the Forms its configuration composes. Before relying on one, ask your Host's support endpoint about its exact Form URL.",
+      "Takoform describes each kind of resource, such as a Worker, a database or a queue, as a Form: a definition its publisher serves at a versioned URL, so the resource means the same on every Host that supports it. Takoserver runs these Forms.",
+    formsNeeds:
+      "Artifacts need only Bun and a short block in the Host's settings. Everything else needs the Worker runtime of step 2 below, and publishing at a hostname also needs step 3. A running Host answers, for each Form URL, whether it serves that Form.",
+    takoform: "About Takoform",
     artifactsTitle: "Artifacts",
-    artifactsBody:
-      "Worker code, static files and SQL migrations, kept by URL and SHA-256. Each needs only Bun and that Form's block in TAKOSERVER_TAKOFORM_V2_CONFIG.",
+    artifactsBody: "Worker code, static files and SQL migrations, pinned by URL and SHA-256.",
     workersTitle: "Workers and HTTPS",
     workersBody:
-      "Create a Worker, cut a version, choose which version serves, run it on a schedule and publish it at an HTTPS hostname. Needs the complete local Worker profile (step 4 below); WorkerEndpoint also needs the HTTPS listener on port 443.",
+      "Create a Worker, cut versions, choose which one serves, run it on a schedule and publish it at its own HTTPS hostname.",
     dataTitle: "Data",
     dataBody:
-      "SQLite databases, KV namespaces and object buckets that a Worker uses through Bindings. Needs the complete local Worker profile; SQLiteMigrationApplication also needs a sqliteMigrationSet block.",
+      "SQLite databases, KV namespaces and object buckets that a Worker reaches through bindings.",
     asyncTitle: "Queues, actors and workflows",
     asyncBody:
-      "At-least-once queues and their consumers, actors that keep state, and durable workflows. Needs the complete local Worker profile.",
+      "At-least-once queues and their consumers, actors that keep state, and durable workflows.",
     hostTitle: "Run your own Host",
     hostStep1:
-      "On Linux x86-64 with Bun, check out a reviewed commit and install its locked dependencies.",
-    hostStep2: "Set the public HTTPS origin, the v2 configuration and a persistent cursor key.",
+      "Use a Linux x86-64 machine with Bun. Check out a reviewed commit (a release tag keeps it matched with that release's workerd) and install its locked dependencies.",
+    hostStep2:
+      "Add the Worker runtime: the pinned workerd from a GitHub Release, checked against its SHA256SUMS, and the Workflow execution guard, a small Go program built from the same checkout.",
     hostStep3:
-      "Start it. Without an identity provider, the first boot prints a single-use operator sign-in assertion.",
+      "Give it HTTPS. For Workers, get a wildcard DNS name and certificate, such as *.apps.example.com; a wildcard certificate is issued through a DNS challenge, which needs your DNS provider's API. The Host serves Workers on port 443 itself, so put the API behind a front end such as Caddy on another port, such as 8443.",
     hostStep4:
-      "For Workers, add the complete local Worker profile: the pinned workerd, Actor and Workflow boot with the Workflow execution guard, all five private data planes, and both bundle blocks on selfhost-v2-worker-primary. Publishing at a hostname also needs HTTPS on port 443.",
+      "Write its settings and start it. Three are always required; the Worker runtime and HTTPS add their own (step 3 of the install guide), and a partial Worker setup offers no Worker Forms. Without an identity provider, the first boot prints a single-use operator sign-in assertion.",
     hostNote:
-      "Serve the API through your own HTTPS front end; do not expose the listener directly. To try the API, sign-in, organizations and keys without running Workers, use Docker.",
+      "Without the Worker runtime and port 443, the Host still keeps artifacts and serves the API, sign-in, organizations and keys. To try that much quickly, use Docker.",
+    releases: "GitHub Releases",
     prerequisites: "Prerequisites",
     docker: "Try it in Docker",
     security: "Self-host security",
     deployTitle: "Deploy one Worker",
     deployBody:
-      "Steps 6 to 9 of the install guide, condensed; $V2 and $KEY come from its step 5. Host API v2 accepts each create as an Operation; for 24 hours, sending it again with the same idempotency-key returns that Operation instead of a second Resource.",
+      "Five Resources, created in this order with curl over Host API v2. Each create is accepted as an Operation that you poll until it succeeds. $V2, $F, $ORG and $KEY come from step 5 of the install guide, which runs the whole chain with a small create function.",
+    createLabel:
+      "Each create is one POST. Sent again with the same idempotency-key within 24 hours, it returns the same Operation instead of a second Worker.",
     workerStep: "is the Worker itself. Its versions, deployment and endpoint refer to it.",
-    bundleStep: "names the bytes of worker.js held by the Host, by URL and SHA-256.",
+    bundleStep:
+      "names the bytes of worker.js by URL and SHA-256. Publish it over public HTTPS and the Host fetches it, or seed it onto the Host beforehand.",
     versionStep: "pairs that bundle with its fetch handler.",
     deploymentStep: "chooses which version serves: here one version, weight 10000.",
     endpointStep: "publishes the Worker at an HTTPS hostname.",
-    resultLabel: "Then request it:",
+    resultLabel: "Then request it, with the UID the Endpoint's create returned in $ENDPOINT:",
     deployMore: "Steps 6 to 9 in the guide",
     afterTitle: "After you deploy",
     consoleTitle: "In the console",
@@ -102,45 +111,51 @@ const landingMessages = {
     source: "ソースコード",
     preview: "Takoserver Consoleのリソース一覧（公開用サンプルデータ）",
     previewAlt:
-      "helloというWorkerのリソース一式とSQLiteデータベースがすべて反映済みになっている、Takoserver Consoleのリソース一覧（公開用サンプルデータ）",
+      "Takoserver Consoleのリソース一覧。helloというWorkerとその版・配信・公開先が稼働中で、WorkerBundleとSQLiteデータベースも並んでいます（公開用サンプルデータ）",
     formsTitle: "デプロイできるもの",
     formsBody:
-      "Hostは、設定で組み合わせたFormだけを提供します。使う前に、HostのsupportエンドポイントでForm URLごとに対応を確認できます。",
+      "Takoformでは、Worker・データベース・キューといったリソースの種類ごとの定義をFormと呼び、公開元がバージョン付きのURLで公開します。対応するHostであれば、どこでも同じ意味のリソースになります。Takoserverは次のFormを動かせます。",
+    formsNeeds:
+      "成果物は、Bunと設定への短い記述の追加だけで使えます。それ以外には下の手順2のWorker実行環境が必要で、ホスト名で公開するには手順3も必要です。動いているHostには、Form URLごとに対応しているかを問い合わせられます。",
+    takoform: "Takoformについて",
     artifactsTitle: "成果物",
     artifactsBody:
-      "Workerのコード・静的ファイル・SQLのマイグレーションを、URLとSHA-256で固定して保持します。Bunと、TAKOSERVER_TAKOFORM_V2_CONFIGにあるそのFormのblockだけで使えます。",
+      "Workerのコード・静的ファイル・SQLのマイグレーションを、URLとSHA-256で固定して保持します。",
     workersTitle: "Workerと公開",
     workersBody:
-      "Workerを作り、版を作り、配信する版を決め、定期実行し、HTTPSのホスト名で公開します。完全なlocal Worker profile（下の手順4）が必要で、WorkerEndpointには443番のHTTPS listenerも必要です。",
+      "Workerを作り、版を作り、配信する版を決め、定期実行し、専用のHTTPSホスト名で公開します。",
     dataTitle: "データ",
-    dataBody:
-      "WorkerがBindingで使うSQLiteデータベース、KV、オブジェクトストレージです。完全なlocal Worker profileが必要で、SQLiteMigrationApplicationにはsqliteMigrationSetのblockも必要です。",
+    dataBody: "WorkerがBindingで使うSQLiteデータベース、KV、オブジェクトストレージです。",
     asyncTitle: "キュー・Actor・Workflow",
-    asyncBody:
-      "少なくとも一度届くキューとその受信、状態を持つActor、永続するWorkflowです。完全なlocal Worker profileが必要です。",
+    asyncBody: "少なくとも一度届くキューとその受信、状態を持つActor、永続するWorkflowです。",
     hostTitle: "自分のHostを動かす",
     hostStep1:
-      "Linux x86-64とBunを用意し、reviewしたcommitを取り出して、lockfileで固定された依存関係をインストールします。",
-    hostStep2: "公開HTTPS origin、v2設定、永続するcursor鍵を設定します。",
+      "Linux x86-64のマシンとBunを用意します。レビュー済みのコミットを取り出し（リリースのタグなら、そのリリースのworkerdと揃います）、ロックファイルで固定された依存関係をインストールします。",
+    hostStep2:
+      "Workerの実行環境を加えます。GitHub Releaseにある固定版のworkerdをSHA256SUMSで確認して置き、Workflow execution guard（同じチェックアウトからGoでビルドする小さなプログラム）を用意します。",
     hostStep3:
-      "起動します。IDプロバイダーが未設定なら、初回起動時に一度だけ使える運営者サインイン用のassertionが表示されます。",
+      "HTTPSを用意します。Worker用に、*.apps.example.comのようなワイルドカードのDNS名と証明書を用意します。ワイルドカード証明書はDNSチャレンジで発行するため、DNSプロバイダーのAPIが必要です。443番はHost自身がWorkerの配信に使うので、APIはCaddyなどのフロントエンドの背後に、8443番など別のポートで置きます。",
     hostStep4:
-      "Workerには完全なlocal Worker profileを追加します。固定版のworkerd、ActorとWorkflowの起動とWorkflow execution guard、5つのprivate data plane、selfhost-v2-worker-primaryに向けた2つのbundle blockです。ホスト名で公開するには443番のHTTPSも必要です。",
+      "設定を書いて起動します。常に必要な設定は3つで、Worker実行環境とHTTPSにはそれぞれ追加の設定があります（導入手順書の手順3）。Worker実行環境の設定が一部でも欠けると、Worker関連のFormは提供されません。IDプロバイダーが未設定なら、初回起動時に一度だけ使える運営者サインイン用のassertionが表示されます。",
     hostNote:
-      "APIは自分で用意したHTTPSフロントエンドの背後で公開し、listenerを直接公開しないでください。Workerを動かさずにAPI・サインイン・組織・APIキーを試すならDockerを使えます。",
+      "Worker実行環境と443番がなくても、Hostは成果物を保持し、API・サインイン・組織・APIキーを提供します。そこまでを手早く試すならDockerを使えます。",
+    releases: "GitHub Releases",
     prerequisites: "前提条件",
     docker: "Dockerで試す",
     security: "セルフホストのセキュリティ",
     deployTitle: "Workerを1つデプロイする",
     deployBody:
-      "導入手順書のstep 6〜9を短くまとめた流れです。$V2と$KEYは手順書のstep 5で用意します。Host API v2は作成をOperationとして受け付けます。24時間以内に同じidempotency-keyで送り直すと、2つ目のリソースは作らず同じOperationを返します。",
+      "5つのリソースを、この順にcurlとHost API v2で作成します。作成はOperationとして受け付けられ、成功するまで状態を確認します。$V2・$F・$ORG・$KEYは導入手順書の手順5で用意します。手順書では、小さなcreate関数でこの流れ全体を実行します。",
+    createLabel:
+      "作成は1回のPOSTです。24時間以内に同じidempotency-keyで送り直すと、2つ目のWorkerは作らず同じOperationを返します。",
     workerStep: "Workerそのものです。版・配信・公開先はこれを参照します。",
-    bundleStep: "Hostに保持したworker.jsの内容を、URLとSHA-256で指定します。",
-    versionStep: "そのbundleとfetchハンドラーを組み合わせた版です。",
+    bundleStep:
+      "worker.jsの内容をURLとSHA-256で指定します。公開HTTPSに置けばHostが取得し、Hostへ事前に保持させることもできます。",
+    versionStep: "そのWorkerBundleとfetchハンドラーを組み合わせた版です。",
     deploymentStep: "どの版を配信するかを決めます。ここでは1つの版を重み10000で配信します。",
     endpointStep: "WorkerをHTTPSのホスト名で公開します。",
-    resultLabel: "公開したら、リクエストします。",
-    deployMore: "手順書のstep 6〜9",
+    resultLabel: "公開したら、Endpointの作成で返ったUIDを$ENDPOINTに入れてリクエストします。",
+    deployMore: "手順書の手順6〜9",
     afterTitle: "デプロイしたあと",
     consoleTitle: "コンソールで",
     consoleBody:
@@ -199,11 +214,11 @@ const FORM_GROUPS = [
 
 /** The Worker chain of the install guide, in the order it is created. */
 const DEPLOY_CHAIN = [
-  ["ModuleWorker", "hello", "workerStep"],
-  ["WorkerBundle", "hello-bundle-v1", "bundleStep"],
-  ["WorkerVersion", "hello-version-v1", "versionStep"],
-  ["WorkerDeployment", "hello-deployment", "deploymentStep"],
-  ["WorkerEndpoint", "hello-endpoint", "endpointStep"],
+  ["ModuleWorker 0.3.0", "hello", "workerStep"],
+  ["WorkerBundle 0.2.0", "hello-bundle-v1", "bundleStep"],
+  ["WorkerVersion 0.5.0", "hello-version-v1", "versionStep"],
+  ["WorkerDeployment 0.4.0", "hello-deployment", "deploymentStep"],
+  ["WorkerEndpoint 0.3.0", "hello-endpoint", "endpointStep"],
 ] as const;
 
 /** The product mark — the pixel tako, drawn once so the page can place it
@@ -309,6 +324,7 @@ pre .out { color: var(--accent); }
 .steps > li > * { grid-column: 2; min-width: 0; }
 .steps p { margin: 0; color: var(--ink-1); font-size: 15px; }
 .steps pre { margin-top: 12px; }
+.steps .more { margin-top: 8px; }
 .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .chips code { padding: 4px 10px; border: 1px solid var(--line-1); border-radius: 999px; background: var(--surface-2); font: 12.5px/1.6 var(--mono); overflow-wrap: anywhere; }
 .note { margin: 24px 0 0; max-width: 44em; color: var(--ink-2); font-size: 14px; }
@@ -335,6 +351,8 @@ footer { display: flex; align-items: center; justify-content: space-between; fle
 .error .pill { margin-top: 28px; }
 
 @media (min-width: 761px) and (max-width: 1100px) { .preview .frame { max-width: 848px; margin-inline: auto; } }
+/* Below desktop width the code beside each list would scroll sideways, so the columns stack. */
+@media (max-width: 1200px) { .deploy, .host { grid-template-columns: minmax(0, 1fr); gap: 24px; } }
 @media (max-width: 760px) {
   .shell { width: calc(100% - 32px); }
   .top { height: 72px; }
@@ -461,9 +479,11 @@ ${preview}
 <section class="block" id="forms" aria-labelledby="forms-title">
 ${text("formsTitle", "h2", ' id="forms-title"')}
 ${text("formsBody", "p", ' class="intro"')}
+${text("formsNeeds", "p", ' class="intro"')}
 <dl class="forms">
 ${formGroups}
 </dl>
+<p class="more"><a href="${TAKOFORM}" data-i18n="takoform">${copy.takoform}</a></p>
 </section>
 
 
@@ -475,9 +495,9 @@ ${text("hostTitle", "h2", ' id="start-title"')}
 cd takoserver
 git checkout --detach &lt;reviewed-commit&gt;
 bun install --frozen-lockfile</pre></li>
-<li>${text("hostStep2", "p")}<span class="chips"><code>TAKOSERVER_PUBLIC_ORIGIN</code><code>TAKOSERVER_TAKOFORM_V2_CONFIG</code><code>TAKOSERVER_TAKOFORM_V2_CURSOR_KEY</code></span></li>
-<li>${text("hostStep3", "p")}<pre>bun --no-env-file src/entry-bun.ts</pre></li>
-<li>${text("hostStep4", "p")}</li>
+<li>${text("hostStep2", "p")}<p class="more"><a href="${RELEASES}" data-i18n="releases">${copy.releases}</a></p></li>
+<li>${text("hostStep3", "p")}</li>
+<li>${text("hostStep4", "p")}<span class="chips"><code>TAKOSERVER_PUBLIC_ORIGIN</code><code>TAKOSERVER_TAKOFORM_V2_CONFIG</code><code>TAKOSERVER_TAKOFORM_V2_CURSOR_KEY</code></span><pre>bun --no-env-file src/entry-bun.ts</pre></li>
 </ol>
 <aside>
 ${text("hostNote", "p", ' class="note"')}
@@ -495,6 +515,13 @@ ${text("deployBody", "p", ' class="intro"')}
 ${chain}
 </ol>
 <div class="code">
+${text("createLabel", "p")}
+<pre>jq -n --arg form "$F/ModuleWorker/0.3.0/" --arg space "$ORG" \\
+  '{$form, $space, name: "hello", spec: {}}' |
+curl -sS "$V2/resources" --data @- \\
+  -H "authorization: Bearer $KEY" \\
+  -H "content-type: application/json" \\
+  -H "idempotency-key: takoserver-first-use-hello"</pre>
 <pre><span class="file">worker.js</span>export default {
   fetch() { return new Response("hello from takoserver\\n"); },
 };</pre>

@@ -740,3 +740,111 @@ test("what names a Resource says how many it checked when it stops early", async
   expect(found.checked).toBe(15);
   expect(found.referrers.map((entry) => entry.resource.uid)).toEqual(["uid-2-a"]);
 });
+
+test("the overview shows each Worker with its state and address", async () => {
+  const body = installDom();
+  const { consoleLocale } = await import("../console/src/i18n.ts");
+  const { organizations, selectOrganization, setApiOrigin } = await import(
+    "../console/src/state.ts"
+  );
+  const { overviewPage } = await import("../console/src/pages/overview.ts");
+  consoleLocale.set("en");
+  setApiOrigin("https://api.example.test");
+  const organization = {
+    id: "org-one",
+    name: "One",
+    ownerPrincipalId: "owner",
+    createdAt: "2026-10-07",
+  };
+  organizations.set([organization]);
+  selectOrganization(organization.id);
+  const forms = "https://edge.forms.takoform.com/forms";
+  const item = (uid: string, form: string, spec: unknown, output = {}, observed = {}) => ({
+    uid,
+    form: `${forms}/${form}/`,
+    space: "org-one",
+    name: uid,
+    generation: 1,
+    observedGeneration: 1,
+    observedAt: "2026-10-07T00:00:00Z",
+    phase: "idle" as const,
+    spec,
+    observed,
+    output,
+    lastOperation: `op-${uid}`,
+  });
+  const items = [
+    item("draft", "ModuleWorker/0.3.0", {}, {}, { ready: true }),
+    item(
+      "draft-deployment",
+      "WorkerDeployment/0.4.0",
+      { worker: { resourceUid: "draft" } },
+      {},
+      { ready: true },
+    ),
+    {
+      ...item(
+        "draft-endpoint",
+        "WorkerEndpoint/0.3.0",
+        { worker: { resourceUid: "draft" } },
+        { url: "https://draft.apps.example.com/" },
+      ),
+      observedGeneration: 0,
+      phase: "pending" as const,
+    },
+    item("hello", "ModuleWorker/0.3.0", {}, {}, { ready: true }),
+    item(
+      "hello-deployment",
+      "WorkerDeployment/0.4.0",
+      { worker: { resourceUid: "hello" } },
+      {},
+      { ready: true },
+    ),
+    item(
+      "hello-endpoint",
+      "WorkerEndpoint/0.3.0",
+      { worker: { resourceUid: "hello" } },
+      { url: "https://hello.apps.example.com/" },
+      { activeDeploymentRouteReady: true },
+    ),
+  ];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/wallet"))
+        return Response.json({
+          wallet: {
+            organizationId: "org-one",
+            availableMicros: "0",
+            heldMicros: "0",
+            settledMicros: "0",
+            currency: "USD",
+            unit: "USD-micros",
+            moneyPolicy: "usd-micros-v2",
+            entries: [],
+          },
+        });
+      if (path.endsWith("/operations")) return Response.json({ operations: [] });
+      return Response.json({ items, nextCursor: null });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  body.append(overviewPage(organization) as unknown as NodeStub);
+  await settle();
+  expect(body.textContent).toContain("Workers");
+  expect(body.textContent).toContain("Where your Workers are served");
+  expect(body.textContent).not.toContain("what changed recently");
+  const links = body.all().filter((node) => node.tag === "a");
+  expect(links.find((node) => node.textContent === "hello")?.attributes.get("href")).toBe(
+    "/resources/hello",
+  );
+  expect(
+    links.some((node) => node.attributes.get("href") === "https://hello.apps.example.com/"),
+  ).toBe(true);
+  // An Endpoint still settling shows its address as text with its own state.
+  expect(
+    links.some((node) => node.attributes.get("href") === "https://draft.apps.example.com/"),
+  ).toBe(false);
+  expect(body.textContent).toContain("https://draft.apps.example.com/");
+  expect(body.textContent).toContain("Pending");
+});

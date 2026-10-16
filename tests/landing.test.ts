@@ -31,7 +31,7 @@ describe("Takoserver public site", () => {
     expect(html).not.toContain("<script src=");
   });
 
-  test("lists the Forms a self-host can compose, with versions and what each group needs", () => {
+  test("explains Takoform and lists the Forms a self-host can compose, with versions", () => {
     const html = landingHtml(site);
     for (const form of [
       "WorkerBundle 0.2.0",
@@ -53,22 +53,37 @@ describe("Takoserver public site", () => {
     ]) {
       expect(html).toContain(`<code>${form}</code>`);
     }
-    expect(html).toContain("that Form's block in TAKOSERVER_TAKOFORM_V2_CONFIG");
-    expect(html).toContain("WorkerEndpoint also needs the HTTPS listener on port 443");
-    expect(html).toContain("SQLiteMigrationApplication also needs a sqliteMigrationSet block");
+    expect(html).toContain("Takoform describes each kind of resource");
+    expect(html).toContain(
+      '<a href="https://takoform.com" data-i18n="takoform">About Takoform</a>',
+    );
+    expect(html).toContain(
+      "Artifacts need only Bun and a short block in the Host's settings. Everything else needs the Worker runtime of step 2 below, and publishing at a hostname also needs step 3.",
+    );
+    // The marketing page names what an operator does, not the Host's internal profile.
+    expect(html).not.toMatch(
+      /local Worker profile|data plane|bundle block|selfhost-v2-worker-primary/u,
+    );
   });
 
   test("walks one Worker through the guide's create chain to its response", () => {
     const html = landingHtml(site);
     const order = [
-      "ModuleWorker",
-      "WorkerBundle",
-      "WorkerVersion",
-      "WorkerDeployment",
-      "WorkerEndpoint",
+      "ModuleWorker 0.3.0",
+      "WorkerBundle 0.2.0",
+      "WorkerVersion 0.5.0",
+      "WorkerDeployment 0.4.0",
+      "WorkerEndpoint 0.3.0",
     ].map((kind) => html.indexOf(`<strong>${kind} <span>`));
     expect(order.every((index) => index > 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
+    // One create, as the guide's create function sends it.
+    expect(html).toContain(
+      'jq -n --arg form "$F/ModuleWorker/0.3.0/" --arg space "$ORG" \\\n' +
+        "  '{$form, $space, name: \"hello\", spec: {}}' |\n" +
+        'curl -sS "$V2/resources" --data @- \\\n',
+    );
+    expect(html).toContain('-H "idempotency-key: takoserver-first-use-hello"');
     expect(html).toContain('return new Response("hello from takoserver\\n");');
     expect(html).toContain('curl -sS "https://$NAME/"');
     expect(html).toContain('<span class="out">hello from takoserver</span>');
@@ -82,7 +97,13 @@ describe("Takoserver public site", () => {
     );
     expect(html).toContain("<code>TAKOSERVER_TAKOFORM_V2_CURSOR_KEY</code>");
     expect(html).toContain("bun --no-env-file src/entry-bun.ts");
-    expect(html).toContain("both bundle blocks on selfhost-v2-worker-primary");
+    // What a Worker Host needs, in plain terms: workerd, the guard, HTTPS and a wildcard name.
+    expect(html).toContain(
+      "the pinned workerd from a GitHub Release, checked against its SHA256SUMS",
+    );
+    expect(html).toContain("the Workflow execution guard, a small Go program");
+    expect(html).toContain("a wildcard DNS name and certificate, such as *.apps.example.com");
+    expect(html).toContain('href="https://github.com/tako0614/takoserver/releases"');
     expect(html).toContain("docs/self-host-operations.md#1-prerequisites");
     expect(html).toContain("docs/self-host-docker.md");
   });
