@@ -1,8 +1,10 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { bytesDigest, canonicalJson } from "../src/json.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject } from "../src/ports.ts";
@@ -16,12 +18,22 @@ import {
   type SelfhostV2ObjectBucketIdentity,
 } from "../src/providers/selfhost-v2-object-bucket-store.ts";
 import {
+  selfhostWorkerPreludeModuleName,
+  selfhostWorkerPreludeSource,
+} from "../src/providers/selfhost-worker-prelude.ts";
+import {
+  SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT,
   SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE,
   SELFHOST_DATA_PLANE_OBJECT_PROTOCOL,
   SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER,
   SELFHOST_DATA_PLANE_OBJECT_RESULT_HEADER,
   SELFHOST_DATA_PLANE_OBJECTS_PATH,
+  SELFHOST_V2_OBJECT_BUCKET_BINDING_ORIGIN,
+  SELFHOST_V2_OBJECT_BUCKET_BINDING_PATH,
+  SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
+  selfhostWorkerEntrypointSource,
 } from "../src/providers/selfhost-worker-wrapper.ts";
+import { WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING } from "../src/providers/workerd-v2-private-binding-names.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import {
@@ -181,6 +193,722 @@ function decodeResult(response: Response): Record<string, unknown> {
   if (!encoded) throw new Error("object result header missing");
   return JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as Record<string, unknown>;
 }
+
+function fragmentedObjectWire(chunks: readonly (readonly number[])[]): ReadableStream<Uint8Array> {
+  let index = 0;
+  return new ReadableStream<Uint8Array>(
+    {
+      pull(controller) {
+        if (index === chunks.length) controller.close();
+        else {
+          const chunk = chunks[index++];
+          if (chunk === undefined) throw new Error("missing wire fixture chunk");
+          controller.enqueue(new Uint8Array(chunk));
+        }
+      },
+    },
+    { highWaterMark: 0 },
+  );
+}
+
+test("signed ObjectBucket raw writes require a declared length before reading a body", async () => {
+  const host = await fixture();
+  try {
+    const empty = await host.request({
+      binding: "MEDIA",
+      op: "put",
+      key: "legacy-empty",
+      contentLength: 0,
+    });
+    expect(await empty.json()).toMatchObject({ ok: true, value: { size: 0 } });
+    const prior = await host.request(
+      { binding: "MEDIA", op: "put", key: "previous-raw", contentLength: 6 },
+      "stable",
+    );
+    expect(await prior.json()).toMatchObject({ ok: true, value: { size: 6 } });
+    const upload = await host.request({
+      binding: "MEDIA",
+      op: "createMultipartUpload",
+      key: "part-raw",
+    });
+    const { uploadId } = ((await upload.json()) as { value: { uploadId: string } }).value;
+    const part = await host.request(
+      {
+        binding: "MEDIA",
+        op: "uploadPart",
+        key: "part-raw",
+        uploadId,
+        partNumber: 1,
+        contentLength: 7,
+      },
+      "receipt",
+    );
+    const { etag } = ((await part.json()) as { value: { etag: string } }).value;
+    for (const document of [
+      { op: "put", key: "previous-raw" },
+      { op: "uploadPart", key: "part-raw", uploadId, partNumber: 1 },
+    ]) {
+      let reads = 0;
+      let bodyAccesses = 0;
+      const body = new ReadableStream<Uint8Array>(
+        {
+          pull(controller) {
+            reads += 1;
+            controller.enqueue(new TextEncoder().encode("replacement"));
+            controller.close();
+          },
+        },
+        { highWaterMark: 0 },
+      );
+      const request = new Request(`${ORIGIN}${SELFHOST_DATA_PLANE_OBJECTS_PATH}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${host.token}`,
+          [SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER]: Buffer.from(
+            JSON.stringify({
+              protocol: SELFHOST_DATA_PLANE_OBJECT_PROTOCOL,
+              binding: "MEDIA",
+              ...document,
+            }),
+          ).toString("base64url"),
+        },
+        body,
+      });
+      Object.defineProperty(request, "body", {
+        get() {
+          bodyAccesses += 1;
+          return body;
+        },
+      });
+      try {
+        const response = await host.broker.handle(request);
+        expect(await response?.json()).toEqual({
+          ok: false,
+          error: { code: "backend_unavailable" },
+        });
+        expect(bodyAccesses).toBe(0);
+        expect(reads).toBe(0);
+        expect(body.locked).toBe(false);
+        const old = await host.request({ binding: "MEDIA", op: "get", key: "previous-raw" });
+        expect(await old.text()).toBe("stable");
+      } finally {
+        await body.cancel().catch(() => undefined);
+      }
+    }
+    host.reopen();
+    const completed = await host.request({
+      binding: "MEDIA",
+      op: "completeMultipartUpload",
+      key: "part-raw",
+      uploadId,
+      parts: [{ etag, partNumber: 1 }],
+    });
+    expect(await completed.json()).toMatchObject({ ok: true, value: { size: 7 } });
+    const oldPart = await host.request({ binding: "MEDIA", op: "get", key: "part-raw" });
+    expect(await oldPart.text()).toBe("receipt");
+  } finally {
+    host.close();
+  }
+});
+
+test("signed ObjectBucket framed receiver assembles fragmented records and validated zero-byte EOF", async () => {
+  const host = await fixture();
+  try {
+    const put = await host.request(
+      {
+        binding: "MEDIA",
+        op: "put",
+        key: "fragmented",
+        bodyFormat: SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT,
+      },
+      fragmentedObjectWire([
+        [],
+        [0, 0],
+        [],
+        [0],
+        [2, 104],
+        [],
+        [101],
+        [0, 0, 0],
+        [3],
+        [108, 108],
+        [],
+        [111, 255, 255],
+        [255],
+        [],
+        [255],
+        [],
+      ]),
+    );
+    expect(await put.json()).toEqual({
+      ok: true,
+      value: {
+        etag: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        size: 5,
+      },
+    });
+    const found = await host.request({ binding: "MEDIA", op: "get", key: "fragmented" });
+    expect(decodeResult(found)).toMatchObject({ size: 5 });
+    expect(await found.text()).toBe("hello");
+    const emptyWires = [
+      [[255], [], [255, 255], [255], []],
+      [[], [255, 255, 255, 255], []],
+    ];
+    for (const [index, chunks] of emptyWires.entries()) {
+      const zero = await host.request(
+        {
+          binding: "MEDIA",
+          op: "put",
+          key: `zero-frame-${index}`,
+          bodyFormat: SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT,
+        },
+        fragmentedObjectWire(chunks),
+      );
+      expect(await zero.json()).toEqual({
+        ok: true,
+        value: {
+          etag: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          size: 0,
+        },
+      });
+      const zeroGet = await host.request({
+        binding: "MEDIA",
+        op: "get",
+        key: `zero-frame-${index}`,
+      });
+      expect(await zeroGet.text()).toBe("");
+    }
+  } finally {
+    host.close();
+  }
+});
+
+test("signed ObjectBucket framed receiver refuses malformed EOF without changing objects or part receipts", async () => {
+  const host = await fixture();
+  try {
+    const prior = await host.request(
+      { binding: "MEDIA", op: "put", key: "previous-frame", contentLength: 6 },
+      "stable",
+    );
+    expect(await prior.json()).toMatchObject({ ok: true, value: { size: 6 } });
+    const upload = await host.request({
+      binding: "MEDIA",
+      op: "createMultipartUpload",
+      key: "part-frame-recovery",
+    });
+    const { uploadId } = ((await upload.json()) as { value: { uploadId: string } }).value;
+    const original = await host.request(
+      {
+        binding: "MEDIA",
+        op: "uploadPart",
+        key: "part-frame-recovery",
+        uploadId,
+        partNumber: 1,
+        contentLength: 8,
+      },
+      "original",
+    );
+    const { etag, partNumber } = (
+      (await original.json()) as { value: { etag: string; partNumber: number } }
+    ).value;
+    const malformed: { reason: string; chunks: readonly (readonly number[])[] }[] = [
+      { reason: "clean empty HTTP EOF is not producer EOF", chunks: [[], []] },
+      {
+        reason: "zero-length wire data records cannot inflate the frame budget",
+        chunks: [
+          [0, 0, 0, 0],
+          [255, 255, 255, 255],
+        ],
+      },
+      { reason: "data without terminal", chunks: [[0, 0, 0, 3], [1, 2, 3], []] },
+      { reason: "truncated length header", chunks: [[0], [], [0, 0]] },
+      { reason: "truncated record data", chunks: [[0, 0, 0, 3], [1], [], [2]] },
+      { reason: "record exceeds 65536 bytes", chunks: [[0, 1], [], [0, 1]] },
+      { reason: "truncated terminal after data", chunks: [[0, 0, 0, 1, 65, 255, 255], [255]] },
+      {
+        reason: "trailing byte buffered with terminal",
+        chunks: [[0, 0, 0, 1, 65, 255, 255, 255, 255, 9]],
+      },
+      { reason: "trailing byte in later wire chunk", chunks: [[255, 255, 255, 255], [], [9]] },
+      {
+        reason: "duplicate terminal",
+        chunks: [
+          [255, 255, 255, 255],
+          [255, 255, 255, 255],
+        ],
+      },
+    ];
+    for (const malformedWire of malformed) {
+      const put = await host.request(
+        {
+          binding: "MEDIA",
+          op: "put",
+          key: "previous-frame",
+          bodyFormat: SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT,
+        },
+        fragmentedObjectWire(malformedWire.chunks),
+      );
+      expect({ reason: malformedWire.reason, result: await put.json() }).toEqual({
+        reason: malformedWire.reason,
+        result: { ok: false, error: { code: "backend_unavailable" } },
+      });
+      const replacement = await host.request(
+        {
+          binding: "MEDIA",
+          op: "uploadPart",
+          key: "part-frame-recovery",
+          uploadId,
+          partNumber: 1,
+          bodyFormat: SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT,
+        },
+        fragmentedObjectWire(malformedWire.chunks),
+      );
+      expect({ reason: malformedWire.reason, result: await replacement.json() }).toEqual({
+        reason: malformedWire.reason,
+        result: { ok: false, error: { code: "backend_unavailable" } },
+      });
+      const previous = await host.request({ binding: "MEDIA", op: "get", key: "previous-frame" });
+      expect(await previous.text()).toBe("stable");
+    }
+    host.reopen();
+    const previous = await host.request({ binding: "MEDIA", op: "get", key: "previous-frame" });
+    expect(await previous.text()).toBe("stable");
+    const completed = await host.request({
+      binding: "MEDIA",
+      op: "completeMultipartUpload",
+      key: "part-frame-recovery",
+      uploadId,
+      parts: [{ etag, partNumber }],
+    });
+    expect(await completed.json()).toMatchObject({ ok: true, value: { size: 8 } });
+    const recovered = await host.request({
+      binding: "MEDIA",
+      op: "get",
+      key: "part-frame-recovery",
+    });
+    expect(await recovered.text()).toBe("original");
+  } finally {
+    host.close();
+  }
+});
+
+test("signed ObjectBucket framed receiver checks declared logical bytes rather than framing bytes", async () => {
+  const host = await fixture();
+  try {
+    const helloFrame = () =>
+      fragmentedObjectWire([[0, 0], [0, 5, 104, 101], [], [108, 108, 111], [255, 255, 255, 255]]);
+    const exact = await host.request(
+      {
+        binding: "MEDIA",
+        op: "put",
+        key: "declared-frame",
+        contentLength: 5,
+        bodyFormat: SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT,
+      },
+      helloFrame(),
+    );
+    expect(await exact.json()).toMatchObject({ ok: true, value: { size: 5 } });
+    const upload = await host.request({
+      binding: "MEDIA",
+      op: "createMultipartUpload",
+      key: "declared-frame-part",
+    });
+    const { uploadId } = ((await upload.json()) as { value: { uploadId: string } }).value;
+    const exactPart = await host.request(
+      {
+        binding: "MEDIA",
+        op: "uploadPart",
+        key: "declared-frame-part",
+        uploadId,
+        partNumber: 1,
+        contentLength: 5,
+        bodyFormat: SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT,
+      },
+      helloFrame(),
+    );
+    const partEnvelope = (await exactPart.json()) as {
+      ok: boolean;
+      value: { etag: string; partNumber: number; size: number };
+    };
+    expect(partEnvelope).toEqual({
+      ok: true,
+      value: {
+        etag: "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        partNumber: 1,
+        size: 5,
+      },
+    });
+    for (const contentLength of [4, 6, 13]) {
+      const mismatch = await host.request(
+        {
+          binding: "MEDIA",
+          op: "put",
+          key: "declared-frame",
+          contentLength,
+          bodyFormat: SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT,
+        },
+        helloFrame(),
+      );
+      expect(await mismatch.json()).toEqual({ ok: false, error: { code: "invalid_body" } });
+      const partMismatch = await host.request(
+        {
+          binding: "MEDIA",
+          op: "uploadPart",
+          key: "declared-frame-part",
+          uploadId,
+          partNumber: 1,
+          contentLength,
+          bodyFormat: SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT,
+        },
+        helloFrame(),
+      );
+      expect(await partMismatch.json()).toEqual({ ok: false, error: { code: "invalid_body" } });
+      const prior = await host.request({ binding: "MEDIA", op: "get", key: "declared-frame" });
+      expect(await prior.text()).toBe("hello");
+    }
+    const completed = await host.request({
+      binding: "MEDIA",
+      op: "completeMultipartUpload",
+      key: "declared-frame-part",
+      uploadId,
+      parts: [{ etag: partEnvelope.value.etag, partNumber: 1 }],
+    });
+    expect(await completed.json()).toMatchObject({ ok: true, value: { size: 5 } });
+    const partBody = await host.request({
+      binding: "MEDIA",
+      op: "get",
+      key: "declared-frame-part",
+    });
+    expect(await partBody.text()).toBe("hello");
+  } finally {
+    host.close();
+  }
+});
+
+/** Import the shipped facade, then bridge its private service to the signed broker. */
+async function generatedObjectTenant(host: Awaited<ReturnType<typeof fixture>>, body: string) {
+  const directory = mkdtempSync(join(host.root, "generated-tenant-"));
+  const main = "tenant.mjs";
+  await Bun.write(
+    join(directory, main),
+    `function chunks(values) {
+      let index = 0;
+      return new ReadableStream({
+        pull(controller) {
+          if (index === values.length) controller.close();
+          else controller.enqueue(new Uint8Array(values[index++]));
+        }
+      }, { highWaterMark: 0 });
+    }
+    async function failure(operation) {
+      try { await operation(); return null; }
+      catch (error) { return { name: error.name, message: error.message }; }
+    }
+    export default { async fetch(request, env) { ${body} } };`,
+  );
+  await Bun.write(
+    join(directory, selfhostWorkerPreludeModuleName(main)),
+    selfhostWorkerPreludeSource(),
+  );
+  const wrapper = join(directory, "wrapper.mjs");
+  await Bun.write(
+    wrapper,
+    selfhostWorkerEntrypointSource(
+      {
+        originalMainModule: main,
+        publication: "object-stream-test",
+        probeHostname: "stream-test.selfhost-internal.invalid",
+        declaredHandlers: ["fetch"],
+        bindings: [
+          {
+            kind: SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND,
+            publicName: "MEDIA",
+            internalName: WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
+          },
+        ],
+      },
+      true,
+    ),
+  );
+  const { default: worker } = (await import(pathToFileURL(wrapper).href)) as {
+    default: {
+      fetch(request: Request, env: Record<string, unknown>, context: object): Promise<Response>;
+    };
+  };
+  const wire: {
+    document: Record<string, unknown>;
+    contentLength: string | null;
+    result?: Record<string, unknown>;
+  }[] = [];
+  return {
+    wire,
+    async fetch() {
+      return await worker.fetch(
+        new Request("https://tenant.example/stream"),
+        {
+          [WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING]: {
+            async fetch(url: string, init: RequestInit) {
+              if (
+                url !==
+                `${SELFHOST_V2_OBJECT_BUCKET_BINDING_ORIGIN}${SELFHOST_V2_OBJECT_BUCKET_BINDING_PATH}`
+              ) {
+                throw new Error("generated facade addressed the wrong private service route");
+              }
+              const headers = new Headers(init.headers);
+              const document = headers.get(SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER);
+              if (!document) throw new Error("generated facade omitted operation metadata");
+              const call: (typeof wire)[number] = {
+                document: JSON.parse(Buffer.from(document, "base64url").toString("utf8")),
+                contentLength: headers.get("content-length"),
+              };
+              wire.push(call);
+              headers.set("authorization", `Bearer ${host.token}`);
+              const response = await host.broker.handle(
+                new Request(`${ORIGIN}${SELFHOST_DATA_PLANE_OBJECTS_PATH}`, {
+                  ...init,
+                  headers,
+                  ...(init.body instanceof ReadableStream ? { duplex: "half" as const } : {}),
+                }),
+              );
+              if (!response) throw new Error("signed broker did not claim the object route");
+              if (!response.headers.has(SELFHOST_DATA_PLANE_OBJECT_RESULT_HEADER)) {
+                call.result = (await response.clone().json()) as Record<string, unknown>;
+              }
+              return response;
+            },
+          },
+        },
+        { waitUntil() {} },
+      );
+    },
+  };
+}
+
+test("generated tenant accepts omitted-length streams and hides private part size receipts", async () => {
+  const host = await fixture();
+  try {
+    const tenant = await generatedObjectTenant(
+      host,
+      `const put = await env.MEDIA.put("hello", chunks([[], [104, 101], [], [108, 108, 111]]));
+       const empty = await env.MEDIA.put("empty", chunks([[], []]));
+       const zeroUpload = await env.MEDIA.createMultipartUpload("zero-part");
+       const zeroPart = await env.MEDIA.uploadPart("zero-part", zeroUpload.uploadId, 1, chunks([[], []]));
+       const zeroDone = await env.MEDIA.completeMultipartUpload("zero-part", zeroUpload.uploadId, [zeroPart]);
+       const upload = await env.MEDIA.createMultipartUpload("small-part");
+       const part = await env.MEDIA.uploadPart("small-part", upload.uploadId, 1, chunks([[], [104, 101], [108, 108, 111]]));
+       const done = await env.MEDIA.completeMultipartUpload("small-part", upload.uploadId, [part]);
+       const found = await env.MEDIA.get("small-part");
+       return Response.json({ put, empty, zeroPart, zeroDone, part, done, text: await new Response(found.body).text() });`,
+    );
+    const response = await tenant.fetch();
+    expect(response.status).toBe(200);
+    const helloEtag = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    const emptyEtag = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    expect(await response.json()).toEqual({
+      put: { etag: helloEtag, size: 5 },
+      empty: { etag: emptyEtag, size: 0 },
+      zeroPart: { etag: emptyEtag, partNumber: 1 },
+      zeroDone: { etag: expect.stringMatching(/^[0-9a-f]{64}-1$/u), size: 0 },
+      part: { etag: helloEtag, partNumber: 1 },
+      done: { etag: expect.stringMatching(/^[0-9a-f]{64}-1$/u), size: 5 },
+      text: "hello",
+    });
+    const writes = tenant.wire.filter(({ document }) =>
+      ["put", "uploadPart"].includes(String(document.op)),
+    );
+    expect(writes).toHaveLength(4);
+    for (const write of writes) {
+      expect(write.document).not.toHaveProperty("contentLength");
+      expect(write.contentLength).toBeNull();
+    }
+    expect(
+      writes.filter(({ document }) => document.op === "uploadPart").map(({ result }) => result),
+    ).toEqual([
+      { ok: true, value: { etag: emptyEtag, partNumber: 1, size: 0 } },
+      { ok: true, value: { etag: helloEtag, partNumber: 1, size: 5 } },
+    ]);
+  } finally {
+    host.close();
+  }
+});
+
+test("generated tenant retains declared-length validation while unknown length is accepted", async () => {
+  const host = await fixture();
+  try {
+    const tenant = await generatedObjectTenant(
+      host,
+      `await env.MEDIA.put("existing", "stable");
+       const exact = await env.MEDIA.put("exact", chunks([[], [65], [66], []]), { contentLength: 2 });
+       const upload = await env.MEDIA.createMultipartUpload("declared-part");
+       const errors = [];
+       errors.push(await failure(() => env.MEDIA.put("existing", chunks([[65]]), { contentLength: 2 })));
+       errors.push(await failure(() => env.MEDIA.put("existing", chunks([[65], [66]]), { contentLength: 1 })));
+       errors.push(await failure(() => env.MEDIA.uploadPart("declared-part", upload.uploadId, 1, chunks([[65]]), { contentLength: 2 })));
+       errors.push(await failure(() => env.MEDIA.uploadPart("declared-part", upload.uploadId, 1, chunks([[65], [66]]), { contentLength: 1 })));
+       const undefinedPut = await failure(() => env.MEDIA.put("undefined-put", chunks([]), { contentLength: undefined }));
+       const undefinedPart = await failure(() => env.MEDIA.uploadPart("declared-part", upload.uploadId, 1, chunks([]), { contentLength: undefined }));
+       const previous = await env.MEDIA.get("existing");
+       return Response.json({ exact, errors, undefinedPut, undefinedPart, previous: await new Response(previous.body).text() });`,
+    );
+    const response = await tenant.fetch();
+    expect(response.status).toBe(200);
+    const result = (await response.json()) as Record<string, unknown>;
+    expect(result.exact).toEqual({
+      etag: "38164fbd17603d73f696b8b4d72664d735bb6a7c88577687fd2ae33fd6964153",
+      size: 2,
+    });
+    expect(result.errors).toEqual(
+      Array.from({ length: 4 }, () => ({ name: "invalid_body", message: "invalid_body" })),
+    );
+    expect(result.undefinedPut).toEqual({
+      name: "TypeError",
+      message: "invalid module-worker.object-bucket arguments",
+    });
+    expect(result.undefinedPart).toEqual(result.undefinedPut);
+    expect(result.previous).toBe("stable");
+    expect(
+      await (await host.request({ binding: "MEDIA", op: "head", key: "undefined-put" })).json(),
+    ).toEqual({ ok: true, value: { found: false } });
+  } finally {
+    host.close();
+  }
+});
+
+test("generated tenant failures preserve previous objects and part receipts across store reopen", async () => {
+  const host = await fixture();
+  try {
+    const tenant = await generatedObjectTenant(
+      host,
+      `function broken(kind) {
+         let sent = false;
+         return new ReadableStream({ pull(controller) {
+           if (!sent) { sent = true; controller.enqueue(new Uint8Array([1, 2, 3])); }
+           else if (kind === "producer") controller.error(new Error("private producer detail"));
+           else controller.enqueue("non-byte chunk");
+         } }, { highWaterMark: 0 });
+       }
+       await env.MEDIA.put("previous", "stable");
+       const upload = await env.MEDIA.createMultipartUpload("part-recovery");
+       const originalPart = await env.MEDIA.uploadPart("part-recovery", upload.uploadId, 1, chunks([[111, 114, 105, 103, 105, 110, 97, 108]]));
+       const errors = [];
+       for (const kind of ["producer", "non-byte"]) {
+         errors.push(await failure(() => env.MEDIA.put("previous", broken(kind))));
+         errors.push(await failure(() => env.MEDIA.put("new-failed", broken(kind))));
+         errors.push(await failure(() => env.MEDIA.uploadPart("part-recovery", upload.uploadId, 1, broken(kind))));
+       }
+       return Response.json({ uploadId: upload.uploadId, originalPart, errors });`,
+    );
+    const response = await tenant.fetch();
+    expect(response.status).toBe(200);
+    const result = (await response.json()) as {
+      uploadId: string;
+      originalPart: { etag: string; partNumber: number };
+      errors: { name: string; message: string }[];
+    };
+    expect(Object.keys(result.originalPart).sort()).toEqual(["etag", "partNumber"]);
+    expect(result.errors).toEqual([
+      ...Array.from({ length: 3 }, () => ({
+        name: "backend_unavailable",
+        message: "backend_unavailable",
+      })),
+      ...Array.from({ length: 3 }, () => ({ name: "invalid_body", message: "invalid_body" })),
+    ]);
+    host.reopen();
+    const previous = await host.request({ binding: "MEDIA", op: "get", key: "previous" });
+    expect(await previous.text()).toBe("stable");
+    expect(
+      await (await host.request({ binding: "MEDIA", op: "head", key: "new-failed" })).json(),
+    ).toEqual({ ok: true, value: { found: false } });
+    const recovered = await generatedObjectTenant(
+      host,
+      `const done = await env.MEDIA.completeMultipartUpload("part-recovery", ${JSON.stringify(result.uploadId)}, [${JSON.stringify(result.originalPart)}]);
+       const found = await env.MEDIA.get("part-recovery");
+       return Response.json({ done, text: await new Response(found.body).text() });`,
+    );
+    const recoveredResponse = await recovered.fetch();
+    expect(recoveredResponse.status).toBe(200);
+    expect(await recoveredResponse.json()).toEqual({
+      done: { etag: expect.stringMatching(/^[0-9a-f]{64}-1$/u), size: 8 },
+      text: "original",
+    });
+  } finally {
+    host.close();
+  }
+});
+
+test("generated tenant completes unequal unknown-length D05 parts using actual broker receipt sizes", async () => {
+  const host = await fixture();
+  try {
+    const tenant = await generatedObjectTenant(
+      host,
+      `function repeated(length, value) {
+         return new ReadableStream({ pull(controller) {
+           if (length === 0) { controller.close(); return; }
+           const size = Math.min(length, 65536);
+           length -= size;
+           controller.enqueue(new Uint8Array(size).fill(value));
+         } }, { highWaterMark: 0 });
+       }
+       const upload = await env.MEDIA.createMultipartUpload("unequal");
+       const parts = [];
+       parts.push(await env.MEDIA.uploadPart("unequal", upload.uploadId, 1, repeated(5242880, 65)));
+       parts.push(await env.MEDIA.uploadPart("unequal", upload.uploadId, 2, repeated(6291456, 66)));
+       parts.push(await env.MEDIA.uploadPart("unequal", upload.uploadId, 3, repeated(7, 67)));
+       const done = await env.MEDIA.completeMultipartUpload("unequal", upload.uploadId, parts);
+       return Response.json({ parts, done });`,
+    );
+    const response = await tenant.fetch();
+    expect(response.status).toBe(200);
+    const result = (await response.json()) as {
+      parts: { etag: string; partNumber: number }[];
+      done: { etag: string; size: number };
+    };
+    expect(result.done.size).toBe(11_534_343);
+    expect(result.done.etag).toMatch(/^[0-9a-f]{64}-3$/u);
+    expect(result.parts.map((part) => Object.keys(part).sort())).toEqual([
+      ["etag", "partNumber"],
+      ["etag", "partNumber"],
+      ["etag", "partNumber"],
+    ]);
+    const partCalls = tenant.wire.filter(({ document }) => document.op === "uploadPart");
+    expect(partCalls.map(({ result: wireResult }) => wireResult?.value)).toEqual(
+      result.parts.map((part, index) => ({ ...part, size: [5_242_880, 6_291_456, 7][index] })),
+    );
+    for (const call of partCalls) expect(call.document).not.toHaveProperty("contentLength");
+    host.reopen();
+    const found = await host.request({ binding: "MEDIA", op: "get", key: "unequal" });
+    expect(decodeResult(found)).toMatchObject({ size: 11_534_343, etag: result.done.etag });
+    if (!found.body) throw new Error("completed ObjectBucket body missing");
+    const reader = found.body.getReader();
+    const digest = createHash("sha256");
+    let offset = 0;
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      digest.update(next.value);
+      let local = 0;
+      while (local < next.value.byteLength) {
+        const value = offset < 5_242_880 ? 65 : offset < 11_534_336 ? 66 : 67;
+        const boundary =
+          offset < 5_242_880 ? 5_242_880 : offset < 11_534_336 ? 11_534_336 : 11_534_343;
+        const count = Math.min(boundary - offset, next.value.byteLength - local);
+        expect(count).toBeGreaterThan(0);
+        expect(next.value.subarray(local, local + count).every((byte) => byte === value)).toBe(
+          true,
+        );
+        local += count;
+        offset += count;
+      }
+    }
+    reader.releaseLock();
+    expect(offset).toBe(11_534_343);
+    expect(digest.digest("hex")).toBe(
+      "d12db80c0453ccff81ca75631ce9c67a437e4f8e088b79e65072f88f654e2ea5",
+    );
+  } finally {
+    host.close();
+  }
+}, 30_000);
 
 test("ObjectBucket broker requires a persistent signing key and exact grant shape", () => {
   expect(() => createSelfhostV2ObjectBucketBindingBroker({} as never)).toThrow(TypeError);

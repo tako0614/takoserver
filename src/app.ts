@@ -108,9 +108,18 @@ import {
   TokenError,
 } from "./token.ts";
 import {
+  assertSharedOriginCarrier,
   createWorkerEndpointOriginReservations,
   type WorkerEndpointOriginReservations,
 } from "./worker-endpoint-origin-reservations.ts";
+import {
+  createWorkerEndpointOriginV2Acceptance,
+  createWorkerEndpointOriginV2FormRouteAcceptance,
+} from "./worker-endpoint-origin-v2-acceptance.ts";
+import {
+  createWorkerRequestConsumers,
+  type WorkerRequestAppInputs,
+} from "./worker-request-composition.ts";
 
 /**
  * The composition root.
@@ -123,6 +132,8 @@ import {
  */
 
 export interface AppPorts {
+  /** Entry-owned fresh primary request composition; absent preserves ordinary construction. */
+  readonly workerRequest?: WorkerRequestAppInputs;
   /** The exact inventory/deployment stores precomposed for native startup. */
   readonly resourceStores?: AppResourceStoreBundle;
   /** Host-only optional data-plane factory, built against these same canonical ledgers. */
@@ -172,6 +183,16 @@ export interface AppPorts {
   readonly v2FormFactory?: V2OperatorFormFactory;
   /** Code-selected full and retained-only maps; exclusive with v2FormFactory. */
   readonly v2FormSelectionFactory?: V2OperatorFormSelectionFactory;
+  /** Code-only fixed staging/direct-Organization compiler selection; omission retains scalar. */
+  readonly v2WorkerEndpointOrigin?:
+    | (Omit<Parameters<typeof createWorkerEndpointOriginV2Acceptance>[0], "sql"> & {
+        readonly kind?: undefined;
+      })
+    | (Omit<Parameters<typeof createWorkerEndpointOriginV2FormRouteAcceptance>[0], "sql"> & {
+        readonly kind: "form-v2@1";
+      });
+  /** Code-selected fresh CREATE/UPDATE policy; absent preserves normal admission. */
+  readonly v2AllowFreshCreateAndUpdate?: boolean;
   /** Code-selected source for configured v2 artifact Forms; absent remains held-only. */
   readonly v2ArtifactSourceFactory?: V2OperatorArtifactSourceFactory;
   /** Explicit operator-private v2 keyring; absent disables privateInputs. */
@@ -343,6 +364,25 @@ export function buildApp(ports: AppPorts): App {
     );
   }
   const clock = ports.clock ?? (() => new Date());
+  const selectedWorkerEndpointOrigin = ports.v2WorkerEndpointOrigin;
+  const workerEndpointOriginConstruction =
+    selectedWorkerEndpointOrigin === undefined
+      ? undefined
+      : (() => {
+          const sql = ports.sql;
+          const { kind, formUrl, backendId, targetKey, ledger } = selectedWorkerEndpointOrigin;
+          if (kind !== undefined && kind !== "form-v2@1")
+            throw new TypeError("unsupported Worker Endpoint origin construction kind");
+          const inputs = { sql, formUrl, backendId, targetKey, ledger };
+          return Object.freeze({
+            sql,
+            shared: kind === "form-v2@1" ? Object.freeze({ kind, ledger }) : undefined,
+            acceptance:
+              kind === "form-v2@1"
+                ? createWorkerEndpointOriginV2FormRouteAcceptance(inputs)
+                : createWorkerEndpointOriginV2Acceptance(inputs),
+          });
+        })();
   if (ports.hostedBilling) {
     assertHostedBillingComposition(ports.hostedBilling, {
       sql: ports.sql,
@@ -371,26 +411,46 @@ export function buildApp(ports: AppPorts): App {
     randomId,
   });
 
-  const apiKeyAdministration = createApiKeyAdministration({
-    sql: ports.sql,
-    clock,
-    randomId,
-  });
-  const accounts = createAccounts({
-    sql: ports.sql,
-    identity: ports.identity,
-    clock,
-    randomId,
-    apiKeyAdministration,
-  });
-  const takoformV2Host = createTakoformV2Application({
-    sql: ports.sql,
+  const workerRequest =
+    ports.workerRequest === undefined
+      ? undefined
+      : createWorkerRequestConsumers({
+          ...ports.workerRequest,
+          sql: ports.sql,
+          identity: ports.identity,
+          clock,
+          randomId,
+          publicOrigin: ports.publicOrigin,
+          consoleOrigin: ports.consoleOrigin,
+        });
+  const apiKeyAdministration =
+    workerRequest?.apiKeyAdministration ??
+    createApiKeyAdministration({
+      sql: ports.sql,
+      clock,
+      randomId,
+    });
+  const accounts =
+    workerRequest?.accounts ??
+    createAccounts({
+      sql: ports.sql,
+      identity: ports.identity,
+      clock,
+      randomId,
+      apiKeyAdministration,
+    });
+  const v2AllowFreshCreateAndUpdate = ports.v2AllowFreshCreateAndUpdate;
+  const v2ApplicationOptions = {
+    sql: workerEndpointOriginConstruction?.sql ?? ports.sql,
     objects: ports.objects,
     accounts,
     publicOrigin: ports.publicOrigin,
     ...(ports.consoleOrigin === undefined ? {} : { consoleOrigin: ports.consoleOrigin }),
     config: ports.v2,
     clock,
+    ...(v2AllowFreshCreateAndUpdate === undefined
+      ? {}
+      : { allowFreshCreateAndUpdate: v2AllowFreshCreateAndUpdate }),
     ...(ports.v2FormFactory === undefined ? {} : { formFactory: ports.v2FormFactory }),
     ...(ports.v2FormSelectionFactory === undefined
       ? {}
@@ -401,7 +461,14 @@ export function buildApp(ports: AppPorts): App {
     ...(ports.v2PrivateInputCustody === undefined
       ? {}
       : { privateInputCustody: ports.v2PrivateInputCustody }),
-  });
+  };
+  const takoformV2Host =
+    workerEndpointOriginConstruction === undefined
+      ? createTakoformV2Application(v2ApplicationOptions)
+      : createTakoformV2Application(
+          v2ApplicationOptions,
+          workerEndpointOriginConstruction.acceptance,
+        );
   const integrationE2eCredentialRoute = integrationE2eCredentialAuthority
     ? createIntegrationE2eCredentialAuthority({
         configuration: integrationE2eCredentialAuthority,
@@ -530,8 +597,18 @@ export function buildApp(ports: AppPorts): App {
           providers: ports.providers ?? [],
           resources: inventory,
           deployments,
+          ...(workerEndpointOriginConstruction?.shared === undefined
+            ? {}
+            : { shared: workerEndpointOriginConstruction.shared }),
         })
       : undefined);
+  if (workerEndpointOriginConstruction?.shared !== undefined && originReservations !== undefined) {
+    assertSharedOriginCarrier(
+      originReservations,
+      ports.sql,
+      workerEndpointOriginConstruction.shared.ledger,
+    );
+  }
   if (ports.selfhostTenantRunCredentialAuthority && !originReservations) {
     throw new TypeError(
       "self-host tenant-run credentials require an endpoint reservation authority",
@@ -947,6 +1024,7 @@ export function buildApp(ports: AppPorts): App {
       : {}),
     control,
     dataAi,
+    ...(workerRequest === undefined ? {} : { sharedAuth: workerRequest.sharedAuth }),
     aiAvailable: ports.ai !== undefined,
     takoformV2Host,
     publicOrigin: ports.publicOrigin,

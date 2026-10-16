@@ -2,6 +2,7 @@ import { canonicalJson } from "../json.ts";
 import type { Clock, Sql, SqlParam } from "../ports.ts";
 import { WORKER_VERSION_FORM_URL } from "./forms/worker-specs.ts";
 import type { V2Execution } from "./types.ts";
+import { v2WorkerNativeIdentityDomainReady } from "./worker-native-identity-schema.ts";
 
 /** Native identity and byte-closure digest chosen before any external send. */
 export interface V2NativeEffectIdentity {
@@ -122,8 +123,16 @@ function sameIntent(row: IntentRow, identity: V2NativeEffectIdentity): boolean {
 export function createV2NativeEffectCustody(options: {
   readonly sql: Sql;
   readonly now?: Clock;
+  /** Source-selected physical domain seal, evaluated inside the existing send grant. */
+  readonly requiredNativeIdentityDomain?: "opaque255";
 }): V2NativeEffectCustody {
-  const { sql } = options;
+  const { sql, requiredNativeIdentityDomain } = options;
+  if (requiredNativeIdentityDomain !== undefined && requiredNativeIdentityDomain !== "opaque255")
+    throw new TypeError("unsupported required v2 Worker native identity domain");
+  const requiredDomainSuffix =
+    requiredNativeIdentityDomain === undefined
+      ? ""
+      : ` AND ${v2WorkerNativeIdentityDomainReady(requiredNativeIdentityDomain)}`;
   const now = options.now ?? (() => new Date());
 
   function currentTime(): number | null {
@@ -251,7 +260,7 @@ export function createV2NativeEffectCustody(options: {
          SELECT op.id, r.uid, op.principal, r.space, op.backend_key, op.backend_id,
            op.target_key, op.generation, ?, ?, op.lease_token, ${DB_NOW_MS}
          FROM tf_v2_operations op JOIN tf_v2_resources r ON r.uid = op.resource_uid
-         WHERE ${CLAIM}
+         WHERE ${CLAIM}${requiredDomainSuffix}
          ON CONFLICT(operation_id) DO NOTHING`,
         [identity.nativeIdentity, identity.closureDigest, ...claimParams(e, nowMs)],
       );

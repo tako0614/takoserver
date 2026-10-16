@@ -6,6 +6,10 @@ import type {
   WorkerModuleInspectionResult,
 } from "../worker-module-inspection-contract.ts";
 import type { SqlArtifactCustodyRead } from "./forms/artifact-custody.ts";
+import {
+  type ObjectBucketBindingForm,
+  snapshotObjectBucketBindingForms,
+} from "./forms/object-bucket-binding-profile.ts";
 import type { StaticAssetBundleManifest } from "./forms/static-asset-bundle.ts";
 import {
   parseWorkerBundleManifest,
@@ -13,7 +17,11 @@ import {
   type WorkerBundleManifest,
   type WorkerBundleMediaType,
 } from "./forms/worker-bundle.ts";
-import { parseWorkerVersionSpec } from "./forms/worker-specs.ts";
+import {
+  FORWARD_WORKER_VERSION_FORM_URL,
+  parseForwardWorkerVersionSpec,
+  parseWorkerVersionSpec,
+} from "./forms/worker-specs.ts";
 import {
   type V2VerifiedAssetMaterials,
   verifyV2AssetMaterials,
@@ -37,6 +45,7 @@ export interface V2ResolvedSqliteBinding {
 export interface V2ResolvedObjectBucketBinding {
   readonly name: string;
   readonly resourceUid: string;
+  readonly formUrl?: ObjectBucketBindingForm["formUrl"];
 }
 
 /** Exact accepted Core KV references verified by the lifecycle backend. */
@@ -114,6 +123,8 @@ export interface V2WorkerCodeEligibilityInput {
   readonly bundleResourceUid?: string;
   readonly assetResourceUid?: string;
   readonly spec: unknown;
+  /** Set only by the exact07 held-material resolver; this is compiler metadata. */
+  readonly sourceForm?: typeof FORWARD_WORKER_VERSION_FORM_URL;
   readonly bundle: SqlArtifactCustodyRead<WorkerBundleManifest> | null;
   readonly assets?: SqlArtifactCustodyRead<StaticAssetBundleManifest> | null;
   readonly inspectModule: V2WorkerModuleInspector;
@@ -205,7 +216,14 @@ async function verifyV2WorkerCodeProjection(
   }
   let spec: ReturnType<typeof parseWorkerVersionSpec>;
   try {
-    spec = parseWorkerVersionSpec(structuredClone(input.spec));
+    if (input.sourceForm !== undefined && input.sourceForm !== FORWARD_WORKER_VERSION_FORM_URL)
+      throw versionUnavailable();
+    spec =
+      input.sourceForm === FORWARD_WORKER_VERSION_FORM_URL
+        ? parseForwardWorkerVersionSpec(structuredClone(input.spec))
+        : parseWorkerVersionSpec(structuredClone(input.spec));
+    if (input.sourceForm && parseForwardWorkerVersionSpec(spec).containerBindings.length)
+      throw versionUnavailable();
   } catch {
     throw versionUnavailable();
   }
@@ -310,6 +328,7 @@ async function verifyV2WorkerCodeProjection(
   const sqliteBoot = snapshotSqliteBoot(input.sqliteBoot);
   const objectBucketBindings = snapshotResolvedObjectBucketBindings(
     input.resolvedObjectBucketBindings,
+    input.sourceForm === FORWARD_WORKER_VERSION_FORM_URL,
   );
   const objectBucketBoot = snapshotObjectBucketBoot(input.objectBucketBoot);
   const kvBindings = snapshotResolvedKvBindings(input.resolvedKvBindings);
@@ -501,14 +520,27 @@ function snapshotKvBoot(input: V2KvNativeBoot | undefined): V2KvNativeBoot | nul
 
 function snapshotResolvedObjectBucketBindings(
   input: readonly V2ResolvedObjectBucketBinding[] | undefined,
+  forward = false,
 ): readonly V2ResolvedObjectBucketBinding[] | null | undefined {
   if (input === undefined) return undefined;
   try {
     if (!Array.isArray(input) || input.length > 64) return null;
-    const copied = input.map((binding) => ({
-      name: binding.name,
-      resourceUid: binding.resourceUid,
-    }));
+    const copied = forward
+      ? snapshotObjectBucketBindingForms(
+          input.map((binding) => ({
+            publicName: binding.name,
+            resourceUid: binding.resourceUid,
+            formUrl: binding.formUrl,
+          })),
+        ).map((binding) => ({
+          name: binding.publicName,
+          resourceUid: binding.resourceUid,
+          formUrl: binding.formUrl,
+        }))
+      : input.map((binding) => ({
+          name: binding.name,
+          resourceUid: binding.resourceUid,
+        }));
     if (
       copied.some(
         (binding) =>

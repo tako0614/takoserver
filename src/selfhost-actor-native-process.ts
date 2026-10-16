@@ -424,7 +424,9 @@ export class ActorChild {
       const action = SafeApply(SafeHeadersGet, incoming, [SOCKET_ACTION]);
       const execution = await this.execution;
       if (action === null) {
-        await execution.alarm(SafeApply(SafeRequestSignal, request, []));
+        const nonce = SafeApply(SafeHeadersGet, incoming, [SOCKET_NONCE]);
+        if (ABI_PROFILE?.kind === "v2" && !nonce) return new SafeResponse(null, { status: 503 });
+        await execution.alarm(SafeApply(SafeRequestSignal, request, []), nonce ?? undefined);
       } else {
         const nonce = SafeApply(SafeHeadersGet, incoming, [SOCKET_NONCE]);
         const socketId = SafeApply(SafeHeadersGet, incoming, [SOCKET_ID]);

@@ -28,11 +28,17 @@ import {
   moneyCutoverClassificationTriggerSql,
   moneyCutoverFinancialTriggerSql,
 } from "../../src/money-cutover-sql.ts";
-import { applicationSchemaMatches } from "./application-schema-shape.ts";
+import { applicationSchemaMatches, canonicalApplicationShape } from "./application-schema-shape.ts";
 import { RemoteD1, sqlLiteral } from "./d1.ts";
 import { buildD1MigrationImport } from "./d1-migration-import.ts";
 import { normalizeSnapshotDump } from "./d1-snapshot-restore.ts";
-import { type DeployPhase, mutationError, preflightError, verificationError } from "./errors.ts";
+import {
+  DeployError,
+  type DeployPhase,
+  mutationError,
+  preflightError,
+  verificationError,
+} from "./errors.ts";
 import {
   canonicalSchemaShape,
   type D1SchemaState,
@@ -60,6 +66,7 @@ const SOURCE_0093_FILE = "0093_wallet_credit_classification_proofs.sql";
 const SOURCE_0094_FILE = "0094_wallet_usd_micros.sql";
 const SOURCE_0093_SHA = "sha256:fc0307e23ee2f80e3eb96da21db7ea065ba7a04d5c582191c34bdf9d4afc3037";
 const SOURCE_0094_SHA = "sha256:7ce85b52626f6cbef6e06484e9cddb5052fab76f9718fea279108e2db6da8e44";
+const SOURCE_0098 = "sha256:9ba4b09b53f531b787f38b9b65155e12850d05345a432e7ed25ac8841b4fb1f7";
 const MAX_CLASSIFICATIONS = 1000;
 
 /** Every predecessor table through which the public Host can start or finish a financial mutation. */
@@ -69,26 +76,30 @@ const FENCE_TABLE = "money_cutover_freeze";
 const FENCE_DDL = MONEY_CUTOVER_FREEZE_DDL;
 const verbs = ["INSERT", "UPDATE", "DELETE"] as const;
 
-export type MoneyCutoverPhase =
+export type MoneyLegacyCutoverPhase =
   | "freeze"
   | "prepare"
   | "classify"
   | "convert"
   | "resume"
   | "abandon";
+export type MoneyPost94Phase = "suffix98" | "resume98";
+export type MoneyCutoverPhase = MoneyLegacyCutoverPhase | MoneyPost94Phase;
 export type MoneySchemaPhase =
   | "0092"
   | "0092-fenced"
   | "0093"
   | "0093-fenced"
   | "0094"
-  | "0094-fenced";
+  | "0094-fenced"
+  | "0098"
+  | "0098-fenced";
 
 export interface MoneyUnitCutoverInvocation {
   readonly action: "status" | "apply";
   readonly environment: "integration";
   readonly commit: string;
-  readonly throughMigration: "0093" | "0094";
+  readonly throughMigration: "0093" | "0094" | "0098";
 }
 
 export interface MoneyStageOriginProof {
@@ -147,7 +158,7 @@ export interface MoneyResumeProof {
 
 export interface MoneyReviewBinding {
   readonly kind: "takoserver.money-review-binding@v1";
-  readonly phase: MoneyCutoverPhase;
+  readonly phase: MoneyLegacyCutoverPhase;
   readonly accountId: string;
   readonly databaseId: string;
   readonly originDigest: string;
@@ -172,9 +183,9 @@ export interface MoneyReviewProof {
   readonly evidenceDigest: string;
 }
 
-export interface MoneyCutoverDispatchBinding {
+export interface MoneyLegacyCutoverDispatchBinding {
   readonly kind: "takoserver.money-cutover-dispatch@v1";
-  readonly phase: MoneyCutoverPhase;
+  readonly phase: MoneyLegacyCutoverPhase;
   readonly accountId: string;
   readonly databaseId: string;
   readonly databaseName: string;
@@ -192,9 +203,27 @@ export interface MoneyCutoverDispatchBinding {
   readonly writerEpoch: string;
   readonly reviewDigest: string;
   readonly beforeShapeDigest: string;
-  readonly afterSchemaPhase: MoneySchemaPhase;
+  readonly afterSchemaPhase: Exclude<MoneySchemaPhase, "0098" | "0098-fenced">;
   readonly sealedImportPath: string;
 }
+
+/** Retained data only: a binding cannot supply the missing Financial transition authority. */
+export interface MoneyPost94DispatchBinding
+  extends Omit<MoneyLegacyCutoverDispatchBinding, "kind" | "phase" | "afterSchemaPhase"> {
+  readonly kind: "takoserver.money-cutover-dispatch@v2";
+  readonly phase: MoneyPost94Phase;
+  readonly afterSchemaPhase: "0098" | "0098-fenced";
+  readonly previousWriterEpoch: string;
+  readonly nextWriterEpoch: string;
+  readonly original92BackupDigest: string;
+  readonly converted94BackupDigest: string;
+  readonly convertBindingDigest: string;
+  readonly modePreparationDigest: string;
+}
+
+export type MoneyCutoverDispatchBinding =
+  | MoneyLegacyCutoverDispatchBinding
+  | MoneyPost94DispatchBinding;
 
 export interface MoneyCutoverCustodyReceipt {
   readonly kind: "takoserver.money-cutover-custody@v1";
@@ -291,6 +320,17 @@ export function assertMoneyCutoverSource(files: readonly MigrationFile[]): void 
   sourcePrefixDigest(files.slice(92, 94));
 }
 
+/** Only the immutable existing suffix; this validates source bytes, never a realm or applied state. */
+export function assertMoneyPost94Source(files: readonly MigrationFile[]): void {
+  assertMoneyCutoverSource(files);
+  if (
+    files.length < 98 ||
+    files.slice(94, 98).some((file, index) => !file.name.startsWith(`00${95 + index}_`)) ||
+    sourcePrefixDigest(files.slice(0, 98)) !== SOURCE_0098
+  )
+    throw preflightError("money suffix requires the exact immutable fixed0098 source prefix");
+}
+
 function fenceTables(phase: MoneySchemaPhase): readonly string[] {
   return phase.startsWith("0092")
     ? MONEY_FENCE_TABLES_0092
@@ -328,6 +368,7 @@ export function moneyUnitCutoverExpectedShape(
   files: readonly MigrationFile[],
   phase: MoneySchemaPhase,
 ): string {
+  if (phase === "0098" || phase === "0098-fenced") return moneyPost94ExpectedShape(files);
   assertMoneyCutoverSource(files);
   const prefixDigest = sourcePrefixDigest(files.slice(0, 94));
   const cached =
@@ -374,6 +415,59 @@ export function moneyUnitCutoverExpectedShape(
     }
     expectedShapeCache = { prefixDigest, shapes };
     return shapes.get(phase) as string;
+  } finally {
+    database.close();
+  }
+}
+
+let post94ExpectedShapeCache: { readonly sourceDigest: string; readonly shape: string } | null =
+  null;
+
+function moneyPost94ExpectedShape(files: readonly MigrationFile[]): string {
+  assertMoneyPost94Source(files);
+  if (post94ExpectedShapeCache?.sourceDigest === SOURCE_0098) return post94ExpectedShapeCache.shape;
+  const database = new Database(":memory:");
+  try {
+    database.exec(buildD1MigrationImport(files.slice(0, 94), { freshLedger: true }).sql);
+    database.exec(
+      `${FENCE_DDL};\n${MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL};\n${MONEY_CUTOVER_PERMIT_DDL};\n${MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL};\n${moneyFenceInstallSql("0094-fenced")}`,
+    );
+    database.exec(buildD1MigrationImport(files.slice(94, 98), { freshLedger: false }).sql);
+    // 0095 removes the original money guards. Restore the same owned definitions;
+    // schema equality says nothing about freeze rows, epochs or Financial mode eligibility.
+    const definitions = [
+      [FENCE_TABLE, FENCE_DDL],
+      [MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE, MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL],
+      [MONEY_CUTOVER_PERMIT_TABLE, MONEY_CUTOVER_PERMIT_DDL],
+      ["money_cutover_permit_epoch_guard", MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL],
+      ...fenceTables("0098-fenced").flatMap((table) =>
+        verbs.map((verb) => [moneyFenceTriggerName(table, verb), fenceTriggerSql(table, verb)]),
+      ),
+    ] as const;
+    for (const [name, sql] of definitions) {
+      if (name === undefined || sql === undefined)
+        throw preflightError("money suffix guard definition is incomplete");
+      const existing = database.query("SELECT sql FROM sqlite_schema WHERE name = ?").get(name) as {
+        sql: string;
+      } | null;
+      if (existing === null) database.exec(sql);
+      else if (existing.sql !== sql)
+        throw preflightError("money suffix changes an existing owned guard definition");
+    }
+    const canonicalShape = canonicalSchemaShape(
+      database
+        .query(
+          "SELECT type, name, tbl_name, COALESCE(sql, '') AS sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+        )
+        .all() as Record<string, unknown>[],
+    );
+    const shape = canonicalApplicationShape({
+      applied: [],
+      shape: canonicalShape,
+      shapeDigest: digest(canonicalShape),
+    });
+    post94ExpectedShapeCache = { sourceDigest: SOURCE_0098, shape };
+    return shape;
   } finally {
     database.close();
   }
@@ -679,10 +773,14 @@ function assertStageTarget(
   target: DeployTarget,
   origin: MoneyStageOriginProof,
   live: MoneyStorageIdentity,
+  originalRead = false,
 ): void {
   if (
     target.environment !== "integration" ||
-    !STAGE_NAME.test(target.d1.databaseName) ||
+    !(
+      STAGE_NAME.test(target.d1.databaseName) ||
+      (originalRead && /^integration-ts-[0-9a-f]{32}$/u.test(target.d1.databaseName))
+    ) ||
     target.r2.bucketName !== target.d1.databaseName ||
     !UUID.test(target.d1.databaseId) ||
     !/^[0-9a-f]{32}$/u.test(target.accountId) ||
@@ -769,8 +867,8 @@ function assertResumeProof(target: DeployTarget, proof: MoneyResumeProof, commit
 }
 
 function phaseSchemas(phase: MoneyCutoverPhase): {
-  before: MoneySchemaPhase;
-  after: MoneySchemaPhase;
+  before: Exclude<MoneySchemaPhase, "0098" | "0098-fenced">;
+  after: Exclude<MoneySchemaPhase, "0098" | "0098-fenced">;
   through: "0093" | "0094";
 } {
   switch (phase) {
@@ -786,6 +884,11 @@ function phaseSchemas(phase: MoneyCutoverPhase): {
       return { before: "0094-fenced", after: "0094", through: "0094" };
     case "abandon":
       return { before: "0092-fenced", after: "0092", through: "0093" };
+    case "suffix98":
+    case "resume98":
+      throw preflightError(
+        "money post94 continuation requires the owning Financial realm transition port",
+      );
   }
 }
 
@@ -794,6 +897,7 @@ async function exactStatus(
   state: D1SchemaState,
   files: readonly MigrationFile[],
   writerEpoch: string,
+  includePost94 = false,
 ): Promise<MoneySchemaPhase | null> {
   for (const phase of [
     "0092",
@@ -802,9 +906,10 @@ async function exactStatus(
     "0093-fenced",
     "0094",
     "0094-fenced",
+    ...(includePost94 ? (["0098", "0098-fenced"] as const) : []),
   ] as const) {
     if (!moneyUnitCutoverSchemaMatches(state, files, phase)) continue;
-    if (phase.endsWith("-fenced") || phase === "0094") {
+    if (phase.endsWith("-fenced") || phase === "0094" || phase === "0098") {
       const permit = await database.query(
         "preflight",
         "money writer permit",
@@ -819,7 +924,8 @@ async function exactStatus(
       if (epoch.length !== 1 || epoch[0]?.singleton !== 1 || epoch[0]?.writer_epoch !== writerEpoch)
         return null;
       const frozen = await readFreezeRow(database, "preflight");
-      if (phase === "0094") return frozen.length === 0 ? phase : "0094-fenced";
+      if (phase === "0094" || phase === "0098")
+        return frozen.length === 0 ? phase : phase === "0094" ? "0094-fenced" : "0098-fenced";
       if (frozen.length !== 1) return null;
     }
     return phase;
@@ -1027,6 +1133,11 @@ function phaseImportSql(
         throw preflightError("money abandon requires exact preconversion fenced schema");
       return `${moneyFenceDropSql(abandonFrom)}\nDROP TABLE ${MONEY_CUTOVER_PERMIT_TABLE};\nDROP TABLE ${MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE};\nDROP TABLE ${FENCE_TABLE};\n`;
     }
+    case "suffix98":
+    case "resume98":
+      throw preflightError(
+        "money post94 continuation requires the owning Financial realm transition port",
+      );
   }
 }
 
@@ -1104,6 +1215,14 @@ function writeProtectedFile(path: string, bytes: Uint8Array): void {
   }
 }
 
+type MoneyBackupProfile =
+  | { readonly schemaPhase: "0092" }
+  | {
+      readonly schemaPhase: "0094-fenced";
+      readonly convertBindingDigest: string;
+      readonly writerEpoch: string;
+    };
+
 async function backupAndRead(
   backupPath: string,
   configPath: string,
@@ -1113,6 +1232,8 @@ async function backupAndRead(
   root: string,
   run: NonNullable<MoneyUnitCutoverOptions["run"]>,
   environment: Readonly<Record<string, string>>,
+  allowExport = true,
+  profile: MoneyBackupProfile = { schemaPhase: "0092" },
 ): Promise<{
   readonly digest: string;
   readonly preimageDigest: string;
@@ -1120,10 +1241,47 @@ async function backupAndRead(
   readonly financialDigest: string;
   readonly allDataDigest: string;
   readonly rowCounts: Readonly<Record<string, number>>;
+  readonly schema?: D1SchemaState;
+  readonly freezeRows?: readonly Record<string, unknown>[];
 }> {
   assertProtectedDirectory(dirname(backupPath), "money backup");
   const identityPath = `${backupPath}.identity.json`;
+  const sourceDigest =
+    profile.schemaPhase === "0092" ? SOURCE_0092 : moneyUnitCutoverSourcePrefixDigest(files, 94);
+  if (
+    profile.schemaPhase === "0094-fenced" &&
+    (!SHA256.test(profile.convertBindingDigest) ||
+      !MONEY_CUTOVER_WRITER_EPOCH_PATTERN.test(profile.writerEpoch))
+  )
+    throw preflightError("money converted backup requires its exact convert binding and old epoch");
+  const expectedIdentity = (backupDigest: string) =>
+    profile.schemaPhase === "0092"
+      ? {
+          kind: "takoserver.money-protected-backup@v1",
+          accountId: target.accountId,
+          databaseId: target.d1.databaseId,
+          databaseName: target.d1.databaseName,
+          originDigest,
+          sourceDigest,
+          backupDigest,
+        }
+      : {
+          kind: "takoserver.money-protected-backup@v2",
+          accountId: target.accountId,
+          databaseId: target.d1.databaseId,
+          databaseName: target.d1.databaseName,
+          originDigest,
+          sourceDigest,
+          backupDigest,
+          schemaPhase: profile.schemaPhase,
+          convertBindingDigest: profile.convertBindingDigest,
+          writerEpoch: profile.writerEpoch,
+        };
   if (!existsSync(backupPath)) {
+    if (!allowExport)
+      throw preflightError(
+        "money resume read requires its existing protected backup; no export allowed",
+      );
     const rawPath = join(root, `export-${randomUUID()}.sql`);
     try {
       const result = await run(
@@ -1152,18 +1310,7 @@ async function backupAndRead(
       writeProtectedFile(backupPath, Buffer.from(normalized.sql, "utf8"));
       writeProtectedFile(
         identityPath,
-        Buffer.from(
-          `${JSON.stringify({
-            kind: "takoserver.money-protected-backup@v1",
-            accountId: target.accountId,
-            databaseId: target.d1.databaseId,
-            databaseName: target.d1.databaseName,
-            originDigest,
-            sourceDigest: SOURCE_0092,
-            backupDigest: normalized.digest,
-          })}\n`,
-          "utf8",
-        ),
+        Buffer.from(`${JSON.stringify(expectedIdentity(normalized.digest))}\n`, "utf8"),
       );
     } finally {
       rmSync(rawPath, { force: true });
@@ -1186,17 +1333,11 @@ async function backupAndRead(
   } catch {
     throw preflightError("money backup lacks a protected target/source identity receipt");
   }
+  const expected = expectedIdentity(normalized.digest);
   if (
     !record(identity) ||
-    Object.keys(identity).sort().join(",") !==
-      "accountId,backupDigest,databaseId,databaseName,kind,originDigest,sourceDigest" ||
-    identity.kind !== "takoserver.money-protected-backup@v1" ||
-    identity.accountId !== target.accountId ||
-    identity.databaseId !== target.d1.databaseId ||
-    identity.databaseName !== target.d1.databaseName ||
-    identity.originDigest !== originDigest ||
-    identity.sourceDigest !== SOURCE_0092 ||
-    identity.backupDigest !== normalized.digest
+    Object.keys(identity).sort().join(",") !== Object.keys(expected).sort().join(",") ||
+    Object.entries(expected).some(([key, value]) => identity[key] !== value)
   ) {
     throw preflightError("money backup target/source identity differs from exact staging origin");
   }
@@ -1209,8 +1350,15 @@ async function backupAndRead(
       query: async (_phase: DeployPhase, _description: string, sql: string) =>
         snapshot.query(sql).all() as Record<string, unknown>[],
     } as unknown as RemoteD1);
-    if (!moneyUnitCutoverSchemaMatches(state, files, "0092"))
-      throw preflightError("money backup application shape differs from fixed 0092");
+    if (!moneyUnitCutoverSchemaMatches(state, files, profile.schemaPhase))
+      throw preflightError(
+        `money backup application shape differs from fixed ${profile.schemaPhase}`,
+      );
+    if (profile.schemaPhase === "0094-fenced") {
+      await assertPermitEmpty(localReader(snapshot), "preflight", profile.writerEpoch);
+      if ((await readFreezeRow(localReader(snapshot), "preflight")).length !== 1)
+        throw preflightError("money converted backup lacks its original freeze row");
+    }
     const tableRows = snapshot
       .query(
         "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB 'sqlite_*' AND name NOT IN ('_cf_KV', '_cf_METADATA', 'd1_migrations') ORDER BY name",
@@ -1229,11 +1377,25 @@ async function backupAndRead(
       throw preflightError("money backup has foreign-key violations");
     return {
       digest: normalized.digest,
-      preimageDigest: await readMoneyPreimageDigest(localReader(snapshot), "preflight"),
-      aggregateDigest: await readMoneyAggregateDigest(localReader(snapshot), "preflight"),
+      preimageDigest: await readMoneyPreimageDigest(
+        localReader(snapshot),
+        "preflight",
+        profile.schemaPhase !== "0092",
+      ),
+      aggregateDigest: await readMoneyAggregateDigest(
+        localReader(snapshot),
+        "preflight",
+        profile.schemaPhase !== "0092",
+      ),
       financialDigest: await readMoneyFrozenDataDigest(localReader(snapshot), "preflight"),
       allDataDigest: await readWholeDatabaseDataDigest(localReader(snapshot), "preflight", tables),
       rowCounts,
+      ...(profile.schemaPhase === "0092"
+        ? {}
+        : {
+            schema: state,
+            freezeRows: await readFreezeRow(localReader(snapshot), "preflight"),
+          }),
     };
   } catch (error) {
     if (error instanceof Error && error.name === "DeployError") throw error;
@@ -1241,6 +1403,615 @@ async function backupAndRead(
   } finally {
     snapshot.close();
   }
+}
+
+/** Current fixed94 money observation. This is never a normal-Host readiness certificate. */
+export interface MoneyUnitResumeState {
+  readonly schemaPhase: "0094" | "0094-fenced";
+  readonly originDigest: string;
+  readonly convertBindingDigest: string;
+  readonly resumeBindingDigest: string | null;
+  readonly nativeResumeProof: MoneyResumeProof;
+  readonly health: "guarded" | "healthy";
+  readonly normalHostReady: false;
+  readonly nextOwner: "qualified-post0094-suffix-and0098-realm";
+}
+
+/**
+ * Shared verification over held custody and read-only SQL. The native owner constructs
+ * all ports; this lower-level function grants no provider-native eligibility itself.
+ */
+interface MoneyHistoryInput {
+  readonly target: DeployTarget;
+  readonly options: MoneyUnitCutoverOptions;
+  readonly files: readonly MigrationFile[];
+  readonly database: Pick<RemoteD1, "query">;
+  readonly readSchema: () => Promise<D1SchemaState>;
+  readonly backup: Awaited<ReturnType<typeof backupAndRead>>;
+}
+
+function captureMoneyOptions(options: MoneyUnitCutoverOptions): MoneyUnitCutoverOptions {
+  return Object.freeze({
+    ...options,
+    custody: Object.freeze({
+      read: options.custody.read.bind(options.custody),
+      readDispatch: options.custody.readDispatch.bind(options.custody),
+      dispatch: options.custody.dispatch.bind(options.custody),
+      terminal: options.custody.terminal.bind(options.custody),
+    }),
+  });
+}
+
+/** Original held history only; no normal Worker proof, publication or new grant. */
+async function readHeldMoneyConversionHistory(
+  input: MoneyHistoryInput,
+  historicalWriterEpoch: string,
+  includeResume: boolean,
+) {
+  const { target, files } = input;
+  const backup = Object.freeze({ ...input.backup });
+  const options = captureMoneyOptions(input.options);
+  const targetSelection = JSON.stringify(target);
+  if (!MONEY_CUTOVER_WRITER_EPOCH_PATTERN.test(historicalWriterEpoch))
+    throw preflightError("money conversion history requires its original Writer epoch");
+  assertMoneyCutoverSource(files);
+  const origin = structuredClone(await options.stageOriginProof());
+  const identity = structuredClone(await options.storageIdentityRead());
+  assertStageTarget(target, origin, identity, true);
+  const originDigest = digest(JSON.stringify(origin));
+  const phases = includeResume
+    ? (["freeze", "prepare", "classify", "convert", "resume"] as const)
+    : (["freeze", "prepare", "classify", "convert"] as const);
+  const retained: {
+    phase: MoneyLegacyCutoverPhase;
+    receipt: MoneyCutoverCustodyReceipt;
+    binding: MoneyLegacyCutoverDispatchBinding;
+  }[] = [];
+  let predecessor = origin.terminalCustodyDigest;
+  const classifications = readProtectedClassifications(
+    options.classificationManifestPath ?? "",
+    options.classificationManifestDigest ?? "",
+  );
+  for (const phase of phases) {
+    const selectedReceipt = await options.custody.read(phase);
+    const selectedBinding = await options.custody.readDispatch(phase);
+    const receipt = selectedReceipt === null ? null : Object.freeze({ ...selectedReceipt });
+    const binding = selectedBinding === null ? null : Object.freeze({ ...selectedBinding });
+    if (phase === "resume" && receipt === null && binding === null) break;
+    if (receipt === null || binding === null)
+      throw preflightError(`money resume read lacks exact ${phase} custody`);
+    if (binding.kind !== "takoserver.money-cutover-dispatch@v1")
+      throw preflightError("money conversion history cannot promote a post94 binding");
+    assertExistingCustodyShape(receipt, phase);
+    if (receipt.state !== "terminal")
+      throw preflightError(`money resume read holds unknown ${phase} dispatch; no reconciliation`);
+    const selected = phaseSchemas(phase);
+    const classificationMatches =
+      phase === "freeze" || phase === "prepare"
+        ? binding.classificationDigest === digest("[]\n") ||
+          binding.classificationDigest === options.classificationManifestDigest
+        : binding.classificationDigest === options.classificationManifestDigest;
+    if (
+      receipt.bindingDigest !== moneyCutoverBindingDigest(binding) ||
+      binding.phase !== phase ||
+      binding.accountId !== target.accountId ||
+      binding.databaseId !== target.d1.databaseId ||
+      binding.databaseName !== target.d1.databaseName ||
+      binding.originDigest !== originDigest ||
+      binding.predecessorCustodyDigest !== predecessor ||
+      !COMMIT.test(binding.sourceCommit) ||
+      binding.sourceDigest !==
+        sourcePrefixDigest(files.slice(0, selected.through === "0093" ? 93 : 94)) ||
+      binding.afterSchemaPhase !== selected.after ||
+      binding.backupDigest !== backup.digest ||
+      binding.preimageDigest !== backup.preimageDigest ||
+      binding.aggregateDigest !== backup.aggregateDigest ||
+      !classificationMatches ||
+      !SHA256.test(binding.reviewDigest) ||
+      binding.writerEpoch !== historicalWriterEpoch
+    )
+      throw preflightError(
+        `money resume read ${phase} dispatch differs from original/source/backup/epoch`,
+      );
+    retained.push({ phase, receipt, binding });
+    predecessor = digest(JSON.stringify(receipt));
+  }
+  const convert = retained.find((entry) => entry.phase === "convert");
+  const resume = retained.find((entry) => entry.phase === "resume");
+  if (convert === undefined)
+    throw preflightError("money resume read requires terminal convert custody");
+  const reviewed = resume ?? convert;
+  const reviewBinding: MoneyReviewBinding = {
+    kind: "takoserver.money-review-binding@v1",
+    phase: reviewed.phase,
+    accountId: target.accountId,
+    databaseId: target.d1.databaseId,
+    originDigest,
+    predecessorCustodyDigest: reviewed.binding.predecessorCustodyDigest,
+    sourceCommit: reviewed.binding.sourceCommit,
+    sourceDigest: reviewed.binding.sourceDigest,
+    importDigest: reviewed.binding.importDigest,
+    backupDigest: backup.digest,
+    preimageDigest: backup.preimageDigest,
+    aggregateDigest: backup.aggregateDigest,
+    classificationDigest: reviewed.binding.classificationDigest,
+    writerDigest: reviewed.binding.writerDigest,
+    resumeDigest: reviewed.binding.resumeDigest,
+    writerEpoch: historicalWriterEpoch,
+  };
+  const assertReview = async () => {
+    if (options.independentReview === undefined)
+      throw preflightError("money resume read independent review unavailable");
+    const review = await options.independentReview(reviewBinding);
+    if (review === null || validateReview(reviewBinding, review) !== reviewed.binding.reviewDigest)
+      throw preflightError("money resume read retained independent review differs");
+  };
+  await assertReview();
+  const writerDigest = convert.binding.writerDigest;
+  const anchor = digest(
+    JSON.stringify({
+      kind: "takoserver.money-freeze-anchor@v1",
+      target: identity,
+      originDigest,
+      backupDigest: backup.digest,
+      preimageDigest: backup.preimageDigest,
+      aggregateDigest: backup.aggregateDigest,
+      financialDigest: backup.financialDigest,
+      writerDigest,
+      writerEpoch: historicalWriterEpoch,
+      sourceDigest: SOURCE_0092,
+    }),
+  );
+  for (const { phase, binding } of retained) {
+    const sql = buildMoneyCutoverImportSql({
+      phase,
+      files,
+      anchor,
+      originDigest,
+      backupDigest: backup.digest,
+      writerDigest,
+      writerEpoch: historicalWriterEpoch,
+      classifications: phase === "freeze" || phase === "prepare" ? [] : classifications,
+    });
+    if (
+      binding.writerDigest !== writerDigest ||
+      digest(sql) !== binding.importDigest ||
+      readProtectedBytes(binding.sealedImportPath, "money resume retained SQL").toString("utf8") !==
+        sql
+    )
+      throw preflightError(`money resume read ${phase} sealed import/source differs`);
+  }
+  const assertCurrent = async () => {
+    if (
+      JSON.stringify(target) !== targetSelection ||
+      JSON.stringify(await options.stageOriginProof()) !== JSON.stringify(origin) ||
+      JSON.stringify(await options.storageIdentityRead()) !== JSON.stringify(identity)
+    )
+      throw preflightError("money conversion history origin/target changed during observation");
+    assertMoneyCutoverSource(files);
+    if (
+      JSON.stringify(
+        readProtectedClassifications(
+          options.classificationManifestPath ?? "",
+          options.classificationManifestDigest ?? "",
+        ),
+      ) !== JSON.stringify(classifications)
+    )
+      throw preflightError("money resume classification changed during observation");
+    for (const { phase: retainedPhase, receipt, binding } of retained) {
+      if (
+        JSON.stringify(await options.custody.read(retainedPhase)) !== JSON.stringify(receipt) ||
+        JSON.stringify(await options.custody.readDispatch(retainedPhase)) !==
+          JSON.stringify(binding)
+      )
+        throw preflightError("money resume read protected custody changed during observation");
+    }
+    if (
+      resume === undefined &&
+      ((await options.custody.read("resume")) !== null ||
+        (await options.custody.readDispatch("resume")) !== null)
+    )
+      throw preflightError("money resume dispatch appeared during observation");
+  };
+  if (
+    !includeResume &&
+    ((await options.custody.read("resume")) !== null ||
+      (await options.custody.readDispatch("resume")) !== null)
+  )
+    throw preflightError("money suffix requires convert custody with no legacy resume dispatch");
+  return {
+    options,
+    origin,
+    identity,
+    originDigest,
+    retained,
+    convert,
+    resume,
+    classifications,
+    writerDigest,
+    anchor,
+    assertReview,
+    assertCurrent,
+  };
+}
+
+export async function inspectMoneyUnitResumeState(input: {
+  readonly target: DeployTarget;
+  readonly options: MoneyUnitCutoverOptions;
+  readonly files: readonly MigrationFile[];
+  readonly database: Pick<RemoteD1, "query">;
+  readonly readSchema: () => Promise<D1SchemaState>;
+  readonly backup: Awaited<ReturnType<typeof backupAndRead>>;
+}): Promise<MoneyUnitResumeState> {
+  const { target, files, database, backup } = input;
+  const options = captureMoneyOptions(input.options);
+  if (
+    options.phase !== "resume" ||
+    options.resumeProof === undefined ||
+    options.resumeCommit === undefined ||
+    options.resumeHealthRead === undefined
+  )
+    throw preflightError("money resume read requires the existing complete resume owner");
+  if (options.writerEpoch !== target.moneyCutoverWriterEpoch)
+    throw preflightError("money resume read epoch differs from the selected target");
+  const history = await readHeldMoneyConversionHistory(
+    { ...input, options },
+    options.writerEpoch,
+    true,
+  );
+  const {
+    origin,
+    identity,
+    originDigest,
+    convert,
+    resume,
+    classifications,
+    writerDigest,
+    anchor,
+    assertReview,
+  } = history;
+  const schema = await input.readSchema();
+  const phase = await exactStatus(database, schema, files, options.writerEpoch);
+  if (phase !== "0094" && phase !== "0094-fenced")
+    throw preflightError(
+      "money resume read requires exact current fixed94; suffix has a separate owner",
+    );
+  if (phase === "0094-fenced") {
+    if (resume !== undefined)
+      throw preflightError("money resume terminal custody disagrees with current freeze");
+    assertFreezeRow(
+      await readFreezeRow(database, "preflight"),
+      anchor,
+      originDigest,
+      backup.digest,
+      writerDigest,
+      "preflight",
+    );
+    await assertPermitEmpty(database, "preflight", options.writerEpoch);
+  } else {
+    if (resume === undefined)
+      throw preflightError("money current94 lacks terminal resume custody; no adoption");
+    await assertResumedFreezeEmpty(database, "preflight", options.writerEpoch);
+  }
+  if (
+    (await readMoneyPreimageDigest(database, "preflight", true)) !== backup.preimageDigest ||
+    (await readMoneyAggregateDigest(database, "preflight", true)) !== backup.aggregateDigest
+  )
+    throw preflightError("money resume read differs from protected financial preimages");
+  await assertClassificationsStored(database, classifications, "preflight");
+  await assertMoneyNativeForeignKeys(database, "preflight");
+  const postDigest = digest(
+    JSON.stringify({
+      applied: schema.applied,
+      shapeDigest: schema.shapeDigest,
+      preimageDigest: backup.preimageDigest,
+      aggregateDigest: backup.aggregateDigest,
+    }),
+  );
+  if (
+    convert.receipt.postDigest !== postDigest ||
+    (resume !== undefined && resume.receipt.postDigest !== postDigest)
+  )
+    throw preflightError("money resume read terminal post digest differs");
+  const nativeResumeProof = await options.resumeProof();
+  assertResumeProof(target, nativeResumeProof, options.resumeCommit);
+  const nativeDigest = digest(JSON.stringify(nativeResumeProof));
+  if (resume !== undefined && resume.binding.resumeDigest !== nativeDigest)
+    throw preflightError("money resume read current native Version differs from terminal resume");
+  await options.resumeHealthRead(phase === "0094-fenced" ? "guarded" : "healthy");
+  await assertReview();
+  if (
+    JSON.stringify(await options.stageOriginProof()) !== JSON.stringify(origin) ||
+    JSON.stringify(await options.storageIdentityRead()) !== JSON.stringify(identity) ||
+    digest(JSON.stringify(await options.resumeProof())) !== nativeDigest ||
+    JSON.stringify(await input.readSchema()) !== JSON.stringify(schema) ||
+    (await exactStatus(database, schema, files, options.writerEpoch)) !== phase
+  )
+    throw preflightError("money resume read origin/native/schema changed during observation");
+  await history.assertCurrent();
+  return {
+    schemaPhase: phase,
+    originDigest,
+    convertBindingDigest: convert.receipt.bindingDigest,
+    resumeBindingDigest: resume?.receipt.bindingDigest ?? null,
+    nativeResumeProof,
+    health: phase === "0094-fenced" ? "guarded" : "healthy",
+    normalHostReady: false,
+    nextOwner: "qualified-post0094-suffix-and0098-realm",
+  };
+}
+
+export interface MoneyUnitPost94State {
+  readonly schemaPhase: "0094-fenced" | "0098-fenced" | "0098";
+  readonly historicalWriterEpoch: string;
+  readonly currentWriterEpoch: string;
+  readonly convertBindingDigest: string;
+  readonly converted94BackupDigest: string;
+  readonly continuation: "blocked-financial-port" | "unknown-dispatch";
+  readonly qualification: "component-simulation-only";
+  readonly normalHostReady: false;
+}
+
+/**
+ * Component inspection of the same held history and real SQL state. This does not
+ * export, import, dispatch, reconcile, publish, or supply Financial realm authority.
+ */
+export async function inspectMoneyUnitPost94State(
+  input: MoneyHistoryInput & {
+    readonly previousWriterEpoch: string;
+    readonly nextWriterEpoch: string;
+    readonly convertedBackupPath: string;
+  },
+): Promise<MoneyUnitPost94State> {
+  const {
+    target,
+    files,
+    database,
+    readSchema,
+    previousWriterEpoch,
+    nextWriterEpoch,
+    convertedBackupPath,
+  } = input;
+  const options = captureMoneyOptions(input.options);
+  const backup = Object.freeze({ ...input.backup });
+  if (
+    target.environment !== "integration" ||
+    (options.phase !== "suffix98" && options.phase !== "resume98") ||
+    !MONEY_CUTOVER_WRITER_EPOCH_PATTERN.test(previousWriterEpoch) ||
+    !MONEY_CUTOVER_WRITER_EPOCH_PATTERN.test(nextWriterEpoch) ||
+    previousWriterEpoch === nextWriterEpoch ||
+    (target.moneyCutoverWriterEpoch !== previousWriterEpoch &&
+      target.moneyCutoverWriterEpoch !== nextWriterEpoch) ||
+    resolve(convertedBackupPath) === resolve(options.backupPath)
+  )
+    throw preflightError(
+      "money post94 read requires distinct epochs and a separate converted backup",
+    );
+  assertMoneyPost94Source(files);
+  const history = await readHeldMoneyConversionHistory(
+    { ...input, options, backup },
+    previousWriterEpoch,
+    false,
+  );
+  const profile: MoneyBackupProfile = {
+    schemaPhase: "0094-fenced",
+    convertBindingDigest: history.convert.receipt.bindingDigest,
+    writerEpoch: previousWriterEpoch,
+  };
+  const convertedIdentityDigest = digest(
+    readProtectedBytes(`${convertedBackupPath}.identity.json`, "money converted backup identity"),
+  );
+  const converted = await backupAndRead(
+    convertedBackupPath,
+    "",
+    target,
+    files,
+    history.originDigest,
+    dirname(convertedBackupPath),
+    options.run ?? runCommand,
+    {},
+    false,
+    profile,
+  );
+  const convertedSchema = converted.schema;
+  if (
+    convertedSchema === undefined ||
+    converted.freezeRows === undefined ||
+    converted.preimageDigest !== backup.preimageDigest ||
+    converted.aggregateDigest !== backup.aggregateDigest ||
+    history.convert.receipt.postDigest !==
+      digest(
+        JSON.stringify({
+          applied: convertedSchema.applied,
+          shapeDigest: convertedSchema.shapeDigest,
+          preimageDigest: backup.preimageDigest,
+          aggregateDigest: backup.aggregateDigest,
+        }),
+      )
+  )
+    throw preflightError("money converted snapshot differs from original terminal convert history");
+  assertFreezeRow(
+    converted.freezeRows,
+    history.anchor,
+    history.originDigest,
+    backup.digest,
+    history.writerDigest,
+    "preflight",
+  );
+  const schema = await readSchema();
+  const currentWriterEpoch = target.moneyCutoverWriterEpoch;
+  if (currentWriterEpoch === undefined)
+    throw preflightError("money post94 target lacks its pinned current epoch");
+  const phase = await exactStatus(database, schema, files, currentWriterEpoch, true);
+  if (
+    (phase !== "0094-fenced" && phase !== "0098-fenced" && phase !== "0098") ||
+    (phase === "0094-fenced"
+      ? currentWriterEpoch !== previousWriterEpoch
+      : currentWriterEpoch !== nextWriterEpoch)
+  )
+    throw preflightError("money post94 current schema and old/new epoch do not match");
+  if (phase.endsWith("-fenced"))
+    assertFreezeRow(
+      await readFreezeRow(database, "preflight"),
+      history.anchor,
+      history.originDigest,
+      backup.digest,
+      history.writerDigest,
+      "preflight",
+    );
+  if (
+    (await readMoneyPreimageDigest(database, "preflight", true)) !== backup.preimageDigest ||
+    (await readMoneyAggregateDigest(database, "preflight", true)) !== backup.aggregateDigest
+  )
+    throw preflightError("money post94 current state differs from conserved financial preimages");
+  await assertClassificationsStored(database, history.classifications, "preflight");
+  await assertMoneyNativeForeignKeys(database, "preflight");
+  let predecessor = digest(JSON.stringify(history.convert.receipt));
+  let unknown = false;
+  let suffixTerminal = false;
+  const held = [];
+  for (const selectedPhase of ["suffix98", "resume98"] as const) {
+    const receipt = await options.custody.read(selectedPhase);
+    const binding = await options.custody.readDispatch(selectedPhase);
+    if (receipt === null && binding === null) {
+      if (selectedPhase === "suffix98" && phase !== "0094-fenced")
+        throw preflightError("money post94 current suffix lacks retained original dispatch");
+      if (selectedPhase === "resume98" && phase === "0098")
+        throw preflightError("money post94 current resume lacks retained original dispatch");
+      held.push({ phase: selectedPhase, receipt: null, binding: null });
+      continue;
+    }
+    if (
+      receipt === null ||
+      binding === null ||
+      binding.kind !== "takoserver.money-cutover-dispatch@v2"
+    )
+      throw preflightError("money post94 custody requires its exact v2 dispatch");
+    assertExistingCustodyShape(receipt, selectedPhase);
+    if (
+      (selectedPhase === "suffix98" && receipt.state === "terminal" && phase === "0094-fenced") ||
+      (selectedPhase === "resume98" &&
+        (!suffixTerminal || (receipt.state === "terminal" && phase !== "0098")))
+    )
+      throw preflightError(
+        "money post94 terminal custody disagrees with its predecessor/current state",
+      );
+    if (
+      receipt.bindingDigest !== moneyCutoverBindingDigest(binding) ||
+      binding.phase !== selectedPhase ||
+      binding.accountId !== target.accountId ||
+      binding.databaseId !== target.d1.databaseId ||
+      binding.databaseName !== target.d1.databaseName ||
+      binding.originDigest !== history.originDigest ||
+      binding.predecessorCustodyDigest !== predecessor ||
+      binding.sourceDigest !== SOURCE_0098 ||
+      binding.previousWriterEpoch !== previousWriterEpoch ||
+      binding.nextWriterEpoch !== nextWriterEpoch ||
+      binding.writerEpoch !==
+        (selectedPhase === "suffix98" ? previousWriterEpoch : nextWriterEpoch) ||
+      binding.original92BackupDigest !== backup.digest ||
+      binding.backupDigest !== backup.digest ||
+      binding.converted94BackupDigest !== converted.digest ||
+      binding.convertBindingDigest !== history.convert.receipt.bindingDigest ||
+      binding.preimageDigest !== backup.preimageDigest ||
+      binding.aggregateDigest !== backup.aggregateDigest ||
+      binding.classificationDigest !== options.classificationManifestDigest ||
+      binding.afterSchemaPhase !== (selectedPhase === "suffix98" ? "0098-fenced" : "0098") ||
+      !SHA256.test(binding.modePreparationDigest) ||
+      (selectedPhase === "resume98" && unknown)
+    )
+      throw preflightError("money post94 dispatch differs from original history/source/epochs");
+    unknown = receipt.state === "dispatched";
+    if (selectedPhase === "suffix98") suffixTerminal = receipt.state === "terminal";
+    held.push({ phase: selectedPhase, receipt: { ...receipt }, binding: { ...binding } });
+    predecessor = digest(JSON.stringify(receipt));
+  }
+  await history.assertReview();
+  await history.assertCurrent();
+  assertMoneyPost94Source(files);
+  if (
+    JSON.stringify(await readSchema()) !== JSON.stringify(schema) ||
+    (await exactStatus(database, schema, files, currentWriterEpoch, true)) !== phase ||
+    digest(readProtectedBytes(convertedBackupPath, "money converted backup")) !==
+      converted.digest ||
+    digest(
+      readProtectedBytes(`${convertedBackupPath}.identity.json`, "money converted backup identity"),
+    ) !== convertedIdentityDigest
+  )
+    throw preflightError(
+      "money post94 current state or converted snapshot changed during observation",
+    );
+  for (const entry of held)
+    if (
+      JSON.stringify(await options.custody.read(entry.phase)) !== JSON.stringify(entry.receipt) ||
+      JSON.stringify(await options.custody.readDispatch(entry.phase)) !==
+        JSON.stringify(entry.binding)
+    )
+      throw preflightError("money post94 custody changed during observation");
+  return {
+    schemaPhase: phase,
+    historicalWriterEpoch: previousWriterEpoch,
+    currentWriterEpoch,
+    convertBindingDigest: history.convert.receipt.bindingDigest,
+    converted94BackupDigest: converted.digest,
+    continuation: unknown ? "unknown-dispatch" : "blocked-financial-port",
+    qualification: "component-simulation-only",
+    normalHostReady: false,
+  };
+}
+
+/** Remote GET/SELECT and existing custody reads only; local source-build scratch is retained. */
+export async function readMoneyUnitResumeState(
+  target: DeployTarget,
+  options: MoneyUnitCutoverOptions,
+): Promise<MoneyUnitResumeState> {
+  if (
+    target.environment !== "integration" ||
+    options.phase !== "resume" ||
+    options.outputDirectory === undefined
+  )
+    throw preflightError("money resume read requires the selected integration resume owner");
+  const files = readMigrationArtifact(
+    options.sourceDirectory ?? resolve(REPOSITORY, "migrations"),
+  ).files;
+  assertMoneyCutoverSource(files);
+  for (const phase of ["convert", "resume"] as const) {
+    const receipt = await options.custody.read(phase);
+    if (receipt?.state === "dispatched")
+      throw preflightError("money resume read holds unknown dispatch; no reconciliation");
+  }
+  const run = options.run ?? runCommand;
+  const credential = await resolveCloudflareCredential("integration", {
+    ...(options.cloudflareEnvironment === undefined
+      ? {}
+      : { cloudflareEnvironment: options.cloudflareEnvironment }),
+    run,
+  });
+  assertProtectedDirectory(options.outputDirectory, "money resume read output");
+  const root = mkdtempSync(join(options.outputDirectory, "money-resume-read-"));
+  const configPath = join(root, "wrangler.jsonc");
+  writeFileSync(configPath, configJson(target), { flag: "wx", mode: 0o600 });
+  const database = new RemoteD1(configPath, { environment: credential.childEnvironment, run });
+  const origin = await options.stageOriginProof();
+  const backup = await backupAndRead(
+    options.backupPath,
+    configPath,
+    target,
+    files,
+    digest(JSON.stringify(origin)),
+    root,
+    run,
+    credential.childEnvironment,
+    false,
+  );
+  return inspectMoneyUnitResumeState({
+    target,
+    options,
+    files,
+    database,
+    readSchema: () => readD1SchemaState(database),
+    backup,
+  });
 }
 
 /** Protects the full existing D1 export against row-value loss, including NUL-bearing text. */
@@ -1444,7 +2215,15 @@ async function runImport(
       `money cutover import was not acknowledged (exit ${result.exitCode}); keep freeze and reconcile by GET only`,
     );
   }
-  sealed.assertUnchanged();
+  try {
+    sealed.assertUnchanged();
+  } catch (cause) {
+    const failure = verificationError(
+      "money cutover import was acknowledged but sealed input validation failed; retain custody and inspect status without replay",
+    );
+    failure.cause = cause;
+    throw failure;
+  }
 }
 
 /** Recover an unknown import acknowledgement using retained evidence and D1 reads only. */
@@ -1467,6 +2246,10 @@ export async function reconcileMoneyCutoverDispatched(input: {
   readonly environment: Readonly<Record<string, string>>;
   readonly receipt: MoneyCutoverCustodyReceipt;
 }): Promise<Record<string, unknown>> {
+  if (input.options.phase === "suffix98" || input.options.phase === "resume98")
+    throw preflightError(
+      "money post94 unknown dispatch remains held; Financial realm reconciliation is unavailable and cannot resend",
+    );
   const {
     invocation,
     target,
@@ -1644,7 +2427,7 @@ export async function reconcileMoneyCutoverDispatched(input: {
   }
   const reviewBinding: MoneyReviewBinding = {
     kind: "takoserver.money-review-binding@v1",
-    phase: options.phase,
+    phase: binding.phase,
     accountId: target.accountId,
     databaseId: target.d1.databaseId,
     originDigest,
@@ -1765,10 +2548,42 @@ export async function runIntegrationMoneyUnitCutover(
     target.environment !== "integration" ||
     !COMMIT.test(invocation.commit) ||
     !options ||
-    !["freeze", "prepare", "classify", "convert", "resume", "abandon"].includes(options.phase)
+    ![
+      "freeze",
+      "prepare",
+      "classify",
+      "convert",
+      "resume",
+      "abandon",
+      "suffix98",
+      "resume98",
+    ].includes(options.phase)
   ) {
     throw preflightError("money cutover requires an exact integration invocation and phase");
   }
+  if (options.phase === "suffix98" || options.phase === "resume98")
+    throw preflightError(
+      "money post94 continuation requires the owning Financial realm transition port; no export/import/dispatch is permitted",
+    );
+  // The adapter is already initialized before invoking this executor. This lazy
+  // assert-only edge avoids a static owner/executor initialization cycle.
+  const originalWriter = /^integration-ts-[0-9a-f]{32}$/u.test(target.d1.databaseName)
+    ? (await import("./schema-money-unit-owner.ts")).assertMoneyUnitOriginalWriterOptions
+    : undefined;
+  if (originalWriter !== undefined) target = originalWriter(options, target);
+  const assertOriginalWriter = (phase: "preflight" | "verification" = "preflight") => {
+    try {
+      return originalWriter?.(options, target);
+    } catch (cause) {
+      if (phase !== "verification") throw cause;
+      const failure = verificationError(
+        "fresh money source changed after import; retain custody and inspect status",
+      );
+      failure.cause = cause;
+      throw failure;
+    }
+  };
+  assertOriginalWriter();
   const selected = phaseSchemas(options.phase);
   if (invocation.throughMigration !== selected.through)
     throw preflightError("money cutover phase and fixed schema wave differ");
@@ -1828,7 +2643,8 @@ export async function runIntegrationMoneyUnitCutover(
   }
   const origin = await options.stageOriginProof();
   const liveIdentity = await options.storageIdentityRead();
-  assertStageTarget(target, origin, liveIdentity);
+  assertOriginalWriter();
+  assertStageTarget(target, origin, liveIdentity, originalWriter !== undefined);
   if (
     !MONEY_CUTOVER_WRITER_EPOCH_PATTERN.test(options.writerEpoch) ||
     options.writerEpoch !== target.moneyCutoverWriterEpoch
@@ -2139,7 +2955,8 @@ export async function runIntegrationMoneyUnitCutover(
     }
     const originNow = await options.stageOriginProof();
     const liveNow = await options.storageIdentityRead();
-    assertStageTarget(target, originNow, liveNow);
+    assertOriginalWriter();
+    assertStageTarget(target, originNow, liveNow, originalWriter !== undefined);
     if (digest(JSON.stringify(originNow)) !== originDigest)
       throw preflightError("money cutover origin changed before dispatch");
     const atDispatch = await readD1SchemaState(database);
@@ -2241,93 +3058,127 @@ export async function runIntegrationMoneyUnitCutover(
       "dispatched",
     );
     sealedImport.assertUnchanged();
+    assertOriginalWriter();
     await runImport(importPath, configPath, target, run, environment);
-    const post = await readD1SchemaState(database, "verification");
-    if (!moneyUnitCutoverSchemaMatches(post, files, expectedAfter)) {
-      throw verificationError(
-        "money cutover import was acknowledged but exact terminal schema failed; keep freeze and repair forward",
+    try {
+      if (originalWriter !== undefined) {
+        try {
+          const postOrigin = await options.stageOriginProof();
+          const postIdentity = await options.storageIdentityRead();
+          assertOriginalWriter();
+          assertStageTarget(target, postOrigin, postIdentity, true);
+          if (
+            digest(JSON.stringify(postOrigin)) !== originDigest ||
+            JSON.stringify(postIdentity) !== JSON.stringify(liveIdentity)
+          )
+            throw verificationError(
+              "fresh money original identity changed after import; retain custody",
+            );
+        } catch (cause) {
+          const failure = verificationError(
+            "fresh money original readback failed after import; keep freeze and inspect status without replay",
+          );
+          failure.cause = cause;
+          throw failure;
+        }
+      }
+      const post = await readD1SchemaState(database, "verification");
+      assertOriginalWriter("verification");
+      if (!moneyUnitCutoverSchemaMatches(post, files, expectedAfter)) {
+        throw verificationError(
+          "money cutover import was acknowledged but exact terminal schema failed; keep freeze and repair forward",
+        );
+      }
+      if (expectedAfter === "0094") {
+        await assertResumedFreezeEmpty(database, "verification", options.writerEpoch);
+        if (options.resumeHealthRead === undefined)
+          throw verificationError("money resume healthy native readback is unavailable");
+        await options.resumeHealthRead("healthy");
+        if (
+          options.resumeProof === undefined ||
+          digest(JSON.stringify(await options.resumeProof())) !== resumeDigest
+        )
+          throw verificationError("money resumed native Version changed after D1 transition");
+      } else if (expectedAfter.endsWith("-fenced"))
+        await assertPermitEmpty(database, "verification", options.writerEpoch);
+      if (
+        options.phase === "freeze" ||
+        options.phase === "prepare" ||
+        options.phase === "classify" ||
+        options.phase === "abandon"
+      ) {
+        if (options.phase !== "abandon")
+          assertFreezeRow(
+            await readFreezeRow(database, "verification"),
+            anchor,
+            originDigest,
+            backup.digest,
+            writerDigest,
+            "verification",
+          );
+        if (
+          (await readMoneyPreimageDigest(database, "verification")) !== backup.preimageDigest ||
+          (await readMoneyAggregateDigest(database, "verification")) !== backup.aggregateDigest ||
+          (await readMoneyFrozenDataDigest(database, "verification")) !== backup.financialDigest
+        ) {
+          throw verificationError(
+            "money freeze changed financial rows; keep freeze and repair forward",
+          );
+        }
+      }
+      if (options.phase === "convert" || options.phase === "resume") {
+        if (
+          (await readMoneyPreimageDigest(database, "verification", true)) !==
+            backup.preimageDigest ||
+          (await readMoneyAggregateDigest(database, "verification", true)) !==
+            backup.aggregateDigest
+        ) {
+          throw verificationError(
+            "money converted preimage differs from protected backup; repair forward",
+          );
+        }
+        await assertClassificationsStored(database, classifications, "verification");
+      }
+      if (options.phase === "classify")
+        await assertClassificationsStored(database, classifications, "verification");
+      await assertMoneyNativeForeignKeys(database, "verification");
+      const postDigest = digest(
+        JSON.stringify({
+          applied: post.applied,
+          shapeDigest: post.shapeDigest,
+          preimageDigest: backup.preimageDigest,
+          aggregateDigest: backup.aggregateDigest,
+        }),
       );
+      validateCustody(
+        await options.custody.terminal(binding, postDigest),
+        options.phase,
+        bindingDigest,
+        "terminal",
+        postDigest,
+      );
+      return {
+        ...status,
+        schemaPhase: expectedAfter,
+        schemaShapeDigest: post.shapeDigest,
+        custody: "terminal",
+        readyForApply: false,
+        postDigest,
+        ...(options.phase === "abandon"
+          ? {
+              writerState: "maintenance-still-quiesced",
+              nextAction: "review-qualified old-cents native recovery or forward repair",
+            }
+          : {}),
+      };
+    } catch (cause) {
+      if (cause instanceof DeployError && cause.phase === "verification") throw cause;
+      const failure = verificationError(
+        "money import was acknowledged but verification or custody settlement failed; keep freeze and inspect status without replay",
+      );
+      failure.cause = cause;
+      throw failure;
     }
-    if (expectedAfter === "0094") {
-      await assertResumedFreezeEmpty(database, "verification", options.writerEpoch);
-      if (options.resumeHealthRead === undefined)
-        throw verificationError("money resume healthy native readback is unavailable");
-      await options.resumeHealthRead("healthy");
-      if (
-        options.resumeProof === undefined ||
-        digest(JSON.stringify(await options.resumeProof())) !== resumeDigest
-      )
-        throw verificationError("money resumed native Version changed after D1 transition");
-    } else if (expectedAfter.endsWith("-fenced"))
-      await assertPermitEmpty(database, "verification", options.writerEpoch);
-    if (
-      options.phase === "freeze" ||
-      options.phase === "prepare" ||
-      options.phase === "classify" ||
-      options.phase === "abandon"
-    ) {
-      if (options.phase !== "abandon")
-        assertFreezeRow(
-          await readFreezeRow(database, "verification"),
-          anchor,
-          originDigest,
-          backup.digest,
-          writerDigest,
-          "verification",
-        );
-      if (
-        (await readMoneyPreimageDigest(database, "verification")) !== backup.preimageDigest ||
-        (await readMoneyAggregateDigest(database, "verification")) !== backup.aggregateDigest ||
-        (await readMoneyFrozenDataDigest(database, "verification")) !== backup.financialDigest
-      ) {
-        throw verificationError(
-          "money freeze changed financial rows; keep freeze and repair forward",
-        );
-      }
-    }
-    if (options.phase === "convert" || options.phase === "resume") {
-      if (
-        (await readMoneyPreimageDigest(database, "verification", true)) !== backup.preimageDigest ||
-        (await readMoneyAggregateDigest(database, "verification", true)) !== backup.aggregateDigest
-      ) {
-        throw verificationError(
-          "money converted preimage differs from protected backup; repair forward",
-        );
-      }
-      await assertClassificationsStored(database, classifications, "verification");
-    }
-    if (options.phase === "classify")
-      await assertClassificationsStored(database, classifications, "verification");
-    await assertMoneyNativeForeignKeys(database, "verification");
-    const postDigest = digest(
-      JSON.stringify({
-        applied: post.applied,
-        shapeDigest: post.shapeDigest,
-        preimageDigest: backup.preimageDigest,
-        aggregateDigest: backup.aggregateDigest,
-      }),
-    );
-    validateCustody(
-      await options.custody.terminal(binding, postDigest),
-      options.phase,
-      bindingDigest,
-      "terminal",
-      postDigest,
-    );
-    return {
-      ...status,
-      schemaPhase: expectedAfter,
-      schemaShapeDigest: post.shapeDigest,
-      custody: "terminal",
-      readyForApply: false,
-      postDigest,
-      ...(options.phase === "abandon"
-        ? {
-            writerState: "maintenance-still-quiesced",
-            nextAction: "review-qualified old-cents native recovery or forward repair",
-          }
-        : {}),
-    };
   } finally {
     if (lease !== null) await lease.release();
     if (options.outputDirectory === undefined) rmSync(root, { recursive: true, force: true });

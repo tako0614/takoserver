@@ -7,8 +7,12 @@ import {
   parseSQLiteMigrationSetSpec,
   projectSQLiteMigrationVerified,
   SQLITE_MIGRATION_SET_FORM_URL,
+  SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
+  SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
+  SQLITE_MIGRATION_SET_FORM_URL_0_4_0,
   SQLITE_MIGRATION_SET_LIMITS,
   type SQLiteMigrationManifest,
+  type SQLiteMigrationSetFormUrl,
   SQLiteMigrationSetValidationError,
   validateSQLiteMigrationPayload,
   validateSQLiteMigrationSetUpdate,
@@ -20,13 +24,21 @@ export function createSQLiteMigrationSetCustody(options: {
   sql: Sql;
   source: V2ArtifactSource;
   now?: Clock;
+  formUrl?: SQLiteMigrationSetFormUrl;
 }): SqlArtifactCustody<SQLiteMigrationManifest> {
+  const formUrl = options.formUrl ?? SQLITE_MIGRATION_SET_FORM_URL;
+  if (
+    formUrl !== SQLITE_MIGRATION_SET_FORM_URL_0_2_0 &&
+    formUrl !== SQLITE_MIGRATION_SET_FORM_URL_0_3_0 &&
+    formUrl !== SQLITE_MIGRATION_SET_FORM_URL_0_4_0
+  )
+    throw new TypeError("SQLiteMigrationSet Form identity is unsupported");
   return createSqlArtifactCustody({
     sql: options.sql,
     source: options.source,
     ...(options.now ? { now: options.now } : {}),
     layout: "migration-set-0071",
-    formUrl: SQLITE_MIGRATION_SET_FORM_URL,
+    formUrl,
     limits: SQLITE_MIGRATION_SET_LIMITS,
     parseSpec: parseSQLiteMigrationSetSpec,
     parseManifest: parseSQLiteMigrationManifest,
@@ -46,6 +58,7 @@ export function createSQLiteMigrationSetForm(options: {
   /** Stable opaque identity of this durable local SQL target, never a path or secret. */
   targetKey: string;
   now?: Clock;
+  formUrl?: SQLiteMigrationSetFormUrl;
 }): V2Form {
   if (!options.targetKey) throw new TypeError("targetKey is required");
   const apply = createSQLiteMigrationSetCustody(options);

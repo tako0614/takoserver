@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import { Database, SQLiteError } from "bun:sqlite";
 import {
   type Row,
   type Sql,
@@ -90,6 +90,13 @@ function bindable(value: SqlParam): string | number | null | Uint8Array {
 
 function sqlError(error: unknown): SqlError {
   const message = error instanceof Error ? error.message : String(error);
+  if (
+    error instanceof SQLiteError &&
+    typeof error.code === "string" &&
+    /^SQLITE_CONSTRAINT(?:_|$)/u.test(error.code)
+  ) {
+    return new SqlError("constraint", message);
+  }
   if (/constraint|unique|check/iu.test(message)) return new SqlError("constraint", message);
   return new SqlError("unavailable", message);
 }

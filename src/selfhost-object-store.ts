@@ -58,6 +58,10 @@ export const MAX_SELFHOST_OBJECT_SINGLE_PUT_BYTES = 314_572_800;
 export const MAX_SELFHOST_OBJECT_PARTS = 10_000;
 export const MIN_SELFHOST_OBJECT_NON_FINAL_PART_BYTES = 5_242_880;
 export const MAX_SELFHOST_OBJECT_LIST_LIMIT = 1_000;
+const OBJECT_FRAME_HEADER_BYTES = 4;
+/** Each positive frame carries at least one payload byte; add one EOF marker. */
+export const MAX_SELFHOST_OBJECT_BODY_WIRE_BYTES =
+  MAX_SELFHOST_OBJECT_BYTES * (1 + OBJECT_FRAME_HEADER_BYTES) + OBJECT_FRAME_HEADER_BYTES;
 
 /**
  * How long an unfinished multipart upload is kept.
@@ -152,7 +156,7 @@ export interface SelfhostObjectGetOptions {
 }
 
 export interface SelfhostObjectPutOptions {
-  readonly contentLength: number;
+  readonly contentLength?: number;
   readonly contentType?: string;
   readonly ifMatch?: string;
   readonly ifNoneMatch?: "*";
@@ -194,7 +198,7 @@ export interface SelfhostObjectStore {
     bucketId: string,
     key: string,
     body: ReadableStream<Uint8Array>,
-    options: SelfhostObjectPutOptions,
+    options?: SelfhostObjectPutOptions,
   ): Promise<{ readonly etag: string; readonly size: number }>;
   delete(bucketId: string, key: string): Promise<void>;
   list(bucketId: string, options?: SelfhostObjectListOptions): Promise<SelfhostObjectListResult>;
@@ -209,8 +213,8 @@ export interface SelfhostObjectStore {
     uploadId: string,
     partNumber: number,
     body: ReadableStream<Uint8Array>,
-    options: { readonly contentLength: number },
-  ): Promise<{ readonly etag: string; readonly partNumber: number }>;
+    options?: { readonly contentLength?: number },
+  ): Promise<{ readonly etag: string; readonly partNumber: number; readonly size: number }>;
   completeMultipartUpload(
     bucketId: string,
     key: string,
@@ -254,6 +258,190 @@ export interface SelfhostObjectStoreOptions {
   readonly clock?: () => Date;
   /** Injected so a test can name an upload; 16 random bytes otherwise. */
   readonly identifier?: () => string;
+}
+
+/** Internal stage consumer: await the sink before pulling another byte chunk. */
+export async function consumeSelfhostObjectBody(
+  body: ReadableStream<Uint8Array>,
+  options: {
+    readonly maximum: number;
+    readonly contentLength?: number | undefined;
+    readonly overflow: "value_too_large" | "invalid_body";
+  },
+  write: (chunk: Uint8Array) => Promise<void>,
+): Promise<number> {
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let received = 0;
+  try {
+    if (
+      Object.hasOwn(options, "contentLength") &&
+      (!Number.isSafeInteger(options.contentLength) || (options.contentLength as number) < 0)
+    ) {
+      throw new SelfhostObjectError("invalid_body");
+    }
+    const expected = options.contentLength;
+    // Preserve the existing refusal for an explicitly oversized declaration.
+    if (expected !== undefined && expected > options.maximum) {
+      throw new SelfhostObjectError("value_too_large");
+    }
+    reader = body.getReader();
+    for (;;) {
+      let next: Awaited<ReturnType<typeof reader.read>>;
+      try {
+        next = await reader.read();
+      } catch {
+        throw new SelfhostObjectError("backend_unavailable");
+      }
+      if (next.done) break;
+      const chunk = next.value;
+      if (!(chunk instanceof Uint8Array)) throw new SelfhostObjectError("invalid_body");
+      if (expected !== undefined && chunk.byteLength > expected - received) {
+        throw new SelfhostObjectError("invalid_body");
+      }
+      if (chunk.byteLength > options.maximum - received) {
+        throw new SelfhostObjectError(options.overflow);
+      }
+      await write(chunk);
+      received += chunk.byteLength;
+    }
+    if (expected !== undefined && received !== expected) {
+      throw new SelfhostObjectError("invalid_body");
+    }
+    return received;
+  } catch (error) {
+    // A producer's cancellation promise must not hold a failed private stage.
+    // Request cancellation, suppress transport diagnostics, and release custody.
+    try {
+      void (reader ? reader.cancel() : body.cancel()).catch(() => undefined);
+    } catch {
+      // Preserve the operation error when the producer refuses cancellation.
+    }
+    throw error instanceof SelfhostObjectError
+      ? error
+      : new SelfhostObjectError("backend_unavailable");
+  } finally {
+    reader?.releaseLock();
+  }
+}
+
+/**
+ * Host-private byte-chunks-v1: bounded big-endian length records, followed by
+ * 0xffffffff only after the sender validated source EOF. HTTP EOF alone cannot
+ * publish an unknown-length producer: a transport may hide a producer error.
+ */
+export function decodeSelfhostObjectBodyFrames(
+  source: ReadableStream<Uint8Array>,
+): ReadableStream<Uint8Array> {
+  const reader = source.getReader();
+  let buffered: Uint8Array | undefined;
+  let offset = 0;
+  let remaining = 0;
+  let terminated = false;
+  function abort() {
+    if (terminated) return;
+    terminated = true;
+    try {
+      void reader.cancel().catch(() => undefined);
+    } catch {
+      // Do not reveal private transport diagnostics or await a hostile cancel.
+    }
+    reader.releaseLock();
+  }
+  async function take(maximum: number): Promise<Uint8Array | null> {
+    for (;;) {
+      if (buffered && offset < buffered.byteLength) {
+        const size = Math.min(maximum, buffered.byteLength - offset);
+        const value = buffered.subarray(offset, offset + size);
+        offset += size;
+        return value;
+      }
+      const next = await reader.read();
+      if (next.done) return null;
+      if (!(next.value instanceof Uint8Array)) {
+        throw new SelfhostObjectError("backend_unavailable");
+      }
+      buffered = next.value;
+      offset = 0;
+    }
+  }
+  return new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        try {
+          if (remaining === 0) {
+            const header = new Uint8Array(OBJECT_FRAME_HEADER_BYTES);
+            let filled = 0;
+            while (filled < OBJECT_FRAME_HEADER_BYTES) {
+              const bytes = await take(OBJECT_FRAME_HEADER_BYTES - filled);
+              if (terminated) return;
+              if (!bytes) throw new SelfhostObjectError("backend_unavailable");
+              header.set(bytes, filled);
+              filled += bytes.byteLength;
+            }
+            const size = new DataView(header.buffer).getUint32(0);
+            if (size === 0xffff_ffff) {
+              // A terminal marker is valid only at the end of the wire body.
+              if (await take(1)) throw new SelfhostObjectError("backend_unavailable");
+              if (terminated) return;
+              terminated = true;
+              reader.releaseLock();
+              controller.close();
+              return;
+            }
+            if (size === 0 || size > 65_536) throw new SelfhostObjectError("backend_unavailable");
+            remaining = size;
+          }
+          const bytes = await take(remaining);
+          if (terminated) return;
+          if (!bytes) throw new SelfhostObjectError("backend_unavailable");
+          remaining -= bytes.byteLength;
+          controller.enqueue(bytes);
+        } catch {
+          abort();
+          controller.error(new SelfhostObjectError("backend_unavailable"));
+        }
+      },
+      cancel() {
+        abort();
+      },
+    },
+    { highWaterMark: 0 },
+  );
+}
+
+/** The same durable receipt checks used immediately before filesystem assembly. */
+export function validateSelfhostObjectParts(
+  parts: readonly { readonly etag: string; readonly partNumber: number }[],
+  recorded: ReadonlyMap<number, { readonly etag: string; readonly size: number }>,
+): number {
+  if (parts.length < 1 || parts.length > MAX_SELFHOST_OBJECT_PARTS) {
+    throw new SelfhostObjectError("invalid_part");
+  }
+  let total = 0;
+  let previous = 0;
+  for (let index = 0; index < parts.length; index += 1) {
+    const part = parts[index];
+    const known = part ? recorded.get(part.partNumber) : undefined;
+    if (
+      !part ||
+      !Number.isSafeInteger(part.partNumber) ||
+      part.partNumber <= previous ||
+      part.partNumber > MAX_SELFHOST_OBJECT_PARTS ||
+      !known ||
+      known.etag !== part.etag ||
+      !Number.isSafeInteger(known.size) ||
+      known.size < 0 ||
+      (index < parts.length - 1 && known.size < MIN_SELFHOST_OBJECT_NON_FINAL_PART_BYTES)
+    ) {
+      throw new SelfhostObjectError("invalid_part");
+    }
+    previous = part.partNumber;
+    if (known.size > MAX_SELFHOST_OBJECT_BYTES - total) {
+      throw new SelfhostObjectError("value_too_large");
+    }
+    total += known.size;
+  }
+  return total;
 }
 
 export function createSelfhostObjectStore(
@@ -329,55 +517,60 @@ export function createSelfhostObjectStore(
   };
 
   /**
-   * Writes one stream to a private file, and refuses anything but exactly the
-   * declared length.
-   *
-   * The length is declared rather than discovered because it is the only thing
-   * that bounds what a caller can make this process write before the check
-   * happens. A body that runs long is stopped at the first byte past it.
+   * Writes byte chunks to a private file under the operation's actual ceiling.
+   * A supplied length stays exact; otherwise clean EOF determines the size.
    */
   const stage = async (
     bucketId: string,
     body: ReadableStream<Uint8Array>,
-    contentLength: number,
+    options: { readonly contentLength?: number },
     maximum: number,
+    overflow: "value_too_large" | "invalid_body",
   ): Promise<{ readonly path: string; readonly etag: string; readonly size: number }> => {
-    if (!Number.isSafeInteger(contentLength) || contentLength < 0) {
-      throw new SelfhostObjectError("invalid_body");
-    }
-    if (contentLength > maximum) throw new SelfhostObjectError("value_too_large");
     const directory = join(bucketDirectory(bucketId), "tmp");
-    await privateDirectory(directory);
     const path = join(directory, identifier());
     const digest = createHash("sha256");
     let received = 0;
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
+      await privateDirectory(directory);
       handle = await open(
         path,
         fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
         0o600,
       );
-      const reader = body.getReader();
-      for (;;) {
-        const next = await reader.read();
-        if (next.done) break;
-        const chunk = next.value;
-        if (!(chunk instanceof Uint8Array)) {
-          await reader.cancel().catch(() => undefined);
-          throw new SelfhostObjectError("invalid_body");
-        }
-        received += chunk.byteLength;
-        if (received > contentLength) {
-          await reader.cancel().catch(() => undefined);
-          throw new SelfhostObjectError("invalid_body");
-        }
-        digest.update(chunk);
-        await handle.write(chunk);
-      }
-      if (received !== contentLength) throw new SelfhostObjectError("invalid_body");
+      const output = handle;
+      received = await consumeSelfhostObjectBody(
+        body,
+        {
+          maximum,
+          overflow,
+          ...(Object.hasOwn(options, "contentLength")
+            ? { contentLength: options.contentLength }
+            : {}),
+        },
+        async (chunk) => {
+          // Own at most one bounded window while an asynchronous file write is
+          // pending. A short write must finish before its bytes are accepted.
+          for (let offset = 0; offset < chunk.byteLength; offset += READ_CHUNK_BYTES) {
+            const window = Buffer.from(chunk.subarray(offset, offset + READ_CHUNK_BYTES));
+            let written = 0;
+            while (written < window.byteLength) {
+              const result = await output.write(window, written, window.byteLength - written);
+              if (result.bytesWritten <= 0) throw new SelfhostObjectError("backend_unavailable");
+              written += result.bytesWritten;
+            }
+            digest.update(window);
+          }
+        },
+      );
       await handle.sync();
     } catch (error) {
+      try {
+        void body.cancel().catch(() => undefined);
+      } catch {
+        // Cancellation must not replace the failed stage's portable error.
+      }
       await handle?.close().catch(() => undefined);
       await rm(path, { force: true }).catch(() => undefined);
       throw error instanceof SelfhostObjectError
@@ -585,14 +778,15 @@ export function createSelfhostObjectStore(
       };
     },
 
-    async put(bucketId, key, body, options) {
+    async put(bucketId, key, body, options = {}) {
       validBucket(bucketId);
       validKey(key);
       const staged = await stage(
         bucketId,
         body,
-        options.contentLength,
+        options,
         MAX_SELFHOST_OBJECT_SINGLE_PUT_BYTES,
+        "value_too_large",
       );
       return await commitBody(bucketId, key, staged, options.contentType, {
         ...(options.ifMatch !== undefined ? { ifMatch: options.ifMatch } : {}),
@@ -633,7 +827,7 @@ export function createSelfhostObjectStore(
       return { uploadId };
     },
 
-    async uploadPart(bucketId, key, uploadId, partNumber, body, options) {
+    async uploadPart(bucketId, key, uploadId, partNumber, body, options = {}) {
       validBucket(bucketId);
       validKey(key);
       if (
@@ -662,8 +856,9 @@ export function createSelfhostObjectStore(
         const staged = await stage(
           bucketId,
           body,
-          options.contentLength,
+          options,
           MAX_SELFHOST_OBJECT_BYTES,
+          "invalid_body",
         );
         const destination = versionedPartPath(bucketId, uploadId, partNumber, staged.etag);
         let created = false;
@@ -714,7 +909,7 @@ export function createSelfhostObjectStore(
             if (previousPath && previousPath !== destination) {
               await rm(previousPath, { force: true }).catch(() => undefined);
             }
-            return { etag: staged.etag, partNumber };
+            return { etag: staged.etag, partNumber, size: staged.size };
           }
           if (!receipt) throw new SelfhostObjectError("backend_unavailable");
           if (created) await rm(destination, { force: true }).catch(() => undefined);
@@ -723,7 +918,7 @@ export function createSelfhostObjectStore(
         if (previousPath && previousPath !== destination) {
           await rm(previousPath, { force: true }).catch(() => undefined);
         }
-        return { etag: staged.etag, partNumber };
+        return { etag: staged.etag, partNumber, size: staged.size };
       });
     },
 
@@ -733,9 +928,6 @@ export function createSelfhostObjectStore(
       if (!UPLOAD_ID.test(uploadId)) throw new SelfhostObjectError("upload_not_found");
       const upload = await readUpload(sql, bucketId, uploadId);
       if (!upload || upload.key !== key) throw new SelfhostObjectError("upload_not_found");
-      if (parts.length < 1 || parts.length > MAX_SELFHOST_OBJECT_PARTS) {
-        throw new SelfhostObjectError("invalid_part");
-      }
       const recorded = new Map<number, { readonly etag: string; readonly size: number }>();
       for (const row of await query(
         sql,
@@ -748,25 +940,7 @@ export function createSelfhostObjectStore(
           size: Number(row.size),
         });
       }
-      let total = 0;
-      let previous = 0;
-      for (let index = 0; index < parts.length; index += 1) {
-        const part = parts[index] as { readonly etag: string; readonly partNumber: number };
-        const known = recorded.get(part.partNumber);
-        if (
-          part.partNumber <= previous ||
-          !known ||
-          known.etag !== part.etag ||
-          (index < parts.length - 1 && known.size < MIN_SELFHOST_OBJECT_NON_FINAL_PART_BYTES)
-        ) {
-          throw new SelfhostObjectError("invalid_part");
-        }
-        previous = part.partNumber;
-        if (known.size > MAX_SELFHOST_OBJECT_BYTES - total) {
-          throw new SelfhostObjectError("value_too_large");
-        }
-        total += known.size;
-      }
+      const total = validateSelfhostObjectParts(parts, recorded);
       // Assembled into one private file before anything durable moves, so a
       // failure halfway leaves the upload exactly where it was and the caller
       // may complete it again.

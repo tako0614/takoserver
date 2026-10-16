@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { base64UrlEncode } from "../src/json.ts";
 import {
   createSharedAuthOidcClient,
+  SHARED_AUTH_STAGING_PROFILE,
   type SharedAuthGrant,
   type SharedAuthOidcConfig,
   SharedAuthOidcError,
@@ -11,10 +12,7 @@ const stamp = 1792022400000;
 const nonce = "test-nonce";
 const verifier = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFG";
 const config: SharedAuthOidcConfig = {
-  environment: "staging",
-  issuer: "https://auth-staging.example.test",
-  publicOrigin: "https://console-staging.example.test",
-  clientId: "takoserver-console-staging-v1",
+  ...SHARED_AUTH_STAGING_PROFILE,
   clientSecret: "test-only:client+credential/α",
 };
 
@@ -489,6 +487,33 @@ describe("first-party staging OIDC protocol", () => {
         createSharedAuthOidcClient({ config: { ...config, ...changes } as SharedAuthOidcConfig }),
       ).toThrow(TypeError);
     }
+  });
+
+  test.each([
+    { issuer: "https://arbitrary.example.test" },
+    { issuer: "https://alias.auth-staging.takos.jp" },
+    { issuer: `${config.issuer}.` },
+    { issuer: `${config.issuer}:443` },
+    { issuer: `${config.issuer}:8443` },
+    { issuer: config.publicOrigin },
+    { publicOrigin: "https://arbitrary.example.test" },
+    { publicOrigin: `https://alias.${new URL(config.publicOrigin).hostname}` },
+    { publicOrigin: `${config.publicOrigin}.` },
+    { publicOrigin: `${config.publicOrigin}:443` },
+    { publicOrigin: `${config.publicOrigin}:8443` },
+    { publicOrigin: SHARED_AUTH_STAGING_PROFILE.consoleOrigin },
+  ])("rejects unselected exact profile before credential-bearing transport %j", (changes) => {
+    let sent = 0;
+    expect(() =>
+      createSharedAuthOidcClient({
+        config: { ...config, ...changes },
+        fetch: async () => {
+          sent += 1;
+          throw new Error("must not send credentials");
+        },
+      }),
+    ).toThrow(TypeError);
+    expect(sent).toBe(0);
   });
 
   test("does not send malformed code, nonce or verifier", async () => {

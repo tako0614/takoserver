@@ -1,6 +1,15 @@
 import { base64UrlDecode, base64UrlEncode } from "./json.ts";
 import { parseStrictJson } from "./strict-json.ts";
 
+/** Selected first-party staging profile; aliases never receive RP credentials. */
+export const SHARED_AUTH_STAGING_PROFILE = Object.freeze({
+  environment: "staging",
+  issuer: "https://auth-staging.takos.jp",
+  publicOrigin: "https://takoserver-api-integration-billing-0092.shoutatomiyama0614.workers.dev",
+  consoleOrigin: "https://takoserver-console-integration.shoutatomiyama0614.workers.dev",
+  clientId: "takoserver-console-staging-v1",
+} as const);
+
 /** The first-party HTTP contract, independent of another product's source. */
 export interface SharedAuthOidcConfig {
   readonly environment: "staging";
@@ -61,23 +70,16 @@ export function createSharedAuthOidcClient(options: {
   readonly now?: () => number;
 }) {
   const config = { ...options.config };
-  const issuer = exactOrigin(config.issuer);
-  const publicOrigin = exactOrigin(config.publicOrigin);
-  const productionHosts = new Set([
-    "auth.takos.jp",
-    "app.takosumi.com",
-    "console.takoserver.com",
-    "api.takoserver.com",
-  ]);
   if (
-    config.environment !== "staging" ||
-    config.clientId !== "takoserver-console-staging-v1" ||
-    productionHosts.has(issuer.hostname) ||
-    productionHosts.has(publicOrigin.hostname) ||
-    config.issuer === config.publicOrigin ||
+    config.environment !== SHARED_AUTH_STAGING_PROFILE.environment ||
+    config.clientId !== SHARED_AUTH_STAGING_PROFILE.clientId ||
+    config.issuer !== SHARED_AUTH_STAGING_PROFILE.issuer ||
+    config.publicOrigin !== SHARED_AUTH_STAGING_PROFILE.publicOrigin ||
     !text(config.clientSecret, 4096)
   )
-    throw new TypeError("Shared login requires isolated staging configuration");
+    throw new TypeError("Shared login requires the exact selected staging profile");
+  exactOrigin(config.issuer);
+  exactOrigin(config.publicOrigin);
   const send = options.fetch ?? ((request: Request) => fetch(request));
   const now = options.now ?? Date.now;
   const redirectUri = `${config.publicOrigin}/auth/oidc/callback`;
@@ -184,7 +186,7 @@ export function createSharedAuthOidcClient(options: {
         })(),
       ]);
     } finally {
-      clearTimeout(timeout);
+      if (timeout !== undefined) clearTimeout(timeout);
     }
   }
 
@@ -258,7 +260,7 @@ export function createSharedAuthOidcClient(options: {
     try {
       const imported = await crypto.subtle.importKey(
         "jwk",
-        key,
+        key as unknown as JsonWebKey,
         { name: "ECDSA", namedCurve: "P-256" },
         false,
         ["verify"],

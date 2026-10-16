@@ -26,6 +26,94 @@ const WORKER_UID = "worker-queue-target";
 const CREATE_ID = "0f2e9831-691d-41d8-b5ce-983e052a14c3";
 const UPDATE_ID = "6cb38324-f2ad-4acc-acd8-b314e891dc54";
 const DELETE_ID = "84ed6745-0688-4201-8372-0c26ddcce0f4";
+type FixtureChild = ReturnType<typeof spawnWorkerdWithParentDeath>;
+type FixtureFailure = { readonly error: unknown } | undefined;
+
+async function preserveFixtureFailure(
+  primary: FixtureFailure,
+  cleanup: () => Promise<void>,
+): Promise<void> {
+  try {
+    await cleanup();
+  } catch (error) {
+    if (primary)
+      throw new AggregateError([primary.error, error], "Queue fixture body and cleanup failed");
+    throw error;
+  }
+}
+
+async function retirementFrontier(root: string, children: readonly FixtureChild[]) {
+  const workerKey = createHash("sha256").update(WORKER_UID).digest("hex");
+  const ownerDirectory = join(root, "owners", workerKey);
+  const file = Bun.file(join(ownerDirectory, "runtime-owner.json"));
+  const bytes = new Uint8Array(await file.slice(0, 64 * 1024 + 1).arrayBuffer());
+  if (bytes.byteLength > 64 * 1024) return { state: "over_limit" };
+  const state = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as {
+    admissionClosedBy?: unknown;
+    physicalAbsences?: unknown;
+    incarnations?: Array<{
+      operationId?: unknown;
+      status?: unknown;
+      receipt?: unknown;
+      executionCopiesCleanupStarted?: unknown;
+      executionCopiesReleased?: unknown;
+      processIdentity?: Parameters<typeof linuxProcessLiveness>[0] | null;
+      listenerPort?: unknown;
+    }>;
+  };
+  if (!Array.isArray(state.incarnations) || state.incarnations.length > 8)
+    return { state: "invalid_inventory" };
+  return {
+    childCount: children.length,
+    children: children.slice(0, 8).map((child) => ({
+      pid: child.pid,
+      exitCode: child.exitCode,
+      signalCode: child.signalCode,
+    })),
+    admissionClosed: state.admissionClosedBy === DELETE_ID,
+    physicalAbsenceCount: Array.isArray(state.physicalAbsences)
+      ? state.physicalAbsences.length
+      : null,
+    incarnations: await Promise.all(
+      state.incarnations.map(async (record) => {
+        const operation =
+          record.operationId === CREATE_ID
+            ? "create"
+            : record.operationId === UPDATE_ID
+              ? "update"
+              : "other";
+        const status = ["candidate", "active", "draining", "retiring", "retired", "uncertain"].find(
+          (value) => value === record.status,
+        );
+        const port = record.listenerPort;
+        const group =
+          operation === "other"
+            ? null
+            : join(ownerDirectory, "incarnations", String(record.operationId), "groups", workerKey);
+        return {
+          operation,
+          status: status ?? "invalid",
+          receiptPresent: record.receipt !== null && record.receipt !== undefined,
+          cleanupStarted: record.executionCopiesCleanupStarted === true,
+          copiesReleased: record.executionCopiesReleased === true,
+          birthLiveness: record.processIdentity
+            ? await linuxProcessLiveness(record.processIdentity).catch(() => "unknown")
+            : "missing",
+          recordedChildIndex: children.findIndex(
+            (child) => child.pid === record.processIdentity?.pid,
+          ),
+          listener:
+            typeof port === "number" && Number.isSafeInteger(port) && port > 0 && port < 65_536
+              ? await workerPortOwnership(port, undefined).catch(() => "unavailable")
+              : "invalid",
+          groupRetirementPresent: group
+            ? await Bun.file(join(group, "retirement.json")).exists()
+            : false,
+        };
+      }),
+    ),
+  };
+}
 
 async function nativeVersionId(operationId: string, generation: number): Promise<string> {
   const seed = new TextEncoder().encode(`version-${operationId}\u0000${generation}`);
@@ -124,6 +212,20 @@ process.on("SIGTERM", () => {
 process.on("SIGUSR1", () => { server.stop(true); setInterval(() => {}, 1000); });
 `;
 
+// Only the companion case creates this gate. Its replacement remains a real
+// live child while the real supervisor waits for the configured listener.
+const RECOVERY_BARRIER_CHILD_SOURCE = `
+const fixtureFs = await import("node:fs");
+const fixturePath = await import("node:path");
+const fixtureRoot = fixturePath.dirname(process.argv[1]);
+const fixtureGate = fixturePath.join(fixtureRoot, "hold-recovery-start");
+if (fixtureFs.existsSync(fixtureGate)) {
+  fixtureFs.writeFileSync(fixturePath.join(fixtureRoot, "recovery-entered." + process.pid), "entered");
+  while (fixtureFs.existsSync(fixtureGate)) await Bun.sleep(5);
+}
+${CHILD_SOURCE}
+`;
+
 async function unusedPort(): Promise<number> {
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response() });
   const port = Number(server.port);
@@ -133,23 +235,39 @@ async function unusedPort(): Promise<number> {
 
 async function closeFixtureOwner(
   owner: Awaited<ReturnType<typeof openWorkerdWorkerRuntimeOwner>>,
-  children: readonly ReturnType<typeof spawnWorkerdWithParentDeath>[],
+  children: readonly FixtureChild[],
   root: string,
+  primary?: FixtureFailure,
 ): Promise<void> {
-  try {
-    expect(await owner.execute(execution(DELETE_ID, "delete"))).toMatchObject({
-      kind: "confirmed",
-      identity: null,
-    });
-    expect(await owner.observeRetirement({})).toMatchObject({ kind: "confirmed_absent" });
-    await owner.close();
-  } finally {
-    for (const child of children)
-      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-    await Promise.all(children.map((child) => child.exited));
-    await removeOwnerPrivateSocketDirectories(root);
-    await rm(root, { recursive: true, force: true });
-  }
+  await preserveFixtureFailure(primary, async () => {
+    let retirementFailure: FixtureFailure;
+    try {
+      expect(await owner.execute(execution(DELETE_ID, "delete"))).toMatchObject({
+        kind: "confirmed",
+        identity: null,
+      });
+      expect(await owner.observeRetirement({})).toMatchObject({ kind: "confirmed_absent" });
+      await owner.close();
+    } catch (error) {
+      const frontier = await retirementFrontier(root, children).catch(() => ({
+        state: "unavailable",
+      }));
+      retirementFailure = {
+        error: new Error(`Queue fixture retirement frontier: ${JSON.stringify(frontier)}`, {
+          cause: error,
+        }),
+      };
+      throw retirementFailure.error;
+    } finally {
+      await preserveFixtureFailure(retirementFailure, async () => {
+        for (const child of children)
+          if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        await Promise.all(children.map((child) => child.exited));
+        await removeOwnerPrivateSocketDirectories(root);
+        await rm(root, { recursive: true, force: true });
+      });
+    }
+  });
 }
 
 function execution(operationId: string, action: V2Execution["action"]): V2Execution {
@@ -333,6 +451,7 @@ test("Queue target observation confirms only the exact live active or draining n
     },
   });
   let heldReader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let primaryFailure: FixtureFailure;
   try {
     expect(await owner.execute(execution(CREATE_ID, "create"))).toMatchObject({
       kind: "confirmed",
@@ -444,9 +563,12 @@ test("Queue target observation confirms only the exact live active or draining n
       identity: null,
     });
     expect(await owner.observeQueueTarget(newTarget)).toEqual({ kind: "unknown" });
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
   } finally {
     await heldReader?.cancel().catch(() => undefined);
-    await closeFixtureOwner(owner, children, root);
+    await closeFixtureOwner(owner, children, root, primaryFailure);
   }
 });
 
@@ -472,6 +594,7 @@ test("suspend joins a draining retirement already waiting for exact child exit",
   });
   let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
   let oldPid = 0;
+  let primaryFailure: FixtureFailure;
   try {
     expect(await owner.execute(execution(CREATE_ID, "create"))).toMatchObject({
       kind: "confirmed",
@@ -537,15 +660,20 @@ test("suspend joins a draining retirement already waiting for exact child exit",
     });
     expect(state.physicalAbsences.map((item) => item.operationId)).toContain(CREATE_ID);
     expect(state.physicalAbsences.map((item) => item.operationId)).toContain(UPDATE_ID);
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
   } finally {
-    await reader?.cancel().catch(() => undefined);
-    if (oldPid)
-      await writeFile(join(root, `release-retirement.${oldPid}`), "release", { mode: 0o600 });
-    for (const child of children)
-      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
-    await Promise.all(children.map((child) => child.exited));
-    await removeOwnerPrivateSocketDirectories(root);
-    await rm(root, { recursive: true, force: true });
+    await preserveFixtureFailure(primaryFailure, async () => {
+      await reader?.cancel().catch(() => undefined);
+      if (oldPid)
+        await writeFile(join(root, `release-retirement.${oldPid}`), "release", { mode: 0o600 });
+      for (const child of children)
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await Promise.all(children.map((child) => child.exited));
+      await removeOwnerPrivateSocketDirectories(root);
+      await rm(root, { recursive: true, force: true });
+    });
   }
 });
 
@@ -553,8 +681,8 @@ test("Queue target observation refuses a live child that lost its listener and a
   const root = await mkdtemp(join(tmpdir(), "takoserver-queue-owner-port-"));
   const binary = join(root, "bun-workerd-stand-in.js");
   const publication = publicationState();
+  const children: FixtureChild[] = [];
   let listenerPort = 0;
-  let child: ReturnType<typeof spawnWorkerdWithParentDeath> | undefined;
   await writeFile(binary, `#!${process.execPath}\n${CHILD_SOURCE}`, { mode: 0o700 });
   await chmod(binary, 0o700);
   const owner = await openWorkerdWorkerRuntimeOwner({
@@ -568,10 +696,12 @@ test("Queue target observation refuses a live child that lost its listener and a
       return listenerPort;
     },
     spawn(command): WorkerdProcess {
-      child = spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "ignore" });
+      const child = spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "ignore" });
+      children.push(child);
       return child;
     },
   });
+  let primaryFailure: FixtureFailure;
   try {
     expect(await owner.execute(execution(CREATE_ID, "create"))).toMatchObject({
       kind: "confirmed",
@@ -587,6 +717,7 @@ test("Queue target observation refuses a live child that lost its listener and a
       kind: "confirmed",
       status: "active",
     });
+    const child = children[0];
     if (!child?.pid) throw new Error("native child PID missing");
     const workerKey = createHash("sha256").update(WORKER_UID).digest("hex");
     const state = JSON.parse(
@@ -610,8 +741,224 @@ test("Queue target observation refuses a live child that lost its listener and a
     await child.exited;
     expect(await linuxProcessLiveness(identity)).toBe("stale");
     expect(await owner.observeQueueTarget(target)).toEqual({ kind: "unknown" });
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
   } finally {
-    await closeFixtureOwner(owner, child ? [child] : [], root);
+    await closeFixtureOwner(owner, children, root, primaryFailure);
+  }
+});
+
+test("Queue owner DELETE joins an automatically replaced child still behind its listener barrier", async () => {
+  const root = await mkdtemp(join(tmpdir(), "takoserver-queue-owner-recovery-delete-"));
+  const binary = join(root, "bun-workerd-stand-in.js");
+  const barrier = join(root, "hold-recovery-start");
+  const children: FixtureChild[] = [];
+  const publication = publicationState();
+  let listenerPort = 0;
+  await writeFile(binary, `#!${process.execPath}\n${RECOVERY_BARRIER_CHILD_SOURCE}`, {
+    mode: 0o700,
+  });
+  await chmod(binary, 0o700);
+  const owner = await openWorkerdWorkerRuntimeOwner({
+    rootDirectory: join(root, "owners"),
+    workerResourceUid: WORKER_UID,
+    targetKey: TARGET_KEY,
+    publicationState: publication.source,
+    workerdBinary: binary,
+    async listenerPortForOperation() {
+      listenerPort = await unusedPort();
+      return listenerPort;
+    },
+    spawn(command): WorkerdProcess {
+      const child = spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "ignore" });
+      children.push(child);
+      return child;
+    },
+  });
+  let primaryFailure: FixtureFailure;
+  try {
+    expect(await owner.execute(execution(CREATE_ID, "create"))).toMatchObject({
+      kind: "confirmed",
+    });
+    publication.setCurrent(CREATE_ID);
+    const first = children[0];
+    if (!first?.pid) throw new Error("initial child PID missing");
+    const target = {
+      workerUid: WORKER_UID,
+      versionId: await nativeVersionId(CREATE_ID, 1),
+      incarnationId: await physicalIncarnationId(root, CREATE_ID),
+      servingSourceOperationId: CREATE_ID,
+    };
+    expect(await owner.observeQueueTarget(target)).toMatchObject({
+      kind: "confirmed",
+      status: "active",
+    });
+    // Close only this real child's future listener startup, without changing
+    // exited, process identity, owner state or the automatic restart scheduler.
+    await writeFile(barrier, "hold", { mode: 0o600 });
+    first.kill("SIGKILL");
+    await first.exited;
+
+    const workerKey = createHash("sha256").update(WORKER_UID).digest("hex");
+    const statePath = join(root, "owners", workerKey, "runtime-owner.json");
+    let replacementIdentity: Parameters<typeof linuxProcessLiveness>[0] | undefined;
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline) {
+      const replacement = children[1];
+      if (
+        replacement &&
+        (await Bun.file(join(root, `recovery-entered.${replacement.pid}`)).exists())
+      ) {
+        const state = JSON.parse(await Bun.file(statePath).text()) as {
+          incarnations: Array<{
+            operationId: string;
+            processIdentity: Parameters<typeof linuxProcessLiveness>[0] | null;
+          }>;
+        };
+        const identity = state.incarnations.find(
+          (record) => record.operationId === CREATE_ID,
+        )?.processIdentity;
+        if (identity?.pid === replacement.pid) {
+          replacementIdentity = identity;
+          break;
+        }
+      }
+      await Bun.sleep(5);
+    }
+    expect(children).toHaveLength(2);
+    if (!replacementIdentity)
+      throw new Error("replacement birth was not persisted behind the barrier");
+    expect(replacementIdentity.pid).not.toBe(first.pid);
+    expect(await linuxProcessLiveness(replacementIdentity)).toBe("live");
+    expect(await workerPortOwnership(listenerPort, undefined)).toBe("vacant");
+    expect(await owner.observeQueueTarget(target)).toEqual({ kind: "unknown" });
+
+    // Keep the startup gate held throughout DELETE. Successful retirement must
+    // stop/join the pending native child; releasing its gate would hide that race.
+    expect(await owner.execute(execution(DELETE_ID, "delete"))).toMatchObject({
+      kind: "confirmed",
+      identity: null,
+    });
+    expect(await owner.observeRetirement({})).toMatchObject({ kind: "confirmed_absent" });
+    expect(await linuxProcessLiveness(replacementIdentity)).toBe("stale");
+    expect(await workerPortOwnership(listenerPort, undefined)).toBe("vacant");
+    expect(await Bun.file(barrier).exists()).toBe(true);
+    expect(children).toHaveLength(2);
+  } catch (error) {
+    const frontier = await retirementFrontier(root, children).catch(() => ({
+      state: "unavailable",
+    }));
+    primaryFailure = {
+      error: new Error(`Queue fixture body frontier: ${JSON.stringify(frontier)}`, {
+        cause: error,
+      }),
+    };
+    throw primaryFailure.error;
+  } finally {
+    await closeFixtureOwner(owner, children, root, primaryFailure);
+  }
+});
+
+test("Queue owner DELETE refuses a foreign listener and confirms after it is released", async () => {
+  const root = await mkdtemp(join(tmpdir(), "takoserver-queue-owner-foreign-"));
+  const binary = join(root, "bun-workerd-stand-in.js");
+  const publication = publicationState();
+  const children: FixtureChild[] = [];
+  let listenerPort = 0;
+  let foreign: ReturnType<typeof Bun.serve> | undefined;
+  await writeFile(binary, `#!${process.execPath}\n${CHILD_SOURCE}`, { mode: 0o700 });
+  await chmod(binary, 0o700);
+  const owner = await openWorkerdWorkerRuntimeOwner({
+    rootDirectory: join(root, "owners"),
+    workerResourceUid: WORKER_UID,
+    targetKey: TARGET_KEY,
+    publicationState: publication.source,
+    workerdBinary: binary,
+    async listenerPortForOperation() {
+      listenerPort = await unusedPort();
+      return listenerPort;
+    },
+    spawn(command): WorkerdProcess {
+      const child = spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "ignore" });
+      children.push(child);
+      return child;
+    },
+  });
+  let primaryFailure: FixtureFailure;
+  const cleanup = async () => {
+    const errors: unknown[] = [];
+    try {
+      await foreign?.stop(true);
+    } catch (error) {
+      errors.push(error);
+    }
+    try {
+      await closeFixtureOwner(owner, children, root);
+    } catch (error) {
+      errors.push(error);
+    }
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1)
+      throw new AggregateError(errors, "Queue foreign-listener cleanup failed");
+  };
+  try {
+    expect(await owner.execute(execution(CREATE_ID, "create"))).toMatchObject({
+      kind: "confirmed",
+    });
+    publication.setCurrent(CREATE_ID);
+    const child = children[0];
+    if (!child?.pid) throw new Error("native child PID missing");
+    const workerKey = createHash("sha256").update(WORKER_UID).digest("hex");
+    const state = JSON.parse(
+      await Bun.file(join(root, "owners", workerKey, "runtime-owner.json")).text(),
+    ) as {
+      incarnations: Array<{ processIdentity: Parameters<typeof linuxProcessLiveness>[0] }>;
+    };
+    const identity = state.incarnations[0]?.processIdentity;
+    if (!identity) throw new Error("persisted child birth identity missing");
+    child.kill("SIGUSR1");
+    const deadline = Date.now() + 3_000;
+    while (
+      Date.now() < deadline &&
+      (await workerPortOwnership(listenerPort, child.pid)) !== "vacant"
+    )
+      await Bun.sleep(20);
+    expect(await linuxProcessLiveness(identity)).toBe("live");
+    expect(await workerPortOwnership(listenerPort, child.pid)).toBe("vacant");
+    child.kill("SIGKILL");
+    await child.exited;
+    expect(await linuxProcessLiveness(identity)).toBe("stale");
+    expect(await workerPortOwnership(listenerPort, undefined)).toBe("vacant");
+    foreign = Bun.serve({
+      hostname: "127.0.0.1",
+      port: listenerPort,
+      fetch: () => new Response("controlled foreign listener"),
+    });
+    expect(await workerPortOwnership(listenerPort, undefined)).toBe("foreign");
+    expect(await owner.execute(execution(DELETE_ID, "delete"))).toEqual({ kind: "unknown" });
+    expect(await retirementFrontier(root, children)).toMatchObject({
+      admissionClosed: true,
+      incarnations: [
+        {
+          status: "uncertain",
+          receiptPresent: false,
+          cleanupStarted: false,
+          copiesReleased: false,
+          birthLiveness: "stale",
+          listener: "foreign",
+          groupRetirementPresent: false,
+        },
+      ],
+    });
+    await foreign.stop(true);
+    foreign = undefined;
+    expect(await workerPortOwnership(listenerPort, undefined)).toBe("vacant");
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
+  } finally {
+    await preserveFixtureFailure(primaryFailure, cleanup);
   }
 });
 
@@ -619,8 +966,8 @@ test("a candidate whose first child spawn fails can retry the same accepted Oper
   const root = await mkdtemp(join(tmpdir(), "takoserver-queue-owner-candidate-retry-"));
   const binary = join(root, "bun-workerd-stand-in.js");
   const publication = publicationState();
+  const children: FixtureChild[] = [];
   let spawnCount = 0;
-  let child: ReturnType<typeof spawnWorkerdWithParentDeath> | undefined;
   await writeFile(binary, `#!${process.execPath}\n${CHILD_SOURCE}`, { mode: 0o700 });
   await chmod(binary, 0o700);
   const owner = await openWorkerdWorkerRuntimeOwner({
@@ -633,10 +980,12 @@ test("a candidate whose first child spawn fails can retry the same accepted Oper
     spawn(command): WorkerdProcess {
       spawnCount += 1;
       if (spawnCount === 1) throw new Error("transient child spawn failure");
-      child = spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "ignore" });
+      const child = spawnWorkerdWithParentDeath(command, { stdout: "ignore", stderr: "ignore" });
+      children.push(child);
       return child;
     },
   });
+  let primaryFailure: FixtureFailure;
   try {
     expect(await owner.execute(execution(CREATE_ID, "create"))).toEqual({ kind: "unknown" });
     expect(await owner.execute(execution(CREATE_ID, "create"))).toMatchObject({
@@ -656,8 +1005,11 @@ test("a candidate whose first child spawn fails can retry the same accepted Oper
     const durableActive = activation.indexOf("const snapshot = await transitionState(");
     expect(seal).toBeGreaterThan(0);
     expect(durableActive).toBeGreaterThan(seal);
+  } catch (error) {
+    primaryFailure = { error };
+    throw error;
   } finally {
-    await closeFixtureOwner(owner, child ? [child] : [], root);
+    await closeFixtureOwner(owner, children, root, primaryFailure);
   }
 });
 

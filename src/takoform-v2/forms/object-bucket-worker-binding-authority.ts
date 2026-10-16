@@ -2,8 +2,20 @@ import { bytesDigest, canonicalJson } from "../../json.ts";
 import type { Sql } from "../../ports.ts";
 import { OBJECT_BUCKET_LIMITS, parseObjectBucketSpec } from "./object-bucket.ts";
 import { resolveObjectBucketBackendId } from "./object-bucket-backend.ts";
-import { referencesForWorkerVersion } from "./worker-references.ts";
-import { parseWorkerVersionSpec, WORKER_VERSION_FORM_URL } from "./worker-specs.ts";
+import {
+  type ObjectBucketBindingFormUrl,
+  snapshotObjectBucketBindingForms,
+} from "./object-bucket-binding-profile.ts";
+import {
+  referencesForForwardWorkerVersion,
+  referencesForWorkerVersion,
+} from "./worker-references.ts";
+import {
+  FORWARD_WORKER_VERSION_FORM_URL,
+  parseForwardWorkerVersionSpec,
+  parseWorkerVersionSpec,
+  WORKER_VERSION_FORM_URL,
+} from "./worker-specs.ts";
 import { isReadyWorkerVersionObservation } from "./worker-version-observed.ts";
 
 /** Structural input shared with the Host-private broker without importing its adapter. */
@@ -28,6 +40,8 @@ export interface ObjectBucketWorkerBindingResolution {
     readonly resourceUid: string;
   };
   readonly vector: string;
+  /** Only present on a forward source; derived from the sealed/current target. */
+  readonly targetFormUrl?: ObjectBucketBindingFormUrl;
 }
 
 /**
@@ -57,13 +71,13 @@ export function createObjectBucketWorkerBindingAuthority(options: {
     const selected = grant.bindings.find((item) => item.name === binding);
     if (!selected) return null;
     const versionRows = await options.sql.query(
-      `SELECT r.uid, r.principal, r.space, r.target_key, r.backend_id, r.generation,
+      `SELECT r.uid, r.form_url, r.principal, r.space, r.target_key, r.backend_id, r.generation,
               r.observed_generation, r.phase, r.spec_json, r.observed_json, r.output_json,
               r.last_operation, r.busy_operation, r.deleted_at, op.id AS operation_id,
               op.action, op.status, op.effect, op.generation AS operation_generation,
               op.accepted_spec_json
        FROM tf_v2_resources r JOIN tf_v2_operations op ON op.id = r.last_operation
-       WHERE r.uid = ? AND r.form_url = ? AND r.principal = ? AND r.space = ?
+       WHERE r.uid = ? AND r.form_url IN (?, ?) AND r.principal = ? AND r.space = ?
          AND r.target_key = ? AND r.deleted_at IS NULL AND r.busy_operation IS NULL
          AND r.phase = 'idle' AND r.observed_generation = r.generation
          AND op.resource_uid = r.uid AND op.principal = r.principal
@@ -74,6 +88,7 @@ export function createObjectBucketWorkerBindingAuthority(options: {
       [
         grant.workerVersionUid,
         WORKER_VERSION_FORM_URL,
+        FORWARD_WORKER_VERSION_FORM_URL,
         grant.principal,
         grant.space,
         grant.targetKey,
@@ -91,7 +106,10 @@ export function createObjectBucketWorkerBindingAuthority(options: {
 
     let spec: ReturnType<typeof parseWorkerVersionSpec>;
     try {
-      spec = parseWorkerVersionSpec(JSON.parse(version.spec_json));
+      spec =
+        version.form_url === FORWARD_WORKER_VERSION_FORM_URL
+          ? parseForwardWorkerVersionSpec(JSON.parse(version.spec_json))
+          : parseWorkerVersionSpec(JSON.parse(version.spec_json));
       if (!isReadyWorkerVersionObservation(JSON.parse(version.observed_json), true)) return null;
     } catch {
       return null;
@@ -149,7 +167,6 @@ export function createObjectBucketWorkerBindingAuthority(options: {
       return null;
     }
 
-    const expected = referencesForWorkerVersion(spec);
     const refSet = await options.sql.query(
       "SELECT sealed FROM tf_v2_operation_reference_sets WHERE operation_id = ?",
       [version.operation_id as string],
@@ -160,6 +177,23 @@ export function createObjectBucketWorkerBindingAuthority(options: {
        FROM tf_v2_operation_references WHERE operation_id = ? ORDER BY target_uid`,
       [version.operation_id as string],
     );
+    let expected: ReturnType<typeof referencesForWorkerVersion>;
+    try {
+      const sealedTargets = references.map((row) => {
+        if (typeof row.target_uid !== "string" || typeof row.form_url !== "string")
+          throw new TypeError("invalid sealed target");
+        return { resourceUid: row.target_uid, formUrl: row.form_url };
+      });
+      expected =
+        version.form_url === FORWARD_WORKER_VERSION_FORM_URL
+          ? referencesForForwardWorkerVersion(
+              parseForwardWorkerVersionSpec(JSON.parse(version.spec_json)),
+              sealedTargets,
+            )
+          : referencesForWorkerVersion(spec);
+    } catch {
+      return null;
+    }
     if (
       references.length !== expected.length ||
       expected.some((requirement, index) => {
@@ -246,6 +280,34 @@ export function createObjectBucketWorkerBindingAuthority(options: {
       }
     }
 
+    const selectedForm =
+      version.form_url === FORWARD_WORKER_VERSION_FORM_URL
+        ? snapshotObjectBucketBindingForms([
+            {
+              publicName: binding,
+              resourceUid: selected.resourceUid,
+              formUrl: expected.find((item) => item.resourceUid === selected.resourceUid)?.formUrl,
+            },
+          ])[0]?.formUrl
+        : undefined;
+    if (version.form_url === FORWARD_WORKER_VERSION_FORM_URL && !selectedForm) return null;
+    const legacyVector = [
+      version.uid,
+      version.generation,
+      version.operation_id,
+      version.spec_json,
+      version.observed_json,
+      version.output_json,
+      version.operation_generation,
+      expected.map((requirement, index) => [
+        requirement.resourceUid,
+        targetRows[index]?.generation,
+        targetRows[index]?.operation_id,
+        targetRows[index]?.spec_json,
+        targetRows[index]?.observed_json,
+        targetRows[index]?.output_json,
+      ]),
+    ];
     return {
       identity: {
         targetKey: grant.targetKey,
@@ -253,23 +315,17 @@ export function createObjectBucketWorkerBindingAuthority(options: {
         space: grant.space,
         resourceUid: selected.resourceUid,
       },
-      vector: canonicalJson([
-        version.uid,
-        version.generation,
-        version.operation_id,
-        version.spec_json,
-        version.observed_json,
-        version.output_json,
-        version.operation_generation,
-        expected.map((requirement, index) => [
-          requirement.resourceUid,
-          targetRows[index]?.generation,
-          targetRows[index]?.operation_id,
-          targetRows[index]?.spec_json,
-          targetRows[index]?.observed_json,
-          targetRows[index]?.output_json,
-        ]),
-      ]),
+      vector: canonicalJson(
+        selectedForm === undefined
+          ? legacyVector
+          : [
+              version.form_url,
+              selectedForm,
+              legacyVector,
+              expected.map((item) => [item.resourceUid, item.formUrl]),
+            ],
+      ),
+      ...(selectedForm === undefined ? {} : { targetFormUrl: selectedForm }),
     };
   }
 

@@ -17,6 +17,8 @@ import {
   validateWorkerBundlePayload,
 } from "../src/takoform-v2/forms/worker-bundle.ts";
 import {
+  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+  FORWARD_WORKER_VERSION_FORM_URL,
   MODULE_WORKER_FORM_URL,
   WORKER_DEPLOYMENT_FORM_URL,
   WORKER_VERSION_FORM_URL,
@@ -35,6 +37,7 @@ import { selectClosedGraphWorkerd } from "../src/workerd-artifact.ts";
 import { spawnWorkerdWithParentDeath } from "../src/workerd-linux-process.ts";
 import { createWorkerdWorkerModuleInspector } from "../src/workerd-worker-module-inspector.ts";
 import {
+  openForwardWorkerdWorkerRuntimeOwner,
   openWorkerdWorkerRuntimeOwner,
   type WorkerdWorkerRuntimeOwner,
 } from "../src/workerd-worker-runtime-owner.ts";
@@ -69,10 +72,13 @@ async function unusedPort(): Promise<number> {
   return port;
 }
 
-test.skipIf(binary === undefined)(
-  "real 0082/0083 custody + exact native owner holds maxConcurrency after early ACK until waitUntil completes",
-  async () => {
+function nativeQueueTest(forward: boolean) {
+  return async () => {
     if (!binary) throw new Error("pinned Workerd missing");
+    const versionForm = forward ? FORWARD_WORKER_VERSION_FORM_URL : WORKER_VERSION_FORM_URL;
+    const deploymentForm = forward
+      ? FORWARD_WORKER_DEPLOYMENT_FORM_URL
+      : WORKER_DEPLOYMENT_FORM_URL;
     const root =
       pidFixtureMode === "first"
         ? (process.env.TAKOSERVER_QUEUE_PID_ROOT ?? "")
@@ -83,6 +89,15 @@ test.skipIf(binary === undefined)(
     const children: ReturnType<typeof spawnWorkerdWithParentDeath>[] = [];
     let owner: WorkerdWorkerRuntimeOwner | undefined;
     let queueComposition: ReturnType<typeof createSelfhostV2QueueComposition> | undefined;
+    let testFailed = false;
+    const suspendOwner = async () => {
+      try {
+        await owner?.suspend();
+      } catch (error) {
+        if (!testFailed) throw error;
+        console.error("Queue fixture secondary cleanup failure", error);
+      }
+    };
     try {
       const selected = await selectClosedGraphWorkerd({
         binary,
@@ -137,12 +152,14 @@ test.skipIf(binary === undefined)(
       if (inspected.outcome !== "valid") throw new Error("native queue export inspection failed");
       let workerUid = "";
       let versionUid = "";
+      let versionOperationId = "";
       let deploymentUid = "";
       let sourceOperationId = "";
       const versionSpec = () => ({
         worker: { resourceUid: workerUid },
         bundle: { resourceUid: "native-queue-bundle" },
         handlers: ["queue"],
+        ...(forward ? { containerBindings: [] } : {}),
       });
       const snapshot = () => ({
         sourceOperationId,
@@ -154,7 +171,21 @@ test.skipIf(binary === undefined)(
             worker: { resourceUid: workerUid },
             versions: [{ workerVersion: { resourceUid: versionUid }, weight: 10_000 }],
           },
-          versions: [{ uid: versionUid, generation: 1, weight: 10_000, spec: versionSpec() }],
+          versions: [
+            {
+              uid: versionUid,
+              generation: 1,
+              weight: 10_000,
+              spec: versionSpec(),
+              ...(forward
+                ? {
+                    form: FORWARD_WORKER_VERSION_FORM_URL,
+                    sourceOperationId: versionOperationId,
+                    bucketBindings: [],
+                  }
+                : {}),
+            },
+          ],
         },
         endpoint: null,
       });
@@ -165,16 +196,17 @@ test.skipIf(binary === undefined)(
         stillCurrent: async () => true,
         readVersionMaterials: async () => ({ bundle: held, assets: null }),
       });
+      const resolve = async ({
+        execution,
+      }: {
+        execution: V2Execution;
+      }): Promise<V2WorkerPublicationResolution> =>
+        execution.operationId === sourceOperationId
+          ? (serving() as unknown as V2WorkerPublicationResolution)
+          : { kind: "unresolved", code: "stale_claim", message: "wrong operation" };
       const publicationState = {
-        async resolve({
-          execution,
-        }: {
-          execution: V2Execution;
-        }): Promise<V2WorkerPublicationResolution> {
-          return execution.operationId === sourceOperationId
-            ? (serving() as unknown as V2WorkerPublicationResolution)
-            : { kind: "unresolved", code: "stale_claim", message: "wrong operation" };
-        },
+        resolve,
+        ...(forward ? { resolveForward: resolve } : {}),
         async resolveCurrentServing(input: {
           workerUid: string;
           targetKey: string;
@@ -234,9 +266,9 @@ test.skipIf(binary === undefined)(
             // inspection result, while Core still checks the accepted SQL
             // Version/Deployment identity at Consumer admission.
             const observed =
-              execution.form === WORKER_VERSION_FORM_URL
+              execution.form === versionForm
                 ? { ready: true, bundleVerified: true, resolvedBindings: true }
-                : execution.form === WORKER_DEPLOYMENT_FORM_URL
+                : execution.form === deploymentForm
                   ? { active: true }
                   : { ready: true };
             return { kind: "complete" as const, observed, output: {} };
@@ -254,8 +286,8 @@ test.skipIf(binary === undefined)(
         authorize: async () => true,
         forms: {
           [MODULE_WORKER_FORM_URL]: ordinary,
-          [WORKER_VERSION_FORM_URL]: ordinary,
-          [WORKER_DEPLOYMENT_FORM_URL]: ordinary,
+          [versionForm]: ordinary,
+          [deploymentForm]: ordinary,
           [AT_LEAST_ONCE_QUEUE_FORM_URL]: createAtLeastOnceQueueForm({ sql, targetKey }),
           [QUEUE_CONSUMER_FORM_URL]: createQueueConsumerForm({ sql, targetKey, capability }),
         },
@@ -274,9 +306,10 @@ test.skipIf(binary === undefined)(
       });
       const worker = await create(MODULE_WORKER_FORM_URL, "worker", {});
       workerUid = worker.resourceUid;
-      const version = await create(WORKER_VERSION_FORM_URL, "version", versionSpec());
+      const version = await create(versionForm, "version", versionSpec());
       versionUid = version.resourceUid;
-      const deployment = await create(WORKER_DEPLOYMENT_FORM_URL, "deployment", {
+      versionOperationId = version.id;
+      const deployment = await create(deploymentForm, "deployment", {
         worker: { resourceUid: workerUid },
         versions: [{ workerVersion: { resourceUid: versionUid }, weight: 10_000 }],
       });
@@ -296,7 +329,10 @@ test.skipIf(binary === undefined)(
           return owner;
         },
       });
-      owner = await openWorkerdWorkerRuntimeOwner({
+      const openOwner = forward
+        ? openForwardWorkerdWorkerRuntimeOwner
+        : openWorkerdWorkerRuntimeOwner;
+      owner = await openOwner({
         rootDirectory: join(root, "owner"),
         workerResourceUid: workerUid,
         targetKey,
@@ -356,6 +392,9 @@ test.skipIf(binary === undefined)(
           targetKey,
         }),
       ).toEqual({ kind: "unknown" });
+      // This proves the named forward owner's inspected native capability.
+      // QueueConsumer SQL admission retains its separate, legacy05 Form scope.
+      if (forward) return;
       const consumer = await create(QUEUE_CONSUMER_FORM_URL, "consumer", {
         queue: { resourceUid: queue.resourceUid },
         worker: { resourceUid: workerUid },
@@ -687,12 +726,15 @@ test.skipIf(binary === undefined)(
       ).toEqual([{ state: "send_authorized" }]);
       expect(await queueComposition.deliverOnce(scope)).toEqual({ kind: "idle" });
       expect(unknownSends).toBe(1);
+    } catch (error) {
+      testFailed = true;
+      throw error;
     } finally {
       await queueComposition?.close().catch(() => undefined);
       try {
         // close() intentionally refuses an active serving graph. Suspend the
         // real owner so its child exits and its private lock is released.
-        await owner?.suspend();
+        await suspendOwner();
       } finally {
         for (const child of children)
           if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
@@ -701,7 +743,17 @@ test.skipIf(binary === undefined)(
         await rm(root, { recursive: true, force: true });
       }
     }
-  },
+  };
+}
+
+test.skipIf(binary === undefined)(
+  "real 0082/0083 custody + exact native owner holds maxConcurrency after early ACK until waitUntil completes",
+  nativeQueueTest(false),
+);
+
+test.skipIf(binary === undefined || pidFixtureMode !== undefined)(
+  "forward07 exact native owner confirms Queue serving capability with explicit empty containerBindings",
+  nativeQueueTest(true),
 );
 
 test.skipIf(binary === undefined || pidFixtureMode !== "recover")(

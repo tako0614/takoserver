@@ -19,6 +19,11 @@ import type {
   EdgeSqlValue as NodeEdgeSqlValue,
   SelfhostV2SqliteStatement as NodeSelfhostV2SqliteStatement,
 } from "../src/providers/selfhost-v2-sqlite-plane.ts";
+import {
+  SELFHOST_DATA_PLANE_CONTENT_TYPE,
+  SELFHOST_DATA_PLANE_PROTOCOL,
+  SELFHOST_DATA_PLANE_SQL_PATH,
+} from "../src/providers/selfhost-worker-wrapper.ts";
 import type { EdgeSqlValue, SelfhostV2SqliteStatement } from "../src/queue-v2-sqlite-contract.ts";
 
 type Same<A, B> =
@@ -36,6 +41,12 @@ test("old Node Queue/SQLite type exports retain the portable contract identity",
   ];
   expect(witness).toHaveLength(7);
   expect("mintSQLiteLockedPhysicalSet" in providerExtension).toBe(false);
+});
+
+test("portable provider extension reexports the existing selfhost SQL wire constants", () => {
+  expect(providerExtension.SELFHOST_DATA_PLANE_SQL_PATH).toBe(SELFHOST_DATA_PLANE_SQL_PATH);
+  expect(providerExtension.SELFHOST_DATA_PLANE_PROTOCOL).toBe(SELFHOST_DATA_PLANE_PROTOCOL);
+  expect(providerExtension.SELFHOST_DATA_PLANE_CONTENT_TYPE).toBe(SELFHOST_DATA_PLANE_CONTENT_TYPE);
 });
 
 test("portable provider extension bundles Queue/SQLite types without Node or Bun imports", async () => {

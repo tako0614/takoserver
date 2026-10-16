@@ -81,10 +81,20 @@ export {
 } from "./forms/object-bucket.ts";
 export {
   createObjectBucketForm,
+  createObjectBucketStreamForm,
   OBJECT_BUCKET_BACKEND_ID,
   type ObjectBucketIdentity,
   type ObjectBucketStore,
 } from "./forms/object-bucket-backend.ts";
+export {
+  OBJECT_BUCKET_EOF_COUNTED_FORM_URL,
+  OBJECT_BUCKET_KNOWN_LENGTH_FORM_URL,
+  type ObjectBucketBindingForm,
+  type ObjectBucketBindingFormUrl,
+  type ObjectBucketBindingProfile,
+  selectObjectBucketBindingProfile,
+  snapshotObjectBucketBindingForms,
+} from "./forms/object-bucket-binding-profile.ts";
 export {
   createObjectBucketWorkerBindingAuthority,
   type ObjectBucketWorkerBindingClaim,
@@ -109,27 +119,64 @@ export {
 } from "./forms/sqlite-database.ts";
 export { createSQLiteDatabaseForm } from "./forms/sqlite-database-backend.ts";
 export {
+  parseSQLiteMigrationApplicationSpec,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_4_0,
+  type SQLiteMigrationApplicationFormUrl,
+  type SQLiteMigrationApplicationSpec,
+} from "./forms/sqlite-migration-application.ts";
+export {
   createSQLiteMigrationApplicationForm,
+  runSQLiteMigrationApplication,
   SQLITE_MIGRATION_APPLICATION_BACKEND_ID,
 } from "./forms/sqlite-migration-application-backend.ts";
 export type {
+  SQLiteMigrationApplicationBatchInput,
+  SQLiteMigrationApplicationBatchPort,
+  SQLiteMigrationApplicationInput,
   SQLiteMigrationApplicationPort,
+  SQLiteMigrationApplicationResult,
   SQLiteMigrationEntry,
   SQLiteMigrationFileResult,
   SQLiteMigrationLedgerResult,
   SQLiteMigrationRecord,
   SQLiteMigrationSession,
 } from "./forms/sqlite-migration-application-port.ts";
+export {
+  parseSQLiteMigrationManifest,
+  parseSQLiteMigrationSetSpec,
+  SQLITE_MIGRATION_SET_FORM_URL,
+  SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
+  SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
+  SQLITE_MIGRATION_SET_FORM_URL_0_4_0,
+  SQLITE_MIGRATION_SET_LIMITS,
+  type SQLiteMigrationManifest,
+  type SQLiteMigrationManifestFile,
+  type SQLiteMigrationSetFormUrl,
+  type SQLiteMigrationSetSpec,
+  validateSQLiteMigrationPayload,
+} from "./forms/sqlite-migration-set.ts";
+export { createSQLiteMigrationSetCustody } from "./forms/sqlite-migration-set-backend.ts";
 export type { SQLiteDatabaseNativePort } from "./forms/sqlite-native-store-port.ts";
 export {
   createSQLiteWorkerBindingAuthority,
   type SQLiteWorkerBindingClaim,
 } from "./forms/sqlite-worker-binding-authority.ts";
-export { STATIC_ASSET_BUNDLE_FORM_URL } from "./forms/static-asset-bundle.ts";
+export {
+  parseStaticAssetBundleManifest,
+  STATIC_ASSET_BUNDLE_FORM_URL,
+  validateStaticAssetBundlePayload,
+} from "./forms/static-asset-bundle.ts";
 export {
   createStaticAssetBundleCustody,
   type StaticAssetBundleCustody,
 } from "./forms/static-asset-bundle-backend.ts";
+export {
+  parseWorkerBundleManifest,
+  validateWorkerBundlePayload,
+} from "./forms/worker-bundle.ts";
 export {
   createWorkerBundleCustody,
   createWorkerBundleHost,
@@ -137,6 +184,12 @@ export {
 } from "./forms/worker-bundle-backend.ts";
 export { WORKER_CRON_TRIGGER_FORM_URL } from "./forms/worker-cron-trigger.ts";
 export {
+  fixedReferencesForForwardWorkerDeployment,
+  fixedReferencesForForwardWorkerVersion,
+  prepareForwardWorkerDeploymentReferences,
+  prepareForwardWorkerVersionReferences,
+  referencesForForwardWorkerDeployment,
+  referencesForForwardWorkerVersion,
   referencesForModuleWorker,
   referencesForWorkerDeployment,
   referencesForWorkerEndpoint,
@@ -144,12 +197,21 @@ export {
   referencesForWorkerVersion,
 } from "./forms/worker-references.ts";
 export {
+  CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
+  CONTAINER_WORKER_VERSION_FORM_URL,
+  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+  FORWARD_WORKER_VERSION_FORM_URL,
+  type ForwardWorkerVersionSpec,
   MODULE_WORKER_FORM_URL,
   type ModuleWorkerSpec,
+  parseForwardWorkerDeploymentSpec,
+  parseForwardWorkerVersionSpec,
   parseModuleWorkerSpec,
   parseWorkerDeploymentSpec,
   parseWorkerEndpointSpec,
   parseWorkerVersionSpec,
+  validateForwardWorkerDeploymentUpdate,
+  validateForwardWorkerVersionUpdate,
   validateModuleWorkerUpdate,
   validateWorkerDeploymentUpdate,
   validateWorkerEndpointUpdate,
@@ -223,6 +285,8 @@ export {
   inspectV2WorkerInvocationDrainSchema,
   inspectV2WorkerInvocationSchema,
   type V2WorkerInvocationSchema,
+  v2WorkerInvocationDrainSchemaReady,
+  v2WorkerInvocationLegacySchemaReady,
   v2WorkerInvocationSchemaReady,
 } from "./worker-invocation-schema.ts";
 export {
@@ -237,6 +301,11 @@ export {
   type V2NativeEffectIdentity,
   type V2NativeEffectInspection,
 } from "./worker-native-effects.ts";
+export {
+  inspectV2WorkerNativeIdentityDomain,
+  type V2WorkerNativeIdentityDomain,
+} from "./worker-native-identity-schema.ts";
+export type { V2ForwardWorkerFamilyProfile } from "./worker-publication-state.ts";
 export {
   createV2WorkerPublicationState,
   type V2WorkerPublicationResolution,

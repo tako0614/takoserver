@@ -5,6 +5,7 @@ import {
   parseObjectBucketSpec,
   validateObjectBucketUpdate,
 } from "./object-bucket.ts";
+import { OBJECT_BUCKET_EOF_COUNTED_FORM_URL } from "./object-bucket-binding-profile.ts";
 
 export const OBJECT_BUCKET_BACKEND_ID = "selfhost-v2-object-bucket-filesystem-v1";
 const BACKEND_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$/u;
@@ -178,5 +179,29 @@ export function createObjectBucketForm(options: {
       execute,
       reconcile,
     },
+  };
+}
+
+/**
+ * New Form management seam, deliberately unsupported without a qualified body
+ * profile port. A caller-provided Form string cannot supply that capability.
+ * This constructor is not entered into the default support/registration map.
+ */
+export function createObjectBucketStreamForm(
+  options: Parameters<typeof createObjectBucketForm>[0],
+): V2Form {
+  const managed = createObjectBucketForm(options);
+  const unavailable = async (execution: V2Execution): Promise<V2BackendResult> => {
+    if (
+      execution.form !== OBJECT_BUCKET_EOF_COUNTED_FORM_URL ||
+      execution.targetKey !== managed.backend.targetKey ||
+      execution.backendId !== managed.backend.id
+    )
+      return unknown("object_bucket_forward_identity_unavailable");
+    return unknown("object_bucket_forward_body_profile_unavailable");
+  };
+  return {
+    ...managed,
+    backend: { ...managed.backend, execute: unavailable, reconcile: unavailable },
   };
 }

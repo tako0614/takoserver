@@ -6434,7 +6434,10 @@ export function createSelfhostProvider(options: SelfhostProviderOptions): Provid
               },
             };
           }
-          if (sql.length > 0) {
+          // A retained prefix is immutable history, not SQL to execute again.
+          // Verify all bytes/identities above, but apply today's permission
+          // policy only to the complete unapplied suffix before its first effect.
+          if (index >= input.expectedPrefix.length && sql.length > 0) {
             try {
               assertSafeMigrationSql(sql);
             } catch {

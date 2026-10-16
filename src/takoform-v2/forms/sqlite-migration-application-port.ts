@@ -41,6 +41,55 @@ export interface SQLiteMigrationSession {
   }): Promise<SQLiteMigrationFileResult>;
 }
 
+export type SQLiteMigrationApplicationResult =
+  | { readonly kind: "complete"; readonly appliedEntries: readonly SQLiteMigrationEntry[] }
+  | {
+      readonly kind: "failure";
+      readonly code:
+        | "artifact_invalid"
+        | "migration_history_conflict"
+        | "migration_sql_error"
+        | "database_busy"
+        | "backend_unavailable";
+      readonly newlyApplied: number;
+      readonly appliedEntries: readonly SQLiteMigrationEntry[];
+    }
+  | {
+      readonly kind: "unknown";
+      readonly code: "migration_history_conflict" | "backend_unavailable";
+    };
+
+export interface SQLiteMigrationApplicationInput {
+  readonly resourceUid: string;
+  readonly execution: Parameters<
+    SQLiteMigrationApplicationPort["withAuthorizedMigrationSession"]
+  >[0]["execution"];
+  readonly stillAuthorized: () => Promise<boolean>;
+  readonly targetEntries: readonly SQLiteMigrationEntry[];
+  readonly files: readonly Uint8Array[];
+}
+
+/** Metadata only; the receiver must independently prove and read the held bytes. */
+export type SQLiteMigrationApplicationBatchInput = Omit<
+  SQLiteMigrationApplicationInput,
+  "files"
+> & {
+  readonly fileSizes: readonly number[];
+};
+
+/**
+ * Host-private remote realization of the same session runner. The receiver
+ * independently proves the accepted identity, references and held manifest,
+ * verifies every complete file, then runs under the existing native UID lock.
+ * Metadata and a successful transport ACK alone are not proof of SQL effects.
+ * A lost response remains unknown; reconciliation reads the durable prefix.
+ */
+export interface SQLiteMigrationApplicationBatchPort {
+  applyAuthorizedMigration(
+    input: SQLiteMigrationApplicationBatchInput,
+  ): Promise<SQLiteMigrationApplicationResult>;
+}
+
 /**
  * The adapter holds one database UID's exclusion for the entire callback. The
  * callback runs in the orchestrator; only the two session operations may cross

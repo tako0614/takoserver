@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { ACTOR_ABI_INTERFACE_REFS } from "../src/actor-abi-ref.ts";
 import { type ActorAbiProfile, resolveActorAbiProfile } from "../src/actor-class-execution.ts";
 import {
   createActorNativeAlarmPort,
@@ -8,6 +9,7 @@ import {
   createActorNativeSocketPort,
   signActorNativeUpgradeDecision,
 } from "../src/actor-native-owner-worker.ts";
+import { actorNativeBundleRealm } from "./helpers/actor-native-bundle-realm.ts";
 
 const v2Profile = resolveActorAbiProfile({
   apiVersion: "interfaces.takoform.com/v1alpha1",
@@ -28,8 +30,17 @@ function inboundFixture(
   const closes: [string, number | undefined][] = [];
   const delivered: string[] = [];
   const retained: Promise<unknown>[] = [];
+  class NativeWebSocket {
+    constructor(readonly id: string) {}
+    close(code?: number) {
+      closes.push([this.id, code]);
+    }
+  }
+  const realm = actorNativeBundleRealm(NativeWebSocket);
+  const selectedProfile =
+    profile?.kind === "v2" ? realm.resolveActorAbiProfile(ACTOR_ABI_INTERFACE_REFS.v2) : undefined;
   let producer!: ReadableStreamDefaultController<Uint8Array>;
-  const Owner = createActorNativeOwner(
+  const Owner = realm.createActorNativeOwner(
     "a".repeat(64),
     "c".repeat(64),
     {
@@ -40,7 +51,7 @@ function inboundFixture(
     undefined,
     undefined,
     undefined,
-    profile,
+    selectedProfile,
   );
   const owner = new Owner(
     {
@@ -116,14 +127,11 @@ function inboundFixture(
       };
     },
     socket(id: string) {
-      const socket = {
+      const socket = Object.assign(new NativeWebSocket(id), {
         deserializeAttachment: () => ({ socketId: id, actorId: "inbound-owner", attachment: null }),
         serializeAttachment(_value: unknown) {},
         send(_value: string | ArrayBuffer) {},
-        close(code?: number) {
-          closes.push([id, code]);
-        },
-      } as Socket;
+      }) as unknown as Socket;
       sockets.push(socket);
       return socket;
     },

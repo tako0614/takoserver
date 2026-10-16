@@ -1,9 +1,16 @@
-import type { V2ReferenceRequirement } from "../types.ts";
+import type { V2AdmissionPredicate, V2Form, V2ReferenceRequirement } from "../types.ts";
+import { selectObjectBucketBindingProfile } from "./object-bucket-binding-profile.ts";
 import { STATIC_ASSET_BUNDLE_FORM_URL } from "./static-asset-bundle.ts";
 import { WORKER_BUNDLE_FORM_URL } from "./worker-bundle.ts";
 import {
+  CONTAINER_WORKER_VERSION_FORM_URL,
+  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+  FORWARD_WORKER_VERSION_FORM_URL,
+  type ForwardWorkerVersionSpec,
   MODULE_WORKER_FORM_URL,
   type ModuleWorkerSpec,
+  parseForwardWorkerDeploymentSpec,
+  parseForwardWorkerVersionSpec,
   parseModuleWorkerSpec,
   parseWorkerDeploymentSpec,
   parseWorkerEndpointSpec,
@@ -27,6 +34,122 @@ const BINDING_FORMS = {
   actorBindings: "https://edge.forms.takoform.com/forms/ActorNamespace/0.3.0/",
   workflowBindings: "https://edge.forms.takoform.com/forms/DurableWorkflow/0.3.0/",
 } as const;
+
+type ForwardAdmission = Parameters<NonNullable<V2Form["prepareAdmission"]>>[0];
+
+/** Variable bucket Forms belong only to the additive prepared reference set. */
+export function fixedReferencesForForwardWorkerVersion(
+  spec: ForwardWorkerVersionSpec,
+): readonly V2ReferenceRequirement[] {
+  return normalizeRequirements([
+    ...referencesForWorkerVersion({ ...spec, bucketBindings: [] }),
+    ...spec.containerBindings.map((binding) =>
+      observed(
+        binding.resource.resourceUid,
+        "https://edge.forms.takoform.com/forms/Container/0.1.0/",
+      ),
+    ),
+  ]);
+}
+
+export function fixedReferencesForForwardWorkerDeployment(
+  spec: WorkerDeploymentSpec,
+): readonly V2ReferenceRequirement[] {
+  return [observed(spec.worker.resourceUid, MODULE_WORKER_FORM_URL)];
+}
+
+export async function prepareForwardWorkerVersionReferences(
+  input: ForwardAdmission,
+): Promise<V2AdmissionPredicate | null> {
+  const prepare = input.prepareExactReferences;
+  if (!prepare || input.form !== FORWARD_WORKER_VERSION_FORM_URL) return null;
+  const spec = parseForwardWorkerVersionSpec(input.spec);
+  // Return Core's issued object directly; it is not transferable or copyable.
+  return prepare(async (lookup) => {
+    const refs: V2ReferenceRequirement[] = [];
+    for (const binding of spec.bucketBindings) {
+      const target = await lookup(binding.resource.resourceUid);
+      if (!target) return null;
+      try {
+        selectObjectBucketBindingProfile(target.formUrl);
+      } catch {
+        return null;
+      }
+      refs.push(observed(target.resourceUid, target.formUrl));
+    }
+    return refs;
+  });
+}
+
+export async function prepareForwardWorkerDeploymentReferences(
+  input: ForwardAdmission,
+  admission: V2AdmissionPredicate,
+): Promise<V2AdmissionPredicate | null> {
+  const prepare = input.prepareExactReferences;
+  if (!prepare || input.form !== FORWARD_WORKER_DEPLOYMENT_FORM_URL) return null;
+  const spec = parseForwardWorkerDeploymentSpec(input.spec);
+  return prepare(async (lookup) => {
+    const refs: V2ReferenceRequirement[] = [];
+    for (const { workerVersion } of spec.versions) {
+      const target = await lookup(workerVersion.resourceUid);
+      if (
+        !target ||
+        (target.formUrl !== WORKER_VERSION_FORM_URL &&
+          target.formUrl !== CONTAINER_WORKER_VERSION_FORM_URL &&
+          target.formUrl !== FORWARD_WORKER_VERSION_FORM_URL)
+      )
+        return null;
+      refs.push({
+        ...target,
+        readiness: "ready",
+        targetSpecMatch: { path: ["worker", "resourceUid"], equals: spec.worker.resourceUid },
+      });
+    }
+    return refs;
+  }, admission);
+}
+
+/** Reconstruct expectations from sealed rows, never from caller-selected profiles. */
+export function referencesForForwardWorkerVersion(
+  spec: ForwardWorkerVersionSpec,
+  sealedTargets: readonly Readonly<{ resourceUid: string; formUrl: string }>[],
+): readonly V2ReferenceRequirement[] {
+  const refs = [...fixedReferencesForForwardWorkerVersion(spec)];
+  for (const binding of spec.bucketBindings) {
+    const selected = sealedTargets.filter(
+      (row) => row.resourceUid === binding.resource.resourceUid,
+    );
+    if (selected.length !== 1 || !selected[0]) throw new WorkerFormValidationError();
+    selectObjectBucketBindingProfile(selected[0].formUrl);
+    refs.push(observed(binding.resource.resourceUid, selected[0].formUrl));
+  }
+  return normalizeRequirements(refs);
+}
+
+export function referencesForForwardWorkerDeployment(
+  spec: WorkerDeploymentSpec,
+  sealedTargets: readonly Readonly<{ resourceUid: string; formUrl: string }>[],
+): readonly V2ReferenceRequirement[] {
+  return normalizeRequirements([
+    ...fixedReferencesForForwardWorkerDeployment(spec),
+    ...spec.versions.map(({ workerVersion }): V2ReferenceRequirement => {
+      const matches = sealedTargets.filter((row) => row.resourceUid === workerVersion.resourceUid);
+      const selected = matches.length === 1 ? matches[0] : undefined;
+      if (
+        !selected ||
+        (selected.formUrl !== WORKER_VERSION_FORM_URL &&
+          selected.formUrl !== CONTAINER_WORKER_VERSION_FORM_URL &&
+          selected.formUrl !== FORWARD_WORKER_VERSION_FORM_URL)
+      )
+        throw new WorkerFormValidationError();
+      return {
+        ...selected,
+        readiness: "ready",
+        targetSpecMatch: { path: ["worker", "resourceUid"], equals: spec.worker.resourceUid },
+      };
+    }),
+  ]);
+}
 
 /** ModuleWorker is an owner identity only; it declares no outbound references. */
 export function referencesForModuleWorker(

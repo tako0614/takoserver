@@ -28,6 +28,7 @@ import {
   type WorkerBundleManifest,
 } from "../src/takoform-v2/forms/worker-bundle.ts";
 import {
+  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
   parseWorkerDeploymentSpec,
   parseWorkerEndpointSpec,
   parseWorkerVersionSpec,
@@ -56,6 +57,7 @@ import {
 } from "../src/workerd-worker-execution-group.ts";
 import {
   createSerializedWorkerdOwnerStateWriter,
+  openForwardWorkerdWorkerRuntimeOwner,
   openWorkerdWorkerRuntimeOwner,
   workerdSuccessorHoldsListener,
 } from "../src/workerd-worker-runtime-owner.ts";
@@ -2761,4 +2763,66 @@ test("a successor holds the listener only when proven to; only an unreadable lis
   await expect(
     classify("live", () => Promise.reject(new Error("procfs unavailable"))),
   ).rejects.toMatchObject({ code: "ownership_uncertain" });
+});
+
+// Actual durable owner/child-group mechanism with the existing Bun stand-in;
+// Core + pinned workerd qualification lives in the separately gated suite.
+test("forward owner component06 uses the same serial custody while retained default refuses it", async () => {
+  const owned = await fixture();
+  const workerUid = "worker-forward-owner-boundary";
+  const publication = staticPublicationState(workerUid);
+  const options = {
+    rootDirectory: join(owned.root, "owners"),
+    workerResourceUid: workerUid,
+    targetKey: TARGET_KEY,
+    publicationState: { ...publication.source, resolveForward: publication.source.resolve },
+    workerdBinary: owned.binary,
+    listenerPortForOperation: unusedPort,
+    spawn: owned.spawn,
+  };
+  const createId = "e9cd597b-79c5-4c35-a675-d36595113e23";
+  const deleteId = "cbf22eac-2d37-4bde-9ed1-a06f455a06c3";
+  const create = {
+    ...execution(workerUid, createId, "create"),
+    form: FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+  };
+  const retained = await openWorkerdWorkerRuntimeOwner(options);
+  try {
+    expect(await retained.execute(create)).toEqual({
+      kind: "not_dispatched",
+      code: "worker_publication_target_mismatch",
+    });
+    expect(owned.children).toHaveLength(0);
+  } finally {
+    await retained.close();
+  }
+  const owner = await openForwardWorkerdWorkerRuntimeOwner(options);
+  try {
+    expect(
+      await owner.execute({
+        ...create,
+        form: "https://invalid.example.test/WorkerDeployment/0.6.0/",
+      }),
+    ).toMatchObject({ kind: "not_dispatched" });
+    expect(owned.children).toHaveLength(0);
+    expect(await owner.execute(create)).toMatchObject({ kind: "confirmed" });
+    publication.setCurrent(createId);
+    expect(owned.children).toHaveLength(1);
+    expect(
+      await owner.observeServing({ workerResourceUid: workerUid, targetKey: TARGET_KEY }),
+    ).toMatchObject({ kind: "serving", sourceOperationId: createId });
+    const count = owned.children.length;
+    expect(await owner.execute(create)).toMatchObject({ kind: "confirmed" });
+    expect(owned.children).toHaveLength(count);
+    expect(
+      await owner.execute({
+        ...execution(workerUid, deleteId, "delete"),
+        form: FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+      }),
+    ).toMatchObject({ kind: "confirmed", identity: null });
+    expect(await owner.observeRetirement({})).toMatchObject({ kind: "confirmed_absent" });
+  } finally {
+    await owner.close().catch(() => undefined);
+    await owned.cleanup();
+  }
 });

@@ -174,6 +174,71 @@ describe("Sql port", () => {
     expect(failure).toBeInstanceOf(SqlError);
     expect((failure as SqlError).code).toBe("constraint");
   });
+
+  test("classifies a native trigger refusal independently of its domain message", async () => {
+    const database = new Database(":memory:");
+    const sql = createSqliteSql(database);
+    try {
+      database.exec(`
+        CREATE TABLE guarded (id INTEGER PRIMARY KEY);
+        CREATE TRIGGER guarded_refusal BEFORE INSERT ON guarded
+        BEGIN SELECT RAISE(ABORT, 'Domain authorization denied'); END;
+      `);
+      await expect(sql.run("INSERT INTO guarded (id) VALUES (1)")).rejects.toMatchObject({
+        name: "SqlError",
+        code: "constraint",
+        message: "Domain authorization denied",
+      });
+      expect(await sql.query("SELECT COUNT(*) AS total FROM guarded")).toEqual([{ total: 0 }]);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("rolls back earlier batch writes when a native trigger refuses with a domain message", async () => {
+    const database = new Database(":memory:");
+    const sql = createSqliteSql(database);
+    try {
+      database.exec(`
+        CREATE TABLE writes (id INTEGER PRIMARY KEY);
+        CREATE TABLE guarded (id INTEGER PRIMARY KEY);
+        CREATE TRIGGER guarded_refusal BEFORE INSERT ON guarded
+        BEGIN SELECT RAISE(ABORT, 'Domain authorization denied'); END;
+      `);
+      await expect(
+        sql.batch([
+          { sql: "INSERT INTO writes (id) VALUES (1)" },
+          { sql: "INSERT INTO guarded (id) VALUES (1)" },
+        ]),
+      ).rejects.toMatchObject({
+        name: "SqlError",
+        code: "constraint",
+        message: "Domain authorization denied",
+      });
+      expect(await sql.query("SELECT COUNT(*) AS total FROM writes")).toEqual([{ total: 0 }]);
+      expect(await sql.query("SELECT COUNT(*) AS total FROM guarded")).toEqual([{ total: 0 }]);
+      expect((await sql.run("INSERT INTO writes (id) VALUES (2)")).changes).toBe(1);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("keeps unknown SQL and closed database failures unavailable", async () => {
+    const database = new Database(":memory:");
+    const sql = createSqliteSql(database);
+    try {
+      await expect(sql.query("SELECT * FROM absent_table")).rejects.toMatchObject({
+        name: "SqlError",
+        code: "unavailable",
+      });
+    } finally {
+      database.close();
+    }
+    await expect(sql.query("SELECT 1")).rejects.toMatchObject({
+      name: "SqlError",
+      code: "unavailable",
+    });
+  });
 });
 
 describe("ObjectStore port", () => {

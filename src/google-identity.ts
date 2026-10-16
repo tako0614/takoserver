@@ -21,7 +21,12 @@ import type { Clock } from "./ports.ts";
  * exchange, so there is no secret to keep.
  */
 
-const GOOGLE_ISSUERS = new Set(["accounts.google.com", "https://accounts.google.com"]);
+/** The accepted Google issuer policy shared with historical verification observations. */
+export const GOOGLE_IDENTITY_ISSUERS = Object.freeze([
+  "accounts.google.com",
+  "https://accounts.google.com",
+] as const);
+const GOOGLE_ISSUERS = new Set<string>(GOOGLE_IDENTITY_ISSUERS);
 const GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs";
 const MAX_TOKEN_BYTES = 8 * 1_024;
 /** How long a fetched key set is reused before being fetched again. */

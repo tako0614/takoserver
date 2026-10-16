@@ -1,7 +1,20 @@
 import { Database } from "bun:sqlite";
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  cpSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DeployError } from "../scripts/deploy/errors.ts";
@@ -14,12 +27,17 @@ import {
   type IntegrationStorageGenerationProvider,
   type IntegrationStorageR2Bucket,
   type IntegrationStorageTargetReadProvider,
+  integrationStorageGenerationName,
+  loadIntegrationStorageOriginalCreateInput,
   runIntegrationStorageGeneration,
   verifyFreshV2ArtifactIntegrationStorageTarget,
+  verifyFreshV2IntegrationStorageTarget,
   verifyIntegrationStorageGenerationTarget,
+  verifyIntegrationStorageOriginalCreate,
 } from "../scripts/deploy/integration-storage-generation.ts";
 import { canonicalSchemaShape, type D1SchemaState } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
+import { unsealDirectory } from "../scripts/deploy/qualification.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import {
@@ -70,7 +88,10 @@ const completeV2ArtifactState = stateWithShape(
   expectedV2ArtifactShape,
 );
 
-afterAll(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+afterAll(() => {
+  unsealDirectory(fixtureRoot);
+  rmSync(fixtureRoot, { recursive: true, force: true });
+});
 
 function state(applied: readonly string[], rows: readonly Record<string, string>[]): D1SchemaState {
   const shape = `${JSON.stringify(rows)}\n`;
@@ -1730,6 +1751,1342 @@ describe("integration storage generation bootstrap", () => {
         }),
       ).rejects.toThrow("exactly 0001-0100");
       expect(refusedProvider.calls).toEqual([]);
+    }
+  });
+});
+
+// The actual owner executes its fixed import into SQLite. Only provider/command boundaries
+// are substituted; resulting custody must therefore remain component-simulation-only.
+const originalDatabases = new Set<Database>();
+afterEach(() => {
+  for (const database of originalDatabases) database.close();
+  originalDatabases.clear();
+});
+
+function originalCreationFixture() {
+  const database = new Database(":memory:");
+  originalDatabases.add(database);
+  const custodyDirectory = mkdtempSync(join(fixtureRoot, "original-custody-"));
+  // A new local fixture's provisioning-time metadata, captured before creator invocation.
+  const custodyStat = lstatSync(custodyDirectory, { bigint: true });
+  const custodyIdentity = { device: String(custodyStat.dev), inode: String(custodyStat.ino) };
+  const prefixedName = `integration-ts-${GENERATION}`;
+  const selected = { ...target, d1: { ...target.d1 }, r2: { ...target.r2 } };
+  const selectedInvocation: IntegrationStorageGenerationInvocation = {
+    ...invocation,
+    namespace: "integration-ts",
+    freshLineage: "v2-0092",
+  };
+  const calls: string[] = [];
+  const process = processFixture();
+  let createdD1: IntegrationStorageD1Database | null = null;
+  let createdR2: IntegrationStorageR2Bucket | null = null;
+  let imports = 0;
+  const provider: IntegrationStorageGenerationProvider = {
+    async listD1(name) {
+      calls.push(`listD1:${name}`);
+      return createdD1 === null ? [] : [createdD1];
+    },
+    async listR2(name) {
+      calls.push(`listR2:${name}`);
+      return createdR2 === null ? [] : [createdR2];
+    },
+    async createD1(name) {
+      calls.push(`createD1:${name}`);
+      createdD1 = { name, uuid: DATABASE_ID };
+      return createdD1;
+    },
+    async getD1(id) {
+      calls.push(`getD1:${id}`);
+      if (createdD1 === null) throw new Error("D1 not created");
+      return { ...createdD1 };
+    },
+    async createR2(name) {
+      calls.push(`createR2:${name}`);
+      createdR2 = { name };
+      return createdR2;
+    },
+    async getR2(name) {
+      calls.push(`getR2:${name}`);
+      if (createdR2 === null) throw new Error("R2 not created");
+      return { ...createdR2 };
+    },
+  };
+  const readState = (): D1SchemaState => {
+    const rows = database
+      .query(
+        "SELECT type, name, tbl_name, COALESCE(sql, '') AS sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name",
+      )
+      .all() as Record<string, unknown>[];
+    const ledgerPresent = rows.some((row) => row.name === "d1_migrations");
+    const shape = canonicalSchemaShape(
+      rows.filter((row) => row.name !== "d1_migrations" && row.tbl_name !== "d1_migrations"),
+    );
+    return stateWithShape(
+      ledgerPresent
+        ? (
+            database.query("SELECT name FROM d1_migrations ORDER BY id").all() as { name: string }[]
+          ).map((row) => row.name)
+        : [],
+      shape,
+    );
+  };
+  const opts: IntegrationStorageGenerationOptions = {
+    provider,
+    review: "independent-original-create-review",
+    migrationDirectory: currentMigrations,
+    originalCreate: { kind: "positive-fresh-0092", custodyDirectory, custodyIdentity },
+    run: async (command, runOptions) => {
+      const result = await process.run(command, runOptions);
+      if (command.includes("execute") && command.includes("--file")) {
+        const importPath = command[command.indexOf("--file") + 1];
+        if (importPath === undefined) throw new Error("missing import");
+        database.exec(readFileSync(importPath, "utf8"));
+        imports += 1;
+      }
+      return result;
+    },
+    reader: {
+      async read() {
+        return readState();
+      },
+    },
+    freshV2DataReader: {
+      async read() {
+        const tables = schemaRows(readState())
+          .filter((row) => row.type === "table")
+          .map((row) => row.name);
+        const tableCounts = Object.fromEntries(
+          tables.map((name) => [
+            name,
+            (database.query(`SELECT COUNT(*) AS count FROM "${name}"`).get() as { count: number })
+              .count,
+          ]),
+        );
+        return {
+          tableCounts,
+          ledgerRows: (
+            database.query("SELECT COUNT(*) AS count FROM d1_migrations").get() as { count: number }
+          ).count,
+          foreignKeyViolations: database.query("PRAGMA foreign_key_check").all().length,
+          invocationEpoch: database
+            .query("SELECT * FROM tf_cloudflare_provider_invocation_epoch")
+            .all() as Record<string, unknown>[],
+          acceptanceCounter: database
+            .query("SELECT * FROM tf_v2_operation_acceptance_counter")
+            .all() as Record<string, unknown>[],
+        };
+      },
+    },
+  };
+  const records = () =>
+    readdirSync(custodyDirectory)
+      .filter((name) => name.endsWith(".json"))
+      .map((name) => ({
+        path: join(custodyDirectory, name),
+        value: JSON.parse(readFileSync(join(custodyDirectory, name), "utf8")) as Record<
+          string,
+          unknown
+        >,
+      }));
+  return {
+    database,
+    custodyDirectory,
+    custodyIdentity,
+    prefixedName,
+    selected,
+    invocation: selectedInvocation,
+    provider,
+    options: opts,
+    calls,
+    process,
+    records,
+    readState,
+    imports: () => imports,
+    apply: (overrides: Partial<IntegrationStorageGenerationOptions> = {}) =>
+      runIntegrationStorageGeneration(selectedInvocation, selected, { ...opts, ...overrides }),
+    status: () =>
+      runIntegrationStorageGeneration({ ...selectedInvocation, action: "status" }, selected, opts),
+  };
+}
+
+function originalCreateInputFixture() {
+  const root = mkdtempSync(join(fixtureRoot, "original-input-"));
+  const custodyDirectory = mkdtempSync(join(fixtureRoot, "input-custody-"));
+  const stat = lstatSync(custodyDirectory, { bigint: true });
+  const locators = {
+    kind: "positive-fresh-0092",
+    custodyDirectory,
+    custodyIdentity: { device: String(stat.dev), inode: String(stat.ino) },
+  } as const;
+  const path = join(root, "input.json");
+  writeFileSync(path, JSON.stringify(locators), { mode: 0o600 });
+  return { root, path, locators };
+}
+
+describe("original-create locator input", () => {
+  test("captures only frozen locators and accepts the exact 16 KiB boundary", () => {
+    const f = originalCreateInputFixture();
+    const json = JSON.stringify(f.locators);
+    writeFileSync(f.path, json.padEnd(16 * 1024, " "));
+    const loaded = loadIntegrationStorageOriginalCreateInput(f.path);
+    expect(loaded).toEqual(f.locators);
+    expect(Object.isFrozen(loaded)).toBe(true);
+    expect(Object.isFrozen(loaded.custodyIdentity)).toBe(true);
+    expect(readdirSync(f.locators.custodyDirectory)).toEqual([]);
+    writeFileSync(f.path, json.padEnd(16 * 1024 + 1, " "));
+    expect(() => loadIntegrationStorageOriginalCreateInput(f.path)).toThrow("16 KiB");
+  });
+
+  test("refuses claimed evidence, unknown fields, malformed UTF-8 and a changed provisioning pin", () => {
+    const f = originalCreateInputFixture();
+    for (const value of [
+      null,
+      [],
+      { ...f.locators, kind: "ready" },
+      ...[
+        "ready",
+        "authority",
+        "qualification",
+        "grants",
+        "databaseId",
+        "proof",
+        "terminalCustodyDigest",
+      ].map((key) => ({ ...f.locators, [key]: true })),
+      { ...f.locators, custodyIdentity: { ...f.locators.custodyIdentity, extra: true } },
+      { ...f.locators, custodyIdentity: { ...f.locators.custodyIdentity, inode: "0" } },
+      { ...f.locators, custodyIdentity: { ...f.locators.custodyIdentity, device: "01" } },
+    ]) {
+      writeFileSync(f.path, JSON.stringify(value));
+      expect(() => loadIntegrationStorageOriginalCreateInput(f.path)).toThrow(
+        "pinned custody locators",
+      );
+    }
+    writeFileSync(f.path, Buffer.from([0x22, 0xc3, 0x28, 0x22]));
+    expect(() => loadIntegrationStorageOriginalCreateInput(f.path)).toThrow(
+      "pinned custody locators",
+    );
+    writeFileSync(f.path, JSON.stringify(f.locators));
+    renameSync(f.locators.custodyDirectory, `${f.locators.custodyDirectory}.original`);
+    mkdirSync(f.locators.custodyDirectory, { mode: 0o700 });
+    expect(() => loadIntegrationStorageOriginalCreateInput(f.path)).toThrow("do not repin");
+  });
+
+  test("refuses unsafe file, parent, link and noncanonical path identities", () => {
+    const f = originalCreateInputFixture();
+    chmodSync(f.path, 0o644);
+    expect(() => loadIntegrationStorageOriginalCreateInput(f.path)).toThrow("0600");
+    chmodSync(f.path, 0o600);
+    chmodSync(f.root, 0o755);
+    expect(() => loadIntegrationStorageOriginalCreateInput(f.path)).toThrow("0700");
+    chmodSync(f.root, 0o700);
+    for (const path of ["relative.json", `${f.root}/../${f.root.split("/").at(-1)}/input.json`]) {
+      expect(() => loadIntegrationStorageOriginalCreateInput(path)).toThrow(
+        "pinned custody locators",
+      );
+    }
+    const alias = join(f.root, "alias.json");
+    symlinkSync(f.path, alias);
+    expect(() => loadIntegrationStorageOriginalCreateInput(alias)).toThrow("single-link");
+    linkSync(f.path, join(f.root, "hardlink.json"));
+    expect(() => loadIntegrationStorageOriginalCreateInput(f.path)).toThrow("single-link");
+  });
+
+  test("loaded locators enter the same six-field creator and retain one-effect component provenance", async () => {
+    const f = originalCreationFixture();
+    const input = originalCreateInputFixture();
+    writeFileSync(input.path, JSON.stringify(f.options.originalCreate));
+    const originalCreate = loadIntegrationStorageOriginalCreateInput(input.path);
+    const selected: IntegrationStorageGenerationInvocation = {
+      action: f.invocation.action,
+      environment: "integration",
+      commit: f.invocation.commit,
+      generation: f.invocation.generation,
+      namespace: "integration-ts",
+      freshLineage: "v2-0092",
+    };
+    const options = { ...f.options, originalCreate };
+    const result = await runIntegrationStorageGeneration(selected, f.selected, options);
+    expect(result.originalCreate).toMatchObject({
+      kind: "takoserver.integration-fresh-0092-component-result@v1",
+      authority: "component-simulation",
+    });
+    expect(result.productionD1Guard).toBeUndefined();
+    expect(f.imports()).toBe(1);
+    expect(f.calls.filter((call) => call.startsWith("createD1:"))).toHaveLength(1);
+    expect(f.calls.filter((call) => call.startsWith("createR2:"))).toHaveLength(1);
+    await expect(runIntegrationStorageGeneration(selected, f.selected, options)).rejects.toThrow(
+      "prior or uncertain custody",
+    );
+    expect(f.calls.filter((call) => call.startsWith("createD1:"))).toHaveLength(1);
+    expect(f.imports()).toBe(1);
+  });
+
+  test("loaded locators preserve lost-ACK UNKNOWN and cannot retry or mint a terminal result", async () => {
+    const f = originalCreationFixture();
+    const input = originalCreateInputFixture();
+    writeFileSync(input.path, JSON.stringify(f.options.originalCreate));
+    const originalCreate = loadIntegrationStorageOriginalCreateInput(input.path);
+    let creates = 0;
+    f.provider.createD1 = async () => {
+      creates += 1;
+      throw new Error("simulated lost original ACK");
+    };
+    const options = { ...f.options, originalCreate };
+    await expect(
+      runIntegrationStorageGeneration(f.invocation, f.selected, options),
+    ).rejects.toThrow();
+    expect(f.records().some((row) => row.value.stage === "unknown")).toBe(true);
+    expect(f.records().some((row) => row.value.stage === "terminal")).toBe(false);
+    await expect(
+      runIntegrationStorageGeneration(f.invocation, f.selected, options),
+    ).rejects.toThrow("prior or uncertain custody");
+    expect(creates).toBe(1);
+    expect(f.imports()).toBe(0);
+    expect(f.calls.some((call) => call.startsWith("createR2:"))).toBe(false);
+  });
+});
+
+describe("original integration-ts fresh0092 creator", () => {
+  test("namespace is closed and the default formatter uses the fresh integration prefix", () => {
+    expect(integrationStorageGenerationName(GENERATION)).toBe(GENERATED_NAME);
+    expect(integrationStorageGenerationName(GENERATION, "integration-ts")).toBe(
+      `integration-ts-${GENERATION}`,
+    );
+    expect(integrationStorageGenerationName(GENERATION, "integration-ts")).toHaveLength(47);
+    for (const [generation, namespace] of [
+      [GENERATION.toUpperCase(), "integration-ts"],
+      ["a".repeat(31), "integration-ts"],
+      [GENERATION, "staging"],
+      [GENERATION, "integration-ts-"],
+      [GENERATION, "takoserver-i"],
+    ]) {
+      expect(() =>
+        integrationStorageGenerationName(generation as string, namespace as "integration-ts"),
+      ).toThrow("closed namespace");
+    }
+  });
+
+  test("actual fixed92 import issues only component evidence and retains a protected original chain", async () => {
+    const f = originalCreationFixture();
+    const result = await f.apply();
+    expect(f.readState().applied).toEqual(MIGRATIONS.slice(0, 92).map((row) => row.name));
+    expect(f.imports()).toBe(1);
+    expect(result).toMatchObject({
+      namespace: "integration-ts",
+      freshLineage: "v2-0092",
+      d1: { databaseName: f.prefixedName, databaseId: DATABASE_ID },
+      r2: { bucketName: f.prefixedName },
+    });
+    expect(result.productionD1Guard).toBeUndefined();
+    expect(result.originalCreate).toMatchObject({
+      kind: "takoserver.integration-fresh-0092-component-result@v1",
+      authority: "component-simulation",
+      qualification: "component-simulation-only",
+      commandPort: "composing-source-owned",
+      namespace: "integration-ts",
+      sourceCommit: COMMIT,
+      migrationDigest: "sha256:6f7c1016b7ffeeb7c02006cdb8e55dc7919bfc2aeaf04c090001dcf423454be2",
+      schemaShapeDigest: f.readState().shapeDigest,
+    });
+    const records = f.records();
+    expect(records.map((row) => row.value.stage).sort()).toEqual([
+      "create-dispatched",
+      "identified",
+      "import-dispatched",
+      "r2-dispatched",
+      "terminal",
+    ]);
+    for (const record of records) {
+      expect(lstatSync(record.path).mode & 0o777).toBe(0o600);
+      expect(lstatSync(record.path).nlink).toBe(1);
+      expect(record.value.kind).toBe("takoserver.integration-fresh-0092-create-custody@v1");
+    }
+    const dispatched = records.find((row) => row.value.stage === "create-dispatched");
+    expect(dispatched?.value.previousDigest).toBeNull();
+    expect(dispatched?.value.binding).toMatchObject({
+      namespace: "integration-ts",
+      generation: GENERATION,
+      authority: "component-simulation",
+    });
+    expect(f.calls).toEqual([
+      `listD1:${f.prefixedName}`,
+      `listR2:${f.prefixedName}`,
+      `listD1:${f.prefixedName}`,
+      `listR2:${f.prefixedName}`,
+      `createD1:${f.prefixedName}`,
+      `getD1:${DATABASE_ID}`,
+      `getD1:${DATABASE_ID}`,
+      `listR2:${f.prefixedName}`,
+      `createR2:${f.prefixedName}`,
+      `getR2:${f.prefixedName}`,
+    ]);
+    expect(
+      f.process.commands.some((command) => command.some((arg) => /production/iu.test(arg))),
+    ).toBe(false);
+    const retainedPayload = readdirSync(f.custodyDirectory).find((name) =>
+      name.endsWith(".artifact"),
+    );
+    expect(retainedPayload).toBeDefined();
+    expect(
+      readdirSync(
+        join(f.custodyDirectory, retainedPayload as string, "release/payload/migrations"),
+      ),
+    ).toHaveLength(92);
+    expect(
+      readFileSync(
+        join(f.custodyDirectory, retainedPayload as string, "release/payload/migration-import.sql"),
+        "utf8",
+      ),
+    ).toContain("0092_org_wallet_lifecycle.sql");
+  });
+
+  test("terminal and unknown status remain read-only diagnosis and can never reissue original proof", async () => {
+    const f = originalCreationFixture();
+    await f.apply();
+    const prior = f.records().map((row) => readFileSync(row.path, "utf8"));
+    const status = await f.status();
+    expect(status.originalCreate).toBeUndefined();
+    expect(status.productionD1Guard).toBeUndefined();
+    expect(status.originalCreateCustody).toMatchObject({
+      state: "terminal",
+      qualification: "diagnostic-only",
+    });
+    expect(status.readyForApply).toBe(false);
+    expect(f.records().map((row) => readFileSync(row.path, "utf8"))).toEqual(prior);
+    const creates = f.calls.filter((call) => call.startsWith("create")).length;
+    await expect(f.apply()).rejects.toThrow("prior or uncertain custody");
+    expect(f.calls.filter((call) => call.startsWith("create"))).toHaveLength(creates);
+    expect(f.imports()).toBe(1);
+  });
+
+  test("new namespace requires original custody and refuses mixing, known UUID or ready/proof input before effects", async () => {
+    const f = originalCreationFixture();
+    for (const invalid of [
+      { ...f.invocation, freshLineage: "v2-0088" },
+      { ...f.invocation, databaseId: DATABASE_ID },
+      { ...f.invocation, ready: true },
+      { ...f.invocation, proof: { state: "terminal" } },
+      { ...f.invocation, namespace: "STAGING" },
+    ]) {
+      await expect(
+        runIntegrationStorageGeneration(
+          invalid as IntegrationStorageGenerationInvocation,
+          f.selected,
+          f.options,
+        ),
+      ).rejects.toThrow();
+    }
+    const optionsWithoutOriginalCreate = { ...f.options };
+    delete optionsWithoutOriginalCreate.originalCreate;
+    await expect(
+      runIntegrationStorageGeneration(f.invocation, f.selected, optionsWithoutOriginalCreate),
+    ).rejects.toThrow("original creation requires");
+    await expect(
+      f.apply({ productionD1: { databaseName: "takoserver-runtime", databaseId: DATABASE_ID } }),
+    ).rejects.toThrow("original creation requires");
+    await expect(f.apply({ outputDirectory: join(fixtureRoot, "not-custody") })).rejects.toThrow(
+      "original creation requires",
+    );
+    await expect(
+      f.apply({
+        originalCreate: {
+          ...f.options.originalCreate,
+          kind: "positive-fresh-0092",
+          custodyDirectory: f.custodyDirectory,
+          proof: true,
+        } as NonNullable<IntegrationStorageGenerationOptions["originalCreate"]>,
+      }),
+    ).rejects.toThrow("original creation requires");
+    expect(f.calls).toEqual([]);
+    expect(f.records()).toEqual([]);
+  });
+
+  test("legacy fresh92 still requires the production tuple and does not silently select the new namespace", async () => {
+    const f = originalCreationFixture();
+    const optionsWithoutOriginalCreate = { ...f.options };
+    delete optionsWithoutOriginalCreate.originalCreate;
+    await expect(
+      runIntegrationStorageGeneration(
+        { ...invocation, freshLineage: "v2-0092" },
+        f.selected,
+        optionsWithoutOriginalCreate,
+      ),
+    ).rejects.toThrow("requires TAKOSERVER_DEPLOY_TARGET_PRODUCTION");
+    const legacy = await runIntegrationStorageGeneration(
+      { ...invocation, action: "status" },
+      f.selected,
+      optionsWithoutOriginalCreate,
+    );
+    expect(legacy.namespace).toBeUndefined();
+    expect(legacy.originalCreateCustody).toBeUndefined();
+    expect(legacy.productionD1Guard).toEqual({ compared: "naming-only" });
+    expect(f.calls).toEqual([`listD1:${GENERATED_NAME}`, `listR2:${GENERATED_NAME}`]);
+  });
+
+  test("an exact legacy pair cannot borrow original namespace custody for apply or status", async () => {
+    for (const action of ["apply", "status"] as const) {
+      const f = originalCreationFixture();
+      f.selected.d1.databaseName = LEGACY_GENERATED_NAME;
+      f.selected.r2.bucketName = LEGACY_GENERATED_NAME;
+      await expect(
+        runIntegrationStorageGeneration({ ...f.invocation, action }, f.selected, f.options),
+      ).rejects.toThrow(
+        action === "apply"
+          ? "legacy integration storage is read-only"
+          : "legacy integration status requires the exact matching pair",
+      );
+      expect(f.calls).toEqual([]);
+      expect(f.records()).toEqual([]);
+    }
+  });
+
+  test("selected names, preexisting resources and either absence fence never become fresh origin", async () => {
+    for (const mode of [
+      "selected-d1",
+      "selected-r2",
+      "existing-d1",
+      "existing-r2",
+      "second-d1",
+      "second-r2",
+    ] as const) {
+      const f = originalCreationFixture();
+      if (mode === "selected-d1") f.selected.d1.databaseName = f.prefixedName;
+      if (mode === "selected-r2") f.selected.r2.bucketName = f.prefixedName;
+      let reads = 0;
+      if (mode.includes("d1") && mode !== "selected-d1")
+        f.provider.listD1 = async () => {
+          reads += 1;
+          return mode === "existing-d1" || reads === 2
+            ? [{ name: f.prefixedName, uuid: DATABASE_ID }]
+            : [];
+        };
+      if (mode.includes("r2") && mode !== "selected-r2")
+        f.provider.listR2 = async () => {
+          reads += 1;
+          return mode === "existing-r2" || reads === 2 ? [{ name: f.prefixedName }] : [];
+        };
+      await expect(f.apply()).rejects.toThrow();
+      expect(f.imports()).toBe(0);
+      expect(f.calls.some((call) => call.startsWith("create"))).toBe(false);
+      expect(f.records()).toEqual([]);
+    }
+  });
+
+  test("original create dispatch exists before provider entry and lost ACK stays UNKNOWN after reopen", async () => {
+    const f = originalCreationFixture();
+    f.provider.createD1 = async () => {
+      expect(f.records().some((row) => row.value.stage === "create-dispatched")).toBe(true);
+      throw new Error("lost ACK confidential response");
+    };
+    const error = await rejectedError(f.apply());
+    expect(error.message).not.toContain("confidential");
+    expect(f.records().some((row) => row.value.stage === "unknown")).toBe(true);
+    const count = f.records().length;
+    await expect(f.apply()).rejects.toThrow("prior or uncertain custody");
+    expect(f.records()).toHaveLength(count);
+    const status = await f.status();
+    expect(status.originalCreateCustody).toMatchObject({
+      state: "unknown",
+      qualification: "diagnostic-only",
+    });
+    expect(status.originalCreate).toBeUndefined();
+    expect(status.readyForApply).toBe(false);
+    expect(f.imports()).toBe(0);
+  });
+
+  test("wrong original create identity or GET and incumbent UUID cannot reach SQL or R2", async () => {
+    for (const mode of [
+      "create-name",
+      "create-uuid",
+      "get-name",
+      "get-uuid",
+      "incumbent-uuid",
+    ] as const) {
+      const f = originalCreationFixture();
+      if (mode === "create-name")
+        f.provider.createD1 = async () => ({ name: GENERATED_NAME, uuid: DATABASE_ID });
+      if (mode === "create-uuid")
+        f.provider.createD1 = async (name) => ({ name, uuid: "not-an-id" });
+      if (mode === "get-name")
+        f.provider.getD1 = async () => ({ name: GENERATED_NAME, uuid: DATABASE_ID });
+      if (mode === "get-uuid")
+        f.provider.getD1 = async () => ({
+          name: f.prefixedName,
+          uuid: "00000000-0000-4000-8000-000000000099",
+        });
+      if (mode === "incumbent-uuid")
+        f.provider.createD1 = async (name) => ({ name, uuid: f.selected.d1.databaseId });
+      await expect(f.apply()).rejects.toThrow();
+      expect(f.imports()).toBe(0);
+      expect(f.records().some((row) => row.value.stage === "unknown")).toBe(true);
+      expect(f.calls.some((call) => call.startsWith("createR2"))).toBe(false);
+    }
+  });
+
+  test("nonempty new D1 is never migrated or promoted", async () => {
+    const f = originalCreationFixture();
+    f.database.exec(
+      "CREATE TABLE protected_row(id INTEGER PRIMARY KEY, amount INTEGER); INSERT INTO protected_row VALUES(1, 7)",
+    );
+    await expect(f.apply()).rejects.toThrow();
+    expect(f.imports()).toBe(0);
+    expect(f.database.query("SELECT amount FROM protected_row").get()).toEqual({ amount: 7 });
+    expect(f.calls.some((call) => call.startsWith("createR2"))).toBe(false);
+    expect(f.records().some((row) => row.value.stage === "unknown")).toBe(true);
+  });
+
+  test("actual application/seed data drift after fixed92 import withholds R2 and terminal", async () => {
+    for (const mode of ["missing-seed", "application-row"] as const) {
+      const f = originalCreationFixture();
+      const readFresh = f.options.freshV2DataReader?.read;
+      if (readFresh === undefined) throw new Error("fresh reader missing");
+      await expect(
+        f.apply({
+          freshV2DataReader: {
+            async read(phase, configPath) {
+              if (mode === "missing-seed") {
+                f.database.exec("DELETE FROM tf_v2_operation_acceptance_counter");
+              } else {
+                f.database.exec(
+                  "INSERT INTO stripe_events(event_id,type,livemode,event_created_at,received_at,outcome) VALUES('evt_fixture','fixture',0,'2026-10-01','2026-10-01','received')",
+                );
+              }
+              return await readFresh(phase, configPath);
+            },
+          },
+        }),
+      ).rejects.toThrow("exact empty 0092");
+      expect(f.imports()).toBe(1);
+      expect(f.calls.some((call) => call.startsWith("createR2"))).toBe(false);
+      expect(f.records().some((row) => row.value.stage === "terminal")).toBe(false);
+    }
+  });
+
+  test("import lost ACK retains its original SQL dispatch and status cannot adopt complete92", async () => {
+    const f = originalCreationFixture();
+    const execute = f.options.run;
+    if (execute === undefined) throw new Error("run missing");
+    const opts = {
+      ...f.options,
+      run: async (command: readonly string[], runOptions?: Parameters<typeof execute>[1]) => {
+        const result = await execute(command, runOptions);
+        if (command.includes("--file")) throw new Error("lost import ACK");
+        return result;
+      },
+    };
+    await expect(runIntegrationStorageGeneration(f.invocation, f.selected, opts)).rejects.toThrow(
+      "indeterminate",
+    );
+    expect(f.readState().applied).toHaveLength(92);
+    expect(f.records().some((row) => row.value.stage === "import-dispatched")).toBe(true);
+    const before = f.records().map((row) => readFileSync(row.path, "utf8"));
+    const status = await runIntegrationStorageGeneration(
+      { ...f.invocation, action: "status" },
+      f.selected,
+      opts,
+    );
+    expect(status.schemaReadback).toBe("complete-0092");
+    expect(status.originalCreateCustody).toMatchObject({ state: "unknown" });
+    expect(status.originalCreate).toBeUndefined();
+    expect(f.records().map((row) => readFileSync(row.path, "utf8"))).toEqual(before);
+    await expect(runIntegrationStorageGeneration(f.invocation, f.selected, opts)).rejects.toThrow(
+      "prior or uncertain custody",
+    );
+    expect(f.imports()).toBe(1);
+  });
+
+  test("partial actual migration failure stays UNKNOWN with exactly one SQL dispatch", async () => {
+    const f = originalCreationFixture();
+    const execute = f.options.run;
+    if (execute === undefined) throw new Error("run missing");
+    let dispatches = 0;
+    const opts = {
+      ...f.options,
+      run: async (command: readonly string[], runOptions?: Parameters<typeof execute>[1]) => {
+        if (command.includes("--file")) {
+          dispatches += 1;
+          f.database.exec(MIGRATIONS[0]?.sql ?? "");
+          return { exitCode: 1, stdout: "", stderr: "confidential raw provider response" };
+        }
+        return await execute(command, runOptions);
+      },
+    };
+    const error = await rejectedError(
+      runIntegrationStorageGeneration(f.invocation, f.selected, opts),
+    );
+    expect(error.message).not.toContain("confidential");
+    expect(f.readState().shape).not.toBe(emptyState.shape);
+    expect(f.records().some((row) => row.value.stage === "unknown")).toBe(true);
+    await expect(runIntegrationStorageGeneration(f.invocation, f.selected, opts)).rejects.toThrow(
+      "prior or uncertain custody",
+    );
+    expect(dispatches).toBe(1);
+    expect(f.calls.some((call) => call.startsWith("createR2"))).toBe(false);
+  });
+
+  test("changed fixed source or sealed SQL cannot cross the original create boundary", async () => {
+    const f = originalCreationFixture();
+    const corruptSource = join(fixtureRoot, "corrupt-original-source");
+    cpSync(currentMigrations, corruptSource, { recursive: true });
+    const last = MIGRATIONS[91]?.name;
+    if (last === undefined) throw new Error("0092 missing");
+    writeFileSync(
+      join(corruptSource, last),
+      `${readFileSync(join(corruptSource, last), "utf8")}\n-- changed bytes\n`,
+    );
+    await expect(f.apply({ migrationDirectory: corruptSource })).rejects.toThrow();
+    expect(f.calls).toEqual([]);
+    let reads = 0;
+    f.provider.listD1 = async () => {
+      if (++reads === 2) {
+        const artifact = readdirSync(f.custodyDirectory).find((name) => name.endsWith(".artifact"));
+        if (artifact === undefined) throw new Error("artifact missing");
+        const path = join(f.custodyDirectory, artifact, "release/payload/migration-import.sql");
+        chmodSync(path, 0o600);
+        writeFileSync(path, `${readFileSync(path, "utf8")}\n-- changed sealed SQL\n`);
+      }
+      return [];
+    };
+    await expect(f.apply()).rejects.toThrow("changed after it was sealed");
+    expect(f.calls.some((call) => call.startsWith("create"))).toBe(false);
+    expect(f.records()).toEqual([]);
+    expect(f.imports()).toBe(0);
+  });
+
+  test("R2 race, lost ACK and GET drift preserve one-shot UNKNOWN without terminal", async () => {
+    for (const mode of ["race", "lost-ack", "get-drift"] as const) {
+      const f = originalCreationFixture();
+      if (mode === "race") {
+        let reads = 0;
+        f.provider.listR2 = async (name) => (++reads === 3 ? [{ name }] : []);
+      }
+      if (mode === "lost-ack")
+        f.provider.createR2 = async () => {
+          throw new Error("lost R2 ACK");
+        };
+      if (mode === "get-drift") f.provider.getR2 = async () => ({ name: GENERATED_NAME });
+      await expect(f.apply()).rejects.toThrow();
+      expect(f.imports()).toBe(1);
+      expect(f.records().some((row) => row.value.stage === "unknown")).toBe(true);
+      expect(f.records().some((row) => row.value.stage === "terminal")).toBe(false);
+      await expect(f.apply()).rejects.toThrow("prior or uncertain custody");
+      expect(f.imports()).toBe(1);
+    }
+  });
+
+  test("mutated caller binding at an async fence cannot select another account or mint evidence", async () => {
+    const f = originalCreationFixture();
+    f.provider.listD1 = async () => {
+      f.selected.accountId = "d".repeat(32);
+      return [];
+    };
+    await expect(f.apply()).rejects.toThrow("binding or custody root changed");
+    expect(f.calls.some((call) => call.startsWith("create"))).toBe(false);
+    expect(f.records()).toEqual([]);
+  });
+
+  test("captured original data still refuses live invocation and provider port replacement", async () => {
+    for (const mode of ["invocation", "provider-port"] as const) {
+      const f = originalCreationFixture();
+      const selectedOptions = { ...f.options };
+      f.provider.listD1 = async () => {
+        if (mode === "invocation") {
+          Object.defineProperty(f.invocation, "generation", { value: "e".repeat(32) });
+        } else {
+          selectedOptions.provider = providerFixture().provider;
+        }
+        return [];
+      };
+      await expect(
+        runIntegrationStorageGeneration(f.invocation, f.selected, selectedOptions),
+      ).rejects.toThrow("binding or custody root changed");
+      expect(f.calls.some((call) => call.startsWith("create"))).toBe(false);
+      expect(f.records()).toEqual([]);
+    }
+  });
+
+  test("custody aliases, unsafe roots and tampered original bytes never authorize another attempt", async () => {
+    const f = originalCreationFixture();
+    const alias = `${f.custodyDirectory}-alias`;
+    symlinkSync(f.custodyDirectory, alias);
+    await expect(
+      f.apply({
+        originalCreate: {
+          kind: "positive-fresh-0092",
+          custodyDirectory: alias,
+          custodyIdentity: f.custodyIdentity,
+        },
+      }),
+    ).rejects.toThrow("0700 custody root");
+    chmodSync(f.custodyDirectory, 0o755);
+    await expect(f.apply()).rejects.toThrow("0700 custody root");
+    chmodSync(f.custodyDirectory, 0o700);
+    await f.apply();
+    const dispatch = f.records().find((row) => row.value.stage === "create-dispatched");
+    if (dispatch === undefined) throw new Error("dispatch missing");
+    writeFileSync(
+      dispatch.path,
+      JSON.stringify({ ...dispatch.value, binding: { namespace: "takoserver-i" } }),
+    );
+    await expect(f.status()).rejects.toThrow("retained operation");
+    await expect(f.apply()).rejects.toThrow("retained operation");
+    expect(f.imports()).toBe(1);
+  });
+
+  test("reopen refuses a replaced custody root before credentials or effects and never repins it", async () => {
+    const f = originalCreationFixture();
+    await f.apply();
+    const calls = f.calls.length;
+    renameSync(f.custodyDirectory, `${f.custodyDirectory}-original-retained`);
+    mkdirSync(f.custodyDirectory, { mode: 0o700 });
+    await expect(f.apply()).rejects.toThrow("provisioning-time device/inode pin");
+    await expect(f.status()).rejects.toThrow("provisioning-time device/inode pin");
+    expect(f.calls).toHaveLength(calls);
+    expect(f.imports()).toBe(1);
+    expect(readdirSync(f.custodyDirectory)).toEqual([]);
+  });
+
+  test("stable generation lock fences concurrent original calls even before first provider ACK", async () => {
+    const f = originalCreationFixture();
+    let release: (() => void) | undefined;
+    let entered: (() => void) | undefined;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const reached = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const create = f.provider.createD1;
+    f.provider.createD1 = async (name) => {
+      entered?.();
+      await blocked;
+      return await create(name);
+    };
+    const first = f.apply();
+    await reached;
+    await expect(f.apply()).rejects.toThrow("prior or uncertain custody");
+    release?.();
+    await first;
+    expect(f.imports()).toBe(1);
+    expect(f.calls.filter((call) => call.startsWith("createD1"))).toHaveLength(1);
+  });
+
+  test("new native storage proof binds namespace/name/UUID and rejects mixed lineage without granting origin", async () => {
+    const f = originalCreationFixture();
+    await f.apply();
+    const selected = {
+      ...f.selected,
+      d1: { databaseName: f.prefixedName, databaseId: DATABASE_ID },
+      r2: { bucketName: f.prefixedName },
+      takoformV2: { config: "{}", storageLineage: "v2-0092" as const },
+    };
+    const proof = await verifyFreshV2IntegrationStorageTarget(selected, "integration", "v2-0092", {
+      provider: f.provider,
+      ...(f.options.reader === undefined ? {} : { reader: f.options.reader }),
+      migrationDirectory: currentMigrations,
+    });
+    expect(proof).toMatchObject({
+      namespace: "integration-ts",
+      generation: GENERATION,
+      freshLineage: "v2-0092",
+      d1: { databaseName: f.prefixedName, databaseId: DATABASE_ID },
+    });
+    expect((proof as unknown as Record<string, unknown>).originalCreate).toBeUndefined();
+    await expect(
+      verifyFreshV2IntegrationStorageTarget(
+        { ...selected, takoformV2: { config: "{}", storageLineage: "v2-0088" } },
+        "integration",
+        "v2-0088",
+        { provider: f.provider },
+      ),
+    ).rejects.toThrow("explicit fresh v2-0092 origin");
+    await expect(
+      verifyFreshV2IntegrationStorageTarget(
+        { ...selected, r2: { bucketName: GENERATED_NAME } },
+        "integration",
+        "v2-0092",
+        { provider: f.provider },
+      ),
+    ).rejects.toThrow("exact matching");
+  });
+});
+
+function originalReaderFixture() {
+  const created = originalCreationFixture();
+  const selected = {
+    ...created.selected,
+    d1: { databaseName: created.prefixedName, databaseId: DATABASE_ID },
+    r2: { bucketName: created.prefixedName },
+    takoformV2: { config: "{}", storageLineage: "v2-0092" },
+  } satisfies DeployTarget;
+  const locator = created.options.originalCreate;
+  if (locator === undefined) throw new Error("original fixture locator missing");
+  const reads: string[] = [];
+  const readOptions = {
+    originalCreate: locator,
+    provider: {
+      async getD1(id: string) {
+        reads.push(`D1:${id}`);
+        return { name: created.prefixedName, uuid: DATABASE_ID };
+      },
+      async getR2(name: string) {
+        reads.push(`R2:${name}`);
+        return { name: created.prefixedName };
+      },
+    },
+  };
+  return {
+    ...created,
+    selectedNew: selected,
+    reads,
+    readOptions,
+    verify: () =>
+      verifyIntegrationStorageOriginalCreate(
+        created.invocation,
+        created.selected,
+        selected,
+        readOptions,
+      ),
+    retainedBytes: () => created.records().map(({ path }) => readFileSync(path, "utf8")),
+  };
+}
+
+function controlledCustodyObject(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("controlled custody fixture is not an object");
+  }
+  return Object.fromEntries(Object.entries(value));
+}
+
+// Controlled retained FORMAT fault injection, never evidence of a native provider creation.
+// Every observation still enters the actual held-file reader with component-only GET ports.
+function rewriteControlledOriginalChain(
+  f: ReturnType<typeof originalReaderFixture>,
+  change: (
+    stage: string,
+    binding: Record<string, unknown>,
+    evidence: Record<string, unknown>,
+  ) => void,
+) {
+  const hash = (value: unknown) =>
+    `sha256:${createHash("sha256").update(JSON.stringify(value)).digest("hex")}`;
+  const digests: string[] = [];
+  const stages = [
+    "create-dispatched",
+    "identified",
+    "import-dispatched",
+    "r2-dispatched",
+    "terminal",
+  ];
+  for (const entry of f
+    .records()
+    .sort(
+      (left, right) =>
+        stages.indexOf(String(left.value.stage)) - stages.indexOf(String(right.value.stage)),
+    )) {
+    const body = { ...entry.value };
+    delete body.digest;
+    const binding = controlledCustodyObject(body.binding);
+    const evidence = controlledCustodyObject(body.evidence);
+    change(String(body.stage), binding, evidence);
+    body.binding = binding;
+    body.evidence = evidence;
+    body.previousDigest = digests.at(-1) ?? null;
+    if (body.stage === "terminal") {
+      const proof = controlledCustodyObject(evidence.proof);
+      proof.kind =
+        binding.authority === "provider-native"
+          ? "takoserver.integration-fresh-0092-original-create@v1"
+          : "takoserver.integration-fresh-0092-component-result@v1";
+      proof.authority = binding.authority;
+      proof.qualification =
+        binding.authority === "provider-native"
+          ? "independent-origin-review-required"
+          : "component-simulation-only";
+      proof.commandPort = binding.commandPort;
+      proof.originalBindingDigest = hash(binding);
+      [
+        proof.createDispatchDigest,
+        proof.identifiedDigest,
+        proof.importDispatchDigest,
+        proof.r2DispatchDigest,
+      ] = digests;
+      evidence.proof = proof;
+    }
+    const digest = hash(body);
+    digests.push(digest);
+    writeFileSync(entry.path, `${JSON.stringify({ ...body, digest })}\n`);
+  }
+}
+
+describe("retained original reader", () => {
+  test("reopens actual fixed92 component custody without writes or current SQL queries", async () => {
+    const f = originalReaderFixture();
+    const applied = await f.apply();
+    // A changed current schema is not a new origin or a claim that money94 was applied.
+    f.database.exec("CREATE TABLE later_owner_state (id TEXT)");
+    const before = f.retainedBytes();
+    const commands = [...f.process.commands];
+    const proof = await f.verify();
+    expect(applied.originalCreate).toEqual(proof.originalCreate);
+    expect(proof.qualification).toBe("component-simulation-only");
+    expect(proof.nativeReadback).toEqual({
+      authority: "component-simulation",
+      accountId: f.selected.accountId,
+      d1: { databaseId: DATABASE_ID, databaseName: f.prefixedName },
+      r2: { bucketName: f.prefixedName },
+    });
+    expect(f.reads).toEqual([`D1:${DATABASE_ID}`, `R2:${f.prefixedName}`]);
+    expect(f.retainedBytes()).toEqual(before);
+    expect(f.process.commands).toEqual(commands);
+    expect(f.imports()).toBe(1);
+    expect(Object.keys(proof).sort()).toEqual([
+      "custodyRootIdentityDigest",
+      "nativeReadback",
+      "originalCreate",
+      "originalSelectedTargetDigest",
+      "qualification",
+    ]);
+  });
+
+  test("refuses changed original tuple and new identity before any GET", async () => {
+    const f = originalReaderFixture();
+    await f.apply();
+    for (const incumbent of [
+      { ...f.selected, workerName: "integration-other-host" },
+      { ...f.selected, d1: { ...f.selected.d1, databaseName: "integration-other-incumbent" } },
+      { ...f.selected, d1: { ...f.selected.d1, databaseId: DATABASE_ID } },
+      { ...f.selected, r2: { bucketName: "integration-other-incumbent" } },
+      f.selectedNew,
+    ]) {
+      await expect(
+        verifyIntegrationStorageOriginalCreate(
+          f.invocation,
+          incumbent,
+          f.selectedNew,
+          f.readOptions,
+        ),
+      ).rejects.toThrow();
+    }
+    for (const selected of [
+      { ...f.selectedNew, accountId: "d".repeat(32) },
+      { ...f.selectedNew, d1: { ...f.selectedNew.d1, databaseId: f.selected.d1.databaseId } },
+      { ...f.selectedNew, r2: { bucketName: GENERATED_NAME } },
+      { ...f.selectedNew, takoformV2: { config: "{}", storageLineage: "v2-0088" as const } },
+    ]) {
+      await expect(
+        verifyIntegrationStorageOriginalCreate(f.invocation, f.selected, selected, f.readOptions),
+      ).rejects.toThrow();
+    }
+    expect(f.reads).toEqual([]);
+  });
+
+  test("cannot promote status, extra proof ports, absent or UNKNOWN custody", async () => {
+    const f = originalReaderFixture();
+    await expect(f.verify()).rejects.toThrow("terminal chain");
+    await expect(
+      verifyIntegrationStorageOriginalCreate(
+        { ...f.invocation, action: "status" },
+        f.selected,
+        f.selectedNew,
+        f.readOptions,
+      ),
+    ).rejects.toThrow("only original selectors");
+    const extra = { ...f.readOptions };
+    Object.defineProperty(extra, "proof", { enumerable: true, value: { state: "terminal" } });
+    await expect(
+      verifyIntegrationStorageOriginalCreate(f.invocation, f.selected, f.selectedNew, extra),
+    ).rejects.toThrow("only original selectors");
+    f.provider.createD1 = async () => {
+      throw new Error("lost ACK");
+    };
+    await expect(f.apply()).rejects.toThrow();
+    const before = f.retainedBytes();
+    await expect(f.verify()).rejects.toThrow("terminal chain");
+    expect(f.retainedBytes()).toEqual(before);
+    expect(f.reads).toEqual([]);
+    expect(f.imports()).toBe(0);
+  });
+
+  test("historical native-format ports never upgrade a component GET observer", async () => {
+    const f = originalReaderFixture();
+    await f.apply();
+    for (const commandPort of ["owner-default", "composing-source-owned"] as const) {
+      rewriteControlledOriginalChain(f, (_stage, binding) => {
+        binding.authority = "provider-native";
+        binding.commandPort = commandPort;
+      });
+      const before = f.retainedBytes();
+      const observed = await f.verify();
+      expect(observed.originalCreate.kind).toBe(
+        "takoserver.integration-fresh-0092-original-create@v1",
+      );
+      expect(observed.originalCreate.authority).toBe("provider-native");
+      expect(observed.originalCreate.commandPort).toBe(commandPort);
+      expect(observed.originalCreate.qualification).toBe("independent-origin-review-required");
+      expect(observed.nativeReadback.authority).toBe("component-simulation");
+      expect(observed.qualification).toBe("component-simulation-only");
+      expect(f.retainedBytes()).toEqual(before);
+    }
+  });
+
+  test("checks exact ACK tuple even when the two retained GET digests agree", async () => {
+    const f = originalReaderFixture();
+    await f.apply();
+    rewriteControlledOriginalChain(f, (stage, _binding, evidence) => {
+      if (stage === "identified") {
+        evidence.createResponseDigest = `sha256:${"e".repeat(64)}`;
+        evidence.identityReadbackDigest = evidence.createResponseDigest;
+      }
+    });
+    const before = f.retainedBytes();
+    await expect(f.verify()).rejects.toThrow("exact original tuple/ACK");
+    expect(f.retainedBytes()).toEqual(before);
+    expect(f.reads).toEqual([]);
+  });
+
+  test("refuses native identity drift while retaining the valid original terminal", async () => {
+    const f = originalReaderFixture();
+    await f.apply();
+    const before = f.retainedBytes();
+    const d1 = f.readOptions.provider.getD1;
+    const r2 = f.readOptions.provider.getR2;
+    for (const mode of ["D1-id", "D1-name", "R2-name", "error"]) {
+      f.readOptions.provider.getD1 = async (id) => {
+        if (mode === "error") throw new Error("confidential GET response");
+        return {
+          name: mode === "D1-name" ? GENERATED_NAME : f.prefixedName,
+          uuid: mode === "D1-id" ? f.selected.d1.databaseId : id,
+        };
+      };
+      f.readOptions.provider.getR2 = async () => ({
+        name: mode === "R2-name" ? GENERATED_NAME : f.prefixedName,
+      });
+      const error = await rejectedError(f.verify());
+      expect(error.stack).not.toContain("confidential");
+      expect(f.retainedBytes()).toEqual(before);
+    }
+    f.readOptions.provider.getD1 = d1;
+    f.readOptions.provider.getR2 = r2;
+  });
+
+  test("repeats the selected tuple and retained chain fences after awaited GET", async () => {
+    for (const mode of ["selected", "chain"]) {
+      const f = originalReaderFixture();
+      await f.apply();
+      f.readOptions.provider.getD1 = async (id) => {
+        if (mode === "selected") f.selectedNew.d1.databaseId = f.selected.d1.databaseId;
+        else {
+          const terminal = f.records().find((entry) => entry.value.stage === "terminal");
+          if (terminal === undefined) throw new Error("terminal missing");
+          writeFileSync(terminal.path, "{}\n");
+        }
+        return { name: f.prefixedName, uuid: id };
+      };
+      await expect(f.verify()).rejects.toThrow();
+      expect(f.reads).toEqual([]);
+      expect(f.imports()).toBe(1);
+    }
+  });
+
+  test("shares actual bounded held-file and original root-pin refusal before GET", async () => {
+    for (const mode of ["oversize", "root"]) {
+      const f = originalReaderFixture();
+      await f.apply();
+      if (mode === "root") {
+        renameSync(f.custodyDirectory, `${f.custodyDirectory}-retained`);
+        mkdirSync(f.custodyDirectory, { mode: 0o700 });
+      } else {
+        const identified = f.records().find((entry) => entry.value.stage === "identified");
+        if (identified === undefined) throw new Error("identified missing");
+        writeFileSync(identified.path, "x".repeat(32 * 1024 + 1));
+      }
+      await expect(f.verify()).rejects.toThrow(
+        mode === "root" ? "device/inode pin" : "unsafe or unreadable",
+      );
+      expect(f.reads).toEqual([]);
+      expect(f.imports()).toBe(1);
+    }
+  });
+});
+
+interface BoundedCustodyProbeResult {
+  readonly mode: string;
+  readonly pid: number;
+  readonly message: string;
+  readonly mutations: number;
+  readonly wholeFdReads: number;
+  readonly requestedBytes: number;
+  readonly injected: boolean;
+  readonly timedOut: boolean;
+}
+
+/** Isolated instrumentation changes real local files; it does not simulate a native race. */
+async function boundedCustodyProbe(mode: string): Promise<BoundedCustodyProbeResult> {
+  const f = originalCreationFixture();
+  const inputOnly = mode.startsWith("input-");
+  const operation = inputOnly ? mode.slice("input-".length) : mode;
+  const moduleUrl = new URL("../scripts/deploy/integration-storage-generation.ts", import.meta.url)
+    .href;
+  const stem = `integration-create-${createHash("sha256")
+    .update(
+      JSON.stringify({
+        accountId: f.selected.accountId,
+        namespace: "integration-ts",
+        generation: GENERATION,
+      }),
+    )
+    .digest("hex")}`;
+  const entry = join(
+    f.custodyDirectory,
+    inputOnly ? "input.json" : `${stem}.create-dispatched.json`,
+  );
+  const artifactEntry = join(f.custodyDirectory, `${stem}.artifact`, "probe-original-entry");
+  const script = `
+    import * as nativeFs from "node:fs";
+    import { mock } from "bun:test";
+    const fs = { ...nativeFs };
+    const mode = ${JSON.stringify(operation)};
+    const inputOnly = ${JSON.stringify(inputOnly)};
+    const entry = ${JSON.stringify(entry)};
+    const artifactEntry = ${JSON.stringify(artifactEntry)};
+    const input = ${JSON.stringify({ invocation: f.invocation, target: f.selected, originalCreate: f.options.originalCreate })};
+    let watchedFd = -1, mutations = 0, wholeFdReads = 0, requestedBytes = 0, injected = false;
+    const fifo = (path) => {
+      const result = Bun.spawnSync(["mkfifo", "--mode=600", path]);
+      if (result.exitCode !== 0) throw new Error("local FIFO creation failed");
+    };
+    if (!mode.startsWith("sync-")) {
+      if (mode === "fifo") fifo(entry);
+      else fs.writeFileSync(entry, mode === "oversize" ? Buffer.alloc((inputOnly ? 16 : 32) * 1024 + 1)
+        : inputOnly ? JSON.stringify(input.originalCreate) : "{}", { mode: 0o600 });
+    }
+    mock.module("node:fs", () => ({
+      ...fs,
+      openSync(path, flags, ...rest) {
+        const watched = path === entry || path === artifactEntry;
+        if (watched && mode === "fifo-swap" && !injected) {
+          fs.unlinkSync(path); fifo(path); injected = true;
+        }
+        const fd = fs.openSync(path, flags, ...rest);
+        if (watched) {
+          watchedFd = fd;
+          if (mode === "sync-replaced" && !injected) {
+            fs.renameSync(path, path + ".held"); fs.writeFileSync(path, "{}", { mode: 0o600 }); injected = true;
+          }
+        }
+        return fd;
+      },
+      readFileSync(path, ...args) {
+        if (typeof path === "number" && path === watchedFd) wholeFdReads += 1;
+        return fs.readFileSync(path, ...args);
+      },
+      readSync(fd, buffer, offset, length, position) {
+        if (fd === watchedFd) {
+          requestedBytes += length;
+          if (!injected && mode === "growth") {
+            fs.appendFileSync(entry, Buffer.alloc(32 * 1024 + 1)); injected = true;
+          } else if (!injected && mode === "replaced") {
+            fs.renameSync(entry, entry + ".held"); fs.writeFileSync(entry, "{}", { mode: 0o600 }); injected = true;
+          }
+        }
+        return fs.readSync(fd, buffer, offset, length, position);
+      },
+    }));
+    const { loadIntegrationStorageOriginalCreateInput, runIntegrationStorageGeneration } = await import(${JSON.stringify(moduleUrl)});
+    let lists = 0;
+    const provider = {
+      async listD1() {
+        if (++lists === 2 && mode.startsWith("sync-")) {
+          if (mode === "sync-fifo") fifo(artifactEntry);
+          else fs.writeFileSync(artifactEntry, "{}", { mode: 0o600 });
+        }
+        return [];
+      },
+      async listR2() { return []; },
+      async createD1() { mutations += 1; throw new Error("unexpected provider mutation"); },
+      async createR2() { mutations += 1; throw new Error("unexpected provider mutation"); },
+      async getD1() { throw new Error("unexpected provider read"); },
+      async getR2() { throw new Error("unexpected provider read"); },
+    };
+    const run = async command => {
+      const key = command.join(" ");
+      if (key === "git rev-parse HEAD") return { exitCode: 0, stdout: ${JSON.stringify(COMMIT + "\n")}, stderr: "" };
+      if (key === "git branch --show-current") return { exitCode: 0, stdout: "component-local\\n", stderr: "" };
+      if (key === "git status --porcelain=v1 -z --untracked-files=all" || key === "bun run check:migrations") return { exitCode: 0, stdout: "", stderr: "" };
+      throw new Error("unexpected command");
+    };
+    let message = "";
+    try {
+      if (inputOnly) loadIntegrationStorageOriginalCreateInput(entry);
+      else await runIntegrationStorageGeneration(input.invocation, input.target, { provider, run,
+        review: "independent-component-custody-read", originalCreate: input.originalCreate,
+        migrationDirectory: ${JSON.stringify(currentMigrations)},
+        reader: { async read() { throw new Error("unexpected schema read"); } },
+      });
+    } catch (error) { message = error.message; }
+    console.log(JSON.stringify({ mode, pid: process.pid, message, mutations, wholeFdReads, requestedBytes, injected }));
+  `;
+  const child = Bun.spawn([process.execPath, "--no-env-file", "--eval", script], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  let timedOut = false;
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    child.kill("SIGKILL");
+  }, 1500);
+  try {
+    const [code, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+    console.info(
+      `bounded-custody-child mode=${mode} pid=${child.pid} exit=${code} timedOut=${timedOut}`,
+    );
+    expect(timedOut).toBe(false);
+    expect(code).toBe(0);
+    if (code !== 0) throw new Error(stderr);
+    return { ...JSON.parse(stdout.trim()), timedOut } as BoundedCustodyProbeResult;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+describe("bounded original custody retained-file I/O", () => {
+  test("locator input refuses FIFO/oversize and real growth or held/path replacement without blocking", async () => {
+    for (const mode of ["fifo", "fifo-swap", "oversize", "growth", "replaced"]) {
+      const result = await boundedCustodyProbe(`input-${mode}`);
+      expect(result.message).toContain(
+        "original-create input requires only pinned custody locators",
+      );
+      expect(result.mutations).toBe(0);
+      expect(result.wholeFdReads).toBe(0);
+      expect(result.requestedBytes).toBeLessThanOrEqual(16 * 1024 + 1);
+      if (["fifo-swap", "growth", "replaced"].includes(mode)) expect(result.injected).toBe(true);
+    }
+  });
+
+  test("bounded custody read refuses FIFO/oversize and controlled real growth or replacement", async () => {
+    for (const mode of ["fifo", "fifo-swap", "oversize", "growth", "replaced"]) {
+      const result = await boundedCustodyProbe(mode);
+      expect(result.message).toContain("UNKNOWN");
+      expect(result.mutations).toBe(0);
+      expect(result.wholeFdReads).toBe(0);
+      expect(result.requestedBytes).toBeLessThanOrEqual(3);
+      if (["fifo-swap", "growth", "replaced"].includes(mode)) expect(result.injected).toBe(true);
+    }
+  });
+
+  test("bounded custody artifact fsync refuses FIFO and a replaced held/path entry before create", async () => {
+    for (const mode of ["sync-fifo", "sync-replaced"]) {
+      const result = await boundedCustodyProbe(mode);
+      expect(result.message).toContain("UNKNOWN");
+      expect(result.mutations).toBe(0);
+      expect(result.wholeFdReads).toBe(0);
+      if (mode === "sync-replaced") expect(result.injected).toBe(true);
     }
   });
 });
