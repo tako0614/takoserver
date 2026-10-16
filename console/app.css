@@ -214,6 +214,18 @@ textarea {
   flex: 1;
 }
 
+/* When space runs out, the organization picker gives way first, down to a
+   few characters, so every other control in the bar stays on screen. */
+.topbar__picker {
+  min-width: 0;
+}
+
+.topbar__org {
+  flex: 0 1 auto;
+  min-width: 4em;
+  text-overflow: ellipsis;
+}
+
 .rail {
   grid-area: rail;
   border-right: 1px solid var(--line-1);
@@ -318,8 +330,34 @@ textarea {
     overflow-x: auto;
   }
 
+  .topbar__who {
+    display: inline-block;
+    max-width: 10em;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   .main {
     padding: 18px 16px 64px;
+  }
+}
+
+/* A phone keeps the top bar on one line: the signed-in name gives way to
+   its icon, and a long organization name is cut instead of pushing the
+   controls out of view. */
+@media (width < 620px) {
+  .topbar {
+    gap: 4px;
+    padding: 0 12px;
+  }
+
+  .topbar__who {
+    display: none;
+  }
+
+  .topbar__org {
+    max-width: 46vw;
   }
 }
 

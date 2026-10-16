@@ -984,6 +984,9 @@ export const DEPLOY_CONTRACT = {
       covers: [
         "src/landing.ts",
         "scripts/build-site.ts",
+        "site/og.png",
+        "site/fonts/",
+        "site/screens/",
         "scripts/deploy.ts",
         "scripts/deploy/static.ts",
         "scripts/deploy/qualification.ts",
