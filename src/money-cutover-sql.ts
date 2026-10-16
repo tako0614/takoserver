@@ -146,6 +146,14 @@ export async function inspectMoneyCutoverGuard(
   return "frozen";
 }
 
+function ownDataSqlMethod<K extends keyof Sql>(sql: Sql, name: K): Sql[K] | undefined {
+  if ((typeof sql !== "object" && typeof sql !== "function") || sql === null) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(sql, name);
+  return descriptor && "value" in descriptor && typeof descriptor.value === "function"
+    ? (descriptor.value as Sql[K])
+    : undefined;
+}
+
 const moneyCutoverSqlOrigins = new WeakMap<
   object,
   {
@@ -154,6 +162,9 @@ const moneyCutoverSqlOrigins = new WeakMap<
     readonly query: Sql["query"];
     readonly run: Sql["run"];
     readonly batch: Sql["batch"];
+    readonly rawQuery: Sql["query"] | undefined;
+    readonly rawRun: Sql["run"] | undefined;
+    readonly rawBatch: Sql["batch"] | undefined;
   }
 >();
 
@@ -189,6 +200,34 @@ export function assertMoneyCutoverSqlOrigin(
     batch.value !== origin.batch
   ) {
     throw new SqlError("invalid", "money cutover Sql origin differs");
+  }
+}
+
+/**
+ * Checks that a captured wrapper still belongs to the exact backing Sql and
+ * epoch supplied by its caller. This is origin evidence only; it does not
+ * qualify the backing adapter, selected realm, schema, or writer profile.
+ */
+export function assertMoneyCutoverSqlBackingOrigin(
+  sql: unknown,
+  context: { readonly rawSql: Sql; readonly writerEpoch: string },
+): void {
+  assertMoneyCutoverSqlOrigin(sql, context);
+  const origin = moneyCutoverSqlOrigins.get(sql);
+  const rawSql = Object.getOwnPropertyDescriptor(context, "rawSql");
+  if (
+    !origin ||
+    !rawSql ||
+    !("value" in rawSql) ||
+    rawSql.value !== origin.raw ||
+    origin.rawQuery === undefined ||
+    origin.rawRun === undefined ||
+    origin.rawBatch === undefined ||
+    ownDataSqlMethod(origin.raw, "query") !== origin.rawQuery ||
+    ownDataSqlMethod(origin.raw, "run") !== origin.rawRun ||
+    ownDataSqlMethod(origin.raw, "batch") !== origin.rawBatch
+  ) {
+    throw new SqlError("invalid", "money cutover Sql backing origin differs");
   }
 }
 
@@ -268,6 +307,9 @@ export function createMoneyCutoverSql(raw: Sql, writerEpoch: string): Sql {
       query: wrapped.query,
       run: wrapped.run,
       batch: wrapped.batch,
+      rawQuery: ownDataSqlMethod(raw, "query"),
+      rawRun: ownDataSqlMethod(raw, "run"),
+      rawBatch: ownDataSqlMethod(raw, "batch"),
     }),
   );
   return wrapped;
