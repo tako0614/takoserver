@@ -606,7 +606,8 @@ export function createFinancialSourceMaterializationStore(
     const rows = await c.sql.query(
       `SELECT m.*,q.receipt_ref AS retained_receipt,q.command_ref AS retained_command,
       q.record_json AS receipt_record,q.all_rows_match,h.genesis_qualification_ref AS retained_genesis,h.created_at AS head_created,
-      r.registration_json,r.registration_digest,r.qualification_ref,r.receiver_ref,r.target_ref
+      r.registration_json,r.registration_digest,r.genesis_digest AS retained_registration_genesis,
+      r.qualification_ref,r.receiver_ref,r.target_ref
       FROM financial_source_materializations m LEFT JOIN financial_source_materialization_receipts q ON q.materialization_ref=m.materialization_ref
       LEFT JOIN financial_source_heads h ON h.registration_ref=m.registration_ref AND h.incarnation=m.incarnation AND h.affected_ref=m.affected_ref
       LEFT JOIN financial_source_registrations r ON r.registration_ref=m.registration_ref AND r.incarnation=m.incarnation
@@ -620,7 +621,25 @@ export function createFinancialSourceMaterializationStore(
         affectedRef,
       ],
     );
-    if (rows.length === 0) return null;
+    // A receipt can survive without its materialization row in a damaged store.
+    // Query its independent keys so missing roots cannot masquerade as absence.
+    const receipts = await c.sql.query(
+      `SELECT * FROM financial_source_materialization_receipts
+      WHERE receipt_ref=? OR materialization_ref=? OR command_ref=?
+      OR (registration_ref=? AND incarnation=? AND affected_ref=?)`,
+      [
+        input.receiptRef,
+        input.materializationRef,
+        input.commandRef,
+        registrationRef,
+        incarnation,
+        affectedRef,
+      ],
+    );
+    if (rows.length === 0) {
+      if (receipts.length !== 0) fail("unavailable");
+      return null;
+    }
     const row = rows[0];
     if (
       rows.length !== 1 ||
@@ -629,7 +648,24 @@ export function createFinancialSourceMaterializationStore(
       row.source_json !== sourceJson
     )
       fail("conflict");
+    const receipt = receipts[0];
     if (
+      receipts.length !== 1 ||
+      receipt === undefined ||
+      row.materialization_ref !== input.materializationRef ||
+      row.command_ref !== input.commandRef ||
+      row.registration_ref !== registrationRef ||
+      row.incarnation !== incarnation ||
+      row.affected_ref !== affectedRef ||
+      row.genesis_qualification_ref !== genesisQualificationRef ||
+      receipt.receipt_ref !== input.receiptRef ||
+      receipt.materialization_ref !== input.materializationRef ||
+      receipt.command_ref !== input.commandRef ||
+      receipt.registration_ref !== registrationRef ||
+      receipt.incarnation !== incarnation ||
+      receipt.affected_ref !== affectedRef ||
+      receipt.record_json !== row.record_json ||
+      receipt.all_rows_match !== 1 ||
       row.retained_receipt !== input.receiptRef ||
       row.retained_command !== input.commandRef ||
       row.receipt_record !== row.record_json ||
@@ -638,6 +674,7 @@ export function createFinancialSourceMaterializationStore(
       row.head_created !== row.created_at ||
       row.registration_json !== registrationJson ||
       row.registration_digest !== source.registrationDigest ||
+      row.retained_registration_genesis !== genesisDigest ||
       row.qualification_ref !== source.qualificationRef ||
       row.receiver_ref !== c.realmData.receiverRef ||
       row.target_ref !== c.realmData.targetRef
@@ -767,5 +804,91 @@ export function createFinancialSourceMaterializationStore(
       return fail("unavailable", error);
     }
   }
-  return Object.freeze({ install });
+  /** GET-only recovery of a completed original; caller authority is external to this private store. */
+  async function readOriginal(
+    input: FinancialMaterializationCommand,
+  ): Promise<FinancialMaterializationReceipt | undefined> {
+    let saved: ReturnType<typeof parse>;
+    try {
+      saved = parse(snapshot(input));
+    } catch (error) {
+      return fail("invalid_request", error);
+    }
+    if (
+      (await financialSourceEventDigest(saved.materialization.event)) !==
+      saved.materialization.eventDigest
+    )
+      fail("invalid_request");
+    try {
+      await c.ready(true);
+      const prior = await original(saved);
+      if (prior) return prior;
+      const heads = await c.sql.query(
+        `SELECT affected_ref FROM financial_source_heads
+        WHERE registration_ref=? AND incarnation=? AND affected_ref=?`,
+        [registrationRef, incarnation, affectedRef],
+      );
+      if (heads.length !== 0) fail("unavailable");
+      const registrations = await c.sql.query(
+        `SELECT receiver_ref,target_ref,genesis_digest,registration_digest,registration_json,qualification_ref
+        FROM financial_source_registrations WHERE registration_ref=? AND incarnation=?`,
+        [registrationRef, incarnation],
+      );
+      if (registrations.length === 0) return undefined;
+      const retained = registrations[0];
+      if (
+        registrations.length !== 1 ||
+        retained === undefined ||
+        retained.receiver_ref !== c.realmData.receiverRef ||
+        retained.target_ref !== c.realmData.targetRef ||
+        retained.genesis_digest !== genesisDigest ||
+        retained.registration_digest !== source.registrationDigest ||
+        retained.registration_json !== registrationJson ||
+        retained.qualification_ref !== source.qualificationRef
+      )
+        fail("unavailable");
+      // A registration alone is a partial bootstrap. Other completed heads may
+      // establish its provenance while this affectedRef remains truly absent.
+      const provenance = await c.sql.query(
+        `SELECT EXISTS(SELECT 1 FROM financial_source_materializations
+        WHERE registration_ref=? AND incarnation=?) AS has_original,
+        NOT EXISTS(SELECT 1 FROM financial_source_materializations m
+        LEFT JOIN financial_source_materialization_receipts q ON q.materialization_ref=m.materialization_ref
+        LEFT JOIN financial_source_heads h ON h.registration_ref=m.registration_ref
+          AND h.incarnation=m.incarnation AND h.affected_ref=m.affected_ref
+        WHERE m.registration_ref=? AND m.incarnation=? AND (
+          m.source_json IS ?
+          AND json_type(m.record_json) IS 'object'
+          AND (SELECT count(*) FROM json_each(m.record_json))=7
+          AND json_extract(m.record_json,'$.materializationRef') IS m.materialization_ref
+          AND json_extract(m.record_json,'$.commandRef') IS m.command_ref
+          AND json_type(m.record_json,'$.receiptRef') IS 'text'
+          AND json_extract(m.record_json,'$.receiptRef') IS q.receipt_ref
+          AND json_extract(m.record_json,'$.source') IS m.source_json
+          AND json_type(m.record_json,'$.materialization') IS 'object'
+          AND json_extract(m.record_json,'$.affectedRef') IS m.affected_ref
+          AND json_extract(m.record_json,'$.genesisQualificationRef') IS m.genesis_qualification_ref
+          AND q.materialization_ref IS m.materialization_ref
+          AND q.command_ref IS m.command_ref
+          AND q.registration_ref IS m.registration_ref
+          AND q.incarnation IS m.incarnation AND q.affected_ref IS m.affected_ref
+          AND q.record_json IS m.record_json AND q.all_rows_match=1
+          AND h.created_at IS m.created_at
+          AND h.genesis_qualification_ref IS m.genesis_qualification_ref
+        ) IS NOT 1) AS all_complete`,
+        [registrationRef, incarnation, registrationRef, incarnation, sourceJson],
+      );
+      if (
+        provenance.length !== 1 ||
+        provenance[0]?.has_original !== 1 ||
+        provenance[0]?.all_complete !== 1
+      )
+        fail("unavailable");
+      return undefined;
+    } catch (error) {
+      if (error instanceof FinancialSourceEnrollmentError) throw error;
+      return fail("unavailable", error);
+    }
+  }
+  return Object.freeze({ install, readOriginal });
 }
