@@ -368,7 +368,7 @@ footer { display: flex; align-items: center; justify-content: space-between; fle
 
 @media (min-width: 761px) and (max-width: 1100px) { .preview .frame { max-width: 848px; margin-inline: auto; } }
 /* Below desktop width the code beside each list would scroll sideways, so the columns stack. */
-@media (max-width: 1200px) { .deploy, .host, .after { grid-template-columns: minmax(0, 1fr); gap: 24px; } }
+@media (max-width: 1216px) { .deploy, .host, .after { grid-template-columns: minmax(0, 1fr); gap: 24px; } }
 @media (max-width: 760px) {
   .shell { width: calc(100% - 32px); }
   .top { height: 72px; }
