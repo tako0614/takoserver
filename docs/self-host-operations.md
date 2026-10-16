@@ -37,6 +37,14 @@ A self-host runs one of two profiles, selected by configuration:
   `WorkerEndpoint 0.3.0`, which publishes a Worker at an HTTPS hostname, also
   needs the TCP 443 listener in step 4.
 
+The guide uses two shells, and each setup block says which: "as root" or "as
+the `takoserver` user". An **administrator shell** as root installs tools, writes
+`/etc/takoserver`, and runs `systemctl` and `journalctl`. An **operator
+shell** as the `takoserver` user (`runuser -u takoserver -- bash`, then
+`cd /opt/takoserver`) runs the `takoserver` blocks of step 3, whose key files
+must belong to that user, and steps 5 to 11, which share shell variables such
+as `KEY` and `ORG`; keep it open between steps.
+
 ### 1. Prerequisites
 
 - Linux x86-64 with `/proc`, `/bin/sh` and `/usr/bin/setpriv`. The Worker
@@ -122,42 +130,53 @@ bun install --frozen-lockfile
 
 ### 2. Data root
 
-Choose a short data root, such as `/var/lib/takoserver`. At startup the Host
-resolves `TAKOSERVER_DATA_ROOT` once to an absolute, canonical path: a
-relative value, including the default, is relative to the working
-directory, and symlinks in the existing part of the path are resolved. When
-the result differs from the configured value, the process prints it.
-SQLite databases created under an earlier relative or symlinked setting stay
-bound to their Workers as long as `TAKOSERVER_DATA_ROOT` keeps the same
-string; changing the string (for example from the default to an absolute
-path, or restoring to a different path) is not supported for existing
-SQLite databases. A data root belongs to one machine; do not share it over
-a network filesystem. A data root that does not exist yet is created with
-mode 0700, together with any missing parent directories. An existing
-directory keeps its permissions. The v2 private planes require it to be mode
-0700 and owned by the Host's user, and refuse otherwise with the path, mode,
-and owner.
+Choose a short data root, such as `/var/lib/takoserver`, and create it as root
+before the first start:
 
-Actor and Workflow runtimes bind private Unix sockets in `<data root>/s`,
-and a Unix socket path is limited to about 100 bytes. The resolved data root
-therefore may be at most 61 bytes whenever Actors or Workflows run. Native
-Actor processes, for both the v2 Actor runtime and the implied Actor
-runtime, also bind sockets below `TMPDIR`, which may be at most 73 bytes.
-`s/` must be mode 0700 and owned by the Host's user. The data root and every
-directory above it must be owned by root or by the Host's user, and no
-other user may be able to write to them, except a sticky root-owned one such
-as `/tmp`. A group-writable ancestor (for example under umask 002, or a
-Kubernetes `fsGroup` volume with mode 2775) is refused; tighten it with
-`chmod g-w`.
+```sh
+install -d -m 0700 -o takoserver -g takoserver /var/lib/takoserver
+```
+
+The data root needs four things; the Host enforces the first two at startup:
+
+- **A short path.** Actor and Workflow runtimes bind private Unix sockets in
+  `<data root>/s`, and a Unix socket path is limited to about 100 bytes, so the
+  resolved data root may be at most 61 bytes whenever Actors or Workflows run.
+  Native Actor processes, for both the v2 Actor runtime and the implied Actor
+  runtime, also bind sockets below `TMPDIR`, which may be at most 73 bytes.
+- **Owned by the Host's user and closed to others.** The v2 private planes
+  require the data root to be mode 0700 and owned by the Host's user, and refuse
+  otherwise with the path, mode and owner; `s/` must be the same. The data root
+  and every directory above it must be owned by root or by the Host's user, and
+  no other user may be able to write to them, except a sticky root-owned one
+  such as `/tmp`. A group-writable ancestor (for example under umask 002, or a
+  Kubernetes `fsGroup` volume with mode 2775) is refused; tighten it with
+  `chmod g-w`.
+- **One stable path on one machine.** At startup the Host resolves
+  `TAKOSERVER_DATA_ROOT` once to an absolute, canonical path: a relative value,
+  including the default, is relative to the working directory, and symlinks in
+  the existing part of the path are resolved. When the result differs from the
+  configured value, the process prints it. SQLite databases created under an
+  earlier relative or symlinked setting stay bound to their Workers as long as
+  `TAKOSERVER_DATA_ROOT` keeps the same string; changing the string (for
+  example from the default to an absolute path, or restoring to a different
+  path) is not supported for existing SQLite databases. A data root belongs to
+  one machine; do not share it over a network filesystem. A data root that
+  does not exist yet is created with mode 0700, together with any missing
+  parent directories; an existing directory keeps its permissions.
+- **A private `/tmp`.** Run the Host with its own `/tmp`, as the systemd unit
+  of step 3 does with `PrivateTmp=yes` (see below for why).
 
 If `TAKOSERVER_V2_WORKER_RUNTIME_BOOT` selects `actor` or `workflow` and one
-of these requirements is not met, startup stops with a message that names
-the variable or directory, its length or mode, and what is required. The
-implied Actor runtime opens only when a workerd binary is selected and the
+of these requirements is not met, startup stops with a message that names the
+variable or directory, its length or mode, and what is required. The implied
+Actor runtime opens only when a workerd binary is selected and the
 ActorNamespace Form is installed. If a requirement is not met in that case,
 the Host prints that Actor admission is unavailable and why, and serves its
-other Forms. The retained v1 Form admission CLI makes the same decision, so it never
-admits Actor support that the Host withholds.
+other Forms. The retained v1 Form admission CLI makes the same decision, so it
+never admits Actor support that the Host withholds.
+
+#### Socket directories (reference)
 
 `s/` holds only listener directories that each start recreates. It does not
 need to be backed up, and a stopped Host may delete it. At startup, the Host
@@ -176,16 +195,9 @@ socket path must stay short. Each directory belongs to the Host's user and
 is removed only when its incarnation retires. It is kept across a restart,
 so that no other local user can create that name in a shared `/tmp` and
 make the next start refuse it. Deleting a data root does not remove these
-directories. Run the Host with its own private `/tmp`, for example with
-systemd `PrivateTmp=yes`: other users cannot reach it, recovery recreates
-any namespace that is missing, and the directories go away with the
-service.
-
-For example, as root before the first start:
-
-```sh
-install -d -m 0700 -o takoserver -g takoserver /var/lib/takoserver
-```
+directories. A private `/tmp` (systemd `PrivateTmp=yes`) keeps other users
+from reaching it, recovery recreates any namespace that is missing, and the
+directories go away with the service.
 
 ### 3. Configuration
 
