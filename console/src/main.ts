@@ -188,18 +188,21 @@ function topbar(): Child {
     ),
     live(() => {
       const who = principal();
+      const label = who
+        ? `${who.displayName} — ${tr("サインアウト", "sign out")}`
+        : tr("サインアウト", "Sign out");
+      // On a phone only the icon shows; the label keeps the button's name.
       return h(
         "button",
         {
           class: "btn btn--ghost btn--sm",
           type: "button",
-          title: who
-            ? `${who.displayName} — ${tr("サインアウト", "sign out")}`
-            : tr("サインアウト", "Sign out"),
+          title: label,
+          "aria-label": label,
           onClick: signOut,
         },
-        icon(ICON.out, 15),
-        text(who ? who.displayName : tr("サインアウト", "Sign out")),
+        icon(ICON.signOut, 15),
+        h("span", { class: "topbar__who" }, who ? who.displayName : tr("サインアウト", "Sign out")),
       );
     }),
   );
@@ -218,11 +221,11 @@ function organizationPicker(): Child {
   }
   return h(
     "div",
-    { style: { display: "flex", alignItems: "center", gap: "8px" } },
+    { class: "topbar__picker", style: { display: "flex", alignItems: "center", gap: "8px" } },
     h(
       "select",
       {
-        class: "select",
+        class: "select topbar__org",
         style: { width: "auto", padding: "5px 9px" },
         "aria-label": tr("組織", "Organization"),
         onChange: (event: Event) => selectOrganization((event.target as HTMLSelectElement).value),
