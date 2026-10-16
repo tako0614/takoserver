@@ -108,80 +108,125 @@ async function submit(intent: ResourceIntent, close: () => void): Promise<void> 
 }
 
 const OTHER_FORM = "other";
+/** A Host that has not answered about one Form by now is not waited for. */
+const PROBE_TIMEOUT_MS = 5_000;
 
 interface FormChoice {
   readonly element: HTMLElement;
-  /** The exact Form URL chosen or typed, trimmed. */
+  /** The exact Form URL chosen or typed, trimmed; empty when none is. */
   value(): string;
   setDisabled(disabled: boolean): void;
 }
 
+/** One Form's support answer, or null when the Host did not give one in time. */
+function probeSupport(organizationId: string, form: string): Promise<boolean | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), PROBE_TIMEOUT_MS);
+    api.formSupport(organizationId, form).then(
+      (supported) => {
+        clearTimeout(timer);
+        resolve(supported);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(null);
+      },
+    );
+  });
+}
+
 /**
- * A choice among the Forms this Host answers for, so nobody has to know a
- * Form URL by heart. Each known Form is asked about once when the dialog
- * opens: one the Host does not compose stays visible but cannot be chosen,
- * and "another Form URL" keeps any exact URL possible. If no answer comes
- * back at all, the URL field is the whole control. The create itself still
- * asks the Host about the exact URL before sending.
+ * A choice among the Forms this Host supports, so nobody has to know a Form
+ * URL by heart. The list is usable at once; each known Form is asked about
+ * when the dialog opens, and its option is marked as the answer arrives: a
+ * Form the Host does not support stays visible but cannot be chosen, and one
+ * the Host did not answer for says so. "Another exact Form URL" keeps any URL
+ * possible. If the Host answered for none, the URL field is the whole
+ * control. The create itself still asks about the exact URL before sending.
  */
 function formChoice(organizationId: string, onChange: () => void): FormChoice {
   const url = h("input", {
     class: "input",
+    id: "create-resource-form-url",
     placeholder: "https://…/forms/Kind/1.0.0/",
     autocomplete: "off",
     spellcheck: "false",
     "aria-label": "Form URL",
   });
   url.hidden = true;
+  const options = new Map<string, HTMLOptionElement>();
   const select = h(
     "select",
     { class: "select", id: "create-resource-form" },
     h(
       "option",
-      { value: "" },
-      tr("このHostのFormを確認しています…", "Checking this Host's Forms…"),
+      { value: "", disabled: true, selected: true },
+      tr("Formを選んでください", "Choose a Form"),
     ),
+    ...KNOWN_FORM_GROUPS.map((group) =>
+      h(
+        "optgroup",
+        { label: group.label() },
+        group.forms.map((form) => {
+          const option = h("option", { value: form }, formLabel(form));
+          options.set(form, option);
+          return option;
+        }),
+      ),
+    ),
+    h("option", { value: OTHER_FORM }, tr("別のForm URLを入力…", "Another exact Form URL…")),
   );
-  select.disabled = true;
+  const label = h("label", { for: "create-resource-form" }, "Form");
   const hint = h("small");
-  let ready = false;
+  let pending = options.size;
+  let answered = 0;
 
+  const typed = (): boolean => select.hidden || select.value === OTHER_FORM;
   const value = (): string =>
-    select.value.startsWith("https://") ? select.value : url.value.trim();
+    typed() ? url.value.trim() : select.value.startsWith("https://") ? select.value : "";
   const render = (): void => {
-    if (ready) url.hidden = !select.hidden && select.value !== OTHER_FORM;
-    const chosen = value();
-    if (chosen.startsWith("https://")) {
+    url.hidden = !typed();
+    if (!typed() && select.value.startsWith("https://")) {
       hint.replaceChildren(
         tr(
-          "specの項目は公開仕様で確認できます：",
+          "設定に書ける項目は公開仕様で確認できます：",
           "The spec's fields are in its published contract: ",
         ),
         h(
           "a",
-          { href: chosen, target: "_blank", rel: "noopener noreferrer" },
-          formLabel(chosen),
+          { href: select.value, target: "_blank", rel: "noopener noreferrer" },
+          formLabel(select.value),
           h("span", { "aria-hidden": "true" }, " ↗"),
+          h(
+            "span",
+            { class: "visually-hidden" },
+            tr("（新しいタブで開きます）", " (opens in a new tab)"),
+          ),
         ),
       );
-    } else {
-      hint.replaceChildren(
-        select.hidden
+      return;
+    }
+    hint.replaceChildren(
+      select.hidden
+        ? tr(
+            "このHostが対応しているFormを確認できませんでした。正確なForm URLを入力してください。",
+            "Couldn't ask this Host which Forms it supports. Enter an exact Form URL.",
+          )
+        : select.value === OTHER_FORM
           ? tr(
-              "このHostに対応Formを問い合わせられませんでした。正確なForm URLを入力してください。",
-              "This Host did not say which Forms it composes. Enter an exact Form URL.",
+              "正確なForm URLを入力してください。送信前に、このHostが対応しているかを確認します。",
+              "Enter an exact Form URL. The Host is asked whether it supports it before anything is sent.",
             )
-          : select.value === OTHER_FORM
+          : pending > 0
             ? tr(
-                "正確なForm URLを入力してください。送信前に、このHostが対応しているかを確認します。",
-                "Enter an exact Form URL. The Host is asked whether it composes it before anything is sent.",
+                "このHostが対応しているFormを確認しています…",
+                "Checking which Forms this Host supports…",
               )
             : tr(
-                "このHostが対応するFormだけを選べます。",
-                "Only the Forms this Host composes can be chosen.",
+                "このHostが対応しているFormだけを選べます。",
+                "Only the Forms this Host supports can be chosen.",
               ),
-      );
-    }
+    );
   };
   const sync = (): void => {
     render();
@@ -190,70 +235,52 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
   select.addEventListener("change", sync);
   url.addEventListener("input", sync);
 
-  const known = KNOWN_FORM_GROUPS.flatMap((group) => [...group.forms]);
-  void Promise.all(
-    known.map((form) =>
-      api.formSupport(organizationId, form).then(
-        (supported) => [form, supported] as const,
-        () => [form, null] as const,
-      ),
-    ),
-  ).then((answers) => {
-    const support = new Map<string, boolean | null>(answers);
-    ready = true;
-    if (answers.every(([, supported]) => supported === null)) {
-      select.hidden = true;
-    } else {
-      select.replaceChildren(
-        h(
-          "option",
-          { value: "", disabled: true, selected: true },
-          tr("Formを選んでください", "Choose a Form"),
-        ),
-        ...KNOWN_FORM_GROUPS.map((group) =>
-          h(
-            "optgroup",
-            { label: group.label() },
-            group.forms.map((form) =>
-              h(
-                "option",
-                { value: form, disabled: support.get(form) === false },
-                support.get(form) === false
-                  ? tr(
-                      `${formLabel(form)}（このHostにはありません）`,
-                      `${formLabel(form)} — not on this Host`,
-                    )
-                  : formLabel(form),
-              ),
-            ),
+  const settle = (form: string, supported: boolean | null): void => {
+    pending -= 1;
+    const option = options.get(form);
+    if (supported === false) {
+      if (option) {
+        option.disabled = true;
+        option.replaceChildren(
+          tr(
+            `${formLabel(form)}（このHostにはありません）`,
+            `${formLabel(form)} — not on this Host`,
           ),
-        ),
-        h("option", { value: OTHER_FORM }, tr("別のForm URLを入力…", "Another exact Form URL…")),
+        );
+      }
+      if (select.value === form) select.value = "";
+      answered += 1;
+    } else if (supported === null) {
+      option?.replaceChildren(
+        tr(`${formLabel(form)}（確認できませんでした）`, `${formLabel(form)} — not checked`),
       );
-      select.disabled = url.disabled;
+    } else {
+      answered += 1;
+    }
+    // A Host that answered for no Form at all leaves only the exact URL,
+    // unless the person has already picked something to keep.
+    if (pending === 0 && answered === 0 && select.value === "") {
+      select.hidden = true;
+      label.setAttribute("for", "create-resource-form-url");
     }
     sync();
-  });
+  };
+  for (const form of options.keys()) {
+    void probeSupport(organizationId, form).then((supported) => settle(form, supported));
+  }
   render();
 
   return {
-    element: h(
-      "div",
-      { class: "field" },
-      h("label", { for: "create-resource-form" }, "Form"),
-      select,
-      url,
-      hint,
-    ),
+    element: h("div", { class: "field" }, label, select, url, hint),
     value,
     setDisabled(disabled) {
       url.disabled = disabled;
-      select.disabled = disabled || !ready;
+      select.disabled = disabled;
     },
   };
 }
 
-/** Create one Resource of an exact Form this Host composes. */
+/** Create one Resource of an exact Form this Host supports. */
 export function createResource(organizationId: string): void {
   const key = `console-create-${crypto.randomUUID()}`;
   const name = h("input", {
