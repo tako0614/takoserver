@@ -13,7 +13,7 @@ import { publishedUrl, servedWorkers } from "../references.ts";
 import { byForm, health, phaseLabel } from "../resource-state.ts";
 import { linkProps, resourcePath } from "../router.ts";
 import { api } from "../state.ts";
-import { ago, badge, card, copyable, empty, ICON, icon, stat, whenReady } from "../ui.ts";
+import { ago, badge, card, copyable, empty, ICON, icon, whenReady } from "../ui.ts";
 import { createResource } from "./create-resource.ts";
 
 /**
@@ -52,72 +52,6 @@ export function overviewPage(organization: Organization): Child {
       ),
     ),
     live(() =>
-      h(
-        "div",
-        { class: "grid grid--stats" },
-        whenReady(
-          resources.get(),
-          ({ resources: all, cursor }) => {
-            const attention = all.filter((entry) =>
-              ["Failed", "NotReady"].includes(health(entry).phase),
-            ).length;
-            // Only the first page is read here. When the Host has more, the
-            // count says so instead of passing a page size off as a total.
-            // The caption names what this count checks (failed or not ready);
-            // the Needs attention card below also lists undelivered changes.
-            const more = cursor !== null && all.length > 0;
-            return stat(
-              tr("リソース", "Resources"),
-              more ? `${all.length}+` : String(all.length),
-              attention > 0
-                ? h(
-                    "span",
-                    { style: { color: "var(--warn)" } },
-                    more
-                      ? tr(`${attention}件以上に確認が必要`, `${attention}+ need attention`)
-                      : tr(`${attention}件に確認が必要`, `${attention} need attention`),
-                  )
-                : more
-                  ? tr("最初のページのみ集計", "first page only")
-                  : all.length === 0
-                    ? tr("まだありません", "none yet")
-                    : tr("失敗・非稼働はありません", "none failed or not ready"),
-            );
-          },
-          { skeleton: h("div", { class: "card" }, h("div", { class: "card__body skeleton" })) },
-        ),
-        whenReady(
-          wallet.get(),
-          ({ wallet: held }) =>
-            // v2 Resources are never charged, so a self-host whose wallet has
-            // never been used has nothing to show here; Usage & billing still
-            // has the wallet. One that has been used keeps its cards at $0.
-            walletInUse(held)
-              ? h(
-                  "div",
-                  { style: { display: "contents" } },
-                  stat(
-                    tr("利用可能", "Available"),
-                    formatMicrosCurrency(held.availableMicros, held.currency, uiLocale()),
-                    BigInt(held.heldMicros) > 0n
-                      ? tr(
-                          `${formatMicrosCurrency(held.heldMicros, held.currency, uiLocale())}を処理中の操作に確保中`,
-                          `${formatMicrosCurrency(held.heldMicros, held.currency, uiLocale())} held against live work`,
-                        )
-                      : tr("確保中の金額はありません", "nothing held"),
-                  ),
-                  stat(
-                    tr("確定残高", "Settled"),
-                    formatMicrosCurrency(held.settledMicros, held.currency, uiLocale()),
-                    tr("入金と確定済み請求", "credited and captured"),
-                  ),
-                )
-              : null,
-          { skeleton: false },
-        ),
-      ),
-    ),
-    live(() =>
       whenReady(
         resources.get(),
         ({ resources: all, cursor }) =>
@@ -139,142 +73,27 @@ export function overviewPage(organization: Organization): Child {
                   ),
                 ),
               )
-            : h(
+            : // What someone signs in to see comes first: where each Worker is
+              // served, then anything broken, then the counts.
+              h(
                 "div",
                 { style: { display: "grid", gap: "18px" } },
                 workersCard(all, cursor !== null),
-                card(
-                  cursor === null
-                    ? tr("Form別", "By Form")
-                    : tr("Form別（最初のページ）", "By Form (first page)"),
-                  h(
-                    "div",
-                    { class: "card__body" },
-                    h(
-                      "div",
-                      { class: "grid" },
-                      ...byForm(all).map((entry) =>
-                        h(
-                          "a",
-                          {
-                            class: "card",
-                            style: { display: "block" },
-                            // Narrowed by the exact URL, so no other Form that
-                            // reads alike is swept in.
-                            ...linkProps(`/resources?form=${encodeURIComponent(entry.form)}`),
-                          },
-                          h(
-                            "div",
-                            { class: "card__body" },
-                            h(
-                              "div",
-                              { class: "stat__form", title: entry.form },
-                              formName(entry.form),
-                            ),
-                            h("div", { class: "stat__value" }, String(entry.total)),
-                            entry.attention > 0
-                              ? h(
-                                  "div",
-                                  { style: { marginTop: "6px" } },
-                                  badge(
-                                    tr(
-                                      `${entry.attention}件に確認が必要`,
-                                      `${entry.attention} need attention`,
-                                    ),
-                                    "warn",
-                                    true,
-                                  ),
-                                )
-                              : null,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                  h(
-                    "a",
-                    { class: "btn btn--sm", ...linkProps("/resources") },
-                    text(tr("すべて表示", "View all")),
-                    icon(ICON.chevron, 13),
-                  ),
-                ),
+                attentionCard(all),
+                resourcesCard(all, cursor !== null),
               ),
         { retry: resources.reload },
       ),
     ),
     live(() =>
       whenReady(
-        resources.get(),
-        ({ resources: all }) => {
-          const attention = all.filter((entry) => {
-            const state = health(entry);
-            return state.phase === "Failed" || state.phase === "NotReady" || state.stale;
-          });
-          if (attention.length === 0) return h("div", { style: { display: "none" } });
-          return card(
-            tr("確認が必要", "Needs attention"),
-            h(
-              "div",
-              { class: "table-scroll" },
-              h(
-                "table",
-                null,
-                h(
-                  "thead",
-                  null,
-                  h(
-                    "tr",
-                    null,
-                    h("th", null, tr("リソース", "Resource")),
-                    h("th", null, tr("状態", "State")),
-                    h("th", null, tr("理由", "Why")),
-                  ),
-                ),
-                h(
-                  "tbody",
-                  null,
-                  ...attention.slice(0, 8).map((entry) => {
-                    const state = health(entry);
-                    return h(
-                      "tr",
-                      null,
-                      h(
-                        "td",
-                        null,
-                        h(
-                          "a",
-                          {
-                            class: "mono",
-                            ...linkProps(resourcePath(entry.uid)),
-                          },
-                          entry.name,
-                        ),
-                      ),
-                      h("td", null, badge(phaseLabel(state.phase), state.tone, true)),
-                      h(
-                        "td",
-                        { class: "dim" },
-                        state.message ??
-                          (state.stale
-                            ? tr(
-                                "最新の宣言がまだ適用されていません",
-                                "the latest declaration has not been applied",
-                              )
-                            : state.phase === "NotReady"
-                              ? tr(
-                                  "最新の観測でReadyではありません",
-                                  "latest observation reports not ready",
-                                )
-                              : "—"),
-                      ),
-                    );
-                  }),
-                ),
-              ),
-            ),
-          );
-        },
-        { skeleton: h("div", { style: { display: "none" } }) },
+        wallet.get(),
+        ({ wallet: held }) =>
+          // v2 Resources are never charged, so a self-host whose wallet has
+          // never been used shows nothing here; Usage & billing still has the
+          // wallet. One that has been used keeps its line at $0.
+          walletInUse(held) ? walletLine(held) : h("div", { style: { display: "none" } }),
+        { skeleton: false },
       ),
     ),
     live(() =>
@@ -336,6 +155,177 @@ export function overviewPage(organization: Organization): Child {
  * Each Worker with the state of the Deployment serving it and the addresses
  * it is published at: what someone signing in most wants to know.
  */
+/** Resources that failed, report not ready, or have a change not yet applied. */
+function attentionCard(all: readonly ResourceSummary[]): Child {
+  const attention = all.filter((entry) => {
+    const state = health(entry);
+    return state.phase === "Failed" || state.phase === "NotReady" || state.stale;
+  });
+  if (attention.length === 0) return null;
+  return card(
+    tr("確認が必要", "Needs attention"),
+    h(
+      "div",
+      { class: "table-scroll" },
+      h(
+        "table",
+        null,
+        h(
+          "thead",
+          null,
+          h(
+            "tr",
+            null,
+            h("th", null, tr("リソース", "Resource")),
+            h("th", null, tr("状態", "State")),
+            h("th", null, tr("理由", "Why")),
+          ),
+        ),
+        h(
+          "tbody",
+          null,
+          ...attention.slice(0, 8).map((entry) => {
+            const state = health(entry);
+            return h(
+              "tr",
+              null,
+              h(
+                "td",
+                null,
+                h("a", { class: "mono", ...linkProps(resourcePath(entry.uid)) }, entry.name),
+              ),
+              h("td", null, badge(phaseLabel(state.phase), state.tone, true)),
+              h(
+                "td",
+                { class: "dim" },
+                state.message ??
+                  (state.stale
+                    ? tr(
+                        "最新の宣言がまだ適用されていません",
+                        "the latest declaration has not been applied",
+                      )
+                    : state.phase === "NotReady"
+                      ? tr(
+                          "最新の観測でReadyではありません",
+                          "latest observation reports not ready",
+                        )
+                      : "—"),
+              ),
+            );
+          }),
+        ),
+      ),
+    ),
+  );
+}
+
+/**
+ * How many Resources the first page holds, by Form. Only the first page is
+ * read here; when the Host has more, the count says so instead of passing a
+ * page size off as a total. Each Form opens the list narrowed to its exact URL.
+ */
+function resourcesCard(all: readonly ResourceSummary[], more: boolean): Child {
+  const attention = all.filter((entry) =>
+    ["Failed", "NotReady"].includes(health(entry).phase),
+  ).length;
+  const caption =
+    attention > 0
+      ? h(
+          "span",
+          { style: { color: "var(--warn)" } },
+          more
+            ? tr(`${attention}件以上に確認が必要`, `${attention}+ need attention`)
+            : tr(`${attention}件に確認が必要`, `${attention} need attention`),
+        )
+      : more
+        ? tr("最初のページのみ集計", "first page only")
+        : tr("失敗・非稼働はありません", "none failed or not ready");
+  return card(
+    h(
+      "span",
+      null,
+      tr("リソース", "Resources"),
+      " ",
+      h("span", { class: "dim" }, more ? `${all.length}+` : String(all.length)),
+    ),
+    h(
+      "div",
+      { class: "card__body rows rows--counts" },
+      h("div", { class: "row" }, h("div", { class: "row__label dim" }, caption)),
+      ...byForm(all).map((entry) =>
+        h(
+          "div",
+          { class: "row" },
+          h(
+            "div",
+            { class: "row__label" },
+            h(
+              "a",
+              {
+                title: entry.form,
+                ...linkProps(`/resources?form=${encodeURIComponent(entry.form)}`),
+              },
+              formName(entry.form),
+            ),
+          ),
+          h(
+            "div",
+            { class: "row__value" },
+            String(entry.total),
+            entry.attention > 0
+              ? h(
+                  "span",
+                  { style: { marginLeft: "8px" } },
+                  badge(
+                    tr(`${entry.attention}件に確認が必要`, `${entry.attention} need attention`),
+                    "warn",
+                    true,
+                  ),
+                )
+              : null,
+          ),
+        ),
+      ),
+    ),
+    h(
+      "a",
+      { class: "btn btn--sm", ...linkProps("/resources") },
+      text(tr("すべて表示", "View all")),
+      icon(ICON.chevron, 13),
+    ),
+  );
+}
+
+/** A wallet that has been used, in one line after what was deployed. */
+function walletLine(held: Wallet): Child {
+  const money = (micros: string) => formatMicrosCurrency(micros, held.currency, uiLocale());
+  return h(
+    "section",
+    { class: "card" },
+    h(
+      "div",
+      { class: "card__body wallet-line" },
+      h("span", { class: "wallet-line__label" }, tr("ウォレット", "Wallet")),
+      h(
+        "span",
+        null,
+        tr("利用可能", "Available"),
+        " ",
+        h("strong", null, money(held.availableMicros)),
+      ),
+      h("span", null, tr("確定残高", "Settled"), " ", money(held.settledMicros)),
+      BigInt(held.heldMicros) > 0n
+        ? h(
+            "span",
+            { class: "dim" },
+            tr(`${money(held.heldMicros)}を確保中`, `${money(held.heldMicros)} held`),
+          )
+        : null,
+      h("a", { ...linkProps("/billing") }, tr("使用量と請求", "Usage & billing")),
+    ),
+  );
+}
+
 function workersCard(all: readonly ResourceSummary[], partial: boolean): Child {
   const workers = servedWorkers(all);
   if (workers.length === 0) return null;
