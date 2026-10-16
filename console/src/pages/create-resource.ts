@@ -126,6 +126,8 @@ interface FormChoice {
   /** The exact Form URL chosen or typed, trimmed; empty when none is. */
   value(): string;
   setDisabled(disabled: boolean): void;
+  /** Chooses an exact Form URL, as a person would. */
+  choose(form: string): void;
 }
 
 /** One Form's support answer, or null when the Host did not give one in time. */
@@ -290,6 +292,15 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
       url.disabled = disabled;
       select.disabled = disabled;
     },
+    choose(form) {
+      if (options.has(form)) {
+        select.value = form;
+      } else {
+        select.value = OTHER_FORM;
+        url.value = form;
+      }
+      sync();
+    },
   };
 }
 
@@ -413,7 +424,14 @@ const ARTIFACT_STEP =
   "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#6-seed-held-artifacts";
 
 /** Create one Resource of an exact Form this Host supports. */
-export function createResource(organizationId: string): void {
+/** What a create opens with when another page knows what to create. */
+export interface CreatePreset {
+  readonly form: string;
+  readonly spec: Record<string, unknown>;
+  readonly note?: string;
+}
+
+export function createResource(organizationId: string, preset?: CreatePreset): void {
   const key = `console-create-${crypto.randomUUID()}`;
   const name = h("input", {
     class: "input",
@@ -431,6 +449,8 @@ export function createResource(organizationId: string): void {
   const artifactHint = h("small");
   const references = h("div");
   let picker: ReturnType<typeof referencePicker> | null = null;
+  // Read through a closure: choosing a Form sets the picker from a callback.
+  const syncReferences = (): void => picker?.sync();
   // The starter for the chosen Form, and the exact text the spec held when the
   // Console last wrote it. A spec the person has not touched follows the
   // chosen Form; an edited one is never overwritten, only offered the starter.
@@ -583,6 +603,13 @@ export function createResource(organizationId: string): void {
     picker?.sync();
     describeStarter();
   });
+  if (preset) {
+    form.choose(preset.form);
+    // The preset is the Console's own writing, like a starter.
+    write(JSON.stringify(preset.spec, null, 2));
+    syncReferences();
+    describeStarter();
+  }
   showDetails();
   let intent: ResourceIntent | null = null;
   const close = openModal({
@@ -591,6 +618,7 @@ export function createResource(organizationId: string): void {
     body: h(
       "div",
       { style: { display: "grid", gap: "14px" } },
+      preset?.note ? h("div", { class: "notice" }, preset.note) : null,
       form.element,
       h(
         "div",
@@ -694,12 +722,21 @@ export function createResource(organizationId: string): void {
   });
 }
 
-/** Update one observed UID, fenced on the generation the person last read. */
-export function updateResource(organizationId: string, resource: ResourceSummary): void {
+/**
+ * Update one observed UID, fenced on the generation the person last read.
+ * Another page may open it with a new spec already written, and a note saying
+ * what that spec does; nothing is sent until the person accepts it.
+ */
+export function updateResource(
+  organizationId: string,
+  resource: ResourceSummary,
+  proposal?: { readonly spec: Record<string, unknown>; readonly note: string },
+): void {
   const key = `console-update-${crypto.randomUUID()}`;
   const path = `/apis/forms.takoform.com/v2/resources/${encodeURIComponent(resource.uid)}`;
   const spec = h("textarea", { class: "textarea", spellcheck: "false" });
-  spec.value = JSON.stringify(resource.spec, null, 2);
+  spec.value = JSON.stringify(proposal?.spec ?? resource.spec, null, 2);
+  spec.rows = Math.min(12, spec.value.split("\n").length + 1);
   const details = h("div");
   const showDetails = (): void => {
     const parsed = jsonSpec(spec.value);
@@ -722,6 +759,7 @@ export function updateResource(organizationId: string, resource: ResourceSummary
     body: h(
       "div",
       { class: "field" },
+      proposal ? h("div", { class: "notice" }, proposal.note) : null,
       h("label", null, tr("設定 (JSON)", "Spec (JSON)")),
       spec,
       requestDisclosure(details),

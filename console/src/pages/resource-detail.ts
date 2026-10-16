@@ -1,6 +1,7 @@
 import type { ResourceSummary } from "../api.ts";
 import { ApiError } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
+import { valueAt, WORKER_DEPLOYMENT, WORKER_VERSION } from "../form-specs.ts";
 import { formLabel } from "../forms.ts";
 import { tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
@@ -9,7 +10,7 @@ import { health, phaseLabel } from "../resource-state.ts";
 import { linkProps, resourcePath, route } from "../router.ts";
 import { api, currentOrganization } from "../state.ts";
 import { badge, card, copyable, empty, ICON, icon, jsonBlock, whenReady } from "../ui.ts";
-import { deleteResource, updateResource } from "./create-resource.ts";
+import { createResource, deleteResource, updateResource } from "./create-resource.ts";
 
 export { publishedUrl, type SpecReference, specReferences } from "../references.ts";
 
@@ -55,6 +56,12 @@ export async function findReferrers(
 
 /** The v2 address is the durable UID, never a reconstructed kind/name tuple. */
 export function resourceDetailPage(organizationId: string, uid: string): Child {
+  // Made once per page, so a re-render does not look the Deployment up again.
+  let serve: Child | undefined;
+  const serveAction = (found: ResourceSummary): Child => {
+    serve ??= found.form === WORKER_VERSION ? serveVersionAction(organizationId, found) : null;
+    return serve;
+  };
   const isCurrent = (): boolean =>
     currentOrganization()?.id === organizationId &&
     route().segments.length === 2 &&
@@ -79,7 +86,7 @@ export function resourceDetailPage(organizationId: string, uid: string): Child {
         (found) => {
           if (!isCurrent()) return null;
           return found
-            ? body(found, organizationId, page.reload)
+            ? body(found, organizationId, page.reload, serveAction(found))
             : card(
                 null,
                 empty(
@@ -102,7 +109,12 @@ export function resourceDetailPage(organizationId: string, uid: string): Child {
   );
 }
 
-function body(found: ResourceSummary, organizationId: string, reload: () => void): Child {
+function body(
+  found: ResourceSummary,
+  organizationId: string,
+  reload: () => void,
+  serve: Child,
+): Child {
   const state = health(found);
   const url = publishedUrl(found.output);
   const references = specReferences(found.spec);
@@ -169,6 +181,7 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
       h(
         "div",
         { class: "toolbar" },
+        serve,
         h(
           "button",
           { class: "btn", type: "button", onClick: reload },
@@ -258,6 +271,73 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
   );
 }
 
+/** The Deployment serving a ModuleWorker, from the first pages of Deployments. */
+async function deploymentOf(
+  organizationId: string,
+  workerUid: string,
+): Promise<ResourceSummary | null> {
+  let cursor: string | null = null;
+  for (let page = 0; page < REFERRER_PAGES; page += 1) {
+    const read = await api.resources(organizationId, {
+      form: WORKER_DEPLOYMENT,
+      ...(cursor ? { cursor } : {}),
+    });
+    const found = read.resources.find(
+      (candidate) => valueAt(candidate.spec, ["worker", "resourceUid"]) === workerUid,
+    );
+    if (found) return found;
+    cursor = read.cursor;
+    if (cursor === null) return null;
+  }
+  return null;
+}
+
+/**
+ * On a WorkerVersion's page: serve this version. It opens the update of the
+ * Worker's Deployment with this version at weight 10000, or a new Deployment
+ * when the Worker has none; nothing is sent until the person accepts it. A
+ * version already served alone says so instead.
+ */
+function serveVersionAction(organizationId: string, version: ResourceSummary): Child {
+  const workerUid = valueAt(version.spec, ["worker", "resourceUid"]);
+  if (typeof workerUid !== "string") return null;
+  const served = resource(() => deploymentOf(organizationId, workerUid));
+  const versions = [{ workerVersion: { resourceUid: version.uid }, weight: 10000 }];
+  return live(() => {
+    const state = served.get();
+    if (state.state !== "ready") return null;
+    const deployment = state.value;
+    const current = deployment ? valueAt(deployment.spec, ["versions"]) : undefined;
+    if (JSON.stringify(current) === JSON.stringify(versions))
+      return h("span", { class: "dim" }, tr("このVersionを配信中です", "Serving this version"));
+    return h(
+      "button",
+      {
+        class: "btn btn--primary",
+        type: "button",
+        onClick: () =>
+          deployment
+            ? updateResource(organizationId, deployment, {
+                spec: { ...deployment.spec, versions },
+                note: tr(
+                  `${deployment.name}を、${version.name}だけを重み10000で配信するよう更新します。内容を確認して受け付けてください。`,
+                  `This updates ${deployment.name} to serve only ${version.name}, at weight 10000. Check it, then accept.`,
+                ),
+              })
+            : createResource(organizationId, {
+                form: WORKER_DEPLOYMENT,
+                spec: { worker: { resourceUid: workerUid }, versions },
+                note: tr(
+                  `このWorkerにはまだDeploymentがありません。${version.name}を配信するDeploymentを作成します。名前を付けて受け付けてください。`,
+                  `This Worker has no Deployment yet. This creates one that serves ${version.name}. Name it, then accept.`,
+                ),
+              }),
+      },
+      tr("このVersionを配信する", "Serve this version"),
+    );
+  });
+}
+
 /** The Resources this spec names, by name, so the graph can be walked rather than read. */
 function referencesCard(organizationId: string, references: readonly SpecReference[]): Child {
   const named = resource(async () => {
@@ -284,7 +364,7 @@ function referencesCard(organizationId: string, references: readonly SpecReferen
       { class: "card__body rows" },
       ...references.map((reference) =>
         field(
-          h("span", { class: "mono" }, reference.path),
+          pathLabel(reference.path),
           live(() => {
             const state = named.get();
             const target = state.state === "ready" ? state.value.get(reference.uid) : undefined;
@@ -334,7 +414,7 @@ function referrersCard(organizationId: string, uid: string): Child {
         ...referrers.map(({ resource: referrer, paths }) => {
           const url = publishedUrl(referrer.output);
           return field(
-            h("span", { class: "mono" }, paths.join(", ")),
+            pathLabel(paths.join(", ")),
             h(
               "span",
               { class: "ref" },
@@ -386,6 +466,19 @@ function httpsUrl(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * A place in a spec, in monospace, that wraps only between its parts
+ * ("versions[0]." / "workerVersion") rather than in the middle of a name.
+ */
+function pathLabel(path: string): Child {
+  const parts = path.split(/(?<=[.,])|(?=\[)/u);
+  return h(
+    "span",
+    { class: "mono path-label" },
+    ...parts.flatMap((part, index) => (index === 0 ? [part] : [h("wbr"), part])),
+  );
 }
 
 function field(label: Child, value: Child): Child {

@@ -3,7 +3,8 @@ const form = (kind: string, version: string): string => `${EDGE}/${kind}/${versi
 
 const MODULE_WORKER = form("ModuleWorker", "0.3.0");
 const WORKER_BUNDLE = form("WorkerBundle", "0.2.0");
-const WORKER_VERSION = form("WorkerVersion", "0.5.0");
+export const WORKER_VERSION = form("WorkerVersion", "0.5.0");
+export const WORKER_DEPLOYMENT = form("WorkerDeployment", "0.4.0");
 const SQLITE_DATABASE = form("SQLiteDatabase", "0.2.0");
 const SQLITE_MIGRATION_SET = form("SQLiteMigrationSet", "0.2.0");
 const AT_LEAST_ONCE_QUEUE = form("AtLeastOnceQueue", "0.2.0");
@@ -53,7 +54,7 @@ const STARTERS: Readonly<Record<string, () => StarterSpec>> = {
       { path: ref("bundle"), form: WORKER_BUNDLE },
     ],
   }),
-  [form("WorkerDeployment", "0.4.0")]: () => ({
+  [WORKER_DEPLOYMENT]: () => ({
     spec: {
       worker: { resourceUid: "" },
       versions: [{ workerVersion: { resourceUid: "" }, weight: 10000 }],

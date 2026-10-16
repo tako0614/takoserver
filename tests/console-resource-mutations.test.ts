@@ -611,6 +611,116 @@ test("an artifact Form's starter says where its url and sha256 come from", async
   expect(body.textContent).not.toContain("url and sha256 are the artifact");
 });
 
+const versionForm = "https://edge.forms.takoform.com/forms/WorkerVersion/0.5.0/";
+const deploymentForm = "https://edge.forms.takoform.com/forms/WorkerDeployment/0.4.0/";
+const resourceAt = (
+  uid: string,
+  name: string,
+  form: string,
+  spec: ResourceSummary["spec"],
+): ResourceSummary => ({
+  ...one,
+  uid,
+  name,
+  form,
+  generation: 3,
+  observedGeneration: 3,
+  observedAt: "2026-10-07T00:00:00Z",
+  phase: "idle" as const,
+  spec,
+});
+const helloV2 = resourceAt("uid-version", "hello-v2", versionForm, {
+  worker: { resourceUid: "uid-worker" },
+  handlers: ["fetch"],
+});
+
+/** A WorkerVersion's page against a Host whose Deployments are `deployments`. */
+async function versionPage(deployments: ResourceSummary[]) {
+  const { body } = await setup("/resources/uid-version");
+  const { resourceDetailPage } = await import("../console/src/pages/resource-detail.ts");
+  const writes: Request[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const url = new URL(request.url);
+      if (url.pathname === "/.well-known/takoform/v2") return Response.json(discovery);
+      if (url.pathname.endsWith("/support")) {
+        const asking = url.searchParams.get("form") ?? "";
+        return Response.json({ form: asking, supported: true, operations: ["create", "update"] });
+      }
+      if (request.method !== "GET") {
+        writes.push(request.clone());
+        return Response.json(op, { status: 202 });
+      }
+      if (url.pathname.endsWith("/resources/uid-version")) return Response.json(helloV2);
+      if (url.pathname.endsWith("/resources")) {
+        const items = url.searchParams.get("form") === deploymentForm ? deployments : [];
+        return Response.json({ items, nextCursor: null });
+      }
+      return Response.json({ error: { code: "not_found" } }, { status: 404 });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  body.append(resourceDetailPage("org-console", "uid-version") as unknown as TestNode);
+  await settle();
+  return { body, writes };
+}
+
+test("a WorkerVersion's page serves it by updating the Worker's Deployment", async () => {
+  const deployment = resourceAt("uid-deployment", "hello-deployment", deploymentForm, {
+    worker: { resourceUid: "uid-worker" },
+    versions: [{ workerVersion: { resourceUid: "uid-v1" }, weight: 10000 }],
+  });
+  const { body, writes } = await versionPage([deployment]);
+  button(body, "Serve this version").click();
+  await settle();
+  expect(body.textContent).toContain(
+    "This updates hello-deployment to serve only hello-v2, at weight 10000. Check it, then accept.",
+  );
+  // Nothing is sent until the person accepts the update.
+  expect(writes).toHaveLength(0);
+  button(body, "Accept update").click();
+  await settle();
+  expect(writes).toHaveLength(1);
+  const [update] = writes;
+  expect(update?.method).toBe("PUT");
+  expect(new URL(update?.url ?? "").pathname).toEndWith("/resources/uid-deployment");
+  expect(update?.headers.get("takoform-expected-generation")).toBe("3");
+  expect(JSON.parse(await (update as Request).text())).toEqual({
+    spec: {
+      worker: { resourceUid: "uid-worker" },
+      versions: [{ workerVersion: { resourceUid: "uid-version" }, weight: 10000 }],
+    },
+  });
+});
+
+test("a WorkerVersion already served alone says so instead of offering to serve it", async () => {
+  const deployment = resourceAt("uid-deployment", "hello-deployment", deploymentForm, {
+    worker: { resourceUid: "uid-worker" },
+    versions: [{ workerVersion: { resourceUid: "uid-version" }, weight: 10000 }],
+  });
+  const { body } = await versionPage([deployment]);
+  expect(body.textContent).toContain("Serving this version");
+  expect(
+    body.all().some((node) => node.tag === "button" && node.textContent === "Serve this version"),
+  ).toBe(false);
+});
+
+test("a Worker without a Deployment gets one to create for the version", async () => {
+  const { body, writes } = await versionPage([]);
+  button(body, "Serve this version").click();
+  await settle();
+  expect(body.textContent).toContain("This Worker has no Deployment yet.");
+  const [form] = body.all().filter((node) => node.tag === "select");
+  expect(form?.value).toBe(deploymentForm);
+  const spec = body.all().find((node) => node.tag === "textarea");
+  expect(JSON.parse(spec?.value ?? "{}")).toEqual({
+    worker: { resourceUid: "uid-worker" },
+    versions: [{ workerVersion: { resourceUid: "uid-version" }, weight: 10000 }],
+  });
+  expect(writes).toHaveLength(0);
+});
+
 test("create falls back to the exact URL field when the Host answers no Form", async () => {
   const { body } = await setup();
   const { createResource } = await import("../console/src/pages/create-resource.ts");

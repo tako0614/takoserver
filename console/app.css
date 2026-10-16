@@ -1428,3 +1428,9 @@ tbody tr.is-clickable:hover {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* A spec path breaks where pathLabel offers a break, and inside a name only
+   when one part alone is too long for the column. */
+.path-label {
+  overflow-wrap: break-word;
+}
