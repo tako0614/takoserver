@@ -611,6 +611,175 @@ test("an artifact Form's starter says where its url and sha256 come from", async
   expect(body.textContent).not.toContain("url and sha256 are the artifact");
 });
 
+const versionForm = "https://edge.forms.takoform.com/forms/WorkerVersion/0.5.0/";
+const deploymentForm = "https://edge.forms.takoform.com/forms/WorkerDeployment/0.4.0/";
+const resourceAt = (
+  uid: string,
+  name: string,
+  form: string,
+  spec: ResourceSummary["spec"],
+): ResourceSummary => ({
+  ...one,
+  uid,
+  name,
+  form,
+  generation: 3,
+  observedGeneration: 3,
+  observedAt: "2026-10-07T00:00:00Z",
+  phase: "idle" as const,
+  spec,
+});
+const helloV2: ResourceSummary = {
+  ...resourceAt("uid-version", "hello-v2", versionForm, {
+    worker: { resourceUid: "uid-worker" },
+    handlers: ["fetch"],
+  }),
+  observed: { ready: true },
+};
+/** A Deployment of uid-worker as the Host returns it: keys sorted, as canonical JSON stores them. */
+const deploymentOf = (
+  versions: ResourceSummary["spec"][],
+  change: Partial<ResourceSummary> = {},
+) => ({
+  ...resourceAt("uid-deployment", "hello-deployment", deploymentForm, {
+    versions,
+    worker: { resourceUid: "uid-worker" },
+  }),
+  ...change,
+});
+
+/** A WorkerVersion's page against a Host whose Deployments are `deployments`. */
+async function versionPage(deployments: ResourceSummary[], version: ResourceSummary = helloV2) {
+  const { body } = await setup("/resources/uid-version");
+  const { resourceDetailPage } = await import("../console/src/pages/resource-detail.ts");
+  const writes: Request[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const url = new URL(request.url);
+      if (url.pathname === "/.well-known/takoform/v2") return Response.json(discovery);
+      if (url.pathname.endsWith("/support")) {
+        const asking = url.searchParams.get("form") ?? "";
+        return Response.json({ form: asking, supported: true, operations: ["create", "update"] });
+      }
+      if (request.method !== "GET") {
+        writes.push(request.clone());
+        return Response.json(op, { status: 202 });
+      }
+      if (url.pathname.endsWith("/resources/uid-version")) return Response.json(version);
+      if (url.pathname.endsWith("/resources")) {
+        const items = url.searchParams.get("form") === deploymentForm ? deployments : [];
+        return Response.json({ items, nextCursor: null });
+      }
+      return Response.json({ error: { code: "not_found" } }, { status: 404 });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  body.append(resourceDetailPage("org-console", "uid-version") as unknown as TestNode);
+  await settle();
+  return { body, writes };
+}
+
+test("a WorkerVersion's page serves it by updating the Worker's Deployment", async () => {
+  const deployment = deploymentOf([{ weight: 10000, workerVersion: { resourceUid: "uid-v1" } }]);
+  const { body, writes } = await versionPage([deployment]);
+  button(body, "Serve this version").click();
+  await settle();
+  expect(body.textContent).toContain(
+    "This updates hello-deployment to serve only hello-v2, at weight 10000. Check it, then accept.",
+  );
+  // Nothing is sent until the person accepts the update.
+  expect(writes).toHaveLength(0);
+  button(body, "Accept update").click();
+  await settle();
+  expect(writes).toHaveLength(1);
+  const [update] = writes;
+  expect(update?.method).toBe("PUT");
+  expect(new URL(update?.url ?? "").pathname).toEndWith("/resources/uid-deployment");
+  expect(update?.headers.get("takoform-expected-generation")).toBe("3");
+  expect(JSON.parse(await (update as Request).text())).toEqual({
+    spec: {
+      worker: { resourceUid: "uid-worker" },
+      versions: [{ workerVersion: { resourceUid: "uid-version" }, weight: 10000 }],
+    },
+  });
+});
+
+test("a version a Deployment already names alone reports how that change stands", async () => {
+  const only = [{ weight: 10000, workerVersion: { resourceUid: "uid-version" } }];
+  const served = await versionPage([deploymentOf(only)]);
+  expect(served.body.textContent).toContain("Serving this version: hello-deployment");
+  expect(
+    served.body
+      .all()
+      .some((node) => node.tag === "button" && node.textContent === "Serve this version"),
+  ).toBe(false);
+  // The spec names it, but the Host has not applied that yet, or failed to.
+  const pending = await versionPage([deploymentOf(only, { observedGeneration: 2 })]);
+  expect(pending.body.textContent).toContain("The Deployment is updating: hello-deployment");
+  expect(pending.body.textContent).not.toContain("Serving this version");
+  // As a real Host leaves them: a failed or deleting change raised the
+  // generation, and the Host never observed it.
+  const failed = await versionPage([
+    deploymentOf(only, { phase: "error", generation: 4, observedGeneration: 3 }),
+  ]);
+  expect(failed.body.textContent).toContain("The Deployment's update failed: hello-deployment");
+  const deleting = await versionPage([
+    deploymentOf(only, { phase: "deleting", generation: 4, observedGeneration: 3 }),
+  ]);
+  expect(deleting.body.textContent).toContain("The Deployment is being deleted: hello-deployment");
+  expect(deleting.body.textContent).not.toContain("Serving this version");
+  const unread = await versionPage([deploymentOf(only, { observedAt: null })]);
+  expect(unread.body.textContent).not.toContain("Serving this version");
+});
+
+test("serving one version says when it replaces a split", async () => {
+  const { body } = await versionPage([
+    deploymentOf([
+      { weight: 9000, workerVersion: { resourceUid: "uid-v1" } },
+      { weight: 1000, workerVersion: { resourceUid: "uid-version" } },
+    ]),
+  ]);
+  button(body, "Serve this version").click();
+  await settle();
+  expect(body.textContent).toContain(
+    "It serves 2 versions now; after this update it serves only hello-v2. This updates hello-deployment. Check it, then accept.",
+  );
+});
+
+test("a version that is not ready is not offered for serving", async () => {
+  const { body } = await versionPage([], { ...helloV2, observed: { ready: false } });
+  expect(body.textContent).toContain("This version can be served once it is Ready");
+  expect(
+    body.all().some((node) => node.tag === "button" && node.textContent === "Serve this version"),
+  ).toBe(false);
+});
+
+test("a Deployment serves one version only when its single entry is that version at 10000", async () => {
+  const { servesOnly } = await import("../console/src/pages/resource-detail.ts");
+  expect(servesOnly([{ weight: 10000, workerVersion: { resourceUid: "v" } }], "v")).toBe(true);
+  expect(servesOnly([{ workerVersion: { resourceUid: "v" }, weight: 10000 }], "v")).toBe(true);
+  expect(servesOnly([{ weight: 5000, workerVersion: { resourceUid: "v" } }], "v")).toBe(false);
+  expect(servesOnly([{ weight: 10000, workerVersion: { resourceUid: "w" } }], "v")).toBe(false);
+  expect(servesOnly([], "v")).toBe(false);
+  expect(servesOnly(undefined, "v")).toBe(false);
+});
+
+test("a Worker without a Deployment gets one to create for the version", async () => {
+  const { body, writes } = await versionPage([]);
+  button(body, "Serve this version").click();
+  await settle();
+  expect(body.textContent).toContain("This Worker has no Deployment yet.");
+  const [form] = body.all().filter((node) => node.tag === "select");
+  expect(form?.value).toBe(deploymentForm);
+  const spec = body.all().find((node) => node.tag === "textarea");
+  expect(JSON.parse(spec?.value ?? "{}")).toEqual({
+    worker: { resourceUid: "uid-worker" },
+    versions: [{ workerVersion: { resourceUid: "uid-version" }, weight: 10000 }],
+  });
+  expect(writes).toHaveLength(0);
+});
+
 test("create falls back to the exact URL field when the Host answers no Form", async () => {
   const { body } = await setup();
   const { createResource } = await import("../console/src/pages/create-resource.ts");

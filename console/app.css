@@ -1456,3 +1456,9 @@ tbody tr.is-clickable:hover {
   text-decoration: underline;
   text-underline-offset: 2px;
 }
+
+/* A spec path breaks where pathLabel offers a break, and inside a name only
+   when one part alone is too long for the column. */
+.path-label {
+  overflow-wrap: break-word;
+}
