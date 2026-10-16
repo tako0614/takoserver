@@ -2,10 +2,11 @@
 
 Takoserver is an open-source cloud you run on your own machine. You deploy
 Workers and their SQLite databases, KV namespaces, object buckets and queues to
-it with [Takoform](https://takoform.com), by exact Form URL over Host API v2, and
-it serves each Worker at an HTTPS hostname. No released Takoform client speaks
-Host API v2 yet (the OpenTofu provider, `terraform-provider-takoform` 4.1.0, is
-v1-only), so today you deploy with HTTP requests or in the console.
+it from [Takoform](https://takoform.com) definitions, by exact Form URL over
+Host API v2, and it serves each Worker at an HTTPS hostname. No released
+Takoform client speaks Host API v2 yet (the OpenTofu provider,
+`terraform-provider-takoform` 4.1.0, is v1-only), so today you deploy with HTTP
+requests or in the console.
 
 An organization owns its Resources. Its API keys, each with read or write
 permission, manage them over the API. A separately served console does the same

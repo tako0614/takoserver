@@ -94,7 +94,9 @@ as `KEY` and `ORG`; keep it open between steps.
   - The pinned closed-graph `workerd` artifact. The GitHub pre-release
     [Takoserver 2.0.0-rc.1](https://github.com/tako0614/takoserver/releases/tag/v2.0.0-rc.1)
     attaches it, with `SHA256SUMS` and the notices bundle; 1.0.0, the release
-    marked Latest, does not. As root, in an empty directory:
+    marked Latest, does not. Its `workerd` is the build main still pins (the
+    digest below), so it is the right one for this guide. As root, in an empty
+    directory:
 
     ```sh
     base=https://github.com/tako0614/takoserver/releases/download/v2.0.0-rc.1
@@ -102,9 +104,9 @@ as `KEY` and `ORG`; keep it open between steps.
       workerd-closed-graph-2026-08-11-notices.tar.gz SHA256SUMS; do
       curl -fsSLO "$base/$file"
     done
-    sha256sum --check SHA256SUMS
-    install -m 0755 -o root -g root workerd-closed-graph-2026-08-11-linux-x64 \
-      /usr/local/libexec/takoserver/workerd-c00638f195e4a9fda4bafb07bb7b1674e4d8324d0072efbf0ea57beb0ff08e52
+    sha256sum --check SHA256SUMS &&
+      install -m 0755 -o root -g root workerd-closed-graph-2026-08-11-linux-x64 \
+        /usr/local/libexec/takoserver/workerd-c00638f195e4a9fda4bafb07bb7b1674e4d8324d0072efbf0ea57beb0ff08e52
     ```
 
     [What an operator verifies](release-assets.md#what-an-operator-verifies)

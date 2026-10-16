@@ -102,7 +102,7 @@ describe("Takoserver public site", () => {
       "the pinned workerd attached to the 2.0.0-rc.1 pre-release, checked against its SHA256SUMS",
     );
     expect(html).toContain("the Workflow execution guard, a small Go program");
-    // The site describes main; the only release is older than the docs it links.
+    // The site describes main; the release that carries workerd is older than the docs it links.
     expect(html).toContain(
       "Check out a reviewed commit of main, which the install guide describes",
     );
