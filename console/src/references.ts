@@ -90,7 +90,7 @@ export interface ServedWorker {
 }
 
 const FORM_KIND = (kind: string) => new RegExp(`/forms/${kind}/[^/]+/$`, "u");
-const MODULE_WORKER = FORM_KIND("ModuleWorker");
+export const MODULE_WORKER = FORM_KIND("ModuleWorker");
 const WORKER_DEPLOYMENT = FORM_KIND("WorkerDeployment");
 export const WORKER_ENDPOINT = FORM_KIND("WorkerEndpoint");
 

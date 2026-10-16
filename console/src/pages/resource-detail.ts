@@ -5,8 +5,8 @@ import { valueAt, WORKER_DEPLOYMENT, WORKER_VERSION } from "../form-specs.ts";
 import { formLabel } from "../forms.ts";
 import { tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
-import { publishedUrl, type SpecReference, specReferences } from "../references.ts";
-import { health, phaseLabel } from "../resource-state.ts";
+import { MODULE_WORKER, publishedUrl, type SpecReference, specReferences } from "../references.ts";
+import { health, phaseLabel, unrecordedDeployment } from "../resource-state.ts";
 import { linkProps, resourcePath, route } from "../router.ts";
 import { api, currentOrganization } from "../state.ts";
 import { badge, card, copyable, empty, ICON, icon, jsonBlock, whenReady } from "../ui.ts";
@@ -56,11 +56,21 @@ export async function findReferrers(
 
 /** The v2 address is the durable UID, never a reconstructed kind/name tuple. */
 export function resourceDetailPage(organizationId: string, uid: string): Child {
-  // Made once per page, so a re-render does not look the Deployment up again.
-  let serve: Child | undefined;
-  const serveAction = (found: ResourceSummary): Child => {
-    serve ??= found.form === WORKER_VERSION ? serveVersionAction(organizationId, found) : null;
-    return serve;
+  // Made once per read of the Resource: a re-render does not look the
+  // Deployment up again, and Reload reads both afresh.
+  let worker: { readonly for: ResourceSummary; readonly action: WorkerAction } | undefined;
+  const workerAction = (found: ResourceSummary): WorkerAction => {
+    if (worker?.for !== found)
+      worker = {
+        for: found,
+        action:
+          found.form === WORKER_VERSION
+            ? { toolbar: serveVersionAction(organizationId, found), notice: null }
+            : MODULE_WORKER.test(found.form)
+              ? { toolbar: null, notice: recordDeploymentNotice(organizationId, found) }
+              : { toolbar: null, notice: null },
+      };
+    return worker.action;
   };
   const isCurrent = (): boolean =>
     currentOrganization()?.id === organizationId &&
@@ -86,7 +96,7 @@ export function resourceDetailPage(organizationId: string, uid: string): Child {
         (found) => {
           if (!isCurrent()) return null;
           return found
-            ? body(found, organizationId, page.reload, serveAction(found))
+            ? body(found, organizationId, page.reload, workerAction(found))
             : card(
                 null,
                 empty(
@@ -109,11 +119,17 @@ export function resourceDetailPage(organizationId: string, uid: string): Child {
   );
 }
 
+/** What a Worker's page adds: a step beside Reload, or a notice under the heading. */
+interface WorkerAction {
+  readonly toolbar: Child;
+  readonly notice: Child;
+}
+
 function body(
   found: ResourceSummary,
   organizationId: string,
   reload: () => void,
-  serve: Child,
+  action: WorkerAction,
 ): Child {
   const state = health(found);
   const url = publishedUrl(found.output);
@@ -181,7 +197,7 @@ function body(
       h(
         "div",
         { class: "toolbar" },
-        serve,
+        action.toolbar,
         h(
           "button",
           { class: "btn", type: "button", onClick: reload },
@@ -214,13 +230,7 @@ function body(
           ),
         )
       : null,
-    state.phase === "NotReady"
-      ? h(
-          "div",
-          { class: "notice notice--warn" },
-          tr("最新の観測でReadyではありません。", "The latest observation reports not ready."),
-        )
-      : null,
+    state.phase === "NotReady" ? (action.notice ?? notReadyNotice()) : null,
     references.length > 0 ? referencesCard(organizationId, references) : null,
     referrersCard(organizationId, found.uid),
     card(
@@ -290,6 +300,63 @@ async function deploymentOf(
     if (cursor === null) return null;
   }
   return null;
+}
+
+function notReadyNotice(): Child {
+  return h(
+    "div",
+    { class: "notice notice--warn" },
+    tr("最新の観測でReadyではありません。", "The latest observation reports not ready."),
+  );
+}
+
+/**
+ * On the page of a ModuleWorker that reports not ready: when its Deployment
+ * serves it but the Worker has not recorded that, say so and offer the
+ * same-spec update that records it. Nothing is sent until the person accepts.
+ */
+function recordDeploymentNotice(organizationId: string, worker: ResourceSummary): Child {
+  if (health(worker).phase !== "NotReady") return null;
+  const served = resource(() => deploymentOf(organizationId, worker.uid));
+  return live(() => {
+    const state = served.get();
+    const deployment = state.state === "ready" ? state.value : null;
+    if (!unrecordedDeployment(worker, deployment)) return notReadyNotice();
+    const link = h("a", { ...linkProps(resourcePath(deployment.uid)) }, deployment.name);
+    return h(
+      "div",
+      {
+        class: "notice notice--warn",
+        style: { display: "grid", gap: "10px", justifyItems: "start" },
+      },
+      h(
+        "span",
+        null,
+        tr("このWorkerは、配信", "This Worker was observed before "),
+        link,
+        tr(
+          "が稼働する前に観測されたため、その配信を記録していません。記録するまでは非稼働と報告され、WorkerCronTriggerによる実行も行われません。同じ設定で更新すると記録されます。",
+          " served it, so it has not recorded that Deployment. Until it does, the Host reports it NotReady and a WorkerCronTrigger does not run it. Updating it with the same spec records it.",
+        ),
+      ),
+      h(
+        "button",
+        {
+          class: "btn",
+          type: "button",
+          onClick: () =>
+            updateResource(organizationId, worker, {
+              spec: worker.spec,
+              note: tr(
+                `${worker.name}を同じ設定のまま更新し、稼働中の配信${deployment.name}を記録します。内容を確認して受け付けてください。`,
+                `This updates ${worker.name} with the same spec, so that it records ${deployment.name}. Check it, then accept.`,
+              ),
+            }),
+        },
+        tr("配信を記録する", "Record the Deployment"),
+      ),
+    );
+  });
 }
 
 /** Whether a Deployment's versions are exactly this one version at weight 10000. */

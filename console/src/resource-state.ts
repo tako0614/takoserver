@@ -1,7 +1,7 @@
 import type { ResourceSummary } from "./api.ts";
 import { formName } from "./forms.ts";
 import { tr } from "./i18n.ts";
-import { WORKER_ENDPOINT } from "./references.ts";
+import { MODULE_WORKER, WORKER_ENDPOINT } from "./references.ts";
 
 /** Display only states the v2 Resource actually reports. */
 export type Phase =
@@ -59,6 +59,28 @@ export function health(resource: ResourceSummary): Health {
     return { phase: "Applied", tone: "ok", reason: null, message: null, stale };
   }
   return { phase: "Unknown", tone: "idle", reason: null, message: null, stale };
+}
+
+/**
+ * Whether a ModuleWorker has not recorded the Deployment that serves it. The
+ * Host writes a Worker's observation only when the Worker's own operation
+ * settles, so a Worker created before its Deployment keeps reporting not
+ * ready, and keeps no active Deployment for WorkerCronTrigger to run, until
+ * it is updated with the same spec.
+ */
+export function unrecordedDeployment(
+  worker: ResourceSummary,
+  deployment: ResourceSummary | null | undefined,
+): deployment is ResourceSummary {
+  return (
+    MODULE_WORKER.test(worker.form) &&
+    deployment !== null &&
+    deployment !== undefined &&
+    health(worker).phase === "NotReady" &&
+    health(deployment).phase === "Ready" &&
+    deployment.observed.active === true &&
+    worker.observed.activeDeploymentUid !== deployment.uid
+  );
 }
 
 export function phaseLabel(phase: Phase): string {
