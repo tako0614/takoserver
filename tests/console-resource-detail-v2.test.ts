@@ -285,13 +285,12 @@ test("overview counts only what it read and offers the first create", async () =
   };
 
   const partial = await render({ items: [item], nextCursor: "next" });
-  expect(partial.textContent).toContain("1+");
+  expect(partial.textContent).toContain("Resources 1+");
   expect(partial.textContent).toContain("first page only");
-  expect(partial.textContent).toContain("By Form (first page)");
 
   const complete = await render({ items: [item], nextCursor: null });
   expect(complete.textContent).toContain("none failed or not ready");
-  expect(complete.textContent).toContain("By Form");
+  expect(complete.textContent).toContain("Resources 1");
   expect(complete.textContent).not.toContain("first page");
   expect(complete.textContent).not.toContain("invalid");
 
@@ -313,7 +312,6 @@ test("overview counts only what it read and offers the first create", async () =
   expect(failing.textContent).toContain("1+ need attention");
 
   const none = await render({ items: [], nextCursor: null });
-  expect(none.textContent).toContain("none yet");
   expect(none.textContent).toContain("Nothing declared yet");
   // A new organization is told how a Worker comes to be served, not to ask for a URL.
   // Until the Host says whether it runs Workers, the steps are qualified.

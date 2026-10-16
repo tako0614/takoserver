@@ -1212,6 +1212,12 @@ tbody tr.is-clickable:hover {
     grid-template-columns: 1fr;
     gap: 3px;
   }
+
+  /* A name and its count stay on one line. */
+  .rows--counts .row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 14px;
+  }
 }
 
 /* --------------------------------------------------------------- signin -- */
@@ -1427,4 +1433,26 @@ tbody tr.is-clickable:hover {
 .request-details pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+/* The overview's wallet: one line after what was deployed, never a headline. */
+.wallet-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 18px;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+
+.wallet-line__label {
+  color: var(--ink-3);
+  font-weight: 550;
+}
+
+.wallet-line a {
+  margin-left: auto;
+  color: var(--ink-2);
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
