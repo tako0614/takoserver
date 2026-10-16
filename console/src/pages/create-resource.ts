@@ -433,6 +433,11 @@ export function createResource(organizationId: string): void {
   let starter: StarterSpec | null = null;
   let untouched = "{}";
   let chosen = "";
+  // The starter's own empty places that the spec still leaves empty.
+  const remainingBlanks = (parsed: Record<string, unknown> | null): (string | number)[][] =>
+    starter && parsed
+      ? blankPaths(starter.spec).filter((path) => valueAt(parsed, path) === "")
+      : [];
   // Console-written text, sized so the whole starter shows without scrolling.
   const write = (text: string): void => {
     spec.value = text;
@@ -454,7 +459,7 @@ export function createResource(organizationId: string): void {
     const label = formLabel(chosen);
     if (spec.value !== untouched) {
       specHint.replaceChildren(
-        blankPaths(jsonSpec(spec.value)).length > 0
+        remainingBlanks(jsonSpec(spec.value)).length > 0
           ? tr(
               "入力した設定を使います。空の値を埋めてください。",
               "Your spec is kept. Fill in the empty values.",
@@ -475,7 +480,7 @@ export function createResource(organizationId: string): void {
             `${label}は空の設定 {} で作成できます。`,
             `${label} is created with an empty spec, {}.`,
           )
-        : blankPaths(jsonSpec(spec.value)).length > 0
+        : remainingBlanks(jsonSpec(spec.value)).length > 0
           ? tr(
               `${label}が受け付ける最小の設定です。空の値を埋めてください。`,
               `The smallest spec ${label} accepts. Fill in the empty values.`,
@@ -592,9 +597,7 @@ export function createResource(organizationId: string): void {
           return;
         }
         // A starter's empty values are the ones the Host would refuse; say which.
-        const blanks = starter
-          ? blankPaths(starter.spec).filter((path) => valueAt(parsed, path) === "")
-          : [];
+        const blanks = remainingBlanks(parsed);
         if (blanks.length > 0) {
           toast(
             tr(
