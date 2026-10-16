@@ -518,7 +518,7 @@ test("names each referenced Resource where the spec names it", async () => {
     { path: "worker", uid: "uid-worker" },
     { path: "bundle", uid: "uid-bundle" },
     { path: "sqliteBindings · DB", uid: "uid-db" },
-    { path: "versions[0] · workerVersion", uid: "uid-version" },
+    { path: "versions[0].workerVersion", uid: "uid-version" },
   ]);
   expect(specReferences({})).toEqual([]);
   expect(publishedUrl({ hostname: "hello.example.com", url: "https://hello.example.com/" })).toBe(
@@ -688,9 +688,22 @@ test("a Worker's page lists what names it, with the address an Endpoint publishe
   expect(text).not.toMatch(/first \d+ checked/);
   expect(text).toContain("hello-version-v1");
   expect(text).toContain("hello-endpoint");
-  expect(text).toContain("as worker");
+  // Each referrer is labelled by the place in its spec that names this one.
+  expect(text).toContain("workerhello-version-v1");
+  expect(text).not.toContain("as worker");
   expect(text).not.toContain("notes");
+  // The heading names the Form as the list does and links its published contract;
+  // the Identity card keeps the exact URL to copy.
   const links = body.all().filter((node) => node.tag === "a");
+  const contract = links.find((node) => node.textContent.startsWith("ModuleWorker 0.3.0"));
+  expect(contract?.attributes.get("href")).toBe(
+    "https://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/",
+  );
+  expect(contract?.attributes.get("target")).toBe("_blank");
+  expect(contract?.attributes.get("rel")).toBe("noopener noreferrer");
+  expect(text).toContain("Formhttps://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/");
+  // The Host's phase reads as words, with the API's own value beside it.
+  expect(text).toContain("Host workNone (settled) · idle");
   expect(links.find((node) => node.textContent === "hello-endpoint")?.attributes.get("href")).toBe(
     "/resources/uid-endpoint",
   );
@@ -847,4 +860,21 @@ test("the overview shows each Worker with its state and address", async () => {
   ).toBe(false);
   expect(body.textContent).toContain("https://draft.apps.example.com/");
   expect(body.textContent).toContain("Pending");
+});
+
+test("says what the Host is doing for each v2 phase, and never calls an unknown one settled", async () => {
+  installDom();
+  const { HOST_WORK, hostWork } = await import("../console/src/pages/resource-detail.ts");
+  expect(HOST_WORK).toEqual({
+    pending: ["処理中", "In progress"],
+    deleting: ["削除中", "Deleting"],
+    error: ["失敗", "Failed"],
+    idle: ["なし（完了）", "None (settled)"],
+  });
+  // The four phases the v2 API reports, and nothing else, have words.
+  expect(Object.keys(HOST_WORK).sort()).toEqual(["deleting", "error", "idle", "pending"]);
+  // A known phase reads in the console's language, whichever it is.
+  expect(HOST_WORK.pending).toContain(hostWork("pending"));
+  expect(hostWork("migrating")).toBe("migrating");
+  expect(hostWork("constructor")).toBe("constructor");
 });
