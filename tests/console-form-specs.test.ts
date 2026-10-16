@@ -92,6 +92,7 @@ function filled(spec: Record<string, unknown>, references: readonly ReferenceSlo
       sha256: "a".repeat(64),
     };
   if ("className" in next) next.className = "ExampleClass";
+  if ("cron" in next) next.cron = "*/5 * * * *";
   return next;
 }
 

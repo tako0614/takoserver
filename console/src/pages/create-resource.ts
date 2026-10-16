@@ -332,15 +332,9 @@ function referencePicker(
           "option",
           { value: "" },
           answer === null
-            ? tr(
-                "一覧を読み込めませんでした（UIDを直接入力できます）",
-                "Couldn't list them (type the UID instead)",
-              )
+            ? tr("読み込めませんでした", "Couldn't load")
             : answer.items.length === 0
-              ? tr(
-                  `${formLabel(slot.form)}のリソースはまだありません`,
-                  `No ${formLabel(slot.form)} Resources yet`,
-                )
+              ? tr("まだありません", "None yet")
               : tr("リソースを選んでください", "Choose a Resource"),
         ),
         ...(answer?.items ?? []).map((item) => h("option", { value: item.uid }, item.name)),
@@ -350,7 +344,7 @@ function referencePicker(
           h(
             "option",
             { value: "", disabled: true },
-            tr("ほかのリソースはUIDを直接入力してください", "For others, type the UID"),
+            tr("ほかはUIDを直接書いてください", "Others: write the UID"),
           ),
         );
       offered.push(...(answer?.items ?? []).map((item) => item.uid));
@@ -394,9 +388,17 @@ function referencePicker(
   return {
     element: h(
       "div",
-      { style: { display: "grid", gap: "10px" } },
+      { class: "field", style: { gap: "10px" } },
       h("span", { class: "field__label" }, tr("参照先", "References")),
       ...selects.map(({ element }) => element),
+      h(
+        "small",
+        null,
+        tr(
+          "選ぶと、そのリソースのUIDが設定に入ります。一覧にないリソースは、UIDを設定に直接書けます。",
+          "Choosing one writes its UID into the spec. For a Resource not listed, write its UID there yourself.",
+        ),
+      ),
     ),
     sync,
     setDisabled(disabled) {
@@ -434,7 +436,7 @@ export function createResource(organizationId: string): void {
   // Console-written text, sized so the whole starter shows without scrolling.
   const write = (text: string): void => {
     spec.value = text;
-    spec.rows = Math.min(16, text.split("\n").length + 1);
+    spec.rows = Math.min(12, text.split("\n").length + 1);
     untouched = text;
   };
   const useStarter = (): void => {
@@ -452,17 +454,27 @@ export function createResource(organizationId: string): void {
     const label = formLabel(chosen);
     if (spec.value !== untouched) {
       specHint.replaceChildren(
+        blankPaths(jsonSpec(spec.value)).length > 0
+          ? tr(
+              "入力した設定を使います。空の値を埋めてください。",
+              "Your spec is kept. Fill in the empty values.",
+            )
+          : tr("入力した設定を使います。", "Your spec is kept."),
+        " ",
         h(
           "button",
           { class: "btn btn--sm", type: "button", onClick: useStarter },
-          tr(`${label}の最小の設定を入れる`, `Use the smallest ${label} spec`),
+          tr(`${label}の最小の設定で置き換える`, `Replace with the smallest ${label} spec`),
         ),
       );
       return;
     }
     specHint.replaceChildren(
       Object.keys(starter.spec).length === 0
-        ? tr(`${label}の設定は空のオブジェクトです。`, `${label} takes an empty spec.`)
+        ? tr(
+            `${label}は空の設定 {} で作成できます。`,
+            `${label} is created with an empty spec, {}.`,
+          )
         : blankPaths(jsonSpec(spec.value)).length > 0
           ? tr(
               `${label}が受け付ける最小の設定です。空の値を埋めてください。`,
@@ -477,8 +489,22 @@ export function createResource(organizationId: string): void {
     const selected = form.value();
     if (selected === chosen) return;
     chosen = selected;
+    const previous = starter;
     starter = selected ? starterSpec(selected) : null;
-    if (spec.value === untouched) write(starter ? JSON.stringify(starter.spec, null, 2) : "{}");
+    if (spec.value === untouched) {
+      // A Resource already chosen for the same place and Form carries over.
+      const before = jsonSpec(spec.value);
+      let next: Record<string, unknown> = starter?.spec ?? {};
+      for (const slot of starter?.references ?? []) {
+        const carried = before ? valueAt(before, slot.path) : undefined;
+        const same = previous?.references.some(
+          (old) => old.form === slot.form && pathLabel(old.path) === pathLabel(slot.path),
+        );
+        if (same && typeof carried === "string" && carried !== "")
+          next = withValueAt(next, slot.path, carried) ?? next;
+      }
+      write(JSON.stringify(next, null, 2));
+    }
     picker =
       starter && starter.references.length > 0
         ? referencePicker(organizationId, starter.references, spec, (text) => {
@@ -539,6 +565,7 @@ export function createResource(organizationId: string): void {
         h("label", null, tr("スペース", "Space")),
         h("span", { class: "field__value" }, organizationId),
       ),
+      references,
       h(
         "div",
         { class: "field" },
@@ -546,7 +573,6 @@ export function createResource(organizationId: string): void {
         spec,
         specHint,
       ),
-      references,
       requestDisclosure(details),
     ),
     onConfirm: async () => {

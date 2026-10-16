@@ -718,7 +718,7 @@ export function createApi(options: ApiOptions) {
               (item) =>
                 isV2Resource(item) &&
                 item.space === organizationId &&
-                (query.form === undefined || item.form === query.form),
+                (!query.form || item.form === query.form),
             ) ||
             (payload.nextCursor !== null && typeof payload.nextCursor !== "string")
           ) {

@@ -417,6 +417,161 @@ test("create starts from the chosen Form's smallest spec and fills references by
   });
 });
 
+const edgeForms = "https://edge.forms.takoform.com/forms";
+const listedAs = (uid: string, name: string, kind: string): ResourceSummary => ({
+  ...one,
+  uid,
+  name,
+  form: `${edgeForms}/${kind}/`,
+});
+
+test("an edited spec is never overwritten; only the replace button writes a starter", async () => {
+  const { body } = await setup();
+  const { createResource } = await import("../console/src/pages/create-resource.ts");
+  const answers: Array<() => void> = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const url = new URL(request.url);
+      if (url.pathname.endsWith("/support")) {
+        const asking = url.searchParams.get("form") ?? "";
+        // Support answers arrive only when the test releases them.
+        await new Promise<void>((resolve) => answers.push(resolve));
+        return Response.json({ form: asking, supported: true, operations: ["create"] });
+      }
+      if (url.pathname.endsWith("/resources")) {
+        const wanted = url.searchParams.get("form");
+        const items =
+          wanted === `${edgeForms}/ModuleWorker/0.3.0/`
+            ? [listedAs("uid-worker", "hello", "ModuleWorker/0.3.0")]
+            : [];
+        return Response.json({ items, nextCursor: null });
+      }
+      return Response.json(discovery);
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  createResource("org-console");
+  const [select] = body.all().filter((node) => node.tag === "select");
+  const spec = body.all().find((node) => node.tag === "textarea");
+  if (!select || !spec) throw new Error("create dialog incomplete");
+  // Chosen before the Host has answered about any Form.
+  select.value = `${edgeForms}/QueueConsumer/0.3.0/`;
+  select.emit("change");
+  await settle();
+  expect(JSON.parse(spec.value).maxBatchSize).toBe(10);
+  // A chosen Resource is carried to the next Form's same place.
+  const worker = body.all().filter((node) => node.tag === "select")[2];
+  if (!worker) throw new Error("worker choice missing");
+  worker.value = "uid-worker";
+  worker.emit("change");
+  select.value = `${edgeForms}/WorkerEndpoint/0.3.0/`;
+  select.emit("change");
+  await settle();
+  expect(JSON.parse(spec.value)).toEqual({ worker: { resourceUid: "uid-worker" } });
+  // Typed into, the spec belongs to the person.
+  spec.value = '{ "worker": { "resourceUid": "typed-by-hand" } }';
+  spec.emit("input");
+  for (const answer of answers.splice(0)) answer();
+  await settle();
+  expect(spec.value).toBe('{ "worker": { "resourceUid": "typed-by-hand" } }');
+  select.value = `${edgeForms}/ActorNamespace/0.3.0/`;
+  select.emit("change");
+  await settle();
+  expect(spec.value).toBe('{ "worker": { "resourceUid": "typed-by-hand" } }');
+  expect(body.textContent).toContain("Your spec is kept.");
+  button(body, "Replace with the smallest ActorNamespace 0.3.0 spec").click();
+  expect(JSON.parse(spec.value)).toEqual({ worker: { resourceUid: "" }, className: "" });
+  expect(body.textContent).toContain("Fill in the empty values.");
+  // An exact URL typed by hand gets its starter too, once the spec is the Console's again.
+  select.value = "other";
+  select.emit("change");
+  const url = body.all().find((node) => node.tag === "input");
+  if (!url) throw new Error("URL field missing");
+  url.value = `${edgeForms}/WorkerCronTrigger/0.3.0/`;
+  url.emit("input");
+  expect(JSON.parse(spec.value)).toEqual({ worker: { resourceUid: "" }, cron: "" });
+});
+
+test("reference choices say when a list failed, is empty or goes on, and lock while sending", async () => {
+  const { body } = await setup();
+  const { createResource } = await import("../console/src/pages/create-resource.ts");
+  const consumer = `${edgeForms}/QueueConsumer/0.3.0/`;
+  let supportAsked = 0;
+  let lockedWhileAsking: boolean[] = [];
+  let choices: TestNode[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const url = new URL(request.url);
+      if (url.pathname.endsWith("/support")) {
+        const asking = url.searchParams.get("form") ?? "";
+        if (asking === consumer) supportAsked += 1;
+        // The create's own check finds the Form gone from this Host.
+        const supported = !(asking === consumer && supportAsked > 1);
+        if (asking === consumer && supportAsked > 1)
+          lockedWhileAsking = choices.map((node) => node.disabled);
+        return Response.json({ form: asking, supported, operations: supported ? ["create"] : [] });
+      }
+      if (url.pathname.endsWith("/resources")) {
+        const wanted = url.searchParams.get("form");
+        if (wanted === `${edgeForms}/WorkerVersion/0.5.0/`)
+          return Response.json({ error: { code: "unavailable" } }, { status: 503 });
+        if (wanted === `${edgeForms}/AtLeastOnceQueue/0.2.0/`)
+          return Response.json({
+            items: [listedAs("uid-queue", "jobs", "AtLeastOnceQueue/0.2.0")],
+            nextCursor: "more",
+          });
+        if (wanted === `${edgeForms}/ModuleWorker/0.3.0/`)
+          return Response.json({
+            items: [listedAs("uid-worker", "hello", "ModuleWorker/0.3.0")],
+            nextCursor: null,
+          });
+        return Response.json({ items: [], nextCursor: null });
+      }
+      return Response.json(discovery);
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  createResource("org-console");
+  await settle();
+  const [select] = body.all().filter((node) => node.tag === "select");
+  const name = body.all().filter((node) => node.tag === "input")[1];
+  if (!select || !name) throw new Error("create dialog incomplete");
+  select.value = `${edgeForms}/SQLiteMigrationApplication/0.2.0/`;
+  select.emit("change");
+  await settle();
+  const [, database] = body.all().filter((node) => node.tag === "select");
+  expect(database?.textContent).toContain("None yet");
+  expect(database?.disabled).toBe(true);
+  select.value = `${edgeForms}/WorkerDeployment/0.4.0/`;
+  select.emit("change");
+  await settle();
+  const version = body.all().filter((node) => node.tag === "select")[2];
+  expect(version?.textContent).toContain("Couldn't load");
+  expect(version?.disabled).toBe(true);
+  select.value = consumer;
+  select.emit("change");
+  await settle();
+  choices = body
+    .all()
+    .filter((node) => node.tag === "select")
+    .slice(1);
+  const [queue, worker] = choices;
+  if (!queue || !worker) throw new Error("consumer choices missing");
+  expect(queue.textContent).toContain("Others: write the UID");
+  queue.value = "uid-queue";
+  queue.emit("change");
+  worker.value = "uid-worker";
+  worker.emit("change");
+  name.value = "jobs-consumer";
+  button(body, "Accept create").click();
+  await settle();
+  expect(lockedWhileAsking).toEqual([true, true]);
+  expect(body.textContent).toContain("This Host does not support create for that exact Form");
+  expect(choices.map((node) => node.disabled)).toEqual([false, false]);
+});
+
 test("create falls back to the exact URL field when the Host answers no Form", async () => {
   const { body } = await setup();
   const { createResource } = await import("../console/src/pages/create-resource.ts");

@@ -63,7 +63,8 @@ const STARTERS: Readonly<Record<string, () => StarterSpec>> = {
       { path: ref("versions", 0, "workerVersion"), form: WORKER_VERSION },
     ],
   }),
-  [form("WorkerCronTrigger", "0.3.0")]: () => workerOnly({ cron: "*/5 * * * *" }),
+  // A schedule is the person's decision, so it is left for them to write.
+  [form("WorkerCronTrigger", "0.3.0")]: () => workerOnly({ cron: "" }),
   [form("WorkerEndpoint", "0.3.0")]: () => workerOnly(),
   [SQLITE_DATABASE]: empty,
   [form("SQLiteMigrationApplication", "0.2.0")]: () => ({
