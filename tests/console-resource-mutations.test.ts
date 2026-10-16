@@ -844,9 +844,18 @@ const deploymentOf = (
   ...change,
 });
 
-/** A WorkerVersion's page against a Host whose Deployments are `deployments`. */
-async function versionPage(deployments: ResourceSummary[], version: ResourceSummary = helloV2) {
-  const { body } = await setup("/resources/uid-version");
+/**
+ * A Resource's page against a Host whose Deployments are `deployments` and
+ * whose full list is `listed`. The Resource is read from `shown` on every
+ * request, so a test can change it between reads.
+ */
+async function detailPage(
+  shown: () => ResourceSummary,
+  deployments: ResourceSummary[],
+  listed: ResourceSummary[] = [],
+) {
+  const uid = shown().uid;
+  const { body } = await setup(`/resources/${uid}`);
   const { resourceDetailPage } = await import("../console/src/pages/resource-detail.ts");
   const writes: Request[] = [];
   globalThis.fetch = Object.assign(
@@ -862,19 +871,24 @@ async function versionPage(deployments: ResourceSummary[], version: ResourceSumm
         writes.push(request.clone());
         return Response.json(op, { status: 202 });
       }
-      if (url.pathname.endsWith("/resources/uid-version")) return Response.json(version);
+      if (url.pathname.endsWith(`/resources/${uid}`)) return Response.json(shown());
       if (url.pathname.endsWith("/resources")) {
-        const items = url.searchParams.get("form") === deploymentForm ? deployments : [];
+        const form = url.searchParams.get("form");
+        const items = form === deploymentForm ? deployments : form === null ? listed : [];
         return Response.json({ items, nextCursor: null });
       }
       return Response.json({ error: { code: "not_found" } }, { status: 404 });
     },
     { preconnect: globalThis.fetch.preconnect },
   );
-  body.append(resourceDetailPage("org-console", "uid-version") as unknown as TestNode);
+  body.append(resourceDetailPage("org-console", uid) as unknown as TestNode);
   await settle();
   return { body, writes };
 }
+
+/** A WorkerVersion's page against a Host whose Deployments are `deployments`. */
+const versionPage = (deployments: ResourceSummary[], version: ResourceSummary = helloV2) =>
+  detailPage(() => version, deployments);
 
 test("a WorkerVersion's page serves it by updating the Worker's Deployment", async () => {
   const deployment = deploymentOf([{ weight: 10000, workerVersion: { resourceUid: "uid-v1" } }]);
@@ -949,6 +963,196 @@ test("a version that is not ready is not offered for serving", async () => {
   expect(
     body.all().some((node) => node.tag === "button" && node.textContent === "Serve this version"),
   ).toBe(false);
+});
+
+test("Reload reads the version and its Deployment again", async () => {
+  let version: ResourceSummary = { ...helloV2, observed: { ready: false } };
+  const deployments = [deploymentOf([{ weight: 10000, workerVersion: { resourceUid: "uid-v1" } }])];
+  const { body } = await detailPage(() => version, deployments);
+  expect(body.textContent).toContain("This version can be served once it is Ready");
+  // The version became ready: Reload offers to serve it.
+  version = helloV2;
+  button(body, "Reload").click();
+  await settle();
+  expect(body.textContent).not.toContain("This version can be served once it is Ready");
+  button(body, "Serve this version");
+  // The Deployment now serves it: Reload says so instead.
+  deployments[0] = deploymentOf([{ weight: 10000, workerVersion: { resourceUid: "uid-version" } }]);
+  button(body, "Reload").click();
+  await settle();
+  expect(body.textContent).toContain("Serving this version: hello-deployment");
+});
+
+const moduleWorkerForm = "https://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/";
+/** hello as the Host leaves it when it was created before its Deployment. */
+const unrecordedWorker: ResourceSummary = {
+  ...resourceAt("uid-worker", "hello", moduleWorkerForm, {}),
+  observed: { activeDeploymentUid: null, ready: false },
+};
+const servingDeployment = deploymentOf(
+  [{ weight: 10000, workerVersion: { resourceUid: "uid-v1" } }],
+  {
+    observed: { active: true, ready: true },
+  },
+);
+/** hello's Endpoint, published: its route and its certificate are ready. */
+const publishedEndpoint: ResourceSummary = {
+  ...resourceAt(
+    "uid-endpoint",
+    "hello-endpoint",
+    "https://edge.forms.takoform.com/forms/WorkerEndpoint/0.3.0/",
+    { worker: { resourceUid: "uid-worker" } },
+  ),
+  observed: { activeDeploymentRouteReady: true, tlsReady: true },
+};
+
+test("a Worker that has not recorded the Deployment serving it offers to record it", async () => {
+  const { body, writes } = await detailPage(
+    () => unrecordedWorker,
+    [servingDeployment],
+    [servingDeployment, publishedEndpoint],
+  );
+  expect(body.textContent).toContain(
+    "This Worker has not recorded hello-deployment, which serves it: the Host records a Worker's Deployment only when the Worker itself is applied.",
+  );
+  expect(body.textContent).toContain(
+    "Until it does, the Host reports it NotReady, and a WorkerCronTrigger for it cannot finish being applied, so it never runs.",
+  );
+  expect(body.textContent).not.toContain("The latest observation reports not ready.");
+  button(body, "Record the Deployment").click();
+  await settle();
+  expect(body.textContent).toContain(
+    "This updates hello with the same spec, so that it records hello-deployment. Check it, then accept.",
+  );
+  expect(writes).toHaveLength(0);
+  button(body, "Accept update").click();
+  await settle();
+  const [update] = writes;
+  expect(update?.method).toBe("PUT");
+  expect(new URL(update?.url ?? "").pathname).toEndWith("/resources/uid-worker");
+  expect(update?.headers.get("takoform-expected-generation")).toBe("3");
+  expect(JSON.parse(await (update as Request).text())).toEqual({ spec: {} });
+});
+
+test("a Worker is offered to record a Deployment only when one serves it unrecorded", async () => {
+  // It already records the Deployment: nothing to say.
+  const recorded = await detailPage(
+    () => ({
+      ...unrecordedWorker,
+      observed: { activeDeploymentUid: "uid-deployment", ready: true },
+    }),
+    [servingDeployment],
+  );
+  expect(recorded.body.textContent).not.toContain("has not recorded");
+  // Its Deployment is not active, or not ready: the plain notice stays.
+  for (const deployment of [
+    deploymentOf([], { observed: { active: false, ready: true } }),
+    deploymentOf([], { observed: { active: true, ready: false } }),
+  ]) {
+    const { body } = await detailPage(() => unrecordedWorker, [deployment]);
+    expect(body.textContent).toContain("The latest observation reports not ready.");
+    expect(body.textContent).not.toContain("Record the Deployment");
+  }
+  // No Deployment at all.
+  const alone = await detailPage(() => unrecordedWorker, []);
+  expect(alone.body.textContent).toContain("The latest observation reports not ready.");
+  expect(alone.body.textContent).not.toContain("Record the Deployment");
+});
+
+test("the record update is offered only where the Host can finish it", async () => {
+  const offered = (body: TestNode) =>
+    body
+      .all()
+      .some((node) => node.tag === "button" && node.textContent === "Record the Deployment");
+  // An Endpoint that failed would keep the update reconciling and the Worker busy.
+  const failed = await detailPage(
+    () => unrecordedWorker,
+    [servingDeployment],
+    [servingDeployment, { ...publishedEndpoint, phase: "error", generation: 4 }],
+  );
+  expect(failed.body.textContent).toContain(
+    "Re-apply or delete hello-endpoint first. Until it is Ready, this update cannot finish, and it would hold the Worker busy meanwhile.",
+  );
+  expect(offered(failed.body)).toBe(false);
+  // Ready but without its certificate is not published either.
+  const noTls = await detailPage(
+    () => unrecordedWorker,
+    [servingDeployment],
+    [servingDeployment, { ...publishedEndpoint, observed: { activeDeploymentRouteReady: true } }],
+  );
+  expect(noTls.body.textContent).toContain("Re-apply or delete hello-endpoint first.");
+  expect(offered(noTls.body)).toBe(false);
+  // Anything naming the Worker still in progress: the Host would refuse it.
+  const pendingVersion = {
+    ...resourceAt("uid-v9", "hello-v9", versionForm, { worker: { resourceUid: "uid-worker" } }),
+    generation: 4,
+  };
+  const pending = await detailPage(
+    () => unrecordedWorker,
+    [servingDeployment],
+    [servingDeployment, publishedEndpoint, pendingVersion],
+  );
+  expect(pending.body.textContent).toContain(
+    "hello-v9 is in progress. Wait until it finishes: the Host refuses this update while anything that names the Worker is in progress.",
+  );
+  expect(offered(pending.body)).toBe(false);
+});
+
+test("a WorkerCronTrigger stuck on the Worker is not something to wait for", async () => {
+  const trigger = {
+    ...resourceAt(
+      "uid-cron",
+      "hello-cron",
+      "https://edge.forms.takoform.com/forms/WorkerCronTrigger/0.3.0/",
+      { worker: { resourceUid: "uid-worker" }, cron: "*/5 * * * *" },
+    ),
+    generation: 4,
+  };
+  const { body } = await detailPage(
+    () => unrecordedWorker,
+    [servingDeployment],
+    [servingDeployment, publishedEndpoint, trigger],
+  );
+  expect(body.textContent).toContain(
+    "hello-cron cannot finish until this Worker records hello-deployment, and the Host refuses that update while it is in progress. Neither can be resolved from the console; it needs a fix on the Host.",
+  );
+  expect(body.textContent).not.toContain("Wait until");
+  expect(
+    body
+      .all()
+      .some((node) => node.tag === "button" && node.textContent === "Record the Deployment"),
+  ).toBe(false);
+  // Its delete does not read the Worker, so that one is worth waiting for.
+  const deleting = await detailPage(
+    () => unrecordedWorker,
+    [servingDeployment],
+    [servingDeployment, publishedEndpoint, { ...trigger, phase: "deleting" }],
+  );
+  expect(deleting.body.textContent).toContain("hello-cron is in progress. Wait until it finishes");
+  expect(deleting.body.textContent).not.toContain("cannot finish until this Worker records");
+  expect(
+    deleting.body
+      .all()
+      .some((node) => node.tag === "button" && node.textContent === "Record the Deployment"),
+  ).toBe(false);
+});
+
+test("a Worker that still names an earlier Deployment is out of date too", async () => {
+  const { body } = await detailPage(
+    () => ({ ...unrecordedWorker, observed: { activeDeploymentUid: "uid-old", ready: true } }),
+    [servingDeployment],
+    [servingDeployment],
+  );
+  expect(body.textContent).toContain(
+    "This Worker has not recorded hello-deployment, which serves it",
+  );
+  // It reports Ready, so the notice does not say otherwise.
+  expect(body.textContent).toContain(
+    "Until it does, a WorkerCronTrigger for it cannot finish being applied, so it never runs.",
+  );
+  expect(body.textContent).not.toContain("reports it NotReady");
+  expect(body.textContent).not.toContain("The latest observation reports not ready.");
+  button(body, "Record the Deployment");
 });
 
 test("a Deployment serves one version only when its single entry is that version at 10000", async () => {
@@ -1119,6 +1323,19 @@ test("an Endpoint without an address says how it stands", async () => {
     .all()
     .find((node) => node.tag === "a" && node.textContent === "hello-endpoint");
   expect(link?.attributes.get("href")).toBe("/resources/uid-end");
+});
+
+test("Needs attention says when a served Worker has not recorded its Deployment", async () => {
+  const stale = { ...hello, observed: { activeDeploymentUid: null, ready: false } };
+  const { body } = await overviewWith([stale, deploymentOfV1()]);
+  expect(body.textContent).toContain("Needs attention");
+  expect(body.textContent).toContain(
+    "its Deployment serves it, but the Worker has not recorded it",
+  );
+  // Without a serving Deployment it is only not ready.
+  const alone = await overviewWith([stale]);
+  expect(alone.body.textContent).toContain("latest observation reports not ready");
+  expect(alone.body.textContent).not.toContain("has not recorded it");
 });
 
 test("create falls back to the exact URL field when the Host answers no Form", async () => {
