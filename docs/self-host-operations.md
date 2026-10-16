@@ -37,8 +37,8 @@ A self-host runs one of two profiles, selected by configuration:
   `WorkerEndpoint 0.3.0`, which publishes a Worker at an HTTPS hostname, also
   needs the TCP 443 listener in step 4.
 
-The guide uses two shells, and each block says which: "as root" or "as the
-`takoserver` user". An **administrator shell** as root installs tools, writes
+The guide uses two shells, and each setup block says which: "as root" or "as
+the `takoserver` user". An **administrator shell** as root installs tools, writes
 `/etc/takoserver`, and runs `systemctl` and `journalctl`. An **operator
 shell** as the `takoserver` user (`runuser -u takoserver -- bash`, then
 `cd /opt/takoserver`) runs the `takoserver` blocks of step 3, whose key files
