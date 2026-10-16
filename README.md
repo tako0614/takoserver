@@ -118,10 +118,10 @@ serves them from this machine.
   such as `env.DB`. The Host serves the SQLite, KV, bucket and queue Bindings
   from private loopback services, not from its public listener. A Resource that
   another still names cannot be deleted, so delete in reference order.
-- **Serve** a Worker with a WorkerDeployment, which splits the Worker's traffic across
-  up to eight WorkerVersions by weights that add up to 10000, and a
-  WorkerEndpoint, which publishes the Worker at an HTTPS hostname on the Host's
-  TCP 443 listener. Neither a bundle nor a WorkerVersion can be changed, so to
+- **Serve** a Worker with a WorkerDeployment, which splits its traffic across up
+  to eight WorkerVersions by weights that add up to 10000, and a WorkerEndpoint,
+  which publishes the Worker at an HTTPS hostname on the Host's TCP 443
+  listener. Neither a bundle nor a WorkerVersion can be changed, so to
   ship new code, create a new WorkerBundle and WorkerVersion, then update the
   Deployment's versions.
 - **Infer** through `/v1/ai` when the operator configures an OpenAI-compatible
