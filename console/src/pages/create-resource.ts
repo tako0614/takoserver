@@ -1,5 +1,15 @@
 import { ApiError, type ResourceSummary } from "../api.ts";
 import { h } from "../dom.ts";
+import {
+  blankPaths,
+  pathLabel,
+  type ReferenceSlot,
+  type StarterSpec,
+  slotLabel,
+  starterSpec,
+  valueAt,
+  withValueAt,
+} from "../form-specs.ts";
 import { formLabel, KNOWN_FORM_GROUPS } from "../forms.ts";
 import { tr } from "../i18n.ts";
 import {
@@ -283,6 +293,120 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
   };
 }
 
+/** The Resources of one exact Form, first page only, or null when the Host did not answer. */
+function resourcesOfForm(
+  organizationId: string,
+  form: string,
+): Promise<{ readonly items: readonly ResourceSummary[]; readonly more: boolean } | null> {
+  return api.resources(organizationId, { form }).then(
+    ({ resources, cursor }) => ({ items: resources, more: cursor !== null }),
+    () => null,
+  );
+}
+
+/**
+ * One choice per place the starter names another Resource. Choosing writes
+ * that Resource's UID into the spec; the JSON stays the one thing that is
+ * sent, so a person can still type any UID by hand.
+ */
+function referencePicker(
+  organizationId: string,
+  slots: readonly ReferenceSlot[],
+  spec: HTMLTextAreaElement,
+  onWrite: (text: string) => void,
+): { readonly element: HTMLElement; sync(): void; setDisabled(disabled: boolean): void } {
+  let sending = false;
+  const selects = slots.map((slot, index) => {
+    const id = `create-resource-ref-${index}`;
+    // The UIDs this choice offers, so the JSON can be matched without reading the DOM back.
+    const offered: string[] = [];
+    const select = h(
+      "select",
+      { class: "select", id },
+      h("option", { value: "" }, tr("読み込み中…", "Loading…")),
+    );
+    select.disabled = true;
+    void resourcesOfForm(organizationId, slot.form).then((answer) => {
+      const options: HTMLOptionElement[] = [
+        h(
+          "option",
+          { value: "" },
+          answer === null
+            ? tr(
+                "一覧を読み込めませんでした（UIDを直接入力できます）",
+                "Couldn't list them (type the UID instead)",
+              )
+            : answer.items.length === 0
+              ? tr(
+                  `${formLabel(slot.form)}のリソースはまだありません`,
+                  `No ${formLabel(slot.form)} Resources yet`,
+                )
+              : tr("リソースを選んでください", "Choose a Resource"),
+        ),
+        ...(answer?.items ?? []).map((item) => h("option", { value: item.uid }, item.name)),
+      ];
+      if (answer?.more)
+        options.push(
+          h(
+            "option",
+            { value: "", disabled: true },
+            tr("ほかのリソースはUIDを直接入力してください", "For others, type the UID"),
+          ),
+        );
+      offered.push(...(answer?.items ?? []).map((item) => item.uid));
+      select.replaceChildren(...options);
+      select.dataset.empty = String(answer === null || answer.items.length === 0);
+      select.disabled = sending || select.dataset.empty === "true";
+      sync();
+    });
+    select.addEventListener("change", () => {
+      const parsed = jsonSpec(spec.value);
+      if (!parsed || select.value === "") return;
+      const next = withValueAt(parsed, slot.path, select.value);
+      if (!next) return;
+      onWrite(JSON.stringify(next, null, 2));
+    });
+    return {
+      slot,
+      select,
+      offered,
+      element: h(
+        "div",
+        { class: "field" },
+        h(
+          "label",
+          { for: id },
+          h("span", { class: "mono" }, slotLabel(slot)),
+          ` — ${formLabel(slot.form)}`,
+        ),
+        select,
+      ),
+    };
+  });
+  // The choice follows the JSON: a UID typed by hand, or removed, shows here.
+  const sync = (): void => {
+    const parsed = jsonSpec(spec.value);
+    for (const { slot, select, offered } of selects) {
+      const current = parsed ? valueAt(parsed, slot.path) : undefined;
+      select.value = typeof current === "string" && offered.includes(current) ? current : "";
+    }
+  };
+  return {
+    element: h(
+      "div",
+      { style: { display: "grid", gap: "10px" } },
+      h("span", { class: "field__label" }, tr("参照先", "References")),
+      ...selects.map(({ element }) => element),
+    ),
+    sync,
+    setDisabled(disabled) {
+      sending = disabled;
+      for (const { select } of selects)
+        select.disabled = disabled || select.dataset.empty !== "false";
+    },
+  };
+}
+
 /** Create one Resource of an exact Form this Host supports. */
 export function createResource(organizationId: string): void {
   const key = `console-create-${crypto.randomUUID()}`;
@@ -298,6 +422,77 @@ export function createResource(organizationId: string): void {
     spellcheck: "false",
   });
   spec.value = "{}";
+  const specHint = h("small");
+  const references = h("div");
+  let picker: ReturnType<typeof referencePicker> | null = null;
+  // The starter for the chosen Form, and the exact text the spec held when the
+  // Console last wrote it. A spec the person has not touched follows the
+  // chosen Form; an edited one is never overwritten, only offered the starter.
+  let starter: StarterSpec | null = null;
+  let untouched = "{}";
+  let chosen = "";
+  // Console-written text, sized so the whole starter shows without scrolling.
+  const write = (text: string): void => {
+    spec.value = text;
+    spec.rows = Math.min(16, text.split("\n").length + 1);
+    untouched = text;
+  };
+  const useStarter = (): void => {
+    if (!starter) return;
+    write(JSON.stringify(starter.spec, null, 2));
+    showDetails();
+    picker?.sync();
+    describeStarter();
+  };
+  const describeStarter = (): void => {
+    if (!starter) {
+      specHint.replaceChildren();
+      return;
+    }
+    const label = formLabel(chosen);
+    if (spec.value !== untouched) {
+      specHint.replaceChildren(
+        h(
+          "button",
+          { class: "btn btn--sm", type: "button", onClick: useStarter },
+          tr(`${label}の最小の設定を入れる`, `Use the smallest ${label} spec`),
+        ),
+      );
+      return;
+    }
+    specHint.replaceChildren(
+      Object.keys(starter.spec).length === 0
+        ? tr(`${label}の設定は空のオブジェクトです。`, `${label} takes an empty spec.`)
+        : blankPaths(jsonSpec(spec.value)).length > 0
+          ? tr(
+              `${label}が受け付ける最小の設定です。空の値を埋めてください。`,
+              `The smallest spec ${label} accepts. Fill in the empty values.`,
+            )
+          : tr(`${label}が受け付ける最小の設定です。`, `The smallest spec ${label} accepts.`),
+    );
+  };
+  // Called on every change to the Form control, including each support answer;
+  // only a different Form changes the starter.
+  const applyStarter = (): void => {
+    const selected = form.value();
+    if (selected === chosen) return;
+    chosen = selected;
+    starter = selected ? starterSpec(selected) : null;
+    if (spec.value === untouched) write(starter ? JSON.stringify(starter.spec, null, 2) : "{}");
+    picker =
+      starter && starter.references.length > 0
+        ? referencePicker(organizationId, starter.references, spec, (text) => {
+            // A chosen Resource is the Console's own writing, like the starter.
+            write(text);
+            showDetails();
+            picker?.sync();
+            describeStarter();
+          })
+        : null;
+    references.replaceChildren(picker?.element ?? "");
+    picker?.sync();
+    describeStarter();
+  };
   const details = h("div");
   const showDetails = (): void => {
     const parsed = jsonSpec(spec.value);
@@ -313,8 +508,16 @@ export function createResource(organizationId: string): void {
       recoveryDetails(key, "POST", "/apis/forms.takoform.com/v2/resources", body),
     );
   };
-  const form = formChoice(organizationId, showDetails);
-  for (const field of [name, spec]) field.addEventListener("input", showDetails);
+  const form = formChoice(organizationId, () => {
+    applyStarter();
+    showDetails();
+  });
+  name.addEventListener("input", showDetails);
+  spec.addEventListener("input", () => {
+    showDetails();
+    picker?.sync();
+    describeStarter();
+  });
   showDetails();
   let intent: ResourceIntent | null = null;
   const close = openModal({
@@ -341,7 +544,9 @@ export function createResource(organizationId: string): void {
         { class: "field" },
         h("label", { for: "create-resource-spec" }, tr("設定 (JSON)", "Spec (JSON)")),
         spec,
+        specHint,
       ),
+      references,
       requestDisclosure(details),
     ),
     onConfirm: async () => {
@@ -360,9 +565,24 @@ export function createResource(organizationId: string): void {
           );
           return;
         }
+        // A starter's empty values are the ones the Host would refuse; say which.
+        const blanks = starter
+          ? blankPaths(starter.spec).filter((path) => valueAt(parsed, path) === "")
+          : [];
+        if (blanks.length > 0) {
+          toast(
+            tr(
+              `まだ空の値があります：${blanks.map(pathLabel).join("、")}`,
+              `Still empty: ${blanks.map(pathLabel).join(", ")}`,
+            ),
+            "bad",
+          );
+          return;
+        }
         form.setDisabled(true);
         name.disabled = true;
         spec.disabled = true;
+        picker?.setDisabled(true);
         showDetails();
         try {
           if (!(await api.formSupport(organizationId, selectedForm))) {
@@ -376,6 +596,7 @@ export function createResource(organizationId: string): void {
             form.setDisabled(false);
             name.disabled = false;
             spec.disabled = false;
+            picker?.setDisabled(false);
             return;
           }
           if (!sameOrganization(organizationId)) return;
@@ -399,6 +620,7 @@ export function createResource(organizationId: string): void {
           form.setDisabled(false);
           name.disabled = false;
           spec.disabled = false;
+          picker?.setDisabled(false);
           toast(explain(error as Error), "bad");
           return;
         }

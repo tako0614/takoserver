@@ -341,6 +341,82 @@ test("create offers the Forms this Host composes and sends the chosen exact URL"
   expect((url as unknown as { hidden: boolean }).hidden).toBe(false);
 });
 
+test("create starts from the chosen Form's smallest spec and fills references by choice", async () => {
+  const { body } = await setup();
+  const { createResource } = await import("../console/src/pages/create-resource.ts");
+  const edge = "https://edge.forms.takoform.com/forms";
+  const deployment = `${edge}/WorkerDeployment/0.4.0/`;
+  const listed = (uid: string, name: string, kind: string): ResourceSummary => ({
+    ...one,
+    uid,
+    name,
+    form: `${edge}/${kind}/`,
+  });
+  const byForm = new Map([
+    [`${edge}/ModuleWorker/0.3.0/`, [listed("uid-worker", "hello", "ModuleWorker/0.3.0")]],
+    [`${edge}/WorkerVersion/0.5.0/`, [listed("uid-version", "hello-v1", "WorkerVersion/0.5.0")]],
+  ]);
+  const writes: Request[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const url = new URL(request.url);
+      if (url.pathname.endsWith("/support")) {
+        const asking = url.searchParams.get("form") ?? "";
+        return Response.json({ form: asking, supported: true, operations: ["create"] });
+      }
+      if (url.pathname === "/.well-known/takoform/v2") return Response.json(discovery);
+      if (request.method === "GET" && url.pathname.endsWith("/resources")) {
+        const items = byForm.get(url.searchParams.get("form") ?? "") ?? [];
+        return Response.json({ items, nextCursor: null });
+      }
+      writes.push(request.clone());
+      return Response.json(op, { status: 202 });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  createResource("org-console");
+  await settle();
+  const [select] = body.all().filter((node) => node.tag === "select");
+  const spec = body.all().find((node) => node.tag === "textarea");
+  const name = body.all().filter((node) => node.tag === "input")[1];
+  if (!select || !spec || !name) throw new Error("create dialog incomplete");
+  select.value = deployment;
+  select.emit("change");
+  await settle();
+  expect(JSON.parse(spec.value)).toEqual({
+    worker: { resourceUid: "" },
+    versions: [{ workerVersion: { resourceUid: "" }, weight: 10000 }],
+  });
+  expect(body.textContent).toContain("versions[0].workerVersion — WorkerVersion 0.5.0");
+  const [, worker, version] = body.all().filter((node) => node.tag === "select");
+  if (!worker || !version) throw new Error("reference choices missing");
+  expect(worker.textContent).toContain("hello");
+  worker.value = "uid-worker";
+  worker.emit("change");
+  expect(JSON.parse(spec.value).worker).toEqual({ resourceUid: "uid-worker" });
+  // An empty reference is named instead of being sent for the Host to refuse.
+  name.value = "hello-deployment";
+  button(body, "Accept create").click();
+  await settle();
+  expect(writes).toHaveLength(0);
+  expect(body.textContent).toContain("Still empty: versions[0].workerVersion");
+  version.value = "uid-version";
+  version.emit("change");
+  button(body, "Accept create").click();
+  await settle();
+  expect(writes).toHaveLength(1);
+  expect(JSON.parse(await (writes[0] as Request).text())).toEqual({
+    form: deployment,
+    space: "org-console",
+    name: "hello-deployment",
+    spec: {
+      worker: { resourceUid: "uid-worker" },
+      versions: [{ workerVersion: { resourceUid: "uid-version" }, weight: 10000 }],
+    },
+  });
+});
+
 test("create falls back to the exact URL field when the Host answers no Form", async () => {
   const { body } = await setup();
   const { createResource } = await import("../console/src/pages/create-resource.ts");
