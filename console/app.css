@@ -536,7 +536,7 @@ tbody tr.is-clickable:hover {
 }
 
 /* The Resources list. On a phone each row stacks: name and state, then the
-   exact Form URL across the whole row, then when it was observed. */
+   Form across the whole row, then when it was observed. */
 .resource-name .truncate {
   max-width: 24ch;
 }

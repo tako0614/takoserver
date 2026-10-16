@@ -60,3 +60,43 @@ test("reads a Form in a list by kind and version, naming any other host", () => 
     "https://forms.example.test/Widget/1.0.0",
   );
 });
+
+test("never reads two different Form URLs the same", () => {
+  const urls = [
+    "https://edge.forms.takoform.com/forms/X/1.0.0/",
+    "https://edge.forms.takoform.com/preview/forms/X/1.0.0/",
+    "https://EDGE.forms.takoform.com/forms/X/1.0.0/",
+    "https://edge.forms.takoform.com:443/forms/X/1.0.0/",
+    "https://h.example/a/forms/X/1/",
+    "https://h.example/b/forms/X/1/",
+  ];
+  expect(new Set(urls.map(formName)).size).toBe(urls.length);
+  expect(formName(urls[0] as string)).toBe("X 1.0.0");
+});
+
+test("the list filter matches the Form as people read it", async () => {
+  const { matchingResources } = await import("../console/src/resource-state.ts");
+  const resource = (name: string, form: string) => ({
+    uid: name,
+    form,
+    space: "org",
+    name,
+    generation: 1,
+    observedGeneration: 1,
+    observedAt: null,
+    phase: "idle" as const,
+    spec: {},
+    observed: {},
+    output: {},
+    lastOperation: `op-${name}`,
+  });
+  const all = [
+    resource("hello-deployment", WORKER_DEPLOYMENT_FORM_URL),
+    resource("notes", SQLITE_DATABASE_FORM_URL),
+  ];
+  const names = (term: string) => matchingResources(all, term).map((entry) => entry.name);
+  expect(names("WorkerDeployment 0.4.0")).toEqual(["hello-deployment"]);
+  expect(names("sqlitedatabase 0.2")).toEqual(["notes"]);
+  expect(names("edge.forms.takoform.com/forms/SQLite")).toEqual(["notes"]);
+  expect(names("  ")).toEqual(["hello-deployment", "notes"]);
+});

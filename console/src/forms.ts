@@ -54,17 +54,16 @@ export function formLabel(form: string): string {
 }
 
 /**
- * A Form as people read it in a list: "WorkerBundle 0.2.0", naming the host
- * only when it is not the edge Forms host, so two Forms that differ only by
- * host still read differently. The exact URL stays the title and the detail.
+ * A Form as people read it in a list: "WorkerBundle 0.2.0". Everything before
+ * `/forms/` is kept verbatim unless it is exactly the edge Forms host, so two
+ * different Form URLs (another host, a path prefix, a different spelling)
+ * never read the same. The exact URL stays the title and the detail.
  */
 export function formName(form: string): string {
-  const label = formLabel(form);
-  if (label === form) return form;
-  try {
-    const host = new URL(form).host;
-    return host === "edge.forms.takoform.com" ? label : `${host} · ${label}`;
-  } catch {
-    return form;
-  }
+  const match = /^https:\/\/(.+)\/forms\/([^/]+)\/([^/]+)\/$/u.exec(form);
+  if (!match) return form;
+  const [, where, kind, version] = match;
+  return where === "edge.forms.takoform.com"
+    ? `${kind} ${version}`
+    : `${where} · ${kind} ${version}`;
 }

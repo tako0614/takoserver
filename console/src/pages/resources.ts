@@ -9,7 +9,7 @@ import {
   settleResourceIntent,
   uncertainResourceIntents,
 } from "../resource-intent.ts";
-import { health, phaseLabel } from "../resource-state.ts";
+import { health, matchingResources, phaseLabel } from "../resource-state.ts";
 import { linkProps, navigate, resourcePath, route } from "../router.ts";
 import { api, currentOrganization } from "../state.ts";
 import { ago, badge, card, copyable, empty, explain, ICON, icon, whenReady } from "../ui.ts";
@@ -300,7 +300,10 @@ export function resourcesPage(organizationId: string): Child {
                   ),
                 )
               : null,
-            card(null, h("div", { class: "table-scroll" }, table(visible(allResources, filter())))),
+            card(
+              null,
+              h("div", { class: "table-scroll" }, table(matchingResources(allResources, filter()))),
+            ),
             pagingError(),
             nextCursor ? moreButton(nextCursor) : null,
           );
@@ -324,17 +327,6 @@ function toolbar(filter: ReturnType<typeof signal<string>>): Child {
       onInput: (event: Event) => filter.set((event.target as HTMLInputElement).value),
     }),
   );
-}
-
-function visible(
-  resources: readonly ResourceSummary[],
-  needle: string,
-): readonly ResourceSummary[] {
-  const term = needle.trim().toLowerCase();
-  return resources.filter((entry) => {
-    if (term === "") return true;
-    return entry.name.toLowerCase().includes(term) || entry.form.toLowerCase().includes(term);
-  });
 }
 
 function table(resources: readonly ResourceSummary[]): Child {
