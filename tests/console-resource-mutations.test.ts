@@ -193,6 +193,8 @@ test("accepted create is not shown as complete and checking it never re-sends", 
     { preconnect: globalThis.fetch.preconnect },
   );
   createResource("org-console");
+  // The mock answers no known Form, so the exact URL field is the control.
+  await settle();
   const inputs = body.all().filter((node) => node.tag === "input");
   if (!inputs[0] || !inputs[1]) throw new Error("create inputs missing");
   inputs[0].value = form;
@@ -241,6 +243,7 @@ test.each(["connection lost", "malformed accepted reply"] as const)(
     );
     createResource("org-console");
     expect(body.textContent).toContain("idempotency-key");
+    await settle();
     const inputs = body.all().filter((node) => node.tag === "input");
     if (!inputs[0] || !inputs[1]) throw new Error("create inputs missing");
     inputs[0].value = form;
@@ -268,6 +271,128 @@ test.each(["connection lost", "malformed accepted reply"] as const)(
     expect(route().query.get("operation")).toBe(op.id);
   },
 );
+
+test("create offers the Forms this Host composes and sends the chosen exact URL", async () => {
+  const { body } = await setup();
+  const { createResource } = await import("../console/src/pages/create-resource.ts");
+  const worker = "https://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/";
+  const endpoint = "https://edge.forms.takoform.com/forms/WorkerEndpoint/0.3.0/";
+  const asked: string[] = [];
+  const writes: Request[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const url = new URL(request.url);
+      if (url.pathname.endsWith("/support")) {
+        const asking = url.searchParams.get("form") ?? "";
+        asked.push(asking);
+        return Response.json({
+          form: asking,
+          supported: asking !== endpoint,
+          operations: asking === endpoint ? [] : ["create", "read", "update", "delete"],
+        });
+      }
+      if (url.pathname === "/.well-known/takoform/v2") return Response.json(discovery);
+      writes.push(request.clone());
+      return Response.json(op, { status: 202 });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  createResource("org-console");
+  const select = body.all().find((node) => node.tag === "select");
+  const url = body.all().find((node) => node.tag === "input");
+  if (!select || !url) throw new Error("Form choice missing");
+  // The list is usable before the Host has answered.
+  expect(select.disabled).toBe(false);
+  expect(select.textContent).toContain("ModuleWorker 0.3.0");
+  expect(body.textContent).toContain("Checking which Forms this Host supports");
+  await settle();
+  expect(asked).toHaveLength(16);
+  expect(asked).toContain(worker);
+  const options = select.all().filter((node) => node.tag === "option");
+  const option = (label: string) => options.find((node) => node.textContent === label);
+  expect(option("ModuleWorker 0.3.0")?.disabled).toBe(false);
+  expect(option("WorkerEndpoint 0.3.0 — not on this Host")?.disabled).toBe(true);
+  expect(option("Another exact Form URL…")).toBeDefined();
+  expect(body.textContent).toContain("Only the Forms this Host supports can be chosen.");
+  expect((url as unknown as { hidden: boolean }).hidden).toBe(true);
+  select.value = worker;
+  select.emit("change");
+  const contract = body
+    .all()
+    .find((node) => node.tag === "a" && node.textContent.startsWith("ModuleWorker 0.3.0"));
+  expect(contract?.attributes.get("href")).toBe(worker);
+  expect(contract?.attributes.get("target")).toBe("_blank");
+  expect(contract?.attributes.get("rel")).toBe("noopener noreferrer");
+  const name = body.all().filter((node) => node.tag === "input")[1];
+  if (!name) throw new Error("name input missing");
+  name.value = "hello";
+  button(body, "Accept create").click();
+  await settle();
+  expect(writes).toHaveLength(1);
+  expect(JSON.parse(await (writes[0] as Request).text())).toEqual({
+    form: worker,
+    space: "org-console",
+    name: "hello",
+    spec: {},
+  });
+  select.value = "other";
+  select.emit("change");
+  expect((url as unknown as { hidden: boolean }).hidden).toBe(false);
+});
+
+test("create falls back to the exact URL field when the Host answers no Form", async () => {
+  const { body } = await setup();
+  const { createResource } = await import("../console/src/pages/create-resource.ts");
+  globalThis.fetch = Object.assign(async () => new Response("unavailable", { status: 503 }), {
+    preconnect: globalThis.fetch.preconnect,
+  });
+  createResource("org-console");
+  await settle();
+  const select = body.all().find((node) => node.tag === "select") as unknown as {
+    hidden: boolean;
+  };
+  const url = body.all().find((node) => node.tag === "input") as unknown as { hidden: boolean };
+  expect(select.hidden).toBe(true);
+  expect(url.hidden).toBe(false);
+  expect(body.textContent).toContain(
+    "Couldn't ask this Host which Forms it supports. Enter an exact Form URL.",
+  );
+});
+
+test("a Form the Host did not answer for is marked, and typing a URL stays a plain hint", async () => {
+  const { body } = await setup();
+  const { createResource } = await import("../console/src/pages/create-resource.ts");
+  const workflow = "https://edge.forms.takoform.com/forms/DurableWorkflow/0.3.0/";
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(new Request(input, init).url);
+      const asking = url.searchParams.get("form") ?? "";
+      if (asking === workflow) return new Response("upstream failed", { status: 502 });
+      return Response.json({ form: asking, supported: true, operations: ["create"] });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  createResource("org-console");
+  await settle();
+  const select = body.all().find((node) => node.tag === "select");
+  if (!select) throw new Error("Form choice missing");
+  const checked = select
+    .all()
+    .find((node) => node.tag === "option" && node.textContent.startsWith("DurableWorkflow"));
+  expect(checked?.textContent).toBe("DurableWorkflow 0.3.0 — not checked");
+  expect(checked?.disabled).toBe(false);
+  select.value = "other";
+  select.emit("change");
+  const url = body.all().find((node) => node.tag === "input");
+  if (!url) throw new Error("URL field missing");
+  url.value = "https://forms.example.test/a/very/long/path/that/is/not/a/kind/and/version";
+  url.emit("input");
+  expect(body.textContent).toContain("The Host is asked whether it supports it");
+  expect(
+    body.all().some((node) => node.tag === "a" && node.textContent.includes("forms.example.test")),
+  ).toBe(false);
+});
 
 test("delete requires explicit confirmation and retains the UID/generation fence", async () => {
   const { body, route } = await setup();
@@ -332,7 +457,10 @@ test("organization switch during support read prevents a stale create send", asy
   globalThis.fetch = Object.assign(
     async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
-      if (new URL(request.url).pathname.endsWith("/support"))
+      const url = new URL(request.url);
+      if (url.pathname.endsWith("/support") && url.searchParams.get("form") !== form)
+        return Response.json({ error: { code: "unavailable" } }, { status: 503 });
+      if (url.pathname.endsWith("/support"))
         return new Promise<Response>((resolve) => {
           release = resolve;
         });
@@ -343,6 +471,7 @@ test("organization switch during support read prevents a stale create send", asy
     { preconnect: globalThis.fetch.preconnect },
   );
   createResource("org-console");
+  await settle();
   const inputs = body.all().filter((node) => node.tag === "input");
   if (!inputs[0] || !inputs[1]) throw new Error("create inputs missing");
   inputs[0].value = form;
