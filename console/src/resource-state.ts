@@ -1,8 +1,7 @@
 import type { ResourceSummary } from "./api.ts";
 import { formName } from "./forms.ts";
 import { tr } from "./i18n.ts";
-
-const WORKER_ENDPOINT = /\/forms\/WorkerEndpoint\/[^/]+\/$/u;
+import { WORKER_ENDPOINT } from "./references.ts";
 
 /** Display only states the v2 Resource actually reports. */
 export type Phase =

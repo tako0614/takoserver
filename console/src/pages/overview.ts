@@ -41,8 +41,8 @@ export function overviewPage(organization: Organization): Child {
           "p",
           null,
           tr(
-            "Takoformで宣言したリソースの状態と、Workerとその公開先を確認できます。",
-            "The state of the resources you declared with Takoform, and your Workers and where they are served.",
+            "Workerの公開先と、Takoformで宣言したリソースの状態を確認できます。",
+            "Where your Workers are served, and the state of the resources you declared with Takoform.",
           ),
         ),
       ),

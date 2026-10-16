@@ -832,7 +832,7 @@ test("the overview shows each Worker with its state and address", async () => {
   body.append(overviewPage(organization) as unknown as NodeStub);
   await settle();
   expect(body.textContent).toContain("Workers");
-  expect(body.textContent).toContain("your Workers and where they are served");
+  expect(body.textContent).toContain("Where your Workers are served");
   expect(body.textContent).not.toContain("what changed recently");
   const links = body.all().filter((node) => node.tag === "a");
   expect(links.find((node) => node.textContent === "hello")?.attributes.get("href")).toBe(
