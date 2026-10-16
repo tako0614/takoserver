@@ -348,6 +348,8 @@ footer { display: flex; align-items: center; justify-content: space-between; fle
   .preview { margin-top: 40px; }
   .frame { padding: 6px; border-radius: 16px; }
   .frame picture { border-radius: 10px; }
+  /* The 390px phone capture plus padding and two 1px borders: never enlarged. */
+  .preview .frame { max-width: 406px; margin-inline: auto; }
   section.block { padding-top: 64px; }
   .forms > div, .deploy, .after, .host { grid-template-columns: minmax(0, 1fr); gap: 24px; }
   .steps > li > pre { grid-column: 1 / -1; }

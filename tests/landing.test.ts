@@ -122,6 +122,9 @@ describe("Takoserver public site", () => {
     expect(english.indexOf("console-mobile-light")).toBeLessThan(
       english.indexOf("console-tablet-dark"),
     );
+    // Neither capture is shown larger than it was taken.
+    expect(english).toContain(".preview .frame { max-width: 848px; margin-inline: auto; }");
+    expect(english).toContain(".preview .frame { max-width: 406px; margin-inline: auto; }");
     expect(english).toContain("public sample data");
     const japanese = landingHtml({ ...site, locale: "ja" });
     expect(japanese).toContain('<html lang="ja">');
