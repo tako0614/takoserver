@@ -378,7 +378,9 @@ prints a new one until the operator has signed in, or every time with
 only how to mint one. [Self-host security](self-host-security.md#sign-in-and-request-limits)
 explains why. If `TAKOSERVER_CONSOLE_ORIGIN` is set, open the exact external console
 origin named by the process and paste the assertion there. It is a separate
-console; the Bun Host does not serve a `/console` page. Treat the operator key
+console; the Bun Host does not serve a `/console` page.
+[The console](#the-console-optional) below explains how to build and serve
+it. Treat the operator key
 under the data root and the printed assertion as credentials; keep them out of
 shell history, shared logs, and this repository. To create later assertions,
 run the printed command, which names the installation's key path and its
@@ -435,6 +437,64 @@ curl -sS http://127.0.0.1:8787/_takoserver/health/ready
 
 The readiness probe goes to the listener directly; use the address in the
 `takoserver listening on` line if `TAKOSERVER_LISTEN_HOST` names another.
+
+#### The console (optional)
+
+The console is a separate static app in `console/`; the Bun Host does not serve
+it. An operator signs in to it with an operator assertion, then creates
+organizations and API keys and creates, updates, reads and deletes Resources.
+Build it as root from the reviewed checkout, with the Host's public origin
+stamped in, into a folder used for nothing else. The build replaces `--out`
+wholesale, so never point it at the data root or any folder that holds
+anything else:
+
+```sh
+cd /opt/takoserver
+umask 022
+bun scripts/build-console.ts --out /srv/takoserver-console \
+  --api-origin https://api.example.com:8443
+```
+
+The output is four files, `index.html`, `console.js`, `app.css` and
+`favicon.svg`, owned by root so that the Host's user cannot change the code
+that runs with an operator's session. Rebuild it from the same commit on every
+update. Serve the folder over HTTPS like the API, at the root of an origin of
+its own, with these properties:
+
+- **The same site as the API**, for example `https://console.example.com:8444`
+  next to `https://api.example.com:8443` (TCP 443 belongs to the Worker
+  Endpoints listener of step 4). The session is an `HttpOnly`, `SameSite=Lax`
+  cookie, `Secure` because the public origin is HTTPS, so a console on another
+  site cannot carry it.
+- **`--api-origin` equal to `TAKOSERVER_PUBLIC_ORIGIN`.** The v2 API answers
+  `421` to a request whose host is not the configured public authority.
+- **Every path that is not a file answers with `index.html`**, so a reload of
+  a deep link such as `/resources/<uid>` opens the console instead of a 404.
+
+With Caddy beside the API front end of step 4, for example:
+
+```caddyfile
+console.example.com:8444 {
+  root * /srv/takoserver-console
+  try_files {path} /index.html
+  file_server
+}
+```
+
+Then, from the administrator shell, add `TAKOSERVER_CONSOLE_ORIGIN` with that
+exact origin to the environment file, written as the browser sends it: scheme,
+lowercase host and the port unless it is the scheme's default, with no
+trailing `/`. Restart the Host. It allows that origin, with credentials,
+across the control and v2 APIs and accepts the session cookie only from it;
+any other spelling falls back to plain CORS and sign-in fails. The startup
+check also accepts plain HTTP for `localhost` and `127.0.0.1`, but a console
+on HTTP may not carry the HTTPS API's cookie.
+
+The first-boot assertion is already spent by the session exchange above, so
+mint a new one with the `operator-key.ts sign-in` command from the start of
+this step (or restart once with `TAKOSERVER_PRINT_OPERATOR_ASSERTION=1`, which
+also names the console origin to open) and paste it on the console's sign-in
+page.
 
 ### 6. Seed held artifacts
 
@@ -939,6 +999,9 @@ git worktree add --detach <new-checkout> <reviewed-commit>
 cd <new-checkout>
 bun install --frozen-lockfile
 ```
+
+If you serve the console, rebuild it from the new checkout as described under
+[The console](#the-console-optional) when you switch to it.
 
 Keep the previous source checkout available so a code-only return is possible
 without changing the active source before the operator has selected it. Use
