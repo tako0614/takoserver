@@ -218,8 +218,10 @@ test("accepted create is not shown as complete and checking it never re-sends", 
   expect(checks).toBe(2);
 });
 
+type Answer = Record<string, unknown>;
+
 /** The Resources page of an accepted operation whose checks answer from `answers`, in turn. */
-async function operationPage(answers: Array<Record<string, unknown>>) {
+async function operationPage(answers: Array<Answer | Promise<Answer>>) {
   const { body, route } = await setup();
   const { resourcesPage } = await import("../console/src/pages/resources.ts");
   let checks = 0;
@@ -229,7 +231,7 @@ async function operationPage(answers: Array<Record<string, unknown>>) {
       if (url.pathname.includes("/operations/")) {
         const answer = answers[Math.min(checks, answers.length - 1)];
         checks += 1;
-        return Response.json(answer);
+        return Response.json(await answer);
       }
       return Response.json({ items: [one], nextCursor: null });
     },
@@ -261,6 +263,33 @@ test("an accepted operation is followed until it settles, without pressing Reloa
     expect(body.textContent).toContain("Done");
     expect(body.textContent).toContain("View resource");
     expect(body.textContent).not.toContain("In progress");
+  } finally {
+    Object.assign(OPERATION_FOLLOW, saved);
+  }
+});
+
+test("a check in progress keeps the last answer on screen", async () => {
+  await setup();
+  const { OPERATION_FOLLOW } = await import("../console/src/pages/resources.ts");
+  const saved = { ...OPERATION_FOLLOW };
+  OPERATION_FOLLOW.intervalMs = 5;
+  try {
+    let release: (answer: Answer) => void = () => {};
+    const held = new Promise<Answer>((resolve) => {
+      release = resolve;
+    });
+    const { body, checks } = await operationPage([op, held]);
+    for (let i = 0; i < 20 && checks() < 2; i += 1) await new Promise((r) => setTimeout(r, 10));
+    await settle();
+    // The second check has not answered; the card still says how the first one stood.
+    expect(checks()).toBe(2);
+    expect(body.textContent).toContain("In progress. Checking automatically.");
+    expect(body.textContent).toContain("(queued)");
+    release({ ...op, status: "succeeded", effect: "complete" });
+    for (let i = 0; i < 20 && !body.textContent.includes("Done"); i += 1)
+      await new Promise((r) => setTimeout(r, 10));
+    await settle();
+    expect(body.textContent).toContain("Done");
   } finally {
     Object.assign(OPERATION_FOLLOW, saved);
   }
