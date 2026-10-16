@@ -780,6 +780,151 @@ test("a Worker without a Deployment gets one to create for the version", async (
   expect(writes).toHaveLength(0);
 });
 
+const edgeKind = (kind: string) => `https://edge.forms.takoform.com/forms/${kind}/`;
+const workerItem = (uid: string, name: string, kind: string, spec: ResourceSummary["spec"]) =>
+  ({
+    ...one,
+    uid,
+    name,
+    form: edgeKind(kind),
+    generation: 1,
+    observedGeneration: 1,
+    observedAt: "2026-10-07T00:00:00Z",
+    phase: "idle",
+    spec,
+  }) as ResourceSummary;
+const hello = workerItem("uid-hello", "hello", "ModuleWorker/0.3.0", {});
+const named = { worker: { resourceUid: "uid-hello" } };
+
+/** The overview of an organization holding `items`, against a Host that supports every Form. */
+async function overviewWith(items: ResourceSummary[]) {
+  const { body, route } = await setup("/");
+  const { overviewPage } = await import("../console/src/pages/overview.ts");
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/support")) {
+        const asking = url.searchParams.get("form") ?? "";
+        return Response.json({ form: asking, supported: true, operations: ["create"] });
+      }
+      if (url.pathname === "/.well-known/takoform/v2") return Response.json(discovery);
+      if (url.pathname.endsWith("/wallet"))
+        return Response.json({ error: { code: "not_found" } }, { status: 404 });
+      return Response.json({ items, nextCursor: null });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  body.append(
+    overviewPage({
+      id: "org-console",
+      name: "Console",
+      ownerPrincipalId: "owner",
+      createdAt: "2026-10-07",
+    }) as unknown as TestNode,
+  );
+  await settle();
+  return { body, route };
+}
+
+const bundle = workerItem("uid-bundle", "hello-bundle", "WorkerBundle/0.2.0", {});
+const fetchVersion = workerItem("uid-v1", "hello-v1", "WorkerVersion/0.5.0", {
+  ...named,
+  handlers: ["fetch"],
+});
+const deploymentOfV1 = (change: Partial<ResourceSummary> = {}) => ({
+  ...workerItem("uid-dep", "hello-deployment", "WorkerDeployment/0.4.0", {
+    versions: [{ weight: 10000, workerVersion: { resourceUid: "uid-v1" } }],
+    ...named,
+  }),
+  observed: { active: true, ready: true },
+  ...change,
+});
+
+test("a Worker without code offers to add it first", async () => {
+  const { body } = await overviewWith([hello]);
+  expect(body.textContent).toContain("No code yet");
+  button(body, "Add code for hello").click();
+  await settle();
+  const [form] = body.all().filter((node) => node.tag === "select");
+  expect(form?.value).toBe(edgeKind("WorkerBundle/0.2.0"));
+  expect(JSON.parse(body.all().find((node) => node.tag === "textarea")?.value ?? "{}")).toEqual({
+    artifact: { url: "", sha256: "" },
+  });
+});
+
+test("a Worker with code and no version offers to create its first version", async () => {
+  const { body } = await overviewWith([hello, bundle]);
+  expect(body.textContent).toContain("No version yet");
+  button(body, "Create a version of hello").click();
+  await settle();
+  expect(body.textContent).toContain("This creates a version of hello.");
+  const [form] = body.all().filter((node) => node.tag === "select");
+  expect(form?.value).toBe(edgeKind("WorkerVersion/0.5.0"));
+  const spec = body.all().find((node) => node.tag === "textarea");
+  expect(JSON.parse(spec?.value ?? "{}")).toEqual({
+    worker: { resourceUid: "uid-hello" },
+    bundle: { resourceUid: "" },
+    handlers: ["fetch"],
+  });
+});
+
+test("a Worker with one version and no Deployment links to serving that version", async () => {
+  const { body } = await overviewWith([hello, bundle, fetchVersion]);
+  const serve = body
+    .all()
+    .find((node) => node.tag === "a" && node.textContent === "Serve hello-v1");
+  expect(serve?.attributes.get("href")).toBe("/resources/uid-v1");
+});
+
+test("a ready Deployment serving HTTP without an address offers to publish it", async () => {
+  const { body } = await overviewWith([hello, bundle, fetchVersion, deploymentOfV1()]);
+  expect(body.textContent).toContain("Not published yet");
+  button(body, "Publish hello").click();
+  await settle();
+  expect(body.textContent).toContain("This creates a WorkerEndpoint that publishes hello");
+  const [form] = body.all().filter((node) => node.tag === "select");
+  expect(form?.value).toBe(edgeKind("WorkerEndpoint/0.3.0"));
+  const spec = body.all().find((node) => node.tag === "textarea");
+  expect(JSON.parse(spec?.value ?? "{}")).toEqual(named);
+});
+
+test("publishing is not offered where the Host would refuse it", async () => {
+  const hasPublish = (body: TestNode) =>
+    body.all().some((node) => node.tag === "button" && node.textContent === "Publish hello");
+  // A Deployment still being applied.
+  const pending = await overviewWith([
+    hello,
+    bundle,
+    fetchVersion,
+    deploymentOfV1({ generation: 2, observedGeneration: 1 }),
+  ]);
+  expect(pending.body.textContent).toContain("Waiting for the deployment to finish");
+  expect(hasPublish(pending.body)).toBe(false);
+  // A Worker that only runs on a schedule answers no HTTP.
+  const scheduled = workerItem("uid-v1", "hello-v1", "WorkerVersion/0.5.0", {
+    ...named,
+    handlers: ["scheduled"],
+  });
+  const cron = await overviewWith([hello, bundle, scheduled, deploymentOfV1()]);
+  expect(hasPublish(cron.body)).toBe(false);
+});
+
+test("an Endpoint without an address says how it stands", async () => {
+  const endpoint = workerItem("uid-end", "hello-endpoint", "WorkerEndpoint/0.3.0", named);
+  const preparing = await overviewWith([hello, deploymentOfV1(), { ...endpoint, generation: 2 }]);
+  expect(preparing.body.textContent).toContain("Its address is being prepared");
+  const failed = await overviewWith([
+    hello,
+    deploymentOfV1(),
+    { ...endpoint, phase: "error", generation: 2 },
+  ]);
+  expect(failed.body.textContent).toContain("Publishing failed: hello-endpoint");
+  const link = failed.body
+    .all()
+    .find((node) => node.tag === "a" && node.textContent === "hello-endpoint");
+  expect(link?.attributes.get("href")).toBe("/resources/uid-end");
+});
+
 test("create falls back to the exact URL field when the Host answers no Form", async () => {
   const { body } = await setup();
   const { createResource } = await import("../console/src/pages/create-resource.ts");
