@@ -252,7 +252,7 @@ try {
           theme: string;
           lang: string;
         }>(
-          `({ rows: document.querySelectorAll('.table-scroll tbody tr').length, settled: [...document.querySelectorAll('.table-scroll tbody tr')].filter(row => /Ready|Applied|稼働中|反映済み/.test(row.innerText)).length, viewport: [innerWidth, innerHeight], pageWidth: document.documentElement.scrollWidth, theme: document.documentElement.dataset.theme, lang: document.documentElement.lang })`,
+          `({ rows: document.querySelectorAll('.table-scroll tbody tr').length, settled: [...document.querySelectorAll('.table-scroll tbody tr')].filter(row => /\\b(Ready|Applied)\\b|稼働中|反映済み/.test(row.innerText)).length, viewport: [innerWidth, innerHeight], pageWidth: document.documentElement.scrollWidth, theme: document.documentElement.dataset.theme, lang: document.documentElement.lang })`,
         );
         if (
           // Every sample row shows a settled, healthy state: Ready where its Form
