@@ -269,6 +269,88 @@ test.each(["connection lost", "malformed accepted reply"] as const)(
   },
 );
 
+test("create offers the Forms this Host composes and sends the chosen exact URL", async () => {
+  const { body } = await setup();
+  const { createResource } = await import("../console/src/pages/create-resource.ts");
+  const worker = "https://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/";
+  const endpoint = "https://edge.forms.takoform.com/forms/WorkerEndpoint/0.3.0/";
+  const asked: string[] = [];
+  const writes: Request[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const url = new URL(request.url);
+      if (url.pathname.endsWith("/support")) {
+        const asking = url.searchParams.get("form") ?? "";
+        asked.push(asking);
+        return Response.json({
+          form: asking,
+          supported: asking !== endpoint,
+          operations: asking === endpoint ? [] : ["create", "read", "update", "delete"],
+        });
+      }
+      if (url.pathname === "/.well-known/takoform/v2") return Response.json(discovery);
+      writes.push(request.clone());
+      return Response.json(op, { status: 202 });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  createResource("org-console");
+  const select = body.all().find((node) => node.tag === "select");
+  const url = body.all().find((node) => node.tag === "input");
+  if (!select || !url) throw new Error("Form choice missing");
+  expect(select.textContent).toContain("Checking this Host's Forms");
+  await settle();
+  expect(asked).toHaveLength(16);
+  expect(asked).toContain(worker);
+  const options = select.all().filter((node) => node.tag === "option");
+  const option = (label: string) => options.find((node) => node.textContent === label);
+  expect(option("ModuleWorker 0.3.0")?.attributes.has("disabled")).toBe(false);
+  expect(option("WorkerEndpoint 0.3.0 — not on this Host")?.attributes.has("disabled")).toBe(true);
+  expect(option("Another exact Form URL…")).toBeDefined();
+  expect((url as unknown as { hidden: boolean }).hidden).toBe(true);
+  select.value = worker;
+  select.emit("change");
+  const contract = body
+    .all()
+    .find((node) => node.tag === "a" && node.textContent.startsWith("ModuleWorker 0.3.0"));
+  expect(contract?.attributes.get("href")).toBe(worker);
+  expect(contract?.attributes.get("target")).toBe("_blank");
+  expect(contract?.attributes.get("rel")).toBe("noopener noreferrer");
+  const name = body.all().filter((node) => node.tag === "input")[1];
+  if (!name) throw new Error("name input missing");
+  name.value = "hello";
+  button(body, "Accept create").click();
+  await settle();
+  expect(writes).toHaveLength(1);
+  expect(JSON.parse(await (writes[0] as Request).text())).toEqual({
+    form: worker,
+    space: "org-console",
+    name: "hello",
+    spec: {},
+  });
+  select.value = "other";
+  select.emit("change");
+  expect((url as unknown as { hidden: boolean }).hidden).toBe(false);
+});
+
+test("create falls back to the exact URL field when the Host answers no Form", async () => {
+  const { body } = await setup();
+  const { createResource } = await import("../console/src/pages/create-resource.ts");
+  globalThis.fetch = Object.assign(async () => new Response("unavailable", { status: 503 }), {
+    preconnect: globalThis.fetch.preconnect,
+  });
+  createResource("org-console");
+  await settle();
+  const select = body.all().find((node) => node.tag === "select") as unknown as {
+    hidden: boolean;
+  };
+  const url = body.all().find((node) => node.tag === "input") as unknown as { hidden: boolean };
+  expect(select.hidden).toBe(true);
+  expect(url.hidden).toBe(false);
+  expect(body.textContent).toContain("This Host did not say which Forms it composes.");
+});
+
 test("delete requires explicit confirmation and retains the UID/generation fence", async () => {
   const { body, route } = await setup();
   const { deleteResource } = await import("../console/src/pages/create-resource.ts");
