@@ -940,23 +940,26 @@ republish.
 serves a ModuleWorker only when the Worker itself is applied. `hello` was
 created before its Deployment, so it still reports `ready: false` with no
 active Deployment, and a WorkerCronTrigger for it cannot finish being applied.
-Once the Endpoint answers, send the Worker's same spec again. The Host refuses
-it with `409 dependency_conflict` while something that names the Worker is
-still in progress, and one sent before the Endpoint is published keeps the
-Worker busy until it is:
+Once the Endpoint answers, send the Worker's spec again unchanged. The Host
+refuses it with `409 dependency_conflict` while anything that names the Worker
+is in progress. If the Worker's WorkerEndpoint has failed or is not Ready, the
+update cannot finish and keeps the Worker busy, so nothing that names the
+Worker can be created or changed meanwhile; re-apply or delete that Endpoint
+first:
 
 ```sh
 GENERATION=$(curl -sS --fail-with-body "$V2/resources/$WORKER" \
   -H "authorization: Bearer $KEY" | jq -r .generation) &&
-recorded=$(curl -sS --fail-with-body -X PUT "$V2/resources/$WORKER" \
-    -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
-    -H 'idempotency-key: takoserver-first-use-hello-record' \
-    -H "takoform-expected-generation: $GENERATION" --data '{"spec": {}}') &&
+{ recorded=$(curl -sS --fail-with-body -X PUT "$V2/resources/$WORKER" \
+      -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+      -H 'idempotency-key: takoserver-first-use-hello-record' \
+      -H "takoform-expected-generation: $GENERATION" --data '{"spec": {}}') ||
+    { echo "hello-record: $recorded" >&2; false; }; } &&
 wait_operation "$(printf '%s' "$recorded" | jq -r .id)" hello-record
 ```
 
-`GET /resources/$WORKER` then reports `ready: true` and the Deployment's UID as
-`activeDeploymentUid`. In the console, open `hello` and choose **Record the
+`GET /resources/$WORKER` then reports `observed.ready: true`, with the
+Deployment's UID as `observed.activeDeploymentUid`. In the console, open `hello` and choose **Record the
 Deployment**; the page offers it only where the update can finish, and
 otherwise says what to do first.
 
