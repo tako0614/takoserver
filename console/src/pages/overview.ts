@@ -148,7 +148,9 @@ export function overviewPage(organization: Organization): Child {
                         {
                           class: "card",
                           style: { display: "block" },
-                          ...linkProps("/resources"),
+                          // Narrowed by the exact URL, so no other Form that
+                          // reads alike is swept in.
+                          ...linkProps(`/resources?form=${encodeURIComponent(entry.form)}`),
                         },
                         h(
                           "div",

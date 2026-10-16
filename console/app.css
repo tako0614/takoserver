@@ -541,6 +541,23 @@ tbody tr.is-clickable:hover {
   max-width: 24ch;
 }
 
+.filter-note {
+  color: var(--ink-3);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.filter-note strong {
+  color: var(--ink-1);
+  font-weight: 550;
+}
+
+.filter-note a {
+  color: var(--ink-1);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
 .resource-form {
   min-width: 16ch;
   font-size: 13px;

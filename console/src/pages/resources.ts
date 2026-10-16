@@ -19,11 +19,13 @@ import { createResource } from "./create-resource.ts";
  * Everything the organization has declared.
  *
  * The columns answer the questions a person actually arrives with: is it
- * working, what is it, where does it live, and when did it last move. The
- * exact Form URL is shown rather than a guessed catalog kind.
+ * working, what is it, where does it live, and when did it last move. A
+ * `?form=` in the address narrows the list to that exact Form URL, so the
+ * overview can link to one Form's Resources; the text filter still applies.
  */
 export function resourcesPage(organizationId: string): Child {
   const filter = signal("");
+  const onlyForm = route().query.get("form");
   const additional = signal<readonly ResourceSummary[]>([]);
   const continuation = signal<{ readonly cursor?: string } | null>(null);
   const loadingMore = signal(false);
@@ -290,6 +292,7 @@ export function resourcesPage(organizationId: string): Child {
             "div",
             { style: { display: "grid", gap: "14px" } },
             toolbar(filter),
+            onlyForm ? formNote(onlyForm) : null,
             nextCursor
               ? h(
                   "div",
@@ -302,7 +305,18 @@ export function resourcesPage(organizationId: string): Child {
               : null,
             card(
               null,
-              h("div", { class: "table-scroll" }, table(matchingResources(allResources, filter()))),
+              h(
+                "div",
+                { class: "table-scroll" },
+                table(
+                  matchingResources(
+                    onlyForm
+                      ? allResources.filter((entry) => entry.form === onlyForm)
+                      : allResources,
+                    filter(),
+                  ),
+                ),
+              ),
             ),
             pagingError(),
             nextCursor ? moreButton(nextCursor) : null,
@@ -323,9 +337,22 @@ function toolbar(filter: ReturnType<typeof signal<string>>): Child {
       style: { maxWidth: "300px" },
       type: "search",
       placeholder: tr("名前またはFormで絞り込み", "Filter by name or Form"),
+      "aria-label": tr("名前またはFormで絞り込み", "Filter by name or Form"),
       value: filter(),
       onInput: (event: Event) => filter.set((event.target as HTMLInputElement).value),
     }),
+  );
+}
+
+/** Says which Form the list is narrowed to, with the way back to all of them. */
+function formNote(form: string): Child {
+  return h(
+    "div",
+    { class: "filter-note" },
+    text(tr("Form：", "Form: ")),
+    h("strong", { title: form }, formName(form)),
+    text(" · "),
+    h("a", { ...linkProps("/resources") }, tr("すべて表示", "Show all")),
   );
 }
 

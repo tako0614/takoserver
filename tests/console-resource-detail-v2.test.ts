@@ -416,6 +416,89 @@ test("overview leads with resources and shows the wallet once it is in use", asy
   expect(spent).toContain("$0");
 });
 
+test("a By Form tile opens the list filtered to that exact Form", async () => {
+  const body = installDom();
+  const { consoleLocale } = await import("../console/src/i18n.ts");
+  const { organizations, selectOrganization, setApiOrigin } = await import(
+    "../console/src/state.ts"
+  );
+  const { route } = await import("../console/src/router.ts");
+  const { overviewPage } = await import("../console/src/pages/overview.ts");
+  const { resourcesPage } = await import("../console/src/pages/resources.ts");
+  consoleLocale.set("en");
+  setApiOrigin("https://api.example.test");
+  const organization = {
+    id: "org-one",
+    name: "One",
+    ownerPrincipalId: "owner",
+    createdAt: "2026-10-07",
+  };
+  organizations.set([organization]);
+  selectOrganization(organization.id);
+  const forms = "https://edge.forms.takoform.com/forms";
+  const item = (uid: string, form: string) => ({
+    uid,
+    form: `${forms}/${form}/`,
+    space: "org-one",
+    name: uid,
+    generation: 1,
+    observedGeneration: 1,
+    observedAt: "2026-10-07T00:00:00Z",
+    phase: "idle" as const,
+    spec: {},
+    observed: {},
+    output: {},
+    lastOperation: `op-${uid}`,
+  });
+  const items = [
+    item("hello-version-v1", "WorkerVersion/0.5.0"),
+    item("notes", "SQLiteDatabase/0.2.0"),
+    // Same kind and version under a differently spelled host: another Form.
+    {
+      ...item("other-version", "WorkerVersion/0.5.0"),
+      form: "https://EDGE.forms.takoform.com/forms/WorkerVersion/0.5.0/",
+    },
+  ];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/wallet"))
+        return Response.json({
+          wallet: {
+            organizationId: "org-one",
+            availableMicros: "0",
+            heldMicros: "0",
+            settledMicros: "0",
+            currency: "USD",
+            unit: "USD-micros",
+            moneyPolicy: "usd-micros-v2",
+            entries: [],
+          },
+        });
+      if (path.endsWith("/operations")) return Response.json({ operations: [] });
+      return Response.json({ items, nextCursor: null });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  body.append(overviewPage(organization) as unknown as NodeStub);
+  await settle();
+  const tile = body
+    .all()
+    .find((node) => node.tag === "a" && node.textContent.startsWith("WorkerVersion 0.5.0"));
+  const href = tile?.attributes.get("href") ?? "";
+  expect(href).toBe(`/resources?form=${encodeURIComponent(`${forms}/WorkerVersion/0.5.0/`)}`);
+  const target = new URL(href, "https://console.example.test");
+  route.set({ path: target.pathname, segments: ["resources"], query: target.searchParams });
+  const list = installDom();
+  list.append(resourcesPage("org-one") as unknown as NodeStub);
+  await settle();
+  expect(list.textContent).toContain("hello-version-v1");
+  expect(list.textContent).not.toContain("notes");
+  expect(list.textContent).not.toContain("other-version");
+  // The page says what it is narrowed to, and how to see everything.
+  expect(list.textContent).toContain("Form: WorkerVersion 0.5.0 · Show all");
+});
+
 test("names each referenced Resource where the spec names it", async () => {
   const { specReferences, publishedUrl } = await import("../console/src/pages/resource-detail.ts");
   expect(
