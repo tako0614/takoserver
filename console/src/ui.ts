@@ -297,7 +297,9 @@ export interface ModalOptions {
 }
 
 export function openModal(options: ModalOptions): () => void {
+  let stopBlocking: (() => void) | null = null;
   const close = (): void => {
+    stopBlocking?.();
     scrim.remove();
     document.removeEventListener("keydown", onKey);
   };
@@ -330,7 +332,7 @@ export function openModal(options: ModalOptions): () => void {
         });
       }
     });
-    if (blocked) effect(settle);
+    if (blocked) stopBlocking = effect(settle);
     confirm = button;
   }
 
