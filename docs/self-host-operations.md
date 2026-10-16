@@ -107,7 +107,7 @@ A self-host runs one of two profiles, selected by configuration:
     ```sh
     curl -fsSLO https://go.dev/dl/go1.26.9.linux-amd64.tar.gz
     sha256sum go1.26.9.linux-amd64.tar.gz
-    rm -rf /usr/local/go && tar -C /usr/local -xzf go1.26.9.linux-amd64.tar.gz
+    rm -rf /usr/local/go && tar -C /usr/local -xzf go1.26.9.linux-amd64.tar.gz   # replaces any Go there
     export PATH=/usr/local/go/bin:$PATH
     cd /opt/takoserver/services/workflow-execution-guard
     go build -o /usr/local/libexec/takoserver/workflow-execution-guard ./cmd/workflow-execution-guard
@@ -403,8 +403,9 @@ api.example.com:8443 {
 ```
 
 Install Caddy as root with `apt-get install caddy` (Ubuntu's universe
-repository, or Caddy's own package repository for a newer release), put the
-block in `/etc/caddy/Caddyfile` and run `systemctl reload caddy`. Caddy then
+repository, or Caddy's own package repository for a newer release), replace
+the packaged example in `/etc/caddy/Caddyfile` with the block (the example
+serves a welcome page on port 80) and run `systemctl reload caddy`. Caddy then
 obtains the certificate for `api.example.com` itself, which needs TCP 80 (see
 the table below).
 
