@@ -1053,6 +1053,32 @@ test("the record update is offered only where the Host can finish it", async () 
   expect(offered(pending.body)).toBe(false);
 });
 
+test("a WorkerCronTrigger stuck on the Worker is not something to wait for", async () => {
+  const trigger = {
+    ...resourceAt(
+      "uid-cron",
+      "hello-cron",
+      "https://edge.forms.takoform.com/forms/WorkerCronTrigger/0.3.0/",
+      { worker: { resourceUid: "uid-worker" }, cron: "*/5 * * * *" },
+    ),
+    generation: 4,
+  };
+  const { body } = await detailPage(
+    () => unrecordedWorker,
+    [servingDeployment],
+    [servingDeployment, publishedEndpoint, trigger],
+  );
+  expect(body.textContent).toContain(
+    "hello-cron cannot finish until this Worker records hello-deployment, and the Host refuses that update while it is in progress. Neither can be resolved from the console; it needs a fix on the Host.",
+  );
+  expect(body.textContent).not.toContain("Wait until");
+  expect(
+    body
+      .all()
+      .some((node) => node.tag === "button" && node.textContent === "Record the Deployment"),
+  ).toBe(false);
+});
+
 test("a Worker that still names an earlier Deployment is out of date too", async () => {
   const { body } = await detailPage(
     () => ({ ...unrecordedWorker, observed: { activeDeploymentUid: "uid-old", ready: true } }),

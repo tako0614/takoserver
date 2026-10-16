@@ -93,6 +93,7 @@ const FORM_KIND = (kind: string) => new RegExp(`/forms/${kind}/[^/]+/$`, "u");
 export const MODULE_WORKER = FORM_KIND("ModuleWorker");
 const WORKER_DEPLOYMENT = FORM_KIND("WorkerDeployment");
 export const WORKER_ENDPOINT = FORM_KIND("WorkerEndpoint");
+export const WORKER_CRON_TRIGGER = FORM_KIND("WorkerCronTrigger");
 
 /**
  * Each ModuleWorker among these Resources with what serves it: the

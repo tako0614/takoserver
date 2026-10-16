@@ -10,6 +10,7 @@ import {
   publishedUrl,
   type SpecReference,
   specReferences,
+  WORKER_CRON_TRIGGER,
   WORKER_ENDPOINT,
 } from "../references.ts";
 import { health, phaseLabel, unrecordedDeployment } from "../resource-state.ts";
@@ -345,61 +346,82 @@ function recordDeploymentNotice(organizationId: string, worker: ResourceSummary)
     if (!found) return plain();
     const { deployment, naming } = found;
     const referrers = naming.referrers.map(({ resource }) => resource);
-    const busy = referrers.filter((entry) => ["Pending", "Deleting"].includes(health(entry).phase));
+    const inProgress = referrers.filter((entry) =>
+      ["Pending", "Deleting"].includes(health(entry).phase),
+    );
+    // A WorkerCronTrigger cannot settle while its Worker has not recorded the
+    // Deployment, so it is not something to wait for.
+    const stuck = inProgress.filter((entry) => WORKER_CRON_TRIGGER.test(entry.form));
+    const busy = inProgress.filter((entry) => !stuck.includes(entry));
     const unpublished = referrers.filter(
       (entry) =>
         WORKER_ENDPOINT.test(entry.form) &&
-        !busy.includes(entry) &&
+        !inProgress.includes(entry) &&
         !(health(entry).phase === "Ready" && entry.observed.tlsReady === true),
     );
-    const next: Child = !naming.complete
-      ? h(
-          "span",
-          null,
-          tr(
-            "このWorkerを参照するリソースをすべては確認できなかったため、ここでは更新を提示しません。",
-            "Not everything that names this Worker could be checked here, so the update is not offered.",
-          ),
-        )
-      : busy.length > 0
+    const next: Child =
+      stuck.length > 0
         ? h(
             "span",
             null,
-            ...links(busy),
+            ...links(stuck),
+            tr("は、このWorkerが", " cannot finish until this Worker records "),
+            ...links([deployment]),
             tr(
-              "の処理が終わるまで待ってください。Workerを参照するリソースの処理中は、Hostはこの更新を受け付けません。",
-              busy.length === 1
-                ? " is in progress. Wait until it finishes: the Host refuses this update while anything that names the Worker is in progress."
-                : " are in progress. Wait until they finish: the Host refuses this update while anything that names the Worker is in progress.",
+              "を記録するまで完了できません。一方、その処理中はHostがこの更新を受け付けません。コンソールからは解消できず、Host側の修正が必要です。",
+              stuck.length === 1
+                ? ", and the Host refuses that update while it is in progress. Neither can be resolved from the console; it needs a fix on the Host."
+                : ", and the Host refuses that update while they are in progress. Neither can be resolved from the console; it needs a fix on the Host.",
             ),
           )
-        : unpublished.length > 0
+        : !naming.complete
           ? h(
               "span",
               null,
-              tr("先に", "Re-apply or delete "),
-              ...links(unpublished),
               tr(
-                "を再適用するか削除してください。稼働中になるまでこの更新は完了せず、その間Workerを処理中のままにします。",
-                " first. Until it is Ready, this update cannot finish, and it would hold the Worker busy meanwhile.",
+                "このWorkerを参照するリソースをすべては確認できなかったため、ここでは更新を提示しません。",
+                "Not everything that names this Worker could be checked here, so the update is not offered.",
               ),
             )
-          : h(
-              "button",
-              {
-                class: "btn",
-                type: "button",
-                onClick: () =>
-                  updateResource(organizationId, worker, {
-                    spec: worker.spec,
-                    note: tr(
-                      `${worker.name}を同じ設定のまま更新し、稼働中の配信${deployment.name}を記録します。内容を確認して受け付けてください。`,
-                      `This updates ${worker.name} with the same spec, so that it records ${deployment.name}. Check it, then accept.`,
-                    ),
-                  }),
-              },
-              tr("配信を記録する", "Record the Deployment"),
-            );
+          : busy.length > 0
+            ? h(
+                "span",
+                null,
+                ...links(busy),
+                tr(
+                  "の処理が終わるまで待ってください。Workerを参照するリソースの処理中は、Hostはこの更新を受け付けません。",
+                  busy.length === 1
+                    ? " is in progress. Wait until it finishes: the Host refuses this update while anything that names the Worker is in progress."
+                    : " are in progress. Wait until they finish: the Host refuses this update while anything that names the Worker is in progress.",
+                ),
+              )
+            : unpublished.length > 0
+              ? h(
+                  "span",
+                  null,
+                  tr("先に", "Re-apply or delete "),
+                  ...links(unpublished),
+                  tr(
+                    "を再適用するか削除してください。稼働中になるまでは、この更新を送っても完了せず、その間Workerが処理中のままになります。",
+                    " first. Until it is Ready, this update cannot finish, and it would hold the Worker busy meanwhile.",
+                  ),
+                )
+              : h(
+                  "button",
+                  {
+                    class: "btn",
+                    type: "button",
+                    onClick: () =>
+                      updateResource(organizationId, worker, {
+                        spec: worker.spec,
+                        note: tr(
+                          `${worker.name}を同じ設定のまま更新し、稼働中の配信${deployment.name}を記録します。内容を確認して受け付けてください。`,
+                          `This updates ${worker.name} with the same spec, so that it records ${deployment.name}. Check it, then accept.`,
+                        ),
+                      }),
+                  },
+                  tr("配信を記録する", "Record the Deployment"),
+                );
     return h(
       "div",
       {
