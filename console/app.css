@@ -1087,8 +1087,11 @@ tbody tr.is-clickable:hover {
   color: var(--ink-3);
 }
 
+/* A UID or a 64-character Binding name has no break points of its own. */
+.row__label,
 .row__value {
   min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .row__value a,

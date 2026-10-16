@@ -357,13 +357,13 @@ test("names each referenced Resource where the spec names it", async () => {
       handlers: ["fetch"],
       sqliteBindings: [{ name: "DB", resource: { resourceUid: "uid-db" } }],
       versions: [{ workerVersion: { resourceUid: "uid-version" }, weight: 10000 }],
-      vars: { note: { resourceUid: "not-a-reference", extra: true } },
+      vars: { note: { resourceUid: "not-a-reference", extra: true }, CONFIG: { resourceUid: "x" } },
     }),
   ).toEqual([
     { path: "worker", uid: "uid-worker" },
     { path: "bundle", uid: "uid-bundle" },
     { path: "sqliteBindings · DB", uid: "uid-db" },
-    { path: "versions · #1 · workerVersion", uid: "uid-version" },
+    { path: "versions[0] · workerVersion", uid: "uid-version" },
   ]);
   expect(specReferences({})).toEqual([]);
   expect(publishedUrl({ hostname: "hello.example.com", url: "https://hello.example.com/" })).toBe(
@@ -417,6 +417,7 @@ test("resource detail links the Resources a spec names and its published URL", a
         worker: { resourceUid: "uid-worker" },
         bundle: { resourceUid: "uid-bundle" },
         sqliteBindings: [{ name: "DB", resource: { resourceUid: "uid-gone" } }],
+        kvBindings: [{ name: "CACHE", resource: { resourceUid: "uid-broken" } }],
       },
       { url: "https://hello.apps.example.com/" },
     ),
@@ -428,7 +429,10 @@ test("resource detail links the Resources a spec names and its published URL", a
     async (input: RequestInfo | URL) => {
       const path = new URL(String(input)).pathname;
       paths.push(path);
-      const found = resources[path.split("/").at(-1) ?? ""];
+      const uid = path.split("/").at(-1) ?? "";
+      if (uid === "uid-broken")
+        return Response.json({ error: { code: "internal" } }, { status: 500 });
+      const found = resources[uid];
       return found
         ? Response.json(found)
         : Response.json({ error: { code: "not_found" } }, { status: 404 });
@@ -439,17 +443,18 @@ test("resource detail links the Resources a spec names and its published URL", a
   await settle();
   expect(new Set(paths)).toEqual(
     new Set(
-      ["uid-version", "uid-worker", "uid-bundle", "uid-gone"].map(
+      ["uid-version", "uid-worker", "uid-bundle", "uid-gone", "uid-broken"].map(
         (uid) => `/apis/forms.takoform.com/v2/resources/${uid}`,
       ),
     ),
   );
   const text = body.textContent;
-  expect(text).toContain("Resources it names");
+  expect(text).toContain("Referenced resources");
   expect(text).toContain("sqliteBindings · DB");
   expect(text).toContain("ModuleWorker 0.3.0");
   expect(text).toContain("WorkerBundle 0.2.0");
   expect(text).toContain("uid-gone — not in this organization");
+  expect(text).toContain("uid-broken — could not be read");
   const links = body.all().filter((node) => node.tag === "a");
   const worker = links.find((node) => node.textContent === "hello");
   expect(worker?.attributes.get("href")).toBe("/resources/uid-worker");
