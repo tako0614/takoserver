@@ -1178,6 +1178,7 @@ tbody tr.is-clickable:hover {
   overflow-wrap: anywhere;
 }
 
+.row__label a,
 .row__value a,
 .published a {
   color: var(--ink-1);
@@ -1187,6 +1188,7 @@ tbody tr.is-clickable:hover {
   overflow-wrap: anywhere;
 }
 
+.row__label a:hover,
 .row__value a:hover,
 .published a:hover {
   text-decoration-color: var(--accent);

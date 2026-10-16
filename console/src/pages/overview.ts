@@ -1,8 +1,14 @@
-import { formatMicrosCurrency, type Organization, type Wallet } from "../api.ts";
+import {
+  formatMicrosCurrency,
+  type Organization,
+  type ResourceSummary,
+  type Wallet,
+} from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
 import { formName } from "../forms.ts";
 import { consoleLocale, tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
+import { servedWorkers } from "../references.ts";
 import { byForm, health, phaseLabel } from "../resource-state.ts";
 import { linkProps, resourcePath } from "../router.ts";
 import { api } from "../state.ts";
@@ -35,8 +41,8 @@ export function overviewPage(organization: Organization): Child {
           "p",
           null,
           tr(
-            "Takoformで宣言したリソースの状態と、最近の変更を確認できます。",
-            "The state of the resources you declared with Takoform, and what changed recently.",
+            "Takoformで宣言したリソースの状態と、公開中のWorkerを確認できます。",
+            "The state of the resources you declared with Takoform, and the Workers you serve.",
           ),
         ),
       ),
@@ -132,59 +138,64 @@ export function overviewPage(organization: Organization): Child {
                   ),
                 ),
               )
-            : card(
-                cursor === null
-                  ? tr("Form別", "By Form")
-                  : tr("Form別（最初のページ）", "By Form (first page)"),
-                h(
-                  "div",
-                  { class: "card__body" },
+            : h(
+                "div",
+                { style: { display: "grid", gap: "18px" } },
+                workersCard(all, cursor !== null),
+                card(
+                  cursor === null
+                    ? tr("Form別", "By Form")
+                    : tr("Form別（最初のページ）", "By Form (first page)"),
                   h(
                     "div",
-                    { class: "grid" },
-                    ...byForm(all).map((entry) =>
-                      h(
-                        "a",
-                        {
-                          class: "card",
-                          style: { display: "block" },
-                          // Narrowed by the exact URL, so no other Form that
-                          // reads alike is swept in.
-                          ...linkProps(`/resources?form=${encodeURIComponent(entry.form)}`),
-                        },
+                    { class: "card__body" },
+                    h(
+                      "div",
+                      { class: "grid" },
+                      ...byForm(all).map((entry) =>
                         h(
-                          "div",
-                          { class: "card__body" },
+                          "a",
+                          {
+                            class: "card",
+                            style: { display: "block" },
+                            // Narrowed by the exact URL, so no other Form that
+                            // reads alike is swept in.
+                            ...linkProps(`/resources?form=${encodeURIComponent(entry.form)}`),
+                          },
                           h(
                             "div",
-                            { class: "stat__form", title: entry.form },
-                            formName(entry.form),
-                          ),
-                          h("div", { class: "stat__value" }, String(entry.total)),
-                          entry.attention > 0
-                            ? h(
-                                "div",
-                                { style: { marginTop: "6px" } },
-                                badge(
-                                  tr(
-                                    `${entry.attention}件に確認が必要`,
-                                    `${entry.attention} need attention`,
+                            { class: "card__body" },
+                            h(
+                              "div",
+                              { class: "stat__form", title: entry.form },
+                              formName(entry.form),
+                            ),
+                            h("div", { class: "stat__value" }, String(entry.total)),
+                            entry.attention > 0
+                              ? h(
+                                  "div",
+                                  { style: { marginTop: "6px" } },
+                                  badge(
+                                    tr(
+                                      `${entry.attention}件に確認が必要`,
+                                      `${entry.attention} need attention`,
+                                    ),
+                                    "warn",
+                                    true,
                                   ),
-                                  "warn",
-                                  true,
-                                ),
-                              )
-                            : null,
+                                )
+                              : null,
+                          ),
                         ),
                       ),
                     ),
                   ),
-                ),
-                h(
-                  "a",
-                  { class: "btn btn--sm", ...linkProps("/resources") },
-                  text(tr("すべて表示", "View all")),
-                  icon(ICON.chevron, 13),
+                  h(
+                    "a",
+                    { class: "btn btn--sm", ...linkProps("/resources") },
+                    text(tr("すべて表示", "View all")),
+                    icon(ICON.chevron, 13),
+                  ),
                 ),
               ),
         { retry: resources.reload },
@@ -316,6 +327,49 @@ export function overviewPage(organization: Organization): Child {
               ),
         { skeleton: h("div", { style: { display: "none" } }) },
       ),
+    ),
+  );
+}
+
+/**
+ * Each Worker with the state of the Deployment serving it and the addresses
+ * it is published at: what someone signing in most wants to know.
+ */
+function workersCard(all: readonly ResourceSummary[], partial: boolean): Child {
+  const workers = servedWorkers(all);
+  if (workers.length === 0) return null;
+  return card(
+    partial ? tr("Worker（最初のページ）", "Workers (first page)") : tr("Worker", "Workers"),
+    h(
+      "div",
+      { class: "card__body rows" },
+      ...workers.map(({ worker, deployment, urls }) => {
+        const state = health(deployment ?? worker);
+        return h(
+          "div",
+          { class: "row" },
+          h(
+            "div",
+            { class: "row__label" },
+            h("a", { class: "mono", ...linkProps(resourcePath(worker.uid)) }, worker.name),
+          ),
+          h(
+            "div",
+            { class: "row__value ref" },
+            badge(phaseLabel(state.phase), state.tone, true),
+            ...(urls.length > 0
+              ? urls.map((url) =>
+                  h(
+                    "a",
+                    { href: url, target: "_blank", rel: "noopener noreferrer" },
+                    url,
+                    h("span", { "aria-hidden": "true" }, " ↗"),
+                  ),
+                )
+              : [h("span", { class: "dim" }, tr("公開先はまだありません", "Not published yet"))]),
+          ),
+        );
+      }),
     ),
   );
 }
