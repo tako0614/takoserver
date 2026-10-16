@@ -90,14 +90,14 @@ const landingMessages = {
     resultLabel: "Then request it, with the UID the Endpoint's create returned in $ENDPOINT:",
     deployMore: "Steps 6 to 9 in the guide",
     afterTitle: "After you deploy",
-    consoleTitle: "See it in the console",
+    consoleTitle: "Use the console",
     consoleBody:
-      "The console shows each Worker with the address it is served at and whether it is Ready, and every Resource with what you declared and what the Host last observed. It is a static app built from this repository and served on its own origin next to the API.",
+      "The console creates the same Resources in the browser. Choose a Form and it fills in the smallest spec this Host accepts; each Resource the spec refers to is chosen by name, and nothing is sent until you accept. It shows each Worker with the address it is served at and whether it is Ready. It is a static app built from this repository and served on its own origin next to the API.",
     consoleSetup: "Set up the console (install guide, step 5)",
     consoleHost: "Open this Host's console",
     shipTitle: "Ship a new version",
     shipBody:
-      "Code never changes in place. Create the new code and a version for it, then point the Deployment at that version; the Endpoint keeps its address.",
+      "Code never changes in place. Create the new code and a version for it, then point the Deployment at that version; the Endpoint keeps its address. In the console, choose “Serve this version” on the new version's page; it prepares this update for you to accept.",
     shipBundle:
       "holds the new worker.js, by the URL and SHA-256 of its manifest (a seeded bundle needs a Host restart first).",
     shipVersion: "pairs the new WorkerBundle with its fetch handler.",
@@ -165,14 +165,14 @@ const landingMessages = {
     resultLabel: "公開したら、Endpointの作成で返ったUIDを$ENDPOINTに入れてリクエストします。",
     deployMore: "手順書の手順6〜9",
     afterTitle: "デプロイしたあと",
-    consoleTitle: "コンソールで確かめる",
+    consoleTitle: "コンソールを使う",
     consoleBody:
-      "コンソールには、各Workerの公開先と稼働中かどうか、各リソースの宣言した内容とHostが最後に観測した状態が表示されます。コンソールはこのリポジトリからビルドする静的アプリで、APIと並ぶ別のオリジンで配信します。",
+      "コンソールでも、同じリソースをブラウザーから作成できます。Formを選ぶとこのHostが受け付ける最小の設定が入り、設定が参照するリソースは名前で選べます。受け付けるまでは何も送信されません。各Workerの公開先と稼働中かどうかも表示されます。コンソールはこのリポジトリからビルドする静的アプリで、APIと並ぶ別のオリジンで配信します。",
     consoleSetup: "コンソールを用意する（導入手順書の手順5）",
     consoleHost: "このHostのコンソールを開く",
     shipTitle: "新しい版を出す",
     shipBody:
-      "動いているコードは書き換えられません。新しいコードと版を作り、Deploymentをその版に切り替えます。Endpointの公開先はそのままです。",
+      "動いているコードは書き換えられません。新しいコードと版を作り、Deploymentをその版に切り替えます。Endpointの公開先はそのままです。コンソールでは、新しい版のページの「この版を配信する」がこの更新を用意し、受け付けると送信されます。",
     shipBundle:
       "新しいworker.jsを、そのmanifestのURLとSHA-256で指定します（Hostに保持させた場合は、先にHostを再起動します）。",
     shipVersion: "新しいWorkerBundleとfetchハンドラーを組み合わせた版です。",

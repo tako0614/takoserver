@@ -878,6 +878,25 @@ after the upgrade; delete it or re-apply it.
 Read any Resource back with
 `GET /apis/forms.takoform.com/v2/resources/{resourceUid}` using the same key.
 
+**In the console.** If you serve the console (step 5), it can create the same
+Worker once step 6 has seeded the bundle. Choose **New resource** and a Form:
+the dialog fills in the smallest spec this Host accepts for that Form, and each
+place that names another Resource lists the organization's Resources of the
+Form the Host requires, by name. Nothing is sent until you accept, and
+**Request to send** shows the exact request first.
+
+1. Create the `ModuleWorker` `hello`.
+2. Create the `WorkerBundle` `hello-bundle-v1`, with `artifact.url` and
+   `artifact.sha256` from `$WORK/hello-v1.json`.
+3. Create the `WorkerVersion` `hello-version-v1`, choosing `hello` and
+   `hello-bundle-v1`.
+4. Once the version is Ready, open its page and choose **Serve this version**.
+   It creates the Worker's `WorkerDeployment` with that version at weight
+   10000; name it `hello-deployment`.
+5. Once the Deployment is Ready, create the `WorkerEndpoint` `hello-endpoint`,
+   choosing `hello`. Once it is published, the overview shows the Worker's
+   address, and the Endpoint page's **Output** has its `hostname`.
+
 ### 9. Verify
 
 ```sh
@@ -922,6 +941,11 @@ updated=$(jq -nc --arg w "$WORKER" --arg v "$VERSION_V2" \
     -H "takoform-expected-generation: $GENERATION" --data @-) &&
 wait_operation "$(printf '%s' "$updated" | jq -r .id)" hello-deployment-v2
 ```
+
+In the console, create the new `WorkerBundle` and `WorkerVersion` as in step 8,
+then open `hello-version-v2` and choose **Serve this version**. It opens the
+update of `hello-deployment` with that version alone at weight 10000, under the
+generation it read, and sends it when you accept.
 
 `tests/selfhost-v2-ordinary-journey-native.test.ts`
 runs this path with real Host and workerd processes and seeds through the same
