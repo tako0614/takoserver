@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { formLabel, KNOWN_FORM_GROUPS } from "../console/src/forms.ts";
+import { formLabel, formName, KNOWN_FORM_GROUPS } from "../console/src/forms.ts";
 import { ACTOR_NAMESPACE_FORM_URL } from "../src/takoform-v2/forms/actor-namespace.ts";
 import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "../src/takoform-v2/forms/at-least-once-queue.ts";
 import { EDGE_KV_NAMESPACE_FORM_URL } from "../src/takoform-v2/forms/edge-kv-namespace.ts";
@@ -47,6 +47,16 @@ test("the Console asks about exactly the Forms the Host implements", () => {
 test("names a Form by kind and version", () => {
   expect(formLabel(MODULE_WORKER_FORM_URL)).toBe("ModuleWorker 0.3.0");
   expect(formLabel("https://forms.example.test/Widget/1.0.0")).toBe(
+    "https://forms.example.test/Widget/1.0.0",
+  );
+});
+
+test("reads a Form in a list by kind and version, naming any other host", () => {
+  expect(formName(WORKER_BUNDLE_FORM_URL)).toBe("WorkerBundle 0.2.0");
+  expect(formName("https://forms.example.com/forms/Widget/1.0.0/")).toBe(
+    "forms.example.com · Widget 1.0.0",
+  );
+  expect(formName("https://forms.example.test/Widget/1.0.0")).toBe(
     "https://forms.example.test/Widget/1.0.0",
   );
 });

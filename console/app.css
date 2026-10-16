@@ -443,12 +443,13 @@ textarea {
   color: var(--ink-4);
 }
 
-/* An exact Form URL keeps its case and wraps inside its card. */
+/* A Form's kind and version (its host too, off the edge Forms host),
+   in its own case, wrapping inside its card. */
 .stat__form {
-  font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: 12.5px;
+  font-weight: 500;
   letter-spacing: 0;
-  color: var(--ink-3);
+  color: var(--ink-2);
   overflow-wrap: anywhere;
 }
 
@@ -541,8 +542,8 @@ tbody tr.is-clickable:hover {
 }
 
 .resource-form {
-  min-width: 24ch;
-  font-size: 12px;
+  min-width: 16ch;
+  font-size: 13px;
   overflow-wrap: anywhere;
 }
 

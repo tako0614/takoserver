@@ -1,5 +1,6 @@
 import { formatMicrosCurrency, type Organization, type Wallet } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
+import { formName } from "../forms.ts";
 import { consoleLocale, tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
 import { byForm, health, phaseLabel } from "../resource-state.ts";
@@ -152,7 +153,11 @@ export function overviewPage(organization: Organization): Child {
                         h(
                           "div",
                           { class: "card__body" },
-                          h("div", { class: "stat__form" }, entry.form),
+                          h(
+                            "div",
+                            { class: "stat__form", title: entry.form },
+                            formName(entry.form),
+                          ),
                           h("div", { class: "stat__value" }, String(entry.total)),
                           entry.attention > 0
                             ? h(

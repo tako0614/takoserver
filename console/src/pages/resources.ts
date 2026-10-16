@@ -1,5 +1,6 @@
 import type { ResourceSummary } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
+import { formName } from "../forms.ts";
 import { tr } from "../i18n.ts";
 import { resource, signal } from "../reactive.ts";
 import {
@@ -390,14 +391,14 @@ function row(entry: ResourceSummary): Child {
     ),
     // Every row is in the selected organization's Space, so the Space is
     // not repeated per row. A long name is cut with an ellipsis (the whole
-    // name is its title and the detail page heading) and the exact Form URL
-    // wraps; on a phone each row stacks so the URL gets the full width.
+    // name is its title and the detail page heading). The Form reads as its
+    // kind and version; the exact URL is its title and on the detail page.
     h(
       "td",
       { class: "resource-name", role: "cell" },
       h("a", { class: "mono truncate", title: entry.name, ...linkProps(href) }, entry.name),
     ),
-    h("td", { class: "resource-form dim mono", role: "cell" }, entry.form),
+    h("td", { class: "resource-form dim", role: "cell", title: entry.form }, formName(entry.form)),
     h(
       "td",
       {
