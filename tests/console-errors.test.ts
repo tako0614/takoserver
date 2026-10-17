@@ -63,6 +63,14 @@ test("says what to do for the refusals a Resource change meets", () => {
   );
   expect(said("invalid_spec")).toStartWith("This Host does not accept that spec for the Form.");
   expect(said("unsupported_form")).toBe("This Host does not serve that exact Form.");
+  // The Host's bare refusal of a malformed request; the console's own check
+  // under the same code, which no Host answered, stays as its code.
+  expect(explain(new ApiError("invalid_request", 400, "/apis/forms.takoform.com/v2"))).toBe(
+    "The Host did not accept this request as written. Check what you entered.",
+  );
+  expect(explain(new ApiError("invalid_request", 0, "/v1/organizations/o/payments"))).toBe(
+    "The server refused this: invalid_request",
+  );
   // A code the console does not know is still shown, so it can be quoted.
   expect(said("private_inputs_conflict")).toBe("The server refused this: private_inputs_conflict");
 });
