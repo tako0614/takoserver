@@ -407,8 +407,8 @@ function recordDeploymentNotice(organizationId: string, worker: ResourceSummary)
                       updateResource(organizationId, worker, {
                         spec: worker.spec,
                         note: tr(
-                          `${worker.name}を同じ設定のまま更新し、稼働中の配信${deployment.name}を記録します。内容を確認して受け付けてください。`,
-                          `This updates ${worker.name} with the same spec, so that it records ${deployment.name}. Check it, then accept.`,
+                          `${worker.name}を同じ設定のまま更新し、稼働中の配信${deployment.name}を記録します。内容を確認して「更新する」を押してください。`,
+                          `This updates ${worker.name} with the same spec, so that it records ${deployment.name}. Check it, then choose Save change.`,
                         ),
                       }),
                   },
@@ -475,12 +475,12 @@ function newVersionAction(organizationId: string, version: ResourceSummary): Chi
           spec,
           note: hasCode
             ? tr(
-                `版は変更できないため、${version.name}の設定（ハンドラー・変数・Bindingを含む）から新しい版を作成します。新しいコードを選び、名前を付けて受け付けてください。その後、新しい版のページから配信できます。`,
-                `A version cannot be changed, so this creates a new one from ${version.name}'s spec, with its handlers, vars and Bindings. Choose its new code, name it, then accept; you can then serve it from its page.`,
+                `版は変更できないため、${version.name}の設定（ハンドラー・変数・Bindingを含む）から新しい版を作成します。新しいコードを選び、名前を付けて「作成する」を押してください。その後、新しい版のページから配信できます。`,
+                `A version cannot be changed, so this creates a new one from ${version.name}'s spec, with its handlers, vars and Bindings. Choose its new code, name it, then choose Create; you can then serve it from its page.`,
               )
             : tr(
-                `版は変更できないため、${version.name}の設定から新しい版を作成します。assets.bundleを新しいStaticAssetBundleのUIDに書き換え、名前を付けて受け付けてください。その後、新しい版のページから配信できます。`,
-                `A version cannot be changed, so this creates a new one from ${version.name}'s spec. Write the new StaticAssetBundle's UID in assets.bundle, name it, then accept; you can then serve it from its page.`,
+                `版は変更できないため、${version.name}の設定から新しい版を作成します。assets.bundleを新しいStaticAssetBundleのUIDに書き換え、名前を付けて「作成する」を押してください。その後、新しい版のページから配信できます。`,
+                `A version cannot be changed, so this creates a new one from ${version.name}'s spec. Write the new StaticAssetBundle's UID in assets.bundle, name it, then choose Create; you can then serve it from its page.`,
               ),
         }),
     },
@@ -560,20 +560,20 @@ function serveVersionAction(organizationId: string, version: ResourceSummary): C
                   split +
                   (split
                     ? tr(
-                        `${deployment.name}を更新します。内容を確認して「更新を受け付ける」を押してください。`,
-                        `This updates ${deployment.name}. Check it, then accept.`,
+                        `${deployment.name}を更新します。内容を確認して「更新する」を押してください。`,
+                        `This updates ${deployment.name}. Check it, then choose Save change.`,
                       )
                     : tr(
-                        `${deployment.name}を更新し、${version.name}だけを重み10000で配信します。内容を確認して「更新を受け付ける」を押してください。`,
-                        `This updates ${deployment.name} to serve only ${version.name}, at weight 10000. Check it, then accept.`,
+                        `${deployment.name}を更新し、${version.name}だけを重み10000で配信します。内容を確認して「更新する」を押してください。`,
+                        `This updates ${deployment.name} to serve only ${version.name}, at weight 10000. Check it, then choose Save change.`,
                       )),
               })
             : createResource(organizationId, {
                 form: WORKER_DEPLOYMENT,
                 spec: { worker: { resourceUid: workerUid }, versions },
                 note: tr(
-                  `このWorkerにはまだ配信（WorkerDeployment）がありません。${version.name}を配信するWorkerDeploymentを作成します。名前を付けて「受け付ける」を押してください。`,
-                  `This Worker has no Deployment yet. This creates one that serves ${version.name}. Name it, then accept.`,
+                  `このWorkerにはまだ配信（WorkerDeployment）がありません。${version.name}を配信するWorkerDeploymentを作成します。名前を付けて「作成する」を押してください。`,
+                  `This Worker has no Deployment yet. This creates one that serves ${version.name}. Name it, then choose Create.`,
                 ),
               }),
       },

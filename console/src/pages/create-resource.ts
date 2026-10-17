@@ -683,7 +683,7 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
   const refusal = refusalNotice();
   const close = openModal({
     title: tr("リソースを作成", "New resource"),
-    confirmLabel: tr("受け付ける", "Accept create"),
+    confirmLabel: tr("作成する", "Create"),
     body: h(
       "div",
       { style: { display: "grid", gap: "14px" } },
@@ -832,7 +832,7 @@ export function updateResource(
   const refusal = refusalNotice();
   const close = openModal({
     title: tr(`${resource.name}を更新`, `Update ${resource.name}`),
-    confirmLabel: tr("更新を受け付ける", "Accept update"),
+    confirmLabel: tr("更新する", "Save change"),
     body: h(
       "div",
       { class: "field" },
