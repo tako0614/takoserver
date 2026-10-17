@@ -957,8 +957,8 @@ curl -sS http://127.0.0.1:8787/_takoserver/health/ready
 ```
 
 The Endpoint answers with the Worker's response, and readiness reports
-`workerRuntime: serving` with the v2 Worker counts described below and no
-`degraded` flag; [Monitoring](#monitoring) explains its backlog and background
+`workerRuntime: serving` with the v2 Worker counts and no `degraded` flag;
+[Monitoring](#monitoring) explains those counts and the backlog and background
 pass sections. A restart keeps serving published Workers without a client
 republish.
 
@@ -990,6 +990,10 @@ Deployment's UID as `observed.activeDeploymentUid`. In the console, open
 the update can finish, and otherwise says what to do first.
 
 ### 10. Ship a new version
+
+Code never changes in place: new code is a new `WorkerBundle` and
+`WorkerVersion`, and the Deployment is pointed at the new version, so the
+Endpoint keeps its address.
 
 To ship new code, put the new files in `$WORK/hello/v2` and give the Host
 their bytes in one of two ways:
@@ -1071,10 +1075,10 @@ Deployment it recorded, so it needs no second record.
 `PUT` naming `$VERSION`. Keep v1 until v2 has served for a while, because step
 12 deletes a version only once nothing serves it.
 
-`tests/selfhost-v2-ordinary-journey-native.test.ts`
-runs this path, apart from recording the Deployment on the Worker, with real
-Host and workerd processes and seeds through the same
-command; [the ordinary journey native test](#ordinary-journey-native-test-and-known-gaps)
+`tests/selfhost-v2-ordinary-journey-native.test.ts` runs steps 8 to 10 with
+real Host and workerd processes, apart from recording the Deployment on the
+Worker, and ships v2 by seeding through the same command;
+[the ordinary journey native test](#ordinary-journey-native-test-and-known-gaps)
 describes its scope and limits.
 
 ### 11. Bind a SQLite database
@@ -1521,7 +1525,7 @@ Serving owners turn a would-be `not-required` into `serving`. One or more
 unavailable owners add `degraded: true` but keep the response `200` when SQLite
 answered: this probe shares its port with the control API, and one broken tenant
 Worker must not make a load balancer withdraw the operator API. The `backlog`
-and `backgroundPasses` sections described in [Monitoring](#monitoring) set
+and `backgroundPasses` sections described below set
 `degraded` the same way. Read `degraded` and the counts to alert on tenant
 Workers and stuck work. The response is `503` only when SQLite did not answer,
 the boot restore failed, the legacy runtime is unavailable, or the v2 owner
@@ -1538,7 +1542,7 @@ checks the exact accepted listener around one loopback HTTP request (250 ms
 request bound, 500 ms total observation bound); it does not schedule recovery.
 The response contains no raw errors, paths, organization, Resource, Operation or
 Worker identifiers, background pass names, or secrets. It does carry Host-wide
-counts (v2 owners, stalled work, failing passes); see [Monitoring](#monitoring)
+counts (v2 owners, stalled work, failing passes); read the rest of this section
 before exposing `/_takoserver/` beyond the Host. A `serving` result means this
 Host's current workerd child passed the Host-owned listener readiness check; it
 is not a claim that every Form, provider, or tenant Worker application is ready.
