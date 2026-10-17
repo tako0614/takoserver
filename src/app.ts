@@ -62,6 +62,7 @@ import {
 } from "./resource-migrations.ts";
 import { createRouter, type Router } from "./router.ts";
 import type { RuntimeInputAuthority } from "./runtime-input-preparations.ts";
+import { SHARED_AUTH_STAGING_PROFILE } from "./shared-auth-oidc-client.ts";
 import {
   type ArtifactReconcileReport,
   type ArtifactReconciler,
@@ -125,7 +126,10 @@ import {
 } from "./worker-endpoint-origin-v2-acceptance.ts";
 import {
   createWorkerRequestConsumers,
+  readWorkerRequestConsumers,
+  readWorkerRequestFinancialInputs,
   type WorkerRequestAppInputs,
+  type WorkerRequestConsumers,
 } from "./worker-request-composition.ts";
 
 /**
@@ -140,7 +144,10 @@ import {
 
 export interface AppPorts {
   /** Entry-owned fresh primary request composition; absent preserves ordinary construction. */
-  readonly workerRequest?: WorkerRequestAppInputs;
+  readonly workerRequest?: WorkerRequestAppInputs & {
+    /** Original graph opt-in; matching objects and alternate construction inputs are refused. */
+    readonly originalConsumers?: WorkerRequestConsumers;
+  };
   /** The exact inventory/deployment stores precomposed for native startup. */
   readonly resourceStores?: AppResourceStoreBundle;
   /** Host-only optional data-plane factory, built against these same canonical ledgers. */
@@ -559,18 +566,73 @@ export function buildApp(ports: AppPorts): App {
     randomId,
   });
 
-  const workerRequest =
-    ports.workerRequest === undefined
-      ? undefined
-      : createWorkerRequestConsumers({
-          ...ports.workerRequest,
-          sql: ports.sql,
-          identity: ports.identity,
-          clock,
-          randomId,
-          publicOrigin: ports.publicOrigin,
-          consoleOrigin: ports.consoleOrigin,
-        });
+  const workerRequest = (() => {
+    const selectionSlot = Object.getOwnPropertyDescriptor(ports, "workerRequest");
+    if (selectionSlot === undefined) return undefined;
+    if (!("value" in selectionSlot))
+      throw new TypeError("Worker request selection must be an own data property");
+    const selected: AppPorts["workerRequest"] = selectionSlot.value;
+    if (selected === undefined) return undefined;
+    const originalSlot = Object.getOwnPropertyDescriptor(selected, "originalConsumers");
+    if (originalSlot !== undefined && !("value" in originalSlot))
+      throw new TypeError("original Worker request graph must be an own data property");
+    if (originalSlot === undefined || originalSlot.value === undefined)
+      return createWorkerRequestConsumers({
+        ...selected,
+        sql: ports.sql,
+        identity: ports.identity,
+        clock,
+        randomId,
+        publicOrigin: ports.publicOrigin,
+        consoleOrigin: ports.consoleOrigin,
+      });
+    const connectionSlot = Object.getOwnPropertyDescriptor(selected, "connection");
+    const clientSlot = Object.getOwnPropertyDescriptor(selected, "client");
+    const realmSlot = Object.getOwnPropertyDescriptor(selected, "realm");
+    const sqlSlot = Object.getOwnPropertyDescriptor(ports, "sql");
+    const clockSlot = Object.getOwnPropertyDescriptor(ports, "clock");
+    const publicOriginSlot = Object.getOwnPropertyDescriptor(ports, "publicOrigin");
+    const consoleOriginSlot = Object.getOwnPropertyDescriptor(ports, "consoleOrigin");
+    if (
+      !connectionSlot ||
+      !("value" in connectionSlot) ||
+      !clientSlot ||
+      !("value" in clientSlot) ||
+      !realmSlot ||
+      !("value" in realmSlot) ||
+      !sqlSlot ||
+      !("value" in sqlSlot) ||
+      !clockSlot ||
+      !("value" in clockSlot) ||
+      !publicOriginSlot ||
+      !("value" in publicOriginSlot) ||
+      !consoleOriginSlot ||
+      !("value" in consoleOriginSlot)
+    )
+      throw new TypeError("original Worker request inputs must be own data properties");
+    const connection: WorkerRequestAppInputs["connection"] = connectionSlot.value;
+    const client: WorkerRequestAppInputs["client"] = clientSlot.value;
+    const realm: WorkerRequestAppInputs["realm"] = realmSlot.value;
+    const sql: AppPorts["sql"] = sqlSlot.value;
+    const originalConsumers: WorkerRequestConsumers = originalSlot.value;
+    const original = readWorkerRequestConsumers(connection);
+    const inputs = readWorkerRequestFinancialInputs(connection);
+    if (
+      originalConsumers !== original ||
+      original.sql !== sql ||
+      original.client !== client ||
+      original.realm !== realm ||
+      inputs.sql !== sql ||
+      inputs.client !== client ||
+      inputs.realm !== realm ||
+      inputs.clock !== clock ||
+      clockSlot.value !== clock ||
+      publicOriginSlot.value !== SHARED_AUTH_STAGING_PROFILE.publicOrigin ||
+      consoleOriginSlot.value !== SHARED_AUTH_STAGING_PROFILE.consoleOrigin
+    )
+      throw new TypeError("original Worker request graph differs from this App");
+    return original;
+  })();
   const apiKeyAdministration =
     workerRequest?.apiKeyAdministration ??
     createApiKeyAdministration({

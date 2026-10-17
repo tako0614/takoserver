@@ -2,6 +2,7 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as financialRequestOrigin from "@takoserver/core/financial-request-origin";
 import sharedPricing from "../config/shared-hosted-pricing.json";
 import { moneyFenceInstallSql } from "../scripts/deploy/schema-money-unit-cutover.ts";
+import { type AppPorts, buildApp } from "../src/app.ts";
 import {
   assertAuthTokenCaptureReader,
   assertRetainedDirectOwnerSessionReader,
@@ -19,6 +20,7 @@ import {
   MONEY_CUTOVER_PERMIT_DDL,
   MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
 } from "../src/money-cutover-sql.ts";
+import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import type { Clock, SqlParam, SqlStatement, SqlWrite } from "../src/ports.ts";
 import { createRouter } from "../src/router.ts";
 import { SHARED_AUTH_STAGING_PROFILE } from "../src/shared-auth-oidc-client.ts";
@@ -59,6 +61,7 @@ import {
   SESSION_TEST_ORGANIZATION,
   SESSION_TEST_PERSONAL,
 } from "./helpers/shared-auth-session-issuer.ts";
+import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const WRITER = `sha256:${"a".repeat(64)}`;
 const ACCOUNT = "acct_requestComposition";
@@ -1793,5 +1796,166 @@ describe("Worker original retained credential inputs", () => {
     expect(await r.capture()).toBeNull();
     expect(r.read(capture)?.credentialOriginal).toBe(original.credentialOriginal);
     expect(await r.accounts.authenticate(r.authorization)).toMatchObject({ kind: "session" });
+  });
+});
+
+// This opt-in reuses local request-origin DATA; it does not qualify Auth103,
+// a distinct human, policy Clock, current admission or Financial permission.
+function originalRequestAppPorts(r: Awaited<ReturnType<typeof retainedDirectRequestFixture>>) {
+  return {
+    sql: r.inputs.sql,
+    identity: r.inputs.identity,
+    clock: r.inputs.clock,
+    randomId: r.inputs.randomId,
+    publicOrigin: r.inputs.publicOrigin,
+    consoleOrigin: r.inputs.consoleOrigin,
+    workerRequest: {
+      connection: r.inputs.connection,
+      sharedAuth: r.inputs.sharedAuth,
+      client: r.inputs.client,
+      realm: r.inputs.realm,
+      originalConsumers: readWorkerRequestConsumers(r.inputs.connection),
+    },
+    objects: createMemoryObjectStore(),
+    settlement: {
+      async verify(): Promise<never> {
+        throw new Error("original request App test permits no settlement");
+      },
+    },
+    forms: [],
+    hostForms: [],
+    offerings: [],
+    v2: TEST_TAKOFORM_V2_CONFIG,
+  } satisfies AppPorts;
+}
+
+describe("App original Worker request graph opt-in", () => {
+  test("refuses accessor-backed graph selection and original fields without invoking getters", async () => {
+    const r = await retainedDirectRequestFixture();
+    const ports = originalRequestAppPorts(r);
+    for (const field of ["originalConsumers", "connection", "client", "realm"] as const) {
+      let reads = 0;
+      const selected = { ...ports.workerRequest };
+      Object.defineProperty(selected, field, {
+        get() {
+          reads += 1;
+          return ports.workerRequest[field];
+        },
+      });
+      expect(() => buildApp({ ...ports, workerRequest: selected })).toThrow();
+      expect(reads).toBe(0);
+    }
+    let reads = 0;
+    const selectedPorts = { ...ports };
+    Object.defineProperty(selectedPorts, "workerRequest", {
+      get() {
+        reads += 1;
+        return ports.workerRequest;
+      },
+    });
+    expect(() => buildApp(selectedPorts)).toThrow();
+    expect(reads).toBe(0);
+    expect(readWorkerRequestConsumers(r.inputs.connection)).toBe(
+      ports.workerRequest.originalConsumers,
+    );
+  });
+
+  test("refuses accessor-selected mixed origins without evaluating the accessor", async () => {
+    const r = await retainedDirectRequestFixture();
+    const other = await r.f.consumers();
+    const ports = originalRequestAppPorts(r);
+    let reads = 0;
+    const mixed = {
+      ...ports,
+      sql: other.inputs.sql,
+      workerRequest: {
+        ...ports.workerRequest,
+        client: other.inputs.client,
+        realm: other.inputs.realm,
+        get connection() {
+          reads += 1;
+          return reads === 1 ? r.inputs.connection : other.inputs.connection;
+        },
+      },
+    };
+    expect(() => buildApp(mixed)).toThrow();
+    expect(reads).toBe(0);
+    expect(readWorkerRequestConsumers(r.inputs.connection)).toBe(
+      ports.workerRequest.originalConsumers,
+    );
+  });
+
+  test("reuses the actual explicit local Accounts and RP graph through App HTTP", async () => {
+    const r = await retainedDirectRequestFixture();
+    const original = readWorkerRequestConsumers(r.inputs.connection);
+    const financialInputs = readWorkerRequestFinancialInputs(r.inputs.connection);
+    const queriesBefore = r.f.sessions.map((session) => session.queries.length);
+    const app = buildApp(originalRequestAppPorts(r));
+    expect(r.f.sessions.map((session) => session.queries.length)).toEqual(queriesBefore);
+    expect(readWorkerRequestConsumers(r.inputs.connection)).toBe(original);
+    expect(readWorkerRequestFinancialInputs(r.inputs.connection)).toBe(financialInputs);
+    const response = await app.fetch(
+      new Request(`${r.inputs.publicOrigin}/v1/me`, {
+        headers: { authorization: r.authorization },
+      }),
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ principal: { id: r.issued.principal.id } });
+    const capture = await r.capture();
+    expect(capture).not.toBeNull();
+    expect(r.read(capture)?.inputs).toBe(financialInputs);
+    expect(financialInputs.clock).toBe(r.inputs.clock);
+    expect(financialInputs.writerEpoch).toBe(WRITER);
+    const login = await app.fetch(new Request(`${r.inputs.publicOrigin}/auth/oidc/login`));
+    expect(login.status).toBe(303);
+    expect(r.f.sessions).toHaveLength(1);
+    expect(original.accounts).toBe(r.accounts);
+  });
+
+  test("refuses graph clones and mismatched connection, Sql, client, realm, Clock and origin without IO", async () => {
+    const r = await retainedDirectRequestFixture();
+    const other = await r.f.consumers();
+    const ports = originalRequestAppPorts(r);
+    const selected = ports.workerRequest;
+    const mismatches: readonly AppPorts[] = [
+      {
+        ...ports,
+        workerRequest: { ...selected, originalConsumers: { ...selected.originalConsumers } },
+      },
+      { ...ports, workerRequest: { ...selected, connection: { ...selected.connection } } },
+      { ...ports, workerRequest: { ...selected, connection: other.inputs.connection } },
+      { ...ports, workerRequest: { ...selected, originalConsumers: other.runtime } },
+      { ...ports, sql: r.f.sql },
+      { ...ports, workerRequest: { ...selected, client: { ...selected.client } } },
+      { ...ports, workerRequest: { ...selected, realm: { ...selected.realm } } },
+      { ...ports, clock: () => r.inputs.clock() },
+      { ...ports, publicOrigin: "https://other-host.example.test" },
+      { ...ports, consoleOrigin: "https://other-console.example.test" },
+    ];
+    const before = r.f.sessions.map((session) => session.queries.length);
+    for (const mismatch of mismatches) expect(() => buildApp(mismatch)).toThrow();
+    expect(r.f.sessions.map((session) => session.queries.length)).toEqual(before);
+    expect(readWorkerRequestConsumers(r.inputs.connection)).toBe(selected.originalConsumers);
+    expect(readWorkerRequestFinancialInputs(r.inputs.connection).writerEpoch).toBe(WRITER);
+  });
+
+  test("ordinary App construction stays available and never implicitly adopts an existing graph", async () => {
+    const r = await retainedDirectRequestFixture();
+    const ports = originalRequestAppPorts(r);
+    const { originalConsumers: _original, ...requestInputs } = ports.workerRequest;
+    expect(() => buildApp({ ...ports, workerRequest: requestInputs })).toThrow(
+      "Worker request consumers are already constructed",
+    );
+    const { workerRequest: _request, ...ordinaryPorts } = ports;
+    const app = buildApp(ordinaryPorts);
+    const response = await app.fetch(
+      new Request(`${ports.publicOrigin}/v1/me`, {
+        headers: { authorization: r.authorization },
+      }),
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ principal: { id: r.issued.principal.id } });
+    expect(readWorkerRequestConsumers(r.inputs.connection)).toBe(_original);
+    expect(r.f.sessions).toHaveLength(1);
   });
 });
