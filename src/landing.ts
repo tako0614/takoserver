@@ -17,6 +17,11 @@ export interface LandingOptions {
   readonly apiOrigin: string | null;
   /** Static locale for the page body; the API root defaults to English. */
   readonly locale?: "en" | "ja";
+  /**
+   * The Host's public origin, when a Host serves the page. Host API v2 answers
+   * only there, so the page names it rather than the origin it was read from.
+   */
+  readonly hostOrigin?: string;
 }
 
 const REPOSITORY = "https://github.com/tako0614/takoserver";
@@ -24,14 +29,19 @@ const GUIDE = `${REPOSITORY}/blob/main/docs/self-host-operations.md`;
 const INSTALL_GUIDE = `${GUIDE}#first-install-and-first-use`;
 const DEPLOY_STEPS = `${GUIDE}#6-seed-held-artifacts`;
 const DOCKER_GUIDE = `${REPOSITORY}/blob/main/docs/self-host-docker.md`;
+const CONSOLE_SETUP = `${GUIDE}#the-console-optional`;
+const SHIP_STEPS = `${GUIDE}#9-verify`;
 const SECURITY_GUIDE = `${REPOSITORY}/blob/main/docs/self-host-security.md`;
 const V2_REFERENCE = `${REPOSITORY}/blob/main/docs/takoform-v2.md`;
 const PREREQUISITES = `${GUIDE}#1-prerequisites`;
+/** The release that attaches the pinned workerd; 1.0.0, marked Latest, has none. */
+const WORKERD_RELEASE = `${REPOSITORY}/releases/tag/v2.0.0-rc.1`;
+const TAKOFORM = "https://takoform.com";
 
 const landingMessages = {
   en: {
     description:
-      "Takoserver is an open-source cloud you host yourself. Deploy Workers and their SQLite, KV, object storage and queues to your own machine with Takoform.",
+      "Takoserver is an open-source cloud you host yourself. Deploy Workers and their SQLite, KV, object storage and queues to your own machine from Takoform definitions.",
     skip: "Skip to content",
     lead: "Deploy Takoform.\nRun your own cloud.",
     lede: "Takoserver is an open-source cloud that runs on your own Linux machine. Deploy Workers and their SQLite, KV, object storage and queues from Takoform definitions, and operate them yourself.",
@@ -39,54 +49,71 @@ const landingMessages = {
     source: "Source code",
     preview: "Resources in the Takoserver Console · public sample data",
     previewAlt:
-      "The Takoserver Console listing the Resources of a Worker named hello and a SQLite database, all applied, with public sample data",
+      "The Takoserver Console's Resources page: a Worker named hello with its version, deployment and endpoint all Ready, its WorkerBundle, and a SQLite database, in public sample data",
     formsTitle: "What you can deploy",
     formsBody:
-      "A Host serves exactly the Forms its configuration composes. Before relying on one, ask your Host's support endpoint about its exact Form URL.",
+      "Takoform describes each kind of resource, such as a Worker, a database or a queue, as a Form: a definition its publisher serves at a versioned URL, so the resource means the same on every Host that supports it. Takoserver runs these Forms.",
+    formsNeeds:
+      "Artifacts need only Bun and a short block in the Host's settings. Everything else needs the Worker runtime of step 2 below, and publishing at a hostname also needs step 3. A running Host answers, for each Form URL, whether it serves that Form.",
+    takoform: "About Takoform",
     artifactsTitle: "Artifacts",
-    artifactsBody:
-      "Worker code, static files and SQL migrations, kept by URL and SHA-256. Each needs only Bun and that Form's block in TAKOSERVER_TAKOFORM_V2_CONFIG.",
+    artifactsBody: "Worker code, static files and SQL migrations, pinned by URL and SHA-256.",
     workersTitle: "Workers and HTTPS",
     workersBody:
-      "Create a Worker, cut a version, choose which version serves, run it on a schedule and publish it at an HTTPS hostname. Needs the complete local Worker profile (step 4 below); WorkerEndpoint also needs the HTTPS listener on port 443.",
+      "Create a Worker, cut versions, choose which one serves, run it on a schedule and publish it at its own HTTPS hostname.",
     dataTitle: "Data",
     dataBody:
-      "SQLite databases, KV namespaces and object buckets that a Worker uses through Bindings. Needs the complete local Worker profile; SQLiteMigrationApplication also needs a sqliteMigrationSet block.",
+      "SQLite databases, KV namespaces and object buckets that a Worker reaches through bindings.",
     asyncTitle: "Queues, actors and workflows",
     asyncBody:
-      "At-least-once queues and their consumers, actors that keep state, and durable workflows. Needs the complete local Worker profile.",
+      "At-least-once queues and their consumers, actors that keep state, and durable workflows.",
     hostTitle: "Run your own Host",
     hostStep1:
-      "On Linux x86-64 with Bun, check out a reviewed commit and install its locked dependencies.",
-    hostStep2: "Set the public HTTPS origin, the v2 configuration and a persistent cursor key.",
+      "Use a Linux x86-64 machine with Bun. Check out a reviewed commit of main, which the install guide describes, and install its locked dependencies.",
+    hostStep2:
+      "Add the Worker runtime: the pinned workerd attached to the 2.0.0-rc.1 pre-release, checked against its SHA256SUMS, and the Workflow execution guard, a small Go program built from the same checkout. That workerd needs glibc 2.38 or newer, such as Ubuntu 24.04.",
     hostStep3:
-      "Start it. Without an identity provider, the first boot prints a single-use operator sign-in assertion.",
+      "Give it HTTPS. For Workers, get a wildcard DNS name and certificate, such as *.apps.example.com; a wildcard certificate is issued through a DNS challenge, which needs your DNS provider's API. The Host serves Workers on port 443 itself, so put the API behind a front end such as Caddy on another port, such as 8443.",
     hostStep4:
-      "For Workers, add the complete local Worker profile: the pinned workerd, Actor and Workflow boot with the Workflow execution guard, all five private data planes, and both bundle blocks on selfhost-v2-worker-primary. Publishing at a hostname also needs HTTPS on port 443.",
+      "Write its settings and start it. Three are always required; the Worker runtime and HTTPS add their own (step 3 of the install guide), and a partial Worker setup offers no Worker Forms. Without an identity provider, the first boot prints a single-use operator sign-in assertion.",
     hostNote:
-      "Serve the API through your own HTTPS front end; do not expose the listener directly. To try the API, sign-in, organizations and keys without running Workers, use Docker.",
+      "Without the Worker runtime and port 443, the Host still keeps artifacts and serves the API, sign-in, organizations and keys. To try that much quickly, use Docker.",
+    releases: "Takoserver 2.0.0-rc.1 (pre-release)",
     prerequisites: "Prerequisites",
     docker: "Try it in Docker",
     security: "Self-host security",
     deployTitle: "Deploy one Worker",
     deployBody:
-      "Steps 6 to 9 of the install guide, condensed; $V2 and $KEY come from its step 5. Host API v2 accepts each create as an Operation; for 24 hours, sending it again with the same idempotency-key returns that Operation instead of a second Resource.",
+      "Five Resources, created in this order with curl over Host API v2. Each create is accepted as an Operation that you poll until it succeeds. $V2, $F, $ORG and $KEY come from step 5 of the install guide, and step 8 runs the whole chain with a small create function. No released Takoform client speaks Host API v2 yet, so today you deploy with requests like these or in the console.",
+    createLabel:
+      "Each create is one POST. Sent again with the same idempotency-key within 24 hours, it returns the same Operation instead of a second Worker.",
     workerStep: "is the Worker itself. Its versions, deployment and endpoint refer to it.",
-    bundleStep: "names the bytes of worker.js held by the Host, by URL and SHA-256.",
+    bundleStep:
+      "names worker.js by the URL and SHA-256 of a manifest that lists it. Publish the manifest and its files over public HTTPS and the Host fetches them, or seed them onto the Host with scripts/selfhost-artifact.ts, which prints both values.",
     versionStep: "pairs that bundle with its fetch handler.",
     deploymentStep: "chooses which version serves: here one version, weight 10000.",
     endpointStep: "publishes the Worker at an HTTPS hostname.",
-    resultLabel: "Then request it:",
+    resultLabel: "Then request it, with the UID the Endpoint's create returned in $ENDPOINT:",
     deployMore: "Steps 6 to 9 in the guide",
     afterTitle: "After you deploy",
-    consoleTitle: "In the console",
+    consoleTitle: "Use the console",
     consoleBody:
-      "The console is a separate static app built from this repository. Serve it on its own origin next to your API and name that origin in the Host's settings. There you sign in, create the organization that owns your Resources, issue API keys, and see each Resource's declared and observed state.",
+      "The console can also create these Resources in the browser. Choose a Form and it fills in the smallest spec this Host accepts; you can pick each Resource it refers to by name, and nothing is sent until you choose Create. It shows each Worker with the address it is served at and whether it is Ready. It is a static app built from this repository and served on its own origin next to the API.",
+    consoleSetup: "Set up the console (install guide, step 5)",
     consoleHost: "Open this Host's console",
-    consoleSite: "takoserver.com's own console",
-    apiTitle: "With the API",
-    apiBody:
-      "Do the same from your own tools over Host API v2. Start by asking your Host whether it supports the exact Form URL you plan to use; $HOST is its public origin.",
+    hereTitle: "This is a Takoserver Host",
+    hereBody:
+      "People with an organization on this Host manage its Workers and data in the console, or over Host API v2 at this address:",
+    hereNoConsole: "This Host serves no console yet.",
+    shipTitle: "Ship a new version",
+    shipBody:
+      "Code never changes in place. Create the new code and a version for it, then point the Deployment at that version; the Endpoint keeps its address. In the console, once the new version is Ready, choose “Serve this version” on its page; it prepares this update, which is sent when you choose Update. To go back, serve the earlier version again the same way.",
+    shipBundle:
+      "holds the new worker.js, by the URL and SHA-256 of its manifest. Published over public HTTPS from another machine, it needs no restart; seeded onto the Host, it needs a restart, which stops every Worker until the Host is back.",
+    shipVersion: "pairs the new WorkerBundle with its fetch handler.",
+    shipDeploy:
+      "is updated to serve hello-version-v2 at weight 10000. The update names the generation it read, so a change made in between is not overwritten.",
+    shipMore: "Step 9 of the install guide",
     reference: "Host API v2 reference",
     openapi: "OpenAPI description",
     discovery: "Takoform Host discovery",
@@ -94,62 +121,78 @@ const landingMessages = {
   },
   ja: {
     description:
-      "Takoserverは、自分でホストするオープンソースのクラウドです。WorkerとそのSQLite・KV・オブジェクトストレージ・キューを、Takoformで自分のマシンへデプロイできます。",
+      "Takoserverは、自分でホストするオープンソースのクラウドです。WorkerとそのSQLite・KV・オブジェクトストレージ・キューを、Takoformの定義から自分のマシンへデプロイできます。",
     skip: "本文へ移動",
     lead: "Takoformを、\n自分のクラウドへ。",
     lede: "Takoserverは、自分のLinuxマシンで動かすオープンソースのクラウドです。WorkerとそのSQLite・KV・オブジェクトストレージ・キューを、Takoformの定義からデプロイして運用できます。",
-    install: "導入手順を読む",
+    install: "導入手順を読む（英語）",
     source: "ソースコード",
     preview: "Takoserver Consoleのリソース一覧（公開用サンプルデータ）",
     previewAlt:
-      "helloというWorkerのリソース一式とSQLiteデータベースがすべて反映済みになっている、Takoserver Consoleのリソース一覧（公開用サンプルデータ）",
+      "Takoserver Consoleのリソース一覧。helloというWorkerとその版・配信・公開先が稼働中で、WorkerBundleとSQLiteデータベースも並んでいます（公開用サンプルデータ）",
     formsTitle: "デプロイできるもの",
     formsBody:
-      "Hostは、設定で組み合わせたFormだけを提供します。使う前に、HostのsupportエンドポイントでForm URLごとに対応を確認できます。",
+      "Takoformでは、Worker・データベース・キューといったリソースの種類ごとの定義をFormと呼び、公開元がバージョン付きのURLで公開します。対応するHostであれば、どこでも同じ意味のリソースになります。Takoserverは次のFormを動かせます。",
+    formsNeeds:
+      "成果物は、Bunと設定への短い記述の追加だけで使えます。それ以外には下の手順2のWorker実行環境が必要で、ホスト名で公開するには手順3も必要です。動いているHostには、Form URLごとに対応しているかを問い合わせられます。",
+    takoform: "Takoformについて",
     artifactsTitle: "成果物",
     artifactsBody:
-      "Workerのコード・静的ファイル・SQLのマイグレーションを、URLとSHA-256で固定して保持します。Bunと、TAKOSERVER_TAKOFORM_V2_CONFIGにあるそのFormのblockだけで使えます。",
+      "Workerのコード・静的ファイル・SQLのマイグレーションを、URLとSHA-256で固定して保持します。",
     workersTitle: "Workerと公開",
     workersBody:
-      "Workerを作り、版を作り、配信する版を決め、定期実行し、HTTPSのホスト名で公開します。完全なlocal Worker profile（下の手順4）が必要で、WorkerEndpointには443番のHTTPS listenerも必要です。",
+      "Workerを作り、版を作り、配信する版を決め、定期実行し、専用のHTTPSホスト名で公開します。",
     dataTitle: "データ",
-    dataBody:
-      "WorkerがBindingで使うSQLiteデータベース、KV、オブジェクトストレージです。完全なlocal Worker profileが必要で、SQLiteMigrationApplicationにはsqliteMigrationSetのblockも必要です。",
+    dataBody: "WorkerがBindingで使うSQLiteデータベース、KV、オブジェクトストレージです。",
     asyncTitle: "キュー・Actor・Workflow",
-    asyncBody:
-      "少なくとも一度届くキューとその受信、状態を持つActor、永続するWorkflowです。完全なlocal Worker profileが必要です。",
+    asyncBody: "少なくとも一度届くキューとその受信、状態を持つActor、永続するWorkflowです。",
     hostTitle: "自分のHostを動かす",
     hostStep1:
-      "Linux x86-64とBunを用意し、reviewしたcommitを取り出して、lockfileで固定された依存関係をインストールします。",
-    hostStep2: "公開HTTPS origin、v2設定、永続するcursor鍵を設定します。",
+      "Linux x86-64のマシンとBunを用意します。導入手順書が説明しているmainから、レビュー済みのコミットを取り出し、ロックファイルで固定された依存関係をインストールします。",
+    hostStep2:
+      "Workerの実行環境を加えます。プレリリース2.0.0-rc.1に添付された固定版のworkerdをSHA256SUMSで確認して置き、Workflow execution guard（同じチェックアウトからGoでビルドする小さなプログラム）を用意します。このworkerdには、Ubuntu 24.04などglibc 2.38以降の環境が必要です。",
     hostStep3:
-      "起動します。IDプロバイダーが未設定なら、初回起動時に一度だけ使える運営者サインイン用のassertionが表示されます。",
+      "HTTPSを用意します。Worker用に、*.apps.example.comのようなワイルドカードのDNS名と証明書を用意します。ワイルドカード証明書はDNSチャレンジで発行するため、DNSプロバイダーのAPIが必要です。443番はHost自身がWorkerの配信に使うので、APIはCaddyなどのフロントエンドの背後に、8443番など別のポートで置きます。",
     hostStep4:
-      "Workerには完全なlocal Worker profileを追加します。固定版のworkerd、ActorとWorkflowの起動とWorkflow execution guard、5つのprivate data plane、selfhost-v2-worker-primaryに向けた2つのbundle blockです。ホスト名で公開するには443番のHTTPSも必要です。",
+      "設定を書いて起動します。常に必要な設定は3つで、Worker実行環境とHTTPSにはそれぞれ追加の設定があります（導入手順書の手順3）。Worker実行環境の設定が一部でも欠けると、Worker関連のFormは提供されません。IDプロバイダーが未設定なら、初回起動時に、一度だけ使える運営者のサインイン用アサーションが表示されます。",
     hostNote:
-      "APIは自分で用意したHTTPSフロントエンドの背後で公開し、listenerを直接公開しないでください。Workerを動かさずにAPI・サインイン・組織・APIキーを試すならDockerを使えます。",
+      "Worker実行環境と443番がなくても、Hostは成果物を保持し、API・サインイン・組織・APIキーを提供します。そこまでを手早く試すならDockerを使えます。",
+    releases: "Takoserver 2.0.0-rc.1（プレリリース）",
     prerequisites: "前提条件",
     docker: "Dockerで試す",
     security: "セルフホストのセキュリティ",
     deployTitle: "Workerを1つデプロイする",
     deployBody:
-      "導入手順書のstep 6〜9を短くまとめた流れです。$V2と$KEYは手順書のstep 5で用意します。Host API v2は作成をOperationとして受け付けます。24時間以内に同じidempotency-keyで送り直すと、2つ目のリソースは作らず同じOperationを返します。",
+      "5つのリソースを、この順にcurlとHost API v2で作成します。作成はOperationとして受け付けられ、成功するまで状態を確認します。$V2・$F・$ORG・$KEYは導入手順書の手順5で用意します。手順書では、小さなcreate関数でこの流れ全体を実行します。Host API v2に対応したTakoformのクライアントはまだリリースされていないため、現在はこのようなリクエストかコンソールでデプロイします。",
+    createLabel:
+      "作成は1回のPOSTです。24時間以内に同じidempotency-keyで送り直すと、2つ目のWorkerは作らず同じOperationを返します。",
     workerStep: "Workerそのものです。版・配信・公開先はこれを参照します。",
-    bundleStep: "Hostに保持したworker.jsの内容を、URLとSHA-256で指定します。",
-    versionStep: "そのbundleとfetchハンドラーを組み合わせた版です。",
+    bundleStep:
+      "worker.jsを、それを列挙したmanifestのURLとSHA-256で指定します。manifestとファイルを公開HTTPSに置けばHostが取得します。scripts/selfhost-artifact.tsでHostに保持させることもでき、このコマンドが両方の値を出力します。",
+    versionStep: "そのWorkerBundleとfetchハンドラーを組み合わせた版です。",
     deploymentStep: "どの版を配信するかを決めます。ここでは1つの版を重み10000で配信します。",
     endpointStep: "WorkerをHTTPSのホスト名で公開します。",
-    resultLabel: "公開したら、リクエストします。",
-    deployMore: "手順書のstep 6〜9",
+    resultLabel: "公開したら、Endpointの作成で返ったUIDを$ENDPOINTに入れてリクエストします。",
+    deployMore: "手順書（英語）の手順6〜9",
     afterTitle: "デプロイしたあと",
-    consoleTitle: "コンソールで",
+    consoleTitle: "コンソールを使う",
     consoleBody:
-      "コンソールは、このリポジトリからbuildする独立した静的アプリです。APIと並ぶ別のoriginで配信し、そのoriginをHostの設定に指定します。そこでサインインし、リソースを所有する組織を作り、APIキーを発行して、各リソースの宣言と観測した状態を確認します。",
+      "コンソールでも、同じリソースをブラウザーから作成できます。Formを選ぶとこのHostが受け付ける最小の設定が入り、設定が参照するリソースは名前で選べます。「作成する」を押すまで、何も送信されません。各Workerの公開先と稼働中かどうかも表示されます。コンソールはこのリポジトリからビルドする静的アプリで、APIと並ぶ別のオリジンで配信します。",
+    consoleSetup: "コンソールを用意する（英語の導入手順書の手順5）",
     consoleHost: "このHostのコンソールを開く",
-    consoleSite: "takoserver.com自身のコンソール",
-    apiTitle: "APIで",
-    apiBody:
-      "同じ操作を、自分のツールからHost API v2で行えます。まず、使う予定のForm URLに自分のHostが対応しているかを確認します。$HOSTはHostの公開originです。",
+    hereTitle: "ここはTakoserverのHostです",
+    hereBody:
+      "このHostに組織を持つ人は、そのWorkerとデータを、コンソールか次のアドレスのHost API v2で管理します。",
+    hereNoConsole: "このHostにはまだコンソールがありません。",
+    shipTitle: "新しい版を出す",
+    shipBody:
+      "動いているコードは書き換えられません。新しいコードと版を作り、Deploymentをその版に切り替えます。Endpointの公開先はそのままです。コンソールでは、新しい版が稼働中になったら、そのページで「この版を配信する」を押すとこの更新が用意され、「更新する」を押すと送信されます。元に戻すときは、前の版を同じ方法で配信します。",
+    shipBundle:
+      "新しいworker.jsを、そのmanifestのURLとSHA-256で指定します。別のマシンの公開HTTPSに置けば再起動は不要です。Hostに保持させる場合は再起動が必要で、その間はすべてのWorkerが止まります。",
+    shipVersion: "新しいWorkerBundleとfetchハンドラーを組み合わせた版です。",
+    shipDeploy:
+      "hello-version-v2を重み10000で配信するよう更新します。更新は読み取った世代を指定するので、その間に入った別の変更を上書きしません。",
+    shipMore: "手順書（英語）の手順9",
     reference: "Host API v2 リファレンス",
     openapi: "OpenAPI仕様",
     discovery: "Takoform Hostディスカバリー",
@@ -199,11 +242,11 @@ const FORM_GROUPS = [
 
 /** The Worker chain of the install guide, in the order it is created. */
 const DEPLOY_CHAIN = [
-  ["ModuleWorker", "hello", "workerStep"],
-  ["WorkerBundle", "hello-bundle-v1", "bundleStep"],
-  ["WorkerVersion", "hello-version-v1", "versionStep"],
-  ["WorkerDeployment", "hello-deployment", "deploymentStep"],
-  ["WorkerEndpoint", "hello-endpoint", "endpointStep"],
+  ["ModuleWorker 0.3.0", "hello", "workerStep"],
+  ["WorkerBundle 0.2.0", "hello-bundle-v1", "bundleStep"],
+  ["WorkerVersion 0.5.0", "hello-version-v1", "versionStep"],
+  ["WorkerDeployment 0.4.0", "hello-deployment", "deploymentStep"],
+  ["WorkerEndpoint 0.3.0", "hello-endpoint", "endpointStep"],
 ] as const;
 
 /** The product mark — the pixel tako, drawn once so the page can place it
@@ -265,6 +308,12 @@ h1 { margin: 0; font-family: var(--display); font-size: clamp(42px, 5.5vw, 68px)
 .pill:active { opacity: 0.72; }
 @media (hover: hover) { .pill.primary:hover { opacity: 0.86; } .pill.secondary:hover { border-color: var(--ink-3); } }
 
+.here { margin: 40px auto 0; max-width: 760px; padding: 28px 32px; text-align: left; background: var(--surface-2); border: 1px solid var(--line-1); border-radius: 18px; }
+.here h2 { font-size: clamp(22px, 2.4vw, 28px); }
+.here p { margin: 12px 0 0; color: var(--ink-2); font-size: 15px; }
+.here .address { overflow-wrap: break-word; color: var(--ink-1); }
+.here .actions { margin-top: 20px; }
+
 .preview { margin: 64px 0 0; }
 .frame { padding: 12px; background: var(--surface-2); border: 1px solid var(--line-1); border-radius: 22px; box-shadow: 0 24px 64px -40px var(--shadow); }
 .frame picture { display: block; overflow: hidden; border: 1px solid var(--line-1); border-radius: 12px; }
@@ -309,6 +358,7 @@ pre .out { color: var(--accent); }
 .steps > li > * { grid-column: 2; min-width: 0; }
 .steps p { margin: 0; color: var(--ink-1); font-size: 15px; }
 .steps pre { margin-top: 12px; }
+.steps .more { margin-top: 8px; }
 .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .chips code { padding: 4px 10px; border: 1px solid var(--line-1); border-radius: 999px; background: var(--surface-2); font: 12.5px/1.6 var(--mono); overflow-wrap: anywhere; }
 .note { margin: 24px 0 0; max-width: 44em; color: var(--ink-2); font-size: 14px; }
@@ -318,6 +368,8 @@ pre .out { color: var(--accent); }
 .after p { margin: 12px 0 0; color: var(--ink-2); font-size: 15px; }
 .after .chips code { font-size: 12px; border-radius: 8px; }
 .after pre { margin-top: 16px; }
+.after .chain { margin-top: 16px; }
+.after .chain p { margin: 2px 0 0; font-size: 14px; }
 .actions.start { justify-content: flex-start; }
 .after .actions { margin-top: 20px; }
 
@@ -335,11 +387,14 @@ footer { display: flex; align-items: center; justify-content: space-between; fle
 .error .pill { margin-top: 28px; }
 
 @media (min-width: 761px) and (max-width: 1100px) { .preview .frame { max-width: 848px; margin-inline: auto; } }
+/* Below desktop width the code beside each list would scroll sideways, so the columns stack. */
+@media (max-width: 1216px) { .deploy, .host, .after { grid-template-columns: minmax(0, 1fr); gap: 24px; } }
 @media (max-width: 760px) {
   .shell { width: calc(100% - 32px); }
   .top { height: 72px; }
   .hero { padding: 48px 0 32px; }
   .hero-title { gap: 12px; }
+  .here { margin-top: 28px; padding: 22px 20px; }
   .hero-title svg { width: 36px; height: 36px; }
   h1 { font-size: clamp(34px, 8.7vw, 56px); }
   .lead { font-size: 19px; margin-top: 20px; }
@@ -361,13 +416,20 @@ footer { display: flex; align-items: center; justify-content: space-between; fle
 export function landingHtml(options: LandingOptions): string {
   const locale = options.locale ?? "en";
   const copy = landingMessages[locale];
-  const base = options.apiOrigin ?? "";
+  const base = options.apiOrigin ?? options.hostOrigin ?? "";
+  // A Host names its own public origin; without one, the page fills in the
+  // origin it was read from.
+  const hostAddress = options.hostOrigin ?? "<span data-origin>$HOST</span>";
   // The public site ships its font and the Console screenshots as files; the
   // API answering its own root stays a single self-contained response.
   const siteAssets = options.apiOrigin !== null;
   // Commands target the reader's own Host. On the public site that is $HOST;
   // the API's own root fills in the origin it was read from.
-  const commandOrigin = siteAssets ? "$HOST" : `<span data-origin>$HOST</span>`;
+  // On the public site the request uses the guide's $V2; a Host's own root
+  // page fills in the origin it was read from.
+  const shipTarget = siteAssets
+    ? "$V2/resources"
+    : `${hostAddress}/apis/forms.takoform.com/v2/resources`;
   const text = (key: keyof typeof copy, tag = "span", attributes = "") =>
     `<${tag}${attributes} data-i18n="${key}">${copy[key]}</${tag}>`;
   const screen = (shape: "desktop" | "tablet" | "mobile", theme: "light" | "dark") =>
@@ -398,11 +460,27 @@ export function landingHtml(options: LandingOptions): string {
   ).join("\n");
   // The API's own root links its own console. The public site's console is
   // takoserver.com's Host, so it is named as that, never as the reader's.
-  const consoleAction = !options.consoleOrigin
+  // Only a Host's own root links its console; the public site describes the
+  // reader's own Host, never takoserver.com's.
+  // A Host's own root first says where the reader is and how to manage it;
+  // the public site has no such place to point at.
+  const here = siteAssets
     ? ""
-    : siteAssets
-      ? `<p class="more"><a href="${options.consoleOrigin}" data-i18n="consoleSite">${copy.consoleSite}</a></p>`
-      : `<div class="actions start"><a class="pill secondary external" href="${options.consoleOrigin}" data-i18n="consoleHost">${copy.consoleHost}</a></div>`;
+    : `<section class="here" aria-labelledby="here-title">
+${text("hereTitle", "h2", ' id="here-title"')}
+${text("hereBody", "p")}
+<p class="address"><code>${hostAddress}/<wbr>apis/<wbr>forms.takoform.com/<wbr>v2</code></p>
+${
+  options.consoleOrigin
+    ? `<div class="actions start"><a class="pill primary external" href="${options.consoleOrigin}" data-i18n="consoleHost">${copy.consoleHost}</a></div>`
+    : `${text("hereNoConsole", "p")}<p class="more"><a href="${CONSOLE_SETUP}" data-i18n="consoleSetup">${copy.consoleSetup}</a></p>`
+}
+<p class="more"><a href="${base}/.well-known/takoform/v2" data-i18n="discovery">${copy.discovery}</a><a href="${base}/openapi.json" data-i18n="openapi">${copy.openapi}</a></p>
+</section>`;
+  const consoleAction =
+    options.consoleOrigin && !siteAssets
+      ? `<div class="actions start"><a class="pill secondary external" href="${options.consoleOrigin}" data-i18n="consoleHost">${copy.consoleHost}</a></div>`
+      : "";
   const locales = `<link rel="alternate" hreflang="en" href="https://takoserver.com/en/">
 <link rel="alternate" hreflang="ja" href="https://takoserver.com/ja/">
 <link rel="alternate" hreflang="x-default" href="https://takoserver.com/">`;
@@ -452,6 +530,7 @@ ${siteAssets ? '@font-face { font-family: "Bricolage Grotesque"; font-style: nor
 <main id="main">
 <section class="hero" aria-labelledby="headline">
 <div class="hero-title">${takoMark(56)}<h1 id="headline">Takoserver</h1></div>
+${here}
 ${text("lead", "p", ' class="lead"')}
 ${text("lede", "p", ' class="lede"')}
 <div class="actions"><a class="pill primary external" href="${INSTALL_GUIDE}" data-i18n="install">${copy.install}</a><a class="pill secondary external" href="${REPOSITORY}" data-i18n="source">${copy.source}</a></div>
@@ -461,9 +540,11 @@ ${preview}
 <section class="block" id="forms" aria-labelledby="forms-title">
 ${text("formsTitle", "h2", ' id="forms-title"')}
 ${text("formsBody", "p", ' class="intro"')}
+${text("formsNeeds", "p", ' class="intro"')}
 <dl class="forms">
 ${formGroups}
 </dl>
+<p class="more"><a href="${TAKOFORM}" data-i18n="takoform">${copy.takoform}</a></p>
 </section>
 
 
@@ -473,11 +554,12 @@ ${text("hostTitle", "h2", ' id="start-title"')}
 <ol class="steps">
 <li>${text("hostStep1", "p")}<pre>git clone ${REPOSITORY}
 cd takoserver
-git checkout --detach &lt;reviewed-commit&gt;
+COMMIT=$(git rev-parse origin/main)
+git checkout --detach "$COMMIT"
 bun install --frozen-lockfile</pre></li>
-<li>${text("hostStep2", "p")}<span class="chips"><code>TAKOSERVER_PUBLIC_ORIGIN</code><code>TAKOSERVER_TAKOFORM_V2_CONFIG</code><code>TAKOSERVER_TAKOFORM_V2_CURSOR_KEY</code></span></li>
-<li>${text("hostStep3", "p")}<pre>bun --no-env-file src/entry-bun.ts</pre></li>
-<li>${text("hostStep4", "p")}</li>
+<li>${text("hostStep2", "p")}<p class="more"><a href="${WORKERD_RELEASE}" data-i18n="releases">${copy.releases}</a></p></li>
+<li>${text("hostStep3", "p")}</li>
+<li>${text("hostStep4", "p")}<span class="chips"><code>TAKOSERVER_PUBLIC_ORIGIN</code><code>TAKOSERVER_TAKOFORM_V2_CONFIG</code><code>TAKOSERVER_TAKOFORM_V2_CURSOR_KEY</code></span><pre>bun --no-env-file src/entry-bun.ts</pre></li>
 </ol>
 <aside>
 ${text("hostNote", "p", ' class="note"')}
@@ -495,6 +577,13 @@ ${text("deployBody", "p", ' class="intro"')}
 ${chain}
 </ol>
 <div class="code">
+${text("createLabel", "p")}
+<pre>jq -n --arg form "$F/ModuleWorker/0.3.0/" --arg space "$ORG" \\
+  '{$form, $space, name: "hello", spec: {}}' |
+curl -sS "$V2/resources" --data @- \\
+  -H "authorization: Bearer $KEY" \\
+  -H "content-type: application/json" \\
+  -H "idempotency-key: takoserver-first-use-hello"</pre>
 <pre><span class="file">worker.js</span>export default {
   fetch() { return new Response("hello from takoserver\\n"); },
 };</pre>
@@ -511,11 +600,24 @@ curl -sS "https://$NAME/"
 <section class="block" id="after" aria-labelledby="after-title">
 ${text("afterTitle", "h2", ' id="after-title"')}
 <div class="after">
-<div>${text("consoleTitle", "h3")}${text("consoleBody", "p")}<span class="chips"><code>bun scripts/build-console.ts --api-origin &lt;API origin&gt;</code><code>TAKOSERVER_CONSOLE_ORIGIN</code></span>${consoleAction}</div>
-<div>${text("apiTitle", "h3")}${text("apiBody", "p")}<pre>curl -sG "${commandOrigin}/apis/forms.takoform.com/v2/support" \\
-  --data-urlencode "form=&lt;Form URL&gt;" \\
-  -H "authorization: Bearer $KEY"</pre>
-<p class="more"><a href="${V2_REFERENCE}" data-i18n="reference">${copy.reference}</a></p></div>
+<div>${text("consoleTitle", "h3")}${text("consoleBody", "p")}${consoleAction}
+<p class="more"><a href="${CONSOLE_SETUP}" data-i18n="consoleSetup">${copy.consoleSetup}</a></p></div>
+<div>${text("shipTitle", "h3")}${text("shipBody", "p")}
+<ol class="chain">
+<li><strong>WorkerBundle 0.2.0 <span>hello-bundle-v2</span></strong>${text("shipBundle", "p")}</li>
+<li><strong>WorkerVersion 0.5.0 <span>hello-version-v2</span></strong>${text("shipVersion", "p")}</li>
+<li><strong>WorkerDeployment 0.4.0 <span>hello-deployment</span></strong>${text("shipDeploy", "p")}</li>
+</ol>
+<pre>PUT ${shipTarget}/&lt;Deployment UID&gt;
+idempotency-key: &lt;a new key&gt;
+takoform-expected-generation: &lt;the generation it read&gt;
+
+{"spec": {
+  "worker": {"resourceUid": "&lt;hello UID&gt;"},
+  "versions": [{
+    "workerVersion": {"resourceUid": "&lt;hello-version-v2 UID&gt;"},
+    "weight": 10000}]}}</pre>
+<p class="more"><a href="${SHIP_STEPS}" data-i18n="shipMore">${copy.shipMore}</a><a href="${V2_REFERENCE}" data-i18n="reference">${copy.reference}</a></p></div>
 </div>
 </section>
 </main>
@@ -542,7 +644,12 @@ ${siteAssets ? "" : 'for(const node of document.querySelectorAll("[data-origin]"
 `;
 }
 
-/** The missing-page response, in the same visual system. */
+/**
+ * The missing-page response, in the same visual system: one page for every
+ * missing address. It reads in the language the rest of the site would:
+ * Japanese under /ja/, English under /en/, and otherwise the browser's first
+ * choice of the two.
+ */
 export function notFoundHtml(): string {
   return `<!doctype html>
 <html lang="en">
@@ -558,10 +665,16 @@ export function notFoundHtml(): string {
 <main>
 <a class="brand" href="/" aria-label="Takoserver">${takoMark(26)}<span>takoserver</span></a>
 <p class="code-label">404</p>
-<h1>Page not found</h1>
-<p>This address does not name a page on takoserver.com.</p>
-<a class="pill primary" href="/">Back to takoserver.com</a>
+<h1 data-404="title">Page not found</h1>
+<p data-404="body">This address does not name a page on takoserver.com.</p>
+<a class="pill primary" href="/" data-404="back">Back to takoserver.com</a>
 </main>
+<script>
+const ja={title:"ページが見つかりません",body:"このアドレスにtakoserver.comのページはありません。",back:"takoserver.comに戻る"};
+const first=location.pathname.split("/")[1];
+const browser=(navigator.languages??[navigator.language]).map(l=>String(l).toLowerCase().split("-")[0]).find(l=>l==="ja"||l==="en");
+if(first==="ja"||(first!=="en"&&browser==="ja")){document.documentElement.lang="ja";for(const node of document.querySelectorAll("[data-404]"))node.textContent=ja[node.dataset["404"]];for(const link of document.querySelectorAll('[data-404="back"],.brand'))link.href="/ja/";}
+</script>
 </body>
 </html>
 `;

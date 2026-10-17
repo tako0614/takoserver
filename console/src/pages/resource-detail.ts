@@ -1,117 +1,58 @@
 import type { ResourceSummary } from "../api.ts";
 import { ApiError } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
+import {
+  acceptsChanges,
+  valueAt,
+  WORKER_DEPLOYMENT,
+  WORKER_VERSION,
+  withValueAt,
+} from "../form-specs.ts";
 import { formLabel } from "../forms.ts";
 import { tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
-import { health, phaseLabel } from "../resource-state.ts";
+import {
+  MODULE_WORKER,
+  publishedUrl,
+  type SpecReference,
+  specReferences,
+  WORKER_CRON_TRIGGER,
+  WORKER_ENDPOINT,
+} from "../references.ts";
+import { findReferrers, REFERRER_PAGES } from "../referrers.ts";
+import { health, phaseLabel, unrecordedDeployment } from "../resource-state.ts";
 import { linkProps, resourcePath, route } from "../router.ts";
 import { api, currentOrganization } from "../state.ts";
 import { badge, card, copyable, empty, ICON, icon, jsonBlock, whenReady } from "../ui.ts";
-import { deleteResource, updateResource } from "./create-resource.ts";
+import { createResource, deleteResource, updateResource } from "./create-resource.ts";
 
-export interface SpecReference {
-  /** Where the spec names it: `bundle`, `sqliteBindings · DB`, `versions[0] · workerVersion`. */
-  readonly path: string;
-  readonly uid: string;
-}
-
-/** Spec fields that hold the person's own data, never references. */
-const OPAQUE_SPEC_FIELDS = new Set(["vars"]);
-
-/**
- * Every Resource a spec names, in the order it names them. A v2 reference is
- * an object holding exactly one `resourceUid`; a Binding entry is labelled by
- * its own `name`, which is how the Worker reaches it, and any other list
- * entry by its index as the spec below shows it.
- */
-export function specReferences(spec: unknown): SpecReference[] {
-  const found: SpecReference[] = [];
-  const walk = (value: unknown, path: readonly string[]): void => {
-    if (Array.isArray(value)) {
-      value.forEach((entry, index) => {
-        const name =
-          entry && typeof entry === "object" ? (entry as { name?: unknown }).name : undefined;
-        walk(
-          entry,
-          typeof name === "string"
-            ? [...path, name]
-            : [...path.slice(0, -1), `${path.at(-1) ?? ""}[${index}]`],
-        );
-      });
-      return;
-    }
-    if (!value || typeof value !== "object") return;
-    const record = value as Record<string, unknown>;
-    const keys = Object.keys(record);
-    if (keys.length === 1 && keys[0] === "resourceUid" && typeof record.resourceUid === "string") {
-      // A Binding's `resource` key adds nothing its name has not said.
-      const shown = path.at(-1) === "resource" && path.length > 1 ? path.slice(0, -1) : path;
-      found.push({ path: shown.join(" · "), uid: record.resourceUid });
-      return;
-    }
-    for (const key of keys) {
-      if (path.length === 0 && OPAQUE_SPEC_FIELDS.has(key)) continue;
-      walk(record[key], [...path, key]);
-    }
-  };
-  walk(spec, []);
-  return found;
-}
-
-/** The https URL a Resource reports for itself, such as a WorkerEndpoint's. */
-export function publishedUrl(output: unknown): string | null {
-  const url = output && typeof output === "object" ? (output as { url?: unknown }).url : null;
-  if (typeof url !== "string") return null;
-  try {
-    return new URL(url).protocol === "https:" ? url : null;
-  } catch {
-    return null;
-  }
-}
-
-/** How many list pages are read to find what names a Resource. */
-const REFERRER_PAGES = 5;
-
-export interface Referrer {
-  readonly resource: ResourceSummary;
-  /** Where its spec names the Resource being shown. */
-  readonly paths: readonly string[];
-}
-
-/**
- * The Resources whose specs name `uid`, from the organization's list. Only
- * the first pages are read, so `complete` says whether the answer covers
- * every Resource and `checked` how many it looked at.
- */
-export async function findReferrers(
-  organizationId: string,
-  uid: string,
-): Promise<{
-  readonly referrers: readonly Referrer[];
-  readonly complete: boolean;
-  readonly checked: number;
-}> {
-  const referrers: Referrer[] = [];
-  let cursor: string | null = null;
-  let checked = 0;
-  for (let page = 0; page < REFERRER_PAGES; page += 1) {
-    const read = await api.resources(organizationId, cursor ? { cursor } : {});
-    checked += read.resources.length;
-    for (const resource of read.resources) {
-      const paths = specReferences(resource.spec)
-        .filter((reference) => reference.uid === uid)
-        .map((reference) => reference.path);
-      if (paths.length > 0 && resource.uid !== uid) referrers.push({ resource, paths });
-    }
-    cursor = read.cursor;
-    if (cursor === null) return { referrers, complete: true, checked };
-  }
-  return { referrers, complete: false, checked };
-}
+export { publishedUrl, type SpecReference, specReferences } from "../references.ts";
+export { findReferrers, type Referrer } from "../referrers.ts";
 
 /** The v2 address is the durable UID, never a reconstructed kind/name tuple. */
 export function resourceDetailPage(organizationId: string, uid: string): Child {
+  // Made once per read of the Resource: a re-render does not look the
+  // Deployment up again, and Reload reads both afresh.
+  let worker: { readonly for: ResourceSummary; readonly action: WorkerAction } | undefined;
+  const workerAction = (found: ResourceSummary): WorkerAction => {
+    if (worker?.for !== found)
+      worker = {
+        for: found,
+        action:
+          found.form === WORKER_VERSION
+            ? {
+                toolbar: [
+                  serveVersionAction(organizationId, found),
+                  newVersionAction(organizationId, found),
+                ],
+                notice: null,
+              }
+            : MODULE_WORKER.test(found.form)
+              ? { toolbar: null, notice: recordDeploymentNotice(organizationId, found) }
+              : { toolbar: null, notice: null },
+      };
+    return worker.action;
+  };
   const isCurrent = (): boolean =>
     currentOrganization()?.id === organizationId &&
     route().segments.length === 2 &&
@@ -136,7 +77,7 @@ export function resourceDetailPage(organizationId: string, uid: string): Child {
         (found) => {
           if (!isCurrent()) return null;
           return found
-            ? body(found, organizationId, page.reload)
+            ? body(found, organizationId, page.reload, workerAction(found))
             : card(
                 null,
                 empty(
@@ -159,7 +100,18 @@ export function resourceDetailPage(organizationId: string, uid: string): Child {
   );
 }
 
-function body(found: ResourceSummary, organizationId: string, reload: () => void): Child {
+/** What a Worker's page adds: a step beside Reload, or a notice under the heading. */
+interface WorkerAction {
+  readonly toolbar: Child;
+  readonly notice: Child;
+}
+
+function body(
+  found: ResourceSummary,
+  organizationId: string,
+  reload: () => void,
+  action: WorkerAction,
+): Child {
   const state = health(found);
   const url = publishedUrl(found.output);
   const references = specReferences(found.spec);
@@ -176,22 +128,43 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
           "div",
           { class: "dim" },
           h("a", { ...linkProps("/resources") }, tr("リソース", "Resources")),
-          text(" / "),
-          found.space,
         ),
+        // The heading is the name alone; the state sits beside it, not inside it.
         h(
-          "h1",
-          null,
-          // The name is the page title; .mono alone would shrink it to body size.
+          "div",
+          { class: "title-row" },
           h(
-            "span",
-            { class: "mono", style: { fontSize: "inherit", overflowWrap: "anywhere" } },
-            found.name,
+            "h1",
+            null,
+            // The name is the page title; .mono alone would shrink it to body size.
+            h(
+              "span",
+              { class: "mono", style: { fontSize: "inherit", overflowWrap: "anywhere" } },
+              found.name,
+            ),
           ),
-          text(" "),
           badge(phaseLabel(state.phase), state.tone, true),
         ),
-        h("p", { class: "mono", style: { overflowWrap: "anywhere" } }, found.form),
+        h(
+          "p",
+          { class: "published" },
+          httpsUrl(found.form)
+            ? h(
+                "a",
+                { href: found.form, target: "_blank", rel: "noopener noreferrer" },
+                formLabel(found.form),
+                h("span", { "aria-hidden": "true" }, " ↗"),
+                h(
+                  "span",
+                  { class: "visually-hidden" },
+                  tr(
+                    "（公開仕様、新しいタブで開きます）",
+                    " (published contract, opens in a new tab)",
+                  ),
+                ),
+              )
+            : formLabel(found.form),
+        ),
         url
           ? h(
               "p",
@@ -201,6 +174,7 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
                 { href: url, target: "_blank", rel: "noopener noreferrer" },
                 url,
                 h("span", { "aria-hidden": "true" }, " ↗"),
+                newTab(),
               ),
             )
           : null,
@@ -208,16 +182,34 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
       h(
         "div",
         { class: "toolbar" },
+        action.toolbar,
         h(
           "button",
           { class: "btn", type: "button", onClick: reload },
           icon(ICON.refresh, 14),
           text(tr("再読み込み", "Reload")),
         ),
+        // A version or an artifact never changes; sending its same spec again
+        // still retries it, for example after its create failed.
         h(
           "button",
-          { class: "btn", type: "button", onClick: () => updateResource(organizationId, found) },
-          tr("更新", "Update"),
+          {
+            class: "btn",
+            type: "button",
+            onClick: () =>
+              acceptsChanges(found.form)
+                ? updateResource(organizationId, found)
+                : updateResource(organizationId, found, {
+                    spec: found.spec,
+                    note: tr(
+                      "このFormのリソースは変更できません。同じ設定をもう一度送ると、失敗した作成などを再試行できます。",
+                      "A Resource of this Form cannot change. Sending the same spec again retries it, for example after its create failed.",
+                    ),
+                    title: tr(`${found.name}を再適用`, `Re-apply ${found.name}`),
+                    confirmLabel: tr("再適用する", "Re-apply"),
+                  }),
+          },
+          acceptsChanges(found.form) ? tr("更新", "Update") : tr("再適用", "Re-apply"),
         ),
         h(
           "button",
@@ -240,13 +232,7 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
           ),
         )
       : null,
-    state.phase === "NotReady"
-      ? h(
-          "div",
-          { class: "notice notice--warn" },
-          tr("最新の観測でReadyではありません。", "The latest observation reports not ready."),
-        )
-      : null,
+    action.notice ?? (state.phase === "NotReady" ? notReadyNotice() : null),
     references.length > 0 ? referencesCard(organizationId, references) : null,
     referrersCard(organizationId, found.uid),
     card(
@@ -259,7 +245,15 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
         field("Form", copyable(found.form)),
         field(tr("世代", "Generation"), String(found.generation)),
         field(tr("観測世代", "Observed generation"), String(found.observedGeneration)),
-        field(tr("段階", "Phase"), found.phase),
+        field(
+          tr("Hostの処理", "Host work"),
+          h(
+            "span",
+            null,
+            hostWork(found.phase),
+            h("span", { class: "mono dim" }, ` · ${found.phase}`),
+          ),
+        ),
         field(
           tr("最終操作", "Last operation"),
           found.lastOperation
@@ -289,6 +283,311 @@ function body(found: ResourceSummary, organizationId: string, reload: () => void
   );
 }
 
+/** The Deployment serving a ModuleWorker, from the first pages of Deployments. */
+async function deploymentOf(
+  organizationId: string,
+  workerUid: string,
+): Promise<ResourceSummary | null> {
+  let cursor: string | null = null;
+  for (let page = 0; page < REFERRER_PAGES; page += 1) {
+    const read = await api.resources(organizationId, {
+      form: WORKER_DEPLOYMENT,
+      ...(cursor ? { cursor } : {}),
+    });
+    const found = read.resources.find(
+      (candidate) => valueAt(candidate.spec, ["worker", "resourceUid"]) === workerUid,
+    );
+    if (found) return found;
+    cursor = read.cursor;
+    if (cursor === null) return null;
+  }
+  return null;
+}
+
+function notReadyNotice(): Child {
+  return h(
+    "div",
+    { class: "notice notice--warn" },
+    tr("最新の観測でReadyではありません。", "The latest observation reports not ready."),
+  );
+}
+
+/**
+ * On a ModuleWorker's page: when its Deployment serves it but the Worker has
+ * not recorded that Deployment, say so, and offer the same-spec update that
+ * records it only where that update can finish. The Host refuses it while
+ * anything naming the Worker is in progress, and it cannot finish until every
+ * WorkerEndpoint naming the Worker is published; until then it would hold the
+ * Worker busy, and nothing could name it. Nothing is sent until the person
+ * accepts the update.
+ */
+function recordDeploymentNotice(organizationId: string, worker: ResourceSummary): Child {
+  const phase = health(worker).phase;
+  if (phase !== "Ready" && phase !== "NotReady") return null;
+  const plain = (): Child => (phase === "NotReady" ? notReadyNotice() : null);
+  const graph = resource(async () => {
+    const deployment = await deploymentOf(organizationId, worker.uid);
+    if (!unrecordedDeployment(worker, deployment)) return null;
+    return { deployment, naming: await findReferrers(organizationId, worker.uid) };
+  });
+  const links = (resources: readonly ResourceSummary[]): Child[] =>
+    resources.flatMap((entry, index) => [
+      index === 0 ? null : tr("、", ", "),
+      h("a", { ...linkProps(resourcePath(entry.uid)) }, entry.name),
+    ]);
+  return live(() => {
+    const state = graph.get();
+    const found = state.state === "ready" ? state.value : null;
+    if (!found) return plain();
+    const { deployment, naming } = found;
+    const referrers = naming.referrers.map(({ resource }) => resource);
+    const inProgress = referrers.filter((entry) =>
+      ["Pending", "Deleting"].includes(health(entry).phase),
+    );
+    // A WorkerCronTrigger's create or update cannot settle while its Worker
+    // has not recorded the Deployment, so it is not something to wait for. Its
+    // delete does not read the Worker, and finishes.
+    const stuck = inProgress.filter(
+      (entry) => WORKER_CRON_TRIGGER.test(entry.form) && health(entry).phase === "Pending",
+    );
+    const busy = inProgress.filter((entry) => !stuck.includes(entry));
+    const unpublished = referrers.filter(
+      (entry) =>
+        WORKER_ENDPOINT.test(entry.form) &&
+        !inProgress.includes(entry) &&
+        !(health(entry).phase === "Ready" && entry.observed.tlsReady === true),
+    );
+    const next: Child =
+      stuck.length > 0
+        ? h(
+            "span",
+            null,
+            ...links(stuck),
+            tr("は、このWorkerが", " cannot finish until this Worker records "),
+            ...links([deployment]),
+            tr(
+              "を記録するまで完了できません。一方、その処理中はHostがこの更新を受け付けません。コンソールからは解消できず、Host側の修正が必要です。",
+              stuck.length === 1
+                ? ", and the Host refuses that update while it is in progress. Neither can be resolved from the console; it needs a fix on the Host."
+                : ", and the Host refuses that update while they are in progress. Neither can be resolved from the console; it needs a fix on the Host.",
+            ),
+          )
+        : !naming.complete
+          ? h(
+              "span",
+              null,
+              tr(
+                "このWorkerを参照するリソースをすべては確認できなかったため、ここでは更新を提示しません。",
+                "Not everything that names this Worker could be checked here, so the update is not offered.",
+              ),
+            )
+          : busy.length > 0
+            ? h(
+                "span",
+                null,
+                ...links(busy),
+                tr(
+                  "の処理が終わるまで待ってください。Workerを参照するリソースの処理中は、Hostはこの更新を受け付けません。",
+                  busy.length === 1
+                    ? " is in progress. Wait until it finishes: the Host refuses this update while anything that names the Worker is in progress."
+                    : " are in progress. Wait until they finish: the Host refuses this update while anything that names the Worker is in progress.",
+                ),
+              )
+            : unpublished.length > 0
+              ? h(
+                  "span",
+                  null,
+                  tr("先に", "Re-apply or delete "),
+                  ...links(unpublished),
+                  tr(
+                    "を再適用するか削除してください。稼働中になるまでは、この更新を送っても完了せず、その間Workerが処理中のままになります。",
+                    " first. Until it is Ready, this update cannot finish, and it would hold the Worker busy meanwhile.",
+                  ),
+                )
+              : h(
+                  "button",
+                  {
+                    class: "btn",
+                    type: "button",
+                    onClick: () =>
+                      updateResource(organizationId, worker, {
+                        spec: worker.spec,
+                        note: tr(
+                          `${worker.name}を同じ設定のまま更新し、稼働中の配信${deployment.name}を記録します。内容を確認して「更新する」を押してください。`,
+                          `This updates ${worker.name} with the same spec, so that it records ${deployment.name}. Check it, then choose Update.`,
+                        ),
+                      }),
+                  },
+                  tr("配信を記録する", "Record the Deployment"),
+                );
+    return h(
+      "div",
+      {
+        class: "notice notice--warn",
+        style: { display: "grid", gap: "10px", justifyItems: "start" },
+      },
+      h(
+        "span",
+        null,
+        tr("このWorkerは、稼働中の配信", "This Worker has not recorded "),
+        ...links([deployment]),
+        tr(
+          `を記録していません。HostがWorkerの配信を記録するのは、そのWorker自体が適用されたときだけです。${
+            phase === "NotReady" ? "記録するまでは非稼働と報告され、" : "記録するまで、"
+          }このWorkerのWorkerCronTriggerは適用を完了できず、実行されません。WorkerCronTriggerを追加する前に、同じ設定で更新して記録してください。`,
+          `, which serves it: the Host records a Worker's Deployment only when the Worker itself is applied. Until it does, ${
+            phase === "NotReady" ? "the Host reports it NotReady, and " : ""
+          }a WorkerCronTrigger for it cannot finish being applied, so it never runs. Update it with the same spec to record it before you add a WorkerCronTrigger.`,
+        ),
+      ),
+      next,
+    );
+  });
+}
+
+/** Where a WorkerVersion names its code bundle. */
+const CODE_PATH = ["bundle", "resourceUid"];
+
+/**
+ * On a WorkerVersion's page: start the next version from this one. A version
+ * cannot be changed, so shipping new code means a new version; it keeps this
+ * one's handlers, vars, Bindings and assets, and leaves its code bundle to be
+ * chosen. A version that needs secret values is not offered: the console
+ * cannot send them.
+ */
+function newVersionAction(organizationId: string, version: ResourceSummary): Child {
+  const secrets = valueAt(version.spec, ["requiredSensitiveVars"]);
+  if (Array.isArray(secrets) && secrets.length > 0)
+    return h(
+      "span",
+      { class: "dim" },
+      tr(
+        "この版には秘密の値が必要ですが、コンソールからは送れません。次の版はAPIでprivateInputsを付けて作成してください。",
+        "This version needs secret values, which the console cannot send; create the next version over the API with privateInputs.",
+      ),
+    );
+  const hasCode = valueAt(version.spec, CODE_PATH) !== undefined;
+  const spec = hasCode
+    ? (withValueAt(structuredClone(version.spec), CODE_PATH, "") ?? version.spec)
+    : version.spec;
+  return h(
+    "button",
+    {
+      class: "btn",
+      type: "button",
+      onClick: () =>
+        createResource(organizationId, {
+          form: version.form,
+          spec,
+          note: hasCode
+            ? tr(
+                `版は変更できないため、${version.name}の設定（ハンドラー・変数・Bindingを含む）から新しい版を作成します。新しいコードを選び、名前を付けて「作成する」を押してください。その後、新しい版のページから配信できます。`,
+                `A version cannot be changed, so this creates a new one from ${version.name}'s spec, with its handlers, vars and Bindings. Choose its new code, name it, then choose Create; you can then serve it from its page.`,
+              )
+            : tr(
+                `版は変更できないため、${version.name}の設定から新しい版を作成します。assets.bundleを新しいStaticAssetBundleのUIDに書き換え、名前を付けて「作成する」を押してください。その後、新しい版のページから配信できます。`,
+                `A version cannot be changed, so this creates a new one from ${version.name}'s spec. Write the new StaticAssetBundle's UID in assets.bundle, name it, then choose Create; you can then serve it from its page.`,
+              ),
+        }),
+    },
+    tr("この版から新しい版を作る", "New version from this one"),
+  );
+}
+
+/** Whether a Deployment's versions are exactly this one version at weight 10000. */
+export function servesOnly(versions: unknown, versionUid: string): boolean {
+  if (!Array.isArray(versions) || versions.length !== 1) return false;
+  const [entry] = versions;
+  return (
+    valueAt(entry, ["workerVersion", "resourceUid"]) === versionUid &&
+    valueAt(entry, ["weight"]) === 10000
+  );
+}
+
+/**
+ * On a WorkerVersion's page: serve this version. It opens the update of the
+ * Worker's Deployment with this version alone at weight 10000, or a new
+ * Deployment when the Worker has none; nothing is sent until the person
+ * accepts it. A Deployment that already names this version alone says how
+ * that change stands, from its own state, rather than claiming it serves.
+ */
+function serveVersionAction(organizationId: string, version: ResourceSummary): Child {
+  const workerUid = valueAt(version.spec, ["worker", "resourceUid"]);
+  if (typeof workerUid !== "string") return null;
+  const served = resource(() => deploymentOf(organizationId, workerUid));
+  const versions = [{ workerVersion: { resourceUid: version.uid }, weight: 10000 }];
+  return live(() => {
+    const state = served.get();
+    if (state.state !== "ready") return null;
+    const deployment = state.value;
+    const current = deployment ? valueAt(deployment.spec, ["versions"]) : undefined;
+    if (deployment && servesOnly(current, version.uid)) {
+      const link = h("a", { ...linkProps(resourcePath(deployment.uid)) }, deployment.name);
+      const settled = health(deployment);
+      // Only a settled, healthy Deployment is said to serve; every other state
+      // says what it is. health() already puts Deleting and Failed before a
+      // change not yet observed (Pending), so the phase alone decides.
+      const words = {
+        Pending: () => tr("配信を更新中です：", "The Deployment is updating: "),
+        Ready: () => tr("この版を配信中です：", "Serving this version: "),
+        Applied: () => tr("この版を配信中です：", "Serving this version: "),
+        Failed: () => tr("配信の更新に失敗しました：", "The Deployment's update failed: "),
+        NotReady: () => tr("配信の準備ができていません：", "The Deployment is not ready: "),
+        Deleting: () => tr("配信を削除中です：", "The Deployment is being deleted: "),
+        Unknown: () => tr("配信の状態を確認できません：", "The Deployment's state is unknown: "),
+      }[settled.phase]();
+      return h("span", { class: "dim published" }, words, link);
+    }
+    // The Host refuses a Deployment of a version that is not ready.
+    const readiness = health(version).phase;
+    if (readiness !== "Ready" && readiness !== "Applied")
+      return h(
+        "span",
+        { class: "dim" },
+        tr("この版の準備ができると配信できます", "This version can be served once it is Ready"),
+      );
+    const split =
+      Array.isArray(current) && current.length > 1
+        ? tr(
+            `現在は${current.length}つの版を配信しています。この更新で${version.name}だけになります。`,
+            `It serves ${current.length} versions now; after this update it serves only ${version.name}. `,
+          )
+        : "";
+    return h(
+      "button",
+      {
+        class: "btn btn--primary",
+        type: "button",
+        onClick: () =>
+          deployment
+            ? updateResource(organizationId, deployment, {
+                spec: { ...deployment.spec, versions },
+                note:
+                  split +
+                  (split
+                    ? tr(
+                        `${deployment.name}を更新します。内容を確認して「更新する」を押してください。`,
+                        `This updates ${deployment.name}. Check it, then choose Update.`,
+                      )
+                    : tr(
+                        `${deployment.name}を更新し、${version.name}だけを重み10000で配信します。内容を確認して「更新する」を押してください。`,
+                        `This updates ${deployment.name} to serve only ${version.name}, at weight 10000. Check it, then choose Update.`,
+                      )),
+              })
+            : createResource(organizationId, {
+                form: WORKER_DEPLOYMENT,
+                spec: { worker: { resourceUid: workerUid }, versions },
+                note: tr(
+                  `このWorkerにはまだ配信（WorkerDeployment）がありません。${version.name}を配信するWorkerDeploymentを作成します。名前を付けて「作成する」を押してください。`,
+                  `This Worker has no Deployment yet. This creates one that serves ${version.name}. Name it, then choose Create.`,
+                ),
+              }),
+      },
+      tr("この版を配信する", "Serve this version"),
+    );
+  });
+}
+
 /** The Resources this spec names, by name, so the graph can be walked rather than read. */
 function referencesCard(organizationId: string, references: readonly SpecReference[]): Child {
   const named = resource(async () => {
@@ -315,7 +614,7 @@ function referencesCard(organizationId: string, references: readonly SpecReferen
       { class: "card__body rows" },
       ...references.map((reference) =>
         field(
-          reference.path,
+          pathLabel(reference.path),
           live(() => {
             const state = named.get();
             const target = state.state === "ready" ? state.value.get(reference.uid) : undefined;
@@ -365,7 +664,7 @@ function referrersCard(organizationId: string, uid: string): Child {
         ...referrers.map(({ resource: referrer, paths }) => {
           const url = publishedUrl(referrer.output);
           return field(
-            tr(`${paths.join("、")} として`, `as ${paths.join(", ")}`),
+            pathLabel(paths.join(", ")),
             h(
               "span",
               { class: "ref" },
@@ -377,6 +676,7 @@ function referrersCard(organizationId: string, uid: string): Child {
                     { href: url, target: "_blank", rel: "noopener noreferrer" },
                     url,
                     h("span", { "aria-hidden": "true" }, " ↗"),
+                    newTab(),
                   )
                 : null,
             ),
@@ -387,7 +687,51 @@ function referrersCard(organizationId: string, uid: string): Child {
   });
 }
 
-function field(label: string, value: Child): Child {
+/** What the Host is doing with a Resource, for each v2 phase, as [Japanese, English]. */
+export const HOST_WORK: Readonly<Record<string, readonly [string, string]>> = {
+  pending: ["処理中", "In progress"],
+  deleting: ["削除中", "Deleting"],
+  error: ["失敗", "Failed"],
+  // Set only when the last Operation succeeded and nothing is running.
+  idle: ["なし（完了）", "None (settled)"],
+};
+
+/** A phase this Console does not know is shown as the Host wrote it, never as settled. */
+export function hostWork(phase: string): string {
+  const words = Object.hasOwn(HOST_WORK, phase) ? HOST_WORK[phase] : undefined;
+  return words ? tr(...words) : phase;
+}
+
+function newTab(): Child {
+  return h(
+    "span",
+    { class: "visually-hidden" },
+    tr("（新しいタブで開きます）", " (opens in a new tab)"),
+  );
+}
+
+function httpsUrl(value: string): boolean {
+  try {
+    return new URL(value).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A place in a spec, in monospace, that wraps only between its parts
+ * ("versions[0]." / "workerVersion") rather than in the middle of a name.
+ */
+function pathLabel(path: string): Child {
+  const parts = path.split(/(?<=[.,])|(?=\[)/u);
+  return h(
+    "span",
+    { class: "mono path-label" },
+    ...parts.flatMap((part, index) => (index === 0 ? [part] : [h("wbr"), part])),
+  );
+}
+
+function field(label: Child, value: Child): Child {
   return h(
     "div",
     { class: "row" },

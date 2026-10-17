@@ -1,9 +1,14 @@
 import type { Organization } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
+import { guideLink, workerSupport } from "../first-run.ts";
 import { consoleLocale, setConsoleLocale, tr } from "../i18n.ts";
+import { resource } from "../reactive.ts";
+import { linkProps } from "../router.ts";
 import {
+  api,
   apiOrigin,
   applyTheme,
+  hostV2Base,
   principal,
   setApiOrigin,
   signOut,
@@ -35,7 +40,7 @@ export function settingsPage(organization: Organization): Child {
           "p",
           null,
           tr(
-            "サインイン中のアカウントと、このConsoleの接続先を確認します。",
+            "サインイン中のアカウントと、このコンソールの接続先を確認します。",
             "Who you are signed in as, and what this console is talking to.",
           ),
         ),
@@ -66,6 +71,7 @@ export function settingsPage(organization: Organization): Child {
         ),
       ),
     ),
+    hostCard(organization.id),
     live(() => {
       const who = principal();
       return card(
@@ -174,7 +180,7 @@ export function settingsPage(organization: Organization): Child {
               "small",
               null,
               tr(
-                "このConsoleのすべてのリクエストがここへ送られます。変更してもデータは移動しません。",
+                "このコンソールのすべてのリクエストがここへ送られます。変更してもデータは移動しません。",
                 "Every request from this console goes here. Changing it does not move any data.",
               ),
             ),
@@ -182,6 +188,112 @@ export function settingsPage(organization: Organization): Child {
         ),
       );
     }),
+  );
+}
+
+/**
+ * What this Host offers: the Host API v2 address that Takoform and curl use,
+ * and whether it runs Workers and publishes them at HTTPS hostnames, as the
+ * Host itself answers.
+ */
+export function hostCard(organizationId: string): Child {
+  const discovery = resource(() => api.hostDiscovery());
+  const support = resource(() => workerSupport(organizationId));
+  const checking = (): Child => h("span", { class: "dim" }, tr("確認中…", "Checking…"));
+  const unchecked = (): Child =>
+    h("span", { class: "dim" }, tr("確認できませんでした", "Couldn't check"));
+  const guideStep = (anchor: string, ja: string, en: string): Child =>
+    guideLink(anchor, tr(`導入手順書（英語）の${ja}`, `${en} of the install guide`));
+
+  const address = (): Child => {
+    const state = discovery.get();
+    if (state.state === "loading") return checking();
+    const v2 = hostV2Base(state.state === "ready" ? state.value : null);
+    return h(
+      "div",
+      { style: { display: "grid", gap: "6px" } },
+      h(
+        "div",
+        { style: { display: "flex", alignItems: "center", gap: "10px" } },
+        // The whole address is read and pasted, so it wraps instead of being cut short.
+        h(
+          "span",
+          { class: "mono", style: { wordBreak: "break-all", flex: "1", minWidth: "0" } },
+          v2,
+        ),
+        copyable(v2, tr("コピー", "copy")),
+      ),
+      h(
+        "small",
+        null,
+        tr(
+          "curlなどのHost API v2クライアントからは、このURL、スペース（上の「識別子」）、",
+          "Host API v2 clients such as curl use this URL, the Identifier above as the Space, and ",
+        ),
+        h("a", { ...linkProps("/keys") }, tr("APIキー", "an API key")),
+        tr("を使って操作します。", "."),
+      ),
+    );
+  };
+
+  return card(
+    tr("このHost", "This Host"),
+    h(
+      "div",
+      { class: "card__body" },
+      // One region for every row, so each row but the last keeps its rule.
+      live(() => {
+        const state = support.get();
+        const [worker, endpoint] = state.state === "ready" ? state.value : [null, null];
+        const rows = [row("Host API v2", address())];
+        rows.push(
+          row(
+            tr("Worker", "Workers"),
+            state.state === "loading"
+              ? checking()
+              : worker === true
+                ? tr("実行します", "Runs Workers")
+                : worker === false
+                  ? h(
+                      "span",
+                      null,
+                      tr(
+                        "実行しません。保持できるのは成果物だけです。Workerを動かすには、",
+                        "Does not run Workers; it keeps artifacts only. Running them needs the Worker runtime and its settings from ",
+                      ),
+                      guideStep("3-configuration", "手順3", "step 3"),
+                      tr("にあるWorker実行環境とその設定が必要です。", "."),
+                    )
+                  : unchecked(),
+          ),
+        );
+        // Publishing is a question only for a Host that runs Workers.
+        if (worker === true)
+          rows.push(
+            row(
+              tr("HTTPSでの公開", "HTTPS publishing"),
+              endpoint === true
+                ? tr(
+                    "WorkerEndpointで、WorkerをHTTPSのホスト名に公開できます",
+                    "WorkerEndpoint publishes Workers at HTTPS hostnames",
+                  )
+                : endpoint === false
+                  ? h(
+                      "span",
+                      null,
+                      tr(
+                        "まだ公開できません。",
+                        "Not yet: it needs the HTTPS listener on TCP 443 from ",
+                      ),
+                      guideStep("4-https-and-tcp-443", "手順4", "step 4"),
+                      tr("にあるHTTPS（TCP 443）の待ち受け設定が必要です。", "."),
+                    )
+                  : unchecked(),
+            ),
+          );
+        return h("div", { class: "rows" }, ...rows);
+      }),
+    ),
   );
 }
 

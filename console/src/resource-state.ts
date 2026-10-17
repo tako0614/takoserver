@@ -1,6 +1,7 @@
 import type { ResourceSummary } from "./api.ts";
 import { formName } from "./forms.ts";
 import { tr } from "./i18n.ts";
+import { MODULE_WORKER, WORKER_ENDPOINT } from "./references.ts";
 
 /** Display only states the v2 Resource actually reports. */
 export type Phase =
@@ -31,10 +32,18 @@ export function health(resource: ResourceSummary): Health {
   if (resource.phase === "pending" || stale) {
     return { phase: "Pending", tone: "warn", reason: null, message: null, stale };
   }
-  if (resource.observedAt !== null && resource.observed.ready === true) {
+  // A Form names its readiness `ready`; a WorkerEndpoint reports whether its
+  // active Deployment's route is ready.
+  const ready =
+    "ready" in resource.observed
+      ? resource.observed.ready
+      : WORKER_ENDPOINT.test(resource.form)
+        ? resource.observed.activeDeploymentRouteReady
+        : undefined;
+  if (resource.observedAt !== null && ready === true) {
     return { phase: "Ready", tone: "ok", reason: null, message: null, stale };
   }
-  if (resource.observedAt !== null && resource.observed.ready === false) {
+  if (resource.observedAt !== null && ready === false) {
     return { phase: "NotReady", tone: "warn", reason: null, message: null, stale };
   }
   // Idle with the latest generation observed is the Host's settled state.
@@ -52,6 +61,30 @@ export function health(resource: ResourceSummary): Health {
   return { phase: "Unknown", tone: "idle", reason: null, message: null, stale };
 }
 
+/**
+ * Whether a ModuleWorker has not recorded the Deployment that serves it. The
+ * Host writes a Worker's observation only when the Worker's own operation
+ * settles, so a Worker created before its Deployment keeps reporting not
+ * ready, and one that recorded an earlier Deployment keeps naming it, until
+ * it is updated with the same spec. Until then no WorkerCronTrigger for it
+ * can finish being applied. A Worker has at most one Deployment, so a settled
+ * Worker that names another one is out of date.
+ */
+export function unrecordedDeployment(
+  worker: ResourceSummary,
+  deployment: ResourceSummary | null | undefined,
+): deployment is ResourceSummary {
+  return (
+    MODULE_WORKER.test(worker.form) &&
+    deployment !== null &&
+    deployment !== undefined &&
+    ["Ready", "NotReady"].includes(health(worker).phase) &&
+    health(deployment).phase === "Ready" &&
+    deployment.observed.active === true &&
+    worker.observed.activeDeploymentUid !== deployment.uid
+  );
+}
+
 export function phaseLabel(phase: Phase): string {
   const japanese = {
     Ready: "稼働中",
@@ -62,7 +95,8 @@ export function phaseLabel(phase: Phase): string {
     Deleting: "削除中",
     Unknown: "不明",
   } as const;
-  return tr(japanese[phase], phase);
+  // English reads its words, not the identifier: NotReady is "Not ready".
+  return tr(japanese[phase], phase === "NotReady" ? "Not ready" : phase);
 }
 
 /** Counts by exact Form URL; a shared noun is not a Form identity. */

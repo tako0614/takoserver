@@ -90,3 +90,31 @@ export function keyScopeGroups(aiAvailable: boolean): readonly ScopeGroup[] {
 
 /** A writer can read what it writes, so one scope covers the common case. */
 export const DEFAULT_KEY_SCOPES: readonly string[] = ["resources:write"];
+
+/**
+ * A first request with a new key, in the install guide's own variable names so
+ * that its later steps continue from it. Null for a key that cannot read
+ * Resources, which Host API v2 would turn away.
+ */
+export function keyUsage(
+  v2: string,
+  organizationId: string,
+  scopes: readonly string[],
+): string | null {
+  if (!scopes.includes("resources:read") && !scopes.includes("resources:write")) return null;
+  return [
+    `V2=${shellQuote(v2)}`,
+    `ORG=${shellQuote(organizationId)}`,
+    // bash and zsh both read silently with -s; zsh's read -p means something
+    // else. The && chain makes the shell parse the curl before read runs, so
+    // a shell without bracketed paste cannot read the next pasted line as the key.
+    "printf 'API key: ' && read -rs KEY && echo &&",
+    'curl -sS -G "$V2/resources" --data-urlencode "space=$ORG" \\',
+    '  -H "authorization: Bearer $KEY"',
+  ].join("\n");
+}
+
+/** One literal shell word, whatever the value holds. */
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}

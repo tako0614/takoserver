@@ -36,6 +36,34 @@ export interface Organization {
   readonly createdAt: string;
 }
 
+/**
+ * The v2 base a Host names, only in the one shape a Host builds it: an HTTPS
+ * origin (plain HTTP only on this machine) and the exact v2 path. The console
+ * puts it into a command a person pastes into a shell, so anything else is
+ * dropped rather than passed on.
+ */
+export function v2Base(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return null;
+  }
+  const local = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && local)) return null;
+  if (url.username !== "" || url.password !== "" || url.search !== "" || url.hash !== "")
+    return null;
+  if (url.pathname !== "/apis/forms.takoform.com/v2") return null;
+  return `${url.origin}${url.pathname}`;
+}
+
+export interface HostDiscovery {
+  readonly ai: boolean;
+  /** The Host API v2 base, such as `https://api.example.com/apis/forms.takoform.com/v2`. */
+  readonly takoform: string | null;
+}
+
 export interface ApiKey {
   readonly id: string;
   readonly organizationId: string;
@@ -157,13 +185,6 @@ export interface FormRef {
 
 export type ResourceSummary = V2Resource;
 
-export interface Operation {
-  readonly id: string;
-  readonly operation: string;
-  readonly state: string;
-  readonly createdAt: string;
-}
-
 /** Durable accepted v2 Operation, distinct from control-plane history. */
 export type ResourceOperation = V2Operation;
 
@@ -178,6 +199,8 @@ export class ApiError extends Error {
     readonly code: string,
     readonly status: number,
     readonly path: string,
+    /** The Host's own explanation, when its problem carries one. */
+    readonly detail: string | null = null,
   ) {
     super(code);
     this.name = "ApiError";
@@ -390,7 +413,13 @@ export function createApi(options: ApiOptions) {
           : typeof envelope?.code === "string"
             ? envelope.code
             : `http_${response.status}`;
-      const failure = new ApiError(code, response.status, path);
+      const detail = (payload as { detail?: unknown } | null)?.detail;
+      const failure = new ApiError(
+        code,
+        response.status,
+        path,
+        typeof detail === "string" && detail.length > 0 && detail.length <= 1024 ? detail : null,
+      );
       if (failure.isExpiredSession) options.onSessionLost();
       throw failure;
     }
@@ -442,20 +471,19 @@ export function createApi(options: ApiOptions) {
       return seconds;
     },
     /**
-     * Whether this Host serves `/v1/ai`, from its own discovery document. An
-     * unreadable document answers false rather than guessing.
+     * What this Host's own discovery document says it serves: whether it has
+     * `/v1/ai`, and the Host API v2 base it names from its public origin. An
+     * unreadable document answers neither rather than guessing.
      */
-    async aiAvailable(): Promise<boolean> {
+    async hostDiscovery(): Promise<HostDiscovery> {
+      const unknown: HostDiscovery = { ai: false, takoform: null };
       try {
         const { payload, status } = await request<unknown>("GET", "/.well-known/takoserver");
-        return (
-          status === 200 &&
-          isRecord(payload) &&
-          isRecord(payload.endpoints) &&
-          typeof payload.endpoints.ai === "string"
-        );
+        if (status !== 200 || !isRecord(payload) || !isRecord(payload.endpoints)) return unknown;
+        const { ai, takoform } = payload.endpoints;
+        return { ai: typeof ai === "string", takoform: v2Base(takoform) };
       } catch {
-        return false;
+        return unknown;
       }
     },
     identityProviders: () =>
@@ -702,9 +730,10 @@ export function createApi(options: ApiOptions) {
       return payload.supported && payload.operations.includes("create");
     },
 
-    resources: (organizationId: string, query: { cursor?: string } = {}) => {
+    resources: (organizationId: string, query: { cursor?: string; form?: string } = {}) => {
       const search = new URLSearchParams();
       search.set("space", organizationId);
+      if (query.form) search.set("form", query.form);
       if (query.cursor) search.set("cursor", query.cursor);
       const path = `${LANE}/resources?${search.toString()}`;
       return request<unknown>("GET", path, undefined, organizationHeader(organizationId)).then(
@@ -713,7 +742,12 @@ export function createApi(options: ApiOptions) {
             status !== 200 ||
             !isRecord(payload) ||
             !Array.isArray(payload.items) ||
-            !payload.items.every((item) => isV2Resource(item) && item.space === organizationId) ||
+            !payload.items.every(
+              (item) =>
+                isV2Resource(item) &&
+                item.space === organizationId &&
+                (!query.form || item.form === query.form),
+            ) ||
             (payload.nextCursor !== null && typeof payload.nextCursor !== "string")
           ) {
             throw new ApiError("invalid_response", status, path);
@@ -825,12 +859,6 @@ export function createApi(options: ApiOptions) {
         throw new ApiError("invalid_response", status, path);
       return payload;
     },
-
-    operations: (organizationId: string) =>
-      call<{ operations: readonly Operation[] }>(
-        "GET",
-        `/v1/organizations/${encodeURIComponent(organizationId)}/operations`,
-      ),
   };
 }
 

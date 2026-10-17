@@ -208,7 +208,9 @@ test("confirmed ready:false is NotReady and visible in overview attention", asyn
   body.append(overviewPage(organization) as unknown as NodeStub);
   await settle();
   expect(body.textContent).toContain("Needs attention");
-  expect(body.textContent).toContain("NotReady");
+  // English reads the words, not the identifier.
+  expect(body.textContent).toContain("Not ready");
+  expect(body.textContent).not.toContain("NotReady");
   expect(body.textContent).toContain("latest observation reports not ready");
   expect(body.textContent).not.toContain("Unknown");
 });
@@ -240,7 +242,10 @@ test("overview counts only what it read and offers the first create", async () =
     output: {},
     lastOperation: "op-one",
   };
-  const render = async (page: { items: unknown[]; nextCursor: string | null }) => {
+  const render = async (
+    page: { items: unknown[]; nextCursor: string | null },
+    supported?: (form: string) => boolean,
+  ) => {
     const body = installDom();
     consoleLocale.set("en");
     setApiOrigin("https://api.example.test");
@@ -263,6 +268,15 @@ test("overview counts only what it read and offers the first create", async () =
             },
           });
         if (path.endsWith("/operations")) return Response.json({ operations: [] });
+        if (path.endsWith("/support") && supported !== undefined) {
+          const form = new URL(String(input)).searchParams.get("form") ?? "";
+          const yes = supported(form);
+          return Response.json({
+            form,
+            supported: yes,
+            operations: yes ? ["create", "read", "update", "delete"] : [],
+          });
+        }
         return Response.json(page);
       },
       { preconnect: globalThis.fetch.preconnect },
@@ -273,13 +287,12 @@ test("overview counts only what it read and offers the first create", async () =
   };
 
   const partial = await render({ items: [item], nextCursor: "next" });
-  expect(partial.textContent).toContain("1+");
+  expect(partial.textContent).toContain("Resources 1+");
   expect(partial.textContent).toContain("first page only");
-  expect(partial.textContent).toContain("By Form (first page)");
 
   const complete = await render({ items: [item], nextCursor: null });
   expect(complete.textContent).toContain("none failed or not ready");
-  expect(complete.textContent).toContain("By Form");
+  expect(complete.textContent).toContain("Resources 1");
   expect(complete.textContent).not.toContain("first page");
   expect(complete.textContent).not.toContain("invalid");
 
@@ -301,8 +314,54 @@ test("overview counts only what it read and offers the first create", async () =
   expect(failing.textContent).toContain("1+ need attention");
 
   const none = await render({ items: [], nextCursor: null });
-  expect(none.textContent).toContain("none yet");
   expect(none.textContent).toContain("Nothing declared yet");
+  // A new organization is told how a Worker comes to be served, not to ask for a URL.
+  // Until the Host says whether it runs Workers, the steps are qualified.
+  expect(none.textContent).toContain(
+    "On a Host that runs Workers, a Worker is served once five Resources are created in this order: ModuleWorker, WorkerBundle, WorkerVersion, WorkerDeployment and WorkerEndpoint",
+  );
+  expect(none.textContent).not.toContain("supplied by the operator");
+  const guide = none.all().find((node) => node.tag === "a");
+  expect(guide?.attributes.get("href")).toBe(
+    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#6-seed-held-artifacts",
+  );
+  expect(guide?.attributes.get("target")).toBe("_blank");
+  expect(guide?.textContent).toContain("(opens in a new tab)");
+
+  const serving = await render({ items: [], nextCursor: null }, () => true);
+  expect(serving.textContent).toContain("A Worker is served once five Resources are created");
+  expect(serving.textContent).not.toContain("On a Host that runs Workers");
+
+  // An artifact-only Host says so instead of promising a Worker.
+  const artifacts = await render({ items: [], nextCursor: null }, () => false);
+  expect(artifacts.textContent).toContain("This Host does not run Workers.");
+  expect(artifacts.textContent).not.toContain("five Resources");
+  expect(
+    artifacts
+      .all()
+      .find((node) => node.tag === "a")
+      ?.attributes.get("href"),
+  ).toBe(
+    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#first-install-and-first-use",
+  );
+
+  // Workers run here but are not published: the note says what publishing needs.
+  const unpublished = await render(
+    { items: [], nextCursor: null },
+    (form) => !form.includes("/WorkerEndpoint/"),
+  );
+  expect(unpublished.textContent).toContain(
+    "This Host runs Workers but does not yet publish them at an HTTPS hostname",
+  );
+  expect(unpublished.textContent).not.toContain("five Resources");
+  expect(
+    unpublished
+      .all()
+      .find((node) => node.tag === "a")
+      ?.attributes.get("href"),
+  ).toBe(
+    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#4-https-and-tcp-443",
+  );
   const create = none.all().find((node) => node.tag === "button");
   expect(create?.className).toBe("btn btn--primary");
   expect(create?.textContent).toContain("New resource");
@@ -518,7 +577,7 @@ test("names each referenced Resource where the spec names it", async () => {
     { path: "worker", uid: "uid-worker" },
     { path: "bundle", uid: "uid-bundle" },
     { path: "sqliteBindings · DB", uid: "uid-db" },
-    { path: "versions[0] · workerVersion", uid: "uid-version" },
+    { path: "versions[0].workerVersion", uid: "uid-version" },
   ]);
   expect(specReferences({})).toEqual([]);
   expect(publishedUrl({ hostname: "hello.example.com", url: "https://hello.example.com/" })).toBe(
@@ -688,9 +747,22 @@ test("a Worker's page lists what names it, with the address an Endpoint publishe
   expect(text).not.toMatch(/first \d+ checked/);
   expect(text).toContain("hello-version-v1");
   expect(text).toContain("hello-endpoint");
-  expect(text).toContain("as worker");
+  // Each referrer is labelled by the place in its spec that names this one.
+  expect(text).toContain("workerhello-version-v1");
+  expect(text).not.toContain("as worker");
   expect(text).not.toContain("notes");
+  // The heading names the Form as the list does and links its published contract;
+  // the Identity card keeps the exact URL to copy.
   const links = body.all().filter((node) => node.tag === "a");
+  const contract = links.find((node) => node.textContent.startsWith("ModuleWorker 0.3.0"));
+  expect(contract?.attributes.get("href")).toBe(
+    "https://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/",
+  );
+  expect(contract?.attributes.get("target")).toBe("_blank");
+  expect(contract?.attributes.get("rel")).toBe("noopener noreferrer");
+  expect(text).toContain("Formhttps://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/");
+  // The Host's phase reads as words, with the API's own value beside it.
+  expect(text).toContain("Host workNone (settled) · idle");
   expect(links.find((node) => node.textContent === "hello-endpoint")?.attributes.get("href")).toBe(
     "/resources/uid-endpoint",
   );
@@ -739,4 +811,129 @@ test("what names a Resource says how many it checked when it stops early", async
   expect(found.complete).toBe(false);
   expect(found.checked).toBe(15);
   expect(found.referrers.map((entry) => entry.resource.uid)).toEqual(["uid-2-a"]);
+});
+
+test("the overview shows each Worker with its state and address", async () => {
+  const body = installDom();
+  const { consoleLocale } = await import("../console/src/i18n.ts");
+  const { organizations, selectOrganization, setApiOrigin } = await import(
+    "../console/src/state.ts"
+  );
+  const { overviewPage } = await import("../console/src/pages/overview.ts");
+  consoleLocale.set("en");
+  setApiOrigin("https://api.example.test");
+  const organization = {
+    id: "org-one",
+    name: "One",
+    ownerPrincipalId: "owner",
+    createdAt: "2026-10-07",
+  };
+  organizations.set([organization]);
+  selectOrganization(organization.id);
+  const forms = "https://edge.forms.takoform.com/forms";
+  const item = (uid: string, form: string, spec: unknown, output = {}, observed = {}) => ({
+    uid,
+    form: `${forms}/${form}/`,
+    space: "org-one",
+    name: uid,
+    generation: 1,
+    observedGeneration: 1,
+    observedAt: "2026-10-07T00:00:00Z",
+    phase: "idle" as const,
+    spec,
+    observed,
+    output,
+    lastOperation: `op-${uid}`,
+  });
+  const items = [
+    item("draft", "ModuleWorker/0.3.0", {}, {}, { ready: true }),
+    item(
+      "draft-deployment",
+      "WorkerDeployment/0.4.0",
+      { worker: { resourceUid: "draft" } },
+      {},
+      { ready: true },
+    ),
+    {
+      ...item(
+        "draft-endpoint",
+        "WorkerEndpoint/0.3.0",
+        { worker: { resourceUid: "draft" } },
+        { url: "https://draft.apps.example.com/" },
+      ),
+      observedGeneration: 0,
+      phase: "pending" as const,
+    },
+    item("hello", "ModuleWorker/0.3.0", {}, {}, { ready: true }),
+    item(
+      "hello-deployment",
+      "WorkerDeployment/0.4.0",
+      { worker: { resourceUid: "hello" } },
+      {},
+      { ready: true },
+    ),
+    item(
+      "hello-endpoint",
+      "WorkerEndpoint/0.3.0",
+      { worker: { resourceUid: "hello" } },
+      { url: "https://hello.apps.example.com/" },
+      { activeDeploymentRouteReady: true },
+    ),
+  ];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/wallet"))
+        return Response.json({
+          wallet: {
+            organizationId: "org-one",
+            availableMicros: "0",
+            heldMicros: "0",
+            settledMicros: "0",
+            currency: "USD",
+            unit: "USD-micros",
+            moneyPolicy: "usd-micros-v2",
+            entries: [],
+          },
+        });
+      if (path.endsWith("/operations")) return Response.json({ operations: [] });
+      return Response.json({ items, nextCursor: null });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  body.append(overviewPage(organization) as unknown as NodeStub);
+  await settle();
+  expect(body.textContent).toContain("Workers");
+  expect(body.textContent).toContain("Where your Workers are served");
+  expect(body.textContent).not.toContain("what changed recently");
+  const links = body.all().filter((node) => node.tag === "a");
+  expect(links.find((node) => node.textContent === "hello")?.attributes.get("href")).toBe(
+    "/resources/hello",
+  );
+  expect(
+    links.some((node) => node.attributes.get("href") === "https://hello.apps.example.com/"),
+  ).toBe(true);
+  // An Endpoint still settling shows its address as text with its own state.
+  expect(
+    links.some((node) => node.attributes.get("href") === "https://draft.apps.example.com/"),
+  ).toBe(false);
+  expect(body.textContent).toContain("https://draft.apps.example.com/");
+  expect(body.textContent).toContain("Pending");
+});
+
+test("says what the Host is doing for each v2 phase, and never calls an unknown one settled", async () => {
+  installDom();
+  const { HOST_WORK, hostWork } = await import("../console/src/pages/resource-detail.ts");
+  expect(HOST_WORK).toEqual({
+    pending: ["処理中", "In progress"],
+    deleting: ["削除中", "Deleting"],
+    error: ["失敗", "Failed"],
+    idle: ["なし（完了）", "None (settled)"],
+  });
+  // The four phases the v2 API reports, and nothing else, have words.
+  expect(Object.keys(HOST_WORK).sort()).toEqual(["deleting", "error", "idle", "pending"]);
+  // A known phase reads in the console's language, whichever it is.
+  expect(HOST_WORK.pending).toContain(hostWork("pending"));
+  expect(hostWork("migrating")).toBe("migrating");
+  expect(hostWork("constructor")).toBe("constructor");
 });

@@ -1,5 +1,6 @@
-import type { ResourceSummary } from "../api.ts";
+import type { ResourceOperation, ResourceSummary } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
+import { firstRunNote, once } from "../first-run.ts";
 import { formName } from "../forms.ts";
 import { tr } from "../i18n.ts";
 import { resource, signal } from "../reactive.ts";
@@ -15,6 +16,35 @@ import { api, currentOrganization } from "../state.ts";
 import { ago, badge, card, copyable, empty, explain, ICON, icon, whenReady } from "../ui.ts";
 import { createResource } from "./create-resource.ts";
 
+/** How an operation still in progress is followed: every 1.5 s for up to two minutes. */
+export const OPERATION_FOLLOW = { intervalMs: 1_500, budgetMs: 120_000 };
+/** Bumped by each build of the Resources page; only the newest build follows. */
+let followGeneration = 0;
+
+/** What a failed operation left behind, which decides whether a retry is safe. */
+function failedEffect(effect: string): string {
+  switch (effect) {
+    case "none":
+      return tr("変更はありません。", "Nothing was changed.");
+    case "partial":
+      return tr(
+        "一部が反映されています。リソースを確認してください。",
+        "Partly applied. Check the Resource.",
+      );
+    case "complete":
+      return tr("変更は反映されています。", "The change was applied.");
+    default:
+      return tr(
+        "反映されたか分かりません。リソースを確認してください。",
+        "Unknown whether it was applied. Check the Resource.",
+      );
+  }
+}
+
+function operationSettled(operation: { readonly status: string }): boolean {
+  return operation.status === "succeeded" || operation.status === "failed";
+}
+
 /**
  * Everything the organization has declared.
  *
@@ -24,6 +54,9 @@ import { createResource } from "./create-resource.ts";
  * overview can link to one Form's Resources; the text filter still applies.
  */
 export function resourcesPage(organizationId: string): Child {
+  // Made on the first empty render and reused, so a re-render does not ask the
+  // Host again.
+  const note = once(() => firstRunNote(organizationId));
   const filter = signal("");
   const onlyForm = route().query.get("form");
   const additional = signal<readonly ResourceSummary[]>([]);
@@ -62,22 +95,101 @@ export function resourcesPage(organizationId: string): Child {
       recovering.set(false);
     }
   };
-  // Keep the accepted handle in the URL across refreshes. Checking status is
-  // explicit: it never resubmits create/delete or claims acceptance is done.
+  // Keep the accepted handle in the URL across refreshes. Checking status only
+  // reads: it never resubmits create/delete or claims acceptance is done. An
+  // operation still in progress is read again on its own for a while, the way
+  // the install guide's helper waits, so nobody has to keep pressing Reload.
+  const followUntil = Date.now() + OPERATION_FOLLOW.budgetMs;
+  const following = signal(true);
+  // The last answer stays on screen while the next check is in flight, so the
+  // card does not blink back to its loading state every 1.5 s.
+  const latest = signal<ResourceOperation | null>(null);
+  let followTimer: ReturnType<typeof setTimeout> | undefined;
+  // Each build of this page follows on its own token. A rebuild (a language
+  // switch, say) takes a new one, so the replaced page stops checking.
+  const followToken = ++followGeneration;
+  // Stop once this page has gone: rebuilt, another route, another
+  // organization, or no document at all (a test that has finished).
+  const stillShown = (): boolean =>
+    followToken === followGeneration &&
+    typeof document !== "undefined" &&
+    currentOrganization()?.id === organizationId &&
+    route().path === "/resources" &&
+    route().query.get("operation") === operationId;
   const operation = operationId
     ? resource(async () => {
+        clearTimeout(followTimer);
         try {
           const observed = await api.resourceOperation(organizationId, operationId);
           if (intentId) settleResourceIntent(intentId, observed);
+          latest.set(observed);
+          if (operationSettled(observed)) {
+            following.set(false);
+            reloadResources();
+          } else if (Date.now() < followUntil) {
+            followTimer = setTimeout(() => {
+              if (stillShown()) operation?.reload();
+            }, OPERATION_FOLLOW.intervalMs);
+          } else {
+            following.set(false);
+          }
           return observed;
-        } finally {
+        } catch (error) {
+          following.set(false);
           reloadResources();
+          throw error;
         }
       })
     : null;
   const reload = (): void => {
     if (operation) operation.reload();
     else reloadResources();
+  };
+  const describeOperation = (current: ResourceOperation): Child => {
+    const raw = h("span", { class: "mono dim" }, ` (${current.status})`);
+    if (!operationSettled(current)) {
+      return h(
+        "div",
+        { class: "notice" },
+        following()
+          ? tr("処理中です。自動で確認しています。", "In progress. Checking automatically.")
+          : tr(
+              "まだ完了していません。「再読み込み」で確認してください。",
+              "Not complete yet. Use Reload to check again.",
+            ),
+        raw,
+      );
+    }
+    if (current.status === "failed") {
+      return h(
+        "div",
+        { class: "notice notice--bad" },
+        tr("失敗しました", "Failed"),
+        current.error
+          ? h(
+              "span",
+              null,
+              text(`${tr("：", ": ")}${current.error.message} `),
+              h("span", { class: "mono dim" }, `(${current.error.code})`),
+            )
+          : raw,
+        // Whether anything changed decides whether a retry is safe.
+        h("div", null, failedEffect(current.effect)),
+      );
+    }
+    if (current.action === "delete") {
+      return badge(tr("削除が完了しました", "Deletion complete"), "ok");
+    }
+    return h(
+      "div",
+      { class: "toolbar" },
+      badge(tr("完了しました", "Done"), "ok"),
+      h(
+        "a",
+        { ...linkProps(resourcePath(current.resourceUid)) },
+        tr("リソースを表示", "View resource"),
+      ),
+    );
   };
   const loadMore = async (cursor: string): Promise<void> => {
     if (loadingMore() || currentOrganization()?.id !== organizationId) return;
@@ -138,7 +250,7 @@ export function resourcesPage(organizationId: string): Child {
           "p",
           null,
           tr(
-            "この組織がTakoformで宣言したリソースと、ホストが最後に確認した状態です。",
+            "この組織がTakoformで宣言したリソースと、Hostが最後に確認した状態です。",
             "Every resource this organization has declared through Takoform, with the state the Host last observed.",
           ),
         ),
@@ -170,14 +282,29 @@ export function resourcesPage(organizationId: string): Child {
           h(
             "div",
             { class: "card__body", style: { display: "grid", gap: "12px" } },
-            h(
-              "div",
-              { class: "notice notice--warn" },
-              tr(
-                "この一覧と対象リソースを読み直してください。表示がないことだけでは未受理を証明できません。ページ再読み込み後に正確な再送情報がない場合や再送期限後は運用者に確認してください。新しいキーで同じ操作を送らないでください。",
-                "Read this inventory and the affected Resource. Absence here does not prove rejection. After a full reload without the exact request, or after the replay deadline, ask the operator to reconcile; do not submit the same intent under a new key.",
-              ),
-            ),
+            // Whether the exact request can still be sent again decides the advice:
+            // resend it under its key, or read before sending anything new.
+            outstanding.some((intent) => canReplayResourceIntent(intent))
+              ? h(
+                  "div",
+                  { class: "notice notice--warn" },
+                  tr(
+                    "Hostがこの要求を受け付けたかどうか、コンソールでは分かりませんでした。「同じ要求を再送」を使ってください。同じキーで同じ要求を送るので、Hostはすでに受け付けていれば同じOperationを返し、まだなら今受け付けます。どちらでも変更は一度だけです。同じ変更を新しいキーで送り直さないでください。",
+                    "The Console could not tell whether the Host accepted this request. Use “Retry exact request”: it sends the same request under the same key. If the Host already accepted it, it returns that same Operation; if not, it accepts it now. Either way only one change is made. Never send the same change again under a new key.",
+                  ),
+                )
+              : null,
+            outstanding.length === 0 ||
+              outstanding.some((intent) => !canReplayResourceIntent(intent))
+              ? h(
+                  "div",
+                  { class: "notice notice--warn" },
+                  tr(
+                    "Hostが要求を受け付けたかどうか分からず、ページの再読み込みか再送期限のために、同じ要求はもう再送できません。新しく送る前に、リソース一覧と対象のリソースを確認してください（リソースが多い場合は「さらに読み込む」で続きを読み込み、絞り込みで探します）。作成が受け付けられていれば、そのリソースはすぐ一覧に出ます。少し待っても出ないなら受け付けられておらず、作り直せます。同じ名前の作成は、最初の作成が届いていれば拒否されます。更新と削除は読み取った世代を指定します。最初のものが反映済みなら、リソースにはすでにその変更が表示されており、古い読み取りに基づく再送は拒否されます。それでも分からず、Hostを運用しているのが別の人なら、その人に確認してください。",
+                    "The Console could not tell whether the Host accepted a request, and it can no longer resend it exactly: the page was reloaded, or the replay window has passed. Check the Resources list and the Resource before sending anything new (with many Resources, use Load more, then the filter). An accepted create is listed at once, so a create still missing after a moment was not accepted and can be made again; a create of the same name is refused if the first one did land. An update or a delete names the generation it read: if the first one applied, the Resource already shows the change, and a resend based on the old read is refused. If that does not settle it and someone else runs this Host, ask them.",
+                  ),
+                )
+              : null,
             ...outstanding.map((intent) =>
               h(
                 "div",
@@ -221,45 +348,13 @@ export function resourcesPage(organizationId: string): Child {
             "div",
             { class: "card__body", style: { display: "grid", gap: "12px" } },
             copyable(operationId),
-            live(() =>
-              whenReady(
-                operation.get(),
-                (current) => {
-                  if (current.status !== "succeeded" && current.status !== "failed") {
-                    return h(
-                      "div",
-                      { class: "notice" },
-                      text(`${current.status} · ${current.effect}`),
-                      text(
-                        tr(
-                          " — まだ完了していません。「再読み込み」で確認してください。",
-                          " — not complete. Use Reload to check again.",
-                        ),
-                      ),
-                    );
-                  }
-                  if (current.status === "failed") {
-                    return h(
-                      "div",
-                      { class: "notice notice--bad" },
-                      text(`failed · ${current.effect}`),
-                      current.error
-                        ? text(` · ${current.error.code}: ${current.error.message}`)
-                        : null,
-                    );
-                  }
-                  if (current.action === "delete") {
-                    return badge(tr("削除が完了しました", "Deletion complete"), "ok");
-                  }
-                  return h(
-                    "a",
-                    { ...linkProps(resourcePath(current.resourceUid)) },
-                    tr("リソースを表示", "View resource"),
-                  );
-                },
-                { retry: reload },
-              ),
-            ),
+            live(() => {
+              const state = operation.get();
+              const shown = latest();
+              return state.state === "loading" && shown
+                ? describeOperation(shown)
+                : whenReady(state, describeOperation, { retry: reload });
+            }),
           ),
         )
       : null,
@@ -276,13 +371,7 @@ export function resourcesPage(organizationId: string): Child {
               h(
                 "div",
                 { style: { display: "grid", gap: "12px" } },
-                empty(
-                  tr("リソースがありません", "Nothing declared yet"),
-                  tr(
-                    "運用者から渡された正確なForm URLでここから作成できます。受理されたリソースも完了前から表示されます。",
-                    "Create one here with an exact Form URL supplied by the operator. An accepted resource can appear before execution completes.",
-                  ),
-                ),
+                empty(tr("リソースがありません", "Nothing declared yet"), note()),
                 pagingError(),
                 nextCursor ? moreButton(nextCursor) : null,
               ),

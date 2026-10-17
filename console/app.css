@@ -261,7 +261,8 @@ textarea {
   font-weight: 600;
   letter-spacing: 0.05em;
   text-transform: uppercase;
-  color: var(--ink-4);
+  /* Small text: --ink-3 keeps it at 4.5:1 or more in both themes. */
+  color: var(--ink-3);
 }
 
 .rail__group:first-child {
@@ -385,6 +386,14 @@ textarea {
   min-width: 240px;
 }
 
+/* A page title with its state beside it, wrapping on a narrow screen. */
+.title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
 .head h1 {
   margin: 0;
   font-size: 22px;
@@ -485,7 +494,8 @@ th {
   font-weight: 600;
   letter-spacing: 0.05em;
   text-transform: uppercase;
-  color: var(--ink-4);
+  /* Small text: --ink-3 keeps it at 4.5:1 or more in both themes. */
+  color: var(--ink-3);
   padding: 10px 16px;
   border-bottom: 1px solid var(--line-1);
   white-space: nowrap;
@@ -938,6 +948,12 @@ tbody tr.is-clickable:hover {
   font-size: 13px;
 }
 
+.empty__body a {
+  color: var(--ink-2);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .notice {
   display: flex;
   gap: 10px;
@@ -963,6 +979,13 @@ tbody tr.is-clickable:hover {
   border-color: color-mix(in srgb, var(--warn) 35%, transparent);
   background: var(--warn-soft);
   color: var(--warn);
+}
+
+/* A Resource named in a notice keeps the notice's colour and still reads as a link. */
+.notice a {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 3px;
 }
 
 .skeleton {
@@ -1178,6 +1201,7 @@ tbody tr.is-clickable:hover {
   overflow-wrap: anywhere;
 }
 
+.row__label a,
 .row__value a,
 .published a {
   color: var(--ink-1);
@@ -1187,6 +1211,7 @@ tbody tr.is-clickable:hover {
   overflow-wrap: anywhere;
 }
 
+.row__label a:hover,
 .row__value a:hover,
 .published a:hover {
   text-decoration-color: var(--accent);
@@ -1203,6 +1228,12 @@ tbody tr.is-clickable:hover {
   .row {
     grid-template-columns: 1fr;
     gap: 3px;
+  }
+
+  /* A name and its count stay on one line. */
+  .rows--counts .row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 14px;
   }
 }
 
@@ -1419,4 +1450,32 @@ tbody tr.is-clickable:hover {
 .request-details pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+/* The overview's wallet: one line after what was deployed, never a headline. */
+.wallet-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px 18px;
+  font-size: 13px;
+  color: var(--ink-2);
+}
+
+.wallet-line__label {
+  color: var(--ink-3);
+  font-weight: 550;
+}
+
+.wallet-line a {
+  margin-left: auto;
+  color: var(--ink-2);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* A spec path breaks where pathLabel offers a break, and inside a name only
+   when one part alone is too long for the column. */
+.path-label {
+  overflow-wrap: break-word;
 }

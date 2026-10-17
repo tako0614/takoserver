@@ -31,7 +31,7 @@ describe("Takoserver public site", () => {
     expect(html).not.toContain("<script src=");
   });
 
-  test("lists the Forms a self-host can compose, with versions and what each group needs", () => {
+  test("explains Takoform and lists the Forms a self-host can compose, with versions", () => {
     const html = landingHtml(site);
     for (const form of [
       "WorkerBundle 0.2.0",
@@ -53,22 +53,37 @@ describe("Takoserver public site", () => {
     ]) {
       expect(html).toContain(`<code>${form}</code>`);
     }
-    expect(html).toContain("that Form's block in TAKOSERVER_TAKOFORM_V2_CONFIG");
-    expect(html).toContain("WorkerEndpoint also needs the HTTPS listener on port 443");
-    expect(html).toContain("SQLiteMigrationApplication also needs a sqliteMigrationSet block");
+    expect(html).toContain("Takoform describes each kind of resource");
+    expect(html).toContain(
+      '<a href="https://takoform.com" data-i18n="takoform">About Takoform</a>',
+    );
+    expect(html).toContain(
+      "Artifacts need only Bun and a short block in the Host's settings. Everything else needs the Worker runtime of step 2 below, and publishing at a hostname also needs step 3.",
+    );
+    // The marketing page names what an operator does, not the Host's internal profile.
+    expect(html).not.toMatch(
+      /local Worker profile|data plane|bundle block|selfhost-v2-worker-primary/u,
+    );
   });
 
   test("walks one Worker through the guide's create chain to its response", () => {
     const html = landingHtml(site);
     const order = [
-      "ModuleWorker",
-      "WorkerBundle",
-      "WorkerVersion",
-      "WorkerDeployment",
-      "WorkerEndpoint",
+      "ModuleWorker 0.3.0",
+      "WorkerBundle 0.2.0",
+      "WorkerVersion 0.5.0",
+      "WorkerDeployment 0.4.0",
+      "WorkerEndpoint 0.3.0",
     ].map((kind) => html.indexOf(`<strong>${kind} <span>`));
     expect(order.every((index) => index > 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
+    // One create, as the guide's create function sends it.
+    expect(html).toContain(
+      'jq -n --arg form "$F/ModuleWorker/0.3.0/" --arg space "$ORG" \\\n' +
+        "  '{$form, $space, name: \"hello\", spec: {}}' |\n" +
+        'curl -sS "$V2/resources" --data @- \\\n',
+    );
+    expect(html).toContain('-H "idempotency-key: takoserver-first-use-hello"');
     expect(html).toContain('return new Response("hello from takoserver\\n");');
     expect(html).toContain('curl -sS "https://$NAME/"');
     expect(html).toContain('<span class="out">hello from takoserver</span>');
@@ -78,30 +93,62 @@ describe("Takoserver public site", () => {
   test("keeps the guide's self-host steps", () => {
     const html = landingHtml(site);
     expect(html).toContain(
-      "git checkout --detach &lt;reviewed-commit&gt;\nbun install --frozen-lockfile",
+      'COMMIT=$(git rev-parse origin/main)\ngit checkout --detach "$COMMIT"\nbun install --frozen-lockfile',
     );
     expect(html).toContain("<code>TAKOSERVER_TAKOFORM_V2_CURSOR_KEY</code>");
     expect(html).toContain("bun --no-env-file src/entry-bun.ts");
-    expect(html).toContain("both bundle blocks on selfhost-v2-worker-primary");
+    // What a Worker Host needs, in plain terms: workerd, the guard, HTTPS and a wildcard name.
+    expect(html).toContain(
+      "the pinned workerd attached to the 2.0.0-rc.1 pre-release, checked against its SHA256SUMS",
+    );
+    expect(html).toContain("the Workflow execution guard, a small Go program");
+    // The site describes main; the release that carries workerd is older than the docs it links.
+    expect(html).toContain(
+      "Check out a reviewed commit of main, which the install guide describes",
+    );
+    expect(html).not.toContain("a release tag keeps it matched");
+    // Where a WorkerBundle's two values come from.
+    expect(html).toContain("the URL and SHA-256 of a manifest that lists it");
+    expect(html).toContain("scripts/selfhost-artifact.ts, which prints both values");
+    expect(html).toContain("a wildcard DNS name and certificate, such as *.apps.example.com");
+    // The release that carries workerd, not the Latest one, which has none.
+    expect(html).toContain(
+      'href="https://github.com/tako0614/takoserver/releases/tag/v2.0.0-rc.1"',
+    );
+    expect(html).toContain("That workerd needs glibc 2.38 or newer, such as Ubuntu 24.04.");
+    // Nothing promises a Takoform client that cannot talk to this Host.
+    expect(html).toContain("No released Takoform client speaks Host API v2 yet");
     expect(html).toContain("docs/self-host-operations.md#1-prerequisites");
     expect(html).toContain("docs/self-host-docker.md");
   });
 
-  test("manages what you deployed on your own Host, not on takoserver.com's", () => {
+  test("after deploying, shows the console and how to ship a new version on your own Host", () => {
     const html = landingHtml(site);
-    expect(html).not.toContain("curl -sG https://api.takoserver.example");
+    expect(html).toContain("Use the console");
+    // The console is a way to deploy and ship, not only to look.
+    expect(html).toContain("The console can also create these Resources in the browser.");
+    expect(html).toContain("choose “Serve this version” on its page");
     expect(html).toContain(
-      'curl -sG "$HOST/apis/forms.takoform.com/v2/support" \\\n' +
-        '  --data-urlencode "form=&lt;Form URL&gt;" \\\n' +
-        '  -H "authorization: Bearer $KEY"',
+      'href="https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#the-console-optional"',
     );
-    expect(html).toContain(
-      "<code>bun scripts/build-console.ts --api-origin &lt;API origin&gt;</code>",
+    // The public site never sends a self-host reader to takoserver.com's console.
+    expect(html).not.toContain("console.takoserver.example");
+    // Shipping new code: a new bundle and version, then the Deployment repointed.
+    const after = html.slice(html.indexOf('id="after"'));
+    const order = [
+      "WorkerBundle 0.2.0 <span>hello-bundle-v2",
+      "WorkerVersion 0.5.0 <span>hello-version-v2",
+      "WorkerDeployment 0.4.0 <span>hello-deployment",
+    ].map((step) => after.indexOf(step));
+    expect(order.every((index) => index > 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    // The request uses the guide's $V2 and carries both headers an update needs.
+    expect(after).toContain(
+      "PUT $V2/resources/&lt;Deployment UID&gt;\nidempotency-key: &lt;a new key&gt;\ntakoform-expected-generation:",
     );
-    expect(html).toContain("<code>TAKOSERVER_CONSOLE_ORIGIN</code>");
-    expect(html).toContain(
-      '<a href="https://console.takoserver.example" data-i18n="consoleSite">takoserver.com\'s own console</a>',
-    );
+    expect(after).toContain('"weight": 10000');
+    expect(after).not.toContain("$HOST");
+    expect(after).toContain("docs/self-host-operations.md#9-verify");
     for (const path of ["/openapi.json", "/.well-known/takoform/v2", "/.well-known/takoserver"]) {
       expect(html).toContain(`href="https://api.takoserver.example${path}"`);
     }
@@ -160,7 +207,7 @@ describe("Takoserver public site", () => {
   test("answers on the API's own root with its own origin and console", () => {
     const html = landingHtml({ consoleOrigin: null, apiOrigin: null });
     expect(html).toContain(
-      'curl -sG "<span data-origin>$HOST</span>/apis/forms.takoform.com/v2/support"',
+      "PUT <span data-origin>$HOST</span>/apis/forms.takoform.com/v2/resources/",
     );
     expect(html).toContain(
       'for(const node of document.querySelectorAll("[data-origin]"))node.textContent=location.origin;',
@@ -178,10 +225,49 @@ describe("Takoserver public site", () => {
     expect(landingHtml(site)).not.toContain("data-origin>");
   });
 
+  test("says on a Host's own root where the reader is, before the product story", () => {
+    const withConsole = landingHtml({
+      consoleOrigin: "https://console.host.example",
+      apiOrigin: null,
+      hostOrigin: "https://api.host.example",
+    });
+    const here = withConsole.indexOf('<section class="here"');
+    expect(here).toBeGreaterThan(withConsole.indexOf('<h1 id="headline">'));
+    expect(here).toBeLessThan(withConsole.indexOf('data-i18n="lead"'));
+    expect(withConsole).toContain("This is a Takoserver Host");
+    expect(withConsole).toContain(
+      "People with an organization on this Host manage its Workers and data in the console",
+    );
+    // Host API v2 answers only at the public origin, so that is the one named,
+    // whatever origin the page was read from.
+    expect(withConsole).toContain(
+      "<code>https://api.host.example/<wbr>apis/<wbr>forms.takoform.com/<wbr>v2</code>",
+    );
+    expect(withConsole).toContain('href="https://api.host.example/.well-known/takoform/v2"');
+    expect(withConsole).toContain(
+      "PUT https://api.host.example/apis/forms.takoform.com/v2/resources/",
+    );
+    expect(withConsole).toContain(
+      'class="pill primary external" href="https://console.host.example" data-i18n="consoleHost"',
+    );
+    // Without a console, it says so and how to set one up.
+    const bare = landingHtml({ consoleOrigin: null, apiOrigin: null });
+    expect(bare).toContain("This Host serves no console yet.");
+    expect(bare).toContain('data-i18n="consoleSetup"');
+    // The public site describes the reader's own Host, never itself as one.
+    expect(landingHtml(site)).not.toContain('<section class="here"');
+  });
+
   test("answers unknown paths in the same visual system", () => {
     const html = notFoundHtml();
     expect(html).toContain("<title>404 | Takoserver</title>");
     expect(html).toContain('<meta name="robots" content="noindex">');
     expect(html).toContain('href="/"');
+    // The same page reads in Japanese under /ja/, or for a Japanese browser.
+    expect(html).toContain('ja={title:"ページが見つかりません"');
+    expect(html).toContain('if(first==="ja"||(first!=="en"&&browser==="ja"))');
+    expect(html).toContain(
+      'for(const link of document.querySelectorAll(\'[data-404="back"],.brand\'))link.href="/ja/"',
+    );
   });
 });

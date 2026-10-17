@@ -1,7 +1,20 @@
 import { ApiError, type ResourceSummary } from "../api.ts";
-import { h } from "../dom.ts";
+import { type Child, h, live } from "../dom.ts";
+import {
+  acceptsChanges,
+  blankPaths,
+  pathLabel,
+  type ReferenceSlot,
+  type StarterSpec,
+  slotLabel,
+  starterSpec,
+  valueAt,
+  withValueAt,
+} from "../form-specs.ts";
 import { formLabel, KNOWN_FORM_GROUPS } from "../forms.ts";
 import { tr } from "../i18n.ts";
+import { resource, signal } from "../reactive.ts";
+import { findReferrers } from "../referrers.ts";
 import {
   isUnknownAcceptance,
   prepareResourceIntent,
@@ -9,7 +22,8 @@ import {
   resourceIntentRequestBody,
   sendResourceIntent,
 } from "../resource-intent.ts";
-import { navigate } from "../router.ts";
+import { health } from "../resource-state.ts";
+import { linkProps, navigate, resourcePath } from "../router.ts";
 import { api, currentOrganization } from "../state.ts";
 import { copyable, explain, openModal, toast } from "../ui.ts";
 
@@ -50,8 +64,8 @@ function recoveryDetails(
       "small",
       null,
       tr(
-        "送信前に正確なキーと本文を確認・コピーできます。ページ再読み込み後はConsoleから再送できません。結果が不明なら読み取りで確認してください。",
-        "Review or copy the exact key and body before sending. After a full reload the Console cannot replay; reconcile by reading if acceptance is unknown.",
+        "送信前に、正確なキーと本文を確認・コピーできます。コンソールはページを再読み込みするまでこれを保持し、応答が失われたときは同じ要求を再送できます。再読み込みした後は、送り直さずにリソース一覧で結果を確認してください。",
+        "You can review or copy the exact key and body before sending. The Console keeps them until the page reloads, so it can resend this exact request if the answer is lost; after a reload, check the Resources list for the result instead of sending again.",
       ),
     ),
     h("div", { class: "mono" }, `${method} ${path}`),
@@ -85,7 +99,51 @@ function requestDisclosure(details: HTMLElement): HTMLElement {
   );
 }
 
-async function submit(intent: ResourceIntent, close: () => void): Promise<void> {
+/**
+ * Where a dialog says why its request was refused, until the next attempt.
+ * A sent request stays as it was, so the same dialog retries it exactly;
+ * changing it takes a new dialog, and a new key.
+ */
+function refusalNotice(): {
+  readonly element: Child;
+  show(error: unknown, sent: boolean): void;
+  clear(): void;
+} {
+  const shown = signal<{ readonly message: string; readonly sent: boolean } | null>(null);
+  return {
+    element: live(() => {
+      const refusal = shown();
+      if (!refusal) return null;
+      return h(
+        "div",
+        { class: "notice notice--bad", role: "alert", style: { display: "grid", gap: "6px" } },
+        h("span", null, refusal.message),
+        refusal.sent
+          ? h(
+              "span",
+              null,
+              tr(
+                "内容を変えるには、キャンセルしてダイアログを開き直してください。",
+                "To change the request, cancel and open the dialog again.",
+              ),
+            )
+          : null,
+      );
+    }),
+    show(error, sent) {
+      shown.set({ message: explain(error as Error), sent });
+    },
+    clear() {
+      shown.set(null);
+    },
+  };
+}
+
+async function submit(
+  intent: ResourceIntent,
+  close: () => void,
+  refused: (error: unknown) => void = (error) => toast(explain(error as Error), "bad"),
+): Promise<void> {
   try {
     const accepted = await sendResourceIntent(intent.id);
     close();
@@ -103,7 +161,7 @@ async function submit(intent: ResourceIntent, close: () => void): Promise<void> 
         navigate(`/resources?acceptance=unknown&intent=${encodeURIComponent(intent.id)}`);
       return;
     }
-    toast(explain(error as Error), "bad");
+    refused(error);
   }
 }
 
@@ -116,6 +174,8 @@ interface FormChoice {
   /** The exact Form URL chosen or typed, trimmed; empty when none is. */
   value(): string;
   setDisabled(disabled: boolean): void;
+  /** Chooses an exact Form URL, as a person would. */
+  choose(form: string): void;
 }
 
 /** One Form's support answer, or null when the Host did not give one in time. */
@@ -280,11 +340,146 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
       url.disabled = disabled;
       select.disabled = disabled;
     },
+    choose(form) {
+      if (options.has(form)) {
+        select.value = form;
+      } else {
+        select.value = OTHER_FORM;
+        url.value = form;
+      }
+      sync();
+    },
   };
 }
 
+/** The Resources of one exact Form, first page only, or null when the Host did not answer. */
+function resourcesOfForm(
+  organizationId: string,
+  form: string,
+): Promise<{ readonly items: readonly ResourceSummary[]; readonly more: boolean } | null> {
+  return api.resources(organizationId, { form }).then(
+    ({ resources, cursor }) => ({ items: resources, more: cursor !== null }),
+    () => null,
+  );
+}
+
+/**
+ * One choice per place the starter names another Resource. Choosing writes
+ * that Resource's UID into the spec; the JSON stays the one thing that is
+ * sent, so a person can still type any UID by hand.
+ */
+function referencePicker(
+  organizationId: string,
+  slots: readonly ReferenceSlot[],
+  spec: HTMLTextAreaElement,
+  onWrite: (text: string) => void,
+): { readonly element: HTMLElement; sync(): void; setDisabled(disabled: boolean): void } {
+  let sending = false;
+  const selects = slots.map((slot, index) => {
+    const id = `create-resource-ref-${index}`;
+    // The UIDs this choice offers, so the JSON can be matched without reading the DOM back.
+    const offered: string[] = [];
+    const select = h(
+      "select",
+      { class: "select", id },
+      h("option", { value: "" }, tr("読み込み中…", "Loading…")),
+    );
+    select.disabled = true;
+    void resourcesOfForm(organizationId, slot.form).then((answer) => {
+      const options: HTMLOptionElement[] = [
+        h(
+          "option",
+          { value: "" },
+          answer === null
+            ? tr("読み込めませんでした", "Couldn't load")
+            : answer.items.length === 0
+              ? tr("まだありません", "None yet")
+              : tr("リソースを選んでください", "Choose a Resource"),
+        ),
+        ...(answer?.items ?? []).map((item) => h("option", { value: item.uid }, item.name)),
+      ];
+      if (answer?.more)
+        options.push(
+          h(
+            "option",
+            { value: "", disabled: true },
+            tr("ほかはUIDを直接書いてください", "Others: write the UID"),
+          ),
+        );
+      offered.push(...(answer?.items ?? []).map((item) => item.uid));
+      select.replaceChildren(...options);
+      select.dataset.empty = String(answer === null || answer.items.length === 0);
+      select.disabled = sending || select.dataset.empty === "true";
+      sync();
+    });
+    select.addEventListener("change", () => {
+      const parsed = jsonSpec(spec.value);
+      if (!parsed || select.value === "") return;
+      const next = withValueAt(parsed, slot.path, select.value);
+      if (!next) return;
+      onWrite(JSON.stringify(next, null, 2));
+    });
+    return {
+      slot,
+      select,
+      offered,
+      element: h(
+        "div",
+        { class: "field" },
+        h(
+          "label",
+          { for: id },
+          h("span", { class: "mono" }, slotLabel(slot)),
+          ` — ${formLabel(slot.form)}`,
+        ),
+        select,
+      ),
+    };
+  });
+  // The choice follows the JSON: a UID typed by hand, or removed, shows here.
+  const sync = (): void => {
+    const parsed = jsonSpec(spec.value);
+    for (const { slot, select, offered } of selects) {
+      const current = parsed ? valueAt(parsed, slot.path) : undefined;
+      select.value = typeof current === "string" && offered.includes(current) ? current : "";
+    }
+  };
+  return {
+    element: h(
+      "div",
+      { class: "field", style: { gap: "10px" } },
+      h("span", { class: "field__label" }, tr("参照先", "References")),
+      ...selects.map(({ element }) => element),
+      h(
+        "small",
+        null,
+        tr(
+          "選ぶと、そのリソースのUIDが設定に入ります。一覧にないリソースは、UIDを設定に直接書けます。",
+          "Choosing one writes its UID into the spec. For a Resource not listed, write its UID there yourself.",
+        ),
+      ),
+    ),
+    sync,
+    setDisabled(disabled) {
+      sending = disabled;
+      for (const { select } of selects)
+        select.disabled = disabled || select.dataset.empty !== "false";
+    },
+  };
+}
+
+const ARTIFACT_STEP =
+  "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#6-seed-held-artifacts";
+
 /** Create one Resource of an exact Form this Host supports. */
-export function createResource(organizationId: string): void {
+/** What a create opens with when another page knows what to create. */
+export interface CreatePreset {
+  readonly form: string;
+  readonly spec: Record<string, unknown>;
+  readonly note?: string;
+}
+
+export function createResource(organizationId: string, preset?: CreatePreset): void {
   const key = `console-create-${crypto.randomUUID()}`;
   const name = h("input", {
     class: "input",
@@ -296,8 +491,161 @@ export function createResource(organizationId: string): void {
     class: "textarea",
     id: "create-resource-spec",
     spellcheck: "false",
+    ...(preset?.note ? { "aria-describedby": "create-resource-note" } : {}),
   });
   spec.value = "{}";
+  const specHint = h("small");
+  const artifactHint = h("small");
+  const references = h("div");
+  let picker: ReturnType<typeof referencePicker> | null = null;
+  // Read through a closure: choosing a Form sets the picker from a callback.
+  const syncReferences = (): void => picker?.sync();
+  // The starter for the chosen Form, and the exact text the spec held when the
+  // Console last wrote it. A spec the person has not touched follows the
+  // chosen Form; an edited one is never overwritten, only offered the starter.
+  let starter: StarterSpec | null = null;
+  let untouched = "{}";
+  // What a preset wrote: a whole spec of its own, not this Form's starter.
+  let presetText: string | null = null;
+  let chosen = "";
+  // The starter's own empty places that the spec still leaves empty.
+  const remainingBlanks = (parsed: Record<string, unknown> | null): (string | number)[][] =>
+    starter && parsed
+      ? blankPaths(starter.spec).filter((path) => valueAt(parsed, path) === "")
+      : [];
+  // Console-written text, sized so the whole starter shows without scrolling.
+  const write = (text: string): void => {
+    spec.value = text;
+    spec.rows = Math.min(12, text.split("\n").length + 1);
+    untouched = text;
+  };
+  const useStarter = (): void => {
+    if (!starter) return;
+    write(JSON.stringify(starter.spec, null, 2));
+    showDetails();
+    picker?.sync();
+    describeStarter();
+  };
+  const describeStarter = (): void => {
+    if (!starter) {
+      specHint.replaceChildren();
+      artifactHint.replaceChildren();
+      return;
+    }
+    const label = formLabel(chosen);
+    artifactHint.replaceChildren(
+      ...("artifact" in starter.spec
+        ? [
+            h("span", { class: "mono" }, "url"),
+            tr(" と ", " and "),
+            h("span", { class: "mono" }, "sha256"),
+            tr(" は、", " are the "),
+            h("span", { class: "mono" }, "artifact"),
+            tr(" として ", " that "),
+            h("span", { class: "mono" }, "scripts/selfhost-artifact.ts seed"),
+            tr(" が出力する値（その後Hostを再起動します。", " prints (then restart the Host; "),
+            h(
+              "a",
+              { href: ARTIFACT_STEP, target: "_blank", rel: "noopener noreferrer" },
+              tr("導入手順書（英語）の手順6", "step 6 of the install guide"),
+              h("span", { "aria-hidden": "true" }, " ↗"),
+              h(
+                "span",
+                { class: "visually-hidden" },
+                tr("（新しいタブで開きます）", " (opens in a new tab)"),
+              ),
+            ),
+            tr(
+              "）か、自分で公開HTTPSに置いたmanifestのURLとそのSHA-256です。manifestの形は上の公開仕様にあります。",
+              "), or the URL and SHA-256 of a manifest you publish over public HTTPS. The manifest's shape is in the published contract above.",
+            ),
+          ]
+        : []),
+    );
+    if (spec.value === presetText) {
+      specHint.replaceChildren(
+        remainingBlanks(jsonSpec(spec.value)).length > 0
+          ? tr("空の値を埋めてください。", "Fill in the empty values.")
+          : "",
+      );
+      return;
+    }
+    if (spec.value !== untouched) {
+      specHint.replaceChildren(
+        remainingBlanks(jsonSpec(spec.value)).length > 0
+          ? tr(
+              "入力した設定を使います。空の値を埋めてください。",
+              "Your spec is kept. Fill in the empty values.",
+            )
+          : tr("入力した設定を使います。", "Your spec is kept."),
+        " ",
+        h(
+          "button",
+          { class: "btn btn--sm", type: "button", onClick: useStarter },
+          tr(`${label}の最小の設定で置き換える`, `Replace with the smallest ${label} spec`),
+        ),
+      );
+      return;
+    }
+    specHint.replaceChildren(
+      Object.keys(starter.spec).length === 0
+        ? tr(
+            `${label}は空の設定 {} で作成できます。`,
+            `${label} is created with an empty spec, {}.`,
+          )
+        : remainingBlanks(jsonSpec(spec.value)).length > 0
+          ? tr(
+              `${label}が受け付ける最小の設定です。空の値を埋めてください。`,
+              `The smallest spec ${label} accepts. Fill in the empty values.`,
+            )
+          : tr(`${label}が受け付ける最小の設定です。`, `The smallest spec ${label} accepts.`),
+    );
+  };
+  // Called on every change to the Form control, including each support answer;
+  // only a different Form changes the starter.
+  const applyStarter = (): void => {
+    const selected = form.value();
+    if (selected === chosen) return;
+    chosen = selected;
+    const previous = starter;
+    starter = selected ? starterSpec(selected) : null;
+    if (spec.value === untouched) {
+      // A Resource already chosen for the same place and Form carries over.
+      const before = jsonSpec(spec.value);
+      let next: Record<string, unknown> = starter?.spec ?? {};
+      for (const slot of starter?.references ?? []) {
+        const carried = before ? valueAt(before, slot.path) : undefined;
+        const same = previous?.references.some(
+          (old) => old.form === slot.form && pathLabel(old.path) === pathLabel(slot.path),
+        );
+        if (same && typeof carried === "string" && carried !== "")
+          next = withValueAt(next, slot.path, carried) ?? next;
+      }
+      write(JSON.stringify(next, null, 2));
+    }
+    // A preset of this Form may leave out a place its starter names, such as
+    // a static-site version's code bundle; that place is not offered.
+    const slots = (starter?.references ?? []).filter(
+      (slot) =>
+        !preset || preset.form !== selected || valueAt(preset.spec, slot.path) !== undefined,
+    );
+    picker =
+      slots.length > 0
+        ? referencePicker(organizationId, slots, spec, (text) => {
+            // A chosen Resource is the Console's own writing, like the starter;
+            // a preset written so stays a preset.
+            const fromPreset = spec.value === presetText;
+            write(text);
+            if (fromPreset) presetText = text;
+            showDetails();
+            picker?.sync();
+            describeStarter();
+          })
+        : null;
+    references.replaceChildren(picker?.element ?? "");
+    picker?.sync();
+    describeStarter();
+  };
   const details = h("div");
   const showDetails = (): void => {
     const parsed = jsonSpec(spec.value);
@@ -313,16 +661,34 @@ export function createResource(organizationId: string): void {
       recoveryDetails(key, "POST", "/apis/forms.takoform.com/v2/resources", body),
     );
   };
-  const form = formChoice(organizationId, showDetails);
-  for (const field of [name, spec]) field.addEventListener("input", showDetails);
+  const form = formChoice(organizationId, () => {
+    applyStarter();
+    showDetails();
+  });
+  name.addEventListener("input", showDetails);
+  spec.addEventListener("input", () => {
+    showDetails();
+    picker?.sync();
+    describeStarter();
+  });
+  if (preset) {
+    form.choose(preset.form);
+    // The preset is the Console's own writing, like a starter.
+    write(JSON.stringify(preset.spec, null, 2));
+    presetText = spec.value;
+    syncReferences();
+    describeStarter();
+  }
   showDetails();
   let intent: ResourceIntent | null = null;
+  const refusal = refusalNotice();
   const close = openModal({
     title: tr("リソースを作成", "New resource"),
-    confirmLabel: tr("受け付ける", "Accept create"),
+    confirmLabel: tr("作成する", "Create"),
     body: h(
       "div",
       { style: { display: "grid", gap: "14px" } },
+      preset?.note ? h("div", { class: "notice", id: "create-resource-note" }, preset.note) : null,
       form.element,
       h(
         "div",
@@ -336,16 +702,21 @@ export function createResource(organizationId: string): void {
         h("label", null, tr("スペース", "Space")),
         h("span", { class: "field__value" }, organizationId),
       ),
+      references,
       h(
         "div",
         { class: "field" },
         h("label", { for: "create-resource-spec" }, tr("設定 (JSON)", "Spec (JSON)")),
         spec,
+        specHint,
+        artifactHint,
       ),
       requestDisclosure(details),
+      refusal.element,
     ),
     onConfirm: async () => {
       if (!sameOrganization(organizationId)) return;
+      refusal.clear();
       if (!intent) {
         const selectedForm = form.value();
         const selectedName = name.value.trim();
@@ -360,9 +731,22 @@ export function createResource(organizationId: string): void {
           );
           return;
         }
+        // A starter's empty values are the ones the Host would refuse; say which.
+        const blanks = remainingBlanks(parsed);
+        if (blanks.length > 0) {
+          toast(
+            tr(
+              `まだ空の値があります：${blanks.map(pathLabel).join("、")}`,
+              `Still empty: ${blanks.map(pathLabel).join(", ")}`,
+            ),
+            "bad",
+          );
+          return;
+        }
         form.setDisabled(true);
         name.disabled = true;
         spec.disabled = true;
+        picker?.setDisabled(true);
         showDetails();
         try {
           if (!(await api.formSupport(organizationId, selectedForm))) {
@@ -376,6 +760,7 @@ export function createResource(organizationId: string): void {
             form.setDisabled(false);
             name.disabled = false;
             spec.disabled = false;
+            picker?.setDisabled(false);
             return;
           }
           if (!sameOrganization(organizationId)) return;
@@ -399,21 +784,42 @@ export function createResource(organizationId: string): void {
           form.setDisabled(false);
           name.disabled = false;
           spec.disabled = false;
-          toast(explain(error as Error), "bad");
+          picker?.setDisabled(false);
+          refusal.show(error, false);
           return;
         }
       }
-      await submit(intent, close);
+      await submit(intent, close, (error) => refusal.show(error, true));
     },
   });
 }
 
-/** Update one observed UID, fenced on the generation the person last read. */
-export function updateResource(organizationId: string, resource: ResourceSummary): void {
+/**
+ * Update one observed UID, fenced on the generation the person last read.
+ * Another page may open it with a new spec already written, and a note saying
+ * what that spec does; nothing is sent until the person accepts it.
+ */
+export function updateResource(
+  organizationId: string,
+  resource: ResourceSummary,
+  proposal?: {
+    readonly spec: Record<string, unknown>;
+    readonly note: string;
+    /** The dialog's and the confirm's own words, where the update is not a change. */
+    readonly title?: string;
+    readonly confirmLabel?: string;
+  },
+): void {
   const key = `console-update-${crypto.randomUUID()}`;
   const path = `/apis/forms.takoform.com/v2/resources/${encodeURIComponent(resource.uid)}`;
-  const spec = h("textarea", { class: "textarea", spellcheck: "false" });
-  spec.value = JSON.stringify(resource.spec, null, 2);
+  const spec = h("textarea", {
+    class: "textarea",
+    spellcheck: "false",
+    // The proposal's note is read out with the spec it explains.
+    ...(proposal ? { "aria-describedby": "update-resource-note" } : {}),
+  });
+  spec.value = JSON.stringify(proposal?.spec ?? resource.spec, null, 2);
+  spec.rows = Math.min(12, spec.value.split("\n").length + 1);
   const details = h("div");
   const showDetails = (): void => {
     const parsed = jsonSpec(spec.value);
@@ -430,18 +836,22 @@ export function updateResource(organizationId: string, resource: ResourceSummary
   spec.addEventListener("input", showDetails);
   showDetails();
   let intent: ResourceIntent | null = null;
+  const refusal = refusalNotice();
   const close = openModal({
-    title: tr(`${resource.name}を更新`, `Update ${resource.name}`),
-    confirmLabel: tr("更新を受け付ける", "Accept update"),
+    title: proposal?.title ?? tr(`${resource.name}を更新`, `Update ${resource.name}`),
+    confirmLabel: proposal?.confirmLabel ?? tr("更新する", "Update"),
     body: h(
       "div",
       { class: "field" },
+      proposal ? h("div", { class: "notice", id: "update-resource-note" }, proposal.note) : null,
       h("label", null, tr("設定 (JSON)", "Spec (JSON)")),
       spec,
       requestDisclosure(details),
+      refusal.element,
     ),
     onConfirm: async () => {
       if (!sameOrganization(organizationId)) return;
+      refusal.clear();
       if (!intent) {
         const parsed = jsonSpec(spec.value);
         if (!parsed) {
@@ -470,36 +880,208 @@ export function updateResource(organizationId: string, resource: ResourceSummary
           );
         } catch (error) {
           spec.disabled = false;
-          toast(explain(error as Error), "bad");
+          refusal.show(error, false);
           return;
         }
       }
-      await submit(intent, close);
+      await submit(intent, close, (error) => refusal.show(error, true));
     },
   });
 }
 
-/** Destructive delete requires a separate explicit confirmation. */
-export function deleteResource(organizationId: string, resource: ResourceSummary): void {
+/** The kind of an exact Form URL, such as "WorkerDeployment". */
+function formKind(formUrl: string): string {
+  return /\/forms\/([^/]+)\//u.exec(formUrl)?.[1] ?? "";
+}
+
+/** What deleting a Resource of this Form takes with it, said before it is confirmed. */
+function deleteConsequence(formUrl: string): string {
+  switch (formKind(formUrl)) {
+    case "SQLiteDatabase":
+    case "EdgeKVNamespace":
+    case "ObjectBucket":
+    case "AtLeastOnceQueue":
+      return tr("保存されているデータも削除されます。", "Its data is deleted with it. ");
+    case "WorkerEndpoint":
+      return tr(
+        "そのホスト名ではWorkerが配信されなくなります。",
+        "Its hostname stops serving the Worker. ",
+      );
+    case "WorkerDeployment":
+      return tr("そのWorkerの配信が止まります。", "Its Worker stops serving. ");
+    case "ActorNamespace":
+      return tr(
+        "保存されている状態も削除されます。",
+        "The stored state of its objects is deleted with it. ",
+      );
+    case "DurableWorkflow":
+      return tr("実行中のインスタンスは停止されます。", "Its running instances are stopped. ");
+    case "WorkerCronTrigger":
+      return tr(
+        "スケジュールによるWorkerの呼び出しが止まります。",
+        "Its schedule stops calling the Worker. ",
+      );
+    case "QueueConsumer":
+      return tr(
+        "Workerはキューのメッセージを受け取らなくなります。",
+        "The Worker stops receiving the queue's messages. ",
+      );
+    default:
+      return "";
+  }
+}
+
+/**
+ * What to do first about one Resource that still names the one being deleted.
+ * A Deployment's versions are the only reference the Host lets change, so a
+ * Deployment serving the version serves another or goes; a Resource that never
+ * changes goes once nothing serves it; any other Form this console knows
+ * cannot be pointed elsewhere, so it goes first. Only a Form it does not know
+ * might be changed instead.
+ */
+function referrerStep(referrer: ResourceSummary, target: ResourceSummary): string {
+  if (formKind(referrer.form) === "WorkerDeployment" && formKind(target.form) === "WorkerVersion")
+    return tr(
+      "先に別の版を配信するか、削除してください",
+      "serve another version first, or delete it",
+    );
+  if (!acceptsChanges(referrer.form))
+    return tr(
+      "変更できないため、配信されなくなってから削除してください",
+      "it cannot change, so delete it once nothing serves it",
+    );
+  if (KNOWN_FORM_GROUPS.some((group) => (group.forms as readonly string[]).includes(referrer.form)))
+    return tr("先に削除してください", "delete it first");
+  return tr(
+    "参照しないよう変更するか、削除してください",
+    "change it so it no longer names this, or delete it",
+  );
+}
+
+/**
+ * A link out of a dialog: it navigates as any link does, and closes the dialog
+ * only when it navigates here, not when it opens a new tab.
+ */
+function openFromDialog(href: string, close: () => void): Record<string, unknown> {
+  const link = linkProps(href);
+  const follow = link.onClick as (event: MouseEvent) => void;
+  return {
+    ...link,
+    onClick: (event: MouseEvent) => {
+      follow(event);
+      if (event.defaultPrevented) close();
+    },
+  };
+}
+
+/**
+ * Deleting, confirmed separately: what the Host removes, and first what still
+ * names this Resource. The Host refuses to delete a Resource another still
+ * names, so while any does, the dialog lists them and the delete is not
+ * offered.
+ */
+export function deleteResource(organizationId: string, target: ResourceSummary): void {
   const key = `console-delete-${crypto.randomUUID()}`;
-  const path = `/apis/forms.takoform.com/v2/resources/${encodeURIComponent(resource.uid)}`;
+  const path = `/apis/forms.takoform.com/v2/resources/${encodeURIComponent(target.uid)}`;
+  const naming = resource(() => findReferrers(organizationId, target.uid));
+  const blocking = (): readonly ResourceSummary[] => {
+    const state = naming.get();
+    return state.state === "ready" ? state.value.referrers.map((entry) => entry.resource) : [];
+  };
   let intent: ResourceIntent | null = null;
   const close = openModal({
-    title: tr(`${resource.name}を削除しますか？`, `Delete ${resource.name}?`),
+    title: tr(`${target.name}を削除しますか？`, `Delete ${target.name}?`),
     confirmLabel: tr("リソースを削除", "Delete resource"),
     confirmTone: "danger",
+    confirmBlocked: () => naming.get().state === "loading" || blocking().length > 0,
     body: h(
       "div",
       { style: { display: "grid", gap: "14px" } },
       h(
         "div",
         { class: "notice notice--bad" },
-        tr(
-          "実体と保存されているデータが削除されます。この操作は元に戻せません。",
-          "The backend resource and its data may be destroyed. This cannot be undone.",
-        ),
+        tr("Hostはこのリソースを削除します。", "The Host deletes this Resource. "),
+        deleteConsequence(target.form),
+        tr("この操作は元に戻せません。", "This cannot be undone."),
       ),
-      requestDisclosure(recoveryDetails(key, "DELETE", path, null, resource.generation)),
+      live(() => {
+        const state = naming.get();
+        if (state.state === "loading")
+          return h(
+            "small",
+            null,
+            tr(
+              "このリソースを参照しているものを確認しています…",
+              "Checking what names this Resource…",
+            ),
+          );
+        if (state.state === "error")
+          return h(
+            "small",
+            null,
+            tr(
+              "このリソースを参照しているものを確認できませんでした。まだ参照しているリソースがあれば、Hostは削除を受け付けません。",
+              "Couldn't check what names this Resource. If another still names it, the Host refuses the delete.",
+            ),
+          );
+        const { referrers, complete } = state.value;
+        if (referrers.length === 0)
+          return complete
+            ? null
+            : h(
+                "small",
+                null,
+                tr(
+                  "参照しているリソースをすべては確認できませんでした。まだ参照しているリソースがあれば、Hostは削除を受け付けません。",
+                  "Not everything that might name this Resource could be checked. If another still names it, the Host refuses the delete.",
+                ),
+              );
+        return h(
+          "div",
+          { class: "notice notice--warn", style: { display: "grid", gap: "8px" } },
+          h(
+            "span",
+            null,
+            tr(
+              "次のリソースがまだこのリソースを参照しているため、Hostは削除を受け付けません。",
+              "The Host refuses this delete while these still name it.",
+            ),
+          ),
+          h(
+            "ul",
+            { style: { margin: "0", paddingLeft: "18px" } },
+            ...referrers.map(({ resource: referrer }) =>
+              h(
+                "li",
+                null,
+                h(
+                  "a",
+                  { class: "mono", ...openFromDialog(resourcePath(referrer.uid), () => close()) },
+                  referrer.name,
+                ),
+                ` ${formLabel(referrer.form)}`,
+                health(referrer).phase === "Deleting"
+                  ? tr("（削除中）", " (being deleted)")
+                  : tr(
+                      `：${referrerStep(referrer, target)}`,
+                      `: ${referrerStep(referrer, target)}`,
+                    ),
+              ),
+            ),
+          ),
+          // The dialog does not watch them, so a change made meanwhile is read on request.
+          h(
+            "div",
+            null,
+            h(
+              "button",
+              { class: "btn", type: "button", onClick: () => naming.reload() },
+              tr("もう一度確認する", "Check again"),
+            ),
+          ),
+        );
+      }),
+      requestDisclosure(recoveryDetails(key, "DELETE", path, null, target.generation)),
     ),
     onConfirm: async () => {
       if (!sameOrganization(organizationId)) return;
@@ -509,7 +1091,7 @@ export function deleteResource(organizationId: string, resource: ResourceSummary
           if (!sameOrganization(organizationId)) return;
           intent = prepareResourceIntent(
             organizationId,
-            { action: "delete", uid: resource.uid, generation: resource.generation },
+            { action: "delete", uid: target.uid, generation: target.generation },
             replayWindowSeconds,
             key,
           );
