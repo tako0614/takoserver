@@ -346,7 +346,8 @@ const BINDINGS: Readonly<
  */
 function bindingCard(found: ResourceSummary): Child {
   const binding = BINDINGS[/\/forms\/([^/]+)\//u.exec(found.form)?.[1] ?? ""];
-  if (!binding) return null;
+  // A Resource on its way out is not one to start using.
+  if (!binding || health(found).phase === "Deleting") return null;
   const entry = `"${binding.key}": ${JSON.stringify(
     [{ name: binding.name, resource: { resourceUid: found.uid } }],
     null,
@@ -362,8 +363,8 @@ function bindingCard(found: ResourceSummary): Child {
         "p",
         null,
         tr(
-          `Workerからは、WorkerVersionの ${binding.key} にあるBindingを通して使います。版は変更できないため、Workerが配信している版を開いて「この版から新しい版を作る」を選び、設定に次の項目を加えてから、新しい版を配信してください。名前は自由に決められます。英数字と「_」「$」で64文字まで、先頭は数字以外です。`,
-          `A Worker reaches it through a Binding in its WorkerVersion's ${binding.key}. A version cannot change, so open the version your Worker serves, choose New version from this one, add this entry to its spec, and serve the new version. The name is yours to choose: up to 64 ASCII letters, digits, _ and $, not starting with a digit.`,
+          `Workerからは、WorkerVersionの ${binding.key} にあるBindingを通して使います。版は変更できないため、Workerが配信している版を開いて「この版から新しい版を作る」を選び、コードは「（現在のもの）」を選び直し、設定に次の項目を加えてから、新しい版を配信してください。設定にすでに ${binding.key} があれば、2つ目の "${binding.key}" を書くと1つ目が置き換わるため、{ … } の部分をそのリストに加えます。名前は自由に決められます。英数字と「_」「$」で64文字まで、先頭は数字以外です。`,
+          `A Worker reaches it through a Binding in its WorkerVersion's ${binding.key}. A version cannot change, so open the version your Worker serves, choose New version from this one, choose its code again (the one marked current), add this entry to its spec, and serve the new version. If the spec already has ${binding.key}, add the { … } object to that list instead: a second "${binding.key}" would replace the first. The name is yours to choose: up to 64 ASCII letters, digits, _ and $, not starting with a digit.`,
         ),
       ),
       // Wrapped, so a phone shows the whole entry without scrolling sideways.

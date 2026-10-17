@@ -1531,6 +1531,11 @@ test("a data Resource's page gives the Binding entry a Worker's version adds", a
   expect(
     body.all().some((node) => node.tag === "button" && node.textContent === "Copy this entry"),
   ).toBe(true);
+  // A second "kvBindings" in the spec would silently replace the first.
+  expect(body.textContent).toContain(
+    'If the spec already has kvBindings, add the { … } object to that list instead: a second "kvBindings" would replace the first.',
+  );
+  expect(body.textContent).toContain("choose its code again (the one marked current)");
   const step = body
     .all()
     .find(
@@ -1551,6 +1556,9 @@ test("a data Resource's page gives the Binding entry a Worker's version adds", a
     [],
   );
   expect(worker.body.textContent).not.toContain("Use it from a Worker");
+  // Nor is a Resource being deleted something to start using.
+  const leaving = await detailPage(() => ({ ...kv, phase: "deleting" as const }), []);
+  expect(leaving.body.textContent).not.toContain("Use it from a Worker");
 });
 
 test("a Resource that can change keeps its Update", async () => {
