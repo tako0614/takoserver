@@ -16,6 +16,7 @@ import { tr } from "../i18n.ts";
 import { resource, signal } from "../reactive.ts";
 import { findReferrers } from "../referrers.ts";
 import {
+  discardRefusedResourceIntent,
   isUnknownAcceptance,
   prepareResourceIntent,
   type ResourceIntent,
@@ -101,15 +102,18 @@ function requestDisclosure(details: HTMLElement): HTMLElement {
 
 /**
  * Where a dialog says why its request was refused, until the next attempt.
- * A sent request stays as it was, so the same dialog retries it exactly;
- * changing it takes a new dialog, and a new key.
+ * A request the Host definitely refused may be changed and sent again; one
+ * whose fate is not settled stays as it was, so only that exact request is
+ * retried, and changing it takes a new dialog.
  */
+type RefusalAfter = "unsent" | "editable" | "fixed";
 function refusalNotice(): {
   readonly element: Child;
-  show(error: unknown, sent: boolean): void;
+  show(error: unknown, after: RefusalAfter): void;
+  say(message: string): void;
   clear(): void;
 } {
-  const shown = signal<{ readonly message: string; readonly sent: boolean } | null>(null);
+  const shown = signal<{ readonly message: string; readonly after: RefusalAfter } | null>(null);
   return {
     element: live(() => {
       const refusal = shown();
@@ -118,7 +122,7 @@ function refusalNotice(): {
         "div",
         { class: "notice notice--bad", role: "alert", style: { display: "grid", gap: "6px" } },
         h("span", null, refusal.message),
-        refusal.sent
+        refusal.after === "fixed"
           ? h(
               "span",
               null,
@@ -127,11 +131,28 @@ function refusalNotice(): {
                 "To change the request, cancel and open the dialog again.",
               ),
             )
-          : null,
+          : refusal.after === "editable"
+            ? h(
+                "span",
+                null,
+                tr(
+                  "Hostは何も保存していないので、内容を変えてもう一度送れます。",
+                  "The Host stored nothing, so you can change the request and send it again.",
+                ),
+              )
+            : null,
       );
     }),
-    show(error, sent) {
-      shown.set({ message: explain(error as Error), sent });
+    show(error, after) {
+      // A stale generation is fixed by reloading, not by sending again here.
+      const stale = (error as { code?: unknown }).code === "generation_conflict";
+      shown.set({
+        message: explain(error as Error),
+        after: after === "editable" && stale ? "unsent" : after,
+      });
+    },
+    say(message) {
+      shown.set({ message, after: "unsent" });
     },
     clear() {
       shown.set(null);
@@ -373,6 +394,7 @@ function referencePicker(
   slots: readonly ReferenceSlot[],
   spec: HTMLTextAreaElement,
   onWrite: (text: string) => void,
+  current: readonly string[] = [],
 ): { readonly element: HTMLElement; sync(): void; setDisabled(disabled: boolean): void } {
   let sending = false;
   const selects = slots.map((slot, index) => {
@@ -396,7 +418,15 @@ function referencePicker(
               ? tr("まだありません", "None yet")
               : tr("リソースを選んでください", "Choose a Resource"),
         ),
-        ...(answer?.items ?? []).map((item) => h("option", { value: item.uid }, item.name)),
+        ...(answer?.items ?? []).map((item) =>
+          h(
+            "option",
+            { value: item.uid },
+            current.includes(item.uid)
+              ? tr(`${item.name}（現在のもの）`, `${item.name} (current)`)
+              : item.name,
+          ),
+        ),
       ];
       if (answer?.more)
         options.push(
@@ -477,15 +507,21 @@ export interface CreatePreset {
   readonly form: string;
   readonly spec: Record<string, unknown>;
   readonly note?: string;
+  /** Resources the preset's source names now, marked as such in the picker. */
+  readonly current?: readonly string[];
 }
 
+/** The Host's rule for a Resource name. */
+const RESOURCE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u;
+
 export function createResource(organizationId: string, preset?: CreatePreset): void {
-  const key = `console-create-${crypto.randomUUID()}`;
+  let key = `console-create-${crypto.randomUUID()}`;
   const name = h("input", {
     class: "input",
     id: "create-resource-name",
     placeholder: "my-resource",
     autocomplete: "off",
+    "aria-describedby": "create-resource-name-rule",
   });
   const spec = h("textarea", {
     class: "textarea",
@@ -631,16 +667,22 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
     );
     picker =
       slots.length > 0
-        ? referencePicker(organizationId, slots, spec, (text) => {
-            // A chosen Resource is the Console's own writing, like the starter;
-            // a preset written so stays a preset.
-            const fromPreset = spec.value === presetText;
-            write(text);
-            if (fromPreset) presetText = text;
-            showDetails();
-            picker?.sync();
-            describeStarter();
-          })
+        ? referencePicker(
+            organizationId,
+            slots,
+            spec,
+            (text) => {
+              // A chosen Resource is the Console's own writing, like the starter;
+              // a preset written so stays a preset.
+              const fromPreset = spec.value === presetText;
+              write(text);
+              if (fromPreset) presetText = text;
+              showDetails();
+              picker?.sync();
+              describeStarter();
+            },
+            preset?.current,
+          )
         : null;
     references.replaceChildren(picker?.element ?? "");
     picker?.sync();
@@ -695,6 +737,14 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
         { class: "field" },
         h("label", { for: "create-resource-name" }, tr("名前", "Name")),
         name,
+        h(
+          "small",
+          { id: "create-resource-name-rule" },
+          tr(
+            "英数字と「.」「_」「-」で128文字まで。先頭は英数字です。この組織の中で、Formを問わず重複できません。",
+            "Up to 128 ASCII letters, digits, '.', '_' or '-', starting with a letter or digit. Unique in this organization, whatever the Form.",
+          ),
+        ),
       ),
       h(
         "div",
@@ -728,6 +778,16 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
               "Choose a Form, then enter a name and a JSON object",
             ),
             "bad",
+          );
+          return;
+        }
+        // The Host's own name rule, so a refused name costs no round trip.
+        if (!RESOURCE_NAME.test(selectedName)) {
+          refusal.say(
+            tr(
+              "名前は、英数字と「.」「_」「-」で128文字までにし、先頭を英数字にしてください。",
+              "Use up to 128 ASCII letters, digits, '.', '_' or '-' for the name, starting with a letter or digit.",
+            ),
           );
           return;
         }
@@ -785,11 +845,24 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
           name.disabled = false;
           spec.disabled = false;
           picker?.setDisabled(false);
-          refusal.show(error, false);
+          refusal.show(error, "unsent");
           return;
         }
       }
-      await submit(intent, close, (error) => refusal.show(error, true));
+      await submit(intent, close, (error) => {
+        // Definitely refused: nothing was stored, so unlock it for a corrected,
+        // new request under a new key. Otherwise only the exact retry remains.
+        if (intent && discardRefusedResourceIntent(intent.id, error)) {
+          intent = null;
+          key = `console-create-${crypto.randomUUID()}`;
+          form.setDisabled(false);
+          name.disabled = false;
+          spec.disabled = false;
+          picker?.setDisabled(false);
+          showDetails();
+          refusal.show(error, "editable");
+        } else refusal.show(error, "fixed");
+      });
     },
   });
 }
@@ -810,10 +883,11 @@ export function updateResource(
     readonly confirmLabel?: string;
   },
 ): void {
-  const key = `console-update-${crypto.randomUUID()}`;
+  let key = `console-update-${crypto.randomUUID()}`;
   const path = `/apis/forms.takoform.com/v2/resources/${encodeURIComponent(resource.uid)}`;
   const spec = h("textarea", {
     class: "textarea",
+    id: "update-resource-spec",
     spellcheck: "false",
     // The proposal's note is read out with the spec it explains.
     ...(proposal ? { "aria-describedby": "update-resource-note" } : {}),
@@ -844,7 +918,7 @@ export function updateResource(
       "div",
       { class: "field" },
       proposal ? h("div", { class: "notice", id: "update-resource-note" }, proposal.note) : null,
-      h("label", null, tr("設定 (JSON)", "Spec (JSON)")),
+      h("label", { for: "update-resource-spec" }, tr("設定 (JSON)", "Spec (JSON)")),
       spec,
       requestDisclosure(details),
       refusal.element,
@@ -880,11 +954,19 @@ export function updateResource(
           );
         } catch (error) {
           spec.disabled = false;
-          refusal.show(error, false);
+          refusal.show(error, "unsent");
           return;
         }
       }
-      await submit(intent, close, (error) => refusal.show(error, true));
+      await submit(intent, close, (error) => {
+        if (intent && discardRefusedResourceIntent(intent.id, error)) {
+          intent = null;
+          key = `console-update-${crypto.randomUUID()}`;
+          spec.disabled = false;
+          showDetails();
+          refusal.show(error, "editable");
+        } else refusal.show(error, "fixed");
+      });
     },
   });
 }
