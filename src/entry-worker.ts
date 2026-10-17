@@ -61,6 +61,7 @@ import { assertStripeModeRealm, parseStripeMode } from "./stripe-mode-realm.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { createTakoformStore } from "./takoform/store.ts";
 import { parseTakoformV2ApplicationConfig } from "./takoform-v2/config.ts";
+import type { V2HostAcceptance } from "./takoform-v2/host-acceptance.ts";
 import { drainV2Operations } from "./takoform-v2/worker-wake.ts";
 import { createWorkerDataServices } from "./worker-data-services.ts";
 import {
@@ -70,6 +71,7 @@ import {
 import { createWorkerProductionComposition } from "./worker-production-composition.ts";
 import {
   captureWorkerSharedAuthStaging,
+  createWorkerPrimaryRequestSql,
   createWorkerRequestSql,
   type WorkerRequestAppInputs,
   type WorkerRequestDatabase,
@@ -383,6 +385,33 @@ export type WorkerEntryV2WorkerEndpointOriginComposer = (context: {
   | undefined
   | Promise<WorkerEntryV2WorkerEndpointOriginSelection | undefined>;
 
+/** Operator code supplies a genuine Container issuer bound to the final Worker Sql. */
+export type WorkerEntryV2ContainerHostAcceptanceComposer = (context: {
+  readonly env: WorkerEnv;
+  readonly sql: Sql;
+  readonly clock: Clock;
+}) => V2HostAcceptance | Promise<V2HostAcceptance>;
+
+/** Capture only trusted issuer-owned data methods before later startup awaits. */
+function captureWorkerContainerHostAcceptance(value: V2HostAcceptance, sql: Sql): V2HostAcceptance {
+  if (typeof value !== "object" || value === null)
+    throw new TypeError("invalid internal Container Host acceptance construction");
+  const ownMethod = (name: "assertSql" | "initialOutput" | "prepare" | "prepareDelete") => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, name);
+    if (!descriptor || !Object.hasOwn(descriptor, "value") || typeof descriptor.value !== "function")
+      throw new TypeError(`Container Host acceptance requires own ${name} method`);
+    return descriptor.value.bind(value);
+  };
+  const assertSql = ownMethod("assertSql") as V2HostAcceptance["assertSql"];
+  const initialOutput = ownMethod("initialOutput") as V2HostAcceptance["initialOutput"];
+  const prepare = ownMethod("prepare") as V2HostAcceptance["prepare"];
+  const prepareDelete = ownMethod("prepareDelete") as NonNullable<
+    V2HostAcceptance["prepareDelete"]
+  >;
+  assertSql(sql);
+  return Object.freeze({ assertSql, initialOutput, prepare, prepareDelete });
+}
+
 export type WorkerEntryV2FormComposer = (context: {
   readonly env: WorkerEnv;
   readonly sql: Sql;
@@ -447,6 +476,8 @@ export interface WorkerEntryOptions {
   readonly composeV2Forms?: WorkerEntryV2FormComposer;
   /** Operator code only; omission or an undefined result leaves origin acceptance unselected. */
   readonly composeV2WorkerEndpointOrigin?: WorkerEntryV2WorkerEndpointOriginComposer;
+  /** Operator code only; omission leaves Container acceptance unselected. */
+  readonly composeV2ContainerHostAcceptance?: WorkerEntryV2ContainerHostAcceptanceComposer;
   /** Operator code only; absent means every configured artifact Form remains held-only. */
   readonly composeV2ArtifactSource?: WorkerEntryV2ArtifactSourceComposer;
   /**
@@ -969,9 +1000,10 @@ async function composeApp(
   composeV2ArtifactSource: WorkerEntryV2ArtifactSourceComposer | undefined,
   composeV2FreshAdmission: WorkerEntryOptions["composeV2FreshAdmission"],
   composeV2WorkerEndpointOrigin: WorkerEntryOptions["composeV2WorkerEndpointOrigin"],
+  composeV2ContainerHostAcceptance: WorkerEntryOptions["composeV2ContainerHostAcceptance"],
   request?: {
     readonly connection: WorkerRequestSql;
-    readonly sharedAuth: WorkerSharedAuthStaging;
+    readonly sharedAuth?: WorkerSharedAuthStaging;
   },
 ): Promise<App> {
   if (composeV2Forms !== undefined && typeof composeV2Forms !== "function") {
@@ -999,6 +1031,15 @@ async function composeApp(
     throw new WorkerStartupError(
       "runtime-configuration",
       new TypeError("v2 Worker entry Endpoint origin composer must be a function"),
+    );
+  }
+  if (
+    composeV2ContainerHostAcceptance !== undefined &&
+    typeof composeV2ContainerHostAcceptance !== "function"
+  ) {
+    throw new WorkerStartupError(
+      "runtime-configuration",
+      new TypeError("v2 Worker entry Container acceptance composer must be a function"),
     );
   }
   const allowFreshCreateAndUpdate =
@@ -1214,22 +1255,21 @@ async function composeApp(
       );
     }
   }
-  const workerRequest: WorkerRequestAppInputs | undefined =
-    request === undefined
-      ? undefined
-      : (() => {
-          if (!canonicalHostedInputs || !hostedRealm || !hostedBilling)
-            throw new WorkerStartupError(
-              "runtime-configuration",
-              new TypeError("shared-login Worker requires its genuine canonical Hosted TEST realm"),
-            );
-          return {
-            connection: request.connection,
-            sharedAuth: request.sharedAuth,
-            client: canonicalHostedInputs.client,
-            realm: hostedRealm,
-          };
-        })();
+  let workerRequest: WorkerRequestAppInputs | undefined;
+  const selectedSharedAuth = request?.sharedAuth;
+  if (request !== undefined && selectedSharedAuth !== undefined) {
+    if (!canonicalHostedInputs || !hostedRealm || !hostedBilling)
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError("shared-login Worker requires its genuine canonical Hosted TEST realm"),
+      );
+    workerRequest = {
+      connection: request.connection,
+      sharedAuth: selectedSharedAuth,
+      client: canonicalHostedInputs.client,
+      realm: hostedRealm,
+    };
+  }
   let selectedV2Forms: WorkerEntryV2FormSelection | undefined;
   let selectedV2PrivateInputHooks = false;
   if (composeV2Forms !== undefined) {
@@ -1270,6 +1310,19 @@ async function composeApp(
       throw new WorkerStartupError(
         "runtime-configuration",
         new TypeError("operator v2 Endpoint origin composition failed"),
+      );
+    }
+  }
+  let selectedV2ContainerHostAcceptance: V2HostAcceptance | undefined;
+  if (composeV2ContainerHostAcceptance !== undefined) {
+    try {
+      const selected = await composeV2ContainerHostAcceptance(Object.freeze({ env, sql, clock }));
+      const captured = captureWorkerContainerHostAcceptance(selected, sql);
+      selectedV2ContainerHostAcceptance = captured;
+    } catch {
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError("operator v2 Container acceptance composition failed"),
       );
     }
   }
@@ -1352,6 +1405,9 @@ async function composeApp(
       ...dataServices,
       publicOrigin: origin,
       v2: v2Config,
+      ...(selectedV2ContainerHostAcceptance !== undefined && hostedBilling === undefined
+        ? { clock }
+        : {}),
       ...(allowFreshCreateAndUpdate === undefined
         ? {}
         : { v2AllowFreshCreateAndUpdate: allowFreshCreateAndUpdate }),
@@ -1363,6 +1419,9 @@ async function composeApp(
       ...(selectedV2WorkerEndpointOrigin === undefined
         ? {}
         : { v2WorkerEndpointOrigin: selectedV2WorkerEndpointOrigin }),
+      ...(selectedV2ContainerHostAcceptance === undefined
+        ? {}
+        : { v2ContainerHostAcceptance: selectedV2ContainerHostAcceptance }),
       ...(composeV2Forms === undefined
         ? {}
         : selectedV2Forms &&
@@ -1392,6 +1451,12 @@ async function composeApp(
         new TypeError("operator v2 Endpoint origin application construction failed"),
       );
     }
+    if (selectedV2ContainerHostAcceptance !== undefined) {
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError("operator v2 Container acceptance application construction failed"),
+      );
+    }
     if (composeV2Forms === undefined && composeV2ArtifactSource === undefined) throw error;
     if (composeV2ArtifactSource !== undefined) {
       // A selected source constructor can throw private transport diagnostics.
@@ -1412,21 +1477,28 @@ async function composeApp(
   return app;
 }
 
-/** A separate startup cache for each code-selected Worker entry. */
+/** Cache only entries without a request-owned Sql/issuer composition. */
 export function createWorkerEntry(options: WorkerEntryOptions = {}) {
   const composeV2Forms = options.composeV2Forms;
   const composeV2ArtifactSource = options.composeV2ArtifactSource;
   const composeV2FreshAdmission = options.composeV2FreshAdmission;
   const composeV2WorkerEndpointOrigin = options.composeV2WorkerEndpointOrigin;
+  const composeV2ContainerHostAcceptance = options.composeV2ContainerHostAcceptance;
   const sharedAuthStaging =
     options.sharedAuthStaging === undefined
       ? undefined
       : captureWorkerSharedAuthStaging(options.sharedAuthStaging);
+  const requestSqlSelected =
+    sharedAuthStaging !== undefined || composeV2ContainerHostAcceptance !== undefined;
   const starts = new WeakMap<WorkerEnv, Promise<App>>();
   const appFor = (env: WorkerEnv, origin: string, connection?: WorkerRequestSql): Promise<App> => {
-    if (sharedAuthStaging !== undefined) {
+    if (requestSqlSelected) {
       if (connection === undefined)
-        throw new TypeError("shared-login Worker request lacks its primary composition");
+        throw new TypeError(
+          sharedAuthStaging === undefined
+            ? "Container Worker request lacks its primary composition"
+            : "shared-login Worker request lacks its primary composition",
+        );
       return composeApp(
         env,
         origin,
@@ -1434,7 +1506,11 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
         composeV2ArtifactSource,
         composeV2FreshAdmission,
         composeV2WorkerEndpointOrigin,
-        { connection, sharedAuth: sharedAuthStaging },
+        composeV2ContainerHostAcceptance,
+        {
+          connection,
+          ...(sharedAuthStaging === undefined ? {} : { sharedAuth: sharedAuthStaging }),
+        },
       );
     }
     const existing = starts.get(env);
@@ -1446,6 +1522,7 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
       composeV2ArtifactSource,
       composeV2FreshAdmission,
       composeV2WorkerEndpointOrigin,
+      composeV2ContainerHostAcceptance,
     ).catch((error: unknown) => {
       if (starts.get(env) === started) starts.delete(env);
       throw error;
@@ -1455,8 +1532,8 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
   };
   return {
     /**
-     * Startup is lazy and per request, and only its success is cached, so a
-     * startup refusal is answered rather than thrown: `/healthz`,
+     * Startup is lazy. Entries without request-owned authority cache success.
+     * A startup refusal is answered rather than thrown: `/healthz`,
      * `/.well-known/takoserver` and every other route report the readable 503
      * reason class instead of a bare provider exception page.
      */
@@ -1478,16 +1555,26 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
         }
         let connection: WorkerRequestSql | undefined;
         let selectedOrigin: string | undefined;
-        if (sharedAuthStaging !== undefined) {
+        if (requestSqlSelected) {
           selectedOrigin = startupStage("public-origin", () => requirePublicOrigin(env));
           if (moneyPolicy === null)
-            throw new TypeError("shared-login Worker requires the selected Money writer");
-          connection = await createWorkerRequestSql({
-            database: env.STATE_DB,
-            writerEpoch: moneyPolicy,
-            publicOrigin: selectedOrigin,
-            consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN,
-          });
+            throw new TypeError(
+              sharedAuthStaging === undefined
+                ? "Container Worker requires the selected Money writer for its native request origin"
+                : "shared-login Worker requires the selected Money writer",
+            );
+          connection =
+            sharedAuthStaging === undefined
+              ? await createWorkerPrimaryRequestSql({
+                  database: env.STATE_DB,
+                  writerEpoch: moneyPolicy,
+                })
+              : await createWorkerRequestSql({
+                  database: env.STATE_DB,
+                  writerEpoch: moneyPolicy,
+                  publicOrigin: selectedOrigin,
+                  consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN,
+                });
           if (connection.moneyGuard === "frozen") return moneyCutoverFrozenResponse();
         } else if (moneyPolicy !== null) {
           const guard = await inspectMoneyCutoverGuard(createD1Sql(env.STATE_DB), moneyPolicy);
@@ -1532,16 +1619,26 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
       const writerEpoch = moneyCutoverWriterPolicy(env);
       let connection: WorkerRequestSql | undefined;
       let selectedOrigin: string | undefined;
-      if (sharedAuthStaging !== undefined) {
+      if (requestSqlSelected) {
         selectedOrigin = requirePublicOrigin(env);
         if (writerEpoch === null)
-          throw new TypeError("shared-login Worker requires the selected Money writer");
-        connection = await createWorkerRequestSql({
-          database: env.STATE_DB,
-          writerEpoch,
-          publicOrigin: selectedOrigin,
-          consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN,
-        });
+          throw new TypeError(
+            sharedAuthStaging === undefined
+              ? "Container Worker requires the selected Money writer for its native request origin"
+              : "shared-login Worker requires the selected Money writer",
+          );
+        connection =
+          sharedAuthStaging === undefined
+            ? await createWorkerPrimaryRequestSql({
+                database: env.STATE_DB,
+                writerEpoch,
+              })
+            : await createWorkerRequestSql({
+                database: env.STATE_DB,
+                writerEpoch,
+                publicOrigin: selectedOrigin,
+                consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN,
+              });
         if (connection.moneyGuard === "frozen") return;
       } else if (writerEpoch !== null) {
         if ((await inspectMoneyCutoverGuard(createD1Sql(env.STATE_DB), writerEpoch)) === "frozen")

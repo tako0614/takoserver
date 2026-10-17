@@ -25,6 +25,16 @@ export interface V2HostAcceptanceContext {
   readonly configuredPrivateInputs?: V2ConfiguredPrivateInputs;
 }
 
+export type V2HostDeleteAcceptanceContext = Omit<
+  V2HostAcceptanceContext,
+  "action" | "referencesJson"
+> & {
+  readonly action: "delete";
+  readonly referencesJson: null;
+};
+
+type V2AnyHostAcceptanceContext = V2HostAcceptanceContext | V2HostDeleteAcceptanceContext;
+
 export type V2HostAcceptanceScope = Pick<
   V2HostAcceptanceContext,
   "form" | "backendId" | "targetKey" | "name"
@@ -35,6 +45,9 @@ export interface V2HostAcceptance {
   assertSql(sql: Sql): void;
   initialOutput(scope: V2HostAcceptanceScope): JsonObject | undefined;
   prepare(context: V2HostAcceptanceContext): Promise<V2PreparedHostAcceptance> | undefined;
+  prepareDelete?(
+    context: V2HostDeleteAcceptanceContext,
+  ): Promise<V2PreparedHostAcceptance> | undefined;
 }
 
 /** Capture trusted construction methods once; no public config or request enters this seam. */
@@ -46,6 +59,20 @@ export function captureV2HostAcceptance(
   const assertSqlMethod = value?.assertSql;
   const initialOutputMethod = value?.initialOutput;
   const prepareMethod = value?.prepare;
+  const deleteDescriptor =
+    value === null || (typeof value !== "object" && typeof value !== "function")
+      ? undefined
+      : Object.getOwnPropertyDescriptor(value, "prepareDelete");
+  const deleteMethod: unknown = deleteDescriptor?.value;
+  if (
+    (deleteDescriptor === undefined &&
+      value !== null &&
+      (typeof value === "object" || typeof value === "function") &&
+      "prepareDelete" in value) ||
+    (deleteDescriptor !== undefined &&
+      (!Object.hasOwn(deleteDescriptor, "value") || typeof deleteMethod !== "function"))
+  )
+    throw new TypeError("invalid internal Host DELETE acceptance construction");
   if (
     value === null ||
     typeof assertSqlMethod !== "function" ||
@@ -56,8 +83,15 @@ export function captureV2HostAcceptance(
   const assertSql = assertSqlMethod.bind(value);
   const initialOutput = initialOutputMethod.bind(value);
   const prepare = prepareMethod.bind(value);
+  const prepareDelete: V2HostAcceptance["prepareDelete"] =
+    typeof deleteMethod === "function" ? deleteMethod.bind(value) : undefined;
   assertSql(sql);
-  return Object.freeze({ assertSql, initialOutput, prepare });
+  return Object.freeze({
+    assertSql,
+    initialOutput,
+    prepare,
+    ...(prepareDelete === undefined ? {} : { prepareDelete }),
+  });
 }
 
 const issuer = Symbol("internal prepared Host acceptance");
@@ -78,14 +112,14 @@ function statement(value: SqlStatement): SqlStatement {
 
 class PreparedHostAcceptance {
   readonly #sql: Sql;
-  readonly #context: V2HostAcceptanceContext;
+  readonly #context: V2AnyHostAcceptanceContext;
   readonly #guard: SqlStatement;
   readonly #terminal: SqlStatement;
 
   constructor(
     key: symbol,
     sql: Sql,
-    context: V2HostAcceptanceContext,
+    context: V2AnyHostAcceptanceContext,
     guard: SqlStatement,
     terminal: SqlStatement,
   ) {
@@ -97,7 +131,7 @@ class PreparedHostAcceptance {
     Object.freeze(this);
   }
 
-  static redeem(value: PreparedHostAcceptance, sql: Sql, context: V2HostAcceptanceContext) {
+  static redeem(value: PreparedHostAcceptance, sql: Sql, context: V2AnyHostAcceptanceContext) {
     if (
       typeof value !== "object" ||
       value === null ||
@@ -122,7 +156,7 @@ export type V2PreparedHostAcceptance = PreparedHostAcceptance;
  */
 export function prepareV2HostAcceptance(
   sql: Sql,
-  context: V2HostAcceptanceContext,
+  context: V2AnyHostAcceptanceContext,
   guard: SqlStatement,
   terminal: SqlStatement,
 ): V2PreparedHostAcceptance {
@@ -132,7 +166,7 @@ export function prepareV2HostAcceptance(
 export function redeemV2HostAcceptance(
   value: V2PreparedHostAcceptance,
   sql: Sql,
-  context: V2HostAcceptanceContext,
+  context: V2AnyHostAcceptanceContext,
 ) {
   return PreparedHostAcceptance.redeem(value, sql, context);
 }
