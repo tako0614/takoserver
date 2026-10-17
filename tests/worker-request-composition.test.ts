@@ -507,9 +507,7 @@ describe("Worker request Financial input carrier", () => {
     const connection = await f.connect();
     expect(() => readWorkerRequestFinancialInputs(connection)).toThrow();
     const selected = await f.consumers();
-    expect(() =>
-      readWorkerRequestFinancialInputs({ ...selected.inputs.connection }),
-    ).toThrow();
+    expect(() => readWorkerRequestFinancialInputs({ ...selected.inputs.connection })).toThrow();
     expect(() => readWorkerRequestFinancialInputs(connection)).toThrow();
     expect(readWorkerRequestFinancialInputs(selected.inputs.connection).sql).toBe(
       selected.runtime.sql,

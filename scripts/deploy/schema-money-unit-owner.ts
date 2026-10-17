@@ -605,9 +605,7 @@ function parseDeclaration(
   return value as unknown as Declaration;
 }
 
-function moneyHeldPost94CommonDeclaration(
-  value: Declaration | MoneyHeldPost94Declaration,
-): string {
+function moneyHeldPost94CommonDeclaration(value: Declaration | MoneyHeldPost94Declaration): string {
   const excluded = new Set([
     "kind",
     "phase",
@@ -686,9 +684,7 @@ function parseHeldPost94Declaration(
   projected.phase = phase === "suffix98" ? "convert" : "resume";
   parseDeclaration(
     projected,
-    phase === "suffix98"
-      ? target
-      : { ...target, moneyCutoverWriterEpoch: facts.nextWriterEpoch },
+    phase === "suffix98" ? target : { ...target, moneyCutoverWriterEpoch: facts.nextWriterEpoch },
     true,
     true,
   );
@@ -2076,9 +2072,7 @@ export async function readMoneyUnitHeldPost94Selection(
 }
 
 /** Rechecks original facts and the same protected declaration before future use. */
-export async function assertMoneyUnitHeldPost94SelectionCurrent(
-  selection: unknown,
-): Promise<void> {
+export async function assertMoneyUnitHeldPost94SelectionCurrent(selection: unknown): Promise<void> {
   const selected =
     typeof selection === "object" && selection !== null
       ? heldPost94Selections.get(selection)

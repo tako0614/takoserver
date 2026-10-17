@@ -74,8 +74,7 @@ function fixture(
       prepareCalls += 1;
       contexts.push(context);
       if (mode === "throw") throw new Error("neutral issuer refusal");
-      if (mode === "resolved-undefined")
-        return undefined as unknown as V2PreparedHostAcceptance;
+      if (mode === "resolved-undefined") return undefined as unknown as V2PreparedHostAcceptance;
       if (race && !raced) {
         raced = true;
         await engine.acceptUpdate({
@@ -190,9 +189,10 @@ function fixture(
     return operation;
   }
   function resource(uid: string) {
-    return db.query("SELECT * FROM tf_v2_resources WHERE uid = ?").get(uid) as
-      | Record<string, unknown>
-      | null;
+    return db.query("SELECT * FROM tf_v2_resources WHERE uid = ?").get(uid) as Record<
+      string,
+      unknown
+    > | null;
   }
   function snapshot(uid: string) {
     return {

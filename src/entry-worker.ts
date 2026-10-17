@@ -398,7 +398,11 @@ function captureWorkerContainerHostAcceptance(value: V2HostAcceptance, sql: Sql)
     throw new TypeError("invalid internal Container Host acceptance construction");
   const ownMethod = (name: "assertSql" | "initialOutput" | "prepare" | "prepareDelete") => {
     const descriptor = Object.getOwnPropertyDescriptor(value, name);
-    if (!descriptor || !Object.hasOwn(descriptor, "value") || typeof descriptor.value !== "function")
+    if (
+      !descriptor ||
+      !Object.hasOwn(descriptor, "value") ||
+      typeof descriptor.value !== "function"
+    )
       throw new TypeError(`Container Host acceptance requires own ${name} method`);
     return descriptor.value.bind(value);
   };

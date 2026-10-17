@@ -196,11 +196,7 @@ const requestFinancialInputs = new WeakMap<WorkerRequestSql, WorkerRequestFinanc
 export function readWorkerRequestConsumers(connection: WorkerRequestSql): WorkerRequestConsumers {
   const consumers = requestConsumers.get(connection);
   const origin = requestOrigins.get(connection);
-  if (
-    !consumers ||
-    origin?.purpose !== "shared-auth-staging" ||
-    consumers.sql !== connection.sql
-  )
+  if (!consumers || origin?.purpose !== "shared-auth-staging" || consumers.sql !== connection.sql)
     throw new TypeError("Worker request consumers have not been constructed");
   assertMoneyCutoverSqlOrigin(consumers.sql, { writerEpoch: origin.writerEpoch });
   assertAuthTokenCaptureReader(consumers.accounts, { sql: consumers.sql });

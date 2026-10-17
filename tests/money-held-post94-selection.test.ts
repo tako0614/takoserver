@@ -1,17 +1,16 @@
 import { expect, test } from "bun:test";
-
+import {
+  type MoneyPost94SelectionReviewBinding,
+  moneyCutoverBindingDigest,
+} from "../scripts/deploy/schema-money-unit-cutover.ts";
 import {
   assertMoneyUnitHeldPost94DispatchSelection,
   assertMoneyUnitHeldPost94SelectionCurrent,
   assertMoneyUnitHeldPost94SelectionOrigin,
-  readMoneyUnitHeldPost94Selection,
   type MoneyUnitHeldConvertContext,
   type MoneyUnitHeldPost94Selection,
+  readMoneyUnitHeldPost94Selection,
 } from "../scripts/deploy/schema-money-unit-owner.ts";
-import {
-  moneyCutoverBindingDigest,
-  type MoneyPost94SelectionReviewBinding,
-} from "../scripts/deploy/schema-money-unit-cutover.ts";
 
 const EPOCH = `sha256:${"a".repeat(64)}`;
 
@@ -124,9 +123,9 @@ test("post94 selection review digest commits the explicit TEST value", () => {
   const selectedDigest = moneyCutoverBindingDigest(binding);
   const missing = { ...binding } as Partial<MoneyPost94SelectionReviewBinding>;
   delete missing.selectedStripeMode;
-  expect(
-    moneyCutoverBindingDigest(missing as MoneyPost94SelectionReviewBinding),
-  ).not.toBe(selectedDigest);
+  expect(moneyCutoverBindingDigest(missing as MoneyPost94SelectionReviewBinding)).not.toBe(
+    selectedDigest,
+  );
   expect(
     moneyCutoverBindingDigest({
       ...binding,

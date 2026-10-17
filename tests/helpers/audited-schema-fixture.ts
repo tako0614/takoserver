@@ -187,28 +187,29 @@ function inspectFull100FreshSqliteInternal(
     throw new Error("full100 inspection requires the exact audited 100-source boundary");
   }
   // migrateSqlite's actual persisted ledger has name and applied_at only.
-  const ledger = database.query(
-    "SELECT name, applied_at FROM main.applied_migrations ORDER BY rowid",
-  ).all() as { name: unknown; applied_at: unknown }[];
+  const ledger = database
+    .query("SELECT name, applied_at FROM main.applied_migrations ORDER BY rowid")
+    .all() as { name: unknown; applied_at: unknown }[];
   if (
     ledger.length !== 100 ||
-    ledger.some((row, index) =>
-      row.name !== source[index]?.name ||
-      typeof row.applied_at !== "string" ||
-      row.applied_at.length === 0
+    ledger.some(
+      (row, index) =>
+        row.name !== source[index]?.name ||
+        typeof row.applied_at !== "string" ||
+        row.applied_at.length === 0,
     )
   ) {
     throw new Error("persisted full100 migration ledger differs from audited source order");
   }
 
   // Existing canonicalSchemaShape owns normalization; its raw shape stays in memory.
-  const catalog = database.query(
-    "SELECT type, name, tbl_name, COALESCE(sql, '') AS sql " +
-      "FROM main.sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
-  ).all() as Record<string, unknown>[];
-  catalog.sort((a, b) =>
-    `${a.type}\0${a.name}`.localeCompare(`${b.type}\0${b.name}`),
-  );
+  const catalog = database
+    .query(
+      "SELECT type, name, tbl_name, COALESCE(sql, '') AS sql " +
+        "FROM main.sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
+    )
+    .all() as Record<string, unknown>[];
+  catalog.sort((a, b) => `${a.type}\0${a.name}`.localeCompare(`${b.type}\0${b.name}`));
   const shape = canonicalSchemaShape(catalog);
   const schemaObjectTypeCounts: Record<string, number> = Object.create(null);
   for (const row of catalog) {
@@ -220,7 +221,8 @@ function inspectFull100FreshSqliteInternal(
     .filter((row) => row.type === "table" && row.name !== "applied_migrations")
     .map((row) => {
       const name = row.name;
-      const rows = database.query(`SELECT * FROM main.${full100QuotedCatalogName(name)}`)
+      const rows = database
+        .query(`SELECT * FROM main.${full100QuotedCatalogName(name)}`)
         .all() as Record<string, unknown>[];
       const digests = rows.map(full100TypedRowDigest).sort();
       return {
@@ -233,10 +235,14 @@ function inspectFull100FreshSqliteInternal(
     kind: "takoserver.full100-fresh-sqlite-observation@v1",
     persistedMigrationCount: ledger.length,
     persistedNamesDigest: full100Digest(JSON.stringify(ledger.map((row) => row.name))),
-    persistedLedgerFieldsDigest: full100Digest(JSON.stringify(ledger.map((row) => [row.name, row.applied_at]))),
+    persistedLedgerFieldsDigest: full100Digest(
+      JSON.stringify(ledger.map((row) => [row.name, row.applied_at])),
+    ),
     persistedSqlChecksumAvailable: false,
     schemaShapeDigest: full100Digest(shape),
-    schemaNamesDigest: full100Digest(JSON.stringify(catalog.map((row) => [row.type, row.name, row.tbl_name]))),
+    schemaNamesDigest: full100Digest(
+      JSON.stringify(catalog.map((row) => [row.type, row.name, row.tbl_name])),
+    ),
     schemaObjectTypeCounts,
     foreignKeyViolationCount,
     tableBaselines,
@@ -250,6 +256,8 @@ export function inspectFull100FreshSqlite(
     return inspectFull100FreshSqliteInternal(database);
   } catch (error) {
     // SQLite or canonicalizer failures may include query/schema text; no raw cause.
-    throw new Error(`full100 readonly inspection failed (opaque diagnostic ${full100Digest(String(error))})`);
+    throw new Error(
+      `full100 readonly inspection failed (opaque diagnostic ${full100Digest(String(error))})`,
+    );
   }
 }

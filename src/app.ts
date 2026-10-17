@@ -347,7 +347,11 @@ function captureContainerHostAcceptance(
     throw new TypeError("invalid internal Container Host acceptance construction");
   const ownMethod = (name: "assertSql" | "initialOutput" | "prepare" | "prepareDelete") => {
     const descriptor = Object.getOwnPropertyDescriptor(value, name);
-    if (!descriptor || !Object.hasOwn(descriptor, "value") || typeof descriptor.value !== "function")
+    if (
+      !descriptor ||
+      !Object.hasOwn(descriptor, "value") ||
+      typeof descriptor.value !== "function"
+    )
       throw new TypeError(`Container Host acceptance requires own ${name} method`);
     return descriptor.value.bind(value);
   };
@@ -390,7 +394,8 @@ function composeV2HostAcceptances(
       const endpointOutput = attempt(() => endpoint.initialOutput(scope));
       if (!containerOutput.ok) throw containerOutput.error;
       if (!endpointOutput.ok) throw endpointOutput.error;
-      if (containerOutput.value !== undefined && endpointOutput.value !== undefined) throw overlap();
+      if (containerOutput.value !== undefined && endpointOutput.value !== undefined)
+        throw overlap();
       return containerOutput.value !== undefined ? containerOutput.value : endpointOutput.value;
     },
     prepare(context: V2HostAcceptanceContext) {

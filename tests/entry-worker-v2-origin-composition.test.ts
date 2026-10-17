@@ -1061,9 +1061,9 @@ test("Container code composer captures the final Worker Sql and clock without ch
         });
       },
     });
-    expect((await request(combined, f.env, `/support?form=${encodeURIComponent(FORM)}`)).status).toBe(
-      200,
-    );
+    expect(
+      (await request(combined, f.env, `/support?form=${encodeURIComponent(FORM)}`)).status,
+    ).toBe(200);
     expect(
       (await create(combined, f.env, combinedClaim.name, "container-endpoint-combined-0001"))
         .status,
@@ -1197,9 +1197,9 @@ test("Container HTTP requests and a scheduled invocation each own an actual nati
       },
     });
     for (let index = 0; index < 2; index++) {
-      expect((await request(entry, f.env, `/support?form=${encodeURIComponent(FORM)}`)).status).toBe(
-        200,
-      );
+      expect(
+        (await request(entry, f.env, `/support?form=${encodeURIComponent(FORM)}`)).status,
+      ).toBe(200);
     }
     expect(captured).toHaveLength(2);
     expect(f.primaries).toHaveLength(2);

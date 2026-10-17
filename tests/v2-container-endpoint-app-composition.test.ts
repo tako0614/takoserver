@@ -27,9 +27,7 @@ import {
   type V2PreparedHostAcceptance,
 } from "../src/takoform-v2/host-acceptance.ts";
 import type { V2Form } from "../src/takoform-v2/types.ts";
-import {
-  createWorkerEndpointOriginV2Acceptance,
-} from "../src/worker-endpoint-origin-v2-acceptance.ts";
+import { createWorkerEndpointOriginV2Acceptance } from "../src/worker-endpoint-origin-v2-acceptance.ts";
 
 const ORIGIN = "https://api.app-origin-composition.test";
 const BASE = `${ORIGIN}/apis/forms.takoform.com/v2`;
@@ -418,8 +416,7 @@ async function fixture(
       const settled = new Promise<void>((resolve) => {
         settle = resolve;
       });
-      if (!entered || !resume || !settle)
-        throw new Error("original read gate was not constructed");
+      if (!entered || !resume || !settle) throw new Error("original read gate was not constructed");
       originalReadGate = { entered, untilResumed, settled: settle };
       return Object.freeze({ reached, resume, settled });
     },
@@ -509,11 +506,16 @@ test("retained canonical Container Form cannot DELETE without its code issuer", 
     const beforeOperations = f.db.query("SELECT count(*) AS n FROM tf_v2_operations").get();
     const beforeResources = f.db.query("SELECT count(*) AS n FROM tf_v2_resources").get();
     const response = await requestDelete(
-      f, retained, resource.resourceUid, "container-retained-no-issuer-0001",
+      f,
+      retained,
+      resource.resourceUid,
+      "container-retained-no-issuer-0001",
     );
     expect(response.status).not.toBe(202);
     expect(f.batches).toHaveLength(beforeBatches);
-    expect(f.db.query("SELECT count(*) AS n FROM tf_v2_operations").get()).toEqual(beforeOperations);
+    expect(f.db.query("SELECT count(*) AS n FROM tf_v2_operations").get()).toEqual(
+      beforeOperations,
+    );
     expect(f.db.query("SELECT count(*) AS n FROM tf_v2_resources").get()).toEqual(beforeResources);
     expect(f.lastBatchError()).toBeUndefined();
   } finally {
@@ -546,9 +548,11 @@ test("configured Container DELETE issuer must be an own data method at App const
       accessor,
       inherited,
     ]) {
-      expect(() => f.makeApp(undefined, {
-        v2ContainerHostAcceptance: malformed as V2HostAcceptance,
-      })).toThrow("Container Host acceptance requires own prepareDelete method");
+      expect(() =>
+        f.makeApp(undefined, {
+          v2ContainerHostAcceptance: malformed as V2HostAcceptance,
+        }),
+      ).toThrow("Container Host acceptance requires own prepareDelete method");
     }
     expect(getterCalls).toBe(0);
     expect(f.batches).toHaveLength(beforeBatches);
@@ -591,11 +595,16 @@ test("canonical Container DELETE refuses an omitted or foreign-context prepared 
       const beforeBatches = f.batches.length;
       const beforeOperations = f.db.query("SELECT count(*) AS n FROM tf_v2_operations").get();
       const response = await requestDelete(
-        f, app, resource.resourceUid, `container-delete-${kind}-0001`,
+        f,
+        app,
+        resource.resourceUid,
+        `container-delete-${kind}-0001`,
       );
       expect(response.status).not.toBe(202);
       expect(f.batches).toHaveLength(beforeBatches);
-      expect(f.db.query("SELECT count(*) AS n FROM tf_v2_operations").get()).toEqual(beforeOperations);
+      expect(f.db.query("SELECT count(*) AS n FROM tf_v2_operations").get()).toEqual(
+        beforeOperations,
+      );
       expect(f.lastBatchError()).toBeUndefined();
     } finally {
       f.close();
@@ -626,7 +635,10 @@ test("Endpoint-only non-Container DELETE retains ordinary admission and never ca
     expect(await app.tickTakoformV2()).toMatchObject({ id: resource.id, status: "succeeded" });
     const beforeReads = f.originalReads();
     const deleted = await requestDelete(
-      f, app, resource.resourceUid, "endpoint-ordinary-delete-0001",
+      f,
+      app,
+      resource.resourceUid,
+      "endpoint-ordinary-delete-0001",
     );
     expect(deleted.status).toBe(202);
     expect(f.originalReads()).toBe(beforeReads);
@@ -669,7 +681,11 @@ test("no-composer non-Container CREATE, UPDATE, and DELETE keep ordinary admissi
       status: "succeeded",
     });
     const deleted = await requestDelete(
-      f, app, resource.resourceUid, "ordinary-no-composer-delete-0001", 2,
+      f,
+      app,
+      resource.resourceUid,
+      "ordinary-no-composer-delete-0001",
+      2,
     );
     expect(deleted.status).toBe(202);
     expect(f.lastBatchError()).toBeUndefined();
