@@ -172,7 +172,7 @@ async function setup(path = "/resources") {
   return { body, route, selectOrganization, principal };
 }
 
-test("a refused create says why in the dialog, and how to change the request", async () => {
+test("a refused create says why in the dialog, and unlocks it for a new request", async () => {
   const { body } = await setup();
   const { createResource } = await import("../console/src/pages/create-resource.ts");
   const posts: Request[] = [];
@@ -214,7 +214,71 @@ test("a refused create says why in the dialog, and how to change the request", a
   expect(alert?.textContent).toContain(
     "Another Resource in this organization already has that name, whatever its Form.",
   );
-  expect(alert?.textContent).toContain("To change the request, cancel and open the dialog again.");
+  // The Host stored nothing, so the same dialog may send a changed request.
+  expect(alert?.textContent).toContain(
+    "The Host stored nothing, so you can change the request and send it again.",
+  );
+  expect(alert?.textContent).not.toContain("cancel and open the dialog again");
+  expect(inputs[1].disabled).toBe(false);
+  inputs[1].value = "two";
+  inputs[1].emit("input");
+  button(body, "Create").click();
+  await settle();
+  expect(posts).toHaveLength(2);
+  const [first, second] = posts;
+  if (!first || !second) throw new Error("both creates were not sent");
+  expect(((await second.json()) as { name?: string }).name).toBe("two");
+  // A new request under a new key, never the refused one's.
+  expect(second.headers.get("idempotency-key")).toStartWith("console-create-");
+  expect(second.headers.get("idempotency-key")).not.toBe(first.headers.get("idempotency-key"));
+});
+
+test("a name the Host would refuse is said before anything is sent", async () => {
+  const { body } = await setup();
+  const { createResource } = await import("../console/src/pages/create-resource.ts");
+  const sent: Request[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const url = new URL(request.url);
+      if (url.pathname.endsWith("/support"))
+        return Response.json({ form, supported: true, operations: ["create"] });
+      if (url.pathname === "/.well-known/takoform/v2") return Response.json(discovery);
+      if (request.method === "POST") {
+        sent.push(request);
+        return Response.json(op, { status: 202 });
+      }
+      return Response.json({ items: [], nextCursor: null });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  createResource("org-console");
+  await settle();
+  // The rule is shown with the field, before anyone types.
+  expect(body.textContent).toContain(
+    "Up to 128 ASCII letters, digits, '.', '_' or '-', starting with a letter or digit.",
+  );
+  const inputs = body.all().filter((node) => node.tag === "input");
+  if (!inputs[0] || !inputs[1]) throw new Error("create inputs missing");
+  expect(inputs[1].attributes.get("aria-describedby")).toBe("create-resource-name-rule");
+  inputs[0].value = form;
+  for (const name of ["my site", "-site", "x".repeat(129)]) {
+    inputs[1].value = name;
+    inputs[1].emit("input");
+    button(body, "Create").click();
+    await settle();
+    const alert = body.all().find((node) => node.attributes.get("role") === "alert");
+    expect(alert?.textContent).toBe(
+      "Use up to 128 ASCII letters, digits, '.', '_' or '-' for the name, starting with a letter or digit.",
+    );
+    expect(inputs[1].disabled).toBe(false);
+  }
+  expect(sent).toHaveLength(0);
+  inputs[1].value = `a${"x".repeat(127)}`;
+  inputs[1].emit("input");
+  button(body, "Create").click();
+  await settle();
+  expect(sent).toHaveLength(1);
 });
 
 test("accepted create is not shown as complete and checking it never re-sends", async () => {
@@ -1258,7 +1322,15 @@ test("choosing the next version's code keeps it described as the copy it is", as
       artifact: { url: "https://artifacts.example.test/v2/manifest.json", sha256: "a".repeat(64) },
     },
   );
-  const { body } = await detailPage(() => withCode, [], [bundleV2]);
+  const bundleV1 = resourceAt(
+    "uid-bundle",
+    "hello-bundle",
+    "https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/",
+    {
+      artifact: { url: "https://artifacts.example.test/v1/manifest.json", sha256: "b".repeat(64) },
+    },
+  );
+  const { body } = await detailPage(() => withCode, [], [bundleV1, bundleV2]);
   button(body, "New version from this one").click();
   await settle();
   const choice = body
@@ -1268,6 +1340,14 @@ test("choosing the next version's code keeps it described as the copy it is", as
         node.tag === "select" && node.all().some((option) => option.value === "uid-bundle-v2"),
     );
   if (!choice) throw new Error("no code bundle choice");
+  // The code the version has now is marked, so it is not chosen again by mistake.
+  const label = (uid: string) =>
+    choice.all().find((option) => option.tag === "option" && option.value === uid)?.textContent;
+  expect(label("uid-bundle")).toBe("hello-bundle (current)");
+  expect(label("uid-bundle-v2")).toBe("hello-bundle-v2");
+  expect(body.textContent).toContain(
+    "If the new code is not a WorkerBundle yet, create that first with New resource.",
+  );
   choice.value = "uid-bundle-v2";
   choice.emit("change");
   await settle();
@@ -1772,6 +1852,76 @@ test("delete that could not check what names the Resource says so and stays offe
   expect(seen).toHaveLength(1);
 });
 
+test("a refused update unlocks the spec and sends the change under a new key", async () => {
+  const { body } = await setup();
+  const { updateResource } = await import("../console/src/pages/create-resource.ts");
+  const puts: Request[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      if (request.method === "GET") return Response.json(discovery);
+      puts.push(request);
+      if (puts.length === 1)
+        return new Response(
+          JSON.stringify({ type: "about:blank", title: "Bad", status: 422, code: "invalid_spec" }),
+          { status: 422, headers: { "content-type": "application/problem+json" } },
+        );
+      return Response.json({ ...op, action: "update", generation: 2 }, { status: 202 });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  updateResource("org-console", one);
+  // The spec box is named by its label.
+  const label = body.all().find((node) => node.tag === "label");
+  expect(label?.attributes.get("for")).toBe("update-resource-spec");
+  const spec = body.all().find((node) => node.tag === "textarea");
+  if (!spec) throw new Error("spec editor missing");
+  expect(spec.attributes.get("id")).toBe("update-resource-spec");
+  spec.value = '{"value":"wrong"}';
+  button(body, "Update").click();
+  await settle();
+  const alert = body.all().find((node) => node.attributes.get("role") === "alert");
+  expect(alert?.textContent).toContain("This Host does not accept that spec for the Form.");
+  expect(alert?.textContent).toContain(
+    "The Host stored nothing, so you can change the request and send it again.",
+  );
+  expect(spec.disabled).toBe(false);
+  spec.value = '{"value":"right"}';
+  button(body, "Update").click();
+  await settle();
+  expect(puts).toHaveLength(2);
+  expect(await puts[1]?.json()).toEqual({ spec: { value: "right" } });
+  expect(puts[1]?.headers.get("idempotency-key")).not.toBe(puts[0]?.headers.get("idempotency-key"));
+});
+
+test("a stale update is not offered to be sent again from the same dialog", async () => {
+  const { body } = await setup();
+  const { updateResource } = await import("../console/src/pages/create-resource.ts");
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      if (request.method === "GET") return Response.json(discovery);
+      return new Response(
+        JSON.stringify({
+          type: "about:blank",
+          title: "Conflict",
+          status: 409,
+          code: "generation_conflict",
+        }),
+        { status: 409, headers: { "content-type": "application/problem+json" } },
+      );
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  updateResource("org-console", one);
+  button(body, "Update").click();
+  await settle();
+  const alert = body.all().find((node) => node.attributes.get("role") === "alert");
+  expect(alert?.textContent).toBe(
+    "This Resource changed after the page read it. Reload, check it, and try again.",
+  );
+});
+
 test("update uses the observed UID and generation rather than a name-based path", async () => {
   const { body, route } = await setup();
   const { updateResource } = await import("../console/src/pages/create-resource.ts");
@@ -1920,6 +2070,45 @@ test("expired Host replay window refuses a second native mutation send", async (
   });
   expect(writes).toHaveLength(1);
   discardResourceIntent(intent.id);
+});
+
+test("only a definite refusal of a request never in doubt is dropped for a new key", async () => {
+  await setup();
+  const { ApiError } = await import("../console/src/api.ts");
+  const {
+    prepareResourceIntent,
+    sendResourceIntent,
+    discardRefusedResourceIntent,
+    discardResourceIntent,
+  } = await import("../console/src/resource-intent.ts");
+  const change = { action: "delete", uid: one.uid, generation: 1 } as const;
+  const refusal = (code: string, status: number) =>
+    new ApiError(code, status, "/apis/forms.takoform.com/v2/resources/uid-one");
+  // A send whose acceptance is unknown stays, whatever a later answer says.
+  const uncertain = prepareResourceIntent("org-console", change, 60);
+  globalThis.fetch = Object.assign(
+    async () => {
+      throw new Error("ACK lost");
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  await expect(sendResourceIntent(uncertain.id)).rejects.toMatchObject({ code: "unreachable" });
+  expect(discardRefusedResourceIntent(uncertain.id, refusal("resource_busy", 409))).toBe(false);
+  // Neither the console's own errors, an unknown acceptance, nor a key that
+  // holds another request is a refusal that stored nothing.
+  const fresh = prepareResourceIntent("org-console", change, 60);
+  for (const [code, status] of [
+    ["principal_changed", 0],
+    ["request_timeout", 408],
+    ["temporarily_unavailable", 503],
+    ["idempotency_conflict", 409],
+  ] as const)
+    expect(discardRefusedResourceIntent(fresh.id, refusal(code, status))).toBe(false);
+  expect(discardRefusedResourceIntent(fresh.id, new Error("name_conflict"))).toBe(false);
+  expect(discardRefusedResourceIntent(fresh.id, refusal("name_conflict", 409))).toBe(true);
+  // Dropped, so it can never be sent again; the next request has its own key.
+  await expect(sendResourceIntent(fresh.id)).rejects.toMatchObject({ code: "intent_missing" });
+  discardResourceIntent(uncertain.id);
 });
 
 test("a different signed-in principal cannot inherit an in-memory replay handle", async () => {
