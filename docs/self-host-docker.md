@@ -5,7 +5,9 @@ container on `127.0.0.1:8787`, with its SQLite state in a Docker volume. It also
 serves the artifact Forms that keep Worker code, static files and SQL
 migrations. It runs no Workers: the image has no workerd or Workflow execution
 guard. For those, follow
-[First install and first use](self-host-operations.md#first-install-and-first-use).
+[First install and first use](self-host-operations.md#first-install-and-first-use);
+a Docker installation does not later become one that runs Workers, and a native
+install starts with its own data root.
 
 You need git, Docker Engine with Compose 2.30 or later (`docker compose
 version`; the Compose file uses raw env-file values), python3, curl and jq. Get
@@ -71,9 +73,22 @@ commands below that need the path spell it out.
 The image listens on `0.0.0.0:8787` inside the container. Compose publishes
 only `127.0.0.1:8787` on the host; `TAKOSERVER_HTTP_PORT` changes that host port.
 For real use, place an operator-controlled HTTPS proxy in front of it for the
-configured public origin, as in
-[control API ingress](self-host-operations.md#4-https-and-tcp-443) (in Docker,
-nothing holds TCP 443 for Workers, so the proxy may use it). A proxy on the
+configured public origin. In Docker nothing holds TCP 443 for Workers, so the
+proxy may use it. With Caddy on this machine, for the example origin:
+
+```caddyfile
+api.example.com {
+  @probes path /_takoserver/*
+  respond @probes 404
+  reverse_proxy 127.0.0.1:8787
+}
+```
+
+The site address must match `TAKOSERVER_PUBLIC_ORIGIN`, port included: the Host
+compares the whole host, so the native guide's `api.example.com:8443` in front
+of this origin gets `421` on every v2 request. The matcher keeps the
+operational probes off the public origin, as in
+[control API ingress](self-host-operations.md#4-https-and-tcp-443). A proxy on the
 same host can reach the loopback port. A proxy in another container needs an
 explicit private network connecting it to this service. Do not publish the
 plaintext backend on a public interface.
@@ -95,7 +110,7 @@ volume. The rest of this guide uses Compose; with `docker run`, use
 and adapt the stop, volume and backup commands of the update steps the same way.
 
 ```sh
-docker run -d --init --stop-timeout 30 --name takoserver-selfhost \
+docker run -d --init --stop-timeout 30 --restart unless-stopped --name takoserver-selfhost \
   --env-file ~/.config/takoserver/docker.env \
   -p 127.0.0.1:8787:8787 \
   --mount type=volume,source=takoserver-selfhost-data,target=/var/lib/takoserver \
@@ -157,18 +172,45 @@ done
 keeps artifacts and runs no Workers. Keep the assertion, session and key out of
 shared logs and shell history, and treat the container logs as credentials. Do
 not dump `docker inspect` or `docker compose config`: the container environment
-holds the cursor key. This image serves no console page; a console needs the API
-behind HTTPS on the same site (see
-[the console](self-host-operations.md#the-console-optional)).
+holds the cursor key.
 
-An artifact Form create names an exact HTTPS URL and SHA-256 of a manifest, and
-the Host fetches a public HTTPS URL itself. The manifest's shape is in the
-[WorkerBundle Form](https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/); the
-create needs a second key with `resources:write` and is sent as in
-[step 8 of the install guide](self-host-operations.md#8-create-and-serve-a-worker).
+To keep an artifact, publish it over public HTTPS and create it by the URL and
+SHA-256 of its manifest; the Host fetches it itself. The manifest's shape and
+the URLs the Host fetches are in step 10's
+[Publish them over public HTTPS](self-host-operations.md#10-ship-a-new-version).
+A create needs a key with `resources:write`. In the same shell, with your own
+manifest URL:
+
+```sh
+WKEY=$(curl -sS --fail-with-body -H "$H" -H "authorization: Bearer $SESSION" \
+    -H 'content-type: application/json' \
+    --data '{"name":"writer","scopes":["resources:write"],"expiresInSeconds":86400}' \
+    "$B/v1/organizations/$ORG/api-keys" | jq -r .secret)
+MANIFEST=https://artifacts.example.com/hello/v1/manifest.json
+SHA=$(curl -sS --fail "$MANIFEST" | sha256sum | cut -d' ' -f1)
+OPERATION=$(jq -n --arg org "$ORG" --arg url "$MANIFEST" --arg sha "$SHA" \
+    '{form: "https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/", space: $org,
+      name: "hello-bundle-v1", spec: {artifact: {$url, sha256: $sha}}}' |
+  curl -sS --fail-with-body -H "$H" -H "authorization: Bearer $WKEY" \
+    -H 'content-type: application/json' -H 'idempotency-key: takoserver-docker-hello-bundle-v1' \
+    --data @- "$B/apis/forms.takoform.com/v2/resources" | jq -r .id)
+curl -sS --fail-with-body -H "$H" -H "authorization: Bearer $WKEY" \
+  "$B/apis/forms.takoform.com/v2/operations/$OPERATION" | jq -c '{status, error}'
+```
+
+Ask for the Operation again until its `status` is `succeeded` or `failed`.
 Seeding held artifacts from local files
-([step 6](self-host-operations.md#6-seed-held-artifacts)) needs the stopped-Host
-check that guide describes, and is not covered for Docker yet.
+([step 6](self-host-operations.md#6-seed-held-artifacts)) needs the Host
+stopped, and in this image the Host is the container's main process, so it is
+not covered for Docker yet.
+
+This image serves no console page. The console is static files built from the
+checkout with Bun on this machine; see
+[the console](self-host-operations.md#the-console-optional), which also needs
+the API behind HTTPS on the same site. Its `TAKOSERVER_CONSOLE_ORIGIN` goes in
+the env file, and a changed env file takes effect with
+`docker compose up -d --no-build`; `docker compose restart` keeps the old
+environment.
 
 ## Stop, update, and verify
 
@@ -180,26 +222,39 @@ keep.
 To update, in the same checkout directory:
 
 1. Stop the Host, copy the stopped volume and the env file into a private
-   directory, and tag the current image so it stays available. Startup can
-   apply forward SQLite migrations, so these copies are the way back:
+   directory, and tag the image the Host was running so it stays available.
+   Startup can apply forward SQLite migrations, so these copies are the way
+   back:
 
    ```sh
    install -d -m 0700 ~/takoserver-backups
+   STAMP=$(date -u +%Y%m%dT%H%M%SZ)
    docker compose stop
    ( umask 077
      docker compose run --rm --no-deps -T --entrypoint tar takoserver \
-       -C /var/lib/takoserver -cpf - . > ~/takoserver-backups/takoserver-data-$(date +%F).tar
-     cp ~/.config/takoserver/docker.env ~/takoserver-backups/takoserver-env-$(date +%F) )
-   docker tag takoserver-selfhost:local takoserver-selfhost:before-$(date +%F)
+       -C /var/lib/takoserver -cpf - . > ~/takoserver-backups/takoserver-data-$STAMP.tar
+     cp ~/.config/takoserver/docker.env ~/takoserver-backups/takoserver-env-$STAMP )
+   docker tag "$(docker inspect -f '{{.Image}}' "$(docker compose ps -aq takoserver)")" \
+     takoserver-selfhost:before-$STAMP
    ```
 
    `docker compose run` mounts this project's own volume, so the copy cannot
    come from the wrong one. The copies hold the operator and signing keys and
    the cursor key; keep them private. Without the tag, rebuilding moves
    `takoserver-selfhost:local` and Docker pruning may delete the old image.
-2. Fetch and check out the new reviewed commit of `main`, rebuild with
-   `docker build -t takoserver-selfhost:local .`, and start it with
-   `docker compose up -d --no-build`.
+2. Check out the new reviewed commit of `main`, rebuild and start it:
+
+   ```sh
+   git fetch origin
+   COMMIT=$(git rev-parse origin/main)   # the commit to review and run
+   git checkout --detach "$COMMIT"
+   docker build -t takoserver-selfhost:local .
+   docker compose up -d --no-build
+   ```
+
+   If an earlier rollback added a `TAKOSERVER_DOCKER_IMAGE` line to `.env`,
+   delete that line before `up`, or it starts the old image again; keep
+   `COMPOSE_PROJECT_NAME`.
 3. Rerun the health, discovery and support checks above.
 
 Going back means restoring the copy into a fresh volume and starting
@@ -209,13 +264,16 @@ a new project name gives a fresh volume:
 
 ```sh
 docker compose stop
-DATE=2026-10-17   # the date in the copy's file names
+STAMP=20261017T091500Z   # the stamp in the copy's file names
 printf 'COMPOSE_PROJECT_NAME=takoserver-restore\nTAKOSERVER_DOCKER_IMAGE=takoserver-selfhost:before-%s\n' \
-  "$DATE" >> .env
+  "$STAMP" >> .env
 docker compose run --rm --no-deps -T --entrypoint tar takoserver \
-  -C /var/lib/takoserver -xpf - < ~/takoserver-backups/takoserver-data-$DATE.tar
+  -C /var/lib/takoserver -xpf - < ~/takoserver-backups/takoserver-data-$STAMP.tar
 docker compose up -d --no-build
 ```
+
+If the env file changed after the copy, put
+`~/takoserver-backups/takoserver-env-$STAMP` back in its place first.
 
 The two lines added to `.env` keep every later `docker compose` command, in any
 shell, on the restored project and the old image. A command without them would
@@ -223,7 +281,8 @@ act on the original project instead, or, without the image line, start the
 newer image on the restored volume, whose migrations would undo the rollback.
 Remove them to return to the original project.
 
-Run the explicit local regression check from the checkout with Bun installed:
+Maintainers, and anyone with Bun installed, can run the explicit local
+regression check from the checkout:
 
 ```sh
 bun run test:selfhost-docker
