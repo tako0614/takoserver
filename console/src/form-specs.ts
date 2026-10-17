@@ -10,6 +10,23 @@ const SQLITE_DATABASE = form("SQLiteDatabase", "0.2.0");
 const SQLITE_MIGRATION_SET = form("SQLiteMigrationSet", "0.2.0");
 const AT_LEAST_ONCE_QUEUE = form("AtLeastOnceQueue", "0.2.0");
 
+/**
+ * Forms whose Resources this Host never lets change: a version and the
+ * artifacts it names are new Resources each time, not edits. An update of one
+ * can only send its same spec again.
+ */
+const UNCHANGEABLE = new Set([
+  WORKER_VERSION,
+  WORKER_BUNDLE,
+  form("StaticAssetBundle", "0.2.0"),
+  SQLITE_MIGRATION_SET,
+]);
+
+/** Whether an update of a Resource of this exact Form can change anything. */
+export function acceptsChanges(formUrl: string): boolean {
+  return !UNCHANGEABLE.has(formUrl);
+}
+
 /** One place in a spec that names another Resource by UID. */
 export interface ReferenceSlot {
   /** Where the UID goes, for example `["versions", 0, "workerVersion", "resourceUid"]`. */

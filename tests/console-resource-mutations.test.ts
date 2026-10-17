@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import type { ResourceSummary } from "../console/src/api.ts";
+import { valueAt } from "../console/src/form-specs.ts";
 
 class TestNode {
   readonly children: TestNode[] = [];
@@ -874,7 +875,12 @@ async function detailPage(
       if (url.pathname.endsWith(`/resources/${uid}`)) return Response.json(shown());
       if (url.pathname.endsWith("/resources")) {
         const form = url.searchParams.get("form");
-        const items = form === deploymentForm ? deployments : form === null ? listed : [];
+        const items =
+          form === deploymentForm
+            ? deployments
+            : form === null
+              ? listed
+              : listed.filter((item) => item.form === form);
         return Response.json({ items, nextCursor: null });
       }
       return Response.json({ error: { code: "not_found" } }, { status: 404 });
@@ -1153,6 +1159,159 @@ test("a Worker that still names an earlier Deployment is out of date too", async
   expect(body.textContent).not.toContain("reports it NotReady");
   expect(body.textContent).not.toContain("The latest observation reports not ready.");
   button(body, "Record the Deployment");
+});
+
+test("a version's page starts the next version from it, with its code left to choose", async () => {
+  const withCode: ResourceSummary = {
+    ...helloV2,
+    spec: {
+      worker: { resourceUid: "uid-worker" },
+      bundle: { resourceUid: "uid-bundle" },
+      handlers: ["fetch"],
+      sqliteBindings: [{ name: "DB", resource: { resourceUid: "uid-db" } }],
+    },
+  };
+  const { body, writes } = await versionPage([], withCode);
+  // A version cannot be changed; its same spec can only be sent again.
+  expect(body.all().some((node) => node.tag === "button" && node.textContent === "Update")).toBe(
+    false,
+  );
+  button(body, "New version from this one").click();
+  await settle();
+  expect(body.textContent).toContain(
+    "A version cannot be changed, so this creates a new one from hello-v2's spec, with its handlers, vars and Bindings.",
+  );
+  const [form] = body.all().filter((node) => node.tag === "select");
+  expect(form?.value).toBe(versionForm);
+  const spec = body.all().find((node) => node.tag === "textarea");
+  expect(JSON.parse(spec?.value ?? "{}")).toEqual({
+    worker: { resourceUid: "uid-worker" },
+    bundle: { resourceUid: "" },
+    handlers: ["fetch"],
+    sqliteBindings: [{ name: "DB", resource: { resourceUid: "uid-db" } }],
+  });
+  // The copy is the Console's own writing, not the smallest spec of the Form.
+  expect(body.textContent).toContain("Fill in the empty values.");
+  expect(body.textContent).not.toContain("The smallest spec");
+  expect(writes).toHaveLength(0);
+});
+
+test("choosing the next version's code keeps it described as the copy it is", async () => {
+  const withCode: ResourceSummary = {
+    ...helloV2,
+    spec: {
+      worker: { resourceUid: "uid-worker" },
+      bundle: { resourceUid: "uid-bundle" },
+      handlers: ["fetch"],
+    },
+  };
+  const bundleV2 = resourceAt(
+    "uid-bundle-v2",
+    "hello-bundle-v2",
+    "https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/",
+    {
+      artifact: { url: "https://artifacts.example.test/v2/manifest.json", sha256: "a".repeat(64) },
+    },
+  );
+  const { body } = await detailPage(() => withCode, [], [bundleV2]);
+  button(body, "New version from this one").click();
+  await settle();
+  const choice = body
+    .all()
+    .find(
+      (node) =>
+        node.tag === "select" && node.all().some((option) => option.value === "uid-bundle-v2"),
+    );
+  if (!choice) throw new Error("no code bundle choice");
+  choice.value = "uid-bundle-v2";
+  choice.emit("change");
+  await settle();
+  const spec = body.all().find((node) => node.tag === "textarea");
+  expect(valueAt(JSON.parse(spec?.value ?? "{}"), ["bundle", "resourceUid"])).toBe("uid-bundle-v2");
+  expect(body.textContent).not.toContain("The smallest spec");
+  expect(body.textContent).not.toContain("Fill in the empty values.");
+});
+
+test("a version keeps its assets in the next one, and only its code bundle is chosen again", async () => {
+  const assets = {
+    bundle: { resourceUid: "uid-assets" },
+    runWorkerFirst: false,
+    notFoundHandling: "none",
+  };
+  const both = await versionPage([], {
+    ...helloV2,
+    spec: {
+      worker: { resourceUid: "uid-worker" },
+      bundle: { resourceUid: "uid-bundle" },
+      handlers: ["fetch"],
+      assets,
+    },
+  });
+  button(both.body, "New version from this one").click();
+  await settle();
+  const spec = both.body.all().find((node) => node.tag === "textarea");
+  expect(JSON.parse(spec?.value ?? "{}")).toEqual({
+    worker: { resourceUid: "uid-worker" },
+    bundle: { resourceUid: "" },
+    handlers: ["fetch"],
+    assets,
+  });
+  // A static-site version has no code bundle: it is told where its new files go.
+  const site = await versionPage([], {
+    ...helloV2,
+    spec: { worker: { resourceUid: "uid-worker" }, handlers: [], assets },
+  });
+  button(site.body, "New version from this one").click();
+  await settle();
+  expect(site.body.textContent).toContain(
+    "Write the new StaticAssetBundle's UID in assets.bundle, name it, then accept",
+  );
+  // Its spec has no code bundle, so none is offered to choose.
+  expect(site.body.textContent).not.toContain("bundle — WorkerBundle");
+});
+
+test("a version that needs secret values is not copied in the console", async () => {
+  const { body } = await versionPage([], {
+    ...helloV2,
+    spec: {
+      worker: { resourceUid: "uid-worker" },
+      bundle: { resourceUid: "uid-bundle" },
+      handlers: ["fetch"],
+      requiredSensitiveVars: ["API_TOKEN"],
+    },
+  });
+  expect(body.textContent).toContain(
+    "This version needs secret values, which the console cannot send; create the next version over the API with privateInputs.",
+  );
+  expect(
+    body
+      .all()
+      .some((node) => node.tag === "button" && node.textContent === "New version from this one"),
+  ).toBe(false);
+});
+
+test("a version can be sent again with its same spec, to retry it", async () => {
+  const { body, writes } = await versionPage([]);
+  button(body, "Re-apply").click();
+  await settle();
+  expect(body.textContent).toContain(
+    "A Resource of this Form cannot change. Sending the same spec again retries it, for example after its create failed.",
+  );
+  button(body, "Accept update").click();
+  await settle();
+  const [update] = writes;
+  expect(update?.method).toBe("PUT");
+  expect(JSON.parse(await (update as Request).text())).toEqual({ spec: helloV2.spec });
+});
+
+test("a Resource that can change keeps its Update", async () => {
+  const { body } = await detailPage(() => servingDeployment, [servingDeployment]);
+  button(body, "Update");
+  expect(
+    body
+      .all()
+      .some((node) => node.tag === "button" && node.textContent === "New version from this one"),
+  ).toBe(false);
 });
 
 test("a Deployment serves one version only when its single entry is that version at 10000", async () => {

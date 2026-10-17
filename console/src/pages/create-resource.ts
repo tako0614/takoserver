@@ -504,6 +504,8 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
   // chosen Form; an edited one is never overwritten, only offered the starter.
   let starter: StarterSpec | null = null;
   let untouched = "{}";
+  // What a preset wrote: a whole spec of its own, not this Form's starter.
+  let presetText: string | null = null;
   let chosen = "";
   // The starter's own empty places that the spec still leaves empty.
   const remainingBlanks = (parsed: Record<string, unknown> | null): (string | number)[][] =>
@@ -559,6 +561,14 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
           ]
         : []),
     );
+    if (spec.value === presetText) {
+      specHint.replaceChildren(
+        remainingBlanks(jsonSpec(spec.value)).length > 0
+          ? tr("空の値を埋めてください。", "Fill in the empty values.")
+          : "",
+      );
+      return;
+    }
     if (spec.value !== untouched) {
       specHint.replaceChildren(
         remainingBlanks(jsonSpec(spec.value)).length > 0
@@ -612,11 +622,20 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
       }
       write(JSON.stringify(next, null, 2));
     }
+    // A preset of this Form may leave out a place its starter names, such as
+    // a static-site version's code bundle; that place is not offered.
+    const slots = (starter?.references ?? []).filter(
+      (slot) =>
+        !preset || preset.form !== selected || valueAt(preset.spec, slot.path) !== undefined,
+    );
     picker =
-      starter && starter.references.length > 0
-        ? referencePicker(organizationId, starter.references, spec, (text) => {
-            // A chosen Resource is the Console's own writing, like the starter.
+      slots.length > 0
+        ? referencePicker(organizationId, slots, spec, (text) => {
+            // A chosen Resource is the Console's own writing, like the starter;
+            // a preset written so stays a preset.
+            const fromPreset = spec.value === presetText;
             write(text);
+            if (fromPreset) presetText = text;
             showDetails();
             picker?.sync();
             describeStarter();
@@ -655,6 +674,7 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
     form.choose(preset.form);
     // The preset is the Console's own writing, like a starter.
     write(JSON.stringify(preset.spec, null, 2));
+    presetText = spec.value;
     syncReferences();
     describeStarter();
   }
