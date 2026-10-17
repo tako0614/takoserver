@@ -1149,7 +1149,8 @@ it afterwards. A broken version shows itself in one of these ways:
   resolve, an exception at the module's top level or top-level work that runs
   past a two-second limit, which also counts the runtime's start-up, or
   `handlers` that is not exactly the list of handlers its default export
-  defines. The Host does not say which. It keeps retrying, and refuses to delete
+  defines. A Binding or assets that the Host cannot use yet look the same. The
+  Host does not say which. It keeps retrying, and refuses to delete
   the version while it retries (`409 resource_busy`), so the version, and the
   Worker and bundle it names, stay. While it retries, the Worker's same-spec
   update (**Record the Deployment**) is refused with `409 dependency_conflict`;
