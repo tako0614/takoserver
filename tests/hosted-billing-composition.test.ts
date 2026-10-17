@@ -1807,6 +1807,8 @@ describe("private Financial card-setup economic DATA selection", () => {
       throw new Error("on-demand payment composition absent");
     const originalTerms = composition.onDemand.readTerms();
     const originalDisclosure = composition.setupDisclosureRevision;
+    if (typeof originalDisclosure !== "string")
+      throw new Error("original setup disclosure revision absent");
     // The original service and configuration are captured by the constructor;
     // later caller mutation must not select another economic disclosure.
     configuration.terms.termsRevision = "replaced-terms";
