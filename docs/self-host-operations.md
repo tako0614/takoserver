@@ -805,8 +805,9 @@ bun --no-env-file scripts/selfhost-artifact.ts verify --config /etc/takoserver/v
 
 Query support for each exact Form URL you intend to use. Proceed only when it
 reports `supported: true`. Support reflects the Forms composed by this running
-Host. If the Worker Forms are unsupported, the Host does not log which setting
-is missing; compare the configuration with the complete-profile table in step 3.
+Host. If the Worker Forms are unsupported, then apart from an unusable
+`workerd`, which it reports at startup, the Host does not log which setting is
+missing; compare the configuration with the complete-profile table in step 3.
 As root, these show the usual causes:
 
 ```sh
@@ -815,15 +816,19 @@ for name in TAKOSERVER_WORKERD_BINARY TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY
     TAKOSERVER_V2_WORKER_RUNTIME_BOOT TAKOSERVER_V2_WORKER_PRIVATE_PLANES; do
   [ -n "$(printenv "$name")" ] || echo "missing: $name"
 done
-"$TAKOSERVER_WORKERD_BINARY" --version   # workerd 2026-08-11; a glibc error means the OS is too old
+"$TAKOSERVER_WORKERD_BINARY" --version   # prints its version; a glibc error means the OS is too old
 jq -r '.workerBundle.targetKey, .staticAssetBundle.targetKey' /etc/takoserver/v2/takoform-v2.json
+printf '%s' "$TAKOSERVER_V2_WORKER_RUNTIME_BOOT" | jq -c 'keys'
 printf '%s' "$TAKOSERVER_V2_WORKER_PRIVATE_PLANES" | jq -r 'keys[]'
-journalctl -u takoserver.service -b --no-pager | grep -i -E 'workerd|actor|workflow|socket|plane'
+journalctl -u takoserver.service -b --no-pager | grep -i -E 'workerd|actor|workflow|socket|plane|endpoint'
 ```
 
-Both `targetKey` values must be `selfhost-v2-worker-primary`, and the planes
-must be `kv`, `objectBucket`, `queue`, `queueProducer` and `sqlite`. Fix the
-configuration, then restart.
+Both `targetKey` values must be `selfhost-v2-worker-primary`, the runtime boot
+must print `["actor","workflow"]`, and the planes must be `kv`,
+`objectBucket`, `queue`, `queueProducer` and `sqlite`. If only
+`WorkerEndpoint` is unsupported, check step 4's
+`TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS=1`, `TAKOSERVER_WORKER_ENDPOINT_SUFFIX`
+and the TLS files. Fix the configuration, then restart.
 
 ```sh
 for form in ModuleWorker/0.3.0 WorkerBundle/0.2.0 WorkerVersion/0.5.0 \
@@ -1061,7 +1066,9 @@ Then give the Host its bytes in one of two ways:
 
 - **Seed them onto the Host**, as in step 6, for a publisher that is not
   public. Seeding needs the Host stopped, so every Worker on the Host stops
-  serving until it starts again:
+  serving until it starts again. Stop the Host first
+  (`systemctl stop takoserver.service`, as root); then, in the shell of step 6
+  with the Host's environment loaded, seed:
 
   ```sh
   bun --no-env-file scripts/selfhost-artifact.ts seed worker-bundle "$WORK/hello/v2" \
@@ -1796,7 +1803,7 @@ are, as root:
 
 ```sh
 systemctl stop takoserver.service
-systemctl is-active takoserver.service   # prints inactive once every writer has exited
+systemctl is-active takoserver.service   # prints inactive (or failed) once every writer has exited
 SNAP=/var/backups/takoserver/$(date -u +%Y%m%dT%H%M%SZ)
 install -d -m 0700 "$SNAP"
 cp -a /var/lib/takoserver "$SNAP/data"

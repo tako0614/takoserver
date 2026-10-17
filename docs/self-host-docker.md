@@ -218,9 +218,10 @@ docker compose up -d --no-build
 ```
 
 The two lines added to `.env` keep every later `docker compose` command, in any
-shell, on the restored project and the old image; a command without them would
-start the newer image, whose migrations would undo the rollback. Remove them to
-return to the original project.
+shell, on the restored project and the old image. A command without them would
+act on the original project instead, or, without the image line, start the
+newer image on the restored volume, whose migrations would undo the rollback.
+Remove them to return to the original project.
 
 Run the explicit local regression check from the checkout with Bun installed:
 
