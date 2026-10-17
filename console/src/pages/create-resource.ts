@@ -1,6 +1,7 @@
 import { ApiError, type ResourceSummary } from "../api.ts";
 import { type Child, h, live } from "../dom.ts";
 import {
+  acceptsChanges,
   blankPaths,
   pathLabel,
   type ReferenceSlot,
@@ -888,6 +889,75 @@ export function updateResource(
   });
 }
 
+/** The kind of an exact Form URL, such as "WorkerDeployment". */
+function formKind(formUrl: string): string {
+  return /\/forms\/([^/]+)\//u.exec(formUrl)?.[1] ?? "";
+}
+
+/** What deleting a Resource of this Form takes with it, said before it is confirmed. */
+function deleteConsequence(formUrl: string): string {
+  switch (formKind(formUrl)) {
+    case "SQLiteDatabase":
+    case "EdgeKVNamespace":
+    case "ObjectBucket":
+    case "AtLeastOnceQueue":
+      return tr("保存されているデータも削除されます。", "Its data is deleted with it. ");
+    case "WorkerEndpoint":
+      return tr(
+        "そのホスト名ではWorkerが配信されなくなります。",
+        "Its hostname stops serving the Worker. ",
+      );
+    case "WorkerDeployment":
+      return tr("そのWorkerの配信が止まります。", "Its Worker stops serving. ");
+    case "ActorNamespace":
+      return tr(
+        "保存されている状態も削除されます。",
+        "The stored state of its objects is deleted with it. ",
+      );
+    case "DurableWorkflow":
+      return tr("実行中のインスタンスは停止されます。", "Its running instances are stopped. ");
+    case "WorkerCronTrigger":
+      return tr(
+        "スケジュールによるWorkerの呼び出しが止まります。",
+        "Its schedule stops calling the Worker. ",
+      );
+    case "QueueConsumer":
+      return tr(
+        "Workerはキューのメッセージを受け取らなくなります。",
+        "The Worker stops receiving the queue's messages. ",
+      );
+    default:
+      return "";
+  }
+}
+
+/**
+ * What to do first about one Resource that still names the one being deleted.
+ * A Deployment's versions are the only reference the Host lets change, so a
+ * Deployment serving the version serves another or goes; a Resource that never
+ * changes goes once nothing serves it; any other Form this console knows
+ * cannot be pointed elsewhere, so it goes first. Only a Form it does not know
+ * might be changed instead.
+ */
+function referrerStep(referrer: ResourceSummary, target: ResourceSummary): string {
+  if (formKind(referrer.form) === "WorkerDeployment" && formKind(target.form) === "WorkerVersion")
+    return tr(
+      "先に別の版を配信するか、削除してください",
+      "serve another version first, or delete it",
+    );
+  if (!acceptsChanges(referrer.form))
+    return tr(
+      "変更できないため、配信されなくなってから削除してください",
+      "it cannot change, so delete it once nothing serves it",
+    );
+  if (KNOWN_FORM_GROUPS.some((group) => (group.forms as readonly string[]).includes(referrer.form)))
+    return tr("先に削除してください", "delete it first");
+  return tr(
+    "参照しないよう変更するか、削除してください",
+    "change it so it no longer names this, or delete it",
+  );
+}
+
 /**
  * A link out of a dialog: it navigates as any link does, and closes the dialog
  * only when it navigates here, not when it opens a new tab.
@@ -930,10 +1000,9 @@ export function deleteResource(organizationId: string, target: ResourceSummary):
       h(
         "div",
         { class: "notice notice--bad" },
-        tr(
-          "Hostはこのリソースと、そのために動かしているものを削除します。データベースならデータが失われ、Endpointのホスト名は配信を停止します。この操作は元に戻せません。",
-          "The Host deletes this Resource and what it runs for it: a database's data is deleted, and an Endpoint's hostname stops serving. This cannot be undone.",
-        ),
+        tr("Hostはこのリソースを削除します。", "The Host deletes this Resource. "),
+        deleteConsequence(target.form),
+        tr("この操作は元に戻せません。", "This cannot be undone."),
       ),
       live(() => {
         const state = naming.get();
@@ -974,8 +1043,8 @@ export function deleteResource(organizationId: string, target: ResourceSummary):
             "span",
             null,
             tr(
-              "次のリソースがまだこのリソースを参照しているため、Hostは削除を受け付けません。参照しないよう変更するか、先に削除してください。",
-              "The Host refuses this delete while these still name it. Change them so they no longer name it, or delete them first.",
+              "次のリソースがまだこのリソースを参照しているため、Hostは削除を受け付けません。",
+              "The Host refuses this delete while these still name it.",
             ),
           ),
           h(
@@ -991,7 +1060,12 @@ export function deleteResource(organizationId: string, target: ResourceSummary):
                   referrer.name,
                 ),
                 ` ${formLabel(referrer.form)}`,
-                health(referrer).phase === "Deleting" ? tr("（削除中）", " (being deleted)") : "",
+                health(referrer).phase === "Deleting"
+                  ? tr("（削除中）", " (being deleted)")
+                  : tr(
+                      `：${referrerStep(referrer, target)}`,
+                      `: ${referrerStep(referrer, target)}`,
+                    ),
               ),
             ),
           ),
