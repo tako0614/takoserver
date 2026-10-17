@@ -2255,3 +2255,106 @@ export async function persistCaptureAndConsumeSharedAuthFinancialConsentRequestD
     return fail("unavailable");
   }
 }
+
+/** Historical external reference DATA. consentProofRef is exactly the already
+ * stored canonical consentRef, not a new identifier, digest, prefix or the
+ * identityEvidence.proofRef. No NEW/current-consent authority is returned.
+ */
+export interface SharedAuthFinancialConsentProofReferenceData {
+  readonly state: "consent-proof-reference-original-data";
+  readonly consentProofRef: string;
+  readonly original: SharedAuthFinancialConsentOriginalData;
+}
+
+/** Same-request query-only immutable-original lookup. This is unmounted DATA,
+ * not a producer/current verifier or a complete request admission port. A ref
+ * cannot prove absence of pending29 (which has no consentRef column), so zero
+ * command rows are unavailable, never positive absence or permission to write.
+ * The original-fullcommand GET recovery API and all write APIs are unchanged.
+ */
+export function createSharedAuthFinancialConsentProofReferenceReader(connection: WorkerRequestSql) {
+  const port = captureRequestCommandSql(connection);
+  const originals = createSharedAuthFinancialConsentOriginalReader(port.queryPort);
+
+  async function readProofOriginalData(
+    input: unknown,
+  ): Promise<SharedAuthFinancialConsentProofReferenceData> {
+    port.sameOrigin();
+    let consentProofRef: string;
+    try {
+      // Primitive original bytes/code units: no trim, normalization or ref mint.
+      consentProofRef = text(input, "invalid_request");
+    } catch {
+      return fail("invalid_request");
+    }
+    let command: SharedAuthFinancialConsentOriginalCommand;
+    try {
+      if ((await inspectSharedAuthFinancialConsentLeafSchema(port.queryPort)) !== "leaf-present")
+        return fail("unavailable");
+      port.sameOrigin();
+      const rows = await port.queryPort.query(
+        `SELECT ${commandColumns.join(",")} FROM ${COMMANDS} WHERE consent_ref=? LIMIT 2`,
+        [consentProofRef],
+      );
+      port.sameOrigin();
+      // No fabricated SqlWrite/changes value for a SELECT. The exact one row
+      // and all16 own data fields are required, then native BLOB copies are
+      // taken before the next await by the existing snapshotRequestCommand.
+      const row = exactOwn(requiredDenseValues(rows, 1)[0], commandColumns, "unavailable");
+      command = snapshotRequestCommand({
+        key: {
+          registrationRef: row.registration_ref,
+          incarnation: row.incarnation,
+          transactionRef: row.transaction_ref,
+          commandRef: row.command_ref,
+          consentRef: row.consent_ref,
+          receiptRef: row.receipt_ref,
+        },
+        selectedScope: {
+          organizationId: row.organization_id,
+          workspaceId: row.workspace_id,
+          workspaceRef: row.workspace_ref,
+        },
+        family: row.family,
+        commandBytes: row.command_bytes,
+        commandCustodySHA256: row.command_custody_sha256,
+        originalBytes: row.original_bytes,
+        originalDigest: row.original_digest,
+        originalCustodySHA256: row.original_custody_sha256,
+        capturedAt: row.captured_at,
+      });
+      if (command.key.consentRef !== consentProofRef) return fail("unavailable");
+    } catch {
+      // SQL/row decoding or stored shape failure, including a borrowed exported
+      // error, is unknown. It is not caller-invalid, absence or another family.
+      port.sameOrigin();
+      return fail("unavailable");
+    }
+
+    try {
+      // Reuse actual pending29/command16/original14 custody, raw byte hashes,
+      // accepted canonical recipe and mandatory same-row receipt validation.
+      // Its historical checks do not consult now, retirement or current rows.
+      const original = await originals.readOriginal(command);
+      port.sameOrigin();
+      if (original === undefined || original.command.key.consentRef !== consentProofRef)
+        return fail("unavailable");
+      return Object.freeze({
+        state: "consent-proof-reference-original-data",
+        consentProofRef: original.command.key.consentRef,
+        original,
+      });
+    } catch (error) {
+      port.sameOrigin();
+      if (
+        error instanceof SharedAuthFinancialConsentOriginalReadError &&
+        error.code === "custody_conflict"
+      )
+        throw error;
+      // Invalid stored canonical bytes/hashes are unavailable here: only the
+      // primitive input boundary above may classify an invalid_request.
+      return fail("unavailable");
+    }
+  }
+  return Object.freeze({ readProofOriginalData });
+}
