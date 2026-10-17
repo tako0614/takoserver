@@ -149,7 +149,7 @@ export function settingsPage(organization: Organization): Child {
       ),
     ),
     live(() => {
-      const input = h("input", { class: "input", value: apiOrigin() });
+      const input = h("input", { class: "input", id: "settings-api-origin", value: apiOrigin() });
       return card(
         tr("API接続先", "API endpoint"),
         h(
@@ -158,7 +158,7 @@ export function settingsPage(organization: Organization): Child {
           h(
             "div",
             { class: "field" },
-            h("label", null, tr("オリジン", "Origin")),
+            h("label", { for: "settings-api-origin" }, tr("オリジン", "Origin")),
             h(
               "div",
               { style: { display: "flex", gap: "8px" } },
