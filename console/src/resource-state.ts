@@ -95,7 +95,8 @@ export function phaseLabel(phase: Phase): string {
     Deleting: "削除中",
     Unknown: "不明",
   } as const;
-  return tr(japanese[phase], phase);
+  // English reads its words, not the identifier: NotReady is "Not ready".
+  return tr(japanese[phase], phase === "NotReady" ? "Not ready" : phase);
 }
 
 /** Counts by exact Form URL; a shared noun is not a Form identity. */

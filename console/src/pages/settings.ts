@@ -227,8 +227,8 @@ export function hostCard(organizationId: string): Child {
         "small",
         null,
         tr(
-          "Takoformやcurlからは、このURL、スペース（上の「識別子」）、",
-          "Takoform and curl use this URL, the Identifier above as the Space, and ",
+          "curlなどのHost API v2クライアントからは、このURL、スペース（上の「識別子」）、",
+          "Host API v2 clients such as curl use this URL, the Identifier above as the Space, and ",
         ),
         h("a", { ...linkProps("/keys") }, tr("APIキー", "an API key")),
         tr("を使って操作します。", "."),

@@ -129,16 +129,20 @@ function body(
           { class: "dim" },
           h("a", { ...linkProps("/resources") }, tr("リソース", "Resources")),
         ),
+        // The heading is the name alone; the state sits beside it, not inside it.
         h(
-          "h1",
-          null,
-          // The name is the page title; .mono alone would shrink it to body size.
+          "div",
+          { class: "title-row" },
           h(
-            "span",
-            { class: "mono", style: { fontSize: "inherit", overflowWrap: "anywhere" } },
-            found.name,
+            "h1",
+            null,
+            // The name is the page title; .mono alone would shrink it to body size.
+            h(
+              "span",
+              { class: "mono", style: { fontSize: "inherit", overflowWrap: "anywhere" } },
+              found.name,
+            ),
           ),
-          text(" "),
           badge(phaseLabel(state.phase), state.tone, true),
         ),
         h(
