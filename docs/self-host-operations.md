@@ -1002,7 +1002,8 @@ their bytes in one of two ways:
     `.lan`, `.home.arpa`, `.test`, `.invalid` or `.example`;
   - its certificate is publicly trusted;
   - it has no port, query or fragment, and is written in its normalized form;
-  - it answers a plain `200` (no redirect) within 30 seconds;
+  - it answers a plain `200` (no redirect) and its whole body arrives within
+    30 seconds;
   - it is not one the Host already holds from seeding.
 
   A manifest is at most 1 MiB, each file at most 16 MiB, and a bundle at most
