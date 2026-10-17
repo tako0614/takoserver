@@ -148,7 +148,7 @@ describe("Takoserver public site", () => {
     );
     expect(after).toContain('"weight": 10000');
     expect(after).not.toContain("$HOST");
-    expect(after).toContain("docs/self-host-operations.md#9-verify");
+    expect(after).toContain("docs/self-host-operations.md#10-ship-a-new-version");
     for (const path of ["/openapi.json", "/.well-known/takoform/v2", "/.well-known/takoserver"]) {
       expect(html).toContain(`href="https://api.takoserver.example${path}"`);
     }
@@ -254,6 +254,13 @@ describe("Takoserver public site", () => {
     const bare = landingHtml({ consoleOrigin: null, apiOrigin: null });
     expect(bare).toContain("This Host serves no console yet.");
     expect(bare).toContain('data-i18n="consoleSetup"');
+    // A shared link to a Host's root names that Host, not takoserver.com, and
+    // search leaves the Host's copy of the page out.
+    expect(withConsole).toContain('<meta property="og:url" content="https://api.host.example/">');
+    expect(withConsole).toContain('<meta name="robots" content="noindex">');
+    expect(withConsole).not.toContain('rel="canonical"');
+    expect(landingHtml(site)).toContain('<link rel="canonical" href="https://takoserver.com/">');
+    expect(landingHtml(site)).not.toContain('content="noindex"');
     // The public site describes the reader's own Host, never itself as one.
     expect(landingHtml(site)).not.toContain('<section class="here"');
   });
