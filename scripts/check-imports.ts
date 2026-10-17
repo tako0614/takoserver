@@ -723,6 +723,16 @@ for (const path of walk("src")) {
       /^import\s*\{\s*prepareV2HostAcceptance\s*,\s*type\s+V2HostAcceptance\s*,\s*type\s+V2HostAcceptanceContext(?:\s*,\s*type\s+V2HostDeleteAcceptanceContext)?\s*,?\s*\}\s*from\s+["']\.\/host-acceptance\.ts["'];$/mu.test(
         readFileSync(path, "utf8"),
       );
+    // The operator SDK exposes the existing compiler constructor from this
+    // exact barrel. Recipes, readiness SQL and mint primitives stay private;
+    // this does not give the extension layer a general schema dependency.
+    const exactContainerConstructionExportEdge =
+      path === "src/takoform-v2/index.ts" &&
+      target === "src/takoform-v2/container-owner-schema.ts" &&
+      localImportsOf(path).filter((candidate) => candidate === target).length === 1 &&
+      /^export\s*\{\s*createV2ContainerHostAcceptance\s*,?\s*\}\s*from\s+["']\.\/container-owner-schema\.ts["'];$/mu.test(
+        readFileSync(path, "utf8"),
+      );
     // This fixed receiver reuses only the owning Deployment parser/error.
     // No general v2-form edge, re-export, namespace or dynamic import is allowed.
     const exactOriginDeploymentParserEdge =
@@ -841,6 +851,7 @@ for (const path of walk("src")) {
       !exactHostAcceptanceEdge &&
       !exactHostAcceptanceCompositionTypeEdge(path, target) &&
       !exactContainerHostAcceptanceEdge &&
+      !exactContainerConstructionExportEdge &&
       !exactOriginDeploymentParserEdge &&
       !exactWorkerEndpointOriginConstructionEdge &&
       !exactOriginPublicationExtensionEdge &&

@@ -40,6 +40,7 @@ export {
   type V2ConfiguredPrivateInputIdentity,
   type V2ConfiguredPrivateInputs,
 } from "./configured-private-inputs.ts";
+export { createV2ContainerHostAcceptance } from "./container-owner-schema.ts";
 export {
   createV2EdgeKvNativeCustody,
   type V2EdgeKvConfirmedIdentity,

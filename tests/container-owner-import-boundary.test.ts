@@ -5,9 +5,11 @@ import { dirname, join, resolve } from "node:path";
 
 const ROOT = resolve(import.meta.dir, "..");
 const CONTAINER = "src/takoform-v2/container-owner-schema.ts";
+const BARREL = "src/takoform-v2/index.ts";
 const SOURCES = [
   "scripts/check-imports.ts",
   CONTAINER,
+  BARREL,
   "src/takoform-v2/host-acceptance.ts",
   "src/worker-endpoint-origin-v2-acceptance.ts",
 ];
@@ -229,5 +231,65 @@ for (const [label, added] of [
     expect(result.stderr).toContain(
       `${CONTAINER} (v2-container-owner-schema) imports src/takoform-v2/host-acceptance.ts`,
     );
+  });
+}
+
+const containerFactoryExport =
+  'export { createV2ContainerHostAcceptance } from "./container-owner-schema.ts";';
+const barrelSource = originals.get(BARREL);
+if (!barrelSource || barrelSource.split(containerFactoryExport).length !== 2)
+  throw new Error("missing unique fixed Container factory barrel export");
+
+test("the v2 barrel permits the exact direct named Container factory reexport", async () => {
+  const result = await probe((files) => files.set(BARREL, `${containerFactoryExport}\n`));
+  expect(result.code).toBe(0);
+  expect(result.stderr).toBe("");
+});
+
+const forbiddenContainerFactoryExports = {
+  star: 'export * from "./container-owner-schema.ts";',
+  namespace: 'export * as containerOwner from "./container-owner-schema.ts";',
+  alias:
+    'export { createV2ContainerHostAcceptance as otherFactory } from "./container-owner-schema.ts";',
+  additionalRecipe:
+    'export { createV2ContainerHostAcceptance, V2_CONTAINER_OWNER_RECIPE } from "./container-owner-schema.ts";',
+  additionalReadiness:
+    'export { createV2ContainerHostAcceptance, inspectV2ContainerOwnerSchema } from "./container-owner-schema.ts";',
+  recipeOnly: 'export { V2_CONTAINER_OWNER_RECIPE } from "./container-owner-schema.ts";',
+  readinessOnly: 'export { inspectV2ContainerOwnerSchema } from "./container-owner-schema.ts";',
+  importThenExport:
+    'import { createV2ContainerHostAcceptance } from "./container-owner-schema.ts";\nexport { createV2ContainerHostAcceptance };',
+  runtimeImport: 'import { createV2ContainerHostAcceptance } from "./container-owner-schema.ts";',
+  dynamic:
+    'const owner = await import("./container-owner-schema.ts");\nexport const createV2ContainerHostAcceptance = owner.createV2ContainerHostAcceptance;',
+  duplicate: `${containerFactoryExport}\n${containerFactoryExport}`,
+  exportAndImport: `${containerFactoryExport}\nimport { createV2ContainerHostAcceptance } from "./container-owner-schema.ts";`,
+  alternateSpecifier:
+    'export { createV2ContainerHostAcceptance } from "././container-owner-schema.ts";',
+};
+for (const [kind, replacement] of Object.entries(forbiddenContainerFactoryExports)) {
+  test(`the v2 barrel cannot widen the Container factory edge with ${kind}`, async () => {
+    const result = await probe((files) => {
+      files.set(BARREL, barrelSource.replace(containerFactoryExport, replacement));
+    });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain(`${BARREL} (v2-extension) imports ${CONTAINER}`);
+  });
+}
+
+for (const path of ["src/index.ts", "src/provider-extension.ts", "src/takoform-v2/host.ts"]) {
+  test(`the Container factory publication edge does not authorize neighboring caller ${path}`, async () => {
+    const specifier = path.startsWith("src/takoform-v2/")
+      ? "./container-owner-schema.ts"
+      : "./takoform-v2/container-owner-schema.ts";
+    const result = await probe((files) => {
+      files.set(
+        path,
+        `export { createV2ContainerHostAcceptance } from ${JSON.stringify(specifier)};\n`,
+      );
+    });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain(`${path} (`);
+    expect(result.stderr).toContain(`imports ${CONTAINER} (v2-container-owner-schema)`);
   });
 }

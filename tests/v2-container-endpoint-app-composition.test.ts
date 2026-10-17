@@ -5,6 +5,7 @@
  */
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { createV2ContainerHostAcceptance } from "@takoserver/core/takoform-v2";
 import { type AppPorts, buildApp } from "../src/app.ts";
 import { createAccounts } from "../src/auth.ts";
 import type { Offering } from "../src/catalog.ts";
@@ -17,7 +18,6 @@ import { FakeProvider } from "../src/providers/fake.ts";
 import { createSharedAppLedger } from "../src/shared-app-ledger.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
-import { createV2ContainerHostAcceptance } from "../src/takoform-v2/container-owner-schema.ts";
 import {
   prepareV2HostAcceptance,
   redeemV2HostAcceptance,
