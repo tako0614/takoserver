@@ -1,7 +1,7 @@
 import { type Child, h, svg, text } from "./dom.ts";
 import { consoleLocale, tr } from "./i18n.ts";
 import type { Async } from "./reactive.ts";
-import { signal } from "./reactive.ts";
+import { effect, signal } from "./reactive.ts";
 
 /** The pieces every screen is built from. */
 
@@ -337,11 +337,15 @@ export interface ModalOptions {
   readonly confirmLabel?: string;
   readonly confirmTone?: "primary" | "danger";
   readonly onConfirm?: () => void | Promise<void>;
+  /** While true, the confirm is disabled: the request would only be refused. */
+  readonly confirmBlocked?: () => boolean;
   readonly dismissLabel?: string;
 }
 
 export function openModal(options: ModalOptions): () => void {
+  let stopBlocking: (() => void) | null = null;
   const close = (): void => {
+    stopBlocking?.();
     scrim.remove();
     document.removeEventListener("keydown", onKey);
   };
@@ -358,15 +362,23 @@ export function openModal(options: ModalOptions): () => void {
     button.append(options.confirmLabel ?? tr("確認", "Confirm"));
     // A confirm that talks to the server disables itself while it does, so a
     // second click cannot issue the same mutation twice.
+    let sending = false;
+    const blocked = options.confirmBlocked;
+    const settle = (): void => {
+      button.disabled = sending || (blocked?.() ?? false);
+    };
     button.addEventListener("click", () => {
       const done = options.onConfirm?.();
       if (done instanceof Promise) {
-        button.disabled = true;
+        sending = true;
+        settle();
         void done.finally(() => {
-          button.disabled = false;
+          sending = false;
+          settle();
         });
       }
     });
+    if (blocked) stopBlocking = effect(settle);
     confirm = button;
   }
 
