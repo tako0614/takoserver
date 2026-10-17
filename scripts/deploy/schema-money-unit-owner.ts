@@ -2590,6 +2590,88 @@ export async function assertMoneyUnitHeldNormalWorkerModePreparationCurrent(
     throw preflightError("money normal Worker native/source preparation changed");
 }
 
+/** Transport of original members only; the aggregate grants no import or resume permission. */
+export interface MoneyUnitHeldPost94ConsumerInputs {
+  readonly context: MoneyUnitHeldConvertContext;
+  readonly selection: MoneyUnitHeldPost94Selection;
+  readonly normalWorkerModePreparation: MoneyUnitHeldNormalWorkerModePreparation;
+}
+
+/** Original native owner → one held context → protected selection and immutable-Version mode. */
+export async function readMoneyUnitHeldPost94ConsumerInputs(
+  options: MoneyUnitOriginalCutoverOptions,
+  post94DeclarationPath: string,
+  normalWorkerSelectorPath: string,
+): Promise<MoneyUnitHeldPost94ConsumerInputs> {
+  const target = originalHeldMoneyOwner(options);
+  for (const path of [post94DeclarationPath, normalWorkerSelectorPath]) {
+    if (
+      typeof path !== "string" ||
+      !isAbsolute(path) ||
+      resolve(path) !== path ||
+      /[\0\r\n]/.test(path)
+    )
+      throw preflightError("money held post94 inputs require canonical protected paths");
+  }
+  const input = originalMoneyInput(post94DeclarationPath, "money held post94 declaration");
+  const normalInput = originalMoneyInput(normalWorkerSelectorPath, "money normal Worker selector");
+  const value = input.value;
+  if (!record(value) || Object.getPrototypeOf(value) !== Object.prototype)
+    throw preflightError("money held post94 inputs require own-data suffix selection");
+  const selected = (name: string): unknown => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, name);
+    if (descriptor === undefined || !("value" in descriptor) || !descriptor.enumerable)
+      throw preflightError("money held post94 inputs require own-data suffix selection");
+    return descriptor.value;
+  };
+  const previousWriterEpoch = selected("previousWriterEpoch");
+  const nextWriterEpoch = selected("nextWriterEpoch");
+  const convertedBackupPath = selected("convertedBackupPath");
+  if (
+    selected("kind") !== "takoserver.money-cutover-owner-post94-declaration@v1" ||
+    selected("phase") !== "suffix98" ||
+    selected("selectedStripeMode") !== "test" ||
+    typeof previousWriterEpoch !== "string" ||
+    typeof nextWriterEpoch !== "string" ||
+    typeof convertedBackupPath !== "string"
+  )
+    throw preflightError("money held post94 inputs require pre-import suffix98 TEST selection");
+  const request = heldMoneySelection({
+    previousWriterEpoch,
+    nextWriterEpoch,
+    convertedBackupPath,
+    selectedStripeMode: "test",
+  });
+  const assertInputs = (): void => {
+    if (originalHeldMoneyOwner(options) !== target)
+      throw preflightError("money held post94 original owner changed");
+    input.assertUnchanged();
+    normalInput.assertUnchanged();
+  };
+  const context = await readMoneyUnitHeldConvertContext(options, request);
+  assertInputs();
+  await assertMoneyUnitHeldConvertCurrent(context);
+  assertInputs();
+  const selection = await readMoneyUnitHeldPost94Selection(context, post94DeclarationPath);
+  assertInputs();
+  await assertMoneyUnitHeldConvertCurrent(context);
+  assertInputs();
+  await assertMoneyUnitHeldPost94SelectionOrigin(selection, context);
+  assertInputs();
+  const normalWorkerModePreparation = await readMoneyUnitHeldNormalWorkerModePreparation(
+    context,
+    normalWorkerSelectorPath,
+  );
+  assertInputs();
+  await assertMoneyUnitHeldConvertCurrent(context);
+  assertInputs();
+  await assertMoneyUnitHeldPost94SelectionOrigin(selection, context);
+  assertInputs();
+  await assertMoneyUnitHeldNormalWorkerModePreparationCurrent(normalWorkerModePreparation, context);
+  assertInputs();
+  return Object.freeze({ context, selection, normalWorkerModePreparation });
+}
+
 export interface MoneyUnitResumeReadRequest {
   readonly selectedTarget: DeployTarget;
   readonly declarationPath: string;
