@@ -150,14 +150,35 @@ export function resourcesPage(organizationId: string): Child {
     if (!operationSettled(current)) {
       return h(
         "div",
-        { class: "notice" },
-        following()
-          ? tr("処理中です。自動で確認しています。", "In progress. Checking automatically.")
-          : tr(
-              "まだ完了していません。「再読み込み」で確認してください。",
-              "Not complete yet. Use Reload to check again.",
-            ),
-        raw,
+        { class: "notice", style: { display: "grid", gap: "6px" } },
+        h(
+          "span",
+          null,
+          following()
+            ? tr("処理中です。自動で確認しています。", "In progress. Checking automatically.")
+            : tr(
+                "まだ完了していません。「再読み込み」で確認してください。",
+                "Not complete yet. Use Reload to check again.",
+              ),
+          raw,
+        ),
+        // What the Host says while it retries, and where the Resource says more.
+        current.error && !following()
+          ? h(
+              "span",
+              null,
+              text(
+                `${tr("Hostの最新の応答：", "The Host's latest answer: ")}${current.error.message} `,
+              ),
+              h("span", { class: "mono dim" }, `(${current.error.code})`),
+              " ",
+              h(
+                "a",
+                { ...linkProps(resourcePath(current.resourceUid)) },
+                tr("リソースを開く", "Open the Resource"),
+              ),
+            )
+          : null,
       );
     }
     if (current.status === "failed") {
