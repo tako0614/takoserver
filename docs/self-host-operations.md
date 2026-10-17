@@ -908,11 +908,15 @@ it stopped:
   unique within the Space across all Forms. Because the helper derives each
   key from the name, fix the cause and create the whole chain again under new
   names, for example with `-2` appended to each name. Delete the old Resources
-  with step 13 once nothing references them.
+  with step 13 once nothing references them; a Resource whose Operation is
+  still `reconciling` cannot be deleted (`409 resource_busy`).
 
 A WorkerVersion, Deployment or Endpoint Operation that cannot finish stays
 `reconciling` and retries; it writes nothing to the Host's output, so the
-`error` the helper prints is the only diagnostic.
+`error` the helper prints is the only diagnostic. For a WorkerVersion whose code
+the Host refused, that `error` is only `outcome_unconfirmed`;
+[When a new version does not work](#when-a-new-version-does-not-work) lists the
+usual causes.
 
 Keep this order. An Endpoint requested before its Worker's Deployment has
 succeeded is refused with `409 dependency_conflict` (its `detail` names the
@@ -1104,10 +1108,12 @@ wait_operation "$(printf '%s' "$updated" | jq -r .id)" hello-deployment-v2
 Once that succeeds, the Endpoint serves the new code at the same address:
 
 ```sh
-curl -sS "https://$NAME/"
+curl -sS -w '%{http_code}\n' "https://$NAME/"
 ```
 
-It answers `hello from takoserver v2`.
+It answers `hello from takoserver v2`, then the status, `200`. If the create
+stays `reconciling` or the status is `500`, see
+[When a new version does not work](#when-a-new-version-does-not-work).
 
 In the console, create `hello-bundle-v2` from `$WORK/hello-v2.json` as in
 step 8. Then open `hello-version-v1` and choose **New version from this one**:
@@ -1129,6 +1135,65 @@ real Host and workerd processes, apart from recording the Deployment on the
 Worker, and ships v2 by seeding through the same command;
 [the ordinary journey native test](#ordinary-journey-native-test-and-known-gaps)
 describes its scope and limits.
+
+#### When a new version does not work
+
+Shipping never touches the version that serves: until the Deployment's `PUT`
+succeeds, the earlier version keeps answering, and **To go back** returns to
+it afterwards. A broken version shows itself in one of these ways:
+
+- **Its create stays `reconciling`**, and after two minutes the helper prints
+  `still {"status":"reconciling","error":{"code":"outcome_unconfirmed",…}}`.
+  The Host checks a WorkerVersion's code before the version can serve, and this
+  is usually that check refusing it: a syntax error, an import that does not
+  resolve, an exception at the module's top level or top-level work that runs
+  past a two-second limit, which also counts the runtime's start-up, or
+  `handlers` that is not exactly the list of handlers its default export
+  defines. A Binding or assets that the Host cannot use yet look the same. The
+  Host does not say which. It keeps retrying, and refuses to delete
+  the version while it retries (`409 resource_busy`), so the version, and the
+  Worker and bundle it names, stay. While it retries, the Worker's same-spec
+  update (**Record the Deployment**) is refused with `409 dependency_conflict`;
+  new versions and the Deployment's `PUT` still work. About ten minutes later,
+  and from then on, the readiness probe reports `degraded`. Check the code
+  before creating its version:
+  `bun build "$WORK/hello/v2/worker.js" --outdir "$(mktemp -d)"` reports syntax
+  errors and imports that do not resolve. Then ship the fix under new names, such
+  as `hello-bundle-v2-2` and `hello-version-v2-2`. If a Binding or assets were
+  the cause, making them available may let the retry finish by itself. (A Host
+  that cannot run the check at all leaves its versions `reconciling` too, and
+  they settle once it can; see
+  [the native test's notes](#ordinary-journey-native-test-and-known-gaps).)
+- **It serves, but answers an empty `500`**: the code threw.
+  `curl -sS -w '%{http_code}\n'` shows the status, which a bare `curl -sS` does
+  not print. The version, its Deployment and its Endpoint still show Ready, and
+  the console's overview still says **Serving**: they report that the Worker is
+  published, not that its responses succeed.
+- **A queue consumer throws**: its batch is retried, at least
+  `retryDelaySeconds` apart, until each message has been delivered
+  `maxRetries` + 1 times. Then the message is deleted, or moved to the
+  consumer's `deadLetterQueue`, an `AtLeastOnceQueue` its spec may name.
+  Nothing records the loss.
+
+The Host keeps no Worker logs. What a Worker writes with `console.log` or
+`console.error`, and the errors it throws, are discarded, not written to the
+journal. While you debug, catch the error and return it, where `handle` is your
+own handler:
+
+```js
+export default {
+  async fetch(request, env) {
+    try {
+      return await handle(request, env);
+    } catch (error) {
+      return new Response(String(error?.stack ?? error), { status: 500 });
+    }
+  }
+};
+```
+
+Remove it before the Worker is public: an error can carry details that are not
+meant to be shown.
 
 ### 11. Bind a SQLite database
 
@@ -1231,8 +1296,10 @@ a database: through a Binding in its WorkerVersion. `kvBindings` name an
 `{name, resource: {resourceUid}}`. A Binding name is up to 64 ASCII letters,
 digits, `_` and `$`, not starting with a digit, such as `NOTES` (no `-`), and
 no var, secret or other Binding of the version may share it. To read a queue,
-a `QueueConsumer` names the queue and the Worker, and the Worker's code exports
-a `queue` handler. The published Forms define each spec:
+a `QueueConsumer` names the queue and the Worker, the Worker's code exports a
+`queue` handler, and the version's `handlers` lists exactly the handlers that
+code's default export defines, here `fetch` and `queue`. The published Forms
+define each spec:
 [EdgeKVNamespace 0.2.0](https://edge.forms.takoform.com/forms/EdgeKVNamespace/0.2.0/),
 [ObjectBucket 0.2.0](https://edge.forms.takoform.com/forms/ObjectBucket/0.2.0/),
 [AtLeastOnceQueue 0.2.0](https://edge.forms.takoform.com/forms/AtLeastOnceQueue/0.2.0/)
@@ -1325,7 +1392,9 @@ curl -sS "https://$NAME/"
 
 The first answers `saved and queued`. The second shows `saved: first`, and
 `consumed: first` once the consumer has run, within a few seconds of the batch
-timeout; ask again while it still says `nothing`.
+timeout; ask again while it still says `nothing`. If it still does after a
+minute, the consumer is probably throwing, and a message whose retries ran out
+is gone; see [When a new version does not work](#when-a-new-version-does-not-work).
 
 These Bindings follow the Takoform interfaces `edge.kv`, `edge.objects` and
 `edge.queue`, not Cloudflare's, and code written for Cloudflare's breaks where
