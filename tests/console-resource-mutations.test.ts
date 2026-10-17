@@ -1,5 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import type { ResourceSummary } from "../console/src/api.ts";
+import { valueAt } from "../console/src/form-specs.ts";
 
 class TestNode {
   readonly children: TestNode[] = [];
@@ -166,6 +167,51 @@ async function setup(path = "/resources") {
   body.append(mountToasts() as unknown as TestNode);
   return { body, route, selectOrganization, principal };
 }
+
+test("a refused create says why in the dialog, and how to change the request", async () => {
+  const { body } = await setup();
+  const { createResource } = await import("../console/src/pages/create-resource.ts");
+  const posts: Request[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const url = new URL(request.url);
+      if (url.pathname.endsWith("/support"))
+        return Response.json({ form, supported: true, operations: ["create"] });
+      if (url.pathname === "/.well-known/takoform/v2") return Response.json(discovery);
+      if (request.method === "POST") {
+        posts.push(request);
+        return new Response(
+          JSON.stringify({
+            type: "about:blank",
+            title: "Conflict",
+            status: 409,
+            code: "name_conflict",
+          }),
+          { status: 409, headers: { "content-type": "application/problem+json" } },
+        );
+      }
+      return Response.json({ items: [], nextCursor: null });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  createResource("org-console");
+  await settle();
+  const inputs = body.all().filter((node) => node.tag === "input");
+  if (!inputs[0] || !inputs[1]) throw new Error("create inputs missing");
+  inputs[0].value = form;
+  inputs[1].value = "one";
+  inputs[1].emit("input");
+  button(body, "Accept create").click();
+  await settle();
+  expect(posts).toHaveLength(1);
+  // Said in the dialog, where it stays until the next attempt, not in a passing toast.
+  const alert = body.all().find((node) => node.attributes.get("role") === "alert");
+  expect(alert?.textContent).toContain(
+    "Another Resource in this organization already has that name, whatever its Form.",
+  );
+  expect(alert?.textContent).toContain("To change the request, cancel and open the dialog again.");
+});
 
 test("accepted create is not shown as complete and checking it never re-sends", async () => {
   const { body, route } = await setup();
@@ -829,7 +875,12 @@ async function detailPage(
       if (url.pathname.endsWith(`/resources/${uid}`)) return Response.json(shown());
       if (url.pathname.endsWith("/resources")) {
         const form = url.searchParams.get("form");
-        const items = form === deploymentForm ? deployments : form === null ? listed : [];
+        const items =
+          form === deploymentForm
+            ? deployments
+            : form === null
+              ? listed
+              : listed.filter((item) => item.form === form);
         return Response.json({ items, nextCursor: null });
       }
       return Response.json({ error: { code: "not_found" } }, { status: 404 });
@@ -1110,6 +1161,159 @@ test("a Worker that still names an earlier Deployment is out of date too", async
   button(body, "Record the Deployment");
 });
 
+test("a version's page starts the next version from it, with its code left to choose", async () => {
+  const withCode: ResourceSummary = {
+    ...helloV2,
+    spec: {
+      worker: { resourceUid: "uid-worker" },
+      bundle: { resourceUid: "uid-bundle" },
+      handlers: ["fetch"],
+      sqliteBindings: [{ name: "DB", resource: { resourceUid: "uid-db" } }],
+    },
+  };
+  const { body, writes } = await versionPage([], withCode);
+  // A version cannot be changed; its same spec can only be sent again.
+  expect(body.all().some((node) => node.tag === "button" && node.textContent === "Update")).toBe(
+    false,
+  );
+  button(body, "New version from this one").click();
+  await settle();
+  expect(body.textContent).toContain(
+    "A version cannot be changed, so this creates a new one from hello-v2's spec, with its handlers, vars and Bindings.",
+  );
+  const [form] = body.all().filter((node) => node.tag === "select");
+  expect(form?.value).toBe(versionForm);
+  const spec = body.all().find((node) => node.tag === "textarea");
+  expect(JSON.parse(spec?.value ?? "{}")).toEqual({
+    worker: { resourceUid: "uid-worker" },
+    bundle: { resourceUid: "" },
+    handlers: ["fetch"],
+    sqliteBindings: [{ name: "DB", resource: { resourceUid: "uid-db" } }],
+  });
+  // The copy is the Console's own writing, not the smallest spec of the Form.
+  expect(body.textContent).toContain("Fill in the empty values.");
+  expect(body.textContent).not.toContain("The smallest spec");
+  expect(writes).toHaveLength(0);
+});
+
+test("choosing the next version's code keeps it described as the copy it is", async () => {
+  const withCode: ResourceSummary = {
+    ...helloV2,
+    spec: {
+      worker: { resourceUid: "uid-worker" },
+      bundle: { resourceUid: "uid-bundle" },
+      handlers: ["fetch"],
+    },
+  };
+  const bundleV2 = resourceAt(
+    "uid-bundle-v2",
+    "hello-bundle-v2",
+    "https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/",
+    {
+      artifact: { url: "https://artifacts.example.test/v2/manifest.json", sha256: "a".repeat(64) },
+    },
+  );
+  const { body } = await detailPage(() => withCode, [], [bundleV2]);
+  button(body, "New version from this one").click();
+  await settle();
+  const choice = body
+    .all()
+    .find(
+      (node) =>
+        node.tag === "select" && node.all().some((option) => option.value === "uid-bundle-v2"),
+    );
+  if (!choice) throw new Error("no code bundle choice");
+  choice.value = "uid-bundle-v2";
+  choice.emit("change");
+  await settle();
+  const spec = body.all().find((node) => node.tag === "textarea");
+  expect(valueAt(JSON.parse(spec?.value ?? "{}"), ["bundle", "resourceUid"])).toBe("uid-bundle-v2");
+  expect(body.textContent).not.toContain("The smallest spec");
+  expect(body.textContent).not.toContain("Fill in the empty values.");
+});
+
+test("a version keeps its assets in the next one, and only its code bundle is chosen again", async () => {
+  const assets = {
+    bundle: { resourceUid: "uid-assets" },
+    runWorkerFirst: false,
+    notFoundHandling: "none",
+  };
+  const both = await versionPage([], {
+    ...helloV2,
+    spec: {
+      worker: { resourceUid: "uid-worker" },
+      bundle: { resourceUid: "uid-bundle" },
+      handlers: ["fetch"],
+      assets,
+    },
+  });
+  button(both.body, "New version from this one").click();
+  await settle();
+  const spec = both.body.all().find((node) => node.tag === "textarea");
+  expect(JSON.parse(spec?.value ?? "{}")).toEqual({
+    worker: { resourceUid: "uid-worker" },
+    bundle: { resourceUid: "" },
+    handlers: ["fetch"],
+    assets,
+  });
+  // A static-site version has no code bundle: it is told where its new files go.
+  const site = await versionPage([], {
+    ...helloV2,
+    spec: { worker: { resourceUid: "uid-worker" }, handlers: [], assets },
+  });
+  button(site.body, "New version from this one").click();
+  await settle();
+  expect(site.body.textContent).toContain(
+    "Write the new StaticAssetBundle's UID in assets.bundle, name it, then accept",
+  );
+  // Its spec has no code bundle, so none is offered to choose.
+  expect(site.body.textContent).not.toContain("bundle — WorkerBundle");
+});
+
+test("a version that needs secret values is not copied in the console", async () => {
+  const { body } = await versionPage([], {
+    ...helloV2,
+    spec: {
+      worker: { resourceUid: "uid-worker" },
+      bundle: { resourceUid: "uid-bundle" },
+      handlers: ["fetch"],
+      requiredSensitiveVars: ["API_TOKEN"],
+    },
+  });
+  expect(body.textContent).toContain(
+    "This version needs secret values, which the console cannot send; create the next version over the API with privateInputs.",
+  );
+  expect(
+    body
+      .all()
+      .some((node) => node.tag === "button" && node.textContent === "New version from this one"),
+  ).toBe(false);
+});
+
+test("a version can be sent again with its same spec, to retry it", async () => {
+  const { body, writes } = await versionPage([]);
+  button(body, "Re-apply").click();
+  await settle();
+  expect(body.textContent).toContain(
+    "A Resource of this Form cannot change. Sending the same spec again retries it, for example after its create failed.",
+  );
+  button(body, "Accept update").click();
+  await settle();
+  const [update] = writes;
+  expect(update?.method).toBe("PUT");
+  expect(JSON.parse(await (update as Request).text())).toEqual({ spec: helloV2.spec });
+});
+
+test("a Resource that can change keeps its Update", async () => {
+  const { body } = await detailPage(() => servingDeployment, [servingDeployment]);
+  button(body, "Update");
+  expect(
+    body
+      .all()
+      .some((node) => node.tag === "button" && node.textContent === "New version from this one"),
+  ).toBe(false);
+});
+
 test("a Deployment serves one version only when its single entry is that version at 10000", async () => {
   const { servesOnly } = await import("../console/src/pages/resource-detail.ts");
   expect(servesOnly([{ weight: 10000, workerVersion: { resourceUid: "v" } }], "v")).toBe(true);
@@ -1346,13 +1550,21 @@ test("a Form the Host did not answer for is marked, and typing a URL stays a pla
   ).toBe(false);
 });
 
-test("delete requires explicit confirmation and retains the UID/generation fence", async () => {
+/**
+ * The delete dialog for `one`, against a Host whose full list is `listed`, read
+ * afresh on every request; `more` makes every page say another follows.
+ */
+async function deleteDialog(listed: ResourceSummary[] | null, more = false) {
   const { body, route } = await setup();
   const { deleteResource } = await import("../console/src/pages/create-resource.ts");
   const seen: Request[] = [];
   globalThis.fetch = Object.assign(
     async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
+      if (request.method === "GET" && new URL(request.url).pathname.endsWith("/resources"))
+        return listed === null
+          ? Response.json({ error: { code: "unavailable" } }, { status: 503 })
+          : Response.json({ items: listed, nextCursor: more ? "next" : null });
       if (request.method === "GET") return Response.json(discovery);
       seen.push(request);
       return Response.json({ ...op, action: "delete", generation: 2 }, { status: 202 });
@@ -1360,8 +1572,14 @@ test("delete requires explicit confirmation and retains the UID/generation fence
     { preconnect: globalThis.fetch.preconnect },
   );
   deleteResource("org-console", one);
+  return { body, route, seen };
+}
+
+test("delete requires explicit confirmation and retains the UID/generation fence", async () => {
+  const { body, route, seen } = await deleteDialog([one, two]);
   expect(seen).toHaveLength(0);
   expect(body.textContent).toContain("cannot be undone");
+  await settle();
   button(body, "Delete resource").click();
   await settle();
   expect(seen).toHaveLength(1);
@@ -1371,6 +1589,66 @@ test("delete requires explicit confirmation and retains the UID/generation fence
     "/apis/forms.takoform.com/v2/resources/uid-one",
   );
   expect(route().query.get("operation")).toBe(op.id);
+});
+
+test("delete lists what still names the Resource and is not offered until nothing does", async () => {
+  const naming = { ...two, name: "names-one", spec: { target: { resourceUid: "uid-one" } } };
+  const { body, seen } = await deleteDialog([one, naming]);
+  // Until the check answers, the delete is not offered either.
+  expect(button(body, "Delete resource").disabled).toBe(true);
+  await settle();
+  expect(body.textContent).toContain(
+    "The Host refuses this delete while these still name it. Change them so they no longer name it, or delete them first.",
+  );
+  const link = body.all().find((node) => node.tag === "a" && node.textContent === "names-one");
+  expect(link?.attributes.get("href")).toBe("/resources/uid-two");
+  expect(button(body, "Delete resource").disabled).toBe(true);
+  button(body, "Delete resource").click();
+  await settle();
+  expect(seen).toHaveLength(0);
+});
+
+test("delete checks again on request, and marks a referrer being deleted", async () => {
+  const naming = {
+    ...two,
+    name: "names-one",
+    phase: "deleting" as const,
+    spec: { target: { resourceUid: "uid-one" } },
+  };
+  const listed: ResourceSummary[] = [one, naming];
+  const { body, seen } = await deleteDialog(listed);
+  await settle();
+  expect(body.textContent).toContain(
+    "names-one https://forms.example.test/Widget/1.0.0 (being deleted)",
+  );
+  expect(button(body, "Delete resource").disabled).toBe(true);
+  // Its delete finished; the dialog reads the list again only when asked.
+  listed.splice(1, 1);
+  button(body, "Check again").click();
+  await settle();
+  expect(body.textContent).not.toContain("still name it");
+  expect(button(body, "Delete resource").disabled).toBe(false);
+  expect(seen).toHaveLength(0);
+});
+
+test("delete that could not read every page says so and stays offered", async () => {
+  const { body } = await deleteDialog([one], true);
+  await settle();
+  expect(body.textContent).toContain(
+    "Not everything that might name this Resource could be checked. If another still names it, the Host refuses the delete.",
+  );
+  expect(button(body, "Delete resource").disabled).toBe(false);
+});
+
+test("delete that could not check what names the Resource says so and stays offered", async () => {
+  const { body, seen } = await deleteDialog(null);
+  await settle();
+  expect(body.textContent).toContain(
+    "Couldn't check what names this Resource. If another still names it, the Host refuses the delete.",
+  );
+  button(body, "Delete resource").click();
+  await settle();
+  expect(seen).toHaveLength(1);
 });
 
 test("update uses the observed UID and generation rather than a name-based path", async () => {

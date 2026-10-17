@@ -1,5 +1,5 @@
 import { ApiError, type ResourceSummary } from "../api.ts";
-import { h } from "../dom.ts";
+import { type Child, h, live } from "../dom.ts";
 import {
   blankPaths,
   pathLabel,
@@ -12,6 +12,8 @@ import {
 } from "../form-specs.ts";
 import { formLabel, KNOWN_FORM_GROUPS } from "../forms.ts";
 import { tr } from "../i18n.ts";
+import { resource, signal } from "../reactive.ts";
+import { findReferrers } from "../referrers.ts";
 import {
   isUnknownAcceptance,
   prepareResourceIntent,
@@ -19,7 +21,8 @@ import {
   resourceIntentRequestBody,
   sendResourceIntent,
 } from "../resource-intent.ts";
-import { navigate } from "../router.ts";
+import { health } from "../resource-state.ts";
+import { linkProps, navigate, resourcePath } from "../router.ts";
 import { api, currentOrganization } from "../state.ts";
 import { copyable, explain, openModal, toast } from "../ui.ts";
 
@@ -95,7 +98,51 @@ function requestDisclosure(details: HTMLElement): HTMLElement {
   );
 }
 
-async function submit(intent: ResourceIntent, close: () => void): Promise<void> {
+/**
+ * Where a dialog says why its request was refused, until the next attempt.
+ * A sent request stays as it was, so the same dialog retries it exactly;
+ * changing it takes a new dialog, and a new key.
+ */
+function refusalNotice(): {
+  readonly element: Child;
+  show(error: unknown, sent: boolean): void;
+  clear(): void;
+} {
+  const shown = signal<{ readonly message: string; readonly sent: boolean } | null>(null);
+  return {
+    element: live(() => {
+      const refusal = shown();
+      if (!refusal) return null;
+      return h(
+        "div",
+        { class: "notice notice--bad", role: "alert", style: { display: "grid", gap: "6px" } },
+        h("span", null, refusal.message),
+        refusal.sent
+          ? h(
+              "span",
+              null,
+              tr(
+                "内容を変えるには、キャンセルしてダイアログを開き直してください。",
+                "To change the request, cancel and open the dialog again.",
+              ),
+            )
+          : null,
+      );
+    }),
+    show(error, sent) {
+      shown.set({ message: explain(error as Error), sent });
+    },
+    clear() {
+      shown.set(null);
+    },
+  };
+}
+
+async function submit(
+  intent: ResourceIntent,
+  close: () => void,
+  refused: (error: unknown) => void = (error) => toast(explain(error as Error), "bad"),
+): Promise<void> {
   try {
     const accepted = await sendResourceIntent(intent.id);
     close();
@@ -113,7 +160,7 @@ async function submit(intent: ResourceIntent, close: () => void): Promise<void> 
         navigate(`/resources?acceptance=unknown&intent=${encodeURIComponent(intent.id)}`);
       return;
     }
-    toast(explain(error as Error), "bad");
+    refused(error);
   }
 }
 
@@ -457,6 +504,8 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
   // chosen Form; an edited one is never overwritten, only offered the starter.
   let starter: StarterSpec | null = null;
   let untouched = "{}";
+  // What a preset wrote: a whole spec of its own, not this Form's starter.
+  let presetText: string | null = null;
   let chosen = "";
   // The starter's own empty places that the spec still leaves empty.
   const remainingBlanks = (parsed: Record<string, unknown> | null): (string | number)[][] =>
@@ -512,6 +561,14 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
           ]
         : []),
     );
+    if (spec.value === presetText) {
+      specHint.replaceChildren(
+        remainingBlanks(jsonSpec(spec.value)).length > 0
+          ? tr("空の値を埋めてください。", "Fill in the empty values.")
+          : "",
+      );
+      return;
+    }
     if (spec.value !== untouched) {
       specHint.replaceChildren(
         remainingBlanks(jsonSpec(spec.value)).length > 0
@@ -565,11 +622,20 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
       }
       write(JSON.stringify(next, null, 2));
     }
+    // A preset of this Form may leave out a place its starter names, such as
+    // a static-site version's code bundle; that place is not offered.
+    const slots = (starter?.references ?? []).filter(
+      (slot) =>
+        !preset || preset.form !== selected || valueAt(preset.spec, slot.path) !== undefined,
+    );
     picker =
-      starter && starter.references.length > 0
-        ? referencePicker(organizationId, starter.references, spec, (text) => {
-            // A chosen Resource is the Console's own writing, like the starter.
+      slots.length > 0
+        ? referencePicker(organizationId, slots, spec, (text) => {
+            // A chosen Resource is the Console's own writing, like the starter;
+            // a preset written so stays a preset.
+            const fromPreset = spec.value === presetText;
             write(text);
+            if (fromPreset) presetText = text;
             showDetails();
             picker?.sync();
             describeStarter();
@@ -608,11 +674,13 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
     form.choose(preset.form);
     // The preset is the Console's own writing, like a starter.
     write(JSON.stringify(preset.spec, null, 2));
+    presetText = spec.value;
     syncReferences();
     describeStarter();
   }
   showDetails();
   let intent: ResourceIntent | null = null;
+  const refusal = refusalNotice();
   const close = openModal({
     title: tr("リソースを作成", "New resource"),
     confirmLabel: tr("受け付ける", "Accept create"),
@@ -643,9 +711,11 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
         artifactHint,
       ),
       requestDisclosure(details),
+      refusal.element,
     ),
     onConfirm: async () => {
       if (!sameOrganization(organizationId)) return;
+      refusal.clear();
       if (!intent) {
         const selectedForm = form.value();
         const selectedName = name.value.trim();
@@ -714,11 +784,11 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
           name.disabled = false;
           spec.disabled = false;
           picker?.setDisabled(false);
-          toast(explain(error as Error), "bad");
+          refusal.show(error, false);
           return;
         }
       }
-      await submit(intent, close);
+      await submit(intent, close, (error) => refusal.show(error, true));
     },
   });
 }
@@ -759,6 +829,7 @@ export function updateResource(
   spec.addEventListener("input", showDetails);
   showDetails();
   let intent: ResourceIntent | null = null;
+  const refusal = refusalNotice();
   const close = openModal({
     title: tr(`${resource.name}を更新`, `Update ${resource.name}`),
     confirmLabel: tr("更新を受け付ける", "Accept update"),
@@ -769,9 +840,11 @@ export function updateResource(
       h("label", null, tr("設定 (JSON)", "Spec (JSON)")),
       spec,
       requestDisclosure(details),
+      refusal.element,
     ),
     onConfirm: async () => {
       if (!sameOrganization(organizationId)) return;
+      refusal.clear();
       if (!intent) {
         const parsed = jsonSpec(spec.value);
         if (!parsed) {
@@ -800,24 +873,51 @@ export function updateResource(
           );
         } catch (error) {
           spec.disabled = false;
-          toast(explain(error as Error), "bad");
+          refusal.show(error, false);
           return;
         }
       }
-      await submit(intent, close);
+      await submit(intent, close, (error) => refusal.show(error, true));
     },
   });
 }
 
-/** Destructive delete requires a separate explicit confirmation. */
-export function deleteResource(organizationId: string, resource: ResourceSummary): void {
+/**
+ * A link out of a dialog: it navigates as any link does, and closes the dialog
+ * only when it navigates here, not when it opens a new tab.
+ */
+function openFromDialog(href: string, close: () => void): Record<string, unknown> {
+  const link = linkProps(href);
+  const follow = link.onClick as (event: MouseEvent) => void;
+  return {
+    ...link,
+    onClick: (event: MouseEvent) => {
+      follow(event);
+      if (event.defaultPrevented) close();
+    },
+  };
+}
+
+/**
+ * Deleting, confirmed separately: what the Host removes, and first what still
+ * names this Resource. The Host refuses to delete a Resource another still
+ * names, so while any does, the dialog lists them and the delete is not
+ * offered.
+ */
+export function deleteResource(organizationId: string, target: ResourceSummary): void {
   const key = `console-delete-${crypto.randomUUID()}`;
-  const path = `/apis/forms.takoform.com/v2/resources/${encodeURIComponent(resource.uid)}`;
+  const path = `/apis/forms.takoform.com/v2/resources/${encodeURIComponent(target.uid)}`;
+  const naming = resource(() => findReferrers(organizationId, target.uid));
+  const blocking = (): readonly ResourceSummary[] => {
+    const state = naming.get();
+    return state.state === "ready" ? state.value.referrers.map((entry) => entry.resource) : [];
+  };
   let intent: ResourceIntent | null = null;
   const close = openModal({
-    title: tr(`${resource.name}を削除しますか？`, `Delete ${resource.name}?`),
+    title: tr(`${target.name}を削除しますか？`, `Delete ${target.name}?`),
     confirmLabel: tr("リソースを削除", "Delete resource"),
     confirmTone: "danger",
+    confirmBlocked: () => naming.get().state === "loading" || blocking().length > 0,
     body: h(
       "div",
       { style: { display: "grid", gap: "14px" } },
@@ -825,11 +925,83 @@ export function deleteResource(organizationId: string, resource: ResourceSummary
         "div",
         { class: "notice notice--bad" },
         tr(
-          "実体と保存されているデータが削除されます。この操作は元に戻せません。",
-          "The backend resource and its data may be destroyed. This cannot be undone.",
+          "Hostはこのリソースと、そのために動かしているものを削除します。データベースならデータが失われ、Endpointのホスト名は配信を停止します。この操作は元に戻せません。",
+          "The Host deletes this Resource and what it runs for it: a database's data is deleted, and an Endpoint's hostname stops serving. This cannot be undone.",
         ),
       ),
-      requestDisclosure(recoveryDetails(key, "DELETE", path, null, resource.generation)),
+      live(() => {
+        const state = naming.get();
+        if (state.state === "loading")
+          return h(
+            "small",
+            null,
+            tr(
+              "このリソースを参照しているものを確認しています…",
+              "Checking what names this Resource…",
+            ),
+          );
+        if (state.state === "error")
+          return h(
+            "small",
+            null,
+            tr(
+              "このリソースを参照しているものを確認できませんでした。まだ参照しているリソースがあれば、Hostは削除を受け付けません。",
+              "Couldn't check what names this Resource. If another still names it, the Host refuses the delete.",
+            ),
+          );
+        const { referrers, complete } = state.value;
+        if (referrers.length === 0)
+          return complete
+            ? null
+            : h(
+                "small",
+                null,
+                tr(
+                  "参照しているリソースをすべては確認できませんでした。まだ参照しているリソースがあれば、Hostは削除を受け付けません。",
+                  "Not everything that might name this Resource could be checked. If another still names it, the Host refuses the delete.",
+                ),
+              );
+        return h(
+          "div",
+          { class: "notice notice--warn", style: { display: "grid", gap: "8px" } },
+          h(
+            "span",
+            null,
+            tr(
+              "次のリソースがまだこのリソースを参照しているため、Hostは削除を受け付けません。参照しないよう変更するか、先に削除してください。",
+              "The Host refuses this delete while these still name it. Change them so they no longer name it, or delete them first.",
+            ),
+          ),
+          h(
+            "ul",
+            { style: { margin: "0", paddingLeft: "18px" } },
+            ...referrers.map(({ resource: referrer }) =>
+              h(
+                "li",
+                null,
+                h(
+                  "a",
+                  { class: "mono", ...openFromDialog(resourcePath(referrer.uid), () => close()) },
+                  referrer.name,
+                ),
+                ` ${formLabel(referrer.form)}`,
+                health(referrer).phase === "Deleting" ? tr("（削除中）", " (being deleted)") : "",
+              ),
+            ),
+          ),
+          // The dialog does not watch them, so a change made meanwhile is read on request.
+          h(
+            "div",
+            null,
+            h(
+              "button",
+              { class: "btn", type: "button", onClick: () => naming.reload() },
+              tr("もう一度確認する", "Check again"),
+            ),
+          ),
+        );
+      }),
+      requestDisclosure(recoveryDetails(key, "DELETE", path, null, target.generation)),
     ),
     onConfirm: async () => {
       if (!sameOrganization(organizationId)) return;
@@ -839,7 +1011,7 @@ export function deleteResource(organizationId: string, resource: ResourceSummary
           if (!sameOrganization(organizationId)) return;
           intent = prepareResourceIntent(
             organizationId,
-            { action: "delete", uid: resource.uid, generation: resource.generation },
+            { action: "delete", uid: target.uid, generation: target.generation },
             replayWindowSeconds,
             key,
           );

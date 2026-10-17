@@ -1,7 +1,13 @@
 import type { ResourceSummary } from "../api.ts";
 import { ApiError } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
-import { valueAt, WORKER_DEPLOYMENT, WORKER_VERSION } from "../form-specs.ts";
+import {
+  acceptsChanges,
+  valueAt,
+  WORKER_DEPLOYMENT,
+  WORKER_VERSION,
+  withValueAt,
+} from "../form-specs.ts";
 import { formLabel } from "../forms.ts";
 import { tr } from "../i18n.ts";
 import { resource } from "../reactive.ts";
@@ -13,6 +19,7 @@ import {
   WORKER_CRON_TRIGGER,
   WORKER_ENDPOINT,
 } from "../references.ts";
+import { findReferrers, REFERRER_PAGES } from "../referrers.ts";
 import { health, phaseLabel, unrecordedDeployment } from "../resource-state.ts";
 import { linkProps, resourcePath, route } from "../router.ts";
 import { api, currentOrganization } from "../state.ts";
@@ -20,46 +27,7 @@ import { badge, card, copyable, empty, ICON, icon, jsonBlock, whenReady } from "
 import { createResource, deleteResource, updateResource } from "./create-resource.ts";
 
 export { publishedUrl, type SpecReference, specReferences } from "../references.ts";
-
-/** How many list pages are read to find what names a Resource. */
-const REFERRER_PAGES = 5;
-
-export interface Referrer {
-  readonly resource: ResourceSummary;
-  /** Where its spec names the Resource being shown. */
-  readonly paths: readonly string[];
-}
-
-/**
- * The Resources whose specs name `uid`, from the organization's list. Only
- * the first pages are read, so `complete` says whether the answer covers
- * every Resource and `checked` how many it looked at.
- */
-export async function findReferrers(
-  organizationId: string,
-  uid: string,
-): Promise<{
-  readonly referrers: readonly Referrer[];
-  readonly complete: boolean;
-  readonly checked: number;
-}> {
-  const referrers: Referrer[] = [];
-  let cursor: string | null = null;
-  let checked = 0;
-  for (let page = 0; page < REFERRER_PAGES; page += 1) {
-    const read = await api.resources(organizationId, cursor ? { cursor } : {});
-    checked += read.resources.length;
-    for (const resource of read.resources) {
-      const paths = specReferences(resource.spec)
-        .filter((reference) => reference.uid === uid)
-        .map((reference) => reference.path);
-      if (paths.length > 0 && resource.uid !== uid) referrers.push({ resource, paths });
-    }
-    cursor = read.cursor;
-    if (cursor === null) return { referrers, complete: true, checked };
-  }
-  return { referrers, complete: false, checked };
-}
+export { findReferrers, type Referrer } from "../referrers.ts";
 
 /** The v2 address is the durable UID, never a reconstructed kind/name tuple. */
 export function resourceDetailPage(organizationId: string, uid: string): Child {
@@ -72,7 +40,13 @@ export function resourceDetailPage(organizationId: string, uid: string): Child {
         for: found,
         action:
           found.form === WORKER_VERSION
-            ? { toolbar: serveVersionAction(organizationId, found), notice: null }
+            ? {
+                toolbar: [
+                  serveVersionAction(organizationId, found),
+                  newVersionAction(organizationId, found),
+                ],
+                notice: null,
+              }
             : MODULE_WORKER.test(found.form)
               ? { toolbar: null, notice: recordDeploymentNotice(organizationId, found) }
               : { toolbar: null, notice: null },
@@ -211,10 +185,25 @@ function body(
           icon(ICON.refresh, 14),
           text(tr("再読み込み", "Reload")),
         ),
+        // A version or an artifact never changes; sending its same spec again
+        // still retries it, for example after its create failed.
         h(
           "button",
-          { class: "btn", type: "button", onClick: () => updateResource(organizationId, found) },
-          tr("更新", "Update"),
+          {
+            class: "btn",
+            type: "button",
+            onClick: () =>
+              acceptsChanges(found.form)
+                ? updateResource(organizationId, found)
+                : updateResource(organizationId, found, {
+                    spec: found.spec,
+                    note: tr(
+                      "このFormのリソースは変更できません。同じ設定をもう一度送ると、失敗した作成などを再試行できます。",
+                      "A Resource of this Form cannot change. Sending the same spec again retries it, for example after its create failed.",
+                    ),
+                  }),
+          },
+          acceptsChanges(found.form) ? tr("更新", "Update") : tr("再適用", "Re-apply"),
         ),
         h(
           "button",
@@ -448,6 +437,55 @@ function recordDeploymentNotice(organizationId: string, worker: ResourceSummary)
       next,
     );
   });
+}
+
+/** Where a WorkerVersion names its code bundle. */
+const CODE_PATH = ["bundle", "resourceUid"];
+
+/**
+ * On a WorkerVersion's page: start the next version from this one. A version
+ * cannot be changed, so shipping new code means a new version; it keeps this
+ * one's handlers, vars, Bindings and assets, and leaves its code bundle to be
+ * chosen. A version that needs secret values is not offered: the console
+ * cannot send them.
+ */
+function newVersionAction(organizationId: string, version: ResourceSummary): Child {
+  const secrets = valueAt(version.spec, ["requiredSensitiveVars"]);
+  if (Array.isArray(secrets) && secrets.length > 0)
+    return h(
+      "span",
+      { class: "dim" },
+      tr(
+        "この版には秘密の値が必要ですが、コンソールからは送れません。次の版はAPIでprivateInputsを付けて作成してください。",
+        "This version needs secret values, which the console cannot send; create the next version over the API with privateInputs.",
+      ),
+    );
+  const hasCode = valueAt(version.spec, CODE_PATH) !== undefined;
+  const spec = hasCode
+    ? (withValueAt(structuredClone(version.spec), CODE_PATH, "") ?? version.spec)
+    : version.spec;
+  return h(
+    "button",
+    {
+      class: "btn",
+      type: "button",
+      onClick: () =>
+        createResource(organizationId, {
+          form: version.form,
+          spec,
+          note: hasCode
+            ? tr(
+                `版は変更できないため、${version.name}の設定（ハンドラー・変数・Bindingを含む）から新しい版を作成します。新しいコードを選び、名前を付けて受け付けてください。その後、新しい版のページから配信できます。`,
+                `A version cannot be changed, so this creates a new one from ${version.name}'s spec, with its handlers, vars and Bindings. Choose its new code, name it, then accept; you can then serve it from its page.`,
+              )
+            : tr(
+                `版は変更できないため、${version.name}の設定から新しい版を作成します。assets.bundleを新しいStaticAssetBundleのUIDに書き換え、名前を付けて受け付けてください。その後、新しい版のページから配信できます。`,
+                `A version cannot be changed, so this creates a new one from ${version.name}'s spec. Write the new StaticAssetBundle's UID in assets.bundle, name it, then accept; you can then serve it from its page.`,
+              ),
+        }),
+    },
+    tr("この版から新しい版を作る", "New version from this one"),
+  );
 }
 
 /** Whether a Deployment's versions are exactly this one version at weight 10000. */
