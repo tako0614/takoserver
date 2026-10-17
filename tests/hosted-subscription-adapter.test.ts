@@ -1240,11 +1240,7 @@ describe("CANCEL economic preparation DATA across both actual command branches",
             [SUB],
           )
         )[0]?.association_generation;
-        if (
-          typeof generation !== "number" ||
-          !Number.isSafeInteger(generation) ||
-          generation < 0
-        )
+        if (typeof generation !== "number" || !Number.isSafeInteger(generation) || generation < 0)
           throw new Error("invalid original association generation");
         const input = {
           organizationId: ORG,
