@@ -16,13 +16,15 @@ import {
   assertIdentityVerificationCaptureReader,
   type IdentityVerificationCaptureReader,
 } from "./identity-setup.ts";
+import { canonicalDigest } from "./json.ts";
 import {
+  assertMoneyCutoverSqlBackingOrigin,
   assertMoneyCutoverSqlOrigin,
   createMoneyCutoverSql,
   inspectMoneyCutoverGuard,
   type MoneyCutoverGuardState,
 } from "./money-cutover-sql.ts";
-import type { Clock, Sql } from "./ports.ts";
+import type { Clock, Row, Sql } from "./ports.ts";
 import { SHARED_AUTH_STAGING_PROFILE } from "./shared-auth-oidc-client.ts";
 import {
   createSharedAuthSession,
@@ -65,7 +67,16 @@ export interface WorkerRequestSql {
 type WorkerRequestOriginPurpose = "native-primary" | "shared-auth-staging";
 const requestOrigins = new WeakMap<
   WorkerRequestSql,
-  { readonly writerEpoch: string; readonly purpose: WorkerRequestOriginPurpose }
+  {
+    readonly writerEpoch: string;
+    readonly purpose: WorkerRequestOriginPurpose;
+    readonly database: WorkerRequestDatabase;
+    readonly withSession: NonNullable<WorkerRequestDatabase["withSession"]>;
+    readonly session: D1DatabaseLike;
+    readonly prepare: unknown;
+    readonly batch: unknown;
+    readonly rawSql: Sql;
+  }
 >();
 
 /**
@@ -100,12 +111,26 @@ async function constructWorkerPrimaryRequestSql(
     throw new TypeError(`${diagnostic} primary session is unavailable`);
   }
   const rawSql = createD1Sql(nativeSession, { acknowledgement: "explicit-d1-result" });
+  const prepare = dataMethod(nativeSession, "prepare");
+  const batch = dataMethod(nativeSession, "batch");
   const writerEpoch = options.writerEpoch;
   const moneyGuard = await inspectMoneyCutoverGuard(rawSql, writerEpoch);
   const sql = createMoneyCutoverSql(rawSql, writerEpoch);
-  assertMoneyCutoverSqlOrigin(sql, { writerEpoch });
+  assertMoneyCutoverSqlBackingOrigin(sql, { rawSql, writerEpoch });
   const connection = Object.freeze({ sql, moneyGuard });
-  requestOrigins.set(connection, Object.freeze({ writerEpoch, purpose }));
+  requestOrigins.set(
+    connection,
+    Object.freeze({
+      writerEpoch,
+      purpose,
+      database,
+      withSession,
+      session: nativeSession,
+      prepare,
+      batch,
+      rawSql,
+    }),
+  );
   return connection;
 }
 
@@ -235,6 +260,155 @@ export function readWorkerRequestFinancialInputs(
   )
     throw new TypeError("Worker request Financial inputs have not been constructed");
   return inputs;
+}
+
+/**
+ * Metadata read from this request's actual first-primary session. This observes
+ * catalog bytes and required table presence, not canonical Auth103 definitions,
+ * a registered/applied migration, physical D1 UUID, current binding or authority.
+ * No raw Sql, native binding/session, catalog SQL or row value is returned.
+ */
+export interface WorkerRequestAuthSchemaObservation {
+  readonly kind: "worker-request-auth-schema-observation";
+  readonly catalogDigest: `sha256:${string}`;
+  readonly objectCount: number;
+}
+
+const requestAuthSchemaObservations = new WeakMap<
+  WorkerRequestAuthSchemaObservation,
+  WorkerRequestSql
+>();
+
+const authSchemaTables = [
+  "principals",
+  "auth_tokens",
+  "auth_principal_incarnations",
+  "shared_principal_bindings",
+  "credential_authority_classes",
+  "shared_auth_sessions",
+] as const;
+
+const authCatalogQuery = `SELECT type, name, tbl_name, sql FROM main.sqlite_schema
+WHERE (type='table' AND name IN (?,?,?,?,?,?))
+ OR (type IN ('index','trigger') AND tbl_name IN (?,?,?,?,?,?))
+ORDER BY type, name`;
+
+/**
+ * Explicit observation only; ordinary request construction issues no new SQL.
+ * Two matching reads detect an observed change, not continuous schema stability.
+ * Rejection, unknown acknowledgement or a changed backing publishes no capture.
+ */
+export async function observeWorkerRequestAuthSchema(
+  connection: WorkerRequestSql,
+): Promise<WorkerRequestAuthSchemaObservation> {
+  const origin = assertWorkerRequestBacking(connection);
+  const first = await origin.rawSql.query(authCatalogQuery, [
+    ...authSchemaTables,
+    ...authSchemaTables,
+  ]);
+  assertWorkerRequestBacking(connection);
+  const catalog = authCatalog(first);
+  const catalogDigest = await canonicalDigest(catalog);
+  assertWorkerRequestBacking(connection);
+  const second = await origin.rawSql.query(authCatalogQuery, [
+    ...authSchemaTables,
+    ...authSchemaTables,
+  ]);
+  assertWorkerRequestBacking(connection);
+  const secondDigest = await canonicalDigest(authCatalog(second));
+  assertWorkerRequestBacking(connection);
+  if (catalogDigest !== secondDigest)
+    throw new TypeError("Worker request Auth schema changed during observation");
+  const observation = Object.freeze({
+    kind: "worker-request-auth-schema-observation" as const,
+    catalogDigest,
+    objectCount: catalog.length,
+  });
+  requestAuthSchemaObservations.set(observation, connection);
+  return observation;
+}
+
+/**
+ * Joins an original observation to the existing original Financial input graph.
+ * The returned Sql/realm/epoch are construction inputs, not qualified Financial
+ * ports or installed-schema/target evidence. This reader performs no SQL and
+ * does not claim the previously observed schema is still current.
+ */
+export function readWorkerRequestFinancialAuthSchemaObservation(
+  connection: WorkerRequestSql,
+  observation: WorkerRequestAuthSchemaObservation,
+): {
+  readonly inputs: WorkerRequestFinancialInputs;
+  readonly observation: WorkerRequestAuthSchemaObservation;
+} {
+  if (requestAuthSchemaObservations.get(observation) !== connection)
+    throw new TypeError("Worker request Auth schema observation origin differs");
+  const origin = assertWorkerRequestBacking(connection);
+  const inputs = readWorkerRequestFinancialInputs(connection);
+  if (inputs.sql !== connection.sql || inputs.writerEpoch !== origin.writerEpoch)
+    throw new TypeError("Worker request Auth schema observation graph differs");
+  return Object.freeze({ inputs, observation });
+}
+
+function assertWorkerRequestBacking(connection: WorkerRequestSql) {
+  const origin = requestOrigins.get(connection);
+  if (!origin) throw new TypeError("Worker request backing has not been constructed");
+  if (
+    dataMethod(origin.database, "withSession") !== origin.withSession ||
+    typeof origin.prepare !== "function" ||
+    typeof origin.batch !== "function" ||
+    dataMethod(origin.session, "prepare") !== origin.prepare ||
+    dataMethod(origin.session, "batch") !== origin.batch
+  )
+    throw new TypeError("Worker request primary session methods differ");
+  assertMoneyCutoverSqlBackingOrigin(connection.sql, {
+    rawSql: origin.rawSql,
+    writerEpoch: origin.writerEpoch,
+  });
+  return origin;
+}
+
+/** Method identity inspection never invokes a replacement accessor. */
+function dataMethod(receiver: object, key: string): unknown {
+  let current: object | null = receiver;
+  while (current !== null && current !== Object.prototype) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, key);
+    if (descriptor) return "value" in descriptor ? descriptor.value : undefined;
+    current = Object.getPrototypeOf(current) as object | null;
+  }
+  return undefined;
+}
+
+function authCatalog(rows: readonly Row[]): readonly (readonly unknown[])[] {
+  const tables = new Set<string>();
+  const objects = new Set<string>();
+  const catalog = rows.map((row) => {
+    const field = (key: string): unknown => {
+      const descriptor = Object.getOwnPropertyDescriptor(row, key);
+      return descriptor && "value" in descriptor ? descriptor.value : undefined;
+    };
+    const type = field("type");
+    const name = field("name");
+    const table = field("tbl_name");
+    const sql = field("sql");
+    if (
+      (type !== "table" && type !== "index" && type !== "trigger") ||
+      typeof name !== "string" ||
+      name.length === 0 ||
+      typeof table !== "string" ||
+      !authSchemaTables.some((expected) => expected === table) ||
+      (type === "table" && name !== table) ||
+      (typeof sql !== "string" && !(type === "index" && sql === null)) ||
+      objects.has(`${type}:${name}`)
+    )
+      throw new TypeError("Worker request Auth schema catalog is invalid");
+    objects.add(`${type}:${name}`);
+    if (type === "table") tables.add(name);
+    return [type, name, table, sql] as const;
+  });
+  if (authSchemaTables.some((name) => !tables.has(name)))
+    throw new TypeError("Worker request Auth schema catalog is incomplete");
+  return catalog;
 }
 
 /**

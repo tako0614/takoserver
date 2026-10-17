@@ -3,6 +3,7 @@ import * as financialRequestOrigin from "@takoserver/core/financial-request-orig
 import sharedPricing from "../config/shared-hosted-pricing.json";
 import { moneyFenceInstallSql } from "../scripts/deploy/schema-money-unit-cutover.ts";
 import { assertAuthTokenCaptureReader } from "../src/auth.ts";
+import { additiveAuthTokenDDL } from "../src/auth-authority-schema-plan.ts";
 import { createWorkerEntry, type WorkerEnv } from "../src/entry-worker.ts";
 import { verifyHostedBillingFinancialRealm } from "../src/hosted-billing-realm.ts";
 import { compilePricingAuthoring } from "../src/hosted-pricing.ts";
@@ -15,13 +16,16 @@ import {
 import type { SqlParam, SqlStatement, SqlWrite } from "../src/ports.ts";
 import { createRouter } from "../src/router.ts";
 import { SHARED_AUTH_STAGING_PROFILE } from "../src/shared-auth-oidc-client.ts";
-import type { D1ResultLike, D1StatementLike } from "../src/sql-d1.ts";
+import type { D1DatabaseLike, D1ResultLike, D1StatementLike } from "../src/sql-d1.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
 import {
   captureWorkerSharedAuthStaging,
+  createWorkerPrimaryRequestSql,
   createWorkerRequestConsumers,
   createWorkerRequestSql,
+  observeWorkerRequestAuthSchema,
   readWorkerRequestConsumers,
+  readWorkerRequestFinancialAuthSchemaObservation,
   readWorkerRequestFinancialInputs,
   type WorkerRequestDatabase,
   type WorkerRequestSql,
@@ -784,4 +788,208 @@ test("post-observer validation rejects actual Sql method substitution after awai
     for (const original of restore) original();
     processor.restore();
   }
+});
+
+/** Actual catalog reads on the structural SQLite binding remain component observations. */
+function catalogResult(result: SqlWrite): boolean {
+  return result.rows.some((row) => Object.hasOwn(row, "tbl_name"));
+}
+
+function acknowledgement(result: SqlWrite): D1ResultLike {
+  return { success: true, results: result.rows, meta: { changes: result.changes } };
+}
+
+describe("Worker primary Auth schema observations", () => {
+  test("observes the captured primary and joins only its original Sql/realm/epoch", async () => {
+    const f = await fixture();
+    // Candidate metadata is sufficient for observation, never installed Auth103 proof.
+    f.db.exec(additiveAuthTokenDDL);
+    const { inputs, runtime } = await f.consumers();
+    const before = f.sessions[0]?.queries.length ?? 0;
+    const observation = await observeWorkerRequestAuthSchema(inputs.connection);
+    expect(f.sessions).toHaveLength(1);
+    expect(f.sessions[0]?.queries.length).toBe(before + 2);
+    expect(Object.keys(observation)).toEqual(["kind", "catalogDigest", "objectCount"]);
+    expect(observation.kind).toBe("worker-request-auth-schema-observation");
+    expect(observation.catalogDigest).toMatch(/^sha256:[0-9a-f]{64}$/u);
+    expect(observation.objectCount).toBeGreaterThan(6);
+    expect(Object.isFrozen(observation)).toBe(true);
+    const joined = readWorkerRequestFinancialAuthSchemaObservation(inputs.connection, observation);
+    expect(joined.observation).toBe(observation);
+    expect(joined.inputs).toBe(readWorkerRequestFinancialInputs(inputs.connection));
+    expect(joined.inputs.sql).toBe(runtime.sql);
+    expect(joined.inputs.realm).toBe(runtime.realm);
+    expect(joined.inputs.writerEpoch).toBe(WRITER);
+    expect(f.sessions[0]?.queries.length).toBe(before + 2);
+    f.db.exec("CREATE INDEX request_auth_observation_extra ON principals(id)");
+    const changed = await observeWorkerRequestAuthSchema(inputs.connection);
+    expect(changed.catalogDigest).not.toBe(observation.catalogDigest);
+    expect(changed.objectCount).toBe(observation.objectCount + 1);
+    // Reading a prior observation deliberately does not claim current schema.
+    expect(
+      readWorkerRequestFinancialAuthSchemaObservation(inputs.connection, observation).observation,
+    ).toBe(observation);
+  });
+
+  test("native-primary observation needs no consumer, but cannot supply a Financial graph", async () => {
+    const f = await fixture();
+    f.db.exec(additiveAuthTokenDDL);
+    const connection = await createWorkerPrimaryRequestSql({
+      database: f.binding,
+      writerEpoch: WRITER,
+    });
+    const before = f.sessions[0]?.queries.length ?? 0;
+    expect(before).toBe(5);
+    const observation = await observeWorkerRequestAuthSchema(connection);
+    expect(f.sessions).toHaveLength(1);
+    expect(f.sessions[0]?.queries.length).toBe(before + 2);
+    expect(() => readWorkerRequestFinancialAuthSchemaObservation(connection, observation)).toThrow();
+  });
+
+  test("missing Auth catalog rejects before publishing a capture or retrying", async () => {
+    const f = await fixture();
+    f.db.exec(additiveAuthTokenDDL);
+    const { inputs } = await f.consumers();
+    f.db.exec("DROP TABLE auth_principal_incarnations");
+    const before = f.sessions[0]?.queries.length ?? 0;
+    await expect(observeWorkerRequestAuthSchema(inputs.connection)).rejects.toThrow(
+      "catalog is incomplete",
+    );
+    expect(f.sessions[0]?.queries.length).toBe(before + 1);
+    expect(() =>
+      readWorkerRequestFinancialAuthSchemaObservation(inputs.connection, {
+        kind: "worker-request-auth-schema-observation",
+        catalogDigest: `sha256:${"0".repeat(64)}`,
+        objectCount: 0,
+      }),
+    ).toThrow();
+  });
+
+  test("a real catalog change between the two reads rejects the observation", async () => {
+    let armed = false;
+    let catalogReads = 0;
+    const f = await fixture((result) => {
+      if (armed && catalogResult(result) && ++catalogReads === 1)
+        f.db.exec("CREATE INDEX request_auth_observation_during ON principals(id)");
+      return acknowledgement(result);
+    });
+    f.db.exec(additiveAuthTokenDDL);
+    const { inputs } = await f.consumers();
+    armed = true;
+    await expect(observeWorkerRequestAuthSchema(inputs.connection)).rejects.toThrow(
+      "schema changed",
+    );
+    expect(catalogReads).toBe(2);
+    expect(f.sessions).toHaveLength(1);
+  });
+
+  test.each(["withSession", "prepare", "batch"] as const)(
+    "replacement %s accessor after await rejects without invoking it or opening another session",
+    async (method) => {
+      let armed = false;
+      let getterCalls = 0;
+      let session: D1DatabaseLike | undefined;
+      const f = await fixture((result) => {
+        if (armed && catalogResult(result)) {
+          const receiver = method === "withSession" ? f.binding : session;
+          if (!receiver) throw new Error("fixture primary session is missing");
+          Object.defineProperty(receiver, method, {
+            configurable: true,
+            get() {
+              getterCalls += 1;
+              throw new Error("replacement method getter was invoked");
+            },
+          });
+        }
+        return acknowledgement(result);
+      });
+      f.db.exec(additiveAuthTokenDDL);
+      const open = f.binding.withSession;
+      if (!open) throw new Error("fixture primary constructor is missing");
+      f.binding.withSession = function (constraint) {
+        const opened: D1DatabaseLike = Reflect.apply(open, this, [constraint]);
+        session = opened;
+        return opened;
+      };
+      const { inputs } = await f.consumers();
+      const before = f.sessions[0]?.queries.length ?? 0;
+      armed = true;
+      await expect(observeWorkerRequestAuthSchema(inputs.connection)).rejects.toThrow(
+        "session methods differ",
+      );
+      expect(getterCalls).toBe(0);
+      expect(f.sessions).toHaveLength(1);
+      expect(f.sessions[0]?.queries.length).toBe(before + 1);
+    },
+  );
+
+  test("Money method replacement after await rejects without invoking its getter", async () => {
+    let armed = false;
+    let getterCalls = 0;
+    const f = await fixture((result) => {
+      if (armed && catalogResult(result))
+        Object.defineProperty(runtime.sql, "run", {
+          configurable: true,
+          get() {
+            getterCalls += 1;
+            throw new Error("replacement Money getter was invoked");
+          },
+        });
+      return acknowledgement(result);
+    });
+    f.db.exec(additiveAuthTokenDDL);
+    const { inputs, runtime } = await f.consumers();
+    const before = f.sessions[0]?.queries.length ?? 0;
+    armed = true;
+    await expect(observeWorkerRequestAuthSchema(inputs.connection)).rejects.toThrow();
+    expect(getterCalls).toBe(0);
+    expect(f.sessions[0]?.queries.length).toBe(before + 1);
+    expect(f.sessions).toHaveLength(1);
+  });
+
+  test("an incomplete catalog acknowledgement is unknown and never retried", async () => {
+    let armed = false;
+    const f = await fixture((result) =>
+      armed && catalogResult(result)
+        ? { success: true, results: result.rows }
+        : acknowledgement(result),
+    );
+    f.db.exec(additiveAuthTokenDDL);
+    const { inputs } = await f.consumers();
+    const before = f.sessions[0]?.queries.length ?? 0;
+    armed = true;
+    await expect(observeWorkerRequestAuthSchema(inputs.connection)).rejects.toThrow(
+      "incomplete statement acknowledgement",
+    );
+    expect(f.sessions[0]?.queries.length).toBe(before + 1);
+    expect(f.sessions).toHaveLength(1);
+  });
+
+  test("copied observations, copied connections and foreign real graphs cannot be joined", async () => {
+    const f = await fixture();
+    f.db.exec(additiveAuthTokenDDL);
+    const first = await f.consumers();
+    const observation = await observeWorkerRequestAuthSchema(first.inputs.connection);
+    const second = await f.consumers();
+    const before = f.sessions.map((session) => session.queries.length);
+    expect(first.runtime.sql).not.toBe(second.runtime.sql);
+    expect(first.runtime.realm).not.toBe(second.runtime.realm);
+    expect(() =>
+      readWorkerRequestFinancialAuthSchemaObservation(second.inputs.connection, observation),
+    ).toThrow();
+    expect(() =>
+      readWorkerRequestFinancialAuthSchemaObservation(first.inputs.connection, { ...observation }),
+    ).toThrow();
+    let getterCalls = 0;
+    const copied: WorkerRequestSql = {
+      moneyGuard: "ready",
+      get sql() {
+        getterCalls += 1;
+        return first.runtime.sql;
+      },
+    };
+    expect(() => readWorkerRequestFinancialAuthSchemaObservation(copied, observation)).toThrow();
+    expect(getterCalls).toBe(0);
+    expect(f.sessions.map((session) => session.queries.length)).toEqual(before);
+  });
 });
