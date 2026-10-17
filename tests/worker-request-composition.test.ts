@@ -1197,8 +1197,18 @@ describe("Worker original RP final-touch retained DATA", () => {
         lastTouch = index;
     }
     if (lastTouch < 0) throw new Error("actual final touch did not execute");
-    expect(queries.slice(lastTouch + 1)).toHaveLength(2);
-    expect(queries.slice(lastTouch + 1).every((sql) => sql.startsWith("SELECT "))).toBe(true);
+    const afterTouch = queries.slice(lastTouch + 1);
+    expect(afterTouch).toHaveLength(3);
+    // The actual Money wrapper closes the touch batch before the two retained reads.
+    expect(afterTouch[0]).toBe(
+      "DELETE FROM money_cutover_writer_permit WHERE singleton = 1 AND epoch = 'usd-micros-v2' AND writer_epoch = ?",
+    );
+    expect(afterTouch[1]).toBe("SELECT * FROM credential_authority_classes WHERE session_digest=?");
+    expect(
+      afterTouch[2]?.startsWith(
+        "SELECT CASE WHEN EXISTS (SELECT 1 FROM credential_authority_classes a JOIN shared_auth_sessions s",
+      ),
+    ).toBe(true);
     const row = await createSharedAuthSessionStore(r.inputs.sql).readSession(r.digest);
     expect(data.current.version).toBe(2);
     expect(row?.version).toBe(data.current.version);
