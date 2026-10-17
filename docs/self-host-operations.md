@@ -995,14 +995,15 @@ their bytes in one of two ways:
 - **Publish them over public HTTPS**, which needs no restart. Serve the files
   and a manifest that lists them over HTTPS on port 443 from another machine,
   such as object storage or a static site; port 443 on this machine belongs to
-  the Host's Endpoints, so it cannot fetch from itself. The Host fetches only:
-  - a DNS name, not an IP address, whose every answer is a public address and
-    which does not end in `.localhost`, `.local`, `.internal`, `.lan`,
-    `.home.arpa`, `.test`, `.invalid` or `.example`;
-  - over a publicly trusted certificate;
-  - a URL with no port, query or fragment, written in its normalized form;
-  - a plain `200` (no redirect), within 30 seconds for each file;
-  - a URL it does not already hold from seeding.
+  the Host's Endpoints, so it cannot fetch from itself. The Host fetches a URL
+  only when:
+  - its host is a DNS name, not an IP address, whose every answer is a public
+    address and which does not end in `.localhost`, `.local`, `.internal`,
+    `.lan`, `.home.arpa`, `.test`, `.invalid` or `.example`;
+  - its certificate is publicly trusted;
+  - it has no port, query or fragment, and is written in its normalized form;
+  - it answers a plain `200` (no redirect) within 30 seconds;
+  - it is not one the Host already holds from seeding.
 
   A manifest is at most 1 MiB, each file at most 16 MiB, and a bundle at most
   512 files and 128 MiB. When the `WorkerBundle` is created, the Host fetches
