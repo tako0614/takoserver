@@ -31,6 +31,9 @@ const DEPLOY_STEPS = `${GUIDE}#6-seed-held-artifacts`;
 const DOCKER_GUIDE = `${REPOSITORY}/blob/main/docs/self-host-docker.md`;
 const CONSOLE_SETUP = `${GUIDE}#the-console-optional`;
 const SHIP_STEPS = `${GUIDE}#10-ship-a-new-version`;
+const WORKER_STEPS = `${GUIDE}#8-create-and-serve-a-worker`;
+const SQLITE_STEPS = `${GUIDE}#11-bind-a-sqlite-database`;
+const DATA_STEPS = `${GUIDE}#12-bind-kv-a-bucket-and-a-queue`;
 const MONITORING = `${GUIDE}#monitoring`;
 const BACKUP = `${GUIDE}#cold-snapshot`;
 const UPDATE = `${GUIDE}#update-and-code-rollback`;
@@ -117,6 +120,11 @@ const landingMessages = {
     shipDeploy:
       "is updated to serve hello-version-v2 at weight 10000. The update names the generation it read, so a change made in between is not overwritten.",
     shipMore: "Step 10 of the install guide",
+    step6: "Step 6 of the install guide",
+    step8: "Step 8 of the install guide",
+    sqliteStep: "SQLite: step 11 of the install guide",
+    dataStep: "KV and buckets: step 12 of the install guide",
+    queueStep: "Queues: step 12 of the install guide",
     keepTitle: "Keep it running",
     keepBody:
       "Poll the Host's readiness probe, GET /_takoserver/health/ready on its own port: 503, or no answer, means it cannot serve; degraded: true means it still serves but something needs you: a Worker that is not ready, work waiting too long, or a background job that keeps failing. To back up, stop the Host and copy its whole data root and /etc/takoserver, which holds its cursor key and the config that grants its seeded code. To update, check out a newer reviewed commit beside the running one and switch to it, keeping the previous checkout and a backup.",
@@ -202,6 +210,11 @@ const landingMessages = {
     shipDeploy:
       "hello-version-v2を重み10000で配信するよう更新します。更新は読み取った世代を指定するので、その間に入った別の変更を上書きしません。",
     shipMore: "手順書（英語）の手順10",
+    step6: "手順書（英語）の手順6",
+    step8: "手順書（英語）の手順8",
+    sqliteStep: "SQLite：手順書（英語）の手順11",
+    dataStep: "KV・バケット：手順書（英語）の手順12",
+    queueStep: "キュー：手順書（英語）の手順12",
     keepTitle: "動かし続ける",
     keepBody:
       "準備状態は、Host自身のポートで GET /_takoserver/health/ready を定期的に確認します。503か応答がなければサービスを提供できず、degraded: true ならサービスは続いていますが、準備できていないWorker、長く待っている作業、失敗が続くバックグラウンド処理など、対応が必要なものがあります。バックアップするには、Hostを停止して、データルート全体と /etc/takoserver（カーソルキーと、保持させたコードを許可する設定があります）をコピーします。更新するには、レビュー済みの新しいコミットを今のチェックアウトの横に用意して切り替えます。前のチェックアウトとバックアップは残しておきます。",
@@ -221,6 +234,7 @@ const FORM_GROUPS = [
     title: "artifactsTitle",
     body: "artifactsBody",
     forms: ["WorkerBundle 0.2.0", "StaticAssetBundle 0.2.0", "SQLiteMigrationSet 0.2.0"],
+    steps: [[DEPLOY_STEPS, "step6"]],
   },
   {
     title: "workersTitle",
@@ -232,6 +246,7 @@ const FORM_GROUPS = [
       "WorkerCronTrigger 0.3.0",
       "WorkerEndpoint 0.3.0",
     ],
+    steps: [[WORKER_STEPS, "step8"]],
   },
   {
     title: "dataTitle",
@@ -241,6 +256,10 @@ const FORM_GROUPS = [
       "SQLiteMigrationApplication 0.2.0",
       "EdgeKVNamespace 0.2.0",
       "ObjectBucket 0.2.0",
+    ],
+    steps: [
+      [SQLITE_STEPS, "sqliteStep"],
+      [DATA_STEPS, "dataStep"],
     ],
   },
   {
@@ -252,6 +271,7 @@ const FORM_GROUPS = [
       "ActorNamespace 0.3.0",
       "DurableWorkflow 0.3.0",
     ],
+    steps: [[DATA_STEPS, "queueStep"]],
   },
 ] as const;
 
@@ -344,6 +364,7 @@ h3 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: -0.02em; }
 .forms > div { display: grid; grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.6fr); gap: 16px 48px; padding: 28px 0; border-bottom: 1px solid var(--line-1); }
 .forms dt { margin: 0; }
 .forms dt p { margin: 8px 0 0; color: var(--ink-2); font-size: 14px; max-width: 28em; }
+.forms dt .more { margin-top: 12px; }
 .forms dd { margin: 0; display: flex; flex-wrap: wrap; gap: 8px; align-content: start; }
 .forms code { padding: 4px 10px; border: 1px solid var(--line-1); border-radius: 999px; background: var(--surface-2); font: 13px/1.6 var(--mono); white-space: nowrap; }
 
@@ -471,7 +492,9 @@ export function landingHtml(options: LandingOptions): string {
     : "";
   const formGroups = FORM_GROUPS.map(
     (group) =>
-      `<div><dt>${text(group.title, "h3")}${text(group.body, "p")}</dt><dd>${group.forms
+      `<div><dt>${text(group.title, "h3")}${text(group.body, "p")}<p class="more">${group.steps
+        .map(([href, key]) => `<a href="${href}" data-i18n="${key}">${copy[key]}</a>`)
+        .join("")}</p></dt><dd>${group.forms
         .map((form) => `<code>${form}</code>`)
         .join("")}</dd></div>`,
   ).join("\n");
