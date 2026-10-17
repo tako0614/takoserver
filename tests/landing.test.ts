@@ -258,6 +258,17 @@ describe("Takoserver public site", () => {
     expect(landingHtml(site)).not.toContain('<section class="here"');
   });
 
+  test("says how to keep a Host running, with the guide's sections", () => {
+    const html = landingHtml(site);
+    expect(html).toContain("Keep it running");
+    expect(html).toContain("GET /_takoserver/health/ready");
+    expect(html).toContain('docs/self-host-operations.md#monitoring" data-i18n="monitoring"');
+    expect(html).toContain('docs/self-host-operations.md#cold-snapshot" data-i18n="backup"');
+    expect(html).toContain(
+      'docs/self-host-operations.md#update-and-code-rollback" data-i18n="update"',
+    );
+  });
+
   test("answers unknown paths in the same visual system", () => {
     const html = notFoundHtml();
     expect(html).toContain("<title>404 | Takoserver</title>");

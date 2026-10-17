@@ -1317,10 +1317,13 @@ commit first, then, as root (the checkout stays root-owned and read-only to
 
    ```sh
    git -C /opt/takoserver fetch origin
-   git -C /opt/takoserver cat-file -e '<reviewed-commit>^{commit}'
-   git -C /opt/takoserver worktree add --detach /opt/takoserver-<short-commit> <reviewed-commit>
-   cd /opt/takoserver-<short-commit> && bun install --frozen-lockfile
+   NEW=$(git -C /opt/takoserver rev-parse origin/main)   # the commit to review and run
+   DIR=/opt/takoserver-$(git -C /opt/takoserver rev-parse --short=12 "$NEW")
+   git -C /opt/takoserver worktree add --detach "$DIR" "$NEW"
+   cd "$DIR" && bun install --frozen-lockfile
    ```
+
+   The steps below name the new checkout `$DIR`.
 
    If `bun install` fails on the lockfile, the new checkout may expect another
    Bun version; see step 2.
@@ -1334,10 +1337,10 @@ commit first, then, as root (the checkout stays root-owned and read-only to
    the Bun version at startup:
 
    ```sh
-   cat /opt/takoserver-<short-commit>/.bun-version; bun --version
-   grep -o 'sha256: "[0-9a-f]*"' /opt/takoserver-<short-commit>/src/workerd-artifact.ts
+   cat "$DIR/.bun-version"; bun --version
+   grep -o 'sha256: "[0-9a-f]*"' "$DIR/src/workerd-artifact.ts"
    . /etc/takoserver/takoserver.env && sha256sum "$TAKOSERVER_WORKERD_BINARY"
-   grep '^toolchain' /opt/takoserver-<short-commit>/services/workflow-execution-guard/go.mod
+   grep '^toolchain' "$DIR/services/workflow-execution-guard/go.mod"
    ```
 
    If the Bun version differs, install it with step 1's installer and rerun
@@ -1357,7 +1360,7 @@ commit first, then, as root (the checkout stays root-owned and read-only to
    (`WorkingDirectory=…`) from step 3, make any change step 2 called for,
    rebuild the Workflow execution guard from the new checkout as in step 1
    (with `export PATH=/usr/local/go/bin:$PATH` and
-   `cd /opt/takoserver-<short-commit>/services/workflow-execution-guard`), and
+   `cd "$DIR/services/workflow-execution-guard"`), and
    run `systemctl daemon-reload`. Keep the
    same protected configuration otherwise. If you serve the console, rebuild
    it from the new checkout as described under
