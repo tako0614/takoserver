@@ -1707,3 +1707,175 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
     }
   });
 });
+
+// Mechanical fixed SQL contribution only; not native primary/Root or genuine issuer qualification.
+describe("fixed C0 builder contribution", () => {
+  test("builds two detached statements without SQL, Clock, provider or write effects", async () => {
+    const f = await fixture();
+    try {
+      const store = f.c0(),
+        input = f.preparation("builder-pure");
+      const before = [f.queryCalls, f.runCalls, f.batchCalls, f.clockCalls, f.providerRequests];
+      const statements = store.buildPreparationBatch(input, AT),
+        original = structuredClone(statements);
+      expect(statements).toHaveLength(2);
+      expect(statements[0]?.sql).toContain("INSERT INTO financial_preproof_challenges");
+      expect(statements[1]?.sql).toContain("INSERT INTO financial_preproof_challenge_receipts");
+      expect(statements[1]?.sql).toContain("CASE WHEN changes()=1");
+      Object.assign(input.challenge, { challengeRef: "challenge:caller-changed" });
+      Object.assign(input.selection.action, { body: { email: "changed@example.invalid" } });
+      expect(statements).toEqual(original);
+      expect([f.queryCalls, f.runCalls, f.batchCalls, f.clockCalls, f.providerRequests]).toEqual(
+        before,
+      );
+      expect(f.counts()).toEqual([0, 0, 0, 0]);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("actual prepare uses the identical fixed SQL and params, then replay reads without another Clock or batch", async () => {
+    const f = await fixture();
+    try {
+      const store = f.c0(),
+        input = f.preparation("builder-prepare");
+      const statements = store.buildPreparationBatch(input, AT),
+        clocks = f.clockCalls,
+        batches = f.batchCalls;
+      const receipt = await store.prepare(input);
+      expect(f.batches.at(-1)).toEqual(statements);
+      expect(f.batchCalls).toBe(batches + 1);
+      expect(f.clockCalls).toBe(clocks + 1);
+      expect(receipt).toEqual({
+        preparationRef: input.preparationRef,
+        challengeRef: input.challenge.challengeRef,
+        receiptRef: input.receiptRef,
+      });
+      expect(f.counts()).toEqual([1, 1, 0, 0]);
+      expect(await store.prepare(input)).toEqual(receipt);
+      expect(f.batchCalls).toBe(batches + 1);
+      expect(f.clockCalls).toBe(clocks + 1);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("closed input/getter and malformed observedAt reject without invoking the getter, SQL or Clock", async () => {
+    const f = await fixture();
+    try {
+      const store = f.c0(),
+        input = f.preparation("builder-closed");
+      let getters = 0;
+      const before = [f.queryCalls, f.runCalls, f.batchCalls, f.clockCalls, f.providerRequests];
+      Object.defineProperty(input.selection.terms, "digest", {
+        enumerable: true,
+        get() {
+          getters++;
+          return D;
+        },
+      });
+      expect(() => store.buildPreparationBatch(input, AT)).toThrow();
+      expect(() =>
+        store.buildPreparationBatch(f.preparation("builder-date"), "not-an-ISO-instant"),
+      ).toThrow();
+      const foreign = f.preparation("builder-foreign");
+      Object.assign(foreign.challenge, { organizationId: "org:other" });
+      expect(() => store.buildPreparationBatch(foreign, AT)).toThrow();
+      expect(getters).toBe(0);
+      expect([f.queryCalls, f.runCalls, f.batchCalls, f.clockCalls, f.providerRequests]).toEqual(
+        before,
+      );
+      expect(f.counts()).toEqual([0, 0, 0, 0]);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("prepare still captures its entire original before the first readiness await", async () => {
+    const f = await fixture();
+    try {
+      const store = f.c0(),
+        input = f.preparation("builder-before-await");
+      const statements = store.buildPreparationBatch(input, AT);
+      const pending = store.prepare(input);
+      Object.assign(input.challenge, {
+        requestFingerprint: G,
+        challengeRef: "challenge:after-await",
+      });
+      Object.assign(input.selection.action, { body: { changed: true } });
+      await pending;
+      expect(f.batches.at(-1)).toEqual(statements);
+      expect(await store.readChallenge("challenge:builder-before-await")).toMatchObject({
+        requestFingerprint: D,
+      });
+      expect(await store.readChallenge("challenge:after-await")).toBeUndefined();
+    } finally {
+      f.close();
+    }
+  });
+
+  test("one exact positive batch precedes a later SQL failure that rolls back both new C0 rows", async () => {
+    const f = await fixture();
+    try {
+      const store = f.c0(),
+        positive = store.buildPreparationBatch(f.preparation("builder-positive"), AT);
+      expect(await f.base.batch(positive)).toHaveLength(2);
+      expect(f.counts()).toEqual([1, 1, 0, 0]);
+      const late = store.buildPreparationBatch(f.preparation("builder-late"), AT);
+      // Explicit in-memory late-failure transport fixture, never part of the fixed producer contribution.
+      await expect(
+        f.base.batch([...late, { sql: "SELECT * FROM missing_c0_builder_late_fixture" }]),
+      ).rejects.toBeInstanceOf(SqlError);
+      expect(f.counts()).toEqual([1, 1, 0, 0]);
+      expect(await store.readChallenge("challenge:builder-late")).toBeUndefined();
+    } finally {
+      f.close();
+    }
+  });
+
+  test("a mandatory receipt mismatch after its original rolls back the pair while the positive pair survives", async () => {
+    const f = await fixture();
+    try {
+      const store = f.c0();
+      await f.base.batch(
+        store.buildPreparationBatch(f.preparation("builder-receipt-positive"), AT),
+      );
+      expect(f.counts()).toEqual([1, 1, 0, 0]);
+      const statements = store.buildPreparationBatch(f.preparation("builder-receipt-bad"), AT);
+      const [original, receipt] = statements;
+      if (!original || !receipt?.params) throw Error("fixed C0 pair missing");
+      const mismatched = {
+        ...receipt,
+        params: receipt.params.map((value, index) => (index === 3 ? "{}" : value)),
+      };
+      await expect(f.base.batch([original, mismatched])).rejects.toBeInstanceOf(SqlError);
+      expect(f.counts()).toEqual([1, 1, 0, 0]);
+      expect(await store.readChallenge("challenge:builder-receipt-bad")).toBeUndefined();
+    } finally {
+      f.close();
+    }
+  });
+
+  test("observedAt remains DATA and builder does not invoke an actual Clock that throws", async () => {
+    const f = await fixture();
+    try {
+      let clocks = 0;
+      const store = createFinancialPreproofChallengeStore({
+        ...f.common,
+        scope: SCOPE,
+        clock() {
+          clocks++;
+          throw Error("unusable actual Clock");
+        },
+      });
+      const input = f.preparation("builder-no-clock");
+      expect(store.buildPreparationBatch(input, AT)).toHaveLength(2);
+      expect(clocks).toBe(0);
+      await expect(store.prepare(input)).rejects.toMatchObject({ code: "unavailable" });
+      expect(clocks).toBe(1);
+      expect(f.counts()).toEqual([0, 0, 0, 0]);
+    } finally {
+      f.close();
+    }
+  });
+});

@@ -440,6 +440,62 @@ export function createFinancialPreproofChallengeStore(
       receiptRef: input.receiptRef,
     };
   }
+  /** Fixed owner-internal SQL contribution. No SQL, Clock, readiness or authority effect. */
+  function compilePreparationBatch(
+    saved: ReturnType<typeof parse>,
+    recordJson: string,
+    challengeJson: string,
+    at: string,
+  ): readonly SqlStatement[] {
+    return [
+      {
+        sql: `INSERT INTO financial_preproof_challenges(challenge_ref,preparation_ref,challenge_json,scope_json,record_json,created_at)
+          SELECT ?,?,?,?,?,? WHERE ${c.current}`,
+        params: [
+          saved.challenge.challengeRef,
+          saved.preparationRef,
+          challengeJson,
+          scopeJson,
+          recordJson,
+          at,
+          ...c.currentParams,
+        ],
+      },
+      {
+        sql: `INSERT INTO financial_preproof_challenge_receipts(receipt_ref,challenge_ref,preparation_ref,record_json,all_rows_match)
+          VALUES(?,?,?,?,CASE WHEN changes()=1 AND EXISTS(SELECT 1 FROM financial_preproof_challenges
+          WHERE challenge_ref=? AND preparation_ref=? AND challenge_json=? AND scope_json=? AND record_json=?) AND (${c.current}) THEN 1 ELSE 0 END)`,
+        params: [
+          saved.receiptRef,
+          saved.challenge.challengeRef,
+          saved.preparationRef,
+          recordJson,
+          saved.challenge.challengeRef,
+          saved.preparationRef,
+          challengeJson,
+          scopeJson,
+          recordJson,
+          ...c.currentParams,
+        ],
+      },
+    ];
+  }
+  /** Closed DATA compiler for a future single owner batch; observedAt is not a qualified Clock. */
+  function buildPreparationBatch(
+    input: FinancialPreproofPreparation,
+    observedAt: string,
+  ): readonly SqlStatement[] {
+    let saved: ReturnType<typeof parse>;
+    try {
+      saved = parse(snapshot(input));
+    } catch (error) {
+      return fail("invalid_request", error);
+    }
+    const recordJson = json(saved),
+      challengeJson = json(saved.challenge),
+      at = iso(observedAt);
+    return compilePreparationBatch(saved, recordJson, challengeJson, at);
+  }
   async function prepare(input: FinancialPreproofPreparation): Promise<FinancialPreproofReceipt> {
     let saved: ReturnType<typeof parse>;
     try {
@@ -454,38 +510,7 @@ export function createFinancialPreproofChallengeStore(
       const recordJson = json(saved),
         challengeJson = json(saved.challenge),
         at = c.observed();
-      const statements: readonly SqlStatement[] = [
-        {
-          sql: `INSERT INTO financial_preproof_challenges(challenge_ref,preparation_ref,challenge_json,scope_json,record_json,created_at)
-          SELECT ?,?,?,?,?,? WHERE ${c.current}`,
-          params: [
-            saved.challenge.challengeRef,
-            saved.preparationRef,
-            challengeJson,
-            scopeJson,
-            recordJson,
-            at,
-            ...c.currentParams,
-          ],
-        },
-        {
-          sql: `INSERT INTO financial_preproof_challenge_receipts(receipt_ref,challenge_ref,preparation_ref,record_json,all_rows_match)
-          VALUES(?,?,?,?,CASE WHEN changes()=1 AND EXISTS(SELECT 1 FROM financial_preproof_challenges
-          WHERE challenge_ref=? AND preparation_ref=? AND challenge_json=? AND scope_json=? AND record_json=?) AND (${c.current}) THEN 1 ELSE 0 END)`,
-          params: [
-            saved.receiptRef,
-            saved.challenge.challengeRef,
-            saved.preparationRef,
-            recordJson,
-            saved.challenge.challengeRef,
-            saved.preparationRef,
-            challengeJson,
-            scopeJson,
-            recordJson,
-            ...c.currentParams,
-          ],
-        },
-      ];
+      const statements = compilePreparationBatch(saved, recordJson, challengeJson, at);
       try {
         await c.sql.batch(statements);
       } catch (error) {
@@ -630,7 +655,13 @@ export function createFinancialPreproofChallengeStore(
       return fail("unavailable", error);
     }
   }
-  return Object.freeze({ prepare, readChallenge, readActionOriginal, readActionSelectionOriginal });
+  return Object.freeze({
+    buildPreparationBatch,
+    prepare,
+    readChallenge,
+    readActionOriginal,
+    readActionSelectionOriginal,
+  });
 }
 
 /** Closed private descriptor data, never a qualification capability minted by this module. */
