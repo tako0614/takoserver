@@ -1537,6 +1537,10 @@ test("an Endpoint without an address says how it stands", async () => {
 test("Needs attention says when a served Worker has not recorded its Deployment", async () => {
   const stale = { ...hello, observed: { activeDeploymentUid: null, ready: false } };
   const { body } = await overviewWith([stale, deploymentOfV1()]);
+  // The Workers card shows the Deployment's state as serving, so it does not
+  // read as the Worker's own Ready beside its Not ready below.
+  expect(body.textContent).toContain("Serving");
+  expect(body.textContent).toContain("1 needs attention");
   expect(body.textContent).toContain("Needs attention");
   expect(body.textContent).toContain(
     "its Deployment serves it, but the Worker has not recorded it",
@@ -1604,7 +1608,11 @@ test("a Form the Host did not answer for is marked, and typing a URL stays a pla
  * The delete dialog for `one`, against a Host whose full list is `listed`, read
  * afresh on every request; `more` makes every page say another follows.
  */
-async function deleteDialog(listed: ResourceSummary[] | null, more = false) {
+async function deleteDialog(
+  listed: ResourceSummary[] | null,
+  more = false,
+  target: ResourceSummary = one,
+) {
   const { body, route } = await setup();
   const { deleteResource } = await import("../console/src/pages/create-resource.ts");
   const seen: Request[] = [];
@@ -1621,7 +1629,7 @@ async function deleteDialog(listed: ResourceSummary[] | null, more = false) {
     },
     { preconnect: globalThis.fetch.preconnect },
   );
-  deleteResource("org-console", one);
+  deleteResource("org-console", target);
   return { body, route, seen };
 }
 
@@ -1647,8 +1655,9 @@ test("delete lists what still names the Resource and is not offered until nothin
   // Until the check answers, the delete is not offered either.
   expect(button(body, "Delete resource").disabled).toBe(true);
   await settle();
+  expect(body.textContent).toContain("The Host refuses this delete while these still name it.");
   expect(body.textContent).toContain(
-    "The Host refuses this delete while these still name it. Change them so they no longer name it, or delete them first.",
+    "names-one https://forms.example.test/Widget/1.0.0: change it so it no longer names this, or delete it",
   );
   const link = body.all().find((node) => node.tag === "a" && node.textContent === "names-one");
   expect(link?.attributes.get("href")).toBe("/resources/uid-two");
@@ -1656,6 +1665,54 @@ test("delete lists what still names the Resource and is not offered until nothin
   button(body, "Delete resource").click();
   await settle();
   expect(seen).toHaveLength(0);
+});
+
+test("delete says what to do first about each Resource that still names it", async () => {
+  const edge = (kind: string) => `https://edge.forms.takoform.com/forms/${kind}/`;
+  const version = {
+    ...one,
+    uid: "uid-version",
+    name: "hello-version-v1",
+    form: edge("WorkerVersion/0.5.0"),
+  };
+  // A version served by a Deployment: serve another one first, never delete the Deployment.
+  const serving = {
+    ...two,
+    name: "hello-deployment",
+    form: edge("WorkerDeployment/0.4.0"),
+    spec: { versions: [{ weight: 10000, workerVersion: { resourceUid: "uid-version" } }] },
+  };
+  const served = await deleteDialog([version, serving], false, version);
+  await settle();
+  expect(served.body.textContent).toContain(
+    "hello-deployment WorkerDeployment 0.4.0: serve another version first",
+  );
+  // A database named by a version, which cannot change: delete the version once nothing serves it.
+  const database = { ...one, uid: "uid-db", name: "hello-db", form: edge("SQLiteDatabase/0.2.0") };
+  const binding = {
+    ...two,
+    name: "hello-version-v1",
+    form: edge("WorkerVersion/0.5.0"),
+    spec: { sqliteBindings: [{ name: "DB", resource: { resourceUid: "uid-db" } }] },
+  };
+  const bound = await deleteDialog([database, binding], false, database);
+  await settle();
+  expect(bound.body.textContent).toContain(
+    "hello-version-v1 WorkerVersion 0.5.0: it cannot change, so delete it once nothing serves it",
+  );
+  // What deleting it takes with it, for this Form.
+  expect(bound.body.textContent).toContain(
+    "The Host deletes this Resource. Its data is deleted with it. This cannot be undone.",
+  );
+  const endpoint = {
+    ...one,
+    uid: "uid-end",
+    name: "hello-endpoint",
+    form: edge("WorkerEndpoint/0.3.0"),
+  };
+  const alone = await deleteDialog([endpoint], false, endpoint);
+  await settle();
+  expect(alone.body.textContent).toContain("Its hostname stops serving the Worker.");
 });
 
 test("delete checks again on request, and marks a referrer being deleted", async () => {

@@ -189,7 +189,10 @@ function resourcesCard(all: readonly ResourceSummary[], more: boolean): Child {
           { style: { color: "var(--warn)" } },
           more
             ? tr(`${attention}件以上に確認が必要`, `${attention}+ need attention`)
-            : tr(`${attention}件に確認が必要`, `${attention} need attention`),
+            : tr(
+                `${attention}件に確認が必要`,
+                attention === 1 ? "1 needs attention" : `${attention} need attention`,
+              ),
         )
       : more
         ? tr("最初のページのみ集計", "first page only")
@@ -231,7 +234,12 @@ function resourcesCard(all: readonly ResourceSummary[], more: boolean): Child {
                   "span",
                   { style: { marginLeft: "8px" } },
                   badge(
-                    tr(`${entry.attention}件に確認が必要`, `${entry.attention} need attention`),
+                    tr(
+                      `${entry.attention}件に確認が必要`,
+                      entry.attention === 1
+                        ? "1 needs attention"
+                        : `${entry.attention} need attention`,
+                    ),
                     "warn",
                     true,
                   ),
@@ -309,7 +317,14 @@ function workersCard(
           h(
             "div",
             { class: "row__value ref" },
-            badge(phaseLabel(state.phase), state.tone, true),
+            // With a Deployment, the badge is its state: whether the Worker is served.
+            badge(
+              deployment && (state.phase === "Ready" || state.phase === "Applied")
+                ? tr("配信中", "Serving")
+                : phaseLabel(state.phase),
+              state.tone,
+              true,
+            ),
             ...(endpoints.length > 0
               ? endpoints.map((endpoint) => address(endpoint))
               : [nextStep(organizationId, all, worker, deployment, partial)]),
