@@ -352,8 +352,8 @@ function stuckVersionNotice(organizationId: string, version: ResourceSummary): C
         "span",
         null,
         tr(
-          "Hostはこの版を2分以上再試行していますが、理由を示していません（outcome_unconfirmed）。多くの場合、版のコードが拒否されています：構文エラー、解決できないimport、モジュールの最上位での例外や2秒の制限（ランタイムの起動を含む）を超える処理、またはhandlersがdefault exportの定義するハンドラーと完全には一致していない、などです。",
-          "The Host has kept retrying this version for more than two minutes without saying why (outcome_unconfirmed). That usually means it refused the version's code: a syntax error, an import that does not resolve, an exception at the module's top level or top-level work past a two-second limit that includes the runtime's start-up, or handlers that are not exactly the handlers its default export defines.",
+          "Hostはこの版を2分以上再試行していますが、理由を示していません（outcome_unconfirmed）。多くの場合、版のコードが拒否されています：構文エラー、解決できないimport、モジュールの最上位での例外や2秒の制限（ランタイムの起動を含む）を超える処理、またはhandlersがdefault exportの定義するハンドラーと完全には一致していない、などです。Hostがまだ使えないBindingやアセットがある場合も同じように見えます。",
+          "The Host has kept retrying this version for more than two minutes without saying why (outcome_unconfirmed). That usually means it refused the version's code: a syntax error, an import that does not resolve, an exception at the module's top level or top-level work past a two-second limit that includes the runtime's start-up, or handlers that are not exactly the handlers its default export defines. A Binding or assets the Host cannot use yet look the same.",
         ),
       ),
       h(
