@@ -5,6 +5,7 @@ import {
   prepareV2HostAcceptance,
   type V2HostAcceptance,
   type V2HostAcceptanceContext,
+  type V2HostDeleteAcceptanceContext,
 } from "./host-acceptance.ts";
 
 /** Unregistered Host-owned storage, not migration 0101 or a native authority grant.
@@ -592,6 +593,104 @@ export function createV2ContainerHostAcceptance(options: {
           c.retainUntil,
           `${c.generation}-${workload}`,
           c.operationId,
+        ],
+      };
+      return Promise.resolve(prepareV2HostAcceptance(sql, context, guard, terminal));
+    },
+    prepareDelete(context: V2HostDeleteAcceptanceContext) {
+      if (context.form !== C.formUrl) return undefined;
+      // Copy synchronously before yielding. Redeem still binds the ORIGINAL context
+      // identity, while every fixed statement parameter is this captured snapshot.
+      const c = Object.freeze({ ...context });
+      for (const field of [
+        "principal",
+        "key",
+        "fingerprint",
+        "operationId",
+        "resourceUid",
+        "at",
+        "retainUntil",
+        "form",
+        "space",
+        "name",
+        "backendId",
+        "targetKey",
+      ] as const) {
+        const value = c[field];
+        if (typeof value !== "string" || value.length < 1 || value.length > 2048)
+          throw new TypeError("invalid Container accepted context");
+      }
+      if (
+        c.backendId !== backendId ||
+        c.targetKey !== targetKey ||
+        c.action !== "delete" ||
+        !Number.isSafeInteger(c.generation) ||
+        c.generation < 2 ||
+        c.referencesJson !== null ||
+        c.privateInputs !== undefined ||
+        c.configuredPrivateInputs !== undefined
+      )
+        throw new TypeError("invalid Container accepted context");
+      const spec = parseStrictJson(new TextEncoder().encode(c.specJson), 1_048_576);
+      if (!spec || typeof spec !== "object" || Array.isArray(spec))
+        throw new TypeError("invalid Container accepted spec");
+      const record = spec as Record<string, unknown>;
+      const sensitive = record[C.fields.requiredSensitiveVars];
+      const workload = record[C.fields.workloadRevision];
+      if (
+        (sensitive !== undefined && (!Array.isArray(sensitive) || sensitive.length !== 0)) ||
+        typeof workload !== "string" ||
+        !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(workload)
+      )
+        throw new TypeError("frozen Container Form cannot accept sensitive inputs");
+      const guard: SqlStatement = {
+        sql: `${V2_CONTAINER_OWNER_READY} AND (${`EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
+            AND principal = ? AND space = ? AND name = ? AND form_url = ? AND backend_id = ? AND target_key = ?
+            AND desired_generation = ? AND retired_at_ms IS NULL)`})`,
+        params: [
+          c.resourceUid,
+          installationId,
+          c.principal,
+          c.space,
+          c.name,
+          c.form,
+          backendId,
+          targetKey,
+          c.generation - 1,
+        ],
+      };
+      // A selected DELETE terminal always attempts insertion. Missing Core or
+      // owner proof must abort the bound batch rather than become zero-row success.
+      const terminal: SqlStatement = {
+        sql: `INSERT OR ABORT INTO main.${A} (operation_id, resource_uid, installation_id, incarnation_id,
+          principal, space, name, form_url, backend_id, target_key, action, generation, backend_key,
+          replay_key, fingerprint, accepted_spec_json, accepted_output_json, references_json,
+          configured_private_inputs_json, accepted_at, retain_until, revision)
+          VALUES ( ?, ?, ?, ${`(SELECT incarnation_id FROM main.${I} WHERE resource_uid = ?)`},
+            ?, ?, ?, ?, ?, ?, ?, ?, (SELECT op.backend_key FROM main.tf_v2_operations op WHERE op.id = ?), ?, ?, ?, ?, ?, NULL, ?, ?, ?
+          )`,
+        params: [
+          c.operationId,
+          c.resourceUid,
+          installationId,
+          c.resourceUid,
+          c.principal,
+          c.space,
+          c.name,
+          c.form,
+          backendId,
+          targetKey,
+          c.action,
+          c.generation,
+          c.operationId,
+          c.key,
+          c.fingerprint,
+          c.specJson,
+          c.outputJson,
+          c.referencesJson,
+          c.at,
+          c.retainUntil,
+          `${c.generation}-${workload}`,
         ],
       };
       return Promise.resolve(prepareV2HostAcceptance(sql, context, guard, terminal));
