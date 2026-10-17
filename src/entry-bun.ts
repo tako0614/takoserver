@@ -1534,7 +1534,7 @@ try {
         warnings: { state: "unavailable", reason: "transport-not-composed" },
       })
     : undefined;
-  const v2FormFactory = completeV2WorkerForms
+  const v2FormSelectionFactory = completeV2WorkerForms
     ? runtimeInputKeyAuthority
       ? v2WorkerComposition.privateInputFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
       : v2WorkerComposition.secretFreeFormFactory(selfhostV2WorkerEndpointBoot?.endpoint)
@@ -1557,8 +1557,8 @@ try {
     hostedPaidFreeExclusion: Boolean(hostedPricing),
     ...(hostedBilling ? { hostedBilling } : {}),
     v2ArtifactSourceFactory: createSelfhostPublicArtifactSource,
-    ...(v2FormFactory ? { v2FormFactory } : {}),
-    ...(v2FormFactory && runtimeInputKeyAuthority
+    ...(v2FormSelectionFactory ? { v2FormSelectionFactory } : {}),
+    ...(v2FormSelectionFactory && runtimeInputKeyAuthority
       ? { v2PrivateInputCustody: runtimeInputKeyAuthority.privateInputCustody }
       : {}),
     ...(payment.checkout ? { checkout: payment.checkout } : {}),

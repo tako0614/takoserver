@@ -1,6 +1,17 @@
 import { canonicalJson } from "../json.ts";
 import type { JsonObject, SqlParam } from "../ports.ts";
-import { WORKER_DEPLOYMENT_FORM_URL, WORKER_ENDPOINT_FORM_URL } from "./forms/worker-specs.ts";
+import {
+  CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
+  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+  FORWARD_WORKER_VERSION_FORM_URL,
+  parseForwardWorkerVersionSpec,
+  parseWorkerDeploymentSpec,
+  parseWorkerEndpointSpec,
+  parseWorkerVersionSpec,
+  WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_ENDPOINT_FORM_URL,
+  WORKER_VERSION_FORM_URL,
+} from "./forms/worker-specs.ts";
 import type { V2Execution } from "./types.ts";
 
 /** A captured predicate, to be embedded in the private route's single CAS statement. */
@@ -107,6 +118,13 @@ function exactIdSet(
 /** Internal builder: all evidence comes from the resolver's own SQL reads. */
 export function createWorkerPublicationSqlGuard(input: {
   readonly execution: V2Execution;
+  /** Closed internal scope, never an arbitrary caller-supplied Form list. */
+  readonly forwardDeployment?: true;
+  /** Endpoint03's actual captured06 source; never a requested Form or family list. */
+  readonly forwardEndpointDeployment?: {
+    readonly resourceUid: string;
+    readonly sourceOperationId: string;
+  } | null;
   readonly workerUid: string;
   readonly principal: string;
   readonly space: string;
@@ -118,11 +136,76 @@ export function createWorkerPublicationSqlGuard(input: {
   readonly referenceSetIds: readonly string[];
   readonly evidence: unknown;
 }): V2WorkerPublicationSqlGuard {
+  if (input.forwardDeployment && input.execution.form !== FORWARD_WORKER_DEPLOYMENT_FORM_URL)
+    throw new Error("Forward publication source mismatch");
   const resources: Rows = new Map();
   const operations: Rows = new Map();
   const owners: Rows = new Map();
   const edges: Rows = new Map();
   scanEvidence(input.evidence, resources, operations, owners, edges);
+  const endpointSource = input.forwardEndpointDeployment;
+  if (endpointSource !== undefined) {
+    if (
+      input.forwardDeployment ||
+      input.execution.form !== WORKER_ENDPOINT_FORM_URL ||
+      input.execution.principal !== input.principal ||
+      input.execution.space !== input.space
+    )
+      throw new Error("Forward Endpoint source mismatch");
+    if (endpointSource === null) {
+      // Removing an Endpoint after its Deployment is gone still needs the
+      // original live DELETE claim and the all-family exact empty set below.
+      if (input.execution.action !== "delete" || input.deploymentIds.length !== 0)
+        throw new Error("Forward Endpoint empty source mismatch");
+    } else {
+      const deployment = resources.get(endpointSource.resourceUid);
+      const source = operations.get(endpointSource.sourceOperationId);
+      if (
+        !deployment ||
+        !source ||
+        deployment.form_url !== FORWARD_WORKER_DEPLOYMENT_FORM_URL ||
+        deployment.uid !== endpointSource.resourceUid ||
+        source.id !== endpointSource.sourceOperationId ||
+        source.resource_uid !== deployment.uid ||
+        source.principal !== input.principal ||
+        deployment.principal !== input.principal ||
+        deployment.space !== input.space ||
+        source.backend_id !== deployment.backend_id ||
+        source.target_key !== deployment.target_key ||
+        source.target_key !== input.execution.targetKey ||
+        source.status !== "succeeded" ||
+        source.effect !== "complete" ||
+        (source.action !== "create" && source.action !== "update") ||
+        source.generation !== deployment.observed_generation ||
+        source.result_observed_json !== deployment.observed_json ||
+        typeof source.accepted_spec_json !== "string" ||
+        parseWorkerEndpointSpec(input.execution.spec).worker.resourceUid !== input.workerUid
+      )
+        throw new Error("Forward Endpoint captured Deployment mismatch");
+      const spec = parseWorkerDeploymentSpec(JSON.parse(source.accepted_spec_json));
+      if (spec.worker.resourceUid !== input.workerUid)
+        throw new Error("Forward Endpoint accepted Worker mismatch");
+      for (const selected of spec.versions) {
+        const version = resources.get(selected.workerVersion.resourceUid);
+        if (
+          !version ||
+          (version.form_url !== WORKER_VERSION_FORM_URL &&
+            version.form_url !== FORWARD_WORKER_VERSION_FORM_URL) ||
+          version.principal !== input.principal ||
+          version.space !== input.space ||
+          typeof version.spec_json !== "string"
+        )
+          throw new Error("Forward Endpoint captured Version mismatch");
+        const versionSpec =
+          version.form_url === WORKER_VERSION_FORM_URL
+            ? parseWorkerVersionSpec(JSON.parse(version.spec_json))
+            : parseForwardWorkerVersionSpec(JSON.parse(version.spec_json));
+        if (versionSpec.worker.resourceUid !== input.workerUid)
+          throw new Error("Forward Endpoint Version Worker mismatch");
+      }
+    }
+  }
+  const forwardScope = input.forwardDeployment === true || endpointSource !== undefined;
 
   const clauses: string[] = [];
   const params: SqlParam[] = [];
@@ -187,32 +270,72 @@ export function createWorkerPublicationSqlGuard(input: {
     ],
   });
 
-  for (const [form, ids] of [
-    [WORKER_DEPLOYMENT_FORM_URL, input.deploymentIds],
-    [WORKER_ENDPOINT_FORM_URL, input.endpointIds],
-  ] as const) {
+  if (forwardScope) {
     add(
       exactIdSet(
-        `tf_v2_resources r WHERE r.form_url = ? AND r.principal = ?
-          AND r.space = ? AND r.deleted_at IS NULL
-          AND json_extract(r.spec_json, '$.worker.resourceUid') = ?`,
+        `tf_v2_resources r WHERE r.form_url IN (?, ?, ?) AND r.principal=? AND r.space=? AND r.deleted_at IS NULL AND json_extract(r.spec_json,'$.worker.resourceUid')=?`,
         "r.uid",
-        ids,
-        [form, input.principal, input.space, input.workerUid],
+        input.deploymentIds,
+        [
+          WORKER_DEPLOYMENT_FORM_URL,
+          CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
+          FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+          input.principal,
+          input.space,
+          input.workerUid,
+        ],
       ),
     );
-  }
-  add(
-    exactIdSet(
-      `tf_v2_operations op JOIN tf_v2_resources r ON r.uid = op.resource_uid
+    add(
+      exactIdSet(
+        `tf_v2_resources r WHERE r.form_url=? AND r.principal=? AND r.space=? AND r.deleted_at IS NULL AND json_extract(r.spec_json,'$.worker.resourceUid')=?`,
+        "r.uid",
+        input.endpointIds,
+        [WORKER_ENDPOINT_FORM_URL, input.principal, input.space, input.workerUid],
+      ),
+    );
+    add(
+      exactIdSet(
+        `tf_v2_operations op JOIN tf_v2_resources r ON r.uid=op.resource_uid WHERE r.form_url IN (?, ?, ?, ?) AND r.deleted_at IS NULL AND op.status IN ('queued','running','waiting_input','reconciling') AND json_extract(op.accepted_spec_json,'$.worker.resourceUid')=?`,
+        "op.id",
+        input.pendingIds,
+        [
+          WORKER_DEPLOYMENT_FORM_URL,
+          CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
+          FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+          WORKER_ENDPOINT_FORM_URL,
+          input.workerUid,
+        ],
+      ),
+    );
+  } else {
+    for (const [form, ids] of [
+      [WORKER_DEPLOYMENT_FORM_URL, input.deploymentIds],
+      [WORKER_ENDPOINT_FORM_URL, input.endpointIds],
+    ] as const) {
+      add(
+        exactIdSet(
+          `tf_v2_resources r WHERE r.form_url = ? AND r.principal = ?
+          AND r.space = ? AND r.deleted_at IS NULL
+          AND json_extract(r.spec_json, '$.worker.resourceUid') = ?`,
+          "r.uid",
+          ids,
+          [form, input.principal, input.space, input.workerUid],
+        ),
+      );
+    }
+    add(
+      exactIdSet(
+        `tf_v2_operations op JOIN tf_v2_resources r ON r.uid = op.resource_uid
         WHERE r.form_url IN (?, ?) AND r.deleted_at IS NULL
           AND op.status IN ('queued', 'running', 'waiting_input', 'reconciling')
           AND json_extract(op.accepted_spec_json, '$.worker.resourceUid') = ?`,
-      "op.id",
-      input.pendingIds,
-      [WORKER_DEPLOYMENT_FORM_URL, WORKER_ENDPOINT_FORM_URL, input.workerUid],
-    ),
-  );
+        "op.id",
+        input.pendingIds,
+        [WORKER_DEPLOYMENT_FORM_URL, WORKER_ENDPOINT_FORM_URL, input.workerUid],
+      ),
+    );
+  }
   for (const id of input.referenceSetIds) {
     add({
       sql: "EXISTS (SELECT 1 FROM tf_v2_operation_reference_sets WHERE operation_id = ? AND sealed = 1)",

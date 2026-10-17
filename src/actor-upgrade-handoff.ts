@@ -5,6 +5,9 @@
  */
 import { type ActorAbiProfile, actorAbiProfile } from "./actor-class-execution.ts";
 
+// The Host wrapper must resolve profiles in this bundle's own identity scope.
+export { resolveActorAbiProfile } from "./actor-class-execution.ts";
+
 const NativeResponse = Response;
 const NativeResponseStatus = Object.getOwnPropertyDescriptor(Response.prototype, "status")?.get;
 const NativeResponseHeaders = Object.getOwnPropertyDescriptor(Response.prototype, "headers")?.get;

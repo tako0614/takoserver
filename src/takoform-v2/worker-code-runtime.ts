@@ -66,6 +66,7 @@ export type V2WorkerCodeDeploymentVariant = WorkerdDeploymentVariant<WorkerdSite
 export async function projectV2WorkerCodeVersion(input: {
   readonly identity: V2WorkerCodeVersionIdentity;
   readonly spec: unknown;
+  readonly sourceForm?: typeof import("./forms/worker-specs.ts").FORWARD_WORKER_VERSION_FORM_URL;
   readonly bundle: SqlArtifactCustodyRead<WorkerBundleManifest> | null;
   readonly assets?: SqlArtifactCustodyRead<StaticAssetBundleManifest> | null;
   readonly inspectModule: WorkerdRuntime["inspectModule"];
@@ -122,6 +123,7 @@ export async function projectV2WorkerCodeVersion(input: {
     resolvedObjectBucketBindings = input.resolvedObjectBucketBindings?.map((binding) => ({
       name: binding.name,
       resourceUid: binding.resourceUid,
+      ...(input.sourceForm === undefined ? {} : { formUrl: binding.formUrl }),
     }));
   } catch {
     throw new V2WorkerCodeRuntimeError("worker_binding_unavailable");
@@ -167,6 +169,7 @@ export async function projectV2WorkerCodeVersion(input: {
       ? {}
       : { assetResourceUid: identity.assetResourceUid }),
     spec: input.spec,
+    ...(input.sourceForm === undefined ? {} : { sourceForm: input.sourceForm }),
     bundle: input.bundle,
     ...(input.assets === undefined ? {} : { assets: input.assets }),
     inspectModule,

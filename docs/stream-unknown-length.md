@@ -2,7 +2,8 @@
 
 This document and the JSON vectors define **proposed F4 acceptance**, exercised
 against a test-only mock sink. They do not claim that the shipped adapters accept
-unknown-length streams. [ADR 0005](adr/0005-object-storage-is-an-exact-objectbucket-binding.md)
+unknown-length streams; the self-host implementation is qualified separately
+below. [ADR 0005](adr/0005-object-storage-is-an-exact-objectbucket-binding.md)
 currently requires `options.contentLength` for a `ReadableStream`, and
 `src/providers/edge-objects-adapter.ts` rejects its omission as `invalid_body`.
 That conformance gap must be resolved by the ObjectBucket/stream implementation
@@ -89,3 +90,55 @@ object visibility/receipt assertions and acknowledges consumed chunks through
 omitted content-length options, expected error shapes, visibility assertions, and
 source/backpressure checks when changing the factory. Mock PASS is fixture
 evidence only; the current production adapter is intentionally not under test.
+
+## Self-host implementation and forward contract alignment
+
+The self-host ObjectBucket path counts unknown-length byte streams in its
+private filesystem stage, under the same put and part ceilings. A supplied
+`contentLength` still requires exact EOF matching. Put publishes only after the
+stage finishes and its existing conditional commit succeeds; multipart records
+the actual part size in its existing durable receipt. Its private transport
+returns that size to the Worker facade, whose portable part receipt remains
+`{etag, partNumber}`. No whole-body buffer is used to discover the size.
+The generated Worker facade validates byte chunks before HTTP encoding can
+coerce another chunk type into bytes, and the data-plane stage counts them
+independently. Reader operations and byte brand checks are captured before
+tenant code runs. Producer failures preserve their sanitized portable code
+even if the transport wraps the stream error.
+
+ReadableStream bodies use the Host-private `byte-chunks-v1` transport on the
+existing ObjectBucket route. Each data record has a four-byte big-endian length
+and between one and 65,536 payload bytes. Empty source chunks are skipped, and
+zero-length wire data records are refused. The terminal
+`0xffffffff` record is emitted only after validated source EOF. The receiver
+requires this record followed by wire EOF, refusing truncated records,
+oversized records, missing termination, and trailing bytes before publication.
+This prevents a transport that presents producer failure as clean HTTP EOF
+from publishing an empty or partial replacement. Existing raw-body requests
+remain compatible. Logical `contentLength` excludes the framing records and is
+never sent as framed HTTP `Content-Length`.
+The private authenticated listener permits at most 26,843,545,604 wire bytes:
+five times the 5 GiB logical ceiling plus the four-byte terminal marker. Every
+data frame contains at least one payload byte, so even one-byte fragments fit
+this finite budget. Raw legacy bodies fit the same listener budget. The stage
+continues to enforce the smaller operation-specific logical byte ceilings.
+
+`tests/selfhost-object-stream-vectors.test.ts` exercises the production stage
+consumer and completion receipt validator with the original 52 vectors. Its
+sink discards bytes, so the actual 300 MiB/5 GiB counting results do not claim
+filesystem or native-provider qualification. The store and broker tests
+separately verify filesystem byte content, EOF visibility, conditional writes,
+failed streams, durable receipts, and unequal parts at bounded sizes. A local
+HTTP test also connects the generated facade and data service to the actual
+filesystem data-plane listener. Facade ceiling tests count real byte chunks
+through the production consumer while discarding them; they do not prove a
+5 GiB native HTTP or filesystem transfer.
+
+This runtime work does not change the immutable `edge.objects` 1.0.0 definition.
+That Interface still mandates stream lengths and equal-sized non-final parts;
+the owning Takoform release must establish the forward contract identity and
+pins before this proposal is advertised as a published portable guarantee.
+Native R2 and private-S3 adapters require separate streaming bridges and
+qualification. Ordinary Worker HTTP and control-plane artifact upload also
+remain separate acceptance surfaces; these ObjectBucket vectors define no
+generic HTTP body ceiling.

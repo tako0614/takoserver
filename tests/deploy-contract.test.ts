@@ -1,9 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import { lstatSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { DEPLOY_CONTRACT } from "../scripts/deploy/contract.ts";
 
 const REPOSITORY = `${import.meta.dir}/..`;
 
-async function deploy(args: readonly string[]): Promise<{
+async function deploy(
+  args: readonly string[],
+  env: Readonly<Record<string, string>> = {},
+): Promise<{
   readonly exitCode: number;
   readonly stdout: string;
   readonly stderr: string;
@@ -13,7 +19,7 @@ async function deploy(args: readonly string[]): Promise<{
     stdin: "ignore",
     stdout: "pipe",
     stderr: "pipe",
-    env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "" },
+    env: { PATH: process.env.PATH ?? "", HOME: process.env.HOME ?? "", ...env },
   });
   const [exitCode, stdout, stderr] = await Promise.all([
     child.exited,
@@ -702,6 +708,94 @@ describe("Takoserver split deploy entrypoint", () => {
       expect(refused.stdout).toBe("");
       expect(refused.stderr).toContain("no target was touched");
       expect(refused.stderr).not.toContain("deploy target descriptor");
+    }
+  });
+
+  test("original-create selection refuses unsupported modes before target or provider access", async () => {
+    const commit = `--commit=${"a".repeat(40)}`;
+    const storage = [
+      "takoserver-integration-storage-generation",
+      "--apply",
+      "--environment=integration",
+      commit,
+      `--generation=${"b".repeat(32)}`,
+    ];
+    const env = {
+      TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH: "/missing/input.json",
+    };
+    for (const args of [
+      storage,
+      ...["v2-0088", "v2-0091"].map((lineage) => [...storage, `--fresh-lineage=${lineage}`]),
+      ["takoserver-worker", "--status", "--environment=integration", commit],
+      ["takoserver-worker", "--status", "--environment=production", commit],
+    ]) {
+      const refused = await deploy(args, env);
+      expect(refused.exitCode).toBe(2);
+      expect(refused.stdout).toBe("");
+      expect(refused.stderr).toContain("original-create input is supported only");
+      expect(refused.stderr).not.toContain("deploy target descriptor");
+      expect(refused.stderr).not.toContain("CLOUDFLARE_API_TOKEN");
+    }
+    const contract = await deploy(["--contract"], env);
+    expect(contract.exitCode).toBe(0);
+    expect(contract.stderr).toBe("");
+    expect(JSON.parse(contract.stdout)).toEqual(DEPLOY_CONTRACT);
+    const surface = DEPLOY_CONTRACT.surfaces.find(
+      (candidate) => candidate.surface === "takoserver-integration-storage-generation",
+    );
+    expect(surface?.requiresEnv).toContain("TAKOSERVER_DEPLOY_TARGET_PRODUCTION");
+    expect(surface?.requiresEnv).toContain(
+      "TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH",
+    );
+  });
+
+  test("original fresh92 CLI loads only protected locators before selecting the existing target", async () => {
+    const root = mkdtempSync(join(tmpdir(), "integration-original-cli-"));
+    const custodyDirectory = join(root, "custody");
+    mkdirSync(custodyDirectory, { mode: 0o700 });
+    const stat = lstatSync(custodyDirectory, { bigint: true });
+    const path = join(root, "original-input.json");
+    writeFileSync(
+      path,
+      JSON.stringify({
+        kind: "positive-fresh-0092",
+        custodyDirectory,
+        custodyIdentity: { device: String(stat.dev), inode: String(stat.ino) },
+      }),
+      { mode: 0o600 },
+    );
+    try {
+      for (const action of ["--status", "--apply"]) {
+        const args = [
+          "takoserver-integration-storage-generation",
+          action,
+          "--environment=integration",
+          `--commit=${"a".repeat(40)}`,
+          `--generation=${"b".repeat(32)}`,
+          "--fresh-lineage=v2-0092",
+        ];
+        const selected = await deploy(args, {
+          TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH: path,
+          // This must not be read by the selected original-create branch.
+          TAKOSERVER_DEPLOY_TARGET_PRODUCTION: "not-an-absolute-production-target",
+        });
+        expect(selected.exitCode).toBe(2);
+        expect(selected.stderr).toContain("deploy target descriptor not found");
+        expect(selected.stderr).not.toContain("TAKOSERVER_DEPLOY_TARGET_PRODUCTION");
+        for (const invalid of ["", "relative-input.json", join(root, "absent.json")]) {
+          const refused = await deploy(args, {
+            TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH: invalid,
+          });
+          expect(refused.exitCode).toBe(2);
+          expect(refused.stdout).toBe("");
+          expect(refused.stderr).toContain(
+            "original-create input requires only pinned custody locators",
+          );
+          expect(refused.stderr).not.toContain("deploy target descriptor");
+        }
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

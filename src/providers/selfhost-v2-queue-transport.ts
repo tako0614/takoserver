@@ -1,16 +1,26 @@
 import { Buffer } from "node:buffer";
 import { createHmac, timingSafeEqual } from "node:crypto";
+import {
+  V2_QUEUE_SETTLEMENT_CONTENT_TYPE,
+  V2_QUEUE_SETTLEMENT_MAX_BYTES,
+  V2_QUEUE_SETTLEMENT_ORIGIN_BINDING,
+  V2_QUEUE_SETTLEMENT_PATH,
+  V2_QUEUE_SETTLEMENT_PROTOCOL,
+  V2_QUEUE_SETTLEMENT_SERVICE_BINDING,
+  V2_QUEUE_SETTLEMENT_SERVICE_MODULE,
+  V2_QUEUE_SETTLEMENT_TOKEN_BINDING,
+} from "./selfhost-v2-queue-contract.ts";
 
-/** This is a Host-private invocation plane, not a Host API or producer Binding. */
-export const V2_QUEUE_SETTLEMENT_PATH = "/.well-known/takoserver/selfhost-queue-settlement/v2";
-export const V2_QUEUE_SETTLEMENT_PROTOCOL = "takoserver.selfhost-queue-settlement@v2";
-export const V2_QUEUE_SETTLEMENT_CONTENT_TYPE =
-  "application/vnd.takoserver.queue-settlement.v2+json";
-export const V2_QUEUE_SETTLEMENT_SERVICE_MODULE = "__takoserver-v2-queue-settlement.js";
-export const V2_QUEUE_SETTLEMENT_SERVICE_BINDING = "__TAKOSERVER_V2_QUEUE_SETTLEMENT";
-export const V2_QUEUE_SETTLEMENT_ORIGIN_BINDING = "__TAKOSERVER_V2_QUEUE_SETTLEMENT_ORIGIN";
-export const V2_QUEUE_SETTLEMENT_TOKEN_BINDING = "__TAKOSERVER_V2_QUEUE_SETTLEMENT_TOKEN";
-export const V2_QUEUE_SETTLEMENT_MAX_BYTES = 8192;
+export {
+  V2_QUEUE_SETTLEMENT_CONTENT_TYPE,
+  V2_QUEUE_SETTLEMENT_MAX_BYTES,
+  V2_QUEUE_SETTLEMENT_ORIGIN_BINDING,
+  V2_QUEUE_SETTLEMENT_PATH,
+  V2_QUEUE_SETTLEMENT_PROTOCOL,
+  V2_QUEUE_SETTLEMENT_SERVICE_BINDING,
+  V2_QUEUE_SETTLEMENT_SERVICE_MODULE,
+  V2_QUEUE_SETTLEMENT_TOKEN_BINDING,
+};
 
 /**
  * Runs in its own workerd service. Its bearer and external origin are never

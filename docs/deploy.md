@@ -198,8 +198,8 @@ digest `sha256:6f7c1016b7ffeeb7c02006cdb8e55dc7919bfc2aeaf04c090001dcf423454be2`
 Choose it only to prepare an isolated staging D1 with the frozen 0092 schema.
 The current USD-micros Worker requires a separately qualified 0093/0094 cutover
 and the complete 0094 schema even when `billingConfig` is absent. The 0092
-payload alone cannot serve the current Worker. It behaves like `v2-0091` in
-every other generation respect:
+payload alone cannot serve the current Worker. Without the optional original-create
+input below, it behaves like `v2-0091` in every other generation respect:
 
 - Production fresh init refuses it.
 - It only creates a new `integration-takoserver-<generation>` D1.
@@ -223,6 +223,56 @@ either profile. For `v2-0092`, read it with these substitutions:
 - Do not bootstrap or routinely publish the current Worker on this D1. Both
   refuse before upload until an independently qualified 0093/0094 cutover has
   produced the exact audited 0094 schema and money-unit policy.
+
+##### Original fresh92 creation with retained custody
+
+The same storage-generation surface can select its existing original creator by
+setting `TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH` to an absolute
+canonical private JSON file, then using the existing arguments:
+
+```bash
+bun run deploy -- takoserver-integration-storage-generation --apply --environment=integration --commit=<sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-0092
+```
+
+This mode fixes `namespace: "integration-ts"` and `freshLineage: "v2-0092"`;
+both new names are `integration-ts-<generation>`. There is no `--namespace` flag.
+The file contains exactly the existing creator's locators:
+
+```json
+{
+  "kind": "positive-fresh-0092",
+  "custodyDirectory": "/absolute/operator-private/original-custody",
+  "custodyIdentity": { "device": "<original decimal device>", "inode": "<original decimal inode>" }
+}
+```
+
+Provision the custody root independently, record its device/inode at provisioning,
+and retain that original pin. The root and input-file parent must already be real,
+owned, canonical `0700` directories outside every checkout. The input is an owned
+single-link `0600` regular file of at most 16 KiB; the reader uses a nonblocking
+held descriptor, bounded reads, strict UTF-8 and replacement/growth checks. It
+does not create or repin custody. Unknown fields, supplied receipts, UUIDs, grants,
+proofs and readiness flags are refused. These serialized locators are not proof
+of origin: only the existing creator constructs its private context and retained
+dispatch/ACK/import/R2/terminal chain.
+
+The integration target is the original incumbent collision tuple, not the new
+target. This mode neither opens `TAKOSERVER_DEPLOY_TARGET_PRODUCTION` nor forwards
+`productionD1`; its existing original creator still owns source qualification,
+fixed92 import, review, incumbent collision checks and native identity readback.
+Omitting the input variable preserves the default branch and its production D1
+guard. A selected input on another surface or lineage refuses before target or
+provider access; `--contract` never opens it.
+
+Keep the original target, invocation, custody root and sealed artifact unchanged
+after the command. The existing read-only `verifyIntegrationStorageOriginalCreate`
+owner reopens that chain and observes actual D1/R2 identities when a separately
+selected new target is needed; neither a saved result nor `--status` can replace
+it. Status is diagnostic-only. Lost ACK or partial progress retains UNKNOWN and
+must not be retried, adopted or automatically deleted. Even a native terminal
+result requires independent origin review; injected component ports remain
+`component-simulation`. Original92 evidence grants neither money94/realm readiness
+nor Host/CPE publication or normal Worker activation.
 
 #### Staging D1 through 0091 (staging-only `v2-0091`)
 
@@ -1915,6 +1965,33 @@ surface exists so that no restore depends on that exit code:
 - after the one `d1 execute --file` import it verifies the target by readback
   and prints every mismatch. A partial application is a verification failure,
   never a success.
+
+The dump scanner keeps an entire `CREATE TRIGGER ... BEGIN ... END;` as one
+statement, including its internal semicolons, quoted tokens and comments.
+Trigger-body `INSERT ... SELECT`, `VALUES`, updates and deletes define behavior;
+they do not add backup rows. An incomplete trigger is refused, and top-level
+INSERTs that cannot be counted remain refused.
+
+`inspectSnapshotDumpLocally` provides source-owned, offline backup verification:
+it restores normalized bytes only into memory, uses the same strict table,
+row-count, schema-object, lineage and foreign-key readback checks, and checks
+SQLite integrity before any optional row inspector runs. Inspectors receive a
+read-only copy for source-owned financial or typed-row digest readers. Its result
+does not prove remote import acknowledgement or writer quiescence, and grants no
+remote apply, replay or cutover authority.
+
+Before any native execution, the local helper accepts only the bounded export
+grammar: table/index/trigger/view creation, counted INSERTs, sqlite_sequence
+cleanup, BEGIN/COMMIT and boolean foreign_keys/defer_foreign_keys pragmas. Counts
+do not authorize other statements. Native SQLite authorization independently
+restricts every expression, trigger and stored-view operation to the main
+in-memory database and built-in functions other than extension loading. Unknown
+actions, attachment/detachment, virtual tables and other pragmas are denied;
+VACUUM and other unsupported top-level verbs are refused before execution.
+Temporary storage stays in memory, database/cell/SQL size is bounded, and the
+inspector's copied connection permits only read operations and bounded readback
+pragmas. Neither dump nor inspector SQL can attach another database or disable
+the read-only policy. Refusals do not print snapshot SQL or embedded paths/values.
 
 Both actions use an absolute, operator-owned 0600 JSON file at
 `TAKOSERVER_D1_SNAPSHOT_RESTORE_DECLARATION_PATH`, and the snapshot itself must

@@ -21,7 +21,10 @@ import {
 } from "./providers/selfhost-worker-wrapper.ts";
 import { createSelfhostV2QueueWorkerCapability } from "./selfhost-v2-queue-worker-capability.ts";
 import { createSelfhostV2ScheduledComposition } from "./selfhost-v2-scheduled-composition.ts";
-import type { V2OperatorFormFactory } from "./takoform-v2/application.ts";
+import type {
+  V2OperatorFormFactory,
+  V2OperatorFormSelectionFactory,
+} from "./takoform-v2/application.ts";
 import type { V2ApplicationConfig } from "./takoform-v2/config.ts";
 import { readV2ConfiguredPrivateInputs } from "./takoform-v2/configured-private-inputs.ts";
 import { ACTOR_NAMESPACE_FORM_URL } from "./takoform-v2/forms/actor-namespace.ts";
@@ -41,15 +44,25 @@ import { QUEUE_CONSUMER_FORM_URL } from "./takoform-v2/forms/queue-consumer.ts";
 import { createQueueWorkerBindingAuthority } from "./takoform-v2/forms/queue-worker-binding-authority.ts";
 import { SQLITE_DATABASE_FORM_URL } from "./takoform-v2/forms/sqlite-database.ts";
 import { createSQLiteDatabaseForm } from "./takoform-v2/forms/sqlite-database-backend.ts";
-import { SQLITE_MIGRATION_APPLICATION_FORM_URL } from "./takoform-v2/forms/sqlite-migration-application.ts";
+import {
+  SQLITE_MIGRATION_APPLICATION_FORM_URL,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0,
+} from "./takoform-v2/forms/sqlite-migration-application.ts";
 import { createSQLiteMigrationApplicationForm } from "./takoform-v2/forms/sqlite-migration-application-backend.ts";
 import { createSQLiteMigrationApplicationNativePort } from "./takoform-v2/forms/sqlite-migration-application-native.ts";
+import {
+  SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
+  SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
+} from "./takoform-v2/forms/sqlite-migration-set.ts";
 import { createSQLiteMigrationSetCustody } from "./takoform-v2/forms/sqlite-migration-set-backend.ts";
 import { createSQLiteWorkerBindingAuthority } from "./takoform-v2/forms/sqlite-worker-binding-authority.ts";
 import { createStaticAssetBundleCustody } from "./takoform-v2/forms/static-asset-bundle-backend.ts";
 import { createWorkerBundleCustody } from "./takoform-v2/forms/worker-bundle-backend.ts";
 import { WORKER_CRON_TRIGGER_FORM_URL } from "./takoform-v2/forms/worker-cron-trigger.ts";
 import {
+  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+  FORWARD_WORKER_VERSION_FORM_URL,
   MODULE_WORKER_FORM_URL,
   parseWorkerDeploymentSpec,
   WORKER_DEPLOYMENT_FORM_URL,
@@ -59,31 +72,47 @@ import {
 import type { createSelfhostV2WorkflowComposition } from "./takoform-v2/selfhost-v2-workflow-composition.ts";
 import { createV2ServiceBindingAuthority } from "./takoform-v2/service-binding-authority.ts";
 import {
+  createForwardWorkerCronTriggerAdmissionReader,
   createWorkerCronTriggerAdmissionReader,
   createWorkerCronTriggerForm,
 } from "./takoform-v2/worker-cron-trigger-backend.ts";
 import type { WorkerCronTriggerTickResult } from "./takoform-v2/worker-cron-trigger-scheduler.ts";
-import { createWorkerDeploymentForm } from "./takoform-v2/worker-deployment-backend.ts";
-import { createWorkerEndpointForm } from "./takoform-v2/worker-endpoint-backend.ts";
 import {
+  createForwardWorkerDeploymentForm,
+  createWorkerDeploymentForm,
+} from "./takoform-v2/worker-deployment-backend.ts";
+import {
+  createForwardWorkerEndpointForm,
+  createWorkerEndpointForm,
+} from "./takoform-v2/worker-endpoint-backend.ts";
+import {
+  createInternalV2ForwardWorkerVersionForm,
   createInternalV2ModuleWorkerForm,
   createInternalV2WorkerVersionForm,
   createV2CodeConfiguredInputReader,
+  createV2ForwardCodeConfiguredInputReader,
   MODULE_WORKER_LIFECYCLE_BACKEND_ID,
 } from "./takoform-v2/worker-lifecycle-backend.ts";
-import { createV2WorkerPublicationState } from "./takoform-v2/worker-publication-state.ts";
+import {
+  createV2ForwardWorkerPublicationState,
+  createV2WorkerPublicationState,
+} from "./takoform-v2/worker-publication-state.ts";
 import { createAtLeastOnceQueueForm } from "./takoform-v2/worker-queue-backend.ts";
 import {
   createQueueConsumerForm,
   type V2QueueConsumerCapability,
 } from "./takoform-v2/worker-queue-consumer-backend.ts";
 import { createV2WorkerdWorkerRuntimeReaders } from "./takoform-v2/worker-runtime-readers.ts";
-import type { createV2WorkerVersionConfiguredInputSealer } from "./takoform-v2/worker-version-configured-inputs.ts";
+import type {
+  createV2ForwardWorkerVersionConfiguredInputSealer,
+  createV2WorkerVersionConfiguredInputSealer,
+} from "./takoform-v2/worker-version-configured-inputs.ts";
 import { spawnWorkerdWithParentDeath } from "./workerd-linux-process.ts";
 import type { WorkerdProcess } from "./workerd-supervisor.ts";
 import { createWorkerdWorkerModuleInspector } from "./workerd-worker-module-inspector.ts";
 import {
   type OpenWorkerdWorkerRuntimeOwnerOptions,
+  openForwardWorkerdWorkerRuntimeOwner,
   openWorkerdWorkerRuntimeOwner,
   type WorkerdWorkerRuntimeOwner,
 } from "./workerd-worker-runtime-owner.ts";
@@ -303,7 +332,26 @@ async function unusedPrivatePort(excluded: Set<number>): Promise<number> {
  * composition shares the normal application's SQL and held object store; it
  * neither adds a Resource ledger nor registers incomplete Worker Forms itself.
  */
-export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompositionOptions): {
+export interface SelfhostV2ForwardWorkerCompositionOptions
+  extends SelfhostV2WorkerCompositionOptions {
+  /** Explicit07 AAD authority from trusted operator boot; never reconstructed from JSON. */
+  readonly forwardConfiguredInputSealer?: ReturnType<
+    typeof createV2ForwardWorkerVersionConfiguredInputSealer
+  >;
+}
+export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompositionOptions) {
+  return createWorkerComposition(options, false);
+}
+/** Named source-owned07/06 composition. Does not register ObjectBucket03 or alter normal boot. */
+export function createSelfhostV2ForwardWorkerComposition(
+  options: SelfhostV2ForwardWorkerCompositionOptions,
+) {
+  return createWorkerComposition(options, true);
+}
+function createWorkerComposition(
+  options: SelfhostV2ForwardWorkerCompositionOptions,
+  forwardFamily: boolean,
+): {
   restoreOwners(): Promise<readonly string[]>;
   /** Trusted graph-reader port; never opens an unlisted owner during restoration. */
   actorOwnerForRecovery(uid: string): Promise<WorkerdWorkerRuntimeOwner | null>;
@@ -346,8 +394,8 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
    */
   internalFormFactoryForEndpoint(endpoint: EndpointPorts): V2OperatorFormFactory;
   /** Complete secret-free public admission; runtime ciphertext recovery remains configured. */
-  secretFreeFormFactory(endpoint?: EndpointPorts): V2OperatorFormFactory;
-  privateInputFormFactory(endpoint?: EndpointPorts): V2OperatorFormFactory;
+  secretFreeFormFactory(endpoint?: EndpointPorts): V2OperatorFormSelectionFactory;
+  privateInputFormFactory(endpoint?: EndpointPorts): V2OperatorFormSelectionFactory;
 } {
   if (!options.targetKey || !options.rootDirectory || !options.sql || !options.objects) {
     throw new TypeError("v2 Worker composition requires SQL, objects, target and private root");
@@ -486,13 +534,29 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         compare: suppliedSealer.compare,
       })
     : undefined;
-  const configuredInputCustody = configuredInputSealer
-    ? {
-        read: (identity: Parameters<typeof readV2ConfiguredPrivateInputs>[1]) =>
-          readV2ConfiguredPrivateInputs(sql, identity),
-      }
+  const suppliedForwardSealer = forwardFamily ? options.forwardConfiguredInputSealer : undefined;
+  if (
+    suppliedForwardSealer &&
+    (typeof suppliedForwardSealer.seal !== "function" ||
+      typeof suppliedForwardSealer.open !== "function" ||
+      typeof suppliedForwardSealer.compare !== "function")
+  )
+    throw new TypeError("forward Worker configured input sealer is incomplete");
+  const forwardConfiguredInputSealer = suppliedForwardSealer
+    ? Object.freeze({
+        seal: suppliedForwardSealer.seal.bind(suppliedForwardSealer),
+        open: suppliedForwardSealer.open.bind(suppliedForwardSealer),
+        compare: suppliedForwardSealer.compare,
+      })
     : undefined;
-  const configuredInputs =
+  const configuredInputCustody =
+    configuredInputSealer || forwardConfiguredInputSealer
+      ? {
+          read: (identity: Parameters<typeof readV2ConfiguredPrivateInputs>[1]) =>
+            readV2ConfiguredPrivateInputs(sql, identity),
+        }
+      : undefined;
+  const retainedConfiguredInputs =
     configuredInputSealer && configuredInputCustody
       ? createV2CodeConfiguredInputReader({
           sql,
@@ -500,6 +564,35 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
           custody: configuredInputCustody,
         })
       : undefined;
+  const forwardConfiguredInputs =
+    forwardConfiguredInputSealer && configuredInputCustody
+      ? createV2ForwardCodeConfiguredInputReader({
+          sql,
+          sealer: forwardConfiguredInputSealer,
+          custody: configuredInputCustody,
+        })
+      : undefined;
+  const configuredInputs = forwardFamily
+    ? {
+        async read(input: Parameters<NonNullable<typeof retainedConfiguredInputs>["read"]>[0]) {
+          // Capture before the first SQL await; source Form comes only from this SQL resource.
+          const captured = { ...input, spec: structuredClone(input.spec) };
+          const rows = await sql.query(
+            `SELECT form_url FROM tf_v2_resources
+        WHERE uid = ? AND principal = ? AND space = ? AND target_key = ? AND deleted_at IS NULL`,
+            [captured.resourceUid, captured.principal, captured.space, captured.targetKey],
+          );
+          if (rows.length !== 1) return null;
+          const reader =
+            rows[0]?.form_url === WORKER_VERSION_FORM_URL
+              ? retainedConfiguredInputs
+              : rows[0]?.form_url === FORWARD_WORKER_VERSION_FORM_URL
+                ? forwardConfiguredInputs
+                : undefined;
+          return reader ? await reader.read(captured) : null;
+        },
+      }
+    : retainedConfiguredInputs;
   const bundleCustody = config.workerBundle
     ? createWorkerBundleCustody({
         sql,
@@ -518,7 +611,9 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         }),
       })
     : undefined;
-  const publicationState = createV2WorkerPublicationState({
+  const publicationState = (
+    forwardFamily ? createV2ForwardWorkerPublicationState : createV2WorkerPublicationState
+  )({
     sql,
     now: clock,
     ...(bundleCustody ? { bundleCustody } : {}),
@@ -947,7 +1042,9 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         throw new Error("v2 Worker UID is not current in this Host target");
       }
       const actorIdentity = Object.freeze({ principal: row.principal, space: row.space });
-      return await openWorkerdWorkerRuntimeOwner({
+      return await (forwardFamily
+        ? openForwardWorkerdWorkerRuntimeOwner
+        : openWorkerdWorkerRuntimeOwner)({
         rootDirectory: options.rootDirectory,
         workerResourceUid: uid,
         targetKey,
@@ -1039,12 +1136,22 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         expectedServing.add(ownerKey(row.uid));
       }
     }
-    const deployments = await sql.query(
-      `SELECT spec_json FROM tf_v2_resources
+    const deployments = [
+      ...(await sql.query(
+        `SELECT spec_json FROM tf_v2_resources
        WHERE form_url = ? AND target_key = ? AND deleted_at IS NULL
          AND json_extract(observed_json, '$.active') = 1`,
-      [WORKER_DEPLOYMENT_FORM_URL, targetKey],
-    );
+        [WORKER_DEPLOYMENT_FORM_URL, targetKey],
+      )),
+    ];
+    if (forwardFamily)
+      deployments.push(
+        ...(await sql.query(
+          `SELECT spec_json FROM tf_v2_resources WHERE form_url = ? AND target_key = ?
+        AND deleted_at IS NULL AND json_extract(observed_json, '$.active') = 1`,
+          [FORWARD_WORKER_DEPLOYMENT_FORM_URL, targetKey],
+        )),
+      );
     for (const row of deployments) {
       if (typeof row.spec_json !== "string") throw new Error("v2 Deployment inventory malformed");
       const workerUid = parseWorkerDeploymentSpec(JSON.parse(row.spec_json)).worker.resourceUid;
@@ -1258,7 +1365,40 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
             : {}),
           backend: runtimeVersionForm.backend,
         };
+    const forwardRuntimeVersionForm = forwardFamily
+      ? createInternalV2ForwardWorkerVersionForm({
+          ...versionOptions,
+          ...(forwardConfiguredInputSealer && configuredInputCustody
+            ? { configuredInputSealer: forwardConfiguredInputSealer, configuredInputCustody }
+            : {}),
+        })
+      : undefined;
+    const forwardAdmissionVersionForm =
+      forwardRuntimeVersionForm && !allowPrivateInputs
+        ? createInternalV2ForwardWorkerVersionForm(versionOptions)
+        : forwardRuntimeVersionForm;
+    // Public admission may refuse sensitive fresh inputs while retained runtime
+    // operations keep the same boot-captured ciphertext authority and backend.
+    // Spreading the actual admission Form preserves its Core-issued exact refs.
+    const forwardVersionForm =
+      forwardRuntimeVersionForm && forwardAdmissionVersionForm
+        ? { ...forwardAdmissionVersionForm, backend: forwardRuntimeVersionForm.backend }
+        : undefined;
     return {
+      ...(forwardVersionForm
+        ? {
+            [FORWARD_WORKER_VERSION_FORM_URL]: forwardVersionForm,
+            [FORWARD_WORKER_DEPLOYMENT_FORM_URL]: createForwardWorkerDeploymentForm({
+              targetKey,
+              publicationState,
+              scheduledAttachments: createForwardWorkerCronTriggerAdmissionReader({ sql }),
+              ownerForWorker: async (uid) => {
+                await restoration;
+                return await openOwner(uid);
+              },
+            }),
+          }
+        : {}),
       [MODULE_WORKER_FORM_URL]: createInternalV2ModuleWorkerForm({
         sql,
         targetKey,
@@ -1302,7 +1442,9 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
         : {}),
       ...(endpoint
         ? {
-            [WORKER_ENDPOINT_FORM_URL]: createWorkerEndpointForm({
+            [WORKER_ENDPOINT_FORM_URL]: (forwardFamily
+              ? createForwardWorkerEndpointForm
+              : createWorkerEndpointForm)({
               targetKey,
               publicationState,
               ownerForWorker: async (uid) => {
@@ -1338,7 +1480,7 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
   function completeFormFactory(
     endpoint: EndpointPorts | undefined,
     allowPrivateInputs: boolean,
-  ): V2OperatorFormFactory {
+  ): V2OperatorFormSelectionFactory {
     if (!restorationComplete || ownerAdmissionFrozen)
       throw new TypeError("v2 Worker owners must restore before Form composition");
     if (
@@ -1369,6 +1511,28 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
           now: clock,
         })
       : undefined;
+    const retainedMigrationCustody = config.sqliteMigrationSet
+      ? createSQLiteMigrationSetCustody({
+          sql,
+          source: createV2HeldArtifactSource({
+            objects,
+            entries: config.sqliteMigrationSet.heldArtifacts,
+          }),
+          now: clock,
+          formUrl: SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
+        })
+      : undefined;
+    const retainedDeferMigrationCustody = config.sqliteMigrationSet
+      ? createSQLiteMigrationSetCustody({
+          sql,
+          source: createV2HeldArtifactSource({
+            objects,
+            entries: config.sqliteMigrationSet.heldArtifacts,
+          }),
+          now: clock,
+          formUrl: SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
+        })
+      : undefined;
     let capturedEndpoint: EndpointPorts | undefined;
     if (endpoint !== undefined) {
       const { assignHostname, observeTls, observeRouteAbsent } = endpoint;
@@ -1382,37 +1546,64 @@ export function createSelfhostV2WorkerComposition(options: SelfhostV2WorkerCompo
       capturedEndpoint = Object.freeze({ assignHostname, observeTls, observeRouteAbsent });
     }
     return (context) => ({
-      ...createInternalForms(context, capturedEndpoint, allowPrivateInputs),
-      [SQLITE_DATABASE_FORM_URL]: createSQLiteDatabaseForm({ store: sqliteStore }),
-      ...(migrationCustody
-        ? {
-            [SQLITE_MIGRATION_APPLICATION_FORM_URL]: createSQLiteMigrationApplicationForm({
-              sql,
-              migrationPort: createSQLiteMigrationApplicationNativePort(sqliteStore),
-              custody: migrationCustody,
-              targetKey,
-              now: clock,
-            }),
-          }
-        : {}),
-      [EDGE_KV_NAMESPACE_FORM_URL]: createEdgeKVNamespaceForm({
-        store: kvStore,
-        targetKey,
-      }),
-      [OBJECT_BUCKET_FORM_URL]: createObjectBucketForm({
-        store: objectBucketStore,
-        targetKey,
-        backendId: v2ObjectBucketBinding.backendId,
-      }),
+      forms: {
+        ...createInternalForms(context, capturedEndpoint, allowPrivateInputs),
+        [SQLITE_DATABASE_FORM_URL]: createSQLiteDatabaseForm({ store: sqliteStore }),
+        ...(migrationCustody
+          ? {
+              [SQLITE_MIGRATION_APPLICATION_FORM_URL]: createSQLiteMigrationApplicationForm({
+                sql,
+                migrationPort: createSQLiteMigrationApplicationNativePort(sqliteStore),
+                custody: migrationCustody,
+                targetKey,
+                now: clock,
+              }),
+            }
+          : {}),
+        [EDGE_KV_NAMESPACE_FORM_URL]: createEdgeKVNamespaceForm({
+          store: kvStore,
+          targetKey,
+        }),
+        [OBJECT_BUCKET_FORM_URL]: createObjectBucketForm({
+          store: objectBucketStore,
+          targetKey,
+          backendId: v2ObjectBucketBinding.backendId,
+        }),
+      },
+      retainedForms:
+        retainedMigrationCustody && retainedDeferMigrationCustody
+          ? {
+              [SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0]: createSQLiteMigrationApplicationForm({
+                sql,
+                migrationPort: createSQLiteMigrationApplicationNativePort(sqliteStore),
+                custody: retainedMigrationCustody,
+                targetKey,
+                now: clock,
+                formUrl: SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
+              }),
+              [SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0]: createSQLiteMigrationApplicationForm({
+                sql,
+                migrationPort: createSQLiteMigrationApplicationNativePort(sqliteStore),
+                custody: retainedDeferMigrationCustody,
+                targetKey,
+                now: clock,
+                formUrl: SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0,
+              }),
+            }
+          : {},
     });
   }
 
-  function secretFreeFormFactory(endpoint?: EndpointPorts): V2OperatorFormFactory {
+  function secretFreeFormFactory(endpoint?: EndpointPorts): V2OperatorFormSelectionFactory {
     return completeFormFactory(endpoint, false);
   }
 
-  function privateInputFormFactory(endpoint?: EndpointPorts): V2OperatorFormFactory {
-    if (!configuredInputSealer || !configuredInputCustody) {
+  function privateInputFormFactory(endpoint?: EndpointPorts): V2OperatorFormSelectionFactory {
+    if (
+      !configuredInputSealer ||
+      !configuredInputCustody ||
+      (forwardFamily && !forwardConfiguredInputSealer)
+    ) {
       throw new TypeError("v2 Worker private input key authority is unavailable");
     }
     return completeFormFactory(endpoint, true);

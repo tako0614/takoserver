@@ -1,10 +1,20 @@
 import { bytesDigest, canonicalJson } from "../json.ts";
 import type { WorkerdPublicationIdentity } from "../workerd-runtime.ts";
 import type { WorkerdWorkerRuntimeOwner } from "../workerd-worker-runtime-owner.ts";
-import { referencesForWorkerDeployment } from "./forms/worker-references.ts";
 import {
+  fixedReferencesForForwardWorkerDeployment,
+  prepareForwardWorkerDeploymentReferences,
+  referencesForWorkerDeployment,
+} from "./forms/worker-references.ts";
+import {
+  CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
+  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+  FORWARD_WORKER_VERSION_FORM_URL,
+  parseForwardWorkerDeploymentSpec,
+  parseForwardWorkerVersionSpec,
   parseWorkerDeploymentSpec,
   parseWorkerVersionSpec,
+  validateForwardWorkerDeploymentUpdate,
   validateWorkerDeploymentUpdate,
   WORKER_DEPLOYMENT_FORM_URL,
   WorkerFormValidationError,
@@ -63,11 +73,13 @@ function deploymentAdmission(input: {
     // A deleting or failed Resource still owns its UID until DELETE settles;
     // a same-UID update excludes itself, while a deleted UID can be replaced.
     sql: `NOT EXISTS (SELECT 1 FROM tf_v2_resources other
-      WHERE other.form_url = ? AND other.principal = ? AND other.space = ?
+      WHERE other.form_url IN (?, ?, ?) AND other.principal = ? AND other.space = ?
         AND other.deleted_at IS NULL AND other.uid <> ?
         AND json_extract(other.spec_json, '$.worker.resourceUid') = ?)`,
     params: [
       WORKER_DEPLOYMENT_FORM_URL,
+      CONTAINER_WORKER_DEPLOYMENT_FORM_URL,
+      FORWARD_WORKER_DEPLOYMENT_FORM_URL,
       input.principal,
       input.space,
       input.resourceUid,
@@ -83,19 +95,23 @@ function deploymentAdmission(input: {
  * No other native sender may be installed for the same Worker UID/target.
  * The caller owns that mapping, durable owner lock, and runtime lifecycle.
  */
-export function createWorkerDeploymentForm(options: {
-  readonly targetKey: string;
-  readonly publicationState: PublicationState;
-  readonly ownerForWorker: (workerUid: string) => Promise<RuntimeOwner> | RuntimeOwner;
-  /** A missing reader is refusal, never evidence that no Cron attachment exists. */
-  readonly scheduledAttachments: V2ScheduledAttachmentRequirementReader;
-}): V2Form {
+export function createWorkerDeploymentForm(
+  options: {
+    readonly targetKey: string;
+    readonly publicationState: PublicationState;
+    readonly ownerForWorker: (workerUid: string) => Promise<RuntimeOwner> | RuntimeOwner;
+    /** A missing reader is refusal, never evidence that no Cron attachment exists. */
+    readonly scheduledAttachments: V2ScheduledAttachmentRequirementReader;
+  },
+  forward = false,
+): V2Form {
   if (!options.targetKey) throw new TypeError("targetKey is required");
   if (!options.scheduledAttachments) throw new TypeError("scheduledAttachments is required");
 
   async function run(execution: V2Execution): Promise<V2BackendResult> {
     if (
-      execution.form !== WORKER_DEPLOYMENT_FORM_URL ||
+      execution.form !==
+        (forward ? FORWARD_WORKER_DEPLOYMENT_FORM_URL : WORKER_DEPLOYMENT_FORM_URL) ||
       execution.backendId !== WORKER_DEPLOYMENT_BACKEND_ID ||
       execution.targetKey !== options.targetKey ||
       (execution.action !== "create" &&
@@ -156,7 +172,12 @@ export function createWorkerDeploymentForm(options: {
         missingScheduledHandler =
           result.required &&
           (before.snapshot.deployment?.versions.some(
-            (version) => !parseWorkerVersionSpec(version.spec).handlers.includes("scheduled"),
+            (version) =>
+              !(
+                version.form === FORWARD_WORKER_VERSION_FORM_URL
+                  ? parseForwardWorkerVersionSpec(version.spec)
+                  : parseWorkerVersionSpec(version.spec)
+              ).handlers.includes("scheduled"),
           ) ??
             true);
       } catch {
@@ -290,7 +311,9 @@ export function createWorkerDeploymentForm(options: {
     },
     async prepareAdmission(input) {
       try {
-        return deploymentAdmission(input);
+        return forward
+          ? await prepareForwardWorkerDeploymentReferences(input, deploymentAdmission(input))
+          : deploymentAdmission(input);
       } catch (error) {
         if (error instanceof WorkerFormValidationError) throw new TakoformV2Error(error.code, 422);
         throw error;
@@ -298,7 +321,9 @@ export function createWorkerDeploymentForm(options: {
     },
     references(spec) {
       try {
-        return referencesForWorkerDeployment(parseWorkerDeploymentSpec(spec));
+        return forward
+          ? fixedReferencesForForwardWorkerDeployment(parseForwardWorkerDeploymentSpec(spec))
+          : referencesForWorkerDeployment(parseWorkerDeploymentSpec(spec));
       } catch (error) {
         if (error instanceof WorkerFormValidationError) throw new TakoformV2Error(error.code, 422);
         throw error;
@@ -368,4 +393,71 @@ export async function exactV2WorkerPublicationIdentity(
     versions,
   };
   return canonicalJson(identity) === canonicalJson(expected);
+}
+
+/** Exact forward admission; no legacy runtime fallback or default registration. */
+export function createForwardWorkerDeploymentForm(
+  options:
+    | { readonly targetKey: string }
+    | (Omit<Parameters<typeof createWorkerDeploymentForm>[0], "publicationState"> & {
+        readonly publicationState: PublicationState & {
+          resolveForward(input: {
+            execution: V2Execution;
+            incumbentSourceOperationId?: string;
+          }): Promise<V2WorkerPublicationResolution>;
+        };
+      }),
+): V2Form {
+  if (!options.targetKey) throw new TypeError("targetKey is required");
+  if ("publicationState" in options)
+    return createWorkerDeploymentForm(
+      {
+        ...options,
+        publicationState: {
+          resolve: options.publicationState.resolveForward.bind(options.publicationState),
+        },
+      },
+      true,
+    );
+  const unavailable = async (execution: V2Execution): Promise<V2BackendResult> => ({
+    kind: "unknown",
+    code:
+      execution.form === FORWARD_WORKER_DEPLOYMENT_FORM_URL &&
+      execution.targetKey === options.targetKey &&
+      execution.backendId === WORKER_DEPLOYMENT_BACKEND_ID
+        ? "worker_forward_materializer_unavailable"
+        : "worker_forward_identity_unavailable",
+    message: "The forward Worker materializer is unavailable",
+  });
+  return {
+    validateCreate(spec) {
+      try {
+        parseForwardWorkerDeploymentSpec(spec);
+      } catch (error) {
+        if (error instanceof WorkerFormValidationError) throw new TakoformV2Error(error.code, 422);
+        throw error;
+      }
+    },
+    validateUpdate(previous, spec) {
+      try {
+        validateForwardWorkerDeploymentUpdate(previous, spec);
+      } catch (error) {
+        if (error instanceof WorkerFormValidationError) throw new TakoformV2Error(error.code, 422);
+        throw error;
+      }
+    },
+    references(spec) {
+      return fixedReferencesForForwardWorkerDeployment(parseForwardWorkerDeploymentSpec(spec));
+    },
+    prepareAdmission(input) {
+      return prepareForwardWorkerDeploymentReferences(input, deploymentAdmission(input));
+    },
+    rejectDeleteWhileReferenced: true,
+    backend: {
+      id: WORKER_DEPLOYMENT_BACKEND_ID,
+      targetKey: options.targetKey,
+      execute: unavailable,
+      reconcile: unavailable,
+    },
+  };
 }

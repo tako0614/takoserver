@@ -9,7 +9,9 @@ import {
   buildHostedSampleFixtureDocument,
   buildWorkerVersionSpec,
   checkHostedSampleFixture,
+  endpointUrlFromResource,
   exactStagingOrigin,
+  hostedSampleEndpointName,
   hostedSampleResourceGraphSummary,
   hostedSampleWorkerSource,
   parseHostedSampleFixtureDocument,
@@ -17,6 +19,7 @@ import {
   SAMPLE_COUNTS,
   scheduledSlots,
   sqliteMigrationSource,
+  typedEndpointUrlFromResource,
   WFP_HOSTED_SAMPLE_FIXTURE_KIND,
   writeHostedSampleFixture,
 } from "../scripts/wfp-hosted-staging-e2e.ts";
@@ -37,7 +40,9 @@ import {
 } from "../src/takoform-v2/forms/worker-bundle.ts";
 import { WORKER_CRON_TRIGGER_FORM_URL } from "../src/takoform-v2/forms/worker-cron-trigger.ts";
 import {
+  MODULE_WORKER_FORM_URL,
   parseWorkerVersionSpec,
+  WORKER_ENDPOINT_FORM_URL,
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
 
@@ -309,36 +314,121 @@ test("scheduled acceptance excludes HTTP-woken later slots and rejects disagreem
   ).toThrow("scale");
 });
 
-test("production and cross-origin discovery are refused before any mutation", async () => {
-  expect(() => exactStagingOrigin("https://api.takoserver.com")).toThrow("staging");
-  expect(() => exactStagingOrigin("https://api.integration.takoserver.com/path")).toThrow(
-    "staging",
-  );
-  expect(exactStagingOrigin("https://api.integration.takoserver.com/")).toBe(
-    "https://api.integration.takoserver.com",
-  );
+test("control origins require a literal staging/integration prefix before file or network access", async () => {
+  for (const origin of [
+    "https://integration-api.takoserver.com",
+    "https://staging-api.takoserver.com",
+    "https://integration-api.account.workers.dev",
+    "https://staging-api.account.workers.dev",
+  ]) {
+    expect(exactStagingOrigin(`${origin}/`)).toBe(origin);
+  }
   let requests = 0;
-  await expect(
-    runHostedStagingE2E({
-      fixturePath: "missing",
-      origin: "https://api.takoserver.com",
-      writerSecretPath: "missing",
-      evidenceSecretPath: "missing",
-      outputPath: "missing",
-      journalPath: "missing",
-      sourceCommit: "a".repeat(40),
-      space: "sample",
-      runId: "sample-run",
-      pollSeconds: 1,
-      scheduleSeconds: 1,
-      now: () => new Date(),
-      fetcher: async () => {
-        requests++;
-        return Response.json({});
-      },
-    }),
-  ).rejects.toThrow("staging");
+  for (const origin of [
+    "https://api.takoserver.com",
+    "https://api.integration.takoserver.com",
+    "https://api-staging.takoserver.com",
+    "https://production.integration.takoserver.com",
+    "https://integration.takoserver.com",
+    "https://integration-.takoserver.com",
+    "https://api.staging.account.workers.dev",
+    "https://integration-api.takoserver.com.evil.test",
+    "https://integration-api.example.test",
+    "http://integration-api.takoserver.com",
+    "https://user:pass@integration-api.takoserver.com",
+    "https://integration-api.takoserver.com:8443",
+    "https://integration-api.takoserver.com/path",
+    "https://integration-api.takoserver.com/?query=1",
+    "https://integration-api.takoserver.com/#fragment",
+  ]) {
+    await expect(
+      runHostedStagingE2E({
+        fixturePath: "missing",
+        origin,
+        writerSecretPath: "missing",
+        evidenceSecretPath: "missing",
+        outputPath: "missing",
+        journalPath: "missing",
+        sourceCommit: "a".repeat(40),
+        space: "sample",
+        runId: "sample-run",
+        pollSeconds: 1,
+        scheduleSeconds: 1,
+        now: () => new Date(),
+        fetcher: async () => {
+          requests++;
+          return Response.json({});
+        },
+      }),
+    ).rejects.toThrow("staging");
+  }
   expect(requests).toBe(0);
+});
+
+test("Endpoint origin binds the accepted canonical UID without widening the Host API origin guard", () => {
+  const uid = "01234567-89ab-cdef-0123-456789abcdef";
+  const hostname = "integration-v2-0123456789abcdef0123456789abcdef.app-staging.takos.jp";
+  expect(
+    endpointUrlFromResource({ uid, output: { hostname, url: `https://${hostname}/` } }, uid),
+  ).toBe(`https://${hostname}`);
+  expect(() => exactStagingOrigin(`https://${hostname}/`)).toThrow("staging");
+});
+
+test("Endpoint origin refuses UID substitution, sibling namespaces and noncanonical URL fields", () => {
+  const uid = "01234567-89ab-cdef-0123-456789abcdef";
+  const hostname = "integration-v2-0123456789abcdef0123456789abcdef.app-staging.takos.jp";
+  const output = { hostname, url: `https://${hostname}/` };
+  for (const invalidUid of [uid.toUpperCase(), uid.replaceAll("-", ""), "resource-fixture"]) {
+    expect(() => endpointUrlFromResource({ uid: invalidUid, output }, invalidUid)).toThrow(
+      "accepted Resource UID",
+    );
+  }
+  expect(() =>
+    endpointUrlFromResource({ uid: "00000000-0000-4000-8000-000000000001", output }, uid),
+  ).toThrow("accepted Resource UID");
+  for (const invalidHostname of [
+    "v2-0123456789abcdef0123456789abcdef.app-staging.takos.jp",
+    "staging-v2-0123456789abcdef0123456789abcdef.app-staging.takos.jp",
+    "integration-v2-00000000000040008000000000000001.app-staging.takos.jp",
+    "integration-v2-0123456789abcdef0123456789abcdef.app.takos.jp",
+    `${hostname}.evil.test`,
+    `${hostname}.integration.takoserver.com`,
+    "integration-v2-0123456789abcdef0123456789abcdef.sibling.app-staging.takos.jp",
+    hostname.toUpperCase(),
+    `${hostname}.`,
+    "worker.integration.takoserver.com",
+  ]) {
+    expect(() =>
+      endpointUrlFromResource(
+        { uid, output: { hostname: invalidHostname, url: `https://${invalidHostname}/` } },
+        uid,
+      ),
+    ).toThrow("accepted staging Resource UID");
+  }
+  for (const invalidUrl of [
+    `http://${hostname}/`,
+    `https://user:pass@${hostname}/`,
+    `https://${hostname}:443/`,
+    `https://${hostname}:8443/`,
+    `https://${hostname}/path`,
+    `https://${hostname}/?query=1`,
+    `https://${hostname}/?`,
+    `https://${hostname}/#fragment`,
+    `https://${hostname}/#`,
+    `https://${hostname}/./`,
+    `https://${hostname}//`,
+    `https://${hostname}`,
+    "https://integration-v2-00000000000040008000000000000001.app-staging.takos.jp/",
+  ]) {
+    expect(() =>
+      endpointUrlFromResource({ uid, output: { hostname, url: invalidUrl } }, uid),
+    ).toThrow("accepted staging Resource UID");
+  }
+  for (const incomplete of [{ hostname }, { url: output.url }, { hostname, url: null }]) {
+    expect(() => endpointUrlFromResource({ uid, output: incomplete }, uid)).toThrow(
+      "accepted staging Resource UID",
+    );
+  }
 });
 
 async function harnessFixture() {
@@ -353,7 +443,7 @@ async function harnessFixture() {
     root,
     options: {
       fixturePath: join(root, "fixture", "fixture.json"),
-      origin: "https://api.integration.takoserver.com",
+      origin: "https://integration-api.takoserver.com",
       writerSecretPath: join(root, "writer.secret"),
       evidenceSecretPath: join(root, "evidence.secret"),
       outputPath: join(root, "evidence.json"),
@@ -364,6 +454,47 @@ async function harnessFixture() {
       pollSeconds: 1,
       scheduleSeconds: 1,
     },
+  };
+}
+
+// Protocol-only stand-in for the existing control API. It does not create or
+// prove a shared ledger hold, eligible Offering, provider derive or native grant.
+function withOriginalReservationCarrier(
+  fetcher: (input: string, init?: RequestInit) => Promise<Response>,
+  options: { readonly origin: string; readonly runId: string },
+  observe?: (method: string, body?: Record<string, unknown>) => void,
+): (input: string, init?: RequestInit) => Promise<Response> {
+  const path = `/v1/worker-endpoint-origin-reservations/integration-wfp-${options.runId}-origin`;
+  let projection: Record<string, unknown> | undefined;
+  return async (input, init) => {
+    const url = new URL(input);
+    if (url.origin !== options.origin || url.pathname !== path) return await fetcher(input, init);
+    const method = init?.method ?? "GET";
+    expect(new Headers(init?.headers).get("authorization")).toBe(
+      "Bearer synthetic-writer-secret-only",
+    );
+    if (method === "GET") {
+      observe?.(method);
+      return projection
+        ? Response.json(projection)
+        : Response.json({ error: { code: "not_found" } }, { status: 404 });
+    }
+    if (method !== "PUT") throw new Error("reservation must be retained, never released");
+    const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    observe?.(method, body);
+    expect(body.format).toBe("takoserver.worker-endpoint-origin-reservation.v2");
+    expect(body.expiresInSeconds).toBe(86_400);
+    expect(body.requestedSubdomain).toBe(hostedSampleEndpointName(options.runId));
+    projection = {
+      format: body.format,
+      reservationId: `integration-wfp-${options.runId}-origin`,
+      requestedSubdomain: body.requestedSubdomain,
+      canonicalPublicOrigin: `https://${body.requestedSubdomain}.app-staging.takos.jp`,
+      revision: "1",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+      status: "prepared",
+    };
+    return Response.json(projection, { status: 201 });
   };
 }
 
@@ -379,6 +510,11 @@ test("harness drives v2 lifecycle, Service/Version rollback and dependency-order
   };
   const resources = new Map<string, Resource>();
   const operations = new Map<string, Record<string, unknown>>();
+  const preflightNames: string[] = [];
+  const createdNames: string[] = [];
+  const reservationMethods: string[] = [];
+  const organizationProofRoles: string[] = [];
+  const mutationKeys: string[] = [];
   let sequence = 0;
   let now = Date.parse("2026-10-14T14:00:00Z");
   const runId = fixture.options.runId;
@@ -410,14 +546,26 @@ test("harness drives v2 lifecycle, Service/Version rollback and dependency-order
       return Response.json({ supported: true, form: url.searchParams.get("form") });
     if (url.pathname.startsWith("/host/v2/operations/"))
       return Response.json(operations.get(url.pathname.split("/").at(-1) ?? ""));
-    if (url.pathname === "/host/v2/resources" && method === "GET")
+    if (url.pathname === "/host/v2/resources" && method === "GET") {
+      expect(url.searchParams.get("space")).toBe("sample");
+      const name = url.searchParams.get("name");
+      if (name === null) {
+        expect(url.searchParams.get("limit")).toBe("1");
+        organizationProofRoles.push(new Headers(init?.headers).get("authorization") ?? "");
+      } else preflightNames.push(name);
       return Response.json({ items: [], nextCursor: null });
+    }
     if (url.pathname.startsWith("/host/v2/resources")) {
       const uid = url.pathname.split("/").at(-1) ?? "";
       const current = resources.get(uid);
       if (method === "GET")
         return current ? Response.json(current) : Response.json({ code: "gone" }, { status: 410 });
       const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+      mutationKeys.push(new Headers(init?.headers).get("idempotency-key") ?? "");
+      if (method === "POST") {
+        expect(body.space).toBe("sample");
+        createdNames.push(String(body.name));
+      }
       if (
         method === "PUT" &&
         current &&
@@ -433,13 +581,18 @@ test("harness drives v2 lifecycle, Service/Version rollback and dependency-order
         return Response.json({ code: "dependency_conflict" }, { status: 409 });
       }
       const id = `operation-${++sequence}`;
-      const resourceUid = current?.uid ?? `resource-${sequence}`;
+      const resourceUid =
+        current?.uid ??
+        (String(body.form).includes("/WorkerEndpoint/")
+          ? "00000000-0000-4000-8000-000000000001"
+          : `resource-${sequence}`);
       const resource: Resource = current
         ? { ...current }
         : {
             uid: resourceUid,
             form: String(body.form),
             name: String(body.name),
+            space: body.space,
             generation: 0,
             spec: {},
             output: {},
@@ -453,9 +606,17 @@ test("harness drives v2 lifecycle, Service/Version rollback and dependency-order
         resource.form.endsWith("/WorkerEndpoint/0.3.0/") ||
         resource.form.includes("/WorkerEndpoint/")
       ) {
-        resource.output = { hostname: "worker.integration.takoserver.com" };
+        const hostname = `${resource.name}.app-staging.takos.jp`;
+        resource.output = { hostname, url: `https://${hostname}/` };
       }
-      operations.set(id, { id, resourceUid, status: "succeeded", effect: "complete" });
+      operations.set(id, {
+        id,
+        resourceUid,
+        action: method === "POST" ? "create" : method === "PUT" ? "update" : "delete",
+        generation: resource.generation,
+        status: "succeeded",
+        effect: "complete",
+      });
       if (method === "DELETE") resources.delete(resourceUid);
       else resources.set(resourceUid, resource);
       return Response.json({ id, resourceUid }, { status: 202 });
@@ -512,7 +673,11 @@ test("harness drives v2 lifecycle, Service/Version rollback and dependency-order
   try {
     const result = await runHostedStagingE2E({
       ...fixture.options,
-      fetcher,
+      fetcher: withOriginalReservationCarrier(fetcher, fixture.options, (method, body) => {
+        reservationMethods.push(method);
+        if (body) expect(body.offeringId).toBe("selected-sold-module-worker-offering");
+      }),
+      reservationOfferingId: "selected-sold-module-worker-offering",
       now: () => new Date(now),
       pause: async (ms) => {
         now += ms;
@@ -521,6 +686,39 @@ test("harness drives v2 lifecycle, Service/Version rollback and dependency-order
     expect(result.status).toBe("HOSTED_STAGING_SCENARIOS_PASSED");
     expect(resources.size).toBe(0);
     expect(result.launchAcceptance).toContain("unqualified");
+    expect(preflightNames).toHaveLength(37);
+    expect(organizationProofRoles).toEqual([
+      "Bearer synthetic-writer-secret-only",
+      "Bearer synthetic-evidence-secret-only",
+    ]);
+    expect(reservationMethods).toEqual(["GET", "PUT", "GET"]);
+    expect(result.originalReservation).toMatchObject({
+      retained: true,
+      globalNameReusable: false,
+      requestedSubdomain: hostedSampleEndpointName(runId),
+    });
+    const freshNames = preflightNames.filter((name) =>
+      name.startsWith(`integration-wfp-${runId}-`),
+    );
+    const legacyNames = preflightNames.filter((name) => name.startsWith(`wfp-${runId}-`));
+    expect(freshNames).toHaveLength(18);
+    expect(legacyNames.sort()).toEqual(
+      freshNames.map((name) => name.slice("integration-".length)).sort(),
+    );
+    expect(createdNames).toHaveLength(18);
+    expect([...createdNames].sort()).toEqual(
+      [
+        ...freshNames.filter((name) => name !== `integration-wfp-${runId}-endpoint`),
+        hostedSampleEndpointName(runId),
+      ].sort(),
+    );
+    expect(new Set(createdNames).size).toBe(createdNames.length);
+    for (const name of createdNames) {
+      if (name === hostedSampleEndpointName(runId)) expect(name).toHaveLength(31);
+      else expect(name).toStartWith(`integration-wfp-${runId}-`);
+    }
+    expect(mutationKeys.length).toBeGreaterThan(createdNames.length);
+    for (const key of mutationKeys) expect(key).toStartWith(`integration-wfp-${runId}-`);
     const journal = await readFile(fixture.options.journalPath, "utf8");
     expect(journal).toContain("absence-confirmed");
     expect(journal).toContain("refusal-confirmed");
@@ -528,6 +726,177 @@ test("harness drives v2 lifecycle, Service/Version rollback and dependency-order
     expect(journal).not.toContain("synthetic-evidence-secret-only");
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("an occupied legacy run name stops before new-prefix mutations in the selected Space", async () => {
+  const fixture = await harnessFixture();
+  const lookedUp: string[] = [];
+  let mutations = 0;
+  const legacyName = `wfp-${fixture.options.runId}-worker`;
+  const fetcher = async (input: string, init?: RequestInit) => {
+    const url = new URL(input);
+    if (init?.method && init.method !== "GET") mutations++;
+    if (url.pathname === "/.well-known/takoform/v2")
+      return Response.json({ api: "forms.takoform.com/v2", baseUrl: `${url.origin}/host/v2` });
+    if (url.pathname === "/host/v2/support")
+      return Response.json({ supported: true, form: url.searchParams.get("form") });
+    if (url.pathname === "/host/v2/resources" && init?.method === "GET") {
+      expect(url.searchParams.get("space")).toBe("sample");
+      const name = url.searchParams.get("name") ?? "";
+      if (url.searchParams.has("name")) lookedUp.push(name);
+      return Response.json({
+        items: name === legacyName ? [{ uid: "old-resource-uid", name }] : [],
+        nextCursor: null,
+      });
+    }
+    throw new Error("unexpected fixture request");
+  };
+  try {
+    await expect(
+      runHostedStagingE2E({
+        ...fixture.options,
+        fetcher: withOriginalReservationCarrier(fetcher, fixture.options),
+        now: () => new Date(),
+      }),
+    ).rejects.toThrow("fixture name already exists");
+    expect(lookedUp).toEqual([`integration-${legacyName}`, legacyName]);
+    expect(mutations).toBe(0);
+    const journal = await readFile(fixture.options.journalPath, "utf8");
+    expect(journal).toContain("halt");
+    expect(journal).not.toContain("mutation-intent");
+    expect(journal).not.toContain("old-resource-uid");
+    expect(JSON.parse(await readFile(fixture.options.outputPath, "utf8")).status).toBe(
+      "INCOMPLETE",
+    );
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("Endpoint probes wait for the accepted operation and exact settled Resource readback", async () => {
+  for (const fault of [
+    "hostname-uid",
+    "resource-name",
+    "resource-space",
+    "resource-form",
+    "worker-binding",
+    "operation-resource",
+    "operation-action",
+    "operation-generation",
+    "url",
+    "resource-uid",
+    "operation-id",
+    "operation-effect",
+    "phase",
+    "observed-generation",
+    "last-operation",
+  ]) {
+    const fixture = await harnessFixture();
+    const uid = "00000000-0000-4000-8000-000000000001";
+    const hostname = `${hostedSampleEndpointName(fixture.options.runId)}.app-staging.takos.jp`;
+    const resources = new Map<string, Record<string, unknown>>();
+    const operations = new Map<string, Record<string, unknown>>();
+    let sequence = 0;
+    let endpointOperation = "";
+    let endpointCreates = 0;
+    let operationReads = 0;
+    let resourceReads = 0;
+    let probes = 0;
+    const fetcher = async (input: string, init?: RequestInit): Promise<Response> => {
+      const url = new URL(input);
+      if (url.origin !== fixture.options.origin) {
+        probes++;
+        throw new Error("Endpoint must not be probed after a refused readback");
+      }
+      if (url.pathname === "/.well-known/takoform/v2")
+        return Response.json({ api: "forms.takoform.com/v2", baseUrl: `${url.origin}/host/v2` });
+      if (url.pathname === "/host/v2/support")
+        return Response.json({ supported: true, form: url.searchParams.get("form") });
+      if (url.pathname === "/host/v2/resources" && init?.method === "GET")
+        return Response.json({ items: [], nextCursor: null });
+      if (url.pathname === "/host/v2/resources" && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+        const endpoint = String(body.form).includes("/WorkerEndpoint/");
+        const id = `operation-${++sequence}`;
+        const resourceUid = endpoint ? uid : `resource-${sequence}`;
+        const operation = {
+          id,
+          resourceUid,
+          action: "create",
+          generation: 1,
+          status: "succeeded",
+          effect: "complete",
+        };
+        const resource: Record<string, unknown> = {
+          uid: resourceUid,
+          ...body,
+          generation: 1,
+          observedGeneration: 1,
+          phase: "idle",
+          lastOperation: id,
+          output: endpoint ? { hostname, url: `https://${hostname}/` } : {},
+        };
+        if (endpoint) {
+          endpointCreates++;
+          endpointOperation = id;
+          if (fault === "hostname-uid") {
+            const foreign = "integration-v2-00000000000040008000000000000002.app-staging.takos.jp";
+            resource.output = { hostname: foreign, url: `https://${foreign}/` };
+          }
+          if (fault === "url") resource.output = { hostname, url: `https://${hostname}/#alias` };
+          if (fault === "resource-uid") resource.uid = "00000000-0000-4000-8000-000000000002";
+          if (fault === "resource-name") resource.name = "integration-foreign-ep";
+          if (fault === "resource-space") resource.space = "foreign-org";
+          if (fault === "resource-form") resource.form = MODULE_WORKER_FORM_URL;
+          if (fault === "worker-binding")
+            resource.spec = { worker: { resourceUid: "foreign-worker" } };
+          if (fault === "operation-resource") operation.resourceUid = "foreign-resource";
+          if (fault === "operation-action") operation.action = "update";
+          if (fault === "operation-generation") operation.generation = 2;
+          if (fault === "operation-id") operation.id = "foreign-operation";
+          if (fault === "operation-effect") operation.effect = "none";
+          if (fault === "phase") resource.phase = "updating";
+          if (fault === "observed-generation") resource.observedGeneration = 0;
+          if (fault === "last-operation") resource.lastOperation = "foreign-operation";
+        }
+        resources.set(resourceUid, resource);
+        operations.set(id, operation);
+        return Response.json({ id, resourceUid }, { status: 202 });
+      }
+      if (url.pathname.startsWith("/host/v2/operations/")) {
+        const id = url.pathname.split("/").at(-1) ?? "";
+        if (id === endpointOperation) operationReads++;
+        return Response.json(operations.get(id));
+      }
+      if (url.pathname.startsWith("/host/v2/resources/")) {
+        const resourceUid = url.pathname.split("/").at(-1) ?? "";
+        if (resourceUid === uid) resourceReads++;
+        return Response.json(resources.get(resourceUid));
+      }
+      throw new Error("unexpected fixture request");
+    };
+    try {
+      await expect(
+        runHostedStagingE2E({
+          ...fixture.options,
+          fetcher: withOriginalReservationCarrier(fetcher, fixture.options),
+          now: () => new Date(),
+        }),
+      ).rejects.toThrow();
+      expect(endpointCreates).toBe(1);
+      expect(operationReads).toBe(1);
+      expect(resourceReads).toBe(fault === "operation-id" || fault === "operation-effect" ? 0 : 1);
+      expect(probes).toBe(0);
+      const journal = (await readFile(fixture.options.journalPath, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(journal.filter((row) => row.kind === "accepted" && row.uid === uid)).toHaveLength(1);
+      expect(journal.some((row) => row.kind === "endpoint-request-intent")).toBe(false);
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
   }
 });
 
@@ -550,7 +919,11 @@ test("unknown CREATE acknowledgement stops without retry and preserves intent wi
   };
   try {
     await expect(
-      runHostedStagingE2E({ ...fixture.options, fetcher, now: () => new Date() }),
+      runHostedStagingE2E({
+        ...fixture.options,
+        fetcher: withOriginalReservationCarrier(fetcher, fixture.options),
+        now: () => new Date(),
+      }),
     ).rejects.toThrow("acknowledgement unknown");
     expect(mutations).toBe(1);
     const journal = await readFile(fixture.options.journalPath, "utf8");
@@ -560,9 +933,14 @@ test("unknown CREATE acknowledgement stops without retry and preserves intent wi
       "INCOMPLETE",
     );
     await expect(
-      runHostedStagingE2E({ ...fixture.options, fetcher, now: () => new Date() }),
+      runHostedStagingE2E({
+        ...fixture.options,
+        fetcher: withOriginalReservationCarrier(fetcher, fixture.options),
+        now: () => new Date(),
+      }),
     ).rejects.toThrow();
     expect(mutations).toBe(1);
+    expect(await readFile(fixture.options.journalPath, "utf8")).toBe(journal);
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
   }
@@ -575,7 +953,7 @@ test("foreign discovery cannot receive credentials and unsupported Form causes z
     let foreignRequests = 0;
     const fetcher = async (input: string, init?: RequestInit) => {
       const url = new URL(input);
-      if (url.hostname !== "api.integration.takoserver.com") foreignRequests++;
+      if (url.hostname !== "integration-api.takoserver.com") foreignRequests++;
       if (init?.method === "POST") mutations++;
       if (url.pathname === "/.well-known/takoform/v2")
         return Response.json({
@@ -586,7 +964,11 @@ test("foreign discovery cannot receive credentials and unsupported Form causes z
     };
     try {
       await expect(
-        runHostedStagingE2E({ ...fixture.options, fetcher, now: () => new Date() }),
+        runHostedStagingE2E({
+          ...fixture.options,
+          fetcher: withOriginalReservationCarrier(fetcher, fixture.options),
+          now: () => new Date(),
+        }),
       ).rejects.toThrow(foreign ? "origin" : "support");
       expect(mutations).toBe(0);
       expect(foreignRequests).toBe(0);
@@ -635,7 +1017,11 @@ test("an accepted Operation survives a malformed Resource acknowledgement in the
   };
   try {
     await expect(
-      runHostedStagingE2E({ ...fixture.options, fetcher, now: () => new Date() }),
+      runHostedStagingE2E({
+        ...fixture.options,
+        fetcher: withOriginalReservationCarrier(fetcher, fixture.options),
+        now: () => new Date(),
+      }),
     ).rejects.toThrow();
     expect(mutations).toBe(1);
     expect(await readFile(fixture.options.journalPath, "utf8")).toContain("accepted-op-owned");
@@ -644,5 +1030,258 @@ test("an accepted Operation survives a malformed Resource acknowledgement in the
     );
   } finally {
     await rm(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("typed Endpoint origin binds the bounded accepted name, UID, create Operation and original", () => {
+  for (const runId of ["sample-run", "a".repeat(64), "sample.with_underscores"]) {
+    const name = hostedSampleEndpointName(runId);
+    expect(name).toMatch(/^integration-[a-f0-9]{16}-ep$/u);
+    expect(name).toHaveLength(31);
+    expect(hostedSampleEndpointName(runId)).toBe(name);
+  }
+  expect(hostedSampleEndpointName("sample-run")).not.toBe(hostedSampleEndpointName("sample-run-2"));
+  expect(() => hostedSampleEndpointName("bad")).toThrow();
+  const name = hostedSampleEndpointName("sample-run");
+  const uid = "01234567-89ab-4def-8123-456789abcdef";
+  const origin = `https://${name}.app-staging.takos.jp`;
+  const resource: Record<string, unknown> = {
+    uid,
+    name,
+    space: "actual-org",
+    form: WORKER_ENDPOINT_FORM_URL,
+    generation: 1,
+    observedGeneration: 1,
+    phase: "idle",
+    lastOperation: "accepted-create-op",
+    spec: { worker: { resourceUid: "accepted-worker-uid" } },
+    output: { hostname: `${name}.app-staging.takos.jp`, url: `${origin}/` },
+  };
+  const operation: Record<string, unknown> = {
+    id: "accepted-create-op",
+    resourceUid: uid,
+    action: "create",
+    generation: 1,
+    status: "succeeded",
+    effect: "complete",
+  };
+  const input = {
+    name,
+    space: "actual-org",
+    workerUid: "accepted-worker-uid",
+    reservedOrigin: origin,
+    endpoint: {
+      uid,
+      operationId: "accepted-create-op",
+      resource,
+      operation,
+    },
+  };
+  expect(typedEndpointUrlFromResource(input)).toBe(origin);
+  const mutations: ((candidate: typeof input) => void)[] = [
+    (v) => {
+      v.endpoint.uid = "01234567-89ab-4def-8123-456789abcdee";
+    },
+    (v) => {
+      v.endpoint.operationId = "foreign-op";
+    },
+    (v) => {
+      v.endpoint.resource.name = "integration-foreign";
+    },
+    (v) => {
+      v.endpoint.resource.space = "foreign-org";
+    },
+    (v) => {
+      v.endpoint.resource.form = MODULE_WORKER_FORM_URL;
+    },
+    (v) => {
+      v.endpoint.resource.generation = 2;
+    },
+    (v) => {
+      v.endpoint.resource.spec = { worker: { resourceUid: "foreign-worker" } };
+    },
+    (v) => {
+      v.endpoint.operation.resourceUid = "foreign-uid";
+    },
+    (v) => {
+      v.endpoint.operation.action = "update";
+    },
+    (v) => {
+      v.endpoint.operation.generation = 2;
+    },
+    (v) => {
+      v.endpoint.operation.status = "running";
+    },
+    (v) => {
+      v.endpoint.operation.effect = "none";
+    },
+    (v) => {
+      v.reservedOrigin = `${origin}/`;
+    },
+    (v) => {
+      v.endpoint.resource.output = {
+        hostname: `${name}.app-staging.takos.jp`,
+        url: `${origin}/#alias`,
+      };
+    },
+    (v) => {
+      const hostname = `integration-v2-${uid.replaceAll("-", "")}.app-staging.takos.jp`;
+      v.endpoint.resource.output = { hostname, url: `https://${hostname}/` };
+    },
+  ];
+  for (const mutate of mutations) {
+    const candidate = structuredClone(input);
+    mutate(candidate);
+    expect(() => typedEndpointUrlFromResource(candidate)).toThrow("accepted name, UID, Operation");
+  }
+});
+
+test("both authenticated keys must prove the explicit organization Space before any reservation or graph write", async () => {
+  for (const fault of ["writer-denied", "evidence-denied", "foreign-row", "malformed-list"]) {
+    const fixture = await harnessFixture();
+    const roles: string[] = [];
+    let mutations = 0;
+    const fetcher = async (input: string, init?: RequestInit): Promise<Response> => {
+      const url = new URL(input);
+      if (init?.method !== "GET") mutations++;
+      if (url.pathname === "/.well-known/takoform/v2")
+        return Response.json({ api: "forms.takoform.com/v2", baseUrl: `${url.origin}/host/v2` });
+      if (url.pathname.endsWith("/support"))
+        return Response.json({ supported: true, form: url.searchParams.get("form") });
+      expect(url.pathname).toBe("/host/v2/resources");
+      expect(url.searchParams.get("space")).toBe(fixture.options.space);
+      expect(url.searchParams.get("limit")).toBe("1");
+      expect(url.searchParams.has("name")).toBe(false);
+      const role =
+        new Headers(init?.headers).get("authorization") === "Bearer synthetic-writer-secret-only"
+          ? "writer"
+          : "evidence";
+      roles.push(role);
+      if (fault === `${role}-denied`) return Response.json({ code: "forbidden" }, { status: 403 });
+      if (fault === "foreign-row")
+        return Response.json({ items: [{ uid: "foreign", space: "other-org" }] });
+      if (fault === "malformed-list") return Response.json({ items: null });
+      return Response.json({ items: [], nextCursor: null });
+    };
+    try {
+      await expect(
+        runHostedStagingE2E({ ...fixture.options, fetcher, now: () => new Date() }),
+      ).rejects.toThrow();
+      expect(roles).toEqual(fault === "evidence-denied" ? ["writer", "evidence"] : ["writer"]);
+      expect(mutations).toBe(0);
+      const journal = await readFile(fixture.options.journalPath, "utf8");
+      expect(journal).not.toContain("original-reservation-intent");
+      expect(journal).not.toContain("mutation-intent");
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("original reservation refuses collisions, ambiguous acknowledgement and changed readback before graph CREATE", async () => {
+  for (const fault of [
+    "present",
+    "wrong-404",
+    "permission",
+    "unknown-put",
+    "wrong-origin",
+    "wrong-name",
+    "wrong-id",
+    "expired",
+    "bound",
+    "changed-readback",
+    "unknown-readback",
+  ]) {
+    const fixture = await harnessFixture();
+    let gets = 0;
+    let puts = 0;
+    let graphWrites = 0;
+    const name = hostedSampleEndpointName(fixture.options.runId);
+    const projection = {
+      format: "takoserver.worker-endpoint-origin-reservation.v2",
+      reservationId: `integration-wfp-${fixture.options.runId}-origin`,
+      requestedSubdomain: name,
+      canonicalPublicOrigin: `https://${name}.app-staging.takos.jp`,
+      revision: "1",
+      expiresAt: "2099-01-01T00:00:00.000Z",
+      status: "prepared",
+    };
+    const fetcher = async (input: string, init?: RequestInit): Promise<Response> => {
+      const url = new URL(input);
+      expect(url.origin).toBe(fixture.options.origin);
+      if (url.pathname === "/.well-known/takoform/v2")
+        return Response.json({ api: "forms.takoform.com/v2", baseUrl: `${url.origin}/host/v2` });
+      if (url.pathname.endsWith("/support"))
+        return Response.json({ supported: true, form: url.searchParams.get("form") });
+      if (url.pathname === "/host/v2/resources" && init?.method === "GET")
+        return Response.json({ items: [], nextCursor: null });
+      if (url.pathname.startsWith("/v1/worker-endpoint-origin-reservations/")) {
+        expect(url.pathname).toBe(
+          `/v1/worker-endpoint-origin-reservations/${projection.reservationId}`,
+        );
+        expect(new Headers(init?.headers).get("authorization")).toBe(
+          "Bearer synthetic-writer-secret-only",
+        );
+        if (init?.method === "GET") {
+          gets++;
+          if (gets === 1) {
+            if (fault === "present") return Response.json(projection);
+            if (fault === "permission")
+              return Response.json({ error: { code: "forbidden" } }, { status: 403 });
+            return Response.json(
+              { error: { code: fault === "wrong-404" ? "other_absence" : "not_found" } },
+              { status: 404 },
+            );
+          }
+          if (fault === "unknown-readback")
+            throw new Error("synthetic-provider-secret-never-persist");
+          return Response.json({
+            ...projection,
+            revision: fault === "changed-readback" ? "2" : "1",
+          });
+        }
+        expect(init?.method).toBe("PUT");
+        puts++;
+        const journal = await readFile(fixture.options.journalPath, "utf8");
+        expect(journal).toContain("original-reservation-intent");
+        expect(journal).toContain(projection.reservationId);
+        if (fault === "unknown-put") throw new Error("synthetic-provider-secret-never-persist");
+        return Response.json(
+          {
+            ...projection,
+            ...(fault === "wrong-origin"
+              ? { canonicalPublicOrigin: "https://arbitrary.example.test" }
+              : {}),
+            ...(fault === "wrong-name" ? { requestedSubdomain: "integration-foreign" } : {}),
+            ...(fault === "wrong-id" ? { reservationId: "foreign-id" } : {}),
+            ...(fault === "expired" ? { expiresAt: "2000-01-01T00:00:00.000Z" } : {}),
+            ...(fault === "bound" ? { status: "bound" } : {}),
+          },
+          { status: 201 },
+        );
+      }
+      graphWrites++;
+      throw new Error("graph must remain untouched");
+    };
+    try {
+      await expect(
+        runHostedStagingE2E({ ...fixture.options, fetcher, now: () => new Date() }),
+      ).rejects.toThrow();
+      const beforePut = ["present", "wrong-404", "permission"].includes(fault);
+      expect(puts).toBe(beforePut ? 0 : 1);
+      expect(gets).toBe(fault === "changed-readback" || fault === "unknown-readback" ? 2 : 1);
+      expect(graphWrites).toBe(0);
+      const journal = await readFile(fixture.options.journalPath, "utf8");
+      expect(journal).not.toContain("synthetic-provider-secret-never-persist");
+      expect(journal).not.toContain("mutation-intent");
+      if (!beforePut) expect(journal).toContain("original-reservation-intent");
+      if (fault === "changed-readback" || fault === "unknown-readback")
+        expect(journal).toContain("original-reservation-acknowledged");
+      expect(JSON.parse(await readFile(fixture.options.outputPath, "utf8")).status).toBe(
+        "INCOMPLETE",
+      );
+    } finally {
+      await rm(fixture.root, { recursive: true, force: true });
+    }
   }
 });

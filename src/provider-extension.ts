@@ -214,6 +214,13 @@ export {
 } from "./providers/http-revision-serving.ts";
 export { ProviderMeterError } from "./providers/provider-meter.ts";
 export {
+  SELFHOST_DATA_PLANE_CONTENT_TYPE,
+  SELFHOST_DATA_PLANE_PROTOCOL,
+  SELFHOST_DATA_PLANE_SQL_PATH,
+  type SelfhostWorkerForwardObjectBucketSourceInput,
+  selfhostWorkerForwardObjectBucketEntrypointSource,
+} from "./providers/selfhost-worker-wrapper.ts";
+export {
   assertSafeMigrationSql,
   MigrationSqlCapacityError,
   prepareMigrationSql,
@@ -260,6 +267,18 @@ export type {
 } from "./queue-v2-sqlite-contract.ts";
 export { createRuntimeInputAuthority } from "./runtime-input-preparations.ts";
 export { parseRuntimeInputSealKeyRing } from "./runtime-input-seal-keyring.ts";
+export {
+  createSharedAppLedger,
+  type SharedAppFormV2Binding,
+  type SharedAppLedger,
+  type SharedAppNativeRouteRowPin,
+  type SharedAppRouteSelection,
+  type SharedAppSelection,
+} from "./shared-app-ledger.ts";
+export {
+  SHARED_APP_STAGING_SUFFIX,
+  sharedAppStagingNameFromHost,
+} from "./shared-app-name.ts";
 export { createD1Sql } from "./sql-d1.ts";
 export { createTakoformArtifacts } from "./takoform/artifacts.ts";
 export { currentTakoformCandidates } from "./takoform/current-candidates.ts";
@@ -319,4 +338,16 @@ export type {
   WorkerClassResourceIdentity,
   WorkerClassRuntimeContract,
 } from "./worker-class-runtime-port.ts";
+export {
+  createWorkerEndpointOriginV2FormRouteAcceptance,
+  createWorkerEndpointOriginV2FormRoutePublication,
+  createWorkerEndpointOriginV2Publication,
+  type WorkerEndpointOriginV2FormRouteDeploymentResult,
+  type WorkerEndpointOriginV2FormRouteEndpointResult,
+  type WorkerEndpointOriginV2FormRouteNativeRows,
+  type WorkerEndpointOriginV2FormRoutePreparation,
+  type WorkerEndpointOriginV2FormRoutePublication,
+  type WorkerEndpointOriginV2Publication,
+  type WorkerEndpointOriginV2PublicationPreparation,
+} from "./worker-endpoint-origin-v2-acceptance.ts";
 export { createWorkerProductionComposition } from "./worker-production-composition.ts";

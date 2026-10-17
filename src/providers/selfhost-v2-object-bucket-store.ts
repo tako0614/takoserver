@@ -49,7 +49,7 @@ export interface SelfhostV2ObjectBucketAccess {
   put(
     key: string,
     body: ReadableStream<Uint8Array>,
-    options: SelfhostObjectPutOptions,
+    options?: SelfhostObjectPutOptions,
   ): Promise<{ readonly etag: string; readonly size: number }>;
   delete(key: string): Promise<void>;
   list(options?: SelfhostObjectListOptions): Promise<SelfhostObjectListResult>;
@@ -62,8 +62,8 @@ export interface SelfhostV2ObjectBucketAccess {
     uploadId: string,
     partNumber: number,
     body: ReadableStream<Uint8Array>,
-    options: { readonly contentLength: number },
-  ): Promise<{ readonly etag: string; readonly partNumber: number }>;
+    options?: { readonly contentLength?: number },
+  ): Promise<{ readonly etag: string; readonly partNumber: number; readonly size: number }>;
   completeMultipartUpload(
     key: string,
     uploadId: string,
@@ -475,7 +475,7 @@ function boundStore(
     head: (key: string) => run(() => store.head(bucketId, key)),
     get: (key: string, options?: SelfhostObjectGetOptions) =>
       run(() => store.get(bucketId, key, options)),
-    put: (key: string, body: ReadableStream<Uint8Array>, options: SelfhostObjectPutOptions) =>
+    put: (key: string, body: ReadableStream<Uint8Array>, options?: SelfhostObjectPutOptions) =>
       run(() => store.put(bucketId, key, body, options)),
     delete: (key: string) => run(() => store.delete(bucketId, key)),
     list: (options?: SelfhostObjectListOptions) => run(() => store.list(bucketId, options)),
@@ -486,7 +486,7 @@ function boundStore(
       uploadId: string,
       partNumber: number,
       body: ReadableStream<Uint8Array>,
-      options: { readonly contentLength: number },
+      options?: { readonly contentLength?: number },
     ) => run(() => store.uploadPart(bucketId, key, uploadId, partNumber, body, options)),
     completeMultipartUpload: (
       key: string,

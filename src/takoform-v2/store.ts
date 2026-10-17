@@ -1,5 +1,12 @@
-import type { Sql } from "../ports.ts";
+import type { Sql, SqlStatement, SqlWrite } from "../ports.ts";
 import type { V2ConfiguredPrivateInputs } from "./configured-private-inputs.ts";
+import {
+  captureV2HostAcceptance,
+  redeemV2HostAcceptance,
+  type V2HostAcceptance,
+  type V2HostAcceptanceContext,
+  type V2PreparedHostAcceptance,
+} from "./host-acceptance.ts";
 import type { V2SealedPrivateInputs } from "./private-inputs.ts";
 import type { V2Action, V2AdmissionPredicate, V2Effect, V2Status } from "./types.ts";
 
@@ -201,7 +208,257 @@ function referenceWrites(record: AcceptRecord, referencesJson: string | null) {
   ];
 }
 
-export function createV2Store(sql: Sql) {
+interface CapturedAcceptance {
+  readonly record: Readonly<AcceptRecord>;
+  readonly resource: Readonly<{ form: string; space: string; name: string }>;
+  readonly referencesJson: string | null;
+  readonly initialOutputJson: string;
+  readonly admission: V2AdmissionPredicate | undefined;
+  readonly referenceGuard: V2AdmissionPredicate | undefined;
+}
+
+function capturePredicate(admission: V2AdmissionPredicate | undefined) {
+  return admission
+    ? Object.freeze({
+        sql: admission.sql,
+        params: Object.freeze(
+          admission.params.map((param) => (param instanceof ArrayBuffer ? param.slice(0) : param)),
+        ),
+        ...(admission.conflictCode === undefined ? {} : { conflictCode: admission.conflictCode }),
+        ...(admission.detail === undefined ? {} : { detail: admission.detail }),
+      })
+    : undefined;
+}
+
+function withReferenceGuard(
+  admission: V2AdmissionPredicate | undefined,
+  referenceGuard: V2AdmissionPredicate,
+): V2AdmissionPredicate {
+  return Object.freeze({
+    ...admission,
+    sql: admission ? `(${admission.sql}) AND (${referenceGuard.sql})` : referenceGuard.sql,
+    params: Object.freeze([...(admission?.params ?? []), ...referenceGuard.params]),
+  });
+}
+
+/** Independently classify the Core preimage; Form predicates keep their own code/detail. */
+function referenceCheck(guard: V2AdmissionPredicate | undefined): readonly SqlStatement[] {
+  return guard ? [{ sql: `SELECT 1 AS permitted WHERE (${guard.sql})`, params: guard.params }] : [];
+}
+
+/** Own every value used by the batch and its post-await classification. */
+function captureAcceptance(
+  record: AcceptRecord,
+  resource: { form: string; space: string; name: string },
+  referencesJson: string | null,
+  initialOutputJson: string,
+  admission: V2AdmissionPredicate | undefined,
+  referenceGuard?: V2AdmissionPredicate,
+): CapturedAcceptance {
+  const capturedRecord = Object.freeze({
+    ...record,
+    ...(record.privateInputs ? { privateInputs: Object.freeze({ ...record.privateInputs }) } : {}),
+    ...(record.configuredPrivateInputs
+      ? { configuredPrivateInputs: Object.freeze({ ...record.configuredPrivateInputs }) }
+      : {}),
+    ...(record.expectedConfiguredPrivateInputs
+      ? {
+          expectedConfiguredPrivateInputs: Object.freeze({
+            ...record.expectedConfiguredPrivateInputs,
+          }),
+        }
+      : {}),
+  });
+  return Object.freeze({
+    record: capturedRecord,
+    resource: Object.freeze({ form: resource.form, space: resource.space, name: resource.name }),
+    referencesJson,
+    initialOutputJson,
+    admission: capturePredicate(admission),
+    referenceGuard: capturePredicate(referenceGuard),
+  });
+}
+
+/** Fixed Core statements only; neither the caller nor a Form supplies a batch. */
+function compileCreateAcceptance(input: CapturedAcceptance): readonly SqlStatement[] {
+  const { record, resource, referencesJson, initialOutputJson, admission } = input;
+  return [
+    ...(admission
+      ? [{ sql: `SELECT 1 AS permitted WHERE (${admission.sql})`, params: admission.params }]
+      : []),
+    {
+      sql: `INSERT INTO tf_v2_resources
+            (uid, principal, form_url, space, name, backend_id, target_key,
+             active_name, generation, phase,
+             spec_json, output_json, last_operation, busy_operation)
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', ?, ?, ?, ?
+            ${admission ? `WHERE (${admission.sql})` : ""}`,
+      params: [
+        record.resourceUid,
+        record.principal,
+        resource.form,
+        resource.space,
+        resource.name,
+        record.backendId,
+        record.targetKey,
+        resource.name,
+        record.specJson,
+        initialOutputJson,
+        record.id,
+        record.id,
+        ...(admission?.params ?? []),
+      ],
+    },
+    {
+      sql: admission ? opInsertIfAccepted : opInsert,
+      params: admission
+        ? [...opParams(record), record.resourceUid, record.id, record.id, record.generation]
+        : opParams(record),
+    },
+    ...privateWrites(record),
+    ...configuredPrivateWrites(record),
+    ...referenceWrites(record, referencesJson),
+  ];
+}
+
+function compileChangeAcceptance(
+  record: AcceptRecord,
+  referencesJson: string | null,
+  serialize: boolean,
+  admission: V2AdmissionPredicate | undefined,
+): readonly SqlStatement[] {
+  return [
+    ...(admission
+      ? [{ sql: `SELECT 1 AS permitted WHERE (${admission.sql})`, params: admission.params }]
+      : []),
+    {
+      sql: `UPDATE tf_v2_resources SET generation = ?, spec_json = ?,
+              phase = ?, last_operation = ?, busy_operation = ?
+            WHERE uid = ? AND principal = ? AND deleted_at IS NULL
+              AND generation = ? AND busy_operation IS NULL
+              ${
+                record.action === "delete"
+                  ? `AND NOT EXISTS (
+                      SELECT 1 FROM tf_v2_resource_references edge
+                      JOIN tf_v2_resources referrer ON referrer.uid = edge.referrer_uid
+                      WHERE edge.target_uid = ? AND referrer.deleted_at IS NULL)`
+                  : ""
+              }
+              ${serialize ? `AND NOT EXISTS (${pendingReferrersSql})` : ""}
+              ${admission ? `AND (${admission.sql})` : ""}
+              ${
+                record.expectedConfiguredPrivateInputs
+                  ? `AND EXISTS (
+                SELECT 1 FROM tf_v2_configured_private_inputs
+                WHERE resource_uid = ? AND key_id = ? AND nonce = ? AND ciphertext = ?)`
+                  : ""
+              }`,
+      params: [
+        record.generation,
+        record.specJson,
+        record.action === "delete" ? "deleting" : "pending",
+        record.id,
+        record.id,
+        record.resourceUid,
+        record.principal,
+        record.generation - 1,
+        ...(record.action === "delete" ? [record.resourceUid] : []),
+        ...(serialize ? [record.resourceUid] : []),
+        ...(admission?.params ?? []),
+        ...(record.expectedConfiguredPrivateInputs
+          ? [
+              record.resourceUid,
+              record.expectedConfiguredPrivateInputs.keyId,
+              record.expectedConfiguredPrivateInputs.nonce,
+              record.expectedConfiguredPrivateInputs.ciphertext,
+            ]
+          : []),
+      ],
+    },
+    {
+      sql: opInsertIfAccepted,
+      params: [...opParams(record), record.resourceUid, record.id, record.id, record.generation],
+    },
+    ...privateWrites(record),
+    ...referenceWrites(record, referencesJson),
+    ...(serialize
+      ? [
+          {
+            sql: `SELECT 1 FROM tf_v2_resources target
+                  WHERE target.uid = ? AND target.principal = ?
+                    AND target.deleted_at IS NULL AND target.generation = ?
+                    AND target.busy_operation IS NULL
+                    AND EXISTS (${pendingReferrersSql}) LIMIT 1`,
+            params: [
+              record.resourceUid,
+              record.principal,
+              record.generation - 1,
+              record.resourceUid,
+            ],
+          },
+        ]
+      : []),
+  ];
+}
+
+function acceptanceContext(input: CapturedAcceptance): V2HostAcceptanceContext {
+  const { record, resource } = input;
+  if (record.action !== "create" && record.action !== "update")
+    throw new TypeError("unsupported Host acceptance action");
+  const configured = record.configuredPrivateInputs ?? record.expectedConfiguredPrivateInputs;
+  return Object.freeze({
+    action: record.action,
+    principal: record.principal,
+    key: record.key,
+    fingerprint: record.fingerprint,
+    operationId: record.id,
+    resourceUid: record.resourceUid,
+    generation: record.generation,
+    at: record.at,
+    retainUntil: record.retainUntil,
+    form: resource.form,
+    space: resource.space,
+    name: resource.name,
+    backendId: record.backendId,
+    targetKey: record.targetKey,
+    specJson: record.specJson,
+    outputJson: input.initialOutputJson,
+    referencesJson: input.referencesJson,
+    ...(record.privateInputs ? { privateInputs: record.privateInputs } : {}),
+    ...(configured ? { configuredPrivateInputs: configured } : {}),
+  });
+}
+
+function guardedAcceptance(
+  prepared: V2PreparedHostAcceptance,
+  sql: Sql,
+  context: V2HostAcceptanceContext,
+  admission: V2AdmissionPredicate | undefined,
+) {
+  const fixed = redeemV2HostAcceptance(prepared, sql, context);
+  const guarded = Object.freeze({
+    ...admission,
+    sql: admission ? `(${admission.sql}) AND (${fixed.guard.sql})` : fixed.guard.sql,
+    params: Object.freeze([...(admission?.params ?? []), ...(fixed.guard.params ?? [])]),
+  });
+  const terminal = {
+    sql: `WITH host_form_admission AS (SELECT 1 AS permitted${
+      admission ? ` WHERE (${admission.sql})` : ""
+    }) ${fixed.terminal.sql}`,
+    params: [...(admission?.params ?? []), ...(fixed.terminal.params ?? [])],
+  };
+  return { admission: guarded, terminal };
+}
+
+function checkedHostBatch(statements: readonly SqlStatement[]): readonly SqlStatement[] {
+  if (statements.some((value) => (value.params?.length ?? 0) > 100))
+    throw new TypeError("Host acceptance parameter limit");
+  return statements;
+}
+
+export function createV2Store(sql: Sql, hostAcceptance?: V2HostAcceptance) {
+  const acceptance = captureV2HostAcceptance(hostAcceptance, sql);
+  const acceptanceBatch = acceptance ? sql.batch.bind(sql) : undefined;
   return {
     async resource(uid: string): Promise<ResourceRow | null> {
       return ((await sql.query("SELECT * FROM tf_v2_resources WHERE uid = ?", [uid]))[0] ??
@@ -281,47 +538,50 @@ export function createV2Store(sql: Sql) {
       referencesJson: string | null = null,
       initialOutputJson = "{}",
       admission?: V2AdmissionPredicate,
-    ): Promise<"accepted" | "dependency_conflict" | "resource_busy"> {
-      const writes = await sql.batch([
-        ...(admission
-          ? [{ sql: `SELECT 1 AS permitted WHERE (${admission.sql})`, params: admission.params }]
-          : []),
-        {
-          sql: `INSERT INTO tf_v2_resources
-            (uid, principal, form_url, space, name, backend_id, target_key,
-             active_name, generation, phase,
-             spec_json, output_json, last_operation, busy_operation)
-            SELECT ?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', ?, ?, ?, ?
-            ${admission ? `WHERE (${admission.sql})` : ""}`,
-          params: [
-            record.resourceUid,
-            record.principal,
-            resource.form,
-            resource.space,
-            resource.name,
-            record.backendId,
-            record.targetKey,
-            resource.name,
-            record.specJson,
-            initialOutputJson,
-            record.id,
-            record.id,
-            ...(admission?.params ?? []),
-          ],
-        },
-        {
-          sql: admission ? opInsertIfAccepted : opInsert,
-          params: admission
-            ? [...opParams(record), record.resourceUid, record.id, record.id, record.generation]
-            : opParams(record),
-        },
-        ...privateWrites(record),
-        ...configuredPrivateWrites(record),
-        ...referenceWrites(record, referencesJson),
-      ]);
-      if (admission && writes[0]?.rows.length !== 1)
-        return admission.conflictCode ?? "dependency_conflict";
-      if (writes[admission ? 1 : 0]?.changes !== 1 || writes[admission ? 2 : 1]?.changes !== 1) {
+      referenceGuard?: V2AdmissionPredicate,
+    ): Promise<"accepted" | "dependency_conflict" | "resource_busy" | "reference_conflict"> {
+      const captured = captureAcceptance(
+        record,
+        resource,
+        referencesJson,
+        initialOutputJson,
+        admission,
+        referenceGuard,
+      );
+      let acceptedInput = captured.referenceGuard
+        ? {
+            ...captured,
+            admission: withReferenceGuard(captured.admission, captured.referenceGuard),
+          }
+        : captured;
+      let terminal: SqlStatement | undefined;
+      if (acceptance) {
+        const context = acceptanceContext(captured);
+        const preparing = acceptance.prepare(context);
+        if (preparing !== undefined) {
+          const guarded = guardedAcceptance(await preparing, sql, context, acceptedInput.admission);
+          acceptedInput = { ...acceptedInput, admission: guarded.admission };
+          terminal = guarded.terminal;
+        }
+      }
+      const statements = [
+        ...referenceCheck(captured.referenceGuard),
+        ...compileCreateAcceptance(acceptedInput),
+      ];
+      let writes: readonly SqlWrite[];
+      if (terminal) {
+        if (!acceptanceBatch) throw new TypeError("missing Host acceptance executor");
+        writes = await acceptanceBatch(checkedHostBatch([...statements, terminal]));
+      } else writes = await sql.batch(statements);
+      const capturedAdmission = acceptedInput.admission;
+      const offset = captured.referenceGuard ? 1 : 0;
+      if (captured.referenceGuard && writes[0]?.rows.length !== 1) return "reference_conflict";
+      if (capturedAdmission && writes[offset]?.rows.length !== 1)
+        return capturedAdmission.conflictCode ?? "dependency_conflict";
+      if (
+        writes[offset + (capturedAdmission ? 1 : 0)]?.changes !== 1 ||
+        writes[offset + (capturedAdmission ? 2 : 1)]?.changes !== 1
+      ) {
         throw new Error("v2 CREATE acceptance did not persist its Resource and Operation");
       }
       return "accepted";
@@ -331,92 +591,61 @@ export function createV2Store(sql: Sql) {
       referencesJson: string | null = null,
       serializeUpdatesWithPendingReferrers = false,
       admission?: V2AdmissionPredicate,
-    ): Promise<"accepted" | "dependency_conflict" | "resource_busy" | "conflict"> {
+      hostResource?: Pick<ResourceRow, "form_url" | "space" | "name" | "output_json">,
+      referenceGuard?: V2AdmissionPredicate,
+    ): Promise<
+      "accepted" | "dependency_conflict" | "resource_busy" | "conflict" | "reference_conflict"
+    > {
       const serialize = record.action === "update" && serializeUpdatesWithPendingReferrers;
-      const writes = await sql.batch([
-        ...(admission
-          ? [{ sql: `SELECT 1 AS permitted WHERE (${admission.sql})`, params: admission.params }]
-          : []),
-        {
-          sql: `UPDATE tf_v2_resources SET generation = ?, spec_json = ?,
-              phase = ?, last_operation = ?, busy_operation = ?
-            WHERE uid = ? AND principal = ? AND deleted_at IS NULL
-              AND generation = ? AND busy_operation IS NULL
-              ${
-                record.action === "delete"
-                  ? `AND NOT EXISTS (
-                      SELECT 1 FROM tf_v2_resource_references edge
-                      JOIN tf_v2_resources referrer ON referrer.uid = edge.referrer_uid
-                      WHERE edge.target_uid = ? AND referrer.deleted_at IS NULL)`
-                  : ""
-              }
-              ${serialize ? `AND NOT EXISTS (${pendingReferrersSql})` : ""}
-              ${admission ? `AND (${admission.sql})` : ""}
-              ${
-                record.expectedConfiguredPrivateInputs
-                  ? `AND EXISTS (
-                SELECT 1 FROM tf_v2_configured_private_inputs
-                WHERE resource_uid = ? AND key_id = ? AND nonce = ? AND ciphertext = ?)`
-                  : ""
-              }`,
-          params: [
-            record.generation,
-            record.specJson,
-            record.action === "delete" ? "deleting" : "pending",
-            record.id,
-            record.id,
-            record.resourceUid,
-            record.principal,
-            record.generation - 1,
-            ...(record.action === "delete" ? [record.resourceUid] : []),
-            ...(serialize ? [record.resourceUid] : []),
-            ...(admission?.params ?? []),
-            ...(record.expectedConfiguredPrivateInputs
-              ? [
-                  record.resourceUid,
-                  record.expectedConfiguredPrivateInputs.keyId,
-                  record.expectedConfiguredPrivateInputs.nonce,
-                  record.expectedConfiguredPrivateInputs.ciphertext,
-                ]
-              : []),
-          ],
-        },
-        {
-          sql: opInsertIfAccepted,
-          params: [
-            ...opParams(record),
-            record.resourceUid,
-            record.id,
-            record.id,
-            record.generation,
-          ],
-        },
-        ...privateWrites(record),
-        ...referenceWrites(record, referencesJson),
-        ...(serialize
-          ? [
-              {
-                sql: `SELECT 1 FROM tf_v2_resources target
-                  WHERE target.uid = ? AND target.principal = ?
-                    AND target.deleted_at IS NULL AND target.generation = ?
-                    AND target.busy_operation IS NULL
-                    AND EXISTS (${pendingReferrersSql}) LIMIT 1`,
-                params: [
-                  record.resourceUid,
-                  record.principal,
-                  record.generation - 1,
-                  record.resourceUid,
-                ],
-              },
-            ]
-          : []),
-      ]);
-      const resourceIndex = admission ? 1 : 0;
+      let statements: readonly SqlStatement[];
+      let terminal: SqlStatement | undefined;
+      const capturedReferenceGuard = capturePredicate(referenceGuard);
+      let capturedAdmission = capturedReferenceGuard
+        ? withReferenceGuard(capturePredicate(admission), capturedReferenceGuard)
+        : admission;
+      if (acceptance && record.action === "update") {
+        if (!hostResource)
+          throw new TypeError("Host UPDATE acceptance requires its owned Resource");
+        const captured = captureAcceptance(
+          record,
+          {
+            form: hostResource.form_url,
+            space: hostResource.space,
+            name: hostResource.name,
+          },
+          referencesJson,
+          hostResource.output_json,
+          capturedAdmission,
+        );
+        record = captured.record;
+        capturedAdmission = captured.admission;
+        const context = acceptanceContext(captured);
+        const preparing = acceptance.prepare(context);
+        if (preparing !== undefined) {
+          const guarded = guardedAcceptance(await preparing, sql, context, captured.admission);
+          capturedAdmission = guarded.admission;
+          terminal = guarded.terminal;
+        }
+      }
+      statements = [
+        ...referenceCheck(capturedReferenceGuard),
+        ...compileChangeAcceptance(record, referencesJson, serialize, capturedAdmission),
+      ];
+      const coreResultCount = statements.length;
+      let writes: readonly SqlWrite[];
+      if (terminal) {
+        if (!acceptanceBatch) throw new TypeError("missing Host acceptance executor");
+        writes = await acceptanceBatch(checkedHostBatch([...statements, terminal]));
+      } else writes = await sql.batch(statements);
+      admission = capturedAdmission;
+      const offset = capturedReferenceGuard ? 1 : 0;
+      const resourceIndex = offset + (admission ? 1 : 0);
       if (writes[resourceIndex]?.changes === 1 && writes[resourceIndex + 1]?.changes === 1)
         return "accepted";
-      if (admission && writes[0]?.rows.length !== 1)
+      if (capturedReferenceGuard && writes[0]?.rows.length !== 1) return "reference_conflict";
+      if (admission && writes[offset]?.rows.length !== 1)
         return admission.conflictCode ?? "dependency_conflict";
-      if (serialize && writes.at(-1)?.rows.length) return "dependency_conflict";
+      if (serialize && writes[coreResultCount - 1]?.rows.length) return "dependency_conflict";
       return "conflict";
     },
     async nextCandidate(nowMs: number): Promise<OperationRow | null> {

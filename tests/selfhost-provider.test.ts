@@ -5187,7 +5187,7 @@ describe("the SQLite migration ledger", () => {
         "  WHERE value = NEW.value;\n" +
         "END;\n" +
         "-- A semicolon in this comment must not end the trigger body.\n" +
-        "PRAGMA user_version = 42;\n" +
+        "PRAGMA defer_foreign_keys = TRUE;\n" +
         "INSERT INTO policy_positive (value, note) VALUES (1, 'initial');\n",
     );
     const migration = {
@@ -5217,7 +5217,105 @@ describe("the SQLite migration ledger", () => {
       expect(persisted.query("SELECT value, note FROM policy_positive").all()).toEqual([
         { value: 1, note: "quoted;semicolon" },
       ]);
+      expect(persisted.query("PRAGMA defer_foreign_keys").get()).toEqual({ defer_foreign_keys: 0 });
+    } finally {
+      persisted.close();
+    }
+  });
+
+  test("retains historical PRAGMA receipts without replay and validates the entire new suffix", async () => {
+    const local = provider();
+    const created = await local.apply({
+      operationId: "staging-retained-database",
+      offering: offering("SQLiteDatabase"),
+      identity: sqliteIdentity("staging-retained-prefix"),
+      spec: {},
+    });
+    expect(created.phase).toBe("succeeded");
+    const nativeId = created.phase === "succeeded" ? created.result.nativeId : "";
+    const name = nativeId.split(":")[1];
+    if (!name) throw new Error("missing fixture database name");
+    const port = local.sqliteMigrations;
+    if (!port) throw new Error("the selfhost provider must execute SQLite migrations");
+    const target = {
+      resourceUid: "staging-retained-resource",
+      incarnationId: "staging-retained-incarnation",
+      generation: "1",
+    };
+    const migration = (path: string, text: string) => {
+      const sql = new TextEncoder().encode(text);
+      return {
+        path,
+        sql,
+        digest: `sha256:${createHash("sha256").update(sql).digest("hex")}` as const,
+      };
+    };
+    const historical = migration(
+      "staging/0001-history.sql",
+      "PRAGMA foreign_keys=ON; PRAGMA user_version=42; " +
+        "CREATE TABLE retained(id INTEGER PRIMARY KEY); INSERT INTO retained VALUES(1);",
+    );
+    // Database apply is lazy. Let its migration owner create the private path
+    // and genuine ledger using the admitted atomic zero-byte migration.
+    const materialize = migration("staging/0000-materialize.sql", "");
+    expect(
+      await port.applySuffix({
+        operationId: "staging-materialize-database",
+        operationMode: "initial",
+        nativeId,
+        target,
+        desired: [materialize],
+        expectedPrefix: [],
+        migrations: [materialize],
+      }),
+    ).toEqual({ ok: true, value: undefined });
+    const prefix = [materialize, historical].map(({ path, digest }) => ({ path, digest }));
+    const persisted = new Database(selfhostDatabasePath(root, name));
+    try {
+      // Native state from the historical policy, not a new admission of that SQL.
+      persisted.exec(new TextDecoder().decode(historical.sql));
+      persisted
+        .query("INSERT INTO _takoform_sqlite_migrations VALUES(2,?,?)")
+        .run(historical.path, historical.digest);
+      const safe = migration(
+        "staging/0002-new.sql",
+        "PRAGMA defer_foreign_keys=TRUE; INSERT INTO retained VALUES(2);",
+      );
+      const unsafe = migration("staging/0003-unsafe.sql", "PRAGMA foreign_keys=OFF;");
+      const refused = await port.applySuffix({
+        operationId: "staging-refuse-suffix",
+        operationMode: "recovery",
+        nativeId,
+        target,
+        desired: [materialize, historical, safe, unsafe],
+        expectedPrefix: prefix,
+        migrations: [safe, unsafe],
+      });
+      expect(refused).toMatchObject({ ok: false, failure: { code: "invalid_spec" } });
+      expect(persisted.query("SELECT * FROM retained").all()).toEqual([{ id: 1 }]);
       expect(persisted.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
+      expect(
+        await port.readLedger({ nativeId, target: { ...target, tenantId: "staging-tenant" } }),
+      ).toEqual({ ok: true, value: prefix });
+      expect(
+        await port.applySuffix({
+          operationId: "staging-apply-suffix",
+          operationMode: "recovery",
+          nativeId,
+          target,
+          desired: [materialize, historical, safe],
+          expectedPrefix: prefix,
+          migrations: [safe],
+        }),
+      ).toEqual({ ok: true, value: undefined });
+      expect(persisted.query("SELECT * FROM retained ORDER BY id").all()).toEqual([
+        { id: 1 },
+        { id: 2 },
+      ]);
+      expect(persisted.query("PRAGMA user_version").get()).toEqual({ user_version: 42 });
+      expect(
+        await port.readLedger({ nativeId, target: { ...target, tenantId: "staging-tenant" } }),
+      ).toEqual({ ok: true, value: [...prefix, { path: safe.path, digest: safe.digest }] });
     } finally {
       persisted.close();
     }

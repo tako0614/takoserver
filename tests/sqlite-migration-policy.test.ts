@@ -117,6 +117,11 @@ test("migration preparation refuses incomplete frames and every authority escape
   expect(() => prepareMigrationSql("\ufeffBEGIN; SELECT 1;")).toThrow();
 
   const forbiddenPolicy = [
+    "PRAGMA foreign_keys=ON",
+    "PRAGMA foreign_keys=OFF",
+    "PRAGMA main.user_version=1",
+    "PRAGMA table_info(source)",
+    "PRAGMA defer_foreign_keys",
     "PRAGMA journal_mode=WAL",
     "PRAGMA main.writable_schema=ON",
     "SELECT * FROM pragma_table_list",
@@ -128,7 +133,7 @@ test("migration preparation refuses incomplete frames and every authority escape
 
   expect(() =>
     assertSafeMigrationSql(
-      "PRAGMA foreign_keys=ON; PRAGMA main.user_version=1; " +
+      "PRAGMA defer_foreign_keys=ON; PRAGMA defer_foreign_keys=0; " +
         "CREATE TABLE commit_log (value TEXT DEFAULT 'BEGIN; ATTACH');",
     ),
   ).not.toThrow();

@@ -1,0 +1,312 @@
+{
+  "form": "https://edge.forms.takoform.com/forms/SQLiteMigrationApplication/0.3.0/",
+  "migrationSetForm": "https://edge.forms.takoform.com/forms/SQLiteMigrationSet/0.3.0/",
+  "cases": [
+    {
+      "id": "on-no-semicolon",
+      "sql": "PRAGMA defer_foreign_keys = ON",
+      "allowed": true,
+      "value": 1
+    },
+    {
+      "id": "on-semicolon",
+      "sql": "PRAGMA defer_foreign_keys = ON;",
+      "allowed": true,
+      "value": 1
+    },
+    {
+      "id": "off-no-semicolon",
+      "sql": "PRAGMA defer_foreign_keys = OFF",
+      "allowed": true,
+      "value": 0
+    },
+    {
+      "id": "off-semicolon",
+      "sql": "PRAGMA defer_foreign_keys = OFF;",
+      "allowed": true,
+      "value": 0
+    },
+    {
+      "id": "true-no-semicolon",
+      "sql": "PRAGMA defer_foreign_keys = TRUE",
+      "allowed": true,
+      "value": 1
+    },
+    {
+      "id": "true-semicolon",
+      "sql": "PRAGMA defer_foreign_keys = TRUE;",
+      "allowed": true,
+      "value": 1
+    },
+    {
+      "id": "false-no-semicolon",
+      "sql": "PRAGMA defer_foreign_keys = FALSE",
+      "allowed": true,
+      "value": 0
+    },
+    {
+      "id": "false-semicolon",
+      "sql": "PRAGMA defer_foreign_keys = FALSE;",
+      "allowed": true,
+      "value": 0
+    },
+    {
+      "id": "1-no-semicolon",
+      "sql": "PRAGMA defer_foreign_keys = 1",
+      "allowed": true,
+      "value": 1
+    },
+    {
+      "id": "1-semicolon",
+      "sql": "PRAGMA defer_foreign_keys = 1;",
+      "allowed": true,
+      "value": 1
+    },
+    {
+      "id": "0-no-semicolon",
+      "sql": "PRAGMA defer_foreign_keys = 0",
+      "allowed": true,
+      "value": 0
+    },
+    {
+      "id": "0-semicolon",
+      "sql": "PRAGMA defer_foreign_keys = 0;",
+      "allowed": true,
+      "value": 0
+    },
+    {
+      "id": "mixed-ascii-case",
+      "sql": "pRaGmA DeFeR_FoReIgN_KeYs=tRuE;",
+      "allowed": true,
+      "value": 1
+    },
+    {
+      "id": "all-ascii-whitespace",
+      "sql": "\t\n\u000b\f\r PRAGMA\tdefer_foreign_keys\n=\rOFF \t;\n",
+      "allowed": true,
+      "value": 0
+    },
+    {
+      "id": "yurucommu-0003_activity_remote_object_edges",
+      "sql": "PRAGMA defer_foreign_keys = TRUE;",
+      "allowed": true,
+      "value": 1,
+      "source": {
+        "repository": "yurucommu",
+        "path": "deploy/takoform/migrations/sql/0003_activity_remote_object_edges.sql",
+        "line": 6
+      }
+    },
+    {
+      "id": "yurucommu-0011_drop_remote_actor_fks",
+      "sql": "PRAGMA defer_foreign_keys = TRUE;",
+      "allowed": true,
+      "value": 1,
+      "source": {
+        "repository": "yurucommu",
+        "path": "deploy/takoform/migrations/sql/0011_drop_remote_actor_fks.sql",
+        "line": 25
+      }
+    },
+    {
+      "id": "defer-read",
+      "sql": "PRAGMA defer_foreign_keys",
+      "allowed": false
+    },
+    {
+      "id": "defer-read-semicolon",
+      "sql": "PRAGMA defer_foreign_keys;",
+      "allowed": false
+    },
+    {
+      "id": "foreign-keys-on",
+      "sql": "PRAGMA foreign_keys = ON;",
+      "allowed": false
+    },
+    {
+      "id": "foreign-keys-off",
+      "sql": "PRAGMA foreign_keys = OFF;",
+      "allowed": false
+    },
+    {
+      "id": "foreign-keys-read",
+      "sql": "PRAGMA foreign_keys;",
+      "allowed": false
+    },
+    {
+      "id": "foreign-keys-mixed-case",
+      "sql": "pRaGmA FoReIgN_KeYs=FaLsE",
+      "allowed": false
+    },
+    {
+      "id": "other-pragma-write",
+      "sql": "PRAGMA journal_mode = WAL;",
+      "allowed": false
+    },
+    {
+      "id": "other-pragma-read",
+      "sql": "PRAGMA table_info(child);",
+      "allowed": false
+    },
+    {
+      "id": "schema-qualified",
+      "sql": "PRAGMA main.defer_foreign_keys = ON;",
+      "allowed": false
+    },
+    {
+      "id": "quoted-name-double",
+      "sql": "PRAGMA \"defer_foreign_keys\" = ON;",
+      "allowed": false
+    },
+    {
+      "id": "quoted-name-backtick",
+      "sql": "PRAGMA `defer_foreign_keys` = ON;",
+      "allowed": false
+    },
+    {
+      "id": "quoted-name-bracket",
+      "sql": "PRAGMA [defer_foreign_keys] = ON;",
+      "allowed": false
+    },
+    {
+      "id": "quoted-value-single",
+      "sql": "PRAGMA defer_foreign_keys = 'ON';",
+      "allowed": false
+    },
+    {
+      "id": "quoted-value-double",
+      "sql": "PRAGMA defer_foreign_keys = \"TRUE\";",
+      "allowed": false
+    },
+    {
+      "id": "parenthesized-argument",
+      "sql": "PRAGMA defer_foreign_keys(ON);",
+      "allowed": false
+    },
+    {
+      "id": "parenthesized-value",
+      "sql": "PRAGMA defer_foreign_keys = (1);",
+      "allowed": false
+    },
+    {
+      "id": "arithmetic",
+      "sql": "PRAGMA defer_foreign_keys = 1 + 0;",
+      "allowed": false
+    },
+    {
+      "id": "signed-value",
+      "sql": "PRAGMA defer_foreign_keys = +1;",
+      "allowed": false
+    },
+    {
+      "id": "decimal-value",
+      "sql": "PRAGMA defer_foreign_keys = 1.0;",
+      "allowed": false
+    },
+    {
+      "id": "hex-value",
+      "sql": "PRAGMA defer_foreign_keys = 0x1;",
+      "allowed": false
+    },
+    {
+      "id": "leading-zero",
+      "sql": "PRAGMA defer_foreign_keys = 01;",
+      "allowed": false
+    },
+    {
+      "id": "invalid-value",
+      "sql": "PRAGMA defer_foreign_keys = 2;",
+      "allowed": false
+    },
+    {
+      "id": "invalid-word",
+      "sql": "PRAGMA defer_foreign_keys = YES;",
+      "allowed": false
+    },
+    {
+      "id": "empty-value",
+      "sql": "PRAGMA defer_foreign_keys = ;",
+      "allowed": false
+    },
+    {
+      "id": "extra-token",
+      "sql": "PRAGMA defer_foreign_keys = ON OFF;",
+      "allowed": false
+    },
+    {
+      "id": "two-allowed-statements",
+      "sql": "PRAGMA defer_foreign_keys = ON; PRAGMA defer_foreign_keys = OFF;",
+      "allowed": false
+    },
+    {
+      "id": "forbidden-suffix",
+      "sql": "PRAGMA defer_foreign_keys = ON; PRAGMA foreign_keys = OFF;",
+      "allowed": false
+    },
+    {
+      "id": "select-suffix",
+      "sql": "PRAGMA defer_foreign_keys = ON; SELECT 1;",
+      "allowed": false
+    },
+    {
+      "id": "extra-semicolon",
+      "sql": "PRAGMA defer_foreign_keys = ON;;",
+      "allowed": false
+    },
+    {
+      "id": "leading-comment",
+      "sql": "-- migration\nPRAGMA defer_foreign_keys = ON;",
+      "allowed": false
+    },
+    {
+      "id": "inline-comment",
+      "sql": "PRAGMA defer_foreign_keys /* comment */ = ON;",
+      "allowed": false
+    },
+    {
+      "id": "trailing-comment",
+      "sql": "PRAGMA defer_foreign_keys = ON; -- comment",
+      "allowed": false
+    },
+    {
+      "id": "unicode-case-fold-long-s",
+      "sql": "PRAGMA defer_foreign_keys = FALſE;",
+      "allowed": false
+    },
+    {
+      "id": "unicode-case-fold-keyword",
+      "sql": "PRAGMA defer_foreign_keyſ = ON;",
+      "allowed": false
+    },
+    {
+      "id": "unicode-nonbreaking-space",
+      "sql": "PRAGMA defer_foreign_keys = ON;",
+      "allowed": false
+    },
+    {
+      "id": "unicode-byte-order-mark",
+      "sql": "﻿PRAGMA defer_foreign_keys = ON;",
+      "allowed": false
+    },
+    {
+      "id": "nul-suffix",
+      "sql": "PRAGMA defer_foreign_keys = ON;\u0000",
+      "allowed": false
+    },
+    {
+      "id": "no-keyword-space",
+      "sql": "PRAGMAdefer_foreign_keys = ON;",
+      "allowed": false
+    },
+    {
+      "id": "missing-keyword",
+      "sql": "defer_foreign_keys = ON;",
+      "allowed": false
+    },
+    {
+      "id": "empty-statement",
+      "sql": "",
+      "allowed": false
+    }
+  ]
+}

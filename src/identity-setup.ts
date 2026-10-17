@@ -3,8 +3,12 @@ import {
   type ExternalIdentityVerifier,
   type IdentityProviderDescriptor,
 } from "./auth.ts";
-import { createGoogleIdentity } from "./google-identity.ts";
-import { createOperatorIdentity, OPERATOR_PROVIDERS } from "./operator-credentials.ts";
+import { createGoogleIdentity, GOOGLE_IDENTITY_ISSUERS } from "./google-identity.ts";
+import {
+  createOperatorIdentity,
+  isOperatorProvider,
+  OPERATOR_PROVIDERS,
+} from "./operator-credentials.ts";
 import type { Clock } from "./ports.ts";
 import { createTakosIdIdentity } from "./takos-id-identity.ts";
 
@@ -40,59 +44,231 @@ export interface IdentitySetupOptions {
 }
 
 export interface IdentitySetup {
-  readonly verifier: ExternalIdentityVerifier;
+  readonly verifier: ExternalIdentityVerifier & IdentityVerificationCaptureReader;
   readonly providers: readonly IdentityProviderDescriptor[];
 }
 
+type IdentityVerificationInput = Parameters<ExternalIdentityVerifier["verify"]>[0];
+type VerifiedIdentity = Awaited<ReturnType<ExternalIdentityVerifier["verify"]>>;
+
+/** The verifier's selected configuration, not claims supplied by a caller. */
+export type IdentityVerificationAuthority =
+  | { readonly kind: "takos-id-oidc"; readonly issuer: string; readonly clientId: string }
+  | {
+      readonly kind: "google-oidc";
+      readonly acceptedIssuerPolicy: typeof GOOGLE_IDENTITY_ISSUERS;
+      readonly clientId: string;
+    }
+  | {
+      readonly kind: "operator-assertion";
+      readonly audience: string;
+      readonly publicKeyJwk: { readonly kty: string; readonly crv: string; readonly x: string };
+    };
+
+// A closed, ordered JSON tuple makes the authority domain independent of an
+// assertion, profile, subject, clock or object-property insertion order.
+const IDENTITY_VERIFICATION_DOMAIN_TAG = "takoserver.identity-verification-domain.v1" as const;
+type IdentityVerificationDomainBody =
+  | readonly [typeof IDENTITY_VERIFICATION_DOMAIN_TAG, "takos-id", "oidc", string, string]
+  | readonly [
+      typeof IDENTITY_VERIFICATION_DOMAIN_TAG,
+      "google",
+      "oidc",
+      (typeof GOOGLE_IDENTITY_ISSUERS)[0],
+      (typeof GOOGLE_IDENTITY_ISSUERS)[1],
+      string,
+    ]
+  | readonly [
+      typeof IDENTITY_VERIFICATION_DOMAIN_TAG,
+      (typeof OPERATOR_PROVIDERS)[number],
+      "operator-assertion",
+      string,
+      string,
+      string,
+      string,
+    ];
+
+function verificationDomainBody(
+  provider: IdentityVerificationInput["provider"],
+  method: IdentityMethod,
+  authority: IdentityVerificationAuthority,
+): IdentityVerificationDomainBody {
+  switch (authority.kind) {
+    case "takos-id-oidc":
+      if (provider !== "takos-id" || method !== "oidc") throw new AuthError("invalid");
+      return Object.freeze([
+        IDENTITY_VERIFICATION_DOMAIN_TAG,
+        provider,
+        method,
+        authority.issuer,
+        authority.clientId,
+      ] as const);
+    case "google-oidc":
+      if (provider !== "google" || method !== "oidc") throw new AuthError("invalid");
+      return Object.freeze([
+        IDENTITY_VERIFICATION_DOMAIN_TAG,
+        provider,
+        method,
+        authority.acceptedIssuerPolicy[0],
+        authority.acceptedIssuerPolicy[1],
+        authority.clientId,
+      ] as const);
+    case "operator-assertion":
+      if (!isOperatorProvider(provider) || method !== "operator-assertion") {
+        throw new AuthError("invalid");
+      }
+      return Object.freeze([
+        IDENTITY_VERIFICATION_DOMAIN_TAG,
+        provider,
+        method,
+        authority.audience,
+        authority.publicKeyJwk.kty,
+        authority.publicKeyJwk.crv,
+        authority.publicKeyJwk.x,
+      ] as const);
+  }
+}
+
+/** Historical verification observation, never a human, class or payer grant. */
+export interface IdentityVerificationObservation {
+  readonly provider: IdentityVerificationInput["provider"];
+  readonly method: IdentityMethod;
+  readonly verificationAuthority: IdentityVerificationAuthority;
+  /** Stable verifier domain only; this does not bind or enroll a Principal. */
+  readonly verificationDomain: {
+    readonly body: IdentityVerificationDomainBody;
+    readonly digest: `sha256:${string}`;
+  };
+  readonly providerSubject: string;
+  readonly email: string;
+  readonly displayName: string;
+  readonly assertionDigest: `sha256:${string}`;
+  readonly verifiedAt: string;
+}
+
+export interface IdentityVerificationCaptureReader {
+  /** Runs the selected real verifier once; does not consume single-use credentials. */
+  captureVerifiedIdentity(input: IdentityVerificationInput): Promise<{
+    readonly verified: VerifiedIdentity;
+    readonly capture: object;
+  }>;
+  inspectVerifiedIdentityCapture(capture: unknown): IdentityVerificationObservation | null;
+}
+
+const verificationReaders = new WeakMap<
+  object,
+  {
+    readonly verify: ExternalIdentityVerifier["verify"];
+    readonly capture: IdentityVerificationCaptureReader["captureVerifiedIdentity"];
+    readonly inspect: IdentityVerificationCaptureReader["inspectVerifiedIdentityCapture"];
+  }
+>();
+
+/** Local constructor/original-method identity only; no SQL or enrollment proof. */
+export function assertIdentityVerificationCaptureReader(reader: unknown): void {
+  if (!reader || typeof reader !== "object") throw new AuthError("invalid");
+  const origin = verificationReaders.get(reader);
+  if (!origin) throw new AuthError("invalid");
+  for (const [name, expected] of [
+    ["verify", origin.verify],
+    ["captureVerifiedIdentity", origin.capture],
+    ["inspectVerifiedIdentityCapture", origin.inspect],
+  ] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(reader, name);
+    if (!descriptor || !("value" in descriptor) || descriptor.value !== expected)
+      throw new AuthError("invalid");
+  }
+}
+
 export function resolveIdentity(options: IdentitySetupOptions): IdentitySetup {
-  if (options.takosId && options.googleClientId) {
+  // Read each option once. The same detached values must configure the actual
+  // verifier and describe the authority retained by a successful capture.
+  const takosIdOption = options.takosId;
+  const googleClientId = options.googleClientId;
+  const operatorKeyOption = options.operatorPublicKeyJwk;
+  const operatorAudience = options.operatorAudience;
+  const clock = options.clock;
+  if (takosIdOption && googleClientId) {
     throw new TypeError("Takos ID and direct Google sign-in cannot both be configured");
   }
   const byProviderMethod = new Map<string, ExternalIdentityVerifier>();
+  const authorityByProviderMethod = new Map<string, IdentityVerificationAuthority>();
   const providers: IdentityProviderDescriptor[] = [];
 
-  if (options.takosId) {
+  if (takosIdOption) {
+    const issuer = takosIdOption.issuer;
+    const clientId = takosIdOption.clientId;
     byProviderMethod.set(
       "takos-id:oidc",
       createTakosIdIdentity({
-        issuer: options.takosId.issuer,
-        clientId: options.takosId.clientId,
-        ...(options.clock ? { clock: options.clock } : {}),
+        issuer,
+        clientId,
+        ...(clock ? { clock } : {}),
+      }),
+    );
+    authorityByProviderMethod.set(
+      "takos-id:oidc",
+      Object.freeze({
+        kind: "takos-id-oidc",
+        issuer,
+        clientId,
       }),
     );
     providers.push({
       id: "takos-id",
       displayName: "Takos ID",
       method: "oidc",
-      issuer: options.takosId.issuer,
-      clientId: options.takosId.clientId,
+      issuer,
+      clientId,
     });
   }
 
-  if (options.googleClientId) {
+  if (googleClientId) {
     byProviderMethod.set(
       "google:oidc",
       createGoogleIdentity({
-        clientId: options.googleClientId,
-        ...(options.clock ? { clock: options.clock } : {}),
+        clientId: googleClientId,
+        ...(clock ? { clock } : {}),
+      }),
+    );
+    authorityByProviderMethod.set(
+      "google:oidc",
+      Object.freeze({
+        kind: "google-oidc",
+        acceptedIssuerPolicy: GOOGLE_IDENTITY_ISSUERS,
+        clientId: googleClientId,
       }),
     );
     providers.push({
       id: "google",
       displayName: "Google",
       method: "oidc",
-      clientId: options.googleClientId,
+      clientId: googleClientId,
     });
   }
 
-  if (options.operatorPublicKeyJwk) {
-    if (!options.operatorAudience) {
+  if (operatorKeyOption) {
+    if (!operatorAudience) {
       throw new TypeError("operator identity public JWK requires its canonical Host audience");
     }
+    // createOperatorIdentity imports its key lazily. Detach the JWK now so a
+    // caller cannot change the key between construction and first verify.
+    // The operator verifier imports an Ed25519 OKP key from x; its input
+    // kty/crv fields are not consulted. Record the effective import policy.
+    const publicKeyJwk = Object.freeze({
+      kty: "OKP",
+      crv: "Ed25519",
+      x: operatorKeyOption.x,
+    });
+    const authority = Object.freeze({
+      kind: "operator-assertion" as const,
+      audience: operatorAudience,
+      publicKeyJwk,
+    });
     const operator = createOperatorIdentity({
-      publicKeyJwk: options.operatorPublicKeyJwk,
-      audience: options.operatorAudience,
-      ...(options.clock ? { clock: options.clock } : {}),
+      publicKeyJwk,
+      audience: operatorAudience,
+      ...(clock ? { clock } : {}),
     });
     // One registration per provider an operator assertion may vouch for, read
     // from the single declaration of that set rather than written out here.
@@ -101,6 +277,7 @@ export function resolveIdentity(options: IdentitySetupOptions): IdentitySetup {
     // which accounts can be reached, not what any one assertion can claim.
     for (const provider of OPERATOR_PROVIDERS) {
       byProviderMethod.set(`${provider}:operator-assertion`, operator);
+      authorityByProviderMethod.set(`${provider}:operator-assertion`, authority);
     }
     // Advertised only when there is no real provider, because it is not
     // sign-in — it is the operator vouching by signature, and it asks a person
@@ -110,7 +287,7 @@ export function resolveIdentity(options: IdentitySetupOptions): IdentitySetup {
     // It keeps working on the wire either way, named explicitly. That is
     // deliberate: it is how the operator gets in when the identity provider is
     // misconfigured, which is exactly when nobody can sign in the normal way.
-    if (!options.googleClientId && !options.takosId) {
+    if (!googleClientId && !takosIdOption) {
       for (const provider of OPERATOR_PROVIDERS) {
         providers.push({
           id: provider,
@@ -123,21 +300,84 @@ export function resolveIdentity(options: IdentitySetupOptions): IdentitySetup {
 
   const fallback = providers[0]?.method;
 
-  return {
-    providers,
-    verifier: {
-      async verify(input) {
-        const method = input.method ?? fallback;
-        const verifier =
-          method === undefined ? undefined : byProviderMethod.get(`${input.provider}:${method}`);
-        // A provider or method this deployment does not verify is something
-        // the caller can correct. Thrown as an AuthError so it lands as a
-        // stable 4xx: an unhandled throw here reached the router's
-        // catch-all and answered `internal_error` with status 500, which
-        // reads as an outage and tells nobody what to fix.
-        if (!verifier) throw new AuthError("invalid");
-        return await verifier.verify(input);
-      },
+  const captures = new WeakMap<object, IdentityVerificationObservation>();
+  const observationClock = clock ?? (() => new Date());
+  const verifier: ExternalIdentityVerifier & IdentityVerificationCaptureReader = {
+    async verify(input) {
+      const method = input.method ?? fallback;
+      const verifier =
+        method === undefined ? undefined : byProviderMethod.get(`${input.provider}:${method}`);
+      // A provider or method this deployment does not verify is something
+      // the caller can correct. Thrown as an AuthError so it lands as a
+      // stable 4xx: an unhandled throw here reached the router's
+      // catch-all and answered `internal_error` with status 500, which
+      // reads as an outage and tells nobody what to fix.
+      if (!verifier) throw new AuthError("invalid");
+      return await verifier.verify(input);
+    },
+    async captureVerifiedIdentity(input) {
+      assertIdentityVerificationCaptureReader(verifier);
+      // Freeze this invocation's original inputs before any await. Retain no
+      // assertion, nonce, bearer or single-use credential in the observation.
+      const captured = Object.freeze({
+        provider: input.provider,
+        assertion: input.assertion,
+        method: input.method,
+        nonce: input.nonce,
+        audience: input.audience,
+      });
+      const method = captured.method ?? fallback;
+      if (method === undefined) throw new AuthError("invalid");
+      const verificationAuthority = authorityByProviderMethod.get(`${captured.provider}:${method}`);
+      if (!verificationAuthority) throw new AuthError("invalid");
+      // Never dispatch through a public method reread after caller getters.
+      const verify = verificationReaders.get(verifier)?.verify;
+      if (!verify) throw new AuthError("invalid");
+      assertIdentityVerificationCaptureReader(verifier);
+      const verified = await Reflect.apply(verify, verifier, [captured]);
+      const body = verificationDomainBody(captured.provider, method, verificationAuthority);
+      const domainHash = new Uint8Array(
+        await crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(body))),
+      );
+      const verificationDomain = Object.freeze({
+        body,
+        digest: `sha256:${Array.from(domainHash, (byte) => byte.toString(16).padStart(2, "0")).join(
+          "",
+        )}` as `sha256:${string}`,
+      });
+      const digest = new Uint8Array(
+        await crypto.subtle.digest("SHA-256", new TextEncoder().encode(captured.assertion)),
+      );
+      const assertionDigest: `sha256:${string}` = `sha256:${Array.from(digest, (byte) =>
+        byte.toString(16).padStart(2, "0"),
+      ).join("")}`;
+      const verifiedAt = observationClock().toISOString();
+      const observation = Object.freeze({
+        provider: captured.provider,
+        method,
+        verificationAuthority,
+        verificationDomain,
+        providerSubject: verified.providerSubject,
+        email: verified.email,
+        displayName: verified.displayName,
+        assertionDigest,
+        verifiedAt,
+      });
+      // Recheck after verification, hashing and the supplied clock callback.
+      assertIdentityVerificationCaptureReader(verifier);
+      const capture = Object.freeze(Object.create(null) as object);
+      captures.set(capture, observation);
+      return Object.freeze({ verified, capture });
+    },
+    inspectVerifiedIdentityCapture(capture) {
+      assertIdentityVerificationCaptureReader(verifier);
+      return capture && typeof capture === "object" ? (captures.get(capture) ?? null) : null;
     },
   };
+  verificationReaders.set(verifier, {
+    verify: verifier.verify,
+    capture: verifier.captureVerifiedIdentity,
+    inspect: verifier.inspectVerifiedIdentityCapture,
+  });
+  return { providers, verifier };
 }

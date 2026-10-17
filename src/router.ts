@@ -24,6 +24,8 @@ export interface CreateRouterOptions {
   /** Dedicated qualified HTTPS hostname dispatch, ahead of every Host path and CORS rule. */
   readonly containerEndpointIngress?: (request: Request) => Promise<Response | null>;
   readonly control: ControlRoutes;
+  /** The request-local RP owns only its existing /auth/oidc paths. */
+  readonly sharedAuth?: { fetch(request: Request): Promise<Response | null> };
   readonly dataAi?: DataAiRoutes;
   readonly aiAvailable?: boolean;
   /** This is the only public Takoform Host handler; legacy repair has no route. */
@@ -52,6 +54,10 @@ export function createRouter(options: CreateRouterOptions): Router {
   return async (request, lifetime) => {
     const endpoint = await options.containerEndpointIngress?.(request);
     if (endpoint) return endpoint;
+    // The RP owns its host-cookie CORS and preflight. General bearer-API CORS
+    // must neither bypass that admission nor rewrite its credentialed reply.
+    const sharedAuth = await options.sharedAuth?.fetch(request);
+    if (sharedAuth) return sharedAuth;
     // A browser asking whether it may make the real call. Answering it is the
     // whole of preflight; nothing is routed and nothing is authenticated.
     if (request.method === "OPTIONS" && request.headers.get("origin")) {

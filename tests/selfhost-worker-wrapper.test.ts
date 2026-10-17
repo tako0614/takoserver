@@ -5,6 +5,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import {
   SELFHOST_WORKER_DATA_PLANE_BINDING,
   SELFHOST_WORKER_DATA_SERVICE_MODULE,
@@ -30,6 +31,7 @@ import {
 } from "../src/providers/selfhost-worker-prelude.ts";
 import {
   SELFHOST_DATA_PLANE_KV_PATH,
+  SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT,
   SELFHOST_DATA_PLANE_OBJECT_CONTENT_TYPE,
   SELFHOST_DATA_PLANE_OBJECT_PROTOCOL,
   SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER,
@@ -58,6 +60,7 @@ import {
   selfhostReadinessAnswer,
   selfhostReadinessFailureMessage,
   selfhostWorkerEntrypointSource,
+  selfhostWorkerForwardObjectBucketEntrypointSource,
 } from "../src/providers/selfhost-worker-wrapper.ts";
 import {
   WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING,
@@ -65,7 +68,17 @@ import {
   WORKERD_V2_PRIVATE_OBJECT_BUCKET_BINDING,
 } from "../src/providers/workerd-v2-private-binding-names.ts";
 import { serveSelfhostDataPlanes } from "../src/selfhost-data-planes.ts";
+import {
+  consumeSelfhostObjectBody,
+  decodeSelfhostObjectBodyFrames,
+  SelfhostObjectError,
+} from "../src/selfhost-object-store.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import {
+  OBJECT_BUCKET_EOF_COUNTED_FORM_URL,
+  OBJECT_BUCKET_KNOWN_LENGTH_FORM_URL,
+  type ObjectBucketBindingForm,
+} from "../src/takoform-v2/forms/object-bucket-binding-profile.ts";
 
 /**
  * The generated entrypoint is the only thing standing between a tenant's module
@@ -123,6 +136,7 @@ function plane(answers: Record<string, unknown>[]): {
 async function loadGenerated(
   tenantSource: string,
   input: SelfhostWorkerEntrypointSourceInput = KV_ONLY,
+  forwardBindings?: readonly ObjectBucketBindingForm[],
 ): Promise<{
   readonly worker: {
     fetch(request: Request, env: Record<string, unknown>, context: object): Promise<Response>;
@@ -144,7 +158,13 @@ async function loadGenerated(
   const wrapperPath = join(root, "wrapper.mjs");
   await Bun.write(
     wrapperPath,
-    selfhostWorkerEntrypointSource(
+    (forwardBindings === undefined
+      ? selfhostWorkerEntrypointSource
+      : (source: SelfhostWorkerEntrypointSourceInput, privateNames: boolean) =>
+          selfhostWorkerForwardObjectBucketEntrypointSource(
+            { source, objectBucketBindings: forwardBindings },
+            privateNames,
+          ))(
       input,
       input.bindings.some(
         (binding) =>
@@ -1920,7 +1940,11 @@ function objectPlane(
             Buffer.from(raw.replaceAll("-", "+").replaceAll("_", "/"), "base64"),
           ),
         ) as Record<string, unknown>;
-        const body = init.body === undefined ? "" : await new Response(init.body).text();
+        const payload =
+          document.bodyFormat === SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT
+            ? decodeSelfhostObjectBodyFrames(init.body as ReadableStream<Uint8Array>)
+            : init.body;
+        const body = payload === undefined ? "" : await new Response(payload).text();
         calls.push({ url, document, body });
         const answer = answers[index] ?? { ok: false, error: { code: "backend_unavailable" } };
         index += 1;
@@ -1963,6 +1987,723 @@ const OBJECTS_ONLY: SelfhostWorkerEntrypointSourceInput = {
   declaredHandlers: ["fetch"],
   bindings: [{ kind: SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND, publicName: "MEDIA" }],
 };
+
+const FORWARD_OBJECT_INPUT: SelfhostWorkerEntrypointSourceInput = {
+  ...OBJECTS_ONLY,
+  bindings: [
+    { kind: SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND, publicName: "OLD" },
+    { kind: SELFHOST_WORKER_EDGE_OBJECTS_BINDING_KIND, publicName: "NEW" },
+  ],
+};
+const FORWARD_OBJECT_FORMS: readonly ObjectBucketBindingForm[] = [
+  { publicName: "OLD", resourceUid: "old-bucket", formUrl: OBJECT_BUCKET_KNOWN_LENGTH_FORM_URL },
+  { publicName: "NEW", resourceUid: "new-bucket", formUrl: OBJECT_BUCKET_EOF_COUNTED_FORM_URL },
+];
+
+test("forward ObjectBucket renderer requires exact complete named Form projections", () => {
+  const first = FORWARD_OBJECT_FORMS[0];
+  if (!first) throw new Error("missing forward Form fixture");
+  const incomplete: readonly (readonly ObjectBucketBindingForm[])[] = [
+    [],
+    [first],
+    [
+      ...FORWARD_OBJECT_FORMS,
+      {
+        publicName: "EXTRA",
+        resourceUid: "extra-bucket",
+        formUrl: OBJECT_BUCKET_EOF_COUNTED_FORM_URL,
+      },
+    ],
+  ];
+  for (const forms of incomplete)
+    expect(() =>
+      selfhostWorkerForwardObjectBucketEntrypointSource({
+        source: FORWARD_OBJECT_INPUT,
+        objectBucketBindings: forms,
+      }),
+    ).toThrow(TypeError);
+  const before = selfhostWorkerEntrypointSource(FORWARD_OBJECT_INPUT);
+  const forward = selfhostWorkerForwardObjectBucketEntrypointSource({
+    source: FORWARD_OBJECT_INPUT,
+    objectBucketBindings: FORWARD_OBJECT_FORMS,
+  });
+  expect(forward).toContain(OBJECT_BUCKET_EOF_COUNTED_FORM_URL);
+  expect(forward).toContain("old-bucket");
+  expect(before).not.toContain("FORWARD_OBJECT_FORMS");
+  expect(selfhostWorkerEntrypointSource(FORWARD_OBJECT_INPUT)).toBe(before);
+});
+
+test("forward ObjectBucket renderer selects strict old streams and counted new streams together", async () => {
+  const { service, calls } = objectPlane([
+    { ok: true, value: { etag: "new-put", size: 3 } },
+    { ok: true, value: { etag: "old-put", size: 3 } },
+    { ok: true, value: { etag: "new-part", partNumber: 1, size: 3 } },
+  ]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+      let oldPulls = 0;
+      const bytes = () => new ReadableStream({pull(c){c.enqueue(new Uint8Array([97,98,99]));c.close()}}, {highWaterMark:0});
+      const result = {};
+      try { await env.OLD.put("key", new ReadableStream({pull(c){oldPulls++;c.close()}}, {highWaterMark:0})); }
+      catch(e){result.oldError=e.name}
+      try { await env.OLD.uploadPart("key","upload",1,bytes()); }
+      catch(e){result.oldPartError=e.name}
+      result.oldPulls=oldPulls;
+      result.newPut=await env.NEW.put("key",bytes());
+      result.oldPut=await env.OLD.put("key",bytes(),{contentLength:3});
+      result.newPart=await env.NEW.uploadPart("key","upload",1,bytes());
+      return Response.json(result);
+    } }`,
+    FORWARD_OBJECT_INPUT,
+    FORWARD_OBJECT_FORMS,
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://example.com"),
+      rawEnv(service),
+      {},
+    );
+    expect(await response.json()).toEqual({
+      oldError: "invalid_body",
+      oldPartError: "invalid_body",
+      oldPulls: 0,
+      newPut: { etag: "new-put", size: 3 },
+      oldPut: { etag: "old-put", size: 3 },
+      newPart: { etag: "new-part", partNumber: 1 },
+    });
+    expect(calls).toHaveLength(3);
+    expect(calls.map((call) => call.body)).toEqual(["abc", "abc", "abc"]);
+    expect(calls.map((call) => Object.hasOwn(call.document, "contentLength"))).toEqual([
+      false,
+      true,
+      false,
+    ]);
+    for (const call of calls)
+      expect(call.document.bodyFormat).toBe(SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("forward ObjectBucket renderer distinguishes own undefined, zero and malformed bodies before consumption", async () => {
+  const { service, calls } = objectPlane([
+    { ok: true, value: { etag: "empty", size: 0 } },
+    { ok: true, value: { etag: "unknown-empty", size: 0 } },
+  ]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+      const result = {}; let pulls=0;
+      const untouched=()=>new ReadableStream({pull(c){pulls++;c.close()}},{highWaterMark:0});
+      const record=async(name,run)=>{try{result[name]=await run()}catch(e){result[name]=e.name}};
+      await record("ownUndefined",()=>env.NEW.put("key",untouched(),{contentLength:undefined}));
+      await record("ownNull",()=>env.NEW.put("key",untouched(),{contentLength:null}));
+      await record("partUndefined",()=>env.NEW.uploadPart("key","upload",1,untouched(),{contentLength:undefined}));
+      await record("negative",()=>env.NEW.put("key",untouched(),{contentLength:-1}));
+      await record("tooLarge",()=>env.NEW.put("key",untouched(),{contentLength:314572801}));
+      await record("unknownOption",()=>env.NEW.put("key",untouched(),{profile:"eof-counted"}));
+      result.untouchedPulls=pulls;
+      let zeroEof=false;
+      result.zero=await env.NEW.put("key",new ReadableStream({pull(c){zeroEof=true;c.close()}},{highWaterMark:0}),{contentLength:0});
+      result.zeroEof=zeroEof;
+      result.unknownEmpty=await env.NEW.put("key",new ReadableStream({pull(c){c.close()}},{highWaterMark:0}));
+      return Response.json(result);
+    } }`,
+    FORWARD_OBJECT_INPUT,
+    FORWARD_OBJECT_FORMS,
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://example.com"),
+      rawEnv(service),
+      {},
+    );
+    expect(await response.json()).toEqual({
+      ownUndefined: "TypeError",
+      ownNull: "TypeError",
+      partUndefined: "TypeError",
+      negative: "invalid_body",
+      tooLarge: "value_too_large",
+      unknownOption: "TypeError",
+      untouchedPulls: 0,
+      zero: { etag: "empty", size: 0 },
+      zeroEof: true,
+      unknownEmpty: { etag: "unknown-empty", size: 0 },
+    });
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.document.contentLength).toBe(0);
+    expect(Object.hasOwn(calls[1]?.document ?? {}, "contentLength")).toBe(false);
+    expect(calls.map((call) => call.body)).toEqual(["", ""]);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("forward ObjectBucket renderer owns ArrayBuffer and options before the first asynchronous call", async () => {
+  const { service, calls } = objectPlane([{ ok: true, value: { etag: "original", size: 3 } }]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+      const bytes=new Uint8Array([97,98,99]);
+      const options={contentLength:3,contentType:"text/original",ifMatch:"original-etag"};
+      const pending=env.NEW.put("original-key",bytes.buffer,options);
+      bytes.fill(120);options.contentLength=0;options.contentType="text/replacement";
+      options.ifMatch="replacement-etag";
+      return Response.json(await pending);
+    } }`,
+    FORWARD_OBJECT_INPUT,
+    FORWARD_OBJECT_FORMS,
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://example.com"),
+      rawEnv(service),
+      {},
+    );
+    expect(await response.json()).toEqual({ etag: "original", size: 3 });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.body).toBe("abc");
+    expect(calls[0]?.document).toMatchObject({
+      key: "original-key",
+      contentLength: 3,
+      contentType: "text/original",
+      ifMatch: "original-etag",
+    });
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("forward ObjectBucket renderer rejects completion JS shape and order before transport", async () => {
+  const { service, calls } = objectPlane([]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+      const results={};
+      const cases=()=>[
+        [{partNumber:1,etag:"a"},{partNumber:1,etag:"b"}],
+        [{partNumber:2,etag:"b"},{partNumber:1,etag:"a"}],
+        null, [], new Array(10001), new Array(1),
+        [null], [{partNumber:1}], [{etag:"a"}],
+        [{partNumber:"1",etag:"a"}], [{partNumber:1,etag:1}],
+        [{partNumber:1,etag:"a",extra:true}],
+      ];
+      for(const name of ["OLD","NEW"]){
+        results[name]=[];
+        for(const parts of cases()){
+          try{await env[name].completeMultipartUpload("key","upload",parts);results[name].push("unexpected success")}
+          catch(e){results[name].push(e.name)}
+        }
+      }
+      return Response.json(results);
+    } }`,
+    FORWARD_OBJECT_INPUT,
+    FORWARD_OBJECT_FORMS,
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://example.com"),
+      rawEnv(service),
+      {},
+    );
+    expect(await response.json()).toEqual({
+      OLD: Array(12).fill("TypeError"),
+      NEW: Array(12).fill("TypeError"),
+    });
+    expect(calls).toHaveLength(0);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("forward ObjectBucket renderer retains invalid_part for well-shaped stored part mismatches", async () => {
+  const { service, calls } = objectPlane([
+    { ok: true, value: { uploadId: "owned-upload" } },
+    { ok: true, value: { etag: "stored-part", partNumber: 1, size: 1 } },
+    { ok: false, error: { code: "invalid_part" } },
+  ]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+      const upload=await env.NEW.createMultipartUpload("key");
+      await env.NEW.uploadPart("key",upload.uploadId,1,"x");
+      const result={};
+      try{await env.NEW.completeMultipartUpload("key",upload.uploadId,[{partNumber:1,etag:"wrong-etag"}])}
+      catch(e){result.knownEtagMismatch=e.name}
+      try{await env.NEW.completeMultipartUpload("key","untracked-upload",[{partNumber:1,etag:"not-stored"}])}
+      catch(e){result.backendPartMismatch=e.name}
+      return Response.json(result);
+    } }`,
+    FORWARD_OBJECT_INPUT,
+    FORWARD_OBJECT_FORMS,
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://example.com"),
+      rawEnv(service),
+      {},
+    );
+    expect(await response.json()).toEqual({
+      knownEtagMismatch: "invalid_part",
+      backendPartMismatch: "invalid_part",
+    });
+    expect(calls.map((call) => call.document.op)).toEqual([
+      "createMultipartUpload",
+      "uploadPart",
+      "completeMultipartUpload",
+    ]);
+    expect(calls[2]?.document.uploadId).toBe("untracked-upload");
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("forward ObjectBucket renderer correction leaves legacy completion behavior intact", async () => {
+  const { service, calls } = objectPlane([]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+      const result=[];
+      for(const parts of [
+        [{partNumber:1,etag:"a"},{partNumber:1,etag:"b"}],
+        [{partNumber:2,etag:"b"},{partNumber:1,etag:"a"}],
+      ]){
+        try{await env.MEDIA.completeMultipartUpload("key","upload",parts);result.push("unexpected success")}
+        catch(e){result.push(e.name)}
+      }
+      return Response.json(result);
+    } }`,
+    OBJECTS_ONLY,
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://example.com"),
+      rawEnv(service),
+      {},
+    );
+    expect(await response.json()).toEqual(["invalid_part", "invalid_part"]);
+    expect(calls).toHaveLength(0);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("forward ObjectBucket renderer preserves validated nonbyte and late-producer failures", async () => {
+  const { service, calls } = objectPlane([]);
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+      const result={};
+      const record=async(name,stream,options)=>{try{await env.NEW.put("key",stream,options)}catch(e){result[name]=e.name}};
+      await record("nonbyte",new ReadableStream({start(c){c.enqueue(new Uint8Array([97]));c.enqueue("not bytes");c.close()}}));
+      let count=0;
+      await record("producer",new ReadableStream({pull(c){if(count++===0)c.enqueue(new Uint8Array([97]));else throw Object.assign(new Error("producer-private-diagnostic"),{name:"invalid_body"})}}, {highWaterMark:0}));
+      await record("count",new ReadableStream({pull(c){c.enqueue(new Uint8Array([97]));c.close()}},{highWaterMark:0}),{contentLength:2});
+      return Response.json(result);
+    } }`,
+    FORWARD_OBJECT_INPUT,
+    FORWARD_OBJECT_FORMS,
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://example.com"),
+      rawEnv(service),
+      {},
+    );
+    expect(await response.json()).toEqual({
+      nonbyte: "invalid_body",
+      producer: "backend_unavailable",
+      count: "invalid_body",
+    });
+    // No source failure produces a complete decoded request in this fixture.
+    expect(calls).toHaveLength(0);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("ObjectBucket byte guards retain pre-tenant reader and Uint8Array brand captures", async () => {
+  // The production data plane is in another authority/realm. Keep this local
+  // backend reader independent of the deliberately poisoned tenant prototypes.
+  const getReader = ReadableStream.prototype.getReader;
+  const read = ReadableStreamDefaultReader.prototype.read;
+  const release = ReadableStreamDefaultReader.prototype.releaseLock;
+  const calls: { key: unknown; body: number[] }[] = [];
+  const service = {
+    async fetch(_url: string, init: RequestInit) {
+      const headers = init.headers as Record<string, string>;
+      const document = JSON.parse(
+        Buffer.from(headers[SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER] ?? "", "base64url").toString(
+          "utf8",
+        ),
+      ) as Record<string, unknown>;
+      const reader = Reflect.apply(
+        getReader,
+        init.body,
+        [],
+      ) as ReadableStreamDefaultReader<Uint8Array>;
+      const body: number[] = [];
+      try {
+        for (;;) {
+          const next = await Reflect.apply(read, reader, []);
+          if (next.done) break;
+          body.push(...next.value);
+        }
+      } finally {
+        Reflect.apply(release, reader, []);
+      }
+      calls.push({ key: document.key, body });
+      return Response.json({ ok: true, value: { etag: "good", size: 3 } });
+    },
+  };
+  const generated = await loadGenerated(
+    `const methods = {
+       getReader: ReadableStream.prototype.getReader,
+       read: ReadableStreamDefaultReader.prototype.read,
+       cancel: ReadableStreamDefaultReader.prototype.cancel,
+       releaseLock: ReadableStreamDefaultReader.prototype.releaseLock,
+       hasInstance: Object.getOwnPropertyDescriptor(Uint8Array, Symbol.hasInstance),
+     };
+     const poison = () => { throw new Error("tenant reader override must not run"); };
+     ReadableStream.prototype.getReader = poison;
+     ReadableStreamDefaultReader.prototype.read = poison;
+     ReadableStreamDefaultReader.prototype.cancel = poison;
+     ReadableStreamDefaultReader.prototype.releaseLock = poison;
+     Object.defineProperty(Uint8Array, Symbol.hasInstance, { configurable: true, value: () => true });
+     export default { async fetch(request, env) {
+       try {
+         let sent = false;
+         const good = new ReadableStream({ pull(controller) {
+           if (sent) controller.close();
+           else { sent = true; controller.enqueue(new Uint8Array([97, 98, 99])); }
+         } }, { highWaterMark: 0 });
+         const written = await env.MEDIA.put("good", good);
+         let cancelled = false;
+         const bad = new ReadableStream({
+           pull(controller) { controller.enqueue("not bytes"); },
+           cancel() { cancelled = true; },
+         }, { highWaterMark: 0 });
+         let error;
+         try { await env.MEDIA.put("bad", bad); }
+         catch (caught) { error = { name: caught.name, message: caught.message }; }
+         return Response.json({ written, error, cancelled, goodLocked: good.locked, badLocked: bad.locked });
+       } finally {
+         ReadableStream.prototype.getReader = methods.getReader;
+         ReadableStreamDefaultReader.prototype.read = methods.read;
+         ReadableStreamDefaultReader.prototype.cancel = methods.cancel;
+         ReadableStreamDefaultReader.prototype.releaseLock = methods.releaseLock;
+         if (methods.hasInstance) Object.defineProperty(Uint8Array, Symbol.hasInstance, methods.hasInstance);
+         else delete Uint8Array[Symbol.hasInstance];
+       }
+     } };`,
+    OBJECTS_ONLY,
+  );
+  try {
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(await response.json()).toEqual({
+      written: { etag: "good", size: 3 },
+      error: { name: "invalid_body", message: "invalid_body" },
+      cancelled: true,
+      goodLocked: false,
+      badLocked: false,
+    });
+    expect(calls).toEqual([{ key: "good", body: [0, 0, 0, 3, 97, 98, 99, 255, 255, 255, 255] }]);
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("generated ObjectBucket guards enforce actual byte ceilings before a discard backend ACK", async () => {
+  // Exercise the real generated facade and production stage consumer at their
+  // actual ceilings without creating 300 MiB/5 GiB files or buffering a body.
+  let acknowledged = 0;
+  const service = {
+    async fetch(_url: string, init: RequestInit) {
+      const headers = init.headers as Record<string, string>;
+      const document = JSON.parse(
+        Buffer.from(headers[SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER] ?? "", "base64url").toString(
+          "utf8",
+        ),
+      ) as { op: string; contentLength?: number; partNumber?: number; bodyFormat?: string };
+      if (document.op === "createMultipartUpload") {
+        return Response.json({ ok: true, value: { uploadId: "discard-upload" } });
+      }
+      expect(Object.hasOwn(document, "contentLength")).toBe(false);
+      const put = document.op === "put";
+      try {
+        const size = await consumeSelfhostObjectBody(
+          document.bodyFormat === SELFHOST_DATA_PLANE_OBJECT_BODY_FORMAT
+            ? decodeSelfhostObjectBodyFrames(init.body as ReadableStream<Uint8Array>)
+            : (init.body as ReadableStream<Uint8Array>),
+          {
+            maximum: put ? 314_572_800 : 5_368_709_120,
+            overflow: put ? "value_too_large" : "invalid_body",
+          },
+          async () => {},
+        );
+        acknowledged += 1;
+        return Response.json({
+          ok: true,
+          value: put
+            ? { etag: "discarded-put", size }
+            : { etag: "discarded-part", partNumber: document.partNumber, size },
+        });
+      } catch (error) {
+        return Response.json({
+          ok: false,
+          error: {
+            code: error instanceof SelfhostObjectError ? error.code : "backend_unavailable",
+          },
+        });
+      }
+    },
+  };
+  const generated = await loadGenerated(
+    `export default { async fetch(request, env) {
+       const params = new URL(request.url).searchParams;
+       const put = params.get("op") === "put";
+       const maximum = put ? 314572800 : 5368709120;
+       const total = maximum + (params.get("overflow") === "yes" ? 1 : 0);
+       const block = new Uint8Array(65536);
+       let emitted = 0, cancelled = false;
+       const body = new ReadableStream({
+         pull(controller) {
+           if (emitted === total) { controller.close(); return; }
+           const size = Math.min(block.byteLength, total - emitted);
+           emitted += size;
+           controller.enqueue(block.subarray(0, size));
+         },
+         cancel() { cancelled = true; },
+       }, { highWaterMark: 0 });
+       let receipt, error;
+       try {
+         if (put) receipt = await env.MEDIA.put("limit", body);
+         else {
+           const upload = await env.MEDIA.createMultipartUpload("limit");
+           receipt = await env.MEDIA.uploadPart("limit", upload.uploadId, 1, body);
+         }
+       } catch (caught) { error = { name: caught.name, message: caught.message }; }
+       return Response.json({ receipt, error, emitted, cancelled, locked: body.locked });
+     } };`,
+    OBJECTS_ONLY,
+  );
+  try {
+    for (const op of ["put", "part"] as const) {
+      const maximum = op === "put" ? 314_572_800 : 5_368_709_120;
+      for (const overflow of [false, true]) {
+        const before = acknowledged;
+        const response = await generated.worker.fetch(
+          new Request(`https://worker.example/?op=${op}&overflow=${overflow ? "yes" : "no"}`),
+          rawEnv(service),
+          context,
+        );
+        if (overflow) {
+          const code = op === "put" ? "value_too_large" : "invalid_body";
+          expect(await response.json()).toEqual({
+            error: { name: code, message: code },
+            emitted: maximum + 1,
+            cancelled: true,
+            locked: false,
+          });
+          expect(acknowledged).toBe(before);
+        } else {
+          expect(await response.json()).toEqual({
+            receipt:
+              op === "put"
+                ? { etag: "discarded-put", size: maximum }
+                : { etag: "discarded-part", partNumber: 1 },
+            emitted: maximum,
+            cancelled: false,
+            locked: false,
+          });
+          expect(acknowledged).toBe(before + 1);
+        }
+      }
+    }
+  } finally {
+    await generated.dispose();
+  }
+});
+
+test("generic ObjectBucket unknown-length HTTP streams reach the filesystem through the generated data service", async () => {
+  const root = await mkdtemp(join(tmpdir(), "takoserver-selfhost-object-chain-"));
+  const control = new Database(":memory:");
+  migrateSqlite(control);
+  const planes = serveSelfhostDataPlanes({
+    sql: createSqliteSql(control),
+    grant: async (script, versionId) =>
+      script === "worker" && versionId === "v1"
+        ? {
+            secret: "selfhost-object-chain-secret-0000",
+            kv: {},
+            sql: {},
+            queue: {},
+            objects: { MEDIA: `tsb-${"a".repeat(40)}` },
+          }
+        : null,
+    databasePath: (name) => join(root, `${name}.sqlite`),
+    objectRoot: join(root, "objects"),
+  });
+  let generated: Awaited<ReturnType<typeof loadGenerated>> | undefined;
+  let observer:
+    | { readonly port: number | undefined; stop(closeActive?: boolean): unknown }
+    | undefined;
+  const receivedWrites: {
+    document: Record<string, unknown>;
+    contentLength: string | null;
+    transferEncoding: string | null;
+  }[] = [];
+  try {
+    // Observe real incoming HTTP framing, then forward with the same body and
+    // disconnect signal to the product-owned loopback listener. Never record auth.
+    observer = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      async fetch(request) {
+        const encoded = request.headers.get(SELFHOST_DATA_PLANE_OBJECT_REQUEST_HEADER);
+        if (!encoded) return new Response(null, { status: 400 });
+        const document = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")) as Record<
+          string,
+          unknown
+        >;
+        if (document.op === "put" || document.op === "uploadPart") {
+          receivedWrites.push({
+            document,
+            contentLength: request.headers.get("content-length"),
+            transferEncoding: request.headers.get("transfer-encoding"),
+          });
+        }
+        const headers = new Headers(request.headers);
+        headers.delete("host");
+        headers.delete("transfer-encoding");
+        return await fetch(`http://127.0.0.1:${planes.port}${new URL(request.url).pathname}`, {
+          method: request.method,
+          headers,
+          signal: request.signal,
+          ...(request.body ? { body: request.body, duplex: "half" as const } : {}),
+        });
+      },
+    });
+    const observerPort = observer.port;
+    if (observerPort === undefined) throw new Error("loopback HTTP observer did not bind a port");
+    await Bun.write(join(root, SELFHOST_WORKER_DATA_SERVICE_MODULE), selfhostDataServiceSource());
+    const dataService = (await import(
+      `${pathToFileURL(join(root, SELFHOST_WORKER_DATA_SERVICE_MODULE)).href}?test=${crypto.randomUUID()}`
+    )) as {
+      readonly default: {
+        fetch(request: Request, env: Record<string, unknown>): Promise<Response>;
+      };
+    };
+    const dataServiceEnv = {
+      [SELFHOST_WORKER_DATA_TOKEN_BINDING]: "worker.v1.selfhost-object-chain-secret-0000",
+      [SELFHOST_WORKER_DATA_PLANE_BINDING]: {
+        async fetch(url: string, init: RequestInit): Promise<Response> {
+          return await fetch(`http://127.0.0.1:${observerPort}${new URL(url).pathname}`, init);
+        },
+      },
+    };
+    const service = {
+      async fetch(url: string, init: RequestInit): Promise<Response> {
+        return await dataService.default.fetch(new Request(url, init), dataServiceEnv);
+      },
+    };
+    generated = await loadGenerated(
+      `function chunks(values) {
+         let index = 0;
+         return new ReadableStream({ async pull(controller) {
+           await new Promise(resolve => setTimeout(resolve, 1));
+           if (index === values.length) controller.close();
+           else controller.enqueue(new Uint8Array(values[index++]));
+         } }, { highWaterMark: 0 });
+       }
+       async function failure(operation) {
+         try { await operation(); return null; }
+         catch (error) { return { name: error.name, message: error.message }; }
+       }
+       function failedSource(malformed) {
+         let sent = 0;
+         return new ReadableStream({ pull(controller) {
+           if (sent++ === 0) controller.enqueue(new Uint8Array([65]));
+           else if (malformed && sent === 2) controller.enqueue("not bytes");
+           else if (malformed) controller.close();
+           else controller.error(new Error("private producer diagnostic"));
+         } }, { highWaterMark: 0 });
+       }
+       export default { async fetch(request, env) {
+         const hello = await env.MEDIA.put("hello", chunks([[], [104, 101], [], [108, 108, 111]]));
+         const empty = await env.MEDIA.put("empty", chunks([[], []]));
+         await env.MEDIA.put("previous", "stable");
+         const exact = await env.MEDIA.put("exact", chunks([[], [65], [66], []]), { contentLength: 2 });
+         const errors = [];
+         errors.push(await failure(() => env.MEDIA.put("previous", chunks([[65]]), { contentLength: 2 })));
+         errors.push(await failure(() => env.MEDIA.put("previous", chunks([[65], [66]]), { contentLength: 1 })));
+         errors.push(await failure(() => env.MEDIA.put("previous", failedSource(true))));
+         errors.push(await failure(() => env.MEDIA.put("previous", failedSource(false))));
+         const upload = await env.MEDIA.createMultipartUpload("small-part");
+         const part = await env.MEDIA.uploadPart("small-part", upload.uploadId, 1, chunks([[], [104, 101], [108, 108, 111]]));
+         errors.push(await failure(() => env.MEDIA.uploadPart("small-part", upload.uploadId, 1, chunks([[65]]), { contentLength: 2 })));
+         const done = await env.MEDIA.completeMultipartUpload("small-part", upload.uploadId, [part]);
+         const zeroUpload = await env.MEDIA.createMultipartUpload("zero-part");
+         const zeroPart = await env.MEDIA.uploadPart("zero-part", zeroUpload.uploadId, 1, chunks([[], []]));
+         const zeroDone = await env.MEDIA.completeMultipartUpload("zero-part", zeroUpload.uploadId, [zeroPart]);
+         const previous = await env.MEDIA.get("previous");
+         const small = await env.MEDIA.get("small-part");
+         const zero = await env.MEDIA.get("zero-part");
+         return Response.json({ hello, empty, exact, part, done, zeroPart, zeroDone, errors,
+           previous: await new Response(previous.body).text(),
+           small: await new Response(small.body).text(), zero: await new Response(zero.body).text() });
+       } };`,
+      OBJECTS_ONLY,
+    );
+    const response = await generated.worker.fetch(
+      new Request("https://worker.example/"),
+      rawEnv(service),
+      context,
+    );
+    expect(response.status).toBe(200);
+    const helloEtag = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+    const emptyEtag = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    expect(await response.json()).toEqual({
+      hello: { etag: helloEtag, size: 5 },
+      empty: { etag: emptyEtag, size: 0 },
+      exact: {
+        etag: "38164fbd17603d73f696b8b4d72664d735bb6a7c88577687fd2ae33fd6964153",
+        size: 2,
+      },
+      part: { etag: helloEtag, partNumber: 1 },
+      done: { etag: expect.stringMatching(/^[0-9a-f]{64}-1$/u), size: 5 },
+      zeroPart: { etag: emptyEtag, partNumber: 1 },
+      zeroDone: { etag: expect.stringMatching(/^[0-9a-f]{64}-1$/u), size: 0 },
+      errors: [
+        { name: "invalid_body", message: "invalid_body" },
+        { name: "invalid_body", message: "invalid_body" },
+        { name: "invalid_body", message: "invalid_body" },
+        { name: "backend_unavailable", message: "backend_unavailable" },
+        { name: "invalid_body", message: "invalid_body" },
+      ],
+      previous: "stable",
+      small: "hello",
+      zero: "",
+    });
+    const unknownWrites = receivedWrites.filter(
+      ({ document }) => !Object.hasOwn(document, "contentLength") && document.key !== "previous",
+    );
+    expect(unknownWrites.map(({ document }) => [document.op, document.key])).toEqual([
+      ["put", "hello"],
+      ["put", "empty"],
+      ["uploadPart", "small-part"],
+      ["uploadPart", "zero-part"],
+    ]);
+    for (const write of unknownWrites) {
+      expect(write.contentLength).toBeNull();
+      expect(write.transferEncoding).toBe("chunked");
+    }
+  } finally {
+    await generated?.dispose();
+    await observer?.stop(true);
+    await planes.stop(true);
+    control.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 test("scheduled event reports exact handler settlement without leaking thrown details", async () => {
   const generated = await loadGenerated(

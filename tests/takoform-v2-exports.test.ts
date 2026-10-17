@@ -66,9 +66,21 @@ import {
   createSQLiteMigrationApplicationForm,
   SQLITE_MIGRATION_APPLICATION_BACKEND_ID,
 } from "../src/takoform-v2/forms/sqlite-migration-application-backend.ts";
+import {
+  parseSQLiteMigrationManifest,
+  validateSQLiteMigrationPayload,
+} from "../src/takoform-v2/forms/sqlite-migration-set.ts";
 import { createSQLiteWorkerBindingAuthority } from "../src/takoform-v2/forms/sqlite-worker-binding-authority.ts";
-import { STATIC_ASSET_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/static-asset-bundle.ts";
+import {
+  parseStaticAssetBundleManifest,
+  STATIC_ASSET_BUNDLE_FORM_URL,
+  validateStaticAssetBundlePayload,
+} from "../src/takoform-v2/forms/static-asset-bundle.ts";
 import { createStaticAssetBundleCustody } from "../src/takoform-v2/forms/static-asset-bundle-backend.ts";
+import {
+  parseWorkerBundleManifest,
+  validateWorkerBundlePayload,
+} from "../src/takoform-v2/forms/worker-bundle.ts";
 import {
   createWorkerBundleCustody,
   createWorkerBundleHost,
@@ -162,11 +174,15 @@ const RUNTIME_EXPORTS = [
   "inspectV2WorkerCodeVersionEligibility",
   "inspectV2WorkerInvocationDrainSchema",
   "inspectV2WorkerInvocationSchema",
+  "inspectV2WorkerNativeIdentityDomain",
   "parseEdgeKVNamespaceSpec",
   "parseModuleWorkerSpec",
   "parseObjectBucketSpec",
   "parseSQLiteDatabaseSpec",
+  "parseSQLiteMigrationManifest",
+  "parseStaticAssetBundleManifest",
   "parseTakoformV2PublicConfig",
+  "parseWorkerBundleManifest",
   "parseWorkerDeploymentSpec",
   "parseWorkerEndpointSpec",
   "parseWorkerVersionSpec",
@@ -182,6 +198,8 @@ const RUNTIME_EXPORTS = [
   "SQLITE_MIGRATION_APPLICATION_BACKEND_ID",
   "STATIC_ASSET_BUNDLE_FORM_URL",
   "TakoformV2Error",
+  "v2WorkerInvocationDrainSchemaReady",
+  "v2WorkerInvocationLegacySchemaReady",
   "v2WorkerInvocationSchemaReady",
   "V2_QUEUE_BACKEND_ID",
   "V2_ACTOR_NAMESPACE_BACKEND_ID",
@@ -190,13 +208,54 @@ const RUNTIME_EXPORTS = [
   "validateModuleWorkerUpdate",
   "validateObjectBucketUpdate",
   "validateSQLiteDatabaseUpdate",
+  "validateSQLiteMigrationPayload",
+  "validateStaticAssetBundlePayload",
+  "validateWorkerBundlePayload",
   "validateWorkerDeploymentUpdate",
   "validateWorkerEndpointUpdate",
   "validateWorkerVersionUpdate",
+  "CONTAINER_WORKER_DEPLOYMENT_FORM_URL",
+  "CONTAINER_WORKER_VERSION_FORM_URL",
+  "FORWARD_WORKER_DEPLOYMENT_FORM_URL",
+  "FORWARD_WORKER_VERSION_FORM_URL",
+  "OBJECT_BUCKET_EOF_COUNTED_FORM_URL",
+  "OBJECT_BUCKET_KNOWN_LENGTH_FORM_URL",
+  "SQLITE_MIGRATION_APPLICATION_FORM_URL",
+  "SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0",
+  "SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0",
+  "SQLITE_MIGRATION_APPLICATION_FORM_URL_0_4_0",
+  "SQLITE_MIGRATION_SET_FORM_URL",
+  "SQLITE_MIGRATION_SET_FORM_URL_0_2_0",
+  "SQLITE_MIGRATION_SET_FORM_URL_0_3_0",
+  "SQLITE_MIGRATION_SET_FORM_URL_0_4_0",
+  "SQLITE_MIGRATION_SET_LIMITS",
+  "createObjectBucketStreamForm",
+  "createSQLiteMigrationSetCustody",
+  "fixedReferencesForForwardWorkerDeployment",
+  "fixedReferencesForForwardWorkerVersion",
+  "parseForwardWorkerDeploymentSpec",
+  "parseForwardWorkerVersionSpec",
+  "parseSQLiteMigrationApplicationSpec",
+  "parseSQLiteMigrationSetSpec",
+  "prepareForwardWorkerDeploymentReferences",
+  "prepareForwardWorkerVersionReferences",
+  "referencesForForwardWorkerDeployment",
+  "referencesForForwardWorkerVersion",
+  "runSQLiteMigrationApplication",
+  "selectObjectBucketBindingProfile",
+  "snapshotObjectBucketBindingForms",
+  "validateForwardWorkerDeploymentUpdate",
+  "validateForwardWorkerVersionUpdate",
 ] as const;
 
 test("the v2 package subpath is the existing SQL and Worker Form authority, not a second registry", async () => {
   expect(Object.keys(extension).sort()).toEqual([...RUNTIME_EXPORTS].sort());
+  expect(extension.parseSQLiteMigrationManifest).toBe(parseSQLiteMigrationManifest);
+  expect(extension.validateSQLiteMigrationPayload).toBe(validateSQLiteMigrationPayload);
+  expect(extension.parseStaticAssetBundleManifest).toBe(parseStaticAssetBundleManifest);
+  expect(extension.validateStaticAssetBundlePayload).toBe(validateStaticAssetBundlePayload);
+  expect(extension.parseWorkerBundleManifest).toBe(parseWorkerBundleManifest);
+  expect(extension.validateWorkerBundlePayload).toBe(validateWorkerBundlePayload);
   expect(extension.createV2WorkerPublicationState).toBe(createV2WorkerPublicationState);
   expect(extension.createV2WorkflowSelectedMaterials).toBe(createV2WorkflowSelectedMaterials);
   expect(extension.createWorkerBundleCustody).toBe(createWorkerBundleCustody);

@@ -1,4 +1,5 @@
 import { MIGRATIONS } from "./db-schema.ts";
+import { frameHostMigrationSql } from "./sqlite-migration-policy.ts";
 import {
   hasImmutableStripeModeRealmSchema,
   parseStripeMode,
@@ -265,7 +266,7 @@ function migrateWithStripeRealm(
       ) {
         refuseAutomaticMoneyCutover(database);
       }
-      executeStatements(database, migration.sql);
+      executeSqliteMigrationStatements(database, migration.sql);
       recordMigration(database, migration.name);
       applied.push(migration.name);
     }
@@ -429,11 +430,11 @@ function migrateExistingDatabase(
         migration.name === WALLET_USD_MICROS_MIGRATION
       )
         refuseAutomaticMoneyCutover(database);
-      executeStatements(database, migration.sql);
+      executeSqliteMigrationStatements(database, migration.sql);
       recordMigration(database, migration.name);
       database.exec("COMMIT");
     } catch (error) {
-      database.exec("ROLLBACK");
+      rollbackQuietly(database);
       if (
         error instanceof UsedV1InstallationError ||
         error instanceof MoneyUnitCutoverRequiredError
@@ -576,7 +577,7 @@ function bootstrapFreshDatabase(database: MigratableDatabase): MigrationReport {
 
     for (const migration of MIGRATIONS) {
       currentMigration = migration.name;
-      executeStatements(database, migration.sql);
+      executeSqliteMigrationStatements(database, migration.sql);
       recordMigration(database, migration.name);
       applied.push(migration.name);
     }
@@ -617,42 +618,12 @@ function createMigrationLedger(database: MigratableDatabase): void {
 }
 
 /**
- * Bun's `Database.exec()` may stop at a failed statement in a multi-statement
- * string without surfacing that intermediate error. Migrations need the
- * opposite contract, so execute the repository's deliberately simple SQL
- * files statement-by-statement after removing line comments.
+ * The existing owning migration writer executes one complete statement at a
+ * time so Bun's batch API cannot hide an intermediate step error. Use the
+ * shared canonical lexer to preserve quoted SQL, comments and trigger bodies.
+ * This internal module export is also the direct qualification seam; it is
+ * not an SDK/package export or a tenant migration permission.
  */
-function executeStatements(database: MigratableDatabase, sql: string): void {
-  const statements = splitStatements(sql.replace(/^\s*--.*$/gmu, ""));
-  for (const statement of statements) database.exec(statement);
-}
-
-/**
- * Migration files are intentionally simple, with one exception: SQLite
- * triggers contain semicolon-delimited statements inside `BEGIN ... END`.
- * Preserve each complete trigger as one statement while retaining the
- * intermediate-error visibility that a raw multi-statement `exec` lacks.
- */
-function splitStatements(sql: string): readonly string[] {
-  const statements: string[] = [];
-  let rest = sql.trim();
-  while (rest.length > 0) {
-    if (/^CREATE\s+TRIGGER\b/iu.test(rest)) {
-      const end = /^END\s*;/imu.exec(rest);
-      if (!end) throw new Error("incomplete CREATE TRIGGER in migration");
-      const boundary = (end.index ?? 0) + end[0].length;
-      statements.push(rest.slice(0, boundary).trim());
-      rest = rest.slice(boundary).trim();
-      continue;
-    }
-    const boundary = rest.indexOf(";");
-    if (boundary < 0) {
-      statements.push(rest);
-      break;
-    }
-    const statement = rest.slice(0, boundary).trim();
-    if (statement.length > 0) statements.push(statement);
-    rest = rest.slice(boundary + 1).trim();
-  }
-  return statements;
+export function executeSqliteMigrationStatements(database: MigratableDatabase, sql: string): void {
+  for (const statement of frameHostMigrationSql(sql)) database.exec(statement);
 }
