@@ -1247,6 +1247,21 @@ async function post94ReadFixture() {
   const suffixBinding = (): MoneyPost94DispatchBinding => {
     const original = f.bindings.get("convert");
     if (original === undefined) throw new Error("missing converted binding");
+    // Structural review data only; no protected declaration or held selection is minted.
+    const selectionReview = {
+      kind: "takoserver.money-post94-selection-review@v1" as const,
+      phase: "suffix98" as const,
+      accountId: original.accountId,
+      databaseId: original.databaseId,
+      databaseName: original.databaseName,
+      previousWriterEpoch: writerEpoch,
+      nextWriterEpoch,
+      original92BackupDigest: f.backup.digest,
+      converted94BackupDigest: converted.digest,
+      convertBindingDigest: convert.bindingDigest,
+      selectedStripeMode: "test" as const,
+      declarationDigest: sha("component-only suffix selection declaration; never native custody"),
+    };
     const sealedImportPath = join(f.directory, "component-only-suffix.sql");
     const bytes = "-- retained structural fixture; no Financial pin or native import\n";
     writeFileSync(sealedImportPath, bytes, { mode: 0o600 });
@@ -1264,6 +1279,8 @@ async function post94ReadFixture() {
       converted94BackupDigest: converted.digest,
       convertBindingDigest: convert.bindingDigest,
       modePreparationDigest: sha("component structural taint; not a Financial preparation"),
+      selectedStripeMode: selectionReview.selectedStripeMode,
+      selectionReviewDigest: moneyCutoverBindingDigest(selectionReview),
       afterSchemaPhase: "0098-fenced",
       sealedImportPath,
     };

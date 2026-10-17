@@ -2209,6 +2209,21 @@ describe("money acknowledged import input failure", () => {
 
 function post94CustodyFixture() {
   const f = sealedImportCustodyFixture();
+  // Structural review data only; no protected declaration or held selection is minted.
+  const selectionReview = {
+    kind: "takoserver.money-post94-selection-review@v1" as const,
+    phase: "suffix98" as const,
+    accountId: f.binding.accountId,
+    databaseId: f.binding.databaseId,
+    databaseName: f.binding.databaseName,
+    previousWriterEpoch: writerEpoch,
+    nextWriterEpoch: sha("next retained writer epoch"),
+    original92BackupDigest: f.binding.backupDigest,
+    converted94BackupDigest: sha("converted full94 snapshot"),
+    convertBindingDigest: sha("original terminal convert binding"),
+    selectedStripeMode: "test" as const,
+    declarationDigest: sha("component-only suffix selection declaration; never native custody"),
+  };
   const binding: MoneyPost94DispatchBinding = {
     ...f.binding,
     kind: "takoserver.money-cutover-dispatch@v2",
@@ -2219,6 +2234,8 @@ function post94CustodyFixture() {
     converted94BackupDigest: sha("converted full94 snapshot"),
     convertBindingDigest: sha("original terminal convert binding"),
     modePreparationDigest: sha("structural fixture, never real Financial mode authority"),
+    selectedStripeMode: selectionReview.selectedStripeMode,
+    selectionReviewDigest: moneyCutoverBindingDigest(selectionReview),
     afterSchemaPhase: "0098-fenced",
     writerEpoch,
   };

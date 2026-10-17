@@ -121,11 +121,9 @@ test("post94 selection review digest commits the explicit TEST value", () => {
     declarationDigest: EPOCH,
   };
   const selectedDigest = moneyCutoverBindingDigest(binding);
-  const missing = { ...binding } as Partial<MoneyPost94SelectionReviewBinding>;
-  delete missing.selectedStripeMode;
-  expect(moneyCutoverBindingDigest(missing as MoneyPost94SelectionReviewBinding)).not.toBe(
-    selectedDigest,
-  );
+  const missing = { ...binding };
+  Reflect.deleteProperty(missing, "selectedStripeMode");
+  expect(moneyCutoverBindingDigest(missing)).not.toBe(selectedDigest);
   expect(
     moneyCutoverBindingDigest({
       ...binding,
