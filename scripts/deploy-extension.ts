@@ -103,15 +103,18 @@ export {
   readCurrentAuditedMigrationSourceArtifact,
   runD1Schema,
 } from "./deploy/schema.ts";
+export type { MoneyHeldNormalWorkerModeFacts } from "./deploy/schema-money-unit-cutover.ts";
 export type {
   MoneyUnitHeldConvertContext,
   MoneyUnitHeldConvertFacts,
+  MoneyUnitHeldNormalWorkerModePreparation,
   MoneyUnitOriginalOriginRead,
   MoneyUnitResumeReadback,
   MoneyUnitResumeReadRequest,
 } from "./deploy/schema-money-unit-owner.ts";
 export {
   assertMoneyUnitHeldConvertCurrent,
+  assertMoneyUnitHeldNormalWorkerModePreparationCurrent,
   readIntegrationMoneyUnitResumeState,
 } from "./deploy/schema-money-unit-owner.ts";
 export type {
