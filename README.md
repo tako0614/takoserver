@@ -325,8 +325,9 @@ the Host with the updated config, then create the `ModuleWorker`,
 Resources through `/apis/forms.takoform.com/v2/resources`. Steps 6 to 10 of the
 [install path](docs/self-host-operations.md#first-install-and-first-use) give
 the complete commands; steps 11 and 12 add SQLite, KV, bucket and queue
-Bindings, and step 13 deletes everything in reference order. `scripts/selfhost-artifact.ts verify` rechecks
-every configured entry read-only, including while the Host runs.
+Bindings, and step 13 deletes everything in reference order.
+`scripts/selfhost-artifact.ts verify` rechecks every configured entry
+read-only, including while the Host runs.
 
 ### HTTPS and TCP 443
 

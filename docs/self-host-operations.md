@@ -1228,9 +1228,9 @@ A Worker reaches a KV namespace, an object bucket or a queue the way it reaches
 a database: through a Binding in its WorkerVersion. `kvBindings` name an
 `EdgeKVNamespace`, `bucketBindings` an `ObjectBucket` and
 `queueProducerBindings` an `AtLeastOnceQueue`, each entry as
-`{name, resource: {resourceUid}}`. A Binding name is a JavaScript identifier of
-up to 64 characters, such as `NOTES` (no `-`), and no var or other Binding of
-the version may share it. To read a queue, a `QueueConsumer` names the queue
+`{name, resource: {resourceUid}}`. A Binding name is up to 64 ASCII letters,
+digits, `_` and `$`, not starting with a digit, such as `NOTES` (no `-`), and
+no var, secret or other Binding of the version may share it. To read a queue, a `QueueConsumer` names the queue
 and the Worker, and the Worker's code exports a `queue` handler. The published
 Forms define each spec:
 [EdgeKVNamespace 0.2.0](https://edge.forms.takoform.com/forms/EdgeKVNamespace/0.2.0/),
@@ -1312,8 +1312,11 @@ CONSUMER=$(create QueueConsumer/0.3.0 hello-consumer "$spec")
 
 A `QueueConsumer` is refused with `409 dependency_conflict`, and nothing is
 stored, until the Worker's Deployment serves only versions whose `handlers`
-include `queue`; while it exists, every version you serve must declare `queue`.
-Now send a note and read it back:
+include `queue`. While it exists, keep `queue` in every version you serve: the
+Host does not refuse a Deployment that serves a version without it, but it then
+delivers nothing to the Worker until every served version declares `queue`
+again, and the messages wait only as long as the queue's retention. Now send a
+note and read it back:
 
 ```sh
 curl -sS "https://$NAME/?note=first"
@@ -1346,7 +1349,8 @@ dialog starts from a spec the Host accepts. Create `hello-bundle-v4` as in
 step 10. Then open the version that serves now and choose **New version from
 this one**, choose `hello-bundle-v4`, and in the spec add `"queue"` to
 `handlers` and the three Binding arrays above, with each Resource's UID from
-its page; the console does not offer Bindings to choose yet. Name it
+its page; the console does not offer Bindings to choose yet. A copy of step
+11's v3 keeps its `DB` Binding, which does no harm. Name it
 `hello-version-v4`, create it and serve it. Once that update has succeeded,
 create the `QueueConsumer` `hello-consumer`, choosing `hello-queue` and
 `hello`.
