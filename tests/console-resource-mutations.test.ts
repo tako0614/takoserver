@@ -460,7 +460,10 @@ test.each(["connection lost", "malformed accepted reply"] as const)(
     body.append(resourcesPage("org-console") as unknown as TestNode);
     await settle();
     expect(body.textContent).toContain("Acceptance is unknown");
-    expect(body.textContent).toContain("Retry exact request");
+    // While the exact request can still be resent, that is the advice.
+    expect(body.textContent).toContain(
+      "Use “Retry exact request”: it sends the same request under the same key",
+    );
     expect(writes).toHaveLength(1);
     button(body, "Retry exact request").click();
     await settle();
@@ -1860,7 +1863,8 @@ test("after a full reload without the in-memory exact intent, warning remains re
   expect(requests.filter((request) => request.url.includes("/support"))).toHaveLength(2);
   await settle();
   expect(body.textContent).toContain("Acceptance is unknown");
-  expect(body.textContent).toContain("After a full reload without the exact request");
+  expect(body.textContent).toContain("it can no longer resend it exactly");
+  expect(body.textContent).not.toContain("Use “Retry exact request”");
   expect(body.textContent).not.toContain("Retry exact request");
   expect(requests.every((request) => request.method === "GET")).toBe(true);
 });

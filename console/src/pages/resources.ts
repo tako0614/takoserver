@@ -282,13 +282,20 @@ export function resourcesPage(organizationId: string): Child {
           h(
             "div",
             { class: "card__body", style: { display: "grid", gap: "12px" } },
+            // Whether the exact request can still be sent again decides the advice:
+            // resend it under its key, or read before sending anything new.
             h(
               "div",
               { class: "notice notice--warn" },
-              tr(
-                "この一覧と対象リソースを読み直してください。表示がないことだけでは未受理を証明できません。ページ再読み込み後に正確な再送情報がない場合や再送期限後は運用者に確認してください。新しいキーで同じ操作を送らないでください。",
-                "Read this inventory and the affected Resource. Absence here does not prove rejection. After a full reload without the exact request, or after the replay deadline, ask the operator to reconcile; do not submit the same intent under a new key.",
-              ),
+              outstanding.some((intent) => canReplayResourceIntent(intent))
+                ? tr(
+                    "Hostがこの要求を受け付けたかどうか、コンソールでは分かりませんでした。「同じ要求を再送」を使ってください。同じキーで同じ要求を送るので、Hostは二重に変更せず、最初のOperationを返します。同じ変更を新しいキーで送り直さないでください。",
+                    "The Console could not tell whether the Host accepted this request. Use “Retry exact request”: it sends the same request under the same key, so the Host returns the original Operation instead of making a second change. Never send the same change again under a new key.",
+                  )
+                : tr(
+                    "Hostがこの要求を受け付けたかどうか、コンソールでは分かりませんでした。ページを再読み込みしたか再送期限を過ぎたため、同じ要求はもう再送できません。新しく送る前に、リソース一覧と対象のリソースを確認してください。まだ表示されていなくても、受け付けられなかったとは限りません。同じ変更を新しいキーで送り直さないでください。",
+                    "The Console could not tell whether the Host accepted this request, and it can no longer resend it exactly: the page was reloaded, or the replay window has passed. Check the Resources list and the Resource itself before sending anything new; a Resource not shown yet does not mean the request was refused. Never send the same change again under a new key.",
+                  ),
             ),
             ...outstanding.map((intent) =>
               h(
