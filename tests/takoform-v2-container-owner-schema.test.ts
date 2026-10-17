@@ -1036,7 +1036,7 @@ test("genuine Core DELETE retires the durable Container owner in the same accept
       action: "delete",
       generation: 3,
       resourceUid: created.resourceUid,
-      status: "accepted",
+      status: "queued",
     });
     expect(observed.deleteBatches).toHaveLength(1);
     const batch = observed.deleteBatches[0]!;
@@ -1066,7 +1066,7 @@ test("genuine Core DELETE retires the durable Container owner in the same accept
       action: "delete",
       generation: 3,
       resource_uid: created.resourceUid,
-      status: "accepted",
+      status: "queued",
     });
     const actualCoreBackend = db
       .query("SELECT backend_key FROM tf_v2_operations WHERE id = ?")
