@@ -15,12 +15,13 @@ import {
   MONEY_CUTOVER_PERMIT_DDL,
   MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
 } from "../src/money-cutover-sql.ts";
-import { type Sql, SqlError } from "../src/ports.ts";
+import { type Sql, SqlError, type SqlStatement } from "../src/ports.ts";
 import {
   createSharedFinancialActionIdentity,
   type SharedFinancialAction,
 } from "../src/shared-financial-action.ts";
 import {
+  buildFinancialR1CoPreparationBatch,
   buildFinancialR1MechanicalBatch,
   createFinancialRetainedR1Store,
   type FinancialR1WriteCommand,
@@ -1092,6 +1093,888 @@ describe("private Financial R1 mechanical custody", () => {
       if (read.status !== "found") throw Error("historical R1 missing");
       expect(read.original.actionSource.incarnation).toBe("incarnation:test");
       expect(read.original.selectedTerms).toEqual(command.original.selectedTerms);
+    } finally {
+      f.close();
+    }
+  });
+});
+
+describe("fixed registration C0 R1 contribution", () => {
+  const tables = [
+    "financial_action_source_registrations",
+    "financial_preproof_challenges",
+    "financial_preproof_challenge_receipts",
+    "financial_retained_r1_originals",
+    "financial_retained_r1_receipts",
+  ] as const;
+  // Explicit generic-SQLite fixture bracket only. This is not the missing genuine
+  // Root R.batch/permit/currentness port and is not exported by product source.
+  function fixtureTransaction(statements: readonly SqlStatement[]): readonly SqlStatement[] {
+    return [
+      {
+        sql: "INSERT INTO money_cutover_writer_permit VALUES(1,'usd-micros-v2',?)",
+        params: [EPOCH],
+      },
+      ...statements,
+      { sql: "DELETE FROM money_cutover_writer_permit WHERE singleton=1" },
+    ];
+  }
+  for (const action of ACTIONS) {
+    test(`${action.kind} compiles one exact registration and both existing pairs without effects`, async () => {
+      const f = await fixture();
+      try {
+        const command = await f.command(action),
+          before = [f.writes, f.clocks, f.providerRequests];
+        const c0 = createFinancialPreproofChallengeStore(f.options).buildPreparationContribution(
+          command.original.c0,
+          AT,
+        );
+        const oldC0 = f.c0.buildPreparationBatch(command.original.c0, AT),
+          oldR1 = await buildFinancialR1MechanicalBatch(f.options, command),
+          fixed = await buildFinancialR1CoPreparationBatch(f.options, command, AT);
+        expect(fixed).toHaveLength(5);
+        expect(fixed.slice(1, 3)).toEqual([...oldC0]);
+        expect(c0.statements).toEqual(oldC0);
+        const originalParams = fixed[3]?.params,
+          oldOriginalParams = oldR1[0]?.params;
+        if (!originalParams) throw Error("co-batch original input missing");
+        if (!oldOriginalParams) throw Error("old R1 original input missing");
+        // The new-only CTE reuses four role IDs instead of repeating 32 binds.
+        // Re-expand every original slot to verify all old typed values, not a subset.
+        const roles = originalParams.slice(0, 4);
+        expect([
+          ...originalParams.slice(0, 13),
+          ...originalParams.slice(21),
+          ...roles,
+          ...roles,
+          ...roles,
+          ...roles,
+          ...roles,
+          ...roles,
+          ...roles,
+          ...roles,
+        ]).toEqual([...oldOriginalParams]);
+        expect(originalParams).toHaveLength(28);
+        const source = command.original.actionSource;
+        const registration = {
+          version: "financial-action-registration-canonical-v1",
+          registrationRef: source.registrationRef,
+          incarnation: source.incarnation,
+          sourceRef: source.ref,
+          originRef: source.originRef,
+          financialRealm: source.financialRealm,
+          organizationId: source.organizationId,
+          workspaceId: source.workspaceId,
+          workspaceRef: source.workspaceRef,
+        };
+        expect(Object.keys(registration)).toHaveLength(9);
+        expect(await canonicalDigest([registration.version, registration])).toBe(
+          source.registrationDigest,
+        );
+        expect(fixed[0]?.params?.slice(0, 6)).toEqual([
+          source.registrationRef,
+          source.incarnation,
+          source.registrationDigest,
+          registration.version,
+          canonicalJson(registration),
+          AT,
+        ]);
+        expect(c0.preparedImage.recordJson).toBe(
+          canonicalJson({
+            ...command.original.c0,
+            scope: command.original.scopeRealm,
+          }),
+        );
+        expect(c0.preparedImage).toEqual({
+          challengeRef: command.key.challengeRef,
+          preparationRef: command.key.preparationRef,
+          receiptRef: command.original.c0ReceiptRef,
+          challengeJson: canonicalJson(command.original.c0.challenge),
+          scopeJson: canonicalJson(command.original.scopeRealm),
+          recordJson: c0.preparedImage.recordJson,
+          createdAt: AT,
+        });
+        expect(Object.isFrozen(c0)).toBe(true);
+        expect(Object.isFrozen(c0.preparedImage)).toBe(true);
+        expect(Object.isFrozen(c0.statements)).toBe(true);
+        expect(
+          fixed.every(
+            (statement) => Object.isFrozen(statement) && Object.isFrozen(statement.params),
+          ),
+        ).toBe(true);
+        expect([f.writes, f.clocks, f.providerRequests]).toEqual(before);
+        expect(tables.map((table) => count(f.db, table))).toEqual([0, 0, 0, 0, 0]);
+      } finally {
+        f.close();
+      }
+    });
+  }
+
+  test("one generic fixture transaction retains all five rows and exact 32768-byte displayed terms", async () => {
+    const f = await fixture();
+    try {
+      const command = await f.command(ACTIONS[0]!, "co-batch-full-terms", "x".repeat(32768));
+      const fixed = await buildFinancialR1CoPreparationBatch(f.options, command, AT);
+      expect(await f.base.batch(fixtureTransaction(fixed))).toHaveLength(7);
+      expect(tables.map((table) => count(f.db, table))).toEqual([1, 1, 1, 1, 1]);
+      const retained = await f.store.readRetainedR1Original(command);
+      expect(retained.status).toBe("found");
+      if (retained.status !== "found") throw Error("positive five-row R1 absent");
+      expect(retained.original).toEqual(command.original);
+      expect(retained.original.selectedTerms.bodyByteLength).toBe(32768);
+      expect(count(f.db, "money_cutover_writer_permit")).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("terminal mandatory receipt rejects a missing C0 receipt and rolls back every new row", async () => {
+    const f = await fixture();
+    try {
+      const command = await f.command(ACTIONS[0]!, "co-batch-missing-c0-receipt"),
+        fixed = await buildFinancialR1CoPreparationBatch(f.options, command, AT);
+      await expect(
+        f.base.batch(fixtureTransaction(fixed.filter((_, index) => index !== 2))),
+      ).rejects.toMatchObject({ code: "constraint" });
+      expect(tables.map((table) => count(f.db, table))).toEqual([0, 0, 0, 0, 0]);
+      expect(count(f.db, "money_cutover_writer_permit")).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+
+  for (const crossed of ["record", "scope", "createdAt"] as const) {
+    test(`terminal mandatory receipt rejects a valid but crossed C0 ${crossed} preimage`, async () => {
+      const f = await fixture();
+      try {
+        const command = await f.command(ACTIONS[0]!, `co-batch-crossed-${crossed}`),
+          fixed = await buildFinancialR1CoPreparationBatch(f.options, command, AT),
+          other = structuredClone(command.original.c0);
+        const otherScope = { ...SCOPE };
+        if (crossed === "record")
+          Object.assign(other.selection.business, { ref: "business:crossed" });
+        if (crossed === "scope") {
+          otherScope.workspaceRef = "workspace-ref:crossed";
+          Object.assign(other.challenge, { workspaceRef: otherScope.workspaceRef });
+          Object.assign(other.selection.billingBinding, { workspaceRef: otherScope.workspaceRef });
+        }
+        const alternateC0 = createFinancialPreproofChallengeStore({
+          ...f.options,
+          scope: otherScope,
+        }).buildPreparationContribution(
+          other,
+          crossed === "createdAt" ? "2026-10-15T00:00:00.001Z" : AT,
+        );
+        const registration = fixed[0],
+          original = fixed[3],
+          receipt = fixed[4];
+        if (!registration || !original || !receipt) throw Error("fixed five statements missing");
+        await expect(
+          f.base.batch(
+            fixtureTransaction([registration, ...alternateC0.statements, original, receipt]),
+          ),
+        ).rejects.toMatchObject({ code: "constraint" });
+        expect(tables.map((table) => count(f.db, table))).toEqual([0, 0, 0, 0, 0]);
+        expect(count(f.db, "money_cutover_writer_permit")).toBe(0);
+      } finally {
+        f.close();
+      }
+    });
+  }
+
+  test("a conditional in-transaction five-row milestone reaches an exact late SQL fault then rolls back", async () => {
+    const f = await fixture();
+    try {
+      const command = await f.command(ACTIONS[0]!, "co-batch-late-fault"),
+        fixed = await buildFinancialR1CoPreparationBatch(f.options, command, AT);
+      // The integer-overflow branch is reached only when all five exact new rows
+      // already exist in this transaction. Missing rows return 0 and must fail this test.
+      const lateFault: SqlStatement = {
+        sql: `SELECT CASE WHEN
+          EXISTS(SELECT 1 FROM financial_action_source_registrations WHERE registration_ref=? AND incarnation=?)
+          AND EXISTS(SELECT 1 FROM financial_preproof_challenges WHERE challenge_ref=? AND preparation_ref=?)
+          AND EXISTS(SELECT 1 FROM financial_preproof_challenge_receipts WHERE receipt_ref=? AND all_rows_match=1)
+          AND EXISTS(SELECT 1 FROM financial_retained_r1_originals WHERE r1_ref=? AND receipt_ref=?)
+          AND EXISTS(SELECT 1 FROM financial_retained_r1_receipts WHERE receipt_ref=? AND all_rows_match=1)
+          THEN abs(-9223372036854775808) ELSE 0 END AS all_five_reached_before_late_fault`,
+        params: [
+          command.original.actionSource.registrationRef,
+          command.original.actionSource.incarnation,
+          command.key.challengeRef,
+          command.key.preparationRef,
+          command.original.c0ReceiptRef,
+          command.key.r1Ref,
+          command.r1ReceiptRef,
+          command.r1ReceiptRef,
+        ],
+      };
+      await expect(f.base.batch(fixtureTransaction([...fixed, lateFault]))).rejects.toMatchObject({
+        name: "SqlError",
+        code: "unavailable",
+        message: "integer overflow",
+      });
+      expect(tables.map((table) => count(f.db, table))).toEqual([0, 0, 0, 0, 0]);
+      expect(count(f.db, "money_cutover_writer_permit")).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("the complete action economic terms and source image is detached before the digest await", async () => {
+    const f = await fixture();
+    try {
+      const command = await f.command(ACTIONS[0]!, "co-batch-before-await"),
+        original = structuredClone(command),
+        before = [f.writes, f.clocks, f.providerRequests];
+      const pending = buildFinancialR1CoPreparationBatch(f.options, command, AT);
+      Object.assign(command.original.selectedTerms, {
+        bodyUtf8Base64url: "altered",
+        ref: "terms:altered",
+      });
+      Object.assign(command.original.actionSource, { originRef: "origin:altered" });
+      Object.assign(command.original.economic, { amountMinor: 999 });
+      const fixed = await pending;
+      expect(fixed).toEqual(await buildFinancialR1CoPreparationBatch(f.options, original, AT));
+      expect([f.writes, f.clocks, f.providerRequests]).toEqual(before);
+      expect(tables.map((table) => count(f.db, table))).toEqual([0, 0, 0, 0, 0]);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("extra SQL-shaped command data and invalid time fail before a contribution or effects", async () => {
+    const f = await fixture();
+    try {
+      const command = await f.command(ACTIONS[0]!, "co-batch-closed-input"),
+        before = [f.writes, f.clocks, f.providerRequests];
+      await expect(
+        buildFinancialR1CoPreparationBatch(
+          f.options,
+          Object.assign(structuredClone(command), { sql: "SELECT 1" }),
+          AT,
+        ),
+      ).rejects.toMatchObject({ code: "invalid_request" });
+      await expect(
+        buildFinancialR1CoPreparationBatch(f.options, command, "today"),
+      ).rejects.toMatchObject({ code: "invalid_request" });
+      expect([f.writes, f.clocks, f.providerRequests]).toEqual(before);
+      expect(tables.map((table) => count(f.db, table))).toEqual([0, 0, 0, 0, 0]);
+    } finally {
+      f.close();
+    }
+  });
+});
+
+describe("business-key historical DATA and new-five-only CAS", () => {
+  const tables = [
+    "financial_action_source_registrations",
+    "financial_preproof_challenges",
+    "financial_preproof_challenge_receipts",
+    "financial_retained_r1_originals",
+    "financial_retained_r1_receipts",
+  ] as const;
+  function fixtureTransaction(statements: readonly SqlStatement[]): readonly SqlStatement[] {
+    return [
+      {
+        sql: "INSERT INTO money_cutover_writer_permit VALUES(1,'usd-micros-v2',?)",
+        params: [EPOCH],
+      },
+      ...statements,
+      { sql: "DELETE FROM money_cutover_writer_permit WHERE singleton=1" },
+    ];
+  }
+  async function candidate(
+    f: Awaited<ReturnType<typeof fixture>>,
+    action: SharedFinancialAction,
+    suffix: string,
+    scope: FinancialPreproofScope = SCOPE,
+  ) {
+    const command = await f.command(action, suffix),
+      o = command.original;
+    Object.assign(o.c0.challenge, scope);
+    Object.assign(o.scopeRealm, scope);
+    Object.assign(o.c0.selection.billingBinding, {
+      organizationId: scope.organizationId,
+      workspaceId: scope.workspaceId,
+      workspaceRef: scope.workspaceRef,
+    });
+    const source = o.actionSource;
+    Object.assign(source, {
+      ref: `action-source:${suffix}`,
+      registrationRef: `action-registration:${suffix}`,
+      incarnation: `incarnation:${suffix}`,
+      originRef: `origin:${suffix}`,
+      organizationId: scope.organizationId,
+      workspaceId: scope.workspaceId,
+      workspaceRef: scope.workspaceRef,
+    });
+    const registration = {
+      version: "financial-action-registration-canonical-v1",
+      registrationRef: source.registrationRef,
+      incarnation: source.incarnation,
+      sourceRef: source.ref,
+      originRef: source.originRef,
+      financialRealm: source.financialRealm,
+      organizationId: source.organizationId,
+      workspaceId: source.workspaceId,
+      workspaceRef: source.workspaceRef,
+    };
+    Object.assign(source, {
+      registrationDigest: await canonicalDigest([registration.version, registration]),
+    });
+    Object.assign(source, {
+      digest: await canonicalDigest([
+        "financial-selected-action-source-canonical-v1",
+        {
+          version: "financial-selected-action-source-canonical-v1",
+          ref: source.ref,
+          registrationRef: source.registrationRef,
+          registrationDigest: source.registrationDigest,
+          incarnation: source.incarnation,
+          originRef: source.originRef,
+          financialRealm: source.financialRealm,
+          organizationId: source.organizationId,
+          workspaceId: source.workspaceId,
+          workspaceRef: source.workspaceRef,
+          selectedAt: source.selectedAt,
+        },
+      ]),
+    });
+    return { command, options: { ...f.options, scope } };
+  }
+
+  test("positive absence requires all four history tables and is DATA only without effects", async () => {
+    const f = await fixture();
+    try {
+      const before = [f.writes, f.clocks, f.providerRequests];
+      expect(await f.store.readBusinessRetainedR1Data(ACTIONS[0]!)).toEqual({
+        status: "not-found",
+      });
+      expect([f.writes, f.clocks, f.providerRequests]).toEqual(before);
+      expect(tables.map((table) => count(f.db, table))).toEqual([0, 0, 0, 0, 0]);
+      await expect(f.store.prepare(await f.command(ACTIONS[0]!))).rejects.toMatchObject({
+        code: "unavailable",
+      });
+    } finally {
+      f.close();
+    }
+  });
+
+  test("same business reads the actual complete old command and full terms without selecting again", async () => {
+    const f = await fixture();
+    try {
+      const c = await candidate(f, ACTIONS[0]!, "business-original");
+      await f.base.batch(
+        fixtureTransaction(await buildFinancialR1CoPreparationBatch(c.options, c.command, AT)),
+      );
+      const before = [f.writes, f.clocks, f.providerRequests];
+      const read = await f.store.readBusinessRetainedR1Data(ACTIONS[0]!);
+      expect(read.status).toBe("found");
+      if (read.status !== "found") throw Error("historical original missing");
+      expect(read.original).toEqual(c.command.original);
+      expect(read.r1ReceiptRef).toBe(c.command.r1ReceiptRef);
+      expect(read.c0ReceiptRef).toBe(c.command.original.c0ReceiptRef);
+      const expectedAction = ACTIONS[0];
+      if (!expectedAction) throw Error("expected original action missing");
+      expect(read.actionIdentity.action).toEqual(expectedAction);
+      expect([f.writes, f.clocks, f.providerRequests]).toEqual(before);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("changed body finds the original reference then conflicts and cannot commit another five rows", async () => {
+    const f = await fixture();
+    try {
+      const first = await candidate(f, ACTIONS[0]!, "business-body-original");
+      await f.base.batch(
+        fixtureTransaction(
+          await buildFinancialR1CoPreparationBatch(first.options, first.command, AT),
+        ),
+      );
+      const changed: SharedFinancialAction = {
+        kind: "topup",
+        organizationId: SCOPE.organizationId,
+        reference: ACTIONS[0]!.reference,
+        amountMinor: 999,
+      };
+      await expect(f.store.readBusinessRetainedR1Data(changed)).rejects.toMatchObject({
+        code: "conflict",
+      });
+      const second = await candidate(f, changed, "business-body-changed");
+      await expect(
+        f.base.batch(
+          fixtureTransaction(
+            await buildFinancialR1CoPreparationBatch(second.options, second.command, AT),
+          ),
+        ),
+      ).rejects.toMatchObject({ code: "constraint" });
+      expect(tables.map((table) => count(f.db, table))).toEqual([1, 1, 1, 1, 1]);
+      expect(count(f.db, "money_cutover_writer_permit")).toBe(0);
+      const kept = await f.store.readBusinessRetainedR1Data(ACTIONS[0]!);
+      expect(kept.status === "found" && kept.original).toEqual(first.command.original);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("another workspace cannot turn the same Org business into absence or another selection", async () => {
+    const f = await fixture();
+    try {
+      const first = await candidate(f, ACTIONS[0]!, "business-workspace-original");
+      await f.base.batch(
+        fixtureTransaction(
+          await buildFinancialR1CoPreparationBatch(first.options, first.command, AT),
+        ),
+      );
+      const scope = {
+        ...SCOPE,
+        workspaceId: "workspace:other",
+        workspaceRef: "workspace-ref:other",
+        clientId: "client:other",
+      };
+      const otherStore = createFinancialRetainedR1Store({ ...f.options, scope });
+      await expect(otherStore.readBusinessRetainedR1Data(ACTIONS[0]!)).rejects.toMatchObject({
+        code: "unavailable",
+      });
+      const second = await candidate(f, ACTIONS[0]!, "business-workspace-other", scope);
+      await expect(
+        f.base.batch(
+          fixtureTransaction(
+            await buildFinancialR1CoPreparationBatch(second.options, second.command, AT),
+          ),
+        ),
+      ).rejects.toMatchObject({ code: "constraint" });
+      expect(tables.map((table) => count(f.db, table))).toEqual([1, 1, 1, 1, 1]);
+      const kept = await f.store.readBusinessRetainedR1Data(ACTIONS[0]!);
+      expect(kept.status === "found" && kept.original).toEqual(first.command.original);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("two precompiled different-ref candidates elect one under serial atomic fixture transactions", async () => {
+    const f = await fixture();
+    try {
+      const first = await candidate(f, ACTIONS[0]!, "business-first"),
+        second = await candidate(f, ACTIONS[0]!, "business-second");
+      const firstBatch = await buildFinancialR1CoPreparationBatch(first.options, first.command, AT),
+        secondBatch = await buildFinancialR1CoPreparationBatch(second.options, second.command, AT);
+      expect(first.command.key).not.toEqual(second.command.key);
+      await f.base.batch(fixtureTransaction(firstBatch));
+      await expect(f.base.batch(fixtureTransaction(secondBatch))).rejects.toMatchObject({
+        code: "constraint",
+      });
+      expect(tables.map((table) => count(f.db, table))).toEqual([1, 1, 1, 1, 1]);
+      expect(count(f.db, "money_cutover_writer_permit")).toBe(0);
+      const kept = await f.store.readBusinessRetainedR1Data(ACTIONS[0]!);
+      expect(kept.status === "found" && kept.original).toEqual(first.command.original);
+      // Old two-statement DATA API remains unchanged and is not claimed to enforce this new CAS.
+      const old = await buildFinancialR1MechanicalBatch(second.options, second.command);
+      expect(old[0]?.params).toHaveLength(52);
+      expect(old[0]?.sql).not.toContain("r1_input");
+    } finally {
+      f.close();
+    }
+  });
+
+  for (const distinct of ["kind", "organization"] as const) {
+    test(`a distinct ${distinct} keeps its actual business namespace and can retain a second original`, async () => {
+      const f = await fixture();
+      try {
+        const first = await candidate(f, ACTIONS[0]!, `business-distinct-${distinct}-first`);
+        await f.base.batch(
+          fixtureTransaction(
+            await buildFinancialR1CoPreparationBatch(first.options, first.command, AT),
+          ),
+        );
+        const scope =
+          distinct === "organization" ? { ...SCOPE, organizationId: "org:other" } : SCOPE;
+        const other: SharedFinancialAction =
+          distinct === "kind"
+            ? {
+                kind: "card-setup",
+                organizationId: SCOPE.organizationId,
+                reference: ACTIONS[0]!.reference,
+                setupDisclosureRevision: "disclosure:other",
+              }
+            : {
+                kind: "topup",
+                organizationId: scope.organizationId,
+                reference: ACTIONS[0]!.reference,
+                amountMinor: 500,
+              };
+        const second = await candidate(f, other, `business-distinct-${distinct}-second`, scope);
+        await f.base.batch(
+          fixtureTransaction(
+            await buildFinancialR1CoPreparationBatch(second.options, second.command, AT),
+          ),
+        );
+        expect(tables.map((table) => count(f.db, table))).toEqual([2, 2, 2, 2, 2]);
+        const read = await createFinancialRetainedR1Store(
+          second.options,
+        ).readBusinessRetainedR1Data(other);
+        expect(read.status === "found" && read.original).toEqual(second.command.original);
+      } finally {
+        f.close();
+      }
+    });
+  }
+
+  for (const partial of [
+    "R1-original-only",
+    "R1-receipt-only",
+    "C0-only",
+    "C0-original-only",
+    "C0-receipt-only",
+  ] as const) {
+    test(`${partial} history is unavailable and blocks a different-ref candidate without altering history`, async () => {
+      const f = await fixture();
+      try {
+        const first = await candidate(f, ACTIONS[0]!, `business-partial-${partial}`);
+        if (partial.startsWith("R1")) {
+          const fixed = await buildFinancialR1CoPreparationBatch(first.options, first.command, AT);
+          await f.base.batch(
+            fixtureTransaction(partial === "R1-original-only" ? fixed.slice(0, 4) : fixed),
+          );
+          if (partial === "R1-receipt-only") {
+            f.db.exec("PRAGMA foreign_keys=OFF");
+            try {
+              await withoutGuard(f.db, "financial_retained_r1_originals_no_delete", () => {
+                f.db
+                  .query("DELETE FROM financial_retained_r1_originals WHERE r1_ref=?")
+                  .run(first.command.key.r1Ref);
+              });
+            } finally {
+              f.db.exec("PRAGMA foreign_keys=ON");
+            }
+          }
+        } else if (partial === "C0-original-only") {
+          const original = f.c0.buildPreparationBatch(first.command.original.c0, AT)[0];
+          if (!original) throw Error("C0 original missing");
+          await f.base.batch([original]);
+        } else {
+          await f.c0.prepare(first.command.original.c0);
+          if (partial === "C0-receipt-only") {
+            f.db.exec("PRAGMA foreign_keys=OFF");
+            try {
+              await withoutGuard(f.db, "financial_preproof_challenges_no_delete", () => {
+                f.db
+                  .query("DELETE FROM financial_preproof_challenges WHERE challenge_ref=?")
+                  .run(first.command.key.challengeRef);
+              });
+            } finally {
+              f.db.exec("PRAGMA foreign_keys=ON");
+            }
+          }
+        }
+        const before = tables.map((table) => count(f.db, table));
+        await expect(f.store.readBusinessRetainedR1Data(ACTIONS[0]!)).rejects.toMatchObject({
+          code: "unavailable",
+        });
+        const second = await candidate(f, ACTIONS[0]!, `business-after-${partial}`);
+        await expect(
+          f.base.batch(
+            fixtureTransaction(
+              await buildFinancialR1CoPreparationBatch(second.options, second.command, AT),
+            ),
+          ),
+        ).rejects.toMatchObject({ code: "constraint" });
+        expect(tables.map((table) => count(f.db, table))).toEqual(before);
+        expect(count(f.db, "money_cutover_writer_permit")).toBe(0);
+      } finally {
+        f.close();
+      }
+    });
+  }
+
+  for (const corrupt of ["malformed-original", "crossed-receipt"] as const) {
+    test(`${corrupt} business history is held rather than parsed as absence`, async () => {
+      const f = await fixture();
+      try {
+        const first = await candidate(f, ACTIONS[0]!, `business-${corrupt}`);
+        await f.base.batch(
+          fixtureTransaction(
+            await buildFinancialR1CoPreparationBatch(first.options, first.command, AT),
+          ),
+        );
+        if (corrupt === "malformed-original") {
+          const altered = structuredClone(first.command);
+          Object.assign(altered.original.economic, { amountMinor: 999 });
+          await withoutGuard(f.db, "financial_retained_r1_originals_no_update", () => {
+            f.db
+              .query("UPDATE financial_retained_r1_originals SET command_json=? WHERE r1_ref=?")
+              .run(canonicalJson(altered), first.command.key.r1Ref);
+          });
+          await withoutGuard(f.db, "financial_retained_r1_receipts_no_update", () => {
+            f.db
+              .query("UPDATE financial_retained_r1_receipts SET command_json=? WHERE receipt_ref=?")
+              .run(canonicalJson(altered), first.command.r1ReceiptRef);
+          });
+        } else {
+          const other = await candidate(f, ACTIONS[0]!, "business-crossed-command");
+          await withoutGuard(f.db, "financial_retained_r1_receipts_no_update", () => {
+            f.db
+              .query("UPDATE financial_retained_r1_receipts SET command_json=? WHERE receipt_ref=?")
+              .run(canonicalJson(other.command), first.command.r1ReceiptRef);
+          });
+        }
+        await expect(f.store.readBusinessRetainedR1Data(ACTIONS[0]!)).rejects.toMatchObject({
+          code: "unavailable",
+        });
+      } finally {
+        f.close();
+      }
+    });
+  }
+
+  test("empty history with a missing C0 schema guard is unavailable until the original guard is restored", async () => {
+    const f = await fixture();
+    try {
+      await withoutGuard(f.db, "financial_preproof_challenges_no_delete", async () => {
+        await expect(f.store.readBusinessRetainedR1Data(ACTIONS[0]!)).rejects.toMatchObject({
+          code: "unavailable",
+        });
+      });
+      expect(await f.store.readBusinessRetainedR1Data(ACTIONS[0]!)).toEqual({
+        status: "not-found",
+      });
+    } finally {
+      f.close();
+    }
+  });
+
+  test("multiple same-business histories written through the old DATA API are held without first-row adoption", async () => {
+    const f = await fixture();
+    try {
+      for (const suffix of ["business-old-first", "business-old-second"]) {
+        const c = await candidate(f, ACTIONS[0]!, suffix);
+        await f.c0.prepare(c.command.original.c0);
+        const registration = (
+          await buildFinancialR1CoPreparationBatch(c.options, c.command, AT)
+        )[0];
+        if (!registration) throw Error("registration fixture missing");
+        await f.base.batch(
+          fixtureTransaction([
+            registration,
+            ...(await buildFinancialR1MechanicalBatch(c.options, c.command)),
+          ]),
+        );
+      }
+      expect(tables.map((table) => count(f.db, table))).toEqual([2, 2, 2, 2, 2]);
+      await expect(f.store.readBusinessRetainedR1Data(ACTIONS[0]!)).rejects.toMatchObject({
+        code: "unavailable",
+      });
+      const third = await candidate(f, ACTIONS[0]!, "business-old-third");
+      await expect(
+        f.base.batch(
+          fixtureTransaction(
+            await buildFinancialR1CoPreparationBatch(third.options, third.command, AT),
+          ),
+        ),
+      ).rejects.toMatchObject({ code: "constraint" });
+      expect(tables.map((table) => count(f.db, table))).toEqual([2, 2, 2, 2, 2]);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("unknown query is unavailable and a later empty DATA read does not classify that attempt's effects", async () => {
+    const f = await fixture();
+    try {
+      f.unknownQuery();
+      await expect(f.store.readBusinessRetainedR1Data(ACTIONS[0]!)).rejects.toMatchObject({
+        code: "unavailable",
+      });
+      expect(await f.store.readBusinessRetainedR1Data(ACTIONS[0]!)).toEqual({
+        status: "not-found",
+      });
+      expect(tables.map((table) => count(f.db, table))).toEqual([0, 0, 0, 0, 0]);
+      // This DATA reader supplies no unknown latch, abort proof or NEW permission.
+    } finally {
+      f.close();
+    }
+  });
+
+  test("lookup detaches the caller action before awaiting and returns the retained original unchanged", async () => {
+    const f = await fixture();
+    try {
+      const first = await candidate(f, ACTIONS[0]!, "business-read-before-await");
+      await f.base.batch(
+        fixtureTransaction(
+          await buildFinancialR1CoPreparationBatch(first.options, first.command, AT),
+        ),
+      );
+      const action = structuredClone(ACTIONS[0]!);
+      const pending = f.store.readBusinessRetainedR1Data(action);
+      Object.assign(action, { amountMinor: 999, reference: "topup:after-await" });
+      const read = await pending;
+      expect(read.status === "found" && read.original).toEqual(first.command.original);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("closed lookup input rejects extra SQL and getters without invoking them", async () => {
+    const f = await fixture();
+    try {
+      let gets = 0;
+      const action = structuredClone(ACTIONS[0]!);
+      Object.defineProperty(action, "reference", {
+        enumerable: true,
+        get() {
+          gets++;
+          return "topup:forged";
+        },
+      });
+      await expect(f.store.readBusinessRetainedR1Data(action)).rejects.toMatchObject({
+        code: "invalid_request",
+      });
+      expect(gets).toBe(0);
+      await expect(
+        f.store.readBusinessRetainedR1Data(
+          Object.assign(structuredClone(ACTIONS[0]!), { sql: "SELECT 1" }),
+        ),
+      ).rejects.toMatchObject({ code: "invalid_request" });
+      expect(tables.map((table) => count(f.db, table))).toEqual([0, 0, 0, 0, 0]);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("actual C0.prepare retains an opaque body and its outer business blocks fresh references", async () => {
+    const f = await fixture();
+    try {
+      const prior = await candidate(f, ACTIONS[0]!, "business-opaque-C0");
+      Object.assign(prior.command.original.c0.selection.action, { body: { amountMinor: 500 } });
+      expect(await f.c0.prepare(prior.command.original.c0)).toEqual({
+        preparationRef: prior.command.key.preparationRef,
+        challengeRef: prior.command.key.challengeRef,
+        receiptRef: prior.command.original.c0ReceiptRef,
+      });
+      expect(await f.c0.readChallenge(prior.command.key.challengeRef)).toEqual(
+        prior.command.original.c0.challenge,
+      );
+      const oldOriginal = f.db.query("SELECT * FROM financial_preproof_challenges").all(),
+        oldReceipt = f.db.query("SELECT * FROM financial_preproof_challenge_receipts").all();
+      expect(tables.map((table) => count(f.db, table))).toEqual([0, 1, 1, 0, 0]);
+      await expect(f.store.readBusinessRetainedR1Data(ACTIONS[0]!)).rejects.toMatchObject({
+        code: "unavailable",
+      });
+      const fresh = await candidate(f, ACTIONS[0]!, "business-after-opaque-C0");
+      const fixed = await buildFinancialR1CoPreparationBatch(fresh.options, fresh.command, AT);
+      expect(fixed[3]?.params).toHaveLength(28);
+      await expect(f.base.batch(fixtureTransaction(fixed))).rejects.toMatchObject({
+        code: "constraint",
+      });
+      expect(tables.map((table) => count(f.db, table))).toEqual([0, 1, 1, 0, 0]);
+      expect(f.db.query("SELECT * FROM financial_preproof_challenges").all()).toEqual(oldOriginal);
+      expect(f.db.query("SELECT * FROM financial_preproof_challenge_receipts").all()).toEqual(
+        oldReceipt,
+      );
+      expect(count(f.db, "money_cutover_writer_permit")).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("actual crossed outer and body C0 keys within its challenge Org are both held", async () => {
+    const f = await fixture();
+    try {
+      const outer = ACTIONS[0]!,
+        body: SharedFinancialAction = {
+          kind: "card-setup",
+          organizationId: SCOPE.organizationId,
+          reference: "card:crossed-C0-body",
+          setupDisclosureRevision: "disclosure:crossed",
+        };
+      const prior = await candidate(f, outer, "business-crossed-outer-body-C0");
+      Object.assign(prior.command.original.c0.selection.action, { body });
+      expect(await f.c0.prepare(prior.command.original.c0)).toMatchObject({
+        challengeRef: prior.command.key.challengeRef,
+      });
+      const oldOriginal = f.db.query("SELECT * FROM financial_preproof_challenges").all(),
+        oldReceipt = f.db.query("SELECT * FROM financial_preproof_challenge_receipts").all();
+      for (const [index, action] of [outer, body].entries()) {
+        await expect(f.store.readBusinessRetainedR1Data(action)).rejects.toMatchObject({
+          code: "unavailable",
+        });
+        const fresh = await candidate(f, action, `business-crossed-C0-attempt-${index}`);
+        await expect(
+          f.base.batch(
+            fixtureTransaction(
+              await buildFinancialR1CoPreparationBatch(fresh.options, fresh.command, AT),
+            ),
+          ),
+        ).rejects.toMatchObject({ code: "constraint" });
+        expect(tables.map((table) => count(f.db, table))).toEqual([0, 1, 1, 0, 0]);
+        expect(f.db.query("SELECT * FROM financial_preproof_challenges").all()).toEqual(
+          oldOriginal,
+        );
+        expect(f.db.query("SELECT * FROM financial_preproof_challenge_receipts").all()).toEqual(
+          oldReceipt,
+        );
+      }
+    } finally {
+      f.close();
+    }
+  });
+
+  test("unvalidated C0 body Org cannot occupy another Org while both refs remain held in its actual Org", async () => {
+    const f = await fixture();
+    try {
+      const foreignScope = { ...SCOPE, organizationId: "org:foreign-C0-body" };
+      const body: SharedFinancialAction = {
+        kind: "topup",
+        organizationId: foreignScope.organizationId,
+        reference: "topup:foreign-C0-body",
+        amountMinor: 500,
+      };
+      const prior = await candidate(f, ACTIONS[0]!, "business-C0-unvalidated-org");
+      Object.assign(prior.command.original.c0.selection.action, { body });
+      expect(await f.c0.prepare(prior.command.original.c0)).toMatchObject({
+        challengeRef: prior.command.key.challengeRef,
+      });
+      await expect(f.store.readBusinessRetainedR1Data(ACTIONS[0]!)).rejects.toMatchObject({
+        code: "unavailable",
+      });
+      const actualOrgBodyKey: SharedFinancialAction = {
+        ...body,
+        organizationId: SCOPE.organizationId,
+      };
+      await expect(f.store.readBusinessRetainedR1Data(actualOrgBodyKey)).rejects.toMatchObject({
+        code: "unavailable",
+      });
+      const actualOrgAttempt = await candidate(
+        f,
+        actualOrgBodyKey,
+        "business-C0-actual-org-blocked",
+      );
+      await expect(
+        f.base.batch(
+          fixtureTransaction(
+            await buildFinancialR1CoPreparationBatch(
+              actualOrgAttempt.options,
+              actualOrgAttempt.command,
+              AT,
+            ),
+          ),
+        ),
+      ).rejects.toMatchObject({ code: "constraint" });
+      const foreignStore = createFinancialRetainedR1Store({ ...f.options, scope: foreignScope });
+      expect(await foreignStore.readBusinessRetainedR1Data(body)).toEqual({ status: "not-found" });
+      const independent = await candidate(f, body, "business-C0-real-foreign-org", foreignScope);
+      await f.base.batch(
+        fixtureTransaction(
+          await buildFinancialR1CoPreparationBatch(independent.options, independent.command, AT),
+        ),
+      );
+      const read = await foreignStore.readBusinessRetainedR1Data(body);
+      expect(read.status === "found" && read.original).toEqual(independent.command.original);
+      expect(tables.map((table) => count(f.db, table))).toEqual([1, 2, 2, 1, 1]);
+      await expect(f.store.readBusinessRetainedR1Data(ACTIONS[0]!)).rejects.toMatchObject({
+        code: "unavailable",
+      });
     } finally {
       f.close();
     }

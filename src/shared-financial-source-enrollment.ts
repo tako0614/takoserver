@@ -351,6 +351,20 @@ export interface FinancialPreproofReceipt {
   readonly challengeRef: string;
   readonly receiptRef: string;
 }
+/** Compiler-produced preimage DATA, not a committed original or mandatory receipt. */
+export interface FinancialPreproofPreparedImage {
+  readonly challengeRef: string;
+  readonly preparationRef: string;
+  readonly receiptRef: string;
+  readonly challengeJson: string;
+  readonly scopeJson: string;
+  readonly recordJson: string;
+  readonly createdAt: string;
+}
+export interface FinancialPreproofPreparationContribution {
+  readonly statements: readonly SqlStatement[];
+  readonly preparedImage: FinancialPreproofPreparedImage;
+}
 /** Historical original data only; neither current source nor human consent is established here. */
 export interface FinancialPreproofActionOriginal {
   readonly preparationRef: string;
@@ -495,6 +509,42 @@ export function createFinancialPreproofChallengeStore(
       challengeJson = json(saved.challenge),
       at = iso(observedAt);
     return compilePreparationBatch(saved, recordJson, challengeJson, at);
+  }
+  /** Existing schema/realm DATA-read readiness only; no history or NEW/current authority assertion. */
+  async function checkPreparationHistorySchema(): Promise<void> {
+    await c.ready();
+  }
+  /** Closed compiler image for an owning co-batch. It proves no commit or authority. */
+  function buildPreparationContribution(
+    input: FinancialPreproofPreparation,
+    observedAt: string,
+  ): FinancialPreproofPreparationContribution {
+    let saved: ReturnType<typeof parse>;
+    try {
+      saved = parse(snapshot(input));
+    } catch (error) {
+      return fail("invalid_request", error);
+    }
+    const recordJson = json(saved),
+      challengeJson = json(saved.challenge),
+      at = iso(observedAt);
+    const statements = Object.freeze(
+      compilePreparationBatch(saved, recordJson, challengeJson, at).map((statement) =>
+        Object.freeze({ ...statement, params: Object.freeze([...(statement.params ?? [])]) }),
+      ),
+    );
+    return Object.freeze({
+      statements,
+      preparedImage: Object.freeze({
+        challengeRef: saved.challenge.challengeRef,
+        preparationRef: saved.preparationRef,
+        receiptRef: saved.receiptRef,
+        challengeJson,
+        scopeJson,
+        recordJson,
+        createdAt: at,
+      }),
+    });
   }
   async function prepare(input: FinancialPreproofPreparation): Promise<FinancialPreproofReceipt> {
     let saved: ReturnType<typeof parse>;
@@ -657,6 +707,8 @@ export function createFinancialPreproofChallengeStore(
   }
   return Object.freeze({
     buildPreparationBatch,
+    buildPreparationContribution,
+    checkPreparationHistorySchema,
     prepare,
     readChallenge,
     readActionOriginal,

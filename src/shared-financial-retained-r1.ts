@@ -6,9 +6,10 @@ import {
 } from "./hosted-billing-realm.ts";
 import { base64UrlDecode, bytesDigest, canonicalDigest, canonicalJson } from "./json.ts";
 import { assertMoneyCutoverSqlOrigin } from "./money-cutover-sql.ts";
-import { type Row, type Sql, type SqlParam, type SqlStatement } from "./ports.ts";
+import type { Row, Sql, SqlParam, SqlStatement } from "./ports.ts";
 import {
   createSharedFinancialActionIdentity,
+  type SharedFinancialAction,
   type SharedFinancialActionIdentity,
 } from "./shared-financial-action.ts";
 import {
@@ -22,6 +23,7 @@ import {
   createFinancialPreproofChallengeStore,
   type FinancialEnrollmentComponentOptions,
   type FinancialPreproofPreparation,
+  type FinancialPreproofPreparedImage,
   type FinancialPreproofScope,
   type FinancialPreproofScopeRealmImage,
 } from "./shared-financial-source-enrollment.ts";
@@ -859,6 +861,116 @@ export async function buildFinancialR1MechanicalBatch(
     if (error instanceof FinancialRetainedR1Error) throw error;
     return fail("unavailable", error);
   }
+  return compileMechanicalBatch(c, p);
+}
+// One primary business namespace. Fingerprint, workspace/client and new refs are never absence keys.
+const R1_BUSINESS = `json_extract(command_json,'$.original.c0.selection.action.body.kind') IS ?
+  AND json_extract(command_json,'$.original.c0.selection.action.body.organizationId') IS ?
+  AND json_extract(command_json,'$.original.c0.selection.action.body.reference') IS ?`;
+// Legacy C0 body is opaque. Its actual Org is the parsed challenge Org, never an unvalidated body claim.
+const C0_BUSINESS = `((json_extract(record_json,'$.selection.action.body.kind') IS ?
+  AND json_extract(record_json,'$.challenge.organizationId') IS ?
+  AND json_extract(record_json,'$.selection.action.body.reference') IS ?)
+  OR (json_extract(record_json,'$.selection.action.kind') IS ?
+  AND json_extract(record_json,'$.challenge.organizationId') IS ?
+  AND json_extract(record_json,'$.selection.action.ref') IS ?))`;
+
+/** New-five-only original. Fixed one-row DATA input reuses all four role IDs and C0 image values.
+ * No field or predicate is omitted to reserve space for a separately qualified future guard. */
+function compileCoPreparationOriginal(
+  p: Parsed,
+  c0: FinancialPreproofPreparedImage,
+  current: string,
+  currentParams: readonly SqlParam[],
+): SqlStatement {
+  const o = p.command.original,
+    s = o.actionSource,
+    action = p.actionIdentity.action;
+  const r1Business = `json_extract(command_json,'$.original.c0.selection.action.body.kind') IS i.action_kind
+    AND json_extract(command_json,'$.original.c0.selection.action.body.organizationId') IS i.organization_id
+    AND json_extract(command_json,'$.original.c0.selection.action.body.reference') IS i.action_reference`;
+  const c0Business = `((json_extract(record_json,'$.selection.action.body.kind') IS i.action_kind
+    AND json_extract(record_json,'$.challenge.organizationId') IS i.organization_id
+    AND json_extract(record_json,'$.selection.action.body.reference') IS i.action_reference)
+    OR (json_extract(record_json,'$.selection.action.kind') IS i.action_kind
+    AND json_extract(record_json,'$.challenge.organizationId') IS i.organization_id
+    AND json_extract(record_json,'$.selection.action.ref') IS i.action_reference))`;
+  const collisions = `r1_ref IN (i.r1_ref,i.challenge_ref,i.preparation_ref,i.receipt_ref)
+    OR challenge_ref IN (i.r1_ref,i.challenge_ref,i.preparation_ref,i.receipt_ref)
+    OR preparation_ref IN (i.r1_ref,i.challenge_ref,i.preparation_ref,i.receipt_ref)
+    OR receipt_ref IN (i.r1_ref,i.challenge_ref,i.preparation_ref,i.receipt_ref)`;
+  return Object.freeze({
+    sql: `WITH r1_input(r1_ref,challenge_ref,preparation_ref,receipt_ref,command_json,original_json,original_digest,
+        terms_ref,terms_digest,source_registration_ref,source_registration_digest,source_incarnation,scope_json,
+        action_kind,organization_id,action_reference,c0_receipt_ref,c0_challenge_json,c0_scope_json,c0_record_json,c0_created_at)
+      AS (VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?))
+      INSERT INTO financial_retained_r1_originals(r1_ref,challenge_ref,preparation_ref,receipt_ref,command_json,original_json,original_digest,terms_ref,terms_digest,source_registration_ref,source_registration_digest,source_incarnation,scope_json)
+      SELECT i.r1_ref,i.challenge_ref,i.preparation_ref,i.receipt_ref,i.command_json,i.original_json,i.original_digest,
+        i.terms_ref,i.terms_digest,i.source_registration_ref,i.source_registration_digest,i.source_incarnation,i.scope_json
+      FROM r1_input i WHERE ${current}
+      AND NOT EXISTS(SELECT 1 FROM financial_retained_r1_originals WHERE ${collisions})
+      AND NOT EXISTS(SELECT 1 FROM financial_retained_r1_receipts WHERE ${collisions})
+      AND NOT EXISTS(SELECT 1 FROM financial_retained_r1_originals WHERE ${r1Business})
+      AND NOT EXISTS(SELECT 1 FROM financial_retained_r1_receipts WHERE ${r1Business})
+      AND NOT EXISTS(SELECT 1 FROM financial_preproof_challenges WHERE ${c0Business}
+        AND NOT(challenge_ref IS i.challenge_ref AND preparation_ref IS i.preparation_ref
+          AND challenge_json IS i.c0_challenge_json AND scope_json IS i.c0_scope_json
+          AND record_json IS i.c0_record_json AND created_at IS i.c0_created_at))
+      AND NOT EXISTS(SELECT 1 FROM financial_preproof_challenge_receipts WHERE ${c0Business}
+        AND NOT(receipt_ref IS i.c0_receipt_ref AND challenge_ref IS i.challenge_ref
+          AND preparation_ref IS i.preparation_ref AND record_json IS i.c0_record_json AND all_rows_match=1))`,
+    params: Object.freeze([
+      o.r1Ref,
+      o.challengeRef,
+      o.preparationRef,
+      p.command.r1ReceiptRef,
+      p.commandJson,
+      p.originalJson,
+      p.originalDigest,
+      o.selectedTerms.ref,
+      o.selectedTerms.digest,
+      s.registrationRef,
+      s.registrationDigest,
+      s.incarnation,
+      json(o.scopeRealm),
+      action.kind,
+      action.organizationId,
+      action.reference,
+      c0.receiptRef,
+      c0.challengeJson,
+      c0.scopeJson,
+      c0.recordJson,
+      c0.createdAt,
+      ...currentParams,
+    ]),
+  });
+}
+function compileMechanicalBatch(
+  c: Captured,
+  p: Parsed,
+  c0?: FinancialPreproofPreparedImage,
+): readonly SqlStatement[] {
+  const c0Match = c0
+    ? ` AND EXISTS(SELECT 1 FROM financial_preproof_challenges c
+        JOIN financial_preproof_challenge_receipts q ON q.challenge_ref=c.challenge_ref
+        WHERE c.challenge_ref=? AND c.preparation_ref=? AND c.challenge_json=? AND c.scope_json=?
+        AND c.record_json=? AND c.created_at=? AND q.receipt_ref=? AND q.challenge_ref=?
+        AND q.preparation_ref=? AND q.record_json=? AND q.all_rows_match=1)`
+    : "";
+  const c0Params: readonly SqlParam[] = c0
+    ? [
+        c0.challengeRef,
+        c0.preparationRef,
+        c0.challengeJson,
+        c0.scopeJson,
+        c0.recordJson,
+        c0.createdAt,
+        c0.receiptRef,
+        c0.challengeRef,
+        c0.preparationRef,
+        c0.recordJson,
+      ]
+    : [];
   const o = p.command.original,
     s = o.actionSource;
   const current = `${c.current} AND EXISTS (SELECT 1 FROM financial_action_source_registrations
@@ -873,35 +985,37 @@ export async function buildFinancialR1MechanicalBatch(
   ];
   const collisions = collisionParams(p.command);
   return Object.freeze([
-    Object.freeze({
-      sql: `INSERT INTO financial_retained_r1_originals(r1_ref,challenge_ref,preparation_ref,receipt_ref,command_json,original_json,original_digest,terms_ref,terms_digest,source_registration_ref,source_registration_digest,source_incarnation,scope_json)
+    c0
+      ? compileCoPreparationOriginal(p, c0, current, currentParams)
+      : Object.freeze({
+          sql: `INSERT INTO financial_retained_r1_originals(r1_ref,challenge_ref,preparation_ref,receipt_ref,command_json,original_json,original_digest,terms_ref,terms_digest,source_registration_ref,source_registration_digest,source_incarnation,scope_json)
         SELECT ?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ${current}
         AND NOT EXISTS(SELECT 1 FROM financial_retained_r1_originals WHERE ${COLLISION})
         AND NOT EXISTS(SELECT 1 FROM financial_retained_r1_receipts WHERE ${COLLISION})`,
-      params: Object.freeze([
-        o.r1Ref,
-        o.challengeRef,
-        o.preparationRef,
-        p.command.r1ReceiptRef,
-        p.commandJson,
-        p.originalJson,
-        p.originalDigest,
-        o.selectedTerms.ref,
-        o.selectedTerms.digest,
-        s.registrationRef,
-        s.registrationDigest,
-        s.incarnation,
-        json(o.scopeRealm),
-        ...currentParams,
-        ...collisions,
-        ...collisions,
-      ]),
-    }),
+          params: Object.freeze([
+            o.r1Ref,
+            o.challengeRef,
+            o.preparationRef,
+            p.command.r1ReceiptRef,
+            p.commandJson,
+            p.originalJson,
+            p.originalDigest,
+            o.selectedTerms.ref,
+            o.selectedTerms.digest,
+            s.registrationRef,
+            s.registrationDigest,
+            s.incarnation,
+            json(o.scopeRealm),
+            ...currentParams,
+            ...collisions,
+            ...collisions,
+          ]),
+        }),
     Object.freeze({
       sql: `INSERT INTO financial_retained_r1_receipts(receipt_ref,r1_ref,challenge_ref,preparation_ref,command_json,original_digest,all_rows_match)
         VALUES(?,?,?,?,?,?,CASE WHEN changes()=1 AND EXISTS(SELECT 1 FROM financial_retained_r1_originals
         WHERE r1_ref=? AND challenge_ref=? AND preparation_ref=? AND receipt_ref=? AND command_json=?
-          AND original_digest=?) AND (${current}) THEN 1 ELSE 0 END)`,
+          AND original_digest=?) AND (${current})${c0Match} THEN 1 ELSE 0 END)`,
       params: Object.freeze([
         p.command.r1ReceiptRef,
         o.r1Ref,
@@ -916,9 +1030,52 @@ export async function buildFinancialR1MechanicalBatch(
         p.commandJson,
         p.originalDigest,
         ...currentParams,
+        ...c0Params,
       ]),
     }),
   ]);
+}
+
+/** Fixed five-statement DATA contribution; no execution, issuer or NEW authority.
+ * observedAt is metadata only. The owning R.batch/permit/replay coordinator is not supplied. */
+export async function buildFinancialR1CoPreparationBatch(
+  options: FinancialEnrollmentComponentOptions & { readonly scope: FinancialPreproofScope },
+  command: FinancialR1WriteCommand,
+  observedAt: string,
+): Promise<readonly SqlStatement[]> {
+  const c = capture(options),
+    at = iso(observedAt);
+  try {
+    const p = await parseCaptured(command, c),
+      s = p.command.original.actionSource;
+    // Obtain both statements and their exact preimage from the actual C0 compiler.
+    // Neither a caller SQL array nor values reconstructed from SQL params are accepted.
+    const c0 = createFinancialPreproofChallengeStore(c.c0Options).buildPreparationContribution(
+      p.command.original.c0,
+      at,
+    );
+    const r1 = compileMechanicalBatch(c, p, c0.preparedImage);
+    return Object.freeze([
+      Object.freeze({
+        sql: `INSERT INTO financial_action_source_registrations(registration_ref,incarnation,registration_digest,digest_recipe,registration_json,created_at)
+          SELECT ?,?,?,?,?,? WHERE ${c.current}`,
+        params: Object.freeze([
+          s.registrationRef,
+          s.incarnation,
+          s.registrationDigest,
+          REG_RECIPE,
+          p.registrationJson,
+          at,
+          ...c.currentParams,
+        ]),
+      }),
+      ...c0.statements,
+      ...r1,
+    ]);
+  } catch (error) {
+    if (error instanceof FinancialRetainedR1Error) throw error;
+    return fail("unavailable", error);
+  }
 }
 
 /** Historical readers are usable without a future C0 row. Qualified prepare remains unavailable. */
@@ -1025,7 +1182,82 @@ export function createFinancialRetainedR1Store(
       return fail("unavailable", error);
     }
   }
-  /** No terms/source producer exists in the pinned Financial source; cannot accept a caller DTO. */
+  /** Historical DATA only. not-found never authorizes NEW or proves no effect after unknown ACK. */
+  async function readBusinessRetainedR1Data(
+    action: SharedFinancialAction,
+  ): Promise<FinancialR1JoinedRead> {
+    let expected: SharedFinancialActionIdentity;
+    try {
+      // The strict action parser detaches before its first digest await.
+      expected = await createSharedFinancialActionIdentity(snapshot(action));
+    } catch (error) {
+      return fail("invalid_request", error);
+    }
+    if (expected.action.organizationId !== c.scopeRealm.organizationId) fail("invalid_request");
+    try {
+      await ready(c);
+      await c0.checkPreparationHistorySchema();
+      const params: readonly SqlParam[] = [
+        expected.action.kind,
+        expected.action.organizationId,
+        expected.action.reference,
+      ];
+      const c0BusinessParams = [...params, ...params];
+      const [originals, receipts, c0Originals, c0Receipts] = await Promise.all([
+        c.sql.query(
+          `SELECT challenge_ref,command_json FROM financial_retained_r1_originals WHERE ${R1_BUSINESS}`,
+          params,
+        ),
+        c.sql.query(
+          `SELECT challenge_ref,command_json FROM financial_retained_r1_receipts WHERE ${R1_BUSINESS}`,
+          params,
+        ),
+        c.sql.query(
+          `SELECT challenge_ref FROM financial_preproof_challenges WHERE ${C0_BUSINESS}`,
+          c0BusinessParams,
+        ),
+        c.sql.query(
+          `SELECT challenge_ref FROM financial_preproof_challenge_receipts WHERE ${C0_BUSINESS}`,
+          c0BusinessParams,
+        ),
+      ]);
+      const families = [originals, receipts, c0Originals, c0Receipts];
+      if (families.every((rows) => rows.length === 0))
+        return Object.freeze({ status: "not-found" });
+      if (families.some((rows) => rows.length !== 1)) fail("unavailable");
+      const challengeRef = originals[0]?.challenge_ref,
+        raw = originals[0]?.command_json;
+      if (
+        typeof challengeRef !== "string" ||
+        typeof raw !== "string" ||
+        receipts[0]?.command_json !== raw ||
+        families.some((rows) => rows[0]?.challenge_ref !== challengeRef)
+      )
+        fail("unavailable");
+      // Validate the real stored full command, never a dummy/current selection.
+      let parsed: Parsed;
+      try {
+        parsed = await parseCaptured(JSON.parse(raw) as FinancialR1WriteCommand, c);
+      } catch (error) {
+        return fail("unavailable", error);
+      }
+      if (parsed.commandJson !== raw) fail("unavailable");
+      const retained = await readJoinedRetainedR1Data(challengeRef);
+      if (retained.status !== "found" || !same(retained.original, parsed.command.original))
+        fail("unavailable");
+      if (
+        !same(expected.action, retained.actionIdentity.action) ||
+        expected.requestFingerprint !== retained.actionIdentity.requestFingerprint
+      )
+        fail("conflict");
+      return retained;
+    } catch (error) {
+      if (error instanceof FinancialRetainedR1Error) throw error;
+      return fail("unavailable", error);
+    }
+  }
+  /** Displayed-terms/canonical DATA producers exist, but the registered genuine issuer and
+   * current admission are unwired; caller DTOs cannot qualify prepare. */
   async function prepare(_command: FinancialR1WriteCommand): Promise<never> {
     return fail("unavailable");
   }
@@ -1038,6 +1270,7 @@ export function createFinancialRetainedR1Store(
     prepare,
     readRetainedR1Original,
     readJoinedRetainedR1Data,
+    readBusinessRetainedR1Data,
     readRetainedActionConsentR1,
   });
 }
