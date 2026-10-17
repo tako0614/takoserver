@@ -167,10 +167,16 @@ function topbar(): Child {
           class: "btn btn--ghost btn--sm",
           type: "button",
           title: tr("英語に切り替える", "Switch to Japanese"),
-          "aria-label": tr("英語に切り替える", "Switch to Japanese"),
           onClick: () => setConsoleLocale(consoleLocale() === "ja" ? "en" : "ja"),
         },
-        consoleLocale() === "ja" ? "EN" : "日本語",
+        // Named by what it shows, so voice control and screen readers say what
+        // sighted people read; only that text is in the other language, and the
+        // title, in the page's language, explains it.
+        h(
+          "span",
+          { lang: consoleLocale() === "ja" ? "en" : "ja" },
+          consoleLocale() === "ja" ? "EN" : "日本語",
+        ),
       ),
     ),
     live(() =>
