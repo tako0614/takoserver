@@ -1,3 +1,4 @@
+import * as financialRequestOrigin from "@takoserver/core/financial-request-origin";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import sharedPricing from "../config/shared-hosted-pricing.json";
 import { moneyFenceInstallSql } from "../scripts/deploy/schema-money-unit-cutover.ts";
@@ -545,4 +546,245 @@ describe("Worker request Financial input carrier", () => {
     expect(capturedFirst.realm).toBe(first.runtime.realm);
     expect(capturedSecond.realm).toBe(second.runtime.realm);
   });
+});
+
+describe("official read-only Financial request origin", () => {
+  test("shares the original module and graph without exporting request constructors", async () => {
+    const f = await fixture();
+    const { inputs, runtime } = await f.consumers();
+    const before = f.sessions.map((session) => session.queries.length);
+    expect(Object.keys(financialRequestOrigin)).toEqual(["readWorkerRequestFinancialInputs"]);
+    expect(financialRequestOrigin.readWorkerRequestFinancialInputs).toBe(
+      readWorkerRequestFinancialInputs,
+    );
+    const original = readWorkerRequestFinancialInputs(inputs.connection);
+    const exposed = financialRequestOrigin.readWorkerRequestFinancialInputs(inputs.connection);
+    expect(exposed).toBe(original);
+    expect(exposed.sql).toBe(runtime.sql);
+    expect(exposed.client).toBe(runtime.client);
+    expect(exposed.realm).toBe(runtime.realm);
+    expect(exposed.clock).toBe(inputs.clock);
+    expect(exposed.writerEpoch).toBe(WRITER);
+    expect(Object.isFrozen(exposed)).toBe(true);
+    expect(() =>
+      financialRequestOrigin.readWorkerRequestFinancialInputs({ ...inputs.connection }),
+    ).toThrow();
+    expect(f.sessions.map((session) => session.queries.length)).toEqual(before);
+  });
+});
+
+describe("post-graph shared-auth request observation", () => {
+  test("awaits the original captured observer before HTTP and scheduled effects", async () => {
+    const f = await fixture();
+    const processor = processorReads();
+    let release: () => void = () => {
+      throw new Error("observer barrier was not initialized");
+    };
+    let entered: () => void = () => {
+      throw new Error("observer signal was not initialized");
+    };
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const observed = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const requests: ReturnType<typeof readWorkerRequestFinancialInputs>[] = [];
+    let replacementCalls = 0;
+    const options = {
+      sharedAuthStaging: f.profile,
+      async observeSharedAuthRequest(connection: WorkerRequestSql) {
+        const inputs = financialRequestOrigin.readWorkerRequestFinancialInputs(connection);
+        expect(inputs.sql).toBe(connection.sql);
+        expect(inputs.writerEpoch).toBe(WRITER);
+        expect(Object.isFrozen(connection)).toBe(true);
+        requests.push(inputs);
+        if (requests.length === 1) {
+          entered();
+          await barrier;
+        }
+      },
+    };
+    const entry = createWorkerEntry(options);
+    options.observeSharedAuthRequest = async () => {
+      replacementCalls += 1;
+    };
+    let settled = false;
+    const first = entry
+      .fetch(
+        new Request(`${SHARED_AUTH_STAGING_PROFILE.publicOrigin}/auth/oidc/login`),
+        f.env,
+      )
+      .then((response) => {
+        settled = true;
+        return response;
+      });
+    try {
+      await Promise.race([
+        observed,
+        first.then(() => {
+          throw new Error("HTTP settled before the post-graph observer");
+        }),
+      ]);
+      expect(settled).toBe(false);
+      expect(await f.sql.query("SELECT COUNT(*) AS n FROM shared_auth_attempts")).toEqual([
+        { n: 0 },
+      ]);
+      release();
+      expect((await first).status).toBe(303);
+      expect(
+        (
+          await entry.fetch(
+            new Request(`${SHARED_AUTH_STAGING_PROFILE.publicOrigin}/auth/oidc/login`),
+            f.env,
+          )
+        ).status,
+      ).toBe(303);
+      await entry.scheduled({}, f.env);
+      expect(requests).toHaveLength(3);
+      expect(f.sessions).toHaveLength(3);
+      expect(requests[0]?.sql).not.toBe(requests[1]?.sql);
+      expect(requests[1]?.sql).not.toBe(requests[2]?.sql);
+      expect(requests[0]?.clock).not.toBe(requests[1]?.clock);
+      expect(requests[1]?.clock).not.toBe(requests[2]?.clock);
+      expect(replacementCalls).toBe(0);
+      expect(f.sessions.every((session) => session.constraint === "first-primary")).toBe(true);
+    } finally {
+      release();
+      processor.restore();
+    }
+  });
+
+  test("observer rejection redacts HTTP startup and rejects scheduled before route effects", async () => {
+    const f = await fixture();
+    const processor = processorReads();
+    const secret = "PRIVATE-POST-GRAPH-OBSERVER-FAILURE";
+    const originalFailure = new Error(secret);
+    let calls = 0;
+    const entry = createWorkerEntry({
+      sharedAuthStaging: f.profile,
+      async observeSharedAuthRequest(connection) {
+        financialRequestOrigin.readWorkerRequestFinancialInputs(connection);
+        calls += 1;
+        throw originalFailure;
+      },
+    });
+    try {
+      const response = await entry.fetch(
+        new Request(`${SHARED_AUTH_STAGING_PROFILE.publicOrigin}/auth/oidc/login`),
+        f.env,
+      );
+      expect(response.status).toBe(503);
+      expect(await response.text()).not.toContain(secret);
+      const scheduledFailure: unknown = await entry.scheduled({}, f.env).then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      expect(scheduledFailure).toBeInstanceOf(Error);
+      if (!(scheduledFailure instanceof Error)) throw new Error("scheduled failure is absent");
+      expect(scheduledFailure.message).toBe("operator shared-login request observation failed");
+      const cause = scheduledFailure.cause;
+      expect(cause).toBeInstanceOf(TypeError);
+      if (!(cause instanceof TypeError)) throw new Error("observer failure cause is absent");
+      expect(cause.cause).toBe(originalFailure);
+      expect(calls).toBe(2);
+      expect(f.sessions).toHaveLength(2);
+      expect(await f.sql.query("SELECT COUNT(*) AS n FROM shared_auth_attempts")).toEqual([
+        { n: 0 },
+      ]);
+    } finally {
+      processor.restore();
+    }
+  });
+
+  test("an observer alone cannot select an origin or replace the ordinary cached App", async () => {
+    const f = await fixture();
+    const processor = processorReads();
+    let calls = 0;
+    try {
+      const open = f.binding.withSession;
+      if (!open) throw new Error("fixture primary method is missing");
+      const primary = Reflect.apply(open, f.binding, ["first-primary"]);
+      const env = { ...f.env, STATE_DB: primary };
+      const entry = createWorkerEntry({
+        observeSharedAuthRequest() {
+          calls += 1;
+        },
+      });
+      for (let index = 0; index < 2; index += 1) {
+        const response = await entry.fetch(
+          new Request(`${SHARED_AUTH_STAGING_PROFILE.publicOrigin}/auth/oidc/login`),
+          env,
+        );
+        expect(response.status).toBe(503);
+      }
+      await expect(entry.scheduled({}, env)).rejects.toThrow(
+        "shared-login request observer requires its constructed original request",
+      );
+      expect(calls).toBe(0);
+      expect(f.sessions).toHaveLength(1);
+      expect(processor.paths.filter((path) => path === "/v1/account")).toHaveLength(1);
+      expect(await f.sql.query("SELECT COUNT(*) AS n FROM shared_auth_attempts")).toEqual([
+        { n: 0 },
+      ]);
+    } finally {
+      processor.restore();
+    }
+  });
+});
+
+test("post-observer validation rejects actual Sql method substitution after await", async () => {
+  const f = await fixture();
+  const processor = processorReads();
+  const restore: (() => void)[] = [];
+  let substitutions = 0;
+  let replacementCalls = 0;
+  const entry = createWorkerEntry({
+    sharedAuthStaging: f.profile,
+    async observeSharedAuthRequest(connection) {
+      const inputs = financialRequestOrigin.readWorkerRequestFinancialInputs(connection);
+      const descriptor = Object.getOwnPropertyDescriptor(inputs.sql, "query");
+      if (!descriptor || !("value" in descriptor) || descriptor.configurable !== true)
+        throw new Error("actual request Sql query is not the expected mutable data method");
+      await Promise.resolve();
+      Object.defineProperty(inputs.sql, "query", {
+        ...descriptor,
+        value() {
+          replacementCalls += 1;
+          throw new Error("substituted request method must never run");
+        },
+      });
+      restore.push(() => Object.defineProperty(inputs.sql, "query", descriptor));
+      substitutions += 1;
+    },
+  });
+  try {
+    const response = await entry.fetch(
+      new Request(`${SHARED_AUTH_STAGING_PROFILE.publicOrigin}/auth/oidc/login`),
+      f.env,
+    );
+    expect(response.status).toBe(503);
+    expect(await response.text()).toContain("operator shared-login request observation failed");
+    expect(substitutions).toBe(1);
+    const failure: unknown = await entry.scheduled({}, f.env).then(
+      () => undefined,
+      (error: unknown) => error,
+    );
+    expect(failure).toBeInstanceOf(Error);
+    if (!(failure instanceof Error)) throw new Error("post-observer scheduled failure is absent");
+    const stageCause = failure.cause;
+    expect(stageCause).toBeInstanceOf(TypeError);
+    if (!(stageCause instanceof TypeError)) throw new Error("post-observer cause is absent");
+    expect(stageCause.cause).toMatchObject({
+      code: "invalid",
+      message: "money cutover Sql origin differs",
+    });
+    expect(substitutions).toBe(2);
+    expect(replacementCalls).toBe(0);
+    expect(f.sessions).toHaveLength(2);
+    expect(await f.sql.query("SELECT COUNT(*) AS n FROM shared_auth_attempts")).toEqual([{ n: 0 }]);
+  } finally {
+    for (const original of restore) original();
+    processor.restore();
+  }
 });

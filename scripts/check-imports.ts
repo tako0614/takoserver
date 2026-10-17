@@ -599,7 +599,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "package-surface",
     match:
-      /^src\/(?:index|provider-extension|workflow-runtime|workflow-runtime-transport|workflow-runtime-workerd)\.ts$|^src\/takoform\/integration-actor-(?:host|form-authority)\.ts$/u,
+      /^src\/(?:index|provider-extension|financial-request-origin|workflow-runtime|workflow-runtime-transport|workflow-runtime-workerd)\.ts$|^src\/takoform\/integration-actor-(?:host|form-authority)\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "app", "package-surface"],
   },
   {

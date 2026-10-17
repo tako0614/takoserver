@@ -73,6 +73,7 @@ import {
   captureWorkerSharedAuthStaging,
   createWorkerPrimaryRequestSql,
   createWorkerRequestSql,
+  readWorkerRequestFinancialInputs,
   type WorkerRequestAppInputs,
   type WorkerRequestDatabase,
   type WorkerRequestSql,
@@ -476,6 +477,8 @@ function hasSelectedV2PrivateInputHooks(
 export interface WorkerEntryOptions {
   /** Code-only isolated shared-login composition; every invocation gets one fresh primary. */
   readonly sharedAuthStaging?: WorkerSharedAuthStaging;
+  /** Code-only post-graph data observer; no source qualification or dispatch authority. */
+  readonly observeSharedAuthRequest?: (connection: WorkerRequestSql) => void | Promise<void>;
   /** Operator code only; no request or environment field selects the composer. */
   readonly composeV2Forms?: WorkerEntryV2FormComposer;
   /** Operator code only; omission or an undefined result leaves origin acceptance unselected. */
@@ -1488,6 +1491,7 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
   const composeV2FreshAdmission = options.composeV2FreshAdmission;
   const composeV2WorkerEndpointOrigin = options.composeV2WorkerEndpointOrigin;
   const composeV2ContainerHostAcceptance = options.composeV2ContainerHostAcceptance;
+  const observeSharedAuthRequest = options.observeSharedAuthRequest;
   const sharedAuthStaging =
     options.sharedAuthStaging === undefined
       ? undefined
@@ -1533,6 +1537,30 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
     });
     starts.set(env, started);
     return started;
+  };
+  const observeRequest = async (connection: WorkerRequestSql | undefined): Promise<void> => {
+    if (observeSharedAuthRequest === undefined) return;
+    if (
+      typeof observeSharedAuthRequest !== "function" ||
+      sharedAuthStaging === undefined ||
+      connection === undefined
+    )
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError("shared-login request observer requires its constructed original request"),
+      );
+    try {
+      // This validates the actual purpose and completed graph before any observer.
+      const inputs = readWorkerRequestFinancialInputs(connection);
+      await observeSharedAuthRequest(connection);
+      if (readWorkerRequestFinancialInputs(connection) !== inputs)
+        throw new TypeError("shared-login request input origin changed during observation");
+    } catch (error) {
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError("operator shared-login request observation failed", { cause: error }),
+      );
+    }
   };
   return {
     /**
@@ -1589,6 +1617,7 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
           selectedOrigin ?? startupStage("public-origin", () => requirePublicOrigin(env)),
           connection,
         );
+        if (observeSharedAuthRequest !== undefined) await observeRequest(connection);
       } catch (error) {
         return workerStartupFailureResponse(error);
       }
@@ -1649,6 +1678,7 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
           return;
       }
       const app = await appFor(env, selectedOrigin ?? requirePublicOrigin(env), connection);
+      if (observeSharedAuthRequest !== undefined) await observeRequest(connection);
       const results = await Promise.allSettled([
         Promise.resolve().then(() => app.tick()),
         Promise.resolve().then(() => drainV2Operations(() => app.tickTakoformV2())),
