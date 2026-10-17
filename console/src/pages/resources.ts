@@ -282,14 +282,29 @@ export function resourcesPage(organizationId: string): Child {
           h(
             "div",
             { class: "card__body", style: { display: "grid", gap: "12px" } },
-            h(
-              "div",
-              { class: "notice notice--warn" },
-              tr(
-                "この一覧と対象リソースを読み直してください。表示がないことだけでは未受理を証明できません。ページ再読み込み後に正確な再送情報がない場合や再送期限後は運用者に確認してください。新しいキーで同じ操作を送らないでください。",
-                "Read this inventory and the affected Resource. Absence here does not prove rejection. After a full reload without the exact request, or after the replay deadline, ask the operator to reconcile; do not submit the same intent under a new key.",
-              ),
-            ),
+            // Whether the exact request can still be sent again decides the advice:
+            // resend it under its key, or read before sending anything new.
+            outstanding.some((intent) => canReplayResourceIntent(intent))
+              ? h(
+                  "div",
+                  { class: "notice notice--warn" },
+                  tr(
+                    "Hostがこの要求を受け付けたかどうか、コンソールでは分かりませんでした。「同じ要求を再送」を使ってください。同じキーで同じ要求を送るので、Hostはすでに受け付けていれば同じOperationを返し、まだなら今受け付けます。どちらでも変更は一度だけです。同じ変更を新しいキーで送り直さないでください。",
+                    "The Console could not tell whether the Host accepted this request. Use “Retry exact request”: it sends the same request under the same key. If the Host already accepted it, it returns that same Operation; if not, it accepts it now. Either way only one change is made. Never send the same change again under a new key.",
+                  ),
+                )
+              : null,
+            outstanding.length === 0 ||
+              outstanding.some((intent) => !canReplayResourceIntent(intent))
+              ? h(
+                  "div",
+                  { class: "notice notice--warn" },
+                  tr(
+                    "Hostが要求を受け付けたかどうか分からず、ページの再読み込みか再送期限のために、同じ要求はもう再送できません。新しく送る前に、リソース一覧と対象のリソースを確認してください（リソースが多い場合は「さらに読み込む」で続きを読み込み、絞り込みで探します）。作成が受け付けられていれば、そのリソースはすぐ一覧に出ます。少し待っても出ないなら受け付けられておらず、作り直せます。同じ名前の作成は、最初の作成が届いていれば拒否されます。更新と削除は読み取った世代を指定します。最初のものが反映済みなら、リソースにはすでにその変更が表示されており、古い読み取りに基づく再送は拒否されます。それでも分からず、Hostを運用しているのが別の人なら、その人に確認してください。",
+                    "The Console could not tell whether the Host accepted a request, and it can no longer resend it exactly: the page was reloaded, or the replay window has passed. Check the Resources list and the Resource before sending anything new (with many Resources, use Load more, then the filter). An accepted create is listed at once, so a create still missing after a moment was not accepted and can be made again; a create of the same name is refused if the first one did land. An update or a delete names the generation it read: if the first one applied, the Resource already shows the change, and a resend based on the old read is refused. If that does not settle it and someone else runs this Host, ask them.",
+                  ),
+                )
+              : null,
             ...outstanding.map((intent) =>
               h(
                 "div",

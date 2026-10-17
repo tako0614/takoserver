@@ -63,8 +63,8 @@ function recoveryDetails(
       "small",
       null,
       tr(
-        "送信前に正確なキーと本文を確認・コピーできます。ページ再読み込み後はコンソールから再送できません。結果が不明なら読み取りで確認してください。",
-        "Review or copy the exact key and body before sending. After a full reload the Console cannot replay; reconcile by reading if acceptance is unknown.",
+        "送信前に、正確なキーと本文を確認・コピーできます。コンソールはページを再読み込みするまでこれを保持し、応答が失われたときは同じ要求を再送できます。再読み込みした後は、送り直さずにリソース一覧で結果を確認してください。",
+        "You can review or copy the exact key and body before sending. The Console keeps them until the page reloads, so it can resend this exact request if the answer is lost; after a reload, check the Resources list for the result instead of sending again.",
       ),
     ),
     h("div", { class: "mono" }, `${method} ${path}`),
