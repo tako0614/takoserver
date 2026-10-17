@@ -208,7 +208,9 @@ test("confirmed ready:false is NotReady and visible in overview attention", asyn
   body.append(overviewPage(organization) as unknown as NodeStub);
   await settle();
   expect(body.textContent).toContain("Needs attention");
-  expect(body.textContent).toContain("NotReady");
+  // English reads the words, not the identifier.
+  expect(body.textContent).toContain("Not ready");
+  expect(body.textContent).not.toContain("NotReady");
   expect(body.textContent).toContain("latest observation reports not ready");
   expect(body.textContent).not.toContain("Unknown");
 });
