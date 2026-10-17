@@ -742,7 +742,7 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
           { id: "create-resource-name-rule" },
           tr(
             "英数字と「.」「_」「-」で128文字まで。先頭は英数字です。この組織の中で、Formを問わず重複できません。",
-            "Up to 128 letters, digits, '.', '_' or '-', starting with a letter or digit. Unique in this organization, whatever the Form.",
+            "Up to 128 ASCII letters, digits, '.', '_' or '-', starting with a letter or digit. Unique in this organization, whatever the Form.",
           ),
         ),
       ),
@@ -786,7 +786,7 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
           refusal.say(
             tr(
               "名前は、英数字と「.」「_」「-」で128文字までにし、先頭を英数字にしてください。",
-              "Use up to 128 letters, digits, '.', '_' or '-' for the name, starting with a letter or digit.",
+              "Use up to 128 ASCII letters, digits, '.', '_' or '-' for the name, starting with a letter or digit.",
             ),
           );
           return;

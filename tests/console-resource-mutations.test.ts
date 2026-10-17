@@ -256,7 +256,7 @@ test("a name the Host would refuse is said before anything is sent", async () =>
   await settle();
   // The rule is shown with the field, before anyone types.
   expect(body.textContent).toContain(
-    "Up to 128 letters, digits, '.', '_' or '-', starting with a letter or digit.",
+    "Up to 128 ASCII letters, digits, '.', '_' or '-', starting with a letter or digit.",
   );
   const inputs = body.all().filter((node) => node.tag === "input");
   if (!inputs[0] || !inputs[1]) throw new Error("create inputs missing");
@@ -269,7 +269,7 @@ test("a name the Host would refuse is said before anything is sent", async () =>
     await settle();
     const alert = body.all().find((node) => node.attributes.get("role") === "alert");
     expect(alert?.textContent).toBe(
-      "Use up to 128 letters, digits, '.', '_' or '-' for the name, starting with a letter or digit.",
+      "Use up to 128 ASCII letters, digits, '.', '_' or '-' for the name, starting with a letter or digit.",
     );
     expect(inputs[1].disabled).toBe(false);
   }
@@ -2070,6 +2070,45 @@ test("expired Host replay window refuses a second native mutation send", async (
   });
   expect(writes).toHaveLength(1);
   discardResourceIntent(intent.id);
+});
+
+test("only a definite refusal of a request never in doubt is dropped for a new key", async () => {
+  await setup();
+  const { ApiError } = await import("../console/src/api.ts");
+  const {
+    prepareResourceIntent,
+    sendResourceIntent,
+    discardRefusedResourceIntent,
+    discardResourceIntent,
+  } = await import("../console/src/resource-intent.ts");
+  const change = { action: "delete", uid: one.uid, generation: 1 } as const;
+  const refusal = (code: string, status: number) =>
+    new ApiError(code, status, "/apis/forms.takoform.com/v2/resources/uid-one");
+  // A send whose acceptance is unknown stays, whatever a later answer says.
+  const uncertain = prepareResourceIntent("org-console", change, 60);
+  globalThis.fetch = Object.assign(
+    async () => {
+      throw new Error("ACK lost");
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  await expect(sendResourceIntent(uncertain.id)).rejects.toMatchObject({ code: "unreachable" });
+  expect(discardRefusedResourceIntent(uncertain.id, refusal("resource_busy", 409))).toBe(false);
+  // Neither the console's own errors, an unknown acceptance, nor a key that
+  // holds another request is a refusal that stored nothing.
+  const fresh = prepareResourceIntent("org-console", change, 60);
+  for (const [code, status] of [
+    ["principal_changed", 0],
+    ["request_timeout", 408],
+    ["temporarily_unavailable", 503],
+    ["idempotency_conflict", 409],
+  ] as const)
+    expect(discardRefusedResourceIntent(fresh.id, refusal(code, status))).toBe(false);
+  expect(discardRefusedResourceIntent(fresh.id, new Error("name_conflict"))).toBe(false);
+  expect(discardRefusedResourceIntent(fresh.id, refusal("name_conflict", 409))).toBe(true);
+  // Dropped, so it can never be sent again; the next request has its own key.
+  await expect(sendResourceIntent(fresh.id)).rejects.toMatchObject({ code: "intent_missing" });
+  discardResourceIntent(uncertain.id);
 });
 
 test("a different signed-in principal cannot inherit an in-memory replay handle", async () => {

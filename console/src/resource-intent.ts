@@ -144,6 +144,8 @@ export function discardRefusedResourceIntent(id: string, error: unknown): boolea
   if (!intent || intent.uncertain || intent.operationId !== null || intent.inFlight) return false;
   if (!(error instanceof ApiError) || isUnknownAcceptance(error)) return false;
   if (error.status < 400 || error.status >= 500) return false;
+  // That key already holds another request, so this refusal is not "nothing stored".
+  if (error.code === "idempotency_conflict") return false;
   intents.delete(id);
   return true;
 }
