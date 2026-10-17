@@ -201,6 +201,7 @@ function body(
                       "このFormのリソースは変更できません。同じ設定をもう一度送ると、失敗した作成などを再試行できます。",
                       "A Resource of this Form cannot change. Sending the same spec again retries it, for example after its create failed.",
                     ),
+                    title: tr(`${found.name}を再適用`, `Re-apply ${found.name}`),
                     confirmLabel: tr("再適用する", "Re-apply"),
                   }),
           },

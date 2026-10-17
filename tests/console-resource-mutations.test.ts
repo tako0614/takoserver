@@ -908,7 +908,7 @@ test("a WorkerVersion's page serves it by updating the Worker's Deployment", asy
   expect(body.textContent).toContain(
     "This updates hello-deployment to serve only hello-v2, at weight 10000. Check it, then choose Update.",
   );
-  // Nothing is sent until the person accepts the update.
+  // Nothing is sent until the person chooses Update.
   expect(writes).toHaveLength(0);
   button(body, "Update").click();
   await settle();
@@ -1301,7 +1301,8 @@ test("a version can be sent again with its same spec, to retry it", async () => 
   expect(body.textContent).toContain(
     "A Resource of this Form cannot change. Sending the same spec again retries it, for example after its create failed.",
   );
-  // The dialog's own confirm says what it does: no change, a re-apply.
+  // The dialog says what it does: no change, a re-apply.
+  expect(body.textContent).toContain("Re-apply hello-v2");
   expect(body.all().some((node) => node.tag === "button" && node.textContent === "Update")).toBe(
     false,
   );

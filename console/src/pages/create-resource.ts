@@ -804,7 +804,8 @@ export function updateResource(
   proposal?: {
     readonly spec: Record<string, unknown>;
     readonly note: string;
-    /** The confirm's own words, where the update is not a change. */
+    /** The dialog's and the confirm's own words, where the update is not a change. */
+    readonly title?: string;
     readonly confirmLabel?: string;
   },
 ): void {
@@ -836,7 +837,7 @@ export function updateResource(
   let intent: ResourceIntent | null = null;
   const refusal = refusalNotice();
   const close = openModal({
-    title: tr(`${resource.name}を更新`, `Update ${resource.name}`),
+    title: proposal?.title ?? tr(`${resource.name}を更新`, `Update ${resource.name}`),
     confirmLabel: proposal?.confirmLabel ?? tr("更新する", "Update"),
     body: h(
       "div",
