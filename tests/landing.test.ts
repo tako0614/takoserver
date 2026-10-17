@@ -148,7 +148,7 @@ describe("Takoserver public site", () => {
     );
     expect(after).toContain('"weight": 10000');
     expect(after).not.toContain("$HOST");
-    expect(after).toContain("docs/self-host-operations.md#9-verify");
+    expect(after).toContain("docs/self-host-operations.md#10-ship-a-new-version");
     for (const path of ["/openapi.json", "/.well-known/takoform/v2", "/.well-known/takoserver"]) {
       expect(html).toContain(`href="https://api.takoserver.example${path}"`);
     }
