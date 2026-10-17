@@ -1,4 +1,8 @@
-import { createCredentialAuthorityClassStore } from "./credential-authority-class.ts";
+import {
+  createCredentialAuthorityClassStore,
+  directCredentialCurrentness,
+  type TokenAuthorityRecord,
+} from "./credential-authority-class.ts";
 import {
   assertIdentityVerificationCaptureReader,
   type IdentityVerificationCaptureReader,
@@ -6,7 +10,10 @@ import {
 } from "./identity-setup.ts";
 import { bytesDigest } from "./json.ts";
 import { type Clock, type Row, type Sql, SqlError, type SqlStatement } from "./ports.ts";
-import type { PrincipalAnchor } from "./shared-principal-authority.ts";
+import {
+  createSharedPrincipalAuthorityStore,
+  type PrincipalAnchor,
+} from "./shared-principal-authority.ts";
 
 /**
  * Who is calling, and what they are allowed to ask for.
@@ -192,12 +199,30 @@ export interface AuthTokenCaptureReader {
   inspectAuthenticatedTokenCapture(capture: unknown): CapturedAuthTokenRow | null;
 }
 
+/** Retained direct DATA from this backend, never a qualified Financial consumer port. */
+export interface RetainedDirectOwnerSessionData {
+  readonly backend: "auth-token";
+  readonly record: TokenAuthorityRecord;
+  readonly capturedExpiresAt: string;
+}
+
+export interface RetainedDirectOwnerSessionReader extends AuthTokenCaptureReader {
+  /** Performs actual authentication and retained103 observation. Missing originals fail closed. */
+  captureRetainedDirectOwnerSession(
+    authorization: string | null,
+  ): Promise<AuthenticatedTokenCapture | null>;
+  /** A detached observation, not permission or a replacement for final same-primary CAS. */
+  readRetainedDirectOwnerSessionCapture(capture: unknown): RetainedDirectOwnerSessionData | null;
+}
+
 const authTokenCaptureReaderOrigins = new WeakMap<
   object,
   {
     readonly sql: Sql;
     readonly capture: AuthTokenCaptureReader["captureAuthenticatedToken"];
     readonly inspect: AuthTokenCaptureReader["inspectAuthenticatedTokenCapture"];
+    readonly captureRetained: RetainedDirectOwnerSessionReader["captureRetainedDirectOwnerSession"];
+    readonly readRetained: RetainedDirectOwnerSessionReader["readRetainedDirectOwnerSessionCapture"];
   }
 >();
 
@@ -233,6 +258,27 @@ export function assertAuthTokenCaptureReader(
   ) {
     throw new AuthError("invalid");
   }
+}
+
+/** Actual Accounts origin and original own methods only; no schema/target/realm qualification. */
+export function assertRetainedDirectOwnerSessionReader(
+  reader: unknown,
+  context: { readonly sql: Sql },
+): asserts reader is RetainedDirectOwnerSessionReader {
+  assertAuthTokenCaptureReader(reader, context);
+  const origin = authTokenCaptureReaderOrigins.get(reader);
+  const capture = Object.getOwnPropertyDescriptor(reader, "captureRetainedDirectOwnerSession");
+  const inspect = Object.getOwnPropertyDescriptor(reader, "readRetainedDirectOwnerSessionCapture");
+  if (
+    !origin ||
+    !capture ||
+    !("value" in capture) ||
+    capture.value !== origin.captureRetained ||
+    !inspect ||
+    !("value" in inspect) ||
+    inspect.value !== origin.readRetained
+  )
+    throw new AuthError("invalid");
 }
 
 export interface ExternalIdentityVerifier {
@@ -857,7 +903,9 @@ type OriginalIdentityCapture = {
 };
 
 /** Ordinary mounted Accounts keeps its historical schema and issuance path. */
-export function createAccounts(options: CreateAccountsOptions): Accounts & AuthTokenCaptureReader {
+export function createAccounts(
+  options: CreateAccountsOptions,
+): Accounts & RetainedDirectOwnerSessionReader {
   return createAccountsInternal(options, null);
 }
 
@@ -870,7 +918,7 @@ export function createAccountsWithUnregisteredLocalIssuer(
   options: CreateAccountsOptions & {
     readonly identity: ExternalIdentityVerifier & IdentityVerificationCaptureReader;
   },
-): Accounts & AuthTokenCaptureReader {
+): Accounts & RetainedDirectOwnerSessionReader {
   // Read the selected verifier once through an own data descriptor. Reading
   // options.identity repeatedly lets an accessor return a genuine verifier
   // for the origin check and fake callbacks for the later captured methods.
@@ -918,7 +966,7 @@ export function createAccountsWithUnregisteredLocalIssuer(
 function createAccountsInternal(
   options: CreateAccountsOptions,
   localIssuer: OriginalIdentityCapture | null,
-): Accounts & AuthTokenCaptureReader {
+): Accounts & RetainedDirectOwnerSessionReader {
   const { sql, identity } = options;
   const clock = options.clock ?? (() => new Date());
   const randomSecret = options.randomSecret ?? defaultSecret;
@@ -928,6 +976,7 @@ function createAccountsInternal(
     createApiKeyAdministration({ sql, clock, randomSecret, randomId });
   const stamp = (): string => clock().toISOString();
   const tokenCaptures = new WeakMap<object, CapturedAuthTokenRow>();
+  const retainedSessionCaptures = new WeakMap<object, RetainedDirectOwnerSessionData>();
 
   const readCurrentToken = async (
     authorization: string | null,
@@ -1044,7 +1093,7 @@ function createAccountsInternal(
     };
   };
 
-  const accounts: Accounts & AuthTokenCaptureReader = {
+  const accounts: Accounts & RetainedDirectOwnerSessionReader = {
     async signIn({ provider, assertion, method, nonce, audience, sessionTtlSeconds }) {
       if (provider !== "takos-id" && provider !== "google" && provider !== "github") {
         throw new AuthError("invalid");
@@ -1546,6 +1595,61 @@ function createAccountsInternal(
       return tokenCaptures.get(capture) ?? null;
     },
 
+    async captureRetainedDirectOwnerSession(authorization) {
+      assertRetainedDirectOwnerSessionReader(accounts, { sql });
+      const observed = await readCurrentToken(authorization);
+      if (!observed) return null;
+      const captured = capturedTokenRow(observed.row, observed.digest, clock().getTime());
+      if (!captured || captured.kind !== "session" || captured.organizationId !== null)
+        return null;
+      const record = await createCredentialAuthorityClassStore({
+        sql,
+      }).readActiveDirectOwnerSessionByToken({ id: captured.tokenId, digest: captured.digest });
+      if (
+        !record ||
+        record.origin.targetRef !== UNREGISTERED_LOCAL_AUTH_TARGET ||
+        record.origin.principalId !== captured.principalId ||
+        record.token.createdAt !== captured.createdAt ||
+        record.token.scopesJson !== captured.scopesJson
+      )
+        return null;
+      const anchor = await createSharedPrincipalAuthorityStore({ sql }).readAnchor(
+        captured.principalId,
+      );
+      if (!anchor || anchor.originKind !== "fresh-local" || anchor.state !== "active")
+        return null;
+      const predicate = directCredentialCurrentness(
+        record,
+        anchor,
+        anchor.verificationDomain,
+        captured.expiresAt,
+      );
+      const current = await sql.query(
+        `SELECT CASE WHEN ${predicate.sql} THEN 1 ELSE 0 END AS valid`,
+        predicate.params,
+      );
+      assertRetainedDirectOwnerSessionReader(accounts, { sql });
+      if (
+        current.length !== 1 ||
+        current[0]?.valid !== 1 ||
+        Date.parse(captured.expiresAt) <= clock().getTime()
+      )
+        return null;
+      const capture: AuthenticatedTokenCapture = { [authTokenCaptureBrand]: true };
+      Object.freeze(capture);
+      tokenCaptures.set(capture, captured);
+      retainedSessionCaptures.set(
+        capture,
+        Object.freeze({ backend: "auth-token", record, capturedExpiresAt: captured.expiresAt }),
+      );
+      return capture;
+    },
+
+    readRetainedDirectOwnerSessionCapture(capture) {
+      if (typeof capture !== "object" || capture === null) return null;
+      return retainedSessionCaptures.get(capture) ?? null;
+    },
+
     async authorize(authorization, scope) {
       const actor = await accounts.authenticate(authorization);
       if (!actor?.organizationId || !grants(actor.scopes, scope)) return null;
@@ -1575,6 +1679,8 @@ function createAccountsInternal(
       sql,
       capture: accounts.captureAuthenticatedToken,
       inspect: accounts.inspectAuthenticatedTokenCapture,
+      captureRetained: accounts.captureRetainedDirectOwnerSession,
+      readRetained: accounts.readRetainedDirectOwnerSessionCapture,
     }),
   );
   return accounts;

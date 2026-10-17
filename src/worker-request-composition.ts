@@ -4,9 +4,14 @@ import {
   type AuthTokenCaptureReader,
   assertAuthTokenCaptureReader,
   createAccounts,
+  createAccountsWithUnregisteredLocalIssuer,
   createApiKeyAdministration,
   type ExternalIdentityVerifier,
 } from "./auth.ts";
+import {
+  assertIdentityVerificationCaptureReader,
+  type IdentityVerificationCaptureReader,
+} from "./identity-setup.ts";
 import {
   assertHostedBillingFinancialRealm,
   type HostedBillingFinancialRealm,
@@ -237,15 +242,40 @@ export function readWorkerRequestFinancialInputs(
  * realm's exact Sql/client. Origin checks are local identity checks, not a
  * substitute for the RP's current row or a Financial effect's own admission.
  */
+type WorkerRequestConsumerOptions = WorkerRequestAppInputs & {
+  readonly sql: Sql;
+  readonly identity: ExternalIdentityVerifier;
+  readonly clock: Clock;
+  readonly randomId: () => string;
+  readonly publicOrigin: string;
+  readonly consoleOrigin: string | undefined;
+};
+
 export function createWorkerRequestConsumers(
-  options: WorkerRequestAppInputs & {
-    readonly sql: Sql;
-    readonly identity: ExternalIdentityVerifier;
-    readonly clock: Clock;
-    readonly randomId: () => string;
-    readonly publicOrigin: string;
-    readonly consoleOrigin: string | undefined;
+  options: WorkerRequestConsumerOptions,
+): WorkerRequestConsumers {
+  return constructWorkerRequestConsumers(options, null);
+}
+
+/**
+ * Explicit local candidate constructor. No active shared entry selects this.
+ * It retains real local issuance on the same primary, without qualifying Auth103.
+ */
+export function createWorkerRequestConsumersWithUnregisteredLocalIssuer(
+  options: WorkerRequestConsumerOptions & {
+    readonly identity: ExternalIdentityVerifier & IdentityVerificationCaptureReader;
   },
+): WorkerRequestConsumers {
+  const identity = Object.getOwnPropertyDescriptor(options, "identity");
+  if (!identity || !("value" in identity))
+    throw new TypeError("local candidate requires the original identity reader");
+  assertIdentityVerificationCaptureReader(identity.value);
+  return constructWorkerRequestConsumers(options, identity.value);
+}
+
+function constructWorkerRequestConsumers(
+  options: WorkerRequestConsumerOptions,
+  localIdentity: (ExternalIdentityVerifier & IdentityVerificationCaptureReader) | null,
 ): WorkerRequestConsumers {
   const origin = requestOrigins.get(options.connection);
   const { sql, client, realm, clock, randomId } = options;
@@ -266,13 +296,17 @@ export function createWorkerRequestConsumers(
   if (requestConsumers.has(options.connection))
     throw new TypeError("Worker request consumers are already constructed");
   const apiKeyAdministration = createApiKeyAdministration({ sql, clock, randomId });
-  const accounts = createAccounts({
+  const accountOptions = {
     sql,
     identity: options.identity,
     clock,
     randomId,
     apiKeyAdministration,
-  });
+  };
+  const accounts =
+    localIdentity === null
+      ? createAccounts(accountOptions)
+      : createAccountsWithUnregisteredLocalIssuer({ ...accountOptions, identity: localIdentity });
   assertAuthTokenCaptureReader(accounts, { sql });
   const store = createSharedAuthSessionStore(sql);
   const finalStore = createSharedAuthFinalSessionStore(sql);

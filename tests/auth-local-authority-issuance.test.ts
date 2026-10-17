@@ -1,7 +1,12 @@
 import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { AuthError, createAccountsWithUnregisteredLocalIssuer } from "../src/auth.ts";
+import {
+  assertRetainedDirectOwnerSessionReader,
+  AuthError,
+  createAccounts,
+  createAccountsWithUnregisteredLocalIssuer,
+} from "../src/auth.ts";
 import { additiveAuthTokenDDL } from "../src/auth-authority-schema-plan.ts";
 import { resolveIdentity } from "../src/identity-setup.ts";
 import { base64UrlEncode } from "../src/json.ts";
@@ -637,4 +642,123 @@ test("method replacement after construction or during a storage await fails clos
   expect(await during.count("auth_tokens")).toBe(0);
   expect(await during.count("credential_authority_classes")).toBe(0);
   Object.defineProperty(during.identity, "verify", { configurable: true, value: originalVerify });
+});
+
+test("retained direct data comes from actual authentication and original issuance, not raw capture", async () => {
+  const f = await fixture();
+  const accounts = candidate(f);
+  const signedIn = await accounts.signIn(await f.input());
+  const authorization = `Bearer ${signedIn.sessionToken}`;
+  assertRetainedDirectOwnerSessionReader(accounts, { sql: f.sql });
+  const raw = await accounts.captureAuthenticatedToken(authorization);
+  expect(accounts.readRetainedDirectOwnerSessionCapture(raw)).toBeNull();
+  const capture = await accounts.captureRetainedDirectOwnerSession(authorization);
+  expect(capture).not.toBeNull();
+  const selected = accounts.readRetainedDirectOwnerSessionCapture(capture);
+  expect(selected).not.toBeNull();
+  expect(selected?.record.class).toBe("direct-owner-session");
+  expect(selected?.record.organizationId).toBeNull();
+  expect(selected?.record.origin.targetRef).toBe("auth103:unregistered-local-candidate");
+  expect(selected?.record.origin.principalId).toBe(signedIn.principal.id);
+  const tokenRows = await f.sql.query("SELECT expires_at FROM auth_tokens WHERE id=?", [
+    selected?.record.token.id ?? "absent",
+  ]);
+  expect(selected?.capturedExpiresAt).toBe(tokenRows[0]?.expires_at);
+  expect(Object.isFrozen(selected)).toBe(true);
+  expect(Object.isFrozen(selected?.record)).toBe(true);
+  expect(candidate(f).readRetainedDirectOwnerSessionCapture(capture)).toBeNull();
+  expect(accounts.readRetainedDirectOwnerSessionCapture({ ...capture })).toBeNull();
+  let getterReads = 0;
+  expect(
+    accounts.readRetainedDirectOwnerSessionCapture({
+      get record() {
+        getterReads++;
+        throw new Error("untrusted capture getter");
+      },
+    }),
+  ).toBeNull();
+  expect(getterReads).toBe(0);
+  expect(() => assertRetainedDirectOwnerSessionReader({ ...accounts }, { sql: f.sql })).toThrow(
+    AuthError,
+  );
+  expect(() => assertRetainedDirectOwnerSessionReader(accounts, { sql: { ...f.sql } })).toThrow(
+    AuthError,
+  );
+  const originalReader = accounts.readRetainedDirectOwnerSessionCapture;
+  Object.defineProperty(accounts, "readRetainedDirectOwnerSessionCapture", {
+    configurable: true,
+    get() {
+      getterReads++;
+      throw new Error("untrusted reader getter");
+    },
+  });
+  expect(() => assertRetainedDirectOwnerSessionReader(accounts, { sql: f.sql })).toThrow(AuthError);
+  expect(getterReads).toBe(0);
+  Object.defineProperty(accounts, "readRetainedDirectOwnerSessionCapture", {
+    configurable: true,
+    value: originalReader,
+  });
+});
+
+test("retired class refuses new retained data without disabling ordinary Auth", async () => {
+  const f = await fixture();
+  const accounts = candidate(f);
+  const signedIn = await accounts.signIn(await f.input());
+  const authorization = `Bearer ${signedIn.sessionToken}`;
+  const original = await accounts.captureRetainedDirectOwnerSession(authorization);
+  expect(original).not.toBeNull();
+  await f.sql.run(
+    "UPDATE credential_authority_classes SET state='retired',terminal_reason='revoked',terminal_at=?,terminal_ref='retire-test'",
+    [new Date(f.now).toISOString()],
+  );
+  expect(await accounts.captureRetainedDirectOwnerSession(authorization)).toBeNull();
+  expect(await accounts.authenticate(authorization)).not.toBeNull();
+  expect(accounts.readRetainedDirectOwnerSessionCapture(original)).not.toBeNull();
+  // Reading retained history does not grant NEW authority or revive the class.
+});
+
+test("ordinary issuance without a retained class and revoked tokens have no retained capture", async () => {
+  const f = await fixture();
+  const ordinary = createAccounts({
+    sql: f.sql,
+    identity: f.identity,
+    clock: () => new Date(f.now),
+  });
+  const old = await ordinary.signIn(await f.input("ordinary"));
+  const oldAuthorization = `Bearer ${old.sessionToken}`;
+  expect(await ordinary.authenticate(oldAuthorization)).not.toBeNull();
+  expect(await ordinary.captureRetainedDirectOwnerSession(oldAuthorization)).toBeNull();
+  expect(await f.count("credential_authority_classes")).toBe(0);
+  const accounts = candidate(f);
+  const issued = await accounts.signIn(await f.input("issued"));
+  const authorization = `Bearer ${issued.sessionToken}`;
+  expect(await accounts.captureRetainedDirectOwnerSession(authorization)).not.toBeNull();
+  await accounts.revokeSession(authorization);
+  expect(await accounts.captureRetainedDirectOwnerSession(authorization)).toBeNull();
+});
+
+test("unknown retained currentness read does not mint a fallback capture or retry", async () => {
+  const f = await fixture();
+  let currentnessReads = 0;
+  const unknown: Sql = {
+    query: (sql, params) => {
+      if (sql.startsWith("SELECT CASE WHEN ")) {
+        currentnessReads++;
+        throw new Error("unknown primary observation");
+      }
+      return f.sql.query(sql, params);
+    },
+    run: (sql, params) => f.sql.run(sql, params),
+    batch: (statements) => f.sql.batch(statements),
+  };
+  const accounts = candidate(f, unknown);
+  const issued = await accounts.signIn(await f.input());
+  const authorization = `Bearer ${issued.sessionToken}`;
+  await expect(accounts.captureRetainedDirectOwnerSession(authorization)).rejects.toThrow(
+    "unknown primary observation",
+  );
+  expect(currentnessReads).toBe(1);
+  const raw = await accounts.captureAuthenticatedToken(authorization);
+  expect(raw).not.toBeNull();
+  expect(accounts.readRetainedDirectOwnerSessionCapture(raw)).toBeNull();
 });
