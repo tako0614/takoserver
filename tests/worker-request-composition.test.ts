@@ -111,7 +111,7 @@ afterEach(() => {
 
 /** Real owning schema and SQLite execution; this structural binding is not native D1 proof. */
 async function fixture(
-  shape?: (result: SqlWrite) => D1ResultLike,
+  shape?: (result: SqlWrite, originalStatementSql: string) => D1ResultLike,
   selectedSharedAuth?: WorkerSharedAuthStaging,
   selectedClock?: Clock,
 ) {
@@ -132,8 +132,8 @@ async function fixture(
     billingAuthority: AUTHORITY,
   });
   const sessions: { readonly constraint: "first-primary"; readonly queries: string[] }[] = [];
-  const resultOf = (result: SqlWrite) =>
-    shape?.(result) ?? {
+  const resultOf = (result: SqlWrite, originalStatementSql: string) =>
+    shape?.(result, originalStatementSql) ?? {
       success: true,
       results: result.rows,
       meta: { changes: result.changes },
@@ -160,7 +160,7 @@ async function fixture(
               const original = originals.get(statement);
               if (!original) throw new Error("fixture statement ownership differs");
               queries.push(original.sql);
-              return resultOf(await database.sql.run(original.sql, original.params));
+              return resultOf(await database.sql.run(original.sql, original.params), original.sql);
             },
           };
           originals.set(statement, { sql });
@@ -173,7 +173,11 @@ async function fixture(
             return original;
           });
           queries.push(...inputs.map((input) => input.sql));
-          return (await database.sql.batch(inputs)).map(resultOf);
+          return (await database.sql.batch(inputs)).map((result, index) => {
+            const original = inputs[index];
+            if (!original) throw new Error("fixture batch result ownership differs");
+            return resultOf(result, original.sql);
+          });
         },
       };
     },
@@ -1033,11 +1037,12 @@ async function retainedRpFixture(withClass = true) {
   const issuer = await createSharedSessionTestIssuer(() => stamp);
   const principalId = "prn_retained_rp_component";
   const control: {
-    onResult?: (result: SqlWrite) => D1ResultLike | undefined;
+    onResult?: (result: SqlWrite, originalStatementSql: string) => D1ResultLike | undefined;
     onPin?: () => Promise<void>;
   } = {};
   const f = await fixture(
-    (result) => control.onResult?.(result) ?? acknowledgement(result),
+    (result, originalStatementSql) =>
+      control.onResult?.(result, originalStatementSql) ?? acknowledgement(result),
     {
       kind: "shared-auth-staging-v1",
       clientSecret: SESSION_TEST_CONFIG.clientSecret,
@@ -1155,7 +1160,6 @@ async function retainedRpFixture(withClass = true) {
     });
   const capture = (connection = inputs.connection) =>
     captureWorkerRequestRetainedRpSession(connection, request(), SESSION_TEST_ORGANIZATION.id);
-  const lastSql = () => f.sessions.at(-1)?.queries.at(-1) ?? "";
   const read = (value: unknown) => readWorkerRequestRetainedRpCapture(inputs.connection, value);
   return {
     f,
@@ -1170,7 +1174,6 @@ async function retainedRpFixture(withClass = true) {
     request,
     capture,
     read,
-    lastSql,
     native: () => {
       if (!native) throw new Error("native session missing");
       return native;
@@ -1282,15 +1285,33 @@ describe("Worker original RP final-touch retained DATA", () => {
       await missing.inputs.sql.query("SELECT count(*) AS n FROM credential_authority_classes"),
     ).toEqual([{ n: 0 }]);
     const mismatch = await retainedRpFixture();
-    expect(
-      (
-        await mismatch.inputs.sql.run(
-          "UPDATE shared_auth_sessions SET workspace_id=? WHERE digest=?",
-          [SESSION_TEST_ORGANIZATION.id, mismatch.digest],
-        )
-      ).changes,
-    ).toBe(1);
+    let mismatchReached = false;
+    mismatch.control.onResult = (result, originalStatementSql) => {
+      if (
+        originalStatementSql !== "SELECT * FROM credential_authority_classes WHERE session_digest=?"
+      )
+        return undefined;
+      mismatchReached = true;
+      return acknowledgement({
+        ...result,
+        rows: result.rows.map((row) => ({ ...row, workspace_id: SESSION_TEST_ORGANIZATION.id })),
+      });
+    };
     expect(await mismatch.capture()).toBeNull();
+    expect(mismatchReached).toBe(true);
+    delete mismatch.control.onResult;
+    expect(
+      await mismatch.inputs.sql.query(
+        "SELECT workspace_id FROM shared_auth_sessions WHERE digest=?",
+        [mismatch.digest],
+      ),
+    ).toEqual([{ workspace_id: SESSION_TEST_PERSONAL.id }]);
+    expect(
+      await mismatch.inputs.sql.query(
+        "SELECT workspace_id FROM credential_authority_classes WHERE session_digest=?",
+        [mismatch.digest],
+      ),
+    ).toEqual([{ workspace_id: SESSION_TEST_PERSONAL.id }]);
   });
 
   for (const ack of ["failed", "unknown"] as const) {
@@ -1299,12 +1320,14 @@ describe("Worker original RP final-touch retained DATA", () => {
       let faultReached = false;
       let classReads = 0;
       let touches = 0;
-      r.control.onResult = (result) => {
+      r.control.onResult = (result, originalStatementSql) => {
         if (
-          r.lastSql().startsWith("SELECT * FROM credential_authority_classes WHERE session_digest")
+          originalStatementSql.startsWith(
+            "SELECT * FROM credential_authority_classes WHERE session_digest",
+          )
         )
           classReads++;
-        if (r.lastSql().startsWith("UPDATE shared_auth_sessions SET last_used_at")) {
+        if (originalStatementSql.startsWith("UPDATE shared_auth_sessions SET last_used_at")) {
           touches++;
           faultReached = result.rows[0]?.digest === r.digest;
           if (ack === "failed") throw new Error("synthetic final-touch failure");
@@ -1325,10 +1348,12 @@ describe("Worker original RP final-touch retained DATA", () => {
     expect(original).not.toBeNull();
     const originalData = r.read(original);
     let retired = false;
-    r.control.onResult = () => {
+    r.control.onResult = (_result, originalStatementSql) => {
       if (
         !retired &&
-        r.lastSql().startsWith("SELECT * FROM credential_authority_classes WHERE session_digest")
+        originalStatementSql.startsWith(
+          "SELECT * FROM credential_authority_classes WHERE session_digest",
+        )
       ) {
         retired = true;
         r.f.db
@@ -1363,11 +1388,13 @@ describe("Worker original RP final-touch retained DATA", () => {
           : method === "prepare"
             ? r.native()
             : r.runtime.accounts;
-      r.control.onResult = () => {
-        if (r.lastSql().startsWith("SELECT CASE WHEN ")) currentnessReads++;
+      r.control.onResult = (_result, originalStatementSql) => {
+        if (originalStatementSql.startsWith("SELECT CASE WHEN ")) currentnessReads++;
         if (
           !changed &&
-          r.lastSql().startsWith("SELECT * FROM credential_authority_classes WHERE session_digest")
+          originalStatementSql.startsWith(
+            "SELECT * FROM credential_authority_classes WHERE session_digest",
+          )
         ) {
           changed = true;
           Object.defineProperty(
