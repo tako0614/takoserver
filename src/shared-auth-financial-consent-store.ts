@@ -2273,7 +2273,10 @@ export interface SharedAuthFinancialConsentProofReferenceData {
  * The original-fullcommand GET recovery API and all write APIs are unchanged.
  */
 export function createSharedAuthFinancialConsentProofReferenceReader(connection: WorkerRequestSql) {
-  const port = captureRequestCommandSql(connection);
+  return proofReferenceReaderFromCapturedPort(captureRequestCommandSql(connection));
+}
+
+function proofReferenceReaderFromCapturedPort(port: ReturnType<typeof captureRequestCommandSql>) {
   const originals = createSharedAuthFinancialConsentOriginalReader(port.queryPort);
 
   async function readProofOriginalData(
@@ -2357,4 +2360,156 @@ export function createSharedAuthFinancialConsentProofReferenceReader(connection:
     }
   }
   return Object.freeze({ readProofOriginalData });
+}
+
+/** Structural metadata DATA only. Its source/qualification is not established
+ * by this interface; no Root credential, distinct human or policyClock is minted.
+ * Original pending/fullcommand/recordedAt are deliberately not caller inputs.
+ */
+export interface SharedAuthFinancialConsentLocalProofInputData {
+  readonly consentProofRef: string;
+  readonly credential: RpAuthorityRecord;
+  readonly human: SharedPrincipalBinding;
+  readonly currentSession: SharedAuthFinancialConsentGuardedStatementData["currentSession"];
+}
+
+export interface SharedAuthFinancialConsentLocalProofData {
+  readonly state: "consent-proof-reference-local-data";
+  readonly consentProofRef: string;
+  readonly original: SharedAuthFinancialConsentOriginalData;
+}
+
+/** Query-only stored-original -> local predicate DATA bridge. This is not a
+ * current consent verifier, permission or NEW/resume/first-dispatch authority.
+ * Caller metadata is copied DATA, not a genuine Root/Financial source assertion.
+ * Historical lookup stays available separately after expiry/retirement. A known
+ * historical original with zero local matches is nonmatch DATA only; missing
+ * historical custody/byref-zero/SQL unknown never becomes positive absence.
+ */
+export function createSharedAuthFinancialConsentLocalProofDataReader(connection: WorkerRequestSql) {
+  const port = captureRequestCommandSql(connection);
+  const historicals = proofReferenceReaderFromCapturedPort(port);
+
+  async function readLocalProofOriginalData(
+    input: SharedAuthFinancialConsentLocalProofInputData,
+  ): Promise<SharedAuthFinancialConsentLocalProofData | undefined> {
+    port.sameOrigin();
+    let metadata: SharedAuthFinancialConsentLocalProofInputData;
+    try {
+      const raw = exactOwn(
+        input,
+        ["consentProofRef", "credential", "human", "currentSession"],
+        "invalid_request",
+      );
+      const session = exactOwn(
+        raw.currentSession,
+        ["version", "absoluteExpiresAt", "lastUsedAt"],
+        "invalid_request",
+      );
+      // Fully detach before the first original/hash/query await. Root-owned
+      // producers still must qualify these values; structural equality cannot.
+      metadata = Object.freeze({
+        consentProofRef: text(raw.consentProofRef, "invalid_request"),
+        credential: snapshotCredential(raw.credential),
+        human: snapshotHuman(raw.human),
+        currentSession: Object.freeze({
+          version: stamp(session.version, "invalid_request"),
+          absoluteExpiresAt: stamp(session.absoluteExpiresAt, "invalid_request"),
+          lastUsedAt: stamp(session.lastUsedAt, "invalid_request"),
+        }),
+      });
+    } catch {
+      return fail("invalid_request");
+    }
+
+    let historical: SharedAuthFinancialConsentProofReferenceData;
+    try {
+      historical = await historicals.readProofOriginalData(metadata.consentProofRef);
+      port.sameOrigin();
+    } catch (error) {
+      port.sameOrigin();
+      if (
+        error instanceof SharedAuthFinancialConsentOriginalReadError &&
+        error.code === "custody_conflict"
+      )
+        throw error;
+      return fail("unavailable");
+    }
+    const original = historical.original;
+    let pending: SharedAuthFinancialConsentPendingData;
+    try {
+      const selected = await port.queryPort.query(
+        `SELECT ${pendingColumns.join(",")} FROM ${PENDING} WHERE transaction_ref=? LIMIT 2`,
+        [original.command.key.transactionRef],
+      );
+      port.sameOrigin();
+      // No caller echo, fake SqlWrite or changes1: this is one actual closed29
+      // row with native byte snapshots before subsequent hashing awaits.
+      pending = snapshotPendingBoundary(requiredDenseValues(selected, 1)[0], "unavailable");
+      if (
+        pending.transaction_ref !== original.command.key.transactionRef ||
+        pending.registration_ref !== original.command.key.registrationRef ||
+        pending.incarnation !== original.command.key.incarnation ||
+        pending.organization_id !== original.command.selectedScope.organizationId ||
+        pending.workspace_id !== original.command.selectedScope.workspaceId ||
+        pending.workspace_ref !== original.command.selectedScope.workspaceRef
+      )
+        return fail("unavailable");
+      await pendingCustody(pending, "unavailable");
+      port.sameOrigin();
+      await requireCaptureRecipe({ pending, command: original.command }, "unavailable");
+      port.sameOrigin();
+    } catch {
+      port.sameOrigin();
+      return fail("unavailable");
+    }
+
+    let guarded: ReturnType<typeof snapshotGuarded>;
+    try {
+      // The only recordedAt is the original, receipt-validated stored timestamp.
+      // No now/current clock or mutable later payment scope is inferred here.
+      guarded = snapshotGuarded({
+        pending,
+        command: original.command,
+        recordedAt: original.recordedAt,
+        credential: metadata.credential,
+        human: metadata.human,
+        currentSession: metadata.currentSession,
+      });
+    } catch {
+      return fail("invalid_request");
+    }
+    try {
+      const statement = localCurrentnessStatement(guarded);
+      const result = await port.queryPort.query(statement.sql, statement.params);
+      port.sameOrigin();
+      if (Array.isArray(result) && Object.getOwnPropertyDescriptor(result, "length")?.value === 0) {
+        requiredDenseValues(result, 0);
+        return undefined; // Known historical original, local nonmatch DATA only.
+      }
+      const row = exactOwn(requiredDenseValues(result, 1)[0], originalColumns, "unavailable");
+      const originalBytes = capturePostimageBytes(row.original_bytes, 16384, "unavailable");
+      if (
+        !matchesKey(row, original.command.key) ||
+        !matchesScope(row, original.command.selectedScope) ||
+        !sameBytes(originalBytes, original.originalBytes) ||
+        text(row.original_digest, "unavailable") !== original.originalDigest ||
+        custodyDigest(row.original_custody_sha256, "unavailable") !==
+          original.originalCustodySHA256 ||
+        stamp(row.recorded_at, "unavailable") !== original.recordedAt ||
+        stamp(row.receipt_recorded_at, "unavailable") !== original.receiptRecordedAt
+      )
+        return fail("unavailable");
+      port.sameOrigin();
+      return Object.freeze({
+        state: "consent-proof-reference-local-data",
+        consentProofRef: historical.consentProofRef,
+        original,
+      });
+    } catch {
+      port.sameOrigin();
+      return fail("unavailable");
+    }
+  }
+  return Object.freeze({ readLocalProofOriginalData });
 }

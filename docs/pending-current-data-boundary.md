@@ -83,3 +83,31 @@ credential assert, separate human, policy Clock/current admission or physical
 Auth103 qualification. Direct-token DATA cannot be cast into RP fields.
 Financial coherent original R1/action/terms readers and same-primary acceptance/
 first-dispatch CAS remain separate owner responsibilities.
+
+## Stored-reference local predicate DATA
+
+`createSharedAuthFinancialConsentLocalProofDataReader(connection)` exposes only
+`readLocalProofOriginalData(input)`. Its closed input is the original
+`consentProofRef` and the existing credential, distinct human and currentSession
+metadata DATA. It does not accept pending, fullcommand or recordedAt echoes.
+The actual same captured request query port loads the historical receipt-backed
+original and strict stored29 pending. All original refs, bytes, family and the
+receipt-validated recordedAt come from that custody. The existing81-bind local
+predicate and exact original14 comparison are reused without a writer or Clock
+read. Metadata is detached before the first await; no DTO, callback or value
+shape proves its Root source or qualification.
+
+Success returns `SharedAuthFinancialConsentLocalProofData`, state
+`consent-proof-reference-local-data`, the unchanged ref and historical original.
+Undefined is only a local SQL nonmatch after complete historical custody. A
+byref-zero or incomplete/unknown/corrupt original remains unavailable. The
+historical-only reader stays usable after expiry or retirement independently
+of this local predicate. No caller metadata mismatch, unknown ACK or nonmatch
+permits NEW, install, resend, resume or another key/family.
+
+This DATA bridge is not a current consent verifier or current-admission port.
+It neither observes/touches sessions nor supplies qualified Root credential,
+separate human, policyClock, physical103, genuine RP issuance or Financial
+original R1/action/terms and payer/CAS. Its structural metadata contract retains
+those existing owner boundaries; genuine provenance cannot be inferred from a
+matching local row. No public route, wire/recipe, schema or registration changes.
