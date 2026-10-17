@@ -645,9 +645,9 @@ ${siteAssets ? "" : 'for(const node of document.querySelectorAll("[data-origin]"
 
 /**
  * The missing-page response, in the same visual system: one page for every
- * missing address. It reads in the language the rest of
- * the site would: Japanese under /ja/, English under /en/, and otherwise the
- * browser's first choice of the two.
+ * missing address. It reads in the language the rest of the site would:
+ * Japanese under /ja/, English under /en/, and otherwise the browser's first
+ * choice of the two.
  */
 export function notFoundHtml(): string {
   return `<!doctype html>
