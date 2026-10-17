@@ -116,8 +116,8 @@ serves them from this machine.
   does not compose is refused, never approximated, so check it first as in
   [What you can deploy](#what-you-can-deploy). Steps
   [8](docs/self-host-operations.md#8-create-and-serve-a-worker),
-  [9](docs/self-host-operations.md#9-verify) and
-  [11](docs/self-host-operations.md#11-delete-resources) of the install
+  [10](docs/self-host-operations.md#10-ship-a-new-version) and
+  [12](docs/self-host-operations.md#12-delete-resources) of the install
   path show the exact create, update and delete requests.
 - **Own** Resources through an organization. Its ID is the v2 Space, and its API
   keys and its owner's session act as one principal, so replacing a key does
@@ -321,9 +321,9 @@ one environment variable. Run it as the Host's user in the Host's PID
 namespace. Restart
 the Host with the updated config, then create the `ModuleWorker`,
 `WorkerBundle`, `WorkerVersion`, `WorkerDeployment` and `WorkerEndpoint`
-Resources through `/apis/forms.takoform.com/v2/resources`. Steps 6 to 9 of the
+Resources through `/apis/forms.takoform.com/v2/resources`. Steps 6 to 10 of the
 [install path](docs/self-host-operations.md#first-install-and-first-use) give
-the complete commands; steps 10 and 11 add a SQLite Binding and delete
+the complete commands; steps 11 and 12 add a SQLite Binding and delete
 everything in reference order. `scripts/selfhost-artifact.ts verify` rechecks
 every configured entry read-only, including while the Host runs.
 

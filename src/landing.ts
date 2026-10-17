@@ -30,7 +30,7 @@ const INSTALL_GUIDE = `${GUIDE}#first-install-and-first-use`;
 const DEPLOY_STEPS = `${GUIDE}#6-seed-held-artifacts`;
 const DOCKER_GUIDE = `${REPOSITORY}/blob/main/docs/self-host-docker.md`;
 const CONSOLE_SETUP = `${GUIDE}#the-console-optional`;
-const SHIP_STEPS = `${GUIDE}#9-verify`;
+const SHIP_STEPS = `${GUIDE}#10-ship-a-new-version`;
 const MONITORING = `${GUIDE}#monitoring`;
 const BACKUP = `${GUIDE}#cold-snapshot`;
 const UPDATE = `${GUIDE}#update-and-code-rollback`;
@@ -116,10 +116,10 @@ const landingMessages = {
     shipVersion: "pairs the new WorkerBundle with its fetch handler.",
     shipDeploy:
       "is updated to serve hello-version-v2 at weight 10000. The update names the generation it read, so a change made in between is not overwritten.",
-    shipMore: "Step 9 of the install guide",
+    shipMore: "Step 10 of the install guide",
     keepTitle: "Keep it running",
     keepBody:
-      "Poll the Host's readiness probe, GET /_takoserver/health/ready on its own port: 503, or no answer, means it cannot serve; degraded: true means it still serves but something needs you: a Worker that is not ready, work waiting too long, or a background job that keeps failing. To back up, stop the Host and copy its whole data root. To update, check out a newer reviewed commit beside the running one and switch to it, keeping the previous checkout and a backup.",
+      "Poll the Host's readiness probe, GET /_takoserver/health/ready on its own port: 503, or no answer, means it cannot serve; degraded: true means it still serves but something needs you: a Worker that is not ready, work waiting too long, or a background job that keeps failing. To back up, stop the Host and copy its whole data root and /etc/takoserver, which holds its cursor key and the config that grants its seeded code. To update, check out a newer reviewed commit beside the running one and switch to it, keeping the previous checkout and a backup.",
     monitoring: "Monitoring",
     backup: "Cold snapshot",
     update: "Update",
@@ -201,10 +201,10 @@ const landingMessages = {
     shipVersion: "新しいWorkerBundleとfetchハンドラーを組み合わせた版です。",
     shipDeploy:
       "hello-version-v2を重み10000で配信するよう更新します。更新は読み取った世代を指定するので、その間に入った別の変更を上書きしません。",
-    shipMore: "手順書（英語）の手順9",
+    shipMore: "手順書（英語）の手順10",
     keepTitle: "動かし続ける",
     keepBody:
-      "準備状態は、Host自身のポートで GET /_takoserver/health/ready を定期的に確認します。503か応答がなければサービスを提供できず、degraded: true ならサービスは続いていますが、準備できていないWorker、長く待っている作業、失敗が続くバックグラウンド処理など、対応が必要なものがあります。バックアップするには、Hostを停止してデータルート全体をコピーします。更新するには、レビュー済みの新しいコミットを今のチェックアウトの横に用意して切り替えます。前のチェックアウトとバックアップは残しておきます。",
+      "準備状態は、Host自身のポートで GET /_takoserver/health/ready を定期的に確認します。503か応答がなければサービスを提供できず、degraded: true ならサービスは続いていますが、準備できていないWorker、長く待っている作業、失敗が続くバックグラウンド処理など、対応が必要なものがあります。バックアップするには、Hostを停止して、データルート全体と /etc/takoserver（カーソルキーと、保持させたコードを許可する設定があります）をコピーします。更新するには、レビュー済みの新しいコミットを今のチェックアウトの横に用意して切り替えます。前のチェックアウトとバックアップは残しておきます。",
     monitoring: "監視（英語）",
     backup: "コールドスナップショット（英語）",
     update: "更新（英語）",
@@ -433,6 +433,11 @@ export function landingHtml(options: LandingOptions): string {
   const locale = options.locale ?? "en";
   const copy = landingMessages[locale];
   const base = options.apiOrigin ?? options.hostOrigin ?? "";
+  // A Host's own root is that Host's page: a shared link names the Host, and
+  // search leaves it out rather than list a copy of takoserver.com's page.
+  const pageUrl = options.hostOrigin
+    ? `${options.hostOrigin}/`
+    : `https://takoserver.com/${locale === "ja" ? "ja/" : ""}`;
   // A Host names its own public origin; without one, the page fills in the
   // origin it was read from.
   const hostAddress = options.hostOrigin ?? "<span data-origin>$HOST</span>";
@@ -518,11 +523,11 @@ ${
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Takoserver">
 <meta property="og:locale" content="${locale === "ja" ? "ja_JP" : "en_US"}">
-<meta property="og:url" content="https://takoserver.com/${locale === "ja" ? "ja/" : ""}">
+<meta property="og:url" content="${pageUrl}">
 <meta property="og:image" content="https://takoserver.com/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<link rel="canonical" href="https://takoserver.com/${locale === "ja" ? "ja/" : ""}">
+${siteAssets ? `<link rel="canonical" href="${pageUrl}">` : '<meta name="robots" content="noindex">'}
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Takoserver">
 <meta name="twitter:description" content="${copy.description}">
