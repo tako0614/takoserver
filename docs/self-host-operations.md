@@ -1317,13 +1317,21 @@ commit first, then, as root (the checkout stays root-owned and read-only to
 
    ```sh
    git -C /opt/takoserver fetch origin
-   NEW=$(git -C /opt/takoserver rev-parse origin/main)   # the commit to review and run
+   NEW=$(git -C /opt/takoserver rev-parse origin/main)
+   git -C /opt/takoserver log -1 --format='%H %cd %s' "$NEW"
+   ```
+
+   Check that this is the commit you reviewed; to run another, set `NEW` to its
+   full hash. Then add it and install its dependencies:
+
+   ```sh
    DIR=/opt/takoserver-$(git -C /opt/takoserver rev-parse --short=12 "$NEW")
    git -C /opt/takoserver worktree add --detach "$DIR" "$NEW"
    cd "$DIR" && bun install --frozen-lockfile
    ```
 
-   The steps below name the new checkout `$DIR`.
+   The steps below name the new checkout `$DIR`. `NEW` and `DIR` last only in
+   this root shell, so run the rest of this update in it.
 
    If `bun install` fails on the lockfile, the new checkout may expect another
    Bun version; see step 2.
