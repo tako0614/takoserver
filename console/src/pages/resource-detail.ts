@@ -360,8 +360,8 @@ function stuckVersionNotice(organizationId: string, version: ResourceSummary): C
         "span",
         null,
         tr(
-          "再試行中は削除できません。コードを直し、新しい名前でバンドルと版を作成してください。今配信している版はそのまま配信を続けます（",
-          "While it retries, it cannot be deleted. Fix the code and create a new bundle and version under new names; the version that serves now keeps serving (",
+          "再試行中は削除できません。コードを直して、新しい名前でバンドルと版を作成してください。Bindingやアセットが原因なら、それを使えるようにすると再試行が完了することがあります。今配信している版はそのまま配信を続けます（",
+          "While it retries, it cannot be deleted. Fix the code and create a new bundle and version under new names; if a Binding or assets are the cause, making them available may let the retry finish by itself. The version that serves now keeps serving (",
         ),
         guideLink(
           "when-a-new-version-does-not-work",
