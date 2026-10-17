@@ -587,9 +587,23 @@ export function createIntegrationOrganizationBootstrapStore(options: {
         ]);
       } catch (error) {
         if (error instanceof SqlError && error.code === "constraint") {
-          const raced = await status(input).catch(() => null);
-          if (raced?.state === "present") return { status: raced, created: false };
-          throw new IntegrationOrganizationBootstrapStoreError("organization_state_conflict");
+          let raced: IntegrationOrganizationBootstrapStatus;
+          try {
+            raced = await status(input);
+          } catch (readError) {
+            if (
+              readError instanceof IntegrationOrganizationBootstrapStoreError &&
+              (readError.code === "principal_unavailable" ||
+                readError.code === "organization_state_conflict")
+            ) {
+              throw new IntegrationOrganizationBootstrapStoreError("organization_state_conflict");
+            }
+            throw error;
+          }
+          if (raced.state === "present") return { status: raced, created: false };
+          // A rolled-back batch with no competing tuple is a storage failure.
+          // Failed readback is also insufficient evidence of an identity conflict.
+          throw error;
         }
         // An unavailable acknowledgement is never retried here. The signed
         // status action is the only operation that settles whether it landed.
