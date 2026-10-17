@@ -909,26 +909,51 @@ function deleteConsequence(formUrl: string): string {
       );
     case "WorkerDeployment":
       return tr("そのWorkerの配信が止まります。", "Its Worker stops serving. ");
+    case "ActorNamespace":
+      return tr(
+        "保存されている状態も削除されます。",
+        "The stored state of its objects is deleted with it. ",
+      );
+    case "DurableWorkflow":
+      return tr("実行中のインスタンスは停止されます。", "Its running instances are stopped. ");
+    case "WorkerCronTrigger":
+      return tr(
+        "スケジュールによるWorkerの呼び出しが止まります。",
+        "Its schedule stops calling the Worker. ",
+      );
+    case "QueueConsumer":
+      return tr(
+        "Workerはキューのメッセージを受け取らなくなります。",
+        "The Worker stops receiving the queue's messages. ",
+      );
     default:
       return "";
   }
 }
 
 /**
- * What to do first about one Resource that still names the one being deleted:
- * a Deployment serving a version serves another, a Resource that never changes
- * is deleted once nothing serves it, and anything else stops naming it.
+ * What to do first about one Resource that still names the one being deleted.
+ * A Deployment's versions are the only reference the Host lets change, so a
+ * Deployment serving the version serves another or goes; a Resource that never
+ * changes goes once nothing serves it; any other Form this console knows
+ * cannot be pointed elsewhere, so it goes first. Only a Form it does not know
+ * might be changed instead.
  */
 function referrerStep(referrer: ResourceSummary, target: ResourceSummary): string {
   if (formKind(referrer.form) === "WorkerDeployment" && formKind(target.form) === "WorkerVersion")
-    return tr("先に別の版を配信します", "serve another version first");
+    return tr(
+      "先に別の版を配信するか、削除してください",
+      "serve another version first, or delete it",
+    );
   if (!acceptsChanges(referrer.form))
     return tr(
-      "変更できないため、配信されなくなってから削除します",
+      "変更できないため、配信されなくなってから削除してください",
       "it cannot change, so delete it once nothing serves it",
     );
+  if (KNOWN_FORM_GROUPS.some((group) => (group.forms as readonly string[]).includes(referrer.form)))
+    return tr("先に削除してください", "delete it first");
   return tr(
-    "参照しないよう変更するか、削除します",
+    "参照しないよう変更するか、削除してください",
     "change it so it no longer names this, or delete it",
   );
 }

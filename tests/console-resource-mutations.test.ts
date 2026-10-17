@@ -1675,7 +1675,7 @@ test("delete says what to do first about each Resource that still names it", asy
     name: "hello-version-v1",
     form: edge("WorkerVersion/0.5.0"),
   };
-  // A version served by a Deployment: serve another one first, never delete the Deployment.
+  // A version served by a Deployment: serve another one first, or retire the Worker's Deployment.
   const serving = {
     ...two,
     name: "hello-deployment",
@@ -1685,7 +1685,7 @@ test("delete says what to do first about each Resource that still names it", asy
   const served = await deleteDialog([version, serving], false, version);
   await settle();
   expect(served.body.textContent).toContain(
-    "hello-deployment WorkerDeployment 0.4.0: serve another version first",
+    "hello-deployment WorkerDeployment 0.4.0: serve another version first, or delete it",
   );
   // A database named by a version, which cannot change: delete the version once nothing serves it.
   const database = { ...one, uid: "uid-db", name: "hello-db", form: edge("SQLiteDatabase/0.2.0") };
@@ -1704,6 +1704,20 @@ test("delete says what to do first about each Resource that still names it", asy
   expect(bound.body.textContent).toContain(
     "The Host deletes this Resource. Its data is deleted with it. This cannot be undone.",
   );
+  // A Worker named by its Endpoint: that reference cannot change, so the Endpoint goes first.
+  const worker = { ...one, uid: "uid-worker", name: "hello", form: edge("ModuleWorker/0.3.0") };
+  const naming = {
+    ...two,
+    name: "hello-endpoint",
+    form: edge("WorkerEndpoint/0.3.0"),
+    spec: { worker: { resourceUid: "uid-worker" } },
+  };
+  const retiring = await deleteDialog([worker, naming], false, worker);
+  await settle();
+  expect(retiring.body.textContent).toContain(
+    "hello-endpoint WorkerEndpoint 0.3.0: delete it first",
+  );
+  expect(retiring.body.textContent).not.toContain("change it so it no longer names this");
   const endpoint = {
     ...one,
     uid: "uid-end",
