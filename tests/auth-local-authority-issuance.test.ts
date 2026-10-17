@@ -663,7 +663,7 @@ test("retained direct data comes from actual authentication and original issuanc
   const tokenRows = await f.sql.query("SELECT expires_at FROM auth_tokens WHERE id=?", [
     selected?.record.token.id ?? "absent",
   ]);
-  expect(selected?.capturedExpiresAt).toBe(tokenRows[0]?.expires_at);
+  expect(tokenRows[0]?.expires_at).toBe(selected?.capturedExpiresAt);
   expect(Object.isFrozen(selected)).toBe(true);
   expect(Object.isFrozen(selected?.record)).toBe(true);
   expect(candidate(f).readRetainedDirectOwnerSessionCapture(capture)).toBeNull();

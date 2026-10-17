@@ -1050,7 +1050,7 @@ test("Container code composer captures the final Worker Sql and clock without ch
         expect(Object.keys(context).sort()).toEqual(["clock", "env", "sql"]);
         expect(Object.isFrozen(context)).toBe(true);
         expect(context.env).toBe(f.env);
-        expect(context.clock).toBe(formClock);
+        expect(formClock).toBe(context.clock);
         expect(context.sql).not.toBe(f.sql);
         capturedSql = context.sql;
         return createV2ContainerHostAcceptance({
@@ -1177,8 +1177,8 @@ test("Container HTTP requests and a scheduled invocation each own an actual nati
       async composeV2ContainerHostAcceptance(context) {
         expect(context.env).toBe(f.env);
         expect(Object.isFrozen(context)).toBe(true);
-        expect(context.sql).toBe(formContext?.sql);
-        expect(context.clock).toBe(formContext?.clock);
+        expect(formContext?.sql).toBe(context.sql);
+        expect(formContext?.clock).toBe(context.clock);
         expect(context.clock()).toBeInstanceOf(Date);
         expect(context.sql).not.toBe(f.sql);
         assertMoneyCutoverSqlOrigin(context.sql, { writerEpoch: REQUEST_WRITER });

@@ -322,7 +322,9 @@ async function fixture(
         documentation: "https://docs.example.test/v2",
         authenticationDocumentation: "https://docs.example.test/v2/authentication",
       },
-      v2FormFactory: () => ({ [FORM]: form }),
+      ...(overrides.v2FormSelectionFactory === undefined
+        ? { v2FormFactory: () => ({ [FORM]: form }) }
+        : {}),
       ...(selected === undefined ? {} : { v2WorkerEndpointOrigin: selected }),
       ...overrides,
     });
@@ -499,7 +501,6 @@ test("retained canonical Container Form cannot DELETE without its code issuer", 
   try {
     const resource = await seedOrdinaryContainerResource(f, "container-retained-unsigned");
     const retained = f.makeApp(undefined, {
-      v2FormFactory: undefined,
       v2FormSelectionFactory: () => ({ forms: {}, retainedForms: { [FORM]: f.form } }),
     });
     const beforeBatches = f.batches.length;
