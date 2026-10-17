@@ -250,7 +250,7 @@ export function resourcesPage(organizationId: string): Child {
           "p",
           null,
           tr(
-            "この組織がTakoformで宣言したリソースと、ホストが最後に確認した状態です。",
+            "この組織がTakoformで宣言したリソースと、Hostが最後に確認した状態です。",
             "Every resource this organization has declared through Takoform, with the state the Host last observed.",
           ),
         ),
