@@ -843,7 +843,10 @@ test("sole genuine Container preparation keeps its original brand through compos
       batch.some((statement) => /INSERT INTO tf_v2_operations\b/u.test(statement.sql)),
     );
     expect(acceptedCoreBatches(f)).toBe(before + 1);
-    expect(attempted?.at(-1)?.sql).toBe(fixed.terminal.sql);
+    expect(attempted?.at(-1)?.sql).toBe(
+      `WITH host_form_admission AS (SELECT 1 AS permitted) ${fixed.terminal.sql}`,
+    );
+    expect(attempted?.at(-1)?.params).toEqual(fixed.terminal.params ?? []);
     expect(attempted?.at(-1)?.sql).toContain("INSERT INTO main.tf_v2_container_acceptances");
     expect(f.lastBatchError()).toBeInstanceOf(SqlError);
     expect(f.db.query("SELECT count(*) AS n FROM tf_v2_operations").get()).toEqual({ n: 0 });
