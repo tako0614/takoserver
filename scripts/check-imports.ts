@@ -624,6 +624,12 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain", "app"],
   },
   {
+    // Canonical R1 selection binds app DATA sources without adapter authority.
+    name: "app",
+    match: /^src\/financial-r1-selection-source\.ts$/u,
+    may: ["core", "domain", "app"],
+  },
+  {
     // Retained history storage is separate from its qualified runtime issuer.
     name: "domain",
     match: /^src\/shared-financial-customer-history\.ts$/u,

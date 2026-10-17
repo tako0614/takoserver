@@ -684,11 +684,11 @@ export async function createCanonicalHostedBillingComposition(options: {
         "reference",
         "amountMinor",
       ]);
-      const economic = await topUpEconomicSelector.call(economicSelections, selected);
+      const economic = await Reflect.apply(topUpEconomicSelector, economicSelections, [selected]);
       return displayedTerms.fromEconomic(economic);
     },
     async selectCardSetupDisplayedTermsR1(): Promise<FinancialDisplayedTermsR1> {
-      const economic = await cardSetupEconomicSelector.call(economicSelections);
+      const economic = await Reflect.apply(cardSetupEconomicSelector, economicSelections, []);
       return displayedTerms.fromEconomic(economic);
     },
     createPayments(context: PaymentEventContext): HostedBillingPaymentAssembly {
@@ -771,7 +771,7 @@ export async function createCanonicalHostedBillingComposition(options: {
             "reference",
             "planKey",
           ]);
-          const economic = await subscriptionStartSelector.call(hosted, selected);
+          const economic = await Reflect.apply(subscriptionStartSelector, hosted, [selected]);
           return displayedTerms.fromEconomic(economic);
         },
         async preparePlanChangeDisplayedTermsR1(input): Promise<FinancialDisplayedTermsR1> {
@@ -781,7 +781,7 @@ export async function createCanonicalHostedBillingComposition(options: {
             "expectedSubscriptionRef",
             "planKey",
           ]);
-          const economic = await planChangeSelector.call(planChangeReceiver, selected);
+          const economic = await Reflect.apply(planChangeSelector, planChangeReceiver, [selected]);
           return displayedTerms.fromEconomic(economic);
         },
         async prepareCancellationDisplayedTermsR1(input): Promise<FinancialDisplayedTermsR1> {
@@ -790,7 +790,7 @@ export async function createCanonicalHostedBillingComposition(options: {
             "reference",
             "expectedSubscriptionRef",
           ]);
-          const economic = await cancellationSelector.call(hosted, selected);
+          const economic = await Reflect.apply(cancellationSelector, hosted, [selected]);
           return displayedTerms.fromEconomic(economic);
         },
       };
