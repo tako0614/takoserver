@@ -110,7 +110,10 @@ async function settle(): Promise<void> {
 }
 /** The last button with this label: a dialog's, when a page under it has one too. */
 function button(body: TestNode, label: string): TestNode {
-  const found = body.all().findLast((node) => node.tag === "button" && node.textContent === label);
+  const found = body
+    .all()
+    .reverse()
+    .find((node) => node.tag === "button" && node.textContent === label);
   if (!found) throw new Error(`missing button: ${label}`);
   return found;
 }
