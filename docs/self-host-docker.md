@@ -182,23 +182,27 @@ A create needs a key with `resources:write`. In the same shell, with your own
 manifest URL:
 
 ```sh
+MANIFEST=https://artifacts.example.com/hello/v1/manifest.json
 WKEY=$(curl -sS --fail-with-body -H "$H" -H "authorization: Bearer $SESSION" \
     -H 'content-type: application/json' \
     --data '{"name":"writer","scopes":["resources:write"],"expiresInSeconds":86400}' \
-    "$B/v1/organizations/$ORG/api-keys" | jq -r .secret)
-MANIFEST=https://artifacts.example.com/hello/v1/manifest.json
-SHA=$(curl -sS --fail "$MANIFEST" | sha256sum | cut -d' ' -f1)
+    "$B/v1/organizations/$ORG/api-keys" | jq -er .secret) &&
+curl -sS --fail -o "$HOME/manifest.json" "$MANIFEST" &&
+SHA=$(sha256sum < "$HOME/manifest.json" | cut -d' ' -f1) &&
 OPERATION=$(jq -n --arg org "$ORG" --arg url "$MANIFEST" --arg sha "$SHA" \
     '{form: "https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/", space: $org,
       name: "hello-bundle-v1", spec: {artifact: {$url, sha256: $sha}}}' |
   curl -sS --fail-with-body -H "$H" -H "authorization: Bearer $WKEY" \
     -H 'content-type: application/json' -H 'idempotency-key: takoserver-docker-hello-bundle-v1' \
-    --data @- "$B/apis/forms.takoform.com/v2/resources" | jq -r .id)
+    --data @- "$B/apis/forms.takoform.com/v2/resources" | jq -er .id) &&
 curl -sS --fail-with-body -H "$H" -H "authorization: Bearer $WKEY" \
   "$B/apis/forms.takoform.com/v2/operations/$OPERATION" | jq -c '{status, error}'
 ```
 
-Ask for the Operation again until its `status` is `succeeded` or `failed`.
+The chain stops at the first step that fails, so a manifest that could not be
+fetched is never sent with the digest of nothing; a create that was sent and
+failed uses up its name. Ask for the Operation again until its `status` is
+`succeeded` or `failed`.
 Seeding held artifacts from local files
 ([step 6](self-host-operations.md#6-seed-held-artifacts)) needs the Host
 stopped, and in this image the Host is the container's main process, so it is
@@ -258,9 +262,10 @@ To update, in the same checkout directory:
 3. Rerun the health, discovery and support checks above.
 
 Going back means restoring the copy into a fresh volume and starting
-`takoserver-selfhost:before-<date>` with it (`compose.yaml` takes its image from
-`TAKOSERVER_DOCKER_IMAGE`), not reverting only the image. With this Host stopped,
-a new project name gives a fresh volume:
+`takoserver-selfhost:before-<stamp>` with it (`compose.yaml` takes its image from
+`TAKOSERVER_DOCKER_IMAGE`), not reverting only the image. If the env file changed
+after the copy, first put `~/takoserver-backups/takoserver-env-<stamp>` back in
+its place. With this Host stopped, a new project name gives a fresh volume:
 
 ```sh
 docker compose stop
@@ -271,9 +276,6 @@ docker compose run --rm --no-deps -T --entrypoint tar takoserver \
   -C /var/lib/takoserver -xpf - < ~/takoserver-backups/takoserver-data-$STAMP.tar
 docker compose up -d --no-build
 ```
-
-If the env file changed after the copy, put
-`~/takoserver-backups/takoserver-env-$STAMP` back in its place first.
 
 The two lines added to `.env` keep every later `docker compose` command, in any
 shell, on the restored project and the old image. A command without them would
