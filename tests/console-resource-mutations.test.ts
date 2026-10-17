@@ -168,6 +168,51 @@ async function setup(path = "/resources") {
   return { body, route, selectOrganization, principal };
 }
 
+test("a refused create says why in the dialog, and how to change the request", async () => {
+  const { body } = await setup();
+  const { createResource } = await import("../console/src/pages/create-resource.ts");
+  const posts: Request[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const url = new URL(request.url);
+      if (url.pathname.endsWith("/support"))
+        return Response.json({ form, supported: true, operations: ["create"] });
+      if (url.pathname === "/.well-known/takoform/v2") return Response.json(discovery);
+      if (request.method === "POST") {
+        posts.push(request);
+        return new Response(
+          JSON.stringify({
+            type: "about:blank",
+            title: "Conflict",
+            status: 409,
+            code: "name_conflict",
+          }),
+          { status: 409, headers: { "content-type": "application/problem+json" } },
+        );
+      }
+      return Response.json({ items: [], nextCursor: null });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  createResource("org-console");
+  await settle();
+  const inputs = body.all().filter((node) => node.tag === "input");
+  if (!inputs[0] || !inputs[1]) throw new Error("create inputs missing");
+  inputs[0].value = form;
+  inputs[1].value = "one";
+  inputs[1].emit("input");
+  button(body, "Accept create").click();
+  await settle();
+  expect(posts).toHaveLength(1);
+  // Said in the dialog, where it stays until the next attempt, not in a passing toast.
+  const alert = body.all().find((node) => node.attributes.get("role") === "alert");
+  expect(alert?.textContent).toContain(
+    "Another Resource in this organization already has that name, whatever its Form.",
+  );
+  expect(alert?.textContent).toContain("To change the request, cancel and open the dialog again.");
+});
+
 test("accepted create is not shown as complete and checking it never re-sends", async () => {
   const { body, route } = await setup();
   const { createResource } = await import("../console/src/pages/create-resource.ts");

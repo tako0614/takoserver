@@ -118,7 +118,7 @@ function dispatch(options: CreateRouterOptions, origin: string): Router {
     if (handled) return handled;
 
     if (request.method === "GET" && url.pathname === "/") {
-      return new Response(landingPage(console), {
+      return new Response(landingPage(console, origin), {
         headers: { "content-type": "text/html; charset=utf-8" },
       });
     }
@@ -169,6 +169,6 @@ function httpsOrigin(value: string): string {
   return url.origin;
 }
 
-function landingPage(consoleOrigin: string | null): string {
-  return landingHtml({ consoleOrigin, apiOrigin: null });
+function landingPage(consoleOrigin: string | null, hostOrigin: string): string {
+  return landingHtml({ consoleOrigin, apiOrigin: null, hostOrigin });
 }
