@@ -41,6 +41,55 @@ export interface SQLiteMigrationSession {
   }): Promise<SQLiteMigrationFileResult>;
 }
 
+export type SQLiteMigrationApplicationResult =
+  | { readonly kind: "complete"; readonly appliedEntries: readonly SQLiteMigrationEntry[] }
+  | {
+      readonly kind: "failure";
+      readonly code:
+        | "artifact_invalid"
+        | "migration_history_conflict"
+        | "migration_sql_error"
+        | "database_busy"
+        | "backend_unavailable";
+      readonly newlyApplied: number;
+      readonly appliedEntries: readonly SQLiteMigrationEntry[];
+    }
+  | {
+      readonly kind: "unknown";
+      readonly code: "migration_history_conflict" | "backend_unavailable";
+    };
+
+export interface SQLiteMigrationApplicationInput {
+  readonly resourceUid: string;
+  readonly execution: Parameters<
+    SQLiteMigrationApplicationPort["withAuthorizedMigrationSession"]
+  >[0]["execution"];
+  readonly stillAuthorized: () => Promise<boolean>;
+  readonly targetEntries: readonly SQLiteMigrationEntry[];
+  readonly files: readonly Uint8Array[];
+}
+
+/**
+ * Host-private remote realization. One request runs the entire verified plan
+ * under the native UID exclusion using runSQLiteMigrationApplication. The
+ * receiver independently proves the accepted identity, references and held
+ * manifest before opening the UID and before each file. A lost response is
+ * unknown; reconciliation reads the durable prefix rather than replaying SQL.
+ * Neither this port nor the session port is a tenant SQL capability.
+ */
+export type SQLiteMigrationApplicationBatchInput = Omit<
+  SQLiteMigrationApplicationInput,
+  "files"
+> & {
+  readonly fileSizes: readonly number[];
+};
+
+export interface SQLiteMigrationApplicationBatchPort {
+  applyAuthorizedMigration(
+    input: SQLiteMigrationApplicationBatchInput,
+  ): Promise<SQLiteMigrationApplicationResult>;
+}
+
 /**
  * The adapter holds one database UID's exclusion for the entire callback. The
  * callback runs in the orchestrator; only the two session operations may cross

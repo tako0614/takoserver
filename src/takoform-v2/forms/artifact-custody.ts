@@ -102,6 +102,11 @@ export interface SqlArtifactCustody<M extends { readonly files: readonly Artifac
     readonly execution: V2Execution;
     readonly targetResourceUid: string;
   }): Promise<SqlArtifactCustodyRead<M>>;
+  /** Bounded private staging read, fenced by this exact accepted leased reference. */
+  openAcceptedUnverified(input: {
+    readonly execution: V2Execution;
+    readonly targetResourceUid: string;
+  }): Promise<SqlArtifactCustodyUnverified<M>>;
   /** Internal graph read. The caller must prove its accepted graph on both sides. */
   readHeldVerified(input: SqlArtifactCustodyHeldInput): Promise<SqlArtifactCustodyRead<M>>;
   /** Internal graph-only bounded read. A caller must re-open after restart. */
@@ -636,10 +641,10 @@ export function createSqlArtifactCustody<
     };
   }
 
-  async function readVerified(input: {
+  function acceptedAuthorization(input: {
     readonly execution: V2Execution;
     readonly targetResourceUid: string;
-  }): Promise<SqlArtifactCustodyRead<M>> {
+  }) {
     const { execution, targetResourceUid } = input;
     if (!targetResourceUid) throw denied();
 
@@ -719,6 +724,15 @@ export function createSqlArtifactCustody<
         throw denied();
       return candidate;
     };
+    return authorizationRow;
+  }
+
+  async function readVerified(input: {
+    readonly execution: V2Execution;
+    readonly targetResourceUid: string;
+  }): Promise<SqlArtifactCustodyRead<M>> {
+    const { execution, targetResourceUid } = input;
+    const authorizationRow = acceptedAuthorization(input);
     const candidate = await authorizationRow();
 
     try {
@@ -737,6 +751,41 @@ export function createSqlArtifactCustody<
         throw denied();
       }
       return read;
+    } catch {
+      throw denied();
+    }
+  }
+
+  async function openAcceptedUnverified(input: {
+    readonly execution: V2Execution;
+    readonly targetResourceUid: string;
+  }): Promise<SqlArtifactCustodyUnverified<M>> {
+    const authorizationRow = acceptedAuthorization(input);
+    const candidate = await authorizationRow();
+    try {
+      const acceptedSpec = JSON.parse(String(candidate.accepted_spec_json)) as JsonObject;
+      if (canonicalJson(acceptedSpec) !== canonicalJson(input.execution.spec)) throw denied();
+      const current = async () => {
+        try {
+          const fresh = await authorizationRow();
+          return (
+            fresh.accepted_spec_json === candidate.accepted_spec_json &&
+            fresh.target_spec_json === candidate.target_spec_json &&
+            fresh.target_observed_json === candidate.target_observed_json &&
+            fresh.owner_observation_json === candidate.owner_observation_json
+          );
+        } catch {
+          return false;
+        }
+      };
+      return await openHeldUnverified({
+        targetResourceUid: input.targetResourceUid,
+        principal: input.execution.principal,
+        space: input.execution.space,
+        expectedSpec: JSON.parse(String(candidate.target_spec_json)) as JsonObject,
+        expectedObserved: JSON.parse(String(candidate.target_observed_json)) as JsonObject,
+        stillAuthorized: current,
+      });
     } catch {
       throw denied();
     }
@@ -1015,7 +1064,7 @@ export function createSqlArtifactCustody<
     }
   }
 
-  return { execute, readVerified, readHeldVerified, openHeldUnverified };
+  return { execute, readVerified, openAcceptedUnverified, readHeldVerified, openHeldUnverified };
 }
 
 function asBytes(value: unknown): Uint8Array {

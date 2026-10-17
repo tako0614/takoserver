@@ -1,6 +1,8 @@
+import { bytesDigest } from "../../json.ts";
 import type { Clock, JsonObject, Sql } from "../../ports.ts";
 import { TakoformV2Error, type V2BackendResult, type V2Execution, type V2Form } from "../types.ts";
 import type { SqlArtifactCustody } from "./artifact-custody.ts";
+import { isValidArtifactPath } from "./artifact-validation.ts";
 import { SQLITE_DATABASE_FORM_URL } from "./sqlite-database.ts";
 import {
   parseSQLiteMigrationApplicationSpec,
@@ -10,45 +12,39 @@ import {
   validateSQLiteMigrationApplicationUpdate,
 } from "./sqlite-migration-application.ts";
 import type {
+  SQLiteMigrationApplicationBatchPort,
+  SQLiteMigrationApplicationInput,
   SQLiteMigrationApplicationPort,
+  SQLiteMigrationApplicationResult,
   SQLiteMigrationEntry,
   SQLiteMigrationRecord,
   SQLiteMigrationSession,
 } from "./sqlite-migration-application-port.ts";
-import type { SQLiteMigrationManifest } from "./sqlite-migration-set.ts";
+import {
+  SQLITE_MIGRATION_SET_LIMITS,
+  type SQLiteMigrationManifest,
+} from "./sqlite-migration-set.ts";
 
 export const SQLITE_MIGRATION_APPLICATION_BACKEND_ID =
   "selfhost-v2-sqlite-migration-application-native-v1";
-type MigrationErrorCode =
-  | "artifact_invalid"
-  | "migration_history_conflict"
-  | "migration_sql_error"
-  | "database_busy"
-  | "backend_unavailable";
-
-type MigrationRunResult =
-  | { readonly kind: "complete"; readonly appliedEntries: readonly SQLiteMigrationEntry[] }
-  | {
-      readonly kind: "failure";
-      readonly code: MigrationErrorCode;
-      readonly newlyApplied: number;
-      readonly appliedEntries: readonly SQLiteMigrationEntry[];
-    }
-  | {
-      readonly kind: "unknown";
-      readonly code: "migration_history_conflict" | "backend_unavailable";
-    };
+type MigrationRunResult = SQLiteMigrationApplicationResult;
 
 export function createSQLiteMigrationApplicationForm(options: {
   readonly sql: Sql;
-  readonly migrationPort: SQLiteMigrationApplicationPort;
-  readonly custody: Pick<SqlArtifactCustody<SQLiteMigrationManifest>, "readVerified">;
+  readonly migrationPort: SQLiteMigrationApplicationPort | SQLiteMigrationApplicationBatchPort;
+  readonly custody: Pick<SqlArtifactCustody<SQLiteMigrationManifest>, "readVerified"> &
+    Partial<Pick<SqlArtifactCustody<SQLiteMigrationManifest>, "openAcceptedUnverified">>;
   readonly targetKey: string;
   readonly now?: Clock;
 }): V2Form {
   if (!options.targetKey || !options.migrationPort || !options.custody) {
     throw new TypeError("SQLiteMigrationApplication backend is incomplete");
   }
+  if (
+    "applyAuthorizedMigration" in options.migrationPort &&
+    typeof options.custody.openAcceptedUnverified !== "function"
+  )
+    throw new TypeError("SQLite remote migration requires bounded accepted artifact custody");
   const now = options.now ?? (() => new Date());
 
   async function stillAuthorized(input: V2Execution, databaseUid: string): Promise<boolean> {
@@ -130,9 +126,18 @@ export function createSQLiteMigrationApplicationForm(options: {
         message: "Database authority is unconfirmed",
       };
     }
-    let held: Awaited<ReturnType<typeof options.custody.readVerified>>;
+    const batchPort =
+      "applyAuthorizedMigration" in options.migrationPort ? options.migrationPort : undefined;
+    let held:
+      | Awaited<ReturnType<typeof options.custody.readVerified>>
+      | Awaited<ReturnType<NonNullable<typeof options.custody.openAcceptedUnverified>>>;
     try {
-      held = await options.custody.readVerified({ execution: input, targetResourceUid: setUid });
+      held = batchPort
+        ? await options.custody.openAcceptedUnverified!({
+            execution: input,
+            targetResourceUid: setUid,
+          })
+        : await options.custody.readVerified({ execution: input, targetResourceUid: setUid });
     } catch {
       return {
         kind: "unknown",
@@ -144,7 +149,8 @@ export function createSQLiteMigrationApplicationForm(options: {
       path: file.path,
       sha256: file.sha256,
     }));
-    if (held.files.length !== targetEntries.length || targetEntries.length === 0) {
+    const fileCount = "files" in held ? held.files.length : held.fileSizes.length;
+    if (fileCount !== targetEntries.length || targetEntries.length === 0) {
       return {
         kind: "no_effect",
         code: "artifact_invalid",
@@ -152,7 +158,7 @@ export function createSQLiteMigrationApplicationForm(options: {
       };
     }
     try {
-      const result = await options.migrationPort.withAuthorizedMigrationSession({
+      const migrationInput: Omit<SQLiteMigrationApplicationInput, "files"> = {
         resourceUid: databaseUid,
         execution: {
           operationId: input.operationId,
@@ -170,10 +176,20 @@ export function createSQLiteMigrationApplicationForm(options: {
           spec: input.spec,
         },
         stillAuthorized: () => stillAuthorized(input, databaseUid),
-        use(session) {
-          return applyHeldMigrations(session, targetEntries, held.files, input.operationId);
-        },
-      });
+        targetEntries,
+      };
+      const result =
+        batchPort && "fileSizes" in held
+          ? await batchPort.applyAuthorizedMigration({
+              ...migrationInput,
+              fileSizes: held.fileSizes,
+            })
+          : "withAuthorizedMigrationSession" in options.migrationPort && "files" in held
+            ? await runSQLiteMigrationApplication(options.migrationPort, {
+                ...migrationInput,
+                files: held.files,
+              })
+            : ({ kind: "unknown", code: "backend_unavailable" } as const);
       if (result.kind === "unknown") {
         return {
           kind: "unknown",
@@ -247,6 +263,49 @@ export function createSQLiteMigrationApplicationForm(options: {
       reconcile: apply,
     },
   };
+}
+
+/** Shared native batch runner. Holds one authorized session across the entire plan. */
+export async function runSQLiteMigrationApplication(
+  port: SQLiteMigrationApplicationPort,
+  input: SQLiteMigrationApplicationInput,
+): Promise<SQLiteMigrationApplicationResult> {
+  const { targetEntries, files } = input;
+  let total = 0;
+  const paths = new Set<string>();
+  if (
+    targetEntries.length === 0 ||
+    targetEntries.length > SQLITE_MIGRATION_SET_LIMITS.fileCount ||
+    files.length !== targetEntries.length
+  ) {
+    return { kind: "failure", code: "artifact_invalid", newlyApplied: 0, appliedEntries: [] };
+  }
+  for (const [index, entry] of targetEntries.entries()) {
+    const bytes = files[index];
+    if (
+      !entry ||
+      typeof entry.path !== "string" ||
+      !isValidArtifactPath(entry.path) ||
+      paths.has(entry.path) ||
+      typeof entry.sha256 !== "string" ||
+      !/^[0-9a-f]{64}$/u.test(entry.sha256) ||
+      !(bytes instanceof Uint8Array) ||
+      bytes.byteLength > SQLITE_MIGRATION_SET_LIMITS.fileBytes ||
+      total + bytes.byteLength > SQLITE_MIGRATION_SET_LIMITS.aggregateBytes ||
+      (await bytesDigest(bytes)) !== `sha256:${entry.sha256}`
+    ) {
+      return { kind: "failure", code: "artifact_invalid", newlyApplied: 0, appliedEntries: [] };
+    }
+    total += bytes.byteLength;
+    paths.add(entry.path);
+  }
+  return port.withAuthorizedMigrationSession({
+    resourceUid: input.resourceUid,
+    execution: input.execution,
+    stillAuthorized: input.stillAuthorized,
+    use: (session) =>
+      applyHeldMigrations(session, targetEntries, files, input.execution.operationId),
+  });
 }
 
 function isNativeBusy(error: unknown): boolean {

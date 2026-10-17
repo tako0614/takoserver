@@ -1130,3 +1130,18 @@ Portable core tests, self-host resource use, Hosted resource use and downstream
 Provider/application installation are separate evidence. The complete portable
 gate is necessary before integration, but is not a live qualification or a
 production activation receipt.
+
+
+The Host-private SQLiteMigrationApplication extension accepts either the
+existing authorized session port or a batch port. A remote batch realization
+receives only the pinned manifest entries and file sizes from
+`openAcceptedUnverified`, without loading the aggregate SQL bytes in the Host
+Worker. The native owner acquires each held file through fixed private accepted
+reference authority and verifies its digest, then runs
+`runSQLiteMigrationApplication`, holding the same UID
+exclusion across ledger readback and every file. It independently verifies the
+accepted Operation, current lease, both references and held manifest identity;
+it does not expose SQL, a SQLite handle or a session to tenant Workers. The
+shared runner verifies file digests before acquiring the database. Lost batch
+responses stay unknown until ordinary reconciliation reads the durable prefix.
+This extension alone does not qualify a hosted backend or staging deployment.
