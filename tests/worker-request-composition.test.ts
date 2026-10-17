@@ -1247,7 +1247,7 @@ describe("Worker original RP final-touch retained DATA", () => {
     const other = await r.f.consumers();
     expect(readWorkerRequestRetainedRpCapture(other.inputs.connection, capture)).toBeNull();
     const forged = {
-      get sql() {
+      get sql(): never {
         getterReads++;
         throw new Error("untrusted connection getter");
       },
