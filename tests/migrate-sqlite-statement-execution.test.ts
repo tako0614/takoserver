@@ -184,7 +184,7 @@ for (const existing of [false, true]) {
           return database.query(sql);
         },
       };
-      expect(MIGRATIONS.length).toBe(99);
+      expect(MIGRATIONS.length).toBe(100);
       expect(migrateSqlite(owner)).toEqual({
         applied: MIGRATIONS.map((migration) => migration.name),
         alreadyApplied: 0,
