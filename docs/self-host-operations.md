@@ -918,6 +918,8 @@ finished, so create anything that names a Resource only once that card offers
 5. Once the Deployment is Ready, create the `WorkerEndpoint` `hello-endpoint`,
    choosing `hello`. Once it is published, the overview shows the Worker's
    address, and the Endpoint page's **Output** has its `hostname`.
+6. Record the Deployment on `hello`, as step 9 describes: open `hello` and
+   choose **Record the Deployment**.
 
 ### 9. Verify
 
@@ -933,6 +935,33 @@ The Endpoint answers with the Worker's response, and readiness reports
 `degraded` flag; [Monitoring](#monitoring) explains its backlog and background
 pass sections. A restart keeps serving published Workers without a client
 republish.
+
+**Record the Deployment on the Worker.** The Host records which Deployment
+serves a ModuleWorker only when the Worker itself is applied. `hello` was
+created before its Deployment, so it still reports `ready: false` with no
+active Deployment, and a WorkerCronTrigger for it cannot finish being applied.
+Once the Endpoint answers, send the Worker's spec again unchanged. The Host
+refuses it with `409 dependency_conflict` while anything that names the Worker
+is in progress. If the Worker's WorkerEndpoint has failed or is not Ready, the
+update cannot finish and keeps the Worker busy, so nothing that names the
+Worker can be created or changed meanwhile; re-apply or delete that Endpoint
+first:
+
+```sh
+GENERATION=$(curl -sS --fail-with-body "$V2/resources/$WORKER" \
+  -H "authorization: Bearer $KEY" | jq -r .generation) &&
+{ recorded=$(curl -sS --fail-with-body -X PUT "$V2/resources/$WORKER" \
+      -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+      -H 'idempotency-key: takoserver-first-use-hello-record' \
+      -H "takoform-expected-generation: $GENERATION" --data '{"spec": {}}') ||
+    { echo "hello-record: $recorded" >&2; false; }; } &&
+wait_operation "$(printf '%s' "$recorded" | jq -r .id)" hello-record
+```
+
+`GET /resources/$WORKER` then reports `observed.ready: true`, with the
+Deployment's UID as `observed.activeDeploymentUid`. In the console, open
+`hello` and choose **Record the Deployment**; the page offers it only where
+the update can finish, and otherwise says what to do first.
 
 To ship new code, seed the new bytes under a new base URL as in step 6: stop
 the Host, put the new files in `$WORK/hello/v2`, seed them, and start it again:
@@ -964,14 +993,19 @@ updated=$(jq -nc --arg w "$WORKER" --arg v "$VERSION_V2" \
 wait_operation "$(printf '%s' "$updated" | jq -r .id)" hello-deployment-v2
 ```
 
-In the console, create `hello-bundle-v2` from `$WORK/hello-v2.json` and
-`hello-version-v2` as in step 8. Once the version is Ready, open it and choose
+In the console, create `hello-bundle-v2` from `$WORK/hello-v2.json` as in
+step 8. Then open `hello-version-v1` and choose **New version from this one**:
+it opens the create of a WorkerVersion with v1's handlers, vars and Bindings,
+and its code bundle left to choose. Choose `hello-bundle-v2`, name it
+`hello-version-v2` and accept. Once that version is Ready, open it and choose
 **Serve this version**. It opens the update of `hello-deployment` with that
 version alone at weight 10000, naming the Deployment generation the page read,
-and sends it when you accept.
+and sends it when you accept. The Worker keeps the Deployment it recorded, so
+it needs no second record.
 
 `tests/selfhost-v2-ordinary-journey-native.test.ts`
-runs this path with real Host and workerd processes and seeds through the same
+runs this path, apart from recording the Deployment on the Worker, with real
+Host and workerd processes and seeds through the same
 command; [the ordinary journey native test](#ordinary-journey-native-test-and-known-gaps)
 describes its scope and limits.
 
