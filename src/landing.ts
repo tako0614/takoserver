@@ -109,7 +109,7 @@ const landingMessages = {
     shipBody:
       "Code never changes in place. Create the new code and a version for it, then point the Deployment at that version; the Endpoint keeps its address. In the console, once the new version is Ready, choose “Serve this version” on its page; it prepares this update, which is sent when you choose Update. To go back, serve the earlier version again the same way.",
     shipBundle:
-      "holds the new worker.js, by the URL and SHA-256 of its manifest. Published over public HTTPS, it needs no restart; seeded onto the Host, it needs a restart, which stops every Worker until the Host is back.",
+      "holds the new worker.js, by the URL and SHA-256 of its manifest. Published over public HTTPS from another machine, it needs no restart; seeded onto the Host, it needs a restart, which stops every Worker until the Host is back.",
     shipVersion: "pairs the new WorkerBundle with its fetch handler.",
     shipDeploy:
       "is updated to serve hello-version-v2 at weight 10000. The update names the generation it read, so a change made in between is not overwritten.",
@@ -178,7 +178,7 @@ const landingMessages = {
     consoleTitle: "コンソールを使う",
     consoleBody:
       "コンソールでも、同じリソースをブラウザーから作成できます。Formを選ぶとこのHostが受け付ける最小の設定が入り、設定が参照するリソースは名前で選べます。「作成する」を押すまで、何も送信されません。各Workerの公開先と稼働中かどうかも表示されます。コンソールはこのリポジトリからビルドする静的アプリで、APIと並ぶ別のオリジンで配信します。",
-    consoleSetup: "コンソールを用意する（導入手順書（英語）の手順5）",
+    consoleSetup: "コンソールを用意する（英語の導入手順書の手順5）",
     consoleHost: "このHostのコンソールを開く",
     hereTitle: "ここはTakoserverのHostです",
     hereBody:
@@ -188,7 +188,7 @@ const landingMessages = {
     shipBody:
       "動いているコードは書き換えられません。新しいコードと版を作り、Deploymentをその版に切り替えます。Endpointの公開先はそのままです。コンソールでは、新しい版が稼働中になったら、そのページで「この版を配信する」を押すとこの更新が用意され、「更新する」を押すと送信されます。元に戻すときは、前の版を同じ方法で配信します。",
     shipBundle:
-      "新しいworker.jsを、そのmanifestのURLとSHA-256で指定します。公開HTTPSに置けば再起動は不要です。Hostに保持させる場合は再起動が必要で、その間はすべてのWorkerが止まります。",
+      "新しいworker.jsを、そのmanifestのURLとSHA-256で指定します。別のマシンの公開HTTPSに置けば再起動は不要です。Hostに保持させる場合は再起動が必要で、その間はすべてのWorkerが止まります。",
     shipVersion: "新しいWorkerBundleとfetchハンドラーを組み合わせた版です。",
     shipDeploy:
       "hello-version-v2を重み10000で配信するよう更新します。更新は読み取った世代を指定するので、その間に入った別の変更を上書きしません。",

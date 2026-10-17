@@ -927,19 +927,25 @@ offers **View resource**.
 6. Record the Deployment on `hello`, as step 9 describes: open `hello` and
    choose **Record the Deployment**.
 
-**Coming back later.** Steps 9 to 11 use the shell variables of steps 5 and 8.
-In a new shell, set `HOST`, `V2` and `F` again as in step 5. `ORG` is the
-**Identifier** on the console's Settings page, and a new key comes from its API
-keys page. Look up each Resource's UID by its name:
+**Coming back later.** Steps 9 to 11 use the shell variables and helpers of
+steps 5, 6 and 8. In a new shell, set `HOST`, `V2` and `F` again as in step 5
+and `WORK` as in step 6, and define `wait_operation` and `create` again from
+step 8. `ORG` is the **Identifier** on the console's Settings page, and a new
+write key comes from its API keys page. Look up each Resource's UID by its
+name; a name that is not found stops the chain:
 
 ```sh
 uid() { # uid <name>
   curl -sS --fail-with-body -G "$V2/resources" --data-urlencode "space=$ORG" \
-    --data-urlencode "name=$1" -H "authorization: Bearer $KEY" | jq -r '.items[0].uid'
+    --data-urlencode "name=$1" -H "authorization: Bearer $KEY" | jq -er '.items[0].uid'
 }
-WORKER=$(uid hello) && DEPLOYMENT=$(uid hello-deployment) &&
-VERSION=$(uid hello-version-v1) && ENDPOINT=$(uid hello-endpoint)
+WORKER=$(uid hello) && BUNDLE=$(uid hello-bundle-v1) &&
+VERSION=$(uid hello-version-v1) && DEPLOYMENT=$(uid hello-deployment) &&
+ENDPOINT=$(uid hello-endpoint)
 ```
+
+The Resources of steps 9 and 10 are found the same way, by their names, such
+as `hello-bundle-v2` and `hello-version-v2`.
 
 ### 9. Verify
 
@@ -987,10 +993,19 @@ To ship new code, put the new files in `$WORK/hello/v2` and give the Host
 their bytes in one of two ways:
 
 - **Publish them over public HTTPS**, which needs no restart. Serve the files
-  and a manifest that lists them from any HTTPS origin that the Host reaches at
-  a public address and whose DNS answers are public, for example a folder
-  behind the Caddy in front of the API. The URLs carry no query or fragment
-  and must not redirect. When the `WorkerBundle` is created, the Host fetches
+  and a manifest that lists them over HTTPS on port 443 from another machine,
+  such as object storage or a static site; port 443 on this machine belongs to
+  the Host's Endpoints, so it cannot fetch from itself. The Host fetches only:
+  - a DNS name, not an IP address, whose every answer is a public address and
+    which does not end in `.localhost`, `.local`, `.internal`, `.lan`,
+    `.home.arpa`, `.test`, `.invalid` or `.example`;
+  - over a publicly trusted certificate;
+  - a URL with no port, query or fragment, written in its normalized form;
+  - a plain `200` (no redirect), within 30 seconds for each file;
+  - a URL it does not already hold from seeding.
+
+  A manifest is at most 1 MiB, each file at most 16 MiB, and a bundle at most
+  512 files and 128 MiB. When the `WorkerBundle` is created, the Host fetches
   the manifest and each file, checks their SHA-256 and keeps the bytes. Write
   the manifest next to `worker.js`, publish both under `$BASE`, and keep the
   bundle's artifact, the manifest's URL and SHA-256, in `$WORK/hello-v2.json`:
