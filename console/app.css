@@ -261,7 +261,8 @@ textarea {
   font-weight: 600;
   letter-spacing: 0.05em;
   text-transform: uppercase;
-  color: var(--ink-4);
+  /* Small text: --ink-3 keeps it at 4.5:1 or more in both themes. */
+  color: var(--ink-3);
 }
 
 .rail__group:first-child {
@@ -385,6 +386,14 @@ textarea {
   min-width: 240px;
 }
 
+/* A page title with its state beside it, wrapping on a narrow screen. */
+.title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
 .head h1 {
   margin: 0;
   font-size: 22px;
@@ -485,7 +494,8 @@ th {
   font-weight: 600;
   letter-spacing: 0.05em;
   text-transform: uppercase;
-  color: var(--ink-4);
+  /* Small text: --ink-3 keeps it at 4.5:1 or more in both themes. */
+  color: var(--ink-3);
   padding: 10px 16px;
   border-bottom: 1px solid var(--line-1);
   white-space: nowrap;
