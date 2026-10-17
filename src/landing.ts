@@ -84,7 +84,7 @@ const landingMessages = {
     security: "Self-host security",
     deployTitle: "Deploy one Worker",
     deployBody:
-      "Five Resources, created in this order with curl over Host API v2. Each create is accepted as an Operation that you poll until it succeeds. $V2, $F, $ORG and $KEY come from step 5 of the install guide, which runs the whole chain with a small create function. No released Takoform client speaks Host API v2 yet, so today you deploy with requests like these or in the console.",
+      "Five Resources, created in this order with curl over Host API v2. Each create is accepted as an Operation that you poll until it succeeds. $V2, $F, $ORG and $KEY come from step 5 of the install guide, and step 8 runs the whole chain with a small create function. No released Takoform client speaks Host API v2 yet, so today you deploy with requests like these or in the console.",
     createLabel:
       "Each create is one POST. Sent again with the same idempotency-key within 24 hours, it returns the same Operation instead of a second Worker.",
     workerStep: "is the Worker itself. Its versions, deployment and endpoint refer to it.",
@@ -107,9 +107,9 @@ const landingMessages = {
     hereNoConsole: "This Host serves no console yet.",
     shipTitle: "Ship a new version",
     shipBody:
-      "Code never changes in place. Create the new code and a version for it, then point the Deployment at that version; the Endpoint keeps its address. In the console, once the new version is Ready, choose “Serve this version” on its page; it prepares this update, which is sent when you choose Update.",
+      "Code never changes in place. Create the new code and a version for it, then point the Deployment at that version; the Endpoint keeps its address. In the console, once the new version is Ready, choose “Serve this version” on its page; it prepares this update, which is sent when you choose Update. To go back, serve the earlier version again the same way.",
     shipBundle:
-      "holds the new worker.js, by the URL and SHA-256 of its manifest (a seeded bundle needs a Host restart first).",
+      "holds the new worker.js, by the URL and SHA-256 of its manifest. Published over public HTTPS from another machine, it needs no restart; seeded onto the Host, it needs a restart, which stops every Worker until the Host is back.",
     shipVersion: "pairs the new WorkerBundle with its fetch handler.",
     shipDeploy:
       "is updated to serve hello-version-v2 at weight 10000. The update names the generation it read, so a change made in between is not overwritten.",
@@ -125,7 +125,7 @@ const landingMessages = {
     skip: "本文へ移動",
     lead: "Takoformを、\n自分のクラウドへ。",
     lede: "Takoserverは、自分のLinuxマシンで動かすオープンソースのクラウドです。WorkerとそのSQLite・KV・オブジェクトストレージ・キューを、Takoformの定義からデプロイして運用できます。",
-    install: "導入手順を読む",
+    install: "導入手順を読む（英語）",
     source: "ソースコード",
     preview: "Takoserver Consoleのリソース一覧（公開用サンプルデータ）",
     previewAlt:
@@ -154,7 +154,7 @@ const landingMessages = {
     hostStep3:
       "HTTPSを用意します。Worker用に、*.apps.example.comのようなワイルドカードのDNS名と証明書を用意します。ワイルドカード証明書はDNSチャレンジで発行するため、DNSプロバイダーのAPIが必要です。443番はHost自身がWorkerの配信に使うので、APIはCaddyなどのフロントエンドの背後に、8443番など別のポートで置きます。",
     hostStep4:
-      "設定を書いて起動します。常に必要な設定は3つで、Worker実行環境とHTTPSにはそれぞれ追加の設定があります（導入手順書の手順3）。Worker実行環境の設定が一部でも欠けると、Worker関連のFormは提供されません。IDプロバイダーが未設定なら、初回起動時に一度だけ使える運営者サインイン用のassertionが表示されます。",
+      "設定を書いて起動します。常に必要な設定は3つで、Worker実行環境とHTTPSにはそれぞれ追加の設定があります（導入手順書の手順3）。Worker実行環境の設定が一部でも欠けると、Worker関連のFormは提供されません。IDプロバイダーが未設定なら、初回起動時に、一度だけ使える運営者のサインイン用アサーションが表示されます。",
     hostNote:
       "Worker実行環境と443番がなくても、Hostは成果物を保持し、API・サインイン・組織・APIキーを提供します。そこまでを手早く試すならDockerを使えます。",
     releases: "Takoserver 2.0.0-rc.1（プレリリース）",
@@ -173,12 +173,12 @@ const landingMessages = {
     deploymentStep: "どの版を配信するかを決めます。ここでは1つの版を重み10000で配信します。",
     endpointStep: "WorkerをHTTPSのホスト名で公開します。",
     resultLabel: "公開したら、Endpointの作成で返ったUIDを$ENDPOINTに入れてリクエストします。",
-    deployMore: "手順書の手順6〜9",
+    deployMore: "手順書（英語）の手順6〜9",
     afterTitle: "デプロイしたあと",
     consoleTitle: "コンソールを使う",
     consoleBody:
       "コンソールでも、同じリソースをブラウザーから作成できます。Formを選ぶとこのHostが受け付ける最小の設定が入り、設定が参照するリソースは名前で選べます。「作成する」を押すまで、何も送信されません。各Workerの公開先と稼働中かどうかも表示されます。コンソールはこのリポジトリからビルドする静的アプリで、APIと並ぶ別のオリジンで配信します。",
-    consoleSetup: "コンソールを用意する（導入手順書の手順5）",
+    consoleSetup: "コンソールを用意する（英語の導入手順書の手順5）",
     consoleHost: "このHostのコンソールを開く",
     hereTitle: "ここはTakoserverのHostです",
     hereBody:
@@ -186,13 +186,13 @@ const landingMessages = {
     hereNoConsole: "このHostにはまだコンソールがありません。",
     shipTitle: "新しい版を出す",
     shipBody:
-      "動いているコードは書き換えられません。新しいコードと版を作り、Deploymentをその版に切り替えます。Endpointの公開先はそのままです。コンソールでは、新しい版が稼働中になったら、そのページで「この版を配信する」を押すとこの更新が用意され、「更新する」を押すと送信されます。",
+      "動いているコードは書き換えられません。新しいコードと版を作り、Deploymentをその版に切り替えます。Endpointの公開先はそのままです。コンソールでは、新しい版が稼働中になったら、そのページで「この版を配信する」を押すとこの更新が用意され、「更新する」を押すと送信されます。元に戻すときは、前の版を同じ方法で配信します。",
     shipBundle:
-      "新しいworker.jsを、そのmanifestのURLとSHA-256で指定します（Hostに保持させた場合は、先にHostを再起動します）。",
+      "新しいworker.jsを、そのmanifestのURLとSHA-256で指定します。別のマシンの公開HTTPSに置けば再起動は不要です。Hostに保持させる場合は再起動が必要で、その間はすべてのWorkerが止まります。",
     shipVersion: "新しいWorkerBundleとfetchハンドラーを組み合わせた版です。",
     shipDeploy:
       "hello-version-v2を重み10000で配信するよう更新します。更新は読み取った世代を指定するので、その間に入った別の変更を上書きしません。",
-    shipMore: "手順書の手順9",
+    shipMore: "手順書（英語）の手順9",
     reference: "Host API v2 リファレンス",
     openapi: "OpenAPI仕様",
     discovery: "Takoform Hostディスカバリー",
@@ -311,7 +311,7 @@ h1 { margin: 0; font-family: var(--display); font-size: clamp(42px, 5.5vw, 68px)
 .here { margin: 40px auto 0; max-width: 760px; padding: 28px 32px; text-align: left; background: var(--surface-2); border: 1px solid var(--line-1); border-radius: 18px; }
 .here h2 { font-size: clamp(22px, 2.4vw, 28px); }
 .here p { margin: 12px 0 0; color: var(--ink-2); font-size: 15px; }
-.here .address { overflow-wrap: anywhere; color: var(--ink-1); }
+.here .address { overflow-wrap: break-word; color: var(--ink-1); }
 .here .actions { margin-top: 20px; }
 
 .preview { margin: 64px 0 0; }
@@ -469,7 +469,7 @@ export function landingHtml(options: LandingOptions): string {
     : `<section class="here" aria-labelledby="here-title">
 ${text("hereTitle", "h2", ' id="here-title"')}
 ${text("hereBody", "p")}
-<p class="address"><code>${hostAddress}/apis/forms.takoform.com/v2</code></p>
+<p class="address"><code>${hostAddress}/<wbr>apis/<wbr>forms.takoform.com/<wbr>v2</code></p>
 ${
   options.consoleOrigin
     ? `<div class="actions start"><a class="pill primary external" href="${options.consoleOrigin}" data-i18n="consoleHost">${copy.consoleHost}</a></div>`
@@ -554,7 +554,8 @@ ${text("hostTitle", "h2", ' id="start-title"')}
 <ol class="steps">
 <li>${text("hostStep1", "p")}<pre>git clone ${REPOSITORY}
 cd takoserver
-git checkout --detach &lt;reviewed-commit&gt;
+COMMIT=$(git rev-parse origin/main)
+git checkout --detach "$COMMIT"
 bun install --frozen-lockfile</pre></li>
 <li>${text("hostStep2", "p")}<p class="more"><a href="${WORKERD_RELEASE}" data-i18n="releases">${copy.releases}</a></p></li>
 <li>${text("hostStep3", "p")}</li>
