@@ -3,22 +3,27 @@ import * as financialRequestOrigin from "@takoserver/core/financial-request-orig
 import sharedPricing from "../config/shared-hosted-pricing.json";
 import { moneyFenceInstallSql } from "../scripts/deploy/schema-money-unit-cutover.ts";
 import { assertAuthTokenCaptureReader } from "../src/auth.ts";
-import { additiveAuthTokenDDL } from "../src/auth-authority-schema-plan.ts";
+import { additiveAuthDDL, additiveAuthTokenDDL } from "../src/auth-authority-schema-plan.ts";
+import { createCredentialAuthorityClassStore } from "../src/credential-authority-class.ts";
 import { createWorkerEntry, type WorkerEnv } from "../src/entry-worker.ts";
 import { verifyHostedBillingFinancialRealm } from "../src/hosted-billing-realm.ts";
 import { compilePricingAuthoring } from "../src/hosted-pricing.ts";
+import { bytesDigest } from "../src/json.ts";
 import {
   MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL,
   MONEY_CUTOVER_FREEZE_DDL,
   MONEY_CUTOVER_PERMIT_DDL,
   MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
 } from "../src/money-cutover-sql.ts";
-import type { SqlParam, SqlStatement, SqlWrite } from "../src/ports.ts";
+import type { Clock, SqlParam, SqlStatement, SqlWrite } from "../src/ports.ts";
 import { createRouter } from "../src/router.ts";
 import { SHARED_AUTH_STAGING_PROFILE } from "../src/shared-auth-oidc-client.ts";
+import { createSharedAuthSessionStore } from "../src/shared-auth-session-store.ts";
+import { createSharedPrincipalAuthorityStore } from "../src/shared-principal-authority.ts";
 import type { D1DatabaseLike, D1ResultLike, D1StatementLike } from "../src/sql-d1.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
 import {
+  captureWorkerRequestRetainedRpSession,
   captureWorkerSharedAuthStaging,
   createWorkerPrimaryRequestSql,
   createWorkerRequestConsumers,
@@ -27,8 +32,10 @@ import {
   readWorkerRequestConsumers,
   readWorkerRequestFinancialAuthSchemaObservation,
   readWorkerRequestFinancialInputs,
+  readWorkerRequestRetainedRpCapture,
   type WorkerRequestDatabase,
   type WorkerRequestSql,
+  type WorkerSharedAuthStaging,
 } from "../src/worker-request-composition.ts";
 import {
   createHostedBillingRealmTestDatabase,
@@ -37,6 +44,14 @@ import {
 } from "./helpers/hosted-billing-realm-fixture.ts";
 
 import { SHARED_AUTH_TEST_ONLY_DDL } from "./helpers/shared-auth-session-fixture.ts";
+import {
+  createSharedSessionTestIssuer,
+  SESSION_TEST_ACCOUNT,
+  SESSION_TEST_CONFIG,
+  SESSION_TEST_CONSOLE,
+  SESSION_TEST_ORGANIZATION,
+  SESSION_TEST_PERSONAL,
+} from "./helpers/shared-auth-session-issuer.ts";
 
 const WRITER = `sha256:${"a".repeat(64)}`;
 const ACCOUNT = "acct_requestComposition";
@@ -95,7 +110,11 @@ afterEach(() => {
 });
 
 /** Real owning schema and SQLite execution; this structural binding is not native D1 proof. */
-async function fixture(shape?: (result: SqlWrite) => D1ResultLike) {
+async function fixture(
+  shape?: (result: SqlWrite) => D1ResultLike,
+  selectedSharedAuth?: WorkerSharedAuthStaging,
+  selectedClock?: Clock,
+) {
   const database = await createHostedBillingRealmTestDatabase();
   close.add(() => database.db.close());
   for (const ddl of SHARED_AUTH_TEST_ONLY_DDL) database.db.exec(ddl);
@@ -186,19 +205,21 @@ async function fixture(shape?: (result: SqlWrite) => D1ResultLike) {
       });
     },
   });
-  const profile = captureWorkerSharedAuthStaging({
-    kind: "shared-auth-staging-v1",
-    clientSecret: "test-only-request-rp-secret",
-    encryptionKey: new Uint8Array(32).fill(7),
-    principals: {
-      async resolve() {
-        throw new Error("test grants no principal authority");
+  const profile = captureWorkerSharedAuthStaging(
+    selectedSharedAuth ?? {
+      kind: "shared-auth-staging-v1",
+      clientSecret: "test-only-request-rp-secret",
+      encryptionKey: new Uint8Array(32).fill(7),
+      principals: {
+        async resolve() {
+          throw new Error("test grants no principal authority");
+        },
+      },
+      async fetch() {
+        throw new Error("test permits no Accounts transport");
       },
     },
-    async fetch() {
-      throw new Error("test permits no Accounts transport");
-    },
-  });
+  );
   async function consumers() {
     const connection = await connect();
     const realm = await verifyHostedBillingFinancialRealm({
@@ -218,7 +239,7 @@ async function fixture(shape?: (result: SqlWrite) => D1ResultLike) {
           throw new Error("test grants no identity");
         },
       },
-      clock: () => new Date(HOSTED_BILLING_REALM_TEST_INSTANT),
+      clock: selectedClock ?? (() => new Date(HOSTED_BILLING_REALM_TEST_INSTANT)),
       randomId: () => crypto.randomUUID(),
       publicOrigin: SHARED_AUTH_STAGING_PROFILE.publicOrigin,
       consoleOrigin: SHARED_AUTH_STAGING_PROFILE.consoleOrigin,
@@ -994,4 +1015,370 @@ describe("Worker primary Auth schema observations", () => {
     expect(getterCalls).toBe(0);
     expect(f.sessions.map((session) => session.queries.length)).toEqual(before);
   });
+});
+
+// Component-only retained rows/projection, with real signed OIDC callback,
+// encrypted session and strict RP final touch. No target/human qualification.
+async function retainedRpFixture(withClass = true) {
+  const stamp = Date.now();
+  const issuer = await createSharedSessionTestIssuer(() => stamp);
+  const principalId = "prn_retained_rp_component";
+  const control: {
+    onResult?: (result: SqlWrite) => D1ResultLike | undefined;
+    onPin?: () => Promise<void>;
+  } = {};
+  const f = await fixture(
+    (result) => control.onResult?.(result) ?? acknowledgement(result),
+    {
+      kind: "shared-auth-staging-v1",
+      clientSecret: SESSION_TEST_CONFIG.clientSecret,
+      encryptionKey: new Uint8Array(32).fill(7),
+      principals: {
+        async resolve() {
+          return { accountId: SESSION_TEST_ACCOUNT, principalId };
+        },
+      },
+      organizations: {
+        async pin(input) {
+          await control.onPin?.();
+          return input;
+        },
+      },
+      fetch: issuer.send,
+    },
+    () => new Date(stamp),
+  );
+  f.db.exec(additiveAuthDDL);
+  const createdAt = new Date(stamp).toISOString();
+  await f.sql.run(
+    "INSERT INTO principals(id,provider,provider_subject,email,display_name,created_at) VALUES (?,'google',?,'component@example.test','Component',?)",
+    [principalId, SESSION_TEST_ACCOUNT, createdAt],
+  );
+  const binding = await createSharedPrincipalAuthorityStore({ sql: f.sql }).bindLegacy({
+    principalId,
+    principalIncarnation: "principal_inc_retained_rp_component",
+    provider: "google",
+    providerSubject: SESSION_TEST_ACCOUNT,
+    createdAt,
+    origin: { ref: "synthetic:rp-origin", digest: `sha256:${"a".repeat(64)}` },
+    binding: {
+      ref: "binding_retained_rp_component",
+      issuer: SESSION_TEST_CONFIG.issuer,
+      subject: SESSION_TEST_ACCOUNT,
+      controllerIncarnation: "synthetic:controller-incarnation",
+      targetRef: "synthetic:unregistered-rp-target",
+      evidence: { ref: "synthetic:rp-evidence", digest: `sha256:${"b".repeat(64)}` },
+      enrolledAt: createdAt,
+    },
+  });
+  const open = f.binding.withSession;
+  if (!open) throw new Error("missing native session factory");
+  let native: D1DatabaseLike | undefined;
+  f.binding.withSession = function (constraint) {
+    const session: D1DatabaseLike = Reflect.apply(open, this, [constraint]);
+    native = session;
+    return session;
+  };
+  const { inputs, runtime } = await f.consumers();
+  const login = await runtime.sharedAuth.fetch(
+    new Request(`${SESSION_TEST_CONFIG.publicOrigin}/auth/oidc/login`),
+  );
+  const location = login?.headers.get("location");
+  if (!login || login.status !== 303 || !location) throw new Error("real RP login did not start");
+  const cookieFrom = (response: Response, name: string) => {
+    const selected = response.headers
+      .getSetCookie()
+      .map((item) => item.split(";")[0] ?? "")
+      .find((item) => item.startsWith(`${name}=`));
+    if (!selected) throw new Error("missing actual RP cookie");
+    return selected;
+  };
+  const callback = await runtime.sharedAuth.fetch(
+    new Request(issuer.authorize(location), {
+      headers: { cookie: cookieFrom(login, "__Host-takoserver_oidc_attempt") },
+    }),
+  );
+  if (!callback || callback.status !== 303)
+    throw new Error("real signed callback did not complete");
+  const cookie = cookieFrom(callback, "__Host-takoserver_shared_session");
+  const digest = await bytesDigest(new TextEncoder().encode(cookie.slice(cookie.indexOf("=") + 1)));
+  const session = await createSharedAuthSessionStore(inputs.sql).readSession(digest);
+  if (!session) throw new Error("real RP session row is missing");
+  const origin = {
+    ref: "authority_retained_rp_component",
+    incarnation: "credential_inc_retained_rp_component",
+    targetRef: binding.targetRef,
+    principalId,
+    principalIncarnation: binding.principalIncarnation,
+    issuanceRef: "synthetic:rp-original-issuance",
+    issuanceDigest: digest,
+    issuedAt: createdAt,
+  };
+  const classes = createCredentialAuthorityClassStore({ sql: inputs.sql });
+  if (withClass)
+    await inputs.sql.batch([
+      classes.sharedRpIssuanceStatement(
+        origin,
+        {
+          principalBindingRef: binding.ref,
+          registrationRef: "synthetic:original-registration",
+          registrationDigest: `sha256:${"c".repeat(64)}`,
+          sessionDigest: digest,
+          sessionCreatedAt: session.createdAt,
+          enrolledSessionVersion: session.version,
+          issuer: SESSION_TEST_CONFIG.issuer,
+          clientId: SESSION_TEST_CONFIG.clientId,
+          subject: SESSION_TEST_ACCOUNT,
+          issuerSessionId: issuer.sessionId,
+          authTime: issuer.authTime,
+          accountId: SESSION_TEST_ACCOUNT,
+          workspaceId: session.workspaceId,
+          workspaceRef: "synthetic:original-personal-workspace-ref",
+        },
+        "synthetic:credential-row-org",
+      ),
+    ]);
+  const request = () =>
+    new Request(`${SESSION_TEST_CONFIG.publicOrigin}/control/rp-component`, {
+      method: "POST",
+      headers: { cookie, origin: SESSION_TEST_CONSOLE },
+      body: "private component request body",
+    });
+  const capture = (connection = inputs.connection) =>
+    captureWorkerRequestRetainedRpSession(connection, request(), SESSION_TEST_ORGANIZATION.id);
+  const lastSql = () => f.sessions.at(-1)?.queries.at(-1) ?? "";
+  const read = (value: unknown) => readWorkerRequestRetainedRpCapture(inputs.connection, value);
+  return {
+    f,
+    inputs,
+    runtime,
+    issuer,
+    control,
+    binding,
+    origin,
+    classes,
+    digest,
+    request,
+    capture,
+    read,
+    lastSql,
+    native: () => {
+      if (!native) throw new Error("native session missing");
+      return native;
+    },
+  };
+}
+
+describe("Worker original RP final-touch retained DATA", () => {
+  test("actual ACK postimage, original class and selected scope stay distinct", async () => {
+    const r = await retainedRpFixture();
+    const request = r.request();
+    const capture = await captureWorkerRequestRetainedRpSession(
+      r.inputs.connection,
+      request,
+      SESSION_TEST_ORGANIZATION.id,
+    );
+    expect(capture).not.toBeNull();
+    const data = r.read(capture);
+    if (!data) throw new Error("missing actual retained RP data");
+    const queries = r.f.sessions[0]?.queries ?? [];
+    let lastTouch = -1;
+    for (let index = 0; index < queries.length; index++) {
+      if (queries[index]?.startsWith("UPDATE shared_auth_sessions SET last_used_at"))
+        lastTouch = index;
+    }
+    if (lastTouch < 0) throw new Error("actual final touch did not execute");
+    expect(queries.slice(lastTouch + 1)).toHaveLength(2);
+    expect(queries.slice(lastTouch + 1).every((sql) => sql.startsWith("SELECT "))).toBe(true);
+    const row = await createSharedAuthSessionStore(r.inputs.sql).readSession(r.digest);
+    expect(data.current.version).toBe(2);
+    expect(row?.version).toBe(data.current.version);
+    expect(row?.lastUsedAt).toBe(data.current.lastUsedAt);
+    expect(row?.absoluteExpiresAt).toBe(data.current.absoluteExpiresAt);
+    expect(data.record.rp.enrolledSessionVersion).toBe(0);
+    expect(data.record.rp.principalBindingRef).toBe(r.binding.ref);
+    expect(data.record.rp.registrationRef).toBe("synthetic:original-registration");
+    expect(data.record.rp.registrationDigest).toBe(`sha256:${"c".repeat(64)}`);
+    expect(data.record.rp.workspaceId).toBe(SESSION_TEST_PERSONAL.id);
+    expect(data.finalSession.sessionWorkspaceId).toBe(SESSION_TEST_PERSONAL.id);
+    expect(data.finalSession.selectedWorkspaceId).toBe(SESSION_TEST_ORGANIZATION.id);
+    expect(data.record.organizationId).toBe("synthetic:credential-row-org");
+    expect(data.selectedScope).toEqual({
+      workspaceId: SESSION_TEST_ORGANIZATION.id,
+      workspaceRef: "immutable-shared-workspace-ref-456",
+      organizationId: "retained-takoserver-organization-789",
+    });
+    expect(r.f.sessions).toHaveLength(1);
+    for (const value of [
+      capture,
+      data,
+      data.record,
+      data.current,
+      data.finalSession,
+      data.selectedScope,
+    ])
+      expect(Object.isFrozen(value)).toBe(true);
+    expect(JSON.stringify(capture)).toBe("{}");
+    const serialized = JSON.stringify(data);
+    expect(serialized).not.toContain(r.issuer.issued[0]?.accessToken ?? "missing-access");
+    expect(serialized).not.toContain(r.issuer.issued[0]?.refreshToken ?? "missing-refresh");
+    expect(request.bodyUsed).toBe(false);
+    expect(await request.text()).toBe("private component request body");
+    expect(r.read({ ...capture })).toBeNull();
+    let getterReads = 0;
+    expect(
+      r.read({
+        get record() {
+          getterReads++;
+          throw new Error("untrusted capture getter");
+        },
+      }),
+    ).toBeNull();
+    expect(getterReads).toBe(0);
+    const other = await r.f.consumers();
+    expect(readWorkerRequestRetainedRpCapture(other.inputs.connection, capture)).toBeNull();
+    const forged = {
+      get sql() {
+        getterReads++;
+        throw new Error("untrusted connection getter");
+      },
+      moneyGuard: r.inputs.connection.moneyGuard,
+    };
+    await expect(r.capture(forged)).rejects.toThrow("not been constructed");
+    expect(getterReads).toBe(0);
+    const before = r.f.sessions[0]?.queries.length;
+    await expect(r.capture({ ...r.inputs.connection })).rejects.toThrow("not been constructed");
+    expect(r.f.sessions[0]?.queries.length).toBe(before);
+    expect(() =>
+      Object.defineProperty(r.runtime.sharedAuth, "finalSessionSelection", {
+        value: () => data.finalSession,
+      }),
+    ).toThrow();
+  });
+
+  test("no retained class issues nothing; a changed row Workspace cannot become selected scope", async () => {
+    const missing = await retainedRpFixture(false);
+    expect(await missing.capture()).toBeNull();
+    expect(
+      await missing.inputs.sql.query("SELECT count(*) AS n FROM credential_authority_classes"),
+    ).toEqual([{ n: 0 }]);
+    const mismatch = await retainedRpFixture();
+    expect(
+      (
+        await mismatch.inputs.sql.run(
+          "UPDATE shared_auth_sessions SET workspace_id=? WHERE digest=?",
+          [SESSION_TEST_ORGANIZATION.id, mismatch.digest],
+        )
+      ).changes,
+    ).toBe(1);
+    expect(await mismatch.capture()).toBeNull();
+  });
+
+  for (const ack of ["failed", "unknown"] as const) {
+    test(`${ack} final-touch ACK stops before retained read without retouch`, async () => {
+      const r = await retainedRpFixture();
+      let faultReached = false;
+      let classReads = 0;
+      let touches = 0;
+      r.control.onResult = (result) => {
+        if (
+          r.lastSql().startsWith("SELECT * FROM credential_authority_classes WHERE session_digest")
+        )
+          classReads++;
+        if (r.lastSql().startsWith("UPDATE shared_auth_sessions SET last_used_at")) {
+          touches++;
+          faultReached = result.rows[0]?.digest === r.digest;
+          if (ack === "failed") throw new Error("synthetic final-touch failure");
+          return { results: result.rows, meta: { changes: result.changes } };
+        }
+        return undefined;
+      };
+      await expect(r.capture()).rejects.toMatchObject({ code: "session_unavailable" });
+      expect(faultReached).toBe(true);
+      expect(touches).toBe(1);
+      expect(classReads).toBe(0);
+    });
+  }
+
+  test("retirement during the retained read refuses NEW data and preserves original history", async () => {
+    const r = await retainedRpFixture();
+    const original = await r.capture();
+    expect(original).not.toBeNull();
+    const originalData = r.read(original);
+    let retired = false;
+    r.control.onResult = () => {
+      if (
+        !retired &&
+        r.lastSql().startsWith("SELECT * FROM credential_authority_classes WHERE session_digest")
+      ) {
+        retired = true;
+        r.f.db
+          .query(
+            "UPDATE credential_authority_classes SET state='retired',terminal_reason='component-race',terminal_at=?,terminal_ref='component-race' WHERE authority_ref=?",
+          )
+          .run(new Date().toISOString(), r.origin.ref);
+      }
+      return undefined;
+    };
+    expect(await r.capture()).toBeNull();
+    expect(retired).toBe(true);
+    expect(r.read(original)).toBe(originalData);
+    expect(originalData?.record.state).toBe("active");
+  });
+
+  for (const method of [
+    "query",
+    "query callable",
+    "prepare",
+    "captureAuthenticatedToken",
+  ] as const) {
+    test(`replacement ${method} getter during retained read refuses without invoking it`, async () => {
+      const r = await retainedRpFixture();
+      let changed = false;
+      let getterReads = 0;
+      let replacementCalls = 0;
+      let currentnessReads = 0;
+      const receiver =
+        method === "query" || method === "query callable"
+          ? r.inputs.sql
+          : method === "prepare"
+            ? r.native()
+            : r.runtime.accounts;
+      r.control.onResult = () => {
+        if (r.lastSql().startsWith("SELECT CASE WHEN ")) currentnessReads++;
+        if (
+          !changed &&
+          r.lastSql().startsWith("SELECT * FROM credential_authority_classes WHERE session_digest")
+        ) {
+          changed = true;
+          Object.defineProperty(
+            receiver,
+            method === "query callable" ? "query" : method,
+            method === "query callable"
+              ? {
+                  configurable: true,
+                  value: async () => {
+                    replacementCalls++;
+                    throw new Error("replacement callable must not execute");
+                  },
+                }
+              : {
+                  configurable: true,
+                  get() {
+                    getterReads++;
+                    throw new Error("replacement getter must not execute");
+                  },
+                },
+          );
+        }
+        return undefined;
+      };
+      await expect(r.capture()).rejects.toThrow();
+      expect(changed).toBe(true);
+      expect(getterReads).toBe(0);
+      expect(replacementCalls).toBe(0);
+      expect(currentnessReads).toBe(0);
+      expect(r.f.sessions).toHaveLength(1);
+    });
+  }
 });

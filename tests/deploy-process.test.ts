@@ -1,10 +1,12 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 
 // takos-secret-scan: synthetic
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  createDeployProcess,
+  type DeployProcessStage,
   parseWranglerAuthToken,
   REPOSITORY,
   resolveCloudflareCredential,
@@ -273,3 +275,127 @@ function findFilesContaining(root: string, secret: string): string[] {
   visit(root);
   return files;
 }
+
+describe("opt-in deploy process stage observations", () => {
+  test("observes completion facts without command, input, environment or output values", async () => {
+    const events: DeployProcessStage[] = [];
+    const sentinel = "synthetic-stage-payload-must-not-cross";
+    const context = createDeployProcess({
+      repositoryRoot: REPOSITORY,
+      onStage: (event) => {
+        events.push(event);
+      },
+    });
+    const result = await context.run(
+      [
+        "bun",
+        "-e",
+        "console.log(await new Response(Bun.stdin.stream()).text()); console.error(process.env.PROCESS_STAGE_SENTINEL);",
+      ],
+      { input: sentinel, env: { PROCESS_STAGE_SENTINEL: sentinel } },
+    );
+    expect(result).toEqual({ exitCode: 0, stdout: `${sentinel}\n`, stderr: `${sentinel}\n` });
+    expect(events.map((event) => event.stage).slice(0, 3)).toEqual([
+      "spawn-started",
+      "spawned",
+      "input-ended",
+    ]);
+    expect(
+      events
+        .map((event) => event.stage)
+        .slice(3, -1)
+        .sort(),
+    ).toEqual(["child-exited", "stderr-eof", "stdout-eof"]);
+    expect(events.at(-1)?.stage).toBe("complete");
+    expect(events.every((event) => Object.isFrozen(event))).toBe(true);
+    expect(events.every((event) => Number.isFinite(event.elapsedMs) && event.elapsedMs >= 0)).toBe(
+      true,
+    );
+    expect(events.every((event) => Object.keys(event).join(",") === "stage,elapsedMs")).toBe(true);
+    expect(JSON.stringify(events)).not.toContain(sentinel);
+  });
+
+  test("observer mutation cannot change the original stdin mode or bytes", async () => {
+    const original = "original-input-before-observation";
+    const replacement = "observer-replacement-must-not-reach-child";
+    const options: { input?: string } = { input: original };
+    const context = createDeployProcess({
+      repositoryRoot: REPOSITORY,
+      onStage(event) {
+        if (event.stage === "spawn-started") delete options.input;
+        if (event.stage === "spawned") options.input = replacement;
+      },
+    });
+    const result = await context.run(
+      ["bun", "-e", "console.log(await new Response(Bun.stdin.stream()).text());"],
+      options,
+    );
+    expect(options.input).toBe(replacement);
+    expect(result).toEqual({ exitCode: 0, stdout: `${original}\n`, stderr: "" });
+  });
+
+  test("a throwing observer cannot interrupt an already spawned child or mask nonzero exit", async () => {
+    const stages: string[] = [];
+    const context = createDeployProcess({
+      repositoryRoot: REPOSITORY,
+      onStage: (event) => {
+        stages.push(event.stage);
+        throw new Error("diagnostic observer failure");
+      },
+    });
+    const result = await context.run([
+      "bun",
+      "-e",
+      "console.log('original stdout'); console.error('original stderr'); process.exit(7);",
+    ]);
+    expect(result).toEqual({
+      exitCode: 7,
+      stdout: "original stdout\n",
+      stderr: "original stderr\n",
+    });
+    expect(stages.at(-1)).toBe("complete");
+  });
+
+  test("a rejected async observer is contained while the original process completes", async () => {
+    const stages: string[] = [];
+    const context = createDeployProcess({
+      repositoryRoot: REPOSITORY,
+      async onStage(event) {
+        stages.push(event.stage);
+        throw new Error("async diagnostic observer failure");
+      },
+    });
+    expect(await context.run(["bun", "-e", "process.exit(0)"])).toEqual({
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+    });
+    expect(stages.at(-1)).toBe("complete");
+  });
+
+  test("spawn failure retains its original Error despite a failing observer", async () => {
+    const events: DeployProcessStage[] = [];
+    const original = new Error("synthetic original spawn failure");
+    const spawn = spyOn(Bun, "spawn").mockImplementation(() => {
+      throw original;
+    });
+    try {
+      const context = createDeployProcess({
+        repositoryRoot: REPOSITORY,
+        onStage: (event) => {
+          events.push(event);
+          throw new Error("observer must not replace spawn failure");
+        },
+      });
+      const failure: unknown = await context
+        .run(["/nonexistent/synthetic-stage-private-argument"])
+        .catch((error: unknown) => error);
+      expect(failure).toBe(original);
+      expect(events.map((event) => event.stage)).toEqual(["spawn-started", "spawn-failed"]);
+      expect(JSON.stringify(events)).not.toContain("synthetic-stage-private-argument");
+      expect(JSON.stringify(events)).not.toContain(original.message);
+    } finally {
+      spawn.mockRestore();
+    }
+  });
+});

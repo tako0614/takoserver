@@ -17,6 +17,24 @@ export type DeployProcess = (
   options?: { readonly env?: Readonly<Record<string, string>>; readonly input?: string },
 ) => Promise<CommandResult>;
 
+/** Finite lifecycle observations only; no command, credential or output values. */
+export interface DeployProcessStage {
+  readonly stage:
+    | "spawn-started"
+    | "spawned"
+    | "spawn-failed"
+    | "input-ended"
+    | "input-failed"
+    | "child-exited"
+    | "child-exit-failed"
+    | "stdout-eof"
+    | "stdout-read-failed"
+    | "stderr-eof"
+    | "stderr-read-failed"
+    | "complete";
+  readonly elapsedMs: number;
+}
+
 export interface DeployProcessContext {
   readonly repositoryRoot: string;
   readonly wranglerPath: string;
@@ -35,32 +53,97 @@ export interface DeployProcessContext {
 export function createDeployProcess(input: {
   readonly repositoryRoot: string;
   readonly wranglerPath?: string;
+  /** Scope an observer to this context; its failure never changes the command outcome. */
+  readonly onStage?: (event: DeployProcessStage) => void;
 }): DeployProcessContext {
   const repositoryRoot = resolve(input.repositoryRoot);
   const wranglerPath = resolve(
     input.wranglerPath ?? resolve(repositoryRoot, "node_modules/.bin/wrangler"),
   );
+  const onStage = input.onStage;
+  if (onStage !== undefined && typeof onStage !== "function")
+    throw new TypeError("a deploy process stage observer must be callable");
   const run: DeployProcess = async (command, options = {}) => {
     const [executable, ...args] = command;
     if (executable === undefined) throw new TypeError("a command is required");
-    const child = Bun.spawn([executable, ...args], {
-      cwd: repositoryRoot,
-      stdin: options.input === undefined ? "ignore" : "pipe",
-      stdout: "pipe",
-      stderr: "pipe",
-      env: sanitizedChildEnvironment(options.env),
-    });
-    if (options.input !== undefined) {
-      const stdin = child.stdin;
-      if (!stdin) throw new TypeError("the child process did not expose the requested stdin pipe");
-      stdin.write(options.input);
-      stdin.end();
+    const stdinInput = options.input;
+    const started = performance.now();
+    const observe = (stage: DeployProcessStage["stage"]): void => {
+      if (onStage === undefined) return;
+      try {
+        // Never await an observer or attach its failure to the command. Async
+        // observers are also allowed to fail without an unhandled rejection.
+        void Promise.resolve(
+          onStage(Object.freeze({ stage, elapsedMs: Math.max(0, performance.now() - started) })),
+        ).catch(() => {});
+      } catch {
+        // A diagnostic throw must not abandon a child or mask its actual error.
+      }
+    };
+    const environment = sanitizedChildEnvironment(options.env);
+    observe("spawn-started");
+    const child = (() => {
+      try {
+        return Bun.spawn([executable, ...args], {
+          cwd: repositoryRoot,
+          stdin: stdinInput === undefined ? "ignore" : "pipe",
+          stdout: "pipe",
+          stderr: "pipe",
+          env: environment,
+        });
+      } catch (error) {
+        observe("spawn-failed");
+        throw error;
+      }
+    })();
+    observe("spawned");
+    if (stdinInput !== undefined) {
+      try {
+        const stdin = child.stdin;
+        if (!stdin)
+          throw new TypeError("the child process did not expose the requested stdin pipe");
+        stdin.write(stdinInput);
+        stdin.end();
+        // Records successful end() submission, not delivery or remote EOF.
+        observe("input-ended");
+      } catch (error) {
+        observe("input-failed");
+        throw error;
+      }
     }
     const [exitCode, stdout, stderr] = await Promise.all([
-      child.exited,
-      new Response(child.stdout).text(),
-      new Response(child.stderr).text(),
+      child.exited.then(
+        (value) => {
+          observe("child-exited");
+          return value;
+        },
+        (error: unknown) => {
+          observe("child-exit-failed");
+          throw error;
+        },
+      ),
+      new Response(child.stdout).text().then(
+        (value) => {
+          observe("stdout-eof");
+          return value;
+        },
+        (error: unknown) => {
+          observe("stdout-read-failed");
+          throw error;
+        },
+      ),
+      new Response(child.stderr).text().then(
+        (value) => {
+          observe("stderr-eof");
+          return value;
+        },
+        (error: unknown) => {
+          observe("stderr-read-failed");
+          throw error;
+        },
+      ),
     ]);
+    observe("complete");
     return { exitCode, stdout, stderr };
   };
   return {

@@ -9,6 +9,11 @@ import {
   type ExternalIdentityVerifier,
 } from "./auth.ts";
 import {
+  createCredentialAuthorityClassStore,
+  type RpAuthorityRecord,
+  sharedRpCredentialCurrentness,
+} from "./credential-authority-class.ts";
+import {
   assertHostedBillingFinancialRealm,
   type HostedBillingFinancialRealm,
 } from "./hosted-billing-realm.ts";
@@ -28,9 +33,11 @@ import type { Clock, Row, Sql } from "./ports.ts";
 import { SHARED_AUTH_STAGING_PROFILE } from "./shared-auth-oidc-client.ts";
 import {
   createSharedAuthSession,
+  type SharedAuthFinalSessionSelection,
   type SharedAuthOrganizationPins,
   type SharedAuthPrincipalProjection,
   type SharedAuthSession,
+  type SharedWorkspaceOrganization,
 } from "./shared-auth-session.ts";
 import {
   createSharedAuthFinalSessionStore,
@@ -221,6 +228,157 @@ export interface WorkerRequestFinancialInputs {
 }
 
 const requestFinancialInputs = new WeakMap<WorkerRequestSql, WorkerRequestFinancialInputs>();
+
+const retainedRpCaptureBrand: unique symbol = Symbol("worker-request-retained-rp");
+export interface WorkerRequestRetainedRpCapture {
+  readonly [retainedRpCaptureBrand]: true;
+}
+
+/** Actual retained DATA and final-touch origin, not qualified authority or consent. */
+export interface WorkerRequestRetainedRpData {
+  readonly backend: "shared-rp-session";
+  readonly record: RpAuthorityRecord;
+  readonly current: {
+    readonly version: number;
+    readonly absoluteExpiresAt: number;
+    readonly lastUsedAt: number;
+  };
+  readonly finalSession: SharedAuthFinalSessionSelection;
+  readonly selectedScope: SharedWorkspaceOrganization;
+}
+
+const retainedRpCaptures = new WeakMap<
+  object,
+  { readonly connection: WorkerRequestSql; readonly data: WorkerRequestRetainedRpData }
+>();
+
+/** Calls only this request graph's existing RP observer; no DTO/callback can mint a capture. */
+export async function captureWorkerRequestRetainedRpSession(
+  connection: WorkerRequestSql,
+  request: Request,
+  workspaceId: string,
+): Promise<WorkerRequestRetainedRpCapture | null> {
+  assertWorkerRequestBacking(connection);
+  const inputs = readWorkerRequestFinancialInputs(connection);
+  const consumers = readWorkerRequestConsumers(connection);
+  const receiver = consumers.sharedAuth;
+  const observer = Object.getOwnPropertyDescriptor(receiver, "observeFinalWorkspaceOrganization");
+  const inspector = Object.getOwnPropertyDescriptor(receiver, "finalSessionSelection");
+  const queryDescriptor = Object.getOwnPropertyDescriptor(inputs.sql, "query");
+  if (
+    !observer ||
+    !("value" in observer) ||
+    typeof observer.value !== "function" ||
+    !inspector ||
+    !("value" in inspector) ||
+    typeof inspector.value !== "function" ||
+    !queryDescriptor ||
+    !("value" in queryDescriptor) ||
+    typeof queryDescriptor.value !== "function"
+  )
+    throw new TypeError("Worker retained RP reader methods differ");
+  const observe: SharedAuthSession["observeFinalWorkspaceOrganization"] = observer.value;
+  const inspect: SharedAuthSession["finalSessionSelection"] = inspector.value;
+  const query: Sql["query"] = queryDescriptor.value;
+  const assertOriginal = () => {
+    assertWorkerRequestBacking(connection);
+    if (
+      readWorkerRequestFinancialInputs(connection) !== inputs ||
+      readWorkerRequestConsumers(connection) !== consumers ||
+      Object.getOwnPropertyDescriptor(receiver, "observeFinalWorkspaceOrganization")?.value !==
+        observe ||
+      Object.getOwnPropertyDescriptor(receiver, "finalSessionSelection")?.value !== inspect ||
+      Object.getOwnPropertyDescriptor(inputs.sql, "query")?.value !== query
+    )
+      throw new TypeError("Worker retained RP reader origin differs");
+  };
+  const retainedSql = Object.freeze<Sql>({
+    async query(text, params) {
+      assertOriginal();
+      const rows: readonly Row[] = await Reflect.apply(query, inputs.sql, [text, params]);
+      assertOriginal();
+      return rows;
+    },
+    async run() {
+      throw new TypeError("Worker retained RP observation is read-only");
+    },
+    async batch() {
+      throw new TypeError("Worker retained RP observation is read-only");
+    },
+  });
+  assertOriginal();
+  const context = await Reflect.apply(observe, receiver, [request, workspaceId]);
+  assertOriginal();
+  if (!context) return null;
+  const finalSession = Reflect.apply(inspect, receiver, [context]);
+  if (
+    !finalSession ||
+    finalSession.selectedWorkspaceId !== workspaceId ||
+    context.workspaceId !== workspaceId ||
+    context.workspace.id !== workspaceId ||
+    finalSession.accountId !== context.accountId ||
+    finalSession.principalId !== context.actor.principalId
+  )
+    return null;
+  const record = await createCredentialAuthorityClassStore({
+    sql: retainedSql,
+  }).readActiveSharedRpSessionByDigest(finalSession.sessionDigest);
+  assertOriginal();
+  if (
+    !record ||
+    record.origin.principalId !== finalSession.principalId ||
+    record.rp.sessionCreatedAt !== finalSession.createdAt ||
+    record.rp.enrolledSessionVersion > finalSession.sessionVersion ||
+    record.rp.accountId !== finalSession.accountId ||
+    record.rp.workspaceId !== finalSession.sessionWorkspaceId ||
+    record.rp.issuer !== finalSession.identity.issuer ||
+    record.rp.clientId !== finalSession.identity.clientId ||
+    record.rp.subject !== finalSession.identity.subject ||
+    record.rp.issuerSessionId !== finalSession.identity.sessionId ||
+    record.rp.authTime !== finalSession.identity.authTime
+  )
+    return null;
+  const current = Object.freeze({
+    version: finalSession.sessionVersion,
+    absoluteExpiresAt: finalSession.absoluteExpiresAt,
+    lastUsedAt: finalSession.lastUsedAt,
+  });
+  // Credential row scope stays original. Selected payment scope is separate DATA.
+  const predicate = sharedRpCredentialCurrentness(record, current, record.organizationId);
+  const rows = await retainedSql.query(
+    `SELECT CASE WHEN ${predicate.sql} THEN 1 ELSE 0 END AS valid`,
+    predicate.params,
+  );
+  assertOriginal();
+  if (rows.length !== 1 || rows[0]?.valid !== 1) return null;
+  const data: WorkerRequestRetainedRpData = Object.freeze({
+    backend: "shared-rp-session",
+    record,
+    current,
+    finalSession,
+    selectedScope: Object.freeze({
+      workspaceId: context.workspaceId,
+      workspaceRef: context.workspaceRef,
+      organizationId: context.organizationId,
+    }),
+  });
+  const capture: WorkerRequestRetainedRpCapture = { [retainedRpCaptureBrand]: true };
+  Object.freeze(capture);
+  retainedRpCaptures.set(capture, Object.freeze({ connection, data }));
+  return capture;
+}
+
+/** Historical DATA is readable only through its original request graph and opaque handle. */
+export function readWorkerRequestRetainedRpCapture(
+  connection: WorkerRequestSql,
+  capture: unknown,
+): WorkerRequestRetainedRpData | null {
+  assertWorkerRequestBacking(connection);
+  readWorkerRequestFinancialInputs(connection);
+  if (!capture || typeof capture !== "object") return null;
+  const original = retainedRpCaptures.get(capture);
+  return original?.connection === connection ? original.data : null;
+}
 
 /** Original in-process RP observer/selection port; no HTTP path or raw Sql accessor. */
 export function readWorkerRequestConsumers(connection: WorkerRequestSql): WorkerRequestConsumers {

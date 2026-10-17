@@ -618,6 +618,24 @@ export function createCredentialAuthorityClassStore(options: { readonly sql: Sql
       }
       return record;
     },
+    /** Retained lookup only: an absent class is never issued from a live session. */
+    async readActiveSharedRpSessionByDigest(digest: string): Promise<RpAuthorityRecord | null> {
+      const selected = authAuthorityDigest(digest);
+      const rows = await sql.query(
+        "SELECT * FROM credential_authority_classes WHERE session_digest=?",
+        [selected],
+      );
+      if (rows.length > 1) throw new AuthAuthorityStoreError("unavailable");
+      if (!rows[0]) return null;
+      const record = fromRow(rows[0]);
+      if (
+        record.backend !== "shared-rp-session" ||
+        record.class !== "official-shared-rp-session" ||
+        record.rp.sessionDigest !== selected
+      )
+        throw new AuthAuthorityStoreError("unavailable");
+      return record.state === "active" ? record : null;
+    },
     async retire(
       expected: CredentialAuthorityOrigin,
       closure: AuthAuthorityTerminal,
