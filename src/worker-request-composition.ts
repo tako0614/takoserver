@@ -57,13 +57,54 @@ export interface WorkerRequestSql {
   readonly moneyGuard: MoneyCutoverGuardState;
 }
 
-const requestOrigins = new WeakMap<WorkerRequestSql, { readonly writerEpoch: string }>();
+type WorkerRequestOriginPurpose = "native-primary" | "shared-auth-staging";
+const requestOrigins = new WeakMap<
+  WorkerRequestSql,
+  { readonly writerEpoch: string; readonly purpose: WorkerRequestOriginPurpose }
+>();
 
 /**
  * One native primary session, one strict raw adapter and one Money wrapper.
  * The guard reads the captured raw adapter before wrapping; the raw adapter and
- * native session are never returned to consumers.
+ * native session are never returned to consumers. This constructs only a local
+ * request origin, not shared-login, credential, realm or current authority.
  */
+export async function createWorkerPrimaryRequestSql(options: {
+  readonly database: WorkerRequestDatabase;
+  readonly writerEpoch: string;
+}): Promise<WorkerRequestSql> {
+  return await constructWorkerPrimaryRequestSql(options, "native-primary");
+}
+
+async function constructWorkerPrimaryRequestSql(
+  options: {
+    readonly database: WorkerRequestDatabase;
+    readonly writerEpoch: string;
+  },
+  purpose: WorkerRequestOriginPurpose,
+): Promise<WorkerRequestSql> {
+  const diagnostic = purpose === "shared-auth-staging" ? "shared-login Worker" : "Worker";
+  const database = options.database;
+  const withSession = database?.withSession;
+  if (typeof withSession !== "function")
+    throw new TypeError(`${diagnostic} requires a native primary D1 session`);
+  let nativeSession: D1DatabaseLike;
+  try {
+    nativeSession = Reflect.apply(withSession, database, ["first-primary"]);
+  } catch {
+    throw new TypeError(`${diagnostic} primary session is unavailable`);
+  }
+  const rawSql = createD1Sql(nativeSession, { acknowledgement: "explicit-d1-result" });
+  const writerEpoch = options.writerEpoch;
+  const moneyGuard = await inspectMoneyCutoverGuard(rawSql, writerEpoch);
+  const sql = createMoneyCutoverSql(rawSql, writerEpoch);
+  assertMoneyCutoverSqlOrigin(sql, { writerEpoch });
+  const connection = Object.freeze({ sql, moneyGuard });
+  requestOrigins.set(connection, Object.freeze({ writerEpoch, purpose }));
+  return connection;
+}
+
+/** Shared-login retains its exact selected origins before native construction. */
 export async function createWorkerRequestSql(options: {
   readonly database: WorkerRequestDatabase;
   readonly writerEpoch: string;
@@ -75,24 +116,7 @@ export async function createWorkerRequestSql(options: {
     options.consoleOrigin !== SHARED_AUTH_STAGING_PROFILE.consoleOrigin
   )
     throw new TypeError("shared-login Worker requires the exact selected staging origins");
-  const database = options.database;
-  const withSession = database?.withSession;
-  if (typeof withSession !== "function")
-    throw new TypeError("shared-login Worker requires a native primary D1 session");
-  let nativeSession: D1DatabaseLike;
-  try {
-    nativeSession = Reflect.apply(withSession, database, ["first-primary"]);
-  } catch {
-    throw new TypeError("shared-login Worker primary session is unavailable");
-  }
-  const rawSql = createD1Sql(nativeSession, { acknowledgement: "explicit-d1-result" });
-  const writerEpoch = options.writerEpoch;
-  const moneyGuard = await inspectMoneyCutoverGuard(rawSql, writerEpoch);
-  const sql = createMoneyCutoverSql(rawSql, writerEpoch);
-  assertMoneyCutoverSqlOrigin(sql, { writerEpoch });
-  const connection = Object.freeze({ sql, moneyGuard });
-  requestOrigins.set(connection, Object.freeze({ writerEpoch }));
-  return connection;
+  return await constructWorkerPrimaryRequestSql(options, "shared-auth-staging");
 }
 
 /** Capture only code inputs; request/environment data cannot replace the owning ports. */
@@ -153,11 +177,30 @@ export interface WorkerRequestConsumers {
 
 const requestConsumers = new WeakMap<WorkerRequestSql, WorkerRequestConsumers>();
 
+/**
+ * The actual request construction inputs, retained at the same successful
+ * construction boundary as Accounts/RP. Clock identity is not qualified Clock
+ * policy, source qualification, Principal/payer authority or M/G command custody.
+ */
+export interface WorkerRequestFinancialInputs {
+  readonly sql: Sql;
+  readonly client: StripeBillingClient;
+  readonly realm: HostedBillingFinancialRealm;
+  readonly clock: Clock;
+  readonly writerEpoch: string;
+}
+
+const requestFinancialInputs = new WeakMap<WorkerRequestSql, WorkerRequestFinancialInputs>();
+
 /** Original in-process RP observer/selection port; no HTTP path or raw Sql accessor. */
 export function readWorkerRequestConsumers(connection: WorkerRequestSql): WorkerRequestConsumers {
   const consumers = requestConsumers.get(connection);
   const origin = requestOrigins.get(connection);
-  if (!consumers || !origin || consumers.sql !== connection.sql)
+  if (
+    !consumers ||
+    origin?.purpose !== "shared-auth-staging" ||
+    consumers.sql !== connection.sql
+  )
     throw new TypeError("Worker request consumers have not been constructed");
   assertMoneyCutoverSqlOrigin(consumers.sql, { writerEpoch: origin.writerEpoch });
   assertAuthTokenCaptureReader(consumers.accounts, { sql: consumers.sql });
@@ -167,6 +210,30 @@ export function readWorkerRequestConsumers(connection: WorkerRequestSql): Worker
     billingAuthority: consumers.realm.billingAuthority,
   });
   return consumers;
+}
+
+/**
+ * Only the owning in-process composition calls this with its original connection.
+ * A matching object or a copied return value is not an accepted connection.
+ * No reader, registration, key, schema digest, receiver or command is minted here.
+ */
+export function readWorkerRequestFinancialInputs(
+  connection: WorkerRequestSql,
+): WorkerRequestFinancialInputs {
+  const consumers = readWorkerRequestConsumers(connection);
+  const inputs = requestFinancialInputs.get(connection);
+  const origin = requestOrigins.get(connection);
+  if (
+    !inputs ||
+    !origin ||
+    inputs.sql !== connection.sql ||
+    inputs.sql !== consumers.sql ||
+    inputs.client !== consumers.client ||
+    inputs.realm !== consumers.realm ||
+    inputs.writerEpoch !== origin.writerEpoch
+  )
+    throw new TypeError("Worker request Financial inputs have not been constructed");
+  return inputs;
 }
 
 /**
@@ -187,7 +254,7 @@ export function createWorkerRequestConsumers(
   const origin = requestOrigins.get(options.connection);
   const { sql, client, realm, clock, randomId } = options;
   if (
-    !origin ||
+    origin?.purpose !== "shared-auth-staging" ||
     options.connection.sql !== sql ||
     options.connection.moneyGuard !== "ready" ||
     options.publicOrigin !== SHARED_AUTH_STAGING_PROFILE.publicOrigin ||
@@ -242,5 +309,9 @@ export function createWorkerRequestConsumers(
     sharedAuth,
   });
   requestConsumers.set(options.connection, consumers);
+  requestFinancialInputs.set(
+    options.connection,
+    Object.freeze({ sql, client, realm, clock, writerEpoch: origin.writerEpoch }),
+  );
   return consumers;
 }

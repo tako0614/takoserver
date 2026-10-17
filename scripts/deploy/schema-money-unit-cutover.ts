@@ -175,6 +175,22 @@ export interface MoneyReviewBinding {
   readonly writerEpoch: string;
 }
 
+/** Selection data only; this is neither a Financial review nor a native mode proof. */
+export interface MoneyPost94SelectionReviewBinding {
+  readonly kind: "takoserver.money-post94-selection-review@v1";
+  readonly phase: MoneyPost94Phase;
+  readonly accountId: string;
+  readonly databaseId: string;
+  readonly databaseName: string;
+  readonly previousWriterEpoch: string;
+  readonly nextWriterEpoch: string;
+  readonly original92BackupDigest: string;
+  readonly converted94BackupDigest: string;
+  readonly convertBindingDigest: string;
+  readonly selectedStripeMode: "test";
+  readonly declarationDigest: string;
+}
+
 export interface MoneyReviewProof {
   readonly kind: "takoserver.money-independent-review@v1";
   readonly reviewer: string;
@@ -219,6 +235,9 @@ export interface MoneyPost94DispatchBinding
   readonly converted94BackupDigest: string;
   readonly convertBindingDigest: string;
   readonly modePreparationDigest: string;
+  /** Bound selection data, not a normal Worker TEST-mode or Financial policy proof. */
+  readonly selectedStripeMode: "test";
+  readonly selectionReviewDigest: string;
 }
 
 export type MoneyCutoverDispatchBinding =
@@ -494,7 +513,7 @@ export function moneyUnitCutoverSchemaMatches(
 }
 
 export function moneyCutoverBindingDigest(
-  binding: MoneyCutoverDispatchBinding | MoneyReviewBinding,
+  binding: MoneyCutoverDispatchBinding | MoneyReviewBinding | MoneyPost94SelectionReviewBinding,
 ): string {
   return digest(JSON.stringify(binding));
 }
@@ -617,7 +636,7 @@ function proofError(phase: DeployPhase, message: string): Error {
   return phase === "verification" ? verificationError(message) : preflightError(message);
 }
 
-interface ClassificationRow {
+export interface ClassificationRow {
   readonly org_id: string;
   readonly ref: string;
   readonly original_kind: "direct" | "plan-included";
@@ -1752,17 +1771,20 @@ export interface MoneyUnitPost94State {
   readonly normalHostReady: false;
 }
 
+type MoneyPost94ReadInput = MoneyHistoryInput & {
+  readonly previousWriterEpoch: string;
+  readonly nextWriterEpoch: string;
+  readonly convertedBackupPath: string;
+};
+
 /**
- * Component inspection of the same held history and real SQL state. This does not
- * export, import, dispatch, reconcile, publish, or supply Financial realm authority.
+ * Shared component inspection. Only the owning reader below may use its retained
+ * backup and history facts; the public component result retains its old shape.
  */
-export async function inspectMoneyUnitPost94State(
-  input: MoneyHistoryInput & {
-    readonly previousWriterEpoch: string;
-    readonly nextWriterEpoch: string;
-    readonly convertedBackupPath: string;
-  },
-): Promise<MoneyUnitPost94State> {
+async function inspectMoneyUnitPost94Details(
+  input: MoneyPost94ReadInput,
+  allowOriginalConvertPhase = false,
+) {
   const {
     target,
     files,
@@ -1776,7 +1798,9 @@ export async function inspectMoneyUnitPost94State(
   const backup = Object.freeze({ ...input.backup });
   if (
     target.environment !== "integration" ||
-    (options.phase !== "suffix98" && options.phase !== "resume98") ||
+    (allowOriginalConvertPhase
+      ? options.phase !== "convert"
+      : options.phase !== "suffix98" && options.phase !== "resume98") ||
     !MONEY_CUTOVER_WRITER_EPOCH_PATTERN.test(previousWriterEpoch) ||
     !MONEY_CUTOVER_WRITER_EPOCH_PATTERN.test(nextWriterEpoch) ||
     previousWriterEpoch === nextWriterEpoch ||
@@ -1918,6 +1942,8 @@ export async function inspectMoneyUnitPost94State(
       binding.classificationDigest !== options.classificationManifestDigest ||
       binding.afterSchemaPhase !== (selectedPhase === "suffix98" ? "0098-fenced" : "0098") ||
       !SHA256.test(binding.modePreparationDigest) ||
+      binding.selectedStripeMode !== "test" ||
+      !SHA256.test(binding.selectionReviewDigest) ||
       (selectedPhase === "resume98" && unknown)
     )
       throw preflightError("money post94 dispatch differs from original history/source/epochs");
@@ -1948,7 +1974,7 @@ export async function inspectMoneyUnitPost94State(
         JSON.stringify(entry.binding)
     )
       throw preflightError("money post94 custody changed during observation");
-  return {
+  const state: MoneyUnitPost94State = {
     schemaPhase: phase,
     historicalWriterEpoch: previousWriterEpoch,
     currentWriterEpoch,
@@ -1958,6 +1984,250 @@ export async function inspectMoneyUnitPost94State(
     qualification: "component-simulation-only",
     normalHostReady: false,
   };
+  return { state, backup, converted, convertedIdentityDigest, schema, history };
+}
+
+/**
+ * Component inspection of the same held history and real SQL state. This does not
+ * export, import, dispatch, reconcile, publish, or supply Financial realm authority.
+ */
+export async function inspectMoneyUnitPost94State(
+  input: MoneyPost94ReadInput,
+): Promise<MoneyUnitPost94State> {
+  return (await inspectMoneyUnitPost94Details(input)).state;
+}
+
+interface MoneyHeldTableCensus {
+  readonly backupDigest: string;
+  readonly identityDigest: string;
+  readonly allDataDigest: string;
+  readonly tableInventory: readonly string[];
+  readonly rowCounts: Readonly<Record<string, number>>;
+  readonly preimageDigest: string;
+  readonly aggregateDigest: string;
+  readonly financialDigest: string;
+}
+
+/** Facts only. Caller-controlled ports never turn this result into native authority. */
+export interface MoneyUnitHeldConvertSourceFacts {
+  readonly qualification: "component-simulation-only";
+  readonly schemaPhase: "0094-fenced";
+  readonly origin: MoneyStageOriginProof;
+  readonly storage: MoneyStorageIdentity;
+  readonly original92: MoneyHeldTableCensus & { readonly sourceDigest: typeof SOURCE_0092 };
+  readonly converted94: MoneyHeldTableCensus & { readonly sourceDigest: string };
+  readonly current94: {
+    readonly schemaShapeDigest: string;
+    readonly applied: readonly string[];
+    readonly allDataDigest: string;
+    readonly tableInventory: readonly string[];
+    readonly rowCounts: Readonly<Record<string, number>>;
+    readonly freezeBindingDigest: string;
+    readonly authorizedWriterEpoch: string;
+  };
+  readonly conversion: {
+    readonly source94Digest: string;
+    readonly originDigest: string;
+    readonly convertBindingDigest: string;
+    readonly convertPostDigest: string;
+    readonly convertImportDigest: string;
+    readonly freezeBindingDigest: string;
+    readonly preimageDigest: string;
+    readonly aggregateDigest: string;
+    readonly classificationDigest: string;
+    readonly classifications: readonly ClassificationRow[];
+    readonly writerDigest: string;
+    readonly retained: readonly {
+      readonly phase: MoneyLegacyCutoverPhase;
+      readonly bindingDigest: string;
+      readonly receiptDigest: string;
+      readonly importDigest: string;
+      readonly sourceDigest: string;
+    }[];
+  };
+  readonly maintenance: MoneyWriterProof;
+  readonly previousWriterEpoch: string;
+  readonly nextWriterEpoch: string;
+}
+
+function freezeMoneyFact<T>(value: T): T {
+  if (typeof value === "object" && value !== null) {
+    for (const child of Object.values(value)) freezeMoneyFact(child);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+/**
+ * Reopens only the existing protected 92/94 snapshots and native GET/SELECT
+ * state. The complete current census must still equal the sealed converted94
+ * snapshot; any unrelated intervening write fails closed for this first route.
+ * This lower reader remains unqualified until the original owner authenticates it.
+ */
+export async function readMoneyUnitHeldConvertFacts(input: {
+  readonly target: DeployTarget;
+  readonly options: MoneyUnitCutoverOptions;
+  readonly previousWriterEpoch: string;
+  readonly nextWriterEpoch: string;
+  readonly convertedBackupPath: string;
+}): Promise<MoneyUnitHeldConvertSourceFacts> {
+  const { target, options, previousWriterEpoch, nextWriterEpoch, convertedBackupPath } = input;
+  if (
+    target.environment !== "integration" ||
+    options.phase !== "convert" ||
+    options.outputDirectory === undefined ||
+    options.writerEpoch !== previousWriterEpoch ||
+    target.moneyCutoverWriterEpoch !== previousWriterEpoch ||
+    !MONEY_CUTOVER_WRITER_EPOCH_PATTERN.test(nextWriterEpoch) ||
+    previousWriterEpoch === nextWriterEpoch ||
+    !isAbsolute(convertedBackupPath)
+  )
+    throw preflightError("money held convert requires exact old/new epochs and the convert owner");
+  const files = readMigrationArtifact(
+    options.sourceDirectory ?? resolve(REPOSITORY, "migrations"),
+  ).files;
+  assertMoneyPost94Source(files);
+  const maintenance = structuredClone(await options.maintenanceProof());
+  assertMaintenanceProof(target, maintenance, options.maintenanceCommit);
+  const run = options.run ?? runCommand;
+  const credential = await resolveCloudflareCredential("integration", {
+    ...(options.cloudflareEnvironment === undefined
+      ? {}
+      : { cloudflareEnvironment: options.cloudflareEnvironment }),
+    run,
+  });
+  assertProtectedDirectory(options.outputDirectory, "money held convert read output");
+  const root = mkdtempSync(join(options.outputDirectory, "money-held-convert-read-"));
+  const configPath = join(root, "wrangler.jsonc");
+  writeFileSync(configPath, configJson(target), { flag: "wx", mode: 0o600 });
+  const database = new RemoteD1(configPath, { environment: credential.childEnvironment, run });
+  const origin = await options.stageOriginProof();
+  const originalIdentityDigest = digest(
+    readProtectedBytes(`${options.backupPath}.identity.json`, "money original backup identity"),
+  );
+  const backup = await backupAndRead(
+    options.backupPath,
+    configPath,
+    target,
+    files,
+    digest(JSON.stringify(origin)),
+    root,
+    run,
+    credential.childEnvironment,
+    false,
+  );
+  const details = await inspectMoneyUnitPost94Details(
+    {
+      target,
+      options,
+      files,
+      database,
+      readSchema: () => readD1SchemaState(database),
+      backup,
+      previousWriterEpoch,
+      nextWriterEpoch,
+      convertedBackupPath,
+    },
+    true,
+  );
+  if (
+    details.state.schemaPhase !== "0094-fenced" ||
+    details.state.continuation !== "blocked-financial-port"
+  )
+    throw preflightError("money held convert requires current fenced94 before suffix dispatch");
+  await assertMoneyLiveBackupCompleteness(database, "preflight", details.converted);
+  const currentSchema = await readD1SchemaState(database);
+  if (
+    JSON.stringify(currentSchema) !== JSON.stringify(details.schema) ||
+    (await exactStatus(database, currentSchema, files, previousWriterEpoch, true)) !== "0094-fenced"
+  )
+    throw preflightError("money held convert current94 schema or old epoch changed");
+  assertFreezeRow(
+    await readFreezeRow(database, "preflight"),
+    details.history.anchor,
+    details.history.originDigest,
+    backup.digest,
+    details.history.writerDigest,
+    "preflight",
+  );
+  for (const phase of ["suffix98", "resume98"] as const) {
+    if (
+      (await options.custody.read(phase)) !== null ||
+      (await options.custody.readDispatch(phase)) !== null
+    )
+      throw preflightError("money held convert suffix dispatch appeared during observation");
+  }
+  await details.history.assertCurrent();
+  const maintenanceAfter = await options.maintenanceProof();
+  assertMaintenanceProof(target, maintenanceAfter, options.maintenanceCommit);
+  if (
+    JSON.stringify(maintenanceAfter) !== JSON.stringify(maintenance) ||
+    digest(readProtectedBytes(options.backupPath, "money original backup")) !== backup.digest ||
+    digest(
+      readProtectedBytes(`${options.backupPath}.identity.json`, "money original backup identity"),
+    ) !== originalIdentityDigest ||
+    digest(readProtectedBytes(convertedBackupPath, "money converted backup")) !==
+      details.converted.digest ||
+    digest(
+      readProtectedBytes(`${convertedBackupPath}.identity.json`, "money converted backup identity"),
+    ) !== details.convertedIdentityDigest
+  )
+    throw preflightError("money held convert maintenance or original backup changed");
+  const census = (value: typeof backup, identityDigest: string): MoneyHeldTableCensus => ({
+    backupDigest: value.digest,
+    identityDigest,
+    allDataDigest: value.allDataDigest,
+    tableInventory: Object.keys(value.rowCounts).sort(),
+    rowCounts: { ...value.rowCounts },
+    preimageDigest: value.preimageDigest,
+    aggregateDigest: value.aggregateDigest,
+    financialDigest: value.financialDigest,
+  });
+  return freezeMoneyFact(
+    structuredClone({
+      qualification: "component-simulation-only" as const,
+      schemaPhase: "0094-fenced" as const,
+      origin: details.history.origin,
+      storage: details.history.identity,
+      original92: { ...census(backup, originalIdentityDigest), sourceDigest: SOURCE_0092 },
+      converted94: {
+        ...census(details.converted, details.convertedIdentityDigest),
+        sourceDigest: moneyUnitCutoverSourcePrefixDigest(files, 94),
+      },
+      current94: {
+        schemaShapeDigest: currentSchema.shapeDigest,
+        applied: [...currentSchema.applied],
+        allDataDigest: details.converted.allDataDigest,
+        tableInventory: Object.keys(details.converted.rowCounts).sort(),
+        rowCounts: { ...details.converted.rowCounts },
+        freezeBindingDigest: details.history.anchor,
+        authorizedWriterEpoch: previousWriterEpoch,
+      },
+      conversion: {
+        source94Digest: moneyUnitCutoverSourcePrefixDigest(files, 94),
+        originDigest: details.history.originDigest,
+        convertBindingDigest: details.history.convert.receipt.bindingDigest,
+        convertPostDigest: details.history.convert.receipt.postDigest as string,
+        convertImportDigest: details.history.convert.binding.importDigest,
+        freezeBindingDigest: details.history.anchor,
+        preimageDigest: backup.preimageDigest,
+        aggregateDigest: backup.aggregateDigest,
+        classificationDigest: details.history.convert.binding.classificationDigest,
+        classifications: details.history.classifications.map((row) => ({ ...row })),
+        writerDigest: details.history.writerDigest,
+        retained: details.history.retained.map(({ phase, receipt, binding }) => ({
+          phase,
+          bindingDigest: receipt.bindingDigest,
+          receiptDigest: digest(JSON.stringify(receipt)),
+          importDigest: binding.importDigest,
+          sourceDigest: binding.sourceDigest,
+        })),
+      },
+      maintenance,
+      previousWriterEpoch,
+      nextWriterEpoch,
+    }),
+  );
 }
 
 /** Remote GET/SELECT and existing custody reads only; local source-build scratch is retained. */

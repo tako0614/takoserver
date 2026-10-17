@@ -660,6 +660,37 @@ function layerOf(path: string): Layer | undefined {
   return LAYERS.find((layer) => layer.match.test(path));
 }
 
+/** Exact composition roots may carry these types without gaining mint access. */
+function exactHostAcceptanceCompositionTypeEdge(path: string, target: string): boolean {
+  const expected =
+    path === "src/app.ts"
+      ? [
+          "V2HostAcceptance",
+          "V2HostAcceptanceContext",
+          "V2HostAcceptanceScope",
+          "V2HostDeleteAcceptanceContext",
+        ]
+      : path === "src/entry-worker.ts"
+        ? ["V2HostAcceptance"]
+        : undefined;
+  if (
+    expected === undefined ||
+    target !== "src/takoform-v2/host-acceptance.ts" ||
+    localImportsOf(path).filter((candidate) => candidate === target).length !== 1
+  )
+    return false;
+  const names = readFileSync(path, "utf8")
+    .match(
+      /^import\s+type\s+\{([^}]*)\}\s+from\s+(["'])\.\/takoform-v2\/host-acceptance\.ts\2;$/mu,
+    )?.[1]
+    ?.trim()
+    .replace(/,\s*$/u, "")
+    .split(",")
+    .map((name) => name.trim())
+    .sort();
+  return JSON.stringify(names) === JSON.stringify(expected.sort());
+}
+
 for (const path of walk("src")) {
   if (!path.endsWith(".ts") || path.endsWith(".d.ts")) continue;
   const layer = layerOf(path);
@@ -689,7 +720,7 @@ for (const path of walk("src")) {
       path === "src/takoform-v2/container-owner-schema.ts" &&
       target === "src/takoform-v2/host-acceptance.ts" &&
       localImportsOf(path).filter((candidate) => candidate === target).length === 1 &&
-      /^import\s*\{\s*prepareV2HostAcceptance\s*,\s*type\s+V2HostAcceptance\s*,\s*type\s+V2HostAcceptanceContext\s*,?\s*\}\s*from\s+["']\.\/host-acceptance\.ts["'];$/mu.test(
+      /^import\s*\{\s*prepareV2HostAcceptance\s*,\s*type\s+V2HostAcceptance\s*,\s*type\s+V2HostAcceptanceContext(?:\s*,\s*type\s+V2HostDeleteAcceptanceContext)?\s*,?\s*\}\s*from\s+["']\.\/host-acceptance\.ts["'];$/mu.test(
         readFileSync(path, "utf8"),
       );
     // This fixed receiver reuses only the owning Deployment parser/error.
@@ -808,6 +839,7 @@ for (const path of walk("src")) {
     if (
       !layer.may.includes(targetLayer.name) &&
       !exactHostAcceptanceEdge &&
+      !exactHostAcceptanceCompositionTypeEdge(path, target) &&
       !exactContainerHostAcceptanceEdge &&
       !exactOriginDeploymentParserEdge &&
       !exactWorkerEndpointOriginConstructionEdge &&

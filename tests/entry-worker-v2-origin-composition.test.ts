@@ -10,16 +10,35 @@ import {
   type WorkerEnv,
 } from "@takoserver/core/worker-entry";
 import { Miniflare } from "miniflare";
+import { moneyFenceInstallSql } from "../scripts/deploy/schema-money-unit-cutover.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { HOSTED_EDGE_SUPPLIES_KIND } from "../src/hosted-edge-supplies.ts";
 import { bytesDigest } from "../src/json.ts";
-import type { SqlParam, SqlStatement } from "../src/ports.ts";
+import {
+  assertMoneyCutoverSqlOrigin,
+  MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL,
+  MONEY_CUTOVER_FREEZE_DDL,
+  MONEY_CUTOVER_FREEZE_TABLE,
+  MONEY_CUTOVER_PERMIT_DDL,
+  MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
+  MONEY_CUTOVER_WRITER_POLICY,
+} from "../src/money-cutover-sql.ts";
+import type { Clock, Sql, SqlParam, SqlStatement } from "../src/ports.ts";
 import type { CloudflareProviderExecutorRpc } from "../src/providers/cloudflare-provider-executor-port.ts";
 import { createSharedAppLedgerD1 } from "../src/shared-app-ledger-d1.ts";
+import { SHARED_AUTH_STAGING_PROFILE } from "../src/shared-auth-oidc-client.ts";
 import { createD1Sql, type D1DatabaseLike, type D1StatementLike } from "../src/sql-d1.ts";
+import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
 import { claimFreshStripeModeRealm } from "../src/stripe-mode-realm.ts";
+import { createV2ContainerHostAcceptance } from "../src/takoform-v2/container-owner-schema.ts";
 import type { V2Form } from "../src/takoform-v2/types.ts";
 import { WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT } from "../src/worker-endpoint-origin-reservations.ts";
+import {
+  createWorkerPrimaryRequestSql,
+  createWorkerRequestConsumers,
+  createWorkerRequestSql,
+  type WorkerRequestDatabase,
+} from "../src/worker-request-composition.ts";
 
 const ORIGIN = "https://api.worker-origin-composition.test";
 const BASE = `${ORIGIN}/apis/forms.takoform.com/v2`;
@@ -29,6 +48,7 @@ const TARGET = "fixture-worker-origin-target";
 const ORG = "org-worker-origin-composition";
 const TOKEN = "worker-origin-composition-public-test-token";
 const BINDINGS = "shared_app_staging_endpoint_bindings";
+const REQUEST_WRITER = `sha256:${"c".repeat(64)}`;
 type Composer = NonNullable<WorkerEntryOptions["composeV2WorkerEndpointOrigin"]>;
 type Selection = Exclude<Awaited<ReturnType<Composer>>, undefined>;
 
@@ -181,8 +201,20 @@ async function fixture(name: string, shared = true, typed = false, carrier = fal
     };
     // Transport observer only: every statement/result/error is delegated to
     // the real Miniflare D1 binding; it cannot fabricate a Core Sql result.
-    const observedDatabase: D1DatabaseLike = {
-      prepare: (query) => observe(database.prepare(query), query),
+    const rootQueries: string[] = [];
+    const primaries: {
+      readonly constraint: "first-primary";
+      readonly native: ReturnType<typeof database.withSession>;
+      readonly queries: string[];
+    }[] = [];
+    const observeDatabase = (
+      nativeDatabase: Pick<typeof database, "prepare" | "batch">,
+      queries: string[],
+    ): D1DatabaseLike => ({
+      prepare(query) {
+        queries.push(query);
+        return observe(nativeDatabase.prepare(query), query);
+      },
       async batch(statements) {
         const native = statements.map((statement) => {
           const value = nativeStatements.get(statement);
@@ -198,11 +230,20 @@ async function fixture(name: string, shared = true, typed = false, carrier = fal
         );
         coreBatchError = undefined;
         try {
-          return await database.batch<Record<string, unknown>>(native);
+          return await nativeDatabase.batch<Record<string, unknown>>(native);
         } catch (error) {
           coreBatchError = error;
           throw error;
         }
+      },
+    });
+    const observedDatabase: WorkerRequestDatabase = {
+      ...observeDatabase(database, rootQueries),
+      withSession(constraint) {
+        const native = database.withSession(constraint);
+        const queries: string[] = [];
+        primaries.push({ constraint, native, queries });
+        return observeDatabase(native, queries);
       },
     };
     const sql = createD1Sql(database);
@@ -357,6 +398,8 @@ async function fixture(name: string, shared = true, typed = false, carrier = fal
       runtime,
       env,
       sql,
+      primaries,
+      rootQueries,
       ledger,
       selection,
       form,
@@ -372,6 +415,25 @@ async function fixture(name: string, shared = true, typed = false, carrier = fal
     await runtime.dispose();
     throw error;
   }
+}
+
+/** Existing owning Money setup on this fixture's real Miniflare database only. */
+async function selectRequestWriter(f: Awaited<ReturnType<typeof fixture>>): Promise<void> {
+  for (const source of [
+    MONEY_CUTOVER_FREEZE_DDL,
+    MONEY_CUTOVER_PERMIT_DDL,
+    MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL,
+    MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
+    moneyFenceInstallSql("0094"),
+  ]) {
+    for (const statement of frameHostMigrationSql(source)) await f.sql.run(statement);
+  }
+  await f.sql.run("INSERT INTO money_cutover_authorized_epoch VALUES (1, ?)", [REQUEST_WRITER]);
+  Object.assign(f.env, {
+    TAKOSERVER_ENVIRONMENT: "integration",
+    TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY: MONEY_CUTOVER_WRITER_POLICY,
+    TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH: REQUEST_WRITER,
+  });
 }
 
 const request = (
@@ -814,6 +876,7 @@ test("Worker does not cache or retry failed startup; repaired code selection is 
     expect(await replay.json()).toMatchObject({ id: operation.id });
     expect(compositions).toBe(2);
     expect(await f.sql.query(`SELECT count(*) AS n FROM ${BINDINGS}`)).toEqual([{ n: 1 }]);
+    expect(f.primaries).toHaveLength(0);
     expect(f.effects()).toBe(0);
   } finally {
     await f.runtime.dispose();
@@ -939,6 +1002,432 @@ test("Worker public carrier uses existing supply derivation and feeds the same o
       original,
     );
     expect(await f.sql.query("SELECT * FROM shared_app_staging_batch_assertions")).toEqual([]);
+    expect(f.providerCalls()).toBe(0);
+    expect(f.effects()).toBe(0);
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 60_000);
+
+test("Container code composer captures the final Worker Sql and clock without changing Endpoint-only admission", async () => {
+  const f = await fixture("entry-container-composer-negative");
+  try {
+    await selectRequestWriter(f);
+    Object.assign(f.env, {
+      composeV2ContainerHostAcceptance() {
+        throw new Error("environment is not a code composer");
+      },
+      TAKOSERVER_V2_CONTAINER_HOST_ACCEPTANCE: "enabled",
+    });
+    const ordinary = createWorkerEntry({ composeV2Forms: () => ({ [FORM]: f.form }) });
+    expect(
+      (await create(ordinary, f.env, "ordinary-container-omitted", "container-omitted-0001"))
+        .status,
+    ).toBe(202);
+
+    const endpointClaim = await f.reserve("endpoint-only-container");
+    const endpointOnly = createWorkerEntry({
+      composeV2Forms: () => ({ [FORM]: f.form }),
+      composeV2WorkerEndpointOrigin: () => f.selection,
+    });
+    expect(
+      (await create(endpointOnly, f.env, endpointClaim.name, "container-endpoint-only-0001"))
+        .status,
+    ).toBe(202);
+
+    let formClock: unknown;
+    let capturedSql: unknown;
+    let compositions = 0;
+    const combinedClaim = await f.reserve("endpoint-with-container");
+    const combined = createWorkerEntry({
+      composeV2Forms({ clock }) {
+        formClock = clock;
+        return { [FORM]: f.form };
+      },
+      composeV2WorkerEndpointOrigin: () => f.selection,
+      composeV2ContainerHostAcceptance(context) {
+        compositions++;
+        expect(Object.keys(context).sort()).toEqual(["clock", "env", "sql"]);
+        expect(Object.isFrozen(context)).toBe(true);
+        expect(context.env).toBe(f.env);
+        expect(context.clock).toBe(formClock);
+        expect(context.sql).not.toBe(f.sql);
+        capturedSql = context.sql;
+        return createV2ContainerHostAcceptance({
+          sql: context.sql,
+          installationId: "fixture-container-installation",
+          backendId: "fixture-container-backend",
+          targetKey: "fixture-container-target",
+        });
+      },
+    });
+    expect((await request(combined, f.env, `/support?form=${encodeURIComponent(FORM)}`)).status).toBe(
+      200,
+    );
+    expect(
+      (await create(combined, f.env, combinedClaim.name, "container-endpoint-combined-0001"))
+        .status,
+    ).toBe(202);
+    expect(compositions).toBe(2);
+    expect(f.primaries).toHaveLength(2);
+    expect(capturedSql).toBeDefined();
+    expect(await f.sql.query(`SELECT count(*) AS n FROM ${BINDINGS}`)).toEqual([{ n: 2 }]);
+    expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_operations")).toEqual([{ n: 3 }]);
+    expect(f.providerCalls()).toBe(0);
+    expect(f.effects()).toBe(0);
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 60_000);
+
+test("Container composer omission result, malformed issuer, foreign Sql and private throw redact startup", async () => {
+  const f = await fixture("entry-container-composer-refusal", false);
+  try {
+    await selectRequestWriter(f);
+    const secret = "PRIVATE-CONTAINER-COMPOSER-DIAGNOSTIC";
+    let deleteGetterCalls = 0;
+    type ContainerComposer = NonNullable<WorkerEntryOptions["composeV2ContainerHostAcceptance"]>;
+    const cases: ContainerComposer[] = [
+      null as unknown as ContainerComposer,
+      () => undefined as never,
+      async () => undefined as never,
+      () => ({}) as never,
+      ({ sql }) => {
+        const actual = createV2ContainerHostAcceptance({
+          sql,
+          installationId: "missing-delete-installation",
+          backendId: "missing-delete-backend",
+          targetKey: "missing-delete-target",
+        });
+        return { ...actual, prepareDelete: undefined } as never;
+      },
+      ({ sql }) => {
+        const actual = createV2ContainerHostAcceptance({
+          sql,
+          installationId: "accessor-delete-installation",
+          backendId: "accessor-delete-backend",
+          targetKey: "accessor-delete-target",
+        });
+        return Object.defineProperty({ ...actual }, "prepareDelete", {
+          get() {
+            deleteGetterCalls++;
+            throw new Error(secret);
+          },
+        }) as never;
+      },
+      () => {
+        throw new Error(secret);
+      },
+      () =>
+        ({
+          get assertSql() {
+            throw new Error(secret);
+          },
+        }) as never,
+      () =>
+        createV2ContainerHostAcceptance({
+          sql: f.sql,
+          installationId: "foreign-container-installation",
+          backendId: "foreign-container-backend",
+          targetKey: "foreign-container-target",
+        }),
+    ];
+    for (const composeV2ContainerHostAcceptance of cases) {
+      const entry = createWorkerEntry({
+        composeV2Forms: () => ({ [FORM]: f.form }),
+        composeV2ContainerHostAcceptance,
+      });
+      const response = await request(entry, f.env, "/resources");
+      expect(response.status).toBe(503);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      const body = await response.text();
+      expect(body).not.toContain(secret);
+      expect(JSON.stringify([...response.headers])).not.toContain(secret);
+      expect(JSON.parse(body)).toMatchObject({
+        error: { code: "backend_unavailable", details: { reason: "runtime-configuration" } },
+      });
+    }
+    expect(deleteGetterCalls).toBe(0);
+    expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_operations")).toEqual([{ n: 0 }]);
+    expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_resources")).toEqual([{ n: 0 }]);
+    expect(f.providerCalls()).toBe(0);
+    expect(f.effects()).toBe(0);
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 60_000);
+
+test("Container HTTP requests and a scheduled invocation each own an actual native primary, final Sql and clock", async () => {
+  const f = await fixture("entry-container-request-origins");
+  try {
+    await selectRequestWriter(f);
+    expect(f.env.PUBLIC_ORIGIN).not.toBe(SHARED_AUTH_STAGING_PROFILE.publicOrigin);
+    let formContext: { readonly sql: Sql; readonly clock: Clock } | undefined;
+    const captured: {
+      readonly sql: Sql;
+      readonly clock: Clock;
+      readonly marker: string;
+      readonly acceptance: ReturnType<typeof createV2ContainerHostAcceptance>;
+    }[] = [];
+    const entry = createWorkerEntry({
+      composeV2Forms({ sql, clock }) {
+        formContext = { sql, clock };
+        return { [FORM]: f.form };
+      },
+      async composeV2ContainerHostAcceptance(context) {
+        expect(context.env).toBe(f.env);
+        expect(Object.isFrozen(context)).toBe(true);
+        expect(context.sql).toBe(formContext?.sql);
+        expect(context.clock).toBe(formContext?.clock);
+        expect(context.clock()).toBeInstanceOf(Date);
+        expect(context.sql).not.toBe(f.sql);
+        assertMoneyCutoverSqlOrigin(context.sql, { writerEpoch: REQUEST_WRITER });
+        const ordinal = captured.length + 1;
+        const marker = `SELECT ${ordinal} AS entry_request_origin`;
+        expect(await context.sql.query(marker)).toEqual([{ entry_request_origin: ordinal }]);
+        const acceptance = createV2ContainerHostAcceptance({
+          sql: context.sql,
+          installationId: "request-container-installation",
+          backendId: "request-container-backend",
+          targetKey: "request-container-target",
+        });
+        acceptance.assertSql(context.sql);
+        captured.push({ sql: context.sql, clock: context.clock, marker, acceptance });
+        return acceptance;
+      },
+    });
+    for (let index = 0; index < 2; index++) {
+      expect((await request(entry, f.env, `/support?form=${encodeURIComponent(FORM)}`)).status).toBe(
+        200,
+      );
+    }
+    expect(captured).toHaveLength(2);
+    expect(f.primaries).toHaveLength(2);
+    await entry.scheduled({}, f.env);
+    expect(captured).toHaveLength(3);
+    expect(f.primaries).toHaveLength(3);
+    for (let index = 0; index < captured.length; index++) {
+      const current = captured[index];
+      const primary = f.primaries[index];
+      if (!current || !primary) throw new Error("missing actual invocation origin");
+      expect(primary.constraint).toBe("first-primary");
+      expect(primary.queries).toContain(current.marker);
+      for (let otherIndex = 0; otherIndex < captured.length; otherIndex++) {
+        if (otherIndex === index) continue;
+        const other = captured[otherIndex];
+        const otherPrimary = f.primaries[otherIndex];
+        if (!other || !otherPrimary) throw new Error("missing competing invocation origin");
+        expect(primary.native).not.toBe(otherPrimary.native);
+        expect(primary.queries).not.toContain(other.marker);
+        expect(current.sql).not.toBe(other.sql);
+        expect(current.clock).not.toBe(other.clock);
+        expect(() => current.acceptance.assertSql(other.sql)).toThrow();
+      }
+    }
+    expect(f.rootQueries).toEqual([]);
+    expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_operations")).toEqual([{ n: 0 }]);
+    expect(f.providerCalls()).toBe(0);
+    expect(f.effects()).toBe(0);
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 60_000);
+
+test("Container freeze is re-read on a fresh native primary before any later HTTP or scheduled composer", async () => {
+  const f = await fixture("entry-container-request-freeze");
+  try {
+    await selectRequestWriter(f);
+    let compositions = 0;
+    const entry = createWorkerEntry({
+      composeV2Forms: () => ({ [FORM]: f.form }),
+      composeV2ContainerHostAcceptance({ sql }) {
+        compositions++;
+        return createV2ContainerHostAcceptance({
+          sql,
+          installationId: "freeze-container-installation",
+          backendId: "freeze-container-backend",
+          targetKey: "freeze-container-target",
+        });
+      },
+    });
+    expect((await request(entry, f.env, `/support?form=${encodeURIComponent(FORM)}`)).status).toBe(
+      200,
+    );
+    expect(compositions).toBe(1);
+    // Test-only row on this actual Miniflare database, using the existing owning DDL.
+    await f.sql.run(
+      `INSERT INTO ${MONEY_CUTOVER_FREEZE_TABLE}
+        (singleton, binding_digest, origin_digest, backup_digest, writer_digest, source_digest)
+        VALUES (?, ?, ?, ?, ?, ?)`,
+      [1, ...["1", "2", "3", "4", "5"].map((hex) => `sha256:${hex.repeat(64)}`)],
+    );
+    const refused = await request(entry, f.env, `/support?form=${encodeURIComponent(FORM)}`);
+    expect(refused.status).toBe(503);
+    expect(refused.headers.get("cache-control")).toBe("no-store");
+    expect(refused.headers.get("retry-after")).toBe("60");
+    expect(await refused.json()).toMatchObject({
+      error: { code: "backend_unavailable", details: { reason: "money-cutover-freeze" } },
+    });
+    await entry.scheduled({}, f.env);
+    expect(compositions).toBe(1);
+    expect(f.primaries).toHaveLength(3);
+    expect(f.primaries.every((primary) => primary.constraint === "first-primary")).toBe(true);
+    expect(f.rootQueries).toEqual([]);
+    expect(await f.sql.query("SELECT count(*) AS n FROM tf_v2_operations")).toEqual([{ n: 0 }]);
+    expect(f.providerCalls()).toBe(0);
+    expect(f.effects()).toBe(0);
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 60_000);
+
+test("selected Container refuses a missing Money epoch or native primary without fallback or composer", async () => {
+  const f = await fixture("entry-container-native-requirements");
+  try {
+    let compositions = 0;
+    const entry = createWorkerEntry({
+      composeV2Forms: () => ({ [FORM]: f.form }),
+      composeV2ContainerHostAcceptance({ sql }) {
+        compositions++;
+        return createV2ContainerHostAcceptance({
+          sql,
+          installationId: "required-container-installation",
+          backendId: "required-container-backend",
+          targetKey: "required-container-target",
+        });
+      },
+    });
+    expect((await request(entry, f.env, "/resources")).status).toBe(503);
+    await expect(entry.scheduled({}, f.env)).rejects.toThrow("requires the selected Money writer");
+    expect(f.primaries).toHaveLength(0);
+    await selectRequestWriter(f);
+    const { withSession: _withSession, ...withoutPrimary } = f.env.STATE_DB;
+    const env = { ...f.env, STATE_DB: withoutPrimary };
+    expect((await request(entry, env, "/resources")).status).toBe(503);
+    await expect(entry.scheduled({}, env)).rejects.toThrow("native primary D1 session");
+    expect(compositions).toBe(0);
+    expect(f.primaries).toHaveLength(0);
+    expect(f.rootQueries).toEqual([]);
+    expect(f.providerCalls()).toBe(0);
+    expect(f.effects()).toBe(0);
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 60_000);
+
+test("generic native provenance cannot select sharedAuth consumers or bypass its existing origin guard", async () => {
+  const f = await fixture("entry-container-generic-not-shared-auth");
+  try {
+    await selectRequestWriter(f);
+    const connection = await createWorkerPrimaryRequestSql({
+      database: f.env.STATE_DB,
+      writerEpoch: REQUEST_WRITER,
+    });
+    expect(connection.moneyGuard).toBe("ready");
+    assertMoneyCutoverSqlOrigin(connection.sql, { writerEpoch: REQUEST_WRITER });
+    const sharedAuthStaging: NonNullable<WorkerEntryOptions["sharedAuthStaging"]> = {
+      kind: "shared-auth-staging-v1",
+      clientSecret: "fixture-shared-auth-not-a-credential",
+      encryptionKey: new Uint8Array(32),
+      principals: {
+        async resolve(): Promise<never> {
+          throw new Error("this fixture grants no Principal producer");
+        },
+      },
+    };
+    expect(() =>
+      createWorkerRequestConsumers({
+        connection,
+        sql: connection.sql,
+        sharedAuth: sharedAuthStaging,
+        // No realm/credential is supplied: refusal must precede either assertion.
+        client: null as never,
+        realm: null as never,
+        identity: {
+          async verify(): Promise<never> {
+            throw new Error("this fixture grants no identity");
+          },
+        },
+        clock: () => new Date(),
+        randomId: () => crypto.randomUUID(),
+        publicOrigin: SHARED_AUTH_STAGING_PROFILE.publicOrigin,
+        consoleOrigin: SHARED_AUTH_STAGING_PROFILE.consoleOrigin,
+      }),
+    ).toThrow("shared-login Worker request composition differs");
+    await expect(
+      createWorkerRequestSql({
+        database: f.env.STATE_DB,
+        writerEpoch: REQUEST_WRITER,
+        publicOrigin: ORIGIN,
+        consoleOrigin: undefined,
+      }),
+    ).rejects.toThrow("exact selected staging origins");
+    let containerCompositions = 0;
+    const entry = createWorkerEntry({
+      sharedAuthStaging,
+      composeV2Forms: () => ({ [FORM]: f.form }),
+      composeV2ContainerHostAcceptance({ sql }) {
+        containerCompositions++;
+        return createV2ContainerHostAcceptance({
+          sql,
+          installationId: "shared-auth-refusal-installation",
+          backendId: "shared-auth-refusal-backend",
+          targetKey: "shared-auth-refusal-target",
+        });
+      },
+    });
+    expect((await request(entry, f.env, "/resources")).status).toBe(503);
+    expect(f.primaries).toHaveLength(1);
+    expect(containerCompositions).toBe(0);
+    expect(f.rootQueries).toEqual([]);
+    expect(f.providerCalls()).toBe(0);
+    expect(f.effects()).toBe(0);
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 60_000);
+
+test("sharedAuth still requires its genuine canonical Hosted realm before Container composition", async () => {
+  const f = await fixture("entry-container-shared-auth-realm-refusal");
+  try {
+    await selectRequestWriter(f);
+    Object.assign(f.env, {
+      PUBLIC_ORIGIN: SHARED_AUTH_STAGING_PROFILE.publicOrigin,
+      TAKOSERVER_CONSOLE_ORIGIN: SHARED_AUTH_STAGING_PROFILE.consoleOrigin,
+    });
+    let containerCompositions = 0;
+    const entry = createWorkerEntry({
+      sharedAuthStaging: {
+        kind: "shared-auth-staging-v1",
+        clientSecret: "fixture-shared-auth-unavailable-realm",
+        encryptionKey: new Uint8Array(32),
+        principals: {
+          async resolve(): Promise<never> {
+            throw new Error("this fixture grants no Principal producer");
+          },
+        },
+      },
+      composeV2ContainerHostAcceptance({ sql }) {
+        containerCompositions++;
+        return createV2ContainerHostAcceptance({
+          sql,
+          installationId: "shared-auth-realm-installation",
+          backendId: "shared-auth-realm-backend",
+          targetKey: "shared-auth-realm-target",
+        });
+      },
+    });
+    for (let index = 0; index < 2; index++) {
+      const response = await entry.fetch(
+        new Request(`${SHARED_AUTH_STAGING_PROFILE.publicOrigin}/healthz`),
+        f.env,
+      );
+      expect(response.status).toBe(503);
+      expect(await response.text()).toContain("requires its genuine canonical Hosted TEST realm");
+    }
+    expect(f.primaries).toHaveLength(2);
+    expect(containerCompositions).toBe(0);
+    expect(f.rootQueries).toEqual([]);
     expect(f.providerCalls()).toBe(0);
     expect(f.effects()).toBe(0);
   } finally {

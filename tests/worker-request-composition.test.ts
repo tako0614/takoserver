@@ -21,7 +21,9 @@ import {
   createWorkerRequestConsumers,
   createWorkerRequestSql,
   readWorkerRequestConsumers,
+  readWorkerRequestFinancialInputs,
   type WorkerRequestDatabase,
+  type WorkerRequestSql,
 } from "../src/worker-request-composition.ts";
 import {
   createHostedBillingRealmTestDatabase,
@@ -481,5 +483,68 @@ describe("Worker request common construction", () => {
     const normal = await router(new Request(`${SHARED_AUTH_STAGING_PROFILE.publicOrigin}/missing`));
     expect(normal.status).toBe(404);
     expect(ordinary).toEqual(["v2", "control"]);
+  });
+});
+
+describe("Worker request Financial input carrier", () => {
+  test("retains the original Sql/client/realm/clock/epoch without additional IO", async () => {
+    const f = await fixture();
+    const { inputs, runtime } = await f.consumers();
+    const queriesBefore = f.sessions.map((session) => session.queries.length);
+    const captured = readWorkerRequestFinancialInputs(inputs.connection);
+    expect(captured.sql).toBe(runtime.sql);
+    expect(captured.client).toBe(runtime.client);
+    expect(captured.realm).toBe(runtime.realm);
+    expect(captured.clock).toBe(inputs.clock);
+    expect(captured.writerEpoch).toBe(WRITER);
+    expect(Object.isFrozen(captured)).toBe(true);
+    expect(readWorkerRequestFinancialInputs(inputs.connection)).toBe(captured);
+    expect(f.sessions.map((session) => session.queries.length)).toEqual(queriesBefore);
+  });
+
+  test("requires successful consumer construction on the original connection", async () => {
+    const f = await fixture();
+    const connection = await f.connect();
+    expect(() => readWorkerRequestFinancialInputs(connection)).toThrow();
+    const selected = await f.consumers();
+    expect(() =>
+      readWorkerRequestFinancialInputs({ ...selected.inputs.connection }),
+    ).toThrow();
+    expect(() => readWorkerRequestFinancialInputs(connection)).toThrow();
+    expect(readWorkerRequestFinancialInputs(selected.inputs.connection).sql).toBe(
+      selected.runtime.sql,
+    );
+  });
+
+  test("rejects a matching forged connection without reading its getter", async () => {
+    const f = await fixture();
+    const { runtime } = await f.consumers();
+    let getterCalls = 0;
+    const copied: WorkerRequestSql = {
+      moneyGuard: "ready",
+      get sql() {
+        getterCalls += 1;
+        return runtime.sql;
+      },
+    };
+    expect(() => readWorkerRequestFinancialInputs(copied)).toThrow();
+    expect(getterCalls).toBe(0);
+  });
+
+  test("keeps each construction clock and connection after options are mutated", async () => {
+    const f = await fixture();
+    const first = await f.consumers();
+    const originalClock = first.inputs.clock;
+    first.inputs.clock = () => new Date(0);
+    const second = await f.consumers();
+    const capturedFirst = readWorkerRequestFinancialInputs(first.inputs.connection);
+    const capturedSecond = readWorkerRequestFinancialInputs(second.inputs.connection);
+    expect(capturedFirst.clock).toBe(originalClock);
+    expect(capturedFirst.clock).not.toBe(first.inputs.clock);
+    expect(capturedSecond.clock).toBe(second.inputs.clock);
+    expect(capturedFirst).not.toBe(capturedSecond);
+    expect(capturedFirst.sql).not.toBe(capturedSecond.sql);
+    expect(capturedFirst.realm).toBe(first.runtime.realm);
+    expect(capturedSecond.realm).toBe(second.runtime.realm);
   });
 });

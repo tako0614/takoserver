@@ -114,3 +114,94 @@ for (const specifier of ["../auth.ts", "../sql-d1.ts", "../workerd-linux-process
     expect(result.stderr).toContain("v2-container-owner-schema may import only core");
   });
 }
+
+const compositionImports = [
+  {
+    path: "src/app.ts",
+    layer: "app",
+    names:
+      "V2HostAcceptance, V2HostAcceptanceContext, V2HostAcceptanceScope, V2HostDeleteAcceptanceContext",
+  },
+  { path: "src/entry-worker.ts", layer: "entry", names: "V2HostAcceptance" },
+] as const;
+const compositionSpecifier = "./takoform-v2/host-acceptance.ts";
+function importTypes(names: string): string {
+  return `import type { ${names} } from ${JSON.stringify(compositionSpecifier)};\n`;
+}
+
+for (const { path, layer, names } of compositionImports) {
+  test(`${path} may carry only its exact Host acceptance type set`, async () => {
+    const result = await probe((files) => files.set(path, importTypes(names)));
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+  });
+
+  const forbiddenCompositionImports = {
+    runtime: importNamed(names, compositionSpecifier),
+    extraType: importTypes(`${names}, V2PreparedHostAcceptance`),
+    mint: importNamed(`${mintName}, ${names}`, compositionSpecifier),
+    alias: importTypes(names.replace("V2HostAcceptance", "V2HostAcceptance as OtherAcceptance")),
+    namespace: `import type * as acceptance from ${JSON.stringify(compositionSpecifier)};`,
+    dynamic: `const acceptance = await import(${JSON.stringify(compositionSpecifier)});`,
+    reexport: importTypes(names).replace(/^import/u, "export"),
+    secondEdge: importTypes(names) + importTypes("V2HostAcceptance"),
+  };
+  for (const [kind, source] of Object.entries(forbiddenCompositionImports)) {
+    test(`${path} cannot widen its Host acceptance type edge with ${kind}`, async () => {
+      const result = await probe((files) => files.set(path, source));
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain(
+        `${path} (${layer}) imports src/takoform-v2/host-acceptance.ts`,
+      );
+    });
+  }
+}
+
+for (const path of ["src/worker-request-composition.ts", "src/entry-cloudflare-worker.ts"]) {
+  test(`another composition root ${path} gains no Host acceptance type edge`, async () => {
+    const result = await probe((files) => files.set(path, importTypes("V2HostAcceptance")));
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain(
+      `imports src/takoform-v2/host-acceptance.ts (v2-host-acceptance-contract)`,
+    );
+  });
+}
+
+const compilerNames = `${mintName}, type V2HostAcceptance, type V2HostAcceptanceContext`;
+for (const [label, names] of [
+  ["original three symbols", compilerNames],
+  ["one additional DELETE context type", `${compilerNames}, type V2HostDeleteAcceptanceContext`],
+] as const) {
+  test(`the fixed Container compiler permits ${label}`, async () => {
+    const result = await probe((files) =>
+      files.set(
+        CONTAINER,
+        containerSource.replace(namedBlock, importNamed(names, "./host-acceptance.ts")),
+      ),
+    );
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+  });
+}
+
+for (const [label, added] of [
+  ["runtime DELETE context", "V2HostDeleteAcceptanceContext"],
+  ["aliased DELETE context", "type V2HostDeleteAcceptanceContext as OtherContext"],
+  ["another context type", "type V2HostAcceptanceScope"],
+] as const) {
+  test(`the fixed Container compiler still rejects ${label}`, async () => {
+    const result = await probe((files) =>
+      files.set(
+        CONTAINER,
+        containerSource.replace(
+          namedBlock,
+          importNamed(`${compilerNames}, ${added}`, "./host-acceptance.ts"),
+        ),
+      ),
+    );
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain(
+      `${CONTAINER} (v2-container-owner-schema) imports src/takoform-v2/host-acceptance.ts`,
+    );
+  });
+}

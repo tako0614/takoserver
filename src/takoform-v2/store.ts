@@ -5,6 +5,7 @@ import {
   redeemV2HostAcceptance,
   type V2HostAcceptance,
   type V2HostAcceptanceContext,
+  type V2HostDeleteAcceptanceContext,
   type V2PreparedHostAcceptance,
 } from "./host-acceptance.ts";
 import type { V2SealedPrivateInputs } from "./private-inputs.ts";
@@ -429,10 +430,35 @@ function acceptanceContext(input: CapturedAcceptance): V2HostAcceptanceContext {
   });
 }
 
+function deleteAcceptanceContext(input: CapturedAcceptance): V2HostDeleteAcceptanceContext {
+  const { record, resource } = input;
+  if (record.action !== "delete" || input.referencesJson !== null)
+    throw new TypeError("invalid Host DELETE acceptance context");
+  return Object.freeze({
+    action: "delete",
+    principal: record.principal,
+    key: record.key,
+    fingerprint: record.fingerprint,
+    operationId: record.id,
+    resourceUid: record.resourceUid,
+    generation: record.generation,
+    at: record.at,
+    retainUntil: record.retainUntil,
+    form: resource.form,
+    space: resource.space,
+    name: resource.name,
+    backendId: record.backendId,
+    targetKey: record.targetKey,
+    specJson: record.specJson,
+    outputJson: input.initialOutputJson,
+    referencesJson: null,
+  });
+}
+
 function guardedAcceptance(
   prepared: V2PreparedHostAcceptance,
   sql: Sql,
-  context: V2HostAcceptanceContext,
+  context: V2HostAcceptanceContext | V2HostDeleteAcceptanceContext,
   admission: V2AdmissionPredicate | undefined,
 ) {
   const fixed = redeemV2HostAcceptance(prepared, sql, context);
@@ -591,7 +617,7 @@ export function createV2Store(sql: Sql, hostAcceptance?: V2HostAcceptance) {
       referencesJson: string | null = null,
       serializeUpdatesWithPendingReferrers = false,
       admission?: V2AdmissionPredicate,
-      hostResource?: Pick<ResourceRow, "form_url" | "space" | "name" | "output_json">,
+      hostResource?: ResourceRow,
       referenceGuard?: V2AdmissionPredicate,
     ): Promise<
       "accepted" | "dependency_conflict" | "resource_busy" | "conflict" | "reference_conflict"
@@ -621,6 +647,39 @@ export function createV2Store(sql: Sql, hostAcceptance?: V2HostAcceptance) {
         capturedAdmission = captured.admission;
         const context = acceptanceContext(captured);
         const preparing = acceptance.prepare(context);
+        if (preparing !== undefined) {
+          const guarded = guardedAcceptance(await preparing, sql, context, captured.admission);
+          capturedAdmission = guarded.admission;
+          terminal = guarded.terminal;
+        }
+      } else if (acceptance?.prepareDelete && record.action === "delete") {
+        if (!hostResource)
+          throw new TypeError("Host DELETE acceptance requires its owned Resource");
+        if (
+          hostResource.uid !== record.resourceUid ||
+          hostResource.principal !== record.principal ||
+          hostResource.generation + 1 !== record.generation ||
+          hostResource.backend_id !== record.backendId ||
+          hostResource.target_key !== record.targetKey
+        )
+          throw new TypeError("Host DELETE acceptance Resource does not match its Operation");
+        if (referencesJson !== null)
+          throw new TypeError("Host DELETE acceptance cannot publish new references");
+        const captured = captureAcceptance(
+          record,
+          {
+            form: hostResource.form_url,
+            space: hostResource.space,
+            name: hostResource.name,
+          },
+          null,
+          hostResource.output_json,
+          capturedAdmission,
+        );
+        record = captured.record;
+        capturedAdmission = captured.admission;
+        const context = deleteAcceptanceContext(captured);
+        const preparing = acceptance.prepareDelete(context);
         if (preparing !== undefined) {
           const guarded = guardedAcceptance(await preparing, sql, context, captured.admission);
           capturedAdmission = guarded.admission;
