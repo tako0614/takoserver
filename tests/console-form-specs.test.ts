@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import {
+  acceptsChanges,
   blankPaths,
   pathLabel,
   type ReferenceSlot,
@@ -61,7 +62,7 @@ const none =
 const HOST: Record<string, Check> = {
   "WorkerBundle/0.2.0": none(parseWorkerBundleSpec),
   "StaticAssetBundle/0.2.0": none(parseStaticAssetBundleSpec),
-  "SQLiteMigrationSet/0.2.0": none(parseSQLiteMigrationSetSpec),
+  "SQLiteMigrationSet/0.4.0": none(parseSQLiteMigrationSetSpec),
   "ModuleWorker/0.3.0": none(parseModuleWorkerSpec),
   "WorkerVersion/0.5.0": (spec) => referencesForWorkerVersion(parseWorkerVersionSpec(spec)),
   "WorkerDeployment/0.4.0": (spec) =>
@@ -70,7 +71,7 @@ const HOST: Record<string, Check> = {
     workerCronTriggerReferences(parseWorkerCronTriggerSpec(spec)),
   "WorkerEndpoint/0.3.0": (spec) => referencesForWorkerEndpoint(parseWorkerEndpointSpec(spec)),
   "SQLiteDatabase/0.2.0": none(parseSQLiteDatabaseSpec),
-  "SQLiteMigrationApplication/0.2.0": (spec) =>
+  "SQLiteMigrationApplication/0.4.0": (spec) =>
     sqliteMigrationApplicationReferences(parseSQLiteMigrationApplicationSpec(spec)),
   "EdgeKVNamespace/0.2.0": none(parseEdgeKVNamespaceSpec),
   "ObjectBucket/0.2.0": none(parseObjectBucketSpec),
@@ -136,6 +137,27 @@ test("writes a chosen UID only into a place the spec still has", () => {
   expect(valueAt(starter.spec, slot.path)).toBe("");
   // A person who removed the versions list does not get it back.
   expect(withValueAt({ worker: { resourceUid: "" } }, slot.path, "uid-version")).toBeNull();
+});
+
+test("migration starters keep the selected version and immutable artifact fence", () => {
+  for (const version of ["0.2.0", "0.4.0"] as const) {
+    const set = `https://edge.forms.takoform.com/forms/SQLiteMigrationSet/${version}/`;
+    const application =
+      `https://edge.forms.takoform.com/forms/SQLiteMigrationApplication/${version}/` as const;
+    const artifact = starterSpec(set);
+    const starter = starterSpec(application);
+    if (!artifact || !starter) throw new Error(`missing migration starter ${version}`);
+    expect(acceptsChanges(set)).toBe(false);
+    expect(starter.references.map((slot) => slot.form)).toEqual([
+      "https://edge.forms.takoform.com/forms/SQLiteDatabase/0.2.0/",
+      set,
+    ]);
+    const spec = parseSQLiteMigrationApplicationSpec(filled(starter.spec, starter.references));
+    expect(
+      sqliteMigrationApplicationReferences(spec, application).map((slot) => slot.formUrl),
+    ).toEqual(starter.references.map((slot) => slot.form));
+    expect(starterSpec(application)).not.toBe(starter);
+  }
 });
 
 test("names the places a starter still leaves empty, as a person reads them", () => {

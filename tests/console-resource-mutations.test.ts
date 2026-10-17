@@ -1003,7 +1003,7 @@ test("missing SQLite migration Forms say what adds them", async () => {
   );
   createResource("org-console");
   await settle();
-  expect(body.textContent).toContain("SQLiteMigrationSet 0.2.0 — not on this Host");
+  expect(body.textContent).toContain("SQLiteMigrationSet 0.4.0 — not on this Host");
   expect(body.textContent).toContain(
     "SQLiteMigrationSet, and on a Host that runs Workers SQLiteMigrationApplication, can be chosen once a migration set is seeded and the Host restarted (",
   );
