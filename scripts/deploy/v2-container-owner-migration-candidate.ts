@@ -30,8 +30,8 @@ export function v2ContainerOwnerMigrationCandidate(): readonly SqlStatement[] {
     {
       sql: `INSERT INTO main.${ASSERTION} (ok, baseline) SELECT CASE WHEN
       NOT EXISTS (SELECT 1 FROM main.sqlite_schema WHERE lower(substr(name, 1, 16)) = 'tf_v2_container_')
-      AND NOT EXISTS (SELECT 1 FROM main.sqlite_schema source JOIN pragma_foreign_key_list(source.name, 'main') fk
-        WHERE source.type = 'table' AND lower(fk."table") IN (${ownTables}))
+      AND NOT EXISTS (SELECT 1 FROM  main.sqlite_schema source  WHERE CASE WHEN lower(source.name) IN ('_cf_kv', '_cf_metadata') THEN 0 ELSE EXISTS (SELECT 1 FROM  pragma_foreign_key_list(source.name, 'main') fk
+         WHERE  source.type = 'table' AND lower(fk."table") IN (${ownTables})) END)
       THEN 1 ELSE 0 END, ${baseline}`,
     },
     ...V2_CONTAINER_OWNER_RECIPE.objects.map(({ sql }) => ({ sql })),
