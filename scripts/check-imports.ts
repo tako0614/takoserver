@@ -618,6 +618,12 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain", "adapter"],
   },
   {
+    // Exact displayed terms join existing R1 app DATA with core/domain tariff facts.
+    name: "app",
+    match: /^src\/financial-displayed-terms\.ts$/u,
+    may: ["core", "domain", "app"],
+  },
+  {
     // Retained history storage is separate from its qualified runtime issuer.
     name: "domain",
     match: /^src\/shared-financial-customer-history\.ts$/u,

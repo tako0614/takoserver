@@ -9,6 +9,11 @@ import type {
   SubscriptionPlanPayments,
 } from "./control.ts";
 import {
+  captureFinancialDisplayInput,
+  createFinancialDisplayedTermsSource,
+  type FinancialDisplayedTermsR1,
+} from "./financial-displayed-terms.ts";
+import {
   assertHostedBillingFinancialRealm,
   assertHostedBillingFinancialRealmPersisted,
   type HostedBillingFinancialRealm,
@@ -186,6 +191,18 @@ export interface HostedBillingPaymentAssembly {
     readonly reference: string;
     readonly planKey: string;
   }): Promise<SelectedSubscriptionStartEconomicR1>;
+  /** NEW display DATA from the exact existing selector; neither consent nor R1.prepare. */
+  selectSubscriptionStartDisplayedTermsR1(input: {
+    readonly organizationId: string;
+    readonly reference: string;
+    readonly planKey: string;
+  }): Promise<FinancialDisplayedTermsR1>;
+  preparePlanChangeDisplayedTermsR1(
+    input: Parameters<HostedBillingPaymentAssembly["preparePlanChangeEconomicR1"]>[0],
+  ): Promise<FinancialDisplayedTermsR1>;
+  prepareCancellationDisplayedTermsR1(
+    input: Parameters<HostedBillingPaymentAssembly["prepareCancellationEconomicR1"]>[0],
+  ): Promise<FinancialDisplayedTermsR1>;
 }
 
 /** Data-only pre-C0 economic choice; neither a Customer pin nor displayed terms. */
@@ -223,6 +240,12 @@ export type HostedBillingComposition = HostedBillingCompositionBase &
           readonly amountMinor: number;
         }): Promise<SelectedTopUpEconomicR1>;
         selectCardSetupEconomicR1(): Promise<SelectedCardSetupEconomicR1>;
+        selectTopUpDisplayedTermsR1(input: {
+          readonly organizationId: string;
+          readonly reference: string;
+          readonly amountMinor: number;
+        }): Promise<FinancialDisplayedTermsR1>;
+        selectCardSetupDisplayedTermsR1(): Promise<FinancialDisplayedTermsR1>;
         createPayments(context: PaymentEventContext): HostedBillingPaymentAssembly;
       }
   );
@@ -542,20 +565,7 @@ export async function createCanonicalHostedBillingComposition(options: {
     cardSetup: cardSetup !== undefined,
     postpaid: false,
   });
-  const bundle = Object.freeze({
-    limitPolicy,
-    dispatchWarnings: local.dispatchWarnings.bind(local),
-    ...(onDemand === undefined ? {} : { onDemand }),
-    ...(cardSetup === undefined ? {} : { cardSetup }),
-    ...(onDemandConfiguration === undefined
-      ? {}
-      : {
-          setupDisclosureRevision: onDemandConfiguration.setupDisclosureRevision,
-        }),
-    status,
-    paymentActivation: true,
-    settlement,
-    checkout,
+  const economicSelections = Object.freeze({
     async selectCardSetupEconomicR1(): Promise<SelectedCardSetupEconomicR1> {
       if (onDemandConfiguration === undefined) throw new StripeCardSetupError("unavailable");
       // Read only the original constructor-owned values. A later service facade or
@@ -621,6 +631,66 @@ export async function createCanonicalHostedBillingComposition(options: {
         financialRealm: realm.financialRealm,
       });
     },
+  });
+  const topUpEconomicSelector = economicSelections.selectTopUpEconomicR1;
+  const cardSetupEconomicSelector = economicSelections.selectCardSetupEconomicR1;
+  const displayedTerms = createFinancialDisplayedTermsSource({
+    billingConfig,
+    plans: pricing.hostedPlanTable.plans.flatMap((plan) =>
+      plan.tier === "subscription"
+        ? [
+            {
+              planKey: plan.planId,
+              priceId: plan.stripePriceId,
+              priceAmountMinor: plan.monthlyAmountMinor,
+              includedMinor: plan.includedCreditMinor,
+            },
+          ]
+        : [],
+    ),
+    checkoutBounds: { minimumMinor, maximumMinor },
+    onDemand:
+      onDemandConfiguration === undefined
+        ? null
+        : {
+            setupDisclosureRevision: onDemandConfiguration.setupDisclosureRevision,
+            terms: onDemandConfiguration.terms,
+          },
+    postpaidEnabled: false,
+  });
+  const bundle = Object.freeze({
+    limitPolicy,
+    dispatchWarnings: local.dispatchWarnings.bind(local),
+    ...(onDemand === undefined ? {} : { onDemand }),
+    ...(cardSetup === undefined ? {} : { cardSetup }),
+    ...(onDemandConfiguration === undefined
+      ? {}
+      : {
+          setupDisclosureRevision: onDemandConfiguration.setupDisclosureRevision,
+        }),
+    status,
+    paymentActivation: true,
+    settlement,
+    checkout,
+    selectTopUpEconomicR1: topUpEconomicSelector,
+    selectCardSetupEconomicR1: cardSetupEconomicSelector,
+    async selectTopUpDisplayedTermsR1(input: {
+      readonly organizationId: string;
+      readonly reference: string;
+      readonly amountMinor: number;
+    }): Promise<FinancialDisplayedTermsR1> {
+      const selected = captureFinancialDisplayInput(input, [
+        "organizationId",
+        "reference",
+        "amountMinor",
+      ]);
+      const economic = await topUpEconomicSelector.call(economicSelections, selected);
+      return displayedTerms.fromEconomic(economic);
+    },
+    async selectCardSetupDisplayedTermsR1(): Promise<FinancialDisplayedTermsR1> {
+      const economic = await cardSetupEconomicSelector.call(economicSelections);
+      return displayedTerms.fromEconomic(economic);
+    },
     createPayments(context: PaymentEventContext): HostedBillingPaymentAssembly {
       if (context.sql !== sql || context.clock !== clock)
         throw new TypeError("Hosted payment context does not belong to this app SQL and clock");
@@ -644,6 +714,18 @@ export async function createCanonicalHostedBillingComposition(options: {
         !hosted.prepareCancellationEconomicR1
       )
         throw new TypeError("Hosted subscription period adapter is unavailable");
+      // Save the actual callable and its original receiver once. A later mutable
+      // assembly facade cannot replace the source used by these display methods.
+      const subscriptionStartSelector = hosted.selectSubscriptionStartEconomicR1;
+      const planChangeReceiver = hosted.subscriptionPlans;
+      const planChangeSelector = planChangeReceiver.preparePlanChangeEconomicR1;
+      const cancellationSelector = hosted.prepareCancellationEconomicR1;
+      if (
+        typeof subscriptionStartSelector !== "function" ||
+        typeof planChangeSelector !== "function" ||
+        typeof cancellationSelector !== "function"
+      )
+        throw new TypeError("Hosted economic selection source is unavailable");
       const notifications = createStripeEvents(
         {
           client: eventReader,
@@ -683,6 +765,34 @@ export async function createCanonicalHostedBillingComposition(options: {
         selectSubscriptionStartEconomicR1: hosted.selectSubscriptionStartEconomicR1,
         preparePlanChangeEconomicR1: hosted.subscriptionPlans.preparePlanChangeEconomicR1,
         prepareCancellationEconomicR1: hosted.prepareCancellationEconomicR1,
+        async selectSubscriptionStartDisplayedTermsR1(input): Promise<FinancialDisplayedTermsR1> {
+          const selected = captureFinancialDisplayInput(input, [
+            "organizationId",
+            "reference",
+            "planKey",
+          ]);
+          const economic = await subscriptionStartSelector.call(hosted, selected);
+          return displayedTerms.fromEconomic(economic);
+        },
+        async preparePlanChangeDisplayedTermsR1(input): Promise<FinancialDisplayedTermsR1> {
+          const selected = captureFinancialDisplayInput(input, [
+            "organizationId",
+            "reference",
+            "expectedSubscriptionRef",
+            "planKey",
+          ]);
+          const economic = await planChangeSelector.call(planChangeReceiver, selected);
+          return displayedTerms.fromEconomic(economic);
+        },
+        async prepareCancellationDisplayedTermsR1(input): Promise<FinancialDisplayedTermsR1> {
+          const selected = captureFinancialDisplayInput(input, [
+            "organizationId",
+            "reference",
+            "expectedSubscriptionRef",
+          ]);
+          const economic = await cancellationSelector.call(hosted, selected);
+          return displayedTerms.fromEconomic(economic);
+        },
       };
     },
   }) as HostedBillingComposition;
