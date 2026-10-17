@@ -765,8 +765,11 @@ Before it writes anything, the command refuses these states:
   files in a root private to this user and is not read. Run the command as the
   Host's user, on the Host's machine and in the Host's PID namespace, because
   processes in other PID namespaces are not in this `/proc`: for a Host in a
-  container, run it inside that container (for example with `docker exec`),
-  not from the machine or from another container;
+  container, run it in that container's PID namespace while the Host process
+  is stopped, not from the machine or from another container. Where the Host
+  is the container's main process, as in
+  [Docker self-host](self-host-docker.md), stopping it stops the container, so
+  seeding is not covered there yet;
 - an organization the control database does not know;
 - a path with a component that starts with `.`, such as `.env` or
   `.git/config`, unless `--include-dotfiles` is given. A `StaticAssetBundle`
