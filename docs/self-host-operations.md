@@ -1143,15 +1143,19 @@ succeeds, the earlier version keeps answering, and **To go back** returns to
 it afterwards. A broken version shows itself in one of these ways:
 
 - **Its create stays `reconciling`**, and after two minutes the helper prints
-  `still {"status":"reconciling",…,"error":{"code":"outcome_unconfirmed",…}}`.
+  `still {"status":"reconciling","error":{"code":"outcome_unconfirmed",…}}`.
   The Host checks a WorkerVersion's code before the version can serve, and this
   is usually that check refusing it: a syntax error, an import that does not
-  resolve, an exception or more than about two seconds of work at the module's
-  top level, or `handlers` that is not exactly the list of handlers its default
-  export defines. The Host does not say which. It keeps retrying, and refuses to
-  delete the version while it retries (`409 resource_busy`), so the version, and
-  the Worker and bundle it names, stay; ten minutes later the readiness probe
-  reports `degraded`. Check the code before creating its version.
+  resolve, an exception at the module's top level or top-level work that runs
+  past a two-second limit, which also counts the runtime's start-up, or
+  `handlers` that is not exactly the list of handlers its default export
+  defines. The Host does not say which. It keeps retrying, and refuses to delete
+  the version while it retries (`409 resource_busy`), so the version, and the
+  Worker and bundle it names, stay. While it retries, the Worker's same-spec
+  update (**Record the Deployment**) is refused with `409 dependency_conflict`;
+  new versions and the Deployment's `PUT` still work. About ten minutes later,
+  and from then on, the readiness probe reports `degraded`. Check the code
+  before creating its version:
   `bun build "$WORK/hello/v2/worker.js" --outdir "$(mktemp -d)"` reports syntax
   errors and imports that do not resolve. Then ship the fix under new names, such
   as `hello-bundle-v2-2` and `hello-version-v2-2`. (A Host that cannot run the
@@ -1162,10 +1166,11 @@ it afterwards. A broken version shows itself in one of these ways:
   not print. The version, its Deployment and its Endpoint still show Ready, and
   the console's overview still says **Serving**: they report that the Worker is
   published, not that its responses succeed.
-- **A queue consumer throws**: its batch is retried, `retryDelaySeconds` apart,
-  until each message has been delivered `maxRetries` + 1 times. Then the message
-  is deleted, or moved to the consumer's `deadLetterQueue`, an
-  `AtLeastOnceQueue` its spec may name. Nothing records the loss.
+- **A queue consumer throws**: its batch is retried, at least
+  `retryDelaySeconds` apart, until each message has been delivered
+  `maxRetries` + 1 times. Then the message is deleted, or moved to the
+  consumer's `deadLetterQueue`, an `AtLeastOnceQueue` its spec may name.
+  Nothing records the loss.
 
 The Host keeps no Worker logs. What a Worker writes with `console.log` or
 `console.error`, and the errors it throws, are discarded, not written to the
