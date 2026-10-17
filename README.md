@@ -4,7 +4,7 @@ Takoserver is an open-source cloud you run on your own Linux machine. You deploy
 Workers, with their SQLite databases, KV namespaces, object buckets and queues,
 from [Takoform](https://takoform.com) definitions, and it serves each Worker at
 an HTTPS hostname on your domain. It is for people who run their own server and
-domain; it is not a managed service.
+domain: this repository gives you the software, not a hosted account.
 
 No released Takoform client speaks the Host API v2 this Host uses yet (the
 OpenTofu provider, `terraform-provider-takoform` 4.1.0, is v1-only), so today you
@@ -23,8 +23,11 @@ To serve Workers:
   [2.0.0-rc.1 pre-release](https://github.com/tako0614/takoserver/releases/tag/v2.0.0-rc.1);
   1.0.0, the release marked Latest, does not have it;
 - a domain with a wildcard DNS name for the Workers, such as
-  `*.apps.example.com`, pointing at the machine, a wildcard certificate for it
-  (issued through a DNS challenge), and TCP 443.
+  `*.apps.example.com`, pointing at the machine, a wildcard certificate for it,
+  issued through a DNS challenge that needs your DNS provider's API, and TCP
+  443;
+- an HTTPS front end such as Caddy for the API, on its own name and another
+  port, such as `api.example.com:8443`, and TCP 80 for its certificate.
 
 For a look without Workers, Docker with Compose is enough.
 
@@ -36,7 +39,7 @@ For a look without Workers, Docker with Compose is enough.
 | Serve a Worker over HTTPS: install, sign in, and create the five Resources of one Worker, with curl or in the console | [First install and first use](docs/self-host-operations.md#first-install-and-first-use), steps 1 to 9 |
 | Ship new code, add SQLite, KV, a bucket or a queue, and delete Resources | Steps [10](docs/self-host-operations.md#10-ship-a-new-version) to [13](docs/self-host-operations.md#13-delete-resources) of the same guide |
 | Decide what to expose and how to harden the machine | [Self-host security](docs/self-host-security.md) |
-| Monitor, back up, update or roll back | [Self-host operations](docs/self-host-operations.md#update-and-code-rollback) |
+| Monitor, back up, update or roll back | [Monitoring](docs/self-host-operations.md#monitoring), [Cold snapshot](docs/self-host-operations.md#cold-snapshot), [Update and code rollback](docs/self-host-operations.md#update-and-code-rollback) |
 | Look up a v2 setting, the Forms a Bun Host supports, or how organizations own Resources | [Takoform v2 architecture and operator setup](docs/takoform-v2.md) |
 | Change the code | [Working on it](#working-on-it): `bun run check` is the gate |
 
