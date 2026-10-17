@@ -466,7 +466,8 @@ function newVersionAction(organizationId: string, version: ResourceSummary): Chi
         "This version needs secret values, which the console cannot send; create the next version over the API with privateInputs.",
       ),
     );
-  const hasCode = valueAt(version.spec, CODE_PATH) !== undefined;
+  const code = valueAt(version.spec, CODE_PATH);
+  const hasCode = code !== undefined;
   const spec = hasCode
     ? (withValueAt(structuredClone(version.spec), CODE_PATH, "") ?? version.spec)
     : version.spec;
@@ -479,10 +480,11 @@ function newVersionAction(organizationId: string, version: ResourceSummary): Chi
         createResource(organizationId, {
           form: version.form,
           spec,
+          ...(typeof code === "string" && code !== "" ? { current: [code] } : {}),
           note: hasCode
             ? tr(
-                `版は変更できないため、${version.name}の設定（ハンドラー・変数・Bindingを含む）から新しい版を作成します。新しいコードを選び、名前を付けて「作成する」を押してください。その後、新しい版のページから配信できます。`,
-                `A version cannot be changed, so this creates a new one from ${version.name}'s spec, with its handlers, vars and Bindings. Choose its new code, name it, then choose Create; you can then serve it from its page.`,
+                `版は変更できないため、${version.name}の設定（ハンドラー・変数・Bindingを含む）から新しい版を作成します。新しいコードを選び、名前を付けて「作成する」を押してください。その後、新しい版のページから配信できます。新しいコードがまだWorkerBundleになっていなければ、先に「リソースを作成」で作成してください。`,
+                `A version cannot be changed, so this creates a new one from ${version.name}'s spec, with its handlers, vars and Bindings. Choose its new code, name it, then choose Create; you can then serve it from its page. If the new code is not a WorkerBundle yet, create that first with New resource.`,
               )
             : tr(
                 `版は変更できないため、${version.name}の設定から新しい版を作成します。assets.bundleを新しいStaticAssetBundleのUIDに書き換え、名前を付けて「作成する」を押してください。その後、新しい版のページから配信できます。`,
