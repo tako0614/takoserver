@@ -25,9 +25,11 @@ console: no released Takoform client speaks Host API v2 yet.
 A self-host runs one of two profiles, selected by configuration:
 
 - **Artifact profile.** The v2 Host API, operator sign-in, organizations, API
-  keys, and the artifact Forms `SQLiteMigrationSet 0.2.0`, `WorkerBundle 0.2.0`
-  and `StaticAssetBundle 0.2.0`. These Forms validate and retain bytes; they
-  do not execute SQL, run a Worker, or serve assets. It needs Bun and the three
+  keys, and an artifact Form for each block of the v2 config:
+  `WorkerBundle 0.2.0` and `StaticAssetBundle 0.2.0` in step 3's config, and
+  `SQLiteMigrationSet 0.2.0` once step 11 seeds a migration set. These Forms
+  validate and retain bytes; they do not execute SQL, run a Worker, or serve
+  assets. It needs Bun and the three
   required settings in step 3.
 - **Complete local Worker profile.** Adds the Worker lifecycle Forms and their
   SQLite, KV, ObjectBucket and Queue Bindings, listed in
@@ -43,7 +45,7 @@ the `takoserver` user". An **administrator shell** as root installs tools, write
 `/etc/takoserver`, and runs `systemctl` and `journalctl`. An **operator
 shell** as the `takoserver` user (`runuser -u takoserver -- bash`, then
 `cd /opt/takoserver`) runs the `takoserver` blocks of step 3, whose key files
-must belong to that user, and steps 5 to 12, which share shell variables such
+must belong to that user, and steps 5 to 13, which share shell variables such
 as `KEY` and `ORG`; keep it open between steps.
 
 ### 1. Prerequisites
@@ -245,7 +247,7 @@ The complete local Worker profile additionally needs all of these:
 | `TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY` | The absolute path of the Workflow execution guard (step 1). |
 | `TAKOSERVER_V2_WORKER_RUNTIME_BOOT` | Both Actor and Workflow boot, for example `{"actor":true,"workflow":{"maximumRegistrations":64}}`. |
 | `TAKOSERVER_V2_WORKER_PRIVATE_PLANES` | All five private planes: `sqlite`, `kv`, `objectBucket`, `queue` and `queueProducer`. Each names a distinct fixed `privatePort` and its own `signingKeyFile`; `sqlite` also names an existing private `stagingRoot`. A key file holds 32 to 4,096 random bytes, is mode 0600 and lies in a directory private to the Host's user. The Host never generates these keys. |
-| `workerBundle` and `staticAssetBundle` config blocks | Both with `targetKey` `selfhost-v2-worker-primary`. An empty `heldArtifacts` list composes the Form; step 6 fills it. An optional `sqliteMigrationSet` block, with any stable `targetKey`, adds `SQLiteMigrationApplication 0.2.0`. |
+| `workerBundle` and `staticAssetBundle` config blocks | Both with `targetKey` `selfhost-v2-worker-primary`. An empty `heldArtifacts` list composes the Form; step 6 fills it. An optional `sqliteMigrationSet` block, with any stable `targetKey`, composes both `SQLiteMigrationSet 0.2.0` and `SQLiteMigrationApplication 0.2.0`; step 11's first seed adds it. |
 
 `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING` is optional: with it, WorkerVersion
 accepts `privateInputs` (see the setup guide).
@@ -575,7 +577,7 @@ path is active.
 
 Exchange the assertion for a session, create the organization that will own
 Resources, and create an organization API key. The organization's ID is the v2
-Space. Run this step and steps 6 to 12 in one shell as the `takoserver` user,
+Space. Run this step and steps 6 to 13 in one shell as the `takoserver` user,
 from the checkout, because they share the `ORG`, `KEY` and other shell
 variables. Stop and start the service (step 6) from a separate administrator
 shell, so that this one keeps them. Keep their working files in a directory outside the data root: the
@@ -906,11 +908,15 @@ it stopped:
   unique within the Space across all Forms. Because the helper derives each
   key from the name, fix the cause and create the whole chain again under new
   names, for example with `-2` appended to each name. Delete the old Resources
-  with step 12 once nothing references them.
+  with step 13 once nothing references them; a Resource whose Operation is
+  still `reconciling` cannot be deleted (`409 resource_busy`).
 
 A WorkerVersion, Deployment or Endpoint Operation that cannot finish stays
 `reconciling` and retries; it writes nothing to the Host's output, so the
-`error` the helper prints is the only diagnostic.
+`error` the helper prints is the only diagnostic. For a WorkerVersion whose code
+the Host refused, that `error` is only `outcome_unconfirmed`;
+[When a new version does not work](#when-a-new-version-does-not-work) lists the
+usual causes.
 
 Keep this order. An Endpoint requested before its Worker's Deployment has
 succeeded is refused with `409 dependency_conflict` (its `detail` names the
@@ -948,7 +954,7 @@ offers **View resource**.
 6. Record the Deployment on `hello`, as step 9 describes: open `hello` and
    choose **Record the Deployment**.
 
-**Coming back later.** Steps 9 to 12 use the shell variables and helpers of
+**Coming back later.** Steps 9 to 13 use the shell variables and helpers of
 steps 5, 6 and 8. In a new shell, set `HOST`, `V2` and `F` again as in step 5
 and `WORK` as in step 6, and define `wait_operation` and `create` again from
 step 8. `ORG` is the **Identifier** on the console's Settings page, and a new
@@ -967,11 +973,11 @@ NAME=$(curl -sS --fail-with-body "$V2/resources/$ENDPOINT" \
   -H "authorization: Bearer $KEY" | jq -er .output.hostname)
 ```
 
-Seeding in steps 10 and 11 also needs the Host's environment in that shell:
+Seeding in steps 10 to 12 also needs the Host's environment in that shell:
 `set -a; . /etc/takoserver/takoserver.env; set +a`, as in step 6.
 
-The Resources of steps 10 and 11 are found the same way, by their names, such
-as `hello-bundle-v2` and `hello-version-v2`.
+The Resources of steps 10 to 12 are found the same way, by their names, such
+as `hello-bundle-v2`, `hello-version-v2` and `hello-queue`.
 
 ### 9. Verify
 
@@ -1102,10 +1108,12 @@ wait_operation "$(printf '%s' "$updated" | jq -r .id)" hello-deployment-v2
 Once that succeeds, the Endpoint serves the new code at the same address:
 
 ```sh
-curl -sS "https://$NAME/"
+curl -sS -w '%{http_code}\n' "https://$NAME/"
 ```
 
-It answers `hello from takoserver v2`.
+It answers `hello from takoserver v2`, then the status, `200`. If the create
+stays `reconciling` or the status is `500`, see
+[When a new version does not work](#when-a-new-version-does-not-work).
 
 In the console, create `hello-bundle-v2` from `$WORK/hello-v2.json` as in
 step 8. Then open `hello-version-v1` and choose **New version from this one**:
@@ -1120,13 +1128,72 @@ Deployment it recorded, so it needs no second record.
 **To go back**, serve the earlier version again: in the console, open
 `hello-version-v1` and choose **Serve this version**; with curl, send the same
 `PUT` naming `$VERSION`. Keep v1 until v2 has served for a while, because step
-12 deletes a version only once nothing serves it.
+13 deletes a version only once nothing serves it.
 
 `tests/selfhost-v2-ordinary-journey-native.test.ts` runs steps 8 to 10 with
 real Host and workerd processes, apart from recording the Deployment on the
 Worker, and ships v2 by seeding through the same command;
 [the ordinary journey native test](#ordinary-journey-native-test-and-known-gaps)
 describes its scope and limits.
+
+#### When a new version does not work
+
+Shipping never touches the version that serves: until the Deployment's `PUT`
+succeeds, the earlier version keeps answering, and **To go back** returns to
+it afterwards. A broken version shows itself in one of these ways:
+
+- **Its create stays `reconciling`**, and after two minutes the helper prints
+  `still {"status":"reconciling","error":{"code":"outcome_unconfirmed",…}}`.
+  The Host checks a WorkerVersion's code before the version can serve, and this
+  is usually that check refusing it: a syntax error, an import that does not
+  resolve, an exception at the module's top level or top-level work that runs
+  past a two-second limit, which also counts the runtime's start-up, or
+  `handlers` that is not exactly the list of handlers its default export
+  defines. A Binding or assets that the Host cannot use yet look the same. The
+  Host does not say which. It keeps retrying, and refuses to delete
+  the version while it retries (`409 resource_busy`), so the version, and the
+  Worker and bundle it names, stay. While it retries, the Worker's same-spec
+  update (**Record the Deployment**) is refused with `409 dependency_conflict`;
+  new versions and the Deployment's `PUT` still work. About ten minutes later,
+  and from then on, the readiness probe reports `degraded`. Check the code
+  before creating its version:
+  `bun build "$WORK/hello/v2/worker.js" --outdir "$(mktemp -d)"` reports syntax
+  errors and imports that do not resolve. Then ship the fix under new names, such
+  as `hello-bundle-v2-2` and `hello-version-v2-2`. If a Binding or assets were
+  the cause, making them available may let the retry finish by itself. (A Host
+  that cannot run the check at all leaves its versions `reconciling` too, and
+  they settle once it can; see
+  [the native test's notes](#ordinary-journey-native-test-and-known-gaps).)
+- **It serves, but answers an empty `500`**: the code threw.
+  `curl -sS -w '%{http_code}\n'` shows the status, which a bare `curl -sS` does
+  not print. The version, its Deployment and its Endpoint still show Ready, and
+  the console's overview still says **Serving**: they report that the Worker is
+  published, not that its responses succeed.
+- **A queue consumer throws**: its batch is retried, at least
+  `retryDelaySeconds` apart, until each message has been delivered
+  `maxRetries` + 1 times. Then the message is deleted, or moved to the
+  consumer's `deadLetterQueue`, an `AtLeastOnceQueue` its spec may name.
+  Nothing records the loss.
+
+The Host keeps no Worker logs. What a Worker writes with `console.log` or
+`console.error`, and the errors it throws, are discarded, not written to the
+journal. While you debug, catch the error and return it, where `handle` is your
+own handler:
+
+```js
+export default {
+  async fetch(request, env) {
+    try {
+      return await handle(request, env);
+    } catch (error) {
+      return new Response(String(error?.stack ?? error), { status: 500 });
+    }
+  }
+};
+```
+
+Remove it before the Worker is public: an error can carry details that are not
+meant to be shown.
 
 ### 11. Bind a SQLite database
 
@@ -1141,7 +1208,8 @@ and [SQLiteMigrationApplication 0.2.0](https://edge.forms.takoform.com/forms/SQL
 
 `sqlite-migration-set` accepts only `.sql` files and applies them in the byte
 order of their paths. The first `seed --config` of a migration set adds the
-`sqliteMigrationSet` block, which composes `SQLiteMigrationApplication 0.2.0`.
+`sqliteMigrationSet` block, which composes `SQLiteMigrationSet 0.2.0` and
+`SQLiteMigrationApplication 0.2.0`; until then the Host supports neither.
 Stop the Host, then seed the migrations and a bundle whose code uses the
 Binding, here named `DB`:
 
@@ -1208,14 +1276,162 @@ curl -sS "https://$NAME/"
 `GET /resources/$APPLICATION` shows `observed.ready: true` and the applied
 entries, and the Endpoint answers `hello from sqlite`.
 
-### 12. Delete Resources
+**In the console**, after the seeding and restart above, create the
+`SQLiteDatabase` `hello-db`; the `SQLiteMigrationSet` `hello-migrations-v1`,
+with `artifact.url` and `artifact.sha256` from `$WORK/migrations-v1.json`; and
+the `SQLiteMigrationApplication` `hello-migration-application`, choosing both.
+Create `hello-bundle-v3` from `$WORK/hello-v3.json`. Then open the version that
+serves now and choose **New version from this one**, choose `hello-bundle-v3`,
+and add `"sqliteBindings": [{"name": "DB", "resource": {"resourceUid": "…"}}]`
+to the spec, with `hello-db`'s UID from its page; the console does not offer
+Bindings to choose yet. Name it `hello-version-v3`, create it and serve it as
+in step 10.
+
+### 12. Bind KV, a bucket and a queue
+
+A Worker reaches a KV namespace, an object bucket or a queue the way it reaches
+a database: through a Binding in its WorkerVersion. `kvBindings` name an
+`EdgeKVNamespace`, `bucketBindings` an `ObjectBucket` and
+`queueProducerBindings` an `AtLeastOnceQueue`, each entry as
+`{name, resource: {resourceUid}}`. A Binding name is up to 64 ASCII letters,
+digits, `_` and `$`, not starting with a digit, such as `NOTES` (no `-`), and
+no var, secret or other Binding of the version may share it. To read a queue,
+a `QueueConsumer` names the queue and the Worker, the Worker's code exports a
+`queue` handler, and the version's `handlers` lists exactly the handlers that
+code's default export defines, here `fetch` and `queue`. The published Forms
+define each spec:
+[EdgeKVNamespace 0.2.0](https://edge.forms.takoform.com/forms/EdgeKVNamespace/0.2.0/),
+[ObjectBucket 0.2.0](https://edge.forms.takoform.com/forms/ObjectBucket/0.2.0/),
+[AtLeastOnceQueue 0.2.0](https://edge.forms.takoform.com/forms/AtLeastOnceQueue/0.2.0/)
+and [QueueConsumer 0.3.0](https://edge.forms.takoform.com/forms/QueueConsumer/0.3.0/).
+
+Check support, then create the three Resources. A queue's
+`messageRetentionSeconds` is required, from 60 to 1,209,600; here, four days:
+
+```sh
+for form in EdgeKVNamespace/0.2.0 ObjectBucket/0.2.0 AtLeastOnceQueue/0.2.0 \
+  QueueConsumer/0.3.0; do
+  curl -sS --fail-with-body -G "$V2/support" --data-urlencode "form=$F/$form/" \
+    -H "authorization: Bearer $KEY" | jq -c --arg form "$form" '{$form, supported}'
+done
+NAMESPACE=$(create EdgeKVNamespace/0.2.0 hello-kv '{}') &&
+BUCKET=$(create ObjectBucket/0.2.0 hello-bucket '{}') &&
+QUEUE=$(create AtLeastOnceQueue/0.2.0 hello-queue '{"messageRetentionSeconds":345600}')
+```
+
+Write code that uses all three. A request with `?note=` saves the note in the
+bucket and sends it to the queue; the `queue` handler keeps the last message it
+consumed in KV; any other request shows both:
+
+```sh
+mkdir -p -m 0700 "$WORK/hello/v4"
+cat > "$WORK/hello/v4/worker.js" <<'EOF'
+const text = (bytes) => new TextDecoder().decode(bytes);
+export default {
+  async fetch(request, env) {
+    const note = new URL(request.url).searchParams.get("note");
+    if (note !== null) {
+      await env.NOTES.put("latest.txt", note, { contentType: "text/plain" });
+      await env.JOBS.send(note);
+      return new Response("saved and queued\n");
+    }
+    const object = await env.NOTES.get("latest.txt", {});
+    const saved = object === null ? "nothing" : await new Response(object.body).text();
+    const seen = await env.SEEN.get("last");
+    return new Response("saved: " + saved + "\nconsumed: " + (seen === null ? "nothing" : text(seen)) + "\n");
+  },
+  async queue(batch, env) {
+    for (const message of batch.messages) await env.SEEN.put("last", text(message.body));
+    await batch.acknowledgeAll();
+  }
+};
+EOF
+```
+
+Give the Host its bytes as in step 10, with `v4` in place of `v2`, so that
+`$WORK/hello-v4.json` holds the artifact. Then create the bundle and a version
+that declares the `queue` handler and the three Bindings, serve it, and only
+then create the consumer:
+
+```sh
+BUNDLE_V4=$(create WorkerBundle/0.2.0 hello-bundle-v4 "$(jq -c '{artifact}' "$WORK/hello-v4.json")") &&
+spec=$(jq -nc --arg w "$WORKER" --arg b "$BUNDLE_V4" --arg k "$NAMESPACE" \
+    --arg o "$BUCKET" --arg q "$QUEUE" \
+  '{worker: {resourceUid: $w}, bundle: {resourceUid: $b}, handlers: ["fetch", "queue"],
+    kvBindings: [{name: "SEEN", resource: {resourceUid: $k}}],
+    bucketBindings: [{name: "NOTES", resource: {resourceUid: $o}}],
+    queueProducerBindings: [{name: "JOBS", resource: {resourceUid: $q}}]}') &&
+VERSION_V4=$(create WorkerVersion/0.5.0 hello-version-v4 "$spec") &&
+GENERATION=$(curl -sS --fail-with-body "$V2/resources/$DEPLOYMENT" \
+  -H "authorization: Bearer $KEY" | jq -r .generation) &&
+updated=$(jq -nc --arg w "$WORKER" --arg v "$VERSION_V4" \
+    '{spec: {worker: {resourceUid: $w}, versions: [{workerVersion: {resourceUid: $v}, weight: 10000}]}}' |
+  curl -sS --fail-with-body -X PUT "$V2/resources/$DEPLOYMENT" \
+    -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+    -H 'idempotency-key: takoserver-hello-deployment-v4' \
+    -H "takoform-expected-generation: $GENERATION" --data @-) &&
+wait_operation "$(printf '%s' "$updated" | jq -r .id)" hello-deployment-v4 &&
+spec=$(jq -nc --arg q "$QUEUE" --arg w "$WORKER" \
+  '{queue: {resourceUid: $q}, worker: {resourceUid: $w}, maxBatchSize: 10,
+    maxBatchTimeoutSeconds: 5, maxConcurrency: 1, maxRetries: 3, retryDelaySeconds: 0}') &&
+CONSUMER=$(create QueueConsumer/0.3.0 hello-consumer "$spec")
+```
+
+A `QueueConsumer` is refused with `409 dependency_conflict`, and nothing is
+stored, until the Worker's Deployment serves only versions whose `handlers`
+include `queue`. While it exists, keep `queue` in every version you serve: the
+Host does not refuse a Deployment that serves a version without it, but it then
+delivers nothing to the Worker until every served version declares `queue`
+again, and the messages wait only as long as the queue's retention. Now send a
+note and read it back:
+
+```sh
+curl -sS "https://$NAME/?note=first"
+curl -sS "https://$NAME/"
+```
+
+The first answers `saved and queued`. The second shows `saved: first`, and
+`consumed: first` once the consumer has run, within a few seconds of the batch
+timeout; ask again while it still says `nothing`. If it still does after a
+minute, the consumer is probably throwing, and a message whose retries ran out
+is gone; see [When a new version does not work](#when-a-new-version-does-not-work).
+
+These Bindings follow the Takoform interfaces `edge.kv`, `edge.objects` and
+`edge.queue`, not Cloudflare's, and code written for Cloudflare's breaks where
+they differ:
+
+| Call | On this Host | Refused or wrong |
+| --- | --- | --- |
+| KV `get(key)` | Resolves to an `ArrayBuffer`, or `null`; decode text with `TextDecoder`. | A second argument such as `"text"` throws `TypeError`; using the result as a string gives `[object ArrayBuffer]`. |
+| KV `put(key, value, options)` | `value` is a string or bytes; `options` may hold `expirationTtlSeconds` (60 or more) and `metadata`. | `expirationTtl` or `expiration` throws `TypeError`. |
+| Bucket `get(key, options)` | Resolves to `{etag, size, contentType, body, partial}`, or `null`; read `body` with `new Response(object.body).text()`. | `object.text()` and `object.json()` do not exist. |
+| Bucket `put(key, body, options)` | `body` is a string, an `ArrayBuffer` or a byte `ReadableStream`; a stream needs `contentLength`. | A `Uint8Array` throws `TypeError`; pass its buffer slice. A stream without `contentLength` fails with `invalid_body`. |
+| Queue `send(body, options)` | `body` is a string or bytes; `options` may hold `delaySeconds`. | An object fails with `invalid_body`; send `JSON.stringify(value)`. |
+| `queue(batch, env, ctx)` | Each of `batch.messages` is `{id, timestampMillis, body, attempts}`, with `body` a `Uint8Array`. Settle with `batch.acknowledge(id)`, `batch.retry(id, delaySeconds)`, `batch.acknowledgeAll()` or `batch.retryAll(delaySeconds)`. When the handler returns, messages left unsettled are acknowledged; when it throws, they are retried. | `message.ack()` and `message.retry()` do not exist; calling one throws, so the batch is retried. |
+
+`tests/selfhost-v2-ordinary-journey-native.test.ts` runs a KV namespace, a
+queue and its consumer this way with real Host and workerd processes, and
+`tests/selfhost-v2-mixed-binding-process-recovery.test.ts` a bucket.
+
+**In the console**, create `hello-kv`, `hello-bucket` and `hello-queue`: each
+dialog starts from a spec the Host accepts. Create `hello-bundle-v4` as in
+step 10. Then open the version that serves now and choose **New version from
+this one**, choose `hello-bundle-v4`, and in the spec add `"queue"` to
+`handlers` and the three Binding arrays above, with each Resource's UID from
+its page; the console does not offer Bindings to choose yet. A copy of step
+11's v3 keeps its `DB` Binding, which does no harm. Name it
+`hello-version-v4`, create it and serve it. Once that update has succeeded,
+create the `QueueConsumer` `hello-consumer`, choosing `hello-queue` and
+`hello`.
+
+### 13. Delete Resources
 
 DELETE needs an `Idempotency-Key` and the Resource's current generation, like
 PUT. Without a valid key it is refused with `400`; with one but without
 `takoform-expected-generation`, with `428` `expected_generation_required`. A
 Resource that another Resource still names is refused with `409`
 `dependency_conflict`, so delete in reference order. Leave out the Resources of
-steps 10 and 11 that you did not create:
+steps 10 to 12 that you did not create:
 
 ```sh
 remove() { # remove <resourceUid> <label>
@@ -1226,12 +1442,16 @@ remove() { # remove <resourceUid> <label>
       -H "takoform-expected-generation: $generation") || { echo "$2: $removed" >&2; return 1; }
   wait_operation "$(printf '%s' "$removed" | jq -r .id)" "$2"
 }
+remove "$CONSUMER" consumer &&
 remove "$ENDPOINT" endpoint &&
 remove "$DEPLOYMENT" deployment &&
-remove "$VERSION_V3" version-v3 && remove "$VERSION_V2" version-v2 && remove "$VERSION" version-v1 &&
-remove "$BUNDLE_V3" bundle-v3 && remove "$BUNDLE_V2" bundle-v2 && remove "$BUNDLE" bundle-v1 &&
+remove "$VERSION_V4" version-v4 && remove "$VERSION_V3" version-v3 &&
+remove "$VERSION_V2" version-v2 && remove "$VERSION" version-v1 &&
+remove "$BUNDLE_V4" bundle-v4 && remove "$BUNDLE_V3" bundle-v3 &&
+remove "$BUNDLE_V2" bundle-v2 && remove "$BUNDLE" bundle-v1 &&
 remove "$APPLICATION" migration-application && remove "$MIGRATIONS" migration-set &&
 remove "$DATABASE" database &&
+remove "$NAMESPACE" kv && remove "$BUCKET" bucket && remove "$QUEUE" queue &&
 remove "$WORKER" worker
 ```
 
