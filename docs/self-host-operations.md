@@ -1160,9 +1160,10 @@ it afterwards. A broken version shows itself in one of these ways:
   `bun build "$WORK/hello/v2/worker.js" --outdir "$(mktemp -d)"` reports syntax
   errors and imports that do not resolve. Then ship the fix under new names, such
   as `hello-bundle-v2-2` and `hello-version-v2-2`. If a Binding or assets were
-  the cause, making them available may let the retry finish by itself. (A Host that cannot run the
-  check at all leaves its versions `reconciling` too, and they settle once it
-  can; see [the native test's notes](#ordinary-journey-native-test-and-known-gaps).)
+  the cause, making them available may let the retry finish by itself. (A Host
+  that cannot run the check at all leaves its versions `reconciling` too, and
+  they settle once it can; see
+  [the native test's notes](#ordinary-journey-native-test-and-known-gaps).)
 - **It serves, but answers an empty `500`**: the code threw.
   `curl -sS -w '%{http_code}\n'` shows the status, which a bare `curl -sS` does
   not print. The version, its Deployment and its Endpoint still show Ready, and
