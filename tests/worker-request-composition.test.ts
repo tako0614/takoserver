@@ -2,13 +2,17 @@ import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import * as financialRequestOrigin from "@takoserver/core/financial-request-origin";
 import sharedPricing from "../config/shared-hosted-pricing.json";
 import { moneyFenceInstallSql } from "../scripts/deploy/schema-money-unit-cutover.ts";
-import { assertAuthTokenCaptureReader } from "../src/auth.ts";
+import {
+  assertAuthTokenCaptureReader,
+  assertRetainedDirectOwnerSessionReader,
+} from "../src/auth.ts";
 import { additiveAuthDDL, additiveAuthTokenDDL } from "../src/auth-authority-schema-plan.ts";
 import { createCredentialAuthorityClassStore } from "../src/credential-authority-class.ts";
 import { createWorkerEntry, type WorkerEnv } from "../src/entry-worker.ts";
 import { verifyHostedBillingFinancialRealm } from "../src/hosted-billing-realm.ts";
 import { compilePricingAuthoring } from "../src/hosted-pricing.ts";
-import { bytesDigest } from "../src/json.ts";
+import { resolveIdentity } from "../src/identity-setup.ts";
+import { base64UrlEncode, bytesDigest } from "../src/json.ts";
 import {
   MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL,
   MONEY_CUTOVER_FREEZE_DDL,
@@ -23,15 +27,18 @@ import { createSharedPrincipalAuthorityStore } from "../src/shared-principal-aut
 import type { D1DatabaseLike, D1ResultLike, D1StatementLike } from "../src/sql-d1.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
 import {
+  captureWorkerRequestRetainedDirectOwnerSession,
   captureWorkerRequestRetainedRpSession,
   captureWorkerSharedAuthStaging,
   createWorkerPrimaryRequestSql,
   createWorkerRequestConsumers,
+  createWorkerRequestConsumersWithUnregisteredLocalIssuer,
   createWorkerRequestSql,
   observeWorkerRequestAuthSchema,
   readWorkerRequestConsumers,
   readWorkerRequestFinancialAuthSchemaObservation,
   readWorkerRequestFinancialInputs,
+  readWorkerRequestRetainedCredentialInputs,
   readWorkerRequestRetainedRpCapture,
   type WorkerRequestDatabase,
   type WorkerRequestSql,
@@ -224,7 +231,7 @@ async function fixture(
       },
     },
   );
-  async function consumers() {
+  async function consumers(localIdentity?: ReturnType<typeof resolveIdentity>["verifier"]) {
     const connection = await connect();
     const realm = await verifyHostedBillingFinancialRealm({
       sql: connection.sql,
@@ -248,6 +255,13 @@ async function fixture(
       publicOrigin: SHARED_AUTH_STAGING_PROFILE.publicOrigin,
       consoleOrigin: SHARED_AUTH_STAGING_PROFILE.consoleOrigin,
     };
+    if (localIdentity !== undefined) {
+      const localInputs = { ...inputs, identity: localIdentity };
+      return {
+        inputs: localInputs,
+        runtime: createWorkerRequestConsumersWithUnregisteredLocalIssuer(localInputs),
+      };
+    }
     return { inputs, runtime: createWorkerRequestConsumers(inputs) };
   }
   const env: WorkerEnv = {
@@ -1427,4 +1441,349 @@ describe("Worker original RP final-touch retained DATA", () => {
       expect(r.f.sessions).toHaveLength(1);
     });
   }
+});
+
+// The existing request fixture plus the real local verifier/issuer. This keeps
+// candidate target DATA explicit and supplies no qualified target, Clock or human.
+async function retainedDirectRequestFixture() {
+  const now = Date.now();
+  const control: {
+    onResult?: (result: SqlWrite) => D1ResultLike | undefined;
+    onClock?: () => void;
+  } = {};
+  const clock = () => {
+    control.onClock?.();
+    return new Date(now);
+  };
+  const f = await fixture(
+    (result) => control.onResult?.(result) ?? acknowledgement(result),
+    undefined,
+    clock,
+  );
+  f.db.exec(additiveAuthTokenDDL);
+  const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+  const publicKey = await crypto.subtle.exportKey("jwk", pair.publicKey);
+  const audience = SHARED_AUTH_STAGING_PROFILE.publicOrigin;
+  const identity = resolveIdentity({
+    operatorPublicKeyJwk: { kty: "OKP", crv: "Ed25519", x: String(publicKey.x) },
+    operatorAudience: audience,
+    clock,
+  }).verifier;
+  const { inputs, runtime } = await f.consumers(identity);
+  const accounts = runtime.accounts;
+  assertRetainedDirectOwnerSessionReader(accounts, { sql: inputs.sql });
+  const payload = base64UrlEncode(
+    new TextEncoder().encode(
+      JSON.stringify({
+        purpose: "sign-in",
+        aud: audience,
+        provider: "google",
+        subject: "retained-request-local",
+        email: "retained-request-local@example.test",
+        displayName: "Retained request local",
+        iat: Math.floor(now / 1000),
+        exp: Math.floor(now / 1000) + 300,
+      }),
+    ),
+  );
+  const signature = await crypto.subtle.sign(
+    "Ed25519",
+    pair.privateKey,
+    new TextEncoder().encode(payload),
+  );
+  const issued = await accounts.signIn({
+    provider: "google",
+    method: "operator-assertion",
+    audience,
+    assertion: `${payload}.${base64UrlEncode(new Uint8Array(signature))}`,
+  });
+  const authorization = `Bearer ${issued.sessionToken}`;
+  const queries = () => f.sessions[0]?.queries ?? [];
+  return {
+    f,
+    inputs,
+    accounts,
+    issued,
+    control,
+    now,
+    authorization,
+    queries,
+    lastSql: () => queries().at(-1) ?? "",
+    capture: (connection = inputs.connection) =>
+      captureWorkerRequestRetainedDirectOwnerSession(connection, authorization),
+    read: (capture: unknown, connection = inputs.connection) =>
+      readWorkerRequestRetainedCredentialInputs(connection, capture),
+  };
+}
+
+const retainedDirectRequestPrefixes = [
+  "SELECT id, kind, principal_id",
+  "SELECT * FROM credential_authority_classes",
+  "SELECT * FROM auth_principal_incarnations",
+  "SELECT CASE WHEN ",
+] as const;
+
+function directRequestReadCounts(queries: readonly string[]): number[] {
+  return retainedDirectRequestPrefixes.map(
+    (prefix) => queries.filter((query) => query.startsWith(prefix)).length,
+  );
+}
+
+describe("Worker original retained credential inputs", () => {
+  test("official reader preserves the direct handle and original request DATA", async () => {
+    const r = await retainedDirectRequestFixture();
+    expect(financialRequestOrigin.captureWorkerRequestRetainedDirectOwnerSession).toBe(
+      captureWorkerRequestRetainedDirectOwnerSession,
+    );
+    expect(financialRequestOrigin.readWorkerRequestRetainedCredentialInputs).toBe(
+      readWorkerRequestRetainedCredentialInputs,
+    );
+    const raw = await r.accounts.captureAuthenticatedToken(r.authorization);
+    expect(r.read(raw)).toBeNull();
+    const before = r.queries().length;
+    const capture = await financialRequestOrigin.captureWorkerRequestRetainedDirectOwnerSession(
+      r.inputs.connection,
+      r.authorization,
+    );
+    expect(capture).not.toBeNull();
+    expect(directRequestReadCounts(r.queries().slice(before))).toEqual([1, 1, 1, 1]);
+    const original = r.accounts.readRetainedDirectOwnerSessionCapture(capture);
+    expect(original).not.toBeNull();
+    const afterCapture = r.queries().length;
+    const selected = financialRequestOrigin.readWorkerRequestRetainedCredentialInputs(
+      r.inputs.connection,
+      capture,
+    );
+    expect(selected?.inputs).toBe(readWorkerRequestFinancialInputs(r.inputs.connection));
+    expect(selected?.credentialOriginal).toBe(original);
+    expect(selected?.credentialOriginal.backend).toBe("auth-token");
+    expect(original?.record.origin.principalId).toBe(r.issued.principal.id);
+    expect(original?.record.origin.targetRef).toBe("auth103:unregistered-local-candidate");
+    expect(Object.isFrozen(selected)).toBe(true);
+    expect(r.read(null)).toBeNull();
+    expect(r.read({ ...capture })).toBeNull();
+    expect(r.read(await r.accounts.authenticate(r.authorization))).toBeNull();
+    let getterReads = 0;
+    expect(
+      r.read({
+        get record(): never {
+          getterReads++;
+          throw new Error("capture getter");
+        },
+      }),
+    ).toBeNull();
+    const other = await r.f.consumers();
+    expect(r.read(capture, other.inputs.connection)).toBeNull();
+    expect(r.queries().length).toBe(afterCapture + 1); // ordinary authenticate above only
+    const forged: WorkerRequestSql = {
+      moneyGuard: "ready",
+      get sql(): never {
+        getterReads++;
+        throw new Error("connection getter");
+      },
+    };
+    const beforeForged = r.f.sessions.map((session) => session.queries.length);
+    await expect(r.capture(forged)).rejects.toThrow("not been constructed");
+    expect(() => r.read(capture, forged)).toThrow("not been constructed");
+    expect(r.f.sessions.map((session) => session.queries.length)).toEqual(beforeForged);
+    expect(getterReads).toBe(0);
+  });
+
+  test("unified reader preserves the original RP and separate selected scope", async () => {
+    const r = await retainedRpFixture();
+    expect(financialRequestOrigin.captureWorkerRequestRetainedRpSession).toBe(
+      captureWorkerRequestRetainedRpSession,
+    );
+    expect(financialRequestOrigin.readWorkerRequestRetainedRpCapture).toBe(
+      readWorkerRequestRetainedRpCapture,
+    );
+    const capture = await r.capture();
+    expect(capture).not.toBeNull();
+    const original = r.read(capture);
+    const before = r.f.sessions.map((session) => session.queries.length);
+    const selected = readWorkerRequestRetainedCredentialInputs(r.inputs.connection, capture);
+    expect(selected?.inputs).toBe(readWorkerRequestFinancialInputs(r.inputs.connection));
+    expect(selected?.credentialOriginal).toBe(original);
+    if (selected?.credentialOriginal.backend !== "shared-rp-session")
+      throw new Error("RP original was not recognized");
+    expect(selected.credentialOriginal.record.rp.workspaceId).toBe(SESSION_TEST_PERSONAL.id);
+    expect(selected.credentialOriginal.record.rp.enrolledSessionVersion).toBe(0);
+    expect(selected.credentialOriginal.selectedScope.workspaceId).toBe(
+      SESSION_TEST_ORGANIZATION.id,
+    );
+    expect(selected.credentialOriginal.record.organizationId).toBe("synthetic:credential-row-org");
+    expect(
+      readWorkerRequestRetainedCredentialInputs(r.inputs.connection, { ...capture }),
+    ).toBeNull();
+    expect(readWorkerRequestRetainedCredentialInputs(r.inputs.connection, null)).toBeNull();
+    expect(r.f.sessions.map((session) => session.queries.length)).toEqual(before);
+    const other = await r.f.consumers();
+    expect(readWorkerRequestRetainedCredentialInputs(other.inputs.connection, capture)).toBeNull();
+  });
+
+  for (const mutation of ["getter", "replacement"] as const) {
+    test(`actual direct read refuses ${mutation} query substitution`, async () => {
+      const r = await retainedDirectRequestFixture();
+      const descriptor = Object.getOwnPropertyDescriptor(r.inputs.sql, "query");
+      if (!descriptor || !("value" in descriptor)) throw new Error("original query missing");
+      let changed = false;
+      let substitutedCalls = 0;
+      r.control.onResult = () => {
+        if (!changed && r.lastSql().startsWith(retainedDirectRequestPrefixes[0])) {
+          changed = true;
+          Object.defineProperty(
+            r.inputs.sql,
+            "query",
+            mutation === "getter"
+              ? {
+                  configurable: true,
+                  get(): never {
+                    substitutedCalls++;
+                    throw new Error("query getter must not run");
+                  },
+                }
+              : {
+                  configurable: true,
+                  value: async () => {
+                    substitutedCalls++;
+                    throw new Error("query replacement must not run");
+                  },
+                },
+          );
+        }
+        return undefined;
+      };
+      const before = r.queries().length;
+      try {
+        await expect(r.capture()).rejects.toMatchObject({ code: "invalid" });
+        expect(changed).toBe(true);
+        expect(substitutedCalls).toBe(0);
+        expect(directRequestReadCounts(r.queries().slice(before))).toEqual([1, 0, 0, 0]);
+      } finally {
+        Object.defineProperty(r.inputs.sql, "query", descriptor);
+      }
+    });
+  }
+
+  test("capture reasserts original Accounts after the actual Auth method finishes", async () => {
+    const r = await retainedDirectRequestFixture();
+    const descriptor = Object.getOwnPropertyDescriptor(
+      r.accounts,
+      "captureRetainedDirectOwnerSession",
+    );
+    if (!descriptor || !("value" in descriptor)) throw new Error("original capture missing");
+    let changed = false;
+    let getterReads = 0;
+    let returned = false;
+    r.control.onResult = () => {
+      if (r.lastSql().startsWith(retainedDirectRequestPrefixes[3])) {
+        // Auth's final expiry Clock read is after its last internal origin check.
+        r.control.onClock = () => {
+          delete r.control.onClock;
+          changed = true;
+          Object.defineProperty(r.accounts, "captureRetainedDirectOwnerSession", {
+            configurable: true,
+            get(): never {
+              getterReads++;
+              throw new Error("capture getter must not run");
+            },
+          });
+        };
+      }
+      return undefined;
+    };
+    const before = r.queries().length;
+    try {
+      await expect(
+        r.capture().then((capture) => {
+          returned = true;
+          return capture;
+        }),
+      ).rejects.toMatchObject({ code: "invalid" });
+      expect(changed).toBe(true);
+      expect(returned).toBe(false);
+      expect(getterReads).toBe(0);
+      expect(directRequestReadCounts(r.queries().slice(before))).toEqual([1, 1, 1, 1]);
+    } finally {
+      delete r.control.onClock;
+      Object.defineProperty(r.accounts, "captureRetainedDirectOwnerSession", descriptor);
+    }
+  });
+
+  test("unknown currentness never retries authentication or falls back", async () => {
+    const r = await retainedDirectRequestFixture();
+    let unknownReached = false;
+    r.control.onResult = () => {
+      if (r.lastSql().startsWith(retainedDirectRequestPrefixes[3])) {
+        unknownReached = true;
+        throw new Error("component unknown currentness");
+      }
+      return undefined;
+    };
+    const before = r.queries().length;
+    await expect(r.capture()).rejects.toMatchObject({ code: "unavailable" });
+    expect(unknownReached).toBe(true);
+    expect(directRequestReadCounts(r.queries().slice(before))).toEqual([1, 1, 1, 1]);
+    expect(r.f.sessions).toHaveLength(1);
+  });
+
+  for (const mutation of ["getter", "replacement"] as const) {
+    test(`unified reader refuses ${mutation} inspector substitution`, async () => {
+      const r = await retainedDirectRequestFixture();
+      const capture = await r.capture();
+      expect(capture).not.toBeNull();
+      const descriptor = Object.getOwnPropertyDescriptor(
+        r.accounts,
+        "readRetainedDirectOwnerSessionCapture",
+      );
+      if (!descriptor || !("value" in descriptor)) throw new Error("original inspector missing");
+      let calls = 0;
+      Object.defineProperty(
+        r.accounts,
+        "readRetainedDirectOwnerSessionCapture",
+        mutation === "getter"
+          ? {
+              configurable: true,
+              get(): never {
+                calls++;
+                throw new Error("inspector getter must not run");
+              },
+            }
+          : {
+              configurable: true,
+              value: () => {
+                calls++;
+                return null;
+              },
+            },
+      );
+      const before = r.queries().length;
+      try {
+        expect(() => r.read(capture)).toThrow();
+        expect(calls).toBe(0);
+        expect(r.queries()).toHaveLength(before);
+      } finally {
+        Object.defineProperty(r.accounts, "readRetainedDirectOwnerSessionCapture", descriptor);
+      }
+    });
+  }
+
+  test("retained history survives retirement while a new capture fails closed", async () => {
+    const r = await retainedDirectRequestFixture();
+    const capture = await r.capture();
+    const original = r.read(capture);
+    if (original?.credentialOriginal.backend !== "auth-token")
+      throw new Error("direct original missing");
+    await createCredentialAuthorityClassStore({ sql: r.inputs.sql }).retire(
+      original.credentialOriginal.record.origin,
+      {
+        reason: "component-retirement",
+        at: new Date(r.now).toISOString(),
+        ref: "component-retirement",
+      },
+    );
+    expect(await r.capture()).toBeNull();
+    expect(r.read(capture)?.credentialOriginal).toBe(original.credentialOriginal);
+    expect(await r.accounts.authenticate(r.authorization)).toMatchObject({ kind: "session" });
+  });
 });

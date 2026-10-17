@@ -3,10 +3,14 @@ import {
   type ApiKeyAdministration,
   type AuthTokenCaptureReader,
   assertAuthTokenCaptureReader,
+  assertRetainedDirectOwnerSessionReader,
+  type AuthenticatedTokenCapture,
   createAccounts,
   createAccountsWithUnregisteredLocalIssuer,
   createApiKeyAdministration,
   type ExternalIdentityVerifier,
+  type RetainedDirectOwnerSessionData,
+  type RetainedDirectOwnerSessionReader,
 } from "./auth.ts";
 import {
   createCredentialAuthorityClassStore,
@@ -378,6 +382,88 @@ export function readWorkerRequestRetainedRpCapture(
   if (!capture || typeof capture !== "object") return null;
   const original = retainedRpCaptures.get(capture);
   return original?.connection === connection ? original.data : null;
+}
+
+/** Original request inputs plus retained historical DATA, not an authority port.
+ * Schema/physical target, distinct human, policy Clock and final current admission
+ * remain unqualified. The existing opaque credential is never rebranded here.
+ */
+export interface WorkerRequestRetainedCredentialInputs {
+  readonly inputs: WorkerRequestFinancialInputs;
+  readonly credentialOriginal: RetainedDirectOwnerSessionData | WorkerRequestRetainedRpData;
+}
+
+/** One actual same-Accounts capture; unknown reads are propagated without fallback. */
+export async function captureWorkerRequestRetainedDirectOwnerSession(
+  connection: WorkerRequestSql,
+  authorization: string | null,
+): Promise<AuthenticatedTokenCapture | null> {
+  assertWorkerRequestBacking(connection);
+  const inputs = readWorkerRequestFinancialInputs(connection);
+  const consumers = readWorkerRequestConsumers(connection);
+  const receiver = consumers.accounts;
+  assertRetainedDirectOwnerSessionReader(receiver, { sql: inputs.sql });
+  const descriptor = Object.getOwnPropertyDescriptor(receiver, "captureRetainedDirectOwnerSession");
+  if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "function")
+    throw new TypeError("Worker retained direct capture method differs");
+  const capture: RetainedDirectOwnerSessionReader["captureRetainedDirectOwnerSession"] =
+    descriptor.value;
+  const assertOriginal = () => {
+    assertWorkerRequestBacking(connection);
+    if (
+      readWorkerRequestFinancialInputs(connection) !== inputs ||
+      readWorkerRequestConsumers(connection) !== consumers
+    )
+      throw new TypeError("Worker retained direct request origin differs");
+    assertRetainedDirectOwnerSessionReader(receiver, { sql: inputs.sql });
+    if (
+      Object.getOwnPropertyDescriptor(receiver, "captureRetainedDirectOwnerSession")?.value !==
+      capture
+    )
+      throw new TypeError("Worker retained direct capture method differs");
+  };
+  assertOriginal();
+  const original: AuthenticatedTokenCapture | null = await Reflect.apply(capture, receiver, [
+    authorization,
+  ]);
+  assertOriginal();
+  return original;
+}
+
+/** Actual readers select their own handle; a caller supplies no family or grant.
+ * Invalid request graphs throw. Unknown, copied or foreign captures return null.
+ */
+export function readWorkerRequestRetainedCredentialInputs(
+  connection: WorkerRequestSql,
+  originalCapture: unknown,
+): WorkerRequestRetainedCredentialInputs | null {
+  assertWorkerRequestBacking(connection);
+  const inputs = readWorkerRequestFinancialInputs(connection);
+  const consumers = readWorkerRequestConsumers(connection);
+  const receiver = consumers.accounts;
+  assertRetainedDirectOwnerSessionReader(receiver, { sql: inputs.sql });
+  if (typeof originalCapture !== "object" || originalCapture === null) return null;
+  const descriptor = Object.getOwnPropertyDescriptor(
+    receiver,
+    "readRetainedDirectOwnerSessionCapture",
+  );
+  if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "function")
+    throw new TypeError("Worker retained direct reader method differs");
+  const read: RetainedDirectOwnerSessionReader["readRetainedDirectOwnerSessionCapture"] =
+    descriptor.value;
+  const direct: RetainedDirectOwnerSessionData | null = Reflect.apply(read, receiver, [
+    originalCapture,
+  ]);
+  const credentialOriginal =
+    direct ?? readWorkerRequestRetainedRpCapture(connection, originalCapture);
+  assertWorkerRequestBacking(connection);
+  if (
+    readWorkerRequestFinancialInputs(connection) !== inputs ||
+    readWorkerRequestConsumers(connection) !== consumers
+  )
+    throw new TypeError("Worker retained credential request origin differs");
+  assertRetainedDirectOwnerSessionReader(receiver, { sql: inputs.sql });
+  return credentialOriginal ? Object.freeze({ inputs, credentialOriginal }) : null;
 }
 
 /** Original in-process RP observer/selection port; no HTTP path or raw Sql accessor. */
