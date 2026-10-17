@@ -896,6 +896,8 @@ describe("split Takoserver Worker surfaces", () => {
       "src/public-form-implementation-build.ts",
       "src/public-form-runtime.ts",
       "src/public-worker-implementation.ts",
+      "src/shared-app-ledger.ts",
+      "src/shared-app-name.ts",
       "src/sqlite-migration-policy.ts",
       "src/standard-service-port.ts",
       "src/strict-json.ts",
