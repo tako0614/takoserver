@@ -1208,3 +1208,317 @@ describe("genuine Hosted subscription adapter and original grant writer", () => 
     }
   });
 });
+
+// Preparation DATA is exercised through the actual writer-owned extension graph.
+// The processor in this fixture is explicit fake transport; no Root authority is asserted.
+async function cancellationCommandRows(f: Awaited<ReturnType<typeof fixture>>) {
+  return await Promise.all([
+    f.sql.query("SELECT * FROM stripe_subscription_cancellation_intents ORDER BY id"),
+    f.sql.query("SELECT * FROM stripe_billing_plan_changes ORDER BY org_id,reference"),
+    f.sql.query("SELECT * FROM stripe_billing_plan_change_slots ORDER BY org_id"),
+    f.sql.query("SELECT * FROM stripe_billing_plan_change_steps ORDER BY org_id,reference,step"),
+  ]);
+}
+
+describe("CANCEL economic preparation DATA across both actual command branches", () => {
+  for (const phase of [false, true]) {
+    const branch = phase ? "pending-plan-change" : "legacy";
+    test(`${branch}: observes the exact tuple without a new command, slot or provider mutation, then preserves the direct command`, async () => {
+      const f = await fixture();
+      try {
+        const ref = await f.begin();
+        if (phase) await f.change(ref);
+        const prepare = f.writer.prepareCancellationEconomicR1;
+        if (!prepare) throw new Error("missing qualified cancellation DATA selector");
+        const planMethods = f.writer.subscriptionPlans ?? {};
+        expect("preparePendingCancellationEconomicR1" in planMethods).toBe(false);
+        const before = await cancellationCommandRows(f);
+        const calls = f.calls.length;
+        const generation = (
+          await f.sql.query(
+            "SELECT association_generation FROM stripe_billing_associations WHERE subscription_id=?",
+            [SUB],
+          )
+        )[0]?.association_generation;
+        const input = {
+          organizationId: ORG,
+          reference: `prepare-${branch}`,
+          expectedSubscriptionRef: ref,
+        };
+        const selected = await prepare(input);
+        expect(selected).toEqual({
+          kind: "cancel",
+          expectedSubscriptionRef: ref,
+          targetSubscriptionId: SUB,
+          targetGeneration: generation,
+          branch,
+          pendingReference: phase ? "actual-upgrade" : null,
+          scheduleId: phase ? "sub_sched_actual" : null,
+          cancelAtPeriodEnd: true,
+        });
+        expect(Object.isFrozen(selected)).toBe(true);
+        expect(await cancellationCommandRows(f)).toEqual(before);
+        expect(
+          f.calls
+            .slice(calls)
+            .some((call) => call.method === "GET" && call.path === `/v1/subscriptions/${SUB}`),
+        ).toBe(true);
+        expect(f.calls.slice(calls).filter((call) => call.method !== "GET")).toEqual([]);
+        expect(
+          await f.writer.subscriptions.change({ ...input, cancelAtPeriodEnd: true }),
+        ).toMatchObject({
+          state: "verified",
+          subscriptionRef: ref,
+          effectiveAt: NEXT,
+        });
+        const original = await cancellationCommandRows(f);
+        await expect(prepare(input)).rejects.toMatchObject({
+          code: "subscription_management_conflict",
+        });
+        expect(await cancellationCommandRows(f)).toEqual(original);
+        expect(
+          f.calls.filter(
+            (call) => call.method === "POST" && call.path === `/v1/subscriptions/${SUB}`,
+          ),
+        ).toHaveLength(1);
+      } finally {
+        f.db.close();
+      }
+    });
+
+    test(`${branch}: a wrong expected target creates no command and never dispatches`, async () => {
+      const f = await fixture();
+      try {
+        const ref = await f.begin();
+        if (phase) await f.change(ref);
+        const before = await cancellationCommandRows(f);
+        const calls = f.calls.length;
+        await expect(
+          f.writer.prepareCancellationEconomicR1?.({
+            organizationId: ORG,
+            reference: `wrong-${branch}`,
+            expectedSubscriptionRef: `sra_${"0".repeat(64)}`,
+          }),
+        ).rejects.toBeTruthy();
+        expect(await cancellationCommandRows(f)).toEqual(before);
+        expect(f.calls.slice(calls).filter((call) => call.method !== "GET")).toEqual([]);
+      } finally {
+        f.db.close();
+      }
+    });
+
+    test(`${branch}: an original unknown cancellation remains original GET-only recovery across restart`, async () => {
+      const f = await fixture();
+      try {
+        const ref = await f.begin();
+        if (phase) await f.change(ref);
+        const input = {
+          organizationId: ORG,
+          reference: `unknown-${branch}`,
+          expectedSubscriptionRef: ref,
+          cancelAtPeriodEnd: true,
+        };
+        f.lose("native-cancel");
+        expect(await f.writer.subscriptions.change(input)).toEqual({
+          state: "pending",
+          subscriptionRef: ref,
+        });
+        const original = await cancellationCommandRows(f);
+        const posts = f.calls.filter((call) => call.method === "POST");
+        f.restart();
+        await expect(f.writer.prepareCancellationEconomicR1?.(input)).rejects.toMatchObject({
+          code: "subscription_management_conflict",
+        });
+        expect(await cancellationCommandRows(f)).toEqual(original);
+        await expect(
+          f.writer.prepareCancellationEconomicR1?.({ ...input, reference: `another-${branch}` }),
+        ).rejects.toBeTruthy();
+        expect(await cancellationCommandRows(f)).toEqual(original);
+        expect(await f.writer.subscriptions.change(input)).toEqual({
+          state: "pending",
+          subscriptionRef: ref,
+        });
+        expect(f.calls.filter((call) => call.method === "POST")).toEqual(posts);
+        f.recoverNativeCancellation();
+        expect(await f.writer.subscriptions.change(input)).toMatchObject({
+          state: "verified",
+          subscriptionRef: ref,
+          effectiveAt: NEXT,
+        });
+        expect(f.calls.filter((call) => call.method === "POST")).toEqual(posts);
+        expect(await f.writer.subscriptions.change(input)).toMatchObject({
+          state: "verified",
+          subscriptionRef: ref,
+          effectiveAt: NEXT,
+        });
+        expect(f.calls.filter((call) => call.method === "POST")).toEqual(posts);
+      } finally {
+        f.db.close();
+      }
+    });
+
+    test(`${branch}: native readback failure refuses DATA without dispatch or new custody`, async () => {
+      const f = await fixture();
+      try {
+        const ref = await f.begin();
+        if (phase) await f.change(ref);
+        const original = f.subscriptions.get(SUB);
+        f.subscriptions.delete(SUB);
+        const before = await cancellationCommandRows(f);
+        const calls = f.calls.length;
+        await expect(
+          f.writer.prepareCancellationEconomicR1?.({
+            organizationId: ORG,
+            reference: `native-missing-${branch}`,
+            expectedSubscriptionRef: ref,
+          }),
+        ).rejects.toBeTruthy();
+        expect(await cancellationCommandRows(f)).toEqual(before);
+        expect(f.calls.slice(calls).filter((call) => call.method !== "GET")).toEqual([]);
+        if (original) f.subscriptions.set(SUB, original);
+      } finally {
+        f.db.close();
+      }
+    });
+  }
+
+  test("an unverified real phase slot refuses preparation while its original workflow owns dispatch", async () => {
+    const f = await fixture();
+    let release!: () => void;
+    let pending: ReturnType<typeof f.change> | undefined;
+    try {
+      const ref = await f.begin();
+      let entered!: () => void;
+      const waiting = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      f.gate({
+        entered,
+        resume: new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+      });
+      pending = f.change(ref);
+      await waiting;
+      const before = await cancellationCommandRows(f);
+      const posts = f.calls.filter((call) => call.method === "POST");
+      await expect(
+        f.writer.prepareCancellationEconomicR1?.({
+          organizationId: ORG,
+          reference: "blocked-pending-slot",
+          expectedSubscriptionRef: ref,
+        }),
+      ).rejects.toMatchObject({ code: "subscription_management_conflict" });
+      expect(await cancellationCommandRows(f)).toEqual(before);
+      expect(f.calls.filter((call) => call.method === "POST")).toEqual(posts);
+    } finally {
+      release?.();
+      await pending;
+      f.db.close();
+    }
+  });
+
+  test("a verified pending slot cannot substitute a different or missing native schedule", async () => {
+    const f = await fixture();
+    try {
+      const ref = await f.begin();
+      await f.change(ref);
+      const sub = f.subscriptions.get(SUB);
+      if (!sub) throw new Error("missing original subscription");
+      sub.schedule = null;
+      const before = await cancellationCommandRows(f);
+      const calls = f.calls.length;
+      await expect(
+        f.writer.prepareCancellationEconomicR1?.({
+          organizationId: ORG,
+          reference: "wrong-schedule",
+          expectedSubscriptionRef: ref,
+        }),
+      ).rejects.toMatchObject({ code: "schedule_readback_mismatch" });
+      expect(await cancellationCommandRows(f)).toEqual(before);
+      expect(f.calls.slice(calls).filter((call) => call.method !== "GET")).toEqual([]);
+    } finally {
+      f.db.close();
+    }
+  });
+
+  test("legacy preparation refuses a native cancellation already scheduled before selection", async () => {
+    const f = await fixture();
+    try {
+      const ref = await f.begin();
+      const native = f.subscriptions.get(SUB);
+      if (!native) throw new Error("missing native subscription");
+      native.cancel_at_period_end = true;
+      const before = await cancellationCommandRows(f);
+      const calls = f.calls.length;
+      await expect(
+        f.writer.prepareCancellationEconomicR1?.({
+          organizationId: ORG,
+          reference: "already-scheduled-native",
+          expectedSubscriptionRef: ref,
+        }),
+      ).rejects.toMatchObject({ code: "subscription_management_conflict" });
+      expect(await cancellationCommandRows(f)).toEqual(before);
+      expect(f.calls.slice(calls).filter((call) => call.method !== "GET")).toEqual([]);
+    } finally {
+      f.db.close();
+    }
+  });
+
+  test("the NEW request tuple is captured before readiness awaits and invalid expected refs never dispatch", async () => {
+    const f = await fixture();
+    try {
+      const ref = await f.begin();
+      const input = {
+        organizationId: ORG,
+        reference: "captured-original-cancel",
+        expectedSubscriptionRef: ref,
+      };
+      const selecting = f.writer.prepareCancellationEconomicR1?.(input);
+      input.expectedSubscriptionRef = `sra_${"0".repeat(64)}`;
+      input.reference = "mutated-cancel";
+      expect(await selecting).toMatchObject({
+        expectedSubscriptionRef: ref,
+        targetSubscriptionId: SUB,
+        branch: "legacy",
+      });
+      const before = await cancellationCommandRows(f);
+      const calls = f.calls.length;
+      await expect(
+        f.writer.prepareCancellationEconomicR1?.({
+          organizationId: ORG,
+          reference: "invalid-ref",
+          expectedSubscriptionRef: "sub_raw_not_an_owner_ref",
+        }),
+      ).rejects.toMatchObject({ code: "invalid_argument" });
+      expect(await cancellationCommandRows(f)).toEqual(before);
+      expect(f.calls.slice(calls)).toEqual([]);
+    } finally {
+      f.db.close();
+    }
+  });
+});
+
+for (const phase of [false, true]) {
+  test(`CANCEL DATA retains the ${phase ? "phase" : "legacy"} current-period Clock refusal`, async () => {
+    const f = await fixture();
+    try {
+      const ref = await f.begin();
+      if (phase) await f.change(ref);
+      f.now(NEXT);
+      const before = await cancellationCommandRows(f);
+      const calls = f.calls.length;
+      await expect(
+        f.writer.prepareCancellationEconomicR1?.({
+          organizationId: ORG,
+          reference: `expired-${phase ? "phase" : "legacy"}`,
+          expectedSubscriptionRef: ref,
+        }),
+      ).rejects.toBeTruthy();
+      expect(await cancellationCommandRows(f)).toEqual(before);
+      expect(f.calls.slice(calls).filter((call) => call.method !== "GET")).toEqual([]);
+    } finally {
+      f.db.close();
+    }
+  });
+}

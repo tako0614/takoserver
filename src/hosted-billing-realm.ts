@@ -395,6 +395,22 @@ export function assertHostedBillingFinancialRealm(
     fail("unqualified_realm");
 }
 
+/** Read-only point-in-time persistence check for an already qualified realm. */
+export async function assertHostedBillingFinancialRealmPersisted(
+  realm: HostedBillingFinancialRealm,
+  context: Parameters<typeof assertHostedBillingFinancialRealm>[1],
+): Promise<void> {
+  const { sql, client, billingAuthority, prices } = context;
+  assertHostedBillingFinancialRealm(realm, {
+    sql,
+    client,
+    billingAuthority,
+    ...(prices === undefined ? {} : { prices }),
+  });
+  await assertSchemaAndMode(sql);
+  if (!(await readPin(sql, realm))) fail("realm_unbound");
+}
+
 function priceFingerprint(prices: readonly HostedBillingRealmPriceProof[]): string {
   return canonicalJson(
     prices

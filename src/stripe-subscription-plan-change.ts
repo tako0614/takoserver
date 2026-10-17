@@ -31,6 +31,34 @@ export interface QualifiedSubscriptionPlan {
   readonly includedMinor: number;
 }
 
+/** Internal selected economic DATA, not a currentness/CAS or consent witness. */
+export interface PlanChangeEconomicPreparationR1 {
+  readonly kind: "plan-change";
+  readonly expectedSubscriptionRef: string;
+  readonly targetSubscriptionId: string;
+  readonly targetGeneration: number;
+  readonly targetPeriodStart: string;
+  readonly targetPeriodEnd: string;
+  readonly planKey: string;
+  readonly pricingRevision: string;
+  readonly priceId: string;
+  readonly priceAmountMinor: number;
+  readonly includedMinor: number;
+  readonly currency: "USD";
+}
+
+/** Internal cancellation selection DATA, never command/currentness/consent authority. */
+export interface CancellationEconomicPreparationR1 {
+  readonly kind: "cancel";
+  readonly expectedSubscriptionRef: string;
+  readonly targetSubscriptionId: string;
+  readonly targetGeneration: number;
+  readonly branch: "legacy" | "pending-plan-change";
+  readonly pendingReference: string | null;
+  readonly scheduleId: string | null;
+  readonly cancelAtPeriodEnd: true;
+}
+
 export interface SubscriptionPlanTarget {
   readonly subscriptionRef: string;
   readonly generation: number;
@@ -780,21 +808,12 @@ export function createSubscriptionPlanChanges(options: {
     )
       fail("invalid_argument", 400);
   }
-  async function prepare(input: {
-    readonly organizationId: string;
-    readonly reference: string;
-    readonly expectedSubscriptionRef: string;
-    readonly kind: Command["kind"];
-    readonly planKey?: string;
-  }): Promise<Command> {
-    validateInput(input);
-    const desired = canonicalJson(input);
-    const pin = await fingerprint(input);
-    const prior = await byCommand(input.organizationId, input.reference);
-    if (prior) {
-      if (prior.fingerprint !== pin) fail("payment_command_conflict");
-      return prior;
-    }
+  /** Shared existing pre-command selection, including its native reads and retained-term writes. */
+  async function prepareNewSelection(input: Parameters<typeof prepare>[0]): Promise<{
+    readonly target: SubscriptionPlanTarget;
+    readonly slot: Row | undefined;
+    readonly frozen: Frozen;
+  }> {
     const target = await custody.readTarget(input.organizationId, input.expectedSubscriptionRef);
     if (
       target.subscriptionRef !== input.expectedSubscriptionRef ||
@@ -856,6 +875,24 @@ export function createSubscriptionPlanChanges(options: {
       periodStart: target.periodStart,
       periodEnd: target.periodEnd,
     });
+    return { target, slot, frozen };
+  }
+  async function prepare(input: {
+    readonly organizationId: string;
+    readonly reference: string;
+    readonly expectedSubscriptionRef: string;
+    readonly kind: Command["kind"];
+    readonly planKey?: string;
+  }): Promise<Command> {
+    validateInput(input);
+    const desired = canonicalJson(input);
+    const pin = await fingerprint(input);
+    const prior = await byCommand(input.organizationId, input.reference);
+    if (prior) {
+      if (prior.fingerprint !== pin) fail("payment_command_conflict");
+      return prior;
+    }
+    const { target, slot, frozen } = await prepareNewSelection(input);
     const generation = Number(slot?.generation ?? 0) + 1;
     try {
       await batch([
@@ -1541,6 +1578,68 @@ export function createSubscriptionPlanChanges(options: {
         return null;
       }
       return receipt.pendingChange;
+    },
+    /**
+     * NEW-reference preparation DATA only. This preserves the owning target/Price
+     * reads, Clock eligibility checks and tariff/original-term retention. It may
+     * perform native GETs and retained-fact writes; it never creates a payment
+     * command/slot or dispatches a mutation. The later command still owns its CAS.
+     */
+    async preparePlanChangeEconomicR1(input: {
+      readonly organizationId: string;
+      readonly reference: string;
+      readonly expectedSubscriptionRef: string;
+      readonly planKey: string;
+    }): Promise<PlanChangeEconomicPreparationR1> {
+      const selected = Object.freeze({ ...input, kind: "plan-change" as const });
+      validateInput(selected);
+      // An accepted command has a different historical read path. Never reprice
+      // its original reference or return this observation as replay authority.
+      if (await byCommand(selected.organizationId, selected.reference))
+        fail("payment_command_conflict");
+      const { target, frozen } = await prepareNewSelection(selected);
+      const plan = frozen.plan ?? fail("unqualified_pricing_revision", 503);
+      return Object.freeze({
+        kind: "plan-change",
+        expectedSubscriptionRef: target.subscriptionRef,
+        targetSubscriptionId: target.terms.subscriptionId,
+        targetGeneration: target.generation,
+        targetPeriodStart: target.periodStart,
+        targetPeriodEnd: target.periodEnd,
+        planKey: plan.planKey,
+        pricingRevision: plan.pricingRevision,
+        priceId: plan.priceId,
+        priceAmountMinor: plan.priceAmountMinor,
+        includedMinor: plan.includedMinor,
+        currency: "USD",
+      });
+    },
+    /** Phase-owned NEW preparation; the adapter selects this only for a verified pending plan slot. */
+    async preparePendingCancellationEconomicR1(input: {
+      readonly organizationId: string;
+      readonly reference: string;
+      readonly expectedSubscriptionRef: string;
+    }): Promise<CancellationEconomicPreparationR1> {
+      const selected = Object.freeze({
+        organizationId: input.organizationId,
+        reference: input.reference,
+        expectedSubscriptionRef: input.expectedSubscriptionRef,
+        kind: "cancel" as const,
+      });
+      validateInput(selected);
+      if (await byCommand(selected.organizationId, selected.reference))
+        fail("payment_command_conflict");
+      const { target, frozen } = await prepareNewSelection(selected);
+      return Object.freeze({
+        kind: "cancel",
+        expectedSubscriptionRef: target.subscriptionRef,
+        targetSubscriptionId: target.terms.subscriptionId,
+        targetGeneration: target.generation,
+        branch: "pending-plan-change",
+        pendingReference: frozen.pendingReference ?? fail("no_verified_pending_plan_change"),
+        scheduleId: frozen.scheduleId ?? fail("schedule_readback_mismatch", 503),
+        cancelAtPeriodEnd: true,
+      });
     },
     async change(input: {
       readonly organizationId: string;

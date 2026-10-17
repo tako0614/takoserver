@@ -12,6 +12,7 @@ import {
 } from "./stripe-billing.ts";
 import type { StripeBillingObject } from "./stripe-billing-client.ts";
 import {
+  type CancellationEconomicPreparationR1,
   createSubscriptionPlanChanges,
   type SubscriptionPeriodTerms,
   SubscriptionPlanChangeError,
@@ -500,8 +501,9 @@ export function createHostedSubscriptionAdapter(options: {
     realm,
     qualifyPlan: context.qualifyPlan,
   });
+  const { preparePendingCancellationEconomicR1, ...commandPlans } = plans;
   const readyPlans = {
-    ...plans,
+    ...commandPlans,
     async cancelPendingChange(input: Parameters<typeof plans.cancelPendingChange>[0]) {
       await context.ready();
       const ownership = await cancellationOwnership(
@@ -530,49 +532,89 @@ export function createHostedSubscriptionAdapter(options: {
       return await plans.reconcilePending(limit);
     },
   };
+  async function cancellationBranch(
+    input: Parameters<StripeBillingSubscriptionExtensions["cancel"]>[0],
+  ) {
+    const ownership = await cancellationOwnership(
+      input.organizationId,
+      input.reference,
+      input.expectedSubscriptionRef,
+    );
+    if (ownership.native && !ownership.phase)
+      return {
+        branch: "native-original" as const,
+        organizationId: input.organizationId,
+        reference: input.reference,
+        expectedSubscriptionRef: input.expectedSubscriptionRef,
+      };
+    const existing = (
+      await sql.query(
+        "SELECT kind,desired_json FROM stripe_billing_plan_changes WHERE org_id=? AND reference=?",
+        [input.organizationId, input.reference],
+      )
+    )[0];
+    if (existing) return { branch: "phase-original" as const, input: { ...input } };
+    const slot = (
+      await sql.query(
+        "SELECT c.kind,c.state FROM stripe_billing_plan_change_slots s JOIN stripe_billing_plan_changes c ON c.org_id=s.org_id AND c.reference=s.reference WHERE s.org_id=?",
+        [input.organizationId],
+      )
+    )[0];
+    if (slot) {
+      if (slot.kind !== "plan-change" || slot.state !== "verified")
+        fail("subscription_management_conflict");
+      return { branch: "pending-plan-change" as const, input: { ...input } };
+    }
+    return {
+      branch: "legacy" as const,
+      organizationId: input.organizationId,
+      reference: input.reference,
+      expectedSubscriptionRef: input.expectedSubscriptionRef,
+    };
+  }
   return {
     plans: readyPlans,
     verifyPeriodTerms: plans.verifyPeriodTerms,
     resolveCurrentTerms,
     managementGuard,
+    /** NEW selection DATA across both original cancellation branches; may GET and retain terms. */
+    async prepareCancellationEconomicR1(input): Promise<CancellationEconomicPreparationR1> {
+      const selected = Object.freeze({
+        organizationId: input.organizationId,
+        reference: input.reference,
+        expectedSubscriptionRef: input.expectedSubscriptionRef,
+        cancelAtPeriodEnd: true,
+      });
+      if (
+        typeof selected.organizationId !== "string" ||
+        !selected.organizationId ||
+        typeof selected.reference !== "string" ||
+        !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(selected.reference) ||
+        typeof selected.expectedSubscriptionRef !== "string" ||
+        !/^sra_[0-9a-f]{64}$/u.test(selected.expectedSubscriptionRef)
+      )
+        fail("invalid_argument", 400);
+      await context.ready();
+      qualified();
+      const route = await cancellationBranch(selected);
+      if (route.branch === "native-original" || route.branch === "phase-original")
+        fail("subscription_management_conflict");
+      return route.branch === "legacy"
+        ? await custody.prepareCancellationEconomicR1(selected)
+        : await preparePendingCancellationEconomicR1(selected);
+    },
     async cancel(input) {
       await context.ready();
       qualified();
       if (input.cancelAtPeriodEnd !== true) fail("subscription_management_conflict");
-      const ownership = await cancellationOwnership(
-        input.organizationId,
-        input.reference,
-        input.expectedSubscriptionRef,
-      );
-      if (ownership.native && !ownership.phase)
+      const route = await cancellationBranch(input);
+      if (route.branch === "native-original" || route.branch === "legacy")
         return await custody.cancel(
-          input.organizationId,
-          input.reference,
-          input.expectedSubscriptionRef,
+          route.organizationId,
+          route.reference,
+          route.expectedSubscriptionRef,
         );
-      const existing = (
-        await sql.query(
-          "SELECT kind,desired_json FROM stripe_billing_plan_changes WHERE org_id=? AND reference=?",
-          [input.organizationId, input.reference],
-        )
-      )[0];
-      if (existing) return await plans.cancelPendingChange(input);
-      const slot = (
-        await sql.query(
-          "SELECT c.kind,c.state FROM stripe_billing_plan_change_slots s JOIN stripe_billing_plan_changes c ON c.org_id=s.org_id AND c.reference=s.reference WHERE s.org_id=?",
-          [input.organizationId],
-        )
-      )[0];
-      if (slot) {
-        if (slot.kind !== "plan-change" || slot.state !== "verified")
-          fail("subscription_management_conflict");
-        return await plans.cancelPendingChange(input);
-      }
-      return await custody.cancel(
-        input.organizationId,
-        input.reference,
-        input.expectedSubscriptionRef,
-      );
+      return await plans.cancelPendingChange(route.input);
     },
   };
 }

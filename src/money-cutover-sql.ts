@@ -146,6 +146,91 @@ export async function inspectMoneyCutoverGuard(
   return "frozen";
 }
 
+function ownDataSqlMethod<K extends keyof Sql>(sql: Sql, name: K): Sql[K] | undefined {
+  if ((typeof sql !== "object" && typeof sql !== "function") || sql === null) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(sql, name);
+  return descriptor && "value" in descriptor && typeof descriptor.value === "function"
+    ? (descriptor.value as Sql[K])
+    : undefined;
+}
+
+const moneyCutoverSqlOrigins = new WeakMap<
+  object,
+  {
+    readonly raw: Sql;
+    readonly writerEpoch: string;
+    readonly query: Sql["query"];
+    readonly run: Sql["run"];
+    readonly batch: Sql["batch"];
+    readonly rawQuery: Sql["query"] | undefined;
+    readonly rawRun: Sql["run"] | undefined;
+    readonly rawBatch: Sql["batch"] | undefined;
+  }
+>();
+
+/**
+ * Checks an actual wrapper's captured epoch and original methods. This neither
+ * exposes its raw Sql nor replaces the current permit/freeze guards on writes.
+ */
+export function assertMoneyCutoverSqlOrigin(
+  sql: unknown,
+  context: { readonly writerEpoch: string },
+): asserts sql is Sql {
+  const origin =
+    typeof sql === "object" && sql !== null ? moneyCutoverSqlOrigins.get(sql) : undefined;
+  if (!origin || typeof context !== "object" || context === null) {
+    throw new SqlError("invalid", "money cutover Sql origin differs");
+  }
+  const writerEpoch = Object.getOwnPropertyDescriptor(context, "writerEpoch");
+  const query = Object.getOwnPropertyDescriptor(sql, "query");
+  const run = Object.getOwnPropertyDescriptor(sql, "run");
+  const batch = Object.getOwnPropertyDescriptor(sql, "batch");
+  if (
+    !writerEpoch ||
+    !("value" in writerEpoch) ||
+    writerEpoch.value !== origin.writerEpoch ||
+    !query ||
+    !("value" in query) ||
+    query.value !== origin.query ||
+    !run ||
+    !("value" in run) ||
+    run.value !== origin.run ||
+    !batch ||
+    !("value" in batch) ||
+    batch.value !== origin.batch
+  ) {
+    throw new SqlError("invalid", "money cutover Sql origin differs");
+  }
+}
+
+/**
+ * Checks that a captured wrapper still belongs to the exact backing Sql and
+ * epoch supplied by its caller. This is origin evidence only; it does not
+ * qualify the backing adapter, selected realm, schema, or writer profile.
+ */
+export function assertMoneyCutoverSqlBackingOrigin(
+  sql: unknown,
+  context: { readonly rawSql: Sql; readonly writerEpoch: string },
+): void {
+  assertMoneyCutoverSqlOrigin(sql, context);
+  const origin = moneyCutoverSqlOrigins.get(sql);
+  const rawSql = Object.getOwnPropertyDescriptor(context, "rawSql");
+  if (
+    !origin ||
+    !rawSql ||
+    !("value" in rawSql) ||
+    rawSql.value !== origin.raw ||
+    origin.rawQuery === undefined ||
+    origin.rawRun === undefined ||
+    origin.rawBatch === undefined ||
+    ownDataSqlMethod(origin.raw, "query") !== origin.rawQuery ||
+    ownDataSqlMethod(origin.raw, "run") !== origin.rawRun ||
+    ownDataSqlMethod(origin.raw, "batch") !== origin.rawBatch
+  ) {
+    throw new SqlError("invalid", "money cutover Sql backing origin differs");
+  }
+}
+
 function assertPublicStatement(statement: SqlStatement): void {
   const source = statement.sql.trim();
   if (
@@ -183,7 +268,7 @@ export function createMoneyCutoverSql(raw: Sql, writerEpoch: string): Sql {
     }
     return result.slice(1, -1);
   }
-  return {
+  const wrapped: Sql = {
     async query(sql, params) {
       // SELECT and the one audited introspection PRAGMA cannot mutate SQLite.
       // WITH (including a mutating final statement) takes the guarded transaction.
@@ -214,4 +299,18 @@ export function createMoneyCutoverSql(raw: Sql, writerEpoch: string): Sql {
     },
     batch: guarded,
   };
+  moneyCutoverSqlOrigins.set(
+    wrapped,
+    Object.freeze({
+      raw,
+      writerEpoch,
+      query: wrapped.query,
+      run: wrapped.run,
+      batch: wrapped.batch,
+      rawQuery: ownDataSqlMethod(raw, "query"),
+      rawRun: ownDataSqlMethod(raw, "run"),
+      rawBatch: ownDataSqlMethod(raw, "batch"),
+    }),
+  );
+  return wrapped;
 }

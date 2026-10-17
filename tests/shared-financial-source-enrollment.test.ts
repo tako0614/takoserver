@@ -24,6 +24,12 @@ import {
   type FinancialPreproofPreparation,
   type FinancialPreproofScope,
 } from "../src/shared-financial-source-enrollment.ts";
+import {
+  createFinancialControlGenesisAdmissionStore,
+  FINANCIAL_SOURCE_GENESIS_DDL,
+  type FinancialControlGenesisCommand,
+} from "../src/shared-financial-source-genesis-admission.ts";
+import { FINANCIAL_GENESIS_SCHEMA } from "../src/shared-financial-source-genesis-schema.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
 
@@ -1137,6 +1143,565 @@ describe("private C0 and explicit M component", () => {
         }
       }
       expect(checked).toBe(11);
+    } finally {
+      f.close();
+    }
+  });
+});
+
+// Mechanical same-primary fixtures only. These originals do not prove a Core
+// producer, registration authority, payer permission, native D1 or a qualified G.
+type EnrollmentFixture = Awaited<ReturnType<typeof fixture>>;
+function readEffects(f: EnrollmentFixture) {
+  const genesisTables = [
+    "financial_source_genesis_admissions",
+    "financial_source_genesis_admission_receipts",
+  ].filter((table) =>
+    f.db.query("SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?").get(table),
+  );
+  return {
+    batches: f.batchCalls,
+    runs: f.runCalls,
+    clocks: f.clockCalls,
+    provider: f.providerRequests,
+    rows: [
+      ...TABLES,
+      "financial_source_registrations",
+      "financial_source_heads",
+      "financial_source_events",
+      "financial_source_receipts",
+      ...genesisTables,
+    ].map((table) => JSON.stringify(f.db.query(`SELECT * FROM ${table} ORDER BY 1`).all())),
+  };
+}
+function mechanicalGenesis(f: EnrollmentFixture) {
+  const workspace = { id: A, createdAt: AT };
+  const binding = {
+    workspaceId: A,
+    organizationRef: SCOPE.organizationId,
+    workspaceRef: SCOPE.workspaceRef,
+    intentId: "intent:mechanical-genesis",
+  };
+  const registration = {
+    sourceRef: REG.registrationRef,
+    incarnation: REG.incarnation,
+    genesisDigest: G.slice("sha256:".length),
+    requiredReceivers: REG.receivers,
+  };
+  const command: FinancialControlGenesisCommand = {
+    admissionRef: "g-admission:mechanical",
+    commandRef: "g-command:mechanical",
+    receiptRef: "g-receipt:mechanical",
+    enrollmentOriginal: {
+      workspaceId: A,
+      sourceRef: REG.registrationRef,
+      incarnation: REG.incarnation,
+      registrationJson: JSON.stringify(registration),
+      enrollmentJson: JSON.stringify({
+        workspace,
+        management: {},
+        binding,
+        members: [{ ref: "member:mechanical" }],
+      }),
+      identityJson: JSON.stringify({
+        ...registration,
+        workspaceId: A,
+        workspaceCreatedAt: AT,
+        organizationRef: binding.organizationRef,
+        workspaceRef: binding.workspaceRef,
+        bindingIntentId: binding.intentId,
+        bindingJson: JSON.stringify(binding),
+        enrolledAt: AT,
+      }),
+      enrolledAt: AT,
+    },
+  };
+  return {
+    command,
+    store: createFinancialControlGenesisAdmissionStore({
+      ...f.common,
+      source: f.source,
+      affectedRef: A,
+      genesisQualificationRef: GQ,
+    }),
+  };
+}
+async function otherMaterialization(f: EnrollmentFixture) {
+  const registration = {
+    ...REG,
+    registrationRef: "registration:other-overlay",
+    incarnation: "incarnation:other-overlay",
+  };
+  const originalEvent: FinancialSourceEvent = {
+    ...event(),
+    registrationRef: registration.registrationRef,
+    incarnation: registration.incarnation,
+  };
+  return {
+    store: createFinancialSourceMaterializationStore({
+      ...f.common,
+      source: { ...f.source, registration },
+      affectedRef: A,
+      genesisQualificationRef: GQ,
+    }),
+    command: {
+      materializationRef: "materialization:other-overlay",
+      commandRef: "command:other-overlay",
+      receiptRef: "m-receipt:other-overlay",
+      materialization: {
+        rawEventDigest: D,
+        event: originalEvent,
+        eventDigest: await financialSourceEventDigest(originalEvent),
+      },
+    },
+  };
+}
+async function rejectsUnreadySchema(f: EnrollmentFixture) {
+  const retained = await f.command();
+  const absent = await f.command("parent:absent-schema", "absent-schema");
+  const before = readEffects(f);
+  await expect(f.c0().prepare(f.preparation("absent-schema"))).rejects.toMatchObject({
+    code: "unavailable",
+  });
+  await expect(f.c0().readChallenge("challenge:one")).rejects.toMatchObject({
+    code: "unavailable",
+  });
+  await expect(f.c0().readChallenge("challenge:absent-schema")).rejects.toMatchObject({
+    code: "unavailable",
+  });
+  await expect(f.m().readOriginal(retained)).rejects.toMatchObject({ code: "unavailable" });
+  await expect(f.m("parent:absent-schema").readOriginal(absent)).rejects.toMatchObject({
+    code: "unavailable",
+  });
+  await expect(f.m("parent:absent-schema").install(absent)).rejects.toMatchObject({
+    code: "unavailable",
+  });
+  expect(readEffects(f)).toEqual(before);
+}
+
+describe("legacy C0/M floor and exact complete G overlay readiness", () => {
+  for (const overlay of [false, true]) {
+    test(`${overlay ? "complete G" : "exact no-G legacy"}: C0/M retain originals, query budgets and GET-only unknowns`, async () => {
+      const f = await fixture();
+      try {
+        if (overlay) f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
+        expect(
+          f.db
+            .query(
+              "SELECT name FROM sqlite_schema WHERE type='table' AND name IN ('financial_source_genesis_admissions','financial_source_genesis_admission_receipts')",
+            )
+            .all(),
+        ).toHaveLength(overlay ? 2 : 0);
+        const preparation = f.preparation();
+        await f.c0().prepare(preparation);
+        let effects = readEffects(f);
+        expect(await f.c0().readChallenge(preparation.challenge.challengeRef)).toEqual(
+          preparation.challenge,
+        );
+        expect(
+          Object.keys((await f.c0().readChallenge(preparation.challenge.challengeRef)) ?? {}),
+        ).toHaveLength(10);
+        expect(await f.c0().readChallenge("challenge:absent-legacy")).toBeUndefined();
+        expect(readEffects(f)).toEqual(effects);
+        const command = await f.command();
+        const extraRead = overlay ? 1 : 0;
+        let queries = f.queryCalls;
+        effects = readEffects(f);
+        expect(await f.m().readOriginal(command)).toBeUndefined();
+        expect(f.queryCalls - queries).toBe(6 + extraRead);
+        expect(readEffects(f)).toEqual(effects);
+        const receipt = await f.m().install(command);
+        expect(receipt).toEqual({
+          materializationRef: command.materializationRef,
+          commandRef: command.commandRef,
+          receiptRef: command.receiptRef,
+        });
+        queries = f.queryCalls;
+        effects = readEffects(f);
+        expect(await f.m().readOriginal(command)).toEqual(receipt);
+        expect(f.queryCalls - queries).toBe(4);
+        expect(readEffects(f)).toEqual(effects);
+        const sibling = await f.command("parent:second-schema", "second-schema");
+        queries = f.queryCalls;
+        expect(await f.m("parent:second-schema").readOriginal(sibling)).toBeUndefined();
+        expect(f.queryCalls - queries).toBe(7 + extraRead);
+        expect(readEffects(f)).toEqual(effects);
+        f.failRead();
+        await expect(f.m().readOriginal(command)).rejects.toMatchObject({ code: "unavailable" });
+        expect(readEffects(f)).toEqual(effects);
+        f.failRead();
+        await expect(
+          f.c0().readChallenge(preparation.challenge.challengeRef),
+        ).rejects.toMatchObject({ code: "unavailable" });
+        expect(readEffects(f)).toEqual(effects);
+      } finally {
+        f.close();
+      }
+    });
+  }
+
+  test("G itself still requires the complete overlay and its original reader remains coherent", async () => {
+    const f = await fixture();
+    try {
+      const g = mechanicalGenesis(f);
+      const before = readEffects(f);
+      await expect(g.store.readGenesisOriginal(g.command)).rejects.toMatchObject({
+        code: "unavailable",
+      });
+      expect(readEffects(f)).toEqual(before);
+      f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
+      expect(await g.store.readGenesisOriginal(g.command)).toBeUndefined();
+      const receipt = await g.store.admitGenesis(g.command);
+      expect(receipt).toEqual({
+        admissionRef: g.command.admissionRef,
+        commandRef: g.command.commandRef,
+        receiptRef: g.command.receiptRef,
+      });
+      const effects = readEffects(f);
+      expect(await g.store.readGenesisOriginal(g.command)).toEqual(receipt);
+      expect(readEffects(f)).toEqual(effects);
+      const sibling = await f.command("parent:another-G-key", "another-G-key");
+      await expect(f.m("parent:another-G-key").readOriginal(sibling)).rejects.toMatchObject({
+        code: "unavailable",
+      });
+      await expect(f.m("parent:another-G-key").install(sibling)).rejects.toMatchObject({
+        code: "unavailable",
+      });
+      expect(readEffects(f)).toEqual(effects);
+    } finally {
+      f.close();
+    }
+  });
+
+  const collisionGuards = [
+    "financial_source_genesis_admissions_no_replace",
+    "financial_source_genesis_admission_receipts_no_replace",
+    "financial_source_materializations_no_genesis_collision",
+    "financial_source_materialization_receipts_no_genesis_collision",
+  ] as const;
+  for (const name of collisionGuards) {
+    for (const fault of ["missing", "corrupt"] as const) {
+      test(`${name} ${fault}: neither effect, retained GET nor positive absence is permitted`, async () => {
+        const f = await fixture();
+        try {
+          f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
+          await f.c0().prepare(f.preparation());
+          await f.m().install(await f.command());
+          f.db.exec(`DROP TRIGGER ${name}`);
+          if (fault === "corrupt") {
+            const original = FINANCIAL_GENESIS_SCHEMA[name];
+            if (!original) throw Error("missing fixed collision guard");
+            const broken = original.replace(/RAISE\(ABORT,'[^']*'\)/u, "1");
+            expect(broken).not.toBe(original);
+            f.db.exec(broken);
+          }
+          await rejectsUnreadySchema(f);
+        } finally {
+          f.close();
+        }
+      });
+    }
+  }
+
+  const partialOverlays: readonly {
+    readonly name: string;
+    readonly mutate: (f: EnrollmentFixture) => void;
+  }[] = [
+    {
+      name: "G tables only",
+      mutate(f) {
+        for (const name of [
+          "financial_source_genesis_admissions",
+          "financial_source_genesis_admission_receipts",
+        ]) {
+          const sql = FINANCIAL_GENESIS_SCHEMA[name];
+          if (!sql) throw Error("missing fixed G table");
+          f.db.exec(sql);
+        }
+      },
+    },
+    {
+      name: "M collision guards without G tables",
+      mutate(f) {
+        for (const name of collisionGuards.slice(2)) {
+          const sql = FINANCIAL_GENESIS_SCHEMA[name];
+          if (!sql) throw Error("missing fixed M/G guard");
+          f.db.exec(sql);
+        }
+      },
+    },
+    {
+      name: "missing G original table",
+      mutate(f) {
+        f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
+        f.db.exec("DROP TABLE financial_source_genesis_admissions");
+      },
+    },
+    {
+      name: "missing G receipt table",
+      mutate(f) {
+        f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
+        f.db.exec("DROP TABLE financial_source_genesis_admission_receipts");
+      },
+    },
+    {
+      name: "renamed G original table",
+      mutate(f) {
+        f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
+        f.db.exec(
+          "ALTER TABLE financial_source_genesis_admissions RENAME TO renamed_overlay_original",
+        );
+      },
+    },
+    {
+      name: "unknown G namespace object on legacy schema",
+      mutate(f) {
+        f.db.exec("CREATE TABLE financial_source_genesis_unknown_overlay(ref TEXT)");
+      },
+    },
+    {
+      name: "unexpected G trigger on a complete overlay",
+      mutate(f) {
+        f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
+        f.db.exec(
+          "CREATE TRIGGER financial_source_genesis_unknown_guard BEFORE INSERT ON financial_preproof_challenges BEGIN SELECT 1; END",
+        );
+      },
+    },
+  ];
+  for (const scenario of partialOverlays) {
+    test(`${scenario.name}: partial or unknown G is never legacy`, async () => {
+      const f = await fixture();
+      try {
+        await f.c0().prepare(f.preparation());
+        await f.m().install(await f.command());
+        scenario.mutate(f);
+        await rejectsUnreadySchema(f);
+      } finally {
+        f.close();
+      }
+    });
+  }
+
+  test("complete G occupies both command/receipt roles even for another M source incarnation", async () => {
+    const f = await fixture();
+    try {
+      f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
+      const g = mechanicalGenesis(f);
+      await g.store.admitGenesis(g.command);
+      const m = await otherMaterialization(f);
+      for (const candidate of [
+        { ...m.command, commandRef: g.command.commandRef },
+        { ...m.command, commandRef: g.command.receiptRef },
+        { ...m.command, receiptRef: g.command.commandRef },
+        { ...m.command, receiptRef: g.command.receiptRef },
+      ]) {
+        const before = readEffects(f);
+        await expect(m.store.readOriginal(candidate)).rejects.toMatchObject({
+          code: "unavailable",
+        });
+        await expect(m.store.install(candidate)).rejects.toMatchObject({ code: "unavailable" });
+        expect(readEffects(f)).toEqual(before);
+      }
+    } finally {
+      f.close();
+    }
+  });
+
+  for (const orphan of ["original-only", "receipt-only"] as const) {
+    test(`complete schema with ${orphan} G cannot manufacture M positive absence`, async () => {
+      const f = await fixture();
+      try {
+        f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
+        const g = mechanicalGenesis(f);
+        await g.store.admitGenesis(g.command);
+        if (orphan === "original-only") {
+          withGuardDisabled(f.db, "financial_source_genesis_admission_receipts_no_delete", () => {
+            f.db.exec("DELETE FROM financial_source_genesis_admission_receipts");
+          });
+        } else {
+          withForeignKeysDisabled(f.db, () => {
+            withGuardDisabled(f.db, "financial_source_genesis_admissions_no_delete", () => {
+              f.db.exec("DELETE FROM financial_source_genesis_admissions");
+            });
+          });
+        }
+        expect(count(f.db, "financial_source_genesis_admissions").n).toBe(
+          orphan === "original-only" ? 1 : 0,
+        );
+        expect(count(f.db, "financial_source_genesis_admission_receipts").n).toBe(
+          orphan === "receipt-only" ? 1 : 0,
+        );
+        const m = await otherMaterialization(f);
+        const candidate = {
+          ...m.command,
+          commandRef: g.command.commandRef,
+          receiptRef: g.command.receiptRef,
+        };
+        const before = readEffects(f);
+        await expect(m.store.readOriginal(candidate)).rejects.toMatchObject({
+          code: "unavailable",
+        });
+        await expect(m.store.install(candidate)).rejects.toMatchObject({ code: "unavailable" });
+        expect(readEffects(f)).toEqual(before);
+      } finally {
+        f.close();
+      }
+    });
+  }
+
+  test("unknown, malformed or ambiguous full-G lookup never becomes M absence or a write", async () => {
+    for (const fault of [
+      "throw",
+      "missing-row",
+      "null-result",
+      "string-zero",
+      "duplicate-row",
+    ] as const) {
+      const f = await fixture();
+      try {
+        f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
+        const command = await f.command();
+        const before = readEffects(f);
+        const query = f.sql.query;
+        let lookups = 0;
+        f.sql.query = async (sql, params) => {
+          if (sql.startsWith("SELECT EXISTS(SELECT 1 FROM financial_source_genesis_admissions")) {
+            lookups++;
+            if (fault === "throw") throw new SqlError("unavailable", "unknown G read");
+            if (fault === "missing-row") return [];
+            if (fault === "null-result") return [{ original_occupied: 0, receipt_occupied: null }];
+            if (fault === "string-zero") return [{ original_occupied: "0", receipt_occupied: 0 }];
+            return [
+              { original_occupied: 0, receipt_occupied: 0 },
+              { original_occupied: 0, receipt_occupied: 0 },
+            ];
+          }
+          return query(sql, params);
+        };
+        await expect(f.m().readOriginal(command)).rejects.toMatchObject({ code: "unavailable" });
+        await expect(f.m().install(command)).rejects.toMatchObject({ code: "unavailable" });
+        expect(lookups).toBe(2);
+        expect(readEffects(f)).toEqual(before);
+      } finally {
+        f.close();
+      }
+    }
+  });
+
+  test("completed M history survives a later valid G cross-role receipt reservation", async () => {
+    const f = await fixture();
+    try {
+      f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
+      const command = await f.command();
+      const receipt = await f.m().install(command);
+      expect(receipt).toEqual({
+        materializationRef: command.materializationRef,
+        commandRef: command.commandRef,
+        receiptRef: command.receiptRef,
+      });
+      const seed = mechanicalGenesis(f);
+      const registration: FinancialSourceRegistration = {
+        ...REG,
+        registrationRef: "registration:history-G",
+        incarnation: "incarnation:history-G",
+      };
+      const coreRegistration = {
+        sourceRef: registration.registrationRef,
+        incarnation: registration.incarnation,
+        genesisDigest: G.slice("sha256:".length),
+        requiredReceivers: registration.receivers,
+      };
+      const binding = {
+        workspaceId: A,
+        organizationRef: SCOPE.organizationId,
+        workspaceRef: SCOPE.workspaceRef,
+        intentId: "intent:mechanical-genesis",
+      };
+      const gCommand: FinancialControlGenesisCommand = {
+        admissionRef: "g-admission:history-G",
+        commandRef: "g-command:history-G",
+        receiptRef: command.commandRef,
+        enrollmentOriginal: {
+          ...seed.command.enrollmentOriginal,
+          sourceRef: registration.registrationRef,
+          incarnation: registration.incarnation,
+          registrationJson: JSON.stringify(coreRegistration),
+          identityJson: JSON.stringify({
+            ...coreRegistration,
+            workspaceId: A,
+            workspaceCreatedAt: AT,
+            organizationRef: binding.organizationRef,
+            workspaceRef: binding.workspaceRef,
+            bindingIntentId: binding.intentId,
+            bindingJson: JSON.stringify(binding),
+            enrolledAt: AT,
+          }),
+        },
+      };
+      expect(registration.registrationRef).not.toBe(REG.registrationRef);
+      expect(registration.incarnation).not.toBe(REG.incarnation);
+      expect(new Set([command.commandRef, command.receiptRef, gCommand.commandRef]).size).toBe(3);
+      expect(gCommand.commandRef).not.toBe(command.commandRef);
+      expect(gCommand.receiptRef).toBe(command.commandRef);
+      expect(gCommand.receiptRef).not.toBe(command.receiptRef);
+      const g = createFinancialControlGenesisAdmissionStore({
+        ...f.common,
+        source: { ...f.source, registration },
+        affectedRef: A,
+        genesisQualificationRef: GQ,
+      });
+      const gReceipt = await g.admitGenesis(gCommand);
+      expect(gReceipt).toEqual({
+        admissionRef: gCommand.admissionRef,
+        commandRef: gCommand.commandRef,
+        receiptRef: gCommand.receiptRef,
+      });
+      expect(await g.readGenesisOriginal(gCommand)).toEqual(gReceipt);
+      expect(f.batchCalls).toBe(2);
+      expect(
+        f.db
+          .query(`SELECT m.command_ref,q.receipt_ref,q.all_rows_match,
+          m.record_json=q.record_json AS record_matches
+          FROM financial_source_materializations m
+          JOIN financial_source_materialization_receipts q ON q.materialization_ref=m.materialization_ref
+          WHERE m.materialization_ref=? AND q.command_ref=m.command_ref`)
+          .all(command.materializationRef),
+      ).toEqual([
+        {
+          command_ref: command.commandRef,
+          receipt_ref: command.receiptRef,
+          all_rows_match: 1,
+          record_matches: 1,
+        },
+      ]);
+      expect(
+        f.db
+          .query(`SELECT g.command_ref,q.receipt_ref,q.all_rows_match,
+          g.record_json=q.record_json AS record_matches
+          FROM financial_source_genesis_admissions g
+          JOIN financial_source_genesis_admission_receipts q ON q.admission_ref=g.admission_ref
+          WHERE g.admission_ref=? AND q.command_ref=g.command_ref`)
+          .all(gCommand.admissionRef),
+      ).toEqual([
+        {
+          command_ref: gCommand.commandRef,
+          receipt_ref: gCommand.receiptRef,
+          all_rows_match: 1,
+          record_matches: 1,
+        },
+      ]);
+      const effects = readEffects(f);
+      let queries = f.queryCalls;
+      expect(await f.m().readOriginal(command)).toEqual(receipt);
+      expect(f.queryCalls - queries).toBe(4);
+      expect(readEffects(f)).toEqual(effects);
+      queries = f.queryCalls;
+      // Normal known-ACK original replay only. Unknown outcomes use readOriginal;
+      // undefined never grants install or retry permission.
+      expect(await f.m().install(command)).toEqual(receipt);
+      expect(f.queryCalls - queries).toBe(4);
+      expect(readEffects(f)).toEqual(effects);
     } finally {
       f.close();
     }

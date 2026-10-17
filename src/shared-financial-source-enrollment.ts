@@ -5,6 +5,10 @@ import {
 import { canonicalDigest } from "./json.ts";
 import { type Clock, type Sql, SqlError, type SqlParam, type SqlStatement } from "./ports.ts";
 import {
+  createSharedFinancialActionIdentity,
+  type SharedFinancialActionIdentity,
+} from "./shared-financial-action.ts";
+import {
   canonicalFinancialSourceJson,
   type FinancialIdentityChallenge,
   type FinancialSourceDigest,
@@ -17,6 +21,7 @@ import {
   parseFinancialSourceMaterialization,
   parseFinancialSourceRegistration,
 } from "./shared-financial-source-contract.ts";
+import { FINANCIAL_GENESIS_SCHEMA } from "./shared-financial-source-genesis-schema.ts";
 import type { StripeBillingClient } from "./stripe-billing-client.ts";
 
 /** PRIVATE unmounted component. These data parsers do not qualify an issuer, peer,
@@ -75,6 +80,7 @@ const SCHEMA: Readonly<Record<string, string>> = {
 };
 const RECEIVER_SCHEMA_DIGEST =
   "sha256:78273f494a3823217edf12e06f06eb4803860452d02278e097a2662befca387b";
+export const FINANCIAL_SOURCE_ENROLLMENT_SCHEMA = SCHEMA;
 export const FINANCIAL_SOURCE_ENROLLMENT_DDL = `${Object.values(SCHEMA).join(";\n")};\n`;
 
 export class FinancialSourceEnrollmentError extends Error {
@@ -130,6 +136,14 @@ function snapshot(value: unknown): unknown {
 }
 function json(value: unknown): string {
   return canonicalFinancialSourceJson(value);
+}
+/** Applied only to detached JSON snapshots, before any digest await. */
+function freezeSnapshot<T>(value: T): T {
+  if (value !== null && typeof value === "object") {
+    for (const nested of Object.values(value)) freezeSnapshot(nested);
+    Object.freeze(value);
+  }
+  return value;
 }
 
 export interface FinancialPreproofScope {
@@ -276,16 +290,32 @@ function component(options: FinancialEnrollmentComponentOptions) {
     "financial_preproof_challenge_receipts",
     "financial_source_materializations",
     "financial_source_materialization_receipts",
+    "financial_source_genesis_admissions",
+    "financial_source_genesis_admission_receipts",
   ];
+  const completeSchema = { ...SCHEMA, ...FINANCIAL_GENESIS_SCHEMA };
   async function ready(receiver = false) {
     try {
       const rows = await sql.query(
-        `SELECT type,name,sql FROM sqlite_schema WHERE tbl_name IN (${names.map(() => "?").join(",")}) AND sql IS NOT NULL ORDER BY type,name`,
+        `SELECT type,name,sql FROM sqlite_schema
+        WHERE (tbl_name IN (${names.map(() => "?").join(",")}) OR instr(name,'financial_source_genesis_')=1)
+        AND NOT (type='index' AND sql IS NULL AND instr(name,'sqlite_autoindex_')=1)
+        ORDER BY type,name`,
         names,
       );
+      // Only the exact original schema is legacy. Any G or unknown relevant
+      // object requires the entire overlay, including both G tables and all guards.
+      const legacy = rows.every(
+        (row) => typeof row.name === "string" && Object.hasOwn(SCHEMA, row.name),
+      );
+      const expectedSchema = legacy ? SCHEMA : completeSchema;
       if (
-        rows.length !== Object.keys(SCHEMA).length ||
-        rows.some((row) => typeof row.name !== "string" || row.sql !== SCHEMA[row.name])
+        rows.length !== Object.keys(expectedSchema).length ||
+        rows.some(
+          (row) =>
+            typeof row.name !== "string" ||
+            row.sql !== expectedSchema[row.name as keyof typeof expectedSchema],
+        )
       )
         fail("unavailable");
       if (receiver) {
@@ -294,6 +324,7 @@ function component(options: FinancialEnrollmentComponentOptions) {
         );
         if ((await canonicalDigest(receiverRows)) !== RECEIVER_SCHEMA_DIGEST) fail("unavailable");
       }
+      return !legacy;
     } catch (error) {
       if (error instanceof FinancialSourceEnrollmentError) throw error;
       fail("unavailable", error);
@@ -319,6 +350,29 @@ export interface FinancialPreproofReceipt {
   readonly preparationRef: string;
   readonly challengeRef: string;
   readonly receiptRef: string;
+}
+/** Historical original data only; neither current source nor human consent is established here. */
+export interface FinancialPreproofActionOriginal {
+  readonly preparationRef: string;
+  readonly receiptRef: string;
+  readonly challenge: FinancialIdentityChallenge;
+  readonly actionIdentity: SharedFinancialActionIdentity;
+  readonly terms: Readonly<{ ref: string; digest: FinancialSourceDigest }>;
+}
+/** The exact C0 scope/realm image checked against the persisted scope_json. */
+export interface FinancialPreproofScopeRealmImage extends FinancialPreproofScope {
+  readonly accountId: string;
+  readonly mode: HostedBillingFinancialRealm["mode"];
+  readonly billingAuthority: string;
+  readonly financialRealm: string;
+  readonly writerEpoch: FinancialSourceDigest;
+  readonly receiverRef: string;
+  readonly targetRef: string;
+}
+/** Historical retained data only. Selection is neither source provenance nor consent. */
+export interface FinancialPreproofActionSelectionOriginal extends FinancialPreproofActionOriginal {
+  readonly selection: FinancialPreproofSelection;
+  readonly scopeRealm: FinancialPreproofScopeRealmImage;
 }
 /** Private data-custody store; no route and no challenge/nonce mint are provided. */
 export function createFinancialPreproofChallengeStore(
@@ -448,6 +502,48 @@ export function createFinancialPreproofChallengeStore(
       return fail("unavailable", error);
     }
   }
+  /** The existing C0 GET projection, query order and mandatory-receipt validation. */
+  async function readSavedChallenge(
+    challengeRef: string,
+  ): Promise<ReturnType<typeof parse> | undefined> {
+    const rows = await c.sql.query(
+      `SELECT c.*,q.receipt_ref AS retained_receipt,q.preparation_ref AS retained_preparation,
+      q.record_json AS receipt_record,q.all_rows_match FROM financial_preproof_challenges c
+      LEFT JOIN financial_preproof_challenge_receipts q ON q.challenge_ref=c.challenge_ref WHERE c.challenge_ref=?`,
+      [challengeRef],
+    );
+    if (rows.length === 0) {
+      const orphan = await c.sql.query(
+        "SELECT receipt_ref FROM financial_preproof_challenge_receipts WHERE challenge_ref=?",
+        [challengeRef],
+      );
+      if (orphan.length !== 0) fail("unavailable");
+      return undefined;
+    }
+    const row = rows[0];
+    if (rows.length !== 1 || row === undefined || typeof row.record_json !== "string")
+      fail("unavailable");
+    const decoded = JSON.parse(row.record_json) as Record<string, unknown>;
+    const saved = parse({
+      preparationRef: decoded.preparationRef,
+      receiptRef: decoded.receiptRef,
+      challenge: decoded.challenge,
+      selection: decoded.selection,
+    });
+    if (
+      json(saved) !== row.record_json ||
+      row.scope_json !== scopeJson ||
+      row.challenge_json !== json(saved.challenge) ||
+      row.challenge_ref !== challengeRef ||
+      row.preparation_ref !== saved.preparationRef ||
+      row.retained_preparation !== saved.preparationRef ||
+      row.retained_receipt !== saved.receiptRef ||
+      row.receipt_record !== row.record_json ||
+      row.all_rows_match !== 1
+    )
+      fail("unavailable");
+    return saved;
+  }
   /** Exact existing Accounts challenges.read seam: bare 10fields or undefined only for positive absence. */
   async function readChallenge(
     challengeRef: string,
@@ -455,50 +551,86 @@ export function createFinancialPreproofChallengeStore(
     ref(challengeRef);
     try {
       await c.ready();
-      const rows = await c.sql.query(
-        `SELECT c.*,q.receipt_ref AS retained_receipt,q.preparation_ref AS retained_preparation,
-        q.record_json AS receipt_record,q.all_rows_match FROM financial_preproof_challenges c
-        LEFT JOIN financial_preproof_challenge_receipts q ON q.challenge_ref=c.challenge_ref WHERE c.challenge_ref=?`,
-        [challengeRef],
-      );
-      if (rows.length === 0) {
-        const orphan = await c.sql.query(
-          "SELECT receipt_ref FROM financial_preproof_challenge_receipts WHERE challenge_ref=?",
-          [challengeRef],
-        );
-        if (orphan.length !== 0) fail("unavailable");
-        return undefined;
-      }
-      const row = rows[0];
-      if (rows.length !== 1 || row === undefined || typeof row.record_json !== "string")
-        fail("unavailable");
-      const decoded = JSON.parse(row.record_json) as Record<string, unknown>;
-      const saved = parse({
-        preparationRef: decoded.preparationRef,
-        receiptRef: decoded.receiptRef,
-        challenge: decoded.challenge,
-        selection: decoded.selection,
-      });
-      if (
-        json(saved) !== row.record_json ||
-        row.scope_json !== scopeJson ||
-        row.challenge_json !== json(saved.challenge) ||
-        row.challenge_ref !== challengeRef ||
-        row.preparation_ref !== saved.preparationRef ||
-        row.retained_preparation !== saved.preparationRef ||
-        row.retained_receipt !== saved.receiptRef ||
-        row.receipt_record !== row.record_json ||
-        row.all_rows_match !== 1
-      )
-        fail("unavailable");
-      return saved.challenge;
+      const saved = await readSavedChallenge(challengeRef);
+      return saved?.challenge;
     } catch (error) {
       if (error instanceof FinancialSourceEnrollmentError && error.code === "unavailable")
         throw error;
       return fail("unavailable", error);
     }
   }
-  return Object.freeze({ prepare, readChallenge });
+  /** Query-only retained action original. No currentness, authority clock, or consent assertion. */
+  async function readActionOriginal(
+    challengeRef: string,
+  ): Promise<FinancialPreproofActionOriginal | undefined> {
+    ref(challengeRef);
+    try {
+      await c.ready();
+      const saved = await readSavedChallenge(challengeRef);
+      if (saved === undefined) return undefined;
+      const actionIdentity = await createSharedFinancialActionIdentity(saved.selection.action.body);
+      if (
+        actionIdentity.action.kind !== saved.selection.action.kind ||
+        actionIdentity.action.reference !== saved.selection.action.ref ||
+        actionIdentity.action.organizationId !== saved.challenge.organizationId ||
+        actionIdentity.action.organizationId !== scope.organizationId ||
+        actionIdentity.requestFingerprint !== saved.selection.action.requestFingerprint ||
+        actionIdentity.requestFingerprint !== saved.challenge.requestFingerprint
+      )
+        fail("unavailable");
+      return Object.freeze({
+        preparationRef: saved.preparationRef,
+        receiptRef: saved.receiptRef,
+        challenge: Object.freeze({ ...saved.challenge }),
+        actionIdentity,
+        terms: Object.freeze({
+          ref: saved.selection.terms.ref,
+          digest: saved.selection.terms.digest,
+        }),
+      });
+    } catch (error) {
+      if (error instanceof FinancialSourceEnrollmentError && error.code === "unavailable")
+        throw error;
+      return fail("unavailable", error);
+    }
+  }
+  /** Query-only C0 selection image; no source, terms-body, consent or currentness qualification. */
+  async function readActionSelectionOriginal(
+    challengeRef: string,
+  ): Promise<FinancialPreproofActionSelectionOriginal | undefined> {
+    ref(challengeRef);
+    try {
+      await c.ready();
+      const saved = await readSavedChallenge(challengeRef);
+      if (saved === undefined) return undefined;
+      const selection = freezeSnapshot(parseSelection(snapshot(saved.selection)));
+      const scopeRealm = freezeSnapshot(saved.scope as FinancialPreproofScopeRealmImage);
+      const actionIdentity = await createSharedFinancialActionIdentity(selection.action.body);
+      if (
+        actionIdentity.action.kind !== selection.action.kind ||
+        actionIdentity.action.reference !== selection.action.ref ||
+        actionIdentity.action.organizationId !== saved.challenge.organizationId ||
+        actionIdentity.action.organizationId !== scope.organizationId ||
+        actionIdentity.requestFingerprint !== selection.action.requestFingerprint ||
+        actionIdentity.requestFingerprint !== saved.challenge.requestFingerprint
+      )
+        fail("unavailable");
+      return Object.freeze({
+        preparationRef: saved.preparationRef,
+        receiptRef: saved.receiptRef,
+        challenge: Object.freeze({ ...saved.challenge }),
+        actionIdentity,
+        terms: selection.terms,
+        selection,
+        scopeRealm,
+      });
+    } catch (error) {
+      if (error instanceof FinancialSourceEnrollmentError && error.code === "unavailable")
+        throw error;
+      return fail("unavailable", error);
+    }
+  }
+  return Object.freeze({ prepare, readChallenge, readActionOriginal, readActionSelectionOriginal });
 }
 
 /** Closed private descriptor data, never a qualification capability minted by this module. */
@@ -686,6 +818,32 @@ export function createFinancialSourceMaterializationStore(
       receiptRef: input.receiptRef,
     };
   }
+  async function rejectGenesisOccupancy(input: ReturnType<typeof parse>): Promise<void> {
+    const rows = await c.sql.query(
+      `SELECT EXISTS(SELECT 1 FROM financial_source_genesis_admissions
+      WHERE command_ref IN (?,?) OR receipt_ref IN (?,?) OR (registration_ref=? AND incarnation=?)) AS original_occupied,
+      EXISTS(SELECT 1 FROM financial_source_genesis_admission_receipts
+      WHERE command_ref IN (?,?) OR receipt_ref IN (?,?) OR (registration_ref=? AND incarnation=?)) AS receipt_occupied`,
+      [
+        input.commandRef,
+        input.receiptRef,
+        input.commandRef,
+        input.receiptRef,
+        registrationRef,
+        incarnation,
+        input.commandRef,
+        input.receiptRef,
+        input.commandRef,
+        input.receiptRef,
+        registrationRef,
+        incarnation,
+      ],
+    );
+    // Occupancy may be intact, orphaned or corrupt. Do not manufacture typed
+    // conflict or positive absence from an unqualified G observation.
+    if (rows.length !== 1 || rows[0]?.original_occupied !== 0 || rows[0]?.receipt_occupied !== 0)
+      fail("unavailable");
+  }
   async function install(
     input: FinancialMaterializationCommand,
   ): Promise<FinancialMaterializationReceipt> {
@@ -701,9 +859,10 @@ export function createFinancialSourceMaterializationStore(
     )
       fail("invalid_request");
     try {
-      await c.ready(true);
+      const genesis = await c.ready(true);
       const prior = await original(saved);
       if (prior) return prior;
+      if (genesis) await rejectGenesisOccupancy(saved);
       const recordJson = json(saved),
         at = c.observed();
       const params: readonly SqlParam[] = [
@@ -820,9 +979,10 @@ export function createFinancialSourceMaterializationStore(
     )
       fail("invalid_request");
     try {
-      await c.ready(true);
+      const genesis = await c.ready(true);
       const prior = await original(saved);
       if (prior) return prior;
+      if (genesis) await rejectGenesisOccupancy(saved);
       const heads = await c.sql.query(
         `SELECT affected_ref FROM financial_source_heads
         WHERE registration_ref=? AND incarnation=? AND affected_ref=?`,

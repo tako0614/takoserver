@@ -1,4 +1,8 @@
-import { type BillingConfig, parseBillingConfig } from "./billing-config.ts";
+import {
+  type BillingConfig,
+  type PurchaseCreditExpiry,
+  parseBillingConfig,
+} from "./billing-config.ts";
 import type {
   Checkout,
   CustodiedSubscriptionPayments,
@@ -6,6 +10,7 @@ import type {
 } from "./control.ts";
 import {
   assertHostedBillingFinancialRealm,
+  assertHostedBillingFinancialRealmPersisted,
   type HostedBillingFinancialRealm,
 } from "./hosted-billing-realm.ts";
 import {
@@ -37,10 +42,15 @@ import {
   validatePaymentSettings,
 } from "./payment-settings.ts";
 import type { Clock, Sql } from "./ports.ts";
+import type { SelectedSubscriptionStartEconomicR1 } from "./stripe-billing.ts";
 import { assertStripeBillingSchema, createStripeBilling } from "./stripe-billing.ts";
 import type { StripeBillingClient } from "./stripe-billing-client.ts";
 import { createStripeBillingStore, type StripeBillingStore } from "./stripe-billing-store.ts";
-import { assertStripeCardSetupSchema, createStripeCardSetup } from "./stripe-card-setup.ts";
+import {
+  assertStripeCardSetupSchema,
+  createStripeCardSetup,
+  StripeCardSetupError,
+} from "./stripe-card-setup.ts";
 import {
   assertStripeCustomerCustodySchema,
   createStripeCustomerCustody,
@@ -165,6 +175,38 @@ export interface HostedBillingPaymentAssembly {
   readonly subscriptionCustody: CustodiedSubscriptionPayments;
   readonly subscriptionPlans: SubscriptionPlanPayments;
   readonly subscriptionCommandReceipts: SubscriptionCommandReceipts;
+  readonly preparePlanChangeEconomicR1: NonNullable<
+    ReturnType<typeof createStripeBilling>["subscriptionPlans"]
+  >["preparePlanChangeEconomicR1"];
+  readonly prepareCancellationEconomicR1: NonNullable<
+    ReturnType<typeof createStripeBilling>["prepareCancellationEconomicR1"]
+  >;
+  selectSubscriptionStartEconomicR1(input: {
+    readonly organizationId: string;
+    readonly reference: string;
+    readonly planKey: string;
+  }): Promise<SelectedSubscriptionStartEconomicR1>;
+}
+
+/** Data-only pre-C0 economic choice; neither a Customer pin nor displayed terms. */
+export interface SelectedTopUpEconomicR1 {
+  readonly kind: "topup";
+  readonly amountMinor: number;
+  readonly currency: "USD";
+  readonly pricingRevision: string;
+  readonly purchaseCreditExpiry: PurchaseCreditExpiry;
+  readonly minimumMinor: number;
+  readonly maximumMinor: number;
+  readonly accountId: string;
+  readonly livemode: false;
+  readonly financialRealm: string;
+}
+
+/** Data-only disclosure selection; no card, Customer or consent qualification. */
+export interface SelectedCardSetupEconomicR1 {
+  readonly kind: "card-setup";
+  readonly setupDisclosureRevision: string;
+  readonly onDemandTermsRevision: string;
 }
 
 /** Financial ports come only from a qualified factory, never an independent app override. */
@@ -175,6 +217,12 @@ export type HostedBillingComposition = HostedBillingCompositionBase &
         readonly paymentActivation: true;
         readonly settlement: FundingSettlementVerifier;
         readonly checkout: Checkout;
+        selectTopUpEconomicR1(input: {
+          readonly organizationId: string;
+          readonly reference: string;
+          readonly amountMinor: number;
+        }): Promise<SelectedTopUpEconomicR1>;
+        selectCardSetupEconomicR1(): Promise<SelectedCardSetupEconomicR1>;
         createPayments(context: PaymentEventContext): HostedBillingPaymentAssembly;
       }
   );
@@ -338,16 +386,17 @@ export async function createCanonicalHostedBillingComposition(options: {
   if (!pricing) throw new TypeError("Hosted pricing is unavailable");
   const billingConfig = parseBillingConfig(pricing.environment.TAKOSERVER_BILLING_CONFIG);
   if (!billingConfig) throw new TypeError("Hosted billing tariff is unavailable");
+  const realmPriceProofs = pricing.hostedPlanTable.plans
+    .filter((plan) => plan.tier === "subscription")
+    .map((plan) => ({
+      priceId: plan.stripePriceId,
+      monthlyAmountMinor: plan.monthlyAmountMinor,
+    }));
   assertHostedBillingFinancialRealm(realm, {
     sql,
     client,
     billingAuthority: realm.billingAuthority,
-    prices: pricing.hostedPlanTable.plans
-      .filter((plan) => plan.tier === "subscription")
-      .map((plan) => ({
-        priceId: plan.stripePriceId,
-        monthlyAmountMinor: plan.monthlyAmountMinor,
-      })),
+    prices: realmPriceProofs,
   });
   const compiledSettings = paymentSettingsFromEnvironment(pricing.environment);
   const settings = Object.freeze(
@@ -358,12 +407,11 @@ export async function createCanonicalHostedBillingComposition(options: {
     settings.checkoutMaximumMinor !== compiledSettings.checkoutMaximumMinor
   )
     throw new TypeError("Hosted Checkout bounds do not match the frozen pricing revision");
-  const bounds = {
-    minimumMinor: settings.checkoutMinimumMinor,
-    maximumMinor: settings.checkoutMaximumMinor,
-  };
-  if (bounds.minimumMinor === undefined || bounds.maximumMinor === undefined)
+  const minimumMinor = settings.checkoutMinimumMinor;
+  const maximumMinor = settings.checkoutMaximumMinor;
+  if (minimumMinor === undefined || maximumMinor === undefined)
     throw new TypeError("Hosted Checkout bounds are unavailable");
+  const bounds = { minimumMinor, maximumMinor };
   const webhookSecret = options.webhookSecret?.trim();
   if (!webhookSecret?.startsWith("whsec_"))
     throw new TypeError("Hosted Stripe webhook capability is unavailable");
@@ -508,6 +556,71 @@ export async function createCanonicalHostedBillingComposition(options: {
     paymentActivation: true,
     settlement,
     checkout,
+    async selectCardSetupEconomicR1(): Promise<SelectedCardSetupEconomicR1> {
+      if (onDemandConfiguration === undefined) throw new StripeCardSetupError("unavailable");
+      // Read only the original constructor-owned values. A later service facade or
+      // caller-owned configuration cannot replace the selected disclosure/terms.
+      const selected = Object.freeze({
+        kind: "card-setup" as const,
+        setupDisclosureRevision: onDemandConfiguration.setupDisclosureRevision,
+        onDemandTermsRevision: onDemandConfiguration.terms.termsRevision,
+      });
+      try {
+        await assertHostedBillingFinancialRealmPersisted(realm, {
+          sql,
+          client,
+          billingAuthority: realm.billingAuthority,
+          prices: realmPriceProofs,
+        });
+      } catch {
+        throw new StripeCardSetupError("unavailable");
+      }
+      return selected;
+    },
+    async selectTopUpEconomicR1({
+      organizationId,
+      reference,
+      amountMinor,
+    }: {
+      readonly organizationId: string;
+      readonly reference: string;
+      readonly amountMinor: number;
+    }): Promise<SelectedTopUpEconomicR1> {
+      const validRef = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+      if (
+        typeof organizationId !== "string" ||
+        !validRef.test(organizationId) ||
+        typeof reference !== "string" ||
+        !validRef.test(reference) ||
+        !Number.isSafeInteger(amountMinor) ||
+        amountMinor <= 0 ||
+        amountMinor < bounds.minimumMinor ||
+        amountMinor > bounds.maximumMinor
+      )
+        throw new OrgTopUpError("invalid_argument");
+      try {
+        await assertHostedBillingFinancialRealmPersisted(realm, {
+          sql,
+          client,
+          billingAuthority: realm.billingAuthority,
+          prices: realmPriceProofs,
+        });
+      } catch {
+        throw new OrgTopUpError("unavailable");
+      }
+      return Object.freeze({
+        kind: "topup",
+        amountMinor,
+        currency: "USD",
+        pricingRevision: billingConfig.revision,
+        purchaseCreditExpiry: Object.freeze({ ...billingConfig.purchaseCreditExpiry }),
+        minimumMinor: bounds.minimumMinor,
+        maximumMinor: bounds.maximumMinor,
+        accountId: realm.accountId,
+        livemode: false,
+        financialRealm: realm.financialRealm,
+      });
+    },
     createPayments(context: PaymentEventContext): HostedBillingPaymentAssembly {
       if (context.sql !== sql || context.clock !== clock)
         throw new TypeError("Hosted payment context does not belong to this app SQL and clock");
@@ -525,7 +638,11 @@ export async function createCanonicalHostedBillingComposition(options: {
         ensureCustomer: customerCustody.ensure.bind(customerCustody),
         subscriptionExtensions: (context) => createHostedSubscriptionAdapter({ context, realm }),
       });
-      if (!hosted.subscriptionPlans || !hosted.subscriptionCommandReceipts)
+      if (
+        !hosted.subscriptionPlans ||
+        !hosted.subscriptionCommandReceipts ||
+        !hosted.prepareCancellationEconomicR1
+      )
         throw new TypeError("Hosted subscription period adapter is unavailable");
       const notifications = createStripeEvents(
         {
@@ -563,6 +680,9 @@ export async function createCanonicalHostedBillingComposition(options: {
         subscriptionCustody: hosted.subscriptions,
         subscriptionPlans: hosted.subscriptionPlans,
         subscriptionCommandReceipts: hosted.subscriptionCommandReceipts,
+        selectSubscriptionStartEconomicR1: hosted.selectSubscriptionStartEconomicR1,
+        preparePlanChangeEconomicR1: hosted.subscriptionPlans.preparePlanChangeEconomicR1,
+        prepareCancellationEconomicR1: hosted.prepareCancellationEconomicR1,
       };
     },
   }) as HostedBillingComposition;
