@@ -1,5 +1,6 @@
 import { ApiError, type ResourceSummary } from "../api.ts";
 import { type Child, h, live } from "../dom.ts";
+import { guideLink } from "../first-run.ts";
 import {
   acceptsChanges,
   blankPaths,
@@ -259,6 +260,8 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
   );
   const label = h("label", { for: "create-resource-form" }, "Form");
   const hint = h("small");
+  // Why the SQLite migration Forms are missing, once the Host says they are.
+  const migrations = h("small");
   let pending = options.size;
   let answered = 0;
 
@@ -320,6 +323,18 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
     pending -= 1;
     const option = options.get(form);
     if (supported === false) {
+      if (formKind(form) === "SQLiteMigrationSet")
+        migrations.replaceChildren(
+          tr(
+            "SQLiteMigrationSet（Workerを実行するHostではSQLiteMigrationApplicationも）は、マイグレーションセットを保持させてHostを再起動すると選べるようになります（",
+            "SQLiteMigrationSet, and on a Host that runs Workers SQLiteMigrationApplication, can be chosen once a migration set is seeded and the Host restarted (",
+          ),
+          guideLink(
+            "11-bind-a-sqlite-database",
+            tr("導入手順書（英語）の手順11", "step 11 of the install guide"),
+          ),
+          tr("）。", ")."),
+        );
       if (option) {
         option.disabled = true;
         option.replaceChildren(
@@ -355,7 +370,7 @@ function formChoice(organizationId: string, onChange: () => void): FormChoice {
   render();
 
   return {
-    element: h("div", { class: "field" }, label, select, url, hint),
+    element: h("div", { class: "field" }, label, select, url, hint, migrations),
     value,
     setDisabled(disabled) {
       url.disabled = disabled;
@@ -498,9 +513,6 @@ function referencePicker(
   };
 }
 
-const ARTIFACT_STEP =
-  "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#6-seed-held-artifacts";
-
 /** Create one Resource of an exact Form this Host supports. */
 /** What a create opens with when another page knows what to create. */
 export interface CreatePreset {
@@ -569,7 +581,32 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
       return;
     }
     const label = formLabel(chosen);
+    const kind = formKind(chosen);
+    // A migration set is seeded with the step that also composes its Form.
+    const seedStep =
+      kind === "SQLiteMigrationSet"
+        ? guideLink(
+            "11-bind-a-sqlite-database",
+            tr("導入手順書（英語）の手順11", "step 11 of the install guide"),
+          )
+        : guideLink(
+            "6-seed-held-artifacts",
+            tr("導入手順書（英語）の手順6", "step 6 of the install guide"),
+          );
     artifactHint.replaceChildren(
+      ...(kind === "QueueConsumer"
+        ? [
+            tr(
+              "WorkerのDeploymentが、handlersに queue を含む版だけを配信するようになってから作成してください。それまではHostが拒否します（",
+              "Create it once the Worker's Deployment serves only versions whose handlers include queue; until then the Host refuses it (",
+            ),
+            guideLink(
+              "12-bind-kv-a-bucket-and-a-queue",
+              tr("導入手順書（英語）の手順12", "step 12 of the install guide"),
+            ),
+            tr("）。", ")."),
+          ]
+        : []),
       ...("artifact" in starter.spec
         ? [
             h("span", { class: "mono" }, "url"),
@@ -580,17 +617,7 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
             tr(" として ", " that "),
             h("span", { class: "mono" }, "scripts/selfhost-artifact.ts seed"),
             tr(" が出力する値（その後Hostを再起動します。", " prints (then restart the Host; "),
-            h(
-              "a",
-              { href: ARTIFACT_STEP, target: "_blank", rel: "noopener noreferrer" },
-              tr("導入手順書（英語）の手順6", "step 6 of the install guide"),
-              h("span", { "aria-hidden": "true" }, " ↗"),
-              h(
-                "span",
-                { class: "visually-hidden" },
-                tr("（新しいタブで開きます）", " (opens in a new tab)"),
-              ),
-            ),
+            seedStep,
             tr(
               "）か、自分で公開HTTPSに置いたmanifestのURLとそのSHA-256です。manifestの形は上の公開仕様にあります。",
               "), or the URL and SHA-256 of a manifest you publish over public HTTPS. The manifest's shape is in the published contract above.",

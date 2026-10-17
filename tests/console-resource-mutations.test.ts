@@ -917,6 +917,80 @@ test("an artifact Form's starter says where its url and sha256 come from", async
   expect(body.textContent).not.toContain("url and sha256 are the artifact");
 });
 
+test("a migration set's starter points at the step that seeds it and composes its Form", async () => {
+  const { body } = await setup();
+  const { createResource } = await import("../console/src/pages/create-resource.ts");
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(new Request(input, init).url);
+      if (url.pathname.endsWith("/support")) {
+        const asking = url.searchParams.get("form") ?? "";
+        return Response.json({ form: asking, supported: true, operations: ["create"] });
+      }
+      if (url.pathname.endsWith("/resources"))
+        return Response.json({ items: [], nextCursor: null });
+      return Response.json(discovery);
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  createResource("org-console");
+  await settle();
+  const [select] = body.all().filter((node) => node.tag === "select");
+  if (!select) throw new Error("Form choice missing");
+  select.value = `${edgeForms}/SQLiteMigrationSet/0.2.0/`;
+  select.emit("change");
+  await settle();
+  const link = (label: string) =>
+    body.all().find((node) => node.tag === "a" && node.textContent.startsWith(label));
+  expect(link("step 11 of the install guide")?.attributes.get("href")).toBe(
+    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#11-bind-a-sqlite-database",
+  );
+  expect(link("step 6 of the install guide")).toBeUndefined();
+  // A consumer says what must be served first, where the Host would refuse it.
+  select.value = `${edgeForms}/QueueConsumer/0.3.0/`;
+  select.emit("change");
+  await settle();
+  expect(body.textContent).toContain(
+    "Create it once the Worker's Deployment serves only versions whose handlers include queue; until then the Host refuses it (",
+  );
+  expect(link("step 12 of the install guide")?.attributes.get("href")).toBe(
+    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#12-bind-kv-a-bucket-and-a-queue",
+  );
+});
+
+test("missing SQLite migration Forms say what adds them", async () => {
+  const { body } = await setup();
+  const { createResource } = await import("../console/src/pages/create-resource.ts");
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(new Request(input, init).url);
+      if (url.pathname.endsWith("/support")) {
+        const asking = url.searchParams.get("form") ?? "";
+        const supported = !asking.includes("/SQLiteMigration");
+        return Response.json({ form: asking, supported, operations: supported ? ["create"] : [] });
+      }
+      if (url.pathname.endsWith("/resources"))
+        return Response.json({ items: [], nextCursor: null });
+      return Response.json(discovery);
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  createResource("org-console");
+  await settle();
+  expect(body.textContent).toContain("SQLiteMigrationSet 0.2.0 — not on this Host");
+  expect(body.textContent).toContain(
+    "SQLiteMigrationSet, and on a Host that runs Workers SQLiteMigrationApplication, can be chosen once a migration set is seeded and the Host restarted (",
+  );
+  const step = body
+    .all()
+    .find(
+      (node) => node.tag === "a" && node.textContent.startsWith("step 11 of the install guide"),
+    );
+  expect(step?.attributes.get("href")).toBe(
+    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#11-bind-a-sqlite-database",
+  );
+});
+
 const versionForm = "https://edge.forms.takoform.com/forms/WorkerVersion/0.5.0/";
 const deploymentForm = "https://edge.forms.takoform.com/forms/WorkerDeployment/0.4.0/";
 const resourceAt = (
