@@ -134,6 +134,22 @@ export async function sendResourceIntent(
   }
 }
 
+/**
+ * Drops an intent the Host definitely refused: a 4xx answer to a request whose
+ * acceptance was never in doubt stored nothing, so the person may change it
+ * and send it anew under a new key. Anything uncertain or accepted is kept.
+ */
+export function discardRefusedResourceIntent(id: string, error: unknown): boolean {
+  const intent = intents.get(id);
+  if (!intent || intent.uncertain || intent.operationId !== null || intent.inFlight) return false;
+  if (!(error instanceof ApiError) || isUnknownAcceptance(error)) return false;
+  if (error.status < 400 || error.status >= 500) return false;
+  // That key already holds another request, so this refusal is not "nothing stored".
+  if (error.code === "idempotency_conflict") return false;
+  intents.delete(id);
+  return true;
+}
+
 export function settleResourceIntent(id: string, operation: ResourceOperation): void {
   const intent = intents.get(id);
   if (
