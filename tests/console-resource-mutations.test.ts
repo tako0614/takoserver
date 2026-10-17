@@ -1812,7 +1812,10 @@ test("list appends the next v2 cursor page without repeating the request on rapi
   expect(cursorCalls).toBe(1);
   expect(body.textContent).toContain("one");
   expect(body.textContent).toContain("two");
-  expect(body.textContent).not.toContain("Load more");
+  // No further page is offered (a notice may still name the button).
+  expect(body.all().some((node) => node.tag === "button" && node.textContent === "Load more")).toBe(
+    false,
+  );
 });
 
 test("expired Host replay window refuses a second native mutation send", async () => {
