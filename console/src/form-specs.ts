@@ -8,6 +8,7 @@ export const WORKER_DEPLOYMENT = form("WorkerDeployment", "0.4.0");
 export const WORKER_ENDPOINT = form("WorkerEndpoint", "0.3.0");
 const SQLITE_DATABASE = form("SQLiteDatabase", "0.2.0");
 const SQLITE_MIGRATION_SET = form("SQLiteMigrationSet", "0.2.0");
+const CURRENT_SQLITE_MIGRATION_SET = form("SQLiteMigrationSet", "0.4.0");
 const AT_LEAST_ONCE_QUEUE = form("AtLeastOnceQueue", "0.2.0");
 
 /**
@@ -20,6 +21,7 @@ const UNCHANGEABLE = new Set([
   WORKER_BUNDLE,
   form("StaticAssetBundle", "0.2.0"),
   SQLITE_MIGRATION_SET,
+  CURRENT_SQLITE_MIGRATION_SET,
 ]);
 
 /** Whether an update of a Resource of this exact Form can change anything. */
@@ -55,6 +57,13 @@ const workerOnly = (extra: Record<string, unknown> = {}): StarterSpec => ({
   spec: { worker: { resourceUid: "" }, ...extra },
   references: [{ path: ref("worker"), form: MODULE_WORKER }],
 });
+const migrationApplication = (migrationSetForm: string): StarterSpec => ({
+  spec: { database: { resourceUid: "" }, migrationSet: { resourceUid: "" } },
+  references: [
+    { path: ref("database"), form: SQLITE_DATABASE },
+    { path: ref("migrationSet"), form: migrationSetForm },
+  ],
+});
 
 /**
  * Starters for the Forms the Console offers, written from this Host's own
@@ -64,6 +73,7 @@ const STARTERS: Readonly<Record<string, () => StarterSpec>> = {
   [WORKER_BUNDLE]: artifact,
   [form("StaticAssetBundle", "0.2.0")]: artifact,
   [SQLITE_MIGRATION_SET]: artifact,
+  [CURRENT_SQLITE_MIGRATION_SET]: artifact,
   [MODULE_WORKER]: empty,
   [WORKER_VERSION]: () => ({
     spec: { worker: { resourceUid: "" }, bundle: { resourceUid: "" }, handlers: ["fetch"] },
@@ -86,13 +96,9 @@ const STARTERS: Readonly<Record<string, () => StarterSpec>> = {
   [form("WorkerCronTrigger", "0.3.0")]: () => workerOnly({ cron: "" }),
   [WORKER_ENDPOINT]: () => workerOnly(),
   [SQLITE_DATABASE]: empty,
-  [form("SQLiteMigrationApplication", "0.2.0")]: () => ({
-    spec: { database: { resourceUid: "" }, migrationSet: { resourceUid: "" } },
-    references: [
-      { path: ref("database"), form: SQLITE_DATABASE },
-      { path: ref("migrationSet"), form: SQLITE_MIGRATION_SET },
-    ],
-  }),
+  [form("SQLiteMigrationApplication", "0.2.0")]: () => migrationApplication(SQLITE_MIGRATION_SET),
+  [form("SQLiteMigrationApplication", "0.4.0")]: () =>
+    migrationApplication(CURRENT_SQLITE_MIGRATION_SET),
   [form("EdgeKVNamespace", "0.2.0")]: empty,
   [form("ObjectBucket", "0.2.0")]: empty,
   [AT_LEAST_ONCE_QUEUE]: () => ({ spec: { messageRetentionSeconds: 345600 }, references: [] }),
