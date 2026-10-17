@@ -66,6 +66,23 @@ describe("Takoserver public site", () => {
     );
   });
 
+  test("links each group of Forms to the guide step that uses it", () => {
+    const html = landingHtml(site);
+    const forms = html.slice(html.indexOf('id="forms"'), html.indexOf('id="start"'));
+    const guide = "docs/self-host-operations.md";
+    for (const [anchor, key] of [
+      ["#6-seed-held-artifacts", "step6"],
+      ["#8-create-and-serve-a-worker", "step8"],
+      ["#11-bind-a-sqlite-database", "sqliteStep"],
+      ["#12-bind-kv-a-bucket-and-a-queue", "dataStep"],
+      ["#12-bind-kv-a-bucket-and-a-queue", "queueStep"],
+    ])
+      expect(forms).toContain(`${guide}${anchor}" data-i18n="${key}"`);
+    // Two links side by side say which is which.
+    expect(forms).toContain(">SQLite: step 11 of the install guide</a>");
+    expect(forms).toContain(">KV and buckets: step 12 of the install guide</a>");
+  });
+
   test("walks one Worker through the guide's create chain to its response", () => {
     const html = landingHtml(site);
     const order = [

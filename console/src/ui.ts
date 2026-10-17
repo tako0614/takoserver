@@ -62,27 +62,32 @@ export function copyable(value: string, display?: string): HTMLElement {
       title: `${tr("コピー", "Copy")} ${value}`,
       onClick: (event: Event) => {
         event.stopPropagation();
-        void navigator.clipboard.writeText(value).then(
-          () => {
-            mark.replaceChildren(icon(ICON.check, 13));
-            toast(tr("コピーしました", "Copied"), "ok");
-            setTimeout(() => mark.replaceChildren(icon(ICON.copy, 13)), 1_400);
-          },
-          () =>
-            toast(
-              tr(
-                "ブラウザがクリップボードへのアクセスを拒否しました",
-                "The browser refused clipboard access",
-              ),
-              "bad",
-            ),
-        );
+        copyText(value, mark);
       },
     },
     label,
     mark,
   );
   return button;
+}
+
+/** Copies text, says so, and shows a check in `mark` for a moment. */
+export function copyText(value: string, mark: HTMLElement): void {
+  void navigator.clipboard.writeText(value).then(
+    () => {
+      mark.replaceChildren(icon(ICON.check, 13));
+      toast(tr("コピーしました", "Copied"), "ok");
+      setTimeout(() => mark.replaceChildren(icon(ICON.copy, 13)), 1_400);
+    },
+    () =>
+      toast(
+        tr(
+          "ブラウザがクリップボードへのアクセスを拒否しました",
+          "The browser refused clipboard access",
+        ),
+        "bad",
+      ),
+  );
 }
 
 export function card(title: Child, body: Child, actions?: Child): HTMLElement {
