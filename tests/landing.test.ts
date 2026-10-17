@@ -263,5 +263,9 @@ describe("Takoserver public site", () => {
     expect(html).toContain("<title>404 | Takoserver</title>");
     expect(html).toContain('<meta name="robots" content="noindex">');
     expect(html).toContain('href="/"');
+    // The same page reads in Japanese under /ja/, or for a Japanese browser.
+    expect(html).toContain('ja={title:"ページが見つかりません"');
+    expect(html).toContain('if(first==="ja"||(first!=="en"&&browser==="ja"))');
+    expect(html).toContain('document.querySelector(\'[data-404="back"]\').href="/ja/"');
   });
 });
