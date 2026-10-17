@@ -365,6 +365,7 @@ h3 { margin: 0; font-size: 17px; font-weight: 600; letter-spacing: -0.02em; }
 .forms dt { margin: 0; }
 .forms dt p { margin: 8px 0 0; color: var(--ink-2); font-size: 14px; max-width: 28em; }
 .forms dt .more { margin-top: 12px; }
+.forms dt .more a { white-space: normal; }
 .forms dd { margin: 0; display: flex; flex-wrap: wrap; gap: 8px; align-content: start; }
 .forms code { padding: 4px 10px; border: 1px solid var(--line-1); border-radius: 999px; background: var(--surface-2); font: 13px/1.6 var(--mono); white-space: nowrap; }
 
