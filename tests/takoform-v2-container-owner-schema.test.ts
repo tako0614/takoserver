@@ -2,7 +2,6 @@ import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { v2ContainerOwnerMigrationCandidate } from "../scripts/deploy/v2-container-owner-migration-candidate.ts";
-import { currentAuditedSchemaMigrations } from "./helpers/audited-schema-fixture.ts";
 import { CONTAINER_CONTRACT as C } from "../src/container-contract.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { Sql } from "../src/ports.ts";
@@ -13,13 +12,14 @@ import {
   V2_CONTAINER_OWNER_RECIPE as recipe,
   V2_CONTAINER_OWNER_READY,
 } from "../src/takoform-v2/container-owner-schema.ts";
+import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import {
   redeemV2HostAcceptance,
   type V2HostAcceptanceContext,
   type V2PreparedHostAcceptance,
 } from "../src/takoform-v2/host-acceptance.ts";
-import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import type { V2Backend, V2Form } from "../src/takoform-v2/types.ts";
+import { currentAuditedSchemaMigrations } from "./helpers/audited-schema-fixture.ts";
 
 // These domain-history seeds live ONLY in the five new owned tables, before
 // guards are installed. They are NOT accepted Core rows or native grants. We
@@ -694,7 +694,11 @@ function refuseSecondOwnerTerminal(original: Sql) {
     },
     batch(statements) {
       const faulted = statements.map((statement) => {
-        if (!statement.sql.startsWith("WITH host_form_admission AS (SELECT 1 AS permitted) INSERT INTO main.tf_v2_container_acceptances ")) {
+        if (
+          !statement.sql.startsWith(
+            "WITH host_form_admission AS (SELECT 1 AS permitted) INSERT INTO main.tf_v2_container_acceptances ",
+          )
+        ) {
           return statement;
         }
         terminalCount += 1;
@@ -733,8 +737,7 @@ function mainSchemaFingerprint(db: Database) {
       name,
       tbl_name,
       sqlLength: sql?.length ?? null,
-      sqlSha256:
-        sql === null ? null : createHash("sha256").update(sql).digest("hex"),
+      sqlSha256: sql === null ? null : createHash("sha256").update(sql).digest("hex"),
     })),
   };
 }
@@ -839,7 +842,9 @@ test("audited full100 Core CREATE and UPDATE atomically publish owner rows from 
     ]);
     expect(
       db
-        .query("SELECT incarnation_id, desired_generation FROM tf_v2_container_instances WHERE resource_uid = ?")
+        .query(
+          "SELECT incarnation_id, desired_generation FROM tf_v2_container_instances WHERE resource_uid = ?",
+        )
         .get(createResource.uid),
     ).toEqual({ incarnation_id: instance.incarnation_id, desired_generation: 2 });
     expect(await inspectV2ContainerOwnerSchema(sql)).toBe(true);
@@ -864,16 +869,20 @@ test("full100 Core CREATE refusal at the owner terminal rolls back Core and owne
         spec: coreContainerSpec("v1"),
       },
     });
-    expect(
-      db.query("SELECT operation_id FROM tf_v2_container_acceptances").all(),
-    ).toEqual([{ operation_id: baseline.id }]);
+    expect(db.query("SELECT operation_id FROM tf_v2_container_acceptances").all()).toEqual([
+      { operation_id: baseline.id },
+    ]);
     expect(await inspectV2ContainerOwnerSchema(sql)).toBe(true);
     const beforeSchema = mainSchemaFingerprint(db);
     const beforeCore = {
       resources: db.query("SELECT * FROM tf_v2_resources ORDER BY uid").all(),
       operations: db.query("SELECT * FROM tf_v2_operations ORDER BY id").all(),
-      referenceSets: db.query("SELECT * FROM tf_v2_operation_reference_sets ORDER BY operation_id").all(),
-      references: db.query("SELECT * FROM tf_v2_operation_references ORDER BY operation_id, target_uid").all(),
+      referenceSets: db
+        .query("SELECT * FROM tf_v2_operation_reference_sets ORDER BY operation_id")
+        .all(),
+      references: db
+        .query("SELECT * FROM tf_v2_operation_references ORDER BY operation_id, target_uid")
+        .all(),
       configuredPrivateInputs: db
         .query("SELECT * FROM tf_v2_configured_private_inputs ORDER BY resource_uid")
         .all(),
@@ -898,8 +907,12 @@ test("full100 Core CREATE refusal at the owner terminal rolls back Core and owne
     expect({
       resources: db.query("SELECT * FROM tf_v2_resources ORDER BY uid").all(),
       operations: db.query("SELECT * FROM tf_v2_operations ORDER BY id").all(),
-      referenceSets: db.query("SELECT * FROM tf_v2_operation_reference_sets ORDER BY operation_id").all(),
-      references: db.query("SELECT * FROM tf_v2_operation_references ORDER BY operation_id, target_uid").all(),
+      referenceSets: db
+        .query("SELECT * FROM tf_v2_operation_reference_sets ORDER BY operation_id")
+        .all(),
+      references: db
+        .query("SELECT * FROM tf_v2_operation_references ORDER BY operation_id, target_uid")
+        .all(),
       configuredPrivateInputs: db
         .query("SELECT * FROM tf_v2_configured_private_inputs ORDER BY resource_uid")
         .all(),
@@ -917,14 +930,17 @@ test("full100 Core CREATE refusal at the owner terminal rolls back Core and owne
   }
 });
 
-
 function containerDeleteSnapshot(db: Database) {
   return {
     core: {
       resources: db.query("SELECT * FROM tf_v2_resources ORDER BY uid").all(),
       operations: db.query("SELECT * FROM tf_v2_operations ORDER BY id").all(),
-      referenceSets: db.query("SELECT * FROM tf_v2_operation_reference_sets ORDER BY operation_id").all(),
-      references: db.query("SELECT * FROM tf_v2_operation_references ORDER BY operation_id, target_uid").all(),
+      referenceSets: db
+        .query("SELECT * FROM tf_v2_operation_reference_sets ORDER BY operation_id")
+        .all(),
+      references: db
+        .query("SELECT * FROM tf_v2_operation_references ORDER BY operation_id, target_uid")
+        .all(),
       configuredPrivateInputs: db
         .query("SELECT * FROM tf_v2_configured_private_inputs ORDER BY resource_uid")
         .all(),
@@ -937,10 +953,7 @@ function containerDeleteSnapshot(db: Database) {
   };
 }
 
-function observeContainerDeleteBatch(
-  original: Sql,
-  fault?: "action" | "missing-operation",
-) {
+function observeContainerDeleteBatch(original: Sql, fault?: "action" | "missing-operation") {
   const deleteBatches: Parameters<Sql["batch"]>[0][] = [];
   let injected = false;
   const sql: Sql = {
@@ -953,7 +966,9 @@ function observeContainerDeleteBatch(
     batch(statements) {
       const terminal = statements.at(-1);
       if (
-        !terminal?.sql.startsWith("WITH host_form_admission AS (SELECT 1 AS permitted) INSERT OR ABORT INTO main.tf_v2_container_acceptances ") ||
+        !terminal?.sql.startsWith(
+          "WITH host_form_admission AS (SELECT 1 AS permitted) INSERT OR ABORT INTO main.tf_v2_container_acceptances ",
+        ) ||
         terminal.params?.[10] !== "delete"
       ) {
         return original.batch(statements);
@@ -964,10 +979,7 @@ function observeContainerDeleteBatch(
       injected = true;
       if (fault === "action") params[10] = "invalid-container-delete-action";
       else params[12] = "missing-container-delete-core-operation";
-      return original.batch([
-        ...statements.slice(0, -1),
-        { sql: terminal.sql, params },
-      ]);
+      return original.batch([...statements.slice(0, -1), { sql: terminal.sql, params }]);
     },
   };
   return { sql, deleteBatches, injected: () => injected };
@@ -1028,7 +1040,11 @@ test("genuine Core DELETE retires the durable Container owner in the same accept
     });
     expect(observed.deleteBatches).toHaveLength(1);
     const batch = observed.deleteBatches[0]!;
-    const ownerTerminals = batch.filter((item) => item.sql.startsWith("WITH host_form_admission AS (SELECT 1 AS permitted) INSERT OR ABORT INTO main.tf_v2_container_acceptances "));
+    const ownerTerminals = batch.filter((item) =>
+      item.sql.startsWith(
+        "WITH host_form_admission AS (SELECT 1 AS permitted) INSERT OR ABORT INTO main.tf_v2_container_acceptances ",
+      ),
+    );
     expect(ownerTerminals).toHaveLength(1);
     expect(batch.at(-1)).toBe(ownerTerminals[0]);
     expect(ownerTerminals[0]!.params?.[0]).toBe(deleted.id);
@@ -1052,7 +1068,9 @@ test("genuine Core DELETE retires the durable Container owner in the same accept
       resource_uid: created.resourceUid,
       status: "accepted",
     });
-    const actualCoreBackend = db.query("SELECT backend_key FROM tf_v2_operations WHERE id = ?").get(deleted.id) as { backend_key: string };
+    const actualCoreBackend = db
+      .query("SELECT backend_key FROM tf_v2_operations WHERE id = ?")
+      .get(deleted.id) as { backend_key: string };
     const acceptances = after.owner[recipe.tables[1].name]!;
     expect(acceptances).toHaveLength(3);
     expect(acceptances.find((row) => row.operation_id === deleted.id)).toMatchObject({
@@ -1071,11 +1089,13 @@ test("genuine Core DELETE retires the durable Container owner in the same accept
       retire_operation_id: deleted.id,
       retired_at_ms: expect.any(Number),
     });
-    expect(after.owner[recipe.tables[2].name]!.map((row) => ({
-      generation: row.generation,
-      operation_id: row.operation_id,
-      retention: row.retention,
-    }))).toEqual([
+    expect(
+      after.owner[recipe.tables[2].name]!.map((row) => ({
+        generation: row.generation,
+        operation_id: row.operation_id,
+        retention: row.retention,
+      })),
+    ).toEqual([
       { generation: 1, operation_id: created.id, retention: "retired" },
       { generation: 2, operation_id: updated.id, retention: "retired" },
     ]);
@@ -1140,7 +1160,9 @@ test("Container DELETE preparation owns its callable and binds exact Sql and ori
   expect(() => redeemV2HostAcceptance(prepared!, { ...noIO }, c)).toThrow();
   expect(() => redeemV2HostAcceptance(prepared!, noIO, { ...c })).toThrow();
   expect(() => redeemV2HostAcceptance({} as V2PreparedHostAcceptance, noIO, c)).toThrow();
-  expect(issue.prepareDelete!({ ...c, form: "https://example.test/noncanonical-container" })).toBeUndefined();
+  expect(
+    issue.prepareDelete!({ ...c, form: "https://example.test/noncanonical-container" }),
+  ).toBeUndefined();
   for (const patch of [
     { backendId: "wrong-backend" },
     { targetKey: "wrong-target" },
