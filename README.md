@@ -1,17 +1,44 @@
 # Takoserver
 
-Takoserver is an open-source cloud you run on your own machine. You deploy
-Workers and their SQLite databases, KV namespaces, object buckets and queues to
-it from [Takoform](https://takoform.com) definitions, by exact Form URL over
-Host API v2, and it serves each Worker at an HTTPS hostname. No released
-Takoform client speaks Host API v2 yet (the OpenTofu provider,
-`terraform-provider-takoform` 4.1.0, is v1-only), so today you deploy with HTTP
-requests or in the console.
+Takoserver is an open-source cloud you run on your own Linux machine. You deploy
+Workers, with their SQLite databases, KV namespaces, object buckets and queues,
+from [Takoform](https://takoform.com) definitions, and it serves each Worker at
+an HTTPS hostname on your domain. It is for people who run their own server and
+domain; it is not a managed service.
 
-An organization owns its Resources. Its API keys, each with read or write
-permission, manage them over the API. A separately served console does the same
-in the browser: it creates, updates and deletes Resources and shows each
-Worker's address and state.
+No released Takoform client speaks the Host API v2 this Host uses yet (the
+OpenTofu provider, `terraform-provider-takoform` 4.1.0, is v1-only), so today you
+deploy with curl, or in a browser console you serve yourself. An organization
+owns its Resources, and its API keys, each with read or write permission,
+manage them.
+
+## What you need
+
+To serve Workers:
+
+- a Linux x86-64 machine with glibc 2.38 or newer, such as Ubuntu 24.04;
+- git, curl, jq, Bun 1.4.0, and the Go toolchain to build the Workflow
+  execution guard;
+- the pinned `workerd`, attached to the
+  [2.0.0-rc.1 pre-release](https://github.com/tako0614/takoserver/releases/tag/v2.0.0-rc.1);
+  1.0.0, the release marked Latest, does not have it;
+- a domain with a wildcard DNS name for the Workers, such as
+  `*.apps.example.com`, pointing at the machine, a wildcard certificate for it
+  (issued through a DNS challenge), and TCP 443.
+
+For a look without Workers, Docker with Compose is enough.
+
+## Get started
+
+| To | Follow |
+| --- | --- |
+| Look around: the Host API, operator sign-in, organizations and API keys, without Workers | [Docker and Compose self-host](docs/self-host-docker.md) |
+| Serve a Worker over HTTPS: install, sign in, and create the five Resources of one Worker, with curl or in the console | [First install and first use](docs/self-host-operations.md#first-install-and-first-use), steps 1 to 9 |
+| Ship new code, add SQLite, KV, a bucket or a queue, and delete Resources | Steps [10](docs/self-host-operations.md#10-ship-a-new-version) to [13](docs/self-host-operations.md#13-delete-resources) of the same guide |
+| Decide what to expose and how to harden the machine | [Self-host security](docs/self-host-security.md) |
+| Monitor, back up, update or roll back | [Self-host operations](docs/self-host-operations.md#update-and-code-rollback) |
+| Look up a v2 setting, the Forms a Bun Host supports, or how organizations own Resources | [Takoform v2 architecture and operator setup](docs/takoform-v2.md) |
+| Change the code | [Working on it](#working-on-it): `bun run check` is the gate |
 
 ## What you can deploy
 
@@ -56,48 +83,6 @@ URL-encoded Form URL, for example
 
 [Takoform v2 architecture and operator setup](docs/takoform-v2.md) has the
 exact gates, Form map and limits.
-
-## Quick start
-
-Three ways in, from the quickest look to a served Worker:
-
-1. **Look around in Docker.**
-   [Docker and Compose self-host](docs/self-host-docker.md) runs the v2 Host
-   API, operator sign-in, organizations and API keys on a loopback port. It
-   runs no Workers.
-2. **Start the Host from a checkout.** Set `TAKOSERVER_PUBLIC_ORIGIN` (the
-   canonical external HTTPS origin), the non-secret
-   `TAKOSERVER_TAKOFORM_V2_CONFIG` and the persistent operator secret
-   `TAKOSERVER_TAKOFORM_V2_CURSOR_KEY`, as described in [Settings](#settings),
-   then run:
-
-   ```sh
-   bun install --frozen-lockfile
-   bun --no-env-file src/entry-bun.ts
-   ```
-
-   This is the artifact profile: with their blocks in
-   `TAKOSERVER_TAKOFORM_V2_CONFIG`, it keeps Worker code, static files and SQL
-   migrations, and it runs no Worker. The public v2 discovery is
-   `/.well-known/takoform/v2`. The Bun HTTP listener requires an
-   operator-controlled HTTPS front end for public use; do not expose that
-   backend listener directly.
-3. **Deploy a Worker.**
-   [First install and first use](docs/self-host-operations.md#first-install-and-first-use)
-   takes a Linux x86-64 machine from a reviewed checkout to a Worker served over
-   HTTPS: the Worker runtime, HTTPS on TCP 443, an API key, and the five
-   Resources that make up one Worker, created with curl or in the console.
-
-## Start here
-
-| To | Read |
-| --- | --- |
-| Run the v2 Host API, operator sign-in, organizations and API keys in Docker, on a loopback port | [Docker and Compose self-host](docs/self-host-docker.md) (no Worker execution) |
-| Install a self-host step by step on Linux x86-64, from a reviewed checkout to a Worker served over HTTPS | [First install and first use](docs/self-host-operations.md#first-install-and-first-use) |
-| Look up a v2 setting, the Forms a Bun Host supports, or how organizations own Resources | [Takoform v2 architecture and operator setup](docs/takoform-v2.md) |
-| Decide what to expose and how to harden the machine | [Self-host security](docs/self-host-security.md) |
-| Update, monitor, back up or restore an installation | [Self-host operations](docs/self-host-operations.md#update-and-code-rollback) |
-| Change the code | [Working on it](#working-on-it): `bun run check` is the gate |
 
 ## How it works
 
@@ -485,11 +470,14 @@ time with `TAKOSERVER_PRINT_OPERATOR_ASSERTION=1`
 ([Self-host security](docs/self-host-security.md#sign-in-and-request-limits)).
 Later ones:
 
-```
+```sh
 TAKOSERVER_OPERATOR_KEY=.takoserver/operator-key.jwk \
 TAKOSERVER_PUBLIC_ORIGIN=https://api.example.com \
-  bun scripts/operator-key.ts sign-in google operator operator@localhost Operator
+  bun --no-env-file scripts/operator-key.ts sign-in google operator operator@localhost Operator
 ```
+
+The key is under the data root (`.takoserver` by default; the install guide
+uses `/var/lib/takoserver`).
 
 `TAKOSERVER_PUBLIC_ORIGIN` must be the Host's own origin: without it the
 assertion is signed for `http://localhost:8787`, and the Host refuses it.
@@ -609,8 +597,8 @@ the procedure and its limits.
   control.sqlite        organizations, keys, the ledger, resources
   signing-key.jwk       signs data-plane tokens
   operator-key.jwk      signs operator assertions
-  objects/              customer objects, uploaded bundles under art/, seeded held artifacts under operator-held/
-  databases/            customer SQL databases
+  objects/              seeded held artifacts under operator-held/; pre-v2 objects and uploaded bundles
+  databases/            pre-v2 SQL databases
   v2-sqlite-databases/  v2 SQLiteDatabase files
   v2-kv-namespaces/     v2 EdgeKVNamespace data
   v2-object-buckets/    v2 ObjectBucket objects
@@ -618,8 +606,10 @@ the procedure and its limits.
   v2-runtime/           v2 Actor and Workflow runtime state
   s/                    per-start private sockets; not needed in a backup
   runtime-probes/       verified workerd snapshot and transient resolver probes
-  workers/              published Workers and the workerd config
+  workers/              pre-v2 published Workers and their workerd config
 ```
+
+The tree is a map, not a backup list: a backup copies the whole root.
 
 ### The local Worker runtime
 
@@ -1108,6 +1098,12 @@ for `/.well-known/takoform/v1` on a plain-HTTP origin, both of which the current
 entry refuses. `bun run conformance:takoform-v1`
 (`scripts/conformance-takoform-v1.ts`) runs the frozen stable-v1 suite against
 the separate v1 conformance entry and says nothing about the v2 Host.
+
+## Security
+
+Report a vulnerability privately, as [SECURITY.md](SECURITY.md) describes, not
+in a public issue. Hardening a self-host is in
+[Self-host security](docs/self-host-security.md).
 
 ## Licence
 
