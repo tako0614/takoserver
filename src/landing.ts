@@ -433,6 +433,11 @@ export function landingHtml(options: LandingOptions): string {
   const locale = options.locale ?? "en";
   const copy = landingMessages[locale];
   const base = options.apiOrigin ?? options.hostOrigin ?? "";
+  // A Host's own root is that Host's page, so a shared link names the Host;
+  // the public site's pages are takoserver.com's.
+  const pageUrl = options.hostOrigin
+    ? `${options.hostOrigin}/`
+    : `https://takoserver.com/${locale === "ja" ? "ja/" : ""}`;
   // A Host names its own public origin; without one, the page fills in the
   // origin it was read from.
   const hostAddress = options.hostOrigin ?? "<span data-origin>$HOST</span>";
@@ -518,11 +523,11 @@ ${
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="Takoserver">
 <meta property="og:locale" content="${locale === "ja" ? "ja_JP" : "en_US"}">
-<meta property="og:url" content="https://takoserver.com/${locale === "ja" ? "ja/" : ""}">
+<meta property="og:url" content="${pageUrl}">
 <meta property="og:image" content="https://takoserver.com/og.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<link rel="canonical" href="https://takoserver.com/${locale === "ja" ? "ja/" : ""}">
+<link rel="canonical" href="${pageUrl}">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="Takoserver">
 <meta name="twitter:description" content="${copy.description}">

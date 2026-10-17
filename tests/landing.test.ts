@@ -254,6 +254,10 @@ describe("Takoserver public site", () => {
     const bare = landingHtml({ consoleOrigin: null, apiOrigin: null });
     expect(bare).toContain("This Host serves no console yet.");
     expect(bare).toContain('data-i18n="consoleSetup"');
+    // A shared link to a Host's root names that Host, not takoserver.com.
+    expect(withConsole).toContain('<link rel="canonical" href="https://api.host.example/">');
+    expect(withConsole).toContain('<meta property="og:url" content="https://api.host.example/">');
+    expect(landingHtml(site)).toContain('<link rel="canonical" href="https://takoserver.com/">');
     // The public site describes the reader's own Host, never itself as one.
     expect(landingHtml(site)).not.toContain('<section class="here"');
   });
