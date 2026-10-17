@@ -603,7 +603,13 @@ describe("official read-only Financial request origin", () => {
     const f = await fixture();
     const { inputs, runtime } = await f.consumers();
     const before = f.sessions.map((session) => session.queries.length);
-    expect(Object.keys(financialRequestOrigin)).toEqual(["readWorkerRequestFinancialInputs"]);
+    expect(Object.keys(financialRequestOrigin)).toEqual([
+      "captureWorkerRequestRetainedDirectOwnerSession",
+      "captureWorkerRequestRetainedRpSession",
+      "readWorkerRequestFinancialInputs",
+      "readWorkerRequestRetainedCredentialInputs",
+      "readWorkerRequestRetainedRpCapture",
+    ]);
     expect(financialRequestOrigin.readWorkerRequestFinancialInputs).toBe(
       readWorkerRequestFinancialInputs,
     );
@@ -1549,6 +1555,7 @@ describe("Worker original retained credential inputs", () => {
     expect(directRequestReadCounts(r.queries().slice(before))).toEqual([1, 1, 1, 1]);
     const original = r.accounts.readRetainedDirectOwnerSessionCapture(capture);
     expect(original).not.toBeNull();
+    if (!original) throw new Error("actual retained direct original is missing");
     const afterCapture = r.queries().length;
     const selected = financialRequestOrigin.readWorkerRequestRetainedCredentialInputs(
       r.inputs.connection,
@@ -1600,6 +1607,7 @@ describe("Worker original retained credential inputs", () => {
     const capture = await r.capture();
     expect(capture).not.toBeNull();
     const original = r.read(capture);
+    if (!original) throw new Error("actual retained RP original is missing");
     const before = r.f.sessions.map((session) => session.queries.length);
     const selected = readWorkerRequestRetainedCredentialInputs(r.inputs.connection, capture);
     expect(selected?.inputs).toBe(readWorkerRequestFinancialInputs(r.inputs.connection));
