@@ -37,7 +37,7 @@ export function workerSupport(
 }
 
 /** A link to one section of the install guide, which opens in a new tab. */
-export function guideLink(anchor: string, label: string): Child {
+export function guideLink(anchor: string, label: string): HTMLElement {
   return h(
     "a",
     { href: `${GUIDE}#${anchor}`, target: "_blank", rel: "noopener noreferrer" },
