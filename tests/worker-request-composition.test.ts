@@ -843,7 +843,9 @@ describe("Worker primary Auth schema observations", () => {
     const observation = await observeWorkerRequestAuthSchema(connection);
     expect(f.sessions).toHaveLength(1);
     expect(f.sessions[0]?.queries.length).toBe(before + 2);
-    expect(() => readWorkerRequestFinancialAuthSchemaObservation(connection, observation)).toThrow();
+    expect(() =>
+      readWorkerRequestFinancialAuthSchemaObservation(connection, observation),
+    ).toThrow();
   });
 
   test("missing Auth catalog rejects before publishing a capture or retrying", async () => {
