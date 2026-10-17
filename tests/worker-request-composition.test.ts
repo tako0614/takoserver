@@ -42,6 +42,7 @@ import {
   readWorkerRequestFinancialInputs,
   readWorkerRequestRetainedCredentialInputs,
   readWorkerRequestRetainedRpCapture,
+  readWorkerRequestRetainedRpPrincipalBindingInputs,
   type WorkerRequestDatabase,
   type WorkerRequestSql,
   type WorkerSharedAuthStaging,
@@ -612,6 +613,7 @@ describe("official read-only Financial request origin", () => {
       "readWorkerRequestFinancialInputs",
       "readWorkerRequestRetainedCredentialInputs",
       "readWorkerRequestRetainedRpCapture",
+      "readWorkerRequestRetainedRpPrincipalBindingInputs",
     ]);
     expect(financialRequestOrigin.readWorkerRequestFinancialInputs).toBe(
       readWorkerRequestFinancialInputs,
@@ -1957,5 +1959,196 @@ describe("App original Worker request graph opt-in", () => {
     expect(await response.json()).toMatchObject({ principal: { id: r.issued.principal.id } });
     expect(readWorkerRequestConsumers(r.inputs.connection)).toBe(_original);
     expect(r.f.sessions).toHaveLength(1);
+  });
+});
+
+// Synthetic retained row DATA only: the real RP observer supplies the opaque
+// capture; the fixture does not supply genuine human/enrollment/target authority.
+describe("Worker original RP retained Principal and binding DATA", () => {
+  const bindingQuery = "SELECT * FROM shared_principal_bindings WHERE binding_ref=?";
+  const anchorQuery = "SELECT * FROM auth_principal_incarnations WHERE principal_id=?";
+
+  test("reads the captured RP rows on the same primary without retouching or reclassifying versions", async () => {
+    const r = await retainedRpFixture();
+    const capture = await r.capture();
+    const original = r.read(capture);
+    if (!original) throw new Error("original RP capture missing");
+    const before = r.f.sessions[0]?.queries.length ?? 0;
+    const retained = await readWorkerRequestRetainedRpPrincipalBindingInputs(
+      r.inputs.connection,
+      capture,
+    );
+    if (!retained) throw new Error("retained RP Principal DATA missing");
+    expect(financialRequestOrigin.readWorkerRequestRetainedRpPrincipalBindingInputs).toBe(
+      readWorkerRequestRetainedRpPrincipalBindingInputs,
+    );
+    expect(retained.inputs).toBe(readWorkerRequestFinancialInputs(r.inputs.connection));
+    expect(retained.credentialOriginal).toBe(original);
+    expect(retained.binding).toEqual(r.binding);
+    expect(retained.anchor.principalId).toBe(r.origin.principalId);
+    expect(retained.anchor.incarnation).toBe(r.origin.principalIncarnation);
+    expect(retained.anchor.originKind).toBe("proved-legacy");
+    expect(original.record.rp.registrationRef).toBe("synthetic:original-registration");
+    expect(original.record.rp.enrolledSessionVersion).toBe(0);
+    expect(original.current.version).toBe(2);
+    expect(r.f.sessions[0]?.queries.slice(before)).toEqual([bindingQuery, anchorQuery]);
+    expect(Object.isFrozen(retained)).toBe(true);
+    expect(Object.isFrozen(retained.anchor)).toBe(true);
+    expect(Object.isFrozen(retained.binding)).toBe(true);
+    expect(r.f.sessions).toHaveLength(1);
+  });
+
+  test("unknown, cloned, foreign and direct-token handles cannot select Principal rows", async () => {
+    const r = await retainedRpFixture();
+    const capture = await r.capture();
+    if (!capture) throw new Error("original RP capture missing");
+    const other = await r.f.consumers();
+    let getterReads = 0;
+    const forged = {
+      get record(): never {
+        getterReads++;
+        throw new Error("untrusted capture getter");
+      },
+    };
+    const before = r.f.sessions.map((session) => session.queries.length);
+    for (const value of [null, {}, { ...capture }, forged])
+      expect(
+        await readWorkerRequestRetainedRpPrincipalBindingInputs(r.inputs.connection, value),
+      ).toBeNull();
+    expect(
+      await readWorkerRequestRetainedRpPrincipalBindingInputs(other.inputs.connection, capture),
+    ).toBeNull();
+    expect(getterReads).toBe(0);
+    expect(r.f.sessions.map((session) => session.queries.length)).toEqual(before);
+    const direct = await retainedDirectRequestFixture();
+    const directCapture = await direct.capture();
+    expect(directCapture).not.toBeNull();
+    const directBefore = direct.queries().length;
+    expect(
+      await readWorkerRequestRetainedRpPrincipalBindingInputs(
+        direct.inputs.connection,
+        directCapture,
+      ),
+    ).toBeNull();
+    expect(direct.queries()).toHaveLength(directBefore);
+  });
+
+  for (const field of ["binding target", "Principal incarnation"] as const) {
+    test(`refuses a different retained ${field}`, async () => {
+      const r = await retainedRpFixture();
+      const capture = await r.capture();
+      if (!capture) throw new Error("original RP capture missing");
+      let changed = false;
+      r.control.onResult = (result, sql) => {
+        if (sql !== (field === "binding target" ? bindingQuery : anchorQuery)) return undefined;
+        changed = true;
+        return acknowledgement({
+          ...result,
+          rows: result.rows.map((row) =>
+            field === "binding target"
+              ? { ...row, target_ref: "synthetic:other-target" }
+              : { ...row, principal_incarnation: "synthetic:other-incarnation" },
+          ),
+        });
+      };
+      expect(
+        await readWorkerRequestRetainedRpPrincipalBindingInputs(r.inputs.connection, capture),
+      ).toBeNull();
+      expect(changed).toBe(true);
+      expect(r.read(capture)?.record.origin).toEqual(r.origin);
+    });
+  }
+
+  for (const query of [bindingQuery, anchorQuery]) {
+    test(`unknown ${query === bindingQuery ? "binding" : "anchor"} ACK propagates without fallback`, async () => {
+      const r = await retainedRpFixture();
+      const capture = await r.capture();
+      if (!capture) throw new Error("original RP capture missing");
+      const before = r.f.sessions[0]?.queries.length ?? 0;
+      let unknown = 0;
+      r.control.onResult = (result, sql) => {
+        if (sql !== query) return undefined;
+        unknown++;
+        return { results: result.rows, meta: { changes: result.changes } };
+      };
+      await expect(
+        readWorkerRequestRetainedRpPrincipalBindingInputs(r.inputs.connection, capture),
+      ).rejects.toThrow();
+      expect(unknown).toBe(1);
+      expect(r.f.sessions[0]?.queries.slice(before)).toEqual(
+        query === bindingQuery ? [bindingQuery] : [bindingQuery, anchorQuery],
+      );
+      expect(r.f.sessions).toHaveLength(1);
+    });
+  }
+
+  for (const method of ["query", "prepare"] as const) {
+    test(`refuses a ${method} getter installed after the binding await without invoking it`, async () => {
+      const r = await retainedRpFixture();
+      const capture = await r.capture();
+      if (!capture) throw new Error("original RP capture missing");
+      const receiver = method === "query" ? r.inputs.sql : r.native();
+      const descriptor = Object.getOwnPropertyDescriptor(receiver, method);
+      if (!descriptor) throw new Error("original method missing");
+      const before = r.f.sessions[0]?.queries.length ?? 0;
+      let changed = false;
+      let getterReads = 0;
+      r.control.onResult = (_result, sql) => {
+        if (sql !== bindingQuery) return undefined;
+        changed = true;
+        Object.defineProperty(receiver, method, {
+          configurable: true,
+          get(): never {
+            getterReads++;
+            throw new Error("replacement method getter");
+          },
+        });
+        return undefined;
+      };
+      try {
+        await expect(
+          readWorkerRequestRetainedRpPrincipalBindingInputs(r.inputs.connection, capture),
+        ).rejects.toThrow();
+        expect(changed).toBe(true);
+        expect(getterReads).toBe(0);
+        expect(r.f.sessions[0]?.queries.slice(before)).toEqual([bindingQuery]);
+      } finally {
+        Object.defineProperty(receiver, method, descriptor);
+      }
+    });
+  }
+
+  test("binding retirement stays readable history and never grants a new RP capture", async () => {
+    const r = await retainedRpFixture();
+    const capture = await r.capture();
+    if (!capture) throw new Error("original RP capture missing");
+    const before = await readWorkerRequestRetainedRpPrincipalBindingInputs(
+      r.inputs.connection,
+      capture,
+    );
+    if (!before) throw new Error("original retained rows missing");
+    const terminal = {
+      reason: "component-binding-retirement",
+      at: new Date().toISOString(),
+      ref: "component-binding-retirement",
+    };
+    await createSharedPrincipalAuthorityStore({ sql: r.inputs.sql }).retireBinding(
+      r.binding.ref,
+      r.binding.evidence,
+      terminal,
+    );
+    const after = await readWorkerRequestRetainedRpPrincipalBindingInputs(
+      r.inputs.connection,
+      capture,
+    );
+    if (!after) throw new Error("retired retained rows missing");
+    expect(after.credentialOriginal).toBe(before.credentialOriginal);
+    expect(after.binding.state).toBe("retired");
+    expect(after.binding.terminal).toEqual(terminal);
+    expect(Object.isFrozen(after.binding.terminal)).toBe(true);
+    expect(before.binding.state).toBe("active");
+    expect(before.binding.terminal).toBeNull();
+    expect(await r.capture()).toBeNull();
+    expect(r.read(capture)).toBe(before.credentialOriginal);
   });
 });

@@ -5,6 +5,7 @@ export type {
   WorkerRequestRetainedCredentialInputs,
   WorkerRequestRetainedRpCapture,
   WorkerRequestRetainedRpData,
+  WorkerRequestRetainedRpPrincipalBindingInputs,
   WorkerRequestSql,
 } from "./worker-request-composition.ts";
 export {
@@ -13,4 +14,5 @@ export {
   readWorkerRequestFinancialInputs,
   readWorkerRequestRetainedCredentialInputs,
   readWorkerRequestRetainedRpCapture,
+  readWorkerRequestRetainedRpPrincipalBindingInputs,
 } from "./worker-request-composition.ts";

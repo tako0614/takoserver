@@ -47,6 +47,11 @@ import {
   createSharedAuthFinalSessionStore,
   createSharedAuthSessionStore,
 } from "./shared-auth-session-store.ts";
+import {
+  createSharedPrincipalAuthorityStore,
+  type PrincipalAnchor,
+  type SharedPrincipalBinding,
+} from "./shared-principal-authority.ts";
 import { createD1Sql, type D1DatabaseLike } from "./sql-d1.ts";
 import type { StripeBillingClient } from "./stripe-billing-client.ts";
 
@@ -382,6 +387,85 @@ export function readWorkerRequestRetainedRpCapture(
   if (!capture || typeof capture !== "object") return null;
   const original = retainedRpCaptures.get(capture);
   return original?.connection === connection ? original.data : null;
+}
+
+/** Same-request retained RP row selections, not a distinct human or authority port.
+ * These separate reads do not assert an atomic/current snapshot or grant NEW use.
+ */
+export interface WorkerRequestRetainedRpPrincipalBindingInputs {
+  readonly inputs: WorkerRequestFinancialInputs;
+  readonly credentialOriginal: WorkerRequestRetainedRpData;
+  readonly anchor: PrincipalAnchor;
+  readonly binding: SharedPrincipalBinding;
+}
+
+/** Only an original RP capture selects the fixed retained rows on its original Sql.
+ * Registration/enrollment and final-touch versions remain in their original fields.
+ * Retired history is readable; qualified schema/target, human, Clock, source admission
+ * and the mandatory final same-primary currentness batch remain separate obligations.
+ */
+export async function readWorkerRequestRetainedRpPrincipalBindingInputs(
+  connection: WorkerRequestSql,
+  originalCapture: unknown,
+): Promise<WorkerRequestRetainedRpPrincipalBindingInputs | null> {
+  const credentialOriginal = readWorkerRequestRetainedRpCapture(connection, originalCapture);
+  if (!credentialOriginal) return null;
+  const inputs = readWorkerRequestFinancialInputs(connection);
+  const descriptor = Object.getOwnPropertyDescriptor(inputs.sql, "query");
+  if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "function")
+    throw new TypeError("Worker retained RP Principal reader method differs");
+  const query: Sql["query"] = descriptor.value;
+  const assertOriginal = () => {
+    assertWorkerRequestBacking(connection);
+    if (
+      readWorkerRequestFinancialInputs(connection) !== inputs ||
+      readWorkerRequestRetainedRpCapture(connection, originalCapture) !== credentialOriginal ||
+      Object.getOwnPropertyDescriptor(inputs.sql, "query")?.value !== query
+    )
+      throw new TypeError("Worker retained RP Principal reader origin differs");
+  };
+  const retainedSql = Object.freeze<Sql>({
+    async query(text, params) {
+      assertOriginal();
+      const rows: readonly Row[] = await Reflect.apply(query, inputs.sql, [text, params]);
+      assertOriginal();
+      return rows;
+    },
+    async run() {
+      throw new TypeError("Worker retained RP Principal observation is read-only");
+    },
+    async batch() {
+      throw new TypeError("Worker retained RP Principal observation is read-only");
+    },
+  });
+  const store = createSharedPrincipalAuthorityStore({ sql: retainedSql });
+  const { record } = credentialOriginal;
+  assertOriginal();
+  const binding = await store.readBinding(record.rp.principalBindingRef);
+  assertOriginal();
+  if (
+    !binding ||
+    binding.ref !== record.rp.principalBindingRef ||
+    binding.principalId !== record.origin.principalId ||
+    binding.principalIncarnation !== record.origin.principalIncarnation ||
+    binding.targetRef !== record.origin.targetRef ||
+    binding.issuer !== record.rp.issuer ||
+    binding.subject !== record.rp.subject ||
+    binding.subject !== record.rp.accountId
+  )
+    return null;
+  const anchor = await store.readAnchor(record.origin.principalId);
+  assertOriginal();
+  if (
+    !anchor ||
+    anchor.principalId !== record.origin.principalId ||
+    anchor.incarnation !== record.origin.principalIncarnation ||
+    anchor.originKind !== binding.kind ||
+    anchor.verificationDomain !== null ||
+    (anchor.originKind === "fresh-shared" && anchor.identitySubject !== binding.ref)
+  )
+    return null;
+  return Object.freeze({ inputs, credentialOriginal, anchor, binding });
 }
 
 /** Original request inputs plus retained historical DATA, not an authority port.
