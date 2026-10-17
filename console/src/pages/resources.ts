@@ -284,19 +284,27 @@ export function resourcesPage(organizationId: string): Child {
             { class: "card__body", style: { display: "grid", gap: "12px" } },
             // Whether the exact request can still be sent again decides the advice:
             // resend it under its key, or read before sending anything new.
-            h(
-              "div",
-              { class: "notice notice--warn" },
-              outstanding.some((intent) => canReplayResourceIntent(intent))
-                ? tr(
-                    "Hostがこの要求を受け付けたかどうか、コンソールでは分かりませんでした。「同じ要求を再送」を使ってください。同じキーで同じ要求を送るので、Hostは二重に変更せず、最初のOperationを返します。同じ変更を新しいキーで送り直さないでください。",
-                    "The Console could not tell whether the Host accepted this request. Use “Retry exact request”: it sends the same request under the same key, so the Host returns the original Operation instead of making a second change. Never send the same change again under a new key.",
-                  )
-                : tr(
-                    "Hostがこの要求を受け付けたかどうか、コンソールでは分かりませんでした。ページを再読み込みしたか再送期限を過ぎたため、同じ要求はもう再送できません。新しく送る前に、リソース一覧と対象のリソースを確認してください。まだ表示されていなくても、受け付けられなかったとは限りません。同じ変更を新しいキーで送り直さないでください。",
-                    "The Console could not tell whether the Host accepted this request, and it can no longer resend it exactly: the page was reloaded, or the replay window has passed. Check the Resources list and the Resource itself before sending anything new; a Resource not shown yet does not mean the request was refused. Never send the same change again under a new key.",
+            outstanding.some((intent) => canReplayResourceIntent(intent))
+              ? h(
+                  "div",
+                  { class: "notice notice--warn" },
+                  tr(
+                    "Hostがこの要求を受け付けたかどうか、コンソールでは分かりませんでした。「同じ要求を再送」を使ってください。同じキーで同じ要求を送るので、Hostはすでに受け付けていれば同じOperationを返し、まだなら今受け付けます。どちらでも変更は一度だけです。同じ変更を新しいキーで送り直さないでください。",
+                    "The Console could not tell whether the Host accepted this request. Use “Retry exact request”: it sends the same request under the same key. If the Host already accepted it, it returns that same Operation; if not, it accepts it now. Either way only one change is made. Never send the same change again under a new key.",
                   ),
-            ),
+                )
+              : null,
+            outstanding.length === 0 ||
+              outstanding.some((intent) => !canReplayResourceIntent(intent))
+              ? h(
+                  "div",
+                  { class: "notice notice--warn" },
+                  tr(
+                    "Hostが要求を受け付けたかどうか分からず、ページの再読み込みか再送期限のために、同じ要求はもう再送できません。新しく送る前に、リソース一覧と対象のリソースを確認してください。受け付けられた作成はすぐ一覧に出るので、少し待っても出ないなら受け付けられておらず、作り直せます。同じ名前の作成は、最初の作成が届いていれば拒否されます。更新と削除は読み取った世代を指定するので、最初のものが反映済みならもう一度送っても拒否されます。それでも分からず、Hostを運用しているのが別の人なら、その人に確認してください。",
+                    "The Console could not tell whether the Host accepted a request, and it can no longer resend it exactly: the page was reloaded, or the replay window has passed. Check the Resources list and the Resource before sending anything new. An accepted create is listed at once, so a create still missing after a moment was not accepted and can be made again; a create of the same name is refused if the first one did land. An update or a delete names the generation it read, so sending it again is refused if the first one already applied. If that does not settle it and someone else runs this Host, ask them.",
+                  ),
+                )
+              : null,
             ...outstanding.map((intent) =>
               h(
                 "div",

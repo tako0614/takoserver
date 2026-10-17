@@ -462,8 +462,9 @@ test.each(["connection lost", "malformed accepted reply"] as const)(
     expect(body.textContent).toContain("Acceptance is unknown");
     // While the exact request can still be resent, that is the advice.
     expect(body.textContent).toContain(
-      "Use “Retry exact request”: it sends the same request under the same key",
+      "Use “Retry exact request”: it sends the same request under the same key. If the Host already accepted it, it returns that same Operation; if not, it accepts it now.",
     );
+    expect(body.textContent).not.toContain("it can no longer resend it exactly");
     expect(writes).toHaveLength(1);
     button(body, "Retry exact request").click();
     await settle();
@@ -475,6 +476,43 @@ test.each(["connection lost", "malformed accepted reply"] as const)(
     expect(route().query.get("operation")).toBe(op.id);
   },
 );
+
+test("a request past its replay window gets the read-first advice, not the retry", async () => {
+  const { body, route } = await setup();
+  const { createResource } = await import("../console/src/pages/create-resource.ts");
+  const { resourcesPage } = await import("../console/src/pages/resources.ts");
+  const writes: Request[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const path = new URL(request.url).pathname;
+      if (path.endsWith("/support"))
+        return Response.json({ form, supported: true, operations: ["create"] });
+      // A one-second window has already closed, less its margin, once the request is sent.
+      if (path === "/.well-known/takoform/v2")
+        return Response.json({ limits: { replayWindowSeconds: 1 } });
+      if (request.method === "GET") return Response.json({ items: [], nextCursor: null });
+      writes.push(request.clone());
+      throw new Error("ACK lost");
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  createResource("org-console");
+  await settle();
+  const inputs = body.all().filter((node) => node.tag === "input");
+  if (!inputs[0] || !inputs[1]) throw new Error("create inputs missing");
+  inputs[0].value = form;
+  inputs[1].value = "one";
+  button(body, "Create").click();
+  await settle();
+  expect(writes).toHaveLength(1);
+  expect(route().query.get("acceptance")).toBe("unknown");
+  body.append(resourcesPage("org-console") as unknown as TestNode);
+  await settle();
+  expect(body.textContent).toContain("it can no longer resend it exactly");
+  expect(body.textContent).not.toContain("Use “Retry exact request”");
+  expect(body.textContent).toContain("Replay window expired");
+});
 
 test("create offers the Forms this Host composes and sends the chosen exact URL", async () => {
   const { body } = await setup();
@@ -1864,6 +1902,7 @@ test("after a full reload without the in-memory exact intent, warning remains re
   await settle();
   expect(body.textContent).toContain("Acceptance is unknown");
   expect(body.textContent).toContain("it can no longer resend it exactly");
+  expect(body.textContent).toContain("An accepted create is listed at once");
   expect(body.textContent).not.toContain("Use “Retry exact request”");
   expect(body.textContent).not.toContain("Retry exact request");
   expect(requests.every((request) => request.method === "GET")).toBe(true);
