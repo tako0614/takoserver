@@ -917,6 +917,80 @@ test("an artifact Form's starter says where its url and sha256 come from", async
   expect(body.textContent).not.toContain("url and sha256 are the artifact");
 });
 
+test("a migration set's starter points at the step that seeds it and composes its Form", async () => {
+  const { body } = await setup();
+  const { createResource } = await import("../console/src/pages/create-resource.ts");
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(new Request(input, init).url);
+      if (url.pathname.endsWith("/support")) {
+        const asking = url.searchParams.get("form") ?? "";
+        return Response.json({ form: asking, supported: true, operations: ["create"] });
+      }
+      if (url.pathname.endsWith("/resources"))
+        return Response.json({ items: [], nextCursor: null });
+      return Response.json(discovery);
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  createResource("org-console");
+  await settle();
+  const [select] = body.all().filter((node) => node.tag === "select");
+  if (!select) throw new Error("Form choice missing");
+  select.value = `${edgeForms}/SQLiteMigrationSet/0.2.0/`;
+  select.emit("change");
+  await settle();
+  const link = (label: string) =>
+    body.all().find((node) => node.tag === "a" && node.textContent.startsWith(label));
+  expect(link("step 11 of the install guide")?.attributes.get("href")).toBe(
+    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#11-bind-a-sqlite-database",
+  );
+  expect(link("step 6 of the install guide")).toBeUndefined();
+  // A consumer says what must be served first, where the Host would refuse it.
+  select.value = `${edgeForms}/QueueConsumer/0.3.0/`;
+  select.emit("change");
+  await settle();
+  expect(body.textContent).toContain(
+    "Create it once its queue exists and the Worker's Deployment serves only versions whose handlers include queue; until then the Host refuses it (",
+  );
+  expect(link("step 12 of the install guide")?.attributes.get("href")).toBe(
+    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#12-bind-kv-a-bucket-and-a-queue",
+  );
+});
+
+test("missing SQLite migration Forms say what adds them", async () => {
+  const { body } = await setup();
+  const { createResource } = await import("../console/src/pages/create-resource.ts");
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(new Request(input, init).url);
+      if (url.pathname.endsWith("/support")) {
+        const asking = url.searchParams.get("form") ?? "";
+        const supported = !asking.includes("/SQLiteMigration");
+        return Response.json({ form: asking, supported, operations: supported ? ["create"] : [] });
+      }
+      if (url.pathname.endsWith("/resources"))
+        return Response.json({ items: [], nextCursor: null });
+      return Response.json(discovery);
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  createResource("org-console");
+  await settle();
+  expect(body.textContent).toContain("SQLiteMigrationSet 0.2.0 — not on this Host");
+  expect(body.textContent).toContain(
+    "SQLiteMigrationSet, and on a Host that runs Workers SQLiteMigrationApplication, can be chosen once a migration set is seeded and the Host restarted (",
+  );
+  const step = body
+    .all()
+    .find(
+      (node) => node.tag === "a" && node.textContent.startsWith("step 11 of the install guide"),
+    );
+  expect(step?.attributes.get("href")).toBe(
+    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#11-bind-a-sqlite-database",
+  );
+});
+
 const versionForm = "https://edge.forms.takoform.com/forms/WorkerVersion/0.5.0/";
 const deploymentForm = "https://edge.forms.takoform.com/forms/WorkerDeployment/0.4.0/";
 const resourceAt = (
@@ -1432,6 +1506,59 @@ test("a version can be sent again with its same spec, to retry it", async () => 
   const [update] = writes;
   expect(update?.method).toBe("PUT");
   expect(JSON.parse(await (update as Request).text())).toEqual({ spec: helloV2.spec });
+});
+
+test("a data Resource's page gives the Binding entry a Worker's version adds", async () => {
+  const kv = resourceAt(
+    "uid-kv",
+    "hello-kv",
+    "https://edge.forms.takoform.com/forms/EdgeKVNamespace/0.2.0/",
+    {},
+  );
+  const { body } = await detailPage(() => kv, []);
+  const entry = `"kvBindings": ${JSON.stringify(
+    [{ name: "KV", resource: { resourceUid: "uid-kv" } }],
+    null,
+    2,
+  )}`;
+  expect(body.all().some((node) => node.tag === "pre" && node.textContent === entry)).toBe(true);
+  expect(body.textContent).toContain(
+    "A Worker reaches it through a Binding in its WorkerVersion's kvBindings.",
+  );
+  expect(body.textContent).toContain(
+    'For example, await env.KV.get("key") resolves to an ArrayBuffer, or null.',
+  );
+  expect(
+    body.all().some((node) => node.tag === "button" && node.textContent === "Copy this entry"),
+  ).toBe(true);
+  // A second "kvBindings" in the spec would silently replace the first.
+  expect(body.textContent).toContain(
+    'If the spec already has kvBindings, add the { … } object to that list instead: a second "kvBindings" would replace the first.',
+  );
+  expect(body.textContent).toContain("choose its code again (the one marked current)");
+  const step = body
+    .all()
+    .find(
+      (node) => node.tag === "a" && node.textContent.startsWith("step 12 of the install guide"),
+    );
+  expect(step?.attributes.get("href")).toBe(
+    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#12-bind-kv-a-bucket-and-a-queue",
+  );
+  // A Worker's own page is not something a Binding names this way.
+  const worker = await detailPage(
+    () =>
+      resourceAt(
+        "uid-worker",
+        "hello",
+        "https://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/",
+        {},
+      ),
+    [],
+  );
+  expect(worker.body.textContent).not.toContain("Use it from a Worker");
+  // Nor is a Resource being deleted something to start using.
+  const leaving = await detailPage(() => ({ ...kv, phase: "deleting" as const }), []);
+  expect(leaving.body.textContent).not.toContain("Use it from a Worker");
 });
 
 test("a Resource that can change keeps its Update", async () => {
