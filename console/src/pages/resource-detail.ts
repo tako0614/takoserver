@@ -1,4 +1,4 @@
-import type { ResourceSummary } from "../api.ts";
+import type { ResourceOperation, ResourceSummary } from "../api.ts";
 import { ApiError } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
 import { guideLink } from "../first-run.ts";
@@ -46,7 +46,7 @@ export function resourceDetailPage(organizationId: string, uid: string): Child {
                   serveVersionAction(organizationId, found),
                   newVersionAction(organizationId, found),
                 ],
-                notice: null,
+                notice: stuckVersionNotice(organizationId, found),
               }
             : MODULE_WORKER.test(found.form)
               ? { toolbar: null, notice: recordDeploymentNotice(organizationId, found) }
@@ -285,6 +285,94 @@ function body(
   );
 }
 
+/** How long a version's create may stay unconfirmed before it is called stuck, as the guide's helper waits. */
+const STUCK_AFTER_MS = 120_000;
+/** At most this many in-progress versions are read when a Worker's page explains what holds it. */
+const REFUSED_CHECKS = 8;
+
+/**
+ * Whether an Operation is a create the Host keeps retrying with no reason
+ * given, past the guide's two minutes: how the Host treats a version whose
+ * code it refused. Such an Operation never settles.
+ */
+export function refusedCreate(operation: ResourceOperation, now = Date.now()): boolean {
+  return (
+    operation.status === "reconciling" &&
+    operation.action !== "delete" &&
+    operation.error?.code === "outcome_unconfirmed" &&
+    now - Date.parse(operation.createdAt) >= STUCK_AFTER_MS
+  );
+}
+
+/** The UIDs of in-progress WorkerVersions among a Worker's referrers whose creates were refused. */
+async function refusedVersions(
+  organizationId: string,
+  naming: Awaited<ReturnType<typeof findReferrers>>,
+): Promise<ReadonlySet<string>> {
+  const pending = naming.referrers
+    .map(({ resource }) => resource)
+    .filter(
+      (entry) =>
+        entry.form === WORKER_VERSION && health(entry).phase === "Pending" && entry.lastOperation,
+    )
+    .slice(0, REFUSED_CHECKS);
+  const read = await Promise.all(
+    pending.map(async (entry) => {
+      try {
+        const operation = await api.resourceOperation(
+          organizationId,
+          entry.lastOperation as string,
+        );
+        return refusedCreate(operation) ? entry.uid : null;
+      } catch {
+        return null;
+      }
+    }),
+  );
+  return new Set(read.filter((uid): uid is string => uid !== null));
+}
+
+/**
+ * A version whose create the Host keeps retrying with no reason given. The
+ * Host refuses a version's code this way, and never settles or deletes it, so
+ * waiting does not help; the person needs the usual causes and the way on.
+ */
+function stuckVersionNotice(organizationId: string, version: ResourceSummary): Child {
+  const id = version.lastOperation;
+  if (health(version).phase !== "Pending" || !id) return null;
+  const last = resource(() => api.resourceOperation(organizationId, id));
+  return live(() => {
+    const state = last.get();
+    const operation = state.state === "ready" ? state.value : null;
+    if (!operation || !refusedCreate(operation)) return null;
+    return h(
+      "div",
+      { class: "notice notice--warn", style: { display: "grid", gap: "6px" } },
+      h(
+        "span",
+        null,
+        tr(
+          "Hostはこの版を2分以上再試行していますが、理由を示していません（outcome_unconfirmed）。多くの場合、版のコードが拒否されています：構文エラー、解決できないimport、モジュールの最上位での例外や2秒の制限（ランタイムの起動を含む）を超える処理、またはhandlersがdefault exportの定義するハンドラーと完全には一致していない、などです。",
+          "The Host has kept retrying this version for more than two minutes without saying why (outcome_unconfirmed). That usually means it refused the version's code: a syntax error, an import that does not resolve, an exception at the module's top level or top-level work past a two-second limit that includes the runtime's start-up, or handlers that are not exactly the handlers its default export defines.",
+        ),
+      ),
+      h(
+        "span",
+        null,
+        tr(
+          "再試行中は削除できません。コードを直し、新しい名前でバンドルと版を作成してください。今配信している版はそのまま配信を続けます（",
+          "While it retries, it cannot be deleted. Fix the code and create a new bundle and version under new names; the version that serves now keeps serving (",
+        ),
+        guideLink(
+          "when-a-new-version-does-not-work",
+          tr("導入手順書（英語）", "the install guide"),
+        ),
+        tr("）。", ")."),
+      ),
+    );
+  });
+}
+
 /** How a Worker's code reaches each data Form, through the Binding it names. */
 const BINDINGS: Readonly<
   Record<
@@ -448,7 +536,8 @@ function recordDeploymentNotice(organizationId: string, worker: ResourceSummary)
   const graph = resource(async () => {
     const deployment = await deploymentOf(organizationId, worker.uid);
     if (!unrecordedDeployment(worker, deployment)) return null;
-    return { deployment, naming: await findReferrers(organizationId, worker.uid) };
+    const naming = await findReferrers(organizationId, worker.uid);
+    return { deployment, naming, refused: await refusedVersions(organizationId, naming) };
   });
   const links = (resources: readonly ResourceSummary[]): Child[] =>
     resources.flatMap((entry, index) => [
@@ -459,7 +548,7 @@ function recordDeploymentNotice(organizationId: string, worker: ResourceSummary)
     const state = graph.get();
     const found = state.state === "ready" ? state.value : null;
     if (!found) return plain();
-    const { deployment, naming } = found;
+    const { deployment, naming, refused: refusedUids } = found;
     const referrers = naming.referrers.map(({ resource }) => resource);
     const inProgress = referrers.filter((entry) =>
       ["Pending", "Deleting"].includes(health(entry).phase),
@@ -470,7 +559,9 @@ function recordDeploymentNotice(organizationId: string, worker: ResourceSummary)
     const stuck = inProgress.filter(
       (entry) => WORKER_CRON_TRIGGER.test(entry.form) && health(entry).phase === "Pending",
     );
-    const busy = inProgress.filter((entry) => !stuck.includes(entry));
+    // A version whose code the Host refused never finishes either, and holds the Worker meanwhile.
+    const refused = inProgress.filter((entry) => refusedUids.has(entry.uid));
+    const busy = inProgress.filter((entry) => !stuck.includes(entry) && !refused.includes(entry));
     const unpublished = referrers.filter(
       (entry) =>
         WORKER_ENDPOINT.test(entry.form) &&
@@ -492,54 +583,71 @@ function recordDeploymentNotice(organizationId: string, worker: ResourceSummary)
                 : ", and the Host refuses that update while they are in progress. Neither can be resolved from the console; it needs a fix on the Host.",
             ),
           )
-        : !naming.complete
+        : refused.length > 0
           ? h(
               "span",
               null,
+              ...links(refused),
               tr(
-                "このWorkerを参照するリソースをすべては確認できなかったため、ここでは更新を提示しません。",
-                "Not everything that names this Worker could be checked here, so the update is not offered.",
+                "は完了できません。Hostは2分以上、理由を示さずに再試行しています。多くの場合、版のコードが拒否されています。再試行中はHostがこの更新を受け付けず、版を削除することもできないため、コンソールから配信を記録することはできません（",
+                refused.length === 1
+                  ? " cannot finish: the Host has kept retrying it for more than two minutes without saying why, which usually means it refused the version's code. While it retries, the Host refuses this update and the version cannot be deleted, so the Deployment cannot be recorded from the console ("
+                  : " cannot finish: the Host has kept retrying them for more than two minutes without saying why, which usually means it refused their code. While they retry, the Host refuses this update and they cannot be deleted, so the Deployment cannot be recorded from the console (",
               ),
+              guideLink(
+                "when-a-new-version-does-not-work",
+                tr("導入手順書（英語）", "the install guide"),
+              ),
+              tr("）。", ")."),
             )
-          : busy.length > 0
+          : !naming.complete
             ? h(
                 "span",
                 null,
-                ...links(busy),
                 tr(
-                  "の処理が終わるまで待ってください。Workerを参照するリソースの処理中は、Hostはこの更新を受け付けません。",
-                  busy.length === 1
-                    ? " is in progress. Wait until it finishes: the Host refuses this update while anything that names the Worker is in progress."
-                    : " are in progress. Wait until they finish: the Host refuses this update while anything that names the Worker is in progress.",
+                  "このWorkerを参照するリソースをすべては確認できなかったため、ここでは更新を提示しません。",
+                  "Not everything that names this Worker could be checked here, so the update is not offered.",
                 ),
               )
-            : unpublished.length > 0
+            : busy.length > 0
               ? h(
                   "span",
                   null,
-                  tr("先に", "Re-apply or delete "),
-                  ...links(unpublished),
+                  ...links(busy),
                   tr(
-                    "を再適用するか削除してください。稼働中になるまでは、この更新を送っても完了せず、その間Workerが処理中のままになります。",
-                    " first. Until it is Ready, this update cannot finish, and it would hold the Worker busy meanwhile.",
+                    "の処理が終わるまで待ってください。Workerを参照するリソースの処理中は、Hostはこの更新を受け付けません。",
+                    busy.length === 1
+                      ? " is in progress. Wait until it finishes: the Host refuses this update while anything that names the Worker is in progress."
+                      : " are in progress. Wait until they finish: the Host refuses this update while anything that names the Worker is in progress.",
                   ),
                 )
-              : h(
-                  "button",
-                  {
-                    class: "btn",
-                    type: "button",
-                    onClick: () =>
-                      updateResource(organizationId, worker, {
-                        spec: worker.spec,
-                        note: tr(
-                          `${worker.name}を同じ設定のまま更新し、稼働中の配信${deployment.name}を記録します。内容を確認して「更新する」を押してください。`,
-                          `This updates ${worker.name} with the same spec, so that it records ${deployment.name}. Check it, then choose Update.`,
-                        ),
-                      }),
-                  },
-                  tr("配信を記録する", "Record the Deployment"),
-                );
+              : unpublished.length > 0
+                ? h(
+                    "span",
+                    null,
+                    tr("先に", "Re-apply or delete "),
+                    ...links(unpublished),
+                    tr(
+                      "を再適用するか削除してください。稼働中になるまでは、この更新を送っても完了せず、その間Workerが処理中のままになります。",
+                      " first. Until it is Ready, this update cannot finish, and it would hold the Worker busy meanwhile.",
+                    ),
+                  )
+                : h(
+                    "button",
+                    {
+                      class: "btn",
+                      type: "button",
+                      onClick: () =>
+                        updateResource(organizationId, worker, {
+                          spec: worker.spec,
+                          note: tr(
+                            `${worker.name}を同じ設定のまま更新し、稼働中の配信${deployment.name}を記録します。内容を確認して「更新する」を押してください。`,
+                            `This updates ${worker.name} with the same spec, so that it records ${deployment.name}. Check it, then choose Update.`,
+                          ),
+                        }),
+                    },
+                    tr("配信を記録する", "Record the Deployment"),
+                  );
     return h(
       "div",
       {
