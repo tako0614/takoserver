@@ -108,8 +108,9 @@ function installDom(path = "/resources"): TestNode {
 async function settle(): Promise<void> {
   for (let i = 0; i < 12; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
 }
+/** The last button with this label: a dialog's, when a page under it has one too. */
 function button(body: TestNode, label: string): TestNode {
-  const found = body.all().find((node) => node.tag === "button" && node.textContent === label);
+  const found = body.all().findLast((node) => node.tag === "button" && node.textContent === label);
   if (!found) throw new Error(`missing button: ${label}`);
   return found;
 }
@@ -902,11 +903,11 @@ test("a WorkerVersion's page serves it by updating the Worker's Deployment", asy
   button(body, "Serve this version").click();
   await settle();
   expect(body.textContent).toContain(
-    "This updates hello-deployment to serve only hello-v2, at weight 10000. Check it, then choose Save change.",
+    "This updates hello-deployment to serve only hello-v2, at weight 10000. Check it, then choose Update.",
   );
   // Nothing is sent until the person accepts the update.
   expect(writes).toHaveLength(0);
-  button(body, "Save change").click();
+  button(body, "Update").click();
   await settle();
   expect(writes).toHaveLength(1);
   const [update] = writes;
@@ -959,7 +960,7 @@ test("serving one version says when it replaces a split", async () => {
   button(body, "Serve this version").click();
   await settle();
   expect(body.textContent).toContain(
-    "It serves 2 versions now; after this update it serves only hello-v2. This updates hello-deployment. Check it, then choose Save change.",
+    "It serves 2 versions now; after this update it serves only hello-v2. This updates hello-deployment. Check it, then choose Update.",
   );
 });
 
@@ -1028,10 +1029,10 @@ test("a Worker that has not recorded the Deployment serving it offers to record 
   button(body, "Record the Deployment").click();
   await settle();
   expect(body.textContent).toContain(
-    "This updates hello with the same spec, so that it records hello-deployment. Check it, then choose Save change.",
+    "This updates hello with the same spec, so that it records hello-deployment. Check it, then choose Update.",
   );
   expect(writes).toHaveLength(0);
-  button(body, "Save change").click();
+  button(body, "Update").click();
   await settle();
   const [update] = writes;
   expect(update?.method).toBe("PUT");
@@ -1297,7 +1298,11 @@ test("a version can be sent again with its same spec, to retry it", async () => 
   expect(body.textContent).toContain(
     "A Resource of this Form cannot change. Sending the same spec again retries it, for example after its create failed.",
   );
-  button(body, "Save change").click();
+  // The dialog's own confirm says what it does: no change, a re-apply.
+  expect(body.all().some((node) => node.tag === "button" && node.textContent === "Update")).toBe(
+    false,
+  );
+  button(body, "Re-apply").click();
   await settle();
   const [update] = writes;
   expect(update?.method).toBe("PUT");
@@ -1668,7 +1673,7 @@ test("update uses the observed UID and generation rather than a name-based path"
   const spec = body.all().find((node) => node.tag === "textarea");
   if (!spec) throw new Error("spec editor missing");
   spec.value = '{"value":"changed"}';
-  button(body, "Save change").click();
+  button(body, "Update").click();
   await settle();
   expect(seen).toHaveLength(1);
   expect(seen[0]?.method).toBe("PUT");

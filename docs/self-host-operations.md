@@ -903,9 +903,9 @@ accepts for that Form, and each place that names another Resource lists the
 organization's Resources of the Form the Host requires, by name. Nothing is
 sent until you choose **Create**; **Request to send**, folded below the spec,
 holds the exact request. After each create, the Resources page shows the
-**Accepted operation**. The Host refuses a reference to a Resource whose create has not
-finished, so create anything that names a Resource only once that card offers
-**View resource**.
+**Accepted operation**. The Host refuses a reference to a Resource whose create
+has not finished, so create anything that names a Resource only once that card
+offers **View resource**.
 
 1. Create the `ModuleWorker` `hello`.
 2. Create the `WorkerBundle` `hello-bundle-v1`, with `artifact.url` and
@@ -1000,7 +1000,7 @@ and its code bundle left to choose. Choose `hello-bundle-v2`, name it
 `hello-version-v2` and choose **Create**. Once that version is Ready, open it
 and choose **Serve this version**. It opens the update of `hello-deployment`
 with that version alone at weight 10000, naming the Deployment generation the
-page read, and sends it when you choose **Save change**. The Worker keeps the
+page read, and sends it when you choose **Update**. The Worker keeps the
 Deployment it recorded, so it needs no second record.
 
 `tests/selfhost-v2-ordinary-journey-native.test.ts`

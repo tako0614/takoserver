@@ -107,7 +107,7 @@ const landingMessages = {
     hereNoConsole: "This Host serves no console yet.",
     shipTitle: "Ship a new version",
     shipBody:
-      "Code never changes in place. Create the new code and a version for it, then point the Deployment at that version; the Endpoint keeps its address. In the console, once the new version is Ready, choose “Serve this version” on its page; it prepares this update, which is sent when you choose Save change.",
+      "Code never changes in place. Create the new code and a version for it, then point the Deployment at that version; the Endpoint keeps its address. In the console, once the new version is Ready, choose “Serve this version” on its page; it prepares this update, which is sent when you choose Update.",
     shipBundle:
       "holds the new worker.js, by the URL and SHA-256 of its manifest (a seeded bundle needs a Host restart first).",
     shipVersion: "pairs the new WorkerBundle with its fetch handler.",

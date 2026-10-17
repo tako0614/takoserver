@@ -201,6 +201,7 @@ function body(
                       "このFormのリソースは変更できません。同じ設定をもう一度送ると、失敗した作成などを再試行できます。",
                       "A Resource of this Form cannot change. Sending the same spec again retries it, for example after its create failed.",
                     ),
+                    confirmLabel: tr("再適用する", "Re-apply"),
                   }),
           },
           acceptsChanges(found.form) ? tr("更新", "Update") : tr("再適用", "Re-apply"),
@@ -408,7 +409,7 @@ function recordDeploymentNotice(organizationId: string, worker: ResourceSummary)
                         spec: worker.spec,
                         note: tr(
                           `${worker.name}を同じ設定のまま更新し、稼働中の配信${deployment.name}を記録します。内容を確認して「更新する」を押してください。`,
-                          `This updates ${worker.name} with the same spec, so that it records ${deployment.name}. Check it, then choose Save change.`,
+                          `This updates ${worker.name} with the same spec, so that it records ${deployment.name}. Check it, then choose Update.`,
                         ),
                       }),
                   },
@@ -561,11 +562,11 @@ function serveVersionAction(organizationId: string, version: ResourceSummary): C
                   (split
                     ? tr(
                         `${deployment.name}を更新します。内容を確認して「更新する」を押してください。`,
-                        `This updates ${deployment.name}. Check it, then choose Save change.`,
+                        `This updates ${deployment.name}. Check it, then choose Update.`,
                       )
                     : tr(
                         `${deployment.name}を更新し、${version.name}だけを重み10000で配信します。内容を確認して「更新する」を押してください。`,
-                        `This updates ${deployment.name} to serve only ${version.name}, at weight 10000. Check it, then choose Save change.`,
+                        `This updates ${deployment.name} to serve only ${version.name}, at weight 10000. Check it, then choose Update.`,
                       )),
               })
             : createResource(organizationId, {
