@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { assertMoneyUnitHeldConvertCurrent as assertCuratedHeldConvertCurrent } from "@takoserver/core/deploy-extension";
 
 import {
   assertMoneyUnitHeldConvertCurrent,
@@ -78,6 +79,22 @@ test("a copied or inherited context shape cannot trigger a currentness read", as
   );
   const inherited = Object.create(copied);
   await expect(assertMoneyUnitHeldConvertCurrent(inherited)).rejects.toThrow(
+    "context or source request differs",
+  );
+  expect(factReads).toBe(0);
+});
+
+test("the curated held-convert assertion retains the original owner's identity check", async () => {
+  expect(assertCuratedHeldConvertCurrent).toBe(assertMoneyUnitHeldConvertCurrent);
+  let factReads = 0;
+  const supplied = {
+    kind: "takoserver.money-held-convert-context@v1",
+    get facts() {
+      factReads++;
+      throw new Error("caller facts were read");
+    },
+  };
+  await expect(assertCuratedHeldConvertCurrent(supplied)).rejects.toThrow(
     "context or source request differs",
   );
   expect(factReads).toBe(0);

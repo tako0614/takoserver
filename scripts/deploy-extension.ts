@@ -104,11 +104,16 @@ export {
   runD1Schema,
 } from "./deploy/schema.ts";
 export type {
+  MoneyUnitHeldConvertContext,
+  MoneyUnitHeldConvertFacts,
   MoneyUnitOriginalOriginRead,
   MoneyUnitResumeReadback,
   MoneyUnitResumeReadRequest,
 } from "./deploy/schema-money-unit-owner.ts";
-export { readIntegrationMoneyUnitResumeState } from "./deploy/schema-money-unit-owner.ts";
+export {
+  assertMoneyUnitHeldConvertCurrent,
+  readIntegrationMoneyUnitResumeState,
+} from "./deploy/schema-money-unit-owner.ts";
 export type {
   DeployTarget,
   ManagedWorkerDispatchNamespaceTarget,
