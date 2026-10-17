@@ -1,5 +1,6 @@
 import type { CapturedAuthTokenRow } from "./auth.ts";
 import type { Row, Sql, SqlParam, SqlStatement } from "./ports.ts";
+import type { OidcSessionRecord } from "./shared-auth-session-store.ts";
 import {
   type AuthAuthorityDigest,
   AuthAuthorityStoreError,
@@ -311,6 +312,163 @@ function insert(fields: readonly Field[], guard: AuthCurrentnessPredicate): SqlS
     params: Object.freeze(params),
   });
 }
+
+/** Fixed storage companion, not a genuine issuer, credential or human grant. */
+function sharedRpClassStatement(
+  input: CredentialAuthorityOrigin,
+  identity: RpAuthorityIdentity,
+  organizationId: string,
+  newSession?: OidcSessionRecord,
+): SqlStatement {
+  const selected = origin(input);
+  const session = rp(identity);
+  const organization = authAuthorityText(organizationId);
+  const retainedGuard = Object.freeze({
+    sql: `EXISTS (SELECT 1 FROM shared_auth_sessions s JOIN shared_principal_bindings b ON b.binding_ref=?
+          WHERE s.digest=? AND s.created_at=? AND s.version=? AND s.status='active'
+            AND s.account_id=? AND s.principal_id=? AND s.workspace_id=?
+            AND b.principal_id=s.principal_id AND b.principal_incarnation=? AND b.target_ref=?
+            AND b.issuer=? AND b.subject=? AND b.subject=s.account_id AND b.state='active'
+            AND b.binding_kind IN ('fresh-shared','proved-legacy')
+            AND EXISTS (SELECT 1 FROM auth_principal_incarnations i
+              WHERE i.principal_id=b.principal_id AND i.principal_incarnation=b.principal_incarnation
+                AND i.origin_kind=b.binding_kind AND i.identity_authority_body IS NULL
+                AND i.identity_authority_digest IS NULL)
+            AND ${currentAnchor("b", "shared")})`,
+    params: Object.freeze([
+      session.principalBindingRef,
+      session.sessionDigest,
+      session.sessionCreatedAt,
+      session.enrolledSessionVersion,
+      session.accountId,
+      selected.principalId,
+      session.workspaceId,
+      selected.principalIncarnation,
+      selected.targetRef,
+      session.issuer,
+      session.subject,
+    ]),
+  });
+  if (
+    newSession !== undefined &&
+    (session.sessionDigest !== newSession.digest ||
+      session.sessionCreatedAt !== newSession.createdAt ||
+      session.enrolledSessionVersion !== 0 ||
+      session.accountId !== newSession.accountId ||
+      selected.principalId !== newSession.principalId ||
+      session.workspaceId !== newSession.workspaceId)
+  )
+    throw new AuthAuthorityStoreError("invalid");
+  const guard =
+    newSession === undefined
+      ? retainedGuard
+      : Object.freeze({
+          // The owning pair keeps its INSERT immediately before this mandatory
+          // CASE. A duplicate/RAISE(IGNORE) sets changes()=0 even when an older
+          // byte-identical session or the preceding Money permit already exists.
+          sql: `(${retainedGuard.sql}) AND (changes()=1 AND EXISTS (
+      SELECT 1 FROM shared_auth_sessions n WHERE n.digest=? AND n.account_id=?
+        AND n.principal_id=? AND n.workspace_id=? AND n.payload=? AND n.created_at=?
+        AND n.last_used_at=? AND n.absolute_expires_at=? AND n.grant_checked_at=?
+        AND n.version=0 AND n.status='active'))`,
+          params: Object.freeze([...retainedGuard.params, ...newSessionParams(newSession)]),
+        });
+  const statement = insert(
+    [
+      ...base(selected, "official-shared-rp-session", "shared-rp-session", organization),
+      ["principal_binding_ref", session.principalBindingRef],
+      ["rp_registration_ref", session.registrationRef],
+      ["rp_registration_digest", session.registrationDigest],
+      ["session_digest", session.sessionDigest],
+      ["session_created_at", session.sessionCreatedAt],
+      ["session_enrolled_version", session.enrolledSessionVersion],
+      ["issuer", session.issuer],
+      ["client_id", session.clientId],
+      ["subject", session.subject],
+      ["issuer_session_id", session.issuerSessionId],
+      ["auth_time", session.authTime],
+      ["account_id", session.accountId],
+      ["workspace_id", session.workspaceId],
+      ["workspace_ref", session.workspaceRef],
+    ],
+    guard,
+  );
+  return newSession === undefined
+    ? statement
+    : Object.freeze({
+        sql: `${statement.sql} RETURNING *`,
+        params: Object.freeze([...(statement.params ?? [])]),
+      });
+}
+
+function captureNewRpSession(input: OidcSessionRecord): OidcSessionRecord {
+  const keys = [
+    "digest",
+    "accountId",
+    "principalId",
+    "workspaceId",
+    "payload",
+    "createdAt",
+    "lastUsedAt",
+    "absoluteExpiresAt",
+    "grantCheckedAt",
+    "version",
+    "status",
+  ] as const;
+  if (
+    !input ||
+    typeof input !== "object" ||
+    Array.isArray(input) ||
+    Reflect.ownKeys(input).length !== keys.length
+  )
+    throw new AuthAuthorityStoreError("invalid");
+  const values: Record<string, unknown> = Object.create(null);
+  for (const key of keys) {
+    const descriptor = Object.getOwnPropertyDescriptor(input, key);
+    if (!descriptor || !("value" in descriptor)) throw new AuthAuthorityStoreError("invalid");
+    values[key] = descriptor.value;
+  }
+  const createdAt = authAuthorityInteger(values.createdAt);
+  const lastUsedAt = authAuthorityInteger(values.lastUsedAt);
+  const absoluteExpiresAt = authAuthorityInteger(values.absoluteExpiresAt);
+  const grantCheckedAt = authAuthorityInteger(values.grantCheckedAt);
+  if (
+    values.version !== 0 ||
+    values.status !== "active" ||
+    lastUsedAt !== createdAt ||
+    grantCheckedAt !== createdAt ||
+    absoluteExpiresAt <= createdAt
+  )
+    throw new AuthAuthorityStoreError("invalid");
+  return Object.freeze({
+    digest: authAuthorityDigest(values.digest),
+    accountId: authAuthorityText(values.accountId),
+    principalId: authAuthorityText(values.principalId),
+    workspaceId: authAuthorityText(values.workspaceId),
+    payload: authAuthorityText(values.payload, 65536),
+    createdAt,
+    lastUsedAt,
+    absoluteExpiresAt,
+    grantCheckedAt,
+    version: 0,
+    status: "active",
+  });
+}
+
+function newSessionParams(session: OidcSessionRecord): readonly SqlParam[] {
+  return Object.freeze([
+    session.digest,
+    session.accountId,
+    session.principalId,
+    session.workspaceId,
+    session.payload,
+    session.createdAt,
+    session.lastUsedAt,
+    session.absoluteExpiresAt,
+    session.grantCheckedAt,
+  ]);
+}
+
 function currentAnchor(prefix: string, branch: "local" | "shared"): string {
   // Prefix comes only from this module's closed literal calls, never a DTO.
   const origin =
@@ -531,55 +689,32 @@ export function createCredentialAuthorityClassStore(options: { readonly sql: Sql
       identity: RpAuthorityIdentity,
       organizationId: string,
     ): SqlStatement {
-      const selected = origin(input);
-      const session = rp(identity);
-      const organization = authAuthorityText(organizationId);
-      const guard = Object.freeze({
-        sql: `EXISTS (SELECT 1 FROM shared_auth_sessions s JOIN shared_principal_bindings b ON b.binding_ref=?
-          WHERE s.digest=? AND s.created_at=? AND s.version=? AND s.status='active'
-            AND s.account_id=? AND s.principal_id=? AND s.workspace_id=?
-            AND b.principal_id=s.principal_id AND b.principal_incarnation=? AND b.target_ref=?
-            AND b.issuer=? AND b.subject=? AND b.subject=s.account_id AND b.state='active'
-            AND b.binding_kind IN ('fresh-shared','proved-legacy')
-            AND EXISTS (SELECT 1 FROM auth_principal_incarnations i
-              WHERE i.principal_id=b.principal_id AND i.principal_incarnation=b.principal_incarnation
-                AND i.origin_kind=b.binding_kind AND i.identity_authority_body IS NULL
-                AND i.identity_authority_digest IS NULL)
-            AND ${currentAnchor("b", "shared")})`,
-        params: Object.freeze([
-          session.principalBindingRef,
-          session.sessionDigest,
-          session.sessionCreatedAt,
-          session.enrolledSessionVersion,
-          session.accountId,
-          selected.principalId,
-          session.workspaceId,
-          selected.principalIncarnation,
-          selected.targetRef,
-          session.issuer,
-          session.subject,
-        ]),
-      });
-      return insert(
-        [
-          ...base(selected, "official-shared-rp-session", "shared-rp-session", organization),
-          ["principal_binding_ref", session.principalBindingRef],
-          ["rp_registration_ref", session.registrationRef],
-          ["rp_registration_digest", session.registrationDigest],
-          ["session_digest", session.sessionDigest],
-          ["session_created_at", session.sessionCreatedAt],
-          ["session_enrolled_version", session.enrolledSessionVersion],
-          ["issuer", session.issuer],
-          ["client_id", session.clientId],
-          ["subject", session.subject],
-          ["issuer_session_id", session.issuerSessionId],
-          ["auth_time", session.authTime],
-          ["account_id", session.accountId],
-          ["workspace_id", session.workspaceId],
-          ["workspace_ref", session.workspaceRef],
-        ],
-        guard,
-      );
+      return sharedRpClassStatement(input, identity, organizationId);
+    },
+    /**
+     * Unmounted NEW-only fixed pair. The owning issuer must send both statements
+     * adjacently in one same-connection Sql.batch and verify both acknowledgements.
+     * Historical class adoption, DTO origin and a cookie/NEW grant are not supplied.
+     * Cross-statement changes() must be qualified on each selected engine/wrapper.
+     */
+    sharedRpNewSessionIssuanceStatements(
+      input: CredentialAuthorityOrigin,
+      identity: RpAuthorityIdentity,
+      organizationId: string,
+      record: OidcSessionRecord,
+    ): readonly [SqlStatement, SqlStatement] {
+      const session = captureNewRpSession(record);
+      const companion = sharedRpClassStatement(input, identity, organizationId, session);
+      return Object.freeze([
+        Object.freeze({
+          sql: `INSERT INTO shared_auth_sessions
+            (digest, account_id, principal_id, workspace_id, payload, created_at,
+             last_used_at, absolute_expires_at, grant_checked_at, version, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'active') RETURNING *`,
+          params: newSessionParams(session),
+        }),
+        companion,
+      ]);
     },
     async readRetained(ref: string): Promise<CredentialAuthorityRecord | null> {
       const rows = await sql.query(
