@@ -25,9 +25,11 @@ console: no released Takoform client speaks Host API v2 yet.
 A self-host runs one of two profiles, selected by configuration:
 
 - **Artifact profile.** The v2 Host API, operator sign-in, organizations, API
-  keys, and the artifact Forms `SQLiteMigrationSet 0.2.0`, `WorkerBundle 0.2.0`
-  and `StaticAssetBundle 0.2.0`. These Forms validate and retain bytes; they
-  do not execute SQL, run a Worker, or serve assets. It needs Bun and the three
+  keys, and an artifact Form for each block of the v2 config:
+  `WorkerBundle 0.2.0` and `StaticAssetBundle 0.2.0` in step 3's config, and
+  `SQLiteMigrationSet 0.2.0` once step 11 seeds a migration set. These Forms
+  validate and retain bytes; they do not execute SQL, run a Worker, or serve
+  assets. It needs Bun and the three
   required settings in step 3.
 - **Complete local Worker profile.** Adds the Worker lifecycle Forms and their
   SQLite, KV, ObjectBucket and Queue Bindings, listed in
@@ -43,7 +45,7 @@ the `takoserver` user". An **administrator shell** as root installs tools, write
 `/etc/takoserver`, and runs `systemctl` and `journalctl`. An **operator
 shell** as the `takoserver` user (`runuser -u takoserver -- bash`, then
 `cd /opt/takoserver`) runs the `takoserver` blocks of step 3, whose key files
-must belong to that user, and steps 5 to 11, which share shell variables such
+must belong to that user, and steps 5 to 13, which share shell variables such
 as `KEY` and `ORG`; keep it open between steps.
 
 ### 1. Prerequisites
@@ -245,7 +247,7 @@ The complete local Worker profile additionally needs all of these:
 | `TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY` | The absolute path of the Workflow execution guard (step 1). |
 | `TAKOSERVER_V2_WORKER_RUNTIME_BOOT` | Both Actor and Workflow boot, for example `{"actor":true,"workflow":{"maximumRegistrations":64}}`. |
 | `TAKOSERVER_V2_WORKER_PRIVATE_PLANES` | All five private planes: `sqlite`, `kv`, `objectBucket`, `queue` and `queueProducer`. Each names a distinct fixed `privatePort` and its own `signingKeyFile`; `sqlite` also names an existing private `stagingRoot`. A key file holds 32 to 4,096 random bytes, is mode 0600 and lies in a directory private to the Host's user. The Host never generates these keys. |
-| `workerBundle` and `staticAssetBundle` config blocks | Both with `targetKey` `selfhost-v2-worker-primary`. An empty `heldArtifacts` list composes the Form; step 6 fills it. An optional `sqliteMigrationSet` block, with any stable `targetKey`, adds `SQLiteMigrationApplication 0.2.0`. |
+| `workerBundle` and `staticAssetBundle` config blocks | Both with `targetKey` `selfhost-v2-worker-primary`. An empty `heldArtifacts` list composes the Form; step 6 fills it. An optional `sqliteMigrationSet` block, with any stable `targetKey`, composes both `SQLiteMigrationSet 0.2.0` and `SQLiteMigrationApplication 0.2.0`; step 11's first seed adds it. |
 
 `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING` is optional: with it, WorkerVersion
 accepts `privateInputs` (see the setup guide).
@@ -425,8 +427,8 @@ covers the listeners in full. The front end terminates HTTPS for
 `TAKOSERVER_PUBLIC_ORIGIN` and must pass the exact public `Host` header;
 `Forwarded` and `X-Forwarded-*` headers never select the authority. With
 Caddy on the same machine, for example (Caddy passes the incoming `Host`
-through unchanged, and the matcher keeps the operational probes of step 9 off
-the public origin, as [Monitoring](#monitoring) recommends):
+through unchanged, and the matcher keeps the operational probes off the public
+origin, as [Monitoring](#monitoring) recommends):
 
 ```caddyfile
 api.example.com:8443 {
@@ -575,7 +577,7 @@ path is active.
 
 Exchange the assertion for a session, create the organization that will own
 Resources, and create an organization API key. The organization's ID is the v2
-Space. Run this step and steps 6 to 11 in one shell as the `takoserver` user,
+Space. Run this step and steps 6 to 13 in one shell as the `takoserver` user,
 from the checkout, because they share the `ORG`, `KEY` and other shell
 variables. Stop and start the service (step 6) from a separate administrator
 shell, so that this one keeps them. Keep their working files in a directory outside the data root: the
@@ -694,7 +696,7 @@ URL is exclusive: a wrong digest or missing organization/Space grant fails,
 without public fallback. The Host reads held grants only at startup, so each
 new held bundle takes the same three steps: stop the Host, seed the bundle,
 start the Host again. Every Worker on the Host stops serving while it is
-stopped. A bundle published over public HTTPS, as step 9 shows for new code,
+stopped. A bundle published over public HTTPS, as step 10 shows for new code,
 needs no restart.
 
 If you are not sure the complete Worker profile registered, check support as
@@ -805,9 +807,30 @@ bun --no-env-file scripts/selfhost-artifact.ts verify --config /etc/takoserver/v
 
 Query support for each exact Form URL you intend to use. Proceed only when it
 reports `supported: true`. Support reflects the Forms composed by this running
-Host. If the Worker Forms are unsupported, read the startup diagnostics
-(`workerd`, Actor and socket messages) and compare the configuration with the
-complete-profile table in step 3, then restart.
+Host. If the Worker Forms are unsupported, then apart from an unusable
+`workerd`, which it reports at startup, the Host does not log which setting is
+missing; compare the configuration with the complete-profile table in step 3.
+As root, these show the usual causes:
+
+```sh
+set -a; . /etc/takoserver/takoserver.env; set +a
+for name in TAKOSERVER_WORKERD_BINARY TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY \
+    TAKOSERVER_V2_WORKER_RUNTIME_BOOT TAKOSERVER_V2_WORKER_PRIVATE_PLANES; do
+  [ -n "$(printenv "$name")" ] || echo "missing: $name"
+done
+"$TAKOSERVER_WORKERD_BINARY" --version   # prints its version; a glibc error means the OS is too old
+jq -r '.workerBundle.targetKey, .staticAssetBundle.targetKey' /etc/takoserver/v2/takoform-v2.json
+printf '%s' "$TAKOSERVER_V2_WORKER_RUNTIME_BOOT" | jq -c 'keys'
+printf '%s' "$TAKOSERVER_V2_WORKER_PRIVATE_PLANES" | jq -r 'keys[]'
+journalctl -u takoserver.service -b --no-pager | grep -i -E 'workerd|actor|workflow|socket|plane|endpoint'
+```
+
+Both `targetKey` values must be `selfhost-v2-worker-primary`, the runtime boot
+must print `["actor","workflow"]`, and the planes must be `kv`,
+`objectBucket`, `queue`, `queueProducer` and `sqlite`. If only
+`WorkerEndpoint` is unsupported, check step 4's
+`TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS=1`, `TAKOSERVER_WORKER_ENDPOINT_SUFFIX`
+and the TLS files. Fix the configuration, then restart.
 
 ```sh
 for form in ModuleWorker/0.3.0 WorkerBundle/0.2.0 WorkerVersion/0.5.0 \
@@ -885,11 +908,15 @@ it stopped:
   unique within the Space across all Forms. Because the helper derives each
   key from the name, fix the cause and create the whole chain again under new
   names, for example with `-2` appended to each name. Delete the old Resources
-  with step 11 once nothing references them.
+  with step 13 once nothing references them; a Resource whose Operation is
+  still `reconciling` cannot be deleted (`409 resource_busy`).
 
 A WorkerVersion, Deployment or Endpoint Operation that cannot finish stays
 `reconciling` and retries; it writes nothing to the Host's output, so the
-`error` the helper prints is the only diagnostic.
+`error` the helper prints is the only diagnostic. For a WorkerVersion whose code
+the Host refused, that `error` is only `outcome_unconfirmed`;
+[When a new version does not work](#when-a-new-version-does-not-work) lists the
+usual causes.
 
 Keep this order. An Endpoint requested before its Worker's Deployment has
 succeeded is refused with `409 dependency_conflict` (its `detail` names the
@@ -927,7 +954,7 @@ offers **View resource**.
 6. Record the Deployment on `hello`, as step 9 describes: open `hello` and
    choose **Record the Deployment**.
 
-**Coming back later.** Steps 9 to 11 use the shell variables and helpers of
+**Coming back later.** Steps 9 to 13 use the shell variables and helpers of
 steps 5, 6 and 8. In a new shell, set `HOST`, `V2` and `F` again as in step 5
 and `WORK` as in step 6, and define `wait_operation` and `create` again from
 step 8. `ORG` is the **Identifier** on the console's Settings page, and a new
@@ -941,11 +968,16 @@ uid() { # uid <name>
 }
 WORKER=$(uid hello) && BUNDLE=$(uid hello-bundle-v1) &&
 VERSION=$(uid hello-version-v1) && DEPLOYMENT=$(uid hello-deployment) &&
-ENDPOINT=$(uid hello-endpoint)
+ENDPOINT=$(uid hello-endpoint) &&
+NAME=$(curl -sS --fail-with-body "$V2/resources/$ENDPOINT" \
+  -H "authorization: Bearer $KEY" | jq -er .output.hostname)
 ```
 
-The Resources of steps 9 and 10 are found the same way, by their names, such
-as `hello-bundle-v2` and `hello-version-v2`.
+Seeding in steps 10 to 12 also needs the Host's environment in that shell:
+`set -a; . /etc/takoserver/takoserver.env; set +a`, as in step 6.
+
+The Resources of steps 10 to 12 are found the same way, by their names, such
+as `hello-bundle-v2`, `hello-version-v2` and `hello-queue`.
 
 ### 9. Verify
 
@@ -957,8 +989,8 @@ curl -sS http://127.0.0.1:8787/_takoserver/health/ready
 ```
 
 The Endpoint answers with the Worker's response, and readiness reports
-`workerRuntime: serving` with the v2 Worker counts described below and no
-`degraded` flag; [Monitoring](#monitoring) explains its backlog and background
+`workerRuntime: serving` with the v2 Worker counts and no `degraded` flag;
+[Monitoring](#monitoring) explains those counts and the backlog and background
 pass sections. A restart keeps serving published Workers without a client
 republish.
 
@@ -989,8 +1021,23 @@ Deployment's UID as `observed.activeDeploymentUid`. In the console, open
 `hello` and choose **Record the Deployment**; the page offers it only where
 the update can finish, and otherwise says what to do first.
 
-To ship new code, put the new files in `$WORK/hello/v2` and give the Host
-their bytes in one of two ways:
+### 10. Ship a new version
+
+Code never changes in place: new code is a new `WorkerBundle` and
+`WorkerVersion`, and the Deployment is pointed at the new version, so the
+Endpoint keeps its address.
+
+To ship new code, write it to `$WORK/hello/v2`, as the `takoserver` user in the
+shell of step 6:
+
+```sh
+mkdir -p -m 0700 "$WORK/hello/v2"
+cat > "$WORK/hello/v2/worker.js" <<'EOF'
+export default { fetch() { return new Response("hello from takoserver v2\n"); } };
+EOF
+```
+
+Then give the Host its bytes in one of two ways:
 
 - **Publish them over public HTTPS**, which needs no restart. Serve the files
   and a manifest that lists them over HTTPS on port 443 from another machine,
@@ -1025,7 +1072,9 @@ their bytes in one of two ways:
 
 - **Seed them onto the Host**, as in step 6, for a publisher that is not
   public. Seeding needs the Host stopped, so every Worker on the Host stops
-  serving until it starts again:
+  serving until it starts again. Stop the Host first
+  (`systemctl stop takoserver.service`, as root); then, in the shell of step 6
+  with the Host's environment loaded, seed:
 
   ```sh
   bun --no-env-file scripts/selfhost-artifact.ts seed worker-bundle "$WORK/hello/v2" \
@@ -1033,6 +1082,8 @@ their bytes in one of two ways:
     --organization "$ORG" --entrypoint worker.js \
     --config /etc/takoserver/v2/takoform-v2.json > "$WORK/hello-v2.json"
   ```
+
+  Then start the Host again (`systemctl start takoserver.service`, as root).
 
 Then create a new `WorkerBundle` and `WorkerVersion` and replace the
 Deployment's spec. A `PUT` names the Deployment's current `generation`, read
@@ -1054,6 +1105,16 @@ updated=$(jq -nc --arg w "$WORKER" --arg v "$VERSION_V2" \
 wait_operation "$(printf '%s' "$updated" | jq -r .id)" hello-deployment-v2
 ```
 
+Once that succeeds, the Endpoint serves the new code at the same address:
+
+```sh
+curl -sS -w '%{http_code}\n' "https://$NAME/"
+```
+
+It answers `hello from takoserver v2`, then the status, `200`. If the create
+stays `reconciling` or the status is `500`, see
+[When a new version does not work](#when-a-new-version-does-not-work).
+
 In the console, create `hello-bundle-v2` from `$WORK/hello-v2.json` as in
 step 8. Then open `hello-version-v1` and choose **New version from this one**:
 it opens the create of a WorkerVersion with v1's handlers, vars and Bindings,
@@ -1067,79 +1128,74 @@ Deployment it recorded, so it needs no second record.
 **To go back**, serve the earlier version again: in the console, open
 `hello-version-v1` and choose **Serve this version**; with curl, send the same
 `PUT` naming `$VERSION`. Keep v1 until v2 has served for a while, because step
-11 deletes a version only once nothing serves it.
+13 deletes a version only once nothing serves it.
 
-`tests/selfhost-v2-ordinary-journey-native.test.ts`
-runs this path, apart from recording the Deployment on the Worker, with real
-Host and workerd processes and seeds through the same
-command; [the ordinary journey native test](#ordinary-journey-native-test-and-known-gaps)
+`tests/selfhost-v2-ordinary-journey-native.test.ts` runs steps 8 to 10 with
+real Host and workerd processes, apart from recording the Deployment on the
+Worker, and ships v2 by seeding through the same command;
+[the ordinary journey native test](#ordinary-journey-native-test-and-known-gaps)
 describes its scope and limits.
 
-The Bun self-host exposes two unauthenticated, no-store operational probes,
-outside the Host API v1 and the shared OpenAPI route table:
+#### When a new version does not work
 
-- `GET /_takoserver/health/live` returns `200` while the Bun HTTP handler is
-  responding. It does not query SQLite or the Worker runtime.
-- `GET /_takoserver/health/ready` performs one read-only `SELECT 1` query with
-  a one-second response deadline, then makes one bounded, read-only listener
-  observation of the accepted legacy workerd child and, when the Host has a v2
-  Worker composition, one bounded read of the v2 owners' state. It runs no
-  other SQL: the backlog counts it reports are the latest sample a background
-  pass took (see [Monitoring](#monitoring)). It returns `200` only when SQLite
-  answered and the legacy runtime's listener is currently reachable or that
-  runtime is not required; otherwise it returns `503`. v2 Worker owners, the
-  backlog and background passes are reported separately (below) and, on their
-  own, only mark the response `degraded`.
+Shipping never touches the version that serves: until the Deployment's `PUT`
+succeeds, the earlier version keeps answering, and **To go back** returns to
+it afterwards. A broken version shows itself in one of these ways:
 
-The readiness body contains fixed state labels and Host-wide counts, never an
-identifier: `database` is `readable` or `unavailable`; `workerRuntime` is
-`not-required`, `starting`, `serving`, `recovering`, `restore-failed`, or
-`unavailable`; and `supervisor` is the current child lifecycle state (`idle`,
-`starting`, `serving`, `recovering`, or `unavailable`). If the accepted child is
-still alive but its listener probe fails, `workerRuntime` is `unavailable` while
-`supervisor` remains `serving`; the fields distinguish observed service
-availability from process lifecycle. v2 Worker owners supervise their own
-workerd children outside that supervisor, so when the Host has a v2 Worker
-composition the body also carries `v2Workers: { owners, serving, unavailable }`:
-counts of opened owners, of owners whose recorded active incarnation's child
-group is ready, and of owners that recorded an active incarnation whose child is
-not ready (crashed or being replaced). For v2, "serving" means the owner's
-supervised child holds its listener port; the probe does not send an HTTP
-request to a tenant Worker, so it is not the listener reachability check
-described above. An owner whose Deployment is being deleted counts as neither
-serving nor unavailable.
+- **Its create stays `reconciling`**, and after two minutes the helper prints
+  `still {"status":"reconciling","error":{"code":"outcome_unconfirmed",…}}`.
+  The Host checks a WorkerVersion's code before the version can serve, and this
+  is usually that check refusing it: a syntax error, an import that does not
+  resolve, an exception at the module's top level or top-level work that runs
+  past a two-second limit, which also counts the runtime's start-up, or
+  `handlers` that is not exactly the list of handlers its default export
+  defines. A Binding or assets that the Host cannot use yet look the same. The
+  Host does not say which. It keeps retrying, and refuses to delete
+  the version while it retries (`409 resource_busy`), so the version, and the
+  Worker and bundle it names, stay. While it retries, the Worker's same-spec
+  update (**Record the Deployment**) is refused with `409 dependency_conflict`;
+  new versions and the Deployment's `PUT` still work. About ten minutes later,
+  and from then on, the readiness probe reports `degraded`. Check the code
+  before creating its version:
+  `bun build "$WORK/hello/v2/worker.js" --outdir "$(mktemp -d)"` reports syntax
+  errors and imports that do not resolve. Then ship the fix under new names, such
+  as `hello-bundle-v2-2` and `hello-version-v2-2`. If a Binding or assets were
+  the cause, making them available may let the retry finish by itself. (A Host
+  that cannot run the check at all leaves its versions `reconciling` too, and
+  they settle once it can; see
+  [the native test's notes](#ordinary-journey-native-test-and-known-gaps).)
+- **It serves, but answers an empty `500`**: the code threw.
+  `curl -sS -w '%{http_code}\n'` shows the status, which a bare `curl -sS` does
+  not print. The version, its Deployment and its Endpoint still show Ready, and
+  the console's overview still says **Serving**: they report that the Worker is
+  published, not that its responses succeed.
+- **A queue consumer throws**: its batch is retried, at least
+  `retryDelaySeconds` apart, until each message has been delivered
+  `maxRetries` + 1 times. Then the message is deleted, or moved to the
+  consumer's `deadLetterQueue`, an `AtLeastOnceQueue` its spec may name.
+  Nothing records the loss.
 
-Serving owners turn a would-be `not-required` into `serving`. One or more
-unavailable owners add `degraded: true` but keep the response `200` when SQLite
-answered: this probe shares its port with the control API, and one broken tenant
-Worker must not make a load balancer withdraw the operator API. The `backlog`
-and `backgroundPasses` sections described in [Monitoring](#monitoring) set
-`degraded` the same way. Read `degraded` and the counts to alert on tenant
-Workers and stuck work. The response is `503` only when SQLite did not answer,
-the boot restore failed, the legacy runtime is unavailable, or the v2 owner
-state could not be read within the deadline. The counts carry no Worker UID or
-hostname. An empty successful boot restore with no published Workers is
-`not-required`, not a failure. A failed boot restore remains `restore-failed`
-for this process even if a later child passes its listener check: that check
-does not prove the entire durable published graph was restored. A process
-restart performs the authoritative boot restore again.
+The Host keeps no Worker logs. What a Worker writes with `console.log` or
+`console.error`, and the errors it throws, are discarded, not written to the
+journal. While you debug, catch the error and return it, where `handle` is your
+own handler:
 
-These probes are observational only: they do not call restore, spawn or ensure
-workerd, stop the child, or run a product/provisioner route. The ready probe
-checks the exact accepted listener around one loopback HTTP request (250 ms
-request bound, 500 ms total observation bound); it does not schedule recovery.
-The response contains no raw errors, paths, organization, Resource, Operation or
-Worker identifiers, background pass names, or secrets. It does carry Host-wide
-counts (v2 owners, stalled work, failing passes); see [Monitoring](#monitoring)
-before exposing `/_takoserver/` beyond the Host. A `serving` result means this
-Host's current workerd child passed the Host-owned listener readiness check; it
-is not a claim that every Form, provider, or tenant Worker application is ready.
-In particular, Host/control-plane readiness and application-level health remain
-distinct. `GET /healthz` on the Cloudflare Worker entry is a separate runtime
-surface; these Bun-only diagnostics do not change that entry or the shared
-OpenAPI contract.
+```js
+export default {
+  async fetch(request, env) {
+    try {
+      return await handle(request, env);
+    } catch (error) {
+      return new Response(String(error?.stack ?? error), { status: 500 });
+    }
+  }
+};
+```
 
-### 10. Bind a SQLite database
+Remove it before the Worker is public: an error can carry details that are not
+meant to be shown.
+
+### 11. Bind a SQLite database
 
 A Worker reaches a database only through a `sqliteBindings` entry of its
 WorkerVersion. The Binding offers `execute`, `query` and `transaction`; it
@@ -1152,7 +1208,8 @@ and [SQLiteMigrationApplication 0.2.0](https://edge.forms.takoform.com/forms/SQL
 
 `sqlite-migration-set` accepts only `.sql` files and applies them in the byte
 order of their paths. The first `seed --config` of a migration set adds the
-`sqliteMigrationSet` block, which composes `SQLiteMigrationApplication 0.2.0`.
+`sqliteMigrationSet` block, which composes `SQLiteMigrationSet 0.2.0` and
+`SQLiteMigrationApplication 0.2.0`; until then the Host supports neither.
 Stop the Host, then seed the migrations and a bundle whose code uses the
 Binding, here named `DB`:
 
@@ -1190,7 +1247,7 @@ done
 ```
 
 Then create the database, apply the migrations, and ship the bundle as in
-step 9 with the Binding in the new Version's spec:
+step 10 with the Binding in the new Version's spec:
 
 ```sh
 DATABASE=$(create SQLiteDatabase/0.2.0 hello-db '{}') &&
@@ -1219,14 +1276,162 @@ curl -sS "https://$NAME/"
 `GET /resources/$APPLICATION` shows `observed.ready: true` and the applied
 entries, and the Endpoint answers `hello from sqlite`.
 
-### 11. Delete Resources
+**In the console**, after the seeding and restart above, create the
+`SQLiteDatabase` `hello-db`; the `SQLiteMigrationSet` `hello-migrations-v1`,
+with `artifact.url` and `artifact.sha256` from `$WORK/migrations-v1.json`; and
+the `SQLiteMigrationApplication` `hello-migration-application`, choosing both.
+Create `hello-bundle-v3` from `$WORK/hello-v3.json`. Then open the version that
+serves now and choose **New version from this one**, choose `hello-bundle-v3`,
+and add `"sqliteBindings": [{"name": "DB", "resource": {"resourceUid": "…"}}]`
+to the spec, with `hello-db`'s UID from its page; the console does not offer
+Bindings to choose yet. Name it `hello-version-v3`, create it and serve it as
+in step 10.
+
+### 12. Bind KV, a bucket and a queue
+
+A Worker reaches a KV namespace, an object bucket or a queue the way it reaches
+a database: through a Binding in its WorkerVersion. `kvBindings` name an
+`EdgeKVNamespace`, `bucketBindings` an `ObjectBucket` and
+`queueProducerBindings` an `AtLeastOnceQueue`, each entry as
+`{name, resource: {resourceUid}}`. A Binding name is up to 64 ASCII letters,
+digits, `_` and `$`, not starting with a digit, such as `NOTES` (no `-`), and
+no var, secret or other Binding of the version may share it. To read a queue,
+a `QueueConsumer` names the queue and the Worker, the Worker's code exports a
+`queue` handler, and the version's `handlers` lists exactly the handlers that
+code's default export defines, here `fetch` and `queue`. The published Forms
+define each spec:
+[EdgeKVNamespace 0.2.0](https://edge.forms.takoform.com/forms/EdgeKVNamespace/0.2.0/),
+[ObjectBucket 0.2.0](https://edge.forms.takoform.com/forms/ObjectBucket/0.2.0/),
+[AtLeastOnceQueue 0.2.0](https://edge.forms.takoform.com/forms/AtLeastOnceQueue/0.2.0/)
+and [QueueConsumer 0.3.0](https://edge.forms.takoform.com/forms/QueueConsumer/0.3.0/).
+
+Check support, then create the three Resources. A queue's
+`messageRetentionSeconds` is required, from 60 to 1,209,600; here, four days:
+
+```sh
+for form in EdgeKVNamespace/0.2.0 ObjectBucket/0.2.0 AtLeastOnceQueue/0.2.0 \
+  QueueConsumer/0.3.0; do
+  curl -sS --fail-with-body -G "$V2/support" --data-urlencode "form=$F/$form/" \
+    -H "authorization: Bearer $KEY" | jq -c --arg form "$form" '{$form, supported}'
+done
+NAMESPACE=$(create EdgeKVNamespace/0.2.0 hello-kv '{}') &&
+BUCKET=$(create ObjectBucket/0.2.0 hello-bucket '{}') &&
+QUEUE=$(create AtLeastOnceQueue/0.2.0 hello-queue '{"messageRetentionSeconds":345600}')
+```
+
+Write code that uses all three. A request with `?note=` saves the note in the
+bucket and sends it to the queue; the `queue` handler keeps the last message it
+consumed in KV; any other request shows both:
+
+```sh
+mkdir -p -m 0700 "$WORK/hello/v4"
+cat > "$WORK/hello/v4/worker.js" <<'EOF'
+const text = (bytes) => new TextDecoder().decode(bytes);
+export default {
+  async fetch(request, env) {
+    const note = new URL(request.url).searchParams.get("note");
+    if (note !== null) {
+      await env.NOTES.put("latest.txt", note, { contentType: "text/plain" });
+      await env.JOBS.send(note);
+      return new Response("saved and queued\n");
+    }
+    const object = await env.NOTES.get("latest.txt", {});
+    const saved = object === null ? "nothing" : await new Response(object.body).text();
+    const seen = await env.SEEN.get("last");
+    return new Response("saved: " + saved + "\nconsumed: " + (seen === null ? "nothing" : text(seen)) + "\n");
+  },
+  async queue(batch, env) {
+    for (const message of batch.messages) await env.SEEN.put("last", text(message.body));
+    await batch.acknowledgeAll();
+  }
+};
+EOF
+```
+
+Give the Host its bytes as in step 10, with `v4` in place of `v2`, so that
+`$WORK/hello-v4.json` holds the artifact. Then create the bundle and a version
+that declares the `queue` handler and the three Bindings, serve it, and only
+then create the consumer:
+
+```sh
+BUNDLE_V4=$(create WorkerBundle/0.2.0 hello-bundle-v4 "$(jq -c '{artifact}' "$WORK/hello-v4.json")") &&
+spec=$(jq -nc --arg w "$WORKER" --arg b "$BUNDLE_V4" --arg k "$NAMESPACE" \
+    --arg o "$BUCKET" --arg q "$QUEUE" \
+  '{worker: {resourceUid: $w}, bundle: {resourceUid: $b}, handlers: ["fetch", "queue"],
+    kvBindings: [{name: "SEEN", resource: {resourceUid: $k}}],
+    bucketBindings: [{name: "NOTES", resource: {resourceUid: $o}}],
+    queueProducerBindings: [{name: "JOBS", resource: {resourceUid: $q}}]}') &&
+VERSION_V4=$(create WorkerVersion/0.5.0 hello-version-v4 "$spec") &&
+GENERATION=$(curl -sS --fail-with-body "$V2/resources/$DEPLOYMENT" \
+  -H "authorization: Bearer $KEY" | jq -r .generation) &&
+updated=$(jq -nc --arg w "$WORKER" --arg v "$VERSION_V4" \
+    '{spec: {worker: {resourceUid: $w}, versions: [{workerVersion: {resourceUid: $v}, weight: 10000}]}}' |
+  curl -sS --fail-with-body -X PUT "$V2/resources/$DEPLOYMENT" \
+    -H "authorization: Bearer $KEY" -H 'content-type: application/json' \
+    -H 'idempotency-key: takoserver-hello-deployment-v4' \
+    -H "takoform-expected-generation: $GENERATION" --data @-) &&
+wait_operation "$(printf '%s' "$updated" | jq -r .id)" hello-deployment-v4 &&
+spec=$(jq -nc --arg q "$QUEUE" --arg w "$WORKER" \
+  '{queue: {resourceUid: $q}, worker: {resourceUid: $w}, maxBatchSize: 10,
+    maxBatchTimeoutSeconds: 5, maxConcurrency: 1, maxRetries: 3, retryDelaySeconds: 0}') &&
+CONSUMER=$(create QueueConsumer/0.3.0 hello-consumer "$spec")
+```
+
+A `QueueConsumer` is refused with `409 dependency_conflict`, and nothing is
+stored, until the Worker's Deployment serves only versions whose `handlers`
+include `queue`. While it exists, keep `queue` in every version you serve: the
+Host does not refuse a Deployment that serves a version without it, but it then
+delivers nothing to the Worker until every served version declares `queue`
+again, and the messages wait only as long as the queue's retention. Now send a
+note and read it back:
+
+```sh
+curl -sS "https://$NAME/?note=first"
+curl -sS "https://$NAME/"
+```
+
+The first answers `saved and queued`. The second shows `saved: first`, and
+`consumed: first` once the consumer has run, within a few seconds of the batch
+timeout; ask again while it still says `nothing`. If it still does after a
+minute, the consumer is probably throwing, and a message whose retries ran out
+is gone; see [When a new version does not work](#when-a-new-version-does-not-work).
+
+These Bindings follow the Takoform interfaces `edge.kv`, `edge.objects` and
+`edge.queue`, not Cloudflare's, and code written for Cloudflare's breaks where
+they differ:
+
+| Call | On this Host | Refused or wrong |
+| --- | --- | --- |
+| KV `get(key)` | Resolves to an `ArrayBuffer`, or `null`; decode text with `TextDecoder`. | A second argument such as `"text"` throws `TypeError`; using the result as a string gives `[object ArrayBuffer]`. |
+| KV `put(key, value, options)` | `value` is a string or bytes; `options` may hold `expirationTtlSeconds` (60 or more) and `metadata`. | `expirationTtl` or `expiration` throws `TypeError`. |
+| Bucket `get(key, options)` | Resolves to `{etag, size, contentType, body, partial}`, or `null`; read `body` with `new Response(object.body).text()`. | `object.text()` and `object.json()` do not exist. |
+| Bucket `put(key, body, options)` | `body` is a string, an `ArrayBuffer` or a byte `ReadableStream`; a stream needs `contentLength`. | A `Uint8Array` throws `TypeError`; pass its buffer slice. A stream without `contentLength` fails with `invalid_body`. |
+| Queue `send(body, options)` | `body` is a string or bytes; `options` may hold `delaySeconds`. | An object fails with `invalid_body`; send `JSON.stringify(value)`. |
+| `queue(batch, env, ctx)` | Each of `batch.messages` is `{id, timestampMillis, body, attempts}`, with `body` a `Uint8Array`. Settle with `batch.acknowledge(id)`, `batch.retry(id, delaySeconds)`, `batch.acknowledgeAll()` or `batch.retryAll(delaySeconds)`. When the handler returns, messages left unsettled are acknowledged; when it throws, they are retried. | `message.ack()` and `message.retry()` do not exist; calling one throws, so the batch is retried. |
+
+`tests/selfhost-v2-ordinary-journey-native.test.ts` runs a KV namespace, a
+queue and its consumer this way with real Host and workerd processes, and
+`tests/selfhost-v2-mixed-binding-process-recovery.test.ts` a bucket.
+
+**In the console**, create `hello-kv`, `hello-bucket` and `hello-queue`: each
+dialog starts from a spec the Host accepts. Create `hello-bundle-v4` as in
+step 10. Then open the version that serves now and choose **New version from
+this one**, choose `hello-bundle-v4`, and in the spec add `"queue"` to
+`handlers` and the three Binding arrays above, with each Resource's UID from
+its page; the console does not offer Bindings to choose yet. A copy of step
+11's v3 keeps its `DB` Binding, which does no harm. Name it
+`hello-version-v4`, create it and serve it. Once that update has succeeded,
+create the `QueueConsumer` `hello-consumer`, choosing `hello-queue` and
+`hello`.
+
+### 13. Delete Resources
 
 DELETE needs an `Idempotency-Key` and the Resource's current generation, like
 PUT. Without a valid key it is refused with `400`; with one but without
 `takoform-expected-generation`, with `428` `expected_generation_required`. A
 Resource that another Resource still names is refused with `409`
 `dependency_conflict`, so delete in reference order. Leave out the Resources of
-steps 9 and 10 that you did not create:
+steps 10 to 12 that you did not create:
 
 ```sh
 remove() { # remove <resourceUid> <label>
@@ -1237,12 +1442,16 @@ remove() { # remove <resourceUid> <label>
       -H "takoform-expected-generation: $generation") || { echo "$2: $removed" >&2; return 1; }
   wait_operation "$(printf '%s' "$removed" | jq -r .id)" "$2"
 }
+remove "$CONSUMER" consumer &&
 remove "$ENDPOINT" endpoint &&
 remove "$DEPLOYMENT" deployment &&
-remove "$VERSION_V3" version-v3 && remove "$VERSION_V2" version-v2 && remove "$VERSION" version-v1 &&
-remove "$BUNDLE_V3" bundle-v3 && remove "$BUNDLE_V2" bundle-v2 && remove "$BUNDLE" bundle-v1 &&
+remove "$VERSION_V4" version-v4 && remove "$VERSION_V3" version-v3 &&
+remove "$VERSION_V2" version-v2 && remove "$VERSION" version-v1 &&
+remove "$BUNDLE_V4" bundle-v4 && remove "$BUNDLE_V3" bundle-v3 &&
+remove "$BUNDLE_V2" bundle-v2 && remove "$BUNDLE" bundle-v1 &&
 remove "$APPLICATION" migration-application && remove "$MIGRATIONS" migration-set &&
 remove "$DATABASE" database &&
+remove "$NAMESPACE" kv && remove "$BUCKET" bucket && remove "$QUEUE" queue &&
 remove "$WORKER" worker
 ```
 
@@ -1317,10 +1526,21 @@ commit first, then, as root (the checkout stays root-owned and read-only to
 
    ```sh
    git -C /opt/takoserver fetch origin
-   git -C /opt/takoserver cat-file -e '<reviewed-commit>^{commit}'
-   git -C /opt/takoserver worktree add --detach /opt/takoserver-<short-commit> <reviewed-commit>
-   cd /opt/takoserver-<short-commit> && bun install --frozen-lockfile
+   NEW=$(git -C /opt/takoserver rev-parse origin/main)
+   git -C /opt/takoserver log -1 --format='%H %cd %s' "$NEW"
    ```
+
+   Check that this is the commit you reviewed; to run another, set `NEW` to its
+   full hash. Then add it and install its dependencies:
+
+   ```sh
+   DIR=/opt/takoserver-$(git -C /opt/takoserver rev-parse --short=12 "$NEW")
+   git -C /opt/takoserver worktree add --detach "$DIR" "$NEW"
+   cd "$DIR" && bun install --frozen-lockfile
+   ```
+
+   The steps below name the new checkout `$DIR`. `NEW` and `DIR` last only in
+   this root shell, so run the rest of this update in it.
 
    If `bun install` fails on the lockfile, the new checkout may expect another
    Bun version; see step 2.
@@ -1334,10 +1554,10 @@ commit first, then, as root (the checkout stays root-owned and read-only to
    the Bun version at startup:
 
    ```sh
-   cat /opt/takoserver-<short-commit>/.bun-version; bun --version
-   grep -o 'sha256: "[0-9a-f]*"' /opt/takoserver-<short-commit>/src/workerd-artifact.ts
+   cat "$DIR/.bun-version"; bun --version
+   grep -o 'sha256: "[0-9a-f]*"' "$DIR/src/workerd-artifact.ts"
    . /etc/takoserver/takoserver.env && sha256sum "$TAKOSERVER_WORKERD_BINARY"
-   grep '^toolchain' /opt/takoserver-<short-commit>/services/workflow-execution-guard/go.mod
+   grep '^toolchain' "$DIR/services/workflow-execution-guard/go.mod"
    ```
 
    If the Bun version differs, install it with step 1's installer and rerun
@@ -1357,7 +1577,7 @@ commit first, then, as root (the checkout stays root-owned and read-only to
    (`WorkingDirectory=…`) from step 3, make any change step 2 called for,
    rebuild the Workflow execution guard from the new checkout as in step 1
    (with `export PATH=/usr/local/go/bin:$PATH` and
-   `cd /opt/takoserver-<short-commit>/services/workflow-execution-guard`), and
+   `cd "$DIR/services/workflow-execution-guard"`), and
    run `systemctl daemon-reload`. Keep the
    same protected configuration otherwise. If you serve the console, rebuild
    it from the new checkout as described under
@@ -1534,6 +1754,70 @@ ObjectBucket.
 
 ## Monitoring
 
+The Bun self-host exposes two unauthenticated, no-store operational probes,
+outside the Host API v1 and the shared OpenAPI route table:
+
+- `GET /_takoserver/health/live` returns `200` while the Bun HTTP handler is
+  responding. It does not query SQLite or the Worker runtime.
+- `GET /_takoserver/health/ready` performs one read-only `SELECT 1` query with
+  a one-second response deadline, then makes one bounded, read-only listener
+  observation of the accepted legacy workerd child and, when the Host has a v2
+  Worker composition, one bounded read of the v2 owners' state. It runs no
+  other SQL: the backlog counts it reports are the latest sample a background
+  pass took (described below). It returns `200` only when SQLite
+  answered and the legacy runtime's listener is currently reachable or that
+  runtime is not required; otherwise it returns `503`. v2 Worker owners, the
+  backlog and background passes are reported separately (below) and, on their
+  own, only mark the response `degraded`.
+
+The readiness body contains fixed state labels and Host-wide counts, never an
+identifier: `database` is `readable` or `unavailable`; `workerRuntime` is
+`not-required`, `starting`, `serving`, `recovering`, `restore-failed`, or
+`unavailable`; and `supervisor` is the current child lifecycle state (`idle`,
+`starting`, `serving`, `recovering`, or `unavailable`). If the accepted child is
+still alive but its listener probe fails, `workerRuntime` is `unavailable` while
+`supervisor` remains `serving`; the fields distinguish observed service
+availability from process lifecycle. v2 Worker owners supervise their own
+workerd children outside that supervisor, so when the Host has a v2 Worker
+composition the body also carries `v2Workers: { owners, serving, unavailable }`:
+counts of opened owners, of owners whose recorded active incarnation's child
+group is ready, and of owners that recorded an active incarnation whose child is
+not ready (crashed or being replaced). For v2, "serving" means the owner's
+supervised child holds its listener port; the probe does not send an HTTP
+request to a tenant Worker, so it is not the listener reachability check
+described above. An owner whose Deployment is being deleted counts as neither
+serving nor unavailable.
+
+Serving owners turn a would-be `not-required` into `serving`. One or more
+unavailable owners add `degraded: true` but keep the response `200` when SQLite
+answered: this probe shares its port with the control API, and one broken tenant
+Worker must not make a load balancer withdraw the operator API. The `backlog`
+and `backgroundPasses` sections described below set
+`degraded` the same way. Read `degraded` and the counts to alert on tenant
+Workers and stuck work. The response is `503` only when SQLite did not answer,
+the boot restore failed, the legacy runtime is unavailable, or the v2 owner
+state could not be read within the deadline. The counts carry no Worker UID or
+hostname. An empty successful boot restore with no published Workers is
+`not-required`, not a failure. A failed boot restore remains `restore-failed`
+for this process even if a later child passes its listener check: that check
+does not prove the entire durable published graph was restored. A process
+restart performs the authoritative boot restore again.
+
+These probes are observational only: they do not call restore, spawn or ensure
+workerd, stop the child, or run a product/provisioner route. The ready probe
+checks the exact accepted listener around one loopback HTTP request (250 ms
+request bound, 500 ms total observation bound); it does not schedule recovery.
+The response contains no raw errors, paths, organization, Resource, Operation or
+Worker identifiers, background pass names, or secrets. It does carry Host-wide
+counts (v2 owners, stalled work, failing passes); read the rest of this section
+before exposing `/_takoserver/` beyond the Host. A `serving` result means this
+Host's current workerd child passed the Host-owned listener readiness check; it
+is not a claim that every Form, provider, or tenant Worker application is ready.
+In particular, Host/control-plane readiness and application-level health remain
+distinct. `GET /healthz` on the Cloudflare Worker entry is a separate runtime
+surface; these Bun-only diagnostics do not change that entry or the shared
+OpenAPI contract.
+
 Poll `GET /_takoserver/health/ready` on the Host's own port (`PORT`, default
 `8787`) every 10 to 30 seconds, from the machine itself or another trusted
 network position. Treat its two answers differently:
@@ -1701,9 +1985,9 @@ Some paths exist only while a Host runs and are not part of the backup set:
 
 ## Cold snapshot
 
-1. Choose a protected destination with enough free space for the whole root and
-   any external `TAKOSERVER_DB`. Use a destination that is not served by the
-   source host.
+1. Choose a protected destination with enough free space for the whole root,
+   any external `TAKOSERVER_DB` and `/etc/takoserver`. Use a destination that
+   is not served by the source host.
 2. Stop the Takoserver service through its actual supervisor and wait until
    `entry-bun.ts`, all of its `workerd` children (the legacy runtime and each v2
    Worker owner's), any Workflow execution guard, and any other process
@@ -1719,8 +2003,13 @@ Some paths exist only while a Host runs and are not part of the backup set:
    journal sidecars in the same stopped window. Do not copy a live SQLite file,
    copy only its main file while sidecars may be changing, or guess which
    sidecars can be omitted. Do not copy the runtime-only socket directories
-   listed above. This procedure intentionally requires a stopped-and-quiescent
-   installation rather than promising a live snapshot.
+   outside the root listed above (`/tmp/tw-*` and `$TMPDIR/tactor-*`); the
+   root's own `s/` may stay in the copy. Copy `/etc/takoserver` in the same
+   window: it holds the environment file with the cursor key, without which
+   the Host refuses to start, and the v2 config, whose grants are the only way
+   a restored Host serves seeded artifacts. This procedure intentionally
+   requires a stopped-and-quiescent installation rather than promising a live
+   snapshot.
 4. Record outside the secret-bearing files which source instance and time the
    copy represents, the resolved data-root and database paths, the product
    commit, and the configured external dependency references needed to locate
@@ -1728,6 +2017,20 @@ Some paths exist only while a Host runs and are not part of the backup set:
    `stagingRoot`. Do not record credentials themselves.
 5. Keep the source stopped until the copy has completed. Then restart only the
    original instance if it is still the active installation.
+
+For the layout of this guide, with the database inside the root, steps 2 and 3
+are, as root:
+
+```sh
+systemctl stop takoserver.service
+systemctl is-active takoserver.service   # prints inactive (or failed) once every writer has exited
+SNAP=/var/backups/takoserver/$(date -u +%Y%m%dT%H%M%SZ)
+install -d -m 0700 "$SNAP"
+cp -a /var/lib/takoserver "$SNAP/data"
+cp -a /etc/takoserver "$SNAP/etc"
+```
+
+Record `$SNAP` with the commit that wrote the data (step 4).
 
 ## Restore boundary
 

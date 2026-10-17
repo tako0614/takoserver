@@ -62,27 +62,32 @@ export function copyable(value: string, display?: string): HTMLElement {
       title: `${tr("コピー", "Copy")} ${value}`,
       onClick: (event: Event) => {
         event.stopPropagation();
-        void navigator.clipboard.writeText(value).then(
-          () => {
-            mark.replaceChildren(icon(ICON.check, 13));
-            toast(tr("コピーしました", "Copied"), "ok");
-            setTimeout(() => mark.replaceChildren(icon(ICON.copy, 13)), 1_400);
-          },
-          () =>
-            toast(
-              tr(
-                "ブラウザがクリップボードへのアクセスを拒否しました",
-                "The browser refused clipboard access",
-              ),
-              "bad",
-            ),
-        );
+        copyText(value, mark);
       },
     },
     label,
     mark,
   );
   return button;
+}
+
+/** Copies text, says so, and shows a check in `mark` for a moment. */
+export function copyText(value: string, mark: HTMLElement): void {
+  void navigator.clipboard.writeText(value).then(
+    () => {
+      mark.replaceChildren(icon(ICON.check, 13));
+      toast(tr("コピーしました", "Copied"), "ok");
+      setTimeout(() => mark.replaceChildren(icon(ICON.copy, 13)), 1_400);
+    },
+    () =>
+      toast(
+        tr(
+          "ブラウザがクリップボードへのアクセスを拒否しました",
+          "The browser refused clipboard access",
+        ),
+        "bad",
+      ),
+  );
 }
 
 export function card(title: Child, body: Child, actions?: Child): HTMLElement {
@@ -187,7 +192,17 @@ export function whenReady<Value>(
 export function explain(error: Error): string {
   const code = (error as { code?: string }).code ?? error.message;
   const detail = (error as { detail?: unknown }).detail;
+  const status = (error as { status?: unknown }).status;
   const known: Record<string, string> = {
+    // Only the Host's own answer; the console's checks use the code too.
+    ...(typeof status === "number" && status >= 400 && status < 500
+      ? {
+          invalid_request: tr(
+            "Hostはこのリクエストをそのままでは受け付けませんでした。入力内容を確認してください。",
+            "The Host did not accept this request as written. Check what you entered.",
+          ),
+        }
+      : {}),
     unreachable: tr(
       "APIに接続できません。接続先とネットワークを確認してください。",
       "Could not reach the API. Check the origin and your connection.",

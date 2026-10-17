@@ -172,7 +172,7 @@ async function setup(path = "/resources") {
   return { body, route, selectOrganization, principal };
 }
 
-test("a refused create says why in the dialog, and how to change the request", async () => {
+test("a refused create says why in the dialog, and unlocks it for a new request", async () => {
   const { body } = await setup();
   const { createResource } = await import("../console/src/pages/create-resource.ts");
   const posts: Request[] = [];
@@ -214,7 +214,71 @@ test("a refused create says why in the dialog, and how to change the request", a
   expect(alert?.textContent).toContain(
     "Another Resource in this organization already has that name, whatever its Form.",
   );
-  expect(alert?.textContent).toContain("To change the request, cancel and open the dialog again.");
+  // The Host stored nothing, so the same dialog may send a changed request.
+  expect(alert?.textContent).toContain(
+    "The Host stored nothing, so you can change the request and send it again.",
+  );
+  expect(alert?.textContent).not.toContain("cancel and open the dialog again");
+  expect(inputs[1].disabled).toBe(false);
+  inputs[1].value = "two";
+  inputs[1].emit("input");
+  button(body, "Create").click();
+  await settle();
+  expect(posts).toHaveLength(2);
+  const [first, second] = posts;
+  if (!first || !second) throw new Error("both creates were not sent");
+  expect(((await second.json()) as { name?: string }).name).toBe("two");
+  // A new request under a new key, never the refused one's.
+  expect(second.headers.get("idempotency-key")).toStartWith("console-create-");
+  expect(second.headers.get("idempotency-key")).not.toBe(first.headers.get("idempotency-key"));
+});
+
+test("a name the Host would refuse is said before anything is sent", async () => {
+  const { body } = await setup();
+  const { createResource } = await import("../console/src/pages/create-resource.ts");
+  const sent: Request[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const url = new URL(request.url);
+      if (url.pathname.endsWith("/support"))
+        return Response.json({ form, supported: true, operations: ["create"] });
+      if (url.pathname === "/.well-known/takoform/v2") return Response.json(discovery);
+      if (request.method === "POST") {
+        sent.push(request);
+        return Response.json(op, { status: 202 });
+      }
+      return Response.json({ items: [], nextCursor: null });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  createResource("org-console");
+  await settle();
+  // The rule is shown with the field, before anyone types.
+  expect(body.textContent).toContain(
+    "Up to 128 ASCII letters, digits, '.', '_' or '-', starting with a letter or digit.",
+  );
+  const inputs = body.all().filter((node) => node.tag === "input");
+  if (!inputs[0] || !inputs[1]) throw new Error("create inputs missing");
+  expect(inputs[1].attributes.get("aria-describedby")).toBe("create-resource-name-rule");
+  inputs[0].value = form;
+  for (const name of ["my site", "-site", "x".repeat(129)]) {
+    inputs[1].value = name;
+    inputs[1].emit("input");
+    button(body, "Create").click();
+    await settle();
+    const alert = body.all().find((node) => node.attributes.get("role") === "alert");
+    expect(alert?.textContent).toBe(
+      "Use up to 128 ASCII letters, digits, '.', '_' or '-' for the name, starting with a letter or digit.",
+    );
+    expect(inputs[1].disabled).toBe(false);
+  }
+  expect(sent).toHaveLength(0);
+  inputs[1].value = `a${"x".repeat(127)}`;
+  inputs[1].emit("input");
+  button(body, "Create").click();
+  await settle();
+  expect(sent).toHaveLength(1);
 });
 
 test("accepted create is not shown as complete and checking it never re-sends", async () => {
@@ -355,6 +419,32 @@ test("following stops after its budget and then asks for Reload", async () => {
     await settle();
     expect(checks()).toBe(1);
     expect(body.textContent).toContain("Not complete yet. Use Reload to check again.");
+  } finally {
+    Object.assign(OPERATION_FOLLOW, saved);
+  }
+});
+
+test("an operation still retrying after the follow says what the Host last answered", async () => {
+  await setup();
+  const { OPERATION_FOLLOW } = await import("../console/src/pages/resources.ts");
+  const saved = { ...OPERATION_FOLLOW };
+  OPERATION_FOLLOW.budgetMs = 0;
+  try {
+    const { body } = await operationPage([
+      {
+        ...op,
+        status: "reconciling",
+        effect: "unknown",
+        error: { code: "outcome_unconfirmed", message: "Execution outcome is not yet confirmed" },
+      },
+    ]);
+    await settle();
+    expect(body.textContent).toContain(
+      "The Host's latest answer: Execution outcome is not yet confirmed (outcome_unconfirmed)",
+    );
+    expect(
+      body.all().some((node) => node.tag === "a" && node.textContent === "Open the Resource"),
+    ).toBe(true);
   } finally {
     Object.assign(OPERATION_FOLLOW, saved);
   }
@@ -853,6 +943,80 @@ test("an artifact Form's starter says where its url and sha256 come from", async
   expect(body.textContent).not.toContain("url and sha256 are the artifact");
 });
 
+test("a migration set's starter points at the step that seeds it and composes its Form", async () => {
+  const { body } = await setup();
+  const { createResource } = await import("../console/src/pages/create-resource.ts");
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(new Request(input, init).url);
+      if (url.pathname.endsWith("/support")) {
+        const asking = url.searchParams.get("form") ?? "";
+        return Response.json({ form: asking, supported: true, operations: ["create"] });
+      }
+      if (url.pathname.endsWith("/resources"))
+        return Response.json({ items: [], nextCursor: null });
+      return Response.json(discovery);
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  createResource("org-console");
+  await settle();
+  const [select] = body.all().filter((node) => node.tag === "select");
+  if (!select) throw new Error("Form choice missing");
+  select.value = `${edgeForms}/SQLiteMigrationSet/0.2.0/`;
+  select.emit("change");
+  await settle();
+  const link = (label: string) =>
+    body.all().find((node) => node.tag === "a" && node.textContent.startsWith(label));
+  expect(link("step 11 of the install guide")?.attributes.get("href")).toBe(
+    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#11-bind-a-sqlite-database",
+  );
+  expect(link("step 6 of the install guide")).toBeUndefined();
+  // A consumer says what must be served first, where the Host would refuse it.
+  select.value = `${edgeForms}/QueueConsumer/0.3.0/`;
+  select.emit("change");
+  await settle();
+  expect(body.textContent).toContain(
+    "Create it once its queue exists and the Worker's Deployment serves only versions whose handlers include queue; until then the Host refuses it (",
+  );
+  expect(link("step 12 of the install guide")?.attributes.get("href")).toBe(
+    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#12-bind-kv-a-bucket-and-a-queue",
+  );
+});
+
+test("missing SQLite migration Forms say what adds them", async () => {
+  const { body } = await setup();
+  const { createResource } = await import("../console/src/pages/create-resource.ts");
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(new Request(input, init).url);
+      if (url.pathname.endsWith("/support")) {
+        const asking = url.searchParams.get("form") ?? "";
+        const supported = !asking.includes("/SQLiteMigration");
+        return Response.json({ form: asking, supported, operations: supported ? ["create"] : [] });
+      }
+      if (url.pathname.endsWith("/resources"))
+        return Response.json({ items: [], nextCursor: null });
+      return Response.json(discovery);
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  createResource("org-console");
+  await settle();
+  expect(body.textContent).toContain("SQLiteMigrationSet 0.2.0 — not on this Host");
+  expect(body.textContent).toContain(
+    "SQLiteMigrationSet, and on a Host that runs Workers SQLiteMigrationApplication, can be chosen once a migration set is seeded and the Host restarted (",
+  );
+  const step = body
+    .all()
+    .find(
+      (node) => node.tag === "a" && node.textContent.startsWith("step 11 of the install guide"),
+    );
+  expect(step?.attributes.get("href")).toBe(
+    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#11-bind-a-sqlite-database",
+  );
+});
+
 const versionForm = "https://edge.forms.takoform.com/forms/WorkerVersion/0.5.0/";
 const deploymentForm = "https://edge.forms.takoform.com/forms/WorkerDeployment/0.4.0/";
 const resourceAt = (
@@ -899,6 +1063,7 @@ async function detailPage(
   shown: () => ResourceSummary,
   deployments: ResourceSummary[],
   listed: ResourceSummary[] = [],
+  operations: Record<string, Record<string, unknown>> = {},
 ) {
   const uid = shown().uid;
   const { body } = await setup(`/resources/${uid}`);
@@ -918,6 +1083,8 @@ async function detailPage(
         return Response.json(op, { status: 202 });
       }
       if (url.pathname.endsWith(`/resources/${uid}`)) return Response.json(shown());
+      const operation = operations[/\/operations\/([^/]+)$/u.exec(url.pathname)?.[1] ?? ""];
+      if (operation) return Response.json(operation);
       if (url.pathname.endsWith("/resources")) {
         const form = url.searchParams.get("form");
         const items =
@@ -1110,6 +1277,55 @@ test("a Worker is offered to record a Deployment only when one serves it unrecor
   expect(alone.body.textContent).not.toContain("Record the Deployment");
 });
 
+test("a version the Host refused is not something the Worker's record waits for", async () => {
+  const refused: ResourceSummary = {
+    ...resourceAt("uid-refused", "hello-v3", versionForm, {
+      worker: { resourceUid: "uid-worker" },
+      handlers: ["fetch"],
+    }),
+    generation: 1,
+    observedGeneration: 0,
+    observedAt: null,
+    phase: "pending",
+    observed: {},
+    lastOperation: "op-refused",
+  };
+  const refusing = (ageMs: number) => ({
+    "op-refused": {
+      ...op,
+      id: "op-refused",
+      resourceUid: "uid-refused",
+      status: "reconciling",
+      effect: "unknown",
+      createdAt: new Date(Date.now() - ageMs).toISOString(),
+      error: { code: "outcome_unconfirmed", message: "Execution outcome is not yet confirmed" },
+    },
+  });
+  const recordButton = (body: TestNode) =>
+    body
+      .all()
+      .some((node) => node.tag === "button" && node.textContent === "Record the Deployment");
+  const { body } = await detailPage(
+    () => unrecordedWorker,
+    [servingDeployment],
+    [servingDeployment, publishedEndpoint, refused],
+    refusing(5 * 60_000),
+  );
+  expect(body.textContent).toContain(
+    "hello-v3 cannot finish: the Host has kept retrying it for more than two minutes without saying why, which usually means it refused the version's code.",
+  );
+  expect(body.textContent).not.toContain("Wait until it finishes");
+  expect(recordButton(body)).toBe(false);
+  // Within the guide's two minutes it is still only in progress.
+  const fresh = await detailPage(
+    () => unrecordedWorker,
+    [servingDeployment],
+    [servingDeployment, publishedEndpoint, refused],
+    refusing(10_000),
+  );
+  expect(fresh.body.textContent).toContain("hello-v3 is in progress. Wait until it finishes");
+});
+
 test("the record update is offered only where the Host can finish it", async () => {
   const offered = (body: TestNode) =>
     body
@@ -1258,7 +1474,15 @@ test("choosing the next version's code keeps it described as the copy it is", as
       artifact: { url: "https://artifacts.example.test/v2/manifest.json", sha256: "a".repeat(64) },
     },
   );
-  const { body } = await detailPage(() => withCode, [], [bundleV2]);
+  const bundleV1 = resourceAt(
+    "uid-bundle",
+    "hello-bundle",
+    "https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/",
+    {
+      artifact: { url: "https://artifacts.example.test/v1/manifest.json", sha256: "b".repeat(64) },
+    },
+  );
+  const { body } = await detailPage(() => withCode, [], [bundleV1, bundleV2]);
   button(body, "New version from this one").click();
   await settle();
   const choice = body
@@ -1268,6 +1492,14 @@ test("choosing the next version's code keeps it described as the copy it is", as
         node.tag === "select" && node.all().some((option) => option.value === "uid-bundle-v2"),
     );
   if (!choice) throw new Error("no code bundle choice");
+  // The code the version has now is marked, so it is not chosen again by mistake.
+  const label = (uid: string) =>
+    choice.all().find((option) => option.tag === "option" && option.value === uid)?.textContent;
+  expect(label("uid-bundle")).toBe("hello-bundle (current)");
+  expect(label("uid-bundle-v2")).toBe("hello-bundle-v2");
+  expect(body.textContent).toContain(
+    "If the new code is not a WorkerBundle yet, create that first with New resource.",
+  );
   choice.value = "uid-bundle-v2";
   choice.emit("change");
   await settle();
@@ -1352,6 +1584,116 @@ test("a version can be sent again with its same spec, to retry it", async () => 
   const [update] = writes;
   expect(update?.method).toBe("PUT");
   expect(JSON.parse(await (update as Request).text())).toEqual({ spec: helloV2.spec });
+});
+
+test("a data Resource's page gives the Binding entry a Worker's version adds", async () => {
+  const kv = resourceAt(
+    "uid-kv",
+    "hello-kv",
+    "https://edge.forms.takoform.com/forms/EdgeKVNamespace/0.2.0/",
+    {},
+  );
+  const { body } = await detailPage(() => kv, []);
+  const entry = `"kvBindings": ${JSON.stringify(
+    [{ name: "KV", resource: { resourceUid: "uid-kv" } }],
+    null,
+    2,
+  )}`;
+  expect(body.all().some((node) => node.tag === "pre" && node.textContent === entry)).toBe(true);
+  expect(body.textContent).toContain(
+    "A Worker reaches it through a Binding in its WorkerVersion's kvBindings.",
+  );
+  expect(body.textContent).toContain(
+    'For example, await env.KV.get("key") resolves to an ArrayBuffer, or null.',
+  );
+  expect(
+    body.all().some((node) => node.tag === "button" && node.textContent === "Copy this entry"),
+  ).toBe(true);
+  // A second "kvBindings" in the spec would silently replace the first.
+  expect(body.textContent).toContain(
+    'If the spec already has kvBindings, add the { … } object to that list instead: a second "kvBindings" would replace the first.',
+  );
+  expect(body.textContent).toContain("choose its code again (the one marked current)");
+  const step = body
+    .all()
+    .find(
+      (node) => node.tag === "a" && node.textContent.startsWith("step 12 of the install guide"),
+    );
+  expect(step?.attributes.get("href")).toBe(
+    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#12-bind-kv-a-bucket-and-a-queue",
+  );
+  // A Worker's own page is not something a Binding names this way.
+  const worker = await detailPage(
+    () =>
+      resourceAt(
+        "uid-worker",
+        "hello",
+        "https://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/",
+        {},
+      ),
+    [],
+  );
+  expect(worker.body.textContent).not.toContain("Use it from a Worker");
+  // Nor is a Resource being deleted something to start using.
+  const leaving = await detailPage(() => ({ ...kv, phase: "deleting" as const }), []);
+  expect(leaving.body.textContent).not.toContain("Use it from a Worker");
+});
+
+test("a version the Host keeps retrying without a reason says what usually causes it", async () => {
+  /** A version page whose create is still retrying, accepted `ageMs` ago, with `code`. */
+  const stuckPage = async (ageMs: number, code: string) => {
+    const pending: ResourceSummary = {
+      ...helloV2,
+      generation: 1,
+      observedGeneration: 0,
+      observedAt: null,
+      phase: "pending",
+      observed: {},
+      lastOperation: "op-stuck",
+    };
+    const { body } = await setup(`/resources/${pending.uid}`);
+    const { resourceDetailPage } = await import("../console/src/pages/resource-detail.ts");
+    globalThis.fetch = Object.assign(
+      async (input: RequestInfo | URL) => {
+        const url = new URL(String(input));
+        if (url.pathname.endsWith("/operations/op-stuck"))
+          return Response.json({
+            ...op,
+            id: "op-stuck",
+            resourceUid: pending.uid,
+            status: "reconciling",
+            effect: "unknown",
+            createdAt: new Date(Date.now() - ageMs).toISOString(),
+            error: { code, message: "Execution outcome is not yet confirmed" },
+          });
+        if (url.pathname.endsWith(`/resources/${pending.uid}`)) return Response.json(pending);
+        if (url.pathname === "/.well-known/takoform/v2") return Response.json(discovery);
+        return Response.json({ items: [], nextCursor: null });
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    );
+    body.append(resourceDetailPage("org-console", pending.uid) as unknown as TestNode);
+    await settle();
+    return body;
+  };
+  const stuck = await stuckPage(5 * 60_000, "outcome_unconfirmed");
+  expect(stuck.textContent).toContain(
+    "The Host has kept retrying this version for more than two minutes without saying why (outcome_unconfirmed).",
+  );
+  expect(stuck.textContent).toContain("While it retries, it cannot be deleted.");
+  const guide = stuck
+    .all()
+    .find((node) => node.tag === "a" && node.textContent.startsWith("the install guide"));
+  expect(guide?.attributes.get("href")).toBe(
+    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#when-a-new-version-does-not-work",
+  );
+  // Within the guide's two minutes, or with another answer, it is only in progress.
+  expect((await stuckPage(10_000, "outcome_unconfirmed")).textContent).not.toContain(
+    "without saying why",
+  );
+  expect((await stuckPage(5 * 60_000, "backend_unavailable")).textContent).not.toContain(
+    "without saying why",
+  );
 });
 
 test("a Resource that can change keeps its Update", async () => {
@@ -1772,6 +2114,76 @@ test("delete that could not check what names the Resource says so and stays offe
   expect(seen).toHaveLength(1);
 });
 
+test("a refused update unlocks the spec and sends the change under a new key", async () => {
+  const { body } = await setup();
+  const { updateResource } = await import("../console/src/pages/create-resource.ts");
+  const puts: Request[] = [];
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      if (request.method === "GET") return Response.json(discovery);
+      puts.push(request);
+      if (puts.length === 1)
+        return new Response(
+          JSON.stringify({ type: "about:blank", title: "Bad", status: 422, code: "invalid_spec" }),
+          { status: 422, headers: { "content-type": "application/problem+json" } },
+        );
+      return Response.json({ ...op, action: "update", generation: 2 }, { status: 202 });
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  updateResource("org-console", one);
+  // The spec box is named by its label.
+  const label = body.all().find((node) => node.tag === "label");
+  expect(label?.attributes.get("for")).toBe("update-resource-spec");
+  const spec = body.all().find((node) => node.tag === "textarea");
+  if (!spec) throw new Error("spec editor missing");
+  expect(spec.attributes.get("id")).toBe("update-resource-spec");
+  spec.value = '{"value":"wrong"}';
+  button(body, "Update").click();
+  await settle();
+  const alert = body.all().find((node) => node.attributes.get("role") === "alert");
+  expect(alert?.textContent).toContain("This Host does not accept that spec for the Form.");
+  expect(alert?.textContent).toContain(
+    "The Host stored nothing, so you can change the request and send it again.",
+  );
+  expect(spec.disabled).toBe(false);
+  spec.value = '{"value":"right"}';
+  button(body, "Update").click();
+  await settle();
+  expect(puts).toHaveLength(2);
+  expect(await puts[1]?.json()).toEqual({ spec: { value: "right" } });
+  expect(puts[1]?.headers.get("idempotency-key")).not.toBe(puts[0]?.headers.get("idempotency-key"));
+});
+
+test("a stale update is not offered to be sent again from the same dialog", async () => {
+  const { body } = await setup();
+  const { updateResource } = await import("../console/src/pages/create-resource.ts");
+  globalThis.fetch = Object.assign(
+    async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      if (request.method === "GET") return Response.json(discovery);
+      return new Response(
+        JSON.stringify({
+          type: "about:blank",
+          title: "Conflict",
+          status: 409,
+          code: "generation_conflict",
+        }),
+        { status: 409, headers: { "content-type": "application/problem+json" } },
+      );
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  updateResource("org-console", one);
+  button(body, "Update").click();
+  await settle();
+  const alert = body.all().find((node) => node.attributes.get("role") === "alert");
+  expect(alert?.textContent).toBe(
+    "This Resource changed after the page read it. Reload, check it, and try again.",
+  );
+});
+
 test("update uses the observed UID and generation rather than a name-based path", async () => {
   const { body, route } = await setup();
   const { updateResource } = await import("../console/src/pages/create-resource.ts");
@@ -1920,6 +2332,45 @@ test("expired Host replay window refuses a second native mutation send", async (
   });
   expect(writes).toHaveLength(1);
   discardResourceIntent(intent.id);
+});
+
+test("only a definite refusal of a request never in doubt is dropped for a new key", async () => {
+  await setup();
+  const { ApiError } = await import("../console/src/api.ts");
+  const {
+    prepareResourceIntent,
+    sendResourceIntent,
+    discardRefusedResourceIntent,
+    discardResourceIntent,
+  } = await import("../console/src/resource-intent.ts");
+  const change = { action: "delete", uid: one.uid, generation: 1 } as const;
+  const refusal = (code: string, status: number) =>
+    new ApiError(code, status, "/apis/forms.takoform.com/v2/resources/uid-one");
+  // A send whose acceptance is unknown stays, whatever a later answer says.
+  const uncertain = prepareResourceIntent("org-console", change, 60);
+  globalThis.fetch = Object.assign(
+    async () => {
+      throw new Error("ACK lost");
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  await expect(sendResourceIntent(uncertain.id)).rejects.toMatchObject({ code: "unreachable" });
+  expect(discardRefusedResourceIntent(uncertain.id, refusal("resource_busy", 409))).toBe(false);
+  // Neither the console's own errors, an unknown acceptance, nor a key that
+  // holds another request is a refusal that stored nothing.
+  const fresh = prepareResourceIntent("org-console", change, 60);
+  for (const [code, status] of [
+    ["principal_changed", 0],
+    ["request_timeout", 408],
+    ["temporarily_unavailable", 503],
+    ["idempotency_conflict", 409],
+  ] as const)
+    expect(discardRefusedResourceIntent(fresh.id, refusal(code, status))).toBe(false);
+  expect(discardRefusedResourceIntent(fresh.id, new Error("name_conflict"))).toBe(false);
+  expect(discardRefusedResourceIntent(fresh.id, refusal("name_conflict", 409))).toBe(true);
+  // Dropped, so it can never be sent again; the next request has its own key.
+  await expect(sendResourceIntent(fresh.id)).rejects.toMatchObject({ code: "intent_missing" });
+  discardResourceIntent(uncertain.id);
 });
 
 test("a different signed-in principal cannot inherit an in-memory replay handle", async () => {

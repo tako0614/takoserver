@@ -188,9 +188,9 @@ function resourcesCard(all: readonly ResourceSummary[], more: boolean): Child {
           "span",
           { style: { color: "var(--warn)" } },
           more
-            ? tr(`${attention}件以上に確認が必要`, `${attention}+ need attention`)
+            ? tr(`確認が必要なもの ${attention}件以上`, `${attention}+ need attention`)
             : tr(
-                `${attention}件に確認が必要`,
+                `確認が必要なもの ${attention}件`,
                 attention === 1 ? "1 needs attention" : `${attention} need attention`,
               ),
         )
@@ -235,7 +235,7 @@ function resourcesCard(all: readonly ResourceSummary[], more: boolean): Child {
                   { style: { marginLeft: "8px" } },
                   badge(
                     tr(
-                      `${entry.attention}件に確認が必要`,
+                      `確認が必要なもの ${entry.attention}件`,
                       entry.attention === 1
                         ? "1 needs attention"
                         : `${entry.attention} need attention`,

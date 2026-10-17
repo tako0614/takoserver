@@ -66,6 +66,23 @@ describe("Takoserver public site", () => {
     );
   });
 
+  test("links each group of Forms to the guide step that uses it", () => {
+    const html = landingHtml(site);
+    const forms = html.slice(html.indexOf('id="forms"'), html.indexOf('id="start"'));
+    const guide = "docs/self-host-operations.md";
+    for (const [anchor, key] of [
+      ["#6-seed-held-artifacts", "step6"],
+      ["#8-create-and-serve-a-worker", "step8"],
+      ["#11-bind-a-sqlite-database", "sqliteStep"],
+      ["#12-bind-kv-a-bucket-and-a-queue", "dataStep"],
+      ["#12-bind-kv-a-bucket-and-a-queue", "queueStep"],
+    ])
+      expect(forms).toContain(`${guide}${anchor}" data-i18n="${key}"`);
+    // Two links side by side say which is which.
+    expect(forms).toContain(">SQLite: step 11 of the install guide</a>");
+    expect(forms).toContain(">KV and buckets: step 12 of the install guide</a>");
+  });
+
   test("walks one Worker through the guide's create chain to its response", () => {
     const html = landingHtml(site);
     const order = [
@@ -148,7 +165,7 @@ describe("Takoserver public site", () => {
     );
     expect(after).toContain('"weight": 10000');
     expect(after).not.toContain("$HOST");
-    expect(after).toContain("docs/self-host-operations.md#9-verify");
+    expect(after).toContain("docs/self-host-operations.md#10-ship-a-new-version");
     for (const path of ["/openapi.json", "/.well-known/takoform/v2", "/.well-known/takoserver"]) {
       expect(html).toContain(`href="https://api.takoserver.example${path}"`);
     }
@@ -254,8 +271,26 @@ describe("Takoserver public site", () => {
     const bare = landingHtml({ consoleOrigin: null, apiOrigin: null });
     expect(bare).toContain("This Host serves no console yet.");
     expect(bare).toContain('data-i18n="consoleSetup"');
+    // A shared link to a Host's root names that Host, not takoserver.com, and
+    // search leaves the Host's copy of the page out.
+    expect(withConsole).toContain('<meta property="og:url" content="https://api.host.example/">');
+    expect(withConsole).toContain('<meta name="robots" content="noindex">');
+    expect(withConsole).not.toContain('rel="canonical"');
+    expect(landingHtml(site)).toContain('<link rel="canonical" href="https://takoserver.com/">');
+    expect(landingHtml(site)).not.toContain('content="noindex"');
     // The public site describes the reader's own Host, never itself as one.
     expect(landingHtml(site)).not.toContain('<section class="here"');
+  });
+
+  test("says how to keep a Host running, with the guide's sections", () => {
+    const html = landingHtml(site);
+    expect(html).toContain("Keep it running");
+    expect(html).toContain("GET /_takoserver/health/ready");
+    expect(html).toContain('docs/self-host-operations.md#monitoring" data-i18n="monitoring"');
+    expect(html).toContain('docs/self-host-operations.md#cold-snapshot" data-i18n="backup"');
+    expect(html).toContain(
+      'docs/self-host-operations.md#update-and-code-rollback" data-i18n="update"',
+    );
   });
 
   test("answers unknown paths in the same visual system", () => {

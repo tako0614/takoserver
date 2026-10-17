@@ -405,7 +405,7 @@ function revealSecret(
               h(
                 "a",
                 { href: INSTALL_GUIDE_STEPS, target: "_blank", rel: "noopener noreferrer" },
-                tr("導入手順書（英語）の手順8〜11", "Steps 8 to 11 of the install guide"),
+                tr("導入手順書（英語）の手順8〜13", "Steps 8 to 13 of the install guide"),
               ),
               tr(
                 "にあります。手順5の変数Fと、手順6で用意した成果物も使います。",
