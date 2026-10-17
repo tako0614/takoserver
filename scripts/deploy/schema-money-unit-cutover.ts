@@ -135,6 +135,37 @@ export interface MoneyWriterProof {
   readonly publicSourceArtifactDigest: string;
 }
 
+/** Immutable uploaded-Version facts only; neither current traffic nor serving permission. */
+export interface MoneyHeldNormalWorkerModeFacts {
+  readonly kind: "takoserver.money-held-normal-worker-mode-facts@v1";
+  readonly accountId: string;
+  readonly databaseId: string;
+  readonly databaseName: string;
+  readonly bucketName: string;
+  readonly workerName: string;
+  readonly previousWriterEpoch: string;
+  readonly nextWriterEpoch: string;
+  readonly heldConvertDigest: string;
+  readonly convertBindingDigest: string;
+  readonly converted94BackupDigest: string;
+  readonly versionId: string;
+  readonly sourceCommit: string;
+  readonly moduleDigest: string;
+  readonly sourceArtifactDigest: string;
+  readonly sourceArtifactBytes: number;
+  readonly sourceArtifactFiles: number;
+  readonly sourceTreeDigest: string;
+  readonly dependencyClosureDigest: string;
+  readonly toolClosureDigest: string;
+  readonly nativeBindingDigest: string;
+  readonly stripeMode: "test";
+  readonly modeEvidence: "explicit-native-test" | "verified-source-default-test-native-absence";
+  readonly entrySourceDigest: string;
+  readonly entryModuleSourceDigest: string;
+  readonly parserSourceDigest: string;
+  readonly parserFunctionDigest: string;
+}
+
 export interface MoneyResumeProof {
   readonly kind: "takoserver.money-resume-worker@v1";
   readonly accountId: string;

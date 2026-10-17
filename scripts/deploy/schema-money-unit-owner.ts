@@ -5,6 +5,7 @@ import {
   constants,
   fstatSync,
   fsyncSync,
+  ftruncateSync,
   lstatSync,
   mkdtempSync,
   openSync,
@@ -14,6 +15,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import type * as TypeScript from "typescript";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { mutationError, preflightError } from "./errors.ts";
 import {
@@ -22,6 +24,10 @@ import {
   type IntegrationStorageOriginalCreateOptions,
   verifyIntegrationStorageOriginalCreate,
 } from "./integration-storage-generation.ts";
+import {
+  captureMoneyNativeBuildClosure,
+  type MoneyNativeBuildClosure,
+} from "./money-native-build-closure.ts";
 import {
   type CommandResult,
   REPOSITORY,
@@ -34,6 +40,7 @@ import {
   type MoneyCutoverCustodyReceipt,
   type MoneyCutoverDispatchBinding,
   type MoneyCutoverPhase,
+  type MoneyHeldNormalWorkerModeFacts,
   type MoneyPost94Phase,
   type MoneyPost94SelectionReviewBinding,
   type MoneyResumeProof,
@@ -53,7 +60,12 @@ import { type DeployTarget, parseDeployTarget } from "./target.ts";
 import { probeMoneyCutoverFrozen, probeProduct } from "./worker.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import { inspectLiveWorkerVersion, workerVersionIdentity } from "./worker-live.ts";
-import { optionalExactPlainTextBinding, parseWorkerDeploymentHistory } from "./worker-state.ts";
+import {
+  assertExactVersionBindingClosure,
+  expectedExactBindingClosure,
+  optionalExactPlainTextBinding,
+  parseWorkerDeploymentHistory,
+} from "./worker-state.ts";
 
 const SHA = /^sha256:[0-9a-f]{64}$/u;
 const COMMIT = /^[0-9a-f]{40}$/u;
@@ -1668,6 +1680,8 @@ export async function loadMoneyUnitOriginalCutoverOptions(
   );
   const declarationInput = originalMoneyInput(request.declarationPath, "fresh money declaration");
   const declaration = parseDeclaration(declarationInput.value, target, true, true);
+  const nativeBuild =
+    nativeOnly && declaration.phase === "convert" ? captureMoneyNativeBuildClosure() : undefined;
   const origin = declaration.originalOrigin;
   if (
     !record(origin) ||
@@ -1767,7 +1781,12 @@ export async function loadMoneyUnitOriginalCutoverOptions(
     target,
     ownedDependencies,
     original,
-    { declaration: declarationInput.value, assertUnchanged },
+    {
+      declaration: declarationInput.value,
+      assertUnchanged,
+      nativeOnly,
+      ...(nativeBuild === undefined ? {} : { nativeBuild }),
+    },
   );
   assertUnchanged();
   const sealed = Object.freeze({
@@ -1781,6 +1800,11 @@ export async function loadMoneyUnitOriginalCutoverOptions(
     }),
     originalOriginQualification: "independent-origin-review-required" as const,
   });
+  if (nativeOnly) {
+    const nativeReader = nativeNormalWorkerReaders.get(options);
+    if (!nativeReader) throw preflightError("money original native mode reader is unavailable");
+    nativeNormalWorkerReaders.set(sealed, nativeReader);
+  }
   originalMoneyWriters.set(sealed, {
     target: JSON.stringify(target),
     ownedTarget: target,
@@ -2168,6 +2192,404 @@ export async function assertMoneyUnitHeldPost94DispatchSelection(
     throw preflightError("money held post94 dispatch differs from its TEST selection");
 }
 
+interface MoneyHeldNormalWorkerSelector {
+  readonly kind: "takoserver.money-held-normal-worker-selector@v1";
+  readonly accountId: string;
+  readonly databaseId: string;
+  readonly databaseName: string;
+  readonly bucketName: string;
+  readonly workerName: string;
+  readonly previousWriterEpoch: string;
+  readonly nextWriterEpoch: string;
+  readonly convertBindingDigest: string;
+  readonly converted94BackupDigest: string;
+  readonly sourceRoot: string;
+  readonly sourceCommit: string;
+  readonly versionId: string;
+  readonly moduleDigest: string;
+  readonly artifactDigest: string;
+  readonly artifactBytes: number;
+  readonly artifactFiles: number;
+  readonly selectedStripeMode: "test";
+}
+
+function normalWorkerDataMethod(receiver: object, name: string): unknown {
+  let current: object | null = receiver;
+  while (current !== null && current !== Object.prototype) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, name);
+    if (descriptor) return "value" in descriptor ? descriptor.value : undefined;
+    current = Object.getPrototypeOf(current) as object | null;
+  }
+  return undefined;
+}
+
+type NativeNormalWorkerReader = (
+  context: MoneyUnitHeldConvertContext,
+  selector: MoneyHeldNormalWorkerSelector,
+) => Promise<MoneyHeldNormalWorkerModeFacts>;
+
+// Only the private native factory inserts readers. No consumer registration,
+// dependency injection, selected JSON or source-inspection result can insert one.
+const nativeNormalWorkerReaders = new WeakMap<MoneyUnitCutoverOptions, NativeNormalWorkerReader>();
+
+declare const heldNormalWorkerModeBrand: unique symbol;
+export interface MoneyUnitHeldNormalWorkerModePreparation {
+  readonly [heldNormalWorkerModeBrand]: true;
+  readonly kind: "takoserver.money-held-normal-worker-mode-preparation@v1";
+  readonly facts: MoneyHeldNormalWorkerModeFacts;
+  readonly bindingDigest: string;
+}
+
+const heldNormalWorkerModes = new WeakMap<
+  object,
+  {
+    readonly context: MoneyUnitHeldConvertContext;
+    readonly selectorPath: string;
+    readonly selectorSeal: string;
+    readonly selectorJson: string;
+    readonly reader: NativeNormalWorkerReader;
+    readonly facts: MoneyHeldNormalWorkerModeFacts;
+    readonly factsJson: string;
+    readonly bindingDigest: string;
+  }
+>();
+
+// Reviewed Root entry source identities, not caller-supplied semantics. A changed
+// entry/call path needs a separate source review rather than default inference.
+const NORMAL_ENTRY_SOURCE =
+  "sha256:29de9a0ae29d3dabf624265088ffd315802c1c62122b61a354600355d6e5a58c";
+const NORMAL_ENTRY_MODULE_SOURCE =
+  "sha256:af8653dfb12f4e0db3841abb7ee31c757dc4cfcaaaa9859f1d91f7bd6bd48612";
+
+/**
+ * Component-only syntax DATA. This cannot mint a native preparation. The private
+ * reader alone feeds immutable selected-Git source into it after native checks.
+ * Source text, diagnostics and unrelated literals are never returned/logged.
+ */
+export async function inspectMoneyNormalWorkerModeFunctionSource(
+  source: string,
+): Promise<{ readonly sourceDigest: string; readonly functionDigest: string } | null> {
+  if (typeof source !== "string" || source.length === 0 || source.length > MAX_PROTECTED_BYTES)
+    return null;
+  const ts = await import("typescript");
+  const file = ts.createSourceFile("selected-mode-source.ts", source, ts.ScriptTarget.Latest, true);
+  const functions = file.statements.filter(
+    (node): node is TypeScript.FunctionDeclaration =>
+      ts.isFunctionDeclaration(node) && node.name?.text === "parseStripeMode",
+  );
+  const fn = functions[0];
+  const parameter = fn?.parameters[0];
+  if (
+    functions.length !== 1 ||
+    !fn?.body ||
+    fn.asteriskToken ||
+    fn.modifiers?.some((node) => node.kind === ts.SyntaxKind.AsyncKeyword) ||
+    !fn.modifiers?.some((node) => node.kind === ts.SyntaxKind.ExportKeyword) ||
+    fn.parameters.length !== 1 ||
+    !parameter ||
+    !ts.isIdentifier(parameter.name) ||
+    parameter.initializer ||
+    parameter.dotDotDotToken ||
+    parameter.questionToken ||
+    fn.body.statements.length !== 3
+  )
+    return null;
+  const name = parameter.name.text;
+  const equal = (node: TypeScript.Expression, value: "undefined" | "test" | "live"): boolean =>
+    ts.isBinaryExpression(node) &&
+    node.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken &&
+    ts.isIdentifier(node.left) &&
+    node.left.text === name &&
+    (value === "undefined"
+      ? ts.isIdentifier(node.right) && node.right.text === "undefined"
+      : ts.isStringLiteral(node.right) && node.right.text === value);
+  const first = fn.body.statements[0];
+  const second = fn.body.statements[1];
+  const third = fn.body.statements[2];
+  if (
+    !first ||
+    !ts.isIfStatement(first) ||
+    first.elseStatement ||
+    !equal(first.expression, "undefined") ||
+    !ts.isReturnStatement(first.thenStatement) ||
+    !first.thenStatement.expression ||
+    !ts.isStringLiteral(first.thenStatement.expression) ||
+    first.thenStatement.expression.text !== "test" ||
+    !second ||
+    !ts.isIfStatement(second) ||
+    second.elseStatement ||
+    !ts.isBinaryExpression(second.expression) ||
+    second.expression.operatorToken.kind !== ts.SyntaxKind.BarBarToken ||
+    !equal(second.expression.left, "test") ||
+    !equal(second.expression.right, "live") ||
+    !ts.isReturnStatement(second.thenStatement) ||
+    !second.thenStatement.expression ||
+    !ts.isIdentifier(second.thenStatement.expression) ||
+    second.thenStatement.expression.text !== name ||
+    !third ||
+    !ts.isThrowStatement(third)
+  )
+    return null;
+  const protectedNames = new Set(["parseStripeMode", "undefined"]);
+  const bound = (node: TypeScript.BindingName): boolean => {
+    if (ts.isIdentifier(node)) return protectedNames.has(node.text);
+    return node.elements.some((item) => ts.isBindingElement(item) && bound(item.name));
+  };
+  const mentionsProtected = (node: TypeScript.Node): boolean => {
+    if (ts.isIdentifier(node) && protectedNames.has(node.text)) return true;
+    let found = false;
+    ts.forEachChild(node, (child) => {
+      if (mentionsProtected(child)) found = true;
+    });
+    return found;
+  };
+  let safe = true;
+  const visit = (node: TypeScript.Node): void => {
+    if (
+      ts.isIdentifier(node) &&
+      ["eval", "Function", "module", "exports", "require"].includes(node.text)
+    )
+      safe = false;
+    if (
+      (ts.isVariableDeclaration(node) || ts.isParameter(node) || ts.isBindingElement(node)) &&
+      bound(node.name)
+    )
+      safe = false;
+    if (
+      (ts.isImportSpecifier(node) || ts.isImportClause(node) || ts.isNamespaceImport(node)) &&
+      node.name &&
+      protectedNames.has(node.name.text)
+    )
+      safe = false;
+    if (
+      (ts.isFunctionDeclaration(node) ||
+        ts.isClassDeclaration(node) ||
+        ts.isModuleDeclaration(node) ||
+        ts.isEnumDeclaration(node) ||
+        ts.isImportEqualsDeclaration(node)) &&
+      node !== fn &&
+      node.name &&
+      protectedNames.has(node.name.text)
+    )
+      safe = false;
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind >= ts.SyntaxKind.FirstAssignment &&
+      node.operatorToken.kind <= ts.SyntaxKind.LastAssignment &&
+      mentionsProtected(node.left)
+    )
+      safe = false;
+    if (
+      (ts.isPrefixUnaryExpression(node) || ts.isPostfixUnaryExpression(node)) &&
+      mentionsProtected(node.operand)
+    )
+      safe = false;
+    if (
+      (ts.isForOfStatement(node) || ts.isForInStatement(node)) &&
+      !ts.isVariableDeclarationList(node.initializer) &&
+      mentionsProtected(node.initializer)
+    )
+      safe = false;
+    if (ts.isDeleteExpression(node) && mentionsProtected(node.expression)) safe = false;
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+  return safe
+    ? Object.freeze({ sourceDigest: digest(source), functionDigest: digest(fn.getText(file)) })
+    : null;
+}
+
+function heldNormalSelector(
+  value: unknown,
+  context: MoneyUnitHeldConvertContext,
+): MoneyHeldNormalWorkerSelector {
+  const held = heldMoneyContexts.get(context);
+  if (
+    !held ||
+    !record(value) ||
+    !keys(value, [
+      "kind",
+      "accountId",
+      "databaseId",
+      "databaseName",
+      "bucketName",
+      "workerName",
+      "previousWriterEpoch",
+      "nextWriterEpoch",
+      "convertBindingDigest",
+      "converted94BackupDigest",
+      "sourceRoot",
+      "sourceCommit",
+      "versionId",
+      "moduleDigest",
+      "artifactDigest",
+      "artifactBytes",
+      "artifactFiles",
+      "selectedStripeMode",
+    ])
+  )
+    throw preflightError("money normal Worker selector is not a closed selection");
+  const facts = held.facts;
+  if (
+    value.kind !== "takoserver.money-held-normal-worker-selector@v1" ||
+    value.accountId !== facts.storage.accountId ||
+    value.databaseId !== facts.storage.databaseId ||
+    value.databaseName !== facts.storage.databaseName ||
+    value.bucketName !== facts.storage.bucketName ||
+    value.workerName !== held.target.workerName ||
+    value.previousWriterEpoch !== facts.previousWriterEpoch ||
+    value.nextWriterEpoch !== facts.nextWriterEpoch ||
+    value.convertBindingDigest !== facts.conversion.convertBindingDigest ||
+    value.converted94BackupDigest !== facts.converted94.backupDigest ||
+    value.selectedStripeMode !== "test" ||
+    typeof value.sourceRoot !== "string" ||
+    !isAbsolute(value.sourceRoot) ||
+    resolve(value.sourceRoot) !== value.sourceRoot ||
+    typeof value.sourceCommit !== "string" ||
+    !requireCommit(value.sourceCommit) ||
+    typeof value.versionId !== "string" ||
+    !UUID.test(value.versionId) ||
+    value.versionId === facts.maintenance.versionId ||
+    typeof value.moduleDigest !== "string" ||
+    !requireSha(value.moduleDigest) ||
+    typeof value.artifactDigest !== "string" ||
+    !requireSha(value.artifactDigest) ||
+    typeof value.artifactBytes !== "number" ||
+    !Number.isSafeInteger(value.artifactBytes) ||
+    value.artifactBytes <= 0 ||
+    typeof value.artifactFiles !== "number" ||
+    !Number.isSafeInteger(value.artifactFiles) ||
+    value.artifactFiles <= 0
+  )
+    throw preflightError("money normal Worker selector differs from original held source");
+  return Object.freeze<MoneyHeldNormalWorkerSelector>({
+    kind: "takoserver.money-held-normal-worker-selector@v1",
+    accountId: facts.storage.accountId,
+    databaseId: facts.storage.databaseId,
+    databaseName: facts.storage.databaseName,
+    bucketName: facts.storage.bucketName,
+    workerName: held.target.workerName,
+    previousWriterEpoch: facts.previousWriterEpoch,
+    nextWriterEpoch: facts.nextWriterEpoch,
+    convertBindingDigest: facts.conversion.convertBindingDigest,
+    converted94BackupDigest: facts.converted94.backupDigest,
+    sourceRoot: value.sourceRoot,
+    sourceCommit: value.sourceCommit,
+    versionId: value.versionId,
+    moduleDigest: value.moduleDigest,
+    artifactDigest: value.artifactDigest,
+    artifactBytes: value.artifactBytes,
+    artifactFiles: value.artifactFiles,
+    selectedStripeMode: "test",
+  });
+}
+
+function assertNormalHeldContext(context: unknown): asserts context is MoneyUnitHeldConvertContext {
+  if (typeof context !== "object" || context === null || !heldMoneyContexts.has(context))
+    throw preflightError("money normal Worker requires its original held context");
+}
+
+/** Native uploaded-Version preparation; never a claim that it serves traffic. */
+export async function readMoneyUnitHeldNormalWorkerModePreparation(
+  context: unknown,
+  selectorPath: string,
+): Promise<MoneyUnitHeldNormalWorkerModePreparation> {
+  assertNormalHeldContext(context);
+  await assertMoneyUnitHeldConvertCurrent(context);
+  const held = heldMoneyContexts.get(context);
+  if (
+    !held ||
+    typeof selectorPath !== "string" ||
+    !isAbsolute(selectorPath) ||
+    resolve(selectorPath) !== selectorPath
+  )
+    throw preflightError(
+      "money normal Worker preparation needs original held context and canonical selector",
+    );
+  const target = originalHeldMoneyOwner(held.options);
+  const reader = nativeNormalWorkerReaders.get(held.options);
+  if (!reader || target !== held.target)
+    throw preflightError("money normal Worker native owner is unavailable");
+  const input = originalMoneyInput(selectorPath, "money normal Worker selector");
+  const selector = heldNormalSelector(input.value, context);
+  const facts = freezeOriginalMoneyData(structuredClone(await reader(context, selector)));
+  await assertMoneyUnitHeldConvertCurrent(context);
+  input.assertUnchanged();
+  if (
+    nativeNormalWorkerReaders.get(held.options) !== reader ||
+    originalHeldMoneyOwner(held.options) !== target
+  )
+    throw preflightError("money normal Worker owner changed during preparation");
+  const bindingDigest = digest(JSON.stringify(facts));
+  const preparation = Object.freeze({
+    kind: "takoserver.money-held-normal-worker-mode-preparation@v1" as const,
+    facts,
+    bindingDigest,
+  }) as MoneyUnitHeldNormalWorkerModePreparation;
+  heldNormalWorkerModes.set(preparation, {
+    context,
+    selectorPath,
+    selectorSeal: input.seal,
+    selectorJson: JSON.stringify(selector),
+    reader,
+    facts,
+    factsJson: JSON.stringify(facts),
+    bindingDigest,
+  });
+  return preparation;
+}
+
+/**
+ * Pre-import only: repeats exact immutable native GET/source build and held94.
+ * A post-import98/resume operation needs its own phase/custody; it cannot reuse
+ * the held94 assertion, relax a legacy phase, or claim this was serving100%.
+ */
+export async function assertMoneyUnitHeldNormalWorkerModePreparationCurrent(
+  preparation: unknown,
+  context: unknown,
+): Promise<void> {
+  const selected =
+    typeof preparation === "object" && preparation !== null
+      ? heldNormalWorkerModes.get(preparation)
+      : undefined;
+  if (
+    !selected ||
+    typeof preparation !== "object" ||
+    preparation === null ||
+    selected.context !== context ||
+    !ownMoneyValue(
+      preparation,
+      "kind",
+      "takoserver.money-held-normal-worker-mode-preparation@v1",
+    ) ||
+    !ownMoneyValue(preparation, "facts", selected.facts) ||
+    !ownMoneyValue(preparation, "bindingDigest", selected.bindingDigest)
+  )
+    throw preflightError("money normal Worker preparation origin differs");
+  assertNormalHeldContext(context);
+  await assertMoneyUnitHeldConvertCurrent(context);
+  const held = heldMoneyContexts.get(context);
+  if (
+    !held ||
+    nativeNormalWorkerReaders.get(held.options) !== selected.reader ||
+    JSON.stringify(selected.facts) !== selected.factsJson
+  )
+    throw preflightError("money normal Worker held owner or detached facts changed");
+  const input = originalMoneyInput(selected.selectorPath, "money normal Worker selector");
+  const selector = heldNormalSelector(input.value, context);
+  if (input.seal !== selected.selectorSeal || JSON.stringify(selector) !== selected.selectorJson)
+    throw preflightError("money normal Worker selector changed after preparation");
+  const current = await selected.reader(context, selector);
+  await assertMoneyUnitHeldConvertCurrent(context);
+  input.assertUnchanged();
+  if (
+    nativeNormalWorkerReaders.get(held.options) !== selected.reader ||
+    JSON.stringify(current) !== selected.factsJson ||
+    digest(JSON.stringify(current)) !== selected.bindingDigest
+  )
+    throw preflightError("money normal Worker native/source preparation changed");
+}
+
 export interface MoneyUnitResumeReadRequest {
   readonly selectedTarget: DeployTarget;
   readonly declarationPath: string;
@@ -2247,7 +2669,12 @@ async function loadMoneyUnitOwnerOptions(
   target: DeployTarget,
   dependencies: MoneyUnitOwnerDependencies,
   originalRead?: MoneyUnitOriginalOriginRead,
-  originalWriter?: { readonly declaration: unknown; readonly assertUnchanged: () => void },
+  originalWriter?: {
+    readonly declaration: unknown;
+    readonly assertUnchanged: () => void;
+    readonly nativeOnly: boolean;
+    readonly nativeBuild?: MoneyNativeBuildClosure;
+  },
 ): Promise<MoneyUnitCutoverOptions> {
   const declaration = parseDeclaration(
     originalWriter === undefined
@@ -2384,6 +2811,14 @@ async function loadMoneyUnitOwnerOptions(
   }
   const selectedState = state;
   const selectedStorage = storage;
+  const nativeModeMethods = originalWriter?.nativeOnly
+    ? Object.freeze({
+        version: normalWorkerDataMethod(selectedState, "workerVersion"),
+        modules: normalWorkerDataMethod(selectedState, "workerVersionWithModules"),
+        d1: normalWorkerDataMethod(selectedStorage, "getD1"),
+        r2: normalWorkerDataMethod(selectedStorage, "getR2"),
+      })
+    : undefined;
   const fetcher =
     dependencies.fetcher ?? ((input: string, init?: RequestInit) => fetch(input, init));
 
@@ -2718,7 +3153,340 @@ async function loadMoneyUnitOwnerOptions(
     };
   }
 
-  return {
+  async function readNormalWorkerMode(
+    context: MoneyUnitHeldConvertContext,
+    selector: MoneyHeldNormalWorkerSelector,
+  ): Promise<MoneyHeldNormalWorkerModeFacts> {
+    const held = heldMoneyContexts.get(context);
+    if (
+      !held ||
+      !originalWriter?.nativeOnly ||
+      !originalWriter.nativeBuild ||
+      selector.sourceCommit !== originalWriter.nativeBuild.sourceCommit ||
+      !nativeModeMethods ||
+      Object.getPrototypeOf(dependencies) !== null ||
+      Reflect.ownKeys(dependencies).join(",") !== "run" ||
+      dependencies.run !== runCommand ||
+      typeof nativeModeMethods.version !== "function" ||
+      typeof nativeModeMethods.modules !== "function" ||
+      typeof nativeModeMethods.d1 !== "function" ||
+      typeof nativeModeMethods.r2 !== "function"
+    )
+      throw preflightError("money normal Worker requires the original native owner closure");
+    const originalAssertion = originalWriter.assertUnchanged;
+    const nativeBuild = originalWriter.nativeBuild;
+    const versionRead = nativeModeMethods.version;
+    const moduleRead = nativeModeMethods.modules;
+    const d1Read = nativeModeMethods.d1;
+    const r2Read = nativeModeMethods.r2;
+    const assertLocal = () => {
+      if (
+        heldMoneyContexts.get(context) !== held ||
+        held.target !== target ||
+        originalHeldMoneyOwner(held.options) !== target ||
+        nativeNormalWorkerReaders.get(held.options) !== readNormalWorkerMode ||
+        JSON.stringify(held.facts) !== held.factsJson ||
+        JSON.stringify(heldMoneySelection(held.request)) !== held.selection ||
+        held.facts.previousWriterEpoch !== selector.previousWriterEpoch ||
+        held.facts.nextWriterEpoch !== selector.nextWriterEpoch ||
+        normalWorkerDataMethod(selectedState, "workerVersion") !== versionRead ||
+        normalWorkerDataMethod(selectedState, "workerVersionWithModules") !== moduleRead ||
+        normalWorkerDataMethod(selectedStorage, "getD1") !== d1Read ||
+        normalWorkerDataMethod(selectedStorage, "getR2") !== r2Read
+      )
+        throw preflightError("money normal Worker original context or native receiver changed");
+      originalAssertion();
+    };
+    const checked = async <T>(operation: () => Promise<T>): Promise<T> => {
+      assertLocal();
+      await assertMoneyUnitHeldConvertCurrent(context);
+      assertLocal();
+      let result: T;
+      try {
+        result = await operation();
+      } catch {
+        throw preflightError("money normal Worker native/source observation failed");
+      }
+      assertLocal();
+      await assertMoneyUnitHeldConvertCurrent(context);
+      assertLocal();
+      return result;
+    };
+    const readStorage = async (): Promise<void> => {
+      const d1: unknown = await checked(() =>
+        Reflect.apply(d1Read, selectedStorage, [target.d1.databaseId]),
+      );
+      const r2: unknown = await checked(() =>
+        Reflect.apply(r2Read, selectedStorage, [target.r2.bucketName]),
+      );
+      if (
+        !record(d1) ||
+        !record(r2) ||
+        d1.uuid !== held.facts.storage.databaseId ||
+        d1.name !== held.facts.storage.databaseName ||
+        r2.name !== held.facts.storage.bucketName
+      )
+        throw preflightError("money normal Worker native D1/R2 differs from original held target");
+    };
+    const readVersion = (): Promise<unknown> =>
+      checked(() =>
+        Reflect.apply(versionRead, selectedState, [target.workerName, selector.versionId]),
+      );
+    const readModules = (): Promise<unknown> =>
+      checked(() =>
+        Reflect.apply(moduleRead, selectedState, [target.workerName, selector.versionId]),
+      );
+    await readStorage();
+    const version = await readVersion();
+    if (!record(version) || version.id !== selector.versionId)
+      throw preflightError("money normal Worker native immutable Version identity differs");
+    const identity = workerVersionIdentity("preflight", version);
+    if (
+      identity.commit !== selector.sourceCommit ||
+      `sha256:${identity.bundleDigestHex}` !== selector.moduleDigest
+    )
+      throw preflightError("money normal Worker selected source differs from native annotation");
+    const nativeModuleDigest = `sha256:${exactV2MaintenanceModuleDigest("preflight", await readModules())}`;
+    if (nativeModuleDigest !== selector.moduleDigest)
+      throw preflightError("money normal Worker native module differs from selected source");
+    const nativeStripeMode = optionalExactPlainTextBinding(
+      "preflight",
+      selector.versionId,
+      version,
+      "TAKOSERVER_STRIPE_MODE",
+    );
+    if (nativeStripeMode !== null && nativeStripeMode !== "test")
+      throw preflightError("money normal Worker native Stripe mode is not TEST");
+    const signingKeyId = optionalExactPlainTextBinding(
+      "preflight",
+      selector.versionId,
+      version,
+      "TAKOSERVER_SIGNING_KEY_ID",
+    );
+    if (signingKeyId === null || !/^[A-Za-z0-9._:-]{1,128}$/u.test(signingKeyId))
+      throw preflightError("money normal Worker native signing-key selector is unavailable");
+    const { schemaMaintenanceMode: _maintenance, ...plainTarget } = target;
+    const normalTarget: DeployTarget = {
+      ...plainTarget,
+      moneyCutoverWriterEpoch: held.facts.nextWriterEpoch,
+    };
+    const expected = {
+      ...expectedExactBindingClosure(normalTarget, {
+        signingKeyId,
+        workerArtifactDigest: `sha256:${identity.bundleDigestHex}`,
+        ...(normalTarget.integrationE2eCredentialAuthority === undefined
+          ? {}
+          : {
+              authorityProfile: {
+                kind: "provenance-bound-jit" as const,
+                provenance: {
+                  sourceCommit: selector.sourceCommit,
+                  artifactDigest: `sha256:${identity.bundleDigestHex}` as const,
+                },
+              },
+            }),
+      }),
+      // Exactly this native TEST binding is allowed independently from Hosted
+      // feature selection. A live/invalid value never reaches this inventory.
+      ...(nativeStripeMode === "test" && normalTarget.hostedBilling === undefined
+        ? {
+            TAKOSERVER_STRIPE_MODE: { type: "plain_text", fields: { text: "test" } },
+          }
+        : {}),
+    };
+    const assertVersion = (observed: unknown) => {
+      if (!record(observed) || observed.id !== selector.versionId)
+        throw preflightError("money normal Worker immutable Version identity changed");
+      const current = workerVersionIdentity("preflight", observed);
+      if (
+        current.commit !== selector.sourceCommit ||
+        `sha256:${current.bundleDigestHex}` !== nativeModuleDigest ||
+        optionalExactPlainTextBinding(
+          "preflight",
+          selector.versionId,
+          observed,
+          "TAKOSERVER_SCHEMA_MAINTENANCE_MODE",
+        ) !== null ||
+        optionalExactPlainTextBinding(
+          "preflight",
+          selector.versionId,
+          observed,
+          "TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY",
+        ) !== "transaction-fenced-usd-micros-v1" ||
+        optionalExactPlainTextBinding(
+          "preflight",
+          selector.versionId,
+          observed,
+          "TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH",
+        ) !== held.facts.nextWriterEpoch ||
+        optionalExactPlainTextBinding(
+          "preflight",
+          selector.versionId,
+          observed,
+          "TAKOSERVER_STRIPE_MODE",
+        ) !== nativeStripeMode
+      )
+        throw preflightError("money normal Worker native mode/policy/next epoch differs");
+      assertExactVersionBindingClosure("preflight", selector.versionId, observed, expected);
+    };
+    assertVersion(version);
+    const buildRoot = mkdtempSync(join(declaration.outputDirectory, "money-normal-build-"));
+    // A selector chooses only an immutable version of the reviewed full source.
+    // The factory captured its own tools/dependencies before its first await.
+    const build = await checked(() =>
+      nativeBuild.bindSource(selector.sourceRoot, selector.sourceCommit, buildRoot),
+    );
+    const sourceAt = (
+      path: "src/entry-worker.ts" | "src/entry-cloudflare-worker.ts" | "src/stripe-mode-realm.ts",
+    ): Promise<string> => checked(() => build.sourceAt(path));
+    const entrySource = await sourceAt("src/entry-worker.ts");
+    const entryModuleSource = await sourceAt("src/entry-cloudflare-worker.ts");
+    if (
+      digest(entrySource) !== NORMAL_ENTRY_SOURCE ||
+      digest(entryModuleSource) !== NORMAL_ENTRY_MODULE_SOURCE
+    )
+      throw preflightError("money normal Worker entry/source call path is not reviewed");
+    // Only an opaque parser AST/digest is retained. The unrelated module source
+    // and any SQL literals are never displayed, copied into evidence or returned.
+    const parserSource = await sourceAt("src/stripe-mode-realm.ts");
+    const parser = await checked(() => inspectMoneyNormalWorkerModeFunctionSource(parserSource));
+    if (!parser) throw preflightError("money normal Worker source mode/default is unknown");
+    build.assertCurrent();
+    const prepared = await checked(() =>
+      prepareWorkerArtifact({
+        root: buildRoot,
+        target: normalTarget,
+        commit: selector.sourceCommit,
+        sourceRepositoryRoot: selector.sourceRoot,
+        wranglerPath: build.wranglerPath,
+        dryRunCommand: "versions-upload",
+        run: build.run,
+        writeConfig: ({ path, main, bundleDigestHex, formImplementationIdentity }) => {
+          const configPath = writeWorkerConfig(normalTarget, {
+            path,
+            main,
+            commit: selector.sourceCommit,
+            signingKeyId,
+            sourceRepositoryRoot: selector.sourceRoot,
+            topology: "version-only",
+            ...(formImplementationIdentity === undefined ? {} : { formImplementationIdentity }),
+            ...(bundleDigestHex === undefined
+              ? {}
+              : { workerArtifactDigest: `sha256:${bundleDigestHex}` as const }),
+            ...(normalTarget.integrationE2eCredentialAuthority === undefined
+              ? {}
+              : bundleDigestHex === undefined
+                ? { authorityProfile: { kind: "historical-pre-jit" as const } }
+                : {
+                    authorityProfile: {
+                      kind: "provenance-bound-jit" as const,
+                      provenance: {
+                        sourceCommit: selector.sourceCommit,
+                        artifactDigest: `sha256:${bundleDigestHex}` as const,
+                      },
+                    },
+                  }),
+          });
+          if (nativeStripeMode === "test" && normalTarget.hostedBilling === undefined) {
+            // This owner-created private build config mirrors an observed native
+            // TEST binding; it does not enable Hosted or accept caller config/SQL.
+            const configInput = originalMoneyInput(
+              configPath,
+              "money normal Worker generated configuration",
+            );
+            const config = configInput.value;
+            if (
+              !record(config) ||
+              !record(config.vars) ||
+              Object.hasOwn(config.vars, "TAKOSERVER_STRIPE_MODE")
+            )
+              throw preflightError("money normal Worker generated configuration differs");
+            const contents = `${JSON.stringify(
+              { ...config, vars: { ...config.vars, TAKOSERVER_STRIPE_MODE: "test" } },
+              null,
+              2,
+            )}\n`;
+            const before = lstatSync(configPath, { bigint: true });
+            if (!before.isFile() || before.nlink !== 1n || (before.mode & 0o777n) !== 0o600n)
+              throw preflightError("money normal Worker generated configuration is not private");
+            const fd = openSync(configPath, constants.O_WRONLY | constants.O_NOFOLLOW);
+            try {
+              const heldConfig = fstatSync(fd, { bigint: true });
+              if (
+                heldConfig.dev !== before.dev ||
+                heldConfig.ino !== before.ino ||
+                heldConfig.nlink !== 1n
+              )
+                throw preflightError("money normal Worker generated configuration changed");
+              configInput.assertUnchanged();
+              ftruncateSync(fd, 0);
+              writeFileSync(fd, contents);
+              fsyncSync(fd);
+            } finally {
+              closeSync(fd);
+            }
+          }
+          return configPath;
+        },
+      }),
+    );
+    const sealed = prepared.seal();
+    sealed.assertUnchanged();
+    if (
+      `sha256:${prepared.bundleDigestHex}` !== nativeModuleDigest ||
+      sealed.digest !== selector.artifactDigest ||
+      sealed.bytes !== selector.artifactBytes ||
+      sealed.files !== selector.artifactFiles
+    )
+      throw preflightError(
+        "money normal Worker source-built module/artifact differs from native/selector",
+      );
+    build.assertCurrent();
+    assertVersion(await readVersion());
+    if (
+      `sha256:${exactV2MaintenanceModuleDigest("preflight", await readModules())}` !==
+      nativeModuleDigest
+    )
+      throw preflightError("money normal Worker native immutable module changed");
+    await readStorage();
+    sealed.assertUnchanged();
+    build.assertCurrent();
+    assertLocal();
+    return freezeOriginalMoneyData<MoneyHeldNormalWorkerModeFacts>({
+      kind: "takoserver.money-held-normal-worker-mode-facts@v1",
+      accountId: held.facts.storage.accountId,
+      databaseId: held.facts.storage.databaseId,
+      databaseName: held.facts.storage.databaseName,
+      bucketName: held.facts.storage.bucketName,
+      workerName: target.workerName,
+      previousWriterEpoch: held.facts.previousWriterEpoch,
+      nextWriterEpoch: held.facts.nextWriterEpoch,
+      heldConvertDigest: digest(held.factsJson),
+      convertBindingDigest: held.facts.conversion.convertBindingDigest,
+      converted94BackupDigest: held.facts.converted94.backupDigest,
+      versionId: selector.versionId,
+      sourceCommit: selector.sourceCommit,
+      moduleDigest: nativeModuleDigest,
+      sourceArtifactDigest: sealed.digest,
+      sourceArtifactBytes: sealed.bytes,
+      sourceArtifactFiles: sealed.files,
+      sourceTreeDigest: build.sourceTreeDigest,
+      dependencyClosureDigest: build.dependencyClosureDigest,
+      toolClosureDigest: build.toolClosureDigest,
+      nativeBindingDigest: digest(JSON.stringify(expected)),
+      stripeMode: "test",
+      modeEvidence:
+        nativeStripeMode === "test"
+          ? "explicit-native-test"
+          : "verified-source-default-test-native-absence",
+      entrySourceDigest: NORMAL_ENTRY_SOURCE,
+      entryModuleSourceDigest: NORMAL_ENTRY_MODULE_SOURCE,
+      parserSourceDigest: parser.sourceDigest,
+      parserFunctionDigest: parser.functionDigest,
+    });
+  }
+
+  const result: MoneyUnitCutoverOptions = {
     phase: declaration.phase,
     writerEpoch: declaration.writerEpoch,
     maintenanceCommit: declaration.maintenanceCommit,
@@ -2834,4 +3602,6 @@ async function loadMoneyUnitOwnerOptions(
       : { cloudflareEnvironment: dependencies.cloudflareEnvironment }),
     ...(dependencies.run === undefined ? {} : { run: dependencies.run }),
   };
+  if (originalWriter?.nativeOnly) nativeNormalWorkerReaders.set(result, readNormalWorkerMode);
+  return result;
 }
