@@ -1596,7 +1596,11 @@ function createAccountsInternal(
          WHERE secret_digest = ? AND kind = 'session' AND revoked_at IS NULL AND expires_at > ?`,
         [revokedAt, await bytesDigest(new TextEncoder().encode(secret)), revokedAt],
       );
-      if (result.changes !== 1) throw new AuthError("unauthenticated");
+      // The unique bearer digest permits at most one token update. D1 also
+      // counts trigger writes, including the retained credential's retirement.
+      const changes = result.changes;
+      if (typeof changes !== "number" || !Number.isSafeInteger(changes) || changes < 1)
+        throw new AuthError("unauthenticated");
     },
 
     async authenticate(authorization) {
