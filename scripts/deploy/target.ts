@@ -310,7 +310,11 @@ export function targetPath(
 export function loadTarget(
   path: string,
   environment: DeployEnvironment,
-  operation: "deploy" | "money-resume-read" | "money-original-cutover" = "deploy",
+  operation:
+    | "deploy"
+    | "money-resume-read"
+    | "money-original-cutover"
+    | "money-original-maintenance-bootstrap" = "deploy",
 ): DeployTarget {
   let raw: string;
   try {
@@ -517,12 +521,17 @@ export function parseDeployTarget(
   value: unknown,
   source: string,
   environment: DeployEnvironment,
-  operation: "deploy" | "money-resume-read" | "money-original-cutover" = "deploy",
+  operation:
+    | "deploy"
+    | "money-resume-read"
+    | "money-original-cutover"
+    | "money-original-maintenance-bootstrap" = "deploy",
 ): DeployTarget {
   if (
     operation !== "deploy" &&
     operation !== "money-resume-read" &&
-    operation !== "money-original-cutover"
+    operation !== "money-original-cutover" &&
+    operation !== "money-original-maintenance-bootstrap"
   ) {
     throw preflightError("deploy target operation selector is invalid");
   }
@@ -664,7 +673,9 @@ export function parseDeployTarget(
         target.takoformV2?.appliedSchemaLineage !== "v2-0092") ||
       !(
         /^takoserver-i-[0-9a-f]{32}$/u.test(target.d1.databaseName) ||
-        ((operation === "money-resume-read" || operation === "money-original-cutover") &&
+        ((operation === "money-resume-read" ||
+          operation === "money-original-cutover" ||
+          operation === "money-original-maintenance-bootstrap") &&
           /^integration-ts-[0-9a-f]{32}$/u.test(target.d1.databaseName))
       ) ||
       target.r2.bucketName !== target.d1.databaseName)
@@ -680,7 +691,9 @@ export function parseDeployTarget(
         target.takoformV2?.appliedSchemaLineage !== "v2-0092") ||
       !(
         /^takoserver-i-[0-9a-f]{32}$/u.test(target.d1.databaseName) ||
-        ((operation === "money-resume-read" || operation === "money-original-cutover") &&
+        ((operation === "money-resume-read" ||
+          operation === "money-original-cutover" ||
+          operation === "money-original-maintenance-bootstrap") &&
           /^integration-ts-[0-9a-f]{32}$/u.test(target.d1.databaseName))
       ) ||
       target.r2.bucketName !== target.d1.databaseName)
@@ -694,7 +707,8 @@ export function parseDeployTarget(
     throw preflightError("money cutover writer policy requires an exact pinned Writer epoch");
   }
   if (
-    operation === "money-original-cutover" &&
+    (operation === "money-original-cutover" ||
+      operation === "money-original-maintenance-bootstrap") &&
     (environment !== "integration" ||
       !/^integration-ts-[0-9a-f]{32}$/u.test(target.d1.databaseName) ||
       target.r2.bucketName !== target.d1.databaseName ||
@@ -706,6 +720,30 @@ export function parseDeployTarget(
     throw preflightError(
       "original money cutover requires exact prefixed fresh92 storage and writer policy",
     );
+  if (operation === "money-original-maintenance-bootstrap") {
+    let origin: URL;
+    try {
+      origin = new URL(target.publicOrigin);
+    } catch {
+      throw preflightError("original money maintenance requires its exact workers.dev origin");
+    }
+    if (
+      target.schemaMaintenanceMode !== "pre-wallet-usd-micros-quiesced" ||
+      origin.protocol !== "https:" ||
+      origin.username !== "" ||
+      origin.password !== "" ||
+      origin.port !== "" ||
+      origin.pathname !== "/" ||
+      origin.search !== "" ||
+      origin.hash !== "" ||
+      !origin.hostname.startsWith(`${target.workerName}.`) ||
+      !origin.hostname.endsWith(".workers.dev") ||
+      (target.aliases !== undefined && target.aliases.length !== 0)
+    )
+      throw preflightError(
+        "original money maintenance bootstrap cannot publish a normal or aliased Host",
+      );
+  }
   if (
     target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced" &&
     target.moneyCutoverWriterPolicy !== "transaction-fenced-usd-micros-v1"

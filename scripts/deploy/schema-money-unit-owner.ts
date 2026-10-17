@@ -24,6 +24,7 @@ import {
   type IntegrationStorageOriginalCreateOptions,
   verifyIntegrationStorageOriginalCreate,
 } from "./integration-storage-generation.ts";
+import { readIntegrationMoneyMaintenancePublicationOriginal } from "./integration-worker-bootstrap.ts";
 import {
   captureMoneyNativeBuildClosure,
   type MoneyNativeBuildClosure,
@@ -907,11 +908,17 @@ interface PublicPublicationReceipt {
   readonly artifactFiles: number;
   readonly deploymentId: string;
   readonly versionId: string;
-  readonly surface: "takoserver-worker-authority-cutover";
+  readonly surface:
+    | "takoserver-worker-authority-cutover"
+    | "takoserver-integration-worker-bootstrap";
+  readonly originalCreateTerminalCustodyDigest?: string;
+  readonly originalMaintenanceDispatchDigest?: string;
+  readonly originalMaintenanceTerminalCustodyDigest?: string;
   /** Normal authority publication adds maintenance; closure transition retires its mode on resume. */
   readonly resultKind:
     | "takoserver.worker-apply@v2"
-    | "takoserver.worker-closure-transition-apply@v1";
+    | "takoserver.worker-closure-transition-apply@v1"
+    | "takoserver.integration-worker-bootstrap-original-money-maintenance-apply@v1";
   readonly resultDigest: string;
   readonly ownerGateDigest: string;
   readonly reviewer: string;
@@ -924,6 +931,10 @@ function parsePublicPublicationReceipt(
   phase: "maintenance" | "resume",
   commit: string,
   bundleDigest: string,
+  originalMaintenance?: {
+    readonly originalCreate: IntegrationStorageOriginalCreateOptions;
+    readonly terminalCustodyDigest: string;
+  },
 ): PublicPublicationReceipt {
   const fields = [
     "kind",
@@ -948,9 +959,18 @@ function parsePublicPublicationReceipt(
     "reviewer",
     "reviewRef",
   ];
+  const originalBootstrap =
+    record(value) &&
+    value.resultKind ===
+      "takoserver.integration-worker-bootstrap-original-money-maintenance-apply@v1";
+  const originalFields = [
+    "originalCreateTerminalCustodyDigest",
+    "originalMaintenanceDispatchDigest",
+    "originalMaintenanceTerminalCustodyDigest",
+  ];
   if (
     !record(value) ||
-    !keys(value, fields) ||
+    !keys(value, [...fields, ...(originalBootstrap ? originalFields : [])]) ||
     value.kind !== "takoserver.money-public-worker-publication@v1" ||
     value.state !== "reviewed" ||
     !requireReviewedAt(value.reviewedAt) ||
@@ -966,10 +986,17 @@ function parsePublicPublicationReceipt(
     Number(value.artifactBytes) <= 0 ||
     !Number.isSafeInteger(value.artifactFiles) ||
     Number(value.artifactFiles) < 2 ||
-    value.surface !== "takoserver-worker-authority-cutover" ||
-    !["takoserver.worker-apply@v2", "takoserver.worker-closure-transition-apply@v1"].includes(
-      String(value.resultKind),
-    ) ||
+    (originalBootstrap
+      ? value.surface !== "takoserver-integration-worker-bootstrap" ||
+        phase !== "maintenance" ||
+        originalMaintenance === undefined ||
+        value.originalCreateTerminalCustodyDigest !== originalMaintenance.terminalCustodyDigest ||
+        !requireSha(value.originalMaintenanceDispatchDigest) ||
+        !requireSha(value.originalMaintenanceTerminalCustodyDigest)
+      : value.surface !== "takoserver-worker-authority-cutover" ||
+        !["takoserver.worker-apply@v2", "takoserver.worker-closure-transition-apply@v1"].includes(
+          String(value.resultKind),
+        )) ||
     !UUID.test(String(value.deploymentId)) ||
     !UUID.test(String(value.versionId)) ||
     !requireSha(value.resultDigest) ||
@@ -980,6 +1007,32 @@ function parsePublicPublicationReceipt(
     throw preflightError(
       "money public Worker terminal publication evidence is malformed or unbound",
     );
+  }
+  if (originalBootstrap) {
+    if (originalMaintenance === undefined)
+      throw preflightError("original maintenance native owner is unavailable");
+    const retained = readIntegrationMoneyMaintenancePublicationOriginal(
+      originalMaintenance.originalCreate,
+      target,
+      commit,
+      originalMaintenance.terminalCustodyDigest,
+    );
+    if (
+      retained === null ||
+      retained.result === null ||
+      retained.dispatchDigest !== value.originalMaintenanceDispatchDigest ||
+      retained.terminalDigest !== value.originalMaintenanceTerminalCustodyDigest ||
+      retained.resultDigest !== value.resultDigest ||
+      retained.result.deploymentId !== value.deploymentId ||
+      retained.result.versionId !== value.versionId ||
+      retained.result.bundleDigest !== value.bundleDigest ||
+      retained.result.artifactDigest !== value.artifactDigest ||
+      retained.result.artifactBytes !== value.artifactBytes ||
+      retained.result.artifactFiles !== value.artifactFiles
+    )
+      throw preflightError(
+        "money original maintenance receipt differs from the original source-built publication custody",
+      );
   }
   return value as unknown as PublicPublicationReceipt;
 }
@@ -2835,7 +2888,14 @@ async function loadMoneyUnitOwnerOptions(
       terminalCustodyDigest: observed.originalCreate.terminalCustodyDigest,
     };
   };
-  await readOrigin();
+  const originalOrigin = await readOrigin();
+  const originalMaintenance =
+    originalWriter?.nativeOnly === true && originalRead !== undefined
+      ? {
+          originalCreate: originalRead.custody,
+          terminalCustodyDigest: originalOrigin.terminalCustodyDigest,
+        }
+      : undefined;
   const scope = parsePrivateScope(
     protectedJson(
       declaration.privateWriterScopePath,
@@ -2855,6 +2915,7 @@ async function loadMoneyUnitOwnerOptions(
     "maintenance",
     declaration.maintenanceCommit,
     declaration.maintenanceModuleDigest,
+    originalMaintenance,
   );
   if (
     declaration.phase === "resume" &&
@@ -3034,7 +3095,28 @@ async function loadMoneyUnitOwnerOptions(
     const selectedTarget: DeployTarget = maintenance
       ? { ...plainTarget, schemaMaintenanceMode: "pre-wallet-usd-micros-quiesced" }
       : plainTarget;
+    const selectedPublication = parsePublicPublicationReceipt(
+      protectedJson(
+        maintenance
+          ? declaration.maintenancePublicationReceiptPath
+          : (declaration.resumePublicationReceiptPath ?? ""),
+        "money public Worker terminal publication",
+        maintenance
+          ? declaration.maintenancePublicationReceiptDigest
+          : declaration.resumePublicationReceiptDigest,
+      ),
+      target,
+      maintenance ? "maintenance" : "resume",
+      maintenance ? declaration.maintenanceCommit : (declaration.resumeCommit ?? ""),
+      maintenance ? declaration.maintenanceModuleDigest : (declaration.resumeModuleDigest ?? ""),
+      maintenance ? originalMaintenance : undefined,
+    );
+    const originalMaintenancePublication =
+      maintenance &&
+      selectedPublication.resultKind ===
+        "takoserver.integration-worker-bootstrap-original-money-maintenance-apply@v1";
     const live = await inspectLiveWorkerVersion("preflight", selectedTarget, selectedState, {
+      ...(originalMaintenancePublication ? { expectedSecrets: [] } : {}),
       ...(selectedTarget.integrationE2eCredentialAuthority === undefined
         ? {}
         : { authorityProfile: { kind: "provenance-bound-jit" as const } }),
@@ -3110,6 +3192,7 @@ async function loadMoneyUnitOwnerOptions(
               commit: expectedCommit,
               sourceRepositoryRoot: sourceRoot,
               topology: "version-only",
+              ...(originalMaintenancePublication ? { transitionExpectedSecrets: [] } : {}),
               ...(formImplementationIdentity === undefined ? {} : { formImplementationIdentity }),
               ...(bundleDigestHex === undefined
                 ? {}
@@ -3158,6 +3241,7 @@ async function loadMoneyUnitOwnerOptions(
       maintenance ? "maintenance" : "resume",
       expectedCommit,
       expectedDigest,
+      maintenance ? originalMaintenance : undefined,
     );
     if (
       publication.artifactDigest !== sourceBuilt.artifactDigest ||
@@ -3181,6 +3265,7 @@ async function loadMoneyUnitOwnerOptions(
         "maintenance",
         declaration.maintenanceCommit,
         declaration.maintenanceModuleDigest,
+        originalMaintenance,
       );
       if (
         publication.deploymentId === predecessor.deploymentId ||

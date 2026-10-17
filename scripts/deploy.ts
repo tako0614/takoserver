@@ -1185,6 +1185,16 @@ function loadMoneyShadowNativeProbeDeclaration(): MoneyShadowNativeProbeDeclarat
 
 async function dispatch(invocation: Invocation): Promise<Record<string, unknown>> {
   const originalCreateInput = process.env.TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH;
+  if (
+    process.env.TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_SELECTION_PATH !== undefined &&
+    (originalCreateInput === undefined ||
+      invocation.surface !== "takoserver-integration-worker-bootstrap" ||
+      invocation.environment !== "integration")
+  )
+    throw new DeployError(
+      "preflight",
+      "original money maintenance selection is scoped to the integration first-publication route",
+    );
   if (invocation.throughMigration === "0098") {
     if (originalCreateInput === undefined)
       throw new DeployError(
@@ -1288,6 +1298,34 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
       { moneyUnitCutover: options },
     );
     return { ...result, originalOriginQualification: options.originalOriginQualification };
+  }
+  if (
+    originalCreateInput !== undefined &&
+    invocation.surface === "takoserver-integration-worker-bootstrap" &&
+    invocation.environment === "integration"
+  ) {
+    const target = loadTarget(
+      targetPath("integration"),
+      "integration",
+      "money-original-maintenance-bootstrap",
+    );
+    return await runIntegrationWorkerBootstrap(
+      {
+        action: invocation.action,
+        environment: "integration",
+        commit: invocation.commit,
+        surface: "takoserver-integration-worker-bootstrap",
+      },
+      target,
+      {
+        originalMoneyMaintenance: {
+          originalCreateInputPath: originalCreateInput,
+          selectionPath: requireEnvironment(
+            "TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_SELECTION_PATH",
+          ),
+        },
+      },
+    );
   }
   if (originalCreateInput !== undefined) {
     if (

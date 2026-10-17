@@ -1,8 +1,23 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { parseRuntimeInputSealKeyRing } from "../../src/runtime-input-seal-keyring.ts";
 import { parseTakoformV2ApplicationConfig } from "../../src/takoform-v2/config.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
@@ -18,8 +33,12 @@ import { assertFreshV2DataReadback, type FreshV2DataReader } from "./fresh-v2-da
 import {
   CloudflareIntegrationStorageProvider,
   type FreshV2IntegrationStorageTargetProof,
+  type IntegrationStorageGenerationInvocation,
   type IntegrationStorageGenerationTargetVerificationOptions,
+  type IntegrationStorageOriginalCreateOptions,
+  loadIntegrationStorageOriginalCreateInput,
   verifyFreshV2IntegrationStorageTarget,
+  verifyIntegrationStorageOriginalCreate,
 } from "./integration-storage-generation.ts";
 import {
   assertMoneyUnitSchema,
@@ -62,11 +81,12 @@ import {
   type SigningDatabase,
   type SigningPublicKeyRow,
 } from "./signing.ts";
-import { type DeployTarget, takoformV2StorageLineage } from "./target.ts";
+import { type DeployTarget, parseDeployTarget, takoformV2StorageLineage } from "./target.ts";
 import {
   assertProviderExecutorUnchanged,
   type ProviderExecutorInspection,
   probeProduct,
+  probeSchemaMaintenance,
   providerExecutorQualificationReader,
   type WorkerProcess,
   type WorkerProviderExecutorQualification,
@@ -186,6 +206,11 @@ export interface IntegrationWorkerBootstrapR2IdentityReader {
 }
 
 export interface IntegrationWorkerBootstrapOptions {
+  /** Locator selection only. This mode accepts no injected read, write, runner or proof ports. */
+  readonly originalMoneyMaintenance?: {
+    readonly originalCreateInputPath: string;
+    readonly selectionPath: string;
+  };
   readonly run?: WorkerProcess;
   readonly state?: IntegrationWorkerBootstrapState;
   readonly sourceRepositoryRoot?: string;
@@ -212,6 +237,572 @@ export interface IntegrationWorkerBootstrapOptions {
   readonly deployLifecycle?: (
     input: Parameters<typeof deployWranglerLifecycleChange>[0],
   ) => Promise<WranglerLifecycleDeployment>;
+}
+
+const ORIGINAL_MONEY_MAINTENANCE_MODE = "pre-wallet-usd-micros-quiesced" as const;
+const ORIGINAL_MONEY_MAINTENANCE_RESULT =
+  "takoserver.integration-worker-bootstrap-original-money-maintenance-apply@v1" as const;
+
+function maintenanceDigest(value: string | Uint8Array): string {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function maintenanceRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function maintenanceKeys(value: Record<string, unknown>, names: readonly string[]): boolean {
+  return Object.keys(value).sort().join("\0") === [...names].sort().join("\0");
+}
+
+/** Detached own DATA only; getters, Proxies and callable values cannot enter native selection. */
+function maintenanceData(value: unknown, seen = new Set<object>()): unknown {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value !== "object" || value === null || seen.has(value))
+    throw preflightError("original money maintenance requires detached own JSON data");
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== Array.prototype)
+    throw preflightError("original money maintenance requires plain own JSON data");
+  seen.add(value);
+  try {
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    if (Object.getOwnPropertySymbols(value).length !== 0)
+      throw preflightError("original money maintenance selection has symbol properties");
+    if (Array.isArray(value)) {
+      const keys = Object.keys(descriptors).filter((name) => name !== "length");
+      if (keys.length !== value.length || keys.some((name, index) => name !== String(index)))
+        throw preflightError("original money maintenance selection has a sparse array");
+      return Object.freeze(
+        keys.map((name) => {
+          const descriptor = descriptors[name];
+          if (!descriptor || !("value" in descriptor) || !descriptor.enumerable)
+            throw preflightError("original money maintenance selection has an accessor");
+          return maintenanceData(descriptor.value, seen);
+        }),
+      );
+    }
+    const detached: Record<string, unknown> = {};
+    for (const [name, descriptor] of Object.entries(descriptors)) {
+      if (!("value" in descriptor) || !descriptor.enumerable || name === "__proto__")
+        throw preflightError("original money maintenance selection has an accessor");
+      detached[name] = maintenanceData(descriptor.value, seen);
+    }
+    return Object.freeze(detached);
+  } finally {
+    seen.delete(value);
+  }
+}
+
+function maintenancePrivateDirectory(path: string): void {
+  if (!isAbsolute(path) || resolve(path) !== path || realpathSync(path) !== path)
+    throw preflightError("original money maintenance custody path is not canonical");
+  const status = lstatSync(path);
+  if (
+    !status.isDirectory() ||
+    status.isSymbolicLink() ||
+    (status.mode & 0o777) !== 0o700 ||
+    status.uid !== process.getuid?.()
+  )
+    throw preflightError("original money maintenance custody requires an owned0700 directory");
+  for (let current = path; current !== dirname(current); current = dirname(current)) {
+    try {
+      lstatSync(join(current, ".git"));
+      throw preflightError("original money maintenance custody must be outside every checkout");
+    } catch (error) {
+      if (error instanceof DeployError) throw error;
+      if (!maintenanceRecord(error) || error.code !== "ENOENT") throw error;
+    }
+  }
+}
+
+function maintenanceProtectedInput(path: string, absent = false) {
+  if (
+    typeof path !== "string" ||
+    !isAbsolute(path) ||
+    resolve(path) !== path ||
+    /[\0\r\n]/u.test(path)
+  )
+    throw preflightError("original money maintenance requires canonical protected locator paths");
+  maintenancePrivateDirectory(dirname(path));
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch (error) {
+    if (absent && maintenanceRecord(error) && error.code === "ENOENT") return null;
+    throw preflightError("original money maintenance protected input is unavailable");
+  }
+  const identity = (status: ReturnType<typeof fstatSync>) =>
+    [
+      status.dev,
+      status.ino,
+      status.uid,
+      status.gid,
+      status.mode,
+      status.nlink,
+      status.size,
+      status.mtimeMs,
+      status.ctimeMs,
+    ].join(":");
+  let bytes: Buffer;
+  let seal: string;
+  try {
+    const before = fstatSync(fd);
+    if (
+      !before.isFile() ||
+      before.nlink !== 1 ||
+      (before.mode & 0o777) !== 0o600 ||
+      before.uid !== process.getuid?.() ||
+      before.size > 1024 * 1024
+    )
+      throw preflightError("original money maintenance input requires an owned bounded0600 file");
+    if (identity(lstatSync(path)) !== identity(before))
+      throw preflightError("original money maintenance named and held inputs differ");
+    bytes = Buffer.alloc(before.size);
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const count = readSync(fd, bytes, offset, bytes.byteLength - offset, null);
+      if (count === 0) throw preflightError("original money maintenance input was truncated");
+      offset += count;
+    }
+    if (
+      readSync(fd, Buffer.alloc(1), 0, 1, null) !== 0 ||
+      identity(fstatSync(fd)) !== identity(before) ||
+      identity(lstatSync(path)) !== identity(before)
+    )
+      throw preflightError("original money maintenance input changed during read");
+    seal = `${identity(before)}:${maintenanceDigest(bytes)}`;
+  } finally {
+    closeSync(fd);
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes));
+  } catch {
+    throw preflightError("original money maintenance input is not fatalUTF8 JSON");
+  }
+  return {
+    value,
+    seal,
+    assertUnchanged(): void {
+      if (maintenanceProtectedInput(path)?.seal !== seal)
+        throw preflightError("original money maintenance input changed after capture");
+    },
+  };
+}
+
+function originalMaintenanceCustodyRoot(
+  originalCreate: IntegrationStorageOriginalCreateOptions,
+): string {
+  if (originalCreate.kind !== "positive-fresh-0092")
+    throw preflightError("original money maintenance requires original fresh92 custody");
+  const root = originalCreate.custodyDirectory;
+  maintenancePrivateDirectory(root);
+  const status = lstatSync(root);
+  if (
+    String(status.dev) !== originalCreate.custodyIdentity.device ||
+    String(status.ino) !== originalCreate.custodyIdentity.inode
+  )
+    throw preflightError("original money maintenance custody root identity differs");
+  return join(dirname(root), `${basename(root)}.money-maintenance-publication`);
+}
+
+interface OriginalMaintenancePublicationBinding {
+  readonly originalCreateTerminalCustodyDigest: string;
+  readonly targetDigest: string;
+  readonly sourceCommit: string;
+  readonly writerEpoch: string;
+  readonly moduleDigest: string;
+  readonly artifactDigest: string;
+  readonly artifactBytes: number;
+  readonly artifactFiles: number;
+}
+
+function maintenanceTargetDigest(target: DeployTarget): string {
+  return maintenanceDigest(
+    canonicalJson({ ...target, schemaMaintenanceMode: ORIGINAL_MONEY_MAINTENANCE_MODE }),
+  );
+}
+
+function readOriginalMaintenanceCustody(
+  originalCreate: IntegrationStorageOriginalCreateOptions,
+  target: DeployTarget,
+  sourceCommit: string,
+  originalCreateTerminalCustodyDigest: string,
+) {
+  const root = originalMaintenanceCustodyRoot(originalCreate);
+  try {
+    lstatSync(root);
+  } catch (error) {
+    if (maintenanceRecord(error) && error.code === "ENOENT") return null;
+    throw error;
+  }
+  const rootPin = maintenanceDirectoryPin(root);
+  const entries = readdirSync(root).sort();
+  if (entries.join(",") !== "dispatch.json" && entries.join(",") !== "dispatch.json,terminal.json")
+    throw preflightError(
+      "original money maintenance existing custody is partial or contains unknown entries; do not retry",
+    );
+  const dispatch = maintenanceProtectedInput(join(root, "dispatch.json"));
+  const terminal = maintenanceProtectedInput(join(root, "terminal.json"), true);
+  if (dispatch === null)
+    throw preflightError("original maintenance custody has no original dispatch");
+  const assertCustodyUnchanged = () => {
+    if (
+      maintenanceDirectoryPin(root) !== rootPin ||
+      readdirSync(root).sort().join(",") !== entries.join(",")
+    )
+      throw preflightError("original money maintenance publication inventory changed during read");
+    dispatch.assertUnchanged();
+    terminal?.assertUnchanged();
+  };
+  const value = dispatch.value;
+  if (
+    !maintenanceRecord(value) ||
+    !maintenanceKeys(value, ["kind", "binding", "bindingDigest"]) ||
+    value.kind !== "takoserver.original-money-maintenance-publication-dispatch@v1" ||
+    !maintenanceRecord(value.binding) ||
+    !maintenanceKeys(value.binding, [
+      "originalCreateTerminalCustodyDigest",
+      "targetDigest",
+      "sourceCommit",
+      "writerEpoch",
+      "moduleDigest",
+      "artifactDigest",
+      "artifactBytes",
+      "artifactFiles",
+    ]) ||
+    value.bindingDigest !== maintenanceDigest(JSON.stringify(value.binding)) ||
+    value.binding.originalCreateTerminalCustodyDigest !== originalCreateTerminalCustodyDigest ||
+    value.binding.targetDigest !== maintenanceTargetDigest(target) ||
+    value.binding.sourceCommit !== sourceCommit ||
+    value.binding.writerEpoch !== target.moneyCutoverWriterEpoch ||
+    !SHA256.test(String(value.binding.moduleDigest)) ||
+    !SHA256.test(String(value.binding.artifactDigest)) ||
+    !Number.isSafeInteger(value.binding.artifactBytes) ||
+    Number(value.binding.artifactBytes) <= 0 ||
+    !Number.isSafeInteger(value.binding.artifactFiles) ||
+    Number(value.binding.artifactFiles) <= 0
+  )
+    throw preflightError(
+      "original money maintenance dispatch custody differs from its full command",
+    );
+  const dispatchDigest = maintenanceDigest(JSON.stringify(value));
+  if (terminal === null) {
+    assertCustodyUnchanged();
+    return {
+      dispatchDigest,
+      binding: value.binding,
+      result: null,
+      resultDigest: null,
+      terminalDigest: null,
+    };
+  }
+  const end = terminal.value;
+  if (
+    !maintenanceRecord(end) ||
+    !maintenanceKeys(end, ["kind", "dispatchDigest", "result", "resultDigest"]) ||
+    end.kind !== "takoserver.original-money-maintenance-publication-terminal@v1" ||
+    end.dispatchDigest !== dispatchDigest ||
+    !maintenanceRecord(end.result) ||
+    end.result.kind !== ORIGINAL_MONEY_MAINTENANCE_RESULT ||
+    end.result.maintenanceOnly !== true ||
+    end.result.normalHostReady !== false ||
+    end.result.runtimeSigningAndSecrets !== "not-qualified-maintenance-unused" ||
+    end.result.originalCreateTerminalCustodyDigest !== originalCreateTerminalCustodyDigest ||
+    end.result.bundleDigest !== value.binding.moduleDigest ||
+    end.result.artifactDigest !== value.binding.artifactDigest ||
+    end.result.artifactBytes !== value.binding.artifactBytes ||
+    end.result.artifactFiles !== value.binding.artifactFiles ||
+    end.result.commit !== sourceCommit ||
+    end.resultDigest !== maintenanceDigest(JSON.stringify(end.result))
+  )
+    throw preflightError(
+      "original money maintenance terminal custody is partial or differs from dispatch",
+    );
+  assertCustodyUnchanged();
+  return {
+    dispatchDigest,
+    binding: value.binding,
+    result: end.result,
+    resultDigest: end.resultDigest,
+    terminalDigest: maintenanceDigest(JSON.stringify(end)),
+  };
+}
+
+/** Historical DATA only. The Money owner separately proves native original and current Version/source. */
+export function readIntegrationMoneyMaintenancePublicationOriginal(
+  originalCreate: IntegrationStorageOriginalCreateOptions,
+  target: DeployTarget,
+  sourceCommit: string,
+  originalCreateTerminalCustodyDigest: string,
+) {
+  return readOriginalMaintenanceCustody(
+    originalCreate,
+    target,
+    sourceCommit,
+    originalCreateTerminalCustodyDigest,
+  );
+}
+
+function maintenanceDirectoryPin(path: string): string {
+  maintenancePrivateDirectory(path);
+  const status = lstatSync(path);
+  return [status.dev, status.ino, status.uid, status.gid, status.mode].join(":");
+}
+
+function writeOriginalMaintenanceCustody(
+  path: string,
+  value: unknown,
+  expectedDirectoryPin: string,
+): void {
+  const root = dirname(path);
+  if (maintenanceDirectoryPin(root) !== expectedDirectoryPin)
+    throw preflightError("original money maintenance publication directory identity changed");
+  const directoryFd = openSync(
+    root,
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    const held = fstatSync(directoryFd);
+    if ([held.dev, held.ino, held.uid, held.gid, held.mode].join(":") !== expectedDirectoryPin)
+      throw preflightError(
+        "original money maintenance named and held publication directories differ",
+      );
+    const fd = openSync(
+      path,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      writeFileSync(fd, `${JSON.stringify(value)}\n`);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    if (maintenanceDirectoryPin(root) !== expectedDirectoryPin)
+      throw preflightError("original money maintenance publication directory changed during write");
+    fsyncSync(directoryFd);
+  } finally {
+    closeSync(directoryFd);
+  }
+}
+
+async function captureOriginalMoneyMaintenance(
+  invocation: IntegrationWorkerBootstrapInvocation,
+  selectedTarget: DeployTarget,
+  options: IntegrationWorkerBootstrapOptions,
+) {
+  const descriptor = Object.getOwnPropertyDescriptor(options, "originalMoneyMaintenance");
+  if (descriptor === undefined) return undefined;
+  if (
+    !("value" in descriptor) ||
+    !descriptor.enumerable ||
+    (Object.getPrototypeOf(options) !== Object.prototype &&
+      Object.getPrototypeOf(options) !== null) ||
+    Object.getOwnPropertyNames(options).join(",") !== "originalMoneyMaintenance" ||
+    Object.getOwnPropertySymbols(options).length !== 0
+  )
+    throw preflightError(
+      "original money maintenance accepts only original locator selection, no injected ports",
+    );
+  const locators = maintenanceData(descriptor.value);
+  if (
+    !maintenanceRecord(locators) ||
+    !maintenanceKeys(locators, ["originalCreateInputPath", "selectionPath"]) ||
+    typeof locators.originalCreateInputPath !== "string" ||
+    typeof locators.selectionPath !== "string"
+  )
+    throw preflightError("original money maintenance requires only two protected locator paths");
+  const target = parseDeployTarget(
+    maintenanceData(selectedTarget),
+    "original money maintenance target",
+    "integration",
+    "money-original-maintenance-bootstrap",
+  );
+  if (target.schemaMaintenanceMode !== ORIGINAL_MONEY_MAINTENANCE_MODE)
+    throw preflightError("original money maintenance cannot publish normal Host code");
+  const input = maintenanceProtectedInput(locators.selectionPath);
+  const originalInput = maintenanceProtectedInput(locators.originalCreateInputPath);
+  if (!input || !originalInput)
+    throw preflightError("original money maintenance locator input is unavailable");
+  const value = input.value;
+  if (
+    !maintenanceRecord(value) ||
+    !maintenanceKeys(value, ["kind", "originalOrigin"]) ||
+    value.kind !== "takoserver.integration-money-maintenance-original-selection@v1" ||
+    !maintenanceRecord(value.originalOrigin) ||
+    !maintenanceKeys(value.originalOrigin, ["invocation", "originalTargetPath"]) ||
+    !maintenanceRecord(value.originalOrigin.invocation) ||
+    !maintenanceKeys(value.originalOrigin.invocation, [
+      "action",
+      "environment",
+      "commit",
+      "generation",
+      "namespace",
+      "freshLineage",
+    ]) ||
+    typeof value.originalOrigin.originalTargetPath !== "string"
+  )
+    throw preflightError(
+      "original money maintenance selection requires the exact original six-field invocation",
+    );
+  const selected = value.originalOrigin.invocation;
+  if (
+    selected.action !== "apply" ||
+    selected.environment !== "integration" ||
+    selected.namespace !== "integration-ts" ||
+    selected.freshLineage !== "v2-0092" ||
+    !COMMIT.test(String(selected.commit)) ||
+    !/^[0-9a-f]{32}$/u.test(String(selected.generation))
+  )
+    throw preflightError("original money maintenance selection differs from fresh92 creation");
+  const originalTargetInput = maintenanceProtectedInput(value.originalOrigin.originalTargetPath);
+  if (!originalTargetInput) throw preflightError("original money collision target is unavailable");
+  const originalTarget = parseDeployTarget(
+    originalTargetInput.value,
+    "original money collision target",
+    "integration",
+  );
+  const originalInvocation = maintenanceData(
+    selected,
+  ) as unknown as IntegrationStorageGenerationInvocation;
+  const originalCreate = loadIntegrationStorageOriginalCreateInput(
+    locators.originalCreateInputPath,
+  );
+  const assertLocators = () => {
+    input.assertUnchanged();
+    originalInput.assertUnchanged();
+    originalTargetInput.assertUnchanged();
+  };
+  // No dependency or caller proof port enters this native original reader.
+  const readOrigin = async () => {
+    assertLocators();
+    const observed = await verifyIntegrationStorageOriginalCreate(
+      originalInvocation,
+      originalTarget,
+      target,
+      { originalCreate },
+    );
+    assertLocators();
+    if (
+      observed.qualification !== "independent-origin-review-required" ||
+      observed.originalCreate.authority !== "provider-native" ||
+      observed.nativeReadback.authority !== "provider-native"
+    )
+      throw preflightError("original money maintenance requires genuine native original92 custody");
+    return observed;
+  };
+  const origin = await readOrigin();
+  const retained = JSON.stringify(origin);
+  const originalDigest = origin.originalCreate.terminalCustodyDigest;
+  const readCustody = () =>
+    readOriginalMaintenanceCustody(originalCreate, target, invocation.commit, originalDigest);
+  // A retained dispatch is never a new publication permission, even after positive native absence.
+  if (invocation.action === "apply" && readCustody() !== null)
+    throw mutationError(
+      "original money maintenance already has publication custody; use original status only, never resend",
+    );
+  let dispatchDigest: string | undefined;
+  let publicationDirectoryPin: string | undefined;
+  const assertPublication = () => {
+    if (
+      publicationDirectoryPin !== undefined &&
+      maintenanceDirectoryPin(originalMaintenanceCustodyRoot(originalCreate)) !==
+        publicationDirectoryPin
+    )
+      throw preflightError(
+        "original money maintenance publication directory changed after dispatch",
+      );
+    if (dispatchDigest !== undefined && readCustody()?.dispatchDigest !== dispatchDigest)
+      throw preflightError("original money maintenance original dispatch changed after capture");
+  };
+  return {
+    target,
+    locators: Object.freeze({
+      originalCreateInputPath: locators.originalCreateInputPath,
+      selectionPath: locators.selectionPath,
+    }),
+    originalCreateTerminalCustodyDigest: originalDigest,
+    readCustody,
+    async assertCurrent() {
+      assertPublication();
+      if (JSON.stringify(await readOrigin()) !== retained)
+        throw preflightError("original money maintenance native original identity changed");
+      assertPublication();
+    },
+    dispatch(
+      binding: Omit<
+        OriginalMaintenancePublicationBinding,
+        "originalCreateTerminalCustodyDigest" | "targetDigest" | "sourceCommit" | "writerEpoch"
+      >,
+    ) {
+      assertLocators();
+      if (readCustody() !== null)
+        throw mutationError("original money maintenance dispatch already exists; do not resend");
+      const root = originalMaintenanceCustodyRoot(originalCreate);
+      try {
+        mkdirSync(root, { mode: 0o700 });
+        const parentFd = openSync(
+          dirname(root),
+          constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+        );
+        try {
+          fsyncSync(parentFd);
+        } finally {
+          closeSync(parentFd);
+        }
+      } catch {
+        throw mutationError(
+          "original money maintenance publication custody already exists or cannot be created; no retry",
+        );
+      }
+      publicationDirectoryPin = maintenanceDirectoryPin(root);
+      if (readdirSync(root).length !== 0)
+        throw mutationError("original money maintenance new publication directory is not empty");
+      const value = {
+        kind: "takoserver.original-money-maintenance-publication-dispatch@v1",
+        binding: {
+          originalCreateTerminalCustodyDigest: originalDigest,
+          targetDigest: maintenanceTargetDigest(target),
+          sourceCommit: invocation.commit,
+          writerEpoch: target.moneyCutoverWriterEpoch,
+          ...binding,
+        },
+      };
+      const record = { ...value, bindingDigest: maintenanceDigest(JSON.stringify(value.binding)) };
+      writeOriginalMaintenanceCustody(join(root, "dispatch.json"), record, publicationDirectoryPin);
+      dispatchDigest = maintenanceDigest(JSON.stringify(record));
+    },
+    terminal(result: Record<string, unknown>) {
+      assertLocators();
+      assertPublication();
+      if (
+        !dispatchDigest ||
+        !publicationDirectoryPin ||
+        readCustody()?.dispatchDigest !== dispatchDigest
+      )
+        throw verificationError(
+          "original money maintenance dispatch custody changed before terminal",
+        );
+      const value = {
+        kind: "takoserver.original-money-maintenance-publication-terminal@v1",
+        dispatchDigest,
+        result,
+        resultDigest: maintenanceDigest(JSON.stringify(result)),
+      };
+      writeOriginalMaintenanceCustody(
+        join(originalMaintenanceCustodyRoot(originalCreate), "terminal.json"),
+        value,
+        publicationDirectoryPin,
+      );
+      return {
+        originalMaintenanceDispatchDigest: dispatchDigest,
+        originalMaintenanceTerminalCustodyDigest: maintenanceDigest(JSON.stringify(value)),
+        originalMaintenanceResultDigest: value.resultDigest,
+      };
+    },
+  };
 }
 
 type MigrationArtifact = ReturnType<typeof readAuditedMigrationArtifact>;
@@ -241,8 +832,36 @@ export async function runIntegrationWorkerBootstrap(
   target: DeployTarget,
   options: IntegrationWorkerBootstrapOptions = {},
 ): Promise<Record<string, unknown>> {
+  const originalDescriptor = Object.getOwnPropertyDescriptor(options, "originalMoneyMaintenance");
+  if (originalDescriptor !== undefined) {
+    target = maintenanceData(target) as unknown as DeployTarget;
+    invocation = maintenanceData(invocation) as unknown as IntegrationWorkerBootstrapInvocation;
+  }
   validateInvocation(invocation, target);
+  const originalMaintenance =
+    originalDescriptor === undefined
+      ? undefined
+      : await captureOriginalMoneyMaintenance(invocation, target, options);
+  if (originalMaintenance !== undefined) {
+    target = originalMaintenance.target;
+    // Never consult a caller's option object, prototype or Proxy after original capture.
+    options = Object.freeze({ originalMoneyMaintenance: originalMaintenance.locators });
+  }
   const run = options.run ?? runCommand;
+  const assertOriginalPublicationSource = async () => {
+    if (originalMaintenance !== undefined) {
+      const current = await qualifySource({
+        environment: "integration",
+        commit: invocation.commit,
+        run,
+      });
+      if (current.dirty) {
+        throw preflightError(
+          "original money maintenance publication requires the exact clean source commit",
+        );
+      }
+    }
+  };
   const resolveCredential = async () =>
     await resolveCloudflareCredential("integration", {
       cloudflareEnvironment: options.cloudflareEnvironment,
@@ -266,6 +885,22 @@ export async function runIntegrationWorkerBootstrap(
   // all four exhaustive native inventories prove exact absence.
   const initial = await readNativePresence("preflight", target, state);
   if (invocation.action === "status" && initial.absent) {
+    if (originalMaintenance !== undefined) {
+      await originalMaintenance.assertCurrent();
+      return {
+        ...statusResult(invocation, target, initial),
+        state:
+          originalMaintenance.readCustody() === null
+            ? "not_published"
+            : "original_publication_outcome_unknown",
+        ready: false,
+        normalHostReady: false,
+        maintenanceOnly: true,
+        originalCreateTerminalCustodyDigest:
+          originalMaintenance.originalCreateTerminalCustodyDigest,
+        runtimeSigningAndSecrets: "not-qualified-maintenance-unused",
+      };
+    }
     if (target.takoformV2 === undefined) return statusResult(invocation, target, initial);
     let storageQualified = false;
     try {
@@ -301,10 +936,11 @@ export async function runIntegrationWorkerBootstrap(
       credential?.token,
       state,
       initial,
+      originalMaintenance,
     );
   }
 
-  await assertTargetComposes("preflight", target);
+  if (originalMaintenance === undefined) await assertTargetComposes("preflight", target);
   const accountSubdomain = await requiredAccountSubdomain("preflight", state);
   assertWorkersDevOrigin(target, accountSubdomain);
   const reviewer = exactReviewer(
@@ -335,7 +971,7 @@ export async function runIntegrationWorkerBootstrap(
     const schemaReader = resolveSchemaReader(options, inspectionConfig, target, environment, run);
     const schemaBefore = await readSchema("preflight", schemaReader);
     assertCompleteSchema(schemaBefore, artifactBefore, expectedShape);
-    assertMoneyUnitSchema(schemaBefore.applied);
+    if (originalMaintenance === undefined) assertMoneyUnitSchema(schemaBefore.applied);
     assertStripeWebhookSchema(target, schemaBefore.applied);
     assertOrgBillingSchema(target, schemaBefore.applied);
     const v2StorageBefore =
@@ -370,12 +1006,15 @@ export async function runIntegrationWorkerBootstrap(
     };
     await assertUnserved();
 
-    const provider = providerExecutorQualificationReader({
-      target,
-      ...(options.providerExecutorQualification === undefined
-        ? {}
-        : { injected: options.providerExecutorQualification }),
-    });
+    const provider =
+      originalMaintenance === undefined
+        ? providerExecutorQualificationReader({
+            target,
+            ...(options.providerExecutorQualification === undefined
+              ? {}
+              : { injected: options.providerExecutorQualification }),
+          })
+        : null;
     const providerBefore = provider === null ? null : await provider.read("preflight");
     if (providerBefore !== null && !providerBefore.ready) {
       throw preflightError(
@@ -384,15 +1023,18 @@ export async function runIntegrationWorkerBootstrap(
     }
 
     const signingDatabase =
-      options.signingDatabase ??
-      createRemoteSigningDatabase(
-        inspectionConfig,
-        environment,
-        run,
-        wranglerCommandForPath(options.wranglerPath),
-      );
-    const signingBefore = await readSigning("preflight", target, signingDatabase);
-    assertDistinctJit(target, signingBefore);
+      originalMaintenance === undefined
+        ? (options.signingDatabase ??
+          createRemoteSigningDatabase(
+            inspectionConfig,
+            environment,
+            run,
+            wranglerCommandForPath(options.wranglerPath),
+          ))
+        : null;
+    const signingBefore =
+      signingDatabase === null ? null : await readSigning("preflight", target, signingDatabase);
+    if (signingBefore !== null) assertDistinctJit(target, signingBefore);
     let r2Identity = resolveR2IdentityReader(options, target, credential?.token);
     await assertR2Identity("preflight", target, r2Identity);
 
@@ -401,11 +1043,21 @@ export async function runIntegrationWorkerBootstrap(
       commit: invocation.commit,
       run,
     });
-    const expectedSecrets = expectedWorkerSecrets(target);
+    if (originalMaintenance !== undefined && source.dirty) {
+      throw preflightError(
+        "original money maintenance publication requires the exact clean source commit",
+      );
+    }
+    const expectedSecrets = originalMaintenance === undefined ? expectedWorkerSecrets(target) : [];
     const secretDirectory =
-      options.secretDirectory ?? requireEnvironment(CLOSURE_SECRET_DIRECTORY_ENV);
+      originalMaintenance === undefined
+        ? (options.secretDirectory ?? requireEnvironment(CLOSURE_SECRET_DIRECTORY_ENV))
+        : undefined;
     const readQualifiedSecretInputs = async (): Promise<Readonly<Record<string, string>>> => {
-      if (target.edgeSupplies !== undefined) {
+      if (originalMaintenance !== undefined) return Object.freeze({});
+      if (secretDirectory === undefined || signingBefore === null)
+        throw preflightError("normal Worker signing and secret qualification are unavailable");
+      if (target.edgeSupplies !== undefined && originalMaintenance === undefined) {
         if (options.expectedRuntimeInputSealKeyring === undefined) {
           throw preflightError("runtime input seal keyring qualification is unavailable");
         }
@@ -425,7 +1077,7 @@ export async function runIntegrationWorkerBootstrap(
       if (privateRaw !== values.TAKOSERVER_SIGNING_KEY) {
         throw preflightError("active runtime signing private key changed during qualification");
       }
-      if (target.edgeSupplies !== undefined) {
+      if (target.edgeSupplies !== undefined && originalMaintenance === undefined) {
         const localKeyring = values.TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING;
         if (localKeyring === undefined || options.expectedRuntimeInputSealKeyring === undefined) {
           throw preflightError("runtime input seal keyring input is unavailable");
@@ -453,6 +1105,7 @@ export async function runIntegrationWorkerBootstrap(
     // bootstrap gate. The read after the gate stays the authoritative one.
     await readQualifiedSecretInputs();
     await checkedGate(run);
+    await assertOriginalPublicationSource();
     // The owner gate can outlive a Wrangler OAuth access token (about one hour;
     // Wrangler refreshes only an already expired token). No Cloudflare read or
     // write after the gate reuses a bearer resolved before it.
@@ -460,6 +1113,7 @@ export async function runIntegrationWorkerBootstrap(
     state = createState(gatedCredential);
     r2Identity = resolveR2IdentityReader(options, target, gatedCredential.token);
 
+    await originalMaintenance?.assertCurrent();
     const secretValues = await readQualifiedSecretInputs();
 
     const prepared = await prepareBootstrapArtifact(
@@ -470,22 +1124,27 @@ export async function runIntegrationWorkerBootstrap(
       run,
       options.wranglerPath,
       secretValues,
+      originalMaintenance !== undefined,
     );
-    secretsRoot = mkdtempSync(join(tmpdir(), "takoserver-integration-worker-secrets-"));
-    mkdirSync(secretsRoot, { recursive: true, mode: 0o700 });
-    const secretsFile = join(secretsRoot, "secrets.json");
-    // Register the path before writing so even a partially-created file is
-    // attempted during the independent cleanup pass below.
-    secretsPath = secretsFile;
-    writeFileSync(secretsFile, `${JSON.stringify(secretValues)}\n`, { mode: 0o600 });
-    assertPrivateSecretFile(secretsFile);
-    const secretSeal = sealDirectory(secretsRoot, ["secrets.json"]);
-    assertSecretSeal("preflight", secretSeal);
+    let secretSeal: SealedArtifact | null = null;
+    if (originalMaintenance === undefined) {
+      secretsRoot = mkdtempSync(join(tmpdir(), "takoserver-integration-worker-secrets-"));
+      mkdirSync(secretsRoot, { recursive: true, mode: 0o700 });
+      const secretsFile = join(secretsRoot, "secrets.json");
+      // Register the path before writing so even a partially-created file is
+      // attempted during the independent cleanup pass below.
+      secretsPath = secretsFile;
+      writeFileSync(secretsFile, `${JSON.stringify(secretValues)}\n`, { mode: 0o600 });
+      assertPrivateSecretFile(secretsFile);
+      secretSeal = sealDirectory(secretsRoot, ["secrets.json"]);
+      assertSecretSeal("preflight", secretSeal);
+    }
     // The public artifact identity deliberately excludes the private secrets
     // file. Its seal is checked in-memory but its digest/size never leave this
     // function, so result identities cannot be influenced by secret bytes.
     const artifact = prepared.seal();
     artifact.assertUnchanged();
+    await assertOriginalPublicationSource();
 
     const afterBuild = await readNativePresence("preflight", target, state);
     if (!afterBuild.absent) {
@@ -498,9 +1157,11 @@ export async function runIntegrationWorkerBootstrap(
     const schemaAfterBuild = await readSchema("preflight", schemaReader);
     assertCompleteSchema(schemaAfterBuild, artifactAfterBuild, expectedShape);
     assertSameSchema(schemaBefore, schemaAfterBuild);
-    const signingAfterBuild = await readSigning("preflight", target, signingDatabase);
-    assertSameSigning(signingBefore, signingAfterBuild);
-    assertDistinctJit(target, signingAfterBuild);
+    if (signingDatabase !== null && signingBefore !== null) {
+      const signingAfterBuild = await readSigning("preflight", target, signingDatabase);
+      assertSameSigning(signingBefore, signingAfterBuild);
+      assertDistinctJit(target, signingAfterBuild);
+    }
     await assertR2Identity("preflight", target, r2Identity);
     const providerAfterBuild = provider === null ? null : await provider.read("preflight");
     if (providerBefore !== null && providerAfterBuild !== null) {
@@ -517,6 +1178,14 @@ export async function runIntegrationWorkerBootstrap(
           : { root: options.publicationLeaseRoot }),
       }));
     const lifecycle = options.deployLifecycle ?? deployWranglerLifecycleChange;
+    await originalMaintenance?.assertCurrent();
+    await assertOriginalPublicationSource();
+    originalMaintenance?.dispatch({
+      moduleDigest: `sha256:${prepared.bundleDigestHex}`,
+      artifactDigest: artifact.digest,
+      artifactBytes: artifact.bytes,
+      artifactFiles: artifact.files,
+    });
     mutationStarted = true;
     const publication = await lifecycle({
       root,
@@ -526,11 +1195,12 @@ export async function runIntegrationWorkerBootstrap(
       workerName: target.workerName,
       message: `takoserver-worker:${source.commit}:${prepared.bundleDigestHex}`,
       lease,
-      secretsFilePath: secretsPath,
+      ...(secretsPath === null ? {} : { secretsFilePath: secretsPath }),
       environment,
       run,
       ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
       assertCurrentStillExpected: async () => {
+        await originalMaintenance?.assertCurrent();
         const current = await readNativePresence("preflight", target, state);
         if (!current.absent) {
           throw preflightError(
@@ -542,9 +1212,11 @@ export async function runIntegrationWorkerBootstrap(
         const schemaFinal = await readSchema("preflight", schemaReader);
         assertCompleteSchema(schemaFinal, localFinal, expectedShape);
         assertSameSchema(schemaBefore, schemaFinal);
-        const signingFinal = await readSigning("preflight", target, signingDatabase);
-        assertSameSigning(signingBefore, signingFinal);
-        assertDistinctJit(target, signingFinal);
+        if (signingDatabase !== null && signingBefore !== null) {
+          const signingFinal = await readSigning("preflight", target, signingDatabase);
+          assertSameSigning(signingBefore, signingFinal);
+          assertDistinctJit(target, signingFinal);
+        }
         await assertR2Identity("preflight", target, r2Identity);
         if (v2StorageBefore !== null) {
           const storageFinal = await readV2StorageProof(target, options);
@@ -555,13 +1227,14 @@ export async function runIntegrationWorkerBootstrap(
         if (providerBefore !== null && providerFinal !== null) {
           assertProviderExecutorUnchanged(providerBefore, providerFinal);
         }
-        assertSecretSeal("preflight", secretSeal);
+        if (secretSeal !== null) assertSecretSeal("preflight", secretSeal);
         artifact.assertUnchanged();
+        await assertOriginalPublicationSource();
       },
     } satisfies LifecycleInput);
 
     try {
-      assertSecretSeal("verification", secretSeal);
+      if (secretSeal !== null) assertSecretSeal("verification", secretSeal);
       result = await verifyBootstrap({
         invocation,
         target,
@@ -583,6 +1256,7 @@ export async function runIntegrationWorkerBootstrap(
         reviewer,
         provider,
         providerBefore,
+        originalMaintenance,
       });
     } catch (error) {
       throw postPublicationVerificationError(error);
@@ -643,6 +1317,53 @@ export async function runIntegrationWorkerBootstrap(
   if (result === undefined) {
     throw preflightError("integration Worker bootstrap produced no result");
   }
+  if (originalMaintenance !== undefined) {
+    await assertOriginalPublicationSource();
+    await originalMaintenance.assertCurrent();
+    const current = await readNativePresence("verification", target, state);
+    if (
+      current.history === null ||
+      current.chain.length !== 1 ||
+      current.history.versionId !== result.versionId ||
+      current.history.deploymentId !== result.deploymentId ||
+      typeof result.bundleDigest !== "string" ||
+      !SHA256.test(result.bundleDigest)
+    )
+      throw verificationError(
+        "original money maintenance native publication changed after cleanup",
+      );
+    const version = await readVersionWithModules(
+      state,
+      target.workerName,
+      current.history.versionId,
+    );
+    await inspectVersion(
+      "verification",
+      target,
+      state,
+      current.history,
+      version,
+      invocation.commit,
+      target.signing.currentKeyId,
+      result.bundleDigest.slice(7),
+      true,
+    );
+    await probeSchemaMaintenance(
+      target.publicOrigin,
+      (url, init) => fetch(url, init),
+      ORIGINAL_MONEY_MAINTENANCE_MODE,
+    );
+    await originalMaintenance.assertCurrent();
+    const after = await readNativePresence("verification", target, state);
+    if (
+      after.history?.versionId !== current.history.versionId ||
+      after.history.deploymentId !== current.history.deploymentId ||
+      after.chain.length !== 1
+    )
+      throw verificationError("original money maintenance Version changed after cleanup probe");
+    await assertOriginalPublicationSource();
+    result = { ...result, ...originalMaintenance.terminal(result) };
+  }
   return result;
 }
 
@@ -655,6 +1376,7 @@ async function statusExisting(
   cloudflareToken: string | undefined,
   state: IntegrationWorkerBootstrapState,
   initial: NativePresence,
+  originalMaintenance?: Awaited<ReturnType<typeof captureOriginalMoneyMaintenance>>,
 ): Promise<Record<string, unknown>> {
   const temporary = options.outputDirectory === undefined;
   const root =
@@ -669,23 +1391,29 @@ async function statusExisting(
     const schemaReader = resolveSchemaReader(options, config, target, environment, run);
     const schema = await readSchema("preflight", schemaReader);
     assertCompleteSchema(schema, artifact, expectedShape);
-    const provider = providerExecutorQualificationReader({
-      target,
-      ...(options.providerExecutorQualification === undefined
-        ? {}
-        : { injected: options.providerExecutorQualification }),
-    });
+    const provider =
+      originalMaintenance === undefined
+        ? providerExecutorQualificationReader({
+            target,
+            ...(options.providerExecutorQualification === undefined
+              ? {}
+              : { injected: options.providerExecutorQualification }),
+          })
+        : null;
     const providerInspection = provider === null ? null : await provider.read("preflight");
     const signingDatabase =
-      options.signingDatabase ??
-      createRemoteSigningDatabase(
-        config,
-        environment,
-        run,
-        wranglerCommandForPath(options.wranglerPath),
-      );
-    const signing = await readSigning("preflight", target, signingDatabase);
-    assertDistinctJit(target, signing);
+      originalMaintenance === undefined
+        ? (options.signingDatabase ??
+          createRemoteSigningDatabase(
+            config,
+            environment,
+            run,
+            wranglerCommandForPath(options.wranglerPath),
+          ))
+        : null;
+    const signing =
+      signingDatabase === null ? null : await readSigning("preflight", target, signingDatabase);
+    if (signing !== null) assertDistinctJit(target, signing);
     const r2Identity = resolveR2IdentityReader(options, target, cloudflareToken);
     await assertR2Identity("preflight", target, r2Identity);
     if (target.takoformV2 !== undefined) await readV2StorageProof(target, options);
@@ -701,17 +1429,51 @@ async function statusExisting(
       history,
       version,
       invocation.commit,
-      signing.keyId,
+      signing?.keyId ?? target.signing.currentKeyId,
+      undefined,
+      originalMaintenance !== undefined,
     );
     await assertWorkerSchedules("preflight", target, state, expectedSchedules);
+    await originalMaintenance?.assertCurrent();
+    const maintenanceProbe =
+      originalMaintenance === undefined
+        ? null
+        : await probeSchemaMaintenance(
+            target.publicOrigin,
+            (url, init) => fetch(url, init),
+            ORIGINAL_MONEY_MAINTENANCE_MODE,
+          );
+    const originalCustody = originalMaintenance?.readCustody();
     const ready =
+      originalMaintenance === undefined &&
       identity.commit === invocation.commit &&
       moneyUnitSchemaReady(schema.applied) &&
       orgBillingSchemaReady(target, schema.applied) &&
       (providerInspection === null || providerInspection.ready);
     return {
       ...statusResult(invocation, target, initial),
-      state: ready ? "complete" : "drift",
+      state:
+        originalMaintenance === undefined
+          ? ready
+            ? "complete"
+            : "drift"
+          : originalCustody === null
+            ? "unbound_maintenance_publication"
+            : "maintenance_observed_original_custody_held",
+      ...(originalMaintenance === undefined
+        ? {}
+        : {
+            maintenanceOnly: true,
+            normalHostReady: false,
+            maintenanceProbe,
+            runtimeSigningAndSecrets: "not-qualified-maintenance-unused",
+            originalPublicationCustody:
+              originalCustody === null
+                ? "absent"
+                : originalCustody?.result === null
+                  ? "unknown"
+                  : "terminal",
+          }),
       deployedCommit: identity.commit,
       artifactDigest: `sha256:${identity.bundleDigestHex}`,
       appliedMigrations: schema.applied,
@@ -793,14 +1555,15 @@ async function verifyBootstrap(input: {
   readonly artifactBefore: MigrationArtifact;
   readonly v2StorageBefore: FreshV2IntegrationStorageTargetProof | null;
   readonly expectedShape: string;
-  readonly signingDatabase: Pick<SigningDatabase, "readKey">;
-  readonly signingBefore: SigningEvidence;
+  readonly signingDatabase: Pick<SigningDatabase, "readKey"> | null;
+  readonly signingBefore: SigningEvidence | null;
   readonly schemaReader: IntegrationWorkerBootstrapSchemaReader;
   readonly r2Identity: IntegrationWorkerBootstrapR2IdentityReader;
   readonly expectedSchedules: readonly string[];
   readonly reviewer: string;
   readonly provider: WorkerProviderExecutorQualification | null;
   readonly providerBefore: ProviderExecutorInspection | null;
+  readonly originalMaintenance?: Awaited<ReturnType<typeof captureOriginalMoneyMaintenance>>;
 }): Promise<Record<string, unknown>> {
   const after = await readNativePresence("verification", input.target, input.state);
   if (after.absent || after.history === null || after.chain.length !== 1) {
@@ -829,8 +1592,9 @@ async function verifyBootstrap(input: {
     after.history,
     version,
     input.source.commit,
-    input.signingBefore.keyId,
+    input.signingBefore?.keyId ?? input.target.signing.currentKeyId,
     input.prepared.bundleDigestHex,
+    input.originalMaintenance !== undefined,
   );
   const artifactAfter = readBootstrapArtifact(
     resolve(input.options.sourceRepositoryRoot ?? REPOSITORY),
@@ -840,9 +1604,13 @@ async function verifyBootstrap(input: {
   const schemaAfter = await readSchema("verification", input.schemaReader);
   assertCompleteSchema(schemaAfter, artifactAfter, input.expectedShape, "verification");
   assertSameSchema(input.schemaBefore, schemaAfter, "verification");
-  const signingAfter = await readSigning("verification", input.target, input.signingDatabase);
-  assertSameSigning(input.signingBefore, signingAfter, "verification");
-  assertDistinctJit(input.target, signingAfter, "verification");
+  if (input.originalMaintenance === undefined) {
+    if (input.signingDatabase === null || input.signingBefore === null)
+      throw verificationError("normal Worker signing qualification is unavailable");
+    const signingAfter = await readSigning("verification", input.target, input.signingDatabase);
+    assertSameSigning(input.signingBefore, signingAfter, "verification");
+    assertDistinctJit(input.target, signingAfter, "verification");
+  }
   await assertR2Identity("verification", input.target, input.r2Identity);
   if (input.v2StorageBefore !== null) {
     const storageAfter = await readV2StorageProof(input.target, input.options);
@@ -853,12 +1621,43 @@ async function verifyBootstrap(input: {
   if (input.providerBefore !== null && providerAfter !== null) {
     assertProviderExecutorUnchanged(input.providerBefore, providerAfter, "verification");
   }
-  const probe = await probeProduct(
-    input.target.publicOrigin,
-    input.options.fetcher ?? ((url, init) => fetch(url, init)),
-  );
+  await input.originalMaintenance?.assertCurrent();
+  const probe =
+    input.originalMaintenance === undefined
+      ? await probeProduct(
+          input.target.publicOrigin,
+          input.options.fetcher ?? ((url, init) => fetch(url, init)),
+        )
+      : await probeSchemaMaintenance(
+          input.target.publicOrigin,
+          (url, init) => fetch(url, init),
+          ORIGINAL_MONEY_MAINTENANCE_MODE,
+        );
+  if (input.originalMaintenance !== undefined) {
+    const final = await readNativePresence("verification", input.target, input.state);
+    if (
+      final.history?.versionId !== after.history.versionId ||
+      final.history.deploymentId !== after.history.deploymentId ||
+      final.chain.length !== 1
+    )
+      throw verificationError("original money maintenance Version changed after503 readback");
+    await input.originalMaintenance.assertCurrent();
+  }
   return {
-    kind: "takoserver.integration-worker-bootstrap-apply@v1",
+    kind:
+      input.originalMaintenance === undefined
+        ? "takoserver.integration-worker-bootstrap-apply@v1"
+        : ORIGINAL_MONEY_MAINTENANCE_RESULT,
+    ...(input.originalMaintenance === undefined
+      ? {}
+      : {
+          maintenanceOnly: true,
+          normalHostReady: false,
+          originalCreateTerminalCustodyDigest:
+            input.originalMaintenance.originalCreateTerminalCustodyDigest,
+          oldWritersAndExternalEffects: "not-qualified-here",
+          runtimeSigningAndSecrets: "not-qualified-maintenance-unused",
+        }),
     surface: INTEGRATION_WORKER_BOOTSTRAP_SURFACE,
     environment: "integration",
     commit: input.source.commit,
@@ -906,6 +1705,7 @@ async function inspectVersion(
   selectedCommit: string,
   signingKeyId: string,
   expectedBundleDigestHex?: string,
+  maintenanceOnly = false,
 ): Promise<{ readonly commit: string; readonly bundleDigestHex: string }> {
   if (workerVersionAnnotationProfile(version) !== "canonical") {
     throw phaseError(phase, "Worker Version has a non-canonical annotation inventory");
@@ -937,13 +1737,14 @@ async function inspectVersion(
     bindingProjection,
     expectedExactBindingClosure(target, {
       signingKeyId,
+      ...(maintenanceOnly ? { expectedSecrets: [] } : {}),
       ...(authorityProfile === undefined ? {} : { authorityProfile }),
       workerArtifactDigest: `sha256:${identity.bundleDigestHex}` as const,
     }),
   );
   assertExactSecretInventory(
     await state.workerSecrets(target.workerName),
-    expectedWorkerSecrets(target),
+    maintenanceOnly ? [] : expectedWorkerSecrets(target),
     phase,
   );
   await assertLiveWorkerRoutingClosure(phase, target, state);
@@ -967,6 +1768,7 @@ async function prepareBootstrapArtifact(
   run: WorkerProcess,
   wranglerPath: string | undefined,
   secretValues: Readonly<Record<string, string>>,
+  maintenanceOnly = false,
 ): Promise<PreparedWorkerArtifact> {
   const buildRun: WorkerProcess = async (command, input = {}) => {
     const childEnvironment = input.env ?? {};
@@ -996,6 +1798,7 @@ async function prepareBootstrapArtifact(
         main,
         commit,
         sourceRepositoryRoot,
+        ...(maintenanceOnly ? { transitionExpectedSecrets: [] } : {}),
         ...(formImplementationIdentity === undefined ? {} : { formImplementationIdentity }),
         ...(bundleDigestHex === undefined
           ? {}
@@ -1279,6 +2082,9 @@ async function readV2StorageProof(
         ? {}
         : { cloudflareEnvironment: options.cloudflareEnvironment }),
       ...options.v2StorageVerification,
+      ...(options.originalMoneyMaintenance === undefined
+        ? {}
+        : { allowMoneyUnitMaintenance: true }),
       migrationDirectory: resolve(options.sourceRepositoryRoot ?? REPOSITORY, "migrations"),
     },
   );

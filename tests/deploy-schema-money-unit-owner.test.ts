@@ -2333,3 +2333,42 @@ describe("post94 retained custody component", () => {
     }
   });
 });
+
+describe("original money maintenance bootstrap publication receipt boundary", () => {
+  test("generic bootstrap output cannot be relabelled as an authority-cutover publication", async () => {
+    const f = fixture();
+    const receipt = JSON.parse(readFileSync(f.paths.maintenancePublication, "utf8"));
+    const receiptDigest = f.write(f.paths.maintenancePublication, {
+      ...receipt,
+      surface: "takoserver-integration-worker-bootstrap",
+      resultKind: "takoserver.integration-worker-bootstrap-apply@v1",
+    });
+    f.write(f.paths.declaration, {
+      ...f.declaration,
+      maintenancePublicationReceiptDigest: receiptDigest,
+    });
+    await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, target, f)).rejects.toThrow(
+      "publication evidence",
+    );
+  });
+
+  test("a JSON original-maintenance receipt cannot enter through a legacy or injected owner", async () => {
+    const f = fixture();
+    const receipt = JSON.parse(readFileSync(f.paths.maintenancePublication, "utf8"));
+    const receiptDigest = f.write(f.paths.maintenancePublication, {
+      ...receipt,
+      surface: "takoserver-integration-worker-bootstrap",
+      resultKind: "takoserver.integration-worker-bootstrap-original-money-maintenance-apply@v1",
+      originalCreateTerminalCustodyDigest: sha("unqualified original"),
+      originalMaintenanceDispatchDigest: sha("unqualified dispatch"),
+      originalMaintenanceTerminalCustodyDigest: sha("unqualified terminal"),
+    });
+    f.write(f.paths.declaration, {
+      ...f.declaration,
+      maintenancePublicationReceiptDigest: receiptDigest,
+    });
+    await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, target, f)).rejects.toThrow(
+      "publication evidence",
+    );
+  });
+});
