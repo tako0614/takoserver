@@ -280,6 +280,13 @@ function processorReads() {
         paths.push(url.pathname);
         if (url.pathname === "/v1/account")
           return Response.json({ id: ACCOUNT, object: "account" });
+        if (url.pathname === "/v1/checkout/sessions" && url.search === "?limit=100&status=complete")
+          return Response.json({
+            object: "list",
+            url: "/v1/checkout/sessions",
+            data: [],
+            has_more: false,
+          });
         const plan = compiled.plans.find(
           (item) => url.pathname === `/v1/prices/${item.stripePriceId}`,
         );
@@ -628,6 +635,7 @@ describe("post-graph shared-auth request observation", () => {
         }),
       ]);
       expect(settled).toBe(false);
+      expect(processor.paths).not.toContain("/v1/checkout/sessions");
       expect(await f.sql.query("SELECT COUNT(*) AS n FROM shared_auth_attempts")).toEqual([
         { n: 0 },
       ]);
@@ -642,6 +650,7 @@ describe("post-graph shared-auth request observation", () => {
         ).status,
       ).toBe(303);
       await entry.scheduled({}, f.env);
+      expect(processor.paths.filter((path) => path === "/v1/checkout/sessions")).toHaveLength(1);
       expect(requests).toHaveLength(3);
       expect(f.sessions).toHaveLength(3);
       expect(requests[0]?.sql).not.toBe(requests[1]?.sql);
