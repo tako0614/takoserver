@@ -762,3 +762,117 @@ test("unknown retained currentness read does not mint a fallback capture or retr
   expect(raw).not.toBeNull();
   expect(accounts.readRetainedDirectOwnerSessionCapture(raw)).toBeNull();
 });
+
+const retainedReadPhases = ["token", "class", "anchor", "currentness"] as const;
+const retainedReadPrefixes = [
+  "SELECT id, kind, principal_id",
+  "SELECT * FROM credential_authority_classes",
+  "SELECT * FROM auth_principal_incarnations",
+  "SELECT CASE WHEN ",
+] as const;
+
+for (const stage of ["before capture", "digest await", ...retainedReadPhases] as const) {
+  for (const mutation of ["getter", "replacement"] as const) {
+    test(`retained query ${mutation} during ${stage} refuses capture without another query`, async () => {
+      const f = await fixture();
+      let mode: "idle" | "control" | "fault" = "idle";
+      const controlReads: string[] = [];
+      const faultReads: string[] = [];
+      let changed = false;
+      let getterReads = 0;
+      let replacementCalls = 0;
+      let receiverChanges = 0;
+      let writes = 0;
+      const replaceQuery = () => {
+        changed = true;
+        Object.defineProperty(
+          sql,
+          "query",
+          mutation === "getter"
+            ? {
+                configurable: true,
+                get() {
+                  getterReads++;
+                  throw new Error("replacement query getter must not run");
+                },
+              }
+            : {
+                configurable: true,
+                value: async () => {
+                  replacementCalls++;
+                  throw new Error("replacement backend must not run");
+                },
+              },
+        );
+      };
+      const sql: Sql = {
+        async query(text, params) {
+          if (this !== sql) receiverChanges++;
+          const rows = await f.sql.query(text, params);
+          if (mode !== "idle") {
+            const index = retainedReadPrefixes.findIndex((prefix) => text.startsWith(prefix));
+            const phase = retainedReadPhases[index] ?? "unexpected";
+            if (mode === "control") controlReads.push(phase);
+            else {
+              faultReads.push(phase);
+              if (stage === phase) replaceQuery();
+            }
+          }
+          return rows;
+        },
+        run(text, params) {
+          if (mode !== "idle") writes++;
+          return f.sql.run(text, params);
+        },
+        batch(statements) {
+          if (mode !== "idle") writes++;
+          return f.sql.batch(statements);
+        },
+      };
+      const descriptor = Object.getOwnPropertyDescriptor(sql, "query");
+      if (!descriptor || !("value" in descriptor)) throw new Error("missing original query");
+      const accounts = candidate(f, sql);
+      const issued = await accounts.signIn(await f.input());
+      const authorization = `Bearer ${issued.sessionToken}`;
+      mode = "control";
+      const original = await accounts.captureRetainedDirectOwnerSession(authorization);
+      expect(original).not.toBeNull();
+      const originalData = accounts.readRetainedDirectOwnerSessionCapture(original);
+      expect(originalData?.record.origin.principalId).toBe(issued.principal.id);
+      expect(originalData?.record.origin.targetRef).toBe("auth103:unregistered-local-candidate");
+      expect(controlReads).toEqual([...retainedReadPhases]);
+      expect(receiverChanges).toBe(0);
+      expect(writes).toBe(0);
+
+      mode = "fault";
+      let returnedCapture = false;
+      try {
+        if (stage === "before capture") replaceQuery();
+        const pending = accounts.captureRetainedDirectOwnerSession(authorization);
+        // The digest await has started, but no storage read has started yet.
+        if (stage === "digest await") replaceQuery();
+        await expect(
+          pending.then((capture) => {
+            returnedCapture = true;
+            return capture;
+          }),
+        ).rejects.toMatchObject({ code: "invalid" });
+        expect(changed).toBe(true);
+        const lastRead = retainedReadPhases.findIndex((phase) => phase === stage);
+        expect(faultReads).toEqual(retainedReadPhases.slice(0, lastRead + 1));
+        expect(returnedCapture).toBe(false);
+        expect(getterReads).toBe(0);
+        expect(replacementCalls).toBe(0);
+        expect(receiverChanges).toBe(0);
+        expect(writes).toBe(0);
+      } finally {
+        mode = "idle";
+        Object.defineProperty(sql, "query", descriptor);
+      }
+      const raw = await accounts.captureAuthenticatedToken(authorization);
+      expect(raw).not.toBeNull();
+      expect(accounts.readRetainedDirectOwnerSessionCapture(raw)).toBeNull();
+      expect(accounts.readRetainedDirectOwnerSessionCapture(original)).toBe(originalData);
+    });
+  }
+}

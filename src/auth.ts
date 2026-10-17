@@ -978,6 +978,42 @@ function createAccountsInternal(
   const tokenCaptures = new WeakMap<object, CapturedAuthTokenRow>();
   const retainedSessionCaptures = new WeakMap<object, RetainedDirectOwnerSessionData>();
 
+  // Retained observations stay on the factory's original query and receiver.
+  // Inspect own data descriptors so replacement accessors never execute.
+  const retainedQueryDescriptor = Object.getOwnPropertyDescriptor(sql, "query");
+  const originalRetainedQuery: Sql["query"] | null =
+    retainedQueryDescriptor &&
+    "value" in retainedQueryDescriptor &&
+    typeof retainedQueryDescriptor.value === "function"
+      ? retainedQueryDescriptor.value
+      : null;
+  const requireRetainedQuery = (): Sql["query"] => {
+    assertRetainedDirectOwnerSessionReader(accounts, { sql });
+    const current = Object.getOwnPropertyDescriptor(sql, "query");
+    if (
+      !originalRetainedQuery ||
+      !current ||
+      !("value" in current) ||
+      current.value !== originalRetainedQuery
+    )
+      throw new AuthError("invalid");
+    return originalRetainedQuery;
+  };
+  const retainedSql = Object.freeze<Sql>({
+    async query(text, params) {
+      const query = requireRetainedQuery();
+      const rows: readonly Row[] = await Reflect.apply(query, sql, [text, params]);
+      requireRetainedQuery();
+      return rows;
+    },
+    async run() {
+      throw new AuthError("invalid");
+    },
+    async batch() {
+      throw new AuthError("invalid");
+    },
+  });
+
   const readCurrentToken = async (
     authorization: string | null,
   ): Promise<{
@@ -1596,14 +1632,25 @@ function createAccountsInternal(
     },
 
     async captureRetainedDirectOwnerSession(authorization) {
-      assertRetainedDirectOwnerSessionReader(accounts, { sql });
-      const observed = await readCurrentToken(authorization);
-      if (!observed) return null;
-      const captured = capturedTokenRow(observed.row, observed.digest, clock().getTime());
+      requireRetainedQuery();
+      const secret = bearer(authorization);
+      if (!secret) return null;
+      const digest = await bytesDigest(new TextEncoder().encode(secret));
+      requireRetainedQuery();
+      const rows = await retainedSql.query(
+        `SELECT id, kind, principal_id, org_id, scopes_json,
+              secret_digest, created_at, expires_at, revoked_at FROM auth_tokens
+       WHERE secret_digest = ? AND revoked_at IS NULL AND expires_at > ?`,
+        [digest, stamp()],
+      );
+      requireRetainedQuery();
+      if (!rows[0]) return null;
+      const captured = capturedTokenRow(rows[0], digest, clock().getTime());
       if (!captured || captured.kind !== "session" || captured.organizationId !== null) return null;
       const record = await createCredentialAuthorityClassStore({
-        sql,
+        sql: retainedSql,
       }).readActiveDirectOwnerSessionByToken({ id: captured.tokenId, digest: captured.digest });
+      requireRetainedQuery();
       if (
         !record ||
         record.origin.targetRef !== UNREGISTERED_LOCAL_AUTH_TARGET ||
@@ -1612,9 +1659,10 @@ function createAccountsInternal(
         record.token.scopesJson !== captured.scopesJson
       )
         return null;
-      const anchor = await createSharedPrincipalAuthorityStore({ sql }).readAnchor(
+      const anchor = await createSharedPrincipalAuthorityStore({ sql: retainedSql }).readAnchor(
         captured.principalId,
       );
+      requireRetainedQuery();
       if (!anchor || anchor.originKind !== "fresh-local" || anchor.state !== "active") return null;
       const predicate = directCredentialCurrentness(
         record,
@@ -1622,11 +1670,11 @@ function createAccountsInternal(
         anchor.verificationDomain,
         captured.expiresAt,
       );
-      const current = await sql.query(
+      const current = await retainedSql.query(
         `SELECT CASE WHEN ${predicate.sql} THEN 1 ELSE 0 END AS valid`,
         predicate.params,
       );
-      assertRetainedDirectOwnerSessionReader(accounts, { sql });
+      requireRetainedQuery();
       if (
         current.length !== 1 ||
         current[0]?.valid !== 1 ||
