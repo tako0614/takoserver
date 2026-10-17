@@ -951,7 +951,7 @@ test("a migration set's starter points at the step that seeds it and composes it
   select.emit("change");
   await settle();
   expect(body.textContent).toContain(
-    "Create it once the Worker's Deployment serves only versions whose handlers include queue; until then the Host refuses it (",
+    "Create it once its queue exists and the Worker's Deployment serves only versions whose handlers include queue; until then the Host refuses it (",
   );
   expect(link("step 12 of the install guide")?.attributes.get("href")).toBe(
     "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#12-bind-kv-a-bucket-and-a-queue",
@@ -1506,6 +1506,51 @@ test("a version can be sent again with its same spec, to retry it", async () => 
   const [update] = writes;
   expect(update?.method).toBe("PUT");
   expect(JSON.parse(await (update as Request).text())).toEqual({ spec: helloV2.spec });
+});
+
+test("a data Resource's page gives the Binding entry a Worker's version adds", async () => {
+  const kv = resourceAt(
+    "uid-kv",
+    "hello-kv",
+    "https://edge.forms.takoform.com/forms/EdgeKVNamespace/0.2.0/",
+    {},
+  );
+  const { body } = await detailPage(() => kv, []);
+  const entry = `"kvBindings": ${JSON.stringify(
+    [{ name: "KV", resource: { resourceUid: "uid-kv" } }],
+    null,
+    2,
+  )}`;
+  expect(body.all().some((node) => node.tag === "pre" && node.textContent === entry)).toBe(true);
+  expect(body.textContent).toContain(
+    "A Worker reaches it through a Binding in its WorkerVersion's kvBindings.",
+  );
+  expect(body.textContent).toContain(
+    'For example, await env.KV.get("key") resolves to an ArrayBuffer, or null.',
+  );
+  expect(
+    body.all().some((node) => node.tag === "button" && node.textContent === "Copy this entry"),
+  ).toBe(true);
+  const step = body
+    .all()
+    .find(
+      (node) => node.tag === "a" && node.textContent.startsWith("step 12 of the install guide"),
+    );
+  expect(step?.attributes.get("href")).toBe(
+    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#12-bind-kv-a-bucket-and-a-queue",
+  );
+  // A Worker's own page is not something a Binding names this way.
+  const worker = await detailPage(
+    () =>
+      resourceAt(
+        "uid-worker",
+        "hello",
+        "https://edge.forms.takoform.com/forms/ModuleWorker/0.3.0/",
+        {},
+      ),
+    [],
+  );
+  expect(worker.body.textContent).not.toContain("Use it from a Worker");
 });
 
 test("a Resource that can change keeps its Update", async () => {

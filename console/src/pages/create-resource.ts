@@ -597,8 +597,8 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
       ...(kind === "QueueConsumer"
         ? [
             tr(
-              "WorkerのDeploymentが、handlersに queue を含む版だけを配信するようになってから作成してください。それまではHostが拒否します（",
-              "Create it once the Worker's Deployment serves only versions whose handlers include queue; until then the Host refuses it (",
+              "キューが作成済みで、WorkerのDeploymentが、handlersに queue を含む版だけを配信するようになってから作成してください。それまではHostが拒否します（",
+              "Create it once its queue exists and the Worker's Deployment serves only versions whose handlers include queue; until then the Host refuses it (",
             ),
             guideLink(
               "12-bind-kv-a-bucket-and-a-queue",

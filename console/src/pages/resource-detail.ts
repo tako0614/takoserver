@@ -1,6 +1,7 @@
 import type { ResourceSummary } from "../api.ts";
 import { ApiError } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
+import { guideLink } from "../first-run.ts";
 import {
   acceptsChanges,
   valueAt,
@@ -23,7 +24,7 @@ import { findReferrers, REFERRER_PAGES } from "../referrers.ts";
 import { health, phaseLabel, unrecordedDeployment } from "../resource-state.ts";
 import { linkProps, resourcePath, route } from "../router.ts";
 import { api, currentOrganization } from "../state.ts";
-import { badge, card, copyable, empty, ICON, icon, jsonBlock, whenReady } from "../ui.ts";
+import { badge, card, copyable, copyText, empty, ICON, icon, jsonBlock, whenReady } from "../ui.ts";
 import { createResource, deleteResource, updateResource } from "./create-resource.ts";
 
 export { publishedUrl, type SpecReference, specReferences } from "../references.ts";
@@ -235,6 +236,7 @@ function body(
     action.notice ?? (state.phase === "NotReady" ? notReadyNotice() : null),
     references.length > 0 ? referencesCard(organizationId, references) : null,
     referrersCard(organizationId, found.uid),
+    bindingCard(found),
     card(
       tr("識別情報", "Identity"),
       h(
@@ -280,6 +282,123 @@ function body(
           ),
     ),
     card(tr("出力", "Output"), jsonBlock(found.output)),
+  );
+}
+
+/** How a Worker's code reaches each data Form, through the Binding it names. */
+const BINDINGS: Readonly<
+  Record<
+    string,
+    {
+      readonly key: string;
+      readonly name: string;
+      readonly call: string;
+      readonly result: () => string;
+      readonly step: string;
+    }
+  >
+> = {
+  SQLiteDatabase: {
+    key: "sqliteBindings",
+    name: "DB",
+    call: 'await env.DB.query("SELECT …")',
+    result: () =>
+      tr(
+        "の結果は { rows } です。スキーマはSQLiteMigrationApplicationで変更します。",
+        " resolves to { rows }; the schema changes only through a SQLiteMigrationApplication.",
+      ),
+    step: "11-bind-a-sqlite-database",
+  },
+  EdgeKVNamespace: {
+    key: "kvBindings",
+    name: "KV",
+    call: 'await env.KV.get("key")',
+    result: () => tr("の結果はArrayBufferかnullです。", " resolves to an ArrayBuffer, or null."),
+    step: "12-bind-kv-a-bucket-and-a-queue",
+  },
+  ObjectBucket: {
+    key: "bucketBindings",
+    name: "BUCKET",
+    call: 'await env.BUCKET.get("key", {})',
+    result: () =>
+      tr(
+        "の結果は { body, … } かnullで、body は new Response(object.body).text() で読めます。",
+        " resolves to { body, … }, or null; read body with new Response(object.body).text().",
+      ),
+    step: "12-bind-kv-a-bucket-and-a-queue",
+  },
+  AtLeastOnceQueue: {
+    key: "queueProducerBindings",
+    name: "QUEUE",
+    call: 'await env.QUEUE.send("text")',
+    result: () =>
+      tr(
+        "は文字列かバイト列を送ります。メッセージを読むには、版で queue ハンドラーを宣言し、その版を配信してから、このキューとWorkerを指定するQueueConsumerを作成します。",
+        " sends a string or bytes. To read its messages, the version also declares the queue handler, and once that version is served, a QueueConsumer names this queue and the Worker.",
+      ),
+    step: "12-bind-kv-a-bucket-and-a-queue",
+  },
+};
+
+/**
+ * What a data Resource's page says about using it: the Binding entry a
+ * WorkerVersion adds, ready to copy, and the first call its code makes.
+ */
+function bindingCard(found: ResourceSummary): Child {
+  const binding = BINDINGS[/\/forms\/([^/]+)\//u.exec(found.form)?.[1] ?? ""];
+  if (!binding) return null;
+  const entry = `"${binding.key}": ${JSON.stringify(
+    [{ name: binding.name, resource: { resourceUid: found.uid } }],
+    null,
+    2,
+  )}`;
+  const mark = h("span", { "aria-hidden": "true" }, icon(ICON.copy, 13));
+  return card(
+    tr("Workerから使う", "Use it from a Worker"),
+    h(
+      "div",
+      { class: "card__body", style: { display: "grid", gap: "10px" } },
+      h(
+        "p",
+        null,
+        tr(
+          `Workerからは、WorkerVersionの ${binding.key} にあるBindingを通して使います。版は変更できないため、Workerが配信している版を開いて「この版から新しい版を作る」を選び、設定に次の項目を加えてから、新しい版を配信してください。名前は自由に決められます。英数字と「_」「$」で64文字まで、先頭は数字以外です。`,
+          `A Worker reaches it through a Binding in its WorkerVersion's ${binding.key}. A version cannot change, so open the version your Worker serves, choose New version from this one, add this entry to its spec, and serve the new version. The name is yours to choose: up to 64 ASCII letters, digits, _ and $, not starting with a digit.`,
+        ),
+      ),
+      // Wrapped, so a phone shows the whole entry without scrolling sideways.
+      h(
+        "pre",
+        { class: "json", style: { whiteSpace: "pre-wrap", overflowWrap: "anywhere" } },
+        entry,
+      ),
+      h(
+        "div",
+        null,
+        h(
+          "button",
+          { class: "btn btn--sm", type: "button", onClick: () => copyText(entry, mark) },
+          mark,
+          text(tr("この項目をコピー", "Copy this entry")),
+        ),
+      ),
+      h(
+        "p",
+        null,
+        tr("たとえば ", "For example, "),
+        h("code", null, binding.call),
+        binding.result(),
+        " ",
+        tr("呼び出し方はCloudflareのものと異なります：", "These calls differ from Cloudflare's: "),
+        guideLink(
+          binding.step,
+          binding.step.startsWith("11-")
+            ? tr("導入手順書（英語）の手順11", "step 11 of the install guide")
+            : tr("導入手順書（英語）の手順12", "step 12 of the install guide"),
+        ),
+        tr("。", "."),
+      ),
+    ),
   );
 }
 
