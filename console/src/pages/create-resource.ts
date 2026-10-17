@@ -683,7 +683,7 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
   const refusal = refusalNotice();
   const close = openModal({
     title: tr("リソースを作成", "New resource"),
-    confirmLabel: tr("受け付ける", "Accept create"),
+    confirmLabel: tr("作成する", "Create"),
     body: h(
       "div",
       { style: { display: "grid", gap: "14px" } },
@@ -801,7 +801,13 @@ export function createResource(organizationId: string, preset?: CreatePreset): v
 export function updateResource(
   organizationId: string,
   resource: ResourceSummary,
-  proposal?: { readonly spec: Record<string, unknown>; readonly note: string },
+  proposal?: {
+    readonly spec: Record<string, unknown>;
+    readonly note: string;
+    /** The dialog's and the confirm's own words, where the update is not a change. */
+    readonly title?: string;
+    readonly confirmLabel?: string;
+  },
 ): void {
   const key = `console-update-${crypto.randomUUID()}`;
   const path = `/apis/forms.takoform.com/v2/resources/${encodeURIComponent(resource.uid)}`;
@@ -831,8 +837,8 @@ export function updateResource(
   let intent: ResourceIntent | null = null;
   const refusal = refusalNotice();
   const close = openModal({
-    title: tr(`${resource.name}を更新`, `Update ${resource.name}`),
-    confirmLabel: tr("更新を受け付ける", "Accept update"),
+    title: proposal?.title ?? tr(`${resource.name}を更新`, `Update ${resource.name}`),
+    confirmLabel: proposal?.confirmLabel ?? tr("更新する", "Update"),
     body: h(
       "div",
       { class: "field" },

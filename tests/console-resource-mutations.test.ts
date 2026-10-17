@@ -108,8 +108,12 @@ function installDom(path = "/resources"): TestNode {
 async function settle(): Promise<void> {
   for (let i = 0; i < 12; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
 }
+/** The last button with this label: a dialog's, when a page under it has one too. */
 function button(body: TestNode, label: string): TestNode {
-  const found = body.all().find((node) => node.tag === "button" && node.textContent === label);
+  const found = body
+    .all()
+    .reverse()
+    .find((node) => node.tag === "button" && node.textContent === label);
   if (!found) throw new Error(`missing button: ${label}`);
   return found;
 }
@@ -202,7 +206,7 @@ test("a refused create says why in the dialog, and how to change the request", a
   inputs[0].value = form;
   inputs[1].value = "one";
   inputs[1].emit("input");
-  button(body, "Accept create").click();
+  button(body, "Create").click();
   await settle();
   expect(posts).toHaveLength(1);
   // Said in the dialog, where it stays until the next attempt, not in a passing toast.
@@ -249,7 +253,7 @@ test("accepted create is not shown as complete and checking it never re-sends", 
   expect(body.textContent).toContain(
     JSON.stringify({ form, space: "org-console", name: "one", spec: {} }),
   );
-  button(body, "Accept create").click();
+  button(body, "Create").click();
   await settle();
   expect(route().query.get("operation")).toBe(op.id);
   body.append(resourcesPage("org-console") as unknown as TestNode);
@@ -445,14 +449,14 @@ test.each(["connection lost", "malformed accepted reply"] as const)(
     if (!inputs[0] || !inputs[1]) throw new Error("create inputs missing");
     inputs[0].value = form;
     inputs[1].value = "one";
-    button(body, "Accept create").click();
+    button(body, "Create").click();
     await settle();
     expect(writes).toHaveLength(1);
     expect(route().query.get("operation")).toBeNull();
     expect(route().query.get("acceptance")).toBe("unknown");
-    expect(
-      body.all().some((node) => node.tag === "button" && node.textContent === "Accept create"),
-    ).toBe(false);
+    expect(body.all().some((node) => node.tag === "button" && node.textContent === "Create")).toBe(
+      false,
+    );
     body.append(resourcesPage("org-console") as unknown as TestNode);
     await settle();
     expect(body.textContent).toContain("Acceptance is unknown");
@@ -524,7 +528,7 @@ test("create offers the Forms this Host composes and sends the chosen exact URL"
   const name = body.all().filter((node) => node.tag === "input")[1];
   if (!name) throw new Error("name input missing");
   name.value = "hello";
-  button(body, "Accept create").click();
+  button(body, "Create").click();
   await settle();
   expect(writes).toHaveLength(1);
   expect(JSON.parse(await (writes[0] as Request).text())).toEqual({
@@ -594,13 +598,13 @@ test("create starts from the chosen Form's smallest spec and fills references by
   expect(JSON.parse(spec.value).worker).toEqual({ resourceUid: "uid-worker" });
   // An empty reference is named instead of being sent for the Host to refuse.
   name.value = "hello-deployment";
-  button(body, "Accept create").click();
+  button(body, "Create").click();
   await settle();
   expect(writes).toHaveLength(0);
   expect(body.textContent).toContain("Still empty: versions[0].workerVersion");
   version.value = "uid-version";
   version.emit("change");
-  button(body, "Accept create").click();
+  button(body, "Create").click();
   await settle();
   expect(writes).toHaveLength(1);
   expect(JSON.parse(await (writes[0] as Request).text())).toEqual({
@@ -762,7 +766,7 @@ test("reference choices say when a list failed, is empty or goes on, and lock wh
   worker.value = "uid-worker";
   worker.emit("change");
   name.value = "jobs-consumer";
-  button(body, "Accept create").click();
+  button(body, "Create").click();
   await settle();
   expect(lockedWhileAsking).toEqual([true, true]);
   expect(body.textContent).toContain("This Host does not support create for that exact Form");
@@ -902,11 +906,11 @@ test("a WorkerVersion's page serves it by updating the Worker's Deployment", asy
   button(body, "Serve this version").click();
   await settle();
   expect(body.textContent).toContain(
-    "This updates hello-deployment to serve only hello-v2, at weight 10000. Check it, then accept.",
+    "This updates hello-deployment to serve only hello-v2, at weight 10000. Check it, then choose Update.",
   );
-  // Nothing is sent until the person accepts the update.
+  // Nothing is sent until the person chooses Update.
   expect(writes).toHaveLength(0);
-  button(body, "Accept update").click();
+  button(body, "Update").click();
   await settle();
   expect(writes).toHaveLength(1);
   const [update] = writes;
@@ -959,7 +963,7 @@ test("serving one version says when it replaces a split", async () => {
   button(body, "Serve this version").click();
   await settle();
   expect(body.textContent).toContain(
-    "It serves 2 versions now; after this update it serves only hello-v2. This updates hello-deployment. Check it, then accept.",
+    "It serves 2 versions now; after this update it serves only hello-v2. This updates hello-deployment. Check it, then choose Update.",
   );
 });
 
@@ -1028,10 +1032,10 @@ test("a Worker that has not recorded the Deployment serving it offers to record 
   button(body, "Record the Deployment").click();
   await settle();
   expect(body.textContent).toContain(
-    "This updates hello with the same spec, so that it records hello-deployment. Check it, then accept.",
+    "This updates hello with the same spec, so that it records hello-deployment. Check it, then choose Update.",
   );
   expect(writes).toHaveLength(0);
-  button(body, "Accept update").click();
+  button(body, "Update").click();
   await settle();
   const [update] = writes;
   expect(update?.method).toBe("PUT");
@@ -1264,7 +1268,7 @@ test("a version keeps its assets in the next one, and only its code bundle is ch
   button(site.body, "New version from this one").click();
   await settle();
   expect(site.body.textContent).toContain(
-    "Write the new StaticAssetBundle's UID in assets.bundle, name it, then accept",
+    "Write the new StaticAssetBundle's UID in assets.bundle, name it, then choose Create",
   );
   // Its spec has no code bundle, so none is offered to choose.
   expect(site.body.textContent).not.toContain("bundle — WorkerBundle");
@@ -1297,7 +1301,12 @@ test("a version can be sent again with its same spec, to retry it", async () => 
   expect(body.textContent).toContain(
     "A Resource of this Form cannot change. Sending the same spec again retries it, for example after its create failed.",
   );
-  button(body, "Accept update").click();
+  // The dialog says what it does: no change, a re-apply.
+  expect(body.textContent).toContain("Re-apply hello-v2");
+  expect(body.all().some((node) => node.tag === "button" && node.textContent === "Update")).toBe(
+    false,
+  );
+  button(body, "Re-apply").click();
   await settle();
   const [update] = writes;
   expect(update?.method).toBe("PUT");
@@ -1668,7 +1677,7 @@ test("update uses the observed UID and generation rather than a name-based path"
   const spec = body.all().find((node) => node.tag === "textarea");
   if (!spec) throw new Error("spec editor missing");
   spec.value = '{"value":"changed"}';
-  button(body, "Accept update").click();
+  button(body, "Update").click();
   await settle();
   expect(seen).toHaveLength(1);
   expect(seen[0]?.method).toBe("PUT");
@@ -1706,7 +1715,7 @@ test("organization switch during support read prevents a stale create send", asy
   if (!inputs[0] || !inputs[1]) throw new Error("create inputs missing");
   inputs[0].value = form;
   inputs[1].value = "one";
-  button(body, "Accept create").click();
+  button(body, "Create").click();
   selectOrganization("other");
   release?.(Response.json({ form, supported: true, operations: ["create"] }));
   await settle();

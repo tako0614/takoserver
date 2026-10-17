@@ -901,11 +901,11 @@ Worker in the organization `$ORG` once step 6 has seeded the bundle. Choose
 **New resource** and a Form: the dialog fills in the smallest spec this Host
 accepts for that Form, and each place that names another Resource lists the
 organization's Resources of the Form the Host requires, by name. Nothing is
-sent until you accept; **Request to send**, folded below the spec, holds the
-exact request. After each accept, the Resources page shows the **Accepted
-operation**. The Host refuses a reference to a Resource whose create has not
-finished, so create anything that names a Resource only once that card offers
-**View resource**.
+sent until you choose **Create**; **Request to send**, folded below the spec,
+holds the exact request. After each create, the Resources page shows the
+**Accepted operation**. The Host refuses a reference to a Resource whose create
+has not finished, so create anything that names a Resource only once that card
+offers **View resource**.
 
 1. Create the `ModuleWorker` `hello`.
 2. Create the `WorkerBundle` `hello-bundle-v1`, with `artifact.url` and
@@ -914,7 +914,7 @@ finished, so create anything that names a Resource only once that card offers
    `hello-version-v1`, choosing `hello` and `hello-bundle-v1`.
 4. Once the version is Ready, open its page and choose **Serve this version**.
    It opens the create of the Worker's `WorkerDeployment` with that version at
-   weight 10000; name it `hello-deployment` and accept.
+   weight 10000; name it `hello-deployment` and choose **Create**.
 5. Once the Deployment is Ready, create the `WorkerEndpoint` `hello-endpoint`,
    choosing `hello`. Once it is published, the overview shows the Worker's
    address, and the Endpoint page's **Output** has its `hostname`.
@@ -997,11 +997,11 @@ In the console, create `hello-bundle-v2` from `$WORK/hello-v2.json` as in
 step 8. Then open `hello-version-v1` and choose **New version from this one**:
 it opens the create of a WorkerVersion with v1's handlers, vars and Bindings,
 and its code bundle left to choose. Choose `hello-bundle-v2`, name it
-`hello-version-v2` and accept. Once that version is Ready, open it and choose
-**Serve this version**. It opens the update of `hello-deployment` with that
-version alone at weight 10000, naming the Deployment generation the page read,
-and sends it when you accept. The Worker keeps the Deployment it recorded, so
-it needs no second record.
+`hello-version-v2` and choose **Create**. Once that version is Ready, open it
+and choose **Serve this version**. It opens the update of `hello-deployment`
+with that version alone at weight 10000, naming the Deployment generation the
+page read, and sends it when you choose **Update**. The Worker keeps the
+Deployment it recorded, so it needs no second record.
 
 `tests/selfhost-v2-ordinary-journey-native.test.ts`
 runs this path, apart from recording the Deployment on the Worker, with real

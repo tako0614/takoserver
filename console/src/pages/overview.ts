@@ -382,8 +382,8 @@ function nextStep(
           form: WORKER_ENDPOINT,
           spec: { worker: { resourceUid: worker.uid } },
           note: tr(
-            `${worker.name}をHTTPSのホスト名で公開するWorkerEndpointを作成します。名前を付けて「受け付ける」を押してください。`,
-            `This creates a WorkerEndpoint that publishes ${worker.name} at an HTTPS hostname. Name it, then accept.`,
+            `${worker.name}をHTTPSのホスト名で公開するWorkerEndpointを作成します。名前を付けて「作成する」を押してください。`,
+            `This creates a WorkerEndpoint that publishes ${worker.name} at an HTTPS hostname. Name it, then choose Create.`,
           ),
         }),
       ),
@@ -417,8 +417,8 @@ function nextStep(
             handlers: ["fetch"],
           },
           note: tr(
-            `${worker.name}の版を作成します。コードのWorkerBundleを選び、名前を付けて「受け付ける」を押してください。`,
-            `This creates a version of ${worker.name}. Choose its WorkerBundle, name it, then accept.`,
+            `${worker.name}の版を作成します。コードのWorkerBundleを選び、名前を付けて「作成する」を押してください。`,
+            `This creates a version of ${worker.name}. Choose its WorkerBundle, name it, then choose Create.`,
           ),
         }),
       ),
