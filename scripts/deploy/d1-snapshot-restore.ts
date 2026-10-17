@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import {
   closeSync,
@@ -321,7 +322,76 @@ export function verifySnapshotRestore(
   return { ok: mismatches.length === 0, mismatches: bounded };
 }
 
-type ScanState = "code" | "single" | "double" | "bracket" | "lineComment" | "blockComment";
+export type SnapshotLocalReader = Pick<RemoteD1, "query" | "column">;
+
+/**
+ * Restore only into memory and use the same strict readback checks as the D1
+ * surface. Optional source-owned inspectors can hash rows through a read-only
+ * reader; this local proof grants no remote import or writer-quiescence authority.
+ */
+export async function inspectSnapshotDumpLocally<T = undefined>(
+  bytes: Uint8Array,
+  inspect?: (reader: SnapshotLocalReader, expected: SnapshotExpectations) => Promise<T>,
+): Promise<{
+  readonly snapshotDigest: string;
+  readonly normalizedBytes: number;
+  readonly nulBytes: number;
+  readonly expected: SnapshotExpectations;
+  readonly readback: SnapshotRestoreReadback;
+  readonly inspection: T | undefined;
+}> {
+  const normalized = normalizeSnapshotDump(bytes);
+  const expected = deriveSnapshotExpectations(normalized.sql);
+  let database = new Database(":memory:");
+  try {
+    database.exec(normalized.sql);
+    const readOnly = Database.deserialize(database.serialize(), true);
+    database.close();
+    database = readOnly;
+    const reader: SnapshotLocalReader = {
+      async query(_phase, _description, sql) {
+        return database.query(sql).all() as Record<string, unknown>[];
+      },
+      async column(phase, description, sql, name) {
+        return readExactStringRows(reader, phase, description, sql, name);
+      },
+    };
+    const readback = await readRestoreReadback(reader, expected, "verification", null);
+    const comparison = verifySnapshotRestore(expected, readback);
+    if (!comparison.ok) {
+      throw verificationError(
+        "local snapshot restore differs from its dump expectations",
+        JSON.stringify(comparison.mismatches),
+      );
+    }
+    const integrity = database.query("PRAGMA integrity_check").all();
+    if (JSON.stringify(integrity) !== JSON.stringify([{ integrity_check: "ok" }])) {
+      throw verificationError("local snapshot restore failed its integrity check");
+    }
+    return {
+      snapshotDigest: normalized.digest,
+      normalizedBytes: normalized.bytes,
+      nulBytes: normalized.nulBytes,
+      expected,
+      readback,
+      inspection: inspect === undefined ? undefined : await inspect(reader, expected),
+    };
+  } catch (error) {
+    if (error instanceof DeployError) throw error;
+    throw verificationError("local snapshot restore or read-only inspection failed");
+  } finally {
+    database.close();
+  }
+}
+
+type ScanState =
+  | "code"
+  | "single"
+  | "double"
+  | "backtick"
+  | "bracket"
+  | "lineComment"
+  | "blockComment";
 
 interface ScannedSnapshot {
   readonly sql: string;
@@ -331,14 +401,16 @@ interface ScannedSnapshot {
 
 /**
  * One pass over a dump that normalizes NUL bytes and splits statements at
- * top-level semicolons. Quote and comment state is tracked with the same rules
- * SQLite uses, so a semicolon inside a literal never ends a statement.
+ * top-level semicolons. Quotes, comments and CREATE TRIGGER bodies are tracked
+ * so a trigger's own statements remain part of its DDL rather than dump rows.
  */
 function scanSnapshot(source: string): ScannedSnapshot {
   const sql: string[] = [];
   const statements: string[] = [];
   const current: string[] = [];
   let state: ScanState = "code";
+  let inTrigger = false;
+  let triggerBoundary: "body" | "semicolon" | "end" = "body";
   let nulBytes = 0;
   const push = (value: string): void => {
     sql.push(value);
@@ -359,15 +431,46 @@ function scanSnapshot(source: string): ScannedSnapshot {
       continue;
     }
     if (state === "code" && character === ";") {
+      if (!inTrigger && CREATE_TRIGGER.test(bareStatement(current.join("")))) inTrigger = true;
+      if (inTrigger && triggerBoundary !== "end") {
+        push(character);
+        triggerBoundary = "semicolon";
+        continue;
+      }
       statements.push(current.join(""));
       current.length = 0;
       sql.push(";");
+      inTrigger = false;
+      triggerBoundary = "body";
       continue;
+    }
+    if (
+      state === "code" &&
+      inTrigger &&
+      triggerBoundary !== "body" &&
+      !/[ \t\r\n\f\v]/u.test(character) &&
+      !(character === "-" && next === "-") &&
+      !(character === "/" && next === "*")
+    ) {
+      // SQLite completes a trigger at ; END; with optional whitespace/comments.
+      // CASE ... END and quoted/commented END tokens cannot close its body.
+      if (
+        triggerBoundary === "semicolon" &&
+        source.slice(index, index + 3).toUpperCase() === "END" &&
+        !/[A-Za-z0-9_$\u0080-\uFFFF]/u.test(source[index + 3] ?? "")
+      ) {
+        push(source.slice(index, index + 3));
+        index += 2;
+        triggerBoundary = "end";
+        continue;
+      }
+      triggerBoundary = "body";
     }
     push(character);
     if (state === "code") {
       if (character === "'") state = "single";
       else if (character === '"') state = "double";
+      else if (character === "`") state = "backtick";
       else if (character === "[") state = "bracket";
       else if (character === "-" && next === "-") {
         push(next);
@@ -396,6 +499,15 @@ function scanSnapshot(source: string): ScannedSnapshot {
           state = "code";
         }
       }
+    } else if (state === "backtick") {
+      if (character === "`") {
+        if (next === "`") {
+          push(next);
+          index += 1;
+        } else {
+          state = "code";
+        }
+      }
     } else if (state === "bracket") {
       if (character === "]") state = "code";
     } else if (state === "lineComment") {
@@ -407,6 +519,9 @@ function scanSnapshot(source: string): ScannedSnapshot {
         state = "code";
       }
     }
+  }
+  if (inTrigger || CREATE_TRIGGER.test(bareStatement(current.join("")))) {
+    throw preflightError("snapshot dump contains an incomplete CREATE TRIGGER");
   }
   if (current.join("").trim().length > 0) statements.push(current.join(""));
   return { sql: sql.join(""), statements, nulBytes };
@@ -649,7 +764,7 @@ interface TargetState {
 }
 
 async function readExactStringRows(
-  database: RemoteD1,
+  database: Pick<RemoteD1, "query">,
   phase: DeployPhase,
   description: string,
   sql: string,
@@ -689,7 +804,10 @@ function readExactCountResult(
   return count;
 }
 
-async function readTargetState(database: RemoteD1, phase: DeployPhase): Promise<TargetState> {
+async function readTargetState(
+  database: Pick<RemoteD1, "query">,
+  phase: DeployPhase,
+): Promise<TargetState> {
   const userTables = await readExactStringRows(
     database,
     phase,
@@ -772,7 +890,7 @@ async function readTargetState(database: RemoteD1, phase: DeployPhase): Promise<
 }
 
 async function readRestoreReadback(
-  database: RemoteD1,
+  database: Pick<RemoteD1, "query">,
   expected: SnapshotExpectations,
   phase: DeployPhase,
   reportedQueries: number | null,
