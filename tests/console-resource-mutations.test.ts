@@ -424,6 +424,32 @@ test("following stops after its budget and then asks for Reload", async () => {
   }
 });
 
+test("an operation still retrying after the follow says what the Host last answered", async () => {
+  await setup();
+  const { OPERATION_FOLLOW } = await import("../console/src/pages/resources.ts");
+  const saved = { ...OPERATION_FOLLOW };
+  OPERATION_FOLLOW.budgetMs = 0;
+  try {
+    const { body } = await operationPage([
+      {
+        ...op,
+        status: "reconciling",
+        effect: "unknown",
+        error: { code: "outcome_unconfirmed", message: "Execution outcome is not yet confirmed" },
+      },
+    ]);
+    await settle();
+    expect(body.textContent).toContain(
+      "The Host's latest answer: Execution outcome is not yet confirmed (outcome_unconfirmed)",
+    );
+    expect(
+      body.all().some((node) => node.tag === "a" && node.textContent === "Open the Resource"),
+    ).toBe(true);
+  } finally {
+    Object.assign(OPERATION_FOLLOW, saved);
+  }
+});
+
 test("a failed operation says so with the Host's message", async () => {
   const { body } = await operationPage([
     {
@@ -1037,6 +1063,7 @@ async function detailPage(
   shown: () => ResourceSummary,
   deployments: ResourceSummary[],
   listed: ResourceSummary[] = [],
+  operations: Record<string, Record<string, unknown>> = {},
 ) {
   const uid = shown().uid;
   const { body } = await setup(`/resources/${uid}`);
@@ -1056,6 +1083,8 @@ async function detailPage(
         return Response.json(op, { status: 202 });
       }
       if (url.pathname.endsWith(`/resources/${uid}`)) return Response.json(shown());
+      const operation = operations[/\/operations\/([^/]+)$/u.exec(url.pathname)?.[1] ?? ""];
+      if (operation) return Response.json(operation);
       if (url.pathname.endsWith("/resources")) {
         const form = url.searchParams.get("form");
         const items =
@@ -1246,6 +1275,55 @@ test("a Worker is offered to record a Deployment only when one serves it unrecor
   const alone = await detailPage(() => unrecordedWorker, []);
   expect(alone.body.textContent).toContain("The latest observation reports not ready.");
   expect(alone.body.textContent).not.toContain("Record the Deployment");
+});
+
+test("a version the Host refused is not something the Worker's record waits for", async () => {
+  const refused: ResourceSummary = {
+    ...resourceAt("uid-refused", "hello-v3", versionForm, {
+      worker: { resourceUid: "uid-worker" },
+      handlers: ["fetch"],
+    }),
+    generation: 1,
+    observedGeneration: 0,
+    observedAt: null,
+    phase: "pending",
+    observed: {},
+    lastOperation: "op-refused",
+  };
+  const refusing = (ageMs: number) => ({
+    "op-refused": {
+      ...op,
+      id: "op-refused",
+      resourceUid: "uid-refused",
+      status: "reconciling",
+      effect: "unknown",
+      createdAt: new Date(Date.now() - ageMs).toISOString(),
+      error: { code: "outcome_unconfirmed", message: "Execution outcome is not yet confirmed" },
+    },
+  });
+  const recordButton = (body: TestNode) =>
+    body
+      .all()
+      .some((node) => node.tag === "button" && node.textContent === "Record the Deployment");
+  const { body } = await detailPage(
+    () => unrecordedWorker,
+    [servingDeployment],
+    [servingDeployment, publishedEndpoint, refused],
+    refusing(5 * 60_000),
+  );
+  expect(body.textContent).toContain(
+    "hello-v3 cannot finish: the Host has kept retrying it for more than two minutes without saying why, which usually means it refused the version's code.",
+  );
+  expect(body.textContent).not.toContain("Wait until it finishes");
+  expect(recordButton(body)).toBe(false);
+  // Within the guide's two minutes it is still only in progress.
+  const fresh = await detailPage(
+    () => unrecordedWorker,
+    [servingDeployment],
+    [servingDeployment, publishedEndpoint, refused],
+    refusing(10_000),
+  );
+  expect(fresh.body.textContent).toContain("hello-v3 is in progress. Wait until it finishes");
 });
 
 test("the record update is offered only where the Host can finish it", async () => {
@@ -1559,6 +1637,63 @@ test("a data Resource's page gives the Binding entry a Worker's version adds", a
   // Nor is a Resource being deleted something to start using.
   const leaving = await detailPage(() => ({ ...kv, phase: "deleting" as const }), []);
   expect(leaving.body.textContent).not.toContain("Use it from a Worker");
+});
+
+test("a version the Host keeps retrying without a reason says what usually causes it", async () => {
+  /** A version page whose create is still retrying, accepted `ageMs` ago, with `code`. */
+  const stuckPage = async (ageMs: number, code: string) => {
+    const pending: ResourceSummary = {
+      ...helloV2,
+      generation: 1,
+      observedGeneration: 0,
+      observedAt: null,
+      phase: "pending",
+      observed: {},
+      lastOperation: "op-stuck",
+    };
+    const { body } = await setup(`/resources/${pending.uid}`);
+    const { resourceDetailPage } = await import("../console/src/pages/resource-detail.ts");
+    globalThis.fetch = Object.assign(
+      async (input: RequestInfo | URL) => {
+        const url = new URL(String(input));
+        if (url.pathname.endsWith("/operations/op-stuck"))
+          return Response.json({
+            ...op,
+            id: "op-stuck",
+            resourceUid: pending.uid,
+            status: "reconciling",
+            effect: "unknown",
+            createdAt: new Date(Date.now() - ageMs).toISOString(),
+            error: { code, message: "Execution outcome is not yet confirmed" },
+          });
+        if (url.pathname.endsWith(`/resources/${pending.uid}`)) return Response.json(pending);
+        if (url.pathname === "/.well-known/takoform/v2") return Response.json(discovery);
+        return Response.json({ items: [], nextCursor: null });
+      },
+      { preconnect: globalThis.fetch.preconnect },
+    );
+    body.append(resourceDetailPage("org-console", pending.uid) as unknown as TestNode);
+    await settle();
+    return body;
+  };
+  const stuck = await stuckPage(5 * 60_000, "outcome_unconfirmed");
+  expect(stuck.textContent).toContain(
+    "The Host has kept retrying this version for more than two minutes without saying why (outcome_unconfirmed).",
+  );
+  expect(stuck.textContent).toContain("While it retries, it cannot be deleted.");
+  const guide = stuck
+    .all()
+    .find((node) => node.tag === "a" && node.textContent.startsWith("the install guide"));
+  expect(guide?.attributes.get("href")).toBe(
+    "https://github.com/tako0614/takoserver/blob/main/docs/self-host-operations.md#when-a-new-version-does-not-work",
+  );
+  // Within the guide's two minutes, or with another answer, it is only in progress.
+  expect((await stuckPage(10_000, "outcome_unconfirmed")).textContent).not.toContain(
+    "without saying why",
+  );
+  expect((await stuckPage(5 * 60_000, "backend_unavailable")).textContent).not.toContain(
+    "without saying why",
+  );
 });
 
 test("a Resource that can change keeps its Update", async () => {
