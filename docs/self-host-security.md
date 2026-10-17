@@ -108,8 +108,8 @@ behaviour exactly.
   Ed25519 assertion. The Host prints one at startup only until the operator
   account exists, that is, until the first successful sign-in. Set
   `TAKOSERVER_PRINT_OPERATOR_ASSERTION=1` to print one on every boot. Mint
-  later ones with `bun scripts/operator-key.ts sign-in google operator
-  operator@localhost Operator`, with `TAKOSERVER_OPERATOR_KEY` and
+  later ones with `bun --no-env-file scripts/operator-key.ts sign-in google
+  operator operator@localhost Operator`, with `TAKOSERVER_OPERATOR_KEY` and
   `TAKOSERVER_PUBLIC_ORIGIN` set for this installation.
 - A sign-in assertion opens one session. The session exchange records it, and
   until it expires (ten minutes for the printed one) both another session
