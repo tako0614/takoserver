@@ -2,8 +2,8 @@ import { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import {
-  assertRetainedDirectOwnerSessionReader,
   AuthError,
+  assertRetainedDirectOwnerSessionReader,
   createAccounts,
   createAccountsWithUnregisteredLocalIssuer,
 } from "../src/auth.ts";

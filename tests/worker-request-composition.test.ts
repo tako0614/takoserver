@@ -1,5 +1,5 @@
-import * as financialRequestOrigin from "@takoserver/core/financial-request-origin";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import * as financialRequestOrigin from "@takoserver/core/financial-request-origin";
 import sharedPricing from "../config/shared-hosted-pricing.json";
 import { moneyFenceInstallSql } from "../scripts/deploy/schema-money-unit-cutover.ts";
 import { assertAuthTokenCaptureReader } from "../src/auth.ts";
@@ -611,10 +611,7 @@ describe("post-graph shared-auth request observation", () => {
     };
     let settled = false;
     const first = entry
-      .fetch(
-        new Request(`${SHARED_AUTH_STAGING_PROFILE.publicOrigin}/auth/oidc/login`),
-        f.env,
-      )
+      .fetch(new Request(`${SHARED_AUTH_STAGING_PROFILE.publicOrigin}/auth/oidc/login`), f.env)
       .then((response) => {
         settled = true;
         return response;

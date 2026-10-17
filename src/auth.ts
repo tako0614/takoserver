@@ -1600,8 +1600,7 @@ function createAccountsInternal(
       const observed = await readCurrentToken(authorization);
       if (!observed) return null;
       const captured = capturedTokenRow(observed.row, observed.digest, clock().getTime());
-      if (!captured || captured.kind !== "session" || captured.organizationId !== null)
-        return null;
+      if (!captured || captured.kind !== "session" || captured.organizationId !== null) return null;
       const record = await createCredentialAuthorityClassStore({
         sql,
       }).readActiveDirectOwnerSessionByToken({ id: captured.tokenId, digest: captured.digest });
@@ -1616,8 +1615,7 @@ function createAccountsInternal(
       const anchor = await createSharedPrincipalAuthorityStore({ sql }).readAnchor(
         captured.principalId,
       );
-      if (!anchor || anchor.originKind !== "fresh-local" || anchor.state !== "active")
-        return null;
+      if (!anchor || anchor.originKind !== "fresh-local" || anchor.state !== "active") return null;
       const predicate = directCredentialCurrentness(
         record,
         anchor,
