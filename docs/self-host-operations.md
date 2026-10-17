@@ -805,9 +805,30 @@ bun --no-env-file scripts/selfhost-artifact.ts verify --config /etc/takoserver/v
 
 Query support for each exact Form URL you intend to use. Proceed only when it
 reports `supported: true`. Support reflects the Forms composed by this running
-Host. If the Worker Forms are unsupported, read the startup diagnostics
-(`workerd`, Actor and socket messages) and compare the configuration with the
-complete-profile table in step 3, then restart.
+Host. If the Worker Forms are unsupported, then apart from an unusable
+`workerd`, which it reports at startup, the Host does not log which setting is
+missing; compare the configuration with the complete-profile table in step 3.
+As root, these show the usual causes:
+
+```sh
+set -a; . /etc/takoserver/takoserver.env; set +a
+for name in TAKOSERVER_WORKERD_BINARY TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY \
+    TAKOSERVER_V2_WORKER_RUNTIME_BOOT TAKOSERVER_V2_WORKER_PRIVATE_PLANES; do
+  [ -n "$(printenv "$name")" ] || echo "missing: $name"
+done
+"$TAKOSERVER_WORKERD_BINARY" --version   # prints its version; a glibc error means the OS is too old
+jq -r '.workerBundle.targetKey, .staticAssetBundle.targetKey' /etc/takoserver/v2/takoform-v2.json
+printf '%s' "$TAKOSERVER_V2_WORKER_RUNTIME_BOOT" | jq -c 'keys'
+printf '%s' "$TAKOSERVER_V2_WORKER_PRIVATE_PLANES" | jq -r 'keys[]'
+journalctl -u takoserver.service -b --no-pager | grep -i -E 'workerd|actor|workflow|socket|plane|endpoint'
+```
+
+Both `targetKey` values must be `selfhost-v2-worker-primary`, the runtime boot
+must print `["actor","workflow"]`, and the planes must be `kv`,
+`objectBucket`, `queue`, `queueProducer` and `sqlite`. If only
+`WorkerEndpoint` is unsupported, check step 4's
+`TAKOSERVER_V2_WORKER_ENDPOINT_HTTPS=1`, `TAKOSERVER_WORKER_ENDPOINT_SUFFIX`
+and the TLS files. Fix the configuration, then restart.
 
 ```sh
 for form in ModuleWorker/0.3.0 WorkerBundle/0.2.0 WorkerVersion/0.5.0 \
@@ -941,8 +962,13 @@ uid() { # uid <name>
 }
 WORKER=$(uid hello) && BUNDLE=$(uid hello-bundle-v1) &&
 VERSION=$(uid hello-version-v1) && DEPLOYMENT=$(uid hello-deployment) &&
-ENDPOINT=$(uid hello-endpoint)
+ENDPOINT=$(uid hello-endpoint) &&
+NAME=$(curl -sS --fail-with-body "$V2/resources/$ENDPOINT" \
+  -H "authorization: Bearer $KEY" | jq -er .output.hostname)
 ```
+
+Seeding in steps 10 and 11 also needs the Host's environment in that shell:
+`set -a; . /etc/takoserver/takoserver.env; set +a`, as in step 6.
 
 The Resources of steps 10 and 11 are found the same way, by their names, such
 as `hello-bundle-v2` and `hello-version-v2`.
@@ -995,8 +1021,17 @@ Code never changes in place: new code is a new `WorkerBundle` and
 `WorkerVersion`, and the Deployment is pointed at the new version, so the
 Endpoint keeps its address.
 
-To ship new code, put the new files in `$WORK/hello/v2` and give the Host
-their bytes in one of two ways:
+To ship new code, write it to `$WORK/hello/v2`, as the `takoserver` user in the
+shell of step 6:
+
+```sh
+mkdir -p -m 0700 "$WORK/hello/v2"
+cat > "$WORK/hello/v2/worker.js" <<'EOF'
+export default { fetch() { return new Response("hello from takoserver v2\n"); } };
+EOF
+```
+
+Then give the Host its bytes in one of two ways:
 
 - **Publish them over public HTTPS**, which needs no restart. Serve the files
   and a manifest that lists them over HTTPS on port 443 from another machine,
@@ -1031,7 +1066,9 @@ their bytes in one of two ways:
 
 - **Seed them onto the Host**, as in step 6, for a publisher that is not
   public. Seeding needs the Host stopped, so every Worker on the Host stops
-  serving until it starts again:
+  serving until it starts again. Stop the Host first
+  (`systemctl stop takoserver.service`, as root); then, in the shell of step 6
+  with the Host's environment loaded, seed:
 
   ```sh
   bun --no-env-file scripts/selfhost-artifact.ts seed worker-bundle "$WORK/hello/v2" \
@@ -1039,6 +1076,8 @@ their bytes in one of two ways:
     --organization "$ORG" --entrypoint worker.js \
     --config /etc/takoserver/v2/takoform-v2.json > "$WORK/hello-v2.json"
   ```
+
+  Then start the Host again (`systemctl start takoserver.service`, as root).
 
 Then create a new `WorkerBundle` and `WorkerVersion` and replace the
 Deployment's spec. A `PUT` names the Deployment's current `generation`, read
@@ -1059,6 +1098,14 @@ updated=$(jq -nc --arg w "$WORKER" --arg v "$VERSION_V2" \
     -H "takoform-expected-generation: $GENERATION" --data @-) &&
 wait_operation "$(printf '%s' "$updated" | jq -r .id)" hello-deployment-v2
 ```
+
+Once that succeeds, the Endpoint serves the new code at the same address:
+
+```sh
+curl -sS "https://$NAME/"
+```
+
+It answers `hello from takoserver v2`.
 
 In the console, create `hello-bundle-v2` from `$WORK/hello-v2.json` as in
 step 8. Then open `hello-version-v1` and choose **New version from this one**:
@@ -1718,9 +1765,9 @@ Some paths exist only while a Host runs and are not part of the backup set:
 
 ## Cold snapshot
 
-1. Choose a protected destination with enough free space for the whole root and
-   any external `TAKOSERVER_DB`. Use a destination that is not served by the
-   source host.
+1. Choose a protected destination with enough free space for the whole root,
+   any external `TAKOSERVER_DB` and `/etc/takoserver`. Use a destination that
+   is not served by the source host.
 2. Stop the Takoserver service through its actual supervisor and wait until
    `entry-bun.ts`, all of its `workerd` children (the legacy runtime and each v2
    Worker owner's), any Workflow execution guard, and any other process
@@ -1736,8 +1783,13 @@ Some paths exist only while a Host runs and are not part of the backup set:
    journal sidecars in the same stopped window. Do not copy a live SQLite file,
    copy only its main file while sidecars may be changing, or guess which
    sidecars can be omitted. Do not copy the runtime-only socket directories
-   listed above. This procedure intentionally requires a stopped-and-quiescent
-   installation rather than promising a live snapshot.
+   outside the root listed above (`/tmp/tw-*` and `$TMPDIR/tactor-*`); the
+   root's own `s/` may stay in the copy. Copy `/etc/takoserver` in the same
+   window: it holds the environment file with the cursor key, without which
+   the Host refuses to start, and the v2 config, whose grants are the only way
+   a restored Host serves seeded artifacts. This procedure intentionally
+   requires a stopped-and-quiescent installation rather than promising a live
+   snapshot.
 4. Record outside the secret-bearing files which source instance and time the
    copy represents, the resolved data-root and database paths, the product
    commit, and the configured external dependency references needed to locate
@@ -1745,6 +1797,20 @@ Some paths exist only while a Host runs and are not part of the backup set:
    `stagingRoot`. Do not record credentials themselves.
 5. Keep the source stopped until the copy has completed. Then restart only the
    original instance if it is still the active installation.
+
+For the layout of this guide, with the database inside the root, steps 2 and 3
+are, as root:
+
+```sh
+systemctl stop takoserver.service
+systemctl is-active takoserver.service   # prints inactive (or failed) once every writer has exited
+SNAP=/var/backups/takoserver/$(date -u +%Y%m%dT%H%M%SZ)
+install -d -m 0700 "$SNAP"
+cp -a /var/lib/takoserver "$SNAP/data"
+cp -a /etc/takoserver "$SNAP/etc"
+```
+
+Record `$SNAP` with the commit that wrote the data (step 4).
 
 ## Restore boundary
 

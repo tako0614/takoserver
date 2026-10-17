@@ -209,13 +209,19 @@ a new project name gives a fresh volume:
 
 ```sh
 docker compose stop
-docker compose -p takoserver-restore run --rm --no-deps -T --entrypoint tar takoserver \
-  -C /var/lib/takoserver -xpf - < ~/takoserver-backups/takoserver-data-<date>.tar
-TAKOSERVER_DOCKER_IMAGE=takoserver-selfhost:before-<date> \
-  docker compose -p takoserver-restore up -d --no-build
+DATE=2026-10-17   # the date in the copy's file names
+printf 'COMPOSE_PROJECT_NAME=takoserver-restore\nTAKOSERVER_DOCKER_IMAGE=takoserver-selfhost:before-%s\n' \
+  "$DATE" >> .env
+docker compose run --rm --no-deps -T --entrypoint tar takoserver \
+  -C /var/lib/takoserver -xpf - < ~/takoserver-backups/takoserver-data-$DATE.tar
+docker compose up -d --no-build
 ```
 
-From then on, pass `-p takoserver-restore` to every `docker compose` command.
+The two lines added to `.env` keep every later `docker compose` command, in any
+shell, on the restored project and the old image. A command without them would
+act on the original project instead, or, without the image line, start the
+newer image on the restored volume, whose migrations would undo the rollback.
+Remove them to return to the original project.
 
 Run the explicit local regression check from the checkout with Bun installed:
 

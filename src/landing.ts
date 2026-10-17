@@ -119,7 +119,7 @@ const landingMessages = {
     shipMore: "Step 10 of the install guide",
     keepTitle: "Keep it running",
     keepBody:
-      "Poll the Host's readiness probe, GET /_takoserver/health/ready on its own port: 503, or no answer, means it cannot serve; degraded: true means it still serves but something needs you: a Worker that is not ready, work waiting too long, or a background job that keeps failing. To back up, stop the Host and copy its whole data root. To update, check out a newer reviewed commit beside the running one and switch to it, keeping the previous checkout and a backup.",
+      "Poll the Host's readiness probe, GET /_takoserver/health/ready on its own port: 503, or no answer, means it cannot serve; degraded: true means it still serves but something needs you: a Worker that is not ready, work waiting too long, or a background job that keeps failing. To back up, stop the Host and copy its whole data root and /etc/takoserver, which holds its cursor key and the config that grants its seeded code. To update, check out a newer reviewed commit beside the running one and switch to it, keeping the previous checkout and a backup.",
     monitoring: "Monitoring",
     backup: "Cold snapshot",
     update: "Update",
@@ -204,7 +204,7 @@ const landingMessages = {
     shipMore: "手順書（英語）の手順10",
     keepTitle: "動かし続ける",
     keepBody:
-      "準備状態は、Host自身のポートで GET /_takoserver/health/ready を定期的に確認します。503か応答がなければサービスを提供できず、degraded: true ならサービスは続いていますが、準備できていないWorker、長く待っている作業、失敗が続くバックグラウンド処理など、対応が必要なものがあります。バックアップするには、Hostを停止してデータルート全体をコピーします。更新するには、レビュー済みの新しいコミットを今のチェックアウトの横に用意して切り替えます。前のチェックアウトとバックアップは残しておきます。",
+      "準備状態は、Host自身のポートで GET /_takoserver/health/ready を定期的に確認します。503か応答がなければサービスを提供できず、degraded: true ならサービスは続いていますが、準備できていないWorker、長く待っている作業、失敗が続くバックグラウンド処理など、対応が必要なものがあります。バックアップするには、Hostを停止して、データルート全体と /etc/takoserver（カーソルキーと、保持させたコードを許可する設定があります）をコピーします。更新するには、レビュー済みの新しいコミットを今のチェックアウトの横に用意して切り替えます。前のチェックアウトとバックアップは残しておきます。",
     monitoring: "監視（英語）",
     backup: "コールドスナップショット（英語）",
     update: "更新（英語）",
