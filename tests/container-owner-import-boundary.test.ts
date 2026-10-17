@@ -62,6 +62,32 @@ test("the fixed Container and Endpoint compilers pass the actual import checker"
   expect(result.stderr).toBe("");
 });
 
+for (const path of [
+  "tests/takoform-v2-host-delete-acceptance.test.ts",
+  "tests/v2-container-endpoint-app-composition.test.ts",
+]) {
+  test(`the exact white-box boundary test may construct a witness in ${path}`, async () => {
+    const result = await probe((files) => {
+      files.set(path, importNamed(mintName, "../src/takoform-v2/host-acceptance.ts"));
+    });
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+  });
+}
+
+for (const path of [
+  "tests/takoform-v2-host-delete-acceptance-copy.test.ts",
+  "tests/v2-container-endpoint-app-composition-copy.test.ts",
+]) {
+  test(`a neighboring test does not inherit witness construction in ${path}`, async () => {
+    const result = await probe((files) => {
+      files.set(path, importNamed(mintName, "../src/takoform-v2/host-acceptance.ts"));
+    });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain(`${path}: prepared Host acceptance mint belongs only`);
+  });
+}
+
 for (const path of ["src/auth.ts", "scripts/rogue-acceptance.ts", "tests/rogue-acceptance.ts"]) {
   test(`another mint caller remains forbidden in ${path}`, async () => {
     const result = await probe((files) => {

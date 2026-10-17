@@ -1206,10 +1206,17 @@ function checkHostAcceptanceImports(path: string): void {
     "src/worker-endpoint-origin-v2-acceptance.ts",
     "src/takoform-v2/container-owner-schema.ts",
   ];
+  // White-box Core/App boundary tests construct hostile and neutral witnesses.
+  // This names only those two tests; runtime callers remain the fixed compilers.
+  const whiteBoxTests = [
+    "tests/takoform-v2-host-delete-acceptance.test.ts",
+    "tests/v2-container-endpoint-app-composition.test.ts",
+  ];
+  const mayMint = owners.includes(path) || whiteBoxTests.includes(path);
   if (
     path !== "scripts/check-imports.ts" &&
     /\bprepareV2HostAcceptance\b/u.test(source) &&
-    !owners.includes(path)
+    !mayMint
   ) {
     violations.push(
       `${path}: prepared Host acceptance mint belongs only to fixed source compilers`,
@@ -1223,10 +1230,7 @@ function checkHostAcceptanceImports(path: string): void {
   ].filter(
     (value) => normalize(relative(resolve("."), resolve(dirname(path), value[3] ?? ""))) === target,
   );
-  if (
-    !owners.includes(path) &&
-    named.some((value) => /\bprepareV2HostAcceptance\b/u.test(value[1] ?? ""))
-  )
+  if (!mayMint && named.some((value) => /\bprepareV2HostAcceptance\b/u.test(value[1] ?? "")))
     violations.push(
       `${path}: prepared Host acceptance mint import is private to fixed source compilers`,
     );
