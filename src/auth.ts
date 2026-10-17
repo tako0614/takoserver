@@ -1,5 +1,12 @@
+import { createCredentialAuthorityClassStore } from "./credential-authority-class.ts";
+import {
+  assertIdentityVerificationCaptureReader,
+  type IdentityVerificationCaptureReader,
+  type IdentityVerificationObservation,
+} from "./identity-setup.ts";
 import { bytesDigest } from "./json.ts";
-import { type Clock, type Row, type Sql, SqlError } from "./ports.ts";
+import { type Clock, type Row, type Sql, SqlError, type SqlStatement } from "./ports.ts";
+import type { PrincipalAnchor } from "./shared-principal-authority.ts";
 
 /**
  * Who is calling, and what they are allowed to ask for.
@@ -840,7 +847,78 @@ export function createSingleUseCredentials(sql: Sql, clock: Clock): SingleUseCre
   };
 }
 
+/** Candidate metadata only: no installed Auth0103 target or qualified consumer port. */
+const UNREGISTERED_LOCAL_AUTH_TARGET = "auth103:unregistered-local-candidate";
+
+type OriginalIdentityCapture = {
+  readonly receiver: ExternalIdentityVerifier & IdentityVerificationCaptureReader;
+  readonly capture: IdentityVerificationCaptureReader["captureVerifiedIdentity"];
+  readonly inspect: IdentityVerificationCaptureReader["inspectVerifiedIdentityCapture"];
+};
+
+/** Ordinary mounted Accounts keeps its historical schema and issuance path. */
 export function createAccounts(options: CreateAccountsOptions): Accounts & AuthTokenCaptureReader {
+  return createAccountsInternal(options, null);
+}
+
+/**
+ * Unmounted Auth0103 source preparation. This constructor requires an original
+ * resolveIdentity verifier; it is never selected from a request/Actor/DTO.
+ * The candidate target text is storage metadata, not installed target proof.
+ */
+export function createAccountsWithUnregisteredLocalIssuer(
+  options: CreateAccountsOptions & {
+    readonly identity: ExternalIdentityVerifier & IdentityVerificationCaptureReader;
+  },
+): Accounts & AuthTokenCaptureReader {
+  // Read the selected verifier once through an own data descriptor. Reading
+  // options.identity repeatedly lets an accessor return a genuine verifier
+  // for the origin check and fake callbacks for the later captured methods.
+  if (!options || typeof options !== "object") throw new AuthError("invalid");
+  const selected = Object.getOwnPropertyDescriptor(options, "identity");
+  if (!selected || !("value" in selected)) throw new AuthError("invalid");
+  const identity = selected.value as ExternalIdentityVerifier & IdentityVerificationCaptureReader;
+  // Read each optional once, then omit absent fields. exactOptionalPropertyTypes
+  // distinguishes an omitted option from an own property set to undefined.
+  const sql = options.sql;
+  const clock = options.clock;
+  const randomSecret = options.randomSecret;
+  const randomId = options.randomId;
+  const apiKeyAdministration = options.apiKeyAdministration;
+  const normalized: CreateAccountsOptions = {
+    sql,
+    identity,
+    ...(clock === undefined ? {} : { clock }),
+    ...(randomSecret === undefined ? {} : { randomSecret }),
+    ...(randomId === undefined ? {} : { randomId }),
+    ...(apiKeyAdministration === undefined ? {} : { apiKeyAdministration }),
+  };
+  assertIdentityVerificationCaptureReader(identity);
+  const capture = Object.getOwnPropertyDescriptor(identity, "captureVerifiedIdentity");
+  const inspect = Object.getOwnPropertyDescriptor(identity, "inspectVerifiedIdentityCapture");
+  if (
+    !capture ||
+    !("value" in capture) ||
+    typeof capture.value !== "function" ||
+    !inspect ||
+    !("value" in inspect) ||
+    typeof inspect.value !== "function"
+  ) {
+    throw new AuthError("invalid");
+  }
+  assertIdentityVerificationCaptureReader(identity);
+  const original: OriginalIdentityCapture = Object.freeze({
+    receiver: identity,
+    capture: capture.value,
+    inspect: inspect.value,
+  });
+  return createAccountsInternal(normalized, original);
+}
+
+function createAccountsInternal(
+  options: CreateAccountsOptions,
+  localIssuer: OriginalIdentityCapture | null,
+): Accounts & AuthTokenCaptureReader {
   const { sql, identity } = options;
   const clock = options.clock ?? (() => new Date());
   const randomSecret = options.randomSecret ?? defaultSecret;
@@ -971,40 +1049,57 @@ export function createAccounts(options: CreateAccountsOptions): Accounts & AuthT
       if (provider !== "takos-id" && provider !== "google" && provider !== "github") {
         throw new AuthError("invalid");
       }
-      const verified = await identity.verify({
-        provider,
-        assertion,
-        method,
-        nonce,
-        audience,
-      });
+      let observed: IdentityVerificationObservation | null = null;
+      let verified: Awaited<ReturnType<ExternalIdentityVerifier["verify"]>>;
+      if (localIssuer) {
+        // Capture methods and their receiver come from the selected factory.
+        // No caller-supplied proof or structural verifier opts into issuance.
+        assertIdentityVerificationCaptureReader(localIssuer.receiver);
+        const result = await Reflect.apply(localIssuer.capture, localIssuer.receiver, [
+          {
+            provider,
+            assertion,
+            method,
+            nonce,
+            audience,
+          },
+        ]);
+        assertIdentityVerificationCaptureReader(localIssuer.receiver);
+        observed = Reflect.apply(localIssuer.inspect, localIssuer.receiver, [result.capture]);
+        verified = result.verified;
+        if (
+          !observed ||
+          observed.provider !== provider ||
+          observed.providerSubject !== verified.providerSubject ||
+          observed.email !== verified.email ||
+          observed.displayName !== verified.displayName
+        ) {
+          throw new AuthError("invalid");
+        }
+      } else {
+        verified = await identity.verify({ provider, assertion, method, nonce, audience });
+      }
       // Spent before anything is written or issued: a replayed credential opens
       // nothing, and a crash after this point burns it rather than leaving it
       // usable twice.
       if (verified.singleUse) await singleUse.spend(verified.singleUse);
+      if (localIssuer) assertIdentityVerificationCaptureReader(localIssuer.receiver);
       const rows = await sql.query(
         "SELECT id, email, display_name FROM principals WHERE provider = ? AND provider_subject = ?",
         [provider, verified.providerSubject],
       );
       const existing = rows[0];
       const id = existing ? String(existing.id) : `prn_${randomId()}`;
-      if (!existing) {
-        await sql.run(
-          `INSERT INTO principals (id, provider, provider_subject, email, display_name, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [id, provider, verified.providerSubject, verified.email, verified.displayName, stamp()],
-        );
-      }
+      // Keep the original Takos ID Organization projection. For a fresh local
+      // Principal its statements join the same issuance batch.
+      const projection: SqlStatement[] = [];
       if (provider === "takos-id") {
         const owned = (verified.organizations ?? []).filter(
           (organization) => organization.role === "owner",
         );
         const projectedAt = stamp();
-        await sql.batch([
-          {
-            sql: "DELETE FROM org_memberships WHERE principal_id = ?",
-            params: [id],
-          },
+        projection.push(
+          { sql: "DELETE FROM org_memberships WHERE principal_id = ?", params: [id] },
           ...owned.flatMap((organization) => [
             {
               sql: `INSERT INTO orgs (id, name, owner_principal_id, created_at)
@@ -1020,8 +1115,171 @@ export function createAccounts(options: CreateAccountsOptions): Accounts & AuthT
               params: [organization.id, id, projectedAt],
             },
           ]),
-        ]);
+        );
       }
+      if (localIssuer && observed && !existing) {
+        assertIdentityVerificationCaptureReader(localIssuer.receiver);
+        const createdAt = stamp();
+        const incarnation = `principal_inc_${randomId()}`;
+        const originRef = `local_identity_${randomId()}`;
+        const anchor: PrincipalAnchor = Object.freeze({
+          principalId: id,
+          incarnation,
+          identityKind: provider,
+          identitySubject: observed.providerSubject,
+          principalCreatedAt: createdAt,
+          originKind: "fresh-local",
+          origin: Object.freeze({ ref: originRef, digest: observed.assertionDigest }),
+          verificationDomain: observed.verificationDomain,
+          enrolledAt: createdAt,
+          state: "active",
+          terminal: null,
+        });
+        const secret = randomSecret();
+        const tokenId = `ses_${randomId()}`;
+        const issuedAt = clock();
+        const tokenCreatedAt = issuedAt.toISOString();
+        const expiresAt = new Date(
+          issuedAt.getTime() + (sessionTtlSeconds ?? 12 * 60 * 60) * 1_000,
+        ).toISOString();
+        const digest = await bytesDigest(new TextEncoder().encode(secret));
+        const classStatement = createCredentialAuthorityClassStore({
+          sql,
+        }).localSessionIssuanceStatement(
+          {
+            ref: `authority_${randomId()}`,
+            incarnation: `credential_inc_${randomId()}`,
+            targetRef: UNREGISTERED_LOCAL_AUTH_TARGET,
+            principalId: id,
+            principalIncarnation: incarnation,
+            issuanceRef: `local_session_${tokenId}`,
+            issuanceDigest: digest,
+            issuedAt: tokenCreatedAt,
+          },
+          { id: tokenId, digest, scopesJson: "[]", createdAt: tokenCreatedAt },
+          anchor,
+          observed.verificationDomain,
+        );
+        assertIdentityVerificationCaptureReader(localIssuer.receiver);
+        await sql.batch([
+          {
+            sql: `INSERT INTO principals (id, provider, provider_subject, email, display_name, created_at)
+                  VALUES (?, ?, ?, ?, ?, ?)`,
+            params: [
+              id,
+              provider,
+              observed.providerSubject,
+              observed.email,
+              observed.displayName,
+              createdAt,
+            ],
+          },
+          {
+            sql: `INSERT INTO auth_principal_incarnations
+                  (principal_id, principal_incarnation, identity_kind, identity_subject,
+                   principal_created_at, origin_kind, origin_ref, origin_digest,
+                   identity_authority_body, identity_authority_digest, enrolled_at)
+                  VALUES (?, ?, ?, ?, ?, 'fresh-local', ?, ?, ?, ?, ?)`,
+            params: [
+              id,
+              incarnation,
+              provider,
+              observed.providerSubject,
+              createdAt,
+              originRef,
+              observed.assertionDigest,
+              JSON.stringify(observed.verificationDomain.body),
+              observed.verificationDomain.digest,
+              createdAt,
+            ],
+          },
+          ...projection,
+          {
+            sql: `INSERT INTO auth_tokens
+                  (secret_digest, id, kind, principal_id, org_id, name, scopes_json, created_at, expires_at)
+                  VALUES (?, ?, 'session', ?, NULL, 'session', '[]', ?, ?)`,
+            params: [digest, tokenId, id, tokenCreatedAt, expiresAt],
+          },
+          // The fixed class INSERT is last. Its computed NULL principal_id
+          // violates NOT NULL on a zero-row token/anchor guard; Sql.batch must
+          // roll back Principal, anchor, projection and token together.
+          classStatement,
+        ]);
+        return {
+          principal: {
+            id,
+            provider,
+            providerSubject: observed.providerSubject,
+            email: observed.email,
+            displayName: observed.displayName,
+          },
+          sessionToken: secret,
+        };
+      }
+      if (localIssuer && existing) {
+        // Reissuance for any enrolled Principal is a separate owner unit.
+        // A failed/missing table read must never become a legacy fallback.
+        const anchors = await sql.query(
+          "SELECT principal_incarnation FROM auth_principal_incarnations WHERE principal_id = ?",
+          [id],
+        );
+        if (anchors.length !== 0) throw new AuthError("permission_denied");
+        const secret = randomSecret();
+        const tokenId = `ses_${randomId()}`;
+        const issuedAt = clock();
+        const tokenCreatedAt = issuedAt.toISOString();
+        const expiresAt = new Date(
+          issuedAt.getTime() + (sessionTtlSeconds ?? 12 * 60 * 60) * 1_000,
+        ).toISOString();
+        const digest = await bytesDigest(new TextEncoder().encode(secret));
+        // Repeat the no-anchor condition in the mandatory token INSERT. A
+        // concurrent enrollment after the read fails inside this same batch,
+        // including its Takos ID projection, instead of minting a legacy token.
+        assertIdentityVerificationCaptureReader(localIssuer.receiver);
+        await sql.batch([
+          ...projection,
+          {
+            sql: `INSERT INTO auth_tokens
+                  (secret_digest, id, kind, principal_id, org_id, name, scopes_json, created_at, expires_at)
+                  VALUES (?, ?, 'session',
+                    CASE WHEN EXISTS (
+                      SELECT 1 FROM principals p WHERE p.id=? AND p.provider=? AND p.provider_subject=?
+                    ) AND NOT EXISTS (
+                      SELECT 1 FROM auth_principal_incarnations i WHERE i.principal_id=?
+                    ) THEN ? ELSE NULL END,
+                    NULL, 'session', '[]', ?, ?)`,
+            params: [
+              digest,
+              tokenId,
+              id,
+              provider,
+              verified.providerSubject,
+              id,
+              id,
+              tokenCreatedAt,
+              expiresAt,
+            ],
+          },
+        ]);
+        return {
+          principal: {
+            id,
+            provider,
+            providerSubject: verified.providerSubject,
+            email: verified.email,
+            displayName: verified.displayName,
+          },
+          sessionToken: secret,
+        };
+      }
+      if (!existing) {
+        await sql.run(
+          `INSERT INTO principals (id, provider, provider_subject, email, display_name, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [id, provider, verified.providerSubject, verified.email, verified.displayName, stamp()],
+        );
+      }
+      if (projection.length > 0) await sql.batch(projection);
       const { secret } = await issueSessionToken({
         principalId: id,
         expiresInSeconds: sessionTtlSeconds ?? 12 * 60 * 60,

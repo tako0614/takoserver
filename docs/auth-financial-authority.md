@@ -40,16 +40,64 @@ future caller must be the genuine Auth-owned verification/issuance operation.
 Missing remains missing, not complete-history/clear. A retained row is not a
 current authentication result or a payer grant.
 
-The unregistered additive Auth103 DDL has one source in
-`src/auth-authority-schema-plan.ts`. The fixture contains only synthetic
-pre-Auth103 Principal, token, Org and RP prerequisites; component tests append
-that exact DDL source. The candidate local anchor stores the canonical tagged
-Unit P verifier-domain tuple as JSON text and its SHA-256 digest. `readAnchor`
-checks tuple shape, exact serialization and digest before returning a frozen
-`fresh-local` anchor. Shared and proved-legacy anchors require both domain
-columns to be NULL. The historical `origin_digest` is separate from the stable
-domain digest, so a later assertion may have different bytes under the same
-issuer/client or public-key configuration.
+The unregistered full Auth103 DDL base remains in
+`src/auth-authority-schema-plan.ts`. Its explicit `additiveAuthFullRpDDL`
+composition appends the Auth-owned, unregistered storage/lifecycle source in
+`src/auth-rp-storage-schema-plan.ts`; it declares the attempts, sessions, and
+revocations consumed by the real RP5 store and retires matching retained RP
+classes on terminal session transition or deletion. It has no expiring-payload
+foreign key, no Financial104 table dependency, and no authority to register or
+apply a migration. Before-insert ignore guards are intended to keep the store's
+`ON CONFLICT DO NOTHING` duplicate result while preventing replacement of an
+extant row; retained-class history also reserves classified session digests
+after cleanup. The source regression covers duplicate attempt insertion and
+replacement/ignore behavior; session claim/one-shot completion and selected
+touch; existing-session revocation queue idempotency/readback, replacement,
+ignore, retry and completion; and safe-integer counter/version boundaries.
+The test is authored but unexecuted. Its known CAS result does not simulate or
+retry an unknown completion acknowledgement. There is no universal tombstone
+for consumed attempts, cleaned unclassified sessions, or deleted outbox rows,
+so the source does not claim permanent reservation for those values. Full
+class-store component tests continue to use their
+explicit synthetic RP prerequisite. The dedicated
+`auth103-rp-schema-lifecycle.test.ts` source test instead targets the canonical
+migration baseline plus this Auth-owned composition and the actual RP5 store;
+it uses the canonical account path to retain a legacy Google Principal for
+structural storage guard coverage, not a fresh fake shared Principal or genuine
+proof. The composed DDL, including a valid class insert against the Auth-owned
+RP table, still requires focused SQLite execution before this candidate can be
+called usable. That source test remains unexecuted in the private preparation.
+
+Local issuer tests use the separate `additiveAuthTokenDDL` candidate. Synthetic
+local issuer fixtures remove the fixture-only RP payload table before setup and
+assert it remains absent; canonical migration lineage asserts that it was never
+present. The token-only candidate shares retained table names and lifecycle
+rules, contains no RP payload-table reference, and explicitly aborts either RP
+backend or class. The full RP and token-only candidates are alternative
+unregistered component schemas: never install them together or swap one for the
+other on a live target. A complete Auth103 candidate still requires the
+gap-free real 101/102 predecessor, an additive Principal provider-preservation
+transition, genuine RP producer closure, and later independent schema/native
+qualification. The local RP-free token candidate does not provide any of those
+full-lane qualifications. A metadata-only in-memory inspection of actual
+migrations 1–100 found the existing Principal relation has six required text
+columns (`id`, `provider`, `provider_subject`, `email`, `display_name`,
+`created_at`), existing unique indexes, a provider check limited to `takos-id`,
+`google`, and `github`, and an inbound
+`personal_organizations.principal_id -> principals.id` NO ACTION foreign key.
+The inspected baseline has no RP storage tables. The provider expansion must
+preserve legacy Principal rows and every existing identity, unique constraint,
+and referencing row while adding the genuine shared-account provider; it cannot
+use a placeholder provider, FK-off/table-wipe shortcut, or destructive lineage
+rewrite. The actual 101/102 prefix and a portable D1 preservation method remain
+unqualified, so no claim is made that this transition is already present or
+safe to apply. The candidate local anchor stores the
+canonical tagged Unit P verifier-domain tuple as JSON text and its SHA-256
+digest. `readAnchor` checks tuple shape, exact serialization and digest before
+returning a frozen `fresh-local` anchor. Shared and proved-legacy anchors
+require both domain columns to be NULL. The historical `origin_digest` is
+separate from the stable domain digest, so a later assertion may have different
+bytes under the same issuer/client or public-key configuration.
 
 Local same-primary currentness binds the original Principal ID, provider,
 subject, creation text and the captured domain pair. Direct session/key class
@@ -60,11 +108,22 @@ class split and keeps both domain columns immutable across retirement. A
 proved-legacy binding does not permit direct class issuance. An existing
 unanchored Principal is not silently adopted as fresh-local.
 
-This is a source-only storage component. The synthetic fresh-local SQL case
-does not prove actual Accounts enrollment: the future issuer must retain Unit P's
-factory-private capture and create a new Principal, anchor, token and mandatory
-class in one real batch. Auth103 registration, physical-target enrollment,
-native D1 qualification and Financial permission remain separate owner work.
+The unmounted `createAccountsWithUnregisteredLocalIssuer` candidate connects the
+actual `resolveIdentity` factory-private capture to a new-Principal sign-in.
+It selects `identity` once from the constructor options' own data descriptor,
+then keeps the same verifier receiver and its original own capture/inspection
+methods. An options accessor, verifier method replacement or clone is rejected
+without trusting a callback's result.
+It spends single-use credentials first, then writes that Principal, its
+`fresh-local` anchor with the exact selected verifier domain, its session token
+and the mandatory `direct-owner-session` class in one `Sql.batch`. The final
+class INSERT aborts that batch if the token or anchor is missing. The
+candidate `target_ref` is unqualified storage metadata only. An existing
+unanchored Principal keeps the legacy sign-in path under a final no-anchor SQL
+guard; an anchored or unreadable Principal cannot mint an unclassified session
+through this constructor. Reissuance for enrolled local Principals is still a
+separate unit. Auth103 registration, physical-target enrollment, native D1
+qualification and Financial permission remain separate owner work.
 
 `createCredentialAuthorityClassStore({sql})` provides separate fixed
 `localSessionIssuanceStatement`, `directKeyIssuanceStatement`,
@@ -75,8 +134,9 @@ credential write in the **same** `Sql.batch`. SQL checks the exact actual
 credential and original Principal incarnation, and the candidate constraints
 preserve the closed backend shape. A zero-row credential INSERT or conflicting
 class must abort that batch. The helper does not generate a secret or turn a
-structural input into proof of enrollment. The real issuer/capture is a separate
-Auth/RP source change; this storage component does not change ordinary issuance.
+structural input into proof of enrollment. The unmounted local constructor
+connects the genuine capture only for a new local Principal. Direct-key,
+broker and RP issuance remain separate owner work; ordinary issuance is unchanged.
 
 `readRetained` preserves exact credential digest/ID/incarnation, issuance
 reference, class and terminal history. `retire` is a one-way CAS against the
@@ -93,9 +153,9 @@ the structural fixture is not an implementation of that producer.
 ordinary `Accounts` and `Actor` contracts stay unchanged. Both ordinary
 authentication and `captureAuthenticatedToken` use the same private token
 lookup on that factory's actual `Sql`, with the bearer digest, unrevoked row
-and existing expiry predicate. No Auth103 table is queried or written. OAuth
-providers, sign-in, key issuance, Organization projection and public wire
-responses retain their existing behavior.
+and existing expiry predicate. Ordinary `createAccounts` does not query or
+write Auth103 tables. OAuth providers, key issuance and public wire responses
+retain their existing behavior.
 
 The capture additionally validates the actual row's digest, current kind,
 Org/session shape, raw scope JSON and expiry after the awaited lookup. It
@@ -114,8 +174,9 @@ CAS. The key's Principal remains its administrative owner, not a shared human
 payer. Missing class cannot become direct classification or permission for a
 new Financial command. No Financial command path consumes this seam yet.
 
-Class issuance and App/control/RP mounting are separate. They require the real
-registered predecessor/Auth schema and owner-qualified target/composition port;
+The source-only local candidate does not mount App/control/RP or issue shared
+credentials. Those paths require the real registered predecessor/Auth schema
+and owner-qualified target/composition port;
 publicOrigin, tenant JSON and ready booleans cannot provide it. Existing tokens
 are not bulk adopted. Actual RP final-row capture remains with its RP owner and
 is not inferred from an Actor or synthesized as an auth_tokens row.
@@ -209,3 +270,10 @@ verified enrollment/proof and all owned Financial guards. Ordinary direct and
 shared origins must stay distinct; missing shared evidence cannot fall back to
 direct. Original accepted unknown operations remain Financial's retained
 recovery responsibility, with their original key/fingerprint/source/realm.
+
+
+### Separate full103 Principal-preserving source alternative
+
+`auth-principal-schema-plan.ts` is an unregistered fixed transition candidate for the exact historical100 plus actual101/102 owner-source graph. Its full103 assembly is `additiveAuthFull103DDL`, distinct from the unchanged base, token-only and RP-storage-only alternatives. It requires the existing migration owner's one transaction and never installs or registers itself. It copies every Principal field and rowid, retains the observed NO ACTION personal-organization references and other catalog objects, and extends the provider domain with `shared-account`. The candidate derives the exact canonical `personal_organizations_owner_insert` trigger from the immutable historical source through the owning statement framer, requires its full catalog definition, and preserves it across the same transaction with the other schema objects. Missing or modified canonical trigger definitions, unknown dependent triggers/views, unknown incoming references, custom indexes, source drift, collisions and failed conservation refuse the transition. `defer_foreign_keys=ON` is kept within the owning transaction; no premature OFF, foreign_keys OFF, schema rewriting or fake legacy provider is used.
+
+The private regression source imports actual immutable100 migration history and both real101/102 candidate producers. It is not runtime evidence until executed and reviewed. The new provider label and structural row are not a genuine shared Principal, issuer, proof, capture or consumer port. Source registration, native D1/transaction/ACK qualification, real predecessor adoption, apply and shared activation remain separate unfinished responsibilities. An unknown import acknowledgement requires the existing owner's original readback protocol, not retrying this non-idempotent candidate or rolling back a committed migration.

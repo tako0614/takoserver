@@ -1,3 +1,6 @@
+import { authPrincipalProviderTransitionDDL } from "./auth-principal-schema-plan.ts";
+import { authRpStorageLifecycleDDL } from "./auth-rp-storage-schema-plan.ts";
+
 /** Unregistered, additive Auth103 candidate. Never apply without owner review/enrollment. */
 export const additiveAuthDDL = String.raw`
 -- PRIVATE UNREGISTERED AUTH0103 ADDITIVE TABLE CANDIDATE.
@@ -408,3 +411,113 @@ END;
 -- the Financial104 producer. No Financial table is referenced by Auth103 DDL.
 -- A missing/currently non-active RP row independently fails the final guard.
 `;
+
+/**
+ * Full RP-capable unregistered candidate: the retained Auth candidate plus its
+ * Auth-owned RP storage/lifecycle component. Not a migration or apply entry.
+ * The separate token-only materialization remains RP-free and unchanged.
+ */
+export const additiveAuthFullRpDDL = `${additiveAuthDDL}\n${authRpStorageLifecycleDDL}`;
+
+function replaceCandidateDdlSegmentOnce(
+  source: string,
+  start: string,
+  end: string,
+  replacement: string,
+): string {
+  const startAt = source.indexOf(start);
+  const endAt = source.indexOf(end, startAt + start.length);
+  if (
+    startAt < 0 ||
+    endAt < 0 ||
+    source.indexOf(start, startAt + start.length) >= 0 ||
+    source.indexOf(end, endAt + end.length) >= 0
+  ) {
+    throw new Error("Auth candidate source segment must occur exactly once");
+  }
+  return `${source.slice(0, startAt)}${replacement}${source.slice(endAt)}`;
+}
+
+function replaceCandidateDdlFragmentOnce(
+  source: string,
+  fragment: string,
+  replacement: string,
+): string {
+  const at = source.indexOf(fragment);
+  if (at < 0 || source.indexOf(fragment, at + fragment.length) >= 0) {
+    throw new Error("Auth candidate source fragment must occur exactly once");
+  }
+  return `${source.slice(0, at)}${replacement}${source.slice(at + fragment.length)}`;
+}
+
+function createAuthTokenOnlyCandidateDDL(): string {
+  const start =
+    "CREATE TRIGGER credential_authority_classes_initial BEFORE INSERT ON credential_authority_classes\n";
+  const end =
+    "-- PRIVATE UNREGISTERED AUTH0103 CANDIDATE, installable only AFTER eventual Principal\n";
+  const startAt = additiveAuthDDL.indexOf(start);
+  const endAt = additiveAuthDDL.indexOf(end, startAt + start.length);
+  if (
+    startAt < 0 ||
+    endAt < 0 ||
+    additiveAuthDDL.indexOf(start, startAt + start.length) >= 0 ||
+    additiveAuthDDL.indexOf(end, endAt + end.length) >= 0
+  ) {
+    throw new Error("Auth candidate class fence source is missing");
+  }
+  let segment = additiveAuthDDL.slice(startAt, endAt);
+
+  const rpPayloadGuardStart =
+    " OR (NEW.backend='shared-rp-session' AND NOT EXISTS (\n SELECT 1 FROM shared_principal_bindings b WHERE b.binding_ref=NEW.principal_binding_ref";
+  const rpGuardEnd =
+    "BEGIN SELECT RAISE(ABORT,'Actual live credential and retained class origin required'); END;";
+  const guardEndAt = segment.indexOf(rpGuardEnd);
+  const rpGuardAt = segment.indexOf(rpPayloadGuardStart);
+  if (
+    rpGuardAt < 0 ||
+    guardEndAt < rpGuardAt ||
+    segment.indexOf(rpPayloadGuardStart, rpGuardAt + rpPayloadGuardStart.length) >= 0 ||
+    segment.indexOf(rpGuardEnd, guardEndAt + rpGuardEnd.length) >= 0
+  ) {
+    throw new Error("Auth candidate RP payload guards must occur exactly once");
+  }
+  segment = `${segment.slice(0, rpGuardAt)}\n${segment.slice(guardEndAt)}`;
+
+  segment = replaceCandidateDdlFragmentOnce(
+    segment,
+    "-- This insert fence checks local physical facts, not enrollment/payer/source\n-- permission. The genuine Auth issuer still owns actual proof+issuance capture.\n-- The exact PR373 shared_auth_sessions row is referenced but not created here.\n-- Its owner schema/identity-lifecycle enforcement must be delivered and joined\n-- into the eventual Auth103 schema before this candidate can be executable.\n-- Genuine RP decrypt/issuer/proof validation and same-batch postcondition remain\n-- producer obligations; current row presence alone never mints a class.\n",
+    "-- This unregistered token-only candidate retains Principal, token, broker,\n-- and history checks, while its explicit fence below refuses either RP class\n-- or backend. It does not supply or qualify the complete Auth103 candidate.\n",
+  );
+
+  const classTrigger =
+    "CREATE TRIGGER credential_authority_classes_initial BEFORE INSERT ON credential_authority_classes\n";
+  segment = replaceCandidateDdlFragmentOnce(
+    segment,
+    classTrigger,
+    "CREATE TRIGGER credential_authority_classes_local_token_only BEFORE INSERT ON credential_authority_classes\nWHEN NEW.backend='shared-rp-session' OR NEW.class='official-shared-rp-session'\nBEGIN SELECT RAISE(ABORT,'Local Auth token candidate rejects RP backend or class'); END;\n\n" +
+      classTrigger,
+  );
+
+  let ddl = replaceCandidateDdlSegmentOnce(additiveAuthDDL, start, end, segment);
+  ddl = replaceCandidateDdlFragmentOnce(
+    ddl,
+    "-- RP state/delete hooks require owner ACK of the actual integrated RP store\n-- schema/transaction. They close exact session_digest + session_created_at class\n-- when active/checking -> revocation_pending/revoked, or before payload deletion;\n-- they must also preserve Financial-owned source-fence/outbox semantics through\n-- the Financial104 producer. No Financial table is referenced by Auth103 DDL.\n-- A missing/currently non-active RP row independently fails the final guard.\n",
+    "-- This local token-only candidate has no RP payload lifecycle hooks.\n",
+  );
+  if (ddl.includes("shared_auth_sessions")) {
+    throw new Error("Local Auth token candidate must not reference RP payload storage");
+  }
+  if (
+    !ddl.includes("WHEN NEW.backend='shared-rp-session' OR NEW.class='official-shared-rp-session'")
+  ) {
+    throw new Error("Local Auth token candidate must reject the RP backend and class");
+  }
+  return ddl;
+}
+
+/** Separate unregistered Auth token-only candidate; never install with or swap against additiveAuthDDL. */
+export const additiveAuthTokenDDL = createAuthTokenOnlyCandidateDDL();
+
+// Separate full103 alternative for a fixed101/102 predecessor. Unregistered;
+// one migration-owner transaction is mandatory. Token/base alternatives stay unchanged.
+export const additiveAuthFull103DDL = `${authPrincipalProviderTransitionDDL}\n${additiveAuthFullRpDDL}`;

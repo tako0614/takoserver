@@ -14,7 +14,7 @@ export const KNOWN_FORM_GROUPS = [
     forms: [
       `${EDGE}/WorkerBundle/0.2.0/`,
       `${EDGE}/StaticAssetBundle/0.2.0/`,
-      `${EDGE}/SQLiteMigrationSet/0.2.0/`,
+      `${EDGE}/SQLiteMigrationSet/0.4.0/`,
     ],
   },
   {
@@ -31,7 +31,7 @@ export const KNOWN_FORM_GROUPS = [
     label: () => tr("データ", "Data"),
     forms: [
       `${EDGE}/SQLiteDatabase/0.2.0/`,
-      `${EDGE}/SQLiteMigrationApplication/0.2.0/`,
+      `${EDGE}/SQLiteMigrationApplication/0.4.0/`,
       `${EDGE}/EdgeKVNamespace/0.2.0/`,
       `${EDGE}/ObjectBucket/0.2.0/`,
     ],
