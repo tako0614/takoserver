@@ -1230,9 +1230,9 @@ a database: through a Binding in its WorkerVersion. `kvBindings` name an
 `queueProducerBindings` an `AtLeastOnceQueue`, each entry as
 `{name, resource: {resourceUid}}`. A Binding name is up to 64 ASCII letters,
 digits, `_` and `$`, not starting with a digit, such as `NOTES` (no `-`), and
-no var, secret or other Binding of the version may share it. To read a queue, a `QueueConsumer` names the queue
-and the Worker, and the Worker's code exports a `queue` handler. The published
-Forms define each spec:
+no var, secret or other Binding of the version may share it. To read a queue,
+a `QueueConsumer` names the queue and the Worker, and the Worker's code exports
+a `queue` handler. The published Forms define each spec:
 [EdgeKVNamespace 0.2.0](https://edge.forms.takoform.com/forms/EdgeKVNamespace/0.2.0/),
 [ObjectBucket 0.2.0](https://edge.forms.takoform.com/forms/ObjectBucket/0.2.0/),
 [AtLeastOnceQueue 0.2.0](https://edge.forms.takoform.com/forms/AtLeastOnceQueue/0.2.0/)
