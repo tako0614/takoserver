@@ -37,6 +37,7 @@ import {
 } from "../src/takoform-v2/actor-namespace-backend.ts";
 import { createV2ActorNamespaceSqlGraphReader } from "../src/takoform-v2/actor-namespace-sql-graph.ts";
 import { parseTakoformV2PublicConfig } from "../src/takoform-v2/config.ts";
+import { createV2ContainerHostAcceptance } from "../src/takoform-v2/container-owner-schema.ts";
 import { createV2EdgeKvNativeCustody } from "../src/takoform-v2/edge-kv-native-custody.ts";
 import { ACTOR_NAMESPACE_FORM_URL } from "../src/takoform-v2/forms/actor-namespace.ts";
 import { createV2HeldArtifactSource } from "../src/takoform-v2/forms/artifact-source.ts";
@@ -143,6 +144,7 @@ const RUNTIME_EXPORTS = [
   "createObjectBucketForm",
   "createObjectBucketWorkerBindingAuthority",
   "createV2EdgeKvNativeCustody",
+  "createV2ContainerHostAcceptance",
   "createV2ActorNamespaceSqlGraphReader",
   "createV2ActorNamespaceForm",
   "createV2ActorNamespaceFormFrontFace",
@@ -250,6 +252,7 @@ const RUNTIME_EXPORTS = [
 
 test("the v2 package subpath is the existing SQL and Worker Form authority, not a second registry", async () => {
   expect(Object.keys(extension).sort()).toEqual([...RUNTIME_EXPORTS].sort());
+  expect(extension.createV2ContainerHostAcceptance).toBe(createV2ContainerHostAcceptance);
   expect(extension.parseSQLiteMigrationManifest).toBe(parseSQLiteMigrationManifest);
   expect(extension.validateSQLiteMigrationPayload).toBe(validateSQLiteMigrationPayload);
   expect(extension.parseStaticAssetBundleManifest).toBe(parseStaticAssetBundleManifest);
