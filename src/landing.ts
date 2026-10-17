@@ -643,7 +643,12 @@ ${siteAssets ? "" : 'for(const node of document.querySelectorAll("[data-origin]"
 `;
 }
 
-/** The missing-page response, in the same visual system. */
+/**
+ * The missing-page response, in the same visual system: one page for every
+ * missing address. It reads in the language the rest of the site would:
+ * Japanese under /ja/, English under /en/, and otherwise the browser's first
+ * choice of the two.
+ */
 export function notFoundHtml(): string {
   return `<!doctype html>
 <html lang="en">
@@ -659,10 +664,16 @@ export function notFoundHtml(): string {
 <main>
 <a class="brand" href="/" aria-label="Takoserver">${takoMark(26)}<span>takoserver</span></a>
 <p class="code-label">404</p>
-<h1>Page not found</h1>
-<p>This address does not name a page on takoserver.com.</p>
-<a class="pill primary" href="/">Back to takoserver.com</a>
+<h1 data-404="title">Page not found</h1>
+<p data-404="body">This address does not name a page on takoserver.com.</p>
+<a class="pill primary" href="/" data-404="back">Back to takoserver.com</a>
 </main>
+<script>
+const ja={title:"ページが見つかりません",body:"このアドレスにtakoserver.comのページはありません。",back:"takoserver.comに戻る"};
+const first=location.pathname.split("/")[1];
+const browser=(navigator.languages??[navigator.language]).map(l=>String(l).toLowerCase().split("-")[0]).find(l=>l==="ja"||l==="en");
+if(first==="ja"||(first!=="en"&&browser==="ja")){document.documentElement.lang="ja";for(const node of document.querySelectorAll("[data-404]"))node.textContent=ja[node.dataset["404"]];for(const link of document.querySelectorAll('[data-404="back"],.brand'))link.href="/ja/";}
+</script>
 </body>
 </html>
 `;
