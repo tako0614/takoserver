@@ -75,6 +75,13 @@ binary digests before writing
 `artifacts/workerd-c00638f195e4a9fda4bafb07bb7b1674e4d8324d0072efbf0ea57beb0ff08e52`.
 Configure that absolute path as `TAKOSERVER_WORKERD_BINARY`.
 
+Startup hashes and snapshots the selected bytes before executing the complete
+closed-graph capability proof. That proof has a bounded 60-second execution
+window so a loaded Linux VM using QEMU TCG can finish V8 startup. Artifact
+hashing and copying happen before that window. A timeout, failed proof or wrong
+digest still disables execution without a fallback; wait for the Host's
+readiness probe before using the installation.
+
 The native acceptance run covers these real V8 targets:
 
 ```text
