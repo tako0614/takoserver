@@ -266,6 +266,8 @@ describe("Takoserver public site", () => {
     // The same page reads in Japanese under /ja/, or for a Japanese browser.
     expect(html).toContain('ja={title:"ページが見つかりません"');
     expect(html).toContain('if(first==="ja"||(first!=="en"&&browser==="ja"))');
-    expect(html).toContain('document.querySelector(\'[data-404="back"]\').href="/ja/"');
+    expect(html).toContain(
+      'for(const link of document.querySelectorAll(\'[data-404="back"],.brand\'))link.href="/ja/"',
+    );
   });
 });

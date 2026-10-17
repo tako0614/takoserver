@@ -643,9 +643,9 @@ ${siteAssets ? "" : 'for(const node of document.querySelectorAll("[data-origin]"
 `;
 }
 
-/** The missing-page response, in the same visual system. */
 /**
- * One page for every missing address. It reads in the language the rest of
+ * The missing-page response, in the same visual system: one page for every
+ * missing address. It reads in the language the rest of
  * the site would: Japanese under /ja/, English under /en/, and otherwise the
  * browser's first choice of the two.
  */
@@ -672,7 +672,7 @@ export function notFoundHtml(): string {
 const ja={title:"ページが見つかりません",body:"このアドレスにtakoserver.comのページはありません。",back:"takoserver.comに戻る"};
 const first=location.pathname.split("/")[1];
 const browser=(navigator.languages??[navigator.language]).map(l=>String(l).toLowerCase().split("-")[0]).find(l=>l==="ja"||l==="en");
-if(first==="ja"||(first!=="en"&&browser==="ja")){document.documentElement.lang="ja";for(const node of document.querySelectorAll("[data-404]"))node.textContent=ja[node.dataset["404"]];document.querySelector('[data-404="back"]').href="/ja/";}
+if(first==="ja"||(first!=="en"&&browser==="ja")){document.documentElement.lang="ja";for(const node of document.querySelectorAll("[data-404]"))node.textContent=ja[node.dataset["404"]];for(const link of document.querySelectorAll('[data-404="back"],.brand'))link.href="/ja/";}
 </script>
 </body>
 </html>
