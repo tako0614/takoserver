@@ -93,7 +93,7 @@ describe("Takoserver public site", () => {
   test("keeps the guide's self-host steps", () => {
     const html = landingHtml(site);
     expect(html).toContain(
-      "git checkout --detach &lt;reviewed-commit&gt;\nbun install --frozen-lockfile",
+      'COMMIT=$(git rev-parse origin/main)\ngit checkout --detach "$COMMIT"\nbun install --frozen-lockfile',
     );
     expect(html).toContain("<code>TAKOSERVER_TAKOFORM_V2_CURSOR_KEY</code>");
     expect(html).toContain("bun --no-env-file src/entry-bun.ts");
@@ -241,7 +241,7 @@ describe("Takoserver public site", () => {
     // Host API v2 answers only at the public origin, so that is the one named,
     // whatever origin the page was read from.
     expect(withConsole).toContain(
-      "<code>https://api.host.example/apis/forms.takoform.com/v2</code>",
+      "<code>https://api.host.example/<wbr>apis/<wbr>forms.takoform.com/<wbr>v2</code>",
     );
     expect(withConsole).toContain('href="https://api.host.example/.well-known/takoform/v2"');
     expect(withConsole).toContain(
@@ -256,6 +256,17 @@ describe("Takoserver public site", () => {
     expect(bare).toContain('data-i18n="consoleSetup"');
     // The public site describes the reader's own Host, never itself as one.
     expect(landingHtml(site)).not.toContain('<section class="here"');
+  });
+
+  test("says how to keep a Host running, with the guide's sections", () => {
+    const html = landingHtml(site);
+    expect(html).toContain("Keep it running");
+    expect(html).toContain("GET /_takoserver/health/ready");
+    expect(html).toContain('docs/self-host-operations.md#monitoring" data-i18n="monitoring"');
+    expect(html).toContain('docs/self-host-operations.md#cold-snapshot" data-i18n="backup"');
+    expect(html).toContain(
+      'docs/self-host-operations.md#update-and-code-rollback" data-i18n="update"',
+    );
   });
 
   test("answers unknown paths in the same visual system", () => {

@@ -16,7 +16,8 @@ that directory:
 ```sh
 git clone https://github.com/tako0614/takoserver
 cd takoserver
-git checkout --detach <reviewed-commit>
+COMMIT=$(git rev-parse origin/main)   # the commit to review and run
+git checkout --detach "$COMMIT"
 ```
 
 ## Configure and start

@@ -74,8 +74,12 @@ as `KEY` and `ORG`; keep it open between steps.
 
   ```sh
   git clone https://github.com/tako0614/takoserver /opt/takoserver
-  git -C /opt/takoserver checkout --detach <reviewed-commit>
+  COMMIT=$(git -C /opt/takoserver rev-parse origin/main)   # the commit to review and run
+  git -C /opt/takoserver checkout --detach "$COMMIT"
   ```
+
+  Keep a note of `$COMMIT`: an update later moves from it to a newer reviewed
+  commit.
 
 - Bun at the version in `.bun-version` (currently 1.4.0), installed where the
   `takoserver` user can run it. The installer's default location is the
@@ -689,7 +693,9 @@ Seeding remains an option for private or operator-controlled publishers. A held
 URL is exclusive: a wrong digest or missing organization/Space grant fails,
 without public fallback. The Host reads held grants only at startup, so each
 new held bundle takes the same three steps: stop the Host, seed the bundle,
-start the Host again.
+start the Host again. Every Worker on the Host stops serving while it is
+stopped. A bundle published over public HTTPS, as step 9 shows for new code,
+needs no restart.
 
 If you are not sure the complete Worker profile registered, check support as
 in step 7 before seeding: seeding costs a stop and a start, and the Host does
@@ -921,6 +927,26 @@ offers **View resource**.
 6. Record the Deployment on `hello`, as step 9 describes: open `hello` and
    choose **Record the Deployment**.
 
+**Coming back later.** Steps 9 to 11 use the shell variables and helpers of
+steps 5, 6 and 8. In a new shell, set `HOST`, `V2` and `F` again as in step 5
+and `WORK` as in step 6, and define `wait_operation` and `create` again from
+step 8. `ORG` is the **Identifier** on the console's Settings page, and a new
+write key comes from its API keys page. Look up each Resource's UID by its
+name; a name that is not found stops the chain:
+
+```sh
+uid() { # uid <name>
+  curl -sS --fail-with-body -G "$V2/resources" --data-urlencode "space=$ORG" \
+    --data-urlencode "name=$1" -H "authorization: Bearer $KEY" | jq -er '.items[0].uid'
+}
+WORKER=$(uid hello) && BUNDLE=$(uid hello-bundle-v1) &&
+VERSION=$(uid hello-version-v1) && DEPLOYMENT=$(uid hello-deployment) &&
+ENDPOINT=$(uid hello-endpoint)
+```
+
+The Resources of steps 9 and 10 are found the same way, by their names, such
+as `hello-bundle-v2` and `hello-version-v2`.
+
 ### 9. Verify
 
 ```sh
@@ -963,15 +989,50 @@ Deployment's UID as `observed.activeDeploymentUid`. In the console, open
 `hello` and choose **Record the Deployment**; the page offers it only where
 the update can finish, and otherwise says what to do first.
 
-To ship new code, seed the new bytes under a new base URL as in step 6: stop
-the Host, put the new files in `$WORK/hello/v2`, seed them, and start it again:
+To ship new code, put the new files in `$WORK/hello/v2` and give the Host
+their bytes in one of two ways:
 
-```sh
-bun --no-env-file scripts/selfhost-artifact.ts seed worker-bundle "$WORK/hello/v2" \
-  --base-url https://artifacts.example.com/hello/v2/ \
-  --organization "$ORG" --entrypoint worker.js \
-  --config /etc/takoserver/v2/takoform-v2.json > "$WORK/hello-v2.json"
-```
+- **Publish them over public HTTPS**, which needs no restart. Serve the files
+  and a manifest that lists them over HTTPS on port 443 from another machine,
+  such as object storage or a static site; port 443 on this machine belongs to
+  the Host's Endpoints, so it cannot fetch from itself. The Host fetches a URL
+  only when:
+  - its host is a DNS name, not an IP address, whose every answer is a public
+    address and which does not end in `.localhost`, `.local`, `.internal`,
+    `.lan`, `.home.arpa`, `.test`, `.invalid` or `.example`;
+  - its certificate is publicly trusted;
+  - it has no port, query or fragment, and is written in its normalized form;
+  - it answers a plain `200` (no redirect) and its whole body arrives within
+    30 seconds;
+  - it is not one the Host already holds from seeding.
+
+  A manifest is at most 1 MiB, each file at most 16 MiB, and a bundle at most
+  512 files and 128 MiB. When the `WorkerBundle` is created, the Host fetches
+  the manifest and each file, checks their SHA-256 and keeps the bytes. Write
+  the manifest next to `worker.js`, publish both under `$BASE`, and keep the
+  bundle's artifact, the manifest's URL and SHA-256, in `$WORK/hello-v2.json`:
+
+  ```sh
+  BASE=https://artifacts.example.com/hello/v2
+  jq -n --arg url "$BASE/worker.js" \
+      --arg sha "$(sha256sum "$WORK/hello/v2/worker.js" | cut -d' ' -f1)" \
+      '{entrypoint: "worker.js", files: [{path: "worker.js", $url, sha256: $sha,
+        mediaType: "application/javascript+module"}]}' > "$WORK/hello/v2/manifest.json" &&
+  jq -n --arg url "$BASE/manifest.json" \
+      --arg sha "$(sha256sum "$WORK/hello/v2/manifest.json" | cut -d' ' -f1)" \
+      '{artifact: {$url, sha256: $sha}}' > "$WORK/hello-v2.json"
+  ```
+
+- **Seed them onto the Host**, as in step 6, for a publisher that is not
+  public. Seeding needs the Host stopped, so every Worker on the Host stops
+  serving until it starts again:
+
+  ```sh
+  bun --no-env-file scripts/selfhost-artifact.ts seed worker-bundle "$WORK/hello/v2" \
+    --base-url https://artifacts.example.com/hello/v2/ \
+    --organization "$ORG" --entrypoint worker.js \
+    --config /etc/takoserver/v2/takoform-v2.json > "$WORK/hello-v2.json"
+  ```
 
 Then create a new `WorkerBundle` and `WorkerVersion` and replace the
 Deployment's spec. A `PUT` names the Deployment's current `generation`, read
@@ -1002,6 +1063,11 @@ and choose **Serve this version**. It opens the update of `hello-deployment`
 with that version alone at weight 10000, naming the Deployment generation the
 page read, and sends it when you choose **Update**. The Worker keeps the
 Deployment it recorded, so it needs no second record.
+
+**To go back**, serve the earlier version again: in the console, open
+`hello-version-v1` and choose **Serve this version**; with curl, send the same
+`PUT` naming `$VERSION`. Keep v1 until v2 has served for a while, because step
+11 deletes a version only once nothing serves it.
 
 `tests/selfhost-v2-ordinary-journey-native.test.ts`
 runs this path, apart from recording the Deployment on the Worker, with real
@@ -1251,10 +1317,21 @@ commit first, then, as root (the checkout stays root-owned and read-only to
 
    ```sh
    git -C /opt/takoserver fetch origin
-   git -C /opt/takoserver cat-file -e '<reviewed-commit>^{commit}'
-   git -C /opt/takoserver worktree add --detach /opt/takoserver-<short-commit> <reviewed-commit>
-   cd /opt/takoserver-<short-commit> && bun install --frozen-lockfile
+   NEW=$(git -C /opt/takoserver rev-parse origin/main)
+   git -C /opt/takoserver log -1 --format='%H %cd %s' "$NEW"
    ```
+
+   Check that this is the commit you reviewed; to run another, set `NEW` to its
+   full hash. Then add it and install its dependencies:
+
+   ```sh
+   DIR=/opt/takoserver-$(git -C /opt/takoserver rev-parse --short=12 "$NEW")
+   git -C /opt/takoserver worktree add --detach "$DIR" "$NEW"
+   cd "$DIR" && bun install --frozen-lockfile
+   ```
+
+   The steps below name the new checkout `$DIR`. `NEW` and `DIR` last only in
+   this root shell, so run the rest of this update in it.
 
    If `bun install` fails on the lockfile, the new checkout may expect another
    Bun version; see step 2.
@@ -1268,10 +1345,10 @@ commit first, then, as root (the checkout stays root-owned and read-only to
    the Bun version at startup:
 
    ```sh
-   cat /opt/takoserver-<short-commit>/.bun-version; bun --version
-   grep -o 'sha256: "[0-9a-f]*"' /opt/takoserver-<short-commit>/src/workerd-artifact.ts
+   cat "$DIR/.bun-version"; bun --version
+   grep -o 'sha256: "[0-9a-f]*"' "$DIR/src/workerd-artifact.ts"
    . /etc/takoserver/takoserver.env && sha256sum "$TAKOSERVER_WORKERD_BINARY"
-   grep '^toolchain' /opt/takoserver-<short-commit>/services/workflow-execution-guard/go.mod
+   grep '^toolchain' "$DIR/services/workflow-execution-guard/go.mod"
    ```
 
    If the Bun version differs, install it with step 1's installer and rerun
@@ -1291,7 +1368,7 @@ commit first, then, as root (the checkout stays root-owned and read-only to
    (`WorkingDirectory=…`) from step 3, make any change step 2 called for,
    rebuild the Workflow execution guard from the new checkout as in step 1
    (with `export PATH=/usr/local/go/bin:$PATH` and
-   `cd /opt/takoserver-<short-commit>/services/workflow-execution-guard`), and
+   `cd "$DIR/services/workflow-execution-guard"`), and
    run `systemctl daemon-reload`. Keep the
    same protected configuration otherwise. If you serve the console, rebuild
    it from the new checkout as described under
