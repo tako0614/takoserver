@@ -179,7 +179,12 @@ export interface V2Form {
       readonly spec: JsonObject;
       readonly privateInputs: V2PrivateInputMap | undefined;
     }): Promise<V2ConfiguredPrivateInputs | null>;
-    /** Authorized preaccept policy; omission preserves the existing configured row. */
+    /**
+     * Authorized preaccept policy. `configured` remains the stable CREATE material.
+     * Void preserves existing behavior. An opaque result with present privateInputs
+     * opts into immutable accepted-UPDATE custody; it never replaces the CREATE row.
+     * This capability does not select a Form's omission or rotation semantics.
+     */
     prepareUpdate?(input: {
       readonly principal: string;
       readonly space: string;
@@ -192,7 +197,8 @@ export interface V2Form {
       readonly spec: JsonObject;
       readonly privateInputs: V2PrivateInputMap | undefined;
       readonly configured: V2ConfiguredPrivateInputs | null;
-    }): Promise<void>;
+      // biome-ignore lint/suspicious/noConfusingVoidType: Existing Promise<void> hooks must remain assignable.
+    }): Promise<void | V2ConfiguredPrivateInputs>;
   };
   /** Internal acceptance ordering for a target whose observation reads live referrers. */
   readonly serializeUpdatesWithPendingReferrers?: true;

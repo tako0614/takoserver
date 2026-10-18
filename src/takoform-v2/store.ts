@@ -88,7 +88,7 @@ export interface AcceptRecord {
   specJson: string;
   privateInputs?: V2SealedPrivateInputs;
   configuredPrivateInputs?: V2ConfiguredPrivateInputs;
-  expectedConfiguredPrivateInputs?: V2ConfiguredPrivateInputs;
+  expectedConfiguredPrivateInputs?: V2ConfiguredPrivateInputs | null;
 }
 
 const opInsert = `INSERT INTO tf_v2_operations
@@ -103,6 +103,20 @@ const opInsertIfAccepted = `INSERT INTO tf_v2_operations
   SELECT ?, ?, ?, ?, ?, ?, ?, 'queued', 'none', ?, ?, ?, ?, ?, ?, ?, ?
   WHERE EXISTS (SELECT 1 FROM tf_v2_resources
     WHERE uid = ? AND last_operation = ? AND busy_operation = ? AND generation = ?)`;
+
+// Selected configured UPDATE only: consume the immediately preceding Resource
+// CAS. The mandatory id becomes NULL if its exact postimage is not retained;
+// the adjacent history insert independently requires the original non-NULL id.
+const opInsertAfterConfiguredChange = `INSERT INTO tf_v2_operations
+  (id, resource_uid, principal, replay_key, request_fingerprint, action, generation,
+   status, effect, created_at, updated_at, retain_until, backend_id, target_key,
+   backend_key, accepted_spec_json, private_inputs_present)
+  SELECT CASE WHEN EXISTS (SELECT 1 FROM tf_v2_resources
+    WHERE uid = ? AND principal = ? AND generation = ?
+      AND last_operation = ? AND busy_operation = ?
+      AND backend_id = ? AND target_key = ? AND deleted_at IS NULL)
+    THEN ? ELSE NULL END, ?, ?, ?, ?, ?, ?, 'queued', 'none', ?, ?, ?, ?, ?, ?, ?, ?
+  WHERE changes() = 1`;
 
 // A current referrer publication must settle before its target starts a new
 // observation. The accepted edge and busy Operation are checked inside the
@@ -163,6 +177,23 @@ function privateWrites(record: AcceptRecord) {
 function configuredPrivateWrites(record: AcceptRecord) {
   const sealed = record.configuredPrivateInputs;
   if (!sealed) return [];
+  if (record.action === "update") {
+    return [
+      {
+        sql: `INSERT INTO tf_v2_operation_configured_private_inputs
+        (operation_id, resource_uid, generation, key_id, nonce, ciphertext)
+        SELECT ?, ?, ?, ?, ?, ? WHERE changes() = 1`,
+        params: [
+          record.id,
+          record.resourceUid,
+          record.generation,
+          sealed.keyId,
+          sealed.nonce,
+          sealed.ciphertext,
+        ],
+      },
+    ];
+  }
   return [
     {
       sql: `INSERT INTO tf_v2_configured_private_inputs
@@ -328,6 +359,8 @@ function compileChangeAcceptance(
   serialize: boolean,
   admission: V2AdmissionPredicate | undefined,
 ): readonly SqlStatement[] {
+  const configuredUpdate =
+    record.action === "update" && record.configuredPrivateInputs !== undefined;
   return [
     ...(admission
       ? [{ sql: `SELECT 1 AS permitted WHERE (${admission.sql})`, params: admission.params }]
@@ -348,11 +381,14 @@ function compileChangeAcceptance(
               ${serialize ? `AND NOT EXISTS (${pendingReferrersSql})` : ""}
               ${admission ? `AND (${admission.sql})` : ""}
               ${
-                record.expectedConfiguredPrivateInputs
-                  ? `AND EXISTS (
+                record.expectedConfiguredPrivateInputs === null
+                  ? `AND NOT EXISTS (
+                    SELECT 1 FROM tf_v2_configured_private_inputs WHERE resource_uid = ?)`
+                  : record.expectedConfiguredPrivateInputs
+                    ? `AND EXISTS (
                 SELECT 1 FROM tf_v2_configured_private_inputs
                 WHERE resource_uid = ? AND key_id = ? AND nonce = ? AND ciphertext = ?)`
-                  : ""
+                    : ""
               }`,
       params: [
         record.generation,
@@ -366,20 +402,40 @@ function compileChangeAcceptance(
         ...(record.action === "delete" ? [record.resourceUid] : []),
         ...(serialize ? [record.resourceUid] : []),
         ...(admission?.params ?? []),
-        ...(record.expectedConfiguredPrivateInputs
-          ? [
-              record.resourceUid,
-              record.expectedConfiguredPrivateInputs.keyId,
-              record.expectedConfiguredPrivateInputs.nonce,
-              record.expectedConfiguredPrivateInputs.ciphertext,
-            ]
-          : []),
+        ...(record.expectedConfiguredPrivateInputs === null
+          ? [record.resourceUid]
+          : record.expectedConfiguredPrivateInputs
+            ? [
+                record.resourceUid,
+                record.expectedConfiguredPrivateInputs.keyId,
+                record.expectedConfiguredPrivateInputs.nonce,
+                record.expectedConfiguredPrivateInputs.ciphertext,
+              ]
+            : []),
       ],
     },
     {
-      sql: opInsertIfAccepted,
-      params: [...opParams(record), record.resourceUid, record.id, record.id, record.generation],
+      // Only the selected capability consumes the immediately preceding CAS
+      // witness. A zero CAS still inserts nothing; a successful CAS must insert
+      // an Operation (or abort) before the immediately adjacent history write.
+      sql: configuredUpdate ? opInsertAfterConfiguredChange : opInsertIfAccepted,
+      params: configuredUpdate
+        ? [
+            record.resourceUid,
+            record.principal,
+            record.generation,
+            record.id,
+            record.id,
+            record.backendId,
+            record.targetKey,
+            ...opParams(record),
+          ]
+        : [...opParams(record), record.resourceUid, record.id, record.id, record.generation],
     },
+    // No private/reference statement may overwrite changes() between the
+    // Operation and this required receipt. Its trigger rejects a wrong or
+    // missing Operation/Resource postimage rather than selecting zero rows.
+    ...(configuredUpdate ? configuredPrivateWrites(record) : []),
     ...privateWrites(record),
     ...referenceWrites(record, referencesJson),
     ...(serialize

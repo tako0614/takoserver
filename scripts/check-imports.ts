@@ -115,7 +115,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "v2-state",
     match:
-      /^src\/takoform-v2\/(?:store|worker-invocation-custody|worker-invocation-schema|worker-native-identity-schema)\.ts$/u,
+      /^src\/takoform-v2\/(?:store|configured-update-inputs-schema|worker-invocation-custody|worker-invocation-schema|worker-native-identity-schema)\.ts$/u,
     may: ["core", "v2-contract", "v2-private", "v2-state"],
   },
   {

@@ -752,7 +752,7 @@ export function createTakoformV2Engine(
           resourceUid: target.uid,
         });
         const configured = configuredRow ? Object.freeze({ ...configuredRow }) : null;
-        await selectedForm.privateInputs.prepareUpdate({
+        const prepared = await selectedForm.privateInputs.prepareUpdate({
           principal: input.principal,
           space: target.space,
           name: target.name,
@@ -765,7 +765,28 @@ export function createTakoformV2Engine(
           privateInputs,
           configured,
         });
-        if (configured) record = { ...record, expectedConfiguredPrivateInputs: configured };
+        if (prepared !== undefined) {
+          const keyId = prepared?.keyId;
+          const nonce = prepared?.nonce;
+          const ciphertext = prepared?.ciphertext;
+          if (
+            privateInputs === undefined ||
+            typeof keyId !== "string" ||
+            !keyId ||
+            typeof nonce !== "string" ||
+            !nonce ||
+            typeof ciphertext !== "string" ||
+            !ciphertext
+          ) {
+            throw new TypeError("invalid configured private input preparation");
+          }
+          record = {
+            ...record,
+            configuredPrivateInputs: Object.freeze({ keyId, nonce, ciphertext }),
+          };
+        }
+        if (configured || prepared !== undefined)
+          record = { ...record, expectedConfiguredPrivateInputs: configured };
       }
       const prepared = selectedForm.prepareAdmission
         ? await prepareAdmission(
