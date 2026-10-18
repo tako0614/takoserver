@@ -314,16 +314,27 @@ export function canonicalizeWorkerBundleSource(
   return source
     .split("\n")
     .map((line) => {
-      if (!line.startsWith("// ")) return line;
-      const label = line.slice(3);
+      const comment = line.startsWith("// ");
+      // Esbuild also puts the same temporary relative source path in its
+      // CommonJS wrapper key. Only this exact generated key shape is a label.
+      const wrapper = comment ? null : /^[ ]{2}"(\.\.\/[^"]+)"\(\) \{$/u.exec(line);
+      if (!comment && !wrapper) return line;
+      const label = comment ? line.slice(3) : wrapper?.[1];
+      if (!label) return line;
+      const emit = (selected: string) => (comment ? `// ${selected}` : `  "${selected}"() {`);
       let base = dirname(absoluteSourcePath);
       while (true) {
         const candidate = resolve(base, label);
         if (candidate === repositoryRoot || candidate.startsWith(repositoryPrefix)) {
-          return `// ${relative(repositoryRoot, candidate).split(sep).join("/")}`;
+          const selected = relative(repositoryRoot, candidate).split(sep).join("/");
+          // A generated wrapper key is app source only. Vendored code can use
+          // path-shaped keys as data, so leave every vendor wrapper untouched.
+          if (comment || (selected.startsWith("src/") && !selected.split("/").includes("vendor"))) {
+            return emit(selected);
+          }
         }
         const externalLabel = canonicalExternalSourceLabel(candidate);
-        if (externalLabel !== undefined) return `// ${externalLabel}`;
+        if (externalLabel !== undefined && comment) return emit(externalLabel);
         const parent = dirname(base);
         if (parent === base) break;
         base = parent;
