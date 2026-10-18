@@ -102,6 +102,8 @@ const USAGE = `takoserver deploy
   Integration original-custody held post94 status also accepts --through-migration=0098.
   It requires the original convert declaration, TAKOSERVER_D1_MONEY_POST94_DECLARATION_PATH,
   and TAKOSERVER_D1_MONEY_NORMAL_WORKER_SELECTOR_PATH; apply remains unavailable.
+  Integration --through-migration=0100 continues only original terminal98 custody through
+  audited 0099/0100 in the same original Money D1 path. Status is GET-only after dispatch.
 
   D1 schema status/apply may select one fixed next-wave boundary:
     --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057|0058|0088|0092|0093|0094>
@@ -223,7 +225,7 @@ type Invocation =
       readonly surface: "takoserver-d1-schema";
       readonly action: "status" | "apply";
       readonly environment: "integration";
-      readonly throughMigration: "0098" | "0103";
+      readonly throughMigration: "0098" | "0100" | "0103";
     })
   | (InvocationBase & {
       readonly surface:
@@ -303,7 +305,7 @@ interface ParsedInvocation {
   readonly adoptLivePath?: string;
   readonly bootstrapVerifierBridge?: boolean;
   readonly bootstrapProbePredecessorVersionId?: string;
-  readonly throughMigration?: SchemaWaveBoundary | "0098" | "0103";
+  readonly throughMigration?: SchemaWaveBoundary | "0098" | "0100" | "0103";
   readonly freshLineage?: "v2-artifacts-0075" | "v2-0088" | "v2-0089" | "v2-0091" | "v2-0092";
   readonly protectedReferenceEnvironment?: "integration" | "production";
   readonly organizationId?: string;
@@ -396,7 +398,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let adoptLivePath: string | null = null;
   let bootstrapVerifierBridge = false;
   let bootstrapProbePredecessorVersionId: string | null = null;
-  let throughMigration: SchemaWaveBoundary | "0098" | "0103" | null = null;
+  let throughMigration: SchemaWaveBoundary | "0098" | "0100" | "0103" | null = null;
   let protectedReferenceEnvironment: "integration" | "production" | null = null;
   let organizationId: string | null = null;
   let keyName: string | null = null;
@@ -625,7 +627,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     if (flag.startsWith("--through-migration=")) {
       if (throughMigration !== null) return null;
       const value = flag.slice("--through-migration=".length);
-      if (value === "0098" || value === "0103") {
+      if (value === "0098" || value === "0100" || value === "0103") {
         throughMigration = value;
       } else {
         if (!SCHEMA_WAVE_BOUNDARIES.includes(value as SchemaWaveBoundary)) return null;
@@ -920,7 +922,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     return null;
   }
   if (
-    (throughMigration === "0098" || throughMigration === "0103") &&
+    (throughMigration === "0098" || throughMigration === "0100" || throughMigration === "0103") &&
     (surfaceValue !== "takoserver-d1-schema" || environment !== "integration")
   ) {
     return null;
@@ -1271,6 +1273,52 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
       { action: invocation.action, environment: "integration", commit: invocation.commit },
       target,
       production.d1,
+    );
+  }
+  if (invocation.throughMigration === "0100") {
+    if (
+      invocation.environment !== "integration" ||
+      invocation.surface !== "takoserver-d1-schema" ||
+      originalCreateInput === undefined ||
+      !isAbsolute(originalCreateInput) ||
+      resolve(originalCreateInput) !== originalCreateInput ||
+      /[\0\r\n]/.test(originalCreateInput)
+    )
+      throw new DeployError(
+        "preflight",
+        "money original100 requires canonical original-create custody",
+      );
+    const locator = (name: string): string => {
+      const value = requireEnvironment(name);
+      if (!isAbsolute(value) || resolve(value) !== value || /[\0\r\n]/.test(value))
+        throw new DeployError("preflight", `${name} must be a canonical absolute protected path`);
+      return value;
+    };
+    const declarationPath = locator("TAKOSERVER_D1_MONEY_CUTOVER_DECLARATION_PATH");
+    const post94DeclarationPath = locator("TAKOSERVER_D1_MONEY_POST94_DECLARATION_PATH");
+    const originalCreate = loadIntegrationStorageOriginalCreateInput(originalCreateInput);
+    const target = loadTarget(targetPath("integration"), "integration", "money-original-cutover");
+    const { loadMoneyUnitOriginalCutoverOptions } = await import(
+      "./deploy/schema-money-unit-owner.ts"
+    );
+    const { runIntegrationMoneyOriginalPreserved100 } = await import(
+      "./deploy/schema-money-unit-cutover.ts"
+    );
+    const options = await loadMoneyUnitOriginalCutoverOptions({
+      selectedTarget: target,
+      declarationPath,
+      originalCreate,
+    });
+    return await runIntegrationMoneyOriginalPreserved100(
+      {
+        action: invocation.action,
+        environment: "integration",
+        commit: invocation.commit,
+        throughMigration: "0100",
+      },
+      target,
+      options,
+      post94DeclarationPath,
     );
   }
   if (invocation.throughMigration === "0098") {

@@ -242,10 +242,20 @@ export function workerSchemaAllowsPending(
   sourceRepositoryRoot = REPOSITORY,
 ): boolean {
   if (target.schemaMaintenanceMode === "pre-auth103-quiesced") {
+    const moneyPreserved =
+      target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1" &&
+      /^sha256:[0-9a-f]{64}$/u.test(target.moneyCutoverWriterEpoch ?? "") &&
+      target.auth103NativeProfile === "root-shared-auth-staging-v1";
     return (
       target.environment === "integration" &&
       target.artifactBlobIoMode === undefined &&
-      auth103SourceSchemaReady(migrations, sourceRepositoryRoot, "maintenance")
+      (target.moneyCutoverWriterPolicy === undefined || moneyPreserved) &&
+      auth103SourceSchemaReady(
+        migrations,
+        sourceRepositoryRoot,
+        "maintenance",
+        moneyPreserved ? "money-preserved" : "ordinary",
+      )
     );
   }
   if (
@@ -253,7 +263,7 @@ export function workerSchemaAllowsPending(
     target.artifactBlobIoMode === undefined &&
     target.environment === "integration" &&
     target.moneyCutoverWriterPolicy === undefined &&
-    migrations.local.length === 103
+    (migrations.local.length === 100 || migrations.local.length === 103)
   ) {
     return auth103SourceSchemaReady(migrations, sourceRepositoryRoot, "normal");
   }

@@ -16,6 +16,7 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type * as TypeScript from "typescript";
+import { SHARED_AUTH_STAGING_PROFILE } from "../../src/shared-auth-oidc-client.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { mutationError, preflightError } from "./errors.ts";
 import {
@@ -41,13 +42,16 @@ import {
 import { writeWorkerConfig } from "./realized-config.ts";
 import {
   captureMoneyUnitConverted94Backup,
+  type MoneyCustodyPhase,
   type MoneyCutoverCustody,
   type MoneyCutoverCustodyReceipt,
   type MoneyCutoverDispatchBinding,
   type MoneyCutoverPhase,
   type MoneyHeldNormalWorkerModeFacts,
+  type MoneyPost94ImportReviewBinding,
   type MoneyPost94Phase,
   type MoneyPost94SelectionReviewBinding,
+  type MoneyPreserved100ReviewBinding,
   type MoneyResumeProof,
   type MoneyReviewBinding,
   type MoneyReviewProof,
@@ -1322,7 +1326,7 @@ async function inspectStandalonePublicSourceArchive(
 
 function custody(directory: string, originalRead = false): MoneyCutoverCustody {
   protectedDirectory(directory, "money custody directory");
-  const path = (phase: MoneyCutoverPhase, state: "dispatched" | "terminal") => {
+  const path = (phase: MoneyCustodyPhase, state: "dispatched" | "terminal") => {
     if (
       ![
         "freeze",
@@ -1333,6 +1337,7 @@ function custody(directory: string, originalRead = false): MoneyCutoverCustody {
         "abandon",
         "suffix98",
         "resume98",
+        "preserved100",
       ].includes(phase)
     )
       throw preflightError("money custody phase is not a closed owning phase");
@@ -1340,7 +1345,7 @@ function custody(directory: string, originalRead = false): MoneyCutoverCustody {
   };
   const parseReceipt = (
     value: unknown,
-    phase: MoneyCutoverPhase,
+    phase: MoneyCustodyPhase,
     state: "dispatched" | "terminal",
   ): MoneyCutoverCustodyReceipt => {
     if (
@@ -1356,8 +1361,29 @@ function custody(directory: string, originalRead = false): MoneyCutoverCustody {
     }
     return value as unknown as MoneyCutoverCustodyReceipt;
   };
-  const parseBinding = (value: unknown, phase: MoneyCutoverPhase): MoneyCutoverDispatchBinding => {
+  const parseBinding = (value: unknown, phase: MoneyCustodyPhase): MoneyCutoverDispatchBinding => {
+    const preserved100 = phase === "preserved100";
     const post94 = phase === "suffix98" || phase === "resume98";
+    const financialFields =
+      post94 &&
+      record(value) &&
+      [
+        "financialContributionDigest",
+        "financialSourceBindingDigest",
+        "financialContributionPath",
+      ].some((name) => Object.hasOwn(value, name))
+        ? [
+            "financialContributionDigest",
+            "financialSourceBindingDigest",
+            "financialContributionPath",
+          ]
+        : [];
+    const genesisFields =
+      post94 &&
+      record(value) &&
+      ["signingGenesisDigest", "signingGenesisPath"].some((name) => Object.hasOwn(value, name))
+        ? ["signingGenesisDigest", "signingGenesisPath"]
+        : [];
     const post94Fields = post94
       ? [
           "previousWriterEpoch",
@@ -1368,6 +1394,8 @@ function custody(directory: string, originalRead = false): MoneyCutoverCustody {
           "modePreparationDigest",
           "selectedStripeMode",
           "selectionReviewDigest",
+          ...financialFields,
+          ...genesisFields,
         ]
       : [];
     const fields = [
@@ -1393,10 +1421,19 @@ function custody(directory: string, originalRead = false): MoneyCutoverCustody {
       "afterSchemaPhase",
       "sealedImportPath",
       ...post94Fields,
+      ...(preserved100
+        ? [
+            "suffixBindingDigest",
+            "suffixPostDigest",
+            "expectedAfterShapeDigest",
+            "nextWriterEpoch",
+            "suffixReviewDigest",
+          ]
+        : []),
     ];
     if (
       !record(value) ||
-      (post94 &&
+      ((post94 || preserved100) &&
         Reflect.ownKeys(value).some((name) => {
           if (typeof name !== "string") return true;
           const descriptor = Object.getOwnPropertyDescriptor(value, name);
@@ -1404,9 +1441,11 @@ function custody(directory: string, originalRead = false): MoneyCutoverCustody {
         })) ||
       !keys(value, fields) ||
       value.kind !==
-        (post94
-          ? "takoserver.money-cutover-dispatch@v2"
-          : "takoserver.money-cutover-dispatch@v1") ||
+        (preserved100
+          ? "takoserver.money-cutover-dispatch@v3"
+          : post94
+            ? "takoserver.money-cutover-dispatch@v2"
+            : "takoserver.money-cutover-dispatch@v1") ||
       value.phase !== phase ||
       !ACCOUNT.test(String(value.accountId)) ||
       !UUID.test(String(value.databaseId)) ||
@@ -1415,18 +1454,28 @@ function custody(directory: string, originalRead = false): MoneyCutoverCustody {
         (originalRead && /^integration-ts-[0-9a-f]{32}$/u.test(String(value.databaseName)))
       ) ||
       !requireCommit(value.sourceCommit) ||
-      (post94
-        ? value.afterSchemaPhase !== (phase === "suffix98" ? "0098-fenced" : "0098") ||
-          value.previousWriterEpoch === value.nextWriterEpoch ||
-          value.writerEpoch !==
-            (phase === "suffix98" ? value.previousWriterEpoch : value.nextWriterEpoch) ||
-          value.original92BackupDigest !== value.backupDigest ||
-          value.selectedStripeMode !== "test"
-        : !["0092", "0092-fenced", "0093", "0093-fenced", "0094", "0094-fenced"].includes(
-            String(value.afterSchemaPhase),
-          )) ||
+      (preserved100
+        ? value.afterSchemaPhase !== "0100-fenced" || value.writerEpoch !== value.nextWriterEpoch
+        : post94
+          ? value.afterSchemaPhase !== (phase === "suffix98" ? "0098-fenced" : "0098") ||
+            value.previousWriterEpoch === value.nextWriterEpoch ||
+            value.writerEpoch !==
+              (phase === "suffix98" ? value.previousWriterEpoch : value.nextWriterEpoch) ||
+            value.original92BackupDigest !== value.backupDigest ||
+            value.selectedStripeMode !== "test"
+          : !["0092", "0092-fenced", "0093", "0093-fenced", "0094", "0094-fenced"].includes(
+              String(value.afterSchemaPhase),
+            )) ||
       typeof value.sealedImportPath !== "string" ||
       !isAbsolute(value.sealedImportPath) ||
+      (genesisFields.length !== 0 &&
+        (typeof value.signingGenesisPath !== "string" ||
+          !isAbsolute(value.signingGenesisPath) ||
+          dirname(value.signingGenesisPath) !== dirname(value.sealedImportPath))) ||
+      (financialFields.length !== 0 &&
+        (typeof value.financialContributionPath !== "string" ||
+          !isAbsolute(value.financialContributionPath) ||
+          dirname(value.financialContributionPath) !== dirname(value.sealedImportPath))) ||
       ![
         "originDigest",
         "predecessorCustodyDigest",
@@ -1441,7 +1490,21 @@ function custody(directory: string, originalRead = false): MoneyCutoverCustody {
         "writerEpoch",
         "reviewDigest",
         "beforeShapeDigest",
-        ...post94Fields.filter((field) => field !== "selectedStripeMode"),
+        ...(preserved100
+          ? [
+              "suffixBindingDigest",
+              "suffixPostDigest",
+              "expectedAfterShapeDigest",
+              "nextWriterEpoch",
+              "suffixReviewDigest",
+            ]
+          : []),
+        ...post94Fields.filter(
+          (field) =>
+            field !== "selectedStripeMode" &&
+            field !== "financialContributionPath" &&
+            field !== "signingGenesisPath",
+        ),
       ].every((field) => requireSha(value[field]))
     ) {
       throw preflightError("money dispatch binding is malformed");
@@ -1449,7 +1512,7 @@ function custody(directory: string, originalRead = false): MoneyCutoverCustody {
     return value as unknown as MoneyCutoverDispatchBinding;
   };
   const readDispatchRecord = (
-    phase: MoneyCutoverPhase,
+    phase: MoneyCustodyPhase,
   ): {
     readonly receipt: MoneyCutoverCustodyReceipt;
     readonly binding: MoneyCutoverDispatchBinding;
@@ -1477,12 +1540,12 @@ function custody(directory: string, originalRead = false): MoneyCutoverCustody {
       throw preflightError("money sealed import SQL differs from immutable dispatch");
     return { receipt, binding };
   };
-  const readTerminal = (phase: MoneyCutoverPhase): MoneyCutoverCustodyReceipt | null => {
+  const readTerminal = (phase: MoneyCustodyPhase): MoneyCutoverCustodyReceipt | null => {
     const value = protectedJson(path(phase, "terminal"), "money terminal custody", undefined, true);
     return value === null ? null : parseReceipt(value, phase, "terminal");
   };
   const writeRecord = (
-    phase: MoneyCutoverPhase,
+    phase: MoneyCustodyPhase,
     state: "dispatched" | "terminal",
     value: unknown,
   ): void => {
@@ -1691,6 +1754,60 @@ export function assertMoneyUnitOriginalWriterOptions(
     throw preflightError("fresh money writer requires the same owning original options and target");
   selected.assertUnchanged();
   return selected.ownedTarget;
+}
+
+/**
+ * Compares two independently owned target selections. This is a source/profile
+ * conservation check only: the Auth103 owner must still prove its own original
+ * native history and the Money owner must prove the intervening deployments.
+ * A caller-supplied Auth103 descriptor alone never authorizes publication.
+ */
+export function assertMoneyUnitOriginalPost103TargetProfile(
+  options: MoneyUnitOriginalCutoverOptions,
+  moneyTarget: DeployTarget,
+  auth103OriginalTarget: DeployTarget,
+  originalNextWriterEpoch: string,
+): DeployTarget {
+  const original = assertMoneyUnitOriginalWriterOptions(options, moneyTarget);
+  const auth = parseDeployTarget(
+    auth103OriginalTarget,
+    "original Auth103 target profile",
+    "integration",
+  );
+  if (
+    original.schemaMaintenanceMode !== "pre-wallet-usd-micros-quiesced" ||
+    original.auth103NativeProfile !== undefined ||
+    !/^sha256:[0-9a-f]{64}$/u.test(originalNextWriterEpoch) ||
+    original.moneyCutoverWriterEpoch === originalNextWriterEpoch ||
+    auth.schemaMaintenanceMode !== "pre-auth103-quiesced" ||
+    auth.auth103NativeProfile !== "root-shared-auth-staging-v1" ||
+    original.accountId !== auth.accountId ||
+    original.d1.databaseId !== auth.d1.databaseId ||
+    original.d1.databaseName !== auth.d1.databaseName ||
+    original.r2.bucketName !== auth.r2.bucketName ||
+    original.workerName !== auth.workerName
+  )
+    throw preflightError("money post103 targets do not select one original physical Host");
+  const expected: DeployTarget = {
+    ...original,
+    schemaMaintenanceMode: "pre-auth103-quiesced",
+    auth103NativeProfile: "root-shared-auth-staging-v1",
+    moneyCutoverWriterEpoch: originalNextWriterEpoch,
+    publicOrigin: SHARED_AUTH_STAGING_PROFILE.publicOrigin,
+  };
+  const fields = Object.keys(expected).sort();
+  if (
+    JSON.stringify(Object.keys(auth).sort()) !== JSON.stringify(fields) ||
+    fields.some(
+      (field) =>
+        JSON.stringify(auth[field as keyof DeployTarget]) !==
+        JSON.stringify(expected[field as keyof DeployTarget]),
+    )
+  )
+    throw preflightError(
+      "money post103 target changes fields outside the reviewed profile transition",
+    );
+  return auth;
 }
 
 function freezeOriginalMoneyData<T>(value: T): T {
@@ -2745,6 +2862,99 @@ export interface MoneyUnitHeldPost94ConsumerInputs {
   readonly normalWorkerModePreparation: MoneyUnitHeldNormalWorkerModePreparation;
 }
 
+/** Original pre-upload members; never an uploaded Version, signing or dispatch permission. */
+export interface MoneyUnitHeldPost94ContextSelection {
+  readonly context: MoneyUnitHeldConvertContext;
+  readonly selection: MoneyUnitHeldPost94Selection;
+}
+
+/** Original native owner → one held context → protected selection and immutable-Version mode. */
+export async function readMoneyUnitHeldPost94ContextSelection(
+  options: MoneyUnitOriginalCutoverOptions,
+  post94DeclarationPath: string,
+): Promise<MoneyUnitHeldPost94ContextSelection> {
+  const target = originalHeldMoneyOwner(options);
+  for (const path of [post94DeclarationPath]) {
+    if (
+      typeof path !== "string" ||
+      !isAbsolute(path) ||
+      resolve(path) !== path ||
+      /[\0\r\n]/.test(path)
+    )
+      throw preflightError("money held post94 inputs require canonical protected paths");
+  }
+  const input = originalMoneyInput(post94DeclarationPath, "money held post94 declaration");
+  const value = input.value;
+  if (!record(value) || Object.getPrototypeOf(value) !== Object.prototype)
+    throw preflightError("money held post94 inputs require own-data suffix selection");
+  const selected = (name: string): unknown => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, name);
+    if (descriptor === undefined || !("value" in descriptor) || !descriptor.enumerable)
+      throw preflightError("money held post94 inputs require own-data suffix selection");
+    return descriptor.value;
+  };
+  const previousWriterEpoch = selected("previousWriterEpoch");
+  const nextWriterEpoch = selected("nextWriterEpoch");
+  const convertedBackupPath = selected("convertedBackupPath");
+  if (
+    selected("kind") !== "takoserver.money-cutover-owner-post94-declaration@v1" ||
+    selected("phase") !== "suffix98" ||
+    selected("selectedStripeMode") !== "test" ||
+    typeof previousWriterEpoch !== "string" ||
+    typeof nextWriterEpoch !== "string" ||
+    typeof convertedBackupPath !== "string"
+  )
+    throw preflightError("money held post94 inputs require pre-import suffix98 TEST selection");
+  const request = heldMoneySelection({
+    previousWriterEpoch,
+    nextWriterEpoch,
+    convertedBackupPath,
+    selectedStripeMode: "test",
+  });
+  const assertInputs = (): void => {
+    if (originalHeldMoneyOwner(options) !== target)
+      throw preflightError("money held post94 original owner changed");
+    input.assertUnchanged();
+  };
+  const context = await readMoneyUnitHeldConvertContext(options, request);
+  assertInputs();
+  await assertMoneyUnitHeldConvertCurrent(context);
+  assertInputs();
+  const selection = await readMoneyUnitHeldPost94Selection(context, post94DeclarationPath);
+  assertInputs();
+  await assertMoneyUnitHeldConvertCurrent(context);
+  assertInputs();
+  await assertMoneyUnitHeldPost94SelectionOrigin(selection, context);
+  assertInputs();
+  return Object.freeze({ context, selection });
+}
+
+/** Same live members only; normal JSON alone cannot mint this original member graph. */
+export async function composeMoneyUnitHeldPost94ConsumerInputs(
+  options: MoneyUnitOriginalCutoverOptions,
+  original: MoneyUnitHeldPost94ContextSelection,
+  normalPreparation: MoneyUnitHeldNormalWorkerModePreparation,
+): Promise<MoneyUnitHeldPost94ConsumerInputs> {
+  if (!record(original) || Reflect.ownKeys(original).length !== 2)
+    throw preflightError("money live original context/selection transport is malformed");
+  const context = Object.getOwnPropertyDescriptor(original, "context"),
+    selection = Object.getOwnPropertyDescriptor(original, "selection");
+  if (!context || !("value" in context) || !selection || !("value" in selection))
+    throw preflightError("money live original members must be own DATA");
+  const inputs: MoneyUnitHeldPost94ConsumerInputs = Object.freeze({
+    context: context.value,
+    selection: selection.value,
+    normalWorkerModePreparation: normalPreparation,
+  });
+  await assertMoneyUnitHeldPost94ConsumerInputsOrigin(options, inputs);
+  if (
+    Object.getOwnPropertyDescriptor(original, "context")?.value !== inputs.context ||
+    Object.getOwnPropertyDescriptor(original, "selection")?.value !== inputs.selection
+  )
+    throw preflightError("money live original transport changed during await");
+  return inputs;
+}
+
 /** Original native owner → one held context → protected selection and immutable-Version mode. */
 export async function readMoneyUnitHeldPost94ConsumerInputs(
   options: MoneyUnitOriginalCutoverOptions,
@@ -2818,6 +3028,283 @@ export async function readMoneyUnitHeldPost94ConsumerInputs(
   await assertMoneyUnitHeldNormalWorkerModePreparationCurrent(normalWorkerModePreparation, context);
   assertInputs();
   return Object.freeze({ context, selection, normalWorkerModePreparation });
+}
+
+function originalPost94Inputs(
+  options: MoneyUnitOriginalCutoverOptions,
+  inputs: MoneyUnitHeldPost94ConsumerInputs,
+) {
+  const fields = ["context", "selection", "normalWorkerModePreparation"] as const;
+  if (!record(inputs) || Reflect.ownKeys(inputs).length !== fields.length)
+    throw preflightError("money ONE requires original post94 transport members");
+  const captured = Object.fromEntries(
+    fields.map((name) => {
+      const slot = Object.getOwnPropertyDescriptor(inputs, name);
+      if (!slot || !("value" in slot))
+        throw preflightError("money ONE post94 members must be own data");
+      return [name, slot.value];
+    }),
+  ) as unknown as MoneyUnitHeldPost94ConsumerInputs;
+  const held = heldMoneyContexts.get(captured.context),
+    selection = heldPost94Selections.get(captured.selection),
+    mode = heldNormalWorkerModes.get(captured.normalWorkerModePreparation);
+  if (
+    !held ||
+    held.options !== options ||
+    held.target !== originalHeldMoneyOwner(options) ||
+    !selection ||
+    selection.context !== captured.context ||
+    !mode ||
+    mode.context !== captured.context
+  )
+    throw preflightError("money ONE original options/context/selection/mode graph differs");
+  return { captured, held, selection, mode };
+}
+
+/** Original aggregate transport never replaces original member provenance. */
+export async function assertMoneyUnitHeldPost94ConsumerInputsOrigin(
+  options: MoneyUnitOriginalCutoverOptions,
+  inputs: MoneyUnitHeldPost94ConsumerInputs,
+): Promise<void> {
+  const selected = originalPost94Inputs(options, inputs);
+  const assertLocal = () => {
+    const current = originalPost94Inputs(options, inputs);
+    if (
+      current.held !== selected.held ||
+      current.selection !== selected.selection ||
+      current.mode !== selected.mode ||
+      current.captured.context !== selected.captured.context ||
+      current.captured.selection !== selected.captured.selection ||
+      current.captured.normalWorkerModePreparation !== selected.captured.normalWorkerModePreparation
+    )
+      throw preflightError("money ONE post94 original transport changed during await");
+  };
+  await assertMoneyUnitHeldPost94SelectionOrigin(
+    selected.captured.selection,
+    selected.captured.context,
+  );
+  assertLocal();
+  await assertMoneyUnitHeldNormalWorkerModePreparationCurrent(
+    selected.captured.normalWorkerModePreparation,
+    selected.captured.context,
+  );
+  assertLocal();
+}
+
+/** Closed retained locator from the same genuine graph, never a new backup selection. */
+export function readMoneyUnitHeldPost94ConvertedBackupPath(
+  options: MoneyUnitOriginalCutoverOptions,
+  inputs: MoneyUnitHeldPost94ConsumerInputs,
+): string {
+  return originalPost94Inputs(options, inputs).held.request.convertedBackupPath;
+}
+
+/** Original retained selector DATA for the real signing-genesis owner; no new selection. */
+export function readMoneyUnitHeldPost94NormalWorkerSelectorPath(
+  options: MoneyUnitOriginalCutoverOptions,
+  inputs: MoneyUnitHeldPost94ConsumerInputs,
+): string {
+  return originalPost94Inputs(options, inputs).mode.selectorPath;
+}
+
+/** Protected independent-review DATA, safe also to re-read after dispatch; no held94 assertion. */
+export function readMoneyUnitHeldPost94IndependentReview(
+  options: MoneyUnitOriginalCutoverOptions,
+  inputs: MoneyUnitHeldPost94ConsumerInputs,
+  binding: MoneyPost94ImportReviewBinding,
+): MoneyReviewProof | null {
+  const selected = originalPost94Inputs(options, inputs),
+    facts = selected.held.facts;
+  const input = originalMoneyInput(
+    selected.selection.declarationPath,
+    "money ONE original suffix declaration",
+  );
+  const declaration = parseHeldPost94Declaration(
+    input.value,
+    selected.held.target,
+    facts,
+    selected.held.request,
+  );
+  if (
+    input.seal !== selected.selection.declarationSeal ||
+    JSON.stringify(declaration) !== selected.selection.declarationJson ||
+    binding.kind !== "takoserver.money-post94-import-review@v1" ||
+    binding.phase !== "suffix98" ||
+    declaration.phase !== "suffix98" ||
+    binding.accountId !== facts.storage.accountId ||
+    binding.databaseId !== facts.storage.databaseId ||
+    binding.previousWriterEpoch !== facts.previousWriterEpoch ||
+    binding.nextWriterEpoch !== facts.nextWriterEpoch ||
+    binding.modePreparationDigest !== selected.captured.normalWorkerModePreparation.bindingDigest ||
+    binding.selectionReviewDigest !== selected.captured.selection.selectionReviewDigest
+  )
+    throw preflightError("money ONE review differs from original declaration/selection/mode");
+  const value = protectedJson(
+    declaration.reviewEvidencePath,
+    "money ONE independent review",
+    undefined,
+    true,
+  );
+  if (value === null) return null;
+  if (
+    !record(value) ||
+    !keys(value, [
+      "kind",
+      "state",
+      "reviewedAt",
+      "reviewEvidenceDigest",
+      "reviewer",
+      "reviewRef",
+      "bindingDigest",
+      "evidenceDigest",
+    ]) ||
+    value.kind !== "takoserver.money-independent-review@v1" ||
+    value.state !== "reviewed" ||
+    !requireReviewedAt(value.reviewedAt) ||
+    !requireReviewEvidence(value.reviewEvidenceDigest) ||
+    !requireReference(value.reviewRef) ||
+    !requireReviewer(value.reviewer) ||
+    value.bindingDigest !== moneyCutoverBindingDigest(binding) ||
+    value.evidenceDigest !== value.reviewEvidenceDigest
+  )
+    throw preflightError("money ONE independent review is malformed or differs from exact binding");
+  input.assertUnchanged();
+  return value as unknown as MoneyReviewProof;
+}
+
+/** Same protected exact-review record, fixed under the original Money output. */
+export function readMoneyUnitOriginalPreserved100IndependentReview(
+  options: MoneyUnitOriginalCutoverOptions,
+  binding: MoneyPreserved100ReviewBinding,
+): MoneyReviewProof | null {
+  const target = originalHeldMoneyOwner(options);
+  if (
+    options.outputDirectory === undefined ||
+    binding.kind !== "takoserver.money-preserved100-import-review@v1" ||
+    binding.phase !== "preserved100" ||
+    binding.accountId !== target.accountId ||
+    binding.databaseId !== target.d1.databaseId ||
+    binding.databaseName !== target.d1.databaseName ||
+    binding.bucketName !== target.r2.bucketName ||
+    binding.workerName !== target.workerName ||
+    !requireCommit(binding.sourceCommit) ||
+    ![
+      binding.sourceDigest,
+      binding.importDigest,
+      binding.suffixBindingDigest,
+      binding.suffixPostDigest,
+      binding.suffixReviewDigest,
+      binding.freezeBindingDigest,
+      binding.originDigest,
+      binding.original92BackupDigest,
+      binding.writerDigest,
+      binding.nextWriterEpoch,
+      binding.beforeShapeDigest,
+      binding.afterShapeDigest,
+    ].every(requireSha)
+  )
+    throw preflightError("money preserved100 review binding differs from original source");
+  const value = protectedJson(
+    join(options.outputDirectory, "money-preserved100-independent-review.json"),
+    "money preserved100 independent review",
+    undefined,
+    true,
+  );
+  if (value === null) return null;
+  return parseMoneyUnitPreserved100ExactReviewData(value, binding);
+}
+
+/** Pure record decoder only. The native owner above supplies protected bytes and origin. */
+export function parseMoneyUnitPreserved100ExactReviewData(
+  value: unknown,
+  binding: MoneyPreserved100ReviewBinding,
+): MoneyReviewProof {
+  if (
+    !record(value) ||
+    !keys(value, [
+      "kind",
+      "state",
+      "reviewedAt",
+      "reviewEvidenceDigest",
+      "reviewer",
+      "reviewRef",
+      "bindingDigest",
+      "evidenceDigest",
+    ]) ||
+    value.kind !== "takoserver.money-independent-review@v1" ||
+    value.state !== "reviewed" ||
+    !requireReviewedAt(value.reviewedAt) ||
+    !requireReviewEvidence(value.reviewEvidenceDigest) ||
+    !requireReference(value.reviewRef) ||
+    !requireReviewer(value.reviewer) ||
+    value.bindingDigest !== moneyCutoverBindingDigest(binding) ||
+    value.evidenceDigest !== value.reviewEvidenceDigest
+  )
+    throw preflightError("money preserved100 review record differs from exact source/import");
+  return value as unknown as MoneyReviewProof;
+}
+
+/** Historical selection comparison only; never calls pre-import held94 currentness after dispatch. */
+export function assertMoneyUnitOriginalPost94DispatchData(
+  options: MoneyUnitOriginalCutoverOptions,
+  declarationPath: string,
+  binding: unknown,
+): void {
+  const target = originalHeldMoneyOwner(options),
+    original = originalMoneyWriters.get(options);
+  const input = originalMoneyInput(declarationPath, "money post94 original declaration"),
+    value = input.value;
+  if (
+    !original ||
+    !record(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype ||
+    !record(binding)
+  )
+    throw preflightError("money post94 status requires original protected selection and dispatch");
+  for (const key of Reflect.ownKeys(value)) {
+    const slot = Object.getOwnPropertyDescriptor(value, key);
+    if (typeof key !== "string" || !slot || !("value" in slot) || !slot.enumerable)
+      throw preflightError("money post94 status selection must be own data");
+  }
+  if (
+    value.kind !== "takoserver.money-cutover-owner-post94-declaration@v1" ||
+    value.phase !== "suffix98" ||
+    value.selectedStripeMode !== "test" ||
+    value.previousWriterEpoch !== options.writerEpoch ||
+    !requireSha(value.nextWriterEpoch) ||
+    value.nextWriterEpoch === value.previousWriterEpoch ||
+    typeof value.convertedBackupPath !== "string" ||
+    !isAbsolute(value.convertedBackupPath) ||
+    resolve(value.convertedBackupPath) !== value.convertedBackupPath ||
+    resolve(value.convertedBackupPath) === resolve(options.backupPath) ||
+    binding.kind !== "takoserver.money-cutover-dispatch@v2" ||
+    binding.phase !== "suffix98" ||
+    binding.previousWriterEpoch !== value.previousWriterEpoch ||
+    binding.nextWriterEpoch !== value.nextWriterEpoch ||
+    binding.accountId !== target.accountId ||
+    binding.databaseId !== target.d1.databaseId ||
+    binding.databaseName !== target.d1.databaseName ||
+    binding.classificationDigest !== options.classificationManifestDigest
+  )
+    throw preflightError("money post94 original selection and dispatch differ");
+  const projected: Record<string, unknown> = Object.assign(Object.create(null), value);
+  for (const name of [
+    "previousWriterEpoch",
+    "nextWriterEpoch",
+    "convertedBackupPath",
+    "selectedStripeMode",
+  ])
+    delete projected[name];
+  projected.kind = "takoserver.money-cutover-owner-declaration@v1";
+  projected.phase = "convert";
+  parseDeclaration(projected, target, true, true);
+  if (
+    moneyHeldPost94CommonDeclaration(value as unknown as MoneyHeldPost94Declaration) !==
+      original.declarationCommon ||
+    resolve(String(value.reviewEvidencePath)) === resolve(original.reviewEvidencePath)
+  )
+    throw preflightError("money post94 declaration cannot replace the original convert owner");
+  input.assertUnchanged();
 }
 
 export interface MoneyUnitResumeReadRequest {

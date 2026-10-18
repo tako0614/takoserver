@@ -4,23 +4,20 @@ import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { additiveAuthFull103DDL } from "../../src/auth-authority-schema-plan.ts";
 import {
   AUTH103_NATIVE_CATALOG_QUERY,
   AUTH103_NATIVE_DEFINE,
-  AUTH103_NATIVE_INSTALL_DDL,
-  AUTH103_NATIVE_MIGRATIONS,
   AUTH103_NATIVE_PROFILE,
   AUTH103_NATIVE_PROFILE_DEFINE,
-  AUTH103_NATIVE_REGISTRATION_DDL,
   AUTH103_NATIVE_REGISTRATION_QUERY,
   type Auth103NativeSourceManifest,
   auth103RpRegistrationRecord,
 } from "../../src/auth103-native-source-contract.ts";
-import { AUTH103_CLOCK_RECIPE } from "../../src/auth103-source-clock.ts";
 import { canonicalJson } from "../../src/json.ts";
 import { SHARED_AUTH_STAGING_PROFILE } from "../../src/shared-auth-oidc-client.ts";
 import { frameHostMigrationSql } from "../../src/sqlite-migration-policy.ts";
+import { readAuth103CanonicalMigrationSource } from "./auth103-canonical-migration-source.ts";
+import { createAuth103CanonicalSourceArtifacts } from "./auth103-canonical-recipes.ts";
 import { preflightError } from "./errors.ts";
 import {
   inspectMoneyNativeBuildDependencyTree,
@@ -28,8 +25,8 @@ import {
 } from "./money-native-build-closure.ts";
 import { type DeployProcess, REPOSITORY, runCommand, WRANGLER } from "./process.ts";
 import type { DeployTarget } from "./target.ts";
-import { v2ContainerOwnerMigrationCandidate } from "./v2-container-owner-migration-candidate.ts";
-import { buildUnregisteredV2WorkerNativeIdentityMigrationCandidate } from "./v2-worker-native-identity-migration-candidate.ts";
+
+export { createAuth103CanonicalSourceArtifacts } from "./auth103-canonical-recipes.ts";
 
 const clockPath = "src/auth103-source-clock.ts";
 const requiredSourcePaths = Object.freeze([
@@ -46,6 +43,8 @@ const requiredSourcePaths = Object.freeze([
   "src/takoform-v2/worker-native-identity-schema.ts",
   "scripts/deploy/v2-container-owner-migration-candidate.ts",
   "scripts/deploy/v2-worker-native-identity-migration-candidate.ts",
+  "scripts/deploy/auth103-canonical-recipes.ts",
+  "scripts/deploy/auth103-canonical-migration-source.ts",
   "scripts/deploy/auth103-native-source.ts",
   "src/shared-auth-oidc-client.ts",
   "src/shared-auth-session.ts",
@@ -90,50 +89,6 @@ function exactGitSource(root: string, commit: string, path: string): string {
   if (result.status !== 0 || result.signal !== null || !Buffer.from(bytes).equals(result.stdout))
     throw preflightError("Auth103 build source differs from its exact commit");
   return bytes;
-}
-
-/** Fixed owner recipes, not supplied SQL. No registration/application happens here. */
-export function createAuth103CanonicalSourceArtifacts(sourceRoot: string) {
-  const clockSourceDigest = digest(source(sourceRoot, clockPath));
-  const clockPolicyRef = dataDigest([
-    "takoserver.auth103.source-clock-policy.v1",
-    AUTH103_CLOCK_RECIPE,
-    clockSourceDigest,
-  ]);
-  const recipeDigest = digest(additiveAuthFull103DDL);
-  const registrationRef = dataDigest([
-    "takoserver.auth103.native-source-registration.v1",
-    recipeDigest,
-    clockSourceDigest,
-    clockPolicyRef,
-  ]);
-  const registrationSql = `${AUTH103_NATIVE_REGISTRATION_DDL}\n${AUTH103_NATIVE_INSTALL_DDL}\nINSERT INTO
-auth103_native_source_registration(registration_ref,recipe_digest,clock_source_digest,clock_policy_ref)
-VALUES (${[registrationRef, recipeDigest, clockSourceDigest, clockPolicyRef].map(literal).join(",")});\n`;
-  const container = v2ContainerOwnerMigrationCandidate();
-  const worker = buildUnregisteredV2WorkerNativeIdentityMigrationCandidate().statements;
-  const workerSql = worker;
-  if (
-    [...container, ...worker].some(
-      (statement) =>
-        typeof statement !== "string" &&
-        statement.params !== undefined &&
-        statement.params.length !== 0,
-    )
-  )
-    throw preflightError("Auth103 canonical predecessors must have no external binds");
-  const files = Object.freeze([
-    Object.freeze({
-      name: AUTH103_NATIVE_MIGRATIONS[0]!,
-      sql: container.map(({ sql }) => sql).join(";\n") + ";\n",
-    }),
-    Object.freeze({ name: AUTH103_NATIVE_MIGRATIONS[1]!, sql: workerSql.join(";\n") + ";\n" }),
-    Object.freeze({
-      name: AUTH103_NATIVE_MIGRATIONS[2]!,
-      sql: `${additiveAuthFull103DDL}\n${registrationSql}`,
-    }),
-  ]);
-  return Object.freeze({ files, registrationRef, recipeDigest, clockSourceDigest, clockPolicyRef });
 }
 
 /**
@@ -431,6 +386,7 @@ interface BuildOriginal {
   readonly sources: readonly { readonly path: string; readonly digest: string }[];
   readonly manifest: Auth103NativeSourceManifest | null;
   readonly closure: ReturnType<typeof captureRegisteredBuildClosure> | null;
+  readonly canonicalArtifactDigest: string | null;
 }
 const builds = new WeakMap<object, BuildOriginal>();
 
@@ -462,125 +418,135 @@ export function prepareAuth103NativeBuildSource(input: {
     manifest: Auth103NativeSourceManifest | null,
     sources: BuildOriginal["sources"],
     closure: BuildOriginal["closure"] = null,
+    canonicalArtifactDigest: string | null = null,
   ) => {
     const capture = Object.freeze({}) as Auth103NativeBuildSource;
-    builds.set(capture, Object.freeze({ ...origin, manifest, sources, closure }));
+    builds.set(
+      capture,
+      Object.freeze({ ...origin, manifest, sources, closure, canonicalArtifactDigest }),
+    );
     return capture;
   };
   // A basic Host never activates Root RP just because canonical103 exists.
   // An explicitly selected profile cannot fall back when registration is absent.
   if (profile === null) return retain(null, Object.freeze([]));
-  const names = readdirSync(resolve(input.sourceRoot, "migrations"))
-    .filter((name) => name.endsWith(".sql"))
-    .sort();
-  if (!names.some((name) => name.startsWith("0103_")))
+  const physicalCount = readdirSync(resolve(input.sourceRoot, "migrations")).filter((name) =>
+    name.endsWith(".sql"),
+  ).length;
+  if (physicalCount < 100)
     throw preflightError(
       "selected Auth103 profile requires its original canonical source registration",
     );
-  if (
-    names.length < 103 ||
-    names.some(
-      (name, index) =>
-        !/^\d{4}_[a-z0-9_]+\.sql$/u.test(name) || Number(name.slice(0, 4)) !== index + 1,
-    )
-  )
-    throw preflightError("Auth103 native source requires an unchanged canonical103 source prefix");
   assertExactCheckout(input.sourceRoot, input.commit);
-  const closure = captureRegisteredBuildClosure(origin.sourceRoot, input.commit);
-  const executingRoot = resolve(import.meta.dir, "../..");
-  const identities = requiredSourcePaths.map((path) => {
-    const original = exactGitSource(input.sourceRoot, input.commit, path);
-    if (source(executingRoot, path) !== original)
-      throw preflightError("Auth103 compiler and selected source must be the same implementation");
-    return Object.freeze({ path, digest: digest(original) });
-  });
-  const registered = createAuth103CanonicalSourceArtifacts(input.sourceRoot);
-  const sources = names.map((name) =>
-    exactGitSource(input.sourceRoot, input.commit, `migrations/${name}`),
-  );
-  for (let index = 0; index < registered.files.length; index++) {
-    const expected = registered.files[index]!;
-    if (names[100 + index] !== expected.name || sources[100 + index] !== expected.sql)
-      throw preflightError("Auth103 canonical source differs from its owning recipes");
-  }
-  const catalog = compileCatalog(sources.slice(0, 103));
-  const targetRef = dataDigest([
-    "takoserver.auth103.native-state-db.v1",
-    input.target.accountId,
-    input.target.d1.databaseId,
-  ]);
-  const authSchemaRef = digest(sources[102]!);
-  const issuerSourceRef = dataDigest([
-    "takoserver.auth103.local-rp-issuer-source.v1",
-    identities.filter(({ path }) =>
-      [
-        "src/shared-auth-oidc-client.ts",
-        "src/shared-auth-session.ts",
-        "src/worker-request-shared-principal-issuance.ts",
-      ].includes(path),
-    ),
-  ]);
-  const configDigest = dataDigest(SHARED_AUTH_STAGING_PROFILE);
-  const rpRegistrationRef = dataDigest([
-    "takoserver.auth103.local-rp-registration.v1",
-    issuerSourceRef,
-    configDigest,
-    targetRef,
-    authSchemaRef,
-    registered.clockPolicyRef,
-  ]);
-  const registrationDigest = dataDigest({
-    registrationRef: rpRegistrationRef,
-    profile: SHARED_AUTH_STAGING_PROFILE,
-    issuerSourceRef,
-    configDigest,
-    targetRef,
-    authSchemaRef,
-    clockPolicyRef: registered.clockPolicyRef,
-  });
-  const manifest: Auth103NativeSourceManifest = Object.freeze({
-    version: 1,
-    sourceCommit: input.commit,
-    sourceRef: dataDigest([
-      "takoserver.auth103.native-build-source.v1",
-      input.commit,
-      identities,
-      names.map((name, index) => ({ name, digest: digest(sources[index]!) })),
-      closure.sourceTreeDigest,
-      closure.dependencyClosureDigest,
-      closure.toolClosureDigest,
-    ]),
-    targetRef,
-    authSchemaRef,
-    catalogDigest: catalog.digest,
-    catalogProjection: catalog.projection,
-    registrationRef: registered.registrationRef,
-    recipeDigest: registered.recipeDigest,
-    clockSourceDigest: registered.clockSourceDigest,
-    clockPolicyRef: registered.clockPolicyRef,
-    rpRegistration: Object.freeze({
-      registrationRef: rpRegistrationRef,
-      registrationDigest,
-      receiptRef: dataDigest([
-        "takoserver.auth103.local-rp-registration-receipt.v1",
-        rpRegistrationRef,
-        registrationDigest,
-      ]),
+  const canonical = readAuth103CanonicalMigrationSource(input.sourceRoot);
+  try {
+    const names = canonical.artifact.names;
+    const closure = captureRegisteredBuildClosure(origin.sourceRoot, input.commit);
+    const executingRoot = resolve(import.meta.dir, "../..");
+    const identities = requiredSourcePaths.map((path) => {
+      const original = exactGitSource(input.sourceRoot, input.commit, path);
+      if (source(executingRoot, path) !== original)
+        throw preflightError(
+          "Auth103 compiler and selected source must be the same implementation",
+        );
+      return Object.freeze({ path, digest: digest(original) });
+    });
+    const registered = createAuth103CanonicalSourceArtifacts(input.sourceRoot);
+    const sources = names.map((name, index) => {
+      if (index < 100 || canonical.physicalNames.length === 103)
+        return exactGitSource(input.sourceRoot, input.commit, `migrations/${name}`);
+      const successor = canonical.recipes.files[index - 100];
+      if (successor === undefined)
+        throw preflightError("Auth103 canonical source lacks one owned successor");
+      return successor.sql;
+    });
+    for (let index = 0; index < registered.files.length; index++) {
+      const expected = registered.files[index]!;
+      if (names[100 + index] !== expected.name || sources[100 + index] !== expected.sql)
+        throw preflightError("Auth103 canonical source differs from its owning recipes");
+    }
+    const catalog = compileCatalog(sources.slice(0, 103));
+    const targetRef = dataDigest([
+      "takoserver.auth103.native-state-db.v1",
+      input.target.accountId,
+      input.target.d1.databaseId,
+    ]);
+    const authSchemaRef = digest(sources[102]!);
+    const issuerSourceRef = dataDigest([
+      "takoserver.auth103.local-rp-issuer-source.v1",
+      identities.filter(({ path }) =>
+        [
+          "src/shared-auth-oidc-client.ts",
+          "src/shared-auth-session.ts",
+          "src/worker-request-shared-principal-issuance.ts",
+        ].includes(path),
+      ),
+    ]);
+    const configDigest = dataDigest(SHARED_AUTH_STAGING_PROFILE);
+    const rpRegistrationRef = dataDigest([
+      "takoserver.auth103.local-rp-registration.v1",
       issuerSourceRef,
       configDigest,
+      targetRef,
+      authSchemaRef,
+      registered.clockPolicyRef,
+    ]);
+    const registrationDigest = dataDigest({
+      registrationRef: rpRegistrationRef,
       profile: SHARED_AUTH_STAGING_PROFILE,
-    }),
-  });
-  return retain(
-    manifest,
-    Object.freeze([
-      ...identities,
-      ...names.map((name, index) =>
-        Object.freeze({ path: `migrations/${name}`, digest: digest(sources[index]!) }),
-      ),
-    ]),
-    closure,
-  );
+      issuerSourceRef,
+      configDigest,
+      targetRef,
+      authSchemaRef,
+      clockPolicyRef: registered.clockPolicyRef,
+    });
+    const manifest: Auth103NativeSourceManifest = Object.freeze({
+      version: 1,
+      sourceCommit: input.commit,
+      sourceRef: dataDigest([
+        "takoserver.auth103.native-build-source.v1",
+        input.commit,
+        identities,
+        names.map((name, index) => ({ name, digest: digest(sources[index]!) })),
+        closure.sourceTreeDigest,
+        closure.dependencyClosureDigest,
+        closure.toolClosureDigest,
+      ]),
+      targetRef,
+      authSchemaRef,
+      catalogDigest: catalog.digest,
+      catalogProjection: catalog.projection,
+      registrationRef: registered.registrationRef,
+      recipeDigest: registered.recipeDigest,
+      clockSourceDigest: registered.clockSourceDigest,
+      clockPolicyRef: registered.clockPolicyRef,
+      rpRegistration: Object.freeze({
+        registrationRef: rpRegistrationRef,
+        registrationDigest,
+        receiptRef: dataDigest([
+          "takoserver.auth103.local-rp-registration-receipt.v1",
+          rpRegistrationRef,
+          registrationDigest,
+        ]),
+        issuerSourceRef,
+        configDigest,
+        profile: SHARED_AUTH_STAGING_PROFILE,
+      }),
+    });
+    return retain(
+      manifest,
+      Object.freeze([
+        ...identities,
+        ...canonical.physicalNames.map((name, index) =>
+          Object.freeze({ path: `migrations/${name}`, digest: digest(sources[index]!) }),
+        ),
+      ]),
+      closure,
+      canonical.artifact.digest,
+    );
+  } finally {
+    canonical.dispose();
+  }
 }
 
 /** Only the owning config writer consumes the checked build original. */
@@ -607,6 +573,16 @@ export function readAuth103NativeBuildDefine(
   for (const entry of original.sources) {
     if (digest(source(original.sourceRoot, entry.path)) !== entry.digest)
       throw preflightError("Auth103 build source changed during artifact preparation");
+  }
+  if (original.canonicalArtifactDigest !== null) {
+    const canonical = readAuth103CanonicalMigrationSource(original.sourceRoot);
+    try {
+      if (canonical.artifact.digest !== original.canonicalArtifactDigest)
+        throw preflightError("Auth103 canonical source changed during artifact preparation");
+      canonical.assertCurrent();
+    } finally {
+      canonical.dispose();
+    }
   }
   return JSON.stringify(original.manifest);
 }

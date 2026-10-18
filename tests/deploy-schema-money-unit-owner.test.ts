@@ -30,12 +30,15 @@ import {
   buildMoneyCutoverImportSql,
   type MoneyCutoverDispatchBinding,
   type MoneyPost94DispatchBinding,
+  type MoneyPreserved100DispatchBinding,
+  type MoneyPreserved100ReviewBinding,
   type MoneyReviewBinding,
   moneyCutoverBindingDigest,
   moneyUnitCutoverSourcePrefixDigest,
   readMoneyAggregateDigest,
   readMoneyFrozenDataDigest,
   readMoneyPreimageDigest,
+  runIntegrationMoneyOriginalPreserved100,
   runIntegrationMoneyUnitCutover,
 } from "../scripts/deploy/schema-money-unit-cutover.ts";
 import {
@@ -45,7 +48,9 @@ import {
   loadMoneyUnitOriginalCutoverOptions,
   type MoneyUnitOriginalCutoverOptions,
   type MoneyUnitOwnerDependencies,
+  parseMoneyUnitPreserved100ExactReviewData,
   readIntegrationMoneyUnitResumeState,
+  readMoneyUnitOriginalPreserved100IndependentReview,
 } from "../scripts/deploy/schema-money-unit-owner.ts";
 import { type DeployTarget, loadTarget, parseDeployTarget } from "../scripts/deploy/target.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
@@ -2346,6 +2351,182 @@ describe("post94 retained custody component", () => {
       );
       expect(f.requests).toEqual(before);
       expect(existsSync(join(f.root, "suffix98.dispatched.json"))).toBe(false);
+    } finally {
+      removeArtifactTree(f.directory);
+    }
+  });
+});
+
+describe("original preserved100 custody", () => {
+  test("existing exact review format binds only original100 source, while test ports remain untrusted", async () => {
+    const f = await createdOriginalMoneyFixture();
+    try {
+      f.write(f.paths.declaration, { ...f.declaration, phase: "convert" });
+      const options = await f.load();
+      const binding: MoneyPreserved100ReviewBinding = {
+        kind: "takoserver.money-preserved100-import-review@v1",
+        phase: "preserved100",
+        accountId: f.target.accountId,
+        databaseId: f.target.d1.databaseId,
+        databaseName: f.target.d1.databaseName,
+        bucketName: f.target.r2.bucketName,
+        workerName: f.target.workerName,
+        sourceCommit: source,
+        sourceDigest: sha("audited physical100"),
+        importDigest: sha("exact99-100 import"),
+        suffixBindingDigest: sha("original terminal98 binding"),
+        suffixPostDigest: sha("original terminal98 post"),
+        suffixReviewDigest: sha("original suffix review"),
+        freezeBindingDigest: sha("original freeze"),
+        originDigest: sha("original origin"),
+        original92BackupDigest: sha("original92 backup"),
+        writerDigest: sha("original maintenance"),
+        nextWriterEpoch: sha("new writer epoch"),
+        beforeShapeDigest: sha("before98 shape"),
+        afterShapeDigest: sha("after100 shape"),
+      };
+      const evidenceDigest = sha("preserved100 independent review evidence");
+      const reviewed = {
+        kind: "takoserver.money-independent-review@v1",
+        state: "reviewed",
+        reviewedAt,
+        reviewEvidenceDigest: evidenceDigest,
+        reviewer: "independent-reviewer",
+        reviewRef: "review://preserved100-exact",
+        bindingDigest: moneyCutoverBindingDigest(binding),
+        evidenceDigest,
+      };
+      f.write(join(f.root, "money-preserved100-independent-review.json"), reviewed);
+      expect(parseMoneyUnitPreserved100ExactReviewData(reviewed, binding)).toMatchObject({
+        bindingDigest: moneyCutoverBindingDigest(binding),
+      });
+      expect(() =>
+        parseMoneyUnitPreserved100ExactReviewData(reviewed, {
+          ...binding,
+          importDigest: sha("foreign SQL"),
+        }),
+      ).toThrow("differs from exact source/import");
+      expect(() =>
+        parseMoneyUnitPreserved100ExactReviewData({ ...reviewed, ready: true }, binding),
+      ).toThrow("differs from exact source/import");
+      expect(() => readMoneyUnitOriginalPreserved100IndependentReview(options, binding)).toThrow(
+        "unchanged native original owner",
+      );
+    } finally {
+      f.close();
+    }
+  });
+
+  test("missing terminal98 refuses native100 before any provider read or mutation", async () => {
+    const f = await createdOriginalMoneyFixture();
+    try {
+      f.write(f.paths.declaration, { ...f.declaration, phase: "convert" });
+      const options = await f.load();
+      const before = [...f.commands];
+      await expect(
+        runIntegrationMoneyOriginalPreserved100(
+          { action: "apply", environment: "integration", commit: source, throughMigration: "0100" },
+          f.target,
+          options,
+          f.paths.declaration,
+        ),
+      ).rejects.toThrow("terminal98");
+      expect(f.commands).toEqual(before);
+      expect(await options.custody.read("preserved100")).toBeNull();
+    } finally {
+      f.close();
+    }
+  });
+
+  test("foreign terminal98 custody cannot select the original100 receiver", async () => {
+    const f = await createdOriginalMoneyFixture();
+    const foreign = post94CustodyFixture();
+    try {
+      f.write(f.paths.declaration, { ...f.declaration, phase: "convert" });
+      const options = await f.load();
+      sealDirectory(foreign.directory, ["import.sql"]);
+      const dispatch = await options.custody.dispatch(foreign.binding);
+      await options.custody.terminal(foreign.binding, sha("foreign98 terminal"));
+      expect(dispatch.state).toBe("dispatched");
+      const before = [...f.commands];
+      await expect(
+        runIntegrationMoneyOriginalPreserved100(
+          { action: "apply", environment: "integration", commit: source, throughMigration: "0100" },
+          f.target,
+          options,
+          f.paths.declaration,
+        ),
+      ).rejects.toThrow();
+      expect(f.commands).toEqual(before);
+      expect(await options.custody.read("preserved100")).toBeNull();
+    } finally {
+      f.close();
+      removeArtifactTree(foreign.directory);
+    }
+  });
+
+  test("v3 original custody retains dispatch on unknown ACK and cannot relabel terminal", async () => {
+    const f = sealedImportCustodyFixture();
+    try {
+      sealDirectory(f.directory, ["import.sql"]);
+      const options = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+      const binding: MoneyPreserved100DispatchBinding = {
+        ...f.binding,
+        kind: "takoserver.money-cutover-dispatch@v3",
+        phase: "preserved100",
+        afterSchemaPhase: "0100-fenced",
+        writerEpoch: sha("new epoch"),
+        nextWriterEpoch: sha("new epoch"),
+        suffixBindingDigest: sha("exact terminal98 binding"),
+        suffixPostDigest: sha("exact terminal98 post"),
+        suffixReviewDigest: sha("original suffix review"),
+        expectedAfterShapeDigest: sha("exact owned100 shape"),
+      };
+      expect((await options.custody.dispatch(binding)).state).toBe("dispatched");
+      expect(await options.custody.read("preserved100")).toMatchObject({
+        state: "dispatched",
+        postDigest: null,
+      });
+      await expect(options.custody.dispatch(binding)).rejects.toThrow("already exists");
+      await expect(
+        options.custody.terminal(
+          { ...binding, suffixBindingDigest: sha("foreign suffix") },
+          sha("post"),
+        ),
+      ).rejects.toThrow("cannot reconcile");
+      expect(await options.custody.read("preserved100")).toMatchObject({ state: "dispatched" });
+      expect(existsSync(join(f.root, "preserved100.terminal.json"))).toBe(false);
+      const reopened = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+      expect(await reopened.custody.readDispatch("preserved100")).toEqual(binding);
+    } finally {
+      removeArtifactTree(f.directory);
+    }
+  });
+
+  test("v3 parser rejects foreign fields and wrong terminal phase", async () => {
+    const f = sealedImportCustodyFixture();
+    try {
+      sealDirectory(f.directory, ["import.sql"]);
+      const options = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+      const binding: MoneyPreserved100DispatchBinding = {
+        ...f.binding,
+        kind: "takoserver.money-cutover-dispatch@v3",
+        phase: "preserved100",
+        afterSchemaPhase: "0100-fenced",
+        writerEpoch: sha("new epoch"),
+        nextWriterEpoch: sha("new epoch"),
+        suffixBindingDigest: sha("exact terminal98 binding"),
+        suffixPostDigest: sha("exact terminal98 post"),
+        suffixReviewDigest: sha("original suffix review"),
+        expectedAfterShapeDigest: sha("exact owned100 shape"),
+      };
+      await expect(options.custody.dispatch({ ...binding, ready: true } as never)).rejects.toThrow(
+        "malformed",
+      );
+      await expect(
+        options.custody.dispatch({ ...binding, afterSchemaPhase: "0098-fenced" } as never),
+      ).rejects.toThrow("malformed");
+      expect(await options.custody.read("preserved100")).toBeNull();
     } finally {
       removeArtifactTree(f.directory);
     }

@@ -26,6 +26,7 @@ import {
   canonicalApplicationShape,
   deriveExpectedApplicationShape,
 } from "./application-schema-shape.ts";
+import { readAuth103CanonicalMigrationSource } from "./auth103-canonical-migration-source.ts";
 import { RemoteD1 } from "./d1.ts";
 import { buildD1MigrationImport } from "./d1-migration-import.ts";
 import {
@@ -831,33 +832,46 @@ async function verifyGeneratedStorageTarget(
       lineage !== "apply-0066" &&
       target.environment === "integration" &&
       target.artifactBlobIoMode === undefined &&
-      (target.schemaMaintenanceMode === "pre-auth103-quiesced" ||
+      ((target.schemaMaintenanceMode === "pre-auth103-quiesced" &&
+        (target.moneyCutoverWriterPolicy === undefined ||
+          (target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1" &&
+            /^sha256:[0-9a-f]{64}$/u.test(target.moneyCutoverWriterEpoch ?? "") &&
+            target.auth103NativeProfile === "root-shared-auth-staging-v1"))) ||
         (target.schemaMaintenanceMode === undefined &&
           target.moneyCutoverWriterPolicy === undefined))
     ) {
+      const sourceRoot = resolve(migrationDirectory, "..");
       const complete = readMigrationArtifact(migrationDirectory);
-      if (
-        complete.names.length === 103 &&
-        auth103SourceSchemaReady(
-          {
-            local: complete.names,
-            applied: migrationState.applied,
-            shape: migrationState.shape,
-            shapeDigest: migrationState.shapeDigest,
-          },
-          resolve(migrationDirectory, ".."),
-          target.schemaMaintenanceMode === "pre-auth103-quiesced" ? "maintenance" : "normal",
-        )
-      ) {
-        return {
-          generation: generated.generation,
-          ...(generated.namespace === undefined ? {} : { namespace: generated.namespace }),
-          d1: { databaseId: generated.databaseId, databaseName: generated.databaseName },
-          r2: { bucketName: generated.bucketName },
-          migrationDigest: complete.digest,
-          appliedMigrations: [...migrationState.applied],
-          schemaShapeDigest: migrationState.shapeDigest,
-        };
+      const canonical = readAuth103CanonicalMigrationSource(sourceRoot);
+      try {
+        if (
+          auth103SourceSchemaReady(
+            {
+              local: complete.names,
+              applied: migrationState.applied,
+              shape: migrationState.shape,
+              shapeDigest: migrationState.shapeDigest,
+            },
+            sourceRoot,
+            target.schemaMaintenanceMode === "pre-auth103-quiesced" ? "maintenance" : "normal",
+            target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1"
+              ? "money-preserved"
+              : "ordinary",
+          )
+        ) {
+          canonical.assertCurrent();
+          return {
+            generation: generated.generation,
+            ...(generated.namespace === undefined ? {} : { namespace: generated.namespace }),
+            d1: { databaseId: generated.databaseId, databaseName: generated.databaseName },
+            r2: { bucketName: generated.bucketName },
+            migrationDigest: canonical.artifact.digest,
+            appliedMigrations: [...migrationState.applied],
+            schemaShapeDigest: migrationState.shapeDigest,
+          };
+        }
+      } finally {
+        canonical.dispose();
       }
     }
     // A full current schema is a read-side successor of the selected origin,

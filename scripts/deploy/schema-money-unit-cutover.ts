@@ -29,7 +29,14 @@ import {
   moneyCutoverClassificationTriggerSql,
   moneyCutoverFinancialTriggerSql,
 } from "../../src/money-cutover-sql.ts";
+import type { Sql, SqlParam } from "../../src/ports.ts";
+import {
+  frameHostMigrationSql,
+  prepareNativeMigrationSql,
+} from "../../src/sqlite-migration-policy.ts";
+import { assertStripeModeRealm } from "../../src/stripe-mode-realm.ts";
 import { applicationSchemaMatches, canonicalApplicationShape } from "./application-schema-shape.ts";
+import { readAuth103CanonicalMigrationSource } from "./auth103-canonical-migration-source.ts";
 import { RemoteD1, sqlLiteral } from "./d1.ts";
 import { buildD1MigrationImport } from "./d1-migration-import.ts";
 import { normalizeSnapshotDump } from "./d1-snapshot-restore.ts";
@@ -47,6 +54,8 @@ import {
   readD1SchemaState,
   readMigrationArtifact,
 } from "./migrations.ts";
+import { readMoneyNativeTypedCensusDigest } from "./money-native-typed-census.ts";
+import type { MoneyNormalWorkerSigningGenesisContribution } from "./money-normal-worker-version-upload.ts";
 import {
   type CommandResult,
   REPOSITORY,
@@ -55,6 +64,11 @@ import {
   wranglerCommand,
 } from "./process.ts";
 import { qualifySource, sealDirectory } from "./qualification.ts";
+import type {
+  MoneyUnitHeldPost94ConsumerInputs,
+  MoneyUnitOriginalCutoverOptions,
+} from "./schema-money-unit-owner.ts";
+import type { MoneyRealmPinContribution, MoneyRealmPinDraftData } from "./stripe-mode-realm.ts";
 import type { DeployTarget } from "./target.ts";
 import { acquireWranglerVersionPublicationLease } from "./wrangler-state.ts";
 
@@ -86,6 +100,7 @@ export type MoneyLegacyCutoverPhase =
   | "abandon";
 export type MoneyPost94Phase = "suffix98" | "resume98";
 export type MoneyCutoverPhase = MoneyLegacyCutoverPhase | MoneyPost94Phase;
+export type MoneyCustodyPhase = MoneyCutoverPhase | "preserved100";
 export type MoneySchemaPhase =
   | "0092"
   | "0092-fenced"
@@ -100,7 +115,7 @@ export interface MoneyUnitCutoverInvocation {
   readonly action: "status" | "apply";
   readonly environment: "integration";
   readonly commit: string;
-  readonly throughMigration: "0093" | "0094" | "0098";
+  readonly throughMigration: "0093" | "0094" | "0098" | "0100";
 }
 
 export interface MoneyStageOriginProof {
@@ -270,24 +285,90 @@ export interface MoneyPost94DispatchBinding
   /** Bound selection data, not a normal Worker TEST-mode or Financial policy proof. */
   readonly selectedStripeMode: "test";
   readonly selectionReviewDigest: string;
+  readonly financialContributionDigest?: string;
+  readonly financialSourceBindingDigest?: string;
+  readonly financialContributionPath?: string;
+  readonly signingGenesisDigest?: string;
+  readonly signingGenesisPath?: string;
+}
+
+/** Exact pre-import review DATA for the sole suffix import, not a phase grant. */
+export interface MoneyPost94OneDispatchBinding extends MoneyPost94DispatchBinding {
+  readonly financialContributionDigest: string;
+  readonly financialSourceBindingDigest: string;
+  readonly financialContributionPath: string;
+  readonly signingGenesisDigest: string;
+  readonly signingGenesisPath: string;
+}
+
+/** Same original custody journal, but a distinct exact98→100 transition. */
+export interface MoneyPreserved100DispatchBinding
+  extends Omit<MoneyLegacyCutoverDispatchBinding, "kind" | "phase" | "afterSchemaPhase"> {
+  readonly kind: "takoserver.money-cutover-dispatch@v3";
+  readonly phase: "preserved100";
+  readonly afterSchemaPhase: "0100-fenced";
+  readonly suffixBindingDigest: string;
+  readonly suffixPostDigest: string;
+  readonly expectedAfterShapeDigest: string;
+  readonly nextWriterEpoch: string;
+  readonly suffixReviewDigest: string;
+}
+
+/** The existing protected exact-review record binds this one source-built transition. */
+export interface MoneyPreserved100ReviewBinding {
+  readonly kind: "takoserver.money-preserved100-import-review@v1";
+  readonly phase: "preserved100";
+  readonly accountId: string;
+  readonly databaseId: string;
+  readonly databaseName: string;
+  readonly bucketName: string;
+  readonly workerName: string;
+  readonly sourceCommit: string;
+  readonly sourceDigest: string;
+  readonly importDigest: string;
+  readonly suffixBindingDigest: string;
+  readonly suffixPostDigest: string;
+  readonly suffixReviewDigest: string;
+  readonly freezeBindingDigest: string;
+  readonly originDigest: string;
+  readonly original92BackupDigest: string;
+  readonly writerDigest: string;
+  readonly nextWriterEpoch: string;
+  readonly beforeShapeDigest: string;
+  readonly afterShapeDigest: string;
+}
+
+export interface MoneyPost94ImportReviewBinding
+  extends Omit<
+    MoneyPost94OneDispatchBinding,
+    | "kind"
+    | "reviewDigest"
+    | "beforeShapeDigest"
+    | "afterSchemaPhase"
+    | "sealedImportPath"
+    | "financialContributionPath"
+    | "signingGenesisPath"
+  > {
+  readonly kind: "takoserver.money-post94-import-review@v1";
 }
 
 export type MoneyCutoverDispatchBinding =
   | MoneyLegacyCutoverDispatchBinding
-  | MoneyPost94DispatchBinding;
+  | MoneyPost94DispatchBinding
+  | MoneyPreserved100DispatchBinding;
 
 export interface MoneyCutoverCustodyReceipt {
   readonly kind: "takoserver.money-cutover-custody@v1";
-  readonly phase: MoneyCutoverPhase;
+  readonly phase: MoneyCustodyPhase;
   readonly state: "dispatched" | "terminal";
   readonly bindingDigest: string;
   readonly postDigest: string | null;
 }
 
 export interface MoneyCutoverCustody {
-  read(phase: MoneyCutoverPhase): Promise<MoneyCutoverCustodyReceipt | null>;
+  read(phase: MoneyCustodyPhase): Promise<MoneyCutoverCustodyReceipt | null>;
   /** Exact immutable dispatch body, retained separately from the no-overwrite receipt. */
-  readDispatch(phase: MoneyCutoverPhase): Promise<MoneyCutoverDispatchBinding | null>;
+  readDispatch(phase: MoneyCustodyPhase): Promise<MoneyCutoverDispatchBinding | null>;
   dispatch(binding: MoneyCutoverDispatchBinding): Promise<MoneyCutoverCustodyReceipt>;
   terminal(
     binding: MoneyCutoverDispatchBinding,
@@ -471,10 +552,25 @@ export function moneyUnitCutoverExpectedShape(
   }
 }
 
+/** Exact source-owned persistent objects that the Money suffix preserves. */
+export function moneyPost94GuardDefinitions(): readonly (readonly [string, string])[] {
+  return [
+    [FENCE_TABLE, FENCE_DDL],
+    [MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE, MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL],
+    [MONEY_CUTOVER_PERMIT_TABLE, MONEY_CUTOVER_PERMIT_DDL],
+    ["money_cutover_permit_epoch_guard", MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL],
+    ...fenceTables("0098-fenced").flatMap((table) =>
+      verbs.map(
+        (verb) => [moneyFenceTriggerName(table, verb), fenceTriggerSql(table, verb)] as const,
+      ),
+    ),
+  ];
+}
+
 let post94ExpectedShapeCache: { readonly sourceDigest: string; readonly shape: string } | null =
   null;
 
-function moneyPost94ExpectedShape(files: readonly MigrationFile[]): string {
+export function moneyPost94ExpectedShape(files: readonly MigrationFile[]): string {
   assertMoneyPost94Source(files);
   if (post94ExpectedShapeCache?.sourceDigest === SOURCE_0098) return post94ExpectedShapeCache.shape;
   const database = new Database(":memory:");
@@ -486,15 +582,7 @@ function moneyPost94ExpectedShape(files: readonly MigrationFile[]): string {
     database.exec(buildD1MigrationImport(files.slice(94, 98), { freshLedger: false }).sql);
     // 0095 removes the original money guards. Restore the same owned definitions;
     // schema equality says nothing about freeze rows, epochs or Financial mode eligibility.
-    const definitions = [
-      [FENCE_TABLE, FENCE_DDL],
-      [MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE, MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL],
-      [MONEY_CUTOVER_PERMIT_TABLE, MONEY_CUTOVER_PERMIT_DDL],
-      ["money_cutover_permit_epoch_guard", MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL],
-      ...fenceTables("0098-fenced").flatMap((table) =>
-        verbs.map((verb) => [moneyFenceTriggerName(table, verb), fenceTriggerSql(table, verb)]),
-      ),
-    ] as const;
+    const definitions = moneyPost94GuardDefinitions();
     for (const [name, sql] of definitions) {
       if (name === undefined || sql === undefined)
         throw preflightError("money suffix guard definition is incomplete");
@@ -524,6 +612,296 @@ function moneyPost94ExpectedShape(files: readonly MigrationFile[]): string {
   }
 }
 
+/**
+ * Exact candidate 103 application shape reached from the Money fenced98
+ * lineage. The Auth103 owner must independently accept this precise preserved
+ * Money union and verify its own source/installation receipts. Source replay
+ * fails if 99–103 remove or rewrite a Money guard; nothing is silently healed.
+ */
+function moneyPostExpectedPreservedShape(
+  files: readonly MigrationFile[],
+  through: 100 | 103,
+): string {
+  assertMoneyPost94Source(files);
+  if (
+    files.length !== through ||
+    files.some(
+      (file, index) =>
+        !new RegExp(`^${String(index + 1).padStart(4, "0")}_[-a-z0-9_]+\\.sql$`, "u").test(
+          file.name,
+        ),
+    )
+  )
+    throw preflightError("money preserved shape requires the exact selected source inventory");
+  const database = new Database(":memory:", { strict: true });
+  let stage = "prefix94";
+  try {
+    database.query("PRAGMA foreign_keys = ON").all();
+    executeMoneyHostSql(
+      database,
+      buildD1MigrationImport(files.slice(0, 94), { freshLedger: true }).sql,
+    );
+    executeMoneyHostSql(
+      database,
+      `${FENCE_DDL};\n${MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL};\n${MONEY_CUTOVER_PERMIT_DDL};\n${MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL};\n${moneyFenceInstallSql("0094-fenced")}`,
+    );
+    stage = "suffix98";
+    executeMoneyHostSql(
+      database,
+      buildD1MigrationImport(files.slice(94, 98), { freshLedger: false }).sql,
+    );
+    for (const [name, sql] of moneyPost94GuardDefinitions()) {
+      const existing = database.query("SELECT sql FROM sqlite_schema WHERE name = ?").get(name) as {
+        sql: string;
+      } | null;
+      if (existing === null) executeMoneyHostSql(database, `${sql};`);
+      else if (existing.sql !== sql)
+        throw preflightError("money post103 predecessor guard differs from owned98 source");
+    }
+    for (const [index, file] of files.slice(98, through).entries()) {
+      stage = `successor${99 + index}`;
+      const statements = frameHostMigrationSql(
+        buildD1MigrationImport([file], { freshLedger: false }).sql,
+      );
+      for (const [statementIndex, statement] of statements.entries()) {
+        try {
+          database.exec(statement);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "";
+          const category = message.includes("already exists")
+            ? "existing-object"
+            : message.includes("no such table")
+              ? "missing-table"
+              : message.includes("no such column")
+                ? "missing-column"
+                : message.includes("FOREIGN KEY")
+                  ? "foreign-key"
+                  : message.includes("syntax error")
+                    ? "syntax"
+                    : message.includes("constraint failed")
+                      ? message.includes("UNIQUE")
+                        ? message.includes("d1_migrations.name")
+                          ? "migration-ledger-duplicate"
+                          : message.includes("money_cutover")
+                            ? "money-fence-trap"
+                            : message.includes("tf_v2")
+                              ? "container-identity"
+                              : message.includes("auth103")
+                                ? "auth-identity"
+                                : "unique-constraint"
+                        : message.includes("CHECK")
+                          ? "check-constraint"
+                          : message.includes("NOT NULL")
+                            ? "not-null-constraint"
+                            : "constraint"
+                      : message.includes("is not allowed")
+                        ? "not-allowed"
+                        : message.includes("cannot")
+                          ? "cannot"
+                          : message.includes("not authorized")
+                            ? "not-authorized"
+                            : "sqlite-rejection";
+          stage = `successor${99 + index}-statement${statementIndex}-${category}`;
+          throw error;
+        }
+      }
+    }
+    stage = "preserved-guards";
+    for (const [name, sql] of moneyPost94GuardDefinitions()) {
+      const existing = database.query("SELECT sql FROM sqlite_schema WHERE name = ?").get(name) as {
+        sql: string;
+      } | null;
+      if (existing?.sql !== sql)
+        throw preflightError("money successor removed or changed an original guard");
+    }
+    stage = "canonical-shape";
+    return canonicalApplicationShape(moneyLocalSchema(database));
+  } catch {
+    throw preflightError(`money exact preserved shape could not be reconstructed at ${stage}`);
+  } finally {
+    database.close();
+  }
+}
+
+/** Exact original100 predecessor of the Money-preserved Auth103 transition. */
+export function moneyPost100ExpectedPreservedShape(files: readonly MigrationFile[]): string {
+  return moneyPostExpectedPreservedShape(files, 100);
+}
+
+/** Exact Money-preserved post103 shape, including source-owned guards. */
+export function moneyPost103ExpectedPreservedShape(files: readonly MigrationFile[]): string {
+  return moneyPostExpectedPreservedShape(files, 103);
+}
+
+/**
+ * Select an original100 or full103 observation from the whole current checkout.
+ * The audited source owner validates the complete inventory, including every
+ * canonical Auth103 successor, before the Money reader takes a 100 prefix.
+ * This is source DATA, not native qualification or permission to apply files.
+ */
+export function readMoneyOriginalPreservedSourceInventory(
+  sourceDirectory: string,
+  through: 100 | 103,
+  scratchBase: string,
+): {
+  readonly sourceDigest: string;
+  readonly files: readonly MigrationFile[];
+  assertCurrent(): void;
+  dispose(): void;
+} {
+  const source = readAuth103CanonicalMigrationSource(resolve(sourceDirectory, ".."), scratchBase);
+  return Object.freeze({
+    sourceDigest: source.artifact.digest,
+    files: through === 100 ? source.prefix.files : source.artifact.files,
+    assertCurrent: () => source.assertCurrent(),
+    dispose: () => source.dispose(),
+  });
+}
+
+export interface MoneyPreserved100ImportData {
+  readonly kind: "takoserver.money-preserved100-import-data@v1";
+  readonly qualification: "source-data-only";
+  readonly sourceDigest: string;
+  readonly importDigest: string;
+  readonly sql: string;
+  readonly beforeShape: string;
+  readonly afterShape: string;
+  readonly names: readonly string[];
+}
+
+function moneyPreserved100SqlShapePredicate(shape: string): string {
+  return `NOT EXISTS (
+    WITH expected AS MATERIALIZED (SELECT value FROM json_each(${sqlLiteral(shape)})),
+    actual AS MATERIALIZED (SELECT type,name,tbl_name,COALESCE(sql,'') AS sql FROM main.sqlite_schema
+      WHERE name NOT GLOB 'sqlite_*' AND tbl_name NOT IN ('d1_migrations','_cf_KV','_cf_METADATA'))
+    SELECT 1 FROM expected LEFT JOIN actual ON actual.type=json_extract(expected.value,'$.type')
+      AND actual.name=json_extract(expected.value,'$.name')
+      AND actual.tbl_name=json_extract(expected.value,'$.table')
+    WHERE actual.name IS NULL OR actual.sql IS NOT json_extract(expected.value,'$.sql')
+    UNION ALL
+    SELECT 1 FROM actual WHERE NOT EXISTS (SELECT 1 FROM expected
+      WHERE actual.type=json_extract(expected.value,'$.type') AND actual.name=json_extract(expected.value,'$.name')
+        AND actual.tbl_name=json_extract(expected.value,'$.table'))
+  )`;
+}
+
+/** Pure, audited 99–100 source DATA. The native owner supplies original custody. */
+export function buildMoneyOriginalPreserved100ImportData(input: {
+  readonly sourceDirectory: string;
+  readonly scratchBase: string;
+  readonly freezeBindingDigest: string;
+  readonly originDigest: string;
+  readonly original92BackupDigest: string;
+  readonly writerDigest: string;
+  readonly nextWriterEpoch: string;
+  readonly signingKeyId: string;
+  readonly signingPublicJwk: string;
+  readonly signingCreatedAtEpochSeconds: number;
+}): MoneyPreserved100ImportData {
+  const fields = [
+    "sourceDirectory",
+    "scratchBase",
+    "freezeBindingDigest",
+    "originDigest",
+    "original92BackupDigest",
+    "writerDigest",
+    "nextWriterEpoch",
+    "signingKeyId",
+    "signingPublicJwk",
+    "signingCreatedAtEpochSeconds",
+  ] as const;
+  if (
+    !record(input) ||
+    Object.getPrototypeOf(input) !== Object.prototype ||
+    JSON.stringify(Object.keys(input).sort()) !== JSON.stringify([...fields].sort()) ||
+    fields.some((name) => {
+      const slot = Object.getOwnPropertyDescriptor(input, name);
+      return !slot || !("value" in slot) || !slot.enumerable;
+    })
+  )
+    throw preflightError("money preserved100 import requires closed source-owned DATA");
+  for (const value of [
+    input.freezeBindingDigest,
+    input.originDigest,
+    input.original92BackupDigest,
+    input.writerDigest,
+    input.nextWriterEpoch,
+  ])
+    if (!SHA256.test(value)) throw preflightError("money preserved100 binding is malformed");
+  if (
+    typeof input.signingKeyId !== "string" ||
+    !/^[A-Za-z0-9._:-]{1,128}$/u.test(input.signingKeyId) ||
+    typeof input.signingPublicJwk !== "string" ||
+    Buffer.byteLength(input.signingPublicJwk, "utf8") > 1024 ||
+    !Number.isSafeInteger(input.signingCreatedAtEpochSeconds) ||
+    input.signingCreatedAtEpochSeconds < 0
+  )
+    throw preflightError("money preserved100 signing identity is malformed");
+  const source = readMoneyOriginalPreservedSourceInventory(
+    input.sourceDirectory,
+    100,
+    input.scratchBase,
+  );
+  try {
+    const files = source.files;
+    const beforeShape = moneyPost94ExpectedShape(files);
+    const afterShape = moneyPost100ExpectedPreservedShape(files);
+    const names = Object.freeze(files.map((file) => file.name));
+    const freeze = [
+      `binding_digest = ${sqlLiteral(input.freezeBindingDigest)}`,
+      `origin_digest = ${sqlLiteral(input.originDigest)}`,
+      `backup_digest = ${sqlLiteral(input.original92BackupDigest)}`,
+      `writer_digest = ${sqlLiteral(input.writerDigest)}`,
+      `source_digest = ${sqlLiteral(SOURCE_0092)}`,
+    ].join(" AND ");
+    const ledger = (count: 98 | 100) =>
+      `(SELECT json_group_array(name) FROM
+        (SELECT name FROM main.d1_migrations ORDER BY id))
+        IS ${sqlLiteral(JSON.stringify(names.slice(0, count)))}
+        AND NOT EXISTS (SELECT 1 FROM main.sqlite_schema
+          WHERE tbl_name='d1_migrations' AND type<>'table' AND name NOT GLOB 'sqlite_*')`;
+    const invariant = `(SELECT COUNT(*) FROM money_cutover_freeze) = 1
+       AND EXISTS (SELECT 1 FROM money_cutover_freeze WHERE singleton = 1 AND ${freeze})
+       AND (SELECT COUNT(*) FROM ${MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE}) = 1
+       AND EXISTS (SELECT 1 FROM ${MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE}
+         WHERE singleton = 1 AND writer_epoch = ${sqlLiteral(input.nextWriterEpoch)})
+       AND NOT EXISTS (SELECT 1 FROM ${MONEY_CUTOVER_PERMIT_TABLE})
+       AND (SELECT COUNT(*) FROM stripe_mode_realm) = 1
+       AND EXISTS (SELECT 1 FROM stripe_mode_realm WHERE singleton = 1 AND mode = 'test')
+       AND (SELECT COUNT(*) FROM runtime_grant_keys) = 1
+       AND EXISTS (SELECT 1 FROM runtime_grant_keys WHERE
+         key_id = ${sqlLiteral(input.signingKeyId)}
+         AND public_jwk = ${sqlLiteral(input.signingPublicJwk)}
+         AND created_at_epoch_seconds = ${input.signingCreatedAtEpochSeconds}
+         AND revoked_at_epoch_seconds IS NULL)`;
+    const guard = (predicate: string) =>
+      `SELECT json(CASE WHEN (${predicate}) IS 1 THEN '{}' ELSE '!' END);\n`;
+    const migration = buildD1MigrationImport(files.slice(98, 100), { freshLedger: false });
+    const sql =
+      guard(
+        `${ledger(98)} AND ${moneyPreserved100SqlShapePredicate(beforeShape)} AND ${invariant}`,
+      ) +
+      migration.sql +
+      "\n" +
+      guard(
+        `${ledger(100)} AND ${moneyPreserved100SqlShapePredicate(afterShape)} AND ${invariant}`,
+      );
+    source.assertCurrent();
+    return Object.freeze({
+      kind: "takoserver.money-preserved100-import-data@v1",
+      qualification: "source-data-only",
+      sourceDigest: source.sourceDigest,
+      importDigest: digest(sql),
+      sql,
+      beforeShape,
+      afterShape,
+      names,
+    });
+  } finally {
+    source.dispose();
+  }
+}
+
 /** Exact application schema, including owned persistent freeze metadata and every abort trigger. */
 export function moneyUnitCutoverSchemaMatches(
   state: D1SchemaState,
@@ -545,7 +923,12 @@ export function moneyUnitCutoverSchemaMatches(
 }
 
 export function moneyCutoverBindingDigest(
-  binding: MoneyCutoverDispatchBinding | MoneyReviewBinding | MoneyPost94SelectionReviewBinding,
+  binding:
+    | MoneyCutoverDispatchBinding
+    | MoneyReviewBinding
+    | MoneyPost94SelectionReviewBinding
+    | MoneyPost94ImportReviewBinding
+    | MoneyPreserved100ReviewBinding,
 ): string {
   return digest(JSON.stringify(binding));
 }
@@ -1053,6 +1436,62 @@ function assertFreezeRow(
   }
 }
 
+/**
+ * The post103 thaw is one guarded native DELETE. It can remove only the
+ * original Money freeze row, while the selected new epoch, empty permit and
+ * exact 103-name ledger are still present. The caller must require one
+ * RETURNING row and re-read the full schema, FK state and public health.
+ */
+export function moneyPost103OriginalFreezeReleaseSql(input: {
+  readonly files: readonly MigrationFile[];
+  readonly freezeBindingDigest: string;
+  readonly originDigest: string;
+  readonly original92BackupDigest: string;
+  readonly originalWriterDigest: string;
+  readonly currentWriterEpoch: string;
+}): string {
+  const {
+    files,
+    freezeBindingDigest,
+    originDigest,
+    original92BackupDigest,
+    originalWriterDigest,
+    currentWriterEpoch,
+  } = input;
+  assertMoneyPost94Source(files);
+  if (
+    files.length !== 103 ||
+    files.some(
+      (file, index) =>
+        !new RegExp(`^${String(index + 1).padStart(4, "0")}_[-a-z0-9_]+\\.sql$`, "u").test(
+          file.name,
+        ),
+    ) ||
+    ![freezeBindingDigest, originDigest, original92BackupDigest, originalWriterDigest].every(
+      (value) => SHA256.test(value),
+    ) ||
+    !MONEY_CUTOVER_WRITER_EPOCH_PATTERN.test(currentWriterEpoch)
+  )
+    throw preflightError("money post103 thaw requires exact source, original binding and epoch");
+  const orderedNames = sqlLiteral(JSON.stringify(files.map((file) => file.name)));
+  return `DELETE FROM ${FENCE_TABLE}
+WHERE singleton = 1
+  AND binding_digest = ${sqlLiteral(freezeBindingDigest)}
+  AND origin_digest = ${sqlLiteral(originDigest)}
+  AND backup_digest = ${sqlLiteral(original92BackupDigest)}
+  AND writer_digest = ${sqlLiteral(originalWriterDigest)}
+  AND source_digest = ${sqlLiteral(SOURCE_0092)}
+  AND (SELECT COUNT(*) FROM ${FENCE_TABLE}) = 1
+  AND (SELECT COUNT(*) FROM ${MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE}) = 1
+  AND EXISTS (SELECT 1 FROM ${MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE}
+              WHERE singleton = 1 AND writer_epoch = ${sqlLiteral(currentWriterEpoch)})
+  AND NOT EXISTS (SELECT 1 FROM ${MONEY_CUTOVER_PERMIT_TABLE})
+  AND (SELECT COUNT(*) FROM d1_migrations) = 103
+  AND (SELECT json_group_array(name) FROM
+       (SELECT name FROM d1_migrations ORDER BY id)) IS ${orderedNames}
+RETURNING binding_digest`;
+}
+
 function exactNumber(
   rows: readonly Record<string, unknown>[],
   field: string,
@@ -1190,6 +1629,587 @@ function phaseImportSql(
         "money post94 continuation requires the owning Financial realm transition port",
       );
   }
+}
+
+/** Fixed Root SQL DATA around the still-missing operative Financial contribution. */
+export interface MoneyPost94RootImportData {
+  readonly kind: "takoserver.money-post94-root-import-data@v1";
+  readonly qualification: "data-only";
+  readonly sourceDigest: string;
+  readonly beforeFinancialSql: string;
+  readonly afterFinancialSql: string;
+  readonly digest: string;
+  readonly normalHostReady: false;
+}
+
+/**
+ * Pure fragments, never import permission. The owning executor still refuses
+ * suffix98/resume98 until Financial supplies its real original contribution.
+ * A future owner must place all three Financial statements adjacently between
+ * these fragments inside the SAME existing sealed ONE; no new importer lives here.
+ */
+export function buildMoneyPost94RootImportData(input: {
+  readonly files: readonly MigrationFile[];
+  readonly freezeBindingDigest: string;
+  readonly originDigest: string;
+  readonly original92BackupDigest: string;
+  readonly writerDigest: string;
+  readonly previousWriterEpoch: string;
+  readonly nextWriterEpoch: string;
+}): MoneyPost94RootImportData {
+  const fields = [
+    "files",
+    "freezeBindingDigest",
+    "originDigest",
+    "original92BackupDigest",
+    "writerDigest",
+    "previousWriterEpoch",
+    "nextWriterEpoch",
+  ] as const;
+  if (
+    input === null ||
+    typeof input !== "object" ||
+    Object.getPrototypeOf(input) !== Object.prototype ||
+    Reflect.ownKeys(input).length !== fields.length
+  )
+    throw preflightError("money post94 Root DATA requires only closed own-data fields");
+  const captured = Object.fromEntries(
+    fields.map((name) => {
+      const property = Object.getOwnPropertyDescriptor(input, name);
+      if (!property || !("value" in property) || !property.enumerable)
+        throw preflightError("money post94 Root DATA fields must be own data");
+      return [name, property.value];
+    }),
+  ) as typeof input;
+  const { files, previousWriterEpoch, nextWriterEpoch } = captured;
+  for (const name of fields.filter((name) => name !== "files"))
+    if (typeof captured[name] !== "string" || !SHA256.test(captured[name]))
+      throw preflightError("money post94 Root DATA requires exact SHA256 bindings");
+  if (previousWriterEpoch === nextWriterEpoch)
+    throw preflightError("money post94 Root DATA requires distinct old and next epochs");
+  assertMoneyPost94Source(files);
+  const suffix = buildD1MigrationImport(files.slice(94, 98), {
+    freshLedger: false,
+  });
+  const freezeValues = [
+    captured.freezeBindingDigest,
+    captured.originDigest,
+    captured.original92BackupDigest,
+    captured.writerDigest,
+    SOURCE_0092,
+  ].map(sqlLiteral);
+  const freezePredicate = [
+    "singleton = 1",
+    `binding_digest = ${freezeValues[0]}`,
+    `origin_digest = ${freezeValues[1]}`,
+    `backup_digest = ${freezeValues[2]}`,
+    `writer_digest = ${freezeValues[3]}`,
+    `source_digest = ${freezeValues[4]}`,
+  ].join(" AND ");
+  const stateGuard = (epoch: string, through: 94 | 98): string =>
+    `INSERT INTO ${MONEY_CUTOVER_PERMIT_TABLE} (singleton, epoch, writer_epoch) SELECT 1, 'invalid-post94-root-state', ${sqlLiteral(epoch)} WHERE (SELECT COUNT(*) FROM ${FENCE_TABLE}) != 1 OR NOT EXISTS (SELECT 1 FROM ${FENCE_TABLE} WHERE ${freezePredicate}) OR (SELECT COUNT(*) FROM ${MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE}) != 1 OR NOT EXISTS (SELECT 1 FROM ${MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE} WHERE singleton = 1 AND writer_epoch = ${sqlLiteral(epoch)}) OR EXISTS (SELECT 1 FROM ${MONEY_CUTOVER_PERMIT_TABLE}) OR (SELECT COUNT(*) FROM d1_migrations) != ${through} OR EXISTS (SELECT 1 FROM d1_migrations WHERE name IS NULL OR name NOT IN (${files
+      .slice(0, through)
+      .map((file) => sqlLiteral(file.name))
+      .join(", ")}));`;
+  const restore: string[] = [];
+  const database = new Database(":memory:");
+  const executeExpectedSql = (sql: string): void => {
+    // Bun exec(script) can continue after an earlier statement error. Use the
+    // existing Host framer so an invalid opaque source reconstruction stops here.
+    for (const statement of frameHostMigrationSql(sql)) database.exec(statement);
+  };
+  try {
+    // Canonical migration bodies stay opaque and byte-checked by the existing
+    // importer. Only known Root guard definitions may be restored here.
+    executeExpectedSql(buildD1MigrationImport(files.slice(0, 94), { freshLedger: true }).sql);
+    executeExpectedSql(
+      `${FENCE_DDL};\n${MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL};\n${MONEY_CUTOVER_PERMIT_DDL};\n${MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL};\n${moneyFenceInstallSql("0094-fenced")}`,
+    );
+    executeExpectedSql(suffix.sql);
+    const missing = new Set<string>();
+    for (const [name, definition] of moneyPost94GuardDefinitions()) {
+      const existing = database.query("SELECT sql FROM sqlite_schema WHERE name = ?").get(name) as {
+        sql: string;
+      } | null;
+      if (existing === null) {
+        missing.add(name);
+        restore.push(`${definition};`);
+        executeExpectedSql(`${definition};`);
+      } else if (existing.sql !== definition)
+        throw preflightError("money post94 Root guard definition differs from fixed source");
+    }
+    if (missing.has(FENCE_TABLE))
+      restore.push(`INSERT INTO ${FENCE_TABLE} VALUES (1, ${freezeValues.join(", ")});`);
+    if (missing.has(MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE))
+      restore.push(
+        `INSERT INTO ${MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE} (singleton, writer_epoch) VALUES (1, ${sqlLiteral(previousWriterEpoch)});`,
+      );
+  } finally {
+    database.close();
+  }
+  const beforeFinancialSql = [
+    stateGuard(previousWriterEpoch, 94),
+    suffix.sql,
+    ...restore,
+    stateGuard(previousWriterEpoch, 98),
+  ].join("\n");
+  const afterFinancialSql = [
+    stateGuard(previousWriterEpoch, 98),
+    `UPDATE ${MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE} SET writer_epoch = ${sqlLiteral(nextWriterEpoch)} WHERE singleton = 1 AND writer_epoch = ${sqlLiteral(previousWriterEpoch)};`,
+    `INSERT INTO ${MONEY_CUTOVER_PERMIT_TABLE} (singleton, epoch, writer_epoch) SELECT 1, 'invalid-post94-root-rotation', ${sqlLiteral(nextWriterEpoch)} WHERE changes() != 1;`,
+    stateGuard(nextWriterEpoch, 98),
+  ].join("\n");
+  assertMoneyPost94Source(files);
+  return Object.freeze({
+    kind: "takoserver.money-post94-root-import-data@v1",
+    qualification: "data-only",
+    sourceDigest: SOURCE_0098,
+    beforeFinancialSql,
+    afterFinancialSql,
+    digest: digest(JSON.stringify([SOURCE_0098, beforeFinancialSql, afterFinancialSql])),
+    normalHostReady: false,
+  });
+}
+
+/** Local source-built result DATA. The actual executor still checks original producers. */
+export interface MoneyPost94OneImportData {
+  readonly qualification: "source-data-only";
+  readonly sql: string;
+  readonly digest: string;
+  readonly financialStatementsDigest: string;
+  readonly expectedRowCounts: Readonly<Record<string, number>>;
+  readonly expectedAllDataDigest: string;
+}
+
+function executeMoneyHostSql(database: Database, sql: string): void {
+  for (const statement of frameHostMigrationSql(sql)) database.exec(statement);
+}
+
+function moneyLocalSchema(database: Database): D1SchemaState {
+  const applied = (
+    database.query("SELECT name FROM d1_migrations ORDER BY id").all() as { name: string }[]
+  ).map((row) => row.name);
+  const shape = canonicalSchemaShape(
+    database
+      .query(
+        "SELECT type, name, tbl_name, COALESCE(sql, '') AS sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name",
+      )
+      .all() as Record<string, unknown>[],
+  );
+  return { applied, shape, shapeDigest: digest(shape) };
+}
+
+/** Native SQLite prepares/binds/expands without executing the selected statement. */
+function renderMoneyBoundSql(database: Database, sql: string, params: readonly SqlParam[]): string {
+  if (
+    typeof sql !== "string" ||
+    Buffer.byteLength(sql, "utf8") > 100_000 ||
+    frameHostMigrationSql(sql).length !== 1 ||
+    params.length > 100
+  )
+    throw preflightError(
+      "money ONE requires one bounded original statement and at most100 parameters",
+    );
+  const captured = params.map((value) => {
+    if (typeof value === "string") {
+      if (
+        value.includes("\0") ||
+        new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(value, "utf8")) !== value
+      )
+        throw preflightError(
+          "money ONE string parameter cannot be represented losslessly by native SQLite expansion",
+        );
+      return value;
+    }
+    if (typeof value === "number" && Number.isSafeInteger(value) && !Object.is(value, -0))
+      return value;
+    if (value === null) return null;
+    if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
+    throw preflightError("money ONE parameter must retain its exact native type and value");
+  });
+  const statement = database.prepare(sql, captured);
+  try {
+    if (statement.paramsCount !== captured.length)
+      throw preflightError("money ONE original parameter arity differs");
+    const expanded = statement.toString();
+    if (
+      frameHostMigrationSql(expanded).length !== 1 ||
+      Buffer.byteLength(expanded, "utf8") > 100_000
+    )
+      throw preflightError("money ONE expanded statement exceeds the native bounded shape");
+    return expanded.endsWith(";") ? expanded : `${expanded};`;
+  } finally {
+    statement.finalize();
+  }
+}
+
+/** Public registration DATA only; native ownership is supplied by the real genesis owner. */
+export interface MoneyPost94SigningGenesisDataInput {
+  readonly keyId: string;
+  readonly publicJwk: string;
+  readonly createdAtEpochSeconds: number;
+  readonly previousWriterEpoch: string;
+}
+export function buildMoneyPost94SigningGenesisData(
+  input: MoneyPost94SigningGenesisDataInput,
+): readonly [string, string, string] {
+  const names = ["keyId", "publicJwk", "createdAtEpochSeconds", "previousWriterEpoch"] as const;
+  if (!record(input) || Reflect.ownKeys(input).length !== names.length)
+    throw preflightError("money signing registration requires closed public DATA");
+  const values = Object.fromEntries(
+    names.map((name) => {
+      const slot = Object.getOwnPropertyDescriptor(input, name);
+      if (!slot || !("value" in slot))
+        throw preflightError("money signing registration fields must be own DATA");
+      return [name, slot.value];
+    }),
+  ) as unknown as MoneyPost94SigningGenesisDataInput;
+  if (
+    typeof values.keyId !== "string" ||
+    !/^[A-Za-z0-9._:-]{1,128}$/u.test(values.keyId) ||
+    typeof values.publicJwk !== "string" ||
+    Buffer.byteLength(values.publicJwk, "utf8") > 1024 ||
+    !Number.isSafeInteger(values.createdAtEpochSeconds) ||
+    values.createdAtEpochSeconds < 0 ||
+    Object.is(values.createdAtEpochSeconds, -0) ||
+    !SHA256.test(values.previousWriterEpoch)
+  )
+    throw preflightError(
+      "money signing registration public identity or retained creation DATA is malformed",
+    );
+  let publicJwk: unknown;
+  try {
+    publicJwk = JSON.parse(values.publicJwk);
+  } catch {
+    throw preflightError("money signing registration public JWK is malformed");
+  }
+  if (
+    !record(publicJwk) ||
+    Object.keys(publicJwk).sort().join(",") !== "crv,kty,x" ||
+    publicJwk.kty !== "OKP" ||
+    publicJwk.crv !== "Ed25519" ||
+    typeof publicJwk.x !== "string" ||
+    !/^[A-Za-z0-9_-]{43}$/u.test(publicJwk.x) ||
+    Buffer.from(publicJwk.x, "base64url").length !== 32 ||
+    Buffer.from(publicJwk.x, "base64url").toString("base64url") !== publicJwk.x ||
+    values.publicJwk !== JSON.stringify({ kty: "OKP", crv: "Ed25519", x: publicJwk.x })
+  )
+    throw preflightError("money signing registration requires canonical public-only Ed25519 bytes");
+  const exact = `key_id=${sqlLiteral(values.keyId)} AND public_jwk=${sqlLiteral(values.publicJwk)} AND created_at_epoch_seconds=${values.createdAtEpochSeconds} AND revoked_at_epoch_seconds IS NULL`;
+  const bad = (condition: string) =>
+    `INSERT INTO ${MONEY_CUTOVER_PERMIT_TABLE} (singleton,epoch,writer_epoch) SELECT 1,'invalid-post94-signing-genesis',${sqlLiteral(values.previousWriterEpoch)} WHERE ${condition};`;
+  return Object.freeze([
+    bad("(SELECT COUNT(*) FROM runtime_grant_keys)!=0"),
+    `INSERT INTO runtime_grant_keys (key_id,public_jwk,created_at_epoch_seconds,revoked_at_epoch_seconds) VALUES (${sqlLiteral(values.keyId)},${sqlLiteral(values.publicJwk)},${values.createdAtEpochSeconds},NULL) RETURNING key_id,public_jwk,created_at_epoch_seconds,revoked_at_epoch_seconds;`,
+    bad(
+      `changes()!=1 OR (SELECT COUNT(*) FROM runtime_grant_keys)!=1 OR NOT EXISTS(SELECT 1 FROM runtime_grant_keys WHERE ${exact})`,
+    ),
+  ]);
+}
+
+/** Never expose a native SQLite query, expanded parameters or foreign error cause. */
+function moneyOneLocalFailure(
+  error: unknown,
+  stage: string,
+  source: string,
+  bindingsDigest: string,
+  statement: number | null,
+  cleanupFailed: boolean,
+): DeployError {
+  const allowed = new Set([
+    "money ONE requires one bounded original statement and at most100 parameters",
+    "money ONE string parameter cannot be represented losslessly by native SQLite expansion",
+    "money ONE parameter must retain its exact native type and value",
+    "money ONE original parameter arity differs",
+    "money ONE expanded statement exceeds the native bounded shape",
+    "money ONE mandatory Financial INSERT did not return its exact singleton TEST postimage",
+    "money ONE local snapshot is not exact fenced94",
+    "money ONE signing genesis old epoch differs",
+    "money ONE signing registration did not return its exact active public row",
+    "money ONE local terminal schema differs from immutable98 plus restored guards",
+    "money ONE local table name is malformed",
+    "money signing registration requires closed public DATA",
+    "money signing registration fields must be own DATA",
+    "money signing registration public identity or retained creation DATA is malformed",
+    "money signing registration public JWK is malformed",
+    "money signing registration requires canonical public-only Ed25519 bytes",
+  ]);
+  let message: unknown, code: unknown;
+  try {
+    if (typeof error === "object" && error !== null) {
+      message = Object.getOwnPropertyDescriptor(error, "message")?.value;
+      code = Object.getOwnPropertyDescriptor(error, "code")?.value;
+    }
+  } catch {}
+  const finiteMessage =
+    error instanceof DeployError && typeof message === "string" && allowed.has(message)
+      ? message
+      : "money ONE local exact rehearsal refused";
+  const nativeCode =
+    code === "SQLITE_ERROR"
+      ? "sqlite_error"
+      : typeof code === "string" && code.startsWith("SQLITE_CONSTRAINT")
+        ? "sqlite_constraint"
+        : "native_sql_failure";
+  return preflightError(
+    finiteMessage,
+    JSON.stringify({
+      kind: "takoserver.money-one-local-failure@v1",
+      stage,
+      statement,
+      nativeCode,
+      reason: message === "malformed JSON" ? "malformed_json" : "unreported",
+      statementDigest: digest(source),
+      bindingsDigest,
+      cleanupFailed,
+    }),
+  );
+}
+
+/**
+ * Rehearses the EXACT single script on the retained converted94 snapshot locally.
+ * This is DATA/atomic-mechanics proof, never a substitute for either original
+ * producer. The live route obtains statements only from Financial V15's real
+ * constructor and reasserts it immediately before no-overwrite dispatch.
+ */
+export async function buildMoneyPost94OneImportData(input: {
+  readonly root: Parameters<typeof buildMoneyPost94RootImportData>[0];
+  readonly financialStatements: MoneyRealmPinDraftData["statements"];
+  readonly convertedSnapshot: string;
+  readonly signingGenesis: MoneyPost94SigningGenesisDataInput;
+}): Promise<MoneyPost94OneImportData> {
+  let root: ReturnType<typeof buildMoneyPost94RootImportData>;
+  try {
+    root = buildMoneyPost94RootImportData(input.root);
+  } catch (error) {
+    throw moneyOneLocalFailure(
+      error,
+      "root-source-reconstruction",
+      "",
+      digest("unavailable-before-original-statement-capture"),
+      null,
+      false,
+    );
+  }
+  if (!Array.isArray(input.financialStatements) || input.financialStatements.length !== 3)
+    throw preflightError("money ONE requires the exact adjacent Financial triple");
+  const statements = input.financialStatements.map((statement) => {
+    if (
+      !record(statement) ||
+      Object.getPrototypeOf(statement) !== Object.prototype ||
+      Reflect.ownKeys(statement).length !== 2 ||
+      !Object.hasOwn(statement, "sql") ||
+      !Object.hasOwn(statement, "params")
+    )
+      throw preflightError("money ONE requires closed original Financial statement DATA");
+    const sql = Object.getOwnPropertyDescriptor(statement, "sql"),
+      params = Object.getOwnPropertyDescriptor(statement, "params");
+    if (
+      !sql ||
+      !("value" in sql) ||
+      !params ||
+      !("value" in params) ||
+      typeof sql.value !== "string" ||
+      !Array.isArray(params.value)
+    )
+      throw preflightError("money ONE Financial statements must be original own-data vectors");
+    const values = Array.from({ length: params.value.length }, (_, index) => {
+      const value = Object.getOwnPropertyDescriptor(params.value, String(index));
+      if (!value || !("value" in value))
+        throw preflightError("money ONE parameters must be own DATA indexes");
+      return value.value;
+    });
+    return Object.freeze({
+      sql: sql.value,
+      params: Object.freeze(values) as readonly (string | number)[],
+    });
+  });
+  const financialStatementsDigest = digest(JSON.stringify(statements));
+  const normalized = normalizeSnapshotDump(Buffer.from(input.convertedSnapshot, "utf8"));
+  if (normalized.sql !== input.convertedSnapshot || normalized.nulBytes !== 0)
+    throw preflightError("money ONE requires the exact normalized converted94 snapshot");
+  const database = new Database(":memory:");
+  let stage = "snapshot-import",
+    source = normalized.sql;
+  let statementIndex: number | null = null;
+  let cleanupFailed = false;
+  let failure: DeployError | undefined;
+  let result: MoneyPost94OneImportData | undefined;
+  try {
+    executeMoneyHostSql(database, normalized.sql);
+    stage = "snapshot-schema";
+    if (!moneyUnitCutoverSchemaMatches(moneyLocalSchema(database), input.root.files, "0094-fenced"))
+      throw preflightError("money ONE local snapshot is not exact fenced94");
+    const expanded: string[] = [];
+    database.transaction(() => {
+      stage = "root-before";
+      source = root.beforeFinancialSql;
+      executeMoneyHostSql(database, root.beforeFinancialSql);
+      for (const [index, statement] of statements.entries()) {
+        let prepared: ReturnType<Database["prepare"]> | undefined;
+        let primaryFailure: unknown;
+        let didFail = false;
+        stage = "financial-expand";
+        source = statement.sql;
+        statementIndex = index + 1;
+        try {
+          const sql = renderMoneyBoundSql(database, statement.sql, statement.params);
+          expanded.push(sql);
+          stage = "financial-prepare";
+          prepared = database.prepare(sql);
+          stage = "financial-execute";
+          const rows = prepared.all() as Record<string, unknown>[];
+          if (
+            index === 1 &&
+            (rows.length !== 1 ||
+              Object.keys(rows[0] ?? {})
+                .sort()
+                .join(",") !== "mode,pinned_at,singleton" ||
+              rows[0]?.singleton !== 1 ||
+              rows[0]?.mode !== "test")
+          )
+            throw preflightError(
+              "money ONE mandatory Financial INSERT did not return its exact singleton TEST postimage",
+            );
+        } catch (error) {
+          didFail = true;
+          primaryFailure = error;
+        }
+        try {
+          prepared?.finalize();
+        } catch (error) {
+          if (!didFail) {
+            didFail = true;
+            primaryFailure = error;
+            stage = "financial-finalize";
+          } else cleanupFailed = true;
+        }
+        if (didFail) throw primaryFailure;
+      }
+      statementIndex = null;
+      stage = "signing-data";
+      source = "";
+      const genesisStatements = buildMoneyPost94SigningGenesisData(input.signingGenesis);
+      if (input.signingGenesis.previousWriterEpoch !== input.root.previousWriterEpoch)
+        throw preflightError("money ONE signing genesis old epoch differs");
+      for (const [index, sql] of genesisStatements.entries()) {
+        stage = "signing-registration";
+        source = sql;
+        statementIndex = index + 1;
+        const statement = database.prepare(sql);
+        try {
+          const rows = statement.all() as Record<string, unknown>[];
+          if (
+            index === 1 &&
+            (rows.length !== 1 || !moneySigningPostimageMatches(rows[0], input.signingGenesis))
+          )
+            throw preflightError(
+              "money ONE signing registration did not return its exact active public row",
+            );
+        } finally {
+          statement.finalize();
+        }
+        expanded.push(sql);
+      }
+      statementIndex = null;
+      stage = "root-after";
+      source = root.afterFinancialSql;
+      executeMoneyHostSql(database, root.afterFinancialSql);
+    })();
+    stage = "terminal-schema";
+    source = "";
+    if (!moneyUnitCutoverSchemaMatches(moneyLocalSchema(database), input.root.files, "0098-fenced"))
+      throw preflightError(
+        "money ONE local terminal schema differs from immutable98 plus restored guards",
+      );
+    stage = "terminal-permit";
+    await assertPermitEmpty(localReader(database), "preflight", input.root.nextWriterEpoch);
+    stage = "terminal-realm";
+    await assertStripeModeRealm(
+      readonlyMoneySql(localReader(database), database, "preflight"),
+      "test",
+    );
+    stage = "terminal-foreign-keys";
+    await assertMoneyNativeForeignKeys(localReader(database), "preflight");
+    stage = "terminal-table-list";
+    const tables = (
+      database
+        .query(
+          "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT GLOB 'sqlite_*' AND name NOT IN ('_cf_KV','_cf_METADATA','d1_migrations') ORDER BY name",
+        )
+        .all() as { name: string }[]
+    ).map((row) => row.name);
+    stage = "terminal-row-counts";
+    const expectedRowCounts = Object.fromEntries(
+      tables.map((table) => {
+        if (!/^[a-z_][a-z_0-9]*$/u.test(table))
+          throw preflightError("money ONE local table name is malformed");
+        return [
+          table,
+          (database.query(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n,
+        ];
+      }),
+    );
+    stage = "terminal-typed-census";
+    const expectedAllDataDigest = await readWholeDatabaseDataDigest(
+      localReader(database),
+      "preflight",
+      tables,
+    );
+    const sql = [root.beforeFinancialSql, ...expanded, root.afterFinancialSql].join("\n");
+    result = Object.freeze({
+      qualification: "source-data-only",
+      sql,
+      digest: digest(sql),
+      financialStatementsDigest,
+      expectedRowCounts: Object.freeze(expectedRowCounts),
+      expectedAllDataDigest,
+    });
+  } catch (error) {
+    failure = moneyOneLocalFailure(
+      error,
+      stage,
+      source,
+      financialStatementsDigest,
+      statementIndex,
+      cleanupFailed,
+    );
+  }
+  try {
+    database.close();
+  } catch (error) {
+    failure =
+      failure === undefined
+        ? moneyOneLocalFailure(error, "database-close", "", financialStatementsDigest, null, true)
+        : preflightError(
+            failure.message,
+            JSON.stringify({ ...JSON.parse(failure.detail ?? "{}"), cleanupFailed: true }),
+          );
+  }
+  if (failure !== undefined) throw failure;
+  if (result === undefined) throw preflightError("money ONE exact rehearsal produced no result");
+  return result;
+}
+
+function readonlyMoneySql(database: PreimageReader, compiler: Database, phase: DeployPhase): Sql {
+  return Object.freeze({
+    query: async (sql: string, params: readonly SqlParam[] = []) => {
+      const framed = prepareNativeMigrationSql(sql, "introspection");
+      if (framed.length !== 1 || !["select", "pragma"].includes(framed[0]?.command ?? ""))
+        throw proofError(phase, "money realm verification attempted a non-read statement");
+      return database.query(
+        phase,
+        "immutable TEST realm read",
+        renderMoneyBoundSql(compiler, sql, params),
+      );
+    },
+    run: async () => {
+      throw proofError(phase, "money realm verification has no writer");
+    },
+    batch: async () => {
+      throw proofError(phase, "money realm verification has no batch writer");
+    },
+  });
 }
 
 /** Pure, exact SQL composer used by the sealed Wrangler import and local rollback tests. */
@@ -2748,56 +3768,7 @@ export async function readWholeDatabaseDataDigest(
   phase: DeployPhase,
   tables: readonly string[],
 ): Promise<string> {
-  const hash = createHash("sha256");
-  for (const table of tables) {
-    if (!/^[a-z_][a-z_0-9]*$/u.test(table))
-      throw proofError(phase, "backup data table name is malformed");
-    const info = await database.query(
-      phase,
-      `backup ${table} columns`,
-      `PRAGMA table_info(${table})`,
-    );
-    const names = info.map((row) => row.name);
-    if (
-      names.length === 0 ||
-      names.some((name) => typeof name !== "string" || !/^[A-Za-z_][A-Za-z_0-9]*$/u.test(name))
-    ) {
-      throw proofError(phase, `backup ${table} columns are malformed`);
-    }
-    const projection = names
-      .map((name, index) => {
-        const column = `"${name}"`;
-        return `typeof(${column}) AS t${index}, CASE typeof(${column}) WHEN 'null' THEN '' WHEN 'text' THEN hex(CAST(${column} AS BLOB)) WHEN 'blob' THEN hex(${column}) WHEN 'integer' THEN CAST(${column} AS TEXT) WHEN 'real' THEN printf('%!.26g', ${column}) ELSE NULL END AS v${index}`;
-      })
-      .join(", ");
-    const order = names.flatMap((_name, index) => [`t${index}`, `v${index}`]).join(", ");
-    const rows = await database.query(
-      phase,
-      `backup ${table} data`,
-      `SELECT ${projection} FROM ${table} ORDER BY ${order} LIMIT 1001`,
-    );
-    if (rows.length > 1000)
-      throw proofError(phase, `backup ${table} exceeds the bounded row-value proof`);
-    hash.update(table).update("\0").update(JSON.stringify(names)).update("\0");
-    for (const row of rows) {
-      const values = names.map((_name, index) => [row[`t${index}`], row[`v${index}`]]);
-      if (
-        values.some(
-          ([type, value]) =>
-            !["null", "text", "blob", "integer", "real"].includes(String(type)) ||
-            typeof value !== "string" ||
-            ((type === "text" || type === "blob") && !/^(?:[0-9A-F]{2})*$/u.test(value)) ||
-            (type === "integer" && !/^-?(?:0|[1-9][0-9]*)$/u.test(value)) ||
-            (type === "real" && !/^-?[0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?$/iu.test(value)),
-        )
-      ) {
-        throw proofError(phase, `backup ${table} typed value is malformed`);
-      }
-      hash.update(JSON.stringify(values)).update("\n");
-    }
-    hash.update("\0");
-  }
-  return `sha256:${hash.digest("hex")}`;
+  return readMoneyNativeTypedCensusDigest(database, phase, tables);
 }
 
 export async function assertMoneyNativeForeignKeys(
@@ -2883,7 +3854,10 @@ export async function assertMoneyLiveBackupCompleteness(
   await assertMoneyNativeForeignKeys(database, phase);
 }
 
-function validateReview(binding: MoneyReviewBinding, proof: MoneyReviewProof): string {
+function validateReview(
+  binding: MoneyReviewBinding | MoneyPost94ImportReviewBinding | MoneyPreserved100ReviewBinding,
+  proof: MoneyReviewProof,
+): string {
   if (
     proof.kind !== "takoserver.money-independent-review@v1" ||
     typeof proof.reviewer !== "string" ||
@@ -2903,7 +3877,7 @@ function validateReview(binding: MoneyReviewBinding, proof: MoneyReviewProof): s
 
 function validateCustody(
   receipt: MoneyCutoverCustodyReceipt,
-  phase: MoneyCutoverPhase,
+  phase: MoneyCustodyPhase,
   bindingDigest: string,
   expectedState: "dispatched" | "terminal",
   expectedPostDigest?: string,
@@ -2946,8 +3920,9 @@ async function runImport(
   target: DeployTarget,
   run: NonNullable<MoneyUnitCutoverOptions["run"]>,
   environment: Readonly<Record<string, string>>,
+  retainedFiles: readonly string[] = [],
 ): Promise<void> {
-  const sealed = sealDirectory(dirname(file), ["wrangler.jsonc", "import.sql"]);
+  const sealed = sealDirectory(dirname(file), ["wrangler.jsonc", "import.sql", ...retainedFiles]);
   sealed.assertUnchanged();
   let result: CommandResult;
   try {
@@ -3942,5 +4917,1549 @@ export async function runIntegrationMoneyUnitCutover(
   } finally {
     if (lease !== null) await lease.release();
     if (options.outputDirectory === undefined) rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function moneyPost94ReadCompiler(files: readonly MigrationFile[]): Database {
+  assertMoneyPost94Source(files);
+  const database = new Database(":memory:");
+  try {
+    executeMoneyHostSql(
+      database,
+      buildD1MigrationImport(files.slice(0, 94), { freshLedger: true }).sql,
+    );
+    executeMoneyHostSql(
+      database,
+      `${FENCE_DDL};\n${MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL};\n${MONEY_CUTOVER_PERMIT_DDL};\n${MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL};\n${moneyFenceInstallSql("0094-fenced")}`,
+    );
+    executeMoneyHostSql(
+      database,
+      buildD1MigrationImport(files.slice(94, 98), { freshLedger: false }).sql,
+    );
+    for (const [name, definition] of moneyPost94GuardDefinitions()) {
+      const existing = database.query("SELECT sql FROM sqlite_schema WHERE name=?").get(name) as {
+        sql: string;
+      } | null;
+      if (existing === null) executeMoneyHostSql(database, `${definition};`);
+      else if (existing.sql !== definition)
+        throw preflightError("money post94 verification guard source differs");
+    }
+    return database;
+  } catch (error) {
+    database.close();
+    throw error;
+  }
+}
+
+/**
+ * Historical original-key GET/SELECT only. This never recreates held94/mode or
+ * Financial pre-import artifacts after dispatch and NEVER settles or resends it.
+ */
+export async function readIntegrationMoneyPost94CustodyStatus(
+  invocation: MoneyUnitCutoverInvocation,
+  target: DeployTarget,
+  options: MoneyUnitOriginalCutoverOptions,
+  post94DeclarationPath: string,
+): Promise<Record<string, unknown>> {
+  if (
+    invocation.action !== "status" ||
+    invocation.environment !== "integration" ||
+    invocation.throughMigration !== "0098"
+  )
+    throw preflightError("money post94 custody observation is integration status only");
+  const owner = await import("./schema-money-unit-owner.ts");
+  target = owner.assertMoneyUnitOriginalWriterOptions(options, target);
+  const receipt = await options.custody.read("suffix98"),
+    binding = await options.custody.readDispatch("suffix98");
+  if (
+    !receipt ||
+    !binding ||
+    binding.kind !== "takoserver.money-cutover-dispatch@v2" ||
+    typeof binding.signingGenesisPath !== "string" ||
+    !SHA256.test(binding.signingGenesisDigest ?? "") ||
+    typeof binding.financialContributionPath !== "string" ||
+    !SHA256.test(binding.financialContributionDigest ?? "") ||
+    !SHA256.test(binding.financialSourceBindingDigest ?? "")
+  )
+    throw preflightError("money post94 status requires the original complete dispatch pair");
+  assertExistingCustodyShape(receipt, "suffix98");
+  owner.assertMoneyUnitOriginalPost94DispatchData(options, post94DeclarationPath, binding);
+  if (
+    digest(
+      readProtectedBytes(binding.signingGenesisPath, "money retained original signing genesis"),
+    ) !== binding.signingGenesisDigest ||
+    dirname(binding.signingGenesisPath) !== dirname(binding.sealedImportPath) ||
+    digest(
+      readProtectedBytes(
+        join(dirname(binding.sealedImportPath), "independent-review.json"),
+        "money retained original review",
+      ),
+    ) !== binding.reviewDigest ||
+    receipt.bindingDigest !== moneyCutoverBindingDigest(binding) ||
+    binding.sourceDigest !== SOURCE_0098 ||
+    options.outputDirectory === undefined ||
+    dirname(binding.financialContributionPath) !== dirname(binding.sealedImportPath) ||
+    !relative(options.outputDirectory, binding.sealedImportPath).startsWith("money-suffix98-") ||
+    !binding.sealedImportPath.endsWith("/import.sql") ||
+    digest(readProtectedBytes(binding.sealedImportPath, "money retained suffix SQL")) !==
+      binding.importDigest ||
+    digest(
+      readProtectedBytes(
+        binding.financialContributionPath,
+        "money retained original Financial DATA",
+      ),
+    ) !== binding.financialContributionDigest
+  )
+    throw preflightError("money post94 status retained dispatch/source/Financial DATA differs");
+  const files = readMigrationArtifact(
+    options.sourceDirectory ?? resolve(REPOSITORY, "migrations"),
+  ).files;
+  assertMoneyPost94Source(files);
+  const run = options.run ?? runCommand,
+    credential = await resolveCloudflareCredential("integration", {
+      ...(options.cloudflareEnvironment === undefined
+        ? {}
+        : { cloudflareEnvironment: options.cloudflareEnvironment }),
+      run,
+    });
+  owner.assertMoneyUnitOriginalWriterOptions(options, target);
+  assertProtectedDirectory(options.outputDirectory, "money post94 status output");
+  const root = mkdtempSync(join(options.outputDirectory, "money-post94-status-"));
+  const compiler = moneyPost94ReadCompiler(files);
+  try {
+    const configPath = join(root, "wrangler.jsonc");
+    writeProtectedFile(configPath, Buffer.from(configJson(target)));
+    const database = new RemoteD1(configPath, { environment: credential.childEnvironment, run });
+    const origin = await options.stageOriginProof(),
+      identity = await options.storageIdentityRead();
+    assertStageTarget(target, origin, identity, true);
+    const backup = await backupAndRead(
+      options.backupPath,
+      configPath,
+      target,
+      files,
+      digest(JSON.stringify(origin)),
+      root,
+      run,
+      credential.childEnvironment,
+      false,
+    );
+    const history = await readHeldMoneyConversionHistory(
+      { target, options, files, database, readSchema: () => readD1SchemaState(database), backup },
+      binding.previousWriterEpoch,
+      false,
+    );
+    if (
+      binding.originDigest !== history.originDigest ||
+      binding.predecessorCustodyDigest !== digest(JSON.stringify(history.convert.receipt)) ||
+      binding.convertBindingDigest !== history.convert.receipt.bindingDigest ||
+      binding.backupDigest !== backup.digest ||
+      binding.original92BackupDigest !== backup.digest ||
+      binding.preimageDigest !== backup.preimageDigest ||
+      binding.aggregateDigest !== backup.aggregateDigest ||
+      binding.writerDigest !== history.writerDigest ||
+      binding.classificationDigest !== options.classificationManifestDigest
+    )
+      throw verificationError(
+        "money retained post94 dispatch differs from actual original history",
+      );
+    const schema = await readD1SchemaState(database);
+    const epochRows = await database.query(
+      "verification",
+      "retained post94 current authorized epoch",
+      `SELECT singleton, writer_epoch FROM ${MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE}`,
+    );
+    if (
+      epochRows.length !== 1 ||
+      epochRows[0]?.singleton !== 1 ||
+      ![binding.previousWriterEpoch, binding.nextWriterEpoch].includes(
+        String(epochRows[0]?.writer_epoch),
+      )
+    )
+      throw verificationError(
+        "money retained post94 current epoch is neither original nor selected next",
+      );
+    const epoch = String(epochRows[0]?.writer_epoch);
+    const schemaPhase = moneyUnitCutoverSchemaMatches(schema, files, "0094-fenced")
+      ? "0094-fenced"
+      : moneyUnitCutoverSchemaMatches(schema, files, "0098-fenced")
+        ? "0098-fenced"
+        : null;
+    if (
+      schemaPhase === null ||
+      (schemaPhase === "0094-fenced"
+        ? epoch !== binding.previousWriterEpoch
+        : epoch !== binding.nextWriterEpoch)
+    )
+      throw verificationError("money retained post94 schema and epoch are partial or divergent");
+    await assertPermitEmpty(database, "verification", epoch);
+    assertFreezeRow(
+      await readFreezeRow(database, "verification"),
+      history.anchor,
+      history.originDigest,
+      backup.digest,
+      history.writerDigest,
+      "verification",
+    );
+    if (schemaPhase === "0098-fenced") {
+      await assertStripeModeRealm(readonlyMoneySql(database, compiler, "verification"), "test");
+      const signing: unknown = JSON.parse(
+        readProtectedBytes(
+          binding.signingGenesisPath,
+          "money retained original signing genesis",
+        ).toString("utf8"),
+      );
+      if (
+        !record(signing) ||
+        signing.kind !== "takoserver.money-normal-signing-genesis-contribution@v1" ||
+        signing.normalModeBindingDigest !== binding.modePreparationDigest ||
+        signing.convertBindingDigest !== binding.convertBindingDigest ||
+        signing.original92BackupDigest !== binding.original92BackupDigest ||
+        signing.converted94BackupDigest !== binding.converted94BackupDigest
+      )
+        throw verificationError(
+          "money retained signing genesis differs from original phase binding",
+        );
+      await assertMoneySigningGenesisPostimage(
+        database,
+        signing as unknown as MoneyNormalWorkerSigningGenesisContribution,
+        "verification",
+      );
+    }
+    await assertMoneyNativeForeignKeys(database, "verification");
+    owner.assertMoneyUnitOriginalWriterOptions(options, target);
+    owner.assertMoneyUnitOriginalPost94DispatchData(options, post94DeclarationPath, binding);
+    await history.assertReview();
+    await history.assertCurrent();
+    if (
+      digest(
+        readProtectedBytes(binding.signingGenesisPath, "money retained original signing genesis"),
+      ) !== binding.signingGenesisDigest
+    )
+      throw verificationError("money retained signing genesis changed during GET");
+    if (
+      JSON.stringify(await options.custody.read("suffix98")) !== JSON.stringify(receipt) ||
+      JSON.stringify(await options.custody.readDispatch("suffix98")) !== JSON.stringify(binding)
+    )
+      throw verificationError("money retained post94 custody changed during GET observation");
+    return {
+      kind: "takoserver.money-post94-custody-observation@v1",
+      phase: "suffix98",
+      custody: receipt.state,
+      schemaPhase,
+      schemaShapeDigest: schema.shapeDigest,
+      currentWriterEpoch: epoch,
+      freezeBindingDigest: history.anchor,
+      originDigest: history.originDigest,
+      readOnly: true,
+      canResend: false,
+      terminalRecovery: "not-attempted",
+      preImportAssertionsReused: false,
+      normalHostReady: false,
+    };
+  } finally {
+    compiler.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+interface MoneyOriginalPreservedSourceFacts {
+  readonly qualification: "native-read-only";
+  readonly accountId: string;
+  readonly databaseId: string;
+  readonly databaseName: string;
+  readonly workerName: string;
+  readonly originDigest: string;
+  readonly original92BackupDigest: string;
+  readonly suffixBindingDigest: string;
+  readonly freezeBindingDigest: string;
+  readonly freezeWriterDigest: string;
+  readonly freezeSourceDigest: typeof SOURCE_0092;
+  readonly currentWriterEpoch: string;
+  readonly schemaShapeDigest: string;
+  readonly normalVersionId: string;
+  readonly normalHostReady: false;
+}
+
+export interface MoneyOriginalPreserved100Source extends MoneyOriginalPreservedSourceFacts {
+  readonly kind: "takoserver.money-original-preserved100-source@v1";
+}
+
+interface MoneyOriginalPreserved103Observed extends MoneyOriginalPreservedSourceFacts {
+  readonly kind: "takoserver.money-original-preserved103-precursor@v1";
+}
+
+export interface MoneyOriginalPreserved103Precursor extends MoneyOriginalPreserved103Observed {
+  readonly authTarget: DeployTarget;
+}
+
+/**
+ * Source-owned original98→100 bridge for Auth103's distinct native importer.
+ * Reads the actual original Money custody, retained SQL/Financial/signing bytes,
+ * the complete original100 D1 shape and its still-frozen new epoch. It neither
+ * reopens held94 nor grants traffic or an Auth103 import on its own.
+ */
+async function readIntegrationMoneyOriginalPreservedSource(
+  target: DeployTarget,
+  options: MoneyUnitOriginalCutoverOptions,
+  post94DeclarationPath: string,
+  through: 100 | 103,
+  custodyState: "terminal" | "dispatched" = "terminal",
+): Promise<MoneyOriginalPreserved100Source | MoneyOriginalPreserved103Observed> {
+  const owner = await import("./schema-money-unit-owner.ts");
+  target = owner.assertMoneyUnitOriginalWriterOptions(options, target);
+  if (options.phase !== "convert" || options.outputDirectory === undefined)
+    throw preflightError("money original100 source requires its original convert owner");
+  const receipt = await options.custody.read("suffix98"),
+    binding = await options.custody.readDispatch("suffix98");
+  if (
+    receipt?.state !== "terminal" ||
+    binding?.kind !== "takoserver.money-cutover-dispatch@v2" ||
+    binding.phase !== "suffix98" ||
+    binding.afterSchemaPhase !== "0098-fenced" ||
+    !SHA256.test(binding.financialContributionDigest ?? "") ||
+    !SHA256.test(binding.signingGenesisDigest ?? "") ||
+    typeof binding.financialContributionPath !== "string" ||
+    typeof binding.signingGenesisPath !== "string" ||
+    receipt.bindingDigest !== moneyCutoverBindingDigest(binding) ||
+    (await options.custody.read("resume98")) !== null ||
+    (await options.custody.readDispatch("resume98")) !== null
+  )
+    throw preflightError("money original100 source requires terminal suffix and no thaw dispatch");
+  const preservedReceipt = await options.custody.read("preserved100"),
+    preservedBinding = await options.custody.readDispatch("preserved100");
+  if (
+    preservedReceipt?.state !== custodyState ||
+    preservedBinding?.kind !== "takoserver.money-cutover-dispatch@v3" ||
+    preservedBinding.phase !== "preserved100" ||
+    preservedBinding.afterSchemaPhase !== "0100-fenced" ||
+    preservedReceipt.bindingDigest !== moneyCutoverBindingDigest(preservedBinding) ||
+    preservedBinding.suffixBindingDigest !== receipt.bindingDigest ||
+    preservedBinding.suffixPostDigest !== receipt.postDigest ||
+    preservedBinding.predecessorCustodyDigest !== digest(JSON.stringify(receipt)) ||
+    preservedBinding.nextWriterEpoch !== binding.nextWriterEpoch
+  )
+    throw preflightError("money original100 requires its distinct exact native99–100 custody");
+  owner.assertMoneyUnitOriginalPost94DispatchData(options, post94DeclarationPath, binding);
+  if (
+    dirname(binding.sealedImportPath) !== dirname(binding.financialContributionPath) ||
+    dirname(binding.sealedImportPath) !== dirname(binding.signingGenesisPath) ||
+    !relative(options.outputDirectory, binding.sealedImportPath).startsWith("money-suffix98-") ||
+    digest(readProtectedBytes(binding.sealedImportPath, "money original suffix SQL")) !==
+      binding.importDigest ||
+    digest(
+      readProtectedBytes(binding.financialContributionPath, "money original Financial DATA"),
+    ) !== binding.financialContributionDigest ||
+    digest(readProtectedBytes(binding.signingGenesisPath, "money original signing DATA")) !==
+      binding.signingGenesisDigest
+  )
+    throw preflightError("money original100 retained suffix artifacts changed");
+  const sourceDirectory = options.sourceDirectory ?? resolve(REPOSITORY, "migrations");
+  const run = options.run ?? runCommand;
+  const credential = await resolveCloudflareCredential("integration", {
+    ...(options.cloudflareEnvironment === undefined
+      ? {}
+      : { cloudflareEnvironment: options.cloudflareEnvironment }),
+    run,
+  });
+  assertProtectedDirectory(options.outputDirectory, "money original100 read output");
+  const root = mkdtempSync(join(options.outputDirectory, `money-original${through}-read-`));
+  let selectedSource: ReturnType<typeof readMoneyOriginalPreservedSourceInventory> | undefined;
+  let compiler: ReturnType<typeof moneyPost94ReadCompiler> | undefined;
+  try {
+    selectedSource = readMoneyOriginalPreservedSourceInventory(sourceDirectory, through, root);
+    const files = selectedSource.files;
+    if (
+      preservedBinding.sourceDigest !== selectedSource.sourceDigest ||
+      preservedBinding.expectedAfterShapeDigest !==
+        digest(moneyPost100ExpectedPreservedShape(files.slice(0, 100))) ||
+      !relative(options.outputDirectory, preservedBinding.sealedImportPath).startsWith(
+        "money-preserved100-",
+      ) ||
+      preservedBinding.importDigest !==
+        digest(
+          readProtectedBytes(preservedBinding.sealedImportPath, "money preserved100 sealed SQL"),
+        )
+    )
+      throw preflightError("money original100 native source or sealed import changed");
+    const expectedShape =
+      through === 100
+        ? moneyPost100ExpectedPreservedShape(files)
+        : moneyPost103ExpectedPreservedShape(files);
+    compiler = moneyPost94ReadCompiler(files);
+    const configPath = join(root, "wrangler.jsonc");
+    writeProtectedFile(configPath, Buffer.from(configJson(target)));
+    const database = new RemoteD1(configPath, { environment: credential.childEnvironment, run });
+    const origin = await options.stageOriginProof(),
+      identity = await options.storageIdentityRead();
+    assertStageTarget(target, origin, identity, true);
+    const backup = await backupAndRead(
+      options.backupPath,
+      configPath,
+      target,
+      files,
+      digest(JSON.stringify(origin)),
+      root,
+      run,
+      credential.childEnvironment,
+      false,
+    );
+    const history = await readHeldMoneyConversionHistory(
+      { target, options, files, database, readSchema: () => readD1SchemaState(database), backup },
+      binding.previousWriterEpoch,
+      false,
+    );
+    if (
+      binding.originDigest !== history.originDigest ||
+      binding.predecessorCustodyDigest !== digest(JSON.stringify(history.convert.receipt)) ||
+      binding.convertBindingDigest !== history.convert.receipt.bindingDigest ||
+      binding.backupDigest !== backup.digest ||
+      binding.original92BackupDigest !== backup.digest ||
+      binding.preimageDigest !== backup.preimageDigest ||
+      binding.aggregateDigest !== backup.aggregateDigest ||
+      binding.writerDigest !== history.writerDigest ||
+      binding.classificationDigest !== options.classificationManifestDigest ||
+      binding.sourceDigest !== SOURCE_0098 ||
+      binding.selectedStripeMode !== "test"
+    )
+      throw preflightError("money original100 suffix differs from original Money history");
+    if (
+      preservedBinding.accountId !== target.accountId ||
+      preservedBinding.databaseId !== target.d1.databaseId ||
+      preservedBinding.databaseName !== target.d1.databaseName ||
+      preservedBinding.originDigest !== history.originDigest ||
+      preservedBinding.backupDigest !== backup.digest ||
+      preservedBinding.writerDigest !== history.writerDigest ||
+      preservedBinding.preimageDigest !== backup.preimageDigest ||
+      preservedBinding.aggregateDigest !== backup.aggregateDigest ||
+      preservedBinding.classificationDigest !== binding.classificationDigest ||
+      preservedBinding.writerEpoch !== binding.nextWriterEpoch ||
+      preservedBinding.suffixReviewDigest !== binding.reviewDigest
+    )
+      throw preflightError("money original100 terminal differs from original suffix history");
+    const schema = await readD1SchemaState(database);
+    if (
+      schema.applied.length !== through ||
+      schema.applied.some((name, index) => name !== files[index]?.name) ||
+      !applicationSchemaMatches(schema, expectedShape)
+    )
+      throw preflightError("money original source requires exact preserved schema and ledger");
+    await assertPermitEmpty(database, "preflight", binding.nextWriterEpoch);
+    assertFreezeRow(
+      await readFreezeRow(database, "preflight"),
+      history.anchor,
+      history.originDigest,
+      backup.digest,
+      history.writerDigest,
+      "preflight",
+    );
+    if (
+      (await readMoneyPreimageDigest(database, "preflight", true)) !== backup.preimageDigest ||
+      (await readMoneyAggregateDigest(database, "preflight", true)) !== backup.aggregateDigest
+    )
+      throw preflightError("money original100 financial preimages changed while frozen");
+    await assertClassificationsStored(database, history.classifications, "preflight");
+    await assertMoneyNativeForeignKeys(database, "preflight");
+    await assertStripeModeRealm(readonlyMoneySql(database, compiler, "preflight"), "test");
+    const signing: unknown = JSON.parse(
+      readProtectedBytes(binding.signingGenesisPath, "money original signing DATA").toString(
+        "utf8",
+      ),
+    );
+    if (
+      !record(signing) ||
+      signing.kind !== "takoserver.money-normal-signing-genesis-contribution@v1" ||
+      signing.normalModeBindingDigest !== binding.modePreparationDigest ||
+      signing.convertBindingDigest !== binding.convertBindingDigest ||
+      signing.original92BackupDigest !== binding.original92BackupDigest ||
+      signing.converted94BackupDigest !== binding.converted94BackupDigest ||
+      typeof signing.versionId !== "string" ||
+      !UUID.test(signing.versionId)
+    )
+      throw preflightError("money original100 signing genesis differs from original suffix");
+    await assertMoneySigningGenesisPostimage(
+      database,
+      signing as unknown as MoneyNormalWorkerSigningGenesisContribution,
+      "preflight",
+    );
+    const expectedImport = buildMoneyOriginalPreserved100ImportData({
+      sourceDirectory,
+      scratchBase: root,
+      freezeBindingDigest: history.anchor,
+      originDigest: history.originDigest,
+      original92BackupDigest: backup.digest,
+      writerDigest: history.writerDigest,
+      nextWriterEpoch: binding.nextWriterEpoch,
+      signingKeyId: String(signing.keyId),
+      signingPublicJwk: String(signing.publicJwk),
+      signingCreatedAtEpochSeconds: Number(signing.createdAtEpochSeconds),
+    });
+    if (
+      preservedBinding.sourceDigest !== expectedImport.sourceDigest ||
+      preservedBinding.importDigest !== expectedImport.importDigest ||
+      readProtectedBytes(
+        preservedBinding.sealedImportPath,
+        "money preserved100 sealed SQL",
+      ).toString("utf8") !== expectedImport.sql
+    )
+      throw preflightError("money preserved100 retained import differs from owned99–100 source");
+    const reviewBinding = moneyPreserved100ReviewBinding({
+      commit: preservedBinding.sourceCommit,
+      target,
+      suffix: binding,
+      suffixReceipt: receipt,
+      freezeBindingDigest: history.anchor,
+      beforeShapeDigest: preservedBinding.beforeShapeDigest,
+      prepared: expectedImport,
+    });
+    const review = owner.readMoneyUnitOriginalPreserved100IndependentReview(options, reviewBinding);
+    if (
+      review === null ||
+      validateReview(reviewBinding, review) !== preservedBinding.reviewDigest ||
+      digest(
+        readProtectedBytes(
+          join(dirname(preservedBinding.sealedImportPath), "independent-review.json"),
+          "money preserved100 sealed review",
+        ),
+      ) !== preservedBinding.reviewDigest
+    )
+      throw preflightError("money preserved100 exact independent review changed");
+    if (
+      custodyState === "terminal" &&
+      through === 100 &&
+      preservedReceipt.postDigest !==
+        digest(
+          JSON.stringify({
+            applied: expectedImport.names,
+            shapeDigest: schema.shapeDigest,
+            writerEpoch: binding.nextWriterEpoch,
+            suffixBindingDigest: receipt.bindingDigest,
+            sourceDigest: expectedImport.sourceDigest,
+            importDigest: expectedImport.importDigest,
+          }),
+        )
+    )
+      throw preflightError("money preserved100 terminal receipt differs from exact native100");
+    await history.assertReview();
+    await history.assertCurrent();
+    owner.assertMoneyUnitOriginalWriterOptions(options, target);
+    owner.assertMoneyUnitOriginalPost94DispatchData(options, post94DeclarationPath, binding);
+    selectedSource.assertCurrent();
+    if (
+      JSON.stringify(await readD1SchemaState(database)) !== JSON.stringify(schema) ||
+      JSON.stringify(await options.custody.read("suffix98")) !== JSON.stringify(receipt) ||
+      JSON.stringify(await options.custody.readDispatch("suffix98")) !== JSON.stringify(binding) ||
+      JSON.stringify(await options.custody.read("preserved100")) !==
+        JSON.stringify(preservedReceipt) ||
+      JSON.stringify(await options.custody.readDispatch("preserved100")) !==
+        JSON.stringify(preservedBinding) ||
+      (await options.custody.read("resume98")) !== null ||
+      (await options.custody.readDispatch("resume98")) !== null
+    )
+      throw preflightError("money original100 schema or custody changed during observation");
+    selectedSource.assertCurrent();
+    const facts: MoneyOriginalPreservedSourceFacts = Object.freeze({
+      qualification: "native-read-only",
+      accountId: target.accountId,
+      databaseId: target.d1.databaseId,
+      databaseName: target.d1.databaseName,
+      workerName: target.workerName,
+      originDigest: history.originDigest,
+      original92BackupDigest: backup.digest,
+      suffixBindingDigest: receipt.bindingDigest,
+      freezeBindingDigest: history.anchor,
+      freezeWriterDigest: history.writerDigest,
+      freezeSourceDigest: SOURCE_0092,
+      currentWriterEpoch: binding.nextWriterEpoch,
+      schemaShapeDigest: schema.shapeDigest,
+      normalVersionId: signing.versionId,
+      normalHostReady: false,
+    });
+    return through === 100
+      ? Object.freeze({ ...facts, kind: "takoserver.money-original-preserved100-source@v1" })
+      : Object.freeze({ ...facts, kind: "takoserver.money-original-preserved103-precursor@v1" });
+  } finally {
+    try {
+      compiler?.close();
+    } finally {
+      try {
+        selectedSource?.dispose();
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  }
+}
+
+export async function readIntegrationMoneyOriginalPreserved100Source(
+  target: DeployTarget,
+  options: MoneyUnitOriginalCutoverOptions,
+  post94DeclarationPath: string,
+): Promise<MoneyOriginalPreserved100Source> {
+  const result = await readIntegrationMoneyOriginalPreservedSource(
+    target,
+    options,
+    post94DeclarationPath,
+    100,
+  );
+  if (result.kind !== "takoserver.money-original-preserved100-source@v1")
+    throw preflightError("money original100 reader returned a divergent phase");
+  return result;
+}
+
+/**
+ * Noncircular Money-owned proof for Auth103's original union importer. This
+ * proves the retained Money source and physical/profile transition without
+ * consulting Auth103 history or accepting a caller's readiness assertion.
+ */
+export async function readIntegrationMoneyOriginalPreserved103Precursor(
+  moneyTarget: DeployTarget,
+  options: MoneyUnitOriginalCutoverOptions,
+  post94DeclarationPath: string,
+  auth103OriginalTarget: DeployTarget,
+): Promise<MoneyOriginalPreserved103Precursor> {
+  const owner = await import("./schema-money-unit-owner.ts");
+  const money = await readIntegrationMoneyOriginalPreservedSource(
+    moneyTarget,
+    options,
+    post94DeclarationPath,
+    103,
+  );
+  if (money.kind !== "takoserver.money-original-preserved103-precursor@v1")
+    throw preflightError("money original103 precursor returned a divergent phase");
+  const authTarget = owner.assertMoneyUnitOriginalPost103TargetProfile(
+    options,
+    moneyTarget,
+    auth103OriginalTarget,
+    money.currentWriterEpoch,
+  );
+  return Object.freeze({ ...money, authTarget });
+}
+
+export interface MoneyOriginalPreserved103Source extends MoneyOriginalPreservedSourceFacts {
+  readonly kind: "takoserver.money-original-preserved103-source@v1";
+  readonly authTarget: DeployTarget;
+  readonly auth103SourceRef: string;
+  readonly auth103DeploymentId: string;
+  readonly auth103VersionId: string;
+}
+
+/** Read-only original 103+Money union; Auth103 owns its native history proof. */
+export async function readIntegrationMoneyOriginalPreserved103Source(
+  moneyTarget: DeployTarget,
+  options: MoneyUnitOriginalCutoverOptions,
+  post94DeclarationPath: string,
+  auth103OriginalTarget: DeployTarget,
+  auth103Commit: string,
+): Promise<MoneyOriginalPreserved103Source> {
+  if (!COMMIT.test(auth103Commit))
+    throw preflightError("money original103 requires the exact original Auth103 commit");
+  const money = await readIntegrationMoneyOriginalPreserved103Precursor(
+    moneyTarget,
+    options,
+    post94DeclarationPath,
+    auth103OriginalTarget,
+  );
+  const authOwner = await import("./schema-auth103-native-source.ts");
+  const auth = await authOwner.readD1SchemaAuth103OriginalHistory(
+    { commit: auth103Commit },
+    money.authTarget,
+    moneyTarget.d1,
+  );
+  if (
+    auth.environment !== "integration" ||
+    auth.accountId !== moneyTarget.accountId ||
+    auth.databaseId !== moneyTarget.d1.databaseId ||
+    auth.databaseName !== moneyTarget.d1.databaseName ||
+    auth.workerName !== moneyTarget.workerName ||
+    auth.commit !== auth103Commit ||
+    !UUID.test(auth.originalVersionId) ||
+    !UUID.test(auth.originalDeploymentId)
+  )
+    throw preflightError("money original103 Auth history differs from the same physical Host");
+  const authAfter = await authOwner.readD1SchemaAuth103OriginalHistory(
+    { commit: auth103Commit },
+    money.authTarget,
+    moneyTarget.d1,
+  );
+  if (JSON.stringify(authAfter) !== JSON.stringify(auth))
+    throw preflightError("money original103 Auth history changed during observation");
+  return Object.freeze({
+    ...money,
+    kind: "takoserver.money-original-preserved103-source@v1",
+    auth103SourceRef: auth.sourceRef,
+    auth103DeploymentId: auth.originalDeploymentId,
+    auth103VersionId: auth.originalVersionId,
+  });
+}
+
+/** Sole sealed fixed95–98 import, reached ONLY through both real original producers. */
+export async function runIntegrationMoneyHeldSuffix98(
+  invocation: MoneyUnitCutoverInvocation,
+  target: DeployTarget,
+  options: MoneyUnitOriginalCutoverOptions,
+  inputs: MoneyUnitHeldPost94ConsumerInputs,
+  normalUploadReceipt: unknown,
+): Promise<Record<string, unknown>> {
+  if (
+    invocation.environment !== "integration" ||
+    invocation.throughMigration !== "0098" ||
+    !COMMIT.test(invocation.commit) ||
+    !["status", "apply"].includes(invocation.action)
+  )
+    throw preflightError("money suffix requires an exact integration0098 invocation");
+  const owner = await import("./schema-money-unit-owner.ts");
+  target = owner.assertMoneyUnitOriginalWriterOptions(options, target);
+  if (
+    options.phase !== "convert" ||
+    options.outputDirectory === undefined ||
+    (options.sourceDirectory !== undefined &&
+      resolve(options.sourceDirectory) !== resolve(REPOSITORY, "migrations"))
+  )
+    throw preflightError(
+      "money suffix requires the same original native convert owner and reviewed source",
+    );
+  if (
+    (await options.custody.read("suffix98")) !== null ||
+    (await options.custody.readDispatch("suffix98")) !== null
+  )
+    throw mutationError(
+      "money suffix already has original custody; no resend, new key or pre-import recovery",
+    );
+  await owner.assertMoneyUnitHeldPost94ConsumerInputsOrigin(options, inputs);
+  if (inputs.selection.phase !== "suffix98")
+    throw preflightError("money suffix cannot use a resume selection");
+  const financialOwner = await import("./stripe-mode-realm.ts");
+  const financial: MoneyRealmPinContribution =
+    await financialOwner.readMoneyD1StripeRealmPinContribution(
+      inputs.context,
+      inputs.normalWorkerModePreparation,
+    );
+  await owner.assertMoneyUnitHeldPost94ConsumerInputsOrigin(options, inputs);
+  await financialOwner.assertMoneyD1StripeRealmPinContributionCurrent(
+    financial,
+    inputs.context,
+    inputs.normalWorkerModePreparation,
+  );
+  const signingOwner = await import("./money-normal-worker-version-upload.ts");
+  const signing = await signingOwner.readMoneyNormalWorkerSigningGenesisContribution(
+    inputs.context,
+    inputs.normalWorkerModePreparation,
+    normalUploadReceipt,
+  );
+  await owner.assertMoneyUnitHeldPost94ConsumerInputsOrigin(options, inputs);
+  await signingOwner.assertMoneyNormalWorkerSigningGenesisContributionCurrent(
+    signing,
+    inputs.context,
+    inputs.normalWorkerModePreparation,
+  );
+  const signingBytes = Buffer.from(`${JSON.stringify(signing)}\n`),
+    signingGenesisDigest = digest(signingBytes);
+  const facts = inputs.context.facts,
+    selection = inputs.selection,
+    mode = inputs.normalWorkerModePreparation;
+  if (
+    financial.modePreparationDigest !== mode.bindingDigest ||
+    financial.writerEpochBeforeRotation !== facts.previousWriterEpoch ||
+    financial.placement !== "same-sealed-one-after-0098-schema-before-epoch-rotation"
+  )
+    throw preflightError(
+      "money suffix Financial original does not bind the same held mode/old epoch/placement",
+    );
+  const factsJson = JSON.stringify(facts),
+    financialBytes = Buffer.from(`${JSON.stringify(financial)}\n`),
+    financialContributionDigest = digest(financialBytes);
+  const files = readMigrationArtifact(
+    options.sourceDirectory ?? resolve(REPOSITORY, "migrations"),
+  ).files;
+  assertMoneyPost94Source(files);
+  const convertedBytes = readProtectedBytes(
+    owner.readMoneyUnitHeldPost94ConvertedBackupPath(options, inputs),
+    "money original converted94 snapshot",
+  );
+  if (digest(convertedBytes) !== facts.converted94.backupDigest)
+    throw preflightError("money suffix retained94 bytes differ from original held context");
+  const one = await buildMoneyPost94OneImportData({
+    root: {
+      files,
+      freezeBindingDigest: facts.conversion.freezeBindingDigest,
+      originDigest: facts.conversion.originDigest,
+      original92BackupDigest: facts.original92.backupDigest,
+      writerDigest: facts.conversion.writerDigest,
+      previousWriterEpoch: facts.previousWriterEpoch,
+      nextWriterEpoch: facts.nextWriterEpoch,
+    },
+    financialStatements: financial.statements,
+    signingGenesis: {
+      keyId: signing.keyId,
+      publicJwk: signing.publicJwk,
+      createdAtEpochSeconds: signing.createdAtEpochSeconds,
+      previousWriterEpoch: facts.previousWriterEpoch,
+    },
+    convertedSnapshot: convertedBytes.toString("utf8"),
+  });
+  await owner.assertMoneyUnitHeldPost94ConsumerInputsOrigin(options, inputs);
+  await financialOwner.assertMoneyD1StripeRealmPinContributionCurrent(
+    financial,
+    inputs.context,
+    mode,
+  );
+  const convert = await options.custody.read("convert");
+  if (
+    convert?.state !== "terminal" ||
+    convert.bindingDigest !== facts.conversion.convertBindingDigest
+  )
+    throw preflightError("money suffix requires the unchanged original terminal convert");
+  const reviewBinding: MoneyPost94ImportReviewBinding = {
+    kind: "takoserver.money-post94-import-review@v1",
+    phase: "suffix98",
+    accountId: target.accountId,
+    databaseId: target.d1.databaseId,
+    databaseName: target.d1.databaseName,
+    originDigest: facts.conversion.originDigest,
+    predecessorCustodyDigest: digest(JSON.stringify(convert)),
+    sourceCommit: invocation.commit,
+    sourceDigest: SOURCE_0098,
+    importDigest: one.digest,
+    backupDigest: facts.original92.backupDigest,
+    preimageDigest: facts.conversion.preimageDigest,
+    aggregateDigest: facts.conversion.aggregateDigest,
+    classificationDigest: facts.conversion.classificationDigest,
+    writerDigest: facts.conversion.writerDigest,
+    resumeDigest: digest("normal immutable Version is held, not serving"),
+    writerEpoch: facts.previousWriterEpoch,
+    previousWriterEpoch: facts.previousWriterEpoch,
+    nextWriterEpoch: facts.nextWriterEpoch,
+    original92BackupDigest: facts.original92.backupDigest,
+    converted94BackupDigest: facts.converted94.backupDigest,
+    convertBindingDigest: facts.conversion.convertBindingDigest,
+    modePreparationDigest: mode.bindingDigest,
+    selectedStripeMode: "test",
+    selectionReviewDigest: selection.selectionReviewDigest,
+    financialContributionDigest,
+    financialSourceBindingDigest: financial.sourceBindingDigest,
+    signingGenesisDigest,
+  };
+  const readReview = () =>
+    owner.readMoneyUnitHeldPost94IndependentReview(options, inputs, reviewBinding);
+  const review = readReview(),
+    reviewDigest = review === null ? null : validateReview(reviewBinding, review);
+  const status = {
+    kind: "takoserver.money-held-suffix98-status@v1",
+    phase: "suffix98",
+    sourceCommit: invocation.commit,
+    sourceDigest: SOURCE_0098,
+    importDigest: one.digest,
+    financialContributionDigest,
+    financialSourceBindingDigest: financial.sourceBindingDigest,
+    modePreparationDigest: mode.bindingDigest,
+    reviewBinding,
+    reviewBindingDigest: moneyCutoverBindingDigest(reviewBinding),
+    reviewed: reviewDigest !== null,
+    normalHostReady: false,
+  };
+  if (invocation.action === "status") return status;
+  if (reviewDigest === null)
+    throw preflightError("money suffix requires exact protected independent import review");
+  const run = options.run ?? runCommand;
+  await qualifySource({
+    environment: "integration",
+    commit: invocation.commit,
+    policy: "clean-remote",
+    run,
+  });
+  const gate = await run(["bun", "run", "check:migrations"]);
+  if (gate.exitCode !== 0)
+    throw preflightError(`money suffix migration gate failed (exit ${gate.exitCode})`);
+  const credential = await resolveCloudflareCredential("integration", {
+    ...(options.cloudflareEnvironment === undefined
+      ? {}
+      : { cloudflareEnvironment: options.cloudflareEnvironment }),
+    run,
+  });
+  assertProtectedDirectory(options.outputDirectory, "money suffix protected output");
+  const root = mkdtempSync(join(options.outputDirectory, "money-suffix98-"));
+  let lease: Awaited<ReturnType<typeof acquireWranglerVersionPublicationLease>> | null = null;
+  let dispatched = false;
+  const compiler = moneyPost94ReadCompiler(files);
+  try {
+    const configPath = join(root, "wrangler.jsonc"),
+      importPath = join(root, "import.sql"),
+      financialPath = join(root, "financial-contribution.json"),
+      signingPath = join(root, "signing-genesis.json"),
+      reviewPath = join(root, "independent-review.json");
+    writeProtectedFile(configPath, Buffer.from(configJson(target)));
+    const database = new RemoteD1(configPath, { environment: credential.childEnvironment, run });
+    const initial = await readD1SchemaState(database);
+    if (!moneyUnitCutoverSchemaMatches(initial, files, "0094-fenced"))
+      throw preflightError("money suffix requires exact current fenced94");
+    lease = await acquireWranglerVersionPublicationLease({
+      accountId: target.accountId,
+      workerName: `d1-${target.d1.databaseId}`,
+      ...(options.leaseRoot === undefined ? {} : { root: options.leaseRoot }),
+    });
+    await qualifySource({
+      environment: "integration",
+      commit: invocation.commit,
+      policy: "clean-remote",
+      run,
+    });
+    await owner.assertMoneyUnitHeldPost94ConsumerInputsOrigin(options, inputs);
+    await financialOwner.assertMoneyD1StripeRealmPinContributionCurrent(
+      financial,
+      inputs.context,
+      mode,
+    );
+    await owner.assertMoneyUnitHeldPost94DispatchSelection(selection, {
+      ...reviewBinding,
+      kind: "takoserver.money-cutover-dispatch@v2",
+    });
+    await signingOwner.assertMoneyNormalWorkerSigningGenesisContributionCurrent(
+      signing,
+      inputs.context,
+      mode,
+    );
+    const reviewedNow = readReview();
+    if (
+      reviewedNow === null ||
+      validateReview(reviewBinding, reviewedNow) !== reviewDigest ||
+      JSON.stringify(facts) !== factsJson ||
+      digest(
+        readProtectedBytes(
+          owner.readMoneyUnitHeldPost94ConvertedBackupPath(options, inputs),
+          "money original converted94",
+        ),
+      ) !== facts.converted94.backupDigest ||
+      digest(Buffer.from(`${JSON.stringify(financial)}\n`)) !== financialContributionDigest
+    )
+      throw preflightError("money suffix original source/Financial/review changed before dispatch");
+    assertMoneyPost94Source(
+      readMigrationArtifact(options.sourceDirectory ?? resolve(REPOSITORY, "migrations")).files,
+    );
+    if (
+      (await options.custody.read("suffix98")) !== null ||
+      (await options.custody.readDispatch("suffix98")) !== null
+    )
+      throw mutationError("money suffix custody appeared; no resend");
+    await owner.assertMoneyUnitHeldPost94ConsumerInputsOrigin(options, inputs);
+    await financialOwner.assertMoneyD1StripeRealmPinContributionCurrent(
+      financial,
+      inputs.context,
+      mode,
+    );
+    await signingOwner.assertMoneyNormalWorkerSigningGenesisContributionCurrent(
+      signing,
+      inputs.context,
+      mode,
+    );
+    owner.assertMoneyUnitOriginalWriterOptions(options, target);
+    writeProtectedFile(importPath, Buffer.from(one.sql));
+    writeProtectedFile(financialPath, financialBytes);
+    writeProtectedFile(signingPath, signingBytes);
+    const dispatchReview = readReview();
+    if (dispatchReview === null || validateReview(reviewBinding, dispatchReview) !== reviewDigest)
+      throw preflightError("money suffix review changed before sealed dispatch");
+    const reviewBytes = Buffer.from(JSON.stringify(dispatchReview));
+    if (digest(reviewBytes) !== reviewDigest)
+      throw preflightError("money suffix sealed review value differs");
+    writeProtectedFile(reviewPath, reviewBytes);
+    const sealed = sealDirectory(root, [
+      "wrangler.jsonc",
+      "import.sql",
+      "financial-contribution.json",
+      "signing-genesis.json",
+      "independent-review.json",
+    ]);
+    const { kind: _reviewKind, ...common } = reviewBinding;
+    const binding: MoneyPost94OneDispatchBinding = {
+      ...common,
+      kind: "takoserver.money-cutover-dispatch@v2",
+      phase: "suffix98",
+      reviewDigest,
+      beforeShapeDigest: initial.shapeDigest,
+      afterSchemaPhase: "0098-fenced",
+      sealedImportPath: importPath,
+      financialContributionPath: financialPath,
+      signingGenesisPath: signingPath,
+    };
+    validateCustody(
+      await options.custody.dispatch(binding),
+      "suffix98",
+      moneyCutoverBindingDigest(binding),
+      "dispatched",
+    );
+    dispatched = true;
+    sealed.assertUnchanged();
+    owner.assertMoneyUnitOriginalWriterOptions(options, target);
+    // This is the review authorization linearization point for the native
+    // invocation. A later withdrawal cannot cancel an irreversible in-flight
+    // request, and never permits a resend or a fabricated successful terminal.
+    const importReview = readReview();
+    if (importReview === null || validateReview(reviewBinding, importReview) !== reviewDigest)
+      throw verificationError("money suffix review changed before native import");
+    await runImport(importPath, configPath, target, run, credential.childEnvironment, [
+      "financial-contribution.json",
+      "signing-genesis.json",
+      "independent-review.json",
+    ]);
+    // From this point held94/pre-import Financial assertions are INVALID. Use
+    // original native GET/SELECT and immutable source/phase readback only.
+    const schema = await readD1SchemaState(database, "verification");
+    if (!moneyUnitCutoverSchemaMatches(schema, files, "0098-fenced"))
+      throw verificationError("money suffix acknowledged but exact98/restored guards failed");
+    assertFreezeRow(
+      await readFreezeRow(database, "verification"),
+      facts.conversion.freezeBindingDigest,
+      facts.conversion.originDigest,
+      facts.original92.backupDigest,
+      facts.conversion.writerDigest,
+      "verification",
+    );
+    await assertPermitEmpty(database, "verification", facts.nextWriterEpoch);
+    await assertStripeModeRealm(readonlyMoneySql(database, compiler, "verification"), "test");
+    await assertMoneySigningGenesisPostimage(database, signing, "verification");
+    await assertMoneyLiveBackupCompleteness(database, "verification", {
+      rowCounts: one.expectedRowCounts,
+      allDataDigest: one.expectedAllDataDigest,
+    });
+    const origin = await options.stageOriginProof(),
+      identity = await options.storageIdentityRead(),
+      maintenance = await options.maintenanceProof();
+    assertStageTarget(target, origin, identity, true);
+    assertMaintenanceProof(target, maintenance, options.maintenanceCommit);
+    if (
+      digest(JSON.stringify(origin)) !== facts.conversion.originDigest ||
+      digest(JSON.stringify(maintenance)) !== facts.conversion.writerDigest ||
+      JSON.stringify(identity) !== JSON.stringify(facts.storage)
+    )
+      throw verificationError("money suffix original physical/maintenance origin changed");
+    owner.assertMoneyUnitOriginalWriterOptions(options, target);
+    sealed.assertUnchanged();
+    const reviewedAfter = readReview();
+    if (reviewedAfter === null || validateReview(reviewBinding, reviewedAfter) !== reviewDigest)
+      throw verificationError("money suffix review custody changed after acknowledgement");
+    const postDigest = digest(
+      JSON.stringify({
+        applied: schema.applied,
+        shapeDigest: schema.shapeDigest,
+        allDataDigest: one.expectedAllDataDigest,
+        writerEpoch: facts.nextWriterEpoch,
+        financialContributionDigest,
+      }),
+    );
+    await lease.release();
+    lease = null;
+    owner.assertMoneyUnitOriginalWriterOptions(options, target);
+    sealed.assertUnchanged();
+    const terminalReview = readReview();
+    if (terminalReview === null || validateReview(reviewBinding, terminalReview) !== reviewDigest)
+      throw verificationError("money suffix review changed after cleanup before terminal");
+    validateCustody(
+      await options.custody.terminal(binding, postDigest),
+      "suffix98",
+      moneyCutoverBindingDigest(binding),
+      "terminal",
+      postDigest,
+    );
+    return {
+      ...status,
+      kind: "takoserver.money-held-suffix98-result@v1",
+      custody: "terminal",
+      schemaPhase: "0098-fenced",
+      postDigest,
+      writerState: "original maintenance still serves; normal Version remains held",
+      normalHostReady: false,
+    };
+  } catch (error) {
+    if (dispatched) {
+      const failure = verificationError(
+        "money suffix dispatch is retained; keep freeze and use original status GET only, never resend",
+      );
+      throw verificationError(
+        failure.message,
+        JSON.stringify({
+          kind: "takoserver.money-suffix-retained-failure@v1",
+          code: "retained_dispatch_failure",
+          sourceDigest: SOURCE_0098,
+          importDigest: one.digest,
+        }),
+      );
+    }
+    throw error;
+  } finally {
+    compiler.close();
+    if (lease !== null) await lease.release();
+    if (!dispatched) rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function moneySigningPostimageMatches(
+  row: unknown,
+  signing: Pick<
+    MoneyNormalWorkerSigningGenesisContribution,
+    "keyId" | "publicJwk" | "createdAtEpochSeconds"
+  >,
+): boolean {
+  return (
+    record(row) &&
+    Object.keys(row).sort().join(",") ===
+      "created_at_epoch_seconds,key_id,public_jwk,revoked_at_epoch_seconds" &&
+    row.key_id === signing.keyId &&
+    row.public_jwk === signing.publicJwk &&
+    row.created_at_epoch_seconds === signing.createdAtEpochSeconds &&
+    row.revoked_at_epoch_seconds === null
+  );
+}
+
+async function assertMoneySigningGenesisPostimage(
+  database: PreimageReader,
+  signing: MoneyNormalWorkerSigningGenesisContribution,
+  phase: DeployPhase,
+): Promise<void> {
+  const rows = await database.query(
+    phase,
+    "exact original signing genesis postimage",
+    "SELECT key_id,public_jwk,created_at_epoch_seconds,revoked_at_epoch_seconds FROM runtime_grant_keys LIMIT 2",
+  );
+  if (rows.length !== 1 || !moneySigningPostimageMatches(rows[0], signing))
+    throw proofError(phase, "money signing genesis exact active row differs");
+}
+
+function moneyPreserved100ReviewBinding(input: {
+  readonly commit: string;
+  readonly target: DeployTarget;
+  readonly suffix: MoneyPost94DispatchBinding;
+  readonly suffixReceipt: MoneyCutoverCustodyReceipt;
+  readonly freezeBindingDigest: string;
+  readonly beforeShapeDigest: string;
+  readonly prepared: MoneyPreserved100ImportData;
+}): MoneyPreserved100ReviewBinding {
+  if (
+    input.suffix.phase !== "suffix98" ||
+    input.suffixReceipt.phase !== "suffix98" ||
+    input.suffixReceipt.state !== "terminal" ||
+    !SHA256.test(input.suffixReceipt.postDigest ?? "") ||
+    !SHA256.test(input.freezeBindingDigest) ||
+    !SHA256.test(input.beforeShapeDigest)
+  )
+    throw preflightError("money preserved100 review requires original exact98 facts");
+  return Object.freeze({
+    kind: "takoserver.money-preserved100-import-review@v1",
+    phase: "preserved100",
+    accountId: input.target.accountId,
+    databaseId: input.target.d1.databaseId,
+    databaseName: input.target.d1.databaseName,
+    bucketName: input.target.r2.bucketName,
+    workerName: input.target.workerName,
+    sourceCommit: input.commit,
+    sourceDigest: input.prepared.sourceDigest,
+    importDigest: input.prepared.importDigest,
+    suffixBindingDigest: input.suffixReceipt.bindingDigest,
+    suffixPostDigest: String(input.suffixReceipt.postDigest),
+    suffixReviewDigest: input.suffix.reviewDigest,
+    freezeBindingDigest: input.freezeBindingDigest,
+    originDigest: input.suffix.originDigest,
+    original92BackupDigest: input.suffix.backupDigest,
+    writerDigest: input.suffix.writerDigest,
+    nextWriterEpoch: input.suffix.nextWriterEpoch,
+    beforeShapeDigest: input.beforeShapeDigest,
+    afterShapeDigest: digest(input.prepared.afterShape),
+  });
+}
+
+/** The existing original Money path's 98→100 continuation; no new importer or uploader. */
+export async function runIntegrationMoneyOriginalPreserved100(
+  invocation: MoneyUnitCutoverInvocation,
+  target: DeployTarget,
+  options: MoneyUnitOriginalCutoverOptions,
+  post94DeclarationPath: string,
+): Promise<Record<string, unknown>> {
+  if (
+    invocation.environment !== "integration" ||
+    invocation.throughMigration !== "0100" ||
+    !COMMIT.test(invocation.commit) ||
+    !["status", "apply"].includes(invocation.action)
+  )
+    throw preflightError("money preserved100 requires the fixed integration0100 invocation");
+  const owner = await import("./schema-money-unit-owner.ts");
+  target = owner.assertMoneyUnitOriginalWriterOptions(options, target);
+  if (
+    options.phase !== "convert" ||
+    options.outputDirectory === undefined ||
+    (options.sourceDirectory !== undefined &&
+      resolve(options.sourceDirectory) !== resolve(REPOSITORY, "migrations"))
+  )
+    throw preflightError("money preserved100 requires the original convert owner and source");
+  const suffixReceipt = await options.custody.read("suffix98"),
+    suffix = await options.custody.readDispatch("suffix98");
+  if (
+    suffixReceipt?.state !== "terminal" ||
+    suffix?.kind !== "takoserver.money-cutover-dispatch@v2" ||
+    suffix.phase !== "suffix98" ||
+    suffix.afterSchemaPhase !== "0098-fenced" ||
+    suffixReceipt.bindingDigest !== moneyCutoverBindingDigest(suffix) ||
+    !SHA256.test(suffixReceipt.postDigest ?? "") ||
+    typeof suffix.signingGenesisPath !== "string" ||
+    (await options.custody.read("resume98")) !== null ||
+    (await options.custody.readDispatch("resume98")) !== null
+  )
+    throw preflightError("money preserved100 requires the original terminal98 without thaw");
+  owner.assertMoneyUnitOriginalPost94DispatchData(options, post94DeclarationPath, suffix);
+  const existing = await options.custody.read("preserved100"),
+    existingBinding = await options.custody.readDispatch("preserved100");
+  if (invocation.action === "status") {
+    if (existing === null && existingBinding === null) {
+      const before = await readIntegrationMoneyPost94CustodyStatus(
+        { ...invocation, action: "status", throughMigration: "0098" },
+        target,
+        options,
+        post94DeclarationPath,
+      );
+      if (before.custody !== "terminal" || before.schemaPhase !== "0098-fenced")
+        throw preflightError("money preserved100 review source requires exact terminal98");
+      const signing: unknown = JSON.parse(
+        readProtectedBytes(suffix.signingGenesisPath, "money original signing DATA").toString(
+          "utf8",
+        ),
+      );
+      if (
+        !record(signing) ||
+        typeof signing.keyId !== "string" ||
+        typeof signing.publicJwk !== "string" ||
+        typeof signing.createdAtEpochSeconds !== "number"
+      )
+        throw preflightError("money preserved100 status signing source is malformed");
+      const scratch = mkdtempSync(join(options.outputDirectory, "money-preserved100-status-"));
+      let reviewBinding: MoneyPreserved100ReviewBinding;
+      try {
+        const prepared = buildMoneyOriginalPreserved100ImportData({
+          sourceDirectory: options.sourceDirectory ?? resolve(REPOSITORY, "migrations"),
+          scratchBase: scratch,
+          freezeBindingDigest: String(before.freezeBindingDigest),
+          originDigest: suffix.originDigest,
+          original92BackupDigest: suffix.original92BackupDigest,
+          writerDigest: suffix.writerDigest,
+          nextWriterEpoch: suffix.nextWriterEpoch,
+          signingKeyId: signing.keyId,
+          signingPublicJwk: signing.publicJwk,
+          signingCreatedAtEpochSeconds: signing.createdAtEpochSeconds,
+        });
+        reviewBinding = moneyPreserved100ReviewBinding({
+          commit: invocation.commit,
+          target,
+          suffix,
+          suffixReceipt,
+          freezeBindingDigest: String(before.freezeBindingDigest),
+          beforeShapeDigest: String(before.schemaShapeDigest),
+          prepared,
+        });
+      } finally {
+        rmSync(scratch, { recursive: true, force: true });
+      }
+      return Object.freeze({
+        kind: "takoserver.money-preserved100-status@v1",
+        custody: "not-dispatched",
+        schemaPhase: before.schemaPhase,
+        reviewBinding,
+        reviewBindingDigest: moneyCutoverBindingDigest(reviewBinding),
+        readOnly: true,
+        canResend: false,
+        normalHostReady: false,
+      });
+    }
+    if (
+      !existing ||
+      !existingBinding ||
+      existingBinding.kind !== "takoserver.money-cutover-dispatch@v3" ||
+      existingBinding.phase !== "preserved100" ||
+      existing.bindingDigest !== moneyCutoverBindingDigest(existingBinding)
+    )
+      throw preflightError("money preserved100 status has partial or foreign custody");
+    let schemaPhase: "0100-fenced" | "unknown" = "unknown";
+    try {
+      await readIntegrationMoneyOriginalPreservedSource(
+        target,
+        options,
+        post94DeclarationPath,
+        100,
+        existing.state,
+      );
+      schemaPhase = "0100-fenced";
+    } catch {
+      // Unknown acknowledgement is observation DATA, never a terminal receipt.
+    }
+    return Object.freeze({
+      kind: "takoserver.money-preserved100-status@v1",
+      custody: existing.state,
+      schemaPhase,
+      readOnly: true,
+      canResend: false,
+      terminalRecovery: "not-attempted",
+      normalHostReady: false,
+    });
+  }
+  if (existing !== null || existingBinding !== null)
+    throw mutationError("money preserved100 custody already exists; no resend");
+  const before = await readIntegrationMoneyPost94CustodyStatus(
+    { ...invocation, action: "status", throughMigration: "0098" },
+    target,
+    options,
+    post94DeclarationPath,
+  );
+  if (before.custody !== "terminal" || before.schemaPhase !== "0098-fenced")
+    throw preflightError("money preserved100 requires exact original fenced98 before dispatch");
+  const signing: unknown = JSON.parse(
+    readProtectedBytes(suffix.signingGenesisPath, "money original signing DATA").toString("utf8"),
+  );
+  if (
+    !record(signing) ||
+    signing.kind !== "takoserver.money-normal-signing-genesis-contribution@v1" ||
+    signing.normalModeBindingDigest !== suffix.modePreparationDigest ||
+    signing.convertBindingDigest !== suffix.convertBindingDigest ||
+    signing.original92BackupDigest !== suffix.original92BackupDigest ||
+    signing.converted94BackupDigest !== suffix.converted94BackupDigest ||
+    typeof signing.keyId !== "string" ||
+    typeof signing.publicJwk !== "string" ||
+    typeof signing.createdAtEpochSeconds !== "number"
+  )
+    throw preflightError("money preserved100 requires unchanged original signing genesis");
+  const run = options.run ?? runCommand;
+  await qualifySource({
+    environment: "integration",
+    commit: invocation.commit,
+    policy: "clean-remote",
+    run,
+  });
+  const gate = await run(["bun", "run", "check:migrations"]);
+  if (gate.exitCode !== 0)
+    throw preflightError(`money preserved100 migration gate failed (exit ${gate.exitCode})`);
+  const credential = await resolveCloudflareCredential("integration", {
+    ...(options.cloudflareEnvironment === undefined
+      ? {}
+      : { cloudflareEnvironment: options.cloudflareEnvironment }),
+    run,
+  });
+  assertProtectedDirectory(options.outputDirectory, "money preserved100 protected output");
+  const root = mkdtempSync(join(options.outputDirectory, "money-preserved100-"));
+  let lease: Awaited<ReturnType<typeof acquireWranglerVersionPublicationLease>> | null = null;
+  let dispatched = false;
+  try {
+    const sourceDirectory = options.sourceDirectory ?? resolve(REPOSITORY, "migrations");
+    const prepared = buildMoneyOriginalPreserved100ImportData({
+      sourceDirectory,
+      scratchBase: root,
+      freezeBindingDigest:
+        suffix.originDigest === before.originDigest ? String(before.freezeBindingDigest) : "",
+      originDigest: suffix.originDigest,
+      original92BackupDigest: suffix.original92BackupDigest,
+      writerDigest: suffix.writerDigest,
+      nextWriterEpoch: suffix.nextWriterEpoch,
+      signingKeyId: signing.keyId,
+      signingPublicJwk: signing.publicJwk,
+      signingCreatedAtEpochSeconds: signing.createdAtEpochSeconds,
+    });
+    const configPath = join(root, "wrangler.jsonc"),
+      importPath = join(root, "import.sql");
+    writeProtectedFile(configPath, Buffer.from(configJson(target)));
+    const database = new RemoteD1(configPath, { environment: credential.childEnvironment, run });
+    lease = await acquireWranglerVersionPublicationLease({
+      accountId: target.accountId,
+      workerName: `d1-${target.d1.databaseId}`,
+      ...(options.leaseRoot === undefined ? {} : { root: options.leaseRoot }),
+    });
+    const observed = await readD1SchemaState(database);
+    if (
+      observed.applied.length !== 98 ||
+      observed.applied.some((name, index) => name !== prepared.names[index]) ||
+      !applicationSchemaMatches(observed, prepared.beforeShape) ||
+      observed.shapeDigest !== before.schemaShapeDigest
+    )
+      throw preflightError("money preserved100 requires exact fenced98 schema and ledger");
+    const reviewBinding = moneyPreserved100ReviewBinding({
+      commit: invocation.commit,
+      target,
+      suffix,
+      suffixReceipt,
+      freezeBindingDigest: String(before.freezeBindingDigest),
+      beforeShapeDigest: observed.shapeDigest,
+      prepared,
+    });
+    const reviewed = owner.readMoneyUnitOriginalPreserved100IndependentReview(
+      options,
+      reviewBinding,
+    );
+    if (reviewed === null)
+      throw preflightError("money preserved100 requires exact protected independent import review");
+    const reviewDigest = validateReview(reviewBinding, reviewed);
+    assertFreezeRow(
+      await readFreezeRow(database, "preflight"),
+      String(before.freezeBindingDigest),
+      suffix.originDigest,
+      suffix.original92BackupDigest,
+      suffix.writerDigest,
+      "preflight",
+    );
+    await assertPermitEmpty(database, "preflight", suffix.nextWriterEpoch);
+    await assertMoneySigningGenesisPostimage(
+      database,
+      signing as unknown as MoneyNormalWorkerSigningGenesisContribution,
+      "preflight",
+    );
+    await assertMoneyNativeForeignKeys(database, "preflight");
+    const maintenance = await options.maintenanceProof();
+    assertMaintenanceProof(target, maintenance, options.maintenanceCommit);
+    if (digest(JSON.stringify(maintenance)) !== suffix.writerDigest)
+      throw preflightError("money preserved100 original maintenance Version changed");
+    const preDispatch = await readIntegrationMoneyPost94CustodyStatus(
+      { ...invocation, action: "status", throughMigration: "0098" },
+      target,
+      options,
+      post94DeclarationPath,
+    );
+    if (
+      preDispatch.custody !== "terminal" ||
+      preDispatch.schemaPhase !== "0098-fenced" ||
+      preDispatch.schemaShapeDigest !== observed.shapeDigest ||
+      preDispatch.freezeBindingDigest !== before.freezeBindingDigest ||
+      preDispatch.originDigest !== suffix.originDigest
+    )
+      throw preflightError("money preserved100 original98 changed before dispatch");
+    const reviewedNow = owner.readMoneyUnitOriginalPreserved100IndependentReview(
+      options,
+      reviewBinding,
+    );
+    if (reviewedNow === null || validateReview(reviewBinding, reviewedNow) !== reviewDigest)
+      throw preflightError("money preserved100 independent review changed before dispatch");
+    if (
+      (await options.custody.read("preserved100")) !== null ||
+      (await options.custody.readDispatch("preserved100")) !== null ||
+      JSON.stringify(await options.custody.read("suffix98")) !== JSON.stringify(suffixReceipt) ||
+      JSON.stringify(await options.custody.readDispatch("suffix98")) !== JSON.stringify(suffix)
+    )
+      throw mutationError("money preserved100 original custody changed before dispatch");
+    const currentSource = readMoneyOriginalPreservedSourceInventory(sourceDirectory, 100, root);
+    try {
+      currentSource.assertCurrent();
+      if (currentSource.sourceDigest !== prepared.sourceDigest)
+        throw preflightError("money preserved100 source changed before sealed dispatch");
+    } finally {
+      currentSource.dispose();
+    }
+    owner.assertMoneyUnitOriginalWriterOptions(options, target);
+    writeProtectedFile(importPath, Buffer.from(prepared.sql));
+    writeProtectedFile(
+      join(root, "independent-review.json"),
+      Buffer.from(JSON.stringify(reviewedNow)),
+    );
+    const sealed = sealDirectory(root, ["wrangler.jsonc", "import.sql", "independent-review.json"]);
+    const binding: MoneyPreserved100DispatchBinding = {
+      kind: "takoserver.money-cutover-dispatch@v3",
+      phase: "preserved100",
+      accountId: target.accountId,
+      databaseId: target.d1.databaseId,
+      databaseName: target.d1.databaseName,
+      originDigest: suffix.originDigest,
+      predecessorCustodyDigest: digest(JSON.stringify(suffixReceipt)),
+      sourceCommit: invocation.commit,
+      sourceDigest: prepared.sourceDigest,
+      importDigest: prepared.importDigest,
+      backupDigest: suffix.backupDigest,
+      preimageDigest: suffix.preimageDigest,
+      aggregateDigest: suffix.aggregateDigest,
+      classificationDigest: suffix.classificationDigest,
+      writerDigest: suffix.writerDigest,
+      resumeDigest: suffix.resumeDigest,
+      writerEpoch: suffix.nextWriterEpoch,
+      reviewDigest,
+      beforeShapeDigest: observed.shapeDigest,
+      afterSchemaPhase: "0100-fenced",
+      sealedImportPath: importPath,
+      suffixBindingDigest: suffixReceipt.bindingDigest,
+      suffixPostDigest: String(suffixReceipt.postDigest),
+      expectedAfterShapeDigest: digest(prepared.afterShape),
+      nextWriterEpoch: suffix.nextWriterEpoch,
+      suffixReviewDigest: suffix.reviewDigest,
+    };
+    validateCustody(
+      await options.custody.dispatch(binding),
+      "preserved100",
+      moneyCutoverBindingDigest(binding),
+      "dispatched",
+    );
+    dispatched = true;
+    sealed.assertUnchanged();
+    owner.assertMoneyUnitOriginalWriterOptions(options, target);
+    const reviewBeforeImport = owner.readMoneyUnitOriginalPreserved100IndependentReview(
+      options,
+      reviewBinding,
+    );
+    if (
+      reviewBeforeImport === null ||
+      validateReview(reviewBinding, reviewBeforeImport) !== reviewDigest
+    )
+      throw verificationError("money preserved100 review changed before native import");
+    await runImport(importPath, configPath, target, run, credential.childEnvironment, [
+      "independent-review.json",
+    ]);
+    const post = await readIntegrationMoneyOriginalPreservedSource(
+      target,
+      options,
+      post94DeclarationPath,
+      100,
+      "dispatched",
+    );
+    if (post.kind !== "takoserver.money-original-preserved100-source@v1")
+      throw verificationError("money preserved100 postread returned a divergent phase");
+    const reviewedAfter = owner.readMoneyUnitOriginalPreserved100IndependentReview(
+      options,
+      reviewBinding,
+    );
+    if (reviewedAfter === null || validateReview(reviewBinding, reviewedAfter) !== reviewDigest)
+      throw verificationError("money preserved100 review changed after acknowledgement");
+    sealed.assertUnchanged();
+    const postDigest = digest(
+      JSON.stringify({
+        applied: prepared.names,
+        shapeDigest: post.schemaShapeDigest,
+        writerEpoch: post.currentWriterEpoch,
+        suffixBindingDigest: post.suffixBindingDigest,
+        sourceDigest: prepared.sourceDigest,
+        importDigest: prepared.importDigest,
+      }),
+    );
+    await lease.release();
+    lease = null;
+    owner.assertMoneyUnitOriginalWriterOptions(options, target);
+    sealed.assertUnchanged();
+    const terminalReview = owner.readMoneyUnitOriginalPreserved100IndependentReview(
+      options,
+      reviewBinding,
+    );
+    if (terminalReview === null || validateReview(reviewBinding, terminalReview) !== reviewDigest)
+      throw verificationError("money preserved100 review changed before terminal custody");
+    validateCustody(
+      await options.custody.terminal(binding, postDigest),
+      "preserved100",
+      moneyCutoverBindingDigest(binding),
+      "terminal",
+      postDigest,
+    );
+    return Object.freeze({
+      kind: "takoserver.money-preserved100-result@v1",
+      custody: "terminal",
+      schemaPhase: "0100-fenced",
+      sourceDigest: prepared.sourceDigest,
+      importDigest: prepared.importDigest,
+      postDigest,
+      normalHostReady: false,
+    });
+  } catch (error) {
+    if (dispatched)
+      throw verificationError(
+        "money preserved100 dispatch is retained; keep freeze and use status GET only, never resend",
+      );
+    throw error;
+  } finally {
+    if (lease !== null) await lease.release();
   }
 }

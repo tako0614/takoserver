@@ -22,7 +22,7 @@ import {
   type ArtifactBlobIoDeploymentCompatibility,
   inspectArtifactBlobIoDeploymentCompatibility,
 } from "./artifact-blob-io-compatibility.ts";
-import { createAuth103CanonicalSourceArtifacts } from "./auth103-native-source.ts";
+import { createAuth103CanonicalSourceArtifacts } from "./auth103-canonical-recipes.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
 import { buildD1MigrationImport } from "./d1-migration-import.ts";
