@@ -1216,7 +1216,7 @@ function attemptMatch(alias: string): string {
 /** Compile one immutable first-attempt row. DATA only: this neither executes the
  * claim nor proves current payer/source authority. The owning issuer is still absent.
  * Exact replay returns zero; it is not a second fresh claim or continuation grant. */
-export async function buildFinancialR1AttemptCustodyStatement(
+async function buildFinancialR1LegacyAttemptCustodyStatement(
   options: FinancialEnrollmentComponentOptions & { readonly scope: FinancialPreproofScope },
   command: FinancialR1WriteCommand,
   observedAt: string,
@@ -1260,6 +1260,16 @@ export async function buildFinancialR1AttemptCustodyStatement(
       p.command.original.c0ReceiptRef,
     ]),
   });
+}
+
+/** Existing consumer entry point uses the bounded compiler. The original
+ * predicate, exact postimage and historical recovery contract are retained. */
+export async function buildFinancialR1AttemptCustodyStatement(
+  options: FinancialEnrollmentComponentOptions & { readonly scope: FinancialPreproofScope },
+  command: FinancialR1WriteCommand,
+  observedAt: string,
+): Promise<SqlStatement> {
+  return buildFinancialR1BoundedAttemptCustodyStatement(options, command, observedAt);
 }
 
 /** Fixed five-statement contribution with the exact original claim predicate in
@@ -1677,5 +1687,81 @@ export function createFinancialRetainedR1Store(
     readJoinedRetainedR1Data,
     readBusinessRetainedR1Data,
     readRetainedActionConsentR1,
+  });
+}
+
+/** Fixed R1 claim compiler DATA with sixteen semantic input slots. It retains
+ * every original claim predicate and RETURNING column; it neither executes a
+ * write nor establishes an Auth/source/payer capability. Root predicates can
+ * later be composed in their own closed CTE without changing their SQL bytes. */
+export async function buildFinancialR1BoundedAttemptCustodyStatement(
+  options: FinancialEnrollmentComponentOptions & { readonly scope: FinancialPreproofScope },
+  command: FinancialR1WriteCommand,
+  observedAt: string,
+): Promise<SqlStatement> {
+  const c = capture(options),
+    at = iso(observedAt);
+  const p = await parseCaptured(command, c);
+  const image = await attemptImage(p, at);
+  const input = Object.freeze([
+    ...image,
+    c.realm.accountId,
+    c.realm.billingAuthority,
+    p.command.original.c0ReceiptRef,
+  ]);
+  const columns = [
+    ...ATTEMPT_COLUMNS,
+    "realm_account_id",
+    "realm_billing_authority",
+    "c0_receipt_ref",
+  ] as const;
+  // A semantic mapping, not value-based deduplication: equal-looking refs from
+  // different namespaces remain separate input slots.
+  const roles = Array.from({ length: 4 }, () => [0, 1, 2, 3]).flat();
+  const business = [4, 5, 6];
+  const mapping = [
+    ...ATTEMPT_COLUMNS.map((_, index) => index),
+    13,
+    14,
+    ...business,
+    ...roles,
+    ...business,
+    ...roles,
+    ...business,
+    ...roles,
+    ...business,
+    ...business,
+    1,
+    2,
+    ...business,
+    ...business,
+    1,
+    2,
+    15,
+  ];
+  const legacy = await buildFinancialR1LegacyAttemptCustodyStatement(c.c0Options, p.command, at);
+  const params = legacy.params;
+  if (
+    input.length !== 16 ||
+    mapping.length !== 89 ||
+    !params ||
+    params.length !== mapping.length ||
+    mapping.some((slot, index) => !Object.is(params[index], input[slot])) ||
+    (legacy.sql.match(/\?/gu) ?? []).length !== mapping.length
+  )
+    fail("unavailable");
+  const alias = "financial_r1_claim_input";
+  let index = 0;
+  const rewritten = legacy.sql.replace(/\?/gu, () => {
+    const slot = mapping[index++];
+    const column = slot === undefined ? undefined : columns[slot];
+    if (column === undefined) return fail("unavailable");
+    return `${alias}.${column}`;
+  });
+  const select = `SELECT ${ATTEMPT_COLUMNS.map((column) => `${alias}.${column}`).join(",")} WHERE`;
+  if (index !== mapping.length || rewritten.split(select).length !== 2) fail("unavailable");
+  return Object.freeze({
+    sql: `WITH ${alias}(${columns.join(",")}) AS (VALUES(${columns.map(() => "?").join(",")}))\n${rewritten.replace(select, select.replace(" WHERE", ` FROM ${alias} WHERE`))}`,
+    params: input,
   });
 }
