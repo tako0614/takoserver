@@ -89,6 +89,8 @@ export interface DeployTarget {
   /** Temporary pre-0043 runtime used only by the 0043 cutover protocol. */
   readonly artifactBlobIoMode?: "pre-0043-quiesced";
   /** Optional whole-Host source-only maintenance profile for an exact pending schema wave. */
+  /** Code-owned Root RP profile selection only; never registration/readiness authority. */
+  readonly auth103NativeProfile?: "root-shared-auth-staging-v1";
   readonly schemaMaintenanceMode?:
     | "pre-0058-quiesced"
     | "pre-v2-0088-quiesced"
@@ -401,6 +403,7 @@ const DEPLOY_TARGET_OPTIONAL_KEYS: readonly string[] = [
   "operatorIdentity",
   "integrationE2eCredentialAuthority",
   "artifactBlobIoMode",
+  "auth103NativeProfile",
   "schemaMaintenanceMode",
   "moneyCutoverWriterPolicy",
   "moneyCutoverWriterEpoch",
@@ -572,6 +575,7 @@ export function parseDeployTarget(
     publicOrigin: httpsOrigin(value.publicOrigin),
     ...(value.takoformV2 === undefined ? {} : { takoformV2: takoformV2(value.takoformV2) }),
     ...artifactBlobIoMode(value.artifactBlobIoMode),
+    ...auth103NativeProfile(value.auth103NativeProfile),
     ...schemaMaintenanceMode(value.schemaMaintenanceMode),
     ...(value.moneyCutoverWriterPolicy === undefined
       ? {}
@@ -662,6 +666,8 @@ export function parseDeployTarget(
     // a target that says something different from what it will do.
     throw preflightError("deploy target Stripe webhook and settings require `stripeCheckout`");
   }
+  if (target.auth103NativeProfile !== undefined && environment !== "integration")
+    throw preflightError("Root shared Auth103 native profile is integration-only");
   if (target.schemaMaintenanceMode === "pre-v2-0088-quiesced" && environment !== "integration") {
     throw preflightError("v2 0088 schema maintenance is integration-only");
   }
@@ -1768,6 +1774,15 @@ function moneyCutoverWriterPolicy(value: unknown): "transaction-fenced-usd-micro
 
 function moneyCutoverWriterEpoch(value: unknown): string {
   return pattern(value, /^sha256:[0-9a-f]{64}$/u, "moneyCutoverWriterEpoch");
+}
+
+function auth103NativeProfile(value: unknown): {
+  readonly auth103NativeProfile?: "root-shared-auth-staging-v1";
+} {
+  if (value === undefined) return {};
+  if (value !== "root-shared-auth-staging-v1")
+    throw preflightError("deploy target Auth103 native profile is unsupported");
+  return { auth103NativeProfile: value };
 }
 
 function schemaMaintenanceMode(value: unknown): {

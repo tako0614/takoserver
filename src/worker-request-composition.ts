@@ -15,6 +15,8 @@ import {
   type VerifiedLocalPrincipalIssuance,
   type VerifiedLocalPrincipalIssuanceReader,
 } from "./auth.ts";
+import type { Auth103NativeRequestOrigin } from "./auth103-native-origin-source.ts";
+import { readAuth103SourceClock } from "./auth103-source-clock.ts";
 import {
   createCredentialAuthorityClassStore,
   type RpAuthorityRecord,
@@ -57,6 +59,7 @@ import {
 } from "./shared-principal-authority.ts";
 import { createD1Sql, type D1DatabaseLike } from "./sql-d1.ts";
 import type { StripeBillingClient } from "./stripe-billing-client.ts";
+import { createAccountsWithQualifiedLocalIssuer } from "./worker-request-qualified-local-issuer.ts";
 
 /** The native binding owns primary consistency; no Sql-shaped input selects it. */
 export interface WorkerRequestDatabase extends D1DatabaseLike {
@@ -129,7 +132,9 @@ async function constructWorkerPrimaryRequestSql(
   } catch {
     throw new TypeError(`${diagnostic} primary session is unavailable`);
   }
-  const rawSql = createD1Sql(nativeSession, { acknowledgement: "explicit-d1-result" });
+  const rawSql = createD1Sql(nativeSession, {
+    acknowledgement: "explicit-d1-result",
+  });
   const prepare = dataMethod(nativeSession, "prepare");
   const batch = dataMethod(nativeSession, "batch");
   const writerEpoch = options.writerEpoch;
@@ -192,8 +197,8 @@ export function captureWorkerSharedAuthStaging(
     clientSecret: options.clientSecret,
     encryptionKey: Uint8Array.from(options.encryptionKey),
     principals: Object.freeze({
-      resolve: (input: Parameters<SharedAuthPrincipalProjection["resolve"]>[0]) =>
-        Reflect.apply(resolvePrincipal, principalReceiver, [input]),
+      resolve: (...input: Parameters<SharedAuthPrincipalProjection["resolve"]>) =>
+        Reflect.apply(resolvePrincipal, principalReceiver, input),
     }),
     ...(organizationReceiver === undefined || pinOrganization === undefined
       ? {}
@@ -261,7 +266,10 @@ export interface WorkerRequestRetainedRpData {
 
 const retainedRpCaptures = new WeakMap<
   object,
-  { readonly connection: WorkerRequestSql; readonly data: WorkerRequestRetainedRpData }
+  {
+    readonly connection: WorkerRequestSql;
+    readonly data: WorkerRequestRetainedRpData;
+  }
 >();
 
 /** Calls only this request graph's existing RP observer; no DTO/callback can mint a capture. */
@@ -374,7 +382,9 @@ export async function captureWorkerRequestRetainedRpSession(
       organizationId: context.organizationId,
     }),
   });
-  const capture: WorkerRequestRetainedRpCapture = { [retainedRpCaptureBrand]: true };
+  const capture: WorkerRequestRetainedRpCapture = {
+    [retainedRpCaptureBrand]: true,
+  };
   Object.freeze(capture);
   retainedRpCaptures.set(capture, Object.freeze({ connection, data }));
   return capture;
@@ -598,7 +608,9 @@ export function readWorkerRequestConsumers(connection: WorkerRequestSql): Worker
   const origin = requestOrigins.get(connection);
   if (!consumers || origin?.purpose !== "shared-auth-staging" || consumers.sql !== connection.sql)
     throw new TypeError("Worker request consumers have not been constructed");
-  assertMoneyCutoverSqlOrigin(consumers.sql, { writerEpoch: origin.writerEpoch });
+  assertMoneyCutoverSqlOrigin(consumers.sql, {
+    writerEpoch: origin.writerEpoch,
+  });
   assertAuthTokenCaptureReader(consumers.accounts, { sql: consumers.sql });
   assertHostedBillingFinancialRealm(consumers.realm, {
     sql: consumers.sql,
@@ -720,6 +732,21 @@ export function readWorkerRequestFinancialAuthSchemaObservation(
   return Object.freeze({ inputs, observation });
 }
 
+/** Revalidate the original native request backing without exposing its private origin. */
+export function assertWorkerRequestBackingOrigin(connection: WorkerRequestSql): void {
+  assertWorkerRequestBacking(connection);
+}
+
+/** Match the actual platform binding without exposing the private native origin. */
+export function assertWorkerRequestNativeBinding(
+  connection: WorkerRequestSql,
+  expectedPlatformDatabase: unknown,
+): void {
+  const original = assertWorkerRequestBacking(connection);
+  if (original.database !== expectedPlatformDatabase)
+    throw new TypeError("Worker request platform database binding differs");
+}
+
 function assertWorkerRequestBacking(connection: WorkerRequestSql) {
   const origin = requestOrigins.get(connection);
   if (!origin) throw new TypeError("Worker request backing has not been constructed");
@@ -795,6 +822,111 @@ type WorkerRequestConsumerOptions = WorkerRequestAppInputs & {
   readonly consoleOrigin: string | undefined;
 };
 
+const nativeConsumerOptionKeys = [
+  "connection",
+  "sql",
+  "client",
+  "realm",
+  "identity",
+  "clock",
+  "randomId",
+  "publicOrigin",
+  "consoleOrigin",
+  "sharedAuth",
+] as const;
+
+const nativeInitializations = new WeakMap<
+  WorkerRequestSql,
+  {
+    readonly options: WorkerRequestConsumerOptions;
+    readonly inputs: WorkerRequestFinancialInputs;
+    readonly methods: readonly unknown[];
+    readonly clock: NonNullable<ReturnType<typeof readAuth103SourceClock>>;
+    construction: object | null;
+    phase: "prepared" | "constructing" | "constructed";
+  }
+>();
+
+function ownNativeInitializationOption(receiver: object, key: string): unknown {
+  const d = Object.getOwnPropertyDescriptor(receiver, key);
+  if (!d || !("value" in d))
+    throw new TypeError("Worker request native initialization inputs differ");
+  return d.value;
+}
+
+/**
+ * Capture the actual original constructor inputs BEFORE its one Accounts/RP
+ * construction. This is DATA origin, not installed/native/source permission;
+ * the separate native owner must authenticate the real platform registration.
+ */
+export function initializeWorkerRequestNativeInputs(options: WorkerRequestConsumerOptions): void {
+  const selected = Object.freeze(
+    Object.fromEntries(
+      nativeConsumerOptionKeys.map((key) => [key, ownNativeInitializationOption(options, key)]),
+    ),
+  ) as unknown as WorkerRequestConsumerOptions;
+  const origin = assertWorkerRequestBacking(selected.connection);
+  if (
+    origin.purpose !== "shared-auth-staging" ||
+    selected.sql !== selected.connection.sql ||
+    selected.connection.moneyGuard !== "ready" ||
+    selected.publicOrigin !== SHARED_AUTH_STAGING_PROFILE.publicOrigin ||
+    selected.consoleOrigin !== SHARED_AUTH_STAGING_PROFILE.consoleOrigin ||
+    nativeInitializations.has(selected.connection) ||
+    requestConsumers.has(selected.connection)
+  )
+    throw new TypeError("Worker request native initialization differs");
+  assertHostedBillingFinancialRealm(selected.realm, {
+    sql: selected.sql,
+    client: selected.client,
+    billingAuthority: selected.realm.billingAuthority,
+  });
+  const clock = readAuth103SourceClock(selected.clock);
+  if (!clock) throw new TypeError("Worker request requires the original source Clock");
+  const methods = ["query", "run", "batch"].map((key) => dataMethod(selected.sql, key));
+  const inputs = Object.freeze({
+    sql: selected.sql,
+    client: selected.client,
+    realm: selected.realm,
+    clock: selected.clock,
+    writerEpoch: origin.writerEpoch,
+  });
+  nativeInitializations.set(selected.connection, {
+    options: selected,
+    inputs,
+    methods,
+    clock,
+    construction: null,
+    phase: "prepared",
+  });
+  readWorkerRequestNativeInitializationInputs(selected.connection);
+}
+
+/** Original preconsumer inputs, rechecked before and after every native await. */
+export function readWorkerRequestNativeInitializationInputs(
+  connection: WorkerRequestSql,
+): WorkerRequestFinancialInputs {
+  const origin = assertWorkerRequestBacking(connection);
+  const held = nativeInitializations.get(connection);
+  if (
+    !held ||
+    held.inputs.sql !== connection.sql ||
+    held.inputs.writerEpoch !== origin.writerEpoch ||
+    readAuth103SourceClock(held.inputs.clock) !== held.clock ||
+    ["query", "run", "batch"].some(
+      (key, index) => dataMethod(held.inputs.sql, key) !== held.methods[index],
+    ) ||
+    (requestConsumers.has(connection) && requestFinancialInputs.get(connection) !== held.inputs)
+  )
+    throw new TypeError("Worker request native initialization origin differs");
+  assertHostedBillingFinancialRealm(held.inputs.realm, {
+    sql: held.inputs.sql,
+    client: held.inputs.client,
+    billingAuthority: held.inputs.realm.billingAuthority,
+  });
+  return held.inputs;
+}
+
 export function createWorkerRequestConsumers(
   options: WorkerRequestConsumerOptions,
 ): WorkerRequestConsumers {
@@ -817,9 +949,65 @@ export function createWorkerRequestConsumersWithUnregisteredLocalIssuer(
   return constructWorkerRequestConsumers(options, identity.value);
 }
 
+/**
+ * The actual native original is obtained before the ONE Accounts constructor.
+ * This branch consumes an existing original initialization, not a caller-supplied
+ * target/Clock/ref or preconstructed Accounts facade. Default remains unchanged.
+ */
+export async function createWorkerRequestConsumersWithQualifiedLocalIssuer(
+  options: WorkerRequestConsumerOptions & {
+    readonly identity: ExternalIdentityVerifier & IdentityVerificationCaptureReader;
+  },
+  nativeOrigin: Auth103NativeRequestOrigin,
+): Promise<WorkerRequestConsumers> {
+  const selected = Object.freeze(
+    Object.fromEntries(
+      nativeConsumerOptionKeys.map((key) => [key, ownNativeInitializationOption(options, key)]),
+    ),
+  ) as unknown as typeof options;
+  const inputs = readWorkerRequestNativeInitializationInputs(selected.connection);
+  const held = nativeInitializations.get(selected.connection);
+  if (
+    held?.phase !== "prepared" ||
+    requestConsumers.has(selected.connection) ||
+    nativeConsumerOptionKeys.some((key) => selected[key] !== held.options[key])
+  )
+    throw new TypeError("Worker request qualified construction differs");
+  assertIdentityVerificationCaptureReader(selected.identity);
+  const construction = Object.freeze({});
+  held.construction = construction;
+  held.phase = "constructing"; // An exception/unknown cannot construct a second Accounts.
+  const apiKeyAdministration = createApiKeyAdministration({
+    sql: inputs.sql,
+    clock: inputs.clock,
+    randomId: selected.randomId,
+  });
+  const accounts = await createAccountsWithQualifiedLocalIssuer(selected.connection, nativeOrigin, {
+    identity: selected.identity,
+    apiKeyAdministration,
+  });
+  if (
+    readWorkerRequestNativeInitializationInputs(selected.connection) !== inputs ||
+    nativeInitializations.get(selected.connection) !== held ||
+    held.phase !== "constructing" ||
+    held.construction !== construction
+  )
+    throw new TypeError("Worker request qualified construction origin differs");
+  return constructWorkerRequestConsumers(selected, null, {
+    construction,
+    accounts,
+    apiKeyAdministration,
+  });
+}
+
 function constructWorkerRequestConsumers(
   options: WorkerRequestConsumerOptions,
   localIdentity: (ExternalIdentityVerifier & IdentityVerificationCaptureReader) | null,
+  qualified: {
+    readonly construction: object;
+    readonly accounts: Accounts;
+    readonly apiKeyAdministration: ApiKeyAdministration;
+  } | null = null,
 ): WorkerRequestConsumers {
   const origin = requestOrigins.get(options.connection);
   const { sql, client, realm, clock, randomId } = options;
@@ -839,7 +1027,30 @@ function constructWorkerRequestConsumers(
   });
   if (requestConsumers.has(options.connection))
     throw new TypeError("Worker request consumers are already constructed");
-  const apiKeyAdministration = createApiKeyAdministration({ sql, clock, randomId });
+  const initialization = nativeInitializations.get(options.connection);
+  if (initialization) {
+    readWorkerRequestNativeInitializationInputs(options.connection);
+    if (
+      (qualified === null
+        ? initialization.phase !== "prepared"
+        : initialization.phase !== "constructing" ||
+          initialization.construction !== qualified.construction) ||
+      nativeConsumerOptionKeys.some(
+        (key) => ownNativeInitializationOption(options, key) !== initialization.options[key],
+      )
+    )
+      throw new TypeError("Worker request constructor differs from original initialization");
+    // One constructor only. A constructor exception is not permission to retry.
+    initialization.phase = "constructing";
+  } else if (qualified !== null)
+    throw new TypeError("Worker request qualified initialization is absent");
+  const apiKeyAdministration =
+    qualified?.apiKeyAdministration ??
+    createApiKeyAdministration({
+      sql,
+      clock,
+      randomId,
+    });
   const accountOptions = {
     sql,
     identity: options.identity,
@@ -848,9 +1059,13 @@ function constructWorkerRequestConsumers(
     apiKeyAdministration,
   };
   const accounts =
-    localIdentity === null
+    qualified?.accounts ??
+    (localIdentity === null
       ? createAccounts(accountOptions)
-      : createAccountsWithUnregisteredLocalIssuer({ ...accountOptions, identity: localIdentity });
+      : createAccountsWithUnregisteredLocalIssuer({
+          ...accountOptions,
+          identity: localIdentity,
+        }));
   assertAuthTokenCaptureReader(accounts, { sql });
   const store = createSharedAuthSessionStore(sql);
   const finalStore = createSharedAuthFinalSessionStore(sql);
@@ -885,7 +1100,18 @@ function constructWorkerRequestConsumers(
   requestConsumers.set(options.connection, consumers);
   requestFinancialInputs.set(
     options.connection,
-    Object.freeze({ sql, client, realm, clock, writerEpoch: origin.writerEpoch }),
+    initialization?.inputs ??
+      Object.freeze({
+        sql,
+        client,
+        realm,
+        clock,
+        writerEpoch: origin.writerEpoch,
+      }),
   );
+  if (initialization) {
+    initialization.phase = "constructed";
+    readWorkerRequestNativeInitializationInputs(options.connection);
+  }
   return consumers;
 }

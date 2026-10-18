@@ -12,6 +12,7 @@ import { resolveIdentity } from "../src/identity-setup.ts";
 import { base64UrlEncode } from "../src/json.ts";
 import type { Sql } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { createAccountsWithQualifiedLocalIssuer } from "../src/worker-request-qualified-local-issuer.ts";
 
 // Candidate-only fixture. This does not qualify an installed Auth0103 target.
 const base = readFileSync(
@@ -876,3 +877,115 @@ for (const stage of ["before capture", "digest await", ...retainedReadPhases] as
     });
   }
 }
+
+// These are refusal tests, not synthetic native-positive qualifications.
+test("qualified local issuer rejects source-ref DTOs without issuing or reading their getters", async () => {
+  const f = await fixture();
+  let getterReads = 0;
+  const forgedOrigin = Object.defineProperties(
+    {},
+    {
+      authSchemaRef: {
+        get() {
+          getterReads++;
+          throw new Error("source getter must not run");
+        },
+      },
+      targetRef: {
+        get() {
+          getterReads++;
+          throw new Error("target getter must not run");
+        },
+      },
+      sourceRef: {
+        get() {
+          getterReads++;
+          throw new Error("source getter must not run");
+        },
+      },
+      clockPolicyRef: {
+        get() {
+          getterReads++;
+          throw new Error("clock getter must not run");
+        },
+      },
+    },
+  );
+  // Reflect deliberately supplies invalid runtime inputs without a nominal-type
+  // cast. This call must never turn row/ref DATA into an original native handle.
+  await expect(
+    Reflect.apply(createAccountsWithQualifiedLocalIssuer, undefined, [
+      {},
+      forgedOrigin,
+      { identity: f.identity },
+    ]),
+  ).rejects.toBeDefined();
+  expect(getterReads).toBe(0);
+  for (const table of [
+    "principals",
+    "auth_principal_incarnations",
+    "auth_tokens",
+    "credential_authority_classes",
+  ] as const)
+    expect(await f.count(table)).toBe(0);
+});
+
+test("qualified local issuer refuses unregistered class metadata and cloned factory inputs", async () => {
+  const f = await fixture();
+  const ordinary = candidate(f);
+  const signedIn = await ordinary.signIn(await f.input());
+  const capture = await ordinary.captureRetainedDirectOwnerSession(
+    `Bearer ${signedIn.sessionToken}`,
+  );
+  const retained = ordinary.readRetainedDirectOwnerSessionCapture(capture);
+  if (!retained) throw new Error("missing retained fixture");
+  expect(retained.record.origin.targetRef).toBe("auth103:unregistered-local-candidate");
+  const before = await f.sql.query(
+    "SELECT * FROM credential_authority_classes ORDER BY authority_ref",
+  );
+  for (const allegedOrigin of [retained.record.origin, { ...retained.record.origin }, {}]) {
+    await expect(
+      Reflect.apply(createAccountsWithQualifiedLocalIssuer, undefined, [
+        { sql: f.sql, clock: () => new Date(f.now) },
+        allegedOrigin,
+        { identity: f.identity },
+      ]),
+    ).rejects.toBeDefined();
+  }
+  expect(
+    await f.sql.query("SELECT * FROM credential_authority_classes ORDER BY authority_ref"),
+  ).toEqual(before);
+  expect(await f.count("principals")).toBe(1);
+  expect(await f.count("auth_tokens")).toBe(1);
+});
+
+test("qualified local issuer refuses unknown origins before caller Sql or options accessors", async () => {
+  const f = await fixture();
+  let getterReads = 0;
+  let calls = 0;
+  const connection = Object.defineProperty({}, "sql", {
+    get() {
+      getterReads++;
+      throw new Error("caller Sql getter must not run");
+    },
+  });
+  const options = Object.defineProperty({}, "identity", {
+    get() {
+      getterReads++;
+      throw new Error("caller verifier getter must not run");
+    },
+  });
+  for (const origin of [null, {}, { targetRef: "auth103:unregistered-local-candidate" }]) {
+    calls++;
+    await expect(
+      Reflect.apply(createAccountsWithQualifiedLocalIssuer, undefined, [
+        connection,
+        origin,
+        options,
+      ]),
+    ).rejects.toBeDefined();
+  }
+  expect(calls).toBe(3);
+  expect(getterReads).toBe(0);
+  expect(await f.count("auth_tokens")).toBe(0);
+});

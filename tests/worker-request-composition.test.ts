@@ -11,6 +11,7 @@ import {
 import { additiveAuthDDL, additiveAuthTokenDDL } from "../src/auth-authority-schema-plan.ts";
 import { createCredentialAuthorityClassStore } from "../src/credential-authority-class.ts";
 import { createWorkerEntry, type WorkerEnv } from "../src/entry-worker.ts";
+import { FinancialAuthConsumerUnavailable } from "../src/financial-auth-consumer.ts";
 import { verifyHostedBillingFinancialRealm } from "../src/hosted-billing-realm.ts";
 import { compilePricingAuthoring } from "../src/hosted-pricing.ts";
 import { resolveIdentity } from "../src/identity-setup.ts";
@@ -610,8 +611,14 @@ describe("official read-only Financial request origin", () => {
     const { inputs, runtime } = await f.consumers();
     const before = f.sessions.map((session) => session.queries.length);
     expect(Object.keys(financialRequestOrigin)).toEqual([
+      "assertFinancialAuthConsumerPort",
+      "assertWorkerRequestFinancialAuthConsumerPort",
+      "captureWorkerRequestFinancialAuthRpRequest",
       "captureWorkerRequestRetainedDirectOwnerSession",
       "captureWorkerRequestRetainedRpSession",
+      "financialAuthConsumerSourceCurrentness",
+      "readWorkerRequestFinancialAuthConsumerContext",
+      "readWorkerRequestFinancialAuthConsumerPort",
       "readWorkerRequestFinancialInputs",
       "readWorkerRequestRetainedCredentialInputs",
       "readWorkerRequestRetainedRpCapture",
@@ -1862,6 +1869,74 @@ function originalRequestAppPorts(r: Awaited<ReturnType<typeof retainedDirectRequ
 }
 
 describe("App original Worker request graph opt-in", () => {
+  test("Financial Auth port is optional DATA selection and never inferred from an original graph", async () => {
+    const r = await retainedDirectRequestFixture();
+    const ports = originalRequestAppPorts(r);
+    const original = readWorkerRequestConsumers(r.inputs.connection);
+    expect(
+      financialRequestOrigin.readWorkerRequestFinancialAuthConsumerPort(r.inputs.connection),
+    ).toBeNull();
+    const app = buildApp({
+      ...ports,
+      workerRequest: { ...ports.workerRequest },
+    });
+    const response = await app.fetch(
+      new Request(`${ports.publicOrigin}/v1/me`, { headers: { authorization: r.authorization } }),
+    );
+    expect(response.status).toBe(200);
+    expect(readWorkerRequestConsumers(r.inputs.connection)).toBe(original);
+    expect(
+      financialRequestOrigin.readWorkerRequestFinancialAuthConsumerPort(r.inputs.connection),
+    ).toBeNull();
+  });
+
+  test("matching Financial Auth DTO cannot qualify even an actual same-graph App selection", async () => {
+    const r = await retainedDirectRequestFixture();
+    const ports = originalRequestAppPorts(r);
+    let calls = 0;
+    const fake = {
+      readValidatedCredential() {
+        calls++;
+        return {};
+      },
+      readValidatedPrincipalBinding() {
+        calls++;
+        return {};
+      },
+    };
+    const before = r.f.sessions.map((session) => session.queries.length);
+    expect(() =>
+      buildApp({
+        ...ports,
+        workerRequest: { ...ports.workerRequest, financialAuth: fake as never },
+      }),
+    ).toThrow(FinancialAuthConsumerUnavailable);
+    expect(
+      financialRequestOrigin.readWorkerRequestFinancialAuthConsumerContext(
+        r.inputs.connection,
+        fake,
+      ),
+    ).toBeNull();
+    expect(calls).toBe(0);
+    expect(r.f.sessions.map((session) => session.queries.length)).toEqual(before);
+  });
+
+  test("App refuses a Financial Auth selection accessor without invoking it", async () => {
+    const r = await retainedDirectRequestFixture();
+    const ports = originalRequestAppPorts(r);
+    let calls = 0;
+    const selection = Object.defineProperty({ ...ports.workerRequest }, "financialAuth", {
+      get() {
+        calls++;
+        throw new Error("forged native source");
+      },
+    });
+    const before = r.f.sessions.map((session) => session.queries.length);
+    expect(() => buildApp({ ...ports, workerRequest: selection })).toThrow();
+    expect(calls).toBe(0);
+    expect(r.f.sessions.map((session) => session.queries.length)).toEqual(before);
+  });
+
   test("refuses accessor-backed graph selection and original fields without invoking getters", async () => {
     const r = await retainedDirectRequestFixture();
     const ports = originalRequestAppPorts(r);

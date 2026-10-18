@@ -598,6 +598,29 @@ const LAYERS: readonly Layer[] = [
       "v2-worker-wake",
     ],
   },
+  {
+    name: "domain",
+    match: /^src\/auth103-native-source-contract\.ts$/u,
+    may: ["core"],
+  },
+  {
+    name: "app",
+    match: /^src\/auth103-native-(?:origin-source|platform-origin)\.ts$/u,
+    may: ["core", "domain", "app"],
+  },
+  {
+    // The single source Clock recipe is a neutral primitive, not a qualifier.
+    name: "core",
+    match: /^src\/auth103-source-clock\.ts$/u,
+    may: ["core"],
+  },
+  {
+    // These exact request adapters compose actual original-backed ports.
+    name: "app",
+    match:
+      /^src\/(?:financial-auth-consumer|worker-request-financial-auth-original|worker-request-direct-owner-key|worker-request-qualified-local-issuer|worker-request-native-rp-transport)\.ts$/u,
+    may: ["core", "domain", "app"],
+  },
   // The published package surface re-exports the product for an embedder. It
   // states no policy of its own, so it may name anything a consumer is allowed
   // to construct — but it stays below `entry`, which owns a running process.

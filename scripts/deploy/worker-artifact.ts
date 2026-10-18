@@ -6,9 +6,15 @@ import {
   type PublicFormImplementationIdentity,
   publicFormCapabilityManifest,
 } from "../../src/public-worker-implementation.ts";
+import {
+  createAuth103NativeSourceInstallContribution,
+  prepareAuth103NativeBuildSource,
+  readAuth103NativeBuildDefine,
+  runAuth103NativeBuildCommand,
+} from "./auth103-native-source.ts";
 import { DeployError, preflightError } from "./errors.ts";
 import { assertPublicFormCapabilityTarget } from "./form-authority-capability.ts";
-import { type CommandResult, REPOSITORY, WRANGLER } from "./process.ts";
+import { type CommandResult, REPOSITORY, runCommand, WRANGLER } from "./process.ts";
 import { type SealedArtifact, sealDirectory } from "./qualification.ts";
 import { writeWorkerConfig } from "./realized-config.ts";
 import type { DeployTarget } from "./target.ts";
@@ -34,6 +40,8 @@ export interface PreparedWorkerArtifact {
   readonly bundlePath: string;
   readonly configPath: string;
   readonly bundleDigestHex: string;
+  /** Sealed SOURCE contribution only; the schema owner supplies one import. */
+  readonly auth103SourceInstallPath?: string;
   readonly formImplementationIdentity?: PublicFormImplementationIdentity;
   seal(additionalRequiredFiles?: readonly string[]): SealedArtifact;
 }
@@ -44,7 +52,7 @@ export interface PreparedWorkerArtifact {
  * build whose digest becomes semantic identity. Callers may add a 0600 secrets
  * file, then seal the outer release directory before their single upload.
  */
-export async function prepareWorkerArtifact(input: {
+export async function prepareWorkerArtifact(supplied: {
   readonly root: string;
   readonly target: DeployTarget;
   readonly commit: string;
@@ -65,6 +73,14 @@ export async function prepareWorkerArtifact(input: {
   readonly environment?: Readonly<Record<string, string>> | undefined;
   readonly run: WorkerArtifactProcess;
 }): Promise<PreparedWorkerArtifact> {
+  // Capture own DATA once. A getter cannot pass the original-run/config check
+  // and substitute another callable when the actual build starts.
+  const descriptors = Object.getOwnPropertyDescriptors(supplied);
+  for (const descriptor of Object.values(descriptors)) {
+    if (!("value" in descriptor))
+      throw preflightError("Worker artifact options require own data properties");
+  }
+  const input = Object.freeze(Object.defineProperties({}, descriptors)) as typeof supplied;
   const sourceRepositoryRoot = resolve(input.sourceRepositoryRoot ?? REPOSITORY);
   const wranglerPath = resolve(input.wranglerPath ?? WRANGLER);
   const build = join(input.root, "build");
@@ -72,13 +88,38 @@ export async function prepareWorkerArtifact(input: {
   mkdirSync(build, { recursive: true, mode: 0o700 });
   mkdirSync(release, { recursive: true, mode: 0o700 });
   const main = input.main ?? resolve(sourceRepositoryRoot, "src/entry-cloudflare-worker.ts");
+  // Only the original public native entry + owning config path can select this
+  // build origin. A custom entry/config receives no transferable manifest DTO.
+  const auth103NativeSource =
+    input.writeConfig === undefined &&
+    resolve(main) === resolve(sourceRepositoryRoot, "src/entry-cloudflare-worker.ts")
+      ? prepareAuth103NativeBuildSource({
+          sourceRoot: sourceRepositoryRoot,
+          commit: input.commit,
+          target: input.target,
+        })
+      : undefined;
+  const registered =
+    auth103NativeSource !== undefined &&
+    readAuth103NativeBuildDefine(
+      auth103NativeSource,
+      input.target,
+      input.commit,
+      sourceRepositoryRoot,
+    ) !== "null";
+  if (registered && (input.run !== runCommand || wranglerPath !== resolve(WRANGLER)))
+    throw preflightError("Auth103 source build requires the original owning process and Wrangler");
+  const execute: WorkerArtifactProcess =
+    registered && auth103NativeSource !== undefined
+      ? (command) => runAuth103NativeBuildCommand(auth103NativeSource, command, input.root)
+      : input.run;
   const formImplementationIdentity =
     input.target.formAuthority !== undefined &&
     resolve(main) === resolve(sourceRepositoryRoot, "src/entry-cloudflare-worker.ts")
       ? await preparePublicFormImplementationPayload({
           root: join(input.root, "form-implementation-payload"),
           target: input.target,
-          run: input.run,
+          run: execute,
           environment: input.environment,
           sourceRepositoryRoot,
           wranglerPath,
@@ -92,6 +133,7 @@ export async function prepareWorkerArtifact(input: {
         main: config.main,
         commit: input.commit,
         sourceRepositoryRoot,
+        ...(auth103NativeSource === undefined ? {} : { auth103NativeSource }),
         ...(input.signingKeyId === undefined ? {} : { signingKeyId: input.signingKeyId }),
         ...(config.formImplementationIdentity === undefined
           ? {}
@@ -116,7 +158,7 @@ export async function prepareWorkerArtifact(input: {
     main,
     ...(formImplementationIdentity === undefined ? {} : { formImplementationIdentity }),
   });
-  const built = await input.run(
+  const built = await execute(
     [
       wranglerPath,
       ...(input.dryRunCommand === "versions-upload" ? ["versions", "upload"] : ["deploy"]),
@@ -152,17 +194,31 @@ export async function prepareWorkerArtifact(input: {
     bundleDigestHex,
     ...(formImplementationIdentity === undefined ? {} : { formImplementationIdentity }),
   });
+  const auth103SourceInstall =
+    auth103NativeSource === undefined
+      ? null
+      : createAuth103NativeSourceInstallContribution(auth103NativeSource, bundlePath);
+  const auth103SourceInstallPath =
+    auth103SourceInstall === null ? undefined : join(release, "auth103-source-install.sql");
+  if (auth103SourceInstallPath !== undefined && auth103SourceInstall !== null)
+    writeFileSync(auth103SourceInstallPath, auth103SourceInstall, { flag: "wx", mode: 0o600 });
   let sealed = false;
   return {
     releaseDirectory: release,
     bundlePath,
     configPath,
     bundleDigestHex,
+    ...(auth103SourceInstallPath === undefined ? {} : { auth103SourceInstallPath }),
     ...(formImplementationIdentity === undefined ? {} : { formImplementationIdentity }),
     seal(additionalRequiredFiles = []) {
       if (sealed) throw preflightError("Worker artifact may be sealed only once");
       sealed = true;
-      return sealDirectory(release, ["worker.js", "wrangler.jsonc", ...additionalRequiredFiles]);
+      return sealDirectory(release, [
+        "worker.js",
+        "wrangler.jsonc",
+        ...(auth103SourceInstallPath === undefined ? [] : ["auth103-source-install.sql"]),
+        ...additionalRequiredFiles,
+      ]);
     },
   };
 }

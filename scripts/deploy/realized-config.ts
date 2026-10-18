@@ -2,6 +2,13 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { PAYMENT_SETTING_VARIABLES } from "../../src/payment-settings.ts";
 import type { PublicFormImplementationIdentity } from "../../src/public-worker-implementation.ts";
+import {
+  AUTH103_NATIVE_DEFINE,
+  AUTH103_NATIVE_PROFILE_DEFINE,
+  type Auth103NativeBuildSource,
+  readAuth103NativeBuildDefine,
+  readAuth103NativeBuildProfileDefine,
+} from "./auth103-native-source.ts";
 import { preflightError } from "./errors.ts";
 import { REPOSITORY } from "./process.ts";
 import { type DeployTarget, isArtifactBlobIoQuiescedTarget } from "./target.ts";
@@ -13,6 +20,8 @@ export interface WorkerConfigOptions {
   readonly commit: string;
   /** Checkout that owns the neutral wrangler.jsonc base. */
   readonly sourceRepositoryRoot?: string;
+  /** Original checked build handle; a JSON/ref-shaped clone is not accepted. */
+  readonly auth103NativeSource?: Auth103NativeBuildSource;
   readonly signingKeyId?: string;
   /**
    * Explicit immutable Version authority profile. JIT-enabled targets must
@@ -122,6 +131,44 @@ export function writeWorkerConfig(target: DeployTarget, options: WorkerConfigOpt
           },
         ]),
   ];
+  const nativeOriginal = options.auth103NativeSource;
+  const nativeDefine =
+    nativeOriginal === undefined
+      ? undefined
+      : Object.freeze({
+          source: readAuth103NativeBuildDefine(
+            nativeOriginal,
+            target,
+            options.commit,
+            options.sourceRepositoryRoot ?? REPOSITORY,
+          ),
+          profile: readAuth103NativeBuildProfileDefine(
+            nativeOriginal,
+            target,
+            options.commit,
+            options.sourceRepositoryRoot ?? REPOSITORY,
+          ),
+        });
+  if (
+    nativeDefine !== undefined &&
+    neutralConfig.define !== undefined &&
+    !isRecord(neutralConfig.define)
+  )
+    throw preflightError("Worker build defines must be an object");
+  const variables = deploymentVariables(target, signingKeyId, authorityProfile, {
+    ...(options.formImplementationIdentity === undefined
+      ? {}
+      : { formImplementationIdentity: options.formImplementationIdentity }),
+    ...(options.workerArtifactDigest === undefined
+      ? {}
+      : { workerArtifactDigest: options.workerArtifactDigest }),
+  });
+  if (nativeDefine !== undefined && nativeDefine.source !== "null") {
+    if (!isRecord(variables.vars)) throw preflightError("Worker variables must be an object");
+    variables.vars.TAKOSERVER_SOURCE_COMMIT = options.commit;
+    if (options.workerArtifactDigest !== undefined)
+      variables.vars.TAKOSERVER_WORKER_ARTIFACT_DIGEST = options.workerArtifactDigest;
+  }
   const realized = {
     ...neutralConfig,
     name: target.workerName,
@@ -138,27 +185,31 @@ export function writeWorkerConfig(target: DeployTarget, options: WorkerConfigOpt
     ...(options.topology === "version-only"
       ? {}
       : serviceAddress(target.publicOrigin, target.aliases ?? [])),
-    ...deploymentVariables(target, signingKeyId, authorityProfile, {
-      ...(options.formImplementationIdentity === undefined
-        ? {}
-        : { formImplementationIdentity: options.formImplementationIdentity }),
-      ...(options.workerArtifactDigest === undefined
-        ? {}
-        : { workerArtifactDigest: options.workerArtifactDigest }),
-    }),
-    ...(options.formImplementationIdentity === undefined
+    ...variables,
+    ...(options.formImplementationIdentity === undefined && nativeDefine === undefined
       ? {}
       : {
           define: {
-            TAKOSERVER_BUILD_FORM_IMPLEMENTATION_DIGEST: JSON.stringify(
-              options.formImplementationIdentity.implementationDigest,
-            ),
-            TAKOSERVER_BUILD_FORM_CAPABILITY_DIGEST: JSON.stringify(
-              options.formImplementationIdentity.capabilityDigest,
-            ),
-            TAKOSERVER_BUILD_FORM_IMPLEMENTATION_PAYLOAD_DIGEST: JSON.stringify(
-              options.formImplementationIdentity.implementationPayloadDigest,
-            ),
+            ...(nativeDefine === undefined
+              ? {}
+              : {
+                  ...(isRecord(neutralConfig.define) ? neutralConfig.define : {}),
+                  [AUTH103_NATIVE_DEFINE]: nativeDefine.source,
+                  [AUTH103_NATIVE_PROFILE_DEFINE]: nativeDefine.profile,
+                }),
+            ...(options.formImplementationIdentity === undefined
+              ? {}
+              : {
+                  TAKOSERVER_BUILD_FORM_IMPLEMENTATION_DIGEST: JSON.stringify(
+                    options.formImplementationIdentity.implementationDigest,
+                  ),
+                  TAKOSERVER_BUILD_FORM_CAPABILITY_DIGEST: JSON.stringify(
+                    options.formImplementationIdentity.capabilityDigest,
+                  ),
+                  TAKOSERVER_BUILD_FORM_IMPLEMENTATION_PAYLOAD_DIGEST: JSON.stringify(
+                    options.formImplementationIdentity.implementationPayloadDigest,
+                  ),
+                }),
           },
         }),
     ...(services.length === 0 ? {} : { services }),

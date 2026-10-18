@@ -1,4 +1,18 @@
-/** Original request/credential DATA; no request constructor or qualified authority. */
+/** Original captures and guarded installed-source Auth readers, never NEW/consent permission. */
+
+export type {
+  FinancialAuthConsumerContext,
+  FinancialAuthConsumerPort,
+  FinancialAuthRpRequestCaptures,
+} from "./financial-auth-consumer.ts";
+export {
+  assertFinancialAuthConsumerPort,
+  assertWorkerRequestFinancialAuthConsumerPort,
+  captureWorkerRequestFinancialAuthRpRequest,
+  financialAuthConsumerSourceCurrentness,
+  readWorkerRequestFinancialAuthConsumerContext,
+  readWorkerRequestFinancialAuthConsumerPort,
+} from "./financial-auth-consumer.ts";
 
 export type {
   WorkerRequestFinancialInputs,

@@ -147,6 +147,8 @@ export interface AppPorts {
   readonly workerRequest?: WorkerRequestAppInputs & {
     /** Original graph opt-in; matching objects and alternate construction inputs are refused. */
     readonly originalConsumers?: WorkerRequestConsumers;
+    /** Internal native-qualified Auth port; accepted only with its SAME original graph. */
+    readonly financialAuth?: FinancialAuthConsumerPort;
   };
   /** The exact inventory/deployment stores precomposed for native startup. */
   readonly resourceStores?: AppResourceStoreBundle;
@@ -576,6 +578,11 @@ export function buildApp(ports: AppPorts): App {
     const originalSlot = Object.getOwnPropertyDescriptor(selected, "originalConsumers");
     if (originalSlot !== undefined && !("value" in originalSlot))
       throw new TypeError("original Worker request graph must be an own data property");
+    const financialAuthSlot = Object.getOwnPropertyDescriptor(selected, "financialAuth");
+    if (financialAuthSlot !== undefined && !("value" in financialAuthSlot))
+      throw new TypeError("Worker request Financial Auth port must be an own data property");
+    if (financialAuthSlot?.value !== undefined && originalSlot?.value === undefined)
+      throw new TypeError("Financial Auth port requires its original Worker request graph");
     if (originalSlot === undefined || originalSlot.value === undefined)
       return createWorkerRequestConsumers({
         ...selected,
@@ -631,6 +638,8 @@ export function buildApp(ports: AppPorts): App {
       consoleOriginSlot.value !== SHARED_AUTH_STAGING_PROFILE.consoleOrigin
     )
       throw new TypeError("original Worker request graph differs from this App");
+    if (financialAuthSlot?.value !== undefined)
+      assertWorkerRequestFinancialAuthConsumerPort(connection, financialAuthSlot.value);
     return original;
   })();
   const apiKeyAdministration =
@@ -1422,3 +1431,8 @@ export function createStaticTestTakoformHost(
     ...(options.provision ? { provision: options.provision } : {}),
   });
 }
+
+import {
+  assertWorkerRequestFinancialAuthConsumerPort,
+  type FinancialAuthConsumerPort,
+} from "./financial-auth-consumer.ts";

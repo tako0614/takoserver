@@ -30,6 +30,126 @@ export interface SharedWorkspaceOrganization {
   readonly organizationId: string;
 }
 
+declare const verifiedPrincipalInputBrand: unique symbol;
+
+/** Opaque owning-RP observation; its shape alone cannot authenticate an issuer input. */
+export interface SharedAuthVerifiedPrincipalInput {
+  readonly [verifiedPrincipalInputBrand]: true;
+}
+
+export type SharedAuthVerifiedPrincipalData = {
+  readonly identity: Readonly<SharedAuthIdentity & { readonly accountId: string }>;
+  readonly workspace: SharedWorkspaceChoice;
+} & (
+  | { readonly phase: "fresh-callback" }
+  | {
+      readonly phase: "existing-session";
+      /** RP row observations, never the Root registration/enrollment version. */
+      readonly sessionObservation: {
+        readonly digest: string;
+        readonly createdAt: number;
+        readonly sessionWorkspaceId: string;
+        readonly principalId: string;
+        readonly readVersion: number;
+        readonly resolvedVersion: number;
+      };
+    }
+);
+
+const verifiedPrincipalInputs = new WeakMap<
+  object,
+  {
+    readonly receiver: object;
+    readonly original: () => boolean;
+    readonly data: SharedAuthVerifiedPrincipalData;
+  }
+>();
+
+/** Only the actual RP receiver can read its capture. No caller property is inspected. */
+export function readSharedAuthVerifiedPrincipalInput(
+  originalRpReceiver: unknown,
+  capture: unknown,
+): SharedAuthVerifiedPrincipalData | null {
+  if (!capture || typeof capture !== "object") return null;
+  const held = verifiedPrincipalInputs.get(capture);
+  if (!held || held.receiver !== originalRpReceiver || !held.original()) return null;
+  return held.data;
+}
+
+/** Descriptor comparison does not invoke substituted accessors, including on the owner. */
+function principalInputDescriptorSeal(source: object, allowReceiverFreeze = false): () => boolean {
+  try {
+    const prototype = Object.getPrototypeOf(source);
+    const descriptors = Reflect.ownKeys(source).map(
+      (key) => [key, Object.getOwnPropertyDescriptor(source, key)] as const,
+    );
+    return () => {
+      try {
+        const frozenReceiver = allowReceiverFreeze && Object.isFrozen(source);
+        return (
+          Object.getPrototypeOf(source) === prototype &&
+          Reflect.ownKeys(source).length === descriptors.length &&
+          descriptors.every(([key, before]) => {
+            const after = Object.getOwnPropertyDescriptor(source, key);
+            return (
+              !!before &&
+              !!after &&
+              "value" in before &&
+              "value" in after &&
+              before.value === after.value &&
+              (before.writable === after.writable ||
+                (frozenReceiver && before.writable === true && after.writable === false)) &&
+              before.enumerable === after.enumerable &&
+              (before.configurable === after.configurable ||
+                (frozenReceiver && before.configurable === true && after.configurable === false))
+            );
+          })
+        );
+      } catch {
+        return false;
+      }
+    };
+  } catch {
+    return () => false;
+  }
+}
+
+/** Inherited/dynamic store methods remain ordinary-only, never original-input evidence. */
+function principalInputStoreSeal(
+  store: SharedAuthSessionStore | SharedAuthFinalSessionStore,
+): () => boolean {
+  try {
+    const names: readonly (keyof SharedAuthSessionStore)[] = [
+      "putAttempt",
+      "consumeAttempt",
+      "createSession",
+      "readSession",
+      "claimSession",
+      "completeSession",
+      "touchSessionAndSelect",
+      "touchSession",
+      "revokeSession",
+      "queueRevocation",
+      "listPendingRevocations",
+      "claimRevocation",
+      "completeRevocation",
+      "retryRevocation",
+      "cleanupExpiredAttempts",
+      "cleanupRevokedSessions",
+    ];
+    if (
+      !names.every((name) => {
+        const descriptor = Object.getOwnPropertyDescriptor(store, name);
+        return descriptor && "value" in descriptor && typeof descriptor.value === "function";
+      })
+    )
+      return () => false;
+    return principalInputDescriptorSeal(store);
+  } catch {
+    return () => false;
+  }
+}
+
 /**
  * The owning Takoserver composition supplies its reviewed local projection.
  * It preserves proved legacy principal references, never resolves by email,
@@ -42,6 +162,8 @@ export interface SharedAuthPrincipalProjection {
       readonly accountId: string;
       readonly workspaceId: string;
     },
+    /** Fresh callback may request enrollment; existing-session is retained-read only. */
+    original: SharedAuthVerifiedPrincipalInput,
   ): Promise<{ readonly accountId: string; readonly principalId: string }>;
 }
 
@@ -142,6 +264,22 @@ export function createSharedAuthSession(options: {
   if (organizationReceiver !== undefined && typeof pinOrganization !== "function")
     throw new TypeError("Shared RP requires its qualified Organization pin method");
   const selections = new WeakMap<SharedAuthSessionContext, SharedAuthFinalSessionSelection>();
+  const principalInputOwnerSeals = [principalInputDescriptorSeal(options)];
+  for (const name of ["config", "principals", "organizations", "encryptionKey"] as const) {
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(options, name);
+      if (
+        descriptor &&
+        "value" in descriptor &&
+        descriptor.value &&
+        typeof descriptor.value === "object"
+      )
+        principalInputOwnerSeals.push(principalInputDescriptorSeal(descriptor.value));
+    } catch {
+      principalInputOwnerSeals.push(() => false);
+    }
+  }
+  let principalInputReceiverSeal = () => false;
 
   function createStore(): SharedAuthSessionStore {
     return Reflect.apply(storeFactory, storeReceiver, []);
@@ -358,7 +496,56 @@ export function createSharedAuthSession(options: {
       throw new SharedAuthSessionError("session_invalid");
     return selected;
   }
-  async function principal(value: SharedAuthGrant, workspaceId: string): Promise<string> {
+  async function principal(
+    value: SharedAuthGrant,
+    workspace: SharedWorkspaceChoice,
+    store: SharedAuthSessionStore | SharedAuthFinalSessionStore,
+    phase:
+      | { readonly phase: "fresh-callback" }
+      | {
+          readonly phase: "existing-session";
+          readonly sessionObservation: {
+            readonly digest: string;
+            readonly createdAt: number;
+            readonly sessionWorkspaceId: string;
+            readonly principalId: string;
+            readonly readVersion: number;
+            readonly resolvedVersion: number;
+          };
+        },
+  ): Promise<string> {
+    const identity = Object.freeze({
+      issuer: value.issuer,
+      clientId: value.clientId,
+      subject: value.subject,
+      sessionId: value.sessionId,
+      authTime: value.authTime,
+      accountId: value.subject,
+    });
+    const selectedWorkspace = Object.freeze({
+      ...workspace,
+      roles: Object.freeze([...workspace.roles]),
+    });
+    const data: SharedAuthVerifiedPrincipalData = Object.freeze({
+      identity,
+      workspace: selectedWorkspace,
+      ...(phase.phase === "fresh-callback"
+        ? phase
+        : {
+            phase: phase.phase,
+            sessionObservation: Object.freeze({ ...phase.sessionObservation }),
+          }),
+    });
+    const storeSeal = principalInputStoreSeal(store);
+    const capture = Object.freeze({}) as SharedAuthVerifiedPrincipalInput;
+    verifiedPrincipalInputs.set(capture, {
+      receiver,
+      data,
+      original: () =>
+        principalInputOwnerSeals.every((seal) => seal()) &&
+        principalInputReceiverSeal() &&
+        storeSeal(),
+    });
     const resolved = await Reflect.apply(resolvePrincipal, principalReceiver, [
       {
         issuer: value.issuer,
@@ -367,8 +554,9 @@ export function createSharedAuthSession(options: {
         sessionId: value.sessionId,
         authTime: value.authTime,
         accountId: value.subject,
-        workspaceId,
+        workspaceId: workspace.id,
       },
+      capture,
     ]);
     if (
       !resolved ||
@@ -458,6 +646,13 @@ export function createSharedAuthSession(options: {
     }
     if (row.status === "checking") throw new SharedAuthSessionError("session_unavailable");
     if (!activeAt(row, digest, stamp)) throw new SharedAuthSessionError("session_unavailable");
+    const originalSessionObservation = Object.freeze({
+      digest: row.digest,
+      createdAt: row.createdAt,
+      sessionWorkspaceId: row.workspaceId,
+      principalId: row.principalId,
+      readVersion: row.version,
+    });
     let value: SharedAuthGrant;
     try {
       value = await grant(digest, row.payload);
@@ -505,7 +700,15 @@ export function createSharedAuthSession(options: {
       if ((await client.canonicalAccount(value)).accountId !== row.accountId)
         throw new SharedAuthSessionError("session_invalid");
       const workspace = await currentWorkspace(value, requestedWorkspaceId ?? row.workspaceId);
-      if ((await principal(value, workspace.id)) !== row.principalId)
+      if (
+        (await principal(value, workspace, store, {
+          phase: "existing-session",
+          sessionObservation: {
+            ...originalSessionObservation,
+            resolvedVersion: row.version,
+          },
+        })) !== row.principalId
+      )
         throw new SharedAuthSessionError("session_invalid");
       let selected = row;
       let observedAt = now();
@@ -695,7 +898,7 @@ export function createSharedAuthSession(options: {
     return result;
   }
 
-  return {
+  const receiver = {
     /** In-process only: plain records, clones and other factory instances have no provenance. */
     finalSessionSelection(context: unknown): SharedAuthFinalSessionSelection | null {
       return record(context)
@@ -828,7 +1031,9 @@ export function createSharedAuthSession(options: {
             const selected = await currentWorkspace(value, workspace.id);
             if (selected.type !== "personal" || !selected.owner)
               throw new SharedAuthSessionError("workspace_forbidden");
-            const principalId = await principal(value, selected.id);
+            const principalId = await principal(value, selected, store, {
+              phase: "fresh-callback",
+            });
             const oldSecret = cookie(request, sessionCookie);
             if (oldSecret) await store.revokeSession(await hash(oldSecret), now());
             const stamp = now();
@@ -906,6 +1111,8 @@ export function createSharedAuthSession(options: {
       }
     },
   };
+  principalInputReceiverSeal = principalInputDescriptorSeal(receiver, true);
+  return receiver;
 }
 
 export type SharedAuthSession = ReturnType<typeof createSharedAuthSession>;
