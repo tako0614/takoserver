@@ -1348,6 +1348,234 @@ function applyPost94SchemaModel(database: Database, nextWriterEpoch: string) {
   database.query("INSERT INTO money_cutover_authorized_epoch VALUES (1,?)").run(nextWriterEpoch);
 }
 
+describe("bounded fresh money table count reads", () => {
+  test("grouped counts match every original COUNT and retain all typed bytes and FK reads", async () => {
+    const database = new Database(":memory:");
+    try {
+      const tables = Array.from(
+        { length: 130 },
+        (_, index) => `count_${String(index).padStart(3, "0")}`,
+      );
+      const rowCounts: Record<string, number> = {};
+      let originalCountReads = 0;
+      for (const [index, table] of tables.entries()) {
+        database.exec(`CREATE TABLE ${table} (id INTEGER PRIMARY KEY, value)`);
+        if (index % 7 !== 0)
+          database.exec(
+            `INSERT INTO ${table} VALUES (1, NULL), (2, X'0041'), (3, 9007199254740993), (4, 'A' || char(0) || 'B'), (5, 1.0000000000000002)`,
+          );
+        rowCounts[table] = (
+          database.query(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }
+        ).n;
+        originalCountReads++;
+      }
+      const allDataDigest = await readWholeDatabaseDataDigest(
+        reader(database),
+        "preflight",
+        tables,
+      );
+      const beforeChanges = database.query("SELECT total_changes() AS n").get();
+      const calls: { description: string; sql: string }[] = [];
+      const countRows: Record<string, unknown>[] = [];
+      await assertMoneyLiveBackupCompleteness(
+        {
+          async query(_phase, description, query) {
+            calls.push({ description, sql: query });
+            const rows = database.query(query).all() as Record<string, unknown>[];
+            if (description === "native complete table row counts") countRows.push(...rows);
+            return rows;
+          },
+        },
+        "preflight",
+        { rowCounts, allDataDigest },
+      );
+      const grouped = calls.filter(
+        (call) => call.description === "native complete table row counts",
+      );
+      expect(originalCountReads).toBe(130);
+      expect(grouped).toHaveLength(2);
+      expect(countRows).toEqual(
+        tables.map((table) => ({ table_name: table, n: rowCounts[table] })),
+      );
+      expect(calls.filter((call) => call.description.endsWith(" columns"))).toHaveLength(130);
+      expect(calls.filter((call) => call.description.endsWith(" data"))).toHaveLength(130);
+      expect(
+        calls.filter((call) => call.description === "native foreign-key integrity"),
+      ).toHaveLength(1);
+      expect(calls).toHaveLength(264);
+      expect(await readWholeDatabaseDataDigest(reader(database), "preflight", tables)).toBe(
+        allDataDigest,
+      );
+      expect(database.query("SELECT total_changes() AS n").get()).toEqual(beforeChanges);
+      for (const call of grouped) {
+        expect(new TextEncoder().encode(call.sql).byteLength).toBeLessThanOrEqual(90_000);
+        expect((call.sql.match(/COUNT\(\*\)/gu) ?? []).length).toBeLessThanOrEqual(128);
+        expect(call.sql.includes("?")).toBe(false);
+        let depth = 0;
+        let maximumDepth = 0;
+        for (const character of call.sql) {
+          if (character === "(") maximumDepth = Math.max(maximumDepth, ++depth);
+          if (character === ")") depth--;
+        }
+        expect(depth).toBe(0);
+        expect(maximumDepth).toBeLessThanOrEqual(20);
+      }
+    } finally {
+      database.close();
+    }
+  });
+
+  test("missing duplicate reordered extra and noninteger count rows refuse before typed data", async () => {
+    const database = new Database(":memory:");
+    try {
+      database.exec(
+        "CREATE TABLE count_a (value); CREATE TABLE count_b (value); INSERT INTO count_a VALUES (1)",
+      );
+      const rowCounts = { count_a: 1, count_b: 0 };
+      const allDataDigest = await readWholeDatabaseDataDigest(
+        reader(database),
+        "preflight",
+        Object.keys(rowCounts),
+      );
+      const invalid: readonly ((rows: Record<string, unknown>[]) => Record<string, unknown>[])[] = [
+        (rows) => rows.slice(1),
+        (rows) => [rows[0] ?? {}, rows[0] ?? {}],
+        (rows) => [...rows].reverse(),
+        (rows) => rows.map((row) => ({ ...row, extra: 0 })),
+        (rows) => rows.map((row) => ({ ...row, n: "0" })),
+        (rows) => rows.map((row) => ({ ...row, n: -1 })),
+        (rows) => rows.map((row) => ({ ...row, n: Number.MAX_SAFE_INTEGER + 1 })),
+        (rows) => rows.map((row) => ({ table_name: row.table_name })),
+      ];
+      for (const replace of invalid) {
+        let countReads = 0;
+        let typedReads = 0;
+        await expect(
+          assertMoneyLiveBackupCompleteness(
+            {
+              async query(_phase, description, query) {
+                const rows = database.query(query).all() as Record<string, unknown>[];
+                if (description === "native complete table row counts") {
+                  countReads++;
+                  return replace(rows);
+                }
+                if (description.startsWith("backup ")) typedReads++;
+                return rows;
+              },
+            },
+            "preflight",
+            { rowCounts, allDataDigest },
+          ),
+        ).rejects.toThrow("money live table count");
+        expect(countReads).toBe(1);
+        expect(typedReads).toBe(0);
+      }
+    } finally {
+      database.close();
+    }
+  });
+
+  test("long valid identifiers split by SQL bytes without losing any fresh count or typed row", async () => {
+    const database = new Database(":memory:");
+    try {
+      const tables = Array.from(
+        { length: 32 },
+        (_, index) => `long_${String(index).padStart(3, "0")}_${"x".repeat(3000)}`,
+      );
+      const rowCounts: Record<string, number> = {};
+      for (const table of tables) {
+        database.exec(`CREATE TABLE ${table} (value)`);
+        rowCounts[table] = 0;
+      }
+      const allDataDigest = await readWholeDatabaseDataDigest(
+        reader(database),
+        "preflight",
+        tables,
+      );
+      const countSql: string[] = [];
+      let typedReads = 0;
+      await assertMoneyLiveBackupCompleteness(
+        {
+          async query(_phase, description, query) {
+            if (description === "native complete table row counts") countSql.push(query);
+            if (description.startsWith("backup ")) typedReads++;
+            return database.query(query).all() as Record<string, unknown>[];
+          },
+        },
+        "preflight",
+        { rowCounts, allDataDigest },
+      );
+      expect(countSql.length).toBeGreaterThan(1);
+      expect(
+        countSql.reduce((count, query) => count + (query.match(/COUNT\(\*\)/gu) ?? []).length, 0),
+      ).toBe(32);
+      expect(countSql.every((query) => new TextEncoder().encode(query).byteLength <= 90_000)).toBe(
+        true,
+      );
+      expect(countSql.every((query) => !query.includes("?"))).toBe(true);
+      expect(typedReads).toBe(64);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("a zero count never skips typed bytes and late row drift still refuses", async () => {
+    const database = new Database(":memory:");
+    try {
+      database.exec("CREATE TABLE count_empty (value)");
+      const allDataDigest = await readWholeDatabaseDataDigest(reader(database), "preflight", [
+        "count_empty",
+      ]);
+      let typedReads = 0;
+      let countReads = 0;
+      await expect(
+        assertMoneyLiveBackupCompleteness(
+          {
+            async query(_phase, description, query) {
+              const rows = database.query(query).all() as Record<string, unknown>[];
+              if (description === "native complete table row counts") {
+                countReads++;
+                database.exec("INSERT INTO count_empty VALUES ('late')");
+              }
+              if (description.startsWith("backup ")) typedReads++;
+              return rows;
+            },
+          },
+          "preflight",
+          { rowCounts: { count_empty: 0 }, allDataDigest },
+        ),
+      ).rejects.toThrow("complete typed row bytes differ");
+      expect(countReads).toBe(1);
+      expect(typedReads).toBe(2);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("grouped complete counts still reach actual foreign-key refusal", async () => {
+    const database = new Database(":memory:");
+    try {
+      database.exec(
+        "PRAGMA foreign_keys = OFF; CREATE TABLE count_parent (id INTEGER PRIMARY KEY); CREATE TABLE count_child (parent_id INTEGER REFERENCES count_parent(id)); INSERT INTO count_child VALUES (9)",
+      );
+      const rowCounts = { count_child: 1, count_parent: 0 };
+      const allDataDigest = await readWholeDatabaseDataDigest(
+        reader(database),
+        "preflight",
+        Object.keys(rowCounts),
+      );
+      await expect(
+        assertMoneyLiveBackupCompleteness(reader(database), "verification", {
+          rowCounts,
+          allDataDigest,
+        }),
+      ).rejects.toThrow("foreign-key violation");
+    } finally {
+      database.close();
+    }
+  });
+});
+
 describe("held post94 continuation component", () => {
   test("post94 shares actual convert history without a normal Worker proof and remains blocked", async () => {
     const f = await post94ReadFixture();

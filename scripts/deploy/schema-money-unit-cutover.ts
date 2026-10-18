@@ -2830,20 +2830,52 @@ export async function assertMoneyLiveBackupCompleteness(
   if (JSON.stringify(liveRows.map((row) => row.name)) !== JSON.stringify(tables)) {
     throw proofError(phase, "money backup and live D1 table inventory differ");
   }
+  // Keep every typed row/FK/currentness proof below. Only group the COUNT
+  // statements into bounded fresh SELECTs; never infer bytes from a zero count.
+  const countReads: { readonly tables: readonly string[]; readonly sql: string }[] = [];
+  const countSql = (selected: readonly string[]) =>
+    `SELECT table_name, n FROM (${moneyProofUnionSql(
+      selected.map(
+        (table) => `SELECT ${sqlLiteral(table)} AS table_name, COUNT(*) AS n FROM ${table}`,
+      ),
+    )}) ORDER BY table_name`;
+  let selected: string[] = [];
   for (const table of tables) {
     if (!/^[a-z_][a-z_0-9]*$/u.test(table))
       throw proofError(phase, "money live table name is malformed");
-    const count = exactNumber(
-      await database.query(
-        phase,
-        `native ${table} row count`,
-        `SELECT COUNT(*) AS n FROM ${table}`,
-      ),
-      "n",
-      phase,
-    );
-    if (count !== backup.rowCounts[table])
-      throw proofError(phase, `money backup and live D1 ${table} row counts differ`);
+    const next = [...selected, table];
+    const query = countSql(next);
+    // Zero bind parameters. At most 128 leaves of the existing balanced
+    // two-term UNION and 90,000 UTF8 bytes, below the native SQL-size budget.
+    if (selected.length !== 0 && (next.length > 128 || Buffer.byteLength(query, "utf8") > 90_000)) {
+      countReads.push({ tables: selected, sql: countSql(selected) });
+      selected = [table];
+      if (Buffer.byteLength(countSql(selected), "utf8") > 90_000)
+        throw proofError(phase, "money live table count exceeds the bounded SQL size");
+    } else {
+      if (Buffer.byteLength(query, "utf8") > 90_000)
+        throw proofError(phase, "money live table count exceeds the bounded SQL size");
+      selected = next;
+    }
+  }
+  if (selected.length !== 0) countReads.push({ tables: selected, sql: countSql(selected) });
+  for (const read of countReads) {
+    const rows = await database.query(phase, "native complete table row counts", read.sql);
+    if (rows.length !== read.tables.length)
+      throw proofError(phase, "money live table counts are incomplete or duplicated");
+    for (const [index, table] of read.tables.entries()) {
+      const row = rows[index];
+      if (
+        !record(row) ||
+        Object.keys(row).sort().join(",") !== "n,table_name" ||
+        row.table_name !== table ||
+        !Number.isSafeInteger(row.n) ||
+        (row.n as number) < 0
+      )
+        throw proofError(phase, "money live table counts are malformed or out of order");
+      if (row.n !== backup.rowCounts[table])
+        throw proofError(phase, `money backup and live D1 ${table} row counts differ`);
+    }
   }
   if ((await readWholeDatabaseDataDigest(database, phase, tables)) !== backup.allDataDigest) {
     throw proofError(phase, "money backup and live D1 complete typed row bytes differ");
