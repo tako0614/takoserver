@@ -281,6 +281,10 @@ export type FinancialR1JoinedRead =
   | {
       readonly status: "found";
       readonly original: FinancialR1Original;
+      /** Exact stored Financial command, distinct from a Hosted claim/operation key. */
+      readonly fullCommand: FinancialR1WriteCommand;
+      /** Original canonical bytes as UTF-8 text; never rebuilt from challenge10. */
+      readonly fullCommandJson: string;
       readonly actionIdentity: SharedFinancialActionIdentity;
       readonly r1ReceiptRef: string;
       readonly c0ReceiptRef: string;
@@ -1146,6 +1150,8 @@ export function createFinancialRetainedR1Store(
       let command: FinancialR1WriteCommand;
       try {
         command = JSON.parse(raw) as FinancialR1WriteCommand;
+        // This is stored custody, not input repair: refuse noncanonical bytes.
+        if (json(command) !== raw) fail("unavailable");
       } catch (error) {
         return fail("unavailable", error);
       }
@@ -1160,6 +1166,7 @@ export function createFinancialRetainedR1Store(
       if (r1.status !== "found") fail("unavailable");
       const o = r1.original;
       if (
+        !same(command.original, o) ||
         o.challengeRef !== key ||
         !same(o.c0.challenge, c0Image.challenge) ||
         !same(o.c0.selection, c0Image.selection) ||
@@ -1173,6 +1180,8 @@ export function createFinancialRetainedR1Store(
       return freeze({
         status: "found",
         original: o,
+        fullCommand: command,
+        fullCommandJson: raw,
         actionIdentity: c0Image.actionIdentity,
         r1ReceiptRef: r1.receipt.r1ReceiptRef,
         c0ReceiptRef: c0Image.receiptRef,
