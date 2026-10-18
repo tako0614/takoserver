@@ -1,0 +1,13 @@
+# R1 first-attempt custody
+
+The retained R1 module owns an unnumbered, unregistered append-only attempt leaf. It stores the original business key `(kind, organizationId, reference)`, four role refs, full canonical command and its byte digest, scope, writer epoch and recorded time. `FINANCIAL_R1_ATTEMPT_DDL` does not register or apply a migration.
+
+`buildFinancialR1AttemptCustodyStatement` returns a fixed claim with thirteen returned columns. Existing business/role claims or C0/R1 history suppress a new claim. The row cannot be replaced, updated or deleted. `buildFinancialR1ClaimedCoPreparationBatch` embeds exact original-claim equality in the Financial registration/R1 original/mandatory-receipt predicates. Its terminal mandatory CHECK rolls back all five statements if that claim is missing or crossed. The C0 pair is unchanged.
+
+Both builders return SQL DATA; neither executes a write nor authorizes NEW, payer admission or first dispatch. An actual issuer must select the original once from its genuine request/source, obtain its own first claim changes1 plus exact thirteen-column postimage and original read, then proceed only in that same acknowledged invocation with its allNEW and same-primary currentness guards. The public qualified prepare/current-consent methods remain unavailable; the older unclaimed DATA compiler is not an authorized issuer.
+
+`createFinancialR1AttemptDataReader(options)` has query-only original-full-command and stable-business-key historical reads. A committed claim survives later preparation rollback and can be read after reopening storage. Pending, not-found or unknown is never permission to retry, select current terms, change key/family or resume. An initial unknown claim plus no observed row remains unknown: a claim that never committed provides no durable negative fence. Authoritative original custody and ordered terminal/read evidence remain the actual issuer/transport responsibility.
+
+Root Auth/RP registration and Financial action/C0 registration are distinct namespaces. A historical record, matching DTO, fresh facade or in-memory latch cannot replace genuine credential and separate human binding, source currentness, qualified Clock or final allNEW acceptance/firstdispatch CAS. No payment/consent/challenge/proof wire changes.
+
+Local tests use actual Money S for claim writes and inject response loss after a real local commit, then close/reopen the SQLite file in the same process. Full-five fixtures retain the existing isolated raw-R permit frame: the current C0 compiler directly references reserved Money tables that public S rejects. These fixtures are neither native D1 nor a mounted authorized pipeline. Schema activation is separate.

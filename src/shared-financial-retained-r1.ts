@@ -29,6 +29,96 @@ import {
 } from "./shared-financial-source-enrollment.ts";
 import type { StripeBillingClient } from "./stripe-billing-client.ts";
 
+/** Financial-owned, unnumbered/unregistered R1 custody leaf. No issuer or NEW authority. */
+export const FINANCIAL_R1_ATTEMPT_OBJECTS = Object.freeze([
+  Object.freeze({
+    name: "financial_r1_preparation_attempts",
+    type: "table",
+    sql: `CREATE TABLE financial_r1_preparation_attempts (
+ r1_ref TEXT PRIMARY KEY NOT NULL,
+ challenge_ref TEXT NOT NULL UNIQUE,
+ preparation_ref TEXT NOT NULL UNIQUE,
+ receipt_ref TEXT NOT NULL UNIQUE,
+ action_kind TEXT NOT NULL CHECK(action_kind IN ('topup','subscription-start','card-setup','plan-change','cancel')),
+ organization_id TEXT NOT NULL,
+ action_reference TEXT NOT NULL,
+ request_fingerprint TEXT NOT NULL,
+ command_json TEXT NOT NULL CHECK(json_valid(command_json)),
+ command_digest TEXT NOT NULL,
+ scope_json TEXT NOT NULL CHECK(json_valid(scope_json)),
+ writer_epoch TEXT NOT NULL,
+ recorded_at TEXT NOT NULL,
+ UNIQUE(action_kind,organization_id,action_reference),
+ CHECK(length(CAST(command_json AS BLOB)) BETWEEN 2 AND 98304),
+ CHECK(r1_ref<>challenge_ref AND r1_ref<>preparation_ref AND r1_ref<>receipt_ref
+   AND challenge_ref<>preparation_ref AND challenge_ref<>receipt_ref AND preparation_ref<>receipt_ref)
+)`,
+  }),
+  Object.freeze({
+    name: "financial_r1_preparation_attempts_shape",
+    type: "trigger",
+    sql: `CREATE TRIGGER financial_r1_preparation_attempts_shape BEFORE INSERT ON financial_r1_preparation_attempts
+WHEN NOT (json_type(NEW.command_json) IS 'object'
+ AND json_extract(NEW.command_json,'$.key.r1Ref') IS NEW.r1_ref
+ AND json_extract(NEW.command_json,'$.key.challengeRef') IS NEW.challenge_ref
+ AND json_extract(NEW.command_json,'$.key.preparationRef') IS NEW.preparation_ref
+ AND json_extract(NEW.command_json,'$.r1ReceiptRef') IS NEW.receipt_ref
+ AND json_extract(NEW.command_json,'$.original.r1Ref') IS NEW.r1_ref
+ AND json_extract(NEW.command_json,'$.original.challengeRef') IS NEW.challenge_ref
+ AND json_extract(NEW.command_json,'$.original.preparationRef') IS NEW.preparation_ref
+ AND json_extract(NEW.command_json,'$.original.c0.selection.action.body.kind') IS NEW.action_kind
+ AND json_extract(NEW.command_json,'$.original.c0.selection.action.body.organizationId') IS NEW.organization_id
+ AND json_extract(NEW.command_json,'$.original.c0.selection.action.body.reference') IS NEW.action_reference
+ AND json_extract(NEW.command_json,'$.original.c0.challenge.requestFingerprint') IS NEW.request_fingerprint
+ AND json_extract(NEW.command_json,'$.original.scopeRealm') IS NEW.scope_json
+ AND json_extract(NEW.scope_json,'$.writerEpoch') IS NEW.writer_epoch) BEGIN
+ SELECT RAISE(ABORT,'constraint: closed R1 attempt');
+END`,
+  }),
+  Object.freeze({
+    name: "financial_r1_preparation_attempts_no_replace",
+    type: "trigger",
+    sql: `CREATE TRIGGER financial_r1_preparation_attempts_no_replace BEFORE INSERT ON financial_r1_preparation_attempts
+WHEN EXISTS(SELECT 1 FROM financial_r1_preparation_attempts WHERE
+ (action_kind IS NEW.action_kind AND organization_id IS NEW.organization_id AND action_reference IS NEW.action_reference)
+ OR r1_ref IN (NEW.r1_ref,NEW.challenge_ref,NEW.preparation_ref,NEW.receipt_ref)
+ OR challenge_ref IN (NEW.r1_ref,NEW.challenge_ref,NEW.preparation_ref,NEW.receipt_ref)
+ OR preparation_ref IN (NEW.r1_ref,NEW.challenge_ref,NEW.preparation_ref,NEW.receipt_ref)
+ OR receipt_ref IN (NEW.r1_ref,NEW.challenge_ref,NEW.preparation_ref,NEW.receipt_ref)) BEGIN
+ SELECT RAISE(ABORT,'constraint: immutable R1 attempt replacement');
+END`,
+  }),
+  Object.freeze({
+    name: "financial_r1_preparation_attempts_no_update",
+    type: "trigger",
+    sql: `CREATE TRIGGER financial_r1_preparation_attempts_no_update BEFORE UPDATE ON financial_r1_preparation_attempts BEGIN
+ SELECT RAISE(ABORT,'constraint: immutable R1 attempt');
+END`,
+  }),
+  Object.freeze({
+    name: "financial_r1_preparation_attempts_no_delete",
+    type: "trigger",
+    sql: `CREATE TRIGGER financial_r1_preparation_attempts_no_delete BEFORE DELETE ON financial_r1_preparation_attempts BEGIN
+ SELECT RAISE(ABORT,'constraint: immutable R1 attempt');
+END`,
+  }),
+  Object.freeze({
+    name: "financial_r1_preparation_attempts_money_fence",
+    type: "trigger",
+    sql: `CREATE TRIGGER financial_r1_preparation_attempts_money_fence BEFORE INSERT ON financial_r1_preparation_attempts
+WHEN EXISTS(SELECT 1 FROM money_cutover_freeze)
+ OR NOT EXISTS(SELECT 1 FROM money_cutover_writer_permit p
+ JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch
+ WHERE p.singleton=1 AND p.epoch='usd-micros-v2' AND p.writer_epoch IS NEW.writer_epoch) BEGIN
+ SELECT RAISE(ABORT,'constraint: Financial R1 attempt permit/epoch required');
+END`,
+  }),
+]);
+
+export const FINANCIAL_R1_ATTEMPT_DDL = FINANCIAL_R1_ATTEMPT_OBJECTS.map(
+  (object) => `${object.sql};`,
+).join("\n");
+
 /** Unmounted, mechanical data custody only. No exported producer, issuer, caller or admission authority. */
 const VERSION = "takoserver-financial-retained-r1-v1";
 const TERMS_RECIPE = "financial-terms-utf8-sha256-v1";
@@ -1050,36 +1140,342 @@ export async function buildFinancialR1CoPreparationBatch(
   const c = capture(options),
     at = iso(observedAt);
   try {
-    const p = await parseCaptured(command, c),
-      s = p.command.original.actionSource;
-    // Obtain both statements and their exact preimage from the actual C0 compiler.
-    // Neither a caller SQL array nor values reconstructed from SQL params are accepted.
-    const c0 = createFinancialPreproofChallengeStore(c.c0Options).buildPreparationContribution(
-      p.command.original.c0,
-      at,
-    );
-    const r1 = compileMechanicalBatch(c, p, c0.preparedImage);
-    return Object.freeze([
-      Object.freeze({
-        sql: `INSERT INTO financial_action_source_registrations(registration_ref,incarnation,registration_digest,digest_recipe,registration_json,created_at)
-          SELECT ?,?,?,?,?,? WHERE ${c.current}`,
-        params: Object.freeze([
-          s.registrationRef,
-          s.incarnation,
-          s.registrationDigest,
-          REG_RECIPE,
-          p.registrationJson,
-          at,
-          ...c.currentParams,
-        ]),
-      }),
-      ...c0.statements,
-      ...r1,
-    ]);
+    const p = await parseCaptured(command, c);
+    return coPreparationBatchData(c, p, at);
   } catch (error) {
     if (error instanceof FinancialRetainedR1Error) throw error;
     return fail("unavailable", error);
   }
+}
+
+function coPreparationBatchData(c: Captured, p: Parsed, at: string): readonly SqlStatement[] {
+  const s = p.command.original.actionSource;
+  // Obtain both statements and their exact preimage from the actual C0 compiler.
+  // Neither a caller SQL array nor values reconstructed from SQL params are accepted.
+  const c0 = createFinancialPreproofChallengeStore(c.c0Options).buildPreparationContribution(
+    p.command.original.c0,
+    at,
+  );
+  const r1 = compileMechanicalBatch(c, p, c0.preparedImage);
+  return Object.freeze([
+    Object.freeze({
+      sql: `INSERT INTO financial_action_source_registrations(registration_ref,incarnation,registration_digest,digest_recipe,registration_json,created_at)
+          SELECT ?,?,?,?,?,? WHERE ${c.current}`,
+      params: Object.freeze([
+        s.registrationRef,
+        s.incarnation,
+        s.registrationDigest,
+        REG_RECIPE,
+        p.registrationJson,
+        at,
+        ...c.currentParams,
+      ]),
+    }),
+    ...c0.statements,
+    ...r1,
+  ]);
+}
+
+const ATTEMPT_TABLE = "financial_r1_preparation_attempts";
+const ATTEMPT_COLUMNS = [
+  "r1_ref",
+  "challenge_ref",
+  "preparation_ref",
+  "receipt_ref",
+  "action_kind",
+  "organization_id",
+  "action_reference",
+  "request_fingerprint",
+  "command_json",
+  "command_digest",
+  "scope_json",
+  "writer_epoch",
+  "recorded_at",
+] as const;
+
+async function attemptImage(p: Parsed, at: string): Promise<readonly SqlParam[]> {
+  const a = p.actionIdentity.action;
+  return Object.freeze([
+    ...keyParams(p.command),
+    a.kind,
+    a.organizationId,
+    a.reference,
+    p.actionIdentity.requestFingerprint,
+    p.commandJson,
+    await bytesDigest(new TextEncoder().encode(p.commandJson)),
+    json(p.command.original.scopeRealm),
+    p.command.original.scopeRealm.writerEpoch,
+    at,
+  ]);
+}
+
+function attemptMatch(alias: string): string {
+  return ATTEMPT_COLUMNS.map((column) => `${alias}.${column} IS ?`).join(" AND ");
+}
+
+/** Compile one immutable first-attempt row. DATA only: this neither executes the
+ * claim nor proves current payer/source authority. The owning issuer is still absent.
+ * Exact replay returns zero; it is not a second fresh claim or continuation grant. */
+export async function buildFinancialR1AttemptCustodyStatement(
+  options: FinancialEnrollmentComponentOptions & { readonly scope: FinancialPreproofScope },
+  command: FinancialR1WriteCommand,
+  observedAt: string,
+): Promise<SqlStatement> {
+  const c = capture(options),
+    at = iso(observedAt);
+  const p = await parseCaptured(command, c),
+    image = await attemptImage(p, at);
+  const a = p.actionIdentity.action,
+    business = [a.kind, a.organizationId, a.reference];
+  // C0 has its own role namespace; do not invent cross-family role collisions.
+  return Object.freeze({
+    sql: `INSERT INTO ${ATTEMPT_TABLE}(${ATTEMPT_COLUMNS.join(",")})
+      SELECT ${ATTEMPT_COLUMNS.map(() => "?").join(",")} WHERE ${c.current}
+      AND NOT EXISTS(SELECT 1 FROM ${ATTEMPT_TABLE} WHERE
+        (action_kind IS ? AND organization_id IS ? AND action_reference IS ?) OR ${COLLISION})
+      AND NOT EXISTS(SELECT 1 FROM financial_retained_r1_originals WHERE (${R1_BUSINESS}) OR ${COLLISION})
+      AND NOT EXISTS(SELECT 1 FROM financial_retained_r1_receipts WHERE (${R1_BUSINESS}) OR ${COLLISION})
+      AND NOT EXISTS(SELECT 1 FROM financial_preproof_challenges WHERE (${C0_BUSINESS})
+        OR challenge_ref IS ? OR preparation_ref IS ?)
+      AND NOT EXISTS(SELECT 1 FROM financial_preproof_challenge_receipts WHERE (${C0_BUSINESS})
+        OR challenge_ref IS ? OR preparation_ref IS ? OR receipt_ref IS ?)
+      RETURNING ${ATTEMPT_COLUMNS.join(",")}`,
+    params: Object.freeze([
+      ...image,
+      ...c.currentParams,
+      ...business,
+      ...collisionParams(p.command),
+      ...business,
+      ...collisionParams(p.command),
+      ...business,
+      ...collisionParams(p.command),
+      ...business,
+      ...business,
+      p.command.key.challengeRef,
+      p.command.key.preparationRef,
+      ...business,
+      ...business,
+      p.command.key.challengeRef,
+      p.command.key.preparationRef,
+      p.command.original.c0ReceiptRef,
+    ]),
+  });
+}
+
+/** Fixed five-statement contribution with the exact original claim predicate in
+ * the R1 INSERT and mandatory terminal receipt. A missing/crossed claim makes the
+ * receipt CHECK fail and rolls back all five statements, including C0/registration.
+ * This is SQL DATA, not permission to execute/resume a pending attempt. A future
+ * owning issuer must have its OWN first claim changes1 + exact13 RETURNING + read,
+ * genuine allNEW guards, and ordered ACK in the same invocation. Later recovery
+ * only reads the original; it never invokes this contribution automatically. */
+export async function buildFinancialR1ClaimedCoPreparationBatch(
+  options: FinancialEnrollmentComponentOptions & { readonly scope: FinancialPreproofScope },
+  command: FinancialR1WriteCommand,
+  observedAt: string,
+): Promise<readonly SqlStatement[]> {
+  const c = capture(options),
+    at = iso(observedAt);
+  const p = await parseCaptured(command, c),
+    image = await attemptImage(p, at);
+  const claimed: Captured = Object.freeze({
+    ...c,
+    current: `(${c.current}) AND EXISTS(SELECT 1 FROM ${ATTEMPT_TABLE} attempt WHERE ${attemptMatch("attempt")})`,
+    currentParams: Object.freeze([...c.currentParams, ...image]),
+  });
+  return coPreparationBatchData(claimed, p, at);
+}
+
+export type FinancialR1AttemptReadData =
+  | { readonly status: "not-found" }
+  | {
+      readonly status: "found";
+      readonly fullCommand: FinancialR1WriteCommand;
+      readonly fullCommandJson: string;
+      readonly commandDigest: FinancialSourceDigest;
+      readonly recordedAt: string;
+    };
+
+export interface FinancialR1AttemptBusinessKeyData {
+  readonly kind: SharedFinancialAction["kind"];
+  readonly organizationId: string;
+  readonly reference: string;
+}
+
+/** Historical query-only custody. Even ready-schema/not-found is DATA, never NEW,
+ * an aborted write, positive dispatch absence, rekey, retry or resume permission.
+ * Initial claim UNKNOWN + empty read remains UNKNOWN, including after restart. */
+export function createFinancialR1AttemptDataReader(
+  options: FinancialEnrollmentComponentOptions & { readonly scope: FinancialPreproofScope },
+) {
+  const c = capture(options);
+  const descriptor = Object.getOwnPropertyDescriptor(c.sql, "query");
+  if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "function")
+    return fail("unavailable");
+  const query: Sql["query"] = descriptor.value;
+  const assertQuery = () => {
+    const current = Object.getOwnPropertyDescriptor(c.sql, "query");
+    if (!current || !("value" in current) || current.value !== query) fail("unavailable");
+    assertMoneyCutoverSqlOrigin(c.sql, { writerEpoch: c.scopeRealm.writerEpoch });
+  };
+  function detachRows(value: unknown, columns: readonly string[]): readonly Row[] {
+    if (
+      !Array.isArray(value) ||
+      value.length > FINANCIAL_R1_ATTEMPT_OBJECTS.length ||
+      Reflect.ownKeys(value).length !== value.length + 1
+    )
+      fail("unavailable");
+    return Array.from({ length: value.length }, (_, index) => {
+      const entry = Object.getOwnPropertyDescriptor(value, String(index));
+      if (!entry || !("value" in entry)) fail("unavailable");
+      const row: unknown = entry.value;
+      if (
+        !row ||
+        typeof row !== "object" ||
+        Array.isArray(row) ||
+        ![Object.prototype, null].includes(Object.getPrototypeOf(row)) ||
+        Reflect.ownKeys(row).length !== columns.length
+      )
+        fail("unavailable");
+      const detached: Row = Object.create(null);
+      for (const column of columns) {
+        const field = Object.getOwnPropertyDescriptor(row, column);
+        if (
+          !field ||
+          !("value" in field) ||
+          typeof field.value !== "string" ||
+          new TextEncoder().encode(field.value).length > MAX_COMMAND_BYTES
+        )
+          fail("unavailable");
+        detached[column] = field.value;
+      }
+      return detached;
+    });
+  }
+  async function read(
+    sql: string,
+    params: readonly SqlParam[],
+    columns: readonly string[],
+  ): Promise<readonly Row[]> {
+    assertQuery();
+    let rows: readonly Row[];
+    try {
+      rows = detachRows(await Reflect.apply(query, c.sql, [sql, params]), columns);
+    } catch (error) {
+      return fail("unavailable", error);
+    }
+    assertQuery();
+    return rows;
+  }
+  async function readAttempt(
+    predicate: string,
+    params: readonly SqlParam[],
+    expected?: string,
+  ): Promise<FinancialR1AttemptReadData> {
+    try {
+      const schema = await read(
+        "SELECT name,type,tbl_name,sql FROM sqlite_schema WHERE tbl_name=? AND sql IS NOT NULL",
+        [ATTEMPT_TABLE],
+        ["name", "type", "tbl_name", "sql"],
+      );
+      if (
+        schema.length !== FINANCIAL_R1_ATTEMPT_OBJECTS.length ||
+        FINANCIAL_R1_ATTEMPT_OBJECTS.some(
+          (object) =>
+            !schema.some(
+              (row) =>
+                row.name === object.name &&
+                row.type === object.type &&
+                row.tbl_name === ATTEMPT_TABLE &&
+                row.sql === object.sql,
+            ),
+        )
+      )
+        fail("unavailable");
+      const rows = await read(
+        `SELECT * FROM ${ATTEMPT_TABLE} WHERE ${predicate} LIMIT 2`,
+        params,
+        ATTEMPT_COLUMNS,
+      );
+      if (rows.length === 0) return Object.freeze({ status: "not-found" });
+      if (rows.length !== 1) fail("conflict");
+      const row = rows[0];
+      if (!row || typeof row.command_json !== "string") fail("unavailable");
+      let stored: Parsed, image: readonly SqlParam[];
+      try {
+        stored = await parseCaptured(JSON.parse(row.command_json) as FinancialR1WriteCommand, c);
+        image = await attemptImage(stored, iso(row.recorded_at));
+      } catch (error) {
+        return fail("unavailable", error);
+      }
+      if (stored.commandJson !== row.command_json) fail("unavailable");
+      if (
+        Object.keys(row).length !== ATTEMPT_COLUMNS.length ||
+        ATTEMPT_COLUMNS.some((column, index) => row[column] !== image[index])
+      )
+        fail("unavailable");
+      if (expected !== undefined && stored.commandJson !== expected) fail("conflict");
+      assertQuery();
+      return freeze({
+        status: "found",
+        fullCommand: stored.command,
+        fullCommandJson: stored.commandJson,
+        commandDigest: digest(row.command_digest),
+        recordedAt: iso(row.recorded_at),
+      });
+    } catch (error) {
+      // Query/decoder errors, including borrowed exported instances, have
+      // already been normalized by read; only locally established conflicts survive.
+      if (error instanceof FinancialRetainedR1Error) throw error;
+      return fail("unavailable", error);
+    }
+  }
+  return Object.freeze({
+    async readOriginalAttemptData(
+      command: FinancialR1WriteCommand,
+    ): Promise<FinancialR1AttemptReadData> {
+      let p: Parsed;
+      try {
+        p = await parseCaptured(snapshot(command), c);
+      } catch (error) {
+        return fail("invalid_request", error);
+      }
+      const a = p.actionIdentity.action;
+      return readAttempt(
+        `(action_kind IS ? AND organization_id IS ? AND action_reference IS ?) OR ${COLLISION}`,
+        [a.kind, a.organizationId, a.reference, ...collisionParams(p.command)],
+        p.commandJson,
+      );
+    },
+    async readBusinessAttemptData(
+      input: FinancialR1AttemptBusinessKeyData,
+    ): Promise<FinancialR1AttemptReadData> {
+      let key: FinancialR1AttemptBusinessKeyData;
+      try {
+        const value = exact(snapshot(input), ["kind", "organizationId", "reference"]);
+        if (
+          !["topup", "subscription-start", "card-setup", "plan-change", "cancel"].includes(
+            String(value.kind),
+          ) ||
+          typeof value.kind !== "string" ||
+          value.organizationId !== c.scopeRealm.organizationId
+        )
+          fail("invalid_request");
+        key = {
+          kind: value.kind as SharedFinancialAction["kind"],
+          organizationId: ref(value.organizationId),
+          reference: ref(value.reference),
+        };
+      } catch (error) {
+        return fail("invalid_request", error);
+      }
+      return readAttempt("action_kind IS ? AND organization_id IS ? AND action_reference IS ?", [
+        key.kind,
+        key.organizationId,
+        key.reference,
+      ]);
+    },
+  });
 }
 
 /** Historical readers are usable without a future C0 row. Qualified prepare remains unavailable. */
