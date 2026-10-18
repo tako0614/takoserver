@@ -208,8 +208,10 @@ interface PrivateWriterScope {
  * Excludes target-declared private money writers and service authorities.
  * operatorIdentity is a validated public verification key, not a private
  * service binding; the public source and exact native closure still bind it.
+ * DATA classification only: the owning scope reader separately authenticates
+ * the maintenance profile through its native original publication context.
  */
-function standaloneMoneyTarget(target: DeployTarget): boolean {
+function standaloneMoneyTargetData(target: DeployTarget): boolean {
   return (
     target.cloudflareProviderExecutor === undefined &&
     target.edgeSupplies === undefined &&
@@ -222,7 +224,8 @@ function standaloneMoneyTarget(target: DeployTarget): boolean {
     target.aiModels === undefined &&
     target.protected0058Custody === undefined &&
     target.artifactBlobIoMode === undefined &&
-    target.schemaMaintenanceMode === undefined
+    (target.schemaMaintenanceMode === undefined ||
+      target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced")
   );
 }
 
@@ -580,7 +583,7 @@ function parseDeclaration(
     (!originalRead && !requireSha(value.originCertificateDigest)) ||
     !requireSha(value.privateWriterScopeDigest) ||
     !requireSha(value.maintenancePublicationReceiptDigest) ||
-    (standaloneMoneyTarget(target)
+    (standaloneMoneyTargetData(target)
       ? value.privateSourceRoot !== undefined
       : typeof value.privateSourceRoot !== "string" || !isAbsolute(value.privateSourceRoot)) ||
     (value.privateSourceRoot !== undefined &&
@@ -838,7 +841,7 @@ function parsePrivateScope(
   }
   if (value.profile === "standalone-host") {
     if (
-      !standaloneMoneyTarget(target) ||
+      !standaloneMoneyTargetData(target) ||
       value.publicSourceCommit !== maintenanceCommit ||
       value.components.length !== 0
     ) {
@@ -2963,27 +2966,55 @@ async function loadMoneyUnitOwnerOptions(
           terminalCustodyDigest: originalOrigin.terminalCustodyDigest,
         }
       : undefined;
-  const scope = parsePrivateScope(
-    protectedJson(
-      declaration.privateWriterScopePath,
-      "money private writer scope",
-      declaration.privateWriterScopeDigest,
-    ),
-    target,
-    declaration.maintenanceCommit,
-  );
-  parsePublicPublicationReceipt(
-    protectedJson(
-      declaration.maintenancePublicationReceiptPath,
-      "money maintenance terminal publication",
-      declaration.maintenancePublicationReceiptDigest,
-    ),
-    target,
-    "maintenance",
-    declaration.maintenanceCommit,
-    declaration.maintenanceModuleDigest,
-    originalMaintenance,
-  );
+  const readMaintenancePublication = (): PublicPublicationReceipt =>
+    parsePublicPublicationReceipt(
+      protectedJson(
+        declaration.maintenancePublicationReceiptPath,
+        "money maintenance terminal publication",
+        declaration.maintenancePublicationReceiptDigest,
+      ),
+      target,
+      "maintenance",
+      declaration.maintenanceCommit,
+      declaration.maintenanceModuleDigest,
+      originalMaintenance,
+    );
+  // The DATA predicate above does not qualify a maintenance target. Only this
+  // source-owned closure can admit its reviewed standalone scope, after the
+  // existing default-native original context and actual protected publication
+  // readers have authenticated the unchanged target and original chain.
+  const readReviewedPrivateScope = (): PrivateWriterScope => {
+    if (
+      target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced" &&
+      standaloneMoneyTargetData(target)
+    ) {
+      if (originalMaintenance === undefined)
+        throw preflightError(
+          "money standalone maintenance requires its native original publication owner",
+        );
+      const publication = readMaintenancePublication();
+      if (
+        publication.resultKind !==
+          "takoserver.integration-worker-bootstrap-original-money-maintenance-apply@v1" &&
+        publication.resultKind !==
+          "takoserver.integration-worker-original-money-maintenance-successor-apply@v1"
+      )
+        throw preflightError(
+          "money standalone maintenance requires original source-built publication custody",
+        );
+    }
+    return parsePrivateScope(
+      protectedJson(
+        declaration.privateWriterScopePath,
+        "money private writer scope",
+        declaration.privateWriterScopeDigest,
+      ),
+      target,
+      declaration.maintenanceCommit,
+    );
+  };
+  const scope = readReviewedPrivateScope();
+  readMaintenancePublication();
   if (
     declaration.phase === "resume" &&
     declaration.resumePublicationReceiptPath !== undefined &&
@@ -3039,15 +3070,7 @@ async function loadMoneyUnitOwnerOptions(
     readonly privateDeploymentsDigest: string;
   }> {
     // Re-read the protected reviewed inventory every time, so a later phase cannot inherit a replaced file.
-    parsePrivateScope(
-      protectedJson(
-        declaration.privateWriterScopePath,
-        "money private writer scope",
-        declaration.privateWriterScopeDigest,
-      ),
-      target,
-      declaration.maintenanceCommit,
-    );
+    readReviewedPrivateScope();
     if (scope.profile === "standalone-host") {
       // The closed standalone target has no declared private service or supply authority.
       // The public Version closure below proves native absence; DB fences block late DML.

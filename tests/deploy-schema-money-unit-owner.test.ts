@@ -2453,3 +2453,92 @@ describe("original money maintenance successor receipt boundary", () => {
     );
   });
 });
+
+describe("standalone original maintenance profile admission", () => {
+  test("classifies the unchanged exact maintenance profile as DATA but refuses a legacy owner", async () => {
+    const f = standaloneFixture();
+    const selected: DeployTarget = {
+      ...f.target,
+      schemaMaintenanceMode: "pre-wallet-usd-micros-quiesced",
+    };
+    const before = JSON.stringify(selected);
+    await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, selected, f)).rejects.toThrow(
+      "standalone maintenance requires its native original publication owner",
+    );
+    expect(JSON.stringify(selected)).toBe(before);
+    expect(selected.schemaMaintenanceMode).toBe("pre-wallet-usd-micros-quiesced");
+    expect(JSON.parse(readFileSync(f.paths.scope, "utf8")).profile).toBe("standalone-host");
+  });
+
+  test("caller booleans and a publication-shaped DTO cannot create the private native context", async () => {
+    const f = standaloneFixture();
+    const selected: DeployTarget = {
+      ...f.target,
+      schemaMaintenanceMode: "pre-wallet-usd-micros-quiesced",
+    };
+    const supplied = Object.assign({}, f, {
+      nativeOnly: true,
+      originalMaintenance: {
+        terminalCustodyDigest: sha("caller DTO"),
+        maintenanceOnly: true,
+        ready: true,
+      },
+    });
+    await expect(
+      loadMoneyUnitCutoverOptions(f.paths.declaration, selected, supplied),
+    ).rejects.toThrow("standalone maintenance requires its native original publication owner");
+  });
+
+  test("missing mode does not make an original-publication DTO qualify through the legacy path", async () => {
+    const f = standaloneFixture();
+    const receipt = JSON.parse(readFileSync(f.paths.maintenancePublication, "utf8"));
+    const receiptDigest = f.write(f.paths.maintenancePublication, {
+      ...receipt,
+      surface: "takoserver-integration-worker-bootstrap",
+      resultKind: "takoserver.integration-worker-original-money-maintenance-successor-apply@v1",
+      originalCreateTerminalCustodyDigest: sha("caller original"),
+      originalMaintenanceSourceCommit: source,
+      originalMaintenanceDispatchDigest: sha("caller first dispatch"),
+      originalMaintenanceSuccessorDispatchDigest: sha("caller successor dispatch"),
+      originalMaintenanceSuccessorTerminalCustodyDigest: sha("caller successor terminal"),
+    });
+    f.write(f.paths.declaration, {
+      ...f.declaration,
+      maintenancePublicationReceiptDigest: receiptDigest,
+    });
+    expect(f.target.schemaMaintenanceMode).toBeUndefined();
+    await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, f.target, f)).rejects.toThrow(
+      "publication evidence",
+    );
+  });
+
+  test("other maintenance modes remain outside the standalone DATA profile", async () => {
+    for (const mode of ["pre-0058-quiesced", "pre-v2-0088-quiesced"] as const) {
+      const f = standaloneFixture();
+      await expect(
+        loadMoneyUnitCutoverOptions(
+          f.paths.declaration,
+          { ...f.target, schemaMaintenanceMode: mode },
+          f,
+        ),
+      ).rejects.toThrow("declaration is malformed");
+    }
+  });
+
+  test("the maintenance mode never removes the existing managed/private authority exclusions", async () => {
+    const f = standaloneFixture();
+    const executor = target.cloudflareProviderExecutor;
+    if (executor === undefined) throw new Error("fixture managed executor is missing");
+    const selected: DeployTarget = {
+      ...f.target,
+      schemaMaintenanceMode: "pre-wallet-usd-micros-quiesced",
+      cloudflareProviderExecutor: executor,
+    };
+    f.write(f.paths.declaration, { ...f.declaration, privateSourceRoot: f.root });
+    await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, selected, f)).rejects.toThrow(
+      "standalone Host scope has private authority",
+    );
+    expect(selected.cloudflareProviderExecutor).toEqual(target.cloudflareProviderExecutor);
+    expect(selected.schemaMaintenanceMode).toBe("pre-wallet-usd-micros-quiesced");
+  });
+});
