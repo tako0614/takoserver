@@ -442,7 +442,7 @@ export const V2_CONTAINER_OWNER_READY = `(
   ${objects.map((item) => `(SELECT count(*) FROM main.sqlite_schema WHERE type = ${literal(item.type)} AND name = ${literal(item.name)} AND tbl_name = ${literal(item.table)} AND sql = ${literal(item.sql)}) = 1`).join("\n  AND ")}
   AND NOT EXISTS (SELECT 1 FROM main.sqlite_schema WHERE sql IS NOT NULL
     AND (lower(substr(name, 1, ${PREFIX.length})) = ${literal(PREFIX)} OR tbl_name IN (${tableNames})) AND name NOT IN (${names}))
-  AND NOT EXISTS (SELECT 1 FROM  main.sqlite_schema source  WHERE CASE WHEN lower(source.name) IN ('_cf_kv', '_cf_metadata') THEN 0 ELSE EXISTS (SELECT 1 FROM  pragma_foreign_key_list(source.name, 'main') fk
+  AND NOT EXISTS (SELECT 1 FROM  main.sqlite_schema source  WHERE CASE WHEN lower(source.name) IN ('_cf_kv', '_cf_metadata')  AND source.sql IS NOT NULL AND instr(upper(source.sql), 'REFERENCES') = 0 THEN 0 ELSE EXISTS (SELECT 1 FROM  pragma_foreign_key_list(source.name, 'main') fk
      WHERE  source.type = 'table' AND lower(fk."table") IN (${tableNames}) AND source.name NOT IN (${tableNames})) END)
   AND NOT EXISTS (SELECT 1 FROM pragma_foreign_key_check(NULL, 'main') WHERE "table" IN (${tableNames}))
 )`;

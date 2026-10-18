@@ -1173,3 +1173,29 @@ test("Container DELETE preparation owns its callable and binds exact Sql and ori
     expect(() => issue.prepareDelete!({ ...c, ...patch })).toThrow();
   }
 });
+
+test("provider catalog category 1 cannot hide an ordinary inbound foreign key", async () => {
+  const db = new Database(":memory:");
+  try {
+    const { sql } = await full100ContainerEngine(db);
+    expect(await inspectV2ContainerOwnerSchema(sql)).toBe(true);
+    db.exec('CREATE TABLE "_cf_kv"(value REFERENCES TF_V2_CONTAINER_INSTANCES(resource_uid))');
+    expect(await inspectV2ContainerOwnerSchema(sql)).toBe(false);
+  } finally {
+    db.close();
+  }
+});
+
+test("provider catalog category 2 cannot hide an ordinary inbound foreign key", async () => {
+  const db = new Database(":memory:");
+  try {
+    const { sql } = await full100ContainerEngine(db);
+    expect(await inspectV2ContainerOwnerSchema(sql)).toBe(true);
+    db.exec(
+      'CREATE TABLE "_cf_metadata"(value REFERENCES TF_V2_CONTAINER_INSTANCES(resource_uid))',
+    );
+    expect(await inspectV2ContainerOwnerSchema(sql)).toBe(false);
+  } finally {
+    db.close();
+  }
+});
