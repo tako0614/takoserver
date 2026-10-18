@@ -566,6 +566,11 @@ const LAYERS: readonly Layer[] = [
       "v2-private",
     ],
   },
+  {
+    name: "app",
+    match: /^src\/worker-request-shared-principal-issuance\.ts$/u,
+    may: ["core", "domain", "app"],
+  },
   // An entry chooses concrete implementations — that is its whole job. What it
   // may not do is reach something its host cannot support, which the
   // host-only ban below enforces per entry rather than by tier.
