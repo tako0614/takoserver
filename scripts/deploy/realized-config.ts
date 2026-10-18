@@ -217,6 +217,7 @@ export function deploymentVariables(
   if (target.moneyCutoverWriterPolicy !== undefined) {
     if (target.moneyCutoverWriterEpoch === undefined)
       throw preflightError("selected money Writer epoch is missing");
+    vars.TAKOSERVER_ENVIRONMENT = target.environment;
     vars.TAKOSERVER_MONEY_CUTOVER_WRITER_POLICY = target.moneyCutoverWriterPolicy;
     vars.TAKOSERVER_MONEY_CUTOVER_WRITER_EPOCH = target.moneyCutoverWriterEpoch;
   }
