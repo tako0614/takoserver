@@ -92,6 +92,7 @@ test("fresh selected 0075 payload stays quiesced on the current Host even after 
     entrypoints: [resolve(import.meta.dir, "helpers/takoform-v2-entry-worker-miniflare.ts")],
     target: "browser",
     format: "esm",
+    external: ["cloudflare:workers"],
   });
   expect(build.success).toBe(true);
   const bundle = build.outputs[0];
