@@ -261,19 +261,24 @@ export const DEPLOY_CONTRACT = {
         "TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY",
         "TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH",
         "TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_SELECTION_PATH",
+        "TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_REPAIR_SELECTION_PATH",
       ],
       triggers: ["irreversible", "authority"],
       obligations: {
         provenance:
-          `${exactSource} Integration-only first publication. Normal Host profile: qualify the source once, then seal the ` +
+          `${exactSource} Integration-only first publication or explicit original-maintenance successor repair. Normal Host profile: qualify the source once, then seal the ` +
           "exact normal Host artifact, configuration and initial secret-name closure before one lifecycle deploy. " +
           "The explicit original-maintenance profile uses the two original locator inputs, not caller-supplied " +
           "proof or ready JSON. It requires native original92 custody and the exact current physical D1/R2 pair; " +
           "the locally clean exact commit is re-fenced after the gate and build, before the sole lifecycle, " +
           "at its final callback, after cleanup and before terminal custody. The same source/artifact/native " +
-          "Version binding must remain exact throughout; no remote-publication requirement is added to this profile.",
+          "Version binding must remain exact throughout; no remote-publication requirement is added to this profile. " +
+          "Only integration --apply with --repair-original-money-maintenance selects same-Worker successor repair. " +
+          "Its repair selection is DATA: original source commit and dispatch digest remain immutable, and the " +
+          "owner captures the exact native predecessor Version/deployment and historical maintenance closure. " +
+          "The successor belongs to the selected current source commit; neither the flag nor locator JSON grants authority.",
         "post-conditions":
-          "Authoritative history must identify the acknowledged first Version with no predecessor; source, " +
+          "First publication: Authoritative history must identify the acknowledged first Version with no predecessor; source, " +
           "module, bindings, settings, source-declared cron schedule and secret inventory must exactly match " +
           "the selected target and artifact. " +
           "Normal Host profile: the public product probe must succeed at its exact account-owned workers.dev origin. " +
@@ -283,14 +288,20 @@ export const DEPLOY_CONTRACT = {
           "signing or private/external writers. First publication is not a freeze or a global quiescence proof; " +
           "the later Money cutover still requires the complete private/native old-writer inventory before " +
           "freeze, backups or conversion. No zone route or custom domain is adopted. " +
-          "This is a public Host component, not a customer ModuleWorker.",
+          "This is a public Host component, not a customer ModuleWorker. " +
+          "Explicit original-maintenance repair instead publishes ONE successor for the same selected Worker, " +
+          "with the captured native predecessor re-fenced before publication. Exact source/module/bindings/settings/" +
+          "schedule/empty-secret readback and the strict 503-before-App probe must match the corrected maintenance " +
+          "closure. A separate repair receipt is recorded only after cleanup and final fences; the original " +
+          "dispatch and its acknowledgement are never rewritten or replayed.",
         reversal:
-          "There is no predecessor to roll back to. Keep the old staging target unchanged; inspect the new " +
+          "First-publication profile: There is no predecessor to roll back to. Keep the old staging target unchanged; inspect the new " +
           "Worker and use an explicitly selected ordinary lifecycle for forward repair, never replay bootstrap. " +
           "Original-maintenance dispatch or terminal custody also refuses a new bootstrap slot; " +
-          "status never repairs or terminalizes an unknown original acknowledgement.",
+          "status never repairs or terminalizes an unknown original acknowledgement. Successor repair does not " +
+          "re-open the original bootstrap slot or automatically restore the historical invalid maintenance closure.",
         "failure-handling":
-          "Existing or partial Worker state refuses apply, even after a prior successful bootstrap. " +
+          "First publication: Existing or partial Worker state refuses apply, even after a prior successful bootstrap. " +
           "Acknowledgement loss is indeterminate; status is read-only and never reads initial secret bytes. " +
           "The command never retries, rotates secrets or changes storage/signing registration. The temporary " +
           "secret file cleanup is attempted on every exit; failure reports potentially retained material. " +
@@ -301,22 +312,31 @@ export const DEPLOY_CONTRACT = {
           "original-maintenance route. This route neither reads the normal secret directory nor a registered " +
           "signing row/private input, and creates no signing row, secret or business/queue effect. Its plain " +
           "declared signing key ID is unused DATA, not signing qualification. Original publication terminal " +
-          "custody is written only after cleanup succeeds and final source/native/503 fences still match." +
+          "custody is written only after cleanup succeeds and final source/native/503 fences still match. " +
+          "For explicit same-Worker repair only, TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_REPAIR_SELECTION_PATH " +
+          "must accompany both original locators; an ambient repair locator without the flag is refused. " +
+          "Known repair dispatch/receipt state and unknown publication acknowledgement both refuse resend. " +
+          "No status action repairs, invents custody or turns missing readback into success." +
           inputContract(applyReviewInput),
         "pre-mutation-proof":
-          "Deployment history, exhaustive script, route and custom-domain inventories must prove the exact " +
+          "First publication: Deployment history, exhaustive script, route and custom-domain inventories must prove the exact " +
           "Worker absent before and after qualification and at the final fence. Normal Host profile: the target must have a " +
           "complete schema, exact R2 identity, valid runtime composition, active registered signing public " +
           "key matching the owned private input, and ready provider qualification. Signing and provider " +
           "state are rechecked before mutation. Only the account-owned workers.dev origin with no aliases " +
           "is accepted; preview URLs remain disabled. The normal profile retains its existing 0094 Money schema " +
-          "requirement. The explicit original-maintenance profile instead requires the exact complete current " +
+          "requirement. The explicit original-maintenance first-publication profile instead requires the exact complete current " +
           "original92 schema and migration seeds, unserved-data proof, original creator custody and exact R2 " +
           "identity. It publishes only the maintenance mode and source-owned empty-secret profile; normal " +
           "runtime composition, active registered signing and ready provider qualification are not claimed " +
-          "by this branch. Native selected-Worker absence and exact source/module/binding/epoch/settings/schedule " +
+          "by this branch. For that first-publication profile, native selected-Worker absence and exact source/module/binding/epoch/settings/schedule " +
           "closure remain mandatory. The actual account-owned workers.dev origin must match the selected new " +
-          "Worker and current native account subdomain, with no aliases.",
+          "Worker and current native account subdomain, with no aliases. Explicit same-Worker repair requires " +
+          "original native custody/current original92 and the exact already-published predecessor history, " +
+          "annotation, module and historical binding/secret closure; no absence proof or normal Worker JIT " +
+          "profile substitutes for that native predecessor fence. Original storage/source identity and the " +
+          "selected corrected successor source/artifact closure remain mandatory; no DB/signing/secret write " +
+          "or writer-freeze qualification is introduced.",
         "independent-review": review,
       },
     },

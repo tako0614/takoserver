@@ -24,7 +24,10 @@ import {
   type IntegrationStorageOriginalCreateOptions,
   verifyIntegrationStorageOriginalCreate,
 } from "./integration-storage-generation.ts";
-import { readIntegrationMoneyMaintenancePublicationOriginal } from "./integration-worker-bootstrap.ts";
+import {
+  readIntegrationMoneyMaintenancePublicationOriginal,
+  readIntegrationMoneyMaintenanceSuccessorOriginal,
+} from "./integration-worker-bootstrap.ts";
 import {
   captureMoneyNativeBuildClosure,
   type MoneyNativeBuildClosure,
@@ -914,11 +917,15 @@ interface PublicPublicationReceipt {
   readonly originalCreateTerminalCustodyDigest?: string;
   readonly originalMaintenanceDispatchDigest?: string;
   readonly originalMaintenanceTerminalCustodyDigest?: string;
+  readonly originalMaintenanceSourceCommit?: string;
+  readonly originalMaintenanceSuccessorDispatchDigest?: string;
+  readonly originalMaintenanceSuccessorTerminalCustodyDigest?: string;
   /** Normal authority publication adds maintenance; closure transition retires its mode on resume. */
   readonly resultKind:
     | "takoserver.worker-apply@v2"
     | "takoserver.worker-closure-transition-apply@v1"
-    | "takoserver.integration-worker-bootstrap-original-money-maintenance-apply@v1";
+    | "takoserver.integration-worker-bootstrap-original-money-maintenance-apply@v1"
+    | "takoserver.integration-worker-original-money-maintenance-successor-apply@v1";
   readonly resultDigest: string;
   readonly ownerGateDigest: string;
   readonly reviewer: string;
@@ -963,14 +970,28 @@ function parsePublicPublicationReceipt(
     record(value) &&
     value.resultKind ===
       "takoserver.integration-worker-bootstrap-original-money-maintenance-apply@v1";
+  const originalSuccessor =
+    record(value) &&
+    value.resultKind ===
+      "takoserver.integration-worker-original-money-maintenance-successor-apply@v1";
   const originalFields = [
     "originalCreateTerminalCustodyDigest",
     "originalMaintenanceDispatchDigest",
     "originalMaintenanceTerminalCustodyDigest",
   ];
+  const successorFields = [
+    "originalCreateTerminalCustodyDigest",
+    "originalMaintenanceSourceCommit",
+    "originalMaintenanceDispatchDigest",
+    "originalMaintenanceSuccessorDispatchDigest",
+    "originalMaintenanceSuccessorTerminalCustodyDigest",
+  ];
   if (
     !record(value) ||
-    !keys(value, [...fields, ...(originalBootstrap ? originalFields : [])]) ||
+    !keys(value, [
+      ...fields,
+      ...(originalBootstrap ? originalFields : originalSuccessor ? successorFields : []),
+    ]) ||
     value.kind !== "takoserver.money-public-worker-publication@v1" ||
     value.state !== "reviewed" ||
     !requireReviewedAt(value.reviewedAt) ||
@@ -986,13 +1007,17 @@ function parsePublicPublicationReceipt(
     Number(value.artifactBytes) <= 0 ||
     !Number.isSafeInteger(value.artifactFiles) ||
     Number(value.artifactFiles) < 2 ||
-    (originalBootstrap
+    (originalBootstrap || originalSuccessor
       ? value.surface !== "takoserver-integration-worker-bootstrap" ||
         phase !== "maintenance" ||
         originalMaintenance === undefined ||
         value.originalCreateTerminalCustodyDigest !== originalMaintenance.terminalCustodyDigest ||
         !requireSha(value.originalMaintenanceDispatchDigest) ||
-        !requireSha(value.originalMaintenanceTerminalCustodyDigest)
+        (originalSuccessor
+          ? !requireCommit(value.originalMaintenanceSourceCommit) ||
+            !requireSha(value.originalMaintenanceSuccessorDispatchDigest) ||
+            !requireSha(value.originalMaintenanceSuccessorTerminalCustodyDigest)
+          : !requireSha(value.originalMaintenanceTerminalCustodyDigest))
       : value.surface !== "takoserver-worker-authority-cutover" ||
         !["takoserver.worker-apply@v2", "takoserver.worker-closure-transition-apply@v1"].includes(
           String(value.resultKind),
@@ -1032,6 +1057,48 @@ function parsePublicPublicationReceipt(
     )
       throw preflightError(
         "money original maintenance receipt differs from the original source-built publication custody",
+      );
+  }
+  if (originalSuccessor) {
+    if (originalMaintenance === undefined)
+      throw preflightError("original maintenance native owner is unavailable");
+    const retained = readIntegrationMoneyMaintenanceSuccessorOriginal(
+      originalMaintenance.originalCreate,
+      target,
+      commit,
+      originalMaintenance.terminalCustodyDigest,
+    );
+    if (
+      retained === null ||
+      retained.result === null ||
+      retained.originalFirst.result !== null ||
+      retained.originalFirst.resultDigest !== null ||
+      retained.originalFirst.terminalDigest !== null ||
+      retained.originalFirst.dispatchDigest !== value.originalMaintenanceDispatchDigest ||
+      retained.originalFirst.binding.sourceCommit !== value.originalMaintenanceSourceCommit ||
+      retained.binding.originalDispatchDigest !== value.originalMaintenanceDispatchDigest ||
+      retained.binding.originalSourceCommit !== value.originalMaintenanceSourceCommit ||
+      retained.dispatchDigest !== value.originalMaintenanceSuccessorDispatchDigest ||
+      retained.terminalDigest !== value.originalMaintenanceSuccessorTerminalCustodyDigest ||
+      retained.resultDigest !== value.resultDigest ||
+      retained.result.kind !==
+        "takoserver.integration-worker-original-money-maintenance-successor-apply@v1" ||
+      retained.result.originalSourceCommit !== value.originalMaintenanceSourceCommit ||
+      retained.result.originalDispatchDigest !== value.originalMaintenanceDispatchDigest ||
+      retained.result.originalCreateTerminalCustodyDigest !==
+        originalMaintenance.terminalCustodyDigest ||
+      retained.result.writerEpoch !== target.moneyCutoverWriterEpoch ||
+      retained.result.originalDispatchPreserved !== true ||
+      retained.result.originalTerminalRecovery !== "not-manufactured-by-successor" ||
+      retained.result.deploymentId !== value.deploymentId ||
+      retained.result.versionId !== value.versionId ||
+      retained.result.bundleDigest !== value.bundleDigest ||
+      retained.result.artifactDigest !== value.artifactDigest ||
+      retained.result.artifactBytes !== value.artifactBytes ||
+      retained.result.artifactFiles !== value.artifactFiles
+    )
+      throw preflightError(
+        "money original maintenance successor receipt differs from distinct source-built publication custody",
       );
   }
   return value as unknown as PublicPublicationReceipt;
@@ -3113,8 +3180,10 @@ async function loadMoneyUnitOwnerOptions(
     );
     const originalMaintenancePublication =
       maintenance &&
-      selectedPublication.resultKind ===
-        "takoserver.integration-worker-bootstrap-original-money-maintenance-apply@v1";
+      (selectedPublication.resultKind ===
+        "takoserver.integration-worker-bootstrap-original-money-maintenance-apply@v1" ||
+        selectedPublication.resultKind ===
+          "takoserver.integration-worker-original-money-maintenance-successor-apply@v1");
     const live = await inspectLiveWorkerVersion("preflight", selectedTarget, selectedState, {
       ...(originalMaintenancePublication ? { expectedSecrets: [] } : {}),
       ...(selectedTarget.integrationE2eCredentialAuthority === undefined

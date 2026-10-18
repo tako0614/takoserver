@@ -2372,3 +2372,84 @@ describe("original money maintenance bootstrap publication receipt boundary", ()
     );
   });
 });
+
+describe("original money maintenance successor receipt boundary", () => {
+  test("reviewed successor JSON cannot enter through a legacy or injected owner", async () => {
+    const f = fixture();
+    const receipt = JSON.parse(readFileSync(f.paths.maintenancePublication, "utf8"));
+    const receiptDigest = f.write(f.paths.maintenancePublication, {
+      ...receipt,
+      surface: "takoserver-integration-worker-bootstrap",
+      resultKind: "takoserver.integration-worker-original-money-maintenance-successor-apply@v1",
+      originalCreateTerminalCustodyDigest: sha("unqualified original"),
+      originalMaintenanceSourceCommit: source,
+      originalMaintenanceDispatchDigest: sha("unqualified first dispatch"),
+      originalMaintenanceSuccessorDispatchDigest: sha("unqualified successor dispatch"),
+      originalMaintenanceSuccessorTerminalCustodyDigest: sha("unqualified successor terminal"),
+    });
+    f.write(f.paths.declaration, {
+      ...f.declaration,
+      maintenancePublicationReceiptDigest: receiptDigest,
+    });
+    await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, target, f)).rejects.toThrow(
+      "publication evidence",
+    );
+  });
+
+  test("a successor cannot manufacture the old first terminal or reuse the first-kind field family", async () => {
+    const f = fixture();
+    const receipt = JSON.parse(readFileSync(f.paths.maintenancePublication, "utf8"));
+    for (const suffix of [
+      {
+        originalMaintenanceSourceCommit: source,
+        originalMaintenanceSuccessorDispatchDigest: sha("successor dispatch"),
+        originalMaintenanceSuccessorTerminalCustodyDigest: sha("successor terminal"),
+        originalMaintenanceTerminalCustodyDigest: sha("manufactured first terminal"),
+      },
+      { originalMaintenanceTerminalCustodyDigest: sha("first terminal only") },
+      {
+        originalMaintenanceSourceCommit: source,
+        originalMaintenanceSuccessorDispatchDigest: sha("successor dispatch"),
+      },
+    ]) {
+      const receiptDigest = f.write(f.paths.maintenancePublication, {
+        ...receipt,
+        surface: "takoserver-integration-worker-bootstrap",
+        resultKind: "takoserver.integration-worker-original-money-maintenance-successor-apply@v1",
+        originalCreateTerminalCustodyDigest: sha("unqualified original"),
+        originalMaintenanceDispatchDigest: sha("first dispatch"),
+        ...suffix,
+      });
+      f.write(f.paths.declaration, {
+        ...f.declaration,
+        maintenancePublicationReceiptDigest: receiptDigest,
+      });
+      await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, target, f)).rejects.toThrow(
+        "publication evidence",
+      );
+    }
+  });
+
+  test("the existing first-publication kind still rejects appended successor custody fields", async () => {
+    const f = fixture();
+    const receipt = JSON.parse(readFileSync(f.paths.maintenancePublication, "utf8"));
+    const receiptDigest = f.write(f.paths.maintenancePublication, {
+      ...receipt,
+      surface: "takoserver-integration-worker-bootstrap",
+      resultKind: "takoserver.integration-worker-bootstrap-original-money-maintenance-apply@v1",
+      originalCreateTerminalCustodyDigest: sha("unqualified original"),
+      originalMaintenanceDispatchDigest: sha("first dispatch"),
+      originalMaintenanceTerminalCustodyDigest: sha("first terminal"),
+      originalMaintenanceSourceCommit: source,
+      originalMaintenanceSuccessorDispatchDigest: sha("successor dispatch"),
+      originalMaintenanceSuccessorTerminalCustodyDigest: sha("successor terminal"),
+    });
+    f.write(f.paths.declaration, {
+      ...f.declaration,
+      maintenancePublicationReceiptDigest: receiptDigest,
+    });
+    await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, target, f)).rejects.toThrow(
+      "publication evidence",
+    );
+  });
+});

@@ -2437,6 +2437,7 @@ describe("original92 maintenance first-publication deploy contract", () => {
       "TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY",
       "TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH",
       "TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_SELECTION_PATH",
+      "TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_REPAIR_SELECTION_PATH",
     ]);
     for (const path of [
       "scripts/deploy/target.ts",

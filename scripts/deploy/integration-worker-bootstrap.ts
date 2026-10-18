@@ -114,6 +114,7 @@ import {
 import {
   acquireWranglerVersionPublicationLease,
   deployWranglerLifecycleChange,
+  publishWranglerVersion,
   type WranglerLifecycleDeployment,
   type WranglerVersionPublicationLease,
 } from "./wrangler-state.ts";
@@ -206,6 +207,12 @@ export interface IntegrationWorkerBootstrapR2IdentityReader {
 }
 
 export interface IntegrationWorkerBootstrapOptions {
+  /** Explicit successor command DATA only; production captures all native evidence itself. */
+  readonly originalMoneyMaintenanceRepair?: {
+    readonly originalCreateInputPath: string;
+    readonly selectionPath: string;
+    readonly repairSelectionPath: string;
+  };
   /** Locator selection only. This mode accepts no injected read, write, runner or proof ports. */
   readonly originalMoneyMaintenance?: {
     readonly originalCreateInputPath: string;
@@ -545,6 +552,164 @@ export function readIntegrationMoneyMaintenancePublicationOriginal(
   );
 }
 
+/** Historical custody DATA only. The Money owner still proves native currentness. */
+export function readIntegrationMoneyMaintenanceSuccessorOriginal(
+  originalCreate: IntegrationStorageOriginalCreateOptions,
+  target: DeployTarget,
+  successorSourceCommit: string,
+  originalCreateTerminalCustodyDigest: string,
+) {
+  const root = `${originalMaintenanceCustodyRoot(originalCreate)}.successor`;
+  try {
+    lstatSync(root);
+  } catch (error) {
+    if (maintenanceRecord(error) && error.code === "ENOENT") return null;
+    throw error;
+  }
+  const rootPin = maintenanceDirectoryPin(root);
+  const entries = readdirSync(root).sort().join(",");
+  if (entries !== "dispatch.json" && entries !== "dispatch.json,terminal.json")
+    throw preflightError(
+      "original maintenance successor custody is partial or contains unknown entries",
+    );
+  const dispatch = maintenanceProtectedInput(join(root, "dispatch.json"));
+  const terminal = maintenanceProtectedInput(join(root, "terminal.json"), true);
+  if (dispatch === null)
+    throw preflightError("original maintenance successor has no original dispatch");
+  const value = dispatch.value;
+  if (
+    !maintenanceRecord(value) ||
+    !maintenanceKeys(value, [
+      "kind",
+      "originalDispatchDigest",
+      "originalSourceCommit",
+      "originalCreateTerminalCustodyDigest",
+      "targetDigest",
+      "writerEpoch",
+      "predecessor",
+      "historicalBindingProfile",
+      "sourceCommit",
+      "moduleDigest",
+      "artifactDigest",
+      "artifactBytes",
+      "artifactFiles",
+    ]) ||
+    value.kind !== "takoserver.original-money-maintenance-successor-dispatch@v1" ||
+    value.sourceCommit !== successorSourceCommit ||
+    !COMMIT.test(successorSourceCommit) ||
+    value.sourceCommit === value.originalSourceCommit ||
+    value.originalCreateTerminalCustodyDigest !== originalCreateTerminalCustodyDigest ||
+    value.targetDigest !== maintenanceTargetDigest(target) ||
+    value.writerEpoch !== target.moneyCutoverWriterEpoch ||
+    !SHA256.test(String(value.moduleDigest)) ||
+    !SHA256.test(String(value.artifactDigest)) ||
+    !Number.isSafeInteger(value.artifactBytes) ||
+    Number(value.artifactBytes) <= 0 ||
+    !Number.isSafeInteger(value.artifactFiles) ||
+    Number(value.artifactFiles) <= 0
+  )
+    throw preflightError("original maintenance successor differs from its exact full command");
+  const selected = parseOriginalMoneyMaintenanceSuccessorSelection({
+    kind: "takoserver.integration-money-maintenance-original-successor-selection@v1",
+    originalSourceCommit: value.originalSourceCommit,
+    originalDispatchDigest: value.originalDispatchDigest,
+    predecessor: value.predecessor,
+    historicalBindingProfile: value.historicalBindingProfile,
+  });
+  const originalFirst = readOriginalMaintenanceCustody(
+    originalCreate,
+    target,
+    selected.originalSourceCommit,
+    originalCreateTerminalCustodyDigest,
+  );
+  if (
+    originalFirst === null ||
+    originalFirst.result !== null ||
+    originalFirst.dispatchDigest !== selected.originalDispatchDigest
+  )
+    throw preflightError(
+      "original maintenance successor lost its immutable unknown first dispatch",
+    );
+  const assertUnchanged = () => {
+    if (maintenanceDirectoryPin(root) !== rootPin || readdirSync(root).sort().join(",") !== entries)
+      throw preflightError("original maintenance successor custody changed during read");
+    dispatch.assertUnchanged();
+    terminal?.assertUnchanged();
+    const first = readOriginalMaintenanceCustody(
+      originalCreate,
+      target,
+      selected.originalSourceCommit,
+      originalCreateTerminalCustodyDigest,
+    );
+    if (JSON.stringify(first) !== JSON.stringify(originalFirst))
+      throw preflightError("original maintenance first dispatch changed during successor read");
+  };
+  const dispatchDigest = maintenanceDigest(JSON.stringify(value));
+  if (terminal === null) {
+    assertUnchanged();
+    return {
+      originalFirst,
+      dispatchDigest,
+      binding: value,
+      result: null,
+      resultDigest: null,
+      terminalDigest: null,
+    };
+  }
+  const end = terminal.value;
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+  if (
+    !maintenanceRecord(end) ||
+    !maintenanceKeys(end, ["kind", "dispatchDigest", "result", "resultDigest"]) ||
+    end.kind !== "takoserver.original-money-maintenance-successor-terminal@v1" ||
+    end.dispatchDigest !== dispatchDigest ||
+    !maintenanceRecord(end.result) ||
+    end.result.kind !==
+      "takoserver.integration-worker-original-money-maintenance-successor-apply@v1" ||
+    end.result.commit !== successorSourceCommit ||
+    end.result.originalSourceCommit !== selected.originalSourceCommit ||
+    end.result.originalDispatchDigest !== originalFirst.dispatchDigest ||
+    end.result.originalCreateTerminalCustodyDigest !== originalCreateTerminalCustodyDigest ||
+    end.result.targetDigest !== value.targetDigest ||
+    end.result.writerEpoch !== value.writerEpoch ||
+    end.result.bundleDigest !== value.moduleDigest ||
+    end.result.artifactDigest !== value.artifactDigest ||
+    end.result.artifactBytes !== value.artifactBytes ||
+    end.result.artifactFiles !== value.artifactFiles ||
+    end.result.previousVersionId !== selected.predecessor.versionId ||
+    end.result.preMutationObservedVersionId !== selected.predecessor.versionId ||
+    !uuid.test(String(end.result.versionId)) ||
+    !uuid.test(String(end.result.deploymentId)) ||
+    end.result.versionId === selected.predecessor.versionId ||
+    end.result.deploymentId === selected.predecessor.deploymentId ||
+    end.result.maintenanceOnly !== true ||
+    end.result.normalHostReady !== false ||
+    end.result.runtimeSigningAndSecrets !== "not-qualified-maintenance-unused" ||
+    end.result.surface !== INTEGRATION_WORKER_BOOTSTRAP_SURFACE ||
+    end.result.environment !== "integration" ||
+    !maintenanceRecord(end.result.probe) ||
+    !maintenanceKeys(end.result.probe, ["url", "status", "traffic"]) ||
+    end.result.probe.url !== `${target.publicOrigin}/healthz` ||
+    end.result.probe.status !== 503 ||
+    end.result.probe.traffic !== "maintenance" ||
+    end.result.originalDispatchPreserved !== true ||
+    end.result.originalTerminalRecovery !== "not-manufactured-by-successor" ||
+    end.resultDigest !== maintenanceDigest(JSON.stringify(end.result))
+  )
+    throw preflightError(
+      "original maintenance successor terminal differs from its mandatory original chain",
+    );
+  assertUnchanged();
+  return {
+    originalFirst,
+    dispatchDigest,
+    binding: value,
+    result: end.result,
+    resultDigest: String(end.resultDigest),
+    terminalDigest: maintenanceDigest(JSON.stringify(end)),
+  };
+}
+
 function maintenanceDirectoryPin(path: string): string {
   maintenancePrivateDirectory(path);
   const status = lstatSync(path);
@@ -827,11 +992,671 @@ interface SigningEvidence {
  * Status is value-free. Apply admits only exact native absence, then performs
  * one normal Host artifact lifecycle deploy with a temporary secrets file.
  */
+/** Closed command DATA only; successful parsing never authorizes publication. */
+export interface OriginalMoneyMaintenanceSuccessorSelection {
+  readonly kind: "takoserver.integration-money-maintenance-original-successor-selection@v1";
+  readonly originalSourceCommit: string;
+  readonly originalDispatchDigest: string;
+  readonly predecessor: { readonly versionId: string; readonly deploymentId: string };
+  readonly historicalBindingProfile: "original-money-maintenance-without-environment-v1";
+}
+
+export function parseOriginalMoneyMaintenanceSuccessorSelection(
+  input: unknown,
+): OriginalMoneyMaintenanceSuccessorSelection {
+  const value = maintenanceData(input);
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+  if (
+    !maintenanceRecord(value) ||
+    !maintenanceKeys(value, [
+      "kind",
+      "originalSourceCommit",
+      "originalDispatchDigest",
+      "predecessor",
+      "historicalBindingProfile",
+    ]) ||
+    value.kind !== "takoserver.integration-money-maintenance-original-successor-selection@v1" ||
+    !COMMIT.test(String(value.originalSourceCommit)) ||
+    !SHA256.test(String(value.originalDispatchDigest)) ||
+    value.historicalBindingProfile !== "original-money-maintenance-without-environment-v1" ||
+    !maintenanceRecord(value.predecessor) ||
+    !maintenanceKeys(value.predecessor, ["versionId", "deploymentId"]) ||
+    !uuid.test(String(value.predecessor.versionId)) ||
+    !uuid.test(String(value.predecessor.deploymentId))
+  )
+    throw preflightError(
+      "original money maintenance repair requires its exact closed original command selection",
+    );
+  return value as unknown as OriginalMoneyMaintenanceSuccessorSelection;
+}
+
+/**
+ * Existing owner, native GET-only selection preparation. The returned JSON is
+ * command DATA, never permission; apply reopens the original and all native fences.
+ * This does not require the known-broken predecessor to pass the new503 contract.
+ */
+export async function prepareIntegrationMoneyMaintenanceSuccessorSelection(
+  originalInvocation: IntegrationWorkerBootstrapInvocation,
+  selectedTarget: DeployTarget,
+  originalLocators: NonNullable<IntegrationWorkerBootstrapOptions["originalMoneyMaintenance"]>,
+): Promise<{
+  readonly selection: OriginalMoneyMaintenanceSuccessorSelection;
+  readonly preparationSource: { readonly head: string; readonly moduleDigest: string };
+}> {
+  const invocation = maintenanceData(
+    originalInvocation,
+  ) as unknown as IntegrationWorkerBootstrapInvocation;
+  const target = parseDeployTarget(
+    maintenanceData(selectedTarget),
+    "original maintenance repair preparation target",
+    "integration",
+    "money-original-maintenance-bootstrap",
+  );
+  const locators = maintenanceData(originalLocators);
+  validateInvocation(invocation, target);
+  if (
+    invocation.action !== "status" ||
+    !maintenanceRecord(locators) ||
+    !maintenanceKeys(locators, ["originalCreateInputPath", "selectionPath"]) ||
+    typeof locators.originalCreateInputPath !== "string" ||
+    typeof locators.selectionPath !== "string"
+  )
+    throw preflightError(
+      "original maintenance successor preparation requires status and original locators only",
+    );
+  const captureCurrentSource = async () => {
+    const observed = await runCommand(["git", "-C", REPOSITORY, "rev-parse", "HEAD"]);
+    const head = observed.stdout.trim();
+    if (observed.exitCode !== 0 || !COMMIT.test(head))
+      throw preflightError(
+        "original maintenance native preparation cannot capture its current source HEAD",
+      );
+    return { head, moduleDigest: maintenanceDigest(readFileSync(new URL(import.meta.url))) };
+  };
+  const preparationSource = await captureCurrentSource();
+  const origin = await captureOriginalMoneyMaintenance(invocation, target, {
+    originalMoneyMaintenance: {
+      originalCreateInputPath: locators.originalCreateInputPath,
+      selectionPath: locators.selectionPath,
+    },
+  });
+  if (origin === undefined)
+    throw preflightError("original maintenance native selection is unavailable");
+  const first = origin.readCustody();
+  if (first === null || first.result !== null)
+    throw preflightError(
+      "original maintenance successor preparation requires retained unknown first dispatch",
+    );
+  const retained = JSON.stringify(first);
+  const credential = await resolveCloudflareCredential("integration", { run: runCommand });
+  const state = new CloudflareState({
+    accountId: target.accountId,
+    token: credential.token ?? exactToken(credential.childEnvironment),
+  });
+  await origin.assertCurrent();
+  const native = await readNativePresence("preflight", target, state);
+  if (
+    !native.scriptPresent ||
+    native.history === null ||
+    native.chain.length !== 1 ||
+    native.history.previousVersionId !== null
+  )
+    throw preflightError(
+      "original maintenance selection requires exactly its one acknowledged first Version",
+    );
+  assertWorkersDevOrigin(target, await requiredAccountSubdomain("preflight", state));
+  const version = await readVersionWithModules(state, target.workerName, native.history.versionId);
+  await inspectVersion(
+    "preflight",
+    target,
+    state,
+    native.history,
+    version,
+    invocation.commit,
+    target.signing.currentKeyId,
+    String(first.binding.moduleDigest).slice(7),
+    true,
+    true,
+  );
+  await assertWorkerSchedules(
+    "preflight",
+    target,
+    state,
+    readExpectedWorkerSchedules("preflight", REPOSITORY),
+  );
+  await origin.assertCurrent();
+  const after = await readNativePresence("preflight", target, state);
+  if (
+    canonicalJson(native) !== canonicalJson(after) ||
+    JSON.stringify(origin.readCustody()) !== retained
+  )
+    throw preflightError("original maintenance native selection changed during preparation");
+  if (JSON.stringify(await captureCurrentSource()) !== JSON.stringify(preparationSource))
+    throw preflightError("original maintenance native preparation source changed during read");
+  return {
+    preparationSource,
+    selection: parseOriginalMoneyMaintenanceSuccessorSelection({
+      kind: "takoserver.integration-money-maintenance-original-successor-selection@v1",
+      originalSourceCommit: invocation.commit,
+      originalDispatchDigest: first.dispatchDigest,
+      predecessor: {
+        versionId: native.history.versionId,
+        deploymentId: native.history.deploymentId,
+      },
+      historicalBindingProfile: "original-money-maintenance-without-environment-v1",
+    }),
+  };
+}
+
+/** A separate successor cohort; the original first-publication15 stay immutable. */
+export const INTEGRATION_WORKER_MAINTENANCE_SUCCESSOR_GATE_TESTS = [
+  ...INTEGRATION_WORKER_BOOTSTRAP_GATE_TESTS,
+  "tests/deploy-integration-worker-maintenance-successor.test.ts",
+  "tests/deploy-money-maintenance-runtime-bindings.test.ts",
+  "tests/deploy-original-maintenance-repair-cli.test.ts",
+  "tests/deploy-contract.test.ts",
+  "tests/deploy-schema-money-unit-owner.test.ts",
+] as const;
+
+async function checkedSuccessorGate(run: WorkerProcess): Promise<void> {
+  for (const command of [
+    ["bun", "run", "typecheck:worker"],
+    [
+      "bun",
+      "test",
+      "--timeout",
+      "60000",
+      "--bail=1",
+      ...INTEGRATION_WORKER_MAINTENANCE_SUCCESSOR_GATE_TESTS,
+    ],
+  ] as const) {
+    let result: CommandResult;
+    try {
+      result = await run(command);
+    } catch {
+      throw preflightError("original maintenance successor owner gate could not be started");
+    }
+    if (result.exitCode !== 0)
+      throw preflightError(
+        "original maintenance successor owner gate failed",
+        `${result.stdout}${result.stderr}`.trim(),
+      );
+  }
+}
+
+/**
+ * Explicit forward command, not a first-publication retry. All ports below are
+ * this owner's existing native implementations; callers supply locators only.
+ */
+async function runOriginalMoneyMaintenanceSuccessor(
+  selectedInvocation: IntegrationWorkerBootstrapInvocation,
+  selectedTarget: DeployTarget,
+  selectedOptions: IntegrationWorkerBootstrapOptions,
+): Promise<Record<string, unknown>> {
+  const descriptor = Object.getOwnPropertyDescriptor(
+    selectedOptions,
+    "originalMoneyMaintenanceRepair",
+  );
+  if (
+    descriptor === undefined ||
+    !("value" in descriptor) ||
+    !descriptor.enumerable ||
+    (Object.getPrototypeOf(selectedOptions) !== Object.prototype &&
+      Object.getPrototypeOf(selectedOptions) !== null) ||
+    Object.getOwnPropertyNames(selectedOptions).join(",") !== "originalMoneyMaintenanceRepair" ||
+    Object.getOwnPropertySymbols(selectedOptions).length !== 0
+  )
+    throw preflightError(
+      "original money maintenance repair accepts only its original locator selection, no injected ports",
+    );
+  const locators = maintenanceData(descriptor.value);
+  if (
+    !maintenanceRecord(locators) ||
+    !maintenanceKeys(locators, [
+      "originalCreateInputPath",
+      "selectionPath",
+      "repairSelectionPath",
+    ]) ||
+    typeof locators.originalCreateInputPath !== "string" ||
+    typeof locators.selectionPath !== "string" ||
+    typeof locators.repairSelectionPath !== "string"
+  )
+    throw preflightError(
+      "original money maintenance repair requires exactly three protected locators",
+    );
+  const invocation = maintenanceData(
+    selectedInvocation,
+  ) as unknown as IntegrationWorkerBootstrapInvocation;
+  const target = parseDeployTarget(
+    maintenanceData(selectedTarget),
+    "original maintenance repair target",
+    "integration",
+    "money-original-maintenance-bootstrap",
+  );
+  validateInvocation(invocation, target);
+  if (invocation.action !== "apply")
+    throw preflightError("original money maintenance repair requires explicit integration apply");
+  const selectionInput = maintenanceProtectedInput(locators.repairSelectionPath);
+  if (selectionInput === null)
+    throw preflightError("original maintenance repair command is unavailable");
+  const selected = parseOriginalMoneyMaintenanceSuccessorSelection(selectionInput.value);
+  if (selected.originalSourceCommit === invocation.commit)
+    throw preflightError(
+      "original maintenance repair must select a distinct corrected source commit",
+    );
+  const origin = await captureOriginalMoneyMaintenance(
+    { ...invocation, action: "status", commit: selected.originalSourceCommit },
+    target,
+    {
+      originalMoneyMaintenance: {
+        originalCreateInputPath: locators.originalCreateInputPath,
+        selectionPath: locators.selectionPath,
+      },
+    },
+  );
+  if (origin === undefined)
+    throw preflightError("original maintenance repair original capture is unavailable");
+  const original = origin.readCustody();
+  if (
+    original === null ||
+    original.result !== null ||
+    original.dispatchDigest !== selected.originalDispatchDigest
+  )
+    throw preflightError(
+      "original maintenance repair requires the exact retained unknown original dispatch",
+    );
+  const retained = JSON.stringify(original);
+  const originalCreate = loadIntegrationStorageOriginalCreateInput(
+    locators.originalCreateInputPath,
+  );
+  const repairRoot = `${originalMaintenanceCustodyRoot(originalCreate)}.successor`;
+  try {
+    lstatSync(repairRoot);
+    throw mutationError("original maintenance successor custody already exists; no replay");
+  } catch (error) {
+    if (!maintenanceRecord(error) || error.code !== "ENOENT") throw error;
+  }
+  const assertOriginal = async () => {
+    selectionInput.assertUnchanged();
+    await origin.assertCurrent();
+    if (JSON.stringify(origin.readCustody()) !== retained)
+      throw preflightError("original maintenance repair retained first dispatch changed");
+    selectionInput.assertUnchanged();
+  };
+  const credential = await resolveCloudflareCredential("integration", { run: runCommand });
+  let environment = credential.childEnvironment;
+  let state: IntegrationWorkerBootstrapState = new CloudflareState({
+    accountId: target.accountId,
+    token: credential.token ?? exactToken(environment),
+  });
+  const assertSource = async () => {
+    const source = await qualifySource({
+      environment: "integration",
+      commit: invocation.commit,
+      run: runCommand,
+    });
+    if (source.dirty)
+      throw preflightError("original maintenance successor requires exact clean corrected source");
+    return source;
+  };
+  const readPredecessor = async () => {
+    await assertOriginal();
+    const native = await readNativePresence("preflight", target, state);
+    if (
+      !native.scriptPresent ||
+      native.history === null ||
+      native.chain.length !== 1 ||
+      native.history.versionId !== selected.predecessor.versionId ||
+      native.history.deploymentId !== selected.predecessor.deploymentId ||
+      native.history.previousVersionId !== null
+    )
+      throw preflightError(
+        "original maintenance repair requires exactly its one acknowledged first native Version",
+      );
+    const version = await readVersionWithModules(
+      state,
+      target.workerName,
+      native.history.versionId,
+    );
+    await inspectVersion(
+      "preflight",
+      target,
+      state,
+      native.history,
+      version,
+      selected.originalSourceCommit,
+      target.signing.currentKeyId,
+      String(original.binding.moduleDigest).slice(7),
+      true,
+      true,
+    );
+    await assertOriginal();
+    return native;
+  };
+  const predecessor = await readPredecessor();
+  assertWorkersDevOrigin(target, await requiredAccountSubdomain("preflight", state));
+  const reviewer = exactReviewer(requireEnvironment("TAKOSERVER_INDEPENDENT_REVIEW"));
+  const source = await assertSource();
+  const root = mkdtempSync(join(tmpdir(), "takoserver-original-money-maintenance-successor-"));
+  let lease: WranglerVersionPublicationLease | undefined;
+  let leaseReleaseAttempted = false;
+  let repairPin: string | undefined;
+  let repairDispatch: ReturnType<typeof maintenanceProtectedInput> = null;
+  let result: Record<string, unknown> | undefined;
+  let rootCleaned = false;
+  try {
+    const inspectionConfig = writeInspectionConfig(root, target, REPOSITORY, invocation.commit);
+    const artifactBefore = readBootstrapArtifact(REPOSITORY, target);
+    const expectedShape = deriveExpectedApplicationShape(artifactBefore);
+    let schemaReader = resolveSchemaReader({}, inspectionConfig, target, environment, runCommand);
+    const schemaBefore = await readSchema("preflight", schemaReader);
+    assertCompleteSchema(schemaBefore, artifactBefore, expectedShape);
+    let r2Identity = resolveR2IdentityReader({}, target, credential.token);
+    await assertR2Identity("preflight", target, r2Identity);
+    const assertStorage = async (phase: "preflight" | "verification") => {
+      await assertOriginal();
+      const currentArtifact = readBootstrapArtifact(REPOSITORY, target);
+      assertSameArtifact(artifactBefore, currentArtifact, phase);
+      const schema = await readSchema(phase, schemaReader);
+      assertCompleteSchema(schema, currentArtifact, expectedShape, phase);
+      assertSameSchema(schemaBefore, schema, phase);
+      await assertR2Identity(phase, target, r2Identity);
+      await assertFreshV2DataReadback(
+        phase,
+        "v2-0092",
+        inspectionConfig,
+        environment,
+        expectedShape,
+        { run: runCommand, allowedTables: ["runtime_grant_keys"] },
+      );
+      await assertOriginal();
+      await assertSource();
+    };
+    await assertStorage("preflight");
+    await checkedSuccessorGate(runCommand);
+    await assertSource();
+    // Resolve the owner credential again after the potentially long gate.
+    const refreshed = await resolveCloudflareCredential("integration", { run: runCommand });
+    environment = refreshed.childEnvironment;
+    state = new CloudflareState({
+      accountId: target.accountId,
+      token: refreshed.token ?? exactToken(environment),
+    });
+    schemaReader = resolveSchemaReader({}, inspectionConfig, target, environment, runCommand);
+    r2Identity = resolveR2IdentityReader({}, target, refreshed.token);
+    await assertSource();
+    const prepared = await prepareBootstrapArtifact(
+      root,
+      target,
+      invocation.commit,
+      REPOSITORY,
+      runCommand,
+      undefined,
+      {},
+      true,
+      true,
+    );
+    const artifact = prepared.seal();
+    artifact.assertUnchanged();
+    await assertSource();
+    const expectedSuccessor = expectedExactBindingClosure(target, {
+      signingKeyId: target.signing.currentKeyId,
+      expectedSecrets: [],
+      workerArtifactDigest: `sha256:${prepared.bundleDigestHex}`,
+    });
+    if (expectedSuccessor.TAKOSERVER_ENVIRONMENT?.fields.text !== "integration")
+      throw preflightError(
+        "corrected maintenance successor must emit the exact integration environment binding",
+      );
+    await assertStorage("preflight");
+    await readPredecessor();
+    lease = await acquireWranglerVersionPublicationLease({
+      accountId: target.accountId,
+      workerName: target.workerName,
+    });
+    // Exclusive custody is written before the first upload attempt; unknown
+    // upload/deploy never authorizes a second call or a first-bootstrap resend.
+    mkdirSync(repairRoot, { mode: 0o700 });
+    const repairParent = openSync(
+      dirname(repairRoot),
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    try {
+      fsyncSync(repairParent);
+    } finally {
+      closeSync(repairParent);
+    }
+    repairPin = maintenanceDirectoryPin(repairRoot);
+    const dispatch = {
+      kind: "takoserver.original-money-maintenance-successor-dispatch@v1",
+      originalDispatchDigest: original.dispatchDigest,
+      originalSourceCommit: selected.originalSourceCommit,
+      originalCreateTerminalCustodyDigest: origin.originalCreateTerminalCustodyDigest,
+      targetDigest: maintenanceTargetDigest(target),
+      writerEpoch: target.moneyCutoverWriterEpoch,
+      predecessor: selected.predecessor,
+      historicalBindingProfile: selected.historicalBindingProfile,
+      sourceCommit: invocation.commit,
+      moduleDigest: `sha256:${prepared.bundleDigestHex}`,
+      artifactDigest: artifact.digest,
+      artifactBytes: artifact.bytes,
+      artifactFiles: artifact.files,
+    };
+    writeOriginalMaintenanceCustody(join(repairRoot, "dispatch.json"), dispatch, repairPin);
+    repairDispatch = maintenanceProtectedInput(join(repairRoot, "dispatch.json"));
+    if (repairDispatch === null)
+      throw mutationError("original maintenance successor dispatch is unavailable after capture");
+    const assertRepair = () => {
+      if (
+        maintenanceDirectoryPin(repairRoot) !== repairPin ||
+        readdirSync(repairRoot).sort().join(",") !== "dispatch.json"
+      )
+        throw mutationError("original maintenance successor custody changed; no replay");
+      if (repairDispatch === null)
+        throw mutationError("original maintenance successor dispatch capture is missing");
+      repairDispatch.assertUnchanged();
+    };
+    await assertSource();
+    artifact.assertUnchanged();
+    assertRepair();
+    const publication = await publishWranglerVersion({
+      root,
+      bundlePath: prepared.bundlePath,
+      configPath: prepared.configPath,
+      accountId: target.accountId,
+      workerName: target.workerName,
+      message: `takoserver-worker:${source.commit}:${prepared.bundleDigestHex}`,
+      lease,
+      environment: refreshed.childEnvironment,
+      run: runCommand,
+      assertUploadedVersion: async (versionId) => {
+        assertRepair();
+        await assertStorage("preflight");
+        const version = await readVersionWithModules(state, target.workerName, versionId);
+        await inspectVersion(
+          "preflight",
+          target,
+          state,
+          { versionId },
+          version,
+          invocation.commit,
+          target.signing.currentKeyId,
+          prepared.bundleDigestHex,
+          true,
+        );
+        await assertSource();
+        artifact.assertUnchanged();
+        assertRepair();
+      },
+      assertPredecessorStillCurrent: async () => {
+        assertRepair();
+        await assertStorage("preflight");
+        const current = await readPredecessor();
+        if (canonicalJson(current) !== canonicalJson(predecessor))
+          throw mutationError("original maintenance successor predecessor changed before traffic");
+        await assertSource();
+        artifact.assertUnchanged();
+        assertRepair();
+      },
+    });
+    const verifySuccessor = async () => {
+      assertRepair();
+      await assertStorage("verification");
+      const current = await readNativePresence("verification", target, state);
+      if (
+        current.history === null ||
+        current.chain.length !== 2 ||
+        current.history.versionId !== publication.versionId ||
+        current.history.deploymentId !== publication.deploymentId ||
+        current.history.previousVersionId !== selected.predecessor.versionId ||
+        current.chain[1]?.versionId !== selected.predecessor.versionId ||
+        current.chain[1]?.deploymentId !== selected.predecessor.deploymentId
+      )
+        throw verificationError(
+          "original maintenance successor native history does not retain its exact first predecessor",
+        );
+      const version = await readVersionWithModules(state, target.workerName, publication.versionId);
+      await inspectVersion(
+        "verification",
+        target,
+        state,
+        current.history,
+        version,
+        invocation.commit,
+        target.signing.currentKeyId,
+        prepared.bundleDigestHex,
+        true,
+      );
+      await assertWorkerSchedules(
+        "verification",
+        target,
+        state,
+        readExpectedWorkerSchedules("verification", REPOSITORY),
+      );
+      const probe = await probeSchemaMaintenance(
+        target.publicOrigin,
+        (url, init) => fetch(url, init),
+        ORIGINAL_MONEY_MAINTENANCE_MODE,
+      );
+      const afterProbe = await readNativePresence("verification", target, state);
+      if (canonicalJson(current) !== canonicalJson(afterProbe))
+        throw verificationError(
+          "original maintenance successor native state changed across strict503 proof",
+        );
+      await assertStorage("verification");
+      assertRepair();
+      return { current, probe };
+    };
+    const verified = await verifySuccessor();
+    result = {
+      kind: "takoserver.integration-worker-original-money-maintenance-successor-apply@v1",
+      surface: INTEGRATION_WORKER_BOOTSTRAP_SURFACE,
+      environment: "integration",
+      commit: source.commit,
+      originalSourceCommit: selected.originalSourceCommit,
+      originalDispatchDigest: original.dispatchDigest,
+      originalCreateTerminalCustodyDigest: origin.originalCreateTerminalCustodyDigest,
+      targetDigest: maintenanceTargetDigest(target),
+      writerEpoch: target.moneyCutoverWriterEpoch,
+      originalDispatchPreserved: true,
+      originalTerminalRecovery: "not-manufactured-by-successor",
+      maintenanceOnly: true,
+      normalHostReady: false,
+      runtimeSigningAndSecrets: "not-qualified-maintenance-unused",
+      previousVersionId: selected.predecessor.versionId,
+      preMutationObservedVersionId: selected.predecessor.versionId,
+      deploymentId: verified.current.history?.deploymentId,
+      versionId: verified.current.history?.versionId,
+      bundleDigest: `sha256:${prepared.bundleDigestHex}`,
+      artifactDigest: artifact.digest,
+      artifactBytes: artifact.bytes,
+      artifactFiles: artifact.files,
+      probe: verified.probe,
+      reviewer,
+    };
+    // Cleanup is part of the terminal path, never silently ignored.
+    unsealDirectory(root);
+    rmSync(root, { recursive: true, force: true });
+    rootCleaned = true;
+    leaseReleaseAttempted = true;
+    await lease.release();
+    lease = undefined;
+    assertRepair();
+    await assertOriginal();
+    await assertSource();
+    const afterCleanup = await readNativePresence("verification", target, state);
+    if (canonicalJson(afterCleanup) !== canonicalJson(verified.current))
+      throw verificationError(
+        "original maintenance successor native history changed after cleanup",
+      );
+    const afterCleanupVersion = await readVersionWithModules(
+      state,
+      target.workerName,
+      publication.versionId,
+    );
+    await inspectVersion(
+      "verification",
+      target,
+      state,
+      { versionId: publication.versionId },
+      afterCleanupVersion,
+      invocation.commit,
+      target.signing.currentKeyId,
+      prepared.bundleDigestHex,
+      true,
+    );
+    await probeSchemaMaintenance(
+      target.publicOrigin,
+      (url, init) => fetch(url, init),
+      ORIGINAL_MONEY_MAINTENANCE_MODE,
+    );
+    await assertOriginal();
+    await assertSource();
+    assertRepair();
+    const finalNative = await readNativePresence("verification", target, state);
+    if (canonicalJson(finalNative) !== canonicalJson(afterCleanup))
+      throw verificationError("original maintenance successor changed after final strict503 proof");
+    await assertOriginal();
+    await assertSource();
+    assertRepair();
+    const terminal = {
+      kind: "takoserver.original-money-maintenance-successor-terminal@v1",
+      dispatchDigest: maintenanceDigest(JSON.stringify(dispatch)),
+      result,
+      resultDigest: maintenanceDigest(JSON.stringify(result)),
+    };
+    writeOriginalMaintenanceCustody(join(repairRoot, "terminal.json"), terminal, repairPin);
+    return {
+      ...result,
+      successorDispatchDigest: terminal.dispatchDigest,
+      successorResultDigest: terminal.resultDigest,
+      successorTerminalCustodyDigest: maintenanceDigest(JSON.stringify(terminal)),
+    };
+  } catch (error) {
+    if (repairPin !== undefined) throw postPublicationVerificationError(error);
+    throw error;
+  } finally {
+    try {
+      if (!rootCleaned) {
+        unsealDirectory(root);
+        rmSync(root, { recursive: true, force: true });
+      }
+    } finally {
+      if (lease !== undefined && !leaseReleaseAttempted) {
+        leaseReleaseAttempted = true;
+        await lease.release();
+      }
+    }
+  }
+}
+
 export async function runIntegrationWorkerBootstrap(
   invocation: IntegrationWorkerBootstrapInvocation,
   target: DeployTarget,
   options: IntegrationWorkerBootstrapOptions = {},
 ): Promise<Record<string, unknown>> {
+  if (Object.getOwnPropertyDescriptor(options, "originalMoneyMaintenanceRepair") !== undefined)
+    return await runOriginalMoneyMaintenanceSuccessor(invocation, target, options);
   const originalDescriptor = Object.getOwnPropertyDescriptor(options, "originalMoneyMaintenance");
   if (originalDescriptor !== undefined) {
     target = maintenanceData(target) as unknown as DeployTarget;
@@ -1700,12 +2525,13 @@ async function inspectVersion(
   phase: "preflight" | "verification",
   target: DeployTarget,
   state: IntegrationWorkerBootstrapState,
-  history: WorkerDeploymentHistory,
+  history: Pick<WorkerDeploymentHistory, "versionId">,
   version: unknown,
   selectedCommit: string,
   signingKeyId: string,
   expectedBundleDigestHex?: string,
   maintenanceOnly = false,
+  historicalMissingMoneyEnvironment = false,
 ): Promise<{ readonly commit: string; readonly bundleDigestHex: string }> {
   if (workerVersionAnnotationProfile(version) !== "canonical") {
     throw phaseError(phase, "Worker Version has a non-canonical annotation inventory");
@@ -1731,17 +2557,23 @@ async function inspectVersion(
           },
         };
   const bindingProjection = flatVersionBindingProjection(phase, history.versionId, version);
-  assertExactVersionBindingClosure(
-    phase,
-    history.versionId,
-    bindingProjection,
-    expectedExactBindingClosure(target, {
+  const expectedBindings = {
+    ...expectedExactBindingClosure(target, {
       signingKeyId,
       ...(maintenanceOnly ? { expectedSecrets: [] } : {}),
       ...(authorityProfile === undefined ? {} : { authorityProfile }),
       workerArtifactDigest: `sha256:${identity.bundleDigestHex}` as const,
     }),
-  );
+  };
+  // This exact historical exception is reachable only after the repair owner
+  // matches original first-dispatch source/module and single native history.
+  // It does not weaken ordinary/current Version inspection.
+  if (historicalMissingMoneyEnvironment) {
+    if (!maintenanceOnly || target.moneyCutoverWriterPolicy !== "transaction-fenced-usd-micros-v1")
+      throw phaseError(phase, "historical maintenance environment profile is unavailable");
+    delete expectedBindings.TAKOSERVER_ENVIRONMENT;
+  }
+  assertExactVersionBindingClosure(phase, history.versionId, bindingProjection, expectedBindings);
   assertExactSecretInventory(
     await state.workerSecrets(target.workerName),
     maintenanceOnly ? [] : expectedWorkerSecrets(target),
@@ -1769,6 +2601,7 @@ async function prepareBootstrapArtifact(
   wranglerPath: string | undefined,
   secretValues: Readonly<Record<string, string>>,
   maintenanceOnly = false,
+  versionOnly = false,
 ): Promise<PreparedWorkerArtifact> {
   const buildRun: WorkerProcess = async (command, input = {}) => {
     const childEnvironment = input.env ?? {};
@@ -1792,6 +2625,7 @@ async function prepareBootstrapArtifact(
     ...(wranglerPath === undefined ? {} : { wranglerPath }),
     run: buildRun,
     environment: {},
+    ...(versionOnly ? { dryRunCommand: "versions-upload" as const } : {}),
     writeConfig: ({ path, main, bundleDigestHex, formImplementationIdentity }) =>
       writeWorkerConfig(target, {
         path,
@@ -1799,6 +2633,7 @@ async function prepareBootstrapArtifact(
         commit,
         sourceRepositoryRoot,
         ...(maintenanceOnly ? { transitionExpectedSecrets: [] } : {}),
+        ...(versionOnly ? { topology: "version-only" as const } : {}),
         ...(formImplementationIdentity === undefined ? {} : { formImplementationIdentity }),
         ...(bundleDigestHex === undefined
           ? {}

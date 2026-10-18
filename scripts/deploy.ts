@@ -87,7 +87,10 @@ const USAGE = `takoserver deploy
     --retired-target=/absolute/old-target.json --retired-deployment=<uuid> --retired-version=<uuid>
     (one replaced public Host only; never deletes storage or forces associated binding removal)
   bun run deploy -- takoserver-integration-worker-bootstrap --<status|apply> --environment=integration --commit=<sha>
-    (first public Host publication only; existing Workers use their normal lifecycle)
+    (first public Host publication only; existing normal Hosts use their normal lifecycle)
+  bun run deploy -- takoserver-integration-worker-bootstrap --apply --environment=integration --commit=<sha>
+    --repair-original-money-maintenance (same original-maintenance Worker successor only;
+    requires the original-create, maintenance-selection and repair-selection locators; never replays bootstrap)
   bun run deploy -- takoserver-sponsorship-authority-worker --<status|apply> --environment=<env> --commit=<sha>
   bun run deploy -- takoserver-sponsorship-public-route-retirement --<status|apply> --environment=<integration|production> --commit=<sha>
     --legacy-host-runtime-predecessor-version=<uuid> [--reverse]
@@ -209,6 +212,7 @@ interface InvocationBase {
   readonly throughMigration?: SchemaWaveBoundary;
   readonly protectedReferenceEnvironment?: "integration" | "production";
   readonly reverse?: boolean;
+  readonly repairOriginalMoneyMaintenance?: boolean;
 }
 
 type Invocation =
@@ -305,6 +309,7 @@ interface ParsedInvocation {
   readonly expiresInDays?: number;
   readonly apiKeyId?: string;
   readonly reverse?: boolean;
+  readonly repairOriginalMoneyMaintenance?: boolean;
 }
 
 /** The durable organization API key surface is the only one with key operands. */
@@ -396,7 +401,13 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let expiresInDays: number | null = null;
   let apiKeyId: string | null = null;
   let reverse = false;
+  let repairOriginalMoneyMaintenance = false;
   for (const flag of flags) {
+    if (flag === "--repair-original-money-maintenance") {
+      if (repairOriginalMoneyMaintenance) return null;
+      repairOriginalMoneyMaintenance = true;
+      continue;
+    }
     if (flag.startsWith("--retired-target=")) {
       const value = flag.slice("--retired-target=".length);
       if (retiredTargetPath !== null || !isAbsolute(value) || /[\0\r\n]/u.test(value)) return null;
@@ -627,6 +638,14 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     return null;
   }
   if (!action || !environment || !commit) return null;
+  if (
+    repairOriginalMoneyMaintenance &&
+    (surfaceValue !== "takoserver-integration-worker-bootstrap" ||
+      action !== "apply" ||
+      environment !== "integration" ||
+      args.length !== 5)
+  )
+    return null;
   const hostRetirement = surfaceValue === "takoserver-integration-host-retirement";
   const retirementOperands = [retiredTargetPath, retiredDeploymentId, retiredVersionId].filter(
     (value) => value !== null,
@@ -662,7 +681,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     (surfaceValue === "takoserver-integration-worker-bootstrap" ||
       surfaceValue === "takoserver-integration-organization-bootstrap") &&
     (environment !== "integration" ||
-      args.length !== 4 ||
+      args.length !== (repairOriginalMoneyMaintenance ? 5 : 4) ||
       (action !== "status" && action !== "apply"))
   )
     return null;
@@ -1061,6 +1080,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     ...(formAuthorityScopeTransitionPath === null ? {} : { formAuthorityScopeTransitionPath }),
     ...(adoptLivePath === null ? {} : { adoptLivePath }),
     ...(bootstrapVerifierBridge ? { bootstrapVerifierBridge: true } : {}),
+    ...(repairOriginalMoneyMaintenance ? { repairOriginalMoneyMaintenance: true } : {}),
     ...(bootstrapProbePredecessorVersionId === null ? {} : { bootstrapProbePredecessorVersionId }),
     ...(throughMigration === null ? {} : { throughMigration }),
     ...(protectedReferenceEnvironment === null ? {} : { protectedReferenceEnvironment }),
@@ -1185,6 +1205,46 @@ function loadMoneyShadowNativeProbeDeclaration(): MoneyShadowNativeProbeDeclarat
 
 async function dispatch(invocation: Invocation): Promise<Record<string, unknown>> {
   const originalCreateInput = process.env.TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH;
+  if (
+    process.env.TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_REPAIR_SELECTION_PATH !== undefined &&
+    invocation.repairOriginalMoneyMaintenance !== true
+  )
+    throw new DeployError(
+      "preflight",
+      "original money maintenance repair selection requires --repair-original-money-maintenance",
+    );
+  if (invocation.repairOriginalMoneyMaintenance === true) {
+    const originalCreateInputPath = requireEnvironment(
+      "TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH",
+    );
+    const selectionPath = requireEnvironment(
+      "TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_SELECTION_PATH",
+    );
+    const repairSelectionPath = requireEnvironment(
+      "TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_REPAIR_SELECTION_PATH",
+    );
+    const target = loadTarget(
+      targetPath("integration"),
+      "integration",
+      "money-original-maintenance-bootstrap",
+    );
+    return await runIntegrationWorkerBootstrap(
+      {
+        action: "apply",
+        environment: "integration",
+        commit: invocation.commit,
+        surface: "takoserver-integration-worker-bootstrap",
+      },
+      target,
+      {
+        originalMoneyMaintenanceRepair: {
+          originalCreateInputPath,
+          selectionPath,
+          repairSelectionPath,
+        },
+      },
+    );
+  }
   if (
     process.env.TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_SELECTION_PATH !== undefined &&
     (originalCreateInput === undefined ||
