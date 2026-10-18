@@ -310,6 +310,24 @@ export function assertStagingTarget(
   return origin.origin;
 }
 
+class BillingHttpStatusError extends Error {
+  readonly #diagnostic: string;
+
+  constructor(method: "GET" | "POST", status: number) {
+    super(`HTTP ${status}; original mutation must not be retried`);
+    const methodLabel = method === "GET" || method === "POST" ? method : "request";
+    const statusLabel =
+      Number.isInteger(status) && status >= 100 && status <= 599 ? status : "unknown";
+    this.#diagnostic = `HTTP ${methodLabel} ${statusLabel}.`;
+  }
+
+  static diagnostic(error: unknown): string | undefined {
+    return typeof error === "object" && error !== null && #diagnostic in error
+      ? error.#diagnostic
+      : undefined;
+  }
+}
+
 export class BillingHttp {
   constructor(
     readonly origin: string,
@@ -349,8 +367,7 @@ export class BillingHttp {
       (response.status >= 300 && response.status < 400)
     )
       throw new Error("redirect or response-origin mismatch refused");
-    if (!response.ok)
-      throw new Error(`HTTP ${response.status}; original mutation must not be retried`);
+    if (!response.ok) throw new BillingHttpStatusError(method, response.status);
     try {
       return object(await response.json());
     } catch {
@@ -762,11 +779,14 @@ export async function main(argv: string[]): Promise<void> {
   }
 }
 
+export function billingE2eFailureDiagnostic(error: unknown): string {
+  const diagnostic = BillingHttpStatusError.diagnostic(error);
+  return `Billing E2E refused or outcome unknown.${diagnostic ? ` ${diagnostic}` : ""} Inspect the private journal; do not repeat start.\n`;
+}
+
 if (import.meta.main) {
-  main(process.argv.slice(2)).catch(() => {
-    process.stderr.write(
-      "Billing E2E refused or outcome unknown. Inspect the private journal; do not repeat start.\n",
-    );
+  main(process.argv.slice(2)).catch((error: unknown) => {
+    process.stderr.write(billingE2eFailureDiagnostic(error));
     process.exitCode = 1;
   });
 }

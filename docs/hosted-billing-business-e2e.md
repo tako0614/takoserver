@@ -71,6 +71,11 @@ It never logs bearer material or Checkout URLs. Checkout URLs are placed in
 separate 0600 `--handoff.subscription.url` and `--handoff.topup.url` files,
 without overwriting existing files. Treat these URLs as bearer capabilities;
 open them only in the isolated TEST browser. The CLI prints only their paths.
+HTTP refusals report only the request method and numeric status (for example,
+`HTTP GET 401` or `HTTP GET 503`). Response bodies, status text, URLs, session
+material and arbitrary error messages are never included in the CLI diagnostic.
+Transport failures remain unknown; every failure retains the instruction to
+inspect the original journal and never repeat `start`.
 
 ```bash
 ./node_modules/.bin/biome check scripts/hosted-billing-business-e2e.ts

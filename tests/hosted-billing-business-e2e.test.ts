@@ -7,6 +7,7 @@ import {
   assertStagingTarget,
   BillingHttp,
   type BusinessInput,
+  billingE2eFailureDiagnostic,
   parseBusinessInput,
   runStart,
   runVerify,
@@ -65,6 +66,56 @@ function publicUsage(input: BusinessInput, organizationId: string) {
     amountMicros: usage.expectedMicros,
   };
 }
+
+test("CLI diagnostics distinguish HTTP refusals without disclosing request or response secrets", async () => {
+  for (const status of [401, 503]) {
+    for (const method of ["GET", "POST"] as const) {
+      const client = new BillingHttp(
+        "https://private.staging.example",
+        "private-session",
+        async () =>
+          new Response("private-response-body", { status, statusText: "private-status-text" }),
+      );
+      let failure: unknown;
+      try {
+        await client.request(method, "/v1/organizations/private-org/wallet", {
+          secret: "private-body",
+        });
+      } catch (error) {
+        failure = error;
+      }
+      const diagnostic = billingE2eFailureDiagnostic(failure);
+      expect(diagnostic).toContain(`HTTP ${method} ${status}`);
+      expect(diagnostic).toContain("do not repeat start");
+      expect(diagnostic).not.toContain("private-");
+      expect(diagnostic).not.toContain("private.staging.example");
+    }
+  }
+});
+
+test("CLI diagnostics keep transport failures and foreign errors private", async () => {
+  const client = new BillingHttp("https://private.staging.example", "private-session", async () => {
+    throw new Error("private-transport-detail");
+  });
+  let failure: unknown;
+  try {
+    await client.request("POST", "/v1/organizations/personal", {});
+  } catch (error) {
+    failure = error;
+  }
+  const generic =
+    "Billing E2E refused or outcome unknown. Inspect the private journal; do not repeat start.\n";
+  expect(billingE2eFailureDiagnostic(failure)).toBe(generic);
+  expect(billingE2eFailureDiagnostic(new Error("HTTP GET 401; private-session"))).toBe(generic);
+  expect(
+    billingE2eFailureDiagnostic({
+      get message() {
+        throw new Error("must not inspect foreign error fields");
+      },
+    }),
+  ).toBe(generic);
+  expect(billingE2eFailureDiagnostic(null)).toBe(generic);
+});
 
 test("production and unselected billing targets are refused", () => {
   expect(() =>
