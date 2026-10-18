@@ -1280,6 +1280,11 @@ describe("production D1 fresh init", () => {
       try {
         const migrationDirectory = join(root, "migrations");
         cpSync(currentMigrations, migrationDirectory, { recursive: true });
+        mkdirSync(join(root, "src"));
+        cpSync(
+          join(import.meta.dir, "../src/auth103-source-clock.ts"),
+          join(root, "src/auth103-source-clock.ts"),
+        );
         const tail = join(migrationDirectory, "0094_wallet_usd_micros.sql");
         if (drift === "missing") rmSync(join(migrationDirectory, "0100_hosted_on_demand.sql"));
         else if (drift === "changed") {
@@ -1297,9 +1302,11 @@ describe("production D1 fresh init", () => {
             migrationDirectory,
           }),
         ).rejects.toThrow(
-          drift === "changed"
-            ? "exact audited migration SHA-256"
-            : "audited migration lineage must contain exactly 0001-0100",
+          drift === "missing"
+            ? "audited migration prefix must be the exact original0001-0100"
+            : drift === "changed"
+              ? "exact audited migration SHA-256"
+              : "audited source extension must be exactly the owning101/102/103 recipes",
         );
         expect(fixture.calls).toEqual([]);
       } finally {
