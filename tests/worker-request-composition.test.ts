@@ -6,6 +6,7 @@ import { type AppPorts, buildApp } from "../src/app.ts";
 import {
   assertAuthTokenCaptureReader,
   assertRetainedDirectOwnerSessionReader,
+  assertVerifiedLocalPrincipalIssuanceReader,
 } from "../src/auth.ts";
 import { additiveAuthDDL, additiveAuthTokenDDL } from "../src/auth-authority-schema-plan.ts";
 import { createCredentialAuthorityClassStore } from "../src/credential-authority-class.ts";
@@ -43,6 +44,7 @@ import {
   readWorkerRequestRetainedCredentialInputs,
   readWorkerRequestRetainedRpCapture,
   readWorkerRequestRetainedRpPrincipalBindingInputs,
+  readWorkerRequestVerifiedLocalPrincipalIssuanceInputs,
   type WorkerRequestDatabase,
   type WorkerRequestSql,
   type WorkerSharedAuthStaging,
@@ -1459,7 +1461,7 @@ describe("Worker original RP final-touch retained DATA", () => {
 async function retainedDirectRequestFixture() {
   const now = Date.now();
   const control: {
-    onResult?: (result: SqlWrite) => D1ResultLike | undefined;
+    onResult?: (result: SqlWrite, originalStatementSql: string) => D1ResultLike | undefined;
     onClock?: () => void;
   } = {};
   const clock = () => {
@@ -1467,7 +1469,8 @@ async function retainedDirectRequestFixture() {
     return new Date(now);
   };
   const f = await fixture(
-    (result) => control.onResult?.(result) ?? acknowledgement(result),
+    (result, originalStatementSql) =>
+      control.onResult?.(result, originalStatementSql) ?? acknowledgement(result),
     undefined,
     clock,
   );
@@ -1520,6 +1523,33 @@ async function retainedDirectRequestFixture() {
     authorization,
     queries,
     lastSql: () => queries().at(-1) ?? "",
+    async issueFresh(subject: string) {
+      const nextPayload = base64UrlEncode(
+        new TextEncoder().encode(
+          JSON.stringify({
+            purpose: "sign-in",
+            aud: audience,
+            provider: "google",
+            subject,
+            email: "retained-request-local@example.test",
+            displayName: "Retained request local",
+            iat: Math.floor(now / 1000),
+            exp: Math.floor(now / 1000) + 300,
+          }),
+        ),
+      );
+      const nextSignature = await crypto.subtle.sign(
+        "Ed25519",
+        pair.privateKey,
+        new TextEncoder().encode(nextPayload),
+      );
+      return accounts.signIn({
+        provider: "google",
+        method: "operator-assertion",
+        audience,
+        assertion: `${nextPayload}.${base64UrlEncode(new Uint8Array(nextSignature))}`,
+      });
+    },
     capture: (connection = inputs.connection) =>
       captureWorkerRequestRetainedDirectOwnerSession(connection, authorization),
     read: (capture: unknown, connection = inputs.connection) =>
@@ -2150,5 +2180,224 @@ describe("Worker original RP retained Principal and binding DATA", () => {
     expect(before.binding.terminal).toBeNull();
     expect(await r.capture()).toBeNull();
     expect(r.read(capture)).toBe(before.credentialOriginal);
+  });
+});
+
+// The producer runs original identity verification and same-batch Principal/class
+// issuance. It does not qualify shared human binding, schema/target or Clock.
+describe("Worker verified local Principal issuance origin", () => {
+  test("original successful verified issuance has a separate Principal origin without bearer inference", async () => {
+    const r = await retainedDirectRequestFixture();
+    assertVerifiedLocalPrincipalIssuanceReader(r.accounts, { sql: r.inputs.sql });
+    const before = r.queries().length;
+    const observed = readWorkerRequestVerifiedLocalPrincipalIssuanceInputs(
+      r.inputs.connection,
+      r.issued,
+    );
+    if (!observed) throw new Error("verified Principal issuance missing");
+    expect(r.queries()).toHaveLength(before);
+    expect(observed.inputs).toBe(readWorkerRequestFinancialInputs(r.inputs.connection));
+    expect(observed.principalOriginal.anchor.principalId).toBe(r.issued.principal.id);
+    expect(observed.principalOriginal.anchor.originKind).toBe("fresh-local");
+    expect(observed.principalOriginal.anchor.identitySubject).toBe(
+      observed.principalOriginal.verification.providerSubject,
+    );
+    expect(observed.principalOriginal.anchor.origin.digest).toBe(
+      observed.principalOriginal.verification.assertionDigest,
+    );
+    expect(observed.principalOriginal.anchor.verificationDomain).toEqual(
+      observed.principalOriginal.verification.verificationDomain,
+    );
+    expect(Object.isFrozen(observed.principalOriginal)).toBe(true);
+    expect(Object.isFrozen(observed.principalOriginal.anchor)).toBe(true);
+    expect(Object.isFrozen(observed.principalOriginal.verification)).toBe(true);
+    expect(JSON.stringify(observed).includes(r.issued.sessionToken)).toBe(false);
+    const tokenCapture = await r.capture();
+    const credential = r.read(tokenCapture);
+    expect(credential?.credentialOriginal.record.origin.principalId).toBe(
+      observed.principalOriginal.anchor.principalId,
+    );
+    expect(
+      readWorkerRequestVerifiedLocalPrincipalIssuanceInputs(r.inputs.connection, tokenCapture),
+    ).toBeNull();
+    expect(r.read(r.issued)).toBeNull();
+    expect(
+      r.queries().filter((q) => q.startsWith("INSERT INTO credential_authority_classes")),
+    ).toHaveLength(1);
+  });
+
+  test("clone, wire DTO, Actor and another Accounts instance cannot select the original verified Principal", async () => {
+    const r = await retainedDirectRequestFixture();
+    const other = await retainedDirectRequestFixture();
+    const actor = await r.accounts.authenticate(r.authorization);
+    let reads = 0;
+    const forged = {
+      get principal(): never {
+        reads++;
+        throw new Error("caller principal getter");
+      },
+    };
+    const before = r.queries().length;
+    for (const value of [
+      null,
+      {},
+      { ...r.issued },
+      JSON.parse(JSON.stringify(r.issued)),
+      actor,
+      forged,
+    ])
+      expect(
+        readWorkerRequestVerifiedLocalPrincipalIssuanceInputs(r.inputs.connection, value),
+      ).toBeNull();
+    expect(
+      readWorkerRequestVerifiedLocalPrincipalIssuanceInputs(other.inputs.connection, r.issued),
+    ).toBeNull();
+    expect(reads).toBe(0);
+    expect(r.queries()).toHaveLength(before);
+  });
+
+  test("the original result is an opaque key; mutable wire fields never replace the verified Principal", async () => {
+    const r = await retainedDirectRequestFixture();
+    const observed = readWorkerRequestVerifiedLocalPrincipalIssuanceInputs(
+      r.inputs.connection,
+      r.issued,
+    );
+    if (!observed) throw new Error("verified Principal issuance missing");
+    let reads = 0;
+    Object.defineProperty(r.issued, "principal", {
+      get(): never {
+        reads++;
+        throw new Error("mutable result getter");
+      },
+    });
+    expect(
+      readWorkerRequestVerifiedLocalPrincipalIssuanceInputs(r.inputs.connection, r.issued)
+        ?.principalOriginal,
+    ).toBe(observed.principalOriginal);
+    expect(reads).toBe(0);
+  });
+
+  for (const method of [
+    "query",
+    "batch",
+    "signIn",
+    "readVerifiedLocalPrincipalIssuance",
+  ] as const) {
+    test(`replaced ${method} getter cannot read or mint a Principal origin`, async () => {
+      const r = await retainedDirectRequestFixture();
+      const receiver = method === "query" || method === "batch" ? r.inputs.sql : r.accounts;
+      const descriptor = Object.getOwnPropertyDescriptor(receiver, method);
+      if (!descriptor) throw new Error("original method missing");
+      let reads = 0;
+      Object.defineProperty(receiver, method, {
+        configurable: true,
+        get(): never {
+          reads++;
+          throw new Error("replacement getter");
+        },
+      });
+      try {
+        expect(() =>
+          readWorkerRequestVerifiedLocalPrincipalIssuanceInputs(r.inputs.connection, r.issued),
+        ).toThrow();
+        expect(reads).toBe(0);
+      } finally {
+        Object.defineProperty(receiver, method, descriptor);
+      }
+    });
+  }
+
+  test("ordinary Accounts never acquires the explicit verified-issuance reader", async () => {
+    const f = await fixture();
+    const { inputs, runtime } = await f.consumers();
+    expect(Object.hasOwn(runtime.accounts, "readVerifiedLocalPrincipalIssuance")).toBe(false);
+    expect(() =>
+      assertVerifiedLocalPrincipalIssuanceReader(runtime.accounts, { sql: inputs.sql }),
+    ).toThrow();
+    expect(() =>
+      readWorkerRequestVerifiedLocalPrincipalIssuanceInputs(inputs.connection, {}),
+    ).toThrow();
+  });
+
+  test("an actual ignored class write cannot publish a Principal issuance origin", async () => {
+    const r = await retainedDirectRequestFixture();
+    r.f.db.exec(
+      "CREATE TRIGGER component_ignore_class BEFORE INSERT ON credential_authority_classes BEGIN SELECT RAISE(IGNORE); END",
+    );
+    await expect(r.issueFresh("verified-ignored-class")).rejects.toThrow();
+    expect(await r.inputs.sql.query("SELECT count(*) AS n FROM principals")).toEqual([{ n: 2 }]);
+    expect(
+      await r.inputs.sql.query("SELECT count(*) AS n FROM credential_authority_classes"),
+    ).toEqual([{ n: 1 }]);
+    expect(
+      readWorkerRequestVerifiedLocalPrincipalIssuanceInputs(r.inputs.connection, {
+        principal: { providerSubject: "verified-ignored-class" },
+      }),
+    ).toBeNull();
+    expect(
+      readWorkerRequestVerifiedLocalPrincipalIssuanceInputs(r.inputs.connection, r.issued),
+    ).not.toBeNull();
+  });
+
+  test("unknown issuance ACK cannot publish verification/enrollment provenance even after actual local commit", async () => {
+    const r = await retainedDirectRequestFixture();
+    let fault = 0;
+    r.control.onResult = (result, originalStatementSql) => {
+      if (!originalStatementSql.startsWith("INSERT INTO credential_authority_classes"))
+        return undefined;
+      fault++;
+      return { results: result.rows, meta: { changes: result.changes } };
+    };
+    await expect(r.issueFresh("verified-unknown-issuance")).rejects.toThrow();
+    delete r.control.onResult;
+    expect(fault).toBeGreaterThan(0);
+    expect(
+      await r.inputs.sql.query("SELECT count(*) AS n FROM credential_authority_classes"),
+    ).toEqual([{ n: 2 }]);
+    expect(
+      readWorkerRequestVerifiedLocalPrincipalIssuanceInputs(r.inputs.connection, {
+        principal: { providerSubject: "verified-unknown-issuance" },
+      }),
+    ).toBeNull();
+    expect(
+      readWorkerRequestVerifiedLocalPrincipalIssuanceInputs(r.inputs.connection, r.issued),
+    ).not.toBeNull();
+  });
+
+  test("batch method substitution after the write await refuses provenance without invoking the getter", async () => {
+    const r = await retainedDirectRequestFixture();
+    const descriptor = Object.getOwnPropertyDescriptor(r.inputs.sql, "batch");
+    if (!descriptor) throw new Error("original batch missing");
+    let changed = false;
+    let reads = 0;
+    r.control.onResult = (_result, originalStatementSql) => {
+      if (!changed && originalStatementSql.startsWith("INSERT INTO credential_authority_classes")) {
+        changed = true;
+        Object.defineProperty(r.inputs.sql, "batch", {
+          configurable: true,
+          get(): never {
+            reads++;
+            throw new Error("replacement batch getter");
+          },
+        });
+      }
+      return undefined;
+    };
+    try {
+      await expect(r.issueFresh("verified-mutated-batch")).rejects.toThrow();
+      expect(changed).toBe(true);
+      expect(reads).toBe(0);
+    } finally {
+      delete r.control.onResult;
+      Object.defineProperty(r.inputs.sql, "batch", descriptor);
+    }
+    expect(
+      readWorkerRequestVerifiedLocalPrincipalIssuanceInputs(r.inputs.connection, {
+        principal: { providerSubject: "verified-mutated-batch" },
+      }),
+    ).toBeNull();
+    expect(
+      readWorkerRequestVerifiedLocalPrincipalIssuanceInputs(r.inputs.connection, r.issued),
+    ).not.toBeNull();
   });
 });

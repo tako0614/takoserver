@@ -5,12 +5,15 @@ import {
   type AuthTokenCaptureReader,
   assertAuthTokenCaptureReader,
   assertRetainedDirectOwnerSessionReader,
+  assertVerifiedLocalPrincipalIssuanceReader,
   createAccounts,
   createAccountsWithUnregisteredLocalIssuer,
   createApiKeyAdministration,
   type ExternalIdentityVerifier,
   type RetainedDirectOwnerSessionData,
   type RetainedDirectOwnerSessionReader,
+  type VerifiedLocalPrincipalIssuance,
+  type VerifiedLocalPrincipalIssuanceReader,
 } from "./auth.ts";
 import {
   createCredentialAuthorityClassStore,
@@ -466,6 +469,45 @@ export async function readWorkerRequestRetainedRpPrincipalBindingInputs(
   )
     return null;
   return Object.freeze({ inputs, credentialOriginal, anchor, binding });
+}
+
+/** Original verified fresh-local Principal issuance, separate from credential DATA.
+ * Not shared-human enrollment, qualified policy Clock/schema/target or NEW permission.
+ */
+export interface WorkerRequestVerifiedLocalPrincipalIssuanceInputs {
+  readonly inputs: WorkerRequestFinancialInputs;
+  readonly principalOriginal: VerifiedLocalPrincipalIssuance;
+}
+
+/** No bearer/Actor/Principal selector can replace the original signIn result. */
+export function readWorkerRequestVerifiedLocalPrincipalIssuanceInputs(
+  connection: WorkerRequestSql,
+  originalSignInResult: unknown,
+): WorkerRequestVerifiedLocalPrincipalIssuanceInputs | null {
+  assertWorkerRequestBacking(connection);
+  const inputs = readWorkerRequestFinancialInputs(connection);
+  const consumers = readWorkerRequestConsumers(connection);
+  const receiver = consumers.accounts;
+  assertVerifiedLocalPrincipalIssuanceReader(receiver, { sql: inputs.sql });
+  const descriptor = Object.getOwnPropertyDescriptor(
+    receiver,
+    "readVerifiedLocalPrincipalIssuance",
+  );
+  if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "function")
+    throw new TypeError("Worker verified Principal issuance reader differs");
+  const read: VerifiedLocalPrincipalIssuanceReader["readVerifiedLocalPrincipalIssuance"] =
+    descriptor.value;
+  const principalOriginal: VerifiedLocalPrincipalIssuance | null = Reflect.apply(read, receiver, [
+    originalSignInResult,
+  ]);
+  assertWorkerRequestBacking(connection);
+  assertVerifiedLocalPrincipalIssuanceReader(receiver, { sql: inputs.sql });
+  if (
+    readWorkerRequestFinancialInputs(connection) !== inputs ||
+    readWorkerRequestConsumers(connection) !== consumers
+  )
+    throw new TypeError("Worker verified Principal issuance request origin differs");
+  return principalOriginal ? Object.freeze({ inputs, principalOriginal }) : null;
 }
 
 /** Original request inputs plus retained historical DATA, not an authority port.

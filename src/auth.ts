@@ -215,6 +215,55 @@ export interface RetainedDirectOwnerSessionReader extends AuthTokenCaptureReader
   readRetainedDirectOwnerSessionCapture(capture: unknown): RetainedDirectOwnerSessionData | null;
 }
 
+/** Original verification plus fresh Principal issuance, separate from any bearer.
+ * This proves the local verified producer and acknowledged issuance only. It does
+ * not qualify shared-human binding, installed Auth103/target, policy Clock or NEW.
+ */
+export interface VerifiedLocalPrincipalIssuance {
+  readonly verification: IdentityVerificationObservation;
+  readonly anchor: PrincipalAnchor;
+}
+
+/** The input is the original in-process signIn result, never its wire DTO/clone. */
+export interface VerifiedLocalPrincipalIssuanceReader {
+  readVerifiedLocalPrincipalIssuance(
+    originalSignInResult: unknown,
+  ): VerifiedLocalPrincipalIssuance | null;
+}
+
+const verifiedLocalPrincipalReaderOrigins = new WeakMap<
+  object,
+  {
+    readonly sql: Sql;
+    readonly identity: OriginalIdentityCapture;
+    readonly signIn: Accounts["signIn"];
+    readonly read: VerifiedLocalPrincipalIssuanceReader["readVerifiedLocalPrincipalIssuance"];
+    readonly query: Sql["query"];
+    readonly batch: Sql["batch"];
+  }
+>();
+
+/** Actual local verifier/Accounts/Sql methods, not a qualified Financial port. */
+export function assertVerifiedLocalPrincipalIssuanceReader(
+  reader: unknown,
+  context: { readonly sql: Sql },
+): asserts reader is VerifiedLocalPrincipalIssuanceReader {
+  assertRetainedDirectOwnerSessionReader(reader, context);
+  const origin = verifiedLocalPrincipalReaderOrigins.get(reader);
+  if (!origin) throw new AuthError("invalid");
+  assertIdentityVerificationCaptureReader(origin.identity.receiver);
+  for (const [receiver, key, expected] of [
+    [reader, "signIn", origin.signIn],
+    [reader, "readVerifiedLocalPrincipalIssuance", origin.read],
+    [origin.sql, "query", origin.query],
+    [origin.sql, "batch", origin.batch],
+  ] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(receiver, key);
+    if (!descriptor || !("value" in descriptor) || descriptor.value !== expected)
+      throw new AuthError("invalid");
+  }
+}
+
 const authTokenCaptureReaderOrigins = new WeakMap<
   object,
   {
@@ -932,7 +981,7 @@ export function createAccountsWithUnregisteredLocalIssuer(
   options: CreateAccountsOptions & {
     readonly identity: ExternalIdentityVerifier & IdentityVerificationCaptureReader;
   },
-): Accounts & RetainedDirectOwnerSessionReader {
+): Accounts & RetainedDirectOwnerSessionReader & VerifiedLocalPrincipalIssuanceReader {
   // Read the selected verifier once through an own data descriptor. Reading
   // options.identity repeatedly lets an accessor return a genuine verifier
   // for the origin check and fake callbacks for the later captured methods.
@@ -974,7 +1023,9 @@ export function createAccountsWithUnregisteredLocalIssuer(
     capture: capture.value,
     inspect: inspect.value,
   });
-  return createAccountsInternal(normalized, original);
+  const accounts = createAccountsInternal(normalized, original);
+  assertVerifiedLocalPrincipalIssuanceReader(accounts, { sql });
+  return accounts;
 }
 
 function createAccountsInternal(
@@ -991,6 +1042,7 @@ function createAccountsInternal(
   const stamp = (): string => clock().toISOString();
   const tokenCaptures = new WeakMap<object, CapturedAuthTokenRow>();
   const retainedSessionCaptures = new WeakMap<object, RetainedDirectOwnerSessionData>();
+  const verifiedLocalPrincipalIssuances = new WeakMap<object, VerifiedLocalPrincipalIssuance>();
 
   // Retained observations stay on the factory's original query and receiver.
   // Inspect own data descriptors so replacement accessors never execute.
@@ -1182,11 +1234,12 @@ function createAccountsInternal(
       // nothing, and a crash after this point burns it rather than leaving it
       // usable twice.
       if (verified.singleUse) await singleUse.spend(verified.singleUse);
-      if (localIssuer) assertIdentityVerificationCaptureReader(localIssuer.receiver);
+      if (localIssuer) assertVerifiedLocalPrincipalIssuanceReader(accounts, { sql });
       const rows = await sql.query(
         "SELECT id, email, display_name FROM principals WHERE provider = ? AND provider_subject = ?",
         [provider, verified.providerSubject],
       );
+      if (localIssuer) assertVerifiedLocalPrincipalIssuanceReader(accounts, { sql });
       const existing = rows[0];
       const id = existing ? String(existing.id) : `prn_${randomId()}`;
       // Keep the original Takos ID Organization projection. For a fresh local
@@ -1217,7 +1270,7 @@ function createAccountsInternal(
         );
       }
       if (localIssuer && observed && !existing) {
-        assertIdentityVerificationCaptureReader(localIssuer.receiver);
+        assertVerifiedLocalPrincipalIssuanceReader(accounts, { sql });
         const createdAt = stamp();
         const incarnation = `principal_inc_${randomId()}`;
         const originRef = `local_identity_${randomId()}`;
@@ -1259,8 +1312,8 @@ function createAccountsInternal(
           anchor,
           observed.verificationDomain,
         );
-        assertIdentityVerificationCaptureReader(localIssuer.receiver);
-        await sql.batch([
+        assertVerifiedLocalPrincipalIssuanceReader(accounts, { sql });
+        const issuance = await sql.batch([
           {
             sql: `INSERT INTO principals (id, provider, provider_subject, email, display_name, created_at)
                   VALUES (?, ?, ?, ?, ?, ?)`,
@@ -1304,7 +1357,18 @@ function createAccountsInternal(
           // roll back Principal, anchor, projection and token together.
           classStatement,
         ]);
-        return {
+        assertVerifiedLocalPrincipalIssuanceReader(accounts, { sql });
+        // Require actual fresh Principal/anchor/token/class write ACKs. Trigger
+        // fanout may exceed one; missing/zero/unknown is never issuance proof.
+        const writes = [issuance[0], issuance[1], issuance[issuance.length - 2], issuance.at(-1)];
+        if (
+          issuance.length !== 4 + projection.length ||
+          writes.some(
+            (write) => !write || !Number.isSafeInteger(write.changes) || write.changes <= 0,
+          )
+        )
+          throw new AuthError("invalid");
+        const result = {
           principal: {
             id,
             provider,
@@ -1314,6 +1378,13 @@ function createAccountsInternal(
           },
           sessionToken: secret,
         };
+        // Published only here: original verified identity and this acknowledged
+        // same-batch enrollment, never a token/Actor/row-kind inferred identity.
+        verifiedLocalPrincipalIssuances.set(
+          result,
+          Object.freeze({ verification: observed, anchor }),
+        );
+        return result;
       }
       if (localIssuer && existing) {
         // Reissuance for any enrolled Principal is a separate owner unit.
@@ -1747,6 +1818,36 @@ function createAccountsInternal(
       readRetained: accounts.readRetainedDirectOwnerSessionCapture,
     }),
   );
+  if (localIssuer) {
+    const batch = Object.getOwnPropertyDescriptor(sql, "batch");
+    if (
+      !originalRetainedQuery ||
+      !batch ||
+      !("value" in batch) ||
+      typeof batch.value !== "function"
+    )
+      throw new AuthError("invalid");
+    const readVerifiedLocalPrincipalIssuance = (
+      result: unknown,
+    ): VerifiedLocalPrincipalIssuance | null => {
+      assertVerifiedLocalPrincipalIssuanceReader(accounts, { sql });
+      return result && typeof result === "object"
+        ? (verifiedLocalPrincipalIssuances.get(result) ?? null)
+        : null;
+    };
+    Object.assign(accounts, { readVerifiedLocalPrincipalIssuance });
+    verifiedLocalPrincipalReaderOrigins.set(
+      accounts,
+      Object.freeze({
+        sql,
+        identity: localIssuer,
+        signIn: accounts.signIn,
+        read: readVerifiedLocalPrincipalIssuance,
+        query: originalRetainedQuery,
+        batch: batch.value,
+      }),
+    );
+  }
   return accounts;
 }
 
