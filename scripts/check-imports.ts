@@ -756,6 +756,121 @@ function exactHostAcceptanceCompositionTypeEdge(path: string, target: string): b
   return JSON.stringify(names) === JSON.stringify(expected.sort());
 }
 
+/** Reviewed Container consumers: exact named imports, never adapter-wide v2 access. */
+const EXACT_CONTAINER_ADAPTER_IMPORTS: readonly {
+  readonly source: string;
+  readonly target: string;
+  readonly typeOnly: boolean;
+  readonly names: readonly string[];
+}[] = [
+  {
+    source: "src/providers/selfhost-container-entry-contract.ts",
+    target: "src/takoform-v2/host-acceptance.ts",
+    typeOnly: true,
+    names: ["V2HostAcceptance"],
+  },
+  {
+    source: "src/providers/selfhost-container-entry-contract.ts",
+    target: "src/takoform-v2/types.ts",
+    typeOnly: true,
+    names: ["V2Form"],
+  },
+  {
+    source: "src/providers/container-secret-codec.ts",
+    target: "src/takoform-v2/private-inputs.ts",
+    typeOnly: true,
+    names: ["V2PrivateInputKey"],
+  },
+  {
+    source: "src/providers/docker-container-configured-inputs.ts",
+    target: "src/takoform-v2/configured-private-inputs.ts",
+    typeOnly: false,
+    names: [
+      "readV2ConfiguredPrivateInputs",
+      "type V2ConfiguredPrivateInputIdentity",
+      "type V2ConfiguredPrivateInputs",
+    ],
+  },
+  {
+    source: "src/providers/docker-container-configured-inputs.ts",
+    target: "src/takoform-v2/forms/container.ts",
+    typeOnly: false,
+    names: ["isContainerHealthPath", "isContainerImage", "scalarStringWithin"],
+  },
+  {
+    source: "src/providers/docker-container-configured-inputs.ts",
+    target: "src/takoform-v2/private-inputs.ts",
+    typeOnly: true,
+    names: ["V2PrivateInputMap"],
+  },
+  {
+    source: "src/providers/docker-container-configured-inputs.ts",
+    target: "src/takoform-v2/types.ts",
+    typeOnly: true,
+    names: ["V2Execution", "V2Form"],
+  },
+  {
+    source: "src/providers/docker-container-core-owner.ts",
+    target: "src/takoform-v2/configured-private-inputs.ts",
+    typeOnly: false,
+    names: ["readV2ConfiguredPrivateInputs"],
+  },
+  {
+    source: "src/providers/docker-container-core-owner.ts",
+    target: "src/takoform-v2/container-owner-schema.ts",
+    typeOnly: false,
+    names: [
+      "createV2ContainerHostAcceptance",
+      "serializeV2ContainerConfiguredPrivateInputs",
+      "V2_CONTAINER_F2_FORM",
+      "validateV2ContainerF2SensitiveNames",
+    ],
+  },
+  {
+    source: "src/providers/docker-container-core-owner.ts",
+    target: "src/takoform-v2/host-acceptance.ts",
+    typeOnly: true,
+    names: ["V2HostAcceptance", "V2HostAcceptanceContext", "V2HostDeleteAcceptanceContext"],
+  },
+  {
+    source: "src/providers/docker-container-core-owner.ts",
+    target: "src/takoform-v2/types.ts",
+    typeOnly: true,
+    names: ["V2Execution"],
+  },
+];
+
+function exactContainerAdapterImportEdge(path: string, target: string): boolean {
+  const expected = EXACT_CONTAINER_ADAPTER_IMPORTS.find(
+    (entry) => entry.source === path && entry.target === target,
+  );
+  if (
+    expected === undefined ||
+    localImportsOf(path).filter((candidate) => candidate === target).length !== 1
+  )
+    return false;
+  const declarations = [
+    ...readFileSync(path, "utf8").matchAll(
+      /^import\s+(type\s+)?\{([^}]+)\}\s+from\s+(["'])([^"']+)\3;$/gmu,
+    ),
+  ].filter(
+    (entry) => normalize(relative(resolve("."), resolve(dirname(path), entry[4] ?? ""))) === target,
+  );
+  const declaration = declarations[0];
+  if (
+    declarations.length !== 1 ||
+    declaration === undefined ||
+    Boolean(declaration[1]) !== expected.typeOnly
+  )
+    return false;
+  const names = (declaration[2] ?? "")
+    .split(",")
+    .map((name) => name.trim().replace(/\s+/gu, " "))
+    .filter((name) => name !== "");
+  if (names.some((name) => !/^(?:type )?[A-Za-z_$][\w$]*$/u.test(name))) return false;
+  return JSON.stringify(names.sort()) === JSON.stringify([...expected.names].sort());
+}
+
 for (const path of walk("src")) {
   if (!path.endsWith(".ts") || path.endsWith(".d.ts")) continue;
   const layer = layerOf(path);
@@ -917,6 +1032,7 @@ for (const path of walk("src")) {
       !exactHostAcceptanceCompositionTypeEdge(path, target) &&
       !exactContainerHostAcceptanceEdge &&
       !exactContainerConstructionExportEdge &&
+      !exactContainerAdapterImportEdge(path, target) &&
       !exactOriginDeploymentParserEdge &&
       !exactWorkerEndpointOriginConstructionEdge &&
       !exactOriginPublicationExtensionEdge &&
