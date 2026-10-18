@@ -9,6 +9,7 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -20,7 +21,10 @@ import { parseTakoformV2ApplicationConfig } from "../../src/takoform-v2/config.t
 import { CloudflareState } from "./cloudflare-state.ts";
 import { mutationError, preflightError } from "./errors.ts";
 import { loadIntegrationStorageOriginalCreateInput } from "./integration-storage-generation.ts";
-import { captureMoneyNativeBuildClosure } from "./money-native-build-closure.ts";
+import {
+  captureMoneyNativeBuildClosure,
+  inspectMoneyNativeBuildDependencyTree,
+} from "./money-native-build-closure.ts";
 import { resolveCloudflareCredential, runCommand } from "./process.ts";
 import { type SealedArtifact, sealDirectory, unsealDirectory } from "./qualification.ts";
 import {
@@ -45,6 +49,7 @@ import { workerVersionIdentity } from "./worker-live.ts";
 import {
   assertExactVersionBindingClosure,
   expectedExactBindingClosure,
+  parseWorkerDeploymentChain,
   parseWorkerDeploymentHistory,
 } from "./worker-state.ts";
 import {
@@ -55,6 +60,8 @@ import {
 } from "./wrangler-state.ts";
 
 const SHA = /^sha256:[0-9a-f]{64}$/u;
+const ORIGINAL_UPLOAD_ROOT = "money-inactive-normal-version";
+const REPLACEMENT_UPLOAD_ROOT = "money-inactive-normal-version-replacement-after-unknown-v1";
 const requestFields = [
   "targetPath",
   "originalCreateInputPath",
@@ -138,6 +145,15 @@ function privateDirectory(path: string): string {
   )
     throw preflightError("money inactive Version needs its actual private owned directory");
   return [info.dev, info.ino, info.mode, info.uid].join(":");
+}
+function syncPrivateDirectory(path: string): void {
+  privateDirectory(path);
+  const fd = openSync(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
 }
 function inputSeal(path: string): string {
   privateDirectory(dirname(path));
@@ -337,6 +353,217 @@ async function provePreparedPair(custodyRoot: string, canonicalPublic: string): 
     throw preflightError("money prepared signing genesis pair changed");
 }
 
+interface OriginalUnknownUpload {
+  readonly versionId: string;
+  readonly bindingDigest: string;
+  readonly sourceCommit: string;
+  readonly sourceTreeDigest: string;
+  readonly publicJwk: string;
+  assertCurrent(): Promise<void>;
+}
+
+/**
+ * Read-only quarantine of the first owner's unknown upload. Its DATA never
+ * enters originalSigningUploads and never supplies a successful receipt.
+ */
+async function readOriginalUnknownUpload(
+  context: MoneyUnitHeldConvertContext,
+  target: DeployTarget,
+  selected: MoneyNormalVersionUploadRequest,
+  state: CloudflareState,
+  originalRoot: string,
+): Promise<OriginalUnknownUpload> {
+  const rootIdentity = privateDirectory(originalRoot);
+  const custodyRoot = join(originalRoot, "CUSTODY");
+  const custodyIdentity = privateDirectory(custodyRoot);
+  const buildOwnerRoot = join(originalRoot, "build-owner");
+  const buildOwnerIdentity = privateDirectory(buildOwnerRoot);
+  const buildOwnerTree = inspectMoneyNativeBuildDependencyTree(buildOwnerRoot);
+  const names = assertFreshSecretProfile(target);
+  const expectedEntries = [
+    "CUSTODY",
+    "INTENT.json",
+    "REQUEST.json",
+    "SIGNING-GENESIS.json",
+    "build-owner",
+    "wrangler-version-upload.jsonl",
+  ].sort();
+  if (
+    JSON.stringify(readdirSync(originalRoot).sort()) !== JSON.stringify(expectedEntries) ||
+    JSON.stringify(readdirSync(custodyRoot).sort()) !== JSON.stringify([...names].sort())
+  )
+    throw preflightError("money replacement requires the exact isolated unknown original root");
+  const requestPath = join(originalRoot, "REQUEST.json");
+  const intentPath = join(originalRoot, "INTENT.json");
+  const genesisPath = join(originalRoot, "SIGNING-GENESIS.json");
+  const outputPath = join(originalRoot, "wrangler-version-upload.jsonl");
+  const paths = [
+    requestPath,
+    intentPath,
+    genesisPath,
+    outputPath,
+    ...names.map((name) => join(custodyRoot, name)),
+  ];
+  const seals = paths.map((path) => [path, inputSeal(path)] as const);
+  const request = parseMoneyNormalVersionUploadRequest(
+    JSON.parse(readFileSync(requestPath, "utf8")),
+  );
+  const intent = JSON.parse(readFileSync(intentPath, "utf8"));
+  const genesis = JSON.parse(readFileSync(genesisPath, "utf8"));
+  const output = readFileSync(outputPath, "utf8");
+  const publication = parseWranglerVersionUploadOutput(output, target.workerName);
+  const facts = context.facts;
+  const heldConvertDigest = sha(new TextEncoder().encode(JSON.stringify(facts)));
+  if (
+    JSON.stringify(request) !== JSON.stringify(selected) ||
+    JSON.stringify(Object.keys(intent).sort()) !==
+      JSON.stringify(
+        [
+          "artifactDigest",
+          "convertBindingDigest",
+          "converted94BackupDigest",
+          "kind",
+          "maintenance",
+          "moduleDigest",
+          "nextWriterEpoch",
+          "previousWriterEpoch",
+          "sourceCommit",
+          "sourceTreeDigest",
+        ].sort(),
+      ) ||
+    intent.kind !== "money-inactive-version-upload-intent@v1" ||
+    !SHA.test(intent.artifactDigest) ||
+    !SHA.test(intent.moduleDigest) ||
+    !SHA.test(intent.sourceTreeDigest) ||
+    !/^[0-9a-f]{40}$/u.test(intent.sourceCommit) ||
+    JSON.stringify(intent.maintenance) !== JSON.stringify(facts.maintenance) ||
+    intent.convertBindingDigest !== facts.conversion.convertBindingDigest ||
+    intent.converted94BackupDigest !== facts.converted94.backupDigest ||
+    intent.previousWriterEpoch !== facts.previousWriterEpoch ||
+    intent.nextWriterEpoch !== facts.nextWriterEpoch ||
+    JSON.stringify(Object.keys(genesis).sort()) !==
+      JSON.stringify(
+        [
+          "convertBindingDigest",
+          "converted94BackupDigest",
+          "createdAtEpochSeconds",
+          "heldConvertDigest",
+          "keyId",
+          "kind",
+          "original92BackupDigest",
+          "publicJwk",
+          "registration",
+          "secretNames",
+        ].sort(),
+      ) ||
+    genesis.kind !== "takoserver.money-prepared-signing-genesis@v1" ||
+    genesis.registration !== "pending-owning-suffix-transaction" ||
+    genesis.keyId !== effectiveSigningKeyId(target) ||
+    genesis.heldConvertDigest !== heldConvertDigest ||
+    genesis.original92BackupDigest !== facts.original92.backupDigest ||
+    genesis.converted94BackupDigest !== facts.converted94.backupDigest ||
+    genesis.convertBindingDigest !== facts.conversion.convertBindingDigest ||
+    JSON.stringify(genesis.secretNames) !== JSON.stringify(names) ||
+    typeof genesis.publicJwk !== "string" ||
+    !Number.isSafeInteger(genesis.createdAtEpochSeconds) ||
+    genesis.createdAtEpochSeconds <= 0 ||
+    publication.versionId === facts.maintenance.versionId
+  )
+    throw preflightError("money replacement original unknown history differs");
+  await provePreparedPair(custodyRoot, genesis.publicJwk);
+  const { schemaMaintenanceMode: _maintenanceMode, ...plainTarget } = target;
+  const normalTarget: DeployTarget = {
+    ...plainTarget,
+    moneyCutoverWriterEpoch: facts.nextWriterEpoch,
+  };
+  const expected = {
+    ...expectedExactBindingClosure(normalTarget, {
+      signingKeyId: genesis.keyId,
+      workerArtifactDigest: intent.moduleDigest,
+      ...(normalTarget.integrationE2eCredentialAuthority === undefined
+        ? {}
+        : {
+            authorityProfile: {
+              kind: "provenance-bound-jit" as const,
+              provenance: {
+                sourceCommit: intent.sourceCommit,
+                artifactDigest: intent.moduleDigest,
+              },
+            },
+          }),
+    }),
+    ...(normalTarget.hostedBilling === undefined
+      ? { TAKOSERVER_STRIPE_MODE: { type: "plain_text", fields: { text: "test" } } }
+      : {}),
+  };
+  const bindingDigest = sha(
+    new TextEncoder().encode(
+      JSON.stringify({
+        rootIdentity,
+        custodyIdentity,
+        buildOwnerIdentity,
+        buildOwnerTree,
+        seals,
+        versionId: publication.versionId,
+        intent,
+        genesisPublicJwk: genesis.publicJwk,
+      }),
+    ),
+  );
+  const assertCurrent = async () => {
+    await assertMoneyUnitHeldConvertCurrent(context);
+    if (
+      privateDirectory(originalRoot) !== rootIdentity ||
+      privateDirectory(custodyRoot) !== custodyIdentity ||
+      privateDirectory(buildOwnerRoot) !== buildOwnerIdentity ||
+      JSON.stringify(inspectMoneyNativeBuildDependencyTree(buildOwnerRoot)) !==
+        JSON.stringify(buildOwnerTree) ||
+      JSON.stringify(readdirSync(originalRoot).sort()) !== JSON.stringify(expectedEntries) ||
+      JSON.stringify(readdirSync(custodyRoot).sort()) !== JSON.stringify([...names].sort()) ||
+      seals.some(([path, seal]) => inputSeal(path) !== seal)
+    )
+      throw preflightError("money replacement original unknown custody changed");
+    await provePreparedPair(custodyRoot, genesis.publicJwk);
+    const version = await state.workerVersion(target.workerName, publication.versionId);
+    const modules = await state.workerVersionWithModules(target.workerName, publication.versionId);
+    const deployments = parseWorkerDeploymentChain(
+      await state.workerDeployments(target.workerName),
+    );
+    const identity = workerVersionIdentity("verification", version);
+    if (
+      (version as { id?: unknown }).id !== publication.versionId ||
+      (modules as { id?: unknown }).id !== publication.versionId ||
+      identity.commit !== intent.sourceCommit ||
+      `sha256:${identity.bundleDigestHex}` !== intent.moduleDigest ||
+      `sha256:${exactV2MaintenanceModuleDigest("verification", modules)}` !== intent.moduleDigest ||
+      deployments.some((entry) => entry.versionId === publication.versionId) ||
+      deployments[0]?.deploymentId !== facts.maintenance.deploymentId ||
+      deployments[0]?.versionId !== facts.maintenance.versionId
+    )
+      throw preflightError("money replacement original Version or maintenance changed");
+    assertExactVersionBindingClosure("verification", publication.versionId, version, expected);
+    await assertMoneyUnitHeldConvertCurrent(context);
+    if (
+      privateDirectory(originalRoot) !== rootIdentity ||
+      privateDirectory(custodyRoot) !== custodyIdentity ||
+      privateDirectory(buildOwnerRoot) !== buildOwnerIdentity ||
+      JSON.stringify(inspectMoneyNativeBuildDependencyTree(buildOwnerRoot)) !==
+        JSON.stringify(buildOwnerTree) ||
+      seals.some(([path, seal]) => inputSeal(path) !== seal)
+    )
+      throw preflightError("money replacement original unknown changed after native read");
+  };
+  await assertCurrent();
+  return Object.freeze({
+    versionId: publication.versionId,
+    bindingDigest,
+    sourceCommit: intent.sourceCommit,
+    sourceTreeDigest: intent.sourceTreeDigest,
+    publicJwk: genesis.publicJwk,
+    assertCurrent,
+  });
+}
+
 async function createFreshSigningGenesis(
   context: MoneyUnitHeldConvertContext,
   target: DeployTarget,
@@ -487,7 +714,7 @@ export async function readMoneyNormalWorkerSigningGenesisContribution(
     !isAbsolute(selectorPath) ||
     resolve(selectorPath) !== selectorPath ||
     basename(selectorPath) !== "normal-worker.selector.json" ||
-    basename(dirname(selectorPath)) !== "money-inactive-normal-version"
+    ![ORIGINAL_UPLOAD_ROOT, REPLACEMENT_UPLOAD_ROOT].includes(basename(dirname(selectorPath)))
   )
     throw preflightError("money signing genesis requires the original normal selector locator");
   const root = dirname(selectorPath);
@@ -709,9 +936,24 @@ export async function uploadMoneyNormalWorkerVersionForOriginalContext(
   return uploadMoneyNormalWorkerVersionOwned(request, context);
 }
 
+/**
+ * Separate source-selected replacement after the original upload is observed
+ * UNKNOWN. This is not a retry or recovery of the old Version/witness. It is
+ * deliberately absent from the ordinary original upload and CLI routes.
+ */
+export async function uploadMoneyNormalWorkerReplacementVersionForOriginalContext(
+  context: MoneyUnitHeldConvertContext,
+  request: unknown,
+): Promise<Readonly<MoneyNormalWorkerOwnedUpload>> {
+  parseMoneyNormalVersionUploadRequest(request);
+  await assertMoneyUnitHeldConvertCurrent(context);
+  return uploadMoneyNormalWorkerVersionOwned(request, context, "replacement-after-unknown");
+}
+
 async function uploadMoneyNormalWorkerVersionOwned(
   request: unknown,
   suppliedContext?: MoneyUnitHeldConvertContext,
+  attempt: "original" | "replacement-after-unknown" = "original",
 ): Promise<Readonly<MoneyNormalWorkerOwnedUpload>> {
   const selected = parseMoneyNormalVersionUploadRequest(request);
   const inputPaths = [
@@ -773,7 +1015,36 @@ async function uploadMoneyNormalWorkerVersionOwned(
     throw preflightError("money inactive Version differs from the genuine original held target");
   // Derive the only output root from the actual owner declaration, not a caller output/config path.
   privateDirectory(options.outputDirectory);
-  const root = join(options.outputDirectory, "money-inactive-normal-version");
+  let replacementUnknown: OriginalUnknownUpload | undefined;
+  let replacementCredential: Awaited<ReturnType<typeof resolveCloudflareCredential>> | undefined;
+  let replacementState: CloudflareState | undefined;
+  if (attempt === "replacement-after-unknown") {
+    if (suppliedContext === undefined)
+      throw preflightError("money replacement requires its live original held context");
+    if (
+      (await options.custody.read("suffix98")) !== null ||
+      (await options.custody.readDispatch("suffix98")) !== null
+    )
+      throw mutationError("money replacement cannot follow original suffix dispatch or terminal");
+    replacementCredential = await resolveCloudflareCredential("integration", { run: runCommand });
+    replacementState = new CloudflareState({
+      accountId: target.accountId,
+      token: replacementCredential.token,
+    });
+    replacementUnknown = await readOriginalUnknownUpload(
+      context,
+      target,
+      selected,
+      replacementState,
+      join(options.outputDirectory, ORIGINAL_UPLOAD_ROOT),
+    );
+    await replacementUnknown.assertCurrent();
+    assertInputs();
+  }
+  const root = join(
+    options.outputDirectory,
+    attempt === "original" ? ORIGINAL_UPLOAD_ROOT : REPLACEMENT_UPLOAD_ROOT,
+  );
   try {
     mkdirSync(root, { mode: 0o700 });
   } catch {
@@ -794,6 +1065,8 @@ async function uploadMoneyNormalWorkerVersionOwned(
   try {
     writePrivate(join(root, "REQUEST.json"), selected);
     const genesis = await createFreshSigningGenesis(context, target, root, assertInputs);
+    if (replacementUnknown !== undefined && genesis.publicJwk === replacementUnknown.publicJwk)
+      throw preflightError("money replacement cannot reuse the unknown original signing key");
     const buildRoot = join(root, "build-owner");
     mkdirSync(buildRoot, { mode: 0o700 });
     const build = await buildClosure.bindSource(
@@ -801,10 +1074,20 @@ async function uploadMoneyNormalWorkerVersionOwned(
       buildClosure.sourceCommit,
       buildRoot,
     );
+    if (
+      replacementUnknown !== undefined &&
+      (replacementUnknown.sourceCommit !== build.sourceCommit ||
+        replacementUnknown.sourceTreeDigest !== build.sourceTreeDigest)
+    )
+      throw preflightError("money replacement original source differs from the reviewed build");
     assertInputs();
-    const credential = await resolveCloudflareCredential("integration", { run: runCommand });
+    const credential =
+      replacementCredential ??
+      (await resolveCloudflareCredential("integration", { run: runCommand }));
     assertInputs();
-    const state = new CloudflareState({ accountId: target.accountId, token: credential.token });
+    const state =
+      replacementState ??
+      new CloudflareState({ accountId: target.accountId, token: credential.token });
     const assertLocal = () => {
       assertInputs();
       build.assertCurrent();
@@ -814,6 +1097,7 @@ async function uploadMoneyNormalWorkerVersionOwned(
     };
     const assertMaintenance = async () => {
       assertLocal();
+      await replacementUnknown?.assertCurrent();
       await assertMoneyUnitHeldConvertCurrent(context);
       assertLocal();
       const writer = await options.maintenanceProof();
@@ -935,8 +1219,9 @@ async function uploadMoneyNormalWorkerVersionOwned(
       expectedWorkerSecrets(normalTarget),
     );
     writePrivate(secretsFilePath, secretValues);
-    temporarySecretSeal = sealDirectory(temporarySecretsRoot, ["secrets.json"]);
-    temporarySecretSeal.assertUnchanged();
+    const sealedSecrets = sealDirectory(temporarySecretsRoot, ["secrets.json"]);
+    temporarySecretSeal = sealedSecrets;
+    sealedSecrets.assertUnchanged();
     const argv = moneyNormalVersionUploadArguments({
       bundlePath: prepared.bundlePath,
       configPath: prepared.configPath,
@@ -956,13 +1241,56 @@ async function uploadMoneyNormalWorkerVersionOwned(
       previousWriterEpoch: context.facts.previousWriterEpoch,
       nextWriterEpoch: context.facts.nextWriterEpoch,
     });
+    const replacementDispatchPath =
+      replacementUnknown === undefined ? undefined : join(root, "REPLACEMENT-DISPATCH-SEAL.json");
+    const replacementSecretInputSeal =
+      replacementDispatchPath === undefined ? undefined : sealedSecrets.digest;
+    if (replacementUnknown !== undefined && replacementDispatchPath !== undefined) {
+      await replacementUnknown.assertCurrent();
+      sealedSecrets.assertUnchanged();
+      writePrivate(replacementDispatchPath, {
+        kind: "takoserver.money-inactive-version-replacement-dispatch-seal@v1",
+        originalUnknownBindingDigest: replacementUnknown.bindingDigest,
+        originalCandidateDigest: sha(new TextEncoder().encode(replacementUnknown.versionId)),
+        accountId: target.accountId,
+        workerName: target.workerName,
+        previousWriterEpoch: context.facts.previousWriterEpoch,
+        nextWriterEpoch: context.facts.nextWriterEpoch,
+        sourceCommit: build.sourceCommit,
+        sourceTreeDigest: build.sourceTreeDigest,
+        moduleDigest: `sha256:${prepared.bundleDigestHex}`,
+        artifactDigest: sealed.digest,
+        publicJwkDigest: sha(new TextEncoder().encode(genesis.publicJwk)),
+        secretInputSeal: replacementSecretInputSeal,
+        secretInputBytes: sealedSecrets.bytes,
+        secretInputFiles: sealedSecrets.files,
+        argvDigest: sha(
+          new TextEncoder().encode(JSON.stringify([node, build.wranglerPath, ...argv])),
+        ),
+      });
+      syncPrivateDirectory(root);
+    }
+    const replacementDispatchSeal =
+      replacementDispatchPath === undefined ? undefined : inputSeal(replacementDispatchPath);
+    const assertReplacementDispatch = async () => {
+      if (replacementUnknown === undefined || replacementDispatchPath === undefined) return;
+      await replacementUnknown.assertCurrent();
+      sealedSecrets.assertUnchanged();
+      if (
+        inputSeal(replacementDispatchPath) !== replacementDispatchSeal ||
+        sealedSecrets.digest !== replacementSecretInputSeal
+      )
+        throw preflightError("money replacement dispatch seal or secret input changed");
+    };
     // The only mutating command in this owner is the trusted versions-upload recipe. Never deploy.
     await genesis.assertCurrent();
     temporarySecretSeal.assertUnchanged();
+    await assertReplacementDispatch();
     uploadStarted = true;
     const upload = await runCommand([node, build.wranglerPath, ...argv], {
       env: { ...credential.childEnvironment, WRANGLER_OUTPUT_FILE_PATH: output },
     });
+    await assertReplacementDispatch();
     assertLocal();
     sealed.assertUnchanged();
     temporarySecretSeal.assertUnchanged();
@@ -1040,6 +1368,7 @@ async function uploadMoneyNormalWorkerVersionOwned(
     assertLocal();
     sealed.assertUnchanged();
     await genesis.assertCurrent();
+    await assertReplacementDispatch();
     const result = Object.freeze({
       kind: "takoserver.money-inactive-normal-version-upload@v1" as const,
       qualification: "immutable-version-only" as const,

@@ -37,6 +37,7 @@ import {
   moneyCutoverBindingDigest,
   moneyUnitCutoverSourcePrefixDigest,
   prepareIntegrationMoneyHeldSuffix98OriginalUpload,
+  prepareIntegrationMoneyHeldSuffix98ReplacementUpload,
   readMoneyAggregateDigest,
   readMoneyFrozenDataDigest,
   readMoneyPreimageDigest,
@@ -2991,5 +2992,20 @@ describe("original suffix98 live upload receiver", () => {
         {},
       ),
     ).rejects.toThrow("no upload or resend");
+  });
+
+  test("replacement refuses retained suffix custody before its producer or provider runs", async () => {
+    await expect(
+      prepareIntegrationMoneyHeldSuffix98ReplacementUpload(
+        {
+          custody: {
+            read: async () => null,
+            readDispatch: async () => ({ state: "dispatched" }),
+          },
+        } as unknown as MoneyUnitOriginalCutoverOptions,
+        "/private/unchanged-post94-declaration.json",
+        {},
+      ),
+    ).rejects.toThrow("cannot follow original suffix custody");
   });
 });

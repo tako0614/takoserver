@@ -5740,6 +5740,45 @@ export async function prepareIntegrationMoneyHeldSuffix98OriginalUpload(
   return Object.freeze({ original, upload });
 }
 
+/**
+ * Explicit second attempt after the first upload remains UNKNOWN. The first
+ * root and Version are quarantined by the upload owner; no retained JSON is
+ * converted to the first owner's live witness. This separate entrypoint is
+ * deliberately not selected by the ordinary original command or CLI. The
+ * replacement preserves the already selected 94 writer epoch. The existing
+ * suffix status/apply receiver owns one Financial returned tuple per new live
+ * inputs object and reuses that same tuple, including originalPinnedAt, on
+ * apply; neither this preparation nor retained v5 DATA re-derives it.
+ */
+export async function prepareIntegrationMoneyHeldSuffix98ReplacementUpload(
+  options: MoneyUnitOriginalCutoverOptions,
+  post94DeclarationPath: string,
+  originalUploadRequest: unknown,
+): Promise<{
+  readonly original: MoneyUnitHeldPost94ContextSelection;
+  readonly upload: Readonly<MoneyNormalWorkerOwnedUpload>;
+}> {
+  const owner = await import("./schema-money-unit-owner.ts");
+  if (
+    (await options.custody.read("suffix98")) !== null ||
+    (await options.custody.readDispatch("suffix98")) !== null
+  )
+    throw mutationError("money replacement cannot follow original suffix custody");
+  const original = await owner.readMoneyUnitHeldPost94ContextSelection(
+    options,
+    post94DeclarationPath,
+  );
+  const uploader = await import("./money-normal-worker-version-upload.ts");
+  const upload = await uploader.uploadMoneyNormalWorkerReplacementVersionForOriginalContext(
+    original.context,
+    originalUploadRequest,
+  );
+  if (upload.context !== original.context)
+    throw mutationError("money replacement returned another held context");
+  await owner.assertMoneyUnitHeldPost94SelectionOrigin(original.selection, original.context);
+  return Object.freeze({ original, upload });
+}
+
 /** Sole sealed fixed95–98 import, reached ONLY through both real original producers. */
 export async function runIntegrationMoneyHeldSuffix98(
   invocation: MoneyUnitCutoverInvocation,

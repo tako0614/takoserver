@@ -5,6 +5,7 @@ import {
   moneyNormalVersionUploadArguments,
   parseMoneyNormalVersionUploadRequest,
   readMoneyNormalWorkerSigningGenesisContribution,
+  uploadMoneyNormalWorkerReplacementVersionForOriginalContext,
   uploadMoneyNormalWorkerVersion,
   uploadMoneyNormalWorkerVersionForOriginalContext,
 } from "../scripts/deploy/money-normal-worker-version-upload.ts";
@@ -38,6 +39,17 @@ describe("inactive original money Version upload boundary", () => {
         "accepts only",
       );
     }
+  });
+  test("replacement is a distinct live-owner path, never an original request flag or JSON witness", async () => {
+    await expect(
+      uploadMoneyNormalWorkerVersion({ ...fields, replacementAfterUnknown: true }),
+    ).rejects.toThrow("accepts only");
+    await expect(
+      uploadMoneyNormalWorkerReplacementVersionForOriginalContext(
+        { kind: "takoserver.money-held-convert-context@v1", facts: {} } as never,
+        fields,
+      ),
+    ).rejects.toThrow("money held convert context or source request differs");
   });
   test("accessors proxies relative paths equal epochs and missing fields refuse before any native factory", () => {
     let reads = 0;
