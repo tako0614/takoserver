@@ -630,7 +630,7 @@ export function createV2ContainerHostAcceptance(options: {
         (c.action === "create" &&
           names.length > 0 &&
           (c.privateInputs === undefined || configuredJson === null)) ||
-        (c.action === "update" && configuredJson === null)
+        (c.action === "update" && names.length > 0 && configuredJson === null)
       )
         throw new TypeError("Container F2 configured private inputs unavailable");
       const incarnation =

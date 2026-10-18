@@ -1238,6 +1238,7 @@ async function full100F2ConfiguredContainerEngine(
   db: Database,
   wrapSql: (sql: Sql) => Sql = (sql) => sql,
   formUrlOverride?: string,
+  requireSensitive = true,
 ) {
   const { V2_CONTAINER_F2_FORM } = await import("../src/takoform-v2/container-owner-schema.ts");
   const selectedForm = formUrlOverride === undefined ? V2_CONTAINER_F2_FORM : formUrlOverride;
@@ -1271,6 +1272,8 @@ async function full100F2ConfiguredContainerEngine(
     const sealing: {
       calls: number;
       updateCalls: number;
+      emptyCreateCalls: number;
+      emptyUpdateCalls: number;
       operationId: string | undefined;
       resourceUid: string | undefined;
       envelope:
@@ -1279,6 +1282,8 @@ async function full100F2ConfiguredContainerEngine(
     } = {
       calls: 0,
       updateCalls: 0,
+      emptyCreateCalls: 0,
+      emptyUpdateCalls: 0,
       operationId: undefined,
       resourceUid: undefined,
       envelope: undefined,
@@ -1289,8 +1294,12 @@ async function full100F2ConfiguredContainerEngine(
       backend,
 
       privateInputs: {
-        requiredForEveryInstance: true,
+        ...(requireSensitive ? { requiredForEveryInstance: true as const } : {}),
         validateCreate(_spec, inputs) {
+          if (!requireSensitive) {
+            expect(inputs).toBeUndefined();
+            return;
+          }
           if (inputs === undefined || inputs.TOKEN !== "owner-f2-fixture-value")
             throw new TypeError("F2 fixture input unavailable");
         },
@@ -1301,6 +1310,11 @@ async function full100F2ConfiguredContainerEngine(
         async prepareCreate(input) {
           expect(input.form).toBe(selectedForm);
           expect(input.generation).toBe(1);
+          if (!requireSensitive) {
+            expect(input.privateInputs).toBeUndefined();
+            sealing.emptyCreateCalls++;
+            return null;
+          }
           if (
             input.privateInputs === undefined ||
             input.privateInputs.TOKEN !== "owner-f2-fixture-value"
@@ -1353,6 +1367,12 @@ async function full100F2ConfiguredContainerEngine(
           }
         },
         async prepareUpdate(input) {
+          if (!requireSensitive) {
+            expect(input.privateInputs).toBeUndefined();
+            expect(input.configured).toBeNull();
+            sealing.emptyUpdateCalls++;
+            return;
+          }
           if (sealing.envelope === undefined) throw new Error("fixture envelope missing");
           expect(input.configured).toEqual(sealing.envelope);
           sealing.updateCalls++;
@@ -1588,6 +1608,56 @@ test("genuine legacy Container rejects prepared nonNULL configured inputs withou
         conservation: true,
       }),
     );
+  } finally {
+    db.close();
+  }
+});
+
+test("F2 no-sensitive Core create then update retains null owner envelope", async () => {
+  const db = new Database(":memory:");
+  try {
+    const f = await full100F2ConfiguredContainerEngine(db, undefined, undefined, false);
+    const desired = Object.freeze({
+      ...coreContainerSpec("1".repeat(64)),
+      [C.fields.image]: "registry.example.test/owner/f2@sha256:" + "a".repeat(64),
+      [C.fields.workloadRevision]: "1".repeat(64),
+      [C.fields.requiredSensitiveVars]: Object.freeze([]),
+    });
+    const created = await f.engine.acceptCreate({
+      principal: "container-owner-test",
+      key: "f2-create-canonical-source",
+      input: {
+        form: f.formUrl,
+        space: "default",
+        name: "f2-secret",
+        spec: desired,
+      },
+    });
+    expect(created.generation).toBe(1);
+    expect(f.sealing.calls).toBe(0);
+    expect(f.sealing.emptyCreateCalls).toBe(1);
+    const createRows = Object.values((await containerDeleteSnapshot(db)).owner).flat();
+    const createAcceptance = createRows.find((row) => row.operation_id === created.id);
+    expect(createAcceptance?.action).toBe("create");
+    expect(createAcceptance?.configured_private_inputs_json).toBeNull();
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const updated = await f.engine.acceptUpdate({
+      principal: "container-owner-test",
+      key: "f2-update-canonical-source",
+      uid: created.resourceUid,
+      expectedGeneration: 1,
+      spec: Object.freeze({ ...desired, [C.fields.workloadRevision]: "2".repeat(64) }),
+    });
+    expect(updated.generation).toBe(2);
+    expect(f.sealing.calls).toBe(0);
+    expect(f.sealing.updateCalls).toBe(0);
+    expect(f.sealing.emptyUpdateCalls).toBe(1);
+    const updateRows = Object.values((await containerDeleteSnapshot(db)).owner).flat();
+    const updateAcceptance = updateRows.find((row) => row.operation_id === updated.id);
+    expect(updateAcceptance?.action).toBe("update");
+    expect(updateAcceptance?.configured_private_inputs_json).toBeNull();
+    expect(updateRows.some((row) => row.desired_generation === 2)).toBe(true);
+    expect((await f.engine.runNext())?.status).toBe("failed");
   } finally {
     db.close();
   }
