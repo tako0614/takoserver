@@ -131,6 +131,11 @@ test("the current source closure projects to an explicit 0066 apply artifact", (
     readSealedApplyQualifiedMigrationArtifact(resolve(import.meta.dir, "../migrations")),
   ).toThrow("sealed apply-qualified migration lineage must contain exactly 0001-0066");
 
+  mkdirSync(join(ROOT, "src"));
+  cpSync(
+    resolve(import.meta.dir, "../src/auth103-source-clock.ts"),
+    join(ROOT, "src/auth103-source-clock.ts"),
+  );
   for (const drift of ["missing", "extra"] as const) {
     const directory = join(ROOT, `${drift}-current-source`);
     cpSync(resolve(import.meta.dir, "../migrations"), directory, { recursive: true });
@@ -138,10 +143,14 @@ test("the current source closure projects to an explicit 0066 apply artifact", (
     else
       writeFileSync(join(directory, "0101_unreviewed.sql"), "CREATE TABLE unreviewed (id TEXT);\n");
     expect(() => readCurrentAuditedMigrationSourceArtifact(directory)).toThrow(
-      "audited migration lineage must contain exactly 0001-0100",
+      drift === "missing"
+        ? "audited migration prefix must be the exact original0001-0100"
+        : "audited source extension must be exactly the owning101/102/103 recipes",
     );
     expect(() => readAuditedMigrationArtifact(directory)).toThrow(
-      "audited migration lineage must contain exactly 0001-0100",
+      drift === "missing"
+        ? "audited migration prefix must be the exact original0001-0100"
+        : "audited source extension must be exactly the owning101/102/103 recipes",
     );
   }
 });

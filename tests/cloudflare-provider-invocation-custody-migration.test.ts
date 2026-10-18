@@ -90,6 +90,11 @@ test("0068 is the exact source-only successor while the qualified 0001-0066 ceil
   try {
     const migrations = join(root, "migrations");
     mkdirSync(migrations);
+    mkdirSync(join(root, "src"));
+    copyFileSync(
+      join(import.meta.dir, "../src/auth103-source-clock.ts"),
+      join(root, "src/auth103-source-clock.ts"),
+    );
     for (const file of source.files) copyFileSync(file.path, join(migrations, file.name));
     const tail = source.files.at(-1);
     if (!tail) throw new Error("audited source is missing its terminal migration");
@@ -98,7 +103,7 @@ test("0068 is the exact source-only successor while the qualified 0001-0066 ceil
       join(migrations, `${String(source.names.length + 1).padStart(4, "0")}_unreviewed.sql`),
     );
     expect(() => readCurrentAuditedMigrationSourceArtifact(migrations)).toThrow(
-      "audited migration lineage must contain exactly",
+      "audited source extension must be exactly the owning101/102/103 recipes",
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
