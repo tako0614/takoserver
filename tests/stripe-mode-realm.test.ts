@@ -306,6 +306,7 @@ test("census rejects missing, extra, duplicate, unsorted, sparse and unsafe obse
       tableInventory: ["wallet_credit_lots", "ledger"],
       rowCounts: { wallet_credit_lots: 0, ledger: 0 },
     },
+    // biome-ignore lint/suspicious/noSparseArray: Intentional hole verifies rejection of sparse census arrays.
     { tableInventory: ["ledger", , "quotes"], rowCounts: { ledger: 0, quotes: 0 } },
     { tableInventory: ["unsafe-name"], rowCounts: { "unsafe-name": 0 } },
     { tableInventory: ["ledger"], rowCounts: { ledger: -1 } },
@@ -1068,6 +1069,9 @@ import {
 } from "../src/money-cutover-sql.ts";
 import { type Sql, SqlError, type SqlStatement } from "../src/ports.ts";
 
+// One captured synthetic command instant; not a native/policy Clock or permission.
+const REALM_PIN_DATA_ORIGINAL_AT = new Date().toISOString();
+
 /** Capture canonical <=94 facts before applying the complete existing95-98 suffix.
  * This fixture never constructs an original native Root context or mode proof. */
 async function realmPinDraftFixture() {
@@ -1128,7 +1132,7 @@ async function realmPinDraftFixture() {
   const pin = MIGRATIONS.find((migration) => migration.name === "0098_stripe_mode_realm.sql");
   if (!pin) throw new Error("canonical pin migration unavailable");
   db.exec(pin.sql);
-  const draft = compileMoneyD1StripeRealmPinDraftData(facts);
+  const draft = compileMoneyD1StripeRealmPinDraftData(facts, REALM_PIN_DATA_ORIGINAL_AT);
   expect(await sql.query(draft.statements[0].sql, draft.statements[0].params)).toEqual([
     { required_financial_realm: 1 },
   ]);
@@ -1169,7 +1173,7 @@ test("realm draft DATA refuses nonzero history, unknown zero tables and non-TEST
   const otherMode = realmHistoryDataModel();
   Object.assign(otherMode, { selectedStripeMode: "live" });
   for (const facts of [unknown, historical, otherMode]) {
-    expect(() => compileMoneyD1StripeRealmPinDraftData(facts)).toThrow(
+    expect(() => compileMoneyD1StripeRealmPinDraftData(facts, REALM_PIN_DATA_ORIGINAL_AT)).toThrow(
       "Financial realm census is malformed",
     );
   }
@@ -1177,7 +1181,7 @@ test("realm draft DATA refuses nonzero history, unknown zero tables and non-TEST
 
 test("realm draft DATA detaches all facts and ordered bind vectors without a permission", () => {
   const facts = realmHistoryDataModel();
-  const draft = compileMoneyD1StripeRealmPinDraftData(facts);
+  const draft = compileMoneyD1StripeRealmPinDraftData(facts, REALM_PIN_DATA_ORIGINAL_AT);
   const source = draft.sourceFactsJson;
   Object.assign(facts.current94.rowCounts, { ledger: 9 });
   Object.assign(facts, { previousWriterEpoch: modelDigest(999) });
@@ -1192,9 +1196,10 @@ test("realm draft DATA detaches all facts and ordered bind vectors without a per
     "microcent-v1",
     "usd-cents-v1",
   ]);
-  expect(draft.statements[0].params).toEqual(draft.statements[2].params);
+  expect(draft.statements[0].params).toEqual(draft.statements[2].params.slice(0, -1));
+  expect(draft.statements[2].params.at(-1)).toBe(REALM_PIN_DATA_ORIGINAL_AT);
   expect(draft.statements[0].params.length).toBeLessThanOrEqual(100);
-  expect(draft.statements[1].params).toEqual([]);
+  expect(draft.statements[1].params).toEqual([REALM_PIN_DATA_ORIGINAL_AT]);
   expect(Reflect.set(draft.statements[0].params, "0", 2)).toBe(false);
   expect(Reflect.set(draft.statements[1], "sql", "caller SQL")).toBe(false);
   expect(Object.isFrozen(draft)).toBe(true);
@@ -1212,7 +1217,7 @@ test("realm draft DATA detaches all facts and ordered bind vectors without a per
       return descriptor;
     },
   });
-  const captured = compileMoneyD1StripeRealmPinDraftData(changing);
+  const captured = compileMoneyD1StripeRealmPinDraftData(changing, REALM_PIN_DATA_ORIGINAL_AT);
   expect(borrowed.previousWriterEpoch).toBe(modelDigest(999));
   expect(captured.sourceFactsJson).toContain(modelDigest(10));
   expect(captured.sourceFactsJson).not.toContain(modelDigest(999));
@@ -1224,7 +1229,7 @@ test("realm draft internal source encoding binds large own DATA without a public
   const facts = realmHistoryDataModel();
   const extra = { retainedSourceNote: "x".repeat(32768) };
   Object.assign(facts, { syntheticEncodingOnly: extra });
-  const draft = compileMoneyD1StripeRealmPinDraftData(facts);
+  const draft = compileMoneyD1StripeRealmPinDraftData(facts, REALM_PIN_DATA_ORIGINAL_AT);
   extra.retainedSourceNote = "changed";
   expect(draft.sourceFactsJson).toContain("x".repeat(32768));
   expect(draft.sourceFactsJson).not.toContain("changed");
@@ -1236,7 +1241,7 @@ test("realm draft internal source encoding binds large own DATA without a public
       return 1;
     },
   });
-  expect(() => compileMoneyD1StripeRealmPinDraftData(facts)).toThrow();
+  expect(() => compileMoneyD1StripeRealmPinDraftData(facts, REALM_PIN_DATA_ORIGINAL_AT)).toThrow();
   expect(reads).toBe(0);
 });
 
@@ -1458,12 +1463,16 @@ function realmNormalModeDataModel() {
 
 test("normal mode draft DATA preserves exact three statements and all27 native/source fields", () => {
   const { facts, mode } = realmNormalModeDataModel();
-  const pin = compileMoneyD1StripeRealmPinDraftData(facts);
+  const pin = compileMoneyD1StripeRealmPinDraftData(facts, REALM_PIN_DATA_ORIGINAL_AT);
   for (const modeEvidence of [
     "explicit-native-test",
     "verified-source-default-test-native-absence",
   ] as const) {
-    const draft = compileMoneyD1StripeRealmNormalModeDraftData(facts, { ...mode, modeEvidence });
+    const draft = compileMoneyD1StripeRealmNormalModeDraftData(
+      facts,
+      { ...mode, modeEvidence },
+      REALM_PIN_DATA_ORIGINAL_AT,
+    );
     expect(draft.pin).toEqual(pin);
     expect(draft.pin.statements.map((item) => item.params.length)).toEqual(
       pin.statements.map((item) => item.params.length),
@@ -1489,15 +1498,21 @@ test("normal mode draft DATA rejects crossed storage, epochs, conversion and pro
     "converted94BackupDigest",
   ] as const) {
     expect(() =>
-      compileMoneyD1StripeRealmNormalModeDraftData(facts, {
-        ...mode,
-        [field]: modelDigest(99),
-      }),
+      compileMoneyD1StripeRealmNormalModeDraftData(
+        facts,
+        {
+          ...mode,
+          [field]: modelDigest(99),
+        },
+        REALM_PIN_DATA_ORIGINAL_AT,
+      ),
     ).toThrow();
   }
   const missing = structuredClone(facts);
   Reflect.deleteProperty(missing, "storage");
-  expect(() => compileMoneyD1StripeRealmNormalModeDraftData(missing, mode)).toThrow();
+  expect(() =>
+    compileMoneyD1StripeRealmNormalModeDraftData(missing, mode, REALM_PIN_DATA_ORIGINAL_AT),
+  ).toThrow();
 });
 
 test("normal mode draft DATA rejects malformed mode metadata without relaxing the old history gate", () => {
@@ -1505,7 +1520,9 @@ test("normal mode draft DATA rejects malformed mode metadata without relaxing th
   for (const field of Object.keys(mode)) {
     const missing = { ...mode };
     Reflect.deleteProperty(missing, field);
-    expect(() => compileMoneyD1StripeRealmNormalModeDraftData(facts, missing)).toThrow();
+    expect(() =>
+      compileMoneyD1StripeRealmNormalModeDraftData(facts, missing, REALM_PIN_DATA_ORIGINAL_AT),
+    ).toThrow();
   }
   for (const change of [
     { stripeMode: "live" },
@@ -1522,17 +1539,27 @@ test("normal mode draft DATA rejects malformed mode metadata without relaxing th
     { ready: true },
   ]) {
     expect(() =>
-      compileMoneyD1StripeRealmNormalModeDraftData(facts, Object.assign({}, mode, change)),
+      compileMoneyD1StripeRealmNormalModeDraftData(
+        facts,
+        Object.assign({}, mode, change),
+        REALM_PIN_DATA_ORIGINAL_AT,
+      ),
     ).toThrow();
   }
   const historical = structuredClone(facts);
   modelStageRows(historical, "original92", "ledger", 1);
-  expect(() => compileMoneyD1StripeRealmNormalModeDraftData(historical, mode)).toThrow();
+  expect(() =>
+    compileMoneyD1StripeRealmNormalModeDraftData(historical, mode, REALM_PIN_DATA_ORIGINAL_AT),
+  ).toThrow();
 });
 
 test("normal mode draft DATA snapshots mode and held inputs without invoking getters", () => {
   const { facts, mode } = realmNormalModeDataModel();
-  const draft = compileMoneyD1StripeRealmNormalModeDraftData(facts, mode);
+  const draft = compileMoneyD1StripeRealmNormalModeDraftData(
+    facts,
+    mode,
+    REALM_PIN_DATA_ORIGINAL_AT,
+  );
   const before = JSON.stringify(draft);
   Object.assign(mode, { moduleDigest: modelDigest(99) });
   Object.assign(facts.storage, { databaseId: "changed-later" });
@@ -1548,13 +1575,18 @@ test("normal mode draft DATA snapshots mode and held inputs without invoking get
       return modelDigest(51);
     },
   });
-  expect(() => compileMoneyD1StripeRealmNormalModeDraftData(fresh.facts, accessor)).toThrow();
+  expect(() =>
+    compileMoneyD1StripeRealmNormalModeDraftData(fresh.facts, accessor, REALM_PIN_DATA_ORIGINAL_AT),
+  ).toThrow();
   expect(reads).toBe(0);
 });
 
 test("normal mode original Root assertion rejects matching DTOs, copies and inheritance", async () => {
   const { facts, mode } = realmNormalModeDataModel();
-  expect(compileMoneyD1StripeRealmNormalModeDraftData(facts, mode).contribution).toBeNull();
+  expect(
+    compileMoneyD1StripeRealmNormalModeDraftData(facts, mode, REALM_PIN_DATA_ORIGINAL_AT)
+      .contribution,
+  ).toBeNull();
   const context = { kind: "takoserver.money-held-convert-context@v1", facts };
   const preparation = {
     kind: "takoserver.money-held-normal-worker-mode-preparation@v1",
@@ -1653,7 +1685,11 @@ test("realm contribution producer refuses forged original members before their f
 
 test("realm contribution origin cannot be minted by matching compiler DATA or static metadata", async () => {
   const { facts, mode } = realmNormalModeDataModel();
-  const data = compileMoneyD1StripeRealmNormalModeDraftData(facts, mode);
+  const data = compileMoneyD1StripeRealmNormalModeDraftData(
+    facts,
+    mode,
+    REALM_PIN_DATA_ORIGINAL_AT,
+  );
   const context = { kind: "takoserver.money-held-convert-context@v1", facts };
   const preparation = {
     kind: "takoserver.money-held-normal-worker-mode-preparation@v1",
@@ -1740,7 +1776,10 @@ test("realm post-suffix inventory accepts exactly canonical zero stage additions
     expect(result[1]?.rows).toHaveLength(1);
     expect(result[2]?.rows).toEqual([{ required_financial_realm: 1 }]);
     expect(f.draft.statements[0].params.length).toBeLessThanOrEqual(100);
-    expect(f.draft.statements[2].params).toEqual(f.draft.statements[0].params);
+    expect(f.draft.statements[2].params).toEqual([
+      ...f.draft.statements[0].params,
+      REALM_PIN_DATA_ORIGINAL_AT,
+    ]);
   } finally {
     f.db.close();
   }
@@ -1752,7 +1791,9 @@ test("realm post-suffix inventory refuses stage tables already present in held94
       const facts = realmHistoryDataModel();
       modelStageRows(facts, "converted94", observed, 0);
       modelStageRows(facts, "current94", observed, 0);
-      expect(() => compileMoneyD1StripeRealmPinDraftData(facts)).toThrow();
+      expect(() =>
+        compileMoneyD1StripeRealmPinDraftData(facts, REALM_PIN_DATA_ORIGINAL_AT),
+      ).toThrow();
     }
   }
 });
@@ -1805,5 +1846,110 @@ test("realm post-suffix inventory refuses rows in each added table before and af
     } finally {
       f.db.close();
     }
+  }
+});
+
+test("realm original pin instant survives two independent delayed SQL materializations", async () => {
+  const fixture = await realmPinDraftFixture();
+  const snapshot = fixture.db.serialize();
+  const originalPinnedAt = new Date().toISOString(); // Synthetic fixture command time, no native authority.
+  const draft = compileMoneyD1StripeRealmPinDraftData(fixture.facts, originalPinnedAt);
+  const encoded = JSON.stringify(draft);
+  const first = Database.deserialize(snapshot);
+  const second = Database.deserialize(snapshot);
+  try {
+    await Bun.sleep(30);
+    const left = await createSqliteSql(first).batch(draft.statements);
+    expect(left[1]?.changes).toBe(1);
+    expect(left[1]?.rows[0]?.pinned_at === originalPinnedAt).toBe(true);
+    await Bun.sleep(30);
+    const right = await createSqliteSql(second).batch(draft.statements);
+    expect(right).toEqual(left);
+    expect(JSON.stringify(draft)).toBe(encoded);
+    expect(first.serialize().equals(second.serialize())).toBe(true);
+  } finally {
+    first.close();
+    second.close();
+    fixture.db.close();
+  }
+});
+
+test("realm original pin instant is explicit canonical DATA and changes the serialized command digest", async () => {
+  const facts = realmHistoryDataModel();
+  const original = new Date().toISOString();
+  const later = new Date(Date.parse(original) + 1).toISOString();
+  const first = compileMoneyD1StripeRealmPinDraftData(facts, original);
+  const same = compileMoneyD1StripeRealmPinDraftData(facts, original);
+  const another = compileMoneyD1StripeRealmPinDraftData(facts, later);
+  expect(first).toEqual(same);
+  expect(first.statements[1].params).toEqual([original]);
+  expect(first.statements[2].params).toEqual([...first.statements[0].params, original]);
+  expect(first.statements.every((statement) => statement.params.length <= 100)).toBe(true);
+  expect(first.statements.some((statement) => /['"]now['"]/iu.test(statement.sql))).toBe(false);
+  const digest = (value: unknown) =>
+    crypto.subtle.digest("SHA-256", new TextEncoder().encode(JSON.stringify(value)));
+  expect(Buffer.from(await digest(first)).equals(Buffer.from(await digest(same)))).toBe(true);
+  expect(Buffer.from(await digest(first)).equals(Buffer.from(await digest(another)))).toBe(false);
+});
+
+test("realm original pin instant refuses missing, noncanonical and object-coerced DATA", () => {
+  const facts = realmHistoryDataModel();
+  let coercions = 0;
+  const object = {
+    toString() {
+      coercions++;
+      return REALM_PIN_DATA_ORIGINAL_AT;
+    },
+  };
+  for (const bad of [
+    undefined,
+    null,
+    0,
+    object,
+    "",
+    "2026-02-30T00:00:00.000Z",
+    "2026-10-18T00:00:00Z",
+    "2026-10-18T00:00:00.000+00:00",
+  ]) {
+    expect(() =>
+      Reflect.apply(compileMoneyD1StripeRealmPinDraftData, undefined, [facts, bad]),
+    ).toThrow();
+  }
+  expect(coercions).toBe(0);
+});
+
+test("realm postassert checks the exact original pin instant and rolls back the earlier prefix", async () => {
+  const f = await realmPinDraftFixture();
+  const before = f.db.serialize();
+  const different = new Date(Date.parse(REALM_PIN_DATA_ORIGINAL_AT) + 1).toISOString();
+  const [pre, insert, post] = f.draft.statements;
+  let insertReached = false;
+  let failure: unknown;
+  try {
+    try {
+      f.db.transaction(() => {
+        f.db.exec(
+          "INSERT INTO principals (id,provider,provider_subject,email,display_name,created_at) VALUES ('pin:prefix','google','pin:prefix','fixture@invalid.example','fixture','2026-10-18T00:00:00.000Z')",
+        );
+        f.db.query(pre.sql).all(...pre.params);
+        const rows = f.db.query(insert.sql).all(different);
+        insertReached =
+          rows.length === 1 &&
+          JSON.stringify(rows) ===
+            JSON.stringify([{ singleton: 1, mode: "test", pinned_at: different }]);
+        f.db.query(post.sql).all(...post.params);
+      })();
+    } catch (error) {
+      failure = error;
+    }
+    expect(insertReached).toBe(true);
+    expect(
+      failure instanceof Error && failure.message.toLowerCase().includes("malformed json"),
+    ).toBe(true);
+    expect(f.db.serialize().equals(before)).toBe(true);
+    expect(await f.sql.query("SELECT id FROM principals WHERE id='pin:prefix'")).toEqual([]);
+    expect(await f.sql.query("SELECT * FROM stripe_mode_realm")).toEqual([]);
+  } finally {
+    f.db.close();
   }
 });

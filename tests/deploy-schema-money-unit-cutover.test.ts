@@ -16,7 +16,10 @@ import {
   assertMoneyLiveBackupCompleteness,
   assertMoneyNativeForeignKeys,
   assertMoneyPost94Source,
+  buildMoneyPost94OneImportData as buildActualMoneyPost94OneImportData,
   buildMoneyCutoverImportSql,
+  buildMoneyPost94RootImportData,
+  buildMoneyPost94SigningGenesisData,
   captureMoneyUnitConverted94Backup,
   inspectMoneyUnitPost94State,
   inspectMoneyUnitResumeState,
@@ -36,10 +39,22 @@ import {
   readMoneyAggregateDigest,
   readMoneyFrozenDataDigest,
   readMoneyPreimageDigest,
+  readMoneyUnitHeldConvertFacts,
   readWholeDatabaseDataDigest,
   reconcileMoneyCutoverDispatched,
+  runIntegrationMoneyHeldSuffix98,
   runIntegrationMoneyUnitCutover,
 } from "../scripts/deploy/schema-money-unit-cutover.ts";
+import type {
+  MoneyUnitHeldConvertFacts,
+  MoneyUnitHeldPost94ConsumerInputs,
+  MoneyUnitOriginalCutoverOptions,
+} from "../scripts/deploy/schema-money-unit-owner.ts";
+import {
+  composeMoneyUnitHeldPost94ConsumerInputs,
+  readMoneyUnitHeldPost94ContextSelection,
+} from "../scripts/deploy/schema-money-unit-owner.ts";
+import { compileMoneyD1StripeRealmPinDraftData } from "../scripts/deploy/stripe-mode-realm.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import {
   createMoneyCutoverSql,
@@ -53,21 +68,30 @@ import {
   moneyCutoverFinancialTriggerSql,
 } from "../src/money-cutover-sql.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
+import { assertStripeModeRealm } from "../src/stripe-mode-realm.ts";
 
 const files = readMigrationArtifact().files;
 const sha = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
+const opaqueSql = (source: string) => ({
+  bytes: Buffer.byteLength(source, "utf8"),
+  sha256: sha(source),
+});
+const opaqueValue = (value: unknown) => opaqueSql(JSON.stringify(value));
 const marker = sha("local money cutover proof");
 const writerEpoch = sha("reviewed writer generation");
 
-function fixture() {
+function fixture(emptyFinancialHistory = false) {
   const database = new Database(":memory:");
   database.exec(buildD1MigrationImport(files.slice(0, 92), { freshLedger: true }).sql);
-  database.exec(
-    "INSERT INTO ledger (id, org_id, type, ref, settled_delta, held_delta, created_at) VALUES ('fund-1','org-1','funding','credit-1',7,0,'2026-01-01T00:00:00Z')",
-  );
-  database.exec(
-    "INSERT INTO wallet_credit_lots (org_id, ref, kind, amount_minor, expires_at, created_at) VALUES ('org-1','credit-1','direct',7,NULL,'2026-01-01T00:00:00Z')",
-  );
+  if (!emptyFinancialHistory) {
+    database.exec(
+      "INSERT INTO ledger (id, org_id, type, ref, settled_delta, held_delta, created_at) VALUES ('fund-1','org-1','funding','credit-1',7,0,'2026-01-01T00:00:00Z')",
+    );
+    database.exec(
+      "INSERT INTO wallet_credit_lots (org_id, ref, kind, amount_minor, expires_at, created_at) VALUES ('org-1','credit-1','direct',7,NULL,'2026-01-01T00:00:00Z')",
+    );
+  }
   return database;
 }
 
@@ -132,8 +156,8 @@ const reader = (database: Database) => ({
 });
 
 /** Actual fixed SQL and SQLite; native proof/health below are controlled component ports. */
-async function resumeReadFixture() {
-  const database = fixture();
+async function resumeReadFixture(emptyFinancialHistory = false) {
+  const database = fixture(emptyFinancialHistory);
   const directory = mkdtempSync(join(tmpdir(), "money-resume-read-component-"));
   const databaseName = `integration-ts-${"a".repeat(32)}`;
   const target: DeployTarget = {
@@ -166,7 +190,9 @@ async function resumeReadFixture() {
   const cursor = database.query("SELECT cursor_handle FROM wallet_credit_lots").get() as {
     cursor_handle: string;
   };
-  const originalSql = `${buildD1MigrationImport(files.slice(0, 92), { freshLedger: true }).sql}\nINSERT INTO ledger (id, org_id, type, ref, settled_delta, held_delta, created_at) VALUES ('fund-1','org-1','funding','credit-1',7,0,'2026-01-01T00:00:00Z');\nINSERT INTO wallet_credit_lots (org_id, ref, kind, amount_minor, expires_at, created_at, cursor_handle) VALUES ('org-1','credit-1','direct',7,NULL,'2026-01-01T00:00:00Z','${cursor.cursor_handle}');\n`;
+  const originalSql = emptyFinancialHistory
+    ? buildD1MigrationImport(files.slice(0, 92), { freshLedger: true }).sql
+    : `${buildD1MigrationImport(files.slice(0, 92), { freshLedger: true }).sql}\nINSERT INTO ledger (id, org_id, type, ref, settled_delta, held_delta, created_at) VALUES ('fund-1','org-1','funding','credit-1',7,0,'2026-01-01T00:00:00Z');\nINSERT INTO wallet_credit_lots (org_id, ref, kind, amount_minor, expires_at, created_at, cursor_handle) VALUES ('org-1','credit-1','direct',7,NULL,'2026-01-01T00:00:00Z','${cursor.cursor_handle}');\n`;
   const normalized = normalizeSnapshotDump(Buffer.from(originalSql));
   const backup = {
     digest: normalized.digest,
@@ -176,18 +202,20 @@ async function resumeReadFixture() {
     allDataDigest: marker,
     rowCounts: {},
   };
-  const classifications = [
-    {
-      org_id: "org-1",
-      ref: "credit-1",
-      original_kind: "direct",
-      original_amount_minor: "7",
-      original_expires_at: null,
-      consumption_class: "free",
-      evidence_ref: "review://credit-1",
-      reviewed_at: "2026-01-01T00:00:00Z",
-    },
-  ] as const;
+  const classifications = emptyFinancialHistory
+    ? []
+    : ([
+        {
+          org_id: "org-1",
+          ref: "credit-1",
+          original_kind: "direct",
+          original_amount_minor: "7",
+          original_expires_at: null,
+          consumption_class: "free",
+          evidence_ref: "review://credit-1",
+          reviewed_at: "2026-01-01T00:00:00Z",
+        },
+      ] as const);
   const classificationPath = join(directory, "classifications.json");
   const classificationBytes = `${JSON.stringify(classifications)}\n`;
   writeFileSync(classificationPath, classificationBytes, { mode: 0o600 });
@@ -1787,8 +1815,8 @@ describe("held post94 continuation component", () => {
 });
 
 /** Real reduced SQLite history/export bytes; native commands are controlled component ports. */
-async function converted94CaptureFixture() {
-  const base = await resumeReadFixture();
+async function converted94CaptureFixture(emptyFinancialHistory = false) {
+  const base = await resumeReadFixture(emptyFinancialHistory);
   const classificationManifestPath = base.options.classificationManifestPath;
   const classificationManifestDigest = base.options.classificationManifestDigest;
   if (classificationManifestPath === undefined || classificationManifestDigest === undefined)
@@ -2212,5 +2240,701 @@ describe("converted94 retained nonregular custody", () => {
     } finally {
       f.close();
     }
+  });
+});
+
+describe("fixed post94 Root import fragments remain DATA only", () => {
+  const nextWriterEpoch = sha("next reviewed writer generation");
+  const selected = () => ({
+    files,
+    freezeBindingDigest: marker,
+    originDigest: marker,
+    original92BackupDigest: marker,
+    writerDigest: marker,
+    previousWriterEpoch: writerEpoch,
+    nextWriterEpoch,
+  });
+  const executeRootSql = (database: Database, source: string): void => {
+    // Preserve complete trigger/literal bytes and fail on the FIRST statement.
+    // A single Bun exec(script) may suppress an earlier statement's SQL error.
+    for (const statement of frameHostMigrationSql(source)) database.exec(statement);
+  };
+  const applyRootSql = (database: Database, source: string): void => {
+    database.transaction(() => executeRootSql(database, source))();
+  };
+  const converted = () => {
+    const database = fixture();
+    applyRootSql(database, sql("freeze"));
+    applyRootSql(database, sql("prepare"));
+    applyRootSql(
+      database,
+      sql("classify", [
+        {
+          org_id: "org-1",
+          ref: "credit-1",
+          original_kind: "direct",
+          original_amount_minor: "7",
+          original_expires_at: null,
+          consumption_class: "free",
+          evidence_ref: "review://credit-1",
+          reviewed_at: "2026-01-01T00:00:00Z",
+        },
+      ]),
+    );
+    applyRootSql(database, sql("convert"));
+    return database;
+  };
+
+  test("fixed suffix and guards preserve original freeze, then rotate exactly once", () => {
+    const database = converted();
+    try {
+      const fragments = buildMoneyPost94RootImportData(selected());
+      expect(fragments.qualification).toBe("data-only");
+      expect(fragments.normalHostReady).toBe(false);
+      expect(Object.isFrozen(fragments)).toBe(true);
+      const oldShape = state(database).shapeDigest;
+      database.exec("BEGIN TRANSACTION");
+      executeRootSql(database, fragments.beforeFinancialSql);
+      expect(moneyUnitCutoverSchemaMatches(state(database), files, "0098-fenced")).toBe(true);
+      expect(state(database).shapeDigest).not.toBe(oldShape);
+      expect(
+        database.query("SELECT writer_epoch FROM money_cutover_authorized_epoch").get(),
+      ).toEqual({ writer_epoch: writerEpoch });
+      expect(
+        database.query("SELECT binding_digest, source_digest FROM money_cutover_freeze").get(),
+      ).toEqual({
+        binding_digest: marker,
+        source_digest: moneyUnitCutoverSourcePrefixDigest(files, 92),
+      });
+      // This isolated Root test deliberately inserts NO Financial pin SQL and
+      // grants no import/native/serving authority to the fragments.
+      executeRootSql(database, fragments.afterFinancialSql);
+      expect(
+        database.query("SELECT writer_epoch FROM money_cutover_authorized_epoch").get(),
+      ).toEqual({ writer_epoch: nextWriterEpoch });
+      expect(database.query("SELECT COUNT(*) AS n FROM money_cutover_writer_permit").get()).toEqual(
+        { n: 0 },
+      );
+      let replayStatements = 0;
+      expect(() => {
+        for (const statement of frameHostMigrationSql(fragments.afterFinancialSql)) {
+          replayStatements++;
+          database.exec(statement);
+        }
+      }).toThrow();
+      expect(replayStatements).toBe(1);
+      expect(
+        database.query("SELECT writer_epoch FROM money_cutover_authorized_epoch").get(),
+      ).toEqual({ writer_epoch: nextWriterEpoch });
+      const statements = frameHostMigrationSql(fragments.afterFinancialSql);
+      const rotation = statements[1];
+      const requiredChangedOne = statements[2];
+      if (statements.length !== 4 || !rotation || !requiredChangedOne)
+        throw new Error("missing exact Root rotation/adjacent changes1 statement");
+      // This actual UPDATE matches zero old rows after the positive rotation.
+      // Its immediately following original SQL guard MUST abort, not no-op.
+      expect(database.exec(rotation).changes).toBe(0);
+      expect(() => database.exec(requiredChangedOne)).toThrow();
+      expect(
+        database.query("SELECT writer_epoch FROM money_cutover_authorized_epoch").get(),
+      ).toEqual({ writer_epoch: nextWriterEpoch });
+      database.exec("ROLLBACK");
+      expect(state(database).shapeDigest).toBe(oldShape);
+    } finally {
+      database.close();
+    }
+  });
+
+  test("wrong freeze or old epoch aborts before immutable suffix changes", () => {
+    for (const patch of [
+      { freezeBindingDigest: sha("foreign freeze") },
+      { previousWriterEpoch: sha("foreign epoch") },
+    ]) {
+      const database = converted();
+      try {
+        const before = state(database);
+        const fragments = buildMoneyPost94RootImportData({
+          ...selected(),
+          ...patch,
+        });
+        database.exec("BEGIN TRANSACTION");
+        let attempted = 0;
+        expect(() => {
+          for (const statement of frameHostMigrationSql(fragments.beforeFinancialSql)) {
+            attempted++;
+            database.exec(statement);
+          }
+        }).toThrow();
+        expect(attempted).toBe(1);
+        expect(opaqueValue(state(database))).toEqual(opaqueValue(before));
+        database.exec("ROLLBACK");
+        expect(opaqueValue(state(database))).toEqual(opaqueValue(before));
+      } finally {
+        database.close();
+      }
+    }
+  });
+
+  test("late SQL failure conserves old schema, original freeze and old epoch", () => {
+    const database = converted();
+    try {
+      const before = state(database);
+      const freezeBefore = database.query("SELECT * FROM money_cutover_freeze").all();
+      const epochBefore = database.query("SELECT * FROM money_cutover_authorized_epoch").all();
+      const fragments = buildMoneyPost94RootImportData(selected());
+      database.exec("BEGIN TRANSACTION");
+      executeRootSql(database, fragments.beforeFinancialSql);
+      executeRootSql(database, fragments.afterFinancialSql);
+      expect(
+        database.query("SELECT writer_epoch FROM money_cutover_authorized_epoch").get(),
+      ).toEqual({ writer_epoch: nextWriterEpoch });
+      expect(() => database.exec("INSERT INTO missing_root_post94_late_fault VALUES (1)")).toThrow(
+        "missing_root_post94_late_fault",
+      );
+      database.exec("ROLLBACK");
+      expect(opaqueValue(state(database))).toEqual(opaqueValue(before));
+      expect(database.query("SELECT * FROM money_cutover_freeze").all()).toEqual(freezeBefore);
+      expect(database.query("SELECT * FROM money_cutover_authorized_epoch").all()).toEqual(
+        epochBefore,
+      );
+    } finally {
+      database.close();
+    }
+  });
+
+  test("getter, inherited, extra, equal epochs and changed fixed source refuse", () => {
+    let getterCalls = 0;
+    const accessor = selected();
+    Object.defineProperty(accessor, "writerDigest", {
+      enumerable: true,
+      get() {
+        getterCalls++;
+        return marker;
+      },
+    });
+    expect(() => buildMoneyPost94RootImportData(accessor)).toThrow("own data");
+    expect(getterCalls).toBe(0);
+    expect(() => buildMoneyPost94RootImportData(Object.create(selected()))).toThrow();
+    expect(() => buildMoneyPost94RootImportData({ ...selected(), extra: true } as never)).toThrow();
+    expect(() =>
+      buildMoneyPost94RootImportData({
+        ...selected(),
+        nextWriterEpoch: writerEpoch,
+      }),
+    ).toThrow("distinct");
+    const changed = files.map((file, index) =>
+      index === 97 ? { ...file, digest: sha("foreign fixed source") } : file,
+    );
+    expect(() => buildMoneyPost94RootImportData({ ...selected(), files: changed })).toThrow();
+  });
+
+  test("Root fragments cannot open the existing post94 importer without Financial", async () => {
+    const options = { phase: "suffix98" } as MoneyUnitCutoverOptions;
+    await expect(
+      runIntegrationMoneyUnitCutover(
+        {
+          action: "apply",
+          environment: "integration",
+          commit: "1".repeat(40),
+          throughMigration: "0098",
+        },
+        legacyMoneyStagingTarget(),
+        options,
+      ),
+    ).rejects.toThrow("owning Financial realm transition port");
+    expect(() =>
+      buildMoneyCutoverImportSql({
+        phase: "suffix98",
+        files,
+        anchor: marker,
+        originDigest: marker,
+        backupDigest: marker,
+        writerDigest: marker,
+        writerEpoch,
+      }),
+    ).toThrow("owning Financial realm transition port");
+  });
+});
+
+describe("fixed post94 ONE Financial DATA composer", () => {
+  // Component DATA fixture only; the actual executor obtains a genuine retained
+  // signing artifact separately and cannot consume this compiler wrapper.
+  const genesis = () => ({
+    keyId: "component-signing-key",
+    publicJwk: JSON.stringify({
+      kty: "OKP",
+      crv: "Ed25519",
+      x: Buffer.from(
+        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+        "hex",
+      ).toString("base64url"),
+    }),
+    createdAtEpochSeconds: 1720000000,
+    previousWriterEpoch: writerEpoch,
+  });
+  const buildMoneyPost94OneImportData = (
+    input: Omit<Parameters<typeof buildActualMoneyPost94OneImportData>[0], "signingGenesis">,
+  ) => buildActualMoneyPost94OneImportData({ ...input, signingGenesis: genesis() });
+
+  const execute = (database: Database, sql: string) => {
+    for (const statement of frameHostMigrationSql(sql)) database.exec(statement);
+  };
+  const allData = (database: Database) =>
+    readWholeDatabaseDataDigest(
+      reader(database),
+      "verification",
+      (
+        database
+          .query(
+            "SELECT name FROM sqlite_schema WHERE type='table' AND name NOT GLOB 'sqlite_*' AND name NOT IN ('_cf_KV','_cf_METADATA','d1_migrations') ORDER BY name",
+          )
+          .all() as { name: string }[]
+      ).map((row) => row.name),
+    );
+  const prepare = async () => {
+    const base = await converted94CaptureFixture(true);
+    const f = { ...base, nextWriterEpoch: sha("ONE component-only next epoch") };
+    try {
+      await f.capture();
+      const sourceFacts = await readMoneyUnitHeldConvertFacts({
+        target: f.target,
+        options: { ...f.options, phase: "convert" },
+        previousWriterEpoch: writerEpoch,
+        nextWriterEpoch: f.nextWriterEpoch,
+        convertedBackupPath: f.convertedBackupPath,
+      });
+      // This compiler input is explicitly synthetic DATA, not an original context.
+      const { qualification: _simulation, ...data } = sourceFacts;
+      const facts: MoneyUnitHeldConvertFacts = { ...data, selectedStripeMode: "test" };
+      // This DATA-only fixture supplies one synthetic original instant to the Financial compiler.
+      const originalPinnedAt = new Date(genesis().createdAtEpochSeconds * 1000).toISOString();
+      const draft = compileMoneyD1StripeRealmPinDraftData(facts, originalPinnedAt);
+      const root = {
+        files,
+        freezeBindingDigest: facts.conversion.freezeBindingDigest,
+        originDigest: facts.conversion.originDigest,
+        original92BackupDigest: facts.original92.backupDigest,
+        writerDigest: facts.conversion.writerDigest,
+        previousWriterEpoch: writerEpoch,
+        nextWriterEpoch: f.nextWriterEpoch,
+      };
+      return {
+        f,
+        facts,
+        draft,
+        root,
+        originalPinnedAt,
+        convertedSnapshot: readFileSync(f.convertedBackupPath, "utf8"),
+      };
+    } catch (error) {
+      f.close();
+      throw error;
+    }
+  };
+  test("actual V15 DATA triple is adjacent between fixed98 and one epoch rotation", async () => {
+    const { f, draft, root, convertedSnapshot, originalPinnedAt } = await prepare();
+    try {
+      expect(draft.contribution).toBe(null);
+      expect(draft.statements[1].params).toEqual([originalPinnedAt]);
+      const one = await buildMoneyPost94OneImportData({
+        root,
+        financialStatements: draft.statements,
+        convertedSnapshot,
+      });
+      expect(one.qualification).toBe("source-data-only");
+      expect(one.digest).toBe(sha(one.sql));
+      expect(one.expectedRowCounts.money_cutover_writer_permit).toBe(0);
+      const statements = frameHostMigrationSql(one.sql),
+        fragments = buildMoneyPost94RootImportData(root);
+      const prefix = frameHostMigrationSql(fragments.beforeFinancialSql),
+        suffix = frameHostMigrationSql(fragments.afterFinancialSql);
+      expect(statements.length).toBe(prefix.length + 6 + suffix.length);
+      expect(statements.slice(prefix.length + 3, prefix.length + 6).map(opaqueSql)).toEqual(
+        [...buildMoneyPost94SigningGenesisData(genesis())]
+          .flatMap((sql) => [...frameHostMigrationSql(sql)])
+          .map((sql) => opaqueSql(`\n${sql}`)),
+      );
+      expect(statements.slice(0, prefix.length).map(opaqueSql)).toEqual(prefix.map(opaqueSql));
+      expect(statements.slice(-suffix.length).map(opaqueSql)).toEqual(
+        suffix.map((sql, index) => opaqueSql(index === 0 ? `\n${sql}` : sql)),
+      );
+      // Replaying after the SQLite clock advances must preserve the composer's typed postimage.
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      f.database.transaction(() => execute(f.database, one.sql))();
+      expect(moneyUnitCutoverSchemaMatches(state(f.database), files, "0098-fenced")).toBe(true);
+      await assertStripeModeRealm(createSqliteSql(f.database), "test");
+      expect(
+        f.database.query("SELECT writer_epoch FROM money_cutover_authorized_epoch").get(),
+      ).toEqual({ writer_epoch: f.nextWriterEpoch });
+      expect(
+        await readWholeDatabaseDataDigest(
+          reader(f.database),
+          "verification",
+          Object.keys(one.expectedRowCounts),
+        ),
+      ).toBe(one.expectedAllDataDigest);
+      expect(() => f.database.transaction(() => execute(f.database, one.sql))()).toThrow();
+    } finally {
+      f.close();
+    }
+  });
+  test("a deliberate error after the real triple rolls back suffix, pin and old epoch together", async () => {
+    const { f, draft, root, convertedSnapshot } = await prepare();
+    try {
+      const one = await buildMoneyPost94OneImportData({
+        root,
+        financialStatements: draft.statements,
+        convertedSnapshot,
+      });
+      const statements = frameHostMigrationSql(one.sql),
+        after = frameHostMigrationSql(buildMoneyPost94RootImportData(root).afterFinancialSql);
+      const before = state(f.database),
+        dataBefore = await allData(f.database);
+      let reached = false;
+      expect(() =>
+        f.database.transaction(() => {
+          execute(f.database, statements.slice(0, -after.length).join("\n"));
+          reached = true;
+          f.database.exec("SELECT missing FROM root_deliberate_missing_post94_table");
+          execute(f.database, after.join("\n"));
+        })(),
+      ).toThrow("root_deliberate_missing_post94_table");
+      expect(reached).toBe(true);
+      expect(opaqueValue(state(f.database))).toEqual(opaqueValue(before));
+      expect(await allData(f.database)).toBe(dataBefore);
+      expect(
+        f.database.query("SELECT writer_epoch FROM money_cutover_authorized_epoch").get(),
+      ).toEqual({ writer_epoch: writerEpoch });
+      await expect(assertStripeModeRealm(createSqliteSql(f.database), "test")).rejects.toThrow();
+    } finally {
+      f.close();
+    }
+  });
+  test("zero-row fake INSERT or a malformed tuple cannot become a positive TEST pin", async () => {
+    const { f, draft, root, convertedSnapshot } = await prepare();
+    try {
+      const triple = [
+        { sql: "SELECT 1", params: [] },
+        {
+          sql: "SELECT 1 AS singleton, 'test' AS mode, 'irrelevant' AS pinned_at WHERE 0",
+          params: [],
+        },
+        draft.statements[2],
+      ] as unknown as typeof draft.statements;
+      await expect(
+        buildMoneyPost94OneImportData({ root, financialStatements: triple, convertedSnapshot }),
+      ).rejects.toThrow("mandatory Financial INSERT");
+      await expect(
+        buildMoneyPost94OneImportData({
+          root,
+          financialStatements: draft.statements.slice(1) as unknown as typeof draft.statements,
+          convertedSnapshot,
+        }),
+      ).rejects.toThrow("exact adjacent Financial triple");
+      const altered = [
+        { sql: "SELECT 1", params: [] },
+        { ...draft.statements[1], params: [...draft.statements[1].params, "extraneous"] },
+        draft.statements[2],
+      ] as unknown as typeof draft.statements;
+      await expect(
+        buildMoneyPost94OneImportData({ root, financialStatements: altered, convertedSnapshot }),
+      ).rejects.toThrow();
+    } finally {
+      f.close();
+    }
+  });
+  test("native SQLite boundaries retain only finite codes and opaque hashes", async () => {
+    const { f, draft, root, convertedSnapshot } = await prepare();
+    try {
+      const cases = [
+        { sql: "SELECT missing FROM root_only_private_sql_marker", stage: "financial-expand" },
+        { sql: "SELECT json('root_only_private_json_marker')", stage: "financial-execute" },
+      ];
+      for (const selected of cases) {
+        const triple = [
+          { sql: selected.sql, params: [] },
+          draft.statements[1],
+          draft.statements[2],
+        ] as unknown as typeof draft.statements;
+        const error = await buildMoneyPost94OneImportData({
+          root,
+          financialStatements: triple,
+          convertedSnapshot,
+        }).then(
+          () => null,
+          (value: unknown) => value,
+        );
+        expect(error instanceof Error).toBe(true);
+        expect(Object.hasOwn(error as object, "query")).toBe(false);
+        expect(Object.hasOwn(error as object, "cause")).toBe(false);
+        expect(JSON.stringify(error).includes("root_only_private_")).toBe(false);
+        const metadata = JSON.parse((error as { detail: string }).detail);
+        expect(metadata.stage).toBe(selected.stage);
+        expect(metadata.nativeCode).toBe("sqlite_error");
+        expect(metadata.statementDigest).toBe(sha(selected.sql));
+      }
+      const badSnapshot = normalizeSnapshotDump(
+        Buffer.from(
+          `${convertedSnapshot}\nSELECT missing FROM root_only_private_snapshot_marker;\n`,
+        ),
+      ).sql;
+      const error = await buildMoneyPost94OneImportData({
+        root,
+        financialStatements: draft.statements,
+        convertedSnapshot: badSnapshot,
+      }).then(
+        () => null,
+        (value: unknown) => value,
+      );
+      expect(error instanceof Error).toBe(true);
+      expect(Object.hasOwn(error as object, "query")).toBe(false);
+      expect(Object.hasOwn(error as object, "cause")).toBe(false);
+      expect(JSON.stringify(error).includes("root_only_private_")).toBe(false);
+      const metadata = JSON.parse((error as { detail: string }).detail);
+      expect(metadata.stage).toBe("snapshot-import");
+      expect(metadata.statementDigest).toBe(sha(badSnapshot));
+    } finally {
+      f.close();
+    }
+  });
+  test("lossy NUL parameter refuses before native expansion or any external mutation", async () => {
+    const { f, draft, root, convertedSnapshot } = await prepare();
+    try {
+      const triple = [
+        { sql: "SELECT ?", params: ["retained\0bytes"] },
+        draft.statements[1],
+        draft.statements[2],
+      ] as unknown as typeof draft.statements;
+      await expect(
+        buildMoneyPost94OneImportData({ root, financialStatements: triple, convertedSnapshot }),
+      ).rejects.toThrow("losslessly");
+      expect(moneyUnitCutoverSchemaMatches(state(f.database), files, "0094-fenced")).toBe(true);
+    } finally {
+      f.close();
+    }
+  });
+  test("bare options/context DTO cannot enter actual operative constructor or native executor", async () => {
+    const target = legacyMoneyStagingTarget();
+    await expect(
+      runIntegrationMoneyHeldSuffix98(
+        {
+          action: "apply",
+          environment: "integration",
+          commit: "a".repeat(40),
+          throughMigration: "0098",
+        },
+        target,
+        { phase: "convert" } as MoneyUnitOriginalCutoverOptions,
+        {} as MoneyUnitHeldPost94ConsumerInputs,
+        {},
+      ),
+    ).rejects.toThrow();
+  });
+});
+
+describe("fixed post94 Root signing genesis DATA", () => {
+  const nextWriterEpoch = sha("signing DATA next epoch");
+  const publicJwk = JSON.stringify({
+    kty: "OKP",
+    crv: "Ed25519",
+    x: Buffer.from(
+      "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+      "hex",
+    ).toString("base64url"),
+  });
+  const input = () => ({
+    keyId: "component-signing-key",
+    publicJwk,
+    createdAtEpochSeconds: 1720000000,
+    previousWriterEpoch: writerEpoch,
+  });
+  const selected = () => ({
+    files,
+    freezeBindingDigest: marker,
+    originDigest: marker,
+    original92BackupDigest: marker,
+    writerDigest: marker,
+    previousWriterEpoch: writerEpoch,
+    nextWriterEpoch,
+  });
+  const execute = (database: Database, source: string) => {
+    for (const statement of frameHostMigrationSql(source)) database.exec(statement);
+  };
+  const converted = () => {
+    const database = fixture(true);
+    for (const phase of ["freeze", "prepare", "classify", "convert"] as const)
+      execute(database, sql(phase, []));
+    return database;
+  };
+  test("fixed public registration returns exact active row and precedes epoch rotation", () => {
+    const database = converted();
+    try {
+      const fragments = buildMoneyPost94RootImportData(selected()),
+        statements = buildMoneyPost94SigningGenesisData(input());
+      database.exec("BEGIN");
+      execute(database, fragments.beforeFinancialSql);
+      database.exec(statements[0]);
+      const rows = database.prepare(statements[1]).all();
+      expect(rows).toEqual([
+        {
+          key_id: input().keyId,
+          public_jwk: publicJwk,
+          created_at_epoch_seconds: 1720000000,
+          revoked_at_epoch_seconds: null,
+        },
+      ]);
+      database.exec(statements[2]);
+      execute(database, fragments.afterFinancialSql);
+      database.exec("COMMIT");
+      expect(
+        database.query("SELECT writer_epoch FROM money_cutover_authorized_epoch").get(),
+      ).toEqual({ writer_epoch: nextWriterEpoch });
+      expect(database.query("SELECT COUNT(*) AS n FROM runtime_grant_keys").get()).toEqual({
+        n: 1,
+      });
+    } finally {
+      database.close();
+    }
+  });
+  test("existing row refuses before INSERT and never overwrites its exact bytes", () => {
+    const database = converted();
+    try {
+      execute(database, buildMoneyPost94RootImportData(selected()).beforeFinancialSql);
+      for (const statement of buildMoneyPost94SigningGenesisData(input()))
+        database.prepare(statement).all();
+      const before = database.query("SELECT * FROM runtime_grant_keys").all();
+      expect(() =>
+        database.transaction(() =>
+          execute(
+            database,
+            buildMoneyPost94SigningGenesisData({ ...input(), keyId: "other-component-key" }).join(
+              "\n",
+            ),
+          ),
+        )(),
+      ).toThrow();
+      expect(database.query("SELECT * FROM runtime_grant_keys").all()).toEqual(before);
+    } finally {
+      database.close();
+    }
+  });
+  test("zero INSERT and a crossed postimage both abort rather than passing on zero rows", () => {
+    for (const mutation of ["zero", "crossed"]) {
+      const database = converted();
+      try {
+        execute(database, buildMoneyPost94RootImportData(selected()).beforeFinancialSql);
+        const statements = buildMoneyPost94SigningGenesisData(input());
+        expect(() =>
+          database.transaction(() => {
+            database.exec(statements[0]);
+            if (mutation === "zero") database.exec("SELECT 1 WHERE 0");
+            else {
+              database.prepare(statements[1]).all();
+              database.exec("UPDATE runtime_grant_keys SET revoked_at_epoch_seconds=1720000001");
+            }
+            database.exec(statements[2]);
+          })(),
+        ).toThrow();
+        expect(database.query("SELECT COUNT(*) AS n FROM runtime_grant_keys").get()).toEqual({
+          n: 0,
+        });
+      } finally {
+        database.close();
+      }
+    }
+  });
+  test("late old-epoch failure rolls back schema and public registration together", () => {
+    const database = converted();
+    try {
+      const before = state(database),
+        fragments = buildMoneyPost94RootImportData(selected());
+      let registered = false;
+      expect(() =>
+        database.transaction(() => {
+          execute(database, fragments.beforeFinancialSql);
+          execute(database, buildMoneyPost94SigningGenesisData(input()).join("\n"));
+          registered = true;
+          execute(
+            database,
+            buildMoneyPost94RootImportData({
+              ...selected(),
+              previousWriterEpoch: sha("wrong-old-epoch"),
+            }).afterFinancialSql,
+          );
+        })(),
+      ).toThrow();
+      expect(registered).toBe(true);
+      expect(opaqueValue(state(database))).toEqual(opaqueValue(before));
+      expect(database.query("SELECT COUNT(*) AS n FROM runtime_grant_keys").get()).toEqual({
+        n: 0,
+      });
+      expect(
+        database.query("SELECT writer_epoch FROM money_cutover_authorized_epoch").get(),
+      ).toEqual({ writer_epoch: writerEpoch });
+    } finally {
+      database.close();
+    }
+  });
+  test("private fields, noncanonical bytes and accessor DATA are refused without minting authority", () => {
+    expect(() =>
+      buildMoneyPost94SigningGenesisData({
+        ...input(),
+        publicJwk: JSON.stringify({ ...JSON.parse(publicJwk), d: "not-a-key" }),
+      }),
+    ).toThrow();
+    expect(() =>
+      buildMoneyPost94SigningGenesisData({ ...input(), publicJwk: `${publicJwk} ` }),
+    ).toThrow();
+    let calls = 0;
+    const accessor = Object.defineProperty({ ...input() }, "keyId", {
+      enumerable: true,
+      get() {
+        calls++;
+        return "component";
+      },
+    });
+    expect(() => buildMoneyPost94SigningGenesisData(accessor)).toThrow();
+    expect(calls).toBe(0);
+  });
+});
+
+describe("fixed post94 live original transport refusal", () => {
+  test("pre-upload original selection cannot be created from naked default-looking options", async () => {
+    await expect(
+      readMoneyUnitHeldPost94ContextSelection(
+        { phase: "convert", writerEpoch } as MoneyUnitOriginalCutoverOptions,
+        "/unavailable/component-only-declaration.json",
+      ),
+    ).rejects.toThrow();
+  });
+  test("matching member DTOs cannot mint original same-context mode inputs", async () => {
+    await expect(
+      composeMoneyUnitHeldPost94ConsumerInputs(
+        { phase: "convert" } as MoneyUnitOriginalCutoverOptions,
+        {
+          context: { kind: "takoserver.money-held-convert-context@v1" },
+          selection: { phase: "suffix98" },
+        } as unknown as Parameters<typeof composeMoneyUnitHeldPost94ConsumerInputs>[1],
+        {} as Parameters<typeof composeMoneyUnitHeldPost94ConsumerInputs>[2],
+      ),
+    ).rejects.toThrow();
+  });
+  test("getter-backed context transport is rejected without invoking getters", async () => {
+    let calls = 0;
+    const data = Object.defineProperty({ selection: {} }, "context", {
+      enumerable: true,
+      get() {
+        calls++;
+        throw Error("must not invoke");
+      },
+    });
+    await expect(
+      composeMoneyUnitHeldPost94ConsumerInputs(
+        {} as MoneyUnitOriginalCutoverOptions,
+        data as unknown as Parameters<typeof composeMoneyUnitHeldPost94ConsumerInputs>[1],
+        {} as Parameters<typeof composeMoneyUnitHeldPost94ConsumerInputs>[2],
+      ),
+    ).rejects.toThrow("own DATA");
+    expect(calls).toBe(0);
   });
 });

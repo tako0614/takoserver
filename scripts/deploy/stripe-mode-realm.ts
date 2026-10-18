@@ -39,6 +39,16 @@ export function inspectStripeModeRealm(
   return { ready: true, selectedMode, pinnedMode, reason: null };
 }
 
+// This import must resolve to the same Root owner module instance that minted
+// the held context. The private source packet does not apply that Root module.
+import {
+  assertMoneyUnitHeldConvertCurrent,
+  assertMoneyUnitHeldNormalWorkerModePreparationCurrent,
+  type MoneyHeldNormalWorkerModeFacts,
+  type MoneyUnitHeldConvertContext,
+  type MoneyUnitHeldConvertFacts,
+  type MoneyUnitHeldNormalWorkerModePreparation,
+} from "@takoserver/core/deploy-extension";
 import {
   MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE,
   MONEY_CUTOVER_EPOCH,
@@ -49,16 +59,6 @@ import {
   STRIPE_REALM_AMBIGUOUS_HISTORY_TABLES,
   STRIPE_REALM_FINANCIAL_HISTORY_QUERY,
 } from "../../src/stripe-mode-realm.ts";
-// This import must resolve to the same Root owner module instance that minted
-// the held context. The private source packet does not apply that Root module.
-import {
-  assertMoneyUnitHeldNormalWorkerModePreparationCurrent,
-  assertMoneyUnitHeldConvertCurrent,
-  type MoneyHeldNormalWorkerModeFacts,
-  type MoneyUnitHeldConvertContext,
-  type MoneyUnitHeldConvertFacts,
-  type MoneyUnitHeldNormalWorkerModePreparation,
-} from "@takoserver/core/deploy-extension";
 
 export type MoneyRealmTableClass =
   | "known_financial"
@@ -910,12 +910,33 @@ const MONEY_REALM_POST94_STAGE_TABLES = [
   "stripe_subscription_custody_reconcile",
 ] as const;
 
+/** Canonical command audit metadata only; this is not a native/policy Clock.
+ * A DATA caller supplies its original instant explicitly. Only the operative
+ * constructor captures a new wall-clock instant after genuine Root assertions. */
+function moneyRealmOriginalPinInstant(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    value.length !== 24 ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u.test(value) ||
+    !Number.isFinite(Date.parse(value)) ||
+    new Date(value).toISOString() !== value
+  )
+    throw moneyRealmCensusError();
+  return value;
+}
+
+function moneyRealmCapturePinInstant(): string {
+  return moneyRealmOriginalPinInstant(new Date().toISOString());
+}
+
 /** Pure DATA compiler. Supplied facts, even matching ones, are not Root evidence.
  * There is no SQL/table/callback input and no SQL runner. A future Root ONE must
  * keep the ordered three adjacent and roll back the entire transaction on error. */
 export function compileMoneyD1StripeRealmPinDraftData(
   facts: MoneyUnitHeldConvertFacts,
+  originalPinnedAt: string,
 ): MoneyRealmPinDraftData {
+  const pinnedAt = moneyRealmOriginalPinInstant(originalPinnedAt);
   const sourceFactsJson = moneyRealmDraftSourceJson(facts);
   // JSON parse uses only our own-data encoding: no borrowed DTO is read again.
   const snapshot: MoneyUnitHeldConvertFacts = JSON.parse(sourceFactsJson);
@@ -975,7 +996,8 @@ export function compileMoneyD1StripeRealmPinDraftData(
     snapshot.conversion.writerDigest,
     snapshot.original92.sourceDigest,
   );
-  if (params.length !== financial.length + 14 || params.length > 100) throw moneyRealmCensusError();
+  if (params.length !== financial.length + 14 || params.length + 1 > 100)
+    throw moneyRealmCensusError();
   const common = moneyRealmDraftAnd(guards);
   const pre = moneyRealmDraftAnd([common, "NOT EXISTS (SELECT 1 FROM stripe_mode_realm)"]);
   const post = moneyRealmDraftAnd([
@@ -984,11 +1006,14 @@ export function compileMoneyD1StripeRealmPinDraftData(
     "(SELECT count(*) FROM stripe_mode_realm) = 1",
     `EXISTS (SELECT 1 FROM stripe_mode_realm WHERE typeof(singleton) = 'integer'
       AND singleton IS 1 AND typeof(mode) = 'text' AND mode IS 'test'
-      AND typeof(pinned_at) = 'text'
+      AND typeof(pinned_at) = 'text' AND pinned_at IS ?
       AND strftime('%Y-%m-%dT%H:%M:%fZ', pinned_at) IS pinned_at)`,
   ]);
-  const statement = (sql: string): MoneyRealmPinDraftStatementData =>
-    Object.freeze({ sql, params: Object.freeze([...params]) });
+  const statement = (
+    sql: string,
+    statementParams: readonly (string | number)[] = params,
+  ): MoneyRealmPinDraftStatementData =>
+    Object.freeze({ sql, params: Object.freeze([...statementParams]) });
   return Object.freeze({
     scope: "financial-realm-pin-source-data-only",
     sourceFactsJson,
@@ -998,12 +1023,13 @@ export function compileMoneyD1StripeRealmPinDraftData(
       ),
       Object.freeze({
         sql: `INSERT INTO stripe_mode_realm (singleton, mode, pinned_at)
-VALUES (1, 'test', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+VALUES (1, 'test', ?)
 RETURNING singleton, mode, pinned_at`,
-        params: Object.freeze([]),
+        params: Object.freeze([pinnedAt]),
       }),
       statement(
         `SELECT json_extract(CASE WHEN ${post} THEN '[1]' ELSE '!' END, '$[0]') AS required_financial_realm`,
+        [...params, pinnedAt],
       ),
     ] as const),
     normalWorkerMode: "not_established",
@@ -1036,7 +1062,7 @@ export async function readMoneyD1StripeRealmPinSourceDraft(
     const held = context as MoneyUnitHeldConvertContext;
     if (held.kind !== "takoserver.money-held-convert-context@v1") throw moneyRealmCensusError();
     const facts = held.facts;
-    const draft = compileMoneyD1StripeRealmPinDraftData(facts);
+    const draft = compileMoneyD1StripeRealmPinDraftData(facts, moneyRealmCapturePinInstant());
     const source = moneyRealmDraftSourceJson([
       "takoserver.financial-realm-pin-internal-source-v1",
       draft,
@@ -1095,8 +1121,9 @@ const MONEY_REALM_MODE_DIGEST_FIELDS = [
 export function compileMoneyD1StripeRealmNormalModeDraftData(
   facts: MoneyUnitHeldConvertFacts,
   modeFacts: MoneyHeldNormalWorkerModeFacts,
+  originalPinnedAt: string,
 ): MoneyRealmNormalModeDraftData {
-  const pin = compileMoneyD1StripeRealmPinDraftData(facts);
+  const pin = compileMoneyD1StripeRealmPinDraftData(facts, originalPinnedAt);
   const held: MoneyUnitHeldConvertFacts = JSON.parse(pin.sourceFactsJson);
   const modeFactsJson = moneyRealmDraftSourceJson(modeFacts);
   const mode: MoneyHeldNormalWorkerModeFacts = JSON.parse(modeFactsJson);
@@ -1173,18 +1200,25 @@ export interface MoneyRealmOriginalModeCheckedPinDraft {
  * There is no runner, issuer, local capability map or consumer assertion port.
  * Root must still bind these exact statements to its sealed ONE and recheck the
  * originals at dispatch; this result cannot perform or authorize an import. */
-export async function readMoneyD1StripeRealmNormalModePinSourceDraft(
+async function moneyRealmReadOriginalModePinSourceDraft(
   context: unknown,
   preparation: unknown,
-): Promise<MoneyRealmOriginalModeCheckedPinDraft> {
+  originalPinnedAt?: string,
+): Promise<{ readonly checked: MoneyRealmOriginalModeCheckedPinDraft; readonly pinnedAt: string }> {
   try {
     await assertMoneyUnitHeldNormalWorkerModePreparationCurrent(preparation, context);
+    // Creation samples the actual owner clock once. Currentness reconstruction
+    // supplies the retained original, so it never samples a new instant.
+    const pinnedAt =
+      originalPinnedAt === undefined
+        ? moneyRealmCapturePinInstant()
+        : moneyRealmOriginalPinInstant(originalPinnedAt);
     const held = context as MoneyUnitHeldConvertContext;
     const original = preparation as MoneyUnitHeldNormalWorkerModePreparation;
     const facts = held.facts;
     const mode = original.facts;
     const preparationBindingDigest = original.bindingDigest;
-    const draft = compileMoneyD1StripeRealmNormalModeDraftData(facts, mode);
+    const draft = compileMoneyD1StripeRealmNormalModeDraftData(facts, mode, pinnedAt);
     const source = moneyRealmDraftSourceJson([
       "takoserver.financial-normal-mode-pin-internal-source-v1",
       preparationBindingDigest,
@@ -1203,7 +1237,7 @@ export async function readMoneyD1StripeRealmNormalModePinSourceDraft(
       moneyRealmDraftSourceJson(mode) !== draft.modeFactsJson
     )
       throw moneyRealmCensusError();
-    return Object.freeze({
+    const checked: MoneyRealmOriginalModeCheckedPinDraft = Object.freeze({
       scope: "financial-original-mode-checked-pin-draft-not-permission",
       draft,
       sourceBindingDigest,
@@ -1215,9 +1249,19 @@ export async function readMoneyD1StripeRealmNormalModePinSourceDraft(
         "root_epoch_rotation_order_unintegrated",
       ] as const),
     });
+    return Object.freeze({ checked, pinnedAt });
   } catch (cause) {
     throw new MoneyRealmDiagnosticError(cause);
   }
+}
+
+/** Original checked DATA entry; operative assertions use only the private
+ * reconstruction path with their retained command instant. */
+export async function readMoneyD1StripeRealmNormalModePinSourceDraft(
+  context: unknown,
+  preparation: unknown,
+): Promise<MoneyRealmOriginalModeCheckedPinDraft> {
+  return (await moneyRealmReadOriginalModePinSourceDraft(context, preparation)).checked;
 }
 
 declare const moneyRealmPinContributionBrand: unique symbol;
@@ -1237,6 +1281,7 @@ export interface MoneyRealmPinContribution {
 interface MoneyRealmPinContributionOrigin {
   readonly context: unknown;
   readonly preparation: unknown;
+  readonly pinnedAt: string;
   readonly sourceBindingDigest: `sha256:${string}`;
   readonly modePreparationDigest: `sha256:${string}`;
   readonly statementsJson: string;
@@ -1271,7 +1316,10 @@ export async function readMoneyD1StripeRealmPinContribution(
   preparation: unknown,
 ): Promise<MoneyRealmPinContribution> {
   try {
-    const checked = await readMoneyD1StripeRealmNormalModePinSourceDraft(context, preparation);
+    const { checked, pinnedAt } = await moneyRealmReadOriginalModePinSourceDraft(
+      context,
+      preparation,
+    );
     const modePreparationDigest = moneyRealmOriginalModeDigest(preparation);
     const facts: MoneyUnitHeldConvertFacts = JSON.parse(checked.draft.pin.sourceFactsJson);
     const contribution = Object.freeze({
@@ -1286,6 +1334,7 @@ export async function readMoneyD1StripeRealmPinContribution(
     moneyRealmPinContributions.set(contribution, {
       context,
       preparation,
+      pinnedAt,
       sourceBindingDigest: checked.sourceBindingDigest,
       modePreparationDigest,
       statementsJson: moneyRealmDraftSourceJson(contribution.statements),
@@ -1317,7 +1366,11 @@ export async function assertMoneyD1StripeRealmPinContributionCurrent(
     // inherited artifacts are refused by identity without invoking their traps.
     if (moneyRealmDraftSourceJson(contribution) !== original.contributionJson)
       throw moneyRealmCensusError();
-    const checked = await readMoneyD1StripeRealmNormalModePinSourceDraft(context, preparation);
+    const { checked } = await moneyRealmReadOriginalModePinSourceDraft(
+      context,
+      preparation,
+      original.pinnedAt,
+    );
     if (
       checked.sourceBindingDigest !== original.sourceBindingDigest ||
       moneyRealmOriginalModeDigest(preparation) !== original.modePreparationDigest ||
