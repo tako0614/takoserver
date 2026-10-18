@@ -54,6 +54,7 @@ async function runtimeWithKey(
     ],
     target: "browser",
     format: "esm",
+    external: ["cloudflare:workers"],
   });
   expect(build.success).toBe(true);
   const bundle = build.outputs[0];
