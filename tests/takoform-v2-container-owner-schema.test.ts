@@ -1213,3 +1213,382 @@ test("provider catalog category 2 cannot hide an ordinary inbound foreign key", 
     db.close();
   }
 });
+
+async function f2CorePrivateInputKeys(
+  previous?: import("../src/takoform-v2/private-inputs.ts").V2PrivateInputCustody,
+): Promise<import("../src/takoform-v2/private-inputs.ts").V2PrivateInputCustody> {
+  const [transfer, comparison] = await Promise.all([
+    crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]),
+    crypto.subtle.generateKey({ name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]),
+  ]);
+  return {
+    transfer: {
+      current: { id: previous ? "transfer-next" : "transfer-first", key: transfer },
+      ...(previous ? { previous: [previous.transfer.current] } : {}),
+    },
+    comparison: {
+      current: { id: previous ? "comparison-next" : "comparison-first", key: comparison },
+      ...(previous ? { previous: [previous.comparison.current] } : {}),
+    },
+    transferTtlSeconds: 2,
+  };
+}
+
+async function full100F2ConfiguredContainerEngine(
+  db: Database,
+  wrapSql: (sql: Sql) => Sql = (sql) => sql,
+  formUrlOverride?: string,
+) {
+  const { V2_CONTAINER_F2_FORM } = await import("../src/takoform-v2/container-owner-schema.ts");
+  const selectedForm = formUrlOverride === undefined ? V2_CONTAINER_F2_FORM : formUrlOverride;
+  if (selectedForm !== C.formUrl && selectedForm !== V2_CONTAINER_F2_FORM)
+    throw new TypeError("Unsupported fixture Form");
+
+  // This helper compares the generated migration set and each generated SQL
+  // value with the exact audited source artifact before canonical migration.
+  const audited = currentAuditedSchemaMigrations();
+  expect(audited.length).toBe(100);
+  migrateSqlite(db);
+  const sql = wrapSql(createSqliteSql(db));
+  const privateInputCustody = await f2CorePrivateInputKeys();
+  return sql.batch(v2ContainerOwnerMigrationCandidate()).then(() => {
+    const host = createV2ContainerHostAcceptance({
+      sql,
+      installationId: "test-installation",
+      backendId: "test-container-backend",
+      targetKey: "test-container-target",
+    });
+    const backend: V2Backend = {
+      id: "test-container-backend",
+      targetKey: "test-container-target",
+      async execute() {
+        return { kind: "no_effect", code: "fixture_no_effect", message: "No effect" };
+      },
+      async reconcile() {
+        return { kind: "no_effect", code: "fixture_no_effect", message: "No effect" };
+      },
+    };
+    const sealing: {
+      calls: number;
+      updateCalls: number;
+      operationId: string | undefined;
+      resourceUid: string | undefined;
+      envelope:
+        | { readonly keyId: string; readonly nonce: string; readonly ciphertext: string }
+        | undefined;
+    } = {
+      calls: 0,
+      updateCalls: 0,
+      operationId: undefined,
+      resourceUid: undefined,
+      envelope: undefined,
+    };
+    const form: V2Form = {
+      validateCreate() {},
+      validateUpdate() {},
+      backend,
+
+      privateInputs: {
+        requiredForEveryInstance: true,
+        validateCreate(_spec, inputs) {
+          if (inputs === undefined || inputs.TOKEN !== "owner-f2-fixture-value")
+            throw new TypeError("F2 fixture input unavailable");
+        },
+        validateUpdate(_previous, _next, inputs) {
+          if (inputs !== undefined)
+            throw new TypeError("F2 fixture replacement is outside this check");
+        },
+        async prepareCreate(input) {
+          expect(input.form).toBe(selectedForm);
+          expect(input.generation).toBe(1);
+          if (
+            input.privateInputs === undefined ||
+            input.privateInputs.TOKEN !== "owner-f2-fixture-value"
+          )
+            throw new TypeError("F2 fixture input unavailable");
+          const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
+            "encrypt",
+            "decrypt",
+          ]);
+          const nonce = crypto.getRandomValues(new Uint8Array(12));
+          const plaintext = new TextEncoder().encode(JSON.stringify(input.privateInputs));
+          const aad = new TextEncoder().encode(
+            JSON.stringify({
+              form: input.form,
+              resourceUid: input.resourceUid,
+              operationId: input.operationId,
+              generation: input.generation,
+            }),
+          );
+          try {
+            const encrypted = await crypto.subtle.encrypt(
+              { name: "AES-GCM", iv: nonce, additionalData: aad },
+              key,
+              plaintext,
+            );
+            const opened = new Uint8Array(
+              await crypto.subtle.decrypt(
+                { name: "AES-GCM", iv: nonce, additionalData: aad },
+                key,
+                encrypted,
+              ),
+            );
+            try {
+              expect(Array.from(opened)).toEqual(Array.from(plaintext));
+            } finally {
+              opened.fill(0);
+            }
+            const envelope = Object.freeze({
+              keyId: "owner-f2-fixture-key",
+              nonce: btoa(String.fromCharCode(...nonce)),
+              ciphertext: btoa(String.fromCharCode(...new Uint8Array(encrypted))),
+            });
+            sealing.calls++;
+            sealing.operationId = input.operationId;
+            sealing.resourceUid = input.resourceUid;
+            sealing.envelope = envelope;
+            return envelope;
+          } finally {
+            plaintext.fill(0);
+          }
+        },
+        async prepareUpdate(input) {
+          if (sealing.envelope === undefined) throw new Error("fixture envelope missing");
+          expect(input.configured).toEqual(sealing.envelope);
+          sealing.updateCalls++;
+        },
+      },
+    };
+    const engine = createTakoformV2Engine(
+      {
+        sql,
+        replayWindowSeconds: 120,
+        now: () => new Date("2026-10-16T00:00:00.000Z"),
+        async authorize(principal, space) {
+          return principal === "container-owner-test" && space === "default";
+        },
+        privateInputCustody,
+        forms: { [selectedForm]: form },
+      },
+      host,
+    );
+    return { engine, sql, sealing, formUrl: selectedForm };
+  });
+}
+
+function observeF2ContainerDeleteBatch(original: Sql, fault?: "action" | "missing-operation") {
+  const deleteBatches: Parameters<Sql["batch"]>[0][] = [];
+  let injected = false;
+  const sql: Sql = {
+    query(statement, params) {
+      return original.query(statement, params);
+    },
+    run(statement, params) {
+      return original.run(statement, params);
+    },
+    batch(statements) {
+      const terminal = statements.at(-1);
+      if (
+        !terminal?.sql.startsWith(
+          "WITH host_form_admission AS (SELECT 1 AS permitted) INSERT OR ABORT INTO main.tf_v2_container_acceptances ",
+        ) ||
+        terminal.params?.[10] !== "delete"
+      ) {
+        return original.batch(statements);
+      }
+      deleteBatches.push(statements);
+      if (fault === undefined) return original.batch(statements);
+      const params = [...terminal.params];
+      injected = true;
+      if (fault === "action") params[10] = "invalid-container-delete-action";
+      else params[12] = "missing-container-delete-core-operation";
+      return original.batch([...statements.slice(0, -1), { sql: terminal.sql, params }]);
+    },
+  };
+  return { sql, deleteBatches, injected: () => injected };
+}
+
+test("genuine F2 full100 nonempty CREATE, retained UPDATE and key-free DELETE", async () => {
+  const db = new Database(":memory:");
+  try {
+    const f = await full100F2ConfiguredContainerEngine(db);
+    const desired = Object.freeze({
+      ...coreContainerSpec("1".repeat(64)),
+      [C.fields.image]: "registry.example.test/owner/f2@sha256:" + "a".repeat(64),
+      [C.fields.workloadRevision]: "1".repeat(64),
+      [C.fields.requiredSensitiveVars]: Object.freeze(["TOKEN"]),
+    });
+    const created = await f.engine.acceptCreate({
+      principal: "container-owner-test",
+      key: "f2-create-canonical-source",
+      input: {
+        form: f.formUrl,
+        space: "default",
+        name: "f2-secret",
+        spec: desired,
+        privateInputs: { TOKEN: "owner-f2-fixture-value" },
+      },
+    });
+    expect(created.generation).toBe(1);
+    expect(f.sealing.calls).toBe(1);
+    expect(f.sealing.operationId).toBe(created.id);
+    expect(f.sealing.resourceUid).toBe(created.resourceUid);
+    const afterCreate = await containerDeleteSnapshot(db);
+    const createAcceptance = Object.values(afterCreate.owner)
+      .flat()
+      .find((row) => row.operation_id === created.id);
+    expect(createAcceptance).toBeDefined();
+    expect(createAcceptance?.configured_private_inputs_json).toBe(
+      JSON.stringify(f.sealing.envelope),
+    );
+    expect(typeof createAcceptance?.configured_private_inputs_json).toBe("string");
+    const configuredCreate = createAcceptance?.configured_private_inputs_json;
+    if (typeof configuredCreate !== "string") throw new TypeError("F2 sealed terminal missing");
+    expect(configuredCreate.length).toBeGreaterThan(0);
+    console.info(
+      JSON.stringify({
+        event: "owner-f2-controlled-stage",
+        stage: "nonempty_create_terminal",
+        generation: 1,
+        sealCalls: f.sealing.calls,
+      }),
+    );
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const updated = await f.engine.acceptUpdate({
+      principal: "container-owner-test",
+      key: "f2-update-canonical-source",
+      uid: created.resourceUid,
+      expectedGeneration: 1,
+      spec: Object.freeze({ ...desired, [C.fields.workloadRevision]: "2".repeat(64) }),
+    });
+    expect(updated.generation).toBe(2);
+    expect(f.sealing.calls).toBe(1);
+    expect(f.sealing.updateCalls).toBe(1);
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const deleted = await f.engine.acceptDelete({
+      principal: "container-owner-test",
+      key: "f2-delete-canonical-source",
+      uid: created.resourceUid,
+      expectedGeneration: 2,
+    });
+    expect(deleted.generation).toBe(3);
+    const afterDelete = await containerDeleteSnapshot(db);
+    const rows = Object.values(afterDelete.owner).flat();
+    const deleteAcceptance = rows.find((row) => row.operation_id === deleted.id);
+    const instance = rows.find((row) => row.retire_operation_id === deleted.id);
+    expect(deleteAcceptance?.action).toBe("delete");
+    expect(deleteAcceptance?.references_json).toBeNull();
+    expect(deleteAcceptance?.configured_private_inputs_json).toBeNull();
+    expect(instance?.desired_generation).toBe(3);
+    expect(typeof instance?.retired_at_ms).toBe("number");
+    expect(f.sealing.calls).toBe(1);
+    expect(f.sealing.updateCalls).toBe(1);
+    console.info(
+      JSON.stringify({
+        event: "owner-f2-controlled-stage",
+        stage: "retained_update_key_free_delete",
+        generation: 3,
+        sealCalls: f.sealing.calls,
+        updateCalls: f.sealing.updateCalls,
+      }),
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("genuine F2 full100 DELETE terminal fault preserves complete Core owner and schema", async () => {
+  const db = new Database(":memory:");
+  try {
+    let observation: ReturnType<typeof observeF2ContainerDeleteBatch> | undefined;
+    const f = await full100F2ConfiguredContainerEngine(db, (sql) => {
+      observation = observeF2ContainerDeleteBatch(sql, "missing-operation");
+      return observation.sql;
+    });
+    const desired = Object.freeze({
+      ...coreContainerSpec("1".repeat(64)),
+      [C.fields.image]: "registry.example.test/owner/f2@sha256:" + "a".repeat(64),
+      [C.fields.workloadRevision]: "3".repeat(64),
+      [C.fields.requiredSensitiveVars]: Object.freeze(["TOKEN"]),
+    });
+    const created = await f.engine.acceptCreate({
+      principal: "container-owner-test",
+      key: "f2-fault-create-canonical-source",
+      input: {
+        form: f.formUrl,
+        space: "default",
+        name: "f2-fault",
+        spec: desired,
+        privateInputs: { TOKEN: "owner-f2-fixture-value" },
+      },
+    });
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const updated = await f.engine.acceptUpdate({
+      principal: "container-owner-test",
+      key: "f2-fault-update-canonical-source",
+      uid: created.resourceUid,
+      expectedGeneration: 1,
+      spec: Object.freeze({ ...desired, [C.fields.workloadRevision]: "4".repeat(64) }),
+    });
+    expect(updated.generation).toBe(2);
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const before = await containerDeleteSnapshot(db);
+    await expect(
+      f.engine.acceptDelete({
+        principal: "container-owner-test",
+        key: "f2-fault-delete-canonical-source",
+        uid: created.resourceUid,
+        expectedGeneration: 2,
+      }),
+    ).rejects.toThrow();
+    expect(observation?.injected()).toBe(true);
+    expect(observation?.deleteBatches.length).toBe(1);
+    expect(await containerDeleteSnapshot(db)).toEqual(before);
+    expect(f.sealing.calls).toBe(1);
+    expect(f.sealing.updateCalls).toBe(1);
+    console.info(
+      JSON.stringify({
+        event: "owner-f2-controlled-stage",
+        stage: "delete_terminal_fault_conservation",
+        generation: 2,
+        injected: 1,
+        conservation: true,
+      }),
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("genuine legacy Container rejects prepared nonNULL configured inputs without mutation", async () => {
+  const db = new Database(":memory:");
+  try {
+    const f = await full100F2ConfiguredContainerEngine(db, undefined, C.formUrl);
+    const before = await containerDeleteSnapshot(db);
+    await expect(
+      f.engine.acceptCreate({
+        principal: "container-owner-test",
+        key: "legacy-configured-reject-canonical-source",
+        input: {
+          form: C.formUrl,
+          space: "default",
+          name: "legacy-configured",
+          spec: coreContainerSpec("1".repeat(64)),
+          privateInputs: { TOKEN: "owner-f2-fixture-value" },
+        },
+      }),
+    ).rejects.toThrow();
+    expect(f.sealing.calls).toBe(1);
+    expect(await containerDeleteSnapshot(db)).toEqual(before);
+    console.info(
+      JSON.stringify({
+        event: "owner-f2-controlled-stage",
+        stage: "legacy_configured_rejected",
+        sealCalls: 1,
+        conservation: true,
+      }),
+    );
+  } finally {
+    db.close();
+  }
+});
