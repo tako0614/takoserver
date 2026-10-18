@@ -7,6 +7,7 @@ import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { Sql } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
+import { readV2ConfiguredPrivateInputs } from "../src/takoform-v2/configured-private-inputs.ts";
 import { additiveV2ConfiguredUpdateInputsDDL } from "../src/takoform-v2/configured-update-inputs-schema.ts";
 import {
   createV2ContainerHostAcceptance,
@@ -1242,6 +1243,7 @@ async function full100F2ConfiguredContainerEngine(
   formUrlOverride?: string,
   requireSensitive = true,
   mapMode = false,
+  emptyCreateMapScenario = false,
 ) {
   const { V2_CONTAINER_F2_FORM } = await import("../src/takoform-v2/container-owner-schema.ts");
   const selectedForm = formUrlOverride === undefined ? V2_CONTAINER_F2_FORM : formUrlOverride;
@@ -1300,6 +1302,7 @@ async function full100F2ConfiguredContainerEngine(
         | undefined;
       submittedMap: Readonly<Record<string, string>> | undefined;
       configuredMap: Readonly<Record<string, string>> | undefined;
+      ownerContextNullGenerations: number[];
       binding:
         | { form: string; resourceUid: string; operationId: string; generation: number }
         | undefined;
@@ -1314,6 +1317,7 @@ async function full100F2ConfiguredContainerEngine(
       priorEnvelope: undefined,
       submittedMap: undefined,
       configuredMap: undefined,
+      ownerContextNullGenerations: [],
       binding: undefined,
     };
     const mapKey = mapMode
@@ -1434,6 +1438,8 @@ async function full100F2ConfiguredContainerEngine(
             return;
           }
           if (mapMode) {
+            if (emptyCreateMapScenario && requiredNames(_spec).length === 0 && inputs === undefined)
+              return;
             if (inputs === undefined) throw new TakoformV2Error("invalid_spec", 422);
             validateMap(requiredNames(_spec), inputs);
             return;
@@ -1462,6 +1468,12 @@ async function full100F2ConfiguredContainerEngine(
             return null;
           }
           if (mapMode) {
+            if (emptyCreateMapScenario && requiredNames(input.spec).length === 0) {
+              if (input.privateInputs !== undefined)
+                throw new TypeError("unexpected empty CREATE map");
+              sealing.emptyCreateCalls++;
+              return null;
+            }
             if (input.privateInputs === undefined) throw new TakoformV2Error("invalid_spec", 422);
             validateMap(requiredNames(input.spec), input.privateInputs);
             sealing.submittedMap = input.privateInputs;
@@ -1519,6 +1531,51 @@ async function full100F2ConfiguredContainerEngine(
           }
         },
         async prepareUpdate(input) {
+          if (emptyCreateMapScenario) {
+            expect(input.configured).toBeNull();
+            sealing.updateCalls++;
+            if (input.privateInputs !== undefined) {
+              validateMap(requiredNames(input.spec), input.privateInputs);
+              return sealMap({ ...input, privateInputs: input.privateInputs });
+            }
+            const prior = (
+              await sql.query(
+                `SELECT operation_id, generation FROM tf_v2_container_acceptances
+               WHERE resource_uid = ? AND principal = ? AND space = ? AND name = ? AND form_url = ?
+                 AND action = 'update' AND configured_private_inputs_json IS NOT NULL
+                 AND generation < ? ORDER BY generation DESC LIMIT 1`,
+                [
+                  input.resourceUid,
+                  input.principal,
+                  input.space,
+                  input.name,
+                  input.form,
+                  input.generation,
+                ],
+              )
+            )[0];
+            if (
+              !prior ||
+              typeof prior.operation_id !== "string" ||
+              typeof prior.generation !== "number"
+            )
+              throw new TypeError("accepted UPDATE map source missing");
+            const material = await readV2ConfiguredPrivateInputs(
+              sql,
+              {
+                principal: input.principal,
+                space: input.space,
+                name: input.name,
+                form: input.form,
+                resourceUid: input.resourceUid,
+              },
+              { operationId: prior.operation_id, generation: prior.generation },
+            );
+            if (!material) throw new TypeError("accepted UPDATE map missing");
+            if (!sealing.envelope) throw new TypeError("fixture map missing");
+            expect(material).toEqual(sealing.envelope);
+            return;
+          }
           if (!requireSensitive) {
             expect(input.privateInputs).toBeUndefined();
             expect(input.configured).toBeNull();
@@ -1566,6 +1623,16 @@ async function full100F2ConfiguredContainerEngine(
         },
       },
     };
+    const observedHost = emptyCreateMapScenario
+      ? {
+          ...host,
+          prepare(context: V2HostAcceptanceContext) {
+            if (context.action === "update" && context.configuredPrivateInputs === undefined)
+              sealing.ownerContextNullGenerations.push(context.generation);
+            return host.prepare(context);
+          },
+        }
+      : host;
     const engine = createTakoformV2Engine(
       {
         sql,
@@ -1577,7 +1644,7 @@ async function full100F2ConfiguredContainerEngine(
         privateInputCustody,
         forms: { [selectedForm]: form },
       },
-      host,
+      observedHost,
     );
     return { engine, sql, sealing, formUrl: selectedForm };
   });
@@ -1978,6 +2045,455 @@ test("F2 no-sensitive Core create then update retains null owner envelope", asyn
     expect(updateAcceptance?.configured_private_inputs_json).toBeNull();
     expect(updateRows.some((row) => row.desired_generation === 2)).toBe(true);
     expect((await f.engine.runNext())?.status).toBe("failed");
+  } finally {
+    db.close();
+  }
+});
+
+test("genuine F2 empty CREATE map retains accepted UPDATE material through omitted updates", async () => {
+  const db = new Database(":memory:");
+  const terminals: {
+    action: unknown;
+    generation: unknown;
+    configured: unknown;
+    firstOperationId: unknown;
+    lastOperationId: unknown;
+    last: boolean;
+    count: number;
+  }[] = [];
+  const guardProbes: Record<string, boolean> = {};
+  let maxBatchParams = 0;
+  let omittedAdmissionParams = 0;
+  const wrapSql = (original: Sql): Sql => ({
+    query: (statement, params) => original.query(statement, params),
+    run: (statement, params) => original.run(statement, params),
+    async batch(statements) {
+      const terminal = statements.at(-1);
+      if (
+        terminal?.sql.startsWith(
+          "WITH host_form_admission AS (SELECT 1 AS permitted) INSERT INTO main.tf_v2_container_acceptances ",
+        )
+      ) {
+        maxBatchParams = Math.max(
+          maxBatchParams,
+          ...statements.map((statement) => statement.params?.length ?? 0),
+        );
+        terminals.push({
+          action: terminal.params?.[10],
+          generation: terminal.params?.[11],
+          configured: terminal.params?.[17],
+          firstOperationId: terminal.params?.[0],
+          lastOperationId: terminal.params?.[21],
+          last: statements.at(-1) === terminal,
+          count: statements.filter((statement) =>
+            statement.sql.includes("INSERT INTO main.tf_v2_container_acceptances "),
+          ).length,
+        });
+        if (terminal.params?.[11] === 3) {
+          const admission = statements.find((statement) =>
+            statement.sql.startsWith("SELECT 1 AS permitted WHERE"),
+          );
+          if (!admission?.params) throw new TypeError("missing owner admission guard");
+          omittedAdmissionParams = admission.params.length;
+          const check = async (index?: number, value?: string | number) => {
+            const params = [...admission.params!];
+            if (index !== undefined) params[index] = value!;
+            return (await original.query(admission.sql, params)).length === 1;
+          };
+          guardProbes.valid = await check();
+          // Offsets after the fixed instance scope target the retained proof.
+          for (const [name, index, value] of [
+            ["resource", 10, "other-resource"],
+            ["future", 11, 2],
+            ["installation", 12, "other-installation"],
+            ["principal", 13, "other-principal"],
+            ["space", 14, "other-space"],
+            ["name", 15, "other-name"],
+            ["form", 16, C.formUrl],
+            ["backend", 17, "other-backend"],
+            ["target", 18, "other-target"],
+            ["currentGeneration", 19, 1],
+            ["undeclaredName", 20, '["TOKEN","OTHER"]'],
+          ] as const)
+            guardProbes[name] = await check(index, value);
+        }
+      }
+      return original.batch(statements);
+    },
+  });
+  try {
+    const f = await full100F2ConfiguredContainerEngine(db, wrapSql, undefined, false, true, true);
+    const empty = Object.freeze({
+      ...coreContainerSpec("1".repeat(64)),
+      [C.fields.image]: "registry.example.test/owner/f2@sha256:" + "a".repeat(64),
+      [C.fields.workloadRevision]: "1".repeat(64),
+      [C.fields.requiredSensitiveVars]: Object.freeze([]),
+    });
+    const created = await f.engine.acceptCreate({
+      principal: "container-owner-test",
+      key: "f2-empty-map-create",
+      input: { form: f.formUrl, space: "default", name: "f2-empty-map", spec: empty },
+    });
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const named = Object.freeze({
+      ...empty,
+      [C.fields.workloadRevision]: "2".repeat(64),
+      [C.fields.requiredSensitiveVars]: Object.freeze(["TOKEN"]),
+    });
+    const supplied = await f.engine.acceptUpdate({
+      principal: "container-owner-test",
+      key: "f2-empty-map-supplied",
+      uid: created.resourceUid,
+      expectedGeneration: 1,
+      spec: named,
+      privateInputs: { TOKEN: "synthetic-map-value" },
+    });
+    expect(supplied.generation).toBe(2);
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const omitted = await f.engine.acceptUpdate({
+      principal: "container-owner-test",
+      key: "f2-empty-map-omitted",
+      uid: created.resourceUid,
+      expectedGeneration: 2,
+      spec: Object.freeze({ ...named, [C.fields.workloadRevision]: "3".repeat(64) }),
+    });
+    expect(omitted.generation).toBe(3);
+    const accepted = db
+      .query(
+        "SELECT action, generation, configured_private_inputs_json FROM tf_v2_container_acceptances WHERE operation_id = ?",
+      )
+      .get(omitted.id) as {
+      action: string;
+      generation: number;
+      configured_private_inputs_json: string | null;
+    };
+    expect(accepted).toEqual({
+      action: "update",
+      generation: 3,
+      configured_private_inputs_json: null,
+    });
+    expect(guardProbes).toEqual({
+      valid: true,
+      resource: false,
+      future: false,
+      installation: false,
+      principal: false,
+      space: false,
+      name: false,
+      form: false,
+      backend: false,
+      target: false,
+      currentGeneration: false,
+      undeclaredName: false,
+    });
+    expect(omittedAdmissionParams).toBe(22);
+    expect(maxBatchParams).toBeLessThanOrEqual(100);
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const repeated = await f.engine.acceptUpdate({
+      principal: "container-owner-test",
+      key: "f2-empty-map-omitted-again",
+      uid: created.resourceUid,
+      expectedGeneration: 3,
+      spec: Object.freeze({ ...named, [C.fields.workloadRevision]: "4".repeat(64) }),
+    });
+    expect(repeated.generation).toBe(4);
+    expect(f.sealing.ownerContextNullGenerations).toEqual([3, 4]);
+    expect(f.sealing.updateCalls).toBe(3);
+    expect(
+      db
+        .query(
+          "SELECT configured_private_inputs_json FROM tf_v2_container_acceptances WHERE operation_id = ?",
+        )
+        .get(repeated.id),
+    ).toEqual({ configured_private_inputs_json: null });
+    expect(
+      terminals.map(
+        ({ action, generation, configured, firstOperationId, lastOperationId, last, count }) => ({
+          action,
+          generation,
+          configured: configured === null,
+          firstOperationId,
+          lastOperationId,
+          last,
+          count,
+        }),
+      ),
+    ).toEqual([
+      {
+        action: "create",
+        generation: 1,
+        configured: true,
+        firstOperationId: created.id,
+        lastOperationId: created.id,
+        last: true,
+        count: 1,
+      },
+      {
+        action: "update",
+        generation: 2,
+        configured: false,
+        firstOperationId: supplied.id,
+        lastOperationId: supplied.id,
+        last: true,
+        count: 1,
+      },
+      {
+        action: "update",
+        generation: 3,
+        configured: true,
+        firstOperationId: omitted.id,
+        lastOperationId: omitted.id,
+        last: true,
+        count: 1,
+      },
+      {
+        action: "update",
+        generation: 4,
+        configured: true,
+        firstOperationId: repeated.id,
+        lastOperationId: repeated.id,
+        last: true,
+        count: 1,
+      },
+    ]);
+  } finally {
+    db.close();
+  }
+});
+
+test("genuine F2 empty CREATE rejects an unprovided first map without writes", async () => {
+  const db = new Database(":memory:");
+  try {
+    const f = await full100F2ConfiguredContainerEngine(db, undefined, undefined, false, true, true);
+    const empty = Object.freeze({
+      ...coreContainerSpec("1".repeat(64)),
+      [C.fields.requiredSensitiveVars]: Object.freeze([]),
+    });
+    const created = await f.engine.acceptCreate({
+      principal: "container-owner-test",
+      key: "f2-empty-no-map-create",
+      input: { form: f.formUrl, space: "default", name: "f2-empty-no-map", spec: empty },
+    });
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const before = await containerDeleteSnapshot(db);
+    await expect(
+      f.engine.acceptUpdate({
+        principal: "container-owner-test",
+        key: "f2-empty-no-map-update",
+        uid: created.resourceUid,
+        expectedGeneration: 1,
+        spec: Object.freeze({
+          ...empty,
+          [C.fields.requiredSensitiveVars]: Object.freeze(["TOKEN"]),
+        }),
+      }),
+    ).rejects.toMatchObject({ code: "invalid_spec" });
+    expect(await containerDeleteSnapshot(db)).toEqual(before);
+    expect(f.sealing.updateCalls).toBe(0);
+  } finally {
+    db.close();
+  }
+});
+
+test("genuine F2 retained 64-name map stays below the Host SQL binding cap", async () => {
+  const db = new Database(":memory:");
+  let omittedGuardBindings = 0;
+  let omittedMaxStatementBindings = 0;
+  const wrapSql = (original: Sql): Sql => ({
+    query: (statement, params) => original.query(statement, params),
+    run: (statement, params) => original.run(statement, params),
+    batch(statements) {
+      const terminal = statements.at(-1);
+      if (
+        terminal?.sql.startsWith(
+          "WITH host_form_admission AS (SELECT 1 AS permitted) INSERT INTO main.tf_v2_container_acceptances ",
+        ) &&
+        terminal.params?.[11] === 3
+      ) {
+        const guard = statements.find((statement) =>
+          statement.sql.startsWith("SELECT 1 AS permitted WHERE"),
+        );
+        omittedGuardBindings = guard?.params?.length ?? 0;
+        omittedMaxStatementBindings = Math.max(
+          ...statements.map((statement) => statement.params?.length ?? 0),
+        );
+      }
+      return original.batch(statements);
+    },
+  });
+  try {
+    const f = await full100F2ConfiguredContainerEngine(db, wrapSql, undefined, false, true, true);
+    const empty = Object.freeze({
+      ...coreContainerSpec("1".repeat(64)),
+      [C.fields.requiredSensitiveVars]: Object.freeze([]),
+    });
+    const created = await f.engine.acceptCreate({
+      principal: "container-owner-test",
+      key: "f2-64-name-create",
+      input: { form: f.formUrl, space: "default", name: "f2-64", spec: empty },
+    });
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const names = Object.freeze(
+      Array.from({ length: 64 }, (_, index) => `TOKEN_${index.toString().padStart(2, "0")}`),
+    );
+    const named = Object.freeze({ ...empty, [C.fields.requiredSensitiveVars]: names });
+    const privateInputs = Object.freeze(
+      Object.fromEntries(names.map((name) => [name, "synthetic-value"])),
+    );
+    const supplied = await f.engine.acceptUpdate({
+      principal: "container-owner-test",
+      key: "f2-64-name-supplied",
+      uid: created.resourceUid,
+      expectedGeneration: 1,
+      spec: named,
+      privateInputs,
+    });
+    expect(supplied.generation).toBe(2);
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const omitted = await f.engine.acceptUpdate({
+      principal: "container-owner-test",
+      key: "f2-64-name-omitted",
+      uid: created.resourceUid,
+      expectedGeneration: 2,
+      spec: named,
+    });
+    expect(omitted.generation).toBe(3);
+    expect(omittedGuardBindings).toBe(22);
+    expect(omittedMaxStatementBindings).toBeLessThanOrEqual(100);
+    expect(
+      db
+        .query(
+          "SELECT configured_private_inputs_json FROM tf_v2_container_acceptances WHERE operation_id = ?",
+        )
+        .get(omitted.id),
+    ).toEqual({ configured_private_inputs_json: null });
+  } finally {
+    db.close();
+  }
+});
+
+test("genuine F2 retained guard scope fault leaves Core and owner unchanged", async () => {
+  const db = new Database(":memory:");
+  let injected = 0;
+  const wrapSql = (original: Sql): Sql => ({
+    query: (statement, params) => original.query(statement, params),
+    run: (statement, params) => original.run(statement, params),
+    batch(statements) {
+      const terminal = statements.at(-1);
+      if (
+        terminal?.sql.startsWith(
+          "WITH host_form_admission AS (SELECT 1 AS permitted) INSERT INTO main.tf_v2_container_acceptances ",
+        ) &&
+        terminal.params?.[11] === 3
+      ) {
+        const marker = "AND EXISTS (SELECT 1 FROM main.tf_v2_container_acceptances prior";
+        const faulted = statements.map((statement) => {
+          const location = statement.sql.indexOf(marker);
+          if (location < 0 || !statement.params) return statement;
+          const prefixBindings = [...statement.sql.slice(0, location)].filter(
+            (character) => character === "?",
+          ).length;
+          const params = [...statement.params];
+          params[prefixBindings + 4] = "other-principal";
+          injected++;
+          return { sql: statement.sql, params };
+        });
+        return original.batch(faulted);
+      }
+      return original.batch(statements);
+    },
+  });
+  try {
+    const f = await full100F2ConfiguredContainerEngine(db, wrapSql, undefined, false, true, true);
+    const empty = Object.freeze({
+      ...coreContainerSpec("1".repeat(64)),
+      [C.fields.requiredSensitiveVars]: Object.freeze([]),
+    });
+    const created = await f.engine.acceptCreate({
+      principal: "container-owner-test",
+      key: "f2-retained-fault-create",
+      input: { form: f.formUrl, space: "default", name: "f2-retained-fault", spec: empty },
+    });
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const named = Object.freeze({
+      ...empty,
+      [C.fields.requiredSensitiveVars]: Object.freeze(["TOKEN"]),
+    });
+    const supplied = await f.engine.acceptUpdate({
+      principal: "container-owner-test",
+      key: "f2-retained-fault-supplied",
+      uid: created.resourceUid,
+      expectedGeneration: 1,
+      spec: named,
+      privateInputs: { TOKEN: "synthetic-value" },
+    });
+    expect(supplied.generation).toBe(2);
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const before = await containerDeleteSnapshot(db);
+    await expect(
+      f.engine.acceptUpdate({
+        principal: "container-owner-test",
+        key: "f2-retained-fault-omitted",
+        uid: created.resourceUid,
+        expectedGeneration: 2,
+        spec: named,
+      }),
+    ).rejects.toThrow();
+    expect(injected).toBe(2);
+    expect(await containerDeleteSnapshot(db)).toEqual(before);
+  } finally {
+    db.close();
+  }
+});
+
+test("genuine F2 omitted map cannot revive a removed name", async () => {
+  const db = new Database(":memory:");
+  try {
+    const f = await full100F2ConfiguredContainerEngine(db, undefined, undefined, false, true, true);
+    const empty = Object.freeze({
+      ...coreContainerSpec("1".repeat(64)),
+      [C.fields.requiredSensitiveVars]: Object.freeze([]),
+    });
+    const created = await f.engine.acceptCreate({
+      principal: "container-owner-test",
+      key: "f2-revival-create",
+      input: { form: f.formUrl, space: "default", name: "f2-revival", spec: empty },
+    });
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const named = Object.freeze({
+      ...empty,
+      [C.fields.requiredSensitiveVars]: Object.freeze(["TOKEN"]),
+    });
+    const supplied = await f.engine.acceptUpdate({
+      principal: "container-owner-test",
+      key: "f2-revival-supplied",
+      uid: created.resourceUid,
+      expectedGeneration: 1,
+      spec: named,
+      privateInputs: { TOKEN: "synthetic-map-value" },
+    });
+    expect(supplied.generation).toBe(2);
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const removed = await f.engine.acceptUpdate({
+      principal: "container-owner-test",
+      key: "f2-revival-removed",
+      uid: created.resourceUid,
+      expectedGeneration: 2,
+      spec: empty,
+    });
+    expect(removed.generation).toBe(3);
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const before = await containerDeleteSnapshot(db);
+    await expect(
+      f.engine.acceptUpdate({
+        principal: "container-owner-test",
+        key: "f2-revival-refused",
+        uid: created.resourceUid,
+        expectedGeneration: 3,
+        spec: named,
+      }),
+    ).rejects.toMatchObject({ code: "invalid_spec" });
+    expect(await containerDeleteSnapshot(db)).toEqual(before);
   } finally {
     db.close();
   }
