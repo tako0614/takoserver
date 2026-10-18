@@ -6,6 +6,8 @@ import { CONTAINER_CONTRACT as C } from "../src/container-contract.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { Sql } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
+import { additiveV2ConfiguredUpdateInputsDDL } from "../src/takoform-v2/configured-update-inputs-schema.ts";
 import {
   createV2ContainerHostAcceptance,
   inspectV2ContainerOwnerSchema,
@@ -18,7 +20,7 @@ import {
   type V2HostAcceptanceContext,
   type V2PreparedHostAcceptance,
 } from "../src/takoform-v2/host-acceptance.ts";
-import type { V2Backend, V2Form } from "../src/takoform-v2/types.ts";
+import { TakoformV2Error, type V2Backend, type V2Form } from "../src/takoform-v2/types.ts";
 import { currentAuditedSchemaMigrations } from "./helpers/audited-schema-fixture.ts";
 
 // These domain-history seeds live ONLY in the five new owned tables, before
@@ -1152,8 +1154,22 @@ test("Container DELETE preparation owns its callable and binds exact Sql and ori
   const prepared = await issue.prepareDelete!(c);
   expect(prepared).toBeDefined();
   const fixed = redeemV2HostAcceptance(prepared!, noIO, c);
-  expect(fixed.guard.params).toHaveLength(9);
-  expect(fixed.guard.params?.[8]).toBe(1);
+  expect(fixed.guard.params).toHaveLength(10);
+  expect(fixed.guard.params?.[0]).toBe(
+    JSON.stringify(recipe.objects.map(({ type, name, table, sql }) => [type, name, table, sql])),
+  );
+  expect(fixed.guard.params?.slice(1)).toEqual([
+    c.resourceUid,
+    "installation",
+    c.principal,
+    c.space,
+    c.name,
+    c.form,
+    "backend",
+    "target",
+    c.generation - 1,
+  ]);
+  expect(fixed.guard.params?.slice(1)[8]).toBe(1);
   expect(fixed.terminal.params).toHaveLength(21);
   expect(fixed.terminal.params?.[0]).toBe(c.operationId);
   expect(fixed.terminal.params?.[12]).toBe(c.operationId);
@@ -1195,6 +1211,773 @@ test("provider catalog category 2 cannot hide an ordinary inbound foreign key", 
       'CREATE TABLE "_cf_metadata"(value REFERENCES TF_V2_CONTAINER_INSTANCES(resource_uid))',
     );
     expect(await inspectV2ContainerOwnerSchema(sql)).toBe(false);
+  } finally {
+    db.close();
+  }
+});
+
+async function f2CorePrivateInputKeys(
+  previous?: import("../src/takoform-v2/private-inputs.ts").V2PrivateInputCustody,
+): Promise<import("../src/takoform-v2/private-inputs.ts").V2PrivateInputCustody> {
+  const [transfer, comparison] = await Promise.all([
+    crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]),
+    crypto.subtle.generateKey({ name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]),
+  ]);
+  return {
+    transfer: {
+      current: { id: previous ? "transfer-next" : "transfer-first", key: transfer },
+      ...(previous ? { previous: [previous.transfer.current] } : {}),
+    },
+    comparison: {
+      current: { id: previous ? "comparison-next" : "comparison-first", key: comparison },
+      ...(previous ? { previous: [previous.comparison.current] } : {}),
+    },
+    transferTtlSeconds: 2,
+  };
+}
+
+async function full100F2ConfiguredContainerEngine(
+  db: Database,
+  wrapSql: (sql: Sql) => Sql = (sql) => sql,
+  formUrlOverride?: string,
+  requireSensitive = true,
+  mapMode = false,
+) {
+  const { V2_CONTAINER_F2_FORM } = await import("../src/takoform-v2/container-owner-schema.ts");
+  const selectedForm = formUrlOverride === undefined ? V2_CONTAINER_F2_FORM : formUrlOverride;
+  if (selectedForm !== C.formUrl && selectedForm !== V2_CONTAINER_F2_FORM)
+    throw new TypeError("Unsupported fixture Form");
+
+  // This helper compares the generated migration set and each generated SQL
+  // value with the exact audited source artifact before canonical migration.
+  const audited = currentAuditedSchemaMigrations();
+  expect(audited.length).toBe(100);
+  migrateSqlite(db);
+  const baseSql = createSqliteSql(db);
+  if (mapMode) {
+    await baseSql.batch(
+      frameHostMigrationSql(additiveV2ConfiguredUpdateInputsDDL).map((statement) => ({
+        sql: statement,
+      })),
+    );
+    expect(
+      db
+        .query("SELECT name FROM sqlite_master WHERE name = ?")
+        .all("tf_v2_operation_configured_private_inputs").length,
+    ).toBe(1);
+  }
+  const sql = wrapSql(baseSql);
+  const privateInputCustody = await f2CorePrivateInputKeys();
+  return sql.batch(v2ContainerOwnerMigrationCandidate()).then(async () => {
+    const host = createV2ContainerHostAcceptance({
+      sql,
+      installationId: "test-installation",
+      backendId: "test-container-backend",
+      targetKey: "test-container-target",
+    });
+    const backend: V2Backend = {
+      id: "test-container-backend",
+      targetKey: "test-container-target",
+      async execute() {
+        return { kind: "no_effect", code: "fixture_no_effect", message: "No effect" };
+      },
+      async reconcile() {
+        return { kind: "no_effect", code: "fixture_no_effect", message: "No effect" };
+      },
+    };
+    const sealing: {
+      calls: number;
+      updateCalls: number;
+      emptyCreateCalls: number;
+      emptyUpdateCalls: number;
+      operationId: string | undefined;
+      resourceUid: string | undefined;
+      envelope:
+        | { readonly keyId: string; readonly nonce: string; readonly ciphertext: string }
+        | undefined;
+      priorEnvelope:
+        | { readonly keyId: string; readonly nonce: string; readonly ciphertext: string }
+        | undefined;
+      submittedMap: Readonly<Record<string, string>> | undefined;
+      configuredMap: Readonly<Record<string, string>> | undefined;
+      binding:
+        | { form: string; resourceUid: string; operationId: string; generation: number }
+        | undefined;
+    } = {
+      calls: 0,
+      updateCalls: 0,
+      emptyCreateCalls: 0,
+      emptyUpdateCalls: 0,
+      operationId: undefined,
+      resourceUid: undefined,
+      envelope: undefined,
+      priorEnvelope: undefined,
+      submittedMap: undefined,
+      configuredMap: undefined,
+      binding: undefined,
+    };
+    const mapKey = mapMode
+      ? await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
+          "encrypt",
+          "decrypt",
+        ])
+      : undefined;
+    function requiredNames(spec: Record<string, unknown>): string[] {
+      const names = spec[C.fields.requiredSensitiveVars];
+      if (!Array.isArray(names) || !names.every((name) => typeof name === "string"))
+        throw new TakoformV2Error("invalid_spec", 422);
+      return names;
+    }
+    function validateMap(names: readonly string[], inputs: Readonly<Record<string, string>>): void {
+      if (
+        names.length > 64 ||
+        JSON.stringify([...names].sort()) !== JSON.stringify(Object.keys(inputs).sort()) ||
+        Object.values(inputs).some(
+          (value) =>
+            typeof value !== "string" || [...value].length < 1 || [...value].length > 16384,
+        ) ||
+        new TextEncoder().encode(Object.values(inputs).join("")).length > 65536
+      )
+        throw new TakoformV2Error("invalid_spec", 422);
+    }
+    async function sealMap(input: {
+      form: string;
+      resourceUid: string;
+      operationId: string;
+      generation: number;
+      privateInputs: Readonly<Record<string, string>>;
+    }) {
+      if (!mapKey) throw new Error("map fixture key missing");
+      const binding = {
+        form: input.form,
+        resourceUid: input.resourceUid,
+        operationId: input.operationId,
+        generation: input.generation,
+      };
+      const nonce = crypto.getRandomValues(new Uint8Array(12));
+      const plaintext = new TextEncoder().encode(JSON.stringify(input.privateInputs));
+      try {
+        const ciphertext = await crypto.subtle.encrypt(
+          {
+            name: "AES-GCM",
+            iv: nonce,
+            additionalData: new TextEncoder().encode(JSON.stringify(binding)),
+          },
+          mapKey,
+          plaintext,
+        );
+        const opened = new Uint8Array(
+          await crypto.subtle.decrypt(
+            {
+              name: "AES-GCM",
+              iv: nonce,
+              additionalData: new TextEncoder().encode(JSON.stringify(binding)),
+            },
+            mapKey,
+            ciphertext,
+          ),
+        );
+        try {
+          expect(Array.from(opened)).toEqual(Array.from(plaintext));
+        } finally {
+          opened.fill(0);
+        }
+        const envelope = Object.freeze({
+          keyId: "owner-f2-map-fixture-key",
+          nonce: btoa(String.fromCharCode(...nonce)),
+          ciphertext: btoa(String.fromCharCode(...new Uint8Array(ciphertext))),
+        });
+        sealing.priorEnvelope = sealing.envelope;
+        sealing.envelope = envelope;
+        sealing.binding = binding;
+        sealing.operationId = input.operationId;
+        sealing.resourceUid = input.resourceUid;
+        sealing.calls++;
+        return envelope;
+      } finally {
+        plaintext.fill(0);
+      }
+    }
+    async function openMap(envelope: {
+      readonly keyId: string;
+      readonly nonce: string;
+      readonly ciphertext: string;
+    }) {
+      if (!mapKey || !sealing.binding) throw new Error("map fixture context missing");
+      const opened = new Uint8Array(
+        await crypto.subtle.decrypt(
+          {
+            name: "AES-GCM",
+            iv: Uint8Array.from(atob(envelope.nonce), (c) => c.charCodeAt(0)),
+            additionalData: new TextEncoder().encode(JSON.stringify(sealing.binding)),
+          },
+          mapKey,
+          Uint8Array.from(atob(envelope.ciphertext), (c) => c.charCodeAt(0)),
+        ),
+      );
+      try {
+        return JSON.parse(new TextDecoder().decode(opened)) as Readonly<Record<string, string>>;
+      } finally {
+        opened.fill(0);
+      }
+    }
+    const form: V2Form = {
+      validateCreate() {},
+      validateUpdate() {},
+      backend,
+
+      privateInputs: {
+        ...(requireSensitive ? { requiredForEveryInstance: true as const } : {}),
+        validateCreate(_spec, inputs) {
+          if (!requireSensitive) {
+            expect(inputs).toBeUndefined();
+            return;
+          }
+          if (mapMode) {
+            if (inputs === undefined) throw new TakoformV2Error("invalid_spec", 422);
+            validateMap(requiredNames(_spec), inputs);
+            return;
+          }
+          if (inputs === undefined || inputs.TOKEN !== "owner-f2-fixture-value")
+            throw new TypeError("F2 fixture input unavailable");
+        },
+        validateUpdate(_previous, _next, inputs) {
+          if (mapMode) {
+            const previousNames = requiredNames(_previous);
+            const nextNames = requiredNames(_next);
+            if (inputs !== undefined) validateMap(nextNames, inputs);
+            else if (nextNames.some((name) => !previousNames.includes(name)))
+              throw new TakoformV2Error("invalid_spec", 422);
+            return;
+          }
+          if (inputs !== undefined)
+            throw new TypeError("F2 fixture replacement is outside this check");
+        },
+        async prepareCreate(input) {
+          expect(input.form).toBe(selectedForm);
+          expect(input.generation).toBe(1);
+          if (!requireSensitive) {
+            expect(input.privateInputs).toBeUndefined();
+            sealing.emptyCreateCalls++;
+            return null;
+          }
+          if (mapMode) {
+            if (input.privateInputs === undefined) throw new TakoformV2Error("invalid_spec", 422);
+            validateMap(requiredNames(input.spec), input.privateInputs);
+            sealing.submittedMap = input.privateInputs;
+            return sealMap({ ...input, privateInputs: input.privateInputs });
+          }
+          if (
+            input.privateInputs === undefined ||
+            input.privateInputs.TOKEN !== "owner-f2-fixture-value"
+          )
+            throw new TypeError("F2 fixture input unavailable");
+          const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
+            "encrypt",
+            "decrypt",
+          ]);
+          const nonce = crypto.getRandomValues(new Uint8Array(12));
+          const plaintext = new TextEncoder().encode(JSON.stringify(input.privateInputs));
+          const aad = new TextEncoder().encode(
+            JSON.stringify({
+              form: input.form,
+              resourceUid: input.resourceUid,
+              operationId: input.operationId,
+              generation: input.generation,
+            }),
+          );
+          try {
+            const encrypted = await crypto.subtle.encrypt(
+              { name: "AES-GCM", iv: nonce, additionalData: aad },
+              key,
+              plaintext,
+            );
+            const opened = new Uint8Array(
+              await crypto.subtle.decrypt(
+                { name: "AES-GCM", iv: nonce, additionalData: aad },
+                key,
+                encrypted,
+              ),
+            );
+            try {
+              expect(Array.from(opened)).toEqual(Array.from(plaintext));
+            } finally {
+              opened.fill(0);
+            }
+            const envelope = Object.freeze({
+              keyId: "owner-f2-fixture-key",
+              nonce: btoa(String.fromCharCode(...nonce)),
+              ciphertext: btoa(String.fromCharCode(...new Uint8Array(encrypted))),
+            });
+            sealing.calls++;
+            sealing.operationId = input.operationId;
+            sealing.resourceUid = input.resourceUid;
+            sealing.envelope = envelope;
+            return envelope;
+          } finally {
+            plaintext.fill(0);
+          }
+        },
+        async prepareUpdate(input) {
+          if (!requireSensitive) {
+            expect(input.privateInputs).toBeUndefined();
+            expect(input.configured).toBeNull();
+            sealing.emptyUpdateCalls++;
+            return;
+          }
+          if (sealing.envelope === undefined) throw new Error("fixture envelope missing");
+          if (mapMode && JSON.stringify(input.configured) !== JSON.stringify(sealing.envelope)) {
+            console.info(
+              JSON.stringify({
+                event: "owner-f2-map-configured-selection",
+                generation: input.generation,
+                matchesPrior:
+                  JSON.stringify(input.configured) === JSON.stringify(sealing.priorEnvelope),
+                isNull: input.configured === null,
+              }),
+            );
+          }
+          if (mapMode)
+            expect(JSON.stringify(input.configured) === JSON.stringify(sealing.envelope)).toBe(
+              true,
+            );
+          else expect(input.configured).toEqual(sealing.envelope);
+          sealing.updateCalls++;
+          if (mapMode) {
+            sealing.configuredMap = await openMap(sealing.envelope);
+            sealing.submittedMap = input.privateInputs;
+            if (input.privateInputs !== undefined) {
+              validateMap(requiredNames(input.spec), input.privateInputs);
+              return sealMap({ ...input, privateInputs: input.privateInputs });
+            }
+            const retainedNames = requiredNames(input.spec);
+            const configuredMap = sealing.configuredMap;
+            if (Object.keys(configuredMap).some((name) => !retainedNames.includes(name))) {
+              const projected = Object.freeze(
+                Object.fromEntries(
+                  Object.entries(configuredMap).filter(([name]) => retainedNames.includes(name)),
+                ),
+              );
+              validateMap(retainedNames, projected);
+              return sealMap({ ...input, privateInputs: projected });
+            }
+            return;
+          }
+        },
+      },
+    };
+    const engine = createTakoformV2Engine(
+      {
+        sql,
+        replayWindowSeconds: 120,
+        now: () => new Date("2026-10-16T00:00:00.000Z"),
+        async authorize(principal, space) {
+          return principal === "container-owner-test" && space === "default";
+        },
+        privateInputCustody,
+        forms: { [selectedForm]: form },
+      },
+      host,
+    );
+    return { engine, sql, sealing, formUrl: selectedForm };
+  });
+}
+
+function observeF2ContainerDeleteBatch(original: Sql, fault?: "action" | "missing-operation") {
+  const deleteBatches: Parameters<Sql["batch"]>[0][] = [];
+  let injected = false;
+  const sql: Sql = {
+    query(statement, params) {
+      return original.query(statement, params);
+    },
+    run(statement, params) {
+      return original.run(statement, params);
+    },
+    batch(statements) {
+      const terminal = statements.at(-1);
+      if (
+        !terminal?.sql.startsWith(
+          "WITH host_form_admission AS (SELECT 1 AS permitted) INSERT OR ABORT INTO main.tf_v2_container_acceptances ",
+        ) ||
+        terminal.params?.[10] !== "delete"
+      ) {
+        return original.batch(statements);
+      }
+      deleteBatches.push(statements);
+      if (fault === undefined) return original.batch(statements);
+      const params = [...terminal.params];
+      injected = true;
+      if (fault === "action") params[10] = "invalid-container-delete-action";
+      else params[12] = "missing-container-delete-core-operation";
+      return original.batch([...statements.slice(0, -1), { sql: terminal.sql, params }]);
+    },
+  };
+  return { sql, deleteBatches, injected: () => injected };
+}
+
+test("genuine F2 full100 nonempty CREATE, retained UPDATE and key-free DELETE", async () => {
+  const db = new Database(":memory:");
+  try {
+    const f = await full100F2ConfiguredContainerEngine(db);
+    const desired = Object.freeze({
+      ...coreContainerSpec("1".repeat(64)),
+      [C.fields.image]: "registry.example.test/owner/f2@sha256:" + "a".repeat(64),
+      [C.fields.workloadRevision]: "1".repeat(64),
+      [C.fields.requiredSensitiveVars]: Object.freeze(["TOKEN"]),
+    });
+    const created = await f.engine.acceptCreate({
+      principal: "container-owner-test",
+      key: "f2-create-canonical-source",
+      input: {
+        form: f.formUrl,
+        space: "default",
+        name: "f2-secret",
+        spec: desired,
+        privateInputs: { TOKEN: "owner-f2-fixture-value" },
+      },
+    });
+    expect(created.generation).toBe(1);
+    expect(f.sealing.calls).toBe(1);
+    expect(f.sealing.operationId).toBe(created.id);
+    expect(f.sealing.resourceUid).toBe(created.resourceUid);
+    const afterCreate = await containerDeleteSnapshot(db);
+    const createAcceptance = Object.values(afterCreate.owner)
+      .flat()
+      .find((row) => row.operation_id === created.id);
+    expect(createAcceptance).toBeDefined();
+    expect(createAcceptance?.configured_private_inputs_json).toBe(
+      JSON.stringify(f.sealing.envelope),
+    );
+    expect(typeof createAcceptance?.configured_private_inputs_json).toBe("string");
+    const configuredCreate = createAcceptance?.configured_private_inputs_json;
+    if (typeof configuredCreate !== "string") throw new TypeError("F2 sealed terminal missing");
+    expect(configuredCreate.length).toBeGreaterThan(0);
+    console.info(
+      JSON.stringify({
+        event: "owner-f2-controlled-stage",
+        stage: "nonempty_create_terminal",
+        generation: 1,
+        sealCalls: f.sealing.calls,
+      }),
+    );
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const updated = await f.engine.acceptUpdate({
+      principal: "container-owner-test",
+      key: "f2-update-canonical-source",
+      uid: created.resourceUid,
+      expectedGeneration: 1,
+      spec: Object.freeze({ ...desired, [C.fields.workloadRevision]: "2".repeat(64) }),
+    });
+    expect(updated.generation).toBe(2);
+    expect(f.sealing.calls).toBe(1);
+    expect(f.sealing.updateCalls).toBe(1);
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const deleted = await f.engine.acceptDelete({
+      principal: "container-owner-test",
+      key: "f2-delete-canonical-source",
+      uid: created.resourceUid,
+      expectedGeneration: 2,
+    });
+    expect(deleted.generation).toBe(3);
+    const afterDelete = await containerDeleteSnapshot(db);
+    const rows = Object.values(afterDelete.owner).flat();
+    const deleteAcceptance = rows.find((row) => row.operation_id === deleted.id);
+    const instance = rows.find((row) => row.retire_operation_id === deleted.id);
+    expect(deleteAcceptance?.action).toBe("delete");
+    expect(deleteAcceptance?.references_json).toBeNull();
+    expect(deleteAcceptance?.configured_private_inputs_json).toBeNull();
+    expect(instance?.desired_generation).toBe(3);
+    expect(typeof instance?.retired_at_ms).toBe("number");
+    expect(f.sealing.calls).toBe(1);
+    expect(f.sealing.updateCalls).toBe(1);
+    console.info(
+      JSON.stringify({
+        event: "owner-f2-controlled-stage",
+        stage: "retained_update_key_free_delete",
+        generation: 3,
+        sealCalls: f.sealing.calls,
+        updateCalls: f.sealing.updateCalls,
+      }),
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("genuine F2 full100 replaces a complete two-name map through Core and owner", async () => {
+  const db = new Database(":memory:");
+  try {
+    const f = await full100F2ConfiguredContainerEngine(db, undefined, undefined, true, true);
+    const initialMap = Object.freeze({ TOKEN: "fixture-first-alpha", OTHER: "fixture-first-beta" });
+    const replacementMap = Object.freeze({
+      TOKEN: "fixture-next-alpha",
+      OTHER: "fixture-next-beta",
+    });
+    const desired = Object.freeze({
+      ...coreContainerSpec("1".repeat(64)),
+      [C.fields.image]: "registry.example.test/owner/f2@sha256:" + "a".repeat(64),
+      [C.fields.requiredSensitiveVars]: Object.freeze(["TOKEN", "OTHER"]),
+    });
+    const created = await f.engine.acceptCreate({
+      principal: "container-owner-test",
+      key: "f2-map-create-canonical-source",
+      input: {
+        form: f.formUrl,
+        space: "default",
+        name: "f2-map-replace",
+        spec: desired,
+        privateInputs: initialMap,
+      },
+    });
+    const firstEnvelope = f.sealing.envelope;
+    expect(firstEnvelope).toBeDefined();
+    expect(f.sealing.calls).toBe(1);
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const updated = await f.engine.acceptUpdate({
+      principal: "container-owner-test",
+      key: "f2-map-update-canonical-source",
+      uid: created.resourceUid,
+      expectedGeneration: 1,
+      spec: desired,
+      privateInputs: replacementMap,
+    });
+    expect(updated.generation).toBe(2);
+    expect(updated.resourceUid).toBe(created.resourceUid);
+    expect(f.sealing.calls).toBe(2);
+    expect(f.sealing.updateCalls).toBe(1);
+    expect(f.sealing.configuredMap).toEqual(initialMap);
+    expect(f.sealing.submittedMap).toEqual(replacementMap);
+    expect(f.sealing.priorEnvelope).toEqual(firstEnvelope);
+    expect(f.sealing.envelope).not.toEqual(firstEnvelope);
+    expect(f.sealing.binding).toEqual({
+      form: f.formUrl,
+      resourceUid: created.resourceUid,
+      operationId: updated.id,
+      generation: 2,
+    });
+    const state = await containerDeleteSnapshot(db);
+    const rows = Object.values(state.owner).flat();
+    const first = rows.find((row) => row.operation_id === created.id);
+    const second = rows.find((row) => row.operation_id === updated.id);
+    expect(first?.configured_private_inputs_json).toBe(JSON.stringify(firstEnvelope));
+    expect(second?.configured_private_inputs_json).toBe(JSON.stringify(f.sealing.envelope));
+    expect(second?.generation).toBe(2);
+    expect(second?.resource_uid).toBe(created.resourceUid);
+    expect(second?.form_url).toBe(f.formUrl);
+    expect(JSON.stringify(state)).not.toContain("fixture-first-alpha");
+    expect(JSON.stringify(state)).not.toContain("fixture-first-beta");
+    expect(JSON.stringify(state)).not.toContain("fixture-next-alpha");
+    expect(JSON.stringify(state)).not.toContain("fixture-next-beta");
+    expect((await f.engine.runNext())?.status).toBe("failed");
+  } finally {
+    db.close();
+  }
+});
+
+test("genuine F2 full100 rejects a partial map before writes and accepts a complete name addition", async () => {
+  const db = new Database(":memory:");
+  try {
+    const f = await full100F2ConfiguredContainerEngine(db, undefined, undefined, true, true);
+    const desired = Object.freeze({
+      ...coreContainerSpec("1".repeat(64)),
+      [C.fields.image]: "registry.example.test/owner/f2@sha256:" + "a".repeat(64),
+      [C.fields.requiredSensitiveVars]: Object.freeze(["TOKEN"]),
+    });
+    const created = await f.engine.acceptCreate({
+      principal: "container-owner-test",
+      key: "f2-map-add-create-canonical-source",
+      input: {
+        form: f.formUrl,
+        space: "default",
+        name: "f2-map-add",
+        spec: desired,
+        privateInputs: { TOKEN: "fixture-original-alpha" },
+      },
+    });
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const next = Object.freeze({
+      ...desired,
+      [C.fields.requiredSensitiveVars]: Object.freeze(["TOKEN", "OTHER"]),
+    });
+    const before = await containerDeleteSnapshot(db);
+    await expect(
+      f.engine.acceptUpdate({
+        principal: "container-owner-test",
+        key: "f2-map-add-partial-canonical-source",
+        uid: created.resourceUid,
+        expectedGeneration: 1,
+        spec: next,
+        privateInputs: { TOKEN: "fixture-next-alpha" },
+      }),
+    ).rejects.toMatchObject({ code: "invalid_spec" });
+    expect(await containerDeleteSnapshot(db)).toEqual(before);
+    expect(f.sealing.calls).toBe(1);
+    expect(f.sealing.updateCalls).toBe(0);
+    const added = await f.engine.acceptUpdate({
+      principal: "container-owner-test",
+      key: "f2-map-add-complete-canonical-source",
+      uid: created.resourceUid,
+      expectedGeneration: 1,
+      spec: next,
+      privateInputs: { TOKEN: "fixture-next-alpha", OTHER: "fixture-new-beta" },
+    });
+    expect(added.generation).toBe(2);
+    expect(f.sealing.calls).toBe(2);
+    expect(f.sealing.updateCalls).toBe(1);
+    expect(f.sealing.configuredMap).toEqual({ TOKEN: "fixture-original-alpha" });
+    expect(f.sealing.submittedMap).toEqual({
+      TOKEN: "fixture-next-alpha",
+      OTHER: "fixture-new-beta",
+    });
+    const rows = Object.values((await containerDeleteSnapshot(db)).owner).flat();
+    const acceptance = rows.find((row) => row.operation_id === added.id);
+    expect(acceptance?.configured_private_inputs_json).toBe(JSON.stringify(f.sealing.envelope));
+  } finally {
+    db.close();
+  }
+});
+
+test("genuine F2 full100 DELETE terminal fault preserves complete Core owner and schema", async () => {
+  const db = new Database(":memory:");
+  try {
+    let observation: ReturnType<typeof observeF2ContainerDeleteBatch> | undefined;
+    const f = await full100F2ConfiguredContainerEngine(db, (sql) => {
+      observation = observeF2ContainerDeleteBatch(sql, "missing-operation");
+      return observation.sql;
+    });
+    const desired = Object.freeze({
+      ...coreContainerSpec("1".repeat(64)),
+      [C.fields.image]: "registry.example.test/owner/f2@sha256:" + "a".repeat(64),
+      [C.fields.workloadRevision]: "3".repeat(64),
+      [C.fields.requiredSensitiveVars]: Object.freeze(["TOKEN"]),
+    });
+    const created = await f.engine.acceptCreate({
+      principal: "container-owner-test",
+      key: "f2-fault-create-canonical-source",
+      input: {
+        form: f.formUrl,
+        space: "default",
+        name: "f2-fault",
+        spec: desired,
+        privateInputs: { TOKEN: "owner-f2-fixture-value" },
+      },
+    });
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const updated = await f.engine.acceptUpdate({
+      principal: "container-owner-test",
+      key: "f2-fault-update-canonical-source",
+      uid: created.resourceUid,
+      expectedGeneration: 1,
+      spec: Object.freeze({ ...desired, [C.fields.workloadRevision]: "4".repeat(64) }),
+    });
+    expect(updated.generation).toBe(2);
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const before = await containerDeleteSnapshot(db);
+    await expect(
+      f.engine.acceptDelete({
+        principal: "container-owner-test",
+        key: "f2-fault-delete-canonical-source",
+        uid: created.resourceUid,
+        expectedGeneration: 2,
+      }),
+    ).rejects.toThrow();
+    expect(observation?.injected()).toBe(true);
+    expect(observation?.deleteBatches.length).toBe(1);
+    expect(await containerDeleteSnapshot(db)).toEqual(before);
+    expect(f.sealing.calls).toBe(1);
+    expect(f.sealing.updateCalls).toBe(1);
+    console.info(
+      JSON.stringify({
+        event: "owner-f2-controlled-stage",
+        stage: "delete_terminal_fault_conservation",
+        generation: 2,
+        injected: 1,
+        conservation: true,
+      }),
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("genuine legacy Container rejects prepared nonNULL configured inputs without mutation", async () => {
+  const db = new Database(":memory:");
+  try {
+    const f = await full100F2ConfiguredContainerEngine(db, undefined, C.formUrl);
+    const before = await containerDeleteSnapshot(db);
+    await expect(
+      f.engine.acceptCreate({
+        principal: "container-owner-test",
+        key: "legacy-configured-reject-canonical-source",
+        input: {
+          form: C.formUrl,
+          space: "default",
+          name: "legacy-configured",
+          spec: coreContainerSpec("1".repeat(64)),
+          privateInputs: { TOKEN: "owner-f2-fixture-value" },
+        },
+      }),
+    ).rejects.toThrow();
+    expect(f.sealing.calls).toBe(1);
+    expect(await containerDeleteSnapshot(db)).toEqual(before);
+    console.info(
+      JSON.stringify({
+        event: "owner-f2-controlled-stage",
+        stage: "legacy_configured_rejected",
+        sealCalls: 1,
+        conservation: true,
+      }),
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("F2 no-sensitive Core create then update retains null owner envelope", async () => {
+  const db = new Database(":memory:");
+  try {
+    const f = await full100F2ConfiguredContainerEngine(db, undefined, undefined, false);
+    const desired = Object.freeze({
+      ...coreContainerSpec("1".repeat(64)),
+      [C.fields.image]: "registry.example.test/owner/f2@sha256:" + "a".repeat(64),
+      [C.fields.workloadRevision]: "1".repeat(64),
+      [C.fields.requiredSensitiveVars]: Object.freeze([]),
+    });
+    const created = await f.engine.acceptCreate({
+      principal: "container-owner-test",
+      key: "f2-create-canonical-source",
+      input: {
+        form: f.formUrl,
+        space: "default",
+        name: "f2-secret",
+        spec: desired,
+      },
+    });
+    expect(created.generation).toBe(1);
+    expect(f.sealing.calls).toBe(0);
+    expect(f.sealing.emptyCreateCalls).toBe(1);
+    const createRows = Object.values((await containerDeleteSnapshot(db)).owner).flat();
+    const createAcceptance = createRows.find((row) => row.operation_id === created.id);
+    expect(createAcceptance?.action).toBe("create");
+    expect(createAcceptance?.configured_private_inputs_json).toBeNull();
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const updated = await f.engine.acceptUpdate({
+      principal: "container-owner-test",
+      key: "f2-update-canonical-source",
+      uid: created.resourceUid,
+      expectedGeneration: 1,
+      spec: Object.freeze({ ...desired, [C.fields.workloadRevision]: "2".repeat(64) }),
+    });
+    expect(updated.generation).toBe(2);
+    expect(f.sealing.calls).toBe(0);
+    expect(f.sealing.updateCalls).toBe(0);
+    expect(f.sealing.emptyUpdateCalls).toBe(1);
+    const updateRows = Object.values((await containerDeleteSnapshot(db)).owner).flat();
+    const updateAcceptance = updateRows.find((row) => row.operation_id === updated.id);
+    expect(updateAcceptance?.action).toBe("update");
+    expect(updateAcceptance?.configured_private_inputs_json).toBeNull();
+    expect(updateRows.some((row) => row.desired_generation === 2)).toBe(true);
+    expect((await f.engine.runNext())?.status).toBe("failed");
   } finally {
     db.close();
   }

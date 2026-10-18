@@ -216,7 +216,9 @@ export interface Auth103NativeBuildSource {
  * obtains the expected Git tree and actual owner tool/dependency roots itself. */
 function captureRegisteredBuildClosure(sourceRoot: string, commit: string) {
   const originalRun = runCommand;
-  const originalSpawn = Bun.spawn;
+  const originalBun = Bun;
+  const originalSpawn = originalBun.spawn;
+  const originalSpawnSync = originalBun.spawnSync;
   const git = realpathSync(Bun.which("git") ?? "");
   const node = realpathSync(Bun.which("node") ?? "");
   const wrangler = realpathSync(WRANGLER);
@@ -234,14 +236,40 @@ function captureRegisteredBuildClosure(sourceRoot: string, commit: string) {
     GIT_CONFIG_SYSTEM: "/dev/null",
     GIT_CONFIG_COUNT: "0",
   };
-  const result = spawnSync(
-    git,
-    ["--no-replace-objects", "-C", sourceRoot, "ls-tree", "-r", "-z", commit],
-    { encoding: "utf8", env: environment, maxBuffer: 32 * 1024 * 1024 },
-  );
-  if (result.status !== 0 || result.signal !== null)
+  if (originalBun.spawnSync !== originalSpawnSync)
+    throw preflightError("Auth103 source/dependency/tool closure changed during its build");
+  const options: Bun.SpawnOptions.SpawnSyncOptions<"ignore", "pipe", "pipe"> & {
+    cmd: string[];
+  } = {
+    cmd: [git, "--no-replace-objects", "-C", sourceRoot, "ls-tree", "-r", "-z", commit],
+    env: environment,
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "pipe",
+    maxBuffer: 32 * 1024 * 1024,
+  };
+  const result: unknown = (() => {
+    try {
+      return Reflect.apply(originalSpawnSync, originalBun, [options]);
+    } catch {
+      throw preflightError("Auth103 exact Git source tree is unavailable");
+    }
+  })();
+  if (
+    result === null ||
+    typeof result !== "object" ||
+    !("exitCode" in result) ||
+    typeof result.exitCode !== "number" ||
+    !("stdout" in result) ||
+    !(result.stdout instanceof Uint8Array) ||
+    result.exitCode !== 0 ||
+    ("signalCode" in result && result.signalCode !== undefined) ||
+    ("exitedDueToMaxBuffer" in result && result.exitedDueToMaxBuffer === true) ||
+    ("exitedDueToTimeout" in result && result.exitedDueToTimeout === true)
+  )
     throw preflightError("Auth103 exact Git source tree is unavailable");
-  const expected = result.stdout
+  const expected = Buffer.from(result.stdout)
+    .toString("utf8")
     .split("\0")
     .filter(Boolean)
     .map((entry) => {
@@ -306,7 +334,9 @@ function captureRegisteredBuildClosure(sourceRoot: string, commit: string) {
   const assertCurrent = () => {
     if (
       runCommand !== originalRun ||
-      Bun.spawn !== originalSpawn ||
+      Bun !== originalBun ||
+      originalBun.spawn !== originalSpawn ||
+      originalBun.spawnSync !== originalSpawnSync ||
       realpathSync(WRANGLER) !== wrangler ||
       toolSnapshot() !== tools ||
       inspectMoneyNativeBuildSourceTree(sourceRoot, expected).identityDigest !==
