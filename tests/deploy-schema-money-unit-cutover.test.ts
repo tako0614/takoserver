@@ -1251,6 +1251,51 @@ async function post94ReadFixture() {
   writeFileSync(`${convertedBackupPath}.identity.json`, JSON.stringify(convertedIdentity), {
     mode: 0o600,
   });
+  // This component fixture carries the exact four-file historical capture
+  // shape. The separate capture-producer tests exercise the real writer.
+  const sourceDigest = moneyUnitCutoverSourcePrefixDigest(files, 94);
+  const captureBytes = `${JSON.stringify({
+    kind: "takoserver.money-converted94-export-capture@v1",
+    accountId: f.target.accountId,
+    databaseId: f.target.d1.databaseId,
+    databaseName: f.target.d1.databaseName,
+    originDigest: sha(JSON.stringify(f.origin)),
+    sourceDigest,
+    convertBindingDigest: convert.bindingDigest,
+    writerEpoch,
+    convertedBackupPath,
+  })}\n`;
+  writeFileSync(`${convertedBackupPath}.capture.json`, captureBytes, { mode: 0o600 });
+  const tables = (
+    f.database
+      .query(
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB 'sqlite_*' AND name NOT IN ('_cf_KV', '_cf_METADATA', 'd1_migrations') ORDER BY name",
+      )
+      .all() as { name: string }[]
+  ).map((row) => row.name);
+  const rowCounts: Record<string, number> = {};
+  for (const table of tables)
+    rowCounts[table] = (
+      f.database.query(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }
+    ).n;
+  const completionBytes = `${JSON.stringify({
+    kind: "takoserver.money-converted94-export-completion@v1",
+    qualification: "component-simulation-only",
+    schemaPhase: "0094-fenced",
+    convertedBackupPath,
+    backupDigest: converted.digest,
+    identityDigest: sha(readFileSync(`${convertedBackupPath}.identity.json`, "utf8")),
+    captureDigest: sha(captureBytes),
+    convertBindingDigest: convert.bindingDigest,
+    historicalWriterEpoch: writerEpoch,
+    sourceDigest,
+    allDataDigest: await readWholeDatabaseDataDigest(reader(f.database), "preflight", tables),
+    tableInventory: tables,
+    rowCounts,
+  })}\n`;
+  writeFileSync(`${convertedBackupPath}.capture.complete.json`, completionBytes, {
+    mode: 0o600,
+  });
   const {
     resumeCommit: _commit,
     resumeProof: _proof,
