@@ -15,6 +15,11 @@ import {
 } from "../src/money-cutover-sql.ts";
 import type { PaymentEventContext } from "../src/payment-events.ts";
 import type { Sql } from "../src/ports.ts";
+import {
+  createSharedAuthFinancialActionConsentCaptureKey,
+  createSharedAuthFinancialActionConsentOriginalIdentity,
+  parseSharedAuthFinancialActionConsentOriginal,
+} from "../src/shared-auth-financial-consent-contract.ts";
 import type { SharedFinancialAction } from "../src/shared-financial-action.ts";
 import {
   buildFinancialR1CoPreparationBatch,
@@ -352,6 +357,152 @@ function changedBody(input: SharedFinancialAction): SharedFinancialAction {
   }
 }
 
+type FoundRetained = Extract<
+  Awaited<ReturnType<F["store"]["readBusinessRetainedR1Data"]>>,
+  { readonly status: "found" }
+>;
+
+async function publicConsentCodecData(retained: FoundRetained, choice: Choice) {
+  const r1 = retained.original;
+  // Separate synthetic Auth originals, not derived from R1 refs/selectedAt or
+  // evidence of an issuer/session/Clock. Fixed times merely fit these fixtures.
+  const initial = ["topup", "subscription-start", "card-setup"].includes(choice);
+  const acceptedAt = Date.parse(initial ? "2026-10-01T00:00:00.050Z" : "2026-10-15T00:00:00.050Z");
+  const expiresAt = Date.parse(initial ? "2026-10-01T00:04:00.000Z" : "2026-10-15T00:04:00.000Z");
+  const core = {
+    version: "takoserver-shared-financial-action-consent-v1",
+    consentRef: "synthetic-rp-consent-original-Ω",
+    actionVersion: "takoserver-shared-financial-action-v1",
+    action: retained.actionIdentity.action,
+    actionRequestFingerprint: retained.actionIdentity.requestFingerprint,
+    challenge: r1.c0.challenge,
+    selectedTerms: { ref: r1.selectedTerms.ref, digest: r1.selectedTerms.digest },
+    path: {
+      organizationId: r1.scopeRealm.organizationId,
+      workspaceId: r1.scopeRealm.workspaceId,
+      workspaceRef: r1.scopeRealm.workspaceRef,
+    },
+    financialRealmRef: r1.scopeRealm.financialRealm,
+    source: {
+      ref: r1.actionSource.ref,
+      digest: r1.actionSource.digest,
+      registrationRef: r1.actionSource.registrationRef,
+      incarnation: r1.actionSource.incarnation,
+    },
+    consentIssuer: {
+      registrationRef: "synthetic-rp-consent-issuer-registration-Ω",
+      registrationDigest: "synthetic RP issuer original digest Ω",
+      incarnation: "synthetic-rp-issuer-incarnation",
+    },
+    identityEvidence: {
+      kind: "financial-proof",
+      proofRef: "synthetic-independent-identity-proof-original-Ω",
+      registrationRef: r1.c0.challenge.registrationRef,
+      identityGeneration: 4,
+      sourceParentPins: [],
+    },
+    rpSession: {
+      sessionDigest: "synthetic-rp-session-original-digest-Ω",
+      acceptedVersion: 7,
+      accountId: "synthetic-rp-account",
+      observedPrincipalId: "synthetic-rp-principal",
+      identity: {
+        issuer: "https://synthetic-rp-issuer.example.test",
+        clientId: "synthetic-rp-client",
+        subject: "synthetic-rp-subject",
+        sessionId: "synthetic-rp-session",
+        authTime: 1,
+      },
+    },
+    principalBinding: {
+      ref: "synthetic-principal-binding-original",
+      digest: "synthetic binding original digest",
+      incarnation: "synthetic-binding-incarnation-not-principal-alias",
+    },
+    credentialClass: {
+      ref: "synthetic-credential-class-original",
+      digest: "synthetic credential original digest",
+      incarnation: "synthetic-credential-incarnation",
+    },
+    acceptedAt,
+    expiresAt,
+  };
+  const consent = await createSharedAuthFinancialActionConsentOriginalIdentity(core);
+  const bytes = new TextEncoder().encode(consent.canonicalOriginalJson);
+  const parsed = await parseSharedAuthFinancialActionConsentOriginal(bytes);
+  expect(parsed).toEqual(consent.original);
+  expect(parsed.action).toEqual(retained.actionIdentity.action);
+  expect(parsed.actionRequestFingerprint).toBe(retained.actionIdentity.requestFingerprint);
+  // Full10 original fields, not a challengeRef alias.
+  expect(parsed.challenge).toEqual(r1.c0.challenge);
+  expect(Object.keys(parsed.challenge)).toHaveLength(10);
+  expect(parsed.selectedTerms).toEqual({
+    ref: r1.selectedTerms.ref,
+    digest: r1.selectedTerms.digest,
+  });
+  expect(parsed.path).toEqual({
+    organizationId: r1.scopeRealm.organizationId,
+    workspaceId: r1.scopeRealm.workspaceId,
+    workspaceRef: r1.scopeRealm.workspaceRef,
+  });
+  expect(parsed.financialRealmRef).toBe(r1.scopeRealm.financialRealm);
+  expect(parsed.source).toEqual({
+    ref: r1.actionSource.ref,
+    digest: r1.actionSource.digest,
+    registrationRef: r1.actionSource.registrationRef,
+    incarnation: r1.actionSource.incarnation,
+  });
+  expect(parsed.consentIssuer.registrationRef).not.toBe(parsed.challenge.registrationRef);
+  expect(parsed.consentIssuer.registrationRef).not.toBe(parsed.source.registrationRef);
+  expect(parsed.identityEvidence.kind).toBe("financial-proof");
+  if (parsed.identityEvidence.kind !== "financial-proof") throw Error("fixture evidence missing");
+  expect(parsed.identityEvidence.proofRef).toBe("synthetic-independent-identity-proof-original-Ω");
+  expect(parsed.identityEvidence.proofRef).not.toBe(r1.r1Ref);
+  expect(parsed.identityEvidence.proofRef).not.toBe(parsed.consentRef);
+  const key = await createSharedAuthFinancialActionConsentCaptureKey(bytes);
+  expect(key).toMatch(/^sha256:[0-9a-f]{64}$/u); // Not an rpfc_ transaction/issuer conversion.
+  expect(await createSharedAuthFinancialActionConsentCaptureKey(parsed)).toBe(key);
+
+  // Both supplied fingerprints agree with each other, but not with the real
+  // retained action. The actual public creator must reject that false image.
+  const wrongFingerprint = `sha256:${"0".repeat(64)}`;
+  const failure: unknown = await createSharedAuthFinancialActionConsentOriginalIdentity({
+    ...core,
+    actionRequestFingerprint: wrongFingerprint,
+    challenge: { ...core.challenge, requestFingerprint: wrongFingerprint },
+  }).then(
+    () => undefined,
+    (error: unknown) => error,
+  );
+  expect(failure).toBeInstanceOf(TypeError);
+  if (!(failure instanceof TypeError)) throw Error("actual consent codec rejection required");
+  expect(failure.message).toBe("invalid shared financial action consent original");
+
+  // A stable key is intentionally narrower than a full original. These are
+  // codec-accepted DATA differences, not a fabricated consumer rejection or CAS.
+  const otherAuth = await createSharedAuthFinancialActionConsentOriginalIdentity({
+    ...core,
+    consentRef: "other-independent-synthetic-rp-consent-original",
+    rpSession: { ...core.rpSession, acceptedVersion: 8 },
+  });
+  expect(await createSharedAuthFinancialActionConsentCaptureKey(otherAuth.original)).toBe(key);
+  expect(otherAuth.canonicalOriginalJson).not.toBe(consent.canonicalOriginalJson);
+  expect(otherAuth.consentDigest).not.toBe(consent.consentDigest);
+  const crossedFinancial = await createSharedAuthFinancialActionConsentOriginalIdentity({
+    ...core,
+    selectedTerms: { ref: "terms:crossed-synthetic-original", digest: `sha256:${"a".repeat(64)}` },
+    source: { ...core.source, incarnation: "crossed-synthetic-source-incarnation" },
+    financialRealmRef: "crossed synthetic financial realm DATA",
+  });
+  expect(await createSharedAuthFinancialActionConsentCaptureKey(crossedFinancial.original)).toBe(
+    key,
+  );
+  expect(crossedFinancial.original.selectedTerms).not.toEqual(parsed.selectedTerms);
+  expect(crossedFinancial.original.source).not.toEqual(parsed.source);
+  expect(crossedFinancial.original.financialRealmRef).not.toBe(parsed.financialRealmRef);
+  expect(crossedFinancial.canonicalOriginalJson).not.toBe(consent.canonicalOriginalJson);
+}
+
 for (const choice of [
   "topup",
   "subscription-start",
@@ -474,6 +625,7 @@ for (const choice of [
       const keptRaw = base64UrlDecode(retained.original.selectedTerms.bodyUtf8Base64url);
       expect(keptRaw).toEqual(raw);
       expect(retained.original.selectedTerms).toEqual(selected.displayed.selectedTerms);
+      await publicConsentCodecData(retained, choice);
       await expect(f.store.readBusinessRetainedR1Data(changedBody(input))).rejects.toMatchObject({
         name: "FinancialRetainedR1Error",
         code: "conflict",
