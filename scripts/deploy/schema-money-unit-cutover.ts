@@ -4,6 +4,7 @@ import {
   closeSync,
   constants,
   existsSync,
+  fstatSync,
   fsyncSync,
   lstatSync,
   mkdtempSync,
@@ -2087,6 +2088,432 @@ function freezeMoneyFact<T>(value: T): T {
     Object.freeze(value);
   }
   return value;
+}
+
+export interface MoneyUnitConverted94BackupData {
+  readonly qualification: "component-simulation-only";
+  readonly schemaPhase: "0094-fenced";
+  readonly convertedBackupPath: string;
+  readonly backupDigest: string;
+  readonly identityDigest: string;
+  readonly captureDigest: string;
+  readonly completionDigest: string;
+  readonly convertBindingDigest: string;
+  readonly historicalWriterEpoch: string;
+  readonly sourceDigest: string;
+  readonly allDataDigest: string;
+  readonly tableInventory: readonly string[];
+  readonly rowCounts: Readonly<Record<string, number>>;
+}
+
+/**
+ * One historical read/export/local-seal operation. DATA only: the original
+ * native owner must authenticate its option instance before and after calling.
+ * This does not create a held context, dispatch SQL, or select a next epoch.
+ */
+export async function captureMoneyUnitConverted94Backup(input: {
+  readonly target: DeployTarget;
+  readonly options: MoneyUnitCutoverOptions;
+  readonly convertedBackupPath: string;
+}): Promise<MoneyUnitConverted94BackupData> {
+  const { target, convertedBackupPath } = input;
+  const options = captureMoneyOptions(input.options);
+  const targetJson = JSON.stringify(target);
+  const epoch = options.writerEpoch;
+  if (
+    target.environment !== "integration" ||
+    target.schemaMaintenanceMode !== "pre-wallet-usd-micros-quiesced" ||
+    options.phase !== "convert" ||
+    epoch !== target.moneyCutoverWriterEpoch ||
+    !MONEY_CUTOVER_WRITER_EPOCH_PATTERN.test(epoch) ||
+    options.outputDirectory === undefined ||
+    typeof convertedBackupPath !== "string" ||
+    !isAbsolute(convertedBackupPath) ||
+    resolve(convertedBackupPath) !== convertedBackupPath ||
+    resolve(convertedBackupPath) === resolve(options.backupPath)
+  )
+    throw preflightError("money converted94 capture requires the unchanged original convert owner");
+  assertProtectedDirectory(options.outputDirectory, "money converted94 capture output");
+  assertProtectedDirectory(dirname(convertedBackupPath), "money converted94 backup");
+  const capturePath = `${convertedBackupPath}.capture.json`;
+  const completionPath = `${convertedBackupPath}.capture.complete.json`;
+  const identityPath = `${convertedBackupPath}.identity.json`;
+  const present = (path: string): boolean => {
+    try {
+      lstatSync(path);
+      return true;
+    } catch (error) {
+      if (record(error) && error.code === "ENOENT") return false;
+      throw preflightError("money converted94 capture path cannot be observed");
+    }
+  };
+  const existing = [capturePath, convertedBackupPath, identityPath, completionPath].map(present);
+  const reopening = existing.every(Boolean);
+  if (!reopening && existing.some(Boolean))
+    throw preflightError("money converted94 capture is partial or unknown; no export or repair");
+  const parentStat = lstatSync(dirname(convertedBackupPath));
+  const parentIdentity = `${parentStat.dev}:${parentStat.ino}:${parentStat.uid}:${parentStat.mode}`;
+  const fileSeal = (path: string): string => {
+    // Capture through one no-follow FD, then require the pathname still names
+    // that exact file. Hashes and physical identity are both retained across awaits.
+    assertProtectedDirectory(dirname(path), "money converted94 capture custody");
+    let fd: number;
+    try {
+      fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    } catch {
+      throw preflightError("money converted94 capture custody file is unavailable");
+    }
+    try {
+      const before = fstatSync(fd, { bigint: true });
+      const fingerprint = (value: typeof before) =>
+        [
+          value.dev,
+          value.ino,
+          value.uid,
+          value.mode,
+          value.nlink,
+          value.size,
+          value.mtimeNs,
+          value.ctimeNs,
+        ]
+          .map(String)
+          .join(":");
+      if (
+        !before.isFile() ||
+        before.nlink !== 1n ||
+        (before.mode & 0o077n) !== 0n ||
+        (typeof process.getuid === "function" && before.uid !== BigInt(process.getuid()))
+      )
+        throw preflightError("money converted94 capture requires owned link-free0600 files");
+      const bytes = readFileSync(fd);
+      const after = fstatSync(fd, { bigint: true });
+      const named = lstatSync(path, { bigint: true });
+      if (fingerprint(before) !== fingerprint(after) || fingerprint(before) !== fingerprint(named))
+        throw preflightError("money converted94 capture custody changed during FD read");
+      return `${fingerprint(after)}:${digest(bytes)}`;
+    } finally {
+      closeSync(fd);
+    }
+  };
+  const syncCaptureDirectory = () => {
+    const fd = openSync(
+      dirname(convertedBackupPath),
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  };
+  const originalSeal = fileSeal(options.backupPath);
+  const originalIdentitySeal = fileSeal(`${options.backupPath}.identity.json`);
+  let captureSeal: string | undefined;
+  let convertedSeal: string | undefined;
+  let convertedIdentitySeal: string | undefined;
+  let completionSeal: string | undefined;
+  if (reopening) {
+    captureSeal = fileSeal(capturePath);
+    convertedSeal = fileSeal(convertedBackupPath);
+    convertedIdentitySeal = fileSeal(identityPath);
+    completionSeal = fileSeal(completionPath);
+  }
+  const sourceDirectory = options.sourceDirectory ?? resolve(REPOSITORY, "migrations");
+  const files = readMigrationArtifact(sourceDirectory).files;
+  assertMoneyCutoverSource(files);
+  const sourceDigest = moneyUnitCutoverSourcePrefixDigest(files, 94);
+  let configPath: string | undefined;
+  let configBytes: string | undefined;
+  const assertLocal = () => {
+    assertProtectedDirectory(dirname(convertedBackupPath), "money converted94 backup");
+    const currentParent = lstatSync(dirname(convertedBackupPath));
+    if (
+      `${currentParent.dev}:${currentParent.ino}:${currentParent.uid}:${currentParent.mode}` !==
+        parentIdentity ||
+      JSON.stringify(target) !== targetJson ||
+      fileSeal(options.backupPath) !== originalSeal ||
+      fileSeal(`${options.backupPath}.identity.json`) !== originalIdentitySeal ||
+      (captureSeal !== undefined && fileSeal(capturePath) !== captureSeal) ||
+      (convertedSeal !== undefined && fileSeal(convertedBackupPath) !== convertedSeal) ||
+      (convertedIdentitySeal !== undefined && fileSeal(identityPath) !== convertedIdentitySeal) ||
+      (completionSeal !== undefined && fileSeal(completionPath) !== completionSeal) ||
+      (configPath !== undefined &&
+        readProtectedBytes(configPath, "money capture config").toString("utf8") !== configBytes)
+    )
+      throw preflightError("money converted94 capture source or physical custody changed");
+    const currentFiles = readMigrationArtifact(sourceDirectory).files;
+    assertMoneyCutoverSource(currentFiles);
+    if (moneyUnitCutoverSourcePrefixDigest(currentFiles, 94) !== sourceDigest)
+      throw preflightError("money converted94 capture source94 changed");
+  };
+  assertLocal();
+  const maintenance = structuredClone(await options.maintenanceProof());
+  assertLocal();
+  assertMaintenanceProof(target, maintenance, options.maintenanceCommit);
+  const run = options.run ?? runCommand;
+  const credential = await resolveCloudflareCredential("integration", {
+    ...(options.cloudflareEnvironment === undefined
+      ? {}
+      : { cloudflareEnvironment: options.cloudflareEnvironment }),
+    run,
+  });
+  assertLocal();
+  const root = mkdtempSync(join(options.outputDirectory, "money-converted94-capture-"));
+  let result: Omit<MoneyUnitConverted94BackupData, "completionDigest">;
+  let completionBytes: Buffer;
+  try {
+    configPath = join(root, "wrangler.jsonc");
+    configBytes = configJson(target);
+    writeFileSync(configPath, configBytes, { flag: "wx", mode: 0o600 });
+    const database = new RemoteD1(configPath, { environment: credential.childEnvironment, run });
+    const originalQuery = database.query;
+    // Every native query retains the exact same RemoteD1 receiver/method and
+    // rechecks local selection/custody on both sides of its awaited operation.
+    const nativeRead: Pick<RemoteD1, "query" | "column"> = Object.freeze({
+      query: async (phase: DeployPhase, description: string, sql: string) => {
+        assertLocal();
+        if (database.query !== originalQuery)
+          throw preflightError("money converted94 native reader was replaced");
+        const rows = await originalQuery.call(database, phase, description, sql);
+        assertLocal();
+        if (database.query !== originalQuery)
+          throw preflightError("money converted94 native reader was replaced");
+        return rows;
+      },
+      column: async (phase: DeployPhase, description: string, sql: string, name: string) => {
+        const rows = await nativeRead.query(phase, description, sql);
+        return rows.map((row) => {
+          if (typeof row[name] !== "string")
+            throw preflightError("money converted94 schema column is malformed");
+          return row[name] as string;
+        });
+      },
+    });
+    const origin = await options.stageOriginProof();
+    assertLocal();
+    const backup = await backupAndRead(
+      options.backupPath,
+      configPath,
+      target,
+      files,
+      digest(JSON.stringify(origin)),
+      root,
+      run,
+      credential.childEnvironment,
+      false,
+    );
+    assertLocal();
+    const history = await readHeldMoneyConversionHistory(
+      {
+        target,
+        options,
+        files,
+        database: nativeRead,
+        readSchema: () => readD1SchemaState(nativeRead as unknown as RemoteD1),
+        backup,
+      },
+      epoch,
+      false,
+    );
+    assertLocal();
+    if (history.writerDigest !== digest(JSON.stringify(maintenance)))
+      throw preflightError("money converted94 maintenance differs from terminal convert Writer");
+    const assertCurrent = async () => {
+      assertLocal();
+      await history.assertCurrent();
+      assertLocal();
+      await history.assertReview();
+      assertLocal();
+      const writer = await options.maintenanceProof();
+      assertLocal();
+      assertMaintenanceProof(target, writer, options.maintenanceCommit);
+      if (JSON.stringify(writer) !== JSON.stringify(maintenance))
+        throw preflightError("money converted94 maintenance changed");
+      const schema = await readD1SchemaState(nativeRead as unknown as RemoteD1);
+      if ((await exactStatus(nativeRead, schema, files, epoch)) !== "0094-fenced")
+        throw preflightError("money converted94 requires native fenced94 and its original epoch");
+      assertFreezeRow(
+        await readFreezeRow(nativeRead, "preflight"),
+        history.anchor,
+        history.originDigest,
+        backup.digest,
+        history.writerDigest,
+        "preflight",
+      );
+      if (
+        (await readMoneyPreimageDigest(nativeRead, "preflight", true)) !== backup.preimageDigest ||
+        (await readMoneyAggregateDigest(nativeRead, "preflight", true)) !== backup.aggregateDigest
+      )
+        throw preflightError("money converted94 conserved preimages differ");
+      await assertClassificationsStored(nativeRead, history.classifications, "preflight");
+      await assertMoneyNativeForeignKeys(nativeRead, "preflight");
+      for (const phase of ["suffix98", "resume98"] as const) {
+        if (
+          (await options.custody.read(phase)) !== null ||
+          (await options.custody.readDispatch(phase)) !== null
+        )
+          throw preflightError("money converted94 capture refuses a post94 dispatch");
+        assertLocal();
+      }
+      if (
+        history.convert.receipt.postDigest !==
+        digest(
+          JSON.stringify({
+            applied: schema.applied,
+            shapeDigest: schema.shapeDigest,
+            preimageDigest: backup.preimageDigest,
+            aggregateDigest: backup.aggregateDigest,
+          }),
+        )
+      )
+        throw preflightError("money converted94 schema differs from terminal convert postimage");
+      assertLocal();
+      return schema;
+    };
+    await assertCurrent();
+    const tables = (
+      await nativeRead.query(
+        "preflight",
+        "converted94 full table inventory",
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB 'sqlite_*' AND name NOT IN ('_cf_KV', '_cf_METADATA', 'd1_migrations') ORDER BY name",
+      )
+    ).map((row) => String(row.name));
+    const rowCounts: Record<string, number> = {};
+    for (const table of tables) {
+      if (!/^[a-z_][a-z_0-9]*$/u.test(table))
+        throw preflightError("money converted94 table name is malformed");
+      rowCounts[table] = exactNumber(
+        await nativeRead.query(
+          "preflight",
+          "converted94 exact row count",
+          `SELECT COUNT(*) AS n FROM ${table}`,
+        ),
+        "n",
+        "preflight",
+      );
+    }
+    const before = {
+      rowCounts,
+      allDataDigest: await readWholeDatabaseDataDigest(nativeRead, "preflight", tables),
+    };
+    const capture = {
+      kind: "takoserver.money-converted94-export-capture@v1",
+      accountId: target.accountId,
+      databaseId: target.d1.databaseId,
+      databaseName: target.d1.databaseName,
+      originDigest: history.originDigest,
+      sourceDigest,
+      convertBindingDigest: history.convert.receipt.bindingDigest,
+      writerEpoch: epoch,
+      convertedBackupPath,
+    };
+    const captureBytes = Buffer.from(`${JSON.stringify(capture)}\n`);
+    await assertCurrent();
+    if (reopening) {
+      if (!readProtectedBytes(capturePath, "money converted94 capture").equals(captureBytes))
+        throw preflightError("money converted94 capture command differs");
+    } else {
+      if ([capturePath, convertedBackupPath, identityPath, completionPath].some(present))
+        throw preflightError("money converted94 capture appeared before its exclusive reservation");
+      writeProtectedFile(capturePath, captureBytes);
+      syncCaptureDirectory();
+      captureSeal = fileSeal(capturePath);
+    }
+    assertLocal();
+    let exported = false;
+    const exportOnce: typeof run = async (command, environment) => {
+      assertLocal();
+      if (
+        reopening ||
+        exported ||
+        present(convertedBackupPath) ||
+        present(identityPath) ||
+        present(completionPath)
+      )
+        throw preflightError("money converted94 export already started or custody changed");
+      exported = true;
+      const response = await run(command, environment);
+      assertLocal();
+      return response;
+    };
+    const converted = await backupAndRead(
+      convertedBackupPath,
+      configPath,
+      target,
+      files,
+      history.originDigest,
+      root,
+      exportOnce,
+      credential.childEnvironment,
+      !reopening,
+      {
+        schemaPhase: "0094-fenced",
+        convertBindingDigest: history.convert.receipt.bindingDigest,
+        writerEpoch: epoch,
+      },
+    );
+    syncCaptureDirectory();
+    convertedSeal = fileSeal(convertedBackupPath);
+    convertedIdentitySeal = fileSeal(identityPath);
+    assertLocal();
+    if (
+      converted.preimageDigest !== backup.preimageDigest ||
+      converted.aggregateDigest !== backup.aggregateDigest ||
+      converted.schema === undefined ||
+      converted.freezeRows === undefined
+    )
+      throw preflightError(
+        "money converted94 exported snapshot differs from original financial data",
+      );
+    assertFreezeRow(
+      converted.freezeRows,
+      history.anchor,
+      history.originDigest,
+      backup.digest,
+      history.writerDigest,
+      "preflight",
+    );
+    await assertMoneyLiveBackupCompleteness(nativeRead, "preflight", before);
+    await assertMoneyLiveBackupCompleteness(nativeRead, "preflight", converted);
+    await assertCurrent();
+    await assertMoneyLiveBackupCompleteness(nativeRead, "preflight", converted);
+    assertLocal();
+    result = {
+      qualification: "component-simulation-only",
+      schemaPhase: "0094-fenced",
+      convertedBackupPath,
+      backupDigest: converted.digest,
+      identityDigest: digest(readProtectedBytes(identityPath, "money converted94 identity")),
+      captureDigest: digest(captureBytes),
+      convertBindingDigest: history.convert.receipt.bindingDigest,
+      historicalWriterEpoch: epoch,
+      sourceDigest,
+      allDataDigest: converted.allDataDigest,
+      tableInventory: Object.keys(converted.rowCounts).sort(),
+      rowCounts: { ...converted.rowCounts },
+    };
+    completionBytes = Buffer.from(
+      `${JSON.stringify({ kind: "takoserver.money-converted94-export-completion@v1", ...result })}\n`,
+    );
+    if (
+      reopening &&
+      !readProtectedBytes(completionPath, "money converted94 completion").equals(completionBytes)
+    )
+      throw preflightError("money converted94 completion differs from its retained exact snapshot");
+  } finally {
+    // Retain reservation/snapshot evidence on every failure; only this temporary
+    // source-built config/raw-export workspace is removed. Never heal or retry.
+    rmSync(root, { recursive: true, force: true });
+    configPath = undefined;
+  }
+  assertLocal();
+  if (!reopening) {
+    writeProtectedFile(completionPath, completionBytes);
+    syncCaptureDirectory();
+    completionSeal = fileSeal(completionPath);
+  }
+  assertLocal();
+  return freezeMoneyFact({ ...result, completionDigest: digest(completionBytes) });
 }
 
 /**

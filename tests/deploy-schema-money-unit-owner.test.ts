@@ -40,8 +40,10 @@ import {
 } from "../scripts/deploy/schema-money-unit-cutover.ts";
 import {
   assertMoneyUnitOriginalWriterOptions,
+  captureMoneyUnitOriginalConverted94Backup,
   loadMoneyUnitCutoverOptions,
   loadMoneyUnitOriginalCutoverOptions,
+  type MoneyUnitOriginalCutoverOptions,
   type MoneyUnitOwnerDependencies,
   readIntegrationMoneyUnitResumeState,
 } from "../scripts/deploy/schema-money-unit-owner.ts";
@@ -2540,5 +2542,25 @@ describe("standalone original maintenance profile admission", () => {
     );
     expect(selected.cloudflareProviderExecutor).toEqual(target.cloudflareProviderExecutor);
     expect(selected.schemaMaintenanceMode).toBe("pre-wallet-usd-micros-quiesced");
+  });
+});
+
+describe("converted94 capture native original owner boundary", () => {
+  test("legacy and caller-shaped DATA cannot reach the native historical export", async () => {
+    const f = fixture();
+    const options = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+    for (const supplied of [
+      options,
+      { ...options, nativeOnly: true, phase: "convert", ready: true },
+    ]) {
+      await expect(
+        captureMoneyUnitOriginalConverted94Backup(
+          supplied as MoneyUnitOriginalCutoverOptions,
+          join(f.root, "captured94.sql"),
+        ),
+      ).rejects.toThrow("unchanged native original owner");
+      expect(existsSync(join(f.root, "captured94.sql"))).toBe(false);
+      expect(existsSync(join(f.root, "captured94.sql.capture.json"))).toBe(false);
+    }
   });
 });

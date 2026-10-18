@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildD1MigrationImport } from "../scripts/deploy/d1-migration-import.ts";
@@ -17,6 +17,7 @@ import {
   assertMoneyNativeForeignKeys,
   assertMoneyPost94Source,
   buildMoneyCutoverImportSql,
+  captureMoneyUnitConverted94Backup,
   inspectMoneyUnitPost94State,
   inspectMoneyUnitResumeState,
   MONEY_FENCE_TABLES_0092,
@@ -1553,6 +1554,435 @@ describe("held post94 continuation component", () => {
       } finally {
         f.close();
       }
+    }
+  });
+});
+
+/** Real reduced SQLite history/export bytes; native commands are controlled component ports. */
+async function converted94CaptureFixture() {
+  const base = await resumeReadFixture();
+  const classificationManifestPath = base.options.classificationManifestPath;
+  const classificationManifestDigest = base.options.classificationManifestDigest;
+  if (classificationManifestPath === undefined || classificationManifestDigest === undefined)
+    throw new Error("actual fixture classification selection missing");
+  const database = new Database(":memory:");
+  database.exec(base.originalSql);
+  const target: DeployTarget = {
+    ...base.target,
+    schemaMaintenanceMode: "pre-wallet-usd-micros-quiesced",
+  };
+  const identity = {
+    accountId: target.accountId,
+    databaseId: target.d1.databaseId,
+    databaseName: target.d1.databaseName,
+    bucketName: target.r2.bucketName,
+  };
+  const writer = {
+    kind: "takoserver.money-writer-quiescence@v1" as const,
+    mode: "pre-wallet-usd-micros-quiesced" as const,
+    accountId: target.accountId,
+    databaseId: target.d1.databaseId,
+    workerName: target.workerName,
+    deploymentId: target.d1.databaseId,
+    versionId: target.d1.databaseId,
+    sourceCommit: "d".repeat(40),
+    moduleDigest: marker,
+    trafficPercent: 100 as const,
+    privateMoneyWriters: 0 as const,
+    writerEpoch,
+    privateScopeDigest: marker,
+    privateSourceInventoryDigest: marker,
+    privateDependencyClosureDigest: marker,
+    privateDeploymentsDigest: marker,
+    publicPublicationDigest: marker,
+    publicSourceArtifactDigest: marker,
+  };
+  const writerDigest = sha(JSON.stringify(writer));
+  const originDigest = sha(JSON.stringify(base.origin));
+  const anchor = sha(
+    JSON.stringify({
+      kind: "takoserver.money-freeze-anchor@v1",
+      target: identity,
+      originDigest,
+      backupDigest: base.backup.digest,
+      preimageDigest: base.backup.preimageDigest,
+      aggregateDigest: base.backup.aggregateDigest,
+      financialDigest: base.backup.financialDigest,
+      writerDigest,
+      writerEpoch,
+      sourceDigest: base.origin.sourceDigest,
+    }),
+  );
+  const classifications = JSON.parse(
+    readFileSync(base.options.classificationManifestPath ?? "", "utf8"),
+  );
+  const receipts = new Map<string, MoneyCutoverCustodyReceipt>();
+  const bindings = new Map<string, MoneyCutoverDispatchBinding>();
+  const reviews = new Map<string, MoneyReviewProof>();
+  let predecessor = base.origin.terminalCustodyDigest;
+  const imports: string[] = [];
+  for (const phase of ["freeze", "prepare", "classify", "convert"] as const) {
+    const before = state(database);
+    const text = buildMoneyCutoverImportSql({
+      phase,
+      files,
+      anchor,
+      originDigest,
+      backupDigest: base.backup.digest,
+      writerDigest,
+      writerEpoch,
+      classifications: phase === "freeze" || phase === "prepare" ? [] : classifications,
+    });
+    const old = base.bindings.get(phase);
+    if (old === undefined || old.kind !== "takoserver.money-cutover-dispatch@v1")
+      throw new Error("actual fixture legacy phase missing");
+    const sealedImportPath = join(base.directory, `capture-${phase}.sql`);
+    writeFileSync(sealedImportPath, text, { mode: 0o600 });
+    apply(database, text);
+    imports.push(text);
+    const binding = {
+      ...old,
+      writerDigest,
+      predecessorCustodyDigest: predecessor,
+      importDigest: sha(text),
+      beforeShapeDigest: before.shapeDigest,
+      sealedImportPath,
+    };
+    const reviewBinding: MoneyReviewBinding = {
+      kind: "takoserver.money-review-binding@v1",
+      phase,
+      accountId: binding.accountId,
+      databaseId: binding.databaseId,
+      originDigest,
+      predecessorCustodyDigest: predecessor,
+      sourceCommit: binding.sourceCommit,
+      sourceDigest: binding.sourceDigest,
+      importDigest: binding.importDigest,
+      backupDigest: binding.backupDigest,
+      preimageDigest: binding.preimageDigest,
+      aggregateDigest: binding.aggregateDigest,
+      classificationDigest: binding.classificationDigest,
+      writerDigest,
+      resumeDigest: binding.resumeDigest,
+      writerEpoch,
+    };
+    const review: MoneyReviewProof = {
+      kind: "takoserver.money-independent-review@v1",
+      reviewer: "capture component reviewer",
+      reviewRef: "review://capture-original-conversion",
+      bindingDigest: moneyCutoverBindingDigest(reviewBinding),
+      evidenceDigest: marker,
+    };
+    const reviewed = { ...binding, reviewDigest: sha(JSON.stringify(review)) };
+    const after = state(database);
+    const receipt: MoneyCutoverCustodyReceipt = {
+      kind: "takoserver.money-cutover-custody@v1",
+      phase,
+      state: "terminal",
+      bindingDigest: moneyCutoverBindingDigest(reviewed),
+      postDigest: sha(
+        JSON.stringify({
+          applied: after.applied,
+          shapeDigest: after.shapeDigest,
+          preimageDigest: base.backup.preimageDigest,
+          aggregateDigest: base.backup.aggregateDigest,
+        }),
+      ),
+    };
+    bindings.set(phase, reviewed);
+    receipts.set(phase, receipt);
+    reviews.set(phase, review);
+    predecessor = sha(JSON.stringify(receipt));
+  }
+  const original = normalizeSnapshotDump(Buffer.from(base.originalSql));
+  writeFileSync(base.options.backupPath, original.sql, { mode: 0o600 });
+  writeFileSync(
+    `${base.options.backupPath}.identity.json`,
+    `${JSON.stringify({
+      kind: "takoserver.money-protected-backup@v1",
+      accountId: target.accountId,
+      databaseId: target.d1.databaseId,
+      databaseName: target.d1.databaseName,
+      originDigest,
+      sourceDigest: base.origin.sourceDigest,
+      backupDigest: original.digest,
+    })}\n`,
+    { mode: 0o600 },
+  );
+  const convertedSql = normalizeSnapshotDump(
+    Buffer.from(base.originalSql + imports.join("\n")),
+  ).sql;
+  let exports = 0;
+  let commands = 0;
+  let mutations = 0;
+  let exportHook: (() => void) | undefined;
+  let writerRead: () => Promise<typeof writer> = async () => writer;
+  const options: MoneyUnitCutoverOptions = {
+    phase: "convert",
+    maintenanceCommit: writer.sourceCommit,
+    writerEpoch,
+    backupPath: base.options.backupPath,
+    outputDirectory: base.directory,
+    classificationManifestPath,
+    classificationManifestDigest,
+    stageOriginProof: async () => base.origin,
+    storageIdentityRead: async () => identity,
+    maintenanceProof: () => writerRead(),
+    independentReview: async (binding) => reviews.get(binding.phase) ?? null,
+    cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "synthetic-component-token-not-live" },
+    custody: {
+      read: async (phase) => receipts.get(phase) ?? null,
+      readDispatch: async (phase) => bindings.get(phase) ?? null,
+      dispatch: async () => {
+        mutations++;
+        throw new Error("unexpected dispatch");
+      },
+      terminal: async () => {
+        mutations++;
+        throw new Error("unexpected terminal");
+      },
+    },
+    run: async (command) => {
+      commands++;
+      if (command.includes("export")) {
+        exports++;
+        const path = command[command.indexOf("--output") + 1];
+        if (typeof path !== "string") throw new Error("missing actual export path");
+        writeFileSync(path, convertedSql, { mode: 0o600 });
+        exportHook?.();
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      const text = command[command.indexOf("--command") + 1];
+      if (
+        !command.includes("execute") ||
+        typeof text !== "string" ||
+        !/^(?:SELECT\b|PRAGMA\b)/u.test(text)
+      )
+        throw new Error("unexpected non-read native command");
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify([{ success: true, results: database.query(text).all() }]),
+        stderr: "",
+      };
+    },
+  };
+  const convertedBackupPath = join(base.directory, "captured94.sql");
+  return {
+    ...base,
+    database,
+    target,
+    options,
+    writer,
+    receipts,
+    bindings,
+    convertedBackupPath,
+    capture: () => captureMoneyUnitConverted94Backup({ target, options, convertedBackupPath }),
+    exports: () => exports,
+    commands: () => commands,
+    mutations: () => mutations,
+    setExportHook: (hook: () => void) => {
+      exportHook = hook;
+    },
+    setWriter: (read: typeof writerRead) => {
+      writerRead = read;
+    },
+    close: () => {
+      database.close();
+      base.close();
+    },
+  };
+}
+
+describe("separate converted94 historical backup producer", () => {
+  test("one exact export preserves original92 and seals separate94 with its old epoch and convert history", async () => {
+    const f = await converted94CaptureFixture();
+    try {
+      const original = readFileSync(f.options.backupPath);
+      const originalIdentity = readFileSync(`${f.options.backupPath}.identity.json`);
+      const result = await f.capture();
+      expect(result.qualification).toBe("component-simulation-only");
+      expect(result.schemaPhase).toBe("0094-fenced");
+      expect(result.historicalWriterEpoch).toBe(writerEpoch);
+      const convert = f.receipts.get("convert");
+      if (convert === undefined) throw new Error("actual fixture terminal convert missing");
+      expect(result.convertBindingDigest).toBe(convert.bindingDigest);
+      expect(result.sourceDigest).toBe(moneyUnitCutoverSourcePrefixDigest(files, 94));
+      expect(result.tableInventory).toEqual(Object.keys(result.rowCounts).sort());
+      const identity = JSON.parse(readFileSync(`${f.convertedBackupPath}.identity.json`, "utf8"));
+      expect(identity.kind).toBe("takoserver.money-protected-backup@v2");
+      expect(identity.writerEpoch).toBe(writerEpoch);
+      expect(identity.convertBindingDigest).toBe(result.convertBindingDigest);
+      expect(sha(readFileSync(f.convertedBackupPath, "utf8"))).toBe(result.backupDigest);
+      expect(sha(readFileSync(`${f.convertedBackupPath}.capture.json`, "utf8"))).toBe(
+        result.captureDigest,
+      );
+      expect(sha(readFileSync(`${f.convertedBackupPath}.capture.complete.json`, "utf8"))).toBe(
+        result.completionDigest,
+      );
+      expect(readFileSync(f.options.backupPath)).toEqual(original);
+      expect(readFileSync(`${f.options.backupPath}.identity.json`)).toEqual(originalIdentity);
+      expect(f.exports()).toBe(1);
+      expect(f.mutations()).toBe(0);
+      expect("nextWriterEpoch" in result).toBe(false);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("a complete exact historical capture reopens without another export or custody write", async () => {
+    const f = await converted94CaptureFixture();
+    try {
+      const first = await f.capture();
+      const paths = [
+        f.convertedBackupPath,
+        `${f.convertedBackupPath}.identity.json`,
+        `${f.convertedBackupPath}.capture.json`,
+        `${f.convertedBackupPath}.capture.complete.json`,
+      ];
+      const before = paths.map((p) => readFileSync(p));
+      const queries = f.commands();
+      expect(await f.capture()).toEqual(first);
+      expect(paths.map((p) => readFileSync(p))).toEqual(before);
+      expect(f.commands()).toBeGreaterThan(queries);
+      expect(f.exports()).toBe(1);
+      expect(f.mutations()).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("partial or orphan local capture is unknown and refuses before any export or native query", async () => {
+    for (const suffix of [".capture.json", ".identity.json", "", ".capture.complete.json"]) {
+      const f = await converted94CaptureFixture();
+      try {
+        const bytes = "retained partial evidence";
+        writeFileSync(`${f.convertedBackupPath}${suffix}`, bytes, { mode: 0o600 });
+        await expect(f.capture()).rejects.toThrow("partial or unknown");
+        expect(readFileSync(`${f.convertedBackupPath}${suffix}`, "utf8")).toBe(bytes);
+        expect(f.exports()).toBe(0);
+        expect(f.commands()).toBe(0);
+        expect(f.mutations()).toBe(0);
+      } finally {
+        f.close();
+      }
+    }
+  });
+
+  test("accepted-unknown export retains the exclusive reservation and cannot export again", async () => {
+    const f = await converted94CaptureFixture();
+    try {
+      f.setExportHook(() => {
+        throw new Error("synthetic acknowledged export response loss");
+      });
+      await expect(f.capture()).rejects.toThrow("acknowledged export response loss");
+      expect(existsSync(`${f.convertedBackupPath}.capture.json`)).toBe(true);
+      expect(existsSync(`${f.convertedBackupPath}.capture.complete.json`)).toBe(false);
+      expect(f.exports()).toBe(1);
+      await expect(f.capture()).rejects.toThrow("partial or unknown");
+      expect(f.exports()).toBe(1);
+      expect(f.mutations()).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("a real late SQLite schema drift retains pair evidence but never a successful completion", async () => {
+    const f = await converted94CaptureFixture();
+    try {
+      f.setExportHook(() => {
+        const changed = f.database
+          .query("DELETE FROM d1_migrations WHERE name = ? RETURNING name")
+          .all("0094_wallet_usd_micros.sql");
+        expect(changed).toHaveLength(1);
+      });
+      await expect(f.capture()).rejects.toThrow("native fenced94");
+      expect(existsSync(f.convertedBackupPath)).toBe(true);
+      expect(existsSync(`${f.convertedBackupPath}.identity.json`)).toBe(true);
+      expect(existsSync(`${f.convertedBackupPath}.capture.json`)).toBe(true);
+      expect(existsSync(`${f.convertedBackupPath}.capture.complete.json`)).toBe(false);
+      const retained = readFileSync(f.convertedBackupPath);
+      await expect(f.capture()).rejects.toThrow("partial or unknown");
+      expect(readFileSync(f.convertedBackupPath)).toEqual(retained);
+      expect(f.exports()).toBe(1);
+      expect(f.mutations()).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("missing or unknown terminal convert is refused before reserving or exporting", async () => {
+    for (const unknown of [false, true]) {
+      const f = await converted94CaptureFixture();
+      try {
+        const terminal = f.receipts.get("convert");
+        if (terminal === undefined) throw new Error("missing actual fixture convert");
+        if (unknown)
+          f.receipts.set("convert", { ...terminal, state: "dispatched", postDigest: null });
+        else f.receipts.delete("convert");
+        await expect(f.capture()).rejects.toThrow();
+        expect(existsSync(`${f.convertedBackupPath}.capture.json`)).toBe(false);
+        expect(f.exports()).toBe(0);
+        expect(f.mutations()).toBe(0);
+      } finally {
+        f.close();
+      }
+    }
+  });
+
+  test("current native maintenance drift is refused before capture rather than accepted from history", async () => {
+    const f = await converted94CaptureFixture();
+    try {
+      let reads = 0;
+      f.setWriter(async () =>
+        ++reads === 1
+          ? f.writer
+          : { ...f.writer, versionId: "22222222-2222-4222-8222-222222222222" },
+      );
+      await expect(f.capture()).rejects.toThrow("maintenance changed");
+      expect(reads).toBe(2);
+      expect(existsSync(`${f.convertedBackupPath}.capture.json`)).toBe(false);
+      expect(f.exports()).toBe(0);
+      expect(f.mutations()).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("a complete pair cannot borrow another physical/path/convert reservation", async () => {
+    const f = await converted94CaptureFixture();
+    try {
+      await f.capture();
+      const path = `${f.convertedBackupPath}.capture.json`;
+      const command = JSON.parse(readFileSync(path, "utf8"));
+      writeFileSync(
+        path,
+        JSON.stringify({ ...command, convertBindingDigest: sha("foreign convert") }),
+        { mode: 0o600 },
+      );
+      await expect(f.capture()).rejects.toThrow("capture command differs");
+      expect(f.exports()).toBe(1);
+      expect(f.mutations()).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+});
+
+describe("converted94 retained nonregular custody", () => {
+  test("a replaced regular record is refused before another export or a native query", async () => {
+    const f = await converted94CaptureFixture();
+    try {
+      await f.capture();
+      const path = `${f.convertedBackupPath}.capture.json`;
+      rmSync(path);
+      mkdirSync(path, { mode: 0o700 });
+      const commands = f.commands();
+      await expect(f.capture()).rejects.toThrow("owned link-free0600 files");
+      expect(f.commands()).toBe(commands);
+      expect(f.exports()).toBe(1);
+      expect(f.mutations()).toBe(0);
+    } finally {
+      f.close();
     }
   });
 });

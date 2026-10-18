@@ -40,6 +40,7 @@ import {
 } from "./process.ts";
 import { writeWorkerConfig } from "./realized-config.ts";
 import {
+  captureMoneyUnitConverted94Backup,
   type MoneyCutoverCustody,
   type MoneyCutoverCustodyReceipt,
   type MoneyCutoverDispatchBinding,
@@ -51,6 +52,7 @@ import {
   type MoneyReviewBinding,
   type MoneyReviewProof,
   type MoneyStageOriginProof,
+  type MoneyUnitConverted94BackupData,
   type MoneyUnitCutoverOptions,
   type MoneyUnitHeldConvertSourceFacts,
   type MoneyUnitResumeState,
@@ -2036,6 +2038,29 @@ function originalHeldMoneyOwner(options: MoneyUnitOriginalCutoverOptions): Deplo
   )
     throw preflightError("money held convert requires unchanged native original owner methods");
   return assertMoneyUnitOriginalWriterOptions(options, selected.ownedTarget);
+}
+
+/**
+ * Explicit historical94 export/local-seal selection. Only the existing unchanged
+ * default-native original convert owner may reach the lower DATA producer.
+ * This neither mints a held context nor dispatches SQL or selects a next epoch.
+ */
+export async function captureMoneyUnitOriginalConverted94Backup(
+  options: MoneyUnitOriginalCutoverOptions,
+  convertedBackupPath: string,
+): Promise<MoneyUnitConverted94BackupData> {
+  const target = originalHeldMoneyOwner(options);
+  if (
+    typeof convertedBackupPath !== "string" ||
+    !isAbsolute(convertedBackupPath) ||
+    resolve(convertedBackupPath) !== convertedBackupPath ||
+    resolve(convertedBackupPath) === resolve(options.backupPath)
+  )
+    throw preflightError("money converted94 capture requires a separate exact protected path");
+  const result = await captureMoneyUnitConverted94Backup({ target, options, convertedBackupPath });
+  if (originalHeldMoneyOwner(options) !== target)
+    throw preflightError("money converted94 original native owner changed during capture");
+  return result;
 }
 
 /**
