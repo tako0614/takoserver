@@ -1425,12 +1425,18 @@ describe("bounded fresh money table count reads", () => {
       expect(countRows).toEqual(
         tables.map((table) => ({ table_name: table, n: rowCounts[table] })),
       );
-      expect(calls.filter((call) => call.description.endsWith(" columns"))).toHaveLength(130);
-      expect(calls.filter((call) => call.description.endsWith(" data"))).toHaveLength(130);
+      const groupedColumns = calls.filter(
+        (call) => call.description === "backup grouped table columns",
+      );
+      const groupedTypedRows = calls.filter(
+        (call) => call.description === "backup grouped typed rows",
+      );
+      expect(groupedColumns).toHaveLength(2);
+      expect(groupedTypedRows).toHaveLength(9);
       expect(
         calls.filter((call) => call.description === "native foreign-key integrity"),
       ).toHaveLength(1);
-      expect(calls).toHaveLength(264);
+      expect(calls).toHaveLength(15);
       expect(await readWholeDatabaseDataDigest(reader(database), "preflight", tables)).toBe(
         allDataDigest,
       );
@@ -1541,7 +1547,7 @@ describe("bounded fresh money table count reads", () => {
         true,
       );
       expect(countSql.every((query) => !query.includes("?"))).toBe(true);
-      expect(typedReads).toBe(64);
+      expect(typedReads).toBe(7);
     } finally {
       database.close();
     }
