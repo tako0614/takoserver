@@ -636,6 +636,18 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain", "adapter"],
   },
   {
+    // Consent codecs and the unregistered history leaf use portable domain ports.
+    name: "domain",
+    match: /^src\/shared-auth-financial-consent-(?:contract|schema-plan)\.ts$/u,
+    may: ["core", "domain"],
+  },
+  {
+    // This exact DATA store consumes the existing request-origin composition.
+    name: "app",
+    match: /^src\/shared-auth-financial-consent-store\.ts$/u,
+    may: ["core", "domain", "app"],
+  },
+  {
     // Exact displayed terms join existing R1 app DATA with core/domain tariff facts.
     name: "app",
     match: /^src\/financial-displayed-terms\.ts$/u,
