@@ -554,3 +554,26 @@ test("known completion does not permit replay/adoption of a second transition", 
   expect(f.db.query("PRAGMA defer_foreign_keys").get()).toEqual({ defer_foreign_keys: 0 });
   noScratch(f.db);
 });
+
+for (const table of ["_cf_kv", "_cf_metadata", "_cf_kv_user", "_cf_metadata_user"] as const)
+  test(`native catalog barrier keeps populated ${table} CASCADE references in the original guard`, async () => {
+    const f = await fixture();
+    const name = quoted(table);
+    f.db.exec(`CREATE TABLE ${name} (
+      principal_id TEXT NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+      payload BLOB NOT NULL
+    );`);
+    f.db
+      .query(`INSERT INTO ${name} (principal_id, payload) VALUES (?, X'00ff10')`)
+      .run(f.signedIn.principal.id);
+    const before = checkpoint(f.db);
+    await expect(f.sql.batch(authPrincipalProviderTransitionStatements())).rejects.toMatchObject({
+      code: "constraint",
+    });
+    expect(checkpoint(f.db)).toEqual(before);
+    expect(f.db.inTransaction).toBe(false);
+    expect(await f.accounts.authenticate(f.authorization)).toMatchObject({
+      principalId: f.signedIn.principal.id,
+    });
+    noScratch(f.db);
+  });

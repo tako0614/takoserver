@@ -75,8 +75,16 @@ const literal = (value: string): string => `'${value.replace(/'/gu, "''")}'`;
 const excluded = [ASSERTION, ROWS, LINKS, SCHEMA, NEXT].map(literal).join(", ");
 const conservedSchema = `SELECT type, name, tbl_name, sql FROM main.sqlite_schema
   WHERE tbl_name <> 'principals' AND name NOT IN (${excluded})`;
-const inbound = `SELECT source.name AS relation, fk.*
-  FROM main.sqlite_schema source JOIN pragma_foreign_key_list(source.name, 'main') fk
+// Only these native-reserved tables with no possible FK clause are omitted.
+// REFERENCES is mandatory for every SQLite FK; a matching user table with a FK
+// stays in this materialized source and reaches the unchanged original guard.
+const inbound = `WITH auth103_inbound_catalog AS MATERIALIZED (
+  SELECT * FROM main.sqlite_schema WHERE type = 'table'
+    AND NOT (name COLLATE NOCASE IN ('_cf_kv', '_cf_metadata')
+      AND sql IS NOT NULL AND sql NOT GLOB '*[Rr][Ee][Ff][Ee][Rr][Ee][Nn][Cc][Ee][Ss]*')
+)
+SELECT source.name AS relation, fk.*
+  FROM auth103_inbound_catalog source JOIN pragma_foreign_key_list(source.name, 'main') fk
   WHERE source.type = 'table' AND lower(fk."table") = 'principals'`;
 const dependentObjects = `SELECT type, name, tbl_name, sql FROM main.sqlite_schema WHERE
   (tbl_name = 'principals' AND type = 'trigger')

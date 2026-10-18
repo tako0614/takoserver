@@ -475,8 +475,9 @@ const COMMON = `(SELECT foreign_keys FROM pragma_foreign_keys) = 1
         OR ("from" = 'source_operation_id' AND "table" = 'tf_v2_operations' AND "to" = 'id')
         OR ("from" = 'resource_uid' AND "table" = 'tf_v2_resources' AND "to" = 'uid'))) = 3
   AND NOT EXISTS (SELECT 1 FROM main.sqlite_schema source
-    JOIN pragma_foreign_key_list(source.name, 'main') incoming
-    WHERE source.type = 'table' AND incoming."table" = ${literal(TABLE)})`;
+    WHERE CASE WHEN lower(source.name) IN ('_cf_kv', '_cf_metadata') THEN 0
+      ELSE EXISTS (SELECT 1 FROM pragma_foreign_key_list(source.name, 'main') incoming
+        WHERE source.type = 'table' AND incoming."table" = ${literal(TABLE)}) END)`;
 
 function predicate(tableSql: string): string {
   return `(${COMMON}
@@ -531,25 +532,50 @@ export async function inspectV2WorkerNativeIdentityDomain(
 /** Internal source recipe only. It neither registers a migration nor executes SQL. */
 export function createV2WorkerNativeIdentityMigrationRecipe() {
   const holding = MARKERS[0];
-  // A distinct owner-local TEMP assertion does not invalidate the unchanged seal.
+  // This candidate owns one fresh MAIN scratch table only inside the same batch.
+  // Its distinct name does not relax the unchanged steady readiness seal.
   const assertion = "_tf_v2_native_identity_candidate_assert";
+  const assertionReady = `(SELECT count(*) FROM main.sqlite_schema
+  WHERE type = 'table' AND name = ${literal(assertion)} AND tbl_name = ${literal(assertion)}
+    AND sql IS NOT NULL) = 1
+AND (SELECT count(*) FROM main.sqlite_schema
+  WHERE name COLLATE NOCASE = ${literal(assertion)}) = 1
+AND (SELECT count(*) FROM main.sqlite_schema WHERE tbl_name = ${literal(assertion)}) = 1
+AND (SELECT count(*) FROM pragma_table_xinfo(${literal(assertion)}, 'main')) = 1
+AND (SELECT count(*) FROM pragma_table_xinfo(${literal(assertion)}, 'main')
+  WHERE cid = 0 AND name = 'ok' AND type = 'INTEGER' AND "notnull" = 0
+    AND dflt_value IS NULL AND pk = 1 AND hidden = 0) = 1
+AND (SELECT count(*) FROM main.${assertion}) = 1
+AND EXISTS (SELECT 1 FROM main.${assertion} WHERE typeof(ok) = 'integer' AND ok = 1)
+AND NOT EXISTS (SELECT 1 FROM sqlite_temp_schema
+  WHERE name COLLATE NOCASE = ${literal(assertion)}
+    OR tbl_name COLLATE NOCASE = ${literal(assertion)})`;
   const columns = COLUMNS.map(([, name]) => name);
   const names = columns.join(", ");
   // SQLite identifiers use ASCII case-insensitive equality, unlike the unchanged
   // legacy inspector's catalog-text comparison. A DROP could otherwise cascade
   // into an unrelated child whose REFERENCES spelling differs only by case.
   const noIncomingReferences = `NOT EXISTS (SELECT 1 FROM main.sqlite_schema source
-  JOIN pragma_foreign_key_list(source.name, 'main') incoming
-  WHERE source.type = 'table' AND incoming."table" COLLATE NOCASE = ${literal(TABLE)})`;
+  WHERE CASE WHEN lower(source.name) IN ('_cf_kv', '_cf_metadata') THEN 0
+    ELSE EXISTS (SELECT 1 FROM pragma_foreign_key_list(source.name, 'main') incoming
+      WHERE source.type = 'table' AND incoming."table" COLLATE NOCASE = ${literal(TABLE)}) END)`;
   // A duplicate PRIMARY KEY still fails when ignore_check_constraints is ON.
   // Unknown/NULL predicates must fail too, rather than selecting no assertion.
   const check = (condition: string) =>
-    `INSERT OR ROLLBACK INTO temp.${assertion}(ok)
+    `INSERT OR ROLLBACK INTO main.${assertion}(ok)
 SELECT 1 WHERE (${condition}) IS NOT 1;`;
   const equal = (left: string, right: string, leftRowid: string, rightRowid: string) => {
-    const values = columns
-      .map((name) => `typeof(l.${name}) = typeof(r.${name}) AND l.${name} IS r.${name}`)
-      .join(" AND ");
+    // Preserve every comparison leaf while bounding native expression depth.
+    const conjunction = (parts: readonly string[]): string => {
+      const first = parts[0];
+      if (first === undefined) throw new Error("native identity preservation has no columns");
+      if (parts.length === 1) return first;
+      const middle = Math.floor(parts.length / 2);
+      return `(${conjunction(parts.slice(0, middle))} AND ${conjunction(parts.slice(middle))})`;
+    };
+    const values = conjunction(
+      columns.map((name) => `typeof(l.${name}) = typeof(r.${name}) AND l.${name} IS r.${name}`),
+    );
     return `(SELECT count(*) FROM ${left}) = (SELECT count(*) FROM ${right})
 AND NOT EXISTS (SELECT 1 FROM ${left} l LEFT JOIN ${right} r
   ON r.${rightRowid} = l.${leftRowid}
@@ -564,11 +590,11 @@ AND NOT EXISTS (SELECT 1 FROM ${right} r LEFT JOIN ${left} l
     transaction: "owning-single-transaction-with-rollback-on-every-error",
     steps: Object.freeze([
       step("precondition", [
-        `CREATE TEMP TABLE ${assertion}(ok INTEGER PRIMARY KEY);`,
-        `INSERT INTO temp.${assertion}(ok) VALUES (1);`,
+        `CREATE TABLE main.${assertion}(ok INTEGER PRIMARY KEY);`,
+        `INSERT INTO main.${assertion}(ok) VALUES (1);`,
         check(`${LEGACY_READY}
 AND ${noIncomingReferences}
-AND NOT EXISTS (SELECT 1 FROM main.sqlite_schema WHERE name = ${literal(assertion)})
+AND ${assertionReady}
 AND NOT EXISTS (SELECT 1 FROM pragma_foreign_key_check(${literal(TABLE)}, 'main'))`),
       ]),
       step("capture", [
@@ -594,8 +620,9 @@ SELECT original_rowid, ${names} FROM main.${holding};`,
         `DROP TABLE main.${holding};`,
         check(`${OPAQUE_READY}
 AND ${noIncomingReferences}
+AND ${assertionReady}
 AND NOT EXISTS (SELECT 1 FROM pragma_foreign_key_check(${literal(TABLE)}, 'main'))`),
-        `DROP TABLE temp.${assertion};`,
+        `DROP TABLE main.${assertion};`,
       ]),
     ]),
   });

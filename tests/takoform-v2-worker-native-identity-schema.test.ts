@@ -1422,3 +1422,208 @@ for (const parentSpelling of ["TF_V2_WORKER_NATIVE_DELETIONS", "Tf_V2_Worker_Nat
         db.close();
       }
     });
+
+// Portable refusal coverage only. These reserved-looking user names are not
+// native internal objects and confer no native/genuine/schema qualification.
+// The actual native full103 companion remains the owning runtime check.
+for (const referrer of ["_cf_kv_user", "_cf_metadata_user", "_cf_other_user"] as const)
+  test(`native identity catalog: ${referrer} incoming FK is never exempt`, async () => {
+    const db = candidateFixture();
+    try {
+      const sql = createSqliteSql(db);
+      const history = candidateHistory(db);
+      const baseline = candidateState(db);
+      const createReferrer = `CREATE TABLE main."${referrer}" (
+        deletion, source,
+        FOREIGN KEY(deletion, source) REFERENCES ${TABLE}(delete_operation_id, source_operation_id));`;
+      const dropReferrer = `DROP TABLE main."${referrer}";`;
+      db.exec(createReferrer);
+      const withReferrer = candidateState(db);
+      expect(await inspectV2WorkerNativeIdentityDomain(sql)).toBeNull();
+      let failure: unknown;
+      try {
+        applyCandidate(db);
+      } catch (error) {
+        failure = error;
+      }
+      if (!failure || typeof failure !== "object" || !("code" in failure))
+        throw new Error("missing reserved-looking incoming FK refusal");
+      expect(failure.code).toBe("SQLITE_CONSTRAINT_PRIMARYKEY");
+      expect(candidateState(db)).toEqual(withReferrer);
+      expect(withReferrer.inTransaction).toBe(false);
+      assertCandidateCustody(db, history);
+
+      db.exec(dropReferrer);
+      expect(candidateState(db)).toEqual(baseline);
+      expect(await inspectV2WorkerNativeIdentityDomain(sql)).toBe("legacy_v2w52");
+      applyCandidate(db);
+      expect(await inspectV2WorkerNativeIdentityDomain(sql)).toBe("opaque255");
+      const installed = candidateState(db);
+      assertCandidateCustody(db, history);
+
+      db.exec(createReferrer);
+      expect(await inspectV2WorkerNativeIdentityDomain(sql)).toBeNull();
+      db.exec(dropReferrer);
+      expect(candidateState(db)).toEqual(installed);
+      expect(await inspectV2WorkerNativeIdentityDomain(sql)).toBe("opaque255");
+      assertCandidateCustody(db, history);
+    } finally {
+      db.close();
+    }
+  });
+
+// Candidate-owned scratch is never adopted. Both namespaces retain their
+// existing raw catalog/row contents when the precondition refuses.
+for (const occupied of ["main-empty", "main-seeded", "main-trigger", "temp-seeded"] as const)
+  test(`native identity MAIN scratch: ${occupied} collision preserves the complete predecessor`, () => {
+    const db = candidateFixture();
+    try {
+      const history = candidateHistory(db);
+      const schema = occupied === "temp-seeded" ? "temp" : "main";
+      const assertion = "_tf_v2_native_identity_candidate_assert";
+      if (occupied === "main-trigger")
+        db.exec(
+          `CREATE TRIGGER main.${assertion} BEFORE INSERT ON component_unrelated BEGIN SELECT 1; END;`,
+        );
+      else {
+        db.exec(
+          schema === "temp"
+            ? `CREATE TEMP TABLE ${assertion}(ok INTEGER PRIMARY KEY);`
+            : `CREATE TABLE main.${assertion}(ok INTEGER PRIMARY KEY);`,
+        );
+        if (occupied !== "main-empty")
+          db.exec(`INSERT INTO ${schema}.${assertion}(ok) VALUES (1);`);
+      }
+      const before = candidateState(db);
+      const occupiedRows =
+        occupied === "main-trigger"
+          ? []
+          : db.query(`SELECT rowid, ok FROM ${schema}.${assertion}`).values();
+      let failure: unknown;
+      try {
+        applyCandidate(db);
+      } catch (error) {
+        failure = error;
+      }
+      if (!failure || typeof failure !== "object" || !("code" in failure))
+        throw new Error("missing occupied MAIN scratch refusal");
+      expect(failure.code).toBe(
+        occupied === "main-empty" || occupied === "main-seeded"
+          ? "SQLITE_ERROR"
+          : "SQLITE_CONSTRAINT_PRIMARYKEY",
+      );
+      expect(candidateState(db)).toEqual(before);
+      if (occupied !== "main-trigger")
+        expect(db.query(`SELECT rowid, ok FROM ${schema}.${assertion}`).values()).toEqual(
+          occupiedRows,
+        );
+      expect(
+        db.query("SELECT count(*) AS count FROM main.sqlite_schema WHERE name = ?").get(assertion),
+      ).toEqual({ count: schema === "main" ? 1 : 0 });
+      expect(db.inTransaction).toBe(false);
+      assertCandidateCustody(db, history);
+    } finally {
+      db.close();
+    }
+  });
+
+test("native identity MAIN scratch: guarded terminal NOT NULL fault restores all catalog/data and leaves no scratch", async () => {
+  const db = candidateFixture();
+  try {
+    const history = candidateHistory(db);
+    db.exec("CREATE TABLE root102_late_fault(value TEXT NOT NULL);");
+    const before = candidateState(db);
+    expect(before.rows.length).toBeGreaterThan(0);
+    const assertion = "_tf_v2_native_identity_candidate_assert";
+    const terminal = `INSERT INTO main.root102_late_fault(value)
+SELECT NULL WHERE ${v2WorkerNativeIdentityDomainReady("opaque255")}
+AND (SELECT count(*) FROM main.${TABLE}) = ${before.rows.length}
+AND NOT EXISTS (SELECT 1 FROM main.sqlite_schema WHERE name = '${assertion}')
+AND NOT EXISTS (SELECT 1 FROM sqlite_temp_schema WHERE name = '${assertion}');`;
+    const candidate = buildUnregisteredV2WorkerNativeIdentityMigrationCandidate();
+    let failure: unknown;
+    try {
+      applyCandidate(db, [...candidate.statements, terminal]);
+    } catch (error) {
+      failure = error;
+    }
+    if (!failure || typeof failure !== "object" || !("code" in failure))
+      throw new Error("missing post-shape terminal NOT NULL fault");
+    expect(failure.code).toBe("SQLITE_CONSTRAINT_NOTNULL");
+    expect(
+      failure instanceof Error &&
+        /NOT NULL constraint failed: root102_late_fault\.value/u.test(failure.message),
+    ).toBe(true);
+    expect(candidateState(db)).toEqual(before);
+    expect(db.inTransaction).toBe(false);
+    assertCandidateCustody(db, history);
+
+    applyCandidate(db);
+    const after = candidateState(db);
+    expect(after.rows).toEqual(before.rows);
+    expect(after.data).toEqual(before.data);
+    expect(after.temporary).toEqual(before.temporary);
+    expect(after.schema.filter((row) => row.name !== TABLE)).toEqual(
+      before.schema.filter((row) => row.name !== TABLE),
+    );
+    expect(await inspectV2WorkerNativeIdentityDomain(createSqliteSql(db))).toBe("opaque255");
+    expect(
+      db.query("SELECT count(*) AS count FROM main.sqlite_schema WHERE name = ?").get(assertion),
+    ).toEqual({ count: 0 });
+    expect(
+      db.query("SELECT count(*) AS count FROM sqlite_temp_schema WHERE name = ?").get(assertion),
+    ).toEqual({ count: 0 });
+    assertCandidateCustody(db, history);
+  } finally {
+    db.close();
+  }
+});
+
+test("native identity preservation: every held field retains its value and storage class", () => {
+  const reference = candidateFixture();
+  let columns: string[];
+  try {
+    columns = reference
+      .query<{ name: string }, []>(
+        `SELECT name FROM pragma_table_xinfo('${TABLE}', 'main') ORDER BY cid`,
+      )
+      .all()
+      .map(({ name }) => name);
+  } finally {
+    reference.close();
+  }
+  expect(columns).toHaveLength(22);
+  for (const column of columns) {
+    const db = candidateFixture();
+    try {
+      const history = candidateHistory(db);
+      const before = candidateState(db);
+      const field = `"${column.replaceAll('"', '""')}"`;
+      const candidate = buildUnregisteredV2WorkerNativeIdentityMigrationCandidate();
+      // Inject into the actual copied holding row immediately before the first
+      // exact preservation check; the original predecessor must fully return.
+      const changed = [
+        ...candidate.statements.slice(0, 5),
+        `UPDATE main._tf_v2_m0102_native_deletions_holding SET ${field} = CASE
+          WHEN typeof(${field}) = 'null' THEN X'00'
+          WHEN typeof(${field}) = 'blob' THEN CAST(${field} AS TEXT)
+          ELSE CAST(${field} AS BLOB) END WHERE original_rowid = -7;`,
+        ...candidate.statements.slice(5),
+      ];
+      let failure: unknown;
+      try {
+        applyCandidate(db, changed);
+      } catch (error) {
+        failure = error;
+      }
+      if (!failure || typeof failure !== "object" || !("code" in failure))
+        throw new Error("missing held-field preservation refusal");
+      expect(failure.code).toBe("SQLITE_CONSTRAINT_PRIMARYKEY");
+      expect(candidateState(db)).toEqual(before);
+      expect(db.inTransaction).toBe(false);
+      assertCandidateCustody(db, history);
+    } finally {
+      db.close();
+    }
+  }
+});
