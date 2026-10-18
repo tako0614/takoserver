@@ -6,6 +6,8 @@ import { CONTAINER_CONTRACT as C } from "../src/container-contract.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { Sql } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
+import { additiveV2ConfiguredUpdateInputsDDL } from "../src/takoform-v2/configured-update-inputs-schema.ts";
 import {
   createV2ContainerHostAcceptance,
   inspectV2ContainerOwnerSchema,
@@ -18,7 +20,7 @@ import {
   type V2HostAcceptanceContext,
   type V2PreparedHostAcceptance,
 } from "../src/takoform-v2/host-acceptance.ts";
-import type { V2Backend, V2Form } from "../src/takoform-v2/types.ts";
+import { TakoformV2Error, type V2Backend, type V2Form } from "../src/takoform-v2/types.ts";
 import { currentAuditedSchemaMigrations } from "./helpers/audited-schema-fixture.ts";
 
 // These domain-history seeds live ONLY in the five new owned tables, before
@@ -1239,6 +1241,7 @@ async function full100F2ConfiguredContainerEngine(
   wrapSql: (sql: Sql) => Sql = (sql) => sql,
   formUrlOverride?: string,
   requireSensitive = true,
+  mapMode = false,
 ) {
   const { V2_CONTAINER_F2_FORM } = await import("../src/takoform-v2/container-owner-schema.ts");
   const selectedForm = formUrlOverride === undefined ? V2_CONTAINER_F2_FORM : formUrlOverride;
@@ -1250,9 +1253,22 @@ async function full100F2ConfiguredContainerEngine(
   const audited = currentAuditedSchemaMigrations();
   expect(audited.length).toBe(100);
   migrateSqlite(db);
-  const sql = wrapSql(createSqliteSql(db));
+  const baseSql = createSqliteSql(db);
+  if (mapMode) {
+    await baseSql.batch(
+      frameHostMigrationSql(additiveV2ConfiguredUpdateInputsDDL).map((statement) => ({
+        sql: statement,
+      })),
+    );
+    expect(
+      db
+        .query("SELECT name FROM sqlite_master WHERE name = ?")
+        .all("tf_v2_operation_configured_private_inputs").length,
+    ).toBe(1);
+  }
+  const sql = wrapSql(baseSql);
   const privateInputCustody = await f2CorePrivateInputKeys();
-  return sql.batch(v2ContainerOwnerMigrationCandidate()).then(() => {
+  return sql.batch(v2ContainerOwnerMigrationCandidate()).then(async () => {
     const host = createV2ContainerHostAcceptance({
       sql,
       installationId: "test-installation",
@@ -1279,6 +1295,14 @@ async function full100F2ConfiguredContainerEngine(
       envelope:
         | { readonly keyId: string; readonly nonce: string; readonly ciphertext: string }
         | undefined;
+      priorEnvelope:
+        | { readonly keyId: string; readonly nonce: string; readonly ciphertext: string }
+        | undefined;
+      submittedMap: Readonly<Record<string, string>> | undefined;
+      configuredMap: Readonly<Record<string, string>> | undefined;
+      binding:
+        | { form: string; resourceUid: string; operationId: string; generation: number }
+        | undefined;
     } = {
       calls: 0,
       updateCalls: 0,
@@ -1287,7 +1311,116 @@ async function full100F2ConfiguredContainerEngine(
       operationId: undefined,
       resourceUid: undefined,
       envelope: undefined,
+      priorEnvelope: undefined,
+      submittedMap: undefined,
+      configuredMap: undefined,
+      binding: undefined,
     };
+    const mapKey = mapMode
+      ? await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
+          "encrypt",
+          "decrypt",
+        ])
+      : undefined;
+    function requiredNames(spec: Record<string, unknown>): string[] {
+      const names = spec[C.fields.requiredSensitiveVars];
+      if (!Array.isArray(names) || !names.every((name) => typeof name === "string"))
+        throw new TakoformV2Error("invalid_spec", 422);
+      return names;
+    }
+    function validateMap(names: readonly string[], inputs: Readonly<Record<string, string>>): void {
+      if (
+        names.length > 64 ||
+        JSON.stringify([...names].sort()) !== JSON.stringify(Object.keys(inputs).sort()) ||
+        Object.values(inputs).some(
+          (value) =>
+            typeof value !== "string" || [...value].length < 1 || [...value].length > 16384,
+        ) ||
+        new TextEncoder().encode(Object.values(inputs).join("")).length > 65536
+      )
+        throw new TakoformV2Error("invalid_spec", 422);
+    }
+    async function sealMap(input: {
+      form: string;
+      resourceUid: string;
+      operationId: string;
+      generation: number;
+      privateInputs: Readonly<Record<string, string>>;
+    }) {
+      if (!mapKey) throw new Error("map fixture key missing");
+      const binding = {
+        form: input.form,
+        resourceUid: input.resourceUid,
+        operationId: input.operationId,
+        generation: input.generation,
+      };
+      const nonce = crypto.getRandomValues(new Uint8Array(12));
+      const plaintext = new TextEncoder().encode(JSON.stringify(input.privateInputs));
+      try {
+        const ciphertext = await crypto.subtle.encrypt(
+          {
+            name: "AES-GCM",
+            iv: nonce,
+            additionalData: new TextEncoder().encode(JSON.stringify(binding)),
+          },
+          mapKey,
+          plaintext,
+        );
+        const opened = new Uint8Array(
+          await crypto.subtle.decrypt(
+            {
+              name: "AES-GCM",
+              iv: nonce,
+              additionalData: new TextEncoder().encode(JSON.stringify(binding)),
+            },
+            mapKey,
+            ciphertext,
+          ),
+        );
+        try {
+          expect(Array.from(opened)).toEqual(Array.from(plaintext));
+        } finally {
+          opened.fill(0);
+        }
+        const envelope = Object.freeze({
+          keyId: "owner-f2-map-fixture-key",
+          nonce: btoa(String.fromCharCode(...nonce)),
+          ciphertext: btoa(String.fromCharCode(...new Uint8Array(ciphertext))),
+        });
+        sealing.priorEnvelope = sealing.envelope;
+        sealing.envelope = envelope;
+        sealing.binding = binding;
+        sealing.operationId = input.operationId;
+        sealing.resourceUid = input.resourceUid;
+        sealing.calls++;
+        return envelope;
+      } finally {
+        plaintext.fill(0);
+      }
+    }
+    async function openMap(envelope: {
+      readonly keyId: string;
+      readonly nonce: string;
+      readonly ciphertext: string;
+    }) {
+      if (!mapKey || !sealing.binding) throw new Error("map fixture context missing");
+      const opened = new Uint8Array(
+        await crypto.subtle.decrypt(
+          {
+            name: "AES-GCM",
+            iv: Uint8Array.from(atob(envelope.nonce), (c) => c.charCodeAt(0)),
+            additionalData: new TextEncoder().encode(JSON.stringify(sealing.binding)),
+          },
+          mapKey,
+          Uint8Array.from(atob(envelope.ciphertext), (c) => c.charCodeAt(0)),
+        ),
+      );
+      try {
+        return JSON.parse(new TextDecoder().decode(opened)) as Readonly<Record<string, string>>;
+      } finally {
+        opened.fill(0);
+      }
+    }
     const form: V2Form = {
       validateCreate() {},
       validateUpdate() {},
@@ -1300,10 +1433,23 @@ async function full100F2ConfiguredContainerEngine(
             expect(inputs).toBeUndefined();
             return;
           }
+          if (mapMode) {
+            if (inputs === undefined) throw new TakoformV2Error("invalid_spec", 422);
+            validateMap(requiredNames(_spec), inputs);
+            return;
+          }
           if (inputs === undefined || inputs.TOKEN !== "owner-f2-fixture-value")
             throw new TypeError("F2 fixture input unavailable");
         },
         validateUpdate(_previous, _next, inputs) {
+          if (mapMode) {
+            const previousNames = requiredNames(_previous);
+            const nextNames = requiredNames(_next);
+            if (inputs !== undefined) validateMap(nextNames, inputs);
+            else if (nextNames.some((name) => !previousNames.includes(name)))
+              throw new TakoformV2Error("invalid_spec", 422);
+            return;
+          }
           if (inputs !== undefined)
             throw new TypeError("F2 fixture replacement is outside this check");
         },
@@ -1314,6 +1460,12 @@ async function full100F2ConfiguredContainerEngine(
             expect(input.privateInputs).toBeUndefined();
             sealing.emptyCreateCalls++;
             return null;
+          }
+          if (mapMode) {
+            if (input.privateInputs === undefined) throw new TakoformV2Error("invalid_spec", 422);
+            validateMap(requiredNames(input.spec), input.privateInputs);
+            sealing.submittedMap = input.privateInputs;
+            return sealMap({ ...input, privateInputs: input.privateInputs });
           }
           if (
             input.privateInputs === undefined ||
@@ -1374,8 +1526,43 @@ async function full100F2ConfiguredContainerEngine(
             return;
           }
           if (sealing.envelope === undefined) throw new Error("fixture envelope missing");
-          expect(input.configured).toEqual(sealing.envelope);
+          if (mapMode && JSON.stringify(input.configured) !== JSON.stringify(sealing.envelope)) {
+            console.info(
+              JSON.stringify({
+                event: "owner-f2-map-configured-selection",
+                generation: input.generation,
+                matchesPrior:
+                  JSON.stringify(input.configured) === JSON.stringify(sealing.priorEnvelope),
+                isNull: input.configured === null,
+              }),
+            );
+          }
+          if (mapMode)
+            expect(JSON.stringify(input.configured) === JSON.stringify(sealing.envelope)).toBe(
+              true,
+            );
+          else expect(input.configured).toEqual(sealing.envelope);
           sealing.updateCalls++;
+          if (mapMode) {
+            sealing.configuredMap = await openMap(sealing.envelope);
+            sealing.submittedMap = input.privateInputs;
+            if (input.privateInputs !== undefined) {
+              validateMap(requiredNames(input.spec), input.privateInputs);
+              return sealMap({ ...input, privateInputs: input.privateInputs });
+            }
+            const retainedNames = requiredNames(input.spec);
+            const configuredMap = sealing.configuredMap;
+            if (Object.keys(configuredMap).some((name) => !retainedNames.includes(name))) {
+              const projected = Object.freeze(
+                Object.fromEntries(
+                  Object.entries(configuredMap).filter(([name]) => retainedNames.includes(name)),
+                ),
+              );
+              validateMap(retainedNames, projected);
+              return sealMap({ ...input, privateInputs: projected });
+            }
+            return;
+          }
         },
       },
     };
@@ -1512,6 +1699,139 @@ test("genuine F2 full100 nonempty CREATE, retained UPDATE and key-free DELETE", 
         updateCalls: f.sealing.updateCalls,
       }),
     );
+  } finally {
+    db.close();
+  }
+});
+
+test("genuine F2 full100 replaces a complete two-name map through Core and owner", async () => {
+  const db = new Database(":memory:");
+  try {
+    const f = await full100F2ConfiguredContainerEngine(db, undefined, undefined, true, true);
+    const initialMap = Object.freeze({ TOKEN: "fixture-first-alpha", OTHER: "fixture-first-beta" });
+    const replacementMap = Object.freeze({
+      TOKEN: "fixture-next-alpha",
+      OTHER: "fixture-next-beta",
+    });
+    const desired = Object.freeze({
+      ...coreContainerSpec("1".repeat(64)),
+      [C.fields.image]: "registry.example.test/owner/f2@sha256:" + "a".repeat(64),
+      [C.fields.requiredSensitiveVars]: Object.freeze(["TOKEN", "OTHER"]),
+    });
+    const created = await f.engine.acceptCreate({
+      principal: "container-owner-test",
+      key: "f2-map-create-canonical-source",
+      input: {
+        form: f.formUrl,
+        space: "default",
+        name: "f2-map-replace",
+        spec: desired,
+        privateInputs: initialMap,
+      },
+    });
+    const firstEnvelope = f.sealing.envelope;
+    expect(firstEnvelope).toBeDefined();
+    expect(f.sealing.calls).toBe(1);
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const updated = await f.engine.acceptUpdate({
+      principal: "container-owner-test",
+      key: "f2-map-update-canonical-source",
+      uid: created.resourceUid,
+      expectedGeneration: 1,
+      spec: desired,
+      privateInputs: replacementMap,
+    });
+    expect(updated.generation).toBe(2);
+    expect(updated.resourceUid).toBe(created.resourceUid);
+    expect(f.sealing.calls).toBe(2);
+    expect(f.sealing.updateCalls).toBe(1);
+    expect(f.sealing.configuredMap).toEqual(initialMap);
+    expect(f.sealing.submittedMap).toEqual(replacementMap);
+    expect(f.sealing.priorEnvelope).toEqual(firstEnvelope);
+    expect(f.sealing.envelope).not.toEqual(firstEnvelope);
+    expect(f.sealing.binding).toEqual({
+      form: f.formUrl,
+      resourceUid: created.resourceUid,
+      operationId: updated.id,
+      generation: 2,
+    });
+    const state = await containerDeleteSnapshot(db);
+    const rows = Object.values(state.owner).flat();
+    const first = rows.find((row) => row.operation_id === created.id);
+    const second = rows.find((row) => row.operation_id === updated.id);
+    expect(first?.configured_private_inputs_json).toBe(JSON.stringify(firstEnvelope));
+    expect(second?.configured_private_inputs_json).toBe(JSON.stringify(f.sealing.envelope));
+    expect(second?.generation).toBe(2);
+    expect(second?.resource_uid).toBe(created.resourceUid);
+    expect(second?.form_url).toBe(f.formUrl);
+    expect(JSON.stringify(state)).not.toContain("fixture-first-alpha");
+    expect(JSON.stringify(state)).not.toContain("fixture-first-beta");
+    expect(JSON.stringify(state)).not.toContain("fixture-next-alpha");
+    expect(JSON.stringify(state)).not.toContain("fixture-next-beta");
+    expect((await f.engine.runNext())?.status).toBe("failed");
+  } finally {
+    db.close();
+  }
+});
+
+test("genuine F2 full100 rejects a partial map before writes and accepts a complete name addition", async () => {
+  const db = new Database(":memory:");
+  try {
+    const f = await full100F2ConfiguredContainerEngine(db, undefined, undefined, true, true);
+    const desired = Object.freeze({
+      ...coreContainerSpec("1".repeat(64)),
+      [C.fields.image]: "registry.example.test/owner/f2@sha256:" + "a".repeat(64),
+      [C.fields.requiredSensitiveVars]: Object.freeze(["TOKEN"]),
+    });
+    const created = await f.engine.acceptCreate({
+      principal: "container-owner-test",
+      key: "f2-map-add-create-canonical-source",
+      input: {
+        form: f.formUrl,
+        space: "default",
+        name: "f2-map-add",
+        spec: desired,
+        privateInputs: { TOKEN: "fixture-original-alpha" },
+      },
+    });
+    expect((await f.engine.runNext())?.status).toBe("failed");
+    const next = Object.freeze({
+      ...desired,
+      [C.fields.requiredSensitiveVars]: Object.freeze(["TOKEN", "OTHER"]),
+    });
+    const before = await containerDeleteSnapshot(db);
+    await expect(
+      f.engine.acceptUpdate({
+        principal: "container-owner-test",
+        key: "f2-map-add-partial-canonical-source",
+        uid: created.resourceUid,
+        expectedGeneration: 1,
+        spec: next,
+        privateInputs: { TOKEN: "fixture-next-alpha" },
+      }),
+    ).rejects.toMatchObject({ code: "invalid_spec" });
+    expect(await containerDeleteSnapshot(db)).toEqual(before);
+    expect(f.sealing.calls).toBe(1);
+    expect(f.sealing.updateCalls).toBe(0);
+    const added = await f.engine.acceptUpdate({
+      principal: "container-owner-test",
+      key: "f2-map-add-complete-canonical-source",
+      uid: created.resourceUid,
+      expectedGeneration: 1,
+      spec: next,
+      privateInputs: { TOKEN: "fixture-next-alpha", OTHER: "fixture-new-beta" },
+    });
+    expect(added.generation).toBe(2);
+    expect(f.sealing.calls).toBe(2);
+    expect(f.sealing.updateCalls).toBe(1);
+    expect(f.sealing.configuredMap).toEqual({ TOKEN: "fixture-original-alpha" });
+    expect(f.sealing.submittedMap).toEqual({
+      TOKEN: "fixture-next-alpha",
+      OTHER: "fixture-new-beta",
+    });
+    const rows = Object.values((await containerDeleteSnapshot(db)).owner).flat();
+    const acceptance = rows.find((row) => row.operation_id === added.id);
+    expect(acceptance?.configured_private_inputs_json).toBe(JSON.stringify(f.sealing.envelope));
   } finally {
     db.close();
   }
