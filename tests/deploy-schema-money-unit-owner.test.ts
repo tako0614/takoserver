@@ -35,9 +35,11 @@ import {
   type MoneyReviewBinding,
   moneyCutoverBindingDigest,
   moneyUnitCutoverSourcePrefixDigest,
+  prepareIntegrationMoneyHeldSuffix98OriginalUpload,
   readMoneyAggregateDigest,
   readMoneyFrozenDataDigest,
   readMoneyPreimageDigest,
+  runIntegrationMoneyHeldSuffix98FromOriginalUpload,
   runIntegrationMoneyOriginalPreserved100,
   runIntegrationMoneyUnitCutover,
 } from "../scripts/deploy/schema-money-unit-cutover.ts";
@@ -2759,5 +2761,63 @@ describe("converted94 capture native original owner boundary", () => {
       expect(existsSync(join(f.root, "captured94.sql"))).toBe(false);
       expect(existsSync(join(f.root, "captured94.sql.capture.json"))).toBe(false);
     }
+  });
+});
+
+describe("original suffix98 live upload receiver", () => {
+  const invocation = {
+    action: "status" as const,
+    environment: "integration" as const,
+    commit: source,
+    throughMigration: "0098" as const,
+  };
+
+  test("a copied upload receipt cannot replace the original upload graph", async () => {
+    const context = Object.freeze({});
+    const original = { context, selection: Object.freeze({}) };
+    const staleReceipt = Object.freeze({
+      kind: "takoserver.money-inactive-normal-version-upload@v1",
+    });
+    await expect(
+      runIntegrationMoneyHeldSuffix98FromOriginalUpload(
+        invocation,
+        target,
+        {} as MoneyUnitOriginalCutoverOptions,
+        original as never,
+        { context, normalPreparation: {}, receipt: staleReceipt, signingGenesisContribution: {} },
+      ),
+    ).rejects.toThrow();
+  });
+
+  test("a different held context refuses before any native or provider action", async () => {
+    await expect(
+      runIntegrationMoneyHeldSuffix98FromOriginalUpload(
+        invocation,
+        target,
+        {} as MoneyUnitOriginalCutoverOptions,
+        { context: Object.freeze({}), selection: Object.freeze({}) } as never,
+        {
+          context: Object.freeze({}),
+          normalPreparation: {},
+          receipt: {},
+          signingGenesisContribution: {},
+        },
+      ),
+    ).rejects.toThrow("same original live normal upload");
+  });
+
+  test("retained suffix custody refuses the original upload before its producer runs", async () => {
+    await expect(
+      prepareIntegrationMoneyHeldSuffix98OriginalUpload(
+        {
+          custody: {
+            read: async () => ({ state: "dispatched" }),
+            readDispatch: async () => null,
+          },
+        } as unknown as MoneyUnitOriginalCutoverOptions,
+        "/private/unchanged-post94-declaration.json",
+        {},
+      ),
+    ).rejects.toThrow("no upload or resend");
   });
 });

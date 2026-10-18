@@ -55,7 +55,10 @@ import {
   readMigrationArtifact,
 } from "./migrations.ts";
 import { readMoneyNativeTypedCensusDigest } from "./money-native-typed-census.ts";
-import type { MoneyNormalWorkerSigningGenesisContribution } from "./money-normal-worker-version-upload.ts";
+import type {
+  MoneyNormalWorkerOwnedUpload,
+  MoneyNormalWorkerSigningGenesisContribution,
+} from "./money-normal-worker-version-upload.ts";
 import {
   type CommandResult,
   REPOSITORY,
@@ -66,6 +69,7 @@ import {
 import { qualifySource, sealDirectory } from "./qualification.ts";
 import type {
   MoneyUnitHeldPost94ConsumerInputs,
+  MoneyUnitHeldPost94ContextSelection,
   MoneyUnitOriginalCutoverOptions,
 } from "./schema-money-unit-owner.ts";
 import type { MoneyRealmPinContribution, MoneyRealmPinDraftData } from "./stripe-mode-realm.ts";
@@ -5593,6 +5597,99 @@ export async function readIntegrationMoneyOriginalPreserved103Source(
   });
 }
 
+const originalSuffixUploadInputs = new WeakMap<
+  object,
+  {
+    readonly options: MoneyUnitOriginalCutoverOptions;
+    readonly original: MoneyUnitHeldPost94ContextSelection;
+    readonly inputs: MoneyUnitHeldPost94ConsumerInputs;
+  }
+>();
+const originalSuffixContributions = new WeakMap<
+  object,
+  {
+    readonly options: MoneyUnitOriginalCutoverOptions;
+    readonly target: DeployTarget;
+    readonly receipt: unknown;
+    readonly financial: MoneyRealmPinContribution;
+    readonly signing: MoneyNormalWorkerSigningGenesisContribution;
+  }
+>();
+
+/**
+ * Same-process receiving seam for the actual normal-Version upload owner. The
+ * returned upload object carries the original context and preparation by
+ * identity; retained receipt JSON cannot reconstruct either member. The
+ * suffix writer below still validates the live receipt in the upload owner's
+ * WeakMap and requires the exact independent review before dispatch.
+ */
+export async function runIntegrationMoneyHeldSuffix98FromOriginalUpload(
+  invocation: MoneyUnitCutoverInvocation,
+  target: DeployTarget,
+  options: MoneyUnitOriginalCutoverOptions,
+  original: MoneyUnitHeldPost94ContextSelection,
+  upload: unknown,
+): Promise<Record<string, unknown>> {
+  if (
+    !record(upload) ||
+    Reflect.ownKeys(upload).map(String).sort().join(",") !==
+      "context,normalPreparation,receipt,signingGenesisContribution" ||
+    upload.context !== original.context
+  )
+    throw preflightError("money suffix requires the same original live normal upload");
+  const owner = await import("./schema-money-unit-owner.ts");
+  const owned = upload as unknown as MoneyNormalWorkerOwnedUpload;
+  const prior = originalSuffixUploadInputs.get(upload);
+  if (prior !== undefined && (prior.options !== options || prior.original !== original))
+    throw preflightError("money suffix live upload was selected for another original owner");
+  const inputs =
+    prior?.inputs ??
+    (await owner.composeMoneyUnitHeldPost94ConsumerInputs(
+      options,
+      original,
+      owned.normalPreparation,
+    ));
+  await owner.assertMoneyUnitHeldPost94ConsumerInputsOrigin(options, inputs);
+  if (prior === undefined) originalSuffixUploadInputs.set(upload, { options, original, inputs });
+  return runIntegrationMoneyHeldSuffix98(invocation, target, options, inputs, owned.receipt);
+}
+
+/**
+ * Prepares the one original live upload for an operator-private same-process
+ * review. The owning uploader reconstructs and compares its native context
+ * before any upload; its one-shot custody refuses an existing attempt. The
+ * caller must retain the returned object in this process for the status and
+ * reviewed apply calls above. This function never dispatches D1 SQL.
+ */
+export async function prepareIntegrationMoneyHeldSuffix98OriginalUpload(
+  options: MoneyUnitOriginalCutoverOptions,
+  post94DeclarationPath: string,
+  originalUploadRequest: unknown,
+): Promise<{
+  readonly original: MoneyUnitHeldPost94ContextSelection;
+  readonly upload: Readonly<MoneyNormalWorkerOwnedUpload>;
+}> {
+  const owner = await import("./schema-money-unit-owner.ts");
+  if (
+    (await options.custody.read("suffix98")) !== null ||
+    (await options.custody.readDispatch("suffix98")) !== null
+  )
+    throw mutationError("money original suffix already has custody; no upload or resend");
+  const original = await owner.readMoneyUnitHeldPost94ContextSelection(
+    options,
+    post94DeclarationPath,
+  );
+  const uploader = await import("./money-normal-worker-version-upload.ts");
+  const upload = await uploader.uploadMoneyNormalWorkerVersionForOriginalContext(
+    original.context,
+    originalUploadRequest,
+  );
+  if (upload.context !== original.context)
+    throw mutationError("money original upload returned another held context");
+  await owner.assertMoneyUnitHeldPost94SelectionOrigin(original.selection, original.context);
+  return Object.freeze({ original, upload });
+}
+
 /** Sole sealed fixed95–98 import, reached ONLY through both real original producers. */
 export async function runIntegrationMoneyHeldSuffix98(
   invocation: MoneyUnitCutoverInvocation,
@@ -5630,11 +5727,20 @@ export async function runIntegrationMoneyHeldSuffix98(
   if (inputs.selection.phase !== "suffix98")
     throw preflightError("money suffix cannot use a resume selection");
   const financialOwner = await import("./stripe-mode-realm.ts");
+  const selected = originalSuffixContributions.get(inputs);
+  if (
+    selected !== undefined &&
+    (selected.options !== options ||
+      selected.target !== target ||
+      selected.receipt !== normalUploadReceipt)
+  )
+    throw preflightError("money suffix captured original contribution belongs to another owner");
   const financial: MoneyRealmPinContribution =
-    await financialOwner.readMoneyD1StripeRealmPinContribution(
+    selected?.financial ??
+    (await financialOwner.readMoneyD1StripeRealmPinContribution(
       inputs.context,
       inputs.normalWorkerModePreparation,
-    );
+    ));
   await owner.assertMoneyUnitHeldPost94ConsumerInputsOrigin(options, inputs);
   await financialOwner.assertMoneyD1StripeRealmPinContributionCurrent(
     financial,
@@ -5642,17 +5748,28 @@ export async function runIntegrationMoneyHeldSuffix98(
     inputs.normalWorkerModePreparation,
   );
   const signingOwner = await import("./money-normal-worker-version-upload.ts");
-  const signing = await signingOwner.readMoneyNormalWorkerSigningGenesisContribution(
+  const liveSigning = await signingOwner.readMoneyNormalWorkerSigningGenesisContribution(
     inputs.context,
     inputs.normalWorkerModePreparation,
     normalUploadReceipt,
   );
+  if (selected !== undefined && JSON.stringify(liveSigning) !== JSON.stringify(selected.signing))
+    throw preflightError("money suffix original signing contribution changed");
+  const signing = selected?.signing ?? liveSigning;
   await owner.assertMoneyUnitHeldPost94ConsumerInputsOrigin(options, inputs);
   await signingOwner.assertMoneyNormalWorkerSigningGenesisContributionCurrent(
     signing,
     inputs.context,
     inputs.normalWorkerModePreparation,
   );
+  if (selected === undefined)
+    originalSuffixContributions.set(inputs, {
+      options,
+      target,
+      receipt: normalUploadReceipt,
+      financial,
+      signing,
+    });
   const signingBytes = Buffer.from(`${JSON.stringify(signing)}\n`),
     signingGenesisDigest = digest(signingBytes);
   const facts = inputs.context.facts,
