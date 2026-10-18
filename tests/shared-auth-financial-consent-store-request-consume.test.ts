@@ -527,7 +527,7 @@ describe("unmounted actual request capture-to-consume ordered DATA effect", () =
     );
     expect(f.native.batchCalls).toBe(2);
     expect(rows(f.db, O)).toHaveLength(1);
-    f.native.beforeRead = undefined;
+    delete f.native.beforeRead;
     const start = f.native.calls.length;
     const result = await recovery.readOriginalData();
     queryOnly(f, start);

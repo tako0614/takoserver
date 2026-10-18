@@ -664,9 +664,10 @@ function oldWithControl(next: SqlStatement): SqlStatement {
   const start = next.sql.indexOf(marker);
   expect(start > 0).toBe(true);
   expect(next.sql.endsWith(") AS local_original")).toBe(true);
+  const params = next.params;
   return {
     sql: next.sql.slice(start + " FROM (".length, -") AS local_original".length),
-    params: next.params,
+    ...(params === undefined ? {} : { params }),
   };
 }
 function expectQueryOnly(f: Awaited<ReturnType<typeof graphFixture>>) {
