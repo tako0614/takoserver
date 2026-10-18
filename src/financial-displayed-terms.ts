@@ -56,7 +56,11 @@ function detach(input: unknown, code: Code): unknown {
     if (typeof value === "string") {
       const raw = new TextEncoder().encode(value);
       bytes -= raw.length;
-      if (bytes < 0 || new TextDecoder("utf-8", { fatal: true }).decode(raw) !== value) fail(code);
+      if (
+        bytes < 0 ||
+        new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(raw) !== value
+      )
+        fail(code);
       return value;
     }
     if (value === null || typeof value === "boolean") return value;
@@ -400,7 +404,7 @@ export function createFinancialDisplayedTermsSource(input: FinancialDisplayedTer
       if (
         bytes.length < 1 ||
         bytes.length > MAX_TERMS_BYTES ||
-        new TextDecoder("utf-8", { fatal: true }).decode(bytes) !== displayText
+        new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes) !== displayText
       )
         return fail("unavailable");
       const digest = await bytesDigest(bytes);
