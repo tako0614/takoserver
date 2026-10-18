@@ -1319,29 +1319,8 @@ export function createSubscriptionCustody(options: {
       (await byCancelId(intent.id)) ?? fail("subscription_management_unavailable"),
     );
   }
-  async function cancel(
-    org: string,
-    requestKey: string,
-    expectedSubscriptionRef: string,
-  ): Promise<CancellationReceipt> {
-    async function replay(intent: CancelIntent): Promise<CancellationReceipt> {
-      const bound = await association(intent.subscriptionId);
-      if (!bound || (await subscriptionRef(bound)) !== expectedSubscriptionRef)
-        fail("subscription_management_conflict");
-      const current = (
-        await sql.query(
-          "SELECT subscription_id FROM stripe_billing_subscriptions WHERE org_id = ?",
-          [org],
-        )
-      )[0];
-      if (current?.subscription_id !== intent.subscriptionId)
-        fail("subscription_management_conflict");
-      return await resumeCancel(intent);
-    }
-    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(requestKey)) fail("invalid_argument");
-    const key = await hash([org, requestKey]);
-    const existing = await byCancelKey(org, key);
-    if (existing) return await replay(existing);
+  /** Existing fresh legacy cancellation checks. This does not dispatch or allocate an intent. */
+  async function prepareNewCancellation(org: string, key: string, expectedSubscriptionRef: string) {
     const current = (
       await sql.query("SELECT * FROM stripe_billing_subscriptions WHERE org_id = ?", [org])
     )[0];
@@ -1367,6 +1346,32 @@ export function createSubscriptionCustody(options: {
     });
     const verified = await readVerifiedSubscription(bound);
     if (verified.cancelAtPeriodEnd) fail("subscription_management_conflict");
+    return { bound, verified };
+  }
+  async function cancel(
+    org: string,
+    requestKey: string,
+    expectedSubscriptionRef: string,
+  ): Promise<CancellationReceipt> {
+    async function replay(intent: CancelIntent): Promise<CancellationReceipt> {
+      const bound = await association(intent.subscriptionId);
+      if (!bound || (await subscriptionRef(bound)) !== expectedSubscriptionRef)
+        fail("subscription_management_conflict");
+      const current = (
+        await sql.query(
+          "SELECT subscription_id FROM stripe_billing_subscriptions WHERE org_id = ?",
+          [org],
+        )
+      )[0];
+      if (current?.subscription_id !== intent.subscriptionId)
+        fail("subscription_management_conflict");
+      return await resumeCancel(intent);
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(requestKey)) fail("invalid_argument");
+    const key = await hash([org, requestKey]);
+    const existing = await byCancelKey(org, key);
+    if (existing) return await replay(existing);
+    const { bound, verified } = await prepareNewCancellation(org, key, expectedSubscriptionRef);
     const intentId = `smc_${crypto.randomUUID()}`;
     const terms = [
       org,
@@ -1428,6 +1433,80 @@ export function createSubscriptionCustody(options: {
     return await resumeCancel(
       (await byCancelId(intentId)) ?? fail("subscription_management_unavailable"),
     );
+  }
+  /**
+   * NEW-reference legacy preparation DATA. Native GETs, Clock checks and configured
+   * period-term retention may occur. No intent, slot or provider mutation is made.
+   * This observation is not the later cancellation's atomic admission/CAS.
+   */
+  async function prepareCancellationEconomicR1(input: {
+    readonly organizationId: string;
+    readonly reference: string;
+    readonly expectedSubscriptionRef: string;
+  }) {
+    const selected = Object.freeze({
+      organizationId: input.organizationId,
+      reference: input.reference,
+      expectedSubscriptionRef: input.expectedSubscriptionRef,
+    });
+    if (
+      typeof selected.organizationId !== "string" ||
+      !selected.organizationId ||
+      typeof selected.reference !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(selected.reference) ||
+      typeof selected.expectedSubscriptionRef !== "string" ||
+      !/^sra_[0-9a-f]{64}$/u.test(selected.expectedSubscriptionRef)
+    )
+      fail("invalid_argument");
+    const key = await hash([selected.organizationId, selected.reference]);
+    if (await byCancelKey(selected.organizationId, key)) fail("subscription_management_conflict");
+    const { bound } = await prepareNewCancellation(
+      selected.organizationId,
+      key,
+      selected.expectedSubscriptionRef,
+    );
+    const shared = managementGuard({
+      organizationId: selected.organizationId,
+      operation: "cancel",
+      requestKeyDigest: key,
+      subscriptionId: bound.subscriptionId,
+    });
+    const row = (
+      await sql.query(
+        `SELECT a.association_generation FROM stripe_billing_subscriptions s
+       JOIN stripe_billing_associations a ON a.subscription_id=s.subscription_id
+       WHERE s.org_id=? AND s.subscription_id=? AND s.customer_id=?
+       AND s.cancel_at_period_end=0 AND s.status NOT IN ('canceled','incomplete_expired')
+       AND a.org_id=s.org_id AND a.customer_id=s.customer_id
+       AND a.association_generation=(SELECT MAX(association_generation) FROM stripe_billing_associations WHERE org_id=?)
+       AND NOT EXISTS (SELECT 1 FROM stripe_subscription_cancellation_intents WHERE subscription_id=? AND state IN ('prepared','dispatched'))
+       AND (${shared.condition})`,
+        [
+          selected.organizationId,
+          bound.subscriptionId,
+          bound.customerId,
+          selected.organizationId,
+          bound.subscriptionId,
+          ...shared.params,
+        ],
+      )
+    )[0];
+    if (
+      !row ||
+      !Number.isSafeInteger(row.association_generation) ||
+      Number(row.association_generation) < 0
+    )
+      fail("subscription_management_conflict");
+    return Object.freeze({
+      kind: "cancel" as const,
+      expectedSubscriptionRef: selected.expectedSubscriptionRef,
+      targetSubscriptionId: bound.subscriptionId,
+      targetGeneration: Number(row.association_generation),
+      branch: "legacy" as const,
+      pendingReference: null,
+      scheduleId: null,
+      cancelAtPeriodEnd: true as const,
+    });
   }
   async function reconcilePending(): Promise<{
     examined: number;
@@ -1503,6 +1582,7 @@ export function createSubscriptionCustody(options: {
   return {
     begin,
     cancel,
+    prepareCancellationEconomicR1,
     association,
     associateSession,
     subscriptionRef,

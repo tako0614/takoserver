@@ -1,6 +1,7 @@
 import { parseBillingConfig } from "./billing-config.ts";
 import {
   assertHostedBillingFinancialRealm,
+  assertHostedBillingFinancialRealmPersisted,
   type HostedBillingFinancialRealm,
 } from "./hosted-billing-realm.ts";
 import { type HostedPricing, parsePersistedHostedPricing } from "./hosted-pricing.ts";
@@ -37,6 +38,7 @@ import {
 } from "./stripe-on-demand.ts";
 import type { StripeOnDemandFundingProof } from "./stripe-on-demand-verification.ts";
 import {
+  type CancellationEconomicPreparationR1,
   type createSubscriptionPlanChanges,
   type QualifiedSubscriptionPlan,
   type SubscriptionPeriodTerms,
@@ -170,6 +172,20 @@ export interface SubscriptionPayments {
     expectedSubscriptionRef: string;
   }): Promise<CancellationReceipt>;
 }
+/** Retained pricing data for a proposed pre-C0 choice, without displayed terms or consent. */
+export interface SelectedSubscriptionStartEconomicR1 {
+  readonly kind: "subscription-start";
+  readonly planKey: string;
+  readonly pricingRevision: string;
+  readonly priceId: string;
+  readonly priceAmountMinor: number;
+  readonly includedMinor: number;
+  readonly currency: "USD";
+  readonly periodMonths: 1;
+  readonly accountId: string;
+  readonly livemode: false;
+  readonly financialRealm: string;
+}
 export interface StripeBillingSubscriptionExtensionContext {
   readonly sql: Sql;
   readonly clock: Clock;
@@ -182,7 +198,10 @@ export interface StripeBillingSubscriptionExtensionContext {
   planForRevision(planKey: string, pricingRevision: string): Promise<QualifiedSubscriptionPlan>;
 }
 export interface StripeBillingSubscriptionExtensions {
-  readonly plans: ReturnType<typeof createSubscriptionPlanChanges>;
+  readonly plans: Omit<
+    ReturnType<typeof createSubscriptionPlanChanges>,
+    "preparePendingCancellationEconomicR1"
+  >;
   readonly verifyPeriodTerms: ReturnType<typeof createSubscriptionPlanChanges>["verifyPeriodTerms"];
   resolveCurrentTerms(input: {
     readonly association: Association;
@@ -191,6 +210,11 @@ export interface StripeBillingSubscriptionExtensions {
     readonly periodEnd: string;
   }): Promise<SubscriptionPeriodTerms>;
   managementGuard(input: SubscriptionManagementContext): SubscriptionManagementPredicate;
+  prepareCancellationEconomicR1(input: {
+    readonly organizationId: string;
+    readonly reference: string;
+    readonly expectedSubscriptionRef: string;
+  }): Promise<CancellationEconomicPreparationR1>;
   cancel(input: Parameters<SubscriptionPayments["change"]>[0]): Promise<CancellationReceipt>;
 }
 const extensionOrigins = new WeakMap<
@@ -261,6 +285,7 @@ export function createStripeBilling(options: {
   ) => StripeBillingSubscriptionExtensions;
 }) {
   const { client, context, pricing } = options;
+  const qualifiedRealm = options.realm;
   const livemode = (options.mode ?? "test") === "live";
   const { sql, clock } = context;
   const store = options.store ?? createStripeBillingStore({ sql, clock });
@@ -268,15 +293,22 @@ export function createStripeBilling(options: {
   const parsedBilling = parseBillingConfig(pricing.environment.TAKOSERVER_BILLING_CONFIG);
   if (!parsedBilling) throw new StripeBillingError("billing_configuration_invalid");
   const billing = parsedBilling;
+  const selectedPricingJson = canonicalJson(pricing);
+  const qualifiedPriceProofs = pricing.hostedPlanTable.plans
+    .filter((plan): plan is PaidPlan => plan.tier === "subscription")
+    .map((plan) => ({
+      priceId: plan.stripePriceId,
+      monthlyAmountMinor: plan.monthlyAmountMinor,
+    }));
   const onDemand = options.onDemand;
   const cardSetup = options.cardSetup;
   if (onDemand) {
-    if (!options.realm) throw new StripeBillingError("financial_realm_unqualified");
+    if (!qualifiedRealm) throw new StripeBillingError("financial_realm_unqualified");
     assertStripeOnDemandService(onDemand, {
       sql,
       clock,
       client,
-      realm: options.realm,
+      realm: qualifiedRealm,
       store,
       billingConfig: billing,
     });
@@ -288,20 +320,15 @@ export function createStripeBilling(options: {
     ...(cardSetup ? ["checkout.session.expired"] : []),
   ];
   const now = () => clock().toISOString();
-  if ((options.subscriptionExtensions || options.topUpCommandForSession) && !options.realm)
+  if ((options.subscriptionExtensions || options.topUpCommandForSession) && !qualifiedRealm)
     throw new StripeBillingError("financial_realm_unqualified");
-  if (options.realm) {
+  if (qualifiedRealm) {
     if (livemode) throw new StripeBillingError("financial_realm_unqualified");
-    assertHostedBillingFinancialRealm(options.realm, {
+    assertHostedBillingFinancialRealm(qualifiedRealm, {
       sql,
       client,
-      billingAuthority: options.realm.billingAuthority,
-      prices: pricing.hostedPlanTable.plans
-        .filter((plan): plan is PaidPlan => plan.tier === "subscription")
-        .map((plan) => ({
-          priceId: plan.stripePriceId,
-          monthlyAmountMinor: plan.monthlyAmountMinor,
-        })),
+      billingAuthority: qualifiedRealm.billingAuthority,
+      prices: qualifiedPriceProofs,
     });
   }
   let initialization: Promise<void> | undefined;
@@ -407,6 +434,88 @@ export function createStripeBilling(options: {
     if (!parsed || canonicalJson(parsed) !== canonicalJson(snapshot))
       refuse("pricing_revision_conflict");
     return parsed;
+  }
+  /** Read only the already-retained tariff and price identity; ready() would write. */
+  async function selectSubscriptionStartEconomicR1(input: {
+    readonly organizationId: string;
+    readonly reference: string;
+    readonly planKey: string;
+  }): Promise<SelectedSubscriptionStartEconomicR1> {
+    const validRef = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+    if (
+      !input ||
+      typeof input.organizationId !== "string" ||
+      !validRef.test(input.organizationId) ||
+      typeof input.reference !== "string" ||
+      !validRef.test(input.reference)
+    )
+      throw new StripeBillingError("invalid_argument", 400);
+    const realm = qualifiedRealm;
+    if (!realm || livemode) throw new StripeBillingError("financial_realm_unqualified");
+    const plan = paidPlan(pricing, input.planKey);
+    if (!plan) throw new StripeBillingError("unknown_plan", 400);
+    const selectedPlan = Object.freeze({
+      planKey: plan.planId,
+      priceId: plan.stripePriceId,
+      amountMinor: plan.monthlyAmountMinor,
+      includedMinor: plan.includedCreditMinor,
+    });
+    await exists(input.organizationId);
+    try {
+      const retained = await tariff(billing.revision);
+      if (canonicalJson(retained) !== selectedPricingJson)
+        throw new StripeBillingError("pricing_revision_conflict");
+      const exactPlan = paidPlan(retained, selectedPlan.planKey);
+      if (
+        !exactPlan ||
+        exactPlan.stripePriceId !== selectedPlan.priceId ||
+        exactPlan.monthlyAmountMinor !== selectedPlan.amountMinor ||
+        exactPlan.includedCreditMinor !== selectedPlan.includedMinor
+      )
+        throw new StripeBillingError("pricing_revision_conflict");
+      const identities = await sql.query(
+        `SELECT i.plan_key, i.amount_minor, i.included_minor, i.period_months, c.valid
+         FROM stripe_billing_price_identity i
+         JOIN stripe_billing_price_identity_checks c ON c.id=?
+         WHERE i.livemode=? AND i.price_id=?`,
+        [`pricing:${billing.revision}:${selectedPlan.planKey}`, 0, selectedPlan.priceId],
+      );
+      if (
+        identities.length !== 1 ||
+        identities[0]?.plan_key !== selectedPlan.planKey ||
+        identities[0].amount_minor !== selectedPlan.amountMinor ||
+        identities[0].included_minor !== selectedPlan.includedMinor ||
+        identities[0].period_months !== 1 ||
+        identities[0].valid !== 1
+      )
+        throw new StripeBillingError("price_identity_unavailable");
+      try {
+        await assertHostedBillingFinancialRealmPersisted(realm, {
+          sql,
+          client,
+          billingAuthority: realm.billingAuthority,
+          prices: qualifiedPriceProofs,
+        });
+      } catch {
+        throw new StripeBillingError("financial_realm_unqualified");
+      }
+      return Object.freeze({
+        kind: "subscription-start",
+        planKey: selectedPlan.planKey,
+        pricingRevision: billing.revision,
+        priceId: selectedPlan.priceId,
+        priceAmountMinor: selectedPlan.amountMinor,
+        includedMinor: selectedPlan.includedMinor,
+        currency: "USD",
+        periodMonths: 1,
+        accountId: realm.accountId,
+        livemode: false,
+        financialRealm: realm.financialRealm,
+      });
+    } catch (error) {
+      if (error instanceof StripeBillingError) throw error;
+      throw new StripeBillingError("economic_selection_unavailable");
+    }
   }
   async function exists(org: unknown): Promise<string> {
     if (
@@ -1816,6 +1925,8 @@ export function createStripeBilling(options: {
   }
   return {
     subscriptions,
+    selectSubscriptionStartEconomicR1,
+    prepareCancellationEconomicR1: extensions?.prepareCancellationEconomicR1,
     subscriptionPlans: extensions?.plans,
     subscriptionCommandReceipts:
       options.realm && extensions

@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { createHmac } from "node:crypto";
 import sharedPricing from "../config/shared-hosted-pricing.json";
 import type { AiGateway } from "../src/ai-port.ts";
@@ -19,6 +19,7 @@ import { createMetering } from "../src/metering.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import type { OrgUsageWarning } from "../src/org-limit-policy.ts";
 import type { Sql } from "../src/ports.ts";
+import { createStripeBilling } from "../src/stripe-billing.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
 import { createStripeBillingStore } from "../src/stripe-billing-store.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
@@ -1428,4 +1429,556 @@ describe("canonical Hosted financial composition", () => {
       ),
     ).toEqual([{ workspace_ref: "workspace_0" }, { workspace_ref: "workspace_1" }]);
   });
+});
+
+// Data-only pre-C0 choices. These use the actual qualified Financial composition;
+// they do not create an R1 terms body, source registration, consent or payer authority.
+describe("private Financial pre-C0 economic selection", () => {
+  test("top-up reads captured bounds, expiry, revision and realm without a Customer or command", async () => {
+    const f = await financialFixture();
+    const composition = await createCanonicalHostedBillingComposition(f.options);
+    if (!composition.paymentActivation) throw new Error("payment composition absent");
+    const run = spyOn(f.sql, "run"),
+      batch = spyOn(f.sql, "batch");
+    try {
+      const requests = f.requests.length;
+      const selected = await composition.selectTopUpEconomicR1({
+        organizationId: f.organization.id,
+        reference: "pre-c0-topup",
+        amountMinor: 500,
+      });
+      expect(selected).toEqual({
+        kind: "topup",
+        amountMinor: 500,
+        currency: "USD",
+        pricingRevision: f.options.billingConfig.revision,
+        purchaseCreditExpiry: f.options.billingConfig.purchaseCreditExpiry,
+        minimumMinor: 50,
+        maximumMinor: 10000,
+        accountId: f.options.realm.accountId,
+        livemode: false,
+        financialRealm: f.options.realm.financialRealm,
+      });
+      expect(Object.isFrozen(selected)).toBe(true);
+      expect(Object.isFrozen(selected.purchaseCreditExpiry)).toBe(true);
+      await expect(
+        composition.selectTopUpEconomicR1({
+          organizationId: f.organization.id,
+          reference: "too-small",
+          amountMinor: 49,
+        }),
+      ).rejects.toMatchObject({ code: "invalid_argument" });
+      await expect(
+        composition.selectTopUpEconomicR1({
+          organizationId: f.organization.id,
+          reference: "too-large",
+          amountMinor: 10001,
+        }),
+      ).rejects.toMatchObject({ code: "invalid_argument" });
+      expect(run).not.toHaveBeenCalled();
+      expect(batch).not.toHaveBeenCalled();
+      expect(f.customers.size).toBe(0);
+      expect(f.sessions.size).toBe(0);
+      expect(f.requests.length).toBe(requests);
+      expect(await f.sql.query("SELECT count(*) AS n FROM stripe_top_up_commands")).toEqual([
+        { n: 0 },
+      ]);
+    } finally {
+      run.mockRestore();
+      batch.mockRestore();
+    }
+  });
+
+  test("subscription start requires retained tariff and identity, then returns the exact paid plan without writes", async () => {
+    const f = await financialFixture();
+    const composition = await createCanonicalHostedBillingComposition(f.options);
+    if (!composition.paymentActivation) throw new Error("payment composition absent");
+    const assembly = composition.createPayments({
+      sql: f.sql,
+      clock: f.options.clock,
+      credit: async () => {
+        throw new Error("credit forbidden");
+      },
+      creditedFunding: async () => new Set<string>(),
+    });
+    const paid = f.options.pricing.hostedPlanTable.plans.find(
+      (plan) => plan.tier === "subscription",
+    );
+    if (!paid || paid.tier !== "subscription") throw new Error("paid plan absent");
+    const input = {
+      organizationId: f.organization.id,
+      reference: "pre-c0-start",
+      planKey: paid.planId,
+    };
+    await expect(assembly.selectSubscriptionStartEconomicR1(input)).rejects.toMatchObject({
+      code: "economic_selection_unavailable",
+    });
+    await assembly.subscriptionCustody.read(f.organization.id); // Existing readiness owns seeding.
+    const run = spyOn(f.sql, "run"),
+      batch = spyOn(f.sql, "batch");
+    try {
+      const requests = f.requests.length;
+      const selected = await assembly.selectSubscriptionStartEconomicR1(input);
+      expect(selected).toEqual({
+        kind: "subscription-start",
+        planKey: paid.planId,
+        pricingRevision: f.options.billingConfig.revision,
+        priceId: paid.stripePriceId,
+        priceAmountMinor: paid.monthlyAmountMinor,
+        includedMinor: paid.includedCreditMinor,
+        currency: "USD",
+        periodMonths: 1,
+        accountId: f.options.realm.accountId,
+        livemode: false,
+        financialRealm: f.options.realm.financialRealm,
+      });
+      expect(Object.isFrozen(selected)).toBe(true);
+      await expect(
+        assembly.selectSubscriptionStartEconomicR1({ ...input, planKey: "free" }),
+      ).rejects.toMatchObject({ code: "unknown_plan" });
+      expect(run).not.toHaveBeenCalled();
+      expect(batch).not.toHaveBeenCalled();
+      expect(f.customers.size).toBe(0);
+      expect(f.sessions.size).toBe(0);
+      expect(f.requests.length).toBe(requests);
+      expect(
+        await f.sql.query("SELECT count(*) AS n FROM stripe_subscription_checkout_intents"),
+      ).toEqual([{ n: 0 }]);
+    } finally {
+      run.mockRestore();
+      batch.mockRestore();
+    }
+  });
+
+  test("missing or corrupt persisted pricing and price identity fail closed", async () => {
+    const f = await financialFixture();
+    const composition = await createCanonicalHostedBillingComposition(f.options);
+    if (!composition.paymentActivation) throw new Error("payment composition absent");
+    const assembly = composition.createPayments({
+      sql: f.sql,
+      clock: f.options.clock,
+      credit: async () => {
+        throw new Error("credit forbidden");
+      },
+      creditedFunding: async () => new Set<string>(),
+    });
+    const paid = f.options.pricing.hostedPlanTable.plans.find(
+      (plan) => plan.tier === "subscription",
+    );
+    if (!paid || paid.tier !== "subscription") throw new Error("paid plan absent");
+    const input = {
+      organizationId: f.organization.id,
+      reference: "pre-c0-guard",
+      planKey: paid.planId,
+    };
+    await assembly.subscriptionCustody.read(f.organization.id);
+    await f.sql.run("DELETE FROM stripe_billing_price_identity_checks WHERE id=?", [
+      `pricing:${f.options.billingConfig.revision}:${paid.planId}`,
+    ]);
+    await expect(assembly.selectSubscriptionStartEconomicR1(input)).rejects.toMatchObject({
+      code: "price_identity_unavailable",
+    });
+    await f.sql.run("INSERT INTO stripe_billing_price_identity_checks (id, valid) VALUES (?, 1)", [
+      `pricing:${f.options.billingConfig.revision}:${paid.planId}`,
+    ]);
+    await f.sql.run(
+      "UPDATE stripe_billing_price_identity SET amount_minor=amount_minor+1 WHERE livemode=0 AND price_id=?",
+      [paid.stripePriceId],
+    );
+    await expect(assembly.selectSubscriptionStartEconomicR1(input)).rejects.toMatchObject({
+      code: "price_identity_unavailable",
+    });
+    await f.sql.run(
+      "UPDATE stripe_billing_price_identity SET amount_minor=amount_minor-1 WHERE livemode=0 AND price_id=?",
+      [paid.stripePriceId],
+    );
+    expect(await assembly.selectSubscriptionStartEconomicR1(input)).toMatchObject({
+      kind: "subscription-start",
+      priceId: paid.stripePriceId,
+    });
+    await f.sql.run("UPDATE stripe_billing_pricing SET config_json='{}' WHERE revision=?", [
+      f.options.billingConfig.revision,
+    ]);
+    await expect(assembly.selectSubscriptionStartEconomicR1(input)).rejects.toMatchObject({
+      code: "economic_selection_unavailable",
+    });
+    expect(f.customers.size).toBe(0);
+    expect(f.sessions.size).toBe(0);
+  });
+
+  test("a changed durable account realm cannot be projected as the captured Financial realm", async () => {
+    const f = await financialFixture();
+    const composition = await createCanonicalHostedBillingComposition(f.options);
+    if (!composition.paymentActivation) throw new Error("payment composition absent");
+    const assembly = composition.createPayments({
+      sql: f.sql,
+      clock: f.options.clock,
+      credit: async () => {
+        throw new Error("credit forbidden");
+      },
+      creditedFunding: async () => new Set<string>(),
+    });
+    await assembly.subscriptionCustody.read(f.organization.id);
+    const paid = f.options.pricing.hostedPlanTable.plans.find(
+      (plan) => plan.tier === "subscription",
+    );
+    if (!paid || paid.tier !== "subscription") throw new Error("paid plan absent");
+    await f.sql.run("DROP TRIGGER stripe_billing_account_realms_no_update");
+    // The row is still equal; loss of its canonical immutability guard alone refuses.
+    await expect(
+      composition.selectTopUpEconomicR1({
+        organizationId: f.organization.id,
+        reference: "missing-guard",
+        amountMinor: 500,
+      }),
+    ).rejects.toMatchObject({ code: "unavailable" });
+    await expect(
+      assembly.selectSubscriptionStartEconomicR1({
+        organizationId: f.organization.id,
+        reference: "missing-guard",
+        planKey: paid.planId,
+      }),
+    ).rejects.toMatchObject({ code: "financial_realm_unqualified" });
+    await f.sql.run("UPDATE stripe_billing_account_realms SET account_id='acct_foreign'");
+    await expect(
+      composition.selectTopUpEconomicR1({
+        organizationId: f.organization.id,
+        reference: "foreign-realm",
+        amountMinor: 500,
+      }),
+    ).rejects.toMatchObject({ code: "unavailable" });
+    await expect(
+      assembly.selectSubscriptionStartEconomicR1({
+        organizationId: f.organization.id,
+        reference: "foreign-realm",
+        planKey: paid.planId,
+      }),
+    ).rejects.toMatchObject({ code: "financial_realm_unqualified" });
+  });
+
+  test("subscription selection returns the pre-await price ID when the exposed plan changes during the identity read", async () => {
+    const f = await financialFixture();
+    const pricing = structuredClone(f.options.pricing);
+    const billing = createStripeBilling({
+      client: f.options.client,
+      pricing,
+      realm: f.options.realm,
+      mode: "test",
+      consoleOrigin: f.options.consoleOrigin,
+      context: {
+        sql: f.sql,
+        clock: f.options.clock,
+        credit: async () => {
+          throw new Error("credit forbidden");
+        },
+        creditedFunding: async () => new Set<string>(),
+      },
+    });
+    const paid = billing.subscriptions.planTable.plans.find((plan) => plan.tier === "subscription");
+    if (!paid || paid.tier !== "subscription") throw new Error("paid plan absent");
+    const input = {
+      organizationId: f.organization.id,
+      reference: "awaited-plan",
+      planKey: paid.planId,
+    };
+    await billing.subscriptions.read(f.organization.id); // Existing writer prepares persisted readiness.
+    const expected = await billing.selectSubscriptionStartEconomicR1(input);
+    const originalQueryMethod = f.sql.query;
+    const originalQuery = originalQueryMethod.bind(f.sql);
+    let entered!: () => void, release!: () => void;
+    const queryEntered = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const queryGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    f.sql.query = async (query, params) => {
+      if (query.includes("FROM stripe_billing_price_identity i")) {
+        entered();
+        await queryGate;
+      }
+      return await originalQuery(query, params);
+    };
+    try {
+      const pending = billing.selectSubscriptionStartEconomicR1(input);
+      await Promise.race([
+        queryEntered,
+        pending.then(
+          () => {
+            throw new Error("price identity read was not reached");
+          },
+          (error: unknown) => {
+            throw error;
+          },
+        ),
+      ]);
+      // This is the exposed planTable object held by the same actual billing instance.
+      (paid as { stripePriceId: string }).stripePriceId = "price_foreign_after_capture";
+      release();
+      expect(await pending).toEqual(expected);
+    } finally {
+      release();
+      f.sql.query = originalQueryMethod;
+    }
+  });
+
+  test("the constructor's genuine realm survives an options replacement by a same-pin shape DTO", async () => {
+    const f = await financialFixture();
+    const originalRealm = f.options.realm;
+    const options = {
+      client: f.options.client,
+      pricing: f.options.pricing,
+      realm: originalRealm,
+      mode: "test" as const,
+      consoleOrigin: f.options.consoleOrigin,
+      context: {
+        sql: f.sql,
+        clock: f.options.clock,
+        credit: async () => {
+          throw new Error("credit forbidden");
+        },
+        creditedFunding: async () => new Set<string>(),
+      },
+    };
+    const billing = createStripeBilling(options);
+    const paid = billing.subscriptions.planTable.plans.find((plan) => plan.tier === "subscription");
+    if (!paid || paid.tier !== "subscription") throw new Error("paid plan absent");
+    await billing.subscriptions.read(f.organization.id);
+    const input = {
+      organizationId: f.organization.id,
+      reference: "original-realm",
+      planKey: paid.planId,
+    };
+    const expected = await billing.selectSubscriptionStartEconomicR1(input);
+    const forgedDto = { ...originalRealm, financialRealm: "realm:forged" } as typeof originalRealm;
+    options.realm = forgedDto; // Negative fixture: same visible pin, absent WeakMap origin.
+    expect(() => createStripeBilling(options)).toThrow();
+    expect(await billing.selectSubscriptionStartEconomicR1(input)).toEqual(expected);
+    expect((await billing.selectSubscriptionStartEconomicR1(input)).financialRealm).toBe(
+      originalRealm.financialRealm,
+    );
+  });
+});
+
+describe("private Financial card-setup economic DATA selection", () => {
+  // Same explicit test-only policy values as the owning on-demand composition
+  // fixture; this is neither a runtime default nor new disclosure text.
+  function operatorConfiguration() {
+    return {
+      terms: {
+        termsRevision: "on-demand-composition-terms-v1",
+        consentRevision: "on-demand-composition-consent-v1",
+        currency: "USD",
+        validity: {
+          validFrom: "2026-10-01T00:00:00.000Z",
+          validUntil: "2026-11-01T00:00:00.000Z",
+        },
+        replenishment: {
+          trigger: "eligible-credit-deficit",
+          rule: "ceil-deficit-to-quantum-with-minimum",
+          fundingQuantumMinor: 25,
+          minimumChargeMinor: 50,
+          maximumChargeMinor: 1000,
+        },
+        cashCapBounds: { minimumMinor: 50, maximumMinor: 10000 },
+        purchaseCreditExpiry: { kind: "none" },
+      },
+      cardSetupReturnUrls: {
+        successUrl: "https://console.example.test/wallet/card-saved",
+        cancelUrl: "https://console.example.test/wallet/card-canceled",
+      },
+      setupDisclosureRevision: "save-card-composition-v1",
+    };
+  }
+
+  test("selects original captured disclosure and terms without Customer, command, clock or processor effects", async () => {
+    const f = await financialFixture();
+    const configuration = operatorConfiguration();
+    let clockCalls = 0;
+    const composition = await createCanonicalHostedBillingComposition({
+      ...f.options,
+      clock: () => {
+        clockCalls++;
+        return f.options.clock();
+      },
+      onDemand: configuration,
+    });
+    if (!composition.paymentActivation || !composition.onDemand)
+      throw new Error("on-demand payment composition absent");
+    const originalTerms = composition.onDemand.readTerms();
+    const originalDisclosure = composition.setupDisclosureRevision;
+    if (typeof originalDisclosure !== "string")
+      throw new Error("original setup disclosure revision absent");
+    // The original service and configuration are captured by the constructor;
+    // later caller mutation must not select another economic disclosure.
+    configuration.terms.termsRevision = "replaced-terms";
+    configuration.setupDisclosureRevision = "replaced-disclosure";
+    const run = spyOn(f.sql, "run"),
+      batch = spyOn(f.sql, "batch");
+    const requests = f.requests.length,
+      clocks = clockCalls;
+    try {
+      const selected = await composition.selectCardSetupEconomicR1();
+      expect(selected).toEqual({
+        kind: "card-setup",
+        setupDisclosureRevision: originalDisclosure,
+        onDemandTermsRevision: originalTerms.termsRevision,
+      });
+      expect(selected).toEqual({
+        kind: "card-setup",
+        setupDisclosureRevision: "save-card-composition-v1",
+        onDemandTermsRevision: "on-demand-composition-terms-v1",
+      });
+      expect(Object.isFrozen(selected)).toBe(true);
+      expect(run).not.toHaveBeenCalled();
+      expect(batch).not.toHaveBeenCalled();
+      expect(f.requests.length).toBe(requests);
+      expect(clockCalls).toBe(clocks);
+      expect(f.customers.size).toBe(0);
+      expect(f.sessions.size).toBe(0);
+      expect(await f.sql.query("SELECT * FROM stripe_billing_card_setup_commands")).toEqual([]);
+      expect(await f.sql.query("SELECT * FROM stripe_billing_customer_commands")).toEqual([]);
+      expect(composition.status.launchReady).toBe(false);
+      expect(composition.status.postpaid).toBe(false);
+    } finally {
+      run.mockRestore();
+      batch.mockRestore();
+    }
+  });
+
+  test("absence of explicit on-demand configuration refuses before reading storage or processor", async () => {
+    const f = await financialFixture();
+    const composition = await createCanonicalHostedBillingComposition(f.options);
+    if (!composition.paymentActivation) throw new Error("payment composition absent");
+    const query = spyOn(f.sql, "query"),
+      run = spyOn(f.sql, "run"),
+      batch = spyOn(f.sql, "batch");
+    const requests = f.requests.length;
+    try {
+      await expect(composition.selectCardSetupEconomicR1()).rejects.toMatchObject({
+        code: "unavailable",
+      });
+      expect(query).not.toHaveBeenCalled();
+      expect(run).not.toHaveBeenCalled();
+      expect(batch).not.toHaveBeenCalled();
+      expect(f.requests.length).toBe(requests);
+    } finally {
+      query.mockRestore();
+      run.mockRestore();
+      batch.mockRestore();
+    }
+  });
+
+  test("configuration getters cannot supply selected terms and a substituted service cannot qualify an app", async () => {
+    const f = await financialFixture();
+    let getters = 0;
+    const query = spyOn(f.sql, "query");
+    try {
+      for (const key of ["terms", "setupDisclosureRevision"]) {
+        const configuration = operatorConfiguration();
+        Object.defineProperty(configuration, key, {
+          enumerable: true,
+          get() {
+            getters++;
+            throw new Error("caller getter must not run");
+          },
+        });
+        await expect(
+          createCanonicalHostedBillingComposition({ ...f.options, onDemand: configuration }),
+        ).rejects.toThrow("must be explicit");
+      }
+      expect(query).not.toHaveBeenCalled();
+      expect(getters).toBe(0);
+    } finally {
+      query.mockRestore();
+    }
+    const composition = await createCanonicalHostedBillingComposition({
+      ...f.options,
+      onDemand: operatorConfiguration(),
+    });
+    if (!composition.paymentActivation) throw new Error("payment composition absent");
+    const substituted = Object.create(composition);
+    Object.defineProperty(substituted, "onDemand", {
+      get() {
+        getters++;
+        throw new Error("substituted service must not qualify");
+      },
+    });
+    expect(() =>
+      buildApp({
+        ...f.ports,
+        billingConfig: f.options.billingConfig,
+        hostedBilling: substituted as HostedBillingComposition,
+      }),
+    ).toThrow("does not belong");
+    expect(getters).toBe(0);
+    expect(await composition.selectCardSetupEconomicR1()).toEqual({
+      kind: "card-setup",
+      setupDisclosureRevision: "save-card-composition-v1",
+      onDemandTermsRevision: "on-demand-composition-terms-v1",
+    });
+  });
+
+  test("loss of the retained realm immutability guard refuses without native recovery or writes", async () => {
+    const f = await financialFixture();
+    const composition = await createCanonicalHostedBillingComposition({
+      ...f.options,
+      onDemand: operatorConfiguration(),
+    });
+    if (!composition.paymentActivation) throw new Error("payment composition absent");
+    await f.sql.run("DROP TRIGGER stripe_billing_account_realms_no_update");
+    const run = spyOn(f.sql, "run"),
+      batch = spyOn(f.sql, "batch");
+    const requests = f.requests.length;
+    try {
+      await expect(composition.selectCardSetupEconomicR1()).rejects.toMatchObject({
+        code: "unavailable",
+      });
+      expect(run).not.toHaveBeenCalled();
+      expect(batch).not.toHaveBeenCalled();
+      expect(f.requests.length).toBe(requests);
+      expect(f.customers.size).toBe(0);
+      expect(f.sessions.size).toBe(0);
+    } finally {
+      run.mockRestore();
+      batch.mockRestore();
+    }
+  });
+});
+
+test("canonical assembly carries both complete cancellation and plan DATA preparations without creating an absent target", async () => {
+  const f = await financialFixture();
+  const composition = await createCanonicalHostedBillingComposition(f.options);
+  if (!composition.paymentActivation) throw new Error("payment composition absent");
+  const assembly = composition.createPayments({
+    sql: f.sql,
+    clock: f.options.clock,
+    credit: async () => {
+      throw new Error("economic DATA cannot grant credit");
+    },
+    creditedFunding: async () => new Set<string>(),
+  });
+  const target = {
+    organizationId: f.organization.id,
+    reference: "combined-plan-selection",
+    expectedSubscriptionRef: `sra_${"0".repeat(64)}`,
+  };
+  const requests = f.requests.length;
+  await expect(
+    assembly.preparePlanChangeEconomicR1({ ...target, planKey: "hosted-50" }),
+  ).rejects.toMatchObject({ code: "subscription_management_not_found" });
+  await expect(
+    assembly.prepareCancellationEconomicR1({ ...target, reference: "combined-cancel-selection" }),
+  ).rejects.toMatchObject({ code: "subscription_management_not_found" });
+  for (const table of [
+    "stripe_billing_plan_changes",
+    "stripe_billing_plan_change_slots",
+    "stripe_billing_plan_change_steps",
+    "stripe_subscription_cancellation_intents",
+    "stripe_subscription_checkout_intents",
+  ])
+    expect(await f.sql.query(`SELECT COUNT(*) AS count FROM ${table}`)).toEqual([{ count: 0 }]);
+  expect(f.customers.size).toBe(0);
+  expect(f.sessions.size).toBe(0);
+  expect(f.requests.slice(requests).filter((request) => request.method !== "GET")).toEqual([]);
 });

@@ -624,6 +624,42 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain"],
   },
   {
+    // These exact genesis modules use only portable domain and core inputs.
+    name: "domain",
+    match: /^src\/shared-financial-source-genesis-(?:admission|schema)\.ts$/u,
+    may: ["core", "domain"],
+  },
+  {
+    // This exact composition joins retained custody with the SQL-origin adapter.
+    name: "app",
+    match: /^src\/shared-financial-retained-r1\.ts$/u,
+    may: ["core", "domain", "adapter"],
+  },
+  {
+    // Consent codecs and the unregistered history leaf use portable domain ports.
+    name: "domain",
+    match: /^src\/shared-auth-financial-consent-(?:contract|schema-plan)\.ts$/u,
+    may: ["core", "domain"],
+  },
+  {
+    // This exact DATA store consumes the existing request-origin composition.
+    name: "app",
+    match: /^src\/shared-auth-financial-consent-store\.ts$/u,
+    may: ["core", "domain", "app"],
+  },
+  {
+    // Exact displayed terms join existing R1 app DATA with core/domain tariff facts.
+    name: "app",
+    match: /^src\/financial-displayed-terms\.ts$/u,
+    may: ["core", "domain", "app"],
+  },
+  {
+    // Canonical R1 selection binds app DATA sources without adapter authority.
+    name: "app",
+    match: /^src\/financial-r1-selection-source\.ts$/u,
+    may: ["core", "domain", "app"],
+  },
+  {
     // Retained history storage is separate from its qualified runtime issuer.
     name: "domain",
     match: /^src\/shared-financial-customer-history\.ts$/u,

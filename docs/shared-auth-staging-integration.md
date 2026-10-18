@@ -266,3 +266,71 @@ does not exercise and reject redirects for every authenticated operation.
 Protocol references: [OpenID Connect Core ID Token validation](https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation),
 [OAuth client authentication](https://www.rfc-editor.org/rfc/rfc6749.html#section-2.3.1),
 and [OAuth security best current practice](https://www.rfc-editor.org/rfc/rfc9700.html).
+
+
+## Explicit action-consent data modules
+
+`shared-auth-financial-consent-contract.ts`,
+`shared-auth-financial-consent-schema-plan.ts` and
+`shared-auth-financial-consent-store.ts` provide unmounted consent data
+interfaces. The schema leaf is unnumbered and unregistered: three append-only
+tables and their preservation constraints do not install a migration or enable
+a login, billing or consent route. These modules have no package-barrel or
+HTTP export.
+
+The contract parser binds the complete action, original challenge, selected
+terms reference and digest, selected Organization/Workspace, RP session facts
+and independent consent issuer. A consent reference is opaque. The consent
+issuer's registration and incarnation are separate from challenge and identity
+proof registrations. The consent digest covers its versioned core; custody of
+the complete canonical original bytes has a separate digest. Neither identity
+proof metadata nor matching digests establish explicit human consent or the
+origin of selected terms. No identity-proof reference is reused as a consent
+proof reference. The durable leaf applies its narrower text and byte limits
+without truncating or converting a larger codec value.
+
+The store exposes the following data operations:
+
+- `createSharedAuthFinancialConsentOriginalReader(...).readOriginal(command)`
+  loads exact immutable fullcommand and same-row mandatory receipt custody.
+  Only positively complete absence returns `undefined`; pending-only,
+  command-only, partial/corrupt rows and query failures cannot establish absence
+  or permission to send again. Historical custody remains readable after expiry
+  or retirement and does not imply current permission.
+- `createSharedAuthFinancialConsentLocalCurrentnessReader(...)` checks local
+  SQL predicates after loading that same historical original. A local nonmatch
+  is data, not a grant to issue a new command.
+- `captureSharedAuthFinancialConsentRequestCommandData(...)` connects an actual
+  captured request Sql write to the exact command postimage check.
+  `captureAndConsumeSharedAuthFinancialConsentRequestOriginalData(...)` orders
+  that write, its successful actual acknowledgement, the guarded original and
+  mandatory-receipt INSERT, its exact postimage check and original fullcommand
+  GET on the same captured request graph and Sql receiver.
+- `createSharedAuthFinancialConsentRequestCommandRecovery(...)` retains the
+  original fullcommand and exposes only `readOriginalData()`. Unknown outcomes
+  never create another key, change family, retry a write or authorize a consume
+  from an ambiguous command-only row.
+
+The ordered effect detaches the full input before its first await, validates
+the original recipe and both fixed statement builders before its first write,
+and rechecks the actual graph and method identities around awaited operations.
+Only that invocation's actual one-row command acknowledgement reaches consume.
+The consume result must have the exact fourteen returned columns, matching
+whole original bytes and mandatory receipt, and an actual affected count of
+one. A caller-constructed matching postimage proves data equality only.
+Capture and consume remain two separate Money permit transactions; the whole
+sequence is not atomic. A crash or acknowledgement loss can leave command-only
+custody that cannot be safely resumed. Repeating the low-level function is not
+a first-attempt, never-dispatched or new-command authorization protocol.
+
+An actual affirmative confirmation and pending producer, qualified retained
+credential plus distinct human binding, qualified Clock/current admission,
+coherent original Financial action and displayed R1 terms, and the genuine
+current consent verifier remain separate integration work. Retained credential
+Workspace and the selected financial Workspace remain distinct facts. Final
+Financial payer/class/source checks and the same-primary command CAS still
+belong in the actual owning mutation. No field, local origin assertion,
+standalone SELECT, remote boolean or opaque proof DTO supplies those missing
+authorities. In-memory synthetic fixtures exercise local mechanics; they do
+not qualify actual D1, schema enrollment, a real issuer or a staged payment
+journey.
