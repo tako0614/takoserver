@@ -58,6 +58,10 @@ import {
   parseRuntimeInputKeyAuthority,
   parseRuntimeInputSealKeyRing,
 } from "./runtime-input-seal-keyring.ts";
+import {
+  createFinancialActionConsentR1Reader,
+  readFinancialActionConsentR1RequestCaptures,
+} from "./shared-financial-retained-r1.ts";
 import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
 import { parseStrictJson } from "./strict-json.ts";
@@ -483,8 +487,13 @@ function hasSelectedV2PrivateInputHooks(
 export interface WorkerEntryOptions {
   /** Code-only isolated shared-login composition; every invocation gets one fresh primary. */
   readonly sharedAuthStaging?: WorkerSharedAuthStaging;
-  /** Code-only post-graph data observer; no source qualification or dispatch authority. */
-  readonly observeSharedAuthRequest?: (connection: WorkerRequestSql) => void | Promise<void>;
+  /** Code-only post-graph data observer; HTTP gets its actual Request and source factory. */
+  readonly observeSharedAuthRequest?: (
+    connection: WorkerRequestSql,
+    request?: Request,
+    createReader?: typeof createFinancialActionConsentR1Reader,
+    readRequestCaptures?: typeof readFinancialActionConsentR1RequestCaptures,
+  ) => void | Promise<void>;
   /** Operator code only; no request or environment field selects the composer. */
   readonly composeV2Forms?: WorkerEntryV2FormComposer;
   /** Operator code only; omission or an undefined result leaves origin acceptance unselected. */
@@ -1537,6 +1546,9 @@ async function composeApp(
   return app;
 }
 
+/** Preserve the existing code-literal source selection for private entry composition. */
+export { auth103NativeSourceCodeSelected };
+
 /** Cache only entries without a request-owned Sql/issuer composition. */
 export function createWorkerEntry(options: WorkerEntryOptions = {}) {
   const composeV2Forms = options.composeV2Forms;
@@ -1611,7 +1623,10 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
     starts.set(env, started);
     return started;
   };
-  const observeRequest = async (connection: WorkerRequestSql | undefined): Promise<void> => {
+  const observeRequest = async (
+    connection: WorkerRequestSql | undefined,
+    request?: Request,
+  ): Promise<void> => {
     if (observeSharedAuthRequest === undefined) return;
     if (
       typeof observeSharedAuthRequest !== "function" ||
@@ -1625,7 +1640,14 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
     try {
       // This validates the actual purpose and completed graph before any observer.
       const inputs = readWorkerRequestFinancialInputs(connection);
-      await observeSharedAuthRequest(connection);
+      if (request === undefined) await observeSharedAuthRequest(connection);
+      else
+        await observeSharedAuthRequest(
+          connection,
+          request,
+          createFinancialActionConsentR1Reader,
+          readFinancialActionConsentR1RequestCaptures,
+        );
       if (readWorkerRequestFinancialInputs(connection) !== inputs)
         throw new TypeError("shared-login request input origin changed during observation");
     } catch (error) {
@@ -1690,7 +1712,7 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
           connection,
         );
         assertSelectedNativeRequest(connection);
-        if (observeSharedAuthRequest !== undefined) await observeRequest(connection);
+        if (observeSharedAuthRequest !== undefined) await observeRequest(connection, request);
         assertSelectedNativeRequest(connection);
       } catch (error) {
         return workerStartupFailureResponse(error);

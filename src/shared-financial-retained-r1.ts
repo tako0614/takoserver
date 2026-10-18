@@ -3,6 +3,7 @@ import { sharedRpCredentialCurrentness } from "./credential-authority-class.ts";
 import {
   assertWorkerRequestFinancialAuthConsumerPort,
   captureWorkerRequestFinancialAuthRpRequest,
+  type FinancialAuthRpRequestCaptures,
   financialAuthConsumerSourceCurrentness,
   readWorkerRequestFinancialAuthConsumerContext,
   readWorkerRequestFinancialAuthConsumerPort,
@@ -2245,6 +2246,50 @@ export interface FinancialActionConsentR1Original {
   readonly fullCommandJson: string;
 }
 
+export interface FinancialActionConsentR1Reader {
+  readRetainedActionConsentR1(challengeRef: string): Promise<FinancialActionConsentR1Original>;
+}
+
+const actionConsentRequestOriginals = new WeakMap<
+  FinancialActionConsentR1Original,
+  {
+    readonly connection: WorkerRequestSql;
+    readonly request: Request;
+    readonly workspaceId: string;
+    readonly reader: FinancialActionConsentR1Reader;
+    readonly captures: FinancialAuthRpRequestCaptures;
+    readonly assertOriginal: () => void;
+  }
+>();
+
+/** Recover only the actual Root captures used for this exact successful R1
+ * result. This static origin read performs no observer, SQL, Clock or write.
+ * Historical origin is not current consent, NEW admission or dispatch permission. */
+export function readFinancialActionConsentR1RequestCaptures(
+  connection: WorkerRequestSql,
+  request: Request,
+  selectedWorkspaceId: string,
+  reader: unknown,
+  original: unknown,
+): FinancialAuthRpRequestCaptures {
+  try {
+    if (!original || typeof original !== "object") fail("unavailable");
+    const held = actionConsentRequestOriginals.get(original as FinancialActionConsentR1Original);
+    if (
+      !held ||
+      held.connection !== connection ||
+      held.request !== request ||
+      held.workspaceId !== selectedWorkspaceId ||
+      held.reader !== reader
+    )
+      fail("unavailable");
+    held.assertOriginal();
+    return held.captures;
+  } catch (error) {
+    return fail("unavailable", error);
+  }
+}
+
 /** Owning composition supplies its actual registered request connection and
  * Request. No credential/human/Clock/qualifier callback or SQL is accepted.
  * The DATA-only store's same-named method deliberately remains unavailable. */
@@ -2252,15 +2297,28 @@ export function createFinancialActionConsentR1Reader(
   connection: WorkerRequestSql,
   request: Request,
   selectedWorkspaceId: string,
-): Readonly<{
-  readRetainedActionConsentR1(challengeRef: string): Promise<FinancialActionConsentR1Original>;
-}> {
+): Readonly<FinancialActionConsentR1Reader> {
   const workspaceId = ref(selectedWorkspaceId);
   try {
     const inputs = readWorkerRequestFinancialInputs(connection);
     const port = readWorkerRequestFinancialAuthConsumerPort(connection);
     if (!port) fail("unavailable");
     const context = readWorkerRequestFinancialAuthConsumerContext(connection, port);
+    const query = Object.getOwnPropertyDescriptor(inputs.sql, "query");
+    const credentialReader = Object.getOwnPropertyDescriptor(port, "readValidatedCredential");
+    const principalReader = Object.getOwnPropertyDescriptor(port, "readValidatedPrincipalBinding");
+    if (
+      !query ||
+      !("value" in query) ||
+      typeof query.value !== "function" ||
+      !credentialReader ||
+      !("value" in credentialReader) ||
+      typeof credentialReader.value !== "function" ||
+      !principalReader ||
+      !("value" in principalReader) ||
+      typeof principalReader.value !== "function"
+    )
+      fail("unavailable");
     const assertOriginal = () => {
       assertWorkerRequestFinancialAuthConsumerPort(connection, port);
       if (
@@ -2270,7 +2328,12 @@ export function createFinancialActionConsentR1Reader(
         context.writerEpoch !== inputs.writerEpoch ||
         readWorkerRequestFinancialInputs(connection) !== inputs ||
         readWorkerRequestFinancialAuthConsumerPort(connection) !== port ||
-        readWorkerRequestFinancialAuthConsumerContext(connection, port) !== context
+        readWorkerRequestFinancialAuthConsumerContext(connection, port) !== context ||
+        Object.getOwnPropertyDescriptor(inputs.sql, "query")?.value !== query.value ||
+        Object.getOwnPropertyDescriptor(port, "readValidatedCredential")?.value !==
+          credentialReader.value ||
+        Object.getOwnPropertyDescriptor(port, "readValidatedPrincipalBinding")?.value !==
+          principalReader.value
       )
         fail("unavailable");
     };
@@ -2296,7 +2359,7 @@ export function createFinancialActionConsentR1Reader(
       }
       return originalCaptures;
     };
-    return Object.freeze({
+    const reader: Readonly<FinancialActionConsentR1Reader> = Object.freeze({
       async readRetainedActionConsentR1(
         challengeRef: string,
       ): Promise<FinancialActionConsentR1Original> {
@@ -2317,7 +2380,10 @@ export function createFinancialActionConsentR1Reader(
           // RP cannot start an affirmative confirmation from absent, partial,
           // or unknown history. The original historical GET stays separate.
           if (retained.status !== "found") fail("unavailable");
-          return freeze({
+          const captured = await captures;
+          assertOriginal();
+          if (!captured) fail("unavailable");
+          const original = freeze({
             original: retained.original,
             actionIdentity: retained.actionIdentity,
             selectedTerms: retained.original.selectedTerms,
@@ -2329,11 +2395,44 @@ export function createFinancialActionConsentR1Reader(
             fullCommand: retained.fullCommand,
             fullCommandJson: retained.fullCommandJson,
           });
+          const assertCaptures = () => {
+            assertOriginal();
+            const credential = port.readValidatedCredential(captured.credential);
+            const human = port.readValidatedPrincipalBinding(captured.userBinding);
+            const rp = readWorkerRequestRetainedRpCapture(connection, captured.credential);
+            assertOriginal();
+            if (
+              !rp ||
+              credential.backend !== "shared-rp-session" ||
+              credential.record !== rp.record ||
+              credential.current !== rp.current ||
+              rp.record.class !== "official-shared-rp-session" ||
+              rp.finalSession.selectedWorkspaceId !== workspaceId ||
+              rp.selectedScope.workspaceId !== workspaceId ||
+              rp.selectedScope.organizationId !== original.scopeRealm.organizationId ||
+              rp.selectedScope.workspaceRef !== original.scopeRealm.workspaceRef ||
+              rp.finalSession.principalId !== human.binding.principalId ||
+              rp.record.origin.principalId !== human.binding.principalId ||
+              rp.record.origin.principalIncarnation !== human.binding.principalIncarnation
+            )
+              fail("unavailable");
+          };
+          assertCaptures();
+          actionConsentRequestOriginals.set(original, {
+            connection,
+            request,
+            workspaceId,
+            reader,
+            captures: captured,
+            assertOriginal: assertCaptures,
+          });
+          return original;
         } catch (error) {
           return fail("unavailable", error);
         }
       },
     });
+    return reader;
   } catch (error) {
     return fail("unavailable", error);
   }

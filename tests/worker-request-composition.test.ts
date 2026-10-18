@@ -27,6 +27,10 @@ import type { Clock, SqlParam, SqlStatement, SqlWrite } from "../src/ports.ts";
 import { createRouter } from "../src/router.ts";
 import { SHARED_AUTH_STAGING_PROFILE } from "../src/shared-auth-oidc-client.ts";
 import { createSharedAuthSessionStore } from "../src/shared-auth-session-store.ts";
+import {
+  createFinancialActionConsentR1Reader,
+  readFinancialActionConsentR1RequestCaptures,
+} from "../src/shared-financial-retained-r1.ts";
 import { createSharedPrincipalAuthorityStore } from "../src/shared-principal-authority.ts";
 import type { D1DatabaseLike, D1ResultLike, D1StatementLike } from "../src/sql-d1.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
@@ -660,15 +664,26 @@ describe("post-graph shared-auth request observation", () => {
       entered = resolve;
     });
     const requests: ReturnType<typeof readWorkerRequestFinancialInputs>[] = [];
+    const actualRequests: (Request | undefined)[] = [];
+    const factories: (typeof createFinancialActionConsentR1Reader | undefined)[] = [];
+    const captureReaders: (typeof readFinancialActionConsentR1RequestCaptures | undefined)[] = [];
     let replacementCalls = 0;
     const options = {
       sharedAuthStaging: f.profile,
-      async observeSharedAuthRequest(connection: WorkerRequestSql) {
+      async observeSharedAuthRequest(
+        connection: WorkerRequestSql,
+        request?: Request,
+        createReader?: typeof createFinancialActionConsentR1Reader,
+        readRequestCaptures?: typeof readFinancialActionConsentR1RequestCaptures,
+      ) {
         const inputs = financialRequestOrigin.readWorkerRequestFinancialInputs(connection);
         expect(inputs.sql).toBe(connection.sql);
         expect(inputs.writerEpoch).toBe(WRITER);
         expect(Object.isFrozen(connection)).toBe(true);
         requests.push(inputs);
+        actualRequests.push(request);
+        factories.push(createReader);
+        captureReaders.push(readRequestCaptures);
         if (requests.length === 1) {
           entered();
           await barrier;
@@ -680,12 +695,11 @@ describe("post-graph shared-auth request observation", () => {
       replacementCalls += 1;
     };
     let settled = false;
-    const first = entry
-      .fetch(new Request(`${SHARED_AUTH_STAGING_PROFILE.publicOrigin}/auth/oidc/login`), f.env)
-      .then((response) => {
-        settled = true;
-        return response;
-      });
+    const firstRequest = new Request(`${SHARED_AUTH_STAGING_PROFILE.publicOrigin}/auth/oidc/login`);
+    const first = entry.fetch(firstRequest, f.env).then((response) => {
+      settled = true;
+      return response;
+    });
     try {
       await Promise.race([
         observed,
@@ -700,17 +714,24 @@ describe("post-graph shared-auth request observation", () => {
       ]);
       release();
       expect((await first).status).toBe(303);
-      expect(
-        (
-          await entry.fetch(
-            new Request(`${SHARED_AUTH_STAGING_PROFILE.publicOrigin}/auth/oidc/login`),
-            f.env,
-          )
-        ).status,
-      ).toBe(303);
+      const secondRequest = new Request(
+        `${SHARED_AUTH_STAGING_PROFILE.publicOrigin}/auth/oidc/login`,
+      );
+      expect((await entry.fetch(secondRequest, f.env)).status).toBe(303);
       await entry.scheduled({}, f.env);
       expect(processor.paths.filter((path) => path === "/v1/checkout/sessions")).toHaveLength(1);
       expect(requests).toHaveLength(3);
+      expect(actualRequests).toEqual([firstRequest, secondRequest, undefined]);
+      expect(factories).toEqual([
+        createFinancialActionConsentR1Reader,
+        createFinancialActionConsentR1Reader,
+        undefined,
+      ]);
+      expect(captureReaders).toEqual([
+        readFinancialActionConsentR1RequestCaptures,
+        readFinancialActionConsentR1RequestCaptures,
+        undefined,
+      ]);
       expect(f.sessions).toHaveLength(3);
       expect(requests[0]?.sql).not.toBe(requests[1]?.sql);
       expect(requests[1]?.sql).not.toBe(requests[2]?.sql);
