@@ -112,7 +112,7 @@ function r1Value(value: unknown, depth = 0, ancestors = new Set<object>()): unkn
     const bytes = new TextEncoder().encode(value);
     if (
       bytes.length > MAX_COMMAND_BYTES ||
-      new TextDecoder("utf-8", { fatal: true }).decode(bytes) !== value
+      new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes) !== value
     )
       fail("invalid_request");
     return value;
@@ -650,7 +650,7 @@ async function parseCaptured(input: FinancialR1WriteCommand, c: Captured): Promi
   )
     fail("invalid_request");
   try {
-    const decoded = new TextDecoder("utf-8", { fatal: true }).decode(termBytes);
+    const decoded = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(termBytes);
     const roundTrip = new TextEncoder().encode(decoded);
     if (
       roundTrip.length !== termBytes.length ||
