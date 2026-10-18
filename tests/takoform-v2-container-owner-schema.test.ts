@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { v2ContainerOwnerMigrationCandidate } from "../scripts/deploy/v2-container-owner-migration-candidate.ts";
 import { CONTAINER_CONTRACT as C } from "../src/container-contract.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
+import { createMoneyCutoverSql } from "../src/money-cutover-sql.ts";
 import type { Sql } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
@@ -13,6 +14,7 @@ import {
   createV2ContainerHostAcceptance,
   inspectV2ContainerOwnerSchema,
   V2_CONTAINER_OWNER_RECIPE as recipe,
+  V2_CONTAINER_F2_FORM,
   V2_CONTAINER_OWNER_READY,
 } from "../src/takoform-v2/container-owner-schema.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
@@ -486,6 +488,81 @@ test("compiler seals exact Sql/context and captures fixed source bytes without I
   expect(() => redeemV2HostAcceptance(prepared!, noIO, { ...c })).toThrow();
   expect(() => redeemV2HostAcceptance({} as V2PreparedHostAcceptance, noIO, c)).toThrow();
   expect(issue.prepare(context({ form: "https://other.invalid/form/" }))).toBeUndefined();
+});
+
+test("F2 CREATE UPDATE and DELETE readiness reaches the actual Money guarded batch", async () => {
+  let rawBatches = 0;
+  const raw: Sql = {
+    ...noIO,
+    async batch(statements) {
+      rawBatches++;
+      expect(statements).toHaveLength(3);
+      throw new Error("F2 guard reached raw batch");
+    },
+  };
+  const sql = createMoneyCutoverSql(raw, `sha256:${"a".repeat(64)}`);
+  const issue = issuer(sql);
+  const create = Object.freeze(context({ form: V2_CONTAINER_F2_FORM }));
+  const update = Object.freeze(
+    context({
+      form: V2_CONTAINER_F2_FORM,
+      action: "update",
+      generation: 2,
+    }),
+  );
+  const deletion = Object.freeze({
+    ...context({ form: V2_CONTAINER_F2_FORM }),
+    action: "delete" as const,
+    generation: 2,
+    referencesJson: null,
+  });
+  const cases = [
+    { context: create, prepared: await issue.prepare(create), scope: [create.resourceUid] },
+    {
+      context: update,
+      prepared: await issue.prepare(update),
+      scope: [
+        update.resourceUid,
+        "installation",
+        update.principal,
+        update.space,
+        update.name,
+        update.form,
+        "backend",
+        "target",
+        1,
+      ],
+    },
+    {
+      context: deletion,
+      prepared: await issue.prepareDelete!(deletion),
+      scope: [
+        deletion.resourceUid,
+        "installation",
+        deletion.principal,
+        deletion.space,
+        deletion.name,
+        deletion.form,
+        "backend",
+        "target",
+        1,
+      ],
+    },
+  ];
+  for (const [index, entry] of cases.entries()) {
+    if (!entry.prepared) throw new TypeError("F2 acceptance missing");
+    const fixed = redeemV2HostAcceptance(entry.prepared, sql, entry.context);
+    const guardParams = fixed.guard.params;
+    if (!guardParams) throw new TypeError("F2 guard bindings missing");
+    await expect(
+      sql.batch([{ sql: `SELECT 1 WHERE (${fixed.guard.sql})`, params: guardParams }]),
+    ).rejects.toThrow("F2 guard reached raw batch");
+    expect(rawBatches).toBe(index + 1);
+    expect(guardParams[0]).toBe(
+      JSON.stringify(recipe.objects.map(({ type, name, table, sql }) => [type, name, table, sql])),
+    );
+    expect(guardParams.slice(1)).toEqual(entry.scope);
+  }
 });
 
 test("frozen0.1 compiler rejects sensitive/private custody but preserves validated true egress", async () => {
@@ -2095,27 +2172,34 @@ test("genuine F2 empty CREATE map retains accepted UPDATE material through omitt
           );
           if (!admission?.params) throw new TypeError("missing owner admission guard");
           omittedAdmissionParams = admission.params.length;
+          const retainedMarker = "AND EXISTS (SELECT 1 FROM main.tf_v2_container_acceptances prior";
+          const retainedLocation = admission.sql.indexOf(retainedMarker);
+          if (retainedLocation < 0) throw new TypeError("missing retained material guard");
+          const retainedBindingStart = [...admission.sql.slice(0, retainedLocation)].filter(
+            (character) => character === "?",
+          ).length;
+          expect(admission.params[retainedBindingStart]).toBe(2);
           const check = async (index?: number, value?: string | number) => {
             const params = [...admission.params!];
             if (index !== undefined) params[index] = value!;
             return (await original.query(admission.sql, params)).length === 1;
           };
           guardProbes.valid = await check();
-          // Offsets after the fixed instance scope target the retained proof.
-          for (const [name, index, value] of [
-            ["resource", 10, "other-resource"],
-            ["future", 11, 2],
-            ["installation", 12, "other-installation"],
-            ["principal", 13, "other-principal"],
-            ["space", 14, "other-space"],
-            ["name", 15, "other-name"],
-            ["form", 16, C.formUrl],
-            ["backend", 17, "other-backend"],
-            ["target", 18, "other-target"],
-            ["currentGeneration", 19, 1],
-            ["undeclaredName", 20, '["TOKEN","OTHER"]'],
+          // The retained proof's first binding follows the captured SQL prefix.
+          for (const [name, offset, value] of [
+            ["resource", 1, "other-resource"],
+            ["future", 2, 2],
+            ["installation", 3, "other-installation"],
+            ["principal", 4, "other-principal"],
+            ["space", 5, "other-space"],
+            ["name", 6, "other-name"],
+            ["form", 7, C.formUrl],
+            ["backend", 8, "other-backend"],
+            ["target", 9, "other-target"],
+            ["currentGeneration", 10, 1],
+            ["undeclaredName", 11, '["TOKEN","OTHER"]'],
           ] as const)
-            guardProbes[name] = await check(index, value);
+            guardProbes[name] = await check(retainedBindingStart + offset, value);
         }
       }
       return original.batch(statements);
@@ -2186,7 +2270,7 @@ test("genuine F2 empty CREATE map retains accepted UPDATE material through omitt
       currentGeneration: false,
       undeclaredName: false,
     });
-    expect(omittedAdmissionParams).toBe(22);
+    expect(omittedAdmissionParams).toBe(23);
     expect(maxBatchParams).toBeLessThanOrEqual(100);
     expect((await f.engine.runNext())?.status).toBe("failed");
     const repeated = await f.engine.acceptUpdate({
@@ -2358,7 +2442,7 @@ test("genuine F2 retained 64-name map stays below the Host SQL binding cap", asy
       spec: named,
     });
     expect(omitted.generation).toBe(3);
-    expect(omittedGuardBindings).toBe(22);
+    expect(omittedGuardBindings).toBe(23);
     expect(omittedMaxStatementBindings).toBeLessThanOrEqual(100);
     expect(
       db

@@ -701,15 +701,16 @@ export function createV2ContainerHostAcceptance(options: {
           ]
         : [];
       const guard: SqlStatement = {
-        sql: `${V2_CONTAINER_OWNER_READY} AND (${
+        sql: `${runtimeReady} AND (${
           c.action === "create"
             ? `NOT EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ?)`
             : `EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
             AND principal = ? AND space = ? AND name = ? AND form_url = ? AND backend_id = ? AND target_key = ?
             AND desired_generation = ? AND retired_at_ms IS NULL)`
         })${retainedMaterialGuard}`,
-        params:
-          c.action === "create"
+        params: [
+          ...runtimeReadyParams,
+          ...(c.action === "create"
             ? [c.resourceUid]
             : [
                 c.resourceUid,
@@ -722,7 +723,8 @@ export function createV2ContainerHostAcceptance(options: {
                 targetKey,
                 c.generation - 1,
                 ...retainedMaterialParams,
-              ],
+              ]),
+        ],
       };
       // If Core accepted op.id, this INSERT MUST run and its guard MUST abort a
       // mismatch. Only a genuine normal refusal (no op.id) produces zero rows.
@@ -813,10 +815,11 @@ export function createV2ContainerHostAcceptance(options: {
       if (typeof workload !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(workload))
         throw new TypeError("invalid Container F2 workload revision");
       const guard: SqlStatement = {
-        sql: `${V2_CONTAINER_OWNER_READY} AND (${`EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
+        sql: `${runtimeReady} AND (${`EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
             AND principal = ? AND space = ? AND name = ? AND form_url = ? AND backend_id = ? AND target_key = ?
             AND desired_generation = ? AND retired_at_ms IS NULL)`})`,
         params: [
+          ...runtimeReadyParams,
           c.resourceUid,
           installationId,
           c.principal,
