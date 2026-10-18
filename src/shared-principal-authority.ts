@@ -423,6 +423,69 @@ export function sharedPrincipalCurrentness(
   });
 }
 
+/** Fixed original storage recipe. Inputs remain DATA, never RP/human proof. */
+function freshSharedPlan(input: FreshSharedPrincipal) {
+  const principalId = authAuthorityText(input.principalId);
+  const incarnation = authAuthorityText(input.principalIncarnation, 256);
+  const createdAt = authAuthorityTime(input.createdAt);
+  const origin = evidence(input.origin);
+  const selected = initial(input.binding);
+  const guard = anchorMatch({
+    principalId,
+    incarnation,
+    kind: "shared-account",
+    subject: selected.ref,
+    createdAt,
+    origin,
+    originKind: "fresh-shared",
+    enrolledAt: selected.enrolledAt,
+  });
+  const statements = Object.freeze([
+    statement(
+      `INSERT INTO principals (id,provider,provider_subject,email,display_name,created_at)
+          VALUES (?,'shared-account',?,NULL,NULL,?)`,
+      [principalId, selected.ref, createdAt],
+    ),
+    statement(
+      `INSERT INTO auth_principal_incarnations
+          (principal_id,principal_incarnation,identity_kind,identity_subject,principal_created_at,
+           origin_kind,origin_ref,origin_digest,enrolled_at)
+          VALUES (?,?,'shared-account',?,?,'fresh-shared',?,?,?)`,
+      [
+        principalId,
+        incarnation,
+        selected.ref,
+        createdAt,
+        origin.ref,
+        origin.digest,
+        selected.enrolledAt,
+      ],
+    ),
+    bindingInsert(principalId, incarnation, "fresh-shared", selected, null, guard),
+  ]);
+  return Object.freeze({ principalId, incarnation, createdAt, origin, selected, statements });
+}
+
+/** Detached, exact INSERT RETURNING rows; not a current/installed or genuine human grant. */
+interface FreshSharedStoragePostimages {
+  readonly principal: Readonly<Row>;
+  readonly anchor: PrincipalAnchor;
+  readonly binding: SharedPrincipalBinding;
+}
+
+function exactReturnedRow(row: Row | undefined, expected: Readonly<Row>): Readonly<Row> {
+  if (!row || Object.keys(row).sort().join("\0") !== Object.keys(expected).sort().join("\0"))
+    throw new AuthAuthorityStoreError("unavailable");
+  const retained: Row = {};
+  for (const key of Object.keys(expected)) {
+    const descriptor = Object.getOwnPropertyDescriptor(row, key);
+    if (!descriptor || !("value" in descriptor) || descriptor.value !== expected[key])
+      throw new AuthAuthorityStoreError("unavailable");
+    retained[key] = descriptor.value;
+  }
+  return Object.freeze(retained);
+}
+
 /**
  * Fixed-Sql retained writer/reader for a future genuine Auth issuer. Its inputs
  * are storage constraints, not proof of identity. This module has no route,
@@ -470,45 +533,87 @@ export function createSharedPrincipalAuthorityStore(options: { readonly sql: Sql
       return rows[0] ? bindingFrom(rows[0]) : null;
     },
     async createFresh(input: FreshSharedPrincipal): Promise<SharedPrincipalBinding> {
-      const principalId = authAuthorityText(input.principalId);
-      const incarnation = authAuthorityText(input.principalIncarnation, 256);
-      const createdAt = authAuthorityTime(input.createdAt);
-      const origin = evidence(input.origin);
-      const selected = initial(input.binding);
-      const guard = anchorMatch({
-        principalId,
-        incarnation,
-        kind: "shared-account",
-        subject: selected.ref,
-        createdAt,
-        origin,
-        originKind: "fresh-shared",
-        enrolledAt: selected.enrolledAt,
+      const plan = freshSharedPlan(input);
+      await batch(sql, plan.statements);
+      return await requireBinding(plan.selected.ref);
+    },
+    /** Storage-only source seam for the future named Root issuer. The real RP
+     * original-capture assertion and qualified Root context are still required.
+     * RETURNING is an INSERT snapshot, not a replacement for final currentness.
+     * Invalid/unknown ACK after a commit must not trigger a resend or reselect.
+     */
+    async createFreshWithPostimages(
+      input: FreshSharedPrincipal,
+    ): Promise<FreshSharedStoragePostimages> {
+      const plan = freshSharedPlan(input);
+      const result = await sql.batch(
+        plan.statements.map((original) =>
+          Object.freeze({
+            sql: `${original.sql} RETURNING *`,
+            ...(original.params === undefined ? {} : { params: original.params }),
+          }),
+        ),
+      );
+      const principalWrite = result[0];
+      const anchorWrite = result[1];
+      const bindingWrite = result[2];
+      if (result.length !== 3 || !principalWrite || !anchorWrite || !bindingWrite)
+        throw new AuthAuthorityStoreError("unavailable");
+      if (
+        [principalWrite, anchorWrite, bindingWrite].some(
+          (write) =>
+            !Number.isSafeInteger(write.changes) || write.changes <= 0 || write.rows.length !== 1,
+        )
+      )
+        throw new AuthAuthorityStoreError("unavailable");
+      const principal = exactReturnedRow(principalWrite.rows[0], {
+        id: plan.principalId,
+        provider: "shared-account",
+        provider_subject: plan.selected.ref,
+        email: null,
+        display_name: null,
+        created_at: plan.createdAt,
       });
-      await batch(sql, [
-        statement(
-          `INSERT INTO principals (id,provider,provider_subject,email,display_name,created_at)
-          VALUES (?,'shared-account',?,NULL,NULL,?)`,
-          [principalId, selected.ref, createdAt],
-        ),
-        statement(
-          `INSERT INTO auth_principal_incarnations
-          (principal_id,principal_incarnation,identity_kind,identity_subject,principal_created_at,
-           origin_kind,origin_ref,origin_digest,enrolled_at)
-          VALUES (?,?,'shared-account',?,?,'fresh-shared',?,?,?)`,
-          [
-            principalId,
-            incarnation,
-            selected.ref,
-            createdAt,
-            origin.ref,
-            origin.digest,
-            selected.enrolledAt,
-          ],
-        ),
-        bindingInsert(principalId, incarnation, "fresh-shared", selected, null, guard),
-      ]);
-      return await requireBinding(selected.ref);
+      const anchorRow = exactReturnedRow(anchorWrite.rows[0], {
+        principal_id: plan.principalId,
+        principal_incarnation: plan.incarnation,
+        identity_kind: "shared-account",
+        identity_subject: plan.selected.ref,
+        principal_created_at: plan.createdAt,
+        origin_kind: "fresh-shared",
+        origin_ref: plan.origin.ref,
+        origin_digest: plan.origin.digest,
+        identity_authority_body: null,
+        identity_authority_digest: null,
+        enrolled_at: plan.selected.enrolledAt,
+        state: "active",
+        terminal_reason: null,
+        terminal_at: null,
+        terminal_ref: null,
+      });
+      const bindingRow = exactReturnedRow(bindingWrite.rows[0], {
+        binding_ref: plan.selected.ref,
+        issuer: plan.selected.issuer,
+        subject: plan.selected.subject,
+        controller_incarnation: plan.selected.controllerIncarnation,
+        principal_id: plan.principalId,
+        principal_incarnation: plan.incarnation,
+        target_ref: plan.selected.targetRef,
+        binding_kind: "fresh-shared",
+        evidence_ref: plan.selected.evidence.ref,
+        evidence_digest: plan.selected.evidence.digest,
+        previous_binding_ref: null,
+        enrolled_at: plan.selected.enrolledAt,
+        state: "active",
+        terminal_reason: null,
+        terminal_at: null,
+        terminal_ref: null,
+      });
+      return Object.freeze({
+        principal,
+        anchor: await anchorFrom(anchorRow),
+        binding: bindingFrom(bindingRow),
+      });
     },
     async bindLegacy(input: ProvedLegacyPrincipal): Promise<SharedPrincipalBinding> {
       const principalId = authAuthorityText(input.principalId);

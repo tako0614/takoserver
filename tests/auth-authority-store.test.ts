@@ -1498,3 +1498,216 @@ test("Auth authority legacy creation text is retained byte-for-byte without inve
     { created_at: originalText },
   ]);
 });
+
+// Source-only storage companion coverage. No original RP capture, installed
+// target, qualified Clock or genuine human is created by these synthetic inputs.
+test("Auth fresh postimages retain the original three SQL recipes and full returned rows", async () => {
+  const old = fixture();
+  const current = fixture();
+  const batches: (readonly SqlStatement[])[] = [];
+  const wrapped = (f: ReturnType<typeof fixture>): Sql => ({
+    query: f.sql.query.bind(f.sql),
+    run: f.sql.run.bind(f.sql),
+    async batch(statements) {
+      batches.push(statements);
+      return await f.sql.batch(statements);
+    },
+  });
+  const input = fresh("postimages");
+  await createSharedPrincipalAuthorityStore({ sql: wrapped(old) }).createFresh(input);
+  const retained = await createSharedPrincipalAuthorityStore({
+    sql: wrapped(current),
+  }).createFreshWithPostimages(input);
+  const original = batches[0];
+  const returning = batches[1];
+  if (!original || !returning) throw new Error("source batches missing");
+  expect(original).toHaveLength(3);
+  expect(returning).toHaveLength(3);
+  expect(returning.map((statement) => statement.sql.replace(/ RETURNING \*$/u, ""))).toEqual(
+    original.map((statement) => statement.sql),
+  );
+  expect(returning.map((statement) => statement.params)).toEqual(
+    original.map((statement) => statement.params),
+  );
+  const principal = (
+    await current.sql.query("SELECT * FROM principals WHERE id=?", [input.principalId])
+  )[0];
+  const anchor = await current.principals.readAnchor(input.principalId);
+  const binding = await current.principals.readBinding(input.binding.ref);
+  if (!principal || !anchor || !binding) throw new Error("synthetic committed postimages missing");
+  expect(retained.principal).toEqual(principal);
+  expect(retained.anchor).toEqual(anchor);
+  expect(retained.binding).toEqual(binding);
+  expect(Object.isFrozen(retained)).toBe(true);
+  expect(Object.isFrozen(retained.principal)).toBe(true);
+  expect(Object.isFrozen(retained.anchor)).toBe(true);
+  expect(Object.isFrozen(retained.binding)).toBe(true);
+});
+
+for (const slot of [0, 1, 2]) {
+  test(`Auth fresh postimages reject missing returned row ${slot} without reselect or resend`, async () => {
+    const f = fixture();
+    let batches = 0;
+    let reads = 0;
+    const sql: Sql = {
+      async query(text, params) {
+        reads++;
+        return await f.sql.query(text, params);
+      },
+      run: f.sql.run.bind(f.sql),
+      async batch(statements) {
+        batches++;
+        const result = await f.sql.batch(statements);
+        return result.map((write, index) => (index === slot ? { ...write, rows: [] } : write));
+      },
+    };
+    await expect(
+      createSharedPrincipalAuthorityStore({ sql }).createFreshWithPostimages(fresh()),
+    ).rejects.toMatchObject({ code: "unavailable" });
+    expect(batches).toBe(1);
+    expect(reads).toBe(0);
+    expect(await f.principals.readBinding(fresh().binding.ref)).not.toBeNull();
+  });
+}
+
+for (const slot of [0, 1, 2]) {
+  test(`Auth fresh postimages reject substituted row ${slot} with unchanged positive ACK`, async () => {
+    const f = fixture();
+    let batches = 0;
+    const sql: Sql = {
+      query: f.sql.query.bind(f.sql),
+      run: f.sql.run.bind(f.sql),
+      async batch(statements) {
+        batches++;
+        const result = await f.sql.batch(statements);
+        return result.map((write, index) =>
+          index === slot
+            ? {
+                ...write,
+                rows: write.rows.map((row) =>
+                  slot === 0
+                    ? { ...row, id: "synthetic:foreign-principal" }
+                    : slot === 1
+                      ? { ...row, principal_incarnation: "synthetic:foreign-incarnation" }
+                      : { ...row, target_ref: "synthetic:foreign-target" },
+                ),
+              }
+            : write,
+        );
+      },
+    };
+    await expect(
+      createSharedPrincipalAuthorityStore({ sql }).createFreshWithPostimages(fresh()),
+    ).rejects.toMatchObject({ code: "unavailable" });
+    expect(batches).toBe(1);
+    expect((await f.principals.readBinding(fresh().binding.ref))?.state).toBe("active");
+  });
+}
+
+test("Auth fresh postimage unknown original ACK is retained without lookup fallback", async () => {
+  const f = fixture();
+  let batches = 0;
+  let reads = 0;
+  const sql: Sql = {
+    async query(text, params) {
+      reads++;
+      return await f.sql.query(text, params);
+    },
+    run: f.sql.run.bind(f.sql),
+    async batch(statements) {
+      batches++;
+      await f.sql.batch(statements);
+      throw new SqlError("unavailable", "synthetic unknown original acknowledgement");
+    },
+  };
+  await expect(
+    createSharedPrincipalAuthorityStore({ sql }).createFreshWithPostimages(fresh()),
+  ).rejects.toMatchObject({ code: "unavailable" });
+  expect(batches).toBe(1);
+  expect(reads).toBe(0);
+  expect(await f.principals.readBinding(fresh().binding.ref)).not.toBeNull();
+});
+
+test("Auth fresh postimage mandatory binding failure preserves all earlier rows", async () => {
+  const f = fixture();
+  const before = {
+    principals: await f.sql.query("SELECT * FROM principals ORDER BY id"),
+    anchors: await f.sql.query("SELECT * FROM auth_principal_incarnations ORDER BY principal_id"),
+    bindings: await f.sql.query("SELECT * FROM shared_principal_bindings ORDER BY binding_ref"),
+  };
+  f.db.exec(
+    "CREATE TRIGGER synthetic_binding_fault BEFORE INSERT ON shared_principal_bindings BEGIN SELECT RAISE(ABORT,'synthetic binding fault'); END",
+  );
+  await expect(f.principals.createFreshWithPostimages(fresh())).rejects.toMatchObject({
+    code: "constraint",
+  });
+  expect(await f.sql.query("SELECT * FROM principals ORDER BY id")).toEqual(before.principals);
+  expect(
+    await f.sql.query("SELECT * FROM auth_principal_incarnations ORDER BY principal_id"),
+  ).toEqual(before.anchors);
+  expect(await f.sql.query("SELECT * FROM shared_principal_bindings ORDER BY binding_ref")).toEqual(
+    before.bindings,
+  );
+});
+
+test("Auth fresh postimages retain actual trigger effects and original write acknowledgements", async () => {
+  const f = fixture();
+  f.db.exec(
+    "CREATE TRIGGER synthetic_binding_audit AFTER INSERT ON shared_principal_bindings BEGIN UPDATE auth_guard_probe SET touched=touched+1 WHERE id=1; END",
+  );
+  let original: Awaited<ReturnType<Sql["batch"]>> | null = null;
+  const sql: Sql = {
+    query: f.sql.query.bind(f.sql),
+    run: f.sql.run.bind(f.sql),
+    async batch(statements) {
+      const result = await f.sql.batch(statements);
+      original = result;
+      return result;
+    },
+  };
+  const retained = await createSharedPrincipalAuthorityStore({ sql }).createFreshWithPostimages(
+    fresh(),
+  );
+  if (!original) throw new Error("original write acknowledgements missing");
+  expect(await f.sql.query("SELECT touched FROM auth_guard_probe WHERE id=1")).toEqual([
+    { touched: 1 },
+  ]);
+  const binding = await f.principals.readBinding(fresh().binding.ref);
+  if (!binding) throw new Error("synthetic committed binding missing");
+  expect(retained.binding).toEqual(binding);
+  expect(original).toHaveLength(3);
+});
+
+test("Auth fresh postimage inspection never calls a substituted returned-row getter", async () => {
+  const f = fixture();
+  let getterCalls = 0;
+  const sql: Sql = {
+    query: f.sql.query.bind(f.sql),
+    run: f.sql.run.bind(f.sql),
+    async batch(statements) {
+      const result = await f.sql.batch(statements);
+      return result.map((write, index) =>
+        index === 0
+          ? {
+              ...write,
+              rows: write.rows.map((row) => {
+                const substituted = { ...row };
+                Object.defineProperty(substituted, "id", {
+                  enumerable: true,
+                  get(): never {
+                    getterCalls++;
+                    throw new Error("synthetic substituted returned-row getter");
+                  },
+                });
+                return substituted;
+              }),
+            }
+          : write,
+      );
+    },
+  };
+  await expect(
+    createSharedPrincipalAuthorityStore({ sql }).createFreshWithPostimages(fresh()),
+  ).rejects.toMatchObject({ code: "unavailable" });
+  expect(getterCalls).toBe(0);
+});
