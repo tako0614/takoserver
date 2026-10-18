@@ -1677,3 +1677,581 @@ export async function captureAndConsumeSharedAuthFinancialConsentRequestOriginal
     return fail("unavailable");
   }
 }
+
+/** Actual pending-row DATA only: no command/consent/receipt echo is returned.
+ * This is not durable fullcommand custody or first-attempt/NEW admission.
+ */
+export interface SharedAuthFinancialConsentPendingPersistenceData {
+  readonly state: "pending-persistence-postimage-data";
+  readonly pending: SharedAuthFinancialConsentPendingData;
+}
+
+function snapshotPendingBoundary(
+  input: unknown,
+  code: Code,
+): SharedAuthFinancialConsentPendingData {
+  try {
+    const row = exactOwn(input, pendingColumns, code);
+    return snapshotPending({
+      ...row,
+      action_original_bytes: capturePostimageBytes(row.action_original_bytes, 16384, code),
+      terms_original_bytes: capturePostimageBytes(row.terms_original_bytes, 16384, code),
+      challenge_original_bytes: capturePostimageBytes(row.challenge_original_bytes, 16384, code),
+    });
+  } catch {
+    return fail(code);
+  }
+}
+
+function samePending(
+  a: SharedAuthFinancialConsentPendingData,
+  b: SharedAuthFinancialConsentPendingData,
+): boolean {
+  return pendingColumns.every((column) => {
+    const name = column as keyof SharedAuthFinancialConsentPendingData;
+    const left = a[name];
+    const right = b[name];
+    return left instanceof Uint8Array && right instanceof Uint8Array
+      ? sameBytes(left, right)
+      : left === right;
+  });
+}
+
+function pendingRows(input: unknown): readonly SharedAuthFinancialConsentPendingData[] {
+  if (!Array.isArray(input)) return fail("unavailable");
+  const descriptors: Record<string, PropertyDescriptor> = Object.getOwnPropertyDescriptors(input);
+  const length: unknown = descriptors.length?.value;
+  if (
+    typeof length !== "number" ||
+    !Number.isSafeInteger(length) ||
+    length < 0 ||
+    length > 2 ||
+    Reflect.ownKeys(descriptors).length !== length + 1
+  )
+    return fail("unavailable");
+  const rows: SharedAuthFinancialConsentPendingData[] = [];
+  for (let index = 0; index < length; index++) {
+    const descriptor = descriptors[String(index)];
+    if (!descriptor || !Object.hasOwn(descriptor, "value") || descriptor.enumerable !== true)
+      return fail("unavailable");
+    rows.push(snapshotPendingBoundary(descriptor.value, "unavailable"));
+  }
+  return Object.freeze(rows);
+}
+
+async function pendingCustody(
+  pending: SharedAuthFinancialConsentPendingData,
+  code: Code,
+): Promise<void> {
+  await requireCustody(pending.action_original_bytes, pending.action_custody_sha256, code);
+  await requireCustody(pending.terms_original_bytes, pending.terms_custody_sha256, code);
+  await requireCustody(pending.challenge_original_bytes, pending.challenge_custody_sha256, code);
+  let terms: string;
+  try {
+    terms = new TextDecoder("utf-8", { fatal: true }).decode(pending.terms_original_bytes);
+  } catch {
+    return fail(code);
+  }
+  if (
+    terms.length < 1 ||
+    terms.length > 8192 ||
+    !sameBytes(new TextEncoder().encode(terms), pending.terms_original_bytes) ||
+    (await bytesDigest(pending.terms_original_bytes)) !== pending.terms_digest_original
+  )
+    return fail(code);
+}
+
+function pendingPersistenceStatement(captured: ReturnType<typeof snapshotGuarded>): SqlStatement {
+  // Reuse the closed 29+16+time DATA vector and the actual owning Root25+10
+  // expressions, not guardedSQL.where (which assumes pre-existing p/c rows).
+  // Command fields are constraints ONLY and are NOT persisted by this INSERT.
+  const expected = expectedCapture(captured, captured.recordedAt);
+  const sameVector =
+    "occupied.registration_ref=e.p_registration_ref AND occupied.incarnation=e.p_incarnation AND occupied.challenge_ref=e.p_challenge_ref AND occupied.action_ref=e.p_action_ref";
+  const where = `e.p_transaction_ref IS e.c_transaction_ref AND e.p_registration_ref IS e.c_registration_ref AND e.p_incarnation IS e.c_incarnation
+ AND e.p_organization_id IS e.c_organization_id AND e.p_workspace_id IS e.c_workspace_id AND e.p_workspace_ref IS e.c_workspace_ref
+ AND e.c_family='${FAMILY}' AND e.p_created_at<=e.c_captured_at AND e.c_captured_at<=e.recorded_at
+ AND e.recorded_at<e.p_expires_at AND e.recorded_at<=${sqlNow} AND ${sqlNow}<e.p_expires_at
+ AND (${captured.rpConstraint.sql}) AND (${captured.humanConstraint.sql})
+ AND NOT EXISTS(SELECT 1 FROM ${PENDING} occupied WHERE occupied.transaction_ref=e.p_transaction_ref OR (${sameVector}))
+ AND NOT ${collision(COMMANDS)} AND NOT ${collision(ORIGINALS)}`;
+  return closedStatement(
+    `${expected.cte}
+INSERT INTO ${PENDING} (${pendingColumns.join(",")})
+SELECT ${pendingColumns.map((name) => `e.p_${name}`).join(",")} FROM expected e
+WHERE ${where}
+RETURNING ${pendingColumns.join(",")}`,
+    [...expected.params, ...captured.rpConstraint.params, ...captured.humanConstraint.params],
+  );
+}
+
+/** Parameterized DATA builder; no SQL is executed and no authority is minted.
+ * Existing original recipe/hash/Root inputs detach before the first await.
+ * The INSERT is one guarded CAS; it does not capture or consume a command.
+ */
+export async function sharedAuthFinancialConsentPendingPersistenceStatement(
+  input: SharedAuthFinancialConsentGuardedStatementData,
+): Promise<SqlStatement> {
+  let captured: SharedAuthFinancialConsentGuardedStatementData;
+  try {
+    captured = snapshotRequestGuarded(input);
+  } catch {
+    return fail("invalid_request");
+  }
+  await requireCaptureRecipe(captured, "invalid_request");
+  await validateCaptureHashes(captured);
+  return pendingPersistenceStatement(snapshotGuarded(captured));
+}
+
+/** UNMOUNTED one-write DATA effect. The actual captured guarded Sql.run result
+ * must have changes1 and exactly one closed29 row with every original value.
+ * A successful pending ACK does not persist the command/opaque consent/proof
+ * or selectedTerms.ref, and never grants capture/consume/NEW/resume permission.
+ * Unknown/zero/malformed ACK: retain the original29 input and use GET-only;
+ * no automatic retry/new key/family or subsequent capture/consume is called.
+ */
+export async function persistSharedAuthFinancialConsentRequestPendingData(
+  connection: WorkerRequestSql,
+  input: SharedAuthFinancialConsentGuardedStatementData,
+): Promise<SharedAuthFinancialConsentPendingPersistenceData> {
+  const port = captureRequestCommandSql(connection);
+  let captured: SharedAuthFinancialConsentGuardedStatementData;
+  let guarded: ReturnType<typeof snapshotGuarded>;
+  try {
+    captured = snapshotRequestGuarded(input);
+    guarded = snapshotGuarded(captured);
+  } catch {
+    return fail("invalid_request");
+  }
+  port.sameOrigin();
+  let statement: SqlStatement;
+  try {
+    await requireCaptureRecipe(captured, "invalid_request");
+    port.sameOrigin();
+    await validateCaptureHashes(captured);
+    port.sameOrigin();
+    statement = pendingPersistenceStatement(guarded);
+  } catch (error) {
+    port.sameOrigin();
+    if (
+      error instanceof SharedAuthFinancialConsentOriginalReadError &&
+      error.code === "invalid_request"
+    )
+      throw error;
+    return fail("unavailable");
+  }
+  try {
+    if ((await inspectSharedAuthFinancialConsentLeafSchema(port.queryPort)) !== "leaf-present")
+      return fail("unavailable");
+    port.sameOrigin();
+    const result = await port.runCapture(statement);
+    port.sameOrigin();
+    // Snapshot actual native bytes/descriptors before the first hash await.
+    const actual = exactOwn(result, ["changes", "rows"], "unavailable");
+    if (actual.changes !== 1) return fail("unavailable");
+    const rows = pendingRows(actual.rows);
+    if (rows.length !== 1 || !samePending(rows[0]!, captured.pending)) return fail("unavailable");
+    const pending = rows[0]!;
+    await pendingCustody(pending, "unavailable");
+    port.sameOrigin();
+    return Object.freeze({ state: "pending-persistence-postimage-data", pending });
+  } catch {
+    port.sameOrigin();
+    return fail("unavailable");
+  }
+}
+
+/** Query-only historical29 recovery, captured before dispatch/unknown.
+ * No command parameter is echoed or treated as stored custody. A complete
+ * positive absence returns undefined DATA only, never permission to resend.
+ * A pending row alone (even after a positive ACK) does not enable continuation.
+ */
+export function createSharedAuthFinancialConsentPendingRecovery(
+  connection: WorkerRequestSql,
+  originalPending: SharedAuthFinancialConsentPendingData,
+) {
+  const port = captureRequestCommandSql(connection);
+  let pending: SharedAuthFinancialConsentPendingData;
+  try {
+    pending = snapshotPendingBoundary(originalPending, "invalid_request");
+  } catch {
+    return fail("invalid_request");
+  }
+  async function readOriginalPendingData(): Promise<
+    SharedAuthFinancialConsentPendingData | undefined
+  > {
+    port.sameOrigin();
+    try {
+      await pendingCustody(pending, "invalid_request");
+    } catch (error) {
+      port.sameOrigin();
+      if (
+        error instanceof SharedAuthFinancialConsentOriginalReadError &&
+        error.code === "invalid_request"
+      )
+        throw error;
+      return fail("unavailable");
+    }
+    port.sameOrigin();
+    try {
+      if ((await inspectSharedAuthFinancialConsentLeafSchema(port.queryPort)) !== "leaf-present")
+        return fail("unavailable");
+      port.sameOrigin();
+    } catch {
+      port.sameOrigin();
+      return fail("unavailable");
+    }
+    let selected: readonly SharedAuthFinancialConsentPendingData[];
+    try {
+      selected = pendingRows(
+        await port.queryPort.query(
+          `SELECT ${pendingColumns.join(",")} FROM ${PENDING}
+WHERE transaction_ref=? OR (registration_ref=? AND incarnation=? AND challenge_ref=? AND action_ref=?) LIMIT 2`,
+          [
+            pending.transaction_ref,
+            pending.registration_ref,
+            pending.incarnation,
+            pending.challenge_ref,
+            pending.action_ref,
+          ],
+        ),
+      );
+    } catch {
+      port.sameOrigin();
+      return fail("unavailable");
+    }
+    port.sameOrigin();
+    if (selected.length > 1) return fail("custody_conflict");
+    if (selected.length === 1) {
+      try {
+        await pendingCustody(selected[0]!, "unavailable");
+      } catch {
+        port.sameOrigin();
+        return fail("unavailable");
+      }
+      port.sameOrigin();
+      if (!samePending(selected[0]!, pending)) return fail("custody_conflict");
+      return selected[0]!;
+    }
+    // Missing pending with an occupied downstream transaction is not absence.
+    // No C/O contents are returned or reconstructed as pending/fullcommand.
+    for (const table of [COMMANDS, ORIGINALS]) {
+      let rows: readonly Row[];
+      try {
+        rows = ownedRows(
+          await port.queryPort.query(
+            `SELECT transaction_ref FROM ${table} WHERE transaction_ref=? LIMIT 2`,
+            [pending.transaction_ref],
+          ),
+          ["transaction_ref"],
+        );
+      } catch {
+        port.sameOrigin();
+        return fail("unavailable");
+      }
+      port.sameOrigin();
+      if (rows.length !== 0) return fail("unavailable");
+    }
+    return undefined;
+  }
+  return Object.freeze({ readOriginalPendingData });
+}
+
+/** Required-row batch builders are DATA only. Each VALUES expected relation has
+ * exactly one row; unique LEFT JOINs preserve it. A false/NULL guard deliberately
+ * selects NULL into an existing NOT NULL key, causing a SQL constraint error.
+ * No WHERE-zero is allowed to silently commit a prefix of the batch.
+ */
+function requiredPendingPersistenceStatement(
+  captured: ReturnType<typeof snapshotGuarded>,
+): SqlStatement {
+  // Reuse the closed 29+16+time DATA vector and the actual owning Root25+10
+  // expressions, not guardedSQL.where (which assumes pre-existing p/c rows).
+  // Command fields are constraints ONLY and are NOT persisted by this INSERT.
+  const expected = expectedCapture(captured, captured.recordedAt);
+  const sameVector =
+    "occupied.registration_ref=e.p_registration_ref AND occupied.incarnation=e.p_incarnation AND occupied.challenge_ref=e.p_challenge_ref AND occupied.action_ref=e.p_action_ref";
+  const where = `e.p_transaction_ref IS e.c_transaction_ref AND e.p_registration_ref IS e.c_registration_ref AND e.p_incarnation IS e.c_incarnation
+ AND e.p_organization_id IS e.c_organization_id AND e.p_workspace_id IS e.c_workspace_id AND e.p_workspace_ref IS e.c_workspace_ref
+ AND e.c_family='${FAMILY}' AND e.p_created_at<=e.c_captured_at AND e.c_captured_at<=e.recorded_at
+ AND e.recorded_at<e.p_expires_at AND e.recorded_at<=${sqlNow} AND ${sqlNow}<e.p_expires_at
+ AND (${captured.rpConstraint.sql}) AND (${captured.humanConstraint.sql})
+ AND NOT EXISTS(SELECT 1 FROM ${PENDING} occupied WHERE occupied.transaction_ref=e.p_transaction_ref OR (${sameVector}))
+ AND NOT ${collision(COMMANDS)} AND NOT ${collision(ORIGINALS)}`;
+  return closedStatement(
+    `${expected.cte}
+INSERT INTO ${PENDING} (${pendingColumns.join(",")})
+SELECT CASE WHEN (${where}) THEN e.p_transaction_ref ELSE NULL END,${pendingColumns
+      .slice(1)
+      .map((name) => `e.p_${name}`)
+      .join(",")} FROM expected e
+RETURNING ${pendingColumns.join(",")}`,
+    [...expected.params, ...captured.rpConstraint.params, ...captured.humanConstraint.params],
+  );
+}
+
+function requiredCommandCaptureStatement(
+  captured: ReturnType<typeof snapshotGuarded>,
+): SqlStatement {
+  const { cte, params } = expectedCapture(captured);
+  const where = `${pendingMatch} AND ${commandPendingMatch}
+ AND e.c_captured_at<=${sqlNow} AND ${sqlNow}<p.expires_at
+ AND NOT ${collision(COMMANDS)} AND NOT ${collision(ORIGINALS)}`;
+  return closedStatement(
+    `${cte}
+INSERT INTO ${COMMANDS} (${commandColumns.join(",")})
+SELECT CASE WHEN (${where}) THEN e.c_command_ref ELSE NULL END,${commandColumns
+      .slice(1)
+      .map((name) => `e.c_${name}`)
+      .join(",")}
+FROM expected e LEFT JOIN ${PENDING} p ON p.transaction_ref=e.p_transaction_ref
+RETURNING ${commandColumns.join(",")}`,
+    params,
+  );
+}
+
+function requiredOriginalConsumeStatement(
+  captured: ReturnType<typeof snapshotGuarded>,
+): SqlStatement {
+  const { cte, where, params } = guardedSQL(captured);
+  return closedStatement(
+    `${cte}
+INSERT INTO ${ORIGINALS} (${originalColumns.join(",")})
+SELECT CASE WHEN (${where} AND NOT ${collision(ORIGINALS)}) THEN c.consent_ref ELSE NULL END,
+ c.command_ref,c.transaction_ref,c.receipt_ref,c.registration_ref,c.incarnation,
+ c.organization_id,c.workspace_id,c.workspace_ref,c.original_bytes,c.original_digest,c.original_custody_sha256,e.recorded_at,e.recorded_at
+FROM expected e LEFT JOIN ${PENDING} p ON p.transaction_ref=e.p_transaction_ref
+ LEFT JOIN ${COMMANDS} c ON c.transaction_ref=p.transaction_ref AND c.command_ref=e.c_command_ref
+RETURNING ${originalColumns.join(",")}`,
+    params,
+  );
+}
+
+function requiredPendingCaptureConsumeStatements(
+  captured: ReturnType<typeof snapshotGuarded>,
+): readonly SqlStatement[] {
+  return Object.freeze([
+    requiredPendingPersistenceStatement(captured),
+    requiredCommandCaptureStatement(captured),
+    requiredOriginalConsumeStatement(captured),
+  ]);
+}
+
+/** Source-only required-row statements, not a caller's NEW/resume admission.
+ * Expected binding counts remain81/45/81. SQL/constraint semantics must be
+ * qualified on the actual same-primary adapter; this builder performs no SQL.
+ */
+export async function sharedAuthFinancialConsentPendingCaptureConsumeStatements(
+  input: SharedAuthFinancialConsentGuardedStatementData,
+): Promise<readonly SqlStatement[]> {
+  let captured: SharedAuthFinancialConsentGuardedStatementData;
+  try {
+    captured = snapshotRequestGuarded(input);
+  } catch {
+    return fail("invalid_request");
+  }
+  const guarded = snapshotGuarded(captured);
+  await requireCaptureRecipe(captured, "invalid_request");
+  await validateCaptureHashes(captured);
+  return requiredPendingCaptureConsumeStatements(guarded);
+}
+
+function captureRequiredRequestBatchSql(connection: WorkerRequestSql) {
+  const selected = captureRequestCommandSql(connection);
+  let graph: ReturnType<typeof readWorkerRequestConsumers>;
+  let batch: Sql["batch"];
+  try {
+    graph = readWorkerRequestConsumers(connection);
+    const descriptor = Object.getOwnPropertyDescriptor(graph.sql, "batch");
+    if (
+      graph.sql !== connection.sql ||
+      !descriptor ||
+      !Object.hasOwn(descriptor, "value") ||
+      typeof descriptor.value !== "function"
+    )
+      return fail("unavailable");
+    batch = descriptor.value;
+  } catch {
+    return fail("unavailable");
+  }
+  const receiver = graph.sql;
+  const client = graph.client;
+  const realm = graph.realm;
+  function sameOrigin(): void {
+    selected.sameOrigin();
+    try {
+      const current = readWorkerRequestConsumers(connection);
+      const descriptor = Object.getOwnPropertyDescriptor(current.sql, "batch");
+      if (
+        current !== graph ||
+        current.sql !== receiver ||
+        current.client !== client ||
+        current.realm !== realm ||
+        !descriptor ||
+        !Object.hasOwn(descriptor, "value") ||
+        descriptor.value !== batch
+      )
+        fail("unavailable");
+    } catch {
+      fail("unavailable");
+    }
+  }
+  const queryPort: Pick<Sql, "query"> = Object.freeze({
+    async query(statement, params) {
+      sameOrigin();
+      try {
+        const rows = await selected.queryPort.query(statement, params);
+        sameOrigin();
+        return rows;
+      } catch {
+        sameOrigin();
+        return fail("unavailable");
+      }
+    },
+  });
+  return Object.freeze({
+    sameOrigin,
+    queryPort,
+    async runRequiredBatch(statements: readonly SqlStatement[]): Promise<readonly SqlWrite[]> {
+      sameOrigin();
+      try {
+        // Original Money wrapper receiver/method: one permit INSERT, these
+        // three statements, one permit DELETE in its same captured raw batch.
+        const result: readonly SqlWrite[] = await Reflect.apply(batch, receiver, [statements]);
+        sameOrigin();
+        return result;
+      } catch {
+        sameOrigin();
+        return fail("unavailable");
+      }
+    },
+  });
+}
+
+function requiredDenseValues(value: unknown, count: number): readonly unknown[] {
+  if (!Array.isArray(value)) return fail("unavailable");
+  const descriptors: Record<string, PropertyDescriptor> = Object.getOwnPropertyDescriptors(value);
+  const length = descriptors.length;
+  if (
+    !length ||
+    !Object.hasOwn(length, "value") ||
+    length.value !== count ||
+    Reflect.ownKeys(descriptors).length !== count + 1
+  )
+    return fail("unavailable");
+  const rows: unknown[] = [];
+  for (let index = 0; index < count; index++) {
+    const descriptor = descriptors[String(index)];
+    if (!descriptor || !Object.hasOwn(descriptor, "value") || descriptor.enumerable !== true)
+      return fail("unavailable");
+    rows.push(descriptor.value);
+  }
+  return Object.freeze(rows);
+}
+
+function snapshotRequiredBatchWrite(value: unknown, columns: readonly string[]): SqlWrite {
+  const actual = exactOwn(value, ["changes", "rows"], "unavailable");
+  if (actual.changes !== 1) return fail("unavailable");
+  const row = exactOwn(requiredDenseValues(actual.rows, 1)[0], columns, "unavailable");
+  const detached: Row = Object.create(null);
+  for (const column of columns) {
+    const value = row[column];
+    if (column.endsWith("_bytes"))
+      detached[column] = capturePostimageBytes(
+        value,
+        column === "command_bytes" ? 65536 : 16384,
+        "unavailable",
+      );
+    else if (typeof value === "string" || typeof value === "number") detached[column] = value;
+    else return fail("unavailable");
+  }
+  return Object.freeze({ changes: actual.changes, rows: Object.freeze([Object.freeze(detached)]) });
+}
+
+/** UNMOUNTED one-batch DATA effect, not request admission or durable resume.
+ * No caller ACK, phase flag, predicate callback or alternate Sql is accepted.
+ * Every guard must insert its one exact row or fail at an existing SQL
+ * constraint. Only the actual same-primary batch contract can roll back its
+ * entire prefix on that failure; JS ACK checks after commit cannot do so.
+ * All three statements are submitted together: no JS ACK16 is available
+ * between them. Consume instead checks the exact stored command in its SQL.
+ *
+ * Success retains fullcommand16 plus original14/mandatory receipt beside29.
+ * It does not prove that an absent record was never attempted. No invocation,
+ * reconstruction, positive absence or command-only state permits a retry/NEW
+ * key/family/resume. Unknown is original-fullcommand query-only recovery using
+ * the existing port; genuine request/Clock/R1/current admission remain absent.
+ */
+export async function persistCaptureAndConsumeSharedAuthFinancialConsentRequestData(
+  connection: WorkerRequestSql,
+  input: SharedAuthFinancialConsentGuardedStatementData,
+): Promise<SharedAuthFinancialConsentOriginalData> {
+  const port = captureRequiredRequestBatchSql(connection);
+  let captured: SharedAuthFinancialConsentGuardedStatementData;
+  let guarded: ReturnType<typeof snapshotGuarded>;
+  try {
+    captured = snapshotRequestGuarded(input);
+    guarded = snapshotGuarded(captured);
+  } catch {
+    return fail("invalid_request");
+  }
+  const expected = Object.freeze({
+    key: captured.command.key,
+    selectedScope: captured.command.selectedScope,
+    originalBytes: new Uint8Array(captured.command.originalBytes),
+    originalDigest: captured.command.originalDigest,
+    originalCustodySHA256: captured.command.originalCustodySHA256,
+    recordedAt: captured.recordedAt,
+  });
+  const originals = createSharedAuthFinancialConsentOriginalReader(port.queryPort);
+  let statements: readonly SqlStatement[];
+  port.sameOrigin();
+  try {
+    await requireCaptureRecipe(captured, "invalid_request");
+    port.sameOrigin();
+    await validateCaptureHashes(captured);
+    port.sameOrigin();
+    statements = requiredPendingCaptureConsumeStatements(guarded);
+  } catch (error) {
+    port.sameOrigin();
+    if (
+      error instanceof SharedAuthFinancialConsentOriginalReadError &&
+      error.code === "invalid_request"
+    )
+      throw error;
+    return fail("unavailable");
+  }
+  try {
+    if ((await inspectSharedAuthFinancialConsentLeafSchema(port.queryPort)) !== "leaf-present")
+      return fail("unavailable");
+    port.sameOrigin();
+    const results = requiredDenseValues(await port.runRequiredBatch(statements), 3);
+    port.sameOrigin();
+    // Capture ALL actual closed rows/native bytes before the first hash await.
+    // Malformed ACK can follow a commit: it remains unknown, never a rollback
+    // assertion or authority to resubmit this batch.
+    const pendingWrite = snapshotRequiredBatchWrite(results[0], pendingColumns);
+    const commandWrite = snapshotRequiredBatchWrite(results[1], commandColumns);
+    const originalWrite = snapshotRequiredBatchWrite(results[2], originalColumns);
+    const pending = snapshotPendingBoundary(pendingWrite.rows[0], "unavailable");
+    if (!samePending(pending, captured.pending)) return fail("unavailable");
+    await pendingCustody(pending, "unavailable");
+    port.sameOrigin();
+    await requireSharedAuthFinancialConsentCommandCapturePostimage(commandWrite, captured.command);
+    port.sameOrigin();
+    await requireSharedAuthFinancialConsentConsumePostimage(originalWrite, expected);
+    port.sameOrigin();
+    const original = await originals.readOriginal(captured.command);
+    port.sameOrigin();
+    if (
+      original === undefined ||
+      original.recordedAt !== captured.recordedAt ||
+      original.receiptRecordedAt !== captured.recordedAt
+    )
+      return fail("unavailable");
+    return original;
+  } catch {
+    port.sameOrigin();
+    return fail("unavailable");
+  }
+}
