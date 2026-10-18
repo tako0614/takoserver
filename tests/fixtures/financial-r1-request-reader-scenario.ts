@@ -15,7 +15,10 @@ const request = new Request("https://fixture.invalid/selected-original");
 const principalId = "principal:fixture";
 let state: {
   inputs: object;
-  port: { readValidatedCredential: () => object; readValidatedPrincipalBinding: () => object };
+  port: {
+    readValidatedCredential: (capture: unknown) => object;
+    readValidatedPrincipalBinding: (capture: unknown) => object;
+  };
   context: object;
   retained: {
     record: {
@@ -32,6 +35,10 @@ let state: {
   humanCurrent: boolean;
   rpCurrent: boolean;
   captures: number;
+  captureMode: "found" | "absent" | "unknown";
+  captureGate?: Promise<void>;
+  credentialHandles: unknown[];
+  userHandles: unknown[];
 };
 const requireOrigin = (original: unknown) => {
   if (original !== connection || !state.active) throw Error("synthetic origin unavailable");
@@ -72,6 +79,9 @@ mock.module("../../src/financial-auth-consumer.ts", () => ({
     )
       throw Error("capture");
     state.captures++;
+    if (state.captureGate) await state.captureGate;
+    if (state.captureMode === "absent") return null;
+    if (state.captureMode === "unknown") throw Error("synthetic unknown final touch");
     return { credential: Object.freeze({}), userBinding: Object.freeze({}) };
   },
   financialAuthConsumerSourceCurrentness() {
@@ -120,14 +130,20 @@ async function setup(action: SharedFinancialAction = topupAction(), terms?: stri
       writerEpoch: EPOCH,
     },
     port: {
-      readValidatedCredential: () => ({
-        backend: "shared-rp-session",
-        record: state.retained.record,
-        current: state.retained.current,
-      }),
-      readValidatedPrincipalBinding: () => ({
-        binding: { principalId, principalIncarnation: "principal-incarnation:fixture" },
-      }),
+      readValidatedCredential: (capture) => {
+        state.credentialHandles.push(capture);
+        return {
+          backend: "shared-rp-session",
+          record: state.retained.record,
+          current: state.retained.current,
+        };
+      },
+      readValidatedPrincipalBinding: (capture) => {
+        state.userHandles.push(capture);
+        return {
+          binding: { principalId, principalIncarnation: "principal-incarnation:fixture" },
+        };
+      },
     },
     context: { sql: f.sql, realm: f.options.realm, writerEpoch: EPOCH },
     retained: {
@@ -149,6 +165,9 @@ async function setup(action: SharedFinancialAction = topupAction(), terms?: stri
     humanCurrent: true,
     rpCurrent: true,
     captures: 0,
+    captureMode: "found",
+    credentialHandles: [],
+    userHandles: [],
   };
   await f.base.run("INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES(?,?,?,?)", [
     SCOPE.organizationId,
@@ -375,6 +394,142 @@ test("RP entry returns exact large UTF-8 historical terms with no RP cap truncat
     );
     expect("disclosureRef" in original).toBe(false);
     expect("consentProofRef" in original).toBe(false);
+  } finally {
+    f.close();
+  }
+});
+
+test("one R1 reader reuses the opaque original across sequential GETs without caching found", async () => {
+  const { command, install, reader } = await setup();
+  try {
+    await install();
+    expect(state.captures).toBe(0);
+    expect(
+      (await reader.readRetainedActionConsentR1(command.key.challengeRef)).fullCommand,
+    ).toEqual(command);
+    state.sourceCurrent = false;
+    await expect(
+      reader.readRetainedActionConsentR1(command.key.challengeRef),
+    ).rejects.toMatchObject({ code: "unavailable" });
+    state.sourceCurrent = true;
+    expect(
+      (await reader.readRetainedActionConsentR1(command.key.challengeRef)).fullCommand,
+    ).toEqual(command);
+    expect(state.captures).toBe(1);
+    expect(new Set(state.credentialHandles).size).toBe(1);
+    expect(new Set(state.userHandles).size).toBe(1);
+    expect(state.credentialHandles.length).toBeGreaterThanOrEqual(3);
+  } finally {
+    f.close();
+  }
+});
+
+test("parallel R1 GETs share one pending Root capture and preserve both original results", async () => {
+  const { command, install, reader } = await setup();
+  try {
+    await install();
+    let release = () => {};
+    state.captureGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const reads = [
+      reader.readRetainedActionConsentR1(command.key.challengeRef),
+      reader.readRetainedActionConsentR1(command.key.challengeRef),
+    ];
+    await Promise.resolve();
+    const pendingCaptures = state.captures;
+    release();
+    const originals = await Promise.all(reads);
+    expect(pendingCaptures).toBe(1);
+    expect(originals.map((original) => original.fullCommand)).toEqual([command, command]);
+    expect(state.captures).toBe(1);
+    expect(new Set(state.credentialHandles).size).toBe(1);
+  } finally {
+    f.close();
+  }
+});
+
+for (const mode of ["absent", "unknown"] as const) {
+  test(`Root ${mode} capture remains unavailable without observer resend`, async () => {
+    const { command, install, reader } = await setup();
+    try {
+      await install();
+      state.captureMode = mode;
+      await expect(
+        reader.readRetainedActionConsentR1(command.key.challengeRef),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      state.captureMode = "found";
+      await expect(
+        reader.readRetainedActionConsentR1(command.key.challengeRef),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(state.captures).toBe(1);
+    } finally {
+      f.close();
+    }
+  });
+}
+
+test("an initial invalid origin stays unavailable after the source echo is restored", async () => {
+  const { command, install, reader } = await setup();
+  try {
+    await install();
+    state.active = false;
+    await expect(
+      reader.readRetainedActionConsentR1(command.key.challengeRef),
+    ).rejects.toMatchObject({ code: "unavailable" });
+    state.active = true;
+    await expect(
+      reader.readRetainedActionConsentR1(command.key.challengeRef),
+    ).rejects.toMatchObject({ code: "unavailable" });
+    expect(state.captures).toBe(0);
+  } finally {
+    f.close();
+  }
+});
+
+test("SQL unknown recovery reads the held original without another Root observation", async () => {
+  const { command, install, reader } = await setup();
+  try {
+    await install();
+    f.unknownQuery();
+    await expect(
+      reader.readRetainedActionConsentR1(command.key.challengeRef),
+    ).rejects.toMatchObject({ code: "unavailable" });
+    expect(
+      (await reader.readRetainedActionConsentR1(command.key.challengeRef)).fullCommand,
+    ).toEqual(command);
+    expect(state.captures).toBe(1);
+    expect(new Set(state.credentialHandles).size).toBe(1);
+  } finally {
+    f.close();
+  }
+});
+
+test("standalone historical reads retain their separate per-invocation observation contract", async () => {
+  const { command, install } = await setup();
+  try {
+    await install();
+    expect(
+      (
+        await readFinancialRequestBoundR1History(
+          connection,
+          request,
+          SCOPE.workspaceId,
+          command.key.challengeRef,
+        )
+      ).status,
+    ).toBe("found");
+    expect(
+      (
+        await readFinancialRequestBoundR1History(
+          connection,
+          request,
+          SCOPE.workspaceId,
+          command.key.challengeRef,
+        )
+      ).status,
+    ).toBe("found");
+    expect(state.captures).toBe(2);
   } finally {
     f.close();
   }

@@ -1870,6 +1870,25 @@ export async function readFinancialRequestBoundR1History(
   workspaceId: string,
   challengeRef: string,
 ): Promise<FinancialRequestBoundR1History> {
+  return readFinancialRequestBoundR1HistoryWithCaptures(
+    connection,
+    request,
+    workspaceId,
+    challengeRef,
+  );
+}
+
+/** Only this module's actual Root capture call can supply the held Promise.
+ * The public standalone history entry still observes once per invocation. */
+async function readFinancialRequestBoundR1HistoryWithCaptures(
+  connection: WorkerRequestSql,
+  request: Request,
+  workspaceId: string,
+  challengeRef: string,
+  originalCaptures?: Promise<
+    Awaited<ReturnType<typeof captureWorkerRequestFinancialAuthRpRequest>>
+  >,
+): Promise<FinancialRequestBoundR1History> {
   const challenge = ref(challengeRef);
   try {
     const inputs = readWorkerRequestFinancialInputs(connection);
@@ -1906,8 +1925,9 @@ export async function readFinancialRequestBoundR1History(
     const read = async (sql: string, params: readonly SqlParam[]): Promise<readonly Row[]> =>
       checked(() => Reflect.apply(query, inputs.sql, [sql, params]) as Promise<readonly Row[]>);
     assertCurrent();
-    const captures = await checked(() =>
-      captureWorkerRequestFinancialAuthRpRequest(port, request, workspaceId),
+    const captures = await checked(
+      () =>
+        originalCaptures ?? captureWorkerRequestFinancialAuthRpRequest(port, request, workspaceId),
     );
     if (!captures) fail("unavailable");
     const credential = port.readValidatedCredential(captures.credential);
@@ -2255,18 +2275,43 @@ export function createFinancialActionConsentR1Reader(
         fail("unavailable");
     };
     assertOriginal();
+    let originalCaptures:
+      | Promise<Awaited<ReturnType<typeof captureWorkerRequestFinancialAuthRpRequest>>>
+      | undefined;
+    const captureOnce = () => {
+      if (!originalCaptures) {
+        try {
+          assertOriginal();
+          // Store before running the observer, including synchronous reentry.
+          // Null/rejection is sticky; no fresh capture follows an unknown ACK.
+          originalCaptures = Promise.resolve()
+            .then(() => {
+              assertOriginal();
+              return captureWorkerRequestFinancialAuthRpRequest(port, request, workspaceId);
+            })
+            .catch(() => null);
+        } catch {
+          originalCaptures = Promise.resolve(null);
+        }
+      }
+      return originalCaptures;
+    };
     return Object.freeze({
       async readRetainedActionConsentR1(
         challengeRef: string,
       ): Promise<FinancialActionConsentR1Original> {
         const challenge = ref(challengeRef);
         try {
+          const captures = captureOnce();
           assertOriginal();
-          const retained = await readFinancialRequestBoundR1History(
+          // Cache only the actual Root handles. Every GET repeats the original
+          // Financial/receipt and final same-primary source checks below.
+          const retained = await readFinancialRequestBoundR1HistoryWithCaptures(
             connection,
             request,
             workspaceId,
             challenge,
+            captures,
           );
           assertOriginal();
           // RP cannot start an affirmative confirmation from absent, partial,
