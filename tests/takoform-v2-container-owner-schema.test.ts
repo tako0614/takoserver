@@ -1152,8 +1152,22 @@ test("Container DELETE preparation owns its callable and binds exact Sql and ori
   const prepared = await issue.prepareDelete!(c);
   expect(prepared).toBeDefined();
   const fixed = redeemV2HostAcceptance(prepared!, noIO, c);
-  expect(fixed.guard.params).toHaveLength(9);
-  expect(fixed.guard.params?.[8]).toBe(1);
+  expect(fixed.guard.params).toHaveLength(10);
+  expect(fixed.guard.params?.[0]).toBe(
+    JSON.stringify(recipe.objects.map(({ type, name, table, sql }) => [type, name, table, sql])),
+  );
+  expect(fixed.guard.params?.slice(1)).toEqual([
+    c.resourceUid,
+    "installation",
+    c.principal,
+    c.space,
+    c.name,
+    c.form,
+    "backend",
+    "target",
+    c.generation - 1,
+  ]);
+  expect(fixed.guard.params?.slice(1)[8]).toBe(1);
   expect(fixed.terminal.params).toHaveLength(21);
   expect(fixed.terminal.params?.[0]).toBe(c.operationId);
   expect(fixed.terminal.params?.[12]).toBe(c.operationId);

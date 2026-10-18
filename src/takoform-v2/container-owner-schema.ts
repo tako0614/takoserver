@@ -438,18 +438,34 @@ const names = objects.map((item) => literal(item.name)).join(", ");
 const tableNames = tables.map((item) => literal(item.name)).join(", ");
 
 /** Main-pinned complete owning shape; it proves storage only, never current authority. */
-export const V2_CONTAINER_OWNER_READY = `(
-  ${objects.map((item) => `(SELECT count(*) FROM main.sqlite_schema WHERE type = ${literal(item.type)} AND name = ${literal(item.name)} AND tbl_name = ${literal(item.table)} AND sql = ${literal(item.sql)}) = 1`).join("\n  AND ")}
+const expectedRows = Object.freeze(
+  objects.map((item) =>
+    Object.freeze<[string, string, string, string]>([item.type, item.name, item.table, item.sql]),
+  ),
+);
+const readyPredicate = (
+  encodeValue: (value: string, rowIndex: number, columnIndex: number) => string,
+): string => `(
+  ${expectedRows.map((row, rowIndex) => `(SELECT count(*) FROM main.sqlite_schema WHERE type = ${encodeValue(row[0], rowIndex, 0)} AND name = ${encodeValue(row[1], rowIndex, 1)} AND tbl_name = ${encodeValue(row[2], rowIndex, 2)} AND sql = ${encodeValue(row[3], rowIndex, 3)}) = 1`).join("\n  AND ")}
   AND NOT EXISTS (SELECT 1 FROM main.sqlite_schema WHERE sql IS NOT NULL
     AND (lower(substr(name, 1, ${PREFIX.length})) = ${literal(PREFIX)} OR tbl_name IN (${tableNames})) AND name NOT IN (${names}))
   AND NOT EXISTS (SELECT 1 FROM  main.sqlite_schema source  WHERE CASE WHEN lower(source.name) IN ('_cf_kv', '_cf_metadata')  AND source.sql IS NOT NULL AND instr(upper(source.sql), 'REFERENCES') = 0 THEN 0 ELSE EXISTS (SELECT 1 FROM  pragma_foreign_key_list(source.name, 'main') fk
      WHERE  source.type = 'table' AND lower(fk."table") IN (${tableNames}) AND source.name NOT IN (${tableNames})) END)
   AND NOT EXISTS (SELECT 1 FROM pragma_foreign_key_check(NULL, 'main') WHERE "table" IN (${tableNames}))
 )`;
+export const V2_CONTAINER_OWNER_READY = readyPredicate(literal);
+const runtimeReadyParams = Object.freeze([JSON.stringify(expectedRows)]);
+const runtimeReady =
+  "(WITH container_owner_expected_values(document) AS (VALUES (?)) SELECT " +
+  readyPredicate(
+    (_value, rowIndex, columnIndex) =>
+      `json_extract((SELECT document FROM container_owner_expected_values), '$[${rowIndex}][${columnIndex}]')`,
+  ) +
+  ")";
 
 export async function inspectV2ContainerOwnerSchema(sql: Sql): Promise<boolean> {
   try {
-    const rows = await sql.query(`SELECT ${V2_CONTAINER_OWNER_READY} AS ready`);
+    const rows = await sql.query(`SELECT ${runtimeReady} AS ready`, runtimeReadyParams);
     if (rows.length !== 1 || Object.keys(rows[0] ?? {}).length !== 1) return false;
     const ready = Object.getOwnPropertyDescriptor(rows[0]!, "ready");
     return !!ready && "value" in ready && ready.value === 1;
@@ -538,15 +554,16 @@ export function createV2ContainerHostAcceptance(options: {
             ).join("")
           : null;
       const guard: SqlStatement = {
-        sql: `${V2_CONTAINER_OWNER_READY} AND (${
+        sql: `${runtimeReady} AND (${
           c.action === "create"
             ? `NOT EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ?)`
             : `EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
             AND principal = ? AND space = ? AND name = ? AND form_url = ? AND backend_id = ? AND target_key = ?
             AND desired_generation = ? AND retired_at_ms IS NULL)`
         })`,
-        params:
-          c.action === "create"
+        params: [
+          ...runtimeReadyParams,
+          ...(c.action === "create"
             ? [c.resourceUid]
             : [
                 c.resourceUid,
@@ -558,7 +575,8 @@ export function createV2ContainerHostAcceptance(options: {
                 backendId,
                 targetKey,
                 c.generation - 1,
-              ],
+              ]),
+        ],
       };
       // If Core accepted op.id, this INSERT MUST run and its guard MUST abort a
       // mismatch. Only a genuine normal refusal (no op.id) produces zero rows.
@@ -644,19 +662,22 @@ export function createV2ContainerHostAcceptance(options: {
       )
         throw new TypeError("frozen Container Form cannot accept sensitive inputs");
       const guard: SqlStatement = {
-        sql: `${V2_CONTAINER_OWNER_READY} AND (${`EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
+        sql: `${runtimeReady} AND (${`EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
             AND principal = ? AND space = ? AND name = ? AND form_url = ? AND backend_id = ? AND target_key = ?
             AND desired_generation = ? AND retired_at_ms IS NULL)`})`,
         params: [
-          c.resourceUid,
-          installationId,
-          c.principal,
-          c.space,
-          c.name,
-          c.form,
-          backendId,
-          targetKey,
-          c.generation - 1,
+          ...runtimeReadyParams,
+          ...[
+            c.resourceUid,
+            installationId,
+            c.principal,
+            c.space,
+            c.name,
+            c.form,
+            backendId,
+            targetKey,
+            c.generation - 1,
+          ],
         ],
       };
       // A selected DELETE terminal always attempts insertion. Missing Core or
