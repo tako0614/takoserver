@@ -1881,6 +1881,22 @@ describe("fresh original money writer", () => {
         throughMigration: "0093" as const,
       };
       const status = await runIntegrationMoneyUnitCutover(invocation, post.target, options);
+      // Wrangler 4.123.0 export accepts --skip-confirmation; --yes is execute-only.
+      expect(
+        post.commands
+          .filter((command) => command[1] === "d1" && command[2] === "export")
+          .map((command) => command.slice(0, 7)),
+      ).toEqual([
+        [
+          join(REPOSITORY, "node_modules/.bin/wrangler"),
+          "d1",
+          "export",
+          post.pair,
+          "--remote",
+          "--skip-confirmation",
+          "--config",
+        ],
+      ]);
       if (typeof status.reviewBindingDigest !== "string")
         throw new Error("missing actual review binding");
       const evidenceDigest = sha("controlled post-import phase review");

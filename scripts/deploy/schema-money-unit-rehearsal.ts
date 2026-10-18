@@ -855,7 +855,7 @@ async function shadowSnapshot(
           "export",
           declaration.databaseName,
           "--remote",
-          "--yes",
+          "--skip-confirmation",
           "--config",
           configPath,
           "--output",

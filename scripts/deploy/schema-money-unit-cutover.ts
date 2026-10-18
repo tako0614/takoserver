@@ -1340,7 +1340,7 @@ async function backupAndRead(
           "export",
           target.d1.databaseName,
           "--remote",
-          "--yes",
+          "--skip-confirmation",
           "--config",
           configPath,
           "--output",
