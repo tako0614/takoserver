@@ -3,12 +3,16 @@ import { createHash } from "node:crypto";
 import { moneyFenceInstallSql } from "../../scripts/deploy/schema-money-unit-cutover.ts";
 import { verifyHostedBillingFinancialRealm } from "../../src/hosted-billing-realm.ts";
 import { canonicalJson } from "../../src/json.ts";
-import type { SqlParam, SqlStatement } from "../../src/ports.ts";
+import type { Row, SqlParam, SqlStatement, SqlWrite } from "../../src/ports.ts";
 import { SHARED_AUTH_STAGING_PROFILE } from "../../src/shared-auth-oidc-client.ts";
 import { customerAdmissionCandidate } from "../../src/shared-financial-admission.ts";
 import { prepareConsentBatch } from "../../src/shared-financial-consent-data.ts";
 import type { CustomerPhaseInput } from "../../src/shared-financial-customer-dispatch.ts";
-import { readCustomerJournalSnapshot } from "../../src/shared-financial-customer-journal.ts";
+import {
+  completedCustomerReceiptReadStatement,
+  readCustomerJournalSnapshot,
+} from "../../src/shared-financial-customer-journal.ts";
+import { customerTrackedOriginalReadStatement } from "../../src/shared-financial-customer-tracked-execution.ts";
 import type { D1DatabaseLike, D1ResultLike, D1StatementLike } from "../../src/sql-d1.ts";
 import { createStripeBillingClient } from "../../src/stripe-billing-client.ts";
 import {
@@ -51,17 +55,78 @@ let synthetic: {
 // The request constructors, private Financial mint/static reader, Root's literal
 // receiver and raw request-origin backing remain the actual production functions.
 const originalWorker = await import("../../src/worker-request-composition.ts");
+const actualRootQuery = originalWorker.queryWorkerRequestFinancialCurrentConsentOriginal;
+const actualRootBatch = originalWorker.batchWorkerRequestFinancialCurrentConsentOriginal;
 const originalAuth = await import("../../src/financial-auth-consumer.ts");
 const originalR1 = await import("../../src/shared-financial-retained-r1.ts");
 const originalConsent = await import("../../src/shared-auth-financial-consent.ts");
 const originalContract = await import("../../src/shared-auth-financial-consent-contract.ts");
 const originalStore = await import("../../src/shared-auth-financial-consent-store.ts");
+interface NativeTrace {
+  readonly reads: {
+    readonly statement: SqlStatement;
+    readonly underlying: SqlWrite;
+    readonly result: D1ResultLike;
+  }[];
+  readonly batches: {
+    readonly statements: readonly SqlStatement[];
+    readonly underlying: readonly SqlWrite[];
+    readonly results: readonly D1ResultLike[];
+  }[];
+}
+const nativeTraces = new WeakMap<object, NativeTrace>();
+const receiverOperations: (
+  | {
+      readonly connection: unknown;
+      readonly operation: Parameters<typeof actualRootQuery>[1];
+      readonly kind: "query";
+      readonly result: readonly Row[];
+      readonly nativeReads: NativeTrace["reads"];
+    }
+  | {
+      readonly connection: unknown;
+      readonly operation: Parameters<typeof actualRootBatch>[1];
+      readonly kind: "batch";
+      readonly result: readonly SqlWrite[];
+      readonly nativeBatches: NativeTrace["batches"];
+    }
+)[] = [];
 function selected() {
   if (!synthetic) throw new Error("synthetic boundary not selected");
   return synthetic;
 }
 mock.module("../../src/worker-request-composition.ts", () => ({
   ...originalWorker,
+  async queryWorkerRequestFinancialCurrentConsentOriginal(
+    ...args: Parameters<typeof originalWorker.queryWorkerRequestFinancialCurrentConsentOriginal>
+  ) {
+    const trace = nativeTraces.get(args[0]);
+    const before = trace?.reads.length ?? 0;
+    const result = await actualRootQuery(...args);
+    receiverOperations.push({
+      connection: args[0],
+      operation: args[1],
+      kind: "query",
+      result,
+      nativeReads: trace?.reads.slice(before) ?? [],
+    });
+    return result;
+  },
+  async batchWorkerRequestFinancialCurrentConsentOriginal(
+    ...args: Parameters<typeof originalWorker.batchWorkerRequestFinancialCurrentConsentOriginal>
+  ) {
+    const trace = nativeTraces.get(args[0]);
+    const before = trace?.batches.length ?? 0;
+    const result = await actualRootBatch(...args);
+    receiverOperations.push({
+      connection: args[0],
+      operation: args[1],
+      kind: "batch",
+      result,
+      nativeBatches: trace?.batches.slice(before) ?? [],
+    });
+    return result;
+  },
   readWorkerRequestRetainedRpCapture: (connection: unknown) => {
     if (connection !== selected().connection) throw new Error("foreign credential connection");
     return selected().retained;
@@ -92,9 +157,10 @@ mock.module("../../src/shared-auth-financial-consent-store.ts", () => ({
   ...originalStore,
   sharedAuthFinancialConsentLocalCurrentnessStatement: async () => selected().rp,
 }));
-const { createFinancialCurrentConsentCustomerExecutor } = await import(
-  "../../src/financial-current-consent-customer.ts"
-);
+const {
+  createFinancialCurrentConsentCustomerExecutor,
+  readFinancialCurrentConsentCustomerOperationOriginal,
+} = await import("../../src/financial-current-consent-customer.ts");
 
 function mechanicalRp(): SqlStatement {
   const params = Array.from({ length: 81 }, (_, index) =>
@@ -118,6 +184,7 @@ async function requestFixture() {
   f.db.exec(moneyFenceInstallSql("0094"));
   const observed = { primary: 0, root: 0, reads: 0, batches: 0 };
   const batchSizes: number[] = [];
+  const nativeTrace: NativeTrace = { reads: [], batches: [] };
   let loseNextAcknowledgement = false;
   const statements = new WeakMap<D1StatementLike, SqlStatement>();
   function statement(sql: string, params: readonly SqlParam[] = []): D1StatementLike {
@@ -128,8 +195,14 @@ async function requestFixture() {
       },
       async all(): Promise<D1ResultLike> {
         observed.reads++;
-        const result = await f.sql.run(selected.sql, selected.params);
-        return { success: true, results: result.rows, meta: { changes: result.changes } };
+        const underlying = await f.sql.run(selected.sql, selected.params);
+        const result = {
+          success: true,
+          results: underlying.rows,
+          meta: { changes: underlying.changes },
+        };
+        nativeTrace.reads.push({ statement: selected, underlying, result });
+        return result;
       },
     });
     statements.set(prepared, selected);
@@ -145,16 +218,18 @@ async function requestFixture() {
         if (!original) throw new Error("statement left its primary session");
         return original;
       });
-      const result = await f.sql.batch(selected);
+      const underlying = await f.sql.batch(selected);
       if (loseNextAcknowledgement) {
         loseNextAcknowledgement = false;
         throw new Error("synthetic ACK lost after committed primary batch");
       }
-      return result.map((item) => ({
+      const results = underlying.map((item) => ({
         success: true,
         results: item.rows,
         meta: { changes: item.changes },
       }));
+      nativeTrace.batches.push({ statements: selected, underlying, results });
+      return results;
     },
   });
   const database: WorkerRequestDatabase = Object.freeze({
@@ -179,6 +254,7 @@ async function requestFixture() {
       publicOrigin: SHARED_AUTH_STAGING_PROFILE.publicOrigin,
       consoleOrigin: SHARED_AUTH_STAGING_PROFILE.consoleOrigin,
     });
+    nativeTraces.set(connection, nativeTrace);
     const client = createStripeBillingClient({
       secretKey: "sk_test_native_bridge_fixture",
       mode: "test",
@@ -242,6 +318,7 @@ async function requestFixture() {
       connection,
       observed,
       batchSizes,
+      nativeTrace,
       loseAck() {
         loseNextAcknowledgement = true;
       },
@@ -512,6 +589,7 @@ async function selectedCustomerCase(request: Awaited<ReturnType<typeof requestFi
 
 test("synthetic RP/R1 selection reaches actual Financial mint and Root native L1 batch", async () => {
   const request = await requestFixture();
+  const foreign = await requestFixture();
   try {
     const { executor, l1, input } = await selectedCustomerCase(request);
     const readsBefore = request.observed.reads;
@@ -573,9 +651,180 @@ test("synthetic RP/R1 selection reaches actual Financial mint and Root native L1
       ),
     ).toHaveLength(1);
     expect(await request.f.sql.query("SELECT * FROM money_cutover_writer_permit")).toEqual([]);
+    const captured = receiverOperations.filter((item) => item.connection === request.connection);
+    expect(
+      [
+        ...new Set(
+          captured
+            .filter((item) => item.kind === "query")
+            .map((item) => {
+              const original = readFinancialCurrentConsentCustomerOperationOriginal(
+                request.connection,
+                item.operation,
+              );
+              return original?.kind;
+            }),
+        ),
+      ].sort(),
+    ).toEqual(["completed-receipt-read", "original-read"]);
+    expect(captured.filter((item) => item.kind === "batch")).toHaveLength(2);
+    const receivedBatches: (readonly SqlWrite[])[] = [];
+    for (const { kind, operation } of captured) {
+      const first = readFinancialCurrentConsentCustomerOperationOriginal(
+        request.connection,
+        operation,
+      );
+      const repeated = readFinancialCurrentConsentCustomerOperationOriginal(
+        request.connection,
+        operation,
+      );
+      if (!first || !repeated) throw new Error("valid private operation was not retained");
+      if (kind === "batch") expect(first.kind).toBe("phase-batch");
+      else expect(["completed-receipt-read", "original-read"]).toContain(first.kind);
+      expect(repeated).toEqual(first);
+      expect(repeated).not.toBe(first);
+      expect(first.requestInputs).toBe(request.inputs);
+      expect(first.writerEpoch).toBe(writerEpoch);
+      expect(first.original.writerEpoch).toBe(writerEpoch);
+      expect(first.original.phase).toBe(first.phase);
+      if (first?.kind === "phase-batch" && repeated?.kind === "phase-batch") {
+        const receiptIndex = first.phase === "L1" ? 4 : 3;
+        const firstBlobs = first.plan.statements[receiptIndex]?.params?.filter(
+          (value) => value instanceof ArrayBuffer,
+        );
+        const repeatBlobs = repeated.plan.statements[receiptIndex]?.params?.filter(
+          (value) => value instanceof ArrayBuffer,
+        );
+        expect(firstBlobs).toHaveLength(5);
+        expect(repeatBlobs).toEqual(firstBlobs);
+        expect(repeatBlobs?.[0]).not.toBe(firstBlobs?.[0]);
+      }
+      expect(
+        readFinancialCurrentConsentCustomerOperationOriginal(foreign.connection, operation),
+      ).toBeNull();
+      expect(
+        readFinancialCurrentConsentCustomerOperationOriginal(request.connection, {
+          ...(operation as object),
+        }),
+      ).toBeNull();
+    }
+    for (const item of captured) {
+      const original = readFinancialCurrentConsentCustomerOperationOriginal(
+        request.connection,
+        item.operation,
+      );
+      if (!original) throw new Error("captured operation lost its original");
+      expect(item.connection).toBe(request.connection);
+      if (item.kind === "query") {
+        if (original.kind === "phase-batch") throw new Error("read operation became batch");
+        expect(item.nativeReads).toHaveLength(1);
+        const native = item.nativeReads[0];
+        if (!native) throw new Error("Root read did not use the native session");
+        const phaseOriginal = original.original;
+        if (phaseOriginal.phase !== "L1" && phaseOriginal.phase !== "D")
+          throw new Error("unexpected Financial phase original");
+        const coreReceiptRef =
+          phaseOriginal.phase === "L1"
+            ? phaseOriginal.admission.receiptRef
+            : phaseOriginal.dispatchReceiptRef;
+        const expected =
+          original.kind === "completed-receipt-read"
+            ? completedCustomerReceiptReadStatement(coreReceiptRef)
+            : customerTrackedOriginalReadStatement(
+                coreReceiptRef,
+                original.original.historyReceiptRef,
+              );
+        expect(original.statement).toEqual(expected);
+        expect(native.statement).toEqual(expected);
+        expect(native.result.results).toBe(native.underlying.rows);
+        expect(item.result).toBe(native.underlying.rows);
+      } else {
+        if (original.kind !== "phase-batch") throw new Error("batch operation became read");
+        expect(item.nativeBatches).toHaveLength(1);
+        const native = item.nativeBatches[0];
+        if (!native) throw new Error("Root batch did not use the native session");
+        expect(native.statements).toEqual(original.plan.statements);
+        expect(native.statements).toHaveLength(original.phase === "L1" ? 9 : 8);
+        expect(native.statements[0]?.sql).toContain("money_cutover_writer_permit");
+        expect(native.statements.at(-1)?.sql).toContain("money_cutover_writer_permit");
+        expect(native.underlying[0]?.changes).toBe(1);
+        expect(native.underlying.at(-1)?.changes).toBe(1);
+        if (original.phase === "D") expect(native.underlying[2]?.changes).toBe(1);
+        expect(item.result).toHaveLength(native.results.length);
+        for (let index = 0; index < native.results.length; index++) {
+          expect(native.results[index]?.results).toBe(native.underlying[index]?.rows);
+          expect(native.results[index]?.meta?.changes).toBe(native.underlying[index]?.changes);
+          expect(item.result[index]?.rows).toBe(native.underlying[index]?.rows);
+          expect(item.result[index]?.changes).toBe(native.underlying[index]?.changes);
+        }
+        receivedBatches.push(item.result);
+      }
+    }
+    expect(receivedBatches).toHaveLength(2);
+    for (const [index, acknowledgement] of [
+      outcome.acknowledgement,
+      dispatched.acknowledgement,
+    ].entries()) {
+      const batch = receivedBatches[index];
+      if (!batch) throw new Error("Root batch acknowledgement missing");
+      expect(
+        batch.map((result, statementIndex) => ({
+          index: statementIndex,
+          changes: result.changes,
+          returnedRows: result.rows.length,
+        })),
+      ).toEqual([...acknowledgement.physicalResults]);
+    }
+    const completedToken = captured.find(
+      (item) =>
+        item.kind === "query" &&
+        readFinancialCurrentConsentCustomerOperationOriginal(request.connection, item.operation)
+          ?.kind === "completed-receipt-read",
+    );
+    if (!completedToken) throw new Error("completed fixed-read token missing");
+    const completedOriginal = readFinancialCurrentConsentCustomerOperationOriginal(
+      request.connection,
+      completedToken.operation,
+    );
+    if (completedOriginal?.kind !== "completed-receipt-read")
+      throw new Error("completed fixed-read original missing");
+    const readsBeforeRepeat = request.nativeTrace.reads.length;
+    const batchesBeforeRepeat = request.observed.batches;
+    const firstRepeat = await actualRootQuery(request.connection, completedToken.operation);
+    expect(request.nativeTrace.reads).toHaveLength(readsBeforeRepeat + 1);
+    const secondRepeat = await actualRootQuery(request.connection, completedToken.operation);
+    expect(request.nativeTrace.reads).toHaveLength(readsBeforeRepeat + 2);
+    const firstNative = request.nativeTrace.reads[readsBeforeRepeat];
+    const secondNative = request.nativeTrace.reads[readsBeforeRepeat + 1];
+    if (!firstNative || !secondNative) throw new Error("repeated native reads missing");
+    expect(firstNative.statement).toEqual(completedOriginal.statement);
+    expect(secondNative.statement).toEqual(completedOriginal.statement);
+    expect(firstRepeat).toBe(firstNative.underlying.rows);
+    expect(secondRepeat).toBe(secondNative.underlying.rows);
+    expect(secondRepeat).toEqual(firstRepeat);
+    expect(request.observed.batches).toBe(batchesBeforeRepeat);
+    expect(request.batchSizes).toEqual([9, 8]);
+    const guardedBatches = captured
+      .filter((item) => item.kind === "batch")
+      .map((item) =>
+        readFinancialCurrentConsentCustomerOperationOriginal(request.connection, item.operation),
+      );
+    expect(
+      guardedBatches.map((item) =>
+        item?.kind === "phase-batch" ? item.plan.statements.length : -1,
+      ),
+    ).toEqual([9, 8]);
+    expect(
+      guardedBatches.map((item) =>
+        item?.kind === "phase-batch"
+          ? item.plan.statements[item.phase === "L1" ? 4 : 3]?.params?.length
+          : -1,
+      ),
+    ).toEqual([96, 98]);
   } finally {
     synthetic = null;
     request.f.close();
+    foreign.f.close();
   }
 });
 
