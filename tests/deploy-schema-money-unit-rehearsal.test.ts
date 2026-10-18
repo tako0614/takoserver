@@ -4,11 +4,13 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import * as ts from "typescript";
 import {
   canonicalSchemaShape,
   type D1SchemaState,
   readMigrationArtifact,
 } from "../scripts/deploy/migrations.ts";
+import { wranglerCommand } from "../scripts/deploy/process.ts";
 import {
   moneyUnitCutoverSchemaMatches,
   readMoneyAggregateDigest,
@@ -446,6 +448,96 @@ describe("money-unit native rehearsal source", () => {
       );
     }
   });
+
+  test("the actual shadow export recipe passes the pinned CLI parser before missing-config refusal", () => {
+    const root = moneyTestRoot("money-shadow-export-parser-");
+    try {
+      const missingConfig = join(root, "intentionally-absent.jsonc");
+      const rawOutput = join(root, "must-not-be-created.sql");
+      const module = ts.createSourceFile(
+        "schema-money-unit-rehearsal.ts",
+        readFileSync(
+          join(import.meta.dir, "../scripts/deploy/schema-money-unit-rehearsal.ts"),
+          "utf8",
+        ),
+        ts.ScriptTarget.Latest,
+        true,
+        ts.ScriptKind.TS,
+      );
+      const recipes: ts.ArrayLiteralExpression[] = [];
+      const visit = (node: ts.Node): void => {
+        if (
+          ts.isCallExpression(node) &&
+          ts.isIdentifier(node.expression) &&
+          node.expression.text === "wranglerCommand"
+        ) {
+          const argument = node.arguments[0];
+          if (argument && ts.isArrayLiteralExpression(argument)) {
+            const [first, second] = argument.elements;
+            if (
+              first &&
+              second &&
+              ts.isStringLiteral(first) &&
+              ts.isStringLiteral(second) &&
+              first.text === "d1" &&
+              second.text === "export"
+            )
+              recipes.push(argument);
+          }
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(module);
+      expect(recipes.length).toBe(1);
+      const recipe = recipes[0];
+      if (!recipe) throw new Error("missing actual shadow export command");
+      const args = recipe.elements.map((element): string => {
+        if (ts.isStringLiteral(element)) return element.text;
+        if (
+          ts.isPropertyAccessExpression(element) &&
+          ts.isIdentifier(element.expression) &&
+          element.expression.text === "declaration" &&
+          element.name.text === "databaseName"
+        )
+          return "parser-only-money-shadow";
+        if (ts.isIdentifier(element) && element.text === "configPath") return missingConfig;
+        if (ts.isIdentifier(element) && element.text === "rawPath") return rawOutput;
+        throw new Error("unexpected actual shadow export argument");
+      });
+      const home = join(root, "home");
+      const temp = join(root, "tmp");
+      const cache = join(root, "cache");
+      for (const directory of [home, temp, cache]) mkdirSync(directory, { mode: 0o700 });
+      const result = Bun.spawnSync([process.execPath, ...wranglerCommand(args)], {
+        cwd: root,
+        env: {
+          PATH: process.env.PATH ?? "/usr/bin:/bin",
+          HOME: home,
+          XDG_CONFIG_HOME: home,
+          XDG_CACHE_HOME: cache,
+          TMPDIR: temp,
+          CI: "1",
+          NO_COLOR: "1",
+          WRANGLER_HIDE_BANNER: "true",
+          WRANGLER_WRITE_LOGS: "false",
+          WRANGLER_SEND_METRICS: "false",
+          DO_NOT_TRACK: "1",
+        },
+        stdin: "ignore",
+        stdout: "pipe",
+        stderr: "pipe",
+        timeout: 15_000,
+      });
+      const stderr = new TextDecoder().decode(result.stderr);
+      expect(result.exitCode).toBe(1);
+      expect(stderr.includes("Unknown argument")).toBe(false);
+      expect(stderr.includes("Could not read file:")).toBe(true);
+      expect(stderr.includes(missingConfig)).toBe(true);
+      expect(() => readFileSync(rawOutput)).toThrow();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   test("Wrangler provenance binds the delegated executable CLI module bytes", () => {
     const installed = readMoneyRehearsalWranglerProvenance();
