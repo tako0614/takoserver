@@ -1,6 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { readFinancialCurrentConsentNativeOriginal } from "../src/financial-current-consent-customer.ts";
+import {
+  readFinancialCurrentConsentCustomerOperationOriginal,
+  readFinancialCurrentConsentNativeOriginal,
+} from "../src/financial-current-consent-customer.ts";
 import { createMoneyCutoverSql } from "../src/money-cutover-sql.ts";
 import type { Row, SqlStatement } from "../src/ports.ts";
 import { sharedAuthFinancialConsentLocalCurrentnessStatement } from "../src/shared-auth-financial-consent-store.ts";
@@ -38,8 +41,13 @@ test("Financial operation reader does not inspect fabricated or accessor-bearing
       throw new Error("fake token inspected");
     },
   });
+  expect(readFinancialCurrentConsentCustomerOperationOriginal({} as never, forged)).toBeNull();
+  expect(
+    readFinancialCurrentConsentCustomerOperationOriginal({} as never, { ...forged }),
+  ).toBeNull();
   expect(readFinancialCurrentConsentNativeOriginal(forged, "query")).toBeNull();
-  expect(readFinancialCurrentConsentNativeOriginal({ ...forged }, "batch")).toBeNull();
+  expect(readFinancialCurrentConsentNativeOriginal(forged, "batch")).toBeNull();
+  expect(readFinancialCurrentConsentNativeOriginal({ ...forged }, "query")).toBeNull();
   expect(reads).toBe(0);
 });
 

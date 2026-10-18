@@ -29,8 +29,11 @@ its opaque operation to Root's closed request-origin receiver for the two fixed
 tracker reads and the original 9/8 statement batch. Root reads the Financial
 operation's private origin and uses the same captured native primary session.
 The focused SQLite tests qualify the compiler and atomic rollback, and still
-reproduce public-wrapper rejection with no mutation. They do not yet qualify a
-positive, fully selected request-origin execution through the new receiver.
+reproduce public-wrapper rejection with no mutation. An isolated local SQLite
+test also passes a synthetically selected RP/R1/credential graph through the
+actual Financial mint, Root receiver, fixed L1/D batches and GET-only recovery
+after a committed batch loses its ACK. It does not qualify genuine RP/R1
+authority or remote native D1 execution.
 This component does not create a payer grant, issuer, live DB change, or new
 request authority.
 
@@ -44,13 +47,20 @@ a matching statement. Root's native receiver consumes it for both reads and
 the batch. Local negative origin tests and the existing compiler tests do not
 qualify a positive native request path.
 
-The Root-facing `readFinancialCurrentConsentNativeOriginal` reader accepts an
-opaque operation and the literal expected kind (`query` or `batch`). It returns
-the original connection and Financial request-input identities with a copied
-fixed statement or complete plan; a mismatched kind returns no original.
+The `readFinancialCurrentConsentCustomerOperationOriginal` reader requires the
+original connection and opaque operation. It returns a detached
+`completed-receipt-read`, `original-read`, or `phase-batch` original with the
+same Financial request-input identity; Root selects the fixed read or complete
+plan from that kind. A foreign connection or copied operation returns no
+original. The fixed Root receiver consumes
+`readFinancialCurrentConsentNativeOriginal(operation, "query" | "batch")`,
+which reuses that same private-origin check and returns the original connection
+and request inputs with the selected fixed read or complete plan. It accepts no
+new SQL, registration, caller inputs, or assertion callback. The five RP BLOB
+binds are copied as BLOBs on repeated reads.
 The isolated synthetic-source test checks one selected-consent-proof mismatch
 and verifies zero SQL effects before either read operation is minted. Other
-tuple mismatches still require a positive native request fixture to qualify.
+tuple mismatches and the genuine authority path remain unqualified.
 
 Before either historical tracker read, Financial checks the supplied phase
 against the held RP consent, R1 selection, native Customer command recipe,

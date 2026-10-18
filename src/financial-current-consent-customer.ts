@@ -89,7 +89,6 @@ export type FinancialCurrentConsentNativeOriginal =
       original: CustomerPhaseInput;
       plan: CustomerPhasePlan;
     }>;
-
 const operationOrigins = new WeakMap<
   FinancialCurrentConsentCustomerOperation,
   {
@@ -171,7 +170,27 @@ function mintOperation(
   return operation;
 }
 
-/** Root's only Financial operation reader. SQL/DTO shape alone has no origin. */
+/** Exact-connection static read of this module's privately minted operation.
+ * SQL/DTO shape alone has no origin; the only mint remains module-private. */
+export function readFinancialCurrentConsentCustomerOperationOriginal(
+  connection: WorkerRequestSql,
+  operation: unknown,
+): FinancialCurrentConsentCustomerOperationOriginal | null {
+  try {
+    const entry =
+      operation !== null && typeof operation === "object"
+        ? operationOrigins.get(operation as FinancialCurrentConsentCustomerOperation)
+        : undefined;
+    if (!entry || entry.connection !== connection) return null;
+    entry.assertOrigin();
+    if (readWorkerRequestFinancialInputs(connection) !== entry.original.requestInputs) return null;
+    return cloneOperationOriginal(entry.original);
+  } catch {
+    return null;
+  }
+}
+
+/** Root's fixed query/batch view of the same privately held operation original. */
 export function readFinancialCurrentConsentNativeOriginal(
   operation: unknown,
   expectedKind: "query" | "batch",
@@ -182,10 +201,8 @@ export function readFinancialCurrentConsentNativeOriginal(
         ? operationOrigins.get(operation as FinancialCurrentConsentCustomerOperation)
         : undefined;
     if (!entry) return null;
-    entry.assertOrigin();
-    if (readWorkerRequestFinancialInputs(entry.connection) !== entry.original.requestInputs)
-      return null;
-    const copy = cloneOperationOriginal(entry.original);
+    const copy = readFinancialCurrentConsentCustomerOperationOriginal(entry.connection, operation);
+    if (!copy) return null;
     if (copy.kind === "phase-batch")
       return expectedKind === "batch"
         ? Object.freeze({
@@ -448,8 +465,8 @@ export function createFinancialCurrentConsentCustomerExecutor(
           original: phase,
           statement: kind === "completed-receipt-read" ? completed : originalRead,
         });
-        const fixed = readFinancialCurrentConsentNativeOriginal(operation, "query");
-        if (fixed?.kind !== "query" || fixed.connection !== connection) unavailable();
+        const fixed = readFinancialCurrentConsentCustomerOperationOriginal(connection, operation);
+        if (!fixed || fixed.kind !== kind || fixed.requestInputs !== inputs) unavailable();
         const result = await queryWorkerRequestFinancialCurrentConsentOriginal(
           connection,
           operation,
@@ -472,8 +489,8 @@ export function createFinancialCurrentConsentCustomerExecutor(
           original: phase,
           plan: guarded,
         });
-        const fixed = readFinancialCurrentConsentNativeOriginal(operation, "batch");
-        if (fixed?.kind !== "batch" || fixed.connection !== connection) unavailable();
+        const fixed = readFinancialCurrentConsentCustomerOperationOriginal(connection, operation);
+        if (fixed?.kind !== "phase-batch" || fixed.requestInputs !== inputs) unavailable();
         const result = await batchWorkerRequestFinancialCurrentConsentOriginal(
           connection,
           operation,
