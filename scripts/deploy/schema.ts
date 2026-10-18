@@ -22,6 +22,7 @@ import {
   type ArtifactBlobIoDeploymentCompatibility,
   inspectArtifactBlobIoDeploymentCompatibility,
 } from "./artifact-blob-io-compatibility.ts";
+import { createAuth103CanonicalSourceArtifacts } from "./auth103-native-source.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
 import { buildD1MigrationImport } from "./d1-migration-import.ts";
@@ -3241,19 +3242,48 @@ function assertOperationGenerationMigrationHashes(
   );
 }
 
-/** Reads and validates the exact current 0001-0100 source corpus. */
+/** Audit100 projection for source-owned successor consumers. This is not an
+ * apply ceiling or permission to adopt any additional migration. */
+export function readAuditedMigrationSourcePrefix100(
+  directory: string = resolve(REPOSITORY, "migrations"),
+): ReturnType<typeof readMigrationArtifact> {
+  const artifact = readMigrationArtifact(directory);
+  if (
+    artifact.files.length < 100 ||
+    JSON.stringify(artifact.names.slice(0, 100)) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)
+  )
+    throw preflightError("audited migration prefix must be the exact original0001-0100");
+  assertAuditedMigrationHashes(artifact.files.slice(0, 100));
+  return createMigrationArtifact(artifact.files.slice(0, 100));
+}
+
+/** Existing consumers retain their exact audited100 projection. The ONLY
+ * supported source extension is machine-equal to the fixed Root101/102/103
+ * recipes; neither ordinary apply nor a fresh payload inherits that suffix. */
 export function readCurrentAuditedMigrationSourceArtifact(
   directory: string = resolve(REPOSITORY, "migrations"),
 ): ReturnType<typeof readMigrationArtifact> {
   const artifact = readMigrationArtifact(directory);
-  if (JSON.stringify(artifact.names) !== JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
-    throw preflightError(
-      "audited migration lineage must contain exactly 0001-0100",
-      `actual=${JSON.stringify(artifact.names)}`,
-    );
+  if (JSON.stringify(artifact.names) === JSON.stringify(AUDITED_MIGRATION_LINEAGE)) {
+    assertAuditedMigrationHashes(artifact.files);
+    return artifact;
   }
-  assertAuditedMigrationHashes(artifact.files);
-  return artifact;
+  const original = readAuditedMigrationSourcePrefix100(directory);
+  const owner = createAuth103CanonicalSourceArtifacts(resolve(directory, ".."));
+  if (
+    artifact.files.length !== 103 ||
+    artifact.files.slice(100).some((file, index) => {
+      const expected = owner.files[index];
+      return (
+        expected === undefined ||
+        file.name !== expected.name ||
+        file.digest !== digestBytes(Buffer.from(expected.sql)) ||
+        readFileSync(file.path, "utf8") !== expected.sql
+      );
+    })
+  )
+    throw preflightError("audited source extension must be exactly the owning101/102/103 recipes");
+  return original;
 }
 
 /** Closed, post-wave canonical integration projection; never a fresh or default apply profile. */

@@ -7,6 +7,7 @@ import {
   publicFormCapabilityManifest,
 } from "../../src/public-worker-implementation.ts";
 import {
+  type Auth103NativeBuildSource,
   createAuth103NativeSourceInstallContribution,
   prepareAuth103NativeBuildSource,
   readAuth103NativeBuildDefine,
@@ -42,6 +43,8 @@ export interface PreparedWorkerArtifact {
   readonly bundleDigestHex: string;
   /** Sealed SOURCE contribution only; the schema owner supplies one import. */
   readonly auth103SourceInstallPath?: string;
+  /** Same owning build original, for its one schema import only. */
+  readonly auth103NativeSource?: Auth103NativeBuildSource;
   readonly formImplementationIdentity?: PublicFormImplementationIdentity;
   seal(additionalRequiredFiles?: readonly string[]): SealedArtifact;
 }
@@ -209,6 +212,7 @@ export async function prepareWorkerArtifact(supplied: {
     configPath,
     bundleDigestHex,
     ...(auth103SourceInstallPath === undefined ? {} : { auth103SourceInstallPath }),
+    ...(auth103NativeSource === undefined ? {} : { auth103NativeSource }),
     ...(formImplementationIdentity === undefined ? {} : { formImplementationIdentity }),
     seal(additionalRequiredFiles = []) {
       if (sealed) throw preflightError("Worker artifact may be sealed only once");

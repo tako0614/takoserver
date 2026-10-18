@@ -233,8 +233,21 @@ export function canonicalSchemaShape(
       sql: row.sql as string,
     };
   });
-  const sorted = [...normalized].sort((left, right) =>
-    `${left.type}\0${left.name}`.localeCompare(`${right.type}\0${right.name}`),
+  // SQLite ORDER BY type,name uses BINARY UTF-8 bytes, never host locale or
+  // JavaScript UTF-16 code-unit order. Validate that order without reordering
+  // the returned original rows or normalizing any schema source.
+  const encoder = new TextEncoder();
+  const compareBinary = (left: string, right: string): number => {
+    const a = encoder.encode(left);
+    const b = encoder.encode(right);
+    for (let index = 0; index < Math.min(a.length, b.length); index++) {
+      const difference = a[index]! - b[index]!;
+      if (difference !== 0) return difference;
+    }
+    return a.length - b.length;
+  };
+  const sorted = [...normalized].sort(
+    (left, right) => compareBinary(left.type, right.type) || compareBinary(left.name, right.name),
   );
   if (JSON.stringify(normalized) !== JSON.stringify(sorted)) {
     throw schemaShapeError(phase, "D1 schema shape readback is not canonically ordered");

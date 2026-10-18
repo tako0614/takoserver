@@ -361,6 +361,10 @@ function exactPublicWorkerProvenance(
 /** Names only; Cloudflare never returns or receives secret bytes here. */
 export function expectedWorkerSecrets(target: DeployTarget): readonly string[] {
   const names = new Set<string>(["TAKOSERVER_SIGNING_KEY"]);
+  if (target.auth103NativeProfile === "root-shared-auth-staging-v1") {
+    names.add("TAKOSERVER_SHARED_AUTH_CLIENT_SECRET");
+    names.add("TAKOSERVER_SHARED_AUTH_SESSION_ENCRYPTION_KEY");
+  }
   if (target.takoformV2 !== undefined) names.add("TAKOSERVER_TAKOFORM_V2_CURSOR_KEY");
   if (target.edgeSupplies !== undefined) {
     names.add("TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING");

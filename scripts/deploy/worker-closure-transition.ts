@@ -1075,6 +1075,15 @@ function readClosureSecretValue(path: string, name: string): string {
       `closure transition secret input ${name} must be an owned 0600 exact non-whitespace regular file`,
     );
   }
+  if (name === "TAKOSERVER_SHARED_AUTH_CLIENT_SECRET" && raw.length > 8192) {
+    throw preflightError("shared Auth client secret input exceeds its exact transport bound");
+  }
+  if (
+    name === "TAKOSERVER_SHARED_AUTH_SESSION_ENCRYPTION_KEY" &&
+    !/^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/u.test(raw)
+  ) {
+    throw preflightError("shared Auth session encryption key input must be canonical base64url32");
+  }
   return raw;
 }
 

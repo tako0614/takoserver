@@ -51,6 +51,7 @@ import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualif
 import { writeWorkerConfig } from "./realized-config.ts";
 import { runAuthorityTransition } from "./retirement.ts";
 import { readCurrentAuditedMigrationSourceArtifact } from "./schema.ts";
+import { auth103SourceSchemaReady } from "./schema-auth103-native-source.ts";
 import { moneyUnitCutoverSchemaMatches } from "./schema-money-unit-cutover.ts";
 import {
   activePublicJwk,
@@ -240,6 +241,22 @@ export function workerSchemaAllowsPending(
   },
   sourceRepositoryRoot = REPOSITORY,
 ): boolean {
+  if (target.schemaMaintenanceMode === "pre-auth103-quiesced") {
+    return (
+      target.environment === "integration" &&
+      target.artifactBlobIoMode === undefined &&
+      auth103SourceSchemaReady(migrations, sourceRepositoryRoot, "maintenance")
+    );
+  }
+  if (
+    target.schemaMaintenanceMode === undefined &&
+    target.artifactBlobIoMode === undefined &&
+    target.environment === "integration" &&
+    target.moneyCutoverWriterPolicy === undefined &&
+    migrations.local.length === 103
+  ) {
+    return auth103SourceSchemaReady(migrations, sourceRepositoryRoot, "normal");
+  }
   if (target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced") {
     if (
       target.moneyCutoverWriterPolicy !== "transaction-fenced-usd-micros-v1" ||
@@ -370,6 +387,9 @@ export function workerMoneyUnitSchemaReady(
   ) {
     return false;
   }
+  if (migrations.local.length === 103) {
+    return auth103SourceSchemaReady(migrations, sourceRepositoryRoot, "normal");
+  }
   const source = readCurrentAuditedMigrationSourceArtifact(
     resolve(sourceRepositoryRoot, "migrations"),
   );
@@ -446,11 +466,13 @@ export async function probeSchemaMaintenance(
     body.error.code !== "backend_unavailable" ||
     !("message" in body.error) ||
     body.error.message !==
-      (mode === "pre-wallet-usd-micros-quiesced"
-        ? "Host is quiesced for the wallet USD-micros schema maintenance transition"
-        : mode === "pre-0058-quiesced"
-          ? "Host is quiesced for the 0058 schema maintenance transition"
-          : "Host is quiesced for the v2 0088 schema maintenance transition") ||
+      (mode === "pre-auth103-quiesced"
+        ? "Host is quiesced for the Auth103 source registration transition"
+        : mode === "pre-wallet-usd-micros-quiesced"
+          ? "Host is quiesced for the wallet USD-micros schema maintenance transition"
+          : mode === "pre-0058-quiesced"
+            ? "Host is quiesced for the 0058 schema maintenance transition"
+            : "Host is quiesced for the v2 0088 schema maintenance transition") ||
     !("details" in body.error) ||
     typeof body.error.details !== "object" ||
     body.error.details === null ||
@@ -1194,7 +1216,9 @@ async function readFreshV2StorageProof(
       {
         ...options.integrationStorageVerification,
         allowCurrentAuditedSuccessor:
-          target.schemaMaintenanceMode === undefined && target.artifactBlobIoMode === undefined,
+          (target.schemaMaintenanceMode === undefined ||
+            target.schemaMaintenanceMode === "pre-auth103-quiesced") &&
+          target.artifactBlobIoMode === undefined,
         allowMoneyUnitMaintenance:
           target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced",
         run,

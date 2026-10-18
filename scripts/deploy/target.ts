@@ -94,7 +94,8 @@ export interface DeployTarget {
   readonly schemaMaintenanceMode?:
     | "pre-0058-quiesced"
     | "pre-v2-0088-quiesced"
-    | "pre-wallet-usd-micros-quiesced";
+    | "pre-wallet-usd-micros-quiesced"
+    | "pre-auth103-quiesced";
   /** Explicit selected-Host D1 transaction containment, retained after resume. */
   readonly moneyCutoverWriterPolicy?: "transaction-fenced-usd-micros-v1";
   /** Reviewed nonsecret Writer generation; new source generations require a separate rotation. */
@@ -668,6 +669,9 @@ export function parseDeployTarget(
   }
   if (target.auth103NativeProfile !== undefined && environment !== "integration")
     throw preflightError("Root shared Auth103 native profile is integration-only");
+  if (target.schemaMaintenanceMode === "pre-auth103-quiesced" && environment !== "integration") {
+    throw preflightError("Auth103 source maintenance is integration-only");
+  }
   if (target.schemaMaintenanceMode === "pre-v2-0088-quiesced" && environment !== "integration") {
     throw preflightError("v2 0088 schema maintenance is integration-only");
   }
@@ -1789,13 +1793,15 @@ function schemaMaintenanceMode(value: unknown): {
   readonly schemaMaintenanceMode?:
     | "pre-0058-quiesced"
     | "pre-v2-0088-quiesced"
-    | "pre-wallet-usd-micros-quiesced";
+    | "pre-wallet-usd-micros-quiesced"
+    | "pre-auth103-quiesced";
 } {
   if (value === undefined) return {};
   if (
     value !== "pre-0058-quiesced" &&
     value !== "pre-v2-0088-quiesced" &&
-    value !== "pre-wallet-usd-micros-quiesced"
+    value !== "pre-wallet-usd-micros-quiesced" &&
+    value !== "pre-auth103-quiesced"
   ) {
     throw preflightError(
       "deploy target `schemaMaintenanceMode` is not a supported maintenance profile",

@@ -1580,6 +1580,8 @@ export const DEPLOY_CONTRACT = {
         "migrations",
         "scripts/deploy/artifact-blob-io-compatibility.ts",
         "scripts/deploy/schema.ts",
+        "scripts/deploy/schema-auth103-native-source.ts",
+        "scripts/deploy/auth103-native-source.ts",
         "scripts/deploy/schema-money-unit-cutover.ts",
         "scripts/deploy/schema-money-unit-owner.ts",
         "scripts/deploy/schema-0058-proof.ts",
@@ -1598,11 +1600,20 @@ export const DEPLOY_CONTRACT = {
         "TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH",
         "TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH",
         "TAKOSERVER_DEPLOY_TARGET_PRODUCTION",
+        "TAKOSERVER_AUTH103_INSTALL_CUSTODY_DIRECTORY",
         "TAKOSERVER_D1_MONEY_CUTOVER_DECLARATION_PATH",
       ],
       triggers: ["irreversible", "authority"],
       obligations: {
         provenance:
+          "Separate integration-only 0103 selection requires the original audited100 predecessor, " +
+          "machine-equal owner101/102/full103 source, exact all-traffic pre-auth103-quiesced source-built " +
+          "Worker/native binding closure and original sealed build contribution. One fixed import " +
+          "contains unchanged101/102/103, their ledger inserts, independent RP enrollment, deployment " +
+          "original and mandatory last receipt. Its first/final SQL guards recheck original100 and " +
+          "owned103 catalog/source/Clock in the same transaction. The ordinary audited100 projection, " +
+          "Money suffix, fresh payloads and previous apply ceilings are unchanged. No registration " +
+          "alone qualifies a request, credential, distinct user or Financial admission. " +
           "Optional fresh-origin input: TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH " +
           "selects the existing protected custody locator reader only for integration 0093/0094. " +
           "The same money declaration then requires originalOrigin with the original exact six-field " +
@@ -1652,6 +1663,10 @@ export const DEPLOY_CONTRACT = {
           "There is no down migration. A separately reviewed preconversion abandon can remove only the owned freeze while retaining non-serving Host admission; it cannot run after 0094 or an indeterminate conversion dispatch and never automatically reactivates old cents code. Failure is repaired forward from authoritative D1 lineage, schema shape and protected wallet-row readback. The original 0088 artifact is not qualified as the 0092 successor; hold current USD-micros Worker publication until a separately qualified 0093/0094 cutover produces complete canonical 0094 schema and money-unit policy with matching private dependencies.",
         "failure-handling":
           highRiskFailure +
+          " Auth103 requires original owned0700 TAKOSERVER_AUTH103_INSTALL_CUSTODY_DIRECTORY, " +
+          "a no-overwrite dispatch record before the single import and retained sealed bytes. " +
+          "After any dispatch, unknown acknowledgement is GET-only even if original100 remains; " +
+          "a JS post-commit failure never claims rollback and no automatic replay/restore exists. " +
           inputContract(applyReviewInput, rehearsalReceiptInput) +
           " The optional original-create input is never required by legacy or ordinary schema modes. " +
           "When present only exact integration 0093/0094 money invocation can consume it; unsupported " +

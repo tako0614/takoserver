@@ -40,7 +40,12 @@ import {
   type FreshV2D1Lineage,
   type FreshV2DataReader,
 } from "./fresh-v2-data-readback.ts";
-import { type D1SchemaState, MONEY_UNIT_MIGRATION, readD1SchemaState } from "./migrations.ts";
+import {
+  type D1SchemaState,
+  MONEY_UNIT_MIGRATION,
+  readD1SchemaState,
+  readMigrationArtifact,
+} from "./migrations.ts";
 import {
   type CommandResult,
   REPOSITORY,
@@ -72,6 +77,7 @@ import {
   readSealedFreshV2ArtifactMigrationArtifact,
   type SchemaReader,
 } from "./schema.ts";
+import { auth103SourceSchemaReady } from "./schema-auth103-native-source.ts";
 import {
   type MoneySchemaPhase,
   moneyUnitCutoverExpectedShape,
@@ -817,6 +823,43 @@ async function verifyGeneratedStorageTarget(
         ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
       },
     );
+    // A registered Auth103 source is a read-side successor of the SAME original
+    // native D1/R2 just inspected above. It never changes the fresh92 payload or
+    // grants Auth permission; original source/receipts are checked by the Worker.
+    if (
+      options.allowCurrentAuditedSuccessor === true &&
+      lineage !== "apply-0066" &&
+      target.environment === "integration" &&
+      target.artifactBlobIoMode === undefined &&
+      (target.schemaMaintenanceMode === "pre-auth103-quiesced" ||
+        (target.schemaMaintenanceMode === undefined &&
+          target.moneyCutoverWriterPolicy === undefined))
+    ) {
+      const complete = readMigrationArtifact(migrationDirectory);
+      if (
+        complete.names.length === 103 &&
+        auth103SourceSchemaReady(
+          {
+            local: complete.names,
+            applied: migrationState.applied,
+            shape: migrationState.shape,
+            shapeDigest: migrationState.shapeDigest,
+          },
+          resolve(migrationDirectory, ".."),
+          target.schemaMaintenanceMode === "pre-auth103-quiesced" ? "maintenance" : "normal",
+        )
+      ) {
+        return {
+          generation: generated.generation,
+          ...(generated.namespace === undefined ? {} : { namespace: generated.namespace }),
+          d1: { databaseId: generated.databaseId, databaseName: generated.databaseName },
+          r2: { bucketName: generated.bucketName },
+          migrationDigest: complete.digest,
+          appliedMigrations: [...migrationState.applied],
+          schemaShapeDigest: migrationState.shapeDigest,
+        };
+      }
+    }
     // A full current schema is a read-side successor of the selected origin,
     // never a new generation payload. Both alternatives are exact audited
     // ledgers; partial states and foreign migration tails match neither.

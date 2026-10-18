@@ -96,6 +96,9 @@ const USAGE = `takoserver deploy
     --legacy-host-runtime-predecessor-version=<uuid> [--reverse]
   bun run deploy -- takoserver-org-api-key --<mint|status|revoke> --environment=<env> --commit=<sha>
     --organization=org_... [--key-name=<name> --scope=<scope> --expires-in-days=<n>] [--key-id=key_...]
+  Integration --through-migration=0103 selects only the fixed audited100 -> original101/102/103
+  source registration plus its same-artifact mandatory deployment/RP receipts in one import.
+  It requires source-proved pre-auth103-quiesced all-traffic Worker and private install custody.
   Integration original-custody held post94 status also accepts --through-migration=0098.
   It requires the original convert declaration, TAKOSERVER_D1_MONEY_POST94_DECLARATION_PATH,
   and TAKOSERVER_D1_MONEY_NORMAL_WORKER_SELECTOR_PATH; apply remains unavailable.
@@ -220,7 +223,7 @@ type Invocation =
       readonly surface: "takoserver-d1-schema";
       readonly action: "status" | "apply";
       readonly environment: "integration";
-      readonly throughMigration: "0098";
+      readonly throughMigration: "0098" | "0103";
     })
   | (InvocationBase & {
       readonly surface:
@@ -300,7 +303,7 @@ interface ParsedInvocation {
   readonly adoptLivePath?: string;
   readonly bootstrapVerifierBridge?: boolean;
   readonly bootstrapProbePredecessorVersionId?: string;
-  readonly throughMigration?: SchemaWaveBoundary | "0098";
+  readonly throughMigration?: SchemaWaveBoundary | "0098" | "0103";
   readonly freshLineage?: "v2-artifacts-0075" | "v2-0088" | "v2-0089" | "v2-0091" | "v2-0092";
   readonly protectedReferenceEnvironment?: "integration" | "production";
   readonly organizationId?: string;
@@ -393,7 +396,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let adoptLivePath: string | null = null;
   let bootstrapVerifierBridge = false;
   let bootstrapProbePredecessorVersionId: string | null = null;
-  let throughMigration: SchemaWaveBoundary | "0098" | null = null;
+  let throughMigration: SchemaWaveBoundary | "0098" | "0103" | null = null;
   let protectedReferenceEnvironment: "integration" | "production" | null = null;
   let organizationId: string | null = null;
   let keyName: string | null = null;
@@ -622,7 +625,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     if (flag.startsWith("--through-migration=")) {
       if (throughMigration !== null) return null;
       const value = flag.slice("--through-migration=".length);
-      if (value === "0098") {
+      if (value === "0098" || value === "0103") {
         throughMigration = value;
       } else {
         if (!SCHEMA_WAVE_BOUNDARIES.includes(value as SchemaWaveBoundary)) return null;
@@ -917,7 +920,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     return null;
   }
   if (
-    throughMigration === "0098" &&
+    (throughMigration === "0098" || throughMigration === "0103") &&
     (surfaceValue !== "takoserver-d1-schema" || environment !== "integration")
   ) {
     return null;
@@ -1255,6 +1258,21 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
       "preflight",
       "original money maintenance selection is scoped to the integration first-publication route",
     );
+  if (invocation.throughMigration === "0103") {
+    if (invocation.environment !== "integration" || invocation.surface !== "takoserver-d1-schema")
+      throw new DeployError("preflight", "0103 source registration is integration-only");
+    const target = loadTarget(targetPath("integration"), "integration");
+    const production = loadTarget(
+      requireEnvironment("TAKOSERVER_DEPLOY_TARGET_PRODUCTION"),
+      "production",
+    );
+    const { runD1SchemaAuth103 } = await import("./deploy/schema-auth103-native-source.ts");
+    return await runD1SchemaAuth103(
+      { action: invocation.action, environment: "integration", commit: invocation.commit },
+      target,
+      production.d1,
+    );
+  }
   if (invocation.throughMigration === "0098") {
     if (originalCreateInput === undefined)
       throw new DeployError(
