@@ -701,6 +701,20 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain"],
   },
   {
+    // Finite portable Financial consent and Customer CAS data compilers.
+    name: "domain",
+    match:
+      /^src\/(?:shared-auth-financial-consent-request|shared-financial-(?:consent-data|admission|customer-(?:dispatch|journal)|current-consent-cas))\.ts$/u,
+    may: ["core", "domain"],
+  },
+  {
+    // Request-bound Financial custody joins already selected sources and ports.
+    name: "app",
+    match:
+      /^src\/(?:shared-auth-financial-(?:source|consent|consent-issuer)|shared-financial-customer-tracked-execution|financial-current-consent-customer)\.ts$/u,
+    may: ["core", "domain", "app"],
+  },
+  {
     // Shared app name policy belongs to the existing origin reservation domain.
     // Its pure helpers do not gain adapter or composition import authority.
     name: "domain",

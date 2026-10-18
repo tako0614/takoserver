@@ -23,6 +23,10 @@ import {
   sharedRpCredentialCurrentness,
 } from "./credential-authority-class.ts";
 import {
+  type FinancialCurrentConsentCustomerOperation,
+  readFinancialCurrentConsentNativeOriginal,
+} from "./financial-current-consent-customer.ts";
+import {
   assertHostedBillingFinancialRealm,
   type HostedBillingFinancialRealm,
 } from "./hosted-billing-realm.ts";
@@ -38,7 +42,7 @@ import {
   inspectMoneyCutoverGuard,
   type MoneyCutoverGuardState,
 } from "./money-cutover-sql.ts";
-import type { Clock, Row, Sql } from "./ports.ts";
+import { type Clock, type Row, type Sql, SqlError, type SqlWrite } from "./ports.ts";
 import { SHARED_AUTH_STAGING_PROFILE } from "./shared-auth-oidc-client.ts";
 import {
   createSharedAuthSession,
@@ -245,6 +249,89 @@ export interface WorkerRequestFinancialInputs {
 }
 
 const requestFinancialInputs = new WeakMap<WorkerRequestSql, WorkerRequestFinancialInputs>();
+
+// A D1 batch may have reached the target even when its acknowledgement was lost.
+// The Financial owner mints each operation, while this native request owns the
+// local send fence. A new operation for the same phase cannot resend it here.
+const financialCurrentConsentBatches = new WeakMap<WorkerRequestSql, Set<"L1" | "D">>();
+
+function readWorkerFinancialCurrentConsentNativeOriginal(
+  connection: WorkerRequestSql,
+  operation: FinancialCurrentConsentCustomerOperation,
+  expectedKind: "query" | "batch",
+) {
+  const origin = assertWorkerRequestBacking(connection);
+  const inputs = readWorkerRequestFinancialInputs(connection);
+  const original = readFinancialCurrentConsentNativeOriginal(operation, expectedKind);
+  if (
+    !original ||
+    original.kind !== expectedKind ||
+    original.connection !== connection ||
+    original.inputs !== inputs ||
+    original.writerEpoch !== origin.writerEpoch ||
+    original.original.writerEpoch !== origin.writerEpoch ||
+    original.original.phase !== original.phase ||
+    inputs.sql !== connection.sql
+  )
+    throw new SqlError("invalid", "Financial current consent operation origin differs");
+  return { origin, inputs, original };
+}
+
+/** Only Financial's retained fixed completed/original read uses the raw primary. */
+export async function queryWorkerRequestFinancialCurrentConsentOriginal(
+  connection: WorkerRequestSql,
+  operation: FinancialCurrentConsentCustomerOperation,
+): Promise<readonly Row[]> {
+  const { original, origin, inputs } = readWorkerFinancialCurrentConsentNativeOriginal(
+    connection,
+    operation,
+    "query",
+  );
+  if (original.kind !== "query")
+    throw new SqlError("invalid", "Financial current consent read origin differs");
+  const rows = await origin.rawSql.query(original.statement.sql, original.statement.params);
+  assertWorkerRequestBacking(connection);
+  const current = readFinancialCurrentConsentNativeOriginal(operation, "query");
+  if (current?.kind !== "query" || current.connection !== connection || current.inputs !== inputs)
+    throw new SqlError("unavailable", "Financial current consent read origin changed");
+  return rows;
+}
+
+/** Send one complete Financial-owned permit/receipt transaction on its original primary. */
+export async function batchWorkerRequestFinancialCurrentConsentOriginal(
+  connection: WorkerRequestSql,
+  operation: FinancialCurrentConsentCustomerOperation,
+): Promise<readonly SqlWrite[]> {
+  const { original, origin, inputs } = readWorkerFinancialCurrentConsentNativeOriginal(
+    connection,
+    operation,
+    "batch",
+  );
+  if (
+    original.kind !== "batch" ||
+    connection.moneyGuard !== "ready" ||
+    original.plan.phase !== original.phase ||
+    original.plan.statements.length !== (original.phase === "L1" ? 9 : 8)
+  )
+    throw new SqlError("invalid", "Financial current consent batch origin differs");
+  const sent = financialCurrentConsentBatches.get(connection) ?? new Set<"L1" | "D">();
+  if (sent.has(original.phase))
+    throw new SqlError("unavailable", "Financial current consent phase was already sent");
+  sent.add(original.phase);
+  financialCurrentConsentBatches.set(connection, sent);
+  const result = await origin.rawSql.batch(original.plan.statements);
+  assertWorkerRequestBacking(connection);
+  const current = readFinancialCurrentConsentNativeOriginal(operation, "batch");
+  if (current?.kind !== "batch" || current.connection !== connection || current.inputs !== inputs)
+    throw new SqlError("unavailable", "Financial current consent batch origin changed");
+  if (
+    result.length !== original.plan.statements.length ||
+    result[0]?.changes !== 1 ||
+    result.at(-1)?.changes !== 1
+  )
+    throw new SqlError("unavailable", "Financial current consent permit acknowledgement differs");
+  return result;
+}
 
 const retainedRpCaptureBrand: unique symbol = Symbol("worker-request-retained-rp");
 export interface WorkerRequestRetainedRpCapture {

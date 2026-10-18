@@ -5,11 +5,18 @@ import {
   captureWorkerRequestFinancialAuthRpRequest,
   readWorkerRequestFinancialAuthConsumerContext,
   readWorkerRequestFinancialAuthConsumerPort,
+} from "./financial-auth-consumer.ts";
+import {
+  type FinancialActionConsentR1Original,
+  type FinancialActionConsentR1Reader,
+  readFinancialActionConsentR1RequestCaptures,
+} from "./shared-financial-retained-r1.ts";
+import {
+  readWorkerRequestConsumers,
   readWorkerRequestFinancialInputs,
   readWorkerRequestRetainedRpCapture,
   type WorkerRequestSql,
-} from "./financial-request-origin.ts";
-import { readWorkerRequestConsumers } from "./worker-request-composition.ts";
+} from "./worker-request-composition.ts";
 
 /** Private, unmounted request observation. No consent, acceptedAt or current grant. */
 export class SharedAuthFinancialSourceUnavailable extends Error {
@@ -42,6 +49,7 @@ export interface SharedAuthFinancialRequestNativeObservationData {
   readonly credential: Retained["record"];
   readonly human: Principal["binding"];
   readonly currentSession: Retained["current"];
+  readonly finalSession: Retained["finalSession"];
 }
 
 type Port = NonNullable<ReturnType<typeof readWorkerRequestFinancialAuthConsumerPort>>;
@@ -177,13 +185,15 @@ function assertCaptures(held: Held): void {
 /**
  * Real request/connection Root input and source Clock observation only. The
  * sampled time stays inside this capture; it is not acceptedAt or a permission.
- * The Financial qualified R1 reader, distinct consent issuer, affirmative POST,
- * current verifier and any durable effect remain unavailable/unmounted.
+ * A successful Financial R1 reader can supply its held Root originals here.
+ * This sample remains DATA; affirmative POST, NEW/CAS and any mounted effect
+ * need separate qualification.
  */
-export async function captureSharedAuthFinancialRequestClockObservation(
+async function captureClockObservationFromOriginal(
   connection: WorkerRequestSql,
   request: Request,
   workspaceId: string,
+  readOriginalCaptures: (port: Port) => Promise<Captures | null>,
 ): Promise<SharedAuthFinancialRequestClockObservation> {
   try {
     if (!requestIsOriginal(request) || typeof workspaceId !== "string" || workspaceId.length === 0)
@@ -216,7 +226,7 @@ export async function captureSharedAuthFinancialRequestClockObservation(
       methods,
     };
     assertOrigin(origin);
-    const captures = await captureWorkerRequestFinancialAuthRpRequest(port, request, workspaceId);
+    const captures = await readOriginalCaptures(port);
     assertOrigin(origin);
     if (!captures) return unavailable();
     const credential = port.readValidatedCredential(captures.credential);
@@ -251,6 +261,42 @@ export async function captureSharedAuthFinancialRequestClockObservation(
   } catch {
     return unavailable();
   }
+}
+
+/** Historical DATA callers keep the original Root observation path. An RP
+ * Financial-R1 continuation supplies the Financial owner's static original
+ * reader to the private common implementation; it must not retouch here. */
+export function captureSharedAuthFinancialRequestClockObservation(
+  connection: WorkerRequestSql,
+  request: Request,
+  workspaceId: string,
+): Promise<SharedAuthFinancialRequestClockObservation> {
+  return captureClockObservationFromOriginal(connection, request, workspaceId, (port) =>
+    captureWorkerRequestFinancialAuthRpRequest(port, request, workspaceId),
+  );
+}
+
+/** Exact Financial successful-R1 result is only a custody key. The Financial
+ * static reader returns the Root handles from its own prior observer; this
+ * path never invokes the observer again or accepts caller-shaped originals. */
+export function captureSharedAuthFinancialRequestClockObservationFromR1(
+  connection: WorkerRequestSql,
+  request: Request,
+  workspaceId: string,
+  reader: FinancialActionConsentR1Reader,
+  retainedR1: FinancialActionConsentR1Original,
+): Promise<SharedAuthFinancialRequestClockObservation> {
+  return captureClockObservationFromOriginal(connection, request, workspaceId, () =>
+    Promise.resolve(
+      readFinancialActionConsentR1RequestCaptures(
+        connection,
+        request,
+        workspaceId,
+        reader,
+        retainedR1,
+      ),
+    ),
+  );
 }
 
 /** Static reader: the original Request object and Root graph must still match. */
@@ -303,6 +349,7 @@ export function readSharedAuthFinancialRequestNativeObservationData(
       credential: held.retained.record,
       human: held.principal.binding,
       currentSession: held.retained.current,
+      finalSession: held.retained.finalSession,
     });
   } catch {
     return unavailable();

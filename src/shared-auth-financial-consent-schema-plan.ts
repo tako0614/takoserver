@@ -8,6 +8,7 @@ export const SHARED_AUTH_FINANCIAL_CONSENT_LEAF_PREFIX = "shared_auth_financial_
 const PENDING = `${SHARED_AUTH_FINANCIAL_CONSENT_LEAF_PREFIX}pending`;
 const COMMANDS = `${SHARED_AUTH_FINANCIAL_CONSENT_LEAF_PREFIX}commands`;
 const ORIGINALS = `${SHARED_AUTH_FINANCIAL_CONSENT_LEAF_PREFIX}originals`;
+export const SHARED_AUTH_FINANCIAL_CONSENT_ISSUERS = `${SHARED_AUTH_FINANCIAL_CONSENT_LEAF_PREFIX}issuer_registrations`;
 const MAX_INTEGER = 9_007_199_254_740_991;
 const FAMILY = "rp-explicit-action-consent";
 
@@ -126,6 +127,18 @@ const originalDDL = `CREATE TABLE ${ORIGINALS} (
  CHECK(receipt_recorded_at=recorded_at)
 )`;
 
+// The RP issuer is a separate code-selected original, never an alias for the
+// Auth103 RP registration or the Financial action-source registration. This is
+// still an unnumbered candidate; Root owns any eventual composition/apply.
+const issuerDDL = `CREATE TABLE ${SHARED_AUTH_FINANCIAL_CONSENT_ISSUERS} (
+ registration_ref TEXT NOT NULL, incarnation TEXT NOT NULL,
+ registration_digest TEXT NOT NULL, original_json TEXT NOT NULL,
+ PRIMARY KEY(registration_ref,incarnation),
+ ${textCheck("registration_ref")}, ${textCheck("incarnation")},
+ ${digestCheck("registration_digest")},
+ ${textCheck("original_json", 4096)}
+)`;
+
 const retainedJoin = `SELECT 1 FROM credential_authority_classes c
  JOIN shared_principal_bindings b ON b.binding_ref=c.principal_binding_ref AND b.principal_id=c.principal_id AND b.principal_incarnation=c.principal_incarnation
  JOIN auth_principal_incarnations p ON p.principal_id=c.principal_id AND p.principal_incarnation=c.principal_incarnation`;
@@ -144,6 +157,12 @@ type SchemaObject = Readonly<{
   sql: string;
 }>;
 const objects: SchemaObject[] = [
+  {
+    type: "table",
+    name: SHARED_AUTH_FINANCIAL_CONSENT_ISSUERS,
+    table: SHARED_AUTH_FINANCIAL_CONSENT_ISSUERS,
+    sql: issuerDDL,
+  },
   { type: "table", name: PENDING, table: PENDING, sql: pendingDDL },
   { type: "table", name: COMMANDS, table: COMMANDS, sql: commandDDL },
   { type: "table", name: ORIGINALS, table: ORIGINALS, sql: originalDDL },
@@ -190,11 +209,13 @@ WHEN NOT EXISTS(SELECT 1 FROM ${COMMANDS} c JOIN ${PENDING} p ON p.transaction_r
 BEGIN SELECT RAISE(ABORT,'Exact predispatch command and active retained tuple required'); END`,
   },
 ];
-for (const table of [PENDING, COMMANDS, ORIGINALS]) {
+for (const table of [SHARED_AUTH_FINANCIAL_CONSENT_ISSUERS, PENDING, COMMANDS, ORIGINALS]) {
   const duplicate =
-    table === PENDING
-      ? `transaction_ref=NEW.transaction_ref OR (registration_ref=NEW.registration_ref AND incarnation=NEW.incarnation AND challenge_ref=NEW.challenge_ref AND action_ref=NEW.action_ref)`
-      : `command_ref=NEW.command_ref OR transaction_ref=NEW.transaction_ref OR consent_ref=NEW.consent_ref OR receipt_ref=NEW.receipt_ref`;
+    table === SHARED_AUTH_FINANCIAL_CONSENT_ISSUERS
+      ? "registration_ref=NEW.registration_ref AND incarnation=NEW.incarnation"
+      : table === PENDING
+        ? `transaction_ref=NEW.transaction_ref OR (registration_ref=NEW.registration_ref AND incarnation=NEW.incarnation AND challenge_ref=NEW.challenge_ref AND action_ref=NEW.action_ref)`
+        : `command_ref=NEW.command_ref OR transaction_ref=NEW.transaction_ref OR consent_ref=NEW.consent_ref OR receipt_ref=NEW.receipt_ref`;
   objects.push(
     {
       type: "trigger",
@@ -346,7 +367,7 @@ async function inspectSchemaWithPort(
   }
   const rows = await query(
     port,
-    "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name GLOB 'shared_auth_financial_consent_*' AND sql IS NOT NULL ORDER BY name LIMIT 16",
+    "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name GLOB 'shared_auth_financial_consent_*' AND sql IS NOT NULL ORDER BY name LIMIT 32",
   );
   if (rows.length === 0) return "leaf-absent";
   if (rows.length !== SHARED_AUTH_FINANCIAL_CONSENT_LEAF_OBJECTS.length) return schemaConflict();

@@ -4,6 +4,8 @@ import { Miniflare } from "miniflare";
 import { moneyFenceInstallSql } from "../scripts/deploy/schema-money-unit-cutover.ts";
 import { assertRetainedDirectOwnerSessionReader } from "../src/auth.ts";
 import { additiveAuthTokenDDL } from "../src/auth-authority-schema-plan.ts";
+import { readWorkerRequestFinancialAuthConsumerPort } from "../src/financial-auth-consumer.ts";
+import { createFinancialCurrentConsentCustomerExecutor } from "../src/financial-current-consent-customer.ts";
 import { verifyHostedBillingFinancialRealm } from "../src/hosted-billing-realm.ts";
 import { resolveIdentity } from "../src/identity-setup.ts";
 import { base64UrlEncode, bytesDigest } from "../src/json.ts";
@@ -434,6 +436,37 @@ test("native request preserves actual issued direct handle and same original inp
     expect(r.trace.reads).toHaveLength(reads);
     expect(r.trace.primaryCalls).toBe(1);
     expect(r.trace.rootCalls).toBe(0);
+  } finally {
+    await f.runtime.dispose();
+  }
+}, 30_000);
+
+test("native original request refuses Financial Customer before its Auth103 port with no new effect", async () => {
+  const f = await fixture();
+  try {
+    const r = await f.requestScope();
+    const reads = r.trace.reads.length;
+    const batches = r.trace.batches.length;
+    const primaryCalls = r.trace.primaryCalls;
+    const rootCalls = r.trace.rootCalls;
+    const counts = await f.counts();
+    expect(readWorkerRequestFinancialAuthConsumerPort(r.connection)).toBeNull();
+    expect(() =>
+      createFinancialCurrentConsentCustomerExecutor(
+        r.connection,
+        undefined as never,
+        new Request("https://fixture.invalid/financial-current-consent"),
+        "fixture-workspace",
+        undefined as never,
+        undefined as never,
+        undefined as never,
+      ),
+    ).toThrow("financial current consent customer unavailable");
+    expect(r.trace.reads).toHaveLength(reads);
+    expect(r.trace.batches).toHaveLength(batches);
+    expect(r.trace.primaryCalls).toBe(primaryCalls);
+    expect(r.trace.rootCalls).toBe(rootCalls);
+    expect(await f.counts()).toEqual(counts);
   } finally {
     await f.runtime.dispose();
   }

@@ -20,6 +20,26 @@ const request = () =>
 // The fixed Root port is absent from this synthetic fixture. These are only
 // fail-closed tests; no fabricated port or session observation is accepted.
 describe("unmounted RP observation to native batch bridge", () => {
+  test("Financial R1 bridge refuses a missing genuine Root origin before Clock or native write", async () => {
+    const f = await graphFixture();
+    const before = snapshot(f.db);
+    const effects = f.effects();
+    const req = request();
+    const handler = createSharedAuthFinancialConsentRequestHandler(f.connection);
+    await expect(
+      handler.persistFinancialR1ObservedData(
+        req,
+        f.input.pending.workspace_id,
+        f.input.pending.challenge_ref,
+        { pending: f.input.pending, command: f.input.command },
+      ),
+    ).rejects.toMatchObject({ code: "unavailable" });
+    expect(req.bodyUsed).toBe(false);
+    expect(f.native.batchCalls).toBe(0);
+    expect(snapshot(f.db)).toEqual(before);
+    expect(f.effects()).toEqual(effects);
+  });
+
   test("own handler connects one observation to the writer and fails without Root", async () => {
     const f = await graphFixture();
     const before = snapshot(f.db);

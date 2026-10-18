@@ -158,6 +158,44 @@ function storedJson(value: unknown): unknown {
   }
 }
 
+/** Shared deterministic customer command DATA recipe; it grants no dispatch authority. */
+export async function createStripeCustomerOriginalDefinition(
+  realm: HostedBillingFinancialRealm,
+  org: string,
+) {
+  const frozenRealm = Object.freeze({
+    accountId: realm.accountId,
+    financialRealm: realm.financialRealm,
+    livemode: false as const,
+    billingAuthority: realm.billingAuthority,
+  });
+  const digest = await canonicalDigest({
+    organizationId: org,
+    realm: frozenRealm,
+    purpose: "hosted_subscription",
+  });
+  const key = `takoserver_customer_${digest.slice(7)}`;
+  const command: CustomerCommand = Object.freeze({
+    organizationId: org,
+    realm: frozenRealm,
+    metadata: Object.freeze({
+      organizationId: org,
+      takoserverPurpose: "hosted_subscription",
+      stripeAccountId: realm.accountId,
+      financialRealm: realm.financialRealm,
+      customerCreationCommand: digest,
+      customerCreationKey: key,
+    }),
+  });
+  return Object.freeze({
+    realmJson: canonicalJson(frozenRealm),
+    requestJson: canonicalJson(command),
+    command,
+    key,
+    fingerprint: await canonicalDigest(command),
+  });
+}
+
 /** One customer authority, used before both canonical subscription and top-up Checkout. */
 export function createStripeCustomerCustody(options: {
   readonly sql: Sql;
@@ -173,31 +211,12 @@ export function createStripeCustomerCustody(options: {
   });
   const now = () => clock().toISOString();
   async function original(org: string) {
-    const frozenRealm = Object.freeze({
-      accountId: realm.accountId,
-      financialRealm: realm.financialRealm,
-      livemode: false as const,
-      billingAuthority: realm.billingAuthority,
-    });
-    const digest = await canonicalDigest({
-      organizationId: org,
-      realm: frozenRealm,
-      purpose: "hosted_subscription",
-    });
-    const key = `takoserver_customer_${digest.slice(7)}`;
-    const command: CustomerCommand = Object.freeze({
-      organizationId: org,
-      realm: frozenRealm,
-      metadata: Object.freeze({
-        organizationId: org,
-        takoserverPurpose: "hosted_subscription",
-        stripeAccountId: realm.accountId,
-        financialRealm: realm.financialRealm,
-        customerCreationCommand: digest,
-        customerCreationKey: key,
-      }),
-    });
-    return { command, key, fingerprint: await canonicalDigest(command) };
+    const selected = await createStripeCustomerOriginalDefinition(realm, org);
+    return {
+      command: selected.command,
+      key: selected.key,
+      fingerprint: selected.fingerprint,
+    };
   }
   async function snapshot(org: string): Promise<{
     readonly receipt: Receipt | null;

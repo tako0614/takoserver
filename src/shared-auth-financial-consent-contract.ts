@@ -584,6 +584,39 @@ export async function createSharedAuthFinancialActionConsentOriginalIdentity(
 }
 
 /** Stable data key from the persisted challenge/action original; never current Principal/session/time. */
+export async function createSharedAuthFinancialActionConsentCaptureKeyData(
+  input: unknown,
+): Promise<FinancialSourceDigest> {
+  const fields = record(input, [
+    "challengeRef",
+    "actionKind",
+    "actionReference",
+    "actionRequestFingerprint",
+  ]);
+  const challengeRef = fields.challengeRef;
+  const actionKind = fields.actionKind;
+  const actionReference = fields.actionReference;
+  const actionRequestFingerprint = fields.actionRequestFingerprint;
+  if (
+    !financialSourceRef(challengeRef) ||
+    !["topup", "subscription-start", "card-setup", "plan-change", "cancel"].includes(
+      String(actionKind),
+    ) ||
+    !financialSourceRef(actionReference) ||
+    !financialSourceDigest(actionRequestFingerprint)
+  )
+    return invalid();
+  const key = await canonicalDigest([
+    CONSENT_CAPTURE_KEY_VERSION,
+    challengeRef,
+    actionKind,
+    actionReference,
+    actionRequestFingerprint,
+  ]);
+  return isSha256Digest(key) ? key : invalid();
+}
+
+/** Pure key DATA shared with the internal rpfc address; it is not consent. */
 export async function createSharedAuthFinancialActionConsentCaptureKey(
   input: unknown,
 ): Promise<FinancialSourceDigest> {
@@ -606,12 +639,10 @@ export async function createSharedAuthFinancialActionConsentCaptureKey(
     consentDigest !== original.consentDigest
   )
     return invalid();
-  const key = await canonicalDigest([
-    CONSENT_CAPTURE_KEY_VERSION,
+  return createSharedAuthFinancialActionConsentCaptureKeyData({
     challengeRef,
     actionKind,
     actionReference,
     actionRequestFingerprint,
-  ]);
-  return isSha256Digest(key) ? key : invalid();
+  });
 }
