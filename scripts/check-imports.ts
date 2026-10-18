@@ -677,6 +677,12 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain", "app"],
   },
   {
+    // Unmounted request observation and consent composition use app ports only.
+    name: "app",
+    match: /^src\/shared-auth-financial-(?:source|consent)\.ts$/u,
+    may: ["core", "domain", "app"],
+  },
+  {
     // Exact displayed terms join existing R1 app DATA with core/domain tariff facts.
     name: "app",
     match: /^src\/financial-displayed-terms\.ts$/u,
@@ -871,6 +877,69 @@ function exactContainerAdapterImportEdge(path: string, target: string): boolean 
   return JSON.stringify(names.sort()) === JSON.stringify([...expected.names].sort());
 }
 
+// These three app modules consume the existing request-origin barrel only for
+// their fixed original-backed readers and currentness guards. This is not a
+// general app -> package-surface dependency or an authority-minting grant.
+const EXACT_RP_FINANCIAL_ORIGIN_IMPORTS: Readonly<Record<string, readonly string[]>> = {
+  "src/shared-auth-financial-consent-store.ts": [
+    "assertFinancialAuthConsumerPort",
+    "assertWorkerRequestFinancialAuthConsumerPort",
+    "captureWorkerRequestFinancialAuthRpRequest",
+    "financialAuthConsumerSourceCurrentness",
+    "readWorkerRequestFinancialAuthConsumerContext",
+    "readWorkerRequestFinancialAuthConsumerPort",
+    "readWorkerRequestFinancialInputs",
+    "readWorkerRequestRetainedRpCapture",
+  ],
+  "src/shared-auth-financial-consent.ts": [
+    "assertFinancialAuthConsumerPort",
+    "assertWorkerRequestFinancialAuthConsumerPort",
+    "captureWorkerRequestFinancialAuthRpRequest",
+    "readWorkerRequestFinancialAuthConsumerContext",
+    "readWorkerRequestFinancialAuthConsumerPort",
+    "readWorkerRequestFinancialInputs",
+    "readWorkerRequestRetainedRpCapture",
+    "type WorkerRequestSql",
+  ],
+  "src/shared-auth-financial-source.ts": [
+    "assertFinancialAuthConsumerPort",
+    "assertWorkerRequestFinancialAuthConsumerPort",
+    "captureWorkerRequestFinancialAuthRpRequest",
+    "readWorkerRequestFinancialAuthConsumerContext",
+    "readWorkerRequestFinancialAuthConsumerPort",
+    "readWorkerRequestFinancialInputs",
+    "readWorkerRequestRetainedRpCapture",
+    "type WorkerRequestSql",
+  ],
+};
+
+function exactRpFinancialOriginImportEdge(path: string, target: string): boolean {
+  if (target !== "src/financial-request-origin.ts") return false;
+  const expected = EXACT_RP_FINANCIAL_ORIGIN_IMPORTS[path];
+  if (expected === undefined) return false;
+  const source = readFileSync(path, "utf8");
+  // Count every literal reference, including export, default/namespace,
+  // dynamic import and require forms that the general graph parser may miss.
+  // These fixed consumers have no dynamic module loading at all.
+  const references = [...source.matchAll(/(["'`])(\.[^"'`]+)\1/gu)].filter(
+    (entry) => normalize(relative(resolve("."), resolve(dirname(path), entry[2] ?? ""))) === target,
+  );
+  if (references.length !== 1 || /\b(?:import|require)\s*\(/u.test(source)) return false;
+  const declarations = [
+    ...source.matchAll(
+      /^import\s+\{([^}]+)\}\s+from\s+(["'])\.\/financial-request-origin\.ts\2;$/gmu,
+    ),
+  ];
+  const declaration = declarations[0];
+  if (declarations.length !== 1 || declaration === undefined) return false;
+  const names = (declaration[1] ?? "")
+    .split(",")
+    .map((name) => name.trim().replace(/\s+/gu, " "))
+    .filter((name) => name !== "");
+  if (names.some((name) => !/^(?:type )?[A-Za-z_$][\w$]*$/u.test(name))) return false;
+  return JSON.stringify(names.sort()) === JSON.stringify([...expected].sort());
+}
+
 for (const path of walk("src")) {
   if (!path.endsWith(".ts") || path.endsWith(".d.ts")) continue;
   const layer = layerOf(path);
@@ -1033,6 +1102,7 @@ for (const path of walk("src")) {
       !exactContainerHostAcceptanceEdge &&
       !exactContainerConstructionExportEdge &&
       !exactContainerAdapterImportEdge(path, target) &&
+      !exactRpFinancialOriginImportEdge(path, target) &&
       !exactOriginDeploymentParserEdge &&
       !exactWorkerEndpointOriginConstructionEdge &&
       !exactOriginPublicationExtensionEdge &&

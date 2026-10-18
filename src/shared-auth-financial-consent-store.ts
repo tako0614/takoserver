@@ -2,6 +2,16 @@ import {
   type RpAuthorityRecord,
   sharedRpCredentialCurrentness,
 } from "./credential-authority-class.ts";
+import {
+  assertFinancialAuthConsumerPort,
+  assertWorkerRequestFinancialAuthConsumerPort,
+  captureWorkerRequestFinancialAuthRpRequest,
+  financialAuthConsumerSourceCurrentness,
+  readWorkerRequestFinancialAuthConsumerContext,
+  readWorkerRequestFinancialAuthConsumerPort,
+  readWorkerRequestFinancialInputs,
+  readWorkerRequestRetainedRpCapture,
+} from "./financial-request-origin.ts";
 import { bytesDigest, canonicalJson } from "./json.ts";
 import type { Row, Sql, SqlParam, SqlStatement, SqlWrite } from "./ports.ts";
 import { parseSharedAuthFinancialActionConsentOriginal } from "./shared-auth-financial-consent-contract.ts";
@@ -12,6 +22,7 @@ import {
   requireSharedAuthFinancialConsentConsumePostimage,
   SHARED_AUTH_FINANCIAL_CONSENT_LEAF_PREFIX,
 } from "./shared-auth-financial-consent-schema-plan.ts";
+import { readSharedAuthFinancialRequestNativeObservationData } from "./shared-auth-financial-source.ts";
 import {
   authAuthorityDigest,
   authAuthorityInteger,
@@ -1351,7 +1362,9 @@ async function requireCaptureRecipe(
     return fail(code);
   let terms: string;
   try {
-    terms = new TextDecoder("utf-8", { fatal: true }).decode(pending.terms_original_bytes);
+    terms = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(
+      pending.terms_original_bytes,
+    );
   } catch {
     return fail(code);
   }
@@ -1748,7 +1761,9 @@ async function pendingCustody(
   await requireCustody(pending.challenge_original_bytes, pending.challenge_custody_sha256, code);
   let terms: string;
   try {
-    terms = new TextDecoder("utf-8", { fatal: true }).decode(pending.terms_original_bytes);
+    terms = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(
+      pending.terms_original_bytes,
+    );
   } catch {
     return fail(code);
   }
@@ -2027,6 +2042,41 @@ RETURNING ${originalColumns.join(",")}`,
   );
 }
 
+/** Root's ten-bound-parameter condition is used only by this private,
+ * request-owned final statement. The public structural DATA builder above
+ * cannot receive or manufacture it. A false condition writes NULL to the
+ * original key, so the existing NOT NULL constraint aborts the batch prefix.
+ */
+function requiredNativeOriginalConsumeStatement(
+  captured: ReturnType<typeof snapshotGuarded>,
+  nativeCurrentness: ReturnType<typeof financialAuthConsumerSourceCurrentness>,
+): SqlStatement {
+  if (nativeCurrentness.params.length !== 10) return fail("unavailable");
+  const { cte, where, params } = guardedSQL(captured);
+  return closedStatement(
+    `${cte}
+INSERT INTO ${ORIGINALS} (${originalColumns.join(",")})
+SELECT CASE WHEN (${where} AND (${nativeCurrentness.sql}) AND NOT ${collision(ORIGINALS)}) THEN c.consent_ref ELSE NULL END,
+ c.command_ref,c.transaction_ref,c.receipt_ref,c.registration_ref,c.incarnation,
+ c.organization_id,c.workspace_id,c.workspace_ref,c.original_bytes,c.original_digest,c.original_custody_sha256,e.recorded_at,e.recorded_at
+FROM expected e LEFT JOIN ${PENDING} p ON p.transaction_ref=e.p_transaction_ref
+ LEFT JOIN ${COMMANDS} c ON c.transaction_ref=p.transaction_ref AND c.command_ref=e.c_command_ref
+RETURNING ${originalColumns.join(",")}`,
+    [...params, ...nativeCurrentness.params],
+  );
+}
+
+function requiredNativePendingCaptureConsumeStatements(
+  captured: ReturnType<typeof snapshotGuarded>,
+  nativeCurrentness: ReturnType<typeof financialAuthConsumerSourceCurrentness>,
+): readonly SqlStatement[] {
+  return Object.freeze([
+    requiredPendingPersistenceStatement(captured),
+    requiredCommandCaptureStatement(captured),
+    requiredNativeOriginalConsumeStatement(captured, nativeCurrentness),
+  ]);
+}
+
 function requiredPendingCaptureConsumeStatements(
   captured: ReturnType<typeof snapshotGuarded>,
 ): readonly SqlStatement[] {
@@ -2254,4 +2304,578 @@ export async function persistCaptureAndConsumeSharedAuthFinancialConsentRequestD
     port.sameOrigin();
     return fail("unavailable");
   }
+}
+
+/** Pending/command/recordedAt remain unqualified RP DATA. The credential,
+ * current retained session, and separate human binding are never caller fields.
+ */
+export interface SharedAuthFinancialConsentNativeRequestData
+  extends SharedAuthFinancialConsentCaptureData {
+  readonly recordedAt: number;
+}
+
+/** UNMOUNTED, request-owned DATA effect with Root native currentness inside the
+ * final required-row statement of the same captured Sql batch. This does not
+ * originate explicit action consent or verify its currentness, and does not
+ * supply Financial R1/terms/current NEW admission or first-dispatch CAS.
+ * Unknown/failed batch never permits resend; historical GET stays separate.
+ */
+export async function persistCaptureAndConsumeSharedAuthFinancialConsentNativeRequestData(
+  connection: WorkerRequestSql,
+  request: Request,
+  workspaceId: string,
+  input: SharedAuthFinancialConsentNativeRequestData,
+): Promise<SharedAuthFinancialConsentOriginalData> {
+  const batch = captureRequiredRequestBatchSql(connection);
+  let captured: SharedAuthFinancialConsentNativeRequestData;
+  try {
+    const raw = exactOwn(input, ["pending", "command", "recordedAt"], "invalid_request");
+    const capture = snapshotRequestCapture({ pending: raw.pending, command: raw.command });
+    captured = Object.freeze({ ...capture, recordedAt: stamp(raw.recordedAt, "invalid_request") });
+    if (
+      !(request instanceof Request) ||
+      typeof workspaceId !== "string" ||
+      workspaceId.length === 0
+    )
+      return fail("invalid_request");
+  } catch {
+    return fail("invalid_request");
+  }
+
+  let rootPort: NonNullable<ReturnType<typeof readWorkerRequestFinancialAuthConsumerPort>>;
+  let rootContext: NonNullable<ReturnType<typeof readWorkerRequestFinancialAuthConsumerContext>>;
+  let inputs: ReturnType<typeof readWorkerRequestFinancialInputs>;
+  let guarded: ReturnType<typeof snapshotGuarded>;
+  const assertRoot = () => {
+    batch.sameOrigin();
+    try {
+      if (
+        readWorkerRequestFinancialInputs(connection) !== inputs ||
+        readWorkerRequestFinancialAuthConsumerPort(connection) !== rootPort ||
+        readWorkerRequestFinancialAuthConsumerContext(connection, rootPort) !== rootContext ||
+        rootContext.sql !== inputs.sql ||
+        rootContext.realm !== inputs.realm ||
+        rootContext.writerEpoch !== inputs.writerEpoch
+      )
+        return fail("unavailable");
+      assertWorkerRequestFinancialAuthConsumerPort(connection, rootPort);
+      assertFinancialAuthConsumerPort(rootPort, rootContext);
+    } catch {
+      return fail("unavailable");
+    }
+  };
+  try {
+    batch.sameOrigin();
+    inputs = readWorkerRequestFinancialInputs(connection);
+    rootPort = readWorkerRequestFinancialAuthConsumerPort(connection) ?? fail("unavailable");
+    rootContext =
+      readWorkerRequestFinancialAuthConsumerContext(connection, rootPort) ?? fail("unavailable");
+    assertRoot();
+    const originals = await captureWorkerRequestFinancialAuthRpRequest(
+      rootPort,
+      request,
+      workspaceId,
+    );
+    assertRoot();
+    if (!originals) return fail("unavailable");
+    const credential = rootPort.readValidatedCredential(originals.credential);
+    assertRoot();
+    if (credential.backend !== "shared-rp-session") return fail("unavailable");
+    const principal = rootPort.readValidatedPrincipalBinding(originals.userBinding);
+    assertRoot();
+    const retained = readWorkerRequestRetainedRpCapture(connection, originals.credential);
+    assertRoot();
+    if (
+      !retained ||
+      retained.record !== credential.record ||
+      retained.current !== credential.current ||
+      retained.selectedScope.workspaceId !== workspaceId
+    )
+      return fail("unavailable");
+    guarded = snapshotGuarded(
+      snapshotRequestGuarded({
+        pending: captured.pending,
+        command: captured.command,
+        recordedAt: captured.recordedAt,
+        credential: retained.record,
+        human: principal.binding,
+        currentSession: retained.current,
+      }),
+    );
+    assertRoot();
+  } catch {
+    batch.sameOrigin();
+    return fail("unavailable");
+  }
+
+  const expected = Object.freeze({
+    key: guarded.command.key,
+    selectedScope: guarded.command.selectedScope,
+    originalBytes: new Uint8Array(guarded.command.originalBytes),
+    originalDigest: guarded.command.originalDigest,
+    originalCustodySHA256: guarded.command.originalCustodySHA256,
+    recordedAt: guarded.recordedAt,
+  });
+  const originals = createSharedAuthFinancialConsentOriginalReader(batch.queryPort);
+  let statements: readonly SqlStatement[];
+  try {
+    await requireCaptureRecipe(guarded, "invalid_request");
+    assertRoot();
+    await validateCaptureHashes(guarded);
+    assertRoot();
+    if ((await inspectSharedAuthFinancialConsentLeafSchema(batch.queryPort)) !== "leaf-present")
+      return fail("unavailable");
+    assertRoot();
+    const nativeCurrentness = financialAuthConsumerSourceCurrentness(rootPort, rootContext);
+    assertRoot();
+    statements = requiredNativePendingCaptureConsumeStatements(guarded, nativeCurrentness);
+    if (statements.length !== 3 || statements[2]?.params?.length !== 91) return fail("unavailable");
+    assertRoot();
+  } catch {
+    assertRoot();
+    return fail("unavailable");
+  }
+  try {
+    const results = requiredDenseValues(await batch.runRequiredBatch(statements), 3);
+    assertRoot();
+    const pendingWrite = snapshotRequiredBatchWrite(results[0], pendingColumns);
+    const commandWrite = snapshotRequiredBatchWrite(results[1], commandColumns);
+    const originalWrite = snapshotRequiredBatchWrite(results[2], originalColumns);
+    const pending = snapshotPendingBoundary(pendingWrite.rows[0], "unavailable");
+    if (!samePending(pending, guarded.pending)) return fail("unavailable");
+    await pendingCustody(pending, "unavailable");
+    assertRoot();
+    await requireSharedAuthFinancialConsentCommandCapturePostimage(commandWrite, guarded.command);
+    assertRoot();
+    await requireSharedAuthFinancialConsentConsumePostimage(originalWrite, expected);
+    assertRoot();
+    const original = await originals.readOriginal(guarded.command);
+    assertRoot();
+    if (
+      original === undefined ||
+      original.recordedAt !== guarded.recordedAt ||
+      original.receiptRecordedAt !== guarded.recordedAt
+    )
+      return fail("unavailable");
+    return original;
+  } catch {
+    assertRoot();
+    return fail("unavailable");
+  }
+}
+
+/**
+ * UNMOUNTED DATA effect using the one already captured RP final observation.
+ * The original Request/connection/Workspace and Root source Clock are
+ * reasserted through the static observation reader across every await. No
+ * second final observer, RP touch, reload or capture fallback occurs here.
+ * This is not affirmative/current consent or Financial NEW admission.
+ */
+export async function persistCaptureAndConsumeSharedAuthFinancialConsentObservedRequestData(
+  connection: WorkerRequestSql,
+  request: Request,
+  workspaceId: string,
+  observation: unknown,
+  input: SharedAuthFinancialConsentCaptureData,
+): Promise<SharedAuthFinancialConsentOriginalData> {
+  const batch = captureRequiredRequestBatchSql(connection);
+  let captured: SharedAuthFinancialConsentCaptureData;
+  try {
+    captured = snapshotRequestCapture(input);
+    if (
+      !(request instanceof Request) ||
+      typeof workspaceId !== "string" ||
+      workspaceId.length === 0
+    )
+      return fail("invalid_request");
+  } catch {
+    return fail("invalid_request");
+  }
+
+  let observed: ReturnType<typeof readSharedAuthFinancialRequestNativeObservationData>;
+  let rootPort: NonNullable<ReturnType<typeof readWorkerRequestFinancialAuthConsumerPort>>;
+  let rootContext: NonNullable<ReturnType<typeof readWorkerRequestFinancialAuthConsumerContext>>;
+  let inputs: ReturnType<typeof readWorkerRequestFinancialInputs>;
+  let guarded: ReturnType<typeof snapshotGuarded>;
+  const assertBridge = (): void => {
+    batch.sameOrigin();
+    try {
+      const current = readSharedAuthFinancialRequestNativeObservationData(
+        connection,
+        request,
+        workspaceId,
+        observation,
+      );
+      if (
+        readWorkerRequestFinancialInputs(connection) !== inputs ||
+        readWorkerRequestFinancialAuthConsumerPort(connection) !== rootPort ||
+        readWorkerRequestFinancialAuthConsumerContext(connection, rootPort) !== rootContext ||
+        rootContext.sql !== inputs.sql ||
+        rootContext.realm !== inputs.realm ||
+        rootContext.writerEpoch !== inputs.writerEpoch ||
+        current.selectedScope !== observed.selectedScope ||
+        current.sampledAt !== observed.sampledAt ||
+        current.credential !== observed.credential ||
+        current.human !== observed.human ||
+        current.currentSession !== observed.currentSession
+      )
+        fail("unavailable");
+      assertWorkerRequestFinancialAuthConsumerPort(connection, rootPort);
+      assertFinancialAuthConsumerPort(rootPort, rootContext);
+    } catch {
+      fail("unavailable");
+    }
+  };
+  try {
+    batch.sameOrigin();
+    observed = readSharedAuthFinancialRequestNativeObservationData(
+      connection,
+      request,
+      workspaceId,
+      observation,
+    );
+    inputs = readWorkerRequestFinancialInputs(connection);
+    rootPort = readWorkerRequestFinancialAuthConsumerPort(connection) ?? fail("unavailable");
+    rootContext =
+      readWorkerRequestFinancialAuthConsumerContext(connection, rootPort) ?? fail("unavailable");
+    assertBridge();
+    const selected = observed.selectedScope;
+    if (
+      selected.workspaceId !== workspaceId ||
+      captured.pending.workspace_id !== selected.workspaceId ||
+      captured.pending.workspace_ref !== selected.workspaceRef ||
+      captured.pending.organization_id !== selected.organizationId ||
+      captured.command.selectedScope.workspaceId !== selected.workspaceId ||
+      captured.command.selectedScope.workspaceRef !== selected.workspaceRef ||
+      captured.command.selectedScope.organizationId !== selected.organizationId
+    )
+      return fail("invalid_request");
+    guarded = snapshotGuarded(
+      snapshotRequestGuarded({
+        pending: captured.pending,
+        command: captured.command,
+        recordedAt: observed.sampledAt,
+        credential: observed.credential,
+        human: observed.human,
+        currentSession: observed.currentSession,
+      }),
+    );
+    assertBridge();
+  } catch {
+    batch.sameOrigin();
+    return fail("unavailable");
+  }
+
+  const expected = Object.freeze({
+    key: guarded.command.key,
+    selectedScope: guarded.command.selectedScope,
+    originalBytes: new Uint8Array(guarded.command.originalBytes),
+    originalDigest: guarded.command.originalDigest,
+    originalCustodySHA256: guarded.command.originalCustodySHA256,
+    recordedAt: guarded.recordedAt,
+  });
+  const originals = createSharedAuthFinancialConsentOriginalReader(batch.queryPort);
+  let statements: readonly SqlStatement[];
+  try {
+    await requireCaptureRecipe(guarded, "invalid_request");
+    assertBridge();
+    await validateCaptureHashes(guarded);
+    assertBridge();
+    if ((await inspectSharedAuthFinancialConsentLeafSchema(batch.queryPort)) !== "leaf-present")
+      return fail("unavailable");
+    assertBridge();
+    const nativeCurrentness = financialAuthConsumerSourceCurrentness(rootPort, rootContext);
+    assertBridge();
+    statements = requiredNativePendingCaptureConsumeStatements(guarded, nativeCurrentness);
+    if (statements.length !== 3 || statements[2]?.params?.length !== 91) return fail("unavailable");
+    assertBridge();
+  } catch {
+    assertBridge();
+    return fail("unavailable");
+  }
+  try {
+    const results = requiredDenseValues(await batch.runRequiredBatch(statements), 3);
+    assertBridge();
+    const pendingWrite = snapshotRequiredBatchWrite(results[0], pendingColumns);
+    const commandWrite = snapshotRequiredBatchWrite(results[1], commandColumns);
+    const originalWrite = snapshotRequiredBatchWrite(results[2], originalColumns);
+    const pending = snapshotPendingBoundary(pendingWrite.rows[0], "unavailable");
+    if (!samePending(pending, guarded.pending)) return fail("unavailable");
+    await pendingCustody(pending, "unavailable");
+    assertBridge();
+    await requireSharedAuthFinancialConsentCommandCapturePostimage(commandWrite, guarded.command);
+    assertBridge();
+    await requireSharedAuthFinancialConsentConsumePostimage(originalWrite, expected);
+    assertBridge();
+    const original = await originals.readOriginal(guarded.command);
+    assertBridge();
+    if (
+      original === undefined ||
+      original.recordedAt !== guarded.recordedAt ||
+      original.receiptRecordedAt !== guarded.recordedAt
+    )
+      return fail("unavailable");
+    return original;
+  } catch {
+    assertBridge();
+    return fail("unavailable");
+  }
+}
+
+/** Historical external reference DATA. consentProofRef is exactly the already
+ * stored canonical consentRef, not a new identifier, digest, prefix or the
+ * identityEvidence.proofRef. No NEW/current-consent authority is returned.
+ */
+export interface SharedAuthFinancialConsentProofReferenceData {
+  readonly state: "consent-proof-reference-original-data";
+  readonly consentProofRef: string;
+  readonly original: SharedAuthFinancialConsentOriginalData;
+}
+
+/** Same-request query-only immutable-original lookup. This is unmounted DATA,
+ * not a producer/current verifier or a complete request admission port. A ref
+ * cannot prove absence of pending29 (which has no consentRef column), so zero
+ * command rows are unavailable, never positive absence or permission to write.
+ * The original-fullcommand GET recovery API and all write APIs are unchanged.
+ */
+export function createSharedAuthFinancialConsentProofReferenceReader(connection: WorkerRequestSql) {
+  return proofReferenceReaderFromCapturedPort(captureRequestCommandSql(connection));
+}
+
+function proofReferenceReaderFromCapturedPort(port: ReturnType<typeof captureRequestCommandSql>) {
+  const originals = createSharedAuthFinancialConsentOriginalReader(port.queryPort);
+
+  async function readProofOriginalData(
+    input: unknown,
+  ): Promise<SharedAuthFinancialConsentProofReferenceData> {
+    port.sameOrigin();
+    let consentProofRef: string;
+    try {
+      // Primitive original bytes/code units: no trim, normalization or ref mint.
+      consentProofRef = text(input, "invalid_request");
+    } catch {
+      return fail("invalid_request");
+    }
+    let command: SharedAuthFinancialConsentOriginalCommand;
+    try {
+      if ((await inspectSharedAuthFinancialConsentLeafSchema(port.queryPort)) !== "leaf-present")
+        return fail("unavailable");
+      port.sameOrigin();
+      const rows = await port.queryPort.query(
+        `SELECT ${commandColumns.join(",")} FROM ${COMMANDS} WHERE consent_ref=? LIMIT 2`,
+        [consentProofRef],
+      );
+      port.sameOrigin();
+      // No fabricated SqlWrite/changes value for a SELECT. The exact one row
+      // and all16 own data fields are required, then native BLOB copies are
+      // taken before the next await by the existing snapshotRequestCommand.
+      const row = exactOwn(requiredDenseValues(rows, 1)[0], commandColumns, "unavailable");
+      command = snapshotRequestCommand({
+        key: {
+          registrationRef: row.registration_ref,
+          incarnation: row.incarnation,
+          transactionRef: row.transaction_ref,
+          commandRef: row.command_ref,
+          consentRef: row.consent_ref,
+          receiptRef: row.receipt_ref,
+        },
+        selectedScope: {
+          organizationId: row.organization_id,
+          workspaceId: row.workspace_id,
+          workspaceRef: row.workspace_ref,
+        },
+        family: row.family,
+        commandBytes: row.command_bytes,
+        commandCustodySHA256: row.command_custody_sha256,
+        originalBytes: row.original_bytes,
+        originalDigest: row.original_digest,
+        originalCustodySHA256: row.original_custody_sha256,
+        capturedAt: row.captured_at,
+      });
+      if (command.key.consentRef !== consentProofRef) return fail("unavailable");
+    } catch {
+      // SQL/row decoding or stored shape failure, including a borrowed exported
+      // error, is unknown. It is not caller-invalid, absence or another family.
+      port.sameOrigin();
+      return fail("unavailable");
+    }
+
+    try {
+      // Reuse actual pending29/command16/original14 custody, raw byte hashes,
+      // accepted canonical recipe and mandatory same-row receipt validation.
+      // Its historical checks do not consult now, retirement or current rows.
+      const original = await originals.readOriginal(command);
+      port.sameOrigin();
+      if (original === undefined || original.command.key.consentRef !== consentProofRef)
+        return fail("unavailable");
+      return Object.freeze({
+        state: "consent-proof-reference-original-data",
+        consentProofRef: original.command.key.consentRef,
+        original,
+      });
+    } catch (error) {
+      port.sameOrigin();
+      if (
+        error instanceof SharedAuthFinancialConsentOriginalReadError &&
+        error.code === "custody_conflict"
+      )
+        throw error;
+      // Invalid stored canonical bytes/hashes are unavailable here: only the
+      // primitive input boundary above may classify an invalid_request.
+      return fail("unavailable");
+    }
+  }
+  return Object.freeze({ readProofOriginalData });
+}
+
+/** Structural metadata DATA only. Its source/qualification is not established
+ * by this interface; no Root credential, distinct human or policyClock is minted.
+ * Original pending/fullcommand/recordedAt are deliberately not caller inputs.
+ */
+export interface SharedAuthFinancialConsentLocalProofInputData {
+  readonly consentProofRef: string;
+  readonly credential: RpAuthorityRecord;
+  readonly human: SharedPrincipalBinding;
+  readonly currentSession: SharedAuthFinancialConsentGuardedStatementData["currentSession"];
+}
+
+export interface SharedAuthFinancialConsentLocalProofData {
+  readonly state: "consent-proof-reference-local-data";
+  readonly consentProofRef: string;
+  readonly original: SharedAuthFinancialConsentOriginalData;
+}
+
+/** Query-only stored-original -> local predicate DATA bridge. This is not a
+ * current consent verifier, permission or NEW/resume/first-dispatch authority.
+ * Caller metadata is copied DATA, not a genuine Root/Financial source assertion.
+ * Historical lookup stays available separately after expiry/retirement. A known
+ * historical original with zero local matches is nonmatch DATA only; missing
+ * historical custody/byref-zero/SQL unknown never becomes positive absence.
+ */
+export function createSharedAuthFinancialConsentLocalProofDataReader(connection: WorkerRequestSql) {
+  const port = captureRequestCommandSql(connection);
+  const historicals = proofReferenceReaderFromCapturedPort(port);
+
+  async function readLocalProofOriginalData(
+    input: SharedAuthFinancialConsentLocalProofInputData,
+  ): Promise<SharedAuthFinancialConsentLocalProofData | undefined> {
+    port.sameOrigin();
+    let metadata: SharedAuthFinancialConsentLocalProofInputData;
+    try {
+      const raw = exactOwn(
+        input,
+        ["consentProofRef", "credential", "human", "currentSession"],
+        "invalid_request",
+      );
+      const session = exactOwn(
+        raw.currentSession,
+        ["version", "absoluteExpiresAt", "lastUsedAt"],
+        "invalid_request",
+      );
+      // Fully detach before the first original/hash/query await. Root-owned
+      // producers still must qualify these values; structural equality cannot.
+      metadata = Object.freeze({
+        consentProofRef: text(raw.consentProofRef, "invalid_request"),
+        credential: snapshotCredential(raw.credential),
+        human: snapshotHuman(raw.human),
+        currentSession: Object.freeze({
+          version: stamp(session.version, "invalid_request"),
+          absoluteExpiresAt: stamp(session.absoluteExpiresAt, "invalid_request"),
+          lastUsedAt: stamp(session.lastUsedAt, "invalid_request"),
+        }),
+      });
+    } catch {
+      return fail("invalid_request");
+    }
+
+    let historical: SharedAuthFinancialConsentProofReferenceData;
+    try {
+      historical = await historicals.readProofOriginalData(metadata.consentProofRef);
+      port.sameOrigin();
+    } catch (error) {
+      port.sameOrigin();
+      if (
+        error instanceof SharedAuthFinancialConsentOriginalReadError &&
+        error.code === "custody_conflict"
+      )
+        throw error;
+      return fail("unavailable");
+    }
+    const original = historical.original;
+    let pending: SharedAuthFinancialConsentPendingData;
+    try {
+      const selected = await port.queryPort.query(
+        `SELECT ${pendingColumns.join(",")} FROM ${PENDING} WHERE transaction_ref=? LIMIT 2`,
+        [original.command.key.transactionRef],
+      );
+      port.sameOrigin();
+      // No caller echo, fake SqlWrite or changes1: this is one actual closed29
+      // row with native byte snapshots before subsequent hashing awaits.
+      pending = snapshotPendingBoundary(requiredDenseValues(selected, 1)[0], "unavailable");
+      if (
+        pending.transaction_ref !== original.command.key.transactionRef ||
+        pending.registration_ref !== original.command.key.registrationRef ||
+        pending.incarnation !== original.command.key.incarnation ||
+        pending.organization_id !== original.command.selectedScope.organizationId ||
+        pending.workspace_id !== original.command.selectedScope.workspaceId ||
+        pending.workspace_ref !== original.command.selectedScope.workspaceRef
+      )
+        return fail("unavailable");
+      await pendingCustody(pending, "unavailable");
+      port.sameOrigin();
+      await requireCaptureRecipe({ pending, command: original.command }, "unavailable");
+      port.sameOrigin();
+    } catch {
+      port.sameOrigin();
+      return fail("unavailable");
+    }
+
+    let guarded: ReturnType<typeof snapshotGuarded>;
+    try {
+      // The only recordedAt is the original, receipt-validated stored timestamp.
+      // No now/current clock or mutable later payment scope is inferred here.
+      guarded = snapshotGuarded({
+        pending,
+        command: original.command,
+        recordedAt: original.recordedAt,
+        credential: metadata.credential,
+        human: metadata.human,
+        currentSession: metadata.currentSession,
+      });
+    } catch {
+      return fail("invalid_request");
+    }
+    try {
+      const statement = localCurrentnessStatement(guarded);
+      const result = await port.queryPort.query(statement.sql, statement.params);
+      port.sameOrigin();
+      if (Array.isArray(result) && Object.getOwnPropertyDescriptor(result, "length")?.value === 0) {
+        requiredDenseValues(result, 0);
+        return undefined; // Known historical original, local nonmatch DATA only.
+      }
+      const row = exactOwn(requiredDenseValues(result, 1)[0], originalColumns, "unavailable");
+      const originalBytes = capturePostimageBytes(row.original_bytes, 16384, "unavailable");
+      if (
+        !matchesKey(row, original.command.key) ||
+        !matchesScope(row, original.command.selectedScope) ||
+        !sameBytes(originalBytes, original.originalBytes) ||
+        text(row.original_digest, "unavailable") !== original.originalDigest ||
+        custodyDigest(row.original_custody_sha256, "unavailable") !==
+          original.originalCustodySHA256 ||
+        stamp(row.recorded_at, "unavailable") !== original.recordedAt ||
+        stamp(row.receipt_recorded_at, "unavailable") !== original.receiptRecordedAt
+      )
+        return fail("unavailable");
+      port.sameOrigin();
+      return Object.freeze({
+        state: "consent-proof-reference-local-data",
+        consentProofRef: historical.consentProofRef,
+        original,
+      });
+    } catch {
+      port.sameOrigin();
+      return fail("unavailable");
+    }
+  }
+  return Object.freeze({ readLocalProofOriginalData });
 }
