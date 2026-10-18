@@ -2408,3 +2408,73 @@ describe("Takoserver split deploy entrypoint", () => {
     }
   });
 });
+
+describe("original92 maintenance first-publication deploy contract", () => {
+  test("reports the conditional maintenance inputs and preserves normal Host requirements", async () => {
+    const probe = await deploy(["--contract"]);
+    expect(probe.exitCode).toBe(0);
+    expect(probe.stderr).toBe("");
+    const contract = JSON.parse(probe.stdout) as {
+      surfaces: {
+        surface: string;
+        target: string;
+        covers: string[];
+        requiresEnv: string[];
+        triggers: string[];
+        obligations: Record<string, string>;
+      }[];
+    };
+    const bootstrap = contract.surfaces.find(
+      (value) => value.surface === "takoserver-integration-worker-bootstrap",
+    );
+    expect(bootstrap).toBeDefined();
+    if (bootstrap === undefined) throw new Error("expected bootstrap contract");
+    expect(bootstrap.target).toBe("cloudflare-worker:new-integration-public-host");
+    expect(bootstrap.triggers).toEqual(["irreversible", "authority"]);
+    expect(bootstrap.requiresEnv).toEqual([
+      "CLOUDFLARE_API_TOKEN",
+      "TAKOSERVER_INDEPENDENT_REVIEW",
+      "TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY",
+      "TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH",
+      "TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_SELECTION_PATH",
+    ]);
+    for (const path of [
+      "scripts/deploy/target.ts",
+      "scripts/deploy/schema-money-unit-owner.ts",
+      "scripts/deploy/qualification.ts",
+      "scripts/deploy/worker-state.ts",
+    ])
+      expect(bootstrap.covers).toContain(path);
+    const obligations = bootstrap.obligations;
+    expect(obligations["pre-mutation-proof"]).toContain(
+      "active registered signing public key matching the owned private input",
+    );
+    expect(obligations["pre-mutation-proof"]).toContain("ready provider qualification");
+    expect(obligations["pre-mutation-proof"]).toContain("existing 0094 Money schema requirement");
+    expect(obligations["pre-mutation-proof"]).toContain(
+      "exact complete current original92 schema and migration seeds",
+    );
+    expect(obligations.provenance).toContain("native original92 custody");
+    expect(obligations.provenance).toContain("locally clean exact commit is re-fenced");
+    expect(obligations["post-conditions"]).toContain(
+      "Normal Host profile: the public product probe must succeed",
+    );
+    expect(obligations["post-conditions"]).toContain(
+      "exact maintenance 503 before App construction and scheduled no-op",
+    );
+    expect(obligations["post-conditions"]).toContain(
+      "First publication is not a freeze or a global quiescence proof",
+    );
+    expect(obligations["failure-handling"]).toContain(
+      "For normal Host apply only, TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY",
+    );
+    expect(obligations["failure-handling"]).toContain("must be selected together");
+    expect(obligations["failure-handling"]).toContain(
+      "neither reads the normal secret directory nor a registered signing row/private input",
+    );
+    expect(obligations["failure-handling"]).toContain("only after cleanup succeeds");
+    expect(obligations.reversal).toContain(
+      "status never repairs or terminalizes an unknown original acknowledgement",
+    );
+  });
+});

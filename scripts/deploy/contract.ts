@@ -246,6 +246,10 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/worker-closure-transition.ts",
         "scripts/deploy/worker-live.ts",
         "scripts/deploy/realized-config.ts",
+        "scripts/deploy/target.ts",
+        "scripts/deploy/schema-money-unit-owner.ts",
+        "scripts/deploy/qualification.ts",
+        "scripts/deploy/worker-state.ts",
         "scripts/deploy/signing.ts",
         "scripts/deploy/wrangler-state.ts",
       ],
@@ -255,36 +259,64 @@ export const DEPLOY_CONTRACT = {
         "CLOUDFLARE_API_TOKEN",
         "TAKOSERVER_INDEPENDENT_REVIEW",
         "TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY",
+        "TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH",
+        "TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_SELECTION_PATH",
       ],
       triggers: ["irreversible", "authority"],
       obligations: {
         provenance:
-          `${exactSource} Integration-only first publication. Qualify the source once, then seal the ` +
-          "exact normal Host artifact, configuration and initial secret-name closure before one lifecycle deploy.",
+          `${exactSource} Integration-only first publication. Normal Host profile: qualify the source once, then seal the ` +
+          "exact normal Host artifact, configuration and initial secret-name closure before one lifecycle deploy. " +
+          "The explicit original-maintenance profile uses the two original locator inputs, not caller-supplied " +
+          "proof or ready JSON. It requires native original92 custody and the exact current physical D1/R2 pair; " +
+          "the locally clean exact commit is re-fenced after the gate and build, before the sole lifecycle, " +
+          "at its final callback, after cleanup and before terminal custody. The same source/artifact/native " +
+          "Version binding must remain exact throughout; no remote-publication requirement is added to this profile.",
         "post-conditions":
           "Authoritative history must identify the acknowledged first Version with no predecessor; source, " +
           "module, bindings, settings, source-declared cron schedule and secret inventory must exactly match " +
           "the selected target and artifact. " +
-          "The public product probe must succeed at its exact account-owned workers.dev origin. No zone route " +
-          "or custom domain is adopted. This is a public Host component, not a customer ModuleWorker.",
+          "Normal Host profile: the public product probe must succeed at its exact account-owned workers.dev origin. " +
+          "The explicit original-maintenance profile instead requires the exact maintenance 503 before App " +
+          "construction and scheduled no-op, with its source-owned empty-secret native closure. The existing " +
+          "readonly source-identity RPC remains available; this does not qualify normal Host readiness, " +
+          "signing or private/external writers. First publication is not a freeze or a global quiescence proof; " +
+          "the later Money cutover still requires the complete private/native old-writer inventory before " +
+          "freeze, backups or conversion. No zone route or custom domain is adopted. " +
+          "This is a public Host component, not a customer ModuleWorker.",
         reversal:
           "There is no predecessor to roll back to. Keep the old staging target unchanged; inspect the new " +
-          "Worker and use an explicitly selected ordinary lifecycle for forward repair, never replay bootstrap.",
+          "Worker and use an explicitly selected ordinary lifecycle for forward repair, never replay bootstrap. " +
+          "Original-maintenance dispatch or terminal custody also refuses a new bootstrap slot; " +
+          "status never repairs or terminalizes an unknown original acknowledgement.",
         "failure-handling":
           "Existing or partial Worker state refuses apply, even after a prior successful bootstrap. " +
           "Acknowledgement loss is indeterminate; status is read-only and never reads initial secret bytes. " +
           "The command never retries, rotates secrets or changes storage/signing registration. The temporary " +
           "secret file cleanup is attempted on every exit; failure reports potentially retained material. " +
-          "TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY supplies only " +
-          "the exact target-derived initial secrets for apply; it is never passed to the build." +
+          "For normal Host apply only, TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY supplies only " +
+          "the exact target-derived initial secrets for apply; it is never passed to the build. " +
+          "requiresEnv lists profile-dependent inputs: TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH " +
+          "and TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_SELECTION_PATH must be selected together for the explicit " +
+          "original-maintenance route. This route neither reads the normal secret directory nor a registered " +
+          "signing row/private input, and creates no signing row, secret or business/queue effect. Its plain " +
+          "declared signing key ID is unused DATA, not signing qualification. Original publication terminal " +
+          "custody is written only after cleanup succeeds and final source/native/503 fences still match." +
           inputContract(applyReviewInput),
         "pre-mutation-proof":
           "Deployment history, exhaustive script, route and custom-domain inventories must prove the exact " +
-          "Worker absent before and after qualification and at the final fence. The target must have a " +
+          "Worker absent before and after qualification and at the final fence. Normal Host profile: the target must have a " +
           "complete schema, exact R2 identity, valid runtime composition, active registered signing public " +
           "key matching the owned private input, and ready provider qualification. Signing and provider " +
           "state are rechecked before mutation. Only the account-owned workers.dev origin with no aliases " +
-          "is accepted; preview URLs remain disabled.",
+          "is accepted; preview URLs remain disabled. The normal profile retains its existing 0094 Money schema " +
+          "requirement. The explicit original-maintenance profile instead requires the exact complete current " +
+          "original92 schema and migration seeds, unserved-data proof, original creator custody and exact R2 " +
+          "identity. It publishes only the maintenance mode and source-owned empty-secret profile; normal " +
+          "runtime composition, active registered signing and ready provider qualification are not claimed " +
+          "by this branch. Native selected-Worker absence and exact source/module/binding/epoch/settings/schedule " +
+          "closure remain mandatory. The actual account-owned workers.dev origin must match the selected new " +
+          "Worker and current native account subdomain, with no aliases.",
         "independent-review": review,
       },
     },
