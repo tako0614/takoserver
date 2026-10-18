@@ -22,11 +22,13 @@ import {
   type SharedFinancialActionIdentity,
 } from "./shared-financial-action.ts";
 import {
+  FINANCIAL_SOURCE_MAX_WIRE_BYTES,
   type FinancialIdentityChallenge,
   type FinancialSourceDigest,
   financialSourceDigest,
   financialSourceRef,
   parseFinancialIdentityChallenge,
+  parseFinancialSourceRegistration,
 } from "./shared-financial-source-contract.ts";
 import {
   createFinancialPreproofChallengeStore,
@@ -2433,6 +2435,251 @@ export function createFinancialActionConsentR1Reader(
       },
     });
     return reader;
+  } catch (error) {
+    return fail("unavailable", error);
+  }
+}
+
+export interface FinancialActionConsentR1IdentityEvidenceData {
+  readonly kind: "financial-proof";
+  readonly proofRef: string;
+  readonly registrationRef: string;
+  readonly identityGeneration: number;
+  readonly sourceParentPins: readonly {
+    readonly registrationRef: string;
+    readonly incarnation: string;
+    readonly affectedRef: string;
+    readonly eventRef: string;
+    readonly eventDigest: FinancialSourceDigest;
+  }[];
+}
+
+/** Accounts wire DATA, not an authenticated RPC result or a new proof codec.
+ * Copy own data before inspecting values; no caller getter or toJSON is used. */
+function identityProofDataSnapshot(value: unknown): unknown {
+  let remaining = 512;
+  const ancestors = new Set<object>();
+  function copy(part: unknown, depth: number): unknown {
+    if (--remaining < 0 || depth > 12) fail("unavailable");
+    if (part === null || typeof part === "boolean") return part;
+    if (typeof part === "number") return safe(part);
+    if (typeof part === "string") {
+      const bytes = new TextEncoder().encode(part);
+      if (
+        bytes.length > FINANCIAL_SOURCE_MAX_WIRE_BYTES ||
+        new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes) !== part
+      )
+        fail("unavailable");
+      return part;
+    }
+    if (!part || typeof part !== "object" || ancestors.has(part)) fail("unavailable");
+    const array = Array.isArray(part);
+    const prototype: unknown = Object.getPrototypeOf(part);
+    if (
+      array ? prototype !== Array.prototype : prototype !== Object.prototype && prototype !== null
+    )
+      fail("unavailable");
+    ancestors.add(part);
+    try {
+      const descriptors: Record<string, PropertyDescriptor> =
+        Object.getOwnPropertyDescriptors(part);
+      const keys = Reflect.ownKeys(part);
+      if (array) {
+        const length = descriptors.length;
+        if (!length || !("value" in length)) fail("unavailable");
+        const count = safe(length.value);
+        if (count > 8 || keys.length !== count + 1) fail("unavailable");
+        return Array.from({ length: count }, (_, index) => {
+          const descriptor = descriptors[String(index)];
+          if (!descriptor || !("value" in descriptor) || descriptor.enumerable !== true)
+            fail("unavailable");
+          return copy(descriptor.value, depth + 1);
+        });
+      }
+      if (keys.length > 16) fail("unavailable");
+      const output: Record<string, unknown> = Object.create(null);
+      for (const key of keys) {
+        if (typeof key !== "string") fail("unavailable");
+        const descriptor = descriptors[key];
+        if (!descriptor || !("value" in descriptor) || descriptor.enumerable !== true)
+          fail("unavailable");
+        output[key] = copy(descriptor.value, depth + 1);
+      }
+      return output;
+    } finally {
+      ancestors.delete(part);
+    }
+  }
+  return copy(value, 0);
+}
+
+/** Join existing Accounts found/current projections to this exact successful
+ * R1 and the same Root RP original. Output is forgeable candidate DATA only:
+ * the request owner must retain actual Accounts reader/ref custody and current
+ * admission; Financial retains allNEW acceptance/first-dispatch CAS. No proof
+ * RPC, Clock, SQL, observer, write, missing
+ * proof exemption, consent acceptance or NEW permission is performed here. */
+export function readFinancialActionConsentR1IdentityEvidenceData(
+  connection: WorkerRequestSql,
+  request: Request,
+  selectedWorkspaceId: string,
+  reader: unknown,
+  original: FinancialActionConsentR1Original,
+  originalProofRequest: unknown,
+  loaded: unknown,
+  current: unknown,
+): FinancialActionConsentR1IdentityEvidenceData {
+  try {
+    // This refuses clones/crossed origins before touching either proof input.
+    const captures = readFinancialActionConsentR1RequestCaptures(
+      connection,
+      request,
+      selectedWorkspaceId,
+      reader,
+      original,
+    );
+    const rp = readWorkerRequestRetainedRpCapture(connection, captures.credential);
+    if (!rp) fail("unavailable");
+    const proofRequest = exact(identityProofDataSnapshot(originalProofRequest), [
+      "v",
+      "proofRef",
+      "challengeRef",
+    ]);
+    if (proofRequest.v !== 1) fail("unavailable");
+    const requestedProofRef = ref(proofRequest.proofRef);
+    if (ref(proofRequest.challengeRef) !== original.original.challengeRef) fail("unavailable");
+    const found = exact(identityProofDataSnapshot(loaded), ["v", "status", "proof"]);
+    const checked = exact(identityProofDataSnapshot(current), [
+      "v",
+      "status",
+      "proof",
+      "observedAt",
+    ]);
+    if (
+      found.v !== 1 ||
+      found.status !== "found" ||
+      checked.v !== 1 ||
+      checked.status !== "current"
+    )
+      fail("unavailable");
+    const proof = exact(found.proof, [
+      "v",
+      "proofRef",
+      "challenge",
+      "issuer",
+      "subject",
+      "clientId",
+      "sid",
+      "issuerSessionId",
+      "identityGeneration",
+      "control",
+      "parents",
+      "issuedAt",
+      "expiresAt",
+    ]);
+    const proofJson = canonicalJson(proof);
+    if (
+      proof.v !== 1 ||
+      proofJson !== canonicalJson(checked.proof) ||
+      new TextEncoder().encode(proofJson).length > FINANCIAL_SOURCE_MAX_WIRE_BYTES
+    )
+      fail("unavailable");
+    const proofRef = ref(proof.proofRef);
+    if (proofRef !== requestedProofRef) fail("unavailable");
+    const subject = ref(proof.subject),
+      clientId = ref(proof.clientId),
+      sid = ref(proof.sid);
+    ref(proof.issuerSessionId); // Private Accounts session key is NOT the OIDC sid.
+    const identityGeneration = safe(proof.identityGeneration);
+    const challenge = parseFinancialIdentityChallenge(proof.challenge);
+    const issuedAt = safe(proof.issuedAt),
+      expiresAt = safe(proof.expiresAt);
+    const observedAt = safe(checked.observedAt);
+    if (
+      typeof proof.issuer !== "string" ||
+      proof.issuer.length > 2048 ||
+      clientId !== challenge.clientId ||
+      issuedAt < challenge.createdAt ||
+      expiresAt <= issuedAt ||
+      expiresAt - issuedAt > 60_000 ||
+      expiresAt > challenge.expiresAt ||
+      observedAt < issuedAt ||
+      observedAt >= expiresAt ||
+      canonicalJson(challenge) !== canonicalJson(original.original.c0.challenge) ||
+      challenge.requestFingerprint !== original.actionIdentity.requestFingerprint ||
+      proof.issuer !== rp.finalSession.identity.issuer ||
+      clientId !== rp.finalSession.identity.clientId ||
+      subject !== rp.finalSession.identity.subject ||
+      sid !== rp.finalSession.identity.sessionId
+    )
+      fail("unavailable");
+    const control = exact(proof.control, ["evidenceRef", "evidenceDigest", "expiresAt", "source"]);
+    ref(control.evidenceRef);
+    digest(control.evidenceDigest);
+    if (safe(control.expiresAt) < expiresAt) fail("unavailable");
+    const source = exact(control.source, [
+      "registrationRef",
+      "incarnation",
+      "affectedRef",
+      "sequence",
+      "eventRef",
+      "eventDigest",
+      "receivers",
+    ]);
+    ref(source.affectedRef);
+    const sequence = safe(source.sequence);
+    if (
+      source.affectedRef !== challenge.workspaceId ||
+      (sequence === 0 ? source.eventRef !== null : !financialSourceRef(source.eventRef))
+    )
+      fail("unavailable");
+    parseFinancialSourceRegistration({
+      registrationRef: source.registrationRef,
+      incarnation: source.incarnation,
+      genesisDigest: source.eventDigest,
+      receivers: source.receivers,
+    });
+    const slots = ["grant", "issuerSession", "client", "accountGeneration"] as const;
+    const parents = exact(proof.parents, slots);
+    const sourceParentPins = slots.map((slot) => {
+      const parent = exact(parents[slot], [
+        "registrationRef",
+        "incarnation",
+        "affectedRef",
+        "sequence",
+        "eventRef",
+        "eventDigest",
+      ]);
+      const registrationRef = ref(parent.registrationRef);
+      if (registrationRef !== challenge.registrationRef) fail("unavailable");
+      safe(parent.sequence, 1);
+      return Object.freeze({
+        registrationRef,
+        incarnation: ref(parent.incarnation),
+        affectedRef: ref(parent.affectedRef),
+        eventRef: ref(parent.eventRef),
+        eventDigest: digest(parent.eventDigest),
+      });
+    });
+    // Descriptor traps during input capture must not invalidate the held origin.
+    if (
+      readFinancialActionConsentR1RequestCaptures(
+        connection,
+        request,
+        selectedWorkspaceId,
+        reader,
+        original,
+      ) !== captures ||
+      readWorkerRequestRetainedRpCapture(connection, captures.credential) !== rp
+    )
+      fail("unavailable");
+    return Object.freeze({
+      kind: "financial-proof",
+      proofRef,
+      registrationRef: challenge.registrationRef,
+      identityGeneration,
+      sourceParentPins: Object.freeze(sourceParentPins),
+    });
   } catch (error) {
     return fail("unavailable", error);
   }

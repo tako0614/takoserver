@@ -29,7 +29,17 @@ let state: {
       origin: { principalId: string; principalIncarnation: string };
     };
     current: object;
-    finalSession: { selectedWorkspaceId: string; principalId: string };
+    finalSession: {
+      selectedWorkspaceId: string;
+      principalId: string;
+      identity: {
+        issuer: string;
+        clientId: string;
+        subject: string;
+        sessionId: string;
+        authTime: number;
+      };
+    };
     selectedScope: { workspaceId: string; organizationId: string; workspaceRef: string };
   };
   active: boolean;
@@ -145,6 +155,7 @@ const {
   createFinancialActionConsentR1Reader,
   buildFinancialR1MechanicalBatch,
   readFinancialActionConsentR1RequestCaptures,
+  readFinancialActionConsentR1IdentityEvidenceData,
   readFinancialRequestBoundR1History,
 } = await import("../../src/shared-financial-retained-r1.ts");
 
@@ -201,7 +212,17 @@ async function setup(action: SharedFinancialAction = topupAction(), terms?: stri
         origin: { principalId, principalIncarnation: "principal-incarnation:fixture" },
       },
       current: {},
-      finalSession: { selectedWorkspaceId: SCOPE.workspaceId, principalId },
+      finalSession: {
+        selectedWorkspaceId: SCOPE.workspaceId,
+        principalId,
+        identity: {
+          issuer: "https://accounts.fixture.invalid",
+          clientId: SCOPE.clientId,
+          subject: "account:fixture",
+          sessionId: "oidc-session:fixture",
+          authTime: Date.parse(AT) - 1000,
+        },
+      },
       selectedScope: {
         workspaceId: SCOPE.workspaceId,
         organizationId: SCOPE.organizationId,
@@ -892,6 +913,497 @@ test("standalone historical reads retain their separate per-invocation observati
       ).status,
     ).toBe("found");
     expect(state.captures).toBe(2);
+  } finally {
+    f.close();
+  }
+});
+
+// Accounts wire fixtures are synthetic external DATA. The production Accounts
+// prove/load/current reader, access token and source registration are not mocked
+// into an authenticated service by this test.
+const proofSlots = ["grant", "issuerSession", "client", "accountGeneration"] as const;
+function accountsPair(command: Awaited<ReturnType<typeof setup>>["command"]) {
+  const challenge = structuredClone(command.original.c0.challenge);
+  const identity = state.retained.finalSession.identity;
+  const proof = {
+    v: 1,
+    proofRef: "afp_fixture_original",
+    challenge,
+    issuer: identity.issuer,
+    subject: identity.subject,
+    clientId: identity.clientId,
+    sid: identity.sessionId,
+    // This is deliberately NOT the OIDC sid. Both fields are actual Accounts ABI.
+    issuerSessionId: "accounts-storage-session:distinct",
+    identityGeneration: 3,
+    control: {
+      evidenceRef: "control-evidence:fixture",
+      evidenceDigest: `sha256:${"d".repeat(64)}`,
+      expiresAt: challenge.expiresAt,
+      source: {
+        registrationRef: "control-registration:fixture",
+        incarnation: "control-incarnation:fixture",
+        affectedRef: SCOPE.workspaceId,
+        sequence: 0,
+        eventRef: null,
+        eventDigest: `sha256:${"e".repeat(64)}`,
+        receivers: [{ receiverRef: "receiver:fixture", targetRef: "target:fixture" }],
+      },
+    },
+    parents: Object.fromEntries(
+      proofSlots.map((slot, index) => [
+        slot,
+        {
+          registrationRef: challenge.registrationRef,
+          incarnation: "accounts-incarnation:fixture",
+          affectedRef: `parent:${slot}`,
+          sequence: index + 1,
+          eventRef: `event:${slot}`,
+          eventDigest: `sha256:${String(index + 1).repeat(64)}` as const,
+        },
+      ]),
+    ),
+    issuedAt: challenge.createdAt,
+    expiresAt: Math.min(challenge.createdAt + 60_000, challenge.expiresAt),
+  };
+  return {
+    request: { v: 1, proofRef: proof.proofRef, challengeRef: challenge.challengeRef },
+    loaded: { v: 1, status: "found", proof },
+    current: {
+      v: 1,
+      status: "current",
+      proof: structuredClone(proof),
+      observedAt: proof.issuedAt + 1,
+    },
+  };
+}
+
+function accountsParent(
+  proof: ReturnType<typeof accountsPair>["loaded"]["proof"],
+  slot: (typeof proofSlots)[number],
+) {
+  const parent = proof.parents[slot];
+  if (!parent) throw Error("missing synthetic Accounts parent");
+  return parent;
+}
+
+test("identity evidence DATA joins actual five-action R1 originals and the same RP identity without observing again", async () => {
+  for (const action of ACTIONS) {
+    const { command, install, reader } = await setup(action);
+    try {
+      await install();
+      const original = await reader.readRetainedActionConsentR1(command.key.challengeRef);
+      const pair = accountsPair(command);
+      const before = {
+        writes: f.writes,
+        provider: f.providerRequests,
+        clocks: f.clocks,
+        captures: state.captures,
+      };
+      const data = readFinancialActionConsentR1IdentityEvidenceData(
+        connection,
+        request,
+        SCOPE.workspaceId,
+        reader,
+        original,
+        pair.request,
+        pair.loaded,
+        pair.current,
+      );
+      expect(data).toEqual({
+        kind: "financial-proof",
+        proofRef: pair.loaded.proof.proofRef,
+        registrationRef: command.original.c0.challenge.registrationRef,
+        identityGeneration: 3,
+        sourceParentPins: proofSlots.map((slot) => {
+          const { sequence: _sequence, ...pin } = accountsParent(pair.loaded.proof, slot);
+          return pin;
+        }),
+      });
+      expect(Object.isFrozen(data)).toBe(true);
+      expect(Object.isFrozen(data.sourceParentPins)).toBe(true);
+      expect(data.sourceParentPins.every((pin) => Object.isFrozen(pin))).toBe(true);
+      expect({
+        writes: f.writes,
+        provider: f.providerRequests,
+        clocks: f.clocks,
+        captures: state.captures,
+      }).toEqual(before);
+      expect(Object.keys(original)).not.toContain("identityEvidence");
+    } finally {
+      f.close();
+    }
+  }
+});
+
+test("identity evidence DATA refuses every crossed original challenge field including action fingerprint", async () => {
+  const { command, install, reader } = await setup();
+  try {
+    await install();
+    const original = await reader.readRetainedActionConsentR1(command.key.challengeRef);
+    const changes = {
+      v: 2,
+      challengeRef: "challenge:other",
+      registrationRef: "registration:other",
+      clientId: "client:other",
+      workspaceId: "workspace:other",
+      organizationId: "org:other",
+      workspaceRef: "workspace-ref:other",
+      requestFingerprint: `sha256:${"f".repeat(64)}`,
+      createdAt: command.original.c0.challenge.createdAt - 1,
+      expiresAt: command.original.c0.challenge.expiresAt - 1,
+    };
+    for (const [key, value] of Object.entries(changes)) {
+      const pair = accountsPair(command);
+      Object.assign(pair.loaded.proof.challenge, { [key]: value });
+      pair.current.proof = structuredClone(pair.loaded.proof);
+      expectUnavailable(() =>
+        readFinancialActionConsentR1IdentityEvidenceData(
+          connection,
+          request,
+          SCOPE.workspaceId,
+          reader,
+          original,
+          pair.request,
+          pair.loaded,
+          pair.current,
+        ),
+      );
+    }
+  } finally {
+    f.close();
+  }
+});
+
+test("identity evidence DATA requires both complete found and current responses with the identical whole proof", async () => {
+  const { command, install, reader } = await setup();
+  try {
+    await install();
+    const original = await reader.readRetainedActionConsentR1(command.key.challengeRef);
+    const pair = accountsPair(command);
+    for (const proofRequest of [
+      undefined,
+      { ...pair.request, proofRef: "afp_different_original" },
+      { ...pair.request, challengeRef: "challenge:different-original" },
+    ])
+      expectUnavailable(() =>
+        readFinancialActionConsentR1IdentityEvidenceData(
+          connection,
+          request,
+          SCOPE.workspaceId,
+          reader,
+          original,
+          proofRequest,
+          pair.loaded,
+          pair.current,
+        ),
+      );
+    for (const loaded of [undefined, { v: 1, status: "not-found" }, { kind: "not-required" }])
+      expectUnavailable(() =>
+        readFinancialActionConsentR1IdentityEvidenceData(
+          connection,
+          request,
+          SCOPE.workspaceId,
+          reader,
+          original,
+          pair.request,
+          loaded,
+          pair.current,
+        ),
+      );
+    for (const current of [
+      undefined,
+      { v: 1, status: "not-current" },
+      { ...pair.current, observedAt: pair.current.proof.expiresAt },
+      { ...pair.current, observedAt: pair.current.proof.issuedAt - 1 },
+    ])
+      expectUnavailable(() =>
+        readFinancialActionConsentR1IdentityEvidenceData(
+          connection,
+          request,
+          SCOPE.workspaceId,
+          reader,
+          original,
+          pair.request,
+          pair.loaded,
+          current,
+        ),
+      );
+    for (const change of [
+      { proofRef: "afp_other" },
+      { identityGeneration: 4 },
+      { issuerSessionId: "different-private-session" },
+    ]) {
+      const current = structuredClone(pair.current);
+      Object.assign(current.proof, change);
+      expectUnavailable(() =>
+        readFinancialActionConsentR1IdentityEvidenceData(
+          connection,
+          request,
+          SCOPE.workspaceId,
+          reader,
+          original,
+          pair.request,
+          pair.loaded,
+          current,
+        ),
+      );
+    }
+  } finally {
+    f.close();
+  }
+});
+
+test("identity evidence DATA binds issuer client subject and OIDC sid while keeping issuerSessionId distinct", async () => {
+  const { command, install, reader } = await setup();
+  try {
+    await install();
+    const original = await reader.readRetainedActionConsentR1(command.key.challengeRef);
+    for (const key of ["issuer", "clientId", "subject", "sid"] as const) {
+      const pair = accountsPair(command);
+      pair.loaded.proof[key] = "different-identity";
+      pair.current.proof = structuredClone(pair.loaded.proof);
+      expectUnavailable(() =>
+        readFinancialActionConsentR1IdentityEvidenceData(
+          connection,
+          request,
+          SCOPE.workspaceId,
+          reader,
+          original,
+          pair.request,
+          pair.loaded,
+          pair.current,
+        ),
+      );
+    }
+    const pair = accountsPair(command);
+    expect(pair.loaded.proof.issuerSessionId).not.toBe(pair.loaded.proof.sid);
+    expect(
+      readFinancialActionConsentR1IdentityEvidenceData(
+        connection,
+        request,
+        SCOPE.workspaceId,
+        reader,
+        original,
+        pair.request,
+        pair.loaded,
+        pair.current,
+      ),
+    ).toMatchObject({ kind: "financial-proof" });
+  } finally {
+    f.close();
+  }
+});
+
+test("identity evidence DATA rejects unknown malformed and crossed parent or control evidence", async () => {
+  const { command, install, reader } = await setup();
+  try {
+    await install();
+    const original = await reader.readRetainedActionConsentR1(command.key.challengeRef);
+    const bad = [
+      (proof: ReturnType<typeof accountsPair>["loaded"]["proof"]) => {
+        delete proof.parents.grant;
+      },
+      (proof: ReturnType<typeof accountsPair>["loaded"]["proof"]) => {
+        accountsParent(proof, "grant").registrationRef = "other:registration";
+      },
+      (proof: ReturnType<typeof accountsPair>["loaded"]["proof"]) => {
+        accountsParent(proof, "grant").sequence = 0;
+      },
+      (proof: ReturnType<typeof accountsPair>["loaded"]["proof"]) => {
+        Object.assign(proof.control.source, { eventRef: "event:not-genesis" });
+      },
+      (proof: ReturnType<typeof accountsPair>["loaded"]["proof"]) => {
+        proof.control.source.affectedRef = "workspace:other";
+      },
+      (proof: ReturnType<typeof accountsPair>["loaded"]["proof"]) => {
+        proof.control.expiresAt = proof.expiresAt - 1;
+      },
+      (proof: ReturnType<typeof accountsPair>["loaded"]["proof"]) => {
+        proof.expiresAt = proof.issuedAt + 60_001;
+      },
+    ];
+    for (const mutate of bad) {
+      const pair = accountsPair(command);
+      mutate(pair.loaded.proof);
+      pair.current.proof = structuredClone(pair.loaded.proof);
+      expectUnavailable(() =>
+        readFinancialActionConsentR1IdentityEvidenceData(
+          connection,
+          request,
+          SCOPE.workspaceId,
+          reader,
+          original,
+          pair.request,
+          pair.loaded,
+          pair.current,
+        ),
+      );
+    }
+  } finally {
+    f.close();
+  }
+});
+
+test("identity evidence DATA snapshots own data without invoking untrusted getters or accepting extra fields", async () => {
+  const { command, install, reader } = await setup();
+  try {
+    await install();
+    const original = await reader.readRetainedActionConsentR1(command.key.challengeRef);
+    let getterCalls = 0;
+    const pair = accountsPair(command);
+    const poison = Object.defineProperty({ ...pair.loaded }, "proof", {
+      enumerable: true,
+      get() {
+        getterCalls++;
+        throw Error("untrusted getter");
+      },
+    });
+    for (const bad of [
+      poison,
+      Object.create(pair.loaded),
+      { ...pair.loaded, extra: true },
+      { ...pair.loaded, [Symbol("extra")]: true },
+    ])
+      expectUnavailable(() =>
+        readFinancialActionConsentR1IdentityEvidenceData(
+          connection,
+          request,
+          SCOPE.workspaceId,
+          reader,
+          original,
+          pair.request,
+          bad,
+          pair.current,
+        ),
+      );
+    const nested = accountsPair(command);
+    Object.defineProperty(accountsParent(nested.loaded.proof, "grant"), "eventRef", {
+      enumerable: true,
+      get() {
+        getterCalls++;
+        throw Error("nested getter");
+      },
+    });
+    expectUnavailable(() =>
+      readFinancialActionConsentR1IdentityEvidenceData(
+        connection,
+        request,
+        SCOPE.workspaceId,
+        reader,
+        original,
+        pair.request,
+        nested.loaded,
+        nested.current,
+      ),
+    );
+    expect(getterCalls).toBe(0);
+  } finally {
+    f.close();
+  }
+});
+
+test("identity evidence DATA refuses crossed request reader and cloned R1 before inspecting proof data", async () => {
+  const { command, install, reader } = await setup();
+  try {
+    await install();
+    const original = await reader.readRetainedActionConsentR1(command.key.challengeRef);
+    let getterCalls = 0;
+    const poison = {
+      get proof() {
+        getterCalls++;
+        throw Error("not reached");
+      },
+    };
+    const otherReader = createFinancialActionConsentR1Reader(
+      connection,
+      request,
+      SCOPE.workspaceId,
+    );
+    for (const [c, r, w, selectedReader, result] of [
+      [Object.create(null), request, SCOPE.workspaceId, reader, original],
+      [connection, new Request(request.url), SCOPE.workspaceId, reader, original],
+      [connection, request, "workspace:other", reader, original],
+      [connection, request, SCOPE.workspaceId, otherReader, original],
+      [connection, request, SCOPE.workspaceId, reader, structuredClone(original)],
+    ] as const)
+      expectUnavailable(() =>
+        readFinancialActionConsentR1IdentityEvidenceData(
+          c,
+          r,
+          w,
+          selectedReader,
+          result,
+          accountsPair(command).request,
+          poison,
+          poison,
+        ),
+      );
+    expect(getterCalls).toBe(0);
+  } finally {
+    f.close();
+  }
+});
+
+test("identity evidence DATA is deeply detached and does no SQL clock observer or proof verification", async () => {
+  const { command, install, reader } = await setup();
+  try {
+    await install();
+    const original = await reader.readRetainedActionConsentR1(command.key.challengeRef);
+    const pair = accountsPair(command);
+    const before = {
+      writes: f.writes,
+      provider: f.providerRequests,
+      clocks: f.clocks,
+      captures: state.captures,
+    };
+    f.unknownQuery();
+    const data = readFinancialActionConsentR1IdentityEvidenceData(
+      connection,
+      request,
+      SCOPE.workspaceId,
+      reader,
+      original,
+      pair.request,
+      pair.loaded,
+      pair.current,
+    );
+    accountsParent(pair.loaded.proof, "grant").eventRef = "mutated:after-return";
+    expect(data).toMatchObject({ sourceParentPins: [{ eventRef: "event:grant" }, {}, {}, {}] });
+    expect({
+      writes: f.writes,
+      provider: f.providerRequests,
+      clocks: f.clocks,
+      captures: state.captures,
+    }).toEqual(before);
+    await expect(
+      reader.readRetainedActionConsentR1(command.key.challengeRef),
+    ).rejects.toMatchObject({ code: "unavailable" });
+  } finally {
+    f.close();
+  }
+});
+
+test("identity evidence DATA refuses drifted Root origin after successful R1 without fresh capture", async () => {
+  const { command, install, reader } = await setup();
+  try {
+    await install();
+    const original = await reader.readRetainedActionConsentR1(command.key.challengeRef);
+    const pair = accountsPair(command);
+    state.active = false;
+    expectUnavailable(() =>
+      readFinancialActionConsentR1IdentityEvidenceData(
+        connection,
+        request,
+        SCOPE.workspaceId,
+        reader,
+        original,
+        pair.request,
+        pair.loaded,
+        pair.current,
+      ),
+    );
+    expect(state.captures).toBe(1);
   } finally {
     f.close();
   }

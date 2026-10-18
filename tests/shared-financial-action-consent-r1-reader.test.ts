@@ -12,6 +12,8 @@ test("request-owned R1 consumer runs all twenty-four external-origin scenarios i
       "--timeout",
       "30000",
       "--bail=1",
+      "-t",
+      "^(?!identity evidence DATA)",
       "./tests/fixtures/financial-r1-request-reader-scenario.ts",
     ],
     cwd: fileURLToPath(new URL("..", import.meta.url)),
