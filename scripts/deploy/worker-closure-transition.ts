@@ -16,7 +16,6 @@ import {
 } from "./integration-storage-generation.ts";
 import {
   moneyUnitSchemaReady,
-  pendingMigrations,
   readD1SchemaState,
   readMigrationArtifact,
   readMoneyUnitPolicy,
@@ -49,6 +48,7 @@ import {
   withProviderExecutorQualification,
   workerMoneyUnitSchemaReady,
   workerSchemaAllowsPending,
+  workerSelectedPendingMigrations,
 } from "./worker.ts";
 import { prepareWorkerArtifact } from "./worker-artifact.ts";
 import { assertTargetComposes } from "./worker-composition.ts";
@@ -333,7 +333,7 @@ export async function runWorkerClosureTransition(
       invocation.environment,
     );
     const migrationState = await migrations.read();
-    const pending = pendingMigrations(migrationState.local, migrationState.applied);
+    const pending = workerSelectedPendingMigrations(target, migrationState, sourceRepositoryRoot);
     if (
       target.schemaMaintenanceMode !== undefined &&
       !workerSchemaAllowsPending(target, migrationState, sourceRepositoryRoot)
@@ -540,7 +540,11 @@ export async function runWorkerClosureTransition(
       );
     }
     const finalMigrationState = await migrations.read();
-    const finalPending = pendingMigrations(finalMigrationState.local, finalMigrationState.applied);
+    const finalPending = workerSelectedPendingMigrations(
+      target,
+      finalMigrationState,
+      sourceRepositoryRoot,
+    );
     if (!workerSchemaAllowsPending(target, finalMigrationState, sourceRepositoryRoot)) {
       throw preflightError(
         "closure transition refuses changed pending D1 migrations before upload; apply takoserver-d1-schema first",
@@ -624,7 +628,11 @@ export async function runWorkerClosureTransition(
       throw verificationError("served Worker annotation does not identify the sealed upload");
     }
     const afterMigrations = await migrations.read();
-    const afterPending = pendingMigrations(afterMigrations.local, afterMigrations.applied);
+    const afterPending = workerSelectedPendingMigrations(
+      target,
+      afterMigrations,
+      sourceRepositoryRoot,
+    );
     if (!workerSchemaAllowsPending(target, afterMigrations, sourceRepositoryRoot)) {
       throw verificationError("closure transition left pending D1 migrations");
     }
@@ -788,7 +796,7 @@ async function appliedClosureTransitionStatus(
       : { authorityProfile: { kind: "provenance-bound-jit" as const } }),
   });
   const migrationState = await migrations.read();
-  const pending = pendingMigrations(migrationState.local, migrationState.applied);
+  const pending = workerSelectedPendingMigrations(target, migrationState, sourceRepositoryRoot);
   if (
     target.schemaMaintenanceMode !== undefined &&
     !workerSchemaAllowsPending(target, migrationState, sourceRepositoryRoot)

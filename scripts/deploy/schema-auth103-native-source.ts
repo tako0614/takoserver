@@ -466,6 +466,11 @@ function shape(database: Database): string {
   );
 }
 
+const auth103CompiledShapeCache = new Map<
+  string,
+  ReturnType<typeof compileAuth103NativeImportShapes>
+>();
+
 /** Schema readiness DATA only. Native request qualification still requires the
  * actual platform binding and the source/RP/deployment originals and receipts. */
 export function auth103SourceSchemaReady(
@@ -491,10 +496,16 @@ export function auth103SourceSchemaReady(
         input.applied.some((name, index) => name !== source.artifact.names[index])
       )
         return false;
-      const expected =
-        profile === "money-preserved"
-          ? compileAuth103MoneyPreservedImportShapes(source.artifact)
-          : compileAuth103NativeImportShapes(source.artifact);
+      const cacheKey = `${profile}:${source.artifact.digest}`;
+      let expected = auth103CompiledShapeCache.get(cacheKey);
+      if (expected === undefined) {
+        expected =
+          profile === "money-preserved"
+            ? compileAuth103MoneyPreservedImportShapes(source.artifact)
+            : compileAuth103NativeImportShapes(source.artifact);
+        if (auth103CompiledShapeCache.size >= 4) auth103CompiledShapeCache.clear();
+        auth103CompiledShapeCache.set(cacheKey, expected);
+      }
       source.assertCurrent();
       return applicationSchemaMatches(
         { applied: input.applied, shape: input.shape, shapeDigest: input.shapeDigest },

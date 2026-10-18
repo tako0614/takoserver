@@ -2,12 +2,14 @@ import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { deriveExpectedApplicationShape } from "../scripts/deploy/application-schema-shape.ts";
+import { readAuth103CanonicalMigrationSource } from "../scripts/deploy/auth103-canonical-migration-source.ts";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import { readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import { expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
+import { compileAuth103NativeImportShapes } from "../scripts/deploy/schema-auth103-native-source.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import type { ProviderExecutorInspection } from "../scripts/deploy/worker.ts";
 import {
@@ -89,6 +91,20 @@ const schemaMaintenanceTarget = {
 const canonicalMigrations = readMigrationArtifact().names;
 const canonicalMoneyShape = deriveExpectedApplicationShape(readMigrationArtifact().files);
 const canonicalMoneyShapeDigest = `sha256:${createHash("sha256").update(canonicalMoneyShape).digest("hex")}`;
+const currentAuth103State = (() => {
+  const source = readAuth103CanonicalMigrationSource(resolve(import.meta.dir, ".."));
+  try {
+    const shape = compileAuth103NativeImportShapes(source.artifact).postShape;
+    source.assertCurrent();
+    return {
+      applied: source.artifact.names,
+      shape,
+      shapeDigest: `sha256:${createHash("sha256").update(shape).digest("hex")}`,
+    };
+  } finally {
+    source.dispose();
+  }
+})();
 const canonicalMoneyPolicy = [
   {
     ledger_unit: "usd-micros-v2",
@@ -143,6 +159,16 @@ function fixture(
 } {
   const calls: string[][] = [];
   const selectedTarget: DeployTarget = input.selectedTarget ?? target;
+  const selectedApplied =
+    input.applied ??
+    (selectedTarget.schemaMaintenanceMode === undefined &&
+    selectedTarget.artifactBlobIoMode === undefined
+      ? currentAuth103State.applied
+      : canonicalMigrations);
+  const selectedShape =
+    selectedApplied.length === 103
+      ? currentAuth103State
+      : { shape: canonicalMoneyShape, shapeDigest: canonicalMoneyShapeDigest };
   let current = input.current ?? "before";
   let built = false;
   let replacementObserved = false;
@@ -302,9 +328,9 @@ function fixture(
       async read() {
         return {
           local: input.local ?? canonicalMigrations,
-          applied: input.applied ?? canonicalMigrations,
-          shape: canonicalMoneyShape,
-          shapeDigest: canonicalMoneyShapeDigest,
+          applied: selectedApplied,
+          shape: selectedShape.shape,
+          shapeDigest: selectedShape.shapeDigest,
           moneyUnitPolicy: canonicalMoneyPolicy,
         };
       },
@@ -1190,7 +1216,7 @@ describe("split Takoserver Worker surfaces", () => {
     for (const count of [66, 75, 87, 89]) {
       expect(workerSchemaAllowsPending(lineage0088, at(count))).toBe(false);
     }
-    expect(workerSchemaAllowsPending(lineage0088, at(canonicalMigrations.length))).toBe(true);
+    expect(workerSchemaAllowsPending(lineage0088, at(canonicalMigrations.length))).toBe(false);
     expect(workerSchemaAllowsPending(lineage0089, at(88))).toBe(false);
     const lineage0091 = {
       ...v2Target,
@@ -1219,7 +1245,13 @@ describe("split Takoserver Worker surfaces", () => {
     expect(workerSchemaAllowsPending(applied0092, exact0092)).toBe(false);
     expect(workerSchemaAllowsPending(lineage0088, exact0092)).toBe(false);
     for (const selected of [lineage0088, lineage0089, lineage0091, lineage0092, applied0092]) {
-      expect(workerSchemaAllowsPending(selected, at(canonicalMigrations.length))).toBe(true);
+      expect(workerSchemaAllowsPending(selected, at(canonicalMigrations.length))).toBe(false);
+      expect(
+        workerSchemaAllowsPending(selected, {
+          local: canonicalMigrations,
+          ...currentAuth103State,
+        }),
+      ).toBe(true);
     }
     expect(
       workerSchemaAllowsPending(lineage0088, {
