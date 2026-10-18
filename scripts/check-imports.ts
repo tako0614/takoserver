@@ -658,10 +658,11 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain"],
   },
   {
-    // This exact composition joins retained custody with the SQL-origin adapter.
+    // This exact composition joins retained custody, the SQL-origin adapter,
+    // and the original request/Financial auth composition.
     name: "app",
     match: /^src\/shared-financial-retained-r1\.ts$/u,
-    may: ["core", "domain", "adapter"],
+    may: ["core", "domain", "adapter", "app"],
   },
   {
     // Consent codecs and the unregistered history leaf use portable domain ports.

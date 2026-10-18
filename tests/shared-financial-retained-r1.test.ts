@@ -21,10 +21,14 @@ import {
   type SharedFinancialAction,
 } from "../src/shared-financial-action.ts";
 import {
+  buildFinancialC0OriginalRoleOccupancyStatementData,
   buildFinancialR1CoPreparationBatch,
+  buildFinancialR1HistoricalC0RecordJsonData,
   buildFinancialR1MechanicalBatch,
+  createFinancialActionConsentR1Reader,
   createFinancialRetainedR1Store,
   type FinancialR1WriteCommand,
+  readFinancialRequestBoundR1History,
   type SelectedEconomicR1,
 } from "../src/shared-financial-retained-r1.ts";
 import {
@@ -1185,6 +1189,12 @@ describe("fixed registration C0 R1 contribution", () => {
             scope: command.original.scopeRealm,
           }),
         );
+        expect(buildFinancialR1HistoricalC0RecordJsonData(command)).toBe(
+          c0.preparedImage.recordJson,
+        );
+        expect(buildFinancialR1HistoricalC0RecordJsonData(command)).not.toBe(
+          canonicalJson(command.original.c0),
+        );
         expect(c0.preparedImage).toEqual({
           challengeRef: command.key.challengeRef,
           preparationRef: command.key.preparationRef,
@@ -1979,4 +1989,206 @@ describe("business-key historical DATA and new-five-only CAS", () => {
       f.close();
     }
   });
+});
+
+describe("Hosted supplier retained Financial command DATA", () => {
+  test("all five actions return the actual stored full command and byte-exact JSON", async () => {
+    for (const action of ACTIONS) {
+      const f = await fixture();
+      try {
+        await f.registerFixtureData();
+        const command = await f.command(action);
+        await f.sql.batch(await buildFinancialR1MechanicalBatch(f.options, command));
+        await f.c0.prepare(command.original.c0);
+        const before = [f.writes, f.clocks, f.providerRequests];
+        const stored = f.db
+          .query("SELECT command_json FROM financial_retained_r1_originals WHERE challenge_ref=?")
+          .get(command.key.challengeRef) as { command_json: string };
+        const read = await f.store.readBusinessRetainedR1Data(action);
+        if (read.status !== "found") throw Error("retained Financial command missing");
+        expect(read.fullCommand).toEqual(command);
+        expect(read.fullCommandJson).toBe(stored.command_json);
+        expect(JSON.parse(read.fullCommandJson)).toEqual(read.fullCommand);
+        expect(read.fullCommand.original).toEqual(read.original);
+        expect(read.fullCommand.key.challengeRef).toBe(read.original.challengeRef);
+        expect(read.fullCommand.r1ReceiptRef).toBe(read.r1ReceiptRef);
+        expect(read.fullCommand.original.c0ReceiptRef).toBe(read.c0ReceiptRef);
+        expect(read.fullCommand.original.selectedTerms).toEqual(command.original.selectedTerms);
+        expect(read.actionIdentity.action).toEqual(action);
+        if (action.kind === "plan-change" || action.kind === "cancel") {
+          expect(read.actionIdentity.action.kind).not.toBe("subscription-start");
+          expect(read.original.economic.kind).toBe(action.kind);
+        }
+        expect(await f.store.readJoinedRetainedR1Data(command.key.challengeRef)).toEqual(read);
+        await expect(
+          f.store.readRetainedActionConsentR1(command.key.challengeRef),
+        ).rejects.toMatchObject({ code: "unavailable" });
+        expect([f.writes, f.clocks, f.providerRequests]).toEqual(before);
+      } finally {
+        f.close();
+      }
+    }
+  });
+
+  test("returned full command is detached from the old caller and deeply immutable", async () => {
+    const f = await fixture();
+    try {
+      await f.registerFixtureData();
+      const command = await f.command(ACTIONS[0]!);
+      await f.sql.batch(await buildFinancialR1MechanicalBatch(f.options, command));
+      await f.c0.prepare(command.original.c0);
+      const read = await f.store.readBusinessRetainedR1Data(ACTIONS[0]!);
+      if (read.status !== "found") throw Error("retained command missing");
+      const raw = read.fullCommandJson;
+      Object.assign(command.key, { r1Ref: "r1:changed-caller" });
+      expect(read.fullCommand).not.toBe(command);
+      expect(read.fullCommand.key.r1Ref).not.toBe(command.key.r1Ref);
+      expect(Object.isFrozen(read.fullCommand)).toBe(true);
+      expect(Object.isFrozen(read.fullCommand.key)).toBe(true);
+      expect(Object.isFrozen(read.fullCommand.original.selectedTerms)).toBe(true);
+      expect(Reflect.set(read.fullCommand.key, "r1Ref", "r1:mutation-refused")).toBe(false);
+      expect(read.fullCommandJson).toBe(raw);
+      expect(await f.store.readBusinessRetainedR1Data(ACTIONS[0]!)).toEqual(read);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("an unknown historical GET does not emit a command or write and same GET later recovers", async () => {
+    const f = await fixture();
+    try {
+      await f.registerFixtureData();
+      const command = await f.command(ACTIONS[0]!);
+      await f.sql.batch(await buildFinancialR1MechanicalBatch(f.options, command));
+      await f.c0.prepare(command.original.c0);
+      const before = [f.writes, f.clocks, f.providerRequests];
+      f.unknownQuery();
+      await expect(f.store.readBusinessRetainedR1Data(ACTIONS[0]!)).rejects.toMatchObject({
+        code: "unavailable",
+      });
+      const read = await f.store.readBusinessRetainedR1Data(ACTIONS[0]!);
+      if (read.status !== "found") throw Error("original GET recovery missing");
+      expect(read.fullCommand).toEqual(command);
+      expect([f.writes, f.clocks, f.providerRequests]).toEqual(before);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("complete historical absence carries no replacement command or NEW permission", async () => {
+    const f = await fixture();
+    try {
+      const before = [f.writes, f.clocks, f.providerRequests];
+      expect(await f.store.readBusinessRetainedR1Data(ACTIONS[0]!)).toEqual({
+        status: "not-found",
+      });
+      expect(await f.store.readJoinedRetainedR1Data("challenge:absent-hosted-source")).toEqual({
+        status: "not-found",
+      });
+      await expect(f.store.prepare(await f.command(ACTIONS[0]!))).rejects.toMatchObject({
+        code: "unavailable",
+      });
+      expect([f.writes, f.clocks, f.providerRequests]).toEqual(before);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("a retained R1 without its original C0 join cannot supply a full command to Hosted", async () => {
+    const f = await fixture();
+    try {
+      await f.registerFixtureData();
+      const command = await f.command(ACTIONS[0]!);
+      await f.sql.batch(await buildFinancialR1MechanicalBatch(f.options, command));
+      const before = [f.writes, f.clocks, f.providerRequests];
+      await expect(f.store.readBusinessRetainedR1Data(ACTIONS[0]!)).rejects.toMatchObject({
+        code: "unavailable",
+      });
+      expect([f.writes, f.clocks, f.providerRequests]).toEqual(before);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("historical C0 image matches the actual stored five-key record", async () => {
+    const f = await fixture();
+    try {
+      await f.registerFixtureData();
+      const command = await f.command(ACTIONS[0]!);
+      await f.c0.prepare(command.original.c0);
+      const rows = await f.sql.query(
+        "SELECT record_json FROM financial_preproof_challenges WHERE challenge_ref=?",
+        [command.key.challengeRef],
+      );
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.record_json).toBe(buildFinancialR1HistoricalC0RecordJsonData(command));
+      expect(rows[0]?.record_json).not.toBe(canonicalJson(command.original.c0));
+    } finally {
+      f.close();
+    }
+  });
+
+  test("an orphan C0 original occupies its saved receipt-ref role", async () => {
+    const f = await fixture();
+    try {
+      const command = await f.command(ACTIONS[0]!);
+      const original = f.c0.buildPreparationBatch(command.original.c0, AT)[0];
+      if (!original) throw Error("C0 original contribution missing");
+      await f.base.batch([original]);
+      const receiptRef = command.original.c0ReceiptRef;
+      expect(receiptRef).not.toBe(command.key.challengeRef);
+      expect(receiptRef).not.toBe(command.key.preparationRef);
+      const collision = buildFinancialC0OriginalRoleOccupancyStatementData(receiptRef);
+      const occupied = await f.sql.query(collision.sql, collision.params);
+      expect(occupied).toHaveLength(1);
+      expect(occupied[0]?.hit).toBe(1);
+      expect(
+        await f.sql.query(
+          "SELECT receipt_ref FROM financial_preproof_challenge_receipts WHERE receipt_ref=?",
+          [receiptRef],
+        ),
+      ).toEqual([]);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("request-bound historical entry refuses a caller-built connection before request access", async () => {
+    let requestAccess = 0;
+    const request = new Proxy({} as Request, {
+      get() {
+        requestAccess++;
+        throw new Error("untrusted request getter");
+      },
+    });
+    await expect(
+      readFinancialRequestBoundR1History(
+        Object.freeze({}) as never,
+        request,
+        "workspace:test",
+        "challenge:unoriginated",
+      ),
+    ).rejects.toMatchObject({ code: "unavailable" });
+    expect(requestAccess).toBe(0);
+  });
+});
+
+test("request-owned R1 consumer rejects a caller-built connection at construction", () => {
+  let touched = 0;
+  const fake = Object.create(null, {
+    query: {
+      get() {
+        touched++;
+        throw Error("caller getter");
+      },
+    },
+  });
+  expect(() =>
+    createFinancialActionConsentR1Reader(
+      fake,
+      new Request("https://fixture.invalid"),
+      "workspace:test",
+    ),
+  ).toThrow("unavailable");
+  expect(touched).toBe(0);
 });
