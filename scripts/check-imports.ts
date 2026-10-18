@@ -666,6 +666,20 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain"],
   },
   {
+    // These exact Financial helpers consume portable core and domain inputs.
+    name: "domain",
+    match:
+      /^src\/(?:shared-financial-admission|shared-financial-consent-data|shared-financial-customer-dispatch|shared-financial-customer-journal|shared-financial-customer-tracked-execution)\.ts$/u,
+    may: ["core", "domain"],
+  },
+  {
+    // These exact action compositions join retained R1 and SQL-origin adapters.
+    name: "app",
+    match:
+      /^src\/(?:topup-existing-customer|subscription-start-existing-customer|card-setup-existing-customer|plan-change-existing-customer|cancel-existing-customer)\.ts$/u,
+    may: ["core", "domain", "adapter", "app"],
+  },
+  {
     // Shared app name policy belongs to the existing origin reservation domain.
     // Its pure helpers do not gain adapter or composition import authority.
     name: "domain",

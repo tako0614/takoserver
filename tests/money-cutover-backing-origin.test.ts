@@ -71,7 +71,7 @@ describe("money cutover backing origin", () => {
         return [];
       },
     };
-    const raw = createD1Sql(database, { acknowledgement: "explicit-d1-result" });
+    const raw = createD1Sql(database);
     const wrapped = createMoneyCutoverSql(raw, WRITER_EPOCH);
     expect(
       assertMoneyCutoverSqlBackingOrigin(wrapped, { rawSql: raw, writerEpoch: WRITER_EPOCH }),
