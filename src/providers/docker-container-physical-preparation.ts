@@ -64,10 +64,10 @@ export function createDockerPhysicalRuntimePreparation(options: {
   readonly packetLimitBytes: number;
 }) {
   const policy = Object.freeze(structuredClone(options.policy));
-  const names = Object.freeze([...options.requiredSecretNames]);
-  // Empty-name actual Core/owner coupling is deliberately not fabricated by
-  // dropping the existing custody validation or creating a dummy secret ref.
-  if (names.length === 0) return fail();
+  const selectedNames = options.requiredSecretNames;
+  if (!Array.isArray(selectedNames)) return fail();
+  const names = Object.freeze([...selectedNames]);
+  // Explicit empty names still pass through original custody/owner validation.
   const selected = Object.freeze(structuredClone(options.process));
   const host = Object.freeze(structuredClone(options.host));
   const maxConnections = options.maxConnections,

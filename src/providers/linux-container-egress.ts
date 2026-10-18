@@ -1064,3 +1064,152 @@ export async function applyLinuxContainerEgress(
   await guard();
   return readLinuxContainerEgress(plan, port);
 }
+
+/** Shared bridge anti-spoof only. Guest namespaces retain their own policy and
+ * quota. This plan is kernel syntax, never accepted owner authority. */
+export interface LinuxContainerSharedBridgeGuardPlan {
+  readonly namespace: string;
+  readonly table: string;
+  readonly script: string;
+  readonly bridge: LinuxContainerHostHttpBridge;
+}
+const sharedBridgeObjects = new WeakMap<
+  LinuxContainerSharedBridgeGuardPlan,
+  readonly Record<string, unknown>[]
+>();
+export function compileLinuxContainerSharedBridgeGuard(input: {
+  readonly namespace: string;
+  readonly table: string;
+  readonly bridge: LinuxContainerHostHttpBridge;
+  readonly policy: LinuxContainerEgressInput["tenants"][number]["authority"];
+}): LinuxContainerSharedBridgeGuardPlan {
+  const value = structuredClone(input),
+    b = value.bridge,
+    policy = value.policy;
+  if (
+    !NETNS.test(value.namespace) ||
+    !b ||
+    !policy ||
+    !BRIDGE_NAME.test(b.bridge) ||
+    value.table !== `takos_cx_${b.networkId.slice(0, 32)}` ||
+    typeof policy.tenantRef !== "string" ||
+    !policy.tenantRef ||
+    !integer(policy.generation) ||
+    policy.generation < 1 ||
+    !SHA.test(policy.policyDigest) ||
+    typeof policy.outboundInternet !== "boolean"
+  )
+    fail();
+  validateHostHttp({
+    namespace: { parent: value.namespace, selected: value.namespace },
+    table: value.table,
+    killSwitch: false,
+    tenants: [
+      { authority: policy, interfaces: [b.bridge], maxConnections: 0, packetLimitBytes: 0 },
+    ],
+    hostHttp: [b],
+  });
+  const lines = [`create table bridge ${value.table}_bridge`];
+  const rules = compileBridgeGuard(value.table, [b], [], lines);
+  const common = { family: "bridge", table: rules.table };
+  const expected: Record<string, unknown>[] = [
+    { table: { family: "bridge", name: rules.table } },
+    { set: { ...common, name: "disabled", type: "ifname", elem: [] } },
+    ...["killed", "bridge_denied"].map((name) => ({ counter: { ...common, name } })),
+    ...["prerouting", "input", "forward", "output"].map((hook) => ({
+      chain: { ...common, name: hook, type: "filter", hook, prio: -210, policy: "accept" },
+    })),
+    ...rules.ruleTags.map((tag, index) => {
+      const [chain, comment] = tag.split(":");
+      return { rule: { ...common, chain, comment, expr: rules.ruleExpressions[index] } };
+    }),
+  ];
+  const plan = freeze({
+    namespace: value.namespace,
+    table: value.table,
+    script: `${lines.join("\n")}\n`,
+    bridge: b,
+  });
+  sharedBridgeObjects.set(plan, expected);
+  return plan;
+}
+export async function readLinuxContainerSharedBridgeGuard(
+  plan: LinuxContainerSharedBridgeGuardPlan,
+  port: LinuxContainerEgressPort,
+) {
+  const expected = sharedBridgeObjects.get(plan);
+  if (!expected || (await port.namespace()) !== plan.namespace) fail();
+  let wire: unknown;
+  try {
+    wire = JSON.parse(
+      await port.execute({
+        argv: ["nft", "-j", "list", "table", "bridge", `${plan.table}_bridge`],
+      }),
+    );
+  } catch {
+    return fail();
+  }
+  const value = normalizeLinuxContainerEgressInterfaceReadback(wire, [plan.bridge]);
+  if (!record(value) || Object.keys(value).length !== 1 || !Array.isArray(value.nftables)) fail();
+  const objects: Record<string, unknown>[] = [];
+  const keys: Record<string, readonly string[]> = {
+    table: ["family", "name", "flags", "handle"],
+    chain: ["family", "table", "name", "type", "hook", "prio", "policy", "handle"],
+    set: ["family", "table", "name", "type", "elem", "handle"],
+    rule: ["family", "table", "chain", "expr", "comment", "handle"],
+    counter: ["family", "table", "name", "bytes", "packets", "handle"],
+  };
+  for (const entry of value.nftables) {
+    if (!record(entry) || Object.keys(entry).length !== 1) fail();
+    if (record(entry.metainfo)) continue;
+    const [kind, body] = Object.entries(entry)[0] ?? [];
+    if (
+      !kind ||
+      !record(body) ||
+      !keys[kind] ||
+      Object.keys(body).some((key) => !keys[kind]?.includes(key))
+    )
+      fail();
+    const { handle, ...normalized } = body;
+    if (handle !== undefined && (!Number.isSafeInteger(handle) || Number(handle) < 1)) fail();
+    if (kind === "table" && "flags" in normalized) {
+      if (!Array.isArray(normalized.flags) || normalized.flags.length) fail();
+      delete normalized.flags;
+    }
+    if (kind === "counter") {
+      if (
+        typeof normalized.bytes !== "number" ||
+        !integer(normalized.bytes) ||
+        typeof normalized.packets !== "number" ||
+        !integer(normalized.packets)
+      )
+        fail();
+      delete normalized.bytes;
+      delete normalized.packets;
+    }
+    if (kind === "set" && normalized.elem === undefined) normalized.elem = [];
+    objects.push({ [kind]: normalized });
+  }
+  if (
+    JSON.stringify(sortedObjects(objects)) !== JSON.stringify(sortedObjects(expected)) ||
+    (await port.namespace()) !== plan.namespace
+  )
+    fail();
+  return Object.freeze({
+    namespace: plan.namespace,
+    table: `${plan.table}_bridge`,
+    structuralDigest: hash(sortedObjects(objects)),
+  });
+}
+/** Exclusive table creation only. An unknown result is never re-applied here;
+ * callers retain their durable pipeline claim and recover by read-only lookup. */
+export async function applyLinuxContainerSharedBridgeGuard(
+  plan: LinuxContainerSharedBridgeGuardPlan,
+  port: LinuxContainerEgressPort,
+) {
+  if (!sharedBridgeObjects.has(plan) || (await port.namespace()) !== plan.namespace) fail();
+  await port.execute({ argv: ["nft", "--check", "-f", "-"], stdin: plan.script });
+  if ((await port.namespace()) !== plan.namespace) fail();
+  await port.execute({ argv: ["nft", "-f", "-"], stdin: plan.script });
+  return readLinuxContainerSharedBridgeGuard(plan, port);
+}

@@ -7,10 +7,15 @@ import {
   type DockerContainerCreateSession,
 } from "./docker-container-create-custody.ts";
 import {
+  DockerImageAcquisition,
+  type DockerImageAcquisitionTarget,
+} from "./docker-container-image-acquisition.ts";
+import {
   type DockerContainerNativeIdentity,
   DockerContainerRuntimePreparation,
   DockerContainerRuntimePreparationError,
 } from "./docker-container-runtime-preparation.ts";
+import { LinuxDockerRuntimePreparation } from "./linux-docker-runtime-preparation.ts";
 
 /** Host-private execution input, not a new Form or an externalServices slot. */
 export interface DockerHttpRevision {
@@ -29,7 +34,12 @@ export interface DockerHttpRevision {
 export type DockerHttpRevisionObservation =
   | { readonly state: "absent" }
   | { readonly state: "stopped" | "starting"; readonly nativeId: string }
-  | { readonly state: "ready"; readonly nativeId: string; readonly endpoint: string };
+  | {
+      readonly state: "ready";
+      readonly nativeId: string;
+      readonly endpoint: string;
+      readonly imageDigest?: string;
+    };
 
 interface EngineResponse {
   readonly status: number;
@@ -56,7 +66,9 @@ export interface DockerHttpRevisionOptions {
   ) => Promise<EngineResponse>;
   readonly healthFetch?: (request: Request) => Promise<Response>;
   /** Host-only opt-in; absent keeps the existing owned internal network profile. */
-  readonly runtimePreparation?: DockerContainerRuntimePreparation;
+  readonly runtimePreparation?: DockerContainerRuntimePreparation | LinuxDockerRuntimePreparation;
+  /** Host archive mode; original held custody is mandatory. No registry pull fallback. */
+  readonly imageAcquisition?: DockerImageAcquisition;
   /** Host-owned ordered numeric resolver override, required for Internet-capable
    * preparation. This pins Engine configuration, not destination permission.
    */
@@ -81,7 +93,10 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
   const options = { ...configuration };
   const timeoutMs = options.timeoutMs ?? 30_000;
   const preparation = options.runtimePreparation;
+  const linuxPreparation =
+    preparation instanceof LinuxDockerRuntimePreparation ? preparation : null;
   const custody = preparation?.createCustody;
+  const imageAcquisition = options.imageAcquisition;
   const dnsServers = dnsSnapshot(options.dnsServers);
   if (
     !options.socketPath.startsWith("/") ||
@@ -92,8 +107,13 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
     !positive(options.maxNanoCpus) ||
     !positive(options.pidsLimit) ||
     !positive(timeoutMs) ||
-    (preparation !== undefined && !(preparation instanceof DockerContainerRuntimePreparation)) ||
-    (preparation?.policy.outboundInternet === true && dnsServers === undefined)
+    (preparation !== undefined &&
+      !(preparation instanceof DockerContainerRuntimePreparation) &&
+      !linuxPreparation) ||
+    (imageAcquisition !== undefined &&
+      (!(imageAcquisition instanceof DockerImageAcquisition) || !custody)) ||
+    (preparation?.policy.outboundInternet === true && dnsServers === undefined) ||
+    (linuxPreparation && !sameStringSet(dnsServers ?? [], linuxPreparation.dnsServers))
   )
     throw new DockerHttpRevisionError("invalid_request");
   const engine = options.engine ?? dockerEngine(options.socketPath, timeoutMs);
@@ -142,7 +162,7 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
         .map(([key, value]) => `${key}=${value}`),
       ExposedPorts: { [`${input.port}/tcp`]: {} },
       HostConfig: {
-        NetworkMode: options.network,
+        NetworkMode: linuxPreparation ? "none" : options.network,
         Memory: input.memoryBytes,
         MemorySwap: input.memoryBytes,
         NanoCpus: input.nanoCpus,
@@ -169,8 +189,28 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
 
   type Desired = Awaited<ReturnType<typeof desired>>;
 
-  /** The image reference names one manifest, never a mutable tag or an index. */
-  async function verifyImage(target: Desired, signal?: AbortSignal): Promise<string> {
+  /** Preserve the original digest-pinned root, including a verified index. */
+  function imageTarget(target: Desired): DockerImageAcquisitionTarget {
+    return {
+      image: target.input.image,
+      installationId: options.installationId,
+      resourceUid: target.input.resourceUid,
+      incarnationId: target.input.incarnationId,
+      revision: target.input.revision,
+      identityLabel: target.labels["takoserver.identity"],
+      revisionLabel: target.labels["takoserver.revision"],
+    };
+  }
+
+  async function verifyImage(
+    target: Desired,
+    signal?: AbortSignal,
+    claimId?: string,
+  ): Promise<string> {
+    if (imageAcquisition) {
+      if (!claimId) throw new DockerHttpRevisionError("unavailable");
+      return imageAcquisition.inspect(imageTarget(target), claimId, signal);
+    }
     const response = await engine(
       "GET",
       `/images/${encodeURIComponent(target.input.image)}/json`,
@@ -236,11 +276,12 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
       (held
         ? labels[CREATE_CLAIM_LABEL] !== held.claimId
         : labels[CREATE_CLAIM_LABEL] !== undefined) ||
-      config.Image !== target.input.image ||
+      (!imageAcquisition && config.Image !== target.input.image) ||
       Object.entries(target.labels).some(([key, label]) => labels[key] !== label)
     )
       throw new DockerHttpRevisionError("conflict");
-    if (value.Image !== (await verifyImage(target, held?.signal)))
+    const imageId = await verifyImage(target, held?.signal, held?.claimId);
+    if (value.Image !== imageId || (imageAcquisition && config.Image !== imageId))
       throw new DockerHttpRevisionError("conflict");
     const hostConfig = value.HostConfig;
     const expectedHostConfig = target.body.HostConfig;
@@ -265,7 +306,10 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
         (!isJsonObject(hostConfig.RestartPolicy) ||
           hostConfig.RestartPolicy.Name !== "no" ||
           hostConfig.RestartPolicy.MaximumRetryCount !== 0)) ||
-      !attachedOnlyToNetwork(value.NetworkSettings, options.network)
+      !(
+        attachedOnlyToNetwork(value.NetworkSettings, options.network) ||
+        (linuxPreparation && quarantineNetworkSettings(value.NetworkSettings))
+      )
     ) {
       throw new DockerHttpRevisionError("conflict");
     }
@@ -292,7 +336,10 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
       value.Name !== options.network ||
       value.Driver !== "bridge" ||
       value.Scope !== "local" ||
-      value.Internal !== !(preparation?.policy.outboundInternet ?? false) ||
+      (linuxPreparation
+        ? typeof value.Internal !== "boolean" ||
+          (linuxPreparation.policy.outboundInternet && value.Internal)
+        : value.Internal !== !(preparation?.policy.outboundInternet ?? false)) ||
       value.Ingress !== false ||
       value.Attachable !== false ||
       !isJsonObject(value.Labels) ||
@@ -323,10 +370,11 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
     // A stopped object's endpoint/sandbox may not exist yet; this is not proof
     // of a physical attachment or installed filtering on that endpoint.
     if (
-      !isJsonObject(attachment) ||
-      typeof attachment.NetworkID !== "string" ||
-      !/^[a-f0-9]{64}$/u.test(attachment.NetworkID) ||
-      attachment.NetworkID !== networkId
+      !(linuxPreparation && quarantineNetworkSettings(current.NetworkSettings)) &&
+      (!isJsonObject(attachment) ||
+        typeof attachment.NetworkID !== "string" ||
+        !/^[a-f0-9]{64}$/u.test(attachment.NetworkID) ||
+        attachment.NetworkID !== networkId)
     )
       throw new DockerHttpRevisionError("conflict");
     return Object.freeze({
@@ -337,7 +385,8 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
       revision: target.input.revision,
       nativeId: current.Id as string,
       network: options.network,
-      networkId: attachment.NetworkID,
+      // Quarantine binds owned immutable network configuration, not attachment.
+      networkId,
       image: target.input.image,
       imageId: current.Image as string,
       identityLabel: target.labels["takoserver.identity"],
@@ -365,40 +414,52 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
       readonly overrides: Readonly<Record<string, string>>;
       readonly signal: AbortSignal;
       readonly guard: () => Promise<void>;
+      readonly session?: DockerContainerCreateSession;
+      readonly importedImage?: string;
     },
   ): Promise<string | null> {
     const signal = transient?.signal;
     await requireOwnedNetwork(signal);
-    const pull = await engine(
-      "POST",
-      `/images/create?fromImage=${encodeURIComponent(target.input.image)}&platform=linux%2Famd64`,
-      undefined,
-      signal,
-    );
-    if (pull.status !== 200) throw new DockerHttpRevisionError("unavailable");
-    for (const line of pull.body.split("\n")) {
-      if (!line.trim()) continue;
-      let progress: unknown;
-      try {
-        progress = JSON.parse(line);
-      } catch {
+    // Network readback awaits Engine I/O. Current-only revocation must refuse
+    // image acquisition before it can change daemon/registry state.
+    if (transient) await transient.guard();
+    let importedImage: string | undefined;
+    if (imageAcquisition) {
+      if (!transient?.session || !transient.importedImage)
         throw new DockerHttpRevisionError("unavailable");
+      importedImage = transient.importedImage;
+    } else {
+      const pull = await engine(
+        "POST",
+        `/images/create?fromImage=${encodeURIComponent(target.input.image)}&platform=linux%2Famd64`,
+        undefined,
+        signal,
+      );
+      if (pull.status !== 200) throw new DockerHttpRevisionError("unavailable");
+      for (const line of pull.body.split("\n")) {
+        if (!line.trim()) continue;
+        let progress: unknown;
+        try {
+          progress = JSON.parse(line);
+        } catch {
+          throw new DockerHttpRevisionError("unavailable");
+        }
+        if (
+          !isJsonObject(progress) ||
+          progress.error !== undefined ||
+          progress.errorDetail !== undefined
+        )
+          throw new DockerHttpRevisionError("unavailable");
       }
-      if (
-        !isJsonObject(progress) ||
-        progress.error !== undefined ||
-        progress.errorDetail !== undefined
-      )
-        throw new DockerHttpRevisionError("unavailable");
     }
-    await verifyImage(target, signal);
-    let creationBody = target.body;
+    if (!imageAcquisition) await verifyImage(target, signal, transient?.claimId);
+    let creationBody = importedImage ? { ...target.body, Image: importedImage } : target.body;
     if (preparation) {
       const networkId = await requireOwnedNetwork(signal);
       if (networkId === null) throw new DockerHttpRevisionError("unavailable");
       // This pins configuration, not a kernel endpoint or installed filtering.
       creationBody = {
-        ...target.body,
+        ...creationBody,
         NetworkingConfig: { EndpointsConfig: { [options.network]: { NetworkID: networkId } } },
       };
     }
@@ -450,7 +511,10 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
     ip: unknown,
     guard?: () => Promise<void>,
     signal?: AbortSignal,
+    verifiedManifestDigest?: string,
   ): Promise<DockerHttpRevisionObservation> {
+    if (imageAcquisition && !/^sha256:[a-f0-9]{64}$/u.test(verifiedManifestDigest ?? ""))
+      throw new DockerHttpRevisionError("unavailable");
     if (typeof ip !== "string" || isIP(ip) !== 4) return { state: "starting", nativeId };
     const endpoint = `http://${ip}:${target.input.port}`;
     let ready = false;
@@ -469,7 +533,14 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
       ready = false;
     }
     if (guard) await prepared(guard);
-    return ready ? { state: "ready", nativeId, endpoint } : { state: "starting", nativeId };
+    return ready
+      ? {
+          state: "ready",
+          nativeId,
+          endpoint,
+          ...(verifiedManifestDigest === undefined ? {} : { imageDigest: verifiedManifestDigest }),
+        }
+      : { state: "starting", nativeId };
   }
 
   /** Every secret-mode native read/create and health observation stays within
@@ -480,10 +551,13 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
     target: Desired,
     phase: "reconcile" | "observe" | "remove",
     use: (session: DockerContainerCreateSession, ips: ReadonlyMap<string, unknown>) => Promise<T>,
+    operationSignal?: AbortSignal,
   ): Promise<T> {
     if (!custody) throw new DockerHttpRevisionError("unavailable");
     const ips = new Map<string, unknown>();
     let creationGuard: (() => Promise<void>) | null = null;
+    let creationSession: DockerContainerCreateSession | null = null;
+    let creationImage: string | undefined;
     const driver: DockerContainerCreateDriver = {
       async inspect(record, signal) {
         const current = await inspect(target, {
@@ -523,6 +597,8 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
           overrides,
           signal,
           guard,
+          ...(creationSession === null ? {} : { session: creationSession }),
+          ...(creationImage === undefined ? {} : { importedImage: creationImage }),
         });
         if (nativeId === null) throw new DockerHttpRevisionError("unavailable");
         return nativeId;
@@ -552,12 +628,23 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
         driver,
         async (session) => {
           creationGuard = () => session.guard();
+          creationSession = session;
           try {
+            // Image bytes are acquired before ensureCreated opens the original
+            // secret environment loan. Observe/remove never import an image.
+            if (imageAcquisition && phase === "reconcile" && !(await session.inspect())) {
+              await requireOwnedNetwork(session.signal);
+              await session.guard();
+              creationImage = await imageAcquisition.acquire(session, imageTarget(target));
+            }
             return await use(session, ips);
           } finally {
             creationGuard = null;
+            creationSession = null;
+            creationImage = undefined;
           }
         },
+        operationSignal,
       ),
     );
   }
@@ -583,6 +670,9 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
         await session.guard();
       },
       session.signal,
+      // Archive inspect verified the original retained archive.manifestDigest
+      // against both native image readback and the exact container binding.
+      imageAcquisition ? current.native.imageId : undefined,
     );
   }
 
@@ -612,11 +702,40 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
   return {
     async reconcile(input: DockerHttpRevision): Promise<DockerHttpRevisionObservation> {
       const target = await desired(input);
+      if (linuxPreparation) {
+        // Close the initial pending CREATE lease before physical START/health.
+        // Only the safe bound projection escapes; no Env or borrowed session.
+        const created = await withCreation(target, "reconcile", async (session) => {
+          const current = await session.ensureCreated();
+          if (!current) throw new DockerHttpRevisionError("unavailable");
+          await session.guard();
+          return Object.freeze({
+            native: Object.freeze(structuredClone(current.native)),
+            state: current.state,
+          });
+        });
+        if (created.state === "stopped")
+          await prepared(() => linuxPreparation.ensureRunning(created.native));
+        return withCreation(target, "reconcile", async (session, ips) => {
+          const observed = await creationObservation(target, session, ips);
+          if (observed.state === "ready") {
+            const current = await session.inspect();
+            if (!current || current.native.nativeId !== created.native.nativeId)
+              throw new DockerHttpRevisionError("conflict");
+            await session.guard();
+            await prepared(() => linuxPreparation.publishServing(current.native));
+            await session.guard();
+          }
+          return observed;
+        });
+      }
       if (custody) {
         return withCreation(target, "reconcile", async (session, ips) => {
           const current = await session.ensureCreated();
           if (!current || !preparation) throw new DockerHttpRevisionError("unavailable");
           if (current.state === "stopped") {
+            if (!(preparation instanceof DockerContainerRuntimePreparation))
+              throw new DockerHttpRevisionError("unavailable");
             await prepared(() =>
               preparation.authorizeStart(
                 { native: current.native, state: "stopped" },
@@ -653,6 +772,8 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
       if (!isJsonObject(current.State) || current.State.Running !== true) {
         const networkId = await requireOwnedNetwork();
         if (preparation) {
+          if (!(preparation instanceof DockerContainerRuntimePreparation))
+            throw new DockerHttpRevisionError("unavailable");
           const native = nativeIdentity(target, current, networkId);
           await prepared(() =>
             preparation.authorizeStart({ native, state: "stopped" }, async (guard) => {
@@ -696,22 +817,34 @@ export function createDockerHttpRevisionRuntime(configuration: DockerHttpRevisio
      * A recreated instance of the same logical revision is not that retirement's
      * target. Omitting the pin is reserved for authoritative logical removal.
      */
-    async remove(input: DockerHttpRevision, expectedNativeId?: string): Promise<void> {
+    async remove(
+      input: DockerHttpRevision,
+      expectedNativeId?: string,
+      signal?: AbortSignal,
+    ): Promise<void> {
+      if (signal !== undefined && (!(signal instanceof AbortSignal) || !custody))
+        throw new DockerHttpRevisionError("invalid_request");
+      if (signal?.aborted) throw new DockerHttpRevisionError("unavailable");
       if (expectedNativeId !== undefined && !/^[a-f0-9]{64}$/u.test(expectedNativeId)) {
         throw new DockerHttpRevisionError("invalid_request");
       }
       const target = await desired(input);
       if (custody) {
-        return withCreation(target, "remove", async (session) => {
-          if (expectedNativeId !== undefined && session.record.nativeId !== expectedNativeId)
-            throw new DockerHttpRevisionError("conflict");
-          // A committed removal can be retried without reopening secret Env.
-          // The custody session verifies exact-ID absence under cleanup authority.
-          const nativeId =
-            session.record.nativeId ?? (await session.inspect())?.native.nativeId ?? null;
-          if (nativeId === null) throw new DockerHttpRevisionError("unavailable");
-          await session.remove(nativeId);
-        });
+        return withCreation(
+          target,
+          "remove",
+          async (session) => {
+            if (expectedNativeId !== undefined && session.record.nativeId !== expectedNativeId)
+              throw new DockerHttpRevisionError("conflict");
+            // A committed removal can be retried without reopening secret Env.
+            // The custody session verifies exact-ID absence under cleanup authority.
+            const nativeId =
+              session.record.nativeId ?? (await session.inspect())?.native.nativeId ?? null;
+            if (nativeId === null) throw new DockerHttpRevisionError("unavailable");
+            await session.remove(nativeId);
+          },
+          signal,
+        );
       }
       const current = await inspect(target);
       if (!current) return;
@@ -847,6 +980,15 @@ function hasNoAdditionalHostAuthority(hostConfig: JsonObject): boolean {
       const mode = hostConfig[field];
       return mode === undefined || mode === "" || mode === "private";
     })
+  );
+}
+
+function quarantineNetworkSettings(value: unknown): boolean {
+  if (!isJsonObject(value) || !isJsonObject(value.Networks)) return false;
+  const names = Object.keys(value.Networks);
+  return (
+    names.length === 0 ||
+    (names.length === 1 && names[0] === "none" && isJsonObject(value.Networks.none))
   );
 }
 
