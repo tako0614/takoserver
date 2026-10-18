@@ -2898,18 +2898,53 @@ async function inspectMoneyUnitPost94Details(
     convertedSchema === undefined ||
     converted.freezeRows === undefined ||
     converted.preimageDigest !== backup.preimageDigest ||
-    converted.aggregateDigest !== backup.aggregateDigest ||
-    history.convert.receipt.postDigest !==
-      digest(
-        JSON.stringify({
-          applied: convertedSchema.applied,
-          shapeDigest: convertedSchema.shapeDigest,
-          preimageDigest: backup.preimageDigest,
-          aggregateDigest: backup.aggregateDigest,
-        }),
-      )
+    converted.aggregateDigest !== backup.aggregateDigest
   )
     throw preflightError("money converted snapshot differs from original terminal convert history");
+  const sourceDigest = moneyUnitCutoverSourcePrefixDigest(files, 94);
+  const captureBytes = Buffer.from(
+    `${JSON.stringify({
+      kind: "takoserver.money-converted94-export-capture@v1",
+      accountId: target.accountId,
+      databaseId: target.d1.databaseId,
+      databaseName: target.d1.databaseName,
+      originDigest: history.originDigest,
+      sourceDigest,
+      convertBindingDigest: history.convert.receipt.bindingDigest,
+      writerEpoch: previousWriterEpoch,
+      convertedBackupPath,
+    })}\n`,
+  );
+  if (
+    !readProtectedBytes(`${convertedBackupPath}.capture.json`, "money converted94 capture").equals(
+      captureBytes,
+    )
+  )
+    throw preflightError("money converted94 capture differs from original terminal conversion");
+  const completionBytes = Buffer.from(
+    `${JSON.stringify({
+      kind: "takoserver.money-converted94-export-completion@v1",
+      qualification: "component-simulation-only",
+      schemaPhase: "0094-fenced",
+      convertedBackupPath,
+      backupDigest: converted.digest,
+      identityDigest: convertedIdentityDigest,
+      captureDigest: digest(captureBytes),
+      convertBindingDigest: history.convert.receipt.bindingDigest,
+      historicalWriterEpoch: previousWriterEpoch,
+      sourceDigest,
+      allDataDigest: converted.allDataDigest,
+      tableInventory: Object.keys(converted.rowCounts).sort(),
+      rowCounts: { ...converted.rowCounts },
+    })}\n`,
+  );
+  if (
+    !readProtectedBytes(
+      `${convertedBackupPath}.capture.complete.json`,
+      "money converted94 completion",
+    ).equals(completionBytes)
+  )
+    throw preflightError("money converted94 completion differs from its sealed snapshot");
   assertFreezeRow(
     converted.freezeRows,
     history.anchor,
@@ -2930,6 +2965,21 @@ async function inspectMoneyUnitPost94Details(
       : currentWriterEpoch !== nextWriterEpoch)
   )
     throw preflightError("money post94 current schema and old/new epoch do not match");
+  if (phase === "0094-fenced") {
+    if (
+      history.convert.receipt.postDigest !==
+      digest(
+        JSON.stringify({
+          applied: schema.applied,
+          shapeDigest: schema.shapeDigest,
+          preimageDigest: backup.preimageDigest,
+          aggregateDigest: backup.aggregateDigest,
+        }),
+      )
+    )
+      throw preflightError("money native fenced94 differs from original terminal conversion");
+    await assertMoneyLiveBackupCompleteness(database, "preflight", converted);
+  }
   if (phase.endsWith("-fenced"))
     assertFreezeRow(
       await readFreezeRow(database, "preflight"),

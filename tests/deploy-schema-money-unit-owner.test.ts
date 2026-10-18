@@ -28,6 +28,7 @@ import { removeArtifactTree, sealDirectory } from "../scripts/deploy/qualificati
 import { expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
 import {
   buildMoneyCutoverImportSql,
+  inspectMoneyUnitPost94State,
   type MoneyCutoverDispatchBinding,
   type MoneyPost94DispatchBinding,
   type MoneyPreserved100DispatchBinding,
@@ -39,6 +40,7 @@ import {
   readMoneyAggregateDigest,
   readMoneyFrozenDataDigest,
   readMoneyPreimageDigest,
+  readWholeDatabaseDataDigest,
   runIntegrationMoneyHeldSuffix98FromOriginalUpload,
   runIntegrationMoneyOriginalPreserved100,
   runIntegrationMoneyUnitCutover,
@@ -611,6 +613,7 @@ async function resumeDependencyFixture(mode: "clear" | "replace") {
     return { applied, shape, shapeDigest: sha(shape) };
   };
   let predecessor = origin.terminalCustodyDigest;
+  const phaseImports: string[] = [];
   for (const phase of ["freeze", "prepare", "classify", "convert"] as const) {
     const beforeShapeDigest = schema().shapeDigest;
     const sql = buildMoneyCutoverImportSql({
@@ -683,6 +686,7 @@ async function resumeDependencyFixture(mode: "clear" | "replace") {
     const reviewedBinding = { ...binding, reviewDigest: sha(JSON.stringify(review)) };
     await owner.custody.dispatch(reviewedBinding);
     database.exec(`BEGIN TRANSACTION;\n${sql}\nCOMMIT;`);
+    phaseImports.push(sql);
     const post = schema();
     const terminal = await owner.custody.terminal(
       reviewedBinding,
@@ -774,6 +778,16 @@ async function resumeDependencyFixture(mode: "clear" | "replace") {
   };
   return {
     f,
+    owner,
+    original,
+    database,
+    schema,
+    phaseImports,
+    originDigest,
+    preimageDigest,
+    aggregateDigest,
+    financialDigest,
+    writerDigest,
     dependencies,
     reads: () => d1Reads,
     builds: () => builds,
@@ -2762,6 +2776,164 @@ describe("converted94 capture native original owner boundary", () => {
       expect(existsSync(join(f.root, "captured94.sql.capture.json"))).toBe(false);
     }
   });
+});
+
+describe("converted94 sealed native capture readback", () => {
+  test("accepts export SQL trivia only with the original native terminal and complete sealed census", async () => {
+    const f = await resumeDependencyFixture("clear");
+    try {
+      const target = f.f.target;
+      const files = readMigrationArtifact().files;
+      const convert = await f.owner.custody.read("convert");
+      if (convert === null) throw new Error("fixture lacks terminal convert");
+      const convertedBackupPath = join(f.f.root, "converted94.sql");
+      const combined = `${f.original.sql}\n${f.phaseImports.map((sql) => `BEGIN TRANSACTION;\n${sql}\nCOMMIT;`).join("\n")}`;
+      const normalized = normalizeSnapshotDump(Buffer.from(combined));
+      const withTrivia = normalized.sql
+        .toString()
+        .replace(/(CREATE TABLE[^;]*?\()/, "$1 /* snapshot trivia */ ");
+      expect(withTrivia).not.toBe(normalized.sql.toString());
+      const convertedBytes = Buffer.from(withTrivia);
+      const convertedDigest = sha(withTrivia);
+      writeFileSync(convertedBackupPath, convertedBytes, { mode: 0o600 });
+      const restored = new Database(":memory:");
+      try {
+        restored.exec(convertedBytes.toString());
+        const restoredReader = {
+          query: async (_phase: unknown, _description: unknown, sql: string) =>
+            restored.query(sql).all() as Record<string, unknown>[],
+        };
+        const restoredRows = restored
+          .query(
+            "SELECT type, name, tbl_name, COALESCE(sql, '') AS sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name",
+          )
+          .all() as Record<string, unknown>[];
+        const restoredShape = canonicalSchemaShape(restoredRows);
+        expect(sha(restoredShape)).not.toBe(f.schema().shapeDigest);
+        const tableInventory = (
+          restored
+            .query(
+              "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB 'sqlite_*' AND name NOT IN ('_cf_KV', '_cf_METADATA', 'd1_migrations') ORDER BY name",
+            )
+            .all() as { name: string }[]
+        ).map((row) => row.name);
+        const rowCounts = Object.fromEntries(
+          tableInventory.map((table) => [
+            table,
+            (restored.query(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n,
+          ]),
+        );
+        const source94Digest = moneyUnitCutoverSourcePrefixDigest(files, 94);
+        const identity = {
+          kind: "takoserver.money-protected-backup@v2",
+          accountId: target.accountId,
+          databaseId: target.d1.databaseId,
+          databaseName: target.d1.databaseName,
+          originDigest: f.originDigest,
+          sourceDigest: source94Digest,
+          backupDigest: convertedDigest,
+          schemaPhase: "0094-fenced",
+          convertBindingDigest: convert.bindingDigest,
+          writerEpoch,
+        };
+        const identityBytes = `${JSON.stringify(identity)}\n`;
+        writeFileSync(`${convertedBackupPath}.identity.json`, identityBytes, { mode: 0o600 });
+        const capture = {
+          kind: "takoserver.money-converted94-export-capture@v1",
+          accountId: target.accountId,
+          databaseId: target.d1.databaseId,
+          databaseName: target.d1.databaseName,
+          originDigest: f.originDigest,
+          sourceDigest: source94Digest,
+          convertBindingDigest: convert.bindingDigest,
+          writerEpoch,
+          convertedBackupPath,
+        };
+        const captureBytes = `${JSON.stringify(capture)}\n`;
+        writeFileSync(`${convertedBackupPath}.capture.json`, captureBytes, { mode: 0o600 });
+        const completion = {
+          kind: "takoserver.money-converted94-export-completion@v1",
+          qualification: "component-simulation-only",
+          schemaPhase: "0094-fenced",
+          convertedBackupPath,
+          backupDigest: convertedDigest,
+          identityDigest: sha(identityBytes),
+          captureDigest: sha(captureBytes),
+          convertBindingDigest: convert.bindingDigest,
+          historicalWriterEpoch: writerEpoch,
+          sourceDigest: source94Digest,
+          allDataDigest: await readWholeDatabaseDataDigest(
+            restoredReader,
+            "preflight",
+            tableInventory,
+          ),
+          tableInventory,
+          rowCounts,
+        };
+        const completionPath = `${convertedBackupPath}.capture.complete.json`;
+        writeFileSync(completionPath, `${JSON.stringify(completion)}\n`, { mode: 0o600 });
+        const backup = {
+          digest: f.original.digest,
+          preimageDigest: f.preimageDigest,
+          aggregateDigest: f.aggregateDigest,
+          financialDigest: f.financialDigest,
+          allDataDigest: sha("fixture original92 complete data"),
+          rowCounts: {},
+        };
+        const reader = {
+          query: async (_phase: unknown, _description: unknown, sql: string) =>
+            f.database.query(sql).all() as Record<string, unknown>[],
+        };
+        const inspect = () =>
+          inspectMoneyUnitPost94State({
+            target,
+            options: { ...f.owner, phase: "suffix98" },
+            files,
+            database: reader,
+            readSchema: async () => f.schema(),
+            backup,
+            previousWriterEpoch: writerEpoch,
+            nextWriterEpoch: sha("fixture next epoch"),
+            convertedBackupPath,
+          } as never);
+        await expect(inspect()).resolves.toMatchObject({ schemaPhase: "0094-fenced" });
+        const capturePath = `${convertedBackupPath}.capture.json`;
+        writeFileSync(
+          capturePath,
+          `${JSON.stringify({ ...capture, writerEpoch: sha("foreign epoch") })}\n`,
+        );
+        await expect(inspect()).rejects.toThrow();
+        writeFileSync(capturePath, captureBytes);
+        writeFileSync(
+          completionPath,
+          `${JSON.stringify({ ...completion, allDataDigest: sha("foreign rows") })}\n`,
+        );
+        await expect(inspect()).rejects.toThrow();
+        writeFileSync(completionPath, `${JSON.stringify(completion)}\n`);
+        f.database.exec("CREATE TABLE foreign_shape_probe (id INTEGER PRIMARY KEY)");
+        await expect(inspect()).rejects.toThrow();
+        f.database.exec("DROP TABLE foreign_shape_probe");
+        const firstMigration = f.database
+          .query("SELECT id, name FROM d1_migrations ORDER BY id LIMIT 1")
+          .get() as {
+          id: number;
+          name: string;
+        };
+        f.database
+          .query("UPDATE d1_migrations SET name = ? WHERE id = ?")
+          .run("foreign_ledger_row", firstMigration.id);
+        await expect(inspect()).rejects.toThrow();
+        f.database
+          .query("UPDATE d1_migrations SET name = ? WHERE id = ?")
+          .run(firstMigration.name, firstMigration.id);
+        await expect(inspect()).resolves.toMatchObject({ schemaPhase: "0094-fenced" });
+      } finally {
+        restored.close();
+      }
+    } finally {
+      f.close();
+    }
+  }, 30_000);
 });
 
 describe("original suffix98 live upload receiver", () => {
