@@ -548,3 +548,480 @@ for (const method of ["createSession", "readSession"] as const) {
     expect(rp.readSharedAuthVerifiedPrincipalInput(f.runtime, f.inputs[0]!.capture)).toBeNull();
   });
 }
+
+const freshSessionFields = [
+  "digest",
+  "accountId",
+  "principalId",
+  "workspaceId",
+  "payload",
+  "createdAt",
+  "lastUsedAt",
+  "absoluteExpiresAt",
+  "grantCheckedAt",
+  "version",
+  "status",
+] as const satisfies readonly (keyof OidcSessionRecord)[];
+
+test("fresh write DATA binds the same record and original only during its one create call", async () => {
+  const f = await fixture(undefined, true);
+  let selectedRecord: OidcSessionRecord | undefined;
+  let held: rp.SharedAuthFreshSessionWriteData | undefined;
+  f.control.resolve = (capture) => {
+    expect(rp.readSharedAuthVerifiedPrincipalInput(f.runtime, capture)?.phase).toBe(
+      "fresh-callback",
+    );
+    expect(rp.readSharedAuthFreshSessionWrite(f.runtime, capture)).toBeNull();
+  };
+  const original = f.store.createSession;
+  f.store.createSession = async (record) => {
+    selectedRecord = record;
+    const data = rp.readSharedAuthFreshSessionWrite(f.runtime, record);
+    if (!data) throw new Error("missing original fresh session write");
+    held = data;
+    expect(data.original).toBe(f.inputs[0]!.capture);
+    expect(data.session).toEqual(record);
+    expect(data.session).not.toBe(record);
+    expect(Object.keys(record).sort()).toEqual([...freshSessionFields].sort());
+    expect(Object.isFrozen(record)).toBe(false);
+    expect(Object.isFrozen(data)).toBe(true);
+    expect(Object.isFrozen(data.session)).toBe(true);
+    expect(data.session).toMatchObject({
+      accountId: SESSION_TEST_ACCOUNT,
+      principalId: PRINCIPAL,
+      workspaceId: SESSION_TEST_PERSONAL.id,
+      createdAt: TIME,
+      lastUsedAt: TIME,
+      absoluteExpiresAt: TIME + 7 * 24 * 60 * 60 * 1000,
+      grantCheckedAt: TIME,
+      version: 0,
+      status: "active",
+    });
+    const issued = f.issuer.issued[0]!;
+    expect(JSON.stringify(data)).not.toContain(issued.accessToken);
+    expect(JSON.stringify(data)).not.toContain(issued.refreshToken);
+    await Promise.resolve();
+    expect(rp.readSharedAuthFreshSessionWrite(f.runtime, record)).toBe(data);
+    return await Reflect.apply(original, f.store, [record]);
+  };
+  const signed = await f.login();
+  expect(signed.response.status).toBe(303);
+  expect(f.calls).toEqual({ create: 1, queue: 0, revoke: 0 });
+  expect(f.sessions.size).toBe(1);
+  expect(selectedRecord).toBeDefined();
+  expect(held?.session).toEqual([...f.sessions.values()][0]);
+  expect(rp.readSharedAuthFreshSessionWrite(f.runtime, selectedRecord)).toBeNull();
+  expect(rp.readSharedAuthVerifiedPrincipalInput(f.runtime, held?.original)?.phase).toBe(
+    "fresh-callback",
+  );
+});
+
+test("fresh write reader rejects unknown clone proxy and foreign receiver without caller getters", async () => {
+  const f = await fixture();
+  const other = await fixture();
+  const original = f.store.createSession;
+  let getters = 0;
+  const trap = new Proxy(
+    {},
+    {
+      get() {
+        getters++;
+        throw new Error("unknown record getter");
+      },
+      ownKeys() {
+        getters++;
+        throw new Error("unknown record enumeration");
+      },
+      getPrototypeOf() {
+        getters++;
+        throw new Error("unknown record prototype");
+      },
+    },
+  );
+  expect(rp.readSharedAuthFreshSessionWrite(f.runtime, trap)).toBeNull();
+  f.store.createSession = async (record) => {
+    expect(rp.readSharedAuthFreshSessionWrite(f.runtime, record)).not.toBeNull();
+    for (const candidate of [
+      null,
+      undefined,
+      trap,
+      {},
+      { ...record },
+      structuredClone(record),
+      Object.create(record),
+      new Proxy(record, {}),
+    ]) {
+      expect(rp.readSharedAuthFreshSessionWrite(f.runtime, candidate)).toBeNull();
+    }
+    for (const receiver of [
+      null,
+      {},
+      other.runtime,
+      Object.create(f.runtime),
+      new Proxy(f.runtime, {}),
+    ]) {
+      expect(rp.readSharedAuthFreshSessionWrite(receiver, record)).toBeNull();
+    }
+    expect(getters).toBe(0);
+    return await Reflect.apply(original, f.store, [record]);
+  };
+  await f.login();
+  expect(f.calls.create).toBe(1);
+  expect(getters).toBe(0);
+});
+
+for (const field of freshSessionFields) {
+  test(`fresh write reader refuses ${field} value drift and keeps the original snapshot`, async () => {
+    const f = await fixture();
+    const original = f.store.createSession;
+    f.store.createSession = async (record) => {
+      const data = rp.readSharedAuthFreshSessionWrite(f.runtime, record);
+      if (!data) throw new Error("missing fresh write before drift");
+      const before = Object.getOwnPropertyDescriptor(record, field)!;
+      const value = before.value;
+      const changed = typeof value === "number" ? value + 1 : `${value}:changed`;
+      try {
+        Object.defineProperty(record, field, { value: changed });
+        expect(rp.readSharedAuthFreshSessionWrite(f.runtime, record)).toBeNull();
+        expect(data.session[field]).toBe(value);
+      } finally {
+        Object.defineProperty(record, field, before);
+      }
+      expect(rp.readSharedAuthFreshSessionWrite(f.runtime, record)).toBe(data);
+      return await Reflect.apply(original, f.store, [record]);
+    };
+    await f.login();
+    expect(f.calls.create).toBe(1);
+  });
+
+  test(`fresh write reader refuses ${field} accessor drift without invoking its getter`, async () => {
+    const f = await fixture();
+    const original = f.store.createSession;
+    let getters = 0;
+    f.store.createSession = async (record) => {
+      const data = rp.readSharedAuthFreshSessionWrite(f.runtime, record);
+      if (!data) throw new Error("missing fresh write before accessor");
+      const before = Object.getOwnPropertyDescriptor(record, field)!;
+      try {
+        Object.defineProperty(record, field, {
+          get() {
+            getters++;
+            throw new Error("replaced record getter");
+          },
+        });
+        expect(rp.readSharedAuthFreshSessionWrite(f.runtime, record)).toBeNull();
+        expect(getters).toBe(0);
+        expect(data.session[field]).toBe(before.value);
+      } finally {
+        Object.defineProperty(record, field, before);
+      }
+      return await Reflect.apply(original, f.store, [record]);
+    };
+    await f.login();
+    expect(f.calls.create).toBe(1);
+    expect(getters).toBe(0);
+  });
+}
+
+for (const change of ["keys", "prototype", "writable", "enumerable", "configurable"] as const) {
+  test(`fresh write reader refuses record ${change} changes without rewriting the row`, async () => {
+    const f = await fixture();
+    const original = f.store.createSession;
+    f.store.createSession = async (record) => {
+      const data = rp.readSharedAuthFreshSessionWrite(f.runtime, record);
+      if (!data) throw new Error("missing fresh write before descriptor change");
+      const before = Object.getOwnPropertyDescriptor(record, "payload")!;
+      const prototype = Object.getPrototypeOf(record);
+      try {
+        if (change === "keys")
+          Object.defineProperty(record, "unexpected", { value: true, configurable: true });
+        if (change === "prototype") Object.setPrototypeOf(record, null);
+        if (change === "writable") Object.defineProperty(record, "payload", { writable: false });
+        if (change === "enumerable")
+          Object.defineProperty(record, "payload", { enumerable: false });
+        if (change === "configurable")
+          Object.defineProperty(record, "payload", { configurable: false });
+        expect(rp.readSharedAuthFreshSessionWrite(f.runtime, record)).toBeNull();
+        expect(data.session.payload).toBe(before.value);
+      } finally {
+        if (change === "keys") Reflect.deleteProperty(record, "unexpected");
+        if (change === "prototype") Object.setPrototypeOf(record, prototype);
+        if (change === "writable" || change === "enumerable")
+          Object.defineProperty(record, "payload", before);
+      }
+      return await Reflect.apply(original, f.store, [record]);
+    };
+    await f.login();
+    expect(f.calls.create).toBe(1);
+  });
+}
+
+for (const owner of [
+  "owner",
+  "config",
+  "store",
+  "factory",
+  "resolver",
+  "key",
+  "receiver",
+] as const) {
+  test(`fresh write reader retains the original ${owner} binding across its call window`, async () => {
+    const f = await fixture();
+    const original = f.store.createSession;
+    f.store.createSession = async (record) => {
+      expect(rp.readSharedAuthFreshSessionWrite(f.runtime, record)).not.toBeNull();
+      let restore = () => {};
+      try {
+        if (owner === "owner") {
+          Object.defineProperty(f.options, "unexpected", { value: true, configurable: true });
+          restore = () => {
+            Reflect.deleteProperty(f.options, "unexpected");
+          };
+        }
+        if (owner === "key") {
+          const before = f.options.encryptionKey[0]!;
+          f.options.encryptionKey[0] = before ^ 1;
+          restore = () => {
+            f.options.encryptionKey[0] = before;
+          };
+        }
+        for (const [target, property] of [
+          ...(owner === "config" ? [[f.options.config, "issuer"] as const] : []),
+          ...(owner === "store" ? [[f.store, "readSession"] as const] : []),
+          ...(owner === "factory" ? [[f.options, "store"] as const] : []),
+          ...(owner === "resolver" ? [[f.options.principals, "resolve"] as const] : []),
+          ...(owner === "receiver" ? [[f.runtime, "fetch"] as const] : []),
+        ]) {
+          const before = Object.getOwnPropertyDescriptor(target, property)!;
+          Object.defineProperty(target, property, {
+            value:
+              typeof before.value === "function"
+                ? () => {
+                    throw new Error("substituted original method");
+                  }
+                : "changed-origin",
+          });
+          restore = () => {
+            Object.defineProperty(target, property, before);
+          };
+        }
+        expect(rp.readSharedAuthFreshSessionWrite(f.runtime, record)).toBeNull();
+      } finally {
+        restore();
+      }
+      return await Reflect.apply(original, f.store, [record]);
+    };
+    await f.login();
+    expect(f.calls.create).toBe(1);
+  });
+}
+
+for (const outcome of ["false", "throw", "unknown-committed-ack"] as const) {
+  test(`fresh write window closes after ${outcome} without cookie or another create attempt`, async () => {
+    const f = await fixture();
+    const original = f.store.createSession;
+    const queue = f.store.queueRevocation;
+    const revoke = f.store.revokeSession;
+    let record: OidcSessionRecord | undefined;
+    let entryData: rp.SharedAuthFreshSessionWriteData | null | undefined;
+    let reachedOutcome: typeof outcome | undefined;
+    let attempts = 0;
+    const cleanupReads: (rp.SharedAuthFreshSessionWriteData | null)[] = [];
+    f.store.queueRevocation = async (input) => {
+      cleanupReads.push(rp.readSharedAuthFreshSessionWrite(f.runtime, record));
+      return await Reflect.apply(queue, f.store, [input]);
+    };
+    f.store.revokeSession = async (digest, now) => {
+      cleanupReads.push(rp.readSharedAuthFreshSessionWrite(f.runtime, record));
+      return await Reflect.apply(revoke, f.store, [digest, now]);
+    };
+    f.store.createSession = async (input) => {
+      attempts++;
+      record = input;
+      entryData = rp.readSharedAuthFreshSessionWrite(f.runtime, input);
+      reachedOutcome = outcome;
+      if (outcome === "false") return false;
+      if (outcome === "throw") throw new rp.SharedAuthSessionError("session_unavailable");
+      f.control.unknownCreate = true;
+      return await Reflect.apply(original, f.store, [input]);
+    };
+    const started = await f.start();
+    const response = await f.callback(started);
+    expect(response.status).toBe(503);
+    expect(record).toBeDefined();
+    expect(entryData).toBeDefined();
+    expect(entryData).not.toBeNull();
+    expect(entryData?.original).toBe(f.inputs[0]!.capture);
+    expect(entryData?.session).toEqual(record);
+    expect(reachedOutcome).toBe(outcome);
+    expect(cleanupReads).toEqual([null, null]);
+    expect(rp.readSharedAuthFreshSessionWrite(f.runtime, record)).toBeNull();
+    expect(response.headers.getSetCookie().some((value) => value.startsWith(`${COOKIE}=`))).toBe(
+      false,
+    );
+    expect(attempts).toBe(1);
+    expect(f.calls.queue).toBe(1);
+    expect(f.calls.revoke).toBe(1);
+    if (outcome === "unknown-committed-ack") {
+      expect(f.calls.create).toBe(1);
+      expect([...f.sessions.values()][0]?.status).toBe("revoked");
+    } else expect(f.sessions.size).toBe(0);
+    const replay = await f.callback(started);
+    expect(replay.status).toBe(400);
+    expect(replay.headers.getSetCookie().some((value) => value.startsWith(`${COOKIE}=`))).toBe(
+      false,
+    );
+    expect(attempts).toBe(1);
+    expect(f.inputs).toHaveLength(1);
+    expect(f.calls.queue).toBe(1);
+    expect(f.calls.revoke).toBe(1);
+  });
+}
+
+for (const unavailable of ["owner", "store", "property"] as const) {
+  test(`fresh write DATA stays unavailable for ordinary ${unavailable} descriptor failures`, async () => {
+    const f = await fixture(unavailable);
+    const original = f.store.createSession;
+    f.store.createSession = async (record) => {
+      expect(rp.readSharedAuthFreshSessionWrite(f.runtime, record)).toBeNull();
+      return await Reflect.apply(original, f.store, [record]);
+    };
+    await f.login();
+    expect(f.calls).toEqual({ create: 1, queue: 0, revoke: 0 });
+  });
+}
+
+test("inherited ordinary stores never acquire fresh write DATA", async () => {
+  const f = await fixture(undefined, false, true);
+  const original = f.store.createSession;
+  f.store.createSession = async (record) => {
+    expect(rp.readSharedAuthFreshSessionWrite(f.runtime, record)).toBeNull();
+    return await Reflect.apply(original, f.store, [record]);
+  };
+  await f.login();
+  expect(f.calls.create).toBe(1);
+});
+
+test("retained session reads cannot reopen the closed fresh write record", async () => {
+  const f = await fixture();
+  const original = f.store.createSession;
+  let created: OidcSessionRecord | undefined;
+  f.store.createSession = async (record) => {
+    created = record;
+    expect(rp.readSharedAuthFreshSessionWrite(f.runtime, record)).not.toBeNull();
+    return await Reflect.apply(original, f.store, [record]);
+  };
+  const signed = await f.login();
+  f.control.resolve = (capture) => {
+    expect(rp.readSharedAuthVerifiedPrincipalInput(f.runtime, capture)?.phase).toBe(
+      "existing-session",
+    );
+    expect(rp.readSharedAuthFreshSessionWrite(f.runtime, created)).toBeNull();
+    expect(rp.readSharedAuthFreshSessionWrite(f.runtime, f.control.readAlias)).toBeNull();
+  };
+  const result = await f.runtime.authenticate(
+    f.request(signed.cookie),
+    SESSION_TEST_ORGANIZATION.id,
+  );
+  expect(result?.workspace.id).toBe(SESSION_TEST_ORGANIZATION.id);
+  expect(f.calls.create).toBe(1);
+  expect(rp.readSharedAuthFreshSessionWrite(f.runtime, created)).toBeNull();
+});
+
+test("fresh record extraction keeps the selected create method across the real grant encryption await", async () => {
+  const f = await fixture();
+  const originalCreate = f.store.createSession;
+  let selectedCalls = 0;
+  let replacementCalls = 0;
+  let grantEncryptions = 0;
+  let afterPrincipal = false;
+  let observedReceiver: unknown;
+  let observedRecord: OidcSessionRecord | undefined;
+  let observedOriginal: unknown;
+  let observedFresh: unknown;
+  f.store.createSession = async function (this: SharedAuthSessionStore, record) {
+    selectedCalls++;
+    observedReceiver = this;
+    observedRecord = record;
+    observedOriginal = rp.readSharedAuthVerifiedPrincipalInput(f.runtime, f.inputs[0]!.capture);
+    observedFresh = rp.readSharedAuthFreshSessionWrite(f.runtime, record);
+    return await Reflect.apply(originalCreate, this, [record]);
+  };
+  f.control.resolve = () => {
+    afterPrincipal = true;
+  };
+  const subtle = crypto.subtle;
+  const before = Object.getOwnPropertyDescriptor(subtle, "encrypt");
+  const originalEncrypt = subtle.encrypt;
+  const encrypt: typeof originalEncrypt = async (...args) => {
+    const result = await Reflect.apply(originalEncrypt, subtle, args);
+    if (afterPrincipal) {
+      grantEncryptions++;
+      f.store.createSession = async (record) => {
+        replacementCalls++;
+        return await Reflect.apply(originalCreate, f.store, [record]);
+      };
+    }
+    return result;
+  };
+  Object.defineProperty(subtle, "encrypt", { value: encrypt, configurable: true, writable: true });
+  try {
+    const signed = await f.login();
+    expect(signed.response.status).toBe(303);
+    expect(grantEncryptions).toBe(1);
+    expect(selectedCalls).toBe(1);
+    expect(replacementCalls).toBe(0);
+    expect(observedReceiver).toBe(f.store);
+    expect(observedRecord).toBeDefined();
+    expect(observedOriginal).toBeNull();
+    expect(observedFresh).toBeNull();
+    expect(f.calls).toEqual({ create: 1, queue: 0, revoke: 0 });
+  } finally {
+    if (before) Object.defineProperty(subtle, "encrypt", before);
+    else Reflect.deleteProperty(subtle, "encrypt");
+  }
+});
+
+test("ordinary create accessor is selected once before the actual grant encryption await", async () => {
+  const f = await fixture();
+  const originalCreate = f.store.createSession;
+  const trace: string[] = [];
+  let afterPrincipal = false;
+  let fresh: unknown;
+  let receiver: unknown;
+  Object.defineProperty(f.store, "createSession", {
+    configurable: true,
+    enumerable: true,
+    get() {
+      trace.push("select-create");
+      return async function (this: SharedAuthSessionStore, record: OidcSessionRecord) {
+        trace.push("invoke-create");
+        receiver = this;
+        fresh = rp.readSharedAuthFreshSessionWrite(f.runtime, record);
+        return await Reflect.apply(originalCreate, this, [record]);
+      };
+    },
+  });
+  f.control.resolve = () => {
+    afterPrincipal = true;
+  };
+  const subtle = crypto.subtle;
+  const before = Object.getOwnPropertyDescriptor(subtle, "encrypt");
+  const originalEncrypt = subtle.encrypt;
+  const encrypt: typeof originalEncrypt = async (...args) => {
+    const result = await Reflect.apply(originalEncrypt, subtle, args);
+    if (afterPrincipal) trace.push("grant-encrypt");
+    return result;
+  };
+  Object.defineProperty(subtle, "encrypt", { value: encrypt, configurable: true, writable: true });
+  try {
+    await f.login();
+    expect(trace).toEqual(["select-create", "grant-encrypt", "invoke-create"]);
+    expect(receiver).toBe(f.store);
+    expect(fresh).toBeNull();
+    expect(f.calls).toEqual({ create: 1, queue: 0, revoke: 0 });
+  } finally {
+    if (before) Object.defineProperty(subtle, "encrypt", before);
+    else Reflect.deleteProperty(subtle, "encrypt");
+  }
+});
