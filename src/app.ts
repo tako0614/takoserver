@@ -14,7 +14,7 @@ import {
 } from "./auth.ts";
 import type { BillingConfig } from "./billing-config.ts";
 import { createCatalog, type Offering } from "./catalog.ts";
-import { CONTAINER_CONTRACT } from "./container-contract.ts";
+import { CONTAINER_CONTRACT, V2_CONTAINER_F2_FORM } from "./container-contract.ts";
 import { type Checkout, createControlRoutes } from "./control.ts";
 import { createDataAiRoutes } from "./data-ai.ts";
 import {
@@ -444,7 +444,8 @@ function composeV2HostAcceptances(
       );
     },
     prepareDelete(context: V2HostDeleteAcceptanceContext) {
-      const canonicalContainer = context.form === CONTAINER_CONTRACT.formUrl;
+      const canonicalContainer =
+        context.form === CONTAINER_CONTRACT.formUrl || context.form === V2_CONTAINER_F2_FORM;
       if (canonicalContainer && container === undefined)
         throw new TypeError("canonical Container DELETE requires its Host issuer");
       // Only an explicit DELETE method participates. Endpoint's generic

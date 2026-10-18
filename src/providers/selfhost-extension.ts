@@ -10,6 +10,8 @@ export {
   type DockerHttpRevisionObservation,
   type DockerHttpRevisionOptions,
 } from "./docker-http-revision.ts";
+export type { DockerRegistryCodecLimits } from "./docker-registry-codec.ts";
+export { expandDockerRegistryLayer } from "./docker-registry-codec.ts";
 export {
   createSelfhostContainerRuntime,
   SelfhostContainerError,

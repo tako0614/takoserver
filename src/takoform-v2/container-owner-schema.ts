@@ -1,4 +1,4 @@
-import { CONTAINER_CONTRACT as C } from "../container-contract.ts";
+import { CONTAINER_CONTRACT as C, V2_CONTAINER_F2_FORM } from "../container-contract.ts";
 import type { Sql, SqlStatement } from "../ports.ts";
 import { parseStrictJson } from "../strict-json.ts";
 import {
@@ -8,7 +8,8 @@ import {
   type V2HostDeleteAcceptanceContext,
 } from "./host-acceptance.ts";
 
-export const V2_CONTAINER_F2_FORM = "https://edge.forms.takoform.com/forms/Container/0.2.0/";
+export { V2_CONTAINER_F2_FORM };
+
 const F2_FORM = V2_CONTAINER_F2_FORM;
 export function validateV2ContainerF2SensitiveNames(
   value: unknown,
@@ -626,11 +627,16 @@ export function createV2ContainerHostAcceptance(options: {
       if (typeof workload !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(workload))
         throw new TypeError("invalid Container F2 workload revision");
       const configuredJson = serializeV2ContainerConfiguredPrivateInputs(c.configuredPrivateInputs);
+      // A void UPDATE hook after an empty CREATE has no stable CREATE envelope
+      // in the original Core context. Retention must be proved from accepted
+      // Core and owner history inside the same atomic admission batch.
+      const needsRetainedMaterial =
+        c.action === "update" && names.length > 0 && configuredJson === null;
       if (
         (c.action === "create" &&
           names.length > 0 &&
           (c.privateInputs === undefined || configuredJson === null)) ||
-        (c.action === "update" && names.length > 0 && configuredJson === null)
+        (needsRetainedMaterial && c.privateInputs !== undefined)
       )
         throw new TypeError("Container F2 configured private inputs unavailable");
       const incarnation =
@@ -639,6 +645,61 @@ export function createV2ContainerHostAcceptance(options: {
               byte.toString(16).padStart(2, "0"),
             ).join("")
           : null;
+      const retainedMaterialGuard = needsRetainedMaterial
+        ? ` AND EXISTS (SELECT 1 FROM main.${A} prior
+          JOIN main.${A} previous ON previous.resource_uid = prior.resource_uid AND previous.generation = ?
+          JOIN main.tf_v2_operations accepted ON accepted.id = prior.operation_id
+          JOIN main.tf_v2_resources resource ON resource.uid = prior.resource_uid
+          WHERE prior.resource_uid = ? AND prior.generation < ?
+            AND prior.installation_id = ? AND prior.principal = ? AND prior.space = ?
+            AND prior.name = ? AND prior.form_url = ? AND prior.backend_id = ? AND prior.target_key = ?
+            AND prior.configured_private_inputs_json IS NOT NULL
+            AND prior.action IN ('create', 'update') AND previous.action IN ('create', 'update')
+            AND resource.principal = prior.principal AND resource.space = prior.space
+            AND resource.name = prior.name AND resource.form_url = prior.form_url
+            AND resource.backend_id = prior.backend_id AND resource.target_key = prior.target_key
+            AND resource.generation = ? AND resource.deleted_at IS NULL
+            AND accepted.resource_uid = prior.resource_uid AND accepted.generation = prior.generation
+            AND accepted.action = prior.action AND accepted.principal = prior.principal
+            AND accepted.backend_id = prior.backend_id AND accepted.target_key = prior.target_key
+            AND accepted.accepted_spec_json = prior.accepted_spec_json
+            AND NOT EXISTS (SELECT 1 FROM json_each(?) required
+              WHERE NOT EXISTS (SELECT 1 FROM json_each(previous.accepted_spec_json, '$.requiredSensitiveVars') declared
+                WHERE declared.value = required.value))
+            AND ((prior.action = 'create' AND prior.generation = 1
+              AND EXISTS (SELECT 1 FROM main.tf_v2_configured_private_inputs material
+                WHERE material.resource_uid = prior.resource_uid
+                  AND material.key_id = json_extract(prior.configured_private_inputs_json, '$.keyId')
+                  AND material.nonce = json_extract(prior.configured_private_inputs_json, '$.nonce')
+                  AND material.ciphertext = json_extract(prior.configured_private_inputs_json, '$.ciphertext')))
+              OR (prior.action = 'update'
+                AND EXISTS (SELECT 1 FROM main.tf_v2_operation_configured_private_inputs material
+                  WHERE material.operation_id = prior.operation_id
+                    AND material.resource_uid = prior.resource_uid AND material.generation = prior.generation
+                    AND material.key_id = json_extract(prior.configured_private_inputs_json, '$.keyId')
+                    AND material.nonce = json_extract(prior.configured_private_inputs_json, '$.nonce')
+                    AND material.ciphertext = json_extract(prior.configured_private_inputs_json, '$.ciphertext'))))
+            AND NOT EXISTS (SELECT 1 FROM main.tf_v2_operation_configured_private_inputs later
+              WHERE later.resource_uid = prior.resource_uid AND later.generation > prior.generation
+                AND later.generation < ?))`
+        : "";
+      const retainedMaterialParams = needsRetainedMaterial
+        ? [
+            c.generation - 1,
+            c.resourceUid,
+            c.generation,
+            installationId,
+            c.principal,
+            c.space,
+            c.name,
+            c.form,
+            backendId,
+            targetKey,
+            c.generation - 1,
+            JSON.stringify(names),
+            c.generation,
+          ]
+        : [];
       const guard: SqlStatement = {
         sql: `${V2_CONTAINER_OWNER_READY} AND (${
           c.action === "create"
@@ -646,7 +707,7 @@ export function createV2ContainerHostAcceptance(options: {
             : `EXISTS (SELECT 1 FROM main.${I} WHERE resource_uid = ? AND installation_id = ?
             AND principal = ? AND space = ? AND name = ? AND form_url = ? AND backend_id = ? AND target_key = ?
             AND desired_generation = ? AND retired_at_ms IS NULL)`
-        })`,
+        })${retainedMaterialGuard}`,
         params:
           c.action === "create"
             ? [c.resourceUid]
@@ -660,6 +721,7 @@ export function createV2ContainerHostAcceptance(options: {
                 backendId,
                 targetKey,
                 c.generation - 1,
+                ...retainedMaterialParams,
               ],
       };
       // If Core accepted op.id, this INSERT MUST run and its guard MUST abort a

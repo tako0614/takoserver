@@ -6,10 +6,11 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { createV2ContainerHostAcceptance } from "@takoserver/core/takoform-v2";
+import { v2ContainerOwnerMigrationCandidate } from "../scripts/deploy/v2-container-owner-migration-candidate.ts";
 import { type AppPorts, buildApp } from "../src/app.ts";
 import { createAccounts } from "../src/auth.ts";
 import type { Offering } from "../src/catalog.ts";
-import { CONTAINER_CONTRACT as C } from "../src/container-contract.ts";
+import { CONTAINER_CONTRACT as C, V2_CONTAINER_F2_FORM } from "../src/container-contract.ts";
 import { STABLE_PRODUCTION_TAKOFORM_CATALOG } from "../src/generated/takoform-stable-v1-catalog.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
@@ -112,11 +113,19 @@ function sharedSchema(db: Database, includeBindings: boolean, typed = false): vo
 }
 
 async function fixture(
-  options: { shared?: boolean; bindings?: boolean; typed?: boolean; carrier?: boolean } = {},
+  options: {
+    shared?: boolean;
+    bindings?: boolean;
+    typed?: boolean;
+    carrier?: boolean;
+    formUrl?: string;
+    containerOwnerSchema?: boolean;
+  } = {},
 ) {
   const db = new Database(":memory:");
   migrateSqlite(db);
   const raw = createSqliteSql(db);
+  if (options.containerOwnerSchema) await raw.batch(v2ContainerOwnerMigrationCandidate());
   if (options.shared !== false)
     sharedSchema(db, options.bindings !== false, options.typed === true);
   const statements: SqlStatement[] = [];
@@ -241,7 +250,12 @@ async function fixture(
       },
     },
   };
-  const selection: Selection = { formUrl: FORM, backendId: BACKEND, targetKey: TARGET, ledger };
+  const selection: Selection = {
+    formUrl: options.formUrl ?? FORM,
+    backendId: BACKEND,
+    targetKey: TARGET,
+    ledger,
+  };
   const stableModule = STABLE_PRODUCTION_TAKOFORM_CATALOG.forms.find(
     (item) => item.identity.formRef.kind === "ModuleWorker",
   )?.identity.formRef;
@@ -323,7 +337,7 @@ async function fixture(
         authenticationDocumentation: "https://docs.example.test/v2/authentication",
       },
       ...(overrides.v2FormSelectionFactory === undefined
-        ? { v2FormFactory: () => ({ [FORM]: form }) }
+        ? { v2FormFactory: () => ({ [options.formUrl ?? FORM]: form }) }
         : {}),
       ...(selected === undefined ? {} : { v2WorkerEndpointOrigin: selected }),
       ...overrides,
@@ -348,7 +362,7 @@ async function fixture(
     request(app, "/resources", {
       method: "POST",
       headers: { "idempotency-key": key },
-      body: JSON.stringify({ form: FORM, space, name, spec: SPEC }),
+      body: JSON.stringify({ form: options.formUrl ?? FORM, space, name, spec: SPEC }),
     });
   return {
     db,
@@ -474,8 +488,7 @@ function afterPromiseSettlementTurn(): Promise<void> {
   return new Promise<void>((resolve) => setImmediate(resolve));
 }
 
-async function seedOrdinaryContainerResource(f: Fixture, name: string) {
-  const app = f.makeApp();
+async function seedOrdinaryContainerResource(f: Fixture, name: string, app = f.makeApp()) {
   const response = await f.create(app, name, `seed-${name}-0001`);
   expect(response.status).toBe(202);
   const accepted = (await response.json()) as { id: string; resourceUid: string };
@@ -518,6 +531,57 @@ test("retained canonical Container Form cannot DELETE without its code issuer", 
       beforeOperations,
     );
     expect(f.db.query("SELECT count(*) AS n FROM tf_v2_resources").get()).toEqual(beforeResources);
+    expect(f.lastBatchError()).toBeUndefined();
+  } finally {
+    f.close();
+  }
+});
+
+test("retained 0.2 canonical Container Form cannot DELETE without its code issuer", async () => {
+  const f = await fixture({ formUrl: V2_CONTAINER_F2_FORM });
+  try {
+    const resource = await seedOrdinaryContainerResource(f, "container-retained-unsigned");
+    const retained = f.makeApp(undefined, {
+      v2FormSelectionFactory: () => ({
+        forms: {},
+        retainedForms: { [V2_CONTAINER_F2_FORM]: f.form },
+      }),
+    });
+    const beforeBatches = f.batches.length;
+    const beforeOperations = f.db.query("SELECT count(*) AS n FROM tf_v2_operations").get();
+    const beforeResources = f.db.query("SELECT count(*) AS n FROM tf_v2_resources").get();
+    const response = await requestDelete(
+      f,
+      retained,
+      resource.resourceUid,
+      "container-retained-no-issuer-0001",
+    );
+    expect(response.status).not.toBe(202);
+    expect(f.batches).toHaveLength(beforeBatches);
+    expect(f.db.query("SELECT count(*) AS n FROM tf_v2_operations").get()).toEqual(
+      beforeOperations,
+    );
+    expect(f.db.query("SELECT count(*) AS n FROM tf_v2_resources").get()).toEqual(beforeResources);
+    expect(f.lastBatchError()).toBeUndefined();
+  } finally {
+    f.close();
+  }
+});
+
+test("retained 0.2 Container DELETE accepts its genuine branded issuer claim", async () => {
+  const f = await fixture({ formUrl: V2_CONTAINER_F2_FORM, containerOwnerSchema: true });
+  try {
+    const app = f.makeApp(undefined, { v2ContainerHostAcceptance: containerIssuer(f.sql) });
+    const resource = await seedOrdinaryContainerResource(f, "container-f2-delete-genuine", app);
+    const beforeBatches = f.batches.length;
+    const response = await requestDelete(
+      f,
+      app,
+      resource.resourceUid,
+      "container-f2-delete-genuine-0001",
+    );
+    expect(response.status).toBe(202);
+    expect(f.batches.length).toBeGreaterThan(beforeBatches);
     expect(f.lastBatchError()).toBeUndefined();
   } finally {
     f.close();
