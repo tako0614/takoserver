@@ -76,7 +76,7 @@ const byName = (a: { name: string }, b: { name: string }) =>
   a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
 
 /** Exact 0100 prefix, then Root's own canonical 0101-0103 recipe bytes. */
-function at0103(path = ":memory:"): Database {
+function at0103(path = ":memory:", options: { readonly money?: boolean } = {}): Database {
   const db = new Database(path);
   const prefix = MIGRATIONS.filter(({ name }) => Number(name.slice(0, 4)) <= 100);
   expect(prefix).toHaveLength(100);
@@ -85,6 +85,8 @@ function at0103(path = ":memory:"): Database {
   expect(recipes.files.map((file) => file.name)).toEqual([...AUTH103_NATIVE_MIGRATIONS]);
   for (const file of recipes.files) db.exec(file.sql);
   // Root/Money's existing cutover guard rows; not part of the Financial body.
+  // `money: false` keeps the pre-cutover / self-host shape without them.
+  if (options.money === false) return db;
   db.exec(MONEY_CUTOVER_FREEZE_DDL);
   db.exec(MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL);
   db.exec(MONEY_CUTOVER_PERMIT_DDL);
@@ -131,6 +133,42 @@ describe("Financial 0104 source recipe", () => {
         FINANCIAL_0104_OBJECTS.map((o) => `${o.type}:${o.name}`).sort(),
       );
       expect(db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("on a pre-cutover/self-host primary 0104 applies cleanly and every 0104 INSERT fails closed", () => {
+    const db = at0103(":memory:", { money: false });
+    try {
+      // Only 0094's historical money_cutover proof tables exist here.
+      for (const missing of [
+        "money_cutover_freeze",
+        "money_cutover_writer_permit",
+        "money_cutover_authorized_epoch",
+      ])
+        expect(db.query("SELECT 1 FROM sqlite_schema WHERE name=?").get(missing)).toBeNull();
+      // Trigger creation does not need the referenced money_cutover tables.
+      db.exec(FINANCIAL_0104_DDL);
+      expect(schemaRows(db, FINANCIAL_0104_TABLES)).toHaveLength(FINANCIAL_0104_OBJECTS.length);
+      // An epoch-bearing table and a receiver table refuse before writing a row.
+      for (const table of ["shared_customer_challenges", "financial_source_events"]) {
+        expect(() => db.exec(`INSERT INTO ${table} DEFAULT VALUES`)).toThrow(
+          /no such table: (?:main\.)?money_cutover_/u,
+        );
+        expect(count(db, table)).toBe(0);
+      }
+      for (const table of FINANCIAL_0104_TABLES) {
+        expect(() => db.exec(`INSERT INTO ${table} DEFAULT VALUES`)).toThrow(
+          /no such table: (?:main\.)?money_cutover_/u,
+        );
+        expect(count(db, table)).toBe(0);
+      }
+      // Unrelated non-0104 writes on the same primary still succeed.
+      db.query(
+        "INSERT INTO runtime_grant_keys(key_id,public_jwk,created_at_epoch_seconds) VALUES(?,?,?)",
+      ).run("key:self-host", "{}", 1);
+      expect(count(db, "runtime_grant_keys")).toBe(1);
     } finally {
       db.close();
     }
