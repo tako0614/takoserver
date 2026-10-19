@@ -274,3 +274,25 @@ origin. The witness shape remains unchanged, and this bounded original DATA
 is not a Financial consumer envelope, current permission, revocation proof,
 first-dispatch claim or NEW/CAS admission; those effects need their own guarded
 same-primary checks.
+
+`provePreparedFinancialR1Identity` is a separate, unmounted effect over the
+exact prepared object that the POST preflight returned. It requires the same
+handler, connection, Request, Workspace and challenge, rechecks the prepared
+origin, held native observation, pending29 and retained R1 before and after,
+and calls Root's fixed retained RP proof original once with the held opaque
+credential capture. `readPreparedFinancialR1IdentityEvidence` then uses only
+that prepared object's own existing proof attempt; it never proves on its own
+and accepts no proofRef. Root's fixed load and current originals call the RP
+session receiver's `loadFinalSessionFinancialIdentityProof` and
+`verifyCurrentFinalSessionFinancialIdentityProof`, which read Accounts
+`loadFinancialIdentityProof` / `verifyCurrentFinancialIdentityProof` for the
+proof that receiver itself obtained, in that order, at most once each. Their
+results are detached plain own-property DATA. Financial's
+`readFinancialActionConsentR1IdentityEvidenceData` joins
+`{v:1, proofRef, challengeRef}` and the found/current DATA to the same retained
+R1 reader, original and Root RP original. Every step is installed before its
+first await and an unknown, rejected or malformed result is never resent. The
+returned `financial-proof` identity evidence is DATA only: it is not
+affirmative consent, acceptedAt, a consent original, command claim or consume,
+current permission or Financial NEW/CAS. Those remain the next guarded
+same-primary effect.
