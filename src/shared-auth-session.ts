@@ -76,6 +76,53 @@ export function readSharedAuthVerifiedPrincipalInput(
   return held.data;
 }
 
+/** Factory-origin DATA from the exact fresh createSession call, never write acceptance. */
+export interface SharedAuthFreshSessionWriteData {
+  readonly original: SharedAuthVerifiedPrincipalInput;
+  /** Original encrypted-grant row bytes; no plaintext grant or browser cookie. */
+  readonly session: Readonly<OidcSessionRecord>;
+}
+
+const freshSessionWrites = new WeakMap<
+  object,
+  {
+    readonly receiver: object;
+    readonly data: SharedAuthFreshSessionWriteData;
+    readonly original: () => boolean;
+  }
+>();
+
+/** Only the same receiver and actual record within its original create call can read. */
+export function readSharedAuthFreshSessionWrite(
+  originalRpReceiver: unknown,
+  record: unknown,
+): SharedAuthFreshSessionWriteData | null {
+  if (!record || typeof record !== "object") return null;
+  const held = freshSessionWrites.get(record);
+  if (!held || held.receiver !== originalRpReceiver || !held.original()) return null;
+  return held.data;
+}
+
+function captureFreshSessionWrite(
+  receiver: object,
+  original: SharedAuthVerifiedPrincipalInput,
+  record: OidcSessionRecord,
+): () => void {
+  const origin = readSharedAuthVerifiedPrincipalInput(receiver, original);
+  if (!origin || origin.phase !== "fresh-callback") return () => {};
+  const recordSeal = principalInputDescriptorSeal(record);
+  const data = Object.freeze({ original, session: Object.freeze({ ...record }) });
+  freshSessionWrites.set(record, {
+    receiver,
+    data,
+    original: () =>
+      recordSeal() && readSharedAuthVerifiedPrincipalInput(receiver, original) === origin,
+  });
+  return () => {
+    freshSessionWrites.delete(record);
+  };
+}
+
 /** Descriptor comparison does not invoke substituted accessors, including on the owner. */
 function principalInputDescriptorSeal(source: object, allowReceiverFreeze = false): () => boolean {
   try {
@@ -513,7 +560,10 @@ export function createSharedAuthSession(options: {
             readonly resolvedVersion: number;
           };
         },
-  ): Promise<string> {
+  ): Promise<{
+    readonly principalId: string;
+    readonly original: SharedAuthVerifiedPrincipalInput;
+  }> {
     const identity = Object.freeze({
       issuer: value.issuer,
       clientId: value.clientId,
@@ -565,7 +615,7 @@ export function createSharedAuthSession(options: {
       !text(resolved.principalId, 512)
     )
       throw new SharedAuthSessionError("session_invalid");
-    return resolved.principalId;
+    return Object.freeze({ principalId: resolved.principalId, original: capture });
   }
   function requestUrl(request: Request): URL {
     const url = new URL(request.url);
@@ -701,13 +751,15 @@ export function createSharedAuthSession(options: {
         throw new SharedAuthSessionError("session_invalid");
       const workspace = await currentWorkspace(value, requestedWorkspaceId ?? row.workspaceId);
       if (
-        (await principal(value, workspace, store, {
-          phase: "existing-session",
-          sessionObservation: {
-            ...originalSessionObservation,
-            resolvedVersion: row.version,
-          },
-        })) !== row.principalId
+        (
+          await principal(value, workspace, store, {
+            phase: "existing-session",
+            sessionObservation: {
+              ...originalSessionObservation,
+              resolvedVersion: row.version,
+            },
+          })
+        ).principalId !== row.principalId
       )
         throw new SharedAuthSessionError("session_invalid");
       let selected = row;
@@ -1031,28 +1083,34 @@ export function createSharedAuthSession(options: {
             const selected = await currentWorkspace(value, workspace.id);
             if (selected.type !== "personal" || !selected.owner)
               throw new SharedAuthSessionError("workspace_forbidden");
-            const principalId = await principal(value, selected, store, {
+            const resolved = await principal(value, selected, store, {
               phase: "fresh-callback",
             });
+            const principalId = resolved.principalId;
             const oldSecret = cookie(request, sessionCookie);
             if (oldSecret) await store.revokeSession(await hash(oldSecret), now());
             const stamp = now();
-            if (
-              !(await store.createSession({
-                digest: sessionDigest,
-                accountId: value.subject,
-                principalId,
-                workspaceId: selected.id,
-                payload: await seal("grant", sessionDigest, value),
-                createdAt: stamp,
-                lastUsedAt: stamp,
-                absoluteExpiresAt: stamp + absoluteTtl,
-                grantCheckedAt: stamp,
-                version: 0,
-                status: "active",
-              }))
-            )
-              throw new SharedAuthSessionError("session_unavailable");
+            const createSession = store.createSession;
+            const session: OidcSessionRecord = {
+              digest: sessionDigest,
+              accountId: value.subject,
+              principalId,
+              workspaceId: selected.id,
+              payload: await seal("grant", sessionDigest, value),
+              createdAt: stamp,
+              lastUsedAt: stamp,
+              absoluteExpiresAt: stamp + absoluteTtl,
+              grantCheckedAt: stamp,
+              version: 0,
+              status: "active",
+            };
+            const closeWrite = captureFreshSessionWrite(receiver, resolved.original, session);
+            try {
+              if (!(await Reflect.apply(createSession, store, [session])))
+                throw new SharedAuthSessionError("session_unavailable");
+            } finally {
+              closeWrite();
+            }
             headers.append("set-cookie", setCookie(sessionCookie, secret, absoluteTtl / 1000));
             headers.set("location", `${consoleOrigin}/`);
             return new Response(null, { status: 303, headers });

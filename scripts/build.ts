@@ -8,6 +8,7 @@ try {
     entrypoints: ["src/index.ts"],
     outdir: output,
     target: "bun",
+    external: ["cloudflare:workers"],
     sourcemap: "external",
   });
   if (!result.success) {
