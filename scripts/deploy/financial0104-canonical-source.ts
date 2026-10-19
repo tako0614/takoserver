@@ -6,6 +6,8 @@ import { readAuth103CanonicalMigrationSource } from "./auth103-canonical-migrati
 import { preflightError } from "./errors.ts";
 import { financial0104RootRecipe } from "./financial0104-recipe.ts";
 import { type MigrationArtifact, readMigrationArtifact } from "./migrations.ts";
+import type { PostAuth103Count } from "./post-auth103-recipes.ts";
+import { root0105Recipe } from "./root0105-recipe.ts";
 
 const immutableArtifact = (value: MigrationArtifact): MigrationArtifact =>
   Object.freeze({
@@ -16,10 +18,11 @@ const immutableArtifact = (value: MigrationArtifact): MigrationArtifact =>
   });
 
 /**
- * Materializes the separate Root-registered 104 candidate: the UNCHANGED
- * Auth103 artifact (audited100 + generated 0101/0102/0103) followed by the
- * exact Financial0104 recipe. The Auth103 artifact, digest and receipts are
- * returned as-is; the 104 artifact is a distinct digest and never replaces it.
+ * Materializes the Root post-Auth103 chain candidates: the UNCHANGED Auth103
+ * artifact (audited100 + generated 0101/0102/0103) followed by the exact
+ * Financial0104 recipe (the 104 artifact) and then Root's exact 0105 (the 105
+ * artifact). The Auth103 artifact, digest and receipts are returned as-is;
+ * each successor artifact is a distinct digest and never replaces it.
  */
 export function readFinancial0104CanonicalMigrationSource(
   sourceRoot: string,
@@ -29,49 +32,72 @@ export function readFinancial0104CanonicalMigrationSource(
   let scratch: string | undefined;
   try {
     const recipe = financial0104RootRecipe();
+    const recipe105 = root0105Recipe();
     if (
       auth103.artifact.files.length !== 103 ||
       JSON.stringify(auth103.artifact.names.slice(100)) !==
         JSON.stringify(AUTH103_NATIVE_MIGRATIONS)
     )
       throw preflightError("Financial0104 predecessor is not the exact Auth103 artifact");
-    scratch = mkdtempSync(join(scratchBase, "financial0104-registered-"));
-    const generatedDirectory = join(scratch, "migrations");
-    mkdirSync(generatedDirectory);
-    for (const file of auth103.artifact.files)
-      writeFileSync(join(generatedDirectory, file.name), readFileSync(file.path), {
-        mode: 0o600,
-        flag: "wx",
-      });
-    writeFileSync(join(generatedDirectory, recipe.name), recipe.sql, { mode: 0o600, flag: "wx" });
-    const artifact = immutableArtifact(readMigrationArtifact(generatedDirectory));
-    const exact = () =>
-      artifact.files.length === 104 &&
-      JSON.stringify(artifact.names) === JSON.stringify([...auth103.artifact.names, recipe.name]) &&
-      artifact.files
+    const owned = mkdtempSync(join(scratchBase, "financial0104-registered-"));
+    scratch = owned;
+    const generate = (label: string, successors: readonly { name: string; sql: string }[]) => {
+      const directory = join(owned, label, "migrations");
+      mkdirSync(directory, { recursive: true });
+      for (const file of auth103.artifact.files)
+        writeFileSync(join(directory, file.name), readFileSync(file.path), {
+          mode: 0o600,
+          flag: "wx",
+        });
+      for (const successor of successors)
+        writeFileSync(join(directory, successor.name), successor.sql, { mode: 0o600, flag: "wx" });
+      return { directory, artifact: immutableArtifact(readMigrationArtifact(directory)) };
+    };
+    const generated104 = generate("104", [recipe]);
+    const generated105 = generate("105", [recipe, recipe105]);
+    const artifact = generated104.artifact;
+    const artifact105 = generated105.artifact;
+    const unchangedPrefix = (value: MigrationArtifact) =>
+      value.files
         .slice(0, 103)
         .every(
           (file, index) =>
             file.digest === auth103.artifact.files[index]?.digest &&
             file.bytes === auth103.artifact.files[index]?.bytes,
-        ) &&
-      artifact.files[103]?.digest === recipe.digest;
-    if (!exact()) throw preflightError("Financial0104 generated source differs from its recipe");
-    const directory = generatedDirectory;
+        );
+    const exact = () =>
+      artifact.files.length === 104 &&
+      JSON.stringify(artifact.names) === JSON.stringify([...auth103.artifact.names, recipe.name]) &&
+      unchangedPrefix(artifact) &&
+      artifact.files[103]?.digest === recipe.digest &&
+      artifact105.files.length === 105 &&
+      JSON.stringify(artifact105.names) === JSON.stringify([...artifact.names, recipe105.name]) &&
+      unchangedPrefix(artifact105) &&
+      artifact105.files[103]?.digest === recipe.digest &&
+      artifact105.files[104]?.digest === recipe105.digest;
+    if (!exact()) throw preflightError("post-Auth103 generated source differs from its recipes");
     const assertCurrent = () => {
       auth103.assertCurrent();
       financial0104RootRecipe();
-      if (readMigrationArtifact(directory).digest !== artifact.digest)
-        throw preflightError("Financial0104 generated source changed during read");
+      root0105Recipe();
+      if (
+        readMigrationArtifact(generated104.directory).digest !== artifact.digest ||
+        readMigrationArtifact(generated105.directory).digest !== artifact105.digest
+      )
+        throw preflightError("post-Auth103 generated source changed during read");
     };
     assertCurrent();
-    const owned = scratch;
     return {
       prefix: auth103.prefix,
       auth103: auth103.artifact,
       auth103Recipes: auth103.recipes,
       artifact,
       recipe,
+      artifact105,
+      recipe105,
+      /** The generated chain artifact whose ledger has exactly `count` names. */
+      artifactFor: (count: PostAuth103Count): MigrationArtifact =>
+        count === 104 ? artifact : artifact105,
       physicalNames: auth103.physicalNames,
       physicalDigest: auth103.physicalDigest,
       assertCurrent,

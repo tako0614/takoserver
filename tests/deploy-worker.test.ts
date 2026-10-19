@@ -7,7 +7,10 @@ import { deriveExpectedApplicationShape } from "../scripts/deploy/application-sc
 import { readAuth103CanonicalMigrationSource } from "../scripts/deploy/auth103-canonical-migration-source.ts";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import { readFinancial0104CanonicalMigrationSource } from "../scripts/deploy/financial0104-canonical-source.ts";
-import { compileFinancial0104ImportShapes } from "../scripts/deploy/financial0104-schema-shape.ts";
+import {
+  compileFinancial0104ImportShapes,
+  compileRoot0105ImportShapes,
+} from "../scripts/deploy/financial0104-schema-shape.ts";
 import { readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import { expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
@@ -1315,6 +1318,49 @@ describe("split Takoserver Worker surfaces", () => {
       source.dispose();
     }
   }, 30_000);
+
+  test("the Root105 successor of that exact104 is recognized only exactly", () => {
+    const source = readFinancial0104CanonicalMigrationSource(resolve(import.meta.dir, ".."));
+    try {
+      const shape = compileRoot0105ImportShapes(
+        source.auth103,
+        source.artifact,
+        source.artifact105,
+        "ordinary",
+      ).postShape;
+      const exact105 = {
+        local: canonicalMigrations,
+        applied: source.artifact105.names,
+        shape,
+        shapeDigest: `sha256:${createHash("sha256").update(shape).digest("hex")}`,
+      };
+      for (const selected of [target, v2Target]) {
+        expect(workerSchemaAllowsPending(selected, exact105)).toBe(true);
+        expect(workerSelectedPendingMigrations(selected, exact105)).toEqual([]);
+      }
+      const foreign = {
+        ...exact105,
+        applied: [...source.artifact105.names.slice(0, 104), "0105_foreign.sql"],
+      };
+      expect(workerSchemaAllowsPending(target, foreign)).toBe(false);
+      expect(() => workerSelectedPendingMigrations(target, foreign)).toThrow();
+      // The exact104 shape under a 105 ledger is not the post105 shape.
+      const at104 = compileFinancial0104ImportShapes(
+        source.auth103,
+        source.artifact,
+        "ordinary",
+      ).postShape;
+      expect(
+        workerSchemaAllowsPending(target, {
+          ...exact105,
+          shape: at104,
+          shapeDigest: `sha256:${createHash("sha256").update(at104).digest("hex")}`,
+        }),
+      ).toBe(false);
+    } finally {
+      source.dispose();
+    }
+  }, 60_000);
 
   test("v2 0088 maintenance probe requires the distinct current-mode response", async () => {
     const response = Response.json(

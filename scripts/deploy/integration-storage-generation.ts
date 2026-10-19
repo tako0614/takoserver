@@ -843,10 +843,16 @@ async function verifyGeneratedStorageTarget(
     ) {
       const sourceRoot = resolve(migrationDirectory, "..");
       const complete = readMigrationArtifact(migrationDirectory);
-      const canonical =
-        migrationState.applied.length === 104
+      const applied = migrationState.applied.length;
+      const chain =
+        applied === 104 || applied === 105
           ? readFinancial0104CanonicalMigrationSource(sourceRoot)
-          : readAuth103CanonicalMigrationSource(sourceRoot);
+          : undefined;
+      const canonical = chain ?? readAuth103CanonicalMigrationSource(sourceRoot);
+      const canonicalDigest =
+        chain !== undefined && (applied === 104 || applied === 105)
+          ? chain.artifactFor(applied).digest
+          : canonical.artifact.digest;
       try {
         if (
           financial0104SourceSchemaReady(
@@ -869,7 +875,7 @@ async function verifyGeneratedStorageTarget(
             ...(generated.namespace === undefined ? {} : { namespace: generated.namespace }),
             d1: { databaseId: generated.databaseId, databaseName: generated.databaseName },
             r2: { bucketName: generated.bucketName },
-            migrationDigest: canonical.artifact.digest,
+            migrationDigest: canonicalDigest,
             appliedMigrations: [...migrationState.applied],
             schemaShapeDigest: migrationState.shapeDigest,
           };

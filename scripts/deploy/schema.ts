@@ -33,7 +33,6 @@ import {
   preflightError,
   verificationError,
 } from "./errors.ts";
-import { isFinancial0104RecipeFile } from "./financial0104-recipe.ts";
 import type {
   CanonicalV20092IntegrationStorageIdentityProof,
   IntegrationStorageTargetReadProvider,
@@ -44,6 +43,7 @@ import {
   readD1SchemaState,
   readMigrationArtifact,
 } from "./migrations.ts";
+import { isPostAuth103RecipeSuffix } from "./post-auth103-recipes.ts";
 import {
   type CommandResult,
   REPOSITORY,
@@ -3260,8 +3260,9 @@ export function readAuditedMigrationSourcePrefix100(
 
 /** Existing consumers retain their exact audited100 projection. The ONLY
  * supported source extension is machine-equal to the fixed Root101/102/103
- * recipes, optionally followed by the exact Root-registered Financial0104
- * recipe; neither ordinary apply nor a fresh payload inherits that suffix. */
+ * recipes, optionally followed by an exact prefix of the Root post-Auth103
+ * chain (Financial0104, then Root0105); neither ordinary apply nor a fresh
+ * payload inherits that suffix. */
 export function readCurrentAuditedMigrationSourceArtifact(
   directory: string = resolve(REPOSITORY, "migrations"),
 ): ReturnType<typeof readMigrationArtifact> {
@@ -3273,8 +3274,10 @@ export function readCurrentAuditedMigrationSourceArtifact(
   const original = readAuditedMigrationSourcePrefix100(directory);
   const owner = createAuth103CanonicalSourceArtifacts(resolve(directory, ".."));
   if (
-    (artifact.files.length !== 103 && artifact.files.length !== 104) ||
-    (artifact.files.length === 104 && !isFinancial0104RecipeFile(artifact.files[103])) ||
+    (artifact.files.length !== 103 &&
+      artifact.files.length !== 104 &&
+      artifact.files.length !== 105) ||
+    !isPostAuth103RecipeSuffix(artifact.files.slice(103)) ||
     artifact.files.slice(100, 103).some((file, index) => {
       const expected = owner.files[index];
       return (
@@ -3286,7 +3289,7 @@ export function readCurrentAuditedMigrationSourceArtifact(
     })
   )
     throw preflightError(
-      "audited source extension must be exactly the owning101/102/103 recipes or their Root-registered Financial0104 successor",
+      "audited source extension must be exactly the owning101/102/103 recipes or their Root-registered post-Auth103 successors",
     );
   return original;
 }

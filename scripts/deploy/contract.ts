@@ -1586,6 +1586,9 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/financial0104-canonical-source.ts",
         "scripts/deploy/financial0104-recipe.ts",
         "scripts/deploy/financial0104-schema-shape.ts",
+        "scripts/deploy/root0105-recipe.ts",
+        "scripts/deploy/post-auth103-recipes.ts",
+        "src/root-0105-org-capture-triggers.ts",
         "scripts/deploy/schema-money-unit-cutover.ts",
         "scripts/deploy/schema-money-unit-owner.ts",
         "scripts/deploy/schema-0058-proof.ts",
@@ -1623,6 +1626,11 @@ export const DEPLOY_CONTRACT = {
           "one guarded import requires the exact103 ledger, current Auth103 registration/catalog and " +
           "exact post103 shape (Money-preserved only after the post103 thaw) and must end at the exact104 " +
           "ledger, post104 shape and Financial catalog; dispatch is recorded once and never replayed. " +
+          "A Money-preserved 0104 import also installs the Money guard's Stripe customer fence " +
+          "generation in the same import; no numbered migration installs a Money fence. " +
+          "Separate integration-only 0105 selection then appends only Root's exact pinned 0105 Org " +
+          "capture recipe after that exact104 state and must end at the exact105 ledger, post105 shape, " +
+          "Financial catalog and Root 0105 objects, with its own once-only dispatch record. " +
           "Optional fresh-origin input: TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH " +
           "selects the existing protected custody locator reader only for integration 0093/0094. " +
           "The same money declaration then requires originalOrigin with the original exact six-field " +
