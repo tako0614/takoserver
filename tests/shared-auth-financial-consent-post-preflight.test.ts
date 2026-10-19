@@ -300,6 +300,9 @@ if (child) {
   const { createSharedAuthFinancialConsentRequestHandler } = await import(
     "../src/shared-auth-financial-consent.ts"
   );
+  const { handleSharedAuthFinancialConsentRequest } = await import(
+    "../src/shared-auth-financial-consent-route.ts"
+  );
   const action = (() => {
     const found = ACTIONS.find((item) => item.kind === "topup");
     if (!found) throw Error("missing topup");
@@ -1232,6 +1235,104 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
     }
   });
 
+  test("mounted route renders the R1 page and its own POST records one consent", async () => {
+    const s = await setup();
+    try {
+      const page = `https://rp.example.invalid/auth/financial/consent?workspace=${encodeURIComponent(SCOPE.workspaceId)}&challenge=${encodeURIComponent(s.challengeRef)}`;
+      const shown = await handleSharedAuthFinancialConsentRequest(
+        connection,
+        new Request(page, { method: "GET" }),
+      );
+      expect(shown.status).toBe(200);
+      expect(shown.headers.get("content-type")).toBe("text/html; charset=utf-8");
+      expect(shown.headers.get("cache-control")).toBe("no-store");
+      expect(shown.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+      const html = await shown.text();
+      const transactionRef =
+        /name="confirmation_transaction" value="(rpfc_[A-Za-z0-9_-]{43})"/u.exec(html)?.[1];
+      if (!transactionRef) throw Error("missing transaction field");
+      expect(html).not.toContain(" action=");
+      const approve = () =>
+        handleSharedAuthFinancialConsentRequest(
+          connection,
+          new Request(page, {
+            method: "POST",
+            headers: {
+              "content-type": "application/x-www-form-urlencoded",
+              origin: "https://rp.example.invalid",
+            },
+            body: new URLSearchParams({ approve: "yes", confirmation_transaction: transactionRef }),
+          }),
+        );
+      const approved = await approve();
+      expect(approved.status).toBe(200);
+      const consentProofRef =
+        /name="takoserver-consent-proof-ref" content="(rpcs_[A-Za-z0-9_-]{43})"/u.exec(
+          await approved.text(),
+        )?.[1];
+      if (!consentProofRef) throw Error("missing consent proof ref");
+      expect(consentWrites()).toEqual({ pending: 1, command: 1, original: 1 });
+      expect([proofCalls, loadCalls, currentCalls]).toEqual([1, 1, 1]);
+      // The same page cannot approve twice, and the stored consent verifies.
+      const again = await approve();
+      expect(again.status).toBe(503);
+      expect(await again.text()).toContain("Nothing was approved.");
+      expect(consentWrites()).toEqual({ pending: 1, command: 1, original: 1 });
+      const witness = await s.handler.verifyCurrentActionConsent(get(), {
+        workspaceId: SCOPE.workspaceId,
+        consentProofRef,
+      });
+      expect(witness.consentProofRef).toBe(consentProofRef);
+    } finally {
+      s.close();
+    }
+  });
+
+  test("mounted route refuses other query shapes and methods without rows", async () => {
+    const s = await setup();
+    try {
+      const base = "https://rp.example.invalid/auth/financial/consent";
+      const challenge = encodeURIComponent(s.challengeRef);
+      for (const query of [
+        "",
+        `?challenge=${challenge}`,
+        `?workspace=${SCOPE.workspaceId}&challenge=${challenge}&extra=1`,
+        `?workspace=${SCOPE.workspaceId}&workspace=${SCOPE.workspaceId}&challenge=${challenge}`,
+      ]) {
+        const response = await handleSharedAuthFinancialConsentRequest(
+          connection,
+          new Request(`${base}${query}`),
+        );
+        expect(response.status).toBe(400);
+      }
+      const put = await handleSharedAuthFinancialConsentRequest(
+        connection,
+        new Request(`${base}?workspace=${SCOPE.workspaceId}&challenge=${challenge}`, {
+          method: "PUT",
+        }),
+      );
+      expect(put.status).toBe(405);
+      expect(put.headers.get("allow")).toBe("GET, POST");
+      // A POST without a prepared GET has nothing to approve.
+      const blind = await handleSharedAuthFinancialConsentRequest(
+        connection,
+        new Request(`${base}?workspace=${SCOPE.workspaceId}&challenge=${challenge}`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            origin: "https://rp.example.invalid",
+          },
+          body: new URLSearchParams({ approve: "yes", confirmation_transaction: "rpfc_x" }),
+        }),
+      );
+      expect(blind.status).not.toBe(200);
+      expect(consentWrites()).toEqual({ pending: 0, command: 0, original: 0 });
+      expect(proofEntries).toBe(0);
+    } finally {
+      s.close();
+    }
+  });
+
   test("identity evidence refuses a failed prove, crossed arguments and pre-load drift", async () => {
     const s = await setup();
     try {
@@ -1512,7 +1613,7 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
     expect(stderr).toContain(
       "(pass) actual R1 and RP POST preflight reads pending only with one held Clock",
     );
-    expect(stderr).toContain("22 pass");
+    expect(stderr).toContain("24 pass");
     expect(stderr).toContain("0 fail");
   }, 100_000);
 }
