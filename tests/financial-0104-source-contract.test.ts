@@ -734,6 +734,24 @@ describe("Financial 0104 R1 builders refuse a schema missing their fences", () =
     }
   });
 
+  test("attempt builders are refused under freeze once an R1 fence is missing", async () => {
+    const f = await at0104();
+    try {
+      f.db.exec("DROP TRIGGER financial_retained_r1_originals_money_fence");
+      f.db.exec(FREEZE);
+      const command = await f.command(action(3), "attempt-r1-unfenced");
+      await expect(
+        buildFinancialR1AttemptCustodyStatement(f.options, command, AT),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      await expect(
+        buildFinancialR1BoundedAttemptCustodyStatement(f.options, command, AT),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(count(f.db, "financial_r1_preparation_attempts")).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+
   test("co-preparation is refused under freeze once any R1 or 0104 fence is missing", async () => {
     for (const drop of ["r1", "c0"] as const) {
       const f = await at0104();

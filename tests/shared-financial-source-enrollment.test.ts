@@ -2068,6 +2068,100 @@ describe("fixed C0 builder contribution", () => {
     }
   });
 
+  test("exported C0 builders write nothing with one fence missing or any fence altered", async () => {
+    const challenge = "financial_preproof_challenges_money_fence",
+      receipt = "financial_preproof_challenge_receipts_money_fence";
+    const scenarios: readonly {
+      readonly name: string;
+      readonly freeze: boolean;
+      readonly mutate: (db: Database) => void;
+    }[] = [
+      {
+        name: "challenge fence missing",
+        freeze: true,
+        mutate: (db) => db.exec(`DROP TRIGGER ${challenge}`),
+      },
+      {
+        name: "receipt fence missing",
+        freeze: true,
+        mutate: (db) => db.exec(`DROP TRIGGER ${receipt}`),
+      },
+      {
+        // Both fences present by name but never firing: only the exact
+        // in-statement check can still refuse the frozen write.
+        name: "both fences altered to WHEN 0",
+        freeze: true,
+        mutate: (db) => {
+          for (const name of [challenge, receipt]) {
+            const sql = (
+              db.query("SELECT sql FROM sqlite_schema WHERE name=?").get(name) as { sql: string }
+            ).sql;
+            const altered = sql.replace(/\nWHEN [\s\S]*\) BEGIN\n/u, "\nWHEN 0 BEGIN\n");
+            expect(altered).toContain("\nWHEN 0 BEGIN\n");
+            db.exec(`DROP TRIGGER ${name}`);
+            db.exec(altered);
+          }
+        },
+      },
+      {
+        // Functionally equivalent but not byte-exact: refused even unfrozen.
+        name: "receipt fence whitespace-altered",
+        freeze: false,
+        mutate: (db) => {
+          const sql = (
+            db.query("SELECT sql FROM sqlite_schema WHERE name=?").get(receipt) as { sql: string }
+          ).sql;
+          const altered = sql.replace("\nWHEN ", "\n WHEN ");
+          expect(altered).not.toBe(sql);
+          db.exec(`DROP TRIGGER ${receipt}`);
+          db.exec(altered);
+        },
+      },
+    ];
+    for (const scenario of scenarios) {
+      const f = await fixture();
+      try {
+        scenario.mutate(f.db);
+        if (scenario.freeze) f.db.exec(MONEY_FREEZE_ROW);
+        const store = f.c0();
+        for (const statements of [
+          store.buildPreparationBatch(f.preparation("one-fence"), AT),
+          store.buildPreparationContribution(f.preparation("one-fence-contribution"), AT)
+            .statements,
+        ])
+          await expect(f.sql.batch(inPermitFrame(W, statements))).rejects.toThrow();
+        expect([scenario.name, f.counts()]).toEqual([scenario.name, [0, 0, 0, 0]]);
+        expect(count(f.db, "money_cutover_writer_permit").n).toBe(0);
+      } finally {
+        f.close();
+      }
+    }
+  });
+
+  test("exported C0 builders refuse a Sql that is not the Money writer for their epoch", async () => {
+    const f = await fixture();
+    try {
+      const realm = await verifyHostedBillingFinancialRealm({
+        sql: f.sql,
+        reader: { client: f.common.client },
+        expected: { accountId: "acct_enrollment", mode: "test", billingAuthority: "enrollment" },
+        prices: [{ priceId: "price_enrollment", monthlyAmountMinor: 1000 }],
+      });
+      const raw = createFinancialPreproofChallengeStore({
+        ...f.common,
+        sql: f.sql,
+        realm,
+        scope: SCOPE,
+      });
+      expect(() => raw.buildPreparationBatch(f.preparation("raw"), AT)).toThrow("unavailable");
+      expect(() => raw.buildPreparationContribution(f.preparation("raw"), AT)).toThrow(
+        "unavailable",
+      );
+    } finally {
+      f.close();
+    }
+  });
+
   test("observedAt remains DATA and builder does not invoke an actual Clock that throws", async () => {
     const f = await fixture();
     try {

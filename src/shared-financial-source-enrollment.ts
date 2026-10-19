@@ -540,11 +540,25 @@ export function createFinancialPreproofChallengeStore(
     if (!isFinancialMoneyFencedBatch(statements)) fail("unavailable");
     return statements;
   }
-  /** Closed DATA compiler for a future single owner batch; observedAt is not a qualified Clock. */
+  /** Same Money writer binding as R1 capture(): only Root's writer created for
+   * exactly the configured writer epoch, checked synchronously before compiling. */
+  function assertWriterOrigin(): void {
+    try {
+      assertMoneyCutoverSqlOrigin(c.sql, { writerEpoch: c.realmData.writerEpoch });
+    } catch (error) {
+      fail("unavailable", error);
+    }
+  }
+  /** Closed DATA compiler for a future single owner batch; observedAt is not a qualified Clock.
+   * The two statements are valid only as ONE atomic batch, sent unchanged and
+   * together: the challenge INSERT carries no fence check of its own and is
+   * protected only by the receipt's in-statement C0 fence check, whose
+   * failure aborts the receipt and so rolls the challenge row back. */
   function buildPreparationBatch(
     input: FinancialPreproofPreparation,
     observedAt: string,
   ): readonly SqlStatement[] {
+    assertWriterOrigin();
     let saved: ReturnType<typeof parse>;
     try {
       saved = parse(snapshot(input));
@@ -560,11 +574,15 @@ export function createFinancialPreproofChallengeStore(
   async function checkPreparationHistorySchema(): Promise<void> {
     await c.ready();
   }
-  /** Closed compiler image for an owning co-batch. It proves no commit or authority. */
+  /** Closed compiler image for an owning co-batch. It proves no commit or authority.
+   * Its two statements are valid only inside ONE atomic batch with both sent
+   * unchanged: the challenge INSERT is protected only by the receipt's
+   * in-statement C0 fence check, whose failure rolls the whole batch back. */
   function buildPreparationContribution(
     input: FinancialPreproofPreparation,
     observedAt: string,
   ): FinancialPreproofPreparationContribution {
+    assertWriterOrigin();
     let saved: ReturnType<typeof parse>;
     try {
       saved = parse(snapshot(input));
