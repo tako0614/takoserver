@@ -347,8 +347,8 @@ for (const failure of ["NULL", "late-unique"] as const)
       const before = f.snapshot();
       const ss = [...prepareHistoryStart(root, enrollment())];
       if (failure === "NULL")
-        ss[3] = { ...ss[3]!, sql: ss[3]!.sql.replace("THEN 1 ELSE NULL", "THEN NULL ELSE NULL") };
-      else ss.push(ss[3]!);
+        ss[4] = { ...ss[4]!, sql: ss[4]!.sql.replace("THEN 1 ELSE NULL", "THEN NULL ELSE NULL") };
+      else ss.push(ss[4]!);
       await constraint(() => f.sql.batch(ss));
       expect(f.snapshot()).toBe(before);
     } finally {
@@ -478,7 +478,7 @@ test("birth trigger failure rolls back actual Accounts Org INSERT, no successful
     f.db.close();
   }
 });
-test("retired namespace and same-ID OR REPLACE retain all raw/post-seal observations with recursive OFF", async () => {
+test("retired namespace and same-ID OR REPLACE keep the one original post-seal observation with recursive OFF", async () => {
   const f = fixture();
   try {
     const run = enrollment();
@@ -497,7 +497,8 @@ test("retired namespace and same-ID OR REPLACE retain all raw/post-seal observat
           "SELECT COUNT(*) n FROM financial_customer_history_birth_observations WHERE org_id='org:retired'",
         )
         .get(),
-    ).toEqual({ n: 2 });
+    ).toEqual({ n: 1 });
+    // Re-creating the same Org id appends no second birth for this enrollment.
     expect(
       f.db
         .query("SELECT * FROM financial_customer_history_birth_observations ORDER BY rowid LIMIT 1")
@@ -515,9 +516,9 @@ test("retired namespace and same-ID OR REPLACE retain all raw/post-seal observat
     f.db.close();
   }
 });
-test("Org UPDATE/DELETE only append a change observation; the framed H0 close moves the head", async () => {
+test("Org identity UPDATE/DELETE only append a change observation; the framed H0 close moves the head", async () => {
   for (const verb of [
-    "UPDATE orgs SET name='Changed' WHERE id='org:fixture'",
+    "UPDATE orgs SET owner_principal_id='principal:other' WHERE id='org:fixture'",
     "DELETE FROM orgs WHERE id='org:fixture'",
   ]) {
     const f = fixture();
@@ -953,7 +954,10 @@ async function completeAndClose(f: ReturnType<typeof fixture>, run: HistoryEnrol
   await f.component.close(root, run);
 }
 
-for (const mutation of ["UPDATE orgs SET name='Changed'", "DELETE FROM orgs"]) {
+for (const mutation of [
+  "UPDATE orgs SET owner_principal_id='principal:other'",
+  "DELETE FROM orgs",
+]) {
   test(`closed unsealed first capture recaptures after actual ${mutation.split(" ")[0]} without fake seal`, async () => {
     const f = fixture();
     try {
@@ -968,7 +972,7 @@ for (const mutation of ["UPDATE orgs SET name='Changed'", "DELETE FROM orgs"]) {
       if (!oldStart) throw new Error("fixture original start missing");
       expect(await f.component.receipt(first.sealReceiptRef)).toBeNull();
       const extra = mutation.startsWith("UPDATE")
-        ? [scope("org-namespace", "org:interrupted", "principal:owner")]
+        ? [scope("org-namespace", "org:interrupted", "principal:other")]
         : [];
       const next: HistoryEnrollment = {
         ...enrollment(extra),
@@ -1358,7 +1362,7 @@ test("H0 writes refuse raw Sql and a foreign Money writer before any SQL, and co
     expect(f.snapshot()).toBe(before);
     // Inside the actual writer for the root's own epoch the same statements commit.
     expect((await f.sql.batch(prepareHistoryStart(root, run))).map((x) => x.changes)).toEqual([
-      1, 1, 1, 1,
+      1, 1, 1, 0, 1,
     ]);
     expect(f.db.query("SELECT COUNT(*) n FROM money_cutover_writer_permit").get()).toEqual({
       n: 0,
@@ -1427,101 +1431,230 @@ test("epoch-bound H0 fences refuse a current permit for another epoch and roll t
 });
 const FREEZE =
   "INSERT INTO money_cutover_freeze VALUES(1,'binding','origin','backup','writer','source')";
+const UPSERT_LOGIN = `INSERT INTO orgs (id, name, owner_principal_id, created_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET name = excluded.name,
+                      owner_principal_id = excluded.owner_principal_id`;
 async function principal(f: ReturnType<typeof fixture>) {
   await f.raw.run(
     "INSERT OR IGNORE INTO principals(id,provider,provider_subject,email,display_name,created_at) VALUES('principal:owner','google','subject:owner','owner@invalid.example','Owner',?)",
     [at],
   );
 }
-const birthInsert = (phase: string, org: string, extra: { seal?: string | null } = {}) => ({
-  sql: `INSERT INTO financial_customer_history_birth_observations(birth_ref,org_id,org_rowid,owner_principal_id,org_name,org_created_at,phase,primary_ref,enrollment_ref,complete_seal_ref,seal_kind)
- SELECT 'birth:forged:'||lower(hex(randomblob(4))),o.id,o.rowid,o.owner_principal_id,o.name,o.created_at,?,?,?,?,? FROM orgs o WHERE o.id=?`,
-  params: [
-    phase,
-    root.primaryRef,
-    "enrollment:1",
-    extra.seal ?? null,
-    extra.seal ? "complete-seal" : null,
-    org,
-  ],
+const changes = (f: ReturnType<typeof fixture>) =>
+  f.db
+    .query(
+      "SELECT change_seq,change_kind,org_id FROM financial_customer_history_org_changes ORDER BY change_seq",
+    )
+    .all();
+const births = (f: ReturnType<typeof fixture>) =>
+  f.db
+    .query(
+      "SELECT org_id,phase,complete_seal_ref FROM financial_customer_history_birth_observations ORDER BY rowid",
+    )
+    .all();
+const forgedBirth = (phase: string, org: string, seal: string | null = null) => ({
+  sql: `INSERT INTO financial_customer_history_birth_observations(birth_ref,org_id,owner_principal_id,org_name,org_created_at,phase,primary_ref,enrollment_ref,complete_seal_ref,seal_kind)
+ SELECT 'birth:forged:'||lower(hex(randomblob(4))),o.id,o.owner_principal_id,o.name,o.created_at,?,?,?,?,? FROM orgs o WHERE o.id=?`,
+  params: [phase, root.primaryRef, "enrollment:1", seal, seal ? "complete-seal" : null, org],
 });
-test("reviewer forgeries: head bumps and forged births for an existing Org are refused under freeze and cannot change seal or coverage", async () => {
+const oldRun = () => enrollment([scope("org-namespace", "org:old", "principal:owner")]);
+async function capturedOld(f: ReturnType<typeof fixture>) {
+  await principal(f);
+  await f.org("org:old");
+  const run = oldRun();
+  await f.component.start(root, run);
+  await f.inventory(run);
+  return run;
+}
+
+test("the framed start writes the exact roster of existing Org ids in the same batch", async () => {
   const f = fixture();
   try {
-    await principal(f);
-    // An existing Org before capture, inventoried by its exact namespace scope.
-    await f.org("org:old");
-    const run = enrollment([scope("org-namespace", "org:old", "principal:owner")]);
-    await f.component.start(root, run);
-    await f.inventory(run);
+    const run = await capturedOld(f);
+    expect(
+      f.db.query("SELECT enrollment_ref,org_id FROM financial_history_enrollment_roster").all(),
+    ).toEqual([{ enrollment_ref: run.enrollmentRef, org_id: "org:old" }]);
+    // The roster is closed once the start receipt exists, even inside the frame.
+    await constraint(() =>
+      f.sql.run(
+        "INSERT INTO financial_history_enrollment_roster(enrollment_ref,primary_ref,org_id) VALUES(?,?,?)",
+        [run.enrollmentRef, root.primaryRef, "org:old"],
+      ),
+    );
+    await f.org("org:late");
+    await constraint(() =>
+      f.sql.run(
+        "INSERT INTO financial_history_enrollment_roster(enrollment_ref,primary_ref,org_id) VALUES(?,?,?)",
+        [run.enrollmentRef, root.primaryRef, "org:late"],
+      ),
+    );
+  } finally {
+    f.db.close();
+  }
+});
+test("reviewer forgeries: head bumps and forged births for a roster Org are refused under freeze and change neither seal nor coverage", async () => {
+  const f = fixture();
+  try {
+    const run = await capturedOld(f);
     await f.raw.run(FREEZE);
     const before = f.snapshot();
-    // Repeated raw capture bumps are refused (no liveness DoS on the seal CAS).
     for (let i = 0; i < 5; i++)
       await constraint(() =>
         f.raw.run(
           "UPDATE financial_history_enrollment_heads SET capture_sequence=capture_sequence+1",
         ),
       );
-    // A during-enrollment birth for the existing Org (at or below the mark) is refused.
-    const during = birthInsert("during-enrollment", "org:old");
+    const during = forgedBirth("during-enrollment", "org:old");
     await constraint(() => f.raw.run(during.sql, during.params));
     expect(f.snapshot()).toBe(before);
     await f.raw.run("DELETE FROM money_cutover_freeze");
-    // The seal still requires the inventory, exactly as without the forgery attempts.
-    const sealed = await f.seal(run);
-    expect(sealed?.all_rows_match).toBe(1);
+    expect((await f.seal(run))?.all_rows_match).toBe(1);
     await f.raw.run(FREEZE);
-    // A post-seal birth for the existing Org is refused, so it can never become a
-    // coverage origin; the Org's raw birth (before capture) is not a post-seal one.
-    const post = birthInsert("post-seal", "org:old", { seal: run.sealReceiptRef });
+    const post = forgedBirth("post-seal", "org:old", run.sealReceiptRef);
     await constraint(() => f.raw.run(post.sql, post.params));
-    // A second raw row for the same Org row is refused.
     await constraint(() =>
       f.raw.run(
-        "INSERT INTO financial_customer_history_birth_observations(birth_ref,org_id,org_rowid,owner_principal_id,org_name,org_created_at,phase) SELECT 'birth:raw2',o.id,o.rowid,o.owner_principal_id,o.name,o.created_at,'raw' FROM orgs o WHERE o.id='org:old'",
+        "INSERT INTO financial_customer_history_birth_observations(birth_ref,org_id,owner_principal_id,org_name,org_created_at,phase) SELECT 'birth:raw2',o.id,o.owner_principal_id,o.name,o.created_at,'raw' FROM orgs o WHERE o.id='org:old'",
       ),
     );
-    expect(
-      f.db
-        .query(
-          "SELECT phase FROM financial_customer_history_birth_observations WHERE org_id='org:old'",
-        )
-        .all(),
-    ).toEqual([{ phase: "raw" }]);
+    expect(births(f)).toEqual([{ org_id: "org:old", phase: "raw", complete_seal_ref: null }]);
   } finally {
     f.db.close();
   }
 });
-test("raw-phase rows must match the current Org row and are one per Org row", async () => {
+for (const replace of [
+  {
+    label: "a new owner",
+    sql: "INSERT OR REPLACE INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:old','Org','principal:other',?)",
+    change: true,
+  },
+  {
+    label: "a new created_at",
+    sql: "INSERT OR REPLACE INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:old','Org','principal:owner','2027-01-01T00:00:00.000Z')",
+    change: false,
+  },
+])
+  test(`INSERT OR REPLACE re-creating a roster Org with ${replace.label} during capture makes the seal refuse`, async () => {
+    const f = fixture();
+    try {
+      const run = await capturedOld(f);
+      await f.raw.run(replace.sql, replace.change ? [at] : []);
+      // No birth for a roster id; an owner change is observed, a created_at change is
+      // caught by the seal's inventory check against the current Org row.
+      expect(births(f)).toEqual([{ org_id: "org:old", phase: "raw", complete_seal_ref: null }]);
+      expect(changes(f)).toEqual(
+        replace.change ? [{ change_seq: 1, change_kind: "replace", org_id: "org:old" }] : [],
+      );
+      const before = f.snapshot();
+      await constraint(() => f.seal(run));
+      expect(f.snapshot()).toBe(before);
+    } finally {
+      f.db.close();
+    }
+  });
+test("an identical INSERT OR REPLACE of a roster Org is harmless; post-seal re-creation never yields a post-seal birth", async () => {
+  const f = fixture();
+  try {
+    const run = await capturedOld(f);
+    await f.raw.run(
+      "INSERT OR REPLACE INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:old','Renamed','principal:owner',?)",
+      [at],
+    );
+    expect(changes(f)).toEqual([]);
+    expect((await f.seal(run))?.all_rows_match).toBe(1);
+    await f.raw.run(
+      "INSERT OR REPLACE INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:old','Again','principal:owner',?)",
+      [at],
+    );
+    expect(births(f)).toEqual([{ org_id: "org:old", phase: "raw", complete_seal_ref: null }]);
+  } finally {
+    f.db.close();
+  }
+});
+test("change_seq is strictly sequential: explicit jumps are refused, a forged sequential change only blocks the seal", async () => {
   const f = fixture();
   try {
     await principal(f);
-    await f.org("org:raw");
-    // A forged raw row after a raw rename must still match the Org row exactly and
-    // cannot duplicate the Org row's existing raw birth.
-    await f.raw.run("UPDATE orgs SET name='Renamed' WHERE id='org:raw'");
-    await constraint(() =>
-      f.raw.run(
-        "INSERT INTO financial_customer_history_birth_observations(birth_ref,org_id,org_rowid,owner_principal_id,org_name,org_created_at,phase) SELECT 'birth:raw:forged',o.id,o.rowid,o.owner_principal_id,o.name,o.created_at,'raw' FROM orgs o WHERE o.id='org:raw'",
-      ),
+    for (const seq of [1000000, 0, -1, 2])
+      await constraint(() =>
+        f.raw.run(
+          "INSERT INTO financial_customer_history_org_changes(change_ref,change_seq,change_kind,org_id,old_owner_principal_id,old_org_name,old_org_created_at) VALUES(?,?,'delete','org:none','p','n','c')",
+          [`change:forged:${seq}`, seq],
+        ),
+      );
+    expect(changes(f)).toEqual([]);
+    const run = enrollment();
+    await f.component.start(root, run);
+    await f.inventory(run);
+    // A sequential fabricated change (for an Org that does not exist) is admitted only
+    // as a refusal: the capture can no longer seal.
+    await f.raw.run(
+      "INSERT INTO financial_customer_history_org_changes(change_ref,change_seq,change_kind,org_id,old_owner_principal_id,old_org_name,old_org_created_at) VALUES('change:fabricated',1,'delete','org:none','p','n','c')",
     );
-    await constraint(() =>
-      f.raw.run(
-        "INSERT INTO financial_customer_history_birth_observations(birth_ref,org_id,org_rowid,owner_principal_id,org_name,org_created_at,phase) SELECT 'birth:raw:stale',o.id,o.rowid,o.owner_principal_id,'Org',o.created_at,'raw' FROM orgs o WHERE o.id='org:raw'",
-      ),
+    await constraint(() => f.seal(run));
+  } finally {
+    f.db.close();
+  }
+});
+test("an identical Takos ID owner-login UPSERT appends nothing; an owner change through it is observed", async () => {
+  const f = fixture();
+  try {
+    await principal(f);
+    const run = await capturedOld(f);
+    for (let login = 0; login < 3; login++)
+      await f.raw.run(UPSERT_LOGIN, [
+        "org:old",
+        `Org ${login}`,
+        "principal:owner",
+        new Date(Date.parse(at) + 1000 * (login + 1)).toISOString(),
+      ]);
+    expect(changes(f)).toEqual([]);
+    expect((await f.seal(run))?.all_rows_match).toBe(1);
+    await f.raw.run(UPSERT_LOGIN, ["org:old", "Org", "principal:other", at]);
+    expect(
+      changes(f)
+        .map((row) => (row as { change_kind: string }).change_kind)
+        .sort(),
+    ).toEqual(["replace", "update"]);
+  } finally {
+    f.db.close();
+  }
+});
+test("self-host delete and re-create of the same Org id succeeds and keeps one raw birth", async () => {
+  const f = fixture();
+  try {
+    await principal(f);
+    await f.org("org:again");
+    await f.raw.run("DELETE FROM orgs WHERE id='org:again'");
+    await f.org("org:again");
+    expect(births(f)).toEqual([{ org_id: "org:again", phase: "raw", complete_seal_ref: null }]);
+    expect(changes(f)).toEqual([{ change_seq: 1, change_kind: "delete", org_id: "org:again" }]);
+  } finally {
+    f.db.close();
+  }
+});
+test("explicit orgs rowids on INSERT or UPDATE change nothing for capture, seal or births", async () => {
+  const f = fixture();
+  try {
+    const run = await capturedOld(f);
+    // A low explicit rowid (below the roster Org's) is still a new Org id: it is born.
+    await f.raw.run(
+      "INSERT INTO orgs(rowid,id,name,owner_principal_id,created_at) VALUES(0,'org:low','Org','principal:owner',?)",
+      [at],
     );
-    expect(
-      f.db.query("SELECT COUNT(*) n FROM financial_customer_history_birth_observations").get(),
-    ).toEqual({ n: 1 });
-    // The rename itself is observed, so a capture that started before it could not seal.
-    expect(
-      f.db
-        .query(
-          "SELECT change_kind,old_org_name,new_org_name FROM financial_customer_history_org_changes",
-        )
-        .all(),
-    ).toEqual([{ change_kind: "update", old_org_name: "Org", new_org_name: "Renamed" }]);
+    await f.raw.run(
+      "INSERT INTO orgs(rowid,id,name,owner_principal_id,created_at) VALUES(9000000,'org:high','Org','principal:owner',?)",
+      [at],
+    );
+    await f.raw.run("UPDATE orgs SET rowid=rowid+100000 WHERE id='org:old'");
+    expect(changes(f)).toEqual([]);
+    expect(births(f)).toEqual([
+      { org_id: "org:old", phase: "raw", complete_seal_ref: null },
+      { org_id: "org:low", phase: "during-enrollment", complete_seal_ref: null },
+      { org_id: "org:high", phase: "during-enrollment", complete_seal_ref: null },
+    ]);
+    expect((await f.seal(run))?.all_rows_match).toBe(1);
   } finally {
     f.db.close();
   }
@@ -1536,27 +1669,21 @@ test("legit capture: an Org created during capture is admitted and sealed; post-
     await f.inventory(run);
     expect((await f.seal(run))?.receipt_kind).toBe("complete-seal");
     await f.org("org:after");
-    expect(
-      f.db
-        .query(
-          "SELECT org_id,phase,complete_seal_ref FROM financial_customer_history_birth_observations ORDER BY rowid",
-        )
-        .all(),
-    ).toEqual([
+    expect(births(f)).toEqual([
       { org_id: "org:during", phase: "during-enrollment", complete_seal_ref: null },
       { org_id: "org:after", phase: "post-seal", complete_seal_ref: run.sealReceiptRef },
     ]);
-    const head = f.db
-      .query("SELECT capture_sequence,state FROM financial_history_enrollment_heads")
-      .get();
-    expect(head).toEqual({ capture_sequence: 0, state: "sealed" });
+    expect(
+      f.db.query("SELECT capture_sequence,state FROM financial_history_enrollment_heads").get(),
+    ).toEqual({ capture_sequence: 0, state: "sealed" });
   } finally {
     f.db.close();
   }
 });
-test("an Org renamed or deleted during capture makes the seal refuse until the framed close", async () => {
+test("an Org identity change or delete during capture makes the seal refuse until the framed close; a name-only rename does not", async () => {
   for (const change of [
-    "UPDATE orgs SET name='Changed' WHERE id='org:during'",
+    "UPDATE orgs SET owner_principal_id='principal:other' WHERE id='org:during'",
+    "UPDATE orgs SET created_at='2027-01-01T00:00:00.000Z' WHERE id='org:during'",
     "DELETE FROM orgs WHERE id='org:during'",
   ]) {
     const f = fixture();
@@ -1570,7 +1697,6 @@ test("an Org renamed or deleted during capture makes the seal refuse until the f
       const before = f.snapshot();
       await constraint(() => f.seal(run));
       expect(f.snapshot()).toBe(before);
-      // Frozen, even the framed close is refused; unfrozen it closes the capture.
       await f.raw.run(FREEZE);
       await constraint(() => f.component.close(root, run));
       await f.raw.run("DELETE FROM money_cutover_freeze");
@@ -1578,24 +1704,26 @@ test("an Org renamed or deleted during capture makes the seal refuse until the f
       expect(f.db.query("SELECT state FROM financial_history_enrollment_heads").get()).toEqual({
         state: "closed",
       });
+      await constraint(() => f.component.close(root, run));
     } finally {
       f.db.close();
     }
   }
-});
-test("a capture without an observed Org change cannot be closed", async () => {
-  const f = fixture();
+  const g = fixture();
   try {
+    await principal(g);
     const run = enrollment();
-    await f.component.start(root, run);
-    const before = f.snapshot();
-    await constraint(() => f.component.close(root, run));
-    expect(f.snapshot()).toBe(before);
+    await g.component.start(root, run);
+    await g.org("org:during");
+    await g.inventory(run);
+    await g.raw.run("UPDATE orgs SET name='Renamed' WHERE id='org:during'");
+    expect(changes(g)).toEqual([]);
+    expect((await g.seal(run))?.all_rows_match).toBe(1);
   } finally {
-    f.db.close();
+    g.db.close();
   }
 });
-test("with an open capture, raw Org create, rename and delete still succeed under freeze and only append observations", async () => {
+test("with an open capture, raw Org create, identity change and delete still succeed under freeze and only append observations", async () => {
   const f = fixture();
   try {
     await principal(f);
@@ -1607,17 +1735,16 @@ test("with an open capture, raw Org create, rename and delete still succeed unde
       "INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:frozen','Org','principal:owner',?)",
       [at],
     );
-    await f.raw.run("UPDATE orgs SET name='Changed' WHERE id='org:frozen'");
+    await f.raw.run("UPDATE orgs SET owner_principal_id='principal:other' WHERE id='org:frozen'");
     await f.raw.run("DELETE FROM orgs WHERE id='org:frozen'");
     expect(f.db.query("SELECT * FROM financial_history_enrollment_heads").get()).toEqual(head);
-    expect(
-      f.db.query("SELECT phase FROM financial_customer_history_birth_observations").all(),
-    ).toEqual([{ phase: "during-enrollment" }]);
-    expect(
-      f.db
-        .query("SELECT change_kind FROM financial_customer_history_org_changes ORDER BY change_seq")
-        .all(),
-    ).toEqual([{ change_kind: "update" }, { change_kind: "delete" }]);
+    expect(births(f)).toEqual([
+      { org_id: "org:frozen", phase: "during-enrollment", complete_seal_ref: null },
+    ]);
+    expect(changes(f).map((row) => (row as { change_kind: string }).change_kind)).toEqual([
+      "update",
+      "delete",
+    ]);
   } finally {
     f.db.close();
   }

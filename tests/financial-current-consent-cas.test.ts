@@ -646,26 +646,38 @@ test("tracked execution commits L1, D and N through the actual Money writer; und
   }
 });
 
-test("an Org change after the H0 seal invalidates Customer coverage: no snapshot, no L1 write", async () => {
-  const { f, l1 } = await customerCase();
-  try {
-    const plan = await mechanicalGuard(f, l1);
-    const before = await customerRows(f);
-    // Root's Org trigger only appends a change observation; it moves no head.
-    await f.sql.run("UPDATE orgs SET name='Renamed' WHERE id=?", [f.org]);
-    expect(
-      await readCustomerJournalSnapshot(f.sql, {
-        organizationId: f.org,
-        realmRegistration: f.journal.realmRegistration,
-        realmIncarnation: f.journal.realmIncarnation,
-      }),
-    ).toBeNull();
-    await expect(f.money.batch(plan.statements)).rejects.toThrow();
-    expect(await customerRows(f)).toEqual(before);
-  } finally {
-    f.close();
-  }
-});
+for (const change of [
+  "UPDATE orgs SET owner_principal_id='principal:other' WHERE id=?",
+  "INSERT OR REPLACE INTO orgs(id,name,owner_principal_id,created_at) SELECT id,name,owner_principal_id,'2027-01-01T00:00:00.000Z' FROM orgs WHERE id=?",
+])
+  test(`an Org identity change after the H0 seal invalidates Customer coverage: ${change.slice(0, 22)}`, async () => {
+    const { f, l1 } = await customerCase();
+    try {
+      const plan = await mechanicalGuard(f, l1);
+      const before = await customerRows(f);
+      expect(
+        await readCustomerJournalSnapshot(f.sql, {
+          organizationId: f.org,
+          realmRegistration: f.journal.realmRegistration,
+          realmIncarnation: f.journal.realmIncarnation,
+        }),
+      ).not.toBeNull();
+      // Root's Org trigger only appends a change observation (or, for a REPLACE that
+      // keeps the owner, nothing): coverage re-checks the live Org identity.
+      await f.sql.run(change, [f.org]);
+      expect(
+        await readCustomerJournalSnapshot(f.sql, {
+          organizationId: f.org,
+          realmRegistration: f.journal.realmRegistration,
+          realmIncarnation: f.journal.realmIncarnation,
+        }),
+      ).toBeNull();
+      await expect(f.money.batch(plan.statements)).rejects.toThrow();
+      expect(await customerRows(f)).toEqual(before);
+    } finally {
+      f.close();
+    }
+  });
 
 test("every Customer and H0 statement and every 0104 trigger compile within D1's depth-100 and 100-bind limits", async () => {
   const { f, l1 } = await customerCase();
@@ -741,6 +753,28 @@ test("every Customer and H0 statement and every 0104 trigger compile within D1's
     add("H0-inventory", prepareHistoryInventory(root, run, first, "inventory:depth"));
     prepareHistorySeal(root, run, 0).forEach((s, i) => add(`H0-seal[${i}]`, s));
     add("H0-close", prepareHistoryClose(root, run));
+    // Root's Org DML with every 0104 and Org capture trigger compiled in.
+    const org = { sql: "", params: [] as (string | number | null)[] };
+    for (const [label, sql] of [
+      ["org-insert", "INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES(?,?,?,?)"],
+      [
+        "org-upsert-login",
+        "INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, owner_principal_id = excluded.owner_principal_id",
+      ],
+      [
+        "org-replace",
+        "INSERT OR REPLACE INTO orgs(id,name,owner_principal_id,created_at) VALUES(?,?,?,?)",
+      ],
+      ["org-update", "UPDATE orgs SET owner_principal_id=?,name=?,created_at=? WHERE id=?"],
+      [
+        "org-delete",
+        "DELETE FROM orgs WHERE id=? AND name<>? AND owner_principal_id<>? AND created_at<>?",
+      ],
+    ] as const) {
+      org.sql = sql;
+      org.params = ["org:depth", "Depth", "principal:depth", f.at];
+      add(label, { ...org });
+    }
     const python = `import json,sqlite3,sys
 p=json.load(sys.stdin)
 c=sqlite3.connect(':memory:')

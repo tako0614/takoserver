@@ -363,8 +363,8 @@ describe("Financial 0104 source recipe", () => {
         (o) => o.name === FINANCIAL_0104_MONEY_FENCES[table],
       )?.sql.includes("p.writer_epoch IS"),
     );
-    // 14 epoch-bearing C0/M/G/R1/consent tables plus all 15 fenced Customer tables.
-    expect(epochBearing).toHaveLength(29);
+    // 14 epoch-bearing C0/M/G/R1/consent tables plus all 16 fenced Customer tables.
+    expect(epochBearing).toHaveLength(30);
     for (const table of FENCED_0104_TABLES) {
       for (const rows of ["current", "foreign"] as const) {
         if (rows === "foreign" && !epochBearing.includes(table)) continue;
@@ -546,8 +546,8 @@ describe("Financial 0104 source recipe", () => {
         ...Object.keys(FINANCIAL_0104_CONSENT_FENCE_SCHEMA),
         ...Object.keys(FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA),
       ]);
-      expect(Object.keys(FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA)).toHaveLength(17);
-      expect(added.size).toBe(35);
+      expect(Object.keys(FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA)).toHaveLength(18);
+      expect(added.size).toBe(36);
       expect(schemaRows(db, FINANCIAL_0104_TABLES)).toEqual(
         FINANCIAL_0104_OBJECTS.filter((o) => !added.has(o.name))
           .map(({ type, name, tbl_name, sql }) => ({ type, name, tbl_name, sql }))
@@ -736,10 +736,10 @@ describe("Financial 0104 source recipe", () => {
     } finally {
       scratchDb.close();
     }
-    expect(orgTriggers).toHaveLength(3);
+    expect(orgTriggers).toHaveLength(4);
     // No Org trigger names a fenced table or a money_cutover table.
     for (const sql of orgTriggers) {
-      expect(sql).not.toMatch(/money_cutover/u);
+      expect(sql).not.toMatch(/money_cutover|RAISE|rowid/iu);
       expect(sql).not.toMatch(/\b(?:UPDATE|DELETE\s+FROM)\s+financial_/u);
       const writes = [...sql.matchAll(/INSERT INTO ([a-z_]+)/gu)].map((m) => m[1] ?? "");
       expect(writes.length).toBeGreaterThan(0);
@@ -756,18 +756,36 @@ describe("Financial 0104 source recipe", () => {
       db.exec(
         "INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:self','Self','principal:self','2026-10-15T00:00:00.000Z')",
       );
+      // Rename, identical owner-login UPSERT, identity change, REPLACE, delete and
+      // re-create of the same id all succeed.
       db.exec("UPDATE orgs SET name='Renamed' WHERE id='org:self'");
+      const upsert = `INSERT INTO orgs (id, name, owner_principal_id, created_at)
+                    VALUES ('org:self', 'Login', 'principal:self', '2026-10-16T00:00:00.000Z')
+                    ON CONFLICT(id) DO UPDATE SET name = excluded.name,
+                      owner_principal_id = excluded.owner_principal_id`;
+      db.exec(upsert);
+      db.exec("UPDATE orgs SET owner_principal_id='principal:other' WHERE id='org:self'");
+      db.exec(
+        "INSERT OR REPLACE INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:self','Replaced','principal:self','2026-10-15T00:00:00.000Z')",
+      );
       db.exec("DELETE FROM orgs WHERE id='org:self'");
+      db.exec(
+        "INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:self','Again','principal:self','2026-10-17T00:00:00.000Z')",
+      );
       expect(
         db.query("SELECT org_id,phase FROM financial_customer_history_birth_observations").all(),
       ).toEqual([{ org_id: "org:self", phase: "raw" }]);
       expect(
         db
           .query(
-            "SELECT change_kind FROM financial_customer_history_org_changes ORDER BY change_seq",
+            "SELECT change_seq,change_kind FROM financial_customer_history_org_changes ORDER BY change_seq",
           )
           .all(),
-      ).toEqual([{ change_kind: "update" }, { change_kind: "delete" }]);
+      ).toEqual([
+        { change_seq: 1, change_kind: "update" },
+        { change_seq: 2, change_kind: "replace" },
+        { change_seq: 3, change_kind: "delete" },
+      ]);
       // Only observations were written among the 0104 tables.
       for (const table of FINANCIAL_0104_TABLES)
         if (!Object.hasOwn(FINANCIAL_0104_UNFENCED_TABLES, table)) expect(count(db, table)).toBe(0);
@@ -796,7 +814,7 @@ describe("Financial 0104 source recipe", () => {
       db.exec("PRAGMA foreign_keys=OFF");
       const birth = (ref: string, org: string, name: string) =>
         db.exec(
-          `INSERT INTO financial_customer_history_birth_observations(birth_ref,org_id,org_rowid,owner_principal_id,org_name,org_created_at,phase) VALUES('${ref}','${org}',COALESCE((SELECT rowid FROM orgs WHERE id='${org}'),1),'owner','${name}','at','raw')`,
+          `INSERT INTO financial_customer_history_birth_observations(birth_ref,org_id,owner_principal_id,org_name,org_created_at,phase) VALUES('${ref}','${org}','owner','${name}','at','raw')`,
         );
       // A forged row with no matching Org is refused, frozen or not.
       db.exec(MONEY_FREEZE_ROW);
@@ -820,7 +838,7 @@ describe("Financial 0104 source recipe", () => {
       // Change observations are append-only too and admit only the exact Org change.
       const change = (ref: string, name: string) =>
         db.exec(
-          `INSERT INTO financial_customer_history_org_changes(change_ref,change_kind,org_id,org_rowid,old_owner_principal_id,old_org_name,old_org_created_at,new_org_id,new_owner_principal_id,new_org_name,new_org_created_at) VALUES('${ref}','update','org:a',(SELECT rowid FROM orgs WHERE id='org:a'),'owner','old','at','org:a','owner','${name}','at')`,
+          `INSERT INTO financial_customer_history_org_changes(change_ref,change_seq,change_kind,org_id,old_owner_principal_id,old_org_name,old_org_created_at,new_org_id,new_owner_principal_id,new_org_name,new_org_created_at) VALUES('${ref}',COALESCE((SELECT max(change_seq) FROM financial_customer_history_org_changes),0)+1,'update','org:a','owner','old','at','org:a','owner','${name}','at')`,
         );
       expect(() => change("change:forged", "other")).toThrow(/exact Org change/u);
       change("change:a", "name");

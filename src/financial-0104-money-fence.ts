@@ -97,6 +97,8 @@ export const FINANCIAL_0104_CUSTOMER_H0_FENCE_SCHEMA: Readonly<Record<string, st
       "CREATE TRIGGER financial_history_enrollments_money_fence BEFORE INSERT ON financial_history_enrollments\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_history_primary_roots r\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE r.primary_ref IS NEW.primary_ref AND p.writer_epoch IS json_extract(r.root_json,'$.writerEpoch')) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial history enrollment permit/epoch required');\nEND",
     financial_history_enrollment_inventory_money_fence:
       "CREATE TRIGGER financial_history_enrollment_inventory_money_fence BEFORE INSERT ON financial_history_enrollment_inventory\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_history_primary_roots r\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE r.primary_ref IS NEW.primary_ref AND p.writer_epoch IS json_extract(r.root_json,'$.writerEpoch')) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial history inventory permit/epoch required');\nEND",
+    financial_history_enrollment_roster_money_fence:
+      "CREATE TRIGGER financial_history_enrollment_roster_money_fence BEFORE INSERT ON financial_history_enrollment_roster\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_history_primary_roots r\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE r.primary_ref IS NEW.primary_ref AND p.writer_epoch IS json_extract(r.root_json,'$.writerEpoch')) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial history roster permit/epoch required');\nEND",
     financial_history_enrollment_heads_money_fence:
       "CREATE TRIGGER financial_history_enrollment_heads_money_fence BEFORE INSERT ON financial_history_enrollment_heads\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_history_primary_roots r\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE r.primary_ref IS NEW.primary_ref AND p.writer_epoch IS json_extract(r.root_json,'$.writerEpoch')) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial history head permit/epoch required');\nEND",
     financial_history_enrollment_heads_money_fence_update:
@@ -167,6 +169,7 @@ export const FINANCIAL_0104_FENCED_TABLES = Object.freeze([
   "financial_history_primary_roots",
   "financial_history_enrollments",
   "financial_history_enrollment_inventory",
+  "financial_history_enrollment_roster",
   "financial_history_enrollment_heads",
   "financial_history_enrollment_receipts",
   "financial_customer_history_coverages",

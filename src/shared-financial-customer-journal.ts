@@ -182,10 +182,11 @@ export const CUSTOMER_MATCH_CTES = `
 export const CUSTOMER_ENTRY_MATCH = `EXISTS(SELECT 1 FROM customer_entry_matches valid
  WHERE valid.history_ref=cv.history_ref AND valid.history_ref=e.history_ref AND valid.entry_ref=e.entry_ref)`;
 /** Exact H0 root/seal/birth, bidirectional actual inventory and current realm;
- * no count/label authority. The origin birth must sit above the capture's orgs
- * high-water mark, and no Org change may have been observed since that capture
- * started (Root's Org triggers no longer close a head; a change invalidates the
- * coverage instead). Money currentness is appended separately below. */
+ * no count/label authority. The origin birth's Org id must be outside the
+ * capture's start roster and still match the current Org row (owner, created_at),
+ * and no Org change may have been observed since that capture started (Root's Org
+ * triggers no longer close a head; a change invalidates the coverage instead).
+ * Money currentness is appended separately below. */
 const CUSTOMER_COVERAGE_CORE = `(
  (cv.original_org_origin IS birth.birth_ref AND birth.org_id IS cv.organization_id AND birth.phase='post-seal'
  AND birth.primary_ref IS cv.primary_ref AND birth.enrollment_ref IS cv.enrollment_ref AND birth.complete_seal_ref IS cv.complete_seal_ref)
@@ -196,7 +197,8 @@ const CUSTOMER_COVERAGE_CORE = `(
  AND (seal.receipt_ref IS cv.complete_seal_ref AND seal.receipt_kind='complete-seal' AND seal.all_rows_match IS 1
  AND seal.enrollment_ref IS cv.enrollment_ref AND seal.primary_ref IS cv.primary_ref
  AND run.expected_seal_ref IS seal.receipt_ref AND run.required_json IS cv.required_scopes_json)
- AND (birth.org_rowid>run.org_high_water
+ AND (NOT EXISTS(SELECT 1 FROM financial_history_enrollment_roster ro WHERE ro.enrollment_ref=run.enrollment_ref AND ro.org_id=birth.org_id)
+ AND EXISTS(SELECT 1 FROM orgs o WHERE o.id IS birth.org_id AND o.owner_principal_id IS birth.owner_principal_id AND o.created_at IS birth.org_created_at)
  AND NOT EXISTS(SELECT 1 FROM financial_customer_history_org_changes ch WHERE ch.change_seq>run.change_high_water))
  AND (eh.enrollment_ref IS run.enrollment_ref AND eh.generation IS run.generation AND eh.state='sealed'
  AND eh.expected_receipt_ref IS seal.receipt_ref)
