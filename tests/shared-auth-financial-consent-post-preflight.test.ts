@@ -31,6 +31,8 @@ if (child) {
   let proofMode: "success" | "unknown" | "malformed" | "expire-after" = "success";
   let proofCapture: unknown;
   let loadCalls = 0;
+  let loadEntries = 0;
+  let issuedProofRef = "proof:from-original";
   let currentCalls = 0;
   let evidenceMode: "success" | "load-unknown" | "crossed-subject" | "expire-after-current" =
     "success";
@@ -62,7 +64,7 @@ if (child) {
     const issuedAt = activeChallenge.createdAt;
     const proof = {
       v: 1,
-      proofRef: "proof:from-original",
+      proofRef: issuedProofRef,
       challenge: activeChallenge,
       issuer: OIDC.issuer,
       subject: evidenceMode === "crossed-subject" && status === "current" ? "other" : OIDC.subject,
@@ -174,7 +176,7 @@ if (child) {
         });
         return response;
       }
-      return Object.freeze({ proofRef: "proof:from-original" });
+      return Object.freeze({ proofRef: issuedProofRef });
     },
     async loadWorkerRequestRetainedRpFinancialIdentityProofOriginal(
       value: unknown,
@@ -183,6 +185,7 @@ if (child) {
       challengeRef: unknown,
       capture: unknown,
     ) {
+      loadEntries++;
       requireHeldProofCapture(value, request, workspaceId, challengeRef, capture);
       loadCalls++;
       loadedCaptures.add(capture as object);
@@ -309,8 +312,10 @@ if (child) {
     proofMode = "success";
     proofCapture = undefined;
     loadCalls = 0;
+    loadEntries = 0;
     currentCalls = 0;
     evidenceMode = "success";
+    issuedProofRef = "proof:from-original";
     requests.clear();
     const principalId = "principal:fixture";
     const principalIncarnation = "principal-incarnation:fixture";
@@ -795,6 +800,7 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
     try {
       const { request, submission } = await provedSubmission(s);
       const before = { writes: writes(), observer: observerCalls, clock: clockCalls };
+      issuedProofRef = "proof:second-original";
       await s.handler.provePreparedFinancialR1Identity(
         request,
         SCOPE.workspaceId,
@@ -816,9 +822,16 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
         ),
       ).toBe(evidence);
       const joined = await evidence;
+      expect(Object.keys(joined).sort()).toEqual([
+        "identityGeneration",
+        "kind",
+        "proofRef",
+        "registrationRef",
+        "sourceParentPins",
+      ]);
       expect(joined).toMatchObject({
         kind: "financial-proof",
-        proofRef: "proof:from-original",
+        proofRef: "proof:second-original",
         registrationRef: SCOPE.registrationRef,
         identityGeneration: 0,
       });
@@ -864,6 +877,78 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
       expect([proofEntries, loadCalls, currentCalls]).toEqual([1, 0, 0]);
     } finally {
       s.close();
+    }
+  });
+
+  test("identity evidence refuses a failed prove, crossed arguments and pre-load drift", async () => {
+    const s = await setup();
+    try {
+      const { request, submission } = await provedSubmission(s);
+      proofMode = "unknown";
+      await expect(
+        s.handler.provePreparedFinancialR1Identity(
+          request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      await expect(
+        s.handler.readPreparedFinancialR1IdentityEvidence(
+          request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect([proofCalls, loadCalls, currentCalls]).toEqual([1, 0, 0]);
+    } finally {
+      s.close();
+    }
+    const next = await setup();
+    try {
+      const { request, submission } = await provedSubmission(next);
+      await next.handler.provePreparedFinancialR1Identity(
+        request,
+        SCOPE.workspaceId,
+        next.challengeRef,
+        submission,
+      );
+      for (const [workspaceId, challengeRef] of [
+        [SCOPE.workspaceId, "challenge:other"],
+        ["workspace:other", next.challengeRef],
+      ] as const) {
+        await expect(
+          next.handler.readPreparedFinancialR1IdentityEvidence(
+            request,
+            workspaceId,
+            challengeRef,
+            submission,
+          ),
+        ).rejects.toMatchObject({ code: "unavailable" });
+      }
+      const other = createSharedAuthFinancialConsentRequestHandler(connection);
+      await expect(
+        other.readPreparedFinancialR1IdentityEvidence(
+          request,
+          SCOPE.workspaceId,
+          next.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      // The pending row expires between prove and evidence: refused before load.
+      dbNow = Date.parse(AT) + 301_000;
+      await expect(
+        next.handler.readPreparedFinancialR1IdentityEvidence(
+          request,
+          SCOPE.workspaceId,
+          next.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect([loadEntries, loadCalls, currentCalls]).toEqual([0, 0, 0]);
+    } finally {
+      next.close();
     }
   });
 
@@ -1075,7 +1160,7 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
     expect(stderr).toContain(
       "(pass) actual R1 and RP POST preflight reads pending only with one held Clock",
     );
-    expect(stderr).toContain("14 pass");
+    expect(stderr).toContain("15 pass");
     expect(stderr).toContain("0 fail");
   }, 100_000);
 }
