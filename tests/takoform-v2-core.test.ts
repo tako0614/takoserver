@@ -261,6 +261,14 @@ test("unknown backend result never becomes none; confirmed no-effect reconciles 
     .query("SELECT phase, active_name FROM tf_v2_resources WHERE uid = ?")
     .get(admitted.resourceUid) as { phase: string; active_name: string };
   expect(row).toEqual({ phase: "error", active_name: "demo" });
+  // A proven no-effect after dispatch releases the resource: DELETE is accepted, not busy.
+  const deletion = await core.acceptDelete({
+    principal: "alice",
+    key: "after-proven-no-effect-key-01",
+    uid: admitted.resourceUid,
+    expectedGeneration: 1,
+  });
+  expect(deletion).toMatchObject({ resourceUid: admitted.resourceUid, action: "delete" });
 });
 
 test("uncertain oldest operation is backed off so a newer queued resource can run", async () => {
