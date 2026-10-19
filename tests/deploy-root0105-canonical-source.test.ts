@@ -16,6 +16,7 @@ import {
   financial0104SourceSchemaReady,
   moneyStripeCustomerGuardRows,
 } from "../scripts/deploy/financial0104-schema-shape.ts";
+import { verifyFreshV2IntegrationStorageTarget } from "../scripts/deploy/integration-storage-generation.ts";
 import { canonicalSchemaShape, readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import { isPostAuth103RecipeSuffix } from "../scripts/deploy/post-auth103-recipes.ts";
 import {
@@ -468,7 +469,7 @@ test(
 
 test(
   "a Worker on a Money-preserved post-Auth103 primary reads its own money-preserved profile",
-  () => {
+  async () => {
     const root = sourceRoot("100");
     const source = readFinancial0104CanonicalMigrationSource(root);
     const ordinaryTarget: DeployTarget = {
@@ -477,8 +478,11 @@ test(
       accountId: "a".repeat(32),
       workerName: "takoserver-api-integration-root0105",
       publicOrigin: "https://root0105.integration.example.test",
-      d1: { databaseId: "00000000-0000-4000-8000-000000000105", databaseName: "root0105" },
-      r2: { bucketName: "root0105" },
+      d1: {
+        databaseId: "00000000-0000-4000-8000-000000000105",
+        databaseName: `integration-ts-${"5".repeat(32)}`,
+      },
+      r2: { bucketName: `integration-ts-${"5".repeat(32)}` },
       signing: { currentKeyId: "current" },
     };
     const moneyTarget: DeployTarget = {
@@ -488,6 +492,20 @@ test(
       auth103NativeProfile: "root-shared-auth-staging-v1",
     };
     const { auth103NativeProfile: _profile, ...moneyWithoutAuthProfile } = moneyTarget;
+    // Every parsed Money target carries the v2-0092 storage lineage, so the
+    // Worker's storage proof reads the same primary before any schema check.
+    const storageLineage = { config: "{}", storageLineage: "v2-0092" } as const;
+    const moneyStorageTarget: DeployTarget = { ...moneyTarget, takoformV2: storageLineage };
+    const storageProof = (target: DeployTarget, observed: ReturnType<typeof observe>) =>
+      verifyFreshV2IntegrationStorageTarget(target, "integration", "v2-0092", {
+        provider: {
+          getD1: async () => ({ name: target.d1.databaseName, uuid: target.d1.databaseId }),
+          getR2: async (name: string) => ({ name }),
+        },
+        reader: { read: async () => observed },
+        migrationDirectory: resolve(root, "migrations"),
+        allowCurrentAuditedSuccessor: true,
+      });
     const observe = (database: Database) => ({
       ...state(database, source.physicalNames),
       moneyUnitPolicy: database
@@ -514,9 +532,21 @@ test(
         const observed = observe(moneyDatabase);
         expect(workerMoneyUnitSchemaReady(observed, root)).toBe(true);
         expect(workerSchemaAllowsPending(moneyTarget, observed, root)).toBe(true);
+        expect(await storageProof(moneyStorageTarget, observed)).toMatchObject({
+          appliedMigrations: observed.applied,
+        });
+        await expect(
+          storageProof({ ...moneyWithoutAuthProfile, takoformV2: storageLineage }, observed),
+        ).rejects.toThrow();
         // Neither an ordinary target nor a Money target off the Auth103 lineage serves it.
         expect(refuses(ordinaryTarget, observed)).toBe(true);
-        expect(refuses(moneyWithoutAuthProfile, observed)).toBe(true);
+        expect(
+          workerSchemaAllowsPending(
+            { ...moneyWithoutAuthProfile, takoformV2: storageLineage },
+            observed,
+            root,
+          ),
+        ).toBe(false);
       }
       // No Money cutover phase resumes past Auth103: its Stripe generation is
       // installed only by the Money-preserved 0104 import above.
@@ -547,6 +577,7 @@ test(
       const missing = observe(moneyDatabase);
       expect(workerMoneyUnitSchemaReady(missing, root)).toBe(false);
       expect(refuses(moneyTarget, missing)).toBe(true);
+      await expect(storageProof(moneyStorageTarget, missing)).rejects.toThrow();
     } finally {
       moneyDatabase.close();
       ordinaryDatabase.close();
