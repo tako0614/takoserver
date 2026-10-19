@@ -1,4 +1,8 @@
 import {
+  FINANCIAL_0104_C0_FENCE_SCHEMA,
+  isFinancialMoneyFencedBatch,
+} from "./financial-0104-money-fence.ts";
+import {
   assertHostedBillingFinancialRealm,
   type HostedBillingFinancialRealm,
 } from "./hosted-billing-realm.ts";
@@ -276,15 +280,17 @@ function component(options: FinancialEnrollmentComponentOptions) {
     receiverRef,
     targetRef,
   });
-  const current = `EXISTS (SELECT 1 FROM stripe_mode_realm WHERE singleton=1 AND mode='test')
-    AND EXISTS (SELECT 1 FROM stripe_billing_account_realms WHERE singleton=1 AND account_id=? AND mode='test' AND billing_authority=?)
+  // C0 is written only inside Root's permit-framed Money writer. Its freeze,
+  // permit and epoch checks are the per-table Financial 0104 money fences, so
+  // this predicate names no money_cutover_* table and passes the writer as-is.
+  const c0Current = `EXISTS (SELECT 1 FROM stripe_mode_realm WHERE singleton=1 AND mode='test')
+    AND EXISTS (SELECT 1 FROM stripe_billing_account_realms WHERE singleton=1 AND account_id=? AND mode='test' AND billing_authority=?)`;
+  const c0CurrentParams: readonly SqlParam[] = [realmData.accountId, realmData.billingAuthority];
+  // M keeps its original in-statement epoch/freeze predicate unchanged.
+  const current = `${c0Current}
     AND EXISTS (SELECT 1 FROM money_cutover_authorized_epoch WHERE singleton=1 AND writer_epoch=?)
     AND NOT EXISTS (SELECT 1 FROM money_cutover_freeze)`;
-  const currentParams: readonly SqlParam[] = [
-    realmData.accountId,
-    realmData.billingAuthority,
-    writerEpoch,
-  ];
+  const currentParams: readonly SqlParam[] = [...c0CurrentParams, writerEpoch];
   const names = [
     "financial_preproof_challenges",
     "financial_preproof_challenge_receipts",
@@ -294,6 +300,8 @@ function component(options: FinancialEnrollmentComponentOptions) {
     "financial_source_genesis_admission_receipts",
   ];
   const completeSchema = { ...SCHEMA, ...FINANCIAL_GENESIS_SCHEMA };
+  // Financial 0104: the complete overlay plus every exact C0/M/G money fence.
+  const fencedSchema = { ...completeSchema, ...FINANCIAL_0104_C0_FENCE_SCHEMA };
   async function ready(receiver = false) {
     try {
       const rows = await sql.query(
@@ -308,7 +316,11 @@ function component(options: FinancialEnrollmentComponentOptions) {
       const legacy = rows.every(
         (row) => typeof row.name === "string" && Object.hasOwn(SCHEMA, row.name),
       );
-      const expectedSchema = legacy ? SCHEMA : completeSchema;
+      const fenced = rows.some(
+        (row) =>
+          typeof row.name === "string" && Object.hasOwn(FINANCIAL_0104_C0_FENCE_SCHEMA, row.name),
+      );
+      const expectedSchema = legacy ? SCHEMA : fenced ? fencedSchema : completeSchema;
       if (
         rows.length !== Object.keys(expectedSchema).length ||
         rows.some(
@@ -337,7 +349,16 @@ function component(options: FinancialEnrollmentComponentOptions) {
       return fail("unavailable", error);
     }
   }
-  return { sql, realmData, current, currentParams, ready, observed };
+  return {
+    sql,
+    realmData,
+    c0Current,
+    c0CurrentParams,
+    current,
+    currentParams,
+    ready,
+    observed,
+  };
 }
 
 export interface FinancialPreproofPreparation {
@@ -461,10 +482,10 @@ export function createFinancialPreproofChallengeStore(
     challengeJson: string,
     at: string,
   ): readonly SqlStatement[] {
-    return [
+    const statements: readonly SqlStatement[] = [
       {
         sql: `INSERT INTO financial_preproof_challenges(challenge_ref,preparation_ref,challenge_json,scope_json,record_json,created_at)
-          SELECT ?,?,?,?,?,? WHERE ${c.current}`,
+          SELECT ?,?,?,?,?,? WHERE ${c.c0Current}`,
         params: [
           saved.challenge.challengeRef,
           saved.preparationRef,
@@ -472,13 +493,13 @@ export function createFinancialPreproofChallengeStore(
           scopeJson,
           recordJson,
           at,
-          ...c.currentParams,
+          ...c.c0CurrentParams,
         ],
       },
       {
         sql: `INSERT INTO financial_preproof_challenge_receipts(receipt_ref,challenge_ref,preparation_ref,record_json,all_rows_match)
           VALUES(?,?,?,?,CASE WHEN changes()=1 AND EXISTS(SELECT 1 FROM financial_preproof_challenges
-          WHERE challenge_ref=? AND preparation_ref=? AND challenge_json=? AND scope_json=? AND record_json=?) AND (${c.current}) THEN 1 ELSE 0 END)`,
+          WHERE challenge_ref=? AND preparation_ref=? AND challenge_json=? AND scope_json=? AND record_json=?) AND (${c.c0Current}) THEN 1 ELSE 0 END)`,
         params: [
           saved.receiptRef,
           saved.challenge.challengeRef,
@@ -489,10 +510,13 @@ export function createFinancialPreproofChallengeStore(
           challengeJson,
           scopeJson,
           recordJson,
-          ...c.currentParams,
+          ...c.c0CurrentParams,
         ],
       },
     ];
+    // Every statement writes a 0104 money-fenced table; nothing else is built.
+    if (!isFinancialMoneyFencedBatch(statements)) fail("unavailable");
+    return statements;
   }
   /** Closed DATA compiler for a future single owner batch; observedAt is not a qualified Clock. */
   function buildPreparationBatch(

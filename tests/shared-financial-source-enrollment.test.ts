@@ -2,10 +2,14 @@ import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { MIGRATIONS } from "../src/db-schema.ts";
+import { FINANCIAL_0104_C0_FENCE_SCHEMA } from "../src/financial-0104-money-fence.ts";
 import { verifyHostedBillingFinancialRealm } from "../src/hosted-billing-realm.ts";
 import {
+  createMoneyCutoverSql,
   MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL,
   MONEY_CUTOVER_FREEZE_DDL,
+  MONEY_CUTOVER_PERMIT_DDL,
+  MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
 } from "../src/money-cutover-sql.ts";
 import { type Sql, SqlError, type SqlStatement } from "../src/ports.ts";
 import { createSharedFinancialSourceReceiver } from "../src/shared-financial-source.ts";
@@ -1046,15 +1050,7 @@ describe("private C0 and explicit M component", () => {
   test("a current primary fence revoked at allocation time rolls back both independent phases", async () => {
     const f = await fixture();
     try {
-      f.fault((s) => {
-        f.db.exec(
-          "INSERT INTO money_cutover_freeze VALUES(1,'binding','origin','backup','writer','source')",
-        );
-        return s;
-      });
-      await expect(f.c0().prepare(f.preparation())).rejects.toMatchObject({ code: "conflict" });
-      expect(f.counts()).toEqual([0, 0, 0, 0]);
-      f.db.exec("DELETE FROM money_cutover_freeze");
+      // M keeps its in-statement epoch/freeze predicate.
       f.fault((s) => {
         f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(D);
         return s;
@@ -1063,6 +1059,49 @@ describe("private C0 and explicit M component", () => {
       expect(f.counts()).toEqual([0, 0, 0, 0]);
       expect(count(f.db, "financial_source_heads").n).toBe(0);
       expect(count(f.db, "financial_source_registrations").n).toBe(0);
+      f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(W);
+      // C0 freeze/permit/epoch are the exact Financial 0104 fences, inside the
+      // actual permit-framed Money writer; the predicate no longer names them.
+      f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
+      for (const sql of Object.values(FINANCIAL_0104_C0_FENCE_SCHEMA)) f.db.exec(sql);
+      f.db.exec(MONEY_CUTOVER_PERMIT_DDL);
+      f.db.exec(MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL);
+      const money = createMoneyCutoverSql(f.sql, W);
+      const realm = await verifyHostedBillingFinancialRealm({
+        sql: money,
+        reader: { client: f.common.client },
+        expected: { accountId: "acct_enrollment", mode: "test", billingAuthority: "enrollment" },
+        prices: [{ priceId: "price_enrollment", monthlyAmountMinor: 1000 }],
+      });
+      const fenced = () =>
+        createFinancialPreproofChallengeStore({ ...f.common, sql: money, realm, scope: SCOPE });
+      f.fault((s) => {
+        f.db.exec(
+          "INSERT INTO money_cutover_freeze VALUES(1,'binding','origin','backup','writer','source')",
+        );
+        return s;
+      });
+      await expect(fenced().prepare(f.preparation())).rejects.toMatchObject({ code: "conflict" });
+      expect(f.counts()).toEqual([0, 0, 0, 0]);
+      expect(count(f.db, "money_cutover_writer_permit").n).toBe(0);
+      f.db.exec("DELETE FROM money_cutover_freeze");
+      f.fault((s) => {
+        f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(D);
+        return s;
+      });
+      await expect(fenced().prepare(f.preparation())).rejects.toMatchObject({ code: "conflict" });
+      expect(f.counts()).toEqual([0, 0, 0, 0]);
+      expect(count(f.db, "money_cutover_writer_permit").n).toBe(0);
+      f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(W);
+      f.fault(undefined);
+      // Outside the permit frame the same C0 pair is refused by the fences.
+      await expect(f.c0().prepare(f.preparation())).rejects.toMatchObject({ code: "conflict" });
+      expect(f.counts()).toEqual([0, 0, 0, 0]);
+      expect(await fenced().prepare(f.preparation())).toMatchObject({
+        challengeRef: "challenge:one",
+      });
+      expect(f.counts()).toEqual([1, 1, 0, 0]);
+      expect(count(f.db, "money_cutover_writer_permit").n).toBe(0);
     } finally {
       f.close();
     }

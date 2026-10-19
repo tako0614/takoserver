@@ -1,6 +1,10 @@
 import type { PurchaseCreditExpiry } from "./billing-config.ts";
 import { sharedRpCredentialCurrentness } from "./credential-authority-class.ts";
 import {
+  FINANCIAL_0104_C0_FENCE_SCHEMA,
+  isFinancialMoneyFencedBatch,
+} from "./financial-0104-money-fence.ts";
+import {
   assertWorkerRequestFinancialAuthConsumerPort,
   captureWorkerRequestFinancialAuthRpRequest,
   type FinancialAuthRpRequestCaptures,
@@ -911,9 +915,19 @@ async function readyC0HistorySchema(sql: Sql): Promise<void> {
     (row) =>
       typeof row.name === "string" && Object.hasOwn(FINANCIAL_SOURCE_ENROLLMENT_SCHEMA, row.name),
   );
+  const fenced = rows.some(
+    (row) =>
+      typeof row.name === "string" && Object.hasOwn(FINANCIAL_0104_C0_FENCE_SCHEMA, row.name),
+  );
   const expected: Readonly<Record<string, string>> = legacy
     ? FINANCIAL_SOURCE_ENROLLMENT_SCHEMA
-    : { ...FINANCIAL_SOURCE_ENROLLMENT_SCHEMA, ...FINANCIAL_GENESIS_SCHEMA };
+    : fenced
+      ? {
+          ...FINANCIAL_SOURCE_ENROLLMENT_SCHEMA,
+          ...FINANCIAL_GENESIS_SCHEMA,
+          ...FINANCIAL_0104_C0_FENCE_SCHEMA,
+        }
+      : { ...FINANCIAL_SOURCE_ENROLLMENT_SCHEMA, ...FINANCIAL_GENESIS_SCHEMA };
   if (
     rows.length !== Object.keys(expected).length ||
     rows.some((row) => typeof row.name !== "string" || row.sql !== expected[row.name])
@@ -1138,7 +1152,7 @@ function compileMechanicalBatch(
     p.registrationJson,
   ];
   const collisions = collisionParams(p.command);
-  return Object.freeze([
+  const statements = Object.freeze([
     c0
       ? compileCoPreparationOriginal(p, c0, current, currentParams)
       : Object.freeze({
@@ -1188,6 +1202,8 @@ function compileMechanicalBatch(
       ]),
     }),
   ]);
+  if (!isFinancialMoneyFencedBatch(statements)) fail("unavailable");
+  return statements;
 }
 
 /** Fixed five-statement DATA contribution; no execution, issuer or NEW authority.
@@ -1217,7 +1233,9 @@ function coPreparationBatchData(c: Captured, p: Parsed, at: string): readonly Sq
     at,
   );
   const r1 = compileMechanicalBatch(c, p, c0.preparedImage);
-  return Object.freeze([
+  // Five statements, each on a 0104 money-fenced table: the permit-framed writer
+  // passes them unchanged and the fences enforce freeze/permit/epoch atomically.
+  const statements = Object.freeze([
     Object.freeze({
       sql: `INSERT INTO financial_action_source_registrations(registration_ref,incarnation,registration_digest,digest_recipe,registration_json,created_at)
           SELECT ?,?,?,?,?,? WHERE ${c.current}`,
@@ -1234,6 +1252,8 @@ function coPreparationBatchData(c: Captured, p: Parsed, at: string): readonly Sq
     ...c0.statements,
     ...r1,
   ]);
+  if (statements.length !== 5 || !isFinancialMoneyFencedBatch(statements)) fail("unavailable");
+  return statements;
 }
 
 const ATTEMPT_TABLE = "financial_r1_preparation_attempts";
