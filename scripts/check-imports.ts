@@ -873,10 +873,29 @@ const EXACT_CONTAINER_ADAPTER_IMPORTS: readonly {
   },
 ];
 
+/** Financial M/G/receiver writers bind their configured writer epoch exactly as
+ * R1 does, through the Money writer origin assertion only. No other adapter access. */
+const EXACT_FINANCIAL_MONEY_ORIGIN_IMPORTS: readonly {
+  readonly source: string;
+  readonly target: string;
+  readonly typeOnly: boolean;
+  readonly names: readonly string[];
+}[] = [
+  "src/shared-financial-source.ts",
+  "src/shared-financial-source-enrollment.ts",
+  "src/shared-financial-source-genesis-admission.ts",
+].map((source) => ({
+  source,
+  target: "src/money-cutover-sql.ts",
+  typeOnly: false,
+  names: ["assertMoneyCutoverSqlOrigin"],
+}));
+
 function exactContainerAdapterImportEdge(path: string, target: string): boolean {
-  const expected = EXACT_CONTAINER_ADAPTER_IMPORTS.find(
-    (entry) => entry.source === path && entry.target === target,
-  );
+  const expected = [
+    ...EXACT_CONTAINER_ADAPTER_IMPORTS,
+    ...EXACT_FINANCIAL_MONEY_ORIGIN_IMPORTS,
+  ].find((entry) => entry.source === path && entry.target === target);
   if (
     expected === undefined ||
     localImportsOf(path).filter((candidate) => candidate === target).length !== 1

@@ -3,6 +3,7 @@ import {
   assertHostedBillingFinancialRealm,
   type HostedBillingFinancialRealm,
 } from "./hosted-billing-realm.ts";
+import { assertMoneyCutoverSqlOrigin } from "./money-cutover-sql.ts";
 import {
   type Clock,
   type Row,
@@ -277,6 +278,14 @@ export function createSharedFinancialSourceReceiver(
   }
 
   async function applySourceEvent(input: FinancialSourceEvent): Promise<FinancialSourceReceipt> {
+    // Receiver rows carry no epoch, so the configured writer epoch is bound the
+    // way R1 binds it: the Sql must be Root's permit-framed Money writer created
+    // for exactly this epoch, checked before any statement is built or sent.
+    try {
+      assertMoneyCutoverSqlOrigin(sql, { writerEpoch });
+    } catch (error) {
+      fail("unavailable", { cause: error });
+    }
     let event: FinancialSourceEvent;
     try {
       event = Object.freeze(parseFinancialSourceEvent(input));

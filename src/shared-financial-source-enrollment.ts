@@ -9,6 +9,7 @@ import {
   type HostedBillingFinancialRealm,
 } from "./hosted-billing-realm.ts";
 import { canonicalDigest } from "./json.ts";
+import { assertMoneyCutoverSqlOrigin } from "./money-cutover-sql.ts";
 import { type Clock, type Sql, SqlError, type SqlParam, type SqlStatement } from "./ports.ts";
 import {
   createSharedFinancialActionIdentity,
@@ -947,6 +948,13 @@ export function createFinancialSourceMaterializationStore(
   async function install(
     input: FinancialMaterializationCommand,
   ): Promise<FinancialMaterializationReceipt> {
+    // Same epoch binding as R1: only Root's Money writer for exactly the
+    // configured writer epoch, checked before any statement is built or sent.
+    try {
+      assertMoneyCutoverSqlOrigin(c.sql, { writerEpoch: c.realmData.writerEpoch });
+    } catch (error) {
+      return fail("unavailable", error);
+    }
     let saved: ReturnType<typeof parse>;
     try {
       saved = parse(snapshot(input));

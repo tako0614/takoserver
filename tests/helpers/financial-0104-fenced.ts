@@ -70,3 +70,14 @@ export async function financial0104Writer(
 
 export const MONEY_FREEZE_ROW =
   "INSERT INTO money_cutover_freeze VALUES(1,'binding','origin','backup','writer','source')";
+
+/** A batch the Money writer framed: its first statement inserts and its last
+ * deletes Root's writer permit. Fixture transports record and fault only the
+ * Financial statements inside it and resend the exact frame around them. */
+export function permitFramed(statements: readonly { readonly sql: string }[]): boolean {
+  return (
+    statements.length >= 2 &&
+    /^INSERT INTO money_cutover_writer_permit\b/u.test(statements[0]?.sql ?? "") &&
+    /^DELETE FROM money_cutover_writer_permit\b/u.test(statements.at(-1)?.sql ?? "")
+  );
+}

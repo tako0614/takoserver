@@ -6,6 +6,7 @@ import {
 } from "./financial-0104-money-fence.ts";
 import { assertHostedBillingFinancialRealm } from "./hosted-billing-realm.ts";
 import { canonicalDigest, canonicalJson } from "./json.ts";
+import { assertMoneyCutoverSqlOrigin } from "./money-cutover-sql.ts";
 import { SqlError, type SqlParam, type SqlStatement } from "./ports.ts";
 import {
   canonicalFinancialSourceJson,
@@ -532,6 +533,13 @@ export function createFinancialControlGenesisAdmissionStore(
   async function admitGenesis(
     input: FinancialControlGenesisCommand,
   ): Promise<FinancialControlGenesisReceipt> {
+    // Same epoch binding as R1: only Root's Money writer for exactly the
+    // configured writer epoch, checked before any statement is built or sent.
+    try {
+      assertMoneyCutoverSqlOrigin(sql, { writerEpoch });
+    } catch (error) {
+      return fail("unavailable", error);
+    }
     let saved: Parsed;
     try {
       saved = parse(input);

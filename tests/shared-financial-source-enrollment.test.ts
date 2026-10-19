@@ -4,8 +4,11 @@ import { readFileSync } from "node:fs";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { verifyHostedBillingFinancialRealm } from "../src/hosted-billing-realm.ts";
 import {
+  createMoneyCutoverSql,
   MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL,
   MONEY_CUTOVER_FREEZE_DDL,
+  MONEY_CUTOVER_PERMIT_DDL,
+  MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
 } from "../src/money-cutover-sql.ts";
 import { type Sql, SqlError, type SqlStatement } from "../src/ports.ts";
 import { createSharedFinancialSourceReceiver } from "../src/shared-financial-source.ts";
@@ -36,6 +39,7 @@ import {
   financial0104Writer,
   installFinancial0104Fences,
   MONEY_FREEZE_ROW,
+  permitFramed,
 } from "./helpers/financial-0104-fenced.ts";
 
 const AT = "2026-10-15T00:00:00.000Z";
@@ -112,6 +116,8 @@ async function fixture() {
   );
   db.exec(MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL);
   db.exec(MONEY_CUTOVER_FREEZE_DDL);
+  db.exec(MONEY_CUTOVER_PERMIT_DDL);
+  db.exec(MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL);
   db.exec(FINANCIAL_SOURCE_ENROLLMENT_DDL);
   const base = createSqliteSql(db);
   let clockCalls = 0,
@@ -138,9 +144,15 @@ async function fixture() {
     },
     batch: async (s) => {
       batchCalls++;
-      batches.push(s);
+      // Record and fault only the Financial statements inside the Money frame.
+      const framed = permitFramed(s);
+      const inner = framed ? s.slice(1, -1) : s;
+      batches.push(inner);
       try {
-        const r = await base.batch(fault ? fault(s) : s);
+        const sent = fault ? fault(inner) : inner;
+        const first = s[0],
+          last = s.at(-1);
+        const r = await base.batch(framed && first && last ? [first, ...sent, last] : sent);
         if (dropAck) {
           dropAck = false;
           readFailure = true;
@@ -182,14 +194,16 @@ async function fixture() {
       throw Error("unexpected fake provider read");
     },
   });
+  // C0/M write only through Root's actual permit-framed Money writer for W.
+  const money = createMoneyCutoverSql(sql, W);
   const realm = await verifyHostedBillingFinancialRealm({
-    sql,
+    sql: money,
     reader: { client },
     expected: { accountId: "acct_enrollment", mode: "test", billingAuthority: "enrollment" },
     prices: [{ priceId: "price_enrollment", monthlyAmountMinor: 1000 }],
   });
   const common: FinancialEnrollmentComponentOptions = {
-    sql,
+    sql: money,
     client,
     realm,
     writerEpoch: W,
@@ -1090,9 +1104,28 @@ describe("private C0 and explicit M component", () => {
         expect(count(f.db, "financial_source_registrations").n).toBe(0);
         expect(count(f.db, "money_cutover_writer_permit").n).toBe(0);
       }
-      // Outside the permit frame the same batches are refused by the fences.
-      await expect(f.c0().prepare(f.preparation())).rejects.toMatchObject({ code: "conflict" });
-      await expect(f.m().install(await f.command())).rejects.toMatchObject({ code: "conflict" });
+      // Outside the permit frame C0 is refused by its fences, and M refuses a
+      // Sql that is not the Money writer for its epoch before building any SQL.
+      const rawRealm = await verifyHostedBillingFinancialRealm({
+        sql: f.sql,
+        reader: { client: f.common.client },
+        expected: { accountId: "acct_enrollment", mode: "test", billingAuthority: "enrollment" },
+        prices: [{ priceId: "price_enrollment", monthlyAmountMinor: 1000 }],
+      });
+      const raw = { ...f.common, sql: f.sql, realm: rawRealm };
+      await expect(
+        createFinancialPreproofChallengeStore({ ...raw, scope: SCOPE }).prepare(f.preparation()),
+      ).rejects.toMatchObject({ code: "conflict" });
+      const batchesBefore = f.batchCalls;
+      await expect(
+        createFinancialSourceMaterializationStore({
+          ...raw,
+          source: f.source,
+          affectedRef: A,
+          genesisQualificationRef: GQ,
+        }).install(await f.command()),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(f.batchCalls).toBe(batchesBefore);
       expect(f.counts()).toEqual([0, 0, 0, 0]);
       expect(count(f.db, "financial_source_heads").n).toBe(0);
       // A current permit under a foreign epoch is refused: each row keeps its own.
@@ -1108,6 +1141,8 @@ describe("private C0 and explicit M component", () => {
           f.preparation(),
         ),
       ).rejects.toMatchObject({ code: "conflict" });
+      // M refuses a writer for another epoch before any SQL (R1's binding).
+      const foreignBatches = f.batchCalls;
       await expect(
         createFinancialSourceMaterializationStore({
           ...foreignOptions,
@@ -1115,7 +1150,8 @@ describe("private C0 and explicit M component", () => {
           affectedRef: A,
           genesisQualificationRef: GQ,
         }).install(await f.command()),
-      ).rejects.toMatchObject({ code: "conflict" });
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(f.batchCalls).toBe(foreignBatches);
       expect(f.counts()).toEqual([0, 0, 0, 0]);
       expect(count(f.db, "financial_source_heads").n).toBe(0);
       f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(W);
@@ -1129,9 +1165,9 @@ describe("private C0 and explicit M component", () => {
       expect(count(f.db, "financial_source_registrations").n).toBe(1);
       expect(count(f.db, "money_cutover_writer_permit").n).toBe(0);
       // Each fenced statement passes the writer unchanged.
+      expect(f.batches.slice(-2).map((batch) => batch.length)).toEqual([2, 4]);
       for (const batch of f.batches.slice(-2))
-        for (const statement of batch.slice(1, -1))
-          expect(statement.sql).not.toMatch(/\bmoney_cutover_/u);
+        for (const statement of batch) expect(statement.sql).not.toMatch(/\bmoney_cutover_/u);
     } finally {
       f.close();
     }
