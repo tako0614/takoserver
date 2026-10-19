@@ -1345,6 +1345,174 @@ describe("staging shared session against native D1 and signed issuer HTTP", () =
     }
   }, 30_000);
 
+  test("financial proof load/current read only this receiver's own proof once each", async () => {
+    const calls: { method: string; receiver: unknown; input: unknown }[] = [];
+    const proofData = (status: string, proofRef: string, challengeRef: string) => ({
+      v: 1,
+      status,
+      proof: { v: 1, proofRef, challenge: { challengeRef, nested: [1, "x"] } },
+      ...(status === "current" ? { observedAt: 7 } : {}),
+    });
+    const financialProof: SharedAuthFinancialProofReceiver = {
+      async prove(input) {
+        calls.push({ method: "prove", receiver: this, input });
+        return { proofRef: "accounts-proof-held" };
+      },
+      async loadFinancialIdentityProof(input) {
+        calls.push({ method: "load", receiver: this, input });
+        return proofData("found", input.proofRef, input.challengeRef);
+      },
+      async verifyCurrentFinancialIdentityProof(input) {
+        calls.push({ method: "current", receiver: this, input });
+        return proofData("current", input.proofRef, input.challengeRef);
+      },
+    };
+    const f = await fixture({ financialProof });
+    try {
+      const signedIn = await f.signedIn();
+      const context = await f.runtime.observeFinalSession(f.sessionRequest(signedIn.sessionCookie));
+      const selected = f.runtime.finalSessionSelection(context);
+      if (!selected) throw new Error("missing final selection");
+      // Order is enforced before any dispatch: no load before prove, no current before load.
+      await expect(
+        f.runtime.loadFinalSessionFinancialIdentityProof(selected, "challenge-held"),
+      ).rejects.toMatchObject({ code: "session_unavailable" });
+      await expect(
+        f.runtime.verifyCurrentFinalSessionFinancialIdentityProof(selected, "challenge-held"),
+      ).rejects.toMatchObject({ code: "session_unavailable" });
+      expect(calls).toHaveLength(0);
+      const requestsBefore = f.issuer.requests.length;
+      const versionBefore = (await f.d1.store.readSession(signedIn.digest))?.version;
+      await f.runtime.proveFinalSessionFinancialIdentity(selected, "challenge-held");
+      await expect(
+        f.runtime.verifyCurrentFinalSessionFinancialIdentityProof(selected, "challenge-held"),
+      ).rejects.toMatchObject({ code: "session_unavailable" });
+      const load = f.runtime.loadFinalSessionFinancialIdentityProof(selected, "challenge-held");
+      expect(f.runtime.loadFinalSessionFinancialIdentityProof(selected, "challenge-held")).toBe(
+        load,
+      );
+      const loaded = await load;
+      const current = await f.runtime.verifyCurrentFinalSessionFinancialIdentityProof(
+        selected,
+        "challenge-held",
+      );
+      await f.runtime.verifyCurrentFinalSessionFinancialIdentityProof(selected, "challenge-held");
+      const request = { v: 1, proofRef: "accounts-proof-held", challengeRef: "challenge-held" };
+      expect(calls.map(({ method, receiver, input }) => [method, receiver, input])).toEqual([
+        ["prove", financialProof, expect.anything()],
+        ["load", financialProof, request],
+        ["current", financialProof, request],
+      ]);
+      expect(Object.isFrozen(calls[1]?.input)).toBe(true);
+      expect(loaded).toEqual(proofData("found", "accounts-proof-held", "challenge-held"));
+      expect(current).toEqual(proofData("current", "accounts-proof-held", "challenge-held"));
+      const proof = (current as { proof: { challenge: { nested: unknown[] } } }).proof;
+      expect(Object.isFrozen(current)).toBe(true);
+      expect(Object.isFrozen(proof.challenge.nested)).toBe(true);
+      const token = f.issuer.issued[0]?.accessToken ?? "missing";
+      expect(JSON.stringify([calls[1]?.input, loaded, current])).not.toContain(token);
+      expect(f.issuer.requests).toHaveLength(requestsBefore);
+      expect((await f.d1.store.readSession(signedIn.digest))?.version).toBe(versionBefore);
+      // Another challenge, a cloned selection or a prove-only receiver has no held proof.
+      await expect(
+        f.runtime.loadFinalSessionFinancialIdentityProof(selected, "challenge-other"),
+      ).rejects.toMatchObject({ code: "session_unavailable" });
+      await expect(
+        f.runtime.loadFinalSessionFinancialIdentityProof({ ...selected }, "challenge-held"),
+      ).rejects.toMatchObject({ code: "session_unavailable" });
+      expect(calls).toHaveLength(3);
+    } finally {
+      await f.dispose();
+    }
+    let proveOnlyCalls = 0;
+    const g = await fixture({
+      financialProof: {
+        async prove() {
+          proveOnlyCalls += 1;
+          return { proofRef: "accounts-proof-only" };
+        },
+      },
+    });
+    try {
+      const signedIn = await g.signedIn();
+      const context = await g.runtime.observeFinalSession(g.sessionRequest(signedIn.sessionCookie));
+      const selected = g.runtime.finalSessionSelection(context);
+      if (!selected) throw new Error("missing final selection");
+      await g.runtime.proveFinalSessionFinancialIdentity(selected, "challenge-only");
+      await expect(
+        g.runtime.loadFinalSessionFinancialIdentityProof(selected, "challenge-only"),
+      ).rejects.toMatchObject({ code: "session_unavailable" });
+      expect(proveOnlyCalls).toBe(1);
+    } finally {
+      await g.dispose();
+    }
+  }, 30_000);
+
+  test("financial proof load/current keep unknown, crossed and getter results sticky", async () => {
+    let loads = 0;
+    let currents = 0;
+    let getterCalls = 0;
+    let mode: "unknown" | "crossed" | "getter" = "unknown";
+    const f = await fixture({
+      financialProof: {
+        async prove({ challengeRef }) {
+          return { proofRef: `proof-${challengeRef}` };
+        },
+        async loadFinancialIdentityProof(input) {
+          loads += 1;
+          if (mode === "unknown") throw new Error("unknown load acknowledgement");
+          if (mode === "crossed")
+            return {
+              v: 1,
+              status: "found",
+              proof: {
+                v: 1,
+                proofRef: "proof-other",
+                challenge: { challengeRef: input.challengeRef },
+              },
+            };
+          const proof = { v: 1, proofRef: input.proofRef };
+          Object.defineProperty(proof, "challenge", {
+            enumerable: true,
+            get() {
+              getterCalls += 1;
+              return { challengeRef: input.challengeRef };
+            },
+          });
+          return { v: 1, status: "found", proof };
+        },
+        async verifyCurrentFinancialIdentityProof() {
+          currents += 1;
+          return {};
+        },
+      },
+    });
+    try {
+      const signedIn = await f.signedIn();
+      const context = await f.runtime.observeFinalSession(f.sessionRequest(signedIn.sessionCookie));
+      const selected = f.runtime.finalSessionSelection(context);
+      if (!selected) throw new Error("missing final selection");
+      for (const [index, next] of (["unknown", "crossed", "getter"] as const).entries()) {
+        mode = next;
+        const challengeRef = `challenge-${next}`;
+        await f.runtime.proveFinalSessionFinancialIdentity(selected, challengeRef);
+        const first = f.runtime.loadFinalSessionFinancialIdentityProof(selected, challengeRef);
+        await expect(first).rejects.toMatchObject({ code: "session_unavailable" });
+        expect(f.runtime.loadFinalSessionFinancialIdentityProof(selected, challengeRef)).toBe(
+          first,
+        );
+        await expect(
+          f.runtime.verifyCurrentFinalSessionFinancialIdentityProof(selected, challengeRef),
+        ).rejects.toMatchObject({ code: "session_unavailable" });
+        expect(loads).toBe(index + 1);
+      }
+      expect(currents).toBe(0);
+      expect(getterCalls).toBe(0);
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
   test("financial proof accepts only detached DATA and releases the same RPC response once", async () => {
     const calls: string[] = [];
     const disposed: object[] = [];

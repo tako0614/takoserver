@@ -165,7 +165,7 @@ function principalInputDescriptorSeal(source: object, allowReceiverFreeze = fals
 }
 
 /** Observe an inherited RPC method without requiring an own-property transport. */
-function proofMethodDescriptorSeal(receiver: object): () => boolean {
+function proofMethodDescriptorSeal(receiver: object, name = "prove"): () => boolean {
   try {
     const chain: {
       readonly owner: object;
@@ -176,7 +176,7 @@ function proofMethodDescriptorSeal(receiver: object): () => boolean {
     let found = false;
     for (let depth = 0; owner !== null && depth < 16; depth += 1) {
       const prototype: object | null = Object.getPrototypeOf(owner);
-      const method = Object.getOwnPropertyDescriptor(owner, "prove");
+      const method = Object.getOwnPropertyDescriptor(owner, name);
       chain.push({ owner, prototype, method });
       if (method) {
         found = true;
@@ -192,7 +192,7 @@ function proofMethodDescriptorSeal(receiver: object): () => boolean {
     return () => {
       try {
         return chain.every(({ owner, prototype, method }) => {
-          const current = Object.getOwnPropertyDescriptor(owner, "prove");
+          const current = Object.getOwnPropertyDescriptor(owner, name);
           if (Object.getPrototypeOf(owner) !== prototype) return false;
           if (!method || !current) return method === current;
           return (
@@ -298,6 +298,17 @@ export interface SharedAuthFinalSessionSelection {
 /** Source-only RPC shape. The owning request graph must supply the real binding. */
 export interface SharedAuthFinancialProofReceiver {
   prove(input: { readonly accessToken: string; readonly challengeRef: string }): Promise<unknown>;
+  loadFinancialIdentityProof?(input: SharedAuthFinancialProofRequestData): Promise<unknown>;
+  verifyCurrentFinancialIdentityProof?(
+    input: SharedAuthFinancialProofRequestData,
+  ): Promise<unknown>;
+}
+
+/** The Accounts load/current request for a proof this receiver itself obtained. */
+export interface SharedAuthFinancialProofRequestData {
+  readonly v: 1;
+  readonly proofRef: string;
+  readonly challengeRef: string;
 }
 
 /** Accounts-produced reference DATA; neither consent nor current proof permission. */
@@ -382,6 +393,23 @@ export function createSharedAuthSession(options: {
     financialProofReceiver === undefined
       ? () => false
       : proofMethodDescriptorSeal(financialProofReceiver);
+  // Load/current stay optional so a prove-only transport keeps its behavior;
+  // when absent, the observation below is unavailable rather than skipped.
+  const loadFinancial = financialProofReceiver?.loadFinancialIdentityProof;
+  const currentFinancial = financialProofReceiver?.verifyCurrentFinancialIdentityProof;
+  if (
+    (loadFinancial !== undefined && typeof loadFinancial !== "function") ||
+    (currentFinancial !== undefined && typeof currentFinancial !== "function")
+  )
+    throw new TypeError("Shared RP financial proof receiver differs");
+  const loadMethodSeal =
+    financialProofReceiver === undefined || loadFinancial === undefined
+      ? () => false
+      : proofMethodDescriptorSeal(financialProofReceiver, "loadFinancialIdentityProof");
+  const currentMethodSeal =
+    financialProofReceiver === undefined || currentFinancial === undefined
+      ? () => false
+      : proofMethodDescriptorSeal(financialProofReceiver, "verifyCurrentFinancialIdentityProof");
   const selections = new WeakMap<SharedAuthSessionContext, SharedAuthFinalSessionSelection>();
   const finalGrants = new WeakMap<
     SharedAuthFinalSessionSelection,
@@ -390,6 +418,11 @@ export function createSharedAuthSession(options: {
   const proofAttempts = new WeakMap<
     SharedAuthFinalSessionSelection,
     Map<string, Promise<SharedAuthFinancialProofReferenceData>>
+  >();
+  const proofLoads = new WeakMap<SharedAuthFinalSessionSelection, Map<string, Promise<unknown>>>();
+  const proofCurrents = new WeakMap<
+    SharedAuthFinalSessionSelection,
+    Map<string, Promise<unknown>>
   >();
   const principalInputOwnerSeals = [principalInputDescriptorSeal(options)];
   for (const name of ["config", "principals", "organizations", "encryptionKey"] as const) {
@@ -1049,6 +1082,84 @@ export function createSharedAuthSession(options: {
     return result;
   }
 
+  /** Load/current over the held proof attempt: each runs at most once per final
+   * selection and challenge; unknown/rejected/malformed results stay memoized. */
+  function readHeldFinancialProof(
+    selected: SharedAuthFinalSessionSelection,
+    challengeRef: string,
+    status: "found" | "current",
+  ): Promise<unknown> {
+    try {
+      const held = finalGrants.get(selected);
+      const proved = proofAttempts.get(selected)?.get(challengeRef);
+      const loaded = status === "current" ? proofLoads.get(selected)?.get(challengeRef) : undefined;
+      const assertOriginal = () => {
+        if (
+          !held ||
+          held !== finalGrants.get(selected) ||
+          held.identity !== selected.identity ||
+          proofAttempts.get(selected)?.get(challengeRef) !== proved ||
+          (status === "current" && proofLoads.get(selected)?.get(challengeRef) !== loaded) ||
+          !principalInputOwnerSeals.every((seal) => seal()) ||
+          !principalInputReceiverSeal() ||
+          !proofMethodSeal() ||
+          !(status === "found" ? loadMethodSeal() : currentMethodSeal()) ||
+          !financialProofReceiver ||
+          !(status === "found" ? loadFinancial : currentFinancial)
+        )
+          throw new SharedAuthSessionError("session_unavailable");
+      };
+      if (
+        !financialSourceRef(challengeRef) ||
+        !selected ||
+        typeof selected !== "object" ||
+        !Object.isFrozen(selected) ||
+        !proved ||
+        (status === "current" && !loaded)
+      )
+        throw new SharedAuthSessionError("session_unavailable");
+      assertOriginal();
+      const method = status === "found" ? loadFinancial : currentFinancial;
+      if (!financialProofReceiver || !method)
+        throw new SharedAuthSessionError("session_unavailable");
+      const proofOwner = financialProofReceiver;
+      const reads = status === "found" ? proofLoads : proofCurrents;
+      let attempts = reads.get(selected);
+      if (!attempts) {
+        attempts = new Map();
+        reads.set(selected, attempts);
+      }
+      const previous = attempts.get(challengeRef);
+      if (previous) return previous;
+      // Install before the first await, as for prove: no resend of this read.
+      const attempted = Promise.resolve()
+        .then(async () => {
+          const { proofRef } = await proved;
+          if (loaded) await loaded;
+          assertOriginal();
+          const proofRequest: SharedAuthFinancialProofRequestData = Object.freeze({
+            v: 1,
+            proofRef,
+            challengeRef,
+          });
+          const data = await financialProofResultData(
+            Reflect.apply(method, proofOwner, [proofRequest]),
+            assertOriginal,
+          );
+          if (!sameFinancialProof(data, status, proofRequest))
+            throw new SharedAuthSessionError("session_unavailable");
+          return data;
+        })
+        .catch(() => {
+          throw new SharedAuthSessionError("session_unavailable");
+        });
+      attempts.set(challengeRef, attempted);
+      return attempted;
+    } catch {
+      return Promise.reject(new SharedAuthSessionError("session_unavailable"));
+    }
+  }
+
   const receiver = {
     /** In-process only: plain records, clones and other factory instances have no provenance. */
     finalSessionSelection(context: unknown): SharedAuthFinalSessionSelection | null {
@@ -1161,6 +1272,21 @@ export function createSharedAuthSession(options: {
       } catch {
         return Promise.reject(new SharedAuthSessionError("session_unavailable"));
       }
+    },
+    /** One Accounts load of the proof this receiver obtained for the same final
+     * selection and challenge. It never proves again or accepts a caller proofRef. */
+    loadFinalSessionFinancialIdentityProof(
+      selected: SharedAuthFinalSessionSelection,
+      challengeRef: string,
+    ): Promise<unknown> {
+      return readHeldFinancialProof(selected, challengeRef, "found");
+    },
+    /** One Accounts current check, only after this receiver's own found load. */
+    verifyCurrentFinalSessionFinancialIdentityProof(
+      selected: SharedAuthFinalSessionSelection,
+      challengeRef: string,
+    ): Promise<unknown> {
+      return readHeldFinancialProof(selected, challengeRef, "current");
     },
     async authenticate(request: Request, workspaceId?: string) {
       const captured = snapshotRequest(request);
@@ -1461,6 +1587,105 @@ function financialSourceRef(value: unknown): value is string {
 function integer(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
+/** Detach one Accounts RPC result into frozen plain DATA. Only the native RPC
+ * top-level non-enumerable dispose method is tolerated and then released; no
+ * getter, toJSON, proxy trap result or foreign prototype becomes DATA. */
+async function financialProofResultData(
+  pending: unknown,
+  assertOriginal: () => void,
+): Promise<unknown> {
+  const response = await pending;
+  let dispose: (() => unknown) | undefined;
+  try {
+    if (
+      !response ||
+      typeof response !== "object" ||
+      Array.isArray(response) ||
+      ![Object.prototype, null].includes(Object.getPrototypeOf(response))
+    )
+      throw new SharedAuthSessionError("session_unavailable");
+    const disposer = Object.getOwnPropertyDescriptor(response, Symbol.dispose);
+    if (disposer) {
+      if (!("value" in disposer) || typeof disposer.value !== "function" || disposer.enumerable)
+        throw new SharedAuthSessionError("session_unavailable");
+      dispose = disposer.value;
+    }
+    assertOriginal();
+    let remaining = 512;
+    const ancestors = new Set<object>();
+    const copy = (part: unknown, depth: number, top: boolean): unknown => {
+      remaining -= 1;
+      if (remaining < 0 || depth > 12) throw new SharedAuthSessionError("session_unavailable");
+      if (part === null || typeof part === "boolean" || typeof part === "string") return part;
+      if (typeof part === "number") {
+        if (!Number.isSafeInteger(part)) throw new SharedAuthSessionError("session_unavailable");
+        return part;
+      }
+      if (!part || typeof part !== "object" || ancestors.has(part))
+        throw new SharedAuthSessionError("session_unavailable");
+      const array = Array.isArray(part);
+      const prototype: object | null = Object.getPrototypeOf(part);
+      if (array ? prototype !== Array.prototype : ![Object.prototype, null].includes(prototype))
+        throw new SharedAuthSessionError("session_unavailable");
+      ancestors.add(part);
+      try {
+        const descriptors = Object.getOwnPropertyDescriptors(part);
+        const keys = Reflect.ownKeys(part).filter((key) => !(top && key === Symbol.dispose));
+        if (array) {
+          const length = Object.getOwnPropertyDescriptor(part, "length");
+          if (!length || !("value" in length) || !Number.isSafeInteger(length.value))
+            throw new SharedAuthSessionError("session_unavailable");
+          const count: number = length.value;
+          if (count > 8 || keys.length !== count + 1)
+            throw new SharedAuthSessionError("session_unavailable");
+          return Object.freeze(
+            Array.from({ length: count }, (_, index) => {
+              const descriptor = descriptors[String(index)];
+              if (!descriptor || !("value" in descriptor) || !descriptor.enumerable)
+                throw new SharedAuthSessionError("session_unavailable");
+              return copy(descriptor.value, depth + 1, false);
+            }),
+          );
+        }
+        if (keys.length > 16) throw new SharedAuthSessionError("session_unavailable");
+        const output: Record<string, unknown> = {};
+        for (const key of keys) {
+          if (typeof key !== "string") throw new SharedAuthSessionError("session_unavailable");
+          const descriptor = descriptors[key];
+          if (!descriptor || !("value" in descriptor) || !descriptor.enumerable)
+            throw new SharedAuthSessionError("session_unavailable");
+          output[key] = copy(descriptor.value, depth + 1, false);
+        }
+        return Object.freeze(output);
+      } finally {
+        ancestors.delete(part);
+      }
+    };
+    return copy(response, 0, true);
+  } finally {
+    try {
+      if (dispose) await Reflect.apply(dispose, response, []);
+    } finally {
+      assertOriginal();
+    }
+  }
+}
+
+/** Status and the held proof/challenge refs only; Financial owns the full join. */
+function sameFinancialProof(
+  data: unknown,
+  status: "found" | "current",
+  request: SharedAuthFinancialProofRequestData,
+): boolean {
+  if (!record(data) || data.v !== 1 || data.status !== status || !record(data.proof)) return false;
+  const proof = data.proof;
+  return (
+    proof.proofRef === request.proofRef &&
+    record(proof.challenge) &&
+    proof.challenge.challengeRef === request.challengeRef
+  );
+}
+
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
