@@ -39,6 +39,7 @@ import {
   dropFinancial0104Fences,
   fenceLiftedSql,
   financial0104Writer,
+  inPermitFrame,
   installFinancial0104Fences,
   MONEY_FREEZE_ROW,
   permitFramed,
@@ -2004,12 +2005,14 @@ describe("fixed C0 builder contribution", () => {
     try {
       const store = f.c0(),
         positive = store.buildPreparationBatch(f.preparation("builder-positive"), AT);
-      expect(await f.base.batch(positive)).toHaveLength(2);
+      expect(await f.sql.batch(inPermitFrame(W, positive))).toHaveLength(4);
       expect(f.counts()).toEqual([1, 1, 0, 0]);
       const late = store.buildPreparationBatch(f.preparation("builder-late"), AT);
       // Explicit in-memory late-failure transport fixture, never part of the fixed producer contribution.
       await expect(
-        f.base.batch([...late, { sql: "SELECT * FROM missing_c0_builder_late_fixture" }]),
+        f.sql.batch(
+          inPermitFrame(W, [...late, { sql: "SELECT * FROM missing_c0_builder_late_fixture" }]),
+        ),
       ).rejects.toBeInstanceOf(SqlError);
       expect(f.counts()).toEqual([1, 1, 0, 0]);
       expect(await store.readChallenge("challenge:builder-late")).toBeUndefined();
@@ -2022,8 +2025,11 @@ describe("fixed C0 builder contribution", () => {
     const f = await fixture();
     try {
       const store = f.c0();
-      await f.base.batch(
-        store.buildPreparationBatch(f.preparation("builder-receipt-positive"), AT),
+      await f.sql.batch(
+        inPermitFrame(
+          W,
+          store.buildPreparationBatch(f.preparation("builder-receipt-positive"), AT),
+        ),
       );
       expect(f.counts()).toEqual([1, 1, 0, 0]);
       const statements = store.buildPreparationBatch(f.preparation("builder-receipt-bad"), AT);
@@ -2033,9 +2039,30 @@ describe("fixed C0 builder contribution", () => {
         ...receipt,
         params: receipt.params.map((value, index) => (index === 3 ? "{}" : value)),
       };
-      await expect(f.base.batch([original, mismatched])).rejects.toBeInstanceOf(SqlError);
+      await expect(f.sql.batch(inPermitFrame(W, [original, mismatched]))).rejects.toBeInstanceOf(
+        SqlError,
+      );
       expect(f.counts()).toEqual([1, 1, 0, 0]);
       expect(await store.readChallenge("challenge:builder-receipt-bad")).toBeUndefined();
+    } finally {
+      f.close();
+    }
+  });
+
+  test("exported C0 builder statements refuse in-statement once the C0 fences are missing, even framed", async () => {
+    const f = await fixture();
+    try {
+      // With both C0 fences gone nothing else would enforce the freeze.
+      f.db.exec("DROP TRIGGER financial_preproof_challenges_money_fence");
+      f.db.exec("DROP TRIGGER financial_preproof_challenge_receipts_money_fence");
+      f.db.exec(MONEY_FREEZE_ROW);
+      const store = f.c0();
+      for (const statements of [
+        store.buildPreparationBatch(f.preparation("builder-unfenced"), AT),
+        store.buildPreparationContribution(f.preparation("contribution-unfenced"), AT).statements,
+      ])
+        await expect(f.sql.batch(inPermitFrame(W, statements))).rejects.toThrow(/all_rows_match/u);
+      expect(f.counts()).toEqual([0, 0, 0, 0]);
     } finally {
       f.close();
     }

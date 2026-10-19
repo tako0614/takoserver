@@ -953,6 +953,34 @@ async function readyFencedCoPreparation(c: Captured): Promise<void> {
     fail("unavailable", error);
   }
 }
+/** A new R1 attempt write requires the exact attempt leaf, including its money
+ * fence, and the exact R1 rows/fences (ready). */
+async function readyFencedAttempt(c: Captured): Promise<void> {
+  try {
+    await ready(c);
+    const schema = await c.sql.query(
+      "SELECT name,type,tbl_name,sql FROM sqlite_schema WHERE tbl_name=? AND sql IS NOT NULL",
+      [ATTEMPT_TABLE],
+    );
+    if (
+      schema.length !== FINANCIAL_R1_ATTEMPT_OBJECTS.length ||
+      FINANCIAL_R1_ATTEMPT_OBJECTS.some(
+        (object) =>
+          !schema.some(
+            (row) =>
+              row.name === object.name &&
+              row.type === object.type &&
+              row.tbl_name === ATTEMPT_TABLE &&
+              row.sql === object.sql,
+          ),
+      )
+    )
+      fail("unavailable");
+  } catch (error) {
+    if (error instanceof FinancialRetainedR1Error) throw error;
+    fail("unavailable", error);
+  }
+}
 async function registered(c: Captured, p: Parsed): Promise<void> {
   const s = p.command.original.actionSource;
   const rows = await c.sql.query(
@@ -1044,6 +1072,13 @@ export async function buildFinancialR1MechanicalBatch(
   let p: Parsed;
   try {
     p = await parseCaptured(command, c);
+  } catch (error) {
+    if (error instanceof FinancialRetainedR1Error) throw error;
+    return fail("unavailable", error);
+  }
+  // It writes only R1 originals/receipts: require their exact rows and fences.
+  try {
+    await ready(c);
   } catch (error) {
     if (error instanceof FinancialRetainedR1Error) throw error;
     return fail("unavailable", error);
@@ -1803,6 +1838,8 @@ export async function buildFinancialR1BoundedAttemptCustodyStatement(
   const c = capture(options),
     at = iso(observedAt);
   const p = await parseCaptured(command, c);
+  // Exact attempt leaf (with its fence) and exact R1 rows/fences, before building.
+  await readyFencedAttempt(c);
   const image = await attemptImage(p, at);
   const input = Object.freeze([
     ...image,

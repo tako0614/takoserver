@@ -41,8 +41,10 @@ import {
 import { prepareConsentBatch } from "../src/shared-financial-consent-data.ts";
 import {
   buildFinancialR1AttemptCustodyStatement,
+  buildFinancialR1BoundedAttemptCustodyStatement,
   buildFinancialR1ClaimedCoPreparationBatch,
   buildFinancialR1CoPreparationBatch,
+  buildFinancialR1MechanicalBatch,
   FINANCIAL_R1_ATTEMPT_DDL,
 } from "../src/shared-financial-retained-r1.ts";
 import {
@@ -52,7 +54,7 @@ import {
 import { FINANCIAL_SOURCE_GENESIS_DDL } from "../src/shared-financial-source-genesis-schema.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { fixture as consentFixture } from "./fixtures/financial-customer-five-action-fixture.ts";
-import { MONEY_FREEZE_ROW } from "./helpers/financial-0104-fenced.ts";
+import { dropFinancial0104Fences, MONEY_FREEZE_ROW } from "./helpers/financial-0104-fenced.ts";
 import { ACTIONS, AT, count, EPOCH, fixture } from "./helpers/financial-r1-custody-fixture.ts";
 
 const ROOT = resolve(import.meta.dir, "..");
@@ -641,6 +643,75 @@ describe("Financial 0104 co-preparation through the existing Money writer", () =
       expect(count(f.db, "money_cutover_writer_permit")).toBe(0);
     } finally {
       f.close();
+    }
+  });
+});
+
+describe("Financial 0104 R1 builders refuse a schema missing their fences", () => {
+  const FREEZE = "INSERT INTO money_cutover_freeze VALUES(1,'b','o','k','w','s')";
+  test("mechanical batch: built and committed when fenced; refused under freeze without its fences", async () => {
+    const f = await at0104();
+    try {
+      await f.registerFixtureData();
+      const command = await f.command(action(0), "mechanical");
+      const batch = await buildFinancialR1MechanicalBatch(f.options, command);
+      expect(await f.sql.batch(batch)).toHaveLength(2);
+      expect(count(f.db, "financial_retained_r1_originals")).toBe(1);
+      for (const name of [
+        "financial_retained_r1_originals_money_fence",
+        "financial_retained_r1_receipts_money_fence",
+      ])
+        f.db.exec(`DROP TRIGGER ${name}`);
+      f.db.exec(FREEZE);
+      const other = await f.command(action(1), "mechanical-unfenced");
+      await expect(buildFinancialR1MechanicalBatch(f.options, other)).rejects.toMatchObject({
+        code: "unavailable",
+      });
+      expect(count(f.db, "financial_retained_r1_originals")).toBe(1);
+      expect(count(f.db, "financial_retained_r1_receipts")).toBe(1);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("attempt builders: built and committed when fenced; refused under freeze without the attempt fence", async () => {
+    const f = await at0104();
+    try {
+      const first = await f.command(action(0), "attempt");
+      const claim = await buildFinancialR1AttemptCustodyStatement(f.options, first, AT);
+      expect((await f.sql.run(claim.sql, claim.params)).changes).toBe(1);
+      expect(count(f.db, "financial_r1_preparation_attempts")).toBe(1);
+      f.db.exec("DROP TRIGGER financial_r1_preparation_attempts_money_fence");
+      f.db.exec(FREEZE);
+      const second = await f.command(action(1), "attempt-unfenced");
+      await expect(
+        buildFinancialR1AttemptCustodyStatement(f.options, second, AT),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      await expect(
+        buildFinancialR1BoundedAttemptCustodyStatement(f.options, second, AT),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(count(f.db, "financial_r1_preparation_attempts")).toBe(1);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("co-preparation is refused under freeze once any R1 or 0104 fence is missing", async () => {
+    for (const drop of ["r1", "c0"] as const) {
+      const f = await at0104();
+      try {
+        if (drop === "r1")
+          f.db.exec("DROP TRIGGER financial_action_source_registrations_money_fence");
+        else dropFinancial0104Fences(f.db);
+        f.db.exec(FREEZE);
+        const command = await f.command(action(2), `co-prep-${drop}`);
+        await expect(
+          buildFinancialR1CoPreparationBatch(f.options, command, AT),
+        ).rejects.toMatchObject({ code: "unavailable" });
+        expect(counts(f.db)).toEqual([0, 0, 0, 0, 0]);
+      } finally {
+        f.close();
+      }
     }
   });
 });

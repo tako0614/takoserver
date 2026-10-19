@@ -86,6 +86,23 @@ const SCHEMA: Readonly<Record<string, string>> = {
     "CREATE TRIGGER financial_source_materialization_receipts_refs BEFORE INSERT ON financial_source_materialization_receipts\nWHEN (typeof(NEW.receipt_ref) IS NOT 'text' OR length(NEW.receipt_ref) NOT BETWEEN 1 AND 256 OR substr(NEW.receipt_ref,1,1) NOT GLOB '[A-Za-z0-9]' OR NEW.receipt_ref GLOB '*[^A-Za-z0-9._:/-]*') OR (typeof(NEW.materialization_ref) IS NOT 'text' OR length(NEW.materialization_ref) NOT BETWEEN 1 AND 256 OR substr(NEW.materialization_ref,1,1) NOT GLOB '[A-Za-z0-9]' OR NEW.materialization_ref GLOB '*[^A-Za-z0-9._:/-]*') OR (typeof(NEW.command_ref) IS NOT 'text' OR length(NEW.command_ref) NOT BETWEEN 1 AND 256 OR substr(NEW.command_ref,1,1) NOT GLOB '[A-Za-z0-9]' OR NEW.command_ref GLOB '*[^A-Za-z0-9._:/-]*') OR (typeof(NEW.registration_ref) IS NOT 'text' OR length(NEW.registration_ref) NOT BETWEEN 1 AND 256 OR substr(NEW.registration_ref,1,1) NOT GLOB '[A-Za-z0-9]' OR NEW.registration_ref GLOB '*[^A-Za-z0-9._:/-]*') OR (typeof(NEW.incarnation) IS NOT 'text' OR length(NEW.incarnation) NOT BETWEEN 1 AND 256 OR substr(NEW.incarnation,1,1) NOT GLOB '[A-Za-z0-9]' OR NEW.incarnation GLOB '*[^A-Za-z0-9._:/-]*') OR (typeof(NEW.affected_ref) IS NOT 'text' OR length(NEW.affected_ref) NOT BETWEEN 1 AND 256 OR substr(NEW.affected_ref,1,1) NOT GLOB '[A-Za-z0-9]' OR NEW.affected_ref GLOB '*[^A-Za-z0-9._:/-]*') BEGIN\n SELECT RAISE(ABORT,'constraint: enrollment reference');\nEND",
 };
 const RECEIVER_SCHEMA_DIGEST = FINANCIAL_RECEIVER_UNFENCED_SCHEMA_DIGEST;
+/** The exported C0 builders are SQL-free DATA compilers, so their write
+ * readiness is in-statement: unless both exact C0 money fences exist, the
+ * unconditional C0 receipt CHECK aborts the whole batch (one JSON bind). */
+const C0_FENCE_NAMES = [
+  "financial_preproof_challenges_money_fence",
+  "financial_preproof_challenge_receipts_money_fence",
+] as const;
+const C0_FENCES_JSON = JSON.stringify(
+  C0_FENCE_NAMES.map((name) => [
+    name,
+    name.slice(0, -"_money_fence".length),
+    FINANCIAL_0104_C0_FENCE_SCHEMA[name] ?? "",
+  ]),
+);
+const C0_FENCED = `(SELECT count(*) FROM main.sqlite_schema f JOIN json_each(?) e ON f.type='trigger'
+          AND f.name=json_extract(e.value,'$[0]') AND f.tbl_name=json_extract(e.value,'$[1]')
+          AND f.sql=json_extract(e.value,'$[2]'))=${C0_FENCE_NAMES.length}`;
 export const FINANCIAL_SOURCE_ENROLLMENT_SCHEMA = SCHEMA;
 export const FINANCIAL_SOURCE_ENROLLMENT_DDL = `${Object.values(SCHEMA).join(";\n")};\n`;
 
@@ -503,7 +520,7 @@ export function createFinancialPreproofChallengeStore(
       {
         sql: `INSERT INTO financial_preproof_challenge_receipts(receipt_ref,challenge_ref,preparation_ref,record_json,all_rows_match)
           VALUES(?,?,?,?,CASE WHEN changes()=1 AND EXISTS(SELECT 1 FROM financial_preproof_challenges
-          WHERE challenge_ref=? AND preparation_ref=? AND challenge_json=? AND scope_json=? AND record_json=?) AND (${c.current}) THEN 1 ELSE 0 END)`,
+          WHERE challenge_ref=? AND preparation_ref=? AND challenge_json=? AND scope_json=? AND record_json=?) AND (${c.current}) AND ${C0_FENCED} THEN 1 ELSE 0 END)`,
         params: [
           saved.receiptRef,
           saved.challenge.challengeRef,
@@ -515,6 +532,7 @@ export function createFinancialPreproofChallengeStore(
           scopeJson,
           recordJson,
           ...c.currentParams,
+          C0_FENCES_JSON,
         ],
       },
     ];

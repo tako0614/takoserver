@@ -100,15 +100,29 @@ export function inPermitFrame<T extends { readonly sql: string }>(
   ];
 }
 
+/** The four pre-existing R1 money fences (three R1 tables and the attempt leaf). */
+export const FINANCIAL_R1_MONEY_FENCE_NAMES = Object.freeze([
+  "financial_action_source_registrations_money_fence",
+  "financial_retained_r1_originals_money_fence",
+  "financial_retained_r1_receipts_money_fence",
+  "financial_r1_preparation_attempts_money_fence",
+]);
+
 /** Drops every installed Financial 0104 money fence, leaving the exact unfenced
- * candidate shape (with any rows already written) for refusal/recovery tests. */
-export function dropFinancial0104Fences(db: Database): void {
+ * candidate shape (with any rows already written) for refusal/recovery tests.
+ * The R1/attempt fences are kept unless `r1` asks for them too. */
+export function dropFinancial0104Fences(
+  db: Database,
+  options: { readonly r1?: boolean } = {},
+): void {
   const fences = db
     .query(
-      "SELECT name FROM sqlite_schema WHERE type='trigger' AND (name GLOB '*_money_fence' OR name GLOB '*_money_fence_update') AND name NOT IN ('financial_action_source_registrations_money_fence','financial_retained_r1_originals_money_fence','financial_retained_r1_receipts_money_fence','financial_r1_preparation_attempts_money_fence')",
+      "SELECT name FROM sqlite_schema WHERE type='trigger' AND (name GLOB '*_money_fence' OR name GLOB '*_money_fence_update')",
     )
     .all() as { name: string }[];
-  for (const { name } of fences) db.exec(`DROP TRIGGER ${name}`);
+  for (const { name } of fences)
+    if (options.r1 || !FINANCIAL_R1_MONEY_FENCE_NAMES.includes(name))
+      db.exec(`DROP TRIGGER ${name}`);
 }
 
 const FENCE_ROWS =
