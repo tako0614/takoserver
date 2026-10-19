@@ -42,6 +42,7 @@ import {
   createWorkerRequestConsumers,
   createWorkerRequestConsumersWithUnregisteredLocalIssuer,
   createWorkerRequestSql,
+  loadWorkerRequestRetainedRpFinancialIdentityProofOriginal,
   observeWorkerRequestAuthSchema,
   proveWorkerRequestRetainedRpFinancialIdentityOriginal,
   readWorkerRequestConsumers,
@@ -51,6 +52,7 @@ import {
   readWorkerRequestRetainedRpCapture,
   readWorkerRequestRetainedRpPrincipalBindingInputs,
   readWorkerRequestVerifiedLocalPrincipalIssuanceInputs,
+  verifyCurrentWorkerRequestRetainedRpFinancialIdentityProofOriginal,
   type WorkerRequestDatabase,
   type WorkerRequestSql,
   type WorkerSharedAuthStaging,
@@ -623,6 +625,7 @@ describe("official read-only Financial request origin", () => {
       "captureWorkerRequestRetainedDirectOwnerSession",
       "captureWorkerRequestRetainedRpSession",
       "financialAuthConsumerSourceCurrentness",
+      "loadWorkerRequestRetainedRpFinancialIdentityProofOriginal",
       "proveWorkerRequestRetainedRpFinancialIdentityOriginal",
       "readWorkerRequestFinancialAuthConsumerContext",
       "readWorkerRequestFinancialAuthConsumerPort",
@@ -630,6 +633,7 @@ describe("official read-only Financial request origin", () => {
       "readWorkerRequestRetainedCredentialInputs",
       "readWorkerRequestRetainedRpCapture",
       "readWorkerRequestRetainedRpPrincipalBindingInputs",
+      "verifyCurrentWorkerRequestRetainedRpFinancialIdentityProofOriginal",
     ]);
     expect(financialRequestOrigin.readWorkerRequestFinancialInputs).toBe(
       readWorkerRequestFinancialInputs,
@@ -1271,14 +1275,15 @@ describe("Worker original RP final-touch retained DATA", () => {
     if (typeof method === "function") {
       const pending = invoke(request, SESSION_TEST_ORGANIZATION.id)();
       expect(invoke(request, SESSION_TEST_ORGANIZATION.id)()).toBe(pending);
-      expect(() =>
-        proveWorkerRequestRetainedRpFinancialIdentityOriginal(
-          r.inputs.connection,
-          request,
-          SESSION_TEST_ORGANIZATION.id,
-          "different-challenge",
-          capture,
-        ),
+      expect(
+        () =>
+          void proveWorkerRequestRetainedRpFinancialIdentityOriginal(
+            r.inputs.connection,
+            request,
+            SESSION_TEST_ORGANIZATION.id,
+            "different-challenge",
+            capture,
+          ),
       ).toThrow();
       await expect(pending).rejects.toThrow();
     } else {
@@ -1286,6 +1291,67 @@ describe("Worker original RP final-touch retained DATA", () => {
         Promise.resolve().then(invoke(request, SESSION_TEST_ORGANIZATION.id)),
       ).rejects.toThrow();
     }
+    expect(r.f.sessions.map((session) => session.queries.length)).toEqual(before);
+  });
+
+  test("financial proof load/current follow this capture's own prove on one challenge", async () => {
+    const r = await retainedRpFixture();
+    const request = r.request();
+    const capture = await captureWorkerRequestRetainedRpSession(
+      r.inputs.connection,
+      request,
+      SESSION_TEST_ORGANIZATION.id,
+    );
+    if (!capture) throw new Error("missing actual retained RP capture");
+    expect(financialRequestOrigin.loadWorkerRequestRetainedRpFinancialIdentityProofOriginal).toBe(
+      loadWorkerRequestRetainedRpFinancialIdentityProofOriginal,
+    );
+    expect(
+      financialRequestOrigin.verifyCurrentWorkerRequestRetainedRpFinancialIdentityProofOriginal,
+    ).toBe(verifyCurrentWorkerRequestRetainedRpFinancialIdentityProofOriginal);
+    const before = r.f.sessions.map((session) => session.queries.length);
+    const call =
+      (
+        operation:
+          | typeof proveWorkerRequestRetainedRpFinancialIdentityOriginal
+          | typeof loadWorkerRequestRetainedRpFinancialIdentityProofOriginal
+          | typeof verifyCurrentWorkerRequestRetainedRpFinancialIdentityProofOriginal,
+        challengeRef = "synthetic:proof-challenge",
+        selectedRequest = request,
+      ) =>
+      () =>
+        operation(
+          r.inputs.connection,
+          selectedRequest,
+          SESSION_TEST_ORGANIZATION.id,
+          challengeRef,
+          capture,
+        );
+    const own = (name: string) =>
+      typeof Object.getOwnPropertyDescriptor(r.runtime.sharedAuth, name)?.value === "function";
+    const load = loadWorkerRequestRetainedRpFinancialIdentityProofOriginal;
+    const current = verifyCurrentWorkerRequestRetainedRpFinancialIdentityProofOriginal;
+    expect(own("proveFinalSessionFinancialIdentity")).toBe(true);
+    expect(own("loadFinalSessionFinancialIdentityProof")).toBe(true);
+    expect(own("verifyCurrentFinalSessionFinancialIdentityProof")).toBe(true);
+    // Neither operation may precede its own predecessor on this capture. Only
+    // synchronous refusals count here; a returned rejected promise is not one.
+    expect(() => void call(load)()).toThrow();
+    expect(() => void call(current)()).toThrow();
+    expect(() => void call(load, "synthetic:proof-challenge", r.request())()).toThrow();
+    const proved = call(proveWorkerRequestRetainedRpFinancialIdentityOriginal)();
+    await proved.catch(() => undefined);
+    expect(() => void call(load, "different-challenge")()).toThrow();
+    expect(() => void call(current)()).toThrow();
+    const loaded = call(load)();
+    expect(call(load)()).toBe(loaded);
+    expect(() => void call(load, "different-challenge")()).toThrow();
+    await loaded.catch(() => undefined);
+    expect(() => void call(current, "different-challenge")()).toThrow();
+    const verified = call(current)();
+    expect(call(current)()).toBe(verified);
+    expect(() => void call(current, "different-challenge")()).toThrow();
+    await verified.catch(() => undefined);
     expect(r.f.sessions.map((session) => session.queries.length)).toEqual(before);
   });
 

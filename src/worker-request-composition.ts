@@ -372,19 +372,30 @@ const retainedRpCaptures = new WeakMap<
     readonly data: WorkerRequestRetainedRpData;
   }
 >();
+// Each fixed operation names one own RP receiver method of the same shape.
+const retainedRpProofOperations = Object.freeze({
+  prove: "proveFinalSessionFinancialIdentity",
+  load: "loadFinalSessionFinancialIdentityProof",
+  current: "verifyCurrentFinalSessionFinancialIdentityProof",
+} as const);
+type RetainedRpProofOperation = keyof typeof retainedRpProofOperations;
+type RetainedRpProofMethod = (
+  selected: SharedAuthFinalSessionSelection,
+  challengeRef: string,
+) => Promise<unknown>;
 const retainedRpProofMethods = new WeakMap<
   WorkerRequestSql,
   {
     readonly receiver: SharedAuthSession;
-    readonly method:
-      | ((selected: SharedAuthFinalSessionSelection, challengeRef: string) => Promise<unknown>)
-      | null;
+    readonly methods: Readonly<Record<RetainedRpProofOperation, RetainedRpProofMethod | null>>;
   }
 >();
-const retainedRpProofAttempts = new WeakMap<
-  object,
-  { readonly challengeRef: string; readonly pending: Promise<unknown> }
->();
+const retainedRpProofAttempts: Readonly<
+  Record<
+    RetainedRpProofOperation,
+    WeakMap<object, { readonly challengeRef: string; readonly pending: Promise<unknown> }>
+  >
+> = Object.freeze({ prove: new WeakMap(), load: new WeakMap(), current: new WeakMap() });
 
 /** Calls only this request graph's existing RP observer; no DTO/callback can mint a capture. */
 export async function captureWorkerRequestRetainedRpSession(
@@ -561,8 +572,57 @@ export function proveWorkerRequestRetainedRpFinancialIdentityOriginal(
   challengeRef: string,
   capture: WorkerRequestRetainedRpCapture,
 ): Promise<unknown> {
+  return retainedRpProofOperation("prove", connection, request, workspaceId, challengeRef, capture);
+}
+
+/** Loads only the proof this capture's own prove attempt produced, on the same challenge;
+ * no proofRef argument exists. An unknown load is never resent.
+ */
+export function loadWorkerRequestRetainedRpFinancialIdentityProofOriginal(
+  connection: WorkerRequestSql,
+  request: Request,
+  workspaceId: string,
+  challengeRef: string,
+  capture: WorkerRequestRetainedRpCapture,
+): Promise<unknown> {
+  return retainedRpProofOperation("load", connection, request, workspaceId, challengeRef, capture);
+}
+
+/** Current verification follows this capture's own load on the same challenge; an
+ * unknown result is never resent and is not consent or NEW permission.
+ */
+export function verifyCurrentWorkerRequestRetainedRpFinancialIdentityProofOriginal(
+  connection: WorkerRequestSql,
+  request: Request,
+  workspaceId: string,
+  challengeRef: string,
+  capture: WorkerRequestRetainedRpCapture,
+): Promise<unknown> {
+  return retainedRpProofOperation(
+    "current",
+    connection,
+    request,
+    workspaceId,
+    challengeRef,
+    capture,
+  );
+}
+
+const retainedRpProofPredecessor: Readonly<
+  Record<RetainedRpProofOperation, RetainedRpProofOperation | null>
+> = Object.freeze({ prove: null, load: "prove", current: "load" });
+
+function retainedRpProofOperation(
+  operation: RetainedRpProofOperation,
+  connection: WorkerRequestSql,
+  request: Request,
+  workspaceId: string,
+  challengeRef: string,
+  capture: WorkerRequestRetainedRpCapture,
+): Promise<unknown> {
   const original = originalRetainedRpCapture(connection, capture);
   const proof = retainedRpProofMethods.get(connection);
+  const method = proof?.methods[operation];
   if (
     !original ||
     original.request !== request ||
@@ -571,27 +631,33 @@ export function proveWorkerRequestRetainedRpFinancialIdentityOriginal(
     challengeRef.length === 0 ||
     !proof ||
     proof.receiver !== original.receiver ||
-    !proof.method
+    !method
   )
     throw new TypeError("Worker retained RP proof origin unavailable");
-  const method = proof.method;
   const receiver = proof.receiver;
+  const name = retainedRpProofOperations[operation];
   const assertOriginal = () => {
     if (
       originalRetainedRpCapture(connection, capture) !== original ||
       retainedRpProofMethods.get(connection) !== proof ||
-      Object.getOwnPropertyDescriptor(receiver, "proveFinalSessionFinancialIdentity")?.value !==
-        method
+      Object.getOwnPropertyDescriptor(receiver, name)?.value !== method
     )
       throw new TypeError("Worker retained RP proof origin differs");
   };
   assertOriginal();
-  const prior = retainedRpProofAttempts.get(capture);
+  const attempts = retainedRpProofAttempts[operation];
+  const prior = attempts.get(capture);
   if (prior) {
     if (prior.challengeRef !== challengeRef)
       throw new TypeError("Worker retained RP proof challenge differs");
     return prior.pending;
   }
+  const predecessor = retainedRpProofPredecessor[operation];
+  if (
+    predecessor !== null &&
+    retainedRpProofAttempts[predecessor].get(capture)?.challengeRef !== challengeRef
+  )
+    throw new TypeError("Worker retained RP proof sequence differs");
   const pending = Promise.resolve().then(async () => {
     assertOriginal();
     try {
@@ -600,7 +666,7 @@ export function proveWorkerRequestRetainedRpFinancialIdentityOriginal(
       assertOriginal();
     }
   });
-  retainedRpProofAttempts.set(capture, Object.freeze({ challengeRef, pending }));
+  attempts.set(capture, Object.freeze({ challengeRef, pending }));
   return pending;
 }
 
@@ -1310,15 +1376,22 @@ function constructWorkerRequestConsumers(
     }),
   );
   fresh?.bindReceiver(sharedAuth);
-  const proofMethod = Object.getOwnPropertyDescriptor(
-    sharedAuth,
-    "proveFinalSessionFinancialIdentity",
-  );
-  if (proofMethod && ("get" in proofMethod || typeof proofMethod.value !== "function"))
-    throw new TypeError("Shared RP proof method origin differs");
+  const proofMethod = (name: string): RetainedRpProofMethod | null => {
+    const descriptor = Object.getOwnPropertyDescriptor(sharedAuth, name);
+    if (descriptor && ("get" in descriptor || typeof descriptor.value !== "function"))
+      throw new TypeError("Shared RP proof method origin differs");
+    return descriptor?.value ?? null;
+  };
   retainedRpProofMethods.set(
     options.connection,
-    Object.freeze({ receiver: sharedAuth, method: proofMethod?.value ?? null }),
+    Object.freeze({
+      receiver: sharedAuth,
+      methods: Object.freeze({
+        prove: proofMethod(retainedRpProofOperations.prove),
+        load: proofMethod(retainedRpProofOperations.load),
+        current: proofMethod(retainedRpProofOperations.current),
+      }),
+    }),
   );
   const consumers = Object.freeze({
     sql,

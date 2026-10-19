@@ -27,37 +27,68 @@ const originalFinancialProof: unknown =
   financialProofProperty !== undefined && "value" in financialProofProperty
     ? financialProofProperty.value
     : undefined;
-const originalFinancialProve: unknown =
-  originalFinancialProof !== null &&
-  (typeof originalFinancialProof === "object" || typeof originalFinancialProof === "function")
-    ? Reflect.get(originalFinancialProof, "prove")
-    : undefined;
 const originalFinancialProofPrototype =
   originalFinancialProof !== null &&
   (typeof originalFinancialProof === "object" || typeof originalFinancialProof === "function")
     ? Object.getPrototypeOf(originalFinancialProof)
     : undefined;
-const originalFinancialProveOwnDescriptor =
-  originalFinancialProof !== null &&
-  (typeof originalFinancialProof === "object" || typeof originalFinancialProof === "function")
-    ? Object.getOwnPropertyDescriptor(originalFinancialProof, "prove")
-    : undefined;
-const originalFinancialProvePrototypeDescriptor =
-  originalFinancialProofPrototype !== null &&
-  (typeof originalFinancialProofPrototype === "object" ||
-    typeof originalFinancialProofPrototype === "function")
-    ? Object.getOwnPropertyDescriptor(originalFinancialProofPrototype, "prove")
-    : undefined;
+
+type FinancialProofMethodName =
+  | "prove"
+  | "loadFinancialIdentityProof"
+  | "verifyCurrentFinancialIdentityProof";
+
 // Workerd RPC stubs can return a fresh callable on every property read. The
 // first callable remains the only one invoked; ordinary stable JS methods
 // retain exact identity checks, while native dynamic stubs require no shadow.
-const originalFinancialProveStable =
-  typeof originalFinancialProve === "function" &&
-  originalFinancialProof !== null &&
-  (typeof originalFinancialProof === "object" || typeof originalFinancialProof === "function") &&
-  Reflect.get(originalFinancialProof, "prove") === originalFinancialProve;
+function captureFinancialProofMethod(name: FinancialProofMethodName) {
+  const target =
+    originalFinancialProof !== null &&
+    (typeof originalFinancialProof === "object" || typeof originalFinancialProof === "function")
+      ? originalFinancialProof
+      : undefined;
+  const method: unknown = target === undefined ? undefined : Reflect.get(target, name);
+  const ownDescriptor =
+    target === undefined ? undefined : Object.getOwnPropertyDescriptor(target, name);
+  const prototypeDescriptor =
+    originalFinancialProofPrototype !== null &&
+    (typeof originalFinancialProofPrototype === "object" ||
+      typeof originalFinancialProofPrototype === "function")
+      ? Object.getOwnPropertyDescriptor(originalFinancialProofPrototype, name)
+      : undefined;
+  const stable =
+    typeof method === "function" && target !== undefined && Reflect.get(target, name) === method;
+  return Object.freeze({ name, method, ownDescriptor, prototypeDescriptor, stable });
+}
+type FinancialProofMethod = ReturnType<typeof captureFinancialProofMethod>;
 
-function assertOriginalFinancialProof(): void {
+// prove keeps its original import-time behaviour. A throwing load/current read
+// leaves that method absent instead of withdrawing prove from the native entry.
+function captureOptionalFinancialProofMethod(name: FinancialProofMethodName) {
+  try {
+    return captureFinancialProofMethod(name);
+  } catch {
+    return Object.freeze({
+      name,
+      method: undefined,
+      ownDescriptor: undefined,
+      prototypeDescriptor: undefined,
+      stable: false,
+    });
+  }
+}
+
+const originalFinancialProve = captureFinancialProofMethod("prove");
+const originalFinancialProofLoad = captureOptionalFinancialProofMethod(
+  "loadFinancialIdentityProof",
+);
+const originalFinancialProofCurrent = captureOptionalFinancialProofMethod(
+  "verifyCurrentFinancialIdentityProof",
+);
+
+function assertOriginalFinancialProof(
+  captured: FinancialProofMethod = originalFinancialProve,
+): void {
   const selected = Object.getOwnPropertyDescriptor(env, "ACCOUNTS_FINANCIAL_PROOF");
   if (
     originalFinancialProof === undefined ||
@@ -69,27 +100,31 @@ function assertOriginalFinancialProof(): void {
     selected.writable !== financialProofProperty?.writable ||
     originalFinancialProof === null ||
     (typeof originalFinancialProof !== "object" && typeof originalFinancialProof !== "function") ||
-    typeof originalFinancialProve !== "function" ||
+    typeof captured.method !== "function" ||
     Object.getPrototypeOf(originalFinancialProof) !== originalFinancialProofPrototype
   )
     throw new SqlError("unavailable", "Auth103 Accounts proof transport is unavailable");
-  const currentMethod = Reflect.get(originalFinancialProof, "prove");
-  if (originalFinancialProveStable) {
-    if (currentMethod !== originalFinancialProve)
+  const currentMethod = Reflect.get(originalFinancialProof, captured.name);
+  if (captured.stable) {
+    if (currentMethod !== captured.method)
       throw new SqlError("unavailable", "Auth103 Accounts proof transport is unavailable");
   } else if (
     typeof currentMethod !== "function" ||
-    originalFinancialProveOwnDescriptor !== undefined ||
-    Object.getOwnPropertyDescriptor(originalFinancialProof, "prove") !== undefined ||
+    captured.ownDescriptor !== undefined ||
+    Object.getOwnPropertyDescriptor(originalFinancialProof, captured.name) !== undefined ||
     originalFinancialProofPrototype === null ||
-    originalFinancialProvePrototypeDescriptor !== undefined ||
-    Object.getOwnPropertyDescriptor(originalFinancialProofPrototype, "prove") !== undefined
+    captured.prototypeDescriptor !== undefined ||
+    Object.getOwnPropertyDescriptor(originalFinancialProofPrototype, captured.name) !== undefined
   ) {
     throw new SqlError("unavailable", "Auth103 Accounts proof transport is unavailable");
   }
 }
 
-/** The native source alone can obtain this fixed RPC adapter; no raw binding leaves. */
+/** The native source alone can obtain this fixed RPC adapter; no raw binding leaves.
+ * Each method forwards its single caller input unchanged to the module-load callable.
+ * load/current are omitted when a plain binding lacked them at load; a Workerd RPC
+ * stub answers every name, so there they always appear and absence fails remotely.
+ */
 export function readAuth103NativeFinancialProofReceiver(
   connection: WorkerRequestSql,
   sourceCommit: string,
@@ -97,20 +132,34 @@ export function readAuth103NativeFinancialProofReceiver(
   assertAuth103NativePlatformOrigin(connection, sourceCommit);
   if (originalFinancialProof === undefined) return null;
   assertOriginalFinancialProof();
-  return Object.freeze({
-    async prove(input: { readonly accessToken: string; readonly challengeRef: string }) {
+  const invoke = async (captured: FinancialProofMethod, input: unknown): Promise<unknown> => {
+    assertAuth103NativePlatformOrigin(connection, sourceCommit);
+    assertOriginalFinancialProof(captured);
+    const method = captured.method;
+    if (typeof method !== "function")
+      throw new SqlError("unavailable", "Auth103 Accounts proof transport is unavailable");
+    try {
+      return await Reflect.apply(method, originalFinancialProof, [input]);
+    } finally {
       assertAuth103NativePlatformOrigin(connection, sourceCommit);
-      assertOriginalFinancialProof();
-      const method = originalFinancialProve;
-      if (typeof method !== "function")
-        throw new SqlError("unavailable", "Auth103 Accounts proof transport is unavailable");
-      try {
-        return await Reflect.apply(method, originalFinancialProof, [input]);
-      } finally {
-        assertAuth103NativePlatformOrigin(connection, sourceCommit);
-        assertOriginalFinancialProof();
-      }
-    },
+      assertOriginalFinancialProof(captured);
+    }
+  };
+  const proofReference = (captured: FinancialProofMethod) =>
+    typeof captured.method === "function"
+      ? (input: {
+          readonly v: 1;
+          readonly proofRef: string;
+          readonly challengeRef: string;
+        }): Promise<unknown> => invoke(captured, input)
+      : undefined;
+  const load = proofReference(originalFinancialProofLoad);
+  const current = proofReference(originalFinancialProofCurrent);
+  return Object.freeze({
+    prove: (input: { readonly accessToken: string; readonly challengeRef: string }) =>
+      invoke(originalFinancialProve, input),
+    ...(load === undefined ? {} : { loadFinancialIdentityProof: load }),
+    ...(current === undefined ? {} : { verifyCurrentFinancialIdentityProof: current }),
   });
 }
 

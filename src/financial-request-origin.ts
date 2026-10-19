@@ -25,9 +25,11 @@ export type {
 export {
   captureWorkerRequestRetainedDirectOwnerSession,
   captureWorkerRequestRetainedRpSession,
+  loadWorkerRequestRetainedRpFinancialIdentityProofOriginal,
   proveWorkerRequestRetainedRpFinancialIdentityOriginal,
   readWorkerRequestFinancialInputs,
   readWorkerRequestRetainedCredentialInputs,
   readWorkerRequestRetainedRpCapture,
   readWorkerRequestRetainedRpPrincipalBindingInputs,
+  verifyCurrentWorkerRequestRetainedRpFinancialIdentityProofOriginal,
 } from "./worker-request-composition.ts";
