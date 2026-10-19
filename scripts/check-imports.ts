@@ -665,6 +665,19 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain", "adapter", "app"],
   },
   {
+    // Exact Financial 0104 money-fence DDL and the static fenced-batch refusal.
+    name: "domain",
+    match: /^src\/financial-0104-money-fence\.ts$/u,
+    may: ["core", "domain"],
+  },
+  {
+    // Financial 0104 source recipe DATA over existing Financial schema leaves.
+    // It registers or applies nothing; Root owns the canonical inventory.
+    name: "app",
+    match: /^src\/financial-0104-source-contract\.ts$/u,
+    may: ["core", "domain", "app"],
+  },
+  {
     // Consent codecs and the unregistered history leaf use portable domain ports.
     name: "domain",
     match: /^src\/shared-auth-financial-consent-(?:contract|schema-plan)\.ts$/u,

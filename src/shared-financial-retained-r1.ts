@@ -161,6 +161,8 @@ const R1_FENCE_DDL = Object.freeze({
   financial_retained_r1_receipts_money_fence:
     "CREATE TRIGGER financial_retained_r1_receipts_money_fence BEFORE INSERT ON financial_retained_r1_receipts\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_retained_r1_originals o\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE o.r1_ref IS NEW.r1_ref AND o.challenge_ref IS NEW.challenge_ref\n AND o.preparation_ref IS NEW.preparation_ref AND o.receipt_ref IS NEW.receipt_ref\n AND o.command_json IS NEW.command_json AND o.original_digest IS NEW.original_digest\n AND p.writer_epoch IS json_extract(o.scope_json,'$.writerEpoch')\n AND p.writer_epoch IS json_extract(o.original_json,'$.scopeRealm.writerEpoch')) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial R1 receipt permit/epoch required');\nEND",
 } as const);
+/** The same exact rows, read by the Financial 0104 source recipe. */
+export const FINANCIAL_R1_FENCE_SCHEMA: Readonly<Record<string, string>> = R1_FENCE_DDL;
 
 export class FinancialRetainedR1Error extends Error {
   constructor(
