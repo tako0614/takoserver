@@ -36,6 +36,8 @@ import {
   preflightError,
   verificationError,
 } from "./errors.ts";
+import { readFinancial0104CanonicalMigrationSource } from "./financial0104-canonical-source.ts";
+import { financial0104SourceSchemaReady } from "./financial0104-schema-shape.ts";
 import {
   assertFreshV2DataReadback,
   type FreshV2D1Lineage,
@@ -78,7 +80,6 @@ import {
   readSealedFreshV2ArtifactMigrationArtifact,
   type SchemaReader,
 } from "./schema.ts";
-import { auth103SourceSchemaReady } from "./schema-auth103-native-source.ts";
 import {
   type MoneySchemaPhase,
   moneyUnitCutoverExpectedShape,
@@ -842,10 +843,13 @@ async function verifyGeneratedStorageTarget(
     ) {
       const sourceRoot = resolve(migrationDirectory, "..");
       const complete = readMigrationArtifact(migrationDirectory);
-      const canonical = readAuth103CanonicalMigrationSource(sourceRoot);
+      const canonical =
+        migrationState.applied.length === 104
+          ? readFinancial0104CanonicalMigrationSource(sourceRoot)
+          : readAuth103CanonicalMigrationSource(sourceRoot);
       try {
         if (
-          auth103SourceSchemaReady(
+          financial0104SourceSchemaReady(
             {
               local: complete.names,
               applied: migrationState.applied,

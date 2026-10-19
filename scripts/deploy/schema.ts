@@ -33,6 +33,7 @@ import {
   preflightError,
   verificationError,
 } from "./errors.ts";
+import { isFinancial0104RecipeFile } from "./financial0104-recipe.ts";
 import type {
   CanonicalV20092IntegrationStorageIdentityProof,
   IntegrationStorageTargetReadProvider,
@@ -3259,7 +3260,8 @@ export function readAuditedMigrationSourcePrefix100(
 
 /** Existing consumers retain their exact audited100 projection. The ONLY
  * supported source extension is machine-equal to the fixed Root101/102/103
- * recipes; neither ordinary apply nor a fresh payload inherits that suffix. */
+ * recipes, optionally followed by the exact Root-registered Financial0104
+ * recipe; neither ordinary apply nor a fresh payload inherits that suffix. */
 export function readCurrentAuditedMigrationSourceArtifact(
   directory: string = resolve(REPOSITORY, "migrations"),
 ): ReturnType<typeof readMigrationArtifact> {
@@ -3271,8 +3273,9 @@ export function readCurrentAuditedMigrationSourceArtifact(
   const original = readAuditedMigrationSourcePrefix100(directory);
   const owner = createAuth103CanonicalSourceArtifacts(resolve(directory, ".."));
   if (
-    artifact.files.length !== 103 ||
-    artifact.files.slice(100).some((file, index) => {
+    (artifact.files.length !== 103 && artifact.files.length !== 104) ||
+    (artifact.files.length === 104 && !isFinancial0104RecipeFile(artifact.files[103])) ||
+    artifact.files.slice(100, 103).some((file, index) => {
       const expected = owner.files[index];
       return (
         expected === undefined ||
@@ -3282,7 +3285,9 @@ export function readCurrentAuditedMigrationSourceArtifact(
       );
     })
   )
-    throw preflightError("audited source extension must be exactly the owning101/102/103 recipes");
+    throw preflightError(
+      "audited source extension must be exactly the owning101/102/103 recipes or their Root-registered Financial0104 successor",
+    );
   return original;
 }
 

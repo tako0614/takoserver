@@ -489,6 +489,9 @@ export function auth103SourceSchemaReady(
     const source = readAuth103CanonicalMigrationSource(sourceRoot);
     try {
       if (JSON.stringify(input.local) !== JSON.stringify(source.physicalNames)) return false;
+      // A physical Financial0104 successor leaves 0104 pending for a normal
+      // Host; only the separate Financial0104 readiness accepts its exact104.
+      if (mode === "normal" && source.physicalNames.length === 104) return false;
       const count = input.applied.length;
       if (
         (count !== 100 && count !== 103) ||
@@ -519,14 +522,14 @@ export function auth103SourceSchemaReady(
   }
 }
 
-function ledgerPredicate(names: readonly string[]): string {
+export function ledgerPredicate(names: readonly string[]): string {
   return `(SELECT json_group_array(name) FROM (SELECT name FROM main.d1_migrations ORDER BY id))
     IS ${sqlLiteral(JSON.stringify(names))}
     AND NOT EXISTS (SELECT 1 FROM main.sqlite_schema
       WHERE tbl_name='d1_migrations' AND type<>'table' AND name NOT GLOB 'sqlite_*')`;
 }
 
-function originalShapePredicate(expectedShape: string): string {
+export function originalShapePredicate(expectedShape: string): string {
   return `NOT EXISTS (
     WITH expected AS MATERIALIZED (SELECT value FROM json_each(${sqlLiteral(expectedShape)})),
     actual AS MATERIALIZED (SELECT type,name,tbl_name,COALESCE(sql,'') AS sql FROM main.sqlite_schema
@@ -542,7 +545,7 @@ function originalShapePredicate(expectedShape: string): string {
   )`;
 }
 
-function boundPredicate(sql: string, values: readonly string[]): string {
+export function boundPredicate(sql: string, values: readonly string[]): string {
   let index = 0;
   const output = sql.replaceAll("?", () => {
     const value = values[index++];

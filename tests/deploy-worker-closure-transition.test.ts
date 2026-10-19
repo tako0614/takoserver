@@ -6,6 +6,8 @@ import { join, resolve } from "node:path";
 import { deriveExpectedApplicationShape } from "../scripts/deploy/application-schema-shape.ts";
 import { readAuth103CanonicalMigrationSource } from "../scripts/deploy/auth103-canonical-migration-source.ts";
 import { DeployError } from "../scripts/deploy/errors.ts";
+import { readFinancial0104CanonicalMigrationSource } from "../scripts/deploy/financial0104-canonical-source.ts";
+import { compileFinancial0104ImportShapes } from "../scripts/deploy/financial0104-schema-shape.ts";
 import { readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import { expectedWorkerSecrets, writeWorkerConfig } from "../scripts/deploy/realized-config.ts";
@@ -600,6 +602,43 @@ describe("reviewed Worker closure transition", () => {
       }),
     ).toThrow();
   });
+
+  test("projects only the exact Root104 Financial successor of installed Auth103", () => {
+    const source = readFinancial0104CanonicalMigrationSource(resolve(import.meta.dir, ".."));
+    try {
+      const shape = compileFinancial0104ImportShapes(
+        source.auth103,
+        source.artifact,
+        "ordinary",
+      ).postShape;
+      const exact104 = {
+        local: source.physicalNames,
+        applied: source.artifact.names,
+        shape,
+        shapeDigest: `sha256:${createHash("sha256").update(shape).digest("hex")}`,
+      };
+      expect(workerSelectedPendingMigrations(v2Target, exact104)).toEqual([]);
+      expect(workerSchemaAllowsPending(v2Target, exact104)).toBe(true);
+      // An exact104 ledger over the post103 shape, or a forged 0104, is refused.
+      expect(
+        workerSchemaAllowsPending(v2Target, { ...currentAuth103State, applied: exact104.applied }),
+      ).toBe(false);
+      expect(() =>
+        workerSelectedPendingMigrations(v2Target, {
+          ...exact104,
+          applied: [...currentAuth103State.applied, "0104_foreign.sql"],
+        }),
+      ).toThrow();
+      expect(() =>
+        workerSelectedPendingMigrations(v2Target, {
+          ...exact104,
+          local: [...exact104.local, "0101_foreign.sql"],
+        }),
+      ).toThrow();
+    } finally {
+      source.dispose();
+    }
+  }, 30_000);
 
   test("v2 startup refuses either lone delta before any provider or upload", async () => {
     const base = { retiredVars: [], refreshedVars: [], addedBindings: [], rotatedSecrets: [] };

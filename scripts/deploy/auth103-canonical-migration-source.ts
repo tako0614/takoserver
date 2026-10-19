@@ -6,6 +6,7 @@ import { AUTH103_NATIVE_MIGRATIONS } from "../../src/auth103-native-source-contr
 import { canonicalJson } from "../../src/json.ts";
 import { createAuth103CanonicalSourceArtifacts } from "./auth103-canonical-recipes.ts";
 import { preflightError } from "./errors.ts";
+import { isFinancial0104RecipeFile } from "./financial0104-recipe.ts";
 import { type MigrationArtifact, readMigrationArtifact } from "./migrations.ts";
 import { readAuditedMigrationSourcePrefix100 } from "./schema.ts";
 
@@ -22,7 +23,8 @@ const immutableArtifact = (value: MigrationArtifact): MigrationArtifact =>
 /**
  * Materializes one source-owned 103 candidate from immutable audited100 bytes
  * and the existing Auth/Container/Worker recipe owner. A physical checkout may
- * contain 100 or the exact owner103 files, but neither path supplies foreign
+ * contain 100, the exact owner103 files or those plus the exact Root-registered
+ * Financial0104 recipe, but no path supplies foreign
  * successor SQL or treats scratch as native dispatch/history authority.
  */
 export function readAuth103CanonicalMigrationSource(sourceRoot: string, scratchBase = tmpdir()) {
@@ -33,14 +35,19 @@ export function readAuth103CanonicalMigrationSource(sourceRoot: string, scratchB
   const assertPhysical = () => {
     const current = readMigrationArtifact(directory);
     if (
-      (current.files.length !== 100 && current.files.length !== 103) ||
+      (current.files.length !== 100 &&
+        current.files.length !== 103 &&
+        current.files.length !== 104) ||
       current.digest !== physical.digest ||
       readAuditedMigrationSourcePrefix100(directory).digest !== prefix.digest ||
-      JSON.stringify(current.names.slice(100)) !==
-        JSON.stringify(current.files.length === 100 ? [] : AUTH103_NATIVE_MIGRATIONS)
+      JSON.stringify(current.names.slice(100, 103)) !==
+        JSON.stringify(current.files.length === 100 ? [] : AUTH103_NATIVE_MIGRATIONS) ||
+      (current.files.length === 104 && !isFinancial0104RecipeFile(current.files[103]))
     )
       throw preflightError("Auth103 audited source inventory changed or has a foreign successor");
-    for (const [index, file] of current.files.slice(100).entries()) {
+    // A physical 104th file is only the exact Root-registered Financial recipe;
+    // it never enters this Auth103 artifact, digest or receipt.
+    for (const [index, file] of current.files.slice(100, 103).entries()) {
       const expected = recipes.files[index];
       if (
         expected === undefined ||

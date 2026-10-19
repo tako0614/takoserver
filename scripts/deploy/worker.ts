@@ -21,6 +21,10 @@ import {
   verificationError,
 } from "./errors.ts";
 import {
+  financial0104LedgerApplied,
+  financial0104SourceSchemaReady,
+} from "./financial0104-schema-shape.ts";
+import {
   type FreshV2IntegrationStorageTargetProof,
   type IntegrationStorageGenerationTargetVerificationOptions,
   verifyFreshV2IntegrationStorageTarget,
@@ -52,7 +56,6 @@ import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualif
 import { writeWorkerConfig } from "./realized-config.ts";
 import { runAuthorityTransition } from "./retirement.ts";
 import { readCurrentAuditedMigrationSourceArtifact } from "./schema.ts";
-import { auth103SourceSchemaReady } from "./schema-auth103-native-source.ts";
 import { moneyUnitCutoverSchemaMatches } from "./schema-money-unit-cutover.ts";
 import {
   activePublicJwk,
@@ -251,7 +254,7 @@ export function workerSchemaAllowsPending(
       target.environment === "integration" &&
       target.artifactBlobIoMode === undefined &&
       (target.moneyCutoverWriterPolicy === undefined || moneyPreserved) &&
-      auth103SourceSchemaReady(
+      financial0104SourceSchemaReady(
         migrations,
         sourceRepositoryRoot,
         "maintenance",
@@ -264,9 +267,11 @@ export function workerSchemaAllowsPending(
     target.artifactBlobIoMode === undefined &&
     target.environment === "integration" &&
     target.moneyCutoverWriterPolicy === undefined &&
-    (migrations.local.length === 100 || migrations.local.length === 103)
+    (migrations.local.length === 100 ||
+      migrations.local.length === 103 ||
+      migrations.local.length === 104)
   ) {
-    return auth103SourceSchemaReady(migrations, sourceRepositoryRoot, "normal");
+    return financial0104SourceSchemaReady(migrations, sourceRepositoryRoot, "normal");
   }
   if (target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced") {
     if (
@@ -422,6 +427,16 @@ export function workerSelectedPendingMigrations(
       source.dispose();
     }
   }
+  // The separate Root-registered Financial0104 successor of that same exact103.
+  if (
+    migrations.applied.length === 104 &&
+    target.environment === "integration" &&
+    target.artifactBlobIoMode === undefined &&
+    (target.schemaMaintenanceMode === undefined ||
+      target.schemaMaintenanceMode === "pre-auth103-quiesced") &&
+    financial0104LedgerApplied(migrations.local, migrations.applied, sourceRepositoryRoot)
+  )
+    return [];
   return pendingMigrations(migrations.local, migrations.applied);
 }
 
@@ -439,9 +454,12 @@ export function workerMoneyUnitSchemaReady(
   }
   if (
     migrations.local.length === 103 ||
-    (migrations.local.length === 100 && migrations.applied.length === 103)
+    migrations.local.length === 104 ||
+    (migrations.local.length === 100 && migrations.applied.length === 103) ||
+    ((migrations.local.length === 100 || migrations.local.length === 103) &&
+      migrations.applied.length === 104)
   ) {
-    return auth103SourceSchemaReady(migrations, sourceRepositoryRoot, "normal");
+    return financial0104SourceSchemaReady(migrations, sourceRepositoryRoot, "normal");
   }
   const source = readCurrentAuditedMigrationSourceArtifact(
     resolve(sourceRepositoryRoot, "migrations"),

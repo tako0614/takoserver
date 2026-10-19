@@ -1582,6 +1582,10 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/schema.ts",
         "scripts/deploy/schema-auth103-native-source.ts",
         "scripts/deploy/auth103-native-source.ts",
+        "scripts/deploy/schema-financial0104-source.ts",
+        "scripts/deploy/financial0104-canonical-source.ts",
+        "scripts/deploy/financial0104-recipe.ts",
+        "scripts/deploy/financial0104-schema-shape.ts",
         "scripts/deploy/schema-money-unit-cutover.ts",
         "scripts/deploy/schema-money-unit-owner.ts",
         "scripts/deploy/schema-0058-proof.ts",
@@ -1614,6 +1618,11 @@ export const DEPLOY_CONTRACT = {
           "owned103 catalog/source/Clock in the same transaction. The ordinary audited100 projection, " +
           "Money suffix, fresh payloads and previous apply ceilings are unchanged. No registration " +
           "alone qualifies a request, credential, distinct user or Financial admission. " +
+          "Separate integration-only 0104 selection appends only the exact Root-pinned Financial0104 " +
+          "recipe after the unchanged Auth103 artifact, whose digest and receipts stay identical. Its " +
+          "one guarded import requires the exact103 ledger, current Auth103 registration/catalog and " +
+          "exact post103 shape (Money-preserved only after the post103 thaw) and must end at the exact104 " +
+          "ledger, post104 shape and Financial catalog; dispatch is recorded once and never replayed. " +
           "Optional fresh-origin input: TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH " +
           "selects the existing protected custody locator reader only for integration 0093/0094. " +
           "The same money declaration then requires originalOrigin with the original exact six-field " +

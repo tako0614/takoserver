@@ -6,6 +6,8 @@ import { join, resolve } from "node:path";
 import { deriveExpectedApplicationShape } from "../scripts/deploy/application-schema-shape.ts";
 import { readAuth103CanonicalMigrationSource } from "../scripts/deploy/auth103-canonical-migration-source.ts";
 import { DeployError } from "../scripts/deploy/errors.ts";
+import { readFinancial0104CanonicalMigrationSource } from "../scripts/deploy/financial0104-canonical-source.ts";
+import { compileFinancial0104ImportShapes } from "../scripts/deploy/financial0104-schema-shape.ts";
 import { readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import { expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
@@ -23,6 +25,7 @@ import {
   type WorkerProcess,
   type WorkerState,
   workerSchemaAllowsPending,
+  workerSelectedPendingMigrations,
 } from "../scripts/deploy/worker.ts";
 import {
   authorityImplementationClosure,
@@ -1268,6 +1271,50 @@ describe("split Takoserver Worker surfaces", () => {
     // Without an explicit lineage the historical rule still refuses any pending tail.
     expect(workerSchemaAllowsPending(v2Target, at(88))).toBe(false);
   });
+
+  test("the separate Root104 Financial successor of exact103 is recognized only exactly", () => {
+    const source = readFinancial0104CanonicalMigrationSource(resolve(import.meta.dir, ".."));
+    try {
+      const shape = compileFinancial0104ImportShapes(
+        source.auth103,
+        source.artifact,
+        "ordinary",
+      ).postShape;
+      const exact104 = {
+        local: canonicalMigrations,
+        applied: source.artifact.names,
+        shape,
+        shapeDigest: `sha256:${createHash("sha256").update(shape).digest("hex")}`,
+      };
+      for (const selected of [target, v2Target]) {
+        expect(workerSchemaAllowsPending(selected, exact104)).toBe(true);
+        expect(workerSelectedPendingMigrations(selected, exact104)).toEqual([]);
+        // The unchanged Auth103 state remains independently accepted.
+        expect(
+          workerSchemaAllowsPending(selected, {
+            local: canonicalMigrations,
+            ...currentAuth103State,
+          }),
+        ).toBe(true);
+      }
+      const foreign = {
+        ...exact104,
+        applied: [...source.artifact.names.slice(0, 103), "0104_foreign.sql"],
+      };
+      expect(workerSchemaAllowsPending(target, foreign)).toBe(false);
+      expect(() => workerSelectedPendingMigrations(target, foreign)).toThrow();
+      expect(
+        workerSchemaAllowsPending(target, {
+          ...exact104,
+          ...currentAuth103State,
+          applied: exact104.applied,
+        }),
+      ).toBe(false);
+      expect(workerSchemaAllowsPending(schemaMaintenanceTarget, exact104)).toBe(false);
+    } finally {
+      source.dispose();
+    }
+  }, 30_000);
 
   test("v2 0088 maintenance probe requires the distinct current-mode response", async () => {
     const response = Response.json(
