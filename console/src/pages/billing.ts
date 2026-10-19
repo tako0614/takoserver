@@ -1,13 +1,14 @@
 import {
   formatMicrosCurrency,
   formatUsagePercent,
+  type HostedPlanTable,
   type HostedSubscriptionProjection,
   type LedgerEntry,
   type OrganizationSubscription,
 } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
 import { consoleLocale, tr } from "../i18n.ts";
-import { type Resource, resource, signal } from "../reactive.ts";
+import { effect, type Resource, resource, signal } from "../reactive.ts";
 import { api, currentOrganization, principal } from "../state.ts";
 import {
   browserSubscriptionCancelIntentLock,
@@ -23,6 +24,8 @@ import {
   createSubscriptionIntentStore,
 } from "../subscription-intent.ts";
 import { subscriptionPlanOptions } from "../subscription-plan-options.ts";
+import { createTopUpCheckoutController, type TopUpCheckoutState } from "../top-up-checkout.ts";
+import { browserTopUpIntentLock, createTopUpIntentStore } from "../top-up-intent.ts";
 import {
   badge,
   card,
@@ -65,18 +68,41 @@ export function billingPage(organizationId: string): Child {
       who && organization?.id === organizationId && who.id === organization.ownerPrincipalId,
     );
   };
+  const ownerScope = () => {
+    const who = principal();
+    const organization = currentOrganization();
+    if (!who || !organization) return null;
+    return {
+      organizationId: organization.id,
+      principalId: who.id,
+      ownerPrincipalId: organization.ownerPrincipalId,
+    };
+  };
+  const browserLocation = {
+    readLocation: () => ({
+      pathname: window.location.pathname,
+      search: window.location.search,
+      hash: window.location.hash,
+    }),
+    replaceLocation: (url: string) => window.history.replaceState({}, "", url),
+    assign: (url: string) => window.location.assign(url),
+  };
+  /**
+   * Which top-up lane this deployment runs, read from the same answer that
+   * draws the subscription card: a Host that serves the hosted plan table
+   * requires a durable reference, and one that has no subscription route is a
+   * legacy self-host wallet. Until that answer arrives, neither is assumed.
+   */
+  const billingMode = (): "hosted" | "legacy" | null => {
+    const loaded = hostedSubscription.get();
+    if (loaded.state === "ready") return "hosted";
+    if (loaded.state === "error" && (loaded.error as { code?: string }).code === "not_found")
+      return "legacy";
+    return null;
+  };
   const checkout = createSubscriptionCheckoutController({
     organizationId,
-    getScope: () => {
-      const who = principal();
-      const organization = currentOrganization();
-      if (!who || !organization) return null;
-      return {
-        organizationId: organization.id,
-        principalId: who.id,
-        ownerPrincipalId: organization.ownerPrincipalId,
-      };
-    },
+    getScope: ownerScope,
     intents: createSubscriptionIntentStore({
       storage: {
         getItem: (key) => window.localStorage.getItem(key),
@@ -87,16 +113,24 @@ export function billingPage(organizationId: string): Child {
       lock: browserSubscriptionIntentLock(),
     }),
     api,
-    browser: {
-      readLocation: () => ({
-        pathname: window.location.pathname,
-        search: window.location.search,
-        hash: window.location.hash,
-      }),
-      replaceLocation: (url) => window.history.replaceState({}, "", url),
-      assign: (url) => window.location.assign(url),
-    },
+    browser: browserLocation,
     onSubscriptionRefresh: reloadSubscription,
+  });
+  const topUp = createTopUpCheckoutController({
+    organizationId,
+    getScope: ownerScope,
+    intents: createTopUpIntentStore({
+      storage: {
+        getItem: (key) => window.localStorage.getItem(key),
+        setItem: (key, value) => window.localStorage.setItem(key, value),
+        removeItem: (key) => window.localStorage.removeItem(key),
+      },
+      uuid: () => crypto.randomUUID(),
+      lock: browserTopUpIntentLock(),
+    }),
+    api,
+    browser: browserLocation,
+    onWalletRefresh: reloadWallet,
   });
   const cancellationIntents = createSubscriptionCancelIntentStore({
     storage: {
@@ -143,11 +177,40 @@ export function billingPage(organizationId: string): Child {
     return controller;
   };
   if (ownerCanManage()) void checkout.handleReturn();
-  // A payment that just completed comes back through the URL. It is settled
-  // before anything renders, so the balance a person sees already includes
-  // what they just paid — otherwise the first thing the console does after
-  // taking money is show the old number.
-  settleReturn(organizationId, reloadWallet);
+  // A payment that just completed comes back through the URL, and it is
+  // answered as soon as the lane is known, so the balance a person sees
+  // includes what they just paid. A hosted return only reads the receipt of
+  // its stored reference; only a legacy return exchanges the session itself.
+  let returnRouted = false;
+  const stopReturnRouting = effect(() => {
+    const mode = billingMode();
+    if (returnRouted || mode === null) return;
+    returnRouted = true;
+    queueMicrotask(() => {
+      stopReturnRouting();
+      if (mode === "legacy") settleReturn(organizationId, reloadWallet);
+      else void topUp.handleReturn().then(() => topUp.handleConsentReturn());
+    });
+  });
+  const openAddFunds = (): void => {
+    const mode = billingMode();
+    if (mode === "legacy") {
+      addFunds(organizationId, reloadWallet);
+      return;
+    }
+    const loaded = hostedSubscription.get();
+    if (mode === "hosted" && loaded.state === "ready") {
+      hostedAddFunds(topUp, topUpBounds(loaded.value.planTable));
+      return;
+    }
+    toast(
+      tr(
+        "支払い方法を確認できません。状態を更新してから再試行してください。",
+        "This deployment's payment method could not be confirmed. Refresh and try again.",
+      ),
+      "bad",
+    );
+  };
 
   return h(
     "div",
@@ -173,12 +236,13 @@ export function billingPage(organizationId: string): Child {
         {
           class: "btn btn--primary",
           type: "button",
-          onClick: () => addFunds(organizationId, reloadWallet),
+          onClick: openAddFunds,
         },
         icon(ICON.plus, 14),
         text(tr("残高を追加", "Add funds")),
       ),
     ),
+    live(() => (billingMode() === "hosted" ? topUpStatus(topUp) : null)),
     hostedSubscriptionCard(hostedSubscription, checkout, ownerCanManage, cancellationFor),
     live(() =>
       whenReady(
@@ -373,6 +437,231 @@ function addFunds(organizationId: string, reload: () => void): void {
       }
     },
   });
+}
+
+/** Current bounds for a new hosted top-up, from the Host-authored plan table. */
+function topUpBounds(
+  table: HostedPlanTable,
+): { readonly minimumMinor: number; readonly maximumMinor: number } | null {
+  for (const plan of table.plans)
+    if (plan.tier === "usage")
+      return { minimumMinor: plan.checkoutMinimumMinor, maximumMinor: plan.checkoutMaximumMinor };
+  return null;
+}
+
+function money(amountMinor: number): string {
+  return formatMicrosCurrency((BigInt(amountMinor) * 10_000n).toString(), "USD", uiLocale());
+}
+
+/**
+ * Adding money on a hosted Host.
+ *
+ * Each payment is one durable reference held in this browser until the server
+ * reports it paid or expired, so a retry, a cancelled Checkout or a lost
+ * response resumes the same payment instead of starting a second one. A
+ * different amount is not sent while an earlier payment is unresolved.
+ */
+function hostedAddFunds(
+  topUp: ReturnType<typeof createTopUpCheckoutController>,
+  bounds: { readonly minimumMinor: number; readonly maximumMinor: number } | null,
+): void {
+  const state = topUp.state();
+  const pending =
+    state.status === "unresolved" || state.status === "amount_conflict" ? state.amountMinor : null;
+  const amount = h("input", {
+    class: "input",
+    type: "number",
+    value: String(pending === null ? 50 : pending / 100),
+    min: String((bounds?.minimumMinor ?? 500) / 100),
+    step: "1",
+  });
+
+  openModal({
+    title: tr("残高を追加", "Add funds"),
+    confirmLabel: tr("支払いへ進む", "Continue to payment"),
+    confirmBlocked: () => ["busy", "redirecting"].includes(topUp.state().status),
+    body: h(
+      "div",
+      { style: { display: "grid", gap: "14px" } },
+      h(
+        "div",
+        { class: "field" },
+        h("label", null, tr("金額（USD）", "Amount (USD)")),
+        amount,
+        h(
+          "small",
+          null,
+          bounds
+            ? tr(
+                `${money(bounds.minimumMinor)}〜${money(bounds.maximumMinor)}。一度だけ決済し、支払い確定後に残高へ反映されます。`,
+                `${money(bounds.minimumMinor)}–${money(bounds.maximumMinor)}. Charged once; the balance is credited when the payment settles.`,
+              )
+            : tr(
+                "一度だけ決済します。支払い確定後に残高へ反映されます。",
+                "Charged once. The balance is credited when the payment settles.",
+              ),
+        ),
+      ),
+      live(() => {
+        const current = topUp.state();
+        if (current.status === "amount_conflict" || current.status === "unresolved")
+          return h(
+            "div",
+            { class: "notice notice--warn", role: "status" },
+            icon(ICON.alert, 15),
+            h(
+              "div",
+              { style: { display: "grid", gap: "8px", justifyItems: "start" } },
+              h(
+                "span",
+                null,
+                tr(
+                  `前回の支払い（${money(current.amountMinor)}）が完了していません。別の金額にする前に、前回の支払いを再開してください。`,
+                  `An earlier payment of ${money(current.amountMinor)} is not finished. Resume it before choosing a different amount.`,
+                ),
+              ),
+              h(
+                "button",
+                {
+                  class: "btn",
+                  type: "button",
+                  onClick: () => void topUp.start(current.amountMinor),
+                },
+                tr(
+                  `前回の支払い（${money(current.amountMinor)}）を再開`,
+                  `Resume the ${money(current.amountMinor)} payment`,
+                ),
+              ),
+            ),
+          );
+        return topUpMessage(current);
+      }),
+    ),
+    onConfirm: async () => {
+      const dollars = Number(amount.value);
+      const amountMinor = Math.round(dollars * 100);
+      const minimumMinor = bounds?.minimumMinor ?? 500;
+      if (
+        !Number.isFinite(dollars) ||
+        amountMinor < minimumMinor ||
+        (bounds !== null && amountMinor > bounds.maximumMinor)
+      ) {
+        toast(
+          bounds
+            ? tr(
+                `${money(bounds.minimumMinor)}〜${money(bounds.maximumMinor)}の金額を入力してください`,
+                `Enter an amount from ${money(bounds.minimumMinor)} to ${money(bounds.maximumMinor)}`,
+              )
+            : tr("5ドル以上の金額を入力してください", "Enter an amount of at least $5"),
+          "bad",
+        );
+        return;
+      }
+      await topUp.start(amountMinor);
+    },
+  });
+}
+
+/** What the page says about a hosted top-up outside the modal: returns and resumes. */
+function topUpStatus(topUp: ReturnType<typeof createTopUpCheckoutController>): HTMLElement | null {
+  const state = topUp.state();
+  if (state.status === "ready")
+    return h(
+      "div",
+      { class: "notice", role: "status", "aria-live": "polite" },
+      icon(ICON.alert, 15),
+      h(
+        "div",
+        { style: { display: "grid", gap: "8px", justifyItems: "start" } },
+        h(
+          "span",
+          null,
+          tr(
+            "支払いはまだ完了していません。同じ支払い画面で続けられます。",
+            "The payment is not finished yet. You can continue on the same Checkout.",
+          ),
+        ),
+        h(
+          "button",
+          { class: "btn", type: "button", onClick: () => topUp.continueCheckout() },
+          tr("支払いを続ける", "Continue payment"),
+        ),
+      ),
+    );
+  if (state.status === "unresolved")
+    return h(
+      "p",
+      { class: "notice", role: "status" },
+      tr(
+        `前回の支払い（${money(state.amountMinor)}）が完了していません。「残高を追加」から再開できます。`,
+        `An earlier payment of ${money(state.amountMinor)} is not finished. Resume it from Add funds.`,
+      ),
+    );
+  return topUpMessage(state);
+}
+
+function topUpMessage(state: TopUpCheckoutState): HTMLElement | null {
+  const messages: Readonly<Record<string, readonly [string, string, "status" | "alert"]>> = {
+    busy: ["支払いを確認しています…", "Checking the payment…", "status"],
+    redirecting: ["支払い画面を開いています…", "Opening Stripe…", "status"],
+    pending: [
+      "支払いを処理しています。確定すると残高に反映されます。",
+      "The payment is processing. The balance is credited once it settles.",
+      "status",
+    ],
+    paid: [
+      "支払いを受け付けました。残高に反映されます。",
+      "Payment received. The balance is being credited.",
+      "status",
+    ],
+    expired: [
+      "前回の支払いは期限切れになりました。請求はありません。",
+      "The earlier payment expired. Nothing was charged.",
+      "status",
+    ],
+    cancelled: [
+      "支払いをキャンセルしました。請求はありません。同じ金額でいつでも再開できます。",
+      "Payment cancelled. Nothing was charged. You can resume it with the same amount.",
+      "status",
+    ],
+    conflict: [
+      "別の支払いが処理中です。完了してから再試行してください。",
+      "Another payment is still in progress. Try again once it finishes.",
+      "alert",
+    ],
+    unavailable: [
+      "この環境ではカード決済を利用できません。",
+      "This deployment does not take card payments.",
+      "alert",
+    ],
+    uncertain: [
+      "支払いの状態を確認できませんでした。同じ支払いのまま再試行できます。",
+      "The payment status could not be confirmed. Retrying keeps the same payment.",
+      "alert",
+    ],
+    missing_intent: [
+      "戻ってきた支払いをこのブラウザの記録と結び付けられません。残高と履歴を確認してください。",
+      "This return does not match a payment saved in this browser. Check the balance and ledger.",
+      "alert",
+    ],
+    error: [
+      "支払いの記録をこのブラウザに保存できないため、送信していません。",
+      "The payment could not be saved in this browser, so nothing was sent.",
+      "alert",
+    ],
+  };
+  const message = messages[state.status];
+  return message
+    ? h(
+        "p",
+        {
+          class: message[2] === "alert" ? "notice notice--bad" : "notice",
+          role: message[2],
+          "aria-live": "polite",
+        },
+        tr(message[0], message[1]),
+      )
+    : null;
 }
 
 /**

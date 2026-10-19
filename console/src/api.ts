@@ -151,6 +151,18 @@ export type SubscriptionCheckoutStart =
         | { readonly state: "expired"; readonly id: string };
     };
 
+/** A hosted top-up Checkout begun or replayed under one durable reference. */
+export interface TopUpCheckoutStart {
+  readonly checkout: { readonly url: string };
+}
+
+/** The server's read of one top-up reference; never permission to settle funds. */
+export interface TopUpReceipt {
+  readonly reference: string;
+  readonly state: "pending" | "ready" | "paid" | "expired";
+  readonly checkout: { readonly url: string } | null;
+}
+
 export type SubscriptionCancellationReceipt =
   | { readonly state: "pending"; readonly subscriptionRef: string }
   | { readonly state: "verified"; readonly subscriptionRef: string; readonly effectiveAt: string };
@@ -687,8 +699,9 @@ export function createApi(options: ApiOptions) {
     },
 
     /**
-     * Starts a payment. Answers 404 where this deployment cannot take one,
-     * which is how the console knows not to offer it.
+     * Starts a legacy self-host payment. Answers 404 where this deployment
+     * cannot take one, which is how the console knows not to offer it. Hosted
+     * billing refuses this body; it uses `beginTopUp` with a durable reference.
      */
     beginCheckout: (organizationId: string, amountMinor: number) =>
       call<{ checkout: { url: string } }>(
@@ -696,6 +709,53 @@ export function createApi(options: ApiOptions) {
         `/v1/organizations/${encodeURIComponent(organizationId)}/wallet/checkout`,
         { amountMinor },
       ),
+
+    /**
+     * Begins or replays one hosted top-up. The reference and amount travel
+     * together because the server fingerprints the original command; a replay
+     * with a different amount is a conflict, not a new payment.
+     */
+    async beginTopUp(
+      organizationId: string,
+      reference: string,
+      amountMinor: number,
+    ): Promise<TopUpCheckoutStart> {
+      const path = `/v1/organizations/${encodeURIComponent(organizationId)}/wallet/checkout`;
+      if (!isBillingReference(reference) || !isSafeIntegerAtLeast(amountMinor, 1))
+        throw new ApiError("invalid_request", 0, path);
+      const { payload, status } = await request<unknown>("POST", path, { reference, amountMinor });
+      if (
+        status !== 201 ||
+        !isRecord(payload) ||
+        !isRecord(payload.checkout) ||
+        !isCheckoutUrl(payload.checkout.url)
+      )
+        throw new ApiError("invalid_response", status, path);
+      return { checkout: { url: payload.checkout.url } };
+    },
+
+    /** Reads one top-up reference's receipt; never reissues the Checkout. */
+    async topUpReceipt(organizationId: string, reference: string): Promise<TopUpReceipt> {
+      const path = `/v1/organizations/${encodeURIComponent(organizationId)}/wallet/checkout/${encodeURIComponent(reference)}`;
+      if (!isBillingReference(reference)) throw new ApiError("invalid_request", 0, path);
+      const { payload, status } = await request<unknown>("GET", path);
+      if (
+        status !== 200 ||
+        !isRecord(payload) ||
+        payload.reference !== reference ||
+        !["pending", "ready", "paid", "expired"].includes(String(payload.state)) ||
+        !(
+          payload.checkout === null ||
+          (isRecord(payload.checkout) && isCheckoutUrl(payload.checkout.url))
+        )
+      )
+        throw new ApiError("invalid_response", status, path);
+      return {
+        reference,
+        state: payload.state as TopUpReceipt["state"],
+        checkout: payload.checkout === null ? null : { url: payload.checkout.url as string },
+      };
+    },
 
     fund: (organizationId: string, settlementProof: string) =>
       call<{ wallet: Wallet }>(
