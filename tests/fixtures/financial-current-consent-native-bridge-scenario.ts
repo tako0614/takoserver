@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { moneyFenceInstallSql } from "../../scripts/deploy/schema-money-unit-cutover.ts";
 import { verifyHostedBillingFinancialRealm } from "../../src/hosted-billing-realm.ts";
 import { canonicalJson } from "../../src/json.ts";
+import { moneyCutoverStripeCustomerGuardDefinitions } from "../../src/money-cutover-sql.ts";
 import type { Row, SqlParam, SqlStatement, SqlWrite } from "../../src/ports.ts";
 import { SHARED_AUTH_STAGING_PROFILE } from "../../src/shared-auth-oidc-client.ts";
 import { customerAdmissionCandidate } from "../../src/shared-financial-admission.ts";
@@ -182,6 +183,8 @@ function mechanicalRp(): SqlStatement {
 async function requestFixture() {
   const f = await customerFixture(true);
   f.db.exec(moneyFenceInstallSql("0094"));
+  // Root's guarded 0104 chain installs the Money guard's Stripe customer generation.
+  for (const [, sql] of moneyCutoverStripeCustomerGuardDefinitions()) f.db.exec(sql);
   const observed = { primary: 0, root: 0, reads: 0, batches: 0 };
   const batchSizes: number[] = [];
   const nativeTrace: NativeTrace = { reads: [], batches: [] };
