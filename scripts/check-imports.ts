@@ -894,13 +894,22 @@ const EXACT_FINANCIAL_MONEY_ORIGIN_IMPORTS: readonly {
   "src/shared-financial-admission.ts",
   "src/shared-financial-customer-history.ts",
   "src/financial-current-consent-customer.ts",
-  "src/shared-financial-customer-tracked-execution.ts",
-].map((source) => ({
-  source,
-  target: "src/money-cutover-sql.ts",
-  typeOnly: false,
-  names: ["assertMoneyCutoverSqlOrigin"],
-}));
+]
+  .map((source) => ({
+    source,
+    target: "src/money-cutover-sql.ts",
+    typeOnly: false,
+    names: ["assertMoneyCutoverSqlOrigin"],
+  }))
+  .concat([
+    {
+      // Customer tracked execution binds its Money writer to its raw read backing.
+      source: "src/shared-financial-customer-tracked-execution.ts",
+      target: "src/money-cutover-sql.ts",
+      typeOnly: false,
+      names: ["assertMoneyCutoverSqlBackingOrigin"],
+    },
+  ]);
 
 function exactContainerAdapterImportEdge(path: string, target: string): boolean {
   const expected = [

@@ -1,6 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA } from "../src/financial-0104-money-fence.ts";
 import {
   readFinancialCurrentConsentCustomerOperationOriginal,
   readFinancialCurrentConsentNativeOriginal,
@@ -483,58 +482,156 @@ for (const phase of ["L1", "D"] as const)
     }
   });
 
-test("tracked execution refuses raw Sql, a foreign writer and an unfenced shape before any statement; freeze writes nothing", async () => {
+function countingTransport(f: Awaited<ReturnType<typeof customerFixture>>, calls: string[]): Sql {
+  // The raw backing beneath the Money writer; it records every statement sent.
+  return {
+    async query(sql, params) {
+      calls.push(`query:${sql.slice(0, 24)}`);
+      return f.sql.query(sql, params);
+    },
+    async run(sql, params) {
+      calls.push("run");
+      return f.sql.run(sql, params);
+    },
+    async batch(statements) {
+      calls.push(`batch:${statements.length}`);
+      return f.sql.batch(statements);
+    },
+  };
+}
+
+test("tracked execution refuses a raw, foreign-epoch or foreign-backing writer and an unfenced shape before any statement", async () => {
   const { f, l1 } = await customerCase();
   try {
     const calls: string[] = [];
-    // The transport beneath any writer; it records every statement sent.
-    const transport: Sql = {
-      async query(sql, params) {
-        calls.push(`query:${sql.slice(0, 24)}`);
-        return f.sql.query(sql, params);
-      },
-      async run(sql, params) {
-        calls.push("run");
-        return f.sql.run(sql, params);
-      },
-      async batch(statements) {
-        calls.push(`batch:${statements.length}`);
-        return f.sql.batch(statements);
-      },
-    };
+    const read = countingTransport(f, calls);
     const before = await customerRows(f);
     const unchanged = async () => expect(await customerRows(f)).toEqual(before);
-    // A raw Sql and a Money writer for another epoch are refused before any SQL.
-    for (const sql of [transport, createMoneyCutoverSql(transport, ROTATED)]) {
-      await expect(createCustomerTrackedExecutionData(sql).executePhase(l1)).rejects.toThrow(
-        "Root's Money writer",
-      );
+    for (const write of [
+      read,
+      createMoneyCutoverSql(read, ROTATED),
+      // A real writer for the right epoch over another backing than `read`.
+      createMoneyCutoverSql(countingTransport(f, calls), writerEpoch),
+    ]) {
+      await expect(
+        createCustomerTrackedExecutionData({ read, write }).executePhase(l1),
+      ).rejects.toThrow("Root's Money writer");
       expect(calls).toEqual([]);
     }
     await unchanged();
-    const writer = createMoneyCutoverSql(transport, writerEpoch);
+    const write = createMoneyCutoverSql(read, writerEpoch);
     // One missing Customer fence is not the exact fenced shape: no batch is sent.
     f.db.exec("DROP TRIGGER financial_customer_history_receipts_money_fence");
-    await expect(createCustomerTrackedExecutionData(writer).executePhase(l1)).rejects.toThrow(
-      "exact fenced shape",
-    );
+    await expect(
+      createCustomerTrackedExecutionData({ read, write }).executePhase(l1),
+    ).rejects.toThrow("exact fenced shape");
     expect(calls.filter((call) => !call.startsWith("query:"))).toEqual([]);
     await unchanged();
-    f.db.exec(
-      FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA.financial_customer_history_receipts_money_fence ?? "",
-    );
-    // Freeze with the exact shape and the actual writer: nothing is written.
+  } finally {
+    f.close();
+  }
+});
+
+test("tracked execution commits L1, D and N through the actual Money writer; under freeze the same L1 writes nothing", async () => {
+  const { f, l1 } = await customerCase();
+  try {
+    const calls: string[] = [];
+    const read = countingTransport(f, calls);
+    const write = createMoneyCutoverSql(read, writerEpoch);
+    const before = await customerRows(f);
+    // Freeze: the phase reaches its batch, the fences abort it inside the frame.
     f.db.exec(
       "INSERT INTO money_cutover_freeze VALUES(1,'binding','origin','backup','writer','source')",
     );
-    const frozen = await createCustomerTrackedExecutionData(writer).executePhase(l1);
+    const frozen = await createCustomerTrackedExecutionData({ read, write }).executePhase(l1);
     expect(frozen.status).toBe("get-only");
-    expect(calls.filter((call) => !call.startsWith("query:"))).toEqual([]);
-    await unchanged();
-    // GET-only recovery stays ungated and still reads nothing it may not.
-    const recovered = await createCustomerTrackedExecutionData(transport).readOriginal(l1);
-    expect(recovered.status).toBe("get-only");
-    await unchanged();
+    if (frozen.status !== "get-only") throw new Error("frozen phase acknowledged");
+    expect(frozen.reason).toBe("batch-outcome-unknown");
+    expect(frozen.observation.status).toBe("no-completed-match");
+    expect(calls.filter((call) => call.startsWith("batch:"))).toEqual(["batch:9"]);
+    expect(await customerRows(f)).toEqual(before);
+    f.db.exec("DELETE FROM money_cutover_freeze");
+    // Unfrozen control: the same L1 original commits and is acknowledged.
+    const tracked = createCustomerTrackedExecutionData({ read, write });
+    const prepared = await tracked.executePhase(l1);
+    expect(prepared.status).toBe("acknowledged-own-phase-data");
+    if (prepared.status !== "acknowledged-own-phase-data") throw new Error("L1 not acknowledged");
+    expect(prepared.acknowledgement.physicalResults).toHaveLength(7);
+    const afterL1 = await customerRows(f);
+    expect(afterL1).not.toEqual(before);
+    expect(await f.sql.query("SELECT state FROM stripe_billing_customer_commands")).toEqual([
+      { state: "prepared" },
+    ]);
+    const snapshot = async () => {
+      const history = await readCustomerJournalSnapshot(f.sql, {
+        organizationId: f.org,
+        realmRegistration: f.journal.realmRegistration,
+        realmIncarnation: f.journal.realmIncarnation,
+      });
+      if (!history) throw new Error("expected Customer history");
+      return history;
+    };
+    const dispatch = {
+      claimRef: "tracked-claim:D",
+      dispatchAttemptRef: "tracked-attempt:D",
+      dispatchReceiptRef: "tracked-receipt:D",
+      dispatchedAt: f.at,
+    };
+    const d: CustomerPhaseInput = {
+      phase: "D",
+      admission: f.admission,
+      history: await snapshot(),
+      writerEpoch,
+      couplingAttemptRef: "tracked:D",
+      entryRef: "tracked-entry:D",
+      historyReceiptRef: "tracked-H1:D",
+      ...dispatch,
+    };
+    const dispatched = await tracked.executePhase(d);
+    expect(dispatched.status).toBe("acknowledged-own-phase-data");
+    if (dispatched.status !== "acknowledged-own-phase-data") throw new Error("D not acknowledged");
+    expect(dispatched.acknowledgement.physicalResults).toHaveLength(6);
+    expect(dispatched.acknowledgement.dispatchCasChanges).toBe(1);
+    const n: CustomerPhaseInput = {
+      phase: "N",
+      admission: f.admission,
+      history: await snapshot(),
+      writerEpoch,
+      couplingAttemptRef: "tracked:N",
+      entryRef: "tracked-entry:N",
+      historyReceiptRef: "tracked-H1:N",
+      ...dispatch,
+      custodyReceiptRef: "tracked-custody:N",
+      verifiedAt: f.at,
+      nativeOriginal: {
+        organizationId: f.org,
+        commandKey: f.admission.original.key,
+        fingerprint: f.admission.original.fingerprint,
+        realmJson: f.admission.original.realmJson,
+        requestJson: f.admission.original.requestJson,
+        customerId: "cus_TrackedN",
+      },
+    };
+    const verified = await tracked.executePhase(n);
+    expect(verified.status).toBe("acknowledged-own-phase-data");
+    if (verified.status !== "acknowledged-own-phase-data") throw new Error("N not acknowledged");
+    expect(verified.acknowledgement.physicalResults).toHaveLength(6);
+    expect(await f.sql.query("SELECT org_id,customer_id FROM stripe_billing_customers")).toEqual([
+      { org_id: f.org, customer_id: "cus_TrackedN" },
+    ]);
+    expect(
+      await f.sql.query("SELECT state,customer_id FROM stripe_billing_customer_commands"),
+    ).toEqual([{ state: "verified", customer_id: "cus_TrackedN" }]);
+    expect(calls.filter((call) => call.startsWith("batch:"))).toEqual([
+      "batch:9",
+      "batch:9",
+      "batch:8",
+      "batch:8",
+    ]);
+    expect(await f.sql.query("SELECT * FROM money_cutover_writer_permit")).toEqual([]);
+    // GET-only recovery reads the raw port and finds the retained N original.
+    const recovered = await createCustomerTrackedExecutionData({ read, write }).readOriginal(n);
+    expect(recovered.observation.status).toBe("matching-original");
   } finally {
     f.close();
   }
