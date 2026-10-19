@@ -1,14 +1,22 @@
 /** PRIVATE Financial-owned 0104 source recipe. Root/Money reserved 0104 for
  * Financial (dependency 0104 -> 0103; source order 0101 -> 0102 -> 0103 -> 0104).
- * Financial authors only this body: the receiver, C0/M/G, R1 and five-action
- * consent tables already defined by existing Financial source, plus a Financial
- * money fence on every table (and on UPDATE where a table admits one). Root alone registers it into the canonical inventory, native
+ * Financial authors only this body: the receiver, C0/M/G, R1, five-action
+ * consent and Customer admission/history/journal/dispatch/custody tables already
+ * defined by existing Financial source and candidates, plus a Financial money
+ * fence on every table that a Financial writer writes (and on UPDATE where a table
+ * admits one). FINANCIAL_0104_UNFENCED_TABLES names the two exceptions. Root alone registers it into the canonical inventory, native
  * migration list and deploy scripts; nothing here registers, applies or selects
  * a migration, and no SQL label confers caller, payer, source or issuer authority. */
 
 import {
+  FINANCIAL_0104_CUSTOMER_H0_SCHEMA,
+  FINANCIAL_0104_CUSTOMER_JOURNAL_SCHEMA,
+  FINANCIAL_0104_CUSTOMER_L1_SCHEMA,
+} from "./financial-0104-customer-schema.ts";
+import {
   FINANCIAL_0104_C0_FENCE_SCHEMA,
   FINANCIAL_0104_CONSENT_FENCE_SCHEMA,
+  FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA,
   FINANCIAL_0104_RECEIVER_FENCE_SCHEMA,
 } from "./financial-0104-money-fence.ts";
 import { bytesDigest } from "./json.ts";
@@ -196,8 +204,8 @@ function objects(schema: Readonly<Record<string, string>>): readonly Financial01
 }
 
 /** Source order: receivers and their fences; C0/M, G, their fences; R1 with its
- * fences; R1 attempt leaf; consent with its fences. Each table precedes every
- * trigger or index on it. */
+ * fences; R1 attempt leaf; consent with its fences; Customer L1, H0 and journal
+ * with their fences. Each table precedes every trigger or index on it. */
 export const FINANCIAL_0104_OBJECTS: readonly Financial0104Object[] = Object.freeze([
   ...objects(RECEIVER_SCHEMA),
   ...objects(FINANCIAL_0104_RECEIVER_FENCE_SCHEMA),
@@ -209,13 +217,24 @@ export const FINANCIAL_0104_OBJECTS: readonly Financial0104Object[] = Object.fre
   ...objects(Object.fromEntries(FINANCIAL_R1_ATTEMPT_OBJECTS.map((o) => [o.name, o.sql]))),
   ...objects(CONSENT_SCHEMA),
   ...objects(FINANCIAL_0104_CONSENT_FENCE_SCHEMA),
+  ...objects(FINANCIAL_0104_CUSTOMER_L1_SCHEMA),
+  ...objects(FINANCIAL_0104_CUSTOMER_H0_SCHEMA),
+  ...objects(FINANCIAL_0104_CUSTOMER_JOURNAL_SCHEMA),
+  ...objects(FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA),
 ]);
 
 export const FINANCIAL_0104_TABLES: readonly string[] = Object.freeze(
   FINANCIAL_0104_OBJECTS.filter((o) => o.type === "table").map((o) => o.name),
 );
 
-/** The INSERT money fence of every 0104 table, keyed by table. */
+/** 0104 triggers on a table 0104 does not create: the H0 Org capture triggers. */
+export const FINANCIAL_0104_FOREIGN_TABLE_TRIGGERS: readonly string[] = Object.freeze(
+  FINANCIAL_0104_OBJECTS.filter((o) => !FINANCIAL_0104_TABLES.includes(o.tbl_name)).map(
+    (o) => o.name,
+  ),
+);
+
+/** The INSERT money fence of every fenced 0104 table, keyed by table. */
 export const FINANCIAL_0104_MONEY_FENCES: Readonly<Record<string, string>> = Object.freeze(
   Object.fromEntries(
     FINANCIAL_0104_OBJECTS.filter(
@@ -236,9 +255,11 @@ export const FINANCIAL_0104_MONEY_UPDATE_FENCES: Readonly<Record<string, string>
 /** The exact migration body, one statement per object, in source order. */
 export const FINANCIAL_0104_DDL = `${FINANCIAL_0104_OBJECTS.map((o) => `${o.sql};`).join("\n")}\n`;
 
-/** Read-only catalog projection over every 0104-owned table's schema objects. */
+/** Read-only catalog projection over every 0104-owned table's schema objects and
+ * the 0104 triggers it places on a foreign table. */
 export const FINANCIAL_0104_CATALOG_QUERY = `SELECT type, name, tbl_name, sql
-FROM main.sqlite_schema WHERE sql IS NOT NULL AND tbl_name IN (${FINANCIAL_0104_TABLES.map((t) => `'${t}'`).join(", ")})
+FROM main.sqlite_schema WHERE sql IS NOT NULL AND (tbl_name IN (${FINANCIAL_0104_TABLES.map((t) => `'${t}'`).join(", ")})
+ OR (type = 'trigger' AND name IN (${FINANCIAL_0104_FOREIGN_TABLE_TRIGGERS.map((t) => `'${t}'`).join(", ")})))
 ORDER BY type COLLATE BINARY, name COLLATE BINARY`;
 
 export interface Financial0104SourceRecipe {

@@ -2,6 +2,7 @@ import type { Database } from "bun:sqlite";
 import {
   FINANCIAL_0104_C0_FENCE_SCHEMA,
   FINANCIAL_0104_CONSENT_FENCE_SCHEMA,
+  FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA,
   FINANCIAL_0104_RECEIVER_FENCE_SCHEMA,
 } from "../../src/financial-0104-money-fence.ts";
 import { verifyHostedBillingFinancialRealm } from "../../src/hosted-billing-realm.ts";
@@ -24,6 +25,7 @@ export function installFinancial0104Fences(
     readonly c0?: boolean;
     readonly genesisOverlay?: boolean;
     readonly consent?: boolean;
+    readonly customer?: boolean;
   },
 ): void {
   if (families.genesisOverlay) db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
@@ -31,6 +33,7 @@ export function installFinancial0104Fences(
     ...(families.receiver ? Object.values(FINANCIAL_0104_RECEIVER_FENCE_SCHEMA) : []),
     ...(families.c0 ? Object.values(FINANCIAL_0104_C0_FENCE_SCHEMA) : []),
     ...(families.consent ? Object.values(FINANCIAL_0104_CONSENT_FENCE_SCHEMA) : []),
+    ...(families.customer ? Object.values(FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA) : []),
   ];
   for (const sql of fences) db.exec(sql);
   const permit = db

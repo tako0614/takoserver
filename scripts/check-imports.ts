@@ -671,6 +671,12 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain"],
   },
   {
+    // Exact Financial 0104 Customer schema leaves and the read-only write-shape check.
+    name: "domain",
+    match: /^src\/financial-0104-customer-schema\.ts$/u,
+    may: ["core", "domain"],
+  },
+  {
     // Financial 0104 source recipe DATA over existing Financial schema leaves.
     // It registers or applies nothing; Root owns the canonical inventory.
     name: "app",

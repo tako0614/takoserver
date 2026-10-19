@@ -71,6 +71,74 @@ export const FINANCIAL_0104_CONSENT_FENCE_SCHEMA: Readonly<Record<string, string
     "CREATE TRIGGER financial_payer_grant_revocations_money_fence BEFORE INSERT ON financial_payer_grant_revocations\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM money_cutover_writer_permit p\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE p.singleton=1 AND p.epoch='usd-micros-v2') BEGIN\n SELECT RAISE(ABORT,'constraint: Financial consent revocation permit required');\nEND",
 });
 
+/** Customer L1 fences. The epoch is the admitted challenge's own column. The
+ * stripe_customer_admission_links row the same batch writes is fenced by Root's
+ * 0105 (Root-owned Stripe tables), and the Financial fences here roll it back. */
+export const FINANCIAL_0104_CUSTOMER_L1_FENCE_SCHEMA: Readonly<Record<string, string>> =
+  Object.freeze({
+    financial_customer_admissions_money_fence:
+      "CREATE TRIGGER financial_customer_admissions_money_fence BEFORE INSERT ON financial_customer_admissions\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM shared_customer_challenges c\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE c.challenge_ref IS NEW.challenge_ref AND p.writer_epoch IS c.writer_epoch) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial Customer admission permit/epoch required');\nEND",
+    financial_customer_admission_receipts_money_fence:
+      "CREATE TRIGGER financial_customer_admission_receipts_money_fence BEFORE INSERT ON financial_customer_admission_receipts\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_customer_admissions x\n JOIN shared_customer_challenges c ON c.challenge_ref=x.challenge_ref\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE x.admission_ref IS NEW.admission_ref AND p.writer_epoch IS c.writer_epoch) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial Customer admission receipt permit/epoch required');\nEND",
+  });
+
+/** Customer H0 history fences. The epoch is the retained root's own writerEpoch.
+ * Enrollment heads admit an UPDATE: the H0 writer's seal and restart keep the
+ * capture sequence, so those are fenced; the existing Org capture triggers only
+ * ever advance it (capture or close), so Root's Org writes are not refused here.
+ * financial_customer_history_birth_observations is written only by those Org
+ * triggers and carries no fence (fencing it would refuse every Org write outside
+ * Root's Money frame). */
+export const FINANCIAL_0104_CUSTOMER_H0_FENCE_SCHEMA: Readonly<Record<string, string>> =
+  Object.freeze({
+    financial_history_primary_roots_money_fence:
+      "CREATE TRIGGER financial_history_primary_roots_money_fence BEFORE INSERT ON financial_history_primary_roots\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM money_cutover_writer_permit p\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE p.singleton=1 AND p.epoch='usd-micros-v2'\n AND p.writer_epoch IS json_extract(NEW.root_json,'$.writerEpoch')) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial history root permit/epoch required');\nEND",
+    financial_history_enrollments_money_fence:
+      "CREATE TRIGGER financial_history_enrollments_money_fence BEFORE INSERT ON financial_history_enrollments\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_history_primary_roots r\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE r.primary_ref IS NEW.primary_ref AND p.writer_epoch IS json_extract(r.root_json,'$.writerEpoch')) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial history enrollment permit/epoch required');\nEND",
+    financial_history_enrollment_inventory_money_fence:
+      "CREATE TRIGGER financial_history_enrollment_inventory_money_fence BEFORE INSERT ON financial_history_enrollment_inventory\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_history_primary_roots r\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE r.primary_ref IS NEW.primary_ref AND p.writer_epoch IS json_extract(r.root_json,'$.writerEpoch')) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial history inventory permit/epoch required');\nEND",
+    financial_history_enrollment_heads_money_fence:
+      "CREATE TRIGGER financial_history_enrollment_heads_money_fence BEFORE INSERT ON financial_history_enrollment_heads\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_history_primary_roots r\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE r.primary_ref IS NEW.primary_ref AND p.writer_epoch IS json_extract(r.root_json,'$.writerEpoch')) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial history head permit/epoch required');\nEND",
+    financial_history_enrollment_heads_money_fence_update:
+      "CREATE TRIGGER financial_history_enrollment_heads_money_fence_update BEFORE UPDATE ON financial_history_enrollment_heads\nWHEN NEW.capture_sequence IS OLD.capture_sequence AND (EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_history_primary_roots r\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE r.primary_ref IS NEW.primary_ref AND p.writer_epoch IS json_extract(r.root_json,'$.writerEpoch'))) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial history head transition permit/epoch required');\nEND",
+    financial_history_enrollment_receipts_money_fence:
+      "CREATE TRIGGER financial_history_enrollment_receipts_money_fence BEFORE INSERT ON financial_history_enrollment_receipts\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_history_primary_roots r\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE r.primary_ref IS NEW.primary_ref AND p.writer_epoch IS json_extract(r.root_json,'$.writerEpoch')) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial history receipt permit/epoch required');\nEND",
+  });
+
+/** Customer H1 journal, dispatch and custody fences. The epoch is the coverage's
+ * own writer_epoch, reached from each row's history or dispatch parent. History
+ * heads advance by CAS UPDATE, so they are fenced for UPDATE as well. */
+export const FINANCIAL_0104_CUSTOMER_JOURNAL_FENCE_SCHEMA: Readonly<Record<string, string>> =
+  Object.freeze({
+    financial_customer_history_coverages_money_fence:
+      "CREATE TRIGGER financial_customer_history_coverages_money_fence BEFORE INSERT ON financial_customer_history_coverages\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM money_cutover_writer_permit p\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE p.singleton=1 AND p.epoch='usd-micros-v2'\n AND p.writer_epoch IS NEW.writer_epoch) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial Customer history coverage permit/epoch required');\nEND",
+    financial_customer_history_scopes_money_fence:
+      "CREATE TRIGGER financial_customer_history_scopes_money_fence BEFORE INSERT ON financial_customer_history_scopes\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_customer_history_coverages cv\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE cv.history_ref IS NEW.history_ref AND p.writer_epoch IS cv.writer_epoch) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial Customer history scope permit/epoch required');\nEND",
+    financial_customer_dispatch_claims_money_fence:
+      "CREATE TRIGGER financial_customer_dispatch_claims_money_fence BEFORE INSERT ON financial_customer_dispatch_claims\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_customer_history_coverages cv\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE cv.history_ref IS NEW.history_ref AND p.writer_epoch IS cv.writer_epoch) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial Customer dispatch claim permit/epoch required');\nEND",
+    financial_customer_dispatch_receipts_money_fence:
+      "CREATE TRIGGER financial_customer_dispatch_receipts_money_fence BEFORE INSERT ON financial_customer_dispatch_receipts\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_customer_dispatch_claims dc\n JOIN financial_customer_history_coverages cv ON cv.history_ref=dc.history_ref\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE dc.claim_ref IS NEW.claim_ref AND p.writer_epoch IS cv.writer_epoch) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial Customer dispatch receipt permit/epoch required');\nEND",
+    financial_customer_custody_receipts_money_fence:
+      "CREATE TRIGGER financial_customer_custody_receipts_money_fence BEFORE INSERT ON financial_customer_custody_receipts\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_customer_dispatch_receipts dr\n JOIN financial_customer_dispatch_claims dc ON dc.claim_ref=dr.claim_ref\n JOIN financial_customer_history_coverages cv ON cv.history_ref=dc.history_ref\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE dr.receipt_ref IS NEW.dispatch_receipt_ref AND p.writer_epoch IS cv.writer_epoch) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial Customer custody receipt permit/epoch required');\nEND",
+    financial_customer_history_entries_money_fence:
+      "CREATE TRIGGER financial_customer_history_entries_money_fence BEFORE INSERT ON financial_customer_history_entries\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_customer_history_coverages cv\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE cv.history_ref IS NEW.history_ref AND p.writer_epoch IS cv.writer_epoch) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial Customer history entry permit/epoch required');\nEND",
+    financial_customer_history_heads_money_fence:
+      "CREATE TRIGGER financial_customer_history_heads_money_fence BEFORE INSERT ON financial_customer_history_heads\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_customer_history_coverages cv\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE cv.history_ref IS NEW.history_ref AND p.writer_epoch IS cv.writer_epoch) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial Customer history head permit/epoch required');\nEND",
+    financial_customer_history_heads_money_fence_update:
+      "CREATE TRIGGER financial_customer_history_heads_money_fence_update BEFORE UPDATE ON financial_customer_history_heads\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_customer_history_coverages cv\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE cv.history_ref IS NEW.history_ref AND p.writer_epoch IS cv.writer_epoch) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial Customer history head advance permit/epoch required');\nEND",
+    financial_customer_history_receipts_money_fence:
+      "CREATE TRIGGER financial_customer_history_receipts_money_fence BEFORE INSERT ON financial_customer_history_receipts\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_customer_history_coverages cv\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE cv.history_ref IS NEW.history_ref AND p.writer_epoch IS cv.writer_epoch) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial Customer history receipt permit/epoch required');\nEND",
+  });
+
+/** Every Customer fence, in source order. */
+export const FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA: Readonly<Record<string, string>> = Object.freeze(
+  {
+    ...FINANCIAL_0104_CUSTOMER_L1_FENCE_SCHEMA,
+    ...FINANCIAL_0104_CUSTOMER_H0_FENCE_SCHEMA,
+    ...FINANCIAL_0104_CUSTOMER_JOURNAL_FENCE_SCHEMA,
+  },
+);
+
 /** Every table that carries a Financial 0104 money fence. A Financial builder may
  * compile a batch only when each statement writes one of these tables. */
 export const FINANCIAL_0104_FENCED_TABLES = Object.freeze([
@@ -94,6 +162,34 @@ export const FINANCIAL_0104_FENCED_TABLES = Object.freeze([
   "financial_payer_consent_witnesses",
   "financial_payer_consent_receipts",
   "financial_payer_grant_revocations",
+  "financial_customer_admissions",
+  "financial_customer_admission_receipts",
+  "financial_history_primary_roots",
+  "financial_history_enrollments",
+  "financial_history_enrollment_inventory",
+  "financial_history_enrollment_heads",
+  "financial_history_enrollment_receipts",
+  "financial_customer_history_coverages",
+  "financial_customer_history_scopes",
+  "financial_customer_dispatch_claims",
+  "financial_customer_dispatch_receipts",
+  "financial_customer_custody_receipts",
+  "financial_customer_history_entries",
+  "financial_customer_history_heads",
+  "financial_customer_history_receipts",
+] as const);
+
+/** 0104 tables that carry no Financial fence, each with its one reason. */
+export const FINANCIAL_0104_UNFENCED_TABLES: Readonly<Record<string, string>> = Object.freeze({
+  stripe_customer_admission_links: "Root 0105 Stripe money fence",
+  financial_customer_history_birth_observations: "written only by Root Org capture triggers",
+});
+
+/** Stripe tables a Customer batch writes. Root owns their money fences (0105). */
+export const ROOT_0105_STRIPE_FENCED_TABLES = Object.freeze([
+  "stripe_billing_customers",
+  "stripe_billing_customer_commands",
+  "stripe_customer_admission_links",
 ] as const);
 
 /** The one write target of a Financial DATA statement, or undefined. This is a
@@ -122,5 +218,26 @@ export function isFinancialMoneyFencedBatch(
         target !== undefined && (FINANCIAL_0104_FENCED_TABLES as readonly string[]).includes(target)
       );
     })
+  );
+}
+
+/** Static Customer builder refusal: every statement writes one Financial-fenced
+ * table or one Root 0105 Stripe table, and at least one writes a Financial-fenced
+ * table, so a Financial fence aborts the whole batch outside Root's Money frame. */
+export function isFinancialCustomerMoneyFencedBatch(
+  statements: readonly { readonly sql: string }[],
+): boolean {
+  const targets = statements.map((statement) => financialStatementWriteTarget(statement.sql));
+  const financial = (target: string | undefined) =>
+    target !== undefined && (FINANCIAL_0104_FENCED_TABLES as readonly string[]).includes(target);
+  return (
+    statements.length > 0 &&
+    targets.some(financial) &&
+    targets.every(
+      (target) =>
+        financial(target) ||
+        (target !== undefined &&
+          (ROOT_0105_STRIPE_FENCED_TABLES as readonly string[]).includes(target)),
+    )
   );
 }
