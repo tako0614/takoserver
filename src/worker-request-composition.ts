@@ -302,7 +302,11 @@ export async function queryWorkerRequestFinancialCurrentConsentOriginal(
   return rows;
 }
 
-/** Send one complete Financial-owned permit/receipt transaction on its original primary. */
+/** Send one complete Financial-owned Customer receipt transaction on its original
+ * primary inside Root's Money permit frame: the request's own verified Money
+ * writer (same raw primary and writer epoch) inserts and deletes the permit
+ * around the plan and checks both acknowledgements. Financial plans carry no
+ * permit statements (L1=7, D=6); a byte-matched permit plan is never sent raw. */
 export async function batchWorkerRequestFinancialCurrentConsentOriginal(
   connection: WorkerRequestSql,
   operation: FinancialCurrentConsentCustomerOperation,
@@ -316,7 +320,7 @@ export async function batchWorkerRequestFinancialCurrentConsentOriginal(
     original.kind !== "batch" ||
     connection.moneyGuard !== "ready" ||
     original.plan.phase !== original.phase ||
-    original.plan.statements.length !== (original.phase === "L1" ? 9 : 8)
+    original.plan.statements.length !== (original.phase === "L1" ? 7 : 6)
   )
     throw new SqlError("invalid", "Financial current consent batch origin differs");
   const sent = financialCurrentConsentBatches.get(connection) ?? new Set<"L1" | "D">();
@@ -324,17 +328,18 @@ export async function batchWorkerRequestFinancialCurrentConsentOriginal(
     throw new SqlError("unavailable", "Financial current consent phase was already sent");
   sent.add(original.phase);
   financialCurrentConsentBatches.set(connection, sent);
-  const result = await origin.rawSql.batch(original.plan.statements);
+  const writer = connection.sql;
+  assertMoneyCutoverSqlBackingOrigin(writer, {
+    rawSql: origin.rawSql,
+    writerEpoch: origin.writerEpoch,
+  });
+  const result = await writer.batch(original.plan.statements);
   assertWorkerRequestBacking(connection);
   const current = readFinancialCurrentConsentNativeOriginal(operation, "batch");
   if (current?.kind !== "batch" || current.connection !== connection || current.inputs !== inputs)
     throw new SqlError("unavailable", "Financial current consent batch origin changed");
-  if (
-    result.length !== original.plan.statements.length ||
-    result[0]?.changes !== 1 ||
-    result.at(-1)?.changes !== 1
-  )
-    throw new SqlError("unavailable", "Financial current consent permit acknowledgement differs");
+  if (result.length !== original.plan.statements.length)
+    throw new SqlError("unavailable", "Financial current consent acknowledgement differs");
   return result;
 }
 
