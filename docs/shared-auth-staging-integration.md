@@ -70,7 +70,13 @@ key, with associated data binding purpose, digest, issuer, client, API and
 Console origins. The callback atomically consumes its attempt before exchange,
 confirms the current canonical account, explicitly bootstraps its personal
 Workspace and verifies current owner membership before creating an active
-local session. It redirects only to the configured Console root, and never
+local session. Before principal resolution, that same verified grant must also
+return an exact billing-organization tuple for the selected personal Workspace.
+The callback checks its three fields and selected Workspace ID, then holds a
+detached tuple only in its receiver-bound fresh original. A missing or changed
+tuple refuses the fresh callback before principal resolution or session creation;
+it does not infer an Organization from the account or session identity. It
+redirects only to the configured Console root, and never
 returns an upstream grant to the browser.
 
 The frozen directory contract uses the same RP Bearer grant at

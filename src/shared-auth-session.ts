@@ -41,7 +41,10 @@ export type SharedAuthVerifiedPrincipalData = {
   readonly identity: Readonly<SharedAuthIdentity & { readonly accountId: string }>;
   readonly workspace: SharedWorkspaceChoice;
 } & (
-  | { readonly phase: "fresh-callback" }
+  | {
+      readonly phase: "fresh-callback";
+      readonly workspaceOrganization: Readonly<SharedWorkspaceOrganization>;
+    }
   | {
       readonly phase: "existing-session";
       /** RP row observations, never the Root registration/enrollment version. */
@@ -620,12 +623,33 @@ export function createSharedAuthSession(options: {
       throw new SharedAuthSessionError("session_invalid");
     return selected;
   }
+  function workspaceOrganizationFromDirectory(
+    body: Record<string, unknown>,
+    workspaceId: string,
+  ): Readonly<SharedWorkspaceOrganization> {
+    if (
+      Object.keys(body).sort().join() !== "organizationId,workspaceId,workspaceRef" ||
+      body.workspaceId !== workspaceId ||
+      !text(body.workspaceRef, 512) ||
+      !text(body.organizationId, 128)
+    )
+      throw new SharedAuthSessionError("session_invalid");
+    return Object.freeze({
+      workspaceId,
+      workspaceRef: body.workspaceRef,
+      organizationId: body.organizationId,
+    });
+  }
   async function principal(
     value: SharedAuthGrant,
     workspace: SharedWorkspaceChoice,
     store: SharedAuthSessionStore | SharedAuthFinalSessionStore,
     phase:
-      | { readonly phase: "fresh-callback" }
+      | {
+          readonly phase: "fresh-callback";
+          readonly workspaceOrganization: Readonly<SharedWorkspaceOrganization>;
+          readonly originalSource: () => boolean;
+        }
       | {
           readonly phase: "existing-session";
           readonly sessionObservation: {
@@ -657,7 +681,10 @@ export function createSharedAuthSession(options: {
       identity,
       workspace: selectedWorkspace,
       ...(phase.phase === "fresh-callback"
-        ? phase
+        ? {
+            phase: phase.phase,
+            workspaceOrganization: Object.freeze({ ...phase.workspaceOrganization }),
+          }
         : {
             phase: phase.phase,
             sessionObservation: Object.freeze({ ...phase.sessionObservation }),
@@ -671,7 +698,8 @@ export function createSharedAuthSession(options: {
       original: () =>
         principalInputOwnerSeals.every((seal) => seal()) &&
         principalInputReceiverSeal() &&
-        storeSeal(),
+        storeSeal() &&
+        (phase.phase !== "fresh-callback" || phase.originalSource()),
     });
     const resolved = await Reflect.apply(resolvePrincipal, principalReceiver, [
       {
@@ -995,18 +1023,7 @@ export function createSharedAuthSession(options: {
     if (value.subject !== session.accountId || row.principalId !== session.actor.principalId)
       throw new SharedAuthSessionError("session_invalid");
     const body = await directory(value, `/${encodeURIComponent(workspaceId)}/billing-organization`);
-    if (
-      Object.keys(body).sort().join() !== "organizationId,workspaceId,workspaceRef" ||
-      body.workspaceId !== workspaceId ||
-      !text(body.workspaceRef, 512) ||
-      !text(body.organizationId, 128)
-    )
-      throw new SharedAuthSessionError("session_invalid");
-    const binding = Object.freeze({
-      workspaceId,
-      workspaceRef: body.workspaceRef,
-      organizationId: body.organizationId,
-    });
+    const binding = workspaceOrganizationFromDirectory(body, workspaceId);
     const pinned = await Reflect.apply(pinOrganization, organizationReceiver, [binding]);
     if (
       !pinned ||
@@ -1271,8 +1288,29 @@ export function createSharedAuthSession(options: {
             const selected = await currentWorkspace(value, workspace.id);
             if (selected.type !== "personal" || !selected.owner)
               throw new SharedAuthSessionError("workspace_forbidden");
+            const storeSeal = principalInputStoreSeal(store);
+            const grantSeal = principalInputDescriptorSeal(value);
+            const workspaceSeal = principalInputDescriptorSeal(selected);
+            const freshOriginalSource = () =>
+              principalInputOwnerSeals.every((seal) => seal()) &&
+              principalInputReceiverSeal() &&
+              storeSeal() &&
+              grantSeal() &&
+              workspaceSeal();
+            // The pre-existing ordinary callback accepts inherited/dynamic
+            // stores even when they cannot furnish a qualified original.
+            // A source that was qualified before this await must not drift.
+            const qualifiedBefore = freshOriginalSource();
+            const workspaceOrganization = workspaceOrganizationFromDirectory(
+              await directory(value, `/${encodeURIComponent(selected.id)}/billing-organization`),
+              selected.id,
+            );
+            if (qualifiedBefore && !freshOriginalSource())
+              throw new SharedAuthSessionError("session_unavailable");
             const resolved = await principal(value, selected, store, {
               phase: "fresh-callback",
+              workspaceOrganization,
+              originalSource: () => qualifiedBefore && freshOriginalSource(),
             });
             const principalId = resolved.principalId;
             const oldSecret = cookie(request, sessionCookie);

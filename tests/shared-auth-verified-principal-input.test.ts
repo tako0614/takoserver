@@ -13,6 +13,7 @@ import {
   SESSION_TEST_CONSOLE,
   SESSION_TEST_ORGANIZATION,
   SESSION_TEST_PERSONAL,
+  SESSION_TEST_PERSONAL_ORGANIZATION,
 } from "./helpers/shared-auth-session-issuer.ts";
 
 const TIME = 1_800_000_000_000;
@@ -32,6 +33,7 @@ async function fixture(
 ) {
   let stamp = TIME;
   const issuer = await createSharedSessionTestIssuer(() => stamp);
+  issuer.control.personalBillingOrganization = SESSION_TEST_PERSONAL_ORGANIZATION;
   const attempts = new Map<string, OidcAttempt>();
   const sessions = new Map<string, OidcSessionRecord>();
   const inputs: {
@@ -239,10 +241,13 @@ test("verified RP original input reaches the resolver only after signed callback
         accountId: SESSION_TEST_ACCOUNT,
       },
       workspace: SESSION_TEST_PERSONAL,
+      workspaceOrganization: SESSION_TEST_PERSONAL_ORGANIZATION,
     });
     expect(Object.isFrozen(data)).toBe(true);
     expect(Object.isFrozen(data?.identity)).toBe(true);
     expect(Object.isFrozen(data?.workspace.roles)).toBe(true);
+    if (data?.phase !== "fresh-callback") throw new Error("missing fresh original");
+    expect(Object.isFrozen(data.workspaceOrganization)).toBe(true);
   };
   const response = await f.callback(started);
   expect(response.status).toBe(303);
@@ -256,8 +261,63 @@ test("verified RP original input reaches the resolver only after signed callback
     expect(JSON.stringify(data)).not.toContain(issued.accessToken);
     expect(JSON.stringify(data)).not.toContain(issued.refreshToken);
   }
-  expect(Object.keys(data!).sort()).toEqual(["identity", "phase", "workspace"]);
+  expect(Object.keys(data!).sort()).toEqual([
+    "identity",
+    "phase",
+    "workspace",
+    "workspaceOrganization",
+  ]);
 });
+
+test.each([
+  "absent",
+  "cross-workspace",
+  "extra-field",
+  "invalid-ref",
+  "forbidden",
+  "await-owner-drift",
+] as const)(
+  "fresh Organization %s refuses before principal resolution, create or Cookie",
+  async (failure) => {
+    const f = await fixture();
+    if (failure === "absent") f.issuer.control.personalBillingOrganization = undefined;
+    if (failure === "cross-workspace")
+      f.issuer.control.personalBillingOrganization = {
+        ...SESSION_TEST_PERSONAL_ORGANIZATION,
+        workspaceId: SESSION_TEST_ORGANIZATION.id,
+      };
+    if (failure === "extra-field")
+      f.issuer.control.personalBillingOrganization = {
+        ...SESSION_TEST_PERSONAL_ORGANIZATION,
+        inferred: true,
+      };
+    if (failure === "invalid-ref")
+      f.issuer.control.personalBillingOrganization = {
+        ...SESSION_TEST_PERSONAL_ORGANIZATION,
+        workspaceRef: "",
+      };
+    if (failure === "forbidden")
+      f.issuer.control.onPersonalBillingOrganization = async () => {
+        f.issuer.control.member = false;
+      };
+    if (failure === "await-owner-drift")
+      f.issuer.control.onPersonalBillingOrganization = async () => {
+        Object.defineProperty(f.options, "store", {
+          value: () => {
+            throw new Error("substituted store factory");
+          },
+          configurable: true,
+        });
+      };
+    const response = await f.callback(await f.start());
+    expect(response.status).not.toBe(303);
+    expect(f.inputs).toHaveLength(0);
+    expect(f.calls.create).toBe(0);
+    expect(response.headers.getSetCookie().some((header) => header.startsWith(`${COOKIE}=`))).toBe(
+      false,
+    );
+  },
+);
 
 test("unknown cloned inherited and other-factory captures cannot trigger caller getters", async () => {
   const f = await fixture();

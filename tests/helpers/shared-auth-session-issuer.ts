@@ -20,6 +20,11 @@ export const SESSION_TEST_PERSONAL: SharedWorkspaceChoice = {
   roles: ["owner"],
   owner: true,
 };
+export const SESSION_TEST_PERSONAL_ORGANIZATION = Object.freeze({
+  workspaceId: SESSION_TEST_PERSONAL.id,
+  workspaceRef: "immutable-personal-workspace-ref-123",
+  organizationId: "retained-takoserver-personal-organization-123",
+});
 export const SESSION_TEST_ORGANIZATION: SharedWorkspaceChoice = {
   id: "organization-workspace-456",
   handle: "organization-456",
@@ -58,6 +63,8 @@ export async function createSharedSessionTestIssuer(now: () => number) {
     email: "untrusted-existing-customer@example.test",
     onRefresh: undefined as (() => Promise<void>) | undefined,
     onBootstrap: undefined as (() => Promise<void>) | undefined,
+    personalBillingOrganization: undefined as Record<string, unknown> | undefined,
+    onPersonalBillingOrganization: undefined as (() => Promise<void>) | undefined,
   };
   const requests: {
     url: URL;
@@ -283,6 +290,17 @@ export async function createSharedSessionTestIssuer(now: () => number) {
           workspaceRef: "immutable-shared-workspace-ref-456",
           organizationId: "retained-takoserver-organization-789",
         });
+      }
+      if (
+        url.pathname ===
+        `/api/v1/account/shared-workspaces/${SESSION_TEST_PERSONAL.id}/billing-organization`
+      ) {
+        await control.onPersonalBillingOrganization?.();
+        if (!control.member)
+          return Response.json({ error: "workspace_forbidden" }, { status: 403 });
+        if (!control.personalBillingOrganization)
+          return Response.json({ error: "organization_unavailable" }, { status: 404 });
+        return Response.json(control.personalBillingOrganization);
       }
       throw new Error(`unexpected synthetic issuer path: ${url.pathname}`);
     },

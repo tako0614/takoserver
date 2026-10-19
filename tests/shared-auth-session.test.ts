@@ -22,6 +22,7 @@ import {
   SESSION_TEST_CONSOLE,
   SESSION_TEST_ORGANIZATION,
   SESSION_TEST_PERSONAL,
+  SESSION_TEST_PERSONAL_ORGANIZATION,
 } from "./helpers/shared-auth-session-issuer.ts";
 
 const INITIAL_TIME = 1_800_000_000_000;
@@ -76,6 +77,9 @@ async function fixture(
     });
     d1.store = createSharedAuthSessionStore(d1.sql);
     const issuer = await createSharedSessionTestIssuer(() => stamp);
+    // The issuer helper has no personal billing Organization by default. This
+    // fixture opts in to an explicit authenticated response for positive logins.
+    issuer.control.personalBillingOrganization = SESSION_TEST_PERSONAL_ORGANIZATION;
     const principalInputs: Parameters<SharedAuthPrincipalProjection["resolve"]>[0][] = [];
     const pins: { workspaceId: string; workspaceRef: string; organizationId: string }[] = [];
     const control = {
