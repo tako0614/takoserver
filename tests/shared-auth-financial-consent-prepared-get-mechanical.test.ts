@@ -107,6 +107,9 @@ if (child) {
     captureSharedAuthFinancialRequestClockObservation() {
       throw Error("unexpected legacy recapture");
     },
+    proveSharedAuthFinancialRequestIdentityFromObservation() {
+      throw Error("prepared GET must not dispatch proof");
+    },
   }));
   mock.module("../src/shared-auth-financial-consent-issuer.ts", () => ({
     createSharedAuthFinancialConsentIssuerSource(connection: unknown) {

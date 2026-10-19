@@ -15,6 +15,7 @@ if (isolated) {
   let active = true;
   let captures = 0;
   let clockCalls = 0;
+  let proofCalls = 0;
   const sourceClock = () => {
     clockCalls++;
     return new Date("2026-10-15T00:00:00.000Z");
@@ -47,6 +48,10 @@ if (isolated) {
       requireOrigin(value);
       if (capture !== originalCaptures?.credential) throw Error("foreign credential capture");
       return retained;
+    },
+    proveWorkerRequestRetainedRpFinancialIdentityOriginal() {
+      proofCalls++;
+      throw Error("Clock-only interop must not dispatch proof");
     },
   }));
   mock.module("../src/financial-auth-consumer.ts", () => ({
@@ -268,6 +273,7 @@ if (isolated) {
       ).toThrow();
       expect(captures).toBe(1);
       expect(clockCalls).toBe(1);
+      expect(proofCalls).toBe(0);
     } finally {
       active = false;
       f.close();

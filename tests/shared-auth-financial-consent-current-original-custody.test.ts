@@ -166,6 +166,9 @@ if (child) {
         throw Error("late source/Clock drift");
       return native;
     },
+    proveSharedAuthFinancialRequestIdentityFromObservation() {
+      throw Error("current consent verification must not dispatch proof");
+    },
   }));
 
   const { createSharedFinancialActionIdentity } = await import("../src/shared-financial-action.ts");

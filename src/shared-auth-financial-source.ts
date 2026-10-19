@@ -12,9 +12,11 @@ import {
   readFinancialActionConsentR1RequestCaptures,
 } from "./shared-financial-retained-r1.ts";
 import {
+  proveWorkerRequestRetainedRpFinancialIdentityOriginal,
   readWorkerRequestConsumers,
   readWorkerRequestFinancialInputs,
   readWorkerRequestRetainedRpCapture,
+  type WorkerRequestRetainedRpCapture,
   type WorkerRequestSql,
 } from "./worker-request-composition.ts";
 
@@ -351,6 +353,47 @@ export function readSharedAuthFinancialRequestNativeObservationData(
       currentSession: held.retained.current,
       finalSession: held.retained.finalSession,
     });
+  } catch {
+    return unavailable();
+  }
+}
+
+/** One proof attempt from the exact held Root capture. The result remains
+ * Accounts reference DATA, not an affirmative consent or financial grant. */
+export async function proveSharedAuthFinancialRequestIdentityFromObservation(
+  connection: WorkerRequestSql,
+  request: Request,
+  workspaceId: string,
+  challengeRef: string,
+  observation: unknown,
+): Promise<unknown> {
+  try {
+    if (!observation || typeof observation !== "object") return unavailable();
+    const held = observations.get(observation);
+    if (
+      !held ||
+      held.connection !== connection ||
+      held.request !== request ||
+      held.workspaceId !== workspaceId ||
+      typeof challengeRef !== "string" ||
+      challengeRef.length === 0
+    )
+      return unavailable();
+    assertCaptures(held);
+    // Root's static reader above proves this exact opaque handle belongs to
+    // the same request/connection. The brand is never accepted from a caller.
+    const capture = held.captures.credential as WorkerRequestRetainedRpCapture;
+    try {
+      return await proveWorkerRequestRetainedRpFinancialIdentityOriginal(
+        connection,
+        request,
+        workspaceId,
+        challengeRef,
+        capture,
+      );
+    } finally {
+      assertCaptures(held);
+    }
   } catch {
     return unavailable();
   }

@@ -25,6 +25,11 @@ if (child) {
   let anchor: object;
   let clockCalls = 0;
   let observerCalls = 0;
+  let proofCalls = 0;
+  let proofEntries = 0;
+  let proofGetterCalls = 0;
+  let proofMode: "success" | "unknown" | "malformed" | "expire-after" = "success";
+  let proofCapture: unknown;
   let dbNow = 0;
   let active = false;
   const captures = new WeakMap<Request, Readonly<{ credential: object; userBinding: object }>>();
@@ -53,8 +58,42 @@ if (child) {
         throw Error("foreign capture");
       return retained;
     },
+    async proveWorkerRequestRetainedRpFinancialIdentityOriginal(
+      value: unknown,
+      request: unknown,
+      workspaceId: unknown,
+      challengeRef: unknown,
+      capture: unknown,
+    ) {
+      proofEntries++;
+      requireConnection(value);
+      if (
+        !(request instanceof Request) ||
+        workspaceId !== SCOPE.workspaceId ||
+        challengeRef !== activeChallengeRef ||
+        captures.get(request)?.credential !== capture
+      )
+        throw Error("crossed retained RP proof capture");
+      proofCalls++;
+      proofCapture = capture;
+      if (proofMode === "unknown") throw Error("unknown proof ACK");
+      if (proofMode === "expire-after") dbNow = Date.parse(AT) + 301_000;
+      if (proofMode === "malformed") {
+        const response = {};
+        Object.defineProperty(response, "proofRef", {
+          enumerable: true,
+          get() {
+            proofGetterCalls++;
+            return "proof:forged";
+          },
+        });
+        return response;
+      }
+      return Object.freeze({ proofRef: "proof:from-original" });
+    },
   }));
   const requests = new Set<Request>();
+  let activeChallengeRef = "";
   mock.module("../src/financial-auth-consumer.ts", () => ({
     readWorkerRequestFinancialAuthConsumerPort(value: unknown) {
       requireConnection(value);
@@ -153,6 +192,11 @@ if (child) {
     Object.defineProperty(connection, "sql", { value: f.sql, enumerable: true });
     clockCalls = 0;
     observerCalls = 0;
+    proofCalls = 0;
+    proofEntries = 0;
+    proofGetterCalls = 0;
+    proofMode = "success";
+    proofCapture = undefined;
     requests.clear();
     const principalId = "principal:fixture";
     const principalIncarnation = "principal-incarnation:fixture";
@@ -351,6 +395,7 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
       AT,
     ]);
     const command = await f.command(action, action.kind);
+    activeChallengeRef = command.key.challengeRef;
     await f.registerFixtureData();
     await f.c0.prepare(command.original.c0);
     await f.sql.batch(await buildFinancialR1MechanicalBatch(f.options, command));
@@ -412,6 +457,206 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
       expect(clockCalls - before.clock).toBe(1);
     } finally {
       s.close();
+    }
+  });
+
+  test("separate proof continuation uses the same prepared Request and held opaque capture", async () => {
+    const s = await setup();
+    try {
+      const view = await prepared(s.handler, s.challengeRef);
+      const request = post(view.transactionRef);
+      const before = { writes: writes(), observer: observerCalls, clock: clockCalls };
+      const submission = await s.handler.readPreparedFinancialR1SubmissionData(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+      );
+      expect(proofCalls).toBe(0);
+      const proof = await s.handler.provePreparedFinancialR1Identity(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+        submission,
+      );
+      expect(proof).toEqual({ proofRef: "proof:from-original" });
+      expect(proofCalls).toBe(1);
+      expect(proofCapture).toBe(captures.get(request)?.credential);
+      expect(observerCalls - before.observer).toBe(1);
+      expect(clockCalls - before.clock).toBe(1);
+      expect(writes()).toBe(before.writes);
+    } finally {
+      s.close();
+    }
+  });
+
+  test("proof continuation rejects cloned result, other Request and handler before dispatch", async () => {
+    const s = await setup();
+    try {
+      const view = await prepared(s.handler, s.challengeRef);
+      const request = post(view.transactionRef);
+      const submission = await s.handler.readPreparedFinancialR1SubmissionData(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+      );
+      await expect(
+        s.handler.provePreparedFinancialR1Identity(request, SCOPE.workspaceId, s.challengeRef, {
+          ...submission,
+        }),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      await expect(
+        s.handler.provePreparedFinancialR1Identity(
+          post(view.transactionRef),
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      const other = createSharedAuthFinancialConsentRequestHandler(connection);
+      await expect(
+        other.provePreparedFinancialR1Identity(
+          request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(proofEntries).toBe(0);
+    } finally {
+      s.close();
+    }
+  });
+
+  test("pre-dispatch currentness failure never reaches Root proof and stays sticky", async () => {
+    const s = await setup();
+    try {
+      const view = await prepared(s.handler, s.challengeRef);
+      const request = post(view.transactionRef);
+      const submission = await s.handler.readPreparedFinancialR1SubmissionData(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+      );
+      const before = writes();
+      dbNow = Date.parse(AT) + 301_000;
+      await expect(
+        s.handler.provePreparedFinancialR1Identity(
+          request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      dbNow = Date.parse(AT) + 2_000;
+      await expect(
+        s.handler.provePreparedFinancialR1Identity(
+          request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(proofEntries).toBe(0);
+      expect(writes()).toBe(before);
+    } finally {
+      s.close();
+    }
+  });
+
+  test("unknown proof ACK is sticky for the same prepared original", async () => {
+    const s = await setup();
+    try {
+      const view = await prepared(s.handler, s.challengeRef);
+      const request = post(view.transactionRef);
+      const submission = await s.handler.readPreparedFinancialR1SubmissionData(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+      );
+      proofMode = "unknown";
+      const first = s.handler.provePreparedFinancialR1Identity(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+        submission,
+      );
+      const second = s.handler.provePreparedFinancialR1Identity(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+        submission,
+      );
+      expect(second).toBe(first);
+      await expect(first).rejects.toMatchObject({ code: "unavailable" });
+      expect(proofCalls).toBe(1);
+    } finally {
+      s.close();
+    }
+  });
+
+  test("malformed proof getter and failed post-effect currentness cannot grant or resend", async () => {
+    const s = await setup();
+    try {
+      const view = await prepared(s.handler, s.challengeRef);
+      const request = post(view.transactionRef);
+      const submission = await s.handler.readPreparedFinancialR1SubmissionData(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+      );
+      proofMode = "malformed";
+      await expect(
+        s.handler.provePreparedFinancialR1Identity(
+          request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(proofGetterCalls).toBe(0);
+      expect(proofCalls).toBe(1);
+      await expect(
+        s.handler.provePreparedFinancialR1Identity(
+          request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(proofCalls).toBe(1);
+    } finally {
+      s.close();
+    }
+    const next = await setup();
+    try {
+      const view = await prepared(next.handler, next.challengeRef);
+      const request = post(view.transactionRef);
+      const submission = await next.handler.readPreparedFinancialR1SubmissionData(
+        request,
+        SCOPE.workspaceId,
+        next.challengeRef,
+      );
+      proofMode = "expire-after";
+      await expect(
+        next.handler.provePreparedFinancialR1Identity(
+          request,
+          SCOPE.workspaceId,
+          next.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(proofCalls).toBe(1);
+      await expect(
+        next.handler.provePreparedFinancialR1Identity(
+          request,
+          SCOPE.workspaceId,
+          next.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(proofCalls).toBe(1);
+    } finally {
+      next.close();
     }
   });
 
@@ -564,7 +809,7 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
     expect(stderr).toContain(
       "(pass) actual R1 and RP POST preflight reads pending only with one held Clock",
     );
-    expect(stderr).toContain("5 pass");
+    expect(stderr).toContain("10 pass");
     expect(stderr).toContain("0 fail");
   }, 100_000);
 }
