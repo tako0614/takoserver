@@ -243,7 +243,11 @@ if (child) {
     },
     financialAuthConsumerSourceCurrentness(selected: unknown, original: unknown) {
       if (selected !== port || original !== context) throw Error("foreign Root source");
-      return { sql: "?=1", params: [1] };
+      // Same ten-bind shape as the Root native source currentness predicate.
+      return {
+        sql: Array.from({ length: 10 }, () => "?=1").join(" AND "),
+        params: Array.from({ length: 10 }, () => 1),
+      };
     },
   }));
   const issuer = Object.freeze({
@@ -259,7 +263,8 @@ if (child) {
           return issuer;
         },
         async currentness() {
-          return { original: issuer, sql: "?=1", params: [1] };
+          // Same four-bind shape as the issuer original EXISTS predicate.
+          return { original: issuer, sql: "?=1 AND ?=1 AND ?=1 AND ?=1", params: [1, 1, 1, 1] };
         },
       });
     },
@@ -381,6 +386,8 @@ if (child) {
       finalSession: Object.freeze({
         selectedWorkspaceId: SCOPE.workspaceId,
         principalId,
+        sessionDigest: `sha256:${"f".repeat(64)}`,
+        accountId: subject,
         identity: OIDC,
       }),
       selectedScope: Object.freeze({
@@ -880,6 +887,202 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
     }
   });
 
+  test("affirmative capture consumes the prepared original's own evidence once", async () => {
+    const s = await setup();
+    try {
+      const { request, submission } = await provedSubmission(s);
+      await s.handler.provePreparedFinancialR1Identity(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+        submission,
+      );
+      await s.handler.readPreparedFinancialR1IdentityEvidence(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+        submission,
+      );
+      const before = { observer: observerCalls, clock: clockCalls, rows: consentWrites() };
+      const captured = s.handler.capturePreparedFinancialR1Consent(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+        submission,
+      );
+      expect(
+        s.handler.capturePreparedFinancialR1Consent(
+          request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).toBe(captured);
+      const original = await captured;
+      expect(original.state).toBe("receipted-original-data");
+      expect(original.command.key.transactionRef).toBe(submission.pending.transaction_ref);
+      expect(original.command.key.consentRef).toMatch(/^rpcs_[A-Za-z0-9_-]{43}$/u);
+      expect(original.command.key.commandRef).toMatch(/^rpcm_[A-Za-z0-9_-]{43}$/u);
+      expect(original.command.key.receiptRef).toMatch(/^rpcr_[A-Za-z0-9_-]{43}$/u);
+      expect(consentWrites()).toEqual({ pending: 1, command: 1, original: 1 });
+      expect(before.rows).toEqual({ pending: 1, command: 0, original: 0 });
+      expect(observerCalls - before.observer).toBe(0);
+      expect(clockCalls - before.clock).toBe(0);
+      // The existing current verifier accepts the produced original on a new Request.
+      const witness = await s.handler.verifyCurrentActionConsent(get(), {
+        workspaceId: SCOPE.workspaceId,
+        consentProofRef: original.command.key.consentRef,
+      });
+      expect(witness.consentProofRef).toBe(original.command.key.consentRef);
+    } finally {
+      s.close();
+    }
+  });
+
+  test("affirmative capture refuses missing evidence, crossing and pre-batch expiry without rows", async () => {
+    const s = await setup();
+    try {
+      const { request, submission } = await provedSubmission(s);
+      await s.handler.provePreparedFinancialR1Identity(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+        submission,
+      );
+      // Never joins evidence on its own.
+      await expect(
+        s.handler.capturePreparedFinancialR1Consent(
+          request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(loadCalls).toBe(0);
+      await s.handler.readPreparedFinancialR1IdentityEvidence(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+        submission,
+      );
+      const other = createSharedAuthFinancialConsentRequestHandler(connection);
+      for (const attempt of [
+        () =>
+          s.handler.capturePreparedFinancialR1Consent(request, SCOPE.workspaceId, s.challengeRef, {
+            ...submission,
+          }),
+        () =>
+          other.capturePreparedFinancialR1Consent(
+            request,
+            SCOPE.workspaceId,
+            s.challengeRef,
+            submission,
+          ),
+        () =>
+          s.handler.capturePreparedFinancialR1Consent(
+            request,
+            SCOPE.workspaceId,
+            "challenge:other",
+            submission,
+          ),
+      ])
+        await expect(attempt()).rejects.toMatchObject({ code: "unavailable" });
+      expect(consentWrites()).toEqual({ pending: 1, command: 0, original: 0 });
+      dbNow = Date.parse(AT) + 301_000;
+      const expired = s.handler.capturePreparedFinancialR1Consent(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+        submission,
+      );
+      await expect(expired).rejects.toMatchObject({ code: "unavailable" });
+      dbNow = Date.parse(AT) + 2_000;
+      expect(
+        s.handler.capturePreparedFinancialR1Consent(
+          request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).toBe(expired);
+      expect(consentWrites()).toEqual({ pending: 1, command: 0, original: 0 });
+    } finally {
+      s.close();
+    }
+  });
+
+  test("affirmative capture after failed evidence or a consumed transaction never re-mints", async () => {
+    const s = await setup();
+    try {
+      const { request, submission } = await provedSubmission(s);
+      await s.handler.provePreparedFinancialR1Identity(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+        submission,
+      );
+      evidenceMode = "load-unknown";
+      await expect(
+        s.handler.readPreparedFinancialR1IdentityEvidence(
+          request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      await expect(
+        s.handler.capturePreparedFinancialR1Consent(
+          request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(consentWrites()).toEqual({ pending: 1, command: 0, original: 0 });
+    } finally {
+      s.close();
+    }
+    const next = await setup();
+    try {
+      const view = await prepared(next.handler, next.challengeRef);
+      const request = post(view.transactionRef);
+      const submission = await next.handler.readPreparedFinancialR1SubmissionData(
+        request,
+        SCOPE.workspaceId,
+        next.challengeRef,
+      );
+      await next.handler.provePreparedFinancialR1Identity(
+        request,
+        SCOPE.workspaceId,
+        next.challengeRef,
+        submission,
+      );
+      await next.handler.readPreparedFinancialR1IdentityEvidence(
+        request,
+        SCOPE.workspaceId,
+        next.challengeRef,
+        submission,
+      );
+      await next.handler.capturePreparedFinancialR1Consent(
+        request,
+        SCOPE.workspaceId,
+        next.challengeRef,
+        submission,
+      );
+      // A re-POST of the consumed transaction cannot even be prepared again.
+      await expect(
+        next.handler.readPreparedFinancialR1SubmissionData(
+          post(view.transactionRef),
+          SCOPE.workspaceId,
+          next.challengeRef,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(consentWrites()).toEqual({ pending: 1, command: 1, original: 1 });
+    } finally {
+      next.close();
+    }
+  });
+
   test("identity evidence refuses a failed prove, crossed arguments and pre-load drift", async () => {
     const s = await setup();
     try {
@@ -1160,7 +1363,7 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
     expect(stderr).toContain(
       "(pass) actual R1 and RP POST preflight reads pending only with one held Clock",
     );
-    expect(stderr).toContain("15 pass");
+    expect(stderr).toContain("18 pass");
     expect(stderr).toContain("0 fail");
   }, 100_000);
 }

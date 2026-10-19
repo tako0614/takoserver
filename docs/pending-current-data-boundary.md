@@ -296,3 +296,27 @@ returned `financial-proof` identity evidence is DATA only: it is not
 affirmative consent, acceptedAt, a consent original, command claim or consume,
 current permission or Financial NEW/CAS. Those remain the next guarded
 same-primary effect.
+
+`capturePreparedFinancialR1Consent` is the unmounted affirmative POST effect
+for one prepared original whose own identity evidence has already joined. It
+never proves or joins on its own. Every v4 consent field comes from the held
+retained R1 (action, challenge, terms, source, path, realm), the held Root
+observation (final session, credential origin, human binding, current
+session), the issuer original and that `financial-proof` evidence. The single
+held Clock sample is `acceptedAt`, `command.capturedAt` and `recordedAt`;
+`expiresAt` is the minimum of pending29 expiry, session absolute expiry and
+challenge expiry. `consentRef`, `commandRef` and `receiptRef` are derived from
+the R1 transaction address (`rpcs_`/`rpcm_`/`rpcr_` plus the base64url SHA-256
+of `["takoserver-rp-explicit-action-consent-refs-v1", role, transactionRef]`),
+and command16 bytes are the canonical JSON of the version, family, key,
+selected scope, `approve=yes` submission, original digest and capture time.
+`captureAndConsumePreparedSharedAuthFinancialConsentObservedRequestData` then
+runs one required batch over the existing pending29 row: command capture and
+the 95-bind native/issuer-guarded consume into original14 with its receipt.
+pending29 is matched in full and never inserted or replaced; a false guard
+aborts both rows. The attempt is installed before its first await and is
+never resent; an unknown acknowledgement keeps the existing original-fullcommand
+GET recovery, and a later re-mint with another capture time is a custody
+conflict. A consumed transaction can no longer be prepared for POST. The
+receipted original is local DATA for `verifyCurrentActionConsent` and the
+Financial consumer, not Financial NEW/CAS admission or a mounted route.
