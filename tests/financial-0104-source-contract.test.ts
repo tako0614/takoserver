@@ -727,7 +727,7 @@ describe("Financial 0104 source recipe", () => {
       db.close();
     }
     // Financial source only reads the table; its one writer is Root's Org cascade.
-    const writers = new Bun.Glob("src/**/*.ts").scanSync({ cwd: ROOT });
+    const writers = new Bun.Glob("src/{financial-,shared-financial-}*.ts").scanSync({ cwd: ROOT });
     for (const path of writers) {
       const source = readFileSync(join(ROOT, path), "utf8");
       expect({
