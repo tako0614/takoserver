@@ -801,3 +801,32 @@ print(json.dumps({'bad':bad,'depth':c.getlimit(sqlite3.SQLITE_LIMIT_EXPR_DEPTH),
     f.close();
   }
 });
+
+test("coverage is scoped per Org: another Org's change leaves it valid, its own change refuses", async () => {
+  const { f, l1 } = await customerCase();
+  try {
+    const snapshot = () =>
+      readCustomerJournalSnapshot(f.sql, {
+        organizationId: f.org,
+        realmRegistration: f.journal.realmRegistration,
+        realmIncarnation: f.journal.realmIncarnation,
+      });
+    await f.sql.run(
+      "INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:other','Other','principal:other',?)",
+      [f.at],
+    );
+    await f.sql.run("UPDATE orgs SET owner_principal_id='principal:moved' WHERE id='org:other'");
+    await f.sql.run("DELETE FROM orgs WHERE id='org:other'");
+    expect(
+      await f.sql.query("SELECT change_kind FROM financial_customer_history_org_changes"),
+    ).toHaveLength(2);
+    expect(await snapshot()).not.toBeNull();
+    // The guarded L1 still commits through the actual writer.
+    const plan = await mechanicalGuard(f, l1);
+    expect((await f.money.batch(plan.statements)).map((x) => x.changes)).toEqual(Array(7).fill(1));
+    await f.sql.run("UPDATE orgs SET created_at='2027-01-01T00:00:00.000Z' WHERE id=?", [f.org]);
+    expect(await snapshot()).toBeNull();
+  } finally {
+    f.close();
+  }
+});

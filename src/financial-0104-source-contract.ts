@@ -185,7 +185,7 @@ export interface Financial0104Object {
 function objects(schema: Readonly<Record<string, string>>): readonly Financial0104Object[] {
   return Object.entries(schema).map(([name, sql]) => {
     const match =
-      /^CREATE (TABLE|TRIGGER|UNIQUE INDEX) ([A-Za-z0-9_]+)\b(?:[\s\S]*?\bON ([A-Za-z0-9_]+)\b)?/u.exec(
+      /^CREATE (TABLE|TRIGGER|UNIQUE INDEX|INDEX) ([A-Za-z0-9_]+)\b(?:[\s\S]*?\bON ([A-Za-z0-9_]+)\b)?/u.exec(
         sql,
       );
     const type =
@@ -193,7 +193,7 @@ function objects(schema: Readonly<Record<string, string>>): readonly Financial01
         ? "table"
         : match?.[1] === "TRIGGER"
           ? "trigger"
-          : match?.[1] === "UNIQUE INDEX"
+          : match?.[1] === "UNIQUE INDEX" || match?.[1] === "INDEX"
             ? "index"
             : undefined;
     const table = type === "table" ? match?.[2] : match?.[3];

@@ -1749,3 +1749,173 @@ test("with an open capture, raw Org create, identity change and delete still suc
     f.db.close();
   }
 });
+const ORG_CAPTURE = [
+  "financial_history_capture_org_replace",
+  "financial_history_capture_org_insert",
+  "financial_history_capture_org_update",
+  "financial_history_capture_org_delete",
+];
+/** An Org write before Root's 0105 existed: no Org capture trigger fires. */
+function pre0105(f: ReturnType<typeof fixture>, sql: string) {
+  const triggers = ORG_CAPTURE.map(
+    (name) =>
+      (f.db.query("SELECT sql FROM sqlite_schema WHERE name=?").get(name) as { sql: string }).sql,
+  );
+  for (const name of ORG_CAPTURE) f.db.exec(`DROP TRIGGER ${name}`);
+  try {
+    f.db.exec(sql);
+  } finally {
+    for (const trigger of triggers) f.db.exec(trigger);
+  }
+}
+let coverageSerial = 0;
+/** The genesis coverage row (framed) whose origin is the Org's post-seal birth. */
+async function coverage(f: ReturnType<typeof fixture>, run: HistoryEnrollment, org: string) {
+  const birth = f.db
+    .query(
+      "SELECT birth_ref FROM financial_customer_history_birth_observations WHERE org_id=? AND phase='post-seal' AND enrollment_ref=?",
+    )
+    .get(org, run.enrollmentRef) as { birth_ref: string } | null;
+  if (!birth) throw new Error(`no post-seal birth for ${org}`);
+  const n = ++coverageSerial;
+  return f.sql.run(
+    `INSERT INTO financial_customer_history_coverages(history_ref,coverage_incarnation,attempt_ref,expected_receipt_ref,coverage_kind,original_org_origin,organization_id,primary_ref,enrollment_ref,complete_seal_ref,seal_kind,realm_registration,realm_incarnation,realm_json,required_scopes_json,writer_epoch,previous_history_ref,created_at)
+     VALUES(?,?,?,?,'qualified-genesis',?,?,?,?,?,'complete-seal',?,?,'{}',?,?,NULL,?)`,
+    [
+      `history:${n}`,
+      `coverage-inc:${n}`,
+      `coverage-attempt:${n}`,
+      `coverage-receipt:${n}`,
+      birth.birth_ref,
+      org,
+      root.primaryRef,
+      run.enrollmentRef,
+      run.sealReceiptRef,
+      `realm-registration:${n}`,
+      "realm-inc:1",
+      canonicalJson(run.required),
+      root.writerEpoch,
+      at,
+    ],
+  );
+}
+const LATER = "2026-10-16T00:00:00.000Z";
+async function sealedFor(f: ReturnType<typeof fixture>, run: HistoryEnrollment) {
+  await f.component.start(root, run);
+  await f.inventory(run);
+  expect((await f.seal(run))?.all_rows_match).toBe(1);
+}
+test("a fresh post-seal Org is a coverage origin", async () => {
+  const f = fixture();
+  try {
+    await principal(f);
+    const run = enrollment();
+    await sealedFor(f, run);
+    await f.org("org:fresh");
+    expect((await coverage(f, run, "org:fresh")).changes).toBe(1);
+  } finally {
+    f.db.close();
+  }
+});
+test("A1: an Org that existed before 0105, deleted before capture and re-inserted after the seal, is never a coverage origin", async () => {
+  const f = fixture();
+  try {
+    await principal(f);
+    pre0105(
+      f,
+      `INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:old','Org','principal:owner','${at}')`,
+    );
+    await f.raw.run("DELETE FROM orgs WHERE id='org:old'");
+    const run = enrollment();
+    await sealedFor(f, run);
+    await f.raw.run(
+      "INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:old','Org','principal:owner',?)",
+      [LATER],
+    );
+    expect(births(f)).toEqual([
+      { org_id: "org:old", phase: "post-seal", complete_seal_ref: run.sealReceiptRef },
+    ]);
+    await constraint(() => coverage(f, run, "org:old"));
+  } finally {
+    f.db.close();
+  }
+});
+test("A2: a gen1 roster Org deleted, gen1 closed, gen2 sealed and the id re-inserted is never a coverage origin", async () => {
+  const f = fixture();
+  try {
+    await principal(f);
+    pre0105(
+      f,
+      `INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:x','Org','principal:owner','${at}')`,
+    );
+    const first = enrollment([scope("org-namespace", "org:x", "principal:owner")]);
+    await f.component.start(root, first);
+    await f.raw.run("DELETE FROM orgs WHERE id='org:x'");
+    await f.component.close(root, first);
+    const next: HistoryEnrollment = {
+      ...enrollment(),
+      enrollmentRef: "enrollment:2",
+      enrollmentIncarnation: "enrollment-inc:2",
+      generation: 2,
+      startReceiptRef: "receipt:start2",
+      sealReceiptRef: "receipt:seal2",
+      previousStartReceiptRef: first.startReceiptRef,
+      previousSealRef: null,
+    };
+    await sealedFor(f, next);
+    await f.raw.run(
+      "INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:x','Org','principal:owner',?)",
+      [LATER],
+    );
+    await constraint(() => coverage(f, next, "org:x"));
+  } finally {
+    f.db.close();
+  }
+});
+test("A3: after an id move, the re-inserted old id is never a coverage origin", async () => {
+  const f = fixture();
+  try {
+    await principal(f);
+    pre0105(
+      f,
+      `INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:a','Org','principal:owner','${at}')`,
+    );
+    await f.raw.run("UPDATE orgs SET id='org:moved' WHERE id='org:a'");
+    const run = enrollment([scope("org-namespace", "org:moved", "principal:owner")]);
+    await sealedFor(f, run);
+    await f.raw.run(
+      "INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:a','Org','principal:owner',?)",
+      [LATER],
+    );
+    await constraint(() => coverage(f, run, "org:a"));
+  } finally {
+    f.db.close();
+  }
+});
+test("an Org id deleted before 0105 with older money rows is never a coverage origin; without any trace it is (documented residual)", async () => {
+  for (const traced of [true, false]) {
+    const f = fixture();
+    try {
+      await principal(f);
+      pre0105(
+        f,
+        `INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:ghost','Org','principal:owner','${at}')`,
+      );
+      if (traced)
+        f.db.exec(
+          `INSERT INTO ledger(id,org_id,type,ref,settled_delta_micros,held_delta_micros,created_at) VALUES('ledger:ghost','org:ghost','funding','ref:ghost',1,0,'${at}')`,
+        );
+      pre0105(f, "DELETE FROM orgs WHERE id='org:ghost'");
+      const run = enrollment();
+      await sealedFor(f, run);
+      await f.raw.run(
+        "INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:ghost','Org','principal:owner',?)",
+        [LATER],
+      );
+      if (traced) await constraint(() => coverage(f, run, "org:ghost"));
+      else expect((await coverage(f, run, "org:ghost")).changes).toBe(1);
+    } finally {
+      f.db.close();
+    }
+  }
+});

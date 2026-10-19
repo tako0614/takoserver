@@ -33,6 +33,7 @@ CREATE TABLE financial_history_enrollment_roster (
  PRIMARY KEY(enrollment_ref,org_id),
  FOREIGN KEY(enrollment_ref,primary_ref) REFERENCES financial_history_enrollments(enrollment_ref,primary_ref)
 );
+CREATE INDEX financial_history_enrollment_roster_by_org ON financial_history_enrollment_roster(primary_ref,org_id);
 CREATE TABLE financial_history_enrollment_inventory (
  inventory_ref TEXT PRIMARY KEY NOT NULL, enrollment_ref TEXT NOT NULL, primary_ref TEXT NOT NULL,
  scope_kind TEXT NOT NULL CHECK(scope_kind IN('physical-primary','writer','credential-alias','org-namespace','retired-namespace','org-alias')),
@@ -113,6 +114,8 @@ CREATE TRIGGER financial_history_enrollment_receipts_no_delete BEFORE DELETE ON 
 END;
 CREATE TRIGGER financial_history_enrollment_receipts_no_update BEFORE UPDATE ON financial_history_enrollment_receipts BEGIN SELECT RAISE(ABORT,'constraint: retained history mutation');
 END;
+CREATE INDEX financial_customer_history_org_changes_by_org ON financial_customer_history_org_changes(org_id);
+CREATE INDEX financial_customer_history_org_changes_by_new_org ON financial_customer_history_org_changes(new_org_id);
 CREATE TRIGGER financial_customer_history_birth_observations_no_replace BEFORE INSERT ON financial_customer_history_birth_observations WHEN EXISTS(SELECT 1 FROM financial_customer_history_birth_observations WHERE (birth_ref=NEW.birth_ref) OR (org_id=NEW.org_id AND primary_ref=NEW.primary_ref AND enrollment_ref=NEW.enrollment_ref) OR (NEW.phase='raw' AND phase='raw' AND org_id=NEW.org_id)) BEGIN SELECT RAISE(ABORT,'constraint: retained history replacement');
 END;
 CREATE TRIGGER financial_customer_history_birth_observations_org_capture BEFORE INSERT ON financial_customer_history_birth_observations
