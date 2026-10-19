@@ -84,11 +84,15 @@ export const FINANCIAL_0104_CUSTOMER_L1_FENCE_SCHEMA: Readonly<Record<string, st
 
 /** Customer H0 history fences. The epoch is the retained root's own writerEpoch.
  * Enrollment heads admit an UPDATE: the H0 writer's seal and restart keep the
- * capture sequence, so those are fenced; Root's Org capture triggers (Root 0105)
- * only ever advance it (capture or close), so Root's Org writes are not refused here.
- * financial_customer_history_birth_observations is append-only and written only by
- * those Org triggers; it carries no fence (fencing it would refuse every Org write
- * outside Root's Money frame), and no Financial batch may write it. */
+ * capture sequence, so those are fenced. The only UPDATE outside the fence is the
+ * exact capture advance of Root's Org INSERT cascade (Root 0105): capture_sequence
+ * OLD+1 with every other column unchanged. Every other UPDATE, including the Org
+ * UPDATE/DELETE cascade's close, needs Root's Money frame.
+ * financial_customer_history_birth_observations is append-only and carries no money
+ * fence (fencing it would refuse every Org creation outside Root's Money frame); its
+ * org_capture guard admits only the exact row the Org INSERT cascade writes (the
+ * current orgs row and the current head capture, phase and seal), and no Financial
+ * batch may write it. */
 export const FINANCIAL_0104_CUSTOMER_H0_FENCE_SCHEMA: Readonly<Record<string, string>> =
   Object.freeze({
     financial_history_primary_roots_money_fence:
@@ -100,7 +104,9 @@ export const FINANCIAL_0104_CUSTOMER_H0_FENCE_SCHEMA: Readonly<Record<string, st
     financial_history_enrollment_heads_money_fence:
       "CREATE TRIGGER financial_history_enrollment_heads_money_fence BEFORE INSERT ON financial_history_enrollment_heads\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_history_primary_roots r\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE r.primary_ref IS NEW.primary_ref AND p.writer_epoch IS json_extract(r.root_json,'$.writerEpoch')) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial history head permit/epoch required');\nEND",
     financial_history_enrollment_heads_money_fence_update:
-      "CREATE TRIGGER financial_history_enrollment_heads_money_fence_update BEFORE UPDATE ON financial_history_enrollment_heads\nWHEN NEW.capture_sequence IS OLD.capture_sequence AND (EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_history_primary_roots r\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE r.primary_ref IS NEW.primary_ref AND p.writer_epoch IS json_extract(r.root_json,'$.writerEpoch'))) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial history head transition permit/epoch required');\nEND",
+      "CREATE TRIGGER financial_history_enrollment_heads_money_fence_update BEFORE UPDATE ON financial_history_enrollment_heads\nWHEN NOT (NEW.capture_sequence=OLD.capture_sequence+1 AND NEW.primary_ref IS OLD.primary_ref AND NEW.enrollment_ref IS OLD.enrollment_ref\n AND NEW.generation IS OLD.generation AND NEW.state IS OLD.state AND NEW.expected_receipt_ref IS OLD.expected_receipt_ref)\n AND (EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_history_primary_roots r\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE r.primary_ref IS NEW.primary_ref AND p.writer_epoch IS json_extract(r.root_json,'$.writerEpoch'))) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial history head transition permit/epoch required');\nEND",
+    financial_customer_history_birth_observations_org_capture:
+      "CREATE TRIGGER financial_customer_history_birth_observations_org_capture BEFORE INSERT ON financial_customer_history_birth_observations\nWHEN NOT EXISTS(SELECT 1 FROM orgs o WHERE o.id IS NEW.org_id AND o.owner_principal_id IS NEW.owner_principal_id\n AND o.name IS NEW.org_name AND o.created_at IS NEW.org_created_at)\n OR NOT ((NEW.phase='raw' AND NOT EXISTS(SELECT 1 FROM financial_history_enrollment_heads WHERE state IN('capturing','sealed')))\n OR EXISTS(SELECT 1 FROM financial_history_enrollment_heads h JOIN financial_history_enrollments e ON e.enrollment_ref=h.enrollment_ref\n LEFT JOIN financial_history_enrollment_receipts r ON r.receipt_ref=e.expected_seal_ref AND r.receipt_kind='complete-seal' AND r.enrollment_ref=e.enrollment_ref\n WHERE h.state IN('capturing','sealed') AND h.primary_ref IS NEW.primary_ref AND h.enrollment_ref IS NEW.enrollment_ref\n AND h.capture_sequence IS NEW.capture_sequence AND NEW.complete_seal_ref IS r.receipt_ref\n AND NEW.phase IS CASE WHEN h.state='sealed' AND r.receipt_ref IS NOT NULL THEN 'post-seal' ELSE 'during-enrollment' END)) BEGIN\n SELECT RAISE(ABORT,'constraint: birth observation requires its exact Org capture');\nEND",
     financial_history_enrollment_receipts_money_fence:
       "CREATE TRIGGER financial_history_enrollment_receipts_money_fence BEFORE INSERT ON financial_history_enrollment_receipts\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_history_primary_roots r\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE r.primary_ref IS NEW.primary_ref AND p.writer_epoch IS json_extract(r.root_json,'$.writerEpoch')) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial history receipt permit/epoch required');\nEND",
   });

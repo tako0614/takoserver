@@ -1400,3 +1400,61 @@ test("epoch-bound H0 fences refuse a current permit for another epoch and roll t
     f.db.close();
   }
 });
+test("forged birth rows and head closes are refused outside the frame; the Org cascade still captures", async () => {
+  const f = fixture();
+  try {
+    const run = enrollment();
+    await f.component.start(root, run);
+    await f.raw.run(
+      "INSERT INTO money_cutover_freeze VALUES(1,'binding','origin','backup','writer','source')",
+    );
+    const before = f.snapshot();
+    // A raw birth row with no matching Org, or disagreeing with the current head, is refused.
+    await constraint(() =>
+      f.raw.run(
+        "INSERT INTO financial_customer_history_birth_observations(birth_ref,org_id,owner_principal_id,org_name,org_created_at,phase,primary_ref,enrollment_ref,capture_sequence) VALUES('birth:forged','org:none','principal:owner','Org',?,'during-enrollment',?,?,1)",
+        [at, root.primaryRef, run.enrollmentRef],
+      ),
+    );
+    // A raw close (the Org UPDATE/DELETE cascade's shape) needs Root's Money frame.
+    await constraint(() =>
+      f.raw.run(
+        "UPDATE financial_history_enrollment_heads SET state='closed',capture_sequence=capture_sequence+1",
+      ),
+    );
+    expect(f.snapshot()).toBe(before);
+    // Root's Org INSERT cascade still captures outside the frame, even frozen.
+    await f.raw.run(
+      "INSERT OR IGNORE INTO principals(id,provider,provider_subject,email,display_name,created_at) VALUES('principal:owner','google','subject:owner','owner@invalid.example','Owner',?)",
+      [at],
+    );
+    await f.raw.run(
+      "INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:frozen','Org','principal:owner',?)",
+      [at],
+    );
+    expect(
+      f.db
+        .query(
+          "SELECT phase,capture_sequence FROM financial_customer_history_birth_observations WHERE org_id='org:frozen'",
+        )
+        .all(),
+    ).toEqual([{ phase: "during-enrollment", capture_sequence: 1 }]);
+    // A forged copy of that row cannot be appended at the same capture.
+    await constraint(() =>
+      f.raw.run(
+        "INSERT INTO financial_customer_history_birth_observations(birth_ref,org_id,owner_principal_id,org_name,org_created_at,phase,primary_ref,enrollment_ref,capture_sequence) VALUES('birth:copy','org:frozen','principal:owner','Org',?,'during-enrollment',?,?,1)",
+        [at, root.primaryRef, run.enrollmentRef],
+      ),
+    );
+    // An Org change during capture closes it only inside Root's unfrozen Money frame.
+    await constraint(() => f.raw.run("UPDATE orgs SET name='Changed' WHERE id='org:frozen'"));
+    await constraint(() => f.sql.run("UPDATE orgs SET name='Changed' WHERE id='org:frozen'"));
+    await f.raw.run("DELETE FROM money_cutover_freeze");
+    await f.sql.run("UPDATE orgs SET name='Changed' WHERE id='org:frozen'");
+    expect(f.db.query("SELECT state FROM financial_history_enrollment_heads").get()).toEqual({
+      state: "closed",
+    });
+  } finally {
+    f.db.close();
+  }
+});

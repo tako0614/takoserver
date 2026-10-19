@@ -266,11 +266,11 @@ describe("Financial 0104 source recipe", () => {
           expect(
             object?.sql.startsWith(`CREATE TRIGGER ${update} BEFORE UPDATE ON ${table}\n`),
           ).toBe(true);
-          // H0 enrollment heads fence only the H0 writer's same-capture transitions;
-          // Root's Org capture triggers (Root 0105) advance the capture sequence.
+          // H0 enrollment heads exempt only the exact capture advance of Root's Org
+          // INSERT cascade (Root 0105); every other UPDATE goes through the fence.
           expect(object?.sql).toContain(
             table === "financial_history_enrollment_heads"
-              ? "WHEN NEW.capture_sequence IS OLD.capture_sequence AND (EXISTS(SELECT 1 FROM money_cutover_freeze)"
+              ? "WHEN NOT (NEW.capture_sequence=OLD.capture_sequence+1 AND NEW.primary_ref IS OLD.primary_ref"
               : "WHEN EXISTS(SELECT 1 FROM money_cutover_freeze)",
           );
           expect(object?.sql).toContain("p.singleton=1 AND p.epoch='usd-micros-v2'");
@@ -471,13 +471,20 @@ describe("Financial 0104 source recipe", () => {
         db.exec("INSERT INTO money_cutover_freeze VALUES(1,'b','o','k','w','s')");
         expect(update).toThrow(/constraint: Financial .*permit/u);
         if (table === "financial_history_enrollment_heads") {
-          // Root's Org capture triggers only advance the capture sequence; that
-          // transition is not a Financial write and stays outside this fence.
+          // The exact capture advance of Root's Org INSERT cascade is not a Financial
+          // write and stays outside this fence, even frozen.
           expect(() =>
             db.exec(
               "UPDATE financial_history_enrollment_heads SET capture_sequence=capture_sequence+1",
             ),
           ).not.toThrow();
+          // A close, a larger jump, or an advance with any other change is fenced.
+          for (const forged of [
+            "UPDATE financial_history_enrollment_heads SET state='closed',capture_sequence=capture_sequence+1",
+            "UPDATE financial_history_enrollment_heads SET capture_sequence=capture_sequence+2",
+            "UPDATE financial_history_enrollment_heads SET capture_sequence=capture_sequence+1,expected_receipt_ref='forged'",
+          ])
+            expect(() => db.exec(forged)).toThrow(/constraint: Financial .*permit/u);
         }
         db.exec("DELETE FROM money_cutover_freeze");
         expect(update).not.toThrow();
@@ -539,8 +546,9 @@ describe("Financial 0104 source recipe", () => {
         ...Object.keys(FINANCIAL_0104_CONSENT_FENCE_SCHEMA),
         ...Object.keys(FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA),
       ]);
-      expect(Object.keys(FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA)).toHaveLength(17);
-      expect(added.size).toBe(35);
+      // 17 Customer money fences plus the birth-observation Org capture guard.
+      expect(Object.keys(FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA)).toHaveLength(18);
+      expect(added.size).toBe(36);
       expect(schemaRows(db, FINANCIAL_0104_TABLES)).toEqual(
         FINANCIAL_0104_OBJECTS.filter((o) => !added.has(o.name))
           .map(({ type, name, tbl_name, sql }) => ({ type, name, tbl_name, sql }))
@@ -718,11 +726,23 @@ describe("Financial 0104 source recipe", () => {
         "financial_customer_history_birth_observations_no_delete",
         "financial_customer_history_birth_observations_no_replace",
         "financial_customer_history_birth_observations_no_update",
+        "financial_customer_history_birth_observations_org_capture",
       ]);
       db.exec("PRAGMA foreign_keys=OFF");
+      const birth = (ref: string, org: string, name: string) =>
+        db.exec(
+          `INSERT INTO financial_customer_history_birth_observations(birth_ref,org_id,owner_principal_id,org_name,org_created_at,phase) VALUES('${ref}','${org}','owner','${name}','at','raw')`,
+        );
+      // A forged row with no matching Org is refused, frozen or not.
+      db.exec(MONEY_FREEZE_ROW);
+      expect(() => birth("birth:forged", "org:a", "name")).toThrow(/exact Org capture/u);
       db.exec(
-        "INSERT INTO financial_customer_history_birth_observations(birth_ref,org_id,owner_principal_id,org_name,org_created_at,phase) VALUES('birth:a','org:a','owner','name','at','raw')",
+        "INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:a','name','owner','at')",
       );
+      // The Org exists but the row disagrees with it.
+      expect(() => birth("birth:forged", "org:a", "other")).toThrow(/exact Org capture/u);
+      // Exactly what the Org INSERT cascade writes while no capture is open.
+      birth("birth:a", "org:a", "name");
       expect(() =>
         db.exec("UPDATE financial_customer_history_birth_observations SET org_name='changed'"),
       ).toThrow(/constraint: retained history mutation/u);
