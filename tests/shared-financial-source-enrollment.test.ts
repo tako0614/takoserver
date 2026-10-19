@@ -4,8 +4,11 @@ import { readFileSync } from "node:fs";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { verifyHostedBillingFinancialRealm } from "../src/hosted-billing-realm.ts";
 import {
+  createMoneyCutoverSql,
   MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL,
   MONEY_CUTOVER_FREEZE_DDL,
+  MONEY_CUTOVER_PERMIT_DDL,
+  MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
 } from "../src/money-cutover-sql.ts";
 import { type Sql, SqlError, type SqlStatement } from "../src/ports.ts";
 import { createSharedFinancialSourceReceiver } from "../src/shared-financial-source.ts";
@@ -32,6 +35,16 @@ import {
 import { FINANCIAL_GENESIS_SCHEMA } from "../src/shared-financial-source-genesis-schema.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
+import {
+  dropFinancial0104Fences,
+  fenceLiftedSql,
+  financial0104Writer,
+  inPermitFrame,
+  installFinancial0104Fences,
+  MONEY_FREEZE_ROW,
+  permitFramed,
+  withMoneyFencesLifted,
+} from "./helpers/financial-0104-fenced.ts";
 
 const AT = "2026-10-15T00:00:00.000Z";
 const D = `sha256:${"a".repeat(64)}` as const,
@@ -70,7 +83,7 @@ function withGuardDisabled(db: Database, name: string, mutate: () => void) {
   if (!guard) throw Error(`missing trigger ${name}`);
   db.exec(`DROP TRIGGER ${name}`);
   try {
-    mutate();
+    withMoneyFencesLifted(db, mutate);
   } finally {
     db.exec(guard.sql);
   }
@@ -96,7 +109,7 @@ function event(affectedRef = A): FinancialSourceEvent {
     evidenceRef: `evidence:${affectedRef}`,
   };
 }
-async function fixture() {
+async function fixture(options: { readonly unfenced?: boolean } = {}) {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m.sql);
   db.exec(
@@ -107,7 +120,13 @@ async function fixture() {
   );
   db.exec(MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL);
   db.exec(MONEY_CUTOVER_FREEZE_DDL);
+  db.exec(MONEY_CUTOVER_PERMIT_DDL);
+  db.exec(MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL);
   db.exec(FINANCIAL_SOURCE_ENROLLMENT_DDL);
+  // New C0/M writes require the exact fenced 0104 shape; `unfenced` keeps the
+  // legacy candidate for read/recovery and write-refusal tests.
+  if (!options.unfenced)
+    installFinancial0104Fences(db, { receiver: true, c0: true, genesisOverlay: true });
   const base = createSqliteSql(db);
   let clockCalls = 0,
     batchCalls = 0,
@@ -133,9 +152,15 @@ async function fixture() {
     },
     batch: async (s) => {
       batchCalls++;
-      batches.push(s);
+      // Record and fault only the Financial statements inside the Money frame.
+      const framed = permitFramed(s);
+      const inner = framed ? s.slice(1, -1) : s;
+      batches.push(inner);
       try {
-        const r = await base.batch(fault ? fault(s) : s);
+        const sent = fault ? fault(inner) : inner;
+        const first = s[0],
+          last = s.at(-1);
+        const r = await base.batch(framed && first && last ? [first, ...sent, last] : sent);
         if (dropAck) {
           dropAck = false;
           readFailure = true;
@@ -177,14 +202,16 @@ async function fixture() {
       throw Error("unexpected fake provider read");
     },
   });
+  // C0/M write only through Root's actual permit-framed Money writer for W.
+  const money = createMoneyCutoverSql(sql, W);
   const realm = await verifyHostedBillingFinancialRealm({
-    sql,
+    sql: money,
     reader: { client },
     expected: { accountId: "acct_enrollment", mode: "test", billingAuthority: "enrollment" },
     prices: [{ priceId: "price_enrollment", monthlyAmountMinor: 1000 }],
   });
   const common: FinancialEnrollmentComponentOptions = {
-    sql,
+    sql: money,
     client,
     realm,
     writerEpoch: W,
@@ -290,7 +317,8 @@ async function fixture() {
     });
   return {
     db,
-    base,
+    // Fixture setup writes are privileged manipulations with the fences lifted.
+    base: fenceLiftedSql(db, base),
     sql,
     common,
     source,
@@ -1046,27 +1074,166 @@ describe("private C0 and explicit M component", () => {
   test("a current primary fence revoked at allocation time rolls back both independent phases", async () => {
     const f = await fixture();
     try {
-      f.fault((s) => {
-        f.db.exec(
-          "INSERT INTO money_cutover_freeze VALUES(1,'binding','origin','backup','writer','source')",
-        );
-        return s;
+      // Freeze, permit and epoch are the exact Financial 0104 fences inside the
+      // actual permit-framed Money writer; neither predicate names them.
+      const { money, realm } = await financial0104Writer(f.sql, W, f.common.client, {
+        accountId: "acct_enrollment",
+        billingAuthority: "enrollment",
+        priceId: "price_enrollment",
       });
-      await expect(f.c0().prepare(f.preparation())).rejects.toMatchObject({ code: "conflict" });
-      expect(f.counts()).toEqual([0, 0, 0, 0]);
-      f.db.exec("DELETE FROM money_cutover_freeze");
-      f.fault((s) => {
-        f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(D);
-        return s;
+      const fenced = { ...f.common, sql: money, realm };
+      const c0 = () => createFinancialPreproofChallengeStore({ ...fenced, scope: SCOPE });
+      const m = () =>
+        createFinancialSourceMaterializationStore({
+          ...fenced,
+          source: f.source,
+          affectedRef: A,
+          genesisQualificationRef: GQ,
+        });
+      for (const phase of ["c0", "m"] as const) {
+        const attempt = async () =>
+          phase === "c0" ? c0().prepare(f.preparation()) : m().install(await f.command());
+        f.fault((s) => {
+          f.db.exec(MONEY_FREEZE_ROW);
+          return s;
+        });
+        await expect(attempt()).rejects.toMatchObject({ code: "conflict" });
+        expect(f.counts()).toEqual([0, 0, 0, 0]);
+        f.db.exec("DELETE FROM money_cutover_freeze");
+        f.fault((s) => {
+          f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(D);
+          return s;
+        });
+        await expect(attempt()).rejects.toMatchObject({ code: "conflict" });
+        expect(f.counts()).toEqual([0, 0, 0, 0]);
+        f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(W);
+        f.fault(undefined);
+        expect(count(f.db, "financial_source_heads").n).toBe(0);
+        expect(count(f.db, "financial_source_registrations").n).toBe(0);
+        expect(count(f.db, "money_cutover_writer_permit").n).toBe(0);
+      }
+      // C0 and M refuse a Sql that is not the Money writer for their epoch
+      // before building any SQL (R1's binding).
+      const rawRealm = await verifyHostedBillingFinancialRealm({
+        sql: f.sql,
+        reader: { client: f.common.client },
+        expected: { accountId: "acct_enrollment", mode: "test", billingAuthority: "enrollment" },
+        prices: [{ priceId: "price_enrollment", monthlyAmountMinor: 1000 }],
       });
-      await expect(f.m().install(await f.command())).rejects.toMatchObject({ code: "conflict" });
+      const raw = { ...f.common, sql: f.sql, realm: rawRealm };
+      const batchesBefore = f.batchCalls;
+      await expect(
+        createFinancialPreproofChallengeStore({ ...raw, scope: SCOPE }).prepare(f.preparation()),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      await expect(
+        createFinancialSourceMaterializationStore({
+          ...raw,
+          source: f.source,
+          affectedRef: A,
+          genesisQualificationRef: GQ,
+        }).install(await f.command()),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(f.batchCalls).toBe(batchesBefore);
       expect(f.counts()).toEqual([0, 0, 0, 0]);
       expect(count(f.db, "financial_source_heads").n).toBe(0);
-      expect(count(f.db, "financial_source_registrations").n).toBe(0);
+      // A current permit under a foreign epoch is refused: each row keeps its own.
+      f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(D);
+      const foreign = await financial0104Writer(f.sql, D, f.common.client, {
+        accountId: "acct_enrollment",
+        billingAuthority: "enrollment",
+        priceId: "price_enrollment",
+      });
+      const foreignOptions = { ...f.common, sql: foreign.money, realm: foreign.realm };
+      await expect(
+        createFinancialPreproofChallengeStore({ ...foreignOptions, scope: SCOPE }).prepare(
+          f.preparation(),
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      // M refuses a writer for another epoch before any SQL (R1's binding).
+      const foreignBatches = f.batchCalls;
+      await expect(
+        createFinancialSourceMaterializationStore({
+          ...foreignOptions,
+          source: f.source,
+          affectedRef: A,
+          genesisQualificationRef: GQ,
+        }).install(await f.command()),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(f.batchCalls).toBe(foreignBatches);
+      expect(f.counts()).toEqual([0, 0, 0, 0]);
+      expect(count(f.db, "financial_source_heads").n).toBe(0);
+      f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(W);
+      // Inside the actual writer with the authorized epoch both commit.
+      expect(await c0().prepare(f.preparation())).toMatchObject({ challengeRef: "challenge:one" });
+      expect(await m().install(await f.command())).toMatchObject({
+        materializationRef: "materialization:one",
+      });
+      expect(f.counts()).toEqual([1, 1, 1, 1]);
+      expect(count(f.db, "financial_source_heads").n).toBe(1);
+      expect(count(f.db, "financial_source_registrations").n).toBe(1);
+      expect(count(f.db, "money_cutover_writer_permit").n).toBe(0);
+      // Each fenced statement passes the writer unchanged.
+      expect(f.batches.slice(-2).map((batch) => batch.length)).toEqual([2, 4]);
+      for (const batch of f.batches.slice(-2))
+        for (const statement of batch) expect(statement.sql).not.toMatch(/\bmoney_cutover_/u);
     } finally {
       f.close();
     }
   });
+  test("on the unfenced candidate, freeze, foreign epoch and raw Sql never write C0 or M", async () => {
+    for (const change of ["freeze", "epoch", "raw"] as const) {
+      const f = await fixture({ unfenced: true });
+      try {
+        if (change === "freeze") f.db.exec(MONEY_FREEZE_ROW);
+        let options = f.common;
+        if (change === "epoch") {
+          // A current permit for a foreign epoch: without fences nothing would
+          // bind the row epoch, so the write must be refused outright.
+          f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(D);
+          const foreign = await financial0104Writer(f.sql, D, f.common.client, {
+            accountId: "acct_enrollment",
+            billingAuthority: "enrollment",
+            priceId: "price_enrollment",
+          });
+          options = { ...f.common, sql: foreign.money, realm: foreign.realm };
+        }
+        if (change === "raw") {
+          const realm = await verifyHostedBillingFinancialRealm({
+            sql: f.sql,
+            reader: { client: f.common.client },
+            expected: {
+              accountId: "acct_enrollment",
+              mode: "test",
+              billingAuthority: "enrollment",
+            },
+            prices: [{ priceId: "price_enrollment", monthlyAmountMinor: 1000 }],
+          });
+          options = { ...f.common, sql: f.sql, realm };
+        }
+        const before = f.batchCalls;
+        await expect(
+          createFinancialPreproofChallengeStore({ ...options, scope: SCOPE }).prepare(
+            f.preparation(),
+          ),
+        ).rejects.toMatchObject({ code: "unavailable" });
+        await expect(
+          createFinancialSourceMaterializationStore({
+            ...options,
+            source: f.source,
+            affectedRef: A,
+            genesisQualificationRef: GQ,
+          }).install(await f.command()),
+        ).rejects.toMatchObject({ code: "unavailable" });
+        expect(f.batchCalls).toBe(before);
+        expect(f.counts()).toEqual([0, 0, 0, 0]);
+        expect(count(f.db, "financial_source_heads").n).toBe(0);
+        expect(count(f.db, "financial_source_registrations").n).toBe(0);
+      } finally {
+        f.close();
+      }
+    }
+  });
+
   test("fixed C0/M batches have exactly matching binds, bounded by actual D1's 100 parameter limit", async () => {
     const f = await fixture();
     try {
@@ -1279,12 +1446,39 @@ async function rejectsUnreadySchema(f: EnrollmentFixture) {
   expect(readEffects(f)).toEqual(before);
 }
 
+/** Leaves the exact unfenced candidate (legacy no-G, or complete G) with the
+ * rows already written, for read/recovery and write-refusal tests. */
+function toUnfenced(f: EnrollmentFixture, genesis: boolean) {
+  dropFinancial0104Fences(f.db);
+  if (genesis) return;
+  for (const [name, sql] of Object.entries(FINANCIAL_GENESIS_SCHEMA))
+    if (sql.startsWith("CREATE TRIGGER")) f.db.exec(`DROP TRIGGER IF EXISTS ${name}`);
+  f.db.exec("DROP TABLE financial_source_genesis_admission_receipts");
+  f.db.exec("DROP TABLE financial_source_genesis_admissions");
+}
+
 describe("legacy C0/M floor and exact complete G overlay readiness", () => {
   for (const overlay of [false, true]) {
     test(`${overlay ? "complete G" : "exact no-G legacy"}: C0/M retain originals, query budgets and GET-only unknowns`, async () => {
       const f = await fixture();
       try {
-        if (overlay) f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
+        // Originals are written on the exact fenced 0104 shape...
+        const preparation = f.preparation();
+        const c0Receipt = await f.c0().prepare(preparation);
+        const command = await f.command();
+        let queries = f.queryCalls;
+        let effects = readEffects(f);
+        expect(await f.m().readOriginal(command)).toBeUndefined();
+        expect(f.queryCalls - queries).toBe(7);
+        expect(readEffects(f)).toEqual(effects);
+        const receipt = await f.m().install(command);
+        expect(receipt).toEqual({
+          materializationRef: command.materializationRef,
+          commandRef: command.commandRef,
+          receiptRef: command.receiptRef,
+        });
+        // ...and stay readable/recoverable on the unfenced candidate shape.
+        toUnfenced(f, overlay);
         expect(
           f.db
             .query(
@@ -1292,9 +1486,7 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
             )
             .all(),
         ).toHaveLength(overlay ? 2 : 0);
-        const preparation = f.preparation();
-        await f.c0().prepare(preparation);
-        let effects = readEffects(f);
+        effects = readEffects(f);
         expect(await f.c0().readChallenge(preparation.challenge.challengeRef)).toEqual(
           preparation.challenge,
         );
@@ -1303,21 +1495,8 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
         ).toHaveLength(10);
         expect(await f.c0().readChallenge("challenge:absent-legacy")).toBeUndefined();
         expect(readEffects(f)).toEqual(effects);
-        const command = await f.command();
         const extraRead = overlay ? 1 : 0;
-        let queries = f.queryCalls;
-        effects = readEffects(f);
-        expect(await f.m().readOriginal(command)).toBeUndefined();
-        expect(f.queryCalls - queries).toBe(6 + extraRead);
-        expect(readEffects(f)).toEqual(effects);
-        const receipt = await f.m().install(command);
-        expect(receipt).toEqual({
-          materializationRef: command.materializationRef,
-          commandRef: command.commandRef,
-          receiptRef: command.receiptRef,
-        });
         queries = f.queryCalls;
-        effects = readEffects(f);
         expect(await f.m().readOriginal(command)).toEqual(receipt);
         expect(f.queryCalls - queries).toBe(4);
         expect(readEffects(f)).toEqual(effects);
@@ -1325,6 +1504,17 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
         queries = f.queryCalls;
         expect(await f.m("parent:second-schema").readOriginal(sibling)).toBeUndefined();
         expect(f.queryCalls - queries).toBe(7 + extraRead);
+        expect(readEffects(f)).toEqual(effects);
+        // Recovery replays still return the originals; every new write is
+        // refused before any statement, since freeze/permit live in fences.
+        expect(await f.c0().prepare(preparation)).toEqual(c0Receipt);
+        expect(await f.m().install(command)).toEqual(receipt);
+        await expect(f.c0().prepare(f.preparation("legacy-new"))).rejects.toMatchObject({
+          code: "unavailable",
+        });
+        await expect(f.m("parent:second-schema").install(sibling)).rejects.toMatchObject({
+          code: "unavailable",
+        });
         expect(readEffects(f)).toEqual(effects);
         f.failRead();
         await expect(f.m().readOriginal(command)).rejects.toMatchObject({ code: "unavailable" });
@@ -1341,7 +1531,7 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
   }
 
   test("G itself still requires the complete overlay and its original reader remains coherent", async () => {
-    const f = await fixture();
+    const f = await fixture({ unfenced: true });
     try {
       const g = mechanicalGenesis(f);
       const before = readEffects(f);
@@ -1349,7 +1539,7 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
         code: "unavailable",
       });
       expect(readEffects(f)).toEqual(before);
-      f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
+      installFinancial0104Fences(f.db, { receiver: true, c0: true, genesisOverlay: true });
       expect(await g.store.readGenesisOriginal(g.command)).toBeUndefined();
       const receipt = await g.store.admitGenesis(g.command);
       expect(receipt).toEqual({
@@ -1384,7 +1574,6 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
       test(`${name} ${fault}: neither effect, retained GET nor positive absence is permitted`, async () => {
         const f = await fixture();
         try {
-          f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
           await f.c0().prepare(f.preparation());
           await f.m().install(await f.command());
           f.db.exec(`DROP TRIGGER ${name}`);
@@ -1475,6 +1664,7 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
       try {
         await f.c0().prepare(f.preparation());
         await f.m().install(await f.command());
+        toUnfenced(f, false);
         scenario.mutate(f);
         await rejectsUnreadySchema(f);
       } finally {
@@ -1486,7 +1676,6 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
   test("complete G occupies both command/receipt roles even for another M source incarnation", async () => {
     const f = await fixture();
     try {
-      f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
       const g = mechanicalGenesis(f);
       await g.store.admitGenesis(g.command);
       const m = await otherMaterialization(f);
@@ -1512,7 +1701,6 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
     test(`complete schema with ${orphan} G cannot manufacture M positive absence`, async () => {
       const f = await fixture();
       try {
-        f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
         const g = mechanicalGenesis(f);
         await g.store.admitGenesis(g.command);
         if (orphan === "original-only") {
@@ -1560,7 +1748,6 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
     ] as const) {
       const f = await fixture();
       try {
-        f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
         const command = await f.command();
         const before = readEffects(f);
         const query = f.sql.query;
@@ -1592,7 +1779,6 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
   test("completed M history survives a later valid G cross-role receipt reservation", async () => {
     const f = await fixture();
     try {
-      f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
       const command = await f.command();
       const receipt = await f.m().install(command);
       expect(receipt).toEqual({
@@ -1819,12 +2005,14 @@ describe("fixed C0 builder contribution", () => {
     try {
       const store = f.c0(),
         positive = store.buildPreparationBatch(f.preparation("builder-positive"), AT);
-      expect(await f.base.batch(positive)).toHaveLength(2);
+      expect(await f.sql.batch(inPermitFrame(W, positive))).toHaveLength(4);
       expect(f.counts()).toEqual([1, 1, 0, 0]);
       const late = store.buildPreparationBatch(f.preparation("builder-late"), AT);
       // Explicit in-memory late-failure transport fixture, never part of the fixed producer contribution.
       await expect(
-        f.base.batch([...late, { sql: "SELECT * FROM missing_c0_builder_late_fixture" }]),
+        f.sql.batch(
+          inPermitFrame(W, [...late, { sql: "SELECT * FROM missing_c0_builder_late_fixture" }]),
+        ),
       ).rejects.toBeInstanceOf(SqlError);
       expect(f.counts()).toEqual([1, 1, 0, 0]);
       expect(await store.readChallenge("challenge:builder-late")).toBeUndefined();
@@ -1837,8 +2025,11 @@ describe("fixed C0 builder contribution", () => {
     const f = await fixture();
     try {
       const store = f.c0();
-      await f.base.batch(
-        store.buildPreparationBatch(f.preparation("builder-receipt-positive"), AT),
+      await f.sql.batch(
+        inPermitFrame(
+          W,
+          store.buildPreparationBatch(f.preparation("builder-receipt-positive"), AT),
+        ),
       );
       expect(f.counts()).toEqual([1, 1, 0, 0]);
       const statements = store.buildPreparationBatch(f.preparation("builder-receipt-bad"), AT);
@@ -1848,9 +2039,124 @@ describe("fixed C0 builder contribution", () => {
         ...receipt,
         params: receipt.params.map((value, index) => (index === 3 ? "{}" : value)),
       };
-      await expect(f.base.batch([original, mismatched])).rejects.toBeInstanceOf(SqlError);
+      await expect(f.sql.batch(inPermitFrame(W, [original, mismatched]))).rejects.toBeInstanceOf(
+        SqlError,
+      );
       expect(f.counts()).toEqual([1, 1, 0, 0]);
       expect(await store.readChallenge("challenge:builder-receipt-bad")).toBeUndefined();
+    } finally {
+      f.close();
+    }
+  });
+
+  test("exported C0 builder statements refuse in-statement once the C0 fences are missing, even framed", async () => {
+    const f = await fixture();
+    try {
+      // With both C0 fences gone nothing else would enforce the freeze.
+      f.db.exec("DROP TRIGGER financial_preproof_challenges_money_fence");
+      f.db.exec("DROP TRIGGER financial_preproof_challenge_receipts_money_fence");
+      f.db.exec(MONEY_FREEZE_ROW);
+      const store = f.c0();
+      for (const statements of [
+        store.buildPreparationBatch(f.preparation("builder-unfenced"), AT),
+        store.buildPreparationContribution(f.preparation("contribution-unfenced"), AT).statements,
+      ])
+        await expect(f.sql.batch(inPermitFrame(W, statements))).rejects.toThrow(/all_rows_match/u);
+      expect(f.counts()).toEqual([0, 0, 0, 0]);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("exported C0 builders write nothing with one fence missing or any fence altered", async () => {
+    const challenge = "financial_preproof_challenges_money_fence",
+      receipt = "financial_preproof_challenge_receipts_money_fence";
+    const scenarios: readonly {
+      readonly name: string;
+      readonly freeze: boolean;
+      readonly mutate: (db: Database) => void;
+    }[] = [
+      {
+        name: "challenge fence missing",
+        freeze: true,
+        mutate: (db) => db.exec(`DROP TRIGGER ${challenge}`),
+      },
+      {
+        name: "receipt fence missing",
+        freeze: true,
+        mutate: (db) => db.exec(`DROP TRIGGER ${receipt}`),
+      },
+      {
+        // Both fences present by name but never firing: only the exact
+        // in-statement check can still refuse the frozen write.
+        name: "both fences altered to WHEN 0",
+        freeze: true,
+        mutate: (db) => {
+          for (const name of [challenge, receipt]) {
+            const sql = (
+              db.query("SELECT sql FROM sqlite_schema WHERE name=?").get(name) as { sql: string }
+            ).sql;
+            const altered = sql.replace(/\nWHEN [\s\S]*\) BEGIN\n/u, "\nWHEN 0 BEGIN\n");
+            expect(altered).toContain("\nWHEN 0 BEGIN\n");
+            db.exec(`DROP TRIGGER ${name}`);
+            db.exec(altered);
+          }
+        },
+      },
+      {
+        // Functionally equivalent but not byte-exact: refused even unfrozen.
+        name: "receipt fence whitespace-altered",
+        freeze: false,
+        mutate: (db) => {
+          const sql = (
+            db.query("SELECT sql FROM sqlite_schema WHERE name=?").get(receipt) as { sql: string }
+          ).sql;
+          const altered = sql.replace("\nWHEN ", "\n WHEN ");
+          expect(altered).not.toBe(sql);
+          db.exec(`DROP TRIGGER ${receipt}`);
+          db.exec(altered);
+        },
+      },
+    ];
+    for (const scenario of scenarios) {
+      const f = await fixture();
+      try {
+        scenario.mutate(f.db);
+        if (scenario.freeze) f.db.exec(MONEY_FREEZE_ROW);
+        const store = f.c0();
+        for (const statements of [
+          store.buildPreparationBatch(f.preparation("one-fence"), AT),
+          store.buildPreparationContribution(f.preparation("one-fence-contribution"), AT)
+            .statements,
+        ])
+          await expect(f.sql.batch(inPermitFrame(W, statements))).rejects.toThrow();
+        expect([scenario.name, f.counts()]).toEqual([scenario.name, [0, 0, 0, 0]]);
+        expect(count(f.db, "money_cutover_writer_permit").n).toBe(0);
+      } finally {
+        f.close();
+      }
+    }
+  });
+
+  test("exported C0 builders refuse a Sql that is not the Money writer for their epoch", async () => {
+    const f = await fixture();
+    try {
+      const realm = await verifyHostedBillingFinancialRealm({
+        sql: f.sql,
+        reader: { client: f.common.client },
+        expected: { accountId: "acct_enrollment", mode: "test", billingAuthority: "enrollment" },
+        prices: [{ priceId: "price_enrollment", monthlyAmountMinor: 1000 }],
+      });
+      const raw = createFinancialPreproofChallengeStore({
+        ...f.common,
+        sql: f.sql,
+        realm,
+        scope: SCOPE,
+      });
+      expect(() => raw.buildPreparationBatch(f.preparation("raw"), AT)).toThrow("unavailable");
+      expect(() => raw.buildPreparationContribution(f.preparation("raw"), AT)).toThrow(
+        "unavailable",
+      );
     } finally {
       f.close();
     }

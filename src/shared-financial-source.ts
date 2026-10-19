@@ -1,7 +1,13 @@
 import {
+  FINANCIAL_0104_RECEIVER_FENCED_SCHEMA_DIGEST,
+  isFinancialMoneyFencedBatch,
+} from "./financial-0104-money-fence.ts";
+import {
   assertHostedBillingFinancialRealm,
   type HostedBillingFinancialRealm,
 } from "./hosted-billing-realm.ts";
+import { canonicalDigest } from "./json.ts";
+import { assertMoneyCutoverSqlOrigin } from "./money-cutover-sql.ts";
 import {
   type Clock,
   type Row,
@@ -144,6 +150,8 @@ export function createSharedFinancialSourceReceiver(
 
   // Fixed owning predicates only. No callback or caller-supplied SQL can turn
   // remote currentness into atomicity; these recheck the actual local primary.
+  // Freeze and permit are the Financial 0104 receiver money fences inside
+  // Root's permit-framed Money writer, so no money_cutover_* table is named.
   const currentRegistration = `r.registration_ref = ? AND r.incarnation = ?
     AND r.receiver_ref = ? AND r.target_ref = ?
     AND r.genesis_digest = ? AND r.registration_digest = ?
@@ -153,10 +161,7 @@ export function createSharedFinancialSourceReceiver(
         AND other.retired_at IS NULL)
     AND EXISTS (SELECT 1 FROM stripe_mode_realm WHERE singleton = 1 AND mode = 'test')
     AND EXISTS (SELECT 1 FROM stripe_billing_account_realms
-      WHERE singleton = 1 AND account_id = ? AND mode = 'test' AND billing_authority = ?)
-    AND EXISTS (SELECT 1 FROM money_cutover_authorized_epoch
-      WHERE singleton = 1 AND writer_epoch = ?)
-    AND NOT EXISTS (SELECT 1 FROM money_cutover_freeze)`;
+      WHERE singleton = 1 AND account_id = ? AND mode = 'test' AND billing_authority = ?)`;
   const currentParams: readonly SqlParam[] = Object.freeze([
     registrationRef,
     incarnation,
@@ -168,7 +173,6 @@ export function createSharedFinancialSourceReceiver(
     qualificationRef,
     accountId,
     billingAuthority,
-    writerEpoch,
   ]);
 
   function matchesEnrollment(row: Row | undefined): boolean {
@@ -278,6 +282,14 @@ export function createSharedFinancialSourceReceiver(
   }
 
   async function applySourceEvent(input: FinancialSourceEvent): Promise<FinancialSourceReceipt> {
+    // Receiver rows carry no epoch, so the configured writer epoch is bound the
+    // way R1 binds it: the Sql must be Root's permit-framed Money writer created
+    // for exactly this epoch, checked before any statement is built or sent.
+    try {
+      assertMoneyCutoverSqlOrigin(sql, { writerEpoch });
+    } catch (error) {
+      fail("unavailable", { cause: error });
+    }
     let event: FinancialSourceEvent;
     try {
       event = Object.freeze(parseFinancialSourceEvent(input));
@@ -290,6 +302,18 @@ export function createSharedFinancialSourceReceiver(
     const eventDigest = await financialSourceEventDigest(event);
     const prior = await retained(event.eventRef);
     if (prior) return original(prior, eventJson);
+    // A new receiver write requires the exact fenced 0104 receiver rows; the
+    // unfenced candidate stays read/recovery-only (freeze/permit live in fences).
+    try {
+      const receiverRows = await sql.query(
+        `SELECT type,name,sql FROM sqlite_schema WHERE tbl_name IN ('financial_source_registrations','financial_source_heads','financial_source_events','financial_source_receipts') AND sql IS NOT NULL ORDER BY type,name`,
+      );
+      if ((await canonicalDigest(receiverRows)) !== FINANCIAL_0104_RECEIVER_FENCED_SCHEMA_DIGEST)
+        fail("unavailable");
+    } catch (error) {
+      if (error instanceof SharedFinancialSourceError) throw error;
+      fail("unavailable", { cause: error });
+    }
 
     let instant: string;
     try {
@@ -450,6 +474,8 @@ export function createSharedFinancialSourceReceiver(
         ],
       },
     ];
+    // Every statement writes a 0104 money-fenced receiver table; nothing else is built.
+    if (!isFinancialMoneyFencedBatch(statements)) fail("unavailable");
     try {
       await sql.batch(statements);
     } catch (error) {

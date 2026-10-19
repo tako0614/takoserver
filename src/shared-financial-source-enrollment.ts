@@ -1,8 +1,15 @@
 import {
+  FINANCIAL_0104_C0_FENCE_SCHEMA,
+  FINANCIAL_0104_RECEIVER_FENCED_SCHEMA_DIGEST,
+  FINANCIAL_RECEIVER_UNFENCED_SCHEMA_DIGEST,
+  isFinancialMoneyFencedBatch,
+} from "./financial-0104-money-fence.ts";
+import {
   assertHostedBillingFinancialRealm,
   type HostedBillingFinancialRealm,
 } from "./hosted-billing-realm.ts";
 import { canonicalDigest } from "./json.ts";
+import { assertMoneyCutoverSqlOrigin } from "./money-cutover-sql.ts";
 import { type Clock, type Sql, SqlError, type SqlParam, type SqlStatement } from "./ports.ts";
 import {
   createSharedFinancialActionIdentity,
@@ -78,8 +85,24 @@ const SCHEMA: Readonly<Record<string, string>> = {
   financial_source_materialization_receipts_refs:
     "CREATE TRIGGER financial_source_materialization_receipts_refs BEFORE INSERT ON financial_source_materialization_receipts\nWHEN (typeof(NEW.receipt_ref) IS NOT 'text' OR length(NEW.receipt_ref) NOT BETWEEN 1 AND 256 OR substr(NEW.receipt_ref,1,1) NOT GLOB '[A-Za-z0-9]' OR NEW.receipt_ref GLOB '*[^A-Za-z0-9._:/-]*') OR (typeof(NEW.materialization_ref) IS NOT 'text' OR length(NEW.materialization_ref) NOT BETWEEN 1 AND 256 OR substr(NEW.materialization_ref,1,1) NOT GLOB '[A-Za-z0-9]' OR NEW.materialization_ref GLOB '*[^A-Za-z0-9._:/-]*') OR (typeof(NEW.command_ref) IS NOT 'text' OR length(NEW.command_ref) NOT BETWEEN 1 AND 256 OR substr(NEW.command_ref,1,1) NOT GLOB '[A-Za-z0-9]' OR NEW.command_ref GLOB '*[^A-Za-z0-9._:/-]*') OR (typeof(NEW.registration_ref) IS NOT 'text' OR length(NEW.registration_ref) NOT BETWEEN 1 AND 256 OR substr(NEW.registration_ref,1,1) NOT GLOB '[A-Za-z0-9]' OR NEW.registration_ref GLOB '*[^A-Za-z0-9._:/-]*') OR (typeof(NEW.incarnation) IS NOT 'text' OR length(NEW.incarnation) NOT BETWEEN 1 AND 256 OR substr(NEW.incarnation,1,1) NOT GLOB '[A-Za-z0-9]' OR NEW.incarnation GLOB '*[^A-Za-z0-9._:/-]*') OR (typeof(NEW.affected_ref) IS NOT 'text' OR length(NEW.affected_ref) NOT BETWEEN 1 AND 256 OR substr(NEW.affected_ref,1,1) NOT GLOB '[A-Za-z0-9]' OR NEW.affected_ref GLOB '*[^A-Za-z0-9._:/-]*') BEGIN\n SELECT RAISE(ABORT,'constraint: enrollment reference');\nEND",
 };
-const RECEIVER_SCHEMA_DIGEST =
-  "sha256:78273f494a3823217edf12e06f06eb4803860452d02278e097a2662befca387b";
+const RECEIVER_SCHEMA_DIGEST = FINANCIAL_RECEIVER_UNFENCED_SCHEMA_DIGEST;
+/** The exported C0 builders are SQL-free DATA compilers, so their write
+ * readiness is in-statement: unless both exact C0 money fences exist, the
+ * unconditional C0 receipt CHECK aborts the whole batch (one JSON bind). */
+const C0_FENCE_NAMES = [
+  "financial_preproof_challenges_money_fence",
+  "financial_preproof_challenge_receipts_money_fence",
+] as const;
+const C0_FENCES_JSON = JSON.stringify(
+  C0_FENCE_NAMES.map((name) => [
+    name,
+    name.slice(0, -"_money_fence".length),
+    FINANCIAL_0104_C0_FENCE_SCHEMA[name] ?? "",
+  ]),
+);
+const C0_FENCED = `(SELECT count(*) FROM main.sqlite_schema f JOIN json_each(?) e ON f.type='trigger'
+          AND f.name=json_extract(e.value,'$[0]') AND f.tbl_name=json_extract(e.value,'$[1]')
+          AND f.sql=json_extract(e.value,'$[2]'))=${C0_FENCE_NAMES.length}`;
 export const FINANCIAL_SOURCE_ENROLLMENT_SCHEMA = SCHEMA;
 export const FINANCIAL_SOURCE_ENROLLMENT_DDL = `${Object.values(SCHEMA).join(";\n")};\n`;
 
@@ -276,15 +299,13 @@ function component(options: FinancialEnrollmentComponentOptions) {
     receiverRef,
     targetRef,
   });
+  // C0 and M are written only inside Root's permit-framed Money writer. Their
+  // freeze, permit and epoch checks are the per-table Financial 0104 money
+  // fences, so this predicate names no money_cutover_* table and passes the
+  // writer as-is.
   const current = `EXISTS (SELECT 1 FROM stripe_mode_realm WHERE singleton=1 AND mode='test')
-    AND EXISTS (SELECT 1 FROM stripe_billing_account_realms WHERE singleton=1 AND account_id=? AND mode='test' AND billing_authority=?)
-    AND EXISTS (SELECT 1 FROM money_cutover_authorized_epoch WHERE singleton=1 AND writer_epoch=?)
-    AND NOT EXISTS (SELECT 1 FROM money_cutover_freeze)`;
-  const currentParams: readonly SqlParam[] = [
-    realmData.accountId,
-    realmData.billingAuthority,
-    writerEpoch,
-  ];
+    AND EXISTS (SELECT 1 FROM stripe_billing_account_realms WHERE singleton=1 AND account_id=? AND mode='test' AND billing_authority=?)`;
+  const currentParams: readonly SqlParam[] = [realmData.accountId, realmData.billingAuthority];
   const names = [
     "financial_preproof_challenges",
     "financial_preproof_challenge_receipts",
@@ -294,7 +315,19 @@ function component(options: FinancialEnrollmentComponentOptions) {
     "financial_source_genesis_admission_receipts",
   ];
   const completeSchema = { ...SCHEMA, ...FINANCIAL_GENESIS_SCHEMA };
-  async function ready(receiver = false) {
+  // Financial 0104: the complete overlay plus every exact C0/M/G money fence.
+  const fencedSchema = { ...completeSchema, ...FINANCIAL_0104_C0_FENCE_SCHEMA };
+  /** Exact read/recovery readiness: legacy, complete G, or fenced 0104. */
+  async function ready(receiver = false): Promise<boolean> {
+    return (await shape(receiver)).genesis;
+  }
+  /** Every new C0/M write requires the exact fenced 0104 C0/M/G rows and the
+   * exact fenced receiver digest. Unfenced shapes stay read/recovery-only,
+   * since freeze/permit/epoch now live only in the fences. */
+  function requireFenced(current: { readonly fenced: boolean }): void {
+    if (!current.fenced) fail("unavailable");
+  }
+  async function shape(receiver: boolean): Promise<{ genesis: boolean; fenced: boolean }> {
     try {
       const rows = await sql.query(
         `SELECT type,name,sql FROM sqlite_schema
@@ -308,7 +341,11 @@ function component(options: FinancialEnrollmentComponentOptions) {
       const legacy = rows.every(
         (row) => typeof row.name === "string" && Object.hasOwn(SCHEMA, row.name),
       );
-      const expectedSchema = legacy ? SCHEMA : completeSchema;
+      const fenced = rows.some(
+        (row) =>
+          typeof row.name === "string" && Object.hasOwn(FINANCIAL_0104_C0_FENCE_SCHEMA, row.name),
+      );
+      const expectedSchema = legacy ? SCHEMA : fenced ? fencedSchema : completeSchema;
       if (
         rows.length !== Object.keys(expectedSchema).length ||
         rows.some(
@@ -322,9 +359,14 @@ function component(options: FinancialEnrollmentComponentOptions) {
         const receiverRows = await sql.query(
           `SELECT type,name,sql FROM sqlite_schema WHERE tbl_name IN ('financial_source_registrations','financial_source_heads','financial_source_events','financial_source_receipts') AND sql IS NOT NULL ORDER BY type,name`,
         );
-        if ((await canonicalDigest(receiverRows)) !== RECEIVER_SCHEMA_DIGEST) fail("unavailable");
+        // Only the exact unfenced receiver with unfenced C0, or the exact
+        // fenced 0104 receiver with fenced 0104 C0/M/G.
+        const expectedReceiver = fenced
+          ? FINANCIAL_0104_RECEIVER_FENCED_SCHEMA_DIGEST
+          : RECEIVER_SCHEMA_DIGEST;
+        if ((await canonicalDigest(receiverRows)) !== expectedReceiver) fail("unavailable");
       }
-      return !legacy;
+      return { genesis: !legacy, fenced: fenced && receiver };
     } catch (error) {
       if (error instanceof FinancialSourceEnrollmentError) throw error;
       fail("unavailable", error);
@@ -337,7 +379,7 @@ function component(options: FinancialEnrollmentComponentOptions) {
       return fail("unavailable", error);
     }
   }
-  return { sql, realmData, current, currentParams, ready, observed };
+  return { sql, realmData, current, currentParams, ready, shape, requireFenced, observed };
 }
 
 export interface FinancialPreproofPreparation {
@@ -461,7 +503,7 @@ export function createFinancialPreproofChallengeStore(
     challengeJson: string,
     at: string,
   ): readonly SqlStatement[] {
-    return [
+    const statements: readonly SqlStatement[] = [
       {
         sql: `INSERT INTO financial_preproof_challenges(challenge_ref,preparation_ref,challenge_json,scope_json,record_json,created_at)
           SELECT ?,?,?,?,?,? WHERE ${c.current}`,
@@ -478,7 +520,7 @@ export function createFinancialPreproofChallengeStore(
       {
         sql: `INSERT INTO financial_preproof_challenge_receipts(receipt_ref,challenge_ref,preparation_ref,record_json,all_rows_match)
           VALUES(?,?,?,?,CASE WHEN changes()=1 AND EXISTS(SELECT 1 FROM financial_preproof_challenges
-          WHERE challenge_ref=? AND preparation_ref=? AND challenge_json=? AND scope_json=? AND record_json=?) AND (${c.current}) THEN 1 ELSE 0 END)`,
+          WHERE challenge_ref=? AND preparation_ref=? AND challenge_json=? AND scope_json=? AND record_json=?) AND (${c.current}) AND ${C0_FENCED} THEN 1 ELSE 0 END)`,
         params: [
           saved.receiptRef,
           saved.challenge.challengeRef,
@@ -490,15 +532,33 @@ export function createFinancialPreproofChallengeStore(
           scopeJson,
           recordJson,
           ...c.currentParams,
+          C0_FENCES_JSON,
         ],
       },
     ];
+    // Every statement writes a 0104 money-fenced table; nothing else is built.
+    if (!isFinancialMoneyFencedBatch(statements)) fail("unavailable");
+    return statements;
   }
-  /** Closed DATA compiler for a future single owner batch; observedAt is not a qualified Clock. */
+  /** Same Money writer binding as R1 capture(): only Root's writer created for
+   * exactly the configured writer epoch, checked synchronously before compiling. */
+  function assertWriterOrigin(): void {
+    try {
+      assertMoneyCutoverSqlOrigin(c.sql, { writerEpoch: c.realmData.writerEpoch });
+    } catch (error) {
+      fail("unavailable", error);
+    }
+  }
+  /** Closed DATA compiler for a future single owner batch; observedAt is not a qualified Clock.
+   * The two statements are valid only as ONE atomic batch, sent unchanged and
+   * together: the challenge INSERT carries no fence check of its own and is
+   * protected only by the receipt's in-statement C0 fence check, whose
+   * failure aborts the receipt and so rolls the challenge row back. */
   function buildPreparationBatch(
     input: FinancialPreproofPreparation,
     observedAt: string,
   ): readonly SqlStatement[] {
+    assertWriterOrigin();
     let saved: ReturnType<typeof parse>;
     try {
       saved = parse(snapshot(input));
@@ -514,11 +574,15 @@ export function createFinancialPreproofChallengeStore(
   async function checkPreparationHistorySchema(): Promise<void> {
     await c.ready();
   }
-  /** Closed compiler image for an owning co-batch. It proves no commit or authority. */
+  /** Closed compiler image for an owning co-batch. It proves no commit or authority.
+   * Its two statements are valid only inside ONE atomic batch with both sent
+   * unchanged: the challenge INSERT is protected only by the receipt's
+   * in-statement C0 fence check, whose failure rolls the whole batch back. */
   function buildPreparationContribution(
     input: FinancialPreproofPreparation,
     observedAt: string,
   ): FinancialPreproofPreparationContribution {
+    assertWriterOrigin();
     let saved: ReturnType<typeof parse>;
     try {
       saved = parse(snapshot(input));
@@ -547,6 +611,13 @@ export function createFinancialPreproofChallengeStore(
     });
   }
   async function prepare(input: FinancialPreproofPreparation): Promise<FinancialPreproofReceipt> {
+    // Same epoch binding as R1/M: only Root's Money writer for exactly the
+    // configured writer epoch, checked before any statement is built or sent.
+    try {
+      assertMoneyCutoverSqlOrigin(c.sql, { writerEpoch: c.realmData.writerEpoch });
+    } catch (error) {
+      return fail("unavailable", error);
+    }
     let saved: ReturnType<typeof parse>;
     try {
       saved = parse(snapshot(input));
@@ -554,9 +625,10 @@ export function createFinancialPreproofChallengeStore(
       return fail("invalid_request", error);
     }
     try {
-      await c.ready();
+      const current = await c.shape(true);
       const prior = await original(saved);
       if (prior) return prior;
+      c.requireFenced(current);
       const recordJson = json(saved),
         challengeJson = json(saved.challenge),
         at = c.observed();
@@ -930,6 +1002,13 @@ export function createFinancialSourceMaterializationStore(
   async function install(
     input: FinancialMaterializationCommand,
   ): Promise<FinancialMaterializationReceipt> {
+    // Same epoch binding as R1: only Root's Money writer for exactly the
+    // configured writer epoch, checked before any statement is built or sent.
+    try {
+      assertMoneyCutoverSqlOrigin(c.sql, { writerEpoch: c.realmData.writerEpoch });
+    } catch (error) {
+      return fail("unavailable", error);
+    }
     let saved: ReturnType<typeof parse>;
     try {
       saved = parse(snapshot(input));
@@ -942,10 +1021,11 @@ export function createFinancialSourceMaterializationStore(
     )
       fail("invalid_request");
     try {
-      const genesis = await c.ready(true);
+      const current = await c.shape(true);
       const prior = await original(saved);
       if (prior) return prior;
-      if (genesis) await rejectGenesisOccupancy(saved);
+      c.requireFenced(current);
+      if (current.genesis) await rejectGenesisOccupancy(saved);
       const recordJson = json(saved),
         at = c.observed();
       const params: readonly SqlParam[] = [
@@ -1030,6 +1110,8 @@ export function createFinancialSourceMaterializationStore(
           ],
         },
       ];
+      // Every M statement writes a 0104 money-fenced table; nothing else is built.
+      if (!isFinancialMoneyFencedBatch(statements)) fail("unavailable");
       try {
         await c.sql.batch(statements);
       } catch (error) {

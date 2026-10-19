@@ -30,6 +30,7 @@ import {
 import { FINANCIAL_SOURCE_GENESIS_DDL } from "../../src/shared-financial-source-genesis-admission.ts";
 import { createSqliteSql } from "../../src/sql-sqlite.ts";
 import { createStripeBillingClient } from "../../src/stripe-billing-client.ts";
+import { installFinancial0104Fences } from "../helpers/financial-0104-fenced.ts";
 
 // Copied isolated Financial custody fixture. Synthetic external Root bindings in
 // the dedicated test do not qualify genuine Auth origin, D1, or a mounted route.
@@ -154,6 +155,8 @@ export async function fixture() {
       "utf8",
     ),
   );
+  // New C0/R1 writes require the exact fenced 0104 shape.
+  installFinancial0104Fences(db, { receiver: true, c0: true });
   const base = createSqliteSql(db);
   let writes = 0,
     providerRequests = 0,
@@ -226,16 +229,17 @@ export async function fixture() {
     },
   };
   const store = createFinancialRetainedR1Store(options);
-  // Frozen C0 v3 embeds reserved-table SQL that Root S rejects. Keep that older
-  // C0 prepare as an explicitly mechanical generic-R fixture on this same primary;
-  // R1 registration/original/receipt writes below use the actual S wrapper only.
+  // C0 SQL no longer names money_cutover_* tables and passes Root S unchanged;
+  // this fixture installs the exact fenced 0104 C0/M/G and receiver shape, so
+  // C0 prepare runs through the actual S wrapper like every R1 write. The raw
+  // realm stays only for raw-R negative tests.
   const c0FixtureRealm = await verifyHostedBillingFinancialRealm({
     sql: raw,
     reader: { client },
     expected: { accountId: "acct_enrollment", mode: "test", billingAuthority: "enrollment" },
     prices: [{ priceId: "price_enrollment", monthlyAmountMinor: 1000 }],
   });
-  const c0 = createFinancialPreproofChallengeStore({ ...options, sql: raw, realm: c0FixtureRealm });
+  const c0 = createFinancialPreproofChallengeStore(options);
   const sourceBody = {
     version: "financial-action-registration-canonical-v1",
     registrationRef: "action-registration:test",

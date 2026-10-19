@@ -1,6 +1,11 @@
 import type { PurchaseCreditExpiry } from "./billing-config.ts";
 import { sharedRpCredentialCurrentness } from "./credential-authority-class.ts";
 import {
+  FINANCIAL_0104_C0_FENCE_SCHEMA,
+  FINANCIAL_0104_RECEIVER_FENCED_SCHEMA_DIGEST,
+  isFinancialMoneyFencedBatch,
+} from "./financial-0104-money-fence.ts";
+import {
   assertWorkerRequestFinancialAuthConsumerPort,
   captureWorkerRequestFinancialAuthRpRequest,
   type FinancialAuthRpRequestCaptures,
@@ -161,6 +166,8 @@ const R1_FENCE_DDL = Object.freeze({
   financial_retained_r1_receipts_money_fence:
     "CREATE TRIGGER financial_retained_r1_receipts_money_fence BEFORE INSERT ON financial_retained_r1_receipts\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_retained_r1_originals o\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE o.r1_ref IS NEW.r1_ref AND o.challenge_ref IS NEW.challenge_ref\n AND o.preparation_ref IS NEW.preparation_ref AND o.receipt_ref IS NEW.receipt_ref\n AND o.command_json IS NEW.command_json AND o.original_digest IS NEW.original_digest\n AND p.writer_epoch IS json_extract(o.scope_json,'$.writerEpoch')\n AND p.writer_epoch IS json_extract(o.original_json,'$.scopeRealm.writerEpoch')) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial R1 receipt permit/epoch required');\nEND",
 } as const);
+/** The same exact rows, read by the Financial 0104 source recipe. */
+export const FINANCIAL_R1_FENCE_SCHEMA: Readonly<Record<string, string>> = R1_FENCE_DDL;
 
 export class FinancialRetainedR1Error extends Error {
   constructor(
@@ -889,7 +896,7 @@ async function ready(c: Captured): Promise<void> {
 
 /** Exact existing C0 schema boundary even when no stored Financial scope is
  * available to construct a scope-specific retained store. */
-async function readyC0HistorySchema(sql: Sql): Promise<void> {
+async function readyC0HistorySchema(sql: Sql, requireFenced = false): Promise<void> {
   const names = [
     "financial_preproof_challenges",
     "financial_preproof_challenge_receipts",
@@ -909,14 +916,70 @@ async function readyC0HistorySchema(sql: Sql): Promise<void> {
     (row) =>
       typeof row.name === "string" && Object.hasOwn(FINANCIAL_SOURCE_ENROLLMENT_SCHEMA, row.name),
   );
+  const fenced = rows.some(
+    (row) =>
+      typeof row.name === "string" && Object.hasOwn(FINANCIAL_0104_C0_FENCE_SCHEMA, row.name),
+  );
   const expected: Readonly<Record<string, string>> = legacy
     ? FINANCIAL_SOURCE_ENROLLMENT_SCHEMA
-    : { ...FINANCIAL_SOURCE_ENROLLMENT_SCHEMA, ...FINANCIAL_GENESIS_SCHEMA };
+    : fenced
+      ? {
+          ...FINANCIAL_SOURCE_ENROLLMENT_SCHEMA,
+          ...FINANCIAL_GENESIS_SCHEMA,
+          ...FINANCIAL_0104_C0_FENCE_SCHEMA,
+        }
+      : { ...FINANCIAL_SOURCE_ENROLLMENT_SCHEMA, ...FINANCIAL_GENESIS_SCHEMA };
   if (
     rows.length !== Object.keys(expected).length ||
-    rows.some((row) => typeof row.name !== "string" || row.sql !== expected[row.name])
+    rows.some((row) => typeof row.name !== "string" || row.sql !== expected[row.name]) ||
+    (requireFenced && !fenced)
   )
     fail("unavailable");
+}
+/** A new co-preparation write requires the exact fenced 0104 shape: R1 rows and
+ * fences, C0/M/G rows and fences, and the fenced receiver digest. Unfenced
+ * shapes stay read/recovery-only since freeze/permit/epoch live in the fences. */
+async function readyFencedCoPreparation(c: Captured): Promise<void> {
+  try {
+    await ready(c);
+    await readyC0HistorySchema(c.sql, true);
+    const receiverRows = await c.sql.query(
+      `SELECT type,name,sql FROM sqlite_schema WHERE tbl_name IN ('financial_source_registrations','financial_source_heads','financial_source_events','financial_source_receipts') AND sql IS NOT NULL ORDER BY type,name`,
+    );
+    if ((await canonicalDigest(receiverRows)) !== FINANCIAL_0104_RECEIVER_FENCED_SCHEMA_DIGEST)
+      fail("unavailable");
+  } catch (error) {
+    if (error instanceof FinancialRetainedR1Error) throw error;
+    fail("unavailable", error);
+  }
+}
+/** A new R1 attempt write requires the exact attempt leaf, including its money
+ * fence, and the exact R1 rows/fences (ready). */
+async function readyFencedAttempt(c: Captured): Promise<void> {
+  try {
+    await ready(c);
+    const schema = await c.sql.query(
+      "SELECT name,type,tbl_name,sql FROM sqlite_schema WHERE tbl_name=? AND sql IS NOT NULL",
+      [ATTEMPT_TABLE],
+    );
+    if (
+      schema.length !== FINANCIAL_R1_ATTEMPT_OBJECTS.length ||
+      FINANCIAL_R1_ATTEMPT_OBJECTS.some(
+        (object) =>
+          !schema.some(
+            (row) =>
+              row.name === object.name &&
+              row.type === object.type &&
+              row.tbl_name === ATTEMPT_TABLE &&
+              row.sql === object.sql,
+          ),
+      )
+    )
+      fail("unavailable");
+  } catch (error) {
+    if (error instanceof FinancialRetainedR1Error) throw error;
+    fail("unavailable", error);
+  }
 }
 async function registered(c: Captured, p: Parsed): Promise<void> {
   const s = p.command.original.actionSource;
@@ -1009,6 +1072,13 @@ export async function buildFinancialR1MechanicalBatch(
   let p: Parsed;
   try {
     p = await parseCaptured(command, c);
+  } catch (error) {
+    if (error instanceof FinancialRetainedR1Error) throw error;
+    return fail("unavailable", error);
+  }
+  // It writes only R1 originals/receipts: require their exact rows and fences.
+  try {
+    await ready(c);
   } catch (error) {
     if (error instanceof FinancialRetainedR1Error) throw error;
     return fail("unavailable", error);
@@ -1136,7 +1206,7 @@ function compileMechanicalBatch(
     p.registrationJson,
   ];
   const collisions = collisionParams(p.command);
-  return Object.freeze([
+  const statements = Object.freeze([
     c0
       ? compileCoPreparationOriginal(p, c0, current, currentParams)
       : Object.freeze({
@@ -1186,6 +1256,8 @@ function compileMechanicalBatch(
       ]),
     }),
   ]);
+  if (!isFinancialMoneyFencedBatch(statements)) fail("unavailable");
+  return statements;
 }
 
 /** Fixed five-statement DATA contribution; no execution, issuer or NEW authority.
@@ -1199,6 +1271,7 @@ export async function buildFinancialR1CoPreparationBatch(
     at = iso(observedAt);
   try {
     const p = await parseCaptured(command, c);
+    await readyFencedCoPreparation(c);
     return coPreparationBatchData(c, p, at);
   } catch (error) {
     if (error instanceof FinancialRetainedR1Error) throw error;
@@ -1215,7 +1288,9 @@ function coPreparationBatchData(c: Captured, p: Parsed, at: string): readonly Sq
     at,
   );
   const r1 = compileMechanicalBatch(c, p, c0.preparedImage);
-  return Object.freeze([
+  // Five statements, each on a 0104 money-fenced table: the permit-framed writer
+  // passes them unchanged and the fences enforce freeze/permit/epoch atomically.
+  const statements = Object.freeze([
     Object.freeze({
       sql: `INSERT INTO financial_action_source_registrations(registration_ref,incarnation,registration_digest,digest_recipe,registration_json,created_at)
           SELECT ?,?,?,?,?,? WHERE ${c.current}`,
@@ -1232,6 +1307,8 @@ function coPreparationBatchData(c: Captured, p: Parsed, at: string): readonly Sq
     ...c0.statements,
     ...r1,
   ]);
+  if (statements.length !== 5 || !isFinancialMoneyFencedBatch(statements)) fail("unavailable");
+  return statements;
 }
 
 const ATTEMPT_TABLE = "financial_r1_preparation_attempts";
@@ -1346,6 +1423,7 @@ export async function buildFinancialR1ClaimedCoPreparationBatch(
     at = iso(observedAt);
   const p = await parseCaptured(command, c),
     image = await attemptImage(p, at);
+  await readyFencedCoPreparation(c);
   const claimed: Captured = Object.freeze({
     ...c,
     current: `(${c.current}) AND EXISTS(SELECT 1 FROM ${ATTEMPT_TABLE} attempt WHERE ${attemptMatch("attempt")})`,
@@ -1760,6 +1838,8 @@ export async function buildFinancialR1BoundedAttemptCustodyStatement(
   const c = capture(options),
     at = iso(observedAt);
   const p = await parseCaptured(command, c);
+  // Exact attempt leaf (with its fence) and exact R1 rows/fences, before building.
+  await readyFencedAttempt(c);
   const image = await attemptImage(p, at);
   const input = Object.freeze([
     ...image,

@@ -4,8 +4,11 @@ import { readFileSync } from "node:fs";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { verifyHostedBillingFinancialRealm } from "../src/hosted-billing-realm.ts";
 import {
+  createMoneyCutoverSql,
   MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL,
   MONEY_CUTOVER_FREEZE_DDL,
+  MONEY_CUTOVER_PERMIT_DDL,
+  MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
 } from "../src/money-cutover-sql.ts";
 import { type Sql, SqlError, type SqlStatement } from "../src/ports.ts";
 import {
@@ -26,6 +29,14 @@ import {
 } from "../src/shared-financial-source-contract.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
+import {
+  dropFinancial0104Fences,
+  fenceLiftedSql,
+  financial0104Writer,
+  installFinancial0104Fences,
+  MONEY_FREEZE_ROW,
+  permitFramed,
+} from "./helpers/financial-0104-fenced.ts";
 
 const AT = "2026-01-01T00:00:00.000Z";
 const GENESIS = `sha256:${"a".repeat(64)}` as const;
@@ -65,6 +76,7 @@ async function fixture(
     readonly registration?: FinancialSourceRegistration;
     readonly receiverRef?: string;
     readonly targetRef?: string;
+    readonly unfenced?: boolean;
   } = {},
 ) {
   const fixtureRegistration = input.registration ?? REGISTRATION;
@@ -83,7 +95,14 @@ async function fixture(
   );
   db.exec(MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL);
   db.exec(MONEY_CUTOVER_FREEZE_DDL);
-  const base = createSqliteSql(db);
+  db.exec(MONEY_CUTOVER_PERMIT_DDL);
+  db.exec(MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL);
+  // New receiver writes require the exact fenced 0104 receiver rows; `unfenced`
+  // keeps the candidate for read/recovery and write-refusal tests.
+  if (!input.unfenced) installFinancial0104Fences(db, { receiver: true });
+  const rawBase = createSqliteSql(db);
+  // Fixture setup writes are privileged manipulations with the fences lifted.
+  const base = fenceLiftedSql(db, rawBase);
   let beforeBatch: (() => Promise<void>) | undefined;
   let batchFault: ((statements: readonly SqlStatement[]) => readonly SqlStatement[]) | undefined;
   let lostAck = false,
@@ -113,11 +132,14 @@ async function fixture(
         lostRead = false;
         throw new SqlError("unavailable", "Lost receipt readback");
       }
-      return base.query(query, params);
+      return rawBase.query(query, params);
     },
-    run: (query, params) => base.run(query, params),
-    async batch(statements) {
+    run: (query, params) => rawBase.run(query, params),
+    async batch(framedStatements) {
       batchCalls++;
+      // Record and fault only the Financial statements inside the Money frame.
+      const framed = permitFramed(framedStatements);
+      const statements = framed ? framedStatements.slice(1, -1) : framedStatements;
       batches.push(statements);
       if (beforeBatch) {
         const action = beforeBatch;
@@ -125,7 +147,10 @@ async function fixture(
         await action();
       }
       try {
-        const result = await base.batch(batchFault ? batchFault(statements) : statements);
+        const sent = batchFault ? batchFault(statements) : statements;
+        const first = framedStatements[0],
+          last = framedStatements.at(-1);
+        const result = await rawBase.batch(framed && first && last ? [first, ...sent, last] : sent);
         if (lostAck) {
           lostAck = false;
           lostRead = true;
@@ -166,8 +191,10 @@ async function fixture(
       throw new Error("Unexpected provider read");
     },
   });
+  // The receiver writes only through Root's actual Money writer for WRITER.
+  const money = createMoneyCutoverSql(sql, WRITER);
   const realm = await verifyHostedBillingFinancialRealm({
-    sql,
+    sql: money,
     reader: { client },
     expected: { accountId: "acct_sourcefixture", mode: "test", billingAuthority: "source-fixture" },
     prices: [{ priceId: "price_sourcefixture", monthlyAmountMinor: 1000 }],
@@ -218,7 +245,7 @@ async function fixture(
     },
   };
   const options = {
-    sql,
+    sql: money,
     clock,
     client,
     realm,
@@ -467,32 +494,160 @@ describe("unmounted shared Financial source primary store", () => {
     f.db.close();
   });
 
-  test("retirement and writer rotation between evidence await and batch are fenced atomically", async () => {
-    for (const mutation of ["retire", "writer", "freeze"] as const) {
+  test("retirement between evidence await and batch is refused atomically", async () => {
+    const f = await fixture();
+    f.beforeBatch(async () => {
+      await f.base.run(
+        "UPDATE financial_source_registrations SET retirement_ref='retired:fixture',retired_at=?",
+        [new Date().toISOString()],
+      );
+    });
+    await expect(f.receiver.applySourceEvent(f.own(first()))).rejects.toMatchObject({
+      code: "source_conflict",
+    });
+    expect(await f.snapshot()).toMatchObject({
+      events: [],
+      receipts: [],
+      heads: [{ sequence: 0, state: "active" }],
+    });
+    f.db.close();
+  });
+
+  test("writer rotation and freeze between evidence await and batch are fenced atomically by 0104", async () => {
+    for (const mutation of ["writer", "freeze"] as const) {
       const f = await fixture();
-      f.beforeBatch(async () => {
-        if (mutation === "retire")
+      try {
+        // Freeze/permit/epoch are the Financial 0104 receiver fences inside the
+        // actual permit-framed Money writer; the predicate names no money table.
+        const { money, realm } = await financial0104Writer(f.sql, WRITER, f.client, {
+          accountId: "acct_sourcefixture",
+          billingAuthority: "source-fixture",
+          priceId: "price_sourcefixture",
+        });
+        const fenced = createSharedFinancialSourceReceiver({ ...f.options, sql: money, realm });
+        f.beforeBatch(async () => {
+          if (mutation === "writer")
+            await f.base.run("UPDATE money_cutover_authorized_epoch SET writer_epoch=?", [
+              `sha256:${"d".repeat(64)}`,
+            ]);
+          else await f.base.run(MONEY_FREEZE_ROW);
+        });
+        await expect(fenced.applySourceEvent(f.own(first()))).rejects.toMatchObject({
+          code: "source_conflict",
+        });
+        expect(await f.snapshot()).toMatchObject({
+          events: [],
+          receipts: [],
+          heads: [{ sequence: 0, state: "active" }],
+        });
+        expect(await f.base.query("SELECT * FROM money_cutover_writer_permit")).toEqual([]);
+        if (mutation === "writer")
+          await f.base.run("UPDATE money_cutover_authorized_epoch SET writer_epoch=?", [WRITER]);
+        if (mutation === "freeze") await f.base.run("DELETE FROM money_cutover_freeze");
+        // Inside the actual writer with the authorized epoch all three writes commit.
+        const receipt = await fenced.applySourceEvent(f.own(first()));
+        expect(receipt.sequence).toBe(1);
+        expect(await f.snapshot()).toMatchObject({
+          events: [{}],
+          receipts: [{}],
+          heads: [{ sequence: 1, state: "active" }],
+        });
+        expect(f.batches.at(-1)).toHaveLength(3);
+        for (const statement of f.batches.at(-1) ?? [])
+          expect(statement.sql).not.toMatch(/\bmoney_cutover_/u);
+        expect(await f.base.query("SELECT * FROM money_cutover_writer_permit")).toEqual([]);
+      } finally {
+        f.db.close();
+      }
+    }
+  });
+
+  test("on the unfenced receiver candidate, freeze, rotation and retirement never write; recovery reads", async () => {
+    for (const change of ["freeze", "writer", "retire"] as const) {
+      const f = await fixture({ unfenced: true });
+      try {
+        if (change === "freeze") await f.base.run(MONEY_FREEZE_ROW);
+        if (change === "writer")
+          await f.base.run("UPDATE money_cutover_authorized_epoch SET writer_epoch=?", [
+            `sha256:${"d".repeat(64)}`,
+          ]);
+        if (change === "retire")
           await f.base.run(
             "UPDATE financial_source_registrations SET retirement_ref='retired:fixture',retired_at=?",
             [new Date().toISOString()],
           );
-        else if (mutation === "writer")
-          await f.base.run("UPDATE money_cutover_authorized_epoch SET writer_epoch=?", [
-            `sha256:${"d".repeat(64)}`,
-          ]);
-        else
-          await f.base.run(
-            "INSERT INTO money_cutover_freeze VALUES(1,'binding','origin','backup','writer','source')",
-          );
+        const before = [f.batchCalls, f.evidenceCalls, f.clockCalls];
+        await expect(f.receiver.applySourceEvent(f.own(first()))).rejects.toMatchObject({
+          code: "unavailable",
+        });
+        expect([f.batchCalls, f.evidenceCalls, f.clockCalls]).toEqual(before);
+        expect(await f.snapshot()).toMatchObject({
+          events: [],
+          receipts: [],
+          heads: [{ sequence: 0, state: "active" }],
+        });
+      } finally {
+        f.db.close();
+      }
+    }
+    // A receipt committed on the fenced shape is still read and replayed once
+    // the receiver is unfenced, without another batch.
+    const f = await fixture();
+    try {
+      const event = f.own(first());
+      const receipt = await f.receiver.applySourceEvent(event);
+      dropFinancial0104Fences(f.db);
+      await f.base.run(MONEY_FREEZE_ROW);
+      const batches = f.batchCalls;
+      expect(await f.make().readSourceEventReceipt(event.eventRef)).toEqual(receipt);
+      expect(await f.make().applySourceEvent(event)).toEqual(receipt);
+      expect(f.batchCalls).toBe(batches);
+    } finally {
+      f.db.close();
+    }
+  });
+
+  test("a receiver Sql that is not the Money writer for its writerEpoch is refused before any SQL", async () => {
+    const f = await fixture();
+    try {
+      const rawRealm = await verifyHostedBillingFinancialRealm({
+        sql: f.sql,
+        reader: { client: f.client },
+        expected: {
+          accountId: "acct_sourcefixture",
+          mode: "test",
+          billingAuthority: "source-fixture",
+        },
+        prices: [{ priceId: "price_sourcefixture", monthlyAmountMinor: 1000 }],
       });
-      await expect(f.receiver.applySourceEvent(f.own(first()))).rejects.toMatchObject({
-        code: "source_conflict",
+      const foreignEpoch = `sha256:${"d".repeat(64)}`;
+      await f.base.run("UPDATE money_cutover_authorized_epoch SET writer_epoch=?", [foreignEpoch]);
+      const foreign = await financial0104Writer(f.sql, foreignEpoch, f.client, {
+        accountId: "acct_sourcefixture",
+        billingAuthority: "source-fixture",
+        priceId: "price_sourcefixture",
       });
-      expect(await f.snapshot()).toMatchObject({
-        events: [],
-        receipts: [],
-        heads: [{ sequence: 0, state: "active" }],
-      });
+      await f.base.run("UPDATE money_cutover_authorized_epoch SET writer_epoch=?", [WRITER]);
+      for (const refused of [
+        createSharedFinancialSourceReceiver({ ...f.options, sql: f.sql, realm: rawRealm }),
+        createSharedFinancialSourceReceiver({
+          ...f.options,
+          sql: foreign.money,
+          realm: foreign.realm,
+        }),
+      ]) {
+        const before = [f.reads, f.batchCalls, f.evidenceCalls, f.clockCalls];
+        await expect(refused.applySourceEvent(f.own(first()))).rejects.toMatchObject({
+          code: "unavailable",
+        });
+        expect([f.reads, f.batchCalls, f.evidenceCalls, f.clockCalls]).toEqual(before);
+        expect(await f.snapshot()).toMatchObject({ events: [], receipts: [] });
+      }
+      // The Money writer for exactly the configured epoch commits.
+      expect((await f.receiver.applySourceEvent(f.own(first()))).sequence).toBe(1);
+      expect(await f.snapshot()).toMatchObject({ events: [{}], receipts: [{}] });
+      expect(await f.base.query("SELECT * FROM money_cutover_writer_permit")).toEqual([]);
+    } finally {
       f.db.close();
     }
   });
@@ -745,9 +900,11 @@ describe("unmounted shared Financial source primary store", () => {
   test("unconditional receipt CHECK rolls back zero-row event or head even without the receipt trigger", async () => {
     for (const operation of ["event", "head", "null-check"] as const) {
       const f = await fixture();
-      f.db.exec("DROP TRIGGER financial_source_receipt_match");
-      f.fault((statements) =>
-        statements.map((statement, index) => {
+      // Drop the receipt trigger only at send time: exact-shape write readiness
+      // would otherwise refuse this altered receiver schema before any batch.
+      f.fault((statements) => {
+        f.db.exec("DROP TRIGGER IF EXISTS financial_source_receipt_match");
+        return statements.map((statement, index) => {
           if ((operation === "event" && index === 0) || (operation === "head" && index === 1))
             return { ...statement, sql: `${statement.sql} AND 0` };
           if (operation === "null-check" && index === 2)
@@ -756,8 +913,8 @@ describe("unmounted shared Financial source primary store", () => {
               sql: statement.sql.replace("THEN 1 ELSE 0 END", "THEN NULL ELSE 0 END"),
             };
           return statement;
-        }),
-      );
+        });
+      });
       const before = await f.snapshot();
       const error = await f.receiver
         .applySourceEvent(f.own(first()))

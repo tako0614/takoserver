@@ -40,6 +40,7 @@ import {
 import { FINANCIAL_SOURCE_GENESIS_DDL } from "../src/shared-financial-source-genesis-admission.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
+import { inPermitFrame, installFinancial0104Fences } from "./helpers/financial-0104-fenced.ts";
 
 const AT = "2026-10-15T00:00:00.000Z";
 const EPOCH = `sha256:${"c".repeat(64)}` as const;
@@ -162,6 +163,8 @@ async function fixture() {
       "utf8",
     ),
   );
+  // New C0/R1 writes require the exact fenced 0104 shape.
+  installFinancial0104Fences(db, { receiver: true, c0: true });
   const base = createSqliteSql(db);
   let writes = 0,
     providerRequests = 0,
@@ -234,16 +237,17 @@ async function fixture() {
     },
   };
   const store = createFinancialRetainedR1Store(options);
-  // Frozen C0 v3 embeds reserved-table SQL that Root S rejects. Keep that older
-  // C0 prepare as an explicitly mechanical generic-R fixture on this same primary;
-  // R1 registration/original/receipt writes below use the actual S wrapper only.
+  // C0 SQL no longer names money_cutover_* tables and passes Root S unchanged;
+  // this fixture installs the exact fenced 0104 C0/M/G and receiver shape, so
+  // C0 prepare runs through the actual S wrapper like every R1 write. The raw
+  // realm stays only for raw-R negative tests.
   const c0FixtureRealm = await verifyHostedBillingFinancialRealm({
     sql: raw,
     reader: { client },
     expected: { accountId: "acct_enrollment", mode: "test", billingAuthority: "enrollment" },
     prices: [{ priceId: "price_enrollment", monthlyAmountMinor: 1000 }],
   });
-  const c0 = createFinancialPreproofChallengeStore({ ...options, sql: raw, realm: c0FixtureRealm });
+  const c0 = createFinancialPreproofChallengeStore(options);
   const sourceBody = {
     version: "financial-action-registration-canonical-v1",
     registrationRef: "action-registration:test",
@@ -1662,7 +1666,7 @@ describe("business-key historical DATA and new-five-only CAS", () => {
         } else if (partial === "C0-original-only") {
           const original = f.c0.buildPreparationBatch(first.command.original.c0, AT)[0];
           if (!original) throw Error("C0 original missing");
-          await f.base.batch([original]);
+          await f.base.batch(inPermitFrame(EPOCH, [original]));
         } else {
           await f.c0.prepare(first.command.original.c0);
           if (partial === "C0-receipt-only") {
@@ -2134,7 +2138,7 @@ describe("Hosted supplier retained Financial command DATA", () => {
       const command = await f.command(ACTIONS[0]!);
       const original = f.c0.buildPreparationBatch(command.original.c0, AT)[0];
       if (!original) throw Error("C0 original contribution missing");
-      await f.base.batch([original]);
+      await f.base.batch(inPermitFrame(EPOCH, [original]));
       const receiptRef = command.original.c0ReceiptRef;
       expect(receiptRef).not.toBe(command.key.challengeRef);
       expect(receiptRef).not.toBe(command.key.preparationRef);

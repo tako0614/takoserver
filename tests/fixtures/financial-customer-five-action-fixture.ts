@@ -9,6 +9,7 @@ import type {
 import { MIGRATIONS } from "../../src/db-schema.ts";
 import { canonicalDigest, canonicalJson } from "../../src/json.ts";
 import {
+  createMoneyCutoverSql,
   MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL,
   MONEY_CUTOVER_FREEZE_DDL,
   MONEY_CUTOVER_PERMIT_DDL,
@@ -35,6 +36,7 @@ import {
 import { parseFinancialIdentityChallenge } from "../../src/shared-financial-source-contract.ts";
 import type { SharedPrincipalBinding } from "../../src/shared-principal-authority.ts";
 import { createSqliteSql } from "../../src/sql-sqlite.ts";
+import { installFinancial0104Fences } from "../helpers/financial-0104-fenced.ts";
 
 const HERE = new URL("./", import.meta.url).pathname;
 const PACKET = new URL("./", import.meta.url).pathname;
@@ -81,6 +83,9 @@ export async function fixture(
   db.exec(readFileSync(`${PACKET}/customer-l1-schema.unnumbered.sql`, "utf8"));
   db.exec(MONEY_CUTOVER_PERMIT_DDL);
   db.exec(MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL);
+  // Consent writes require the exact Financial 0104 consent fences and run only
+  // through Root's actual permit-framed Money writer.
+  installFinancial0104Fences(db, { consent: true });
   db.exec(readFileSync(`${PACKET}/shared-financial-customer-history-component-schema.sql`, "utf8"));
   db.exec(readFileSync(`${PACKET}/customer-journal-schema.unnumbered.sql`, "utf8"));
   const now = Date.now(),
@@ -126,6 +131,7 @@ export async function fixture(
     [created],
   );
   await sql.run(`INSERT INTO money_cutover_authorized_epoch VALUES(1,?)`, [S("writer")]);
+  const consentWriter = createMoneyCutoverSql(sql, S("writer"));
   const h0 = await setupH0(sql, financialRealm);
   await sql.run("INSERT INTO orgs(id,name,owner_principal_id,created_at)VALUES(?,?,?,?)", [
     org,
@@ -456,14 +462,14 @@ export async function fixture(
       created_at_ms: original.createdAt,
       expires_at_ms: original.expiresAt,
     };
-    await sql.run(
+    await consentWriter.run(
       `INSERT INTO shared_customer_challenges(${Object.keys(c).join(",")})VALUES(${Object.keys(c)
         .map(() => "?")
         .join(",")})`,
       Object.values(c),
     );
     for (const affected of ["component:session", "component:workspace"])
-      await sql.run(
+      await consentWriter.run(
         `INSERT INTO financial_payer_challenge_sources VALUES(?,?,?,?,?,?,?,?,?,?,0,?,NULL)`,
         [
           input.challengeRef,
@@ -481,7 +487,7 @@ export async function fixture(
       );
   }
   await challenge(input);
-  await sql.batch(prepareConsentBatch(input, org));
+  await consentWriter.batch(prepareConsentBatch(input, org));
   const admission = await customerAdmissionCandidate(
     { action, consent: input, selectedTerms },
     identity,
@@ -509,6 +515,7 @@ export async function fixture(
   return {
     db,
     sql,
+    consentWriter,
     input,
     org,
     created,

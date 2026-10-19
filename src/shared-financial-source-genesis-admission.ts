@@ -1,5 +1,12 @@
+import {
+  FINANCIAL_0104_C0_FENCE_SCHEMA,
+  FINANCIAL_0104_RECEIVER_FENCED_SCHEMA_DIGEST,
+  FINANCIAL_RECEIVER_UNFENCED_SCHEMA_DIGEST,
+  isFinancialMoneyFencedBatch,
+} from "./financial-0104-money-fence.ts";
 import { assertHostedBillingFinancialRealm } from "./hosted-billing-realm.ts";
 import { canonicalDigest, canonicalJson } from "./json.ts";
+import { assertMoneyCutoverSqlOrigin } from "./money-cutover-sql.ts";
 import { SqlError, type SqlParam, type SqlStatement } from "./ports.ts";
 import {
   canonicalFinancialSourceJson,
@@ -335,11 +342,11 @@ export function createFinancialControlGenesisAdmissionStore(
   const sourceJson = json(source),
     registrationJson = json(registration);
   const { registrationRef, incarnation, genesisDigest } = registration;
+  // G is written only inside Root's permit-framed Money writer; freeze, permit
+  // and epoch are the per-table Financial 0104 money fences, not this predicate.
   const current = `EXISTS (SELECT 1 FROM stripe_mode_realm WHERE singleton=1 AND mode='test')
-    AND EXISTS (SELECT 1 FROM stripe_billing_account_realms WHERE singleton=1 AND account_id=? AND mode='test' AND billing_authority=?)
-    AND EXISTS (SELECT 1 FROM money_cutover_authorized_epoch WHERE singleton=1 AND writer_epoch=?)
-    AND NOT EXISTS (SELECT 1 FROM money_cutover_freeze)`;
-  const currentParams: readonly SqlParam[] = [realm.accountId, realm.billingAuthority, writerEpoch];
+    AND EXISTS (SELECT 1 FROM stripe_billing_account_realms WHERE singleton=1 AND account_id=? AND mode='test' AND billing_authority=?)`;
+  const currentParams: readonly SqlParam[] = [realm.accountId, realm.billingAuthority];
   const regMatch = `r.registration_ref=? AND r.incarnation=? AND r.receiver_ref=? AND r.target_ref=?
     AND r.genesis_digest=? AND r.registration_digest=? AND r.registration_json=? AND r.qualification_ref=?`;
   const regParams: readonly SqlParam[] = [
@@ -353,13 +360,21 @@ export function createFinancialControlGenesisAdmissionStore(
     source.qualificationRef,
   ];
 
-  async function ready() {
+  /** Read/recovery accepts the exact complete or fenced overlay; returns fenced. */
+  async function ready(): Promise<boolean> {
     try {
-      const expected = { ...FINANCIAL_SOURCE_ENROLLMENT_SCHEMA, ...FINANCIAL_GENESIS_SCHEMA };
+      const complete = { ...FINANCIAL_SOURCE_ENROLLMENT_SCHEMA, ...FINANCIAL_GENESIS_SCHEMA };
       const rows = await sql.query(`SELECT name,sql FROM sqlite_schema WHERE tbl_name IN
         ('financial_preproof_challenges','financial_preproof_challenge_receipts','financial_source_materializations',
          'financial_source_materialization_receipts','financial_source_genesis_admissions','financial_source_genesis_admission_receipts')
         AND sql IS NOT NULL ORDER BY name`);
+      // Exactly the complete overlay, or exactly it plus every 0104 C0/M/G fence.
+      const fenced = rows.some(
+        (r) => typeof r.name === "string" && Object.hasOwn(FINANCIAL_0104_C0_FENCE_SCHEMA, r.name),
+      );
+      const expected: Readonly<Record<string, string>> = fenced
+        ? { ...complete, ...FINANCIAL_0104_C0_FENCE_SCHEMA }
+        : complete;
       if (
         rows.length !== Object.keys(expected).length ||
         rows.some((r) => typeof r.name !== "string" || r.sql !== expected[r.name])
@@ -370,9 +385,12 @@ export function createFinancialControlGenesisAdmissionStore(
         ('financial_source_registrations','financial_source_heads','financial_source_events','financial_source_receipts') AND sql IS NOT NULL ORDER BY type,name`);
       if (
         (await canonicalDigest(receiverRows)) !==
-        "sha256:78273f494a3823217edf12e06f06eb4803860452d02278e097a2662befca387b"
+        (fenced
+          ? FINANCIAL_0104_RECEIVER_FENCED_SCHEMA_DIGEST
+          : FINANCIAL_RECEIVER_UNFENCED_SCHEMA_DIGEST)
       )
         fail("unavailable");
+      return fenced;
     } catch (error) {
       if (error instanceof FinancialControlGenesisError) throw error;
       fail("unavailable", error);
@@ -517,6 +535,13 @@ export function createFinancialControlGenesisAdmissionStore(
   async function admitGenesis(
     input: FinancialControlGenesisCommand,
   ): Promise<FinancialControlGenesisReceipt> {
+    // Same epoch binding as R1: only Root's Money writer for exactly the
+    // configured writer epoch, checked before any statement is built or sent.
+    try {
+      assertMoneyCutoverSqlOrigin(sql, { writerEpoch });
+    } catch (error) {
+      return fail("unavailable", error);
+    }
     let saved: Parsed;
     try {
       saved = parse(input);
@@ -524,9 +549,12 @@ export function createFinancialControlGenesisAdmissionStore(
       return fail("invalid_request", error);
     }
     try {
-      await ready();
+      const fenced = await ready();
       const prior = await original(saved);
       if (prior) return prior;
+      // A new G write requires the exact fenced 0104 shape; unfenced overlays
+      // are read/recovery-only since freeze/permit/epoch live in the fences.
+      if (!fenced) fail("unavailable");
       let at: string;
       try {
         at = iso(clock().toISOString());
@@ -608,6 +636,8 @@ export function createFinancialControlGenesisAdmissionStore(
           ],
         },
       ];
+      // Every G statement writes a 0104 money-fenced table; nothing else is built.
+      if (!isFinancialMoneyFencedBatch(statements)) fail("unavailable");
       try {
         await sql.batch(statements);
       } catch (error) {
