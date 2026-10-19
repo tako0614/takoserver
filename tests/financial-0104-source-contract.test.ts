@@ -7,7 +7,12 @@ import { join, resolve } from "node:path";
 import { createAuth103CanonicalSourceArtifacts } from "../scripts/deploy/auth103-canonical-recipes.ts";
 import { AUTH103_NATIVE_MIGRATIONS } from "../src/auth103-native-source-contract.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import { assertFinancial0104CustomerWriteShape } from "../src/financial-0104-customer-schema.ts";
+import {
+  assertFinancial0104CustomerWriteShape,
+  FINANCIAL_0104_CUSTOMER_H0_SCHEMA,
+  FINANCIAL_0104_ORG_TRACE_EXCLUSIONS,
+  FINANCIAL_0104_ORG_TRACE_TABLES,
+} from "../src/financial-0104-customer-schema.ts";
 import {
   FINANCIAL_0104_C0_FENCE_SCHEMA,
   FINANCIAL_0104_CONSENT_FENCE_SCHEMA,
@@ -230,7 +235,7 @@ describe("Financial 0104 source recipe", () => {
         expect(
           db
             .query(
-              "SELECT name FROM sqlite_schema WHERE type='trigger' AND tbl_name=? AND sql LIKE '%money_cutover%'",
+              "SELECT name FROM sqlite_schema WHERE type='trigger' AND tbl_name=? AND sql LIKE '%money_cutover_writer_permit%'",
             )
             .all(table),
         ).toEqual([]);
@@ -739,7 +744,11 @@ describe("Financial 0104 source recipe", () => {
     expect(orgTriggers).toHaveLength(4);
     // No Org trigger names a fenced table or a money_cutover table.
     for (const sql of orgTriggers) {
-      expect(sql).not.toMatch(/money_cutover|RAISE|rowid/iu);
+      // Reads of the org-keyed trace tables are allowed (0094's money_cutover_aggregates
+      // exists on every migrated primary); the cutover-only guard tables are not.
+      expect(sql).not.toMatch(
+        /money_cutover_(?:freeze|writer_permit|authorized_epoch)|RAISE|rowid/iu,
+      );
       expect(sql).not.toMatch(/\b(?:UPDATE|DELETE\s+FROM)\s+financial_/u);
       const writes = [...sql.matchAll(/INSERT INTO ([a-z_]+)/gu)].map((m) => m[1] ?? "");
       expect(writes.length).toBeGreaterThan(0);
@@ -791,6 +800,66 @@ describe("Financial 0104 source recipe", () => {
         if (!Object.hasOwn(FINANCIAL_0104_UNFENCED_TABLES, table)) expect(count(db, table)).toBe(0);
     } finally {
       db.close();
+    }
+  });
+
+  test("the Org trace table set is every org_id table at the 0104 state minus the named exclusions, in both SQL texts", () => {
+    const db = at0103();
+    let derived: string[];
+    try {
+      db.exec(FINANCIAL_0104_DDL);
+      const tables = (
+        db.query("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").all() as {
+          name: string;
+        }[]
+      ).map((row) => row.name);
+      derived = tables.filter((table) =>
+        (db.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).some(
+          (column) => column.name === "org_id",
+        ),
+      );
+    } finally {
+      db.close();
+    }
+    const exclusions = Object.keys(FINANCIAL_0104_ORG_TRACE_EXCLUSIONS).sort();
+    for (const table of exclusions) expect(derived).toContain(table);
+    expect([...FINANCIAL_0104_ORG_TRACE_TABLES].sort()).toEqual(
+      derived.filter((table) => !exclusions.includes(table)).sort(),
+    );
+    const named = (sql: string, column: string) =>
+      [
+        ...sql.matchAll(
+          new RegExp(`EXISTS\\(SELECT 1 FROM ([a-z_0-9]+) m WHERE m\\.org_id=${column}\\)`, "gu"),
+        ),
+      ]
+        .map((match) => match[1] ?? "")
+        .sort();
+    // The 0104 birth guard and Root's Org INSERT trigger (as the H0 candidate) both
+    // name exactly this set.
+    const guard =
+      FINANCIAL_0104_CUSTOMER_H0_SCHEMA.financial_customer_history_birth_observations_org_capture ??
+      "";
+    expect(named(guard, "NEW\\.org_id")).toEqual([...FINANCIAL_0104_ORG_TRACE_TABLES].sort());
+    const scratchDb = new Database(":memory:");
+    try {
+      scratchDb.exec("CREATE TABLE orgs(id TEXT PRIMARY KEY)");
+      scratchDb.exec(
+        readFileSync(
+          new URL(
+            "./fixtures/shared-financial-customer-history-component-schema.sql",
+            import.meta.url,
+          ),
+          "utf8",
+        ),
+      );
+      const insert = (
+        scratchDb
+          .query("SELECT sql FROM sqlite_schema WHERE name='financial_history_capture_org_insert'")
+          .get() as { sql: string }
+      ).sql;
+      expect(named(insert, "NEW\\.id")).toEqual([...FINANCIAL_0104_ORG_TRACE_TABLES].sort());
+    } finally {
+      scratchDb.close();
     }
   });
 

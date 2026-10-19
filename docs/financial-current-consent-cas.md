@@ -76,14 +76,17 @@ id was in no start roster of that primary, still matches the current Org row
 (owner, created_at), and was never named by any change observation (as the old or
 new id); 0105 also backfills one raw birth for every Org existing at install. So a
 deleted, moved or re-created id that Financial ever observed never becomes an
-origin. An Org id that already has any money row (ledger, wallet_credit_lots,
-wallet_credit_allocations, stripe_billing_customers,
-stripe_billing_customer_commands, stripe_billing_subscriptions or
-stripe_billing_commands) never receives a post-seal birth; 0105's Org trigger
-skips it and the 0104 birth guard refuses it, decided at birth time without any
-timestamp. Residual limitation: an id created and deleted before 0105 with no
-money row in those tables leaves no observation and is indistinguishable from a
-new Org. A capture start requires Root's four 0105 Org triggers on orgs (pinned by
+origin. An Org id that already has any row in the derived org-keyed table set
+(every table with an org_id column at the 0104 state except org_memberships,
+personal_organizations and the H0 observation and roster tables; the list is
+pinned by a test against the schema) never receives a post-seal birth; 0105's Org
+trigger skips it and the 0104 birth guard refuses it, decided at birth time without
+any timestamp. Residual limitations: an id created and deleted before 0105 with no
+row in that set leaves no observation and is indistinguishable from a new Org; and
+the trace partly relies on rows that can be deleted or rewritten (of the set, only
+ledger and stripe_billing_customer_commands are append-only), so a writer with raw
+write access to those tables could erase a trace, the same threat class as forging
+those rows directly. A capture start requires Root's four 0105 Org triggers on orgs (pinned by
 name until Root's official 0105 lands, then by exact SQL). Coverage is scoped per
 Org (a change to another Org does not affect it); the seal keeps the global
 no-change rule, where a framed close and restart is cheap. A spurious replace

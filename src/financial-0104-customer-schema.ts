@@ -54,8 +54,8 @@ export const FINANCIAL_0104_CUSTOMER_L1_SCHEMA: Readonly<Record<string, string>>
  * that roster, once per enrollment; seal requires inventory matching the current
  * Org row for every roster id, a during-enrollment birth for every other Org, and
  * no change observation since the start. A post-seal birth is never written (and
- * never admitted) for an Org id that already has money rows (ledger, wallet credit
- * lots/allocations, Stripe customers/customer commands/subscriptions/commands).
+ * never admitted) for an Org id that already has a row in any table of
+ * FINANCIAL_0104_ORG_TRACE_TABLES.
  * A capture start requires Root's four Org capture triggers on orgs; they are
  * pinned by name until Root's official 0105 lands, then by exact SQL. */
 export const FINANCIAL_0104_CUSTOMER_H0_SCHEMA: Readonly<Record<string, string>> = Object.freeze({
@@ -114,7 +114,7 @@ export const FINANCIAL_0104_CUSTOMER_H0_SCHEMA: Readonly<Record<string, string>>
   financial_customer_history_birth_observations_no_replace:
     "CREATE TRIGGER financial_customer_history_birth_observations_no_replace BEFORE INSERT ON financial_customer_history_birth_observations WHEN EXISTS(SELECT 1 FROM financial_customer_history_birth_observations WHERE (birth_ref=NEW.birth_ref) OR (org_id=NEW.org_id AND primary_ref=NEW.primary_ref AND enrollment_ref=NEW.enrollment_ref) OR (NEW.phase='raw' AND phase='raw' AND org_id=NEW.org_id)) BEGIN SELECT RAISE(ABORT,'constraint: retained history replacement');\nEND",
   financial_customer_history_birth_observations_org_capture:
-    "CREATE TRIGGER financial_customer_history_birth_observations_org_capture BEFORE INSERT ON financial_customer_history_birth_observations\nWHEN NOT EXISTS(SELECT 1 FROM orgs o WHERE o.id IS NEW.org_id AND o.owner_principal_id IS NEW.owner_principal_id\n AND o.name IS NEW.org_name AND o.created_at IS NEW.org_created_at)\n OR NOT ((NEW.phase='raw' AND NOT EXISTS(SELECT 1 FROM financial_history_enrollment_heads WHERE state IN('capturing','sealed')))\n OR EXISTS(SELECT 1 FROM financial_history_enrollment_heads h JOIN financial_history_enrollments e ON e.enrollment_ref=h.enrollment_ref AND e.primary_ref=h.primary_ref\n LEFT JOIN financial_history_enrollment_receipts r ON r.receipt_ref=e.expected_seal_ref AND r.receipt_kind='complete-seal' AND r.enrollment_ref=e.enrollment_ref\n WHERE h.state IN('capturing','sealed') AND h.primary_ref IS NEW.primary_ref AND h.enrollment_ref IS NEW.enrollment_ref\n AND NOT EXISTS(SELECT 1 FROM financial_history_enrollment_roster ro WHERE ro.enrollment_ref=e.enrollment_ref AND ro.org_id=NEW.org_id)\n AND NEW.complete_seal_ref IS r.receipt_ref\n AND NEW.phase IS CASE WHEN h.state='sealed' AND r.receipt_ref IS NOT NULL THEN 'post-seal' ELSE 'during-enrollment' END\n AND (NEW.phase<>'post-seal' OR NOT (EXISTS(SELECT 1 FROM ledger m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM wallet_credit_lots m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM wallet_credit_allocations m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_customers m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_customer_commands m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_subscriptions m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_commands m WHERE m.org_id=NEW.org_id)))))\nBEGIN SELECT RAISE(ABORT,'constraint: birth observation requires its exact Org capture');\nEND",
+    "CREATE TRIGGER financial_customer_history_birth_observations_org_capture BEFORE INSERT ON financial_customer_history_birth_observations\nWHEN NOT EXISTS(SELECT 1 FROM orgs o WHERE o.id IS NEW.org_id AND o.owner_principal_id IS NEW.owner_principal_id\n AND o.name IS NEW.org_name AND o.created_at IS NEW.org_created_at)\n OR NOT ((NEW.phase='raw' AND NOT EXISTS(SELECT 1 FROM financial_history_enrollment_heads WHERE state IN('capturing','sealed')))\n OR EXISTS(SELECT 1 FROM financial_history_enrollment_heads h JOIN financial_history_enrollments e ON e.enrollment_ref=h.enrollment_ref AND e.primary_ref=h.primary_ref\n LEFT JOIN financial_history_enrollment_receipts r ON r.receipt_ref=e.expected_seal_ref AND r.receipt_kind='complete-seal' AND r.enrollment_ref=e.enrollment_ref\n WHERE h.state IN('capturing','sealed') AND h.primary_ref IS NEW.primary_ref AND h.enrollment_ref IS NEW.enrollment_ref\n AND NOT EXISTS(SELECT 1 FROM financial_history_enrollment_roster ro WHERE ro.enrollment_ref=e.enrollment_ref AND ro.org_id=NEW.org_id)\n AND NEW.complete_seal_ref IS r.receipt_ref\n AND NEW.phase IS CASE WHEN h.state='sealed' AND r.receipt_ref IS NOT NULL THEN 'post-seal' ELSE 'during-enrollment' END\n AND (NEW.phase<>'post-seal' OR NOT (((((EXISTS(SELECT 1 FROM auth_tokens m WHERE m.org_id=NEW.org_id) OR (EXISTS(SELECT 1 FROM financial_customer_admission_receipts m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM financial_customer_custody_receipts m WHERE m.org_id=NEW.org_id))) OR (EXISTS(SELECT 1 FROM financial_customer_dispatch_claims m WHERE m.org_id=NEW.org_id) OR (EXISTS(SELECT 1 FROM financial_customer_dispatch_receipts m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM integration_e2e_credential_pair_operations m WHERE m.org_id=NEW.org_id)))) OR ((EXISTS(SELECT 1 FROM ledger m WHERE m.org_id=NEW.org_id) OR (EXISTS(SELECT 1 FROM money_cutover_aggregates m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM org_wallet_cash_cap_buckets m WHERE m.org_id=NEW.org_id))) OR ((EXISTS(SELECT 1 FROM org_wallet_cash_exposures m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM org_wallet_grant_snapshots m WHERE m.org_id=NEW.org_id)) OR (EXISTS(SELECT 1 FROM org_wallet_holds m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM org_wallet_limit_policies m WHERE m.org_id=NEW.org_id))))) OR (((EXISTS(SELECT 1 FROM org_wallet_limit_policy_commands m WHERE m.org_id=NEW.org_id) OR (EXISTS(SELECT 1 FROM org_wallet_usage_records m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM org_wallet_usage_warnings m WHERE m.org_id=NEW.org_id))) OR ((EXISTS(SELECT 1 FROM org_wallet_workspace_bindings m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM org_wallet_workspace_snapshots m WHERE m.org_id=NEW.org_id)) OR (EXISTS(SELECT 1 FROM quotes m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM reseller_settlement_intents m WHERE m.org_id=NEW.org_id)))) OR ((EXISTS(SELECT 1 FROM reservations m WHERE m.org_id=NEW.org_id) OR (EXISTS(SELECT 1 FROM sponsorship_credential_issuance_operations m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM sponsorship_tenants m WHERE m.org_id=NEW.org_id))) OR ((EXISTS(SELECT 1 FROM stripe_billing_associations m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_card_setup_commands m WHERE m.org_id=NEW.org_id)) OR (EXISTS(SELECT 1 FROM stripe_billing_card_setup_results m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_checkouts m WHERE m.org_id=NEW.org_id)))))) OR ((((EXISTS(SELECT 1 FROM stripe_billing_commands m WHERE m.org_id=NEW.org_id) OR (EXISTS(SELECT 1 FROM stripe_billing_customer_commands m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_customers m WHERE m.org_id=NEW.org_id))) OR (EXISTS(SELECT 1 FROM stripe_billing_fences m WHERE m.org_id=NEW.org_id) OR (EXISTS(SELECT 1 FROM stripe_billing_grants m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_on_demand_abandonments m WHERE m.org_id=NEW.org_id)))) OR ((EXISTS(SELECT 1 FROM stripe_billing_on_demand_attempts m WHERE m.org_id=NEW.org_id) OR (EXISTS(SELECT 1 FROM stripe_billing_on_demand_commands m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_on_demand_funding m WHERE m.org_id=NEW.org_id))) OR ((EXISTS(SELECT 1 FROM stripe_billing_on_demand_refunds m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_on_demand_terminals m WHERE m.org_id=NEW.org_id)) OR (EXISTS(SELECT 1 FROM stripe_billing_plan_change_slots m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_plan_change_steps m WHERE m.org_id=NEW.org_id))))) OR (((EXISTS(SELECT 1 FROM stripe_billing_plan_changes m WHERE m.org_id=NEW.org_id) OR (EXISTS(SELECT 1 FROM stripe_billing_refunds m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_subscription_term_revocations m WHERE m.org_id=NEW.org_id))) OR ((EXISTS(SELECT 1 FROM stripe_billing_subscription_terms m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_subscriptions m WHERE m.org_id=NEW.org_id)) OR (EXISTS(SELECT 1 FROM stripe_customer_admission_links m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_subscription_cancellation_intents m WHERE m.org_id=NEW.org_id)))) OR ((EXISTS(SELECT 1 FROM stripe_subscription_checkout_intents m WHERE m.org_id=NEW.org_id) OR (EXISTS(SELECT 1 FROM stripe_top_up_commands m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM usage_events m WHERE m.org_id=NEW.org_id))) OR ((EXISTS(SELECT 1 FROM usage_statements m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM wallet_credit_allocations m WHERE m.org_id=NEW.org_id)) OR (EXISTS(SELECT 1 FROM wallet_credit_lot_classification_proofs m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM wallet_credit_lots m WHERE m.org_id=NEW.org_id))))))))))\nBEGIN SELECT RAISE(ABORT,'constraint: birth observation requires its exact Org capture');\nEND",
   financial_customer_history_org_changes_org_capture:
     "CREATE TRIGGER financial_customer_history_org_changes_org_capture BEFORE INSERT ON financial_customer_history_org_changes\nWHEN NEW.change_seq IS NOT COALESCE((SELECT max(change_seq) FROM financial_customer_history_org_changes),0)+1\n OR NOT ((NEW.change_kind='update' AND EXISTS(SELECT 1 FROM orgs o WHERE o.id IS NEW.new_org_id\n AND o.owner_principal_id IS NEW.new_owner_principal_id AND o.name IS NEW.new_org_name AND o.created_at IS NEW.new_org_created_at))\n OR (NEW.change_kind='replace' AND EXISTS(SELECT 1 FROM orgs o WHERE o.id IS NEW.org_id\n AND o.owner_principal_id IS NEW.old_owner_principal_id AND o.name IS NEW.old_org_name AND o.created_at IS NEW.old_org_created_at))\n OR (NEW.change_kind='delete' AND NOT EXISTS(SELECT 1 FROM orgs o WHERE o.id IS NEW.org_id)))\nBEGIN SELECT RAISE(ABORT,'constraint: change observation requires its exact Org change');\nEND",
   financial_customer_history_org_changes_no_replace:
@@ -228,6 +228,77 @@ export const FINANCIAL_0104_CUSTOMER_JOURNAL_SCHEMA: Readonly<Record<string, str
     financial_customer_history_receipt_parent:
       "CREATE TRIGGER financial_customer_history_receipt_parent BEFORE INSERT ON financial_customer_history_receipts\nWHEN NOT EXISTS(SELECT 1 FROM financial_customer_history_entries e JOIN financial_customer_history_coverages cv ON cv.history_ref=e.history_ref\n JOIN financial_customer_history_heads h ON h.original_org_origin=cv.original_org_origin AND h.realm_registration=cv.realm_registration AND h.realm_incarnation=cv.realm_incarnation\n LEFT JOIN financial_customer_history_receipts p ON p.receipt_ref=e.previous_history_receipt_ref\n WHERE e.entry_ref IS NEW.entry_ref AND cv.history_ref IS NEW.history_ref AND e.journal_sequence IS NEW.journal_sequence\n AND h.history_ref IS cv.history_ref AND h.journal_sequence IS e.journal_sequence AND h.last_entry_ref IS e.entry_ref\n AND h.last_expected_receipt_ref IS NEW.receipt_ref AND e.expected_history_receipt_ref IS NEW.receipt_ref AND e.coupling_attempt_ref IS NEW.attempt_ref\n AND NEW.original_org_origin IS cv.original_org_origin AND NEW.realm_registration IS cv.realm_registration AND NEW.realm_incarnation IS cv.realm_incarnation\n AND e.evidence_kind IS NEW.evidence_kind AND e.command_org_id IS NEW.command_org_id AND e.l1_receipt_ref IS NEW.l1_receipt_ref\n AND e.dispatch_receipt_ref IS NEW.dispatch_receipt_ref AND e.custody_receipt_ref IS NEW.custody_receipt_ref\n AND ((e.evidence_kind='genesis' AND cv.expected_receipt_ref IS NEW.receipt_ref AND cv.attempt_ref IS NEW.attempt_ref)\n OR (p.receipt_ref IS NEW.previous_history_receipt_ref AND p.entry_ref IS NEW.previous_entry_ref AND p.journal_sequence IS NEW.previous_journal_sequence\n AND p.history_ref IS e.history_ref AND p.journal_sequence=e.journal_sequence-1 AND p.all_rows_match=1)))\nBEGIN SELECT RAISE(ABORT,'constraint: exact typed history receipt parent'); END",
   });
+
+/** Org-keyed tables whose rows mark an Org id as already used: every table with an
+ * org_id column at the 0104 state except FINANCIAL_0104_ORG_TRACE_EXCLUSIONS. A
+ * post-seal birth is skipped (Root's Org INSERT trigger) and refused (the 0104
+ * birth guard) when any of them has a row for the id. A test derives this set
+ * from the schema and fails when it drifts, so a new org-keyed table forces an
+ * explicit update of this list and of both SQL texts. */
+export const FINANCIAL_0104_ORG_TRACE_TABLES: readonly string[] = Object.freeze([
+  "auth_tokens",
+  "financial_customer_admission_receipts",
+  "financial_customer_custody_receipts",
+  "financial_customer_dispatch_claims",
+  "financial_customer_dispatch_receipts",
+  "integration_e2e_credential_pair_operations",
+  "ledger",
+  "money_cutover_aggregates",
+  "org_wallet_cash_cap_buckets",
+  "org_wallet_cash_exposures",
+  "org_wallet_grant_snapshots",
+  "org_wallet_holds",
+  "org_wallet_limit_policies",
+  "org_wallet_limit_policy_commands",
+  "org_wallet_usage_records",
+  "org_wallet_usage_warnings",
+  "org_wallet_workspace_bindings",
+  "org_wallet_workspace_snapshots",
+  "quotes",
+  "reseller_settlement_intents",
+  "reservations",
+  "sponsorship_credential_issuance_operations",
+  "sponsorship_tenants",
+  "stripe_billing_associations",
+  "stripe_billing_card_setup_commands",
+  "stripe_billing_card_setup_results",
+  "stripe_billing_checkouts",
+  "stripe_billing_commands",
+  "stripe_billing_customer_commands",
+  "stripe_billing_customers",
+  "stripe_billing_fences",
+  "stripe_billing_grants",
+  "stripe_billing_on_demand_abandonments",
+  "stripe_billing_on_demand_attempts",
+  "stripe_billing_on_demand_commands",
+  "stripe_billing_on_demand_funding",
+  "stripe_billing_on_demand_refunds",
+  "stripe_billing_on_demand_terminals",
+  "stripe_billing_plan_change_slots",
+  "stripe_billing_plan_change_steps",
+  "stripe_billing_plan_changes",
+  "stripe_billing_refunds",
+  "stripe_billing_subscription_term_revocations",
+  "stripe_billing_subscription_terms",
+  "stripe_billing_subscriptions",
+  "stripe_customer_admission_links",
+  "stripe_subscription_cancellation_intents",
+  "stripe_subscription_checkout_intents",
+  "stripe_top_up_commands",
+  "usage_events",
+  "usage_statements",
+  "wallet_credit_allocations",
+  "wallet_credit_lot_classification_proofs",
+  "wallet_credit_lots",
+]);
+/** The only org_id tables left out of the trace, each with its reason. */
+export const FINANCIAL_0104_ORG_TRACE_EXCLUSIONS: Readonly<Record<string, string>> = Object.freeze({
+  org_memberships: "written for a brand-new Org in Root's create batch",
+  personal_organizations: "written for a brand-new Org in Root's create batch",
+  financial_customer_history_birth_observations: "the Financial H0 observation itself",
+  financial_customer_history_org_changes: "the Financial H0 observation itself",
+  financial_history_enrollment_roster: "the Financial H0 start roster",
+});
 
 /** Every Customer schema row, then the Customer fences: the exact fenced shape. */
 const CUSTOMER_FENCED_SHAPE: Readonly<Record<string, string>> = Object.freeze({
