@@ -125,9 +125,19 @@ export interface HostedSubscriptionProjection {
   readonly updatedAt: string;
 }
 
+/** What a Host with hosted billing composed declares; absent on every other Host. */
+export interface HostedBillingCapabilities {
+  readonly contractVersion: string;
+  readonly topUps: boolean;
+  readonly subscriptionStart: boolean;
+  readonly subscriptionCancellation: boolean;
+  readonly subscriptionPlanChange: boolean;
+}
+
 export interface OrganizationSubscription {
   readonly subscription: HostedSubscriptionProjection | null;
   readonly planTable: HostedPlanTable;
+  readonly billingCapabilities?: HostedBillingCapabilities;
 }
 
 export type SubscriptionCheckoutStart =
@@ -150,6 +160,18 @@ export type SubscriptionCheckoutStart =
           }
         | { readonly state: "expired"; readonly id: string };
     };
+
+/** A hosted top-up Checkout begun or replayed under one durable reference. */
+export interface TopUpCheckoutStart {
+  readonly checkout: { readonly url: string };
+}
+
+/** The server's read of one top-up reference; never permission to settle funds. */
+export interface TopUpReceipt {
+  readonly reference: string;
+  readonly state: "pending" | "ready" | "paid" | "expired";
+  readonly checkout: { readonly url: string } | null;
+}
 
 export type SubscriptionCancellationReceipt =
   | { readonly state: "pending"; readonly subscriptionRef: string }
@@ -588,7 +610,11 @@ export function createApi(options: ApiOptions) {
         throw new ApiError("invalid_response", status, path);
       const planTable = decodeHostedPlanTable(payload.planTable);
       if (!planTable) throw new ApiError("invalid_response", status, path);
-      return { subscription: payload.subscription, planTable };
+      if (payload.billingCapabilities === undefined)
+        return { subscription: payload.subscription, planTable };
+      const billingCapabilities = decodeBillingCapabilities(payload.billingCapabilities);
+      if (!billingCapabilities) throw new ApiError("invalid_response", status, path);
+      return { subscription: payload.subscription, planTable, billingCapabilities };
     },
 
     /** Replays one durable caller reference against one Host-configured plan key. */
@@ -687,8 +713,9 @@ export function createApi(options: ApiOptions) {
     },
 
     /**
-     * Starts a payment. Answers 404 where this deployment cannot take one,
-     * which is how the console knows not to offer it.
+     * Starts a legacy self-host payment. Answers 404 where this deployment
+     * cannot take one, which is how the console knows not to offer it. Hosted
+     * billing refuses this body; it uses `beginTopUp` with a durable reference.
      */
     beginCheckout: (organizationId: string, amountMinor: number) =>
       call<{ checkout: { url: string } }>(
@@ -696,6 +723,53 @@ export function createApi(options: ApiOptions) {
         `/v1/organizations/${encodeURIComponent(organizationId)}/wallet/checkout`,
         { amountMinor },
       ),
+
+    /**
+     * Begins or replays one hosted top-up. The reference and amount travel
+     * together because the server fingerprints the original command; a replay
+     * with a different amount is a conflict, not a new payment.
+     */
+    async beginTopUp(
+      organizationId: string,
+      reference: string,
+      amountMinor: number,
+    ): Promise<TopUpCheckoutStart> {
+      const path = `/v1/organizations/${encodeURIComponent(organizationId)}/wallet/checkout`;
+      if (!isBillingReference(reference) || !isSafeIntegerAtLeast(amountMinor, 1))
+        throw new ApiError("invalid_request", 0, path);
+      const { payload, status } = await request<unknown>("POST", path, { reference, amountMinor });
+      if (
+        status !== 201 ||
+        !isRecord(payload) ||
+        !isRecord(payload.checkout) ||
+        !isCheckoutUrl(payload.checkout.url)
+      )
+        throw new ApiError("invalid_response", status, path);
+      return { checkout: { url: payload.checkout.url } };
+    },
+
+    /** Reads one top-up reference's receipt; never reissues the Checkout. */
+    async topUpReceipt(organizationId: string, reference: string): Promise<TopUpReceipt> {
+      const path = `/v1/organizations/${encodeURIComponent(organizationId)}/wallet/checkout/${encodeURIComponent(reference)}`;
+      if (!isBillingReference(reference)) throw new ApiError("invalid_request", 0, path);
+      const { payload, status } = await request<unknown>("GET", path);
+      if (
+        status !== 200 ||
+        !isRecord(payload) ||
+        payload.reference !== reference ||
+        !["pending", "ready", "paid", "expired"].includes(String(payload.state)) ||
+        !(
+          payload.checkout === null ||
+          (isRecord(payload.checkout) && isCheckoutUrl(payload.checkout.url))
+        )
+      )
+        throw new ApiError("invalid_response", status, path);
+      return {
+        reference,
+        state: payload.state as TopUpReceipt["state"],
+        checkout: payload.checkout === null ? null : { url: payload.checkout.url as string },
+      };
+    },
 
     fund: (organizationId: string, settlementProof: string) =>
       call<{ wallet: Wallet }>(
@@ -905,6 +979,26 @@ function decodeHostedPlanTable(value: unknown): HostedPlanTable | null {
     return null;
   if (new Set(value.plans.map((plan) => plan.planId)).size !== value.plans.length) return null;
   return value as unknown as HostedPlanTable;
+}
+
+function decodeBillingCapabilities(value: unknown): HostedBillingCapabilities | null {
+  if (
+    !isRecord(value) ||
+    typeof value.contractVersion !== "string" ||
+    value.contractVersion.length === 0 ||
+    typeof value.topUps !== "boolean" ||
+    typeof value.subscriptionStart !== "boolean" ||
+    typeof value.subscriptionCancellation !== "boolean" ||
+    typeof value.subscriptionPlanChange !== "boolean"
+  )
+    return null;
+  return {
+    contractVersion: value.contractVersion,
+    topUps: value.topUps,
+    subscriptionStart: value.subscriptionStart,
+    subscriptionCancellation: value.subscriptionCancellation,
+    subscriptionPlanChange: value.subscriptionPlanChange,
+  };
 }
 
 function isHostedSubscriptionProjection(

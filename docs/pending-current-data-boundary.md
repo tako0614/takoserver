@@ -274,3 +274,81 @@ origin. The witness shape remains unchanged, and this bounded original DATA
 is not a Financial consumer envelope, current permission, revocation proof,
 first-dispatch claim or NEW/CAS admission; those effects need their own guarded
 same-primary checks.
+
+`provePreparedFinancialR1Identity` is a separate, unmounted effect over the
+exact prepared object that the POST preflight returned. It requires the same
+handler, connection, Request, Workspace and challenge, rechecks the prepared
+origin, held native observation, pending29 and retained R1 before and after,
+and calls Root's fixed retained RP proof original once with the held opaque
+credential capture. `readPreparedFinancialR1IdentityEvidence` then uses only
+that prepared object's own existing proof attempt; it never proves on its own
+and accepts no proofRef. Root's fixed load and current originals call the RP
+session receiver's `loadFinalSessionFinancialIdentityProof` and
+`verifyCurrentFinalSessionFinancialIdentityProof`, which read Accounts
+`loadFinancialIdentityProof` / `verifyCurrentFinancialIdentityProof` for the
+proof that receiver itself obtained, in that order, at most once each. Their
+results are detached plain own-property DATA. Financial's
+`readFinancialActionConsentR1IdentityEvidenceData` joins
+`{v:1, proofRef, challengeRef}` and the found/current DATA to the same retained
+R1 reader, original and Root RP original. Every step is installed before its
+first await and an unknown, rejected or malformed result is never resent. The
+returned `financial-proof` identity evidence is DATA only: it is not
+affirmative consent, acceptedAt, a consent original, command claim or consume,
+current permission or Financial NEW/CAS. Those remain the next guarded
+same-primary effect.
+
+`capturePreparedFinancialR1Consent` is the unmounted affirmative POST effect
+for one prepared original whose own identity evidence has already joined. It
+never proves or joins on its own. Every v4 consent field comes from the held
+retained R1 (action, challenge, terms, source, path, realm), the held Root
+observation (final session, credential origin, human binding, current
+session), the issuer original and that `financial-proof` evidence. The single
+held Clock sample is `acceptedAt`, `command.capturedAt` and `recordedAt`;
+`expiresAt` is the minimum of pending29 expiry, session absolute expiry and
+challenge expiry. `consentRef`, `commandRef` and `receiptRef` are derived from
+the R1 transaction address (`rpcs_`/`rpcm_`/`rpcr_` plus the base64url SHA-256
+of `["takoserver-rp-explicit-action-consent-refs-v1", role, transactionRef]`),
+and command16 bytes are the canonical JSON of the version, family, key,
+selected scope, `approve=yes` submission, original digest and capture time.
+`captureAndConsumePreparedSharedAuthFinancialConsentObservedRequestData` then
+runs one required batch over the existing pending29 row: command capture and
+the 95-bind native/issuer-guarded consume into original14 with its receipt.
+pending29 is matched in full and never inserted or replaced; a false guard
+aborts both rows. Before any capture the producer also requires the joins the
+verifiers check (final session account and Principal against the credential
+and human binding), so it never consumes a transaction into a consent that
+cannot verify. The attempt is installed before its first await and is never
+resent. When the batch outcome is unknown, the same invocation performs only
+the existing original-fullcommand GET of its exact held command: a committed
+original is returned, an absent one stays unavailable. Once dispatched for a
+transaction, the connection fences any further capture+consume batch for it,
+so a re-POST after an unknown or rolled-back batch cannot re-mint command16
+with a new Clock sample; like the GET pending fence this is process-local and
+not durable across connections or restarts. A consumed transaction can no
+longer be prepared for POST, and a committed row with other bytes is a custody
+conflict. The identity proof is checked current when the evidence joins under
+the same held observation whose sample is `acceptedAt` (Financial receiver
+owner ruling); the write itself is bounded by pending29 expiry, not by a
+second sample against the proof expiry. The receipted original is local DATA
+for `verifyCurrentActionConsent` and the Financial consumer, not Financial
+NEW/CAS admission or a mounted route.
+
+`handleSharedAuthFinancialConsentRequest` is the RP consent page that Root
+mounts on its observed request connection at `/auth/financial/consent` with
+exactly one `workspace` and one `challenge`. GET renders the retained R1
+action and terms with a same-URL form; if this R1 already has its stored
+consent (read by the derived consentRef and matched to the R1), it shows the
+recorded approval with no form. POST runs the prepared preflight, identity
+proof, load/current evidence and affirmative capture in order and answers
+`303 See Other` to `${consoleOrigin}/billing?consent=returned`, where the
+console origin is the same validated value the app uses (exact origin, no
+credentials, http or https only, as for the billing checkout return) and the
+query is fixed, carrying no data or caller return URL. Without a valid console
+origin the POST is refused with 503 before any effect, never redirected to a
+relative path. The console re-issues its held payment reference there;
+Financial derives the consent proof ref from its retained R1 with the exported
+`sharedAuthFinancialConsentTransactionRef` and `sharedAuthFinancialConsentRefs`
+recipes rather than trusting a client-supplied ref. An invalid selection is
+400; an unknown or conflicting outcome is 503/409 saying the approval could
+not be confirmed, with a link back to the GET page for recovery, never a
+resubmission. Pages are no-store with a deny-all CSP.

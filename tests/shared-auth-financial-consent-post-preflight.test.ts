@@ -31,6 +31,7 @@ if (child) {
   let proofMode: "success" | "unknown" | "malformed" | "expire-after" = "success";
   let proofCapture: unknown;
   let loadCalls = 0;
+  let issuerMode: "ok" | "false-currentness" | "unknown-after-commit" = "ok";
   let loadEntries = 0;
   let issuedProofRef = "proof:from-original";
   let currentCalls = 0;
@@ -243,7 +244,11 @@ if (child) {
     },
     financialAuthConsumerSourceCurrentness(selected: unknown, original: unknown) {
       if (selected !== port || original !== context) throw Error("foreign Root source");
-      return { sql: "?=1", params: [1] };
+      // Same ten-bind shape as the Root native source currentness predicate.
+      return {
+        sql: Array.from({ length: 10 }, () => "?=1").join(" AND "),
+        params: Array.from({ length: 10 }, () => 1),
+      };
     },
   }));
   const issuer = Object.freeze({
@@ -256,10 +261,28 @@ if (child) {
       requireConnection(value);
       return Object.freeze({
         async readCurrentOriginal() {
+          if (
+            issuerMode === "unknown-after-commit" &&
+            (
+              f.db
+                .query("SELECT count(*) AS n FROM shared_auth_financial_consent_commands")
+                .get() as { n: number } | null
+            )?.n === 1
+          )
+            throw Error("unknown issuer read after the batch committed");
           return issuer;
         },
         async currentness() {
-          return { original: issuer, sql: "?=1", params: [1] };
+          // Same four-bind shape as the issuer original EXISTS predicate.
+          // False only inside the capture+consume batch, so the POST pending
+          // rereads still pass and the consume itself fails in SQL.
+          const inBatch = String(new Error().stack).includes("observedRequestCaptureConsume");
+          const first = issuerMode === "false-currentness" && inBatch ? "?=0" : "?=1";
+          return {
+            original: issuer,
+            sql: `${first} AND ?=1 AND ?=1 AND ?=1`,
+            params: [1, 1, 1, 1],
+          };
         },
       });
     },
@@ -277,12 +300,16 @@ if (child) {
   const { createSharedAuthFinancialConsentRequestHandler } = await import(
     "../src/shared-auth-financial-consent.ts"
   );
+  const { handleSharedAuthFinancialConsentRequest } = await import(
+    "../src/shared-auth-financial-consent-route.ts"
+  );
   const action = (() => {
     const found = ACTIONS.find((item) => item.kind === "topup");
     if (!found) throw Error("missing topup");
     return found;
   })();
   const url = "https://rp.example.invalid/financial/consent";
+  const CONSOLE = "https://console.example.invalid";
   const get = () => new Request(url, { method: "GET" });
   const post = (transactionRef: string, origin: string | null = new URL(url).origin) =>
     new Request(url, {
@@ -299,7 +326,9 @@ if (child) {
       .query(`INSERT INTO ${table} (${names.join(",")}) VALUES (${names.map(() => "?").join(",")})`)
       .run(...Object.values(value));
   };
-  async function setup(): Promise<{ handler: Handler; challengeRef: string; close: () => void }> {
+  async function setup(
+    options: { readonly finalAccountId?: string } = {},
+  ): Promise<{ handler: Handler; challengeRef: string; close: () => void }> {
     f = await fixture();
     active = true;
     connection = Object.create(null) as WorkerRequestSql;
@@ -313,6 +342,7 @@ if (child) {
     proofCapture = undefined;
     loadCalls = 0;
     loadEntries = 0;
+    issuerMode = "ok";
     currentCalls = 0;
     evidenceMode = "success";
     issuedProofRef = "proof:from-original";
@@ -381,6 +411,8 @@ if (child) {
       finalSession: Object.freeze({
         selectedWorkspaceId: SCOPE.workspaceId,
         principalId,
+        sessionDigest: `sha256:${"f".repeat(64)}`,
+        accountId: options.finalAccountId ?? subject,
         identity: OIDC,
       }),
       selectedScope: Object.freeze({
@@ -880,6 +912,529 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
     }
   });
 
+  test("affirmative capture consumes the prepared original's own evidence once", async () => {
+    const s = await setup();
+    try {
+      const { request, submission } = await provedSubmission(s);
+      await s.handler.provePreparedFinancialR1Identity(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+        submission,
+      );
+      await s.handler.readPreparedFinancialR1IdentityEvidence(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+        submission,
+      );
+      const before = { observer: observerCalls, clock: clockCalls, rows: consentWrites() };
+      const captured = s.handler.capturePreparedFinancialR1Consent(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+        submission,
+      );
+      expect(
+        s.handler.capturePreparedFinancialR1Consent(
+          request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).toBe(captured);
+      const original = await captured;
+      expect(original.state).toBe("receipted-original-data");
+      expect(original.command.key.transactionRef).toBe(submission.pending.transaction_ref);
+      expect(original.command.key.consentRef).toMatch(/^rpcs_[A-Za-z0-9_-]{43}$/u);
+      expect(original.command.key.commandRef).toMatch(/^rpcm_[A-Za-z0-9_-]{43}$/u);
+      expect(original.command.key.receiptRef).toMatch(/^rpcr_[A-Za-z0-9_-]{43}$/u);
+      expect(consentWrites()).toEqual({ pending: 1, command: 1, original: 1 });
+      expect(before.rows).toEqual({ pending: 1, command: 0, original: 0 });
+      const stored = JSON.parse(new TextDecoder().decode(original.originalBytes));
+      expect(stored.acceptedAt).toBe(original.command.capturedAt);
+      expect(original.recordedAt).toBe(original.command.capturedAt);
+      expect(original.receiptRecordedAt).toBe(original.command.capturedAt);
+      expect(observerCalls - before.observer).toBe(0);
+      expect(clockCalls - before.clock).toBe(0);
+      // The existing current verifier accepts the produced original on a new Request.
+      const witness = await s.handler.verifyCurrentActionConsent(get(), {
+        workspaceId: SCOPE.workspaceId,
+        consentProofRef: original.command.key.consentRef,
+      });
+      expect(witness.consentProofRef).toBe(original.command.key.consentRef);
+    } finally {
+      s.close();
+    }
+  });
+
+  test("affirmative capture refuses missing evidence, crossing and pre-batch expiry without rows", async () => {
+    const s = await setup();
+    try {
+      const { request, submission } = await provedSubmission(s);
+      await s.handler.provePreparedFinancialR1Identity(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+        submission,
+      );
+      // Never joins evidence on its own.
+      await expect(
+        s.handler.capturePreparedFinancialR1Consent(
+          request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(loadCalls).toBe(0);
+      await s.handler.readPreparedFinancialR1IdentityEvidence(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+        submission,
+      );
+      const other = createSharedAuthFinancialConsentRequestHandler(connection);
+      for (const attempt of [
+        () =>
+          s.handler.capturePreparedFinancialR1Consent(request, SCOPE.workspaceId, s.challengeRef, {
+            ...submission,
+          }),
+        () =>
+          other.capturePreparedFinancialR1Consent(
+            request,
+            SCOPE.workspaceId,
+            s.challengeRef,
+            submission,
+          ),
+        () =>
+          s.handler.capturePreparedFinancialR1Consent(
+            request,
+            SCOPE.workspaceId,
+            "challenge:other",
+            submission,
+          ),
+      ])
+        await expect(attempt()).rejects.toMatchObject({ code: "unavailable" });
+      expect(consentWrites()).toEqual({ pending: 1, command: 0, original: 0 });
+      dbNow = Date.parse(AT) + 301_000;
+      const expired = s.handler.capturePreparedFinancialR1Consent(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+        submission,
+      );
+      await expect(expired).rejects.toMatchObject({ code: "unavailable" });
+      dbNow = Date.parse(AT) + 2_000;
+      expect(
+        s.handler.capturePreparedFinancialR1Consent(
+          request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).toBe(expired);
+      expect(consentWrites()).toEqual({ pending: 1, command: 0, original: 0 });
+    } finally {
+      s.close();
+    }
+  });
+
+  test("affirmative capture after failed evidence or a consumed transaction never re-mints", async () => {
+    const s = await setup();
+    try {
+      const { request, submission } = await provedSubmission(s);
+      await s.handler.provePreparedFinancialR1Identity(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+        submission,
+      );
+      evidenceMode = "load-unknown";
+      await expect(
+        s.handler.readPreparedFinancialR1IdentityEvidence(
+          request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      await expect(
+        s.handler.capturePreparedFinancialR1Consent(
+          request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(consentWrites()).toEqual({ pending: 1, command: 0, original: 0 });
+    } finally {
+      s.close();
+    }
+    const next = await setup();
+    try {
+      const view = await prepared(next.handler, next.challengeRef);
+      const request = post(view.transactionRef);
+      const submission = await next.handler.readPreparedFinancialR1SubmissionData(
+        request,
+        SCOPE.workspaceId,
+        next.challengeRef,
+      );
+      await next.handler.provePreparedFinancialR1Identity(
+        request,
+        SCOPE.workspaceId,
+        next.challengeRef,
+        submission,
+      );
+      await next.handler.readPreparedFinancialR1IdentityEvidence(
+        request,
+        SCOPE.workspaceId,
+        next.challengeRef,
+        submission,
+      );
+      await next.handler.capturePreparedFinancialR1Consent(
+        request,
+        SCOPE.workspaceId,
+        next.challengeRef,
+        submission,
+      );
+      // A re-POST of the consumed transaction cannot even be prepared again.
+      await expect(
+        next.handler.readPreparedFinancialR1SubmissionData(
+          post(view.transactionRef),
+          SCOPE.workspaceId,
+          next.challengeRef,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(consentWrites()).toEqual({ pending: 1, command: 1, original: 1 });
+    } finally {
+      next.close();
+    }
+  });
+
+  async function evidencedSubmission(s: Awaited<ReturnType<typeof setup>>) {
+    const { request, submission } = await provedSubmission(s);
+    await s.handler.provePreparedFinancialR1Identity(
+      request,
+      SCOPE.workspaceId,
+      s.challengeRef,
+      submission,
+    );
+    await s.handler.readPreparedFinancialR1IdentityEvidence(
+      request,
+      SCOPE.workspaceId,
+      s.challengeRef,
+      submission,
+    );
+    return { request, submission };
+  }
+
+  test("a consume that fails in SQL rolls back command16 and fences a re-POST", async () => {
+    const s = await setup();
+    try {
+      const first = await evidencedSubmission(s);
+      issuerMode = "false-currentness";
+      await expect(
+        s.handler.capturePreparedFinancialR1Consent(
+          first.request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          first.submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(consentWrites()).toEqual({ pending: 1, command: 0, original: 0 });
+      // A new POST is preparable (no rows) but this connection never re-mints.
+      // Keep the DB clock ahead of the later source Clock samples so only the
+      // attempt fence can refuse it.
+      issuerMode = "ok";
+      dbNow = Date.parse(AT) + 60_000;
+      const again = await evidencedSubmission(s);
+      await expect(
+        s.handler.capturePreparedFinancialR1Consent(
+          again.request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          again.submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(consentWrites()).toEqual({ pending: 1, command: 0, original: 0 });
+    } finally {
+      s.close();
+    }
+  });
+
+  test("an unknown pending reread right before the batch refuses without dispatch", async () => {
+    const s = await setup();
+    try {
+      const { request, submission } = await evidencedSubmission(s);
+      const originalQuery = f.db.query.bind(f.db);
+      let rereads = 0;
+      Object.defineProperty(f.db, "query", {
+        configurable: true,
+        value: (sql: string) => {
+          // The first capture reread passes; only the one just before the
+          // batch (and any later read) is unknown.
+          if (
+            sql.includes(
+              "FROM shared_auth_financial_consent_pending WHERE transaction_ref=? LIMIT 2",
+            ) &&
+            ++rereads >= 2
+          )
+            throw Error("unknown pending reread");
+          return originalQuery(sql);
+        },
+      });
+      await expect(
+        s.handler.capturePreparedFinancialR1Consent(
+          request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      Object.defineProperty(f.db, "query", { configurable: true, value: originalQuery });
+      expect(consentWrites()).toEqual({ pending: 1, command: 0, original: 0 });
+    } finally {
+      s.close();
+    }
+  });
+
+  test("a final session that does not join the credential account is refused before capture", async () => {
+    const s = await setup({ finalAccountId: "account_other" });
+    try {
+      const { request, submission } = await evidencedSubmission(s);
+      await expect(
+        s.handler.capturePreparedFinancialR1Consent(
+          request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(consentWrites()).toEqual({ pending: 1, command: 0, original: 0 });
+    } finally {
+      s.close();
+    }
+  });
+
+  test("an unknown outcome after commit recovers the exact original by GET only", async () => {
+    const s = await setup();
+    try {
+      const { request, submission } = await evidencedSubmission(s);
+      issuerMode = "unknown-after-commit";
+      const original = await s.handler.capturePreparedFinancialR1Consent(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+        submission,
+      );
+      expect(original.state).toBe("receipted-original-data");
+      expect(original.command.key.transactionRef).toBe(submission.pending.transaction_ref);
+      expect(consentWrites()).toEqual({ pending: 1, command: 1, original: 1 });
+    } finally {
+      s.close();
+    }
+  });
+
+  test("mounted route renders the R1 page and its own POST records one consent", async () => {
+    const s = await setup();
+    try {
+      const page = `https://rp.example.invalid/auth/financial/consent?workspace=${encodeURIComponent(SCOPE.workspaceId)}&challenge=${encodeURIComponent(s.challengeRef)}`;
+      const shown = await handleSharedAuthFinancialConsentRequest(
+        connection,
+        new Request(page, { method: "GET" }),
+        CONSOLE,
+      );
+      expect(shown.status).toBe(200);
+      expect(shown.headers.get("content-type")).toBe("text/html; charset=utf-8");
+      expect(shown.headers.get("cache-control")).toBe("no-store");
+      expect(shown.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+      const html = await shown.text();
+      const transactionRef =
+        /name="confirmation_transaction" value="(rpfc_[A-Za-z0-9_-]{43})"/u.exec(html)?.[1];
+      if (!transactionRef) throw Error("missing transaction field");
+      expect(html).not.toContain(" action=");
+      const approve = () =>
+        handleSharedAuthFinancialConsentRequest(
+          connection,
+          new Request(page, {
+            method: "POST",
+            headers: {
+              "content-type": "application/x-www-form-urlencoded",
+              origin: "https://rp.example.invalid",
+            },
+            body: new URLSearchParams({ approve: "yes", confirmation_transaction: transactionRef }),
+          }),
+          CONSOLE,
+        );
+      const approved = await approve();
+      expect(approved.status).toBe(303);
+      expect(approved.headers.get("location")).toBe(
+        "https://console.example.invalid/billing?consent=returned",
+      );
+      expect(await approved.text()).toBe("");
+      expect(consentWrites()).toEqual({ pending: 1, command: 1, original: 1 });
+      expect([proofCalls, loadCalls, currentCalls]).toEqual([1, 1, 1]);
+      // GET-only recovery: the page now shows the recorded consent, with no form,
+      // from the R1 reader's one capture and no Clock sample.
+      const beforeRecorded = { observer: observerCalls, clock: clockCalls };
+      const recorded = await handleSharedAuthFinancialConsentRequest(
+        connection,
+        new Request(page, { method: "GET" }),
+        CONSOLE,
+      );
+      expect(recorded.status).toBe(200);
+      const recordedHtml = await recorded.text();
+      expect(recordedHtml).toContain("is recorded");
+      expect(recordedHtml).not.toContain("<form");
+      expect(recordedHtml).not.toContain("rpcs_");
+      expect(observerCalls - beforeRecorded.observer).toBe(1);
+      expect(clockCalls - beforeRecorded.clock).toBe(0);
+      // The same page cannot approve twice; it never claims nothing happened.
+      const again = await approve();
+      expect(again.status).toBe(503);
+      const againHtml = await again.text();
+      expect(againHtml).toContain("We could not confirm this approval");
+      expect(againHtml).not.toContain("Nothing was approved");
+      expect(againHtml).not.toContain("rpcs_");
+      expect(againHtml).toContain('href="/auth/financial/consent?workspace=');
+      expect(consentWrites()).toEqual({ pending: 1, command: 1, original: 1 });
+      // Financial derives the consent proof ref itself from the same recipe.
+      const { sharedAuthFinancialConsentRefs } = await import(
+        "../src/shared-auth-financial-consent.ts"
+      );
+      const { consentRef: consentProofRef } = await sharedAuthFinancialConsentRefs(transactionRef);
+      const witness = await s.handler.verifyCurrentActionConsent(get(), {
+        workspaceId: SCOPE.workspaceId,
+        consentProofRef,
+      });
+      expect(witness.consentProofRef).toBe(consentProofRef);
+    } finally {
+      s.close();
+    }
+  });
+
+  test("mounted route refuses other query shapes and methods without rows", async () => {
+    const s = await setup();
+    try {
+      const base = "https://rp.example.invalid/auth/financial/consent";
+      const challenge = encodeURIComponent(s.challengeRef);
+      for (const query of [
+        "",
+        `?challenge=${challenge}`,
+        `?workspace=${SCOPE.workspaceId}&challenge=${challenge}&extra=1`,
+        `?workspace=${SCOPE.workspaceId}&workspace=${SCOPE.workspaceId}&challenge=${challenge}`,
+        `?workspace=&challenge=${challenge}`,
+        `?workspace=${SCOPE.workspaceId}&challenge=`,
+      ]) {
+        const response = await handleSharedAuthFinancialConsentRequest(
+          connection,
+          new Request(`${base}${query}`),
+          CONSOLE,
+        );
+        expect(response.status).toBe(400);
+      }
+      const put = await handleSharedAuthFinancialConsentRequest(
+        connection,
+        new Request(`${base}?workspace=${SCOPE.workspaceId}&challenge=${challenge}`, {
+          method: "PUT",
+        }),
+        CONSOLE,
+      );
+      expect(put.status).toBe(405);
+      expect(put.headers.get("allow")).toBe("GET, POST");
+      // A POST without a prepared GET has nothing to approve.
+      const blind = await handleSharedAuthFinancialConsentRequest(
+        connection,
+        new Request(`${base}?workspace=${SCOPE.workspaceId}&challenge=${challenge}`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/x-www-form-urlencoded",
+            origin: "https://rp.example.invalid",
+          },
+          body: new URLSearchParams({ approve: "yes", confirmation_transaction: "rpfc_x" }),
+        }),
+        CONSOLE,
+      );
+      expect(blind.status).not.toBe(200);
+      expect(consentWrites()).toEqual({ pending: 0, command: 0, original: 0 });
+      expect(proofEntries).toBe(0);
+    } finally {
+      s.close();
+    }
+  });
+
+  test("mounted route refuses POST without a valid console origin before any effect", async () => {
+    const s = await setup();
+    try {
+      const page = `https://rp.example.invalid/auth/financial/consent?workspace=${encodeURIComponent(SCOPE.workspaceId)}&challenge=${encodeURIComponent(s.challengeRef)}`;
+      const html = await (
+        await handleSharedAuthFinancialConsentRequest(connection, new Request(page), CONSOLE)
+      ).text();
+      const transactionRef = /value="(rpfc_[A-Za-z0-9_-]{43})"/u.exec(html)?.[1];
+      if (!transactionRef) throw Error("missing transaction field");
+      for (const origin of [
+        undefined,
+        "https://console.example.invalid/",
+        "https://console.example.invalid/billing",
+        "https://user:pw@console.example.invalid",
+        "javascript:alert(1)",
+        "not a url",
+      ]) {
+        const response = await handleSharedAuthFinancialConsentRequest(
+          connection,
+          new Request(page, {
+            method: "POST",
+            headers: {
+              "content-type": "application/x-www-form-urlencoded",
+              origin: "https://rp.example.invalid",
+            },
+            body: new URLSearchParams({ approve: "yes", confirmation_transaction: transactionRef }),
+          }),
+          origin,
+        );
+        expect(response.status).toBe(503);
+        expect(response.headers.get("location")).toBeNull();
+        expect(await response.text()).not.toContain("Approved");
+      }
+      expect([proofEntries, loadCalls, currentCalls]).toEqual([0, 0, 0]);
+      expect(consentWrites()).toEqual({ pending: 1, command: 0, original: 0 });
+    } finally {
+      s.close();
+    }
+  });
+
+  test("mounted route encodes the recheck link from the selected pair", async () => {
+    const s = await setup();
+    try {
+      const hostile = `x"><script>alert(1)</script>&a=b`;
+      const response = await handleSharedAuthFinancialConsentRequest(
+        connection,
+        new Request(
+          `https://rp.example.invalid/auth/financial/consent?workspace=${encodeURIComponent(SCOPE.workspaceId)}&challenge=${encodeURIComponent(hostile)}`,
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/x-www-form-urlencoded",
+              origin: "https://rp.example.invalid",
+            },
+            body: new URLSearchParams({ approve: "yes", confirmation_transaction: "rpfc_x" }),
+          },
+        ),
+        CONSOLE,
+      );
+      expect(response.status).toBe(503);
+      const html = await response.text();
+      expect(html).not.toContain("<script>");
+      expect(html).not.toContain(`x">`);
+      expect(html).toContain(
+        `href="/auth/financial/consent?workspace=${new URLSearchParams({ workspace: SCOPE.workspaceId }).toString().slice("workspace=".length)}&challenge=x%22%3E%3Cscript%3Ealert%281%29%3C%2Fscript%3E%26a%3Db"`,
+      );
+    } finally {
+      s.close();
+    }
+  });
+
   test("identity evidence refuses a failed prove, crossed arguments and pre-load drift", async () => {
     const s = await setup();
     try {
@@ -1160,7 +1715,7 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
     expect(stderr).toContain(
       "(pass) actual R1 and RP POST preflight reads pending only with one held Clock",
     );
-    expect(stderr).toContain("15 pass");
+    expect(stderr).toContain("26 pass");
     expect(stderr).toContain("0 fail");
   }, 100_000);
 }

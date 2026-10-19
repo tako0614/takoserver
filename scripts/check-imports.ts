@@ -679,7 +679,7 @@ const LAYERS: readonly Layer[] = [
   {
     // Unmounted request observation and consent composition use app ports only.
     name: "app",
-    match: /^src\/shared-auth-financial-(?:source|consent)\.ts$/u,
+    match: /^src\/shared-auth-financial-(?:source|consent|consent-route)\.ts$/u,
     may: ["core", "domain", "app"],
   },
   {

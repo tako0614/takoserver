@@ -5,9 +5,16 @@ import {
   readWorkerRequestFinancialAuthConsumerContext,
   readWorkerRequestFinancialAuthConsumerPort,
 } from "./financial-auth-consumer.ts";
-import { base64UrlDecode, base64UrlEncode, bytesDigest, canonicalJson } from "./json.ts";
+import {
+  base64UrlDecode,
+  base64UrlEncode,
+  bytesDigest,
+  canonicalDigest,
+  canonicalJson,
+} from "./json.ts";
 import {
   createSharedAuthFinancialActionConsentCaptureKeyData,
+  createSharedAuthFinancialActionConsentOriginalIdentity,
   parseSharedAuthFinancialActionConsentOriginal,
 } from "./shared-auth-financial-consent-contract.ts";
 import { createSharedAuthFinancialConsentIssuerSource } from "./shared-auth-financial-consent-issuer.ts";
@@ -17,13 +24,16 @@ import {
   type SharedAuthFinancialConfirmationSubmissionData,
 } from "./shared-auth-financial-consent-request.ts";
 import {
+  captureAndConsumePreparedSharedAuthFinancialConsentObservedRequestData,
   createSharedAuthFinancialConsentLocalProofDataReader,
   createSharedAuthFinancialConsentProofReferenceReader,
+  createSharedAuthFinancialConsentRequestCommandRecovery,
   persistCaptureAndConsumeSharedAuthFinancialConsentObservedRequestData,
   prepareSharedAuthFinancialConsentPendingFromObservation,
   readSharedAuthFinancialConsentPreparedPendingForPost,
   type SharedAuthFinancialConsentCaptureData,
   type SharedAuthFinancialConsentLocalProofData,
+  type SharedAuthFinancialConsentOriginalCommand,
   type SharedAuthFinancialConsentOriginalData,
   SharedAuthFinancialConsentOriginalReadError,
   type SharedAuthFinancialConsentPendingData,
@@ -228,7 +238,9 @@ export interface SharedAuthFinancialPreparedConsentViewData {
   readonly transactionRef: string;
   readonly disclosureRef: string;
   readonly html: string;
-  readonly disposition: "strict-insert-ack" | "original-get";
+  /** `recorded-consent`: this R1 already has its stored consent; the page
+   * shows that and carries no form. */
+  readonly disposition: "strict-insert-ack" | "original-get" | "recorded-consent";
 }
 
 /** Query-only POST preflight over the prepared GET original. No affirmative
@@ -272,6 +284,27 @@ const preparedEvidenceAttempts = new WeakMap<
   object,
   Promise<FinancialActionConsentR1IdentityEvidenceData>
 >();
+const preparedConsentAttempts = new WeakMap<
+  object,
+  Promise<SharedAuthFinancialConsentOriginalData>
+>();
+
+const CONSENT_FAMILY = "rp-explicit-action-consent" as const;
+const CONSENT_REFS_RECIPE = "takoserver-rp-explicit-action-consent-refs-v1";
+const CONSENT_COMMAND_VERSION = 1;
+
+/** Deterministic refs from the R1 transaction address: a retry of the same
+ * prepared original names the same rows, so the batch's collision guards turn
+ * a repeat into a conflict/GET instead of a second consent. */
+async function consentRefFromTransaction(
+  role: "consent" | "command" | "receipt",
+  transactionRef: string,
+): Promise<string> {
+  const digest = await canonicalDigest([CONSENT_REFS_RECIPE, role, transactionRef]);
+  const hex = digest.slice("sha256:".length);
+  const prefix = role === "consent" ? "rpcs_" : role === "command" ? "rpcm_" : "rpcr_";
+  return `${prefix}${base64UrlEncode(Uint8Array.from({ length: 32 }, (_, i) => Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16)))}`;
+}
 
 function detachedPendingValues(
   pending: SharedAuthFinancialConsentPendingData,
@@ -360,6 +393,29 @@ function method<T extends object, K extends keyof T>(receiver: T, name: K): T[K]
 
 function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
   return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+/** Pure recipe shared with Financial: the R1 transaction address. */
+export function sharedAuthFinancialConsentTransactionRef(
+  original: FinancialActionConsentR1Original,
+): Promise<string> {
+  return transactionRefForR1(original);
+}
+
+/** Pure recipe shared with Financial: the consent, command and receipt refs a
+ * transaction's one affirmative capture uses. Deriving them is not consent. */
+export async function sharedAuthFinancialConsentRefs(transactionRef: string): Promise<{
+  readonly consentRef: string;
+  readonly commandRef: string;
+  readonly receiptRef: string;
+}> {
+  if (!/^rpfc_[A-Za-z0-9_-]{43}$/u.test(transactionRef)) unavailable();
+  const [consentRef, commandRef, receiptRef] = await Promise.all([
+    consentRefFromTransaction("consent", transactionRef),
+    consentRefFromTransaction("command", transactionRef),
+    consentRefFromTransaction("receipt", transactionRef),
+  ]);
+  return Object.freeze({ consentRef, commandRef, receiptRef });
 }
 
 async function transactionRefForR1(original: FinancialActionConsentR1Original): Promise<string> {
@@ -834,6 +890,41 @@ export function createSharedAuthFinancialConsentRequestHandler(connection: Worke
         unavailable();
       const transactionRef = await transactionRefForR1(retained);
       sameOrigin();
+      // GET-only recovery: a stored consent for this exact R1 is shown as
+      // recorded, with no form. Any read failure falls through to the page,
+      // whose POST preflight still refuses an occupied transaction.
+      const recorded = await (async () => {
+        try {
+          const { consentRef } = await sharedAuthFinancialConsentRefs(transactionRef);
+          const historical = await Reflect.apply(readHistorical, historicals, [consentRef]);
+          sameOrigin();
+          const consent = await parseSharedAuthFinancialActionConsentOriginal(
+            historical.original.originalBytes,
+          );
+          sameOrigin();
+          if (
+            consent.consentRef !== consentRef ||
+            historical.original.command.key.transactionRef !== transactionRef
+          )
+            return false;
+          assertSameFinancialR1Original(consent, retained);
+          return true;
+        } catch {
+          sameOrigin();
+          return false;
+        }
+      })();
+      if (recorded)
+        return Object.freeze({
+          state: "prepared-financial-consent-view-data",
+          transactionRef,
+          disclosureRef: await canonicalDigest([
+            "takoserver-rp-consent-recorded-view-v1",
+            transactionRef,
+          ]),
+          html: '<!doctype html><html lang="en"><meta charset="utf-8"><title>Financial action approved</title><main><h1>Approved</h1><p>Your approval of this financial action is recorded.</p></main></html>',
+          disposition: "recorded-consent",
+        });
       const view = await renderSharedAuthFinancialPreparedConsentView({
         transactionRef,
         action,
@@ -1355,6 +1446,199 @@ export function createSharedAuthFinancialConsentRequestHandler(connection: Worke
     return attempt;
   }
 
+  /** The affirmative POST effect for one prepared original whose own identity
+   * evidence already joined. Every consent field comes from the held R1, Root
+   * observation, issuer original and that evidence; one held Clock sample is
+   * acceptedAt, capturedAt and recordedAt. The existing same-Sql batch captures
+   * command16 and consumes into original14 with its receipt, or nothing. The
+   * receipted original is DATA, not Financial NEW/CAS. Never resent. */
+  function capturePreparedFinancialR1Consent(
+    request: Request,
+    workspaceId: string,
+    challengeRef: string,
+    prepared: SharedAuthFinancialPreparedSubmissionData,
+  ): Promise<SharedAuthFinancialConsentOriginalData> {
+    const held = heldPrepared(request, workspaceId, challengeRef, prepared);
+    const evidenced = preparedEvidenceAttempts.get(prepared);
+    // Never proves or joins on its own: only the prepared original's evidence.
+    if (!held || !evidenced)
+      return Promise.reject(new SharedAuthFinancialConsentOriginalReadError("unavailable"));
+    const prior = preparedConsentAttempts.get(prepared);
+    if (prior) return prior;
+    const attempt = Promise.resolve().then(async () => {
+      const { assertHeld, assertCurrent } = preparedCurrentness(held);
+      const assertR1 = async () => {
+        const currentR1 = await Reflect.apply(held.readR1, held.reader, [challengeRef]);
+        assertHeld();
+        if (
+          currentR1.fullCommandJson !== held.retained.fullCommandJson ||
+          currentR1.r1ReceiptRef !== held.retained.r1ReceiptRef ||
+          currentR1.c0ReceiptRef !== held.retained.c0ReceiptRef
+        )
+          unavailable();
+      };
+      try {
+        const identityEvidence = await evidenced;
+        if (preparedEvidenceAttempts.get(prepared) !== evidenced) unavailable();
+        await assertCurrent();
+        const issuer = await issuerSource.readCurrentOriginal(
+          request,
+          workspaceId,
+          held.observation,
+        );
+        assertHeld();
+        const { selectedScope, sampledAt, credential, human, currentSession, finalSession } =
+          held.native;
+        const r1 = held.retained;
+        const challenge = r1.original.c0.challenge;
+        const pending = prepared.pending;
+        const transactionRef = pending.transaction_ref;
+        // The verifiers also require these joins; refuse before consuming the
+        // transaction rather than commit a consent that can never verify.
+        if (
+          prepared.submission.transactionRef !== transactionRef ||
+          pending.registration_ref !== issuer.registrationRef ||
+          pending.incarnation !== issuer.incarnation ||
+          finalSession.accountId !== credential.rp.accountId ||
+          finalSession.principalId !== human.principalId ||
+          human.ref !== credential.rp.principalBindingRef
+        )
+          unavailable();
+        const { consentRef, commandRef, receiptRef } =
+          await sharedAuthFinancialConsentRefs(transactionRef);
+        const identity = await createSharedAuthFinancialActionConsentOriginalIdentity({
+          version: "takoserver-shared-financial-action-consent-v1",
+          consentRef,
+          actionVersion: r1.actionIdentity.version,
+          action: r1.actionIdentity.action,
+          actionRequestFingerprint: r1.actionIdentity.requestFingerprint,
+          challenge,
+          selectedTerms: { ref: r1.selectedTerms.ref, digest: r1.selectedTerms.digest },
+          path: {
+            organizationId: r1.scopeRealm.organizationId,
+            workspaceId: r1.scopeRealm.workspaceId,
+            workspaceRef: r1.scopeRealm.workspaceRef,
+          },
+          financialRealmRef: r1.scopeRealm.financialRealm,
+          source: {
+            ref: r1.actionSource.ref,
+            digest: r1.actionSource.digest,
+            registrationRef: r1.actionSource.registrationRef,
+            incarnation: r1.actionSource.incarnation,
+          },
+          consentIssuer: {
+            registrationRef: issuer.registrationRef,
+            registrationDigest: issuer.registrationDigest,
+            incarnation: issuer.incarnation,
+          },
+          identityEvidence,
+          rpSession: {
+            sessionDigest: finalSession.sessionDigest,
+            acceptedVersion: currentSession.version,
+            accountId: finalSession.accountId,
+            observedPrincipalId: finalSession.principalId,
+            identity: {
+              issuer: finalSession.identity.issuer,
+              clientId: finalSession.identity.clientId,
+              subject: finalSession.identity.subject,
+              sessionId: finalSession.identity.sessionId,
+              authTime: finalSession.identity.authTime,
+            },
+          },
+          principalBinding: {
+            ref: human.ref,
+            digest: human.evidence.digest,
+            incarnation: human.controllerIncarnation,
+          },
+          credentialClass: {
+            ref: credential.origin.ref,
+            digest: credential.origin.issuanceDigest,
+            incarnation: credential.origin.incarnation,
+          },
+          acceptedAt: sampledAt,
+          expiresAt: Math.min(
+            pending.expires_at,
+            currentSession.absoluteExpiresAt,
+            challenge.expiresAt,
+          ),
+        });
+        assertHeld();
+        const originalBytes = new TextEncoder().encode(identity.canonicalOriginalJson);
+        const key = Object.freeze({
+          registrationRef: issuer.registrationRef,
+          incarnation: issuer.incarnation,
+          transactionRef,
+          commandRef,
+          consentRef,
+          receiptRef,
+        });
+        const scope = Object.freeze({
+          organizationId: selectedScope.organizationId,
+          workspaceId: selectedScope.workspaceId,
+          workspaceRef: selectedScope.workspaceRef,
+        });
+        const commandBytes = new TextEncoder().encode(
+          canonicalJson({
+            v: CONSENT_COMMAND_VERSION,
+            family: CONSENT_FAMILY,
+            key,
+            selectedScope: scope,
+            submission: { approve: "yes", confirmationTransaction: transactionRef },
+            originalDigest: identity.consentDigest,
+            capturedAt: sampledAt,
+          }),
+        );
+        const [commandCustodySHA256, originalCustodySHA256] = await Promise.all([
+          bytesDigest(commandBytes),
+          bytesDigest(originalBytes),
+        ]);
+        const command: SharedAuthFinancialConsentOriginalCommand = Object.freeze({
+          key,
+          selectedScope: scope,
+          family: CONSENT_FAMILY,
+          commandBytes,
+          commandCustodySHA256,
+          originalBytes,
+          originalDigest: identity.consentDigest,
+          originalCustodySHA256,
+          capturedAt: sampledAt,
+        });
+        await assertCurrent();
+        let result: SharedAuthFinancialConsentOriginalData;
+        try {
+          result = await captureAndConsumePreparedSharedAuthFinancialConsentObservedRequestData(
+            connection,
+            request,
+            workspaceId,
+            held.observation,
+            { pending, command },
+          );
+        } catch {
+          // Unknown outcome: GET-only recovery of this exact held command. An
+          // absent original stays unavailable; nothing is re-minted or resent.
+          result = await createSharedAuthFinancialConsentRequestCommandRecovery(
+            connection,
+            command,
+          ).readOriginalData();
+        }
+        assertHeld();
+        // pending29 is now occupied, so only the R1 and held origin are rechecked.
+        await assertR1();
+        if (
+          result.command.key.consentRef !== consentRef ||
+          result.originalDigest !== identity.consentDigest ||
+          result.recordedAt !== sampledAt
+        )
+          unavailable();
+        return result;
+      } catch {
+        return unavailable();
+      }
+    });
+    preparedConsentAttempts.set(prepared, attempt);
+    return attempt;
+  }
+
   /** Shared local/issuer/expiry checks over one already-held Root observation.
    * The Financial continuation supplies the observation made from its own
    * original capture; this helper never invokes the RP observer again. */
@@ -1613,6 +1897,7 @@ export function createSharedAuthFinancialConsentRequestHandler(connection: Worke
     readPreparedFinancialR1SubmissionData,
     provePreparedFinancialR1Identity,
     readPreparedFinancialR1IdentityEvidence,
+    capturePreparedFinancialR1Consent,
     readUnexpiredLocalData,
     verifyCurrentActionConsent,
   });
