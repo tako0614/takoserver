@@ -73,7 +73,7 @@ export const FINANCIAL_0104_CONSENT_FENCE_SCHEMA: Readonly<Record<string, string
 
 /** Customer L1 fences. The epoch is the admitted challenge's own column. The
  * stripe_customer_admission_links row the same batch writes is fenced by Root's
- * 0105 (Root-owned Stripe tables), and the Financial fences here roll it back. */
+ * Money cutover-guard Stripe generation, and the Financial fences here roll it back. */
 export const FINANCIAL_0104_CUSTOMER_L1_FENCE_SCHEMA: Readonly<Record<string, string>> =
   Object.freeze({
     financial_customer_admissions_money_fence:
@@ -84,11 +84,11 @@ export const FINANCIAL_0104_CUSTOMER_L1_FENCE_SCHEMA: Readonly<Record<string, st
 
 /** Customer H0 history fences. The epoch is the retained root's own writerEpoch.
  * Enrollment heads admit an UPDATE: the H0 writer's seal and restart keep the
- * capture sequence, so those are fenced; the existing Org capture triggers only
- * ever advance it (capture or close), so Root's Org writes are not refused here.
- * financial_customer_history_birth_observations is written only by those Org
- * triggers and carries no fence (fencing it would refuse every Org write outside
- * Root's Money frame). */
+ * capture sequence, so those are fenced; Root's Org capture triggers (Root 0105)
+ * only ever advance it (capture or close), so Root's Org writes are not refused here.
+ * financial_customer_history_birth_observations is append-only and written only by
+ * those Org triggers; it carries no fence (fencing it would refuse every Org write
+ * outside Root's Money frame), and no Financial batch may write it. */
 export const FINANCIAL_0104_CUSTOMER_H0_FENCE_SCHEMA: Readonly<Record<string, string>> =
   Object.freeze({
     financial_history_primary_roots_money_fence:
@@ -181,12 +181,14 @@ export const FINANCIAL_0104_FENCED_TABLES = Object.freeze([
 
 /** 0104 tables that carry no Financial fence, each with its one reason. */
 export const FINANCIAL_0104_UNFENCED_TABLES: Readonly<Record<string, string>> = Object.freeze({
-  stripe_customer_admission_links: "Root 0105 Stripe money fence",
-  financial_customer_history_birth_observations: "written only by Root Org capture triggers",
+  stripe_customer_admission_links: "Root Money cutover-guard Stripe fence",
+  financial_customer_history_birth_observations:
+    "append-only, written only by Root's Org capture triggers, read by Financial",
 });
 
-/** Stripe tables a Customer batch writes. Root owns their money fences (0105). */
-export const ROOT_0105_STRIPE_FENCED_TABLES = Object.freeze([
+/** Stripe tables a Customer batch writes. Root owns their money fences: Money's
+ * cutover guard set (moneyCutoverFinancialTriggerSql shape), installed at cutover. */
+export const ROOT_MONEY_GUARD_STRIPE_TABLES = Object.freeze([
   "stripe_billing_customers",
   "stripe_billing_customer_commands",
   "stripe_customer_admission_links",
@@ -222,7 +224,7 @@ export function isFinancialMoneyFencedBatch(
 }
 
 /** Static Customer builder refusal: every statement writes one Financial-fenced
- * table or one Root 0105 Stripe table, and at least one writes a Financial-fenced
+ * table or one Root Money-guard Stripe table, and at least one writes a Financial-fenced
  * table, so a Financial fence aborts the whole batch outside Root's Money frame. */
 export function isFinancialCustomerMoneyFencedBatch(
   statements: readonly { readonly sql: string }[],
@@ -237,7 +239,7 @@ export function isFinancialCustomerMoneyFencedBatch(
       (target) =>
         financial(target) ||
         (target !== undefined &&
-          (ROOT_0105_STRIPE_FENCED_TABLES as readonly string[]).includes(target)),
+          (ROOT_MONEY_GUARD_STRIPE_TABLES as readonly string[]).includes(target)),
     )
   );
 }

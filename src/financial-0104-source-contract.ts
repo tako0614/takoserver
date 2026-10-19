@@ -227,13 +227,6 @@ export const FINANCIAL_0104_TABLES: readonly string[] = Object.freeze(
   FINANCIAL_0104_OBJECTS.filter((o) => o.type === "table").map((o) => o.name),
 );
 
-/** 0104 triggers on a table 0104 does not create: the H0 Org capture triggers. */
-export const FINANCIAL_0104_FOREIGN_TABLE_TRIGGERS: readonly string[] = Object.freeze(
-  FINANCIAL_0104_OBJECTS.filter((o) => !FINANCIAL_0104_TABLES.includes(o.tbl_name)).map(
-    (o) => o.name,
-  ),
-);
-
 /** The INSERT money fence of every fenced 0104 table, keyed by table. */
 export const FINANCIAL_0104_MONEY_FENCES: Readonly<Record<string, string>> = Object.freeze(
   Object.fromEntries(
@@ -255,11 +248,9 @@ export const FINANCIAL_0104_MONEY_UPDATE_FENCES: Readonly<Record<string, string>
 /** The exact migration body, one statement per object, in source order. */
 export const FINANCIAL_0104_DDL = `${FINANCIAL_0104_OBJECTS.map((o) => `${o.sql};`).join("\n")}\n`;
 
-/** Read-only catalog projection over every 0104-owned table's schema objects and
- * the 0104 triggers it places on a foreign table. */
+/** Read-only catalog projection over every 0104-owned table's schema objects. */
 export const FINANCIAL_0104_CATALOG_QUERY = `SELECT type, name, tbl_name, sql
-FROM main.sqlite_schema WHERE sql IS NOT NULL AND (tbl_name IN (${FINANCIAL_0104_TABLES.map((t) => `'${t}'`).join(", ")})
- OR (type = 'trigger' AND name IN (${FINANCIAL_0104_FOREIGN_TABLE_TRIGGERS.map((t) => `'${t}'`).join(", ")})))
+FROM main.sqlite_schema WHERE sql IS NOT NULL AND tbl_name IN (${FINANCIAL_0104_TABLES.map((t) => `'${t}'`).join(", ")})
 ORDER BY type COLLATE BINARY, name COLLATE BINARY`;
 
 export interface Financial0104SourceRecipe {

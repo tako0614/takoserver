@@ -42,9 +42,11 @@ export const FINANCIAL_0104_CUSTOMER_L1_SCHEMA: Readonly<Record<string, string>>
     "CREATE TRIGGER financial_customer_admission_receipts_no_delete BEFORE DELETE ON financial_customer_admission_receipts BEGIN\n SELECT RAISE(ABORT,'constraint: retained L1 history deletion');\nEND",
 });
 
-/** Exact Customer H0 history rows, byte-identical to the H0 component fixture,
- * including its three Org capture triggers (tbl_name orgs), the only writer of
- * birth observations. */
+/** Exact Customer H0 history rows, byte-identical to the H0 component fixture.
+ * The fixture's three Org capture triggers sit on Root's orgs table and are Root's
+ * (its 0105, 0105 -> 0104), so they are not part of the Financial body. They are
+ * the only writer of birth observations, which are append-only (no_update and
+ * no_delete triggers) and only read by Financial batches. */
 export const FINANCIAL_0104_CUSTOMER_H0_SCHEMA: Readonly<Record<string, string>> = Object.freeze({
   financial_history_primary_roots:
     "CREATE TABLE financial_history_primary_roots (\n primary_ref TEXT PRIMARY KEY NOT NULL, primary_incarnation TEXT NOT NULL UNIQUE,\n physical_binding_ref TEXT NOT NULL, physical_binding_incarnation TEXT NOT NULL,\n root_json TEXT NOT NULL CHECK(json_valid(root_json) AND json_type(root_json)='object'),\n CHECK(json_extract(root_json,'$.primaryRef') IS primary_ref AND json_extract(root_json,'$.primaryIncarnation') IS primary_incarnation AND json_extract(root_json,'$.physicalBindingRef') IS physical_binding_ref AND json_extract(root_json,'$.physicalBindingIncarnation') IS physical_binding_incarnation),\n UNIQUE(physical_binding_ref,physical_binding_incarnation)\n)",
@@ -100,12 +102,6 @@ export const FINANCIAL_0104_CUSTOMER_H0_SCHEMA: Readonly<Record<string, string>>
     "CREATE TRIGGER financial_history_inventory_phase BEFORE INSERT ON financial_history_enrollment_inventory\nWHEN NOT EXISTS(SELECT 1 FROM financial_history_enrollment_heads h JOIN financial_history_enrollments e ON e.enrollment_ref=h.enrollment_ref WHERE h.primary_ref=NEW.primary_ref AND h.enrollment_ref=NEW.enrollment_ref AND h.state='capturing' AND EXISTS(SELECT 1 FROM financial_history_enrollment_receipts r WHERE r.receipt_ref=e.expected_start_receipt_ref AND r.receipt_kind='capture-start') AND EXISTS(SELECT 1 FROM json_each(e.required_json) j WHERE json(j.value)=json(NEW.evidence_json)))\nBEGIN SELECT RAISE(ABORT,'constraint: inventory original/phase mismatch');\nEND",
   financial_history_receipt_match:
     "CREATE TRIGGER financial_history_receipt_match BEFORE INSERT ON financial_history_enrollment_receipts\nWHEN NOT EXISTS(SELECT 1 FROM financial_history_enrollment_heads h JOIN financial_history_enrollments e ON e.enrollment_ref=h.enrollment_ref AND e.primary_ref=h.primary_ref\n WHERE h.primary_ref=NEW.primary_ref AND h.enrollment_ref=NEW.enrollment_ref AND h.generation=NEW.generation AND e.generation=NEW.generation AND h.capture_sequence=NEW.capture_sequence AND h.expected_receipt_ref IS NEW.receipt_ref AND\n ((NEW.receipt_kind='capture-start' AND h.state='capturing' AND e.expected_start_receipt_ref IS NEW.receipt_ref)\n OR (NEW.receipt_kind='complete-seal' AND h.state='sealed' AND e.expected_seal_ref IS NEW.receipt_ref\n AND EXISTS(SELECT 1 FROM financial_history_enrollment_receipts r WHERE r.receipt_ref=e.expected_start_receipt_ref AND r.enrollment_ref=e.enrollment_ref AND r.receipt_kind='capture-start')\n AND NOT EXISTS(SELECT 1 FROM json_each(e.required_json) j WHERE NOT EXISTS(SELECT 1 FROM financial_history_enrollment_inventory i WHERE i.enrollment_ref=e.enrollment_ref AND json(i.evidence_json)=json(j.value)))\n AND NOT EXISTS(SELECT 1 FROM financial_history_enrollment_inventory i WHERE i.enrollment_ref=e.enrollment_ref AND NOT EXISTS(SELECT 1 FROM json_each(e.required_json) j WHERE json(i.evidence_json)=json(j.value)))\n AND NOT EXISTS(SELECT 1 FROM orgs o WHERE NOT EXISTS(SELECT 1 FROM financial_history_enrollment_inventory i WHERE i.enrollment_ref=e.enrollment_ref AND i.scope_kind='org-namespace' AND i.original_scope_ref=o.id AND json_extract(i.evidence_json,'$.ownerPrincipalId') IS o.owner_principal_id AND json_extract(i.evidence_json,'$.orgCreatedAt') IS o.created_at) AND NOT EXISTS(SELECT 1 FROM financial_customer_history_birth_observations b WHERE b.org_id=o.id AND b.owner_principal_id=o.owner_principal_id AND b.org_created_at=o.created_at AND b.enrollment_ref=e.enrollment_ref)))))\nBEGIN SELECT RAISE(ABORT,'constraint: mandatory receipt mismatch');\nEND",
-  financial_history_capture_org_insert:
-    "CREATE TRIGGER financial_history_capture_org_insert AFTER INSERT ON orgs\nBEGIN\n UPDATE financial_history_enrollment_heads SET capture_sequence=capture_sequence+1 WHERE state IN('capturing','sealed');\n INSERT INTO financial_customer_history_birth_observations(birth_ref,org_id,owner_principal_id,org_name,org_created_at,phase,primary_ref,enrollment_ref,capture_sequence,complete_seal_ref,seal_kind)\n SELECT 'birth:'||lower(hex(randomblob(16))),NEW.id,NEW.owner_principal_id,NEW.name,NEW.created_at,\n CASE WHEN h.state='sealed' AND r.receipt_ref IS NOT NULL THEN 'post-seal' ELSE 'during-enrollment' END,h.primary_ref,h.enrollment_ref,h.capture_sequence,r.receipt_ref,CASE WHEN r.receipt_ref IS NOT NULL THEN 'complete-seal' ELSE NULL END\n FROM financial_history_enrollment_heads h JOIN financial_history_enrollments e ON e.enrollment_ref=h.enrollment_ref LEFT JOIN financial_history_enrollment_receipts r ON r.receipt_ref=e.expected_seal_ref AND r.receipt_kind='complete-seal' AND r.enrollment_ref=e.enrollment_ref\n WHERE h.state IN('capturing','sealed');\n INSERT INTO financial_customer_history_birth_observations(birth_ref,org_id,owner_principal_id,org_name,org_created_at,phase)\n SELECT 'birth:'||lower(hex(randomblob(16))),NEW.id,NEW.owner_principal_id,NEW.name,NEW.created_at,'raw'\n WHERE NOT EXISTS(SELECT 1 FROM financial_history_enrollment_heads WHERE state IN('capturing','sealed'));\nEND",
-  financial_history_capture_org_update:
-    "CREATE TRIGGER financial_history_capture_org_update AFTER UPDATE ON orgs\nBEGIN\n UPDATE financial_history_enrollment_heads SET state='closed',capture_sequence=capture_sequence+1 WHERE state IN('capturing','sealed');\nEND",
-  financial_history_capture_org_delete:
-    "CREATE TRIGGER financial_history_capture_org_delete AFTER DELETE ON orgs\nBEGIN\n UPDATE financial_history_enrollment_heads SET state='closed',capture_sequence=capture_sequence+1 WHERE state IN('capturing','sealed');\nEND",
 });
 
 /** Exact Customer H1 journal, dispatch and custody rows, byte-identical to the
@@ -198,7 +194,8 @@ const CUSTOMER_FENCED_SHAPE: Readonly<Record<string, string>> = Object.freeze({
   ...FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA,
 });
 /** Tables whose every schema object Financial owns. stripe_customer_admission_links
- * also carries Root's 0105 money fence, so it is compared by Financial name only. */
+ * also carries Root's Money cutover-guard Stripe fences, so it is compared by
+ * Financial name only. */
 const CUSTOMER_OWNED_TABLES = Object.freeze(
   [
     ...Object.entries({
@@ -212,10 +209,8 @@ const CUSTOMER_OWNED_TABLES = Object.freeze(
     .filter((name) => name !== "stripe_customer_admission_links"),
 );
 const CUSTOMER_NAMED_OBJECTS = Object.freeze(
-  Object.keys(CUSTOMER_FENCED_SHAPE).filter(
-    (name) =>
-      name.startsWith("stripe_customer_admission_link") ||
-      name.startsWith("financial_history_capture_org_"),
+  Object.keys(CUSTOMER_FENCED_SHAPE).filter((name) =>
+    name.startsWith("stripe_customer_admission_link"),
   ),
 );
 const CUSTOMER_SHAPE_QUERY = `SELECT name,sql FROM sqlite_schema

@@ -3,7 +3,7 @@
  * S/R composition may eventually execute a plan; these objects confer no payer/native authority.
  * A plan holds only Customer statements (L1 7, D 6, N 6) and names no money_cutover_*
  * table: Root's Money writer adds its own permit frame around it, and every row the
- * plan writes is 0104 money-fenced (Financial) or 0105 money-fenced (Root Stripe).
+ * plan writes is 0104 money-fenced (Financial) or Money-guard fenced (Root Stripe).
  */
 
 import { isFinancialCustomerMoneyFencedBatch } from "./financial-0104-money-fence.ts";

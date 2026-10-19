@@ -1,5 +1,7 @@
 -- PRIVATE unnumbered H0 component. Labels/JSON are not genuine source authority.
 -- No H1/payer/grant/native/money writer. Existing 0096-0100 are unchanged.
+-- The three financial_history_capture_org_* triggers on orgs are Root-owned (Root
+-- 0105, 0105 -> 0104); every other object here is a Financial 0104 row.
 CREATE TABLE financial_history_primary_roots (
  primary_ref TEXT PRIMARY KEY NOT NULL, primary_incarnation TEXT NOT NULL UNIQUE,
  physical_binding_ref TEXT NOT NULL, physical_binding_incarnation TEXT NOT NULL,

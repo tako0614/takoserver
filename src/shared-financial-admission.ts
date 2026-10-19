@@ -328,7 +328,7 @@ export function prepareCustomerAdmissionBatch(
     ],
   };
   const statements = [first, second, third, last];
-  // Every statement writes a Financial-fenced table or a Root 0105 Stripe table.
+  // Every statement writes a Financial-fenced table or a Root Money-guard Stripe table.
   if (!isFinancialCustomerMoneyFencedBatch(statements))
     throw new SqlError("invalid", "Customer admission batch must write only money-fenced tables");
   return statements;

@@ -20,13 +20,12 @@ import {
   financialStatementWriteTarget,
   isFinancialCustomerMoneyFencedBatch,
   isFinancialMoneyFencedBatch,
-  ROOT_0105_STRIPE_FENCED_TABLES,
+  ROOT_MONEY_GUARD_STRIPE_TABLES,
 } from "../src/financial-0104-money-fence.ts";
 import {
   createFinancial0104SourceRecipe,
   FINANCIAL_0104_CATALOG_QUERY,
   FINANCIAL_0104_DDL,
-  FINANCIAL_0104_FOREIGN_TABLE_TRIGGERS,
   FINANCIAL_0104_MIGRATION,
   FINANCIAL_0104_MONEY_FENCES,
   FINANCIAL_0104_MONEY_UPDATE_FENCES,
@@ -114,17 +113,6 @@ function schemaRows(db: Database, tables: readonly string[]): SchemaRow[] {
   ).sort(byName);
 }
 
-/** Every 0104 table's rows plus the 0104 triggers it places on a foreign table. */
-function rows0104(db: Database): SchemaRow[] {
-  return [
-    ...schemaRows(db, FINANCIAL_0104_TABLES),
-    ...(db
-      .query(
-        `SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE type='trigger' AND name IN (${FINANCIAL_0104_FOREIGN_TABLE_TRIGGERS.map(() => "?").join(",")})`,
-      )
-      .all(...FINANCIAL_0104_FOREIGN_TABLE_TRIGGERS) as SchemaRow[]),
-  ].sort(byName);
-}
 const FENCED_0104_TABLES = FINANCIAL_0104_TABLES.filter(
   (table) => !Object.hasOwn(FINANCIAL_0104_UNFENCED_TABLES, table),
 );
@@ -139,17 +127,13 @@ describe("Financial 0104 source recipe", () => {
       for (const object of FINANCIAL_0104_OBJECTS)
         expect(before).not.toContain(`${object.type}:${object.name}`);
       db.exec(FINANCIAL_0104_DDL);
-      // The only foreign-table objects are the three H0 Org capture triggers.
+      // Every 0104 object sits on a 0104 table: the H0 Org capture triggers on
+      // Root's orgs table are Root's 0105, not part of this body.
       expect(
-        FINANCIAL_0104_OBJECTS.filter((o) =>
-          FINANCIAL_0104_FOREIGN_TABLE_TRIGGERS.includes(o.name),
-        ).map((o) => [o.type, o.name, o.tbl_name]),
-      ).toEqual([
-        ["trigger", "financial_history_capture_org_insert", "orgs"],
-        ["trigger", "financial_history_capture_org_update", "orgs"],
-        ["trigger", "financial_history_capture_org_delete", "orgs"],
-      ]);
-      const installed = rows0104(db);
+        FINANCIAL_0104_OBJECTS.filter((o) => !FINANCIAL_0104_TABLES.includes(o.tbl_name)),
+      ).toEqual([]);
+      expect(FINANCIAL_0104_DDL).not.toContain(" ON orgs");
+      const installed = schemaRows(db, FINANCIAL_0104_TABLES);
       expect(installed).toEqual(
         FINANCIAL_0104_OBJECTS.map(({ type, name, tbl_name, sql }) => ({
           type,
@@ -222,8 +206,8 @@ describe("Financial 0104 source recipe", () => {
           .all(...FINANCIAL_0104_TABLES) as { name: string }[]
       ).map((row) => row.name);
       expect(tables).toEqual([...FINANCIAL_0104_TABLES].sort());
-      // Exactly two named 0104 tables carry no Financial fence: Root fences the
-      // links in 0105, and only Root's Org capture triggers write birth rows.
+      // Exactly two named 0104 tables carry no Financial fence: Root's Money cutover
+      // guard fences the links, and only Root's Org capture triggers append birth rows.
       expect(Object.keys(FINANCIAL_0104_UNFENCED_TABLES).sort()).toEqual([
         "financial_customer_history_birth_observations",
         "stripe_customer_admission_links",
@@ -276,7 +260,7 @@ describe("Financial 0104 source recipe", () => {
             object?.sql.startsWith(`CREATE TRIGGER ${update} BEFORE UPDATE ON ${table}\n`),
           ).toBe(true);
           // H0 enrollment heads fence only the H0 writer's same-capture transitions;
-          // Root's Org capture triggers advance the capture sequence.
+          // Root's Org capture triggers (Root 0105) advance the capture sequence.
           expect(object?.sql).toContain(
             table === "financial_history_enrollment_heads"
               ? "WHEN NEW.capture_sequence IS OLD.capture_sequence AND (EXISTS(SELECT 1 FROM money_cutover_freeze)"
@@ -533,7 +517,8 @@ describe("Financial 0104 source recipe", () => {
           "utf8",
         ),
       );
-      // The Customer candidates: L1, H0 (its Org capture triggers need orgs) and journal.
+      // The Customer candidates: L1, H0 and journal. The H0 fixture also carries
+      // Root's Org capture triggers on orgs; they are not 0104 rows.
       db.exec("CREATE TABLE orgs(id TEXT PRIMARY KEY)");
       for (const file of [
         "customer-l1-schema.unnumbered.sql",
@@ -549,7 +534,7 @@ describe("Financial 0104 source recipe", () => {
       ]);
       expect(Object.keys(FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA)).toHaveLength(17);
       expect(added.size).toBe(35);
-      expect(rows0104(db)).toEqual(
+      expect(schemaRows(db, FINANCIAL_0104_TABLES)).toEqual(
         FINANCIAL_0104_OBJECTS.filter((o) => !added.has(o.name))
           .map(({ type, name, tbl_name, sql }) => ({ type, name, tbl_name, sql }))
           .sort(byName),
@@ -667,9 +652,9 @@ describe("Financial 0104 source recipe", () => {
         "WITH i(a) AS (VALUES(?)) INSERT INTO financial_retained_r1_originals(a) SELECT a FROM i",
       ),
     ).toBe("financial_retained_r1_originals");
-    // Customer batches may also write Root's 0105-fenced Stripe tables, but only
+    // Customer batches may also write Root's Money-guard Stripe tables, but only
     // alongside a Financial-fenced write, and never any other table.
-    expect([...ROOT_0105_STRIPE_FENCED_TABLES].sort()).toEqual([
+    expect([...ROOT_MONEY_GUARD_STRIPE_TABLES].sort()).toEqual([
       "stripe_billing_customer_commands",
       "stripe_billing_customers",
       "stripe_customer_admission_links",
@@ -696,6 +681,63 @@ describe("Financial 0104 source recipe", () => {
         { sql: "INSERT INTO stripe_customer_admission_links(org_id) VALUES(?)" },
       ]),
     ).toBe(false);
+    // Birth observations are Root's Org-trigger rows: no Financial batch may write them.
+    for (const write of [
+      "INSERT INTO financial_customer_history_birth_observations(birth_ref) VALUES(?)",
+      "UPDATE financial_customer_history_birth_observations SET phase='raw'",
+      "DELETE FROM financial_customer_history_birth_observations",
+    ]) {
+      const batch = [
+        { sql: "INSERT INTO financial_customer_history_entries(entry_ref) VALUES(?)" },
+        { sql: write },
+      ];
+      expect(isFinancialMoneyFencedBatch(batch)).toBe(false);
+      expect(isFinancialCustomerMoneyFencedBatch(batch)).toBe(false);
+    }
+  });
+
+  test("birth observations are append-only and no Financial source writes them", async () => {
+    const db = at0103();
+    try {
+      db.exec(FINANCIAL_0104_DDL);
+      const triggers = (
+        db
+          .query(
+            "SELECT name FROM sqlite_schema WHERE type='trigger' AND tbl_name='financial_customer_history_birth_observations' ORDER BY name",
+          )
+          .all() as { name: string }[]
+      ).map((row) => row.name);
+      expect(triggers).toEqual([
+        "financial_customer_history_birth_observations_no_delete",
+        "financial_customer_history_birth_observations_no_replace",
+        "financial_customer_history_birth_observations_no_update",
+      ]);
+      db.exec("PRAGMA foreign_keys=OFF");
+      db.exec(
+        "INSERT INTO financial_customer_history_birth_observations(birth_ref,org_id,owner_principal_id,org_name,org_created_at,phase) VALUES('birth:a','org:a','owner','name','at','raw')",
+      );
+      expect(() =>
+        db.exec("UPDATE financial_customer_history_birth_observations SET org_name='changed'"),
+      ).toThrow(/constraint: retained history mutation/u);
+      expect(() => db.exec("DELETE FROM financial_customer_history_birth_observations")).toThrow(
+        /constraint: retained history deletion/u,
+      );
+      expect(count(db, "financial_customer_history_birth_observations")).toBe(1);
+    } finally {
+      db.close();
+    }
+    // Financial source only reads the table; its one writer is Root's Org cascade.
+    const writers = new Bun.Glob("src/**/*.ts").scanSync({ cwd: ROOT });
+    for (const path of writers) {
+      const source = readFileSync(join(ROOT, path), "utf8");
+      expect({
+        path,
+        writes:
+          /\b(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|UPDATE|DELETE\s+FROM|REPLACE\s+INTO)\s+financial_customer_history_birth_observations\b/iu.test(
+            source,
+          ),
+      }).toEqual({ path, writes: false });
+    }
   });
 
   test("Customer writes require exactly the fenced 0104 Customer shape", async () => {
@@ -721,10 +763,10 @@ describe("Financial 0104 source recipe", () => {
       );
       db.exec(fences[0] ?? "");
       await expect(assertFinancial0104CustomerWriteShape(sql)).resolves.toBeUndefined();
-      // Root's own 0105 trigger on the links table is Root's; an extra object on a
-      // Financial-owned Customer table is not the exact shape.
+      // Root's Money cutover-guard fence on the links table is Root's; an extra
+      // object on a Financial-owned Customer table is not the exact shape.
       db.exec(
-        "CREATE TRIGGER stripe_customer_admission_links_money_fence BEFORE INSERT ON stripe_customer_admission_links BEGIN SELECT 1; END",
+        "CREATE TRIGGER money_cutover_fence_stripe_customer_admission_links_insert BEFORE INSERT ON stripe_customer_admission_links BEGIN SELECT 1; END",
       );
       await expect(assertFinancial0104CustomerWriteShape(sql)).resolves.toBeUndefined();
       db.exec(
