@@ -2,6 +2,8 @@
 -- No H1/payer/grant/native/money writer. Existing 0096-0100 are unchanged.
 -- The three financial_history_capture_org_* triggers on orgs are Root-owned (Root
 -- 0105, 0105 -> 0104); every other object here is a Financial 0104 row.
+-- A capture start requires Root's four Org capture triggers on orgs, pinned by
+-- name until Root's official 0105 lands (Financial then pins their exact SQL).
 -- Org capture is append-only and never relies on orgs rowids: Root's Org triggers
 -- only append birth and change observations and never update a Financial head or
 -- RAISE. A framed capture start writes, in the same batch, a fenced roster of the
@@ -127,7 +129,8 @@ WHEN NOT EXISTS(SELECT 1 FROM orgs o WHERE o.id IS NEW.org_id AND o.owner_princi
  WHERE h.state IN('capturing','sealed') AND h.primary_ref IS NEW.primary_ref AND h.enrollment_ref IS NEW.enrollment_ref
  AND NOT EXISTS(SELECT 1 FROM financial_history_enrollment_roster ro WHERE ro.enrollment_ref=e.enrollment_ref AND ro.org_id=NEW.org_id)
  AND NEW.complete_seal_ref IS r.receipt_ref
- AND NEW.phase IS CASE WHEN h.state='sealed' AND r.receipt_ref IS NOT NULL THEN 'post-seal' ELSE 'during-enrollment' END))
+ AND NEW.phase IS CASE WHEN h.state='sealed' AND r.receipt_ref IS NOT NULL THEN 'post-seal' ELSE 'during-enrollment' END
+ AND (NEW.phase<>'post-seal' OR NOT (EXISTS(SELECT 1 FROM ledger m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM wallet_credit_lots m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM wallet_credit_allocations m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_customers m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_customer_commands m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_subscriptions m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_commands m WHERE m.org_id=NEW.org_id)))))
 BEGIN SELECT RAISE(ABORT,'constraint: birth observation requires its exact Org capture');
 END;
 CREATE TRIGGER financial_customer_history_org_changes_org_capture BEFORE INSERT ON financial_customer_history_org_changes
@@ -190,6 +193,7 @@ CREATE TRIGGER financial_history_receipt_match BEFORE INSERT ON financial_histor
 WHEN NOT EXISTS(SELECT 1 FROM financial_history_enrollment_heads h JOIN financial_history_enrollments e ON e.enrollment_ref=h.enrollment_ref AND e.primary_ref=h.primary_ref
  WHERE h.primary_ref=NEW.primary_ref AND h.enrollment_ref=NEW.enrollment_ref AND h.generation=NEW.generation AND e.generation=NEW.generation AND h.capture_sequence=NEW.capture_sequence AND h.expected_receipt_ref IS NEW.receipt_ref AND
  ((NEW.receipt_kind='capture-start' AND h.state='capturing' AND e.expected_start_receipt_ref IS NEW.receipt_ref
+ AND (SELECT count(*) FROM main.sqlite_schema WHERE type='trigger' AND tbl_name='orgs' AND name IN('financial_history_capture_org_replace','financial_history_capture_org_insert','financial_history_capture_org_update','financial_history_capture_org_delete'))=4
  AND NOT EXISTS(SELECT 1 FROM orgs o WHERE NOT EXISTS(SELECT 1 FROM financial_history_enrollment_roster ro WHERE ro.enrollment_ref=e.enrollment_ref AND ro.org_id=o.id))
  AND NOT EXISTS(SELECT 1 FROM financial_history_enrollment_roster ro WHERE ro.enrollment_ref=e.enrollment_ref AND (ro.primary_ref IS NOT e.primary_ref OR NOT EXISTS(SELECT 1 FROM orgs o WHERE o.id=ro.org_id))))
  OR (NEW.receipt_kind='complete-seal' AND h.state='sealed' AND e.expected_seal_ref IS NEW.receipt_ref
@@ -216,7 +220,8 @@ BEGIN
  FROM financial_history_enrollment_heads h JOIN financial_history_enrollments e ON e.enrollment_ref=h.enrollment_ref AND e.primary_ref=h.primary_ref LEFT JOIN financial_history_enrollment_receipts r ON r.receipt_ref=e.expected_seal_ref AND r.receipt_kind='complete-seal' AND r.enrollment_ref=e.enrollment_ref
  WHERE h.state IN('capturing','sealed')
  AND NOT EXISTS(SELECT 1 FROM financial_history_enrollment_roster ro WHERE ro.enrollment_ref=e.enrollment_ref AND ro.org_id=NEW.id)
- AND NOT EXISTS(SELECT 1 FROM financial_customer_history_birth_observations b WHERE b.org_id=NEW.id AND b.primary_ref=h.primary_ref AND b.enrollment_ref=h.enrollment_ref);
+ AND NOT EXISTS(SELECT 1 FROM financial_customer_history_birth_observations b WHERE b.org_id=NEW.id AND b.primary_ref=h.primary_ref AND b.enrollment_ref=h.enrollment_ref)
+ AND NOT (h.state='sealed' AND r.receipt_ref IS NOT NULL AND (EXISTS(SELECT 1 FROM ledger m WHERE m.org_id=NEW.id) OR EXISTS(SELECT 1 FROM wallet_credit_lots m WHERE m.org_id=NEW.id) OR EXISTS(SELECT 1 FROM wallet_credit_allocations m WHERE m.org_id=NEW.id) OR EXISTS(SELECT 1 FROM stripe_billing_customers m WHERE m.org_id=NEW.id) OR EXISTS(SELECT 1 FROM stripe_billing_customer_commands m WHERE m.org_id=NEW.id) OR EXISTS(SELECT 1 FROM stripe_billing_subscriptions m WHERE m.org_id=NEW.id) OR EXISTS(SELECT 1 FROM stripe_billing_commands m WHERE m.org_id=NEW.id)));
  INSERT INTO financial_customer_history_birth_observations(birth_ref,org_id,owner_principal_id,org_name,org_created_at,phase)
  SELECT 'birth:'||lower(hex(randomblob(16))),NEW.id,NEW.owner_principal_id,NEW.name,NEW.created_at,'raw'
  WHERE NOT EXISTS(SELECT 1 FROM financial_history_enrollment_heads WHERE state IN('capturing','sealed'))

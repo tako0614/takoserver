@@ -187,9 +187,9 @@ export const CUSTOMER_ENTRY_MATCH = `EXISTS(SELECT 1 FROM customer_entry_matches
  * created_at), and no change observation may ever have named it (as org_id or
  * new_org_id): an id that existed before, or was moved or deleted, never yields a
  * coverage origin. A change to another Org does not affect this coverage (the
- * seal keeps the global no-change rule). The origin trigger additionally refuses
- * an id with money rows older than the Org row. Money currentness is appended
- * separately below. */
+ * seal keeps the global no-change rule). An id that already had money rows never
+ * receives a post-seal birth (decided at birth time, no timestamps). Money
+ * currentness is appended separately below. */
 const CUSTOMER_COVERAGE_CORE = `(
  (cv.original_org_origin IS birth.birth_ref AND birth.org_id IS cv.organization_id AND birth.phase='post-seal'
  AND birth.primary_ref IS cv.primary_ref AND birth.enrollment_ref IS cv.enrollment_ref AND birth.complete_seal_ref IS cv.complete_seal_ref)

@@ -1892,28 +1892,71 @@ test("A3: after an id move, the re-inserted old id is never a coverage origin", 
     f.db.close();
   }
 });
-test("an Org id deleted before 0105 with older money rows is never a coverage origin; without any trace it is (documented residual)", async () => {
-  for (const traced of [true, false]) {
+for (const createdAt of ["2000-01-01T00:00:00.000Z", "1700000000000", LATER])
+  test(`an Org id with any money row gets no post-seal birth and no origin (created_at ${createdAt})`, async () => {
     const f = fixture();
     try {
       await principal(f);
+      // Created and deleted before 0105: no observation, but a ledger row remains.
       pre0105(
         f,
         `INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:ghost','Org','principal:owner','${at}')`,
       );
-      if (traced)
-        f.db.exec(
-          `INSERT INTO ledger(id,org_id,type,ref,settled_delta_micros,held_delta_micros,created_at) VALUES('ledger:ghost','org:ghost','funding','ref:ghost',1,0,'${at}')`,
-        );
+      f.db.exec(
+        `INSERT INTO ledger(id,org_id,type,ref,settled_delta_micros,held_delta_micros,created_at) VALUES('ledger:ghost','org:ghost','funding','ref:ghost',1,0,'${at}')`,
+      );
       pre0105(f, "DELETE FROM orgs WHERE id='org:ghost'");
       const run = enrollment();
       await sealedFor(f, run);
+      // The re-INSERT succeeds whatever created_at it claims; no post-seal birth.
       await f.raw.run(
         "INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:ghost','Org','principal:owner',?)",
-        [LATER],
+        [createdAt],
       );
-      if (traced) await constraint(() => coverage(f, run, "org:ghost"));
-      else expect((await coverage(f, run, "org:ghost")).changes).toBe(1);
+      expect(births(f)).toEqual([]);
+      await expect(coverage(f, run, "org:ghost")).rejects.toThrow("no post-seal birth");
+      // A forged post-seal birth is refused by the 0104 guard as well.
+      const forged = forgedBirth("post-seal", "org:ghost", run.sealReceiptRef);
+      await constraint(() => f.raw.run(forged.sql, forged.params));
+    } finally {
+      f.db.close();
+    }
+  });
+test("a brand-new post-seal Org id is still admitted; only an id with no money rows at all is indistinguishable (documented residual)", async () => {
+  const f = fixture();
+  try {
+    await principal(f);
+    pre0105(
+      f,
+      `INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:quiet','Org','principal:owner','${at}')`,
+    );
+    pre0105(f, "DELETE FROM orgs WHERE id='org:quiet'");
+    const run = enrollment();
+    await sealedFor(f, run);
+    await f.org("org:brand-new");
+    expect((await coverage(f, run, "org:brand-new")).changes).toBe(1);
+    await f.raw.run(
+      "INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:quiet','Org','principal:owner',?)",
+      [LATER],
+    );
+    expect((await coverage(f, run, "org:quiet")).changes).toBe(1);
+  } finally {
+    f.db.close();
+  }
+});
+test("a capture start requires Root's four Org capture triggers on orgs", async () => {
+  for (const missing of ORG_CAPTURE) {
+    const f = fixture();
+    try {
+      const sql = (
+        f.db.query("SELECT sql FROM sqlite_schema WHERE name=?").get(missing) as { sql: string }
+      ).sql;
+      f.db.exec(`DROP TRIGGER ${missing}`);
+      const before = f.snapshot();
+      await constraint(() => f.component.start(root, enrollment()));
+      expect(f.snapshot()).toBe(before);
+      f.db.exec(sql);
+      expect((await f.component.start(root, enrollment()))?.receipt_kind).toBe("capture-start");
     } finally {
       f.db.close();
     }

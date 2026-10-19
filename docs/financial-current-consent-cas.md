@@ -76,11 +76,15 @@ id was in no start roster of that primary, still matches the current Org row
 (owner, created_at), and was never named by any change observation (as the old or
 new id); 0105 also backfills one raw birth for every Org existing at install. So a
 deleted, moved or re-created id that Financial ever observed never becomes an
-origin. Residual limitation: an Org id created and deleted before 0105 was
-installed leaves no observation. The origin trigger then refuses only when money
-rows for that id older than the new Org row exist (stripe_billing_customers,
-stripe_billing_customer_commands, ledger, wallet_credit_lots); an id reused
-without any such trace is indistinguishable from a new Org. Coverage is scoped per
+origin. An Org id that already has any money row (ledger, wallet_credit_lots,
+wallet_credit_allocations, stripe_billing_customers,
+stripe_billing_customer_commands, stripe_billing_subscriptions or
+stripe_billing_commands) never receives a post-seal birth; 0105's Org trigger
+skips it and the 0104 birth guard refuses it, decided at birth time without any
+timestamp. Residual limitation: an id created and deleted before 0105 with no
+money row in those tables leaves no observation and is indistinguishable from a
+new Org. A capture start requires Root's four 0105 Org triggers on orgs (pinned by
+name until Root's official 0105 lands, then by exact SQL). Coverage is scoped per
 Org (a change to another Org does not affect it); the seal keeps the global
 no-change rule, where a framed close and restart is cheap. A spurious replace
 observation from INSERT OR IGNORE or ON CONFLICT DO NOTHING with a different owner
