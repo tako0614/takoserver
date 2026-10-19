@@ -395,10 +395,56 @@ describe("hosted top-up intent and Checkout", () => {
     const page = harness({ storage, search: "?consent=returned&tab=ledger" });
     await page.controller.handleConsentReturn();
     expect(page.begins).toEqual([{ reference, amountMinor: 7500 }]);
-    expect(page.receipts).toEqual([]);
+    expect(page.receipts).toEqual([reference]);
     expect(page.location.assigned).toEqual([checkoutUrl]);
     expect(page.location.replaced).toEqual(["/billing?tab=ledger#wallet"]);
     expect(storedReference(storage)).toBe(reference);
+  });
+
+  test("a consent return reads the receipt first and never reopens a settled payment", async () => {
+    const storage = new MemoryStorage();
+    await intentStore(storage).getOrCreate({ ...scope, amountMinor: 7500 });
+    const reference = storedReference(storage) ?? "";
+    const page = harness({
+      storage,
+      search: "?consent=returned",
+      receipt: async (ref) => ({ reference: ref, state: "paid", checkout: null }),
+    });
+    await page.controller.handleConsentReturn();
+    expect(page.receipts).toEqual([reference]);
+    expect(page.begins).toEqual([]);
+    expect(page.location.assigned).toEqual([]);
+    expect(page.controller.state()).toEqual({ status: "paid" });
+    expect(storedReference(storage)).toBeNull();
+  });
+
+  test("a new reference refused before creation is discarded only after a not-found receipt", async () => {
+    const refused = harness({
+      begin: async () => Promise.reject(apiError("invalid_argument", 400)),
+    });
+    await refused.controller.start(5000);
+    const reference = refused.begins[0]?.reference ?? "";
+    expect(refused.receipts).toEqual([reference]);
+    expect(refused.controller.state()).toEqual({ status: "rejected" });
+    expect(storedReference(refused.storage)).toBeNull();
+
+    // A receipt that exists means the server holds the command: keep custody.
+    const held = harness({
+      begin: async () => Promise.reject(apiError("invalid_argument", 400)),
+      receipt: async (ref) => ({ reference: ref, state: "pending", checkout: null }),
+    });
+    await held.controller.start(5000);
+    const heldReference = held.begins[0]?.reference ?? "";
+    expect(held.controller.state()).toEqual({ status: "uncertain" });
+    expect(storedReference(held.storage)).toBe(heldReference);
+
+    // An unreachable receipt is not absence either.
+    const unknown = harness({
+      begin: async () => Promise.reject(apiError("invalid_argument", 400)),
+      receipt: async () => Promise.reject(apiError("unavailable", 503)),
+    });
+    await unknown.controller.start(5000);
+    expect(storedReference(unknown.storage)).toBe(unknown.begins[0]?.reference ?? "");
   });
 
   test("a consent return without an intent sends nothing", async () => {

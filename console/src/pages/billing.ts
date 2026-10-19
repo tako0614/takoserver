@@ -629,6 +629,11 @@ function topUpMessage(state: TopUpCheckoutState): HTMLElement | null {
       "Another payment is still in progress. Try again once it finishes.",
       "alert",
     ],
+    rejected: [
+      "この金額では支払いを開始できませんでした。請求はありません。金額を変えて再度お試しください。",
+      "This payment could not be started for that amount. Nothing was charged. Try another amount.",
+      "alert",
+    ],
     unavailable: [
       "この環境ではカード決済を利用できません。",
       "This deployment does not take card payments.",

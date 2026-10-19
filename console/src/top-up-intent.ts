@@ -22,7 +22,8 @@ export interface TopUpIntentRecord {
 /** The only receipt states that conclude a top-up reference. */
 export interface ConclusiveTopUpReceipt {
   readonly reference: string;
-  readonly state: "paid" | "expired";
+  /** `never_created` is a refused begin followed by a not-found receipt for the same reference. */
+  readonly state: "paid" | "expired" | "never_created";
 }
 
 export type TopUpIntentLock = <T>(name: string, operation: () => T | Promise<T>) => Promise<T>;
@@ -103,7 +104,12 @@ export function createTopUpIntentStore(options: TopUpIntentStoreOptions) {
       stillOwnsScope?: () => boolean,
     ): Promise<void> {
       validateScope(scope);
-      if (!receipt || (receipt.state !== "paid" && receipt.state !== "expired"))
+      if (
+        !receipt ||
+        (receipt.state !== "paid" &&
+          receipt.state !== "expired" &&
+          receipt.state !== "never_created")
+      )
         throw new TopUpIntentStoreError("invalid_receipt");
       if (typeof receipt.reference !== "string" || !isBillingReference(receipt.reference))
         throw new TopUpIntentStoreError("invalid_reference");

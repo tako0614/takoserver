@@ -31,6 +31,8 @@ export type TopUpCheckoutState =
   | { readonly status: "expired" }
   | { readonly status: "cancelled" }
   | { readonly status: "conflict" }
+  /** The server refused a new payment before creating it; the stored intent was discarded. */
+  | { readonly status: "rejected" }
   | { readonly status: "unavailable" }
   | { readonly status: "uncertain" }
   | { readonly status: "missing_intent" }
@@ -158,6 +160,31 @@ export function createTopUpCheckoutController(options: TopUpCheckoutControllerOp
     options.browser.assign(url);
   }
 
+  /**
+   * A new reference refused with `invalid_argument` (the server checks current
+   * bounds before it stores anything) is concluded only when its receipt is
+   * then not found. Any other answer keeps the intent.
+   */
+  async function settleRefused(scope: TopUpIntentScope, reference: string): Promise<boolean> {
+    try {
+      await options.api.topUpReceipt(scope.organizationId, reference);
+      return false;
+    } catch (error) {
+      if (errorCode(error) !== "not_found") return false;
+    }
+    try {
+      await options.intents.removeAfterConclusiveReceipt(
+        scope,
+        { reference, state: "never_created" },
+        () => ownsScope(scope),
+      );
+    } catch {
+      return false;
+    }
+    if (ownsScope(scope)) current.set({ status: "rejected" });
+    return true;
+  }
+
   function failed(scope: TopUpIntentScope, error: unknown, requestStarted: boolean): void {
     if (!ownsScope(scope)) return;
     const code = errorCode(error);
@@ -185,6 +212,7 @@ export function createTopUpCheckoutController(options: TopUpCheckoutControllerOp
     inFlight = true;
     current.set({ status: "busy" });
     let requestStarted = false;
+    let sent: string | null = null;
     try {
       const stored = options.intents.peek(scope);
       if (!ownsScope(scope)) return;
@@ -215,8 +243,15 @@ export function createTopUpCheckoutController(options: TopUpCheckoutControllerOp
       );
       if (!ownsScope(scope)) return;
       requestStarted = true;
+      sent = reference;
       await begin(scope, reference, amountMinor);
     } catch (error) {
+      if (
+        sent !== null &&
+        errorCode(error) === "invalid_argument" &&
+        (await settleRefused(scope, sent))
+      )
+        return;
       failed(scope, error, requestStarted);
     } finally {
       inFlight = false;
@@ -269,7 +304,7 @@ export function createTopUpCheckoutController(options: TopUpCheckoutControllerOp
   /**
    * The explicit financial consent page returns to a fixed `?consent=returned`.
    * It carries no data and no destination; the payment it consented to is the
-   * stored intent, replayed with exactly its reference and amount.
+   * stored intent, resumed with exactly its reference and amount.
    */
   async function handleConsentReturn(): Promise<void> {
     const returned = new URLSearchParams(options.browser.readLocation().search).get("consent");
@@ -285,15 +320,10 @@ export function createTopUpCheckoutController(options: TopUpCheckoutControllerOp
       return;
     }
     if (!stored) return;
-    inFlight = true;
-    current.set({ status: "busy" });
-    try {
-      await begin(scope, stored.reference, stored.amountMinor);
-    } catch (error) {
-      failed(scope, error, true);
-    } finally {
-      inFlight = false;
-    }
+    // Same path as an explicit resume: the receipt is read first, so a payment
+    // that settled meanwhile is not reopened, then the stored reference and
+    // amount are begun again.
+    await start(stored.amountMinor);
   }
 
   return {
