@@ -59,6 +59,11 @@ import {
   parseRuntimeInputSealKeyRing,
 } from "./runtime-input-seal-keyring.ts";
 import {
+  handleSharedAuthFinancialConsentRequest,
+  isSharedAuthFinancialConsentRequest,
+} from "./shared-auth-financial-consent-route.ts";
+import { SHARED_AUTH_STAGING_PROFILE } from "./shared-auth-oidc-client.ts";
+import {
   createFinancialActionConsentR1Reader,
   readFinancialActionConsentR1RequestCaptures,
 } from "./shared-financial-retained-r1.ts";
@@ -1714,6 +1719,19 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
         assertSelectedNativeRequest(connection);
         if (observeSharedAuthRequest !== undefined) await observeRequest(connection, request);
         assertSelectedNativeRequest(connection);
+        // RP consent page on this request's own observed connection. Its console
+        // origin is the fixed profile value the shared-login connection was
+        // validated against (createWorkerRequestSql), never a fresh env read.
+        if (
+          connection !== undefined &&
+          sharedRequestSelected() &&
+          isSharedAuthFinancialConsentRequest(request)
+        )
+          return await handleSharedAuthFinancialConsentRequest(
+            connection,
+            request,
+            SHARED_AUTH_STAGING_PROFILE.consoleOrigin,
+          );
       } catch (error) {
         return workerStartupFailureResponse(error);
       }
