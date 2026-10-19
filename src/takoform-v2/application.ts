@@ -7,13 +7,18 @@ import {
   type V2ArtifactSource,
   type V2HeldArtifactEntry,
 } from "./forms/artifact-source.ts";
-import { SQLITE_MIGRATION_SET_FORM_URL } from "./forms/sqlite-migration-set.ts";
+import {
+  SQLITE_MIGRATION_SET_FORM_URL,
+  SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
+  SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
+} from "./forms/sqlite-migration-set.ts";
 import { createSQLiteMigrationSetForm } from "./forms/sqlite-migration-set-backend.ts";
 import { STATIC_ASSET_BUNDLE_FORM_URL } from "./forms/static-asset-bundle.ts";
 import { createStaticAssetBundleForm } from "./forms/static-asset-bundle-backend.ts";
 import { WORKER_BUNDLE_FORM_URL } from "./forms/worker-bundle.ts";
 import { createWorkerBundleForm } from "./forms/worker-bundle-backend.ts";
 import { createTakoformV2Host } from "./host.ts";
+import type { V2HostAcceptance } from "./host-acceptance.ts";
 import type { V2PrivateInputCustody } from "./private-inputs.ts";
 import type { V2Form } from "./types.ts";
 
@@ -84,24 +89,30 @@ function addForms(
 }
 
 /** Compose complete public Forms and optional retained-only internal adapters. */
-export function createTakoformV2Application(options: {
-  readonly sql: Sql;
-  readonly objects: ObjectStoreAccess;
-  readonly accounts: Pick<Accounts, "authenticate" | "requireOwner">;
-  readonly publicOrigin: string;
-  /** Exact operator-configured Origin permitted to carry session cookies. */
-  readonly consoleOrigin?: string;
-  readonly config: V2ApplicationConfig;
-  readonly clock: Clock;
-  /** Selected by the embedding operator, never by public configuration or a request. */
-  readonly formFactory?: V2OperatorFormFactory;
-  /** Code-only full plus retained maps; mutually exclusive with formFactory. */
-  readonly formSelectionFactory?: V2OperatorFormSelectionFactory;
-  /** Operator code only; absence preserves the held-only source for every Form. */
-  readonly artifactSourceFactory?: V2OperatorArtifactSourceFactory;
-  /** Operator-private composition only; never parsed from public config. */
-  readonly privateInputCustody?: V2PrivateInputCustody;
-}) {
+export function createTakoformV2Application(
+  options: {
+    readonly sql: Sql;
+    readonly objects: ObjectStoreAccess;
+    readonly accounts: Pick<Accounts, "authenticate" | "requireOwner">;
+    readonly publicOrigin: string;
+    /** Exact operator-configured Origin permitted to carry session cookies. */
+    readonly consoleOrigin?: string;
+    readonly config: V2ApplicationConfig;
+    readonly clock: Clock;
+    /** Selected by the embedding operator, never by public configuration or a request. */
+    readonly formFactory?: V2OperatorFormFactory;
+    /** Code-only full plus retained maps; mutually exclusive with formFactory. */
+    readonly formSelectionFactory?: V2OperatorFormSelectionFactory;
+    /** Operator code only; absence preserves the held-only source for every Form. */
+    readonly artifactSourceFactory?: V2OperatorArtifactSourceFactory;
+    /** Operator-private composition only; never parsed from public config. */
+    readonly privateInputCustody?: V2PrivateInputCustody;
+    /** Code-selected at construction; covers automatic artifact Forms as well. */
+    readonly allowFreshCreateAndUpdate?: boolean;
+  },
+  hostAcceptance?: V2HostAcceptance,
+) {
+  const allowFreshCreateAndUpdate = options.allowFreshCreateAndUpdate;
   if (
     (options.formFactory !== undefined && typeof options.formFactory !== "function") ||
     (options.formSelectionFactory !== undefined &&
@@ -147,6 +158,24 @@ export function createTakoformV2Application(options: {
       sql,
       source,
       targetKey: config.sqliteMigrationSet.targetKey,
+    });
+    retainedForms[SQLITE_MIGRATION_SET_FORM_URL_0_2_0] = createSQLiteMigrationSetForm({
+      sql,
+      source: artifactSource(
+        SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
+        config.sqliteMigrationSet.heldArtifacts,
+      ),
+      targetKey: config.sqliteMigrationSet.targetKey,
+      formUrl: SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
+    });
+    retainedForms[SQLITE_MIGRATION_SET_FORM_URL_0_3_0] = createSQLiteMigrationSetForm({
+      sql,
+      source: artifactSource(
+        SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
+        config.sqliteMigrationSet.heldArtifacts,
+      ),
+      targetKey: config.sqliteMigrationSet.targetKey,
+      formUrl: SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
     });
   }
   if (config.workerBundle) {
@@ -198,21 +227,25 @@ export function createTakoformV2Application(options: {
       addForms(selected, forms, retainedForms);
     }
   }
-  return createTakoformV2Host({
-    sql,
-    now: clock,
-    authorize: access.authorize,
-    forms: Object.freeze(forms),
-    retainedForms: Object.freeze(retainedForms),
-    baseUrl: `${publicOrigin}/apis/forms.takoform.com/v2`,
-    documentation: config.documentation,
-    authenticationDocumentation: config.authenticationDocumentation,
-    authenticationSchemes: ["Bearer"],
-    maxRequestBytes: 1_048_576,
-    maxPageSize: 100,
-    replayWindowSeconds: 86_400,
-    cursorSigningKey: config.cursorSigningKey,
-    ...(options.privateInputCustody ? { privateInputCustody: options.privateInputCustody } : {}),
-    authenticate: access.authenticate,
-  });
+  return createTakoformV2Host(
+    {
+      sql,
+      now: clock,
+      authorize: access.authorize,
+      forms: Object.freeze(forms),
+      retainedForms: Object.freeze(retainedForms),
+      ...(allowFreshCreateAndUpdate === undefined ? {} : { allowFreshCreateAndUpdate }),
+      baseUrl: `${publicOrigin}/apis/forms.takoform.com/v2`,
+      documentation: config.documentation,
+      authenticationDocumentation: config.authenticationDocumentation,
+      authenticationSchemes: ["Bearer"],
+      maxRequestBytes: 1_048_576,
+      maxPageSize: 100,
+      replayWindowSeconds: 86_400,
+      cursorSigningKey: config.cursorSigningKey,
+      ...(options.privateInputCustody ? { privateInputCustody: options.privateInputCustody } : {}),
+      authenticate: access.authenticate,
+    },
+    hostAcceptance,
+  );
 }

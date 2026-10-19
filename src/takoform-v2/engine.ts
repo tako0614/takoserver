@@ -1,6 +1,7 @@
 import { bytesDigest, canonicalJson } from "../json.ts";
 import { type JsonObject, SqlError, type SqlParam } from "../ports.ts";
 import { readV2ConfiguredPrivateInputs } from "./configured-private-inputs.ts";
+import { captureV2HostAcceptance, type V2HostAcceptance } from "./host-acceptance.ts";
 import { isV2FormUrl } from "./identity.ts";
 import {
   hasPrivateComparisonMaterial,
@@ -11,7 +12,7 @@ import {
   type V2PrivateInputMap,
   validatePrivateInputCustody,
 } from "./private-inputs.ts";
-import { prepareV2References } from "./references.ts";
+import { createV2ExactReferencePreparation, prepareV2References } from "./references.ts";
 import { type AcceptRecord, createV2Store, type OperationRow, type ResourceRow } from "./store.ts";
 import {
   TakoformV2Error,
@@ -20,6 +21,7 @@ import {
   type V2CreateInput,
   type V2EngineOptions,
   type V2Execution,
+  type V2Form,
   type V2Operation,
   type V2Resource,
 } from "./types.ts";
@@ -126,6 +128,8 @@ function snapshotRequest<T>(request: T): T {
   }
 }
 
+function snapshotAdmission(value: V2AdmissionPredicate): V2AdmissionPredicate;
+function snapshotAdmission(value: V2AdmissionPredicate | null): V2AdmissionPredicate | null;
 function snapshotAdmission(value: V2AdmissionPredicate | null): V2AdmissionPredicate | null {
   if (value === null) return null;
   const sql = value.sql;
@@ -186,7 +190,15 @@ function replayBodyWithoutPrivateValues(body: Readonly<Record<string, unknown>>)
   ) as JsonObject;
 }
 
-export function createTakoformV2Engine(options: V2EngineOptions) {
+export function createTakoformV2Engine(
+  options: V2EngineOptions,
+  hostAcceptance?: V2HostAcceptance,
+) {
+  const configuredFreshAdmission = options.allowFreshCreateAndUpdate;
+  if (configuredFreshAdmission !== undefined && typeof configuredFreshAdmission !== "boolean") {
+    throw new TypeError("allowFreshCreateAndUpdate must be a boolean");
+  }
+  const allowFreshCreateAndUpdate = configuredFreshAdmission !== false;
   if (options.privateInputCustody) validatePrivateInputCustody(options.privateInputCustody);
   if (!Number.isSafeInteger(options.replayWindowSeconds) || options.replayWindowSeconds < 1) {
     throw new TypeError("replayWindowSeconds must be a positive safe integer");
@@ -197,7 +209,9 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
   }
   const now = options.now ?? (() => new Date());
   const retryMs = Math.max(1_000, leaseMs);
-  const store = createV2Store(options.sql);
+  const sql = options.sql;
+  const acceptance = captureV2HostAcceptance(hostAcceptance, sql);
+  const store = createV2Store(sql, acceptance);
   const formUrls = Object.freeze(Object.keys(options.forms));
   const retainedForms = options.retainedForms ?? {};
   for (const url of Object.keys(retainedForms)) {
@@ -263,6 +277,44 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
     if (!(await options.authorize(principal, space, access))) fail("forbidden", 403);
   }
 
+  async function prepareAdmission(
+    selected: V2Form,
+    record: AcceptRecord,
+    space: string,
+    formUrl: string,
+    referencesJson: string | null,
+  ) {
+    const prepare = selected.prepareAdmission;
+    if (!prepare) return { admission: undefined, referencesJson, referenceGuard: undefined };
+    const frame = createV2ExactReferencePreparation({
+      sql,
+      principal: record.principal,
+      space,
+      referencesJson,
+      authorizeRead: () => permitted(record.principal, space, "read"),
+      snapshotAdmission,
+    });
+    try {
+      // This frame and its issued result never escape into another request's
+      // acceptance. The spec is a copy of this exact accepted record's bytes.
+      const result = frame.finish(
+        await prepare.call(selected, {
+          action: record.action === "create" ? "create" : "update",
+          principal: record.principal,
+          space,
+          form: formUrl,
+          resourceUid: record.resourceUid,
+          spec: JSON.parse(record.specJson) as JsonObject,
+          prepareExactReferences: frame.prepareExactReferences,
+        }),
+      );
+      if (result === null) fail("dependency_conflict", 409);
+      return result;
+    } finally {
+      frame.close();
+    }
+  }
+
   async function ownedResource(principal: string, uid: string, access: "read" | "write") {
     const row = await store.resource(uid);
     if (!row || row.principal !== principal) fail("not_found", 404);
@@ -309,7 +361,11 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
 
   function form(formUrl: string) {
     const found = Object.hasOwn(options.forms, formUrl) ? options.forms[formUrl] : undefined;
-    if (!found || (!privateInputsCapability && found.privateInputs?.requiredForEveryInstance)) {
+    if (
+      !allowFreshCreateAndUpdate ||
+      !found ||
+      (!privateInputsCapability && found.privateInputs?.requiredForEveryInstance)
+    ) {
       fail("unsupported_form", 422);
     }
     return found;
@@ -318,6 +374,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
   function supportsCompleteForm(formUrl: string): boolean {
     const selected = Object.hasOwn(options.forms, formUrl) ? options.forms[formUrl] : undefined;
     return (
+      allowFreshCreateAndUpdate &&
       selected !== undefined &&
       (privateInputsCapability || selected.privateInputs?.requiredForEveryInstance !== true)
     );
@@ -423,7 +480,11 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
       return supportsCompleteForm(formUrl);
     },
     supportsPrivateInputs(formUrl: string): boolean {
-      return privateInputsCapability && options.forms[formUrl]?.privateInputs !== undefined;
+      return (
+        allowFreshCreateAndUpdate &&
+        privateInputsCapability &&
+        options.forms[formUrl]?.privateInputs !== undefined
+      );
     },
     async supportsPrivateInputsForUpdate(principal: string, uid: string): Promise<boolean> {
       const target = await ownedResource(principal, uid, "write");
@@ -567,27 +628,28 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           };
         }
       }
-      const admission = selected.prepareAdmission
-        ? snapshotAdmission(
-            await selected.prepareAdmission({
-              action: "create",
-              principal,
-              space: desired.space,
-              form: desired.form,
+      const prepared = selected.prepareAdmission
+        ? await prepareAdmission(selected, record, desired.space, desired.form, referencesJson)
+        : { admission: undefined, referencesJson, referenceGuard: undefined };
+      const admission = prepared.admission;
+      const assignedOutput = acceptance?.initialOutput(
+        Object.freeze({
+          form: desired.form,
+          backendId: record.backendId,
+          targetKey: record.targetKey,
+          name: desired.name,
+        }),
+      );
+      const output =
+        assignedOutput ??
+        (selected.initialOutput
+          ? selected.initialOutput({
               resourceUid: record.resourceUid,
+              space: desired.space,
+              name: desired.name,
               spec: JSON.parse(record.specJson) as JsonObject,
-            }),
-          )
-        : undefined;
-      if (admission === null) fail("dependency_conflict", 409);
-      const output = selected.initialOutput
-        ? selected.initialOutput({
-            resourceUid: record.resourceUid,
-            space: desired.space,
-            name: desired.name,
-            spec: JSON.parse(record.specJson) as JsonObject,
-          })
-        : {};
+            })
+          : {});
       if (typeof output !== "object" || output === null || Array.isArray(output)) {
         throw new TypeError("Form initial output must be a public JSON object");
       }
@@ -596,11 +658,12 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         const result = await store.insertCreate(
           record,
           desired,
-          referencesJson,
+          prepared.referencesJson,
           initialOutputJson,
           admission,
+          prepared.referenceGuard,
         );
-        // Only the Form's admission predicate refuses CREATE this way.
+        if (result === "reference_conflict") fail("dependency_conflict", 409);
         if (result === "dependency_conflict")
           fail("dependency_conflict", 409, undefined, admission?.detail);
         if (result === "resource_busy") fail("resource_busy", 409);
@@ -681,7 +744,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         privateInputs,
       );
       if (selectedForm.privateInputs?.prepareUpdate) {
-        const configuredRow = await readV2ConfiguredPrivateInputs(options.sql, {
+        const configuredRow = await readV2ConfiguredPrivateInputs(acceptance ? sql : options.sql, {
           principal: input.principal,
           space: target.space,
           name: target.name,
@@ -689,7 +752,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           resourceUid: target.uid,
         });
         const configured = configuredRow ? Object.freeze({ ...configuredRow }) : null;
-        await selectedForm.privateInputs.prepareUpdate({
+        const prepared = await selectedForm.privateInputs.prepareUpdate({
           principal: input.principal,
           space: target.space,
           name: target.name,
@@ -702,28 +765,48 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
           privateInputs,
           configured,
         });
-        if (configured) record = { ...record, expectedConfiguredPrivateInputs: configured };
+        if (prepared !== undefined) {
+          const keyId = prepared?.keyId;
+          const nonce = prepared?.nonce;
+          const ciphertext = prepared?.ciphertext;
+          if (
+            privateInputs === undefined ||
+            typeof keyId !== "string" ||
+            !keyId ||
+            typeof nonce !== "string" ||
+            !nonce ||
+            typeof ciphertext !== "string" ||
+            !ciphertext
+          ) {
+            throw new TypeError("invalid configured private input preparation");
+          }
+          record = {
+            ...record,
+            configuredPrivateInputs: Object.freeze({ keyId, nonce, ciphertext }),
+          };
+        }
+        if (configured || prepared !== undefined)
+          record = { ...record, expectedConfiguredPrivateInputs: configured };
       }
-      const admission = selectedForm.prepareAdmission
-        ? snapshotAdmission(
-            await selectedForm.prepareAdmission({
-              action: "update",
-              principal: input.principal,
-              space: target.space,
-              form: target.form_url,
-              resourceUid: target.uid,
-              spec: JSON.parse(record.specJson) as JsonObject,
-            }),
+      const prepared = selectedForm.prepareAdmission
+        ? await prepareAdmission(
+            selectedForm,
+            record,
+            target.space,
+            target.form_url,
+            referencesJson,
           )
-        : undefined;
-      if (admission === null) fail("dependency_conflict", 409);
+        : { admission: undefined, referencesJson, referenceGuard: undefined };
+      const admission = prepared.admission;
       let result: Awaited<ReturnType<typeof store.insertChange>>;
       try {
         result = await store.insertChange(
           record,
-          referencesJson,
+          prepared.referencesJson,
           serializeUpdatesWithPendingReferrers,
           admission,
+          acceptance ? target : undefined,
+          prepared.referenceGuard,
         );
         if (result === "accepted") {
           const acceptedOperation = operation(await storedOperation(record.id));
@@ -750,6 +833,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         return winner;
       }
       // The admission predicate, or the pending-referrer serialization guard.
+      if (result === "reference_conflict") fail("dependency_conflict", 409);
       if (result === "dependency_conflict")
         fail(
           "dependency_conflict",
@@ -800,7 +884,7 @@ export function createTakoformV2Engine(options: V2EngineOptions) {
         formUrl: target.form_url,
       });
       try {
-        if ((await store.insertChange(record)) === "accepted") {
+        if ((await store.insertChange(record, null, false, undefined, target)) === "accepted") {
           const acceptedOperation = operation(await storedOperation(record.id));
           wakeAfterCommit(wake);
           return acceptedOperation;

@@ -4,16 +4,20 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { deriveExpectedApplicationShape } from "../scripts/deploy/application-schema-shape.ts";
+import { readAuth103CanonicalMigrationSource } from "../scripts/deploy/auth103-canonical-migration-source.ts";
 import { DeployError } from "../scripts/deploy/errors.ts";
 import { readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import { expectedWorkerSecrets, writeWorkerConfig } from "../scripts/deploy/realized-config.ts";
+import { compileAuth103NativeImportShapes } from "../scripts/deploy/schema-auth103-native-source.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
-import type {
-  ProviderExecutorInspection,
-  WorkerMigrationReader,
-  WorkerProviderExecutorQualification,
-  WorkerState,
+import {
+  type ProviderExecutorInspection,
+  type WorkerMigrationReader,
+  type WorkerProviderExecutorQualification,
+  type WorkerState,
+  workerSchemaAllowsPending,
+  workerSelectedPendingMigrations,
 } from "../scripts/deploy/worker.ts";
 import {
   type ClosureTransitionProcess,
@@ -134,11 +138,22 @@ const canonicalMoneyPolicy = [
     cash_unit: "usd-cents-v1",
   },
 ];
-const currentMoneyStorageState = {
-  applied: schemaMigrations,
-  shape: canonicalMoneyShape,
-  shapeDigest: `sha256:${createHash("sha256").update(canonicalMoneyShape).digest("hex")}`,
-};
+function currentAuth103SchemaState() {
+  const source = readAuth103CanonicalMigrationSource(resolve(import.meta.dir, ".."));
+  try {
+    const shape = compileAuth103NativeImportShapes(source.artifact).postShape;
+    source.assertCurrent();
+    return {
+      local: source.physicalNames,
+      applied: source.artifact.names,
+      shape,
+      shapeDigest: `sha256:${createHash("sha256").update(shape).digest("hex")}`,
+    };
+  } finally {
+    source.dispose();
+  }
+}
+const currentAuth103State = currentAuth103SchemaState();
 const schemaPredecessor = schemaMigrations.slice(0, 57);
 
 const storageRebindTarget = {
@@ -307,7 +322,15 @@ function fixture(
     readonly moneyUnitPolicy?: readonly Readonly<Record<string, unknown>>[];
   } = {},
 ): Fixture {
-  const selected = input.selected ?? target;
+  const selected: DeployTarget = input.selected ?? target;
+  const selectedApplied =
+    input.applied ??
+    (selected.schemaMaintenanceMode === undefined && selected.artifactBlobIoMode === undefined
+      ? currentAuth103State.applied
+      : schemaMigrations);
+  const selectedShape =
+    input.auditedShape ??
+    (selectedApplied.length === 103 ? currentAuth103State.shape : canonicalMoneyShape);
   const calls: string[][] = [];
   const stateCalls: string[] = [];
   let current = input.current ?? "predecessor";
@@ -401,11 +424,9 @@ function fixture(
       async read() {
         return {
           local: input.local ?? schemaMigrations,
-          applied: input.applied ?? schemaMigrations,
-          shape: input.auditedShape ?? canonicalMoneyShape,
-          shapeDigest: `sha256:${createHash("sha256")
-            .update(input.auditedShape ?? canonicalMoneyShape)
-            .digest("hex")}`,
+          applied: selectedApplied,
+          shape: selectedShape,
+          shapeDigest: `sha256:${createHash("sha256").update(selectedShape).digest("hex")}`,
           moneyUnitPolicy: input.moneyUnitPolicy ?? canonicalMoneyPolicy,
         };
       },
@@ -487,6 +508,7 @@ function withRoot<T>(name: string, body: (root: string) => Promise<T>): Promise<
 describe("reviewed Worker closure transition", () => {
   test("atomically adds v2 startup JSON and cursor secret in one qualified integration upload", async () => {
     await withRoot("takoserver-v2-startup-transition-", async (root) => {
+      const auth103 = currentAuth103State;
       const delta: WorkerClosureDelta = {
         retiredVars: [],
         addedVars: [V2_CONFIG_VAR],
@@ -504,8 +526,9 @@ describe("reviewed Worker closure transition", () => {
           dropSecrets: [V2_CURSOR_SECRET],
         },
         storeSecrets: expectedWorkerSecrets(v2Target).filter((name) => name !== V2_CURSOR_SECRET),
-        local: schemaMigrations,
-        applied: schemaMigrations,
+        local: auth103.local,
+        applied: auth103.applied,
+        auditedShape: auth103.shape,
       });
       const input = {
         surface: "takoserver-worker-authority-cutover",
@@ -521,7 +544,7 @@ describe("reviewed Worker closure transition", () => {
         secretDirectory: parts.secretDirectory,
         cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
         integrationStorageVerification: baseIntegrationStorageVerificationOptions(v2Target, {
-          readState: async () => currentMoneyStorageState,
+          readState: async () => auth103,
         }),
         fetcher: publishedProductFetcher(),
       };
@@ -550,6 +573,32 @@ describe("reviewed Worker closure transition", () => {
       expect(uploaded).not.toContain(V2_CURSOR_TEST_VALUE);
       expect(JSON.stringify(result)).not.toContain(V2_CURSOR_TEST_VALUE);
     });
+  });
+
+  test("projects only the exact installed Auth103 successor over physical audited100", () => {
+    const selected = currentAuth103State;
+    expect(workerSelectedPendingMigrations(v2Target, selected)).toEqual([]);
+    for (const applied of [
+      selected.applied.slice(0, 101),
+      selected.applied.slice(0, 102),
+      [...selected.applied, "0104_foreign.sql"],
+    ]) {
+      expect(() => workerSelectedPendingMigrations(v2Target, { ...selected, applied })).toThrow();
+    }
+    const foreignShape = `${selected.shape}foreign`;
+    const foreign = {
+      ...selected,
+      shape: foreignShape,
+      shapeDigest: `sha256:${createHash("sha256").update(foreignShape).digest("hex")}`,
+    };
+    expect(workerSelectedPendingMigrations(v2Target, foreign)).toEqual([]);
+    expect(workerSchemaAllowsPending(v2Target, foreign)).toBe(false);
+    expect(() =>
+      workerSelectedPendingMigrations(v2Target, {
+        ...selected,
+        local: [...selected.local, "0101_foreign.sql"],
+      }),
+    ).toThrow();
   });
 
   test("v2 startup refuses either lone delta before any provider or upload", async () => {
@@ -585,12 +634,14 @@ describe("reviewed Worker closure transition", () => {
   test("v2 cursor rotation validates its input before the single upload", async () => {
     for (const valid of [false, true]) {
       await withRoot("takoserver-v2-cursor-rotation-", async (root) => {
+        const auth103 = currentAuth103State;
         const parts = fixture(root, {
           selected: v2Target,
           predecessor: { selected: v2Target, v2Startup: true },
           storeSecrets: expectedWorkerSecrets(v2Target),
-          local: schemaMigrations,
-          applied: schemaMigrations,
+          local: auth103.local,
+          applied: auth103.applied,
+          auditedShape: auth103.shape,
         });
         if (!valid) {
           writeFileSync(join(parts.secretDirectory, V2_CURSOR_SECRET), "short", { mode: 0o600 });
@@ -619,7 +670,7 @@ describe("reviewed Worker closure transition", () => {
             secretDirectory: parts.secretDirectory,
             cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "test-token" },
             integrationStorageVerification: baseIntegrationStorageVerificationOptions(v2Target, {
-              readState: async () => currentMoneyStorageState,
+              readState: async () => auth103,
             }),
             fetcher: publishedProductFetcher(),
           },

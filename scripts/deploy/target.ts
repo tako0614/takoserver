@@ -89,10 +89,13 @@ export interface DeployTarget {
   /** Temporary pre-0043 runtime used only by the 0043 cutover protocol. */
   readonly artifactBlobIoMode?: "pre-0043-quiesced";
   /** Optional whole-Host source-only maintenance profile for an exact pending schema wave. */
+  /** Code-owned Root RP profile selection only; never registration/readiness authority. */
+  readonly auth103NativeProfile?: "root-shared-auth-staging-v1";
   readonly schemaMaintenanceMode?:
     | "pre-0058-quiesced"
     | "pre-v2-0088-quiesced"
-    | "pre-wallet-usd-micros-quiesced";
+    | "pre-wallet-usd-micros-quiesced"
+    | "pre-auth103-quiesced";
   /** Explicit selected-Host D1 transaction containment, retained after resume. */
   readonly moneyCutoverWriterPolicy?: "transaction-fenced-usd-micros-v1";
   /** Reviewed nonsecret Writer generation; new source generations require a separate rotation. */
@@ -307,7 +310,15 @@ export function targetPath(
   return isAbsolute(candidate) ? candidate : resolve(repositoryRoot, candidate);
 }
 
-export function loadTarget(path: string, environment: DeployEnvironment): DeployTarget {
+export function loadTarget(
+  path: string,
+  environment: DeployEnvironment,
+  operation:
+    | "deploy"
+    | "money-resume-read"
+    | "money-original-cutover"
+    | "money-original-maintenance-bootstrap" = "deploy",
+): DeployTarget {
   let raw: string;
   try {
     raw = readFileSync(path, "utf8");
@@ -355,7 +366,7 @@ export function loadTarget(path: string, environment: DeployEnvironment): Deploy
   } catch {
     throw preflightError(`deploy target descriptor is not valid JSON: ${path}`);
   }
-  return parseDeployTarget(parsed, path, environment);
+  return parseDeployTarget(parsed, path, environment, operation);
 }
 
 /** Top-level keys every complete deploy target carries. */
@@ -393,6 +404,7 @@ const DEPLOY_TARGET_OPTIONAL_KEYS: readonly string[] = [
   "operatorIdentity",
   "integrationE2eCredentialAuthority",
   "artifactBlobIoMode",
+  "auth103NativeProfile",
   "schemaMaintenanceMode",
   "moneyCutoverWriterPolicy",
   "moneyCutoverWriterEpoch",
@@ -513,7 +525,20 @@ export function parseDeployTarget(
   value: unknown,
   source: string,
   environment: DeployEnvironment,
+  operation:
+    | "deploy"
+    | "money-resume-read"
+    | "money-original-cutover"
+    | "money-original-maintenance-bootstrap" = "deploy",
 ): DeployTarget {
+  if (
+    operation !== "deploy" &&
+    operation !== "money-resume-read" &&
+    operation !== "money-original-cutover" &&
+    operation !== "money-original-maintenance-bootstrap"
+  ) {
+    throw preflightError("deploy target operation selector is invalid");
+  }
   if (!isRecord(value)) {
     throw preflightError(`deploy target descriptor must be an object: ${source}`);
   }
@@ -551,6 +576,7 @@ export function parseDeployTarget(
     publicOrigin: httpsOrigin(value.publicOrigin),
     ...(value.takoformV2 === undefined ? {} : { takoformV2: takoformV2(value.takoformV2) }),
     ...artifactBlobIoMode(value.artifactBlobIoMode),
+    ...auth103NativeProfile(value.auth103NativeProfile),
     ...schemaMaintenanceMode(value.schemaMaintenanceMode),
     ...(value.moneyCutoverWriterPolicy === undefined
       ? {}
@@ -641,6 +667,11 @@ export function parseDeployTarget(
     // a target that says something different from what it will do.
     throw preflightError("deploy target Stripe webhook and settings require `stripeCheckout`");
   }
+  if (target.auth103NativeProfile !== undefined && environment !== "integration")
+    throw preflightError("Root shared Auth103 native profile is integration-only");
+  if (target.schemaMaintenanceMode === "pre-auth103-quiesced" && environment !== "integration") {
+    throw preflightError("Auth103 source maintenance is integration-only");
+  }
   if (target.schemaMaintenanceMode === "pre-v2-0088-quiesced" && environment !== "integration") {
     throw preflightError("v2 0088 schema maintenance is integration-only");
   }
@@ -650,7 +681,13 @@ export function parseDeployTarget(
       target.artifactBlobIoMode !== undefined ||
       (target.takoformV2?.storageLineage !== "v2-0092" &&
         target.takoformV2?.appliedSchemaLineage !== "v2-0092") ||
-      !/^takoserver-i-[0-9a-f]{32}$/u.test(target.d1.databaseName) ||
+      !(
+        /^takoserver-i-[0-9a-f]{32}$/u.test(target.d1.databaseName) ||
+        ((operation === "money-resume-read" ||
+          operation === "money-original-cutover" ||
+          operation === "money-original-maintenance-bootstrap") &&
+          /^integration-ts-[0-9a-f]{32}$/u.test(target.d1.databaseName))
+      ) ||
       target.r2.bucketName !== target.d1.databaseName)
   ) {
     throw preflightError(
@@ -662,7 +699,13 @@ export function parseDeployTarget(
     (environment !== "integration" ||
       (target.takoformV2?.storageLineage !== "v2-0092" &&
         target.takoformV2?.appliedSchemaLineage !== "v2-0092") ||
-      !/^takoserver-i-[0-9a-f]{32}$/u.test(target.d1.databaseName) ||
+      !(
+        /^takoserver-i-[0-9a-f]{32}$/u.test(target.d1.databaseName) ||
+        ((operation === "money-resume-read" ||
+          operation === "money-original-cutover" ||
+          operation === "money-original-maintenance-bootstrap") &&
+          /^integration-ts-[0-9a-f]{32}$/u.test(target.d1.databaseName))
+      ) ||
       target.r2.bucketName !== target.d1.databaseName)
   ) {
     throw preflightError("money cutover writer policy requires selected integration 0092 storage");
@@ -672,6 +715,44 @@ export function parseDeployTarget(
     (target.moneyCutoverWriterEpoch !== undefined)
   ) {
     throw preflightError("money cutover writer policy requires an exact pinned Writer epoch");
+  }
+  if (
+    (operation === "money-original-cutover" ||
+      operation === "money-original-maintenance-bootstrap") &&
+    (environment !== "integration" ||
+      !/^integration-ts-[0-9a-f]{32}$/u.test(target.d1.databaseName) ||
+      target.r2.bucketName !== target.d1.databaseName ||
+      target.takoformV2?.storageLineage !== "v2-0092" ||
+      target.moneyCutoverWriterPolicy !== "transaction-fenced-usd-micros-v1" ||
+      target.artifactBlobIoMode !== undefined ||
+      !/^(?:integration|staging)-[a-z0-9]/u.test(target.workerName))
+  )
+    throw preflightError(
+      "original money cutover requires exact prefixed fresh92 storage and writer policy",
+    );
+  if (operation === "money-original-maintenance-bootstrap") {
+    let origin: URL;
+    try {
+      origin = new URL(target.publicOrigin);
+    } catch {
+      throw preflightError("original money maintenance requires its exact workers.dev origin");
+    }
+    if (
+      target.schemaMaintenanceMode !== "pre-wallet-usd-micros-quiesced" ||
+      origin.protocol !== "https:" ||
+      origin.username !== "" ||
+      origin.password !== "" ||
+      origin.port !== "" ||
+      origin.pathname !== "/" ||
+      origin.search !== "" ||
+      origin.hash !== "" ||
+      !origin.hostname.startsWith(`${target.workerName}.`) ||
+      !origin.hostname.endsWith(".workers.dev") ||
+      (target.aliases !== undefined && target.aliases.length !== 0)
+    )
+      throw preflightError(
+        "original money maintenance bootstrap cannot publish a normal or aliased Host",
+      );
   }
   if (
     target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced" &&
@@ -1699,17 +1780,28 @@ function moneyCutoverWriterEpoch(value: unknown): string {
   return pattern(value, /^sha256:[0-9a-f]{64}$/u, "moneyCutoverWriterEpoch");
 }
 
+function auth103NativeProfile(value: unknown): {
+  readonly auth103NativeProfile?: "root-shared-auth-staging-v1";
+} {
+  if (value === undefined) return {};
+  if (value !== "root-shared-auth-staging-v1")
+    throw preflightError("deploy target Auth103 native profile is unsupported");
+  return { auth103NativeProfile: value };
+}
+
 function schemaMaintenanceMode(value: unknown): {
   readonly schemaMaintenanceMode?:
     | "pre-0058-quiesced"
     | "pre-v2-0088-quiesced"
-    | "pre-wallet-usd-micros-quiesced";
+    | "pre-wallet-usd-micros-quiesced"
+    | "pre-auth103-quiesced";
 } {
   if (value === undefined) return {};
   if (
     value !== "pre-0058-quiesced" &&
     value !== "pre-v2-0088-quiesced" &&
-    value !== "pre-wallet-usd-micros-quiesced"
+    value !== "pre-wallet-usd-micros-quiesced" &&
+    value !== "pre-auth103-quiesced"
   ) {
     throw preflightError(
       "deploy target `schemaMaintenanceMode` is not a supported maintenance profile",

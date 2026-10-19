@@ -45,7 +45,7 @@ const native: DockerContainerNativeIdentity = {
 };
 
 /** External Host/daemon model. It proves consumer behavior, not a native producer. */
-function fixture() {
+function fixture(requiredSecretNames: readonly string[] = ["TOKEN"]) {
   let durable: DockerContainerCreateRecord | null = null;
   let inspected: Awaited<ReturnType<DockerContainerCreateDriver["inspect"]>> = null;
   let creates = 0;
@@ -61,7 +61,10 @@ function fixture() {
     stillCurrent: async () => current,
     async withEnvironment(use) {
       environmentLoans++;
-      return use({ TOKEN: "synthetic-transient-value" }, revocation.signal);
+      return use(
+        requiredSecretNames.length === 0 ? {} : { TOKEN: "synthetic-transient-value" },
+        revocation.signal,
+      );
     },
   };
   const owner: DockerContainerCreateOwnerPort = {
@@ -118,7 +121,7 @@ function fixture() {
   };
   const options: DockerContainerCreateCustodyOptions = {
     policy,
-    requiredSecretNames: ["TOKEN"],
+    requiredSecretNames: requiredSecretNames,
     owner,
   };
   const run = <T>(use: (session: DockerContainerCreateSession) => Promise<T>) =>
@@ -487,7 +490,12 @@ test("secret names, getters, extra values and cancelled loans cannot reach the d
     code: "unavailable",
   });
   expect(f.counts().creates).toBe(0);
-  for (const names of [[], ["TOKEN", "TOKEN"], ["not-valid-name"]])
+  const empty = fixture([]);
+  await empty.run(async (session) => {
+    const created = await session.ensureCreated();
+    expect(created).not.toBeNull();
+  });
+  for (const names of [["TOKEN", "TOKEN"], ["not-valid-name"]])
     expect(() =>
       createDockerContainerCreateCustody({ ...f.options, requiredSecretNames: names }),
     ).toThrow("invalid_request");

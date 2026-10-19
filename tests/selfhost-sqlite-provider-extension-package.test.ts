@@ -37,6 +37,7 @@ test("Node selfhost extension exposes the existing SQLite store and guarded brok
       "createSelfhostV2SqliteBindingBroker",
       "createSelfhostV2SqliteQueueBindingBroker",
       "createWorkerdWorkerModuleInspector",
+      "expandDockerRegistryLayer",
     ].sort(),
   );
   expect(createWorkerdWorkerModuleInspector).toBe(existingWorkerdInspector);

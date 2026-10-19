@@ -51,7 +51,7 @@ import {
   assertExactVersionBindingClosure,
   expectedTransitionBindingClosure,
   extractLegacyHostServiceBinding,
-  LEGACY_HOSTED_SPONSORSHIP_SECRET,
+  LEGACY_HOSTED_SPONSORSHIP_SECRET as HOSTED_SPONSORSHIP_SECRET,
   type LegacyHostServiceBinding,
   parseWorkerDeploymentHistory,
   versionSecretBindingNames,
@@ -61,7 +61,8 @@ import {
 } from "./worker-state.ts";
 import { acquireWranglerVersionPublicationLease } from "./wrangler-state.ts";
 
-export const HOSTED_SPONSORSHIP_SECRET = LEGACY_HOSTED_SPONSORSHIP_SECRET;
+export { HOSTED_SPONSORSHIP_SECRET };
+
 const QUIESCED_ARTIFACT_MODE = "pre-0043-quiesced" as const;
 const PROVIDER_EXECUTOR_BINDING = "CLOUDFLARE_PROVIDER_EXECUTOR" as const;
 

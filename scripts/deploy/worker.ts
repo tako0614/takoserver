@@ -10,6 +10,7 @@ import {
   artifactBlobIoSchemaAllowsPending,
   probeArtifactBlobIoQuiescence,
 } from "./artifact-blob-io-compatibility.ts";
+import { readAuth103CanonicalMigrationSource } from "./auth103-canonical-migration-source.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
 import { RemoteD1 } from "./d1.ts";
 import {
@@ -51,6 +52,7 @@ import { type DeployEnvironment, qualifySource, unsealDirectory } from "./qualif
 import { writeWorkerConfig } from "./realized-config.ts";
 import { runAuthorityTransition } from "./retirement.ts";
 import { readCurrentAuditedMigrationSourceArtifact } from "./schema.ts";
+import { auth103SourceSchemaReady } from "./schema-auth103-native-source.ts";
 import { moneyUnitCutoverSchemaMatches } from "./schema-money-unit-cutover.ts";
 import {
   activePublicJwk,
@@ -240,6 +242,32 @@ export function workerSchemaAllowsPending(
   },
   sourceRepositoryRoot = REPOSITORY,
 ): boolean {
+  if (target.schemaMaintenanceMode === "pre-auth103-quiesced") {
+    const moneyPreserved =
+      target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1" &&
+      /^sha256:[0-9a-f]{64}$/u.test(target.moneyCutoverWriterEpoch ?? "") &&
+      target.auth103NativeProfile === "root-shared-auth-staging-v1";
+    return (
+      target.environment === "integration" &&
+      target.artifactBlobIoMode === undefined &&
+      (target.moneyCutoverWriterPolicy === undefined || moneyPreserved) &&
+      auth103SourceSchemaReady(
+        migrations,
+        sourceRepositoryRoot,
+        "maintenance",
+        moneyPreserved ? "money-preserved" : "ordinary",
+      )
+    );
+  }
+  if (
+    target.schemaMaintenanceMode === undefined &&
+    target.artifactBlobIoMode === undefined &&
+    target.environment === "integration" &&
+    target.moneyCutoverWriterPolicy === undefined &&
+    (migrations.local.length === 100 || migrations.local.length === 103)
+  ) {
+    return auth103SourceSchemaReady(migrations, sourceRepositoryRoot, "normal");
+  }
   if (target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced") {
     if (
       target.moneyCutoverWriterPolicy !== "transaction-fenced-usd-micros-v1" ||
@@ -358,6 +386,45 @@ export function workerSchemaAllowsPending(
   return migrations.applied.every((name, index) => name === source.names[index]);
 }
 
+/**
+ * The audited checkout may still contain physical 0100 after the owner-generated
+ * Auth103 source was imported into D1. Project only the exact owner-authored
+ * ledger here; publication readiness separately proves the installed shape.
+ */
+export function workerSelectedPendingMigrations(
+  target: DeployTarget,
+  migrations: {
+    readonly local: readonly string[];
+    readonly applied: readonly string[];
+    readonly shape?: string;
+    readonly shapeDigest?: string;
+  },
+  sourceRepositoryRoot = REPOSITORY,
+): readonly string[] {
+  if (
+    migrations.local.length === 100 &&
+    migrations.applied.length === 103 &&
+    target.environment === "integration" &&
+    target.artifactBlobIoMode === undefined &&
+    (target.schemaMaintenanceMode === undefined ||
+      target.schemaMaintenanceMode === "pre-auth103-quiesced")
+  ) {
+    const source = readAuth103CanonicalMigrationSource(sourceRepositoryRoot);
+    try {
+      if (
+        JSON.stringify(migrations.local) === JSON.stringify(source.physicalNames) &&
+        JSON.stringify(migrations.applied) === JSON.stringify(source.artifact.names)
+      ) {
+        source.assertCurrent();
+        return [];
+      }
+    } finally {
+      source.dispose();
+    }
+  }
+  return pendingMigrations(migrations.local, migrations.applied);
+}
+
 export function workerMoneyUnitSchemaReady(
   migrations: Awaited<ReturnType<WorkerMigrationReader["read"]>>,
   sourceRepositoryRoot: string,
@@ -369,6 +436,12 @@ export function workerMoneyUnitSchemaReady(
     migrations.shapeDigest === undefined
   ) {
     return false;
+  }
+  if (
+    migrations.local.length === 103 ||
+    (migrations.local.length === 100 && migrations.applied.length === 103)
+  ) {
+    return auth103SourceSchemaReady(migrations, sourceRepositoryRoot, "normal");
   }
   const source = readCurrentAuditedMigrationSourceArtifact(
     resolve(sourceRepositoryRoot, "migrations"),
@@ -446,11 +519,13 @@ export async function probeSchemaMaintenance(
     body.error.code !== "backend_unavailable" ||
     !("message" in body.error) ||
     body.error.message !==
-      (mode === "pre-wallet-usd-micros-quiesced"
-        ? "Host is quiesced for the wallet USD-micros schema maintenance transition"
-        : mode === "pre-0058-quiesced"
-          ? "Host is quiesced for the 0058 schema maintenance transition"
-          : "Host is quiesced for the v2 0088 schema maintenance transition") ||
+      (mode === "pre-auth103-quiesced"
+        ? "Host is quiesced for the Auth103 source registration transition"
+        : mode === "pre-wallet-usd-micros-quiesced"
+          ? "Host is quiesced for the wallet USD-micros schema maintenance transition"
+          : mode === "pre-0058-quiesced"
+            ? "Host is quiesced for the 0058 schema maintenance transition"
+            : "Host is quiesced for the v2 0088 schema maintenance transition") ||
     !("details" in body.error) ||
     typeof body.error.details !== "object" ||
     body.error.details === null ||
@@ -687,6 +762,7 @@ export async function runWorker(
         : { legacyPredecessorVersionId: invocation.legacyPredecessorVersionId }),
     });
     const before = await inspectWorker("preflight", target, state, migrations, {
+      sourceRepositoryRoot,
       ...(invocation.legacyPredecessorVersionId === undefined
         ? {}
         : {
@@ -896,6 +972,7 @@ export async function runWorker(
     }
     if (!legacyBootstrap) {
       const last = await inspectWorker("preflight", target, state, migrations, {
+        sourceRepositoryRoot,
         ...(beforeAuthorityProfile === undefined
           ? {}
           : { authorityProfile: beforeAuthorityProfile }),
@@ -998,6 +1075,7 @@ export async function runWorker(
         ...(options.wranglerPath === undefined ? {} : { wranglerPath: options.wranglerPath }),
         assertPredecessorStillCurrent: async () => {
           const current = await inspectWorker("preflight", target, state, migrations, {
+            sourceRepositoryRoot,
             ...(beforeAuthorityProfile === undefined
               ? {}
               : { authorityProfile: beforeAuthorityProfile }),
@@ -1054,6 +1132,7 @@ export async function runWorker(
             },
           };
     const after = await inspectWorker("verification", target, state, migrations, {
+      sourceRepositoryRoot,
       ...(afterAuthorityProfile === undefined ? {} : { authorityProfile: afterAuthorityProfile }),
     });
     const rollbackVersionId = after.history.previousVersionId;
@@ -1194,7 +1273,9 @@ async function readFreshV2StorageProof(
       {
         ...options.integrationStorageVerification,
         allowCurrentAuditedSuccessor:
-          target.schemaMaintenanceMode === undefined && target.artifactBlobIoMode === undefined,
+          (target.schemaMaintenanceMode === undefined ||
+            target.schemaMaintenanceMode === "pre-auth103-quiesced") &&
+          target.artifactBlobIoMode === undefined,
         allowMoneyUnitMaintenance:
           target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced",
         run,
@@ -1364,6 +1445,7 @@ async function inspectWorker(
     readonly legacyPredecessorVersionId?: string;
     readonly reconcileStatus?: boolean;
     readonly authorityProfile?: WorkerVersionAuthoritySelection;
+    readonly sourceRepositoryRoot?: string;
   } = {},
 ): Promise<WorkerInspection> {
   try {
@@ -1390,6 +1472,7 @@ async function inspectWorkerState(
     readonly legacyPredecessorVersionId?: string;
     readonly reconcileStatus?: boolean;
     readonly authorityProfile?: WorkerVersionAuthoritySelection;
+    readonly sourceRepositoryRoot?: string;
   },
 ): Promise<WorkerInspection> {
   const inspect = async (selectedTarget: DeployTarget) =>
@@ -1417,7 +1500,11 @@ async function inspectWorkerState(
     target.integrationE2eCredentialAuthority === undefined ||
     options.authorityProfile?.kind === "provenance-bound-jit";
   const migrationState = await migrations.read();
-  const pending = pendingMigrations(migrationState.local, migrationState.applied);
+  const pending = workerSelectedPendingMigrations(
+    target,
+    migrationState,
+    options.sourceRepositoryRoot,
+  );
   return {
     history: live.history,
     commit: live.commit,

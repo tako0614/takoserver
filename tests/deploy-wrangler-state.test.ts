@@ -9,11 +9,12 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { deriveExpectedApplicationShape } from "../scripts/deploy/application-schema-shape.ts";
+import { resolve } from "node:path";
+import { readAuth103CanonicalMigrationSource } from "../scripts/deploy/auth103-canonical-migration-source.ts";
 import { DeployError, deployFailureAftermath, preflightError } from "../scripts/deploy/errors.ts";
-import { readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import { expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
+import { compileAuth103NativeImportShapes } from "../scripts/deploy/schema-auth103-native-source.ts";
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import {
   runWorker,
@@ -47,9 +48,21 @@ const BEFORE_VERSION = "00000000-0000-4000-8000-000000000005";
 const BEFORE_DEPLOYMENT = "00000000-0000-4000-8000-000000000004";
 const CONCURRENT_VERSION = "00000000-0000-4000-8000-000000000006";
 const CONCURRENT_DEPLOYMENT = "00000000-0000-4000-8000-000000000007";
-const canonicalMigrations = readMigrationArtifact();
-const canonicalMoneyShape = deriveExpectedApplicationShape(canonicalMigrations.files);
-const canonicalMoneyShapeDigest = `sha256:${createHash("sha256").update(canonicalMoneyShape).digest("hex")}`;
+const currentAuth103State = (() => {
+  const source = readAuth103CanonicalMigrationSource(resolve(import.meta.dir, ".."));
+  try {
+    const shape = compileAuth103NativeImportShapes(source.artifact).postShape;
+    source.assertCurrent();
+    return {
+      local: source.physicalNames,
+      applied: source.artifact.names,
+      shape,
+      shapeDigest: `sha256:${createHash("sha256").update(shape).digest("hex")}`,
+    };
+  } finally {
+    source.dispose();
+  }
+})();
 
 const VERSION_BODY = {
   id: VERSION,
@@ -648,7 +661,7 @@ describe("Wrangler version publication output", () => {
       const owner = JSON.parse(readFileSync(ownerPath, "utf8")) as Record<string, unknown>;
       const lockIdentity = lstatSync(lockPath, { bigint: true });
       // Bun matchers mutate their subject; preserve the raw holder identity for /proc.
-      expect({ ...owner }).toMatchObject({
+      expect(structuredClone(owner)).toMatchObject({
         kind: "takoserver.worker-publication-lease-owner@v1",
         accountId: target.accountId,
         workerName: target.workerName,
@@ -1442,10 +1455,7 @@ async function routineVersionPublication(
   const migrations: WorkerMigrationReader = {
     async read() {
       return {
-        local: canonicalMigrations.names,
-        applied: canonicalMigrations.names,
-        shape: canonicalMoneyShape,
-        shapeDigest: canonicalMoneyShapeDigest,
+        ...currentAuth103State,
         moneyUnitPolicy: [
           {
             ledger_unit: "usd-micros-v2",

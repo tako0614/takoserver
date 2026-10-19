@@ -125,3 +125,139 @@ export function copyOperationGenerationSchemaFixture(directory: string): string 
   }
   return directory;
 }
+
+/** Read-only facts from a separately created fresh full100 SQLite file.
+ * This records an observation; no expected shape/baseline or D1 apply grant is inferred.
+ */
+export interface Full100FreshSqliteObservation {
+  readonly kind: "takoserver.full100-fresh-sqlite-observation@v1";
+  readonly persistedMigrationCount: number;
+  readonly persistedNamesDigest: string;
+  readonly persistedLedgerFieldsDigest: string;
+  readonly persistedSqlChecksumAvailable: false;
+  readonly schemaShapeDigest: string;
+  readonly schemaNamesDigest: string;
+  readonly schemaObjectTypeCounts: Readonly<Record<string, number>>;
+  readonly foreignKeyViolationCount: number;
+  readonly tableBaselines: readonly {
+    readonly name: string;
+    readonly rowCount: number;
+    readonly typedRowMultisetDigest: string;
+  }[];
+}
+
+function full100Digest(value: string | Uint8Array): string {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function full100QuotedCatalogName(value: unknown): string {
+  if (typeof value !== "string" || value.length === 0 || value.includes("\0")) {
+    throw new Error("full100 SQLite catalog contains an invalid table name");
+  }
+  return `"${value.replaceAll('"', '""')}"`;
+}
+
+function full100TypedCell(value: unknown): readonly [string, string?] {
+  if (value === null) return ["null"];
+  if (typeof value === "string") return ["text-sha256", full100Digest(value)];
+  if (typeof value === "bigint") return ["integer", value.toString()];
+  if (typeof value === "number") {
+    if (Number.isInteger(value) && !Number.isSafeInteger(value)) {
+      throw new Error("full100 SQLite integer exceeds exact JavaScript number range");
+    }
+    return ["number", Object.is(value, -0) ? "-0" : String(value)];
+  }
+  if (value instanceof Uint8Array) {
+    return ["blob-sha256", `${value.byteLength}:${full100Digest(value)}`];
+  }
+  throw new Error("full100 SQLite row contains an unsupported value type");
+}
+
+function full100TypedRowDigest(row: Record<string, unknown>): string {
+  const columns = Object.keys(row).sort();
+  const canonical = columns.map((name) => [name, full100TypedCell(row[name])]);
+  return full100Digest(JSON.stringify(canonical));
+}
+
+function inspectFull100FreshSqliteInternal(
+  database: Pick<Database, "query">,
+): Full100FreshSqliteObservation {
+  const source = currentAuditedSchemaMigrations();
+  if (source.length !== 100 || !source[99]?.name.startsWith("0100_")) {
+    throw new Error("full100 inspection requires the exact audited 100-source boundary");
+  }
+  // migrateSqlite's actual persisted ledger has name and applied_at only.
+  const ledger = database
+    .query("SELECT name, applied_at FROM main.applied_migrations ORDER BY rowid")
+    .all() as { name: unknown; applied_at: unknown }[];
+  if (
+    ledger.length !== 100 ||
+    ledger.some(
+      (row, index) =>
+        row.name !== source[index]?.name ||
+        typeof row.applied_at !== "string" ||
+        row.applied_at.length === 0,
+    )
+  ) {
+    throw new Error("persisted full100 migration ledger differs from audited source order");
+  }
+
+  // Existing canonicalSchemaShape owns normalization; its raw shape stays in memory.
+  const catalog = database
+    .query(
+      "SELECT type, name, tbl_name, COALESCE(sql, '') AS sql " +
+        "FROM main.sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
+    )
+    .all() as Record<string, unknown>[];
+  catalog.sort((a, b) => `${a.type}\0${a.name}`.localeCompare(`${b.type}\0${b.name}`));
+  const shape = canonicalSchemaShape(catalog);
+  const schemaObjectTypeCounts: Record<string, number> = Object.create(null);
+  for (const row of catalog) {
+    const type = String(row.type);
+    schemaObjectTypeCounts[type] = (schemaObjectTypeCounts[type] ?? 0) + 1;
+  }
+  const foreignKeyViolationCount = database.query("PRAGMA main.foreign_key_check").all().length;
+  const tableBaselines = catalog
+    .filter((row) => row.type === "table" && row.name !== "applied_migrations")
+    .map((row) => {
+      const name = row.name;
+      const rows = database
+        .query(`SELECT * FROM main.${full100QuotedCatalogName(name)}`)
+        .all() as Record<string, unknown>[];
+      const digests = rows.map(full100TypedRowDigest).sort();
+      return {
+        name: String(name),
+        rowCount: rows.length,
+        typedRowMultisetDigest: full100Digest(JSON.stringify([name, digests])),
+      };
+    });
+  return {
+    kind: "takoserver.full100-fresh-sqlite-observation@v1",
+    persistedMigrationCount: ledger.length,
+    persistedNamesDigest: full100Digest(JSON.stringify(ledger.map((row) => row.name))),
+    persistedLedgerFieldsDigest: full100Digest(
+      JSON.stringify(ledger.map((row) => [row.name, row.applied_at])),
+    ),
+    persistedSqlChecksumAvailable: false,
+    schemaShapeDigest: full100Digest(shape),
+    schemaNamesDigest: full100Digest(
+      JSON.stringify(catalog.map((row) => [row.type, row.name, row.tbl_name])),
+    ),
+    schemaObjectTypeCounts,
+    foreignKeyViolationCount,
+    tableBaselines,
+  };
+}
+
+export function inspectFull100FreshSqlite(
+  database: Pick<Database, "query">,
+): Full100FreshSqliteObservation {
+  try {
+    return inspectFull100FreshSqliteInternal(database);
+  } catch (error) {
+    // SQLite or canonicalizer failures may include query/schema text; no raw cause.
+    throw new Error(
+      `full100 readonly inspection failed (opaque diagnostic ${full100Digest(String(error))})`,
+    );
+  }
+}

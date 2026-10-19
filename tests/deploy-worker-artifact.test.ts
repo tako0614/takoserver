@@ -241,7 +241,8 @@ describe("hermetic Worker bundle identity", () => {
         nestedSourceLabels: nested.sourceLabels,
       });
       expect(shallow.bytes).toEqual(nested.bytes);
-      expect(shallow.sourceLabels[0]).toBe("// src/entry-cloudflare-worker.ts");
+      expect(shallow.sourceLabels[0]).toBe("// src/ports.ts");
+      expect(shallow.sourceLabels).toContain("// src/entry-cloudflare-worker.ts");
       expect(shallow.sourceLabels.every((label) => !label.includes(root))).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -253,6 +254,21 @@ describe("hermetic Worker bundle identity", () => {
   test("preserves comments that are not repository source labels", () => {
     const source = ["// external explanatory comment", "export default {};", ""].join("\n");
     expect(canonicalizeWorkerBundleSource(source, "/tmp/build/index.js")).toBe(source);
+  });
+
+  test("normalizes app source wrapper keys without changing vendor wrapper keys", () => {
+    const repositoryRoot = join(import.meta.dir, "..");
+    const sourcePath = join(repositoryRoot, "output", "worker.js");
+    const vendor = '  "../vendor/fixture.ts"() {';
+    const nestedVendor = '  "../src/vendor/fixture.ts"() {';
+    const app = '  "../src/fixture.ts"() {';
+    expect(canonicalizeWorkerBundleSource(vendor, sourcePath, repositoryRoot)).toBe(vendor);
+    expect(canonicalizeWorkerBundleSource(nestedVendor, sourcePath, repositoryRoot)).toBe(
+      nestedVendor,
+    );
+    expect(canonicalizeWorkerBundleSource(app, sourcePath, repositoryRoot)).toBe(
+      '  "src/fixture.ts"() {',
+    );
   });
 });
 

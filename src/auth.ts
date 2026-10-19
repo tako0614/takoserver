@@ -1,5 +1,29 @@
+import {
+  type CredentialAuthorityOrigin,
+  createCredentialAuthorityClassStore,
+  directCredentialCurrentness,
+  type TokenAuthorityRecord,
+} from "./credential-authority-class.ts";
+import {
+  assertIdentityVerificationCaptureReader,
+  type IdentityVerificationCaptureReader,
+  type IdentityVerificationObservation,
+} from "./identity-setup.ts";
 import { bytesDigest } from "./json.ts";
-import { type Clock, type Row, type Sql, SqlError } from "./ports.ts";
+import {
+  type Clock,
+  type Row,
+  type Sql,
+  SqlError,
+  type SqlParam,
+  type SqlStatement,
+  type SqlWrite,
+} from "./ports.ts";
+import {
+  type AuthCurrentnessPredicate,
+  createSharedPrincipalAuthorityStore,
+  type PrincipalAnchor,
+} from "./shared-principal-authority.ts";
 
 /**
  * Who is calling, and what they are allowed to ask for.
@@ -151,6 +175,169 @@ export interface Actor {
   readonly organizationId?: string;
   readonly scopes: readonly ApiKeyScope[];
   readonly kind: "session" | "api_key";
+}
+
+const authTokenCaptureBrand: unique symbol = Symbol("Auth token capture");
+
+/** An opaque local handle. Its private owning map, not this shape, identifies it. */
+export interface AuthenticatedTokenCapture {
+  readonly [authTokenCaptureBrand]: true;
+}
+
+/**
+ * Exact observed token backend data, without the bearer. This is neither a
+ * credential class nor current Financial permission; final owning CAS is separate.
+ */
+export interface CapturedAuthTokenRow {
+  readonly tokenId: string;
+  readonly digest: `sha256:${string}`;
+  readonly kind: "session" | "api_key";
+  readonly principalId: string;
+  readonly organizationId: string | null;
+  readonly scopesJson: string;
+  readonly scopes: readonly ApiKeyScope[];
+  readonly createdAt: string;
+  readonly expiresAt: string;
+}
+
+/** Internal read-only backend seam; not a public route, issuer or enrollment API. */
+export interface AuthTokenCaptureReader {
+  captureAuthenticatedToken(
+    authorization: string | null,
+  ): Promise<AuthenticatedTokenCapture | null>;
+  /** Returns null for a clone, serialization, Actor or another factory's handle. */
+  inspectAuthenticatedTokenCapture(capture: unknown): CapturedAuthTokenRow | null;
+}
+
+/** Retained direct DATA from this backend, never a qualified Financial consumer port. */
+export interface RetainedDirectOwnerSessionData {
+  readonly backend: "auth-token";
+  readonly record: TokenAuthorityRecord;
+  readonly capturedExpiresAt: string;
+}
+
+export interface RetainedDirectOwnerSessionReader extends AuthTokenCaptureReader {
+  /** Performs actual authentication and retained103 observation. Missing originals fail closed. */
+  captureRetainedDirectOwnerSession(
+    authorization: string | null,
+  ): Promise<AuthenticatedTokenCapture | null>;
+  /** A detached observation, not permission or a replacement for final same-primary CAS. */
+  readRetainedDirectOwnerSessionCapture(capture: unknown): RetainedDirectOwnerSessionData | null;
+}
+
+/** Original verification plus fresh Principal issuance, separate from any bearer.
+ * This proves the local verified producer and acknowledged issuance only. It does
+ * not qualify shared-human binding, installed Auth103/target, policy Clock or NEW.
+ */
+export interface VerifiedLocalPrincipalIssuance {
+  readonly verification: IdentityVerificationObservation;
+  readonly anchor: PrincipalAnchor;
+}
+
+/** The input is the original in-process signIn result, never its wire DTO/clone. */
+export interface VerifiedLocalPrincipalIssuanceReader {
+  readVerifiedLocalPrincipalIssuance(
+    originalSignInResult: unknown,
+  ): VerifiedLocalPrincipalIssuance | null;
+}
+
+const verifiedLocalPrincipalReaderOrigins = new WeakMap<
+  object,
+  {
+    readonly sql: Sql;
+    readonly identity: OriginalIdentityCapture;
+    readonly signIn: Accounts["signIn"];
+    readonly read: VerifiedLocalPrincipalIssuanceReader["readVerifiedLocalPrincipalIssuance"];
+    readonly query: Sql["query"];
+    readonly batch: Sql["batch"];
+  }
+>();
+
+/** Actual local verifier/Accounts/Sql methods, not a qualified Financial port. */
+export function assertVerifiedLocalPrincipalIssuanceReader(
+  reader: unknown,
+  context: { readonly sql: Sql },
+): asserts reader is VerifiedLocalPrincipalIssuanceReader {
+  assertRetainedDirectOwnerSessionReader(reader, context);
+  const origin = verifiedLocalPrincipalReaderOrigins.get(reader);
+  if (!origin) throw new AuthError("invalid");
+  assertIdentityVerificationCaptureReader(origin.identity.receiver);
+  for (const [receiver, key, expected] of [
+    [reader, "signIn", origin.signIn],
+    [reader, "readVerifiedLocalPrincipalIssuance", origin.read],
+    [origin.sql, "query", origin.query],
+    [origin.sql, "batch", origin.batch],
+  ] as const) {
+    const descriptor = Object.getOwnPropertyDescriptor(receiver, key);
+    if (!descriptor || !("value" in descriptor) || descriptor.value !== expected)
+      throw new AuthError("invalid");
+  }
+}
+
+const authTokenCaptureReaderOrigins = new WeakMap<
+  object,
+  {
+    readonly sql: Sql;
+    readonly capture: AuthTokenCaptureReader["captureAuthenticatedToken"];
+    readonly inspect: AuthTokenCaptureReader["inspectAuthenticatedTokenCapture"];
+    readonly captureRetained: RetainedDirectOwnerSessionReader["captureRetainedDirectOwnerSession"];
+    readonly readRetained: RetainedDirectOwnerSessionReader["readRetainedDirectOwnerSessionCapture"];
+  }
+>();
+
+/**
+ * Checks the actual Accounts factory and its original capture methods without
+ * calling them. This proves local origin only, not class or Financial authority.
+ */
+export function assertAuthTokenCaptureReader(
+  reader: unknown,
+  context: { readonly sql: Sql },
+): asserts reader is AuthTokenCaptureReader {
+  const origin =
+    typeof reader === "object" && reader !== null
+      ? authTokenCaptureReaderOrigins.get(reader)
+      : undefined;
+  if (!origin || typeof context !== "object" || context === null) {
+    throw new AuthError("invalid");
+  }
+  // Own data descriptors avoid executing an alleged reader/context's getters.
+  const sql = Object.getOwnPropertyDescriptor(context, "sql");
+  const capture = Object.getOwnPropertyDescriptor(reader, "captureAuthenticatedToken");
+  const inspect = Object.getOwnPropertyDescriptor(reader, "inspectAuthenticatedTokenCapture");
+  if (
+    !sql ||
+    !("value" in sql) ||
+    sql.value !== origin.sql ||
+    !capture ||
+    !("value" in capture) ||
+    capture.value !== origin.capture ||
+    !inspect ||
+    !("value" in inspect) ||
+    inspect.value !== origin.inspect
+  ) {
+    throw new AuthError("invalid");
+  }
+}
+
+/** Actual Accounts origin and original own methods only; no schema/target/realm qualification. */
+export function assertRetainedDirectOwnerSessionReader(
+  reader: unknown,
+  context: { readonly sql: Sql },
+): asserts reader is RetainedDirectOwnerSessionReader {
+  assertAuthTokenCaptureReader(reader, context);
+  const origin = authTokenCaptureReaderOrigins.get(reader);
+  const capture = Object.getOwnPropertyDescriptor(reader, "captureRetainedDirectOwnerSession");
+  const inspect = Object.getOwnPropertyDescriptor(reader, "readRetainedDirectOwnerSessionCapture");
+  if (
+    !origin ||
+    !capture ||
+    !("value" in capture) ||
+    capture.value !== origin.captureRetained ||
+    !inspect ||
+    !("value" in inspect) ||
+    inspect.value !== origin.readRetained
+  )
+    throw new AuthError("invalid");
 }
 
 export interface ExternalIdentityVerifier {
@@ -459,9 +646,23 @@ export function createIntegrationOrganizationBootstrapStore(options: {
         ]);
       } catch (error) {
         if (error instanceof SqlError && error.code === "constraint") {
-          const raced = await status(input).catch(() => null);
-          if (raced?.state === "present") return { status: raced, created: false };
-          throw new IntegrationOrganizationBootstrapStoreError("organization_state_conflict");
+          let raced: IntegrationOrganizationBootstrapStatus;
+          try {
+            raced = await status(input);
+          } catch (readError) {
+            if (
+              readError instanceof IntegrationOrganizationBootstrapStoreError &&
+              (readError.code === "principal_unavailable" ||
+                readError.code === "organization_state_conflict")
+            ) {
+              throw new IntegrationOrganizationBootstrapStoreError("organization_state_conflict");
+            }
+            throw error;
+          }
+          if (raced.state === "present") return { status: raced, created: false };
+          // A rolled-back batch with no competing tuple is a storage failure.
+          // Failed readback is also insufficient evidence of an identity conflict.
+          throw error;
         }
         // An unavailable acknowledgement is never retried here. The signed
         // status action is the only operation that settles whether it landed.
@@ -765,8 +966,233 @@ export function createSingleUseCredentials(sql: Sql, clock: Clock): SingleUseCre
   };
 }
 
-export function createAccounts(options: CreateAccountsOptions): Accounts {
+/** Candidate metadata only: no installed Auth0103 target or qualified consumer port. */
+const UNREGISTERED_LOCAL_AUTH_TARGET = "auth103:unregistered-local-candidate";
+
+type OriginalIdentityCapture = {
+  readonly receiver: ExternalIdentityVerifier & IdentityVerificationCaptureReader;
+  readonly capture: IdentityVerificationCaptureReader["captureVerifiedIdentity"];
+  readonly inspect: IdentityVerificationCaptureReader["inspectVerifiedIdentityCapture"];
+  readonly storage?: LocalIssuerStorage;
+};
+
+/** Storage DATA only; native/source qualification belongs to the request adapter. */
+interface LocalIssuerStorage {
+  readonly targetRef: string;
+  readonly sql: Sql;
+  readonly currentness: AuthCurrentnessPredicate;
+}
+
+/**
+ * Internal fixed local enrollment storage. Supplying this DATA does not qualify
+ * a platform, target, source, Clock or Financial consumer. The owning request
+ * adapter must obtain and retain those originals separately.
+ */
+export function createAccountsWithLocalIssuerStorage(
+  options: {
+    readonly sql: Sql;
+    readonly clock: Clock;
+    readonly identity: ExternalIdentityVerifier & IdentityVerificationCaptureReader;
+    readonly apiKeyAdministration?: ApiKeyAdministration;
+  },
+  storage: LocalIssuerStorage,
+): Accounts & RetainedDirectOwnerSessionReader & VerifiedLocalPrincipalIssuanceReader {
+  const selected = Object.getOwnPropertyDescriptor(options, "identity");
+  const selectedSql = Object.getOwnPropertyDescriptor(options, "sql");
+  const selectedClock = Object.getOwnPropertyDescriptor(options, "clock");
+  const administration = Object.getOwnPropertyDescriptor(options, "apiKeyAdministration");
+  if (
+    !selected ||
+    !("value" in selected) ||
+    !selectedSql ||
+    !("value" in selectedSql) ||
+    !selectedClock ||
+    !("value" in selectedClock) ||
+    typeof selectedClock.value !== "function" ||
+    (administration && !("value" in administration))
+  )
+    throw new AuthError("invalid");
+  const identity = selected.value;
+  assertIdentityVerificationCaptureReader(identity);
+  const capture = Object.getOwnPropertyDescriptor(identity, "captureVerifiedIdentity");
+  const inspect = Object.getOwnPropertyDescriptor(identity, "inspectVerifiedIdentityCapture");
+  if (
+    !capture ||
+    !("value" in capture) ||
+    typeof capture.value !== "function" ||
+    !inspect ||
+    !("value" in inspect) ||
+    typeof inspect.value !== "function"
+  )
+    throw new AuthError("invalid");
+  const accounts = createAccountsInternal(
+    {
+      sql: selectedSql.value,
+      clock: selectedClock.value,
+      identity,
+      ...(administration ? { apiKeyAdministration: administration.value } : {}),
+    },
+    Object.freeze({
+      receiver: identity,
+      capture: capture.value,
+      inspect: inspect.value,
+      storage: Object.freeze({
+        targetRef: storage.targetRef,
+        sql: storage.sql,
+        currentness: Object.freeze({
+          sql: storage.currentness.sql,
+          params: Object.freeze([...storage.currentness.params]),
+        }),
+      }),
+    }),
+  );
+  assertVerifiedLocalPrincipalIssuanceReader(accounts, { sql: selectedSql.value });
+  return accounts;
+}
+
+type LocalPostimage = {
+  readonly table:
+    | "principals"
+    | "auth_principal_incarnations"
+    | "auth_tokens"
+    | "credential_authority_classes";
+  readonly values: Readonly<Record<string, SqlParam>>;
+};
+
+/** Private fixed-recipe closure; no caller SQL, row DTO or callback input. */
+function localIssuerStorageBatch(
+  statements: readonly SqlStatement[],
+  images: readonly LocalPostimage[],
+  currentness: AuthCurrentnessPredicate,
+): readonly SqlStatement[] {
+  const indices = [0, 1, statements.length - 2, statements.length - 1];
+  const returning = statements.map((statement, index) => {
+    const image = images[indices.indexOf(index)];
+    return image
+      ? {
+          sql: `${statement.sql} RETURNING ${Object.keys(image.values).join(",")}`,
+          ...(statement.params === undefined ? {} : { params: statement.params }),
+        }
+      : statement;
+  });
+  const token = images[2];
+  if (
+    !token ||
+    token.table !== "auth_tokens" ||
+    typeof token.values.secret_digest !== "string" ||
+    typeof token.values.id !== "string"
+  )
+    throw new AuthError("invalid");
+  const predicates = images.map(
+    (image) =>
+      `EXISTS (SELECT 1 FROM ${image.table} WHERE ${Object.keys(image.values)
+        .map((key) => `${key} IS ?`)
+        .join(" AND ")})`,
+  );
+  return [
+    ...returning,
+    {
+      // Under the exact registered catalog this identity UPDATE either leaves
+      // the original token unchanged or aborts the same batch via NOT NULL.
+      // In particular an ignored class INSERT cannot commit a usable new token.
+      sql: `UPDATE auth_tokens SET principal_id=CASE WHEN (${currentness.sql})
+      AND ${predicates.join(" AND ")} THEN principal_id ELSE NULL END
+      WHERE secret_digest=? AND id=? RETURNING ${Object.keys(token.values).join(",")}`,
+      params: [
+        ...currentness.params,
+        ...images.flatMap((image) => Object.values(image.values)),
+        token.values.secret_digest,
+        token.values.id,
+      ],
+    },
+  ];
+}
+
+function exactLocalPostimage(write: SqlWrite | undefined, image: LocalPostimage): boolean {
+  if (
+    !write ||
+    !Number.isSafeInteger(write.changes) ||
+    write.changes <= 0 ||
+    write.rows.length !== 1
+  )
+    return false;
+  const row = write.rows[0];
+  if (!row || Reflect.ownKeys(row).length !== Object.keys(image.values).length) return false;
+  return Object.entries(image.values).every(([key, expected]) => {
+    const actual = Object.getOwnPropertyDescriptor(row, key);
+    return actual && "value" in actual && actual.value === expected;
+  });
+}
+
+/** Ordinary mounted Accounts keeps its historical schema and issuance path. */
+export function createAccounts(
+  options: CreateAccountsOptions,
+): Accounts & RetainedDirectOwnerSessionReader {
+  return createAccountsInternal(options, null);
+}
+
+/**
+ * Unmounted Auth0103 source preparation. This constructor requires an original
+ * resolveIdentity verifier; it is never selected from a request/Actor/DTO.
+ * The candidate target text is storage metadata, not installed target proof.
+ */
+export function createAccountsWithUnregisteredLocalIssuer(
+  options: CreateAccountsOptions & {
+    readonly identity: ExternalIdentityVerifier & IdentityVerificationCaptureReader;
+  },
+): Accounts & RetainedDirectOwnerSessionReader & VerifiedLocalPrincipalIssuanceReader {
+  // Read the selected verifier once through an own data descriptor. Reading
+  // options.identity repeatedly lets an accessor return a genuine verifier
+  // for the origin check and fake callbacks for the later captured methods.
+  if (!options || typeof options !== "object") throw new AuthError("invalid");
+  const selected = Object.getOwnPropertyDescriptor(options, "identity");
+  if (!selected || !("value" in selected)) throw new AuthError("invalid");
+  const identity = selected.value as ExternalIdentityVerifier & IdentityVerificationCaptureReader;
+  // Read each optional once, then omit absent fields. exactOptionalPropertyTypes
+  // distinguishes an omitted option from an own property set to undefined.
+  const sql = options.sql;
+  const clock = options.clock;
+  const randomSecret = options.randomSecret;
+  const randomId = options.randomId;
+  const apiKeyAdministration = options.apiKeyAdministration;
+  const normalized: CreateAccountsOptions = {
+    sql,
+    identity,
+    ...(clock === undefined ? {} : { clock }),
+    ...(randomSecret === undefined ? {} : { randomSecret }),
+    ...(randomId === undefined ? {} : { randomId }),
+    ...(apiKeyAdministration === undefined ? {} : { apiKeyAdministration }),
+  };
+  assertIdentityVerificationCaptureReader(identity);
+  const capture = Object.getOwnPropertyDescriptor(identity, "captureVerifiedIdentity");
+  const inspect = Object.getOwnPropertyDescriptor(identity, "inspectVerifiedIdentityCapture");
+  if (
+    !capture ||
+    !("value" in capture) ||
+    typeof capture.value !== "function" ||
+    !inspect ||
+    !("value" in inspect) ||
+    typeof inspect.value !== "function"
+  ) {
+    throw new AuthError("invalid");
+  }
+  assertIdentityVerificationCaptureReader(identity);
+  const original: OriginalIdentityCapture = Object.freeze({
+    receiver: identity,
+    capture: capture.value,
+    inspect: inspect.value,
+  });
+  const accounts = createAccountsInternal(normalized, original);
+  assertVerifiedLocalPrincipalIssuanceReader(accounts, { sql });
+  return accounts;
+}
+
+function createAccountsInternal(
+  options: CreateAccountsOptions,
+  localIssuer: OriginalIdentityCapture | null,
+): Accounts & RetainedDirectOwnerSessionReader {
   const { sql, identity } = options;
+  const issuerSql = localIssuer?.storage?.sql ?? sql;
   const clock = options.clock ?? (() => new Date());
   const randomSecret = options.randomSecret ?? defaultSecret;
   const randomId = options.randomId ?? (() => crypto.randomUUID().replaceAll("-", ""));
@@ -774,6 +1200,65 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
     options.apiKeyAdministration ??
     createApiKeyAdministration({ sql, clock, randomSecret, randomId });
   const stamp = (): string => clock().toISOString();
+  const tokenCaptures = new WeakMap<object, CapturedAuthTokenRow>();
+  const retainedSessionCaptures = new WeakMap<object, RetainedDirectOwnerSessionData>();
+  const verifiedLocalPrincipalIssuances = new WeakMap<object, VerifiedLocalPrincipalIssuance>();
+
+  // Retained observations stay on the factory's original query and receiver.
+  // Inspect own data descriptors so replacement accessors never execute.
+  const retainedQueryDescriptor = Object.getOwnPropertyDescriptor(sql, "query");
+  const originalRetainedQuery: Sql["query"] | null =
+    retainedQueryDescriptor &&
+    "value" in retainedQueryDescriptor &&
+    typeof retainedQueryDescriptor.value === "function"
+      ? retainedQueryDescriptor.value
+      : null;
+  const requireRetainedQuery = (): Sql["query"] => {
+    assertRetainedDirectOwnerSessionReader(accounts, { sql });
+    const current = Object.getOwnPropertyDescriptor(sql, "query");
+    if (
+      !originalRetainedQuery ||
+      !current ||
+      !("value" in current) ||
+      current.value !== originalRetainedQuery
+    )
+      throw new AuthError("invalid");
+    return originalRetainedQuery;
+  };
+  const retainedSql = Object.freeze<Sql>({
+    async query(text, params) {
+      const query = requireRetainedQuery();
+      const rows: readonly Row[] = localIssuer?.storage
+        ? await localIssuer.storage.sql.query(text, params)
+        : await Reflect.apply(query, sql, [text, params]);
+      requireRetainedQuery();
+      return rows;
+    },
+    async run() {
+      throw new AuthError("invalid");
+    },
+    async batch() {
+      throw new AuthError("invalid");
+    },
+  });
+
+  const readCurrentToken = async (
+    authorization: string | null,
+  ): Promise<{
+    readonly row: Row;
+    readonly digest: `sha256:${string}`;
+  } | null> => {
+    const secret = bearer(authorization);
+    if (!secret) return null;
+    const digest = await bytesDigest(new TextEncoder().encode(secret));
+    const rows = await sql.query(
+      `SELECT id, kind, principal_id, org_id, scopes_json,
+              secret_digest, created_at, expires_at, revoked_at FROM auth_tokens
+       WHERE secret_digest = ? AND revoked_at IS NULL AND expires_at > ?`,
+      [digest, stamp()],
+    );
+    return rows[0] ? { row: rows[0], digest } : null;
+  };
 
   const issueSessionToken = async (input: {
     readonly principalId: string;
@@ -808,7 +1293,7 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
     return { id, secret, createdAt, expiresAt };
   };
 
-  const singleUse = createSingleUseCredentials(sql, clock);
+  const singleUse = createSingleUseCredentials(issuerSql, clock);
 
   const personalOrganizationState = async (
     principalId: string,
@@ -872,45 +1357,63 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
     };
   };
 
-  const accounts: Accounts = {
+  const accounts: Accounts & RetainedDirectOwnerSessionReader = {
     async signIn({ provider, assertion, method, nonce, audience, sessionTtlSeconds }) {
       if (provider !== "takos-id" && provider !== "google" && provider !== "github") {
         throw new AuthError("invalid");
       }
-      const verified = await identity.verify({
-        provider,
-        assertion,
-        method,
-        nonce,
-        audience,
-      });
+      let observed: IdentityVerificationObservation | null = null;
+      let verified: Awaited<ReturnType<ExternalIdentityVerifier["verify"]>>;
+      if (localIssuer) {
+        // Capture methods and their receiver come from the selected factory.
+        // No caller-supplied proof or structural verifier opts into issuance.
+        assertIdentityVerificationCaptureReader(localIssuer.receiver);
+        const result = await Reflect.apply(localIssuer.capture, localIssuer.receiver, [
+          {
+            provider,
+            assertion,
+            method,
+            nonce,
+            audience,
+          },
+        ]);
+        assertIdentityVerificationCaptureReader(localIssuer.receiver);
+        observed = Reflect.apply(localIssuer.inspect, localIssuer.receiver, [result.capture]);
+        verified = result.verified;
+        if (
+          !observed ||
+          observed.provider !== provider ||
+          observed.providerSubject !== verified.providerSubject ||
+          observed.email !== verified.email ||
+          observed.displayName !== verified.displayName
+        ) {
+          throw new AuthError("invalid");
+        }
+      } else {
+        verified = await identity.verify({ provider, assertion, method, nonce, audience });
+      }
       // Spent before anything is written or issued: a replayed credential opens
       // nothing, and a crash after this point burns it rather than leaving it
       // usable twice.
       if (verified.singleUse) await singleUse.spend(verified.singleUse);
-      const rows = await sql.query(
+      if (localIssuer) assertVerifiedLocalPrincipalIssuanceReader(accounts, { sql });
+      const rows = await issuerSql.query(
         "SELECT id, email, display_name FROM principals WHERE provider = ? AND provider_subject = ?",
         [provider, verified.providerSubject],
       );
+      if (localIssuer) assertVerifiedLocalPrincipalIssuanceReader(accounts, { sql });
       const existing = rows[0];
       const id = existing ? String(existing.id) : `prn_${randomId()}`;
-      if (!existing) {
-        await sql.run(
-          `INSERT INTO principals (id, provider, provider_subject, email, display_name, created_at)
-           VALUES (?, ?, ?, ?, ?, ?)`,
-          [id, provider, verified.providerSubject, verified.email, verified.displayName, stamp()],
-        );
-      }
+      // Keep the original Takos ID Organization projection. For a fresh local
+      // Principal its statements join the same issuance batch.
+      const projection: SqlStatement[] = [];
       if (provider === "takos-id") {
         const owned = (verified.organizations ?? []).filter(
           (organization) => organization.role === "owner",
         );
         const projectedAt = stamp();
-        await sql.batch([
-          {
-            sql: "DELETE FROM org_memberships WHERE principal_id = ?",
-            params: [id],
-          },
+        projection.push(
+          { sql: "DELETE FROM org_memberships WHERE principal_id = ?", params: [id] },
           ...owned.flatMap((organization) => [
             {
               sql: `INSERT INTO orgs (id, name, owner_principal_id, created_at)
@@ -926,8 +1429,302 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
               params: [organization.id, id, projectedAt],
             },
           ]),
-        ]);
+        );
       }
+      if (localIssuer && observed && !existing) {
+        assertVerifiedLocalPrincipalIssuanceReader(accounts, { sql });
+        const createdAt = stamp();
+        const incarnation = `principal_inc_${randomId()}`;
+        const originRef = `local_identity_${randomId()}`;
+        const anchor: PrincipalAnchor = Object.freeze({
+          principalId: id,
+          incarnation,
+          identityKind: provider,
+          identitySubject: observed.providerSubject,
+          principalCreatedAt: createdAt,
+          originKind: "fresh-local",
+          origin: Object.freeze({ ref: originRef, digest: observed.assertionDigest }),
+          verificationDomain: observed.verificationDomain,
+          enrolledAt: createdAt,
+          state: "active",
+          terminal: null,
+        });
+        const secret = randomSecret();
+        const tokenId = `ses_${randomId()}`;
+        const issuedAt = clock();
+        const tokenCreatedAt = issuedAt.toISOString();
+        const expiresAt = new Date(
+          issuedAt.getTime() + (sessionTtlSeconds ?? 12 * 60 * 60) * 1_000,
+        ).toISOString();
+        const digest = await bytesDigest(new TextEncoder().encode(secret));
+        const classOrigin: CredentialAuthorityOrigin = Object.freeze({
+          ref: `authority_${randomId()}`,
+          incarnation: `credential_inc_${randomId()}`,
+          targetRef: localIssuer.storage?.targetRef ?? UNREGISTERED_LOCAL_AUTH_TARGET,
+          principalId: id,
+          principalIncarnation: incarnation,
+          issuanceRef: `local_session_${tokenId}`,
+          issuanceDigest: digest,
+          issuedAt: tokenCreatedAt,
+        });
+        const classStatement = createCredentialAuthorityClassStore({
+          sql,
+        }).localSessionIssuanceStatement(
+          classOrigin,
+          { id: tokenId, digest, scopesJson: "[]", createdAt: tokenCreatedAt },
+          anchor,
+          observed.verificationDomain,
+        );
+        assertVerifiedLocalPrincipalIssuanceReader(accounts, { sql });
+        const statements: readonly SqlStatement[] = [
+          {
+            sql: `INSERT INTO principals (id, provider, provider_subject, email, display_name, created_at)
+                  VALUES (?, ?, ?, ?, ?, ?)`,
+            params: [
+              id,
+              provider,
+              observed.providerSubject,
+              observed.email,
+              observed.displayName,
+              createdAt,
+            ],
+          },
+          {
+            sql: `INSERT INTO auth_principal_incarnations
+                  (principal_id, principal_incarnation, identity_kind, identity_subject,
+                   principal_created_at, origin_kind, origin_ref, origin_digest,
+                   identity_authority_body, identity_authority_digest, enrolled_at)
+                  VALUES (?, ?, ?, ?, ?, 'fresh-local', ?, ?, ?, ?, ?)`,
+            params: [
+              id,
+              incarnation,
+              provider,
+              observed.providerSubject,
+              createdAt,
+              originRef,
+              observed.assertionDigest,
+              JSON.stringify(observed.verificationDomain.body),
+              observed.verificationDomain.digest,
+              createdAt,
+            ],
+          },
+          ...projection,
+          {
+            sql: `INSERT INTO auth_tokens
+                  (secret_digest, id, kind, principal_id, org_id, name, scopes_json, created_at, expires_at)
+                  VALUES (?, ?, 'session', ?, NULL, 'session', '[]', ?, ?)`,
+            params: [digest, tokenId, id, tokenCreatedAt, expiresAt],
+          },
+          // The fixed class INSERT is last. Its computed NULL principal_id
+          // violates NOT NULL on a zero-row token/anchor guard; Sql.batch must
+          // roll back Principal, anchor, projection and token together.
+          classStatement,
+        ];
+        const images: readonly LocalPostimage[] = localIssuer.storage
+          ? [
+              {
+                table: "principals",
+                values: {
+                  id,
+                  provider,
+                  provider_subject: observed.providerSubject,
+                  email: observed.email,
+                  display_name: observed.displayName,
+                  created_at: createdAt,
+                },
+              },
+              {
+                table: "auth_principal_incarnations",
+                values: {
+                  principal_id: id,
+                  principal_incarnation: incarnation,
+                  identity_kind: provider,
+                  identity_subject: observed.providerSubject,
+                  principal_created_at: createdAt,
+                  origin_kind: "fresh-local",
+                  origin_ref: originRef,
+                  origin_digest: observed.assertionDigest,
+                  identity_authority_body: JSON.stringify(observed.verificationDomain.body),
+                  identity_authority_digest: observed.verificationDomain.digest,
+                  enrolled_at: createdAt,
+                  state: "active",
+                  terminal_reason: null,
+                  terminal_at: null,
+                  terminal_ref: null,
+                },
+              },
+              {
+                table: "auth_tokens",
+                values: {
+                  secret_digest: digest,
+                  id: tokenId,
+                  kind: "session",
+                  principal_id: id,
+                  org_id: null,
+                  name: "session",
+                  scopes_json: "[]",
+                  created_at: tokenCreatedAt,
+                  expires_at: expiresAt,
+                  revoked_at: null,
+                },
+              },
+              {
+                table: "credential_authority_classes",
+                values: {
+                  authority_ref: classOrigin.ref,
+                  credential_incarnation: classOrigin.incarnation,
+                  class: "direct-owner-session",
+                  backend: "auth-token",
+                  target_ref: classOrigin.targetRef,
+                  organization_id: null,
+                  principal_id: id,
+                  principal_incarnation: incarnation,
+                  issuance_ref: classOrigin.issuanceRef,
+                  issuance_digest: digest,
+                  issued_at: tokenCreatedAt,
+                  token_id: tokenId,
+                  token_digest: digest,
+                  token_kind: "session",
+                  token_scopes_json: "[]",
+                  token_created_at: tokenCreatedAt,
+                  principal_binding_ref: null,
+                  rp_registration_ref: null,
+                  rp_registration_digest: null,
+                  session_digest: null,
+                  session_created_at: null,
+                  session_enrolled_version: null,
+                  issuer: null,
+                  client_id: null,
+                  subject: null,
+                  issuer_session_id: null,
+                  auth_time: null,
+                  account_id: null,
+                  workspace_id: null,
+                  workspace_ref: null,
+                  state: "active",
+                  terminal_reason: null,
+                  terminal_at: null,
+                  terminal_ref: null,
+                },
+              },
+            ]
+          : [];
+        const selected = localIssuer.storage
+          ? localIssuerStorageBatch(statements, images, localIssuer.storage.currentness)
+          : statements;
+        const issuance = await issuerSql.batch(selected);
+        assertVerifiedLocalPrincipalIssuanceReader(accounts, { sql });
+        if (localIssuer.storage) {
+          const indices = [0, 1, statements.length - 2, statements.length - 1];
+          const tokenImage = images[2];
+          if (
+            issuance.length !== selected.length ||
+            !tokenImage ||
+            !images.every((image, index) =>
+              exactLocalPostimage(issuance[indices[index] ?? -1], image),
+            ) ||
+            !exactLocalPostimage(issuance.at(-1), tokenImage)
+          )
+            throw new AuthError("invalid");
+        }
+        // Require actual fresh Principal/anchor/token/class write ACKs. Trigger
+        // fanout may exceed one; missing/zero/unknown is never issuance proof.
+        const writes = [
+          issuance[0],
+          issuance[1],
+          issuance[statements.length - 2],
+          issuance[statements.length - 1],
+        ];
+        if (
+          issuance.length !== 4 + projection.length + (localIssuer.storage ? 1 : 0) ||
+          writes.some(
+            (write) => !write || !Number.isSafeInteger(write.changes) || write.changes <= 0,
+          )
+        )
+          throw new AuthError("invalid");
+        const result = {
+          principal: {
+            id,
+            provider,
+            providerSubject: observed.providerSubject,
+            email: observed.email,
+            displayName: observed.displayName,
+          },
+          sessionToken: secret,
+        };
+        // Published only here: original verified identity and this acknowledged
+        // same-batch enrollment, never a token/Actor/row-kind inferred identity.
+        verifiedLocalPrincipalIssuances.set(
+          result,
+          Object.freeze({ verification: observed, anchor }),
+        );
+        return result;
+      }
+      if (localIssuer?.storage && existing) throw new AuthError("permission_denied");
+      if (localIssuer && existing) {
+        // Reissuance for any enrolled Principal is a separate owner unit.
+        // A failed/missing table read must never become a legacy fallback.
+        const anchors = await issuerSql.query(
+          "SELECT principal_incarnation FROM auth_principal_incarnations WHERE principal_id = ?",
+          [id],
+        );
+        if (anchors.length !== 0) throw new AuthError("permission_denied");
+        const secret = randomSecret();
+        const tokenId = `ses_${randomId()}`;
+        const issuedAt = clock();
+        const tokenCreatedAt = issuedAt.toISOString();
+        const expiresAt = new Date(
+          issuedAt.getTime() + (sessionTtlSeconds ?? 12 * 60 * 60) * 1_000,
+        ).toISOString();
+        const digest = await bytesDigest(new TextEncoder().encode(secret));
+        // Repeat the no-anchor condition in the mandatory token INSERT. A
+        // concurrent enrollment after the read fails inside this same batch,
+        // including its Takos ID projection, instead of minting a legacy token.
+        assertIdentityVerificationCaptureReader(localIssuer.receiver);
+        await issuerSql.batch([
+          ...projection,
+          {
+            sql: `INSERT INTO auth_tokens
+                  (secret_digest, id, kind, principal_id, org_id, name, scopes_json, created_at, expires_at)
+                  VALUES (?, ?, 'session',
+                    CASE WHEN EXISTS (
+                      SELECT 1 FROM principals p WHERE p.id=? AND p.provider=? AND p.provider_subject=?
+                    ) AND NOT EXISTS (
+                      SELECT 1 FROM auth_principal_incarnations i WHERE i.principal_id=?
+                    ) THEN ? ELSE NULL END,
+                    NULL, 'session', '[]', ?, ?)`,
+            params: [
+              digest,
+              tokenId,
+              id,
+              provider,
+              verified.providerSubject,
+              id,
+              id,
+              tokenCreatedAt,
+              expiresAt,
+            ],
+          },
+        ]);
+        return {
+          principal: {
+            id,
+            provider,
+            providerSubject: verified.providerSubject,
+            email: verified.email,
+            displayName: verified.displayName,
+          },
+          sessionToken: secret,
+        };
+      }
+      if (!existing) {
+        await issuerSql.run(
+          `INSERT INTO principals (id, provider, provider_subject, email, display_name, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [id, provider, verified.providerSubject, verified.email, verified.displayName, stamp()],
+        );
+      }
+      if (projection.length > 0) await issuerSql.batch(projection);
       const { secret } = await issueSessionToken({
         principalId: id,
         expiresInSeconds: sessionTtlSeconds ?? 12 * 60 * 60,
@@ -1159,19 +1956,17 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
          WHERE secret_digest = ? AND kind = 'session' AND revoked_at IS NULL AND expires_at > ?`,
         [revokedAt, await bytesDigest(new TextEncoder().encode(secret)), revokedAt],
       );
-      if (result.changes !== 1) throw new AuthError("unauthenticated");
+      // The unique bearer digest permits at most one token update. D1 also
+      // counts trigger writes, including the retained credential's retirement.
+      const changes = result.changes;
+      if (typeof changes !== "number" || !Number.isSafeInteger(changes) || changes < 1)
+        throw new AuthError("unauthenticated");
     },
 
     async authenticate(authorization) {
-      const secret = bearer(authorization);
-      if (!secret) return null;
-      const rows = await sql.query(
-        `SELECT id, kind, principal_id, org_id, scopes_json FROM auth_tokens
-         WHERE secret_digest = ? AND revoked_at IS NULL AND expires_at > ?`,
-        [await bytesDigest(new TextEncoder().encode(secret)), stamp()],
-      );
-      const row = rows[0];
-      if (!row) return null;
+      const observed = await readCurrentToken(authorization);
+      if (!observed) return null;
+      const { row } = observed;
       const organizationId = row.org_id;
       const kind = String(row.kind) === "session" ? "session" : "api_key";
       return {
@@ -1182,6 +1977,95 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
         scopes: JSON.parse(String(row.scopes_json)) as ApiKeyScope[],
         kind,
       };
+    },
+
+    async captureAuthenticatedToken(authorization) {
+      const observed = await readCurrentToken(authorization);
+      if (!observed) return null;
+      const retained = capturedTokenRow(observed.row, observed.digest, clock().getTime());
+      if (!retained) return null;
+      const capture: AuthenticatedTokenCapture = { [authTokenCaptureBrand]: true };
+      Object.freeze(capture);
+      tokenCaptures.set(capture, retained);
+      return capture;
+    },
+
+    inspectAuthenticatedTokenCapture(capture) {
+      if (typeof capture !== "object" || capture === null) return null;
+      return tokenCaptures.get(capture) ?? null;
+    },
+
+    async captureRetainedDirectOwnerSession(authorization) {
+      requireRetainedQuery();
+      const secret = bearer(authorization);
+      if (!secret) return null;
+      const digest = await bytesDigest(new TextEncoder().encode(secret));
+      requireRetainedQuery();
+      const rows = await retainedSql.query(
+        `SELECT id, kind, principal_id, org_id, scopes_json,
+              secret_digest, created_at, expires_at, revoked_at FROM auth_tokens
+       WHERE secret_digest = ? AND revoked_at IS NULL AND expires_at > ?`,
+        [digest, stamp()],
+      );
+      requireRetainedQuery();
+      if (!rows[0]) return null;
+      const captured = capturedTokenRow(rows[0], digest, clock().getTime());
+      if (!captured || captured.kind !== "session" || captured.organizationId !== null) return null;
+      const record = await createCredentialAuthorityClassStore({
+        sql: retainedSql,
+      }).readActiveDirectOwnerSessionByToken({ id: captured.tokenId, digest: captured.digest });
+      requireRetainedQuery();
+      if (
+        !record ||
+        record.origin.targetRef !==
+          (localIssuer?.storage?.targetRef ?? UNREGISTERED_LOCAL_AUTH_TARGET) ||
+        record.origin.principalId !== captured.principalId ||
+        record.token.createdAt !== captured.createdAt ||
+        record.token.scopesJson !== captured.scopesJson
+      )
+        return null;
+      const anchor = await createSharedPrincipalAuthorityStore({ sql: retainedSql }).readAnchor(
+        captured.principalId,
+      );
+      requireRetainedQuery();
+      if (!anchor || anchor.originKind !== "fresh-local" || anchor.state !== "active") return null;
+      const predicate = directCredentialCurrentness(
+        record,
+        anchor,
+        anchor.verificationDomain,
+        captured.expiresAt,
+      );
+      const nativeCurrentness = localIssuer?.storage?.currentness;
+      const selectedPredicate = nativeCurrentness
+        ? {
+            sql: `(${predicate.sql}) AND (${nativeCurrentness.sql})`,
+            params: [...predicate.params, ...nativeCurrentness.params],
+          }
+        : predicate;
+      const current = await retainedSql.query(
+        `SELECT CASE WHEN ${selectedPredicate.sql} THEN 1 ELSE 0 END AS valid`,
+        selectedPredicate.params,
+      );
+      requireRetainedQuery();
+      if (
+        current.length !== 1 ||
+        current[0]?.valid !== 1 ||
+        Date.parse(captured.expiresAt) <= clock().getTime()
+      )
+        return null;
+      const capture: AuthenticatedTokenCapture = { [authTokenCaptureBrand]: true };
+      Object.freeze(capture);
+      tokenCaptures.set(capture, captured);
+      retainedSessionCaptures.set(
+        capture,
+        Object.freeze({ backend: "auth-token", record, capturedExpiresAt: captured.expiresAt }),
+      );
+      return capture;
+    },
+
+    readRetainedDirectOwnerSessionCapture(capture) {
+      if (typeof capture !== "object" || capture === null) return null;
+      return retainedSessionCaptures.get(capture) ?? null;
     },
 
     async authorize(authorization, scope) {
@@ -1207,7 +2091,105 @@ export function createAccounts(options: CreateAccountsOptions): Accounts {
     },
   };
 
+  authTokenCaptureReaderOrigins.set(
+    accounts,
+    Object.freeze({
+      sql,
+      capture: accounts.captureAuthenticatedToken,
+      inspect: accounts.inspectAuthenticatedTokenCapture,
+      captureRetained: accounts.captureRetainedDirectOwnerSession,
+      readRetained: accounts.readRetainedDirectOwnerSessionCapture,
+    }),
+  );
+  if (localIssuer) {
+    const batch = Object.getOwnPropertyDescriptor(sql, "batch");
+    if (
+      !originalRetainedQuery ||
+      !batch ||
+      !("value" in batch) ||
+      typeof batch.value !== "function"
+    )
+      throw new AuthError("invalid");
+    const readVerifiedLocalPrincipalIssuance = (
+      result: unknown,
+    ): VerifiedLocalPrincipalIssuance | null => {
+      assertVerifiedLocalPrincipalIssuanceReader(accounts, { sql });
+      return result && typeof result === "object"
+        ? (verifiedLocalPrincipalIssuances.get(result) ?? null)
+        : null;
+    };
+    Object.assign(accounts, { readVerifiedLocalPrincipalIssuance });
+    verifiedLocalPrincipalReaderOrigins.set(
+      accounts,
+      Object.freeze({
+        sql,
+        identity: localIssuer,
+        signIn: accounts.signIn,
+        read: readVerifiedLocalPrincipalIssuance,
+        query: originalRetainedQuery,
+        batch: batch.value,
+      }),
+    );
+  }
   return accounts;
+}
+
+function capturedTokenRow(
+  row: Row,
+  digest: `sha256:${string}`,
+  now: number,
+): CapturedAuthTokenRow | null {
+  if (
+    row.secret_digest !== digest ||
+    row.revoked_at !== null ||
+    (row.kind !== "session" && row.kind !== "api_key") ||
+    typeof row.id !== "string" ||
+    row.id.length === 0 ||
+    typeof row.principal_id !== "string" ||
+    row.principal_id.length === 0 ||
+    typeof row.created_at !== "string" ||
+    row.created_at.length === 0 ||
+    typeof row.expires_at !== "string" ||
+    !Number.isFinite(now) ||
+    !Number.isFinite(Date.parse(row.expires_at)) ||
+    Date.parse(row.expires_at) <= now ||
+    typeof row.scopes_json !== "string" ||
+    row.scopes_json.length < 2 ||
+    row.scopes_json.length > 1024 ||
+    (row.org_id !== null && (typeof row.org_id !== "string" || row.org_id.length === 0))
+  ) {
+    return null;
+  }
+  let decoded: unknown;
+  try {
+    decoded = JSON.parse(row.scopes_json);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(decoded)) return null;
+  const scopes: ApiKeyScope[] = [];
+  for (const value of decoded) {
+    const scope = API_KEY_SCOPES.find((candidate) => candidate === value);
+    if (scope === undefined || scopes.includes(scope)) return null;
+    scopes.push(scope);
+  }
+  if (
+    (row.kind === "session" && (row.org_id !== null || scopes.length !== 0)) ||
+    (row.kind === "api_key" && (typeof row.org_id !== "string" || scopes.length === 0))
+  ) {
+    return null;
+  }
+  return Object.freeze({
+    tokenId: row.id,
+    digest,
+    kind: row.kind,
+    principalId: row.principal_id,
+    organizationId: row.org_id,
+    scopesJson: row.scopes_json,
+    scopes: Object.freeze(scopes),
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+  });
 }
 
 function apiKeyFromRow(row: Readonly<Record<string, unknown>>): ApiKey {

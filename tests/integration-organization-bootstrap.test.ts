@@ -458,6 +458,96 @@ describe("integration organization bootstrap", () => {
     expect(await rowCount(fixture.sql, "org_memberships", "org_id = ?", [ORGANIZATION_ID])).toBe(0);
   });
 
+  test("keeps a rolled-back constraint unavailable when its state readback fails", async () => {
+    const fixture = await authorityFixture();
+    await fixture.sql.run(
+      `CREATE TRIGGER reject_bootstrap_membership BEFORE INSERT ON org_memberships
+       WHEN NEW.org_id = '${ORGANIZATION_ID}'
+       BEGIN SELECT RAISE(ABORT, 'bootstrap membership failure'); END`,
+    );
+    let attempted = false;
+    let batches = 0;
+    const unavailableReadback: Sql = {
+      query(sql, params) {
+        if (attempted) throw new Error("simulated unavailable state readback");
+        return fixture.sql.query(sql, params);
+      },
+      run: (sql, params) => fixture.sql.run(sql, params),
+      async batch(statements) {
+        batches += 1;
+        try {
+          return await fixture.sql.batch(statements);
+        } finally {
+          attempted = true;
+        }
+      },
+    };
+    const route = createIntegrationOrganizationBootstrap({
+      configuration: fixture.configuration,
+      sql: unavailableReadback,
+      clock: () => NOW,
+    });
+    const response = await callBootstrap({
+      route,
+      configuration: fixture.configuration,
+      privateKey: fixture.keyPair.privateKey,
+      action: "apply",
+      body: applyRequestBody(PRINCIPAL_ID),
+    });
+    expect(response.response.status).toBe(503);
+    expect(await response.response.json()).toMatchObject({
+      error: { code: "unavailable", hostCode: "internal_error" },
+    });
+    expect(batches).toBe(1);
+    expect(await rowCount(fixture.sql, "orgs", "id = ?", [ORGANIZATION_ID])).toBe(0);
+    expect(await rowCount(fixture.sql, "org_memberships", "org_id = ?", [ORGANIZATION_ID])).toBe(0);
+  });
+
+  test("reports an observed identity conflict after a constraint without retrying the batch", async () => {
+    const fixture = await authorityFixture();
+    await fixture.sql.run(
+      `CREATE TRIGGER reject_bootstrap_membership BEFORE INSERT ON org_memberships
+       WHEN NEW.org_id = '${ORGANIZATION_ID}'
+       BEGIN SELECT RAISE(ABORT, 'bootstrap membership failure'); END`,
+    );
+    let batches = 0;
+    const changedOwner: Sql = {
+      query: (sql, params) => fixture.sql.query(sql, params),
+      run: (sql, params) => fixture.sql.run(sql, params),
+      async batch(statements) {
+        batches += 1;
+        try {
+          return await fixture.sql.batch(statements);
+        } catch (error) {
+          await fixture.sql.run("UPDATE principals SET email = ? WHERE id = ?", [
+            "changed@example.test",
+            PRINCIPAL_ID,
+          ]);
+          throw error;
+        }
+      },
+    };
+    const route = createIntegrationOrganizationBootstrap({
+      configuration: fixture.configuration,
+      sql: changedOwner,
+      clock: () => NOW,
+    });
+    const response = await callBootstrap({
+      route,
+      configuration: fixture.configuration,
+      privateKey: fixture.keyPair.privateKey,
+      action: "apply",
+      body: applyRequestBody(PRINCIPAL_ID),
+    });
+    expect(response.response.status).toBe(409);
+    expect(await response.response.json()).toMatchObject({
+      error: { code: "conflict", hostCode: "organization_state_conflict" },
+    });
+    expect(batches).toBe(1);
+    expect(await rowCount(fixture.sql, "orgs", "id = ?", [ORGANIZATION_ID])).toBe(0);
+    expect(await rowCount(fixture.sql, "org_memberships", "org_id = ?", [ORGANIZATION_ID])).toBe(0);
+  });
+
   test("reports post-commit readback drift as unknown while retaining both rows", async () => {
     const fixture = await authorityFixture();
     const driftingReadbackSql: Sql = {

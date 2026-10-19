@@ -14,6 +14,7 @@ import {
 } from "./auth.ts";
 import type { BillingConfig } from "./billing-config.ts";
 import { createCatalog, type Offering } from "./catalog.ts";
+import { CONTAINER_CONTRACT, V2_CONTAINER_F2_FORM } from "./container-contract.ts";
 import { type Checkout, createControlRoutes } from "./control.ts";
 import { createDataAiRoutes } from "./data-ai.ts";
 import {
@@ -61,6 +62,7 @@ import {
 } from "./resource-migrations.ts";
 import { createRouter, type Router } from "./router.ts";
 import type { RuntimeInputAuthority } from "./runtime-input-preparations.ts";
+import { SHARED_AUTH_STAGING_PROFILE } from "./shared-auth-oidc-client.ts";
 import {
   type ArtifactReconcileReport,
   type ArtifactReconciler,
@@ -96,6 +98,12 @@ import {
   type V2OperatorFormSelectionFactory,
 } from "./takoform-v2/application.ts";
 import type { V2ApplicationConfig } from "./takoform-v2/config.ts";
+import type {
+  V2HostAcceptance,
+  V2HostAcceptanceContext,
+  V2HostAcceptanceScope,
+  V2HostDeleteAcceptanceContext,
+} from "./takoform-v2/host-acceptance.ts";
 import type { V2PrivateInputCustody } from "./takoform-v2/private-inputs.ts";
 import type { V2Operation } from "./takoform-v2/types.ts";
 import { tenantRunPrincipalId } from "./tenant-run-principal.ts";
@@ -108,9 +116,21 @@ import {
   TokenError,
 } from "./token.ts";
 import {
+  assertSharedOriginCarrier,
   createWorkerEndpointOriginReservations,
   type WorkerEndpointOriginReservations,
 } from "./worker-endpoint-origin-reservations.ts";
+import {
+  createWorkerEndpointOriginV2Acceptance,
+  createWorkerEndpointOriginV2FormRouteAcceptance,
+} from "./worker-endpoint-origin-v2-acceptance.ts";
+import {
+  createWorkerRequestConsumers,
+  readWorkerRequestConsumers,
+  readWorkerRequestFinancialInputs,
+  type WorkerRequestAppInputs,
+  type WorkerRequestConsumers,
+} from "./worker-request-composition.ts";
 
 /**
  * The composition root.
@@ -123,6 +143,13 @@ import {
  */
 
 export interface AppPorts {
+  /** Entry-owned fresh primary request composition; absent preserves ordinary construction. */
+  readonly workerRequest?: WorkerRequestAppInputs & {
+    /** Original graph opt-in; matching objects and alternate construction inputs are refused. */
+    readonly originalConsumers?: WorkerRequestConsumers;
+    /** Internal native-qualified Auth port; accepted only with its SAME original graph. */
+    readonly financialAuth?: FinancialAuthConsumerPort;
+  };
   /** The exact inventory/deployment stores precomposed for native startup. */
   readonly resourceStores?: AppResourceStoreBundle;
   /** Host-only optional data-plane factory, built against these same canonical ledgers. */
@@ -172,6 +199,18 @@ export interface AppPorts {
   readonly v2FormFactory?: V2OperatorFormFactory;
   /** Code-selected full and retained-only maps; exclusive with v2FormFactory. */
   readonly v2FormSelectionFactory?: V2OperatorFormSelectionFactory;
+  /** Code-only fixed staging/direct-Organization compiler selection; omission retains scalar. */
+  readonly v2WorkerEndpointOrigin?:
+    | (Omit<Parameters<typeof createWorkerEndpointOriginV2Acceptance>[0], "sql"> & {
+        readonly kind?: undefined;
+      })
+    | (Omit<Parameters<typeof createWorkerEndpointOriginV2FormRouteAcceptance>[0], "sql"> & {
+        readonly kind: "form-v2@1";
+      });
+  /** Trusted operator-code Container issuer, bound to this exact Sql before construction. */
+  readonly v2ContainerHostAcceptance?: V2HostAcceptance;
+  /** Code-selected fresh CREATE/UPDATE policy; absent preserves normal admission. */
+  readonly v2AllowFreshCreateAndUpdate?: boolean;
   /** Code-selected source for configured v2 artifact Forms; absent remains held-only. */
   readonly v2ArtifactSourceFactory?: V2OperatorArtifactSourceFactory;
   /** Explicit operator-private v2 keyring; absent disables privateInputs. */
@@ -308,6 +347,146 @@ export interface TickReport {
   };
 }
 
+function captureContainerHostAcceptance(
+  value: V2HostAcceptance | undefined,
+  sql: Sql,
+): V2HostAcceptance | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null)
+    throw new TypeError("invalid internal Container Host acceptance construction");
+  const ownMethod = (name: "assertSql" | "initialOutput" | "prepare" | "prepareDelete") => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, name);
+    if (
+      !descriptor ||
+      !Object.hasOwn(descriptor, "value") ||
+      typeof descriptor.value !== "function"
+    )
+      throw new TypeError(`Container Host acceptance requires own ${name} method`);
+    return descriptor.value.bind(value);
+  };
+  const assertSql = ownMethod("assertSql") as V2HostAcceptance["assertSql"];
+  const initialOutput = ownMethod("initialOutput") as V2HostAcceptance["initialOutput"];
+  const prepare = ownMethod("prepare") as V2HostAcceptance["prepare"];
+  const prepareDelete = ownMethod("prepareDelete") as NonNullable<
+    V2HostAcceptance["prepareDelete"]
+  >;
+  assertSql(sql);
+  return Object.freeze({ assertSql, initialOutput, prepare, prepareDelete });
+}
+
+function composeV2HostAcceptances(
+  container: V2HostAcceptance | undefined,
+  endpoint: V2HostAcceptance | undefined,
+): V2HostAcceptance {
+  const attempt = <T>(
+    read: () => T,
+  ): { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: unknown } => {
+    try {
+      return { ok: true, value: read() };
+    } catch (error) {
+      return { ok: false, error };
+    }
+  };
+  const overlap = () => new TypeError("multiple v2 Host acceptances claimed one operation");
+
+  return Object.freeze({
+    assertSql(sql: Sql) {
+      const containerCheck = attempt(() => container?.assertSql(sql));
+      const endpointCheck = attempt(() => endpoint?.assertSql(sql));
+      if (!containerCheck.ok) throw containerCheck.error;
+      if (!endpointCheck.ok) throw endpointCheck.error;
+    },
+    initialOutput(scope: V2HostAcceptanceScope) {
+      if (container === undefined) return endpoint?.initialOutput(scope);
+      if (endpoint === undefined) return container.initialOutput(scope);
+      const containerOutput = attempt(() => container.initialOutput(scope));
+      const endpointOutput = attempt(() => endpoint.initialOutput(scope));
+      if (!containerOutput.ok) throw containerOutput.error;
+      if (!endpointOutput.ok) throw endpointOutput.error;
+      if (containerOutput.value !== undefined && endpointOutput.value !== undefined)
+        throw overlap();
+      return containerOutput.value !== undefined ? containerOutput.value : endpointOutput.value;
+    },
+    prepare(context: V2HostAcceptanceContext) {
+      if (container === undefined) return endpoint?.prepare(context);
+      if (endpoint === undefined) return container.prepare(context);
+      // A true omission stays synchronous: the Store uses it to choose the
+      // ordinary batch. When either issuer participates, settle both before
+      // returning the original branded preparation to the Store.
+      const containerStart = attempt(() => container.prepare(context));
+      const endpointStart = attempt(() => endpoint.prepare(context));
+      const containerPreparing = containerStart.ok ? containerStart.value : undefined;
+      const endpointPreparing = endpointStart.ok ? endpointStart.value : undefined;
+      if (containerPreparing === undefined && endpointPreparing === undefined) {
+        if (!containerStart.ok) throw containerStart.error;
+        if (!endpointStart.ok) throw endpointStart.error;
+        return undefined;
+      }
+      return Promise.allSettled([containerPreparing, endpointPreparing] as const).then(
+        ([containerResult, endpointResult]) => {
+          if (
+            containerResult.status === "fulfilled" &&
+            endpointResult.status === "fulfilled" &&
+            containerResult.value !== undefined &&
+            endpointResult.value !== undefined
+          )
+            throw overlap();
+          if (!containerStart.ok) throw containerStart.error;
+          if (!endpointStart.ok) throw endpointStart.error;
+          if (containerResult.status === "rejected") throw containerResult.reason;
+          if (endpointResult.status === "rejected") throw endpointResult.reason;
+          const selected =
+            containerResult.value !== undefined ? containerResult.value : endpointResult.value;
+          if (selected === undefined)
+            throw new TypeError("v2 Host acceptance preparation resolved without a claim");
+          return selected;
+        },
+      );
+    },
+    prepareDelete(context: V2HostDeleteAcceptanceContext) {
+      const canonicalContainer =
+        context.form === CONTAINER_CONTRACT.formUrl || context.form === V2_CONTAINER_F2_FORM;
+      if (canonicalContainer && container === undefined)
+        throw new TypeError("canonical Container DELETE requires its Host issuer");
+      // Only an explicit DELETE method participates. Endpoint's generic
+      // prepare compiles non-CREATE as UPDATE and must never receive DELETE.
+      const containerStart = attempt(() => container?.prepareDelete?.(context));
+      const endpointStart = attempt(() => endpoint?.prepareDelete?.(context));
+      const containerPreparing = containerStart.ok ? containerStart.value : undefined;
+      const endpointPreparing = endpointStart.ok ? endpointStart.value : undefined;
+      if (containerPreparing === undefined && endpointPreparing === undefined) {
+        if (!containerStart.ok) throw containerStart.error;
+        if (!endpointStart.ok) throw endpointStart.error;
+        if (canonicalContainer)
+          throw new TypeError("canonical Container DELETE requires its own preparation");
+        return undefined;
+      }
+      return Promise.allSettled([containerPreparing, endpointPreparing] as const).then(
+        ([containerResult, endpointResult]) => {
+          if (
+            containerResult.status === "fulfilled" &&
+            endpointResult.status === "fulfilled" &&
+            containerResult.value !== undefined &&
+            endpointResult.value !== undefined
+          )
+            throw overlap();
+          if (!containerStart.ok) throw containerStart.error;
+          if (!endpointStart.ok) throw endpointStart.error;
+          if (containerResult.status === "rejected") throw containerResult.reason;
+          if (endpointResult.status === "rejected") throw endpointResult.reason;
+          if (canonicalContainer && containerResult.value === undefined)
+            throw new TypeError("canonical Container DELETE requires its own preparation");
+          const selected =
+            containerResult.value !== undefined ? containerResult.value : endpointResult.value;
+          if (selected === undefined)
+            throw new TypeError("v2 Host DELETE preparation resolved without a claim");
+          return selected;
+        },
+      );
+    },
+  });
+}
+
 export function buildApp(ports: AppPorts): App {
   // Configuration is validated before any storage capability is constructed or
   // used. Undefined means the route is intentionally absent; partial is fatal.
@@ -343,6 +522,25 @@ export function buildApp(ports: AppPorts): App {
     );
   }
   const clock = ports.clock ?? (() => new Date());
+  const selectedWorkerEndpointOrigin = ports.v2WorkerEndpointOrigin;
+  const workerEndpointOriginConstruction =
+    selectedWorkerEndpointOrigin === undefined
+      ? undefined
+      : (() => {
+          const sql = ports.sql;
+          const { kind, formUrl, backendId, targetKey, ledger } = selectedWorkerEndpointOrigin;
+          if (kind !== undefined && kind !== "form-v2@1")
+            throw new TypeError("unsupported Worker Endpoint origin construction kind");
+          const inputs = { sql, formUrl, backendId, targetKey, ledger };
+          return Object.freeze({
+            sql,
+            shared: kind === "form-v2@1" ? Object.freeze({ kind, ledger }) : undefined,
+            acceptance:
+              kind === "form-v2@1"
+                ? createWorkerEndpointOriginV2FormRouteAcceptance(inputs)
+                : createWorkerEndpointOriginV2Acceptance(inputs),
+          });
+        })();
   if (ports.hostedBilling) {
     assertHostedBillingComposition(ports.hostedBilling, {
       sql: ports.sql,
@@ -371,26 +569,108 @@ export function buildApp(ports: AppPorts): App {
     randomId,
   });
 
-  const apiKeyAdministration = createApiKeyAdministration({
-    sql: ports.sql,
-    clock,
-    randomId,
-  });
-  const accounts = createAccounts({
-    sql: ports.sql,
-    identity: ports.identity,
-    clock,
-    randomId,
-    apiKeyAdministration,
-  });
-  const takoformV2Host = createTakoformV2Application({
-    sql: ports.sql,
+  const workerRequest = (() => {
+    const selectionSlot = Object.getOwnPropertyDescriptor(ports, "workerRequest");
+    if (selectionSlot === undefined) return undefined;
+    if (!("value" in selectionSlot))
+      throw new TypeError("Worker request selection must be an own data property");
+    const selected: AppPorts["workerRequest"] = selectionSlot.value;
+    if (selected === undefined) return undefined;
+    const originalSlot = Object.getOwnPropertyDescriptor(selected, "originalConsumers");
+    if (originalSlot !== undefined && !("value" in originalSlot))
+      throw new TypeError("original Worker request graph must be an own data property");
+    const financialAuthSlot = Object.getOwnPropertyDescriptor(selected, "financialAuth");
+    if (financialAuthSlot !== undefined && !("value" in financialAuthSlot))
+      throw new TypeError("Worker request Financial Auth port must be an own data property");
+    if (financialAuthSlot?.value !== undefined && originalSlot?.value === undefined)
+      throw new TypeError("Financial Auth port requires its original Worker request graph");
+    if (originalSlot === undefined || originalSlot.value === undefined)
+      return createWorkerRequestConsumers({
+        ...selected,
+        sql: ports.sql,
+        identity: ports.identity,
+        clock,
+        randomId,
+        publicOrigin: ports.publicOrigin,
+        consoleOrigin: ports.consoleOrigin,
+      });
+    const connectionSlot = Object.getOwnPropertyDescriptor(selected, "connection");
+    const clientSlot = Object.getOwnPropertyDescriptor(selected, "client");
+    const realmSlot = Object.getOwnPropertyDescriptor(selected, "realm");
+    const sqlSlot = Object.getOwnPropertyDescriptor(ports, "sql");
+    const clockSlot = Object.getOwnPropertyDescriptor(ports, "clock");
+    const publicOriginSlot = Object.getOwnPropertyDescriptor(ports, "publicOrigin");
+    const consoleOriginSlot = Object.getOwnPropertyDescriptor(ports, "consoleOrigin");
+    if (
+      !connectionSlot ||
+      !("value" in connectionSlot) ||
+      !clientSlot ||
+      !("value" in clientSlot) ||
+      !realmSlot ||
+      !("value" in realmSlot) ||
+      !sqlSlot ||
+      !("value" in sqlSlot) ||
+      !clockSlot ||
+      !("value" in clockSlot) ||
+      !publicOriginSlot ||
+      !("value" in publicOriginSlot) ||
+      !consoleOriginSlot ||
+      !("value" in consoleOriginSlot)
+    )
+      throw new TypeError("original Worker request inputs must be own data properties");
+    const connection: WorkerRequestAppInputs["connection"] = connectionSlot.value;
+    const client: WorkerRequestAppInputs["client"] = clientSlot.value;
+    const realm: WorkerRequestAppInputs["realm"] = realmSlot.value;
+    const sql: AppPorts["sql"] = sqlSlot.value;
+    const originalConsumers: WorkerRequestConsumers = originalSlot.value;
+    const original = readWorkerRequestConsumers(connection);
+    const inputs = readWorkerRequestFinancialInputs(connection);
+    if (
+      originalConsumers !== original ||
+      original.sql !== sql ||
+      original.client !== client ||
+      original.realm !== realm ||
+      inputs.sql !== sql ||
+      inputs.client !== client ||
+      inputs.realm !== realm ||
+      inputs.clock !== clock ||
+      clockSlot.value !== clock ||
+      publicOriginSlot.value !== SHARED_AUTH_STAGING_PROFILE.publicOrigin ||
+      consoleOriginSlot.value !== SHARED_AUTH_STAGING_PROFILE.consoleOrigin
+    )
+      throw new TypeError("original Worker request graph differs from this App");
+    if (financialAuthSlot?.value !== undefined)
+      assertWorkerRequestFinancialAuthConsumerPort(connection, financialAuthSlot.value);
+    return original;
+  })();
+  const apiKeyAdministration =
+    workerRequest?.apiKeyAdministration ??
+    createApiKeyAdministration({
+      sql: ports.sql,
+      clock,
+      randomId,
+    });
+  const accounts =
+    workerRequest?.accounts ??
+    createAccounts({
+      sql: ports.sql,
+      identity: ports.identity,
+      clock,
+      randomId,
+      apiKeyAdministration,
+    });
+  const v2AllowFreshCreateAndUpdate = ports.v2AllowFreshCreateAndUpdate;
+  const v2ApplicationOptions = {
+    sql: workerEndpointOriginConstruction?.sql ?? ports.sql,
     objects: ports.objects,
     accounts,
     publicOrigin: ports.publicOrigin,
     ...(ports.consoleOrigin === undefined ? {} : { consoleOrigin: ports.consoleOrigin }),
     config: ports.v2,
     clock,
+    ...(v2AllowFreshCreateAndUpdate === undefined
+      ? {}
+      : { allowFreshCreateAndUpdate: v2AllowFreshCreateAndUpdate }),
     ...(ports.v2FormFactory === undefined ? {} : { formFactory: ports.v2FormFactory }),
     ...(ports.v2FormSelectionFactory === undefined
       ? {}
@@ -401,7 +681,12 @@ export function buildApp(ports: AppPorts): App {
     ...(ports.v2PrivateInputCustody === undefined
       ? {}
       : { privateInputCustody: ports.v2PrivateInputCustody }),
-  });
+  };
+  const v2HostAcceptance = composeV2HostAcceptances(
+    captureContainerHostAcceptance(ports.v2ContainerHostAcceptance, ports.sql),
+    workerEndpointOriginConstruction?.acceptance,
+  );
+  const takoformV2Host = createTakoformV2Application(v2ApplicationOptions, v2HostAcceptance);
   const integrationE2eCredentialRoute = integrationE2eCredentialAuthority
     ? createIntegrationE2eCredentialAuthority({
         configuration: integrationE2eCredentialAuthority,
@@ -530,8 +815,18 @@ export function buildApp(ports: AppPorts): App {
           providers: ports.providers ?? [],
           resources: inventory,
           deployments,
+          ...(workerEndpointOriginConstruction?.shared === undefined
+            ? {}
+            : { shared: workerEndpointOriginConstruction.shared }),
         })
       : undefined);
+  if (workerEndpointOriginConstruction?.shared !== undefined && originReservations !== undefined) {
+    assertSharedOriginCarrier(
+      originReservations,
+      ports.sql,
+      workerEndpointOriginConstruction.shared.ledger,
+    );
+  }
   if (ports.selfhostTenantRunCredentialAuthority && !originReservations) {
     throw new TypeError(
       "self-host tenant-run credentials require an endpoint reservation authority",
@@ -947,6 +1242,7 @@ export function buildApp(ports: AppPorts): App {
       : {}),
     control,
     dataAi,
+    ...(workerRequest === undefined ? {} : { sharedAuth: workerRequest.sharedAuth }),
     aiAvailable: ports.ai !== undefined,
     takoformV2Host,
     publicOrigin: ports.publicOrigin,
@@ -1136,3 +1432,8 @@ export function createStaticTestTakoformHost(
     ...(options.provision ? { provision: options.provision } : {}),
   });
 }
+
+import {
+  assertWorkerRequestFinancialAuthConsumerPort,
+  type FinancialAuthConsumerPort,
+} from "./financial-auth-consumer.ts";

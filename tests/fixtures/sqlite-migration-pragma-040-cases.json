@@ -1,0 +1,765 @@
+{
+  "format": "sqlite-migration-conformance/1",
+  "form": "https://edge.forms.takoform.com/forms/SQLiteMigrationApplication/0.4.0/",
+  "migrationSetForm": "https://edge.forms.takoform.com/forms/SQLiteMigrationSet/0.4.0/",
+  "setupSql": "CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id)); CREATE INDEX child_parent_idx ON child(parent_id); CREATE TABLE evidence(name TEXT);",
+  "ledgerTable": "migration_history",
+  "cases": [
+    {
+      "id": "table_info-function",
+      "sql": "SELECT * FROM pragma_table_info('child');",
+      "allowed": true,
+      "expectedRows": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "parent_id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ]
+    },
+    {
+      "id": "table_info-statement",
+      "sql": "PRAGMA table_info('child');",
+      "allowed": true,
+      "expectedRows": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "parent_id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ]
+    },
+    {
+      "id": "table_info-selector-equals",
+      "sql": "PRAGMA table_info = 'child';",
+      "allowed": true,
+      "expectedRows": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "parent_id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ]
+    },
+    {
+      "id": "table_info-main-statement",
+      "sql": "PRAGMA main.table_info('child')",
+      "allowed": true,
+      "expectedRows": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "parent_id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ]
+    },
+    {
+      "id": "table_info-main-function",
+      "sql": "SELECT * FROM pragma_table_info('child', 'main')",
+      "allowed": true,
+      "expectedRows": [
+        {
+          "cid": 0,
+          "name": "id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 1
+        },
+        {
+          "cid": 1,
+          "name": "parent_id",
+          "type": "INTEGER",
+          "notnull": 0,
+          "dflt_value": null,
+          "pk": 0
+        }
+      ]
+    },
+    {
+      "id": "table_info-temp",
+      "sql": "SELECT * FROM pragma_table_info('child', 'temp')",
+      "allowed": false
+    },
+    {
+      "id": "table_info-ledger",
+      "sql": "PRAGMA table_info('migration_history')",
+      "allowed": false
+    },
+    {
+      "id": "foreign_key_list-function",
+      "sql": "SELECT * FROM pragma_foreign_key_list('child');",
+      "allowed": true,
+      "expectedRows": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "parent",
+          "from": "parent_id",
+          "to": "id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    {
+      "id": "foreign_key_list-statement",
+      "sql": "PRAGMA foreign_key_list('child');",
+      "allowed": true,
+      "expectedRows": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "parent",
+          "from": "parent_id",
+          "to": "id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    {
+      "id": "foreign_key_list-selector-equals",
+      "sql": "PRAGMA foreign_key_list = 'child';",
+      "allowed": true,
+      "expectedRows": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "parent",
+          "from": "parent_id",
+          "to": "id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    {
+      "id": "foreign_key_list-main-statement",
+      "sql": "PRAGMA main.foreign_key_list('child')",
+      "allowed": true,
+      "expectedRows": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "parent",
+          "from": "parent_id",
+          "to": "id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    {
+      "id": "foreign_key_list-main-function",
+      "sql": "SELECT * FROM pragma_foreign_key_list('child', 'main')",
+      "allowed": true,
+      "expectedRows": [
+        {
+          "id": 0,
+          "seq": 0,
+          "table": "parent",
+          "from": "parent_id",
+          "to": "id",
+          "on_update": "NO ACTION",
+          "on_delete": "NO ACTION",
+          "match": "NONE"
+        }
+      ]
+    },
+    {
+      "id": "foreign_key_list-temp",
+      "sql": "SELECT * FROM pragma_foreign_key_list('child', 'temp')",
+      "allowed": false
+    },
+    {
+      "id": "foreign_key_list-ledger",
+      "sql": "PRAGMA foreign_key_list('migration_history')",
+      "allowed": false
+    },
+    {
+      "id": "index_list-function",
+      "sql": "SELECT * FROM pragma_index_list('child');",
+      "allowed": true,
+      "expectedRows": [
+        {
+          "seq": 0,
+          "name": "child_parent_idx",
+          "unique": 0,
+          "origin": "c",
+          "partial": 0
+        }
+      ]
+    },
+    {
+      "id": "index_list-statement",
+      "sql": "PRAGMA index_list('child');",
+      "allowed": true,
+      "expectedRows": [
+        {
+          "seq": 0,
+          "name": "child_parent_idx",
+          "unique": 0,
+          "origin": "c",
+          "partial": 0
+        }
+      ]
+    },
+    {
+      "id": "index_list-selector-equals",
+      "sql": "PRAGMA index_list = 'child';",
+      "allowed": true,
+      "expectedRows": [
+        {
+          "seq": 0,
+          "name": "child_parent_idx",
+          "unique": 0,
+          "origin": "c",
+          "partial": 0
+        }
+      ]
+    },
+    {
+      "id": "index_list-main-statement",
+      "sql": "PRAGMA main.index_list('child')",
+      "allowed": true,
+      "expectedRows": [
+        {
+          "seq": 0,
+          "name": "child_parent_idx",
+          "unique": 0,
+          "origin": "c",
+          "partial": 0
+        }
+      ]
+    },
+    {
+      "id": "index_list-main-function",
+      "sql": "SELECT * FROM pragma_index_list('child', 'main')",
+      "allowed": true,
+      "expectedRows": [
+        {
+          "seq": 0,
+          "name": "child_parent_idx",
+          "unique": 0,
+          "origin": "c",
+          "partial": 0
+        }
+      ]
+    },
+    {
+      "id": "index_list-temp",
+      "sql": "SELECT * FROM pragma_index_list('child', 'temp')",
+      "allowed": false
+    },
+    {
+      "id": "index_list-ledger",
+      "sql": "PRAGMA index_list('migration_history')",
+      "allowed": false
+    },
+    {
+      "id": "index_info-function",
+      "sql": "SELECT * FROM pragma_index_info('child_parent_idx');",
+      "allowed": true,
+      "expectedRows": [
+        {
+          "seqno": 0,
+          "cid": 1,
+          "name": "parent_id"
+        }
+      ]
+    },
+    {
+      "id": "index_info-statement",
+      "sql": "PRAGMA index_info('child_parent_idx');",
+      "allowed": true,
+      "expectedRows": [
+        {
+          "seqno": 0,
+          "cid": 1,
+          "name": "parent_id"
+        }
+      ]
+    },
+    {
+      "id": "index_info-selector-equals",
+      "sql": "PRAGMA index_info = 'child_parent_idx';",
+      "allowed": true,
+      "expectedRows": [
+        {
+          "seqno": 0,
+          "cid": 1,
+          "name": "parent_id"
+        }
+      ]
+    },
+    {
+      "id": "index_info-main-statement",
+      "sql": "PRAGMA main.index_info('child_parent_idx')",
+      "allowed": true,
+      "expectedRows": [
+        {
+          "seqno": 0,
+          "cid": 1,
+          "name": "parent_id"
+        }
+      ]
+    },
+    {
+      "id": "index_info-main-function",
+      "sql": "SELECT * FROM pragma_index_info('child_parent_idx', 'main')",
+      "allowed": true,
+      "expectedRows": [
+        {
+          "seqno": 0,
+          "cid": 1,
+          "name": "parent_id"
+        }
+      ]
+    },
+    {
+      "id": "index_info-temp",
+      "sql": "SELECT * FROM pragma_index_info('child_parent_idx', 'temp')",
+      "allowed": false
+    },
+    {
+      "id": "index_info-ledger",
+      "sql": "PRAGMA index_info('migration_history')",
+      "allowed": false
+    },
+    {
+      "id": "metadata-case-comments-quotes",
+      "sql": "pRaGmA /* read */ \"TaBlE_InFo\" ('child');",
+      "allowed": true
+    },
+    {
+      "id": "metadata-no-object",
+      "sql": "PRAGMA table_info",
+      "allowed": true
+    },
+    {
+      "id": "catalog-master",
+      "sql": "SELECT name, sql FROM sqlite_master WHERE type='table'",
+      "allowed": true
+    },
+    {
+      "id": "catalog-schema",
+      "sql": "SELECT name FROM main.sqlite_schema",
+      "allowed": true
+    },
+    {
+      "id": "catalog-join-dynamic",
+      "sql": "SELECT m.name, f.\"table\" FROM sqlite_master AS m JOIN pragma_foreign_key_list(m.name) AS f WHERE m.type='table' AND m.name='child'",
+      "allowed": true
+    },
+    {
+      "id": "metadata-cte-subquery",
+      "sql": "WITH cols AS (SELECT name FROM pragma_table_info('child')) SELECT count(*) FROM cols WHERE name IN (SELECT name FROM pragma_index_info('child_parent_idx'))",
+      "allowed": true
+    },
+    {
+      "id": "metadata-hidden-selector",
+      "sql": "SELECT name FROM pragma_table_info WHERE arg='child' AND schema='main'",
+      "allowed": true
+    },
+    {
+      "id": "metadata-in-data-write",
+      "sql": "INSERT INTO evidence SELECT name FROM pragma_table_info('child')",
+      "allowed": true
+    },
+    {
+      "id": "metadata-view",
+      "sql": "CREATE VIEW columns_view AS SELECT name FROM pragma_table_info('child'); SELECT * FROM columns_view",
+      "allowed": true
+    },
+    {
+      "id": "ddl-engine-schema-writes",
+      "sql": "CREATE TABLE new_table (id INTEGER); ALTER TABLE new_table ADD COLUMN note TEXT; DROP TABLE new_table",
+      "allowed": true
+    },
+    {
+      "id": "semicolon-and-keywords-in-strings",
+      "sql": "INSERT INTO evidence VALUES ('PRAGMA foreign_keys=OFF; COMMIT;'); SELECT name FROM sqlite_schema",
+      "allowed": true
+    },
+    {
+      "id": "defer-on",
+      "sql": "PRAGMA defer_foreign_keys = ON;",
+      "allowed": true
+    },
+    {
+      "id": "defer-off",
+      "sql": "PRAGMA defer_foreign_keys = OFF;",
+      "allowed": true
+    },
+    {
+      "id": "defer-true",
+      "sql": "PRAGMA defer_foreign_keys = TRUE;",
+      "allowed": true
+    },
+    {
+      "id": "defer-false",
+      "sql": "PRAGMA defer_foreign_keys = FALSE;",
+      "allowed": true
+    },
+    {
+      "id": "defer-1",
+      "sql": "PRAGMA defer_foreign_keys = 1;",
+      "allowed": true
+    },
+    {
+      "id": "defer-0",
+      "sql": "PRAGMA defer_foreign_keys = 0;",
+      "allowed": true
+    },
+    {
+      "id": "foreign-keys-read",
+      "sql": "PRAGMA foreign_keys",
+      "allowed": false
+    },
+    {
+      "id": "foreign-keys-on",
+      "sql": "PRAGMA foreign_keys=ON",
+      "allowed": false
+    },
+    {
+      "id": "foreign-keys-off",
+      "sql": "PRAGMA foreign_keys=OFF",
+      "allowed": false
+    },
+    {
+      "id": "defer-read",
+      "sql": "PRAGMA defer_foreign_keys",
+      "allowed": false
+    },
+    {
+      "id": "defer-function",
+      "sql": "SELECT * FROM pragma_defer_foreign_keys",
+      "allowed": false
+    },
+    {
+      "id": "defer-parenthesis",
+      "sql": "PRAGMA defer_foreign_keys(ON)",
+      "allowed": false
+    },
+    {
+      "id": "defer-quote",
+      "sql": "PRAGMA defer_foreign_keys=\"ON\"",
+      "allowed": false
+    },
+    {
+      "id": "defer-schema",
+      "sql": "PRAGMA main.defer_foreign_keys=ON",
+      "allowed": false
+    },
+    {
+      "id": "defer-comment",
+      "sql": "PRAGMA defer_foreign_keys /*x*/ = ON",
+      "allowed": false
+    },
+    {
+      "id": "defer-other-value",
+      "sql": "PRAGMA defer_foreign_keys=2",
+      "allowed": false
+    },
+    {
+      "id": "journal-read",
+      "sql": "PRAGMA journal_mode",
+      "allowed": false
+    },
+    {
+      "id": "journal-write",
+      "sql": "PRAGMA journal_mode=WAL",
+      "allowed": false
+    },
+    {
+      "id": "writable-schema",
+      "sql": "PRAGMA writable_schema=ON",
+      "allowed": false
+    },
+    {
+      "id": "writable-schema-read",
+      "sql": "PRAGMA writable_schema",
+      "allowed": false
+    },
+    {
+      "id": "user-version-write",
+      "sql": "PRAGMA user_version=9",
+      "allowed": false
+    },
+    {
+      "id": "foreign-key-check",
+      "sql": "PRAGMA foreign_key_check",
+      "allowed": false
+    },
+    {
+      "id": "table-xinfo",
+      "sql": "PRAGMA table_xinfo(child)",
+      "allowed": false
+    },
+    {
+      "id": "index-xinfo",
+      "sql": "SELECT * FROM pragma_index_xinfo('child_parent_idx')",
+      "allowed": false
+    },
+    {
+      "id": "unknown-pragma",
+      "sql": "PRAGMA unknown_migration_setting=ON",
+      "allowed": false
+    },
+    {
+      "id": "schema-update",
+      "sql": "UPDATE sqlite_master SET sql='broken' WHERE name='child'",
+      "allowed": false
+    },
+    {
+      "id": "schema-delete",
+      "sql": "DELETE FROM sqlite_schema WHERE name='child'",
+      "allowed": false
+    },
+    {
+      "id": "schema-insert",
+      "sql": "INSERT INTO sqlite_master(type,name,tbl_name,rootpage,sql) VALUES('table','bad','bad',0,'bad')",
+      "allowed": false
+    },
+    {
+      "id": "ledger-read",
+      "sql": "SELECT * FROM migration_history",
+      "allowed": false
+    },
+    {
+      "id": "ledger-write",
+      "sql": "INSERT INTO migration_history VALUES('fake')",
+      "allowed": false
+    },
+    {
+      "id": "ledger-drop",
+      "sql": "DROP TABLE migration_history",
+      "allowed": false
+    },
+    {
+      "id": "ledger-alter",
+      "sql": "ALTER TABLE migration_history RENAME TO other",
+      "allowed": false
+    },
+    {
+      "id": "ledger-function",
+      "sql": "SELECT * FROM pragma_table_info('migration_history')",
+      "allowed": false
+    },
+    {
+      "id": "metadata-then-write",
+      "sql": "PRAGMA table_info(child); PRAGMA foreign_keys=OFF",
+      "allowed": false
+    },
+    {
+      "id": "defer-then-write",
+      "sql": "PRAGMA defer_foreign_keys=ON; PRAGMA foreign_keys=OFF",
+      "allowed": false
+    },
+    {
+      "id": "commit",
+      "sql": "COMMIT",
+      "allowed": false
+    },
+    {
+      "id": "begin",
+      "sql": "BEGIN",
+      "allowed": false
+    },
+    {
+      "id": "savepoint",
+      "sql": "SAVEPOINT escape",
+      "allowed": false
+    },
+    {
+      "id": "attach",
+      "sql": "ATTACH ':memory:' AS other",
+      "allowed": false
+    },
+    {
+      "id": "vacuum",
+      "sql": "VACUUM",
+      "allowed": false
+    },
+    {
+      "id": "extension",
+      "sql": "SELECT load_extension('/nonexistent')",
+      "allowed": false
+    },
+    {
+      "id": "view-bypass",
+      "sql": "CREATE VIEW forbidden_view AS SELECT * FROM pragma_foreign_keys; SELECT * FROM forbidden_view",
+      "allowed": false
+    },
+    {
+      "id": "cte-bypass",
+      "sql": "WITH forbidden AS (SELECT * FROM pragma_foreign_keys) SELECT * FROM forbidden",
+      "allowed": false
+    },
+    {
+      "id": "schema-temp",
+      "sql": "SELECT * FROM temp.sqlite_schema",
+      "allowed": false
+    },
+    {
+      "id": "bad-sql",
+      "sql": "SELEC name FROM sqlite_master",
+      "allowed": false
+    },
+    {
+      "id": "dynamic-ledger-introspection",
+      "sql": "SELECT f.* FROM sqlite_master AS m JOIN pragma_table_info(m.name) AS f WHERE m.name='migration_history'",
+      "allowed": false
+    },
+    {
+      "id": "metadata-setting-suffix",
+      "sql": "PRAGMA table_info('child')=OFF",
+      "allowed": false
+    },
+    {
+      "id": "metadata-virtual-write",
+      "sql": "INSERT INTO pragma_table_info(name) VALUES('bad')",
+      "allowed": false
+    },
+    {
+      "id": "metadata-virtual-update",
+      "sql": "UPDATE pragma_index_list SET name='bad'",
+      "allowed": false
+    },
+    {
+      "id": "metadata-virtual-delete",
+      "sql": "DELETE FROM pragma_index_info",
+      "allowed": false
+    },
+    {
+      "id": "hidden-temp-schema",
+      "sql": "SELECT name FROM pragma_table_info WHERE arg='child' AND schema='temp'",
+      "allowed": false
+    },
+    {
+      "id": "explicit-aux-schema",
+      "sql": "PRAGMA other.table_info(child)",
+      "allowed": false
+    },
+    {
+      "id": "dynamic-temp-schema",
+      "sql": "SELECT * FROM pragma_table_info('child', lower('TEMP'))",
+      "allowed": false
+    },
+    {
+      "id": "main-uppercase-statement",
+      "sql": "PRAGMA MAIN.table_info(child)",
+      "allowed": true
+    },
+    {
+      "id": "main-uppercase-function",
+      "sql": "SELECT * FROM PRAGMA_TABLE_INFO('child','MAIN')",
+      "allowed": true
+    },
+    {
+      "id": "null-schema-native-main",
+      "sql": "SELECT * FROM pragma_table_info('child',NULL)",
+      "allowed": true
+    },
+    {
+      "id": "absent-object",
+      "sql": "SELECT * FROM pragma_table_info('missing_object')",
+      "allowed": true
+    },
+    {
+      "id": "pragma-lookalike-in-string",
+      "sql": "SELECT 'pragma_foreign_keys' AS text FROM sqlite_schema LIMIT 1",
+      "allowed": true
+    },
+    {
+      "id": "ledger-index-introspection",
+      "sql": "SELECT * FROM pragma_index_info('sqlite_autoindex_migration_history_1')",
+      "allowed": false
+    },
+    {
+      "id": "temp-alter",
+      "setupSql": "CREATE TEMP TABLE scratch(id INTEGER)",
+      "sql": "ALTER TABLE temp.scratch RENAME TO renamed",
+      "allowed": false
+    },
+    {
+      "id": "attached-metadata",
+      "setupSql": "ATTACH ':memory:' AS other; CREATE TABLE other.remote_table(id INTEGER)",
+      "sql": "SELECT * FROM pragma_table_info('remote_table','other')",
+      "allowed": false
+    },
+    {
+      "id": "attached-catalog",
+      "setupSql": "ATTACH ':memory:' AS other; CREATE TABLE other.remote_table(id INTEGER)",
+      "sql": "SELECT * FROM other.sqlite_schema",
+      "allowed": false
+    },
+    {
+      "id": "implicit-temp-shadow",
+      "setupSql": "CREATE TEMP TABLE child(secret TEXT)",
+      "sql": "SELECT * FROM pragma_table_info('child')",
+      "allowed": false
+    },
+    {
+      "id": "ordinary-table-pragma-prefix",
+      "sql": "CREATE TABLE pragma_notes(value TEXT); INSERT INTO pragma_notes VALUES('ok'); SELECT * FROM pragma_notes",
+      "allowed": true
+    }
+  ],
+  "observations": {
+    "foreignKeysAfter": 1,
+    "deferForeignKeysAfter": 0,
+    "ledgerRowsAfter": 0,
+    "onRejection": "Roll back every user-data/schema change from this file; do not record the file in the Host ledger."
+  },
+  "ledgerTableNote": "migration_history is a fixture name. Adapters must substitute and protect their own ledger identity, including dynamic metadata arguments."
+}

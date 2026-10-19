@@ -14,6 +14,7 @@ const roots = ["src", "scripts", "tests"];
 for (const root of roots) {
   for (const path of walk(root)) {
     if (!path.endsWith(".ts")) continue;
+    checkHostAcceptanceImports(path);
     for (const specifier of importsOf(path)) {
       if (forbidden.test(specifier)) violations.push(`${path}: ${specifier}`);
     }
@@ -52,6 +53,22 @@ interface Layer {
 }
 
 const LAYERS: readonly Layer[] = [
+  {
+    name: "v2-host-acceptance-contract",
+    match: /^src\/takoform-v2\/host-acceptance\.ts$/u,
+    may: ["core", "v2-private"],
+  },
+  {
+    // Fixed Container SQL compiler; its acceptance edge is pinned below.
+    name: "v2-container-owner-schema",
+    match: /^src\/takoform-v2\/container-owner-schema\.ts$/u,
+    may: ["core"],
+  },
+  {
+    name: "worker-endpoint-origin-v2-acceptance-composition",
+    match: /^src\/worker-endpoint-origin-v2-acceptance\.ts$/u,
+    may: ["core", "domain", "v2-contract"],
+  },
   {
     // Candidate SQL grants use portable Form/reference evidence, never Docker.
     name: "v2-container-binding-authority",
@@ -97,7 +114,8 @@ const LAYERS: readonly Layer[] = [
   },
   {
     name: "v2-state",
-    match: /^src\/takoform-v2\/(?:store|worker-invocation-custody|worker-invocation-schema)\.ts$/u,
+    match:
+      /^src\/takoform-v2\/(?:store|configured-update-inputs-schema|worker-invocation-custody|worker-invocation-schema|worker-native-identity-schema)\.ts$/u,
     may: ["core", "v2-contract", "v2-private", "v2-state"],
   },
   {
@@ -105,7 +123,7 @@ const LAYERS: readonly Layer[] = [
     // Portable Form orchestration and the SDK index must not import it.
     name: "v2-sqlite-migration-native",
     match: /^src\/takoform-v2\/forms\/sqlite-migration-application-native\.ts$/u,
-    may: ["v2-form"],
+    may: ["core", "v2-form"],
   },
   {
     name: "v2-form",
@@ -504,7 +522,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "core",
     match:
-      /^src\/(?:ports|json|strict-json|container-contract|container-http|artifact-path|cron|selfhost-socket-layout|error-envelope|route-table|request-authorization|request-lifetime|public-host-identity|form-ref|interface-ref|actor-abi-ref|standard-service-port|worker-class-runtime-port|worker-module-inspection-contract|worker-invocation-port|queue-v2-batch-custody-contract|queue-v2-sqlite-contract|queue-v2-sqlite-physical-fence|workflow-v2-resource-authority|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|stripe-mode-realm|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
+      /^src\/(?:ports|json|strict-json|container-contract|container-http|artifact-path|object-bucket-binding-profile|cron|selfhost-socket-layout|error-envelope|route-table|request-authorization|request-lifetime|public-host-identity|form-ref|interface-ref|actor-abi-ref|standard-service-port|worker-class-runtime-port|worker-module-inspection-contract|worker-invocation-port|queue-v2-batch-custody-contract|queue-v2-sqlite-contract|queue-v2-sqlite-physical-fence|workflow-v2-resource-authority|provider-port|provider-meter-port|provider-runtime-input-port|provider-worker-endpoint-origin|ai-port|database|database-schema|db-schema|migrate-sqlite|sqlite-migration-policy|stripe-mode-realm|vector-index-codec)\.ts$|^src\/takoform\/limits\.ts$/u,
     // Frozen published data sits below every layer: it is bytes a release
     // pinned, not a decision any layer here may make. The wire error taxonomy
     // this Host answers by is exactly that.
@@ -519,7 +537,7 @@ const LAYERS: readonly Layer[] = [
   {
     name: "domain",
     match:
-      /^src\/(?:token|auth|ledger|money|meter-pricing|org-billing|org-usage-summary|org-workspace-usage|org-limit-policy|org-on-demand-terms|org-top-up|shared-financial-action|hosted-billing-realm|hosted-subscription-adapter|stripe-top-up-client|stripe-customer-custody|stripe-card-setup|stripe-on-demand|stripe-on-demand-verification|billing-config|hosted-pricing|hosted-run-pricing|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|provider-placement|provider-runtime-bindings|resource-deployments|resource-execution-evidence|resource-migrations|runtime-input-preparations|queue-custody|actor-class-execution|actor-class-candidate-inspection|actor-resource-graph|worker-endpoint-origin-reservations|selfhost-actor-contract-closure|workflow-instances|workflow-resource-graph|workflow-resource-lifecycle|workflow-data|workflow-driver|workflow-execution|workflow-due-scheduler|workflow-class-execution|workflow-execution-host|artifact-consumer-repair|artifact-recovery|artifact-recovery-owner-gc|exact-artifact-recovery-operator-proof|attachments|reconcile|metering|edge-forms|ai-requests|operator-credentials|integration-e2e-credential-authority|integration-organization-bootstrap|sponsorship-authority|sponsorship-credential|sponsorship-issuance-receipt|tenant-run-credential|tenant-run-principal|form-authority-operator-proof|google-identity|takos-id-identity|shared-auth-oidc-client|shared-auth-session|shared-auth-session-store|identity-setup|stripe-settlement|stripe-events|stripe-billing|stripe-billing-client|stripe-billing-store|subscription-custody|subscription-command-receipts|stripe-subscription-plan-change|payment-events|payment-settings|signing-key|operator-key|ed25519-private-jwk|runtime-grants|takoform-released-provider)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$|host-admission-endpoint\.ts$|integration-operator-endpoint\.ts$|integration-actor-(?:host|form-authority)\.ts$)/u,
+      /^src\/(?:token|auth|auth-authority-schema-plan|auth-principal-schema-plan|auth-rp-storage-schema-plan|credential-authority-class|shared-principal-authority|ledger|money|meter-pricing|org-billing|org-usage-summary|org-workspace-usage|org-limit-policy|org-on-demand-terms|org-top-up|shared-financial-action|hosted-billing-realm|hosted-subscription-adapter|stripe-top-up-client|stripe-customer-custody|stripe-card-setup|stripe-on-demand|stripe-on-demand-verification|billing-config|hosted-pricing|hosted-run-pricing|catalog|catalog-compiler|reseller|metering|provider-driver|provider-pack|provider-metering|provider-placement|provider-runtime-bindings|resource-deployments|resource-execution-evidence|resource-migrations|runtime-input-preparations|queue-custody|actor-class-execution|actor-class-candidate-inspection|actor-resource-graph|worker-endpoint-origin-reservations|selfhost-actor-contract-closure|workflow-instances|workflow-resource-graph|workflow-resource-lifecycle|workflow-data|workflow-driver|workflow-execution|workflow-due-scheduler|workflow-class-execution|workflow-execution-host|artifact-consumer-repair|artifact-recovery|artifact-recovery-owner-gc|exact-artifact-recovery-operator-proof|attachments|reconcile|metering|edge-forms|ai-requests|operator-credentials|integration-e2e-credential-authority|integration-organization-bootstrap|sponsorship-authority|sponsorship-credential|sponsorship-issuance-receipt|tenant-run-credential|tenant-run-principal|form-authority-operator-proof|google-identity|takos-id-identity|shared-auth-oidc-client|shared-auth-session|shared-auth-session-store|identity-setup|stripe-settlement|stripe-events|stripe-billing|stripe-billing-client|stripe-billing-store|subscription-custody|subscription-command-receipts|stripe-subscription-plan-change|payment-events|payment-settings|signing-key|operator-key|ed25519-private-jwk|runtime-grants|takoform-released-provider)\.ts$|^src\/takoform\/(?!routes\.ts$|host\.ts$|host-admission-endpoint\.ts$|integration-operator-endpoint\.ts$|integration-actor-(?:host|form-authority)\.ts$)/u,
     may: ["core", "domain", "release-data"],
   },
   {
@@ -533,7 +551,7 @@ const LAYERS: readonly Layer[] = [
     // `payment-setup` builds the shape the routes layer asks for, which makes
     // it composition rather than domain: it is allowed to know both halves.
     match:
-      /^src\/(?:app|actor-addressing(?:-source)?|actor-upgrade-handoff(?:-source)?|actor-namespace-facade(?:-source)?|actor-native-(?:class-execution|owner-worker|bootstrap-entry|bootstrap-source)|selfhost-actor-(?:execution-host|graph-authority|lease|native-process|upgrade-broker|http-broker|forward-runtime(?:-entry)?|forward-worker-wrapper|forward-brokers|public-runtime)|compat|cloudflare-provider-surface|cloudflare-runtime-binding-materializer|deployment-composition|exact-artifact-recovery-worker|existing-space-operator(?:-proof)?|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|hosted-billing-composition|public-form-(?:implementation-build|runtime)|public-host-form-source|public-worker-implementation|runtime-input-seal-keyring|selfhost-composition|selfhost-container-(?:bootstrap|endpoint-(?:ingress|https))|selfhost-data-planes|selfhost-entry-(?:process-)?shutdown|selfhost-form-authority-composition|selfhost-health(?:-signals)?|selfhost-queue-pump|selfhost-runtime-binding-materializer|selfhost-scheduler|selfhost-startup-instructions|selfhost-tenant-run-credentials|selfhost-workflow-binding-(?:broker|runtime-entry)|selfhost-workflow-execution-host|selfhost-workflow-http-transport|selfhost-workflow-preparation|selfhost-workflow-private-owner|selfhost-workflow-serving|workerd-workflow-preparation|workflow-http-bootstrap-entry|workflow-http-controller|workflow-http-worker|standalone-provider-composition|worker-data-services|worker-(?:production|stable-local)-composition)\.ts$|^src\/generated\/(?:workflow-http-bootstrap|actor-upgrade-handoff-source|actor-namespace-facade-source|actor-addressing-source)\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
+      /^src\/(?:app|actor-addressing(?:-source)?|actor-upgrade-handoff(?:-source)?|actor-namespace-facade(?:-source)?|actor-native-(?:class-execution|owner-worker|bootstrap-entry|bootstrap-source)|selfhost-actor-(?:execution-host|graph-authority|lease|native-process|upgrade-broker|http-broker|forward-runtime(?:-entry)?|forward-worker-wrapper|forward-brokers|public-runtime)|compat|cloudflare-provider-surface|cloudflare-runtime-binding-materializer|deployment-composition|exact-artifact-recovery-worker|existing-space-operator(?:-proof)?|form-authority-(?:identity-probe|public-identity|worker-composition)|integration-form-authority-gateway|hosted-(?:object-bucket|edge)-supplies|object-bucket-deployment|payment-setup|hosted-billing-composition|public-form-(?:implementation-build|runtime)|public-host-form-source|public-worker-implementation|runtime-input-seal-keyring|selfhost-composition|selfhost-container-(?:bootstrap|endpoint-(?:ingress|https))|selfhost-data-planes|selfhost-entry-(?:process-)?shutdown|selfhost-form-authority-composition|selfhost-health(?:-signals)?|selfhost-queue-pump|selfhost-runtime-binding-materializer|selfhost-scheduler|selfhost-startup-instructions|selfhost-tenant-run-credentials|selfhost-workflow-binding-(?:broker|runtime-entry)|selfhost-workflow-execution-host|selfhost-workflow-http-transport|selfhost-workflow-preparation|selfhost-workflow-private-owner|selfhost-workflow-serving|workerd-workflow-preparation|workflow-http-bootstrap-entry|workflow-http-controller|workflow-http-worker|standalone-provider-composition|worker-data-services|worker-(?:production|stable-local|request)-composition)\.ts$|^src\/generated\/(?:workflow-http-bootstrap|actor-upgrade-handoff-source|actor-namespace-facade-source|actor-addressing-source)\.ts$|^src\/takoform\/(?:host-admission-endpoint|integration-operator-endpoint)\.ts$/u,
     may: [
       "core",
       "adapter",
@@ -547,6 +565,11 @@ const LAYERS: readonly Layer[] = [
       "v2-contract",
       "v2-private",
     ],
+  },
+  {
+    name: "app",
+    match: /^src\/worker-request-shared-principal-issuance\.ts$/u,
+    may: ["core", "domain", "app"],
   },
   // An entry chooses concrete implementations — that is its whole job. What it
   // may not do is reach something its host cannot support, which the
@@ -575,13 +598,36 @@ const LAYERS: readonly Layer[] = [
       "v2-worker-wake",
     ],
   },
+  {
+    name: "domain",
+    match: /^src\/auth103-native-source-contract\.ts$/u,
+    may: ["core"],
+  },
+  {
+    name: "app",
+    match: /^src\/auth103-native-(?:origin-source|platform-origin)\.ts$/u,
+    may: ["core", "domain", "app"],
+  },
+  {
+    // The single source Clock recipe is a neutral primitive, not a qualifier.
+    name: "core",
+    match: /^src\/auth103-source-clock\.ts$/u,
+    may: ["core"],
+  },
+  {
+    // These exact request adapters compose actual original-backed ports.
+    name: "app",
+    match:
+      /^src\/(?:financial-auth-consumer|worker-request-financial-auth-original|worker-request-direct-owner-key|worker-request-qualified-local-issuer|worker-request-native-rp-transport)\.ts$/u,
+    may: ["core", "domain", "app"],
+  },
   // The published package surface re-exports the product for an embedder. It
   // states no policy of its own, so it may name anything a consumer is allowed
   // to construct — but it stays below `entry`, which owns a running process.
   {
     name: "package-surface",
     match:
-      /^src\/(?:index|provider-extension|workflow-runtime|workflow-runtime-transport|workflow-runtime-workerd)\.ts$|^src\/takoform\/integration-actor-(?:host|form-authority)\.ts$/u,
+      /^src\/(?:index|provider-extension|financial-request-origin|workflow-runtime|workflow-runtime-transport|workflow-runtime-workerd)\.ts$|^src\/takoform\/integration-actor-(?:host|form-authority)\.ts$/u,
     may: ["core", "adapter", "domain", "routes", "app", "package-surface"],
   },
   {
@@ -606,10 +652,67 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain"],
   },
   {
+    // These exact genesis modules use only portable domain and core inputs.
+    name: "domain",
+    match: /^src\/shared-financial-source-genesis-(?:admission|schema)\.ts$/u,
+    may: ["core", "domain"],
+  },
+  {
+    // This exact composition joins retained custody, the SQL-origin adapter,
+    // and the original request/Financial auth composition.
+    name: "app",
+    match: /^src\/shared-financial-retained-r1\.ts$/u,
+    may: ["core", "domain", "adapter", "app"],
+  },
+  {
+    // Consent codecs and the unregistered history leaf use portable domain ports.
+    name: "domain",
+    match: /^src\/shared-auth-financial-consent-(?:contract|schema-plan)\.ts$/u,
+    may: ["core", "domain"],
+  },
+  {
+    // This exact DATA store consumes the existing request-origin composition.
+    name: "app",
+    match: /^src\/shared-auth-financial-consent-store\.ts$/u,
+    may: ["core", "domain", "app"],
+  },
+  {
+    // Unmounted request observation and consent composition use app ports only.
+    name: "app",
+    match: /^src\/shared-auth-financial-(?:source|consent)\.ts$/u,
+    may: ["core", "domain", "app"],
+  },
+  {
+    // Exact displayed terms join existing R1 app DATA with core/domain tariff facts.
+    name: "app",
+    match: /^src\/financial-displayed-terms\.ts$/u,
+    may: ["core", "domain", "app"],
+  },
+  {
+    // Canonical R1 selection binds app DATA sources without adapter authority.
+    name: "app",
+    match: /^src\/financial-r1-selection-source\.ts$/u,
+    may: ["core", "domain", "app"],
+  },
+  {
     // Retained history storage is separate from its qualified runtime issuer.
     name: "domain",
     match: /^src\/shared-financial-customer-history\.ts$/u,
     may: ["core", "domain"],
+  },
+  {
+    // Finite portable Financial consent and Customer CAS data compilers.
+    name: "domain",
+    match:
+      /^src\/(?:shared-auth-financial-consent-request|shared-financial-(?:consent-data|admission|customer-(?:dispatch|journal)|current-consent-cas))\.ts$/u,
+    may: ["core", "domain"],
+  },
+  {
+    // Request-bound Financial custody joins already selected sources and ports.
+    name: "app",
+    match:
+      /^src\/(?:shared-auth-financial-(?:source|consent|consent-issuer)|shared-financial-customer-tracked-execution|financial-current-consent-customer)\.ts$/u,
+    may: ["core", "domain", "app"],
   },
   {
     // Shared app name policy belongs to the existing origin reservation domain.
@@ -642,6 +745,215 @@ function layerOf(path: string): Layer | undefined {
   return LAYERS.find((layer) => layer.match.test(path));
 }
 
+/** Exact composition roots may carry these types without gaining mint access. */
+function exactHostAcceptanceCompositionTypeEdge(path: string, target: string): boolean {
+  const expected =
+    path === "src/app.ts"
+      ? [
+          "V2HostAcceptance",
+          "V2HostAcceptanceContext",
+          "V2HostAcceptanceScope",
+          "V2HostDeleteAcceptanceContext",
+        ]
+      : path === "src/entry-worker.ts"
+        ? ["V2HostAcceptance"]
+        : undefined;
+  if (
+    expected === undefined ||
+    target !== "src/takoform-v2/host-acceptance.ts" ||
+    localImportsOf(path).filter((candidate) => candidate === target).length !== 1
+  )
+    return false;
+  const names = readFileSync(path, "utf8")
+    .match(
+      /^import\s+type\s+\{([^}]*)\}\s+from\s+(["'])\.\/takoform-v2\/host-acceptance\.ts\2;$/mu,
+    )?.[1]
+    ?.trim()
+    .replace(/,\s*$/u, "")
+    .split(",")
+    .map((name) => name.trim())
+    .sort();
+  return JSON.stringify(names) === JSON.stringify(expected.sort());
+}
+
+/** Reviewed Container consumers: exact named imports, never adapter-wide v2 access. */
+const EXACT_CONTAINER_ADAPTER_IMPORTS: readonly {
+  readonly source: string;
+  readonly target: string;
+  readonly typeOnly: boolean;
+  readonly names: readonly string[];
+}[] = [
+  {
+    source: "src/providers/selfhost-container-entry-contract.ts",
+    target: "src/takoform-v2/host-acceptance.ts",
+    typeOnly: true,
+    names: ["V2HostAcceptance"],
+  },
+  {
+    source: "src/providers/selfhost-container-entry-contract.ts",
+    target: "src/takoform-v2/types.ts",
+    typeOnly: true,
+    names: ["V2Form"],
+  },
+  {
+    source: "src/providers/container-secret-codec.ts",
+    target: "src/takoform-v2/private-inputs.ts",
+    typeOnly: true,
+    names: ["V2PrivateInputKey"],
+  },
+  {
+    source: "src/providers/docker-container-configured-inputs.ts",
+    target: "src/takoform-v2/configured-private-inputs.ts",
+    typeOnly: false,
+    names: [
+      "readV2ConfiguredPrivateInputs",
+      "type V2ConfiguredPrivateInputIdentity",
+      "type V2ConfiguredPrivateInputs",
+    ],
+  },
+  {
+    source: "src/providers/docker-container-configured-inputs.ts",
+    target: "src/takoform-v2/forms/container.ts",
+    typeOnly: false,
+    names: ["isContainerHealthPath", "isContainerImage", "scalarStringWithin"],
+  },
+  {
+    source: "src/providers/docker-container-configured-inputs.ts",
+    target: "src/takoform-v2/private-inputs.ts",
+    typeOnly: true,
+    names: ["V2PrivateInputMap"],
+  },
+  {
+    source: "src/providers/docker-container-configured-inputs.ts",
+    target: "src/takoform-v2/types.ts",
+    typeOnly: true,
+    names: ["V2Execution", "V2Form"],
+  },
+  {
+    source: "src/providers/docker-container-core-owner.ts",
+    target: "src/takoform-v2/configured-private-inputs.ts",
+    typeOnly: false,
+    names: ["readV2ConfiguredPrivateInputs"],
+  },
+  {
+    source: "src/providers/docker-container-core-owner.ts",
+    target: "src/takoform-v2/container-owner-schema.ts",
+    typeOnly: false,
+    names: [
+      "createV2ContainerHostAcceptance",
+      "serializeV2ContainerConfiguredPrivateInputs",
+      "V2_CONTAINER_F2_FORM",
+      "validateV2ContainerF2SensitiveNames",
+    ],
+  },
+  {
+    source: "src/providers/docker-container-core-owner.ts",
+    target: "src/takoform-v2/host-acceptance.ts",
+    typeOnly: true,
+    names: ["V2HostAcceptance", "V2HostAcceptanceContext", "V2HostDeleteAcceptanceContext"],
+  },
+  {
+    source: "src/providers/docker-container-core-owner.ts",
+    target: "src/takoform-v2/types.ts",
+    typeOnly: true,
+    names: ["V2Execution"],
+  },
+];
+
+function exactContainerAdapterImportEdge(path: string, target: string): boolean {
+  const expected = EXACT_CONTAINER_ADAPTER_IMPORTS.find(
+    (entry) => entry.source === path && entry.target === target,
+  );
+  if (
+    expected === undefined ||
+    localImportsOf(path).filter((candidate) => candidate === target).length !== 1
+  )
+    return false;
+  const declarations = [
+    ...readFileSync(path, "utf8").matchAll(
+      /^import\s+(type\s+)?\{([^}]+)\}\s+from\s+(["'])([^"']+)\3;$/gmu,
+    ),
+  ].filter(
+    (entry) => normalize(relative(resolve("."), resolve(dirname(path), entry[4] ?? ""))) === target,
+  );
+  const declaration = declarations[0];
+  if (
+    declarations.length !== 1 ||
+    declaration === undefined ||
+    Boolean(declaration[1]) !== expected.typeOnly
+  )
+    return false;
+  const names = (declaration[2] ?? "")
+    .split(",")
+    .map((name) => name.trim().replace(/\s+/gu, " "))
+    .filter((name) => name !== "");
+  if (names.some((name) => !/^(?:type )?[A-Za-z_$][\w$]*$/u.test(name))) return false;
+  return JSON.stringify(names.sort()) === JSON.stringify([...expected.names].sort());
+}
+
+// These three app modules consume the existing request-origin barrel only for
+// their fixed original-backed readers and currentness guards. This is not a
+// general app -> package-surface dependency or an authority-minting grant.
+const EXACT_RP_FINANCIAL_ORIGIN_IMPORTS: Readonly<Record<string, readonly string[]>> = {
+  "src/shared-auth-financial-consent-store.ts": [
+    "assertFinancialAuthConsumerPort",
+    "assertWorkerRequestFinancialAuthConsumerPort",
+    "captureWorkerRequestFinancialAuthRpRequest",
+    "financialAuthConsumerSourceCurrentness",
+    "readWorkerRequestFinancialAuthConsumerContext",
+    "readWorkerRequestFinancialAuthConsumerPort",
+    "readWorkerRequestFinancialInputs",
+    "readWorkerRequestRetainedRpCapture",
+  ],
+  "src/shared-auth-financial-consent.ts": [
+    "assertFinancialAuthConsumerPort",
+    "assertWorkerRequestFinancialAuthConsumerPort",
+    "captureWorkerRequestFinancialAuthRpRequest",
+    "readWorkerRequestFinancialAuthConsumerContext",
+    "readWorkerRequestFinancialAuthConsumerPort",
+    "readWorkerRequestFinancialInputs",
+    "readWorkerRequestRetainedRpCapture",
+    "type WorkerRequestSql",
+  ],
+  "src/shared-auth-financial-source.ts": [
+    "assertFinancialAuthConsumerPort",
+    "assertWorkerRequestFinancialAuthConsumerPort",
+    "captureWorkerRequestFinancialAuthRpRequest",
+    "readWorkerRequestFinancialAuthConsumerContext",
+    "readWorkerRequestFinancialAuthConsumerPort",
+    "readWorkerRequestFinancialInputs",
+    "readWorkerRequestRetainedRpCapture",
+    "type WorkerRequestSql",
+  ],
+};
+
+function exactRpFinancialOriginImportEdge(path: string, target: string): boolean {
+  if (target !== "src/financial-request-origin.ts") return false;
+  const expected = EXACT_RP_FINANCIAL_ORIGIN_IMPORTS[path];
+  if (expected === undefined) return false;
+  const source = readFileSync(path, "utf8");
+  // Count every literal reference, including export, default/namespace,
+  // dynamic import and require forms that the general graph parser may miss.
+  // These fixed consumers have no dynamic module loading at all.
+  const references = [...source.matchAll(/(["'`])(\.[^"'`]+)\1/gu)].filter(
+    (entry) => normalize(relative(resolve("."), resolve(dirname(path), entry[2] ?? ""))) === target,
+  );
+  if (references.length !== 1 || /\b(?:import|require)\s*\(/u.test(source)) return false;
+  const declarations = [
+    ...source.matchAll(
+      /^import\s+\{([^}]+)\}\s+from\s+(["'])\.\/financial-request-origin\.ts\2;$/gmu,
+    ),
+  ];
+  const declaration = declarations[0];
+  if (declarations.length !== 1 || declaration === undefined) return false;
+  const names = (declaration[1] ?? "")
+    .split(",")
+    .map((name) => name.trim().replace(/\s+/gu, " "))
+    .filter((name) => name !== "");
+  if (names.some((name) => !/^(?:type )?[A-Za-z_$][\w$]*$/u.test(name))) return false;
+  return JSON.stringify(names.sort()) === JSON.stringify([...expected].sort());
+}
+
 for (const path of walk("src")) {
   if (!path.endsWith(".ts") || path.endsWith(".d.ts")) continue;
   const layer = layerOf(path);
@@ -658,6 +970,76 @@ for (const path of walk("src")) {
       violations.push(`${path} (${layer.name}) imports unclassified module ${target}`);
       continue;
     }
+    const exactHostAcceptanceEdge =
+      target === "src/takoform-v2/host-acceptance.ts" &&
+      [
+        "src/takoform-v2/engine.ts",
+        "src/takoform-v2/store.ts",
+        "src/takoform-v2/host.ts",
+        "src/takoform-v2/application.ts",
+        "src/worker-endpoint-origin-v2-acceptance.ts",
+      ].includes(path);
+    const exactContainerHostAcceptanceEdge =
+      path === "src/takoform-v2/container-owner-schema.ts" &&
+      target === "src/takoform-v2/host-acceptance.ts" &&
+      localImportsOf(path).filter((candidate) => candidate === target).length === 1 &&
+      /^import\s*\{\s*prepareV2HostAcceptance\s*,\s*type\s+V2HostAcceptance\s*,\s*type\s+V2HostAcceptanceContext(?:\s*,\s*type\s+V2HostDeleteAcceptanceContext)?\s*,?\s*\}\s*from\s+["']\.\/host-acceptance\.ts["'];$/mu.test(
+        readFileSync(path, "utf8"),
+      );
+    // The operator SDK exposes the existing compiler constructor from this
+    // exact barrel. Recipes, readiness SQL and mint primitives stay private;
+    // this does not give the extension layer a general schema dependency.
+    const exactContainerConstructionExportEdge =
+      path === "src/takoform-v2/index.ts" &&
+      target === "src/takoform-v2/container-owner-schema.ts" &&
+      localImportsOf(path).filter((candidate) => candidate === target).length === 1 &&
+      /^export\s*\{\s*createV2ContainerHostAcceptance\s*,?\s*\}\s*from\s+["']\.\/container-owner-schema\.ts["'];$/mu.test(
+        readFileSync(path, "utf8"),
+      );
+    // This fixed receiver reuses only the owning Deployment parser/error.
+    // No general v2-form edge, re-export, namespace or dynamic import is allowed.
+    const exactOriginDeploymentParserEdge =
+      path === "src/worker-endpoint-origin-v2-acceptance.ts" &&
+      target === "src/takoform-v2/forms/worker-specs.ts" &&
+      localImportsOf(path).filter((candidate) => candidate === target).length === 1 &&
+      /import\s*\{\s*parseWorkerDeploymentSpec\s*,\s*WorkerFormValidationError\s*,?\s*\}\s*from\s+["']\.\/takoform-v2\/forms\/worker-specs\.ts["'];/u.test(
+        readFileSync(path, "utf8"),
+      );
+    const exactWorkerEndpointOriginConstructionEdge =
+      path === "src/app.ts" &&
+      target === "src/worker-endpoint-origin-v2-acceptance.ts" &&
+      localImportsOf(path).filter((candidate) => candidate === target).length === 1 &&
+      /import\s*\{\s*createWorkerEndpointOriginV2Acceptance\s*(?:,\s*createWorkerEndpointOriginV2FormRouteAcceptance\s*,?)?\s*\}\s*from\s+["']\.\/worker-endpoint-origin-v2-acceptance\.ts["'];/u.test(
+        readFileSync(path, "utf8"),
+      );
+    const originPublicationExports = readFileSync(path, "utf8").match(
+      /export\s*\{([^}]*)\}\s*from\s+["']\.\/worker-endpoint-origin-v2-acceptance\.ts["'];/u,
+    )?.[1];
+    const exactOriginPublicationExtensionEdge =
+      path === "src/provider-extension.ts" &&
+      target === "src/worker-endpoint-origin-v2-acceptance.ts" &&
+      localImportsOf(path).filter((candidate) => candidate === target).length === 1 &&
+      JSON.stringify(
+        originPublicationExports
+          ?.split(",")
+          .map((name) => name.trim().replace(/^type\s+/u, ""))
+          .filter((name) => name !== "")
+          .sort(),
+      ) ===
+        JSON.stringify(
+          [
+            "createWorkerEndpointOriginV2FormRouteAcceptance",
+            "createWorkerEndpointOriginV2FormRoutePublication",
+            "createWorkerEndpointOriginV2Publication",
+            "WorkerEndpointOriginV2FormRouteDeploymentResult",
+            "WorkerEndpointOriginV2FormRouteEndpointResult",
+            "WorkerEndpointOriginV2FormRouteNativeRows",
+            "WorkerEndpointOriginV2FormRoutePreparation",
+            "WorkerEndpointOriginV2FormRoutePublication",
+            "WorkerEndpointOriginV2Publication",
+            "WorkerEndpointOriginV2PublicationPreparation",
+          ].sort(),
+        );
     // This Host-only callback carries the exact accepted execution into
     // private lifecycle readbacks. Permit only this single type-only edge;
     // do not widen the general self-host composition layer to v2-contract.
@@ -729,6 +1111,15 @@ for (const path of walk("src")) {
         );
     if (
       !layer.may.includes(targetLayer.name) &&
+      !exactHostAcceptanceEdge &&
+      !exactHostAcceptanceCompositionTypeEdge(path, target) &&
+      !exactContainerHostAcceptanceEdge &&
+      !exactContainerConstructionExportEdge &&
+      !exactContainerAdapterImportEdge(path, target) &&
+      !exactRpFinancialOriginImportEdge(path, target) &&
+      !exactOriginDeploymentParserEdge &&
+      !exactWorkerEndpointOriginConstructionEdge &&
+      !exactOriginPublicationExtensionEdge &&
       !exactExecutionTypeEdge &&
       !exactLinuxContainerEgressPolicyEdge &&
       !exactQueueProviderExtensionEdge &&
@@ -1081,6 +1472,49 @@ function importsOf(path: string): readonly string[] {
   return [...source.matchAll(/(?:from\s+|import\s*\(|import\s+)(["'])([^"']+)\1/gu)]
     .map((match) => match[2])
     .filter((specifier): specifier is string => specifier !== undefined);
+}
+
+/** Only fixed SQL compilers may mint; Host/Form hooks cannot supply statements. */
+function checkHostAcceptanceImports(path: string): void {
+  const source = readFileSync(path, "utf8");
+  const owners = [
+    "src/takoform-v2/host-acceptance.ts",
+    "src/worker-endpoint-origin-v2-acceptance.ts",
+    "src/takoform-v2/container-owner-schema.ts",
+  ];
+  // White-box Core/App boundary tests construct hostile and neutral witnesses.
+  // This names only those two tests; runtime callers remain the fixed compilers.
+  const whiteBoxTests = [
+    "tests/takoform-v2-host-delete-acceptance.test.ts",
+    "tests/v2-container-endpoint-app-composition.test.ts",
+  ];
+  const mayMint = owners.includes(path) || whiteBoxTests.includes(path);
+  if (
+    path !== "scripts/check-imports.ts" &&
+    /\bprepareV2HostAcceptance\b/u.test(source) &&
+    !mayMint
+  ) {
+    violations.push(
+      `${path}: prepared Host acceptance mint belongs only to fixed source compilers`,
+    );
+  }
+  const target = "src/takoform-v2/host-acceptance.ts";
+  const references = localImportsOf(path).filter((value) => value === target);
+  if (references.length === 0) return;
+  const named = [
+    ...source.matchAll(/import\s+(?:type\s+)?\{([^}]*)\}\s+from\s+(["'])([^"']+)\2/gu),
+  ].filter(
+    (value) => normalize(relative(resolve("."), resolve(dirname(path), value[3] ?? ""))) === target,
+  );
+  if (!mayMint && named.some((value) => /\bprepareV2HostAcceptance\b/u.test(value[1] ?? "")))
+    violations.push(
+      `${path}: prepared Host acceptance mint import is private to fixed source compilers`,
+    );
+  if (named.length !== references.length) {
+    violations.push(
+      `${path}: Host acceptance contract permits named imports only, no re-export or namespace/dynamic access`,
+    );
+  }
 }
 
 /** Repository-relative paths of the in-repo modules a file imports. */

@@ -246,6 +246,10 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/worker-closure-transition.ts",
         "scripts/deploy/worker-live.ts",
         "scripts/deploy/realized-config.ts",
+        "scripts/deploy/target.ts",
+        "scripts/deploy/schema-money-unit-owner.ts",
+        "scripts/deploy/qualification.ts",
+        "scripts/deploy/worker-state.ts",
         "scripts/deploy/signing.ts",
         "scripts/deploy/wrangler-state.ts",
       ],
@@ -255,36 +259,84 @@ export const DEPLOY_CONTRACT = {
         "CLOUDFLARE_API_TOKEN",
         "TAKOSERVER_INDEPENDENT_REVIEW",
         "TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY",
+        "TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH",
+        "TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_SELECTION_PATH",
+        "TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_REPAIR_SELECTION_PATH",
       ],
       triggers: ["irreversible", "authority"],
       obligations: {
         provenance:
-          `${exactSource} Integration-only first publication. Qualify the source once, then seal the ` +
-          "exact normal Host artifact, configuration and initial secret-name closure before one lifecycle deploy.",
+          `${exactSource} Integration-only first publication or explicit original-maintenance successor repair. Normal Host profile: qualify the source once, then seal the ` +
+          "exact normal Host artifact, configuration and initial secret-name closure before one lifecycle deploy. " +
+          "The explicit original-maintenance profile uses the two original locator inputs, not caller-supplied " +
+          "proof or ready JSON. It requires native original92 custody and the exact current physical D1/R2 pair; " +
+          "the locally clean exact commit is re-fenced after the gate and build, before the sole lifecycle, " +
+          "at its final callback, after cleanup and before terminal custody. The same source/artifact/native " +
+          "Version binding must remain exact throughout; no remote-publication requirement is added to this profile. " +
+          "Only integration --apply with --repair-original-money-maintenance selects same-Worker successor repair. " +
+          "Its repair selection is DATA: original source commit and dispatch digest remain immutable, and the " +
+          "owner captures the exact native predecessor Version/deployment and historical maintenance closure. " +
+          "The successor belongs to the selected current source commit; neither the flag nor locator JSON grants authority.",
         "post-conditions":
-          "Authoritative history must identify the acknowledged first Version with no predecessor; source, " +
+          "First publication: Authoritative history must identify the acknowledged first Version with no predecessor; source, " +
           "module, bindings, settings, source-declared cron schedule and secret inventory must exactly match " +
           "the selected target and artifact. " +
-          "The public product probe must succeed at its exact account-owned workers.dev origin. No zone route " +
-          "or custom domain is adopted. This is a public Host component, not a customer ModuleWorker.",
+          "Normal Host profile: the public product probe must succeed at its exact account-owned workers.dev origin. " +
+          "The explicit original-maintenance profile instead requires the exact maintenance 503 before App " +
+          "construction and scheduled no-op, with its source-owned empty-secret native closure. The existing " +
+          "readonly source-identity RPC remains available; this does not qualify normal Host readiness, " +
+          "signing or private/external writers. First publication is not a freeze or a global quiescence proof; " +
+          "the later Money cutover still requires the complete private/native old-writer inventory before " +
+          "freeze, backups or conversion. No zone route or custom domain is adopted. " +
+          "This is a public Host component, not a customer ModuleWorker. " +
+          "Explicit original-maintenance repair instead publishes ONE successor for the same selected Worker, " +
+          "with the captured native predecessor re-fenced before publication. Exact source/module/bindings/settings/" +
+          "schedule/empty-secret readback and the strict 503-before-App probe must match the corrected maintenance " +
+          "closure. A separate repair receipt is recorded only after cleanup and final fences; the original " +
+          "dispatch and its acknowledgement are never rewritten or replayed.",
         reversal:
-          "There is no predecessor to roll back to. Keep the old staging target unchanged; inspect the new " +
-          "Worker and use an explicitly selected ordinary lifecycle for forward repair, never replay bootstrap.",
+          "First-publication profile: There is no predecessor to roll back to. Keep the old staging target unchanged; inspect the new " +
+          "Worker and use an explicitly selected ordinary lifecycle for forward repair, never replay bootstrap. " +
+          "Original-maintenance dispatch or terminal custody also refuses a new bootstrap slot; " +
+          "status never repairs or terminalizes an unknown original acknowledgement. Successor repair does not " +
+          "re-open the original bootstrap slot or automatically restore the historical invalid maintenance closure.",
         "failure-handling":
-          "Existing or partial Worker state refuses apply, even after a prior successful bootstrap. " +
+          "First publication: Existing or partial Worker state refuses apply, even after a prior successful bootstrap. " +
           "Acknowledgement loss is indeterminate; status is read-only and never reads initial secret bytes. " +
           "The command never retries, rotates secrets or changes storage/signing registration. The temporary " +
           "secret file cleanup is attempted on every exit; failure reports potentially retained material. " +
-          "TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY supplies only " +
-          "the exact target-derived initial secrets for apply; it is never passed to the build." +
+          "For normal Host apply only, TAKOSERVER_WORKER_CLOSURE_SECRET_DIRECTORY supplies only " +
+          "the exact target-derived initial secrets for apply; it is never passed to the build. " +
+          "requiresEnv lists profile-dependent inputs: TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH " +
+          "and TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_SELECTION_PATH must be selected together for the explicit " +
+          "original-maintenance route. This route neither reads the normal secret directory nor a registered " +
+          "signing row/private input, and creates no signing row, secret or business/queue effect. Its plain " +
+          "declared signing key ID is unused DATA, not signing qualification. Original publication terminal " +
+          "custody is written only after cleanup succeeds and final source/native/503 fences still match. " +
+          "For explicit same-Worker repair only, TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_REPAIR_SELECTION_PATH " +
+          "must accompany both original locators; an ambient repair locator without the flag is refused. " +
+          "Known repair dispatch/receipt state and unknown publication acknowledgement both refuse resend. " +
+          "No status action repairs, invents custody or turns missing readback into success." +
           inputContract(applyReviewInput),
         "pre-mutation-proof":
-          "Deployment history, exhaustive script, route and custom-domain inventories must prove the exact " +
-          "Worker absent before and after qualification and at the final fence. The target must have a " +
+          "First publication: Deployment history, exhaustive script, route and custom-domain inventories must prove the exact " +
+          "Worker absent before and after qualification and at the final fence. Normal Host profile: the target must have a " +
           "complete schema, exact R2 identity, valid runtime composition, active registered signing public " +
           "key matching the owned private input, and ready provider qualification. Signing and provider " +
           "state are rechecked before mutation. Only the account-owned workers.dev origin with no aliases " +
-          "is accepted; preview URLs remain disabled.",
+          "is accepted; preview URLs remain disabled. The normal profile retains its existing 0094 Money schema " +
+          "requirement. The explicit original-maintenance first-publication profile instead requires the exact complete current " +
+          "original92 schema and migration seeds, unserved-data proof, original creator custody and exact R2 " +
+          "identity. It publishes only the maintenance mode and source-owned empty-secret profile; normal " +
+          "runtime composition, active registered signing and ready provider qualification are not claimed " +
+          "by this branch. For that first-publication profile, native selected-Worker absence and exact source/module/binding/epoch/settings/schedule " +
+          "closure remain mandatory. The actual account-owned workers.dev origin must match the selected new " +
+          "Worker and current native account subdomain, with no aliases. Explicit same-Worker repair requires " +
+          "original native custody/current original92 and the exact already-published predecessor history, " +
+          "annotation, module and historical binding/secret closure; no absence proof or normal Worker JIT " +
+          "profile substitutes for that native predecessor fence. Original storage/source identity and the " +
+          "selected corrected successor source/artifact closure remain mandatory; no DB/signing/secret write " +
+          "or writer-freeze qualification is introduced.",
         "independent-review": review,
       },
     },
@@ -1065,25 +1117,34 @@ export const DEPLOY_CONTRACT = {
         "CLOUDFLARE_API_TOKEN",
         "TAKOSERVER_INDEPENDENT_REVIEW",
         "TAKOSERVER_DEPLOY_TARGET_PRODUCTION",
+        "TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH",
       ],
       triggers: ["irreversible", "authority"],
       obligations: {
         provenance:
           `${exactSource} Integration only. One explicit --generation=<32-lowercase-hex> derives ` +
-          "both new resource names as integration-takoserver-<generation>. The scoped migration gate runs once; " +
+          "both new resource names as integration-takoserver-<generation> by default. The optional " +
+          "TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH selects only the existing integration-ts " +
+          "original fresh92 creator using bounded protected custody locators and the exact six-field invocation; " +
+          "it derives integration-ts-<generation> names and never reads or forwards the production target. " +
+          "The scoped migration gate runs once; " +
           "the default fixed audited 0001-0066 names and bytes, or one explicit fixed " +
           "--fresh-lineage=v2-artifacts-0075, v2-0088, v2-0089, v2-0091 or v2-0092 payload (v2-0088/v2-0089 are the " +
           "same fixed-digest payloads as the production fresh-init profiles; v2-0091 (through the Stripe event table) and v2-0092 (through the Organization wallet lifecycle tables) are " +
           "staging-only and no production surface accepts them), are sealed before creation. A separately " +
           "digested import file preserves every migration byte and adds only Wrangler's migration-ledger DDL and inserts. " +
-          "Every newly created D1 must be integration-takoserver-<generation> and never production-named; when " +
+          "Every newly created D1 must have its selected integration-prefixed name and never be production-named; in default mode, when " +
           "TAKOSERVER_DEPLOY_TARGET_PRODUCTION is set its exact D1 name and id are refused before creation and again once the new id " +
-          "is known, and applying v2-0091 or v2-0092 requires that production target.",
+          "is known, and applying v2-0091 or v2-0092 requires that production target. " +
+          "Original fresh92 mode instead retains the independently provisioned custody root device/inode pin, " +
+          "original incumbent collision identities and the existing source/review/native readback fences; no supplied receipt or ready flag is accepted.",
         "post-conditions":
           "The invocation creates one D1 database, proves it empty, applies and reads back the exact " +
           "selected 0001-0066, 0001-0075, 0001-0088, 0001-0089, 0001-0091 or 0001-0092 lineage and canonical schema after one Wrangler file import " +
           "(v2-0088/v2-0089/v2-0091/v2-0092 also read back the exact empty seeded data and ledger count), then creates and reads back one new R2 bucket. " +
-          "Status and apply record which production D1 identity the guard compared. " +
+          "Default status and apply record which production D1 identity the guard compared. " +
+          "Original fresh92 apply retains its existing dispatch/ACK/import/R2/terminal chain; its originalCreate " +
+          "result requires independent origin review, and status is diagnostic-only, never original creation evidence or money/normal Worker readiness. " +
           "It emits a nonsecret candidate storage projection, not an adopted target. No Worker, " +
           "route, namespace, secret or current target is changed.",
         reversal:
@@ -1096,7 +1157,10 @@ export const DEPLOY_CONTRACT = {
           "readback for separate owner review but cannot re-import, adopt or repair it. " +
           "A selected exact legacy takoserver-i-<generation> pair remains readable by status; " +
           "same-generation legacy apply is refused before credentials or provider access, " +
-          "and both create fences require the new integration-prefixed pair." +
+          "and both create fences require the new integration-prefixed pair. " +
+          "The optional original-create locator file is owned single-link 0600, bounded to 16 KiB under an existing " +
+          "canonical owned 0700 root outside every checkout; unsupported selectors refuse before target or provider access. " +
+          "Original mode retains uncertain custody without retry, adoption or automatic repinning; --contract opens no input." +
           inputContract(applyReviewInput),
         "pre-mutation-proof":
           "Both derived names must be absent at inspection and at the creation fence. The new D1 " +
@@ -1516,6 +1580,8 @@ export const DEPLOY_CONTRACT = {
         "migrations",
         "scripts/deploy/artifact-blob-io-compatibility.ts",
         "scripts/deploy/schema.ts",
+        "scripts/deploy/schema-auth103-native-source.ts",
+        "scripts/deploy/auth103-native-source.ts",
         "scripts/deploy/schema-money-unit-cutover.ts",
         "scripts/deploy/schema-money-unit-owner.ts",
         "scripts/deploy/schema-0058-proof.ts",
@@ -1534,15 +1600,33 @@ export const DEPLOY_CONTRACT = {
         "TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH",
         "TAKOSERVER_ARTIFACT_BLOB_IO_QUIESCENCE_RECEIPT_PATH",
         "TAKOSERVER_DEPLOY_TARGET_PRODUCTION",
+        "TAKOSERVER_AUTH103_INSTALL_CUSTODY_DIRECTORY",
         "TAKOSERVER_D1_MONEY_CUTOVER_DECLARATION_PATH",
       ],
       triggers: ["irreversible", "authority"],
       obligations: {
         provenance:
+          "Separate integration-only 0103 selection requires the original audited100 predecessor, " +
+          "machine-equal owner101/102/full103 source, exact all-traffic pre-auth103-quiesced source-built " +
+          "Worker/native binding closure and original sealed build contribution. One fixed import " +
+          "contains unchanged101/102/103, their ledger inserts, independent RP enrollment, deployment " +
+          "original and mandatory last receipt. Its first/final SQL guards recheck original100 and " +
+          "owned103 catalog/source/Clock in the same transaction. The ordinary audited100 projection, " +
+          "Money suffix, fresh payloads and previous apply ceilings are unchanged. No registration " +
+          "alone qualifies a request, credential, distinct user or Financial admission. " +
+          "Optional fresh-origin input: TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH " +
+          "selects the existing protected custody locator reader only for integration 0093/0094. " +
+          "The same money declaration then requires originalOrigin with the original exact six-field " +
+          "integration-ts/fresh92 invocation and originalTargetPath; neither a receipt, ready flag, " +
+          "legacy certificate nor a read-only selector can register writer options. The same native " +
+          "original creator/verifier binds immutable fixed92 custody/source to the current exact " +
+          "account/D1 UUID/name/R2 pair. Current phase schema is separately proved by this owner; " +
+          "independent-origin-review-required remains explicit. Absent this optional input, legacy " +
+          "declaration/certificate semantics are unchanged and no original locator is read. " +
           `${exactSource} Rehearsal and production accept only the fixed next boundaries 0022, 0028, ` +
           "0033, 0036, 0043, 0044, 0045, 0046, 0047, 0048, 0049, 0050, 0051, 0052, 0053, 0054, 0055, 0056, 0057 or status-only 0058. The exact predecessor lineage, selected through-prefix and wave " +
           "bytes are checked against their fixed SHA-256 inventory, digested and sealed before the " +
-          "forward-only apply. The current audited source inventory is exactly 0001-0094; the qualified integration 0088-to-0092 wave uses only its frozen 92-file projection and does not qualify 0093 or 0094. Separate integration-only 0093 preparation and 0094 money-unit phases require an owned declaration from TAKOSERVER_D1_MONEY_CUTOVER_DECLARATION_PATH, a reviewed positive staging-origin certificate and native identity readback, a source-proved non-serving public Host, persistent financial write fences, verified protected full backup and exact money preimages, reviewed lot classifications, and phase-specific independent review. They never read production target settings and never widen a fresh or legacy apply ceiling. Exact old-fence removal, unchanged audited SQL and ledger insert, and replacement fences use one sealed D1 /import with durable no-overwrite dispatch custody. The ordinary existing-target ceiling remains 0066, the fresh-empty production path remains 0069, and the separate fresh v2 artifact generation remains 0075. An explicit integration-only 0066-to-0088 selector requires canonical intermediate shapes, a closed 0068 invocation epoch, no affected v2 data, exact non-serving public Host and private CPE publisher proof, source-compatible historical predecessors and same-owner publication leases; no other selector inherits this authority. The separate integration-only 0088-to-0092 selector requires the fixed audited 92-file digest, canonical exact 88 predecessor, an original v2-0088 generated D1/R2 target distinct from the read-only production D1 identity, and a bounded value-free preservation digest of ledger, lots and allocations. It seals 0089-0092 plus ledger inserts into one D1 file import; it does not change the fresh v2-0088 payload or enable Worker publication by marker alone. Before applying, the private canonical owner must independently prove all pending publication attempts terminal or GET-recovered, retain frozen historical Version and native settings evidence, and qualify the current 88 dependency state with 92-capable inspector, gateway, Tail, Host and CPE owner code. It must then prove actual exact 92 dependency readback after mutation. Separate integration-only in-place 0063 to 0064, 0064 to 0065 and 0065 to 0066 waves follow their exact predecessors. The 0065 to 0066 Actor KV capability claim transition accepts only its audited additive suffix and canonical 0065 predecessor. A fresh integration storage generation uses the apply-qualified 0001-0066 lineage. Protected mutation remains capped at 0057; 0058 inspects an exact canonical 0057 predecessor but cannot apply until real owner evidence exists. " +
+          "forward-only apply. The current audited source inventory is exactly 0001-0094; the qualified integration 0088-to-0092 wave uses only its frozen 92-file projection and does not qualify 0093 or 0094. Separate integration-only 0093 preparation and 0094 money-unit phases require an owned declaration from TAKOSERVER_D1_MONEY_CUTOVER_DECLARATION_PATH, a reviewed legacy staging-origin certificate or the explicit genuine original fresh92 custody branch, native identity readback, a source-proved non-serving public Host, persistent financial write fences, verified protected full backup and exact money preimages, reviewed lot classifications, and phase-specific independent review. They never read production target settings and never widen a fresh or legacy apply ceiling. Exact old-fence removal, unchanged audited SQL and ledger insert, and replacement fences use one sealed D1 /import with durable no-overwrite dispatch custody. The ordinary existing-target ceiling remains 0066, the fresh-empty production path remains 0069, and the separate fresh v2 artifact generation remains 0075. An explicit integration-only 0066-to-0088 selector requires canonical intermediate shapes, a closed 0068 invocation epoch, no affected v2 data, exact non-serving public Host and private CPE publisher proof, source-compatible historical predecessors and same-owner publication leases; no other selector inherits this authority. The separate integration-only 0088-to-0092 selector requires the fixed audited 92-file digest, canonical exact 88 predecessor, an original v2-0088 generated D1/R2 target distinct from the read-only production D1 identity, and a bounded value-free preservation digest of ledger, lots and allocations. It seals 0089-0092 plus ledger inserts into one D1 file import; it does not change the fresh v2-0088 payload or enable Worker publication by marker alone. Before applying, the private canonical owner must independently prove all pending publication attempts terminal or GET-recovered, retain frozen historical Version and native settings evidence, and qualify the current 88 dependency state with 92-capable inspector, gateway, Tail, Host and CPE owner code. It must then prove actual exact 92 dependency readback after mutation. Separate integration-only in-place 0063 to 0064, 0064 to 0065 and 0065 to 0066 waves follow their exact predecessors. The 0065 to 0066 Actor KV capability claim transition accepts only its audited additive suffix and canonical 0065 predecessor. A fresh integration storage generation uses the apply-qualified 0001-0066 lineage. Protected mutation remains capped at 0057; 0058 inspects an exact canonical 0057 predecessor but cannot apply until real owner evidence exists. " +
           "Integration may select one audited wave or a separately qualified existing-data additive " +
           "transition; selected integration reports evidenceClass integration-protected-wave, " +
           "never writes rehearsal receipts, and is never production evidence. The 0022 selector is a one-time exact 0016-to-0022 " +
@@ -1579,7 +1663,16 @@ export const DEPLOY_CONTRACT = {
           "There is no down migration. A separately reviewed preconversion abandon can remove only the owned freeze while retaining non-serving Host admission; it cannot run after 0094 or an indeterminate conversion dispatch and never automatically reactivates old cents code. Failure is repaired forward from authoritative D1 lineage, schema shape and protected wallet-row readback. The original 0088 artifact is not qualified as the 0092 successor; hold current USD-micros Worker publication until a separately qualified 0093/0094 cutover produces complete canonical 0094 schema and money-unit policy with matching private dependencies.",
         "failure-handling":
           highRiskFailure +
+          " Auth103 requires original owned0700 TAKOSERVER_AUTH103_INSTALL_CUSTODY_DIRECTORY, " +
+          "a no-overwrite dispatch record before the single import and retained sealed bytes. " +
+          "After any dispatch, unknown acknowledgement is GET-only even if original100 remains; " +
+          "a JS post-commit failure never claims rollback and no automatic replay/restore exists. " +
           inputContract(applyReviewInput, rehearsalReceiptInput) +
+          " The optional original-create input is never required by legacy or ordinary schema modes. " +
+          "When present only exact integration 0093/0094 money invocation can consume it; unsupported " +
+          "selection refuses before target/provider access and --contract opens no input. Fresh money " +
+          "declaration and original collision target are owned single-link bounded 0600 held reads " +
+          "under private0700 roots, rechecked with their original custody before dispatch and after import. " +
           " Every rehearsal wave after the first also requires " +
           "TAKOSERVER_D1_PREDECESSOR_REHEARSAL_RECEIPT_PATH; its exact canonical bytes are " +
           "SHA-256-linked into the next receipt. One target-D1 kernel lease spans attempt creation, " +

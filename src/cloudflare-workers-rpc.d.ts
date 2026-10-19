@@ -1,4 +1,6 @@
 declare module "cloudflare:workers" {
+  /** Actual Worker programs use the platform declaration; portable code must inspect it. */
+  export const env: unknown;
   export abstract class WorkerEntrypoint<Env = unknown> {
     protected readonly env: Env;
   }

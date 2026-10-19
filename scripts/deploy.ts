@@ -1,5 +1,5 @@
 import { closeSync, constants, fstatSync, openSync, readFileSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { API_KEY_SCOPES, type ApiKeyScope } from "../src/auth.ts";
 import { runConsole } from "./deploy/console.ts";
 import { DEPLOY_CONTRACT } from "./deploy/contract.ts";
@@ -26,7 +26,11 @@ import {
 } from "./deploy/integration-money-shadow-native-probe.ts";
 import { runIntegrationOrganizationBootstrap } from "./deploy/integration-organization-bootstrap.ts";
 import { runIntegrationStorageDisposal } from "./deploy/integration-storage-disposal.ts";
-import { runIntegrationStorageGeneration } from "./deploy/integration-storage-generation.ts";
+import {
+  type IntegrationStorageGenerationInvocation,
+  loadIntegrationStorageOriginalCreateInput,
+  runIntegrationStorageGeneration,
+} from "./deploy/integration-storage-generation.ts";
 import { runIntegrationWorkerBootstrap } from "./deploy/integration-worker-bootstrap.ts";
 import { runOrgApiKey } from "./deploy/org-api-key.ts";
 import { requireEnvironment } from "./deploy/process.ts";
@@ -83,12 +87,24 @@ const USAGE = `takoserver deploy
     --retired-target=/absolute/old-target.json --retired-deployment=<uuid> --retired-version=<uuid>
     (one replaced public Host only; never deletes storage or forces associated binding removal)
   bun run deploy -- takoserver-integration-worker-bootstrap --<status|apply> --environment=integration --commit=<sha>
-    (first public Host publication only; existing Workers use their normal lifecycle)
+    (first public Host publication only; existing normal Hosts use their normal lifecycle)
+  bun run deploy -- takoserver-integration-worker-bootstrap --apply --environment=integration --commit=<sha>
+    --repair-original-money-maintenance (same original-maintenance Worker successor only;
+    requires the original-create, maintenance-selection and repair-selection locators; never replays bootstrap)
   bun run deploy -- takoserver-sponsorship-authority-worker --<status|apply> --environment=<env> --commit=<sha>
   bun run deploy -- takoserver-sponsorship-public-route-retirement --<status|apply> --environment=<integration|production> --commit=<sha>
     --legacy-host-runtime-predecessor-version=<uuid> [--reverse]
   bun run deploy -- takoserver-org-api-key --<mint|status|revoke> --environment=<env> --commit=<sha>
     --organization=org_... [--key-name=<name> --scope=<scope> --expires-in-days=<n>] [--key-id=key_...]
+  Integration --through-migration=0103 selects only the fixed audited100 -> original101/102/103
+  source registration plus its same-artifact mandatory deployment/RP receipts in one import.
+  It requires source-proved pre-auth103-quiesced all-traffic Worker and private install custody.
+  Integration original-custody held post94 status also accepts --through-migration=0098.
+  It requires the original convert declaration, TAKOSERVER_D1_MONEY_POST94_DECLARATION_PATH,
+  and TAKOSERVER_D1_MONEY_NORMAL_WORKER_SELECTOR_PATH; apply remains unavailable.
+  Integration --through-migration=0100 continues only original terminal98 custody through
+  audited 0099/0100 in the same original Money D1 path. Status is GET-only after dispatch.
+
   D1 schema status/apply may select one fixed next-wave boundary:
     --through-migration=<0022|0028|0033|0036|0043|0044|0045|0046|0047|0048|0049|0050|0051|0052|0053|0054|0055|0056|0057|0058|0088|0092|0093|0094>
   Integration without a selector keeps its disposable suffix path; selected integration applies
@@ -201,9 +217,16 @@ interface InvocationBase {
   readonly throughMigration?: SchemaWaveBoundary;
   readonly protectedReferenceEnvironment?: "integration" | "production";
   readonly reverse?: boolean;
+  readonly repairOriginalMoneyMaintenance?: boolean;
 }
 
 type Invocation =
+  | (Omit<InvocationBase, "throughMigration"> & {
+      readonly surface: "takoserver-d1-schema";
+      readonly action: "status" | "apply";
+      readonly environment: "integration";
+      readonly throughMigration: "0098" | "0100" | "0103";
+    })
   | (InvocationBase & {
       readonly surface:
         | MoneyShadowCreateSurface
@@ -282,7 +305,7 @@ interface ParsedInvocation {
   readonly adoptLivePath?: string;
   readonly bootstrapVerifierBridge?: boolean;
   readonly bootstrapProbePredecessorVersionId?: string;
-  readonly throughMigration?: SchemaWaveBoundary;
+  readonly throughMigration?: SchemaWaveBoundary | "0098" | "0100" | "0103";
   readonly freshLineage?: "v2-artifacts-0075" | "v2-0088" | "v2-0089" | "v2-0091" | "v2-0092";
   readonly protectedReferenceEnvironment?: "integration" | "production";
   readonly organizationId?: string;
@@ -291,6 +314,7 @@ interface ParsedInvocation {
   readonly expiresInDays?: number;
   readonly apiKeyId?: string;
   readonly reverse?: boolean;
+  readonly repairOriginalMoneyMaintenance?: boolean;
 }
 
 /** The durable organization API key surface is the only one with key operands. */
@@ -374,7 +398,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let adoptLivePath: string | null = null;
   let bootstrapVerifierBridge = false;
   let bootstrapProbePredecessorVersionId: string | null = null;
-  let throughMigration: SchemaWaveBoundary | null = null;
+  let throughMigration: SchemaWaveBoundary | "0098" | "0100" | "0103" | null = null;
   let protectedReferenceEnvironment: "integration" | "production" | null = null;
   let organizationId: string | null = null;
   let keyName: string | null = null;
@@ -382,7 +406,13 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   let expiresInDays: number | null = null;
   let apiKeyId: string | null = null;
   let reverse = false;
+  let repairOriginalMoneyMaintenance = false;
   for (const flag of flags) {
+    if (flag === "--repair-original-money-maintenance") {
+      if (repairOriginalMoneyMaintenance) return null;
+      repairOriginalMoneyMaintenance = true;
+      continue;
+    }
     if (flag.startsWith("--retired-target=")) {
       const value = flag.slice("--retired-target=".length);
       if (retiredTargetPath !== null || !isAbsolute(value) || /[\0\r\n]/u.test(value)) return null;
@@ -597,8 +627,12 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     if (flag.startsWith("--through-migration=")) {
       if (throughMigration !== null) return null;
       const value = flag.slice("--through-migration=".length);
-      if (!SCHEMA_WAVE_BOUNDARIES.includes(value as SchemaWaveBoundary)) return null;
-      throughMigration = value as SchemaWaveBoundary;
+      if (value === "0098" || value === "0100" || value === "0103") {
+        throughMigration = value;
+      } else {
+        if (!SCHEMA_WAVE_BOUNDARIES.includes(value as SchemaWaveBoundary)) return null;
+        throughMigration = value as SchemaWaveBoundary;
+      }
       continue;
     }
     if (flag === "--reverse") {
@@ -609,6 +643,14 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     return null;
   }
   if (!action || !environment || !commit) return null;
+  if (
+    repairOriginalMoneyMaintenance &&
+    (surfaceValue !== "takoserver-integration-worker-bootstrap" ||
+      action !== "apply" ||
+      environment !== "integration" ||
+      args.length !== 5)
+  )
+    return null;
   const hostRetirement = surfaceValue === "takoserver-integration-host-retirement";
   const retirementOperands = [retiredTargetPath, retiredDeploymentId, retiredVersionId].filter(
     (value) => value !== null,
@@ -644,7 +686,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     (surfaceValue === "takoserver-integration-worker-bootstrap" ||
       surfaceValue === "takoserver-integration-organization-bootstrap") &&
     (environment !== "integration" ||
-      args.length !== 4 ||
+      args.length !== (repairOriginalMoneyMaintenance ? 5 : 4) ||
       (action !== "status" && action !== "apply"))
   )
     return null;
@@ -880,6 +922,12 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     return null;
   }
   if (
+    (throughMigration === "0098" || throughMigration === "0100" || throughMigration === "0103") &&
+    (surfaceValue !== "takoserver-d1-schema" || environment !== "integration")
+  ) {
+    return null;
+  }
+  if (
     (throughMigration === "0093" || throughMigration === "0094") &&
     environment !== "integration"
   ) {
@@ -1037,6 +1085,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     ...(formAuthorityScopeTransitionPath === null ? {} : { formAuthorityScopeTransitionPath }),
     ...(adoptLivePath === null ? {} : { adoptLivePath }),
     ...(bootstrapVerifierBridge ? { bootstrapVerifierBridge: true } : {}),
+    ...(repairOriginalMoneyMaintenance ? { repairOriginalMoneyMaintenance: true } : {}),
     ...(bootstrapProbePredecessorVersionId === null ? {} : { bootstrapProbePredecessorVersionId }),
     ...(throughMigration === null ? {} : { throughMigration }),
     ...(protectedReferenceEnvironment === null ? {} : { protectedReferenceEnvironment }),
@@ -1160,6 +1209,273 @@ function loadMoneyShadowNativeProbeDeclaration(): MoneyShadowNativeProbeDeclarat
 }
 
 async function dispatch(invocation: Invocation): Promise<Record<string, unknown>> {
+  const originalCreateInput = process.env.TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH;
+  if (
+    process.env.TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_REPAIR_SELECTION_PATH !== undefined &&
+    invocation.repairOriginalMoneyMaintenance !== true
+  )
+    throw new DeployError(
+      "preflight",
+      "original money maintenance repair selection requires --repair-original-money-maintenance",
+    );
+  if (invocation.repairOriginalMoneyMaintenance === true) {
+    const originalCreateInputPath = requireEnvironment(
+      "TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH",
+    );
+    const selectionPath = requireEnvironment(
+      "TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_SELECTION_PATH",
+    );
+    const repairSelectionPath = requireEnvironment(
+      "TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_REPAIR_SELECTION_PATH",
+    );
+    const target = loadTarget(
+      targetPath("integration"),
+      "integration",
+      "money-original-maintenance-bootstrap",
+    );
+    return await runIntegrationWorkerBootstrap(
+      {
+        action: "apply",
+        environment: "integration",
+        commit: invocation.commit,
+        surface: "takoserver-integration-worker-bootstrap",
+      },
+      target,
+      {
+        originalMoneyMaintenanceRepair: {
+          originalCreateInputPath,
+          selectionPath,
+          repairSelectionPath,
+        },
+      },
+    );
+  }
+  if (
+    process.env.TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_SELECTION_PATH !== undefined &&
+    (originalCreateInput === undefined ||
+      invocation.surface !== "takoserver-integration-worker-bootstrap" ||
+      invocation.environment !== "integration")
+  )
+    throw new DeployError(
+      "preflight",
+      "original money maintenance selection is scoped to the integration first-publication route",
+    );
+  if (invocation.throughMigration === "0103") {
+    if (invocation.environment !== "integration" || invocation.surface !== "takoserver-d1-schema")
+      throw new DeployError("preflight", "0103 source registration is integration-only");
+    const target = loadTarget(targetPath("integration"), "integration");
+    const production = loadTarget(
+      requireEnvironment("TAKOSERVER_DEPLOY_TARGET_PRODUCTION"),
+      "production",
+    );
+    const { runD1SchemaAuth103 } = await import("./deploy/schema-auth103-native-source.ts");
+    return await runD1SchemaAuth103(
+      { action: invocation.action, environment: "integration", commit: invocation.commit },
+      target,
+      production.d1,
+    );
+  }
+  if (invocation.throughMigration === "0100") {
+    if (
+      invocation.environment !== "integration" ||
+      invocation.surface !== "takoserver-d1-schema" ||
+      originalCreateInput === undefined ||
+      !isAbsolute(originalCreateInput) ||
+      resolve(originalCreateInput) !== originalCreateInput ||
+      /[\0\r\n]/.test(originalCreateInput)
+    )
+      throw new DeployError(
+        "preflight",
+        "money original100 requires canonical original-create custody",
+      );
+    const locator = (name: string): string => {
+      const value = requireEnvironment(name);
+      if (!isAbsolute(value) || resolve(value) !== value || /[\0\r\n]/.test(value))
+        throw new DeployError("preflight", `${name} must be a canonical absolute protected path`);
+      return value;
+    };
+    const declarationPath = locator("TAKOSERVER_D1_MONEY_CUTOVER_DECLARATION_PATH");
+    const post94DeclarationPath = locator("TAKOSERVER_D1_MONEY_POST94_DECLARATION_PATH");
+    const originalCreate = loadIntegrationStorageOriginalCreateInput(originalCreateInput);
+    const target = loadTarget(targetPath("integration"), "integration", "money-original-cutover");
+    const { loadMoneyUnitOriginalCutoverOptions } = await import(
+      "./deploy/schema-money-unit-owner.ts"
+    );
+    const { runIntegrationMoneyOriginalPreserved100 } = await import(
+      "./deploy/schema-money-unit-cutover.ts"
+    );
+    const options = await loadMoneyUnitOriginalCutoverOptions({
+      selectedTarget: target,
+      declarationPath,
+      originalCreate,
+    });
+    return await runIntegrationMoneyOriginalPreserved100(
+      {
+        action: invocation.action,
+        environment: "integration",
+        commit: invocation.commit,
+        throughMigration: "0100",
+      },
+      target,
+      options,
+      post94DeclarationPath,
+    );
+  }
+  if (invocation.throughMigration === "0098") {
+    if (originalCreateInput === undefined)
+      throw new DeployError(
+        "preflight",
+        "money held post94 status requires original-create custody",
+      );
+    // There is no Financial contribution yet. Status observations cannot authorize dispatch.
+    if (invocation.action !== "status")
+      throw new DeployError(
+        "preflight",
+        "money held post94 apply requires the real Financial contribution",
+      );
+    const locator = (name: string): string => {
+      const value = requireEnvironment(name);
+      if (!isAbsolute(value) || resolve(value) !== value || /[\0\r\n]/.test(value))
+        throw new DeployError("preflight", `${name} must be a canonical absolute protected path`);
+      return value;
+    };
+    // Validate every locator before loading custody or capturing the native owner.
+    const declarationPath = locator("TAKOSERVER_D1_MONEY_CUTOVER_DECLARATION_PATH");
+    const post94DeclarationPath = locator("TAKOSERVER_D1_MONEY_POST94_DECLARATION_PATH");
+    const normalWorkerSelectorPath = locator("TAKOSERVER_D1_MONEY_NORMAL_WORKER_SELECTOR_PATH");
+    if (
+      !isAbsolute(originalCreateInput) ||
+      resolve(originalCreateInput) !== originalCreateInput ||
+      /[\0\r\n]/.test(originalCreateInput)
+    )
+      throw new DeployError(
+        "preflight",
+        "money held post94 status requires a canonical original-create custody path",
+      );
+    const originalCreate = loadIntegrationStorageOriginalCreateInput(originalCreateInput);
+    const target = loadTarget(targetPath("integration"), "integration", "money-original-cutover");
+    const { loadMoneyUnitOriginalCutoverOptions, readMoneyUnitHeldPost94ConsumerInputs } =
+      await import("./deploy/schema-money-unit-owner.ts");
+    const options = await loadMoneyUnitOriginalCutoverOptions({
+      selectedTarget: target,
+      declarationPath,
+      originalCreate,
+    });
+    const inputs = await readMoneyUnitHeldPost94ConsumerInputs(
+      options,
+      post94DeclarationPath,
+      normalWorkerSelectorPath,
+    );
+    const facts = inputs.normalWorkerModePreparation.facts;
+    // Bounded DATA only: none of the opaque inputs is exposed as a deploy permission.
+    return {
+      surface: invocation.surface,
+      action: "status",
+      environment: "integration",
+      commit: invocation.commit,
+      throughMigration: "0098",
+      observationKind: "held-post94-pre-import-data",
+      observations: {
+        previousWriterEpoch: facts.previousWriterEpoch,
+        nextWriterEpoch: facts.nextWriterEpoch,
+        heldConvertDigest: facts.heldConvertDigest,
+        convertBindingDigest: facts.convertBindingDigest,
+        converted94BackupDigest: facts.converted94BackupDigest,
+        selectionDeclarationDigest: inputs.selection.declarationDigest,
+        selectionReviewDigest: inputs.selection.selectionReviewDigest,
+        normalWorkerModePreparationDigest: inputs.normalWorkerModePreparation.bindingDigest,
+        versionId: facts.versionId,
+        sourceCommit: facts.sourceCommit,
+        moduleDigest: facts.moduleDigest,
+        sourceArtifactDigest: facts.sourceArtifactDigest,
+        sourceTreeDigest: facts.sourceTreeDigest,
+        dependencyClosureDigest: facts.dependencyClosureDigest,
+        toolClosureDigest: facts.toolClosureDigest,
+        nativeBindingDigest: facts.nativeBindingDigest,
+        stripeMode: facts.stripeMode,
+        modeEvidence: facts.modeEvidence,
+      },
+    };
+  }
+  if (
+    originalCreateInput !== undefined &&
+    invocation.surface === "takoserver-d1-schema" &&
+    invocation.environment === "integration" &&
+    (invocation.throughMigration === "0093" || invocation.throughMigration === "0094")
+  ) {
+    const originalCreate = loadIntegrationStorageOriginalCreateInput(originalCreateInput);
+    const target = loadTarget(targetPath("integration"), "integration", "money-original-cutover");
+    const { loadMoneyUnitOriginalCutoverOptions } = await import(
+      "./deploy/schema-money-unit-owner.ts"
+    );
+    const options = await loadMoneyUnitOriginalCutoverOptions({
+      selectedTarget: target,
+      declarationPath: requireEnvironment("TAKOSERVER_D1_MONEY_CUTOVER_DECLARATION_PATH"),
+      originalCreate,
+    });
+    const result = await runD1Schema(
+      {
+        action: invocation.action,
+        environment: "integration",
+        commit: invocation.commit,
+        throughMigration: invocation.throughMigration,
+      },
+      target,
+      { moneyUnitCutover: options },
+    );
+    return { ...result, originalOriginQualification: options.originalOriginQualification };
+  }
+  if (
+    originalCreateInput !== undefined &&
+    invocation.surface === "takoserver-integration-worker-bootstrap" &&
+    invocation.environment === "integration"
+  ) {
+    const target = loadTarget(
+      targetPath("integration"),
+      "integration",
+      "money-original-maintenance-bootstrap",
+    );
+    return await runIntegrationWorkerBootstrap(
+      {
+        action: invocation.action,
+        environment: "integration",
+        commit: invocation.commit,
+        surface: "takoserver-integration-worker-bootstrap",
+      },
+      target,
+      {
+        originalMoneyMaintenance: {
+          originalCreateInputPath: originalCreateInput,
+          selectionPath: requireEnvironment(
+            "TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_SELECTION_PATH",
+          ),
+        },
+      },
+    );
+  }
+  if (originalCreateInput !== undefined) {
+    if (
+      invocation.surface !== "takoserver-integration-storage-generation" ||
+      invocation.environment !== "integration" ||
+      invocation.freshLineage !== "v2-0092"
+    ) {
+      throw new DeployError(
+        "preflight",
+        "original-create input is supported only for integration storage generation with --fresh-lineage=v2-0092",
+      );
+    }
+    const originalCreate = loadIntegrationStorageOriginalCreateInput(originalCreateInput);
+    const target = loadTarget(targetPath("integration"), "integration");
+    const selected: IntegrationStorageGenerationInvocation = {
+      action: invocation.action,
+      environment: "integration",
+      commit: invocation.commit,
+      generation: invocation.generation,
+      namespace: "integration-ts",
+      freshLineage: "v2-0092",
+    };
+    return await runIntegrationStorageGeneration(selected, target, { originalCreate });
+  }
   if (invocation.surface === "takoserver-integration-money-shadow-native-probe") {
     return await runIntegrationMoneyShadowNativeProbe(
       loadMoneyShadowNativeProbeDeclaration(),

@@ -120,7 +120,23 @@ export interface V2AdmissionPredicate {
    * this predicate: it names what the Form requires. Never request values.
    */
   readonly detail?: string;
+  /** Core-captured exact requirements; valid only on this request's issued result. */
+  readonly preparedExactReferences?: readonly V2ReferenceRequirement[];
 }
+
+/** Authorized, same-owner/Space identity only; not publication or execution authority. */
+export interface V2ExactReferenceTarget {
+  readonly resourceUid: string;
+  readonly formUrl: string;
+}
+
+/** Request-local Core preparation, available only inside prepareAdmission. */
+export type V2PrepareExactReferences = (
+  choose: (
+    lookup: (resourceUid: string) => Promise<V2ExactReferenceTarget | null>,
+  ) => readonly V2ReferenceRequirement[] | null | Promise<readonly V2ReferenceRequirement[] | null>,
+  admission?: V2AdmissionPredicate,
+) => Promise<V2AdmissionPredicate | null>;
 
 export interface V2Form {
   validateCreate(spec: JsonObject): void;
@@ -138,6 +154,8 @@ export interface V2Form {
     readonly form: string;
     readonly resourceUid: string;
     readonly spec: JsonObject;
+    /** Read authorization precedes chooser/lookup; exact-key replay never calls it. */
+    readonly prepareExactReferences?: V2PrepareExactReferences;
   }): Promise<V2AdmissionPredicate | null>;
   /** Exact Form-owned names, requiredness, and omission/update preservation semantics. */
   readonly privateInputs?: {
@@ -161,7 +179,12 @@ export interface V2Form {
       readonly spec: JsonObject;
       readonly privateInputs: V2PrivateInputMap | undefined;
     }): Promise<V2ConfiguredPrivateInputs | null>;
-    /** Authorized preaccept policy; omission preserves the existing configured row. */
+    /**
+     * Authorized preaccept policy. `configured` remains the stable CREATE material.
+     * Void preserves existing behavior. An opaque result with present privateInputs
+     * opts into immutable accepted-UPDATE custody; it never replaces the CREATE row.
+     * This capability does not select a Form's omission or rotation semantics.
+     */
     prepareUpdate?(input: {
       readonly principal: string;
       readonly space: string;
@@ -174,7 +197,8 @@ export interface V2Form {
       readonly spec: JsonObject;
       readonly privateInputs: V2PrivateInputMap | undefined;
       readonly configured: V2ConfiguredPrivateInputs | null;
-    }): Promise<void>;
+      // biome-ignore lint/suspicious/noConfusingVoidType: Existing Promise<void> hooks must remain assignable.
+    }): Promise<void | V2ConfiguredPrivateInputs>;
   };
   /** Internal acceptance ordering for a target whose observation reads live referrers. */
   readonly serializeUpdatesWithPendingReferrers?: true;
@@ -205,6 +229,12 @@ export interface V2EngineOptions {
   authorize(principal: string, space: string, access: "read" | "write"): Promise<boolean>;
   /** Only fully implemented, exact Form URLs are entered here. */
   forms: Readonly<Record<string, V2Form>>;
+  /**
+   * Code-selected construction policy; absent preserves ordinary admission.
+   * False refuses fresh CREATE/UPDATE, not original-key replay, accepted work,
+   * reads or DELETE. It does not fence serving or asynchronous delivery.
+   */
+  readonly allowFreshCreateAndUpdate?: boolean;
   /**
    * Internal adapters for already accepted Resources/Operations only. These
    * URLs are never public Form support and cannot accept a new CREATE/UPDATE.

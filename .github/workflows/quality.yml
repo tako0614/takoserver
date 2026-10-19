@@ -36,9 +36,10 @@ jobs:
   quality:
     name: check and test
     runs-on: ubuntu-24.04
-    # The complete suite exceeded 45 minutes on a shared runner. Reserve time
+    # The complete suite exceeded 45 minutes on a shared runner, and later grew
+    # past 75 (local pinned run 64.5 min; runner cancelled at 75). Reserve time
     # for every test plus the D1 migration and build phases; do not skip them.
-    timeout-minutes: 75
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # pinned: v6.0.2

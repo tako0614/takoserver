@@ -1,3 +1,4 @@
+import "./auth103-native-platform-origin.ts";
 import { WorkerEntrypoint } from "cloudflare:workers";
 import worker, {
   requirePublicOrigin,

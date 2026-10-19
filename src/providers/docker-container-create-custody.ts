@@ -189,7 +189,6 @@ function policySnapshot(value: DockerContainerRuntimePolicy): DockerContainerRun
 function namesSnapshot(value: readonly string[]): readonly string[] {
   if (
     !Array.isArray(value) ||
-    value.length === 0 ||
     value.length > 64 ||
     value.some((name) => typeof name !== "string" || !NAME.test(name)) ||
     new Set(value).size !== value.length
@@ -306,14 +305,16 @@ function nativeSnapshot(
   return Object.freeze({ ...value }) as unknown as DockerContainerNativeIdentity;
 }
 async function abortable<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) return fail("unavailable");
   let abort: () => void = () => undefined;
   const cancelled = new Promise<never>((_resolve, reject) => {
     abort = () => reject(new DockerContainerCreateCustodyError("unavailable"));
     signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
   });
   try {
-    return await Promise.race([promise, cancelled]);
+    // Attach both branches even when already aborted, retaining late rejection
+    // custody. Cancellation wins if both were settled before this race.
+    return await Promise.race([cancelled, promise]);
   } finally {
     signal.removeEventListener("abort", abort);
   }
@@ -354,7 +355,11 @@ export class DockerContainerCreateCustody {
     phase: DockerContainerCreatePhase,
     driver: DockerContainerCreateDriver,
     use: (session: DockerContainerCreateSession) => Promise<T>,
+    signal?: AbortSignal,
   ): Promise<T> {
+    if (signal !== undefined && (!(signal instanceof AbortSignal) || phase !== "remove"))
+      return fail("invalid_request");
+    if (signal?.aborted) return fail("unavailable");
     let driverSnapshot: DockerContainerCreateDriver;
     let intent: DockerContainerCreateIntent;
     try {
@@ -384,7 +389,9 @@ export class DockerContainerCreateCustody {
     let record: DockerContainerCreateRecord;
     let won = false;
     try {
-      const previous = await owner.read(intent);
+      const previous = signal
+        ? await abortable(owner.read(intent), signal)
+        : await owner.read(intent);
       if (previous !== null) {
         record = recordSnapshot(previous, intent);
       } else {
@@ -404,8 +411,8 @@ export class DockerContainerCreateCustody {
       let complete = false;
       let result: T | undefined;
       try {
-        await owner.withAuthority(record, phase, async (held) => {
-          if (ownerFinished || invocations++ !== 0) return fail("unavailable");
+        const heldWork = owner.withAuthority(record, phase, async (held) => {
+          if (ownerFinished || signal?.aborted || invocations++ !== 0) return fail("unavailable");
           let active = true;
           const lifetime = new AbortController();
           cancelHeld = () => lifetime.abort();
@@ -424,8 +431,12 @@ export class DockerContainerCreateCustody {
             const withEnvironment = loan.bind(held);
             const revoke = () => lifetime.abort();
             revocation.addEventListener("abort", revoke, { once: true });
-            unsubscribe = () => revocation.removeEventListener("abort", revoke);
-            if (revocation.aborted) lifetime.abort();
+            signal?.addEventListener("abort", revoke, { once: true });
+            unsubscribe = () => {
+              revocation.removeEventListener("abort", revoke);
+              signal?.removeEventListener("abort", revoke);
+            };
+            if (revocation.aborted || signal?.aborted) lifetime.abort();
             const guard = async () => {
               if (ownerFinished || !active || lifetime.signal.aborted) return fail("unavailable");
               const current = await abortable(stillCurrent(), lifetime.signal);
@@ -511,6 +522,31 @@ export class DockerContainerCreateCustody {
               await bind(native.nativeId);
               return Object.freeze({ native, state: raw.state });
             };
+            // Cleanup does not need to open or compare secret values. The
+            // original remove hold, exact claim/native identity and immutable
+            // intent labels remain mandatory before and after every read/write.
+            // A pending claim may only bind an actually discovered same-claim
+            // native; GET404 never constitutes retirement.
+            const inspectRemoval = async (): Promise<DockerContainerCreateInspection | null> => {
+              await guard();
+              if (phase !== "remove") return fail("conflict");
+              const raw = await abortable(
+                driverSnapshot.inspect(record, lifetime.signal),
+                lifetime.signal,
+              );
+              await guard();
+              if (raw === null) return null;
+              if (
+                !closed(raw, ["native", "state", "claimId", "environment"]) ||
+                raw.claimId !== record.claimId ||
+                (raw.state !== "stopped" && raw.state !== "running")
+              )
+                return fail("conflict");
+              const native = nativeSnapshot(raw.native, record);
+              await bind(native.nativeId);
+              await guard();
+              return Object.freeze({ native, state: raw.state });
+            };
             let ensuring: Promise<DockerContainerCreateInspection | null> | undefined;
             let spent = false;
             const session: DockerContainerCreateSession = Object.freeze({
@@ -522,7 +558,7 @@ export class DockerContainerCreateCustody {
               inspect: () => {
                 if (record.state === "removed")
                   return Promise.reject(new DockerContainerCreateCustodyError("conflict"));
-                return transient(inspect);
+                return phase === "remove" ? inspectRemoval() : transient(inspect);
               },
               ensureCreated: async () => {
                 await guard();
@@ -584,21 +620,24 @@ export class DockerContainerCreateCustody {
                   return;
                 }
                 if (record.state !== "bound") return fail("conflict");
-                await transient(async (environment, signal) => {
-                  // Only an already-bound native ID can be removed. A pending
-                  // CREATE GET404 never constitutes retirement.
-                  const existing = await inspect(environment, signal);
+                // The bound exact ID is already fenced by the original
+                // remove authority. No keyring/Env callback is involved.
+                {
+                  const signal = lifetime.signal;
+                  const existing = await inspectRemoval();
                   await guard();
                   if (existing !== null && existing.native.nativeId !== nativeId)
                     return fail("conflict");
-                  const acknowledgement = await abortable(
-                    driverSnapshot.remove(record, nativeId, signal),
-                    signal,
-                  );
-                  await guard();
-                  if (acknowledgement !== "deleted" && acknowledgement !== "not-found")
-                    return fail("unavailable");
-                  if ((await inspect(environment, signal)) !== null) return fail("conflict");
+                  if (existing !== null) {
+                    const acknowledgement = await abortable(
+                      driverSnapshot.remove(record, nativeId, signal),
+                      signal,
+                    );
+                    await guard();
+                    if (acknowledgement !== "deleted" && acknowledgement !== "not-found")
+                      return fail("unavailable");
+                  }
+                  if ((await inspectRemoval()) !== null) return fail("conflict");
                   await guard();
                   await abortable(owner.confirmRemoved(record, nativeId), signal);
                   const removed = recordSnapshot(
@@ -610,7 +649,7 @@ export class DockerContainerCreateCustody {
                   if (removed.state !== "removed" || removed.nativeId !== nativeId)
                     return fail("conflict");
                   record = removed;
-                });
+                }
               },
             });
             await guard();
@@ -624,11 +663,13 @@ export class DockerContainerCreateCustody {
             unsubscribe();
           }
         });
+        if (signal) await abortable(heldWork, signal);
+        else await heldWork;
       } finally {
         ownerFinished = true;
         cancelHeld();
       }
-      if (invocations !== 1 || !complete) return fail("unavailable");
+      if (signal?.aborted || invocations !== 1 || !complete) return fail("unavailable");
       return result as T;
     } catch (error) {
       if (error instanceof DockerContainerCreateCustodyError) throw error;

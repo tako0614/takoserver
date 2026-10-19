@@ -12,6 +12,7 @@ import {
   referencesForWorkerVersion,
 } from "./forms/worker-references.ts";
 import {
+  FORWARD_WORKER_DEPLOYMENT_FORM_URL,
   parseWorkerDeploymentSpec,
   parseWorkerVersionSpec,
   WORKER_DEPLOYMENT_FORM_URL,
@@ -73,10 +74,18 @@ export type WorkerCronTriggerAdmissionResolution =
  * Operation. This is an internal required-handler admission seam, not an
  * application registry or an execution delivery port.
  */
-export function createWorkerCronTriggerAdmissionReader(options: {
-  readonly sql: Sql;
-  readonly now?: Clock;
-}) {
+type AdmissionReaderOptions = { readonly sql: Sql; readonly now?: Clock };
+export function createWorkerCronTriggerAdmissionReader(options: AdmissionReaderOptions) {
+  return createAdmissionReader(options, WORKER_DEPLOYMENT_FORM_URL);
+}
+/** Exact06 claim reader; same attachment inventory and currentness implementation. */
+export function createForwardWorkerCronTriggerAdmissionReader(options: AdmissionReaderOptions) {
+  return createAdmissionReader(options, FORWARD_WORKER_DEPLOYMENT_FORM_URL);
+}
+function createAdmissionReader(
+  options: AdmissionReaderOptions,
+  form: typeof WORKER_DEPLOYMENT_FORM_URL | typeof FORWARD_WORKER_DEPLOYMENT_FORM_URL,
+) {
   const now = options.now ?? (() => new Date());
 
   async function capture(input: WorkerCronTriggerAdmissionInput) {
@@ -103,7 +112,7 @@ export function createWorkerCronTriggerAdmissionReader(options: {
       claim.id !== claim.last_operation ||
       claim.principal !== input.principal ||
       claim.space !== input.space ||
-      claim.form_url !== WORKER_DEPLOYMENT_FORM_URL ||
+      claim.form_url !== form ||
       claim.backend_id !== input.backendId ||
       claim.backend_key !== input.backendKey ||
       claim.target_key !== input.targetKey ||

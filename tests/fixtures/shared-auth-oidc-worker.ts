@@ -1,11 +1,12 @@
 import {
   createSharedAuthOidcClient,
+  SHARED_AUTH_STAGING_PROFILE,
   type SharedAuthGrant,
   SharedAuthOidcError,
 } from "../../src/shared-auth-oidc-client.ts";
 
 const stamp = 1792022400000;
-const issuer = "https://auth-staging.example.test";
+const issuer = SHARED_AUTH_STAGING_PROFILE.issuer;
 const clientId = "takoserver-console-staging-v1";
 const previous: SharedAuthGrant = {
   issuer,
@@ -26,10 +27,7 @@ export default {
     const redirect = path.endsWith("-redirect");
     const client = createSharedAuthOidcClient({
       config: {
-        environment: "staging",
-        issuer,
-        publicOrigin: "https://console-staging.example.test",
-        clientId,
+        ...SHARED_AUTH_STAGING_PROFILE,
         clientSecret: "test-only-native-client-secret",
       },
       now: () => stamp,

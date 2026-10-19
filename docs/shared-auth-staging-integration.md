@@ -1,7 +1,8 @@
 # Shared Accounts login: staged Takoserver consumer
 
-Status: prepared protocol client. No login route, schema migration, Console
-button, deployment configuration or traffic cutover is enabled by this change.
+Status: prepared protocol client and unmounted session/store runtime. No login
+route, schema migration, Console button, deployment configuration or traffic
+cutover is enabled by this change.
 Task 0109 coordinates the remaining owner changes and their release evidence.
 
 ## Implemented protocol boundary
@@ -11,12 +12,16 @@ HTTP contract. It does not import Accounts or another product's source, and it
 does not use the existing `takos-id` Organization projection.
 
 The client requires explicit `environment: "staging"`, the registered client
-`takoserver-console-staging-v1`, distinct exact HTTPS issuer and Console
-origins, and a server-only client secret. Production origins and DNS trailing
-dot aliases are refused. Realized staging origins and credentials belong in
-operator configuration outside this repository; this document does not choose
-them. The registered redirect must exactly equal
-`<console-origin>/auth/oidc/callback`.
+`takoserver-console-staging-v1`, the selected exact first-party staging issuer
+and API/RP origins in `SHARED_AUTH_STAGING_PROFILE`, and a server-only client
+secret. The session factory additionally requires that profile's exact Console
+origin before constructing the client or accessing storage. An arbitrary HTTPS
+origin, alias, subdomain, trailing dot, explicit port or swapped role is refused
+before any credential-bearing transport. Credentials and registration remain
+operator configuration outside this repository. The registered redirect must exactly equal
+`<api-rp-origin>/auth/oidc/callback`. The separately hosted static Console is
+only a fixed return/CORS origin. The API owns the callback and cookie: moving
+the callback to the Console would not authenticate the API's host-only session.
 
 The code flow uses S256, state, nonce, explicit consent and `offline_access`.
 Token exchange, rotating refresh, introspection and revocation authenticate
@@ -49,6 +54,142 @@ Organizations, Workspace roles or other product authority are refused. Access
 tokens obtained here are identity-only credentials for the issuer's own
 endpoints, never Takoserver business API keys.
 
+## Prepared session runtime
+
+`src/shared-auth-session.ts` supplies the unmounted login, callback, logout and
+session handlers, a server-only authenticated actor/context port, and current
+Workspace/Organization resolution. Its required principal projection is an
+owning Takoserver port that preserves proved local actor references; there is
+no email matching or alternate account registry. Organization pins require a
+separate owning port and never imply financial consent.
+
+The API issues random `__Host-` Secure/HttpOnly/SameSite=Lax cookies. Only their
+SHA-256 digests are indexed. Attempt state, nonce and verifier and upstream
+grants are encrypted with AES-GCM under the operator-supplied 32-byte local
+key, with associated data binding purpose, digest, issuer, client, API and
+Console origins. The callback atomically consumes its attempt before exchange,
+confirms the current canonical account, explicitly bootstraps its personal
+Workspace and verifies current owner membership before creating an active
+local session. Before principal resolution, that same verified grant must also
+return an exact billing-organization tuple for the selected personal Workspace.
+The callback checks its three fields and selected Workspace ID, then holds a
+detached tuple only in its receiver-bound fresh original. A missing or changed
+tuple refuses the fresh callback before principal resolution or session creation;
+it does not infer an Organization from the account or session identity. It
+redirects only to the configured Console root, and never
+returns an upstream grant to the browser.
+
+The frozen directory contract uses the same RP Bearer grant at
+`/api/v1/account/shared-workspaces`: the current menu with a selected Workspace,
+explicit `POST /bootstrap {}`, and `GET /:id/billing-organization`. Every
+authenticated request confirms the current canonical account, current
+Workspace membership and qualified local principal. Token roles and retained
+legacy memberships provide no shared-session authority. The Organization
+context is checked again after its owning pin operation.
+
+`src/shared-auth-session-store.ts` receives fresh primary-consistent SQL for
+each request. It atomically burns attempts, serializes refresh with a version
+claim, and keeps encrypted grants in a durable revocation outbox. A competing
+request while refresh is in progress receives temporary unavailability; an
+unknown refresh or completion acknowledgement is never replayed. Newly known
+rotated grants are durably queued together with a local denial fence. The
+issuer's same-client revocation of a retained spent refresh handle revokes the
+current family when a rotation response was lost.
+
+Sessions expire after twelve idle hours or seven absolute days. Grant health
+is checked at most every four minutes and before imminent access expiry;
+canonical account and Workspace checks remain live on each authenticated
+operation. Logout immediately fences the local session and clears its cookie.
+It leaves upstream cleanup in the durable outbox instead of delaying the
+browser on an issuer outage. The owning maintenance entry must call
+`retryRevocations` with at most two grants per pass; only revocation has a
+retryable lease. A crashed refresh claimant stays denied until login/revoke,
+and is never reclaimed for another refresh.
+
+The portable native D1 tests use explicitly unadopted test-only DDL. These
+modules do not create tables or select a public migration number. Adopting the
+forward schema, principal projection, maintenance entry, Console flow and
+protected composition remains an owner-coordinated change. The current
+factory cannot enable an authentication surface by itself.
+
+### Private final-session observation
+
+The store module provides the dedicated private
+`createSharedAuthFinalSessionStore(sql): SharedAuthFinalSessionStore` factory.
+It shares ordinary operations with `createSharedAuthSessionStore` and captures
+that same supplied Sql; it creates no connection, money wrapper, extra query
+or retry. The ordinary factory keeps its boolean touch and rejects zero-row
+results from its own selected-row method.
+
+The dedicated factory is accepted only in the owning strict-connected common
+primary composition: the actual explicit-result native driver, the existing
+money wrapper applied once, and the same final Sql/native client/realm used by
+Auth, RP and Financial under a fresh first-primary request. A generic Sql
+object, the factory name, or a configuration flag cannot supply that
+qualification. The adopted driver source contract uses
+`createD1Sql(database, { acknowledgement: "explicit-d1-result" })` and preserves
+legacy/default behavior elsewhere. Its raw success, result array and change
+metadata must survive explicit validation; unknown metadata cannot become a
+known zero. Actual driver and common-factory native qualification remain
+separate owner work.
+
+`touchSessionAndSelect` performs one guarded primary `UPDATE ... RETURNING *`
+and validates the actual count and returned image. A complete, genuinely
+strict-connected `0/[]` acknowledgement returns null. Exactly one returned
+row must conserve digest, account, local principal, stored Workspace,
+encrypted payload, creation/expiry/health times, requested touch time and the
+actual post-update version. An acknowledged first null permits one reload of
+an active compatible row with the same grant/immutable facts, strictly newer
+safe version and valid lifetime, followed by one guarded retouch. Only that
+retouch's actual returned image can be selected. A second null, changed row,
+unknown acknowledgement, exception or malformed result is unavailable with
+no additional read, touch resend or refresh.
+
+The service constructor captures an optional private
+`finalStore: () => SharedAuthFinalSessionStore` callable and receiver once.
+`observeFinalSession` and `observeFinalWorkspaceOrganization` require it;
+absence is unavailable without invoking the ordinary store as a fallback.
+Existing `authenticate`, `workspaceOrganization` and HTTP handlers retain the
+ordinary RP's bounded compatible-touch behavior and register no final
+selection. All paths share the same authentication, issuer, refresh,
+Directory and Organization-resolution core; only the lexical final-touch
+policy differs. The private observation consumer ABI is adopted as source
+contract, while actual common-factory connection and activation remain
+unqualified here.
+
+The in-process `finalSessionSelection(context)` reader accepts only the exact
+original context object produced by that factory instance. Its closure-local
+WeakMap holds an immutable selection with the real session digest, actual
+post-touch version, validated identity and observation times. The stored
+session Workspace anchor and the request's selected current Workspace remain
+separate. The final Organization result is registered after its post-pin
+authentication, including the exact new returned context object. Request
+URL/method/headers are captured before authentication awaits; this seam never
+consumes or forwards the request body. Principal and pin callables and their
+receivers are also captured once.
+
+There is no HTTP/RPC endpoint, browser response field or persistence format
+for this selection. Cloning a context or supplying the same fields does not
+preserve provenance. The explicit HTTP handler projects its existing
+response, and the Worker fixture mounts only its existing test handlers.
+The observation linearizes at the acknowledged primary update; a later
+touch or revoke can make it stale. The owning consumer must use its genuine
+in-process factory/context/selection and independently fence the actual
+selected row plus its own authority on the same primary at the effect
+boundary. Row CAS versions supply no authority class, payer, consent, realm,
+source epoch, enrollment receipt or Financial admission. Retained authority
+history belongs to its separate owner and cannot be replaced by this
+WeakMap.
+
+The authored component tests target the adopted strict-driver option and
+exercise actual native D1 one-zero/one-reload/one-retouch, real post-commit
+acknowledgement loss, second misses and malformed images. Outer response-loss
+injection is synthetic and labelled. They require the owning driver changes
+before execution; source preparation or TypeScript casts do not qualify
+native acknowledgement semantics, a fake store or a common-primary graph.
+No driver, entry, schema or Financial source change is implemented in these
+RP files.
+
 ## Existing behavior that requires a separate owner change
 
 The audit base is Takoserver commit
@@ -77,13 +218,13 @@ recovery paths.
    domain classification in `scripts/check-imports.ts` only after that owner
    agrees. The prepared hunk adds one exact module name, without exempting a
    directory or changing permitted dependency directions.
-3. Implement a dedicated trusted server session adapter, with a durable
+3. Adopt the prepared trusted server session adapter, with a durable
    single-use login attempt and a host-only `__Host-` HttpOnly Secure cookie.
    Validate exact request origin, duplicate callback parameters, state, optional
    response issuer and the attempt's nonce/verifier. Atomically consume the
    attempt before exchange. Never accept caller-supplied claims, an incoming
    identity header or the email as a login binding.
-4. Implement a durable local session store and explicit account-to-principal
+4. Adopt the prepared durable local session store and explicit account-to-principal
    binding. One canonical Accounts ID can bind at most one local actor; preserve
    existing local principal, Organization, API-key and billing references when
    adopting a proved legacy account. Newly provisioned product actors require
@@ -93,7 +234,7 @@ recovery paths.
    lineage. Do not reserve or author a migration number here: the schema owner
    must allocate it after the billing and dispatch migrations.
 5. Keep grants encrypted under an operator-managed local session key, with
-   associated data binding the environment, issuer, client and Console origin.
+   associated data binding the environment, issuer, client, API and Console origins.
    Cookie secrets are random; only their digests are indexed. Keep idle and
    absolute expiry, current grant activity and revocation local to the RP.
    Serialize refresh through durable version/compare-and-set ownership. Lost
@@ -131,3 +272,71 @@ does not exercise and reject redirects for every authenticated operation.
 Protocol references: [OpenID Connect Core ID Token validation](https://openid.net/specs/openid-connect-core-1_0.html#IDTokenValidation),
 [OAuth client authentication](https://www.rfc-editor.org/rfc/rfc6749.html#section-2.3.1),
 and [OAuth security best current practice](https://www.rfc-editor.org/rfc/rfc9700.html).
+
+
+## Explicit action-consent data modules
+
+`shared-auth-financial-consent-contract.ts`,
+`shared-auth-financial-consent-schema-plan.ts` and
+`shared-auth-financial-consent-store.ts` provide unmounted consent data
+interfaces. The schema leaf is unnumbered and unregistered: three append-only
+tables and their preservation constraints do not install a migration or enable
+a login, billing or consent route. These modules have no package-barrel or
+HTTP export.
+
+The contract parser binds the complete action, original challenge, selected
+terms reference and digest, selected Organization/Workspace, RP session facts
+and independent consent issuer. A consent reference is opaque. The consent
+issuer's registration and incarnation are separate from challenge and identity
+proof registrations. The consent digest covers its versioned core; custody of
+the complete canonical original bytes has a separate digest. Neither identity
+proof metadata nor matching digests establish explicit human consent or the
+origin of selected terms. No identity-proof reference is reused as a consent
+proof reference. The durable leaf applies its narrower text and byte limits
+without truncating or converting a larger codec value.
+
+The store exposes the following data operations:
+
+- `createSharedAuthFinancialConsentOriginalReader(...).readOriginal(command)`
+  loads exact immutable fullcommand and same-row mandatory receipt custody.
+  Only positively complete absence returns `undefined`; pending-only,
+  command-only, partial/corrupt rows and query failures cannot establish absence
+  or permission to send again. Historical custody remains readable after expiry
+  or retirement and does not imply current permission.
+- `createSharedAuthFinancialConsentLocalCurrentnessReader(...)` checks local
+  SQL predicates after loading that same historical original. A local nonmatch
+  is data, not a grant to issue a new command.
+- `captureSharedAuthFinancialConsentRequestCommandData(...)` connects an actual
+  captured request Sql write to the exact command postimage check.
+  `captureAndConsumeSharedAuthFinancialConsentRequestOriginalData(...)` orders
+  that write, its successful actual acknowledgement, the guarded original and
+  mandatory-receipt INSERT, its exact postimage check and original fullcommand
+  GET on the same captured request graph and Sql receiver.
+- `createSharedAuthFinancialConsentRequestCommandRecovery(...)` retains the
+  original fullcommand and exposes only `readOriginalData()`. Unknown outcomes
+  never create another key, change family, retry a write or authorize a consume
+  from an ambiguous command-only row.
+
+The ordered effect detaches the full input before its first await, validates
+the original recipe and both fixed statement builders before its first write,
+and rechecks the actual graph and method identities around awaited operations.
+Only that invocation's actual one-row command acknowledgement reaches consume.
+The consume result must have the exact fourteen returned columns, matching
+whole original bytes and mandatory receipt, and an actual affected count of
+one. A caller-constructed matching postimage proves data equality only.
+Capture and consume remain two separate Money permit transactions; the whole
+sequence is not atomic. A crash or acknowledgement loss can leave command-only
+custody that cannot be safely resumed. Repeating the low-level function is not
+a first-attempt, never-dispatched or new-command authorization protocol.
+
+An actual affirmative confirmation and pending producer, qualified retained
+credential plus distinct human binding, qualified Clock/current admission,
+coherent original Financial action and displayed R1 terms, and the genuine
+current consent verifier remain separate integration work. Retained credential
+Workspace and the selected financial Workspace remain distinct facts. Final
+Financial payer/class/source checks and the same-primary command CAS still
+belong in the actual owning mutation. No field, local origin assertion,
+standalone SELECT, remote boolean or opaque proof DTO supplies those missing
+authorities. In-memory synthetic fixtures exercise local mechanics; they do
+not qualify actual D1, schema enrollment, a real issuer or a staged payment
+journey.

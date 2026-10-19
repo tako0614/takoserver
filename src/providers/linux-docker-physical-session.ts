@@ -16,6 +16,50 @@ function fail(): never {
   throw new Error("docker_physical_session_unavailable");
 }
 
+/** Closed nonsecret metadata from the original pinned daemon, not authority or
+ * an enforcement receipt. Env, mounts, logs and arbitrary labels never cross
+ * the native-helper reply boundary. */
+export interface DockerPhysicalContainerInspection {
+  readonly id: string;
+  readonly pid: number;
+  readonly running: boolean;
+  readonly paused: boolean;
+  readonly restarting: boolean;
+  readonly dead: boolean;
+  readonly imageId: string;
+  readonly identityLabel: string;
+  readonly revisionLabel: string;
+  readonly claimId: string;
+  readonly networkMode: string;
+  readonly sandboxId: string;
+  readonly dns: readonly string[];
+  /** Observed pinned-daemon config facts, not accepted authority or coverage. */
+  readonly security: Readonly<
+    Record<
+      | "nonPrivileged"
+      | "capDropAll"
+      | "capAddEmpty"
+      | "noNewPrivileges"
+      | "noHostMounts"
+      | "noDevices"
+      | "privatePid"
+      | "privateIpc"
+      | "privateUts"
+      | "privateCgroup"
+      | "unpublishedPorts",
+      boolean
+    >
+  >;
+  readonly networks: readonly {
+    readonly name: string;
+    readonly networkId: string;
+    readonly endpointId: string;
+    readonly ipv4: string;
+    readonly ipv6: string;
+    readonly mac: string;
+  }[];
+}
+
 export interface DockerPhysicalProcessOptions {
   readonly helper: string;
   readonly socketPath: string;
@@ -25,8 +69,27 @@ export interface DockerPhysicalProcessOptions {
   readonly networkId: string;
   readonly table: string;
   readonly signal: AbortSignal;
+  /** Host-selected exact existing container, never a caller-supplied daemon path. */
+  readonly nativeId?: string;
   /** Explicit native mode is only for a separately qualified selected namespace. */
-  readonly native?: { readonly ipBinary: string; readonly nftBinary: string };
+  readonly native?: {
+    readonly ipBinary: string;
+    readonly nftBinary: string;
+    /** Host code-owned Engine sandbox root. Opts into held guest namespace mode;
+     * initial capture requires NetworkMode none and a separate NSFS sandbox.
+     * This is an execution target, not admission or an enforcement receipt. */
+    readonly guestNamespaceRoot?: string;
+    /** Fixed selected-ID Docker mutations only; this mode never executes native
+     * binaries or enters the daemon namespace. Original durable owner claim is
+     * required by lifecycle before quarantineStart(). */
+    readonly quarantineControl?: true;
+    /** Resolves original network -> bridge -> actual rtnetlink binding. Only
+     * the helper's closed anti-spoof bridge script can execute in this mode. */
+    readonly hostBridge?: true;
+    /** Retained original guest-FD deny watchdog. It is armed only on a filter
+     * attempt or explicit post-readback arm, never by observed labels. */
+    readonly guestFailClosed?: true;
+  };
 }
 
 /** The process, not the emitted metadata, retains the original peer pidfd/netnsFD.
@@ -42,8 +105,34 @@ export async function openDockerPhysicalProcess(options: DockerPhysicalProcessOp
     !Number.isSafeInteger(options.peerUid) ||
     options.peerUid < 0 ||
     !/^[a-f0-9]{64}$/u.test(options.networkId) ||
+    (options.nativeId !== undefined && !/^[a-f0-9]{64}$/u.test(options.nativeId)) ||
     !/^takos_cx_[a-z0-9_]{1,40}$/u.test(options.table) ||
     options.signal.aborted ||
+    (options.native?.guestNamespaceRoot !== undefined &&
+      (options.nativeId === undefined ||
+        typeof options.native.guestNamespaceRoot !== "string" ||
+        !options.native.guestNamespaceRoot.startsWith("/") ||
+        options.native.guestNamespaceRoot.length < 2 ||
+        options.native.guestNamespaceRoot.length > 384 ||
+        options.native.guestNamespaceRoot.endsWith("/") ||
+        options.native.guestNamespaceRoot.includes("..") ||
+        options.native.guestNamespaceRoot.includes("//") ||
+        /[^\x21-\x7e]|\\/u.test(options.native.guestNamespaceRoot))) ||
+    (options.native?.quarantineControl !== undefined &&
+      (options.native.quarantineControl !== true ||
+        options.nativeId === undefined ||
+        options.native.guestNamespaceRoot !== undefined)) ||
+    (options.native?.hostBridge !== undefined &&
+      (options.native.hostBridge !== true ||
+        options.nativeId !== undefined ||
+        options.native.quarantineControl !== undefined ||
+        options.native.guestNamespaceRoot !== undefined ||
+        options.table !== `takos_cx_${options.networkId.slice(0, 32)}`)) ||
+    (options.native?.guestFailClosed !== undefined &&
+      (options.native.guestFailClosed !== true ||
+        options.native.guestNamespaceRoot === undefined ||
+        options.nativeId === undefined ||
+        options.table !== `takos_cx_${options.nativeId.slice(0, 32)}`)) ||
     (options.native &&
       ![options.native.ipBinary, options.native.nftBinary].every(
         (value) => value.startsWith("/") && !/[\0\r\n]/u.test(value),
@@ -57,17 +146,26 @@ export async function openDockerPhysicalProcess(options: DockerPhysicalProcessOp
     options.networkId,
     options.table,
     ...(options.native ? ["--native", options.native.ipBinary, options.native.nftBinary] : []),
+    ...(options.nativeId === undefined ? [] : ["--container", options.nativeId]),
+    ...(options.native?.hostBridge ? ["--host-bridge"] : []),
+    ...(options.native?.quarantineControl ? ["--quarantine-control"] : []),
+    ...(options.native?.guestNamespaceRoot === undefined
+      ? []
+      : ["--guest-netns-root", options.native.guestNamespaceRoot]),
+    ...(options.native?.guestFailClosed ? ["--guest-failclosed"] : []),
   ];
   const child = spawn(options.helper, args, {
     stdio: ["pipe", "pipe", "ignore"],
     env: { LANG: "C", LC_ALL: "C" },
   });
-  let ended = false;
+  let ended = false,
+    cleanExit = false;
   let buffered = Buffer.alloc(0);
   let waiter: { resolve(value: Buffer): void; reject(): void } | undefined;
   let terminal = false;
   const exited = new Promise<void>((resolve) => {
-    child.once("close", () => {
+    child.once("close", (code, signal) => {
+      cleanExit = code === 0 && signal === null;
       ended = true;
       terminal = true;
       waiter?.reject();
@@ -78,7 +176,9 @@ export async function openDockerPhysicalProcess(options: DockerPhysicalProcessOp
     terminal = true;
     waiter?.reject();
     child.stdin.destroy();
-    if (!ended) child.kill("SIGKILL");
+    // The retained native watchdog joins monotonic deny on EOF. Killing this
+    // controller here would hide its cleanup result and bypass normal custody.
+    if (!ended && !options.native?.guestFailClosed) child.kill("SIGKILL");
   };
   child.once("error", stop);
   const consume = () => {
@@ -152,6 +252,15 @@ export async function openDockerPhysicalProcess(options: DockerPhysicalProcessOp
       hello.peerPid !== options.peerPid ||
       hello.peerUid !== options.peerUid ||
       hello.captureOnly !== !options.native ||
+      hello.nativeId !== options.nativeId ||
+      hello.namespaceKind !==
+        (options.native?.hostBridge
+          ? "bridge"
+          : options.native?.quarantineControl
+            ? "control"
+            : options.native?.guestNamespaceRoot === undefined
+              ? undefined
+              : "container") ||
       ![hello.namespaceDevice, hello.namespaceInode, hello.parentDevice, hello.parentInode].every(
         (value) => typeof value === "string" && /^[0-9]+$/u.test(value),
       )
@@ -167,6 +276,155 @@ export async function openDockerPhysicalProcess(options: DockerPhysicalProcessOp
       async network() {
         return parseNetworkHttp(await request("NETWORK"));
       },
+      async inspect(): Promise<DockerPhysicalContainerInspection> {
+        if (options.nativeId === undefined) return fail();
+        const snapshot = parseContainerInspection(await request("INSPECT"), options.nativeId);
+        await request("CURRENT");
+        if (terminal || options.signal.aborted) return fail();
+        return snapshot;
+      },
+      async bridgeBinding(): Promise<{
+        readonly name: string;
+        readonly ifindex: number;
+        readonly mac: string;
+        readonly addresses: readonly string[];
+      }> {
+        if (!options.native?.hostBridge) return fail();
+        const value: unknown = JSON.parse((await request("BRIDGEBINDING")).toString("utf8"));
+        if (
+          !isJsonObject(value) ||
+          Object.keys(value).sort().join() !==
+            ["name", "ifindex", "mac", "addresses"].sort().join() ||
+          typeof value.name !== "string" ||
+          !/^[A-Za-z][A-Za-z0-9_-]{0,14}$/u.test(value.name) ||
+          typeof value.ifindex !== "number" ||
+          !Number.isSafeInteger(value.ifindex) ||
+          value.ifindex < 1 ||
+          typeof value.mac !== "string" ||
+          !/^(?:[0-9a-f]{2}:){5}[0-9a-f]{2}$/u.test(value.mac) ||
+          !Array.isArray(value.addresses) ||
+          value.addresses.length < 1 ||
+          value.addresses.length > 8 ||
+          value.addresses.some((x) => typeof x !== "string" || x.includes("%") || !isIP(x)) ||
+          new Set(value.addresses).size !== value.addresses.length
+        )
+          return fail();
+        const addresses: string[] = [];
+        for (const x of value.addresses) {
+          if (typeof x !== "string") return fail();
+          addresses.push(x);
+        }
+        await request("CURRENT");
+        return Object.freeze({
+          name: value.name,
+          ifindex: value.ifindex,
+          mac: value.mac,
+          addresses: Object.freeze(addresses),
+        });
+      },
+      bridgePort(
+        plan: Pick<LinuxContainerEgressPlan, "table" | "script">,
+      ): LinuxContainerEgressPort {
+        if (!options.native?.hostBridge || plan.table !== options.table) return fail();
+        return Object.freeze({
+          async namespace() {
+            await request("CURRENT");
+            return `net:[${String(metadata.namespaceInode)}]`;
+          },
+          async execute(command: Parameters<LinuxContainerEgressPort["execute"]>[0]) {
+            const argv = canonicalJson(command.argv);
+            if (
+              argv === canonicalJson(["nft", "--check", "-f", "-"]) ||
+              argv === canonicalJson(["nft", "-f", "-"])
+            ) {
+              if (command.stdin !== plan.script) return fail();
+              return (
+                await request(command.argv[1] === "--check" ? "BRIDGECHECK" : "BRIDGEINSTALL")
+              ).toString("utf8");
+            }
+            if (
+              command.stdin === undefined &&
+              argv ===
+                canonicalJson(["nft", "-j", "list", "table", "bridge", `${options.table}_bridge`])
+            )
+              return (await request("BRIDGEREAD")).toString("utf8");
+            return fail();
+          },
+        });
+      },
+      /** Each command's attempt is consumed natively before its socket write.
+       * A lost ACK rejects; neither this helper nor recovery re-sends it. */
+      async resumeGuestLifetime() {
+        if (!options.native?.guestFailClosed) return fail();
+        await request("RESUMEGUEST");
+      },
+      async hostInventory(): Promise<{
+        readonly addresses: readonly string[];
+        readonly networks: readonly string[];
+      }> {
+        if (!options.native?.guestFailClosed) return fail();
+        const value: unknown = JSON.parse((await request("HOSTINVENTORY")).toString("utf8"));
+        if (
+          !isJsonObject(value) ||
+          Object.keys(value).sort().join() !== ["addresses", "networks"].sort().join() ||
+          !Array.isArray(value.addresses) ||
+          value.addresses.length < 1 ||
+          value.addresses.length > 1024 ||
+          !Array.isArray(value.networks) ||
+          value.networks.length > 256 ||
+          new Set(value.addresses).size !== value.addresses.length ||
+          new Set(value.networks).size !== value.networks.length
+        )
+          return fail();
+        const addresses: string[] = [],
+          networks: string[] = [];
+        for (const address of value.addresses) {
+          if (typeof address !== "string" || address.includes("%") || !isIP(address)) return fail();
+          addresses.push(address);
+        }
+        for (const network of value.networks) {
+          if (typeof network !== "string") return fail();
+          const parts = network.split("/"),
+            ip = parts[0],
+            bits = parts[1];
+          if (
+            parts.length !== 2 ||
+            !ip ||
+            !isIP(ip) ||
+            ip.includes("%") ||
+            !bits ||
+            !/^[0-9]{1,3}$/u.test(bits) ||
+            Number(bits) > (isIP(ip) === 4 ? 32 : 128)
+          )
+            return fail();
+          networks.push(network);
+        }
+        await request("CURRENT");
+        return Object.freeze({
+          addresses: Object.freeze(addresses),
+          networks: Object.freeze(networks),
+        });
+      },
+      async keepGuestLifetime() {
+        if (!options.native?.guestFailClosed) return fail();
+        await request("KEEPGUEST");
+      },
+      async armGuestLifetime() {
+        if (!options.native?.guestFailClosed) return fail();
+        await request("ARMGUEST");
+      },
+      async quarantineStart() {
+        if (!options.native?.quarantineControl) return fail();
+        await request("QUARANTINESTART");
+      },
+      async disconnectNone() {
+        if (!options.native?.quarantineControl) return fail();
+        await request("DISCONNECTNONE");
+      },
+      async connectOwned() {
+        if (!options.native?.quarantineControl) return fail();
+        await request("CONNECTOWNED");
+      },
       async link(name: string) {
         if (!/^[A-Za-z][A-Za-z0-9_-]{0,14}$/u.test(name)) fail();
         return JSON.parse((await request(`LINK ${name}`)).toString("utf8")) as unknown;
@@ -175,7 +433,9 @@ export async function openDockerPhysicalProcess(options: DockerPhysicalProcessOp
         if (!/^[A-Za-z][A-Za-z0-9_-]{0,14}$/u.test(name)) fail();
         return JSON.parse((await request(`ADDR ${name}`)).toString("utf8")) as unknown;
       },
-      port(plan: LinuxContainerEgressPlan): LinuxContainerEgressPort {
+      /** Script transport only. The plan shape is not accepted authority or proof;
+       * actual preparation retains the original owner and verifies readback. */
+      port(plan: Pick<LinuxContainerEgressPlan, "table" | "script">): LinuxContainerEgressPort {
         if (plan.table !== options.table) fail();
         const script = plan.script;
         return Object.freeze({
@@ -216,6 +476,7 @@ export async function openDockerPhysicalProcess(options: DockerPhysicalProcessOp
           await exited;
           options.signal.removeEventListener("abort", stop);
         }
+        if (options.native?.guestFailClosed && !cleanExit) return fail();
       },
     });
   } catch {
@@ -224,6 +485,158 @@ export async function openDockerPhysicalProcess(options: DockerPhysicalProcessOp
     options.signal.removeEventListener("abort", stop);
     return fail();
   }
+}
+
+function parseContainerInspection(
+  bytes: Buffer,
+  expectedId: string,
+): DockerPhysicalContainerInspection {
+  if (bytes.byteLength > 16384) return fail();
+  let value: unknown;
+  try {
+    value = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    return fail();
+  }
+  const closed = (input: unknown, keys: readonly string[]): input is Record<string, unknown> =>
+    isJsonObject(input) &&
+    Object.keys(input).length === keys.length &&
+    keys.every((key) => Object.hasOwn(input, key));
+  const id = (input: unknown): input is string =>
+    typeof input === "string" && /^[a-f0-9]{64}$/u.test(input);
+  const digest = (input: unknown): input is string =>
+    typeof input === "string" && /^sha256:[a-f0-9]{64}$/u.test(input);
+  const text = (input: unknown, max: number): input is string =>
+    typeof input === "string" &&
+    input.length > 0 &&
+    input.length <= max &&
+    !/[^\x20-\x7e]/u.test(input);
+  if (
+    !closed(value, [
+      "id",
+      "pid",
+      "running",
+      "paused",
+      "restarting",
+      "dead",
+      "imageId",
+      "identityLabel",
+      "revisionLabel",
+      "claimId",
+      "networkMode",
+      "sandboxId",
+      "dns",
+      "security",
+      "networks",
+    ]) ||
+    value.id !== expectedId ||
+    !id(value.id) ||
+    typeof value.pid !== "number" ||
+    !Number.isSafeInteger(value.pid) ||
+    value.pid < 0 ||
+    value.pid > 2147483647 ||
+    typeof value.running !== "boolean" ||
+    typeof value.paused !== "boolean" ||
+    typeof value.restarting !== "boolean" ||
+    typeof value.dead !== "boolean" ||
+    (value.running ? value.pid < 1 : value.pid !== 0) ||
+    (value.dead && value.running) ||
+    !digest(value.imageId) ||
+    !digest(value.identityLabel) ||
+    !digest(value.revisionLabel) ||
+    !id(value.claimId) ||
+    !text(value.networkMode, 256) ||
+    (value.sandboxId !== "" && !id(value.sandboxId)) ||
+    !Array.isArray(value.dns) ||
+    value.dns.length > 3 ||
+    !Array.isArray(value.networks) ||
+    value.networks.length > 2
+  )
+    return fail();
+  if (
+    !closed(value.security, [
+      "nonPrivileged",
+      "capDropAll",
+      "capAddEmpty",
+      "noNewPrivileges",
+      "noHostMounts",
+      "noDevices",
+      "privatePid",
+      "privateIpc",
+      "privateUts",
+      "privateCgroup",
+      "unpublishedPorts",
+    ]) ||
+    Object.values(value.security).some((x) => typeof x !== "boolean")
+  )
+    return fail();
+  const security = value.security;
+  const dns: string[] = [];
+  for (const address of value.dns) {
+    if (typeof address !== "string" || address.includes("%") || !isIP(address)) return fail();
+    dns.push(address);
+  }
+  const networks: DockerPhysicalContainerInspection["networks"][number][] = [];
+  const names = new Set<string>();
+  for (const network of value.networks) {
+    if (
+      !closed(network, ["name", "networkId", "endpointId", "ipv4", "ipv6", "mac"]) ||
+      typeof network.name !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/u.test(network.name) ||
+      names.has(network.name) ||
+      (network.networkId !== "" && !id(network.networkId)) ||
+      (value.running && network.networkId === "") ||
+      (network.endpointId !== "" && !id(network.endpointId)) ||
+      typeof network.ipv4 !== "string" ||
+      (network.ipv4 !== "" && isIP(network.ipv4) !== 4) ||
+      typeof network.ipv6 !== "string" ||
+      network.ipv6.includes("%") ||
+      (network.ipv6 !== "" && isIP(network.ipv6) !== 6) ||
+      typeof network.mac !== "string" ||
+      (network.mac !== "" && !/^(?:[a-f0-9]{2}:){5}[a-f0-9]{2}$/u.test(network.mac))
+    )
+      return fail();
+    names.add(network.name);
+    networks.push(
+      Object.freeze({
+        name: network.name,
+        networkId: network.networkId,
+        endpointId: network.endpointId,
+        ipv4: network.ipv4,
+        ipv6: network.ipv6,
+        mac: network.mac,
+      }),
+    );
+  }
+  return Object.freeze({
+    id: value.id,
+    pid: value.pid,
+    running: value.running,
+    paused: value.paused,
+    restarting: value.restarting,
+    dead: value.dead,
+    imageId: value.imageId,
+    identityLabel: value.identityLabel,
+    revisionLabel: value.revisionLabel,
+    claimId: value.claimId,
+    networkMode: value.networkMode,
+    sandboxId: value.sandboxId,
+    dns: Object.freeze(dns),
+    networks: Object.freeze(networks),
+    security: Object.freeze({
+      nonPrivileged: security.nonPrivileged === true,
+      capDropAll: security.capDropAll === true,
+      capAddEmpty: security.capAddEmpty === true,
+      noNewPrivileges: security.noNewPrivileges === true,
+      noHostMounts: security.noHostMounts === true,
+      noDevices: security.noDevices === true,
+      privatePid: security.privatePid === true,
+      privateIpc: security.privateIpc === true,
+      privateUts: security.privateUts === true,
+      privateCgroup: security.privateCgroup === true,
+      unpublishedPorts: security.unpublishedPorts === true,
+    }),
+  });
 }
 
 function parseNetworkHttp(bytes: Buffer): unknown {

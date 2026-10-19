@@ -9,6 +9,7 @@ import {
   type D1SnapshotRestoreInvocation,
   type D1SnapshotRestoreOptions,
   deriveSnapshotExpectations,
+  inspectSnapshotDumpLocally,
   normalizeSnapshotDump,
   runD1SnapshotRestore,
   type SnapshotExpectations,
@@ -284,6 +285,87 @@ describe("snapshot expectations", () => {
 
   test.each([
     [
+      "INSERT SELECT in the exported artifact compatibility trigger",
+      [
+        "UPDATE alpha SET note = NEW.note WHERE id = NEW.id;",
+        "INSERT OR IGNORE INTO beta (id, payload) SELECT NEW.id + 10, NEW.note;",
+        "INSERT INTO beta (id, payload) VALUES (NEW.id + 20, 'trigger only');",
+      ],
+    ],
+    [
+      "multiple INSERT VALUES without adding phantom backup rows",
+      [
+        "INSERT INTO beta (id, payload) VALUES (NEW.id + 10, 'first');",
+        "INSERT INTO beta (id, payload) VALUES (NEW.id + 20, 'second');",
+      ],
+    ],
+    [
+      "CASE endings, quoted delimiters and comments in the trigger body",
+      [
+        "SELECT CASE WHEN NEW.id > 0 THEN CASE WHEN NEW.note IS NULL THEN 'END;' ELSE 'semi;colon' END ELSE 'BEGIN' END;",
+        "/* END; INSERT INTO beta VALUES (100, 'comment'); */",
+        "-- END; DELETE FROM beta;",
+        "INSERT INTO beta (id, payload) SELECT NEW.id + 10, 'x\u0000y';",
+      ],
+    ],
+  ] as const)("keeps %s inside one trigger statement", (_label, body) => {
+    const sql = `${DUMP}\nCREATE TRIGGER alpha_side_effects AFTER INSERT ON alpha\nBEGIN\n${body.join("\n")}\nEND;\n`;
+    const normalized = normalizeSnapshotDump(Buffer.from(sql));
+    const expected = deriveSnapshotExpectations(normalized.sql);
+    expect(expected.triggers).toBe(1);
+    expect(expected.statements).toBe(fixtureExpectations().statements + 1);
+    expect(expected.rowCounts).toEqual({ alpha: 2, beta: 2 });
+    const database = new Database(":memory:");
+    try {
+      database.exec(normalized.sql);
+      expect(database.query("SELECT COUNT(*) AS n FROM beta").get()).toEqual({ n: 2 });
+      expect(
+        database.query("SELECT COUNT(*) AS n FROM sqlite_schema WHERE type = 'trigger'").get(),
+      ).toEqual({ n: 1 });
+      database.exec("INSERT INTO alpha VALUES (3, 'new', 'note')");
+      expect(database.query("SELECT COUNT(*) AS n FROM beta").get()).toEqual({
+        n: 2 + body.filter((line) => /^INSERT /u.test(line)).length,
+      });
+    } finally {
+      database.close();
+    }
+  });
+
+  test("still refuses top-level INSERT SELECT after a complete trigger", () => {
+    const sql = `${DUMP}\nCREATE TRIGGER alpha_side_effects AFTER INSERT ON alpha BEGIN SELECT CASE WHEN NEW.id > 0 THEN 1 ELSE 0 END; END;\nINSERT INTO beta SELECT id, note FROM alpha;`;
+    expect(() => deriveSnapshotExpectations(normalizeSnapshotDump(Buffer.from(sql)).sql)).toThrow(
+      "cannot count",
+    );
+  });
+
+  test.each(['"END;trigger"', "`END;tri``gger`"])(
+    "keeps quoted trigger name %s and closing comments intact",
+    (name) => {
+      const sql = `${DUMP}\nCREATE TRIGGER ${name} AFTER INSERT ON alpha BEGIN SELECT 1; INSERT INTO beta SELECT NEW.id + 10, NEW.note; END /* ; END; */ -- ; END;\n;`;
+      const normalized = normalizeSnapshotDump(Buffer.from(sql));
+      const expected = deriveSnapshotExpectations(normalized.sql);
+      expect(expected.triggers).toBe(1);
+      expect(expected.statements).toBe(fixtureExpectations().statements + 1);
+      expect(expected.rowCounts).toEqual({ alpha: 2, beta: 2 });
+      const database = new Database(":memory:");
+      try {
+        database.exec(normalized.sql);
+        expect(
+          database.query("SELECT COUNT(*) AS n FROM sqlite_schema WHERE type = 'trigger'").get(),
+        ).toEqual({ n: 1 });
+      } finally {
+        database.close();
+      }
+    },
+  );
+
+  test("refuses a truncated trigger instead of hiding subsequent backup statements", () => {
+    const sql = `${DUMP}\nCREATE TRIGGER alpha_side_effects AFTER INSERT ON alpha BEGIN SELECT 1;\nINSERT INTO beta (id, payload) SELECT NEW.id, NEW.note;`;
+    expect(() => normalizeSnapshotDump(Buffer.from(sql))).toThrow("incomplete CREATE TRIGGER");
+  });
+
+  test.each([
+    [
       "an INSERT this restore cannot count",
       'INSERT INTO "alpha" ("id") SELECT id FROM "beta";',
       "cannot count",
@@ -301,6 +383,135 @@ describe("snapshot expectations", () => {
 });
 
 describe("snapshot restore verification", () => {
+  test("local memory-only restore refuses an attachment before native execution", async () => {
+    let inspected = false;
+    const error = await rejected(
+      inspectSnapshotDumpLocally(
+        Buffer.from(
+          `${DUMP}\nATTACH ':memory:' AS scratch; PRAGMA scratch.user_version=17; DETACH scratch;`,
+        ),
+        async () => {
+          inspected = true;
+        },
+      ),
+    );
+    expect(error.phase).toBe("preflight");
+    expect(error.message).toContain("unsupported local snapshot SQL");
+    expect(inspected).toBe(false);
+  });
+
+  test.each([
+    "VACUUM INTO NULL;",
+    "PRAGMA user_version=17;",
+    "PRAGMA temp_store=FILE;",
+    "SELECT 1;",
+    "SAVEPOINT scratch; RELEASE scratch;",
+    "CREATE VIRTUAL TABLE scratch USING fts5(note);",
+  ])("local restore refuses unsupported export SQL: %s", async (statement) => {
+    const error = await rejected(inspectSnapshotDumpLocally(Buffer.from(`${DUMP}\n${statement}`)));
+    expect(error.phase).toBe("preflight");
+    expect(error.message).toContain("unsupported local snapshot SQL");
+  });
+
+  test.each([
+    "INSERT INTO beta VALUES (3, fts5_source_id());",
+    "CREATE TRIGGER beta_external AFTER INSERT ON beta BEGIN SELECT fts5_source_id(); END; INSERT INTO beta VALUES (3, 'trigger');",
+  ])(
+    "native authorization refuses extension functions through valid export DDL/DML",
+    async (sql) => {
+      let inspected = false;
+      const error = await rejected(
+        inspectSnapshotDumpLocally(Buffer.from(`${DUMP}\n${sql}`), async () => {
+          inspected = true;
+        }),
+      );
+      expect(error.phase).toBe("verification");
+      expect(error.message).toContain("unauthorized SQLite operation");
+      expect(inspected).toBe(false);
+    },
+  );
+
+  test("read-only snapshot authorization also refuses a stored view's extension function", async () => {
+    const error = await rejected(
+      inspectSnapshotDumpLocally(
+        Buffer.from(`${DUMP}\nCREATE VIEW extension_view AS SELECT fts5_source_id() AS version;`),
+        async (reader) =>
+          reader.query("verification", "extension view", "SELECT * FROM extension_view"),
+      ),
+    );
+    expect(error.phase).toBe("verification");
+    expect(error.message).toContain("unauthorized SQLite operation");
+  });
+
+  test("source-owned inspection cannot attach even another in-memory database", async () => {
+    const error = await rejected(
+      inspectSnapshotDumpLocally(dumpBytes(), async (reader) =>
+        reader.query("verification", "attachment denied", "ATTACH ':memory:' AS scratch"),
+      ),
+    );
+    expect(error.phase).toBe("verification");
+    expect(error.message).toContain("unauthorized SQLite operation");
+  });
+
+  test("canonical export transactions, bounded pragmas and SQL-looking literals remain valid", async () => {
+    const bytes = Buffer.from(
+      `PRAGMA foreign_keys=OFF; BEGIN TRANSACTION; ${DUMP}\nINSERT INTO beta VALUES (3, 'ATTACH '':memory:'' AS scratch; VACUUM INTO NULL;'); COMMIT;`,
+    );
+    const result = await inspectSnapshotDumpLocally(bytes);
+    expect(result.readback.rowCounts).toEqual({ alpha: 2, beta: 3 });
+    expect(result.readback.foreignKeyViolations).toBe(0);
+  });
+
+  test("source-owned local restore verifies a trigger-bearing NUL snapshot before row inspection", async () => {
+    const dump = Buffer.from(
+      `${DUMP}\nCREATE TRIGGER alpha_side_effects AFTER INSERT ON alpha BEGIN SELECT 1; INSERT INTO beta SELECT NEW.id + 10, NEW.note; END;`,
+    );
+    const result = await inspectSnapshotDumpLocally(dump, async (reader) =>
+      reader.column(
+        "verification",
+        "payload bytes",
+        "SELECT hex(payload) AS value FROM beta WHERE id = 1",
+        "value",
+      ),
+    );
+    expect(result.expected.rowCounts).toEqual({ alpha: 2, beta: 2 });
+    expect(result.readback.rowCounts).toEqual(result.expected.rowCounts);
+    expect(result.readback.triggers).toBe(1);
+    expect(result.readback.foreignKeyViolations).toBe(0);
+    expect(result.inspection).toEqual(["780079"]);
+    expect(result.nulBytes).toBe(1);
+  });
+
+  test("local restore refuses foreign-key loss before an inspector can certify it", async () => {
+    let inspected = false;
+    const dump = Buffer.from(
+      `${DUMP}\nCREATE TABLE orphan (parent_id INTEGER REFERENCES alpha(id)); INSERT INTO orphan VALUES (999);`,
+    );
+    const error = await rejected(
+      inspectSnapshotDumpLocally(dump, async () => {
+        inspected = true;
+      }),
+    );
+    expect(error.phase).toBe("verification");
+    expect(error.detail).toContain("foreign key violations: 1");
+    expect(inspected).toBe(false);
+  });
+
+  test("local snapshot inspection cannot rewrite the restored rows", async () => {
+    const error = await rejected(
+      inspectSnapshotDumpLocally(dumpBytes(), async (reader) => {
+        await reader.query("verification", "cannot enable writes", "PRAGMA query_only = OFF");
+        return reader.query("verification", "invalid write", "DELETE FROM beta");
+      }),
+    );
+    expect(error.phase).toBe("verification");
+    expect(error.message).toContain("read-only inspection failed");
+    expect((await inspectSnapshotDumpLocally(dumpBytes())).readback.rowCounts).toEqual({
+      alpha: 2,
+      beta: 2,
+    });
+  });
+
   test("accepts an exact readback", () => {
     expect(verifySnapshotRestore(fixtureExpectations(), readbackFixture({}))).toEqual({
       ok: true,

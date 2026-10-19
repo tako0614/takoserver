@@ -1130,3 +1130,38 @@ Portable core tests, self-host resource use, Hosted resource use and downstream
 Provider/application installation are separate evidence. The complete portable
 gate is necessary before integration, but is not a live qualification or a
 production activation receipt.
+
+## Request-local tenant-run credential originals
+
+The concrete `createTokenService` result additionally exposes
+`openTakoformTenantRunOriginal`, `readTakoformTenantRunOriginal` and
+`closeTakoformTenantRunOriginal`. The existing `TokenService` interface and
+plain-claims verifier remain compatible. These methods are an internal producer
+foundation; the normal v2 organization/session/API-key lane does not consume
+them. They do not change the console cookie policy.
+
+Opening captures a genuinely signed tenant-run credential only after the
+built-in sponsorship issuance admission and the exact six-column issuance row
+are verified against the same captured Sql. The opaque handle belongs to that
+concrete TokenService and Sql, keeps the bearer private, and cannot be recreated
+from a JSON claim, spread, clone or another issuer instance. Its handle, prototype
+and returned claims/issuance view are frozen. A read reopens the same credential,
+rechecks current admission and the captured original, and refuses closure, expiry
+or changes to the captured service/Sql callable identities across awaits.
+Explicit close revokes that handle and clears its private bearer reference; it
+does not promise memory zeroization. Key revocation retains the existing
+`keyCacheSeconds` policy.
+
+Only the selected built-in issuance authority can produce this original. A
+custom self-host admission continues to support the existing plain verifier but
+cannot assert built-in sponsorship provenance. An original identifies credential
+and issuance provenance, not a human, payer, credential class, physical database
+certificate, business acceptance or grant. Product identity is absent from these
+claims, and an absent original reservation reference remains absent.
+
+Keep the handle in its owning request and close it when that request ends; never
+put it in Form/Operation JSON. Connection to the v2 request context and genuine
+reservation/business-owner resolution remains separate. Final acceptance must
+still bind the genuine original and business decision in the same Sql atomic
+acceptance boundary; this read-only producer does not replace that guard or
+qualify integrated shared execution, native deployment or staging.

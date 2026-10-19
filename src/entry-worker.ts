@@ -1,14 +1,23 @@
-import { type App, buildApp } from "./app.ts";
+import { type App, type AppPorts, buildApp } from "./app.ts";
+import { auth103NativeSourceCodeSelected } from "./auth103-native-origin-source.ts";
+import { createAuth103SourceClock } from "./auth103-source-clock.ts";
 import { parseBillingConfig } from "./billing-config.ts";
 import { createCatalog } from "./catalog.ts";
 import { buildEdgeForms } from "./edge-forms.ts";
 import { errorEnvelopeResponse } from "./error-envelope.ts";
 import {
+  createWorkerRequestConsumersWithFinancialAuthSourceClock,
+  readWorkerRequestFinancialAuthConsumerPort,
+} from "./financial-auth-consumer.ts";
+import {
   createCanonicalHostedBillingComposition,
   type HostedBillingComposition,
   type HostedOnDemandConfiguration,
 } from "./hosted-billing-composition.ts";
-import { verifyHostedBillingFinancialRealm } from "./hosted-billing-realm.ts";
+import {
+  type HostedBillingFinancialRealm,
+  verifyHostedBillingFinancialRealm,
+} from "./hosted-billing-realm.ts";
 import { assertHostedPricingMatchesBilling, parseHostedPricing } from "./hosted-pricing.ts";
 import { resolveIdentity } from "./identity-setup.ts";
 import {
@@ -49,6 +58,10 @@ import {
   parseRuntimeInputKeyAuthority,
   parseRuntimeInputSealKeyRing,
 } from "./runtime-input-seal-keyring.ts";
+import {
+  createFinancialActionConsentR1Reader,
+  readFinancialActionConsentR1RequestCaptures,
+} from "./shared-financial-retained-r1.ts";
 import { loadSigningKey } from "./signing-key.ts";
 import { createD1Sql } from "./sql-d1.ts";
 import { parseStrictJson } from "./strict-json.ts";
@@ -58,6 +71,7 @@ import { assertStripeModeRealm, parseStripeMode } from "./stripe-mode-realm.ts";
 import { createTakoformArtifacts } from "./takoform/artifacts.ts";
 import { createTakoformStore } from "./takoform/store.ts";
 import { parseTakoformV2ApplicationConfig } from "./takoform-v2/config.ts";
+import type { V2HostAcceptance } from "./takoform-v2/host-acceptance.ts";
 import { drainV2Operations } from "./takoform-v2/worker-wake.ts";
 import { createWorkerDataServices } from "./worker-data-services.ts";
 import {
@@ -65,6 +79,16 @@ import {
   createWorkerEndpointOriginReservations,
 } from "./worker-endpoint-origin-reservations.ts";
 import { createWorkerProductionComposition } from "./worker-production-composition.ts";
+import {
+  captureWorkerSharedAuthStaging,
+  createWorkerPrimaryRequestSql,
+  createWorkerRequestSql,
+  readWorkerRequestFinancialInputs,
+  type WorkerRequestDatabase,
+  type WorkerRequestSql,
+  type WorkerSharedAuthStaging,
+} from "./worker-request-composition.ts";
+import { captureWorkerRequestNativeRpTransport } from "./worker-request-native-rp-transport.ts";
 
 /**
  * The Cloudflare Workers entry.
@@ -78,7 +102,7 @@ import { createWorkerProductionComposition } from "./worker-production-compositi
 
 export interface WorkerEnv {
   readonly AI?: CloudflareWorkersAiBinding;
-  readonly STATE_DB: Parameters<typeof createD1Sql>[0];
+  readonly STATE_DB: WorkerRequestDatabase;
   readonly OBJECTS: Parameters<typeof createR2ObjectStore>[0];
   readonly WORKER_VERSION: { readonly id: string };
   readonly PUBLIC_ORIGIN?: string;
@@ -359,6 +383,50 @@ type WorkerEntryV2FormMaps = ReturnType<
 >;
 type WorkerEntryV2FormSelection = WorkerEntryV2FormMap | WorkerEntryV2FormMaps;
 
+type WorkerEntryV2WorkerEndpointOriginSelection = NonNullable<
+  Parameters<typeof buildApp>[0]["v2WorkerEndpointOrigin"]
+>;
+
+/** Code-only fixed compiler inputs; no request, Sql, token or SQL effect is returned. */
+export type WorkerEntryV2WorkerEndpointOriginComposer = (context: {
+  readonly env: WorkerEnv;
+  readonly clock: Clock;
+}) =>
+  | WorkerEntryV2WorkerEndpointOriginSelection
+  | undefined
+  | Promise<WorkerEntryV2WorkerEndpointOriginSelection | undefined>;
+
+/** Operator code supplies a genuine Container issuer bound to the final Worker Sql. */
+export type WorkerEntryV2ContainerHostAcceptanceComposer = (context: {
+  readonly env: WorkerEnv;
+  readonly sql: Sql;
+  readonly clock: Clock;
+}) => V2HostAcceptance | Promise<V2HostAcceptance>;
+
+/** Capture only trusted issuer-owned data methods before later startup awaits. */
+function captureWorkerContainerHostAcceptance(value: V2HostAcceptance, sql: Sql): V2HostAcceptance {
+  if (typeof value !== "object" || value === null)
+    throw new TypeError("invalid internal Container Host acceptance construction");
+  const ownMethod = (name: "assertSql" | "initialOutput" | "prepare" | "prepareDelete") => {
+    const descriptor = Object.getOwnPropertyDescriptor(value, name);
+    if (
+      !descriptor ||
+      !Object.hasOwn(descriptor, "value") ||
+      typeof descriptor.value !== "function"
+    )
+      throw new TypeError(`Container Host acceptance requires own ${name} method`);
+    return descriptor.value.bind(value);
+  };
+  const assertSql = ownMethod("assertSql") as V2HostAcceptance["assertSql"];
+  const initialOutput = ownMethod("initialOutput") as V2HostAcceptance["initialOutput"];
+  const prepare = ownMethod("prepare") as V2HostAcceptance["prepare"];
+  const prepareDelete = ownMethod("prepareDelete") as NonNullable<
+    V2HostAcceptance["prepareDelete"]
+  >;
+  assertSql(sql);
+  return Object.freeze({ assertSql, initialOutput, prepare, prepareDelete });
+}
+
 export type WorkerEntryV2FormComposer = (context: {
   readonly env: WorkerEnv;
   readonly sql: Sql;
@@ -417,10 +485,30 @@ function hasSelectedV2PrivateInputHooks(
 }
 
 export interface WorkerEntryOptions {
+  /** Code-only isolated shared-login composition; every invocation gets one fresh primary. */
+  readonly sharedAuthStaging?: WorkerSharedAuthStaging;
+  /** Code-only post-graph data observer; HTTP gets its actual Request and source factory. */
+  readonly observeSharedAuthRequest?: (
+    connection: WorkerRequestSql,
+    request?: Request,
+    createReader?: typeof createFinancialActionConsentR1Reader,
+    readRequestCaptures?: typeof readFinancialActionConsentR1RequestCaptures,
+  ) => void | Promise<void>;
   /** Operator code only; no request or environment field selects the composer. */
   readonly composeV2Forms?: WorkerEntryV2FormComposer;
+  /** Operator code only; omission or an undefined result leaves origin acceptance unselected. */
+  readonly composeV2WorkerEndpointOrigin?: WorkerEntryV2WorkerEndpointOriginComposer;
+  /** Operator code only; omission leaves Container acceptance unselected. */
+  readonly composeV2ContainerHostAcceptance?: WorkerEntryV2ContainerHostAcceptanceComposer;
   /** Operator code only; absent means every configured artifact Form remains held-only. */
   readonly composeV2ArtifactSource?: WorkerEntryV2ArtifactSourceComposer;
+  /**
+   * Operator code only, evaluated once at startup from the emitted deploy mode.
+   * No request field or ordinary Host configuration installs this composer.
+   */
+  readonly composeV2FreshAdmission?: (context: {
+    readonly environment: string | undefined;
+  }) => boolean;
 }
 
 /**
@@ -507,13 +595,19 @@ function artifactBlobIoMode(
 
 function schemaMaintenanceMode(
   env: Pick<WorkerEnv, "TAKOSERVER_SCHEMA_MAINTENANCE_MODE" | "TAKOSERVER_ARTIFACT_BLOB_IO_MODE">,
-): "normal" | "pre-0058-quiesced" | "pre-v2-0088-quiesced" | "pre-wallet-usd-micros-quiesced" {
+):
+  | "normal"
+  | "pre-0058-quiesced"
+  | "pre-v2-0088-quiesced"
+  | "pre-wallet-usd-micros-quiesced"
+  | "pre-auth103-quiesced" {
   const value = env.TAKOSERVER_SCHEMA_MAINTENANCE_MODE;
   if (value === undefined) return "normal";
   if (
     value !== "pre-0058-quiesced" &&
     value !== "pre-v2-0088-quiesced" &&
-    value !== "pre-wallet-usd-micros-quiesced"
+    value !== "pre-wallet-usd-micros-quiesced" &&
+    value !== "pre-auth103-quiesced"
   ) {
     throw new TypeError("TAKOSERVER_SCHEMA_MAINTENANCE_MODE is invalid");
   }
@@ -547,18 +641,24 @@ function moneyCutoverFrozenResponse(): Response {
 }
 
 function schemaMaintenanceResponse(
-  mode: "pre-0058-quiesced" | "pre-v2-0088-quiesced" | "pre-wallet-usd-micros-quiesced",
+  mode:
+    | "pre-0058-quiesced"
+    | "pre-v2-0088-quiesced"
+    | "pre-wallet-usd-micros-quiesced"
+    | "pre-auth103-quiesced",
 ): Response {
   return errorEnvelopeResponse(
     "backend_unavailable",
     503,
     { reason: "runtime-configuration" },
     { headers: { "cache-control": "no-store", "retry-after": "60" } },
-    mode === "pre-wallet-usd-micros-quiesced"
-      ? "Host is quiesced for the wallet USD-micros schema maintenance transition"
-      : mode === "pre-0058-quiesced"
-        ? "Host is quiesced for the 0058 schema maintenance transition"
-        : "Host is quiesced for the v2 0088 schema maintenance transition",
+    mode === "pre-auth103-quiesced"
+      ? "Host is quiesced for the Auth103 source registration transition"
+      : mode === "pre-wallet-usd-micros-quiesced"
+        ? "Host is quiesced for the wallet USD-micros schema maintenance transition"
+        : mode === "pre-0058-quiesced"
+          ? "Host is quiesced for the 0058 schema maintenance transition"
+          : "Host is quiesced for the v2 0088 schema maintenance transition",
   );
 }
 
@@ -932,7 +1032,15 @@ async function composeApp(
   origin: string,
   composeV2Forms: WorkerEntryV2FormComposer | undefined,
   composeV2ArtifactSource: WorkerEntryV2ArtifactSourceComposer | undefined,
+  composeV2FreshAdmission: WorkerEntryOptions["composeV2FreshAdmission"],
+  composeV2WorkerEndpointOrigin: WorkerEntryOptions["composeV2WorkerEndpointOrigin"],
+  composeV2ContainerHostAcceptance: WorkerEntryOptions["composeV2ContainerHostAcceptance"],
+  request?: {
+    readonly connection: WorkerRequestSql;
+    readonly sharedAuth?: WorkerSharedAuthStaging;
+  },
 ): Promise<App> {
+  const nativeAuthSelected = auth103NativeSourceCodeSelected();
   if (composeV2Forms !== undefined && typeof composeV2Forms !== "function") {
     throw new WorkerStartupError(
       "runtime-configuration",
@@ -945,6 +1053,41 @@ async function composeApp(
       new TypeError("v2 Worker entry artifact source composer must be a function"),
     );
   }
+  if (composeV2FreshAdmission !== undefined && typeof composeV2FreshAdmission !== "function") {
+    throw new WorkerStartupError(
+      "runtime-configuration",
+      new TypeError("v2 Worker entry fresh admission composer must be a function"),
+    );
+  }
+  if (
+    composeV2WorkerEndpointOrigin !== undefined &&
+    typeof composeV2WorkerEndpointOrigin !== "function"
+  ) {
+    throw new WorkerStartupError(
+      "runtime-configuration",
+      new TypeError("v2 Worker entry Endpoint origin composer must be a function"),
+    );
+  }
+  if (
+    composeV2ContainerHostAcceptance !== undefined &&
+    typeof composeV2ContainerHostAcceptance !== "function"
+  ) {
+    throw new WorkerStartupError(
+      "runtime-configuration",
+      new TypeError("v2 Worker entry Container acceptance composer must be a function"),
+    );
+  }
+  const allowFreshCreateAndUpdate =
+    composeV2FreshAdmission === undefined
+      ? undefined
+      : startupStage("runtime-configuration", () => {
+          const selected = composeV2FreshAdmission(
+            Object.freeze({ environment: env.TAKOSERVER_ENVIRONMENT }),
+          );
+          if (typeof selected !== "boolean")
+            throw new TypeError("v2 Worker entry fresh admission must be a boolean");
+          return selected;
+        });
   const v2Config = startupStage("runtime-configuration", () =>
     parseTakoformV2ApplicationConfig(env),
   );
@@ -1022,9 +1165,14 @@ async function composeApp(
     origin,
     integrationE2eCredentialAuthority,
   );
-  const rawSql = createD1Sql(env.STATE_DB);
-  const writerEpoch = moneyCutoverWriterPolicy(env);
-  const sql = writerEpoch === null ? rawSql : createMoneyCutoverSql(rawSql, writerEpoch);
+  const sql =
+    request === undefined
+      ? (() => {
+          const rawSql = createD1Sql(env.STATE_DB);
+          const writerEpoch = moneyCutoverWriterPolicy(env);
+          return writerEpoch === null ? rawSql : createMoneyCutoverSql(rawSql, writerEpoch);
+        })()
+      : request.connection.sql;
   try {
     // The wallet and ledger use USD micros even when tariff billing is disabled.
     // This read-only proof precedes every normal serving composition and tariff write.
@@ -1096,8 +1244,10 @@ async function composeApp(
     }
   }
   const objects = createR2ObjectStore(env.OBJECTS);
-  const clock = () => new Date();
+  const clock = nativeAuthSelected ? createAuth103SourceClock() : () => new Date();
+  const requestRandomId = () => crypto.randomUUID().replaceAll("-", "");
   let hostedBilling: HostedBillingComposition | undefined;
+  let hostedRealm: HostedBillingFinancialRealm | undefined;
   if (canonicalHostedInputs) {
     try {
       const realm = await verifyHostedBillingFinancialRealm({
@@ -1115,6 +1265,7 @@ async function composeApp(
             monthlyAmountMinor: plan.monthlyAmountMinor,
           })),
       });
+      hostedRealm = realm;
       hostedBilling = await createCanonicalHostedBillingComposition({
         sql,
         clock,
@@ -1140,6 +1291,53 @@ async function composeApp(
       );
     }
   }
+  let workerRequest: AppPorts["workerRequest"];
+  const selectedSharedAuth = request?.sharedAuth;
+  if (request !== undefined && selectedSharedAuth !== undefined) {
+    if (!canonicalHostedInputs || !hostedRealm || !hostedBilling)
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError("shared-login Worker requires its genuine canonical Hosted TEST realm"),
+      );
+    const originalInputs = {
+      connection: request.connection,
+      sharedAuth: selectedSharedAuth,
+      client: canonicalHostedInputs.client,
+      realm: hostedRealm,
+    };
+    if (nativeAuthSelected) {
+      try {
+        const qualified = await createWorkerRequestConsumersWithFinancialAuthSourceClock(
+          {
+            ...originalInputs,
+            sql,
+            identity,
+            randomId: requestRandomId,
+            publicOrigin: origin,
+            consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN,
+          },
+          clock,
+        );
+        workerRequest = {
+          ...originalInputs,
+          originalConsumers: qualified.consumers,
+          financialAuth: qualified.port,
+        };
+      } catch (error) {
+        throw new WorkerStartupError(
+          "runtime-configuration",
+          new TypeError("selected native Auth request composition is unavailable", {
+            cause: error,
+          }),
+        );
+      }
+    } else workerRequest = originalInputs;
+  }
+  if (nativeAuthSelected && workerRequest === undefined)
+    throw new WorkerStartupError(
+      "runtime-configuration",
+      new TypeError("selected native Auth build requires its original shared-login inputs"),
+    );
   let selectedV2Forms: WorkerEntryV2FormSelection | undefined;
   let selectedV2PrivateInputHooks = false;
   if (composeV2Forms !== undefined) {
@@ -1152,6 +1350,47 @@ async function composeApp(
       throw new WorkerStartupError(
         "runtime-configuration",
         new Error("operator v2 Form composition failed", { cause: error }),
+      );
+    }
+  }
+  let selectedV2WorkerEndpointOrigin: WorkerEntryV2WorkerEndpointOriginSelection | undefined;
+  if (composeV2WorkerEndpointOrigin !== undefined) {
+    try {
+      const selected = await composeV2WorkerEndpointOrigin(Object.freeze({ env, clock }));
+      if (selected !== undefined) {
+        // Capture returned inputs now, before later startup awaits. Core owns its Sql and issuer.
+        const { kind, formUrl, backendId, targetKey, ledger } = selected;
+        if (kind === undefined) {
+          selectedV2WorkerEndpointOrigin = Object.freeze({ formUrl, backendId, targetKey, ledger });
+        } else if (kind === "form-v2@1") {
+          selectedV2WorkerEndpointOrigin = Object.freeze({
+            kind,
+            formUrl,
+            backendId,
+            targetKey,
+            ledger,
+          });
+        } else {
+          throw new TypeError("unsupported Worker Endpoint origin construction kind");
+        }
+      }
+    } catch {
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError("operator v2 Endpoint origin composition failed"),
+      );
+    }
+  }
+  let selectedV2ContainerHostAcceptance: V2HostAcceptance | undefined;
+  if (composeV2ContainerHostAcceptance !== undefined) {
+    try {
+      const selected = await composeV2ContainerHostAcceptance(Object.freeze({ env, sql, clock }));
+      const captured = captureWorkerContainerHostAcceptance(selected, sql);
+      selectedV2ContainerHostAcceptance = captured;
+    } catch {
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError("operator v2 Container acceptance composition failed"),
       );
     }
   }
@@ -1196,12 +1435,19 @@ async function composeApp(
     providers: deployment.providers,
     resources: createTakoformStore(sql, clock),
     deployments: createResourceDeploymentStore(sql, clock),
+    ...(selectedV2WorkerEndpointOrigin?.kind === "form-v2@1"
+      ? {
+          shared: { kind: "form-v2@1" as const, ledger: selectedV2WorkerEndpointOrigin.ledger },
+        }
+      : {}),
   });
   originReservationBinding.connect(originReservations);
   let app: App;
   try {
     app = buildApp({
       sql,
+      ...(nativeAuthSelected ? { clock, randomId: requestRandomId } : {}),
+      ...(workerRequest === undefined ? {} : { workerRequest }),
       objects,
       publicWorkerVersionId: env.WORKER_VERSION.id,
       ...(implementationIdentity
@@ -1228,11 +1474,23 @@ async function composeApp(
       ...dataServices,
       publicOrigin: origin,
       v2: v2Config,
+      ...(selectedV2ContainerHostAcceptance !== undefined && hostedBilling === undefined
+        ? { clock }
+        : {}),
+      ...(allowFreshCreateAndUpdate === undefined
+        ? {}
+        : { v2AllowFreshCreateAndUpdate: allowFreshCreateAndUpdate }),
       ...(selectedV2PrivateInputHooks &&
       runtimeInputKeyAuthority &&
       "privateInputCustody" in runtimeInputKeyAuthority
         ? { v2PrivateInputCustody: runtimeInputKeyAuthority.privateInputCustody }
         : {}),
+      ...(selectedV2WorkerEndpointOrigin === undefined
+        ? {}
+        : { v2WorkerEndpointOrigin: selectedV2WorkerEndpointOrigin }),
+      ...(selectedV2ContainerHostAcceptance === undefined
+        ? {}
+        : { v2ContainerHostAcceptance: selectedV2ContainerHostAcceptance }),
       ...(composeV2Forms === undefined
         ? {}
         : selectedV2Forms &&
@@ -1256,6 +1514,18 @@ async function composeApp(
       offerings: deployment.offerings,
     });
   } catch (error) {
+    if (selectedV2WorkerEndpointOrigin !== undefined) {
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError("operator v2 Endpoint origin application construction failed"),
+      );
+    }
+    if (selectedV2ContainerHostAcceptance !== undefined) {
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError("operator v2 Container acceptance application construction failed"),
+      );
+    }
     if (composeV2Forms === undefined && composeV2ArtifactSource === undefined) throw error;
     if (composeV2ArtifactSource !== undefined) {
       // A selected source constructor can throw private transport diagnostics.
@@ -1276,27 +1546,121 @@ async function composeApp(
   return app;
 }
 
-/** A separate startup cache for each code-selected Worker entry. */
+/** Preserve the existing code-literal source selection for private entry composition. */
+export { auth103NativeSourceCodeSelected };
+
+/** Cache only entries without a request-owned Sql/issuer composition. */
 export function createWorkerEntry(options: WorkerEntryOptions = {}) {
   const composeV2Forms = options.composeV2Forms;
   const composeV2ArtifactSource = options.composeV2ArtifactSource;
+  const composeV2FreshAdmission = options.composeV2FreshAdmission;
+  const composeV2WorkerEndpointOrigin = options.composeV2WorkerEndpointOrigin;
+  const composeV2ContainerHostAcceptance = options.composeV2ContainerHostAcceptance;
+  const observeSharedAuthRequest = options.observeSharedAuthRequest;
+  const sharedAuthStaging =
+    options.sharedAuthStaging === undefined
+      ? undefined
+      : captureWorkerSharedAuthStaging(options.sharedAuthStaging);
+  const sharedRequestSelected = () =>
+    sharedAuthStaging !== undefined || auth103NativeSourceCodeSelected();
+  // Build selection is not authority; every selected HTTP request still performs
+  // actual native registration qualification before its ONE Accounts/RP graph.
+  const requestSqlSelected = () =>
+    sharedRequestSelected() || composeV2ContainerHostAcceptance !== undefined;
   const starts = new WeakMap<WorkerEnv, Promise<App>>();
-  const appFor = (env: WorkerEnv, origin: string): Promise<App> => {
+  const assertSelectedNativeRequest = (connection: WorkerRequestSql | undefined) => {
+    if (!auth103NativeSourceCodeSelected()) return;
+    if (!connection || !readWorkerRequestFinancialAuthConsumerPort(connection))
+      throw new TypeError("selected native Auth request lacks its original port");
+  };
+  const appFor = async (
+    env: WorkerEnv,
+    origin: string,
+    connection?: WorkerRequestSql,
+  ): Promise<App> => {
+    if (requestSqlSelected()) {
+      if (connection === undefined)
+        throw new TypeError(
+          sharedAuthStaging === undefined
+            ? "Container Worker request lacks its primary composition"
+            : "shared-login Worker request lacks its primary composition",
+        );
+      // Actual startup transport plus this primary's Root projection; a missing
+      // selected secret/configuration refuses, without ordinary fallback.
+      const selectedSharedAuth =
+        sharedAuthStaging ??
+        (auth103NativeSourceCodeSelected()
+          ? await captureWorkerRequestNativeRpTransport(connection)
+          : undefined);
+      return composeApp(
+        env,
+        origin,
+        composeV2Forms,
+        composeV2ArtifactSource,
+        composeV2FreshAdmission,
+        composeV2WorkerEndpointOrigin,
+        composeV2ContainerHostAcceptance,
+        {
+          connection,
+          ...(selectedSharedAuth === undefined ? {} : { sharedAuth: selectedSharedAuth }),
+        },
+      );
+    }
     const existing = starts.get(env);
     if (existing) return existing;
-    const started = composeApp(env, origin, composeV2Forms, composeV2ArtifactSource).catch(
-      (error: unknown) => {
-        if (starts.get(env) === started) starts.delete(env);
-        throw error;
-      },
-    );
+    const started = composeApp(
+      env,
+      origin,
+      composeV2Forms,
+      composeV2ArtifactSource,
+      composeV2FreshAdmission,
+      composeV2WorkerEndpointOrigin,
+      composeV2ContainerHostAcceptance,
+    ).catch((error: unknown) => {
+      if (starts.get(env) === started) starts.delete(env);
+      throw error;
+    });
     starts.set(env, started);
     return started;
   };
+  const observeRequest = async (
+    connection: WorkerRequestSql | undefined,
+    request?: Request,
+  ): Promise<void> => {
+    if (observeSharedAuthRequest === undefined) return;
+    if (
+      typeof observeSharedAuthRequest !== "function" ||
+      !sharedRequestSelected() ||
+      connection === undefined
+    )
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError("shared-login request observer requires its constructed original request"),
+      );
+    try {
+      // This validates the actual purpose and completed graph before any observer.
+      const inputs = readWorkerRequestFinancialInputs(connection);
+      if (request === undefined) await observeSharedAuthRequest(connection);
+      else
+        await observeSharedAuthRequest(
+          connection,
+          request,
+          createFinancialActionConsentR1Reader,
+          readFinancialActionConsentR1RequestCaptures,
+        );
+      if (readWorkerRequestFinancialInputs(connection) !== inputs)
+        throw new TypeError("shared-login request input origin changed during observation");
+    } catch (error) {
+      throw new WorkerStartupError(
+        "runtime-configuration",
+        new TypeError("operator shared-login request observation failed", { cause: error }),
+      );
+    }
+  };
   return {
     /**
-     * Startup is lazy and per request, and only its success is cached, so a
-     * startup refusal is answered rather than thrown: `/healthz`,
+     * Startup is lazy. Entries without request-owned authority cache success.
+     * A startup refusal is answered rather than thrown: `/healthz`,
      * `/.well-known/takoserver` and every other route report the readable 503
      * reason class instead of a bare provider exception page.
      */
@@ -1316,14 +1680,40 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
         if (mode === "pre-0043-quiesced") {
           return artifactBlobIoQuiescenceResponse();
         }
-        if (moneyPolicy !== null) {
+        let connection: WorkerRequestSql | undefined;
+        let selectedOrigin: string | undefined;
+        if (requestSqlSelected()) {
+          selectedOrigin = startupStage("public-origin", () => requirePublicOrigin(env));
+          if (moneyPolicy === null)
+            throw new TypeError(
+              sharedAuthStaging === undefined
+                ? "Container Worker requires the selected Money writer for its native request origin"
+                : "shared-login Worker requires the selected Money writer",
+            );
+          connection = !sharedRequestSelected()
+            ? await createWorkerPrimaryRequestSql({
+                database: env.STATE_DB,
+                writerEpoch: moneyPolicy,
+              })
+            : await createWorkerRequestSql({
+                database: env.STATE_DB,
+                writerEpoch: moneyPolicy,
+                publicOrigin: selectedOrigin,
+                consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN,
+              });
+          if (connection.moneyGuard === "frozen") return moneyCutoverFrozenResponse();
+        } else if (moneyPolicy !== null) {
           const guard = await inspectMoneyCutoverGuard(createD1Sql(env.STATE_DB), moneyPolicy);
           if (guard === "frozen") return moneyCutoverFrozenResponse();
         }
         app = await appFor(
           env,
-          startupStage("public-origin", () => requirePublicOrigin(env)),
+          selectedOrigin ?? startupStage("public-origin", () => requirePublicOrigin(env)),
+          connection,
         );
+        assertSelectedNativeRequest(connection);
+        if (observeSharedAuthRequest !== undefined) await observeRequest(connection, request);
+        assertSelectedNativeRequest(connection);
       } catch (error) {
         return workerStartupFailureResponse(error);
       }
@@ -1356,11 +1746,36 @@ export function createWorkerEntry(options: WorkerEntryOptions = {}) {
       if (schemaMaintenanceMode(env) !== "normal") return;
       if (artifactBlobIoMode(env) === "pre-0043-quiesced") return;
       const writerEpoch = moneyCutoverWriterPolicy(env);
-      if (writerEpoch !== null) {
+      let connection: WorkerRequestSql | undefined;
+      let selectedOrigin: string | undefined;
+      if (requestSqlSelected()) {
+        selectedOrigin = requirePublicOrigin(env);
+        if (writerEpoch === null)
+          throw new TypeError(
+            sharedAuthStaging === undefined
+              ? "Container Worker requires the selected Money writer for its native request origin"
+              : "shared-login Worker requires the selected Money writer",
+          );
+        connection = !sharedRequestSelected()
+          ? await createWorkerPrimaryRequestSql({
+              database: env.STATE_DB,
+              writerEpoch,
+            })
+          : await createWorkerRequestSql({
+              database: env.STATE_DB,
+              writerEpoch,
+              publicOrigin: selectedOrigin,
+              consoleOrigin: env.TAKOSERVER_CONSOLE_ORIGIN,
+            });
+        if (connection.moneyGuard === "frozen") return;
+      } else if (writerEpoch !== null) {
         if ((await inspectMoneyCutoverGuard(createD1Sql(env.STATE_DB), writerEpoch)) === "frozen")
           return;
       }
-      const app = await appFor(env, requirePublicOrigin(env));
+      const app = await appFor(env, selectedOrigin ?? requirePublicOrigin(env), connection);
+      assertSelectedNativeRequest(connection);
+      if (observeSharedAuthRequest !== undefined) await observeRequest(connection);
+      assertSelectedNativeRequest(connection);
       const results = await Promise.allSettled([
         Promise.resolve().then(() => app.tick()),
         Promise.resolve().then(() => drainV2Operations(() => app.tickTakoformV2())),

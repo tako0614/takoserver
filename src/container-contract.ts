@@ -47,6 +47,10 @@ export const CONTAINER_CONTRACT = Object.freeze({
 } as const);
 
 /** Host-private claim types carry no credential or provider target. */
+/** Canonical retained Container F2 Form identity shared by App and owner compiler. */
+export const V2_CONTAINER_F2_FORM =
+  "https://edge.forms.takoform.com/forms/Container/0.2.0/" as const;
+
 export interface ContainerBindingClaim {
   readonly principal: string;
   readonly space: string;

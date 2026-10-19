@@ -5332,9 +5332,13 @@ describe("released edge Form placement", () => {
     });
   });
 
-  test("reads and atomically appends the exact SQLite migration prefix", async () => {
-    const firstSql = new TextEncoder().encode("CREATE TABLE first (id INTEGER PRIMARY KEY);");
-    const secondSql = new TextEncoder().encode("CREATE TABLE example (id INTEGER PRIMARY KEY);");
+  test("retains historic PRAGMA receipts and atomically appends only a defer suffix", async () => {
+    const firstSql = new TextEncoder().encode(
+      "PRAGMA foreign_keys=ON; PRAGMA user_version=42; CREATE TABLE first (id INTEGER PRIMARY KEY);",
+    );
+    const secondSql = new TextEncoder().encode(
+      "PRAGMA defer_foreign_keys=TRUE;\nCREATE TABLE example (id INTEGER PRIMARY KEY);",
+    );
     const firstDigest = await bytesDigest(firstSql);
     const secondDigest = await bytesDigest(secondSql);
     const calls: Call[] = [];
@@ -5449,15 +5453,60 @@ describe("released edge Form placement", () => {
     const batch = JSON.parse(calls[2]?.body ?? "{}") as {
       batch?: { sql?: string; params?: unknown[] }[];
     };
-    expect(batch.batch).toHaveLength(3);
+    expect(batch.batch).toHaveLength(4);
     expect(batch.batch?.[0]?.sql).toContain("json_each(?)");
     expect(batch.batch?.[0]?.params).toEqual([
       1,
       JSON.stringify([{ path: "0001.sql", digest: firstDigest }]),
     ]);
-    expect(batch.batch?.[1]?.sql).toBe("CREATE TABLE example (id INTEGER PRIMARY KEY);");
-    expect(batch.batch?.[2]?.sql).toContain("INSERT INTO _takoform_sqlite_migrations");
-    expect(batch.batch?.[2]?.params?.[0]).toBe(2);
+    expect(batch.batch?.[1]?.sql).toBe("PRAGMA defer_foreign_keys=TRUE;");
+    expect(batch.batch?.[2]?.sql).toBe("\nCREATE TABLE example (id INTEGER PRIMARY KEY);");
+    expect(batch.batch?.[3]?.sql).toContain("INSERT INTO _takoform_sqlite_migrations");
+    expect(batch.batch?.[3]?.params?.[0]).toBe(2);
+    expect(calls[2]?.body).not.toContain("PRAGMA foreign_keys");
+    expect(calls[2]?.body).not.toContain("PRAGMA user_version");
+  });
+
+  test("refuses the entire new D1 suffix before any dispatch while retaining historical identities", async () => {
+    const files = await Promise.all(
+      [
+        "PRAGMA foreign_keys=ON; PRAGMA user_version=42; CREATE TABLE retained(id);",
+        "PRAGMA defer_foreign_keys=ON; INSERT INTO retained VALUES(1);",
+        "PRAGMA foreign_keys=OFF;",
+      ].map(async (text, index) => {
+        const sql = new TextEncoder().encode(text);
+        return { path: `staging/${index + 1}.sql`, digest: await bytesDigest(sql), sql };
+      }),
+    );
+    let dispatches = 0;
+    const provider = new CloudflareProvider({
+      accountId: "staging-account",
+      offerings: [technical("SQLiteDatabase")],
+      artifacts,
+      authorize: () => "Bearer fixture-only",
+      apiOrigin: "https://api.cloudflare.test/client/v4",
+      async fetch() {
+        dispatches += 1;
+        throw new Error("an unsafe unapplied suffix must never reach D1");
+      },
+    });
+    const historical = files[0];
+    if (!historical) throw new Error("missing historical fixture");
+    const result = await provider.sqliteMigrations.applySuffix({
+      operationId: "staging-unsafe-suffix",
+      operationMode: "recovery",
+      nativeId: "d1:staging-database",
+      target: {
+        resourceUid: "staging-resource",
+        incarnationId: "staging-incarnation",
+        generation: "1",
+      },
+      desired: files,
+      expectedPrefix: [{ path: historical.path, digest: historical.digest }],
+      migrations: files.slice(1),
+    });
+    expect(result).toMatchObject({ ok: false, failure: { code: "invalid_spec" } });
+    expect(dispatches).toBe(0);
   });
 
   test("applies an admitted 105-file suffix as one D1 transaction per file", async () => {

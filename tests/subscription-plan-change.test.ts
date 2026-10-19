@@ -1169,3 +1169,275 @@ describe("custodied next-period subscription changes", () => {
     },
   );
 });
+
+// Preparation DATA over this existing synthetic custody fixture is not genuine
+// adapter/native/Root qualification. Actual SQLite retention and no-command
+// boundaries are exercised; the unchanged adapter owns ready()/native reads.
+describe("private Financial PLAN economic preparation DATA", () => {
+  const paymentTables = [
+    "stripe_billing_plan_changes",
+    "stripe_billing_plan_change_slots",
+    "stripe_billing_plan_change_steps",
+    "stripe_billing_grants",
+    "wallet_credit_lots",
+  ];
+  function payments(h: Awaited<ReturnType<typeof fixture>>) {
+    return Object.fromEntries(
+      paymentTables.map((name) => [name, h.db.query(`SELECT * FROM ${name}`).all()]),
+    );
+  }
+
+  test("shares the exact command pre-selection and retains terms without command, slot or processor mutation", async () => {
+    const h = await fixture();
+    try {
+      const trace: string[] = [];
+      const read = h.custody.readTarget.bind(h.custody);
+      const original = h.custody.originalTerms.bind(h.custody);
+      h.custody.readTarget = async (org, ref) => {
+        trace.push("target");
+        return await read(org, ref);
+      };
+      h.custody.originalTerms = async (id) => {
+        trace.push("original-terms");
+        return await original(id);
+      };
+      const service = h.make(async (key) => {
+        trace.push("desired-plan");
+        expect(key).toBe(PLAN.planKey);
+        return PLAN;
+      });
+      const before = payments(h);
+      const selected = await service.preparePlanChangeEconomicR1(request);
+      expect(selected).toEqual({
+        kind: "plan-change",
+        expectedSubscriptionRef: REF,
+        targetSubscriptionId: OLD.subscriptionId,
+        targetGeneration: 1,
+        targetPeriodStart: START,
+        targetPeriodEnd: NEXT,
+        ...PLAN,
+        currency: "USD",
+      });
+      expect(Object.isFrozen(selected)).toBe(true);
+      expect(trace).toEqual(["target", "desired-plan", "original-terms", "original-terms"]);
+      expect(payments(h)).toEqual(before);
+      expect(h.calls).toEqual([]);
+      expect(h.cancelCalls).toEqual([]);
+      expect(
+        await h.sql.query(
+          "SELECT terms_json,command_reference FROM stripe_billing_subscription_terms",
+        ),
+      ).toEqual([{ terms_json: canonicalJson(OLD), command_reference: null }]);
+      const selectionTrace = [...trace];
+      trace.length = 0;
+      const batch = h.sql.batch.bind(h.sql);
+      let attempted: Parameters<Sql["batch"]>[0] | undefined;
+      const stop = new Error("test stops before actual command batch");
+      h.sql.batch = async (statements) => {
+        if (statements.some((s) => s.sql.includes("INSERT INTO stripe_billing_plan_changes"))) {
+          attempted = statements;
+          throw stop;
+        }
+        return await batch(statements);
+      };
+      await expect(service.change(request)).rejects.toBe(stop);
+      expect(trace).toEqual(selectionTrace);
+      if (!attempted) throw new Error("original command batch was not reached");
+      expect(attempted.some((s) => s.sql.includes("custody_test_target"))).toBe(true);
+      expect(
+        attempted.some((s) =>
+          s.sql.includes("NOT EXISTS(SELECT 1 FROM stripe_billing_plan_change_slots"),
+        ),
+      ).toBe(true);
+      const command = attempted.find((s) =>
+        s.sql.includes("INSERT INTO stripe_billing_plan_changes"),
+      );
+      expect(command?.params?.[8]).toBe(
+        canonicalJson({
+          target: await read(OLD.organizationId, REF),
+          plan: PLAN,
+          effectiveAt: NEXT,
+        }),
+      );
+      expect(payments(h)).toEqual(before);
+      expect(h.calls).toEqual([]);
+      expect(h.cancelCalls).toEqual([]);
+    } finally {
+      h.db.close();
+    }
+  });
+
+  const refusedTargets: {
+    name: string;
+    change: (target: SubscriptionPlanTarget) => SubscriptionPlanTarget;
+    code: string;
+  }[] = [
+    {
+      name: "expected reference",
+      change: (t) => ({ ...t, subscriptionRef: `sra_${"b".repeat(64)}` }),
+      code: "subscription_target_changed",
+    },
+    {
+      name: "Organization",
+      change: (t) => ({ ...t, terms: { ...t.terms, organizationId: "foreign" } }),
+      code: "subscription_target_changed",
+    },
+    {
+      name: "settlement",
+      change: (t) => ({ ...t, unresolvedSettlement: true }),
+      code: "subscription_settlement_unresolved",
+    },
+    {
+      name: "exclusive period end",
+      change: (t) => ({ ...t, periodEnd: NOW }),
+      code: "subscription_period_changed",
+    },
+    {
+      name: "generation",
+      change: (t) => ({ ...t, generation: -1 }),
+      code: "invalid_subscription_target",
+    },
+    {
+      name: "billing anchor",
+      change: (t) => ({ ...t, billingCycleAnchor: Number.NaN }),
+      code: "invalid_subscription_target",
+    },
+    {
+      name: "scheduled cancellation",
+      change: (t) => ({ ...t, cancelAtPeriodEnd: true }),
+      code: "subscription_cancellation_scheduled",
+    },
+    {
+      name: "attached schedule",
+      change: (t) => ({ ...t, scheduleId: "sub_sched_plan" }),
+      code: "subscription_management_conflict",
+    },
+  ];
+  for (const c of refusedTargets)
+    test(`retains ${c.name} refusal before command preparation`, async () => {
+      const h = await fixture();
+      try {
+        const read = h.custody.readTarget.bind(h.custody);
+        h.custody.readTarget = async (org, ref) => c.change(await read(org, ref));
+        const before = payments(h);
+        await expect(h.make().preparePlanChangeEconomicR1(request)).rejects.toMatchObject({
+          code: c.code,
+        });
+        expect(payments(h)).toEqual(before);
+        expect(h.calls).toEqual([]);
+        expect(h.cancelCalls).toEqual([]);
+        expect(await h.sql.query("SELECT * FROM stripe_billing_subscription_terms")).toEqual([]);
+      } finally {
+        h.db.close();
+      }
+    });
+
+  test("keeps the owning desired-plan qualifier, unchanged-plan and retained original-term refusals", async () => {
+    const h = await fixture();
+    try {
+      const before = payments(h);
+      await expect(
+        h.make(async () => ({ ...PLAN, planKey: "wrong" })).preparePlanChangeEconomicR1(request),
+      ).rejects.toMatchObject({ code: "unqualified_pricing_revision" });
+      await expect(
+        h.make(async () => OLD).preparePlanChangeEconomicR1({ ...request, planKey: OLD.planKey }),
+      ).rejects.toMatchObject({ code: "subscription_plan_unchanged" });
+      const unavailable = new Error("actual qualifier unavailable");
+      await expect(
+        h
+          .make(async () => {
+            throw unavailable;
+          })
+          .preparePlanChangeEconomicR1(request),
+      ).rejects.toBe(unavailable);
+      await h.sql.run(
+        "INSERT INTO stripe_billing_subscription_terms(subscription_id,effective_at,org_id,terms_json,command_reference) VALUES (?,?,?,?,NULL)",
+        [
+          OLD.subscriptionId,
+          START,
+          OLD.organizationId,
+          canonicalJson({ ...OLD, priceId: "price_wrong" }),
+        ],
+      );
+      await expect(h.make().preparePlanChangeEconomicR1(request)).rejects.toMatchObject({
+        code: "subscription_terms_conflict",
+      });
+      expect(payments(h)).toEqual(before);
+      expect(h.calls).toEqual([]);
+      expect(h.cancelCalls).toEqual([]);
+    } finally {
+      h.db.close();
+    }
+  });
+
+  test("an existing original reference and occupied slot are never repriced as NEW preparation DATA", async () => {
+    const h = await fixture();
+    try {
+      await h.make().change(request);
+      const before = payments(h),
+        calls = h.calls.length;
+      let targets = 0,
+        qualifiers = 0;
+      const read = h.custody.readTarget.bind(h.custody);
+      h.custody.readTarget = async (org, ref) => {
+        targets++;
+        return await read(org, ref);
+      };
+      const service = h.make(async () => {
+        qualifiers++;
+        return PLAN;
+      });
+      await expect(service.preparePlanChangeEconomicR1(request)).rejects.toMatchObject({
+        code: "payment_command_conflict",
+      });
+      expect(targets).toBe(0);
+      expect(qualifiers).toBe(0);
+      await expect(
+        service.preparePlanChangeEconomicR1({ ...request, reference: "new-reference" }),
+      ).rejects.toMatchObject({ code: "subscription_management_conflict" });
+      expect(payments(h)).toEqual(before);
+      expect(h.calls.length).toBe(calls);
+      expect(qualifiers).toBe(0);
+    } finally {
+      h.db.close();
+    }
+  });
+
+  test("captures all existing action inputs before the first selection await", async () => {
+    const h = await fixture();
+    let release!: () => void;
+    try {
+      let reached!: () => void;
+      const seen = new Promise<void>((resolve) => {
+        reached = resolve;
+      });
+      const wait = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const read = h.custody.readTarget.bind(h.custody);
+      h.custody.readTarget = async (org, ref) => {
+        const target = await read(org, ref);
+        reached();
+        await wait;
+        return target;
+      };
+      const mutable = { ...request };
+      const pending = h.make().preparePlanChangeEconomicR1(mutable);
+      await seen;
+      mutable.reference = "changed-after-await";
+      mutable.planKey = "changed-after-await";
+      mutable.expectedSubscriptionRef = `sra_${"b".repeat(64)}`;
+      release();
+      expect(await pending).toMatchObject({
+        planKey: PLAN.planKey,
+        expectedSubscriptionRef: REF,
+        targetGeneration: 1,
+      });
+      expect(Object.values(payments(h)).every((rows) => rows.length === 0)).toBe(true);
+      expect(h.calls).toEqual([]);
+    } finally {
+      release?.();
+      h.db.close();
+    }
+  });
+});

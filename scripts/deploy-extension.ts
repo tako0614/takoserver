@@ -41,11 +41,26 @@ export {
   runExactArtifactRecoveryDeployment,
 } from "./deploy/exact-artifact-recovery.ts";
 export type {
+  FreshV2IntegrationStorageTargetProof,
+  IntegrationStorageGenerationInvocation,
+  IntegrationStorageGenerationNamespace,
+  IntegrationStorageGenerationOptions,
   IntegrationStorageGenerationTargetProof,
   IntegrationStorageGenerationTargetVerificationOptions,
+  IntegrationStorageOriginalCreateEvidence,
+  IntegrationStorageOriginalCreateOptions,
+  IntegrationStorageOriginalCreateReceipt,
+  IntegrationStorageOriginalCreateVerification,
+  IntegrationStorageOriginalCreateVerificationOptions,
   IntegrationStorageTargetReadProvider,
 } from "./deploy/integration-storage-generation.ts";
-export { verifyIntegrationStorageGenerationTarget } from "./deploy/integration-storage-generation.ts";
+export {
+  integrationStorageGenerationName,
+  runIntegrationStorageGeneration,
+  verifyFreshV2IntegrationStorageTarget,
+  verifyIntegrationStorageGenerationTarget,
+  verifyIntegrationStorageOriginalCreate,
+} from "./deploy/integration-storage-generation.ts";
 export { runIntegrationWorkerBootstrap } from "./deploy/integration-worker-bootstrap.ts";
 export type { D1SchemaState, MigrationArtifact, MigrationFile } from "./deploy/migrations.ts";
 export { readD1SchemaState } from "./deploy/migrations.ts";
@@ -88,6 +103,20 @@ export {
   readCurrentAuditedMigrationSourceArtifact,
   runD1Schema,
 } from "./deploy/schema.ts";
+export type { MoneyHeldNormalWorkerModeFacts } from "./deploy/schema-money-unit-cutover.ts";
+export type {
+  MoneyUnitHeldConvertContext,
+  MoneyUnitHeldConvertFacts,
+  MoneyUnitHeldNormalWorkerModePreparation,
+  MoneyUnitOriginalOriginRead,
+  MoneyUnitResumeReadback,
+  MoneyUnitResumeReadRequest,
+} from "./deploy/schema-money-unit-owner.ts";
+export {
+  assertMoneyUnitHeldConvertCurrent,
+  assertMoneyUnitHeldNormalWorkerModePreparationCurrent,
+  readIntegrationMoneyUnitResumeState,
+} from "./deploy/schema-money-unit-owner.ts";
 export type {
   DeployTarget,
   ManagedWorkerDispatchNamespaceTarget,

@@ -1,5 +1,9 @@
 import { parseActorAbiRef } from "./actor-abi-ref.ts";
 import {
+  type ObjectBucketBindingForm,
+  snapshotObjectBucketBindingForms,
+} from "./object-bucket-binding-profile.ts";
+import {
   SELFHOST_WORKER_DATA_SERVICE_MODULE,
   selfhostDataServiceSource,
 } from "./providers/selfhost-data-service.ts";
@@ -39,6 +43,7 @@ import {
   SELFHOST_WORKER_SERVICE_BINDING_KIND,
   type SelfhostWorkerBindingDescriptor,
   selfhostWorkerEntrypointSource,
+  selfhostWorkerForwardObjectBucketEntrypointSource,
 } from "./providers/selfhost-worker-wrapper.ts";
 import {
   WORKERD_V2_PRIVATE_DATA_SERVICE_BINDING,
@@ -116,6 +121,8 @@ type WorkerdAssetInput = {
 
 /** The already-selected, credential-bearing facts needed to compile one Version graph. */
 export interface WorkerdVersionGraphInput {
+  /** Exact source-owned07 profile; pure compiler metadata, not a native grant. */
+  readonly forwardObjectBucketBindings?: readonly ObjectBucketBindingForm[];
   readonly directory: string;
   readonly mainModule: string;
   readonly modules: ReadonlyMap<string, Uint8Array>;
@@ -247,6 +254,20 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
     input.v2ObjectBucketBinding,
     v2PrivateNames,
   );
+  const forwardObjectBucketBindings =
+    input.forwardObjectBucketBindings === undefined
+      ? undefined
+      : snapshotObjectBucketBindingForms(input.forwardObjectBucketBindings);
+  if (
+    forwardObjectBucketBindings !== undefined &&
+    (!v2PrivateNames ||
+      forwardObjectBucketBindings.length !== (v2ObjectBucketBinding?.bindings.length ?? 0) ||
+      forwardObjectBucketBindings.some(
+        (binding, index) =>
+          binding.publicName !== v2ObjectBucketBinding?.bindings[index]?.publicName,
+      ))
+  )
+    invalid();
   const v2KvBinding = projectV2KvBinding(input.v2KvBinding, v2PrivateNames);
   const v2QueueProducerBinding = projectV2KvBinding(input.v2QueueProducerBinding, v2PrivateNames);
   const serviceBindings = projectServiceBindings(input.serviceBindings);
@@ -313,28 +334,34 @@ export function compileWorkerdVersionGraph(input: WorkerdVersionGraphInput): Wor
       unavailableToken: service.unavailableToken,
     })),
   ];
-  const wrapperSource = selfhostWorkerEntrypointSource(
-    {
-      originalMainModule: input.mainModule,
-      declaredHandlers: input.declaredHandlers,
-      bindings: [
-        ...bindings,
-        ...(actorForward?.bindings.map((binding) => ({
-          name: binding.publicName,
-          type: "json" as const,
-        })) ?? []),
-        ...(workflowForward?.bindings.map((binding) => ({
-          name: binding.publicName,
-          type: "json" as const,
-        })) ?? []),
-      ],
-      publication: input.readiness.publication,
-      probeHostname: input.readiness.probeHostname,
-      ...(eventToken === undefined ? {} : { events: true }),
-      ...(v2QueueSettlement === undefined ? {} : { v2Queue: true }),
-    },
-    v2PrivateNames,
-  );
+  const wrapperInput = {
+    originalMainModule: input.mainModule,
+    declaredHandlers: input.declaredHandlers,
+    bindings: [
+      ...bindings,
+      ...(actorForward?.bindings.map((binding) => ({
+        name: binding.publicName,
+        type: "json" as const,
+      })) ?? []),
+      ...(workflowForward?.bindings.map((binding) => ({
+        name: binding.publicName,
+        type: "json" as const,
+      })) ?? []),
+    ],
+    publication: input.readiness.publication,
+    probeHostname: input.readiness.probeHostname,
+    ...(eventToken === undefined ? {} : { events: true }),
+    ...(v2QueueSettlement === undefined ? {} : { v2Queue: true }),
+  };
+  // The exact profile was validated against every declared bucket above.
+  // An empty accepted profile introduces no forward bucket semantics.
+  const wrapperSource =
+    forwardObjectBucketBindings === undefined || forwardObjectBucketBindings.length === 0
+      ? selfhostWorkerEntrypointSource(wrapperInput, v2PrivateNames)
+      : selfhostWorkerForwardObjectBucketEntrypointSource(
+          { source: wrapperInput, objectBucketBindings: forwardObjectBucketBindings },
+          v2PrivateNames,
+        );
 
   const preludeModule = selfhostWorkerPreludeModuleName(input.mainModule);
   const encoder = new TextEncoder();

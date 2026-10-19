@@ -1,12 +1,63 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  linkSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { buildD1MigrationImport } from "../scripts/deploy/d1-migration-import.ts";
+import { normalizeSnapshotDump } from "../scripts/deploy/d1-snapshot-restore.ts";
+import {
+  type IntegrationStorageGenerationInvocation,
+  runIntegrationStorageGeneration,
+} from "../scripts/deploy/integration-storage-generation.ts";
+import { canonicalSchemaShape, readMigrationArtifact } from "../scripts/deploy/migrations.ts";
+import { type CommandResult, REPOSITORY } from "../scripts/deploy/process.ts";
+import { removeArtifactTree, sealDirectory } from "../scripts/deploy/qualification.ts";
 import { expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
-import { moneyCutoverBindingDigest } from "../scripts/deploy/schema-money-unit-cutover.ts";
-import { loadMoneyUnitCutoverOptions } from "../scripts/deploy/schema-money-unit-owner.ts";
-import type { DeployTarget } from "../scripts/deploy/target.ts";
+import {
+  buildMoneyCutoverImportSql,
+  inspectMoneyUnitPost94State,
+  type MoneyCutoverDispatchBinding,
+  type MoneyPost94DispatchBinding,
+  type MoneyPreserved100DispatchBinding,
+  type MoneyPreserved100ReviewBinding,
+  type MoneyReviewBinding,
+  moneyCutoverBindingDigest,
+  moneyUnitCutoverSourcePrefixDigest,
+  prepareIntegrationMoneyHeldSuffix98OriginalUpload,
+  prepareIntegrationMoneyHeldSuffix98ReplacementUpload,
+  readMoneyAggregateDigest,
+  readMoneyFrozenDataDigest,
+  readMoneyPreimageDigest,
+  readWholeDatabaseDataDigest,
+  runIntegrationMoneyHeldSuffix98FromOriginalUpload,
+  runIntegrationMoneyOriginalPreserved100,
+  runIntegrationMoneyUnitCutover,
+} from "../scripts/deploy/schema-money-unit-cutover.ts";
+import {
+  assertMoneyUnitOriginalWriterOptions,
+  captureMoneyUnitOriginalConverted94Backup,
+  loadMoneyUnitCutoverOptions,
+  loadMoneyUnitOriginalCutoverOptions,
+  type MoneyUnitOriginalCutoverOptions,
+  type MoneyUnitOwnerDependencies,
+  parseMoneyUnitPreserved100ExactReviewData,
+  readIntegrationMoneyUnitResumeState,
+  readMoneyUnitOriginalPreserved100IndependentReview,
+} from "../scripts/deploy/schema-money-unit-owner.ts";
+import { type DeployTarget, loadTarget, parseDeployTarget } from "../scripts/deploy/target.ts";
 import { expectedExactBindingClosure } from "../scripts/deploy/worker-state.ts";
 
 const account = "a".repeat(32);
@@ -75,8 +126,9 @@ const target: DeployTarget = {
 };
 
 const roots: string[] = [];
+// Sealed 0500 import directories are not removable by a non-root runner; unseal first.
 afterEach(() => {
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  for (const root of roots.splice(0)) removeArtifactTree(root);
 });
 
 function fixture(selectedTarget: DeployTarget = target) {
@@ -464,7 +516,375 @@ function standaloneFixture(operatorIdentity?: NonNullable<DeployTarget["operator
   };
 }
 
+/** Full owner reader and held custody; all native ports are controlled component fixtures. */
+async function resumeDependencyFixture(mode: "clear" | "replace") {
+  const f = standaloneFixture();
+  f.setPublicMode(false);
+  f.setResumeFrozen(true);
+  const resumeRoot = join(f.root, "resume-source");
+  mkdirSync(resumeRoot, { mode: 0o700 });
+  const files = readMigrationArtifact().files;
+  const database = new Database(":memory:");
+  const original = normalizeSnapshotDump(
+    Buffer.from(buildD1MigrationImport(files.slice(0, 92), { freshLedger: true }).sql),
+  );
+  database.exec(original.sql);
+  writeFileSync(f.paths.backup, original.sql, { mode: 0o600 });
+  const manifestPath = join(f.root, "classifications.json");
+  writeFileSync(manifestPath, "[]\n", { mode: 0o600 });
+  const resumePublicationReceiptDigest = f.write(f.paths.resumePublication, {
+    kind: "takoserver.money-public-worker-publication@v1",
+    state: "reviewed",
+    reviewedAt,
+    reviewEvidenceDigest: sha("resume-publication-review-evidence"),
+    phase: "resume",
+    accountId: account,
+    databaseId,
+    workerName: f.target.workerName,
+    sourceCommit: resumeSource,
+    bundleDigest: sha(resumeBytes),
+    artifactDigest: sha("sealed-resume"),
+    artifactBytes: 100,
+    artifactFiles: 2,
+    deploymentId: id(45),
+    versionId: id(44),
+    surface: "takoserver-worker-authority-cutover",
+    resultKind: "takoserver.worker-closure-transition-apply@v1",
+    resultDigest: sha("resume-result"),
+    ownerGateDigest: sha("resume-gate"),
+    reviewer: "publication-reviewer",
+    reviewRef: "review://resume-publication",
+  });
+  f.write(f.paths.declaration, {
+    ...f.declaration,
+    phase: "resume",
+    resumeCommit: resumeSource,
+    resumeModuleDigest: sha(resumeBytes),
+    resumeSourceRoot: resumeRoot,
+    resumePublicationReceiptPath: f.paths.resumePublication,
+    resumePublicationReceiptDigest,
+    classificationManifestPath: manifestPath,
+    classificationManifestDigest: sha("[]\n"),
+  });
+  const owner = await loadMoneyUnitCutoverOptions(f.paths.declaration, f.target, f);
+  const origin = await owner.stageOriginProof();
+  const identity = await owner.storageIdentityRead();
+  const originDigest = sha(JSON.stringify(origin));
+  f.write(`${f.paths.backup}.identity.json`, {
+    kind: "takoserver.money-protected-backup@v1",
+    accountId: account,
+    databaseId,
+    databaseName: name,
+    originDigest,
+    sourceDigest,
+    backupDigest: original.digest,
+  });
+  const local = {
+    query: async (_phase: unknown, _description: unknown, sql: string) =>
+      database.query(sql).all() as Record<string, unknown>[],
+  };
+  const preimageDigest = await readMoneyPreimageDigest(local, "preflight");
+  const aggregateDigest = await readMoneyAggregateDigest(local, "preflight");
+  const financialDigest = await readMoneyFrozenDataDigest(local, "preflight");
+  const writerDigest = sha("controlled prior native maintenance proof");
+  const anchor = sha(
+    JSON.stringify({
+      kind: "takoserver.money-freeze-anchor@v1",
+      target: identity,
+      originDigest,
+      backupDigest: original.digest,
+      preimageDigest,
+      aggregateDigest,
+      financialDigest,
+      writerDigest,
+      writerEpoch,
+      sourceDigest,
+    }),
+  );
+  const schema = () => {
+    const applied = (
+      database.query("SELECT name FROM d1_migrations ORDER BY id").all() as { name: string }[]
+    ).map((row) => row.name);
+    const shape = canonicalSchemaShape(
+      database
+        .query(
+          "SELECT type, name, tbl_name, COALESCE(sql, '') AS sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name",
+        )
+        .all() as Record<string, unknown>[],
+    );
+    return { applied, shape, shapeDigest: sha(shape) };
+  };
+  let predecessor = origin.terminalCustodyDigest;
+  const phaseImports: string[] = [];
+  for (const phase of ["freeze", "prepare", "classify", "convert"] as const) {
+    const beforeShapeDigest = schema().shapeDigest;
+    const sql = buildMoneyCutoverImportSql({
+      phase,
+      files,
+      anchor,
+      originDigest,
+      backupDigest: original.digest,
+      writerDigest,
+      writerEpoch,
+      classifications: [],
+    });
+    const directory = join(f.root, `money-${phase}-fixture`);
+    mkdirSync(directory, { mode: 0o700 });
+    const sealedImportPath = join(directory, "import.sql");
+    writeFileSync(sealedImportPath, sql, { mode: 0o600 });
+    const binding: MoneyCutoverDispatchBinding = {
+      kind: "takoserver.money-cutover-dispatch@v1",
+      phase,
+      accountId: account,
+      databaseId,
+      databaseName: name,
+      originDigest,
+      predecessorCustodyDigest: predecessor,
+      sourceCommit: source,
+      sourceDigest: moneyUnitCutoverSourcePrefixDigest(files, phase === "convert" ? 94 : 93),
+      importDigest: sha(sql),
+      backupDigest: original.digest,
+      preimageDigest,
+      aggregateDigest,
+      classificationDigest: sha("[]\n"),
+      writerDigest,
+      resumeDigest: sha("no-resume-worker"),
+      writerEpoch,
+      reviewDigest: sha("temporary-review-digest"),
+      beforeShapeDigest,
+      afterSchemaPhase:
+        phase === "freeze" ? "0092-fenced" : phase === "convert" ? "0094-fenced" : "0093-fenced",
+      sealedImportPath,
+    };
+    const reviewBinding: MoneyReviewBinding = {
+      kind: "takoserver.money-review-binding@v1",
+      phase,
+      accountId: account,
+      databaseId,
+      originDigest,
+      predecessorCustodyDigest: predecessor,
+      sourceCommit: source,
+      sourceDigest: binding.sourceDigest,
+      importDigest: binding.importDigest,
+      backupDigest: binding.backupDigest,
+      preimageDigest,
+      aggregateDigest,
+      classificationDigest: binding.classificationDigest,
+      writerDigest,
+      resumeDigest: binding.resumeDigest,
+      writerEpoch,
+    };
+    const review = {
+      kind: "takoserver.money-independent-review@v1",
+      state: "reviewed",
+      reviewedAt,
+      reviewEvidenceDigest: sha("controlled component review"),
+      reviewer: "component-reviewer",
+      reviewRef: "review://controlled-component",
+      bindingDigest: moneyCutoverBindingDigest(reviewBinding),
+      evidenceDigest: sha("controlled component review"),
+    };
+    f.write(f.paths.review, review);
+    const reviewedBinding = { ...binding, reviewDigest: sha(JSON.stringify(review)) };
+    await owner.custody.dispatch(reviewedBinding);
+    database.exec(`BEGIN TRANSACTION;\n${sql}\nCOMMIT;`);
+    phaseImports.push(sql);
+    const post = schema();
+    const terminal = await owner.custody.terminal(
+      reviewedBinding,
+      sha(
+        JSON.stringify({
+          applied: post.applied,
+          shapeDigest: post.shapeDigest,
+          preimageDigest,
+          aggregateDigest,
+        }),
+      ),
+    );
+    predecessor = sha(JSON.stringify(terminal));
+  }
+  let builds = 0;
+  let lateCallbacks = 0;
+  let d1Reads = 0;
+  type MutableDependencies = {
+    -readonly [K in keyof MoneyUnitOwnerDependencies]: MoneyUnitOwnerDependencies[K];
+  };
+  const dependencies: MutableDependencies = {
+    state: {
+      ...f.state,
+      async workerDeployments(workerName: string) {
+        const history = await f.state.workerDeployments(workerName);
+        if (builds === 2) {
+          await Promise.resolve();
+          lateCallbacks++;
+          if (mode === "clear") {
+            delete dependencies.state;
+            delete dependencies.storage;
+            delete dependencies.fetcher;
+            delete dependencies.publicArtifactBuilder;
+          } else {
+            dependencies.state = {
+              ...f.state,
+              workerDeployments: async () => {
+                throw new Error("replacement state consumed");
+              },
+            };
+            dependencies.storage = {
+              getD1: async () => {
+                throw new Error("replacement D1 consumed");
+              },
+              getR2: async () => {
+                throw new Error("replacement R2 consumed");
+              },
+            };
+            dependencies.fetcher = async () => {
+              throw new Error("replacement fetcher consumed");
+            };
+            dependencies.publicArtifactBuilder = async () => {
+              throw new Error("replacement builder consumed");
+            };
+          }
+        }
+        return history;
+      },
+    },
+    storage: f.storage,
+    fetcher: f.fetcher,
+    publicArtifactBuilder: async (root: string, commit: string) => {
+      builds++;
+      return f.publicArtifactBuilder(root, commit);
+    },
+    cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "controlled-component-token" },
+    run: async (command) => {
+      if (command[0] === "git" && command[3] === "rev-parse") {
+        const selectedRoot = command[2];
+        return {
+          exitCode: 0,
+          stdout: `${command[4] === "HEAD" ? (selectedRoot === resumeRoot ? resumeSource : source) : selectedRoot}\n`,
+          stderr: "",
+        };
+      }
+      const commandIndex = command.indexOf("--command");
+      if (command.includes("d1") && command.includes("execute") && commandIndex >= 0) {
+        const sql = command[commandIndex + 1];
+        if (!sql || !/^(?:SELECT\b|PRAGMA\b)/u.test(sql)) throw new Error("non-read D1 command");
+        d1Reads++;
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify([{ success: true, results: database.query(sql).all() }]),
+          stderr: "",
+        };
+      }
+      return f.run(command);
+    },
+  };
+  return {
+    f,
+    owner,
+    original,
+    database,
+    schema,
+    phaseImports,
+    originDigest,
+    preimageDigest,
+    aggregateDigest,
+    financialDigest,
+    writerDigest,
+    dependencies,
+    reads: () => d1Reads,
+    builds: () => builds,
+    lateCallbacks: () => lateCallbacks,
+    close: () => database.close(),
+  };
+}
+
 describe("money unit owner adapter", () => {
+  for (const mode of ["clear", "replace"] as const) {
+    test(`money resume dependency snapshot preserves component taint when late ports ${mode}`, async () => {
+      const fixture = await resumeDependencyFixture(mode);
+      try {
+        const result = await readIntegrationMoneyUnitResumeState(
+          { selectedTarget: fixture.f.target, declarationPath: fixture.f.paths.declaration },
+          fixture.dependencies,
+        );
+        expect(fixture.builds()).toBe(2);
+        expect(fixture.lateCallbacks()).toBe(1);
+        expect(fixture.reads()).toBeGreaterThan(0);
+        expect(result.schemaPhase).toBe("0094-fenced");
+        expect(result.normalHostReady).toBe(false);
+        expect(result.qualification).toBe("component-simulation-only");
+      } finally {
+        fixture.close();
+      }
+    });
+  }
+
+  test("money resume read admits prefixed policy only under its explicit read selector", async () => {
+    const f = fixture();
+    const { cloudflareProviderExecutor: _private, ...standalone } = target;
+    const pair = `integration-ts-${generation}`;
+    const selected = {
+      ...standalone,
+      d1: { databaseId, databaseName: pair },
+      r2: { bucketName: pair },
+      takoformV2: {
+        storageLineage: "v2-0092",
+        config: JSON.stringify({
+          documentation: "https://docs.example.test",
+          authenticationDocumentation: "https://auth.example.test",
+        }),
+      },
+    };
+    expect(() => parseDeployTarget(selected, "component target", "integration")).toThrow(
+      "money cutover writer policy",
+    );
+    const readTarget = parseDeployTarget(
+      selected,
+      "component target",
+      "integration",
+      "money-resume-read",
+    );
+    expect(readTarget.d1.databaseName).toBe(pair);
+    const path = join(f.root, "read-target.json");
+    f.write(path, selected);
+    expect(loadTarget(path, "integration", "money-resume-read")).toEqual(readTarget);
+    expect(() => loadTarget(path, "integration")).toThrow("money cutover writer policy");
+    await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, readTarget, f)).rejects.toThrow(
+      "existing legacy staging origin",
+    );
+    expect(f.requests).toEqual([]);
+  });
+
+  test("money resume read refuses a legacy certificate as original origin for the new namespace", async () => {
+    const f = fixture();
+    const pair = `integration-ts-${generation}`;
+    const selected = {
+      ...target,
+      d1: { databaseId, databaseName: pair },
+      r2: { bucketName: pair },
+    };
+    await expect(
+      readIntegrationMoneyUnitResumeState(
+        { selectedTarget: selected, declarationPath: f.paths.declaration },
+        f,
+      ),
+    ).rejects.toThrow("original-origin locators");
+    expect(f.requests).toEqual([]);
+  });
+
+  test("money resume read refuses JSON proof promotion before touching owner inputs", async () => {
+    const f = fixture();
+    const request = {
+      selectedTarget: target,
+      declarationPath: f.paths.declaration,
+      nativeResumeProof: { ready: true, schemaPhase: "0094" },
+    };
+    await expect(readIntegrationMoneyUnitResumeState(request, f)).rejects.toThrow(
+      "original-origin locators",
+    );
+    expect(f.requests).toEqual([]);
+  });
+
   test("accepts the qualified authority closure receipt and rejects other publication kinds", async () => {
     const f = standaloneFixture();
     const receipt = JSON.parse(readFileSync(f.paths.maintenancePublication, "utf8"));
@@ -957,5 +1377,1636 @@ describe("money unit owner adapter", () => {
       state: "reviewed",
       bindingDigest: moneyCutoverBindingDigest(binding),
     });
+  });
+});
+
+function freshOriginalMoneyFixture() {
+  const { cloudflareProviderExecutor: _managed, ...standalone } = target;
+  const pair = `integration-ts-${generation}`;
+  const selected: DeployTarget = {
+    ...standalone,
+    workerName: "integration-money-host",
+    publicOrigin: "https://integration-money-host.test.workers.dev",
+    d1: { databaseName: pair, databaseId },
+    r2: { bucketName: pair },
+    takoformV2: {
+      storageLineage: "v2-0092",
+      config: JSON.stringify({
+        documentation: "https://docs.example.test",
+        authenticationDocumentation: "https://auth.example.test",
+      }),
+    },
+  };
+  const f = fixture(selected);
+  const originalTarget: DeployTarget = {
+    kind: "takoserver.deploy-target@v2",
+    environment: "integration",
+    accountId: account,
+    workerName: "old-incumbent",
+    publicOrigin: "https://old-incumbent.test.workers.dev",
+    d1: { databaseName: "old-incumbent", databaseId: id(900) },
+    r2: { bucketName: "old-incumbent" },
+    signing: { currentKeyId: "key-current" },
+  };
+  const originalTargetPath = join(f.root, "original-target.json");
+  f.write(originalTargetPath, originalTarget);
+  const originalDirectory = join(f.root, "original-custody");
+  mkdirSync(originalDirectory, { mode: 0o700 });
+  const pin = lstatSync(originalDirectory, { bigint: true });
+  const originalCreate = {
+    kind: "positive-fresh-0092" as const,
+    custodyDirectory: originalDirectory,
+    custodyIdentity: { device: String(pin.dev), inode: String(pin.ino) },
+  };
+  const invocation: IntegrationStorageGenerationInvocation = {
+    action: "apply",
+    environment: "integration",
+    commit: source,
+    generation,
+    namespace: "integration-ts",
+    freshLineage: "v2-0092",
+  };
+  const {
+    originCertificatePath: _certificate,
+    originCertificateDigest: _digest,
+    privateSourceRoot: _privateSource,
+    ...base
+  } = f.declaration;
+  const declaration = {
+    ...base,
+    databaseName: pair,
+    bucketName: pair,
+    privateWriterScopeDigest: f.write(f.paths.scope, {
+      ...f.scope,
+      profile: "standalone-host",
+      publicSourceCommit: source,
+      sourceInventoryDigest: sha(f.inventory),
+      components: [],
+    }),
+    originalOrigin: { invocation, originalTargetPath },
+  };
+  f.write(f.paths.declaration, declaration);
+  const request = {
+    selectedTarget: selected,
+    declarationPath: f.paths.declaration,
+    originalCreate,
+  };
+  return {
+    ...f,
+    target: selected,
+    declaration,
+    request,
+    invocation,
+    originalTarget,
+    originalTargetPath,
+    originalDirectory,
+    pair,
+  };
+}
+
+/** Actual creator/verifier/HTTP adapter; HTTP and command protocols are local stand-ins, never native evidence. */
+async function createdOriginalMoneyFixture(lostCreateAck = false) {
+  const f = freshOriginalMoneyFixture();
+  const database = new Database(":memory:");
+  const contacts: string[] = [];
+  const commands: string[][] = [];
+  let createdD1 = false;
+  let createdR2 = false;
+  let returnedD1Id = databaseId;
+  let returnedD1Name = f.pair;
+  let imports = 0;
+  let loseIdentityAfterImport = false;
+  let retainedImportFailure: "mixed-mode" | "digest" | undefined;
+  let retainedImport: { path: string; bytes: Uint8Array } | undefined;
+  let retainedImportFaultApplied = false;
+  let driftSealedInputAfterProviderAck = false;
+  let importAckSealFaultApplied = false;
+  const snapshot = () => {
+    const quoteName = (name: string) => `"${name.replaceAll('"', '""')}"`;
+    const tables = database
+      .query(
+        "SELECT name, sql FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+      )
+      .all() as { name: string; sql: string }[];
+    const statements = ["PRAGMA foreign_keys=OFF;", "BEGIN TRANSACTION;"];
+    for (const table of tables) statements.push(`${table.sql};`);
+    for (const table of tables) {
+      const columns = database.query(`PRAGMA table_info(${quoteName(table.name)})`).all() as {
+        name: string;
+      }[];
+      const projections = columns.map(
+        (column, index) => `quote(${quoteName(column.name)}) AS v${index}`,
+      );
+      const rows = database
+        .query(`SELECT ${projections.join(",")} FROM ${quoteName(table.name)}`)
+        .all() as Record<string, string>[];
+      for (const row of rows)
+        statements.push(
+          `INSERT INTO ${quoteName(table.name)} VALUES (${columns.map((_, index) => row[`v${index}`]).join(",")});`,
+        );
+    }
+    for (const row of database
+      .query(
+        "SELECT sql FROM sqlite_schema WHERE type IN ('index','trigger','view') AND sql IS NOT NULL ORDER BY type, name",
+      )
+      .all() as { sql: string }[])
+      statements.push(`${row.sql};`);
+    statements.push("COMMIT;");
+    return statements.join("\n");
+  };
+  const protocolFetch = Object.assign(
+    async (input: Parameters<typeof globalThis.fetch>[0]) => {
+      if (!(input instanceof Request)) throw new Error("unexpected non-Request protocol");
+      const url = new URL(input.url);
+      if (
+        url.origin !== "https://api.cloudflare.com" ||
+        !url.pathname.startsWith(`/client/v4/accounts/${account}/`)
+      )
+        throw new Error("unexpected protocol destination");
+      contacts.push(`${input.method} ${url.pathname}`);
+      const path = url.pathname.slice(`/client/v4/accounts/${account}`.length);
+      let result: unknown;
+      if (path === "/d1/database" && input.method === "POST") {
+        expect(await input.json()).toEqual({ name: f.pair });
+        createdD1 = true;
+        if (lostCreateAck) throw new Error("controlled lost create ACK");
+        result = { name: f.pair, uuid: databaseId };
+      } else if (path === "/d1/database" && input.method === "GET") {
+        expect(url.searchParams.get("name")).toBe(f.pair);
+        result = createdD1 ? [{ name: f.pair, uuid: databaseId }] : [];
+      } else if (path === `/d1/database/${databaseId}` && input.method === "GET") {
+        if (!createdD1) throw new Error("D1 not created");
+        result = { name: returnedD1Name, uuid: returnedD1Id };
+      } else if (path === "/r2/buckets" && input.method === "POST") {
+        expect(await input.json()).toEqual({ name: f.pair });
+        createdR2 = true;
+        result = { name: f.pair };
+      } else if (path === "/r2/buckets" && input.method === "GET") {
+        result = { buckets: createdR2 ? [{ name: f.pair }] : [] };
+      } else if (path === `/r2/buckets/${f.pair}` && input.method === "GET") {
+        if (!createdR2) throw new Error("R2 not created");
+        result = { name: f.pair };
+      } else throw new Error("unexpected provider protocol operation");
+      return Response.json({ success: true, errors: [], messages: [], result });
+    },
+    {
+      preconnect(..._parameters: Parameters<typeof globalThis.fetch.preconnect>): never {
+        throw new Error("unexpected original money preconnect");
+      },
+    },
+  ) satisfies typeof globalThis.fetch;
+  const http = spyOn(globalThis, "fetch").mockImplementation(protocolFetch);
+  const run: NonNullable<MoneyUnitOwnerDependencies["run"]> = async (command) => {
+    commands.push([...command]);
+    const key = command.join(" ");
+    const ok = (stdout = ""): CommandResult => ({ exitCode: 0, stdout, stderr: "" });
+    if (key === "git rev-parse HEAD") return ok(`${source}\n`);
+    if (key === "git branch --show-current") return ok("component-original-money\n");
+    if (key === "git status --porcelain=v1 -z --untracked-files=all") return ok();
+    if (key === "bun run check:migrations") return ok("controlled source gate\n");
+    if (key === "git fetch --quiet --all --prune") return ok();
+    if (key === `git branch -r --contains ${source}`)
+      return ok("origin/component-original-money\n");
+    if (command.includes("d1") && command.includes("export")) {
+      const path = command[command.indexOf("--output") + 1];
+      if (!path) throw new Error("missing controlled export path");
+      writeFileSync(path, snapshot(), { mode: 0o600 });
+      return ok("controlled export\n");
+    }
+    if (command.includes("d1") && command.includes("execute")) {
+      const file = command.indexOf("--file");
+      if (file >= 0) {
+        const path = command[file + 1];
+        if (!path) throw new Error("missing controlled import path");
+        database.exec(readFileSync(path, "utf8"));
+        imports++;
+        if (loseIdentityAfterImport && imports > 1) returnedD1Id = id(903);
+        if (retainedImportFailure !== undefined && imports > 1) {
+          retainedImport = { path, bytes: readFileSync(path) };
+        }
+        const acknowledgement = ok("controlled import ACK\n");
+        if (driftSealedInputAfterProviderAck && imports > 1) {
+          // The provider accepted the import; drift before runImport receives its success result.
+          const retained = readFileSync(path);
+          chmodSync(path, 0o600);
+          writeFileSync(
+            path,
+            Buffer.concat([retained, Buffer.from("\n-- controlled acknowledged input drift\n")]),
+          );
+          chmodSync(path, 0o400);
+          importAckSealFaultApplied = true;
+        }
+        return acknowledgement;
+      }
+      const query = command.indexOf("--command");
+      const sql = command[query + 1];
+      if (query < 0 || !sql || !/^(?:SELECT|PRAGMA)\b/u.test(sql))
+        throw new Error("unexpected D1 protocol");
+      if (
+        retainedImportFailure !== undefined &&
+        retainedImport !== undefined &&
+        !retainedImportFaultApplied
+      ) {
+        // The import command already returned its ACK; fault the retained seal on post-read.
+        chmodSync(retainedImport.path, 0o600);
+        if (retainedImportFailure === "digest") {
+          writeFileSync(
+            retainedImport.path,
+            Buffer.concat([
+              retainedImport.bytes,
+              Buffer.from("\n-- controlled retained import drift\n"),
+            ]),
+          );
+          chmodSync(retainedImport.path, 0o400);
+        }
+        retainedImportFaultApplied = true;
+      }
+      return ok(JSON.stringify([{ success: true, results: database.query(sql).all() }]));
+    }
+    return f.run(command);
+  };
+  const dependencies = {
+    ...f,
+    run,
+    cloudflareEnvironment: { CLOUDFLARE_API_TOKEN: "controlled-original-money-token" },
+    storage: {
+      async getD1() {
+        return { name: f.pair, uuid: databaseId };
+      },
+      async getR2() {
+        return { name: f.pair };
+      },
+    },
+  };
+  const create = () =>
+    runIntegrationStorageGeneration(f.invocation, f.originalTarget, {
+      originalCreate: f.request.originalCreate,
+      run,
+      cloudflareEnvironment: dependencies.cloudflareEnvironment,
+      review: "controlled-original-protocol-review",
+    });
+  try {
+    if (!lostCreateAck) await create();
+  } catch (error) {
+    http.mockRestore();
+    database.close();
+    throw error;
+  }
+  return {
+    ...f,
+    database,
+    contacts,
+    commands,
+    dependencies,
+    create,
+    load: () => loadMoneyUnitOriginalCutoverOptions(f.request, dependencies),
+    replaceNativeD1(id: string, name = f.pair) {
+      returnedD1Id = id;
+      returnedD1Name = name;
+    },
+    failPostImportIdentity() {
+      loseIdentityAfterImport = true;
+    },
+    failRetainedImportAfterAck(kind: "mixed-mode" | "digest") {
+      retainedImportFailure = kind;
+    },
+    retainedImportFaultApplied: () => retainedImportFaultApplied,
+    failImportSealAfterProviderAck() {
+      driftSealedInputAfterProviderAck = true;
+    },
+    importAckSealFaultApplied: () => importAckSealFaultApplied,
+    imports: () => imports,
+    close() {
+      http.mockRestore();
+      database.close();
+    },
+  };
+}
+
+// All positives below are component protocol fixtures, not native creation/cutover qualification.
+describe("fresh original money writer", () => {
+  test("fresh writer keeps default/read parser semantics and requires its exact source selector", () => {
+    const f = freshOriginalMoneyFixture();
+    expect(() => parseDeployTarget(f.target, "component", "integration")).toThrow("writer policy");
+    expect(
+      parseDeployTarget(f.target, "component", "integration", "money-resume-read"),
+    ).toMatchObject({ d1: { databaseName: f.pair } });
+    expect(
+      parseDeployTarget(f.target, "component", "integration", "money-original-cutover"),
+    ).toMatchObject({ d1: { databaseName: f.pair } });
+    for (const selected of [
+      target,
+      { ...f.target, environment: "production" as const },
+      { ...f.target, workerName: "host-integration" },
+      { ...f.target, r2: { bucketName: name } },
+      { ...f.target, moneyCutoverWriterEpoch: undefined },
+    ]) {
+      expect(() =>
+        parseDeployTarget(selected, "component", "integration", "money-original-cutover"),
+      ).toThrow();
+    }
+  });
+
+  test("fresh writer refuses missing original locators, legacy certificates and JSON proofs before native reads", async () => {
+    const f = freshOriginalMoneyFixture();
+    await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, f.target, f)).rejects.toThrow(
+      "legacy staging origin",
+    );
+    const { originalOrigin: _locators, ...withoutOriginal } = f.declaration;
+    f.write(f.paths.declaration, {
+      ...withoutOriginal,
+      originCertificatePath: f.paths.origin,
+      originCertificateDigest: sha(JSON.stringify(f.origin)),
+    });
+    await expect(loadMoneyUnitOriginalCutoverOptions(f.request, f)).rejects.toThrow("declaration");
+    f.write(f.paths.declaration, f.declaration);
+    const forged = { ...f.request, originalCreate: { ...f.request.originalCreate, ready: true } };
+    await expect(loadMoneyUnitOriginalCutoverOptions(forged, f)).rejects.toThrow();
+    const forgedProof = {
+      ...f.request,
+      nativeProof: { authority: "provider-native", state: "terminal" },
+    };
+    await expect(loadMoneyUnitOriginalCutoverOptions(forgedProof, f)).rejects.toThrow(
+      "only target",
+    );
+    expect(f.requests).toEqual([]);
+  });
+
+  test("fresh writer bounds and fatally decodes its held declaration before native reads", async () => {
+    const f = freshOriginalMoneyFixture();
+    for (const bytes of [new Uint8Array([0xff]), new Uint8Array(1024 * 1024 + 1)]) {
+      writeFileSync(f.paths.declaration, bytes);
+      await expect(loadMoneyUnitOriginalCutoverOptions(f.request, f)).rejects.toThrow();
+    }
+    f.write(f.paths.declaration, f.declaration);
+    chmodSync(f.paths.declaration, 0o644);
+    await expect(loadMoneyUnitOriginalCutoverOptions(f.request, f)).rejects.toThrow("0600");
+    expect(f.requests).toEqual([]);
+  });
+
+  test("fresh writer uses the actual original chain after current schema advances through 93 and 94", async () => {
+    const f = await createdOriginalMoneyFixture();
+    try {
+      const options = await f.load();
+      expect(options.originalOriginQualification).toBe("independent-origin-review-required");
+      expect(Object.isFrozen(options)).toBe(true);
+      expect(Object.isFrozen(options.custody)).toBe(true);
+      expect(() => assertMoneyUnitOriginalWriterOptions(options, f.target)).not.toThrow();
+      const origin = await options.stageOriginProof();
+      expect(origin).toMatchObject({
+        databaseName: f.pair,
+        databaseId,
+        sourceCommit: source,
+        sourceDigest,
+        state: "terminal",
+      });
+      const queries = f.commands.filter((c) => c.includes("--command")).length;
+      const files = readMigrationArtifact(join(REPOSITORY, "migrations")).files;
+      for (const index of [92, 93]) {
+        const file = files[index];
+        if (!file) throw new Error("missing audited current phase source");
+        f.database.exec(readFileSync(file.path, "utf8"));
+        expect(await options.stageOriginProof()).toEqual(origin);
+      }
+      expect(f.commands.filter((c) => c.includes("--command")).length).toBe(queries);
+      expect(await options.storageIdentityRead()).toEqual({
+        accountId: account,
+        databaseId,
+        databaseName: f.pair,
+        bucketName: f.pair,
+      });
+      const binding: MoneyReviewBinding = {
+        kind: "takoserver.money-review-binding@v1",
+        phase: "freeze",
+        accountId: account,
+        databaseId,
+        originDigest: sha(JSON.stringify(origin)),
+        predecessorCustodyDigest: origin.terminalCustodyDigest,
+        sourceCommit: source,
+        sourceDigest,
+        importDigest: sha("component sealed import"),
+        backupDigest: sha("component backup"),
+        preimageDigest: sha("component preimage"),
+        aggregateDigest: sha("component aggregates"),
+        classificationDigest: sha("component classification"),
+        writerDigest: sha("component exact writer"),
+        resumeDigest: sha("none"),
+        writerEpoch,
+      };
+      expect(await options.independentReview?.(binding)).toBeNull();
+      expect((await options.maintenanceProof()).privateMoneyWriters).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("fresh writer rejects copied options, forged proof ports and a different current target", async () => {
+    const f = await createdOriginalMoneyFixture();
+    try {
+      const options = await f.load();
+      const invocation = {
+        action: "status" as const,
+        environment: "integration" as const,
+        commit: source,
+        throughMigration: "0093" as const,
+      };
+      for (const copied of [
+        { ...options },
+        {
+          ...options,
+          stageOriginProof: async () => ({
+            ...(await options.stageOriginProof()),
+            state: "terminal" as const,
+          }),
+        },
+      ]) {
+        await expect(runIntegrationMoneyUnitCutover(invocation, f.target, copied)).rejects.toThrow(
+          "same owning original options",
+        );
+      }
+      await expect(
+        runIntegrationMoneyUnitCutover(
+          { ...invocation, throughMigration: "0094" },
+          f.target,
+          options,
+        ),
+      ).rejects.toThrow("phase and fixed schema wave differ");
+      expect(() =>
+        assertMoneyUnitOriginalWriterOptions(options, {
+          ...f.target,
+          d1: { ...f.target.d1, databaseId: id(901) },
+        }),
+      ).toThrow("same owning original options");
+      expect(() =>
+        Object.defineProperty(options, "stageOriginProof", {
+          value: async () => ({ ready: true }),
+        }),
+      ).toThrow();
+      expect(() =>
+        Object.defineProperty(options.custody, "dispatch", {
+          value: async () => ({ ready: true }),
+        }),
+      ).toThrow();
+    } finally {
+      f.close();
+    }
+  });
+
+  test("fresh writer captures original dependency ports and refuses replaced selected inputs", async () => {
+    const f = await createdOriginalMoneyFixture();
+    try {
+      const options = await f.load();
+      f.dependencies.storage.getD1 = async () => {
+        throw new Error("late storage replacement consumed");
+      };
+      f.dependencies.state.workerDeployments = async () => {
+        throw new Error("late state replacement consumed");
+      };
+      expect(await options.storageIdentityRead()).toMatchObject({ databaseName: f.pair });
+      expect((await options.maintenanceProof()).privateMoneyWriters).toBe(0);
+      const contacts = f.contacts.length;
+      f.write(f.originalTargetPath, { ...f.originalTarget, workerName: "changed-incumbent" });
+      await expect(options.stageOriginProof()).rejects.toThrow("changed after selection");
+      expect(f.contacts.length).toBe(contacts);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("fresh writer retains UNKNOWN and classifies post-import identity loss as verification", async () => {
+    const f = await createdOriginalMoneyFixture(true);
+    try {
+      await expect(f.create()).rejects.toThrow();
+      const paths = readdirSync(f.originalDirectory).filter((p) => p.endsWith(".json"));
+      const before = paths.map((p) => readFileSync(join(f.originalDirectory, p), "utf8"));
+      const contacts = f.contacts.length;
+      await expect(f.load()).rejects.toThrow("terminal chain");
+      expect(f.contacts.length).toBe(contacts);
+      expect(paths.map((p) => readFileSync(join(f.originalDirectory, p), "utf8"))).toEqual(before);
+      expect(
+        f.contacts.filter((p) => p === `POST /client/v4/accounts/${account}/d1/database`),
+      ).toHaveLength(1);
+    } finally {
+      f.close();
+    }
+    const mismatch = await createdOriginalMoneyFixture();
+    try {
+      mismatch.replaceNativeD1(id(902));
+      await expect(mismatch.load()).rejects.toThrow("ACK");
+    } finally {
+      mismatch.close();
+    }
+    const post = await createdOriginalMoneyFixture();
+    try {
+      const options = await post.load();
+      const invocation = {
+        action: "status" as const,
+        environment: "integration" as const,
+        commit: source,
+        throughMigration: "0093" as const,
+      };
+      const status = await runIntegrationMoneyUnitCutover(invocation, post.target, options);
+      // Wrangler 4.123.0 export accepts --skip-confirmation; --yes is execute-only.
+      expect(
+        post.commands
+          .filter((command) => command[1] === "d1" && command[2] === "export")
+          .map((command) => command.slice(0, 7)),
+      ).toEqual([
+        [
+          join(REPOSITORY, "node_modules/.bin/wrangler"),
+          "d1",
+          "export",
+          post.pair,
+          "--remote",
+          "--skip-confirmation",
+          "--config",
+        ],
+      ]);
+      if (typeof status.reviewBindingDigest !== "string")
+        throw new Error("missing actual review binding");
+      const evidenceDigest = sha("controlled post-import phase review");
+      post.write(post.paths.review, {
+        kind: "takoserver.money-independent-review@v1",
+        state: "reviewed",
+        reviewedAt,
+        reviewEvidenceDigest: evidenceDigest,
+        reviewer: "component-reviewer",
+        reviewRef: "review://controlled-post-import",
+        bindingDigest: status.reviewBindingDigest,
+        evidenceDigest,
+      });
+      post.failPostImportIdentity();
+      try {
+        await runIntegrationMoneyUnitCutover(
+          { ...invocation, action: "apply" },
+          post.target,
+          options,
+        );
+        throw new Error("expected controlled post-import failure");
+      } catch (error) {
+        expect(error).toMatchObject({ phase: "verification" });
+        if (!(error instanceof Error)) throw error;
+        expect(error.message).toContain("after import");
+        expect(error.cause).toBeInstanceOf(Error);
+      }
+      expect(post.imports()).toBe(2); // Original92 plus exactly one actual money freeze import.
+      expect(await options.custody.read("freeze")).toMatchObject({ state: "dispatched" });
+      await expect(
+        runIntegrationMoneyUnitCutover({ ...invocation, action: "apply" }, post.target, options),
+      ).rejects.toThrow("cannot resend");
+      expect(post.imports()).toBe(2);
+      expect(await options.custody.read("freeze")).toMatchObject({ state: "dispatched" });
+    } finally {
+      post.close();
+    }
+  });
+
+  test("fresh money CLI keeps original selection closed before provider or production input reads", () => {
+    const result = Bun.spawnSync(
+      [
+        process.execPath,
+        "--no-env-file",
+        "scripts/deploy.ts",
+        "takoserver-d1-schema",
+        "--status",
+        "--environment=integration",
+        `--commit=${source}`,
+        "--through-migration=0088",
+      ],
+      {
+        cwd: REPOSITORY,
+        env: {
+          PATH: "/usr/local/bin:/usr/bin:/bin",
+          TMPDIR: tmpdir(),
+          TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH: "/not-a-selected-input",
+          TAKOSERVER_DEPLOY_TARGET_PRODUCTION: "/must-not-read-production",
+        },
+        timeout: 1000,
+      },
+    );
+    expect(result.exitCode).not.toBe(0);
+    expect(new TextDecoder().decode(result.stderr)).toContain(
+      "original-create input is supported only",
+    );
+  });
+});
+
+function sealedImportCustodyFixture() {
+  const f = fixture();
+  const directory = join(f.root, "sealed-money-import");
+  mkdirSync(directory, { mode: 0o700 });
+  const sealedImportPath = join(directory, "import.sql");
+  const sql = "-- component custody bytes; never executed\n";
+  writeFileSync(sealedImportPath, sql, { mode: 0o600 });
+  const binding: MoneyCutoverDispatchBinding = {
+    kind: "takoserver.money-cutover-dispatch@v1",
+    phase: "freeze",
+    accountId: account,
+    databaseId,
+    databaseName: name,
+    originDigest: sha("origin"),
+    predecessorCustodyDigest: sha("previous"),
+    sourceCommit: source,
+    sourceDigest,
+    importDigest: sha(sql),
+    backupDigest: sha("backup"),
+    preimageDigest: sha("preimage"),
+    aggregateDigest: sha("aggregate"),
+    classificationDigest: sha("classifications"),
+    writerDigest: sha("writer"),
+    resumeDigest: sha("none"),
+    writerEpoch,
+    reviewDigest: sha("review"),
+    beforeShapeDigest: sha("shape"),
+    afterSchemaPhase: "0092-fenced",
+    sealedImportPath,
+  };
+  return { ...f, directory, sealedImportPath, sql, binding };
+}
+
+describe("money sealed import custody", () => {
+  test("reads the real readonly producer seal through dispatch, reopen and terminal custody", async () => {
+    const f = sealedImportCustodyFixture();
+    try {
+      const seal = sealDirectory(f.directory, ["import.sql"]);
+      expect(lstatSync(f.directory).mode & 0o777).toBe(0o500);
+      expect(lstatSync(f.sealedImportPath).mode & 0o777).toBe(0o400);
+      const options = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+      expect((await options.custody.dispatch(f.binding)).state).toBe("dispatched");
+      expect(await options.custody.readDispatch("freeze")).toEqual(f.binding);
+      expect(await options.custody.read("freeze")).toMatchObject({ state: "dispatched" });
+      const reopened = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+      expect(await reopened.custody.readDispatch("freeze")).toEqual(f.binding);
+      expect((await reopened.custody.terminal(f.binding, sha("post"))).state).toBe("terminal");
+      expect(await reopened.custody.read("freeze")).toMatchObject({ state: "terminal" });
+      expect(() => seal.assertUnchanged()).not.toThrow();
+      expect(lstatSync(f.directory).mode & 0o777).toBe(0o500);
+      expect(lstatSync(f.sealedImportPath).mode & 0o777).toBe(0o400);
+      await expect(reopened.custody.dispatch(f.binding)).rejects.toThrow("already exists");
+    } finally {
+      removeArtifactTree(f.directory);
+    }
+  });
+
+  test("refuses mixed or exposed import modes, links, oversize bytes and digest drift before custody writes", async () => {
+    const f = sealedImportCustodyFixture();
+    const options = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+    const directories: string[] = [];
+    let ordinal = 0;
+    const input = (directoryMode = 0o500, fileMode = 0o400, bytes = f.sql) => {
+      const directory = join(f.root, `invalid-import-${ordinal++}`);
+      directories.push(directory);
+      mkdirSync(directory, { mode: 0o700 });
+      const path = join(directory, "import.sql");
+      writeFileSync(path, bytes, { mode: 0o600 });
+      chmodSync(path, fileMode);
+      chmodSync(directory, directoryMode);
+      return {
+        directory,
+        path,
+        binding: { ...f.binding, sealedImportPath: path, importDigest: sha(bytes) },
+      };
+    };
+    const refused = async (binding: MoneyCutoverDispatchBinding) => {
+      await expect(options.custody.dispatch(binding)).rejects.toThrow();
+      expect(await options.custody.read("freeze")).toBeNull();
+      expect(await options.custody.readDispatch("freeze")).toBeNull();
+    };
+    try {
+      // Legacy 0700/0600 is deliberately still valid, as the unchanged old19 prove.
+      for (const [directoryMode, fileMode] of [
+        [0o500, 0o600],
+        [0o700, 0o400],
+        [0o755, 0o400],
+        [0o500, 0o440],
+        [0o700, 0o660],
+        [0o500, 0o200],
+      ])
+        await refused(input(directoryMode, fileMode).binding);
+      const linked = input(0o700, 0o600);
+      rmSync(linked.path);
+      symlinkSync(f.sealedImportPath, linked.path);
+      await refused(linked.binding);
+      const hard = input(0o700, 0o600);
+      rmSync(hard.path);
+      linkSync(f.sealedImportPath, hard.path);
+      await refused(hard.binding);
+      const nested = input(0o700, 0o600);
+      const alias = join(f.root, "import-directory-alias");
+      symlinkSync(nested.directory, alias);
+      await refused({ ...nested.binding, sealedImportPath: join(alias, "import.sql") });
+      await refused(input(0o500, 0o400, "x".repeat(1024 * 1024 + 1)).binding);
+      const drift = input();
+      await expect(
+        options.custody.dispatch({ ...drift.binding, importDigest: sha("other bytes") }),
+      ).rejects.toThrow("sealed import SQL differs before dispatch");
+      expect(await options.custody.read("freeze")).toBeNull();
+      await refused({ ...f.binding, sealedImportPath: join(REPOSITORY, "package.json") });
+    } finally {
+      for (const directory of directories) removeArtifactTree(directory);
+      removeArtifactTree(f.directory);
+    }
+  });
+});
+
+describe("money acknowledged custody failure", () => {
+  test("classifies retained seal drift after an import ACK as verification and never replays", async () => {
+    for (const fault of ["mixed-mode", "digest"] as const) {
+      const post = await createdOriginalMoneyFixture();
+      try {
+        const options = await post.load();
+        const invocation = {
+          action: "status" as const,
+          environment: "integration" as const,
+          commit: source,
+          throughMigration: "0093" as const,
+        };
+        const status = await runIntegrationMoneyUnitCutover(invocation, post.target, options);
+        if (typeof status.reviewBindingDigest !== "string")
+          throw new Error("missing actual review binding");
+        const evidenceDigest = sha(`controlled retained-seal phase review ${fault}`);
+        post.write(post.paths.review, {
+          kind: "takoserver.money-independent-review@v1",
+          state: "reviewed",
+          reviewedAt,
+          reviewEvidenceDigest: evidenceDigest,
+          reviewer: "component-reviewer",
+          reviewRef: "review://controlled-retained-seal",
+          bindingDigest: status.reviewBindingDigest,
+          evidenceDigest,
+        });
+        post.failRetainedImportAfterAck(fault);
+        try {
+          await runIntegrationMoneyUnitCutover(
+            { ...invocation, action: "apply" },
+            post.target,
+            options,
+          );
+          throw new Error("expected controlled post-ACK custody verification failure");
+        } catch (error) {
+          expect(error).toMatchObject({ phase: "verification" });
+          if (!(error instanceof Error) || !(error.cause instanceof Error)) throw error;
+          expect(error.message).toContain("acknowledged");
+          expect(error.cause).toMatchObject({ phase: "preflight" });
+          expect(error.cause.message).toContain("money sealed import SQL");
+          if (fault === "digest")
+            expect(error.cause.message).toContain("differs from immutable dispatch");
+        }
+        expect(post.retainedImportFaultApplied()).toBe(true);
+        expect(post.imports()).toBe(2);
+        const dispatched = join(post.declaration.custodyDirectory, "freeze.dispatched.json");
+        const retained = readFileSync(dispatched, "utf8");
+        const retainedDigest = sha(retained);
+        expect(JSON.parse(retained)).toMatchObject({ receipt: { state: "dispatched" } });
+        expect(existsSync(join(post.declaration.custodyDirectory, "freeze.terminal.json"))).toBe(
+          false,
+        );
+        await expect(options.custody.readDispatch("freeze")).rejects.toThrow(
+          "money sealed import SQL",
+        );
+        await expect(
+          runIntegrationMoneyUnitCutover({ ...invocation, action: "apply" }, post.target, options),
+        ).rejects.toThrow("money sealed import SQL");
+        expect(post.imports()).toBe(2);
+        expect(readFileSync(dispatched, "utf8")).toBe(retained);
+        expect(sha(readFileSync(dispatched, "utf8"))).toBe(retainedDigest);
+        expect(existsSync(join(post.declaration.custodyDirectory, "freeze.terminal.json"))).toBe(
+          false,
+        );
+      } finally {
+        post.close();
+      }
+    }
+  });
+});
+
+describe("money acknowledged import input failure", () => {
+  test("classifies input drift before an acknowledged import returns as verification without replay", async () => {
+    const post = await createdOriginalMoneyFixture();
+    try {
+      const options = await post.load();
+      const invocation = {
+        action: "status" as const,
+        environment: "integration" as const,
+        commit: source,
+        throughMigration: "0093" as const,
+      };
+      const status = await runIntegrationMoneyUnitCutover(invocation, post.target, options);
+      if (typeof status.reviewBindingDigest !== "string")
+        throw new Error("missing actual review binding");
+      const evidenceDigest = sha("controlled acknowledged-input phase review");
+      post.write(post.paths.review, {
+        kind: "takoserver.money-independent-review@v1",
+        state: "reviewed",
+        reviewedAt,
+        reviewEvidenceDigest: evidenceDigest,
+        reviewer: "component-reviewer",
+        reviewRef: "review://controlled-acknowledged-input",
+        bindingDigest: status.reviewBindingDigest,
+        evidenceDigest,
+      });
+      post.failImportSealAfterProviderAck();
+      try {
+        await runIntegrationMoneyUnitCutover(
+          { ...invocation, action: "apply" },
+          post.target,
+          options,
+        );
+        throw new Error("expected acknowledged import input verification failure");
+      } catch (error) {
+        expect(error).toMatchObject({ phase: "verification" });
+        if (!(error instanceof Error) || !(error.cause instanceof Error)) throw error;
+        expect(error.message).toContain("acknowledged");
+        expect(error.message).toContain("without replay");
+        expect(error.cause).toMatchObject({ phase: "preflight" });
+        expect(error.cause.message).toContain("artifact changed after it was sealed");
+      }
+      expect(post.importAckSealFaultApplied()).toBe(true);
+      expect(post.imports()).toBe(2);
+      const dispatched = join(post.declaration.custodyDirectory, "freeze.dispatched.json");
+      const retained = readFileSync(dispatched, "utf8");
+      const retainedDigest = sha(retained);
+      expect(JSON.parse(retained)).toMatchObject({ receipt: { state: "dispatched" } });
+      expect(existsSync(join(post.declaration.custodyDirectory, "freeze.terminal.json"))).toBe(
+        false,
+      );
+      await expect(options.custody.readDispatch("freeze")).rejects.toThrow(
+        "differs from immutable dispatch",
+      );
+      await expect(
+        runIntegrationMoneyUnitCutover({ ...invocation, action: "apply" }, post.target, options),
+      ).rejects.toThrow("differs from immutable dispatch");
+      expect(post.imports()).toBe(2);
+      expect(readFileSync(dispatched, "utf8")).toBe(retained);
+      expect(sha(readFileSync(dispatched, "utf8"))).toBe(retainedDigest);
+      expect(existsSync(join(post.declaration.custodyDirectory, "freeze.terminal.json"))).toBe(
+        false,
+      );
+    } finally {
+      post.close();
+    }
+  });
+});
+
+function post94CustodyFixture() {
+  const f = sealedImportCustodyFixture();
+  // Structural review data only; no protected declaration or held selection is minted.
+  const selectionReview = {
+    kind: "takoserver.money-post94-selection-review@v1" as const,
+    phase: "suffix98" as const,
+    accountId: f.binding.accountId,
+    databaseId: f.binding.databaseId,
+    databaseName: f.binding.databaseName,
+    previousWriterEpoch: writerEpoch,
+    nextWriterEpoch: sha("next retained writer epoch"),
+    original92BackupDigest: f.binding.backupDigest,
+    converted94BackupDigest: sha("converted full94 snapshot"),
+    convertBindingDigest: sha("original terminal convert binding"),
+    selectedStripeMode: "test" as const,
+    declarationDigest: sha("component-only suffix selection declaration; never native custody"),
+  };
+  const binding: MoneyPost94DispatchBinding = {
+    ...f.binding,
+    kind: "takoserver.money-cutover-dispatch@v2",
+    phase: "suffix98",
+    previousWriterEpoch: writerEpoch,
+    nextWriterEpoch: sha("next retained writer epoch"),
+    original92BackupDigest: f.binding.backupDigest,
+    converted94BackupDigest: sha("converted full94 snapshot"),
+    convertBindingDigest: sha("original terminal convert binding"),
+    modePreparationDigest: sha("structural fixture, never real Financial mode authority"),
+    selectedStripeMode: selectionReview.selectedStripeMode,
+    selectionReviewDigest: moneyCutoverBindingDigest(selectionReview),
+    afterSchemaPhase: "0098-fenced",
+    writerEpoch,
+  };
+  return { ...f, binding };
+}
+
+describe("post94 retained custody component", () => {
+  test("post94 holds exact v2 dispatch through the existing readonly seal without authorizing apply", async () => {
+    const f = post94CustodyFixture();
+    try {
+      const seal = sealDirectory(f.directory, ["import.sql"]);
+      const options = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+      expect((await options.custody.dispatch(f.binding)).state).toBe("dispatched");
+      const reopened = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+      expect(await reopened.custody.readDispatch("suffix98")).toEqual(f.binding);
+      expect(await reopened.custody.read("suffix98")).toMatchObject({ state: "dispatched" });
+      await expect(reopened.custody.dispatch(f.binding)).rejects.toThrow("already exists");
+      const before = [...f.requests];
+      await expect(
+        runIntegrationMoneyUnitCutover(
+          { action: "apply", environment: "integration", commit: source, throughMigration: "0098" },
+          target,
+          { ...options, phase: "suffix98" },
+        ),
+      ).rejects.toThrow("Financial realm transition port");
+      expect(f.requests).toEqual(before);
+      expect(await reopened.custody.read("suffix98")).toMatchObject({ state: "dispatched" });
+      expect(() => seal.assertUnchanged()).not.toThrow();
+      expect(lstatSync(f.directory).mode & 0o777).toBe(0o500);
+      expect(lstatSync(f.sealedImportPath).mode & 0o777).toBe(0o400);
+    } finally {
+      removeArtifactTree(f.directory);
+    }
+  });
+
+  test("post94 v2 parser refuses legacy promotion, missing history, equal epochs and field drift", async () => {
+    const mutations = [
+      { kind: "takoserver.money-cutover-dispatch@v1" },
+      { phase: "freeze" },
+      { previousWriterEpoch: sha("invalid selection") },
+      { nextWriterEpoch: writerEpoch },
+      { original92BackupDigest: sha("wrong old backup") },
+      { converted94BackupDigest: null },
+      { convertBindingDigest: "not-a-digest" },
+      { modePreparationDigest: null },
+      { afterSchemaPhase: "0098" },
+      { extra: true },
+    ];
+    for (const mutation of mutations) {
+      const f = post94CustodyFixture();
+      try {
+        sealDirectory(f.directory, ["import.sql"]);
+        const options = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+        const binding = { ...f.binding, ...mutation };
+        // Raw retained record tests the real protected parser, without a type escape or writer.
+        writeFileSync(
+          join(f.root, "suffix98.dispatched.json"),
+          JSON.stringify({
+            kind: "takoserver.money-cutover-dispatch-record@v1",
+            receipt: {
+              kind: "takoserver.money-cutover-custody@v1",
+              phase: "suffix98",
+              state: "dispatched",
+              bindingDigest: sha(JSON.stringify(binding)),
+              postDigest: null,
+            },
+            binding,
+          }),
+          { mode: 0o600 },
+        );
+        await expect(options.custody.readDispatch("suffix98")).rejects.toThrow("malformed");
+        expect(existsSync(join(f.root, "suffix98.terminal.json"))).toBe(false);
+      } finally {
+        removeArtifactTree(f.directory);
+      }
+    }
+  });
+
+  test("post94 owner declaration cannot turn a retained v2 record into a native writer selection", async () => {
+    const f = post94CustodyFixture();
+    try {
+      f.write(f.paths.declaration, {
+        ...f.declaration,
+        phase: "suffix98",
+        nextWriterEpoch: f.binding.nextWriterEpoch,
+      });
+      const before = [...f.requests];
+      await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, target, f)).rejects.toThrow(
+        "declaration is malformed",
+      );
+      expect(f.requests).toEqual(before);
+      expect(existsSync(join(f.root, "suffix98.dispatched.json"))).toBe(false);
+    } finally {
+      removeArtifactTree(f.directory);
+    }
+  });
+});
+
+describe("original preserved100 custody", () => {
+  test("existing exact review format binds only original100 source, while test ports remain untrusted", async () => {
+    const f = await createdOriginalMoneyFixture();
+    try {
+      f.write(f.paths.declaration, { ...f.declaration, phase: "convert" });
+      const options = await f.load();
+      const binding: MoneyPreserved100ReviewBinding = {
+        kind: "takoserver.money-preserved100-import-review@v1",
+        phase: "preserved100",
+        accountId: f.target.accountId,
+        databaseId: f.target.d1.databaseId,
+        databaseName: f.target.d1.databaseName,
+        bucketName: f.target.r2.bucketName,
+        workerName: f.target.workerName,
+        sourceCommit: source,
+        sourceDigest: sha("audited physical100"),
+        importDigest: sha("exact99-100 import"),
+        suffixBindingDigest: sha("original terminal98 binding"),
+        suffixPostDigest: sha("original terminal98 post"),
+        suffixReviewDigest: sha("original suffix review"),
+        freezeBindingDigest: sha("original freeze"),
+        originDigest: sha("original origin"),
+        original92BackupDigest: sha("original92 backup"),
+        writerDigest: sha("original maintenance"),
+        nextWriterEpoch: sha("new writer epoch"),
+        beforeShapeDigest: sha("before98 shape"),
+        afterShapeDigest: sha("after100 shape"),
+      };
+      const evidenceDigest = sha("preserved100 independent review evidence");
+      const reviewed = {
+        kind: "takoserver.money-independent-review@v1",
+        state: "reviewed",
+        reviewedAt,
+        reviewEvidenceDigest: evidenceDigest,
+        reviewer: "independent-reviewer",
+        reviewRef: "review://preserved100-exact",
+        bindingDigest: moneyCutoverBindingDigest(binding),
+        evidenceDigest,
+      };
+      f.write(join(f.root, "money-preserved100-independent-review.json"), reviewed);
+      expect(parseMoneyUnitPreserved100ExactReviewData(reviewed, binding)).toMatchObject({
+        bindingDigest: moneyCutoverBindingDigest(binding),
+      });
+      expect(() =>
+        parseMoneyUnitPreserved100ExactReviewData(reviewed, {
+          ...binding,
+          importDigest: sha("foreign SQL"),
+        }),
+      ).toThrow("differs from exact source/import");
+      expect(() =>
+        parseMoneyUnitPreserved100ExactReviewData({ ...reviewed, ready: true }, binding),
+      ).toThrow("differs from exact source/import");
+      expect(() => readMoneyUnitOriginalPreserved100IndependentReview(options, binding)).toThrow(
+        "unchanged native original owner",
+      );
+    } finally {
+      f.close();
+    }
+  });
+
+  test("missing terminal98 refuses native100 before any provider read or mutation", async () => {
+    const f = await createdOriginalMoneyFixture();
+    try {
+      f.write(f.paths.declaration, { ...f.declaration, phase: "convert" });
+      const options = await f.load();
+      const before = [...f.commands];
+      await expect(
+        runIntegrationMoneyOriginalPreserved100(
+          { action: "apply", environment: "integration", commit: source, throughMigration: "0100" },
+          f.target,
+          options,
+          f.paths.declaration,
+        ),
+      ).rejects.toThrow("terminal98");
+      expect(f.commands).toEqual(before);
+      expect(await options.custody.read("preserved100")).toBeNull();
+    } finally {
+      f.close();
+    }
+  });
+
+  test("foreign terminal98 custody cannot select the original100 receiver", async () => {
+    const f = await createdOriginalMoneyFixture();
+    const foreign = post94CustodyFixture();
+    try {
+      f.write(f.paths.declaration, { ...f.declaration, phase: "convert" });
+      const options = await f.load();
+      sealDirectory(foreign.directory, ["import.sql"]);
+      const dispatch = await options.custody.dispatch(foreign.binding);
+      await options.custody.terminal(foreign.binding, sha("foreign98 terminal"));
+      expect(dispatch.state).toBe("dispatched");
+      const before = [...f.commands];
+      await expect(
+        runIntegrationMoneyOriginalPreserved100(
+          { action: "apply", environment: "integration", commit: source, throughMigration: "0100" },
+          f.target,
+          options,
+          f.paths.declaration,
+        ),
+      ).rejects.toThrow();
+      expect(f.commands).toEqual(before);
+      expect(await options.custody.read("preserved100")).toBeNull();
+    } finally {
+      f.close();
+      removeArtifactTree(foreign.directory);
+    }
+  });
+
+  test("v3 original custody retains dispatch on unknown ACK and cannot relabel terminal", async () => {
+    const f = sealedImportCustodyFixture();
+    try {
+      sealDirectory(f.directory, ["import.sql"]);
+      const options = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+      const binding: MoneyPreserved100DispatchBinding = {
+        ...f.binding,
+        kind: "takoserver.money-cutover-dispatch@v3",
+        phase: "preserved100",
+        afterSchemaPhase: "0100-fenced",
+        writerEpoch: sha("new epoch"),
+        nextWriterEpoch: sha("new epoch"),
+        suffixBindingDigest: sha("exact terminal98 binding"),
+        suffixPostDigest: sha("exact terminal98 post"),
+        suffixReviewDigest: sha("original suffix review"),
+        expectedAfterShapeDigest: sha("exact owned100 shape"),
+      };
+      expect((await options.custody.dispatch(binding)).state).toBe("dispatched");
+      expect(await options.custody.read("preserved100")).toMatchObject({
+        state: "dispatched",
+        postDigest: null,
+      });
+      await expect(options.custody.dispatch(binding)).rejects.toThrow("already exists");
+      await expect(
+        options.custody.terminal(
+          { ...binding, suffixBindingDigest: sha("foreign suffix") },
+          sha("post"),
+        ),
+      ).rejects.toThrow("cannot reconcile");
+      expect(await options.custody.read("preserved100")).toMatchObject({ state: "dispatched" });
+      expect(existsSync(join(f.root, "preserved100.terminal.json"))).toBe(false);
+      const reopened = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+      expect(await reopened.custody.readDispatch("preserved100")).toEqual(binding);
+    } finally {
+      removeArtifactTree(f.directory);
+    }
+  });
+
+  test("v3 parser rejects foreign fields and wrong terminal phase", async () => {
+    const f = sealedImportCustodyFixture();
+    try {
+      sealDirectory(f.directory, ["import.sql"]);
+      const options = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+      const binding: MoneyPreserved100DispatchBinding = {
+        ...f.binding,
+        kind: "takoserver.money-cutover-dispatch@v3",
+        phase: "preserved100",
+        afterSchemaPhase: "0100-fenced",
+        writerEpoch: sha("new epoch"),
+        nextWriterEpoch: sha("new epoch"),
+        suffixBindingDigest: sha("exact terminal98 binding"),
+        suffixPostDigest: sha("exact terminal98 post"),
+        suffixReviewDigest: sha("original suffix review"),
+        expectedAfterShapeDigest: sha("exact owned100 shape"),
+      };
+      await expect(options.custody.dispatch({ ...binding, ready: true } as never)).rejects.toThrow(
+        "malformed",
+      );
+      await expect(
+        options.custody.dispatch({ ...binding, afterSchemaPhase: "0098-fenced" } as never),
+      ).rejects.toThrow("malformed");
+      expect(await options.custody.read("preserved100")).toBeNull();
+    } finally {
+      removeArtifactTree(f.directory);
+    }
+  });
+});
+
+describe("original money maintenance bootstrap publication receipt boundary", () => {
+  test("generic bootstrap output cannot be relabelled as an authority-cutover publication", async () => {
+    const f = fixture();
+    const receipt = JSON.parse(readFileSync(f.paths.maintenancePublication, "utf8"));
+    const receiptDigest = f.write(f.paths.maintenancePublication, {
+      ...receipt,
+      surface: "takoserver-integration-worker-bootstrap",
+      resultKind: "takoserver.integration-worker-bootstrap-apply@v1",
+    });
+    f.write(f.paths.declaration, {
+      ...f.declaration,
+      maintenancePublicationReceiptDigest: receiptDigest,
+    });
+    await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, target, f)).rejects.toThrow(
+      "publication evidence",
+    );
+  });
+
+  test("a JSON original-maintenance receipt cannot enter through a legacy or injected owner", async () => {
+    const f = fixture();
+    const receipt = JSON.parse(readFileSync(f.paths.maintenancePublication, "utf8"));
+    const receiptDigest = f.write(f.paths.maintenancePublication, {
+      ...receipt,
+      surface: "takoserver-integration-worker-bootstrap",
+      resultKind: "takoserver.integration-worker-bootstrap-original-money-maintenance-apply@v1",
+      originalCreateTerminalCustodyDigest: sha("unqualified original"),
+      originalMaintenanceDispatchDigest: sha("unqualified dispatch"),
+      originalMaintenanceTerminalCustodyDigest: sha("unqualified terminal"),
+    });
+    f.write(f.paths.declaration, {
+      ...f.declaration,
+      maintenancePublicationReceiptDigest: receiptDigest,
+    });
+    await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, target, f)).rejects.toThrow(
+      "publication evidence",
+    );
+  });
+});
+
+describe("original money maintenance successor receipt boundary", () => {
+  test("reviewed successor JSON cannot enter through a legacy or injected owner", async () => {
+    const f = fixture();
+    const receipt = JSON.parse(readFileSync(f.paths.maintenancePublication, "utf8"));
+    const receiptDigest = f.write(f.paths.maintenancePublication, {
+      ...receipt,
+      surface: "takoserver-integration-worker-bootstrap",
+      resultKind: "takoserver.integration-worker-original-money-maintenance-successor-apply@v1",
+      originalCreateTerminalCustodyDigest: sha("unqualified original"),
+      originalMaintenanceSourceCommit: source,
+      originalMaintenanceDispatchDigest: sha("unqualified first dispatch"),
+      originalMaintenanceSuccessorDispatchDigest: sha("unqualified successor dispatch"),
+      originalMaintenanceSuccessorTerminalCustodyDigest: sha("unqualified successor terminal"),
+    });
+    f.write(f.paths.declaration, {
+      ...f.declaration,
+      maintenancePublicationReceiptDigest: receiptDigest,
+    });
+    await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, target, f)).rejects.toThrow(
+      "publication evidence",
+    );
+  });
+
+  test("a successor cannot manufacture the old first terminal or reuse the first-kind field family", async () => {
+    const f = fixture();
+    const receipt = JSON.parse(readFileSync(f.paths.maintenancePublication, "utf8"));
+    for (const suffix of [
+      {
+        originalMaintenanceSourceCommit: source,
+        originalMaintenanceSuccessorDispatchDigest: sha("successor dispatch"),
+        originalMaintenanceSuccessorTerminalCustodyDigest: sha("successor terminal"),
+        originalMaintenanceTerminalCustodyDigest: sha("manufactured first terminal"),
+      },
+      { originalMaintenanceTerminalCustodyDigest: sha("first terminal only") },
+      {
+        originalMaintenanceSourceCommit: source,
+        originalMaintenanceSuccessorDispatchDigest: sha("successor dispatch"),
+      },
+    ]) {
+      const receiptDigest = f.write(f.paths.maintenancePublication, {
+        ...receipt,
+        surface: "takoserver-integration-worker-bootstrap",
+        resultKind: "takoserver.integration-worker-original-money-maintenance-successor-apply@v1",
+        originalCreateTerminalCustodyDigest: sha("unqualified original"),
+        originalMaintenanceDispatchDigest: sha("first dispatch"),
+        ...suffix,
+      });
+      f.write(f.paths.declaration, {
+        ...f.declaration,
+        maintenancePublicationReceiptDigest: receiptDigest,
+      });
+      await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, target, f)).rejects.toThrow(
+        "publication evidence",
+      );
+    }
+  });
+
+  test("the existing first-publication kind still rejects appended successor custody fields", async () => {
+    const f = fixture();
+    const receipt = JSON.parse(readFileSync(f.paths.maintenancePublication, "utf8"));
+    const receiptDigest = f.write(f.paths.maintenancePublication, {
+      ...receipt,
+      surface: "takoserver-integration-worker-bootstrap",
+      resultKind: "takoserver.integration-worker-bootstrap-original-money-maintenance-apply@v1",
+      originalCreateTerminalCustodyDigest: sha("unqualified original"),
+      originalMaintenanceDispatchDigest: sha("first dispatch"),
+      originalMaintenanceTerminalCustodyDigest: sha("first terminal"),
+      originalMaintenanceSourceCommit: source,
+      originalMaintenanceSuccessorDispatchDigest: sha("successor dispatch"),
+      originalMaintenanceSuccessorTerminalCustodyDigest: sha("successor terminal"),
+    });
+    f.write(f.paths.declaration, {
+      ...f.declaration,
+      maintenancePublicationReceiptDigest: receiptDigest,
+    });
+    await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, target, f)).rejects.toThrow(
+      "publication evidence",
+    );
+  });
+});
+
+describe("standalone original maintenance profile admission", () => {
+  test("classifies the unchanged exact maintenance profile as DATA but refuses a legacy owner", async () => {
+    const f = standaloneFixture();
+    const selected: DeployTarget = {
+      ...f.target,
+      schemaMaintenanceMode: "pre-wallet-usd-micros-quiesced",
+    };
+    const before = JSON.stringify(selected);
+    await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, selected, f)).rejects.toThrow(
+      "standalone maintenance requires its native original publication owner",
+    );
+    expect(JSON.stringify(selected)).toBe(before);
+    expect(selected.schemaMaintenanceMode).toBe("pre-wallet-usd-micros-quiesced");
+    expect(JSON.parse(readFileSync(f.paths.scope, "utf8")).profile).toBe("standalone-host");
+  });
+
+  test("caller booleans and a publication-shaped DTO cannot create the private native context", async () => {
+    const f = standaloneFixture();
+    const selected: DeployTarget = {
+      ...f.target,
+      schemaMaintenanceMode: "pre-wallet-usd-micros-quiesced",
+    };
+    const supplied = Object.assign({}, f, {
+      nativeOnly: true,
+      originalMaintenance: {
+        terminalCustodyDigest: sha("caller DTO"),
+        maintenanceOnly: true,
+        ready: true,
+      },
+    });
+    await expect(
+      loadMoneyUnitCutoverOptions(f.paths.declaration, selected, supplied),
+    ).rejects.toThrow("standalone maintenance requires its native original publication owner");
+  });
+
+  test("missing mode does not make an original-publication DTO qualify through the legacy path", async () => {
+    const f = standaloneFixture();
+    const receipt = JSON.parse(readFileSync(f.paths.maintenancePublication, "utf8"));
+    const receiptDigest = f.write(f.paths.maintenancePublication, {
+      ...receipt,
+      surface: "takoserver-integration-worker-bootstrap",
+      resultKind: "takoserver.integration-worker-original-money-maintenance-successor-apply@v1",
+      originalCreateTerminalCustodyDigest: sha("caller original"),
+      originalMaintenanceSourceCommit: source,
+      originalMaintenanceDispatchDigest: sha("caller first dispatch"),
+      originalMaintenanceSuccessorDispatchDigest: sha("caller successor dispatch"),
+      originalMaintenanceSuccessorTerminalCustodyDigest: sha("caller successor terminal"),
+    });
+    f.write(f.paths.declaration, {
+      ...f.declaration,
+      maintenancePublicationReceiptDigest: receiptDigest,
+    });
+    expect(f.target.schemaMaintenanceMode).toBeUndefined();
+    await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, f.target, f)).rejects.toThrow(
+      "publication evidence",
+    );
+  });
+
+  test("other maintenance modes remain outside the standalone DATA profile", async () => {
+    for (const mode of ["pre-0058-quiesced", "pre-v2-0088-quiesced"] as const) {
+      const f = standaloneFixture();
+      await expect(
+        loadMoneyUnitCutoverOptions(
+          f.paths.declaration,
+          { ...f.target, schemaMaintenanceMode: mode },
+          f,
+        ),
+      ).rejects.toThrow("declaration is malformed");
+    }
+  });
+
+  test("the maintenance mode never removes the existing managed/private authority exclusions", async () => {
+    const f = standaloneFixture();
+    const executor = target.cloudflareProviderExecutor;
+    if (executor === undefined) throw new Error("fixture managed executor is missing");
+    const selected: DeployTarget = {
+      ...f.target,
+      schemaMaintenanceMode: "pre-wallet-usd-micros-quiesced",
+      cloudflareProviderExecutor: executor,
+    };
+    f.write(f.paths.declaration, { ...f.declaration, privateSourceRoot: f.root });
+    await expect(loadMoneyUnitCutoverOptions(f.paths.declaration, selected, f)).rejects.toThrow(
+      "standalone Host scope has private authority",
+    );
+    expect(selected.cloudflareProviderExecutor).toEqual(target.cloudflareProviderExecutor);
+    expect(selected.schemaMaintenanceMode).toBe("pre-wallet-usd-micros-quiesced");
+  });
+});
+
+describe("converted94 capture native original owner boundary", () => {
+  test("legacy and caller-shaped DATA cannot reach the native historical export", async () => {
+    const f = fixture();
+    const options = await loadMoneyUnitCutoverOptions(f.paths.declaration, target, f);
+    for (const supplied of [
+      options,
+      { ...options, nativeOnly: true, phase: "convert", ready: true },
+    ]) {
+      await expect(
+        captureMoneyUnitOriginalConverted94Backup(
+          supplied as MoneyUnitOriginalCutoverOptions,
+          join(f.root, "captured94.sql"),
+        ),
+      ).rejects.toThrow("unchanged native original owner");
+      expect(existsSync(join(f.root, "captured94.sql"))).toBe(false);
+      expect(existsSync(join(f.root, "captured94.sql.capture.json"))).toBe(false);
+    }
+  });
+});
+
+describe("converted94 sealed native capture readback", () => {
+  test("accepts export SQL trivia only with the original native terminal and complete sealed census", async () => {
+    const f = await resumeDependencyFixture("clear");
+    try {
+      const target = f.f.target;
+      const files = readMigrationArtifact().files;
+      const convert = await f.owner.custody.read("convert");
+      if (convert === null) throw new Error("fixture lacks terminal convert");
+      const convertedBackupPath = join(f.f.root, "converted94.sql");
+      const combined = `${f.original.sql}\n${f.phaseImports.map((sql) => `BEGIN TRANSACTION;\n${sql}\nCOMMIT;`).join("\n")}`;
+      const normalized = normalizeSnapshotDump(Buffer.from(combined));
+      const withTrivia = normalized.sql
+        .toString()
+        .replace(/(CREATE TABLE[^;]*?\()/, "$1 /* snapshot trivia */ ");
+      expect(withTrivia).not.toBe(normalized.sql.toString());
+      const convertedBytes = Buffer.from(withTrivia);
+      const convertedDigest = sha(withTrivia);
+      writeFileSync(convertedBackupPath, convertedBytes, { mode: 0o600 });
+      const restored = new Database(":memory:");
+      try {
+        restored.exec(convertedBytes.toString());
+        const restoredReader = {
+          query: async (_phase: unknown, _description: unknown, sql: string) =>
+            restored.query(sql).all() as Record<string, unknown>[],
+        };
+        const restoredRows = restored
+          .query(
+            "SELECT type, name, tbl_name, COALESCE(sql, '') AS sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name",
+          )
+          .all() as Record<string, unknown>[];
+        const restoredShape = canonicalSchemaShape(restoredRows);
+        expect(sha(restoredShape)).not.toBe(f.schema().shapeDigest);
+        const tableInventory = (
+          restored
+            .query(
+              "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT GLOB 'sqlite_*' AND name NOT IN ('_cf_KV', '_cf_METADATA', 'd1_migrations') ORDER BY name",
+            )
+            .all() as { name: string }[]
+        ).map((row) => row.name);
+        const rowCounts = Object.fromEntries(
+          tableInventory.map((table) => [
+            table,
+            (restored.query(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n,
+          ]),
+        );
+        const source94Digest = moneyUnitCutoverSourcePrefixDigest(files, 94);
+        const identity = {
+          kind: "takoserver.money-protected-backup@v2",
+          accountId: target.accountId,
+          databaseId: target.d1.databaseId,
+          databaseName: target.d1.databaseName,
+          originDigest: f.originDigest,
+          sourceDigest: source94Digest,
+          backupDigest: convertedDigest,
+          schemaPhase: "0094-fenced",
+          convertBindingDigest: convert.bindingDigest,
+          writerEpoch,
+        };
+        const identityBytes = `${JSON.stringify(identity)}\n`;
+        writeFileSync(`${convertedBackupPath}.identity.json`, identityBytes, { mode: 0o600 });
+        const capture = {
+          kind: "takoserver.money-converted94-export-capture@v1",
+          accountId: target.accountId,
+          databaseId: target.d1.databaseId,
+          databaseName: target.d1.databaseName,
+          originDigest: f.originDigest,
+          sourceDigest: source94Digest,
+          convertBindingDigest: convert.bindingDigest,
+          writerEpoch,
+          convertedBackupPath,
+        };
+        const captureBytes = `${JSON.stringify(capture)}\n`;
+        writeFileSync(`${convertedBackupPath}.capture.json`, captureBytes, { mode: 0o600 });
+        const completion = {
+          kind: "takoserver.money-converted94-export-completion@v1",
+          qualification: "component-simulation-only",
+          schemaPhase: "0094-fenced",
+          convertedBackupPath,
+          backupDigest: convertedDigest,
+          identityDigest: sha(identityBytes),
+          captureDigest: sha(captureBytes),
+          convertBindingDigest: convert.bindingDigest,
+          historicalWriterEpoch: writerEpoch,
+          sourceDigest: source94Digest,
+          allDataDigest: await readWholeDatabaseDataDigest(
+            restoredReader,
+            "preflight",
+            tableInventory,
+          ),
+          tableInventory,
+          rowCounts,
+        };
+        const completionPath = `${convertedBackupPath}.capture.complete.json`;
+        writeFileSync(completionPath, `${JSON.stringify(completion)}\n`, { mode: 0o600 });
+        const backup = {
+          digest: f.original.digest,
+          preimageDigest: f.preimageDigest,
+          aggregateDigest: f.aggregateDigest,
+          financialDigest: f.financialDigest,
+          allDataDigest: sha("fixture original92 complete data"),
+          rowCounts: {},
+        };
+        const reader = {
+          query: async (_phase: unknown, _description: unknown, sql: string) =>
+            f.database.query(sql).all() as Record<string, unknown>[],
+        };
+        const inspect = () =>
+          inspectMoneyUnitPost94State({
+            target,
+            options: { ...f.owner, phase: "suffix98" },
+            files,
+            database: reader,
+            readSchema: async () => f.schema(),
+            backup,
+            previousWriterEpoch: writerEpoch,
+            nextWriterEpoch: sha("fixture next epoch"),
+            convertedBackupPath,
+          } as never);
+        await expect(inspect()).resolves.toMatchObject({ schemaPhase: "0094-fenced" });
+        const capturePath = `${convertedBackupPath}.capture.json`;
+        writeFileSync(
+          capturePath,
+          `${JSON.stringify({ ...capture, writerEpoch: sha("foreign epoch") })}\n`,
+        );
+        await expect(inspect()).rejects.toThrow();
+        writeFileSync(capturePath, captureBytes);
+        writeFileSync(
+          completionPath,
+          `${JSON.stringify({ ...completion, allDataDigest: sha("foreign rows") })}\n`,
+        );
+        await expect(inspect()).rejects.toThrow();
+        writeFileSync(completionPath, `${JSON.stringify(completion)}\n`);
+        f.database.exec("CREATE TABLE foreign_shape_probe (id INTEGER PRIMARY KEY)");
+        await expect(inspect()).rejects.toThrow();
+        f.database.exec("DROP TABLE foreign_shape_probe");
+        const firstMigration = f.database
+          .query("SELECT id, name FROM d1_migrations ORDER BY id LIMIT 1")
+          .get() as {
+          id: number;
+          name: string;
+        };
+        f.database
+          .query("UPDATE d1_migrations SET name = ? WHERE id = ?")
+          .run("foreign_ledger_row", firstMigration.id);
+        await expect(inspect()).rejects.toThrow();
+        f.database
+          .query("UPDATE d1_migrations SET name = ? WHERE id = ?")
+          .run(firstMigration.name, firstMigration.id);
+        await expect(inspect()).resolves.toMatchObject({ schemaPhase: "0094-fenced" });
+      } finally {
+        restored.close();
+      }
+    } finally {
+      f.close();
+    }
+  }, 30_000);
+});
+
+describe("original suffix98 live upload receiver", () => {
+  const invocation = {
+    action: "status" as const,
+    environment: "integration" as const,
+    commit: source,
+    throughMigration: "0098" as const,
+  };
+
+  test("a copied upload receipt cannot replace the original upload graph", async () => {
+    const context = Object.freeze({});
+    const original = { context, selection: Object.freeze({}) };
+    const staleReceipt = Object.freeze({
+      kind: "takoserver.money-inactive-normal-version-upload@v1",
+    });
+    await expect(
+      runIntegrationMoneyHeldSuffix98FromOriginalUpload(
+        invocation,
+        target,
+        {} as MoneyUnitOriginalCutoverOptions,
+        original as never,
+        { context, normalPreparation: {}, receipt: staleReceipt, signingGenesisContribution: {} },
+      ),
+    ).rejects.toThrow();
+  });
+
+  test("a different held context refuses before any native or provider action", async () => {
+    await expect(
+      runIntegrationMoneyHeldSuffix98FromOriginalUpload(
+        invocation,
+        target,
+        {} as MoneyUnitOriginalCutoverOptions,
+        { context: Object.freeze({}), selection: Object.freeze({}) } as never,
+        {
+          context: Object.freeze({}),
+          normalPreparation: {},
+          receipt: {},
+          signingGenesisContribution: {},
+        },
+      ),
+    ).rejects.toThrow("same original live normal upload");
+  });
+
+  test("retained suffix custody refuses the original upload before its producer runs", async () => {
+    await expect(
+      prepareIntegrationMoneyHeldSuffix98OriginalUpload(
+        {
+          custody: {
+            read: async () => ({ state: "dispatched" }),
+            readDispatch: async () => null,
+          },
+        } as unknown as MoneyUnitOriginalCutoverOptions,
+        "/private/unchanged-post94-declaration.json",
+        {},
+      ),
+    ).rejects.toThrow("no upload or resend");
+  });
+
+  test("replacement refuses retained suffix custody before its producer or provider runs", async () => {
+    await expect(
+      prepareIntegrationMoneyHeldSuffix98ReplacementUpload(
+        {
+          custody: {
+            read: async () => null,
+            readDispatch: async () => ({ state: "dispatched" }),
+          },
+        } as unknown as MoneyUnitOriginalCutoverOptions,
+        "/private/unchanged-post94-declaration.json",
+        {},
+      ),
+    ).rejects.toThrow("cannot follow original suffix custody");
   });
 });

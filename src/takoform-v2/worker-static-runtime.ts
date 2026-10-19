@@ -1,5 +1,5 @@
 import type { WorkerdDeploymentVariant, WorkerdStaticSite } from "../workerd-runtime.ts";
-import { parseWorkerVersionSpec } from "./forms/worker-specs.ts";
+import { parseForwardWorkerVersionSpec, parseWorkerVersionSpec } from "./forms/worker-specs.ts";
 import {
   V2WorkerStaticRuntimeError,
   verifyV2AssetMaterials,
@@ -34,15 +34,31 @@ export type V2StaticWorkerDeploymentVariant = WorkerdDeploymentVariant<WorkerdSt
  * authority's `readVersionMaterials`. This function validates and copies its
  * input but does not authorize the read or perform source/network/SQL access.
  */
-export async function projectV2StaticWorkerVersion(input: {
+type StaticInput = {
   readonly identity: V2StaticWorkerVersionIdentity;
   readonly spec: unknown;
   readonly materials: V2WorkerVersionMaterials | null;
-}): Promise<V2StaticWorkerDeploymentVariant> {
+};
+
+export function projectV2StaticWorkerVersion(
+  input: StaticInput,
+): Promise<V2StaticWorkerDeploymentVariant> {
+  return projectStatic(input, false);
+}
+export function projectV2ForwardStaticWorkerVersion(
+  input: StaticInput,
+): Promise<V2StaticWorkerDeploymentVariant> {
+  return projectStatic(input, true);
+}
+
+async function projectStatic(
+  input: StaticInput,
+  forward: boolean,
+): Promise<V2StaticWorkerDeploymentVariant> {
   const unavailable = () => new V2WorkerStaticRuntimeError("worker_version_unavailable");
   let spec: ReturnType<typeof parseWorkerVersionSpec>;
   try {
-    spec = parseWorkerVersionSpec(input.spec);
+    spec = forward ? parseForwardWorkerVersionSpec(input.spec) : parseWorkerVersionSpec(input.spec);
   } catch {
     throw unavailable();
   }
