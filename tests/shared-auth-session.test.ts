@@ -1513,6 +1513,96 @@ describe("staging shared session against native D1 and signed issuer HTTP", () =
     }
   }, 30_000);
 
+  test("financial proof load/current reject prototype keys, crossed challenge, drift and failed current", async () => {
+    let loads = 0;
+    let currents = 0;
+    let disposed = 0;
+    let mode: "proto" | "challenge" | "current" | "drift" = "proto";
+    const found = (proofRef: string, challengeRef: string) => ({
+      v: 1,
+      status: "found",
+      proof: { v: 1, proofRef, challenge: { challengeRef } },
+    });
+    const financialProof: SharedAuthFinancialProofReceiver = {
+      async prove({ challengeRef }) {
+        return { proofRef: `proof-${challengeRef}` };
+      },
+      async loadFinancialIdentityProof(input) {
+        loads += 1;
+        if (mode === "proto")
+          return JSON.parse(
+            `{"__proto__":${JSON.stringify(found(input.proofRef, input.challengeRef))}}`,
+          );
+        if (mode === "challenge") return found(input.proofRef, "challenge-other");
+        const response = found(input.proofRef, input.challengeRef);
+        Object.defineProperty(response, Symbol.dispose, {
+          value() {
+            disposed += 1;
+          },
+        });
+        return response;
+      },
+      async verifyCurrentFinancialIdentityProof() {
+        currents += 1;
+        return { v: 1, status: "not-current" };
+      },
+    };
+    const f = await fixture({ financialProof });
+    try {
+      const signedIn = await f.signedIn();
+      const context = await f.runtime.observeFinalSession(f.sessionRequest(signedIn.sessionCookie));
+      const selected = f.runtime.finalSessionSelection(context);
+      if (!selected) throw new Error("missing final selection");
+      for (const next of ["proto", "challenge"] as const) {
+        mode = next;
+        await f.runtime.proveFinalSessionFinancialIdentity(selected, `challenge-${next}`);
+        await expect(
+          f.runtime.loadFinalSessionFinancialIdentityProof(selected, `challenge-${next}`),
+        ).rejects.toMatchObject({ code: "session_unavailable" });
+        await expect(
+          f.runtime.verifyCurrentFinalSessionFinancialIdentityProof(selected, `challenge-${next}`),
+        ).rejects.toMatchObject({ code: "session_unavailable" });
+      }
+      expect([loads, currents]).toEqual([2, 0]);
+      mode = "current";
+      await f.runtime.proveFinalSessionFinancialIdentity(selected, "challenge-current");
+      expect(
+        await f.runtime.loadFinalSessionFinancialIdentityProof(selected, "challenge-current"),
+      ).toEqual(found("proof-challenge-current", "challenge-current"));
+      expect(disposed).toBe(1);
+      const failed = f.runtime.verifyCurrentFinalSessionFinancialIdentityProof(
+        selected,
+        "challenge-current",
+      );
+      await expect(failed).rejects.toMatchObject({ code: "session_unavailable" });
+      expect(
+        f.runtime.verifyCurrentFinalSessionFinancialIdentityProof(selected, "challenge-current"),
+      ).toBe(failed);
+      expect([loads, currents]).toEqual([3, 1]);
+      // Replacing the captured load transport after construction stops dispatch.
+      mode = "drift";
+      await f.runtime.proveFinalSessionFinancialIdentity(selected, "challenge-drift");
+      Object.defineProperty(financialProof, "loadFinancialIdentityProof", {
+        configurable: true,
+        value: async () => found("proof-challenge-drift", "challenge-drift"),
+      });
+      await expect(
+        f.runtime.loadFinalSessionFinancialIdentityProof(selected, "challenge-drift"),
+      ).rejects.toMatchObject({ code: "session_unavailable" });
+      expect(loads).toBe(3);
+    } finally {
+      await f.dispose();
+    }
+    await expect(
+      fixture({
+        financialProof: {
+          prove: async () => ({ proofRef: "unused" }),
+          loadFinancialIdentityProof: "not-a-method" as never,
+        },
+      }),
+    ).rejects.toThrow(TypeError);
+  }, 30_000);
+
   test("financial proof accepts only detached DATA and releases the same RPC response once", async () => {
     const calls: string[] = [];
     const disposed: object[] = [];

@@ -1650,7 +1650,9 @@ async function financialProofResultData(
         if (keys.length > 16) throw new SharedAuthSessionError("session_unavailable");
         const output: Record<string, unknown> = {};
         for (const key of keys) {
-          if (typeof key !== "string") throw new SharedAuthSessionError("session_unavailable");
+          // An own "__proto__" would hit the inherited setter and swap the prototype.
+          if (typeof key !== "string" || key === "__proto__")
+            throw new SharedAuthSessionError("session_unavailable");
           const descriptor = descriptors[key];
           if (!descriptor || !("value" in descriptor) || !descriptor.enumerable)
             throw new SharedAuthSessionError("session_unavailable");
@@ -1677,12 +1679,19 @@ function sameFinancialProof(
   status: "found" | "current",
   request: SharedAuthFinancialProofRequestData,
 ): boolean {
-  if (!record(data) || data.v !== 1 || data.status !== status || !record(data.proof)) return false;
-  const proof = data.proof;
+  const own = (value: unknown, key: string): unknown =>
+    record(value) && Object.hasOwn(value, key) ? value[key] : undefined;
+  if (
+    !record(data) ||
+    Object.getPrototypeOf(data) !== Object.prototype ||
+    own(data, "v") !== 1 ||
+    own(data, "status") !== status
+  )
+    return false;
+  const proof = own(data, "proof");
   return (
-    proof.proofRef === request.proofRef &&
-    record(proof.challenge) &&
-    proof.challenge.challengeRef === request.challengeRef
+    own(proof, "proofRef") === request.proofRef &&
+    own(own(proof, "challenge"), "challengeRef") === request.challengeRef
   );
 }
 
