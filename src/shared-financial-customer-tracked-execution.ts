@@ -1,7 +1,9 @@
 /** PRIVATE mechanical SQL execution DATA. No provider or admission permission API.
  * Qualified Root backing origin, genuine Auth/Clock and the actual caller are not mounted.
  */
+import { assertFinancial0104CustomerWriteShape } from "./financial-0104-customer-schema.ts";
 import { canonicalJson } from "./json.ts";
+import { assertMoneyCutoverSqlOrigin } from "./money-cutover-sql.ts";
 import { type Row, type Sql, SqlError, type SqlStatement, type SqlWrite } from "./ports.ts";
 import {
   type CustomerPhaseInput,
@@ -18,7 +20,7 @@ export interface CustomerBatchAcknowledgementData {
     readonly changes: 1;
     readonly returnedRows: 0;
   }[];
-  /** Actual result[2] of this invocation, never inferred from a receipt INSERT. */
+  /** Actual result[1] of this invocation, never inferred from a receipt INSERT. */
   readonly dispatchCasChanges: 1 | null;
 }
 export type CustomerReceiptObservationData =
@@ -259,8 +261,34 @@ function matchesOriginal(
  * Executes only this module's actual frozen compiler output; the permit frame is Root's.
  * Own-data method/receiver identity is checked before/after every await. This is
  * NOT a Root physical-primary assertion or a qualified production constructor.
+ * Same rule as every Customer writer: before any statement of a phase, the Sql must
+ * be Root's Money writer for that phase's own writer epoch and the database must
+ * hold the exact fenced 0104 Customer shape; otherwise the phase is refused and
+ * nothing is read or written. GET-only recovery (readOriginal) is not gated.
  */
 export function createCustomerTrackedExecutionData(sql: Sql) {
+  return trackedExecution(sql, async (q) => {
+    try {
+      assertMoneyCutoverSqlOrigin(sql, { writerEpoch: q.writerEpoch });
+    } catch {
+      throw new SqlError("unavailable", "Customer phase writer must be Root's Money writer");
+    }
+    await assertFinancial0104CustomerWriteShape(sql);
+  });
+}
+
+/**
+ * The current-consent executor's form only (check-imports pins that one importer).
+ * Its transport is the executor's request-scoped wrapper: a batch reaches nothing
+ * but Root's native receiver, which frames it with Root's Money writer, and the
+ * executor asserts that writer's origin for the phase epoch and the exact fenced
+ * shape before it mints each batch operation. No other Sql may use this form.
+ */
+export function createCustomerTrackedExecutionOverRootReceiver(transport: Sql) {
+  return trackedExecution(transport, async () => undefined);
+}
+
+function trackedExecution(sql: Sql, writable: (q: CustomerPhaseInput) => Promise<void>) {
   function own<K extends "query" | "run" | "batch">(name: K): Sql[K] {
     const property = Object.getOwnPropertyDescriptor(sql, name);
     if (!property || !("value" in property) || typeof property.value !== "function") invalid();
@@ -349,6 +377,7 @@ export function createCustomerTrackedExecutionData(sql: Sql) {
     async executePhase(input: CustomerPhaseInput): Promise<CustomerTrackedExecutionData> {
       const q = detached(input);
       const plan = compileCustomerPhase(q);
+      await writable(q);
       const base = { qualification: "private-mechanical-sql-data-only" as const, original: q };
       const key = originalKey(q);
       if (observedOriginals.has(key))

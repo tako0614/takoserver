@@ -1,11 +1,12 @@
 import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA } from "../src/financial-0104-money-fence.ts";
 import {
   readFinancialCurrentConsentCustomerOperationOriginal,
   readFinancialCurrentConsentNativeOriginal,
 } from "../src/financial-current-consent-customer.ts";
 import { createMoneyCutoverSql } from "../src/money-cutover-sql.ts";
-import type { Row, SqlStatement } from "../src/ports.ts";
+import type { Row, Sql, SqlStatement } from "../src/ports.ts";
 import { sharedAuthFinancialConsentLocalCurrentnessStatement } from "../src/shared-auth-financial-consent-store.ts";
 import {
   guardCustomerConsentReceipt,
@@ -22,6 +23,7 @@ import {
 } from "../src/shared-financial-customer-journal.ts";
 import {
   captureCustomerTrackedPhaseOriginal,
+  createCustomerTrackedExecutionData,
   customerTrackedOriginalReadStatement,
 } from "../src/shared-financial-customer-tracked-execution.ts";
 import {
@@ -480,3 +482,60 @@ for (const phase of ["L1", "D"] as const)
       f.close();
     }
   });
+
+test("tracked execution refuses raw Sql, a foreign writer and an unfenced shape before any statement; freeze writes nothing", async () => {
+  const { f, l1 } = await customerCase();
+  try {
+    const calls: string[] = [];
+    // The transport beneath any writer; it records every statement sent.
+    const transport: Sql = {
+      async query(sql, params) {
+        calls.push(`query:${sql.slice(0, 24)}`);
+        return f.sql.query(sql, params);
+      },
+      async run(sql, params) {
+        calls.push("run");
+        return f.sql.run(sql, params);
+      },
+      async batch(statements) {
+        calls.push(`batch:${statements.length}`);
+        return f.sql.batch(statements);
+      },
+    };
+    const before = await customerRows(f);
+    const unchanged = async () => expect(await customerRows(f)).toEqual(before);
+    // A raw Sql and a Money writer for another epoch are refused before any SQL.
+    for (const sql of [transport, createMoneyCutoverSql(transport, ROTATED)]) {
+      await expect(createCustomerTrackedExecutionData(sql).executePhase(l1)).rejects.toThrow(
+        "Root's Money writer",
+      );
+      expect(calls).toEqual([]);
+    }
+    await unchanged();
+    const writer = createMoneyCutoverSql(transport, writerEpoch);
+    // One missing Customer fence is not the exact fenced shape: no batch is sent.
+    f.db.exec("DROP TRIGGER financial_customer_history_receipts_money_fence");
+    await expect(createCustomerTrackedExecutionData(writer).executePhase(l1)).rejects.toThrow(
+      "exact fenced shape",
+    );
+    expect(calls.filter((call) => !call.startsWith("query:"))).toEqual([]);
+    await unchanged();
+    f.db.exec(
+      FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA.financial_customer_history_receipts_money_fence ?? "",
+    );
+    // Freeze with the exact shape and the actual writer: nothing is written.
+    f.db.exec(
+      "INSERT INTO money_cutover_freeze VALUES(1,'binding','origin','backup','writer','source')",
+    );
+    const frozen = await createCustomerTrackedExecutionData(writer).executePhase(l1);
+    expect(frozen.status).toBe("get-only");
+    expect(calls.filter((call) => !call.startsWith("query:"))).toEqual([]);
+    await unchanged();
+    // GET-only recovery stays ungated and still reads nothing it may not.
+    const recovered = await createCustomerTrackedExecutionData(transport).readOriginal(l1);
+    expect(recovered.status).toBe("get-only");
+    await unchanged();
+  } finally {
+    f.close();
+  }
+});

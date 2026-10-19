@@ -25,7 +25,7 @@ import { compileCustomerPhase } from "./shared-financial-customer-dispatch.ts";
 import { completedCustomerReceiptReadStatement } from "./shared-financial-customer-journal.ts";
 import {
   captureCustomerTrackedPhaseOriginal,
-  createCustomerTrackedExecutionData,
+  createCustomerTrackedExecutionOverRootReceiver,
   customerTrackedOriginalReadStatement,
 } from "./shared-financial-customer-tracked-execution.ts";
 import {
@@ -510,7 +510,7 @@ export function createFinancialCurrentConsentCustomerExecutor(
         return result;
       },
     });
-    return createCustomerTrackedExecutionData(wrapped);
+    return createCustomerTrackedExecutionOverRootReceiver(wrapped);
   }
   const prior = attempted.get(connection) ?? new Set<string>();
   attempted.set(connection, prior);

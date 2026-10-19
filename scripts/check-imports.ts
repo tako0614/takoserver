@@ -879,9 +879,9 @@ const EXACT_CONTAINER_ADAPTER_IMPORTS: readonly {
   },
 ];
 
-/** Financial M/G/receiver and Customer admission/history/current-consent writers
- * bind their writer epoch exactly as R1 does, through the Money writer origin
- * assertion only. No other adapter access. */
+/** Financial M/G/receiver and Customer admission/history/tracked/current-consent
+ * writers bind their writer epoch exactly as R1 does, through the Money writer
+ * origin assertion only. No other adapter access. */
 const EXACT_FINANCIAL_MONEY_ORIGIN_IMPORTS: readonly {
   readonly source: string;
   readonly target: string;
@@ -894,6 +894,7 @@ const EXACT_FINANCIAL_MONEY_ORIGIN_IMPORTS: readonly {
   "src/shared-financial-admission.ts",
   "src/shared-financial-customer-history.ts",
   "src/financial-current-consent-customer.ts",
+  "src/shared-financial-customer-tracked-execution.ts",
 ].map((source) => ({
   source,
   target: "src/money-cutover-sql.ts",
@@ -1496,6 +1497,25 @@ if (existsSync(EXACT_RECOVERY_ENTRY)) {
         `${EXACT_RECOVERY_ENTRY} transitively imports public route module ${forbidden}`,
       );
     }
+  }
+}
+
+// The ungated Customer tracked-execution form exists only for the current-consent
+// executor, whose transport reaches nothing but Root's framing receiver and which
+// gates the Money writer origin and fenced shape itself. No other file may name it.
+const ROOT_RECEIVER_TRACKED_EXECUTION = "createCustomerTrackedExecutionOverRootReceiver";
+const ROOT_RECEIVER_TRACKED_EXECUTION_FILES = [
+  "src/shared-financial-customer-tracked-execution.ts",
+  "src/financial-current-consent-customer.ts",
+];
+for (const root of roots) {
+  for (const path of walk(root)) {
+    if (!path.endsWith(".ts") || ROOT_RECEIVER_TRACKED_EXECUTION_FILES.includes(path)) continue;
+    if (path === "scripts/check-imports.ts") continue;
+    if (readFileSync(path, "utf8").includes(ROOT_RECEIVER_TRACKED_EXECUTION))
+      violations.push(
+        `${path}: ${ROOT_RECEIVER_TRACKED_EXECUTION} is the current-consent executor's form only`,
+      );
   }
 }
 
