@@ -314,9 +314,21 @@ selected scope, `approve=yes` submission, original digest and capture time.
 runs one required batch over the existing pending29 row: command capture and
 the 95-bind native/issuer-guarded consume into original14 with its receipt.
 pending29 is matched in full and never inserted or replaced; a false guard
-aborts both rows. The attempt is installed before its first await and is
-never resent; an unknown acknowledgement keeps the existing original-fullcommand
-GET recovery, and a later re-mint with another capture time is a custody
-conflict. A consumed transaction can no longer be prepared for POST. The
-receipted original is local DATA for `verifyCurrentActionConsent` and the
-Financial consumer, not Financial NEW/CAS admission or a mounted route.
+aborts both rows. Before any capture the producer also requires the joins the
+verifiers check (final session account and Principal against the credential
+and human binding), so it never consumes a transaction into a consent that
+cannot verify. The attempt is installed before its first await and is never
+resent. When the batch outcome is unknown, the same invocation performs only
+the existing original-fullcommand GET of its exact held command: a committed
+original is returned, an absent one stays unavailable. Once dispatched for a
+transaction, the connection fences any further capture+consume batch for it,
+so a re-POST after an unknown or rolled-back batch cannot re-mint command16
+with a new Clock sample; like the GET pending fence this is process-local and
+not durable across connections or restarts. A consumed transaction can no
+longer be prepared for POST, and a committed row with other bytes is a custody
+conflict. The identity proof is checked current when the evidence joins under
+the same held observation whose sample is `acceptedAt` (Financial receiver
+owner ruling); the write itself is bounded by pending29 expiry, not by a
+second sample against the proof expiry. The receipted original is local DATA
+for `verifyCurrentActionConsent` and the Financial consumer, not Financial
+NEW/CAS admission or a mounted route.

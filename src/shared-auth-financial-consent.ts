@@ -27,11 +27,13 @@ import {
   captureAndConsumePreparedSharedAuthFinancialConsentObservedRequestData,
   createSharedAuthFinancialConsentLocalProofDataReader,
   createSharedAuthFinancialConsentProofReferenceReader,
+  createSharedAuthFinancialConsentRequestCommandRecovery,
   persistCaptureAndConsumeSharedAuthFinancialConsentObservedRequestData,
   prepareSharedAuthFinancialConsentPendingFromObservation,
   readSharedAuthFinancialConsentPreparedPendingForPost,
   type SharedAuthFinancialConsentCaptureData,
   type SharedAuthFinancialConsentLocalProofData,
+  type SharedAuthFinancialConsentOriginalCommand,
   type SharedAuthFinancialConsentOriginalData,
   SharedAuthFinancialConsentOriginalReadError,
   type SharedAuthFinancialConsentPendingData,
@@ -1431,10 +1433,15 @@ export function createSharedAuthFinancialConsentRequestHandler(connection: Worke
         const challenge = r1.original.c0.challenge;
         const pending = prepared.pending;
         const transactionRef = pending.transaction_ref;
+        // The verifiers also require these joins; refuse before consuming the
+        // transaction rather than commit a consent that can never verify.
         if (
           prepared.submission.transactionRef !== transactionRef ||
           pending.registration_ref !== issuer.registrationRef ||
-          pending.incarnation !== issuer.incarnation
+          pending.incarnation !== issuer.incarnation ||
+          finalSession.accountId !== credential.rp.accountId ||
+          finalSession.principalId !== human.principalId ||
+          human.ref !== credential.rp.principalBindingRef
         )
           unavailable();
         const [consentRef, commandRef, receiptRef] = await Promise.all([
@@ -1528,27 +1535,35 @@ export function createSharedAuthFinancialConsentRequestHandler(connection: Worke
           bytesDigest(commandBytes),
           bytesDigest(originalBytes),
         ]);
+        const command: SharedAuthFinancialConsentOriginalCommand = Object.freeze({
+          key,
+          selectedScope: scope,
+          family: CONSENT_FAMILY,
+          commandBytes,
+          commandCustodySHA256,
+          originalBytes,
+          originalDigest: identity.consentDigest,
+          originalCustodySHA256,
+          capturedAt: sampledAt,
+        });
         await assertCurrent();
-        const result = await captureAndConsumePreparedSharedAuthFinancialConsentObservedRequestData(
-          connection,
-          request,
-          workspaceId,
-          held.observation,
-          {
-            pending,
-            command: {
-              key,
-              selectedScope: scope,
-              family: CONSENT_FAMILY,
-              commandBytes,
-              commandCustodySHA256,
-              originalBytes,
-              originalDigest: identity.consentDigest,
-              originalCustodySHA256,
-              capturedAt: sampledAt,
-            },
-          },
-        );
+        let result: SharedAuthFinancialConsentOriginalData;
+        try {
+          result = await captureAndConsumePreparedSharedAuthFinancialConsentObservedRequestData(
+            connection,
+            request,
+            workspaceId,
+            held.observation,
+            { pending, command },
+          );
+        } catch {
+          // Unknown outcome: GET-only recovery of this exact held command. An
+          // absent original stays unavailable; nothing is re-minted or resent.
+          result = await createSharedAuthFinancialConsentRequestCommandRecovery(
+            connection,
+            command,
+          ).readOriginalData();
+        }
         assertHeld();
         // pending29 is now occupied, so only the R1 and held origin are rechecked.
         await assertR1();

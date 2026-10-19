@@ -81,6 +81,11 @@ const ORIGINALS = `${SHARED_AUTH_FINANCIAL_CONSENT_LEAF_PREFIX}originals`;
 // address, never retried on this connection (including another factory).
 // This is process-local; a new connection/restart has no durable attempt fence.
 const attemptedPreparedPending = new WeakMap<WorkerRequestSql, Set<string>>();
+// Process-local per connection, like the GET pending fence: once a prepared
+// capture+consume batch is dispatched for a transaction, this connection never
+// dispatches another (a re-POST would otherwise re-mint command16 bytes after a
+// batch whose outcome is unknown). Not durable across connections or restarts.
+const attemptedPreparedConsume = new WeakMap<WorkerRequestSql, Set<string>>();
 const keyNames = [
   "registrationRef",
   "incarnation",
@@ -3085,6 +3090,15 @@ async function observedRequestCaptureConsume(
     return fail("unavailable");
   }
   try {
+    if (existingPending) {
+      let attempts = attemptedPreparedConsume.get(connection);
+      if (!attempts) {
+        attempts = new Set();
+        attemptedPreparedConsume.set(connection, attempts);
+      }
+      if (attempts.has(guarded.command.key.transactionRef)) return fail("unavailable");
+      attempts.add(guarded.command.key.transactionRef);
+    }
     const results = requiredDenseValues(
       await batch.runRequiredBatch(statements),
       existingPending ? 2 : 3,

@@ -31,6 +31,7 @@ if (child) {
   let proofMode: "success" | "unknown" | "malformed" | "expire-after" = "success";
   let proofCapture: unknown;
   let loadCalls = 0;
+  let issuerMode: "ok" | "false-currentness" | "unknown-after-commit" = "ok";
   let loadEntries = 0;
   let issuedProofRef = "proof:from-original";
   let currentCalls = 0;
@@ -260,11 +261,28 @@ if (child) {
       requireConnection(value);
       return Object.freeze({
         async readCurrentOriginal() {
+          if (
+            issuerMode === "unknown-after-commit" &&
+            (
+              f.db
+                .query("SELECT count(*) AS n FROM shared_auth_financial_consent_commands")
+                .get() as { n: number } | null
+            )?.n === 1
+          )
+            throw Error("unknown issuer read after the batch committed");
           return issuer;
         },
         async currentness() {
           // Same four-bind shape as the issuer original EXISTS predicate.
-          return { original: issuer, sql: "?=1 AND ?=1 AND ?=1 AND ?=1", params: [1, 1, 1, 1] };
+          // False only inside the capture+consume batch, so the POST pending
+          // rereads still pass and the consume itself fails in SQL.
+          const inBatch = String(new Error().stack).includes("observedRequestCaptureConsume");
+          const first = issuerMode === "false-currentness" && inBatch ? "?=0" : "?=1";
+          return {
+            original: issuer,
+            sql: `${first} AND ?=1 AND ?=1 AND ?=1`,
+            params: [1, 1, 1, 1],
+          };
         },
       });
     },
@@ -318,6 +336,7 @@ if (child) {
     proofCapture = undefined;
     loadCalls = 0;
     loadEntries = 0;
+    issuerMode = "ok";
     currentCalls = 0;
     evidenceMode = "success";
     issuedProofRef = "proof:from-original";
@@ -926,6 +945,10 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
       expect(original.command.key.receiptRef).toMatch(/^rpcr_[A-Za-z0-9_-]{43}$/u);
       expect(consentWrites()).toEqual({ pending: 1, command: 1, original: 1 });
       expect(before.rows).toEqual({ pending: 1, command: 0, original: 0 });
+      const stored = JSON.parse(new TextDecoder().decode(original.originalBytes));
+      expect(stored.acceptedAt).toBe(original.command.capturedAt);
+      expect(original.recordedAt).toBe(original.command.capturedAt);
+      expect(original.receiptRecordedAt).toBe(original.command.capturedAt);
       expect(observerCalls - before.observer).toBe(0);
       expect(clockCalls - before.clock).toBe(0);
       // The existing current verifier accepts the produced original on a new Request.
@@ -1080,6 +1103,108 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
       expect(consentWrites()).toEqual({ pending: 1, command: 1, original: 1 });
     } finally {
       next.close();
+    }
+  });
+
+  async function evidencedSubmission(s: Awaited<ReturnType<typeof setup>>) {
+    const { request, submission } = await provedSubmission(s);
+    await s.handler.provePreparedFinancialR1Identity(
+      request,
+      SCOPE.workspaceId,
+      s.challengeRef,
+      submission,
+    );
+    await s.handler.readPreparedFinancialR1IdentityEvidence(
+      request,
+      SCOPE.workspaceId,
+      s.challengeRef,
+      submission,
+    );
+    return { request, submission };
+  }
+
+  test("a consume that fails in SQL rolls back command16 and fences a re-POST", async () => {
+    const s = await setup();
+    try {
+      const first = await evidencedSubmission(s);
+      issuerMode = "false-currentness";
+      await expect(
+        s.handler.capturePreparedFinancialR1Consent(
+          first.request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          first.submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(consentWrites()).toEqual({ pending: 1, command: 0, original: 0 });
+      // A new POST is preparable (no rows) but this connection never re-mints.
+      // Keep the DB clock ahead of the later source Clock samples so only the
+      // attempt fence can refuse it.
+      issuerMode = "ok";
+      dbNow = Date.parse(AT) + 60_000;
+      const again = await evidencedSubmission(s);
+      await expect(
+        s.handler.capturePreparedFinancialR1Consent(
+          again.request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          again.submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      expect(consentWrites()).toEqual({ pending: 1, command: 0, original: 0 });
+    } finally {
+      s.close();
+    }
+  });
+
+  test("an unknown pending reread before the batch refuses without dispatch", async () => {
+    const s = await setup();
+    try {
+      const { request, submission } = await evidencedSubmission(s);
+      const originalQuery = f.db.query.bind(f.db);
+      Object.defineProperty(f.db, "query", {
+        configurable: true,
+        value: (sql: string) => {
+          if (
+            sql.includes(
+              "FROM shared_auth_financial_consent_pending WHERE transaction_ref=? LIMIT 2",
+            )
+          )
+            throw Error("unknown pending reread");
+          return originalQuery(sql);
+        },
+      });
+      await expect(
+        s.handler.capturePreparedFinancialR1Consent(
+          request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
+      Object.defineProperty(f.db, "query", { configurable: true, value: originalQuery });
+      expect(consentWrites()).toEqual({ pending: 1, command: 0, original: 0 });
+    } finally {
+      s.close();
+    }
+  });
+
+  test("an unknown outcome after commit recovers the exact original by GET only", async () => {
+    const s = await setup();
+    try {
+      const { request, submission } = await evidencedSubmission(s);
+      issuerMode = "unknown-after-commit";
+      const original = await s.handler.capturePreparedFinancialR1Consent(
+        request,
+        SCOPE.workspaceId,
+        s.challengeRef,
+        submission,
+      );
+      expect(original.state).toBe("receipted-original-data");
+      expect(original.command.key.transactionRef).toBe(submission.pending.transaction_ref);
+      expect(consentWrites()).toEqual({ pending: 1, command: 1, original: 1 });
+    } finally {
+      s.close();
     }
   });
 
@@ -1363,7 +1488,7 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
     expect(stderr).toContain(
       "(pass) actual R1 and RP POST preflight reads pending only with one held Clock",
     );
-    expect(stderr).toContain("18 pass");
+    expect(stderr).toContain("21 pass");
     expect(stderr).toContain("0 fail");
   }, 100_000);
 }
