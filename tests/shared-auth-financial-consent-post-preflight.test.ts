@@ -322,7 +322,9 @@ if (child) {
       .query(`INSERT INTO ${table} (${names.join(",")}) VALUES (${names.map(() => "?").join(",")})`)
       .run(...Object.values(value));
   };
-  async function setup(): Promise<{ handler: Handler; challengeRef: string; close: () => void }> {
+  async function setup(
+    options: { readonly finalAccountId?: string } = {},
+  ): Promise<{ handler: Handler; challengeRef: string; close: () => void }> {
     f = await fixture();
     active = true;
     connection = Object.create(null) as WorkerRequestSql;
@@ -406,7 +408,7 @@ if (child) {
         selectedWorkspaceId: SCOPE.workspaceId,
         principalId,
         sessionDigest: `sha256:${"f".repeat(64)}`,
-        accountId: subject,
+        accountId: options.finalAccountId ?? subject,
         identity: OIDC,
       }),
       selectedScope: Object.freeze({
@@ -1157,18 +1159,22 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
     }
   });
 
-  test("an unknown pending reread before the batch refuses without dispatch", async () => {
+  test("an unknown pending reread right before the batch refuses without dispatch", async () => {
     const s = await setup();
     try {
       const { request, submission } = await evidencedSubmission(s);
       const originalQuery = f.db.query.bind(f.db);
+      let rereads = 0;
       Object.defineProperty(f.db, "query", {
         configurable: true,
         value: (sql: string) => {
+          // The first capture reread passes; only the one just before the
+          // batch (and any later read) is unknown.
           if (
             sql.includes(
               "FROM shared_auth_financial_consent_pending WHERE transaction_ref=? LIMIT 2",
-            )
+            ) &&
+            ++rereads >= 2
           )
             throw Error("unknown pending reread");
           return originalQuery(sql);
@@ -1183,6 +1189,24 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
         ),
       ).rejects.toMatchObject({ code: "unavailable" });
       Object.defineProperty(f.db, "query", { configurable: true, value: originalQuery });
+      expect(consentWrites()).toEqual({ pending: 1, command: 0, original: 0 });
+    } finally {
+      s.close();
+    }
+  });
+
+  test("a final session that does not join the credential account is refused before capture", async () => {
+    const s = await setup({ finalAccountId: "account_other" });
+    try {
+      const { request, submission } = await evidencedSubmission(s);
+      await expect(
+        s.handler.capturePreparedFinancialR1Consent(
+          request,
+          SCOPE.workspaceId,
+          s.challengeRef,
+          submission,
+        ),
+      ).rejects.toMatchObject({ code: "unavailable" });
       expect(consentWrites()).toEqual({ pending: 1, command: 0, original: 0 });
     } finally {
       s.close();
@@ -1488,7 +1512,7 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
     expect(stderr).toContain(
       "(pass) actual R1 and RP POST preflight reads pending only with one held Clock",
     );
-    expect(stderr).toContain("21 pass");
+    expect(stderr).toContain("22 pass");
     expect(stderr).toContain("0 fail");
   }, 100_000);
 }
