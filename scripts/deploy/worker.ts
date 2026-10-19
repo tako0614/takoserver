@@ -234,6 +234,17 @@ interface WorkerInspection {
 const SCHEMA_0058_NAME = "0058_cloudflare_managed_worker_domain_receipts.sql";
 const expectedMoneyShapes = new Map<string, string>();
 
+/** The Money-preserved Auth103 lineage: the fenced USD-micros writer and its
+ * epoch on the shared-auth profile, the only target whose post-103 primary
+ * keeps Money's own guards. */
+function workerMoneyPreservedTarget(target: DeployTarget): boolean {
+  return (
+    target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1" &&
+    /^sha256:[0-9a-f]{64}$/u.test(target.moneyCutoverWriterEpoch ?? "") &&
+    target.auth103NativeProfile === "root-shared-auth-staging-v1"
+  );
+}
+
 /** Explicit source profiles only; this check never grants D1 apply authority. */
 export function workerSchemaAllowsPending(
   target: DeployTarget,
@@ -246,10 +257,7 @@ export function workerSchemaAllowsPending(
   sourceRepositoryRoot = REPOSITORY,
 ): boolean {
   if (target.schemaMaintenanceMode === "pre-auth103-quiesced") {
-    const moneyPreserved =
-      target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1" &&
-      /^sha256:[0-9a-f]{64}$/u.test(target.moneyCutoverWriterEpoch ?? "") &&
-      target.auth103NativeProfile === "root-shared-auth-staging-v1";
+    const moneyPreserved = workerMoneyPreservedTarget(target);
     return (
       target.environment === "integration" &&
       target.artifactBlobIoMode === undefined &&
@@ -273,6 +281,24 @@ export function workerSchemaAllowsPending(
       migrations.local.length === 105)
   ) {
     return financial0104SourceSchemaReady(migrations, sourceRepositoryRoot, "normal");
+  }
+  // A Money-preserved primary past Auth103 serves only its own exact
+  // money-preserved shape; earlier Money phases keep their cutover profiles below.
+  if (
+    target.schemaMaintenanceMode === undefined &&
+    target.artifactBlobIoMode === undefined &&
+    target.environment === "integration" &&
+    workerMoneyPreservedTarget(target) &&
+    (migrations.applied.length === 103 ||
+      migrations.applied.length === 104 ||
+      migrations.applied.length === 105)
+  ) {
+    return financial0104SourceSchemaReady(
+      migrations,
+      sourceRepositoryRoot,
+      "normal",
+      "money-preserved",
+    );
   }
   if (target.schemaMaintenanceMode === "pre-wallet-usd-micros-quiesced") {
     if (
@@ -466,7 +492,12 @@ export function workerMoneyUnitSchemaReady(
       migrations.local.length === 104) &&
       migrations.applied.length === 105)
   ) {
-    return financial0104SourceSchemaReady(migrations, sourceRepositoryRoot, "normal");
+    // The ordinary and Money-preserved post-103 shapes, as 0094 and 0094-fenced
+    // below; the publication profile itself is bound by workerSchemaAllowsPending.
+    return (
+      financial0104SourceSchemaReady(migrations, sourceRepositoryRoot, "normal") ||
+      financial0104SourceSchemaReady(migrations, sourceRepositoryRoot, "normal", "money-preserved")
+    );
   }
   const source = readCurrentAuditedMigrationSourceArtifact(
     resolve(sourceRepositoryRoot, "migrations"),

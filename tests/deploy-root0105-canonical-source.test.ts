@@ -29,6 +29,9 @@ import {
   composeFinancial0104ImportData,
   type Financial0104ImportInput,
 } from "../scripts/deploy/schema-financial0104-source.ts";
+import { moneyUnitCutoverSchemaMatches } from "../scripts/deploy/schema-money-unit-cutover.ts";
+import type { DeployTarget } from "../scripts/deploy/target.ts";
+import { workerMoneyUnitSchemaReady, workerSchemaAllowsPending } from "../scripts/deploy/worker.ts";
 import { AUTH103_NATIVE_CATALOG_QUERY } from "../src/auth103-native-source-contract.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { FINANCIAL_0104_DDL } from "../src/financial-0104-source-contract.ts";
@@ -457,6 +460,96 @@ test(
       expect(count(database, "d1_migrations")).toBe(105);
     } finally {
       database.close();
+      source.dispose();
+    }
+  },
+  LONG,
+);
+
+test(
+  "a Worker on a Money-preserved post-Auth103 primary reads its own money-preserved profile",
+  () => {
+    const root = sourceRoot("100");
+    const source = readFinancial0104CanonicalMigrationSource(root);
+    const ordinaryTarget: DeployTarget = {
+      kind: "takoserver.deploy-target@v2",
+      environment: "integration",
+      accountId: "a".repeat(32),
+      workerName: "takoserver-api-integration-root0105",
+      publicOrigin: "https://root0105.integration.example.test",
+      d1: { databaseId: "00000000-0000-4000-8000-000000000105", databaseName: "root0105" },
+      r2: { bucketName: "root0105" },
+      signing: { currentKeyId: "current" },
+    };
+    const moneyTarget: DeployTarget = {
+      ...ordinaryTarget,
+      moneyCutoverWriterPolicy: "transaction-fenced-usd-micros-v1",
+      moneyCutoverWriterEpoch: EPOCH,
+      auth103NativeProfile: "root-shared-auth-staging-v1",
+    };
+    const { auth103NativeProfile: _profile, ...moneyWithoutAuthProfile } = moneyTarget;
+    const observe = (database: Database) => ({
+      ...state(database, source.physicalNames),
+      moneyUnitPolicy: database
+        .query<{ ledger_unit: string; historical_usage_unit: string; cash_unit: string }, []>(
+          "SELECT ledger_unit,historical_usage_unit,cash_unit FROM money_unit_policy",
+        )
+        .all(),
+    });
+    // Refusal is a false result or the existing pending-migration preflight error.
+    const refuses = (target: DeployTarget, observed: ReturnType<typeof observe>) => {
+      try {
+        return !workerSchemaAllowsPending(target, observed, root);
+      } catch {
+        return true;
+      }
+    };
+    const preserved = inputs(source, "money-preserved");
+    const ordinary = inputs(source, "ordinary");
+    const moneyDatabase = moneyPreserved103(source, preserved.at104.prefixShape);
+    const ordinaryDatabase = ordinary103(source);
+    try {
+      for (const step of [undefined, preserved.step104, preserved.step105]) {
+        if (step !== undefined) run(moneyDatabase, composeFinancial0104ImportData(step).sql);
+        const observed = observe(moneyDatabase);
+        expect(workerMoneyUnitSchemaReady(observed, root)).toBe(true);
+        expect(workerSchemaAllowsPending(moneyTarget, observed, root)).toBe(true);
+        // Neither an ordinary target nor a Money target off the Auth103 lineage serves it.
+        expect(refuses(ordinaryTarget, observed)).toBe(true);
+        expect(refuses(moneyWithoutAuthProfile, observed)).toBe(true);
+      }
+      // No Money cutover phase resumes past Auth103: its Stripe generation is
+      // installed only by the Money-preserved 0104 import above.
+      const audited = readCurrentAuditedMigrationSourceArtifact(resolve(root, "migrations")).files;
+      for (const phase of [
+        "0092",
+        "0092-fenced",
+        "0093",
+        "0093-fenced",
+        "0094",
+        "0094-fenced",
+        "0098",
+        "0098-fenced",
+      ] as const)
+        expect(moneyUnitCutoverSchemaMatches(observe(moneyDatabase), audited, phase)).toBe(false);
+      for (const step of [undefined, ordinary.step104, ordinary.step105]) {
+        if (step !== undefined) run(ordinaryDatabase, composeFinancial0104ImportData(step).sql);
+        const observed = observe(ordinaryDatabase);
+        expect(workerMoneyUnitSchemaReady(observed, root)).toBe(true);
+        expect(workerSchemaAllowsPending(ordinaryTarget, observed, root)).toBe(true);
+        // The ordinary shape lacks Money's guards, so the Money writer is refused.
+        expect(refuses(moneyTarget, observed)).toBe(true);
+      }
+      // A Money-preserved exact105 missing one Stripe customer fence qualifies neither check.
+      const [first] = moneyCutoverStripeCustomerGuardDefinitions();
+      if (first === undefined) throw new Error("missing Stripe definition");
+      moneyDatabase.exec(`DROP TRIGGER ${first[0]}`);
+      const missing = observe(moneyDatabase);
+      expect(workerMoneyUnitSchemaReady(missing, root)).toBe(false);
+      expect(refuses(moneyTarget, missing)).toBe(true);
+    } finally {
+      moneyDatabase.close();
+      ordinaryDatabase.close();
       source.dispose();
     }
   },
