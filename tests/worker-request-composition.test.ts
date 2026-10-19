@@ -623,6 +623,7 @@ describe("official read-only Financial request origin", () => {
       "captureWorkerRequestRetainedDirectOwnerSession",
       "captureWorkerRequestRetainedRpSession",
       "financialAuthConsumerSourceCurrentness",
+      "proveWorkerRequestRetainedRpFinancialIdentityOriginal",
       "readWorkerRequestFinancialAuthConsumerContext",
       "readWorkerRequestFinancialAuthConsumerPort",
       "readWorkerRequestFinancialInputs",
