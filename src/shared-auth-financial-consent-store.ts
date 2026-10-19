@@ -81,6 +81,11 @@ const ORIGINALS = `${SHARED_AUTH_FINANCIAL_CONSENT_LEAF_PREFIX}originals`;
 // address, never retried on this connection (including another factory).
 // This is process-local; a new connection/restart has no durable attempt fence.
 const attemptedPreparedPending = new WeakMap<WorkerRequestSql, Set<string>>();
+// Process-local per connection, like the GET pending fence: once a prepared
+// capture+consume batch is dispatched for a transaction, this connection never
+// dispatches another (a re-POST would otherwise re-mint command16 bytes after a
+// batch whose outcome is unknown). Not durable across connections or restarts.
+const attemptedPreparedConsume = new WeakMap<WorkerRequestSql, Set<string>>();
 const keyNames = [
   "registrationRef",
   "incarnation",
@@ -2910,12 +2915,39 @@ export async function persistCaptureAndConsumeSharedAuthFinancialConsentNativeRe
  * second final observer, RP touch, reload or capture fallback occurs here.
  * This is not affirmative/current consent or Financial NEW admission.
  */
-export async function persistCaptureAndConsumeSharedAuthFinancialConsentObservedRequestData(
+export function persistCaptureAndConsumeSharedAuthFinancialConsentObservedRequestData(
   connection: WorkerRequestSql,
   request: Request,
   workspaceId: string,
   observation: unknown,
   input: SharedAuthFinancialConsentCaptureData,
+): Promise<SharedAuthFinancialConsentOriginalData> {
+  return observedRequestCaptureConsume(connection, request, workspaceId, observation, input, false);
+}
+
+/** The POST continuation over the pending29 row that the prepared GET already
+ * stored: one required batch captures command16 and consumes into original14
+ * with its receipt under the same held observation, Root native and issuer
+ * predicates. pending29 is matched in full, never inserted or replaced. A
+ * failed/unknown batch keeps the existing original-fullcommand GET recovery;
+ * it never re-mints a command or resends. Not Financial NEW/CAS admission. */
+export function captureAndConsumePreparedSharedAuthFinancialConsentObservedRequestData(
+  connection: WorkerRequestSql,
+  request: Request,
+  workspaceId: string,
+  observation: unknown,
+  input: SharedAuthFinancialConsentCaptureData,
+): Promise<SharedAuthFinancialConsentOriginalData> {
+  return observedRequestCaptureConsume(connection, request, workspaceId, observation, input, true);
+}
+
+async function observedRequestCaptureConsume(
+  connection: WorkerRequestSql,
+  request: Request,
+  workspaceId: string,
+  observation: unknown,
+  input: SharedAuthFinancialConsentCaptureData,
+  existingPending: boolean,
 ): Promise<SharedAuthFinancialConsentOriginalData> {
   const batch = captureRequiredRequestBatchSql(connection);
   let captured: SharedAuthFinancialConsentCaptureData;
@@ -3040,31 +3072,52 @@ export async function persistCaptureAndConsumeSharedAuthFinancialConsentObserved
     assertBridge();
     const nativeCurrentness = financialAuthConsumerSourceCurrentness(rootPort, rootContext);
     assertBridge();
-    statements = requiredNativePendingCaptureConsumeStatements(
-      guarded,
-      nativeCurrentness,
-      issuerCurrentness,
-    );
-    if (statements.length !== 3 || statements[2]?.params?.length !== 95) return fail("unavailable");
+    statements = existingPending
+      ? Object.freeze([
+          requiredCommandCaptureStatement(guarded),
+          requiredNativeOriginalConsumeStatement(guarded, nativeCurrentness, issuerCurrentness),
+        ])
+      : requiredNativePendingCaptureConsumeStatements(
+          guarded,
+          nativeCurrentness,
+          issuerCurrentness,
+        );
+    if (statements.length !== (existingPending ? 2 : 3) || statements.at(-1)?.params?.length !== 95)
+      return fail("unavailable");
     assertBridge();
   } catch {
     assertBridge();
     return fail("unavailable");
   }
   try {
-    const results = requiredDenseValues(await batch.runRequiredBatch(statements), 3);
+    if (existingPending) {
+      let attempts = attemptedPreparedConsume.get(connection);
+      if (!attempts) {
+        attempts = new Set();
+        attemptedPreparedConsume.set(connection, attempts);
+      }
+      if (attempts.has(guarded.command.key.transactionRef)) return fail("unavailable");
+      attempts.add(guarded.command.key.transactionRef);
+    }
+    const results = requiredDenseValues(
+      await batch.runRequiredBatch(statements),
+      existingPending ? 2 : 3,
+    );
     assertBridge();
-    const pendingWrite = snapshotRequiredBatchWrite(results[0], pendingColumns);
-    const commandWrite = snapshotRequiredBatchWrite(results[1], commandColumns);
-    const originalWrite = snapshotRequiredBatchWrite(results[2], originalColumns);
-    const pending = snapshotPendingBoundary(pendingWrite.rows[0], "unavailable");
-    if (!samePending(pending, guarded.pending)) return fail("unavailable");
-    await pendingCustody(pending, "unavailable");
-    assertBridge();
+    if (!existingPending) {
+      const pendingWrite = snapshotRequiredBatchWrite(results[0], pendingColumns);
+      const pending = snapshotPendingBoundary(pendingWrite.rows[0], "unavailable");
+      if (!samePending(pending, guarded.pending)) return fail("unavailable");
+      await pendingCustody(pending, "unavailable");
+      assertBridge();
+    }
+    const commandWrite = snapshotRequiredBatchWrite(results.at(-2), commandColumns);
+    const originalWrite = snapshotRequiredBatchWrite(results.at(-1), originalColumns);
     await requireSharedAuthFinancialConsentCommandCapturePostimage(commandWrite, guarded.command);
     assertBridge();
     await requireSharedAuthFinancialConsentConsumePostimage(originalWrite, expected);
     assertBridge();
+    // The original reader re-reads pending29 beside command16/original14.
     const original = await originals.readOriginal(guarded.command);
     assertBridge();
     await issuerSource.readCurrentOriginal(request, workspaceId, observation);
