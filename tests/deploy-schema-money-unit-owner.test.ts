@@ -126,8 +126,9 @@ const target: DeployTarget = {
 };
 
 const roots: string[] = [];
+// Sealed 0500 import directories are not removable by a non-root runner; unseal first.
 afterEach(() => {
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  for (const root of roots.splice(0)) removeArtifactTree(root);
 });
 
 function fixture(selectedTarget: DeployTarget = target) {
