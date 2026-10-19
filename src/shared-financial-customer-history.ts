@@ -3,6 +3,7 @@ import { isFinancialMoneyFencedBatch } from "./financial-0104-money-fence.ts";
 import { canonicalJson } from "./json.ts";
 import { assertMoneyCutoverSqlOrigin } from "./money-cutover-sql.ts";
 import { type JsonValue, type Row, type Sql, SqlError, type SqlStatement } from "./ports.ts";
+import { ROOT_0105_ORG_CAPTURE_TRIGGERS } from "./root-0105-org-capture-triggers.ts";
 
 /** Unmounted private H0 component. Syntactic captured inputs are NOT source authentication. */
 export const HISTORY_COMPONENT_QUALIFICATION = "synthetic-input-h0-component-only" as const;
@@ -265,7 +266,7 @@ export function prepareHistoryStart(
           ],
         };
   const last = {
-    sql: `INSERT INTO financial_history_enrollment_receipts(receipt_ref,attempt_ref,enrollment_ref,primary_ref,generation,receipt_kind,capture_sequence,all_rows_match) VALUES(?,?,?,?,?,'capture-start',COALESCE((SELECT capture_sequence FROM financial_history_enrollment_heads WHERE primary_ref=?),0),CASE WHEN EXISTS(SELECT 1 FROM financial_history_primary_roots r JOIN financial_history_enrollments e ON e.primary_ref=r.primary_ref JOIN financial_history_enrollment_heads h ON h.primary_ref=e.primary_ref AND h.enrollment_ref=e.enrollment_ref WHERE ${rootMatch} AND e.enrollment_ref=? AND e.enrollment_incarnation=? AND e.required_json=? AND e.expected_start_receipt_ref=? AND e.expected_seal_ref=? AND e.previous_start_receipt_ref IS ? AND e.previous_seal_ref IS ? AND h.state='capturing' AND h.generation=? AND h.expected_receipt_ref=?) THEN 1 ELSE NULL END)`,
+    sql: `INSERT INTO financial_history_enrollment_receipts(receipt_ref,attempt_ref,enrollment_ref,primary_ref,generation,receipt_kind,capture_sequence,all_rows_match) VALUES(?,?,?,?,?,'capture-start',COALESCE((SELECT capture_sequence FROM financial_history_enrollment_heads WHERE primary_ref=?),0),CASE WHEN EXISTS(SELECT 1 FROM financial_history_primary_roots r JOIN financial_history_enrollments e ON e.primary_ref=r.primary_ref JOIN financial_history_enrollment_heads h ON h.primary_ref=e.primary_ref AND h.enrollment_ref=e.enrollment_ref WHERE ${rootMatch} AND e.enrollment_ref=? AND e.enrollment_incarnation=? AND e.required_json=? AND e.expected_start_receipt_ref=? AND e.expected_seal_ref=? AND e.previous_start_receipt_ref IS ? AND e.previous_seal_ref IS ? AND h.state='capturing' AND h.generation=? AND h.expected_receipt_ref=?)${ORG_CAPTURE_EXACT} THEN 1 ELSE NULL END)`,
     params: [
       run.startReceiptRef,
       run.startReceiptRef,
@@ -284,6 +285,7 @@ export function prepareHistoryStart(
       run.previousSealRef,
       run.generation,
       run.startReceiptRef,
+      ORG_CAPTURE_TRIGGERS_JSON,
     ],
   };
   // The start snapshot of existing Org ids, in the same batch as the run and head.
@@ -293,6 +295,12 @@ export function prepareHistoryStart(
   };
   return fenced([rootInsert, runInsert, head, roster, last]);
 }
+/** Root's official 0105 Org capture triggers, compared byte for byte with the
+ * stored schema when a capture starts: a same-named trigger with other SQL, or a
+ * missing one, makes the start receipt fail its all_rows_match CHECK. */
+const ORG_CAPTURE_TRIGGERS_JSON = canonicalJson(Object.entries(ROOT_0105_ORG_CAPTURE_TRIGGERS));
+const ORG_CAPTURE_EXACT = ` AND (SELECT count(*) FROM main.sqlite_schema f JOIN json_each(?) t ON f.type='trigger' AND f.tbl_name='orgs' AND f.name=json_extract(t.value,'$[0]') AND f.sql=json_extract(t.value,'$[1]'))=${Object.keys(ROOT_0105_ORG_CAPTURE_TRIGGERS).length}`;
+
 /** Every H0 statement writes one 0104 money-fenced history table; nothing else is built. */
 function fenced<T extends readonly SqlStatement[]>(statements: T): T {
   if (!isFinancialMoneyFencedBatch(statements))

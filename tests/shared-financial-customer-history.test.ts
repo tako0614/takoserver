@@ -15,6 +15,7 @@ import {
   MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
 } from "../src/money-cutover-sql.ts";
 import { type Sql, SqlError, type SqlStatement } from "../src/ports.ts";
+import { ROOT_0105_ORG_CAPTURE_TRIGGERS } from "../src/root-0105-org-capture-triggers.ts";
 import {
   createHistoryH0Component,
   type HistoryEnrollment,
@@ -1955,6 +1956,30 @@ test("a capture start requires Root's four Org capture triggers on orgs", async 
       const before = f.snapshot();
       await constraint(() => f.component.start(root, enrollment()));
       expect(f.snapshot()).toBe(before);
+      f.db.exec(sql);
+      expect((await f.component.start(root, enrollment()))?.receipt_kind).toBe("capture-start");
+    } finally {
+      f.db.close();
+    }
+  }
+});
+test("a capture start pins Root's official 0105 trigger SQL byte for byte", async () => {
+  for (const [name, sql] of Object.entries(ROOT_0105_ORG_CAPTURE_TRIGGERS)) {
+    const f = fixture();
+    try {
+      const stored = (
+        f.db.query("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?").get(name) as {
+          sql: string;
+        }
+      ).sql;
+      expect(stored).toBe(sql);
+      // Same name and table, different body: a no-op capture would pass a name check.
+      f.db.exec(`DROP TRIGGER ${name}`);
+      f.db.exec(sql.replace(/\nBEGIN\n[\s\S]*\nEND$/u, "\nBEGIN\n SELECT 1;\nEND"));
+      const before = f.snapshot();
+      await constraint(() => f.component.start(root, enrollment()));
+      expect(f.snapshot()).toBe(before);
+      f.db.exec(`DROP TRIGGER ${name}`);
       f.db.exec(sql);
       expect((await f.component.start(root, enrollment()))?.receipt_kind).toBe("capture-start");
     } finally {
