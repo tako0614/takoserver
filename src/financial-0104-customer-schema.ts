@@ -1,0 +1,365 @@
+/** PRIVATE Financial-owned 0104 Customer schema leaves. These are the exact
+ * candidate rows the Customer admission, history, journal, dispatch and custody
+ * writers already target, now owned by the Financial 0104 recipe with their money
+ * fences. The write-shape check below is the only runtime use: every Customer
+ * write requires the exact fenced 0104 Customer shape; an unfenced or partial
+ * shape stays readable for recovery but is never written. No authority here. */
+
+import { FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA } from "./financial-0104-money-fence.ts";
+import { type Row, type Sql, SqlError } from "./ports.ts";
+
+/** Exact Customer L1 admission rows, byte-identical to the L1 candidate fixture. */
+export const FINANCIAL_0104_CUSTOMER_L1_SCHEMA: Readonly<Record<string, string>> = Object.freeze({
+  financial_customer_admissions:
+    "CREATE TABLE financial_customer_admissions (\n admission_ref TEXT PRIMARY KEY NOT NULL, challenge_ref TEXT NOT NULL UNIQUE,\n grant_ref TEXT NOT NULL, issuance_attempt TEXT NOT NULL UNIQUE, expected_receipt_ref TEXT NOT NULL UNIQUE,\n organization_id TEXT NOT NULL, action_kind TEXT NOT NULL CHECK(action_kind IN('topup','subscription-start','card-setup')),\n action_ref TEXT NOT NULL, request_fingerprint TEXT NOT NULL,\n action_json TEXT NOT NULL CHECK(json_valid(action_json) AND json_type(action_json)='object'),\n selection_json TEXT NOT NULL CHECK(json_valid(selection_json) AND json_type(selection_json)='object'),\n terms_json TEXT NOT NULL CHECK(json_valid(terms_json) AND json_type(terms_json)='object'),\n context_json TEXT NOT NULL CHECK(json_valid(context_json) AND json_type(context_json)='object'),\n realm_json TEXT NOT NULL CHECK(json_valid(realm_json) AND json_type(realm_json)='object'),\n customer_request_json TEXT NOT NULL CHECK(json_valid(customer_request_json) AND json_type(customer_request_json)='object'),\n customer_fingerprint TEXT NOT NULL, stripe_key TEXT NOT NULL, created_at TEXT NOT NULL,\n FOREIGN KEY(grant_ref,challenge_ref) REFERENCES financial_payer_grants(grant_ref,challenge_ref) ON DELETE RESTRICT,\n CHECK(length(created_at)=24 AND strftime('%Y-%m-%dT%H:%M:%fZ',created_at) IS created_at),\n CHECK(length(CAST(context_json AS BLOB)) BETWEEN 2 AND 65536)\n)",
+  stripe_customer_admission_links:
+    "CREATE TABLE stripe_customer_admission_links (\n org_id TEXT PRIMARY KEY NOT NULL, admission_ref TEXT NOT NULL UNIQUE,\n customer_fingerprint TEXT NOT NULL, stripe_key TEXT NOT NULL,\n realm_json TEXT NOT NULL, customer_request_json TEXT NOT NULL, created_at TEXT NOT NULL,\n FOREIGN KEY(org_id) REFERENCES stripe_billing_customer_commands(org_id) ON DELETE RESTRICT,\n FOREIGN KEY(admission_ref) REFERENCES financial_customer_admissions(admission_ref) ON DELETE RESTRICT\n)",
+  financial_customer_admission_receipts:
+    "CREATE TABLE financial_customer_admission_receipts (\n receipt_ref TEXT PRIMARY KEY NOT NULL, admission_ref TEXT NOT NULL UNIQUE,\n issuance_attempt TEXT NOT NULL UNIQUE, org_id TEXT NOT NULL, created_at TEXT NOT NULL,\n all_rows_match INTEGER NOT NULL CHECK(typeof(all_rows_match)='integer' AND all_rows_match=1),\n FOREIGN KEY(admission_ref) REFERENCES financial_customer_admissions(admission_ref) ON DELETE RESTRICT,\n FOREIGN KEY(org_id) REFERENCES stripe_customer_admission_links(org_id) ON DELETE RESTRICT\n)",
+  financial_customer_admission_receipts_by_org:
+    "CREATE INDEX financial_customer_admission_receipts_by_org ON financial_customer_admission_receipts(org_id)",
+  financial_customer_admission_original:
+    "CREATE TRIGGER financial_customer_admission_original BEFORE INSERT ON financial_customer_admissions\nWHEN NOT EXISTS(SELECT 1 FROM shared_customer_challenges c\n JOIN financial_payer_grants g ON g.challenge_ref=c.challenge_ref\n JOIN financial_payer_consent_witnesses w ON w.grant_ref=g.grant_ref AND w.challenge_ref=g.challenge_ref\n JOIN financial_payer_consent_receipts r ON r.grant_ref=g.grant_ref AND r.challenge_ref=g.challenge_ref\n WHERE (g.grant_ref IS NEW.grant_ref AND c.challenge_ref IS NEW.challenge_ref\n AND c.organization_id IS NEW.organization_id AND c.action_kind IS NEW.action_kind\n AND c.action_ref IS NEW.action_ref AND c.request_fingerprint IS NEW.request_fingerprint)\n AND (c.action_json IS NEW.action_json AND c.selection_json IS NEW.selection_json\n AND json_extract(c.selection_json,'$.selectedTerms') IS NEW.terms_json\n AND json_extract(c.selection_json,'$.customer.realmJson') IS NEW.realm_json\n AND json_extract(c.selection_json,'$.customer.requestJson') IS NEW.customer_request_json\n AND json_extract(c.selection_json,'$.customer.fingerprint') IS NEW.customer_fingerprint\n AND json_extract(c.selection_json,'$.customer.key') IS NEW.stripe_key)\n AND (w.issuance_attempt IS g.issuance_attempt AND r.issuance_attempt IS g.issuance_attempt\n AND r.receipt_ref IS g.expected_receipt_ref AND r.all_rows_match IS 1)) BEGIN\n SELECT RAISE(ABORT,'constraint: exact completed original consent/customer selection');\nEND",
+  stripe_customer_admission_link_original:
+    "CREATE TRIGGER stripe_customer_admission_link_original BEFORE INSERT ON stripe_customer_admission_links\nWHEN NOT EXISTS(SELECT 1 FROM financial_customer_admissions a\n JOIN stripe_billing_customer_commands k ON k.org_id=a.organization_id\n WHERE (a.admission_ref IS NEW.admission_ref AND a.organization_id IS NEW.org_id\n AND a.customer_fingerprint IS NEW.customer_fingerprint AND a.stripe_key IS NEW.stripe_key)\n AND (a.realm_json IS NEW.realm_json AND a.customer_request_json IS NEW.customer_request_json\n AND k.fingerprint IS a.customer_fingerprint AND k.stripe_key IS a.stripe_key\n AND k.realm_json IS a.realm_json AND k.request_json IS a.customer_request_json\n AND k.state IS 'prepared' AND k.dispatched_at IS NULL AND k.customer_id IS NULL)\n AND (NEW.created_at IS a.created_at AND k.created_at IS a.created_at)) BEGIN\n SELECT RAISE(ABORT,'constraint: exact original customer creation link');\nEND",
+  financial_customer_admission_receipt_original:
+    "CREATE TRIGGER financial_customer_admission_receipt_original BEFORE INSERT ON financial_customer_admission_receipts\nWHEN NOT EXISTS(SELECT 1 FROM financial_customer_admissions a JOIN stripe_customer_admission_links l\n ON l.admission_ref=a.admission_ref AND l.org_id=a.organization_id\n WHERE (a.admission_ref IS NEW.admission_ref AND a.expected_receipt_ref IS NEW.receipt_ref\n AND a.issuance_attempt IS NEW.issuance_attempt AND a.organization_id IS NEW.org_id\n AND a.created_at IS NEW.created_at AND l.created_at IS a.created_at)) BEGIN\n SELECT RAISE(ABORT,'constraint: mandatory receipt exact L1 consumed winner');\nEND",
+  financial_customer_admissions_no_replace:
+    "CREATE TRIGGER financial_customer_admissions_no_replace BEFORE INSERT ON financial_customer_admissions\nWHEN EXISTS(SELECT 1 FROM financial_customer_admissions WHERE admission_ref IS NEW.admission_ref OR challenge_ref IS NEW.challenge_ref OR issuance_attempt IS NEW.issuance_attempt OR expected_receipt_ref IS NEW.expected_receipt_ref) BEGIN\n SELECT RAISE(ABORT,'constraint: retained L1 row replacement');\nEND",
+  financial_customer_admissions_no_update:
+    "CREATE TRIGGER financial_customer_admissions_no_update BEFORE UPDATE ON financial_customer_admissions BEGIN\n SELECT RAISE(ABORT,'constraint: retained L1 row immutable');\nEND",
+  financial_customer_admissions_no_delete:
+    "CREATE TRIGGER financial_customer_admissions_no_delete BEFORE DELETE ON financial_customer_admissions BEGIN\n SELECT RAISE(ABORT,'constraint: retained L1 history deletion');\nEND",
+  stripe_customer_admission_links_no_replace:
+    "CREATE TRIGGER stripe_customer_admission_links_no_replace BEFORE INSERT ON stripe_customer_admission_links\nWHEN EXISTS(SELECT 1 FROM stripe_customer_admission_links WHERE org_id IS NEW.org_id OR admission_ref IS NEW.admission_ref) BEGIN\n SELECT RAISE(ABORT,'constraint: retained L1 row replacement');\nEND",
+  stripe_customer_admission_links_no_update:
+    "CREATE TRIGGER stripe_customer_admission_links_no_update BEFORE UPDATE ON stripe_customer_admission_links BEGIN\n SELECT RAISE(ABORT,'constraint: retained L1 row immutable');\nEND",
+  stripe_customer_admission_links_no_delete:
+    "CREATE TRIGGER stripe_customer_admission_links_no_delete BEFORE DELETE ON stripe_customer_admission_links BEGIN\n SELECT RAISE(ABORT,'constraint: retained L1 history deletion');\nEND",
+  financial_customer_admission_receipts_no_replace:
+    "CREATE TRIGGER financial_customer_admission_receipts_no_replace BEFORE INSERT ON financial_customer_admission_receipts\nWHEN EXISTS(SELECT 1 FROM financial_customer_admission_receipts WHERE receipt_ref IS NEW.receipt_ref OR admission_ref IS NEW.admission_ref OR issuance_attempt IS NEW.issuance_attempt) BEGIN\n SELECT RAISE(ABORT,'constraint: retained L1 row replacement');\nEND",
+  financial_customer_admission_receipts_no_update:
+    "CREATE TRIGGER financial_customer_admission_receipts_no_update BEFORE UPDATE ON financial_customer_admission_receipts BEGIN\n SELECT RAISE(ABORT,'constraint: retained L1 row immutable');\nEND",
+  financial_customer_admission_receipts_no_delete:
+    "CREATE TRIGGER financial_customer_admission_receipts_no_delete BEFORE DELETE ON financial_customer_admission_receipts BEGIN\n SELECT RAISE(ABORT,'constraint: retained L1 history deletion');\nEND",
+});
+
+/** Exact Customer H0 history rows, byte-identical to the H0 component fixture.
+ * The fixture's four Org capture triggers sit on Root's orgs table and are Root's
+ * (its 0105, 0105 -> 0104), so they are not part of the Financial body. Org capture
+ * is append-only and never relies on orgs rowids: those triggers only append birth
+ * and change observations (both append-only and unfenced, each guarded to the
+ * cascade's exact row; change_seq is strictly sequential) and never update a head
+ * or RAISE. A framed capture start writes, in the same batch, a fenced roster of
+ * the Org ids existing at start (exact, checked by the start receipt) and the
+ * change high-water mark. A non-raw birth is admissible only for an Org id outside
+ * that roster, once per enrollment; seal requires inventory matching the current
+ * Org row for every roster id, a during-enrollment birth for every other Org, and
+ * no change observation since the start. A post-seal birth is never written (and
+ * never admitted) for an Org id that already has a row in any table of
+ * FINANCIAL_0104_ORG_TRACE_TABLES.
+ * A capture start requires Root's four Org capture triggers on orgs; they are
+ * pinned by name until Root's official 0105 lands, then by exact SQL. */
+export const FINANCIAL_0104_CUSTOMER_H0_SCHEMA: Readonly<Record<string, string>> = Object.freeze({
+  financial_history_primary_roots:
+    "CREATE TABLE financial_history_primary_roots (\n primary_ref TEXT PRIMARY KEY NOT NULL, primary_incarnation TEXT NOT NULL UNIQUE,\n physical_binding_ref TEXT NOT NULL, physical_binding_incarnation TEXT NOT NULL,\n root_json TEXT NOT NULL CHECK(json_valid(root_json) AND json_type(root_json)='object'),\n CHECK(json_extract(root_json,'$.primaryRef') IS primary_ref AND json_extract(root_json,'$.primaryIncarnation') IS primary_incarnation AND json_extract(root_json,'$.physicalBindingRef') IS physical_binding_ref AND json_extract(root_json,'$.physicalBindingIncarnation') IS physical_binding_incarnation),\n UNIQUE(physical_binding_ref,physical_binding_incarnation)\n)",
+  financial_history_enrollments:
+    "CREATE TABLE financial_history_enrollments (\n enrollment_ref TEXT PRIMARY KEY NOT NULL, enrollment_incarnation TEXT NOT NULL UNIQUE,\n primary_ref TEXT NOT NULL REFERENCES financial_history_primary_roots(primary_ref),\n generation INTEGER NOT NULL CHECK(typeof(generation)='integer' AND generation BETWEEN 1 AND 9007199254740991),\n expected_start_receipt_ref TEXT NOT NULL UNIQUE, expected_seal_ref TEXT NOT NULL UNIQUE,\n previous_start_receipt_ref TEXT REFERENCES financial_history_enrollment_receipts(receipt_ref),\n previous_seal_ref TEXT REFERENCES financial_history_enrollment_receipts(receipt_ref),\n required_json TEXT NOT NULL CHECK(json_valid(required_json) AND json_type(required_json)='array' AND json_array_length(required_json) BETWEEN 1 AND 64),\n change_high_water INTEGER NOT NULL CHECK(typeof(change_high_water)='integer' AND change_high_water>=0),\n CHECK((generation=1 AND previous_start_receipt_ref IS NULL AND previous_seal_ref IS NULL) OR (generation>1 AND previous_start_receipt_ref IS NOT NULL)),\n CHECK(expected_start_receipt_ref<>expected_seal_ref),\n UNIQUE(primary_ref,generation), UNIQUE(enrollment_ref,primary_ref)\n)",
+  financial_history_enrollment_roster:
+    "CREATE TABLE financial_history_enrollment_roster (\n enrollment_ref TEXT NOT NULL, primary_ref TEXT NOT NULL, org_id TEXT NOT NULL,\n PRIMARY KEY(enrollment_ref,org_id),\n FOREIGN KEY(enrollment_ref,primary_ref) REFERENCES financial_history_enrollments(enrollment_ref,primary_ref)\n)",
+  financial_history_enrollment_roster_by_org:
+    "CREATE INDEX financial_history_enrollment_roster_by_org ON financial_history_enrollment_roster(primary_ref,org_id)",
+  financial_history_enrollment_inventory:
+    "CREATE TABLE financial_history_enrollment_inventory (\n inventory_ref TEXT PRIMARY KEY NOT NULL, enrollment_ref TEXT NOT NULL, primary_ref TEXT NOT NULL,\n scope_kind TEXT NOT NULL CHECK(scope_kind IN('physical-primary','writer','credential-alias','org-namespace','retired-namespace','org-alias')),\n original_scope_ref TEXT NOT NULL, original_scope_incarnation TEXT NOT NULL,\n evidence_json TEXT NOT NULL CHECK(json_valid(evidence_json) AND json_type(evidence_json)='object'),\n CHECK(json_extract(evidence_json,'$.scopeKind') IS scope_kind AND json_extract(evidence_json,'$.originalScopeRef') IS original_scope_ref AND json_extract(evidence_json,'$.originalScopeIncarnation') IS original_scope_incarnation),\n FOREIGN KEY(enrollment_ref,primary_ref) REFERENCES financial_history_enrollments(enrollment_ref,primary_ref),\n UNIQUE(enrollment_ref,scope_kind,original_scope_ref,original_scope_incarnation)\n)",
+  financial_history_enrollment_heads:
+    "CREATE TABLE financial_history_enrollment_heads (\n primary_ref TEXT PRIMARY KEY NOT NULL REFERENCES financial_history_primary_roots(primary_ref),\n enrollment_ref TEXT NOT NULL, generation INTEGER NOT NULL,\n capture_sequence INTEGER NOT NULL CHECK(typeof(capture_sequence)='integer' AND capture_sequence BETWEEN 0 AND 9007199254740991),\n state TEXT NOT NULL CHECK(state IN('capturing','sealed','closed')),\n expected_receipt_ref TEXT NOT NULL,\n FOREIGN KEY(enrollment_ref,primary_ref) REFERENCES financial_history_enrollments(enrollment_ref,primary_ref)\n)",
+  financial_history_enrollment_receipts:
+    "CREATE TABLE financial_history_enrollment_receipts (\n receipt_ref TEXT PRIMARY KEY NOT NULL, attempt_ref TEXT NOT NULL UNIQUE,\n enrollment_ref TEXT NOT NULL, primary_ref TEXT NOT NULL REFERENCES financial_history_enrollment_heads(primary_ref),\n generation INTEGER NOT NULL, receipt_kind TEXT NOT NULL CHECK(receipt_kind IN('capture-start','complete-seal')),\n capture_sequence INTEGER NOT NULL CHECK(typeof(capture_sequence)='integer' AND capture_sequence BETWEEN 0 AND 9007199254740991),\n all_rows_match INTEGER NOT NULL CHECK(typeof(all_rows_match)='integer' AND all_rows_match=1),\n FOREIGN KEY(enrollment_ref,primary_ref) REFERENCES financial_history_enrollments(enrollment_ref,primary_ref),\n UNIQUE(enrollment_ref,receipt_kind), UNIQUE(primary_ref,generation,receipt_kind),\n UNIQUE(receipt_ref,primary_ref,enrollment_ref,receipt_kind)\n)",
+  financial_customer_history_birth_observations:
+    "CREATE TABLE financial_customer_history_birth_observations (\n birth_ref TEXT PRIMARY KEY NOT NULL, org_id TEXT NOT NULL,\n owner_principal_id TEXT NOT NULL, org_name TEXT NOT NULL, org_created_at TEXT NOT NULL,\n phase TEXT NOT NULL CHECK(phase IN('raw','during-enrollment','post-seal')),\n primary_ref TEXT, enrollment_ref TEXT,\n complete_seal_ref TEXT, seal_kind TEXT,\n CHECK((phase='raw' AND primary_ref IS NULL AND enrollment_ref IS NULL AND complete_seal_ref IS NULL AND seal_kind IS NULL)\n OR (phase='during-enrollment' AND primary_ref IS NOT NULL AND enrollment_ref IS NOT NULL AND complete_seal_ref IS NULL AND seal_kind IS NULL)\n OR (phase='post-seal' AND primary_ref IS NOT NULL AND enrollment_ref IS NOT NULL AND complete_seal_ref IS NOT NULL AND seal_kind IS 'complete-seal')),\n FOREIGN KEY(enrollment_ref,primary_ref) REFERENCES financial_history_enrollments(enrollment_ref,primary_ref),\n FOREIGN KEY(complete_seal_ref,primary_ref,enrollment_ref,seal_kind) REFERENCES financial_history_enrollment_receipts(receipt_ref,primary_ref,enrollment_ref,receipt_kind),\n UNIQUE(org_id,primary_ref,enrollment_ref)\n)",
+  financial_customer_history_birth_observations_raw_once:
+    "CREATE UNIQUE INDEX financial_customer_history_birth_observations_raw_once\n ON financial_customer_history_birth_observations(org_id) WHERE phase='raw'",
+  financial_customer_history_org_changes:
+    "CREATE TABLE financial_customer_history_org_changes (\n change_ref TEXT PRIMARY KEY NOT NULL,\n change_seq INTEGER NOT NULL UNIQUE CHECK(typeof(change_seq)='integer' AND change_seq>0),\n change_kind TEXT NOT NULL CHECK(change_kind IN('update','delete','replace')),\n org_id TEXT NOT NULL,\n old_owner_principal_id TEXT NOT NULL, old_org_name TEXT NOT NULL, old_org_created_at TEXT NOT NULL,\n new_org_id TEXT, new_owner_principal_id TEXT, new_org_name TEXT, new_org_created_at TEXT,\n CHECK((change_kind='delete' AND new_org_id IS NULL AND new_owner_principal_id IS NULL AND new_org_name IS NULL AND new_org_created_at IS NULL)\n OR (change_kind IN('update','replace') AND new_org_id IS NOT NULL AND new_owner_principal_id IS NOT NULL AND new_org_name IS NOT NULL AND new_org_created_at IS NOT NULL))\n)",
+  financial_history_primary_roots_no_replace:
+    "CREATE TRIGGER financial_history_primary_roots_no_replace BEFORE INSERT ON financial_history_primary_roots WHEN EXISTS(SELECT 1 FROM financial_history_primary_roots WHERE (primary_ref=NEW.primary_ref) OR (primary_incarnation=NEW.primary_incarnation) OR (physical_binding_ref=NEW.physical_binding_ref AND physical_binding_incarnation=NEW.physical_binding_incarnation)) BEGIN SELECT RAISE(ABORT,'constraint: retained history replacement');\nEND",
+  financial_history_primary_roots_no_delete:
+    "CREATE TRIGGER financial_history_primary_roots_no_delete BEFORE DELETE ON financial_history_primary_roots BEGIN SELECT RAISE(ABORT,'constraint: retained history deletion');\nEND",
+  financial_history_primary_roots_no_update:
+    "CREATE TRIGGER financial_history_primary_roots_no_update BEFORE UPDATE ON financial_history_primary_roots BEGIN SELECT RAISE(ABORT,'constraint: retained history mutation');\nEND",
+  financial_history_enrollments_no_replace:
+    "CREATE TRIGGER financial_history_enrollments_no_replace BEFORE INSERT ON financial_history_enrollments WHEN EXISTS(SELECT 1 FROM financial_history_enrollments WHERE (enrollment_ref=NEW.enrollment_ref) OR (enrollment_incarnation=NEW.enrollment_incarnation) OR (primary_ref=NEW.primary_ref AND generation=NEW.generation) OR (expected_start_receipt_ref=NEW.expected_start_receipt_ref) OR (expected_seal_ref=NEW.expected_seal_ref) OR (expected_start_receipt_ref=NEW.expected_seal_ref) OR (expected_seal_ref=NEW.expected_start_receipt_ref)) BEGIN SELECT RAISE(ABORT,'constraint: retained history replacement');\nEND",
+  financial_history_enrollments_no_delete:
+    "CREATE TRIGGER financial_history_enrollments_no_delete BEFORE DELETE ON financial_history_enrollments BEGIN SELECT RAISE(ABORT,'constraint: retained history deletion');\nEND",
+  financial_history_enrollments_no_update:
+    "CREATE TRIGGER financial_history_enrollments_no_update BEFORE UPDATE ON financial_history_enrollments BEGIN SELECT RAISE(ABORT,'constraint: retained history mutation');\nEND",
+  financial_history_enrollment_inventory_no_replace:
+    "CREATE TRIGGER financial_history_enrollment_inventory_no_replace BEFORE INSERT ON financial_history_enrollment_inventory WHEN EXISTS(SELECT 1 FROM financial_history_enrollment_inventory WHERE (inventory_ref=NEW.inventory_ref) OR (enrollment_ref=NEW.enrollment_ref AND scope_kind=NEW.scope_kind AND original_scope_ref=NEW.original_scope_ref AND original_scope_incarnation=NEW.original_scope_incarnation)) BEGIN SELECT RAISE(ABORT,'constraint: retained history replacement');\nEND",
+  financial_history_enrollment_inventory_no_delete:
+    "CREATE TRIGGER financial_history_enrollment_inventory_no_delete BEFORE DELETE ON financial_history_enrollment_inventory BEGIN SELECT RAISE(ABORT,'constraint: retained history deletion');\nEND",
+  financial_history_enrollment_inventory_no_update:
+    "CREATE TRIGGER financial_history_enrollment_inventory_no_update BEFORE UPDATE ON financial_history_enrollment_inventory BEGIN SELECT RAISE(ABORT,'constraint: retained history mutation');\nEND",
+  financial_history_enrollment_heads_no_replace:
+    "CREATE TRIGGER financial_history_enrollment_heads_no_replace BEFORE INSERT ON financial_history_enrollment_heads WHEN EXISTS(SELECT 1 FROM financial_history_enrollment_heads WHERE (primary_ref=NEW.primary_ref)) BEGIN SELECT RAISE(ABORT,'constraint: retained history replacement');\nEND",
+  financial_history_enrollment_heads_no_delete:
+    "CREATE TRIGGER financial_history_enrollment_heads_no_delete BEFORE DELETE ON financial_history_enrollment_heads BEGIN SELECT RAISE(ABORT,'constraint: retained history deletion');\nEND",
+  financial_history_enrollment_receipts_no_replace:
+    "CREATE TRIGGER financial_history_enrollment_receipts_no_replace BEFORE INSERT ON financial_history_enrollment_receipts WHEN EXISTS(SELECT 1 FROM financial_history_enrollment_receipts WHERE (receipt_ref=NEW.receipt_ref) OR (attempt_ref=NEW.attempt_ref) OR (enrollment_ref=NEW.enrollment_ref AND receipt_kind=NEW.receipt_kind) OR (primary_ref=NEW.primary_ref AND generation=NEW.generation AND receipt_kind=NEW.receipt_kind)) BEGIN SELECT RAISE(ABORT,'constraint: retained history replacement');\nEND",
+  financial_history_enrollment_receipts_no_delete:
+    "CREATE TRIGGER financial_history_enrollment_receipts_no_delete BEFORE DELETE ON financial_history_enrollment_receipts BEGIN SELECT RAISE(ABORT,'constraint: retained history deletion');\nEND",
+  financial_history_enrollment_receipts_no_update:
+    "CREATE TRIGGER financial_history_enrollment_receipts_no_update BEFORE UPDATE ON financial_history_enrollment_receipts BEGIN SELECT RAISE(ABORT,'constraint: retained history mutation');\nEND",
+  financial_customer_history_org_changes_by_org:
+    "CREATE INDEX financial_customer_history_org_changes_by_org ON financial_customer_history_org_changes(org_id)",
+  financial_customer_history_org_changes_by_new_org:
+    "CREATE INDEX financial_customer_history_org_changes_by_new_org ON financial_customer_history_org_changes(new_org_id)",
+  financial_customer_history_birth_observations_no_replace:
+    "CREATE TRIGGER financial_customer_history_birth_observations_no_replace BEFORE INSERT ON financial_customer_history_birth_observations WHEN EXISTS(SELECT 1 FROM financial_customer_history_birth_observations WHERE (birth_ref=NEW.birth_ref) OR (org_id=NEW.org_id AND primary_ref=NEW.primary_ref AND enrollment_ref=NEW.enrollment_ref) OR (NEW.phase='raw' AND phase='raw' AND org_id=NEW.org_id)) BEGIN SELECT RAISE(ABORT,'constraint: retained history replacement');\nEND",
+  financial_customer_history_birth_observations_org_capture:
+    "CREATE TRIGGER financial_customer_history_birth_observations_org_capture BEFORE INSERT ON financial_customer_history_birth_observations\nWHEN NOT EXISTS(SELECT 1 FROM orgs o WHERE o.id IS NEW.org_id AND o.owner_principal_id IS NEW.owner_principal_id\n AND o.name IS NEW.org_name AND o.created_at IS NEW.org_created_at)\n OR NOT ((NEW.phase='raw' AND NOT EXISTS(SELECT 1 FROM financial_history_enrollment_heads WHERE state IN('capturing','sealed')))\n OR EXISTS(SELECT 1 FROM financial_history_enrollment_heads h JOIN financial_history_enrollments e ON e.enrollment_ref=h.enrollment_ref AND e.primary_ref=h.primary_ref\n LEFT JOIN financial_history_enrollment_receipts r ON r.receipt_ref=e.expected_seal_ref AND r.receipt_kind='complete-seal' AND r.enrollment_ref=e.enrollment_ref\n WHERE h.state IN('capturing','sealed') AND h.primary_ref IS NEW.primary_ref AND h.enrollment_ref IS NEW.enrollment_ref\n AND NOT EXISTS(SELECT 1 FROM financial_history_enrollment_roster ro WHERE ro.enrollment_ref=e.enrollment_ref AND ro.org_id=NEW.org_id)\n AND NEW.complete_seal_ref IS r.receipt_ref\n AND NEW.phase IS CASE WHEN h.state='sealed' AND r.receipt_ref IS NOT NULL THEN 'post-seal' ELSE 'during-enrollment' END\n AND (NEW.phase<>'post-seal' OR NOT (((((EXISTS(SELECT 1 FROM auth_tokens m WHERE m.org_id=NEW.org_id) OR (EXISTS(SELECT 1 FROM financial_customer_admission_receipts m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM financial_customer_custody_receipts m WHERE m.org_id=NEW.org_id))) OR (EXISTS(SELECT 1 FROM financial_customer_dispatch_claims m WHERE m.org_id=NEW.org_id) OR (EXISTS(SELECT 1 FROM financial_customer_dispatch_receipts m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM integration_e2e_credential_pair_operations m WHERE m.org_id=NEW.org_id)))) OR ((EXISTS(SELECT 1 FROM ledger m WHERE m.org_id=NEW.org_id) OR (EXISTS(SELECT 1 FROM money_cutover_aggregates m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM org_wallet_cash_cap_buckets m WHERE m.org_id=NEW.org_id))) OR ((EXISTS(SELECT 1 FROM org_wallet_cash_exposures m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM org_wallet_grant_snapshots m WHERE m.org_id=NEW.org_id)) OR (EXISTS(SELECT 1 FROM org_wallet_holds m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM org_wallet_limit_policies m WHERE m.org_id=NEW.org_id))))) OR (((EXISTS(SELECT 1 FROM org_wallet_limit_policy_commands m WHERE m.org_id=NEW.org_id) OR (EXISTS(SELECT 1 FROM org_wallet_usage_records m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM org_wallet_usage_warnings m WHERE m.org_id=NEW.org_id))) OR ((EXISTS(SELECT 1 FROM org_wallet_workspace_bindings m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM org_wallet_workspace_snapshots m WHERE m.org_id=NEW.org_id)) OR (EXISTS(SELECT 1 FROM quotes m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM reseller_settlement_intents m WHERE m.org_id=NEW.org_id)))) OR ((EXISTS(SELECT 1 FROM reservations m WHERE m.org_id=NEW.org_id) OR (EXISTS(SELECT 1 FROM sponsorship_credential_issuance_operations m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM sponsorship_tenants m WHERE m.org_id=NEW.org_id))) OR ((EXISTS(SELECT 1 FROM stripe_billing_associations m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_card_setup_commands m WHERE m.org_id=NEW.org_id)) OR (EXISTS(SELECT 1 FROM stripe_billing_card_setup_results m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_checkouts m WHERE m.org_id=NEW.org_id)))))) OR ((((EXISTS(SELECT 1 FROM stripe_billing_commands m WHERE m.org_id=NEW.org_id) OR (EXISTS(SELECT 1 FROM stripe_billing_customer_commands m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_customers m WHERE m.org_id=NEW.org_id))) OR (EXISTS(SELECT 1 FROM stripe_billing_fences m WHERE m.org_id=NEW.org_id) OR (EXISTS(SELECT 1 FROM stripe_billing_grants m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_on_demand_abandonments m WHERE m.org_id=NEW.org_id)))) OR ((EXISTS(SELECT 1 FROM stripe_billing_on_demand_attempts m WHERE m.org_id=NEW.org_id) OR (EXISTS(SELECT 1 FROM stripe_billing_on_demand_commands m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_on_demand_funding m WHERE m.org_id=NEW.org_id))) OR ((EXISTS(SELECT 1 FROM stripe_billing_on_demand_refunds m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_on_demand_terminals m WHERE m.org_id=NEW.org_id)) OR (EXISTS(SELECT 1 FROM stripe_billing_plan_change_slots m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_plan_change_steps m WHERE m.org_id=NEW.org_id))))) OR (((EXISTS(SELECT 1 FROM stripe_billing_plan_changes m WHERE m.org_id=NEW.org_id) OR (EXISTS(SELECT 1 FROM stripe_billing_refunds m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_subscription_term_revocations m WHERE m.org_id=NEW.org_id))) OR ((EXISTS(SELECT 1 FROM stripe_billing_subscription_terms m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_billing_subscriptions m WHERE m.org_id=NEW.org_id)) OR (EXISTS(SELECT 1 FROM stripe_customer_admission_links m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM stripe_subscription_cancellation_intents m WHERE m.org_id=NEW.org_id)))) OR ((EXISTS(SELECT 1 FROM stripe_subscription_checkout_intents m WHERE m.org_id=NEW.org_id) OR (EXISTS(SELECT 1 FROM stripe_top_up_commands m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM usage_events m WHERE m.org_id=NEW.org_id))) OR ((EXISTS(SELECT 1 FROM usage_statements m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM wallet_credit_allocations m WHERE m.org_id=NEW.org_id)) OR (EXISTS(SELECT 1 FROM wallet_credit_lot_classification_proofs m WHERE m.org_id=NEW.org_id) OR EXISTS(SELECT 1 FROM wallet_credit_lots m WHERE m.org_id=NEW.org_id))))))))))\nBEGIN SELECT RAISE(ABORT,'constraint: birth observation requires its exact Org capture');\nEND",
+  financial_customer_history_org_changes_org_capture:
+    "CREATE TRIGGER financial_customer_history_org_changes_org_capture BEFORE INSERT ON financial_customer_history_org_changes\nWHEN NEW.change_seq IS NOT COALESCE((SELECT max(change_seq) FROM financial_customer_history_org_changes),0)+1\n OR NOT ((NEW.change_kind='update' AND EXISTS(SELECT 1 FROM orgs o WHERE o.id IS NEW.new_org_id\n AND o.owner_principal_id IS NEW.new_owner_principal_id AND o.name IS NEW.new_org_name AND o.created_at IS NEW.new_org_created_at))\n OR (NEW.change_kind='replace' AND EXISTS(SELECT 1 FROM orgs o WHERE o.id IS NEW.org_id\n AND o.owner_principal_id IS NEW.old_owner_principal_id AND o.name IS NEW.old_org_name AND o.created_at IS NEW.old_org_created_at))\n OR (NEW.change_kind='delete' AND NOT EXISTS(SELECT 1 FROM orgs o WHERE o.id IS NEW.org_id)))\nBEGIN SELECT RAISE(ABORT,'constraint: change observation requires its exact Org change');\nEND",
+  financial_customer_history_org_changes_no_replace:
+    "CREATE TRIGGER financial_customer_history_org_changes_no_replace BEFORE INSERT ON financial_customer_history_org_changes WHEN EXISTS(SELECT 1 FROM financial_customer_history_org_changes WHERE (change_seq=NEW.change_seq) OR (change_ref=NEW.change_ref)) BEGIN SELECT RAISE(ABORT,'constraint: retained history replacement');\nEND",
+  financial_customer_history_org_changes_no_delete:
+    "CREATE TRIGGER financial_customer_history_org_changes_no_delete BEFORE DELETE ON financial_customer_history_org_changes BEGIN SELECT RAISE(ABORT,'constraint: retained history deletion');\nEND",
+  financial_customer_history_org_changes_no_update:
+    "CREATE TRIGGER financial_customer_history_org_changes_no_update BEFORE UPDATE ON financial_customer_history_org_changes BEGIN SELECT RAISE(ABORT,'constraint: retained history mutation');\nEND",
+  financial_history_enrollment_roster_no_replace:
+    "CREATE TRIGGER financial_history_enrollment_roster_no_replace BEFORE INSERT ON financial_history_enrollment_roster WHEN EXISTS(SELECT 1 FROM financial_history_enrollment_roster WHERE enrollment_ref=NEW.enrollment_ref AND org_id=NEW.org_id) BEGIN SELECT RAISE(ABORT,'constraint: retained history replacement');\nEND",
+  financial_history_enrollment_roster_no_delete:
+    "CREATE TRIGGER financial_history_enrollment_roster_no_delete BEFORE DELETE ON financial_history_enrollment_roster BEGIN SELECT RAISE(ABORT,'constraint: retained history deletion');\nEND",
+  financial_history_enrollment_roster_no_update:
+    "CREATE TRIGGER financial_history_enrollment_roster_no_update BEFORE UPDATE ON financial_history_enrollment_roster BEGIN SELECT RAISE(ABORT,'constraint: retained history mutation');\nEND",
+  financial_history_enrollment_roster_start_only:
+    "CREATE TRIGGER financial_history_enrollment_roster_start_only BEFORE INSERT ON financial_history_enrollment_roster\nWHEN NOT EXISTS(SELECT 1 FROM financial_history_enrollment_heads h JOIN financial_history_enrollments e ON e.enrollment_ref=h.enrollment_ref AND e.primary_ref=h.primary_ref\n WHERE h.primary_ref IS NEW.primary_ref AND h.enrollment_ref IS NEW.enrollment_ref AND h.state='capturing'\n AND NOT EXISTS(SELECT 1 FROM financial_history_enrollment_receipts r WHERE r.receipt_ref=e.expected_start_receipt_ref))\n OR NOT EXISTS(SELECT 1 FROM orgs o WHERE o.id IS NEW.org_id)\nBEGIN SELECT RAISE(ABORT,'constraint: roster is the start snapshot of existing Org ids');\nEND",
+  financial_history_enrollment_watermarks:
+    "CREATE TRIGGER financial_history_enrollment_watermarks BEFORE INSERT ON financial_history_enrollments\nWHEN NEW.change_high_water IS NOT COALESCE((SELECT max(change_seq) FROM financial_customer_history_org_changes),0)\nBEGIN SELECT RAISE(ABORT,'constraint: capture watermark must be the current change high-water mark');\nEND",
+  financial_customer_history_birth_observations_no_delete:
+    "CREATE TRIGGER financial_customer_history_birth_observations_no_delete BEFORE DELETE ON financial_customer_history_birth_observations BEGIN SELECT RAISE(ABORT,'constraint: retained history deletion');\nEND",
+  financial_customer_history_birth_observations_no_update:
+    "CREATE TRIGGER financial_customer_history_birth_observations_no_update BEFORE UPDATE ON financial_customer_history_birth_observations BEGIN SELECT RAISE(ABORT,'constraint: retained history mutation');\nEND",
+  financial_history_enrollment_predecessor:
+    "CREATE TRIGGER financial_history_enrollment_predecessor BEFORE INSERT ON financial_history_enrollments\nWHEN NEW.generation>1 AND NOT EXISTS(\n SELECT 1 FROM financial_history_enrollment_heads h JOIN financial_history_enrollments e ON e.enrollment_ref=h.enrollment_ref AND e.primary_ref=h.primary_ref\n JOIN financial_history_enrollment_receipts start ON start.receipt_ref=e.expected_start_receipt_ref AND start.enrollment_ref=e.enrollment_ref AND start.primary_ref=e.primary_ref AND start.generation=e.generation AND start.receipt_kind='capture-start' AND start.all_rows_match=1\n LEFT JOIN financial_history_enrollment_receipts seal ON seal.receipt_ref=e.expected_seal_ref AND seal.enrollment_ref=e.enrollment_ref AND seal.primary_ref=e.primary_ref AND seal.generation=e.generation AND seal.receipt_kind='complete-seal' AND seal.all_rows_match=1\n WHERE h.primary_ref=NEW.primary_ref AND h.state='closed' AND h.generation=NEW.generation-1 AND e.generation=h.generation AND start.receipt_ref IS NEW.previous_start_receipt_ref AND seal.receipt_ref IS NEW.previous_seal_ref\n) BEGIN SELECT RAISE(ABORT,'constraint: exact closed predecessor required');\nEND",
+  financial_history_heads_cas:
+    "CREATE TRIGGER financial_history_heads_cas BEFORE UPDATE ON financial_history_enrollment_heads\nWHEN NEW.primary_ref IS NOT OLD.primary_ref OR NOT (\n (NEW.enrollment_ref IS OLD.enrollment_ref AND NEW.generation IS OLD.generation AND\n  ((NEW.capture_sequence IS OLD.capture_sequence AND OLD.state='capturing' AND NEW.state='sealed' AND NEW.expected_receipt_ref IS (SELECT expected_seal_ref FROM financial_history_enrollments WHERE enrollment_ref=OLD.enrollment_ref))\n   OR (NEW.capture_sequence=OLD.capture_sequence+1 AND NEW.state='closed' AND OLD.state IN('capturing','sealed') AND NEW.expected_receipt_ref IS OLD.expected_receipt_ref)))\n OR (OLD.state='closed' AND NEW.state='capturing' AND NEW.generation=OLD.generation+1 AND NEW.capture_sequence IS OLD.capture_sequence AND EXISTS(SELECT 1 FROM financial_history_enrollments e WHERE e.enrollment_ref=NEW.enrollment_ref AND e.primary_ref=NEW.primary_ref AND e.generation=NEW.generation AND e.expected_start_receipt_ref IS NEW.expected_receipt_ref))\n) BEGIN SELECT RAISE(ABORT,'constraint: history head CAS');\nEND",
+  financial_history_inventory_phase:
+    "CREATE TRIGGER financial_history_inventory_phase BEFORE INSERT ON financial_history_enrollment_inventory\nWHEN NOT EXISTS(SELECT 1 FROM financial_history_enrollment_heads h JOIN financial_history_enrollments e ON e.enrollment_ref=h.enrollment_ref WHERE h.primary_ref=NEW.primary_ref AND h.enrollment_ref=NEW.enrollment_ref AND h.state='capturing' AND EXISTS(SELECT 1 FROM financial_history_enrollment_receipts r WHERE r.receipt_ref=e.expected_start_receipt_ref AND r.receipt_kind='capture-start') AND EXISTS(SELECT 1 FROM json_each(e.required_json) j WHERE json(j.value)=json(NEW.evidence_json)))\nBEGIN SELECT RAISE(ABORT,'constraint: inventory original/phase mismatch');\nEND",
+  financial_history_receipt_match:
+    "CREATE TRIGGER financial_history_receipt_match BEFORE INSERT ON financial_history_enrollment_receipts\nWHEN NOT EXISTS(SELECT 1 FROM financial_history_enrollment_heads h JOIN financial_history_enrollments e ON e.enrollment_ref=h.enrollment_ref AND e.primary_ref=h.primary_ref\n WHERE h.primary_ref=NEW.primary_ref AND h.enrollment_ref=NEW.enrollment_ref AND h.generation=NEW.generation AND e.generation=NEW.generation AND h.capture_sequence=NEW.capture_sequence AND h.expected_receipt_ref IS NEW.receipt_ref AND\n ((NEW.receipt_kind='capture-start' AND h.state='capturing' AND e.expected_start_receipt_ref IS NEW.receipt_ref\n AND (SELECT count(*) FROM main.sqlite_schema WHERE type='trigger' AND tbl_name='orgs' AND name IN('financial_history_capture_org_replace','financial_history_capture_org_insert','financial_history_capture_org_update','financial_history_capture_org_delete'))=4\n AND NOT EXISTS(SELECT 1 FROM orgs o WHERE NOT EXISTS(SELECT 1 FROM financial_history_enrollment_roster ro WHERE ro.enrollment_ref=e.enrollment_ref AND ro.org_id=o.id))\n AND NOT EXISTS(SELECT 1 FROM financial_history_enrollment_roster ro WHERE ro.enrollment_ref=e.enrollment_ref AND (ro.primary_ref IS NOT e.primary_ref OR NOT EXISTS(SELECT 1 FROM orgs o WHERE o.id=ro.org_id))))\n OR (NEW.receipt_kind='complete-seal' AND h.state='sealed' AND e.expected_seal_ref IS NEW.receipt_ref\n AND EXISTS(SELECT 1 FROM financial_history_enrollment_receipts r WHERE r.receipt_ref=e.expected_start_receipt_ref AND r.enrollment_ref=e.enrollment_ref AND r.receipt_kind='capture-start')\n AND NOT EXISTS(SELECT 1 FROM json_each(e.required_json) j WHERE NOT EXISTS(SELECT 1 FROM financial_history_enrollment_inventory i WHERE i.enrollment_ref=e.enrollment_ref AND json(i.evidence_json)=json(j.value)))\n AND NOT EXISTS(SELECT 1 FROM financial_history_enrollment_inventory i WHERE i.enrollment_ref=e.enrollment_ref AND NOT EXISTS(SELECT 1 FROM json_each(e.required_json) j WHERE json(i.evidence_json)=json(j.value)))\n AND NOT EXISTS(SELECT 1 FROM financial_history_enrollment_roster ro WHERE ro.enrollment_ref=e.enrollment_ref AND NOT EXISTS(SELECT 1 FROM orgs o JOIN financial_history_enrollment_inventory i ON i.enrollment_ref=e.enrollment_ref AND i.scope_kind='org-namespace' AND i.original_scope_ref=o.id AND json_extract(i.evidence_json,'$.ownerPrincipalId') IS o.owner_principal_id AND json_extract(i.evidence_json,'$.orgCreatedAt') IS o.created_at WHERE o.id=ro.org_id))\n AND NOT EXISTS(SELECT 1 FROM orgs o WHERE NOT EXISTS(SELECT 1 FROM financial_history_enrollment_roster ro WHERE ro.enrollment_ref=e.enrollment_ref AND ro.org_id=o.id) AND NOT EXISTS(SELECT 1 FROM financial_customer_history_birth_observations b WHERE b.org_id=o.id AND b.owner_principal_id=o.owner_principal_id AND b.org_created_at=o.created_at AND b.primary_ref=e.primary_ref AND b.enrollment_ref=e.enrollment_ref AND b.phase='during-enrollment'))\n AND NOT EXISTS(SELECT 1 FROM financial_customer_history_org_changes ch WHERE ch.change_seq>e.change_high_water))))\nBEGIN SELECT RAISE(ABORT,'constraint: mandatory receipt mismatch');\nEND",
+});
+
+/** Exact Customer H1 journal, dispatch and custody rows, byte-identical to the
+ * journal candidate fixture. */
+export const FINANCIAL_0104_CUSTOMER_JOURNAL_SCHEMA: Readonly<Record<string, string>> =
+  Object.freeze({
+    financial_customer_history_coverages:
+      "CREATE TABLE financial_customer_history_coverages (\n history_ref TEXT PRIMARY KEY NOT NULL, coverage_incarnation TEXT NOT NULL UNIQUE,\n attempt_ref TEXT NOT NULL UNIQUE, expected_receipt_ref TEXT NOT NULL UNIQUE,\n coverage_kind TEXT NOT NULL CHECK(coverage_kind='qualified-genesis'),\n original_org_origin TEXT NOT NULL REFERENCES financial_customer_history_birth_observations(birth_ref),\n organization_id TEXT NOT NULL, primary_ref TEXT NOT NULL, enrollment_ref TEXT NOT NULL,\n complete_seal_ref TEXT NOT NULL, seal_kind TEXT NOT NULL CHECK(seal_kind='complete-seal'),\n realm_registration TEXT NOT NULL, realm_incarnation TEXT NOT NULL,\n realm_json TEXT NOT NULL CHECK(json_valid(realm_json) AND json_type(realm_json)='object'),\n required_scopes_json TEXT NOT NULL CHECK(json_valid(required_scopes_json) AND json_type(required_scopes_json)='array' AND json_array_length(required_scopes_json) BETWEEN 1 AND 64),\n writer_epoch TEXT NOT NULL, previous_history_ref TEXT REFERENCES financial_customer_history_coverages(history_ref),\n created_at TEXT NOT NULL,\n FOREIGN KEY(complete_seal_ref,primary_ref,enrollment_ref,seal_kind) REFERENCES financial_history_enrollment_receipts(receipt_ref,primary_ref,enrollment_ref,receipt_kind),\n CHECK(length(created_at)=24 AND strftime('%Y-%m-%dT%H:%M:%fZ',created_at) IS created_at),\n CHECK(previous_history_ref IS NULL),\n UNIQUE(original_org_origin,realm_registration,realm_incarnation)\n)",
+    financial_customer_history_scopes:
+      "CREATE TABLE financial_customer_history_scopes (\n scope_ref TEXT PRIMARY KEY NOT NULL, history_ref TEXT NOT NULL REFERENCES financial_customer_history_coverages(history_ref),\n inventory_ref TEXT NOT NULL REFERENCES financial_history_enrollment_inventory(inventory_ref),\n scope_kind TEXT NOT NULL, original_scope_ref TEXT NOT NULL, original_scope_incarnation TEXT NOT NULL,\n evidence_json TEXT NOT NULL CHECK(json_valid(evidence_json) AND json_type(evidence_json)='object'),\n UNIQUE(history_ref,inventory_ref), UNIQUE(history_ref,scope_kind,original_scope_ref,original_scope_incarnation)\n)",
+    financial_customer_dispatch_claims:
+      "CREATE TABLE financial_customer_dispatch_claims (\n claim_ref TEXT PRIMARY KEY NOT NULL, attempt_ref TEXT NOT NULL UNIQUE,\n admission_ref TEXT NOT NULL UNIQUE REFERENCES financial_customer_admissions(admission_ref),\n org_id TEXT NOT NULL UNIQUE REFERENCES stripe_billing_customer_commands(org_id),\n l1_receipt_ref TEXT NOT NULL REFERENCES financial_customer_admission_receipts(receipt_ref),\n expected_dispatch_receipt_ref TEXT NOT NULL UNIQUE, context_json TEXT NOT NULL,\n history_ref TEXT NOT NULL REFERENCES financial_customer_history_coverages(history_ref), coverage_incarnation TEXT NOT NULL,\n pre_journal_sequence INTEGER NOT NULL CHECK(typeof(pre_journal_sequence)='integer' AND pre_journal_sequence BETWEEN 0 AND 9007199254740990),\n pre_history_receipt_ref TEXT NOT NULL REFERENCES financial_customer_history_receipts(receipt_ref),\n created_at TEXT NOT NULL CHECK(length(created_at)=24 AND strftime('%Y-%m-%dT%H:%M:%fZ',created_at) IS created_at)\n)",
+    financial_customer_dispatch_receipts:
+      "CREATE TABLE financial_customer_dispatch_receipts (\n receipt_ref TEXT PRIMARY KEY NOT NULL, claim_ref TEXT NOT NULL UNIQUE REFERENCES financial_customer_dispatch_claims(claim_ref),\n attempt_ref TEXT NOT NULL UNIQUE, admission_ref TEXT NOT NULL REFERENCES financial_customer_admissions(admission_ref),\n org_id TEXT NOT NULL REFERENCES stripe_billing_customer_commands(org_id), dispatched_at TEXT NOT NULL, created_at TEXT NOT NULL,\n all_rows_match INTEGER NOT NULL CHECK(typeof(all_rows_match)='integer' AND all_rows_match=1)\n)",
+    financial_customer_custody_receipts:
+      "CREATE TABLE financial_customer_custody_receipts (\n custody_receipt_ref TEXT PRIMARY KEY NOT NULL,\n dispatch_receipt_ref TEXT NOT NULL UNIQUE REFERENCES financial_customer_dispatch_receipts(receipt_ref),\n org_id TEXT NOT NULL REFERENCES stripe_billing_customers(org_id), customer_id TEXT NOT NULL REFERENCES stripe_billing_customers(customer_id),\n binding_created_at TEXT NOT NULL, verified_at TEXT NOT NULL, created_at TEXT NOT NULL,\n all_rows_match INTEGER NOT NULL CHECK(typeof(all_rows_match)='integer' AND all_rows_match=1)\n)",
+    financial_customer_dispatch_receipts_by_org:
+      "CREATE INDEX financial_customer_dispatch_receipts_by_org ON financial_customer_dispatch_receipts(org_id)",
+    financial_customer_custody_receipts_by_org:
+      "CREATE INDEX financial_customer_custody_receipts_by_org ON financial_customer_custody_receipts(org_id)",
+    financial_customer_history_entries:
+      "CREATE TABLE financial_customer_history_entries (\n entry_ref TEXT PRIMARY KEY NOT NULL, history_ref TEXT NOT NULL REFERENCES financial_customer_history_coverages(history_ref),\n journal_sequence INTEGER NOT NULL CHECK(typeof(journal_sequence)='integer' AND journal_sequence BETWEEN 0 AND 9007199254740991),\n ordinal INTEGER NOT NULL CHECK(typeof(ordinal)='integer' AND ordinal=0),\n writer_kind TEXT NOT NULL CHECK(writer_kind='customer-custody'),\n evidence_kind TEXT NOT NULL CHECK(evidence_kind IN('genesis','customer-prepared','customer-first-dispatch','customer-verified-binding')),\n original_command_key TEXT, transition_ref TEXT NOT NULL,\n coupling_attempt_ref TEXT NOT NULL UNIQUE, expected_history_receipt_ref TEXT NOT NULL UNIQUE,\n previous_history_receipt_ref TEXT REFERENCES financial_customer_history_receipts(receipt_ref),\n command_org_id TEXT REFERENCES stripe_billing_customer_commands(org_id),\n admission_ref TEXT REFERENCES financial_customer_admissions(admission_ref),\n creation_link_org_id TEXT REFERENCES stripe_customer_admission_links(org_id),\n l1_receipt_ref TEXT REFERENCES financial_customer_admission_receipts(receipt_ref),\n dispatch_claim_ref TEXT REFERENCES financial_customer_dispatch_claims(claim_ref),\n dispatch_receipt_ref TEXT REFERENCES financial_customer_dispatch_receipts(receipt_ref),\n custody_receipt_ref TEXT REFERENCES financial_customer_custody_receipts(custody_receipt_ref),\n binding_org_id TEXT REFERENCES stripe_billing_customers(org_id), binding_customer_id TEXT REFERENCES stripe_billing_customers(customer_id),\n command_before_exists INTEGER NOT NULL CHECK(command_before_exists IN(0,1)), command_before_state TEXT,\n command_before_dispatched_at TEXT, command_before_customer_id TEXT, command_before_verified_at TEXT,\n command_after_state TEXT, command_after_dispatched_at TEXT, command_after_customer_id TEXT, command_after_verified_at TEXT,\n binding_before_exists INTEGER NOT NULL CHECK(binding_before_exists=0), binding_before_customer_id TEXT, binding_before_created_at TEXT,\n binding_after_exists INTEGER NOT NULL CHECK(binding_after_exists IN(0,1)), binding_after_customer_id TEXT, binding_after_created_at TEXT,\n recorded_at TEXT NOT NULL CHECK(length(recorded_at)=24 AND strftime('%Y-%m-%dT%H:%M:%fZ',recorded_at) IS recorded_at),\n UNIQUE(history_ref,journal_sequence,ordinal), UNIQUE(history_ref,writer_kind,original_command_key,transition_ref),\n CHECK(binding_before_customer_id IS NULL AND binding_before_created_at IS NULL AND command_before_customer_id IS NULL AND command_before_verified_at IS NULL),\n CHECK((evidence_kind='genesis' AND journal_sequence=0 AND previous_history_receipt_ref IS NULL AND original_command_key IS NULL\n  AND command_org_id IS NULL AND admission_ref IS NULL AND creation_link_org_id IS NULL AND l1_receipt_ref IS NULL\n  AND dispatch_claim_ref IS NULL AND dispatch_receipt_ref IS NULL AND custody_receipt_ref IS NULL AND binding_org_id IS NULL AND binding_customer_id IS NULL\n  AND command_before_exists=0 AND command_before_state IS NULL AND command_before_dispatched_at IS NULL\n  AND command_after_state IS NULL AND command_after_dispatched_at IS NULL AND command_after_customer_id IS NULL AND command_after_verified_at IS NULL\n  AND binding_after_exists=0 AND binding_after_customer_id IS NULL AND binding_after_created_at IS NULL)\n OR (evidence_kind<>'genesis' AND journal_sequence>0 AND previous_history_receipt_ref IS NOT NULL AND original_command_key IS NOT NULL\n  AND command_org_id IS NOT NULL AND admission_ref IS NOT NULL AND creation_link_org_id IS NOT NULL AND l1_receipt_ref IS NOT NULL\n  AND ((evidence_kind='customer-prepared' AND transition_ref IS l1_receipt_ref AND command_before_exists=0 AND command_before_state IS NULL\n    AND command_before_dispatched_at IS NULL AND command_after_state='prepared' AND command_after_dispatched_at IS NULL\n    AND command_after_customer_id IS NULL AND command_after_verified_at IS NULL\n    AND dispatch_claim_ref IS NULL AND dispatch_receipt_ref IS NULL AND custody_receipt_ref IS NULL AND binding_org_id IS NULL AND binding_customer_id IS NULL\n    AND binding_after_exists=0 AND binding_after_customer_id IS NULL AND binding_after_created_at IS NULL)\n   OR (evidence_kind='customer-first-dispatch' AND transition_ref IS dispatch_receipt_ref AND command_before_exists=1 AND command_before_state='prepared'\n    AND command_before_dispatched_at IS NULL AND command_after_state='dispatched' AND command_after_dispatched_at IS NOT NULL\n    AND command_after_customer_id IS NULL AND command_after_verified_at IS NULL\n    AND dispatch_claim_ref IS NOT NULL AND dispatch_receipt_ref IS NOT NULL AND custody_receipt_ref IS NULL AND binding_org_id IS NULL AND binding_customer_id IS NULL\n    AND binding_after_exists=0 AND binding_after_customer_id IS NULL AND binding_after_created_at IS NULL)\n   OR (evidence_kind='customer-verified-binding' AND transition_ref IS custody_receipt_ref AND command_before_exists=1 AND command_before_state='dispatched'\n    AND command_before_dispatched_at IS NOT NULL AND command_after_state='verified' AND command_after_dispatched_at IS command_before_dispatched_at\n    AND command_after_customer_id IS NOT NULL AND command_after_verified_at IS NOT NULL\n    AND dispatch_claim_ref IS NOT NULL AND dispatch_receipt_ref IS NOT NULL AND custody_receipt_ref IS NOT NULL AND binding_org_id IS command_org_id\n    AND binding_customer_id IS command_after_customer_id AND binding_after_exists=1\n    AND binding_after_customer_id IS command_after_customer_id AND binding_after_created_at IS command_after_verified_at))))\n)",
+    financial_customer_history_prepared_once:
+      "CREATE UNIQUE INDEX financial_customer_history_prepared_once ON financial_customer_history_entries(l1_receipt_ref) WHERE evidence_kind='customer-prepared'",
+    financial_customer_history_dispatched_once:
+      "CREATE UNIQUE INDEX financial_customer_history_dispatched_once ON financial_customer_history_entries(dispatch_receipt_ref) WHERE evidence_kind='customer-first-dispatch'",
+    financial_customer_history_verified_once:
+      "CREATE UNIQUE INDEX financial_customer_history_verified_once ON financial_customer_history_entries(custody_receipt_ref) WHERE evidence_kind='customer-verified-binding'",
+    financial_customer_history_heads:
+      "CREATE TABLE financial_customer_history_heads (\n original_org_origin TEXT NOT NULL REFERENCES financial_customer_history_birth_observations(birth_ref),\n realm_registration TEXT NOT NULL, realm_incarnation TEXT NOT NULL,\n history_ref TEXT NOT NULL REFERENCES financial_customer_history_coverages(history_ref),\n journal_sequence INTEGER NOT NULL CHECK(typeof(journal_sequence)='integer' AND journal_sequence BETWEEN 0 AND 9007199254740991),\n last_entry_ref TEXT NOT NULL REFERENCES financial_customer_history_entries(entry_ref), last_expected_receipt_ref TEXT NOT NULL,\n state TEXT NOT NULL CHECK(state IN('active','closed')),\n PRIMARY KEY(original_org_origin,realm_registration,realm_incarnation)\n)",
+    financial_customer_history_receipts:
+      "CREATE TABLE financial_customer_history_receipts (\n receipt_ref TEXT PRIMARY KEY NOT NULL, attempt_ref TEXT NOT NULL UNIQUE,\n history_ref TEXT NOT NULL REFERENCES financial_customer_history_coverages(history_ref),\n journal_sequence INTEGER NOT NULL CHECK(typeof(journal_sequence)='integer' AND journal_sequence BETWEEN 0 AND 9007199254740991),\n original_org_origin TEXT NOT NULL, realm_registration TEXT NOT NULL, realm_incarnation TEXT NOT NULL,\n previous_journal_sequence INTEGER, previous_entry_ref TEXT REFERENCES financial_customer_history_entries(entry_ref),\n previous_history_receipt_ref TEXT REFERENCES financial_customer_history_receipts(receipt_ref),\n entry_ref TEXT NOT NULL REFERENCES financial_customer_history_entries(entry_ref),\n evidence_kind TEXT NOT NULL, command_org_id TEXT REFERENCES stripe_billing_customer_commands(org_id),\n l1_receipt_ref TEXT REFERENCES financial_customer_admission_receipts(receipt_ref),\n dispatch_receipt_ref TEXT REFERENCES financial_customer_dispatch_receipts(receipt_ref),\n custody_receipt_ref TEXT REFERENCES financial_customer_custody_receipts(custody_receipt_ref),\n all_rows_match INTEGER NOT NULL CHECK(typeof(all_rows_match)='integer' AND all_rows_match=1), created_at TEXT NOT NULL,\n FOREIGN KEY(original_org_origin,realm_registration,realm_incarnation) REFERENCES financial_customer_history_heads(original_org_origin,realm_registration,realm_incarnation),\n UNIQUE(history_ref,journal_sequence), UNIQUE(entry_ref),\n CHECK((journal_sequence=0 AND previous_journal_sequence IS NULL AND previous_entry_ref IS NULL AND previous_history_receipt_ref IS NULL AND evidence_kind='genesis')\n OR (journal_sequence>0 AND typeof(previous_journal_sequence)='integer' AND previous_journal_sequence=journal_sequence-1 AND previous_entry_ref IS NOT NULL AND previous_history_receipt_ref IS NOT NULL AND evidence_kind IN('customer-prepared','customer-first-dispatch','customer-verified-binding')))\n)",
+    financial_customer_history_coverages_no_replace:
+      "CREATE TRIGGER financial_customer_history_coverages_no_replace BEFORE INSERT ON financial_customer_history_coverages WHEN EXISTS(SELECT 1 FROM financial_customer_history_coverages WHERE (history_ref IS NEW.history_ref) OR (coverage_incarnation IS NEW.coverage_incarnation) OR (attempt_ref IS NEW.attempt_ref) OR (expected_receipt_ref IS NEW.expected_receipt_ref) OR (original_org_origin IS NEW.original_org_origin AND realm_registration IS NEW.realm_registration AND realm_incarnation IS NEW.realm_incarnation)) BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 replacement'); END",
+    financial_customer_history_coverages_no_update:
+      "CREATE TRIGGER financial_customer_history_coverages_no_update BEFORE UPDATE ON financial_customer_history_coverages BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 mutation'); END",
+    financial_customer_history_coverages_no_delete:
+      "CREATE TRIGGER financial_customer_history_coverages_no_delete BEFORE DELETE ON financial_customer_history_coverages BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 mutation'); END",
+    financial_customer_history_scopes_no_replace:
+      "CREATE TRIGGER financial_customer_history_scopes_no_replace BEFORE INSERT ON financial_customer_history_scopes WHEN EXISTS(SELECT 1 FROM financial_customer_history_scopes WHERE (scope_ref IS NEW.scope_ref) OR (history_ref IS NEW.history_ref AND inventory_ref IS NEW.inventory_ref) OR (history_ref IS NEW.history_ref AND scope_kind IS NEW.scope_kind AND original_scope_ref IS NEW.original_scope_ref AND original_scope_incarnation IS NEW.original_scope_incarnation)) BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 replacement'); END",
+    financial_customer_history_scopes_no_update:
+      "CREATE TRIGGER financial_customer_history_scopes_no_update BEFORE UPDATE ON financial_customer_history_scopes BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 mutation'); END",
+    financial_customer_history_scopes_no_delete:
+      "CREATE TRIGGER financial_customer_history_scopes_no_delete BEFORE DELETE ON financial_customer_history_scopes BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 mutation'); END",
+    financial_customer_dispatch_claims_no_replace:
+      "CREATE TRIGGER financial_customer_dispatch_claims_no_replace BEFORE INSERT ON financial_customer_dispatch_claims WHEN EXISTS(SELECT 1 FROM financial_customer_dispatch_claims WHERE (claim_ref IS NEW.claim_ref) OR (attempt_ref IS NEW.attempt_ref) OR (admission_ref IS NEW.admission_ref) OR (org_id IS NEW.org_id) OR (expected_dispatch_receipt_ref IS NEW.expected_dispatch_receipt_ref)) BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 replacement'); END",
+    financial_customer_dispatch_claims_no_update:
+      "CREATE TRIGGER financial_customer_dispatch_claims_no_update BEFORE UPDATE ON financial_customer_dispatch_claims BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 mutation'); END",
+    financial_customer_dispatch_claims_no_delete:
+      "CREATE TRIGGER financial_customer_dispatch_claims_no_delete BEFORE DELETE ON financial_customer_dispatch_claims BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 mutation'); END",
+    financial_customer_dispatch_receipts_no_replace:
+      "CREATE TRIGGER financial_customer_dispatch_receipts_no_replace BEFORE INSERT ON financial_customer_dispatch_receipts WHEN EXISTS(SELECT 1 FROM financial_customer_dispatch_receipts WHERE (receipt_ref IS NEW.receipt_ref) OR (claim_ref IS NEW.claim_ref) OR (attempt_ref IS NEW.attempt_ref)) BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 replacement'); END",
+    financial_customer_dispatch_receipts_no_update:
+      "CREATE TRIGGER financial_customer_dispatch_receipts_no_update BEFORE UPDATE ON financial_customer_dispatch_receipts BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 mutation'); END",
+    financial_customer_dispatch_receipts_no_delete:
+      "CREATE TRIGGER financial_customer_dispatch_receipts_no_delete BEFORE DELETE ON financial_customer_dispatch_receipts BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 mutation'); END",
+    financial_customer_custody_receipts_no_replace:
+      "CREATE TRIGGER financial_customer_custody_receipts_no_replace BEFORE INSERT ON financial_customer_custody_receipts WHEN EXISTS(SELECT 1 FROM financial_customer_custody_receipts WHERE (custody_receipt_ref IS NEW.custody_receipt_ref) OR (dispatch_receipt_ref IS NEW.dispatch_receipt_ref)) BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 replacement'); END",
+    financial_customer_custody_receipts_no_update:
+      "CREATE TRIGGER financial_customer_custody_receipts_no_update BEFORE UPDATE ON financial_customer_custody_receipts BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 mutation'); END",
+    financial_customer_custody_receipts_no_delete:
+      "CREATE TRIGGER financial_customer_custody_receipts_no_delete BEFORE DELETE ON financial_customer_custody_receipts BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 mutation'); END",
+    financial_customer_history_entries_no_replace:
+      "CREATE TRIGGER financial_customer_history_entries_no_replace BEFORE INSERT ON financial_customer_history_entries WHEN EXISTS(SELECT 1 FROM financial_customer_history_entries WHERE (entry_ref IS NEW.entry_ref) OR (coupling_attempt_ref IS NEW.coupling_attempt_ref) OR (expected_history_receipt_ref IS NEW.expected_history_receipt_ref) OR (history_ref IS NEW.history_ref AND journal_sequence IS NEW.journal_sequence AND ordinal IS NEW.ordinal) OR (history_ref IS NEW.history_ref AND writer_kind IS NEW.writer_kind AND original_command_key IS NEW.original_command_key AND transition_ref IS NEW.transition_ref) OR (NEW.evidence_kind='customer-prepared' AND evidence_kind='customer-prepared' AND l1_receipt_ref IS NEW.l1_receipt_ref) OR (NEW.evidence_kind='customer-first-dispatch' AND evidence_kind='customer-first-dispatch' AND dispatch_receipt_ref IS NEW.dispatch_receipt_ref) OR (NEW.evidence_kind='customer-verified-binding' AND evidence_kind='customer-verified-binding' AND custody_receipt_ref IS NEW.custody_receipt_ref)) BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 replacement'); END",
+    financial_customer_history_entries_no_update:
+      "CREATE TRIGGER financial_customer_history_entries_no_update BEFORE UPDATE ON financial_customer_history_entries BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 mutation'); END",
+    financial_customer_history_entries_no_delete:
+      "CREATE TRIGGER financial_customer_history_entries_no_delete BEFORE DELETE ON financial_customer_history_entries BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 mutation'); END",
+    financial_customer_history_receipts_no_replace:
+      "CREATE TRIGGER financial_customer_history_receipts_no_replace BEFORE INSERT ON financial_customer_history_receipts WHEN EXISTS(SELECT 1 FROM financial_customer_history_receipts WHERE (receipt_ref IS NEW.receipt_ref) OR (attempt_ref IS NEW.attempt_ref) OR (history_ref IS NEW.history_ref AND journal_sequence IS NEW.journal_sequence) OR (entry_ref IS NEW.entry_ref)) BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 replacement'); END",
+    financial_customer_history_receipts_no_update:
+      "CREATE TRIGGER financial_customer_history_receipts_no_update BEFORE UPDATE ON financial_customer_history_receipts BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 mutation'); END",
+    financial_customer_history_receipts_no_delete:
+      "CREATE TRIGGER financial_customer_history_receipts_no_delete BEFORE DELETE ON financial_customer_history_receipts BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 mutation'); END",
+    financial_customer_history_heads_no_replace:
+      "CREATE TRIGGER financial_customer_history_heads_no_replace BEFORE INSERT ON financial_customer_history_heads\nWHEN EXISTS(SELECT 1 FROM financial_customer_history_heads WHERE original_org_origin IS NEW.original_org_origin AND realm_registration IS NEW.realm_registration AND realm_incarnation IS NEW.realm_incarnation)\nBEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 head replacement'); END",
+    financial_customer_history_heads_no_delete:
+      "CREATE TRIGGER financial_customer_history_heads_no_delete BEFORE DELETE ON financial_customer_history_heads BEGIN SELECT RAISE(ABORT,'constraint: retained Customer H1 head deletion'); END",
+    financial_customer_history_heads_cas:
+      "CREATE TRIGGER financial_customer_history_heads_cas BEFORE UPDATE ON financial_customer_history_heads\nWHEN NOT (NEW.original_org_origin IS OLD.original_org_origin AND NEW.realm_registration IS OLD.realm_registration AND NEW.realm_incarnation IS OLD.realm_incarnation\n AND NEW.history_ref IS OLD.history_ref AND NEW.journal_sequence=OLD.journal_sequence+1 AND NEW.state IS OLD.state\n AND EXISTS(SELECT 1 FROM financial_customer_history_entries e WHERE e.entry_ref IS NEW.last_entry_ref AND e.history_ref IS OLD.history_ref\n AND e.journal_sequence IS NEW.journal_sequence AND e.expected_history_receipt_ref IS NEW.last_expected_receipt_ref\n AND e.previous_history_receipt_ref IS OLD.last_expected_receipt_ref\n AND (OLD.state='active' OR (OLD.state='closed' AND e.evidence_kind='customer-verified-binding'))))\nBEGIN SELECT RAISE(ABORT,'constraint: exact Customer H1 head CAS'); END",
+    financial_customer_history_coverage_origin:
+      "CREATE TRIGGER financial_customer_history_coverage_origin BEFORE INSERT ON financial_customer_history_coverages\nWHEN NOT EXISTS(SELECT 1 FROM financial_customer_history_birth_observations b\n JOIN financial_history_enrollment_receipts seal ON seal.receipt_ref=b.complete_seal_ref AND seal.primary_ref=b.primary_ref AND seal.enrollment_ref=b.enrollment_ref AND seal.receipt_kind='complete-seal' AND seal.all_rows_match=1\n JOIN financial_history_enrollments run ON run.enrollment_ref=seal.enrollment_ref AND run.primary_ref=seal.primary_ref\n WHERE b.birth_ref IS NEW.original_org_origin AND b.org_id IS NEW.organization_id AND b.phase='post-seal'\n AND b.primary_ref IS NEW.primary_ref AND b.enrollment_ref IS NEW.enrollment_ref AND seal.receipt_ref IS NEW.complete_seal_ref\n AND run.required_json IS NEW.required_scopes_json AND run.expected_seal_ref IS seal.receipt_ref\n AND NOT EXISTS(SELECT 1 FROM financial_history_enrollment_roster ro WHERE ro.primary_ref=b.primary_ref AND ro.org_id=b.org_id)\n AND EXISTS(SELECT 1 FROM orgs o WHERE o.id IS b.org_id AND o.owner_principal_id IS b.owner_principal_id AND o.created_at IS b.org_created_at)\n AND NOT EXISTS(SELECT 1 FROM financial_customer_history_org_changes ch WHERE ch.org_id=b.org_id OR ch.new_org_id=b.org_id)\n AND NOT EXISTS(SELECT 1 FROM financial_customer_history_birth_observations old WHERE old.org_id=b.org_id AND old.birth_ref<>b.birth_ref))\nBEGIN SELECT RAISE(ABORT,'constraint: exact H0 post-seal origin; retained adoption is not implemented'); END",
+    financial_customer_history_scope_original:
+      "CREATE TRIGGER financial_customer_history_scope_original BEFORE INSERT ON financial_customer_history_scopes\nWHEN NOT EXISTS(SELECT 1 FROM financial_customer_history_coverages cv JOIN financial_history_enrollment_inventory i\n ON i.primary_ref=cv.primary_ref AND i.enrollment_ref=cv.enrollment_ref\n WHERE cv.history_ref IS NEW.history_ref AND i.inventory_ref IS NEW.inventory_ref AND i.scope_kind IS NEW.scope_kind\n AND i.original_scope_ref IS NEW.original_scope_ref AND i.original_scope_incarnation IS NEW.original_scope_incarnation AND i.evidence_json IS NEW.evidence_json\n AND EXISTS(SELECT 1 FROM json_each(cv.required_scopes_json) j WHERE json(j.value)=json(i.evidence_json)))\nBEGIN SELECT RAISE(ABORT,'constraint: actual retained H0 scope parent'); END",
+    financial_customer_history_receipt_parent:
+      "CREATE TRIGGER financial_customer_history_receipt_parent BEFORE INSERT ON financial_customer_history_receipts\nWHEN NOT EXISTS(SELECT 1 FROM financial_customer_history_entries e JOIN financial_customer_history_coverages cv ON cv.history_ref=e.history_ref\n JOIN financial_customer_history_heads h ON h.original_org_origin=cv.original_org_origin AND h.realm_registration=cv.realm_registration AND h.realm_incarnation=cv.realm_incarnation\n LEFT JOIN financial_customer_history_receipts p ON p.receipt_ref=e.previous_history_receipt_ref\n WHERE e.entry_ref IS NEW.entry_ref AND cv.history_ref IS NEW.history_ref AND e.journal_sequence IS NEW.journal_sequence\n AND h.history_ref IS cv.history_ref AND h.journal_sequence IS e.journal_sequence AND h.last_entry_ref IS e.entry_ref\n AND h.last_expected_receipt_ref IS NEW.receipt_ref AND e.expected_history_receipt_ref IS NEW.receipt_ref AND e.coupling_attempt_ref IS NEW.attempt_ref\n AND NEW.original_org_origin IS cv.original_org_origin AND NEW.realm_registration IS cv.realm_registration AND NEW.realm_incarnation IS cv.realm_incarnation\n AND e.evidence_kind IS NEW.evidence_kind AND e.command_org_id IS NEW.command_org_id AND e.l1_receipt_ref IS NEW.l1_receipt_ref\n AND e.dispatch_receipt_ref IS NEW.dispatch_receipt_ref AND e.custody_receipt_ref IS NEW.custody_receipt_ref\n AND ((e.evidence_kind='genesis' AND cv.expected_receipt_ref IS NEW.receipt_ref AND cv.attempt_ref IS NEW.attempt_ref)\n OR (p.receipt_ref IS NEW.previous_history_receipt_ref AND p.entry_ref IS NEW.previous_entry_ref AND p.journal_sequence IS NEW.previous_journal_sequence\n AND p.history_ref IS e.history_ref AND p.journal_sequence=e.journal_sequence-1 AND p.all_rows_match=1)))\nBEGIN SELECT RAISE(ABORT,'constraint: exact typed history receipt parent'); END",
+  });
+
+/** Org-keyed tables whose rows mark an Org id as already used: every table with an
+ * org_id column at the 0104 state except FINANCIAL_0104_ORG_TRACE_EXCLUSIONS. A
+ * post-seal birth is skipped (Root's Org INSERT trigger) and refused (the 0104
+ * birth guard) when any of them has a row for the id. A test derives this set
+ * from the schema and fails when it drifts, so a new org-keyed table forces an
+ * explicit update of this list and of both SQL texts. */
+export const FINANCIAL_0104_ORG_TRACE_TABLES: readonly string[] = Object.freeze([
+  "auth_tokens",
+  "financial_customer_admission_receipts",
+  "financial_customer_custody_receipts",
+  "financial_customer_dispatch_claims",
+  "financial_customer_dispatch_receipts",
+  "integration_e2e_credential_pair_operations",
+  "ledger",
+  "money_cutover_aggregates",
+  "org_wallet_cash_cap_buckets",
+  "org_wallet_cash_exposures",
+  "org_wallet_grant_snapshots",
+  "org_wallet_holds",
+  "org_wallet_limit_policies",
+  "org_wallet_limit_policy_commands",
+  "org_wallet_usage_records",
+  "org_wallet_usage_warnings",
+  "org_wallet_workspace_bindings",
+  "org_wallet_workspace_snapshots",
+  "quotes",
+  "reseller_settlement_intents",
+  "reservations",
+  "sponsorship_credential_issuance_operations",
+  "sponsorship_tenants",
+  "stripe_billing_associations",
+  "stripe_billing_card_setup_commands",
+  "stripe_billing_card_setup_results",
+  "stripe_billing_checkouts",
+  "stripe_billing_commands",
+  "stripe_billing_customer_commands",
+  "stripe_billing_customers",
+  "stripe_billing_fences",
+  "stripe_billing_grants",
+  "stripe_billing_on_demand_abandonments",
+  "stripe_billing_on_demand_attempts",
+  "stripe_billing_on_demand_commands",
+  "stripe_billing_on_demand_funding",
+  "stripe_billing_on_demand_refunds",
+  "stripe_billing_on_demand_terminals",
+  "stripe_billing_plan_change_slots",
+  "stripe_billing_plan_change_steps",
+  "stripe_billing_plan_changes",
+  "stripe_billing_refunds",
+  "stripe_billing_subscription_term_revocations",
+  "stripe_billing_subscription_terms",
+  "stripe_billing_subscriptions",
+  "stripe_customer_admission_links",
+  "stripe_subscription_cancellation_intents",
+  "stripe_subscription_checkout_intents",
+  "stripe_top_up_commands",
+  "usage_events",
+  "usage_statements",
+  "wallet_credit_allocations",
+  "wallet_credit_lot_classification_proofs",
+  "wallet_credit_lots",
+]);
+/** The only org_id tables left out of the trace, each with its reason. */
+export const FINANCIAL_0104_ORG_TRACE_EXCLUSIONS: Readonly<Record<string, string>> = Object.freeze({
+  org_memberships: "written for a brand-new Org in Root's create batch",
+  personal_organizations: "written for a brand-new Org in Root's create batch",
+  financial_customer_history_birth_observations: "the Financial H0 observation itself",
+  financial_customer_history_org_changes: "the Financial H0 observation itself",
+  financial_history_enrollment_roster: "the Financial H0 start roster",
+});
+
+/** Every Customer schema row, then the Customer fences: the exact fenced shape. */
+const CUSTOMER_FENCED_SHAPE: Readonly<Record<string, string>> = Object.freeze({
+  ...FINANCIAL_0104_CUSTOMER_L1_SCHEMA,
+  ...FINANCIAL_0104_CUSTOMER_H0_SCHEMA,
+  ...FINANCIAL_0104_CUSTOMER_JOURNAL_SCHEMA,
+  ...FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA,
+});
+/** Tables whose every schema object Financial owns. stripe_customer_admission_links
+ * also carries Root's Money cutover-guard Stripe fences, so it is compared by
+ * Financial name only. */
+const CUSTOMER_OWNED_TABLES = Object.freeze(
+  [
+    ...Object.entries({
+      ...FINANCIAL_0104_CUSTOMER_L1_SCHEMA,
+      ...FINANCIAL_0104_CUSTOMER_H0_SCHEMA,
+      ...FINANCIAL_0104_CUSTOMER_JOURNAL_SCHEMA,
+    }),
+  ]
+    .filter(([, sql]) => sql.startsWith("CREATE TABLE "))
+    .map(([name]) => name)
+    .filter((name) => name !== "stripe_customer_admission_links"),
+);
+const CUSTOMER_NAMED_OBJECTS = Object.freeze(
+  Object.keys(CUSTOMER_FENCED_SHAPE).filter((name) =>
+    name.startsWith("stripe_customer_admission_link"),
+  ),
+);
+const CUSTOMER_SHAPE_QUERY = `SELECT name,sql FROM sqlite_schema
+ WHERE (tbl_name IN (${CUSTOMER_OWNED_TABLES.map(() => "?").join(",")}) OR name IN (${CUSTOMER_NAMED_OBJECTS.map(() => "?").join(",")}))
+ AND sql IS NOT NULL ORDER BY name`;
+
+/** Refuses a Customer write unless the database holds exactly the fenced 0104
+ * Customer shape. Read-only; recovery reads never call it. */
+export async function assertFinancial0104CustomerWriteShape(sql: Sql): Promise<void> {
+  let rows: readonly Row[];
+  try {
+    rows = await sql.query(CUSTOMER_SHAPE_QUERY, [
+      ...CUSTOMER_OWNED_TABLES,
+      ...CUSTOMER_NAMED_OBJECTS,
+    ]);
+  } catch {
+    throw new SqlError("unavailable", "Financial 0104 Customer write shape unreadable");
+  }
+  if (
+    rows.length !== Object.keys(CUSTOMER_FENCED_SHAPE).length ||
+    rows.some(
+      (row) =>
+        typeof row.name !== "string" ||
+        !Object.hasOwn(CUSTOMER_FENCED_SHAPE, row.name) ||
+        row.sql !== CUSTOMER_FENCED_SHAPE[row.name],
+    )
+  )
+    throw new SqlError(
+      "unavailable",
+      "Financial 0104 Customer write requires the exact fenced shape",
+    );
+}

@@ -1,7 +1,9 @@
 /** PRIVATE mechanical SQL execution DATA. No provider or admission permission API.
  * Qualified Root backing origin, genuine Auth/Clock and the actual caller are not mounted.
  */
+import { assertFinancial0104CustomerWriteShape } from "./financial-0104-customer-schema.ts";
 import { canonicalJson } from "./json.ts";
+import { assertMoneyCutoverSqlBackingOrigin } from "./money-cutover-sql.ts";
 import { type Row, type Sql, SqlError, type SqlStatement, type SqlWrite } from "./ports.ts";
 import {
   type CustomerPhaseInput,
@@ -18,7 +20,7 @@ export interface CustomerBatchAcknowledgementData {
     readonly changes: 1;
     readonly returnedRows: 0;
   }[];
-  /** Actual result[2] of this invocation, never inferred from a receipt INSERT. */
+  /** Actual result[1] of this invocation, never inferred from a receipt INSERT. */
   readonly dispatchCasChanges: 1 | null;
 }
 export type CustomerReceiptObservationData =
@@ -124,7 +126,8 @@ function acknowledgement(
 ): CustomerBatchAcknowledgementData | null {
   try {
     const result = detached(value);
-    if (!Array.isArray(result) || result.length !== (phase === "L1" ? 9 : 8)) return null;
+    // Root's Money writer returns only the Customer statements' results.
+    if (!Array.isArray(result) || result.length !== (phase === "L1" ? 7 : 6)) return null;
     const physicalResults: { index: number; changes: 1; returnedRows: 0 }[] = [];
     for (let index = 0; index < result.length; index++) {
       const item = result[index];
@@ -255,22 +258,68 @@ function matchesOriginal(
 }
 
 /**
- * Executes only this module's actual frozen compiler output, including permit0/last.
+ * Executes only this module's actual frozen compiler output; the permit frame is Root's.
  * Own-data method/receiver identity is checked before/after every await. This is
  * NOT a Root physical-primary assertion or a qualified production constructor.
+ * Same rule as every Customer writer, with reads and writes on separate ports: the
+ * fixed GET reads (which name money_cutover_* and are raw-only) run on `read`, and
+ * batches run only on `write`. Before any statement of a phase, `write` must be
+ * Root's Money writer for that phase's own writer epoch over exactly the `read`
+ * backing (assertMoneyCutoverSqlBackingOrigin, as Root's request origin binds it),
+ * and the database must hold the exact fenced 0104 Customer shape; otherwise the
+ * phase is refused and nothing is read or written. GET-only recovery is ungated.
  */
-export function createCustomerTrackedExecutionData(sql: Sql) {
-  function own<K extends "query" | "run" | "batch">(name: K): Sql[K] {
-    const property = Object.getOwnPropertyDescriptor(sql, name);
+export function createCustomerTrackedExecutionData(ports: {
+  readonly read: Sql;
+  readonly write: Sql;
+}) {
+  const read = ports.read;
+  const write = ports.write;
+  return trackedExecution(read, write, async (q) => {
+    try {
+      assertMoneyCutoverSqlBackingOrigin(write, { rawSql: read, writerEpoch: q.writerEpoch });
+    } catch {
+      throw new SqlError("unavailable", "Customer phase writer must be Root's Money writer");
+    }
+    await assertFinancial0104CustomerWriteShape(read);
+  });
+}
+
+/**
+ * The current-consent executor's form only (check-imports pins that one importer).
+ * Its transport is the executor's request-scoped wrapper: a batch reaches nothing
+ * but Root's native receiver, which frames it with Root's Money writer, and the
+ * executor asserts that writer's origin for the phase epoch and the exact fenced
+ * shape before it mints each batch operation. No other Sql may use this form.
+ */
+export function createCustomerTrackedExecutionOverRootReceiver(transport: Sql) {
+  return trackedExecution(transport, transport, async () => undefined);
+}
+
+function trackedExecution(
+  sql: Sql,
+  writer: Sql,
+  writable: (q: CustomerPhaseInput) => Promise<void>,
+) {
+  function own<K extends "query" | "run" | "batch">(port: Sql, name: K): Sql[K] {
+    const property = Object.getOwnPropertyDescriptor(port, name);
     if (!property || !("value" in property) || typeof property.value !== "function") invalid();
     return property.value;
   }
-  const query = own("query"),
-    run = own("run"),
-    batch = own("batch");
+  const query = own(sql, "query"),
+    run = own(sql, "run"),
+    readBatch = own(sql, "batch"),
+    writeRun = own(writer, "run"),
+    batch = own(writer, "batch");
   function stable(): void {
     try {
-      if (own("query") !== query || own("run") !== run || own("batch") !== batch)
+      if (
+        own(sql, "query") !== query ||
+        own(sql, "run") !== run ||
+        own(sql, "batch") !== readBatch ||
+        own(writer, "run") !== writeRun ||
+        own(writer, "batch") !== batch
+      )
         throw new MethodDrift();
     } catch {
       throw new MethodDrift();
@@ -348,6 +397,7 @@ export function createCustomerTrackedExecutionData(sql: Sql) {
     async executePhase(input: CustomerPhaseInput): Promise<CustomerTrackedExecutionData> {
       const q = detached(input);
       const plan = compileCustomerPhase(q);
+      await writable(q);
       const base = { qualification: "private-mechanical-sql-data-only" as const, original: q };
       const key = originalKey(q);
       if (observedOriginals.has(key))
@@ -373,7 +423,7 @@ export function createCustomerTrackedExecutionData(sql: Sql) {
       let ack: CustomerBatchAcknowledgementData | null;
       try {
         stable();
-        const actual: unknown = await Reflect.apply(batch, sql, [plan.statements]);
+        const actual: unknown = await Reflect.apply(batch, writer, [plan.statements]);
         stable();
         ack = acknowledgement(actual, q.phase);
       } catch (error) {

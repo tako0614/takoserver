@@ -31,6 +31,7 @@ CREATE TABLE financial_customer_admission_receipts (
  FOREIGN KEY(admission_ref) REFERENCES financial_customer_admissions(admission_ref) ON DELETE RESTRICT,
  FOREIGN KEY(org_id) REFERENCES stripe_customer_admission_links(org_id) ON DELETE RESTRICT
 );
+CREATE INDEX financial_customer_admission_receipts_by_org ON financial_customer_admission_receipts(org_id);
 CREATE TRIGGER financial_customer_admission_original BEFORE INSERT ON financial_customer_admissions
 WHEN NOT EXISTS(SELECT 1 FROM shared_customer_challenges c
  JOIN financial_payer_grants g ON g.challenge_ref=c.challenge_ref

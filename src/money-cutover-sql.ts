@@ -36,6 +36,27 @@ export const MONEY_CUTOVER_FINANCIAL_TABLES = [
   "sponsorship_credential_issuance_operations",
 ] as const;
 
+/**
+ * The later Stripe customer guard generation: the Stripe tables a Financial
+ * Customer batch writes. It exists only on a guarded primary that also holds
+ * 0104's Customer link table, because the only guarded path that creates that
+ * table (the Root post-Auth103 chain on a Money-preserved target) installs
+ * these fences in the same import. Never installed by a numbered migration;
+ * pre-cutover and self-host primaries keep raw Sql and carry no fence.
+ */
+export const MONEY_CUTOVER_STRIPE_CUSTOMER_TABLES = [
+  "stripe_billing_customers",
+  "stripe_billing_customer_commands",
+  "stripe_customer_admission_links",
+] as const;
+/** The 0104 table whose presence on a guarded primary selects that generation. */
+export const MONEY_CUTOVER_STRIPE_CUSTOMER_GENERATION_TABLE = "stripe_customer_admission_links";
+export type MoneyCutoverGuardGeneration = "financial-0092" | "stripe-customer-0104";
+
+function moneyCutoverFenceTriggerSql(table: string, verb: "INSERT" | "UPDATE" | "DELETE"): string {
+  return `CREATE TRIGGER money_cutover_fence_${table}_${verb.toLowerCase()} BEFORE ${verb} ON ${table} WHEN EXISTS (SELECT 1 FROM ${MONEY_CUTOVER_FREEZE_TABLE}) OR NOT EXISTS (SELECT 1 FROM ${MONEY_CUTOVER_PERMIT_TABLE} AS permit JOIN ${MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE} AS authorized ON authorized.singleton = 1 AND authorized.writer_epoch = permit.writer_epoch WHERE permit.singleton = 1 AND permit.epoch = '${MONEY_CUTOVER_EPOCH}') BEGIN SELECT RAISE(ABORT, 'money cutover writer permit required'); END`;
+}
+
 export function moneyCutoverFinancialTriggerSql(
   table: string,
   verb: "INSERT" | "UPDATE" | "DELETE",
@@ -43,7 +64,34 @@ export function moneyCutoverFinancialTriggerSql(
   if (!(MONEY_CUTOVER_FINANCIAL_TABLES as readonly string[]).includes(table)) {
     throw new TypeError("unknown money cutover financial table");
   }
-  return `CREATE TRIGGER money_cutover_fence_${table}_${verb.toLowerCase()} BEFORE ${verb} ON ${table} WHEN EXISTS (SELECT 1 FROM ${MONEY_CUTOVER_FREEZE_TABLE}) OR NOT EXISTS (SELECT 1 FROM ${MONEY_CUTOVER_PERMIT_TABLE} AS permit JOIN ${MONEY_CUTOVER_AUTHORIZED_EPOCH_TABLE} AS authorized ON authorized.singleton = 1 AND authorized.writer_epoch = permit.writer_epoch WHERE permit.singleton = 1 AND permit.epoch = '${MONEY_CUTOVER_EPOCH}') BEGIN SELECT RAISE(ABORT, 'money cutover writer permit required'); END`;
+  return moneyCutoverFenceTriggerSql(table, verb);
+}
+
+/** The same permit/freeze fence shape on one Stripe customer generation table. */
+export function moneyCutoverStripeCustomerTriggerSql(
+  table: string,
+  verb: "INSERT" | "UPDATE" | "DELETE",
+): string {
+  if (!(MONEY_CUTOVER_STRIPE_CUSTOMER_TABLES as readonly string[]).includes(table)) {
+    throw new TypeError("unknown money cutover Stripe customer table");
+  }
+  return moneyCutoverFenceTriggerSql(table, verb);
+}
+
+/** Exact [name, sql] Stripe customer generation fences, in table/verb order. */
+export function moneyCutoverStripeCustomerGuardDefinitions(): readonly (readonly [
+  string,
+  string,
+])[] {
+  return MONEY_CUTOVER_STRIPE_CUSTOMER_TABLES.flatMap((table) =>
+    (["INSERT", "UPDATE", "DELETE"] as const).map(
+      (verb) =>
+        [
+          `money_cutover_fence_${table}_${verb.toLowerCase()}`,
+          moneyCutoverStripeCustomerTriggerSql(table, verb),
+        ] as const,
+    ),
+  );
 }
 
 export function moneyCutoverClassificationTriggerSql(verb: "INSERT" | "UPDATE" | "DELETE"): string {
@@ -71,13 +119,54 @@ export async function inspectMoneyCutoverGuard(
         ),
     ),
   ];
-  const rows = await sql.query(
-    `SELECT type, name, sql FROM sqlite_schema WHERE name IN (${names.map(() => "?").join(", ")}) ORDER BY name`,
-    names,
+  const stripe = moneyCutoverStripeCustomerGuardDefinitions();
+  const generationNames = [
+    MONEY_CUTOVER_STRIPE_CUSTOMER_GENERATION_TABLE,
+    ...stripe.map(([name]) => name),
+  ];
+  const lookup = [...names, ...generationNames];
+  const found = await sql.query(
+    `SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE name IN (${lookup.map(() => "?").join(", ")}) ORDER BY name`,
+    lookup,
   );
+  const rows = found.filter((row) => !generationNames.includes(row.name as string));
   if (rows.length !== names.length)
     throw new SqlError("invalid", "money cutover guard is incomplete");
   const byName = new Map(rows.map((row) => [row.name, row]));
+  // Explicit generation: 0104's Customer link table on a guarded primary means
+  // the Stripe customer generation was installed with it, so all of its fences
+  // must be exact; before it, none of them may exist. Partial is refused.
+  const generationTable = found.filter(
+    (row) => row.name === MONEY_CUTOVER_STRIPE_CUSTOMER_GENERATION_TABLE,
+  );
+  const stripeFences = new Map(
+    found
+      .filter(
+        (row) =>
+          row.name !== MONEY_CUTOVER_STRIPE_CUSTOMER_GENERATION_TABLE &&
+          generationNames.includes(row.name as string),
+      )
+      .map((row) => [row.name, row]),
+  );
+  if (
+    generationTable.length > 1 ||
+    (generationTable.length === 1 &&
+      (generationTable[0]?.type !== "table" ||
+        generationTable[0]?.tbl_name !== MONEY_CUTOVER_STRIPE_CUSTOMER_GENERATION_TABLE))
+  )
+    throw new SqlError("invalid", "money cutover guard generation differs");
+  if (generationTable.length === 0) {
+    if (stripeFences.size !== 0)
+      throw new SqlError("invalid", "money cutover Stripe customer fence predates its generation");
+  } else if (
+    stripeFences.size !== stripe.length ||
+    stripe.some(([name, definition]) => {
+      const row = stripeFences.get(name);
+      return row?.type !== "trigger" || row.sql !== definition;
+    })
+  ) {
+    throw new SqlError("invalid", "money cutover Stripe customer trigger differs");
+  }
   if (
     byName.get(MONEY_CUTOVER_PERMIT_TABLE)?.type !== "table" ||
     byName.get(MONEY_CUTOVER_PERMIT_TABLE)?.sql !== MONEY_CUTOVER_PERMIT_DDL ||

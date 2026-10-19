@@ -181,8 +181,16 @@ export const CUSTOMER_MATCH_CTES = `
 /** Structural historical contribution. A missing or NULL proof stays false. */
 export const CUSTOMER_ENTRY_MATCH = `EXISTS(SELECT 1 FROM customer_entry_matches valid
  WHERE valid.history_ref=cv.history_ref AND valid.history_ref=e.history_ref AND valid.entry_ref=e.entry_ref)`;
-/** Exact H0 root/seal/birth and bidirectional actual inventory; no count/label authority. */
-export const CUSTOMER_COVERAGE_MATCH = `(
+/** Exact H0 root/seal/birth, bidirectional actual inventory and current realm;
+ * no count/label authority. The origin birth's Org id must never have been in any
+ * start roster of this primary, must still match the current Org row (owner,
+ * created_at), and no change observation may ever have named it (as org_id or
+ * new_org_id): an id that existed before, or was moved or deleted, never yields a
+ * coverage origin. A change to another Org does not affect this coverage (the
+ * seal keeps the global no-change rule). An id that already had money rows never
+ * receives a post-seal birth (decided at birth time, no timestamps). Money
+ * currentness is appended separately below. */
+const CUSTOMER_COVERAGE_CORE = `(
  (cv.original_org_origin IS birth.birth_ref AND birth.org_id IS cv.organization_id AND birth.phase='post-seal'
  AND birth.primary_ref IS cv.primary_ref AND birth.enrollment_ref IS cv.enrollment_ref AND birth.complete_seal_ref IS cv.complete_seal_ref)
  AND (json_extract(root.root_json,'$.accountId') IS json_extract(cv.realm_json,'$.accountId')
@@ -192,6 +200,9 @@ export const CUSTOMER_COVERAGE_MATCH = `(
  AND (seal.receipt_ref IS cv.complete_seal_ref AND seal.receipt_kind='complete-seal' AND seal.all_rows_match IS 1
  AND seal.enrollment_ref IS cv.enrollment_ref AND seal.primary_ref IS cv.primary_ref
  AND run.expected_seal_ref IS seal.receipt_ref AND run.required_json IS cv.required_scopes_json)
+ AND (NOT EXISTS(SELECT 1 FROM financial_history_enrollment_roster ro WHERE ro.primary_ref=birth.primary_ref AND ro.org_id=birth.org_id)
+ AND EXISTS(SELECT 1 FROM orgs o WHERE o.id IS birth.org_id AND o.owner_principal_id IS birth.owner_principal_id AND o.created_at IS birth.org_created_at)
+ AND NOT EXISTS(SELECT 1 FROM financial_customer_history_org_changes ch WHERE ch.org_id=birth.org_id OR ch.new_org_id=birth.org_id))
  AND (eh.enrollment_ref IS run.enrollment_ref AND eh.generation IS run.generation AND eh.state='sealed'
  AND eh.expected_receipt_ref IS seal.receipt_ref)
  AND EXISTS(SELECT 1 FROM financial_history_enrollment_receipts start
@@ -208,9 +219,17 @@ export const CUSTOMER_COVERAGE_MATCH = `(
  OR s.evidence_json IS NOT i.evidence_json OR NOT EXISTS(SELECT 1 FROM json_each(cv.required_scopes_json) j WHERE json(j.value)=json(i.evidence_json))))
  AND EXISTS(SELECT 1 FROM stripe_billing_account_realms realm JOIN stripe_mode_realm mode ON mode.singleton=realm.singleton
  WHERE realm.singleton=1 AND realm.account_id IS json_extract(cv.realm_json,'$.accountId')
- AND realm.billing_authority IS json_extract(cv.realm_json,'$.billingAuthority') AND realm.mode='test' AND mode.mode='test')
+ AND realm.billing_authority IS json_extract(cv.realm_json,'$.billingAuthority') AND realm.mode='test' AND mode.mode='test')`;
+/** Read/recovery coverage match, byte-identical to the original: the core plus the
+ * authorized-epoch and freeze reads. Only fixed GET statements use it. */
+export const CUSTOMER_COVERAGE_MATCH = `${CUSTOMER_COVERAGE_CORE}
  AND EXISTS(SELECT 1 FROM money_cutover_authorized_epoch ep WHERE ep.singleton=1 AND ep.writer_epoch IS cv.writer_epoch)
  AND NOT EXISTS(SELECT 1 FROM money_cutover_freeze)
+)`;
+/** Write coverage match for Customer phase statements. Every row they write is
+ * 0104 money-fenced (freeze, Root permit and the coverage's own writer epoch),
+ * so no money_cutover_* table is named and Root's Money writer sends them. */
+export const CUSTOMER_COVERAGE_FENCED_MATCH = `${CUSTOMER_COVERAGE_CORE}
 )`;
 export const CUSTOMER_COVERAGE_JOINS = `FROM financial_customer_history_coverages cv
  JOIN financial_customer_history_birth_observations birth ON birth.birth_ref=cv.original_org_origin

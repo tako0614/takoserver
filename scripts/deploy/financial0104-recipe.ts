@@ -12,7 +12,7 @@ import type { MigrationFile } from "./migrations.ts";
 /** Root's reviewed pin over the exact Financial-owned 0104 body. A Financial
  * recipe edit must be re-reviewed here before Root registers different bytes. */
 export const FINANCIAL0104_ROOT_RECIPE_DIGEST =
-  "sha256:189f56e787b0e147032de7432e05f23a9d152971d08534893f6bef161e1253f6";
+  "sha256:dce564f5ed3cfe297ec14f185cabf1066414711e35699c2949523dabbbcf93eb";
 export const FINANCIAL0104_MIGRATION_NAME = "0104_financial_custody.sql";
 
 const digest = (value: string | Uint8Array): `sha256:${string}` =>

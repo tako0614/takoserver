@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { moneyFenceInstallSql } from "../../scripts/deploy/schema-money-unit-cutover.ts";
 import { verifyHostedBillingFinancialRealm } from "../../src/hosted-billing-realm.ts";
 import { canonicalJson } from "../../src/json.ts";
+import { moneyCutoverStripeCustomerGuardDefinitions } from "../../src/money-cutover-sql.ts";
 import type { Row, SqlParam, SqlStatement, SqlWrite } from "../../src/ports.ts";
 import { SHARED_AUTH_STAGING_PROFILE } from "../../src/shared-auth-oidc-client.ts";
 import { customerAdmissionCandidate } from "../../src/shared-financial-admission.ts";
@@ -182,6 +183,8 @@ function mechanicalRp(): SqlStatement {
 async function requestFixture() {
   const f = await customerFixture(true);
   f.db.exec(moneyFenceInstallSql("0094"));
+  // Root's guarded 0104 chain installs the Money guard's Stripe customer generation.
+  for (const [, sql] of moneyCutoverStripeCustomerGuardDefinitions()) f.db.exec(sql);
   const observed = { primary: 0, root: 0, reads: 0, batches: 0 };
   const batchSizes: number[] = [];
   const nativeTrace: NativeTrace = { reads: [], batches: [] };
@@ -556,7 +559,9 @@ async function selectedCustomerCase(request: Awaited<ReturnType<typeof requestFi
     captures: { credential: credentialCapture, userBinding: userBindingCapture },
     rp: mechanicalRp(),
     root: {
-      sql: `EXISTS(SELECT 1 FROM money_cutover_authorized_epoch WHERE writer_epoch=?)${" AND ? IS NOT NULL".repeat(9)}`,
+      // Synthetic Root currentness; like the actual Auth103 predicate it names no
+      // money_cutover_* table, so Root's Money writer can send the guarded receipt.
+      sql: `EXISTS(SELECT 1 FROM shared_customer_challenges WHERE writer_epoch=?)${" AND ? IS NOT NULL".repeat(9)}`,
       params: [writerEpoch, ...Array(9).fill("synthetic-root")],
     },
   };
@@ -596,7 +601,8 @@ test("synthetic RP/R1 selection reaches actual Financial mint and Root native L1
     const outcome = await executor.executePhase(l1);
     expect(outcome.status).toBe("acknowledged-own-phase-data");
     if (outcome.status !== "acknowledged-own-phase-data") throw new Error("L1 not acknowledged");
-    expect(outcome.acknowledgement.physicalResults).toHaveLength(9);
+    // Seven Customer results; the native batch is Root's permit frame around them.
+    expect(outcome.acknowledgement.physicalResults).toHaveLength(7);
     expect(request.batchSizes).toEqual([9]);
     expect(request.observed.reads).toBeGreaterThan(readsBefore);
     expect(request.observed.root).toBe(0);
@@ -631,10 +637,10 @@ test("synthetic RP/R1 selection reaches actual Financial mint and Root native L1
     const dispatched = await executor.executePhase(d);
     expect(dispatched.status).toBe("acknowledged-own-phase-data");
     if (dispatched.status !== "acknowledged-own-phase-data") throw new Error("D not acknowledged");
-    expect(dispatched.acknowledgement.physicalResults).toHaveLength(8);
+    expect(dispatched.acknowledgement.physicalResults).toHaveLength(6);
     expect(dispatched.acknowledgement.dispatchCasChanges).toBe(1);
-    expect(dispatched.acknowledgement.physicalResults[2]).toEqual({
-      index: 2,
+    expect(dispatched.acknowledgement.physicalResults[1]).toEqual({
+      index: 1,
       changes: 1,
       returnedRows: 0,
     });
@@ -688,7 +694,7 @@ test("synthetic RP/R1 selection reaches actual Financial mint and Root native L1
       expect(first.original.writerEpoch).toBe(writerEpoch);
       expect(first.original.phase).toBe(first.phase);
       if (first?.kind === "phase-batch" && repeated?.kind === "phase-batch") {
-        const receiptIndex = first.phase === "L1" ? 4 : 3;
+        const receiptIndex = first.phase === "L1" ? 3 : 2;
         const firstBlobs = first.plan.statements[receiptIndex]?.params?.filter(
           (value) => value instanceof ArrayBuffer,
         );
@@ -743,19 +749,29 @@ test("synthetic RP/R1 selection reaches actual Financial mint and Root native L1
         expect(item.nativeBatches).toHaveLength(1);
         const native = item.nativeBatches[0];
         if (!native) throw new Error("Root batch did not use the native session");
-        expect(native.statements).toEqual(original.plan.statements);
-        expect(native.statements).toHaveLength(original.phase === "L1" ? 9 : 8);
-        expect(native.statements[0]?.sql).toContain("money_cutover_writer_permit");
-        expect(native.statements.at(-1)?.sql).toContain("money_cutover_writer_permit");
+        // Root's Money writer frames the exact Financial plan with its permit.
+        expect(original.plan.statements).toHaveLength(original.phase === "L1" ? 7 : 6);
+        for (const statement of original.plan.statements)
+          expect(statement.sql).not.toContain("money_cutover_");
+        expect(native.statements).toHaveLength(original.plan.statements.length + 2);
+        expect(native.statements.slice(1, -1)).toEqual([...original.plan.statements]);
+        expect(native.statements[0]?.sql).toStartWith("INSERT INTO money_cutover_writer_permit");
+        expect(native.statements.at(-1)?.sql).toStartWith(
+          "DELETE FROM money_cutover_writer_permit",
+        );
+        expect(native.statements[0]?.params).toEqual([writerEpoch]);
+        expect(native.statements.at(-1)?.params).toEqual([writerEpoch]);
         expect(native.underlying[0]?.changes).toBe(1);
         expect(native.underlying.at(-1)?.changes).toBe(1);
         if (original.phase === "D") expect(native.underlying[2]?.changes).toBe(1);
-        expect(item.result).toHaveLength(native.results.length);
+        expect(item.result).toHaveLength(native.results.length - 2);
         for (let index = 0; index < native.results.length; index++) {
           expect(native.results[index]?.results).toBe(native.underlying[index]?.rows);
           expect(native.results[index]?.meta?.changes).toBe(native.underlying[index]?.changes);
-          expect(item.result[index]?.rows).toBe(native.underlying[index]?.rows);
-          expect(item.result[index]?.changes).toBe(native.underlying[index]?.changes);
+        }
+        for (let index = 0; index < item.result.length; index++) {
+          expect(item.result[index]?.rows).toBe(native.underlying[index + 1]?.rows);
+          expect(item.result[index]?.changes).toBe(native.underlying[index + 1]?.changes);
         }
         receivedBatches.push(item.result);
       }
@@ -813,14 +829,14 @@ test("synthetic RP/R1 selection reaches actual Financial mint and Root native L1
       guardedBatches.map((item) =>
         item?.kind === "phase-batch" ? item.plan.statements.length : -1,
       ),
-    ).toEqual([9, 8]);
+    ).toEqual([7, 6]);
     expect(
       guardedBatches.map((item) =>
         item?.kind === "phase-batch"
-          ? item.plan.statements[item.phase === "L1" ? 4 : 3]?.params?.length
+          ? item.plan.statements[item.phase === "L1" ? 3 : 2]?.params?.length
           : -1,
       ),
-    ).toEqual([96, 98]);
+    ).toEqual([97, 99]);
   } finally {
     synthetic = null;
     request.f.close();
@@ -856,6 +872,29 @@ test("committed L1 with lost ACK recovers its original by GET without another ba
     expect(request.batchSizes).toEqual([9]);
     expect(request.observed.primary).toBe(1);
     expect(request.observed.root).toBe(0);
+  } finally {
+    synthetic = null;
+    request.f.close();
+  }
+});
+
+test("an unfenced Customer shape refuses the L1 write before Root's receiver sends a batch", async () => {
+  const request = await requestFixture();
+  try {
+    const { executor, l1 } = await selectedCustomerCase(request);
+    // One missing Customer fence is not the exact fenced 0104 shape.
+    request.f.db.exec("DROP TRIGGER financial_customer_history_entries_money_fence");
+    const outcome = await executor.executePhase(l1);
+    expect(outcome.status).toBe("get-only");
+    expect(request.batchSizes).toEqual([]);
+    expect(
+      receiverOperations.filter(
+        (item) => item.connection === request.connection && item.kind === "batch",
+      ),
+    ).toEqual([]);
+    expect(await request.f.sql.query("SELECT * FROM financial_customer_admissions")).toEqual([]);
+    expect(await request.f.sql.query("SELECT * FROM stripe_billing_customer_commands")).toEqual([]);
+    expect(await request.f.sql.query("SELECT * FROM money_cutover_writer_permit")).toEqual([]);
   } finally {
     synthetic = null;
     request.f.close();

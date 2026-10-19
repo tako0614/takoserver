@@ -70,13 +70,6 @@ export const SOURCE_CURRENT = `(
   ) IS NOT 1)
 )`;
 
-const MONEY_CURRENT = Object.freeze({
-  sql: `
- AND EXISTS(SELECT 1 FROM money_cutover_authorized_epoch e WHERE e.singleton=1 AND e.writer_epoch IS c.writer_epoch)
- AND NOT EXISTS(SELECT 1 FROM money_cutover_freeze)`,
-  params: Object.freeze([]) as readonly SqlParam[],
-});
-
 /** The exact 0104 consent fence rows, as one JSON bind. The consent batch is a
  * DATA compiler with no Sql of its own, so its write readiness is in-statement:
  * unless every consent money fence exists byte-for-byte, S1/S2 select no row
@@ -96,25 +89,13 @@ const CONSENT_FENCED = Object.freeze({
   params: Object.freeze([CONSENT_FENCES_JSON]) as readonly SqlParam[],
 });
 
-/** Exact observed Root helper SQL/params, not a substitute for missing Root private-origin assertion/readers.
- * Byte-identical for its existing consumers (Customer admission), whose writes are not 0104-fenced. */
-export function guard(input: ConsentCandidate, organizationId: string) {
-  return guardWith(input, organizationId, MONEY_CURRENT);
-}
-
-/** The same guard for the consent batch itself. Every table it writes carries a
- * Financial 0104 money fence, so freeze, permit and epoch are enforced inside
- * Root's permit-framed Money writer and no money_cutover_* table is named here;
- * the batch requires those exact fences to exist (CONSENT_FENCED). */
+/** Exact observed Root helper SQL/params for the consent batch and Customer
+ * admission, not a substitute for missing Root private-origin assertion/readers.
+ * Every table they write carries a Financial 0104 money fence, so freeze, permit
+ * and epoch are enforced inside Root's permit-framed Money writer and no
+ * money_cutover_* table is named here; the guarded statement requires those
+ * exact consent fences to exist (CONSENT_FENCED). */
 export function consentGuard(input: ConsentCandidate, organizationId: string) {
-  return guardWith(input, organizationId, CONSENT_FENCED);
-}
-
-function guardWith(
-  input: ConsentCandidate,
-  organizationId: string,
-  money: { readonly sql: string; readonly params: readonly SqlParam[] },
-) {
   const principal = sharedPrincipalCurrentness(input.auth.human);
   const credential = input.auth.credential;
   const transport =
@@ -149,7 +130,7 @@ function guardWith(
   WHERE o.id=c.organization_id AND o.owner_principal_id=? AND m.principal_id=o.owner_principal_id AND m.role='owner'))
  AND (EXISTS(SELECT 1 FROM stripe_billing_account_realms r JOIN stripe_mode_realm sm ON sm.singleton=r.singleton
   WHERE r.singleton=1 AND r.account_id IS c.account_id AND r.mode IS c.mode
-  AND r.billing_authority IS c.billing_authority AND sm.mode IS c.mode)${money.sql})
+  AND r.billing_authority IS c.billing_authority AND sm.mode IS c.mode)${CONSENT_FENCED.sql})
  AND (${SOURCE_CURRENT}
  AND (${principal.sql})) AND ((${transport.sql}) AND (${relation}))
  )`;
@@ -162,7 +143,7 @@ function guardWith(
       input.requestFingerprint,
       stable,
       human.principalId,
-      ...money.params,
+      ...CONSENT_FENCED.params,
       ...principal.params,
       ...transport.params,
       ...relationParams,

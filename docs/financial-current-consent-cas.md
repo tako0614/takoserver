@@ -19,8 +19,8 @@ while fitting SQLite's expression depth of 100. The receipt also checks the
 exact append-only issuer original and the
 consent acceptance/expiry interval against SQLite time. A false late predicate
 violates the receipt's existing CHECK, rolling back earlier writes in that same
-batch. The L1 and D statement counts and the D physical CAS result index stay
-9, 8, and 2. Recovery is GET-only and never mints a new consent observation.
+batch. The L1 and D plans hold only their 7 and 6 Customer statements (D's physical CAS
+result index is 1); Root's Money writer frames each batch with its permit. Recovery is GET-only and never mints a new consent observation.
 
 The request composition gives ordinary consumers a Money public SQL wrapper.
 That wrapper correctly refuses the existing Customer receipt observation SQL and
@@ -67,3 +67,28 @@ against the held RP consent, R1 selection, native Customer command recipe,
 realm and writer epoch. Historical GET-only recovery does not require the
 consent to be unexpired. The pending row and RP/Root currentness checks remain
 write-only predicates in the mandatory receipt batch.
+
+## Customer history coverage origin and Org identity (0104/0105)
+
+Root's 0105 Org capture triggers append birth and change observations and never
+move a Financial head. A Customer coverage origin is a post-seal birth whose Org
+id was in no start roster of that primary, still matches the current Org row
+(owner, created_at), and was never named by any change observation (as the old or
+new id); 0105 also backfills one raw birth for every Org existing at install. So a
+deleted, moved or re-created id that Financial ever observed never becomes an
+origin. An Org id that already has any row in the derived org-keyed table set
+(every table with an org_id column at the 0104 state except org_memberships,
+personal_organizations and the H0 observation and roster tables; the list is
+pinned by a test against the schema) never receives a post-seal birth; 0105's Org
+trigger skips it and the 0104 birth guard refuses it, decided at birth time without
+any timestamp. Residual limitations: an id created and deleted before 0105 with no
+row in that set leaves no observation and is indistinguishable from a new Org; and
+the trace partly relies on rows that can be deleted or rewritten (of the set, only
+ledger and stripe_billing_customer_commands are append-only), so a writer with raw
+write access to those tables could erase a trace, the same threat class as forging
+those rows directly. A capture start requires Root's four 0105 Org triggers on orgs (pinned by
+name until Root's official 0105 lands, then by exact SQL). Coverage is scoped per
+Org (a change to another Org does not affect it); the seal keeps the global
+no-change rule, where a framed close and restart is cheap. A spurious replace
+observation from INSERT OR IGNORE or ON CONFLICT DO NOTHING with a different owner
+only refuses that Org's coverage (a per-Org denial of service, never an admission).

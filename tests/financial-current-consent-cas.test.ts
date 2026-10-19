@@ -1,11 +1,12 @@
 import { afterEach, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   readFinancialCurrentConsentCustomerOperationOriginal,
   readFinancialCurrentConsentNativeOriginal,
 } from "../src/financial-current-consent-customer.ts";
 import { createMoneyCutoverSql } from "../src/money-cutover-sql.ts";
-import type { Row, SqlStatement } from "../src/ports.ts";
+import type { Row, Sql, SqlStatement } from "../src/ports.ts";
 import { sharedAuthFinancialConsentLocalCurrentnessStatement } from "../src/shared-auth-financial-consent-store.ts";
 import {
   guardCustomerConsentReceipt,
@@ -16,12 +17,21 @@ import {
   compileCustomerPhase,
 } from "../src/shared-financial-customer-dispatch.ts";
 import {
+  type HistoryEnrollment,
+  type HistoryRoot,
+  prepareHistoryClose,
+  prepareHistoryInventory,
+  prepareHistorySeal,
+  prepareHistoryStart,
+} from "../src/shared-financial-customer-history.ts";
+import {
   completedCustomerReceiptReadStatement,
   readCompletedCustomerReceipt,
   readCustomerJournalSnapshot,
 } from "../src/shared-financial-customer-journal.ts";
 import {
   captureCustomerTrackedPhaseOriginal,
+  createCustomerTrackedExecutionData,
   customerTrackedOriginalReadStatement,
 } from "../src/shared-financial-customer-tracked-execution.ts";
 import {
@@ -148,6 +158,9 @@ test("JSON packing preserves Unicode and BLOB types and refuses malformed UTF-16
 });
 
 const writerEpoch = `sha256:${createHash("sha256").update("writer").digest("hex")}`;
+const ROTATED = `sha256:${"d".repeat(64)}`;
+const MONEY_WORDS =
+  /\b(?:money_cutover_freeze|money_cutover_writer_permit|money_cutover_authorized_epoch)\b/u;
 const issuerDigest = `sha256:${"a".repeat(64)}`;
 const issuerJson = JSON.stringify({
   incarnation: "1",
@@ -185,7 +198,9 @@ async function mechanicalGuard(
   const guarded = guardCustomerConsentReceipt(plan, {
     rp: mechanicalRp(options.rp !== false),
     root: {
-      sql: `EXISTS(SELECT 1 FROM money_cutover_authorized_epoch WHERE writer_epoch=?)${" AND ? IS NOT NULL".repeat(9)}`,
+      // Synthetic Root currentness over a retained epoch column. Like the actual
+      // Auth103 predicate it names no money_cutover_* table.
+      sql: `EXISTS(SELECT 1 FROM shared_customer_challenges WHERE writer_epoch=?)${" AND ? IS NOT NULL".repeat(9)}`,
       params: [
         options.root === false ? "stale" : writerEpoch,
         ...Array(9).fill("held-root-source"),
@@ -199,14 +214,17 @@ async function mechanicalGuard(
     acceptedAt: now - 60_000,
     expiresAt: options.expired ? now - 1 : now + 60_000,
   });
-  expect(guarded.statements).toHaveLength(input.phase === "L1" ? 9 : 8);
-  expect(guarded.firstDispatchResultIndex).toBe(input.phase === "D" ? 2 : null);
+  // Customer statements only: Root's Money writer adds its own permit frame.
+  expect(guarded.statements).toHaveLength(input.phase === "L1" ? 7 : 6);
+  expect(guarded.firstDispatchResultIndex).toBe(input.phase === "D" ? 1 : null);
   expect(guarded.statements.every((s) => (s.params?.length ?? 0) <= 100)).toBe(true);
-  const receiptIndex = input.phase === "L1" ? 4 : 3;
+  for (const statement of guarded.statements) expect(statement.sql).not.toMatch(MONEY_WORDS);
+  const receiptIndex = input.phase === "L1" ? 3 : 2;
   expect(guarded.statements[receiptIndex]?.params).toHaveLength(
     (plan.statements[receiptIndex]?.params?.length ?? 0) + 16,
   );
-  expect(guarded.statements[receiptIndex]?.params).toHaveLength(input.phase === "L1" ? 96 : 98);
+  // consentGuard() carries one bind for its in-statement consent-fence check.
+  expect(guarded.statements[receiptIndex]?.params).toHaveLength(input.phase === "L1" ? 97 : 99);
   if (options.issuer !== false) {
     await f.sql.run(
       "INSERT OR IGNORE INTO shared_auth_financial_consent_issuer_registrations VALUES(?,?,?,?)",
@@ -233,11 +251,14 @@ async function customerCase() {
   return { f, l1 };
 }
 
-test("actual Customer L1 and first-D receipt guards keep 9/8 ACK and D result index 2", async () => {
+test("actual Customer L1 and first-D receipt guards keep 7/6 ACK through the Money writer and D result index 1", async () => {
   const { f, l1 } = await customerCase();
   try {
     const l1Plan = await mechanicalGuard(f, l1);
-    expect((await f.sql.batch(l1Plan.statements)).map((x) => x.changes)).toEqual(Array(9).fill(1));
+    expect((await f.money.batch(l1Plan.statements)).map((x) => x.changes)).toEqual(
+      Array(7).fill(1),
+    );
+    expect(await f.sql.query("SELECT * FROM money_cutover_writer_permit")).toEqual([]);
     const history = await readCustomerJournalSnapshot(f.sql, {
       organizationId: f.org,
       realmRegistration: f.journal.realmRegistration,
@@ -259,10 +280,11 @@ test("actual Customer L1 and first-D receipt guards keep 9/8 ACK and D result in
       dispatchedAt: f.at,
     };
     const dPlan = await mechanicalGuard(f, d);
-    const ack = await f.sql.batch(dPlan.statements);
-    expect(ack.map((x) => x.changes)).toEqual(Array(8).fill(1));
-    expect(dPlan.firstDispatchResultIndex).toBe(2);
-    expect(ack[2]?.changes).toBe(1);
+    const ack = await f.money.batch(dPlan.statements);
+    expect(ack.map((x) => x.changes)).toEqual(Array(6).fill(1));
+    expect(dPlan.firstDispatchResultIndex).toBe(1);
+    expect(ack[1]?.changes).toBe(1);
+    expect(await f.sql.query("SELECT * FROM money_cutover_writer_permit")).toEqual([]);
   } finally {
     f.close();
   }
@@ -284,7 +306,7 @@ test.each(["rp", "root", "issuer", "expired"] as const)(
         tables.map((table) => f.sql.query(`SELECT * FROM ${table}`)),
       );
       const plan = await mechanicalGuard(f, l1, { [failure]: failure === "expired" });
-      await expect(f.sql.batch(plan.statements)).rejects.toThrow();
+      await expect(f.money.batch(plan.statements)).rejects.toThrow();
       for (const [index, table] of tables.entries()) {
         expect(await f.sql.query(`SELECT * FROM ${table}`)).toEqual(before[index] ?? []);
       }
@@ -297,7 +319,7 @@ test.each(["rp", "root", "issuer", "expired"] as const)(
 test("late D RP nonmatch rolls back only the new dispatch and retains completed L1", async () => {
   const { f, l1 } = await customerCase();
   try {
-    await f.sql.batch((await mechanicalGuard(f, l1)).statements);
+    await f.money.batch((await mechanicalGuard(f, l1)).statements);
     const history = await readCustomerJournalSnapshot(f.sql, {
       organizationId: f.org,
       realmRegistration: f.journal.realmRegistration,
@@ -327,7 +349,7 @@ test("late D RP nonmatch rolls back only the new dispatch and retains completed 
     ];
     const before = await Promise.all(tables.map((table) => f.sql.query(`SELECT * FROM ${table}`)));
     const plan = await mechanicalGuard(f, d, { rp: false });
-    await expect(f.sql.batch(plan.statements)).rejects.toThrow();
+    await expect(f.money.batch(plan.statements)).rejects.toThrow();
     for (const [index, table] of tables.entries()) {
       expect(await f.sql.query(`SELECT * FROM ${table}`)).toEqual(before[index] ?? []);
     }
@@ -344,7 +366,9 @@ test("two RP-current rows cannot satisfy the mandatory receipt", async () => {
     const duplicatePlan = guardCustomerConsentReceipt(compileCustomerPhase(l1), {
       rp: { ...duplicateRp, sql: `${duplicateRp.sql} UNION ALL SELECT 1 AS original` },
       root: {
-        sql: `EXISTS(SELECT 1 FROM money_cutover_authorized_epoch WHERE writer_epoch=?)${" AND ? IS NOT NULL".repeat(9)}`,
+        // Synthetic Root currentness over a retained epoch column. Like the actual
+        // Auth103 predicate it names no money_cutover_* table.
+        sql: `EXISTS(SELECT 1 FROM shared_customer_challenges WHERE writer_epoch=?)${" AND ? IS NOT NULL".repeat(9)}`,
         params: [writerEpoch, ...Array(9).fill("held-root-source")],
       },
       issuer: {
@@ -355,25 +379,454 @@ test("two RP-current rows cannot satisfy the mandatory receipt", async () => {
       acceptedAt: Date.now() - 60_000,
       expiresAt: Date.now() + 60_000,
     });
-    await expect(f.sql.batch(duplicatePlan.statements)).rejects.toThrow();
+    await expect(f.money.batch(duplicatePlan.statements)).rejects.toThrow();
     expect(await f.sql.query("SELECT * FROM financial_customer_admissions")).toEqual([]);
   } finally {
     f.close();
   }
 });
 
-test("actual Money request wrapper refuses Customer internal receipt read and guarded batch without effect", async () => {
+test("actual Money writer refuses the Customer internal receipt read but sends the guarded batch; raw Sql cannot", async () => {
   const { f, l1 } = await customerCase();
   try {
     const wrapped = createMoneyCutoverSql(f.sql, writerEpoch);
     const plan = await mechanicalGuard(f, l1);
     const before = await f.sql.query("SELECT * FROM financial_customer_admissions");
+    // The fixed recovery read still names money_cutover_* and stays raw-only.
     await expect(readCompletedCustomerReceipt(wrapped, f.admission.receiptRef)).rejects.toThrow(
       "outside the guarded surface",
     );
-    await expect(wrapped.batch(plan.statements)).rejects.toThrow("outside the guarded surface");
+    // Outside Root's permit frame the Customer fences refuse the whole batch.
+    await expect(f.sql.batch(plan.statements)).rejects.toThrow(/constraint: Financial Customer/u);
     expect(await f.sql.query("SELECT * FROM financial_customer_admissions")).toEqual(before);
+    expect(await f.sql.query("SELECT * FROM stripe_billing_customer_commands")).toEqual([]);
     expect(await f.sql.query("SELECT * FROM money_cutover_writer_permit")).toEqual([]);
+    // The same plan names no money_cutover_* table and commits inside the writer.
+    expect((await wrapped.batch(plan.statements)).map((x) => x.changes)).toEqual(Array(7).fill(1));
+    expect(await f.sql.query("SELECT * FROM financial_customer_admissions")).toHaveLength(1);
+    expect(await f.sql.query("SELECT * FROM money_cutover_writer_permit")).toEqual([]);
+  } finally {
+    f.close();
+  }
+});
+
+const CUSTOMER_ROWS = [
+  "financial_customer_admissions",
+  "stripe_billing_customer_commands",
+  "stripe_customer_admission_links",
+  "financial_customer_admission_receipts",
+  "financial_customer_dispatch_claims",
+  "financial_customer_dispatch_receipts",
+  "financial_customer_history_entries",
+  "financial_customer_history_heads",
+  "financial_customer_history_receipts",
+  "money_cutover_writer_permit",
+] as const;
+async function customerRows(f: Awaited<ReturnType<typeof customerFixture>>) {
+  return Promise.all(CUSTOMER_ROWS.map((table) => f.sql.query(`SELECT * FROM ${table}`)));
+}
+async function dispatchCase(
+  f: Awaited<ReturnType<typeof customerFixture>>,
+  l1: CustomerPhaseInput,
+): Promise<CustomerPhaseInput> {
+  await f.money.batch((await mechanicalGuard(f, l1)).statements);
+  const history = await readCustomerJournalSnapshot(f.sql, {
+    organizationId: f.org,
+    realmRegistration: f.journal.realmRegistration,
+    realmIncarnation: f.journal.realmIncarnation,
+  });
+  if (!history) throw new Error("expected completed L1 history");
+  return {
+    phase: "D",
+    admission: f.admission,
+    history,
+    writerEpoch,
+    couplingAttemptRef: "consent-cas:D-money",
+    entryRef: "consent-cas-entry:D-money",
+    historyReceiptRef: "consent-cas-H1:D-money",
+    claimRef: "consent-cas-claim:D-money",
+    dispatchAttemptRef: "consent-cas-attempt:D-money",
+    dispatchReceiptRef: "consent-cas-receipt:D-money",
+    dispatchedAt: f.at,
+  };
+}
+
+for (const phase of ["L1", "D"] as const)
+  test(`${phase}: freeze, revoked or foreign epoch and a missing permit roll back every Customer and Stripe row`, async () => {
+    const { f, l1 } = await customerCase();
+    try {
+      const input = phase === "L1" ? l1 : await dispatchCase(f, l1);
+      const plan = await mechanicalGuard(f, input);
+      const before = await customerRows(f);
+      const unchanged = async () => expect(await customerRows(f)).toEqual(before);
+      // Freeze.
+      f.db.exec(
+        "INSERT INTO money_cutover_freeze VALUES(1,'binding','origin','backup','writer','source')",
+      );
+      await expect(f.money.batch(plan.statements)).rejects.toThrow(
+        /constraint: Financial Customer/u,
+      );
+      await unchanged();
+      f.db.exec("DELETE FROM money_cutover_freeze");
+      // Revoked epoch: the writer's own permit insert aborts.
+      f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(ROTATED);
+      await expect(f.money.batch(plan.statements)).rejects.toThrow();
+      await unchanged();
+      // Foreign epoch: an authorized permit that is not the retained rows' own epoch.
+      await expect(createMoneyCutoverSql(f.sql, ROTATED).batch(plan.statements)).rejects.toThrow(
+        /constraint: Financial Customer .*permit\/epoch required/u,
+      );
+      await unchanged();
+      f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(writerEpoch);
+      // Missing permit: the same statements on the raw Sql.
+      await expect(f.sql.batch(plan.statements)).rejects.toThrow(/constraint: Financial Customer/u);
+      await unchanged();
+      // The exact plan then commits inside the writer for the authorized epoch.
+      expect((await f.money.batch(plan.statements)).map((x) => x.changes)).toEqual(
+        Array(phase === "L1" ? 7 : 6).fill(1),
+      );
+      expect(await f.sql.query("SELECT * FROM money_cutover_writer_permit")).toEqual([]);
+    } finally {
+      f.close();
+    }
+  });
+
+function countingTransport(f: Awaited<ReturnType<typeof customerFixture>>, calls: string[]): Sql {
+  // The raw backing beneath the Money writer; it records every statement sent.
+  return {
+    async query(sql, params) {
+      calls.push(`query:${sql.slice(0, 24)}`);
+      return f.sql.query(sql, params);
+    },
+    async run(sql, params) {
+      calls.push("run");
+      return f.sql.run(sql, params);
+    },
+    async batch(statements) {
+      calls.push(`batch:${statements.length}`);
+      return f.sql.batch(statements);
+    },
+  };
+}
+
+test("tracked execution refuses a raw, foreign-epoch or foreign-backing writer and an unfenced shape before any statement", async () => {
+  const { f, l1 } = await customerCase();
+  try {
+    const calls: string[] = [];
+    const read = countingTransport(f, calls);
+    const before = await customerRows(f);
+    const unchanged = async () => expect(await customerRows(f)).toEqual(before);
+    for (const write of [
+      read,
+      createMoneyCutoverSql(read, ROTATED),
+      // A real writer for the right epoch over another backing than `read`.
+      createMoneyCutoverSql(countingTransport(f, calls), writerEpoch),
+    ]) {
+      await expect(
+        createCustomerTrackedExecutionData({ read, write }).executePhase(l1),
+      ).rejects.toThrow("Root's Money writer");
+      expect(calls).toEqual([]);
+    }
+    await unchanged();
+    const write = createMoneyCutoverSql(read, writerEpoch);
+    // One missing Customer fence is not the exact fenced shape: no batch is sent.
+    f.db.exec("DROP TRIGGER financial_customer_history_receipts_money_fence");
+    await expect(
+      createCustomerTrackedExecutionData({ read, write }).executePhase(l1),
+    ).rejects.toThrow("exact fenced shape");
+    expect(calls.filter((call) => !call.startsWith("query:"))).toEqual([]);
+    await unchanged();
+  } finally {
+    f.close();
+  }
+});
+
+test("tracked execution commits L1, D and N through the actual Money writer; under freeze the same L1 writes nothing", async () => {
+  const { f, l1 } = await customerCase();
+  try {
+    const calls: string[] = [];
+    const read = countingTransport(f, calls);
+    const write = createMoneyCutoverSql(read, writerEpoch);
+    const before = await customerRows(f);
+    // Freeze: the phase reaches its batch, the fences abort it inside the frame.
+    f.db.exec(
+      "INSERT INTO money_cutover_freeze VALUES(1,'binding','origin','backup','writer','source')",
+    );
+    const frozen = await createCustomerTrackedExecutionData({ read, write }).executePhase(l1);
+    expect(frozen.status).toBe("get-only");
+    if (frozen.status !== "get-only") throw new Error("frozen phase acknowledged");
+    expect(frozen.reason).toBe("batch-outcome-unknown");
+    expect(frozen.observation.status).toBe("no-completed-match");
+    expect(calls.filter((call) => call.startsWith("batch:"))).toEqual(["batch:9"]);
+    expect(await customerRows(f)).toEqual(before);
+    f.db.exec("DELETE FROM money_cutover_freeze");
+    // Unfrozen control: the same L1 original commits and is acknowledged.
+    const tracked = createCustomerTrackedExecutionData({ read, write });
+    const prepared = await tracked.executePhase(l1);
+    expect(prepared.status).toBe("acknowledged-own-phase-data");
+    if (prepared.status !== "acknowledged-own-phase-data") throw new Error("L1 not acknowledged");
+    expect(prepared.acknowledgement.physicalResults).toHaveLength(7);
+    const afterL1 = await customerRows(f);
+    expect(afterL1).not.toEqual(before);
+    expect(await f.sql.query("SELECT state FROM stripe_billing_customer_commands")).toEqual([
+      { state: "prepared" },
+    ]);
+    const snapshot = async () => {
+      const history = await readCustomerJournalSnapshot(f.sql, {
+        organizationId: f.org,
+        realmRegistration: f.journal.realmRegistration,
+        realmIncarnation: f.journal.realmIncarnation,
+      });
+      if (!history) throw new Error("expected Customer history");
+      return history;
+    };
+    const dispatch = {
+      claimRef: "tracked-claim:D",
+      dispatchAttemptRef: "tracked-attempt:D",
+      dispatchReceiptRef: "tracked-receipt:D",
+      dispatchedAt: f.at,
+    };
+    const d: CustomerPhaseInput = {
+      phase: "D",
+      admission: f.admission,
+      history: await snapshot(),
+      writerEpoch,
+      couplingAttemptRef: "tracked:D",
+      entryRef: "tracked-entry:D",
+      historyReceiptRef: "tracked-H1:D",
+      ...dispatch,
+    };
+    const dispatched = await tracked.executePhase(d);
+    expect(dispatched.status).toBe("acknowledged-own-phase-data");
+    if (dispatched.status !== "acknowledged-own-phase-data") throw new Error("D not acknowledged");
+    expect(dispatched.acknowledgement.physicalResults).toHaveLength(6);
+    expect(dispatched.acknowledgement.dispatchCasChanges).toBe(1);
+    const n: CustomerPhaseInput = {
+      phase: "N",
+      admission: f.admission,
+      history: await snapshot(),
+      writerEpoch,
+      couplingAttemptRef: "tracked:N",
+      entryRef: "tracked-entry:N",
+      historyReceiptRef: "tracked-H1:N",
+      ...dispatch,
+      custodyReceiptRef: "tracked-custody:N",
+      verifiedAt: f.at,
+      nativeOriginal: {
+        organizationId: f.org,
+        commandKey: f.admission.original.key,
+        fingerprint: f.admission.original.fingerprint,
+        realmJson: f.admission.original.realmJson,
+        requestJson: f.admission.original.requestJson,
+        customerId: "cus_TrackedN",
+      },
+    };
+    const verified = await tracked.executePhase(n);
+    expect(verified.status).toBe("acknowledged-own-phase-data");
+    if (verified.status !== "acknowledged-own-phase-data") throw new Error("N not acknowledged");
+    expect(verified.acknowledgement.physicalResults).toHaveLength(6);
+    expect(await f.sql.query("SELECT org_id,customer_id FROM stripe_billing_customers")).toEqual([
+      { org_id: f.org, customer_id: "cus_TrackedN" },
+    ]);
+    expect(
+      await f.sql.query("SELECT state,customer_id FROM stripe_billing_customer_commands"),
+    ).toEqual([{ state: "verified", customer_id: "cus_TrackedN" }]);
+    expect(calls.filter((call) => call.startsWith("batch:"))).toEqual([
+      "batch:9",
+      "batch:9",
+      "batch:8",
+      "batch:8",
+    ]);
+    expect(await f.sql.query("SELECT * FROM money_cutover_writer_permit")).toEqual([]);
+    // GET-only recovery reads the raw port and finds the retained N original.
+    const recovered = await createCustomerTrackedExecutionData({ read, write }).readOriginal(n);
+    expect(recovered.observation.status).toBe("matching-original");
+  } finally {
+    f.close();
+  }
+});
+
+for (const change of [
+  "UPDATE orgs SET owner_principal_id='principal:other' WHERE id=?",
+  "INSERT OR REPLACE INTO orgs(id,name,owner_principal_id,created_at) SELECT id,name,owner_principal_id,'2027-01-01T00:00:00.000Z' FROM orgs WHERE id=?",
+])
+  test(`an Org identity change after the H0 seal invalidates Customer coverage: ${change.slice(0, 22)}`, async () => {
+    const { f, l1 } = await customerCase();
+    try {
+      const plan = await mechanicalGuard(f, l1);
+      const before = await customerRows(f);
+      expect(
+        await readCustomerJournalSnapshot(f.sql, {
+          organizationId: f.org,
+          realmRegistration: f.journal.realmRegistration,
+          realmIncarnation: f.journal.realmIncarnation,
+        }),
+      ).not.toBeNull();
+      // Root's Org trigger only appends a change observation (or, for a REPLACE that
+      // keeps the owner, nothing): coverage re-checks the live Org identity.
+      await f.sql.run(change, [f.org]);
+      expect(
+        await readCustomerJournalSnapshot(f.sql, {
+          organizationId: f.org,
+          realmRegistration: f.journal.realmRegistration,
+          realmIncarnation: f.journal.realmIncarnation,
+        }),
+      ).toBeNull();
+      await expect(f.money.batch(plan.statements)).rejects.toThrow();
+      expect(await customerRows(f)).toEqual(before);
+    } finally {
+      f.close();
+    }
+  });
+
+test("every Customer and H0 statement and every 0104 trigger compile within D1's depth-100 and 100-bind limits", async () => {
+  const { f, l1 } = await customerCase();
+  try {
+    const ddl = (
+      f.db
+        .query(
+          "SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY rowid",
+        )
+        .all() as { sql: string }[]
+    ).map((row) => row.sql);
+    const statements: { label: string; sql: string; params: (string | number | null)[] }[] = [];
+    const add = (label: string, statement: SqlStatement) =>
+      statements.push({
+        label,
+        sql: statement.sql,
+        params: (statement.params ?? []).map((value) =>
+          value instanceof ArrayBuffer ? null : (value as string | number | null),
+        ),
+      });
+    const history = f.journal;
+    const dispatch = {
+      claimRef: "depth-claim",
+      dispatchAttemptRef: "depth-attempt",
+      dispatchReceiptRef: "depth-receipt",
+      dispatchedAt: f.at,
+    };
+    const d: CustomerPhaseInput = { ...l1, phase: "D", history, ...dispatch };
+    const n: CustomerPhaseInput = {
+      ...l1,
+      phase: "N",
+      history,
+      ...dispatch,
+      custodyReceiptRef: "depth-custody",
+      verifiedAt: f.at,
+      nativeOriginal: {
+        organizationId: f.org,
+        commandKey: f.admission.original.key,
+        fingerprint: f.admission.original.fingerprint,
+        realmJson: f.admission.original.realmJson,
+        requestJson: f.admission.original.requestJson,
+        customerId: "cus_Depth",
+      },
+    };
+    for (const input of [l1, d, n]) {
+      const plan =
+        input.phase === "N" ? compileCustomerPhase(input) : await mechanicalGuard(f, input);
+      for (const [index, statement] of plan.statements.entries())
+        add(`${input.phase}[${index}]`, statement);
+    }
+    add("completed-read", completedCustomerReceiptReadStatement(f.admission.receiptRef));
+    const rootRow = f.db.query("SELECT root_json FROM financial_history_primary_roots").get() as {
+      root_json: string;
+    };
+    const runRow = f.db
+      .query(
+        "SELECT enrollment_ref,enrollment_incarnation,generation,expected_start_receipt_ref,expected_seal_ref,required_json FROM financial_history_enrollments",
+      )
+      .get() as Record<string, string | number>;
+    const root = JSON.parse(rootRow.root_json) as HistoryRoot;
+    const run: HistoryEnrollment = {
+      enrollmentRef: String(runRow.enrollment_ref),
+      enrollmentIncarnation: String(runRow.enrollment_incarnation),
+      generation: Number(runRow.generation),
+      startReceiptRef: String(runRow.expected_start_receipt_ref),
+      sealReceiptRef: String(runRow.expected_seal_ref),
+      previousStartReceiptRef: null,
+      previousSealRef: null,
+      required: JSON.parse(String(runRow.required_json)),
+    };
+    for (const [i, s] of prepareHistoryStart(root, run).entries()) add(`H0-start[${i}]`, s);
+    const first = run.required[0];
+    if (!first) throw new Error("required scope missing");
+    add("H0-inventory", prepareHistoryInventory(root, run, first, "inventory:depth"));
+    for (const [i, s] of prepareHistorySeal(root, run, 0).entries()) add(`H0-seal[${i}]`, s);
+    add("H0-close", prepareHistoryClose(root, run));
+    // Root's Org DML with every 0104 and Org capture trigger compiled in.
+    const org = { sql: "", params: [] as (string | number | null)[] };
+    for (const [label, sql] of [
+      ["org-insert", "INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES(?,?,?,?)"],
+      [
+        "org-upsert-login",
+        "INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name = excluded.name, owner_principal_id = excluded.owner_principal_id",
+      ],
+      [
+        "org-replace",
+        "INSERT OR REPLACE INTO orgs(id,name,owner_principal_id,created_at) VALUES(?,?,?,?)",
+      ],
+      ["org-update", "UPDATE orgs SET owner_principal_id=?,name=?,created_at=? WHERE id=?"],
+      [
+        "org-delete",
+        "DELETE FROM orgs WHERE id=? AND name<>? AND owner_principal_id<>? AND created_at<>?",
+      ],
+    ] as const) {
+      org.sql = sql;
+      org.params = ["org:depth", "Depth", "principal:depth", f.at];
+      add(label, { ...org });
+    }
+    const python = `import json,sqlite3,sys
+p=json.load(sys.stdin)
+c=sqlite3.connect(':memory:')
+c.execute('PRAGMA foreign_keys=OFF')
+c.setlimit(sqlite3.SQLITE_LIMIT_EXPR_DEPTH,100)
+c.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER,100)
+bad=[]
+for s in p['ddl']:
+ try: c.execute(s)
+ except Exception as e: bad.append(['ddl',s[:60],str(e)])
+for q in p['statements']:
+ try: c.execute('EXPLAIN '+q['sql'],q['params'])
+ except Exception as e: bad.append([q['label'],str(e)])
+print(json.dumps({'bad':bad,'depth':c.getlimit(sqlite3.SQLITE_LIMIT_EXPR_DEPTH),'binds':c.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)}))`;
+    const run2 = spawnSync("python3", ["-c", python], {
+      input: JSON.stringify({ ddl, statements }),
+      encoding: "utf8",
+      timeout: 20_000,
+    });
+    expect(run2.status, run2.stderr).toBe(0);
+    expect(JSON.parse(run2.stdout)).toEqual({ bad: [], depth: 100, binds: 100 });
+    expect(statements.length).toBeGreaterThan(25);
+  } finally {
+    f.close();
+  }
+});
+
+test("coverage is scoped per Org: another Org's change leaves it valid, its own change refuses", async () => {
+  const { f, l1 } = await customerCase();
+  try {
+    const snapshot = () =>
+      readCustomerJournalSnapshot(f.sql, {
+        organizationId: f.org,
+        realmRegistration: f.journal.realmRegistration,
+        realmIncarnation: f.journal.realmIncarnation,
+      });
+    await f.sql.run(
+      "INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:other','Other','principal:other',?)",
+      [f.at],
+    );
+    await f.sql.run("UPDATE orgs SET owner_principal_id='principal:moved' WHERE id='org:other'");
+    await f.sql.run("DELETE FROM orgs WHERE id='org:other'");
+    expect(
+      await f.sql.query("SELECT change_kind FROM financial_customer_history_org_changes"),
+    ).toHaveLength(2);
+    expect(await snapshot()).not.toBeNull();
+    // The guarded L1 still commits through the actual writer.
+    const plan = await mechanicalGuard(f, l1);
+    expect((await f.money.batch(plan.statements)).map((x) => x.changes)).toEqual(Array(7).fill(1));
+    await f.sql.run("UPDATE orgs SET created_at='2027-01-01T00:00:00.000Z' WHERE id=?", [f.org]);
+    expect(await snapshot()).toBeNull();
   } finally {
     f.close();
   }

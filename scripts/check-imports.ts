@@ -671,6 +671,12 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain"],
   },
   {
+    // Exact Financial 0104 Customer schema leaves and the read-only write-shape check.
+    name: "domain",
+    match: /^src\/financial-0104-customer-schema\.ts$/u,
+    may: ["core", "domain"],
+  },
+  {
     // Financial 0104 source recipe DATA over existing Financial schema leaves.
     // It registers or applies nothing; Root owns the canonical inventory.
     name: "app",
@@ -726,6 +732,12 @@ const LAYERS: readonly Layer[] = [
     match:
       /^src\/(?:shared-auth-financial-(?:source|consent|consent-issuer)|shared-financial-customer-tracked-execution|financial-current-consent-customer)\.ts$/u,
     may: ["core", "domain", "app"],
+  },
+  {
+    // Root 0105 Org history capture recipe DATA; it imports nothing.
+    name: "domain",
+    match: /^src\/root-0105-org-capture-triggers\.ts$/u,
+    may: ["core", "domain"],
   },
   {
     // Shared app name policy belongs to the existing origin reservation domain.
@@ -873,8 +885,9 @@ const EXACT_CONTAINER_ADAPTER_IMPORTS: readonly {
   },
 ];
 
-/** Financial M/G/receiver writers bind their configured writer epoch exactly as
- * R1 does, through the Money writer origin assertion only. No other adapter access. */
+/** Financial M/G/receiver and Customer admission/history/tracked/current-consent
+ * writers bind their writer epoch exactly as R1 does, through the Money writer
+ * origin assertion only. No other adapter access. */
 const EXACT_FINANCIAL_MONEY_ORIGIN_IMPORTS: readonly {
   readonly source: string;
   readonly target: string;
@@ -884,12 +897,25 @@ const EXACT_FINANCIAL_MONEY_ORIGIN_IMPORTS: readonly {
   "src/shared-financial-source.ts",
   "src/shared-financial-source-enrollment.ts",
   "src/shared-financial-source-genesis-admission.ts",
-].map((source) => ({
-  source,
-  target: "src/money-cutover-sql.ts",
-  typeOnly: false,
-  names: ["assertMoneyCutoverSqlOrigin"],
-}));
+  "src/shared-financial-admission.ts",
+  "src/shared-financial-customer-history.ts",
+  "src/financial-current-consent-customer.ts",
+]
+  .map((source) => ({
+    source,
+    target: "src/money-cutover-sql.ts",
+    typeOnly: false,
+    names: ["assertMoneyCutoverSqlOrigin"],
+  }))
+  .concat([
+    {
+      // Customer tracked execution binds its Money writer to its raw read backing.
+      source: "src/shared-financial-customer-tracked-execution.ts",
+      target: "src/money-cutover-sql.ts",
+      typeOnly: false,
+      names: ["assertMoneyCutoverSqlBackingOrigin"],
+    },
+  ]);
 
 function exactContainerAdapterImportEdge(path: string, target: string): boolean {
   const expected = [
@@ -1486,6 +1512,25 @@ if (existsSync(EXACT_RECOVERY_ENTRY)) {
         `${EXACT_RECOVERY_ENTRY} transitively imports public route module ${forbidden}`,
       );
     }
+  }
+}
+
+// The ungated Customer tracked-execution form exists only for the current-consent
+// executor, whose transport reaches nothing but Root's framing receiver and which
+// gates the Money writer origin and fenced shape itself. No other file may name it.
+const ROOT_RECEIVER_TRACKED_EXECUTION = "createCustomerTrackedExecutionOverRootReceiver";
+const ROOT_RECEIVER_TRACKED_EXECUTION_FILES = [
+  "src/shared-financial-customer-tracked-execution.ts",
+  "src/financial-current-consent-customer.ts",
+];
+for (const root of roots) {
+  for (const path of walk(root)) {
+    if (!path.endsWith(".ts") || ROOT_RECEIVER_TRACKED_EXECUTION_FILES.includes(path)) continue;
+    if (path === "scripts/check-imports.ts") continue;
+    if (readFileSync(path, "utf8").includes(ROOT_RECEIVER_TRACKED_EXECUTION))
+      violations.push(
+        `${path}: ${ROOT_RECEIVER_TRACKED_EXECUTION} is the current-consent executor's form only`,
+      );
   }
 }
 

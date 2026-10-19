@@ -489,9 +489,9 @@ export function auth103SourceSchemaReady(
     const source = readAuth103CanonicalMigrationSource(sourceRoot);
     try {
       if (JSON.stringify(input.local) !== JSON.stringify(source.physicalNames)) return false;
-      // A physical Financial0104 successor leaves 0104 pending for a normal
-      // Host; only the separate Financial0104 readiness accepts its exact104.
-      if (mode === "normal" && source.physicalNames.length === 104) return false;
+      // A physical post-Auth103 successor leaves it pending for a normal Host;
+      // only the separate post-Auth103 readiness accepts exact104/exact105.
+      if (mode === "normal" && source.physicalNames.length > 103) return false;
       const count = input.applied.length;
       if (
         (count !== 100 && count !== 103) ||

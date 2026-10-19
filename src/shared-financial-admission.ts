@@ -2,13 +2,16 @@
  * Original Root depth100 failures and missing enrollment/payer/history writers remain unqualified.
  */
 
+import { assertFinancial0104CustomerWriteShape } from "./financial-0104-customer-schema.ts";
+import { isFinancialCustomerMoneyFencedBatch } from "./financial-0104-money-fence.ts";
 import { canonicalDigest, canonicalJson } from "./json.ts";
-import type { JsonObject, Sql, SqlParam, SqlStatement } from "./ports.ts";
+import { assertMoneyCutoverSqlOrigin } from "./money-cutover-sql.ts";
+import { type JsonObject, type Sql, SqlError, type SqlParam, type SqlStatement } from "./ports.ts";
 import type {
   SharedFinancialAction,
   SharedFinancialActionIdentity,
 } from "./shared-financial-action.ts";
-import { type ConsentCandidate, guard } from "./shared-financial-consent-data.ts";
+import { type ConsentCandidate, consentGuard } from "./shared-financial-consent-data.ts";
 
 export interface SharedCustomerAdmissionInput {
   readonly action: SharedFinancialAction;
@@ -97,10 +100,13 @@ const COMPLETED = `FROM shared_customer_challenges c
  JOIN financial_payer_grants g ON g.challenge_ref=c.challenge_ref
  JOIN financial_payer_consent_witnesses w ON w.grant_ref=g.grant_ref AND w.challenge_ref=g.challenge_ref
  JOIN financial_payer_consent_receipts cr ON cr.grant_ref=g.grant_ref AND cr.challenge_ref=g.challenge_ref`;
+/** Every L1/D row is 0104 money-fenced, so the consent currentness guard is the
+ * money-free consentGuard(); freeze, permit and epoch are the fences inside Root's
+ * Money writer. */
 function completeGuard(q: CustomerAdmissionCandidate) {
   const { consent } = q.input;
   const org = q.identity.action.organizationId;
-  const g = guard(consent, org);
+  const g = consentGuard(consent, org);
   return {
     sql: `(${g.sql}
      AND (((((g.grant_ref IS ?
@@ -163,14 +169,15 @@ function completeGuard(q: CustomerAdmissionCandidate) {
 /** One keyed row at most: challenge PK -> grant/witness/receipt UNIQUE ->
  * admission UNIQUE challenge -> command/link PK organization. All old B S4
  * conditions are retained on the join that first has their aliases in scope.
- * Root's guard text and its parameter order are used without modification.
+ * Root's guard text and its parameter order are used without modification, in
+ * the money-free consentGuard() form: every row it gates is 0104 money-fenced.
  */
 export function prepareCustomerCompletionProof(
   q: CustomerAdmissionCandidate,
   state: "prepared" | "dispatched",
 ): { readonly sql: string; readonly params: readonly SqlParam[] } {
   const consent = q.input.consent;
-  const root = guard(consent, q.identity.action.organizationId);
+  const root = consentGuard(consent, q.identity.action.organizationId);
   const grantParams: SqlParam[] = [
     consent.grantRef,
     consent.grantIncarnation,
@@ -320,9 +327,28 @@ export function prepareCustomerAdmissionBatch(
       ...completed.params,
     ],
   };
-  return [first, second, third, last];
+  const statements = [first, second, third, last];
+  // Every statement writes a Financial-fenced table or a Root Money-guard Stripe table.
+  if (!isFinancialCustomerMoneyFencedBatch(statements))
+    throw new SqlError("invalid", "Customer admission batch must write only money-fenced tables");
+  return statements;
 }
-export function createSharedFinancialAdmissionComponent(sql: Sql) {
+/** Root hands this component only its Money writer, created for exactly the
+ * configured writer epoch (as R1 binds its epoch). A raw Sql or a writer for any
+ * other epoch is refused before any SQL, and the write requires the exact fenced
+ * 0104 Customer shape. */
+export function createSharedFinancialAdmissionComponent(
+  sql: Sql,
+  context: { readonly writerEpoch: string },
+) {
+  const writerEpoch = context.writerEpoch;
+  function framed(): void {
+    try {
+      assertMoneyCutoverSqlOrigin(sql, { writerEpoch });
+    } catch {
+      throw new SqlError("unavailable", "Customer admission writer must be Root's Money writer");
+    }
+  }
   async function read(q: CustomerAdmissionCandidate): Promise<CustomerL1Receipt | null> {
     const rows = await sql.query(
       `SELECT a.*,r.receipt_ref FROM financial_customer_admissions a
@@ -357,11 +383,14 @@ export function createSharedFinancialAdmissionComponent(sql: Sql) {
   return {
     readCustomerAdmission: read,
     async acceptCustomerCreation(q: CustomerAdmissionCandidate): Promise<CustomerL1Receipt> {
+      framed();
       // Historical exact readback comes first. It confers no current dispatch or business authority.
       const prior = await read(q);
       if (prior) return prior;
+      const statements = prepareCustomerAdmissionBatch(q);
+      await assertFinancial0104CustomerWriteShape(sql);
       try {
-        await sql.batch(prepareCustomerAdmissionBatch(q));
+        await sql.batch(statements);
       } catch (error) {
         const committed = await read(q);
         if (committed) return committed;

@@ -88,6 +88,11 @@ export async function fixture(
   installFinancial0104Fences(db, { consent: true });
   db.exec(readFileSync(`${PACKET}/shared-financial-customer-history-component-schema.sql`, "utf8"));
   db.exec(readFileSync(`${PACKET}/customer-journal-schema.unnumbered.sql`, "utf8"));
+  // The Customer L1/H0/journal candidates plus their exact 0104 money fences: the
+  // fenced 0104 Customer shape every Customer write requires. Customer rows are
+  // therefore written only inside the actual Money writer's permit frame below.
+  installFinancial0104Fences(db, { customer: true });
+  const money = createMoneyCutoverSql(sql, S("writer"));
   const now = Date.now(),
     created = iso(now - 60000),
     expires = iso(now + 3600000),
@@ -131,8 +136,9 @@ export async function fixture(
     [created],
   );
   await sql.run(`INSERT INTO money_cutover_authorized_epoch VALUES(1,?)`, [S("writer")]);
-  const consentWriter = createMoneyCutoverSql(sql, S("writer"));
-  const h0 = await setupH0(sql, financialRealm);
+  // Consent and Customer rows share the one actual Money writer for this epoch.
+  const consentWriter = money;
+  const h0 = await setupH0(money, financialRealm);
   await sql.run("INSERT INTO orgs(id,name,owner_principal_id,created_at)VALUES(?,?,?,?)", [
     org,
     "synthetic",
@@ -494,7 +500,7 @@ export async function fixture(
     customerOriginal,
     at,
   );
-  const journal = await seedJournal(sql, org, customerOriginal.realmJson, h0, at);
+  const journal = await seedJournal(sql, money, org, customerOriginal.realmJson, h0, at);
   const snapshot = async (tables = names) => {
     const rows: Record<string, unknown> = {};
     for (const table of tables)
@@ -516,6 +522,7 @@ export async function fixture(
     db,
     sql,
     consentWriter,
+    money,
     input,
     org,
     created,
@@ -606,6 +613,7 @@ async function setupH0(sql: Sql, financialRealm: string) {
 }
 async function seedJournal(
   sql: Sql,
+  money: Sql,
   org: string,
   realmJson: string,
   h0: Awaited<ReturnType<typeof setupH0>>,
@@ -623,7 +631,7 @@ async function seedJournal(
   const historyRef = "history:synthetic-unqualified",
     genesis = "history-entry:genesis",
     receipt = "history-receipt:genesis";
-  await sql.run(
+  await money.run(
     `INSERT INTO financial_customer_history_coverages(history_ref,coverage_incarnation,attempt_ref,expected_receipt_ref,coverage_kind,original_org_origin,organization_id,primary_ref,enrollment_ref,complete_seal_ref,seal_kind,realm_registration,realm_incarnation,realm_json,required_scopes_json,writer_epoch,previous_history_ref,created_at)
     VALUES(?,?,?,?,'qualified-genesis',?,?,?,?,?,'complete-seal',?,?,?,?,?,NULL,?)`,
     [
@@ -645,7 +653,7 @@ async function seedJournal(
     ],
   );
   for (const [i, item] of h0.run.required.entries())
-    await sql.run(
+    await money.run(
       `INSERT INTO financial_customer_history_scopes(scope_ref,history_ref,inventory_ref,scope_kind,original_scope_ref,original_scope_incarnation,evidence_json) VALUES(?,?,?,?,?,?,?)`,
       [
         `scope:${i}`,
@@ -657,12 +665,12 @@ async function seedJournal(
         canonicalJson(item),
       ],
     );
-  await sql.run(
+  await money.run(
     `INSERT INTO financial_customer_history_entries(entry_ref,history_ref,journal_sequence,ordinal,writer_kind,evidence_kind,transition_ref,coupling_attempt_ref,expected_history_receipt_ref,command_before_exists,binding_before_exists,binding_after_exists,recorded_at)
     VALUES(?,?,0,0,'customer-custody','genesis',?,?,?,0,0,0,?)`,
     [genesis, historyRef, receipt, "history-attempt:genesis", receipt, at],
   );
-  await sql.run(`INSERT INTO financial_customer_history_heads VALUES(?,?,?,?,0,?,?,'active')`, [
+  await money.run(`INSERT INTO financial_customer_history_heads VALUES(?,?,?,?,0,?,?,'active')`, [
     birth.birth_ref,
     "realm-registration:synthetic",
     "realm-inc:1",
@@ -670,7 +678,7 @@ async function seedJournal(
     genesis,
     receipt,
   ]);
-  await sql.run(
+  await money.run(
     `INSERT INTO financial_customer_history_receipts(receipt_ref,attempt_ref,history_ref,journal_sequence,original_org_origin,realm_registration,realm_incarnation,entry_ref,evidence_kind,all_rows_match,created_at)
     VALUES(?,?,?,0,?,?,?,?,'genesis',1,?)`,
     [

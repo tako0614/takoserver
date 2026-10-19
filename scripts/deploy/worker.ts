@@ -269,7 +269,8 @@ export function workerSchemaAllowsPending(
     target.moneyCutoverWriterPolicy === undefined &&
     (migrations.local.length === 100 ||
       migrations.local.length === 103 ||
-      migrations.local.length === 104)
+      migrations.local.length === 104 ||
+      migrations.local.length === 105)
   ) {
     return financial0104SourceSchemaReady(migrations, sourceRepositoryRoot, "normal");
   }
@@ -427,9 +428,10 @@ export function workerSelectedPendingMigrations(
       source.dispose();
     }
   }
-  // The separate Root-registered Financial0104 successor of that same exact103.
+  // The separate Root post-Auth103 chain (Financial0104, then Root0105) of that
+  // same exact103.
   if (
-    migrations.applied.length === 104 &&
+    (migrations.applied.length === 104 || migrations.applied.length === 105) &&
     target.environment === "integration" &&
     target.artifactBlobIoMode === undefined &&
     (target.schemaMaintenanceMode === undefined ||
@@ -455,9 +457,14 @@ export function workerMoneyUnitSchemaReady(
   if (
     migrations.local.length === 103 ||
     migrations.local.length === 104 ||
+    migrations.local.length === 105 ||
     (migrations.local.length === 100 && migrations.applied.length === 103) ||
     ((migrations.local.length === 100 || migrations.local.length === 103) &&
-      migrations.applied.length === 104)
+      migrations.applied.length === 104) ||
+    ((migrations.local.length === 100 ||
+      migrations.local.length === 103 ||
+      migrations.local.length === 104) &&
+      migrations.applied.length === 105)
   ) {
     return financial0104SourceSchemaReady(migrations, sourceRepositoryRoot, "normal");
   }

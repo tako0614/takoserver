@@ -29,8 +29,11 @@ import { readFinancial0104CanonicalMigrationSource } from "./financial0104-canon
 import { FINANCIAL0104_MIGRATION_NAME, financial0104RootRecipe } from "./financial0104-recipe.ts";
 import {
   compileFinancial0104ImportShapes,
+  compileRoot0105ImportShapes,
   type Financial0104Profile,
   financial0104CatalogPredicate,
+  moneyStripeCustomerGuardInstallSql,
+  root0105CatalogPredicate,
 } from "./financial0104-schema-shape.ts";
 import { type D1SchemaState, type MigrationArtifact, readD1SchemaState } from "./migrations.ts";
 import {
@@ -41,6 +44,7 @@ import {
   wranglerCommand,
 } from "./process.ts";
 import { qualifySource } from "./qualification.ts";
+import { ROOT0105_MIGRATION_NAME, root0105Recipe } from "./root0105-recipe.ts";
 import {
   boundPredicate,
   ledgerPredicate,
@@ -53,9 +57,10 @@ import { acquireWranglerVersionPublicationLease } from "./wrangler-state.ts";
 const SHA256 = /^sha256:[0-9a-f]{64}$/u;
 const ROLLBACK = "forward repair only after dispatch; JS postconditions do not prove rollback";
 
-/** A Money-preserved target admits 0104 only AFTER its post103 thaw: Money's
- * own release guard is pinned to the exact 103 ledger, so 104 never runs while
- * the original freeze row, a stray permit or another epoch remains. */
+/** A Money-preserved target admits 0104 (and later 0105) only AFTER its post103
+ * thaw: Money's own release guard is pinned to the exact 103 ledger, so the
+ * chain never runs while the original freeze row, a stray permit or another
+ * epoch remains. */
 export function financial0104MoneyThawedPredicate(writerEpoch: string): string {
   if (!SHA256.test(writerEpoch))
     throw preflightError("Financial0104 Money profile requires the exact writer epoch");
@@ -71,6 +76,7 @@ export function financial0104MoneyThawedPredicate(writerEpoch: string): string {
 }
 
 export interface Financial0104ImportInput {
+  /** The TARGET chain artifact: 104 files (0104 step) or 105 files (0105 step). */
   readonly artifact: MigrationArtifact;
   readonly prefixShape: string;
   readonly postShape: string;
@@ -79,43 +85,70 @@ export interface Financial0104ImportInput {
   readonly moneyWriterEpoch?: string;
 }
 
-/** Exact first/final guards around the unchanged ledger import of ONE 0104. */
+/** Exact first/final guards around the unchanged ledger import of ONE chain
+ * step: exact103 -> 0104, or exact104 -> 0105. Each step's after-state must be
+ * exact; the 0105 step also requires the exact Financial catalog before it. */
 export function financial0104ImportPredicates(input: Financial0104ImportInput) {
   const recipe = financial0104RootRecipe();
-  const file = input.artifact.files[103];
+  const count = input.artifact.files.length;
+  const file104 = input.artifact.files[103];
+  const file105 = input.artifact.files[104];
+  const expectedNames =
+    count === 104
+      ? [...AUTH103_NATIVE_MIGRATIONS, FINANCIAL0104_MIGRATION_NAME]
+      : [...AUTH103_NATIVE_MIGRATIONS, FINANCIAL0104_MIGRATION_NAME, ROOT0105_MIGRATION_NAME];
   if (
-    input.artifact.files.length !== 104 ||
-    file === undefined ||
-    JSON.stringify(input.artifact.names.slice(100)) !==
-      JSON.stringify([...AUTH103_NATIVE_MIGRATIONS, FINANCIAL0104_MIGRATION_NAME]) ||
-    file.digest !== recipe.digest ||
-    readFileSync(file.path, "utf8") !== recipe.sql
+    (count !== 104 && count !== 105) ||
+    file104 === undefined ||
+    JSON.stringify(input.artifact.names.slice(100)) !== JSON.stringify(expectedNames) ||
+    file104.digest !== recipe.digest ||
+    readFileSync(file104.path, "utf8") !== recipe.sql ||
+    (count === 105 &&
+      (file105 === undefined ||
+        file105.digest !== root0105Recipe().digest ||
+        readFileSync(file105.path, "utf8") !== root0105Recipe().sql))
   )
-    throw preflightError("Financial0104 import requires the exact Auth103 artifact plus 0104");
+    throw preflightError(
+      count === 105
+        ? "Root0105 import requires the exact Auth103 artifact plus 0104 and 0105"
+        : "Financial0104 import requires the exact Auth103 artifact plus 0104",
+    );
   const auth103 = boundPredicate(AUTH103_NATIVE_CURRENT_PREDICATE, [
     ...input.registration,
     input.auth103CatalogJson,
   ]);
+  const profile: Financial0104Profile =
+    input.moneyWriterEpoch === undefined ? "ordinary" : "money-preserved";
   const money =
     input.moneyWriterEpoch === undefined
       ? ""
       : ` AND (${financial0104MoneyThawedPredicate(input.moneyWriterEpoch)})`;
+  const financial = ` AND ${financial0104CatalogPredicate(profile)}`;
   return Object.freeze({
-    before: `${ledgerPredicate(input.artifact.names.slice(0, 103))} AND ${auth103} AND ${originalShapePredicate(input.prefixShape)}${money}`,
-    after: `${ledgerPredicate(input.artifact.names)} AND ${auth103} AND ${originalShapePredicate(input.postShape)} AND ${financial0104CatalogPredicate()}${money}`,
+    before: `${ledgerPredicate(input.artifact.names.slice(0, count - 1))} AND ${auth103} AND ${originalShapePredicate(input.prefixShape)}${count === 105 ? financial : ""}${money}`,
+    after: `${ledgerPredicate(input.artifact.names)} AND ${auth103} AND ${originalShapePredicate(input.postShape)}${financial}${count === 105 ? ` AND ${root0105CatalogPredicate()}` : ""}${money}`,
   });
 }
 
 /** SQL DATA composer only. The unchanged ledger importer is the only migration
- * composer; the false branch of each guard raises a real SQL error. */
+ * composer; the false branch of each guard raises a real SQL error. On a
+ * Money-preserved 0104 step the Money guard's Stripe customer generation is
+ * installed in the same import, after 0104 creates its link table. */
 export function composeFinancial0104ImportData(
   input: Financial0104ImportInput,
 ): D1MigrationImportArtifact {
   const { before, after } = financial0104ImportPredicates(input);
-  const migration = buildD1MigrationImport(input.artifact.files.slice(103), { freshLedger: false });
+  const count = input.artifact.files.length;
+  const migration = buildD1MigrationImport(input.artifact.files.slice(count - 1), {
+    freshLedger: false,
+  });
+  const stripe =
+    count === 104 && input.moneyWriterEpoch !== undefined
+      ? `${moneyStripeCustomerGuardInstallSql()}\n`
+      : "";
   const guard = (predicate: string) =>
     `SELECT json(CASE WHEN (${predicate}) IS 1 THEN '{}' ELSE '!' END);\n`;
-  const sql = `${guard(before)}${migration.sql}\n${guard(after)}`;
+  const sql = `${guard(before)}${migration.sql}\n${stripe}${guard(after)}`;
   return Object.freeze({
     sql,
     digest: `sha256:${createHash("sha256").update(sql).digest("hex")}`,
@@ -149,17 +182,21 @@ function writeD1Config(path: string, target: DeployTarget, migrationDirectory: s
 }
 
 /**
- * Separate integration-only Root registration of Financial0104 after the
- * unchanged Auth103 installation. One guarded import: exact103 ledger, current
- * Auth103 registration/catalog and exact post103 shape (thawed Money when that
- * profile applies) -> unchanged 0104 + ledger insert -> exact104 ledger, exact
- * post104 shape and Financial catalog. Dispatch is recorded once; replay never.
+ * Separate integration-only Root post-Auth103 chain, one step per invocation.
+ * 0104: exact103 ledger, current Auth103 registration/catalog and exact post103
+ * shape (thawed Money when that profile applies) -> unchanged 0104 + ledger
+ * insert (+ the Money guard's Stripe customer generation when Money-preserved)
+ * -> exact104 ledger, exact post104 shape and Financial catalog.
+ * 0105: that exact104 state -> unchanged Root 0105 + ledger insert -> exact105
+ * ledger, exact post105 shape, Financial catalog and Root 0105 objects.
+ * Each step's dispatch is recorded once; replay never.
  */
 export async function runD1SchemaFinancial0104(
   invocation: {
     readonly action: "status" | "apply";
     readonly environment: "integration";
     readonly commit: string;
+    readonly throughMigration?: "0104" | "0105";
   },
   target: DeployTarget,
   productionD1: { readonly databaseId: string; readonly databaseName: string },
@@ -180,6 +217,10 @@ export async function runD1SchemaFinancial0104(
   )
     throw preflightError("Financial0104 Money profile is not the exact fenced writer policy");
   const profile: Financial0104Profile = moneyPreserved ? "money-preserved" : "ordinary";
+  const step = invocation.throughMigration ?? "0104";
+  if (step !== "0104" && step !== "0105")
+    throw preflightError("post-Auth103 chain step is not registered");
+  const label = step === "0104" ? "financial0104" : "root0105";
   const selectedTarget = canonicalJson(target);
   const custodyOwner = readAuth103OriginalCustodyDirectory();
   const custody = custodyOwner.path;
@@ -189,10 +230,10 @@ export async function runD1SchemaFinancial0104(
       throw preflightError("Financial0104 target changed during preparation");
     custodyOwner.assertUnchanged();
   };
-  const attempt = join(custody, "financial0104-dispatched.json");
-  const receipt = join(custody, "financial0104-installed.json");
+  const attempt = join(custody, `${label}-dispatched.json`);
+  const receipt = join(custody, `${label}-installed.json`);
   if (invocation.action === "apply" && existsSync(attempt))
-    throw mutationError("Financial0104 dispatch already exists; read status without replay");
+    throw mutationError(`${label} dispatch already exists; read status without replay`);
   const source = await qualifySource({ environment: "integration", commit: invocation.commit });
   if (source.dirty)
     throw preflightError("Financial0104 registration requires unchanged committed source");
@@ -214,7 +255,12 @@ export async function runD1SchemaFinancial0104(
       );
       assertTarget();
       for (const command of [
-        ["bun", "test", "tests/deploy-financial0104-canonical-source.test.ts"],
+        [
+          "bun",
+          "test",
+          "tests/deploy-financial0104-canonical-source.test.ts",
+          "tests/deploy-root0105-canonical-source.test.ts",
+        ],
         ["bun", "run", "check:migrations"],
       ]) {
         const checked = await runCommand(command);
@@ -222,14 +268,21 @@ export async function runD1SchemaFinancial0104(
         if (checked.exitCode !== 0) throw preflightError("Financial0104 scoped source gate failed");
       }
     }
-    const shapes = compileFinancial0104ImportShapes(
-      registered.auth103,
-      registered.artifact,
-      profile,
-    );
+    const shapes =
+      step === "0104"
+        ? compileFinancial0104ImportShapes(registered.auth103, registered.artifact, profile)
+        : compileRoot0105ImportShapes(
+            registered.auth103,
+            registered.artifact,
+            registered.artifact105,
+            profile,
+          );
+    const targetArtifact = step === "0104" ? registered.artifact : registered.artifact105;
+    const predecessorNames = step === "0104" ? registered.auth103.names : registered.artifact.names;
+    const stepRecipe = step === "0104" ? registered.recipe : registered.recipe105;
     const recipes = registered.auth103Recipes;
     const input: Financial0104ImportInput = {
-      artifact: registered.artifact,
+      artifact: targetArtifact,
       prefixShape: shapes.prefixShape,
       postShape: shapes.postShape,
       auth103CatalogJson: JSON.stringify(shapes.auth103Catalog),
@@ -250,7 +303,7 @@ export async function runD1SchemaFinancial0104(
       target,
       join(root, "migrations-unused"),
     );
-    const importPath = join(release, "financial0104-one-import.sql");
+    const importPath = join(release, `${label}-one-import.sql`);
     writeFileSync(importPath, contribution.sql, { flag: "wx", mode: 0o600 });
     const assertSealed = () => {
       if (!readFileSync(importPath).equals(Buffer.from(contribution.sql)))
@@ -270,11 +323,11 @@ export async function runD1SchemaFinancial0104(
       return rows.length === 1 && rows[0]?.current === 1;
     };
     const ready = async (phase: DeployPhase, snapshot: D1SchemaState) =>
-      JSON.stringify(snapshot.applied) === JSON.stringify(registered.auth103.names) &&
+      JSON.stringify(snapshot.applied) === JSON.stringify(predecessorNames) &&
       applicationSchemaMatches(snapshot, shapes.prefixShape) &&
       (await holds(phase, predicates.before));
     const installed = async (phase: DeployPhase, snapshot: D1SchemaState) =>
-      JSON.stringify(snapshot.applied) === JSON.stringify(registered.artifact.names) &&
+      JSON.stringify(snapshot.applied) === JSON.stringify(targetArtifact.names) &&
       applicationSchemaMatches(snapshot, shapes.postShape) &&
       (await holds(phase, predicates.after));
     const initial = await readD1SchemaState(database);
@@ -283,26 +336,30 @@ export async function runD1SchemaFinancial0104(
     const before = !alreadyInstalled && (await ready("preflight", initial));
     if (invocation.action === "status")
       return {
-        kind: "takoserver.financial0104-source-status@v1",
+        kind: `takoserver.${label}-source-status@v1`,
         environment: "integration",
         commit: source.commit,
         sourceProfile: profile,
         status: alreadyInstalled
-          ? "installed-financial0104"
+          ? `installed-${label}`
           : before
-            ? "auth103-awaiting-financial0104"
+            ? step === "0104"
+              ? "auth103-awaiting-financial0104"
+              : "financial0104-awaiting-root0105"
             : "foreign-frozen-or-indeterminate",
         appliedCount: initial.applied.length,
         auth103SourceDigest: registered.auth103.digest,
-        sourceDigest: registered.artifact.digest,
-        recipeDigest: registered.recipe.digest,
+        sourceDigest: targetArtifact.digest,
+        recipeDigest: stepRecipe.digest,
         importDigest: contribution.digest,
         dispatchRecorded: existsSync(attempt),
         nativeRequestQualified: false,
       };
     if (!before || alreadyInstalled)
       throw preflightError(
-        "Financial0104 apply requires exact installed Auth103 (thawed when Money-preserved); installed or foreign state is never replayed",
+        step === "0104"
+          ? "Financial0104 apply requires exact installed Auth103 (thawed when Money-preserved); installed or foreign state is never replayed"
+          : "Root0105 apply requires exact installed Financial0104 (thawed when Money-preserved); installed or foreign state is never replayed",
       );
     const final = await readD1SchemaState(database, "mutation");
     assertTarget();
@@ -316,11 +373,11 @@ export async function runD1SchemaFinancial0104(
     assertSealed();
     const dispatchBytes = Buffer.from(
       `${JSON.stringify({
-        kind: "takoserver.financial0104-dispatched@v1",
+        kind: `takoserver.${label}-dispatched@v1`,
         commit: source.commit,
         sourceProfile: profile,
-        sourceDigest: registered.artifact.digest,
-        recipeDigest: registered.recipe.digest,
+        sourceDigest: targetArtifact.digest,
+        recipeDigest: stepRecipe.digest,
         importDigest: contribution.digest,
         importBytes: contribution.bytes,
         releaseDirectory: release,
@@ -394,16 +451,18 @@ export async function runD1SchemaFinancial0104(
     assertTarget();
     if (!(await installed("verification", post)))
       throw verificationError(
-        "Financial0104 import was acknowledged but exact104 postconditions are unproved; repair forward",
+        step === "0104"
+          ? "Financial0104 import was acknowledged but exact104 postconditions are unproved; repair forward"
+          : "Root0105 import was acknowledged but exact105 postconditions are unproved; repair forward",
       );
     const result = {
-      kind: "takoserver.financial0104-source-apply@v1",
+      kind: `takoserver.${label}-source-apply@v1`,
       environment: "integration",
       commit: source.commit,
       sourceProfile: profile,
       auth103SourceDigest: registered.auth103.digest,
-      sourceDigest: registered.artifact.digest,
-      recipeDigest: registered.recipe.digest,
+      sourceDigest: targetArtifact.digest,
+      recipeDigest: stepRecipe.digest,
       importDigest: contribution.digest,
       importBytes: contribution.bytes,
       appliedCount: post.applied.length,

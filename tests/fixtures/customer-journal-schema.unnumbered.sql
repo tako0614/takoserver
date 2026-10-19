@@ -48,6 +48,8 @@ CREATE TABLE financial_customer_custody_receipts (
  binding_created_at TEXT NOT NULL, verified_at TEXT NOT NULL, created_at TEXT NOT NULL,
  all_rows_match INTEGER NOT NULL CHECK(typeof(all_rows_match)='integer' AND all_rows_match=1)
 );
+CREATE INDEX financial_customer_dispatch_receipts_by_org ON financial_customer_dispatch_receipts(org_id);
+CREATE INDEX financial_customer_custody_receipts_by_org ON financial_customer_custody_receipts(org_id);
 CREATE TABLE financial_customer_history_entries (
  entry_ref TEXT PRIMARY KEY NOT NULL, history_ref TEXT NOT NULL REFERENCES financial_customer_history_coverages(history_ref),
  journal_sequence INTEGER NOT NULL CHECK(typeof(journal_sequence)='integer' AND journal_sequence BETWEEN 0 AND 9007199254740991),
@@ -168,6 +170,9 @@ WHEN NOT EXISTS(SELECT 1 FROM financial_customer_history_birth_observations b
  WHERE b.birth_ref IS NEW.original_org_origin AND b.org_id IS NEW.organization_id AND b.phase='post-seal'
  AND b.primary_ref IS NEW.primary_ref AND b.enrollment_ref IS NEW.enrollment_ref AND seal.receipt_ref IS NEW.complete_seal_ref
  AND run.required_json IS NEW.required_scopes_json AND run.expected_seal_ref IS seal.receipt_ref
+ AND NOT EXISTS(SELECT 1 FROM financial_history_enrollment_roster ro WHERE ro.primary_ref=b.primary_ref AND ro.org_id=b.org_id)
+ AND EXISTS(SELECT 1 FROM orgs o WHERE o.id IS b.org_id AND o.owner_principal_id IS b.owner_principal_id AND o.created_at IS b.org_created_at)
+ AND NOT EXISTS(SELECT 1 FROM financial_customer_history_org_changes ch WHERE ch.org_id=b.org_id OR ch.new_org_id=b.org_id)
  AND NOT EXISTS(SELECT 1 FROM financial_customer_history_birth_observations old WHERE old.org_id=b.org_id AND old.birth_ref<>b.birth_ref))
 BEGIN SELECT RAISE(ABORT,'constraint: exact H0 post-seal origin; retained adoption is not implemented'); END;
 CREATE TRIGGER financial_customer_history_scope_original BEFORE INSERT ON financial_customer_history_scopes

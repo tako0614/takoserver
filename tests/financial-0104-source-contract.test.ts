@@ -8,14 +8,24 @@ import { createAuth103CanonicalSourceArtifacts } from "../scripts/deploy/auth103
 import { AUTH103_NATIVE_MIGRATIONS } from "../src/auth103-native-source-contract.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import {
+  assertFinancial0104CustomerWriteShape,
+  FINANCIAL_0104_CUSTOMER_H0_SCHEMA,
+  FINANCIAL_0104_ORG_TRACE_EXCLUSIONS,
+  FINANCIAL_0104_ORG_TRACE_TABLES,
+} from "../src/financial-0104-customer-schema.ts";
+import {
   FINANCIAL_0104_C0_FENCE_SCHEMA,
   FINANCIAL_0104_CONSENT_FENCE_SCHEMA,
+  FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA,
   FINANCIAL_0104_FENCED_TABLES,
   FINANCIAL_0104_RECEIVER_FENCE_SCHEMA,
   FINANCIAL_0104_RECEIVER_FENCED_SCHEMA_DIGEST,
+  FINANCIAL_0104_UNFENCED_TABLES,
   FINANCIAL_RECEIVER_UNFENCED_SCHEMA_DIGEST,
   financialStatementWriteTarget,
+  isFinancialCustomerMoneyFencedBatch,
   isFinancialMoneyFencedBatch,
+  ROOT_MONEY_GUARD_STRIPE_TABLES,
 } from "../src/financial-0104-money-fence.ts";
 import {
   createFinancial0104SourceRecipe,
@@ -38,6 +48,11 @@ import {
   MONEY_CUTOVER_PERMIT_DDL,
   MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
 } from "../src/money-cutover-sql.ts";
+import type { Sql } from "../src/ports.ts";
+import {
+  createSharedFinancialAdmissionComponent,
+  prepareCustomerAdmissionBatch,
+} from "../src/shared-financial-admission.ts";
 import { prepareConsentBatch } from "../src/shared-financial-consent-data.ts";
 import {
   buildFinancialR1AttemptCustodyStatement,
@@ -103,6 +118,10 @@ function schemaRows(db: Database, tables: readonly string[]): SchemaRow[] {
   ).sort(byName);
 }
 
+const FENCED_0104_TABLES = FINANCIAL_0104_TABLES.filter(
+  (table) => !Object.hasOwn(FINANCIAL_0104_UNFENCED_TABLES, table),
+);
+
 describe("Financial 0104 source recipe", () => {
   test("installs on the exact 0100+0103 state and owns only its declared objects", () => {
     const db = at0103();
@@ -113,6 +132,12 @@ describe("Financial 0104 source recipe", () => {
       for (const object of FINANCIAL_0104_OBJECTS)
         expect(before).not.toContain(`${object.type}:${object.name}`);
       db.exec(FINANCIAL_0104_DDL);
+      // Every 0104 object sits on a 0104 table: the H0 Org capture triggers on
+      // Root's orgs table are Root's 0105, not part of this body.
+      expect(
+        FINANCIAL_0104_OBJECTS.filter((o) => !FINANCIAL_0104_TABLES.includes(o.tbl_name)),
+      ).toEqual([]);
+      expect(FINANCIAL_0104_DDL).not.toContain(" ON orgs");
       const installed = schemaRows(db, FINANCIAL_0104_TABLES);
       expect(installed).toEqual(
         FINANCIAL_0104_OBJECTS.map(({ type, name, tbl_name, sql }) => ({
@@ -158,10 +183,17 @@ describe("Financial 0104 source recipe", () => {
         );
         expect(count(db, table)).toBe(0);
       }
-      for (const table of FINANCIAL_0104_TABLES) {
+      for (const table of FENCED_0104_TABLES) {
         expect(() => db.exec(`INSERT INTO ${table} DEFAULT VALUES`)).toThrow(
           /no such table: (?:main\.)?money_cutover_/u,
         );
+        expect(count(db, table)).toBe(0);
+      }
+      // The two unfenced 0104 tables carry no money fence here (Root's Money guard
+      // fences the links at cutover; birth rows come only from Root's Org cascade),
+      // and their own original guards still refuse a bare row.
+      for (const table of Object.keys(FINANCIAL_0104_UNFENCED_TABLES)) {
+        expect(() => db.exec(`INSERT INTO ${table} DEFAULT VALUES`)).toThrow();
         expect(count(db, table)).toBe(0);
       }
       // Unrelated non-0104 writes on the same primary still succeed.
@@ -186,10 +218,28 @@ describe("Financial 0104 source recipe", () => {
           .all(...FINANCIAL_0104_TABLES) as { name: string }[]
       ).map((row) => row.name);
       expect(tables).toEqual([...FINANCIAL_0104_TABLES].sort());
+      // Exactly three named 0104 tables carry no Financial fence: Root's Money cutover
+      // guard fences the links, and only Root's Org capture triggers append birth and
+      // change observations.
+      expect(Object.keys(FINANCIAL_0104_UNFENCED_TABLES).sort()).toEqual([
+        "financial_customer_history_birth_observations",
+        "financial_customer_history_org_changes",
+        "stripe_customer_admission_links",
+      ]);
       const fencedTables: string[] = [...FINANCIAL_0104_FENCED_TABLES];
-      expect(fencedTables.sort()).toEqual([...FINANCIAL_0104_TABLES].sort());
-      expect(Object.keys(FINANCIAL_0104_MONEY_FENCES).sort()).toEqual(tables);
-      for (const table of tables) {
+      expect(fencedTables.sort()).toEqual([...FENCED_0104_TABLES].sort());
+      expect(Object.keys(FINANCIAL_0104_MONEY_FENCES).sort()).toEqual(
+        [...FENCED_0104_TABLES].sort(),
+      );
+      for (const table of Object.keys(FINANCIAL_0104_UNFENCED_TABLES))
+        expect(
+          db
+            .query(
+              "SELECT name FROM sqlite_schema WHERE type='trigger' AND tbl_name=? AND sql LIKE '%money_cutover_writer_permit%'",
+            )
+            .all(table),
+        ).toEqual([]);
+      for (const table of FENCED_0104_TABLES) {
         const fences = db
           .query(
             "SELECT name,sql FROM sqlite_schema WHERE type='trigger' AND tbl_name=? AND name=?",
@@ -211,6 +261,8 @@ describe("Financial 0104 source recipe", () => {
       // Tables that admit an UPDATE at all also carry an UPDATE fence; every
       // other table refuses every UPDATE through its existing immutable trigger.
       expect(Object.keys(FINANCIAL_0104_MONEY_UPDATE_FENCES).sort()).toEqual([
+        "financial_customer_history_heads",
+        "financial_history_enrollment_heads",
         "financial_source_heads",
         "financial_source_registrations",
       ]);
@@ -221,6 +273,7 @@ describe("Financial 0104 source recipe", () => {
           expect(
             object?.sql.startsWith(`CREATE TRIGGER ${update} BEFORE UPDATE ON ${table}\n`),
           ).toBe(true);
+          // Every UPDATE fence, H0 enrollment heads included, has no exemption.
           expect(object?.sql).toContain("WHEN EXISTS(SELECT 1 FROM money_cutover_freeze)");
           expect(object?.sql).toContain("p.singleton=1 AND p.epoch='usd-micros-v2'");
         } else
@@ -260,7 +313,7 @@ describe("Financial 0104 source recipe", () => {
   });
 
   test("each fence alone refuses frozen and unpermitted INSERTs before any other guard", () => {
-    for (const table of FINANCIAL_0104_TABLES) {
+    for (const table of FENCED_0104_TABLES) {
       const db = new Database(":memory:");
       try {
         db.exec("PRAGMA foreign_keys=OFF");
@@ -296,20 +349,28 @@ describe("Financial 0104 source recipe", () => {
           ? JSON.stringify({ writerEpoch: epoch, scopeRealm: { writerEpoch: epoch } })
           : "k";
     const insertRow = (db: Database, table: string, epoch: string) => {
-      const columns = (db.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).map(
-        (column) => column.name,
-      );
+      // An INTEGER PRIMARY KEY (rowid alias) is left to SQLite.
+      const columns = (
+        db.query(`PRAGMA table_info(${table})`).all() as {
+          name: string;
+          type: string;
+          pk: number;
+        }[]
+      )
+        .filter((column) => !(column.pk === 1 && column.type === "INTEGER"))
+        .map((column) => column.name);
       db.query(
         `INSERT INTO ${table}(${columns.join(",")}) VALUES(${columns.map(() => "?").join(",")})`,
       ).run(...columns.map((column) => rowValue(column, epoch)));
     };
-    const epochBearing = FINANCIAL_0104_TABLES.filter((table) =>
+    const epochBearing = FENCED_0104_TABLES.filter((table) =>
       FINANCIAL_0104_OBJECTS.find(
         (o) => o.name === FINANCIAL_0104_MONEY_FENCES[table],
       )?.sql.includes("p.writer_epoch IS"),
     );
-    expect(epochBearing).toHaveLength(14);
-    for (const table of FINANCIAL_0104_TABLES) {
+    // 14 epoch-bearing C0/M/G/R1/consent tables plus all 16 fenced Customer tables.
+    expect(epochBearing).toHaveLength(30);
+    for (const table of FENCED_0104_TABLES) {
       for (const rows of ["current", "foreign"] as const) {
         if (rows === "foreign" && !epochBearing.includes(table)) continue;
         const db = new Database(":memory:");
@@ -351,15 +412,52 @@ describe("Financial 0104 source recipe", () => {
     }
   });
 
-  test("each UPDATE fence alone refuses frozen and unpermitted receiver UPDATEs", () => {
-    const rows: Record<string, string> = {
-      financial_source_registrations: `INSERT INTO financial_source_registrations
+  test("each UPDATE fence alone refuses frozen and unpermitted UPDATEs", () => {
+    const rootJson = JSON.stringify({
+      primaryRef: "primary:u",
+      primaryIncarnation: "primary-inc:u",
+      physicalBindingRef: "binding:u",
+      physicalBindingIncarnation: "binding-inc:u",
+      writerEpoch: EPOCH,
+    });
+    // Parent rows carry the epoch an epoch-bound fence reads; then one row to update.
+    const rows: Record<string, { readonly seed: readonly string[]; readonly update: string }> = {
+      financial_source_registrations: {
+        seed: [
+          `INSERT INTO financial_source_registrations
         (registration_ref,incarnation,receiver_ref,target_ref,genesis_digest,registration_digest,registration_json,qualification_ref,registered_at)
         VALUES('registration:u','inc:u','receiver:u','target:u','${EPOCH}','${EPOCH}','{}','qualification:u','${AT}')`,
-      financial_source_heads: `INSERT INTO financial_source_heads
+        ],
+        update: "UPDATE financial_source_registrations SET registration_ref=registration_ref",
+      },
+      financial_source_heads: {
+        seed: [
+          `INSERT INTO financial_source_heads
         (registration_ref,incarnation,affected_ref,genesis_qualification_ref,created_at,sequence,event_digest,state,last_event_ref,updated_at)
         VALUES('registration:u','inc:u','affected:u','genesis:u','${AT}',0,'${EPOCH}','active',NULL,'${AT}')`,
+        ],
+        update: "UPDATE financial_source_heads SET registration_ref=registration_ref",
+      },
+      financial_customer_history_heads: {
+        seed: [
+          `INSERT INTO financial_customer_history_coverages
+        (history_ref,coverage_incarnation,attempt_ref,expected_receipt_ref,coverage_kind,original_org_origin,organization_id,primary_ref,enrollment_ref,complete_seal_ref,seal_kind,realm_registration,realm_incarnation,realm_json,required_scopes_json,writer_epoch,previous_history_ref,created_at)
+        VALUES('history:u','coverage-inc:u','attempt:u','receipt:u','qualified-genesis','birth:u','org:u','primary:u','enrollment:u','seal:u','complete-seal','realm:u','realm-inc:u','{}','[{}]','${EPOCH}',NULL,'${AT}')`,
+          `INSERT INTO financial_customer_history_heads VALUES('birth:u','realm:u','realm-inc:u','history:u',0,'entry:u','receipt:u','active')`,
+        ],
+        update: "UPDATE financial_customer_history_heads SET journal_sequence=journal_sequence",
+      },
+      financial_history_enrollment_heads: {
+        seed: [
+          `INSERT INTO financial_history_primary_roots VALUES('primary:u','primary-inc:u','binding:u','binding-inc:u','${rootJson}')`,
+          "INSERT INTO financial_history_enrollment_heads VALUES('primary:u','enrollment:u',1,0,'capturing','start:u')",
+        ],
+        update: "UPDATE financial_history_enrollment_heads SET state='sealed'",
+      },
     };
+    expect(Object.keys(rows).sort()).toEqual(
+      Object.keys(FINANCIAL_0104_MONEY_UPDATE_FENCES).sort(),
+    );
     for (const [table, name] of Object.entries(FINANCIAL_0104_MONEY_UPDATE_FENCES)) {
       const db = new Database(":memory:");
       try {
@@ -369,20 +467,41 @@ describe("Financial 0104 source recipe", () => {
         db.exec(MONEY_CUTOVER_PERMIT_DDL);
         for (const object of FINANCIAL_0104_OBJECTS)
           if (object.type === "table") db.exec(object.sql);
-        const insert = rows[table];
-        if (!insert) throw Error(`missing row for ${table}`);
-        db.exec(insert);
+        const selected = rows[table];
+        if (!selected) throw Error(`missing row for ${table}`);
+        for (const seed of selected.seed) db.exec(seed);
         const fence = FINANCIAL_0104_OBJECTS.find((o) => o.name === name);
         if (!fence) throw Error(`missing fence ${name}`);
         db.exec(fence.sql);
         db.query("INSERT INTO money_cutover_authorized_epoch VALUES(1,?)").run(EPOCH);
-        const update = () => db.exec(`UPDATE ${table} SET registration_ref=registration_ref`);
+        const update = () => db.exec(selected.update);
         expect(update).toThrow(/constraint: Financial .*permit/u);
         db.query("INSERT INTO money_cutover_writer_permit VALUES(1,'usd-micros-v2',?)").run(EPOCH);
         db.exec("INSERT INTO money_cutover_freeze VALUES(1,'b','o','k','w','s')");
         expect(update).toThrow(/constraint: Financial .*permit/u);
+        if (table === "financial_history_enrollment_heads") {
+          // No head UPDATE is exempt: a bare capture advance, a close, a jump or an
+          // advance with any other change all need the frame (Root's Org triggers
+          // never move a head).
+          for (const forged of [
+            "UPDATE financial_history_enrollment_heads SET capture_sequence=capture_sequence+1",
+            "UPDATE financial_history_enrollment_heads SET state='closed',capture_sequence=capture_sequence+1",
+            "UPDATE financial_history_enrollment_heads SET capture_sequence=capture_sequence+2",
+            "UPDATE financial_history_enrollment_heads SET capture_sequence=capture_sequence+1,expected_receipt_ref='forged'",
+          ])
+            expect(() => db.exec(forged)).toThrow(/constraint: Financial .*permit/u);
+        }
         db.exec("DELETE FROM money_cutover_freeze");
         expect(update).not.toThrow();
+        if (table !== "financial_source_registrations" && table !== "financial_source_heads") {
+          // A current permit for another epoch is refused by the epoch-bound fence.
+          db.exec("DELETE FROM money_cutover_writer_permit");
+          db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(ROTATED);
+          db.query("INSERT INTO money_cutover_writer_permit VALUES(1,'usd-micros-v2',?)").run(
+            ROTATED,
+          );
+          expect(update).toThrow(/constraint: Financial .*permit\/epoch/u);
+        }
       } finally {
         db.close();
       }
@@ -417,12 +536,23 @@ describe("Financial 0104 source recipe", () => {
           "utf8",
         ),
       );
+      // The Customer candidates: L1, H0 and journal. The H0 fixture also carries
+      // Root's Org capture triggers on orgs; they are not 0104 rows.
+      db.exec("CREATE TABLE orgs(id TEXT PRIMARY KEY)");
+      for (const file of [
+        "customer-l1-schema.unnumbered.sql",
+        "shared-financial-customer-history-component-schema.sql",
+        "customer-journal-schema.unnumbered.sql",
+      ])
+        db.exec(readFileSync(new URL(`./fixtures/${file}`, import.meta.url), "utf8"));
       const added = new Set([
         ...Object.keys(FINANCIAL_0104_RECEIVER_FENCE_SCHEMA),
         ...Object.keys(FINANCIAL_0104_C0_FENCE_SCHEMA),
         ...Object.keys(FINANCIAL_0104_CONSENT_FENCE_SCHEMA),
+        ...Object.keys(FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA),
       ]);
-      expect(added.size).toBe(18);
+      expect(Object.keys(FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA)).toHaveLength(18);
+      expect(added.size).toBe(36);
       expect(schemaRows(db, FINANCIAL_0104_TABLES)).toEqual(
         FINANCIAL_0104_OBJECTS.filter((o) => !added.has(o.name))
           .map(({ type, name, tbl_name, sql }) => ({ type, name, tbl_name, sql }))
@@ -452,11 +582,14 @@ describe("Financial 0104 source recipe", () => {
       for (const table of [...auth103, "credential_authority_classes"])
         expect(parents.has(table)).toBe(true);
       expect([...parents].filter((table) => !present.has(table))).toEqual([]);
+      // Customer rows also reference Root's existing 0095/0099 Stripe customer tables.
       expect([...parents].filter((table) => !FINANCIAL_0104_TABLES.includes(table)).sort()).toEqual(
         [
           "auth_principal_incarnations",
           "credential_authority_classes",
           "shared_principal_bindings",
+          "stripe_billing_customer_commands",
+          "stripe_billing_customers",
         ],
       );
     } finally {
@@ -538,6 +671,340 @@ describe("Financial 0104 source recipe", () => {
         "WITH i(a) AS (VALUES(?)) INSERT INTO financial_retained_r1_originals(a) SELECT a FROM i",
       ),
     ).toBe("financial_retained_r1_originals");
+    // Customer batches may also write Root's Money-guard Stripe tables, but only
+    // alongside a Financial-fenced write, and never any other table.
+    expect([...ROOT_MONEY_GUARD_STRIPE_TABLES].sort()).toEqual([
+      "stripe_billing_customer_commands",
+      "stripe_billing_customers",
+      "stripe_customer_admission_links",
+    ]);
+    expect(
+      isFinancialCustomerMoneyFencedBatch([
+        { sql: "INSERT INTO stripe_billing_customer_commands(org_id) VALUES(?)" },
+      ]),
+    ).toBe(false);
+    expect(
+      isFinancialCustomerMoneyFencedBatch([
+        { sql: "INSERT INTO financial_customer_admissions(admission_ref) VALUES(?)" },
+        { sql: "UPDATE stripe_billing_customer_commands SET state='dispatched'" },
+      ]),
+    ).toBe(true);
+    expect(
+      isFinancialCustomerMoneyFencedBatch([
+        { sql: "INSERT INTO financial_customer_admissions(admission_ref) VALUES(?)" },
+        { sql: "UPDATE stripe_billing_subscriptions SET status='active'" },
+      ]),
+    ).toBe(false);
+    expect(
+      isFinancialMoneyFencedBatch([
+        { sql: "INSERT INTO stripe_customer_admission_links(org_id) VALUES(?)" },
+      ]),
+    ).toBe(false);
+    // Birth observations are Root's Org-trigger rows: no Financial batch may write them.
+    for (const write of [
+      "INSERT INTO financial_customer_history_birth_observations(birth_ref) VALUES(?)",
+      "UPDATE financial_customer_history_birth_observations SET phase='raw'",
+      "DELETE FROM financial_customer_history_birth_observations",
+    ]) {
+      const batch = [
+        { sql: "INSERT INTO financial_customer_history_entries(entry_ref) VALUES(?)" },
+        { sql: write },
+      ];
+      expect(isFinancialMoneyFencedBatch(batch)).toBe(false);
+      expect(isFinancialCustomerMoneyFencedBatch(batch)).toBe(false);
+    }
+  });
+
+  test("without money_cutover tables, 0104 plus the H0 Org capture triggers keep Org create, rename and delete working", () => {
+    // Root's Org capture triggers, exactly as the H0 candidate fixture (and Root's
+    // 0105 reference) define them.
+    const scratchDb = new Database(":memory:");
+    let orgTriggers: string[];
+    try {
+      scratchDb.exec("CREATE TABLE orgs(id TEXT PRIMARY KEY)");
+      scratchDb.exec(
+        readFileSync(
+          new URL(
+            "./fixtures/shared-financial-customer-history-component-schema.sql",
+            import.meta.url,
+          ),
+          "utf8",
+        ),
+      );
+      orgTriggers = (
+        scratchDb
+          .query(
+            "SELECT sql FROM sqlite_schema WHERE type='trigger' AND tbl_name='orgs' ORDER BY rowid",
+          )
+          .all() as { sql: string }[]
+      ).map((row) => row.sql);
+    } finally {
+      scratchDb.close();
+    }
+    expect(orgTriggers).toHaveLength(4);
+    // No Org trigger names a fenced table or a money_cutover table.
+    for (const sql of orgTriggers) {
+      // Reads of the org-keyed trace tables are allowed (0094's money_cutover_aggregates
+      // exists on every migrated primary); the cutover-only guard tables are not.
+      expect(sql).not.toMatch(
+        /money_cutover_(?:freeze|writer_permit|authorized_epoch)|RAISE|rowid/iu,
+      );
+      expect(sql).not.toMatch(/\b(?:UPDATE|DELETE\s+FROM)\s+financial_/u);
+      const writes = [...sql.matchAll(/INSERT INTO ([a-z_]+)/gu)].map((m) => m[1] ?? "");
+      expect(writes.length).toBeGreaterThan(0);
+      for (const table of writes)
+        expect(Object.keys(FINANCIAL_0104_UNFENCED_TABLES)).toContain(table);
+    }
+    const db = at0103(":memory:", { money: false });
+    try {
+      db.exec(FINANCIAL_0104_DDL);
+      for (const sql of orgTriggers) db.exec(sql);
+      db.exec(
+        "INSERT INTO principals(id,provider,provider_subject,email,display_name,created_at) VALUES('principal:self','google','self','self@invalid.example','Self','2026-10-15T00:00:00.000Z')",
+      );
+      db.exec(
+        "INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:self','Self','principal:self','2026-10-15T00:00:00.000Z')",
+      );
+      // Rename, identical owner-login UPSERT, identity change, REPLACE, delete and
+      // re-create of the same id all succeed.
+      db.exec("UPDATE orgs SET name='Renamed' WHERE id='org:self'");
+      const upsert = `INSERT INTO orgs (id, name, owner_principal_id, created_at)
+                    VALUES ('org:self', 'Login', 'principal:self', '2026-10-16T00:00:00.000Z')
+                    ON CONFLICT(id) DO UPDATE SET name = excluded.name,
+                      owner_principal_id = excluded.owner_principal_id`;
+      db.exec(upsert);
+      db.exec("UPDATE orgs SET owner_principal_id='principal:other' WHERE id='org:self'");
+      db.exec(
+        "INSERT OR REPLACE INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:self','Replaced','principal:self','2026-10-15T00:00:00.000Z')",
+      );
+      db.exec("DELETE FROM orgs WHERE id='org:self'");
+      db.exec(
+        "INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:self','Again','principal:self','2026-10-17T00:00:00.000Z')",
+      );
+      expect(
+        db.query("SELECT org_id,phase FROM financial_customer_history_birth_observations").all(),
+      ).toEqual([{ org_id: "org:self", phase: "raw" }]);
+      expect(
+        db
+          .query(
+            "SELECT change_seq,change_kind FROM financial_customer_history_org_changes ORDER BY change_seq",
+          )
+          .all(),
+      ).toEqual([
+        { change_seq: 1, change_kind: "update" },
+        { change_seq: 2, change_kind: "replace" },
+        { change_seq: 3, change_kind: "delete" },
+      ]);
+      // Only observations were written among the 0104 tables.
+      for (const table of FINANCIAL_0104_TABLES)
+        if (!Object.hasOwn(FINANCIAL_0104_UNFENCED_TABLES, table)) expect(count(db, table)).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  test("the Org trace table set is every org_id table at the 0104 state minus the named exclusions, in both SQL texts", () => {
+    const db = at0103();
+    let derived: string[];
+    try {
+      db.exec(FINANCIAL_0104_DDL);
+      const tables = (
+        db.query("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").all() as {
+          name: string;
+        }[]
+      ).map((row) => row.name);
+      derived = tables.filter((table) =>
+        (db.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).some(
+          (column) => column.name === "org_id",
+        ),
+      );
+    } finally {
+      db.close();
+    }
+    const exclusions = Object.keys(FINANCIAL_0104_ORG_TRACE_EXCLUSIONS).sort();
+    for (const table of exclusions) expect(derived).toContain(table);
+    expect([...FINANCIAL_0104_ORG_TRACE_TABLES].sort()).toEqual(
+      derived.filter((table) => !exclusions.includes(table)).sort(),
+    );
+    const named = (sql: string, column: string) =>
+      [
+        ...sql.matchAll(
+          new RegExp(`EXISTS\\(SELECT 1 FROM ([a-z_0-9]+) m WHERE m\\.org_id=${column}\\)`, "gu"),
+        ),
+      ]
+        .map((match) => match[1] ?? "")
+        .sort();
+    // The 0104 birth guard and Root's Org INSERT trigger (as the H0 candidate) both
+    // name exactly this set.
+    const guard =
+      FINANCIAL_0104_CUSTOMER_H0_SCHEMA.financial_customer_history_birth_observations_org_capture ??
+      "";
+    expect(named(guard, "NEW\\.org_id")).toEqual([...FINANCIAL_0104_ORG_TRACE_TABLES].sort());
+    const scratchDb = new Database(":memory:");
+    try {
+      scratchDb.exec("CREATE TABLE orgs(id TEXT PRIMARY KEY)");
+      scratchDb.exec(
+        readFileSync(
+          new URL(
+            "./fixtures/shared-financial-customer-history-component-schema.sql",
+            import.meta.url,
+          ),
+          "utf8",
+        ),
+      );
+      const insert = (
+        scratchDb
+          .query("SELECT sql FROM sqlite_schema WHERE name='financial_history_capture_org_insert'")
+          .get() as { sql: string }
+      ).sql;
+      expect(named(insert, "NEW\\.id")).toEqual([...FINANCIAL_0104_ORG_TRACE_TABLES].sort());
+    } finally {
+      scratchDb.close();
+    }
+  });
+
+  test("every 0104-created Org trace table answers an org_id lookup through an index", () => {
+    const db = at0103();
+    try {
+      db.exec(FINANCIAL_0104_DDL);
+      const own = FINANCIAL_0104_ORG_TRACE_TABLES.filter((table) =>
+        FINANCIAL_0104_TABLES.includes(table),
+      );
+      expect(own.length).toBeGreaterThan(0);
+      for (const table of own) {
+        const plan = (
+          db
+            .query(`EXPLAIN QUERY PLAN SELECT 1 FROM ${table} m WHERE m.org_id=?`)
+            .all("org:plan") as { detail: string }[]
+        ).map((row) => row.detail);
+        expect({ table, plan }).toEqual({
+          table,
+          plan: [expect.stringMatching(/^SEARCH m USING (?:COVERING )?INDEX /u)],
+        });
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  test("birth and change observations are append-only and no Financial source writes them", async () => {
+    const db = at0103();
+    try {
+      db.exec(FINANCIAL_0104_DDL);
+      const triggers = (
+        db
+          .query(
+            "SELECT name FROM sqlite_schema WHERE type='trigger' AND tbl_name='financial_customer_history_birth_observations' ORDER BY name",
+          )
+          .all() as { name: string }[]
+      ).map((row) => row.name);
+      expect(triggers).toEqual([
+        "financial_customer_history_birth_observations_no_delete",
+        "financial_customer_history_birth_observations_no_replace",
+        "financial_customer_history_birth_observations_no_update",
+        "financial_customer_history_birth_observations_org_capture",
+      ]);
+      db.exec("PRAGMA foreign_keys=OFF");
+      const birth = (ref: string, org: string, name: string) =>
+        db.exec(
+          `INSERT INTO financial_customer_history_birth_observations(birth_ref,org_id,owner_principal_id,org_name,org_created_at,phase) VALUES('${ref}','${org}','owner','${name}','at','raw')`,
+        );
+      // A forged row with no matching Org is refused, frozen or not.
+      db.exec(MONEY_FREEZE_ROW);
+      expect(() => birth("birth:forged", "org:a", "name")).toThrow(/exact Org capture/u);
+      db.exec(
+        "INSERT INTO orgs(id,name,owner_principal_id,created_at) VALUES('org:a','name','owner','at')",
+      );
+      // The Org exists but the row disagrees with it.
+      expect(() => birth("birth:forged", "org:a", "other")).toThrow(/exact Org capture/u);
+      // Exactly what the Org INSERT cascade writes while no capture is open.
+      birth("birth:a", "org:a", "name");
+      expect(() =>
+        db.exec("UPDATE financial_customer_history_birth_observations SET org_name='changed'"),
+      ).toThrow(/constraint: retained history mutation/u);
+      expect(() => db.exec("DELETE FROM financial_customer_history_birth_observations")).toThrow(
+        /constraint: retained history deletion/u,
+      );
+      expect(count(db, "financial_customer_history_birth_observations")).toBe(1);
+      // A second raw row for the same Org row is refused.
+      expect(() => birth("birth:again", "org:a", "name")).toThrow(/constraint/u);
+      // Change observations are append-only too and admit only the exact Org change.
+      const change = (ref: string, name: string) =>
+        db.exec(
+          `INSERT INTO financial_customer_history_org_changes(change_ref,change_seq,change_kind,org_id,old_owner_principal_id,old_org_name,old_org_created_at,new_org_id,new_owner_principal_id,new_org_name,new_org_created_at) VALUES('${ref}',COALESCE((SELECT max(change_seq) FROM financial_customer_history_org_changes),0)+1,'update','org:a','owner','old','at','org:a','owner','${name}','at')`,
+        );
+      expect(() => change("change:forged", "other")).toThrow(/exact Org change/u);
+      change("change:a", "name");
+      expect(() =>
+        db.exec("UPDATE financial_customer_history_org_changes SET old_org_name='x'"),
+      ).toThrow(/constraint: retained history mutation/u);
+      expect(() => db.exec("DELETE FROM financial_customer_history_org_changes")).toThrow(
+        /constraint: retained history deletion/u,
+      );
+    } finally {
+      db.close();
+    }
+    // Financial source only reads the table; its one writer is Root's Org cascade.
+    const writers = new Bun.Glob("src/{financial-,shared-financial-}*.ts").scanSync({ cwd: ROOT });
+    for (const path of writers) {
+      const source = readFileSync(join(ROOT, path), "utf8");
+      expect({
+        path,
+        writes:
+          /\b(?:INSERT(?:\s+OR\s+\w+)?\s+INTO|UPDATE|DELETE\s+FROM|REPLACE\s+INTO)\s+financial_customer_history_(?:birth_observations|org_changes)\b/iu.test(
+            source,
+          ),
+      }).toEqual({ path, writes: false });
+    }
+  });
+
+  test("Customer writes require exactly the fenced 0104 Customer shape", async () => {
+    const db = at0103();
+    try {
+      const sql = createSqliteSql(db);
+      // Unfenced candidates (the existing fixtures) are readable but never written.
+      for (const file of [
+        "financial-five-action-consent-schema.unnumbered.sql",
+        "customer-l1-schema.unnumbered.sql",
+        "shared-financial-customer-history-component-schema.sql",
+        "customer-journal-schema.unnumbered.sql",
+      ])
+        db.exec(readFileSync(new URL(`./fixtures/${file}`, import.meta.url), "utf8"));
+      await expect(assertFinancial0104CustomerWriteShape(sql)).rejects.toThrow(
+        "exact fenced shape",
+      );
+      // Every fence but one is still a partial shape.
+      const fences = Object.values(FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA);
+      for (const fence of fences.slice(1)) db.exec(fence);
+      await expect(assertFinancial0104CustomerWriteShape(sql)).rejects.toThrow(
+        "exact fenced shape",
+      );
+      db.exec(fences[0] ?? "");
+      await expect(assertFinancial0104CustomerWriteShape(sql)).resolves.toBeUndefined();
+      // Root's Money cutover-guard fence on the links table is Root's; an extra
+      // object on a Financial-owned Customer table is not the exact shape.
+      db.exec(
+        "CREATE TRIGGER money_cutover_fence_stripe_customer_admission_links_insert BEFORE INSERT ON stripe_customer_admission_links BEGIN SELECT 1; END",
+      );
+      await expect(assertFinancial0104CustomerWriteShape(sql)).resolves.toBeUndefined();
+      db.exec(
+        "CREATE TRIGGER foreign_extra BEFORE INSERT ON financial_customer_history_entries BEGIN SELECT 1; END",
+      );
+      await expect(assertFinancial0104CustomerWriteShape(sql)).rejects.toThrow(
+        "exact fenced shape",
+      );
+    } finally {
+      db.close();
+    }
+    const installed = at0103();
+    try {
+      installed.exec(FINANCIAL_0104_DDL);
+      await expect(
+        assertFinancial0104CustomerWriteShape(createSqliteSql(installed)),
+      ).resolves.toBeUndefined();
+    } finally {
+      installed.close();
+    }
   });
 });
 
@@ -876,6 +1343,87 @@ describe("Financial 0104 consent batch through the existing Money writer", () =>
       expect(await rotated.batch([revoke])).toHaveLength(1);
       expect(count(f.db, "financial_payer_grant_revocations")).toBe(1);
       expect(count(f.db, "money_cutover_writer_permit")).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+});
+
+describe("Financial 0104 Customer admission through the existing Money writer", () => {
+  const ROWS = [
+    "financial_customer_admissions",
+    "stripe_billing_customer_commands",
+    "stripe_customer_admission_links",
+    "financial_customer_admission_receipts",
+    "money_cutover_writer_permit",
+  ] as const;
+  test("acceptCustomerCreation refuses raw Sql, a foreign writer and an unfenced shape, rolls back under freeze, then commits", async () => {
+    const f = await consentFixture();
+    try {
+      const epoch = (
+        f.db.query("SELECT writer_epoch FROM money_cutover_authorized_epoch").get() as {
+          writer_epoch: string;
+        }
+      ).writer_epoch;
+      const batch = prepareCustomerAdmissionBatch(f.admission);
+      expect(batch).toHaveLength(4);
+      for (const statement of batch) expect(statement.sql).not.toMatch(MONEY_WORDS);
+      const counts = () => ROWS.map((table) => count(f.db, table));
+      expect(counts()).toEqual([0, 0, 0, 0, 0]);
+      // A raw Sql is refused before any SQL is sent.
+      const calls: string[] = [];
+      const raw: Sql = {
+        async query(sql, params) {
+          calls.push("query");
+          return f.sql.query(sql, params);
+        },
+        async run(sql, params) {
+          calls.push("run");
+          return f.sql.run(sql, params);
+        },
+        async batch(statements) {
+          calls.push("batch");
+          return f.sql.batch(statements);
+        },
+      };
+      await expect(
+        createSharedFinancialAdmissionComponent(raw, { writerEpoch: epoch }).acceptCustomerCreation(
+          f.admission,
+        ),
+      ).rejects.toThrow("Root's Money writer");
+      expect(calls).toEqual([]);
+      // A Money writer for any other epoch is refused the same way.
+      await expect(
+        createSharedFinancialAdmissionComponent(createMoneyCutoverSql(f.sql, ROTATED), {
+          writerEpoch: epoch,
+        }).acceptCustomerCreation(f.admission),
+      ).rejects.toThrow("Root's Money writer");
+      const component = createSharedFinancialAdmissionComponent(f.money, { writerEpoch: epoch });
+      // An unfenced shape (one Customer fence missing) is never written.
+      const fence = "financial_customer_admissions_money_fence";
+      const fenceSql = FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA[fence] ?? "";
+      f.db.exec(`DROP TRIGGER ${fence}`);
+      await expect(component.acceptCustomerCreation(f.admission)).rejects.toThrow(
+        "exact fenced shape",
+      );
+      expect(counts()).toEqual([0, 0, 0, 0, 0]);
+      f.db.exec(fenceSql);
+      // Freeze: the whole four-row batch, Stripe rows included, rolls back.
+      f.db.exec(MONEY_FREEZE_ROW);
+      await expect(component.acceptCustomerCreation(f.admission)).rejects.toThrow(
+        /constraint: Financial Customer admission/u,
+      );
+      expect(counts()).toEqual([0, 0, 0, 0, 0]);
+      f.db.exec("DELETE FROM money_cutover_freeze");
+      // Missing permit: the same statements on the raw Sql are refused.
+      await expect(f.sql.batch(batch)).rejects.toThrow(/constraint: Financial Customer/u);
+      expect(counts()).toEqual([0, 0, 0, 0, 0]);
+      const receipt = await component.acceptCustomerCreation(f.admission);
+      expect(receipt.receiptRef).toBe(f.admission.receiptRef);
+      expect(counts()).toEqual([1, 1, 1, 1, 0]);
+      // Historical exact readback, no second write.
+      expect(await component.acceptCustomerCreation(f.admission)).toEqual(receipt);
+      expect(counts()).toEqual([1, 1, 1, 1, 0]);
     } finally {
       f.close();
     }

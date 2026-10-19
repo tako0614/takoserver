@@ -31,7 +31,7 @@ test("Financial current consent native request bridge stays on one SQLite primar
     exit: 0,
     diagnostics: "",
   });
-  expect(stderr).toMatch(/(?:^|\n)\s*3 pass\s*(?:\n|$)/u);
+  expect(stderr).toMatch(/(?:^|\n)\s*4 pass\s*(?:\n|$)/u);
   expect(stderr).toMatch(/(?:^|\n)\s*0 fail\s*(?:\n|$)/u);
-  expect(stderr.match(/^\(pass\) /gmu)).toHaveLength(3);
+  expect(stderr.match(/^\(pass\) /gmu)).toHaveLength(4);
 }, 100_000);
