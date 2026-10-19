@@ -13,6 +13,10 @@ import { MIGRATIONS } from "../src/db-schema.ts";
 import { resolveIdentity } from "../src/identity-setup.ts";
 import { base64UrlEncode } from "../src/json.ts";
 import { executeSqliteMigrationStatements } from "../src/migrate-sqlite.ts";
+import {
+  createSharedPrincipalAuthorityStore,
+  type FreshSharedPrincipal,
+} from "../src/shared-principal-authority.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 
 // A migration-component regression against historical100 plus actual owner101/102
@@ -540,6 +544,50 @@ test("the host statement framer composes the full103 alternative in its one owni
   await expect(f.sql.run(insertShared)).resolves.toMatchObject({ changes: 1 });
   expect(f.db.query("PRAGMA foreign_key_check").all()).toEqual([]);
   expect(f.db.query("PRAGMA defer_foreign_keys").get()).toEqual({ defer_foreign_keys: 0 });
+  noScratch(f.db);
+});
+
+// The fixed fresh-shared storage recipe must commit on the actual full103 chain,
+// not only on the synthetic candidate fixture. Its rows stay DATA; no genuine
+// RP/human proof, deployed target or consumer capability follows.
+test("fresh shared Principal storage commits on the full103 chain without NULL identity text", async () => {
+  const f = await fixture();
+  f.db.exec("BEGIN IMMEDIATE");
+  try {
+    executeOpaqueHostAuthMigration(f.db, "full103");
+    f.db.exec("COMMIT");
+  } catch (error) {
+    f.db.exec("ROLLBACK");
+    throw error;
+  }
+  const digestRef = (text: string) => `sha256:${digest(text)}` as const;
+  const input: FreshSharedPrincipal = {
+    principalId: "prn_full103_fresh",
+    principalIncarnation: "principal_inc_full103_fresh",
+    createdAt: "2026-10-19T00:00:00.000Z",
+    origin: { ref: "synthetic:origin:full103", digest: digestRef("origin") },
+    binding: {
+      ref: "binding_full103_fresh",
+      issuer: "https://issuer.invalid",
+      subject: "account_full103_fresh",
+      controllerIncarnation: "controller_1",
+      targetRef: "synthetic:server-target",
+      evidence: { ref: "synthetic:verified-binding:full103:1", digest: digestRef("binding") },
+      enrolledAt: "2026-10-19T00:00:00.000Z",
+    },
+  };
+  const retained = await createSharedPrincipalAuthorityStore({
+    sql: f.sql,
+  }).createFreshWithPostimages(input);
+  expect(retained.principal).toEqual({
+    id: input.principalId,
+    provider: "shared-account",
+    provider_subject: input.binding.ref,
+    email: "",
+    display_name: "",
+    created_at: input.createdAt,
+  });
+  expect(f.db.query("PRAGMA foreign_key_check").all()).toEqual([]);
   noScratch(f.db);
 });
 

@@ -443,7 +443,7 @@ function freshSharedPlan(input: FreshSharedPrincipal) {
   const statements = Object.freeze([
     statement(
       `INSERT INTO principals (id,provider,provider_subject,email,display_name,created_at)
-          VALUES (?,'shared-account',?,NULL,NULL,?)`,
+          VALUES (?,'shared-account',?,'','',?)`,
       [principalId, selected.ref, createdAt],
     ),
     statement(
@@ -570,8 +570,8 @@ export function createSharedPrincipalAuthorityStore(options: { readonly sql: Sql
         id: plan.principalId,
         provider: "shared-account",
         provider_subject: plan.selected.ref,
-        email: null,
-        display_name: null,
+        email: "",
+        display_name: "",
         created_at: plan.createdAt,
       });
       const anchorRow = exactReturnedRow(anchorWrite.rows[0], {

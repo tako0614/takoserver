@@ -6,12 +6,11 @@ CREATE TABLE principals (
   id TEXT PRIMARY KEY NOT NULL,
   provider TEXT NOT NULL,
   provider_subject TEXT NOT NULL,
-  email TEXT,
-  display_name TEXT,
+  email TEXT NOT NULL,
+  display_name TEXT NOT NULL,
   created_at TEXT NOT NULL,
   UNIQUE (provider, provider_subject),
-  CHECK (provider IN ('takos-id', 'google', 'github', 'shared-account')),
-  CHECK (provider = 'shared-account' OR (email IS NOT NULL AND display_name IS NOT NULL))
+  CHECK (provider IN ('takos-id', 'google', 'github', 'shared-account'))
 );
 
 CREATE TABLE orgs (id TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,

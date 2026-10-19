@@ -557,7 +557,7 @@ test("Auth authority Principal deletion fences classes preserves history and blo
   expect((await f.principals.readBinding(b.binding.ref))?.state).toBe("retired");
   expect((await f.classes.readRetained(b.origin.ref))?.state).toBe("retired");
   await expect(
-    f.sql.run("INSERT INTO principals VALUES (?,'shared-account',?,NULL,NULL,?)", [
+    f.sql.run("INSERT INTO principals VALUES (?,'shared-account',?,'','',?)", [
       b.binding.principalId,
       b.binding.ref,
       "2026-10-15T00:00:00.000Z",
