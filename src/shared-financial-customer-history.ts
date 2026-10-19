@@ -1,4 +1,7 @@
+import { assertFinancial0104CustomerWriteShape } from "./financial-0104-customer-schema.ts";
+import { isFinancialMoneyFencedBatch } from "./financial-0104-money-fence.ts";
 import { canonicalJson } from "./json.ts";
+import { assertMoneyCutoverSqlOrigin } from "./money-cutover-sql.ts";
 import { type JsonValue, type Row, type Sql, SqlError, type SqlStatement } from "./ports.ts";
 
 /** Unmounted private H0 component. Syntactic captured inputs are NOT source authentication. */
@@ -188,11 +191,12 @@ function inputs(root: HistoryRoot, run: HistoryEnrollment): void {
     if (!run.required.some((s) => s.scopeKind === kind))
       throw new SqlError("invalid", "missing required fixture scope family");
 }
-/** Current SQL facts are actual same-primary rows, not cached JS readiness. Full genuine capture remains unmounted. */
+/** Current SQL facts are actual same-primary rows, not cached JS readiness. Full genuine capture remains unmounted.
+ * Money currentness is not read here: every H0 table is 0104 money-fenced (freeze,
+ * Root permit and the root's own writer epoch) inside Root's Money writer. */
 function current(alias: string): string {
   return `EXISTS(SELECT 1 FROM stripe_mode_realm m WHERE m.singleton=1 AND m.mode IS json_extract(${alias}.root_json,'$.mode'))
- AND EXISTS(SELECT 1 FROM stripe_billing_account_realms a WHERE a.singleton=1 AND a.account_id IS json_extract(${alias}.root_json,'$.accountId') AND a.mode IS json_extract(${alias}.root_json,'$.mode') AND a.billing_authority IS json_extract(${alias}.root_json,'$.billingAuthority'))
- AND EXISTS(SELECT 1 FROM money_cutover_authorized_epoch a WHERE a.singleton=1 AND a.writer_epoch IS json_extract(${alias}.root_json,'$.writerEpoch')) AND NOT EXISTS(SELECT 1 FROM money_cutover_freeze)`;
+ AND EXISTS(SELECT 1 FROM stripe_billing_account_realms a WHERE a.singleton=1 AND a.account_id IS json_extract(${alias}.root_json,'$.accountId') AND a.mode IS json_extract(${alias}.root_json,'$.mode') AND a.billing_authority IS json_extract(${alias}.root_json,'$.billingAuthority'))`;
 }
 const rootMatch = `r.primary_ref=? AND r.root_json=? AND ${current("r")}`;
 export function prepareHistoryStart(
@@ -282,7 +286,13 @@ export function prepareHistoryStart(
       run.startReceiptRef,
     ],
   };
-  return [rootInsert, runInsert, head, last];
+  return fenced([rootInsert, runInsert, head, last]);
+}
+/** Every H0 statement writes one 0104 money-fenced history table; nothing else is built. */
+function fenced<T extends readonly SqlStatement[]>(statements: T): T {
+  if (!isFinancialMoneyFencedBatch(statements))
+    throw new SqlError("invalid", "history batch must write only money-fenced tables");
+  return statements;
 }
 export function prepareHistoryInventory(
   root: HistoryRoot,
@@ -293,7 +303,7 @@ export function prepareHistoryInventory(
   inputs(root, run);
   if (!validRef(inventoryRef) || !run.required.some((s) => encode(s) === encode(evidence)))
     throw new SqlError("invalid", "inventory not in original required set");
-  return {
+  const statement: SqlStatement = {
     sql: `INSERT INTO financial_history_enrollment_inventory(inventory_ref,enrollment_ref,primary_ref,scope_kind,original_scope_ref,original_scope_incarnation,evidence_json) SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM financial_history_primary_roots r WHERE ${rootMatch})`,
     params: [
       inventoryRef,
@@ -307,6 +317,8 @@ export function prepareHistoryInventory(
       encode(root),
     ],
   };
+  fenced([statement]);
+  return statement;
 }
 export function prepareHistorySeal(
   root: HistoryRoot,
@@ -316,7 +328,7 @@ export function prepareHistorySeal(
   inputs(root, run);
   if (!Number.isSafeInteger(sequence) || sequence < 0)
     throw new SqlError("invalid", "invalid capture sequence");
-  return [
+  return fenced([
     {
       sql: `UPDATE financial_history_enrollment_heads SET state='sealed',expected_receipt_ref=? WHERE primary_ref=? AND enrollment_ref=? AND generation=? AND capture_sequence=? AND state='capturing' AND EXISTS(SELECT 1 FROM financial_history_primary_roots r WHERE ${rootMatch})`,
       params: [
@@ -352,7 +364,7 @@ export function prepareHistorySeal(
         run.sealReceiptRef,
       ],
     },
-  ];
+  ]);
 }
 function detached(
   root: HistoryRoot,
@@ -412,6 +424,16 @@ export function prepareHistoryReceiptRead(
   };
 }
 export function createHistoryH0Component(sql: Sql) {
+  /** Root hands H0 only its Money writer, created for exactly the root's own writer
+   * epoch (as R1 binds its epoch); a raw Sql or another epoch is refused before any
+   * SQL. Writes also require the exact fenced 0104 Customer shape. */
+  function framed(root: HistoryRoot): void {
+    try {
+      assertMoneyCutoverSqlOrigin(sql, { writerEpoch: root.writerEpoch });
+    } catch {
+      throw new SqlError("unavailable", "history writer must be Root's Money writer for its epoch");
+    }
+  }
   /** Raw diagnostic SELECT only. Completion paths never use this unselected read. */
   async function receipt(ref: string): Promise<Row | null> {
     return (
@@ -440,9 +462,12 @@ export function createHistoryH0Component(sql: Sql) {
     receipt,
     async start(root: HistoryRoot, run: HistoryEnrollment) {
       const fixed = detached(root, run);
+      framed(fixed.root);
       const saved = await originalReceipt(fixed.root, fixed.run, "capture-start", null);
       if (saved) return saved;
-      await sql.batch(prepareHistoryStart(fixed.root, fixed.run));
+      const statements = prepareHistoryStart(fixed.root, fixed.run);
+      await assertFinancial0104CustomerWriteShape(sql);
+      await sql.batch(statements);
       const completed = await originalReceipt(fixed.root, fixed.run, "capture-start", null);
       if (!completed) throw new SqlError("unavailable", "completed history receipt missing");
       return completed;
@@ -454,6 +479,8 @@ export function createHistoryH0Component(sql: Sql) {
       ref: string,
     ) {
       const statement = prepareHistoryInventory(root, run, evidence, ref);
+      framed(root);
+      await assertFinancial0104CustomerWriteShape(sql);
       const result = await sql.run(statement.sql, statement.params);
       if (result.changes !== 1) throw new SqlError("constraint", "inventory currentness failed");
     },
@@ -461,9 +488,12 @@ export function createHistoryH0Component(sql: Sql) {
       const fixed = detached(root, run);
       if (!Number.isSafeInteger(sequence) || sequence < 0)
         throw new SqlError("invalid", "invalid capture sequence");
+      framed(fixed.root);
       const saved = await originalReceipt(fixed.root, fixed.run, "complete-seal", sequence);
       if (saved) return saved;
-      await sql.batch(prepareHistorySeal(fixed.root, fixed.run, sequence));
+      const statements = prepareHistorySeal(fixed.root, fixed.run, sequence);
+      await assertFinancial0104CustomerWriteShape(sql);
+      await sql.batch(statements);
       const completed = await originalReceipt(fixed.root, fixed.run, "complete-seal", sequence);
       if (!completed) throw new SqlError("unavailable", "completed history receipt missing");
       return completed;

@@ -124,7 +124,8 @@ function acknowledgement(
 ): CustomerBatchAcknowledgementData | null {
   try {
     const result = detached(value);
-    if (!Array.isArray(result) || result.length !== (phase === "L1" ? 9 : 8)) return null;
+    // Root's Money writer returns only the Customer statements' results.
+    if (!Array.isArray(result) || result.length !== (phase === "L1" ? 7 : 6)) return null;
     const physicalResults: { index: number; changes: 1; returnedRows: 0 }[] = [];
     for (let index = 0; index < result.length; index++) {
       const item = result[index];
@@ -255,7 +256,7 @@ function matchesOriginal(
 }
 
 /**
- * Executes only this module's actual frozen compiler output, including permit0/last.
+ * Executes only this module's actual frozen compiler output; the permit frame is Root's.
  * Own-data method/receiver identity is checked before/after every await. This is
  * NOT a Root physical-primary assertion or a qualified production constructor.
  */

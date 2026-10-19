@@ -1,7 +1,12 @@
 /** PRIVATE finite Customer phase SQL compiler. Immutable SQL DATA, never an executor/issuer.
  * No Root backing-origin assertion exists in this closure. Only an actual owning, qualified
  * S/R composition may eventually execute a plan; these objects confer no payer/native authority.
+ * A plan holds only Customer statements (L1 7, D 6, N 6) and names no money_cutover_*
+ * table: Root's Money writer adds its own permit frame around it, and every row the
+ * plan writes is 0104 money-fenced (Financial) or 0105 money-fenced (Root Stripe).
  */
+
+import { isFinancialCustomerMoneyFencedBatch } from "./financial-0104-money-fence.ts";
 import { canonicalJson } from "./json.ts";
 import { SqlError, type SqlParam, type SqlStatement } from "./ports.ts";
 import {
@@ -11,8 +16,8 @@ import {
 } from "./shared-financial-admission.ts";
 import {
   CUSTOMER_CHAIN_MATCH,
+  CUSTOMER_COVERAGE_FENCED_MATCH,
   CUSTOMER_COVERAGE_JOINS,
-  CUSTOMER_COVERAGE_MATCH,
   CUSTOMER_MATCH_CTES,
   type CustomerJournalSnapshot,
   captureCustomerJournalSnapshot,
@@ -67,7 +72,7 @@ export interface CustomerPhasePlan {
   readonly historyReceiptRef: string;
   readonly couplingAttemptRef: string;
   readonly commandKey: string;
-  readonly firstDispatchResultIndex: 2 | null;
+  readonly firstDispatchResultIndex: 1 | null;
 }
 function fail(): never {
   throw new SqlError("invalid", "invalid closed Customer phase data");
@@ -278,7 +283,7 @@ function anchorQuery(
  AND previous.journal_sequence IS old.journal_sequence AND previous.expected_history_receipt_ref IS old.last_expected_receipt_ref
  AND previous.evidence_kind='${previousKind}'
  AND old.state='active'
- AND ${CUSTOMER_COVERAGE_MATCH} AND ${OLD_CHAIN} AND ${currentState(state)}
+ AND ${CUSTOMER_COVERAGE_FENCED_MATCH} AND ${OLD_CHAIN} AND ${currentState(state)}
  AND NOT EXISTS(SELECT 1 FROM financial_customer_history_entries extra WHERE extra.history_ref=cv.history_ref AND extra.journal_sequence>old.journal_sequence
  AND (extra.entry_ref IS NOT ${V("entryRef")} OR extra.journal_sequence<>old.journal_sequence+1 OR extra.expected_history_receipt_ref IS NOT ${V("historyReceiptRef")}))`;
 }
@@ -647,19 +652,13 @@ export function compileCustomerPhase(input: CustomerPhaseInput): CustomerPhasePl
       ),
     );
   }
-  const statements: SqlStatement[] = [
-    {
-      sql: "INSERT INTO money_cutover_writer_permit(singleton,epoch,writer_epoch) VALUES(1,'usd-micros-v2',?)",
-      params: [q.writerEpoch],
-    },
-    ...core,
-    ...suffix(q, data),
-    {
-      sql: "DELETE FROM money_cutover_writer_permit WHERE singleton=1 AND epoch='usd-micros-v2' AND writer_epoch=?",
-      params: [q.writerEpoch],
-    },
-  ];
-  if (statements.length !== (q.phase === "L1" ? 9 : 8)) fail();
+  // Root's Money writer frames this plan with its own permit insert/delete.
+  const statements: SqlStatement[] = [...core, ...suffix(q, data)];
+  if (
+    statements.length !== (q.phase === "L1" ? 7 : 6) ||
+    !isFinancialCustomerMoneyFencedBatch(statements)
+  )
+    fail();
   return freeze({
     qualification: "private-mechanical-sql-data",
     phase: q.phase,
@@ -673,6 +672,6 @@ export function compileCustomerPhase(input: CustomerPhaseInput): CustomerPhasePl
     historyReceiptRef: q.historyReceiptRef,
     couplingAttemptRef: q.couplingAttemptRef,
     commandKey: q.admission.original.key,
-    firstDispatchResultIndex: q.phase === "D" ? 2 : null,
+    firstDispatchResultIndex: q.phase === "D" ? 1 : null,
   });
 }

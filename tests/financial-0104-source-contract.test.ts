@@ -44,6 +44,11 @@ import {
   MONEY_CUTOVER_PERMIT_DDL,
   MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
 } from "../src/money-cutover-sql.ts";
+import type { Sql } from "../src/ports.ts";
+import {
+  createSharedFinancialAdmissionComponent,
+  prepareCustomerAdmissionBatch,
+} from "../src/shared-financial-admission.ts";
 import { prepareConsentBatch } from "../src/shared-financial-consent-data.ts";
 import {
   buildFinancialR1AttemptCustodyStatement,
@@ -1078,6 +1083,87 @@ describe("Financial 0104 consent batch through the existing Money writer", () =>
       expect(await rotated.batch([revoke])).toHaveLength(1);
       expect(count(f.db, "financial_payer_grant_revocations")).toBe(1);
       expect(count(f.db, "money_cutover_writer_permit")).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+});
+
+describe("Financial 0104 Customer admission through the existing Money writer", () => {
+  const ROWS = [
+    "financial_customer_admissions",
+    "stripe_billing_customer_commands",
+    "stripe_customer_admission_links",
+    "financial_customer_admission_receipts",
+    "money_cutover_writer_permit",
+  ] as const;
+  test("acceptCustomerCreation refuses raw Sql, a foreign writer and an unfenced shape, rolls back under freeze, then commits", async () => {
+    const f = await consentFixture();
+    try {
+      const epoch = (
+        f.db.query("SELECT writer_epoch FROM money_cutover_authorized_epoch").get() as {
+          writer_epoch: string;
+        }
+      ).writer_epoch;
+      const batch = prepareCustomerAdmissionBatch(f.admission);
+      expect(batch).toHaveLength(4);
+      for (const statement of batch) expect(statement.sql).not.toMatch(MONEY_WORDS);
+      const counts = () => ROWS.map((table) => count(f.db, table));
+      expect(counts()).toEqual([0, 0, 0, 0, 0]);
+      // A raw Sql is refused before any SQL is sent.
+      const calls: string[] = [];
+      const raw: Sql = {
+        async query(sql, params) {
+          calls.push("query");
+          return f.sql.query(sql, params);
+        },
+        async run(sql, params) {
+          calls.push("run");
+          return f.sql.run(sql, params);
+        },
+        async batch(statements) {
+          calls.push("batch");
+          return f.sql.batch(statements);
+        },
+      };
+      await expect(
+        createSharedFinancialAdmissionComponent(raw, { writerEpoch: epoch }).acceptCustomerCreation(
+          f.admission,
+        ),
+      ).rejects.toThrow("Root's Money writer");
+      expect(calls).toEqual([]);
+      // A Money writer for any other epoch is refused the same way.
+      await expect(
+        createSharedFinancialAdmissionComponent(createMoneyCutoverSql(f.sql, ROTATED), {
+          writerEpoch: epoch,
+        }).acceptCustomerCreation(f.admission),
+      ).rejects.toThrow("Root's Money writer");
+      const component = createSharedFinancialAdmissionComponent(f.money, { writerEpoch: epoch });
+      // An unfenced shape (one Customer fence missing) is never written.
+      const fence = "financial_customer_admissions_money_fence";
+      const fenceSql = FINANCIAL_0104_CUSTOMER_FENCE_SCHEMA[fence] ?? "";
+      f.db.exec(`DROP TRIGGER ${fence}`);
+      await expect(component.acceptCustomerCreation(f.admission)).rejects.toThrow(
+        "exact fenced shape",
+      );
+      expect(counts()).toEqual([0, 0, 0, 0, 0]);
+      f.db.exec(fenceSql);
+      // Freeze: the whole four-row batch, Stripe rows included, rolls back.
+      f.db.exec(MONEY_FREEZE_ROW);
+      await expect(component.acceptCustomerCreation(f.admission)).rejects.toThrow(
+        /constraint: Financial Customer admission/u,
+      );
+      expect(counts()).toEqual([0, 0, 0, 0, 0]);
+      f.db.exec("DELETE FROM money_cutover_freeze");
+      // Missing permit: the same statements on the raw Sql are refused.
+      await expect(f.sql.batch(batch)).rejects.toThrow(/constraint: Financial Customer/u);
+      expect(counts()).toEqual([0, 0, 0, 0, 0]);
+      const receipt = await component.acceptCustomerCreation(f.admission);
+      expect(receipt.receiptRef).toBe(f.admission.receiptRef);
+      expect(counts()).toEqual([1, 1, 1, 1, 0]);
+      // Historical exact readback, no second write.
+      expect(await component.acceptCustomerCreation(f.admission)).toEqual(receipt);
+      expect(counts()).toEqual([1, 1, 1, 1, 0]);
     } finally {
       f.close();
     }

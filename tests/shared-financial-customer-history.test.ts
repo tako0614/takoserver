@@ -8,8 +8,11 @@ import { createAccounts } from "../src/auth.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { canonicalJson } from "../src/json.ts";
 import {
+  createMoneyCutoverSql,
   MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL,
   MONEY_CUTOVER_FREEZE_DDL,
+  MONEY_CUTOVER_PERMIT_DDL,
+  MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
 } from "../src/money-cutover-sql.ts";
 import { type Sql, SqlError, type SqlStatement } from "../src/ports.ts";
 import {
@@ -23,11 +26,19 @@ import {
   prepareHistoryStart,
 } from "../src/shared-financial-customer-history.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { installFinancial0104Fences } from "./helpers/financial-0104-fenced.ts";
 
 const ddl = readFileSync(
   new URL("./fixtures/shared-financial-customer-history-component-schema.sql", import.meta.url),
   "utf8",
 );
+/** The rest of the 0104 Customer candidates. H0 writes require the whole exact
+ * fenced 0104 Customer shape, so the fixture installs it with every fence. */
+const customerDdl = [
+  "financial-five-action-consent-schema.unnumbered.sql",
+  "customer-l1-schema.unnumbered.sql",
+  "customer-journal-schema.unnumbered.sql",
+].map((file) => readFileSync(new URL(`./fixtures/${file}`, import.meta.url), "utf8"));
 const ownTemporaryDirectories = new Set<string>();
 afterEach(() => {
   for (const path of ownTemporaryDirectories) rmSync(path, { recursive: true, force: true });
@@ -113,18 +124,26 @@ function enrollment(extra: readonly HistoryScope[] = []): HistoryEnrollment {
   };
 }
 
-function fixture(file = false) {
+/** The actual Money writer for the root's own epoch over a fixture transport. */
+const money = (transport: Sql) => createMoneyCutoverSql(transport, root.writerEpoch);
+function fixture(file = false, fenced = true) {
   const temporaryDirectory = file ? mkdtempSync(join(tmpdir(), "takoserver-history-h0-")) : null;
   if (temporaryDirectory) ownTemporaryDirectories.add(temporaryDirectory);
   const filename = temporaryDirectory ? join(temporaryDirectory, "history.sqlite") : ":memory:";
   const db = new Database(filename),
-    sql = createSqliteSql(db);
+    raw = createSqliteSql(db);
   for (const m of MIGRATIONS) db.exec(m.sql);
   expect(MIGRATIONS).toHaveLength(100);
   db.exec(MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL);
   db.exec(MONEY_CUTOVER_FREEZE_DDL);
+  db.exec(MONEY_CUTOVER_PERMIT_DDL);
+  db.exec(MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL);
   db.exec(ddl);
+  for (const candidate of customerDdl) db.exec(candidate);
+  if (fenced) installFinancial0104Fences(db, { customer: true });
   db.exec("PRAGMA recursive_triggers=OFF");
+  // Root hands H0 only its Money writer; raw is the fixture transport beneath it.
+  const sql = money(raw);
   db.query("INSERT INTO stripe_mode_realm VALUES(1,'test',?)").run(at);
   db.query("INSERT INTO stripe_billing_account_realms VALUES(1,?,'test',?,?)").run(
     root.accountId,
@@ -162,7 +181,7 @@ function fixture(file = false) {
     };
     return component.seal(root, run, h.capture_sequence);
   }
-  return { db, sql, component, snapshot, org, inventory, seal, filename };
+  return { db, raw, sql, component, snapshot, org, inventory, seal, filename };
 }
 async function constraint(call: () => Promise<unknown>) {
   let error: unknown;
@@ -179,13 +198,19 @@ test("zero Org/A/payer/H1 start, complete typed fixture inventory and mandatory 
   const f = fixture();
   try {
     expect(f.db.query("SELECT COUNT(*) n FROM orgs").get()).toEqual({ n: 0 });
-    expect(
+    // The exact 0104 Customer shape holds the payer/H1 tables, but H0 needs and
+    // writes none of their rows.
+    const dependents = (
       f.db
         .query(
-          "SELECT name FROM sqlite_schema WHERE name LIKE 'financial_payer_%' OR name LIKE 'financial_customer_history_coverages'",
+          "SELECT name FROM sqlite_schema WHERE type='table' AND (name LIKE 'financial_payer_%' OR name LIKE 'financial_customer_history_coverages')",
         )
-        .all(),
-    ).toEqual([]);
+        .all() as { name: string }[]
+    ).map((row) => row.name);
+    expect(dependents.length).toBeGreaterThan(0);
+    const empty = () =>
+      dependents.map((table) => f.db.query(`SELECT COUNT(*) n FROM ${table}`).get());
+    expect(empty()).toEqual(dependents.map(() => ({ n: 0 })));
     const run = enrollment();
     await f.component.start(root, run);
     await f.inventory(run);
@@ -193,6 +218,10 @@ test("zero Org/A/payer/H1 start, complete typed fixture inventory and mandatory 
     expect(r?.receipt_kind).toBe("complete-seal");
     expect(r?.all_rows_match).toBe(1);
     expect(f.db.query("PRAGMA foreign_key_check").all()).toEqual([]);
+    expect(empty()).toEqual(dependents.map(() => ({ n: 0 })));
+    expect(f.db.query("SELECT COUNT(*) n FROM money_cutover_writer_permit").get()).toEqual({
+      n: 0,
+    });
     profile.push(
       { label: "start", statements: prepareHistoryStart(root, run) },
       {
@@ -402,9 +431,9 @@ test("account/mode mismatch and epoch/freeze await drift fail in original SQL ba
       await f.inventory(run);
       const planned = prepareHistorySeal(root, run, 0);
       if (drift === "epoch")
-        await f.sql.run("UPDATE money_cutover_authorized_epoch SET writer_epoch=?", [S("revoked")]);
+        await f.raw.run("UPDATE money_cutover_authorized_epoch SET writer_epoch=?", [S("revoked")]);
       else
-        await f.sql.run(
+        await f.raw.run(
           "INSERT INTO money_cutover_freeze VALUES(1,'binding','origin','backup','writer','source')",
         );
       const before = f.snapshot();
@@ -571,11 +600,12 @@ test("committed DB ACK is actually dropped, then original replay uses retained r
   try {
     const run = enrollment();
     let drop = true;
-    const sql: Sql = {
-      query: (q, p) => f.sql.query(q, p),
-      run: (q, p) => f.sql.run(q, p),
+    // The ACK is dropped by the transport beneath Root's Money writer.
+    const transport: Sql = {
+      query: (q, p) => f.raw.query(q, p),
+      run: (q, p) => f.raw.run(q, p),
       async batch(s) {
-        const r = await f.sql.batch(s);
+        const r = await f.raw.batch(s);
         if (drop) {
           drop = false;
           throw new SqlError("unavailable", "synthetic ACK drop after actual commit");
@@ -583,6 +613,7 @@ test("committed DB ACK is actually dropped, then original replay uses retained r
         return r;
       },
     };
+    const sql = money(transport);
     await expect(createHistoryH0Component(sql).start(root, run)).rejects.toMatchObject({
       code: "unavailable",
     });
@@ -591,7 +622,7 @@ test("committed DB ACK is actually dropped, then original replay uses retained r
     expect(f.snapshot()).toBe(before);
     await f.inventory(run);
     await f.seal(run);
-    await f.sql.run("UPDATE money_cutover_authorized_epoch SET writer_epoch=?", [S("revoked")]);
+    await f.raw.run("UPDATE money_cutover_authorized_epoch SET writer_epoch=?", [S("revoked")]);
     const after = f.snapshot();
     await createHistoryH0Component(f.sql).seal(root, run, 0);
     expect(f.snapshot()).toBe(after);
@@ -613,7 +644,7 @@ test("adapter close and reopen is durable recovery, not OS restart or ACK-drop p
   f.db.close();
   const db = new Database(f.filename);
   try {
-    const sql = createSqliteSql(db);
+    const sql = money(createSqliteSql(db));
     expect(await createHistoryH0Component(sql).seal(root, run, 0)).not.toBeNull();
     expect(
       JSON.stringify(
@@ -1054,7 +1085,7 @@ test("strict original receipt keeps own replay after later head, rejects wrong w
     await completeAndClose(f, run);
     const saved = await f.component.receipt(run.sealReceiptRef);
     if (!saved) throw new Error("fixture original seal missing");
-    await f.sql.run("UPDATE money_cutover_authorized_epoch SET writer_epoch=?", [S("revoked")]);
+    await f.raw.run("UPDATE money_cutover_authorized_epoch SET writer_epoch=?", [S("revoked")]);
     const before = f.snapshot();
     expect(await f.component.seal(root, run, 0)).toEqual(saved);
     await constraint(() => f.component.seal(root, run, 1));
@@ -1093,8 +1124,8 @@ for (const method of ["start", "seal"] as const)
       const mutable = JSON.parse(JSON.stringify(run)) as HistoryEnrollment;
       const expected = mutable.required[1]!.sourceHeadRef;
       (mutable.required[1] as { sourceHeadRef: string }).sourceHeadRef = "head:wrong-at-entry";
-      const { barrier, wrapped } = queryBarrier(f.sql);
-      const api = createHistoryH0Component(wrapped);
+      const { barrier, wrapped } = queryBarrier(f.raw);
+      const api = createHistoryH0Component(money(wrapped));
       const before = f.snapshot();
       const pending = method === "start" ? api.start(root, mutable) : api.seal(root, mutable, 0);
       const outcome = pending.then(
@@ -1128,8 +1159,8 @@ test("postcommit mutation of root/run cannot redirect start readback to an older
       previousSealRef: run.sealReceiptRef,
     };
     const mutableRoot = { ...root };
-    const { barrier, wrapped } = batchBarrier(f.sql);
-    const pending = createHistoryH0Component(wrapped).start(mutableRoot, mutable);
+    const { barrier, wrapped } = batchBarrier(f.raw);
+    const pending = createHistoryH0Component(money(wrapped)).start(mutableRoot, mutable);
     await barrier.seen;
     Object.assign(mutable, run);
     mutableRoot.profileRef = "profile:changed-after-commit";
@@ -1148,8 +1179,8 @@ test("postcommit seal mutation cannot substitute old ref or nested original sele
     await f.component.start(root, run);
     await f.inventory(run);
     const mutable = JSON.parse(JSON.stringify(run)) as HistoryEnrollment;
-    const { barrier, wrapped } = batchBarrier(f.sql);
-    const pending = createHistoryH0Component(wrapped).seal(root, mutable, 0);
+    const { barrier, wrapped } = batchBarrier(f.raw);
+    const pending = createHistoryH0Component(money(wrapped)).seal(root, mutable, 0);
     await barrier.seen;
     (mutable as { sealReceiptRef: string }).sealReceiptRef = run.startReceiptRef;
     (mutable.required[1] as { sourceHeadRef: string }).sourceHeadRef = "head:changed-after-commit";
@@ -1263,4 +1294,109 @@ test("strict receipt and next-generation query profiles remain finite", () => {
   };
   profile.push({ label: "recapture-start", statements: prepareHistoryStart(root, next) });
   expect(profile.length).toBe(5);
+});
+
+test("H0 writes refuse raw Sql and a foreign Money writer before any SQL, and commit only inside the writer", async () => {
+  const f = fixture();
+  try {
+    const run = enrollment();
+    const first = run.required[0];
+    if (!first) throw new Error("fixture scope missing");
+    const calls: string[] = [];
+    const counted: Sql = {
+      async query(q, p) {
+        calls.push("query");
+        return f.raw.query(q, p);
+      },
+      async run(q, p) {
+        calls.push("run");
+        return f.raw.run(q, p);
+      },
+      async batch(s) {
+        calls.push("batch");
+        return f.raw.batch(s);
+      },
+    };
+    const before = f.snapshot();
+    for (const sql of [counted, f.raw, createMoneyCutoverSql(counted, S("foreign"))]) {
+      const component = createHistoryH0Component(sql);
+      await expect(component.start(root, run)).rejects.toThrow("Root's Money writer");
+      await expect(component.inventory(root, run, first, "inventory:raw")).rejects.toThrow(
+        "Root's Money writer",
+      );
+      await expect(component.seal(root, run, 0)).rejects.toThrow("Root's Money writer");
+    }
+    expect(calls).toEqual([]);
+    expect(f.snapshot()).toBe(before);
+    // Outside the permit frame every prepared H0 statement is refused by its fence.
+    await constraint(() => f.raw.batch(prepareHistoryStart(root, run)));
+    expect(f.snapshot()).toBe(before);
+    // Inside the actual writer for the root's own epoch the same statements commit.
+    expect((await f.sql.batch(prepareHistoryStart(root, run))).map((x) => x.changes)).toEqual([
+      1, 1, 1, 1,
+    ]);
+    expect(f.db.query("SELECT COUNT(*) n FROM money_cutover_writer_permit").get()).toEqual({
+      n: 0,
+    });
+  } finally {
+    f.db.close();
+  }
+});
+test("unfenced H0 shape stays readable for recovery but every write is refused, even inside the writer", async () => {
+  const fenced = fixture();
+  const run = enrollment();
+  try {
+    await fenced.component.start(root, run);
+    await fenced.inventory(run);
+    const saved = await fenced.seal(run);
+    const first = run.required[0];
+    if (!first) throw new Error("fixture scope missing");
+    // Drop one H0 fence: the original receipt remains a GET, a new write is refused.
+    fenced.db.exec("DROP TRIGGER financial_history_enrollment_receipts_money_fence");
+    expect(await fenced.component.seal(root, run, 0)).toEqual(saved);
+    const rows = fenced.snapshot();
+    await expect(
+      fenced.component.inventory(root, run, first, "inventory:after-unfence"),
+    ).rejects.toThrow("exact fenced shape");
+    expect(fenced.snapshot()).toBe(rows);
+  } finally {
+    fenced.db.close();
+  }
+  // The unfenced candidate: freeze, a foreign epoch or raw Sql never write.
+  const f = fixture(false, false);
+  try {
+    const before = f.snapshot();
+    await f.raw.run(
+      "INSERT INTO money_cutover_freeze VALUES(1,'binding','origin','backup','writer','source')",
+    );
+    await expect(f.component.start(root, run)).rejects.toThrow("exact fenced shape");
+    await f.raw.run("DELETE FROM money_cutover_freeze");
+    await expect(f.component.start(root, run)).rejects.toThrow("exact fenced shape");
+    await expect(createHistoryH0Component(f.raw).start(root, run)).rejects.toThrow(
+      "Root's Money writer",
+    );
+    await expect(
+      createHistoryH0Component(createMoneyCutoverSql(f.raw, S("foreign"))).start(root, run),
+    ).rejects.toThrow("Root's Money writer");
+    expect(f.snapshot()).toBe(before);
+  } finally {
+    f.db.close();
+  }
+});
+test("epoch-bound H0 fences refuse a current permit for another epoch and roll the whole batch back", async () => {
+  const f = fixture();
+  try {
+    const before = f.snapshot();
+    const rotated = S("rotated");
+    await f.raw.run("UPDATE money_cutover_authorized_epoch SET writer_epoch=?", [rotated]);
+    await constraint(() =>
+      createMoneyCutoverSql(f.raw, rotated).batch(prepareHistoryStart(root, enrollment())),
+    );
+    expect(f.snapshot()).toBe(before);
+    expect(f.db.query("SELECT COUNT(*) n FROM money_cutover_writer_permit").get()).toEqual({
+      n: 0,
+    });
+  } finally {
+    f.db.close();
+  }
 });

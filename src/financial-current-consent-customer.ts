@@ -1,3 +1,4 @@
+import { assertFinancial0104CustomerWriteShape } from "./financial-0104-customer-schema.ts";
 import {
   assertFinancialAuthConsumerPort,
   type FinancialAuthConsumerContext,
@@ -7,6 +8,7 @@ import {
   readWorkerRequestFinancialAuthConsumerPort,
 } from "./financial-auth-consumer.ts";
 import { canonicalJson } from "./json.ts";
+import { assertMoneyCutoverSqlOrigin } from "./money-cutover-sql.ts";
 import type { Row, Sql, SqlParam, SqlStatement, SqlWrite } from "./ports.ts";
 import { readSharedAuthFinancialConsentCurrentOriginalData } from "./shared-auth-financial-consent.ts";
 import { parseSharedAuthFinancialActionConsentOriginal } from "./shared-auth-financial-consent-contract.ts";
@@ -398,6 +400,15 @@ export function createFinancialCurrentConsentCustomerExecutor(
     assertOrigin();
     const plan = compileCustomerPhase(phase);
     if (!sameStatements(plan.statements, statements)) unavailable();
+    // The request Sql must be Root's Money writer for this phase's own epoch, and
+    // a write requires the exact fenced 0104 Customer shape; recovery reads do not.
+    try {
+      assertMoneyCutoverSqlOrigin(inputs.sql, { writerEpoch: phase.writerEpoch });
+      await assertFinancial0104CustomerWriteShape(inputs.sql);
+    } catch {
+      unavailable();
+    }
+    assertOrigin();
     if (consent.acceptedAt > current.sampledAt || current.sampledAt >= consent.expiresAt)
       unavailable();
     const rows: unknown = await Reflect.apply(query, inputs.sql, [

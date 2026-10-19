@@ -1,3 +1,4 @@
+import { isFinancialCustomerMoneyFencedBatch } from "./financial-0104-money-fence.ts";
 import { canonicalJson } from "./json.ts";
 import type { SqlParam, SqlStatement } from "./ports.ts";
 import { SHARED_AUTH_FINANCIAL_CONSENT_ISSUERS } from "./shared-auth-financial-consent-schema-plan.ts";
@@ -171,8 +172,9 @@ export function guardCustomerConsentReceipt(
   predicates: FinancialCurrentConsentPredicates,
 ): CustomerPhasePlan {
   if (plan.phase !== "L1" && plan.phase !== "D") unavailable();
-  const receiptIndex = plan.phase === "L1" ? 4 : 3;
-  if (plan.statements.length !== (plan.phase === "L1" ? 9 : 8)) unavailable();
+  // Customer statements only; Root's Money writer adds its permit frame around them.
+  const receiptIndex = plan.phase === "L1" ? 3 : 2;
+  if (plan.statements.length !== (plan.phase === "L1" ? 7 : 6)) unavailable();
   const selected = plan.statements[receiptIndex];
   if (!selected?.params || !predicates.root.params) unavailable();
   const target =
@@ -231,5 +233,6 @@ export function guardCustomerConsentReceipt(
     unavailable();
   const statements = [...plan.statements];
   statements[receiptIndex] = Object.freeze({ sql, params: Object.freeze(params) });
+  if (!isFinancialCustomerMoneyFencedBatch(statements)) unavailable();
   return Object.freeze({ ...plan, statements: Object.freeze(statements) });
 }

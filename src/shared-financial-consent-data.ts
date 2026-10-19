@@ -97,7 +97,8 @@ const CONSENT_FENCED = Object.freeze({
 });
 
 /** Exact observed Root helper SQL/params, not a substitute for missing Root private-origin assertion/readers.
- * Byte-identical for its existing consumers (Customer admission), whose writes are not 0104-fenced. */
+ * Kept byte-identical. No 0104 writer uses it: consent and Customer admission
+ * writes are all 0104 money-fenced and use consentGuard(). */
 export function guard(input: ConsentCandidate, organizationId: string) {
   return guardWith(input, organizationId, MONEY_CURRENT);
 }

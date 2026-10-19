@@ -879,8 +879,9 @@ const EXACT_CONTAINER_ADAPTER_IMPORTS: readonly {
   },
 ];
 
-/** Financial M/G/receiver writers bind their configured writer epoch exactly as
- * R1 does, through the Money writer origin assertion only. No other adapter access. */
+/** Financial M/G/receiver and Customer admission/history/current-consent writers
+ * bind their writer epoch exactly as R1 does, through the Money writer origin
+ * assertion only. No other adapter access. */
 const EXACT_FINANCIAL_MONEY_ORIGIN_IMPORTS: readonly {
   readonly source: string;
   readonly target: string;
@@ -890,6 +891,9 @@ const EXACT_FINANCIAL_MONEY_ORIGIN_IMPORTS: readonly {
   "src/shared-financial-source.ts",
   "src/shared-financial-source-enrollment.ts",
   "src/shared-financial-source-genesis-admission.ts",
+  "src/shared-financial-admission.ts",
+  "src/shared-financial-customer-history.ts",
+  "src/financial-current-consent-customer.ts",
 ].map((source) => ({
   source,
   target: "src/money-cutover-sql.ts",
