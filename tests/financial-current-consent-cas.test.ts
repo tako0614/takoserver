@@ -725,7 +725,8 @@ test("every Customer and H0 statement and every 0104 trigger compile within D1's
     for (const input of [l1, d, n]) {
       const plan =
         input.phase === "N" ? compileCustomerPhase(input) : await mechanicalGuard(f, input);
-      plan.statements.forEach((statement, index) => add(`${input.phase}[${index}]`, statement));
+      for (const [index, statement] of plan.statements.entries())
+        add(`${input.phase}[${index}]`, statement);
     }
     add("completed-read", completedCustomerReceiptReadStatement(f.admission.receiptRef));
     const rootRow = f.db.query("SELECT root_json FROM financial_history_primary_roots").get() as {
@@ -747,11 +748,11 @@ test("every Customer and H0 statement and every 0104 trigger compile within D1's
       previousSealRef: null,
       required: JSON.parse(String(runRow.required_json)),
     };
-    prepareHistoryStart(root, run).forEach((s, i) => add(`H0-start[${i}]`, s));
+    for (const [i, s] of prepareHistoryStart(root, run).entries()) add(`H0-start[${i}]`, s);
     const first = run.required[0];
     if (!first) throw new Error("required scope missing");
     add("H0-inventory", prepareHistoryInventory(root, run, first, "inventory:depth"));
-    prepareHistorySeal(root, run, 0).forEach((s, i) => add(`H0-seal[${i}]`, s));
+    for (const [i, s] of prepareHistorySeal(root, run, 0).entries()) add(`H0-seal[${i}]`, s);
     add("H0-close", prepareHistoryClose(root, run));
     // Root's Org DML with every 0104 and Org capture trigger compiled in.
     const org = { sql: "", params: [] as (string | number | null)[] };
