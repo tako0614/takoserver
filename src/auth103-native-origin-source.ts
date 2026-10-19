@@ -13,6 +13,7 @@ import { readAuth103SourceClock } from "./auth103-source-clock.ts";
 import { canonicalDigest, canonicalJson } from "./json.ts";
 import { type Row, type Sql, SqlError, type SqlParam } from "./ports.ts";
 import { SHARED_AUTH_STAGING_PROFILE } from "./shared-auth-oidc-client.ts";
+import type { SharedAuthFinancialProofReceiver } from "./shared-auth-session.ts";
 import type {
   WorkerRequestFinancialInputs,
   WorkerRequestSql,
@@ -360,6 +361,23 @@ export function readAuth103NativeRequestOrigin(
   assertOriginal(original);
   const { authSchemaRef, targetRef, sourceRef, clockPolicyRef } = original.manifest;
   return Object.freeze({ authSchemaRef, targetRef, sourceRef, clockPolicyRef });
+}
+
+/** Original code-selected platform binding only; absence is an unavailable proof path. */
+export async function captureAuth103NativeFinancialProofReceiver(
+  capture: Auth103NativeRequestOrigin,
+  connection: WorkerRequestSql,
+): Promise<SharedAuthFinancialProofReceiver | null> {
+  const original = originals.get(capture);
+  if (original === undefined || original.connection !== connection) return unavailable();
+  assertOriginal(original);
+  const platform = await import("./auth103-native-platform-origin.ts");
+  const receiver = platform.readAuth103NativeFinancialProofReceiver(
+    connection,
+    original.manifest.sourceCommit,
+  );
+  assertOriginal(original);
+  return receiver;
 }
 
 /**

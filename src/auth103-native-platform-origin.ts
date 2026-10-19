@@ -1,5 +1,6 @@
 import { env } from "cloudflare:workers";
 import { SqlError } from "./ports.ts";
+import type { SharedAuthFinancialProofReceiver } from "./shared-auth-session.ts";
 import {
   assertWorkerRequestNativeBinding,
   type WorkerRequestSql,
@@ -18,6 +19,100 @@ const originalArtifactDigest =
   artifactProperty !== undefined && "value" in artifactProperty
     ? artifactProperty.value
     : undefined;
+
+// This logical binding is projected only by the private selected Host recipe.
+// Capture the module-load platform value before any request-scoped withEnv().
+const financialProofProperty = Object.getOwnPropertyDescriptor(env, "ACCOUNTS_FINANCIAL_PROOF");
+const originalFinancialProof: unknown =
+  financialProofProperty !== undefined && "value" in financialProofProperty
+    ? financialProofProperty.value
+    : undefined;
+const originalFinancialProve: unknown =
+  originalFinancialProof !== null &&
+  (typeof originalFinancialProof === "object" || typeof originalFinancialProof === "function")
+    ? Reflect.get(originalFinancialProof, "prove")
+    : undefined;
+const originalFinancialProofPrototype =
+  originalFinancialProof !== null &&
+  (typeof originalFinancialProof === "object" || typeof originalFinancialProof === "function")
+    ? Object.getPrototypeOf(originalFinancialProof)
+    : undefined;
+const originalFinancialProveOwnDescriptor =
+  originalFinancialProof !== null &&
+  (typeof originalFinancialProof === "object" || typeof originalFinancialProof === "function")
+    ? Object.getOwnPropertyDescriptor(originalFinancialProof, "prove")
+    : undefined;
+const originalFinancialProvePrototypeDescriptor =
+  originalFinancialProofPrototype !== null &&
+  (typeof originalFinancialProofPrototype === "object" ||
+    typeof originalFinancialProofPrototype === "function")
+    ? Object.getOwnPropertyDescriptor(originalFinancialProofPrototype, "prove")
+    : undefined;
+// Workerd RPC stubs can return a fresh callable on every property read. The
+// first callable remains the only one invoked; ordinary stable JS methods
+// retain exact identity checks, while native dynamic stubs require no shadow.
+const originalFinancialProveStable =
+  typeof originalFinancialProve === "function" &&
+  originalFinancialProof !== null &&
+  (typeof originalFinancialProof === "object" || typeof originalFinancialProof === "function") &&
+  Reflect.get(originalFinancialProof, "prove") === originalFinancialProve;
+
+function assertOriginalFinancialProof(): void {
+  const selected = Object.getOwnPropertyDescriptor(env, "ACCOUNTS_FINANCIAL_PROOF");
+  if (
+    originalFinancialProof === undefined ||
+    selected === undefined ||
+    !("value" in selected) ||
+    selected.value !== originalFinancialProof ||
+    selected.configurable !== financialProofProperty?.configurable ||
+    selected.enumerable !== financialProofProperty?.enumerable ||
+    selected.writable !== financialProofProperty?.writable ||
+    originalFinancialProof === null ||
+    (typeof originalFinancialProof !== "object" && typeof originalFinancialProof !== "function") ||
+    typeof originalFinancialProve !== "function" ||
+    Object.getPrototypeOf(originalFinancialProof) !== originalFinancialProofPrototype
+  )
+    throw new SqlError("unavailable", "Auth103 Accounts proof transport is unavailable");
+  const currentMethod = Reflect.get(originalFinancialProof, "prove");
+  if (originalFinancialProveStable) {
+    if (currentMethod !== originalFinancialProve)
+      throw new SqlError("unavailable", "Auth103 Accounts proof transport is unavailable");
+  } else if (
+    typeof currentMethod !== "function" ||
+    originalFinancialProveOwnDescriptor !== undefined ||
+    Object.getOwnPropertyDescriptor(originalFinancialProof, "prove") !== undefined ||
+    originalFinancialProofPrototype === null ||
+    originalFinancialProvePrototypeDescriptor !== undefined ||
+    Object.getOwnPropertyDescriptor(originalFinancialProofPrototype, "prove") !== undefined
+  ) {
+    throw new SqlError("unavailable", "Auth103 Accounts proof transport is unavailable");
+  }
+}
+
+/** The native source alone can obtain this fixed RPC adapter; no raw binding leaves. */
+export function readAuth103NativeFinancialProofReceiver(
+  connection: WorkerRequestSql,
+  sourceCommit: string,
+): SharedAuthFinancialProofReceiver | null {
+  assertAuth103NativePlatformOrigin(connection, sourceCommit);
+  if (originalFinancialProof === undefined) return null;
+  assertOriginalFinancialProof();
+  return Object.freeze({
+    async prove(input: { readonly accessToken: string; readonly challengeRef: string }) {
+      assertAuth103NativePlatformOrigin(connection, sourceCommit);
+      assertOriginalFinancialProof();
+      const method = originalFinancialProve;
+      if (typeof method !== "function")
+        throw new SqlError("unavailable", "Auth103 Accounts proof transport is unavailable");
+      try {
+        return await Reflect.apply(method, originalFinancialProof, [input]);
+      } finally {
+        assertAuth103NativePlatformOrigin(connection, sourceCommit);
+        assertOriginalFinancialProof();
+      }
+    },
+  });
+}
 
 // Dedicated original platform transports, captured before request withEnv()
 // scopes. Their bytes remain internal DATA and never become a native witness.

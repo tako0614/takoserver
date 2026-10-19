@@ -118,6 +118,7 @@ test("Root fixed3 and original RP pair are one batch, with exact returned postim
   const result = await createSharedRpPrincipalIssuanceStore({ sql: f.sql }).issueFreshOnce(data);
   expect(f.calls).toHaveLength(1);
   expect(f.calls[0]).toHaveLength(5);
+  expect(f.calls[0]?.every((statement) => (statement.params?.length ?? 0) <= 100)).toBe(true);
   expect(f.calls[0]?.[3]?.sql.startsWith("INSERT INTO shared_auth_sessions")).toBe(true);
   expect(f.calls[0]?.[4]?.sql).toContain("INSERT INTO credential_authority_classes");
   expect(result.principal.binding.ref).toBe(data.principal.binding.ref);

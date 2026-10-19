@@ -31,6 +31,7 @@ import {
   SESSION_TEST_ACCOUNT,
   SESSION_TEST_CONFIG,
   SESSION_TEST_CONSOLE,
+  SESSION_TEST_PERSONAL_ORGANIZATION,
 } from "./helpers/shared-auth-session-issuer.ts";
 
 const INITIAL_TIME = 1_800_000_000_000;
@@ -118,6 +119,7 @@ async function fixture() {
       .all();
     let now = INITIAL_TIME;
     const issuer = await createSharedSessionTestIssuer(() => now);
+    issuer.control.personalBillingOrganization = SESSION_TEST_PERSONAL_ORGANIZATION;
     const client = createStripeBillingClient({
       secretKey: "sk_test_request_native_fixture",
       mode: "test",

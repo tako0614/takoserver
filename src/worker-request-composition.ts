@@ -15,7 +15,10 @@ import {
   type VerifiedLocalPrincipalIssuance,
   type VerifiedLocalPrincipalIssuanceReader,
 } from "./auth.ts";
-import type { Auth103NativeRequestOrigin } from "./auth103-native-origin-source.ts";
+import {
+  type Auth103NativeRequestOrigin,
+  captureAuth103NativeFinancialProofReceiver,
+} from "./auth103-native-origin-source.ts";
 import { readAuth103SourceClock } from "./auth103-source-clock.ts";
 import {
   createCredentialAuthorityClassStore,
@@ -47,6 +50,7 @@ import { SHARED_AUTH_STAGING_PROFILE } from "./shared-auth-oidc-client.ts";
 import {
   createSharedAuthSession,
   type SharedAuthFinalSessionSelection,
+  type SharedAuthFinancialProofReceiver,
   type SharedAuthOrganizationPins,
   type SharedAuthPrincipalProjection,
   type SharedAuthSession,
@@ -64,6 +68,7 @@ import {
 import { createD1Sql, type D1DatabaseLike } from "./sql-d1.ts";
 import type { StripeBillingClient } from "./stripe-billing-client.ts";
 import { createAccountsWithQualifiedLocalIssuer } from "./worker-request-qualified-local-issuer.ts";
+import { createWorkerRequestSharedRpFreshSessionStore } from "./worker-request-shared-principal-issuance.ts";
 
 /** The native binding owns primary consistency; no Sql-shaped input selects it. */
 export interface WorkerRequestDatabase extends D1DatabaseLike {
@@ -355,8 +360,30 @@ const retainedRpCaptures = new WeakMap<
   object,
   {
     readonly connection: WorkerRequestSql;
+    readonly request: Request;
+    readonly workspaceId: string;
+    readonly inputs: WorkerRequestFinancialInputs;
+    readonly consumers: WorkerRequestConsumers;
+    readonly receiver: SharedAuthSession;
+    readonly inspect: SharedAuthSession["finalSessionSelection"];
+    readonly context: NonNullable<
+      Awaited<ReturnType<SharedAuthSession["observeFinalWorkspaceOrganization"]>>
+    >;
     readonly data: WorkerRequestRetainedRpData;
   }
+>();
+const retainedRpProofMethods = new WeakMap<
+  WorkerRequestSql,
+  {
+    readonly receiver: SharedAuthSession;
+    readonly method:
+      | ((selected: SharedAuthFinalSessionSelection, challengeRef: string) => Promise<unknown>)
+      | null;
+  }
+>();
+const retainedRpProofAttempts = new WeakMap<
+  object,
+  { readonly challengeRef: string; readonly pending: Promise<unknown> }
 >();
 
 /** Calls only this request graph's existing RP observer; no DTO/callback can mint a capture. */
@@ -473,8 +500,49 @@ export async function captureWorkerRequestRetainedRpSession(
     [retainedRpCaptureBrand]: true,
   };
   Object.freeze(capture);
-  retainedRpCaptures.set(capture, Object.freeze({ connection, data }));
+  retainedRpCaptures.set(
+    capture,
+    Object.freeze({
+      connection,
+      request,
+      workspaceId,
+      inputs,
+      consumers,
+      receiver,
+      inspect,
+      context,
+      data,
+    }),
+  );
   return capture;
+}
+
+/** The final context is held only here for the original grant operation. The
+ * public capture reader still returns secret-free DATA and no context/token. */
+function originalRetainedRpCapture(connection: WorkerRequestSql, capture: unknown) {
+  assertWorkerRequestBacking(connection);
+  const inputs = readWorkerRequestFinancialInputs(connection);
+  if (!capture || typeof capture !== "object") return null;
+  const original = retainedRpCaptures.get(capture);
+  if (original?.connection !== connection) return null;
+  if (
+    original.inputs !== inputs ||
+    original.consumers !== readWorkerRequestConsumers(connection) ||
+    original.consumers.sharedAuth !== original.receiver ||
+    inputs.sql !== original.consumers.sql ||
+    inputs.client !== original.consumers.client ||
+    inputs.realm !== original.consumers.realm ||
+    Object.getOwnPropertyDescriptor(original.receiver, "finalSessionSelection")?.value !==
+      original.inspect ||
+    Reflect.apply(original.inspect, original.receiver, [original.context]) !==
+      original.data.finalSession ||
+    original.context.workspaceId !== original.workspaceId ||
+    original.context.workspace.id !== original.workspaceId ||
+    original.context.workspaceRef !== original.data.selectedScope.workspaceRef ||
+    original.context.organizationId !== original.data.selectedScope.organizationId
+  )
+    throw new TypeError("Worker retained RP final context origin differs");
+  return original;
 }
 
 /** Historical DATA is readable only through its original request graph and opaque handle. */
@@ -482,11 +550,58 @@ export function readWorkerRequestRetainedRpCapture(
   connection: WorkerRequestSql,
   capture: unknown,
 ): WorkerRequestRetainedRpData | null {
-  assertWorkerRequestBacking(connection);
-  readWorkerRequestFinancialInputs(connection);
-  if (!capture || typeof capture !== "object") return null;
-  const original = retainedRpCaptures.get(capture);
-  return original?.connection === connection ? original.data : null;
+  return originalRetainedRpCapture(connection, capture)?.data ?? null;
+}
+
+/** One original request, final RP selection and challenge; an unknown proof is never resent. */
+export function proveWorkerRequestRetainedRpFinancialIdentityOriginal(
+  connection: WorkerRequestSql,
+  request: Request,
+  workspaceId: string,
+  challengeRef: string,
+  capture: WorkerRequestRetainedRpCapture,
+): Promise<unknown> {
+  const original = originalRetainedRpCapture(connection, capture);
+  const proof = retainedRpProofMethods.get(connection);
+  if (
+    !original ||
+    original.request !== request ||
+    original.workspaceId !== workspaceId ||
+    typeof challengeRef !== "string" ||
+    challengeRef.length === 0 ||
+    !proof ||
+    proof.receiver !== original.receiver ||
+    !proof.method
+  )
+    throw new TypeError("Worker retained RP proof origin unavailable");
+  const method = proof.method;
+  const receiver = proof.receiver;
+  const assertOriginal = () => {
+    if (
+      originalRetainedRpCapture(connection, capture) !== original ||
+      retainedRpProofMethods.get(connection) !== proof ||
+      Object.getOwnPropertyDescriptor(receiver, "proveFinalSessionFinancialIdentity")?.value !==
+        method
+    )
+      throw new TypeError("Worker retained RP proof origin differs");
+  };
+  assertOriginal();
+  const prior = retainedRpProofAttempts.get(capture);
+  if (prior) {
+    if (prior.challengeRef !== challengeRef)
+      throw new TypeError("Worker retained RP proof challenge differs");
+    return prior.pending;
+  }
+  const pending = Promise.resolve().then(async () => {
+    assertOriginal();
+    try {
+      return await Reflect.apply(method, receiver, [original.data.finalSession, challengeRef]);
+    } finally {
+      assertOriginal();
+    }
+  });
+  retainedRpProofAttempts.set(capture, Object.freeze({ challengeRef, pending }));
+  return pending;
 }
 
 /** Same-request retained RP row selections, not a distinct human or authority port.
@@ -1073,6 +1188,10 @@ export async function createWorkerRequestConsumersWithQualifiedLocalIssuer(
     identity: selected.identity,
     apiKeyAdministration,
   });
+  const financialProof = await captureAuth103NativeFinancialProofReceiver(
+    nativeOrigin,
+    selected.connection,
+  );
   if (
     readWorkerRequestNativeInitializationInputs(selected.connection) !== inputs ||
     nativeInitializations.get(selected.connection) !== held ||
@@ -1084,6 +1203,8 @@ export async function createWorkerRequestConsumersWithQualifiedLocalIssuer(
     construction,
     accounts,
     apiKeyAdministration,
+    financialProof,
+    nativeOrigin,
   });
 }
 
@@ -1094,6 +1215,8 @@ function constructWorkerRequestConsumers(
     readonly construction: object;
     readonly accounts: Accounts;
     readonly apiKeyAdministration: ApiKeyAdministration;
+    readonly financialProof: SharedAuthFinancialProofReceiver | null;
+    readonly nativeOrigin: Auth103NativeRequestOrigin;
   } | null = null,
 ): WorkerRequestConsumers {
   const origin = requestOrigins.get(options.connection);
@@ -1154,7 +1277,16 @@ function constructWorkerRequestConsumers(
           identity: localIdentity,
         }));
   assertAuthTokenCaptureReader(accounts, { sql });
-  const store = createSharedAuthSessionStore(sql);
+  const ordinaryStore = createSharedAuthSessionStore(sql);
+  const fresh =
+    qualified === null
+      ? null
+      : createWorkerRequestSharedRpFreshSessionStore(
+          options.connection,
+          ordinaryStore,
+          qualified.nativeOrigin,
+        );
+  const store = fresh?.store ?? ordinaryStore;
   const finalStore = createSharedAuthFinalSessionStore(sql);
   const selected = options.sharedAuth;
   const sharedAuth = Object.freeze(
@@ -1171,10 +1303,22 @@ function constructWorkerRequestConsumers(
       store: () => store,
       finalStore: () => finalStore,
       principals: selected.principals,
+      ...(qualified?.financialProof ? { financialProof: qualified.financialProof } : {}),
       ...(selected.organizations === undefined ? {} : { organizations: selected.organizations }),
       ...(selected.fetch === undefined ? {} : { fetch: selected.fetch }),
       now: () => clock().getTime(),
     }),
+  );
+  fresh?.bindReceiver(sharedAuth);
+  const proofMethod = Object.getOwnPropertyDescriptor(
+    sharedAuth,
+    "proveFinalSessionFinancialIdentity",
+  );
+  if (proofMethod && ("get" in proofMethod || typeof proofMethod.value !== "function"))
+    throw new TypeError("Shared RP proof method origin differs");
+  retainedRpProofMethods.set(
+    options.connection,
+    Object.freeze({ receiver: sharedAuth, method: proofMethod?.value ?? null }),
   );
   const consumers = Object.freeze({
     sql,

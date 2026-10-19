@@ -43,6 +43,7 @@ import {
   createWorkerRequestConsumersWithUnregisteredLocalIssuer,
   createWorkerRequestSql,
   observeWorkerRequestAuthSchema,
+  proveWorkerRequestRetainedRpFinancialIdentityOriginal,
   readWorkerRequestConsumers,
   readWorkerRequestFinancialAuthSchemaObservation,
   readWorkerRequestFinancialInputs,
@@ -68,6 +69,7 @@ import {
   SESSION_TEST_CONSOLE,
   SESSION_TEST_ORGANIZATION,
   SESSION_TEST_PERSONAL,
+  SESSION_TEST_PERSONAL_ORGANIZATION,
 } from "./helpers/shared-auth-session-issuer.ts";
 import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
@@ -1090,6 +1092,7 @@ describe("Worker primary Auth schema observations", () => {
 async function retainedRpFixture(withClass = true) {
   const stamp = Date.now();
   const issuer = await createSharedSessionTestIssuer(() => stamp);
+  issuer.control.personalBillingOrganization = SESSION_TEST_PERSONAL_ORGANIZATION;
   const principalId = "prn_retained_rp_component";
   const control: {
     onResult?: (result: SqlWrite, originalStatementSql: string) => D1ResultLike | undefined;
@@ -1237,6 +1240,54 @@ async function retainedRpFixture(withClass = true) {
 }
 
 describe("Worker original RP final-touch retained DATA", () => {
+  test("financial proof keeps the original request and fails closed without a selected binding", async () => {
+    const r = await retainedRpFixture();
+    const request = r.request();
+    const capture = await captureWorkerRequestRetainedRpSession(
+      r.inputs.connection,
+      request,
+      SESSION_TEST_ORGANIZATION.id,
+    );
+    if (!capture) throw new Error("missing actual retained RP capture");
+    expect(financialRequestOrigin.proveWorkerRequestRetainedRpFinancialIdentityOriginal).toBe(
+      proveWorkerRequestRetainedRpFinancialIdentityOriginal,
+    );
+    const before = r.f.sessions.map((session) => session.queries.length);
+    const invoke = (selectedRequest: Request, selectedWorkspace: string) => () =>
+      proveWorkerRequestRetainedRpFinancialIdentityOriginal(
+        r.inputs.connection,
+        selectedRequest,
+        selectedWorkspace,
+        "synthetic:proof-challenge",
+        capture,
+      );
+    expect(invoke(r.request(), SESSION_TEST_ORGANIZATION.id)).toThrow();
+    expect(invoke(request, SESSION_TEST_PERSONAL.id)).toThrow();
+    const method = Object.getOwnPropertyDescriptor(
+      r.runtime.sharedAuth,
+      "proveFinalSessionFinancialIdentity",
+    )?.value;
+    if (typeof method === "function") {
+      const pending = invoke(request, SESSION_TEST_ORGANIZATION.id)();
+      expect(invoke(request, SESSION_TEST_ORGANIZATION.id)()).toBe(pending);
+      expect(() =>
+        proveWorkerRequestRetainedRpFinancialIdentityOriginal(
+          r.inputs.connection,
+          request,
+          SESSION_TEST_ORGANIZATION.id,
+          "different-challenge",
+          capture,
+        ),
+      ).toThrow();
+      await expect(pending).rejects.toThrow();
+    } else {
+      await expect(
+        Promise.resolve().then(invoke(request, SESSION_TEST_ORGANIZATION.id)),
+      ).rejects.toThrow();
+    }
+    expect(r.f.sessions.map((session) => session.queries.length)).toEqual(before);
+  });
+
   test("actual ACK postimage, original class and selected scope stay distinct", async () => {
     const r = await retainedRpFixture();
     const request = r.request();

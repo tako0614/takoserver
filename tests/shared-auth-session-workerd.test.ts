@@ -5,6 +5,7 @@ import {
   createSharedSessionTestIssuer,
   SESSION_TEST_CONFIG,
   SESSION_TEST_CONSOLE,
+  SESSION_TEST_PERSONAL_ORGANIZATION,
 } from "./helpers/shared-auth-session-issuer.ts";
 
 const NOW = 1_800_000_000_000;
@@ -13,6 +14,7 @@ const api = SESSION_TEST_CONFIG.publicOrigin;
 async function fixture() {
   let now = NOW;
   const issuer = await createSharedSessionTestIssuer(() => now);
+  issuer.control.personalBillingOrganization = SESSION_TEST_PERSONAL_ORGANIZATION;
   const build = await Bun.build({
     entrypoints: [new URL("./fixtures/shared-auth-session-worker.ts", import.meta.url).pathname],
     target: "browser",

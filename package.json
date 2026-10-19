@@ -9,6 +9,7 @@
     "./container-egress-policy": "./src/container-egress-policy.ts",
     "./container-image-admission": "./src/container-image-admission.ts",
     "./worker-entry": "./src/entry-worker.ts",
+    "./auth103-native-platform-origin": "./src/auth103-native-platform-origin.ts",
     "./financial-request-origin": "./src/financial-request-origin.ts",
     "./provider-extension": "./src/provider-extension.ts",
     "./provider-extension/selfhost": "./src/providers/selfhost-extension.ts",

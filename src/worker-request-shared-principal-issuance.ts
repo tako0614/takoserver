@@ -1,15 +1,24 @@
 import {
+  type Auth103NativeRequestOrigin,
+  auth103NativeRequestCurrentness,
+  readAuth103NativeRequestOrigin,
+  readAuth103NativeRpRegistrationOriginal,
+} from "./auth103-native-origin-source.ts";
+import { readAuth103SourceClock } from "./auth103-source-clock.ts";
+import {
   type CredentialAuthorityOrigin,
   createCredentialAuthorityClassStore,
   type RpAuthorityIdentity,
 } from "./credential-authority-class.ts";
+import { bytesDigest } from "./json.ts";
 import type { Row, Sql, SqlStatement, SqlWrite } from "./ports.ts";
 import {
+  readSharedAuthFreshSessionWrite,
   readSharedAuthVerifiedPrincipalInput,
   type SharedAuthPrincipalProjection,
   type SharedAuthVerifiedPrincipalData,
 } from "./shared-auth-session.ts";
-import type { OidcSessionRecord } from "./shared-auth-session-store.ts";
+import type { OidcSessionRecord, SharedAuthSessionStore } from "./shared-auth-session-store.ts";
 import {
   AuthAuthorityStoreError,
   createSharedPrincipalAuthorityStore,
@@ -21,6 +30,8 @@ import {
   createWorkerRequestConsumers,
   readWorkerRequestConsumers,
   readWorkerRequestFinancialInputs,
+  readWorkerRequestNativeInitializationInputs,
+  type WorkerRequestConsumers,
   type WorkerRequestSql,
 } from "./worker-request-composition.ts";
 import {
@@ -42,6 +53,9 @@ function unavailable(): never {
 }
 function invalid(): never {
   throw new AuthAuthorityStoreError("invalid");
+}
+function exactDigest(value: string): value is `sha256:${string}` {
+  return /^sha256:[0-9a-f]{64}$/u.test(value);
 }
 
 /** Own DATA only; snapshot all command/result bytes before any subsequent await. */
@@ -100,7 +114,10 @@ function batchMethod(sql: Sql): Sql["batch"] {
  * accepted. The caller must be the future genuine Root issuer; plain inputs and
  * this returned DATA never establish RP verification, human origin or admission.
  */
-export function createSharedRpPrincipalIssuanceStore(options: { readonly sql: Sql }) {
+function createSharedRpPrincipalIssuanceStoreInternal(
+  options: { readonly sql: Sql },
+  nativeCurrentness: (() => ReturnType<typeof auth103NativeRequestCurrentness>) | null,
+) {
   const sql = options.sql;
   const originalBatch = batchMethod(sql);
   let attempted = false;
@@ -143,8 +160,32 @@ export function createSharedRpPrincipalIssuanceStore(options: { readonly sql: Sq
           if (attempted || principalStatements.length !== 3) return unavailable();
           assertSql();
           attempted = true; // No retry after invocation/unknown; not durable phase permission.
+          let companion: SqlStatement = pair[1];
+          if (nativeCurrentness !== null) {
+            const current = nativeCurrentness();
+            const marker = "CASE WHEN ";
+            const params = companion.params;
+            if (
+              !companion.sql.startsWith("INSERT INTO credential_authority_classes ") ||
+              !companion.sql.endsWith(" RETURNING *") ||
+              companion.sql.split(marker).length !== 2 ||
+              !params ||
+              params.length < 7
+            )
+              return unavailable();
+            // The fixed class recipe places six base fields before the guarded
+            // principal_id. Keep the native source predicate in that mandatory
+            // last statement, so stale source rolls back the entire fixed five.
+            companion = Object.freeze({
+              sql: companion.sql.replace(marker, `${marker}(${current.sql}) AND `),
+              params: Object.freeze([...params.slice(0, 6), ...current.params, ...params.slice(6)]),
+            });
+          }
+          const fixedFive = Object.freeze([...principalStatements, pair[0], companion]);
+          if (fixedFive.some((statement) => (statement.params?.length ?? 0) > 100))
+            return unavailable();
           const original: readonly SqlWrite[] = await Reflect.apply(originalBatch, sql, [
-            Object.freeze([...principalStatements, ...pair]),
+            fixedFive,
           ]);
           assertSql();
           let writes: readonly SqlWrite[];
@@ -243,6 +284,10 @@ export function createSharedRpPrincipalIssuanceStore(options: { readonly sql: Sq
   });
 }
 
+export function createSharedRpPrincipalIssuanceStore(options: { readonly sql: Sql }) {
+  return createSharedRpPrincipalIssuanceStoreInternal(options, null);
+}
+
 /** Bind the contribution to the actual completed common request graph, not caller Sql. */
 export function createWorkerRequestSharedRpIssuanceContribution(connection: WorkerRequestSql) {
   const inputs = readWorkerRequestFinancialInputs(connection);
@@ -292,6 +337,159 @@ export function readWorkerRequestVerifiedSharedPrincipalInputs(
   )
     return unavailable();
   return Object.freeze({ inputs, principalOriginal });
+}
+
+interface PendingFreshRpIssuance {
+  readonly original: Parameters<SharedAuthPrincipalProjection["resolve"]>[1];
+  readonly held: WorkerRequestVerifiedSharedPrincipalInputs;
+  readonly nativeOrigin: Auth103NativeRequestOrigin;
+  readonly principal: FreshSharedPrincipal;
+  readonly registration: NonNullable<ReturnType<typeof readAuth103NativeRpRegistrationOriginal>>;
+  readonly credentialRef: string;
+  readonly credentialIncarnation: string;
+  readonly issuanceRef: string;
+}
+
+const freshRpIssuance = new WeakMap<WorkerRequestSql, PendingFreshRpIssuance>();
+const freshRpStores = new WeakMap<WorkerRequestSql, Auth103NativeRequestOrigin>();
+
+function originalFreshCurrent(connection: WorkerRequestSql, pending: PendingFreshRpIssuance): void {
+  assertWorkerRequestBackingOrigin(connection);
+  const held = readWorkerRequestVerifiedSharedPrincipalInputs(connection, pending.original);
+  const native = readAuth103NativeRequestOrigin(pending.nativeOrigin, connection);
+  const registration = readAuth103NativeRpRegistrationOriginal(pending.nativeOrigin, connection);
+  if (
+    freshRpIssuance.get(connection) !== pending ||
+    !held ||
+    held.inputs !== pending.held.inputs ||
+    held.principalOriginal !== pending.held.principalOriginal ||
+    !native ||
+    !registration ||
+    registration.registrationRef !== pending.registration.registrationRef ||
+    registration.registrationDigest !== pending.registration.registrationDigest ||
+    readAuth103SourceClock(held.inputs.clock) === null
+  )
+    unavailable();
+}
+
+/** Qualified constructor's exact original store, never a caller-selected issuer. */
+export function createWorkerRequestSharedRpFreshSessionStore(
+  connection: WorkerRequestSql,
+  ordinary: SharedAuthSessionStore,
+  nativeOrigin: Auth103NativeRequestOrigin,
+): Readonly<{
+  store: SharedAuthSessionStore;
+  bindReceiver(receiver: WorkerRequestConsumers["sharedAuth"]): void;
+}> {
+  assertWorkerRequestBackingOrigin(connection);
+  const native = readAuth103NativeRequestOrigin(nativeOrigin, connection);
+  const registration = readAuth103NativeRpRegistrationOriginal(nativeOrigin, connection);
+  if (
+    !native ||
+    !registration ||
+    readAuth103SourceClock(readWorkerRequestNativeInitializationInputs(connection).clock) ===
+      null ||
+    freshRpStores.has(connection)
+  )
+    return unavailable();
+  const originalCreate = Object.getOwnPropertyDescriptor(ordinary, "createSession");
+  if (!originalCreate || !("value" in originalCreate) || typeof originalCreate.value !== "function")
+    return unavailable();
+  let receiver: WorkerRequestConsumers["sharedAuth"] | null = null;
+  let attempted = false;
+  const store: SharedAuthSessionStore = Object.freeze({
+    ...ordinary,
+    async createSession(record: OidcSessionRecord): Promise<boolean> {
+      // A qualified fresh callback has no ordinary-write escape hatch. Lost
+      // acknowledgement, absent original, or stale source all refuse retry.
+      if (attempted) return unavailable();
+      attempted = true;
+      const selected = receiver;
+      const pending = freshRpIssuance.get(connection);
+      const original = selected && readSharedAuthFreshSessionWrite(selected, record);
+      if (
+        !selected ||
+        !pending ||
+        !original ||
+        original.original !== pending.original ||
+        original.session.digest !== record.digest ||
+        original.session.principalId !== pending.principal.principalId ||
+        original.session.workspaceId !== pending.held.principalOriginal.workspace.id ||
+        original.session.accountId !== pending.held.principalOriginal.identity.accountId ||
+        !exactDigest(record.digest)
+      )
+        return unavailable();
+      originalFreshCurrent(connection, pending);
+      const data = pending.held.principalOriginal;
+      if (data.phase !== "fresh-callback") return unavailable();
+      const nativeData = readAuth103NativeRequestOrigin(nativeOrigin, connection);
+      if (!nativeData || nativeData.targetRef !== pending.principal.binding.targetRef)
+        return unavailable();
+      const issuanceDigest = await bytesDigest(
+        new TextEncoder().encode(
+          JSON.stringify([nativeData.sourceRef, pending.issuanceRef, record.digest]),
+        ),
+      );
+      originalFreshCurrent(connection, pending);
+      const issuedAt = pending.principal.createdAt;
+      const credential: CredentialAuthorityOrigin = Object.freeze({
+        ref: pending.credentialRef,
+        incarnation: pending.credentialIncarnation,
+        targetRef: nativeData.targetRef,
+        principalId: pending.principal.principalId,
+        principalIncarnation: pending.principal.principalIncarnation,
+        issuanceRef: pending.issuanceRef,
+        issuanceDigest,
+        issuedAt,
+      });
+      const rp: RpAuthorityIdentity = Object.freeze({
+        principalBindingRef: pending.principal.binding.ref,
+        registrationRef: pending.registration.registrationRef,
+        registrationDigest: pending.registration.registrationDigest,
+        sessionDigest: record.digest,
+        sessionCreatedAt: record.createdAt,
+        enrolledSessionVersion: 0,
+        issuer: data.identity.issuer,
+        clientId: data.identity.clientId,
+        subject: data.identity.subject,
+        issuerSessionId: data.identity.sessionId,
+        authTime: data.identity.authTime,
+        accountId: data.identity.accountId,
+        workspaceId: data.workspace.id,
+        workspaceRef: data.workspaceOrganization.workspaceRef,
+      });
+      const input: FreshSharedRpIssuanceData = Object.freeze({
+        principal: pending.principal,
+        credential,
+        rp,
+        organizationId: data.workspaceOrganization.organizationId,
+        session: original.session,
+      });
+      const inputs = readWorkerRequestFinancialInputs(connection);
+      const consumers = readWorkerRequestConsumers(connection);
+      if (consumers.sharedAuth !== selected || inputs !== pending.held.inputs) return unavailable();
+      const issued = await createSharedRpPrincipalIssuanceStoreInternal({ sql: inputs.sql }, () =>
+        auth103NativeRequestCurrentness(nativeOrigin, connection),
+      ).issueFreshOnce(input);
+      originalFreshCurrent(connection, pending);
+      if (
+        issued.session.digest !== record.digest ||
+        issued.principal.binding.ref !== pending.principal.binding.ref ||
+        readWorkerRequestConsumers(connection) !== consumers
+      )
+        return unavailable();
+      freshRpIssuance.delete(connection);
+      return true;
+    },
+  });
+  freshRpStores.set(connection, nativeOrigin);
+  return Object.freeze({
+    store,
+    bindReceiver(actual) {
+      if (receiver !== null || freshRpStores.get(connection) !== nativeOrigin) return unavailable();
+      receiver = actual;
+    },
+  });
 }
 
 // Populated only after this actual original projection verifies the retained
@@ -367,10 +565,85 @@ export function createWorkerRequestSharedRpOriginalPrincipalProjection(
         compatibility.workspaceId !== workspace.id
       )
         return unavailable();
-      // The actual callback has not yet created its sealed OIDC session draft.
-      // Calling fixed5 here would invent that original input. No fallback to the
-      // externally selected projection, local issuer, random refs or old touch.
-      if (held.principalOriginal.phase !== "existing-session") return unavailable();
+      if (held.principalOriginal.phase === "fresh-callback") {
+        const bridge = freshRpStores.get(connection);
+        const { workspaceOrganization, identity } = held.principalOriginal;
+        if (
+          !bridge ||
+          freshRpIssuance.has(connection) ||
+          workspaceOrganization.workspaceId !== workspace.id ||
+          !workspaceOrganization.workspaceRef ||
+          !workspaceOrganization.organizationId
+        )
+          return unavailable();
+        const native = readAuth103NativeRequestOrigin(bridge, connection);
+        const registration = readAuth103NativeRpRegistrationOriginal(bridge, connection);
+        const clock = readAuth103SourceClock(held.inputs.clock);
+        if (
+          !native ||
+          !registration ||
+          !clock ||
+          registration.profile.issuer !== identity.issuer ||
+          registration.profile.clientId !== identity.clientId ||
+          registration.native.targetRef !== native.targetRef ||
+          registration.native.sourceRef !== native.sourceRef
+        )
+          return unavailable();
+        const at = held.inputs.clock().toISOString();
+        const evidenceBytes = new TextEncoder().encode(
+          JSON.stringify([
+            native.authSchemaRef,
+            native.targetRef,
+            native.sourceRef,
+            registration.registrationRef,
+            registration.registrationDigest,
+            identity,
+            workspace,
+            workspaceOrganization,
+            at,
+          ]),
+        );
+        const digest = await bytesDigest(evidenceBytes);
+        const current = readWorkerRequestVerifiedSharedPrincipalInputs(connection, original);
+        if (
+          !current ||
+          current.inputs !== held.inputs ||
+          current.principalOriginal !== held.principalOriginal ||
+          readAuth103NativeRequestOrigin(bridge, connection) === null ||
+          readAuth103SourceClock(held.inputs.clock) !== clock
+        )
+          return unavailable();
+        const id = () => crypto.randomUUID();
+        const principal: FreshSharedPrincipal = Object.freeze({
+          principalId: `prn_${id()}`,
+          principalIncarnation: `pri_${id()}`,
+          createdAt: at,
+          origin: Object.freeze({ ref: `pro_${id()}`, digest }),
+          binding: Object.freeze({
+            ref: `spb_${id()}`,
+            issuer: identity.issuer,
+            subject: identity.subject,
+            controllerIncarnation: `ctl_${id()}`,
+            targetRef: native.targetRef,
+            evidence: Object.freeze({ ref: `bev_${id()}`, digest }),
+            enrolledAt: at,
+          }),
+        });
+        freshRpIssuance.set(
+          connection,
+          Object.freeze({
+            original,
+            held,
+            nativeOrigin: bridge,
+            principal,
+            registration,
+            credentialRef: `cra_${id()}`,
+            credentialIncarnation: `cri_${id()}`,
+            issuanceRef: `iss_${id()}`,
+          }),
+        );
+        return Object.freeze({ accountId: identity.accountId, principalId: principal.principalId });
+      }
       const observation = held.principalOriginal.sessionObservation;
       const descriptor = Object.getOwnPropertyDescriptor(held.inputs.sql, "query");
       if (!descriptor || !("value" in descriptor) || typeof descriptor.value !== "function")

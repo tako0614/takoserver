@@ -54,6 +54,7 @@ import {
   SESSION_TEST_CONFIG,
   SESSION_TEST_CONSOLE,
   SESSION_TEST_ORGANIZATION,
+  SESSION_TEST_PERSONAL_ORGANIZATION,
 } from "./helpers/shared-auth-session-issuer.ts";
 
 // Synthetic protocol+SQLite/common-graph mechanics only. No installed/native103,
@@ -75,6 +76,7 @@ const cookieFrom = (response: Response, name: string) => {
 async function fixture() {
   const stamp = Date.now();
   const issuer = await createSharedSessionTestIssuer(() => stamp);
+  issuer.control.personalBillingOrganization = SESSION_TEST_PERSONAL_ORGANIZATION;
   const database = await createHostedBillingRealmTestDatabase();
   closes.push(() => database.db.close());
   for (const ddl of SHARED_AUTH_TEST_ONLY_DDL) database.db.exec(ddl);

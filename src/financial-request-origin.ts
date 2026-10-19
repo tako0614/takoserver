@@ -25,6 +25,7 @@ export type {
 export {
   captureWorkerRequestRetainedDirectOwnerSession,
   captureWorkerRequestRetainedRpSession,
+  proveWorkerRequestRetainedRpFinancialIdentityOriginal,
   readWorkerRequestFinancialInputs,
   readWorkerRequestRetainedCredentialInputs,
   readWorkerRequestRetainedRpCapture,
