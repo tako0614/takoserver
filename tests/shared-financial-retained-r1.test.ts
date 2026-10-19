@@ -234,9 +234,10 @@ async function fixture() {
     },
   };
   const store = createFinancialRetainedR1Store(options);
-  // Frozen C0 v3 embeds reserved-table SQL that Root S rejects. Keep that older
-  // C0 prepare as an explicitly mechanical generic-R fixture on this same primary;
-  // R1 registration/original/receipt writes below use the actual S wrapper only.
+  // C0 SQL no longer names money_cutover_* tables and passes Root S unchanged;
+  // on the Financial 0104 schema its freeze/permit/epoch are the C0 money fences.
+  // This fixture installs the unfenced C0 candidate, so its C0 prepare stays a
+  // mechanical raw-Sql fixture on this same primary; R1 writes use the actual S wrapper.
   const c0FixtureRealm = await verifyHostedBillingFinancialRealm({
     sql: raw,
     reader: { client },
