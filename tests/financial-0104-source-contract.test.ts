@@ -863,6 +863,30 @@ describe("Financial 0104 source recipe", () => {
     }
   });
 
+  test("every 0104-created Org trace table answers an org_id lookup through an index", () => {
+    const db = at0103();
+    try {
+      db.exec(FINANCIAL_0104_DDL);
+      const own = FINANCIAL_0104_ORG_TRACE_TABLES.filter((table) =>
+        FINANCIAL_0104_TABLES.includes(table),
+      );
+      expect(own.length).toBeGreaterThan(0);
+      for (const table of own) {
+        const plan = (
+          db
+            .query(`EXPLAIN QUERY PLAN SELECT 1 FROM ${table} m WHERE m.org_id=?`)
+            .all("org:plan") as { detail: string }[]
+        ).map((row) => row.detail);
+        expect({ table, plan }).toEqual({
+          table,
+          plan: [expect.stringMatching(/^SEARCH m USING (?:COVERING )?INDEX /u)],
+        });
+      }
+    } finally {
+      db.close();
+    }
+  });
+
   test("birth and change observations are append-only and no Financial source writes them", async () => {
     const db = at0103();
     try {

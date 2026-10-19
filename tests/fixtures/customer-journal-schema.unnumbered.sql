@@ -48,6 +48,8 @@ CREATE TABLE financial_customer_custody_receipts (
  binding_created_at TEXT NOT NULL, verified_at TEXT NOT NULL, created_at TEXT NOT NULL,
  all_rows_match INTEGER NOT NULL CHECK(typeof(all_rows_match)='integer' AND all_rows_match=1)
 );
+CREATE INDEX financial_customer_dispatch_receipts_by_org ON financial_customer_dispatch_receipts(org_id);
+CREATE INDEX financial_customer_custody_receipts_by_org ON financial_customer_custody_receipts(org_id);
 CREATE TABLE financial_customer_history_entries (
  entry_ref TEXT PRIMARY KEY NOT NULL, history_ref TEXT NOT NULL REFERENCES financial_customer_history_coverages(history_ref),
  journal_sequence INTEGER NOT NULL CHECK(typeof(journal_sequence)='integer' AND journal_sequence BETWEEN 0 AND 9007199254740991),
