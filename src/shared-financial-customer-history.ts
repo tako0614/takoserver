@@ -219,7 +219,7 @@ export function prepareHistoryStart(
     ],
   };
   const runInsert = {
-    sql: `INSERT INTO financial_history_enrollments(enrollment_ref,enrollment_incarnation,primary_ref,generation,expected_start_receipt_ref,expected_seal_ref,previous_start_receipt_ref,previous_seal_ref,required_json) SELECT ?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM financial_history_primary_roots r WHERE ${rootMatch}) AND (?=1 OR EXISTS(SELECT 1 FROM financial_history_enrollment_heads h JOIN financial_history_enrollments e ON e.enrollment_ref=h.enrollment_ref AND e.primary_ref=h.primary_ref JOIN financial_history_enrollment_receipts start ON start.receipt_ref=e.expected_start_receipt_ref AND start.primary_ref=e.primary_ref AND start.enrollment_ref=e.enrollment_ref AND start.generation=e.generation AND start.receipt_kind='capture-start' AND start.all_rows_match=1 LEFT JOIN financial_history_enrollment_receipts seal ON seal.receipt_ref=e.expected_seal_ref AND seal.primary_ref=e.primary_ref AND seal.enrollment_ref=e.enrollment_ref AND seal.generation=e.generation AND seal.receipt_kind='complete-seal' AND seal.all_rows_match=1 WHERE h.primary_ref=? AND h.state='closed' AND h.generation=?-1 AND e.generation=h.generation AND start.receipt_ref IS ? AND seal.receipt_ref IS ?))`,
+    sql: `INSERT INTO financial_history_enrollments(enrollment_ref,enrollment_incarnation,primary_ref,generation,expected_start_receipt_ref,expected_seal_ref,previous_start_receipt_ref,previous_seal_ref,required_json,org_high_water,change_high_water) SELECT ?,?,?,?,?,?,?,?,?,COALESCE((SELECT max(rowid) FROM orgs),0),COALESCE((SELECT max(change_seq) FROM financial_customer_history_org_changes),0) WHERE EXISTS(SELECT 1 FROM financial_history_primary_roots r WHERE ${rootMatch}) AND (?=1 OR EXISTS(SELECT 1 FROM financial_history_enrollment_heads h JOIN financial_history_enrollments e ON e.enrollment_ref=h.enrollment_ref AND e.primary_ref=h.primary_ref JOIN financial_history_enrollment_receipts start ON start.receipt_ref=e.expected_start_receipt_ref AND start.primary_ref=e.primary_ref AND start.enrollment_ref=e.enrollment_ref AND start.generation=e.generation AND start.receipt_kind='capture-start' AND start.all_rows_match=1 LEFT JOIN financial_history_enrollment_receipts seal ON seal.receipt_ref=e.expected_seal_ref AND seal.primary_ref=e.primary_ref AND seal.enrollment_ref=e.enrollment_ref AND seal.generation=e.generation AND seal.receipt_kind='complete-seal' AND seal.all_rows_match=1 WHERE h.primary_ref=? AND h.state='closed' AND h.generation=?-1 AND e.generation=h.generation AND start.receipt_ref IS ? AND seal.receipt_ref IS ?))`,
     params: [
       run.enrollmentRef,
       run.enrollmentIncarnation,
@@ -366,6 +366,28 @@ export function prepareHistorySeal(
     },
   ]);
 }
+/** Close an open capture after an observed Org change. Root's Org triggers only
+ * append change observations; closing (and so a next-generation restart) is this
+ * framed Financial H0 step, admitted only when a change was observed after the
+ * capture started. */
+export function prepareHistoryClose(root: HistoryRoot, run: HistoryEnrollment): SqlStatement {
+  inputs(root, run);
+  const statement: SqlStatement = {
+    sql: `UPDATE financial_history_enrollment_heads SET state='closed',capture_sequence=capture_sequence+1 WHERE primary_ref=? AND enrollment_ref=? AND generation=? AND state IN('capturing','sealed') AND EXISTS(SELECT 1 FROM financial_history_primary_roots r WHERE ${rootMatch}) AND EXISTS(SELECT 1 FROM financial_history_enrollments e JOIN financial_customer_history_org_changes ch ON ch.change_seq>e.change_high_water WHERE e.enrollment_ref=? AND e.primary_ref=? AND e.enrollment_incarnation=?)`,
+    params: [
+      root.primaryRef,
+      run.enrollmentRef,
+      run.generation,
+      root.primaryRef,
+      encode(root),
+      run.enrollmentRef,
+      root.primaryRef,
+      run.enrollmentIncarnation,
+    ],
+  };
+  fenced([statement]);
+  return statement;
+}
 function detached(
   root: HistoryRoot,
   run: HistoryEnrollment,
@@ -483,6 +505,14 @@ export function createHistoryH0Component(sql: Sql) {
       await assertFinancial0104CustomerWriteShape(sql);
       const result = await sql.run(statement.sql, statement.params);
       if (result.changes !== 1) throw new SqlError("constraint", "inventory currentness failed");
+    },
+    async close(root: HistoryRoot, run: HistoryEnrollment) {
+      const fixed = detached(root, run);
+      framed(fixed.root);
+      const statement = prepareHistoryClose(fixed.root, fixed.run);
+      await assertFinancial0104CustomerWriteShape(sql);
+      const result = await sql.run(statement.sql, statement.params);
+      if (result.changes !== 1) throw new SqlError("constraint", "no observed Org change to close");
     },
     async seal(root: HistoryRoot, run: HistoryEnrollment, sequence: number) {
       const fixed = detached(root, run);

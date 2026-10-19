@@ -168,6 +168,8 @@ WHEN NOT EXISTS(SELECT 1 FROM financial_customer_history_birth_observations b
  WHERE b.birth_ref IS NEW.original_org_origin AND b.org_id IS NEW.organization_id AND b.phase='post-seal'
  AND b.primary_ref IS NEW.primary_ref AND b.enrollment_ref IS NEW.enrollment_ref AND seal.receipt_ref IS NEW.complete_seal_ref
  AND run.required_json IS NEW.required_scopes_json AND run.expected_seal_ref IS seal.receipt_ref
+ AND b.org_rowid>run.org_high_water
+ AND NOT EXISTS(SELECT 1 FROM financial_customer_history_org_changes ch WHERE ch.change_seq>run.change_high_water)
  AND NOT EXISTS(SELECT 1 FROM financial_customer_history_birth_observations old WHERE old.org_id=b.org_id AND old.birth_ref<>b.birth_ref))
 BEGIN SELECT RAISE(ABORT,'constraint: exact H0 post-seal origin; retained adoption is not implemented'); END;
 CREATE TRIGGER financial_customer_history_scope_original BEFORE INSERT ON financial_customer_history_scopes

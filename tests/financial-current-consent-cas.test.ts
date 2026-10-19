@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   readFinancialCurrentConsentCustomerOperationOriginal,
@@ -15,6 +16,14 @@ import {
   type CustomerPhaseInput,
   compileCustomerPhase,
 } from "../src/shared-financial-customer-dispatch.ts";
+import {
+  type HistoryEnrollment,
+  type HistoryRoot,
+  prepareHistoryClose,
+  prepareHistoryInventory,
+  prepareHistorySeal,
+  prepareHistoryStart,
+} from "../src/shared-financial-customer-history.ts";
 import {
   completedCustomerReceiptReadStatement,
   readCompletedCustomerReceipt,
@@ -632,6 +641,128 @@ test("tracked execution commits L1, D and N through the actual Money writer; und
     // GET-only recovery reads the raw port and finds the retained N original.
     const recovered = await createCustomerTrackedExecutionData({ read, write }).readOriginal(n);
     expect(recovered.observation.status).toBe("matching-original");
+  } finally {
+    f.close();
+  }
+});
+
+test("an Org change after the H0 seal invalidates Customer coverage: no snapshot, no L1 write", async () => {
+  const { f, l1 } = await customerCase();
+  try {
+    const plan = await mechanicalGuard(f, l1);
+    const before = await customerRows(f);
+    // Root's Org trigger only appends a change observation; it moves no head.
+    await f.sql.run("UPDATE orgs SET name='Renamed' WHERE id=?", [f.org]);
+    expect(
+      await readCustomerJournalSnapshot(f.sql, {
+        organizationId: f.org,
+        realmRegistration: f.journal.realmRegistration,
+        realmIncarnation: f.journal.realmIncarnation,
+      }),
+    ).toBeNull();
+    await expect(f.money.batch(plan.statements)).rejects.toThrow();
+    expect(await customerRows(f)).toEqual(before);
+  } finally {
+    f.close();
+  }
+});
+
+test("every Customer and H0 statement and every 0104 trigger compile within D1's depth-100 and 100-bind limits", async () => {
+  const { f, l1 } = await customerCase();
+  try {
+    const ddl = (
+      f.db
+        .query(
+          "SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY rowid",
+        )
+        .all() as { sql: string }[]
+    ).map((row) => row.sql);
+    const statements: { label: string; sql: string; params: (string | number | null)[] }[] = [];
+    const add = (label: string, statement: SqlStatement) =>
+      statements.push({
+        label,
+        sql: statement.sql,
+        params: (statement.params ?? []).map((value) =>
+          value instanceof ArrayBuffer ? null : (value as string | number | null),
+        ),
+      });
+    const history = f.journal;
+    const dispatch = {
+      claimRef: "depth-claim",
+      dispatchAttemptRef: "depth-attempt",
+      dispatchReceiptRef: "depth-receipt",
+      dispatchedAt: f.at,
+    };
+    const d: CustomerPhaseInput = { ...l1, phase: "D", history, ...dispatch };
+    const n: CustomerPhaseInput = {
+      ...l1,
+      phase: "N",
+      history,
+      ...dispatch,
+      custodyReceiptRef: "depth-custody",
+      verifiedAt: f.at,
+      nativeOriginal: {
+        organizationId: f.org,
+        commandKey: f.admission.original.key,
+        fingerprint: f.admission.original.fingerprint,
+        realmJson: f.admission.original.realmJson,
+        requestJson: f.admission.original.requestJson,
+        customerId: "cus_Depth",
+      },
+    };
+    for (const input of [l1, d, n]) {
+      const plan =
+        input.phase === "N" ? compileCustomerPhase(input) : await mechanicalGuard(f, input);
+      plan.statements.forEach((statement, index) => add(`${input.phase}[${index}]`, statement));
+    }
+    add("completed-read", completedCustomerReceiptReadStatement(f.admission.receiptRef));
+    const rootRow = f.db.query("SELECT root_json FROM financial_history_primary_roots").get() as {
+      root_json: string;
+    };
+    const runRow = f.db
+      .query(
+        "SELECT enrollment_ref,enrollment_incarnation,generation,expected_start_receipt_ref,expected_seal_ref,required_json FROM financial_history_enrollments",
+      )
+      .get() as Record<string, string | number>;
+    const root = JSON.parse(rootRow.root_json) as HistoryRoot;
+    const run: HistoryEnrollment = {
+      enrollmentRef: String(runRow.enrollment_ref),
+      enrollmentIncarnation: String(runRow.enrollment_incarnation),
+      generation: Number(runRow.generation),
+      startReceiptRef: String(runRow.expected_start_receipt_ref),
+      sealReceiptRef: String(runRow.expected_seal_ref),
+      previousStartReceiptRef: null,
+      previousSealRef: null,
+      required: JSON.parse(String(runRow.required_json)),
+    };
+    prepareHistoryStart(root, run).forEach((s, i) => add(`H0-start[${i}]`, s));
+    const first = run.required[0];
+    if (!first) throw new Error("required scope missing");
+    add("H0-inventory", prepareHistoryInventory(root, run, first, "inventory:depth"));
+    prepareHistorySeal(root, run, 0).forEach((s, i) => add(`H0-seal[${i}]`, s));
+    add("H0-close", prepareHistoryClose(root, run));
+    const python = `import json,sqlite3,sys
+p=json.load(sys.stdin)
+c=sqlite3.connect(':memory:')
+c.execute('PRAGMA foreign_keys=OFF')
+c.setlimit(sqlite3.SQLITE_LIMIT_EXPR_DEPTH,100)
+c.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER,100)
+bad=[]
+for s in p['ddl']:
+ try: c.execute(s)
+ except Exception as e: bad.append(['ddl',s[:60],str(e)])
+for q in p['statements']:
+ try: c.execute('EXPLAIN '+q['sql'],q['params'])
+ except Exception as e: bad.append([q['label'],str(e)])
+print(json.dumps({'bad':bad,'depth':c.getlimit(sqlite3.SQLITE_LIMIT_EXPR_DEPTH),'binds':c.getlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER)}))`;
+    const run2 = spawnSync("python3", ["-c", python], {
+      input: JSON.stringify({ ddl, statements }),
+      encoding: "utf8",
+      timeout: 20_000,
+    });
+    expect(run2.status, run2.stderr).toBe(0);
+    expect(JSON.parse(run2.stdout)).toEqual({ bad: [], depth: 100, binds: 100 });
+    expect(statements.length).toBeGreaterThan(25);
   } finally {
     f.close();
   }
