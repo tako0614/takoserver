@@ -309,6 +309,7 @@ if (child) {
     return found;
   })();
   const url = "https://rp.example.invalid/financial/consent";
+  const CONSOLE = "https://console.example.invalid";
   const get = () => new Request(url, { method: "GET" });
   const post = (transactionRef: string, origin: string | null = new URL(url).origin) =>
     new Request(url, {
@@ -1242,6 +1243,7 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
       const shown = await handleSharedAuthFinancialConsentRequest(
         connection,
         new Request(page, { method: "GET" }),
+        CONSOLE,
       );
       expect(shown.status).toBe(200);
       expect(shown.headers.get("content-type")).toBe("text/html; charset=utf-8");
@@ -1263,29 +1265,38 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
             },
             body: new URLSearchParams({ approve: "yes", confirmation_transaction: transactionRef }),
           }),
+          CONSOLE,
         );
       const approved = await approve();
       expect(approved.status).toBe(303);
-      expect(approved.headers.get("location")).toBe("/billing?consent=returned");
+      expect(approved.headers.get("location")).toBe(
+        "https://console.example.invalid/billing?consent=returned",
+      );
       expect(await approved.text()).toBe("");
       expect(consentWrites()).toEqual({ pending: 1, command: 1, original: 1 });
       expect([proofCalls, loadCalls, currentCalls]).toEqual([1, 1, 1]);
-      // GET-only recovery: the page now shows the recorded consent, with no form.
+      // GET-only recovery: the page now shows the recorded consent, with no form,
+      // from the R1 reader's one capture and no Clock sample.
+      const beforeRecorded = { observer: observerCalls, clock: clockCalls };
       const recorded = await handleSharedAuthFinancialConsentRequest(
         connection,
         new Request(page, { method: "GET" }),
+        CONSOLE,
       );
       expect(recorded.status).toBe(200);
       const recordedHtml = await recorded.text();
       expect(recordedHtml).toContain("is recorded");
       expect(recordedHtml).not.toContain("<form");
       expect(recordedHtml).not.toContain("rpcs_");
+      expect(observerCalls - beforeRecorded.observer).toBe(1);
+      expect(clockCalls - beforeRecorded.clock).toBe(0);
       // The same page cannot approve twice; it never claims nothing happened.
       const again = await approve();
       expect(again.status).toBe(503);
       const againHtml = await again.text();
       expect(againHtml).toContain("We could not confirm this approval");
       expect(againHtml).not.toContain("Nothing was approved");
+      expect(againHtml).not.toContain("rpcs_");
       expect(againHtml).toContain('href="/auth/financial/consent?workspace=');
       expect(consentWrites()).toEqual({ pending: 1, command: 1, original: 1 });
       // Financial derives the consent proof ref itself from the same recipe.
@@ -1313,10 +1324,13 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
         `?challenge=${challenge}`,
         `?workspace=${SCOPE.workspaceId}&challenge=${challenge}&extra=1`,
         `?workspace=${SCOPE.workspaceId}&workspace=${SCOPE.workspaceId}&challenge=${challenge}`,
+        `?workspace=&challenge=${challenge}`,
+        `?workspace=${SCOPE.workspaceId}&challenge=`,
       ]) {
         const response = await handleSharedAuthFinancialConsentRequest(
           connection,
           new Request(`${base}${query}`),
+          CONSOLE,
         );
         expect(response.status).toBe(400);
       }
@@ -1325,6 +1339,7 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
         new Request(`${base}?workspace=${SCOPE.workspaceId}&challenge=${challenge}`, {
           method: "PUT",
         }),
+        CONSOLE,
       );
       expect(put.status).toBe(405);
       expect(put.headers.get("allow")).toBe("GET, POST");
@@ -1339,10 +1354,82 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
           },
           body: new URLSearchParams({ approve: "yes", confirmation_transaction: "rpfc_x" }),
         }),
+        CONSOLE,
       );
       expect(blind.status).not.toBe(200);
       expect(consentWrites()).toEqual({ pending: 0, command: 0, original: 0 });
       expect(proofEntries).toBe(0);
+    } finally {
+      s.close();
+    }
+  });
+
+  test("mounted route refuses POST without a valid console origin before any effect", async () => {
+    const s = await setup();
+    try {
+      const page = `https://rp.example.invalid/auth/financial/consent?workspace=${encodeURIComponent(SCOPE.workspaceId)}&challenge=${encodeURIComponent(s.challengeRef)}`;
+      const html = await (
+        await handleSharedAuthFinancialConsentRequest(connection, new Request(page), CONSOLE)
+      ).text();
+      const transactionRef = /value="(rpfc_[A-Za-z0-9_-]{43})"/u.exec(html)?.[1];
+      if (!transactionRef) throw Error("missing transaction field");
+      for (const origin of [
+        undefined,
+        "https://console.example.invalid/",
+        "https://console.example.invalid/billing",
+        "https://user:pw@console.example.invalid",
+        "javascript:alert(1)",
+        "not a url",
+      ]) {
+        const response = await handleSharedAuthFinancialConsentRequest(
+          connection,
+          new Request(page, {
+            method: "POST",
+            headers: {
+              "content-type": "application/x-www-form-urlencoded",
+              origin: "https://rp.example.invalid",
+            },
+            body: new URLSearchParams({ approve: "yes", confirmation_transaction: transactionRef }),
+          }),
+          origin,
+        );
+        expect(response.status).toBe(503);
+        expect(response.headers.get("location")).toBeNull();
+        expect(await response.text()).not.toContain("Approved");
+      }
+      expect([proofEntries, loadCalls, currentCalls]).toEqual([0, 0, 0]);
+      expect(consentWrites()).toEqual({ pending: 1, command: 0, original: 0 });
+    } finally {
+      s.close();
+    }
+  });
+
+  test("mounted route encodes the recheck link from the selected pair", async () => {
+    const s = await setup();
+    try {
+      const hostile = `x"><script>alert(1)</script>&a=b`;
+      const response = await handleSharedAuthFinancialConsentRequest(
+        connection,
+        new Request(
+          `https://rp.example.invalid/auth/financial/consent?workspace=${encodeURIComponent(SCOPE.workspaceId)}&challenge=${encodeURIComponent(hostile)}`,
+          {
+            method: "POST",
+            headers: {
+              "content-type": "application/x-www-form-urlencoded",
+              origin: "https://rp.example.invalid",
+            },
+            body: new URLSearchParams({ approve: "yes", confirmation_transaction: "rpfc_x" }),
+          },
+        ),
+        CONSOLE,
+      );
+      expect(response.status).toBe(503);
+      const html = await response.text();
+      expect(html).not.toContain("<script>");
+      expect(html).not.toContain(`x">`);
+      expect(html).toContain(
+        `href="/auth/financial/consent?workspace=${new URLSearchParams({ workspace: SCOPE.workspaceId }).toString().slice("workspace=".length)}&challenge=x%22%3E%3Cscript%3Ealert%281%29%3C%2Fscript%3E%26a%3Db"`,
+      );
     } finally {
       s.close();
     }
@@ -1628,7 +1715,7 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
     expect(stderr).toContain(
       "(pass) actual R1 and RP POST preflight reads pending only with one held Clock",
     );
-    expect(stderr).toContain("24 pass");
+    expect(stderr).toContain("26 pass");
     expect(stderr).toContain("0 fail");
   }, 100_000);
 }

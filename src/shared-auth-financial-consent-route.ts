@@ -6,9 +6,27 @@ import type { WorkerRequestSql } from "./worker-request-composition.ts";
  * page's own form POSTs back to the same URL. Root mounts this on its request
  * graph after the request observation; RP owns everything behind it. */
 export const SHARED_AUTH_FINANCIAL_CONSENT_PATH = "/auth/financial/consent";
-/** Fixed same-origin continuation after an approval: the console billing page
- * re-issues its held payment reference. No data, return URL or external host. */
+/** Fixed continuation on the configured console after an approval: its billing
+ * page re-issues the held payment reference. No data or caller return URL. */
 export const SHARED_AUTH_FINANCIAL_CONSENT_RETURN = "/billing?consent=returned";
+
+/** The same checks the console billing redirect applies to its origin. */
+function consoleReturn(consoleOrigin: string | undefined): string | null {
+  if (typeof consoleOrigin !== "string") return null;
+  try {
+    const origin = new URL(consoleOrigin);
+    if (
+      origin.origin !== consoleOrigin ||
+      origin.username ||
+      origin.password ||
+      !["https:", "http:"].includes(origin.protocol)
+    )
+      return null;
+    return `${origin.origin}${SHARED_AUTH_FINANCIAL_CONSENT_RETURN}`;
+  } catch {
+    return null;
+  }
+}
 
 const PAGE_HEADERS = Object.freeze({
   "cache-control": "no-store",
@@ -77,6 +95,7 @@ function refused(error: unknown, recheck?: string): Response {
 export async function handleSharedAuthFinancialConsentRequest(
   connection: WorkerRequestSql,
   request: Request,
+  consoleOrigin: string | undefined,
 ): Promise<Response> {
   const url = new URL(request.url);
   const selected = selection(url);
@@ -91,6 +110,11 @@ export async function handleSharedAuthFinancialConsentRequest(
       const view = await handler.prepareFinancialR1ConsentView(request, workspaceId, challengeRef);
       return page(200, view.html);
     }
+    // Without a valid configured console there is no continuation: refuse
+    // before any effect rather than fall back to a relative path.
+    const continuation = consoleReturn(consoleOrigin);
+    if (continuation === null)
+      return refused(new SharedAuthFinancialConsentOriginalReadError("unavailable"));
     const prepared = await handler.readPreparedFinancialR1SubmissionData(
       request,
       workspaceId,
@@ -108,7 +132,7 @@ export async function handleSharedAuthFinancialConsentRequest(
     // the consent proof ref from its retained R1; nothing is carried here.
     return new Response(null, {
       status: 303,
-      headers: { ...PAGE_HEADERS, location: SHARED_AUTH_FINANCIAL_CONSENT_RETURN },
+      headers: { ...PAGE_HEADERS, location: continuation },
     });
   } catch (error) {
     return refused(

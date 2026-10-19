@@ -340,8 +340,12 @@ action and terms with a same-URL form; if this R1 already has its stored
 consent (read by the derived consentRef and matched to the R1), it shows the
 recorded approval with no form. POST runs the prepared preflight, identity
 proof, load/current evidence and affirmative capture in order and answers
-`303 See Other` to the fixed same-origin `/billing?consent=returned`, carrying
-no data or return URL. The console re-issues its held payment reference there;
+`303 See Other` to `${consoleOrigin}/billing?consent=returned`, where the
+console origin is the same validated value the app uses (exact origin, no
+credentials, http or https only, as for the billing checkout return) and the
+query is fixed, carrying no data or caller return URL. Without a valid console
+origin the POST is refused with 503 before any effect, never redirected to a
+relative path. The console re-issues its held payment reference there;
 Financial derives the consent proof ref from its retained R1 with the exported
 `sharedAuthFinancialConsentTransactionRef` and `sharedAuthFinancialConsentRefs`
 recipes rather than trusting a client-supplied ref. An invalid selection is
