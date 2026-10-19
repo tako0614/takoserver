@@ -1265,19 +1265,34 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
           }),
         );
       const approved = await approve();
-      expect(approved.status).toBe(200);
-      const consentProofRef =
-        /name="takoserver-consent-proof-ref" content="(rpcs_[A-Za-z0-9_-]{43})"/u.exec(
-          await approved.text(),
-        )?.[1];
-      if (!consentProofRef) throw Error("missing consent proof ref");
+      expect(approved.status).toBe(303);
+      expect(approved.headers.get("location")).toBe("/billing?consent=returned");
+      expect(await approved.text()).toBe("");
       expect(consentWrites()).toEqual({ pending: 1, command: 1, original: 1 });
       expect([proofCalls, loadCalls, currentCalls]).toEqual([1, 1, 1]);
-      // The same page cannot approve twice, and the stored consent verifies.
+      // GET-only recovery: the page now shows the recorded consent, with no form.
+      const recorded = await handleSharedAuthFinancialConsentRequest(
+        connection,
+        new Request(page, { method: "GET" }),
+      );
+      expect(recorded.status).toBe(200);
+      const recordedHtml = await recorded.text();
+      expect(recordedHtml).toContain("is recorded");
+      expect(recordedHtml).not.toContain("<form");
+      expect(recordedHtml).not.toContain("rpcs_");
+      // The same page cannot approve twice; it never claims nothing happened.
       const again = await approve();
       expect(again.status).toBe(503);
-      expect(await again.text()).toContain("Nothing was approved.");
+      const againHtml = await again.text();
+      expect(againHtml).toContain("We could not confirm this approval");
+      expect(againHtml).not.toContain("Nothing was approved");
+      expect(againHtml).toContain('href="/auth/financial/consent?workspace=');
       expect(consentWrites()).toEqual({ pending: 1, command: 1, original: 1 });
+      // Financial derives the consent proof ref itself from the same recipe.
+      const { sharedAuthFinancialConsentRefs } = await import(
+        "../src/shared-auth-financial-consent.ts"
+      );
+      const { consentRef: consentProofRef } = await sharedAuthFinancialConsentRefs(transactionRef);
       const witness = await s.handler.verifyCurrentActionConsent(get(), {
         workspaceId: SCOPE.workspaceId,
         consentProofRef,

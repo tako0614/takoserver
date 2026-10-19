@@ -238,7 +238,9 @@ export interface SharedAuthFinancialPreparedConsentViewData {
   readonly transactionRef: string;
   readonly disclosureRef: string;
   readonly html: string;
-  readonly disposition: "strict-insert-ack" | "original-get";
+  /** `recorded-consent`: this R1 already has its stored consent; the page
+   * shows that and carries no form. */
+  readonly disposition: "strict-insert-ack" | "original-get" | "recorded-consent";
 }
 
 /** Query-only POST preflight over the prepared GET original. No affirmative
@@ -391,6 +393,29 @@ function method<T extends object, K extends keyof T>(receiver: T, name: K): T[K]
 
 function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
   return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+/** Pure recipe shared with Financial: the R1 transaction address. */
+export function sharedAuthFinancialConsentTransactionRef(
+  original: FinancialActionConsentR1Original,
+): Promise<string> {
+  return transactionRefForR1(original);
+}
+
+/** Pure recipe shared with Financial: the consent, command and receipt refs a
+ * transaction's one affirmative capture uses. Deriving them is not consent. */
+export async function sharedAuthFinancialConsentRefs(transactionRef: string): Promise<{
+  readonly consentRef: string;
+  readonly commandRef: string;
+  readonly receiptRef: string;
+}> {
+  if (!/^rpfc_[A-Za-z0-9_-]{43}$/u.test(transactionRef)) unavailable();
+  const [consentRef, commandRef, receiptRef] = await Promise.all([
+    consentRefFromTransaction("consent", transactionRef),
+    consentRefFromTransaction("command", transactionRef),
+    consentRefFromTransaction("receipt", transactionRef),
+  ]);
+  return Object.freeze({ consentRef, commandRef, receiptRef });
 }
 
 async function transactionRefForR1(original: FinancialActionConsentR1Original): Promise<string> {
@@ -865,6 +890,41 @@ export function createSharedAuthFinancialConsentRequestHandler(connection: Worke
         unavailable();
       const transactionRef = await transactionRefForR1(retained);
       sameOrigin();
+      // GET-only recovery: a stored consent for this exact R1 is shown as
+      // recorded, with no form. Any read failure falls through to the page,
+      // whose POST preflight still refuses an occupied transaction.
+      const recorded = await (async () => {
+        try {
+          const { consentRef } = await sharedAuthFinancialConsentRefs(transactionRef);
+          const historical = await Reflect.apply(readHistorical, historicals, [consentRef]);
+          sameOrigin();
+          const consent = await parseSharedAuthFinancialActionConsentOriginal(
+            historical.original.originalBytes,
+          );
+          sameOrigin();
+          if (
+            consent.consentRef !== consentRef ||
+            historical.original.command.key.transactionRef !== transactionRef
+          )
+            return false;
+          assertSameFinancialR1Original(consent, retained);
+          return true;
+        } catch {
+          sameOrigin();
+          return false;
+        }
+      })();
+      if (recorded)
+        return Object.freeze({
+          state: "prepared-financial-consent-view-data",
+          transactionRef,
+          disclosureRef: await canonicalDigest([
+            "takoserver-rp-consent-recorded-view-v1",
+            transactionRef,
+          ]),
+          html: '<!doctype html><html lang="en"><meta charset="utf-8"><title>Financial action approved</title><main><h1>Approved</h1><p>Your approval of this financial action is recorded.</p></main></html>',
+          disposition: "recorded-consent",
+        });
       const view = await renderSharedAuthFinancialPreparedConsentView({
         transactionRef,
         action,
@@ -1444,11 +1504,8 @@ export function createSharedAuthFinancialConsentRequestHandler(connection: Worke
           human.ref !== credential.rp.principalBindingRef
         )
           unavailable();
-        const [consentRef, commandRef, receiptRef] = await Promise.all([
-          consentRefFromTransaction("consent", transactionRef),
-          consentRefFromTransaction("command", transactionRef),
-          consentRefFromTransaction("receipt", transactionRef),
-        ]);
+        const { consentRef, commandRef, receiptRef } =
+          await sharedAuthFinancialConsentRefs(transactionRef);
         const identity = await createSharedAuthFinancialActionConsentOriginalIdentity({
           version: "takoserver-shared-financial-action-consent-v1",
           consentRef,

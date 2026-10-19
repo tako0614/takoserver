@@ -332,3 +332,19 @@ owner ruling); the write itself is bounded by pending29 expiry, not by a
 second sample against the proof expiry. The receipted original is local DATA
 for `verifyCurrentActionConsent` and the Financial consumer, not Financial
 NEW/CAS admission or a mounted route.
+
+`handleSharedAuthFinancialConsentRequest` is the RP consent page that Root
+mounts on its observed request connection at `/auth/financial/consent` with
+exactly one `workspace` and one `challenge`. GET renders the retained R1
+action and terms with a same-URL form; if this R1 already has its stored
+consent (read by the derived consentRef and matched to the R1), it shows the
+recorded approval with no form. POST runs the prepared preflight, identity
+proof, load/current evidence and affirmative capture in order and answers
+`303 See Other` to the fixed same-origin `/billing?consent=returned`, carrying
+no data or return URL. The console re-issues its held payment reference there;
+Financial derives the consent proof ref from its retained R1 with the exported
+`sharedAuthFinancialConsentTransactionRef` and `sharedAuthFinancialConsentRefs`
+recipes rather than trusting a client-supplied ref. An invalid selection is
+400; an unknown or conflicting outcome is 503/409 saying the approval could
+not be confirmed, with a link back to the GET page for recovery, never a
+resubmission. Pages are no-store with a deny-all CSP.

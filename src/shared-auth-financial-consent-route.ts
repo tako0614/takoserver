@@ -6,6 +6,9 @@ import type { WorkerRequestSql } from "./worker-request-composition.ts";
  * page's own form POSTs back to the same URL. Root mounts this on its request
  * graph after the request observation; RP owns everything behind it. */
 export const SHARED_AUTH_FINANCIAL_CONSENT_PATH = "/auth/financial/consent";
+/** Fixed same-origin continuation after an approval: the console billing page
+ * re-issues its held payment reference. No data, return URL or external host. */
+export const SHARED_AUTH_FINANCIAL_CONSENT_RETURN = "/billing?consent=returned";
 
 const PAGE_HEADERS = Object.freeze({
   "cache-control": "no-store",
@@ -45,12 +48,26 @@ function page(status: number, html: string): Response {
   });
 }
 
-function refused(error: unknown): Response {
+/** The page's own GET, built from server constants and the selected pair only;
+ * there is no caller-supplied return URL. */
+function pageLocation(workspaceId: string, challengeRef: string): string {
+  const query = new URLSearchParams({ workspace: workspaceId, challenge: challengeRef });
+  return `${SHARED_AUTH_FINANCIAL_CONSENT_PATH}?${query.toString()}`;
+}
+
+function refused(error: unknown, recheck?: string): Response {
   const code = error instanceof SharedAuthFinancialConsentOriginalReadError ? error.code : null;
-  const status = code === "invalid_request" ? 400 : code === "custody_conflict" ? 409 : 503;
+  if (code === "invalid_request")
+    return page(
+      400,
+      '<!doctype html><html lang="en"><meta charset="utf-8"><title>Financial action unavailable</title><main><h1>This financial action is unavailable</h1><p>Nothing was approved.</p></main></html>',
+    );
+  // An unknown outcome may still have committed: never claim it did not, and
+  // recover only by reading this page again (GET), never by resubmitting.
+  const link = recheck === undefined ? "" : `<p><a href="${recheck}">Check again</a></p>`;
   return page(
-    status,
-    '<!doctype html><html lang="en"><meta charset="utf-8"><title>Financial action unavailable</title><main><h1>This financial action is unavailable</h1><p>Nothing was approved.</p></main></html>',
+    code === "custody_conflict" ? 409 : 503,
+    `<!doctype html><html lang="en"><meta charset="utf-8"><title>Approval not confirmed</title><main><h1>We could not confirm this approval</h1><p>Do not submit it again. Reload this page to see whether it was recorded.</p>${link}</main></html>`,
   );
 }
 
@@ -86,20 +103,17 @@ export async function handleSharedAuthFinancialConsentRequest(
       challengeRef,
       prepared,
     );
-    const original = await handler.capturePreparedFinancialR1Consent(
-      request,
-      workspaceId,
-      challengeRef,
-      prepared,
-    );
-    // The consent proof ref is the stored canonical consentRef the Financial
-    // consumer selects by; it is a reference, not a bearer of authority.
-    const consentProofRef = original.command.key.consentRef;
-    return page(
-      200,
-      `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="takoserver-consent-proof-ref" content="${consentProofRef}"><title>Financial action approved</title><main><h1>Approved</h1><p>Your approval was recorded.</p></main></html>`,
-    );
+    await handler.capturePreparedFinancialR1Consent(request, workspaceId, challengeRef, prepared);
+    // Post/Redirect/Get to the fixed billing continuation. Financial derives
+    // the consent proof ref from its retained R1; nothing is carried here.
+    return new Response(null, {
+      status: 303,
+      headers: { ...PAGE_HEADERS, location: SHARED_AUTH_FINANCIAL_CONSENT_RETURN },
+    });
   } catch (error) {
-    return refused(error);
+    return refused(
+      error,
+      request.method === "POST" ? pageLocation(workspaceId, challengeRef) : undefined,
+    );
   }
 }
