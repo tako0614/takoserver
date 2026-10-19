@@ -178,10 +178,17 @@ describe("Financial 0104 source recipe", () => {
         );
         expect(count(db, table)).toBe(0);
       }
-      for (const table of FINANCIAL_0104_TABLES) {
+      for (const table of FENCED_0104_TABLES) {
         expect(() => db.exec(`INSERT INTO ${table} DEFAULT VALUES`)).toThrow(
           /no such table: (?:main\.)?money_cutover_/u,
         );
+        expect(count(db, table)).toBe(0);
+      }
+      // The two unfenced 0104 tables carry no money fence here (Root's Money guard
+      // fences the links at cutover; birth rows come only from Root's Org cascade),
+      // and their own original guards still refuse a bare row.
+      for (const table of Object.keys(FINANCIAL_0104_UNFENCED_TABLES)) {
+        expect(() => db.exec(`INSERT INTO ${table} DEFAULT VALUES`)).toThrow();
         expect(count(db, table)).toBe(0);
       }
       // Unrelated non-0104 writes on the same primary still succeed.
