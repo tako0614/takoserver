@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { bytesDigest } from "../src/json.ts";
 import {
   createSharedAuthSession,
+  type SharedAuthFinancialProofReceiver,
   type SharedAuthPrincipalProjection,
   SharedAuthSessionError,
 } from "../src/shared-auth-session.ts";
@@ -60,6 +61,7 @@ async function fixture(
   options: {
     wrapStore?: (store: SharedAuthSessionStore) => SharedAuthSessionStore;
     wrapFinalStore?: (store: SharedAuthFinalSessionStore) => SharedAuthFinalSessionStore;
+    financialProof?: SharedAuthFinancialProofReceiver;
     send?: (request: Request, send: (request: Request) => Promise<Response>) => Promise<Response>;
   } = {},
 ) {
@@ -109,6 +111,7 @@ async function fixture(
           return input;
         },
       },
+      ...(options.financialProof === undefined ? {} : { financialProof: options.financialProof }),
     };
     const runtime = createSharedAuthSession(composition);
     async function request(path: string, init: RequestInit = {}): Promise<Response> {
@@ -1222,6 +1225,313 @@ describe("staging shared session against native D1 and signed issuer HTTP", () =
           SESSION_TEST_ORGANIZATION.id,
         ),
       ).not.toBeNull();
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("financial proof uses the second acknowledged final grant, not the first workspace selection", async () => {
+    const calls: { receiver: unknown; accessToken: string; challengeRef: string }[] = [];
+    const financialProof: SharedAuthFinancialProofReceiver = {
+      async prove(input) {
+        calls.push({ receiver: this, ...input });
+        return { proofRef: "accounts-proof-organization" };
+      },
+    };
+    const f = await fixture({ financialProof });
+    try {
+      const signedIn = await f.signedIn();
+      f.control.onPin = async () => f.setTime(INITIAL_TIME + 5 * 60 * 1000 + 1);
+      const context = await f.runtime.observeFinalWorkspaceOrganization(
+        f.sessionRequest(signedIn.sessionCookie),
+        SESSION_TEST_ORGANIZATION.id,
+      );
+      const selected = f.runtime.finalSessionSelection(context);
+      if (!selected) throw new Error("missing second final selection");
+      expect(selected.selectedWorkspaceId).toBe(SESSION_TEST_ORGANIZATION.id);
+      expect(f.issuer.issued).toHaveLength(2);
+      const refreshed = f.issuer.issued[1]?.accessToken;
+      if (!refreshed) throw new Error("missing refreshed grant");
+      const requestsBefore = f.issuer.requests.length;
+      const versionBefore = (await f.d1.store.readSession(signedIn.digest))?.version;
+      const proof = await f.runtime.proveFinalSessionFinancialIdentity(selected, "challenge-org");
+      expect(proof).toEqual({ proofRef: "accounts-proof-organization" });
+      expect(Object.isFrozen(proof)).toBe(true);
+      expect(calls).toEqual([
+        { receiver: financialProof, accessToken: refreshed, challengeRef: "challenge-org" },
+      ]);
+      expect(JSON.stringify(selected)).not.toContain(refreshed);
+      expect(JSON.stringify(proof)).not.toContain(refreshed);
+      expect(f.issuer.requests).toHaveLength(requestsBefore);
+      expect((await f.d1.store.readSession(signedIn.digest))?.version).toBe(versionBefore);
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("financial proof denies an absent binding and foreign, ordinary or cloned selections", async () => {
+    let calls = 0;
+    const f = await fixture();
+    const g = await fixture({
+      financialProof: {
+        async prove() {
+          calls += 1;
+          return { proofRef: "unused" };
+        },
+      },
+    });
+    try {
+      const signedIn = await f.signedIn();
+      const final = await f.runtime.observeFinalSession(f.sessionRequest(signedIn.sessionCookie));
+      const selected = f.runtime.finalSessionSelection(final);
+      if (!selected) throw new Error("missing final selection");
+      await expect(
+        f.runtime.proveFinalSessionFinancialIdentity(selected, "challenge-r1"),
+      ).rejects.toMatchObject({ code: "session_unavailable" });
+      await expect(
+        g.runtime.proveFinalSessionFinancialIdentity(selected, "challenge-r1"),
+      ).rejects.toMatchObject({ code: "session_unavailable" });
+      await expect(
+        f.runtime.proveFinalSessionFinancialIdentity({ ...selected }, "challenge-r1"),
+      ).rejects.toMatchObject({ code: "session_unavailable" });
+      const ordinary = await f.runtime.authenticate(f.sessionRequest(signedIn.sessionCookie));
+      expect(f.runtime.finalSessionSelection(ordinary)).toBeNull();
+      await expect(
+        g.runtime.proveFinalSessionFinancialIdentity(ordinary as never, "challenge-r1"),
+      ).rejects.toMatchObject({ code: "session_unavailable" });
+      expect(calls).toBe(0);
+    } finally {
+      await f.dispose();
+      await g.dispose();
+    }
+  }, 30_000);
+
+  test("financial proof registers one attempt before dispatch and keeps unknown rejection", async () => {
+    let calls = 0;
+    let rejectRemote: (reason: Error) => void = () => {};
+    const pending = new Promise<unknown>((_resolve, reject) => {
+      rejectRemote = reject;
+    });
+    const f = await fixture({
+      financialProof: {
+        prove() {
+          calls += 1;
+          return pending;
+        },
+      },
+    });
+    try {
+      const signedIn = await f.signedIn();
+      const context = await f.runtime.observeFinalSession(f.sessionRequest(signedIn.sessionCookie));
+      const selected = f.runtime.finalSessionSelection(context);
+      if (!selected) throw new Error("missing final selection");
+      const first = f.runtime.proveFinalSessionFinancialIdentity(selected, "challenge-unknown");
+      const second = f.runtime.proveFinalSessionFinancialIdentity(selected, "challenge-unknown");
+      expect(second).toBe(first);
+      await Promise.resolve();
+      expect(calls).toBe(1);
+      rejectRemote(new Error("unknown remote acknowledgement"));
+      await expect(first).rejects.toMatchObject({ code: "session_unavailable" });
+      await expect(
+        f.runtime.proveFinalSessionFinancialIdentity(selected, "challenge-unknown"),
+      ).rejects.toMatchObject({ code: "session_unavailable" });
+      expect(calls).toBe(1);
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("financial proof accepts only detached DATA and releases the same RPC response once", async () => {
+    const calls: string[] = [];
+    const disposed: object[] = [];
+    const financialProof: SharedAuthFinancialProofReceiver = {
+      async prove({ challengeRef }) {
+        calls.push(challengeRef);
+        const response = { proofRef: `proof-${challengeRef}` };
+        Object.defineProperty(response, Symbol.dispose, {
+          value: function (this: typeof response) {
+            disposed.push(this);
+            this.proofRef = "changed-after-detachment";
+          },
+          enumerable: false,
+        });
+        if (challengeRef === "invalid")
+          Object.defineProperty(response, "extra", { value: true, enumerable: true });
+        return response;
+      },
+    };
+    const f = await fixture({ financialProof });
+    try {
+      const signedIn = await f.signedIn();
+      const context = await f.runtime.observeFinalSession(f.sessionRequest(signedIn.sessionCookie));
+      const selected = f.runtime.finalSessionSelection(context);
+      if (!selected) throw new Error("missing final selection");
+      expect(await f.runtime.proveFinalSessionFinancialIdentity(selected, "valid")).toEqual({
+        proofRef: "proof-valid",
+      });
+      await expect(
+        f.runtime.proveFinalSessionFinancialIdentity(selected, "invalid"),
+      ).rejects.toMatchObject({ code: "session_unavailable" });
+      await expect(
+        f.runtime.proveFinalSessionFinancialIdentity(selected, "invalid"),
+      ).rejects.toMatchObject({ code: "session_unavailable" });
+      expect(calls).toEqual(["valid", "invalid"]);
+      expect(disposed).toHaveLength(2);
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("an inherited RPC method is captured without an own-property prerequisite", async () => {
+    const prototype = {
+      async prove({
+        challengeRef,
+      }: {
+        readonly accessToken: string;
+        readonly challengeRef: string;
+      }) {
+        return { proofRef: `proof-${challengeRef}` };
+      },
+    };
+    const financialProof = Object.create(prototype) as SharedAuthFinancialProofReceiver;
+    const f = await fixture({ financialProof });
+    try {
+      const signedIn = await f.signedIn();
+      const context = await f.runtime.observeFinalSession(f.sessionRequest(signedIn.sessionCookie));
+      const selected = f.runtime.finalSessionSelection(context);
+      if (!selected) throw new Error("missing final selection");
+      expect(Object.hasOwn(financialProof, "prove")).toBe(false);
+      expect(await f.runtime.proveFinalSessionFinancialIdentity(selected, "inherited")).toEqual({
+        proofRef: "proof-inherited",
+      });
+      prototype.prove = async () => ({ proofRef: "changed" });
+      await expect(
+        f.runtime.proveFinalSessionFinancialIdentity(selected, "after-prototype-change"),
+      ).rejects.toMatchObject({ code: "session_unavailable" });
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("a complete descriptorless synthetic receiver uses only its construction-time callable", async () => {
+    let lookups = 0;
+    let calls = 0;
+    const financialProof = new Proxy(Object.create(null) as SharedAuthFinancialProofReceiver, {
+      get(_target, name) {
+        if (name !== "prove") return undefined;
+        lookups++;
+        if (lookups > 1) throw Error("unexpected dynamic method relookup");
+        return async () => {
+          calls++;
+          return { proofRef: "synthetic-dynamic-proof" };
+        };
+      },
+    });
+    const f = await fixture({ financialProof });
+    try {
+      const signedIn = await f.signedIn();
+      const context = await f.runtime.observeFinalSession(f.sessionRequest(signedIn.sessionCookie));
+      const selected = f.runtime.finalSessionSelection(context);
+      if (!selected) throw new Error("missing final selection");
+      expect(
+        await f.runtime.proveFinalSessionFinancialIdentity(selected, "dynamic-challenge"),
+      ).toEqual({ proofRef: "synthetic-dynamic-proof" });
+      expect(lookups).toBe(1);
+      expect(calls).toBe(1);
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("a prove method beyond the bounded prototype chain cannot receive the grant", async () => {
+    let calls = 0;
+    let prototype: object = {
+      async prove() {
+        calls += 1;
+        return { proofRef: "unbounded" };
+      },
+    };
+    for (let depth = 0; depth < 17; depth += 1) prototype = Object.create(prototype);
+    const financialProof = Object.create(prototype) as SharedAuthFinancialProofReceiver;
+    const f = await fixture({ financialProof });
+    try {
+      const signedIn = await f.signedIn();
+      const context = await f.runtime.observeFinalSession(f.sessionRequest(signedIn.sessionCookie));
+      const selected = f.runtime.finalSessionSelection(context);
+      if (!selected) throw new Error("missing final selection");
+      await expect(
+        f.runtime.proveFinalSessionFinancialIdentity(selected, "deep-method"),
+      ).rejects.toMatchObject({ code: "session_unavailable" });
+      expect(calls).toBe(0);
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("a deep inherited method changed while pending cannot publish its proofRef", async () => {
+    let calls = 0;
+    let complete: (result: unknown) => void = () => {};
+    const response = new Promise<unknown>((resolve) => {
+      complete = resolve;
+    });
+    const owner = {
+      prove() {
+        calls += 1;
+        return response;
+      },
+    };
+    let prototype: object = owner;
+    for (let depth = 0; depth < 14; depth += 1) prototype = Object.create(prototype);
+    const financialProof = Object.create(prototype) as SharedAuthFinancialProofReceiver;
+    const f = await fixture({ financialProof });
+    try {
+      const signedIn = await f.signedIn();
+      const context = await f.runtime.observeFinalSession(f.sessionRequest(signedIn.sessionCookie));
+      const selected = f.runtime.finalSessionSelection(context);
+      if (!selected) throw new Error("missing final selection");
+      const attempted = f.runtime.proveFinalSessionFinancialIdentity(selected, "deep-drift");
+      await Promise.resolve();
+      expect(calls).toBe(1);
+      owner.prove = async () => ({ proofRef: "substituted" });
+      complete({ proofRef: "ack-after-drift" });
+      await expect(attempted).rejects.toMatchObject({ code: "session_unavailable" });
+      await expect(
+        f.runtime.proveFinalSessionFinancialIdentity(selected, "deep-drift"),
+      ).rejects.toMatchObject({ code: "session_unavailable" });
+      expect(calls).toBe(1);
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("late RPC method drift rejects the awaited result without dispatch replay", async () => {
+    let dispatches = 0;
+    let complete: (result: unknown) => void = () => {};
+    const response = new Promise<unknown>((resolve) => {
+      complete = resolve;
+    });
+    const financialProof: SharedAuthFinancialProofReceiver = {
+      prove() {
+        dispatches += 1;
+        return response;
+      },
+    };
+    const f = await fixture({ financialProof });
+    try {
+      const signedIn = await f.signedIn();
+      const context = await f.runtime.observeFinalSession(f.sessionRequest(signedIn.sessionCookie));
+      const selected = f.runtime.finalSessionSelection(context);
+      if (!selected) throw new Error("missing final selection");
+      const attempted = f.runtime.proveFinalSessionFinancialIdentity(selected, "late-drift");
+      await Promise.resolve();
+      expect(dispatches).toBe(1);
+      financialProof.prove = async () => ({ proofRef: "substituted" });
+      complete({ proofRef: "real-ack" });
+      await expect(attempted).rejects.toMatchObject({ code: "session_unavailable" });
+      await expect(
+        f.runtime.proveFinalSessionFinancialIdentity(selected, "late-drift"),
+      ).rejects.toMatchObject({ code: "session_unavailable" });
+      expect(dispatches).toBe(1);
     } finally {
       await f.dispose();
     }

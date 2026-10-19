@@ -161,6 +161,55 @@ function principalInputDescriptorSeal(source: object, allowReceiverFreeze = fals
   }
 }
 
+/** Observe an inherited RPC method without requiring an own-property transport. */
+function proofMethodDescriptorSeal(receiver: object): () => boolean {
+  try {
+    const chain: {
+      readonly owner: object;
+      readonly prototype: object | null;
+      readonly method: PropertyDescriptor | undefined;
+    }[] = [];
+    let owner: object | null = receiver;
+    let found = false;
+    for (let depth = 0; owner !== null && depth < 16; depth += 1) {
+      const prototype: object | null = Object.getPrototypeOf(owner);
+      const method = Object.getOwnPropertyDescriptor(owner, "prove");
+      chain.push({ owner, prototype, method });
+      if (method) {
+        found = true;
+        break;
+      }
+      owner = prototype;
+    }
+    // The native Worker RPC stub has a callable method but no descriptor in
+    // its complete prototype chain. Keep the construction-time callable and
+    // reassert that chain without a second property lookup. A depth-truncated
+    // chain cannot establish the same boundary and remains unavailable.
+    if (!found && owner !== null) return () => false;
+    return () => {
+      try {
+        return chain.every(({ owner, prototype, method }) => {
+          const current = Object.getOwnPropertyDescriptor(owner, "prove");
+          if (Object.getPrototypeOf(owner) !== prototype) return false;
+          if (!method || !current) return method === current;
+          return (
+            method.value === current.value &&
+            method.get === current.get &&
+            method.set === current.set &&
+            method.writable === current.writable &&
+            method.enumerable === current.enumerable &&
+            method.configurable === current.configurable
+          );
+        });
+      } catch {
+        return false;
+      }
+    };
+  } catch {
+    return () => false;
+  }
+}
+
 /** Inherited/dynamic store methods remain ordinary-only, never original-input evidence. */
 function principalInputStoreSeal(
   store: SharedAuthSessionStore | SharedAuthFinalSessionStore,
@@ -243,6 +292,16 @@ export interface SharedAuthFinalSessionSelection {
   readonly observedAt: number;
 }
 
+/** Source-only RPC shape. The owning request graph must supply the real binding. */
+export interface SharedAuthFinancialProofReceiver {
+  prove(input: { readonly accessToken: string; readonly challengeRef: string }): Promise<unknown>;
+}
+
+/** Accounts-produced reference DATA; neither consent nor current proof permission. */
+export interface SharedAuthFinancialProofReferenceData {
+  readonly proofRef: string;
+}
+
 export class SharedAuthSessionError extends Error {
   constructor(readonly code: "session_invalid" | "session_unavailable" | "workspace_forbidden") {
     super(code);
@@ -273,6 +332,8 @@ export function createSharedAuthSession(options: {
   readonly finalStore?: () => SharedAuthFinalSessionStore;
   readonly principals: SharedAuthPrincipalProjection;
   readonly organizations?: SharedAuthOrganizationPins;
+  /** Unmounted fixed Accounts RPC contract; absence denies this proof branch. */
+  readonly financialProof?: SharedAuthFinancialProofReceiver;
   readonly fetch?: (request: Request) => Promise<Response>;
   readonly now?: () => number;
 }) {
@@ -310,7 +371,23 @@ export function createSharedAuthSession(options: {
   const pinOrganization = organizationReceiver?.pin;
   if (organizationReceiver !== undefined && typeof pinOrganization !== "function")
     throw new TypeError("Shared RP requires its qualified Organization pin method");
+  const financialProofReceiver = options.financialProof;
+  const proveFinancial = financialProofReceiver?.prove;
+  if (financialProofReceiver !== undefined && typeof proveFinancial !== "function")
+    throw new TypeError("Shared RP financial proof receiver differs");
+  const proofMethodSeal =
+    financialProofReceiver === undefined
+      ? () => false
+      : proofMethodDescriptorSeal(financialProofReceiver);
   const selections = new WeakMap<SharedAuthSessionContext, SharedAuthFinalSessionSelection>();
+  const finalGrants = new WeakMap<
+    SharedAuthFinalSessionSelection,
+    Readonly<{ readonly accessToken: string; readonly identity: Readonly<SharedAuthIdentity> }>
+  >();
+  const proofAttempts = new WeakMap<
+    SharedAuthFinalSessionSelection,
+    Map<string, Promise<SharedAuthFinancialProofReferenceData>>
+  >();
   const principalInputOwnerSeals = [principalInputDescriptorSeal(options)];
   for (const name of ["config", "principals", "organizations", "encryptionKey"] as const) {
     try {
@@ -839,24 +916,29 @@ export function createSharedAuthSession(options: {
         workspace: Object.freeze({ ...workspace, roles: Object.freeze([...workspace.roles]) }),
         provenance: Object.freeze({ kind: "shared-account-session" as const, ...identity }),
       });
-      if (selectFinal)
-        selections.set(
-          context,
-          Object.freeze({
-            sessionDigest: selected.digest,
-            sessionVersion: selected.version,
-            accountId: selected.accountId,
-            principalId: selected.principalId,
-            sessionWorkspaceId: selected.workspaceId,
-            selectedWorkspaceId: workspace.id,
-            identity,
-            createdAt: selected.createdAt,
-            lastUsedAt: selected.lastUsedAt,
-            grantCheckedAt: selected.grantCheckedAt,
-            absoluteExpiresAt: selected.absoluteExpiresAt,
-            observedAt,
-          }),
+      if (selectFinal) {
+        const finalSelection = Object.freeze({
+          sessionDigest: selected.digest,
+          sessionVersion: selected.version,
+          accountId: selected.accountId,
+          principalId: selected.principalId,
+          sessionWorkspaceId: selected.workspaceId,
+          selectedWorkspaceId: workspace.id,
+          identity,
+          createdAt: selected.createdAt,
+          lastUsedAt: selected.lastUsedAt,
+          grantCheckedAt: selected.grantCheckedAt,
+          absoluteExpiresAt: selected.absoluteExpiresAt,
+          observedAt,
+        });
+        // This token belongs to this acknowledged final touch, not to an
+        // earlier workspace observation or a caller-shaped selection.
+        finalGrants.set(
+          finalSelection,
+          Object.freeze({ accessToken: value.accessToken, identity }),
         );
+        selections.set(context, finalSelection);
+      }
       return context;
     } catch (error) {
       if (invalid(error)) {
@@ -956,6 +1038,112 @@ export function createSharedAuthSession(options: {
       return record(context)
         ? (selections.get(context as unknown as SharedAuthSessionContext) ?? null)
         : null;
+    },
+    /** Process-local, one-attempt Accounts proof DATA for this exact final row. */
+    proveFinalSessionFinancialIdentity(
+      selected: SharedAuthFinalSessionSelection,
+      challengeRef: string,
+    ): Promise<SharedAuthFinancialProofReferenceData> {
+      try {
+        const held = finalGrants.get(selected);
+        const assertOriginal = () => {
+          if (
+            !held ||
+            held !== finalGrants.get(selected) ||
+            held.identity !== selected.identity ||
+            !principalInputOwnerSeals.every((seal) => seal()) ||
+            !principalInputReceiverSeal() ||
+            !proofMethodSeal() ||
+            !financialProofReceiver ||
+            !proveFinancial
+          )
+            throw new SharedAuthSessionError("session_unavailable");
+        };
+        if (
+          !financialSourceRef(challengeRef) ||
+          !selected ||
+          typeof selected !== "object" ||
+          !Object.isFrozen(selected)
+        )
+          throw new SharedAuthSessionError("session_unavailable");
+        assertOriginal();
+        if (!held || !financialProofReceiver || !proveFinancial)
+          throw new SharedAuthSessionError("session_unavailable");
+        const heldGrant = held;
+        const proofOwner = financialProofReceiver;
+        const proofMethod = proveFinancial;
+        let attempts = proofAttempts.get(selected);
+        if (!attempts) {
+          attempts = new Map();
+          proofAttempts.set(selected, attempts);
+        }
+        const previous = attempts.get(challengeRef);
+        if (previous) return previous;
+        // Install the pending result before invoking the remote receiver. An
+        // unknown/rejected/malformed result stays memoized: no resend here.
+        const attempted = Promise.resolve()
+          .then(async () => {
+            assertOriginal();
+            const response = await Reflect.apply(proofMethod, proofOwner, [
+              Object.freeze({ accessToken: heldGrant.accessToken, challengeRef }),
+            ]);
+            let dispose: (() => unknown) | undefined;
+            try {
+              if (
+                !response ||
+                typeof response !== "object" ||
+                Array.isArray(response) ||
+                ![Object.prototype, null].includes(Object.getPrototypeOf(response))
+              )
+                throw new SharedAuthSessionError("session_unavailable");
+              const disposer = Object.getOwnPropertyDescriptor(response, Symbol.dispose);
+              // Native Worker RPC adds only this non-enumerable resource method.
+              // Capture its data function without invoking a getter; it never
+              // contributes proof authority and must be released on rejection.
+              if (
+                disposer &&
+                "value" in disposer &&
+                typeof disposer.value === "function" &&
+                !disposer.enumerable
+              )
+                dispose = disposer.value;
+              assertOriginal();
+              const keys = Reflect.ownKeys(response);
+              if (
+                !(
+                  (keys.length === 1 && keys[0] === "proofRef" && !dispose) ||
+                  (keys.length === 2 &&
+                    keys.includes("proofRef") &&
+                    keys.includes(Symbol.dispose) &&
+                    dispose)
+                )
+              )
+                throw new SharedAuthSessionError("session_unavailable");
+              const descriptor = Object.getOwnPropertyDescriptor(response, "proofRef");
+              if (
+                !descriptor ||
+                !("value" in descriptor) ||
+                !descriptor.enumerable ||
+                !financialSourceRef(descriptor.value)
+              )
+                throw new SharedAuthSessionError("session_unavailable");
+              return Object.freeze({ proofRef: descriptor.value });
+            } finally {
+              try {
+                if (dispose) await Reflect.apply(dispose, response, []);
+              } finally {
+                assertOriginal();
+              }
+            }
+          })
+          .catch(() => {
+            throw new SharedAuthSessionError("session_unavailable");
+          });
+        attempts.set(challengeRef, attempted);
+        return attempted;
+      } catch {
+        return Promise.reject(new SharedAuthSessionError("session_unavailable"));
+      }
     },
     async authenticate(request: Request, workspaceId?: string) {
       const captured = snapshotRequest(request);
@@ -1227,6 +1415,10 @@ function text(value: unknown, maximum: number): value is string {
       (character) => character.charCodeAt(0) > 0x20 && character.charCodeAt(0) !== 0x7f,
     )
   );
+}
+/** The named Accounts RPC's bounded opaque reference syntax, not a local recipe. */
+function financialSourceRef(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/u.test(value);
 }
 function integer(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
