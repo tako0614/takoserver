@@ -36,10 +36,13 @@ import { FINANCIAL_GENESIS_SCHEMA } from "../src/shared-financial-source-genesis
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
 import {
+  dropFinancial0104Fences,
+  fenceLiftedSql,
   financial0104Writer,
   installFinancial0104Fences,
   MONEY_FREEZE_ROW,
   permitFramed,
+  withMoneyFencesLifted,
 } from "./helpers/financial-0104-fenced.ts";
 
 const AT = "2026-10-15T00:00:00.000Z";
@@ -79,7 +82,7 @@ function withGuardDisabled(db: Database, name: string, mutate: () => void) {
   if (!guard) throw Error(`missing trigger ${name}`);
   db.exec(`DROP TRIGGER ${name}`);
   try {
-    mutate();
+    withMoneyFencesLifted(db, mutate);
   } finally {
     db.exec(guard.sql);
   }
@@ -105,7 +108,7 @@ function event(affectedRef = A): FinancialSourceEvent {
     evidenceRef: `evidence:${affectedRef}`,
   };
 }
-async function fixture() {
+async function fixture(options: { readonly unfenced?: boolean } = {}) {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m.sql);
   db.exec(
@@ -119,6 +122,10 @@ async function fixture() {
   db.exec(MONEY_CUTOVER_PERMIT_DDL);
   db.exec(MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL);
   db.exec(FINANCIAL_SOURCE_ENROLLMENT_DDL);
+  // New C0/M writes require the exact fenced 0104 shape; `unfenced` keeps the
+  // legacy candidate for read/recovery and write-refusal tests.
+  if (!options.unfenced)
+    installFinancial0104Fences(db, { receiver: true, c0: true, genesisOverlay: true });
   const base = createSqliteSql(db);
   let clockCalls = 0,
     batchCalls = 0,
@@ -309,7 +316,8 @@ async function fixture() {
     });
   return {
     db,
-    base,
+    // Fixture setup writes are privileged manipulations with the fences lifted.
+    base: fenceLiftedSql(db, base),
     sql,
     common,
     source,
@@ -1067,7 +1075,6 @@ describe("private C0 and explicit M component", () => {
     try {
       // Freeze, permit and epoch are the exact Financial 0104 fences inside the
       // actual permit-framed Money writer; neither predicate names them.
-      installFinancial0104Fences(f.db, { receiver: true, c0: true, genesisOverlay: true });
       const { money, realm } = await financial0104Writer(f.sql, W, f.common.client, {
         accountId: "acct_enrollment",
         billingAuthority: "enrollment",
@@ -1104,8 +1111,8 @@ describe("private C0 and explicit M component", () => {
         expect(count(f.db, "financial_source_registrations").n).toBe(0);
         expect(count(f.db, "money_cutover_writer_permit").n).toBe(0);
       }
-      // Outside the permit frame C0 is refused by its fences, and M refuses a
-      // Sql that is not the Money writer for its epoch before building any SQL.
+      // C0 and M refuse a Sql that is not the Money writer for their epoch
+      // before building any SQL (R1's binding).
       const rawRealm = await verifyHostedBillingFinancialRealm({
         sql: f.sql,
         reader: { client: f.common.client },
@@ -1113,10 +1120,10 @@ describe("private C0 and explicit M component", () => {
         prices: [{ priceId: "price_enrollment", monthlyAmountMinor: 1000 }],
       });
       const raw = { ...f.common, sql: f.sql, realm: rawRealm };
+      const batchesBefore = f.batchCalls;
       await expect(
         createFinancialPreproofChallengeStore({ ...raw, scope: SCOPE }).prepare(f.preparation()),
-      ).rejects.toMatchObject({ code: "conflict" });
-      const batchesBefore = f.batchCalls;
+      ).rejects.toMatchObject({ code: "unavailable" });
       await expect(
         createFinancialSourceMaterializationStore({
           ...raw,
@@ -1140,7 +1147,7 @@ describe("private C0 and explicit M component", () => {
         createFinancialPreproofChallengeStore({ ...foreignOptions, scope: SCOPE }).prepare(
           f.preparation(),
         ),
-      ).rejects.toMatchObject({ code: "conflict" });
+      ).rejects.toMatchObject({ code: "unavailable" });
       // M refuses a writer for another epoch before any SQL (R1's binding).
       const foreignBatches = f.batchCalls;
       await expect(
@@ -1172,6 +1179,60 @@ describe("private C0 and explicit M component", () => {
       f.close();
     }
   });
+  test("on the unfenced candidate, freeze, foreign epoch and raw Sql never write C0 or M", async () => {
+    for (const change of ["freeze", "epoch", "raw"] as const) {
+      const f = await fixture({ unfenced: true });
+      try {
+        if (change === "freeze") f.db.exec(MONEY_FREEZE_ROW);
+        let options = f.common;
+        if (change === "epoch") {
+          // A current permit for a foreign epoch: without fences nothing would
+          // bind the row epoch, so the write must be refused outright.
+          f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(D);
+          const foreign = await financial0104Writer(f.sql, D, f.common.client, {
+            accountId: "acct_enrollment",
+            billingAuthority: "enrollment",
+            priceId: "price_enrollment",
+          });
+          options = { ...f.common, sql: foreign.money, realm: foreign.realm };
+        }
+        if (change === "raw") {
+          const realm = await verifyHostedBillingFinancialRealm({
+            sql: f.sql,
+            reader: { client: f.common.client },
+            expected: {
+              accountId: "acct_enrollment",
+              mode: "test",
+              billingAuthority: "enrollment",
+            },
+            prices: [{ priceId: "price_enrollment", monthlyAmountMinor: 1000 }],
+          });
+          options = { ...f.common, sql: f.sql, realm };
+        }
+        const before = f.batchCalls;
+        await expect(
+          createFinancialPreproofChallengeStore({ ...options, scope: SCOPE }).prepare(
+            f.preparation(),
+          ),
+        ).rejects.toMatchObject({ code: "unavailable" });
+        await expect(
+          createFinancialSourceMaterializationStore({
+            ...options,
+            source: f.source,
+            affectedRef: A,
+            genesisQualificationRef: GQ,
+          }).install(await f.command()),
+        ).rejects.toMatchObject({ code: "unavailable" });
+        expect(f.batchCalls).toBe(before);
+        expect(f.counts()).toEqual([0, 0, 0, 0]);
+        expect(count(f.db, "financial_source_heads").n).toBe(0);
+        expect(count(f.db, "financial_source_registrations").n).toBe(0);
+      } finally {
+        f.close();
+      }
+    }
+  });
+
   test("fixed C0/M batches have exactly matching binds, bounded by actual D1's 100 parameter limit", async () => {
     const f = await fixture();
     try {
@@ -1384,12 +1445,39 @@ async function rejectsUnreadySchema(f: EnrollmentFixture) {
   expect(readEffects(f)).toEqual(before);
 }
 
+/** Leaves the exact unfenced candidate (legacy no-G, or complete G) with the
+ * rows already written, for read/recovery and write-refusal tests. */
+function toUnfenced(f: EnrollmentFixture, genesis: boolean) {
+  dropFinancial0104Fences(f.db);
+  if (genesis) return;
+  for (const [name, sql] of Object.entries(FINANCIAL_GENESIS_SCHEMA))
+    if (sql.startsWith("CREATE TRIGGER")) f.db.exec(`DROP TRIGGER IF EXISTS ${name}`);
+  f.db.exec("DROP TABLE financial_source_genesis_admission_receipts");
+  f.db.exec("DROP TABLE financial_source_genesis_admissions");
+}
+
 describe("legacy C0/M floor and exact complete G overlay readiness", () => {
   for (const overlay of [false, true]) {
     test(`${overlay ? "complete G" : "exact no-G legacy"}: C0/M retain originals, query budgets and GET-only unknowns`, async () => {
       const f = await fixture();
       try {
-        if (overlay) f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
+        // Originals are written on the exact fenced 0104 shape...
+        const preparation = f.preparation();
+        const c0Receipt = await f.c0().prepare(preparation);
+        const command = await f.command();
+        let queries = f.queryCalls;
+        let effects = readEffects(f);
+        expect(await f.m().readOriginal(command)).toBeUndefined();
+        expect(f.queryCalls - queries).toBe(7);
+        expect(readEffects(f)).toEqual(effects);
+        const receipt = await f.m().install(command);
+        expect(receipt).toEqual({
+          materializationRef: command.materializationRef,
+          commandRef: command.commandRef,
+          receiptRef: command.receiptRef,
+        });
+        // ...and stay readable/recoverable on the unfenced candidate shape.
+        toUnfenced(f, overlay);
         expect(
           f.db
             .query(
@@ -1397,9 +1485,7 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
             )
             .all(),
         ).toHaveLength(overlay ? 2 : 0);
-        const preparation = f.preparation();
-        await f.c0().prepare(preparation);
-        let effects = readEffects(f);
+        effects = readEffects(f);
         expect(await f.c0().readChallenge(preparation.challenge.challengeRef)).toEqual(
           preparation.challenge,
         );
@@ -1408,21 +1494,8 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
         ).toHaveLength(10);
         expect(await f.c0().readChallenge("challenge:absent-legacy")).toBeUndefined();
         expect(readEffects(f)).toEqual(effects);
-        const command = await f.command();
         const extraRead = overlay ? 1 : 0;
-        let queries = f.queryCalls;
-        effects = readEffects(f);
-        expect(await f.m().readOriginal(command)).toBeUndefined();
-        expect(f.queryCalls - queries).toBe(6 + extraRead);
-        expect(readEffects(f)).toEqual(effects);
-        const receipt = await f.m().install(command);
-        expect(receipt).toEqual({
-          materializationRef: command.materializationRef,
-          commandRef: command.commandRef,
-          receiptRef: command.receiptRef,
-        });
         queries = f.queryCalls;
-        effects = readEffects(f);
         expect(await f.m().readOriginal(command)).toEqual(receipt);
         expect(f.queryCalls - queries).toBe(4);
         expect(readEffects(f)).toEqual(effects);
@@ -1430,6 +1503,17 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
         queries = f.queryCalls;
         expect(await f.m("parent:second-schema").readOriginal(sibling)).toBeUndefined();
         expect(f.queryCalls - queries).toBe(7 + extraRead);
+        expect(readEffects(f)).toEqual(effects);
+        // Recovery replays still return the originals; every new write is
+        // refused before any statement, since freeze/permit live in fences.
+        expect(await f.c0().prepare(preparation)).toEqual(c0Receipt);
+        expect(await f.m().install(command)).toEqual(receipt);
+        await expect(f.c0().prepare(f.preparation("legacy-new"))).rejects.toMatchObject({
+          code: "unavailable",
+        });
+        await expect(f.m("parent:second-schema").install(sibling)).rejects.toMatchObject({
+          code: "unavailable",
+        });
         expect(readEffects(f)).toEqual(effects);
         f.failRead();
         await expect(f.m().readOriginal(command)).rejects.toMatchObject({ code: "unavailable" });
@@ -1446,7 +1530,7 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
   }
 
   test("G itself still requires the complete overlay and its original reader remains coherent", async () => {
-    const f = await fixture();
+    const f = await fixture({ unfenced: true });
     try {
       const g = mechanicalGenesis(f);
       const before = readEffects(f);
@@ -1454,7 +1538,7 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
         code: "unavailable",
       });
       expect(readEffects(f)).toEqual(before);
-      f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
+      installFinancial0104Fences(f.db, { receiver: true, c0: true, genesisOverlay: true });
       expect(await g.store.readGenesisOriginal(g.command)).toBeUndefined();
       const receipt = await g.store.admitGenesis(g.command);
       expect(receipt).toEqual({
@@ -1489,7 +1573,6 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
       test(`${name} ${fault}: neither effect, retained GET nor positive absence is permitted`, async () => {
         const f = await fixture();
         try {
-          f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
           await f.c0().prepare(f.preparation());
           await f.m().install(await f.command());
           f.db.exec(`DROP TRIGGER ${name}`);
@@ -1580,6 +1663,7 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
       try {
         await f.c0().prepare(f.preparation());
         await f.m().install(await f.command());
+        toUnfenced(f, false);
         scenario.mutate(f);
         await rejectsUnreadySchema(f);
       } finally {
@@ -1591,7 +1675,6 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
   test("complete G occupies both command/receipt roles even for another M source incarnation", async () => {
     const f = await fixture();
     try {
-      f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
       const g = mechanicalGenesis(f);
       await g.store.admitGenesis(g.command);
       const m = await otherMaterialization(f);
@@ -1617,7 +1700,6 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
     test(`complete schema with ${orphan} G cannot manufacture M positive absence`, async () => {
       const f = await fixture();
       try {
-        f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
         const g = mechanicalGenesis(f);
         await g.store.admitGenesis(g.command);
         if (orphan === "original-only") {
@@ -1665,7 +1747,6 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
     ] as const) {
       const f = await fixture();
       try {
-        f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
         const command = await f.command();
         const before = readEffects(f);
         const query = f.sql.query;
@@ -1697,7 +1778,6 @@ describe("legacy C0/M floor and exact complete G overlay readiness", () => {
   test("completed M history survives a later valid G cross-role receipt reservation", async () => {
     const f = await fixture();
     try {
-      f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
       const command = await f.command();
       const receipt = await f.m().install(command);
       expect(receipt).toEqual({

@@ -35,10 +35,13 @@ import {
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
 import {
+  dropFinancial0104Fences,
+  fenceLiftedSql,
   financial0104Writer,
   installFinancial0104Fences,
   MONEY_FREEZE_ROW,
   permitFramed,
+  withMoneyFencesLifted,
 } from "./helpers/financial-0104-fenced.ts";
 
 const AT = "2026-10-15T00:00:00.000Z";
@@ -78,7 +81,7 @@ function withGuardDisabled(db: Database, name: string, mutate: () => void) {
   if (!guard) throw Error(`missing trigger ${name}`);
   db.exec(`DROP TRIGGER ${name}`);
   try {
-    mutate();
+    withMoneyFencesLifted(db, mutate);
   } finally {
     db.exec(guard.sql);
   }
@@ -486,7 +489,6 @@ describe("private historical Control G candidate", () => {
       try {
         // Freeze/permit/epoch are the Financial 0104 fences inside the actual
         // permit-framed Money writer; the G predicate names no money table.
-        installFinancial0104Fences(f.db, { receiver: true, c0: true });
         const { money, realm } = await financial0104Writer(f.sql, W, f.common.client, {
           accountId: "acct_enrollment",
           billingAuthority: "enrollment",
@@ -582,6 +584,67 @@ describe("private historical Control G candidate", () => {
           expect(statement.sql).not.toMatch(/\bmoney_cutover_/u);
       } finally {
         f.close();
+      }
+    },
+  );
+
+  test.each(["freeze", "epoch", "raw"] as const)(
+    "on the unfenced candidate, %s never writes G and recovery still reads the original",
+    async (change) => {
+      const f = await fixture({ unfenced: true });
+      const recovered = await fixture();
+      try {
+        if (change === "freeze") f.db.exec(MONEY_FREEZE_ROW);
+        let options = { ...f.common };
+        if (change === "epoch") {
+          f.db.exec(
+            `UPDATE money_cutover_authorized_epoch SET writer_epoch='${D}' WHERE singleton=1`,
+          );
+          const foreign = await financial0104Writer(f.sql, D, f.common.client, {
+            accountId: "acct_enrollment",
+            billingAuthority: "enrollment",
+            priceId: "price_enrollment",
+          });
+          options = { ...f.common, sql: foreign.money, realm: foreign.realm };
+        }
+        if (change === "raw") {
+          const realm = await verifyHostedBillingFinancialRealm({
+            sql: f.sql,
+            reader: { client: f.common.client },
+            expected: {
+              accountId: "acct_enrollment",
+              mode: "test",
+              billingAuthority: "enrollment",
+            },
+            prices: [{ priceId: "price_enrollment", monthlyAmountMinor: 1000 }],
+          });
+          options = { ...f.common, sql: f.sql, realm };
+        }
+        const before = f.batchCalls;
+        await expect(
+          createFinancialControlGenesisAdmissionStore({
+            ...options,
+            source: f.source,
+            affectedRef: A,
+            genesisQualificationRef: GQ,
+          }).admitGenesis(genesisCommand()),
+        ).rejects.toMatchObject({ code: "unavailable" });
+        expect(f.batchCalls).toBe(before);
+        assertNoGenesisRows(f.db);
+        // A G original committed on the fenced shape stays readable and
+        // replayable once the shape is unfenced, without another batch.
+        const committed = await genesisStore(recovered).admitGenesis(genesisCommand());
+        dropFinancial0104Fences(recovered.db);
+        if (change === "freeze") recovered.db.exec(MONEY_FREEZE_ROW);
+        const batches = recovered.batchCalls;
+        expect(await genesisStore(recovered).readGenesisOriginal(genesisCommand())).toEqual(
+          committed,
+        );
+        expect(await genesisStore(recovered).admitGenesis(genesisCommand())).toEqual(committed);
+        expect(recovered.batchCalls).toBe(batches);
+      } finally {
+        f.close();
+        recovered.close();
       }
     },
   );
@@ -1065,7 +1128,7 @@ describe("private historical Control G candidate", () => {
     }
   });
 });
-async function fixture() {
+async function fixture(options: { readonly unfenced?: boolean } = {}) {
   const db = new Database(":memory:");
   for (const m of MIGRATIONS) db.exec(m.sql);
   db.exec(
@@ -1080,6 +1143,9 @@ async function fixture() {
   db.exec(MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL);
   db.exec(FINANCIAL_SOURCE_ENROLLMENT_DDL);
   db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
+  // New writes require the exact fenced 0104 shape; `unfenced` keeps the
+  // complete candidate for read/recovery and write-refusal tests.
+  if (!options.unfenced) installFinancial0104Fences(db, { receiver: true, c0: true });
   const base = createSqliteSql(db);
   let clockCalls = 0,
     batchCalls = 0,
@@ -1282,7 +1348,8 @@ async function fixture() {
     });
   return {
     db,
-    base,
+    // Fixture setup writes are privileged manipulations with the fences lifted.
+    base: fenceLiftedSql(db, base),
     sql,
     common,
     source,

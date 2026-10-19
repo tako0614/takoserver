@@ -300,7 +300,17 @@ function component(options: FinancialEnrollmentComponentOptions) {
   const completeSchema = { ...SCHEMA, ...FINANCIAL_GENESIS_SCHEMA };
   // Financial 0104: the complete overlay plus every exact C0/M/G money fence.
   const fencedSchema = { ...completeSchema, ...FINANCIAL_0104_C0_FENCE_SCHEMA };
-  async function ready(receiver = false) {
+  /** Exact read/recovery readiness: legacy, complete G, or fenced 0104. */
+  async function ready(receiver = false): Promise<boolean> {
+    return (await shape(receiver)).genesis;
+  }
+  /** Every new C0/M write requires the exact fenced 0104 C0/M/G rows and the
+   * exact fenced receiver digest. Unfenced shapes stay read/recovery-only,
+   * since freeze/permit/epoch now live only in the fences. */
+  function requireFenced(current: { readonly fenced: boolean }): void {
+    if (!current.fenced) fail("unavailable");
+  }
+  async function shape(receiver: boolean): Promise<{ genesis: boolean; fenced: boolean }> {
     try {
       const rows = await sql.query(
         `SELECT type,name,sql FROM sqlite_schema
@@ -339,7 +349,7 @@ function component(options: FinancialEnrollmentComponentOptions) {
           : RECEIVER_SCHEMA_DIGEST;
         if ((await canonicalDigest(receiverRows)) !== expectedReceiver) fail("unavailable");
       }
-      return !legacy;
+      return { genesis: !legacy, fenced: fenced && receiver };
     } catch (error) {
       if (error instanceof FinancialSourceEnrollmentError) throw error;
       fail("unavailable", error);
@@ -352,7 +362,7 @@ function component(options: FinancialEnrollmentComponentOptions) {
       return fail("unavailable", error);
     }
   }
-  return { sql, realmData, current, currentParams, ready, observed };
+  return { sql, realmData, current, currentParams, ready, shape, requireFenced, observed };
 }
 
 export interface FinancialPreproofPreparation {
@@ -565,6 +575,13 @@ export function createFinancialPreproofChallengeStore(
     });
   }
   async function prepare(input: FinancialPreproofPreparation): Promise<FinancialPreproofReceipt> {
+    // Same epoch binding as R1/M: only Root's Money writer for exactly the
+    // configured writer epoch, checked before any statement is built or sent.
+    try {
+      assertMoneyCutoverSqlOrigin(c.sql, { writerEpoch: c.realmData.writerEpoch });
+    } catch (error) {
+      return fail("unavailable", error);
+    }
     let saved: ReturnType<typeof parse>;
     try {
       saved = parse(snapshot(input));
@@ -572,9 +589,10 @@ export function createFinancialPreproofChallengeStore(
       return fail("invalid_request", error);
     }
     try {
-      await c.ready();
+      const current = await c.shape(true);
       const prior = await original(saved);
       if (prior) return prior;
+      c.requireFenced(current);
       const recordJson = json(saved),
         challengeJson = json(saved.challenge),
         at = c.observed();
@@ -967,10 +985,11 @@ export function createFinancialSourceMaterializationStore(
     )
       fail("invalid_request");
     try {
-      const genesis = await c.ready(true);
+      const current = await c.shape(true);
       const prior = await original(saved);
       if (prior) return prior;
-      if (genesis) await rejectGenesisOccupancy(saved);
+      c.requireFenced(current);
+      if (current.genesis) await rejectGenesisOccupancy(saved);
       const recordJson = json(saved),
         at = c.observed();
       const params: readonly SqlParam[] = [

@@ -52,7 +52,7 @@ import {
 import { FINANCIAL_SOURCE_GENESIS_DDL } from "../src/shared-financial-source-genesis-schema.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { fixture as consentFixture } from "./fixtures/financial-customer-five-action-fixture.ts";
-import { installFinancial0104Fences, MONEY_FREEZE_ROW } from "./helpers/financial-0104-fenced.ts";
+import { MONEY_FREEZE_ROW } from "./helpers/financial-0104-fenced.ts";
 import { ACTIONS, AT, count, EPOCH, fixture } from "./helpers/financial-r1-custody-fixture.ts";
 
 const ROOT = resolve(import.meta.dir, "..");
@@ -198,13 +198,15 @@ describe("Financial 0104 source recipe", () => {
           });
       }
       // Every Financial-retained epoch is bound. The R1 registration and the four
-      // receiver tables carry no epoch column (existing R1 registration shape).
+      // receiver tables carry no epoch column, and a grant revocation must stay
+      // possible after rotation (existing R1 registration shape).
       const epochless = [
         "financial_action_source_registrations",
         "financial_source_registrations",
         "financial_source_events",
         "financial_source_heads",
         "financial_source_receipts",
+        "financial_payer_grant_revocations",
       ];
       for (const [table, name] of Object.entries(FINANCIAL_0104_MONEY_FENCES)) {
         const object = FINANCIAL_0104_OBJECTS.find((o) => o.name === name);
@@ -242,6 +244,69 @@ describe("Financial 0104 source recipe", () => {
         expect(count(db, table)).toBe(0);
       } finally {
         db.close();
+      }
+    }
+  });
+
+  test("each fence alone passes the correct permit and refuses a foreign row epoch", () => {
+    const rowValue = (column: string, epoch: string) =>
+      column === "writer_epoch"
+        ? epoch
+        : column.endsWith("_json")
+          ? JSON.stringify({ writerEpoch: epoch, scopeRealm: { writerEpoch: epoch } })
+          : "k";
+    const insertRow = (db: Database, table: string, epoch: string) => {
+      const columns = (db.query(`PRAGMA table_info(${table})`).all() as { name: string }[]).map(
+        (column) => column.name,
+      );
+      db.query(
+        `INSERT INTO ${table}(${columns.join(",")}) VALUES(${columns.map(() => "?").join(",")})`,
+      ).run(...columns.map((column) => rowValue(column, epoch)));
+    };
+    const epochBearing = FINANCIAL_0104_TABLES.filter((table) =>
+      FINANCIAL_0104_OBJECTS.find(
+        (o) => o.name === FINANCIAL_0104_MONEY_FENCES[table],
+      )?.sql.includes("p.writer_epoch IS"),
+    );
+    expect(epochBearing).toHaveLength(14);
+    for (const table of FINANCIAL_0104_TABLES) {
+      for (const rows of ["current", "foreign"] as const) {
+        if (rows === "foreign" && !epochBearing.includes(table)) continue;
+        const db = new Database(":memory:");
+        try {
+          // Only the fence under test exists; every other check is off so that
+          // one synthetic row per table can satisfy the fence's own joins.
+          db.exec("PRAGMA foreign_keys=OFF");
+          db.exec("PRAGMA ignore_check_constraints=ON");
+          db.exec(MONEY_CUTOVER_FREEZE_DDL);
+          db.exec(MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL);
+          db.exec(MONEY_CUTOVER_PERMIT_DDL);
+          for (const object of FINANCIAL_0104_OBJECTS)
+            if (object.type === "table") db.exec(object.sql);
+          const epoch = rows === "current" ? EPOCH : ROTATED;
+          for (const other of FINANCIAL_0104_TABLES)
+            if (other !== table) insertRow(db, other, epoch);
+          const fence = FINANCIAL_0104_OBJECTS.find(
+            (o) => o.name === FINANCIAL_0104_MONEY_FENCES[table],
+          );
+          if (!fence) throw Error(`missing fence for ${table}`);
+          db.exec(fence.sql);
+          db.query("INSERT INTO money_cutover_authorized_epoch VALUES(1,?)").run(EPOCH);
+          db.query("INSERT INTO money_cutover_writer_permit VALUES(1,'usd-micros-v2',?)").run(
+            EPOCH,
+          );
+          if (rows === "current") {
+            insertRow(db, table, EPOCH);
+            expect(count(db, table)).toBe(1);
+          } else {
+            expect(() => insertRow(db, table, ROTATED)).toThrow(
+              /constraint: Financial .*permit\/epoch/u,
+            );
+            expect(count(db, table)).toBe(0);
+          }
+        } finally {
+          db.close();
+        }
       }
     }
   });
@@ -589,7 +654,7 @@ describe("Financial 0104 consent batch through the existing Money writer", () =>
   test("commits with the authorized epoch; freeze, revoked or foreign epoch and no permit roll back", async () => {
     const f = await consentFixture();
     try {
-      // The fixture's own first consent committed before the fences existed.
+      // The fixture's own first consent committed through the actual writer.
       const before = CONSENT_TABLES.map((table) => count(f.db, table));
       expect(before).toEqual([1, 1, 1]);
       const second = {
@@ -602,7 +667,6 @@ describe("Financial 0104 consent batch through the existing Money writer", () =>
         receiptRef: "consent-receipt:fenced",
       };
       await f.challenge(second);
-      installFinancial0104Fences(f.db, { consent: true });
       const epoch = (
         f.db.query("SELECT writer_epoch FROM money_cutover_authorized_epoch").get() as {
           writer_epoch: string;
@@ -636,9 +700,54 @@ describe("Financial 0104 consent batch through the existing Money writer", () =>
       await expect(f.sql.batch(batch)).rejects.toThrow(/constraint: Financial consent/u);
       unchanged();
       expect(count(f.db, "money_cutover_writer_permit")).toBe(0);
+      // On the unfenced consent candidate the batch refuses in-statement: S1/S2
+      // select nothing and the unconditional receipt CHECK aborts all three.
+      const fences = Object.values(FINANCIAL_0104_CONSENT_FENCE_SCHEMA);
+      for (const name of Object.keys(FINANCIAL_0104_CONSENT_FENCE_SCHEMA))
+        f.db.exec(`DROP TRIGGER ${name}`);
+      await expect(writer.batch(batch)).rejects.toThrow(
+        /mandatory consent receipt|all_rows_match/u,
+      );
+      unchanged();
+      for (const sql of fences) f.db.exec(sql);
       // Inside the actual writer with the authorized epoch all three rows commit.
       expect((await writer.batch(batch)).map((write) => write.changes)).toEqual([1, 1, 1]);
       expect(CONSENT_TABLES.map((table) => count(f.db, table))).toEqual([2, 2, 2]);
+      expect(count(f.db, "money_cutover_writer_permit")).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+
+  test("a grant issued under an old epoch stays revocable after rotation, never frozen or unpermitted", async () => {
+    const f = await consentFixture();
+    try {
+      const revoke = {
+        sql: `INSERT INTO financial_payer_grant_revocations(grant_ref,revocation_ref,reason,authority_evidence_ref,revoked_at)
+          VALUES(?,?,?,?,?)`,
+        params: [
+          "grant:1",
+          "revocation:1",
+          "rotation",
+          "evidence:rotation",
+          new Date().toISOString(),
+        ],
+      };
+      const issued = (
+        f.db
+          .query("SELECT writer_epoch FROM shared_customer_challenges WHERE challenge_ref=?")
+          .get("challenge:1") as { writer_epoch: string }
+      ).writer_epoch;
+      expect(issued).not.toBe(ROTATED);
+      f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(ROTATED);
+      const rotated = createMoneyCutoverSql(f.sql, ROTATED);
+      f.db.exec(MONEY_FREEZE_ROW);
+      await expect(rotated.batch([revoke])).rejects.toThrow(/consent revocation permit required/u);
+      f.db.exec("DELETE FROM money_cutover_freeze");
+      await expect(f.sql.batch([revoke])).rejects.toThrow(/consent revocation permit required/u);
+      expect(count(f.db, "financial_payer_grant_revocations")).toBe(0);
+      expect(await rotated.batch([revoke])).toHaveLength(1);
+      expect(count(f.db, "financial_payer_grant_revocations")).toBe(1);
       expect(count(f.db, "money_cutover_writer_permit")).toBe(0);
     } finally {
       f.close();

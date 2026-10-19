@@ -1,8 +1,12 @@
-import { isFinancialMoneyFencedBatch } from "./financial-0104-money-fence.ts";
+import {
+  FINANCIAL_0104_RECEIVER_FENCED_SCHEMA_DIGEST,
+  isFinancialMoneyFencedBatch,
+} from "./financial-0104-money-fence.ts";
 import {
   assertHostedBillingFinancialRealm,
   type HostedBillingFinancialRealm,
 } from "./hosted-billing-realm.ts";
+import { canonicalDigest } from "./json.ts";
 import { assertMoneyCutoverSqlOrigin } from "./money-cutover-sql.ts";
 import {
   type Clock,
@@ -298,6 +302,18 @@ export function createSharedFinancialSourceReceiver(
     const eventDigest = await financialSourceEventDigest(event);
     const prior = await retained(event.eventRef);
     if (prior) return original(prior, eventJson);
+    // A new receiver write requires the exact fenced 0104 receiver rows; the
+    // unfenced candidate stays read/recovery-only (freeze/permit live in fences).
+    try {
+      const receiverRows = await sql.query(
+        `SELECT type,name,sql FROM sqlite_schema WHERE tbl_name IN ('financial_source_registrations','financial_source_heads','financial_source_events','financial_source_receipts') AND sql IS NOT NULL ORDER BY type,name`,
+      );
+      if ((await canonicalDigest(receiverRows)) !== FINANCIAL_0104_RECEIVER_FENCED_SCHEMA_DIGEST)
+        fail("unavailable");
+    } catch (error) {
+      if (error instanceof SharedFinancialSourceError) throw error;
+      fail("unavailable", { cause: error });
+    }
 
     let instant: string;
     try {

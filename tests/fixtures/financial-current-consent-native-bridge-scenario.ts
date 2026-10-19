@@ -414,7 +414,7 @@ async function selectedCustomerCase(request: Awaited<ReturnType<typeof requestFi
   } finally {
     f.db.exec(trigger.sql);
   }
-  await f.sql.batch(prepareConsentBatch(input, f.org));
+  await f.consentWriter.batch(prepareConsentBatch(input, f.org));
   const admission = await customerAdmissionCandidate(
     { action: f.action, consent: input, selectedTerms: terms },
     f.identity,

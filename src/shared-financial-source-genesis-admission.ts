@@ -360,7 +360,8 @@ export function createFinancialControlGenesisAdmissionStore(
     source.qualificationRef,
   ];
 
-  async function ready() {
+  /** Read/recovery accepts the exact complete or fenced overlay; returns fenced. */
+  async function ready(): Promise<boolean> {
     try {
       const complete = { ...FINANCIAL_SOURCE_ENROLLMENT_SCHEMA, ...FINANCIAL_GENESIS_SCHEMA };
       const rows = await sql.query(`SELECT name,sql FROM sqlite_schema WHERE tbl_name IN
@@ -389,6 +390,7 @@ export function createFinancialControlGenesisAdmissionStore(
           : FINANCIAL_RECEIVER_UNFENCED_SCHEMA_DIGEST)
       )
         fail("unavailable");
+      return fenced;
     } catch (error) {
       if (error instanceof FinancialControlGenesisError) throw error;
       fail("unavailable", error);
@@ -547,9 +549,12 @@ export function createFinancialControlGenesisAdmissionStore(
       return fail("invalid_request", error);
     }
     try {
-      await ready();
+      const fenced = await ready();
       const prior = await original(saved);
       if (prior) return prior;
+      // A new G write requires the exact fenced 0104 shape; unfenced overlays
+      // are read/recovery-only since freeze/permit/epoch live in the fences.
+      if (!fenced) fail("unavailable");
       let at: string;
       try {
         at = iso(clock().toISOString());

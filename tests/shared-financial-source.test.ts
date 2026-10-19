@@ -30,6 +30,8 @@ import {
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
 import {
+  dropFinancial0104Fences,
+  fenceLiftedSql,
   financial0104Writer,
   installFinancial0104Fences,
   MONEY_FREEZE_ROW,
@@ -74,6 +76,7 @@ async function fixture(
     readonly registration?: FinancialSourceRegistration;
     readonly receiverRef?: string;
     readonly targetRef?: string;
+    readonly unfenced?: boolean;
   } = {},
 ) {
   const fixtureRegistration = input.registration ?? REGISTRATION;
@@ -94,7 +97,12 @@ async function fixture(
   db.exec(MONEY_CUTOVER_FREEZE_DDL);
   db.exec(MONEY_CUTOVER_PERMIT_DDL);
   db.exec(MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL);
-  const base = createSqliteSql(db);
+  // New receiver writes require the exact fenced 0104 receiver rows; `unfenced`
+  // keeps the candidate for read/recovery and write-refusal tests.
+  if (!input.unfenced) installFinancial0104Fences(db, { receiver: true });
+  const rawBase = createSqliteSql(db);
+  // Fixture setup writes are privileged manipulations with the fences lifted.
+  const base = fenceLiftedSql(db, rawBase);
   let beforeBatch: (() => Promise<void>) | undefined;
   let batchFault: ((statements: readonly SqlStatement[]) => readonly SqlStatement[]) | undefined;
   let lostAck = false,
@@ -124,9 +132,9 @@ async function fixture(
         lostRead = false;
         throw new SqlError("unavailable", "Lost receipt readback");
       }
-      return base.query(query, params);
+      return rawBase.query(query, params);
     },
-    run: (query, params) => base.run(query, params),
+    run: (query, params) => rawBase.run(query, params),
     async batch(framedStatements) {
       batchCalls++;
       // Record and fault only the Financial statements inside the Money frame.
@@ -142,7 +150,7 @@ async function fixture(
         const sent = batchFault ? batchFault(statements) : statements;
         const first = framedStatements[0],
           last = framedStatements.at(-1);
-        const result = await base.batch(framed && first && last ? [first, ...sent, last] : sent);
+        const result = await rawBase.batch(framed && first && last ? [first, ...sent, last] : sent);
         if (lostAck) {
           lostAck = false;
           lostRead = true;
@@ -511,7 +519,6 @@ describe("unmounted shared Financial source primary store", () => {
       try {
         // Freeze/permit/epoch are the Financial 0104 receiver fences inside the
         // actual permit-framed Money writer; the predicate names no money table.
-        installFinancial0104Fences(f.db, { receiver: true });
         const { money, realm } = await financial0104Writer(f.sql, WRITER, f.client, {
           accountId: "acct_sourcefixture",
           billingAuthority: "source-fixture",
@@ -552,6 +559,51 @@ describe("unmounted shared Financial source primary store", () => {
       } finally {
         f.db.close();
       }
+    }
+  });
+
+  test("on the unfenced receiver candidate, freeze, rotation and retirement never write; recovery reads", async () => {
+    for (const change of ["freeze", "writer", "retire"] as const) {
+      const f = await fixture({ unfenced: true });
+      try {
+        if (change === "freeze") await f.base.run(MONEY_FREEZE_ROW);
+        if (change === "writer")
+          await f.base.run("UPDATE money_cutover_authorized_epoch SET writer_epoch=?", [
+            `sha256:${"d".repeat(64)}`,
+          ]);
+        if (change === "retire")
+          await f.base.run(
+            "UPDATE financial_source_registrations SET retirement_ref='retired:fixture',retired_at=?",
+            [new Date().toISOString()],
+          );
+        const before = [f.batchCalls, f.evidenceCalls, f.clockCalls];
+        await expect(f.receiver.applySourceEvent(f.own(first()))).rejects.toMatchObject({
+          code: "unavailable",
+        });
+        expect([f.batchCalls, f.evidenceCalls, f.clockCalls]).toEqual(before);
+        expect(await f.snapshot()).toMatchObject({
+          events: [],
+          receipts: [],
+          heads: [{ sequence: 0, state: "active" }],
+        });
+      } finally {
+        f.db.close();
+      }
+    }
+    // A receipt committed on the fenced shape is still read and replayed once
+    // the receiver is unfenced, without another batch.
+    const f = await fixture();
+    try {
+      const event = f.own(first());
+      const receipt = await f.receiver.applySourceEvent(event);
+      dropFinancial0104Fences(f.db);
+      await f.base.run(MONEY_FREEZE_ROW);
+      const batches = f.batchCalls;
+      expect(await f.make().readSourceEventReceipt(event.eventRef)).toEqual(receipt);
+      expect(await f.make().applySourceEvent(event)).toEqual(receipt);
+      expect(f.batchCalls).toBe(batches);
+    } finally {
+      f.db.close();
     }
   });
 
@@ -848,9 +900,11 @@ describe("unmounted shared Financial source primary store", () => {
   test("unconditional receipt CHECK rolls back zero-row event or head even without the receipt trigger", async () => {
     for (const operation of ["event", "head", "null-check"] as const) {
       const f = await fixture();
-      f.db.exec("DROP TRIGGER financial_source_receipt_match");
-      f.fault((statements) =>
-        statements.map((statement, index) => {
+      // Drop the receipt trigger only at send time: exact-shape write readiness
+      // would otherwise refuse this altered receiver schema before any batch.
+      f.fault((statements) => {
+        f.db.exec("DROP TRIGGER IF EXISTS financial_source_receipt_match");
+        return statements.map((statement, index) => {
           if ((operation === "event" && index === 0) || (operation === "head" && index === 1))
             return { ...statement, sql: `${statement.sql} AND 0` };
           if (operation === "null-check" && index === 2)
@@ -859,8 +913,8 @@ describe("unmounted shared Financial source primary store", () => {
               sql: statement.sql.replace("THEN 1 ELSE 0 END", "THEN NULL ELSE 0 END"),
             };
           return statement;
-        }),
-      );
+        });
+      });
       const before = await f.snapshot();
       const error = await f.receiver
         .applySourceEvent(f.own(first()))

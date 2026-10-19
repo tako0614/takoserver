@@ -31,6 +31,7 @@ import {
 import { FINANCIAL_SOURCE_GENESIS_DDL } from "../../src/shared-financial-source-genesis-admission.ts";
 import { createSqliteSql } from "../../src/sql-sqlite.ts";
 import { createStripeBillingClient } from "../../src/stripe-billing-client.ts";
+import { installFinancial0104Fences } from "./financial-0104-fenced.ts";
 
 export const AT = "2026-10-15T00:00:00.000Z";
 export const EPOCH = `sha256:${"c".repeat(64)}` as const;
@@ -154,6 +155,8 @@ export async function fixture(databasePath = ":memory:", initialize = true) {
         "utf8",
       ),
     );
+    // New C0/R1 writes require the exact fenced 0104 shape.
+    installFinancial0104Fences(db, { receiver: true, c0: true });
     db.exec(FINANCIAL_R1_ATTEMPT_DDL);
   }
   const base = createSqliteSql(db);
@@ -235,16 +238,16 @@ export async function fixture(databasePath = ":memory:", initialize = true) {
   };
   const store = createFinancialRetainedR1Store(options);
   // C0 SQL no longer names money_cutover_* tables and passes Root S unchanged;
-  // on the Financial 0104 schema its freeze/permit/epoch are the C0 money fences.
-  // This fixture installs the unfenced C0 candidate, so its C0 prepare stays a
-  // mechanical raw-Sql fixture on this same primary; R1 writes use the actual S wrapper.
+  // this fixture installs the exact fenced 0104 C0/M/G and receiver shape, so
+  // C0 prepare runs through the actual S wrapper like every R1 write. The raw
+  // realm stays only for raw-R negative tests.
   const c0FixtureRealm = await verifyHostedBillingFinancialRealm({
     sql: raw,
     reader: { client },
     expected: { accountId: "acct_enrollment", mode: "test", billingAuthority: "enrollment" },
     prices: [{ priceId: "price_enrollment", monthlyAmountMinor: 1000 }],
   });
-  const c0 = createFinancialPreproofChallengeStore({ ...options, sql: raw, realm: c0FixtureRealm });
+  const c0 = createFinancialPreproofChallengeStore(options);
   const sourceBody = {
     version: "financial-action-registration-canonical-v1",
     registrationRef: "action-registration:test",

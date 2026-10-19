@@ -2,6 +2,7 @@ import type { PurchaseCreditExpiry } from "./billing-config.ts";
 import { sharedRpCredentialCurrentness } from "./credential-authority-class.ts";
 import {
   FINANCIAL_0104_C0_FENCE_SCHEMA,
+  FINANCIAL_0104_RECEIVER_FENCED_SCHEMA_DIGEST,
   isFinancialMoneyFencedBatch,
 } from "./financial-0104-money-fence.ts";
 import {
@@ -895,7 +896,7 @@ async function ready(c: Captured): Promise<void> {
 
 /** Exact existing C0 schema boundary even when no stored Financial scope is
  * available to construct a scope-specific retained store. */
-async function readyC0HistorySchema(sql: Sql): Promise<void> {
+async function readyC0HistorySchema(sql: Sql, requireFenced = false): Promise<void> {
   const names = [
     "financial_preproof_challenges",
     "financial_preproof_challenge_receipts",
@@ -930,9 +931,27 @@ async function readyC0HistorySchema(sql: Sql): Promise<void> {
       : { ...FINANCIAL_SOURCE_ENROLLMENT_SCHEMA, ...FINANCIAL_GENESIS_SCHEMA };
   if (
     rows.length !== Object.keys(expected).length ||
-    rows.some((row) => typeof row.name !== "string" || row.sql !== expected[row.name])
+    rows.some((row) => typeof row.name !== "string" || row.sql !== expected[row.name]) ||
+    (requireFenced && !fenced)
   )
     fail("unavailable");
+}
+/** A new co-preparation write requires the exact fenced 0104 shape: R1 rows and
+ * fences, C0/M/G rows and fences, and the fenced receiver digest. Unfenced
+ * shapes stay read/recovery-only since freeze/permit/epoch live in the fences. */
+async function readyFencedCoPreparation(c: Captured): Promise<void> {
+  try {
+    await ready(c);
+    await readyC0HistorySchema(c.sql, true);
+    const receiverRows = await c.sql.query(
+      `SELECT type,name,sql FROM sqlite_schema WHERE tbl_name IN ('financial_source_registrations','financial_source_heads','financial_source_events','financial_source_receipts') AND sql IS NOT NULL ORDER BY type,name`,
+    );
+    if ((await canonicalDigest(receiverRows)) !== FINANCIAL_0104_RECEIVER_FENCED_SCHEMA_DIGEST)
+      fail("unavailable");
+  } catch (error) {
+    if (error instanceof FinancialRetainedR1Error) throw error;
+    fail("unavailable", error);
+  }
 }
 async function registered(c: Captured, p: Parsed): Promise<void> {
   const s = p.command.original.actionSource;
@@ -1217,6 +1236,7 @@ export async function buildFinancialR1CoPreparationBatch(
     at = iso(observedAt);
   try {
     const p = await parseCaptured(command, c);
+    await readyFencedCoPreparation(c);
     return coPreparationBatchData(c, p, at);
   } catch (error) {
     if (error instanceof FinancialRetainedR1Error) throw error;
@@ -1368,6 +1388,7 @@ export async function buildFinancialR1ClaimedCoPreparationBatch(
     at = iso(observedAt);
   const p = await parseCaptured(command, c),
     image = await attemptImage(p, at);
+  await readyFencedCoPreparation(c);
   const claimed: Captured = Object.freeze({
     ...c,
     current: `(${c.current}) AND EXISTS(SELECT 1 FROM ${ATTEMPT_TABLE} attempt WHERE ${attemptMatch("attempt")})`,

@@ -64,8 +64,11 @@ export const FINANCIAL_0104_CONSENT_FENCE_SCHEMA: Readonly<Record<string, string
     "CREATE TRIGGER financial_payer_consent_witnesses_money_fence BEFORE INSERT ON financial_payer_consent_witnesses\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM shared_customer_challenges c\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE c.challenge_ref IS NEW.challenge_ref AND p.writer_epoch IS c.writer_epoch) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial consent witness permit/epoch required');\nEND",
   financial_payer_consent_receipts_money_fence:
     "CREATE TRIGGER financial_payer_consent_receipts_money_fence BEFORE INSERT ON financial_payer_consent_receipts\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM shared_customer_challenges c\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE c.challenge_ref IS NEW.challenge_ref AND p.writer_epoch IS c.writer_epoch) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial consent receipt permit/epoch required');\nEND",
+  // Revocation must stay possible for a grant issued under an earlier epoch,
+  // so it binds no row epoch: no freeze, and the current permit joined to the
+  // authorized epoch only (the R1 registration fence shape).
   financial_payer_grant_revocations_money_fence:
-    "CREATE TRIGGER financial_payer_grant_revocations_money_fence BEFORE INSERT ON financial_payer_grant_revocations\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM financial_payer_grants g\n JOIN shared_customer_challenges c ON c.challenge_ref=g.challenge_ref\n JOIN money_cutover_writer_permit p ON p.singleton=1 AND p.epoch='usd-micros-v2'\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE g.grant_ref IS NEW.grant_ref AND p.writer_epoch IS c.writer_epoch) BEGIN\n SELECT RAISE(ABORT,'constraint: Financial consent revocation permit/epoch required');\nEND",
+    "CREATE TRIGGER financial_payer_grant_revocations_money_fence BEFORE INSERT ON financial_payer_grant_revocations\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM money_cutover_writer_permit p\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE p.singleton=1 AND p.epoch='usd-micros-v2') BEGIN\n SELECT RAISE(ABORT,'constraint: Financial consent revocation permit required');\nEND",
 });
 
 /** Every table that carries a Financial 0104 money fence. A Financial builder may
@@ -93,7 +96,10 @@ export const FINANCIAL_0104_FENCED_TABLES = Object.freeze([
   "financial_payer_grant_revocations",
 ] as const);
 
-/** The one INSERT target of a Financial DATA statement, or undefined. */
+/** The one write target of a Financial DATA statement, or undefined. This is a
+ * static builder-side name check only, not a schema guarantee: whether the
+ * target actually carries its fence is proven by the live fences themselves
+ * and the exact fenced-shape readiness checks that every write path runs. */
 export function financialStatementWriteTarget(sql: string): string | undefined {
   const targets = [
     ...sql.matchAll(

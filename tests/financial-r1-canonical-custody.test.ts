@@ -32,6 +32,7 @@ import {
   type FinancialEnrollmentComponentOptions,
   type FinancialPreproofScope,
 } from "../src/shared-financial-source-enrollment.ts";
+import { installFinancial0104Fences } from "./helpers/financial-0104-fenced.ts";
 import {
   fixture,
   NEXT,
@@ -73,6 +74,14 @@ async function setup() {
         "utf8",
       ),
     );
+    // New C0/R1 writes require the exact fenced 0104 shape: receivers, G and fences.
+    native.db.exec(
+      readFileSync(
+        new URL("./fixtures/shared-financial-source-component-schema.sql", import.meta.url),
+        "utf8",
+      ),
+    );
+    installFinancial0104Fences(native.db, { receiver: true, c0: true, genesisOverlay: true });
     await native.sql.run("INSERT INTO money_cutover_authorized_epoch VALUES(1,?)", [EPOCH]);
     const sql = createMoneyCutoverSql(native.sql, EPOCH);
     const assertBacking = () =>

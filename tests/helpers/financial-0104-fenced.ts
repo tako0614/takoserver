@@ -81,3 +81,66 @@ export function permitFramed(statements: readonly { readonly sql: string }[]): b
     /^DELETE FROM money_cutover_writer_permit\b/u.test(statements.at(-1)?.sql ?? "")
   );
 }
+
+/** Fixture-only raw seeding inside Root's exact permit frame for `epoch`. */
+export function inPermitFrame<T extends { readonly sql: string }>(
+  epoch: string,
+  statements: readonly T[],
+): readonly (T | { readonly sql: string; readonly params: readonly string[] })[] {
+  return [
+    {
+      sql: "INSERT INTO money_cutover_writer_permit(singleton,epoch,writer_epoch) VALUES(1,'usd-micros-v2',?)",
+      params: [epoch],
+    },
+    ...statements,
+    {
+      sql: "DELETE FROM money_cutover_writer_permit WHERE singleton=1 AND epoch='usd-micros-v2' AND writer_epoch=?",
+      params: [epoch],
+    },
+  ];
+}
+
+/** Drops every installed Financial 0104 money fence, leaving the exact unfenced
+ * candidate shape (with any rows already written) for refusal/recovery tests. */
+export function dropFinancial0104Fences(db: Database): void {
+  const fences = db
+    .query(
+      "SELECT name FROM sqlite_schema WHERE type='trigger' AND (name GLOB '*_money_fence' OR name GLOB '*_money_fence_update') AND name NOT IN ('financial_action_source_registrations_money_fence','financial_retained_r1_originals_money_fence','financial_retained_r1_receipts_money_fence','financial_r1_preparation_attempts_money_fence')",
+    )
+    .all() as { name: string }[];
+  for (const { name } of fences) db.exec(`DROP TRIGGER ${name}`);
+}
+
+const FENCE_ROWS =
+  "SELECT name,sql FROM sqlite_schema WHERE type='trigger' AND (name GLOB '*_money_fence' OR name GLOB '*_money_fence_update')";
+
+/** Fixture-only privileged manipulation: lifts every money fence for exactly
+ * the duration of `mutate` and restores the exact rows afterwards. Never used
+ * underneath a writer path under test. */
+export function withMoneyFencesLifted<T>(db: Database, mutate: () => T): T {
+  const fences = db.query(FENCE_ROWS).all() as { name: string; sql: string }[];
+  for (const { name } of fences) db.exec(`DROP TRIGGER ${name}`);
+  try {
+    return mutate();
+  } finally {
+    for (const { sql } of fences) db.exec(sql);
+  }
+}
+
+/** A fixture setup Sql whose writes run with the money fences lifted. */
+export function fenceLiftedSql(db: Database, raw: Sql): Sql {
+  async function lifted<T>(write: () => Promise<T>): Promise<T> {
+    const fences = db.query(FENCE_ROWS).all() as { name: string; sql: string }[];
+    for (const { name } of fences) db.exec(`DROP TRIGGER ${name}`);
+    try {
+      return await write();
+    } finally {
+      for (const { sql } of fences) db.exec(sql);
+    }
+  }
+  return {
+    query: (sql, params) => raw.query(sql, params),
+    run: (sql, params) => lifted(() => raw.run(sql, params)),
+    batch: (statements) => lifted(() => raw.batch(statements)),
+  };
+}
