@@ -734,6 +734,12 @@ const LAYERS: readonly Layer[] = [
     may: ["core", "domain", "app"],
   },
   {
+    // Root 0105 Org history capture recipe DATA; it imports nothing.
+    name: "domain",
+    match: /^src\/root-0105-org-capture-triggers\.ts$/u,
+    may: ["core", "domain"],
+  },
+  {
     // Shared app name policy belongs to the existing origin reservation domain.
     // Its pure helpers do not gain adapter or composition import authority.
     name: "domain",
