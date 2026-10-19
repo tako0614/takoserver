@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { createApi, type TopUpCheckoutStart, type TopUpReceipt } from "../console/src/api.ts";
-import { createTopUpCheckoutController } from "../console/src/top-up-checkout.ts";
+import {
+  createApi,
+  type OrganizationSubscription,
+  type TopUpCheckoutStart,
+  type TopUpReceipt,
+} from "../console/src/api.ts";
+import { createTopUpCheckoutController, topUpLane } from "../console/src/top-up-checkout.ts";
 import {
   createTopUpIntentStore,
   type TopUpIntentStorage,
@@ -94,6 +99,7 @@ function harness(input?: {
   readonly intents?: ReturnType<typeof intentStore>;
   readonly principalId?: string;
   readonly scopeOrganizationId?: string;
+  readonly signedOut?: boolean;
   readonly begin?: (reference: string, amountMinor: number) => Promise<TopUpCheckoutStart>;
   readonly receipt?: (reference: string) => Promise<TopUpReceipt>;
 }) {
@@ -103,11 +109,17 @@ function harness(input?: {
   const begins: { readonly reference: string; readonly amountMinor: number }[] = [];
   const receipts: string[] = [];
   let refreshes = 0;
-  let activeScope = {
-    organizationId: input?.scopeOrganizationId ?? organizationId,
-    principalId: input?.principalId ?? ownerPrincipalId,
-    ownerPrincipalId,
-  };
+  let activeScope: {
+    readonly organizationId: string;
+    readonly principalId: string;
+    readonly ownerPrincipalId: string;
+  } | null = input?.signedOut
+    ? null
+    : {
+        organizationId: input?.scopeOrganizationId ?? organizationId,
+        principalId: input?.principalId ?? ownerPrincipalId,
+        ownerPrincipalId,
+      };
   const controller = createTopUpCheckoutController({
     organizationId,
     getScope: () => activeScope,
@@ -190,17 +202,30 @@ describe("hosted top-up intent and Checkout", () => {
 
   test("a different amount minted by another tab under the lock is refused, not overwritten", async () => {
     const storage = new MemoryStorage();
-    const page = harness({ storage });
-    const otherTab = intentStore(storage);
-    await otherTab.getOrCreate({ ...scope, amountMinor: 1000 });
-    const otherReference = storedReference(storage);
-    await expect(otherTab.getOrCreate({ ...scope, amountMinor: 2000 })).rejects.toMatchObject({
-      code: "intent_amount_mismatch",
+    const shared = exclusiveLock();
+    let next = 1;
+    const uuid = () => `00000000-0000-4000-8000-${String(next++).padStart(12, "0")}`;
+    const otherTab = createTopUpIntentStore({ storage, lock: shared, uuid });
+    let otherReference: string | null = null;
+    // This tab's peek and unlocked read saw nothing; the other tab mints its
+    // own amount while this tab is still waiting for the exclusive lock.
+    const interleaved = async <T>(name: string, operation: () => T | Promise<T>): Promise<T> => {
+      expect(storedReference(storage)).toBeNull();
+      await otherTab.getOrCreate({ ...scope, amountMinor: 1000 });
+      otherReference = storedReference(storage);
+      return shared(name, operation);
+    };
+    const page = harness({
+      storage,
+      intents: createTopUpIntentStore({ storage, lock: interleaved, uuid }),
     });
     await page.controller.start(2000);
+    expect(otherReference).not.toBeNull();
     expect(page.begins).toEqual([]);
+    expect(page.receipts).toEqual([]);
     expect(page.controller.state()).toEqual({ status: "amount_conflict", amountMinor: 1000 });
     expect(storedReference(storage)).toBe(otherReference);
+    expect(JSON.parse(storage.getItem(storageKey) ?? "{}").amountMinor).toBe(1000);
   });
 
   test("storage failure or an absent exclusive lock refuses to mint a reference", async () => {
@@ -447,6 +472,53 @@ describe("hosted top-up intent and Checkout", () => {
     expect(storedReference(unknown.storage)).toBe(unknown.begins[0]?.reference ?? "");
   });
 
+  test("a begin answered not_found is discarded only after a not-found receipt, then unavailable", async () => {
+    const absent = harness({ begin: async () => Promise.reject(apiError("not_found", 404)) });
+    await absent.controller.start(5000);
+    const reference = absent.begins[0]?.reference ?? "";
+    expect(absent.receipts).toEqual([reference]);
+    expect(absent.controller.state()).toEqual({ status: "unavailable" });
+    expect(storedReference(absent.storage)).toBeNull();
+
+    for (const receipt of [
+      async (ref: string): Promise<TopUpReceipt> => ({
+        reference: ref,
+        state: "pending",
+        checkout: null,
+      }),
+      async (): Promise<TopUpReceipt> => Promise.reject(apiError("unreachable", 0)),
+    ]) {
+      const held = harness({
+        begin: async () => Promise.reject(apiError("not_found", 404)),
+        receipt,
+      });
+      await held.controller.start(5000);
+      expect(held.controller.state()).toEqual({ status: "unavailable" });
+      expect(storedReference(held.storage)).toBe(held.begins[0]?.reference ?? "");
+    }
+  });
+
+  test("a return before the owner scope loads is kept and answered once the scope arrives", async () => {
+    const storage = new MemoryStorage();
+    await intentStore(storage).getOrCreate({ ...scope, amountMinor: 5000 });
+    const page = harness({
+      storage,
+      signedOut: true,
+      search: "?checkout=cs_test_top_up&consent=returned",
+      receipt: async (ref) => ({ reference: ref, state: "pending", checkout: null }),
+    });
+    expect(await page.controller.handleReturn()).toBe(false);
+    expect(await page.controller.handleConsentReturn()).toBe(false);
+    expect(page.receipts).toEqual([]);
+    expect(page.location.replaced).toEqual([]);
+    expect(page.location.currentSearch()).toBe("?checkout=cs_test_top_up&consent=returned");
+
+    page.switchScope({ organizationId, principalId: ownerPrincipalId, ownerPrincipalId });
+    expect(await page.controller.handleReturn()).toBe(true);
+    expect(page.receipts).toHaveLength(1);
+    expect(page.controller.state()).toEqual({ status: "pending" });
+  });
+
   test("a consent return without an intent sends nothing", async () => {
     const page = harness({ search: "?consent=returned" });
     await page.controller.handleConsentReturn();
@@ -500,6 +572,35 @@ describe("hosted top-up intent and Checkout", () => {
     await started;
     expect(page.begins).toHaveLength(1);
     expect(page.location.assigned).toEqual([]);
+  });
+});
+
+describe("top-up lane", () => {
+  const planTable = finalizedHostedPlanTable() as unknown as OrganizationSubscription["planTable"];
+  const capabilities = {
+    contractVersion: "hosted-billing-v1",
+    topUps: true,
+    subscriptionStart: true,
+    subscriptionCancellation: true,
+    subscriptionPlanChange: true,
+  };
+  const ready = (value: OrganizationSubscription) => ({ state: "ready" as const, value });
+
+  test("only the declared hosted billing contract with top-ups takes a durable reference", () => {
+    expect(
+      topUpLane(ready({ subscription: null, planTable, billingCapabilities: capabilities })),
+    ).toBe("hosted");
+    expect(topUpLane(ready({ subscription: null, planTable }))).toBe("legacy");
+    for (const billingCapabilities of [
+      { ...capabilities, topUps: false },
+      { ...capabilities, contractVersion: "hosted-billing-v2" },
+    ])
+      expect(topUpLane(ready({ subscription: null, planTable, billingCapabilities }))).toBe(
+        "legacy",
+      );
+    expect(topUpLane({ state: "error", error: apiError("not_found", 404) })).toBe("legacy");
+    expect(topUpLane({ state: "error", error: apiError("unavailable", 503) })).toBeNull();
+    expect(topUpLane({ state: "loading" })).toBeNull();
   });
 });
 
@@ -573,6 +674,33 @@ describe("console top-up API", () => {
     }
   });
 
+  test("the subscription read keeps declared billing capabilities and refuses malformed ones", async () => {
+    const planTable = finalizedHostedPlanTable();
+    const capabilities = {
+      contractVersion: "hosted-billing-v1",
+      topUps: true,
+      subscriptionStart: true,
+      subscriptionCancellation: false,
+      subscriptionPlanChange: false,
+    };
+    transport(() =>
+      Response.json({ subscription: null, planTable, billingCapabilities: capabilities }),
+    );
+    expect((await client().subscription(organizationId)).billingCapabilities).toEqual(capabilities);
+    transport(() => Response.json({ subscription: null, planTable }));
+    expect(await client().subscription(organizationId)).not.toHaveProperty("billingCapabilities");
+    transport(() =>
+      Response.json({
+        subscription: null,
+        planTable,
+        billingCapabilities: { ...capabilities, topUps: "yes" },
+      }),
+    );
+    await expect(client().subscription(organizationId)).rejects.toMatchObject({
+      code: "invalid_response",
+    });
+  });
+
   test("legacy begin still sends only the amount and legacy funding the session proof", async () => {
     const seen = transport((request) =>
       new URL(request.url).pathname.endsWith("/funding")
@@ -594,6 +722,7 @@ describe("console top-up API", () => {
 class TestNode {
   readonly children: TestNode[] = [];
   readonly attributes = new Map<string, string>();
+  readonly listeners = new Map<string, Array<(event: unknown) => unknown>>();
   readonly style = {};
   readonly dataset = {};
   parent: TestNode | null = null;
@@ -618,22 +747,61 @@ class TestNode {
     this.children.length = 0;
     this.append(...values);
   }
-  remove(): void {}
+  remove(): void {
+    if (!this.parent) return;
+    this.parent.children.splice(this.parent.children.indexOf(this), 1);
+    this.parent = null;
+  }
   setAttribute(name: string, value: string): void {
     this.attributes.set(name, value);
   }
-  addEventListener(): void {}
+  addEventListener(type: string, listener: (event: unknown) => unknown): void {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+  }
   removeEventListener(): void {}
+  querySelector(): null {
+    return null;
+  }
+  click(): void {
+    for (const listener of this.listeners.get("click") ?? []) listener({ target: this });
+  }
+  all(): TestNode[] {
+    return [this, ...this.children.flatMap((child) => child.all())];
+  }
 }
+
+type SubscriptionAnswer =
+  /** Hosted billing composed: the GET declares the hosted contract with top-ups. */
+  | "hosted"
+  /** Self-host with hosted pricing: a subscription route, no hosted capabilities. */
+  | "self-host-subscriptions"
+  /** Legacy self-host: no subscription route. */
+  | "legacy"
+  /** The subscription read never answers. */
+  | "loading"
+  /** The subscription read fails with something other than not_found. */
+  | "failing";
+
+interface SentRequest {
+  readonly call: string;
+  readonly body: unknown;
+}
+
+const flush = async (rounds = 20) => {
+  for (let i = 0; i < rounds; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+};
 
 /**
  * Builds the billing page over a Host that answers as given, then reports
- * which money paths it called. Only the lane decision is under test.
+ * which money paths it called. Only the lane decision and its routing are
+ * under test; the rest of the page is built but not inspected.
  */
 async function billingPageFor(input: {
-  readonly hosted: boolean;
-  readonly search: string;
+  readonly subscription: SubscriptionAnswer;
+  readonly search?: string;
   readonly storage?: Map<string, string>;
+  readonly signedIn?: boolean;
+  readonly receiptState?: TopUpReceipt["state"];
 }) {
   const values = input.storage ?? new Map<string, string>();
   const storage = {
@@ -641,14 +809,16 @@ async function billingPageFor(input: {
     setItem: (key: string, value: string) => values.set(key, value),
     removeItem: (key: string) => values.delete(key),
   };
-  const location = new URL(`https://console.example.test/billing${input.search}`);
+  const location = new URL(`https://console.example.test/billing${input.search ?? ""}`);
   const replaced: string[] = [];
+  const assigned: string[] = [];
+  const body = new TestNode("body");
   Object.assign(globalThis, {
     Node: TestNode,
     HTMLInputElement: TestNode,
     localStorage: storage,
     document: {
-      body: new TestNode("body"),
+      body,
       documentElement: new TestNode("html"),
       createElement: (tag: string) => new TestNode(tag),
       createElementNS: (_ns: string, tag: string) => new TestNode(tag),
@@ -658,13 +828,12 @@ async function billingPageFor(input: {
       removeEventListener: () => undefined,
     },
     window: {
-      location: Object.assign(location, { assign: () => undefined }),
+      location: Object.assign(location, { assign: (url: string) => assigned.push(url) }),
       localStorage: storage,
       history: {
         replaceState: (_state: unknown, _title: string, url: string) => {
           replaced.push(url);
-          const next = new URL(url, location);
-          location.search = next.search;
+          location.search = new URL(url, location).search;
         },
       },
       addEventListener: () => undefined,
@@ -680,72 +849,227 @@ async function billingPageFor(input: {
       },
     },
   });
-  const calls: string[] = [];
+  const sent: SentRequest[] = [];
+  const base = `/v1/organizations/${organizationId}`;
   globalThis.fetch = Object.assign(
     async (target: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(target));
       const method = init?.method ?? "GET";
-      calls.push(`${method} ${url.pathname}`);
-      const base = `/v1/organizations/${organizationId}`;
-      if (url.pathname === `${base}/payments/subscription`)
-        return input.hosted
-          ? Response.json({ subscription: null, planTable: finalizedHostedPlanTable() })
-          : Response.json({ error: { code: "not_found" } }, { status: 404 });
-      if (url.pathname.startsWith(`${base}/wallet/checkout/`))
+      sent.push({
+        call: `${method} ${url.pathname}`,
+        body: typeof init?.body === "string" ? JSON.parse(init.body) : undefined,
+      });
+      if (url.pathname === `${base}/payments/subscription`) {
+        if (input.subscription === "loading") return new Promise<Response>(() => undefined);
+        if (input.subscription === "failing")
+          return Response.json({ error: { code: "unavailable" } }, { status: 503 });
+        if (input.subscription === "legacy")
+          return Response.json({ error: { code: "not_found" } }, { status: 404 });
+        return Response.json({
+          subscription: null,
+          planTable: finalizedHostedPlanTable(),
+          ...(input.subscription === "hosted"
+            ? {
+                billingCapabilities: {
+                  contractVersion: "hosted-billing-v1",
+                  topUps: true,
+                  subscriptionStart: true,
+                  subscriptionCancellation: true,
+                  subscriptionPlanChange: true,
+                },
+              }
+            : {}),
+        });
+      }
+      if (method === "GET" && url.pathname.startsWith(`${base}/wallet/checkout/`))
         return Response.json({
           reference: decodeURIComponent(url.pathname.split("/").at(-1) ?? ""),
-          state: "paid",
+          state: input.receiptState ?? "paid",
           checkout: null,
         });
+      if (method === "POST" && url.pathname === `${base}/wallet/checkout`)
+        return input.subscription === "hosted"
+          ? Response.json({ checkout: { url: checkoutUrl } }, { status: 201 })
+          : Response.json({ error: { code: "not_found" } }, { status: 404 });
       if (url.pathname === `${base}/wallet/funding`) return Response.json({ wallet: {} });
       return Response.json({ error: { code: "not_found" } }, { status: 404 });
     },
     { preconnect: globalThis.fetch.preconnect },
   );
   const state = await import("../console/src/state.ts");
+  const { consoleLocale } = await import("../console/src/i18n.ts");
   const { billingPage } = await import("../console/src/pages/billing.ts");
+  consoleLocale.set("en");
   state.setApiOrigin("https://api.example.test");
-  state.principal.set({
-    id: ownerPrincipalId,
-    provider: "test",
-    email: "owner@example.test",
-    displayName: "Owner",
-  });
-  state.organizations.set([
-    { id: organizationId, name: "Example", ownerPrincipalId, createdAt: "2026-10-01T00:00:00Z" },
-  ]);
-  state.selectOrganization(organizationId);
-  billingPage(organizationId);
-  for (let i = 0; i < 20; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
-  return { calls, replaced, values };
+  const signIn = () => {
+    state.principal.set({
+      id: ownerPrincipalId,
+      provider: "test",
+      email: "owner@example.test",
+      displayName: "Owner",
+    });
+    state.organizations.set([
+      { id: organizationId, name: "Example", ownerPrincipalId, createdAt: "2026-10-01T00:00:00Z" },
+    ]);
+    state.selectOrganization(organizationId);
+  };
+  if (input.signedIn === false) {
+    state.principal.set(null);
+    state.organizations.set([]);
+  } else signIn();
+  const root = billingPage(organizationId) as unknown as TestNode;
+  await flush();
+  const button = (label: string) =>
+    [...root.all(), ...body.all()]
+      .filter((node) => node.tag === "button" && node.textContent.trim() === label)
+      .at(-1);
+  return {
+    sent,
+    calls: () => sent.map((request) => request.call),
+    replaced,
+    assigned,
+    values,
+    location,
+    body,
+    signIn,
+    async click(label: string) {
+      const target = button(label);
+      expect(target).toBeDefined();
+      target?.click();
+      await flush();
+    },
+  };
+}
+
+const fundingCall = `POST /v1/organizations/${organizationId}/wallet/funding`;
+const checkoutCall = `POST /v1/organizations/${organizationId}/wallet/checkout`;
+
+function seededStorage(amountMinor = 5000) {
+  const storage = new Map<string, string>();
+  const seeded = intentStore({
+    getItem: (key) => storage.get(key) ?? null,
+    setItem: (key, value) => storage.set(key, value),
+    removeItem: (key) => storage.delete(key),
+  }).getOrCreate({ ...scope, amountMinor });
+  return seeded.then(() => ({
+    storage,
+    reference: JSON.parse(storage.get(storageKey) ?? "{}").reference as string,
+  }));
 }
 
 describe("billing page top-up lane", () => {
   test("a legacy Host still exchanges the returned session through funding", async () => {
-    const page = await billingPageFor({ hosted: false, search: "?checkout=cs_test_legacy" });
-    expect(page.calls).toContain(`POST /v1/organizations/${organizationId}/wallet/funding`);
-    expect(page.calls.some((call) => call.includes("/wallet/checkout/"))).toBe(false);
+    const page = await billingPageFor({
+      subscription: "legacy",
+      search: "?checkout=cs_test_legacy",
+    });
+    expect(page.calls()).toContain(fundingCall);
+    expect(page.sent.find((request) => request.call === fundingCall)?.body).toEqual({
+      settlementProof: "cs_test_legacy",
+    });
+    expect(page.calls().some((call) => call.includes("/wallet/checkout/"))).toBe(false);
     expect(page.replaced).toEqual(["/billing"]);
   });
 
-  test("a hosted Host reads the stored reference's receipt and never calls funding", async () => {
-    const storage = new Map<string, string>();
-    await intentStore({
-      getItem: (key) => storage.get(key) ?? null,
-      setItem: (key, value) => storage.set(key, value),
-      removeItem: (key) => storage.delete(key),
-    }).getOrCreate({ ...scope, amountMinor: 5000 });
-    const reference = JSON.parse(storage.get(storageKey) ?? "{}").reference as string;
+  test("a self-host with a subscription route but no hosted capabilities stays legacy", async () => {
     const page = await billingPageFor({
-      hosted: true,
+      subscription: "self-host-subscriptions",
+      search: "?checkout=cs_test_selfhost",
+    });
+    expect(page.calls().filter((call) => call === fundingCall)).toHaveLength(1);
+    expect(page.calls().some((call) => call.includes("/wallet/checkout/"))).toBe(false);
+
+    await page.click("Add funds");
+    await page.click("Continue to payment");
+    expect(page.sent.find((request) => request.call === checkoutCall)?.body).toEqual({
+      amountMinor: 5000,
+    });
+    // not_found from the legacy checkout falls back to the operator's proof.
+    expect(page.body.textContent).toContain("Settlement proof");
+    expect(page.values.has(storageKey)).toBe(false);
+  });
+
+  test("legacy Add funds sends only the amount and falls back to operator funding", async () => {
+    const page = await billingPageFor({ subscription: "legacy" });
+    await page.click("Add funds");
+    await page.click("Continue to payment");
+    expect(page.sent.filter((request) => request.call === checkoutCall)).toEqual([
+      { call: checkoutCall, body: { amountMinor: 5000 } },
+    ]);
+    expect(page.body.textContent).toContain("Settlement proof");
+    expect(page.body.textContent).toContain("Credit wallet");
+    expect(page.values.has(storageKey)).toBe(false);
+  });
+
+  test("hosted Add funds sends a durable reference with the amount", async () => {
+    const page = await billingPageFor({ subscription: "hosted" });
+    await page.click("Add funds");
+    await page.click("Continue to payment");
+    const reference = JSON.parse(page.values.get(storageKey) ?? "{}").reference as string;
+    expect(reference).toMatch(/^console-top-up-/u);
+    expect(page.sent.filter((request) => request.call === checkoutCall)).toEqual([
+      { call: checkoutCall, body: { reference, amountMinor: 5000 } },
+    ]);
+    expect(page.assigned).toEqual([checkoutUrl]);
+    expect(page.calls()).not.toContain(fundingCall);
+  });
+
+  test("Add funds sends nothing while the lane is unknown", async () => {
+    for (const subscription of ["loading", "failing"] as const) {
+      const page = await billingPageFor({ subscription });
+      await page.click("Add funds");
+      expect(page.calls().filter((call) => call.includes("/wallet/"))).not.toContain(checkoutCall);
+      expect(page.body.textContent).not.toContain("Continue to payment");
+    }
+  });
+
+  test("a hosted Host reads the stored reference's receipt and never calls funding", async () => {
+    const { storage, reference } = await seededStorage();
+    const page = await billingPageFor({
+      subscription: "hosted",
       search: "?checkout=cs_test_hosted",
       storage,
     });
-    expect(page.calls).toContain(
+    expect(page.calls()).toContain(
       `GET /v1/organizations/${organizationId}/wallet/checkout/${reference}`,
     );
-    expect(page.calls.some((call) => call.endsWith("/wallet/funding"))).toBe(false);
+    expect(page.calls()).not.toContain(fundingCall);
     expect(storage.has(storageKey)).toBe(false);
     expect(page.replaced).toEqual(["/billing"]);
+  });
+
+  test("while the lane is unknown a return calls neither funding nor a receipt", async () => {
+    for (const subscription of ["loading", "failing"] as const) {
+      const { storage } = await seededStorage();
+      const page = await billingPageFor({ subscription, search: "?checkout=cs_test_x", storage });
+      expect(page.calls()).not.toContain(fundingCall);
+      expect(page.calls().some((call) => call.includes("/wallet/checkout/"))).toBe(false);
+      expect(page.replaced).toEqual([]);
+      expect(page.location.search).toBe("?checkout=cs_test_x");
+      expect(storage.has(storageKey)).toBe(true);
+    }
+  });
+
+  test("a hosted return before the owner scope loads is answered exactly once when it does", async () => {
+    const { storage, reference } = await seededStorage();
+    const page = await billingPageFor({
+      subscription: "hosted",
+      search: "?checkout=cs_test_hosted",
+      storage,
+      signedIn: false,
+      receiptState: "pending",
+    });
+    const receiptCall = `GET /v1/organizations/${organizationId}/wallet/checkout/${reference}`;
+    expect(page.calls()).not.toContain(receiptCall);
+    expect(page.location.search).toBe("?checkout=cs_test_hosted");
+
+    page.signIn();
+    await flush();
+    // Signal churn after the return was answered does not ask again.
+    page.signIn();
+    await flush();
+    expect(page.calls().filter((call) => call === receiptCall)).toHaveLength(1);
+    expect(page.calls()).not.toContain(fundingCall);
+    expect(storage.has(storageKey)).toBe(true);
   });
 });

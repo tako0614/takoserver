@@ -125,9 +125,19 @@ export interface HostedSubscriptionProjection {
   readonly updatedAt: string;
 }
 
+/** What a Host with hosted billing composed declares; absent on every other Host. */
+export interface HostedBillingCapabilities {
+  readonly contractVersion: string;
+  readonly topUps: boolean;
+  readonly subscriptionStart: boolean;
+  readonly subscriptionCancellation: boolean;
+  readonly subscriptionPlanChange: boolean;
+}
+
 export interface OrganizationSubscription {
   readonly subscription: HostedSubscriptionProjection | null;
   readonly planTable: HostedPlanTable;
+  readonly billingCapabilities?: HostedBillingCapabilities;
 }
 
 export type SubscriptionCheckoutStart =
@@ -600,7 +610,11 @@ export function createApi(options: ApiOptions) {
         throw new ApiError("invalid_response", status, path);
       const planTable = decodeHostedPlanTable(payload.planTable);
       if (!planTable) throw new ApiError("invalid_response", status, path);
-      return { subscription: payload.subscription, planTable };
+      if (payload.billingCapabilities === undefined)
+        return { subscription: payload.subscription, planTable };
+      const billingCapabilities = decodeBillingCapabilities(payload.billingCapabilities);
+      if (!billingCapabilities) throw new ApiError("invalid_response", status, path);
+      return { subscription: payload.subscription, planTable, billingCapabilities };
     },
 
     /** Replays one durable caller reference against one Host-configured plan key. */
@@ -965,6 +979,26 @@ function decodeHostedPlanTable(value: unknown): HostedPlanTable | null {
     return null;
   if (new Set(value.plans.map((plan) => plan.planId)).size !== value.plans.length) return null;
   return value as unknown as HostedPlanTable;
+}
+
+function decodeBillingCapabilities(value: unknown): HostedBillingCapabilities | null {
+  if (
+    !isRecord(value) ||
+    typeof value.contractVersion !== "string" ||
+    value.contractVersion.length === 0 ||
+    typeof value.topUps !== "boolean" ||
+    typeof value.subscriptionStart !== "boolean" ||
+    typeof value.subscriptionCancellation !== "boolean" ||
+    typeof value.subscriptionPlanChange !== "boolean"
+  )
+    return null;
+  return {
+    contractVersion: value.contractVersion,
+    topUps: value.topUps,
+    subscriptionStart: value.subscriptionStart,
+    subscriptionCancellation: value.subscriptionCancellation,
+    subscriptionPlanChange: value.subscriptionPlanChange,
+  };
 }
 
 function isHostedSubscriptionProjection(

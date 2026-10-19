@@ -24,7 +24,11 @@ import {
   createSubscriptionIntentStore,
 } from "../subscription-intent.ts";
 import { subscriptionPlanOptions } from "../subscription-plan-options.ts";
-import { createTopUpCheckoutController, type TopUpCheckoutState } from "../top-up-checkout.ts";
+import {
+  createTopUpCheckoutController,
+  type TopUpCheckoutState,
+  topUpLane,
+} from "../top-up-checkout.ts";
 import { browserTopUpIntentLock, createTopUpIntentStore } from "../top-up-intent.ts";
 import {
   badge,
@@ -89,17 +93,9 @@ export function billingPage(organizationId: string): Child {
   };
   /**
    * Which top-up lane this deployment runs, read from the same answer that
-   * draws the subscription card: a Host that serves the hosted plan table
-   * requires a durable reference, and one that has no subscription route is a
-   * legacy self-host wallet. Until that answer arrives, neither is assumed.
+   * draws the subscription card. Until that answer arrives, neither is assumed.
    */
-  const billingMode = (): "hosted" | "legacy" | null => {
-    const loaded = hostedSubscription.get();
-    if (loaded.state === "ready") return "hosted";
-    if (loaded.state === "error" && (loaded.error as { code?: string }).code === "not_found")
-      return "legacy";
-    return null;
-  };
+  const billingMode = () => topUpLane(hostedSubscription.get());
   const checkout = createSubscriptionCheckoutController({
     organizationId,
     getScope: ownerScope,
@@ -181,16 +177,43 @@ export function billingPage(organizationId: string): Child {
   // answered as soon as the lane is known, so the balance a person sees
   // includes what they just paid. A hosted return only reads the receipt of
   // its stored reference; only a legacy return exchanges the session itself.
-  let returnRouted = false;
+  // Routing stays armed until the lane is known and the return was consumed
+  // or deliberately kept — a scope that loads later still gets its answer.
+  let returnSettled = false;
+  let routing = false;
+  let rerouteRequested = false;
+  const routeReturn = async (): Promise<void> => {
+    if (returnSettled) return;
+    if (routing) {
+      rerouteRequested = true;
+      return;
+    }
+    routing = true;
+    try {
+      do {
+        rerouteRequested = false;
+        const mode = billingMode();
+        if (mode === "legacy") {
+          settleReturn(organizationId, reloadWallet);
+          returnSettled = true;
+        } else if (mode === "hosted") {
+          const checkoutHandled = await topUp.handleReturn();
+          const consentHandled = await topUp.handleConsentReturn();
+          returnSettled = checkoutHandled && consentHandled;
+        }
+      } while (!returnSettled && rerouteRequested);
+    } finally {
+      routing = false;
+    }
+    if (returnSettled) stopReturnRouting();
+  };
   const stopReturnRouting = effect(() => {
-    const mode = billingMode();
-    if (returnRouted || mode === null) return;
-    returnRouted = true;
-    queueMicrotask(() => {
-      stopReturnRouting();
-      if (mode === "legacy") settleReturn(organizationId, reloadWallet);
-      else void topUp.handleReturn().then(() => topUp.handleConsentReturn());
-    });
+    // Read what can make an unanswered return answerable: the lane, the owner
+    // scope, and the controller finishing a request it was busy with.
+    billingMode();
+    ownerScope();
+    topUp.state();
+    queueMicrotask(() => void routeReturn());
   });
   const openAddFunds = (): void => {
     const mode = billingMode();
@@ -615,8 +638,8 @@ function topUpMessage(state: TopUpCheckoutState): HTMLElement | null {
       "status",
     ],
     expired: [
-      "前回の支払いは期限切れになりました。請求はありません。",
-      "The earlier payment expired. Nothing was charged.",
+      "前回の支払いは期限切れになりました。請求はありません。新しく支払いを始められます。",
+      "The earlier payment expired. Nothing was charged. You can start a new payment.",
       "status",
     ],
     cancelled: [

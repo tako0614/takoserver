@@ -1,5 +1,5 @@
-import type { TopUpCheckoutStart, TopUpReceipt } from "./api.ts";
-import { signal } from "./reactive.ts";
+import type { OrganizationSubscription, TopUpCheckoutStart, TopUpReceipt } from "./api.ts";
+import { type Async, signal } from "./reactive.ts";
 import type {
   ConclusiveTopUpReceipt,
   TopUpIntentIdentity,
@@ -161,11 +161,16 @@ export function createTopUpCheckoutController(options: TopUpCheckoutControllerOp
   }
 
   /**
-   * A new reference refused with `invalid_argument` (the server checks current
-   * bounds before it stores anything) is concluded only when its receipt is
-   * then not found. Any other answer keeps the intent.
+   * A sent reference refused before creation — `invalid_argument` (the server
+   * checks current bounds before it stores anything) or `not_found` (this
+   * deployment takes no card) — is concluded only when its receipt is then not
+   * found. Any other answer keeps the intent.
    */
-  async function settleRefused(scope: TopUpIntentScope, reference: string): Promise<boolean> {
+  async function settleRefused(
+    scope: TopUpIntentScope,
+    reference: string,
+    outcome: "rejected" | "unavailable",
+  ): Promise<boolean> {
     try {
       await options.api.topUpReceipt(scope.organizationId, reference);
       return false;
@@ -181,7 +186,7 @@ export function createTopUpCheckoutController(options: TopUpCheckoutControllerOp
     } catch {
       return false;
     }
-    if (ownsScope(scope)) current.set({ status: "rejected" });
+    if (ownsScope(scope)) current.set({ status: outcome });
     return true;
   }
 
@@ -246,10 +251,11 @@ export function createTopUpCheckoutController(options: TopUpCheckoutControllerOp
       sent = reference;
       await begin(scope, reference, amountMinor);
     } catch (error) {
+      const code = errorCode(error);
       if (
         sent !== null &&
-        errorCode(error) === "invalid_argument" &&
-        (await settleRefused(scope, sent))
+        (code === "invalid_argument" || code === "not_found") &&
+        (await settleRefused(scope, sent, code === "not_found" ? "unavailable" : "rejected"))
       )
         return;
       failed(scope, error, requestStarted);
@@ -258,44 +264,53 @@ export function createTopUpCheckoutController(options: TopUpCheckoutControllerOp
     }
   }
 
-  async function handleReturn(): Promise<void> {
+  /**
+   * Answers a Checkout return. Resolves true once the return is consumed or
+   * deliberately kept, and false when it could not be looked at yet (no owner
+   * scope loaded, or another request in flight), so the page may ask again.
+   */
+  async function handleReturn(): Promise<boolean> {
     const returned = new URLSearchParams(options.browser.readLocation().search).get("checkout");
-    if (returned === null) return;
+    if (returned === null) return true;
     const scope = identity();
-    if (!scope) return;
+    if (!scope) return false;
     if (returned === "cancelled") {
       // The stored intent stays: the next start with the same amount resumes
       // the same reference rather than creating a second payment.
       removeQueryKey("checkout");
       current.set({ status: "cancelled" });
-      return;
+      return true;
     }
-    if (inFlight || !isStripeSessionId(returned)) return;
+    if (!isStripeSessionId(returned)) return true;
+    if (inFlight) return false;
     let stored: TopUpIntentRecord | null;
     try {
       stored = options.intents.peek(scope);
     } catch {
       current.set({ status: "error" });
-      return;
+      return true;
     }
     if (!stored) {
       current.set({ status: "missing_intent" });
-      return;
+      return true;
     }
     inFlight = true;
     current.set({ status: "busy" });
     try {
       const receipt = await options.api.topUpReceipt(scope.organizationId, stored.reference);
-      if (!ownsScope(scope)) return;
+      if (!ownsScope(scope)) return false;
       if (await apply(scope, stored, receipt)) {
         const concluded = current().status;
         if (concluded === "paid" || concluded === "expired") removeQueryKey("checkout");
-        return;
+        return true;
       }
       const url = receipt.state === "ready" ? safeCheckoutUrl(receipt.checkout?.url ?? "") : null;
       current.set(url ? { status: "ready", url } : { status: "pending" });
+      return true;
     } catch {
-      if (ownsScope(scope)) current.set({ status: "uncertain" });
+      if (!ownsScope(scope)) return false;
+      current.set({ status: "uncertain" });
+      return true;
     } finally {
       inFlight = false;
     }
@@ -306,24 +321,26 @@ export function createTopUpCheckoutController(options: TopUpCheckoutControllerOp
    * It carries no data and no destination; the payment it consented to is the
    * stored intent, resumed with exactly its reference and amount.
    */
-  async function handleConsentReturn(): Promise<void> {
+  async function handleConsentReturn(): Promise<boolean> {
     const returned = new URLSearchParams(options.browser.readLocation().search).get("consent");
-    if (returned !== "returned") return;
-    removeQueryKey("consent");
+    if (returned !== "returned") return true;
+    // Kept until an owner scope can look at it, like a Checkout return.
     const scope = identity();
-    if (!scope || inFlight) return;
+    if (!scope || inFlight) return false;
+    removeQueryKey("consent");
     let stored: TopUpIntentRecord | null;
     try {
       stored = options.intents.peek(scope);
     } catch {
       current.set({ status: "error" });
-      return;
+      return true;
     }
-    if (!stored) return;
+    if (!stored) return true;
     // Same path as an explicit resume: the receipt is read first, so a payment
     // that settled meanwhile is not reopened, then the stored reference and
     // amount are begun again.
     await start(stored.amountMinor);
+    return true;
   }
 
   return {
@@ -342,6 +359,23 @@ export function createTopUpCheckoutController(options: TopUpCheckoutControllerOp
       options.browser.assign(url);
     },
   };
+}
+
+/**
+ * Which top-up lane a Host runs, from its subscription read. Only a Host that
+ * declares the hosted billing contract with top-ups takes a durable reference;
+ * any other answer, including a subscription route without that declaration,
+ * is a legacy wallet. While the read is loading or failed otherwise, neither.
+ */
+export function topUpLane(loaded: Async<OrganizationSubscription>): "hosted" | "legacy" | null {
+  if (loaded.state === "ready") {
+    const capabilities = loaded.value.billingCapabilities;
+    return capabilities?.contractVersion === "hosted-billing-v1" && capabilities.topUps
+      ? "hosted"
+      : "legacy";
+  }
+  if (loaded.state === "error" && errorCode(loaded.error) === "not_found") return "legacy";
+  return null;
 }
 
 function isAmountMinor(value: unknown): value is number {
