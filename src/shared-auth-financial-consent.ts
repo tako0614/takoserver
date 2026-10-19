@@ -32,12 +32,16 @@ import {
 import {
   captureSharedAuthFinancialRequestClockObservation,
   captureSharedAuthFinancialRequestClockObservationFromR1,
+  loadSharedAuthFinancialRequestIdentityProofFromObservation,
   proveSharedAuthFinancialRequestIdentityFromObservation,
   readSharedAuthFinancialRequestNativeObservationData,
+  verifyCurrentSharedAuthFinancialRequestIdentityProofFromObservation,
 } from "./shared-auth-financial-source.ts";
 import {
   createFinancialActionConsentR1Reader,
+  type FinancialActionConsentR1IdentityEvidenceData,
   type FinancialActionConsentR1Original,
+  readFinancialActionConsentR1IdentityEvidenceData,
 } from "./shared-financial-retained-r1.ts";
 import { financialSourceRef } from "./shared-financial-source-contract.ts";
 import {
@@ -263,6 +267,10 @@ const preparedSubmissionOrigins = new WeakMap<object, HeldPreparedSubmission>();
 const preparedProofAttempts = new WeakMap<
   object,
   Promise<SharedAuthFinancialPreparedIdentityProofData>
+>();
+const preparedEvidenceAttempts = new WeakMap<
+  object,
+  Promise<FinancialActionConsentR1IdentityEvidenceData>
 >();
 
 function detachedPendingValues(
@@ -1191,6 +1199,61 @@ export function createSharedAuthFinancialConsentRequestHandler(connection: Worke
     }
   }
 
+  function heldPrepared(
+    request: Request,
+    workspaceId: string,
+    challengeRef: string,
+    prepared: SharedAuthFinancialPreparedSubmissionData,
+  ): HeldPreparedSubmission | null {
+    const held = preparedSubmissionOrigins.get(prepared);
+    return held &&
+      held.handler === handler &&
+      held.connection === connection &&
+      held.request === request &&
+      held.workspaceId === workspaceId &&
+      held.challengeRef === challengeRef
+      ? held
+      : null;
+  }
+
+  /** Same prepared POST origin, native observation, pending row and retained R1. */
+  function preparedCurrentness(held: HeldPreparedSubmission) {
+    const { request, workspaceId, challengeRef } = held;
+    const assertHeld = () => {
+      held.assertOrigin();
+      held.assertRequestOrigin();
+      if (method(held.reader, "readRetainedActionConsentR1") !== held.readR1) unavailable();
+      const now = readSharedAuthFinancialRequestNativeObservationData(
+        connection,
+        request,
+        workspaceId,
+        held.observation,
+      );
+      if (!sameNativeObservation(now, held.native)) unavailable();
+    };
+    const assertCurrent = async () => {
+      assertHeld();
+      const currentPending = await readSharedAuthFinancialConsentPreparedPendingForPost(
+        connection,
+        request,
+        workspaceId,
+        held.observation,
+        held.pendingValues.get("transaction_ref") as string,
+      );
+      assertHeld();
+      if (!sameDetachedPending(held.pendingValues, currentPending)) unavailable();
+      const currentR1 = await Reflect.apply(held.readR1, held.reader, [challengeRef]);
+      assertHeld();
+      if (
+        currentR1.fullCommandJson !== held.retained.fullCommandJson ||
+        currentR1.r1ReceiptRef !== held.retained.r1ReceiptRef ||
+        currentR1.c0ReceiptRef !== held.retained.c0ReceiptRef
+      )
+        unavailable();
+    };
+    return { assertHeld, assertCurrent };
+  }
+
   /** A separate, one-attempt identity-proof effect for the same prepared POST
    * original. The query-only preflight above never invokes this operation.
    * Even a successful reference is DATA, not consent or Financial NEW/CAS. */
@@ -1200,53 +1263,15 @@ export function createSharedAuthFinancialConsentRequestHandler(connection: Worke
     challengeRef: string,
     prepared: SharedAuthFinancialPreparedSubmissionData,
   ): Promise<SharedAuthFinancialPreparedIdentityProofData> {
-    const held = preparedSubmissionOrigins.get(prepared);
-    if (
-      !held ||
-      held.handler !== handler ||
-      held.connection !== connection ||
-      held.request !== request ||
-      held.workspaceId !== workspaceId ||
-      held.challengeRef !== challengeRef
-    )
+    const held = heldPrepared(request, workspaceId, challengeRef, prepared);
+    if (!held)
       return Promise.reject(new SharedAuthFinancialConsentOriginalReadError("unavailable"));
     const prior = preparedProofAttempts.get(prepared);
     if (prior) return prior;
     // Publish the attempt before the first await. Unknown proof or post-effect
     // currentness failure remains sticky for this exact prepared original.
     const attempt = Promise.resolve().then(async () => {
-      const assertHeld = () => {
-        held.assertOrigin();
-        held.assertRequestOrigin();
-        if (method(held.reader, "readRetainedActionConsentR1") !== held.readR1) unavailable();
-        const now = readSharedAuthFinancialRequestNativeObservationData(
-          connection,
-          request,
-          workspaceId,
-          held.observation,
-        );
-        if (!sameNativeObservation(now, held.native)) unavailable();
-      };
-      const assertCurrent = async () => {
-        assertHeld();
-        const currentPending = await readSharedAuthFinancialConsentPreparedPendingForPost(
-          connection,
-          request,
-          workspaceId,
-          held.observation,
-          held.pendingValues.get("transaction_ref") as string,
-        );
-        assertHeld();
-        if (!sameDetachedPending(held.pendingValues, currentPending)) unavailable();
-        const currentR1 = await Reflect.apply(held.readR1, held.reader, [challengeRef]);
-        assertHeld();
-        if (
-          currentR1.fullCommandJson !== held.retained.fullCommandJson ||
-          currentR1.r1ReceiptRef !== held.retained.r1ReceiptRef ||
-          currentR1.c0ReceiptRef !== held.retained.c0ReceiptRef
-        )
-          unavailable();
-      };
+      const { assertHeld, assertCurrent } = preparedCurrentness(held);
       try {
         await assertCurrent();
         assertHeld();
@@ -1267,6 +1292,66 @@ export function createSharedAuthFinancialConsentRequestHandler(connection: Worke
       }
     });
     preparedProofAttempts.set(prepared, attempt);
+    return attempt;
+  }
+
+  /** One Accounts load→current of this prepared original's own proof, joined by
+   * Financial to the same retained R1 and Root RP original. The result is
+   * identity-evidence DATA only: no consent, acceptedAt, NEW/CAS or resend. */
+  function readPreparedFinancialR1IdentityEvidence(
+    request: Request,
+    workspaceId: string,
+    challengeRef: string,
+    prepared: SharedAuthFinancialPreparedSubmissionData,
+  ): Promise<FinancialActionConsentR1IdentityEvidenceData> {
+    const held = heldPrepared(request, workspaceId, challengeRef, prepared);
+    const proved = preparedProofAttempts.get(prepared);
+    // Never proves on its own: only the prepared original's existing attempt.
+    if (!held || !proved)
+      return Promise.reject(new SharedAuthFinancialConsentOriginalReadError("unavailable"));
+    const prior = preparedEvidenceAttempts.get(prepared);
+    if (prior) return prior;
+    const attempt = Promise.resolve().then(async () => {
+      const { assertHeld, assertCurrent } = preparedCurrentness(held);
+      try {
+        const { proofRef } = await proved;
+        if (preparedProofAttempts.get(prepared) !== proved) unavailable();
+        await assertCurrent();
+        assertHeld();
+        const loaded = await loadSharedAuthFinancialRequestIdentityProofFromObservation(
+          connection,
+          request,
+          workspaceId,
+          challengeRef,
+          held.observation,
+        );
+        assertHeld();
+        const current = await verifyCurrentSharedAuthFinancialRequestIdentityProofFromObservation(
+          connection,
+          request,
+          workspaceId,
+          challengeRef,
+          held.observation,
+        );
+        assertHeld();
+        const evidence = readFinancialActionConsentR1IdentityEvidenceData(
+          connection,
+          request,
+          workspaceId,
+          held.reader,
+          held.retained,
+          Object.freeze({ v: 1, proofRef, challengeRef }),
+          loaded,
+          current,
+        );
+        await assertCurrent();
+        assertHeld();
+        return evidence;
+      } catch {
+        return unavailable();
+      }
+    });
+    preparedEvidenceAttempts.set(prepared, attempt);
     return attempt;
   }
 
@@ -1527,6 +1612,7 @@ export function createSharedAuthFinancialConsentRequestHandler(connection: Worke
     prepareFinancialR1ConsentView,
     readPreparedFinancialR1SubmissionData,
     provePreparedFinancialR1Identity,
+    readPreparedFinancialR1IdentityEvidence,
     readUnexpiredLocalData,
     verifyCurrentActionConsent,
   });

@@ -12,10 +12,12 @@ import {
   readFinancialActionConsentR1RequestCaptures,
 } from "./shared-financial-retained-r1.ts";
 import {
+  loadWorkerRequestRetainedRpFinancialIdentityProofOriginal,
   proveWorkerRequestRetainedRpFinancialIdentityOriginal,
   readWorkerRequestConsumers,
   readWorkerRequestFinancialInputs,
   readWorkerRequestRetainedRpCapture,
+  verifyCurrentWorkerRequestRetainedRpFinancialIdentityProofOriginal,
   type WorkerRequestRetainedRpCapture,
   type WorkerRequestSql,
 } from "./worker-request-composition.ts";
@@ -360,7 +362,62 @@ export function readSharedAuthFinancialRequestNativeObservationData(
 
 /** One proof attempt from the exact held Root capture. The result remains
  * Accounts reference DATA, not an affirmative consent or financial grant. */
-export async function proveSharedAuthFinancialRequestIdentityFromObservation(
+export function proveSharedAuthFinancialRequestIdentityFromObservation(
+  connection: WorkerRequestSql,
+  request: Request,
+  workspaceId: string,
+  challengeRef: string,
+  observation: unknown,
+): Promise<unknown> {
+  return retainedProofOperation(
+    proveWorkerRequestRetainedRpFinancialIdentityOriginal,
+    connection,
+    request,
+    workspaceId,
+    challengeRef,
+    observation,
+  );
+}
+
+/** One Accounts load of the proof the same held capture produced; Root keeps the
+ * prove→load sequence and never resends. The result is found/absent DATA only. */
+export function loadSharedAuthFinancialRequestIdentityProofFromObservation(
+  connection: WorkerRequestSql,
+  request: Request,
+  workspaceId: string,
+  challengeRef: string,
+  observation: unknown,
+): Promise<unknown> {
+  return retainedProofOperation(
+    loadWorkerRequestRetainedRpFinancialIdentityProofOriginal,
+    connection,
+    request,
+    workspaceId,
+    challengeRef,
+    observation,
+  );
+}
+
+/** One Accounts current check after the same capture's load; DATA, not consent. */
+export function verifyCurrentSharedAuthFinancialRequestIdentityProofFromObservation(
+  connection: WorkerRequestSql,
+  request: Request,
+  workspaceId: string,
+  challengeRef: string,
+  observation: unknown,
+): Promise<unknown> {
+  return retainedProofOperation(
+    verifyCurrentWorkerRequestRetainedRpFinancialIdentityProofOriginal,
+    connection,
+    request,
+    workspaceId,
+    challengeRef,
+    observation,
+  );
+}
+
+async function retainedProofOperation(
+  operation: typeof proveWorkerRequestRetainedRpFinancialIdentityOriginal,
   connection: WorkerRequestSql,
   request: Request,
   workspaceId: string,
@@ -384,13 +441,7 @@ export async function proveSharedAuthFinancialRequestIdentityFromObservation(
     // the same request/connection. The brand is never accepted from a caller.
     const capture = held.captures.credential as WorkerRequestRetainedRpCapture;
     try {
-      return await proveWorkerRequestRetainedRpFinancialIdentityOriginal(
-        connection,
-        request,
-        workspaceId,
-        challengeRef,
-        capture,
-      );
+      return await operation(connection, request, workspaceId, challengeRef, capture);
     } finally {
       assertCaptures(held);
     }

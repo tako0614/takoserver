@@ -169,6 +169,12 @@ if (child) {
     proveSharedAuthFinancialRequestIdentityFromObservation() {
       throw Error("current consent verification must not dispatch proof");
     },
+    loadSharedAuthFinancialRequestIdentityProofFromObservation() {
+      throw Error("current consent verification must not load proof");
+    },
+    verifyCurrentSharedAuthFinancialRequestIdentityProofFromObservation() {
+      throw Error("current consent verification must not verify proof");
+    },
   }));
 
   const { createSharedFinancialActionIdentity } = await import("../src/shared-financial-action.ts");

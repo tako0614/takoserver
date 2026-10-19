@@ -53,6 +53,14 @@ if (isolated) {
       proofCalls++;
       throw Error("Clock-only interop must not dispatch proof");
     },
+    loadWorkerRequestRetainedRpFinancialIdentityProofOriginal() {
+      proofCalls++;
+      throw Error("Clock-only interop must not load proof");
+    },
+    verifyCurrentWorkerRequestRetainedRpFinancialIdentityProofOriginal() {
+      proofCalls++;
+      throw Error("Clock-only interop must not verify proof");
+    },
   }));
   mock.module("../src/financial-auth-consumer.ts", () => ({
     readWorkerRequestFinancialAuthConsumerPort(value: unknown) {

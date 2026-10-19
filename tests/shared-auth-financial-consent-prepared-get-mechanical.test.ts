@@ -110,6 +110,12 @@ if (child) {
     proveSharedAuthFinancialRequestIdentityFromObservation() {
       throw Error("prepared GET must not dispatch proof");
     },
+    loadSharedAuthFinancialRequestIdentityProofFromObservation() {
+      throw Error("prepared GET must not load proof");
+    },
+    verifyCurrentSharedAuthFinancialRequestIdentityProofFromObservation() {
+      throw Error("prepared GET must not verify proof");
+    },
   }));
   mock.module("../src/shared-auth-financial-consent-issuer.ts", () => ({
     createSharedAuthFinancialConsentIssuerSource(connection: unknown) {
@@ -150,6 +156,9 @@ if (child) {
     },
     readFinancialActionConsentR1RequestCaptures() {
       throw new Error("prepared GET must not capture Financial R1 request originals");
+    },
+    readFinancialActionConsentR1IdentityEvidenceData() {
+      throw new Error("prepared GET must not join Financial identity evidence");
     },
   }));
 
