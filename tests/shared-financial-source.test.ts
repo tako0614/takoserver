@@ -26,6 +26,11 @@ import {
 } from "../src/shared-financial-source-contract.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
+import {
+  financial0104Writer,
+  installFinancial0104Fences,
+  MONEY_FREEZE_ROW,
+} from "./helpers/financial-0104-fenced.ts";
 
 const AT = "2026-01-01T00:00:00.000Z";
 const GENESIS = `sha256:${"a".repeat(64)}` as const;
@@ -467,33 +472,73 @@ describe("unmounted shared Financial source primary store", () => {
     f.db.close();
   });
 
-  test("retirement and writer rotation between evidence await and batch are fenced atomically", async () => {
-    for (const mutation of ["retire", "writer", "freeze"] as const) {
+  test("retirement between evidence await and batch is refused atomically", async () => {
+    const f = await fixture();
+    f.beforeBatch(async () => {
+      await f.base.run(
+        "UPDATE financial_source_registrations SET retirement_ref='retired:fixture',retired_at=?",
+        [new Date().toISOString()],
+      );
+    });
+    await expect(f.receiver.applySourceEvent(f.own(first()))).rejects.toMatchObject({
+      code: "source_conflict",
+    });
+    expect(await f.snapshot()).toMatchObject({
+      events: [],
+      receipts: [],
+      heads: [{ sequence: 0, state: "active" }],
+    });
+    f.db.close();
+  });
+
+  test("writer rotation and freeze between evidence await and batch are fenced atomically by 0104", async () => {
+    for (const mutation of ["writer", "freeze", "unpermitted"] as const) {
       const f = await fixture();
-      f.beforeBatch(async () => {
-        if (mutation === "retire")
-          await f.base.run(
-            "UPDATE financial_source_registrations SET retirement_ref='retired:fixture',retired_at=?",
-            [new Date().toISOString()],
-          );
-        else if (mutation === "writer")
-          await f.base.run("UPDATE money_cutover_authorized_epoch SET writer_epoch=?", [
-            `sha256:${"d".repeat(64)}`,
-          ]);
-        else
-          await f.base.run(
-            "INSERT INTO money_cutover_freeze VALUES(1,'binding','origin','backup','writer','source')",
-          );
-      });
-      await expect(f.receiver.applySourceEvent(f.own(first()))).rejects.toMatchObject({
-        code: "source_conflict",
-      });
-      expect(await f.snapshot()).toMatchObject({
-        events: [],
-        receipts: [],
-        heads: [{ sequence: 0, state: "active" }],
-      });
-      f.db.close();
+      try {
+        // Freeze/permit/epoch are the Financial 0104 receiver fences inside the
+        // actual permit-framed Money writer; the predicate names no money table.
+        installFinancial0104Fences(f.db, { receiver: true });
+        const { money, realm } = await financial0104Writer(f.sql, WRITER, f.client, {
+          accountId: "acct_sourcefixture",
+          billingAuthority: "source-fixture",
+          priceId: "price_sourcefixture",
+        });
+        const fenced = createSharedFinancialSourceReceiver({ ...f.options, sql: money, realm });
+        if (mutation !== "unpermitted")
+          f.beforeBatch(async () => {
+            if (mutation === "writer")
+              await f.base.run("UPDATE money_cutover_authorized_epoch SET writer_epoch=?", [
+                `sha256:${"d".repeat(64)}`,
+              ]);
+            else await f.base.run(MONEY_FREEZE_ROW);
+          });
+        const receiver = mutation === "unpermitted" ? f.receiver : fenced;
+        await expect(receiver.applySourceEvent(f.own(first()))).rejects.toMatchObject({
+          code: "source_conflict",
+        });
+        expect(await f.snapshot()).toMatchObject({
+          events: [],
+          receipts: [],
+          heads: [{ sequence: 0, state: "active" }],
+        });
+        expect(await f.base.query("SELECT * FROM money_cutover_writer_permit")).toEqual([]);
+        if (mutation === "writer")
+          await f.base.run("UPDATE money_cutover_authorized_epoch SET writer_epoch=?", [WRITER]);
+        if (mutation === "freeze") await f.base.run("DELETE FROM money_cutover_freeze");
+        // Inside the actual writer with the authorized epoch all three writes commit.
+        const receipt = await fenced.applySourceEvent(f.own(first()));
+        expect(receipt.sequence).toBe(1);
+        expect(await f.snapshot()).toMatchObject({
+          events: [{}],
+          receipts: [{}],
+          heads: [{ sequence: 1, state: "active" }],
+        });
+        for (const statement of f.batches.at(-1)?.slice(1, -1) ?? [])
+          expect(statement.sql).not.toMatch(/\bmoney_cutover_/u);
+        expect(await f.base.query("SELECT * FROM money_cutover_writer_permit")).toEqual([]);
+      } finally {
+        f.db.close();
+      }
     }
   });
 

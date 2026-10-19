@@ -5,6 +5,37 @@
  * shared-financial-retained-r1.ts. No table, column, permit entry or epoch is
  * minted here; the fences only read Root's existing money_cutover_* rows. */
 
+/** Receiver fences. Receiver rows carry no writer epoch column, so these take the
+ * existing R1 registration fence shape: no freeze, and Root's permit joined to the
+ * authorized epoch. Heads advance and registrations retire by UPDATE, so those two
+ * tables are fenced for UPDATE as well; every other receiver mutation is refused
+ * by the existing immutable triggers. */
+export const FINANCIAL_0104_RECEIVER_FENCE_SCHEMA: Readonly<Record<string, string>> = Object.freeze(
+  {
+    financial_source_registrations_money_fence:
+      "CREATE TRIGGER financial_source_registrations_money_fence BEFORE INSERT ON financial_source_registrations\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM money_cutover_writer_permit p\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE p.singleton=1 AND p.epoch='usd-micros-v2') BEGIN\n SELECT RAISE(ABORT,'constraint: Financial receiver registration permit required');\nEND",
+    financial_source_registrations_money_fence_update:
+      "CREATE TRIGGER financial_source_registrations_money_fence_update BEFORE UPDATE ON financial_source_registrations\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM money_cutover_writer_permit p\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE p.singleton=1 AND p.epoch='usd-micros-v2') BEGIN\n SELECT RAISE(ABORT,'constraint: Financial receiver retirement permit required');\nEND",
+    financial_source_events_money_fence:
+      "CREATE TRIGGER financial_source_events_money_fence BEFORE INSERT ON financial_source_events\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM money_cutover_writer_permit p\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE p.singleton=1 AND p.epoch='usd-micros-v2') BEGIN\n SELECT RAISE(ABORT,'constraint: Financial receiver event permit required');\nEND",
+    financial_source_heads_money_fence:
+      "CREATE TRIGGER financial_source_heads_money_fence BEFORE INSERT ON financial_source_heads\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM money_cutover_writer_permit p\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE p.singleton=1 AND p.epoch='usd-micros-v2') BEGIN\n SELECT RAISE(ABORT,'constraint: Financial receiver head permit required');\nEND",
+    financial_source_heads_money_fence_update:
+      "CREATE TRIGGER financial_source_heads_money_fence_update BEFORE UPDATE ON financial_source_heads\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM money_cutover_writer_permit p\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE p.singleton=1 AND p.epoch='usd-micros-v2') BEGIN\n SELECT RAISE(ABORT,'constraint: Financial receiver head advance permit required');\nEND",
+    financial_source_receipts_money_fence:
+      "CREATE TRIGGER financial_source_receipts_money_fence BEFORE INSERT ON financial_source_receipts\nWHEN EXISTS(SELECT 1 FROM money_cutover_freeze)\n OR NOT EXISTS(SELECT 1 FROM money_cutover_writer_permit p\n JOIN money_cutover_authorized_epoch a ON a.singleton=1 AND a.writer_epoch=p.writer_epoch\n WHERE p.singleton=1 AND p.epoch='usd-micros-v2') BEGIN\n SELECT RAISE(ABORT,'constraint: Financial receiver receipt permit required');\nEND",
+  },
+);
+
+/** canonicalDigest of the exact fenced receiver rows (type,name,sql ordered by
+ * type,name), as the enrollment and genesis readiness checks project them. The
+ * only other accepted receiver shape is the exact unfenced candidate. */
+export const FINANCIAL_0104_RECEIVER_FENCED_SCHEMA_DIGEST =
+  "sha256:5ddf9c93ca4e4d37456c6ed3895549927aa1ac7d08c0980a1c49a66d5f405047";
+/** The exact unfenced receiver candidate digest, accepted only with unfenced C0. */
+export const FINANCIAL_RECEIVER_UNFENCED_SCHEMA_DIGEST =
+  "sha256:78273f494a3823217edf12e06f06eb4803860452d02278e097a2662befca387b";
+
 /** C0/M enrollment and G genesis fences. Readiness compares these exact rows. */
 export const FINANCIAL_0104_C0_FENCE_SCHEMA: Readonly<Record<string, string>> = Object.freeze({
   financial_preproof_challenges_money_fence:
@@ -40,6 +71,10 @@ export const FINANCIAL_0104_CONSENT_FENCE_SCHEMA: Readonly<Record<string, string
 /** Every table that carries a Financial 0104 money fence. A Financial builder may
  * compile a batch only when each statement writes one of these tables. */
 export const FINANCIAL_0104_FENCED_TABLES = Object.freeze([
+  "financial_source_registrations",
+  "financial_source_events",
+  "financial_source_heads",
+  "financial_source_receipts",
   "financial_preproof_challenges",
   "financial_preproof_challenge_receipts",
   "financial_source_materializations",

@@ -31,6 +31,11 @@ import {
 } from "../src/shared-financial-source-genesis-admission.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
+import {
+  financial0104Writer,
+  installFinancial0104Fences,
+  MONEY_FREEZE_ROW,
+} from "./helpers/financial-0104-fenced.ts";
 
 const AT = "2026-10-15T00:00:00.000Z";
 const D = `sha256:${"a".repeat(64)}` as const,
@@ -153,7 +158,7 @@ function largeOriginalCommand(): FinancialControlGenesisCommand {
   };
   enrollment.members = Array.from({ length: 64 }, (_, i) => ({
     workspaceId: A,
-    accountId: `account:${i}:\"\\雪:${"x".repeat(600)}`,
+    accountId: `account:${i}:"\\雪:${"x".repeat(600)}`,
     status: "active",
   }));
   if (
@@ -452,30 +457,107 @@ describe("private historical Control G candidate", () => {
     }
   });
 
-  test.each(["realm", "epoch", "freeze"] as const)(
-    "local %s change after GET and before batch rolls back all G rows",
+  test("local realm change after GET and before batch rolls back all G rows", async () => {
+    const f = await fixture();
+    try {
+      f.fault((statements) => {
+        withGuardDisabled(f.db, "stripe_mode_realm_no_update", () =>
+          f.db.exec("UPDATE stripe_mode_realm SET mode='live' WHERE singleton=1"),
+        );
+        return statements;
+      });
+      await expect(genesisStore(f).admitGenesis(genesisCommand())).rejects.toMatchObject({
+        code: "conflict",
+      });
+      assertNoGenesisRows(f.db);
+    } finally {
+      f.close();
+    }
+  });
+
+  test.each(["epoch", "freeze"] as const)(
+    "local %s change after GET and before batch rolls back all G rows through the 0104 fences",
     async (change) => {
       const f = await fixture();
       try {
+        // Freeze/permit/epoch are the Financial 0104 fences inside the actual
+        // permit-framed Money writer; the G predicate names no money table.
+        installFinancial0104Fences(f.db, { receiver: true, c0: true });
+        const { money, realm } = await financial0104Writer(f.sql, W, f.common.client, {
+          accountId: "acct_enrollment",
+          billingAuthority: "enrollment",
+          priceId: "price_enrollment",
+        });
+        const fenced = () =>
+          createFinancialControlGenesisAdmissionStore({
+            ...f.common,
+            sql: money,
+            realm,
+            source: f.source,
+            affectedRef: A,
+            genesisQualificationRef: GQ,
+          });
         f.fault((statements) => {
-          if (change === "realm")
-            withGuardDisabled(f.db, "stripe_mode_realm_no_update", () =>
-              f.db.exec("UPDATE stripe_mode_realm SET mode='live' WHERE singleton=1"),
-            );
           if (change === "epoch")
             f.db.exec(
               `UPDATE money_cutover_authorized_epoch SET writer_epoch='${D}' WHERE singleton=1`,
             );
-          if (change === "freeze")
-            f.db.exec(
-              `INSERT INTO money_cutover_freeze VALUES(1,'${D}','${D}','${D}','${D}','${D}')`,
-            );
+          if (change === "freeze") f.db.exec(MONEY_FREEZE_ROW);
           return statements;
         });
+        await expect(fenced().admitGenesis(genesisCommand())).rejects.toMatchObject({
+          code: "conflict",
+        });
+        assertNoGenesisRows(f.db);
+        expect(count(f.db, "money_cutover_writer_permit").n).toBe(0);
+        f.fault(undefined);
+        if (change === "epoch")
+          f.db.exec(
+            `UPDATE money_cutover_authorized_epoch SET writer_epoch='${W}' WHERE singleton=1`,
+          );
+        else f.db.exec("DELETE FROM money_cutover_freeze");
+        // Outside the permit frame the same G batch is refused by the fences.
         await expect(genesisStore(f).admitGenesis(genesisCommand())).rejects.toMatchObject({
           code: "conflict",
         });
         assertNoGenesisRows(f.db);
+        // A current permit under a foreign epoch is refused: the G row keeps its own.
+        f.db.exec(
+          `UPDATE money_cutover_authorized_epoch SET writer_epoch='${D}' WHERE singleton=1`,
+        );
+        const foreign = await financial0104Writer(f.sql, D, f.common.client, {
+          accountId: "acct_enrollment",
+          billingAuthority: "enrollment",
+          priceId: "price_enrollment",
+        });
+        await expect(
+          createFinancialControlGenesisAdmissionStore({
+            ...f.common,
+            sql: foreign.money,
+            realm: foreign.realm,
+            source: f.source,
+            affectedRef: A,
+            genesisQualificationRef: GQ,
+          }).admitGenesis(genesisCommand()),
+        ).rejects.toMatchObject({ code: "conflict" });
+        assertNoGenesisRows(f.db);
+        f.db.exec(
+          `UPDATE money_cutover_authorized_epoch SET writer_epoch='${W}' WHERE singleton=1`,
+        );
+        // Inside the actual writer with the authorized epoch all four rows commit.
+        expect(await fenced().admitGenesis(genesisCommand())).toMatchObject({
+          admissionRef: "admission:one",
+        });
+        for (const table of [
+          "financial_source_genesis_admissions",
+          "financial_source_genesis_admission_receipts",
+          "financial_source_registrations",
+          "financial_source_heads",
+        ])
+          expect(count(f.db, table).n).toBe(1);
+        expect(count(f.db, "money_cutover_writer_permit").n).toBe(0);
+        for (const statement of f.batches.at(-1)?.slice(1, -1) ?? [])
+          expect(statement.sql).not.toMatch(/\bmoney_cutover_/u);
       } finally {
         f.close();
       }

@@ -1,3 +1,4 @@
+import { isFinancialMoneyFencedBatch } from "./financial-0104-money-fence.ts";
 import {
   assertHostedBillingFinancialRealm,
   type HostedBillingFinancialRealm,
@@ -144,6 +145,8 @@ export function createSharedFinancialSourceReceiver(
 
   // Fixed owning predicates only. No callback or caller-supplied SQL can turn
   // remote currentness into atomicity; these recheck the actual local primary.
+  // Freeze and permit are the Financial 0104 receiver money fences inside
+  // Root's permit-framed Money writer, so no money_cutover_* table is named.
   const currentRegistration = `r.registration_ref = ? AND r.incarnation = ?
     AND r.receiver_ref = ? AND r.target_ref = ?
     AND r.genesis_digest = ? AND r.registration_digest = ?
@@ -153,10 +156,7 @@ export function createSharedFinancialSourceReceiver(
         AND other.retired_at IS NULL)
     AND EXISTS (SELECT 1 FROM stripe_mode_realm WHERE singleton = 1 AND mode = 'test')
     AND EXISTS (SELECT 1 FROM stripe_billing_account_realms
-      WHERE singleton = 1 AND account_id = ? AND mode = 'test' AND billing_authority = ?)
-    AND EXISTS (SELECT 1 FROM money_cutover_authorized_epoch
-      WHERE singleton = 1 AND writer_epoch = ?)
-    AND NOT EXISTS (SELECT 1 FROM money_cutover_freeze)`;
+      WHERE singleton = 1 AND account_id = ? AND mode = 'test' AND billing_authority = ?)`;
   const currentParams: readonly SqlParam[] = Object.freeze([
     registrationRef,
     incarnation,
@@ -168,7 +168,6 @@ export function createSharedFinancialSourceReceiver(
     qualificationRef,
     accountId,
     billingAuthority,
-    writerEpoch,
   ]);
 
   function matchesEnrollment(row: Row | undefined): boolean {
@@ -450,6 +449,8 @@ export function createSharedFinancialSourceReceiver(
         ],
       },
     ];
+    // Every statement writes a 0104 money-fenced receiver table; nothing else is built.
+    if (!isFinancialMoneyFencedBatch(statements)) fail("unavailable");
     try {
       await sql.batch(statements);
     } catch (error) {

@@ -6,6 +6,7 @@ import {
   sharedRpCredentialCurrentness,
   type TokenAuthorityRecord,
 } from "./credential-authority-class.ts";
+import { isFinancialMoneyFencedBatch } from "./financial-0104-money-fence.ts";
 import type { SqlParam, SqlStatement } from "./ports.ts";
 import {
   type SharedPrincipalBinding,
@@ -66,8 +67,24 @@ export const SOURCE_CURRENT = `(
   ) IS NOT 1)
 )`;
 
-/** Exact observed Root helper SQL/params, not a substitute for missing Root private-origin assertion/readers. */
+const MONEY_CURRENT = `
+ AND EXISTS(SELECT 1 FROM money_cutover_authorized_epoch e WHERE e.singleton=1 AND e.writer_epoch IS c.writer_epoch)
+ AND NOT EXISTS(SELECT 1 FROM money_cutover_freeze)`;
+
+/** Exact observed Root helper SQL/params, not a substitute for missing Root private-origin assertion/readers.
+ * Byte-identical for its existing consumers (Customer admission), whose writes are not 0104-fenced. */
 export function guard(input: ConsentCandidate, organizationId: string) {
+  return guardWith(input, organizationId, MONEY_CURRENT);
+}
+
+/** The same guard for the consent batch itself. Every table it writes carries a
+ * Financial 0104 money fence, so freeze, permit and epoch are enforced inside
+ * Root's permit-framed Money writer and no money_cutover_* table is named here. */
+export function consentGuard(input: ConsentCandidate, organizationId: string) {
+  return guardWith(input, organizationId, "");
+}
+
+function guardWith(input: ConsentCandidate, organizationId: string, money: string) {
   const principal = sharedPrincipalCurrentness(input.auth.human);
   const credential = input.auth.credential;
   const transport =
@@ -102,9 +119,7 @@ export function guard(input: ConsentCandidate, organizationId: string) {
   WHERE o.id=c.organization_id AND o.owner_principal_id=? AND m.principal_id=o.owner_principal_id AND m.role='owner'))
  AND (EXISTS(SELECT 1 FROM stripe_billing_account_realms r JOIN stripe_mode_realm sm ON sm.singleton=r.singleton
   WHERE r.singleton=1 AND r.account_id IS c.account_id AND r.mode IS c.mode
-  AND r.billing_authority IS c.billing_authority AND sm.mode IS c.mode)
- AND EXISTS(SELECT 1 FROM money_cutover_authorized_epoch e WHERE e.singleton=1 AND e.writer_epoch IS c.writer_epoch)
- AND NOT EXISTS(SELECT 1 FROM money_cutover_freeze))
+  AND r.billing_authority IS c.billing_authority AND sm.mode IS c.mode)${money})
  AND (${SOURCE_CURRENT}
  AND (${principal.sql})) AND ((${transport.sql}) AND (${relation}))
  )`;
@@ -130,7 +145,7 @@ export function prepareConsentBatch(
   input: ConsentCandidate,
   organizationId: string,
 ): readonly SqlStatement[] {
-  const g = guard(input, organizationId);
+  const g = consentGuard(input, organizationId);
   const h = input.auth.human;
   const a = input.auth.credential.origin;
   const authJson = JSON.stringify(input.auth);
@@ -210,7 +225,11 @@ export function prepareConsentBatch(
       ...g.params,
     ],
   };
-  return [first, second, last];
+  const statements = [first, second, last];
+  // Every statement writes a 0104 money-fenced consent table; nothing else is built.
+  if (!isFinancialMoneyFencedBatch(statements))
+    throw new TypeError("Financial consent batch must write only money-fenced tables");
+  return statements;
 }
 
 /** Historical exact readback only; a returned receipt never bypasses fresh L1/L2 currentness. */

@@ -11,6 +11,9 @@ import {
   FINANCIAL_0104_C0_FENCE_SCHEMA,
   FINANCIAL_0104_CONSENT_FENCE_SCHEMA,
   FINANCIAL_0104_FENCED_TABLES,
+  FINANCIAL_0104_RECEIVER_FENCE_SCHEMA,
+  FINANCIAL_0104_RECEIVER_FENCED_SCHEMA_DIGEST,
+  FINANCIAL_RECEIVER_UNFENCED_SCHEMA_DIGEST,
   financialStatementWriteTarget,
   isFinancialMoneyFencedBatch,
 } from "../src/financial-0104-money-fence.ts";
@@ -20,11 +23,13 @@ import {
   FINANCIAL_0104_DDL,
   FINANCIAL_0104_MIGRATION,
   FINANCIAL_0104_MONEY_FENCES,
+  FINANCIAL_0104_MONEY_UPDATE_FENCES,
   FINANCIAL_0104_OBJECTS,
   FINANCIAL_0104_PREDECESSOR,
   FINANCIAL_0104_TABLES,
   financial0104RecipeDigest,
 } from "../src/financial-0104-source-contract.ts";
+import { canonicalDigest } from "../src/json.ts";
 import {
   assertMoneyCutoverSqlOrigin,
   createMoneyCutoverSql,
@@ -33,6 +38,7 @@ import {
   MONEY_CUTOVER_PERMIT_DDL,
   MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
 } from "../src/money-cutover-sql.ts";
+import { prepareConsentBatch } from "../src/shared-financial-consent-data.ts";
 import {
   buildFinancialR1AttemptCustodyStatement,
   buildFinancialR1ClaimedCoPreparationBatch,
@@ -44,6 +50,9 @@ import {
   FINANCIAL_SOURCE_ENROLLMENT_DDL,
 } from "../src/shared-financial-source-enrollment.ts";
 import { FINANCIAL_SOURCE_GENESIS_DDL } from "../src/shared-financial-source-genesis-schema.ts";
+import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { fixture as consentFixture } from "./fixtures/financial-customer-five-action-fixture.ts";
+import { installFinancial0104Fences, MONEY_FREEZE_ROW } from "./helpers/financial-0104-fenced.ts";
 import { ACTIONS, AT, count, EPOCH, fixture } from "./helpers/financial-r1-custody-fixture.ts";
 
 const ROOT = resolve(import.meta.dir, "..");
@@ -159,13 +168,48 @@ describe("Financial 0104 source recipe", () => {
         expect(sql).toContain("p.singleton=1 AND p.epoch='usd-micros-v2'");
         expect(sql).toContain("SELECT RAISE(ABORT,'constraint: Financial ");
       }
-      // Every Financial-retained epoch is bound, except the R1 registration row
-      // which carries none (existing R1 fence shape).
+      // Tables that admit an UPDATE at all also carry an UPDATE fence; every
+      // other table refuses every UPDATE through its existing immutable trigger.
+      expect(Object.keys(FINANCIAL_0104_MONEY_UPDATE_FENCES).sort()).toEqual([
+        "financial_source_heads",
+        "financial_source_registrations",
+      ]);
+      for (const table of tables) {
+        const update = FINANCIAL_0104_MONEY_UPDATE_FENCES[table];
+        if (update) {
+          const object = FINANCIAL_0104_OBJECTS.find((o) => o.name === update);
+          expect(
+            object?.sql.startsWith(`CREATE TRIGGER ${update} BEFORE UPDATE ON ${table}\n`),
+          ).toBe(true);
+          expect(object?.sql).toContain("WHEN EXISTS(SELECT 1 FROM money_cutover_freeze)");
+          expect(object?.sql).toContain("p.singleton=1 AND p.epoch='usd-micros-v2'");
+        } else
+          expect(
+            db
+              .query("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name=?")
+              .get(`${table}_no_update`),
+          ).toEqual({
+            sql: expect.stringMatching(
+              new RegExp(
+                `^CREATE TRIGGER ${table}_no_update BEFORE UPDATE ON ${table}\\s+BEGIN\\b`,
+                "u",
+              ),
+            ),
+          });
+      }
+      // Every Financial-retained epoch is bound. The R1 registration and the four
+      // receiver tables carry no epoch column (existing R1 registration shape).
+      const epochless = [
+        "financial_action_source_registrations",
+        "financial_source_registrations",
+        "financial_source_events",
+        "financial_source_heads",
+        "financial_source_receipts",
+      ];
       for (const [table, name] of Object.entries(FINANCIAL_0104_MONEY_FENCES)) {
         const object = FINANCIAL_0104_OBJECTS.find((o) => o.name === name);
         if (!object) throw Error(`missing fence ${name}`);
-        if (table === "financial_action_source_registrations")
-          expect(object.sql).not.toContain("p.writer_epoch IS");
+        if (epochless.includes(table)) expect(object.sql).not.toContain("p.writer_epoch IS");
         else expect(object.sql).toContain("p.writer_epoch IS");
       }
     } finally {
@@ -202,10 +246,54 @@ describe("Financial 0104 source recipe", () => {
     }
   });
 
+  test("each UPDATE fence alone refuses frozen and unpermitted receiver UPDATEs", () => {
+    const rows: Record<string, string> = {
+      financial_source_registrations: `INSERT INTO financial_source_registrations
+        (registration_ref,incarnation,receiver_ref,target_ref,genesis_digest,registration_digest,registration_json,qualification_ref,registered_at)
+        VALUES('registration:u','inc:u','receiver:u','target:u','${EPOCH}','${EPOCH}','{}','qualification:u','${AT}')`,
+      financial_source_heads: `INSERT INTO financial_source_heads
+        (registration_ref,incarnation,affected_ref,genesis_qualification_ref,created_at,sequence,event_digest,state,last_event_ref,updated_at)
+        VALUES('registration:u','inc:u','affected:u','genesis:u','${AT}',0,'${EPOCH}','active',NULL,'${AT}')`,
+    };
+    for (const [table, name] of Object.entries(FINANCIAL_0104_MONEY_UPDATE_FENCES)) {
+      const db = new Database(":memory:");
+      try {
+        db.exec("PRAGMA foreign_keys=OFF");
+        db.exec(MONEY_CUTOVER_FREEZE_DDL);
+        db.exec(MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL);
+        db.exec(MONEY_CUTOVER_PERMIT_DDL);
+        for (const object of FINANCIAL_0104_OBJECTS)
+          if (object.type === "table") db.exec(object.sql);
+        const insert = rows[table];
+        if (!insert) throw Error(`missing row for ${table}`);
+        db.exec(insert);
+        const fence = FINANCIAL_0104_OBJECTS.find((o) => o.name === name);
+        if (!fence) throw Error(`missing fence ${name}`);
+        db.exec(fence.sql);
+        db.query("INSERT INTO money_cutover_authorized_epoch VALUES(1,?)").run(EPOCH);
+        const update = () => db.exec(`UPDATE ${table} SET registration_ref=registration_ref`);
+        expect(update).toThrow(/constraint: Financial .*permit/u);
+        db.query("INSERT INTO money_cutover_writer_permit VALUES(1,'usd-micros-v2',?)").run(EPOCH);
+        db.exec("INSERT INTO money_cutover_freeze VALUES(1,'b','o','k','w','s')");
+        expect(update).toThrow(/constraint: Financial .*permit/u);
+        db.exec("DELETE FROM money_cutover_freeze");
+        expect(update).not.toThrow();
+      } finally {
+        db.close();
+      }
+    }
+  });
+
   test("the fixture SQL the existing tests install equals the 0104 objects minus the new fences", () => {
     const db = new Database(":memory:");
     try {
       db.exec("PRAGMA foreign_keys=OFF");
+      db.exec(
+        readFileSync(
+          new URL("./fixtures/shared-financial-source-component-schema.sql", import.meta.url),
+          "utf8",
+        ),
+      );
       db.exec(FINANCIAL_SOURCE_ENROLLMENT_DDL);
       db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
       db.exec(
@@ -225,10 +313,11 @@ describe("Financial 0104 source recipe", () => {
         ),
       );
       const added = new Set([
+        ...Object.keys(FINANCIAL_0104_RECEIVER_FENCE_SCHEMA),
         ...Object.keys(FINANCIAL_0104_C0_FENCE_SCHEMA),
         ...Object.keys(FINANCIAL_0104_CONSENT_FENCE_SCHEMA),
       ]);
-      expect(added.size).toBe(12);
+      expect(added.size).toBe(18);
       expect(schemaRows(db, FINANCIAL_0104_TABLES)).toEqual(
         FINANCIAL_0104_OBJECTS.filter((o) => !added.has(o.name))
           .map(({ type, name, tbl_name, sql }) => ({ type, name, tbl_name, sql }))
@@ -239,7 +328,7 @@ describe("Financial 0104 source recipe", () => {
     }
   });
 
-  test("depends on 0103 only; the receiver head parent is the one recorded absent table", () => {
+  test("depends on 0103 only; every foreign-key parent exists at the 0103+0104 state", () => {
     const db = at0103();
     try {
       db.exec(FINANCIAL_0104_DDL);
@@ -257,11 +346,49 @@ describe("Financial 0104 source recipe", () => {
       const auth103 = ["auth_principal_incarnations", "shared_principal_bindings"];
       for (const table of [...auth103, "credential_authority_classes"])
         expect(parents.has(table)).toBe(true);
-      expect([...parents].filter((table) => !present.has(table)).sort()).toEqual([
-        "financial_source_heads",
-      ]);
+      expect([...parents].filter((table) => !present.has(table))).toEqual([]);
+      expect([...parents].filter((table) => !FINANCIAL_0104_TABLES.includes(table)).sort()).toEqual(
+        [
+          "auth_principal_incarnations",
+          "credential_authority_classes",
+          "shared_principal_bindings",
+        ],
+      );
     } finally {
       db.close();
+    }
+  });
+
+  test("receiver readiness pins exactly the unfenced candidate or the exact fenced 0104 rows", async () => {
+    const query = `SELECT type,name,sql FROM sqlite_schema WHERE tbl_name IN ('financial_source_registrations','financial_source_heads','financial_source_events','financial_source_receipts') AND sql IS NOT NULL ORDER BY type,name`;
+    const installed = at0103();
+    const fixtureDb = new Database(":memory:");
+    try {
+      installed.exec(FINANCIAL_0104_DDL);
+      expect(await canonicalDigest(await createSqliteSql(installed).query(query))).toBe(
+        FINANCIAL_0104_RECEIVER_FENCED_SCHEMA_DIGEST,
+      );
+      fixtureDb.exec(
+        readFileSync(
+          new URL("./fixtures/shared-financial-source-component-schema.sql", import.meta.url),
+          "utf8",
+        ),
+      );
+      expect(await canonicalDigest(await createSqliteSql(fixtureDb).query(query))).toBe(
+        FINANCIAL_RECEIVER_UNFENCED_SCHEMA_DIGEST,
+      );
+      // Any partial fence set matches neither pinned shape.
+      fixtureDb.exec(
+        Object.values(FINANCIAL_0104_RECEIVER_FENCE_SCHEMA)[0] ?? "SELECT RAISE(ABORT,'none')",
+      );
+      const partial = await canonicalDigest(await createSqliteSql(fixtureDb).query(query));
+      expect([
+        FINANCIAL_0104_RECEIVER_FENCED_SCHEMA_DIGEST,
+        FINANCIAL_RECEIVER_UNFENCED_SCHEMA_DIGEST,
+      ]).not.toContain(partial);
+    } finally {
+      installed.close();
+      fixtureDb.close();
     }
   });
 
@@ -446,6 +573,72 @@ describe("Financial 0104 co-preparation through the existing Money writer", () =
       expect(await f.sql.batch(batch)).toHaveLength(5);
       expect(counts(f.db)).toEqual([1, 1, 1, 1, 1]);
       expect(count(f.db, "financial_r1_preparation_attempts")).toBe(1);
+      expect(count(f.db, "money_cutover_writer_permit")).toBe(0);
+    } finally {
+      f.close();
+    }
+  });
+});
+
+describe("Financial 0104 consent batch through the existing Money writer", () => {
+  const CONSENT_TABLES = [
+    "financial_payer_grants",
+    "financial_payer_consent_witnesses",
+    "financial_payer_consent_receipts",
+  ] as const;
+  test("commits with the authorized epoch; freeze, revoked or foreign epoch and no permit roll back", async () => {
+    const f = await consentFixture();
+    try {
+      // The fixture's own first consent committed before the fences existed.
+      const before = CONSENT_TABLES.map((table) => count(f.db, table));
+      expect(before).toEqual([1, 1, 1]);
+      const second = {
+        ...f.input,
+        challengeRef: "challenge:fenced",
+        grantRef: "grant:fenced",
+        grantIncarnation: "grant-inc:fenced",
+        consentRef: "consent-original:fenced",
+        issuanceAttempt: "attempt:fenced",
+        receiptRef: "consent-receipt:fenced",
+      };
+      await f.challenge(second);
+      installFinancial0104Fences(f.db, { consent: true });
+      const epoch = (
+        f.db.query("SELECT writer_epoch FROM money_cutover_authorized_epoch").get() as {
+          writer_epoch: string;
+        }
+      ).writer_epoch;
+      const batch = prepareConsentBatch(second, f.org);
+      expect(batch).toHaveLength(3);
+      for (const statement of batch) expect(statement.sql).not.toMatch(MONEY_WORDS);
+      expect(batch.map((statement) => financialStatementWriteTarget(statement.sql))).toEqual([
+        ...CONSENT_TABLES,
+      ]);
+      const writer = createMoneyCutoverSql(f.sql, epoch);
+      const unchanged = () =>
+        expect(CONSENT_TABLES.map((table) => count(f.db, table))).toEqual(before);
+      // Freeze.
+      f.db.exec(MONEY_FREEZE_ROW);
+      await expect(writer.batch(batch)).rejects.toThrow(/constraint: Financial consent/u);
+      unchanged();
+      f.db.exec("DELETE FROM money_cutover_freeze");
+      // Revoked epoch: the writer's permit insert aborts.
+      f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(ROTATED);
+      await expect(writer.batch(batch)).rejects.toThrow();
+      unchanged();
+      // Foreign epoch: a current permit that is not the retained challenge's.
+      await expect(createMoneyCutoverSql(f.sql, ROTATED).batch(batch)).rejects.toThrow(
+        /constraint: Financial consent grant permit\/epoch/u,
+      );
+      unchanged();
+      f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(epoch);
+      // No permit frame.
+      await expect(f.sql.batch(batch)).rejects.toThrow(/constraint: Financial consent/u);
+      unchanged();
+      expect(count(f.db, "money_cutover_writer_permit")).toBe(0);
+      // Inside the actual writer with the authorized epoch all three rows commit.
+      expect((await writer.batch(batch)).map((write) => write.changes)).toEqual([1, 1, 1]);
+      expect(CONSENT_TABLES.map((table) => count(f.db, table))).toEqual([2, 2, 2]);
       expect(count(f.db, "money_cutover_writer_permit")).toBe(0);
     } finally {
       f.close();

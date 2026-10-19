@@ -1,5 +1,7 @@
 import {
   FINANCIAL_0104_C0_FENCE_SCHEMA,
+  FINANCIAL_0104_RECEIVER_FENCED_SCHEMA_DIGEST,
+  FINANCIAL_RECEIVER_UNFENCED_SCHEMA_DIGEST,
   isFinancialMoneyFencedBatch,
 } from "./financial-0104-money-fence.ts";
 import {
@@ -82,8 +84,7 @@ const SCHEMA: Readonly<Record<string, string>> = {
   financial_source_materialization_receipts_refs:
     "CREATE TRIGGER financial_source_materialization_receipts_refs BEFORE INSERT ON financial_source_materialization_receipts\nWHEN (typeof(NEW.receipt_ref) IS NOT 'text' OR length(NEW.receipt_ref) NOT BETWEEN 1 AND 256 OR substr(NEW.receipt_ref,1,1) NOT GLOB '[A-Za-z0-9]' OR NEW.receipt_ref GLOB '*[^A-Za-z0-9._:/-]*') OR (typeof(NEW.materialization_ref) IS NOT 'text' OR length(NEW.materialization_ref) NOT BETWEEN 1 AND 256 OR substr(NEW.materialization_ref,1,1) NOT GLOB '[A-Za-z0-9]' OR NEW.materialization_ref GLOB '*[^A-Za-z0-9._:/-]*') OR (typeof(NEW.command_ref) IS NOT 'text' OR length(NEW.command_ref) NOT BETWEEN 1 AND 256 OR substr(NEW.command_ref,1,1) NOT GLOB '[A-Za-z0-9]' OR NEW.command_ref GLOB '*[^A-Za-z0-9._:/-]*') OR (typeof(NEW.registration_ref) IS NOT 'text' OR length(NEW.registration_ref) NOT BETWEEN 1 AND 256 OR substr(NEW.registration_ref,1,1) NOT GLOB '[A-Za-z0-9]' OR NEW.registration_ref GLOB '*[^A-Za-z0-9._:/-]*') OR (typeof(NEW.incarnation) IS NOT 'text' OR length(NEW.incarnation) NOT BETWEEN 1 AND 256 OR substr(NEW.incarnation,1,1) NOT GLOB '[A-Za-z0-9]' OR NEW.incarnation GLOB '*[^A-Za-z0-9._:/-]*') OR (typeof(NEW.affected_ref) IS NOT 'text' OR length(NEW.affected_ref) NOT BETWEEN 1 AND 256 OR substr(NEW.affected_ref,1,1) NOT GLOB '[A-Za-z0-9]' OR NEW.affected_ref GLOB '*[^A-Za-z0-9._:/-]*') BEGIN\n SELECT RAISE(ABORT,'constraint: enrollment reference');\nEND",
 };
-const RECEIVER_SCHEMA_DIGEST =
-  "sha256:78273f494a3823217edf12e06f06eb4803860452d02278e097a2662befca387b";
+const RECEIVER_SCHEMA_DIGEST = FINANCIAL_RECEIVER_UNFENCED_SCHEMA_DIGEST;
 export const FINANCIAL_SOURCE_ENROLLMENT_SCHEMA = SCHEMA;
 export const FINANCIAL_SOURCE_ENROLLMENT_DDL = `${Object.values(SCHEMA).join(";\n")};\n`;
 
@@ -280,17 +281,13 @@ function component(options: FinancialEnrollmentComponentOptions) {
     receiverRef,
     targetRef,
   });
-  // C0 is written only inside Root's permit-framed Money writer. Its freeze,
-  // permit and epoch checks are the per-table Financial 0104 money fences, so
-  // this predicate names no money_cutover_* table and passes the writer as-is.
-  const c0Current = `EXISTS (SELECT 1 FROM stripe_mode_realm WHERE singleton=1 AND mode='test')
+  // C0 and M are written only inside Root's permit-framed Money writer. Their
+  // freeze, permit and epoch checks are the per-table Financial 0104 money
+  // fences, so this predicate names no money_cutover_* table and passes the
+  // writer as-is.
+  const current = `EXISTS (SELECT 1 FROM stripe_mode_realm WHERE singleton=1 AND mode='test')
     AND EXISTS (SELECT 1 FROM stripe_billing_account_realms WHERE singleton=1 AND account_id=? AND mode='test' AND billing_authority=?)`;
-  const c0CurrentParams: readonly SqlParam[] = [realmData.accountId, realmData.billingAuthority];
-  // M keeps its original in-statement epoch/freeze predicate unchanged.
-  const current = `${c0Current}
-    AND EXISTS (SELECT 1 FROM money_cutover_authorized_epoch WHERE singleton=1 AND writer_epoch=?)
-    AND NOT EXISTS (SELECT 1 FROM money_cutover_freeze)`;
-  const currentParams: readonly SqlParam[] = [...c0CurrentParams, writerEpoch];
+  const currentParams: readonly SqlParam[] = [realmData.accountId, realmData.billingAuthority];
   const names = [
     "financial_preproof_challenges",
     "financial_preproof_challenge_receipts",
@@ -334,7 +331,12 @@ function component(options: FinancialEnrollmentComponentOptions) {
         const receiverRows = await sql.query(
           `SELECT type,name,sql FROM sqlite_schema WHERE tbl_name IN ('financial_source_registrations','financial_source_heads','financial_source_events','financial_source_receipts') AND sql IS NOT NULL ORDER BY type,name`,
         );
-        if ((await canonicalDigest(receiverRows)) !== RECEIVER_SCHEMA_DIGEST) fail("unavailable");
+        // Only the exact unfenced receiver with unfenced C0, or the exact
+        // fenced 0104 receiver with fenced 0104 C0/M/G.
+        const expectedReceiver = fenced
+          ? FINANCIAL_0104_RECEIVER_FENCED_SCHEMA_DIGEST
+          : RECEIVER_SCHEMA_DIGEST;
+        if ((await canonicalDigest(receiverRows)) !== expectedReceiver) fail("unavailable");
       }
       return !legacy;
     } catch (error) {
@@ -349,16 +351,7 @@ function component(options: FinancialEnrollmentComponentOptions) {
       return fail("unavailable", error);
     }
   }
-  return {
-    sql,
-    realmData,
-    c0Current,
-    c0CurrentParams,
-    current,
-    currentParams,
-    ready,
-    observed,
-  };
+  return { sql, realmData, current, currentParams, ready, observed };
 }
 
 export interface FinancialPreproofPreparation {
@@ -485,7 +478,7 @@ export function createFinancialPreproofChallengeStore(
     const statements: readonly SqlStatement[] = [
       {
         sql: `INSERT INTO financial_preproof_challenges(challenge_ref,preparation_ref,challenge_json,scope_json,record_json,created_at)
-          SELECT ?,?,?,?,?,? WHERE ${c.c0Current}`,
+          SELECT ?,?,?,?,?,? WHERE ${c.current}`,
         params: [
           saved.challenge.challengeRef,
           saved.preparationRef,
@@ -493,13 +486,13 @@ export function createFinancialPreproofChallengeStore(
           scopeJson,
           recordJson,
           at,
-          ...c.c0CurrentParams,
+          ...c.currentParams,
         ],
       },
       {
         sql: `INSERT INTO financial_preproof_challenge_receipts(receipt_ref,challenge_ref,preparation_ref,record_json,all_rows_match)
           VALUES(?,?,?,?,CASE WHEN changes()=1 AND EXISTS(SELECT 1 FROM financial_preproof_challenges
-          WHERE challenge_ref=? AND preparation_ref=? AND challenge_json=? AND scope_json=? AND record_json=?) AND (${c.c0Current}) THEN 1 ELSE 0 END)`,
+          WHERE challenge_ref=? AND preparation_ref=? AND challenge_json=? AND scope_json=? AND record_json=?) AND (${c.current}) THEN 1 ELSE 0 END)`,
         params: [
           saved.receiptRef,
           saved.challenge.challengeRef,
@@ -510,7 +503,7 @@ export function createFinancialPreproofChallengeStore(
           challengeJson,
           scopeJson,
           recordJson,
-          ...c.c0CurrentParams,
+          ...c.currentParams,
         ],
       },
     ];
@@ -1054,6 +1047,8 @@ export function createFinancialSourceMaterializationStore(
           ],
         },
       ];
+      // Every M statement writes a 0104 money-fenced table; nothing else is built.
+      if (!isFinancialMoneyFencedBatch(statements)) fail("unavailable");
       try {
         await c.sql.batch(statements);
       } catch (error) {

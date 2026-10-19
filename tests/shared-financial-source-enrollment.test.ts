@@ -2,14 +2,10 @@ import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import { FINANCIAL_0104_C0_FENCE_SCHEMA } from "../src/financial-0104-money-fence.ts";
 import { verifyHostedBillingFinancialRealm } from "../src/hosted-billing-realm.ts";
 import {
-  createMoneyCutoverSql,
   MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL,
   MONEY_CUTOVER_FREEZE_DDL,
-  MONEY_CUTOVER_PERMIT_DDL,
-  MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL,
 } from "../src/money-cutover-sql.ts";
 import { type Sql, SqlError, type SqlStatement } from "../src/ports.ts";
 import { createSharedFinancialSourceReceiver } from "../src/shared-financial-source.ts";
@@ -36,6 +32,11 @@ import {
 import { FINANCIAL_GENESIS_SCHEMA } from "../src/shared-financial-source-genesis-schema.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
+import {
+  financial0104Writer,
+  installFinancial0104Fences,
+  MONEY_FREEZE_ROW,
+} from "./helpers/financial-0104-fenced.ts";
 
 const AT = "2026-10-15T00:00:00.000Z";
 const D = `sha256:${"a".repeat(64)}` as const,
@@ -1050,58 +1051,87 @@ describe("private C0 and explicit M component", () => {
   test("a current primary fence revoked at allocation time rolls back both independent phases", async () => {
     const f = await fixture();
     try {
-      // M keeps its in-statement epoch/freeze predicate.
-      f.fault((s) => {
-        f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(D);
-        return s;
+      // Freeze, permit and epoch are the exact Financial 0104 fences inside the
+      // actual permit-framed Money writer; neither predicate names them.
+      installFinancial0104Fences(f.db, { receiver: true, c0: true, genesisOverlay: true });
+      const { money, realm } = await financial0104Writer(f.sql, W, f.common.client, {
+        accountId: "acct_enrollment",
+        billingAuthority: "enrollment",
+        priceId: "price_enrollment",
       });
+      const fenced = { ...f.common, sql: money, realm };
+      const c0 = () => createFinancialPreproofChallengeStore({ ...fenced, scope: SCOPE });
+      const m = () =>
+        createFinancialSourceMaterializationStore({
+          ...fenced,
+          source: f.source,
+          affectedRef: A,
+          genesisQualificationRef: GQ,
+        });
+      for (const phase of ["c0", "m"] as const) {
+        const attempt = async () =>
+          phase === "c0" ? c0().prepare(f.preparation()) : m().install(await f.command());
+        f.fault((s) => {
+          f.db.exec(MONEY_FREEZE_ROW);
+          return s;
+        });
+        await expect(attempt()).rejects.toMatchObject({ code: "conflict" });
+        expect(f.counts()).toEqual([0, 0, 0, 0]);
+        f.db.exec("DELETE FROM money_cutover_freeze");
+        f.fault((s) => {
+          f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(D);
+          return s;
+        });
+        await expect(attempt()).rejects.toMatchObject({ code: "conflict" });
+        expect(f.counts()).toEqual([0, 0, 0, 0]);
+        f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(W);
+        f.fault(undefined);
+        expect(count(f.db, "financial_source_heads").n).toBe(0);
+        expect(count(f.db, "financial_source_registrations").n).toBe(0);
+        expect(count(f.db, "money_cutover_writer_permit").n).toBe(0);
+      }
+      // Outside the permit frame the same batches are refused by the fences.
+      await expect(f.c0().prepare(f.preparation())).rejects.toMatchObject({ code: "conflict" });
       await expect(f.m().install(await f.command())).rejects.toMatchObject({ code: "conflict" });
       expect(f.counts()).toEqual([0, 0, 0, 0]);
       expect(count(f.db, "financial_source_heads").n).toBe(0);
-      expect(count(f.db, "financial_source_registrations").n).toBe(0);
+      // A current permit under a foreign epoch is refused: each row keeps its own.
+      f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(D);
+      const foreign = await financial0104Writer(f.sql, D, f.common.client, {
+        accountId: "acct_enrollment",
+        billingAuthority: "enrollment",
+        priceId: "price_enrollment",
+      });
+      const foreignOptions = { ...f.common, sql: foreign.money, realm: foreign.realm };
+      await expect(
+        createFinancialPreproofChallengeStore({ ...foreignOptions, scope: SCOPE }).prepare(
+          f.preparation(),
+        ),
+      ).rejects.toMatchObject({ code: "conflict" });
+      await expect(
+        createFinancialSourceMaterializationStore({
+          ...foreignOptions,
+          source: f.source,
+          affectedRef: A,
+          genesisQualificationRef: GQ,
+        }).install(await f.command()),
+      ).rejects.toMatchObject({ code: "conflict" });
+      expect(f.counts()).toEqual([0, 0, 0, 0]);
+      expect(count(f.db, "financial_source_heads").n).toBe(0);
       f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(W);
-      // C0 freeze/permit/epoch are the exact Financial 0104 fences, inside the
-      // actual permit-framed Money writer; the predicate no longer names them.
-      f.db.exec(FINANCIAL_SOURCE_GENESIS_DDL);
-      for (const sql of Object.values(FINANCIAL_0104_C0_FENCE_SCHEMA)) f.db.exec(sql);
-      f.db.exec(MONEY_CUTOVER_PERMIT_DDL);
-      f.db.exec(MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL);
-      const money = createMoneyCutoverSql(f.sql, W);
-      const realm = await verifyHostedBillingFinancialRealm({
-        sql: money,
-        reader: { client: f.common.client },
-        expected: { accountId: "acct_enrollment", mode: "test", billingAuthority: "enrollment" },
-        prices: [{ priceId: "price_enrollment", monthlyAmountMinor: 1000 }],
+      // Inside the actual writer with the authorized epoch both commit.
+      expect(await c0().prepare(f.preparation())).toMatchObject({ challengeRef: "challenge:one" });
+      expect(await m().install(await f.command())).toMatchObject({
+        materializationRef: "materialization:one",
       });
-      const fenced = () =>
-        createFinancialPreproofChallengeStore({ ...f.common, sql: money, realm, scope: SCOPE });
-      f.fault((s) => {
-        f.db.exec(
-          "INSERT INTO money_cutover_freeze VALUES(1,'binding','origin','backup','writer','source')",
-        );
-        return s;
-      });
-      await expect(fenced().prepare(f.preparation())).rejects.toMatchObject({ code: "conflict" });
-      expect(f.counts()).toEqual([0, 0, 0, 0]);
+      expect(f.counts()).toEqual([1, 1, 1, 1]);
+      expect(count(f.db, "financial_source_heads").n).toBe(1);
+      expect(count(f.db, "financial_source_registrations").n).toBe(1);
       expect(count(f.db, "money_cutover_writer_permit").n).toBe(0);
-      f.db.exec("DELETE FROM money_cutover_freeze");
-      f.fault((s) => {
-        f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(D);
-        return s;
-      });
-      await expect(fenced().prepare(f.preparation())).rejects.toMatchObject({ code: "conflict" });
-      expect(f.counts()).toEqual([0, 0, 0, 0]);
-      expect(count(f.db, "money_cutover_writer_permit").n).toBe(0);
-      f.db.query("UPDATE money_cutover_authorized_epoch SET writer_epoch=?").run(W);
-      f.fault(undefined);
-      // Outside the permit frame the same C0 pair is refused by the fences.
-      await expect(f.c0().prepare(f.preparation())).rejects.toMatchObject({ code: "conflict" });
-      expect(f.counts()).toEqual([0, 0, 0, 0]);
-      expect(await fenced().prepare(f.preparation())).toMatchObject({
-        challengeRef: "challenge:one",
-      });
-      expect(f.counts()).toEqual([1, 1, 0, 0]);
-      expect(count(f.db, "money_cutover_writer_permit").n).toBe(0);
+      // Each fenced statement passes the writer unchanged.
+      for (const batch of f.batches.slice(-2))
+        for (const statement of batch.slice(1, -1))
+          expect(statement.sql).not.toMatch(/\bmoney_cutover_/u);
     } finally {
       f.close();
     }

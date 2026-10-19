@@ -1,14 +1,15 @@
 /** PRIVATE Financial-owned 0104 source recipe. Root/Money reserved 0104 for
  * Financial (dependency 0104 -> 0103; source order 0101 -> 0102 -> 0103 -> 0104).
- * Financial authors only this body: the C0/M/G, R1 and five-action consent
- * tables already defined by existing Financial source, plus one Financial money
- * fence per table. Root alone registers it into the canonical inventory, native
+ * Financial authors only this body: the receiver, C0/M/G, R1 and five-action
+ * consent tables already defined by existing Financial source, plus a Financial
+ * money fence on every table (and on UPDATE where a table admits one). Root alone registers it into the canonical inventory, native
  * migration list and deploy scripts; nothing here registers, applies or selects
  * a migration, and no SQL label confers caller, payer, source or issuer authority. */
 
 import {
   FINANCIAL_0104_C0_FENCE_SCHEMA,
   FINANCIAL_0104_CONSENT_FENCE_SCHEMA,
+  FINANCIAL_0104_RECEIVER_FENCE_SCHEMA,
 } from "./financial-0104-money-fence.ts";
 import { bytesDigest } from "./json.ts";
 import {
@@ -21,6 +22,53 @@ import { FINANCIAL_GENESIS_SCHEMA } from "./shared-financial-source-genesis-sche
 export const FINANCIAL_0104_MIGRATION = "0104_financial_custody.sql";
 export const FINANCIAL_0104_PREDECESSOR = "0103_auth_authority.sql";
 export const FINANCIAL_0104_RECIPE_VERSION = "takoserver.financial0104.source-recipe.v1";
+
+/** Exact receiver candidate rows, byte-identical to the unfenced receiver
+ * shape whose digest the enrollment and genesis readiness checks pin. */
+const RECEIVER_SCHEMA: Readonly<Record<string, string>> = Object.freeze({
+  financial_source_registrations:
+    "CREATE TABLE financial_source_registrations (\n registration_ref TEXT NOT NULL, incarnation TEXT NOT NULL,\n receiver_ref TEXT NOT NULL, target_ref TEXT NOT NULL,\n genesis_digest TEXT NOT NULL, registration_digest TEXT NOT NULL,\n registration_json TEXT NOT NULL CHECK(json_valid(registration_json)),\n qualification_ref TEXT NOT NULL, registered_at TEXT NOT NULL,\n retirement_ref TEXT, retired_at TEXT,\n PRIMARY KEY(registration_ref,incarnation),\n CHECK((retirement_ref IS NULL)=(retired_at IS NULL)),\n CHECK(retirement_ref IS NULL OR (length(retirement_ref) BETWEEN 1 AND 256 AND substr(retirement_ref,1,1) GLOB '[A-Za-z0-9]' AND retirement_ref NOT GLOB '*[^A-Za-z0-9._:/-]*')),\n CHECK(retired_at IS NULL OR strftime('%Y-%m-%dT%H:%M:%fZ',retired_at) IS retired_at),\n CHECK(retired_at IS NULL OR retired_at>=registered_at),\n CHECK(length(CAST(registration_json AS BLOB)) BETWEEN 2 AND 16384),\n CHECK(length(registration_ref) BETWEEN 1 AND 256 AND substr(registration_ref,1,1) GLOB '[A-Za-z0-9]' AND registration_ref NOT GLOB '*[^A-Za-z0-9._:/-]*'),\n CHECK(length(incarnation) BETWEEN 1 AND 256 AND substr(incarnation,1,1) GLOB '[A-Za-z0-9]' AND incarnation NOT GLOB '*[^A-Za-z0-9._:/-]*'),\n CHECK(length(receiver_ref) BETWEEN 1 AND 256 AND substr(receiver_ref,1,1) GLOB '[A-Za-z0-9]' AND receiver_ref NOT GLOB '*[^A-Za-z0-9._:/-]*'),\n CHECK(length(target_ref) BETWEEN 1 AND 256 AND substr(target_ref,1,1) GLOB '[A-Za-z0-9]' AND target_ref NOT GLOB '*[^A-Za-z0-9._:/-]*'),\n CHECK(length(qualification_ref) BETWEEN 1 AND 256 AND substr(qualification_ref,1,1) GLOB '[A-Za-z0-9]' AND qualification_ref NOT GLOB '*[^A-Za-z0-9._:/-]*'),\n CHECK(substr(genesis_digest,1,7)='sha256:' AND length(genesis_digest)=71 AND substr(genesis_digest,8) NOT GLOB '*[^0-9a-f]*'),\n CHECK(substr(registration_digest,1,7)='sha256:' AND length(registration_digest)=71 AND substr(registration_digest,8) NOT GLOB '*[^0-9a-f]*'),\n CHECK(strftime('%Y-%m-%dT%H:%M:%fZ',registered_at) IS registered_at)\n)",
+  financial_source_events:
+    "CREATE TABLE financial_source_events (\n event_ref TEXT PRIMARY KEY NOT NULL,\n registration_ref TEXT NOT NULL, incarnation TEXT NOT NULL, affected_ref TEXT NOT NULL,\n sequence INTEGER NOT NULL CHECK(typeof(sequence)='integer' AND sequence BETWEEN 1 AND 9007199254740991),\n previous_digest TEXT NOT NULL, event_digest TEXT NOT NULL,\n kind TEXT NOT NULL CHECK(kind IN('advance','close')), evidence_ref TEXT NOT NULL,\n event_json TEXT NOT NULL CHECK(json_valid(event_json)), applied_at TEXT NOT NULL,\n UNIQUE(registration_ref,incarnation,affected_ref,sequence),\n FOREIGN KEY(registration_ref,incarnation) REFERENCES financial_source_registrations(registration_ref,incarnation) ON DELETE RESTRICT,\n CHECK(length(CAST(event_json AS BLOB)) BETWEEN 2 AND 16384),\n CHECK(length(event_ref) BETWEEN 1 AND 256 AND substr(event_ref,1,1) GLOB '[A-Za-z0-9]' AND event_ref NOT GLOB '*[^A-Za-z0-9._:/-]*'),\n CHECK(length(registration_ref) BETWEEN 1 AND 256 AND substr(registration_ref,1,1) GLOB '[A-Za-z0-9]' AND registration_ref NOT GLOB '*[^A-Za-z0-9._:/-]*'),\n CHECK(length(incarnation) BETWEEN 1 AND 256 AND substr(incarnation,1,1) GLOB '[A-Za-z0-9]' AND incarnation NOT GLOB '*[^A-Za-z0-9._:/-]*'),\n CHECK(length(affected_ref) BETWEEN 1 AND 256 AND substr(affected_ref,1,1) GLOB '[A-Za-z0-9]' AND affected_ref NOT GLOB '*[^A-Za-z0-9._:/-]*'),\n CHECK(length(evidence_ref) BETWEEN 1 AND 256 AND substr(evidence_ref,1,1) GLOB '[A-Za-z0-9]' AND evidence_ref NOT GLOB '*[^A-Za-z0-9._:/-]*'),\n CHECK(substr(previous_digest,1,7)='sha256:' AND length(previous_digest)=71 AND substr(previous_digest,8) NOT GLOB '*[^0-9a-f]*'),\n CHECK(substr(event_digest,1,7)='sha256:' AND length(event_digest)=71 AND substr(event_digest,8) NOT GLOB '*[^0-9a-f]*'),\n CHECK(strftime('%Y-%m-%dT%H:%M:%fZ',applied_at) IS applied_at)\n)",
+  financial_source_heads:
+    "CREATE TABLE financial_source_heads (\n registration_ref TEXT NOT NULL, incarnation TEXT NOT NULL, affected_ref TEXT NOT NULL,\n genesis_qualification_ref TEXT NOT NULL, created_at TEXT NOT NULL,\n sequence INTEGER NOT NULL CHECK(typeof(sequence)='integer' AND sequence BETWEEN 0 AND 9007199254740991),\n event_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN('active','closed')),\n last_event_ref TEXT, updated_at TEXT NOT NULL,\n PRIMARY KEY(registration_ref,incarnation,affected_ref),\n FOREIGN KEY(registration_ref,incarnation) REFERENCES financial_source_registrations(registration_ref,incarnation) ON DELETE RESTRICT,\n FOREIGN KEY(last_event_ref) REFERENCES financial_source_events(event_ref) ON DELETE RESTRICT,\n CHECK((sequence=0 AND last_event_ref IS NULL AND state='active') OR (sequence>0 AND last_event_ref IS NOT NULL)),\n CHECK(updated_at>=created_at),\n CHECK(length(registration_ref) BETWEEN 1 AND 256 AND substr(registration_ref,1,1) GLOB '[A-Za-z0-9]' AND registration_ref NOT GLOB '*[^A-Za-z0-9._:/-]*'),\n CHECK(length(incarnation) BETWEEN 1 AND 256 AND substr(incarnation,1,1) GLOB '[A-Za-z0-9]' AND incarnation NOT GLOB '*[^A-Za-z0-9._:/-]*'),\n CHECK(length(affected_ref) BETWEEN 1 AND 256 AND substr(affected_ref,1,1) GLOB '[A-Za-z0-9]' AND affected_ref NOT GLOB '*[^A-Za-z0-9._:/-]*'),\n CHECK(length(genesis_qualification_ref) BETWEEN 1 AND 256 AND substr(genesis_qualification_ref,1,1) GLOB '[A-Za-z0-9]' AND genesis_qualification_ref NOT GLOB '*[^A-Za-z0-9._:/-]*'),\n CHECK(substr(event_digest,1,7)='sha256:' AND length(event_digest)=71 AND substr(event_digest,8) NOT GLOB '*[^0-9a-f]*'),\n CHECK(strftime('%Y-%m-%dT%H:%M:%fZ',created_at) IS created_at),\n CHECK(strftime('%Y-%m-%dT%H:%M:%fZ',updated_at) IS updated_at)\n)",
+  financial_source_receipts:
+    "CREATE TABLE financial_source_receipts (\n event_ref TEXT PRIMARY KEY NOT NULL, receipt_ref TEXT NOT NULL UNIQUE,\n registration_ref TEXT NOT NULL, incarnation TEXT NOT NULL, affected_ref TEXT NOT NULL,\n receiver_ref TEXT NOT NULL, target_ref TEXT NOT NULL,\n sequence INTEGER NOT NULL CHECK(typeof(sequence)='integer' AND sequence BETWEEN 1 AND 9007199254740991),\n event_digest TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN('admission-closed','advanced')),\n receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)), created_at TEXT NOT NULL,\n all_rows_match INTEGER NOT NULL CHECK(typeof(all_rows_match)='integer' AND all_rows_match=1),\n FOREIGN KEY(event_ref) REFERENCES financial_source_events(event_ref) ON DELETE RESTRICT,\n FOREIGN KEY(registration_ref,incarnation,affected_ref) REFERENCES financial_source_heads(registration_ref,incarnation,affected_ref) ON DELETE RESTRICT,\n FOREIGN KEY(registration_ref,incarnation) REFERENCES financial_source_registrations(registration_ref,incarnation) ON DELETE RESTRICT,\n CHECK(length(receipt_ref)=68 AND substr(receipt_ref,1,4)='fsr_' AND substr(receipt_ref,5) NOT GLOB '*[^0-9a-f]*'),\n CHECK(length(CAST(receipt_json AS BLOB)) BETWEEN 2 AND 16384),\n CHECK(length(event_ref) BETWEEN 1 AND 256 AND substr(event_ref,1,1) GLOB '[A-Za-z0-9]' AND event_ref NOT GLOB '*[^A-Za-z0-9._:/-]*'),\n CHECK(length(registration_ref) BETWEEN 1 AND 256 AND substr(registration_ref,1,1) GLOB '[A-Za-z0-9]' AND registration_ref NOT GLOB '*[^A-Za-z0-9._:/-]*'),\n CHECK(length(incarnation) BETWEEN 1 AND 256 AND substr(incarnation,1,1) GLOB '[A-Za-z0-9]' AND incarnation NOT GLOB '*[^A-Za-z0-9._:/-]*'),\n CHECK(length(affected_ref) BETWEEN 1 AND 256 AND substr(affected_ref,1,1) GLOB '[A-Za-z0-9]' AND affected_ref NOT GLOB '*[^A-Za-z0-9._:/-]*'),\n CHECK(length(receiver_ref) BETWEEN 1 AND 256 AND substr(receiver_ref,1,1) GLOB '[A-Za-z0-9]' AND receiver_ref NOT GLOB '*[^A-Za-z0-9._:/-]*'),\n CHECK(length(target_ref) BETWEEN 1 AND 256 AND substr(target_ref,1,1) GLOB '[A-Za-z0-9]' AND target_ref NOT GLOB '*[^A-Za-z0-9._:/-]*'),\n CHECK(substr(event_digest,1,7)='sha256:' AND length(event_digest)=71 AND substr(event_digest,8) NOT GLOB '*[^0-9a-f]*'),\n CHECK(strftime('%Y-%m-%dT%H:%M:%fZ',created_at) IS created_at)\n)",
+  financial_source_registration_shape:
+    "CREATE TRIGGER financial_source_registration_shape BEFORE INSERT ON financial_source_registrations\nWHEN ((json_type(NEW.registration_json) IS 'object' AND (SELECT count(*) FROM json_each(NEW.registration_json))=4 AND json_extract(NEW.registration_json,'$.registrationRef') IS NEW.registration_ref AND json_extract(NEW.registration_json,'$.incarnation') IS NEW.incarnation AND json_extract(NEW.registration_json,'$.genesisDigest') IS NEW.genesis_digest) AND (json_type(NEW.registration_json,'$.receivers') IS 'array' AND json_array_length(NEW.registration_json,'$.receivers') BETWEEN 1 AND 8 AND (SELECT count(DISTINCT json_extract(value,'$.receiverRef')) FROM json_each(NEW.registration_json,'$.receivers'))=json_array_length(NEW.registration_json,'$.receivers') AND NOT EXISTS(SELECT 1 FROM json_each(NEW.registration_json,'$.receivers') AS member WHERE json_type(member.value) IS NOT 'object' OR (SELECT count(*) FROM json_each(member.value))<>2 OR json_type(member.value,'$.receiverRef') IS NOT 'text' OR json_type(member.value,'$.targetRef') IS NOT 'text') AND EXISTS(SELECT 1 FROM json_each(NEW.registration_json,'$.receivers') WHERE json_extract(value,'$.receiverRef') IS NEW.receiver_ref AND json_extract(value,'$.targetRef') IS NEW.target_ref)) AND (json_type(NEW.registration_json,'$.registrationRef') IS 'text' AND json_type(NEW.registration_json,'$.incarnation') IS 'text' AND json_type(NEW.registration_json,'$.genesisDigest') IS 'text' AND NEW.retired_at IS NULL AND NEW.retirement_ref IS NULL)) IS NOT 1 BEGIN\n SELECT RAISE(ABORT,'constraint: source enrollment closed tuple');\nEND",
+  financial_source_registration_retire_only:
+    "CREATE TRIGGER financial_source_registration_retire_only BEFORE UPDATE ON financial_source_registrations\nWHEN ((NEW.registration_ref IS OLD.registration_ref AND NEW.incarnation IS OLD.incarnation AND NEW.receiver_ref IS OLD.receiver_ref AND NEW.target_ref IS OLD.target_ref AND NEW.genesis_digest IS OLD.genesis_digest) AND (NEW.registration_digest IS OLD.registration_digest AND NEW.registration_json IS OLD.registration_json AND NEW.qualification_ref IS OLD.qualification_ref AND NEW.registered_at IS OLD.registered_at)) IS NOT 1\n OR OLD.retired_at IS NOT NULL OR NEW.retired_at IS NULL OR NEW.retirement_ref IS NULL BEGIN\n SELECT RAISE(ABORT,'constraint: source registration immutable or retirement terminal');\nEND",
+  financial_source_head_genesis:
+    "CREATE TRIGGER financial_source_head_genesis BEFORE INSERT ON financial_source_heads\nWHEN NEW.sequence<>0 OR NEW.last_event_ref IS NOT NULL OR NEW.state<>'active'\n OR NOT EXISTS(SELECT 1 FROM financial_source_registrations r\n  WHERE r.registration_ref=NEW.registration_ref AND r.incarnation=NEW.incarnation\n   AND r.retired_at IS NULL AND r.genesis_digest=NEW.event_digest) BEGIN\n SELECT RAISE(ABORT,'constraint: explicit enrolled genesis required');\nEND",
+  financial_source_event_predecessor:
+    "CREATE TRIGGER financial_source_event_predecessor BEFORE INSERT ON financial_source_events\nWHEN NOT EXISTS(SELECT 1 FROM financial_source_registrations r\n JOIN financial_source_heads h ON h.registration_ref=r.registration_ref AND h.incarnation=r.incarnation\n WHERE ((r.registration_ref IS NEW.registration_ref AND r.incarnation IS NEW.incarnation AND r.retired_at IS NULL AND h.affected_ref IS NEW.affected_ref AND h.state IS 'active') AND (h.sequence=NEW.sequence-1 AND h.event_digest IS NEW.previous_digest AND json_type(NEW.event_json) IS 'object' AND (SELECT count(*) FROM json_each(NEW.event_json))=9 AND json_extract(NEW.event_json,'$.v') IS 1) AND (json_type(NEW.event_json,'$.v') IS 'integer' AND json_extract(NEW.event_json,'$.eventRef') IS NEW.event_ref AND json_extract(NEW.event_json,'$.registrationRef') IS NEW.registration_ref AND json_extract(NEW.event_json,'$.incarnation') IS NEW.incarnation AND json_extract(NEW.event_json,'$.affectedRef') IS NEW.affected_ref) AND (json_extract(NEW.event_json,'$.sequence') IS NEW.sequence AND json_extract(NEW.event_json,'$.previousDigest') IS NEW.previous_digest AND json_extract(NEW.event_json,'$.kind') IS NEW.kind AND json_extract(NEW.event_json,'$.evidenceRef') IS NEW.evidence_ref AND json_type(NEW.event_json,'$.sequence') IS 'integer') AND (json_type(NEW.event_json,'$.eventRef') IS 'text' AND json_type(NEW.event_json,'$.registrationRef') IS 'text' AND json_type(NEW.event_json,'$.incarnation') IS 'text' AND json_type(NEW.event_json,'$.affectedRef') IS 'text' AND json_type(NEW.event_json,'$.previousDigest') IS 'text') AND (json_type(NEW.event_json,'$.kind') IS 'text' AND json_type(NEW.event_json,'$.evidenceRef') IS 'text'))) BEGIN\n SELECT RAISE(ABORT,'constraint: source event original predecessor or closed tuple');\nEND",
+  financial_source_head_advance:
+    "CREATE TRIGGER financial_source_head_advance BEFORE UPDATE ON financial_source_heads\nWHEN ((NEW.registration_ref IS OLD.registration_ref AND NEW.incarnation IS OLD.incarnation AND NEW.affected_ref IS OLD.affected_ref AND NEW.genesis_qualification_ref IS OLD.genesis_qualification_ref AND NEW.created_at IS OLD.created_at)) IS NOT 1\n OR OLD.state<>'active' OR NEW.sequence<>OLD.sequence+1\n OR NOT EXISTS(SELECT 1 FROM financial_source_events e JOIN financial_source_registrations r\n  ON r.registration_ref=e.registration_ref AND r.incarnation=e.incarnation\n WHERE ((e.event_ref IS NEW.last_event_ref AND e.registration_ref IS NEW.registration_ref AND e.incarnation IS NEW.incarnation AND e.affected_ref IS NEW.affected_ref AND e.sequence IS NEW.sequence) AND (e.previous_digest IS OLD.event_digest AND e.event_digest IS NEW.event_digest AND r.retired_at IS NULL AND NEW.state IS CASE e.kind WHEN 'close' THEN 'closed' ELSE 'active' END))) BEGIN\n SELECT RAISE(ABORT,'constraint: source head exact one-step monotonic transition');\nEND",
+  financial_source_receipt_match:
+    "CREATE TRIGGER financial_source_receipt_match BEFORE INSERT ON financial_source_receipts\nWHEN NOT EXISTS(SELECT 1 FROM financial_source_events e\n JOIN financial_source_heads h ON h.registration_ref=e.registration_ref AND h.incarnation=e.incarnation AND h.affected_ref=e.affected_ref\n JOIN financial_source_registrations r ON r.registration_ref=e.registration_ref AND r.incarnation=e.incarnation\n WHERE ((e.event_ref IS NEW.event_ref AND e.registration_ref IS NEW.registration_ref AND e.incarnation IS NEW.incarnation AND e.affected_ref IS NEW.affected_ref AND e.sequence IS NEW.sequence) AND (e.event_digest IS NEW.event_digest AND r.receiver_ref IS NEW.receiver_ref AND r.target_ref IS NEW.target_ref AND r.retired_at IS NULL AND h.sequence IS e.sequence) AND (h.last_event_ref IS e.event_ref AND h.event_digest IS e.event_digest AND h.state IS CASE e.kind WHEN 'close' THEN 'closed' ELSE 'active' END AND NEW.state IS CASE e.kind WHEN 'close' THEN 'admission-closed' ELSE 'advanced' END AND json_type(NEW.receipt_json) IS 'object') AND ((SELECT count(*) FROM json_each(NEW.receipt_json))=7 AND json_extract(NEW.receipt_json,'$.v') IS 1 AND json_type(NEW.receipt_json,'$.v') IS 'integer' AND json_extract(NEW.receipt_json,'$.eventRef') IS NEW.event_ref AND json_extract(NEW.receipt_json,'$.eventDigest') IS NEW.event_digest) AND (json_extract(NEW.receipt_json,'$.receiptRef') IS NEW.receipt_ref AND json_extract(NEW.receipt_json,'$.incarnation') IS NEW.incarnation AND json_extract(NEW.receipt_json,'$.sequence') IS NEW.sequence AND json_extract(NEW.receipt_json,'$.state') IS NEW.state AND json_type(NEW.receipt_json,'$.sequence') IS 'integer') AND (json_type(NEW.receipt_json,'$.eventRef') IS 'text' AND json_type(NEW.receipt_json,'$.eventDigest') IS 'text' AND json_type(NEW.receipt_json,'$.receiptRef') IS 'text' AND json_type(NEW.receipt_json,'$.incarnation') IS 'text' AND json_type(NEW.receipt_json,'$.state') IS 'text'))) BEGIN\n SELECT RAISE(ABORT,'constraint: source receipt exact committed event and head');\nEND",
+  financial_source_registrations_no_replace:
+    "CREATE TRIGGER financial_source_registrations_no_replace BEFORE INSERT ON financial_source_registrations\nWHEN EXISTS(SELECT 1 FROM financial_source_registrations WHERE registration_ref IS NEW.registration_ref AND (incarnation IS NEW.incarnation OR retired_at IS NULL)) BEGIN\n SELECT RAISE(ABORT,'constraint: retained source row replacement');\nEND",
+  financial_source_registrations_no_delete:
+    "CREATE TRIGGER financial_source_registrations_no_delete BEFORE DELETE ON financial_source_registrations BEGIN\n SELECT RAISE(ABORT,'constraint: retained source row deletion');\nEND",
+  financial_source_heads_no_replace:
+    "CREATE TRIGGER financial_source_heads_no_replace BEFORE INSERT ON financial_source_heads\nWHEN EXISTS(SELECT 1 FROM financial_source_heads WHERE registration_ref IS NEW.registration_ref AND incarnation IS NEW.incarnation AND affected_ref IS NEW.affected_ref) BEGIN\n SELECT RAISE(ABORT,'constraint: retained source row replacement');\nEND",
+  financial_source_heads_no_delete:
+    "CREATE TRIGGER financial_source_heads_no_delete BEFORE DELETE ON financial_source_heads BEGIN\n SELECT RAISE(ABORT,'constraint: retained source row deletion');\nEND",
+  financial_source_events_no_replace:
+    "CREATE TRIGGER financial_source_events_no_replace BEFORE INSERT ON financial_source_events\nWHEN EXISTS(SELECT 1 FROM financial_source_events WHERE event_ref IS NEW.event_ref OR (registration_ref IS NEW.registration_ref AND incarnation IS NEW.incarnation AND affected_ref IS NEW.affected_ref AND sequence IS NEW.sequence)) BEGIN\n SELECT RAISE(ABORT,'constraint: retained source row replacement');\nEND",
+  financial_source_events_no_delete:
+    "CREATE TRIGGER financial_source_events_no_delete BEFORE DELETE ON financial_source_events BEGIN\n SELECT RAISE(ABORT,'constraint: retained source row deletion');\nEND",
+  financial_source_events_no_update:
+    "CREATE TRIGGER financial_source_events_no_update BEFORE UPDATE ON financial_source_events BEGIN\n SELECT RAISE(ABORT,'constraint: immutable source event or receipt');\nEND",
+  financial_source_receipts_no_replace:
+    "CREATE TRIGGER financial_source_receipts_no_replace BEFORE INSERT ON financial_source_receipts\nWHEN EXISTS(SELECT 1 FROM financial_source_receipts WHERE event_ref IS NEW.event_ref OR receipt_ref IS NEW.receipt_ref) BEGIN\n SELECT RAISE(ABORT,'constraint: retained source row replacement');\nEND",
+  financial_source_receipts_no_delete:
+    "CREATE TRIGGER financial_source_receipts_no_delete BEFORE DELETE ON financial_source_receipts BEGIN\n SELECT RAISE(ABORT,'constraint: retained source row deletion');\nEND",
+  financial_source_receipts_no_update:
+    "CREATE TRIGGER financial_source_receipts_no_update BEFORE UPDATE ON financial_source_receipts BEGIN\n SELECT RAISE(ABORT,'constraint: immutable source event or receipt');\nEND",
+  financial_source_registrations_one_active:
+    "CREATE UNIQUE INDEX financial_source_registrations_one_active\n ON financial_source_registrations(registration_ref) WHERE retired_at IS NULL",
+});
 
 /** Exact R1 custody core, byte-identical to the retained R1 candidate rows that
  * readyHistorySchema digests (R1_SCHEMA_DIGEST). */
@@ -120,7 +168,7 @@ const CONSENT_SCHEMA: Readonly<Record<string, string>> = Object.freeze({
 });
 
 export interface Financial0104Object {
-  readonly type: "table" | "trigger";
+  readonly type: "table" | "trigger" | "index";
   readonly name: string;
   readonly tbl_name: string;
   readonly sql: string;
@@ -129,19 +177,30 @@ export interface Financial0104Object {
 function objects(schema: Readonly<Record<string, string>>): readonly Financial0104Object[] {
   return Object.entries(schema).map(([name, sql]) => {
     const match =
-      /^CREATE (TABLE|TRIGGER) ([A-Za-z0-9_]+)\b(?:[^\n]*?\bON ([A-Za-z0-9_]+)\b)?/u.exec(sql);
+      /^CREATE (TABLE|TRIGGER|UNIQUE INDEX) ([A-Za-z0-9_]+)\b(?:[\s\S]*?\bON ([A-Za-z0-9_]+)\b)?/u.exec(
+        sql,
+      );
     const type =
-      match?.[1] === "TABLE" ? "table" : match?.[1] === "TRIGGER" ? "trigger" : undefined;
+      match?.[1] === "TABLE"
+        ? "table"
+        : match?.[1] === "TRIGGER"
+          ? "trigger"
+          : match?.[1] === "UNIQUE INDEX"
+            ? "index"
+            : undefined;
     const table = type === "table" ? match?.[2] : match?.[3];
     if (!type || match?.[2] !== name || table === undefined)
-      throw new TypeError("Financial 0104 object is not one closed table/trigger");
+      throw new TypeError("Financial 0104 object is not one closed table/trigger/index");
     return Object.freeze({ type, name, tbl_name: table, sql });
   });
 }
 
-/** Source order: C0/M, G, their fences; R1 with its fences; R1 attempt leaf;
- * consent with its fences. Each table precedes every trigger on it. */
+/** Source order: receivers and their fences; C0/M, G, their fences; R1 with its
+ * fences; R1 attempt leaf; consent with its fences. Each table precedes every
+ * trigger or index on it. */
 export const FINANCIAL_0104_OBJECTS: readonly Financial0104Object[] = Object.freeze([
+  ...objects(RECEIVER_SCHEMA),
+  ...objects(FINANCIAL_0104_RECEIVER_FENCE_SCHEMA),
   ...objects(FINANCIAL_SOURCE_ENROLLMENT_SCHEMA),
   ...objects(FINANCIAL_GENESIS_SCHEMA),
   ...objects(FINANCIAL_0104_C0_FENCE_SCHEMA),
@@ -156,11 +215,20 @@ export const FINANCIAL_0104_TABLES: readonly string[] = Object.freeze(
   FINANCIAL_0104_OBJECTS.filter((o) => o.type === "table").map((o) => o.name),
 );
 
-/** One money fence trigger per 0104 table, keyed by table. */
+/** The INSERT money fence of every 0104 table, keyed by table. */
 export const FINANCIAL_0104_MONEY_FENCES: Readonly<Record<string, string>> = Object.freeze(
   Object.fromEntries(
     FINANCIAL_0104_OBJECTS.filter(
       (o) => o.type === "trigger" && o.name === `${o.tbl_name}_money_fence`,
+    ).map((o) => [o.tbl_name, o.name]),
+  ),
+);
+
+/** The UPDATE money fence of each 0104 table that admits an UPDATE at all. */
+export const FINANCIAL_0104_MONEY_UPDATE_FENCES: Readonly<Record<string, string>> = Object.freeze(
+  Object.fromEntries(
+    FINANCIAL_0104_OBJECTS.filter(
+      (o) => o.type === "trigger" && o.name === `${o.tbl_name}_money_fence_update`,
     ).map((o) => [o.tbl_name, o.name]),
   ),
 );
