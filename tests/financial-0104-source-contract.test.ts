@@ -1,7 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createAuth103CanonicalSourceArtifacts } from "../scripts/deploy/auth103-canonical-recipes.ts";
@@ -90,9 +90,18 @@ type SchemaRow = { type: string; name: string; tbl_name: string; sql: string };
 const byName = (a: { name: string }, b: { name: string }) =>
   a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
 
-/** Exact 0100 prefix, then Root's own canonical 0101-0103 recipe bytes. */
+/** Exact 0100 prefix, then Root's own canonical 0101-0103 recipe bytes. The
+ * state is built once per profile and copied for each caller. */
 function at0103(path = ":memory:", options: { readonly money?: boolean } = {}): Database {
-  const db = new Database(path);
+  const key = options.money === false ? "plain" : "money";
+  const image = (at0103Images[key] ??= at0103Built(key === "money"));
+  if (path === ":memory:") return Database.deserialize(image);
+  writeFileSync(path, image, { flag: "wx", mode: 0o600 });
+  return new Database(path);
+}
+const at0103Images: { money?: Uint8Array; plain?: Uint8Array } = {};
+function at0103Built(money: boolean): Uint8Array {
+  const db = new Database(":memory:");
   const prefix = MIGRATIONS.filter(({ name }) => Number(name.slice(0, 4)) <= 100);
   expect(prefix).toHaveLength(100);
   for (const migration of prefix) db.exec(migration.sql);
@@ -101,12 +110,15 @@ function at0103(path = ":memory:", options: { readonly money?: boolean } = {}): 
   for (const file of recipes.files) db.exec(file.sql);
   // Root/Money's existing cutover guard rows; not part of the Financial body.
   // `money: false` keeps the pre-cutover / self-host shape without them.
-  if (options.money === false) return db;
-  db.exec(MONEY_CUTOVER_FREEZE_DDL);
-  db.exec(MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL);
-  db.exec(MONEY_CUTOVER_PERMIT_DDL);
-  db.exec(MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL);
-  return db;
+  if (money) {
+    db.exec(MONEY_CUTOVER_FREEZE_DDL);
+    db.exec(MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL);
+    db.exec(MONEY_CUTOVER_PERMIT_DDL);
+    db.exec(MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL);
+  }
+  const image = db.serialize();
+  db.close();
+  return image;
 }
 function schemaRows(db: Database, tables: readonly string[]): SchemaRow[] {
   return (
