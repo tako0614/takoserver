@@ -1051,6 +1051,17 @@ bun run fmt       # the only thing that rewrites source
 
 `bun run check` is the gate. It is read-only and it does not skip.
 
+Its test step (`bun run test`, `scripts/run-tests.ts`) runs every test file in
+parallel worker processes. Each file gets its own
+global scope and module registry, so a module mock in one file cannot reach
+another. The step fails unless Bun's summary covers every test file.
+`TAKOSERVER_TEST_WORKERS` sets the worker count (the default is half the CPUs,
+leaving room for the workerd and Miniflare processes the tests start),
+and `tests/test-timings.json` only orders the files, slowest first. Fixtures
+that need a migrated SQLite database copy one built once per process from the
+real migration chain (`tests/helpers/migrated-database.ts`), instead of
+replaying the chain for every test.
+
 A green gate is not a rollout. `bun run check` and local native evidence do not
 show that any deployment works: not a self-host's public TLS and DNS, not the
 hosted service's D1 or Workers for Platforms, and not adoption by downstream

@@ -1,11 +1,11 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 import type { InstalledTakoformForm, TakoformHost } from "../src/takoform/types.ts";
 import { createConfiguredHistoricalTakoformHost } from "./helpers/historical-takoform-host.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const ORIGIN = "https://module-worker-delete-regression.invalid";
 const LANE = "/apis/forms.takoform.com/v1beta4";
@@ -133,8 +133,7 @@ async function deferredDeleteFixture(
   idempotencyKey: string,
   extraHeaders: Record<string, string> = {},
 ): Promise<DeferredDeleteFixture> {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   const deleteCalls = { count: 0 };
   const host = createHost(database, deleteCalls);
   const resource = {

@@ -29,6 +29,7 @@ import {
   createV2QueueDelivery,
   v2QueueId,
 } from "../src/takoform-v2/worker-queue-delivery.ts";
+import { migratedDatabase, writeMigratedDatabaseFile } from "./helpers/migrated-database.ts";
 
 const principal = "queue-scheduler-principal";
 const space = "default";
@@ -288,9 +289,9 @@ async function acceptedConsumer(database: Database) {
 test("accepted active Consumer is rediscovered from durable SQL after restart", async () => {
   const root = mkdtempSync(join(tmpdir(), "v2-queue-scheduler-"));
   const path = join(root, "state.sqlite");
+  writeMigratedDatabaseFile(path);
   let database = new Database(path);
   try {
-    for (const migration of MIGRATIONS) database.exec(migration.sql);
     const accepted = await acceptedConsumer(database);
     const visited: string[] = [];
     const composition = {
@@ -325,9 +326,8 @@ test("accepted active Consumer is rediscovered from durable SQL after restart", 
 });
 
 test("real Queue delivery cannot claim before the native owner restore completes", async () => {
-  const database = new Database(":memory:");
+  const database = migratedDatabase();
   try {
-    for (const migration of MIGRATIONS) database.exec(migration.sql);
     const accepted = await acceptedConsumer(database);
     let releaseRestore!: (uids: readonly string[]) => void;
     const restore = new Promise<readonly string[]>((resolve) => {
@@ -364,9 +364,8 @@ test("real Queue delivery cannot claim before the native owner restore completes
 });
 
 test("worker-wide recovery retains its 32-row cursor across scheduler ticks", async () => {
-  const database = new Database(":memory:");
+  const database = migratedDatabase();
   try {
-    for (const migration of MIGRATIONS) database.exec(migration.sql);
     const accepted = await acceptedConsumer(database);
     const cursors: (string | undefined)[] = [];
     const sql = {
@@ -405,9 +404,8 @@ test("worker-wide recovery retains its 32-row cursor across scheduler ticks", as
 });
 
 test("Worker scheduler retains synchronously before native delivery and refuses safely", async () => {
-  const database = new Database(":memory:");
+  const database = migratedDatabase();
   try {
-    for (const migration of MIGRATIONS) database.exec(migration.sql);
     const accepted = await acceptedConsumer(database);
     const sql = accepted.sql;
     const custody = createQueueCustody({ sql });
@@ -478,9 +476,9 @@ test("Worker scheduler retains synchronously before native delivery and refuses 
 test("a persisted send-authorized slot prevents a second send after SQL handle restart", async () => {
   const root = mkdtempSync(join(tmpdir(), "v2-queue-authorized-restart-"));
   const path = join(root, "state.sqlite");
+  writeMigratedDatabaseFile(path);
   let database = new Database(path);
   try {
-    for (const migration of MIGRATIONS) database.exec(migration.sql);
     const accepted = await acceptedConsumer(database);
     const custody = createQueueCustody({ sql: accepted.sql });
     await custody.admit(
@@ -559,9 +557,8 @@ test("a persisted send-authorized slot prevents a second send after SQL handle r
 });
 
 test("one Consumer is not re-sent while its native handler remains in flight", async () => {
-  const database = new Database(":memory:");
+  const database = migratedDatabase();
   try {
-    for (const migration of MIGRATIONS) database.exec(migration.sql);
     const accepted = await acceptedConsumer(database);
     let entered = 0;
     let release!: () => void;
@@ -602,9 +599,8 @@ test("one Consumer is not re-sent while its native handler remains in flight", a
 });
 
 test("one indefinitely running Consumer cannot block a later SQL page or scheduler stop", async () => {
-  const database = new Database(":memory:");
+  const database = migratedDatabase();
   try {
-    for (const migration of MIGRATIONS) database.exec(migration.sql);
     const first = await acceptedConsumer(database);
     const consumerUids = [first.consumerUid];
     for (let index = 1; index < 17; index += 1) {
@@ -666,9 +662,8 @@ test("one indefinitely running Consumer cannot block a later SQL page or schedul
 
 for (const copiedOutcome of ["ack", "retry"] as const)
   test(`a copied DLQ message already ${copiedOutcome === "ack" ? "ACKed" : "retried"} by its exact native batch releases the source notice`, async () => {
-    const database = new Database(":memory:");
+    const database = migratedDatabase();
     try {
-      for (const migration of MIGRATIONS) database.exec(migration.sql);
       const accepted = await acceptedConsumer(database);
       const sourceQueueUid = await accepted.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "receipt-source", {
         messageRetentionSeconds: 3_600,
@@ -823,9 +818,9 @@ for (const copiedOutcome of ["ack", "retry"] as const)
 test("dead-letter notice stays pending without a verified active target wake, then ACKs exact token", async () => {
   const root = mkdtempSync(join(tmpdir(), "v2-queue-notice-"));
   const path = join(root, "state.sqlite");
+  writeMigratedDatabaseFile(path);
   let database = new Database(path);
   try {
-    for (const migration of MIGRATIONS) database.exec(migration.sql);
     const accepted = await acceptedConsumer(database);
     const sourceQueueUid = await accepted.create(AT_LEAST_ONCE_QUEUE_FORM_URL, "source-queue", {
       messageRetentionSeconds: 3_600,

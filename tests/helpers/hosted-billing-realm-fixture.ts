@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { MIGRATIONS } from "../../src/db-schema.ts";
 import type { Sql } from "../../src/ports.ts";
 import { createSqliteSql } from "../../src/sql-sqlite.ts";
+import { databaseAfter } from "./migrated-database.ts";
 
 export const HOSTED_BILLING_REALM_TEST_INSTANT = "2026-10-15T00:00:00.000Z";
 
@@ -33,9 +34,8 @@ export async function createHostedBillingRealmTestDatabase(
   readonly db: Database;
   readonly sql: Sql;
 }> {
-  const db = new Database(":memory:");
+  const db = databaseAfter(await hostedBillingRealmTestMigrations());
   try {
-    for (const migration of await hostedBillingRealmTestMigrations()) db.exec(migration);
     const sql = createSqliteSql(db);
     if (input.mode !== null)
       await sql.run("INSERT INTO stripe_mode_realm VALUES (1, ?, ?)", [

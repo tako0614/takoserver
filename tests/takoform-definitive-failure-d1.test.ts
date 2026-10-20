@@ -721,11 +721,10 @@ async function call(
 async function applyMigrations(
   database: Awaited<ReturnType<Miniflare["getD1Database"]>>,
 ): Promise<void> {
-  for (const migration of MIGRATIONS) {
-    for (const statement of splitMigration(migration.sql)) {
-      await database.prepare(statement).run();
-    }
-  }
+  for (const migration of MIGRATIONS)
+    await database.batch(
+      splitMigration(migration.sql).map((statement) => database.prepare(statement)),
+    );
 }
 
 function splitMigration(source: string): readonly string[] {

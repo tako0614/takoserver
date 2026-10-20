@@ -1,11 +1,11 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { createAccounts, createAccountsWithUnregisteredLocalIssuer } from "../src/auth.ts";
 import { additiveAuthTokenDDL } from "../src/auth-authority-schema-plan.ts";
-import { MIGRATIONS } from "../src/db-schema.ts";
 import { resolveIdentity } from "../src/identity-setup.ts";
 import { base64UrlEncode } from "../src/json.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { migratedDatabase } from "./helpers/migrated-database.ts";
 
 const audience = "https://local-issuer.example.test";
 const opened = new Set<Database>();
@@ -15,9 +15,8 @@ afterEach(() => {
 });
 
 async function canonicalFixture() {
-  const db = new Database(":memory:");
+  const db = migratedDatabase();
   opened.add(db);
-  for (const migration of MIGRATIONS) db.exec(migration.sql);
   const hasSharedAuthSessions = () =>
     db
       .query("SELECT name FROM sqlite_master WHERE type='table' AND name='shared_auth_sessions'")

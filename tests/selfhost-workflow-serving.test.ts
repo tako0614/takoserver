@@ -1,9 +1,7 @@
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { chmod, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { canonicalJson } from "../src/json.ts";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { Sql } from "../src/ports.ts";
 import { selfhostVersionBindingsRoot } from "../src/providers/selfhost.ts";
 import {
@@ -25,6 +23,7 @@ import type { WorkerdWorkflowForwardBinding } from "../src/workerd-runtime.ts";
 import { createWorkflowInstances } from "../src/workflow-instances.ts";
 import { createWorkflowResourceGraphReader } from "../src/workflow-resource-graph.ts";
 import { createWorkflowResourceDeletionContribution } from "../src/workflow-resource-lifecycle.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 import { mkdtempForSockets } from "./helpers/socket-temp-root.ts";
 
 const NOW = Date.UTC(2026, 9, 4);
@@ -79,8 +78,7 @@ async function fixture(
   );
   const socketParent = join(root, "sockets");
   await chmod(root, 0o700);
-  const db = new Database(":memory:");
-  migrateSqlite(db);
+  const db = migrateSqliteDatabase();
   const base = createSqliteSql(db);
   const sql: Sql = holdCreate
     ? {

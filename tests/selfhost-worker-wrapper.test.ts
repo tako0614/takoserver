@@ -5,7 +5,6 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import {
   SELFHOST_WORKER_DATA_PLANE_BINDING,
   SELFHOST_WORKER_DATA_SERVICE_MODULE,
@@ -79,6 +78,7 @@ import {
   OBJECT_BUCKET_KNOWN_LENGTH_FORM_URL,
   type ObjectBucketBindingForm,
 } from "../src/takoform-v2/forms/object-bucket-binding-profile.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 /**
  * The generated entrypoint is the only thing standing between a tenant's module
@@ -2525,8 +2525,7 @@ test("generated ObjectBucket guards enforce actual byte ceilings before a discar
 
 test("generic ObjectBucket unknown-length HTTP streams reach the filesystem through the generated data service", async () => {
   const root = await mkdtemp(join(tmpdir(), "takoserver-selfhost-object-chain-"));
-  const control = new Database(":memory:");
-  migrateSqlite(control);
+  const control = migrateSqliteDatabase();
   const planes = serveSelfhostDataPlanes({
     sql: createSqliteSql(control),
     grant: async (script, versionId) =>

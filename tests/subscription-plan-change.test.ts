@@ -1,6 +1,4 @@
-import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { MIGRATIONS } from "../src/db-schema.ts";
 import { canonicalJson } from "../src/json.ts";
 import { type Sql, SqlError } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
@@ -15,6 +13,7 @@ import {
   type SubscriptionPlanCustody,
   type SubscriptionPlanTarget,
 } from "../src/stripe-subscription-plan-change.ts";
+import { migratedDatabase } from "./helpers/migrated-database.ts";
 
 const START = "2026-10-01T00:00:00.000Z";
 const NEXT = "2026-11-01T00:00:00.000Z";
@@ -70,8 +69,7 @@ async function fixture(
   } = {},
 ) {
   const calendar = input.calendar ?? { start: START, end: NEXT, next: AFTER, now: NOW };
-  const db = new Database(":memory:");
-  for (const migration of MIGRATIONS) db.exec(migration.sql);
+  const db = migratedDatabase();
   // The forward schema is deliberately required. An operator-private draft can
   // be injected while the reserved #342 prefix is awaiting owner integration.
   const schema =

@@ -1,9 +1,7 @@
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { Miniflare } from "miniflare";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { canonicalJson } from "../src/json.ts";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import {
@@ -13,10 +11,10 @@ import {
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import type { V2Execution } from "../src/takoform-v2/types.ts";
 import { createWorkerPublicationSqlGuard } from "../src/takoform-v2/worker-publication-sql-guard.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 function fixture() {
-  const db = new Database(":memory:");
-  migrateSqlite(db);
+  const db = migrateSqliteDatabase();
   const sql = createSqliteSql(db);
   const workerUid = "worker-1";
   const spec = { worker: { resourceUid: workerUid }, versions: [] };

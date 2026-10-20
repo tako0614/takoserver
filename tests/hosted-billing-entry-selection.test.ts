@@ -5,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import sharedPricing from "../config/shared-hosted-pricing.json";
 import { createAccounts } from "../src/auth.ts";
-import { MIGRATIONS } from "../src/db-schema.ts";
 import {
   createWorkerEntry,
   type WorkerEnv,
@@ -14,9 +13,9 @@ import {
 } from "../src/entry-worker.ts";
 import { HostedBillingRealmError } from "../src/hosted-billing-realm.ts";
 import { compilePricingAuthoring } from "../src/hosted-pricing.ts";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { SqlParam } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { migratedDatabase, writeMigrateSqliteFile } from "./helpers/migrated-database.ts";
 
 const ORIGIN = "https://api.integration.example.test";
 const ACCOUNT = "acct_entrySelection";
@@ -96,8 +95,7 @@ const onDemandConfiguration = {
 };
 
 function fixture(options: { accountPin?: boolean; modePin?: boolean; schemaCount?: number } = {}) {
-  const db = new Database(":memory:");
-  for (const migration of MIGRATIONS.slice(0, options.schemaCount)) db.exec(migration.sql);
+  const db = migratedDatabase(options.schemaCount);
   if (options.modePin !== false)
     db.exec("INSERT INTO stripe_mode_realm VALUES (1, 'test', '2026-10-15T00:00:00.000Z')");
   if (
@@ -652,8 +650,8 @@ test.each(["qualified", "qualified-on-demand", "foreign-account"] as const)(
   async (scenario) => {
     const root = mkdtempSync(join(tmpdir(), "hosted-billing-entry-selection-"));
     const databasePath = join(root, "control.sqlite");
+    writeMigrateSqliteFile(databasePath);
     const database = new Database(databasePath);
-    migrateSqlite(database);
     database.exec("INSERT INTO stripe_mode_realm VALUES (1, 'test', '2026-10-15T00:00:00.000Z')");
     database
       .query(

@@ -6,7 +6,6 @@ import { join } from "node:path";
 import { runSelfhostFormAdmission } from "../scripts/selfhost-form-admission.ts";
 import { createActorResourceGraphReader } from "../src/actor-resource-graph.ts";
 import { createAppResourceStoreBundle } from "../src/app.ts";
-import { MIGRATIONS } from "../src/db-schema.ts";
 import { buildEdgeForms } from "../src/edge-forms.ts";
 import { canonicalDigest, canonicalJson } from "../src/json.ts";
 import { createFileObjectStore } from "../src/objects-fs.ts";
@@ -35,6 +34,7 @@ import {
   yurucommuLifecycleCapabilityManifest,
 } from "../src/takoform/implementation-catalog.ts";
 import { createWorkerdRuntime } from "../src/workerd-runtime.ts";
+import { migratedDatabase, writeMigratedDatabaseFile } from "./helpers/migrated-database.ts";
 import { createSyntheticPublisherSetVerifier } from "./helpers/synthetic-publisher-set-verifier.ts";
 
 const SELFHOST_CAPABILITIES = yurucommuLifecycleCapabilityManifest(
@@ -72,8 +72,8 @@ describe("self-host Form admission CLI", () => {
   test("uses the running Host's configured database without opening the default", async () => {
     const root = mkdtempSync(join(tmpdir(), "tsa-cli-"));
     const databasePath = join(root, "custom.sqlite");
+    writeMigratedDatabaseFile(databasePath);
     const database = new Database(databasePath);
-    for (const migration of MIGRATIONS) database.exec(migration.sql);
     database.close();
     try {
       // The unreachable verifier keeps this a pre-admission probe. The CLI
@@ -119,9 +119,9 @@ describe("self-host Form admission CLI", () => {
       const targetRefJson = canonicalJson(lastActivated.formRef);
       const quoteSql = (value: string) => value.replaceAll("'", "''");
       const databasePath = join(root, "control.sqlite");
+      writeMigratedDatabaseFile(databasePath);
       const seed = new Database(databasePath);
       try {
-        for (const migration of MIGRATIONS) seed.exec(migration.sql);
         seed.exec(
           `CREATE TRIGGER fail_last_selfhost_activation
            BEFORE INSERT ON tf_form_activation_events
@@ -639,8 +639,7 @@ function dataRoot() {
   // These cases receive an SQL handle and never reopen a database file. Keep
   // the full SQLite schema and constraints without per-migration disk flushes;
   // the assertions cover admission authority/state, not filesystem durability.
-  const database = new Database(":memory:");
-  for (const migration of MIGRATIONS) database.exec(migration.sql);
+  const database = migratedDatabase();
   return {
     root,
     sql: createSqliteSql(database),

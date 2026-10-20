@@ -1,6 +1,5 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { MIGRATIONS } from "../src/db-schema.ts";
 import type { Sql } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { formKey } from "../src/takoform/forms.ts";
@@ -11,6 +10,7 @@ import type {
   TakoformStoredResource,
   TakoformV1Alpha3FormRef,
 } from "../src/takoform/types.ts";
+import { migratedDatabase } from "./helpers/migrated-database.ts";
 
 const TENANT_ID = "tenant-resource-relation-snapshot";
 const SPACE = "main";
@@ -115,8 +115,7 @@ function relationFor(
 }
 
 function openDatabase(): Database {
-  const database = new Database(":memory:");
-  for (const migration of MIGRATIONS) database.exec(migration.sql);
+  const database = migratedDatabase();
   return database;
 }
 

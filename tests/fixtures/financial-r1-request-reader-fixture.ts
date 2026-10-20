@@ -1,6 +1,4 @@
-import { Database } from "bun:sqlite";
 import { readFileSync } from "node:fs";
-import { MIGRATIONS } from "../../src/db-schema.ts";
 import { verifyHostedBillingFinancialRealm } from "../../src/hosted-billing-realm.ts";
 import { base64UrlEncode, bytesDigest, canonicalDigest, canonicalJson } from "../../src/json.ts";
 import {
@@ -31,6 +29,7 @@ import { FINANCIAL_SOURCE_GENESIS_DDL } from "../../src/shared-financial-source-
 import { createSqliteSql } from "../../src/sql-sqlite.ts";
 import { createStripeBillingClient } from "../../src/stripe-billing-client.ts";
 import { installFinancial0104Fences } from "../helpers/financial-0104-fenced.ts";
+import { migratedDatabase } from "../helpers/migrated-database.ts";
 
 // Copied isolated Financial custody fixture. Synthetic external Root bindings in
 // the dedicated test do not qualify genuine Auth origin, D1, or a mounted route.
@@ -135,8 +134,7 @@ function economic(action: SharedFinancialAction): SelectedEconomicR1 {
   }
 }
 export async function fixture() {
-  const db = new Database(":memory:");
-  for (const migration of MIGRATIONS) db.exec(migration.sql);
+  const db = migratedDatabase();
   db.exec(
     readFileSync(
       new URL("./shared-financial-source-component-schema.sql", import.meta.url),

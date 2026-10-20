@@ -24,6 +24,7 @@ import {
   type ObjectBucketStore,
 } from "../src/takoform-v2/forms/object-bucket-backend.ts";
 import type { V2Form } from "../src/takoform-v2/types.ts";
+import { writeMigrateSqliteFile } from "./helpers/migrated-database.ts";
 
 const OBJECT_BUCKET_REFERENCE_FORM_URL = "https://fixture.example/ObjectBucketReference/1.0.0/";
 
@@ -423,9 +424,9 @@ test("ObjectBucket refuses a second live process handle for an owned namespace",
   const root = await mkdtemp(join(tmpdir(), "takoserver-v2-object-bucket-process-owner-"));
   const databasePath = join(root, "control.sqlite");
   const objectsRoot = join(root, "objects");
+  writeMigrateSqliteFile(databasePath);
   const database = new Database(databasePath);
   try {
-    migrateSqlite(database);
     const sql = createSqliteSql(database);
     const identity = {
       targetKey: "selfhost-test-target",

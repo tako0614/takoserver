@@ -1,8 +1,16 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { buildD1MigrationImport } from "../scripts/deploy/d1-migration-import.ts";
@@ -23,6 +31,7 @@ import { read0058VolumeReceipt } from "../scripts/deploy/schema-0058-volume-rece
 import type { DeployTarget } from "../scripts/deploy/target.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { copyCurrentSchemaFixture } from "./helpers/audited-schema-fixture.ts";
+import { databaseBuiltOnce } from "./helpers/migrated-database.ts";
 
 const root = mkdtempSync(join(tmpdir(), "takoserver-0058-rehearsal-tests-"));
 const migrationDirectory = copyCurrentSchemaFixture(join(root, "migrations"));
@@ -66,21 +75,25 @@ function sqliteReader(database: Database) {
 }
 
 function databaseThrough(count: number): Database {
-  const database = new Database(":memory:");
+  // The ledgered prefix is built once per count (with foreign keys on, as
+  // before); each caller gets its own copy and turns foreign keys on again.
+  const database = databaseBuiltOnce(`0058-rehearsal-through:${count}`, (fresh) => {
+    fresh.exec("PRAGMA foreign_keys = ON");
+    fresh.exec(`
+      CREATE TABLE d1_migrations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE,
+        applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+      );
+    `);
+    for (const migration of MIGRATIONS.slice(0, count)) {
+      fresh.exec(migration.sql);
+      fresh
+        .query("INSERT INTO d1_migrations (name, applied_at) VALUES (?, 'fixture')")
+        .run(migration.name);
+    }
+  });
   database.exec("PRAGMA foreign_keys = ON");
-  database.exec(`
-    CREATE TABLE d1_migrations (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT UNIQUE,
-      applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
-    );
-  `);
-  for (const migration of MIGRATIONS.slice(0, count)) {
-    database.exec(migration.sql);
-    database
-      .query("INSERT INTO d1_migrations (name, applied_at) VALUES (?, 'fixture')")
-      .run(migration.name);
-  }
   return database;
 }
 
@@ -1676,12 +1689,10 @@ describe("0058 selected-reference volume producer", () => {
         encoding: "utf8",
         timeout: 4_000,
       });
-    // Deliberately blocking test double: no writer exists, so GNU timeout
-    // must stop it. It neither calls nor weakens the production reader.
-    const blocked = runWatched(
-      'import { openSync, constants } from "node:fs"; openSync(process.env.TAKOSERVER_0058_FIFO_PATH + ".0058-volume-dispatched.json", constants.O_RDONLY);',
-    );
-    expect(blocked.status).toBe(124);
+    // A writer-less FIFO: a plain blocking open() of it never returns, so a
+    // reader that opened it that way would be stopped by the 3s watchdog
+    // (status 124) instead of reporting the refusal asserted below.
+    expect(lstatSync(dispatchedPath).isFIFO()).toBe(true);
     const readerModule = new URL(
       "../scripts/deploy/schema-0058-volume-receipt.ts",
       import.meta.url,

@@ -1,7 +1,6 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { MIGRATIONS } from "../src/db-schema.ts";
 import { verifyHostedBillingFinancialRealm } from "../src/hosted-billing-realm.ts";
 import {
   createMoneyCutoverSql,
@@ -12,7 +11,6 @@ import {
 } from "../src/money-cutover-sql.ts";
 import { type Sql, SqlError, type SqlParam, type SqlStatement } from "../src/ports.ts";
 import { createSharedFinancialSourceReceiver } from "../src/shared-financial-source.ts";
-import { financialSourceReceiptRef } from "../src/shared-financial-source-abi.ts";
 import {
   canonicalFinancialSourceJson,
   type FinancialSourceEvent,
@@ -43,6 +41,7 @@ import {
   permitFramed,
   withMoneyFencesLifted,
 } from "./helpers/financial-0104-fenced.ts";
+import { migratedDatabase } from "./helpers/migrated-database.ts";
 
 const AT = "2026-10-15T00:00:00.000Z";
 const D = `sha256:${"a".repeat(64)}` as const,
@@ -1129,8 +1128,7 @@ describe("private historical Control G candidate", () => {
   });
 });
 async function fixture(options: { readonly unfenced?: boolean } = {}) {
-  const db = new Database(":memory:");
-  for (const m of MIGRATIONS) db.exec(m.sql);
+  const db = migratedDatabase();
   db.exec(
     readFileSync(
       new URL("./fixtures/shared-financial-source-component-schema.sql", import.meta.url),

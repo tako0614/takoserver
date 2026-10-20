@@ -1,4 +1,4 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { createAccounts } from "../src/auth.ts";
 import { additiveAuthFullRpDDL } from "../src/auth-authority-schema-plan.ts";
@@ -7,7 +7,6 @@ import {
   createCredentialAuthorityClassStore,
   type RpAuthorityIdentity,
 } from "../src/credential-authority-class.ts";
-import { MIGRATIONS } from "../src/db-schema.ts";
 import { resolveIdentity } from "../src/identity-setup.ts";
 import { base64UrlEncode } from "../src/json.ts";
 import type { SqlStatement } from "../src/ports.ts";
@@ -21,6 +20,7 @@ import {
   createSharedPrincipalAuthorityStore,
 } from "../src/shared-principal-authority.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { migratedDatabase } from "./helpers/migrated-database.ts";
 
 // Structural storage/lifecycle coverage only. bindLegacy inputs below are not
 // proof, and this test does not qualify a genuine RP verifier or issuer carrier.
@@ -32,9 +32,8 @@ afterEach(() => {
 });
 
 async function fixture() {
-  const db = new Database(":memory:");
+  const db = migratedDatabase();
   opened.add(db);
-  for (const migration of MIGRATIONS) db.exec(migration.sql);
   const hasRpSessions = () =>
     db
       .query("SELECT name FROM sqlite_master WHERE type='table' AND name='shared_auth_sessions'")

@@ -1,12 +1,10 @@
-import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createResourceDeploymentStore } from "../src/resource-deployments.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 function store() {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   return createResourceDeploymentStore(
     createSqliteSql(database),
     () => new Date(1_700_000_000_000),

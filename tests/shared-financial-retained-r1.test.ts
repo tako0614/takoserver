@@ -1,7 +1,6 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { MIGRATIONS } from "../src/db-schema.ts";
 import {
   assertHostedBillingFinancialRealm,
   verifyHostedBillingFinancialRealm,
@@ -41,6 +40,7 @@ import { FINANCIAL_SOURCE_GENESIS_DDL } from "../src/shared-financial-source-gen
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
 import { inPermitFrame, installFinancial0104Fences } from "./helpers/financial-0104-fenced.ts";
+import { migratedDatabase } from "./helpers/migrated-database.ts";
 
 const AT = "2026-10-15T00:00:00.000Z";
 const EPOCH = `sha256:${"c".repeat(64)}` as const;
@@ -143,8 +143,7 @@ function economic(action: SharedFinancialAction): SelectedEconomicR1 {
   }
 }
 async function fixture() {
-  const db = new Database(":memory:");
-  for (const migration of MIGRATIONS) db.exec(migration.sql);
+  const db = migratedDatabase();
   db.exec(
     readFileSync(
       new URL("./fixtures/shared-financial-source-component-schema.sql", import.meta.url),

@@ -140,8 +140,7 @@ test("missing pin schema fails closed", async () => {
 });
 
 test("a pin without the immutable schema cannot authorize financial serving", async () => {
-  const db = new Database(":memory:");
-  for (const migration of MIGRATIONS) db.exec(migration.sql);
+  const db = migratedDatabase();
   const sql = createSqliteSql(db);
   await claimFreshStripeModeRealm(sql, "live");
   db.exec("DROP TRIGGER stripe_mode_realm_no_delete");
@@ -152,8 +151,7 @@ test("a pin without the immutable schema cannot authorize financial serving", as
 });
 
 test("fresh claiming does not create a pin when the immutability trigger is absent", async () => {
-  const db = new Database(":memory:");
-  for (const migration of MIGRATIONS) db.exec(migration.sql);
+  const db = migratedDatabase();
   db.exec("DROP TRIGGER stripe_mode_realm_no_update");
   const sql = createSqliteSql(db);
   await expect(claimFreshStripeModeRealm(sql, "live")).rejects.toMatchObject({
@@ -1075,10 +1073,8 @@ const REALM_PIN_DATA_ORIGINAL_AT = new Date().toISOString();
 /** Capture canonical <=94 facts before applying the complete existing95-98 suffix.
  * This fixture never constructs an original native Root context or mode proof. */
 async function realmPinDraftFixture() {
-  const db = new Database(":memory:");
-  for (const migration of MIGRATIONS) {
-    if (migration.name.slice(0, 4) <= "0094") db.exec(migration.sql);
-  }
+  // MIGRATIONS 0001..0094 are exactly the first 94 entries.
+  const db = migratedDatabase(94);
   db.exec(MONEY_CUTOVER_FREEZE_DDL);
   db.exec(MONEY_CUTOVER_PERMIT_DDL);
   db.exec(MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL);
@@ -1642,6 +1638,7 @@ import {
   assertMoneyD1StripeRealmPinContributionCurrent,
   readMoneyD1StripeRealmPinContribution,
 } from "../scripts/deploy/stripe-mode-realm.ts";
+import { migratedDatabase } from "./helpers/migrated-database.ts";
 
 test("realm contribution producer refuses forged original members before their facts getters", async () => {
   let reads = 0;

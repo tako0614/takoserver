@@ -1,9 +1,7 @@
-import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { type AttachmentRebinding, createAttachmentStore } from "../src/attachments.ts";
 import { createCatalog, type Offering } from "../src/catalog.ts";
 import type { TakoformV1Alpha3FormRef } from "../src/form-ref.ts";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createProviderPack, type ProviderPackDefinition } from "../src/provider-pack.ts";
 import {
   type ApplyInput,
@@ -21,6 +19,7 @@ import {
 } from "../src/resource-migrations.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformStore } from "../src/takoform/store.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const FORM = {
   apiVersion: "data.forms.takoform.com/v1alpha1",
@@ -104,8 +103,7 @@ function fixture(
 ) {
   let current = 1_700_000_000_000;
   const clock = () => new Date(current);
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   const sql = createSqliteSql(database);
   const deployments = createResourceDeploymentStore(sql, clock);
   const attachmentStore = createAttachmentStore(sql, clock);

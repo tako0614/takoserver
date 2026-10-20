@@ -1,10 +1,9 @@
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import type { V2PrivateInputCustody } from "../src/takoform-v2/private-inputs.ts";
 import type { V2Form } from "../src/takoform-v2/types.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const FORM = "https://forms.example.test/Snapshot/1.0.0";
 
@@ -28,8 +27,7 @@ function barrier() {
 }
 
 function fixture(privateInputCustody?: V2PrivateInputCustody) {
-  const db = new Database(":memory:");
-  migrateSqlite(db);
+  const db = migrateSqliteDatabase();
   let paused: ReturnType<typeof barrier> | undefined;
   const form: V2Form = {
     validateCreate() {},

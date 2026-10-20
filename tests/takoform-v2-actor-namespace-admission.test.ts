@@ -1,4 +1,3 @@
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -6,7 +5,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Miniflare } from "miniflare";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject, Sql } from "../src/ports.ts";
 import { createSelfhostActorExecutionHost } from "../src/selfhost-actor-execution-host.ts";
 import {
@@ -50,6 +48,7 @@ import {
   WORKER_VERSION_FORM_URL,
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import type { V2Form } from "../src/takoform-v2/types.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 import { mkdtempForSockets } from "./helpers/socket-temp-root.ts";
 
 const PRINCIPAL = "org:actor-admission";
@@ -61,8 +60,7 @@ function fixture(
   providerNative?: V2ActorNamespaceProviderPort,
   sqlOverride?: Sql,
 ) {
-  const db = new Database(":memory:");
-  migrateSqlite(db);
+  const db = migrateSqliteDatabase();
   const rawSql = sqlOverride ?? createSqliteSql(db);
   let beforeActorBatch: (() => Promise<void>) | undefined;
   let afterActorForget: (() => Promise<void>) | undefined;
@@ -1386,10 +1384,10 @@ test("Miniflare D1 accepts one weighted Actor class in the Host INSERT and refus
   let f: ReturnType<typeof fixture> | undefined;
   try {
     const database = await runtime.getD1Database("STATE_DB");
-    for (const migration of MIGRATIONS) {
-      for (const statement of splitMigration(migration.sql))
-        await database.prepare(statement).run();
-    }
+    for (const migration of MIGRATIONS)
+      await database.batch(
+        splitMigration(migration.sql).map((statement) => database.prepare(statement)),
+      );
     f = fixture(undefined, undefined, createD1Sql(database));
     const worker = await f.worker();
     const version = await f.version(worker.resourceUid, "d1-version");

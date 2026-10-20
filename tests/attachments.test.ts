@@ -1,4 +1,3 @@
-import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import {
   type AttachmentFactory,
@@ -6,9 +5,9 @@ import {
   createAttachmentStore,
 } from "../src/attachments.ts";
 import type { TakoformInterfaceRef } from "../src/interface-ref.ts";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createResourceDeploymentStore } from "../src/resource-deployments.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const POSTGRES: TakoformInterfaceRef = {
   apiVersion: "interfaces.takoform.com/v1alpha1",
@@ -18,8 +17,7 @@ const POSTGRES: TakoformInterfaceRef = {
 };
 
 function fixture() {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   const sql = createSqliteSql(database);
   const deployments = createResourceDeploymentStore(sql, () => new Date(1_700_000_000_000));
   const factory: AttachmentFactory = {

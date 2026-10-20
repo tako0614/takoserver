@@ -27,6 +27,7 @@ import {
   type SelfhostBacklogHealth,
 } from "../src/selfhost-health-signals.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const NOW = new Date("2026-10-11T12:00:00.000Z");
 const MINUTE = 60_000;
@@ -44,8 +45,7 @@ type OperationStatus =
   | "failed";
 
 function migratedDatabase(): Database {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   return database;
 }
 

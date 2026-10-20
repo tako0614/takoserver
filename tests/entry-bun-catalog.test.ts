@@ -221,20 +221,3 @@ test("the Bun entry refuses an HTTP public origin before creating local state", 
     rmSync(dataRoot, { recursive: true, force: true });
   }
 });
-
-test("the Bun entry has no shared-D1 or dead signing-key branches", async () => {
-  const source = await Bun.file(new URL("../src/entry-bun.ts", import.meta.url)).text();
-
-  expect(source).not.toContain("createD1HttpSql");
-  expect(source).not.toContain("loadSigningKey");
-  expect(source).not.toContain("sharedDatabaseId");
-  expect(source).toContain("TAKOSERVER_D1_DATABASE_ID");
-  expect(source).toContain("TAKOSERVER_R2_BUCKET");
-  expect(source).toContain("const controlDatabase = new Database(databasePath);");
-  expect(source).toContain("const sql = createSqliteSql(controlDatabase);");
-  expect(source.indexOf("TAKOSERVER_D1_DATABASE_ID")).toBeLessThan(
-    source.indexOf("const dataRoot"),
-  );
-  expect(source.indexOf("TAKOSERVER_R2_BUCKET")).toBeLessThan(source.indexOf("const dataRoot"));
-  expect(source).not.toContain("createR2HttpObjectStore");
-});

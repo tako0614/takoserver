@@ -1,8 +1,6 @@
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { createCatalog, type Offering } from "../src/catalog.ts";
 import { createLedger } from "../src/ledger.ts";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { type CreateProviderDriverOptions, createProviderDriver } from "../src/provider-driver.ts";
 import { type Provider, succeeded } from "../src/provider-port.ts";
@@ -12,6 +10,7 @@ import { createResourceDeploymentStore } from "../src/resource-deployments.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import type { InstalledTakoformForm, TakoformStoredResource } from "../src/takoform/types.ts";
 import { createStaticStableTestTakoformHost } from "./helpers/historical-takoform-host.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const formRef = {
   apiVersion: "example.forms.invalid",
@@ -82,8 +81,7 @@ function setup(
   resolve?: NonNullable<CreateProviderDriverOptions["noncommercialPlacement"]>["resolve"],
   sold?: Offering,
 ) {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   const sql = createSqliteSql(database);
   const clock = () => new Date("2026-09-28T00:00:00.000Z");
   const calls: string[] = [];

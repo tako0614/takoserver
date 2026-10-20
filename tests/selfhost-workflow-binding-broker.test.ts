@@ -1,15 +1,14 @@
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { Sql } from "../src/ports.ts";
 import { openSelfhostWorkflowBindingBroker } from "../src/selfhost-workflow-binding-broker.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { WorkflowRuntimeError } from "../src/workflow-driver.ts";
 import { createWorkflowInstances } from "../src/workflow-instances.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const ROUTE = "http://workflow.invalid/__takoserver/workflow-binding/v1/";
 const TOKEN_HEADER = "x-takoserver-private-workflow-binding-token";
@@ -20,8 +19,7 @@ const SCOPE = { tenantId: "tenant-fixed", workflowResourceUid: "workflow-fixed" 
 async function fixture(wrapSql?: (base: Sql) => Sql) {
   const directory = await mkdtemp(join(tmpdir(), "takoserver-workflow-binding-broker-"));
   await chmod(directory, 0o700);
-  const db = new Database(":memory:");
-  migrateSqlite(db);
+  const db = migrateSqliteDatabase();
   const base = createSqliteSql(db);
   const sql = wrapSql?.(base) ?? base;
   let nextId = 0;
@@ -59,8 +57,7 @@ async function fixture(wrapSql?: (base: Sql) => Sql) {
 test("authenticated Unix binding create and get use only the fixed Workflow incarnation", async () => {
   const directory = await mkdtemp(join(tmpdir(), "takoserver-workflow-binding-broker-"));
   await chmod(directory, 0o700);
-  const db = new Database(":memory:");
-  migrateSqlite(db);
+  const db = migrateSqliteDatabase();
   const sql = createSqliteSql(db);
   let nextId = 0;
   const instances = createWorkflowInstances({

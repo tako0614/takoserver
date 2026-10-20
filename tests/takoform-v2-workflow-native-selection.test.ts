@@ -1,10 +1,8 @@
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { v2SqliteWorkerProjection } from "../src/providers/selfhost-v2-sqlite-worker-projection.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import {
@@ -20,6 +18,7 @@ import { createV2WorkflowForwardRuntime } from "../src/takoform-v2/workflow-forw
 import { createV2WorkflowNativeSelection } from "../src/takoform-v2/workflow-native-selection.ts";
 import { createV2WorkflowSelectedMaterials } from "../src/takoform-v2/workflow-selected-materials.ts";
 import type { WorkflowRunIdentity } from "../src/workflow-execution.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const PRINCIPAL = "org:workflow-native";
 const SPACE = "production";
@@ -44,8 +43,7 @@ const identity: WorkflowRunIdentity = {
 };
 
 function fixture(basisPoint: () => number = () => 7) {
-  const db = new Database(":memory:");
-  migrateSqlite(db);
+  const db = migrateSqliteDatabase();
   const sql = createSqliteSql(db);
   const spec = JSON.stringify({ worker: { resourceUid: WORKER_UID }, className: "ReportWorkflow" });
   const instant = new Date().toISOString();

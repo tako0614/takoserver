@@ -1,10 +1,9 @@
-import { Database } from "bun:sqlite";
 import { expect, spyOn, test } from "bun:test";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject, Sql, SqlStatement } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import type { V2Backend, V2EngineOptions, V2Execution, V2Form } from "../src/takoform-v2/types.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const FORM = "https://fresh-admission.example.test/fixture";
 const PRINCIPAL = "org:fixture";
@@ -14,8 +13,7 @@ const ORIGIN = "https://host.example.test";
 async function fixture(
   input: { admission?: boolean; loseAck?: boolean; privateInputs?: boolean } = {},
 ) {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   const backing = createSqliteSql(database);
   const batches: (readonly SqlStatement[])[] = [];
   const sql: Sql = {
@@ -414,8 +412,7 @@ test("fresh admission application: automatic artifact Forms honor policy", async
     SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
   } = await import("../src/takoform-v2/forms/sqlite-migration-set.ts");
   for (const admission of [undefined, true, false]) {
-    const database = new Database(":memory:");
-    migrateSqlite(database);
+    const database = migrateSqliteDatabase();
     const memory = createMemoryObjectStore();
     let objectReads = 0;
     const objects = {

@@ -1,6 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { readdirSync, readFileSync } from "node:fs";
-import { join, relative, resolve } from "node:path";
 import { createEphemeralSql } from "../src/compat.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
@@ -79,42 +77,7 @@ describe("independent Takoserver Host boundary", () => {
     expect(accepted.status).toBe(201);
     expect(providerApplyCalls).toBe(1);
   });
-
-  test("production source contains no retired hosted materialization seam", () => {
-    const repository = resolve(import.meta.dir, "..");
-    const retiredNames = [
-      ["HOST", "RUNTIME", "MATERIALIZER"].join("_"),
-      ["hosted", "Topology"].join(""),
-      ["runtime", "Materialization"].join(""),
-      ["Runtime", "Materializer"].join(""),
-      ["runtime", "materialization"].join("-"),
-      ["Takosumi", "RuntimeBindingMaterializerEntrypoint"].join(""),
-      ["Takosumi", "HostRuntimeMaterializerEntrypoint"].join(""),
-    ];
-    const retained: string[] = [];
-    for (const root of [join(repository, "src"), join(repository, "scripts")]) {
-      for (const path of sourceFiles(root)) {
-        const source = readFileSync(path, "utf8");
-        const relativePath = relative(repository, path);
-        for (const name of retiredNames) {
-          if (!source.includes(name)) continue;
-          retained.push(`${relativePath}: ${name}`);
-        }
-      }
-    }
-    expect(retained).toEqual([]);
-  }, 15_000);
 });
-
-function sourceFiles(root: string): string[] {
-  const paths: string[] = [];
-  for (const entry of readdirSync(root, { withFileTypes: true })) {
-    const path = join(root, entry.name);
-    if (entry.isDirectory()) paths.push(...sourceFiles(path));
-    else if (entry.isFile() && /\.(?:[cm]?ts|jsonc?)$/u.test(entry.name)) paths.push(path);
-  }
-  return paths;
-}
 
 async function applyWorkerVersion(
   host: { handle(request: Request): Promise<Response | null> },

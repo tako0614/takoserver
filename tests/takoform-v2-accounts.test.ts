@@ -1,12 +1,11 @@
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { type Accounts, createAccounts, type ExternalIdentityVerifier } from "../src/auth.ts";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2AccountAccess } from "../src/takoform-v2/accounts.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { createTakoformV2Routes } from "../src/takoform-v2/routes.ts";
 import type { V2Backend, V2Form } from "../src/takoform-v2/types.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const FORM = "https://forms.example/fixture-only/key-value/1.0.0";
 const BASE_URL = "https://host.example/takoform-v2";
@@ -24,8 +23,7 @@ const identity: ExternalIdentityVerifier = {
 };
 
 function setup() {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   const sql = createSqliteSql(database);
   const accounts = createAccounts({ sql, identity });
   const backend: V2Backend = {

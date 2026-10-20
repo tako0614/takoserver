@@ -18,6 +18,7 @@ import {
   type WorkerdSite,
   writeWorkerdPrivateExecution,
 } from "../src/workerd-runtime.ts";
+import { mkdtempForSockets } from "./helpers/socket-temp-root.ts";
 
 const encoder = new TextEncoder();
 const HOST_ENTRYPOINT = "__takoserver-host.js";
@@ -63,9 +64,11 @@ interface ConfigProbe {
 
 let configProbes: ConfigProbe[];
 
-beforeEach(() => {
+beforeEach(async () => {
   runtimeRoot = mkdtempSync(join(tmpdir(), "tss-runtime-"));
-  socketDirectory = mkdtempSync(join(tmpdir(), "tss-"));
+  // A private socket directory leaves room for `<64 hex>.sock` within the
+  // 100-byte Unix socket path budget, whatever the runner's TMPDIR length.
+  socketDirectory = await mkdtempForSockets("tss-", 30);
   chmodSync(socketDirectory, 0o700);
   temporaryRoots = [];
   configProbes = [];

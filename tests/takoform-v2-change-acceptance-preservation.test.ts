@@ -1,11 +1,10 @@
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { Sql, SqlParam, SqlStatement } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { type AcceptRecord, createV2Store } from "../src/takoform-v2/store.ts";
 import type { V2AdmissionPredicate } from "../src/takoform-v2/types.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const FORM = "https://forms.example.test/ChangeBytes/1.0.0/";
 const AT = "2026-10-15T00:00:00.000Z";
@@ -107,8 +106,7 @@ const CASES: readonly {
 async function captureChanges() {
   const captured: Record<string, { bytes: string; sha256: string; outcome: string }> = {};
   for (const scenario of CASES) {
-    const db = new Database(":memory:");
-    migrateSqlite(db);
+    const db = migrateSqliteDatabase();
     const raw = createSqliteSql(db);
     const batches: string[] = [];
     const sql: Sql = {

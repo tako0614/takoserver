@@ -33,6 +33,7 @@ import { createTakoformStore } from "../src/takoform/store.ts";
 import type { InstalledTakoformForm, TakoformHostPrincipal } from "../src/takoform/types.ts";
 import { createWorkerEndpointOriginReservationBindingHandle } from "../src/worker-endpoint-origin-reservations.ts";
 import { applyWithSelection } from "./helpers/apply-with-selection.ts";
+import { migratedDatabase } from "./helpers/migrated-database.ts";
 
 const FORM = (() => {
   const form = STABLE_PRODUCTION_TAKOFORM_CATALOG.forms.find(
@@ -58,7 +59,7 @@ const RESERVATION_V2_MIGRATION = readFileSync(
   "utf8",
 );
 
-function createReservationV2Sql(database = new Database(":memory:")) {
+function createReservationV2Sql(database = migratedDatabase()) {
   const initialized = database
     .query("SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = 'tf_resources'")
     .get();

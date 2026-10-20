@@ -3,7 +3,6 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { MIGRATIONS } from "../src/db-schema.ts";
 import type { JsonObject, Sql, SqlParam } from "../src/ports.ts";
 import { createQueueCustody } from "../src/queue-custody.ts";
 import { createSelfhostV2QueueComposition } from "../src/selfhost-v2-queue-composition.ts";
@@ -33,6 +32,7 @@ import {
   verifyV2QueueSettlementScope,
 } from "../src/takoform-v2/worker-queue-delivery.ts";
 import type { WorkerdWorkerRuntimeOwner } from "../src/workerd-worker-runtime-owner.ts";
+import { migratedDatabase, writeMigratedDatabaseFile } from "./helpers/migrated-database.ts";
 
 const principal = "org-one";
 const space = "default";
@@ -53,8 +53,8 @@ const consumerSpec = (
 });
 
 function fixture(databasePath = ":memory:", beforeRetentionWrite?: () => Promise<void>) {
-  const database = new Database(databasePath);
-  for (const migration of MIGRATIONS) database.exec(migration.sql);
+  if (databasePath !== ":memory:") writeMigratedDatabaseFile(databasePath);
+  const database = databasePath === ":memory:" ? migratedDatabase() : new Database(databasePath);
   const sql = createSqliteSql(database);
   const queueSql = beforeRetentionWrite
     ? {

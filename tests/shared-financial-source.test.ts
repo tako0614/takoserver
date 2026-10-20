@@ -1,7 +1,5 @@
-import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { MIGRATIONS } from "../src/db-schema.ts";
 import { verifyHostedBillingFinancialRealm } from "../src/hosted-billing-realm.ts";
 import {
   createMoneyCutoverSql,
@@ -37,6 +35,7 @@ import {
   MONEY_FREEZE_ROW,
   permitFramed,
 } from "./helpers/financial-0104-fenced.ts";
+import { migratedDatabase } from "./helpers/migrated-database.ts";
 
 const AT = "2026-01-01T00:00:00.000Z";
 const GENESIS = `sha256:${"a".repeat(64)}` as const;
@@ -82,8 +81,7 @@ async function fixture(
   const fixtureRegistration = input.registration ?? REGISTRATION;
   const fixtureReceiver = input.receiverRef ?? RECEIVER;
   const fixtureTarget = input.targetRef ?? TARGET;
-  const db = new Database(":memory:");
-  for (const migration of MIGRATIONS) db.exec(migration.sql);
+  const db = migratedDatabase();
   // Explicit synthetic, UNREGISTERED component schema, not public migration
   // lineage or genuine peer evidence. Always apply it: a future owning public
   // migration must fail on duplicates until this fixture is explicitly synced.

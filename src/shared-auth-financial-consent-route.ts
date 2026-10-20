@@ -32,7 +32,9 @@ const PAGE_HEADERS = Object.freeze({
   "cache-control": "no-store",
   "content-security-policy":
     "default-src 'none'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
-  "referrer-policy": "no-referrer",
+  // The page's own form POST must carry this origin: a no-referrer page makes
+  // browsers send `Origin: null`, which the POST preflight refuses.
+  "referrer-policy": "same-origin",
   "x-content-type-options": "nosniff",
   "x-frame-options": "DENY",
 });

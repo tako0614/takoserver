@@ -1,12 +1,11 @@
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { type Sql, SqlError, type SqlParam, type SqlStatement } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { type AcceptRecord, createV2Store } from "../src/takoform-v2/store.ts";
 import type { V2AdmissionPredicate, V2Form } from "../src/takoform-v2/types.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const FORM = "https://forms.example.test/Acceptance/1.0.0/";
 const TARGET = "00000000-0000-4000-8000-000000000001";
@@ -53,8 +52,7 @@ function record(label: string): AcceptRecord {
 }
 
 function fixture() {
-  const db = new Database(":memory:");
-  migrateSqlite(db);
+  const db = migrateSqliteDatabase();
   db.query(`INSERT INTO tf_v2_resources
     (uid,principal,form_url,space,name,backend_id,target_key,active_name,generation,
      observed_generation,observed_at,phase,spec_json,observed_json,output_json,
