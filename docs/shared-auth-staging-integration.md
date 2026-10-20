@@ -221,12 +221,27 @@ Known limitation: there is no owner transfer. If a subject's active binding is
 revoked and the same subject later receives a fresh principal, the Org remains
 owned by the previous principal and that issuance is refused. This fail-closed
 behavior is accepted for staging and must be revisited before production.
-A second known limitation: Workspace bindings are global and the first one
-wins. An Org with `wallet:write` that posts a hold naming another
-Workspace's `workspaceRef` before its owner's first login binds it first, and
-that owner's issuance is then refused. Accounts refs are random 128-bit values
-shown only to their owner. Reserving shared-auth Workspace refs against
-hold-time binding remains a pre-production item.
+Workspace bindings are global and set once, and a hold or usage record
+normally creates its Workspace's binding lazily. Accounts issues every
+shared-auth Workspace reference as `wrk_` followed by 32 lowercase hex digits,
+so that namespace is reserved. In the canonical Hosted billing composition,
+which has a qualified financial realm and its `billingAuthority`, a hold or
+usage record that would create the first binding for a reference matching
+`^wrk_[0-9a-f]{32}$` is refused unless its Organization is the derived
+`org_wb_` id for that reference and authority. Without the reservation, an Org
+with `wallet:write` could bind another Workspace's reference before the
+owner's first login, and that owner's issuance would then be refused with no
+repair. The refusal is the billing service code `workspace_ref_reserved`
+(409), sent on the wire as `conflict` like `workspace_ref_conflict`. It
+writes no hold, usage, ledger or binding row: the reserved binding is never
+in the admission batch, and the admission row requires it. An existing
+binding behaves as before: the same Org is admitted and another Org gets
+`workspace_ref_conflict`. Other references, such as operator-chosen opaque
+references used by personal or created Organizations, keep lazy first
+binding. Self-host and compositions without a realm do not reserve the
+namespace. The rule is in `src/org-workspace-usage.ts`; the authority comes
+only from a canonical composition (`hostedSharedWorkspaceAuthority` in
+`src/hosted-billing-composition.ts`).
 
 ## Existing behavior that requires a separate owner change
 

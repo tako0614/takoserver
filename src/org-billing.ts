@@ -41,7 +41,8 @@ import {
   validateWorkspaceRef,
   type WorkspaceUsageOptions,
   workspaceAttributionSchemaReady,
-  workspaceBindingStatement,
+  workspaceBindingCreatable,
+  workspaceBindingStatements,
 } from "./org-workspace-usage.ts";
 import { type Clock, type Row, type Sql, SqlError, type SqlStatement } from "./ports.ts";
 import { assertStripeOnDemandService, type StripeOnDemandService } from "./stripe-on-demand.ts";
@@ -366,13 +367,24 @@ export function createOrgBilling(options: {
   readonly hostedPaidFreeExclusion?: boolean;
   /** Hosted composition requires explicit attribution for new admissions; old receipts still replay. */
   readonly requireWorkspaceAttribution?: boolean;
+  /**
+   * The served realm's billing authority, present only in the canonical Hosted
+   * composition. A new binding for a shared-auth `wrk_` Workspace reference is
+   * then reserved for that reference's derived billing Organization.
+   */
+  readonly sharedWorkspaceAuthority?: string;
   readonly admissionFunding?: StripeOnDemandService;
   readonly limitPolicy?: Pick<
     OrgLimitPolicy,
     "prepareAdmission" | "observeUsageSummary" | "warningStatements"
   >;
 }): OrgBilling {
-  const { sql, clock, ledger, config, admissionFunding } = options;
+  const { sql, clock, ledger, config, admissionFunding, sharedWorkspaceAuthority } = options;
+  if (
+    sharedWorkspaceAuthority !== undefined &&
+    (typeof sharedWorkspaceAuthority !== "string" || sharedWorkspaceAuthority.length === 0)
+  )
+    throw new TypeError("Shared Workspace authority must be a billing authority");
   if (admissionFunding)
     assertStripeOnDemandService(admissionFunding, { sql, clock, billingConfig: config });
   const hostedPaidFreeExclusion = options.hostedPaidFreeExclusion === true;
@@ -762,7 +774,14 @@ export function createOrgBilling(options: {
     const structured = await workspaceOperation(workspaceAttributionSchemaReady(sql));
     if (input.workspaceRef !== undefined) {
       if (!structured) orgBillingFail("billing_schema_not_ready", 503);
-      await workspaceOperation(assertWorkspaceOwner(sql, input.organizationId, input.workspaceRef));
+      await workspaceOperation(
+        assertWorkspaceOwner(
+          sql,
+          input.organizationId,
+          input.workspaceRef,
+          sharedWorkspaceAuthority,
+        ),
+      );
     }
     const tariff = await tariffAt(now());
     if (!tariff || input.pricingRevision !== tariff.revision)
@@ -822,7 +841,16 @@ export function createOrgBilling(options: {
         ...(admission && input.amountMicros === 0 ? [admission.guard] : []),
         ...(input.workspaceRef === undefined
           ? []
-          : [workspaceBindingStatement(input.organizationId, input.workspaceRef, instant)]),
+          : workspaceBindingStatements(
+              input.organizationId,
+              input.workspaceRef,
+              instant,
+              await workspaceBindingCreatable(
+                input.organizationId,
+                input.workspaceRef,
+                sharedWorkspaceAuthority,
+              ),
+            )),
         {
           sql: summaryRead
             ? `WITH summary AS (${summaryRead.sql})
@@ -877,7 +905,12 @@ export function createOrgBilling(options: {
       }
       if (input.workspaceRef !== undefined)
         await workspaceOperation(
-          assertWorkspaceOwner(sql, input.organizationId, input.workspaceRef),
+          assertWorkspaceOwner(
+            sql,
+            input.organizationId,
+            input.workspaceRef,
+            sharedWorkspaceAuthority,
+          ),
         );
       if (admission) await assertAdmissionCurrent(sql, input.organizationId, admission);
       if (
@@ -997,7 +1030,12 @@ export function createOrgBilling(options: {
       if (input.workspaceRef !== undefined) {
         if (!structured) orgBillingFail("billing_schema_not_ready", 503);
         await workspaceOperation(
-          assertWorkspaceOwner(sql, input.organizationId, input.workspaceRef),
+          assertWorkspaceOwner(
+            sql,
+            input.organizationId,
+            input.workspaceRef,
+            sharedWorkspaceAuthority,
+          ),
         );
       }
       if (
@@ -1089,7 +1127,12 @@ export function createOrgBilling(options: {
             return await admitUsage(input, true);
           if (input.workspaceRef !== undefined)
             await workspaceOperation(
-              assertWorkspaceOwner(sql, input.organizationId, input.workspaceRef),
+              assertWorkspaceOwner(
+                sql,
+                input.organizationId,
+                input.workspaceRef,
+                sharedWorkspaceAuthority,
+              ),
             );
           await assertAdmissionCurrent(sql, input.organizationId, admission);
           if (
@@ -1155,7 +1198,16 @@ export function createOrgBilling(options: {
           ...(admission ? [admission.guard] : []),
           ...(input.workspaceRef === undefined
             ? []
-            : [workspaceBindingStatement(input.organizationId, input.workspaceRef, instant)]),
+            : workspaceBindingStatements(
+                input.organizationId,
+                input.workspaceRef,
+                instant,
+                await workspaceBindingCreatable(
+                  input.organizationId,
+                  input.workspaceRef,
+                  sharedWorkspaceAuthority,
+                ),
+              )),
           insert,
           guard(pendingGuard, "changes() = 1"),
           { sql: "DELETE FROM wallet_allocation_guards WHERE id = ?", params: [pendingGuard] },
@@ -1170,7 +1222,12 @@ export function createOrgBilling(options: {
       if (!row && admission) await assertAdmissionCurrent(sql, input.organizationId, admission);
       if (!row && input.workspaceRef !== undefined)
         await workspaceOperation(
-          assertWorkspaceOwner(sql, input.organizationId, input.workspaceRef),
+          assertWorkspaceOwner(
+            sql,
+            input.organizationId,
+            input.workspaceRef,
+            sharedWorkspaceAuthority,
+          ),
         );
       if (
         !row &&

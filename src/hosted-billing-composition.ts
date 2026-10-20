@@ -344,6 +344,18 @@ export async function createHostedBillingComposition(options: {
   return bundle;
 }
 
+/**
+ * The billing authority of the qualified financial realm this bundle was built
+ * against, or undefined for the wallet-policy-only lane that has no realm. Only
+ * a bundle from the canonical factory carries one, so a caller cannot reserve
+ * shared-auth Workspace references against an authority it chose.
+ */
+export function hostedSharedWorkspaceAuthority(
+  composition: HostedBillingComposition,
+): string | undefined {
+  return origins.get(composition)?.realm?.billingAuthority;
+}
+
 /** Refuses object-shaped stubs and bundles qualified against another database. */
 export function assertHostedBillingComposition(
   composition: HostedBillingComposition,

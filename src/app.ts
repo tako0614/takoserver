@@ -21,6 +21,7 @@ import {
   assertHostedBillingComposition,
   type HostedBillingComposition,
   type HostedBillingStatus,
+  hostedSharedWorkspaceAuthority,
 } from "./hosted-billing-composition.ts";
 import {
   createIntegrationE2eCredentialAuthority,
@@ -740,6 +741,9 @@ export function buildApp(ports: AppPorts): App {
     ...(allocationAdmissionResolver ? { allocationAdmissionResolver } : {}),
     ...(usageWarnings ? { usageWarnings } : {}),
   });
+  const sharedWorkspaceAuthority = ports.hostedBilling
+    ? hostedSharedWorkspaceAuthority(ports.hostedBilling)
+    : undefined;
   const orgBilling = ports.billingConfig
     ? createOrgBilling({
         sql: ports.sql,
@@ -751,6 +755,7 @@ export function buildApp(ports: AppPorts): App {
         ...(ports.hostedBilling
           ? { limitPolicy: ports.hostedBilling.limitPolicy, requireWorkspaceAttribution: true }
           : {}),
+        ...(sharedWorkspaceAuthority === undefined ? {} : { sharedWorkspaceAuthority }),
         ...(ports.hostedBilling?.onDemand
           ? { admissionFunding: ports.hostedBilling.onDemand }
           : {}),

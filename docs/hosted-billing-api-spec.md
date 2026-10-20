@@ -285,7 +285,11 @@ closed usage, receipts and exact request fingerprints. Hosted new writes
 require an Org-bound random reference; independent/self-host and historical
 writes may remain unattributed. A reference has the existing opaque-reference
 grammar and is unique within an Org. Binding is immutable while live holds or
-unpaid usage remain. Capture inherits the hold's reference and cannot switch
+unpaid usage remain. References matching `^wrk_[0-9a-f]{32}$` are reserved
+for shared-auth Workspaces: in the canonical composition, only the Workspace's
+derived billing Organization may create their first binding, and any other
+Org is refused with `409 conflict` (service code `workspace_ref_reserved`)
+and no write. See `docs/shared-auth-staging-integration.md`. Capture inherits the hold's reference and cannot switch
 Workspace. Release/refund/expiry keep the same attribution. Do not derive it
 from arbitrary hold reference text. Late usage belongs to its measured period,
 not delivery time; prepaid allocations do not become new usage rows.
