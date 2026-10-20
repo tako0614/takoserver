@@ -29,6 +29,7 @@ const INITIAL_TIME = 1_800_000_000_000;
 const LOCAL_PRINCIPAL = "retained-local-takoserver-principal-123";
 const ATTEMPT_COOKIE = "__Host-takoserver_oidc_attempt";
 const SESSION_COOKIE = "__Host-takoserver_shared_session";
+const LEGACY_SESSION_COOKIE = "takoserver_session";
 
 const pinnedOrigins = {
   issuer: SESSION_TEST_CONFIG.issuer,
@@ -240,7 +241,10 @@ describe("staging shared session against native D1 and signed issuer HTTP", () =
       expect(JSON.stringify(attempts)).not.toContain(started.location.searchParams.get("state"));
       expect(JSON.stringify(attempts)).not.toContain(started.location.searchParams.get("nonce"));
 
-      const response = await f.callback(started);
+      const response = await f.callback({
+        ...started,
+        browserCookie: `${started.browserCookie}; ${LEGACY_SESSION_COOKIE}=legacy_B`,
+      });
       expect(response.status).toBe(303);
       expect(response.headers.get("location")).toBe(`${SESSION_TEST_CONSOLE}/`);
       expect(response.headers.get("location")).not.toContain("token");
@@ -248,6 +252,9 @@ describe("staging shared session against native D1 and signed issuer HTTP", () =
       const setCookies = response.headers.getSetCookie();
       expect(setCookies).toContain(
         `${ATTEMPT_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`,
+      );
+      expect(setCookies).toContain(
+        `${LEGACY_SESSION_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`,
       );
       expect(setCookies.find((item) => item.startsWith(SESSION_COOKIE))).toContain(
         "Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=604800",
@@ -647,12 +654,16 @@ describe("staging shared session against native D1 and signed issuer HTTP", () =
       f.issuer.control.revocationAvailable = false;
       const response = await f.request("/auth/oidc/logout", {
         method: "POST",
-        headers: { cookie: signedIn.sessionCookie, origin: SESSION_TEST_CONSOLE },
+        headers: {
+          cookie: `${signedIn.sessionCookie}; ${LEGACY_SESSION_COOKIE}=legacy_B`,
+          origin: SESSION_TEST_CONSOLE,
+        },
       });
       expect(response.status).toBe(204);
-      expect(response.headers.get("set-cookie")).toBe(
+      expect(response.headers.getSetCookie()).toEqual([
         `${SESSION_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`,
-      );
+        `${LEGACY_SESSION_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`,
+      ]);
       expect(f.issuer.requests.filter((r) => r.url.pathname === "/oauth/revoke")).toEqual([]);
       expect(await f.runtime.authenticate(f.sessionRequest(signedIn.sessionCookie))).toBeNull();
       expect(await f.runtime.retryRevocations()).toEqual({ completed: 0, pending: 1 });
@@ -691,10 +702,18 @@ describe("staging shared session against native D1 and signed issuer HTTP", () =
       });
       try {
         const started = await f.login();
-        const response = await f.callback(started);
+        const response = await f.callback({
+          ...started,
+          browserCookie: `${started.browserCookie}; ${LEGACY_SESSION_COOKIE}=legacy_B`,
+        });
         expect(response.status).toBe(503);
         expect(
           response.headers.getSetCookie().some((item) => item.startsWith(SESSION_COOKIE)),
+        ).toBe(false);
+        expect(
+          response.headers
+            .getSetCookie()
+            .some((item) => item.startsWith(`${LEGACY_SESSION_COOKIE}=`)),
         ).toBe(false);
         expect(creations).toBe(1);
         expect((await f.callback(started)).status).toBe(400);
