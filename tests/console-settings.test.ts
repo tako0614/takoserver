@@ -29,7 +29,15 @@ class TestNode {
   setAttribute(name: string, value: string): void {
     this.attributes.set(name, value);
   }
-  addEventListener(): void {}
+  private readonly listeners = new Map<string, EventListener[]>();
+  addEventListener(type: string, listener: EventListener): void {
+    const listeners = this.listeners.get(type) ?? [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
+  }
+  click(): void {
+    for (const listener of this.listeners.get("click") ?? []) listener({} as Event);
+  }
   all(): TestNode[] {
     return [this, ...this.children.flatMap((child) => child.all())];
   }
@@ -184,4 +192,73 @@ test("a Host that does not answer is not guessed about", async () => {
   expect(body.textContent).not.toContain("Runs Workers");
   expect(body.textContent).not.toContain("Does not run Workers");
   expect(body.textContent).not.toContain("HTTPS publishing");
+});
+
+test("Settings reports shared-session logout failures and keeps the local session marker", async () => {
+  const body = new TestNode("body");
+  const values = new Map<string, string>();
+  Object.assign(globalThis, {
+    Node: TestNode,
+    HTMLInputElement: TestNode,
+    localStorage: {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+    },
+    document: {
+      body,
+      documentElement: new TestNode("html"),
+      createElement: (tag: string) => new TestNode(tag),
+      createElementNS: (_ns: string, tag: string) => new TestNode(tag),
+      createTextNode: (value: string) => new TestNode("text", value),
+      createDocumentFragment: () => new TestNode("fragment"),
+      addEventListener: () => undefined,
+    },
+    window: {
+      location: new URL("https://console.example.test/settings"),
+      addEventListener: () => undefined,
+    },
+  });
+
+  const state = await import("../console/src/state.ts");
+  const previousKind = state.sessionKind();
+  const previousSession = state.session();
+  const previousPrincipal = state.principal();
+  const previousOrganizations = state.organizations();
+  const { consoleLocale } = await import("../console/src/i18n.ts");
+  const { mountToasts } = await import("../console/src/ui.ts");
+  const page = await import("../console/src/pages/settings.ts");
+  consoleLocale.set("en");
+  state.setApiOrigin("https://api.example.test");
+  state.adoptSession("shared-auth");
+  globalThis.fetch = Object.assign(
+    async () => {
+      throw new TypeError("network unavailable");
+    },
+    { preconnect: globalThis.fetch.preconnect },
+  );
+  body.append(mountToasts() as unknown as TestNode);
+  body.append(
+    page.settingsPage({
+      id: "org-console",
+      name: "Console",
+      ownerPrincipalId: "principal-console",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    }) as unknown as TestNode,
+  );
+
+  const signOut = body
+    .all()
+    .find((node) => node.tag === "button" && node.textContent === "Sign out");
+  expect(signOut).toBeDefined();
+  signOut?.click();
+  for (let i = 0; i < 12; i += 1) await new Promise((resolve) => setTimeout(resolve, 0));
+
+  expect(body.textContent).toContain("Could not reach the API.");
+  expect(state.session()).toBe("cookie");
+  expect(state.sessionKind()).toBe("shared-auth");
+  state.session.set(previousSession);
+  state.sessionKind.set(previousKind);
+  state.principal.set(previousPrincipal);
+  state.organizations.set(previousOrganizations);
 });
