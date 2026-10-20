@@ -16,6 +16,7 @@ import {
 } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { workspaceBillingOrganizationRef } from "../src/workspace-billing-organization.ts";
 import { type DeployTarget, loadTarget } from "./deploy/target.ts";
 
 const ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -24,6 +25,9 @@ const SHA = /^sha256:[0-9a-f]{64}$/u;
 const HEAD = /^[0-9a-f]{40}$/u;
 const JOURNAL_KIND = "takoserver.hosted-billing-business-e2e-journal@v1";
 const INPUT_KIND = "takoserver.hosted-billing-business-e2e-input@v1";
+// Accounts issues shared-auth Workspace refs in this namespace; their billing
+// Organization is derived and created at the owner's first login, never here.
+const SHARED_WORKSPACE_REF = /^wrk_[0-9a-f]{32}$/u;
 type ObjectValue = Record<string, unknown>;
 type Step = "personal" | "usage" | "subscription" | "topup";
 type Event =
@@ -35,7 +39,8 @@ type Event =
       origin: string;
     }
   | { kind: "intent"; step: Step; organizationId: string | null; body: ObjectValue }
-  | { kind: "ack"; step: Step; organizationId?: string };
+  | { kind: "ack"; step: Step; organizationId?: string }
+  | { kind: "select"; step: "personal"; organizationId: string; source: "shared-workspace" };
 
 export interface BusinessInput {
   readonly kind: typeof INPUT_KIND;
@@ -265,6 +270,21 @@ function journal(path: string): Event[] {
         body: object(event.body),
       });
       pending = step;
+    } else if (event.kind === "select") {
+      // A shared-auth Workspace's derived Organization is selected, not created.
+      keys(event, ["kind", "step", "organizationId", "source"]);
+      if (next !== 0 || pending !== undefined || event.step !== "personal")
+        throw new Error("invalid journal selection sequence");
+      if (event.source !== "shared-workspace") throw new Error("invalid journal selection");
+      organizationId = reference(event.organizationId);
+      if (!organizationId.startsWith("org_wb_")) throw new Error("invalid journal Organization");
+      events.push({
+        kind: "select",
+        step: "personal",
+        organizationId,
+        source: "shared-workspace",
+      });
+      next++;
     } else if (event.kind === "ack") {
       if (pending === undefined || event.step !== pending)
         throw new Error("orphan or out-of-order mutation acknowledgement");
@@ -444,6 +464,30 @@ function ack(path: string, step: Step, organizationId?: string): void {
   append(path, { kind: "ack", step, ...(organizationId === undefined ? {} : { organizationId }) });
 }
 
+/**
+ * The Organization a shared-auth Workspace bills: derived from the target's
+ * billing authority and the Workspace ref, and present in the session's own
+ * Organizations because the owner's first login created it. Personal
+ * Organizations are only for google/github principals, so a shared-auth
+ * session never creates one. Returns null for an ordinary opaque Workspace ref.
+ */
+export async function sharedWorkspaceOrganization(
+  input: BusinessInput,
+  billingAuthority: string | undefined,
+  organizations: unknown,
+): Promise<string | null> {
+  if (!SHARED_WORKSPACE_REF.test(input.usage.workspaceRef)) return null;
+  if (billingAuthority === undefined)
+    throw new Error("shared Workspace journey requires the target billing authority");
+  const derived = await workspaceBillingOrganizationRef(billingAuthority, input.usage.workspaceRef);
+  if (
+    !Array.isArray(organizations) ||
+    !organizations.some((organization) => object(organization).id === derived)
+  )
+    throw new Error("session does not own the shared Workspace billing Organization");
+  return derived;
+}
+
 export async function runStart(options: {
   readonly journalPath: string;
   readonly inputRaw: string;
@@ -451,6 +495,7 @@ export async function runStart(options: {
   readonly origin: string;
   readonly client: BillingHttp;
   readonly handoffPath: string;
+  readonly billingAuthority?: string;
 }): Promise<void> {
   const { journalPath: path, inputRaw, targetSha256, origin, client, handoffPath } = options;
   const input = parseBusinessInput(inputRaw);
@@ -464,6 +509,11 @@ export async function runStart(options: {
     const me = await client.request("GET", "/v1/me");
     object(me.principal);
     if (!Array.isArray(me.organizations)) throw new Error("session preflight response invalid");
+    const shared = await sharedWorkspaceOrganization(
+      input,
+      options.billingAuthority,
+      me.organizations,
+    );
     const fd = openSync(path, "wx", 0o600);
     closeSync(fd);
     append(path, {
@@ -474,10 +524,28 @@ export async function runStart(options: {
       origin,
     });
     syncParent(path);
-    const personal = await mutate(path, "personal", client, "/v1/organizations/personal", {}, null);
-    const org = reference(object(personal.organization).id);
-    if (!org.startsWith("org_")) throw new Error("personal Organization response invalid");
-    ack(path, "personal", org);
+    let org: string;
+    if (shared !== null) {
+      append(path, {
+        kind: "select",
+        step: "personal",
+        organizationId: shared,
+        source: "shared-workspace",
+      });
+      org = shared;
+    } else {
+      const personal = await mutate(
+        path,
+        "personal",
+        client,
+        "/v1/organizations/personal",
+        {},
+        null,
+      );
+      org = reference(object(personal.organization).id);
+      if (!org.startsWith("org_")) throw new Error("personal Organization response invalid");
+      ack(path, "personal", org);
+    }
     await client.request("GET", orgPath(org, "wallet"));
     await client.request("GET", orgPath(org, "wallet/usage-summary"));
     await client.request("GET", orgPath(org, "wallet/usage-summary/workspaces"));
@@ -608,7 +676,10 @@ export async function runVerify(options: {
       (event): event is Extract<Event, { kind: "ack" }> =>
         event.kind === "ack" && event.step === "personal",
     );
-    const org = personalAck?.organizationId;
+    const selected = events.find(
+      (event): event is Extract<Event, { kind: "select" }> => event.kind === "select",
+    );
+    const org = personalAck?.organizationId ?? selected?.organizationId;
     if (!org) return { state: "unresolved-personal-ack", webhookProven: false };
     await client.request("GET", "/v1/me");
     const wallet = await client.request("GET", orgPath(org, "wallet"));
@@ -768,6 +839,9 @@ export async function main(argv: string[]): Promise<void> {
     targetSha256,
     origin,
     client: new BillingHttp(origin, session),
+    ...(target.hostedBilling === undefined
+      ? {}
+      : { billingAuthority: target.hostedBilling.billingAuthority }),
   };
   if (phase === "start") {
     await runStart(options);
