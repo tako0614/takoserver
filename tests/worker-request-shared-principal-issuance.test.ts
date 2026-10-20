@@ -116,7 +116,10 @@ function fixture() {
 test("Root fixed3 and original RP pair are one batch, with exact returned postimages", async () => {
   const f = fixture();
   const data = input();
-  const result = await createSharedRpPrincipalIssuanceStore({ sql: f.sql }).issueFreshOnce(data);
+  const result = await createSharedRpPrincipalIssuanceStore({
+    sql: f.sql,
+    workspaceBillingAuthority: null,
+  }).issueFreshOnce(data);
   expect(f.calls).toHaveLength(1);
   expect(f.calls[0]).toHaveLength(5);
   expect(f.calls[0]?.every((statement) => (statement.params?.length ?? 0) <= 100)).toBe(true);
@@ -170,7 +173,10 @@ test("deliberate last INSERT SQL rejection rolls back the four preceding real wr
   };
   let failure: unknown;
   try {
-    await createSharedRpPrincipalIssuanceStore({ sql: instrumented }).issueFreshOnce(input());
+    await createSharedRpPrincipalIssuanceStore({
+      sql: instrumented,
+      workspaceBillingAuthority: null,
+    }).issueFreshOnce(input());
   } catch (error) {
     failure = error;
   }
@@ -186,6 +192,7 @@ test("deliberate last INSERT SQL rejection rolls back the four preceding real wr
 test("committed acknowledgement loss is unknown and the same instance never resends", async () => {
   const f = fixture();
   const store = createSharedRpPrincipalIssuanceStore({
+    workspaceBillingAuthority: null,
     sql: {
       ...f.sql,
       async batch(statements) {
@@ -218,6 +225,7 @@ test("malformed or missing batch ACKs normalize unavailable without a second wri
   for (const damage of malformed) {
     const f = fixture();
     const store = createSharedRpPrincipalIssuanceStore({
+      workspaceBillingAuthority: null,
       sql: {
         ...f.sql,
         async batch(statements) {
@@ -241,6 +249,7 @@ test("malformed or missing batch ACKs normalize unavailable without a second wri
 test("a substituted class scope is rejected even with positive actual ACK", async () => {
   const f = fixture();
   const store = createSharedRpPrincipalIssuanceStore({
+    workspaceBillingAuthority: null,
     sql: {
       ...f.sql,
       async batch(statements) {
@@ -264,7 +273,10 @@ test("input accessors are rejected without evaluation or SQL", async () => {
     },
   });
   await expect(
-    createSharedRpPrincipalIssuanceStore({ sql: f.sql }).issueFreshOnce(data),
+    createSharedRpPrincipalIssuanceStore({
+      sql: f.sql,
+      workspaceBillingAuthority: null,
+    }).issueFreshOnce(data),
   ).rejects.toThrow("invalid");
   expect(getters).toBe(0);
   expect(f.calls).toHaveLength(0);
@@ -278,7 +290,10 @@ test("crossed principal target or subject is refused before the batch", async ()
       principal: { ...data.principal, binding: { ...data.principal.binding, [field]: "crossed" } },
     };
     await expect(
-      createSharedRpPrincipalIssuanceStore({ sql: f.sql }).issueFreshOnce(crossed),
+      createSharedRpPrincipalIssuanceStore({
+        sql: f.sql,
+        workspaceBillingAuthority: null,
+      }).issueFreshOnce(crossed),
     ).rejects.toThrow("invalid");
     expect(f.calls).toHaveLength(0);
   }

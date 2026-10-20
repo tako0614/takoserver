@@ -125,12 +125,13 @@ function createSharedRpPrincipalIssuanceStoreInternal(
   options: {
     readonly sql: Sql;
     /**
-     * The served realm's billing authority. When present, the tuple's
-     * Organization must be the workspace-billing derivation for it, and the
-     * Organization, its owner membership and the Workspace binding are
-     * materialized in the same issuance batch.
+     * The served realm's billing authority: the tuple's Organization must be
+     * the workspace-billing derivation for it, and the Organization, its owner
+     * membership and the Workspace binding are materialized in the same
+     * issuance batch. Only an explicit null (no hosted billing realm) skips
+     * both, so a caller cannot drop them by omission.
      */
-    readonly workspaceBillingAuthority?: string;
+    readonly workspaceBillingAuthority: string | null;
   },
   nativeCurrentness: (() => ReturnType<typeof auth103NativeRequestCurrentness>) | null,
 ) {
@@ -163,7 +164,7 @@ function createSharedRpPrincipalIssuanceStoreInternal(
         return invalid();
       const authority = options.workspaceBillingAuthority;
       let organization: readonly SqlStatement[] = [];
-      if (authority !== undefined) {
+      if (authority !== null) {
         if (
           !(await isWorkspaceBillingOrganization(authority, {
             workspaceRef: r.workspaceRef,
@@ -347,7 +348,7 @@ function createSharedRpPrincipalIssuanceStoreInternal(
 
 export function createSharedRpPrincipalIssuanceStore(options: {
   readonly sql: Sql;
-  readonly workspaceBillingAuthority?: string;
+  readonly workspaceBillingAuthority: string | null;
 }) {
   return createSharedRpPrincipalIssuanceStoreInternal(options, null);
 }
