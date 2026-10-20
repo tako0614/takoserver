@@ -5,6 +5,7 @@ import {
   type HostedSubscriptionProjection,
   type LedgerEntry,
   type OrganizationSubscription,
+  type WorkspaceUsageAmounts,
 } from "../api.ts";
 import { type Child, h, live, text } from "../dom.ts";
 import { consoleLocale, tr } from "../i18n.ts";
@@ -39,11 +40,13 @@ import {
   ICON,
   icon,
   openModal,
+  skeletonRows,
   stat,
   toast,
   when,
   whenReady,
 } from "../ui.ts";
+import { createWorkspaceUsageController, type WorkspaceUsageState } from "../workspace-usage.ts";
 
 /**
  * The wallet, and the ledger it is derived from.
@@ -57,9 +60,16 @@ export function billingPage(organizationId: string): Child {
   const wallet = resource(() => api.wallet(organizationId));
   const usageSummary = resource(() => api.usageSummary(organizationId));
   const hostedSubscription = resource(() => api.subscription(organizationId));
+  const workspaceUsage = createWorkspaceUsageController({
+    organizationId,
+    api,
+    isCurrent: () => currentOrganization()?.id === organizationId,
+  });
+  workspaceUsage.reload();
   const reloadWallet = () => {
     wallet.reload();
     usageSummary.reload();
+    workspaceUsage.reload();
   };
   const reloadSubscription = () => {
     hostedSubscription.reload();
@@ -326,7 +336,174 @@ export function billingPage(organizationId: string): Child {
         { retry: reloadWallet },
       ),
     ),
+    workspaceUsageCard(workspaceUsage),
   );
+}
+
+/**
+ * Where this period's usage went, by opaque Workspace reference.
+ *
+ * Read-only and paged within one frozen server snapshot. The totals row is the
+ * snapshot's Organization total, not a sum of the loaded pages, and the
+ * unattributed row is historical usage that carries no Workspace. A Host that
+ * has no breakdown answers `not_found`, and then the section is not drawn.
+ */
+function workspaceUsageCard(
+  controller: ReturnType<typeof createWorkspaceUsageController>,
+): HTMLElement {
+  return live(() => {
+    const state = controller.state();
+    if (state.status === "unavailable") return null;
+    return card(
+      tr("ワークスペース別の使用量", "Workspace usage"),
+      workspaceUsageBody(state, controller),
+      h(
+        "button",
+        {
+          class: "btn btn--sm",
+          type: "button",
+          ...(state.status === "loading" ? { disabled: true, "aria-busy": "true" } : {}),
+          onClick: controller.reload,
+        },
+        icon(ICON.refresh, 13),
+        text(tr("更新", "Refresh")),
+      ),
+    );
+  });
+}
+
+function workspaceUsageBody(
+  state: Exclude<WorkspaceUsageState, { readonly status: "unavailable" }>,
+  controller: ReturnType<typeof createWorkspaceUsageController>,
+): Child {
+  if (state.status === "loading") return skeletonRows(3);
+  if (state.status === "error")
+    return whenReady({ state: "error", error: state.error }, () => null, {
+      retry: controller.reload,
+    });
+  const { snapshot } = state;
+  return h(
+    "div",
+    null,
+    h(
+      "div",
+      { class: "card__body", style: { display: "grid", gap: "8px" } },
+      h(
+        "p",
+        { class: "dim" },
+        tr(
+          `対象期間：${when(snapshot.periodStart)} 〜 ${when(snapshot.periodEnd)} ・ 集計時点：${when(snapshot.snapshotAt)}`,
+          `Period ${when(snapshot.periodStart)} – ${when(snapshot.periodEnd)} · snapshot taken ${when(snapshot.snapshotAt)}`,
+        ),
+      ),
+      h(
+        "small",
+        { class: "dim" },
+        tr(
+          "すべての消費区分の使用量です。ワークスペースは参照IDで表示します。合計は組織全体の値で、ページを読み込んでも変わりません。未払いは使用済みで支払い前の額で、利用可能残高ではありません。",
+          "All consumption classes, by opaque Workspace reference. The total is the whole Organization's for this snapshot and does not change as pages load. Pending is used but not yet paid; it is not available balance.",
+        ),
+      ),
+      state.restarted
+        ? h(
+            "p",
+            { class: "notice", role: "status", "aria-live": "polite" },
+            tr(
+              "前の集計の有効期限が切れたため、新しい集計を最初のページから表示しています。",
+              "The earlier snapshot expired, so a new snapshot is shown from the first page.",
+            ),
+          )
+        : null,
+    ),
+    h(
+      "div",
+      { class: "table-scroll" },
+      h(
+        "table",
+        null,
+        h(
+          "thead",
+          null,
+          h(
+            "tr",
+            null,
+            h("th", null, tr("ワークスペース", "Workspace")),
+            h("th", { class: "num" }, tr("使用済み", "Used")),
+            h("th", { class: "num" }, tr("確保中", "Held")),
+            h("th", { class: "num" }, tr("未払い", "Pending")),
+          ),
+        ),
+        h(
+          "tbody",
+          null,
+          ...(state.rows.length === 0
+            ? [
+                h(
+                  "tr",
+                  null,
+                  h(
+                    "td",
+                    { class: "dim", colspan: 4 },
+                    tr(
+                      "この期間にワークスペースへ帰属する使用量はありません。",
+                      "No Workspace-attributed usage in this period.",
+                    ),
+                  ),
+                ),
+              ]
+            : state.rows.map((row) => workspaceUsageRow(copyable(row.workspaceRef), row))),
+          workspaceUsageRow(
+            h("span", { class: "dim" }, tr("ワークスペースなし", "Unattributed")),
+            snapshot.unattributed,
+          ),
+          workspaceUsageRow(
+            h("strong", null, tr("組織の合計", "Organization total")),
+            snapshot.totals,
+          ),
+        ),
+      ),
+    ),
+    state.cursor === null
+      ? null
+      : h(
+          "div",
+          { class: "card__body", style: { display: "grid", gap: "8px", justifyItems: "center" } },
+          state.more.status === "error"
+            ? h("div", { class: "notice notice--bad" }, text(explain(state.more.error)))
+            : null,
+          h(
+            "button",
+            {
+              class: "btn",
+              type: "button",
+              ...(state.more.status === "loading" ? { disabled: true, "aria-busy": "true" } : {}),
+              onClick: () => void controller.loadMore(),
+            },
+            text(
+              state.more.status === "loading"
+                ? tr("読み込み中…", "Loading…")
+                : state.more.status === "error"
+                  ? tr("もう一度試す", "Try again")
+                  : tr("さらに読み込む", "Load more"),
+            ),
+          ),
+        ),
+  );
+}
+
+function workspaceUsageRow(label: Child, amounts: WorkspaceUsageAmounts): HTMLElement {
+  return h(
+    "tr",
+    null,
+    h("td", null, label),
+    h("td", { class: "num mono" }, usageAmount(amounts.usedMicros)),
+    h("td", { class: "num mono" }, usageAmount(amounts.heldMicros)),
+    h("td", { class: "num mono" }, usageAmount(amounts.pendingMicros)),
+  );
+}
+
+function usageAmount(micros: string): string {
+  return micros === "0" ? "—" : formatMicrosCurrency(micros, "USD", uiLocale());
 }
 
 function ledgerTable(entries: readonly LedgerEntry[], currency: string): Child {
