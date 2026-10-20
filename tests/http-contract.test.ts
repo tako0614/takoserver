@@ -273,10 +273,38 @@ describe("published API description", () => {
     expect(await response.json()).toMatchObject({ error: { code: "not_found" } });
   });
 
-  test("names one server and one bearer scheme", () => {
+  test("names one server and preserves the bearer scheme", () => {
     expect(openApiDocument.openapi).toBe("3.1.0");
     expect(openApiDocument.servers).toEqual([{ url: "https://api.takoserver.com" }]);
     expect(openApiDocument.components.securitySchemes.bearerAuth.scheme).toBe("bearer");
+  });
+
+  test("documents the conditional Server cookie and exact Origin only on its control routes", () => {
+    expect(openApiDocument.components.securitySchemes.serverSharedSession).toMatchObject({
+      type: "apiKey",
+      in: "cookie",
+      name: "__Host-takoserver_shared_session",
+    });
+    expect(openApiDocument.components.securitySchemes.serverSharedSession.description).toContain(
+      "Requires the exact configured console Origin on every request",
+    );
+    for (const [path, method] of [
+      ["/v1/me", "get"],
+      ["/v1/organizations/{organizationId}/api-keys", "get"],
+      ["/v1/organizations/{organizationId}/wallet/checkout", "post"],
+      ["/v1/organizations/{organizationId}/payments/subscription", "get"],
+    ] as const) {
+      const operation = openApiDocument.paths[path]?.[method];
+      expect(operation?.security).toEqual([{ bearerAuth: [] }, { serverSharedSession: [] }]);
+    }
+    for (const [path, method] of [
+      ["/v1/organizations", "post"],
+      ["/v1/organizations/personal", "post"],
+      ["/v1/session", "delete"],
+      ["/v1/ai/chat/completions", "post"],
+    ] as const) {
+      expect(openApiDocument.paths[path]?.[method]?.security).toBeUndefined();
+    }
   });
 
   test("describes the native residual response as a closed tri-state schema", () => {

@@ -159,18 +159,18 @@ describe("same-request shared RP admission in Owner HTTP", () => {
     const me = await f.fetch("/v1/me", headers);
     expect(me.status).toBe(200);
     expect((await me.json()).principal.id).toBe(f.signed.principal.id);
+    const organizationsBefore = await f.sql.query("SELECT id FROM orgs ORDER BY id");
     const created = await f.fetch("/v1/organizations", {
       ...headers,
       method: "POST",
       body: { name: "Another local organization" },
     });
-    expect(created.status).toBe(201);
-    // The local Accounts personal-organization producer still applies its
-    // generic-ownership rule after shared-session admission.
+    expect(created.status).toBe(401);
     expect(
       (await f.fetch("/v1/organizations/personal", { ...headers, method: "POST", body: {} }))
         .status,
-    ).toBe(503);
+    ).toBe(401);
+    expect(await f.sql.query("SELECT id FROM orgs ORDER BY id")).toEqual(organizationsBefore);
     const keysPath = `/v1/organizations/${f.organization.id}/api-keys`;
     expect((await f.fetch(keysPath, headers)).status).toBe(200);
     const checkoutPath = `/v1/organizations/${f.organization.id}/wallet/checkout`;
@@ -216,6 +216,15 @@ describe("same-request shared RP admission in Owner HTTP", () => {
     expect(
       (
         await f.fetch(path, {
+          cookie: `${shared}; takoserver_session=${f.signed.sessionToken}`,
+          origin: SESSION_TEST_CONSOLE,
+          authorization: "",
+        })
+      ).status,
+    ).toBe(401);
+    expect(
+      (
+        await f.fetch(path, {
           cookie: `${shared}; takoserver_session=invalid`,
           origin: SESSION_TEST_CONSOLE,
         })
@@ -244,6 +253,28 @@ describe("same-request shared RP admission in Owner HTTP", () => {
         })
       ).status,
     ).toBe(200);
+  });
+
+  test("empty selected legacy cookies cannot fall through to a valid shared RP session", async () => {
+    const f = await fixture();
+    const shared = await f.sharedCookie();
+    const issuerCalls = f.issuer.requests.length;
+    const path = `/v1/organizations/${f.organization.id}/wallet/checkout`;
+    for (const legacyCookie of [
+      "takoserver_session=",
+      `takoserver_session=; takoserver_session=${f.signed.sessionToken}`,
+    ]) {
+      const response = await f.fetch(path, {
+        method: "POST",
+        cookie: `${legacyCookie}; ${shared}`,
+        origin: SESSION_TEST_CONSOLE,
+        body: { reference: "checkout-1", amountMinor: 50 },
+      });
+      expect(response.status).toBe(401);
+      expect((await response.json()).error.code).toBe("unauthenticated");
+    }
+    expect(f.issuer.requests).toHaveLength(issuerCalls);
+    expect(f.checkoutCalls).toEqual([]);
   });
 
   test("malformed, unknown, revoked and expired shared sessions cannot act; API key scope stays independent", async () => {

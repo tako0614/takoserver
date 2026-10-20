@@ -317,13 +317,25 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
 
   const authorization = (request: Request): string | null =>
     requestAuthorization(request, consoleOrigin);
+  const hasLegacySessionCookie = (request: Request): boolean =>
+    (request.headers.get("cookie") ?? "")
+      .split(";")
+      .some((part) => part.trim().split("=", 1)[0] === "takoserver_session");
 
   const requestActor = async (request: Request): Promise<Actor | null> => {
-    const credential = authorization(request);
+    const credential = request.headers.has("authorization")
+      ? request.headers.get("authorization")
+      : authorization(request);
     const actor = await accounts.authenticate(credential);
-    // An explicit header (including an empty one), or a selected legacy cookie,
-    // has already chosen its authority. A failed credential cannot try the RP.
-    if (actor || credential !== null || request.headers.has("authorization")) return actor;
+    // An explicit header (including an empty one), or a named legacy cookie
+    // (including an empty first value), has already chosen its authority.
+    if (
+      actor ||
+      credential !== null ||
+      request.headers.has("authorization") ||
+      hasLegacySessionCookie(request)
+    )
+      return actor;
     if (!sharedAuthenticate || !consoleOrigin || request.headers.get("origin") !== consoleOrigin)
       return null;
     try {
@@ -683,7 +695,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     }
 
     if (request.method === "POST" && url.pathname === "/v1/organizations") {
-      const actor = await requestActor(request);
+      const actor = await accounts.authenticate(authorization(request));
       if (actor?.kind !== "session") throw new AuthError("unauthenticated");
       const body = await jsonObject(request);
       exactKeys(body, ["name"]);
@@ -692,7 +704,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     }
 
     if (request.method === "POST" && url.pathname === "/v1/organizations/personal") {
-      const actor = await requestActor(request);
+      const actor = await accounts.authenticate(authorization(request));
       if (actor?.kind !== "session") throw new AuthError("unauthenticated");
       exactKeys(await jsonObject(request), []);
       const result = await accounts.createPersonalOrganization({ actor });

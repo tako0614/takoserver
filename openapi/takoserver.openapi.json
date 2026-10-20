@@ -21,6 +21,12 @@
         "type": "http",
         "scheme": "bearer",
         "description": "A session secret, an organization API key, a tenant-run Space-scoped token, a resource-scoped token, or a purpose-specific operator assertion, depending on the route."
+      },
+      "serverSharedSession": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "__Host-takoserver_shared_session",
+        "description": "The original Server RP session cookie, when that receiver is mounted. Requires the exact configured console Origin on every request. An explicit Authorization header or legacy session cookie selects that credential instead, even if invalid. It is not a Bearer token, Hosted/issuer cookie, or Org API key. The business request itself checks current Organization ownership; a prior GET is not a grant."
       }
     },
     "schemas": {
@@ -4656,7 +4662,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/ai/models": {
@@ -4860,7 +4874,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       },
       "get": {
         "summary": "List the organization's live API keys",
@@ -4868,7 +4890,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/worker-endpoint-origin-reservations/{reservationId}": {
@@ -5552,6 +5582,14 @@
               "pattern": "^(?![\\u0009-\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff])(?![\\s\\S]*[/\\u0000-\\u001f\\u007f-\\u009f])(?![\\s\\S]*[\\u0009-\\u000d\\u0020\\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000\\ufeff]$)[\\s\\S]+$"
             }
           }
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -5562,7 +5600,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/resources/{resourceUid}/execution-evidence": {
@@ -5674,7 +5720,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/resources/{resourceUid}/native-residual": {
@@ -5818,7 +5872,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/artifact-consumer-repairs/{deploymentId}": {
@@ -5907,7 +5969,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       },
       "post": {
         "summary": "Apply one exact provider-backed artifact-consumer repair plan",
@@ -6025,7 +6095,15 @@
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations": {
@@ -6035,7 +6113,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       },
       "post": {
         "summary": "Plan a migration against an exact commercial reservation",
@@ -6043,7 +6129,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}": {
@@ -6053,7 +6147,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/execute": {
@@ -6063,7 +6165,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/cutover": {
@@ -6073,7 +6183,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/rollback": {
@@ -6083,7 +6201,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/resources/{resourceUid}/migrations/{migrationId}/cancel": {
@@ -6093,7 +6219,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/attachments": {
@@ -6103,7 +6237,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       },
       "post": {
         "summary": "Resolve and create a Resource Attachment",
@@ -6111,7 +6253,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/attachments/{attachmentId}": {
@@ -6121,7 +6271,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       },
       "delete": {
         "summary": "Delete one Resource Attachment",
@@ -6129,7 +6287,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/operations": {
@@ -6139,7 +6305,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/api-keys/{apiKeyId}": {
@@ -6149,7 +6323,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/organizations/{organizationId}/wallet": {
@@ -6211,6 +6393,14 @@
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -6305,6 +6495,14 @@
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -6367,6 +6565,14 @@
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -6494,6 +6700,14 @@
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -6577,6 +6791,14 @@
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       },
       "patch": {
@@ -6678,6 +6900,14 @@
         },
         "x-required-scopes": [
           "payments:write"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -6751,6 +6981,14 @@
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -6854,6 +7092,14 @@
         },
         "x-required-scopes": [
           "payments:write"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -6949,6 +7195,14 @@
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -7043,6 +7297,14 @@
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -7145,6 +7407,14 @@
         },
         "x-required-scopes": [
           "wallet:write"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -7259,6 +7529,14 @@
         },
         "x-required-scopes": [
           "wallet:write"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -7343,6 +7621,14 @@
         ],
         "x-required-scopes": [
           "wallet:write"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -7437,6 +7723,14 @@
         ],
         "x-required-scopes": [
           "usage:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       },
       "post": {
@@ -7528,6 +7822,14 @@
         },
         "x-required-scopes": [
           "usage:write"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -7631,6 +7933,14 @@
         },
         "x-required-scopes": [
           "payments:write"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -7736,6 +8046,14 @@
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -7746,7 +8064,15 @@
           "200": {
             "description": "Success"
           }
-        }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
+        ]
       }
     },
     "/v1/payments/stripe/webhook": {
@@ -7969,6 +8295,14 @@
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       },
       "post": {
@@ -8148,6 +8482,14 @@
         },
         "x-required-scopes": [
           "payments:write"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       },
       "patch": {
@@ -8318,6 +8660,14 @@
         },
         "x-required-scopes": [
           "payments:write"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
@@ -8426,6 +8776,14 @@
         ],
         "x-required-scopes": [
           "wallet:read"
+        ],
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "serverSharedSession": []
+          }
         ]
       }
     },
