@@ -198,6 +198,11 @@ export async function inspectLiveWorkerVersion(
   input: {
     readonly signingKeyId?: string;
     readonly expectedSecrets?: readonly string[];
+    /**
+     * Exact script secret-store names when they legitimately differ from the
+     * served Version's bindings (`expectedSecrets` still governs those).
+     */
+    readonly expectedInventorySecrets?: readonly string[];
     readonly secretInventory?: readonly unknown[];
     /** JIT-enabled targets must select the immutable Version's exact profile. */
     readonly authorityProfile?: WorkerVersionAuthoritySelection;
@@ -562,6 +567,7 @@ async function inspectLiveWorkerVersionCore(
   input: {
     readonly signingKeyId?: string;
     readonly expectedSecrets?: readonly string[];
+    readonly expectedInventorySecrets?: readonly string[];
     readonly legacyPredecessorVersionId?: string;
     readonly secretInventory?: readonly unknown[];
     readonly authorityProfile?: WorkerVersionAuthoritySelection;
@@ -640,7 +646,7 @@ async function inspectLiveWorkerVersionCore(
   );
   assertExactSecretInventory(
     input.secretInventory ?? (await state.workerSecrets(target.workerName)),
-    input.expectedSecrets ?? expectedWorkerSecrets(target),
+    input.expectedInventorySecrets ?? input.expectedSecrets ?? expectedWorkerSecrets(target),
     phase,
   );
   await assertLiveWorkerRoutingClosure(phase, target, state);
