@@ -8,6 +8,7 @@ import {
   ftruncateSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
   readdirSync,
   readFileSync,
@@ -15,6 +16,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { types as nodeTypes } from "node:util";
 import { parseTakoformV2ApplicationConfig } from "../../src/takoform-v2/config.ts";
@@ -607,6 +609,46 @@ async function readOriginalUnknownUpload(
  * uploaded Version, its reviewed source and module, its own fresh key and the
  * unknown original it replaced. A missing, edited or foreign record refuses.
  */
+const COMPLETED_SELECTOR_KEYS = [
+  "accountId",
+  "artifactBytes",
+  "artifactDigest",
+  "artifactFiles",
+  "bucketName",
+  "convertBindingDigest",
+  "converted94BackupDigest",
+  "databaseId",
+  "databaseName",
+  "kind",
+  "moduleDigest",
+  "nextWriterEpoch",
+  "previousWriterEpoch",
+  "selectedStripeMode",
+  "sourceCommit",
+  "sourceRoot",
+  "versionId",
+  "workerName",
+].sort();
+// The first replacement's own seal, which names no earlier replacement.
+const COMPLETED_SEAL_KEYS = [
+  "accountId",
+  "argvDigest",
+  "artifactDigest",
+  "kind",
+  "moduleDigest",
+  "nextWriterEpoch",
+  "originalCandidateDigest",
+  "originalUnknownBindingDigest",
+  "previousWriterEpoch",
+  "publicJwkDigest",
+  "secretInputBytes",
+  "secretInputFiles",
+  "secretInputSeal",
+  "sourceCommit",
+  "sourceTreeDigest",
+  "workerName",
+].sort();
+
 export function assertCompletedReplacementRecords(
   root: string,
   expected: {
@@ -658,12 +700,15 @@ export function assertCompletedReplacementRecords(
     typeof receipt.modeBindingDigest !== "string" ||
     !SHA.test(receipt.modeBindingDigest) ||
     !isPlainRecord(selector) ||
+    JSON.stringify(Object.keys(selector).sort()) !== JSON.stringify(COMPLETED_SELECTOR_KEYS) ||
+    selector.kind !== "takoserver.money-held-normal-worker-selector@v1" ||
     selector.versionId !== expected.versionId ||
     selector.sourceCommit !== expected.sourceCommit ||
     selector.moduleDigest !== expected.moduleDigest ||
     selector.accountId !== expected.accountId ||
     selector.workerName !== expected.workerName ||
     !isPlainRecord(seal) ||
+    JSON.stringify(Object.keys(seal).sort()) !== JSON.stringify(COMPLETED_SEAL_KEYS) ||
     seal.kind !== "takoserver.money-inactive-version-replacement-dispatch-seal@v1" ||
     seal.originalUnknownBindingDigest !== expected.priorUnknownBindingDigest ||
     seal.originalCandidateDigest !==
@@ -1077,6 +1122,38 @@ export async function uploadMoneyNormalWorkerReplacementVersionForOriginalContex
   return uploadMoneyNormalWorkerVersionOwned(request, context, "replacement-after-unknown");
 }
 
+/**
+ * Which replacement root the next attempt may create. The first attempt takes
+ * v1; only when v1 exists (it must then be the completed first replacement) may
+ * v2 be created; v2 is the last attempt, and v2 without v1 is a foreign layout.
+ * Only a missing path counts as absent; any other lstat failure refuses.
+ */
+export function selectMoneyReplacementRoot(outputDirectory: string): {
+  readonly root: string;
+  readonly quarantineFirst: boolean;
+} {
+  const present = (name: string): boolean => {
+    try {
+      lstatSync(join(outputDirectory, name));
+      return true;
+    } catch (error) {
+      if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
+      throw preflightError("money replacement root presence is unreadable");
+    }
+  };
+  const first = present(REPLACEMENT_UPLOAD_ROOT);
+  if (present(SECOND_REPLACEMENT_UPLOAD_ROOT))
+    throw preflightError(
+      first
+        ? "money replacement already used its last attempt; no third root"
+        : "money second replacement root exists without the first; no third root",
+    );
+  return Object.freeze({
+    root: join(outputDirectory, first ? SECOND_REPLACEMENT_UPLOAD_ROOT : REPLACEMENT_UPLOAD_ROOT),
+    quarantineFirst: first,
+  });
+}
+
 /** What a replacement upload would do, read before any write or upload. */
 export interface MoneyNormalWorkerReplacementPreflight {
   readonly kind: "takoserver.money-inactive-version-replacement-preflight@v1";
@@ -1089,8 +1166,9 @@ export interface MoneyNormalWorkerReplacementPreflight {
  * Every read-only check the replacement upload makes before it creates its
  * root: the frozen target, the held convert context, the quarantined unknown
  * original and, if present, the completed first replacement (their custody,
- * Versions and the active maintenance deployment), and an absent next root.
- * It writes nothing, holds no lease and never uploads.
+ * Versions and the active maintenance deployment), the root layout, and the
+ * reviewed source binding. It changes no provider state, creates no root,
+ * holds no lease and never uploads; its reads use local scratch directories.
  */
 export async function preflightMoneyNormalWorkerReplacementVersionForOriginalContext(
   context: MoneyUnitHeldConvertContext,
@@ -1212,55 +1290,64 @@ async function uploadMoneyNormalWorkerVersionOwned(
     // A first replacement that completed its upload but lost its live owner
     // before suffix custody is quarantined read-only like the unknown original;
     // the next attempt gets a new root and a new key, never its receipt.
-    const firstReplacement = join(options.outputDirectory, REPLACEMENT_UPLOAD_ROOT);
-    let firstReplacementExists = true;
-    try {
-      lstatSync(firstReplacement);
-    } catch {
-      firstReplacementExists = false;
-    }
-    if (firstReplacementExists) {
+    if (selectMoneyReplacementRoot(options.outputDirectory).quarantineFirst) {
       quarantinedReplacement = await readOriginalUnknownUpload(
         context,
         target,
         selected,
         replacementState,
-        firstReplacement,
+        join(options.outputDirectory, REPLACEMENT_UPLOAD_ROOT),
         replacementUnknown,
       );
       await quarantinedReplacement.assertCurrent();
       assertInputs();
     }
   }
-  const root = join(
-    options.outputDirectory,
+  const root =
     attempt === "original"
-      ? ORIGINAL_UPLOAD_ROOT
-      : quarantinedReplacement === undefined
-        ? REPLACEMENT_UPLOAD_ROOT
-        : SECOND_REPLACEMENT_UPLOAD_ROOT,
-  );
+      ? join(options.outputDirectory, ORIGINAL_UPLOAD_ROOT)
+      : selectMoneyReplacementRoot(options.outputDirectory).root;
+  if (
+    attempt !== "original" &&
+    (root === join(options.outputDirectory, SECOND_REPLACEMENT_UPLOAD_ROOT)) !==
+      (quarantinedReplacement !== undefined)
+  )
+    throw preflightError("money replacement root layout changed during its preflight");
   if (preflightOnly) {
     if (attempt !== "replacement-after-unknown" || replacementUnknown === undefined)
       throw preflightError("money upload preflight exists only for a replacement attempt");
+    // The selected root is this attempt's only chance, so the checks the upload
+    // makes on the reviewed source happen here first, against a local scratch
+    // directory that is removed afterwards. No provider state is touched.
+    const scratch = mkdtempSync(join(tmpdir(), "money-replacement-preflight-"));
     try {
-      lstatSync(root);
-    } catch {
-      return Object.freeze({
-        kind: "takoserver.money-inactive-version-replacement-preflight@v1" as const,
-        attemptRoot:
-          quarantinedReplacement === undefined
-            ? REPLACEMENT_UPLOAD_ROOT
-            : SECOND_REPLACEMENT_UPLOAD_ROOT,
-        quarantinedVersionIds: Object.freeze([
-          replacementUnknown.versionId,
-          ...(quarantinedReplacement === undefined ? [] : [quarantinedReplacement.versionId]),
-        ]),
-      });
+      const build = await buildClosure.bindSource(
+        selected.normalSourceRoot,
+        buildClosure.sourceCommit,
+        scratch,
+      );
+      for (const earlier of [replacementUnknown, quarantinedReplacement])
+        if (
+          earlier !== undefined &&
+          (earlier.sourceCommit !== build.sourceCommit ||
+            earlier.sourceTreeDigest !== build.sourceTreeDigest)
+        )
+          throw preflightError("money replacement original source differs from the reviewed build");
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
     }
-    throw preflightError(
-      "money inactive Version attempt already exists or is unavailable; no retry",
-    );
+    assertInputs();
+    return Object.freeze({
+      kind: "takoserver.money-inactive-version-replacement-preflight@v1" as const,
+      attemptRoot:
+        quarantinedReplacement === undefined
+          ? REPLACEMENT_UPLOAD_ROOT
+          : SECOND_REPLACEMENT_UPLOAD_ROOT,
+      quarantinedVersionIds: Object.freeze([
+        replacementUnknown.versionId,
+        ...(quarantinedReplacement === undefined ? [] : [quarantinedReplacement.versionId]),
+      ]),
+    });
   }
   try {
     mkdirSync(root, { mode: 0o700 });

@@ -3,7 +3,10 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { assertCompletedReplacementRecords } from "../scripts/deploy/money-normal-worker-version-upload.ts";
+import {
+  assertCompletedReplacementRecords,
+  selectMoneyReplacementRoot,
+} from "../scripts/deploy/money-normal-worker-version-upload.ts";
 
 /**
  * The first replacement of the Money S3 v2 run completed its upload, then the
@@ -55,7 +58,19 @@ function completedRoot(
   const records: Record<string, Record<string, unknown>> = {
     receipt,
     selector: {
-      kind: "takoserver.money-normal-worker-selector@v1",
+      kind: "takoserver.money-held-normal-worker-selector@v1",
+      artifactBytes: 1,
+      artifactDigest: sha("artifact"),
+      artifactFiles: 1,
+      bucketName: "integration-ts-fixture",
+      convertBindingDigest: sha("convert"),
+      converted94BackupDigest: sha("converted94"),
+      databaseId: "00000000-0000-4000-8000-000000000000",
+      databaseName: "integration-ts-fixture",
+      nextWriterEpoch: sha("next"),
+      previousWriterEpoch: sha("previous"),
+      selectedStripeMode: "test",
+      sourceRoot: "/private/reviewed-normal-source",
       versionId: expected.versionId,
       sourceCommit: expected.sourceCommit,
       moduleDigest: expected.moduleDigest,
@@ -72,6 +87,13 @@ function completedRoot(
       sourceTreeDigest: expected.sourceTreeDigest,
       moduleDigest: expected.moduleDigest,
       publicJwkDigest: expected.publicJwkDigest,
+      argvDigest: sha("argv"),
+      artifactDigest: sha("artifact"),
+      nextWriterEpoch: sha("next"),
+      previousWriterEpoch: sha("previous"),
+      secretInputBytes: 1,
+      secretInputFiles: 2,
+      secretInputSeal: sha("secrets"),
     },
   };
   edit(records);
@@ -145,4 +167,46 @@ test("a foreign, edited or incomplete first replacement refuses the second attem
         reuse,
       ),
     ).toThrow("exact completed first replacement");
+});
+
+test("records with an extra key or a foreign selector kind refuse", () => {
+  for (const [name, edit] of [
+    [
+      "selector-extra",
+      (r: Record<string, Record<string, unknown>>) => set(r, "selector", "ready", true),
+    ],
+    [
+      "selector-kind",
+      (r: Record<string, Record<string, unknown>>) =>
+        set(r, "selector", "kind", "takoserver.money-normal-worker-selector@v1"),
+    ],
+    ["seal-extra", (r: Record<string, Record<string, unknown>>) => set(r, "seal", "resume", true)],
+  ] as const)
+    expect(() => assertCompletedReplacementRecords(completedRoot(name, edit), expected)).toThrow(
+      "exact completed first replacement",
+    );
+});
+
+test("the replacement root is v1, then v2 after a completed v1, and never a third", () => {
+  const V1 = "money-inactive-normal-version-replacement-after-unknown-v1";
+  const V2 = "money-inactive-normal-version-replacement-after-unknown-v2";
+  const layout = (name: string, roots: readonly string[]) => {
+    const output = join(ROOT, `layout-${name}`);
+    mkdirSync(output);
+    for (const root of roots) mkdirSync(join(output, root));
+    return output;
+  };
+  const fresh = layout("fresh", []);
+  expect(selectMoneyReplacementRoot(fresh)).toEqual({
+    root: join(fresh, V1),
+    quarantineFirst: false,
+  });
+  const afterFirst = layout("after-first", [V1]);
+  expect(selectMoneyReplacementRoot(afterFirst)).toEqual({
+    root: join(afterFirst, V2),
+    quarantineFirst: true,
+  });
+  expect(() => selectMoneyReplacementRoot(layout("both", [V1, V2]))).toThrow("no third root");
+  // An operator moving v1 aside must not open a third attempt that cannot see v2.
+  expect(() => selectMoneyReplacementRoot(layout("second-only", [V2]))).toThrow("no third root");
 });

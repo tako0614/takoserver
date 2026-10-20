@@ -5809,8 +5809,10 @@ export async function prepareIntegrationMoneyHeldSuffix98ReplacementUpload(
  * The read-only part of the replacement before it uploads: suffix custody is
  * absent, the post94 context selection reads current, and the uploader's own
  * preflight passes (frozen target, quarantined earlier attempts, maintenance
- * still active, an absent next root). Nothing is written, leased or uploaded,
- * so a caller runs it first and only then the upload.
+ * still active, the root layout, the reviewed source). It changes no provider
+ * state and creates no root, lease or upload (only local scratch reads), so a
+ * caller runs it first and only then the upload. The attempt it selects is the
+ * last one available: a failure after its root exists is final, by design.
  */
 export async function preflightIntegrationMoneyHeldSuffix98ReplacementUpload(
   options: MoneyUnitOriginalCutoverOptions,
