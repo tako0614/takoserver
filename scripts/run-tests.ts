@@ -1,9 +1,12 @@
 // Runs the portable test suite in isolated parallel worker processes.
 //
 //   bun run test                  complete gate: every test file, all must run
-//   bun run test:changed [ref]    development: only files affected by changes
-//                                 against `ref` (default origin/main), through
-//                                 Bun's import graph
+//   bun run test:changed          development: only files Bun's import graph
+//                                 links to changes against origin/main
+//                                 (`bun scripts/run-tests.ts --changed=<ref>`
+//                                 picks another base). Files read at runtime
+//                                 (SQL, config) do not select tests, so this is
+//                                 a fast check, not the gate.
 //
 // --parallel implies --isolate: each test file gets a fresh global scope and
 // module registry, so process-wide module mocks and singletons cannot cross
@@ -45,8 +48,8 @@ function usableCpus(): number {
   let cpus = availableParallelism();
   try {
     const [quota, period] = readFileSync("/sys/fs/cgroup/cpu.max", "utf8").trim().split(/\s+/u);
-    if (quota !== undefined && quota !== "max" && period !== undefined)
-      cpus = Math.min(cpus, Math.max(1, Math.floor(Number(quota) / Number(period))));
+    const limit = Math.floor(Number(quota) / Number(period));
+    if (quota !== "max" && Number.isFinite(limit)) cpus = Math.min(cpus, Math.max(1, limit));
   } catch {}
   return cpus;
 }

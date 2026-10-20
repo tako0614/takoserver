@@ -448,7 +448,13 @@ function replayAuth103NativeImportShapes(sources: readonly Buffer[]) {
     return Object.freeze({
       prefixShape,
       postShape: shape(database),
-      catalog: Object.freeze(database.query(AUTH103_NATIVE_CATALOG_QUERY).all()),
+      // Shared across callers through the content memo: freeze every row too.
+      catalog: Object.freeze(
+        database
+          .query(AUTH103_NATIVE_CATALOG_QUERY)
+          .all()
+          .map((row) => Object.freeze(row)),
+      ),
     });
   } catch {
     // Engine failures can contain an opaque predecessor SQL body.

@@ -638,13 +638,21 @@ function moneyPostExpectedPreservedShape(
     )
   )
     throw preflightError("money preserved shape requires the exact selected source inventory");
-  // The inputs are validated above on every call; the replay result is reused
-  // only for the identical bytes, and each replay still re-reads its files.
-  let contents: Buffer[];
-  try {
-    contents = files.map((file) => readFileSync(file.path));
-  } catch {
-    throw preflightError("money preserved shape source could not be read");
+  // Reuse a replay only for files whose bytes match their recorded size and
+  // digest on this call. Anything else replays as before, which refuses with
+  // the original stage-specific error; the replay itself re-reads and checks
+  // every file against the same metadata, so a result always belongs to its key.
+  const contents: Buffer[] = [];
+  for (const file of files) {
+    let bytes: Buffer;
+    try {
+      bytes = readFileSync(file.path);
+    } catch {
+      return replayMoneyPostExpectedPreservedShape(files, through);
+    }
+    if (bytes.length !== file.bytes || digest(bytes) !== file.digest)
+      return replayMoneyPostExpectedPreservedShape(files, through);
+    contents.push(Buffer.from(file.name, "utf8"), bytes);
   }
   return memoByContent(`money-preserved-shape@1:${through}`, contents, () =>
     replayMoneyPostExpectedPreservedShape(files, through),
