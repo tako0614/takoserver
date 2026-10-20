@@ -295,7 +295,10 @@ describe("published API description", () => {
       ["/v1/organizations/{organizationId}/payments/subscription", "get"],
     ] as const) {
       const operation = openApiDocument.paths[path]?.[method];
-      expect(operation?.security).toEqual([{ bearerAuth: [] }, { serverSharedSession: [] }]);
+      expect(operation).toHaveProperty("security", [
+        { bearerAuth: [] },
+        { serverSharedSession: [] },
+      ]);
     }
     for (const [path, method] of [
       ["/v1/organizations", "post"],
@@ -303,7 +306,9 @@ describe("published API description", () => {
       ["/v1/session", "delete"],
       ["/v1/ai/chat/completions", "post"],
     ] as const) {
-      expect(openApiDocument.paths[path]?.[method]?.security).toBeUndefined();
+      const operation = openApiDocument.paths[path]?.[method];
+      expect(operation).toBeDefined();
+      expect(operation).not.toHaveProperty("security");
     }
   });
 
