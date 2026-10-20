@@ -2446,10 +2446,13 @@ describe("original92 maintenance first-publication deploy contract", () => {
       "TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH",
       "TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_SELECTION_PATH",
       "TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_REPAIR_SELECTION_PATH",
+      "TAKOSERVER_FRESH_MONEY_WRITER_EPOCH_RECORD_PATH",
     ]);
     for (const path of [
       "scripts/deploy/target.ts",
       "scripts/deploy/schema-money-unit-owner.ts",
+      "scripts/deploy/money-fresh-writer-epoch.ts",
+      "scripts/deploy/fresh-v2-data-readback.ts",
       "scripts/deploy/qualification.ts",
       "scripts/deploy/worker-state.ts",
     ])

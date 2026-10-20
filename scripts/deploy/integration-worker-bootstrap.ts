@@ -51,6 +51,11 @@ import {
   readD1SchemaState,
 } from "./migrations.ts";
 import {
+  type FreshMoneyWriterEpochBinding,
+  type FreshMoneyWriterEpochRecord,
+  verifyFreshMoneyWriterEpoch,
+} from "./money-fresh-writer-epoch.ts";
+import {
   type CommandResult,
   REPOSITORY,
   requireEnvironment,
@@ -75,6 +80,7 @@ import {
   readAuditedMigrationArtifact,
   readCurrentAuditedMigrationSourceArtifact,
 } from "./schema.ts";
+import { moneyPost100ExpectedPreservedShape } from "./schema-money-unit-cutover.ts";
 import {
   activePublicJwk,
   createRemoteSigningDatabase,
@@ -232,6 +238,12 @@ export interface IntegrationWorkerBootstrapOptions {
   readonly v2StorageVerification?: IntegrationStorageGenerationTargetVerificationOptions;
   /** Test seam for the fresh-lineage unserved-data proof; production reads remote D1. */
   readonly freshV2DataReader?: FreshV2DataReader;
+  /**
+   * `v2-0100-money-preserved` only: the absolute owner-private 0600 path of the
+   * Financial Writer-epoch mint record the storage generation retained for
+   * this exact D1. Its first Host publication refuses without it.
+   */
+  readonly freshMoneyWriterEpochRecordPath?: string;
   readonly secretDirectory?: string;
   /** The exact keyring retained by the qualified CPE owner (never emitted). */
   readonly expectedRuntimeInputSealKeyring?: string;
@@ -1664,6 +1676,10 @@ export async function runIntegrationWorkerBootstrap(
     invocation = maintenanceData(invocation) as unknown as IntegrationWorkerBootstrapInvocation;
   }
   validateInvocation(invocation, target);
+  // Pure, before any credential or provider call: a fresh Money-preserved
+  // first Host must carry the writer, its minted epoch and the retained mint.
+  const freshMoneyWriter =
+    invocation.action === "apply" ? assertFreshMoneyPreservedHost(target, options) : undefined;
   const originalMaintenance =
     originalDescriptor === undefined
       ? undefined
@@ -1793,7 +1809,7 @@ export async function runIntegrationWorkerBootstrap(
       invocation.commit,
     );
     const artifactBefore = readBootstrapArtifact(sourceRepositoryRoot, target);
-    const expectedShape = deriveExpectedApplicationShape(artifactBefore);
+    const expectedShape = bootstrapExpectedShape(target, artifactBefore);
     const schemaReader = resolveSchemaReader(options, inspectionConfig, target, environment, run);
     const schemaBefore = await readSchema("preflight", schemaReader);
     assertCompleteSchema(schemaBefore, artifactBefore, expectedShape);
@@ -1822,6 +1838,7 @@ export async function runIntegrationWorkerBootstrap(
               ? {}
               : { freshV2DataReader: options.freshV2DataReader }),
             allowedTables: ["runtime_grant_keys"],
+            ...(freshMoneyWriter === undefined ? {} : { moneyWriterEpoch: freshMoneyWriter }),
           },
         );
       } catch {
@@ -2213,7 +2230,7 @@ async function statusExisting(
     const expectedSchedules = readExpectedWorkerSchedules("preflight", sourceRoot);
     const config = writeInspectionConfig(root, target, sourceRoot, invocation.commit);
     const artifact = readBootstrapArtifact(sourceRoot, target);
-    const expectedShape = deriveExpectedApplicationShape(artifact);
+    const expectedShape = bootstrapExpectedShape(target, artifact);
     const schemaReader = resolveSchemaReader(options, config, target, environment, run);
     const schema = await readSchema("preflight", schemaReader);
     assertCompleteSchema(schema, artifact, expectedShape);
@@ -2903,12 +2920,123 @@ function readBootstrapArtifact(sourceRoot: string, target: DeployTarget): Migrat
     case "v2-0100":
       return projectFreshIntegrationV2MigrationArtifact0100(source);
     case "v2-0100-money-preserved":
-      // Its first Host needs the selected Money writer and its retained epoch
-      // record; that publication is not qualified on this surface.
-      throw preflightError(
-        "integration Worker bootstrap does not yet serve the fresh v2-0100-money-preserved lineage",
-      );
+      // The same audited 0001-0100 files; its schema is the Money-preserved
+      // shape (bootstrapExpectedShape) and its Host serves only through the
+      // selected Money writer and retained epoch (assertFreshMoneyPreservedHost).
+      return projectFreshIntegrationV2MigrationArtifact0100(source);
   }
+}
+
+/**
+ * Pure: the bootstrap's own complete-schema predicate for the selected target's
+ * lineage against one D1 readback. Throws exactly as a bootstrap would.
+ */
+export function assertBootstrapLineageSchema(
+  target: DeployTarget,
+  state: D1SchemaState,
+  sourceRoot: string = REPOSITORY,
+): void {
+  const artifact = readBootstrapArtifact(resolve(sourceRoot), target);
+  assertCompleteSchema(state, artifact, bootstrapExpectedShape(target, artifact));
+}
+
+/** The exact application schema the selected lineage's D1 must already hold. */
+function bootstrapExpectedShape(target: DeployTarget, artifact: MigrationArtifact): string {
+  return takoformV2StorageLineage(target) === FRESH_MONEY_PRESERVED_LINEAGE
+    ? moneyPost100ExpectedPreservedShape(artifact.files)
+    : deriveExpectedApplicationShape(artifact);
+}
+
+const FRESH_MONEY_PRESERVED_LINEAGE = "v2-0100-money-preserved" as const;
+const FRESH_MONEY_WRITER_EPOCH_RECORD_LIMIT = 64 * 1024;
+
+export const FRESH_MONEY_PRESERVED_HOST_REQUIRES_WRITER =
+  "fresh v2-0100-money-preserved first Host requires the selected Money writer policy, its exact minted epoch and the retained epoch record" as const;
+
+/**
+ * Bounded read of the retained Writer-epoch mint record: an absolute canonical
+ * path with no symlink in any component, an owner-only single-link 0600 regular
+ * file, opened without following a link or blocking on a FIFO. Its contents
+ * (including the nonce) are never echoed.
+ */
+function readFreshMoneyWriterEpochRecord(path: string): unknown {
+  let fd: number | undefined;
+  try {
+    const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    const parent = lstatSync(dirname(path));
+    if (
+      !isAbsolute(path) ||
+      resolve(path) !== path ||
+      realpathSync(path) !== path ||
+      !parent.isDirectory() ||
+      (uid !== undefined && parent.uid !== uid) ||
+      (parent.mode & 0o022) !== 0
+    )
+      throw preflightError(FRESH_MONEY_PRESERVED_HOST_REQUIRES_WRITER);
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const stat = fstatSync(fd);
+    if (
+      !stat.isFile() ||
+      stat.nlink !== 1 ||
+      (stat.mode & 0o7777) !== 0o600 ||
+      (uid !== undefined && stat.uid !== uid) ||
+      stat.size <= 0 ||
+      stat.size > FRESH_MONEY_WRITER_EPOCH_RECORD_LIMIT
+    )
+      throw preflightError(FRESH_MONEY_PRESERVED_HOST_REQUIRES_WRITER);
+    const bytes = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < bytes.length) {
+      const read = readSync(fd, bytes, offset, bytes.length - offset, offset);
+      if (read <= 0) break;
+      offset += read;
+    }
+    if (offset !== bytes.length) throw preflightError(FRESH_MONEY_PRESERVED_HOST_REQUIRES_WRITER);
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    throw preflightError(FRESH_MONEY_PRESERVED_HOST_REQUIRES_WRITER);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/**
+ * A `v2-0100-money-preserved` first Host serves only through the Money writer
+ * bound to the epoch Financial minted for exactly this D1: the target selects
+ * the writer policy and that epoch, and the retained mint record reproduces it
+ * for the target's own account and generated D1. Pure before any provider call;
+ * the D1 readback later requires that epoch as its only authorized row.
+ */
+export function assertFreshMoneyPreservedHost(
+  target: DeployTarget,
+  options: IntegrationWorkerBootstrapOptions,
+):
+  | { readonly record: FreshMoneyWriterEpochRecord; readonly binding: FreshMoneyWriterEpochBinding }
+  | undefined {
+  if (takoformV2StorageLineage(target) !== FRESH_MONEY_PRESERVED_LINEAGE) return undefined;
+  const generation = /^integration-takoserver-([0-9a-f]{32})$/u.exec(target.d1.databaseName)?.[1];
+  const path = options.freshMoneyWriterEpochRecordPath;
+  if (
+    target.moneyCutoverWriterPolicy !== "transaction-fenced-usd-micros-v1" ||
+    target.moneyCutoverWriterEpoch === undefined ||
+    generation === undefined ||
+    options.originalMoneyMaintenance !== undefined ||
+    typeof path !== "string"
+  )
+    throw preflightError(FRESH_MONEY_PRESERVED_HOST_REQUIRES_WRITER);
+  const binding: FreshMoneyWriterEpochBinding = {
+    accountId: target.accountId,
+    databaseId: target.d1.databaseId,
+    databaseName: target.d1.databaseName,
+    generation,
+  };
+  const record = readFreshMoneyWriterEpochRecord(path);
+  try {
+    verifyFreshMoneyWriterEpoch(record, { binding, epoch: target.moneyCutoverWriterEpoch });
+  } catch {
+    throw preflightError(FRESH_MONEY_PRESERVED_HOST_REQUIRES_WRITER);
+  }
+  return Object.freeze({ record: record as FreshMoneyWriterEpochRecord, binding });
 }
 
 async function readV2StorageProof(

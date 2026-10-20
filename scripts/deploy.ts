@@ -1701,11 +1701,16 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
       return await runIntegrationStorageDisposal(invocation, target);
     case "takoserver-integration-host-retirement":
       return await runIntegrationHostRetirement(invocation, target);
-    case "takoserver-integration-worker-bootstrap":
+    case "takoserver-integration-worker-bootstrap": {
+      // Only a fresh v2-0100-money-preserved first Host reads this locator.
+      const freshMoneyWriterEpochRecordPath =
+        process.env.TAKOSERVER_FRESH_MONEY_WRITER_EPOCH_RECORD_PATH;
       return await runIntegrationWorkerBootstrap(
         { ...invocation, surface: "takoserver-integration-worker-bootstrap" },
         target,
+        freshMoneyWriterEpochRecordPath === undefined ? {} : { freshMoneyWriterEpochRecordPath },
       );
+    }
     case "takoserver-d1-schema": {
       if (invocation.throughMigration === "0093" || invocation.throughMigration === "0094") {
         if (invocation.environment !== "integration") {

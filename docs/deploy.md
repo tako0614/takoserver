@@ -354,9 +354,23 @@ Differences from `v2-0100`:
 - The apply record adds `moneyPreserved: { epochBindingDigest, shapeDigest }`
   next to `stripeRealmClaim`, and `moneyWriterEpochRecord: { path, digest }`
   for the private record. The epoch and nonce are not in the output.
-- `takoformV2.storageLineage: "v2-0100-money-preserved"` names it on a target,
-  but Worker bootstrap refuses it until its Money writer publication is
-  qualified.
+- `takoformV2.storageLineage: "v2-0100-money-preserved"` names it on a target.
+  Such a target may select `moneyCutoverWriterPolicy:
+  "transaction-fenced-usd-micros-v1"` with `moneyCutoverWriterEpoch`, but only
+  for an ordinary integration deploy of its own generated
+  `integration-takoserver-<generation>` D1/R2 pair, with no maintenance profile.
+  The plain `v2-0100` lineage still refuses a writer policy.
+- Its first Host goes through `takoserver-integration-worker-bootstrap`. Apply
+  refuses before any credential or provider call unless the target selects
+  that policy and the exact minted epoch, and
+  `TAKOSERVER_FRESH_MONEY_WRITER_EPOCH_RECORD_PATH` names the retained mint
+  record. That record must be an absolute canonical path with no symlink in
+  any component, and a single-link 0600 file owned by the operator.
+  `verifyFreshMoneyWriterEpoch` must reproduce it for the target's account and
+  generated D1. The bootstrap compares the D1 with the exact Money-preserved
+  shape. Its unserved readback then requires that epoch as the D1's only
+  authorized row, in addition to the seeds, the pin and the one signing
+  registration. The original-maintenance profile never selects this lineage.
 
 ```sh
 bun run deploy -- takoserver-integration-storage-generation --apply --environment=integration --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-0100-money-preserved --epoch-record-directory=<absolute-private-dir>
