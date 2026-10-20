@@ -1,5 +1,71 @@
 import { describe, expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { landingHtml, notFoundHtml } from "../src/landing.ts";
+import { ACTOR_NAMESPACE_FORM_URL } from "../src/takoform-v2/forms/actor-namespace.ts";
+import { AT_LEAST_ONCE_QUEUE_FORM_URL } from "../src/takoform-v2/forms/at-least-once-queue.ts";
+import { EDGE_KV_NAMESPACE_FORM_URL } from "../src/takoform-v2/forms/edge-kv-namespace.ts";
+import { OBJECT_BUCKET_FORM_URL } from "../src/takoform-v2/forms/object-bucket.ts";
+import { QUEUE_CONSUMER_FORM_URL } from "../src/takoform-v2/forms/queue-consumer.ts";
+import { SQLITE_DATABASE_FORM_URL } from "../src/takoform-v2/forms/sqlite-database.ts";
+import {
+  SQLITE_MIGRATION_APPLICATION_FORM_URL,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0,
+} from "../src/takoform-v2/forms/sqlite-migration-application.ts";
+import {
+  SQLITE_MIGRATION_SET_FORM_URL,
+  SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
+  SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
+} from "../src/takoform-v2/forms/sqlite-migration-set.ts";
+import { STATIC_ASSET_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/static-asset-bundle.ts";
+import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.ts";
+import { WORKER_CRON_TRIGGER_FORM_URL } from "../src/takoform-v2/forms/worker-cron-trigger.ts";
+import {
+  MODULE_WORKER_FORM_URL,
+  WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_ENDPOINT_FORM_URL,
+  WORKER_VERSION_FORM_URL,
+} from "../src/takoform-v2/forms/worker-specs.ts";
+import { DURABLE_WORKFLOW_FORM_URL } from "../src/workflow-v2-resource-authority.ts";
+
+/** "SQLiteMigrationSet 0.4.0" for the exact Form URL the Host composes. */
+function formLabel(url: string): string {
+  const match = /^https:\/\/edge\.forms\.takoform\.com\/forms\/([^/]+)\/([^/]+)\/$/u.exec(url);
+  if (!match) throw new TypeError(`unexpected Form URL ${url}`);
+  return `${match[1]} ${match[2]}`;
+}
+
+/**
+ * The fresh public Forms a complete Bun self-host composes, taken from the
+ * same constants the composition registers, so a successor version cannot
+ * leave the site or README advertising a retained one.
+ */
+const COMPOSED_FORMS = [
+  WORKER_BUNDLE_FORM_URL,
+  STATIC_ASSET_BUNDLE_FORM_URL,
+  SQLITE_MIGRATION_SET_FORM_URL,
+  MODULE_WORKER_FORM_URL,
+  WORKER_VERSION_FORM_URL,
+  WORKER_DEPLOYMENT_FORM_URL,
+  WORKER_CRON_TRIGGER_FORM_URL,
+  WORKER_ENDPOINT_FORM_URL,
+  SQLITE_DATABASE_FORM_URL,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL,
+  EDGE_KV_NAMESPACE_FORM_URL,
+  OBJECT_BUCKET_FORM_URL,
+  AT_LEAST_ONCE_QUEUE_FORM_URL,
+  QUEUE_CONSUMER_FORM_URL,
+  ACTOR_NAMESPACE_FORM_URL,
+  DURABLE_WORKFLOW_FORM_URL,
+].map(formLabel);
+
+/** Accepted only for existing Resources; never offered for a fresh create. */
+const RETAINED_ONLY_FORMS = [
+  SQLITE_MIGRATION_SET_FORM_URL_0_2_0,
+  SQLITE_MIGRATION_SET_FORM_URL_0_3_0,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_2_0,
+  SQLITE_MIGRATION_APPLICATION_FORM_URL_0_3_0,
+].map(formLabel);
 
 const site = {
   consoleOrigin: "https://console.takoserver.example",
@@ -33,26 +99,9 @@ describe("Takoserver public site", () => {
 
   test("explains Takoform and lists the Forms a self-host can compose, with versions", () => {
     const html = landingHtml(site);
-    for (const form of [
-      "WorkerBundle 0.2.0",
-      "StaticAssetBundle 0.2.0",
-      "SQLiteMigrationSet 0.2.0",
-      "ModuleWorker 0.3.0",
-      "WorkerVersion 0.5.0",
-      "WorkerDeployment 0.4.0",
-      "WorkerCronTrigger 0.3.0",
-      "WorkerEndpoint 0.3.0",
-      "SQLiteDatabase 0.2.0",
-      "SQLiteMigrationApplication 0.2.0",
-      "EdgeKVNamespace 0.2.0",
-      "ObjectBucket 0.2.0",
-      "AtLeastOnceQueue 0.2.0",
-      "QueueConsumer 0.3.0",
-      "ActorNamespace 0.3.0",
-      "DurableWorkflow 0.3.0",
-    ]) {
-      expect(html).toContain(`<code>${form}</code>`);
-    }
+    expect(COMPOSED_FORMS).toContain("SQLiteMigrationSet 0.4.0");
+    for (const form of COMPOSED_FORMS) expect(html).toContain(`<code>${form}</code>`);
+    for (const form of RETAINED_ONLY_FORMS) expect(html).not.toContain(`<code>${form}</code>`);
     expect(html).toContain("Takoform describes each kind of resource");
     expect(html).toContain(
       '<a href="https://takoform.com" data-i18n="takoform">About Takoform</a>',
@@ -64,6 +113,16 @@ describe("Takoserver public site", () => {
     expect(html).not.toMatch(
       /local Worker profile|data plane|bundle block|selfhost-v2-worker-primary/u,
     );
+  });
+
+  test("the README lists the same composed Form versions, not retained ones", () => {
+    const readme = readFileSync(new URL("../README.md", import.meta.url), "utf8");
+    const section = readme.slice(
+      readme.indexOf("## What you can deploy"),
+      readme.indexOf("## How it works"),
+    );
+    for (const form of COMPOSED_FORMS) expect(section).toContain(`\`${form}\``);
+    for (const form of RETAINED_ONLY_FORMS) expect(section).not.toContain(`\`${form}\``);
   });
 
   test("links each group of Forms to the guide step that uses it", () => {

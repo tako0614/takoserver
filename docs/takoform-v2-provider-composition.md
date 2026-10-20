@@ -67,17 +67,25 @@ read-only startup qualification; it must not mutate provider state during
 composition. A concrete backend still owns its Form-specific admission,
 execution, reconciliation, and native authority.
 
-The callback returns a plain map keyed by exact HTTPS Form URL. The canonical
-v2 application validates and snapshots it, rejects incomplete entries and
-collisions with the configured built-in artifact Forms, then uses that same
-snapshot for support and Operation execution. A missing callback retains the
-existing three-artifact-form behavior. Each `createWorkerEntry` instance has its
-own per-Env startup cache; simultaneous fetch and scheduled calls share one
-composition. Failed composition is not cached, so a repaired environment may
-retry; the ordinary Worker startup 503 envelope applies. A selected composer's
-callback, Form-map validation, or backend-constructor exception text is not
-returned to the caller. Existing no-composer configuration diagnostics remain
-unchanged.
+The callback returns either a plain map keyed by exact HTTPS Form URL, which
+means complete public Forms, or a plain object with exactly the two keys
+`forms` and `retainedForms`, each such a map. A retained-only entry serves the
+exact Form of already accepted Resources and Operations (replay, read, recovery
+and reference-safe DELETE) but never appears in `/support` or accepts a fresh
+CREATE or UPDATE. The canonical v2 application validates and snapshots the
+result, rejects incomplete entries and any URL that appears twice across the
+two maps or collides with the configured built-in artifact Forms, then uses
+that same snapshot for support and Operation execution. A missing callback
+retains the existing three-artifact-form behavior. Each `createWorkerEntry`
+instance has its own per-Env startup cache; simultaneous fetch and scheduled
+calls share one composition. When a Container Host acceptance composer,
+shared-login staging or native Auth103 source is selected, there is no such
+cache: each fetch and scheduled call composes again on its own primary
+request connection. Failed composition is not cached, so a repaired
+environment may retry; the ordinary Worker startup 503 envelope applies. A
+selected composer's callback, Form-map validation, or backend-constructor
+exception text is not returned to the caller. Existing no-composer
+configuration diagnostics remain unchanged.
 
 The hook creates no additional credential, private-input channel, or registry;
 `env` remains the existing operator-owned Worker binding object and must not be

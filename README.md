@@ -49,14 +49,14 @@ A Takoform Form defines one kind of resource, such as a Worker or a SQLite
 database, at a versioned URL. These are the Forms a Bun Host can serve:
 
 - **Artifacts:** `WorkerBundle 0.2.0`, `StaticAssetBundle 0.2.0` and
-  `SQLiteMigrationSet 0.2.0`. Worker code, static files and SQL migrations,
+  `SQLiteMigrationSet 0.4.0`. Worker code, static files and SQL migrations,
   pinned by URL and SHA-256 and kept by the Host. By themselves they do not run
   a Worker, serve assets, apply SQL or create an endpoint.
 - **Workers and HTTPS:** `ModuleWorker 0.3.0`, `WorkerVersion 0.5.0`,
   `WorkerDeployment 0.4.0`, `WorkerCronTrigger 0.3.0` and `WorkerEndpoint 0.3.0`.
   A Worker, its versions, how its traffic is split across up to eight of them,
   a schedule, and an HTTPS hostname.
-- **Data:** `SQLiteDatabase 0.2.0`, `SQLiteMigrationApplication 0.2.0`,
+- **Data:** `SQLiteDatabase 0.2.0`, `SQLiteMigrationApplication 0.4.0`,
   `EdgeKVNamespace 0.2.0` and `ObjectBucket 0.2.0`. SQLite databases, KV
   namespaces and object buckets, which a Worker reaches through Bindings, and
   the application of a migration set to a database.
@@ -75,9 +75,13 @@ A Host serves exactly the Forms its configuration composes:
   pinned `workerd`, the Workflow execution guard and the settings listed for
   that profile under [Settings](#settings). A partial Worker profile advertises
   none of these Forms.
-- Within that profile, `SQLiteMigrationApplication 0.2.0` also needs a
+- Within that profile, `SQLiteMigrationApplication 0.4.0` also needs a
   `sqliteMigrationSet` block, and `WorkerEndpoint 0.3.0` needs the listener on
   TCP 443; without one of them, only that Form is absent.
+- `SQLiteMigrationSet` and `SQLiteMigrationApplication` 0.2.0 and 0.3.0 are
+  retained, not offered: Resources a Host already accepted under them stay
+  readable, recoverable and deletable, but the support endpoint reports them
+  unsupported and a new create or update is refused with `unsupported_form`.
 
 Before relying on a Form, ask a running Host with an API key, passing the
 URL-encoded Form URL, for example

@@ -233,7 +233,7 @@ const FORM_GROUPS = [
   {
     title: "artifactsTitle",
     body: "artifactsBody",
-    forms: ["WorkerBundle 0.2.0", "StaticAssetBundle 0.2.0", "SQLiteMigrationSet 0.2.0"],
+    forms: ["WorkerBundle 0.2.0", "StaticAssetBundle 0.2.0", "SQLiteMigrationSet 0.4.0"],
     steps: [[DEPLOY_STEPS, "step6"]],
   },
   {
@@ -253,7 +253,7 @@ const FORM_GROUPS = [
     body: "dataBody",
     forms: [
       "SQLiteDatabase 0.2.0",
-      "SQLiteMigrationApplication 0.2.0",
+      "SQLiteMigrationApplication 0.4.0",
       "EdgeKVNamespace 0.2.0",
       "ObjectBucket 0.2.0",
     ],
