@@ -89,7 +89,13 @@ bun --no-env-file scripts/hosted-billing-business-e2e.ts \
 ```
 
 `start` first checks `/v1/me`, then invokes session-only
-`POST /v1/organizations/personal`. It reads wallet, usage summary, Workspace
+`POST /v1/organizations/personal`. A shared-auth Workspace ref (`wrk_` plus 32
+hex digits) is different: its billing Organization is derived from the
+target's `hostedBilling.billingAuthority` and was created at the owner's first
+login, and personal Organizations exist only for google/github principals. For
+such a ref, `start` requires that derived Organization among the session's
+`/v1/me` Organizations, journals it as a selection, and creates nothing. It
+then reads wallet, usage summary, Workspace
 summary, and subscription plan table; posts the supplied closed usage record;
 starts the selected subscription plan; and starts the top-up with its exact
 reference and amount. The returned Checkout URLs, when present, are preserved

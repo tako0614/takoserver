@@ -13,6 +13,7 @@ import {
   runVerify,
 } from "../scripts/hosted-billing-business-e2e.ts";
 import type { CheckoutReceipt } from "../src/subscription-custody.ts";
+import { workspaceBillingOrganizationRef } from "../src/workspace-billing-organization.ts";
 
 const dirs: string[] = [];
 afterEach(() => {
@@ -437,6 +438,90 @@ test("real route sequence retains exact commands, permits GET reentry, and never
     mode: 0o600,
   });
   await expect(runVerify({ ...f, client })).rejects.toThrow("handoff differs");
+});
+
+test("a shared-auth Workspace selects its derived Organization and never creates a personal one", async () => {
+  const f = fixture();
+  const authority = "takoserver.hosted.staging-test.v1";
+  const workspaceRef = `wrk_${"c".repeat(32)}`;
+  const inputRaw = f.inputRaw.replace('"workspace-original"', `"${workspaceRef}"`);
+  const input = parseBusinessInput(inputRaw);
+  const org = await workspaceBillingOrganizationRef(authority, workspaceRef);
+  let ownsOrg = true;
+  const calls: string[] = [];
+  const client = new BillingHttp(f.origin, "session-private", async (request) => {
+    const url = new URL(request.url);
+    calls.push(`${request.method} ${url.pathname}`);
+    if (url.pathname === "/v1/me")
+      return Response.json({
+        principal: {},
+        organizations: ownsOrg ? [{ id: org }] : [{ id: "org_other" }],
+      });
+    if (url.pathname === "/v1/organizations/personal") throw new Error("personal POST refused");
+    if (url.pathname.endsWith("/wallet/usage-records") && request.method === "POST")
+      return Response.json({ usageRecord: publicUsage(input, org) });
+    if (url.pathname.endsWith("/wallet/usage-records"))
+      return Response.json({ usageRecords: [publicUsage(input, org)], cursor: null });
+    if (url.pathname.endsWith("/wallet/usage-summary/workspaces"))
+      return Response.json({ workspaces: [{ workspaceRef }] });
+    if (url.pathname.endsWith("/wallet/usage-summary"))
+      return Response.json({ usageSummary: { organizationId: org } });
+    if (url.pathname.endsWith("/wallet")) return Response.json({ wallet: { organizationId: org } });
+    if (url.pathname.endsWith("/payments/subscription/commands/start/subscription-original"))
+      return Response.json({
+        receipt: {
+          reference: "subscription-original",
+          organizationId: org,
+          planKey: "monthly-original",
+          state: "open",
+          checkout: { url: "https://checkout.stripe.com/c/pay/cs_test_shared" },
+        },
+      });
+    if (url.pathname.endsWith("/payments/subscription") && request.method === "GET")
+      return Response.json({
+        subscription: null,
+        planTable: { plans: [{ planId: "monthly-original" }] },
+      });
+    if (url.pathname.endsWith("/payments/subscription"))
+      return Response.json({
+        checkout: {
+          state: "open",
+          id: "cs_test_shared",
+          url: "https://checkout.stripe.com/c/pay/cs_test_shared",
+        },
+      });
+    if (url.pathname.endsWith("/wallet/checkout/topup-original"))
+      return Response.json({
+        reference: "topup-original",
+        state: "paid",
+        checkout: { url: "https://checkout.stripe.com/c/pay/cs_test_topup" },
+      });
+    if (url.pathname.endsWith("/wallet/checkout"))
+      return Response.json({
+        checkout: { url: "https://checkout.stripe.com/c/pay/cs_test_topup" },
+      });
+    throw new Error("unexpected route");
+  });
+  // Without the target authority, or when the session lacks the derived Org, nothing is journaled.
+  await expect(runStart({ ...f, inputRaw, client })).rejects.toThrow("billing authority");
+  ownsOrg = false;
+  await expect(runStart({ ...f, inputRaw, client, billingAuthority: authority })).rejects.toThrow(
+    "does not own",
+  );
+  expect(() => statSync(f.journalPath)).toThrow();
+  ownsOrg = true;
+  await runStart({ ...f, inputRaw, client, billingAuthority: authority });
+  expect(calls).not.toContain("POST /v1/organizations/personal");
+  expect(calls.filter((call) => call.startsWith("POST"))).toHaveLength(3);
+  expect(calls).toContain(`POST /v1/organizations/${org}/wallet/usage-records`);
+  const journal = readFileSync(f.journalPath, "utf8");
+  expect(journal).toContain('"kind":"select"');
+  expect(journal).toContain(`"organizationId":"${org}"`);
+  expect(await runVerify({ ...f, inputRaw, client })).toMatchObject({
+    organizationId: org,
+    usagePublicFieldsMatch: true,
+    webhookProven: false,
+  });
 });
 
 for (const outcome of ["lost-ack", "conflict"] as const)
