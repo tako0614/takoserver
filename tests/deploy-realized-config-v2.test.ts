@@ -57,6 +57,39 @@ describe("realized Worker configuration", () => {
     }
   });
 
+  test("binds the shared-auth Accounts proof entrypoint only for the selected profile", () => {
+    const root = mkdtempSync(join(tmpdir(), "takoserver-config-accounts-proof-"));
+    try {
+      const realized = (selected: DeployTarget, name: string) =>
+        JSON.parse(
+          readFileSync(
+            writeWorkerConfig(selected, {
+              path: join(root, name),
+              main: "worker.js",
+              commit: "a".repeat(40),
+            }),
+            "utf8",
+          ),
+        ) as { services?: readonly Record<string, string>[] };
+      const integration = { ...target, environment: "integration" } satisfies DeployTarget;
+      expect(realized(integration, "plain.json").services ?? []).not.toContainEqual(
+        expect.objectContaining({ binding: "ACCOUNTS_FINANCIAL_PROOF" }),
+      );
+      expect(
+        realized(
+          { ...integration, auth103NativeProfile: "root-shared-auth-staging-v1" },
+          "shared-auth.json",
+        ).services,
+      ).toContainEqual({
+        binding: "ACCOUNTS_FINANCIAL_PROOF",
+        service: "takosumi-auth-staging",
+        entrypoint: "AccountsFinancialProof",
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("realizes the pre-0043 artifact I/O compatibility mode as an exact version binding", () => {
     const root = mkdtempSync(join(tmpdir(), "takoserver-config-artifact-quiescence-"));
     try {

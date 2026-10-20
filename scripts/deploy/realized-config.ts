@@ -112,6 +112,12 @@ export function writeWorkerConfig(target: DeployTarget, options: WorkerConfigOpt
       : neutralConfigWithTopology;
   const signingKeyId = options.signingKeyId ?? effectiveSigningKeyId(target);
   const services = [
+    // The selected shared-auth profile's financial identity proofs come only
+    // from its Accounts Worker's named entrypoint; without the profile no
+    // binding exists and the RP proof stays default-deny.
+    ...(target.auth103NativeProfile === undefined
+      ? []
+      : [{ binding: "ACCOUNTS_FINANCIAL_PROOF", ...SHARED_AUTH_STAGING_ACCOUNTS_FINANCIAL_PROOF }]),
     ...(target.cloudflareProviderExecutor === undefined || isArtifactBlobIoQuiescedTarget(target)
       ? []
       : [
@@ -357,6 +363,12 @@ function exactPublicWorkerProvenance(
   }
   return value;
 }
+
+/** The Accounts Worker entrypoint behind `root-shared-auth-staging-v1` (same account). */
+export const SHARED_AUTH_STAGING_ACCOUNTS_FINANCIAL_PROOF = Object.freeze({
+  service: "takosumi-auth-staging",
+  entrypoint: "AccountsFinancialProof",
+} as const);
 
 /** Names only; Cloudflare never returns or receives secret bytes here. */
 export function expectedWorkerSecrets(target: DeployTarget): readonly string[] {
