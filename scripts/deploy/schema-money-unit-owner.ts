@@ -9,6 +9,7 @@ import {
   lstatSync,
   mkdtempSync,
   openSync,
+  readdirSync,
   readFileSync,
   readSync,
   realpathSync,
@@ -39,7 +40,7 @@ import {
   resolveCloudflareCredential,
   runCommand,
 } from "./process.ts";
-import { writeWorkerConfig } from "./realized-config.ts";
+import { expectedWorkerSecrets, writeWorkerConfig } from "./realized-config.ts";
 import {
   captureMoneyUnitConverted94Backup,
   type MoneyCustodyPhase,
@@ -75,9 +76,112 @@ import {
   expectedExactBindingClosure,
   optionalExactPlainTextBinding,
   parseWorkerDeploymentHistory,
+  parseWorkerSecretInventory,
+  versionSecretBindingNames,
 } from "./worker-state.ts";
+import { parseWranglerVersionUploadOutput } from "./wrangler-state.ts";
 
 const SHA = /^sha256:[0-9a-f]{64}$/u;
+
+const RETAINED_INACTIVE_UPLOAD_ENTRIES = [
+  "CUSTODY",
+  "INTENT.json",
+  "REQUEST.json",
+  "SIGNING-GENESIS.json",
+  "build-owner",
+  "wrangler-version-upload.jsonl",
+];
+
+/**
+ * Read-only witness for the script secret store of the original maintenance
+ * Worker after the first normal-Version upload (outcome UNKNOWN). Uploading
+ * an inactive Version with --secrets-file puts its secret names into the
+ * script store although the served maintenance Version binds none. The names
+ * are accepted only when the retained upload root, its CUSTODY files, its
+ * signing genesis and a GET of the uploaded (never served) Version all name
+ * exactly the same secrets. This grants nothing: it is DATA that lets the
+ * existing exact checks continue, and any other inventory still refuses.
+ */
+export async function readRetainedInactiveUploadWitness(input: {
+  readonly root: string;
+  readonly workerName: string;
+  readonly allowedNames: readonly string[];
+  readonly workerVersion: (workerName: string, versionId: string) => Promise<unknown>;
+}): Promise<{
+  readonly names: readonly string[];
+  readonly versionId: string;
+  assertCurrent(): void;
+}> {
+  const refuse = (): never => {
+    throw preflightError(
+      "money maintenance Worker secret store differs from its retained inactive upload",
+    );
+  };
+  let entries: string[];
+  try {
+    if (!lstatSync(input.root).isDirectory()) return refuse();
+    entries = readdirSync(input.root).sort();
+  } catch {
+    return refuse();
+  }
+  if (JSON.stringify(entries) !== JSON.stringify([...RETAINED_INACTIVE_UPLOAD_ENTRIES].sort()))
+    return refuse();
+  const custody = join(input.root, "CUSTODY");
+  let names: string[];
+  try {
+    if (!lstatSync(custody).isDirectory()) return refuse();
+    names = readdirSync(custody).sort();
+  } catch {
+    return refuse();
+  }
+  if (names.length === 0 || names.some((name) => !input.allowedNames.includes(name)))
+    return refuse();
+  const files = [
+    join(input.root, "SIGNING-GENESIS.json"),
+    join(input.root, "wrangler-version-upload.jsonl"),
+    ...names.map((name) => join(custody, name)),
+  ];
+  const seal = () =>
+    files.map((path) => {
+      const stat = lstatSync(path, { bigint: true });
+      if (!stat.isFile() || stat.nlink !== 1n) return refuse();
+      return [path, stat.dev, stat.ino, stat.size, stat.mtimeNs].join(":");
+    });
+  const before = seal();
+  let genesisNames: unknown;
+  let versionId: string;
+  try {
+    genesisNames = (
+      JSON.parse(readFileSync(join(input.root, "SIGNING-GENESIS.json"), "utf8")) as {
+        secretNames?: unknown;
+      }
+    ).secretNames;
+    versionId = parseWranglerVersionUploadOutput(
+      readFileSync(join(input.root, "wrangler-version-upload.jsonl"), "utf8"),
+      input.workerName,
+    ).versionId;
+  } catch {
+    return refuse();
+  }
+  if (
+    !Array.isArray(genesisNames) ||
+    JSON.stringify([...genesisNames].sort()) !== JSON.stringify(names)
+  )
+    return refuse();
+  const bound = versionSecretBindingNames(
+    "preflight",
+    versionId,
+    await input.workerVersion(input.workerName, versionId),
+  );
+  if (JSON.stringify(bound) !== JSON.stringify(names)) return refuse();
+  return Object.freeze({
+    names: Object.freeze(names),
+    versionId,
+    assertCurrent() {
+      if (JSON.stringify(seal()) !== JSON.stringify(before)) refuse();
+    },
+  });
+}
 const COMMIT = /^[0-9a-f]{40}$/u;
 const ACCOUNT = /^[0-9a-f]{32}$/u;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
@@ -3719,12 +3823,45 @@ async function loadMoneyUnitOwnerOptions(
         "takoserver.integration-worker-bootstrap-original-money-maintenance-apply@v1" ||
         selectedPublication.resultKind ===
           "takoserver.integration-worker-original-money-maintenance-successor-apply@v1");
+    // The original maintenance Version binds no secret. Its script store may
+    // still hold exactly the names of the retained inactive upload, witnessed
+    // by that upload's custody and a GET of the uploaded Version.
+    let inventory: readonly unknown[] | undefined;
+    let retained: Awaited<ReturnType<typeof readRetainedInactiveUploadWitness>> | undefined;
+    if (originalMaintenancePublication) {
+      inventory = await selectedState.workerSecrets(target.workerName);
+      const held = [...parseWorkerSecretInventory(inventory, "preflight")].sort();
+      if (held.length > 0) {
+        retained = await readRetainedInactiveUploadWitness({
+          root: join(declaration.outputDirectory, "money-inactive-normal-version"),
+          workerName: target.workerName,
+          allowedNames: expectedWorkerSecrets(plainTarget),
+          workerVersion: (workerName, versionId) =>
+            selectedState.workerVersion(workerName, versionId),
+        });
+        if (JSON.stringify(held) !== JSON.stringify(retained.names))
+          throw preflightError(
+            "money maintenance Worker secret store differs from its retained inactive upload",
+          );
+      }
+    }
     const live = await inspectLiveWorkerVersion("preflight", selectedTarget, selectedState, {
-      ...(originalMaintenancePublication ? { expectedSecrets: [] } : {}),
+      ...(originalMaintenancePublication
+        ? {
+            expectedSecrets: [],
+            ...(inventory === undefined ? {} : { secretInventory: inventory }),
+            ...(retained === undefined ? {} : { expectedInventorySecrets: retained.names }),
+          }
+        : {}),
       ...(selectedTarget.integrationE2eCredentialAuthority === undefined
         ? {}
         : { authorityProfile: { kind: "provenance-bound-jit" as const } }),
     });
+    if (retained !== undefined) {
+      if (retained.versionId === live.history.versionId)
+        throw preflightError("money retained inactive upload became the served Version");
+      retained.assertCurrent();
+    }
     const expectedCommit = maintenance ? declaration.maintenanceCommit : declaration.resumeCommit;
     const expectedDigest = maintenance
       ? declaration.maintenanceModuleDigest
