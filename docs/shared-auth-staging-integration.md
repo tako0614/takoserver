@@ -190,6 +190,44 @@ native acknowledgement semantics, a fake store or a common-primary graph.
 No driver, entry, schema or Financial source change is implemented in these
 RP files.
 
+## Workspace billing Organization
+
+The Organization in the billing-organization tuple is derived, not created
+by a call between the services. Contract
+`takoserver.workspace-billing-organization@v1` in
+`src/workspace-billing-organization.ts` defines it as `org_wb_` followed by
+the first 32 lowercase hex digits of SHA-256 over the compact JSON array
+`["takoserver.workspace-billing-organization@v1", billingAuthority,
+workspaceRef]`. `billingAuthority` is the served financial realm's value, and
+the Accounts setting `TAKOSUMI_ACCOUNTS_WORKSPACE_BILLING_AUTHORITY` must equal
+it. `workspaceRef` uses the wallet Workspace grammar of at most 128
+characters.
+
+Accounts computes the id when it ensures a Workspace's Organization. The same
+Workspace and authority always give the same id, so a retry creates no second
+Organization and needs no Takoserver credential. Takoserver never accepts a
+tuple whose `organizationId` differs from the derivation for its own realm.
+
+The Organization rows are written in the fresh principal issuance that mints
+the Workspace owner, because `orgs` requires an owner principal. The
+materialization statements first insert the Org, then its owner membership,
+then the Workspace binding, so Root 0105's birth capture sees the Org before
+any Org-keyed trace row. A later login by the same principal inserts nothing.
+A different owner, a missing owner membership or a Workspace bound to another
+Org aborts the issuing batch. The id locates product records and grants no
+payment consent.
+
+Known limitation: there is no owner transfer. If a subject's active binding is
+revoked and the same subject later receives a fresh principal, the Org remains
+owned by the previous principal and that issuance is refused. This fail-closed
+behavior is accepted for staging and must be revisited before production.
+A second known limitation: Workspace bindings are global and the first one
+wins. An Org with `wallet:write` that posts a hold naming another
+Workspace's `workspaceRef` before its owner's first login binds it first, and
+that owner's issuance is then refused. Accounts refs are random 128-bit values
+shown only to their owner. Reserving shared-auth Workspace refs against
+hold-time binding remains a pre-production item.
+
 ## Existing behavior that requires a separate owner change
 
 The audit base is Takoserver commit
