@@ -5,19 +5,22 @@ import { createLedger } from "../src/ledger.ts";
 import { type Sql, SqlError } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { type BillingGrant, createStripeBillingStore } from "../src/stripe-billing-store.ts";
+import { databaseAfter } from "./helpers/migrated-database.ts";
 
 const start = "2026-10-14T00:00:00.000Z";
 const clock = () => new Date(start);
 
 async function fixture(now = clock) {
-  const db = new Database(":memory:");
   const billingMigration = await Bun.file(
     new URL("../migrations/0095_stripe_billing.sql", import.meta.url),
   ).text();
-  for (const migration of MIGRATIONS) {
-    // Exercise the on-disk billing SQL in its canonical dependency position.
-    db.exec(migration.name === "0095_stripe_billing.sql" ? billingMigration : migration.sql);
-  }
+  // Exercise the on-disk billing SQL in its canonical dependency position
+  // (the image is keyed by these exact statements).
+  const db = databaseAfter(
+    MIGRATIONS.map((migration) =>
+      migration.name === "0095_stripe_billing.sql" ? billingMigration : migration.sql,
+    ),
+  );
   const sql = createSqliteSql(db);
   const ledger = createLedger(sql, now);
   const store = createStripeBillingStore({ sql, clock: now });

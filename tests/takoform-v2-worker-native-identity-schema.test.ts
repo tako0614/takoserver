@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,7 @@ import {
   type V2WorkerNativeIdentityDomain,
   v2WorkerNativeIdentityDomainReady,
 } from "../src/takoform-v2/worker-native-identity-schema.ts";
+import { databaseBuiltOnce } from "./helpers/migrated-database.ts";
 
 // Synthetic schema component fixtures copied from the allowed 0079/0087/0088
 // effective source closure. This is not canonical migration 0102 or a genuine
@@ -781,21 +783,33 @@ test("native identity domain: MAIN incoming FK cannot be hidden by a TEMP referr
 // All raw rows remain synthetic: never actual final0101, native permission,
 // canonical0102 registration/application, or staging qualification.
 function candidateFixture(file = ":memory:"): Database {
-  const db = new Database(file);
-  try {
+  const directory = join(import.meta.dir, "../migrations");
+  const names = readdirSync(directory)
+    .filter((name) => /^\d{4}_.+\.sql$/u.test(name) && Number(name.slice(0, 4)) <= 88)
+    .sort();
+  expect(names).toHaveLength(88);
+  const sources = names.map((name) => readFileSync(join(directory, name), "utf8"));
+  // The 0001-0088 statement replay runs once per run for these exact bytes;
+  // each caller gets its own copy and the same connection pragmas as before.
+  // A file-backed caller (the WAL writer test) keeps the real replay on disk.
+  const replay = (db: Database) => {
     db.exec("PRAGMA foreign_keys = ON; PRAGMA ignore_check_constraints = OFF;");
-    const directory = join(import.meta.dir, "../migrations");
-    const names = readdirSync(directory)
-      .filter((name) => /^\d{4}_.+\.sql$/u.test(name) && Number(name.slice(0, 4)) <= 88)
-      .sort();
-    expect(names).toHaveLength(88);
-    for (const name of names)
-      executeSqliteMigrationStatements(db, readFileSync(join(directory, name), "utf8"));
-    return db;
-  } catch (error) {
-    db.close();
-    throw error;
+    for (const source of sources) executeSqliteMigrationStatements(db, source);
+  };
+  if (file !== ":memory:") {
+    const db = new Database(file);
+    try {
+      replay(db);
+      return db;
+    } catch (error) {
+      db.close();
+      throw error;
+    }
   }
+  const key = createHash("sha256").update(JSON.stringify(sources)).digest("hex");
+  const db = databaseBuiltOnce(`native-identity-candidate88:${key}`, replay);
+  db.exec("PRAGMA foreign_keys = ON; PRAGMA ignore_check_constraints = OFF;");
+  return db;
 }
 
 function candidateCurrentFixture(): Database {

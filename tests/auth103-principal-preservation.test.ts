@@ -1,4 +1,4 @@
-import { Database, SQLiteError } from "bun:sqlite";
+import { type Database, SQLiteError } from "bun:sqlite";
 import { afterEach, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { v2ContainerOwnerMigrationCandidate } from "../scripts/deploy/v2-container-owner-migration-candidate.ts";
@@ -18,6 +18,7 @@ import {
   type FreshSharedPrincipal,
 } from "../src/shared-principal-authority.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { databaseAfter } from "./helpers/migrated-database.ts";
 
 // A migration-component regression against historical100 plus actual owner101/102
 // candidates. It neither registers those candidates nor establishes a deployed
@@ -130,24 +131,21 @@ function checkpoint(db: Database) {
 }
 
 async function fixture() {
-  const db = new Database(":memory:");
-  opened.add(db);
   const prefix = MIGRATIONS.filter(({ name }) => Number(name.slice(0, 4)) <= 100);
   expect(prefix.length).toBe(100);
   expect(prefix.map(({ name }) => Number(name.slice(0, 4)))).toEqual(
     Array.from({ length: 100 }, (_, i) => i + 1),
   );
-  for (const migration of prefix) {
-    try {
-      db.exec(migration.sql);
-    } catch (error) {
-      // Native SQLite diagnostics may retain the historical SQL query. Never
-      // attach/rethrow that object or render protected migration bodies.
-      throw new Error(
-        `historical setup ${migration.name} failed (opaque diagnostic ${digest(String(error))})`,
-      );
-    }
+  let db: Database;
+  try {
+    // The exact 0001-0100 prefix, built once per run from the real chain.
+    db = databaseAfter(prefix.map(({ sql }) => sql));
+  } catch (error) {
+    // Native SQLite diagnostics may retain the historical SQL query. Never
+    // attach/rethrow that object or render protected migration bodies.
+    throw new Error(`historical setup failed (opaque diagnostic ${digest(String(error))})`);
   }
+  opened.add(db);
   const sql = createSqliteSql(db);
   await sql.batch(v2ContainerOwnerMigrationCandidate());
   await sql.batch(

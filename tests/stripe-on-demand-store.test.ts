@@ -18,6 +18,7 @@ import {
   type StripeOnDemandFundingProof,
   verifyStripeOnDemandFunding,
 } from "../src/stripe-on-demand-verification.ts";
+import { migratedDatabase } from "./helpers/migrated-database.ts";
 
 const preparedAt = "2026-10-15T12:00:00.000Z";
 const dispatchedAt = "2026-10-15T12:00:01.000Z";
@@ -41,9 +42,7 @@ async function fixture(
     readonly wrap?: (sql: Sql) => Sql;
   } = {},
 ) {
-  const db = new Database(":memory:");
-  for (const migration of options.extended === false ? MIGRATIONS.slice(0, 99) : MIGRATIONS)
-    db.exec(migration.sql);
+  const db = migratedDatabase(options.extended === false ? 99 : MIGRATIONS.length);
   const originalSql = createSqliteSql(db);
   const sql = options.wrap?.(originalSql) ?? originalSql;
   let instant = fundedAt;
