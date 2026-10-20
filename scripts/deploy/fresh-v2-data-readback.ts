@@ -1,5 +1,11 @@
+import { MONEY_CUTOVER_WRITER_EPOCH_PATTERN } from "../../src/money-cutover-sql.ts";
 import { RemoteD1 } from "./d1.ts";
 import { DeployError } from "./errors.ts";
+import {
+  type FreshMoneyWriterEpochBinding,
+  type FreshMoneyWriterEpochRecord,
+  verifyFreshMoneyWriterEpoch,
+} from "./money-fresh-writer-epoch.ts";
 import { type CommandResult, runCommand, wranglerCommand } from "./process.ts";
 
 /**
@@ -7,9 +13,16 @@ import { type CommandResult, runCommand, wranglerCommand } from "./process.ts";
  * payload; a later audited source migration never widens any selector.
  * `v2-0091`, `v2-0092` and `v2-0100` are staging-only: only the integration
  * generation surface offers them. `v2-0100` also carries the test Stripe
- * realm pin its import claimed.
+ * realm pin its import claimed. `v2-0100-money-preserved` is the staging-only
+ * Money-preserved 0100 shape with that pin and one fresh Writer epoch row.
  */
-export type FreshV2D1Lineage = "v2-0088" | "v2-0089" | "v2-0091" | "v2-0092" | "v2-0100";
+export type FreshV2D1Lineage =
+  | "v2-0088"
+  | "v2-0089"
+  | "v2-0091"
+  | "v2-0092"
+  | "v2-0100"
+  | "v2-0100-money-preserved";
 
 /** The exact migration-ledger row count each fresh profile leaves behind. */
 const FRESH_V2_LEDGER_ROWS: Readonly<Record<FreshV2D1Lineage, number>> = {
@@ -18,6 +31,7 @@ const FRESH_V2_LEDGER_ROWS: Readonly<Record<FreshV2D1Lineage, number>> = {
   "v2-0091": 91,
   "v2-0092": 92,
   "v2-0100": 100,
+  "v2-0100-money-preserved": 100,
 };
 
 export interface FreshV2DataReadback {
@@ -29,6 +43,8 @@ export interface FreshV2DataReadback {
   /** Read only for `v2-0100`: the 0094 policy seed and the claimed realm pin. */
   readonly moneyUnitPolicy?: readonly Record<string, unknown>[];
   readonly stripeRealm?: readonly Record<string, unknown>[];
+  /** Read only for `v2-0100-money-preserved`: every authorized Writer epoch row. */
+  readonly authorizedEpoch?: readonly Record<string, unknown>[];
 }
 
 /** Test seam; deploy callers always use authoritative remote D1 queries. */
@@ -50,6 +66,15 @@ export interface FreshV2DataReadbackOptions {
    * table must still be exactly as the migrations left it.
    */
   readonly allowedTables?: readonly string[];
+  /**
+   * `v2-0100-money-preserved` only: the retained mint for this exact D1. With
+   * it the single authorized-epoch row must be that epoch; without it (status,
+   * which never holds the record) the row must only be one well-formed epoch.
+   */
+  readonly moneyWriterEpoch?: {
+    readonly record: FreshMoneyWriterEpochRecord;
+    readonly binding: FreshMoneyWriterEpochBinding;
+  };
 }
 
 const FRESH_V2_SEED_TABLES = [
@@ -61,6 +86,10 @@ const FRESH_V2_SEED_TABLES = [
 const FRESH_V2_0100_SEED_TABLES = ["money_unit_policy", "stripe_mode_realm"] as const;
 export const FRESH_V2_UNPINNED_0100 =
   "fresh v2-0100 D1 has its schema but no claimed Stripe realm pin";
+// The Money-preserved profile also holds its one fresh Writer epoch row.
+const FRESH_V2_MONEY_PRESERVED_SEED_TABLES = ["money_cutover_authorized_epoch"] as const;
+export const FRESH_V2_INTERRUPTED_MONEY_PRESERVED =
+  "fresh v2-0100-money-preserved D1 has its schema but no claimed realm pin or Writer epoch";
 const PINNED_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 
 /**
@@ -95,14 +124,36 @@ export async function assertFreshV2DataReadback(
   ) {
     throw new DeployError(phase, "fresh v2 audited table inventory is malformed");
   }
-  const servingSeeds = lineage === "v2-0100";
+  const moneyPreserved = lineage === "v2-0100-money-preserved";
+  const servingSeeds = lineage === "v2-0100" || moneyPreserved;
+  if (moneyPreserved !== (options.moneyWriterEpoch !== undefined) && phase === "verification")
+    throw new DeployError(phase, "fresh v2 Writer epoch readback requires its retained mint");
   const seedTables: readonly string[] = servingSeeds
-    ? [...FRESH_V2_SEED_TABLES, ...FRESH_V2_0100_SEED_TABLES]
+    ? [
+        ...FRESH_V2_SEED_TABLES,
+        ...FRESH_V2_0100_SEED_TABLES,
+        ...(moneyPreserved ? FRESH_V2_MONEY_PRESERVED_SEED_TABLES : []),
+      ]
     : FRESH_V2_SEED_TABLES;
   const readback =
     options.freshV2DataReader === undefined
-      ? await readRemoteFreshV2Data(configPath, environment, tables, phase, options, servingSeeds)
+      ? await readRemoteFreshV2Data(
+          configPath,
+          environment,
+          tables,
+          phase,
+          options,
+          servingSeeds,
+          moneyPreserved,
+        )
       : await options.freshV2DataReader.read(phase, configPath);
+  // A complete Money-preserved schema without its pin or its epoch row is an
+  // import that stopped before its tail, never an in-use generation.
+  if (
+    moneyPreserved &&
+    ((readback.stripeRealm ?? []).length === 0 || (readback.authorizedEpoch ?? []).length === 0)
+  )
+    throw new DeployError(phase, FRESH_V2_INTERRUPTED_MONEY_PRESERVED);
   // A complete plain 0100 schema without its pin is an interrupted import,
   // never an in-use generation; say so before the generic refusal.
   if (servingSeeds && (readback.stripeRealm ?? []).length === 0)
@@ -133,6 +184,7 @@ export async function assertFreshV2DataReadback(
         },
       ) ||
         !matchesClaimedTestRealm(readback.stripeRealm ?? []))) ||
+    (moneyPreserved && !matchesAuthorizedEpoch(readback.authorizedEpoch ?? [], options)) ||
     !matchesFreshV2Seed(
       readback.invocationEpoch,
       ["closed_at_ms", "epoch_id", "opened_at_ms", "singleton", "state"],
@@ -148,6 +200,36 @@ export async function assertFreshV2DataReadback(
       phase,
       `fresh v2 D1 is not the exact empty ${String(FRESH_V2_LEDGER_ROWS[lineage]).padStart(4, "0")} database`,
     );
+  }
+}
+
+/**
+ * Exactly one authorized Writer epoch. With the retained mint, Financial's
+ * verifier proves it is that D1's minted epoch; status only sees its form.
+ */
+function matchesAuthorizedEpoch(
+  rows: readonly Record<string, unknown>[],
+  options: FreshV2DataReadbackOptions,
+): boolean {
+  const row = rows.length === 1 ? rows[0] : undefined;
+  if (
+    row === undefined ||
+    JSON.stringify(Object.keys(row).sort()) !== JSON.stringify(["singleton", "writer_epoch"]) ||
+    row.singleton !== 1 ||
+    typeof row.writer_epoch !== "string" ||
+    !MONEY_CUTOVER_WRITER_EPOCH_PATTERN.test(row.writer_epoch)
+  )
+    return false;
+  if (options.moneyWriterEpoch === undefined) return true;
+  try {
+    verifyFreshMoneyWriterEpoch(options.moneyWriterEpoch.record, {
+      binding: options.moneyWriterEpoch.binding,
+      epoch: options.moneyWriterEpoch.record.epoch,
+      readbackRows: rows,
+    });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -186,6 +268,7 @@ async function readRemoteFreshV2Data(
   phase: "preflight" | "verification",
   options: FreshV2DataReadbackOptions,
   servingSeeds: boolean,
+  moneyPreserved: boolean,
 ): Promise<FreshV2DataReadback> {
   const database = new RemoteD1(configPath, {
     environment,
@@ -253,6 +336,13 @@ async function readRemoteFreshV2Data(
     "fresh v2 claimed Stripe realm pin",
     "SELECT singleton, mode, pinned_at FROM stripe_mode_realm LIMIT 2",
   );
+  const authorizedEpoch = moneyPreserved
+    ? await database.query(
+        phase,
+        "fresh v2 authorized Writer epoch",
+        "SELECT singleton, writer_epoch FROM money_cutover_authorized_epoch LIMIT 2",
+      )
+    : undefined;
   return {
     tableCounts,
     ledgerRows: ledger[0]?.count as number,
@@ -261,5 +351,6 @@ async function readRemoteFreshV2Data(
     acceptanceCounter,
     moneyUnitPolicy,
     stripeRealm,
+    ...(authorizedEpoch === undefined ? {} : { authorizedEpoch }),
   };
 }

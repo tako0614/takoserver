@@ -1129,20 +1129,25 @@ export const DEPLOY_CONTRACT = {
           "it derives integration-ts-<generation> names and never reads or forwards the production target. " +
           "The scoped migration gate runs once; " +
           "the default fixed audited 0001-0066 names and bytes, or one explicit fixed " +
-          "--fresh-lineage=v2-artifacts-0075, v2-0088, v2-0089, v2-0091, v2-0092 or v2-0100 payload (v2-0088/v2-0089 are the " +
-          "same fixed-digest payloads as the production fresh-init profiles; v2-0091 (through the Stripe event table), v2-0092 (through the Organization wallet lifecycle tables) and v2-0100 (the plain serving lineage) are " +
+          "--fresh-lineage=v2-artifacts-0075, v2-0088, v2-0089, v2-0091, v2-0092, v2-0100 or v2-0100-money-preserved payload (v2-0088/v2-0089 are the " +
+          "same fixed-digest payloads as the production fresh-init profiles; v2-0091 (through the Stripe event table), v2-0092 (through the Organization wallet lifecycle tables), v2-0100 (the plain serving lineage) and v2-0100-money-preserved (the Money-preserved 0100 shape) are " +
           "staging-only and no production surface accepts them), are sealed before creation. A separately " +
           "digested import file preserves every migration byte and adds only Wrangler's migration-ledger DDL and inserts; for v2-0100 it then appends one guarded claim of the test Stripe realm, " +
           "which inserts only when no pin and no financial history exist and fails the import otherwise. " +
+          "For v2-0100-money-preserved the one sealed import is instead the Money-preserved 0001-0100 replay, Financial's test realm claim over that replay's own inventory, " +
+          "then one money_cutover_authorized_epoch row; its Writer epoch is minted by the Financial owner only after the new D1 identity readback and before the import is written, " +
+          "never derived from an old D1, frame or production, and the full epoch record stays operator-private (0600) beside the generation artifact. " +
           "Every newly created D1 must have its selected integration-prefixed name and never be production-named; in default mode, when " +
           "TAKOSERVER_DEPLOY_TARGET_PRODUCTION is set its exact D1 name and id are refused before creation and again once the new id " +
-          "is known, and applying v2-0091, v2-0092 or v2-0100 requires that production target. " +
+          "is known, and applying v2-0091, v2-0092, v2-0100 or v2-0100-money-preserved requires that production target. " +
           "Original fresh92 mode instead retains the independently provisioned custody root device/inode pin, " +
           "original incumbent collision identities and the existing source/review/native readback fences; no supplied receipt or ready flag is accepted.",
         "post-conditions":
           "The invocation creates one D1 database, proves it empty, applies and reads back the exact " +
           "selected 0001-0066, 0001-0075, 0001-0088, 0001-0089, 0001-0091, 0001-0092 or 0001-0100 lineage and canonical schema after one Wrangler file import " +
-          "(v2-0088/v2-0089/v2-0091/v2-0092/v2-0100 also read back the exact empty seeded data and ledger count; v2-0100 also reads back its money-unit policy and exactly one claimed test Stripe realm pin), then creates and reads back one new R2 bucket. " +
+          "(v2-0088/v2-0089/v2-0091/v2-0092/v2-0100 also read back the exact empty seeded data and ledger count; v2-0100 also reads back its money-unit policy and exactly one claimed test Stripe realm pin; " +
+          "v2-0100-money-preserved reads back the exact Money-preserved shape, that policy and pin, exactly one authorized Writer epoch equal to the minted one, and no freeze or permit row, " +
+          "and its apply record names only moneyPreserved.epochBindingDigest and shapeDigest plus the private epoch record path and digest), then creates and reads back one new R2 bucket. " +
           "Default status and apply record which production D1 identity the guard compared. " +
           "Original fresh92 apply retains its existing dispatch/ACK/import/R2/terminal chain; its originalCreate " +
           "result requires independent origin review, and status is diagnostic-only, never original creation evidence or money/normal Worker readiness. " +

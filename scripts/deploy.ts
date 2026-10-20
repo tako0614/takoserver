@@ -79,9 +79,10 @@ const USAGE = `takoserver deploy
   bun run deploy -- takoserver-integration-organization-bootstrap --<status|apply> --environment=integration --commit=<sha>
   bun run deploy -- takoserver-integration-storage-generation --<status|apply> --environment=integration --commit=<sha>
     --generation=<32-lowercase-hex> (new isolated D1/R2 only; never resets an existing target)
-    [--fresh-lineage=<v2-artifacts-0075|v2-0088|v2-0089|v2-0091|v2-0092|v2-0100>] (fixed fresh payload; default remains 0066;
-    v2-0091/v2-0092/v2-0100 are staging-only and their apply requires TAKOSERVER_DEPLOY_TARGET_PRODUCTION to refuse the production D1;
-    v2-0100 is the plain serving lineage whose import also claims the test Stripe realm)
+    [--fresh-lineage=<v2-artifacts-0075|v2-0088|v2-0089|v2-0091|v2-0092|v2-0100|v2-0100-money-preserved>] (fixed fresh payload; default remains 0066;
+    v2-0091/v2-0092/v2-0100/v2-0100-money-preserved are staging-only and their apply requires TAKOSERVER_DEPLOY_TARGET_PRODUCTION to refuse the production D1;
+    v2-0100 is the plain serving lineage whose import also claims the test Stripe realm;
+    v2-0100-money-preserved imports the Money-preserved 0100 shape, the test realm claim and one fresh Writer epoch row)
   bun run deploy -- takoserver-integration-storage-disposal --<status|apply> --environment=integration --commit=<sha>
     (one exact selected D1/R2 pair only; refuses current regular/dispatch Worker bindings)
   bun run deploy -- takoserver-integration-host-retirement --<status|apply> --environment=integration --commit=<sha>
@@ -265,7 +266,8 @@ type Invocation =
         | "v2-0089"
         | "v2-0091"
         | "v2-0092"
-        | "v2-0100";
+        | "v2-0100"
+        | "v2-0100-money-preserved";
     })
   | (InvocationBase & {
       readonly surface: ProductionD1FreshInitSurface;
@@ -323,7 +325,8 @@ interface ParsedInvocation {
     | "v2-0089"
     | "v2-0091"
     | "v2-0092"
-    | "v2-0100";
+    | "v2-0100"
+    | "v2-0100-money-preserved";
   readonly protectedReferenceEnvironment?: "integration" | "production";
   readonly organizationId?: string;
   readonly keyName?: string;
@@ -400,6 +403,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     | "v2-0091"
     | "v2-0092"
     | "v2-0100"
+    | "v2-0100-money-preserved"
     | null = null;
   let retiredTargetPath: string | null = null;
   let retiredDeploymentId: string | null = null;
@@ -540,6 +544,8 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       else if (flag === "--fresh-lineage=v2-0091") freshLineage = "v2-0091";
       else if (flag === "--fresh-lineage=v2-0092") freshLineage = "v2-0092";
       else if (flag === "--fresh-lineage=v2-0100") freshLineage = "v2-0100";
+      else if (flag === "--fresh-lineage=v2-0100-money-preserved")
+        freshLineage = "v2-0100-money-preserved";
       else return null;
       continue;
     }
@@ -732,13 +738,15 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   const storageGeneration = surfaceValue === "takoserver-integration-storage-generation";
   const productionFreshInit = surfaceValue === "takoserver-production-d1-fresh-init";
   if (
-    // v2-0091, v2-0092 and v2-0100 are staging-only: production fresh init
-    // never accepts them, so they cannot fall back to its default payload either.
+    // v2-0091, v2-0092, v2-0100 and v2-0100-money-preserved are staging-only:
+    // production fresh init never accepts them, so they cannot fall back to its
+    // default payload either.
     (productionFreshInit &&
       (freshLineage === "v2-artifacts-0075" ||
         freshLineage === "v2-0091" ||
         freshLineage === "v2-0092" ||
-        freshLineage === "v2-0100")) ||
+        freshLineage === "v2-0100" ||
+        freshLineage === "v2-0100-money-preserved")) ||
     (freshLineage !== null && !storageGeneration && !productionFreshInit)
   )
     return null;
@@ -1633,7 +1641,7 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
     case "takoserver-integration-storage-generation": {
       // The production target is read only for its D1 identity, which the
       // staging generation must never be. Set, it must load; unset, the
-      // staging-only v2-0091/v2-0092/v2-0100 apply refuses.
+      // staging-only v2-0091/v2-0092/v2-0100/v2-0100-money-preserved apply refuses.
       const productionPath = process.env.TAKOSERVER_DEPLOY_TARGET_PRODUCTION?.trim();
       if (productionPath !== undefined && productionPath !== "" && !isAbsolute(productionPath)) {
         throw new DeployError(
