@@ -5,10 +5,11 @@ import { type CommandResult, runCommand, wranglerCommand } from "./process.ts";
 /**
  * The closed fresh v2 D1 profiles. Each names one reviewed, fixed-digest
  * payload; a later audited source migration never widens any selector.
- * `v2-0091` and `v2-0092` are staging-only: only the integration generation
- * surface offers them.
+ * `v2-0091`, `v2-0092` and `v2-0100` are staging-only: only the integration
+ * generation surface offers them. `v2-0100` also carries the test Stripe
+ * realm pin its import claimed.
  */
-export type FreshV2D1Lineage = "v2-0088" | "v2-0089" | "v2-0091" | "v2-0092";
+export type FreshV2D1Lineage = "v2-0088" | "v2-0089" | "v2-0091" | "v2-0092" | "v2-0100";
 
 /** The exact migration-ledger row count each fresh profile leaves behind. */
 const FRESH_V2_LEDGER_ROWS: Readonly<Record<FreshV2D1Lineage, number>> = {
@@ -16,6 +17,7 @@ const FRESH_V2_LEDGER_ROWS: Readonly<Record<FreshV2D1Lineage, number>> = {
   "v2-0089": 89,
   "v2-0091": 91,
   "v2-0092": 92,
+  "v2-0100": 100,
 };
 
 export interface FreshV2DataReadback {
@@ -24,6 +26,9 @@ export interface FreshV2DataReadback {
   readonly foreignKeyViolations: number;
   readonly invocationEpoch: readonly Record<string, unknown>[];
   readonly acceptanceCounter: readonly Record<string, unknown>[];
+  /** Read only for `v2-0100`: the 0094 policy seed and the claimed realm pin. */
+  readonly moneyUnitPolicy?: readonly Record<string, unknown>[];
+  readonly stripeRealm?: readonly Record<string, unknown>[];
 }
 
 /** Test seam; deploy callers always use authoritative remote D1 queries. */
@@ -51,6 +56,10 @@ const FRESH_V2_SEED_TABLES = [
   "tf_cloudflare_provider_invocation_epoch",
   "tf_v2_operation_acceptance_counter",
 ] as const;
+
+// The plain 0100 profile also holds the 0094 policy seed and its claimed pin.
+const FRESH_V2_0100_SEED_TABLES = ["money_unit_policy", "stripe_mode_realm"] as const;
+const PINNED_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 
 /**
  * Data proof in addition to the canonical schema/ledger readback, never a
@@ -84,9 +93,13 @@ export async function assertFreshV2DataReadback(
   ) {
     throw new DeployError(phase, "fresh v2 audited table inventory is malformed");
   }
+  const servingSeeds = lineage === "v2-0100";
+  const seedTables: readonly string[] = servingSeeds
+    ? [...FRESH_V2_SEED_TABLES, ...FRESH_V2_0100_SEED_TABLES]
+    : FRESH_V2_SEED_TABLES;
   const readback =
     options.freshV2DataReader === undefined
-      ? await readRemoteFreshV2Data(configPath, environment, tables, phase, options)
+      ? await readRemoteFreshV2Data(configPath, environment, tables, phase, options, servingSeeds)
       : await options.freshV2DataReader.read(phase, configPath);
   const allowed = new Set(options.allowedTables ?? []);
   if ([...allowed].some((name) => !tables.includes(name)))
@@ -95,14 +108,25 @@ export async function assertFreshV2DataReadback(
     readback.ledgerRows !== FRESH_V2_LEDGER_ROWS[lineage] ||
     readback.foreignKeyViolations !== 0 ||
     Object.keys(readback.tableCounts).length !== tables.length ||
-    FRESH_V2_SEED_TABLES.some((name) => !tables.includes(name)) ||
+    seedTables.some((name) => !tables.includes(name)) ||
     tables.some((name) =>
       allowed.has(name)
         ? !Number.isSafeInteger(readback.tableCounts[name]) ||
           (readback.tableCounts[name] as number) < 0
-        : readback.tableCounts[name] !==
-          (FRESH_V2_SEED_TABLES.includes(name as (typeof FRESH_V2_SEED_TABLES)[number]) ? 1 : 0),
+        : readback.tableCounts[name] !== (seedTables.includes(name) ? 1 : 0),
     ) ||
+    (servingSeeds &&
+      (!matchesFreshV2Seed(
+        readback.moneyUnitPolicy ?? [],
+        ["cash_unit", "historical_usage_unit", "ledger_unit", "singleton"],
+        {
+          singleton: 1,
+          ledger_unit: "usd-micros-v2",
+          historical_usage_unit: "microcent-v1",
+          cash_unit: "usd-cents-v1",
+        },
+      ) ||
+        !matchesClaimedTestRealm(readback.stripeRealm ?? []))) ||
     !matchesFreshV2Seed(
       readback.invocationEpoch,
       ["closed_at_ms", "epoch_id", "opened_at_ms", "singleton", "state"],
@@ -119,6 +143,20 @@ export async function assertFreshV2DataReadback(
       `fresh v2 D1 is not the exact empty ${String(FRESH_V2_LEDGER_ROWS[lineage]).padStart(4, "0")} database`,
     );
   }
+}
+
+/** Exactly the one pin the import claimed: test mode with a canonical instant. */
+function matchesClaimedTestRealm(rows: readonly Record<string, unknown>[]): boolean {
+  const row = rows.length === 1 ? rows[0] : undefined;
+  return (
+    row !== undefined &&
+    JSON.stringify(Object.keys(row).sort()) ===
+      JSON.stringify(["mode", "pinned_at", "singleton"]) &&
+    row.singleton === 1 &&
+    row.mode === "test" &&
+    typeof row.pinned_at === "string" &&
+    PINNED_AT.test(row.pinned_at)
+  );
 }
 
 function matchesFreshV2Seed(
@@ -141,6 +179,7 @@ async function readRemoteFreshV2Data(
   tables: readonly string[],
   phase: "preflight" | "verification",
   options: FreshV2DataReadbackOptions,
+  servingSeeds: boolean,
 ): Promise<FreshV2DataReadback> {
   const database = new RemoteD1(configPath, {
     environment,
@@ -190,11 +229,31 @@ async function readRemoteFreshV2Data(
     "fresh v2 acceptance counter seed",
     "SELECT id, last_order, last_operation_id FROM tf_v2_operation_acceptance_counter LIMIT 2",
   );
+  if (!servingSeeds)
+    return {
+      tableCounts,
+      ledgerRows: ledger[0]?.count as number,
+      foreignKeyViolations: foreignKeys.length,
+      invocationEpoch,
+      acceptanceCounter,
+    };
+  const moneyUnitPolicy = await database.query(
+    phase,
+    "fresh v2 money-unit policy seed",
+    "SELECT singleton, ledger_unit, historical_usage_unit, cash_unit FROM money_unit_policy LIMIT 2",
+  );
+  const stripeRealm = await database.query(
+    phase,
+    "fresh v2 claimed Stripe realm pin",
+    "SELECT singleton, mode, pinned_at FROM stripe_mode_realm LIMIT 2",
+  );
   return {
     tableCounts,
     ledgerRows: ledger[0]?.count as number,
     foreignKeyViolations: foreignKeys.length,
     invocationEpoch,
     acceptanceCounter,
+    moneyUnitPolicy,
+    stripeRealm,
   };
 }

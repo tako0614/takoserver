@@ -39,6 +39,10 @@ import {
 import { readFinancial0104CanonicalMigrationSource } from "./financial0104-canonical-source.ts";
 import { financial0104SourceSchemaReady } from "./financial0104-schema-shape.ts";
 import {
+  appendFreshStripeRealmClaim,
+  buildFreshStripeRealmClaim,
+} from "./fresh-stripe-realm-claim.ts";
+import {
   assertFreshV2DataReadback,
   type FreshV2D1Lineage,
   type FreshV2DataReader,
@@ -68,6 +72,7 @@ import {
   projectCanonicalIntegrationV2MigrationArtifact0092,
   projectFreshIntegrationV2MigrationArtifact0091,
   projectFreshIntegrationV2MigrationArtifact0092,
+  projectFreshIntegrationV2MigrationArtifact0100,
   projectFreshProductionV2MigrationArtifact,
   projectFreshProductionV2MigrationArtifact0089,
   projectFreshV2ArtifactMigrationArtifact,
@@ -75,6 +80,7 @@ import {
   readSealedApplyQualifiedMigrationArtifact,
   readSealedFreshIntegrationV2MigrationArtifact0091,
   readSealedFreshIntegrationV2MigrationArtifact0092,
+  readSealedFreshIntegrationV2MigrationArtifact0100,
   readSealedFreshProductionV2MigrationArtifact,
   readSealedFreshProductionV2MigrationArtifact0089,
   readSealedFreshV2ArtifactMigrationArtifact,
@@ -129,6 +135,9 @@ class MigrationApplyError extends DeployError {
  * Organization wallet lifecycle tables) are the staging-only profiles: no
  * production surface offers them, and their apply also requires the
  * production target so the production D1 identity is refused explicitly.
+ * `v2-0100` is the staging-only plain serving profile: the whole audited
+ * 0001-0100 source plus the test Stripe realm claimed in the same import,
+ * which is what the served Worker requires to start.
  */
 export type IntegrationFreshLineage = "v2-artifacts-0075" | FreshV2D1Lineage;
 
@@ -138,10 +147,15 @@ const INTEGRATION_FRESH_LINEAGES: readonly IntegrationFreshLineage[] = [
   "v2-0089",
   "v2-0091",
   "v2-0092",
+  "v2-0100",
 ];
 
 /** Profiles no production surface offers; their apply requires the production target. */
-const STAGING_ONLY_LINEAGES: ReadonlySet<IntegrationFreshLineage> = new Set(["v2-0091", "v2-0092"]);
+const STAGING_ONLY_LINEAGES: ReadonlySet<IntegrationFreshLineage> = new Set([
+  "v2-0091",
+  "v2-0092",
+  "v2-0100",
+]);
 
 /** The exact production D1 a staging generation must never be. */
 export interface ProductionD1Identity {
@@ -1827,9 +1841,12 @@ function generatedStorageTarget(
   if (prefixed !== null && target.takoformV2?.storageLineage !== "v2-0092") {
     throw preflightError("integration-ts readback requires its explicit fresh v2-0092 origin");
   }
+  // The plain serving lineage's realm pin exists only through this surface's
+  // own import into a D1 it created, so it has no operator-provisioned pair.
   const stagingPair =
     generated === null &&
     target.takoformV2?.storageLineage !== undefined &&
+    target.takoformV2.storageLineage !== "v2-0100" &&
     STAGING_ONLY_LINEAGES.has(target.takoformV2.storageLineage) &&
     STAGING_PAIR_NAME.test(databaseName) &&
     !PRODUCTION_D1_NAME.test(databaseName);
@@ -2130,6 +2147,8 @@ function selectedSourceArtifact(
       return projectFreshIntegrationV2MigrationArtifact0091(source);
     case "v2-0092":
       return projectFreshIntegrationV2MigrationArtifact0092(source);
+    case "v2-0100":
+      return projectFreshIntegrationV2MigrationArtifact0100(source);
     case "applied-v2-0092":
       return projectCanonicalIntegrationV2MigrationArtifact0092(source);
   }
@@ -2152,6 +2171,8 @@ function readSealedSelectedArtifact(
       return readSealedFreshIntegrationV2MigrationArtifact0091(directory);
     case "v2-0092":
       return readSealedFreshIntegrationV2MigrationArtifact0092(directory);
+    case "v2-0100":
+      return readSealedFreshIntegrationV2MigrationArtifact0100(directory);
   }
 }
 
@@ -2159,14 +2180,15 @@ function freshV2D1Lineage(lineage: IntegrationFreshLineage | undefined): FreshV2
   return lineage === "v2-0088" ||
     lineage === "v2-0089" ||
     lineage === "v2-0091" ||
-    lineage === "v2-0092"
+    lineage === "v2-0092" ||
+    lineage === "v2-0100"
     ? lineage
     : null;
 }
 
 function lineageCeiling(
   lineage: IntegrationFreshLineage | undefined,
-): "0066" | "0075" | "0088" | "0089" | "0091" | "0092" {
+): "0066" | "0075" | "0088" | "0089" | "0091" | "0092" | "0100" {
   switch (lineage) {
     case undefined:
       return "0066";
@@ -2180,6 +2202,8 @@ function lineageCeiling(
       return "0091";
     case "v2-0092":
       return "0092";
+    case "v2-0100":
+      return "0100";
   }
 }
 
@@ -2312,7 +2336,19 @@ async function applyStorageGeneration(
     // D1's /query parser truncates the nested CASE in the frozen 0047 trigger.
     // Its /import transport accepts those exact bytes; do not rewrite history
     // or change the canonical schema to work around a transport parser.
-    const migrationImport = buildD1MigrationImport(sealedArtifact.files, { freshLedger: true });
+    // The plain serving profile claims the test Stripe realm inside the same
+    // import that creates the schema, on the D1 this run created and proved empty.
+    const realmClaim =
+      invocation.freshLineage === "v2-0100"
+        ? buildFreshStripeRealmClaim(sealedArtifact.files)
+        : null;
+    const migrationImport =
+      realmClaim === null
+        ? buildD1MigrationImport(sealedArtifact.files, { freshLedger: true })
+        : appendFreshStripeRealmClaim(
+            buildD1MigrationImport(sealedArtifact.files, { freshLedger: true }),
+            realmClaim,
+          );
     const importPath = join(payload, "migration-import.sql");
     writeFileSync(importPath, migrationImport.sql, { mode: 0o600, flag: "wx" });
     migrationSeal = sealDirectory(payload, [
@@ -2549,6 +2585,15 @@ async function applyStorageGeneration(
       migrationBytes: sourceArtifact.bytes,
       migrationImportDigest: migrationImport.digest,
       migrationImportBytes: migrationImport.bytes,
+      ...(realmClaim === null
+        ? {}
+        : {
+            stripeRealmClaim: {
+              mode: realmClaim.mode,
+              placement: "same-import-after-last-migration",
+              historyTables: realmClaim.historyTables.length,
+            },
+          }),
       appliedMigrations: postMigration.applied,
       schemaShapeDigest: postMigration.shapeDigest,
       rollback: "old active target remains unchanged; repair forward from this exact generation",

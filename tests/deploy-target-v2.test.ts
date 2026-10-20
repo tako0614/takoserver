@@ -293,12 +293,12 @@ describe("environment-exact deploy target", () => {
     ).toThrow("maintenance profile");
   });
 
-  test("selects an explicit fresh v2 storage lineage only as v2-0088, v2-0089, v2-0091 or v2-0092", () => {
+  test("selects an explicit fresh v2 storage lineage only as v2-0088, v2-0089, v2-0091, v2-0092 or v2-0100", () => {
     const config = JSON.stringify({
       documentation: "https://docs.example.test/v2",
       authenticationDocumentation: "https://docs.example.test/v2/authentication",
     });
-    for (const storageLineage of ["v2-0088", "v2-0089", "v2-0091", "v2-0092"] as const) {
+    for (const storageLineage of ["v2-0088", "v2-0089", "v2-0091", "v2-0092", "v2-0100"] as const) {
       const selected = parseDeployTarget(
         descriptor({ environment: "integration", takoformV2: { config, storageLineage } }),
         "fresh v2 target",
@@ -314,7 +314,7 @@ describe("environment-exact deploy target", () => {
     );
     expect(historical.takoformV2).toEqual({ config });
     expect(takoformV2StorageLineage(historical)).toBe("v2-artifacts-0075");
-    for (const storageLineage of ["v2-artifacts-0075", "v2-0090", "0088", 88, null]) {
+    for (const storageLineage of ["v2-artifacts-0075", "v2-0090", "v2-0101", "0088", 88, null]) {
       expect(() =>
         parseDeployTarget(
           descriptor({ environment: "integration", takoformV2: { config, storageLineage } }),

@@ -224,6 +224,52 @@ either profile. For `v2-0092`, read it with these substitutions:
   refuse before upload until an independently qualified 0093/0094 cutover has
   produced the exact audited 0094 schema and money-unit policy.
 
+#### Plain serving D1 through 0100 (staging-only `v2-0100`)
+
+`--fresh-lineage=v2-0100` creates a new staging D1 that the current Worker can
+serve. The payload is the whole audited 0001–0100 source, ending in
+`0100_hosted_on_demand.sql`, with the fixed digest
+`sha256:ef9b62429718904c90f904bf10abd337fdba0d5a8cb1cee8bc50e5e6c20ed3ac`.
+
+The import also claims the 0098 Stripe realm in `test` mode. One guarded
+statement follows the last migration in the same sealed import file. It inserts
+the pin only when:
+
+- no pin exists, and
+- the financial-history inventory is exactly the one these migrations create,
+  and every one of those tables is empty.
+
+The next statement fails the import unless exactly that test pin exists. So an
+existing pin, a history row or an unexpected financial table refuses the whole
+import. The pin is never copied from another D1 or inferred from a Stripe key.
+
+In every other respect it behaves like `v2-0091`:
+
+- Production fresh init refuses it.
+- It only creates a new `integration-takoserver-<generation>` D1, after the
+  absence fence and an empty readback of that new database.
+- Applying it requires `TAKOSERVER_DEPLOY_TARGET_PRODUCTION`.
+
+Differences from `v2-0091`:
+
+- The data proof reads 100 ledger rows, the two seeds, the 0094
+  `money_unit_policy` row and exactly one `test` realm pin with a canonical
+  instant.
+- The apply record names the composed import digest and a `stripeRealmClaim`
+  entry.
+- An operator-provisioned staging pair is **not** accepted for `v2-0100`: its
+  pin can exist only through this surface's own import.
+- `takoformV2.storageLineage: "v2-0100"` selects it on a target. This is the
+  plain shape. It is not the Money-preserved 0100 shape, which carries cutover
+  fences and an epoch from its own history and stays a separate generation.
+
+```sh
+bun run deploy -- takoserver-integration-storage-generation --apply --environment=integration --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-0100
+```
+
+There is no in-place route from an existing 0088/0089 D1 to this lineage. A
+new generation replaces it, and the old D1 stays protected history.
+
 ##### Original fresh92 creation with retained custody
 
 The same storage-generation surface can select its existing original creator by
