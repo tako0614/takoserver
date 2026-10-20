@@ -281,13 +281,17 @@ describe("strict paginated Cloudflare state", () => {
 
   test("preserves safe HTTP status on semantic body-cap failures", async () => {
     let failure: unknown;
+    let calls = 0;
     try {
       await readCloudflareGetText({
-        fetcher: async () =>
-          new Response("", {
+        retryDelaysMs: [0, 0],
+        fetcher: async () => {
+          calls += 1;
+          return new Response("", {
             status: 503,
             headers: { "content-length": "1025" },
-          }),
+          });
+        },
         request: (signal) =>
           new Request("https://api.cloudflare.com/client/v4/test", {
             redirect: "manual",
@@ -301,6 +305,32 @@ describe("strict paginated Cloudflare state", () => {
     }
     expect(failure).toBeInstanceOf(CloudflareGetResponseError);
     expect((failure as CloudflareGetResponseError).status).toBe(503);
+    // The 503 is read again within its bound; the last answer is judged.
+    expect(calls).toBe(3);
+  });
+
+  test("a refusal whose body transport breaks is judged once", async () => {
+    let calls = 0;
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "operator-token",
+      getRetryDelaysMs: [0, 0],
+      fetcher: async () => {
+        calls += 1;
+        return new Response(
+          new ReadableStream({
+            pull: () => {
+              throw new TypeError("body failed");
+            },
+          }),
+          { status: 403 },
+        );
+      },
+    });
+    await expect(state.read("/workers/scripts", "script read")).rejects.toBeInstanceOf(
+      CloudflareGetTransportError,
+    );
+    expect(calls).toBe(1);
   });
 
   test("preserves a caller's explicit UTF-8 BOM decoding mode", async () => {

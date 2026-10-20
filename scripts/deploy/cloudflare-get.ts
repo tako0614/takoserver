@@ -157,6 +157,14 @@ export async function readCloudflareGetText(input: {
           attempt + 1,
         );
       }
+      // A transport error raised inside the body reader counts this attempt too.
+      if (error instanceof CloudflareGetTransportError && error.reason?.attempts !== attempt + 1)
+        throw new CloudflareGetTransportError(
+          input.label,
+          error.status,
+          error.detail ?? "",
+          attempt + 1,
+        );
       throw error;
     } finally {
       if (timer !== undefined) clearTimeout(timer);

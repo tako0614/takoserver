@@ -25,7 +25,7 @@ export interface DeployReason {
     | "storage-write"
     | "health-read"
     | "provider-read";
-  /** Wrangler invocations made for this one operation, retries included. */
+  /** Requests or Wrangler invocations made for this one operation, retries included. */
   readonly attempts: number;
 }
 

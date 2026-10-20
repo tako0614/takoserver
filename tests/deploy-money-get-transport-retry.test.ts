@@ -17,14 +17,14 @@ const d1Ok = () =>
     success: true,
     result: { uuid: D1_ID, name: "integration-ts-fixture", created_at: "2026-10-20T00:00:00Z" },
   });
-const brokenBody = () =>
+const brokenBody = (status = 200) =>
   new Response(
     new ReadableStream({
       pull(controller) {
         controller.error(new Error("connection reset while reading"));
       },
     }),
-    { status: 200 },
+    { status },
   );
 
 function storage(outcomes: (() => Response | Promise<Response>)[]) {
@@ -53,7 +53,7 @@ async function rejection(promise: Promise<unknown>): Promise<Error & { reason?: 
 test("a storage GET is read again after transport, body transport, 429 or 5xx", async () => {
   for (const first of [
     () => Promise.reject(new TypeError("fetch failed")),
-    brokenBody,
+    () => brokenBody(),
     () => new Response("busy", { status: 429, headers: { "retry-after": "0" } }),
     () => new Response("<html>bad gateway</html>", { status: 502 }),
   ]) {
@@ -128,7 +128,7 @@ test("the expected maintenance 503 is judged once; only transport, 429 and other
   expect(once.calls()).toBe(1);
   for (const first of [
     () => Promise.reject(new TypeError("fetch failed")),
-    brokenBody,
+    () => brokenBody(),
     () => new Response("", { status: 429, headers: { "retry-after": "0" } }),
     () => new Response("<html>bad gateway</html>", { status: 502 }),
   ]) {
@@ -161,4 +161,39 @@ test("a malformed health body is refused once and exhausted reads keep a closed 
   expect(
     (await rejection(healthRead("https://worker.example.test", down.fetcher, [0, 0]))).reason,
   ).toEqual({ code: "http-transport", operation: "health-read", attempts: 3 });
+});
+
+test("a refusal whose body breaks, a 404 and a failed create are each sent once", async () => {
+  for (const [answer, code] of [
+    [() => brokenBody(401), "http-transport"],
+    [() => brokenBody(403), "http-transport"],
+    [() => Response.json({ success: false, errors: [] }, { status: 404 }), "http-response"],
+  ] as const) {
+    const run = storage([answer]);
+    expect((await rejection(run.provider.getD1(D1_ID))).reason).toEqual({
+      code,
+      operation: "storage-read",
+      attempts: 1,
+    });
+    expect(run.methods).toHaveLength(1);
+  }
+  for (const status of [429, 503]) {
+    const create = storage([() => new Response("", { status })]);
+    expect((await rejection(create.provider.createD1("integration-ts-fixture"))).reason).toEqual({
+      code: "http-status",
+      operation: "storage-write",
+      attempts: 1,
+    });
+    expect(create.methods).toEqual(["POST"]);
+  }
+});
+
+test("a maintenance 503 or a refusal whose body breaks is judged once, never read again", async () => {
+  for (const status of [503, 401]) {
+    const run = health([() => brokenBody(status)]);
+    expect(
+      (await rejection(healthRead("https://worker.example.test", run.fetcher, [0, 0]))).reason,
+    ).toEqual({ code: "http-transport", operation: "health-read", attempts: 1 });
+    expect(run.calls()).toBe(1);
+  }
 });

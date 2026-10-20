@@ -1752,6 +1752,25 @@ const HEALTH_PROBE_TOTAL_MS = 60_000;
  * including the expected maintenance 503 and any non-JSON or wrong body. The
  * 15 s timeout covers both the response and reading its body.
  */
+function storageReason(error: unknown): DeployReason | undefined {
+  const reason = error instanceof Error ? (error as { reason?: unknown }).reason : undefined;
+  return reason !== null &&
+    typeof reason === "object" &&
+    ["http-transport", "http-status", "http-response"].includes(
+      (reason as { code?: unknown }).code as string,
+    ) &&
+    ["storage-read", "storage-write"].includes(
+      (reason as { operation?: unknown }).operation as string,
+    ) &&
+    Number.isSafeInteger((reason as { attempts?: unknown }).attempts)
+    ? Object.freeze({
+        code: (reason as DeployReason).code,
+        operation: (reason as DeployReason).operation,
+        attempts: (reason as DeployReason).attempts,
+      })
+    : undefined;
+}
+
 /** Exported for its retry and classification tests only. */
 export async function healthRead(
   origin: string,
@@ -1799,6 +1818,10 @@ export async function healthRead(
       } catch {
         text = undefined;
       }
+      // Only a successful answer whose body broke is read again; a 503 or 4xx
+      // whose body broke is judged now, as unavailable.
+      if (text === undefined && !response.ok)
+        throw failed("money Worker health probe is unavailable", "http-transport");
       if (text === undefined) retryable = { code: "http-transport" };
       else {
         try {
@@ -4464,10 +4487,22 @@ async function loadMoneyUnitOwnerOptions(
     ...(declaration.resumeCommit === undefined ? {} : { resumeCommit: declaration.resumeCommit }),
     stageOriginProof: readOrigin,
     async storageIdentityRead() {
-      const [d1, r2] = await Promise.all([
-        selectedStorage.getD1(target.d1.databaseId),
-        selectedStorage.getR2(target.r2.bucketName),
-      ]);
+      let d1: Awaited<ReturnType<typeof selectedStorage.getD1>>;
+      let r2: Awaited<ReturnType<typeof selectedStorage.getR2>>;
+      try {
+        [d1, r2] = await Promise.all([
+          selectedStorage.getD1(target.d1.databaseId),
+          selectedStorage.getR2(target.r2.bucketName),
+        ]);
+      } catch (error) {
+        // Keep only the provider's closed reason, never its message or response.
+        throw new DeployError(
+          "preflight",
+          "money selected staging D1/R2 native GET failed",
+          undefined,
+          storageReason(error),
+        );
+      }
       if (
         d1.uuid !== target.d1.databaseId ||
         d1.name !== target.d1.databaseName ||

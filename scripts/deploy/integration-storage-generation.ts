@@ -3283,7 +3283,10 @@ export class CloudflareIntegrationStorageProvider implements IntegrationStorageG
         const reason = (code: DeployReason["code"]): DeployReason =>
           Object.freeze({ code, operation, attempts: attempt + 1 });
         if (!(error instanceof RetryableStorageRead))
-          throw new StorageProviderError(error.message, reason("http-response"));
+          throw new StorageProviderError(
+            error.message,
+            reason(error instanceof FinalStorageTransport ? "http-transport" : "http-response"),
+          );
         // A bounded wait that also honours a finite Retry-After, within one total budget.
         wait =
           delay === undefined
@@ -3334,6 +3337,8 @@ export class CloudflareIntegrationStorageProvider implements IntegrationStorageG
       text = await boundedResponseText(response);
     } catch (error) {
       if (error instanceof StorageProviderError) throw error;
+      // Only a successful answer whose body broke is read again; a refusal is final.
+      if (!response.ok) throw new FinalStorageTransport(`${label} transport failed`);
       throw new RetryableStorageRead(`${label} transport failed`, "http-transport");
     }
     let parsed: unknown;
@@ -3363,6 +3368,8 @@ class StorageProviderError extends Error {
     super(message);
   }
 }
+/** A refusal whose body broke while being read: final, but still a transport failure. */
+class FinalStorageTransport extends StorageProviderError {}
 /** A read the envelope may send again; it never leaves the envelope as itself. */
 class RetryableStorageRead extends StorageProviderError {
   constructor(
