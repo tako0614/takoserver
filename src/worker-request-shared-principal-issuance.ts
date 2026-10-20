@@ -38,6 +38,10 @@ import {
   captureWorkerRequestAuthenticatedRpUserBindingOriginal,
   type WorkerRequestAuthenticatedRpUserBindingOriginal,
 } from "./worker-request-financial-auth-original.ts";
+import {
+  isWorkspaceBillingOrganization,
+  workspaceBillingOrganizationStatements,
+} from "./workspace-billing-organization.ts";
 
 /** Storage contribution, not a verified RP subject or qualified human capture. */
 export interface FreshSharedRpIssuanceData {
@@ -114,8 +118,21 @@ function batchMethod(sql: Sql): Sql["batch"] {
  * accepted. The caller must be the future genuine Root issuer; plain inputs and
  * this returned DATA never establish RP verification, human origin or admission.
  */
+/** The fixed name of a shared-auth personal Workspace's billing Organization. */
+const WORKSPACE_BILLING_ORGANIZATION_NAME = "Personal workspace";
+
 function createSharedRpPrincipalIssuanceStoreInternal(
-  options: { readonly sql: Sql },
+  options: {
+    readonly sql: Sql;
+    /**
+     * The served realm's billing authority: the tuple's Organization must be
+     * the workspace-billing derivation for it, and the Organization, its owner
+     * membership and the Workspace binding are materialized in the same
+     * issuance batch. Only an explicit null (no hosted billing realm) skips
+     * both, so a caller cannot drop them by omission.
+     */
+    readonly workspaceBillingAuthority: string | null;
+  },
   nativeCurrentness: (() => ReturnType<typeof auth103NativeRequestCurrentness>) | null,
 ) {
   const sql = options.sql;
@@ -145,6 +162,28 @@ function createSharedRpPrincipalIssuanceStoreInternal(
         n.principalId !== p.principalId
       )
         return invalid();
+      const authority = options.workspaceBillingAuthority;
+      let organization: readonly SqlStatement[] = [];
+      if (authority !== null) {
+        if (
+          !(await isWorkspaceBillingOrganization(authority, {
+            workspaceRef: r.workspaceRef,
+            organizationId: data.organizationId,
+          }))
+        )
+          return invalid();
+        try {
+          organization = workspaceBillingOrganizationStatements({
+            organizationId: data.organizationId,
+            workspaceRef: r.workspaceRef,
+            principalId: p.principalId,
+            name: WORKSPACE_BILLING_ORGANIZATION_NAME,
+            createdAt: new Date(n.createdAt).toISOString(),
+          });
+        } catch {
+          return invalid();
+        }
+      }
       const pair = createCredentialAuthorityClassStore({
         sql,
       }).sharedRpNewSessionIssuanceStatements(c, r, data.organizationId, n);
@@ -181,18 +220,41 @@ function createSharedRpPrincipalIssuanceStoreInternal(
               params: Object.freeze([...params.slice(0, 6), ...current.params, ...params.slice(6)]),
             });
           }
+          // The Organization statements follow the companion, never between
+          // pair[0] and the companion whose guard reads the statement before it.
           const fixedFive = Object.freeze([...principalStatements, pair[0], companion]);
-          if (fixedFive.some((statement) => (statement.params?.length ?? 0) > 100))
+          const statements = Object.freeze([...fixedFive, ...organization]);
+          if (statements.some((statement) => (statement.params?.length ?? 0) > 100))
             return unavailable();
           const original: readonly SqlWrite[] = await Reflect.apply(originalBatch, sql, [
-            fixedFive,
+            statements,
           ]);
           assertSql();
           let writes: readonly SqlWrite[];
           try {
-            const candidate = snapshot(original);
+            const all = snapshot(original);
+            if (!Array.isArray(all) || all.length !== 5 + organization.length) return unavailable();
+            // Organization writes return no rows: the three conditional INSERTs
+            // change 0 or 1 row and the final guard changes none (it aborts the
+            // batch through a CHECK unless the Organization is consistent).
+            const organizationWrites = all.slice(5);
             if (
-              !Array.isArray(candidate) ||
+              organizationWrites.some(
+                (w, index) =>
+                  typeof w !== "object" ||
+                  w === null ||
+                  Array.isArray(w) ||
+                  Object.keys(w).sort().join(",") !== "changes,rows" ||
+                  !Number.isSafeInteger(w.changes) ||
+                  w.changes < 0 ||
+                  w.changes > (index === organization.length - 1 ? 0 : 1) ||
+                  !Array.isArray(w.rows) ||
+                  w.rows.length !== 0,
+              )
+            )
+              return unavailable();
+            const candidate = all.slice(0, 5);
+            if (
               candidate.length !== 5 ||
               candidate.some(
                 (w) =>
@@ -284,7 +346,10 @@ function createSharedRpPrincipalIssuanceStoreInternal(
   });
 }
 
-export function createSharedRpPrincipalIssuanceStore(options: { readonly sql: Sql }) {
+export function createSharedRpPrincipalIssuanceStore(options: {
+  readonly sql: Sql;
+  readonly workspaceBillingAuthority: string | null;
+}) {
   return createSharedRpPrincipalIssuanceStoreInternal(options, null);
 }
 
@@ -292,7 +357,10 @@ export function createSharedRpPrincipalIssuanceStore(options: { readonly sql: Sq
 export function createWorkerRequestSharedRpIssuanceContribution(connection: WorkerRequestSql) {
   const inputs = readWorkerRequestFinancialInputs(connection);
   const consumers = readWorkerRequestConsumers(connection);
-  const store = createSharedRpPrincipalIssuanceStore({ sql: inputs.sql });
+  const store = createSharedRpPrincipalIssuanceStore({
+    sql: inputs.sql,
+    workspaceBillingAuthority: consumers.realm.billingAuthority,
+  });
   const assertOrigin = () => {
     if (
       readWorkerRequestFinancialInputs(connection) !== inputs ||
@@ -468,8 +536,9 @@ export function createWorkerRequestSharedRpFreshSessionStore(
       const inputs = readWorkerRequestFinancialInputs(connection);
       const consumers = readWorkerRequestConsumers(connection);
       if (consumers.sharedAuth !== selected || inputs !== pending.held.inputs) return unavailable();
-      const issued = await createSharedRpPrincipalIssuanceStoreInternal({ sql: inputs.sql }, () =>
-        auth103NativeRequestCurrentness(nativeOrigin, connection),
+      const issued = await createSharedRpPrincipalIssuanceStoreInternal(
+        { sql: inputs.sql, workspaceBillingAuthority: consumers.realm.billingAuthority },
+        () => auth103NativeRequestCurrentness(nativeOrigin, connection),
       ).issueFreshOnce(input);
       originalFreshCurrent(connection, pending);
       if (
