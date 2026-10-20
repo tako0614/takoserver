@@ -1382,12 +1382,14 @@ async function uploadMoneyNormalWorkerVersionOwned(
       buildClosure.sourceCommit,
       buildRoot,
     );
-    if (
-      replacementUnknown !== undefined &&
-      (replacementUnknown.sourceCommit !== build.sourceCommit ||
-        replacementUnknown.sourceTreeDigest !== build.sourceTreeDigest)
-    )
-      throw preflightError("money replacement original source differs from the reviewed build");
+    // The same source check as the preflight, so an upload never depends on it.
+    for (const earlier of [replacementUnknown, quarantinedReplacement])
+      if (
+        earlier !== undefined &&
+        (earlier.sourceCommit !== build.sourceCommit ||
+          earlier.sourceTreeDigest !== build.sourceTreeDigest)
+      )
+        throw preflightError("money replacement original source differs from the reviewed build");
     assertInputs();
     const credential =
       replacementCredential ??
