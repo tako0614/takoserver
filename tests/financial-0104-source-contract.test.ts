@@ -94,7 +94,8 @@ const byName = (a: { name: string }, b: { name: string }) =>
  * state is built once per profile and copied for each caller. */
 function at0103(path = ":memory:", options: { readonly money?: boolean } = {}): Database {
   const key = options.money === false ? "plain" : "money";
-  const image = (at0103Images[key] ??= at0103Built(key === "money"));
+  const image = at0103Images[key] ?? at0103Built(key === "money");
+  at0103Images[key] = image;
   if (path === ":memory:") return Database.deserialize(image);
   writeFileSync(path, image, { flag: "wx", mode: 0o600 });
   return new Database(path);
