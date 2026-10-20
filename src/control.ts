@@ -47,6 +47,7 @@ import {
   type RuntimeInputAuthority,
   RuntimeInputPreparationError,
 } from "./runtime-input-preparations.ts";
+import { type SharedAuthSession, SharedAuthSessionError } from "./shared-auth-session.ts";
 import { parseStrictJson, StrictJsonError } from "./strict-json.ts";
 import { type SubscriptionPayments, stripeBillingFailure } from "./stripe-billing.ts";
 import {
@@ -258,6 +259,8 @@ export interface CreateControlRoutesOptions {
   readonly clock: Clock;
   /** Exact browser console origin allowed to carry the HttpOnly session cookie. */
   readonly consoleOrigin?: string;
+  /** The owning Server RP's already composed shared-session receiver, when mounted. */
+  readonly sharedAuth?: SharedAuthSession;
   /** Optional provider-backed residual proof; absent means unavailable. */
   readonly nativeResidual?: NativeResidualReader;
   /** Takoserver lifecycle-owned repair; never exposed through the Takoform Host API. */
@@ -309,12 +312,40 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     runtimeInputPolicy,
   } = options;
   const secureCookies = new URL(publicOrigin).protocol === "https:";
+  const sharedAuth = options.sharedAuth;
+  const sharedAuthenticate = sharedAuth?.authenticate;
 
   const authorization = (request: Request): string | null =>
     requestAuthorization(request, consoleOrigin);
 
+  const requestActor = async (request: Request): Promise<Actor | null> => {
+    const credential = authorization(request);
+    const actor = await accounts.authenticate(credential);
+    // An explicit header (including an empty one), or a selected legacy cookie,
+    // has already chosen its authority. A failed credential cannot try the RP.
+    if (actor || credential !== null || request.headers.has("authorization")) return actor;
+    if (!sharedAuthenticate || !consoleOrigin || request.headers.get("origin") !== consoleOrigin)
+      return null;
+    try {
+      const context: Awaited<ReturnType<SharedAuthSession["authenticate"]>> = await Reflect.apply(
+        sharedAuthenticate,
+        sharedAuth,
+        [request],
+      );
+      if (!context) return null;
+      if (context.actor.kind !== "session") controlError("backend_unavailable", 503);
+      return context.actor;
+    } catch (error) {
+      if (error instanceof SharedAuthSessionError) {
+        if (error.code === "session_invalid") throw new AuthError("unauthenticated");
+        if (error.code === "workspace_forbidden") throw new AuthError("permission_denied");
+      }
+      controlError("backend_unavailable", 503);
+    }
+  };
+
   const owner = async (request: Request, organizationId: string): Promise<Actor> => {
-    const actor = await accounts.authenticate(authorization(request));
+    const actor = await requestActor(request);
     if (actor?.kind !== "session") throw new AuthError("unauthenticated");
     await accounts.requireOwner(actor, organizationId);
     return actor;
@@ -326,7 +357,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     organizationId: string,
     scope: ApiKeyScope,
   ): Promise<Actor> => {
-    const actor = await accounts.authenticate(authorization(request));
+    const actor = await requestActor(request);
     if (!actor) throw new AuthError("unauthenticated");
     if (actor.kind === "session") {
       await accounts.requireOwner(actor, organizationId);
@@ -641,7 +672,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     }
 
     if (request.method === "GET" && url.pathname === "/v1/me") {
-      const actor = await accounts.authenticate(authorization(request));
+      const actor = await requestActor(request);
       if (actor?.kind !== "session") throw new AuthError("unauthenticated");
       const principal = await accounts.principal(actor.principalId);
       if (!principal) throw new AuthError("unauthenticated");
@@ -652,7 +683,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     }
 
     if (request.method === "POST" && url.pathname === "/v1/organizations") {
-      const actor = await accounts.authenticate(authorization(request));
+      const actor = await requestActor(request);
       if (actor?.kind !== "session") throw new AuthError("unauthenticated");
       const body = await jsonObject(request);
       exactKeys(body, ["name"]);
@@ -661,7 +692,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
     }
 
     if (request.method === "POST" && url.pathname === "/v1/organizations/personal") {
-      const actor = await accounts.authenticate(authorization(request));
+      const actor = await requestActor(request);
       if (actor?.kind !== "session") throw new AuthError("unauthenticated");
       exactKeys(await jsonObject(request), []);
       const result = await accounts.createPersonalOrganization({ actor });

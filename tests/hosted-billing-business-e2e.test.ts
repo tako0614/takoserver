@@ -8,6 +8,7 @@ import {
   BillingHttp,
   type BusinessInput,
   billingE2eFailureDiagnostic,
+  parseBillingSessionFile,
   parseBusinessInput,
   runStart,
   runVerify,
@@ -67,6 +68,70 @@ function publicUsage(input: BusinessInput, organizationId: string) {
     amountMicros: usage.expectedMicros,
   };
 }
+
+test("shared Server session uses its own cookie and exact console Origin on actual billing requests", async () => {
+  const credential = parseBillingSessionFile(
+    "__Host-takoserver_shared_session=actual-server-session\n",
+    "https://console.staging.example",
+  );
+  const seen: Request[] = [];
+  const client = new BillingHttp("https://api.staging.example", credential, async (request) => {
+    seen.push(request);
+    return Response.json({ ok: true });
+  });
+  await client.request("GET", "/v1/me");
+  await client.request("POST", "/v1/organizations/org_original/wallet/checkout", {
+    reference: "original-reference",
+    amountMinor: 500,
+  });
+  expect(seen).toHaveLength(2);
+  for (const request of seen) {
+    expect(request.headers.get("cookie")).toBe(
+      "__Host-takoserver_shared_session=actual-server-session",
+    );
+    expect(request.headers.get("origin")).toBe("https://console.staging.example");
+    expect(request.headers.has("authorization")).toBe(false);
+  }
+  const post = seen[1];
+  if (!post) throw new Error("missing business POST");
+  expect(await post.json()).toEqual({ reference: "original-reference", amountMinor: 500 });
+});
+
+test("session file refuses other cookies, mixed credentials and an unselected console Origin", () => {
+  expect(parseBillingSessionFile("legacy-session\n")).toBe("legacy-session");
+  expect(parseBillingSessionFile("legacy-padded==\n")).toBe("legacy-padded==");
+  for (const raw of [
+    "__Host-takosumi_hosted_session=foreign-session",
+    "takoserver_session=legacy-session",
+    "__Host-takoserver_shared_session=first; other=second",
+    "__Host-takoserver_shared_session=first\nother=second",
+    "__Host-takoserver_shared_session=",
+  ]) {
+    expect(() => parseBillingSessionFile(raw, "https://console.staging.example")).toThrow();
+  }
+  expect(() => parseBillingSessionFile("__Host-takoserver_shared_session=original")).toThrow();
+  for (const origin of ["http://console.staging.example", "https://console.staging.example/path"]) {
+    expect(() =>
+      parseBillingSessionFile("__Host-takoserver_shared_session=original", origin),
+    ).toThrow();
+  }
+});
+
+test("HTTP client detaches the selected session credential before caller mutation", async () => {
+  const credential = {
+    kind: "shared-cookie" as const,
+    secret: "original-session",
+    consoleOrigin: "https://console.staging.example",
+  };
+  const client = new BillingHttp("https://api.staging.example", credential, async (request) => {
+    expect(request.headers.get("cookie")).toBe("__Host-takoserver_shared_session=original-session");
+    expect(request.headers.get("origin")).toBe("https://console.staging.example");
+    return Response.json({ ok: true });
+  });
+  credential.secret = "replacement-session";
+  credential.consoleOrigin = "https://other.example";
+  await client.request("GET", "/v1/me");
+});
 
 test("CLI diagnostics distinguish HTTP refusals without disclosing request or response secrets", async () => {
   for (const status of [401, 503]) {

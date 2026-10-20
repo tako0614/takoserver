@@ -77,6 +77,18 @@ material and arbitrary error messages are never included in the CLI diagnostic.
 Transport failures remain unknown; every failure retains the instruction to
 inspect the original journal and never repeat `start`.
 
+The 0600 session file contains either the original local `auth_tokens` session
+secret (sent as Bearer), or exactly
+`__Host-takoserver_shared_session=<original-Server-RP-cookie-value>`. The latter
+uses the Server's own cookie and the selected target's exact `consoleOrigin` on
+every GET and POST; it requires the shared-session Owner HTTP connection in the
+serving source. It is never sent as a Bearer token. Hosted and issuer cookies,
+multiple cookies and an unselected console Origin are refused. No Org API key
+replaces this same-user session after an Owner preflight. The business request
+itself must pass the Server's current Owner check. This changes no API body or
+consent-proof wire, and does not mint a session or grant authority to a caller
+without the actual Server credential.
+
 ```bash
 ./node_modules/.bin/biome check scripts/hosted-billing-business-e2e.ts
 bun --no-env-file scripts/hosted-billing-business-e2e.ts \
