@@ -127,7 +127,13 @@ export async function readRetainedInactiveUploadWitness(input: {
   if (JSON.stringify(entries) !== JSON.stringify([...RETAINED_INACTIVE_UPLOAD_ENTRIES].sort()))
     return refuse();
   const custody = join(input.root, "CUSTODY");
-  const names = readdirSync(custody).sort();
+  let names: string[];
+  try {
+    if (!lstatSync(custody).isDirectory()) return refuse();
+    names = readdirSync(custody).sort();
+  } catch {
+    return refuse();
+  }
   if (names.length === 0 || names.some((name) => !input.allowedNames.includes(name)))
     return refuse();
   const files = [
