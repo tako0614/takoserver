@@ -59,6 +59,8 @@ const FRESH_V2_SEED_TABLES = [
 
 // The plain 0100 profile also holds the 0094 policy seed and its claimed pin.
 const FRESH_V2_0100_SEED_TABLES = ["money_unit_policy", "stripe_mode_realm"] as const;
+export const FRESH_V2_UNPINNED_0100 =
+  "fresh v2-0100 D1 has its schema but no claimed Stripe realm pin";
 const PINNED_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
 
 /**
@@ -101,6 +103,10 @@ export async function assertFreshV2DataReadback(
     options.freshV2DataReader === undefined
       ? await readRemoteFreshV2Data(configPath, environment, tables, phase, options, servingSeeds)
       : await options.freshV2DataReader.read(phase, configPath);
+  // A complete plain 0100 schema without its pin is an interrupted import,
+  // never an in-use generation; say so before the generic refusal.
+  if (servingSeeds && (readback.stripeRealm ?? []).length === 0)
+    throw new DeployError(phase, FRESH_V2_UNPINNED_0100);
   const allowed = new Set(options.allowedTables ?? []);
   if ([...allowed].some((name) => !tables.includes(name)))
     throw new DeployError(phase, "fresh v2 allowed table is not part of the audited schema");

@@ -433,7 +433,7 @@ for (const lineage of ["v2-0088", "v2-0089", "v2-0091", "v2-0092", "v2-0100"] as
           : lineage === "v2-0089"
             ? 89
             : 88;
-  test(`fresh selected ${lineage} payload remains quiesced on the current audited Host`, async () => {
+  test(`fresh selected ${lineage} payload ${lineage === "v2-0100" ? "starts" : "remains quiesced on"} the current audited Host`, async () => {
     const artifacts = await Promise.all(
       CASES.map(async ({ slug, path, mediaType, contents }) => {
         const fileBytes = new TextEncoder().encode(contents);

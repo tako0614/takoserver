@@ -2,7 +2,13 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { deriveExpectedApplicationShape } from "../scripts/deploy/application-schema-shape.ts";
 import { buildFreshStripeRealmClaim } from "../scripts/deploy/fresh-stripe-realm-claim.ts";
+import {
+  assertFreshV2DataReadback,
+  FRESH_V2_UNPINNED_0100,
+  type FreshV2DataReadback,
+} from "../scripts/deploy/fresh-v2-data-readback.ts";
 import {
   type IntegrationStorageGenerationProcess,
   isGeneratedIntegrationStorageTarget,
@@ -141,6 +147,61 @@ describe("staging-only plain v2-0100 D1 profile", () => {
     ).rejects.toThrow("requires TAKOSERVER_DEPLOY_TARGET_PRODUCTION");
     expect(providerCalls).toBe(0);
     expect(imports).toEqual([]);
+  });
+
+  test("the data proof requires exactly the claimed test pin and names an unpinned import", async () => {
+    const shape = deriveExpectedApplicationShape(projected.files);
+    const tables = (JSON.parse(shape) as { type: string; name: string }[])
+      .filter((row) => row.type === "table")
+      .map((row) => row.name);
+    const seeded = new Set([
+      "tf_cloudflare_provider_invocation_epoch",
+      "tf_v2_operation_acceptance_counter",
+      "money_unit_policy",
+      "stripe_mode_realm",
+    ]);
+    const exact: FreshV2DataReadback = {
+      tableCounts: Object.fromEntries(tables.map((name) => [name, seeded.has(name) ? 1 : 0])),
+      ledgerRows: 100,
+      foreignKeyViolations: 0,
+      invocationEpoch: [
+        { singleton: 1, epoch_id: null, state: "closed", opened_at_ms: null, closed_at_ms: null },
+      ],
+      acceptanceCounter: [{ id: 1, last_order: 0, last_operation_id: null }],
+      moneyUnitPolicy: [
+        {
+          singleton: 1,
+          ledger_unit: "usd-micros-v2",
+          historical_usage_unit: "microcent-v1",
+          cash_unit: "usd-cents-v1",
+        },
+      ],
+      stripeRealm: [{ singleton: 1, mode: "test", pinned_at: "2026-10-20T09:37:06.426Z" }],
+    };
+    const proof = (readback: FreshV2DataReadback) =>
+      assertFreshV2DataReadback("verification", "v2-0100", "/private/wrangler.jsonc", {}, shape, {
+        freshV2DataReader: { read: async () => readback },
+      });
+    await expect(proof(exact)).resolves.toBeUndefined();
+    await expect(
+      proof({
+        ...exact,
+        stripeRealm: [],
+        tableCounts: { ...exact.tableCounts, stripe_mode_realm: 0 },
+      }),
+    ).rejects.toThrow(FRESH_V2_UNPINNED_0100);
+    for (const stripeRealm of [
+      [{ singleton: 1, mode: "live", pinned_at: "2026-10-20T09:37:06.426Z" }],
+      [{ singleton: 1, mode: "test", pinned_at: "2026-10-20 09:37:06" }],
+      [
+        { singleton: 1, mode: "test", pinned_at: "2026-10-20T09:37:06.426Z" },
+        { singleton: 1, mode: "test", pinned_at: "2026-10-20T09:37:06.426Z" },
+      ],
+    ])
+      await expect(proof({ ...exact, stripeRealm })).rejects.toThrow("exact empty 0100 database");
+    await expect(
+      proof({ ...exact, tableCounts: { ...exact.tableCounts, stripe_events: 1 } }),
+    ).rejects.toThrow("exact empty 0100 database");
   });
 
   test("an operator staging pair never stands in for the plain generation", () => {

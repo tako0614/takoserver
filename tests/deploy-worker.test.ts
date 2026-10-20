@@ -393,6 +393,23 @@ describe("split Takoserver Worker surfaces", () => {
       }),
     ).toBe(false);
   });
+  test("routine Worker publication waits for Auth103 on a plain v2-0100 generation", () => {
+    // The fresh plain 0100 generation lets the Worker start (first publication
+    // goes through bootstrap); routine normal mode reads 0103 and later only.
+    const selected = {
+      ...v2Target,
+      takoformV2: { ...v2Target.takoformV2, storageLineage: "v2-0100" as const },
+    };
+    expect(canonicalMigrations).toHaveLength(100);
+    expect(
+      workerSchemaAllowsPending(selected, {
+        local: canonicalMigrations,
+        applied: canonicalMigrations,
+        shape: canonicalMoneyShape,
+        shapeDigest: canonicalMoneyShapeDigest,
+      }),
+    ).toBe(false);
+  });
   test("0092 without billingConfig refuses before Worker upload and reports not ready", async () => {
     const current = fixture({ applied: canonicalMigrations.slice(0, 92) });
     const status = await runWorker(

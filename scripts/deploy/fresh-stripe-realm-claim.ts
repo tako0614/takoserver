@@ -59,11 +59,14 @@ export function buildFreshStripeRealmClaim(files: readonly MigrationFile[]): Fre
     "INSERT INTO stripe_mode_realm (singleton, mode, pinned_at)\n" +
     `SELECT 1, '${FRESH_STRIPE_REALM_CLAIM_MODE}', strftime('%Y-%m-%dT%H:%M:%fZ', 'now')\n` +
     "WHERE NOT EXISTS (SELECT 1 FROM stripe_mode_realm)\n" +
+    // json_group_array follows the subquery's ORDER BY name, as in the runtime
+    // claimFreshStripeModeRealm; the expected list comes from the same query.
     `  AND (SELECT json_group_array(name) FROM (${STRIPE_REALM_FINANCIAL_HISTORY_QUERY})) = '${JSON.stringify(historyTables)}'\n` +
     `  AND ${empty.join("\n  AND ")};\n` +
-    // json() on a non-JSON literal raises, failing the import when the claim
-    // did not leave exactly the test pin.
-    "SELECT CASE WHEN (SELECT COUNT(*) FROM stripe_mode_realm) = 1 AND " +
+    // json() on a non-JSON literal raises, failing the import unless this very
+    // INSERT wrote the row (changes() = 1, so a pre-existing test pin also
+    // refuses) and exactly the test pin now exists.
+    "SELECT CASE WHEN changes() = 1 AND (SELECT COUNT(*) FROM stripe_mode_realm) = 1 AND " +
     `(SELECT mode FROM stripe_mode_realm WHERE singleton = 1) = '${FRESH_STRIPE_REALM_CLAIM_MODE}' ` +
     "THEN 1 ELSE json('fresh Stripe realm claim refused') END AS claimed;";
   return { mode: FRESH_STRIPE_REALM_CLAIM_MODE, historyTables, sql };

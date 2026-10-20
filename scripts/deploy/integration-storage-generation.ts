@@ -44,6 +44,7 @@ import {
 } from "./fresh-stripe-realm-claim.ts";
 import {
   assertFreshV2DataReadback,
+  FRESH_V2_UNPINNED_0100,
   type FreshV2D1Lineage,
   type FreshV2DataReader,
 } from "./fresh-v2-data-readback.ts";
@@ -2099,6 +2100,7 @@ async function statusStorageGeneration(
       : "incomplete-or-divergent";
     const freshV2 = freshV2D1Lineage(invocation.freshLineage);
     let dataEmpty: boolean | null = null;
+    let unpinned = false;
     if (complete && freshV2 !== null) {
       try {
         await assertFreshV2DataReadback(
@@ -2110,19 +2112,23 @@ async function statusStorageGeneration(
           { ...options, run: options.run ?? runCommand },
         );
         dataEmpty = true;
-      } catch {
+      } catch (error) {
         // A complete schema with application rows is a generation a Host (or
         // the signing registration) has already written, not a broken import.
+        // A plain 0100 schema without its pin is the exception: the import
+        // stopped after the migrations, so the generation is quarantined.
+        unpinned = error instanceof DeployError && error.message === FRESH_V2_UNPINNED_0100;
         dataEmpty = false;
       }
-      result.dataReadback = dataEmpty ? "empty-seeded" : "present";
+      result.dataReadback = dataEmpty ? "empty-seeded" : unpinned ? "unpinned" : "present";
     }
     original?.assertUnchanged();
-    result.resume = !complete
-      ? "Quarantine this generation and plan separate owner-reviewed forward repair; no SQL re-import or new generation retry."
-      : dataEmpty === false
-        ? "Complete schema with application data: this generation is in use. Keep it as the selected target; it is no longer a fresh candidate. No SQL re-import."
-        : "Correlate the exact prior apply identity; separately review any missing R2 and target binding. No SQL re-import.";
+    result.resume =
+      !complete || unpinned
+        ? "Quarantine this generation and plan separate owner-reviewed forward repair; no SQL re-import or new generation retry."
+        : dataEmpty === false
+          ? "Complete schema with application data: this generation is in use. Keep it as the selected target; it is no longer a fresh candidate. No SQL re-import."
+          : "Correlate the exact prior apply identity; separately review any missing R2 and target binding. No SQL re-import.";
     return result;
   } finally {
     if (temporary) rmSync(root, { recursive: true, force: true });

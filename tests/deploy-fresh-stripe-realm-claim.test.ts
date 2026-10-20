@@ -52,6 +52,11 @@ test("an existing pin, a history row or an unexpected financial table refuses th
       db.exec(
         "INSERT INTO stripe_mode_realm (singleton, mode, pinned_at) VALUES (1, 'live', '2026-01-01T00:00:00.000Z')",
       ),
+    // Even an existing test pin refuses: only this import's own INSERT may pin.
+    (db) =>
+      db.exec(
+        "INSERT INTO stripe_mode_realm (singleton, mode, pinned_at) VALUES (1, 'test', '2026-01-01T00:00:00.000Z')",
+      ),
     (db) =>
       db.exec(
         "INSERT INTO idempotency (scope_key, fingerprint, status, body_json, expires_at) VALUES ('scope', 'fingerprint', 200, NULL, 0)",
