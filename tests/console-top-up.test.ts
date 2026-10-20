@@ -802,6 +802,7 @@ async function billingPageFor(input: {
   readonly storage?: Map<string, string>;
   readonly signedIn?: boolean;
   readonly receiptState?: TopUpReceipt["state"];
+  readonly workspaceUsage?: (url: URL) => Response | Promise<Response>;
 }) {
   const values = input.storage ?? new Map<string, string>();
   const storage = {
@@ -892,6 +893,8 @@ async function billingPageFor(input: {
           ? Response.json({ checkout: { url: checkoutUrl } }, { status: 201 })
           : Response.json({ error: { code: "not_found" } }, { status: 404 });
       if (url.pathname === `${base}/wallet/funding`) return Response.json({ wallet: {} });
+      if (url.pathname === `${base}/wallet/usage-summary/workspaces` && input.workspaceUsage)
+        return input.workspaceUsage(url);
       return Response.json({ error: { code: "not_found" } }, { status: 404 });
     },
     { preconnect: globalThis.fetch.preconnect },
@@ -925,6 +928,7 @@ async function billingPageFor(input: {
       .at(-1);
   return {
     sent,
+    root,
     calls: () => sent.map((request) => request.call),
     replaced,
     assigned,
@@ -1071,5 +1075,111 @@ describe("billing page top-up lane", () => {
     expect(page.calls().filter((call) => call === receiptCall)).toHaveLength(1);
     expect(page.calls()).not.toContain(fundingCall);
     expect(storage.has(storageKey)).toBe(true);
+  });
+});
+
+function workspaceUsageBody(
+  workspaces: readonly string[],
+  cursor: string | null,
+  snapshotAt = "2026-10-15T00:00:00.000Z",
+) {
+  return {
+    organizationId,
+    snapshotAt,
+    periodStart: "2026-10-01T00:00:00.000Z",
+    periodEnd: "2026-11-01T00:00:00.000Z",
+    unit: "USD-micros",
+    totalsScope: "organization",
+    totals: { usedMicros: "9000000", heldMicros: "0", pendingMicros: "250000" },
+    usageSummary: {
+      organizationId,
+      currency: "USD",
+      unit: "USD-micros",
+      periodStart: "2026-10-01T00:00:00.000Z",
+      periodEnd: "2026-11-01T00:00:00.000Z",
+    },
+    workspaces: workspaces.map((workspaceRef) => ({
+      workspaceRef,
+      usedMicros: "1000000",
+      heldMicros: "0",
+      pendingMicros: "0",
+    })),
+    unattributed: { usedMicros: "2000000", heldMicros: "0", pendingMicros: "0" },
+    cursor,
+  };
+}
+
+describe("billing page Workspace usage", () => {
+  test("shows snapshot totals and the unattributed row, and loads the next page by cursor", async () => {
+    const queries: string[] = [];
+    const page = await billingPageFor({
+      subscription: "hosted",
+      workspaceUsage: (url) => {
+        queries.push(url.search);
+        return Response.json(
+          url.searchParams.has("cursor")
+            ? workspaceUsageBody(["ws_c"], null)
+            : workspaceUsageBody(["ws_a", "ws_b"], "next_page"),
+        );
+      },
+    });
+    const text = () => page.root.textContent;
+    expect(text()).toContain("Workspace usage");
+    expect(text()).toContain("ws_a");
+    expect(text()).toContain("ws_b");
+    expect(text()).toContain("Unattributed");
+    expect(text()).toContain("$2");
+    expect(text()).toContain("Organization total");
+    expect(text()).toContain("$9");
+    expect(text()).toContain("$0.25");
+    expect(text()).not.toContain("ws_c");
+    await page.click("Load more");
+    expect(text()).toContain("ws_c");
+    expect(text()).not.toContain("Load more");
+    expect(queries).toEqual(["", "?cursor=next_page"]);
+  });
+
+  test("an expired cursor restarts from page one without mixing snapshots", async () => {
+    let firstPages = 0;
+    const page = await billingPageFor({
+      subscription: "hosted",
+      workspaceUsage: (url) => {
+        if (url.searchParams.has("cursor"))
+          return Response.json({ error: { code: "expired", retryable: false } }, { status: 409 });
+        firstPages += 1;
+        return Response.json(
+          firstPages === 1
+            ? workspaceUsageBody(["ws_old"], "stale")
+            : workspaceUsageBody(["ws_new"], null, "2026-10-15T00:11:00.000Z"),
+        );
+      },
+    });
+    expect(page.root.textContent).toContain("ws_old");
+    await page.click("Load more");
+    expect(firstPages).toBe(2);
+    expect(page.root.textContent).toContain("ws_new");
+    expect(page.root.textContent).not.toContain("ws_old");
+    expect(page.root.textContent).toContain("The earlier snapshot expired");
+  });
+
+  test("a Host without the breakdown hides the section; a failure offers a retry", async () => {
+    const absent = await billingPageFor({ subscription: "legacy" });
+    expect(absent.calls()).toContain(
+      `GET /v1/organizations/${organizationId}/wallet/usage-summary/workspaces`,
+    );
+    expect(absent.root.textContent).not.toContain("Workspace usage");
+
+    let reads = 0;
+    const failing = await billingPageFor({
+      subscription: "hosted",
+      workspaceUsage: () =>
+        ++reads === 1
+          ? Response.json({ error: { code: "billing_unavailable" } }, { status: 503 })
+          : Response.json(workspaceUsageBody([], null)),
+    });
+    expect(failing.root.textContent).toContain("Workspace usage");
+    await failing.click("Try again");
+    expect(reads).toBe(2);
+    expect(failing.root.textContent).toContain("No Workspace-attributed usage in this period.");
   });
 });

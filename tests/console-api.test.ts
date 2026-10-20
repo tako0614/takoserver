@@ -110,6 +110,178 @@ test("usage summary refuses unknown, foreign or invalid units and utilization in
   expect(sessionLost).toBe(true);
 });
 
+function workspaceUsagePage(change: Record<string, unknown> = {}) {
+  return {
+    organizationId: org,
+    snapshotAt: "2026-10-15T00:00:00.000Z",
+    periodStart: "2026-10-01T00:00:00.000Z",
+    periodEnd: "2026-11-01T00:00:00.000Z",
+    unit: "USD-micros",
+    totalsScope: "organization",
+    totals: { usedMicros: "12000", heldMicros: "8000", pendingMicros: "1000" },
+    usageSummary: {
+      organizationId: org,
+      currency: "USD",
+      unit: "USD-micros",
+      periodKind: "free",
+      periodStart: "2026-10-01T00:00:00.000Z",
+      periodEnd: "2026-11-01T00:00:00.000Z",
+      usedMicros: "9000",
+      effectiveIncludedMicros: "1500000",
+    },
+    workspaces: [
+      { workspaceRef: "ws_a", usedMicros: "6000", heldMicros: "8000", pendingMicros: "0" },
+      { workspaceRef: "ws_b", usedMicros: "4000", heldMicros: "0", pendingMicros: "1000" },
+    ],
+    unattributed: { usedMicros: "2000", heldMicros: "0", pendingMicros: "0" },
+    cursor: "eyJhZnRlciI6IndzX2IifQ",
+    ...change,
+  };
+}
+
+test("Workspace usage decodes exact micros strings, snapshot identity and an opaque cursor", async () => {
+  const seen = transport(() => Response.json(workspaceUsagePage()));
+  const page = await client().workspaceUsage(org);
+  expect(page).toEqual({
+    organizationId: org,
+    snapshotAt: "2026-10-15T00:00:00.000Z",
+    periodStart: "2026-10-01T00:00:00.000Z",
+    periodEnd: "2026-11-01T00:00:00.000Z",
+    unit: "USD-micros",
+    totalsScope: "organization",
+    totals: { usedMicros: "12000", heldMicros: "8000", pendingMicros: "1000" },
+    unattributed: { usedMicros: "2000", heldMicros: "0", pendingMicros: "0" },
+    workspaces: [
+      { workspaceRef: "ws_a", usedMicros: "6000", heldMicros: "8000", pendingMicros: "0" },
+      { workspaceRef: "ws_b", usedMicros: "4000", heldMicros: "0", pendingMicros: "1000" },
+    ],
+    cursor: "eyJhZnRlciI6IndzX2IifQ",
+  });
+  const first = new URL(seen[0]?.url ?? origin);
+  expect(first.pathname).toBe(
+    "/v1/organizations/org%2Fexample%3Fx%3D1%23%25/wallet/usage-summary/workspaces",
+  );
+  expect(first.search).toBe("");
+  expect(seen[0]?.method).toBe("GET");
+  expect(seen[0]?.credentials).toBe("include");
+  expect(seen[0]?.headers.get("authorization")).toBe("Bearer session");
+
+  const continued = transport(() =>
+    Response.json(workspaceUsagePage({ workspaces: [], cursor: null })),
+  );
+  expect(
+    (await client().workspaceUsage(org, { cursor: "eyJhZnRlciI6IndzX2IifQ", limit: 25 })).cursor,
+  ).toBeNull();
+  const next = new URL(continued[0]?.url ?? origin);
+  expect([...next.searchParams.entries()]).toEqual([
+    ["limit", "25"],
+    ["cursor", "eyJhZnRlciI6IndzX2IifQ"],
+  ]);
+});
+
+test("Workspace usage refuses foreign, malformed or inconsistent pages instead of showing them", async () => {
+  const workspace = (change: Record<string, unknown>) => ({
+    workspaces: [
+      {
+        workspaceRef: "ws_a",
+        usedMicros: "6000",
+        heldMicros: "8000",
+        pendingMicros: "0",
+        ...change,
+      },
+    ],
+  });
+  for (const change of [
+    { organizationId: "foreign-org" },
+    { unit: "USD-cents" },
+    { totalsScope: "page" },
+    { snapshotAt: "2026-10-15T00:00:00Z" },
+    { snapshotAt: "2026-11-02T00:00:00.000Z" },
+    { periodEnd: "2026-10-01T00:00:00.000Z" },
+    { extra: true },
+    { usageSummary: undefined },
+    { usageSummary: { ...workspaceUsagePage().usageSummary, organizationId: "foreign-org" } },
+    { usageSummary: { ...workspaceUsagePage().usageSummary, currency: "JPY" } },
+    {
+      usageSummary: {
+        ...workspaceUsagePage().usageSummary,
+        periodStart: "2026-09-01T00:00:00.000Z",
+      },
+    },
+    { cursor: "" },
+    { cursor: 7 },
+    { cursor: "has space" },
+    { cursor: "a".repeat(1025) },
+    { cursor: "next", workspaces: [] },
+    { totals: { usedMicros: 12000, heldMicros: "8000", pendingMicros: "1000" } },
+    { totals: { usedMicros: "12000", heldMicros: "8000" } },
+    { totals: { usedMicros: "12000", heldMicros: "8000", pendingMicros: "1000", extra: "0" } },
+    { totals: { usedMicros: "-1", heldMicros: "8000", pendingMicros: "1000" } },
+    { totals: { usedMicros: "9007199254740992", heldMicros: "0", pendingMicros: "0" } },
+    { totals: { usedMicros: "9007199254740991", heldMicros: "1", pendingMicros: "0" } },
+    { totals: { usedMicros: "11999", heldMicros: "8000", pendingMicros: "1000" } },
+    { unattributed: null },
+    { unattributed: { usedMicros: "2001", heldMicros: "0", pendingMicros: "0" } },
+    { workspaces: null },
+    workspace({ workspaceRef: "bad/ref" }),
+    workspace({ workspaceRef: "" }),
+    workspace({ usedMicros: "06000" }),
+    workspace({ pendingMicros: undefined }),
+    workspace({ name: "Workspace A" }),
+    {
+      workspaces: [
+        { workspaceRef: "ws_b", usedMicros: "0", heldMicros: "0", pendingMicros: "0" },
+        { workspaceRef: "ws_a", usedMicros: "0", heldMicros: "0", pendingMicros: "0" },
+      ],
+    },
+    {
+      workspaces: [
+        { workspaceRef: "ws_a", usedMicros: "0", heldMicros: "0", pendingMicros: "0" },
+        { workspaceRef: "ws_a", usedMicros: "0", heldMicros: "0", pendingMicros: "0" },
+      ],
+    },
+  ]) {
+    transport(() => Response.json(workspaceUsagePage(change)));
+    await expect(client().workspaceUsage(org)).rejects.toMatchObject({ code: "invalid_response" });
+  }
+  transport(() => Response.json(workspaceUsagePage()));
+  await expect(client().workspaceUsage(org, { limit: 1 })).rejects.toMatchObject({
+    code: "invalid_response",
+  });
+  transport(() => Response.json(workspaceUsagePage(), { status: 202 }));
+  await expect(client().workspaceUsage(org)).rejects.toMatchObject({ code: "invalid_response" });
+  transport(() => Response.json([]));
+  await expect(client().workspaceUsage(org)).rejects.toMatchObject({ code: "invalid_response" });
+
+  let sent = 0;
+  transport(() => {
+    sent += 1;
+    return Response.json(workspaceUsagePage());
+  });
+  for (const query of [{ limit: 0 }, { limit: 101 }, { limit: 1.5 }, { cursor: "" }])
+    await expect(client().workspaceUsage(org, query)).rejects.toMatchObject({
+      code: "invalid_request",
+    });
+  expect(sent).toBe(0);
+
+  transport(() => Response.json({ error: { code: "expired", retryable: false } }, { status: 409 }));
+  await expect(client().workspaceUsage(org, { cursor: "old" })).rejects.toMatchObject({
+    code: "expired",
+    status: 409,
+  });
+  transport(() => Response.json({ error: { code: "not_found" } }, { status: 404 }));
+  await expect(client().workspaceUsage(org)).rejects.toMatchObject({
+    code: "not_found",
+    status: 404,
+  });
+  let sessionLost = false;
+  transport(() => Response.json({ error: { code: "unauthenticated" } }, { status: 401 }));
+  await expect(client(() => (sessionLost = true)).workspaceUsage(org)).rejects.toMatchObject({
+    code: "unauthenticated",
+  });
+  expect(sessionLost).toBe(true);
+});
+
 test("wallet micros decode as canonical bounded USD strings and display exact fractions", async () => {
   const wallet = {
     organizationId: org,

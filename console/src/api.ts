@@ -100,6 +100,39 @@ export interface WalletUsageSummary {
   readonly utilizationBasisPoints: number;
 }
 
+/** One Workspace's (or the unattributed bucket's) share of a frozen usage snapshot. */
+export interface WorkspaceUsageAmounts {
+  readonly usedMicros: string;
+  readonly heldMicros: string;
+  /** Consumed but unpaid usage; not available balance and not another debit. */
+  readonly pendingMicros: string;
+}
+
+export interface WorkspaceUsageRow extends WorkspaceUsageAmounts {
+  /** Opaque Workspace reference; the Console never resolves it to a name. */
+  readonly workspaceRef: string;
+}
+
+/**
+ * One page of the server's frozen per-Workspace usage snapshot.
+ *
+ * `totals` and `unattributed` describe the whole snapshot, never this page, so
+ * they repeat unchanged on every page and must not be summed across pages.
+ */
+export interface WorkspaceUsagePage {
+  readonly organizationId: string;
+  readonly snapshotAt: string;
+  readonly periodStart: string;
+  readonly periodEnd: string;
+  readonly unit: "USD-micros";
+  readonly totalsScope: "organization";
+  readonly totals: WorkspaceUsageAmounts;
+  readonly unattributed: WorkspaceUsageAmounts;
+  readonly workspaces: readonly WorkspaceUsageRow[];
+  /** Opaque continuation inside the same snapshot; `null` on the last page. */
+  readonly cursor: string | null;
+}
+
 export type HostedPlanTable = HostedPricing["hostedPlanTable"];
 
 export interface HostedSubscriptionProjection {
@@ -372,6 +405,120 @@ function decodeWallet(payload: unknown, organizationId: string): Wallet {
   return { organizationId, currency: "USD", settledMicros, heldMicros, availableMicros, entries };
 }
 
+const WORKSPACE_USAGE_KEYS = [
+  "cursor",
+  "organizationId",
+  "periodEnd",
+  "periodStart",
+  "snapshotAt",
+  "totals",
+  "totalsScope",
+  "unattributed",
+  "unit",
+  "usageSummary",
+  "workspaces",
+].join();
+const WORKSPACE_AMOUNT_KEYS = ["heldMicros", "pendingMicros", "usedMicros"].join();
+const WORKSPACE_ROW_KEYS = ["heldMicros", "pendingMicros", "usedMicros", "workspaceRef"].join();
+
+function exactKeys(value: Record<string, unknown>, keys: string): boolean {
+  return Object.keys(value).sort().join() === keys;
+}
+
+function workspaceUsageAmounts(value: unknown, keys = WORKSPACE_AMOUNT_KEYS) {
+  if (!isRecord(value) || !exactKeys(value, keys)) throw new TypeError("invalid usage amounts");
+  const amounts = {
+    usedMicros: unsignedMicros(value.usedMicros),
+    heldMicros: unsignedMicros(value.heldMicros),
+    pendingMicros: unsignedMicros(value.pendingMicros),
+  };
+  if (
+    BigInt(amounts.usedMicros) + BigInt(amounts.heldMicros) + BigInt(amounts.pendingMicros) >
+    MAX_SAFE_MICROS
+  )
+    throw new TypeError("usage amounts out of range");
+  return amounts;
+}
+
+/**
+ * Decodes one page of the per-Workspace breakdown, or refuses it.
+ *
+ * Identity, period and snapshot instant must agree with each other and with
+ * the embedded included-usage summary; rows must be the server's strictly
+ * ordered opaque references; and this page's rows plus the unattributed bucket
+ * can never exceed the Organization totals they are a part of.
+ */
+export function decodeWorkspaceUsagePage(
+  payload: unknown,
+  organizationId: string,
+): WorkspaceUsagePage {
+  if (!isRecord(payload) || !exactKeys(payload, WORKSPACE_USAGE_KEYS))
+    throw new TypeError("invalid workspace usage");
+  if (
+    payload.organizationId !== organizationId ||
+    payload.unit !== "USD-micros" ||
+    payload.totalsScope !== "organization" ||
+    !isCanonicalIsoTimestamp(payload.snapshotAt) ||
+    !isCanonicalIsoTimestamp(payload.periodStart) ||
+    !isCanonicalIsoTimestamp(payload.periodEnd) ||
+    !(payload.periodStart <= payload.snapshotAt && payload.snapshotAt < payload.periodEnd)
+  )
+    throw new TypeError("invalid workspace usage identity");
+  const summary = payload.usageSummary;
+  if (
+    !isRecord(summary) ||
+    summary.organizationId !== organizationId ||
+    summary.currency !== "USD" ||
+    summary.unit !== "USD-micros" ||
+    summary.periodStart !== payload.periodStart ||
+    summary.periodEnd !== payload.periodEnd
+  )
+    throw new TypeError("invalid workspace usage summary");
+  if (
+    payload.cursor !== null &&
+    (typeof payload.cursor !== "string" ||
+      payload.cursor.length === 0 ||
+      payload.cursor.length > 1024 ||
+      !/^[A-Za-z0-9_-]+$/u.test(payload.cursor))
+  )
+    throw new TypeError("invalid workspace usage cursor");
+  if (!Array.isArray(payload.workspaces)) throw new TypeError("invalid workspace rows");
+  const totals = workspaceUsageAmounts(payload.totals);
+  const unattributed = workspaceUsageAmounts(payload.unattributed);
+  let previous: string | null = null;
+  const workspaces = payload.workspaces.map((row): WorkspaceUsageRow => {
+    const amounts = workspaceUsageAmounts(row, WORKSPACE_ROW_KEYS);
+    const workspaceRef = (row as Record<string, unknown>).workspaceRef;
+    if (!isWorkspaceRef(workspaceRef) || (previous !== null && workspaceRef <= previous))
+      throw new TypeError("invalid workspace ref");
+    previous = workspaceRef;
+    return { workspaceRef, ...amounts };
+  });
+  if (workspaces.length > 100 || (payload.cursor !== null && workspaces.length === 0))
+    throw new TypeError("invalid workspace page size");
+  for (const field of ["usedMicros", "heldMicros", "pendingMicros"] as const) {
+    const listed = workspaces.reduce((sum, row) => sum + BigInt(row[field]), 0n);
+    if (listed + BigInt(unattributed[field]) > BigInt(totals[field]))
+      throw new TypeError("workspace rows exceed totals");
+  }
+  return {
+    organizationId,
+    snapshotAt: payload.snapshotAt,
+    periodStart: payload.periodStart,
+    periodEnd: payload.periodEnd,
+    unit: "USD-micros",
+    totalsScope: "organization",
+    totals,
+    unattributed,
+    workspaces,
+    cursor: payload.cursor,
+  };
+}
+
+function isWorkspaceRef(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u.test(value);
+}
+
 function unsignedMicros(value: unknown): string {
   if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/u.test(value)) {
     throw new TypeError("invalid unsigned micros");
@@ -590,6 +737,38 @@ export function createApi(options: ApiOptions) {
             utilizationBasisPoints,
           },
         };
+      } catch {
+        throw new ApiError("invalid_response", status, path);
+      }
+    },
+
+    /**
+     * Reads one page of the frozen per-Workspace usage snapshot. Without a
+     * cursor the server creates a new snapshot; a cursor continues the snapshot
+     * it came from and answers 409 once that snapshot has expired.
+     */
+    async workspaceUsage(
+      organizationId: string,
+      query: { readonly cursor?: string; readonly limit?: number } = {},
+    ): Promise<WorkspaceUsagePage> {
+      const search = new URLSearchParams();
+      if (query.limit !== undefined) search.set("limit", String(query.limit));
+      if (query.cursor !== undefined) search.set("cursor", query.cursor);
+      const encoded = search.toString();
+      const path = `/v1/organizations/${encodeURIComponent(organizationId)}/wallet/usage-summary/workspaces${encoded ? `?${encoded}` : ""}`;
+      if (
+        (query.limit !== undefined &&
+          (!Number.isSafeInteger(query.limit) || query.limit < 1 || query.limit > 100)) ||
+        (query.cursor !== undefined && (query.cursor.length === 0 || query.cursor.length > 1024))
+      )
+        throw new ApiError("invalid_request", 0, path);
+      const { payload, status } = await request<unknown>("GET", path);
+      try {
+        if (status !== 200) throw new TypeError("unexpected status");
+        const page = decodeWorkspaceUsagePage(payload, organizationId);
+        if (query.limit !== undefined && page.workspaces.length > query.limit)
+          throw new TypeError("page exceeds limit");
+        return page;
       } catch {
         throw new ApiError("invalid_response", status, path);
       }

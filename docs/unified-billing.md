@@ -40,7 +40,7 @@ billing GA.
 | Invoicing | Aggregate payable micros, then ceiling to cents once | Capture/usage retain micros; the arithmetic helper is available, while Stripe invoice settlement remains a later wave |
 | Holds and scopes | Immutable TTL, capture ≤ hold, automatic release; four routine writes with exact Organization/scopes | #330 preserves #318's transactional lifecycle and supplies the four micros commands and scoped reads |
 | Hosted plans | Edge allowance, monthly included credit, additional credit/usage; the same three configured IDs and table | #319 is a shared-table preview, not an activated catalog; configuration/subscription/refund alignment is owned by #325 / `106603b4` |
-| Screens | USD cents presentation, exact micros details; shared balance/held/lot semantics | Common contract below; current Console shows exact micros and no lot breakdown, so screen adoption remains an explicit acceptance step |
+| Screens | USD cents presentation, exact micros details; shared balance/held/lot semantics | Common contract below; current Console shows exact micros, the included-usage percentage and a paged per-Workspace usage snapshot, but no lot breakdown, so screen adoption remains an explicit acceptance step |
 
 ## One wallet authority, separate product identities
 
@@ -424,6 +424,7 @@ a view with its fetch time, but cannot maintain or write a second balance.
 | Refund receivable / 返金未回収額 | `/wallet.refundReceivableMicros`: non-spendable debt from refunded credit already used; separate from current credit and blocks new billable admission even when available credit is positive |
 | Free / Subscription / Purchased | Lot `consumptionClass`, original grant/purchase, remaining, held, available and expiry; display in the fixed consumption order |
 | Included usage / 当期の無料・有料枠 | `/wallet/usage-summary`: verified paid invoice service period or frozen UTC Free month, effective allowance after refunds, this period's used/held/available micros, capped basis-point utilization, 80%/95% flags and grant-end `nextResetAt`; purchased/direct credit is separate |
+| Workspace usage / ワークスペース別の使用量 | `/wallet/usage-summary/workspaces`: one frozen snapshot of this period's used/held/pending micros per opaque `workspaceRef`, an explicit unattributed row and the snapshot's Organization totals; paged by cursor within that snapshot, restarted from page one after an expired (`409`) continuation, and never summed or merged across snapshots |
 | Edge-resource allowance | Configured quota units, period, used and remaining resources; separate from monetary credit and never added to the wallet |
 | Postpaid usage | Confirmed payable usage, pending cap reservation, cash cap and invoiced/uncollected amounts; separate from the nonnegative prepaid wallet |
 
@@ -520,7 +521,8 @@ credentials, Hosted user/session IDs, or billing keys in these views.
 
 Current source acceptance is intentionally explicit: #330 supplies the four
 commands, micros wallet totals and paged per-lot class/expiry data. The Console
-currently formats exact micros (up to six decimal places), and has no class
+currently formats exact micros (up to six decimal places) and shows the
+read-only Workspace usage snapshot described above, and has no class
 breakdown; its old explanation of a balance as an append-only-entry sum also
 needs the expiry-aware wording above. This document specifies the common
 Hosted screens, not a claim that both product UIs already implement them.

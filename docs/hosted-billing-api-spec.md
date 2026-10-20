@@ -298,6 +298,17 @@ continuation. Preserve rows and complete totals across pages. Use a declared
 a fresh first page. Implement/readback this schema before advertising the
 route. Concurrent settlement tests must prove pages sum to the frozen totals.
 
+The Console billing page shows this route read-only as **Workspace usage**:
+opaque `workspaceRef` rows with used/held/pending micros, the `unattributed`
+row and the snapshot's Organization total, labelled with the period and
+snapshot time. "Load more" follows `cursor` within the same snapshot, and the
+section refreshes together with the wallet. The Console rejects a page whose
+identity, exact keys, micros strings or row order are malformed, never sums
+`totals` across pages, and never merges pages whose snapshot time, period,
+totals or unattributed bucket differ. An expired continuation (`409`) discards
+the loaded rows and restarts from page one. A Host without the route
+(`not_found`) shows no section; any other failure is shown with a retry.
+
 ## Subscription start, change and cancellation
 
 GET preserves `{subscription: <projection or null>, planTable: <existing table>}`.
