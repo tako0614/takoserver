@@ -1841,12 +1841,23 @@ function optionalInteger(flags: Map<string, string>, name: string, fallback: num
   return parsed;
 }
 
-function usage(): string {
+/** CLI help text; the doc's command-line reference lists the same flags. */
+export function usage(): string {
   return [
     "usage:",
     "  bun scripts/wfp-hosted-staging-e2e.ts --emit-fixture --artifact-base-url=https://.../ --output-dir=/tmp/wfp-fixture",
     "  bun scripts/wfp-hosted-staging-e2e.ts --check-fixture --fixture=/tmp/wfp-fixture/fixture.json",
-    "  bun scripts/wfp-hosted-staging-e2e.ts --run --fixture=/tmp/wfp-fixture/fixture.json --origin=https://integration-api.takoserver.com --writer-secret=/path/writer.secret --evidence-secret=/path/evidence.secret --source-commit=<full-sha> --space=<actual-organization-id> [--reservation-offering-id=<eligible-offering-id>] --journal=/tmp/run.jsonl --output=/tmp/evidence.json",
+    "  bun scripts/wfp-hosted-staging-e2e.ts --run --fixture=/tmp/wfp-fixture/fixture.json --origin=https://integration-api.takoserver.com --writer-secret=/path/writer.secret --evidence-secret=/path/evidence.secret --source-commit=<full-sha> --space=<actual-organization-id> [--reservation-offering-id=<eligible-offering-id>] [--run-id=<6-64 lowercase identifier characters>] [--poll-seconds=300] [--schedule-timeout-seconds=240] --journal=/tmp/run.jsonl --output=/tmp/evidence.json",
+    "  bun scripts/wfp-hosted-staging-e2e.ts --help",
+    "",
+    "--run-id defaults to wfp-<random UUID>. --poll-seconds bounds each Operation wait",
+    "and --schedule-timeout-seconds the scheduled-evidence wait after the 130-second",
+    "quiet window; both take a positive integer. When --artifact-base-url, --output-dir,",
+    "--fixture, --origin, --writer-secret, --evidence-secret, --source-commit, --journal",
+    "or --output is absent, it is read from the environment variable of the same name",
+    "without the leading dashes, such as source-commit. --space,",
+    "--reservation-offering-id, --run-id, --poll-seconds and --schedule-timeout-seconds",
+    "are flags only.",
   ].join("\n");
 }
 

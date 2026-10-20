@@ -160,6 +160,41 @@ routes. This first selected carrier slice does not implement release, and a
 legacy release cannot prove v2 drain or global-name reuse. Graph deletion and
 route absence are not a claim that the global original has been released.
 
+## Command-Line Reference
+
+The script runs one mode per invocation, checked in this order:
+`--emit-fixture`, `--check-fixture`, `--run`. `--help` prints the usage and
+exits 0; no arguments print it and exit 2. Every argument is `--name=value`
+or a bare `--name`; positional arguments are refused. A flag the selected
+mode does not read is ignored.
+
+| Flag | Mode | Required | Default | Environment fallback |
+| --- | --- | --- | --- | --- |
+| `--artifact-base-url` | emit-fixture | yes | none | `artifact-base-url` |
+| `--output-dir` | emit-fixture | yes | none | `output-dir` |
+| `--fixture` | check-fixture, run | yes | none | `fixture` |
+| `--origin` | run | yes | none | `origin` |
+| `--writer-secret` | run | yes | none | `writer-secret` |
+| `--evidence-secret` | run | yes | none | `evidence-secret` |
+| `--source-commit` | run | yes | none | `source-commit` |
+| `--space` | run | yes | none | none |
+| `--journal` | run | yes | none | `journal` |
+| `--output` | run | yes | none | `output` |
+| `--reservation-offering-id` | run | no | existing selector | none |
+| `--run-id` | run | no | `wfp-<random UUID>` | none |
+| `--poll-seconds` | run | no | `300` | none |
+| `--schedule-timeout-seconds` | run | no | `240` | none |
+
+An environment fallback is read only when its flag is absent. Its variable
+name is the flag name without the leading dashes, such as `source-commit`, so
+set it with `env 'source-commit=...' bun run ...`; an empty flag value is
+refused rather than replaced. `--run-id` takes 6 to 64 lowercase identifier
+characters (`[a-z0-9][a-z0-9._-]{5,63}`). `--poll-seconds` bounds each
+Operation wait and `--schedule-timeout-seconds` bounds the scheduled-evidence
+wait that follows the fixed 130-second quiet window; both take a positive
+integer. Without `--reservation-offering-id`, the existing selector must find
+exactly one eligible Offering.
+
 ## Evidence And Failure
 
 Successful output says `HOSTED_STAGING_SCENARIOS_PASSED`, records source and
