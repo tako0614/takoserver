@@ -1251,6 +1251,10 @@ CREATE TABLE shared_auth_sessions (digest TEXT PRIMARY KEY NOT NULL,created_at I
       expect(shown.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
       // Browsers POST `Origin: null` from a no-referrer page; the form must keep its origin.
       expect(shown.headers.get("referrer-policy")).toBe("same-origin");
+      // The approval's 303 to the console is a form-action redirect target.
+      expect(shown.headers.get("content-security-policy")).toContain(
+        "form-action 'self' https://console.example.invalid;",
+      );
       const html = await shown.text();
       const transactionRef =
         /name="confirmation_transaction" value="(rpfc_[A-Za-z0-9_-]{43})"/u.exec(html)?.[1];

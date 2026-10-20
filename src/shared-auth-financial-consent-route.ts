@@ -61,10 +61,17 @@ function selection(
   return { workspaceId, challengeRef };
 }
 
-function page(status: number, html: string): Response {
+/** form-action also governs the redirect that answers the form POST, so the
+ * consent page names the validated console origin its 303 continues to. */
+function page(status: number, html: string, consoleOrigin?: string): Response {
+  const target = consoleReturn(consoleOrigin) === null ? "" : ` ${consoleOrigin}`;
   return new Response(html, {
     status,
-    headers: { ...PAGE_HEADERS, "content-type": "text/html; charset=utf-8" },
+    headers: {
+      ...PAGE_HEADERS,
+      "content-security-policy": `default-src 'none'; form-action 'self'${target}; frame-ancestors 'none'; base-uri 'none'`,
+      "content-type": "text/html; charset=utf-8",
+    },
   });
 }
 
@@ -110,7 +117,7 @@ export async function handleSharedAuthFinancialConsentRequest(
     const handler = createSharedAuthFinancialConsentRequestHandler(connection);
     if (request.method === "GET") {
       const view = await handler.prepareFinancialR1ConsentView(request, workspaceId, challengeRef);
-      return page(200, view.html);
+      return page(200, view.html, consoleOrigin);
     }
     // Without a valid configured console there is no continuation: refuse
     // before any effect rather than fall back to a relative path.
