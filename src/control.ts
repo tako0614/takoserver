@@ -680,11 +680,14 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       const actor = await accounts.authenticate(credential);
       if (actor?.kind !== "session") throw new AuthError("unauthenticated");
       await accounts.revokeSession(credential);
+      const headers = new Headers();
+      headers.append("set-cookie", clearSessionCookie(secureCookies));
+      // Logout clears the browser's remaining shared mode after the local
+      // revocation is acknowledged; it does not touch the Server RP row.
+      if (secureCookies) headers.append("set-cookie", clearSharedSessionCookie());
       return new Response(null, {
         status: 204,
-        headers: {
-          "set-cookie": clearSessionCookie(secureCookies),
-        },
+        headers,
       });
     }
 

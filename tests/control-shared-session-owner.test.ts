@@ -465,4 +465,113 @@ describe("same-request shared RP admission in Owner HTTP", () => {
     expect(typeof (await nonbrowser.json()).sessionToken).toBe("string");
     expect(nonbrowser.headers.getSetCookie()).toEqual([]);
   });
+
+  test("legacy logout clears both browser cookies after revoking only the explicit legacy session", async () => {
+    const f = await fixture({ distinctSharedPrincipal: true });
+    const shared = await f.sharedCookie();
+    const sharedBefore = await f.fetch("/v1/me", {
+      cookie: shared,
+      origin: SESSION_TEST_CONSOLE,
+    });
+    expect(sharedBefore.status).toBe(200);
+    expect((await sharedBefore.json()).principal.id).toBe(f.sharedSigned.principal.id);
+    expect(f.sharedSigned.principal.id).not.toBe(f.signed.principal.id);
+    const digest = await bytesDigest(
+      new TextEncoder().encode(shared.slice(`${SHARED_COOKIE}=`.length)),
+    );
+    const store = createSharedAuthSessionStore(f.sql);
+    const rowBefore = await store.readSession(digest);
+    expect(rowBefore?.status).toBe("active");
+    expect(await f.accounts.authenticate(`Bearer ${f.signed.sessionToken}`)).toMatchObject({
+      principalId: f.signed.principal.id,
+    });
+
+    const both = `${shared}; takoserver_session=${f.signed.sessionToken}`;
+    const automatic = await f.fetch("/v1/session", {
+      method: "DELETE",
+      cookie: both,
+      origin: SESSION_TEST_CONSOLE,
+    });
+    expect(automatic.status).toBe(401);
+    expect(automatic.headers.getSetCookie()).toEqual([]);
+
+    const logout = await f.fetch("/v1/session", {
+      method: "DELETE",
+      cookie: both,
+      origin: SESSION_TEST_CONSOLE,
+      authorization: `Bearer ${f.signed.sessionToken}`,
+    });
+    expect(logout.status).toBe(204);
+    expect(logout.headers.getSetCookie()).toEqual([
+      "takoserver_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0; Secure",
+      `${SHARED_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`,
+    ]);
+    expect(await f.accounts.authenticate(`Bearer ${f.signed.sessionToken}`)).toBeNull();
+    expect(await store.readSession(digest)).toEqual(rowBefore);
+    const stillLive = await f.fetch("/v1/me", { cookie: shared, origin: SESSION_TEST_CONSOLE });
+    expect(stillLive.status).toBe(200);
+    expect((await stillLive.json()).principal.id).toBe(f.sharedSigned.principal.id);
+  });
+
+  test("legacy logout failure, unknown bearer, and lost revoke ACK emit no cookie expiration", async () => {
+    const f = await fixture({ distinctSharedPrincipal: true });
+    const shared = await f.sharedCookie();
+    const digest = await bytesDigest(
+      new TextEncoder().encode(shared.slice(`${SHARED_COOKIE}=`.length)),
+    );
+    const store = createSharedAuthSessionStore(f.sql);
+    const rowBefore = await store.readSession(digest);
+    const rawSharedBefore = await f.sql.query(
+      "SELECT * FROM shared_auth_sessions WHERE digest = ?",
+      [digest],
+    );
+    for (const authorization of ["Bearer invalid", `Bearer ${"f".repeat(64)}`]) {
+      const response = await f.fetch("/v1/session", {
+        method: "DELETE",
+        cookie: shared,
+        origin: SESSION_TEST_CONSOLE,
+        authorization,
+      });
+      expect(response.status).toBe(401);
+      expect(response.headers.getSetCookie()).toEqual([]);
+    }
+    const originalRevoke = f.accounts.revokeSession;
+    f.accounts.revokeSession = async () => {
+      throw new Error("test revoke failure");
+    };
+    const failed = await f.fetch("/v1/session", {
+      method: "DELETE",
+      cookie: shared,
+      origin: SESSION_TEST_CONSOLE,
+      authorization: `Bearer ${f.signed.sessionToken}`,
+    });
+    expect(failed.status).toBe(500);
+    expect(failed.headers.getSetCookie()).toEqual([]);
+    f.accounts.revokeSession = originalRevoke;
+    expect(await f.accounts.authenticate(`Bearer ${f.signed.sessionToken}`)).not.toBeNull();
+    expect(await store.readSession(digest)).toEqual(rowBefore);
+
+    f.accounts.revokeSession = async (credential) => {
+      await Reflect.apply(originalRevoke, f.accounts, [credential]);
+      throw new Error("test lost revoke acknowledgement");
+    };
+    const ackLost = await f.fetch("/v1/session", {
+      method: "DELETE",
+      cookie: shared,
+      origin: SESSION_TEST_CONSOLE,
+      authorization: `Bearer ${f.signed.sessionToken}`,
+    });
+    expect(ackLost.status).toBe(500);
+    expect(ackLost.headers.getSetCookie()).toEqual([]);
+    expect(await f.accounts.authenticate(`Bearer ${f.signed.sessionToken}`)).toBeNull();
+    const tokenDigest = await bytesDigest(new TextEncoder().encode(f.signed.sessionToken));
+    const tokenRows = await f.sql.query(
+      "SELECT revoked_at FROM auth_tokens WHERE secret_digest = ?",
+      [tokenDigest],
+    );
+    expect(typeof tokenRows[0]?.revoked_at).toBe("string");
+    expect(
+      await f.sql.query("SELECT * FROM shared_auth_sessions WHERE digest = ?", [digest]),
+    ).toEqual(rawSharedBefore);
+  });
 });
