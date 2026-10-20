@@ -37,6 +37,7 @@ import {
 import { assertStripeModeRealm } from "../../src/stripe-mode-realm.ts";
 import { applicationSchemaMatches, canonicalApplicationShape } from "./application-schema-shape.ts";
 import { readAuth103CanonicalMigrationSource } from "./auth103-canonical-migration-source.ts";
+import { memoByContent } from "./compile-memo.ts";
 import { RemoteD1, sqlLiteral } from "./d1.ts";
 import { buildD1MigrationImport } from "./d1-migration-import.ts";
 import { normalizeSnapshotDump } from "./d1-snapshot-restore.ts";
@@ -637,6 +638,31 @@ function moneyPostExpectedPreservedShape(
     )
   )
     throw preflightError("money preserved shape requires the exact selected source inventory");
+  // Reuse a replay only for files whose bytes match their recorded size and
+  // digest on this call. Anything else replays as before, which refuses with
+  // the original stage-specific error; the replay itself re-reads and checks
+  // every file against the same metadata, so a result always belongs to its key.
+  const contents: Buffer[] = [];
+  for (const file of files) {
+    let bytes: Buffer;
+    try {
+      bytes = readFileSync(file.path);
+    } catch {
+      return replayMoneyPostExpectedPreservedShape(files, through);
+    }
+    if (bytes.length !== file.bytes || digest(bytes) !== file.digest)
+      return replayMoneyPostExpectedPreservedShape(files, through);
+    contents.push(Buffer.from(file.name, "utf8"), bytes);
+  }
+  return memoByContent(`money-preserved-shape@1:${through}`, contents, () =>
+    replayMoneyPostExpectedPreservedShape(files, through),
+  );
+}
+
+function replayMoneyPostExpectedPreservedShape(
+  files: readonly MigrationFile[],
+  through: 100 | 103,
+): string {
   const database = new Database(":memory:", { strict: true });
   let stage = "prefix94";
   try {

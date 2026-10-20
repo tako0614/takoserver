@@ -154,9 +154,13 @@ export async function openDockerPhysicalProcess(options: DockerPhysicalProcessOp
       : ["--guest-netns-root", options.native.guestNamespaceRoot]),
     ...(options.native?.guestFailClosed ? ["--guest-failclosed"] : []),
   ];
+  // An embedding Host may augment NodeJS.ProcessEnv with required names (for
+  // example Wrangler-generated Worker types); the helper still gets exactly
+  // this minimal locale environment.
+  const helperEnvironment: Record<string, string> = { LANG: "C", LC_ALL: "C" };
   const child = spawn(options.helper, args, {
     stdio: ["pipe", "pipe", "ignore"],
-    env: { LANG: "C", LC_ALL: "C" },
+    env: helperEnvironment as NodeJS.ProcessEnv,
   });
   let ended = false,
     cleanExit = false;
