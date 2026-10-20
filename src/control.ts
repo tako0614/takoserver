@@ -2023,6 +2023,7 @@ function classify(error: unknown): { code: string; status: number } {
     if (
       [
         "workspace_ref_conflict",
+        "workspace_ref_reserved",
         "workspace_snapshot_expired",
         "workspace_not_found",
         "usage_period_crosses_entitlement",

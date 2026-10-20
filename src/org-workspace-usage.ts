@@ -6,6 +6,7 @@ import {
   parseOrgUsageSummaryRows,
 } from "./org-usage-summary.ts";
 import { type Row, type Sql, SqlError, type SqlParam, type SqlStatement } from "./ports.ts";
+import { workspaceBillingOrganizationRef } from "./workspace-billing-organization.ts";
 
 export class OrgWorkspaceUsageError extends Error {
   constructor(
@@ -69,28 +70,73 @@ export async function workspaceAttributionSchemaReady(sql: Sql): Promise<boolean
   return rows.length === 3;
 }
 
-/** Bind inside the same batch as admission, so a failed monetary write creates no binding. */
-export function workspaceBindingStatement(
+/**
+ * Accounts issues every shared-auth Workspace reference in this namespace, and
+ * the Workspace's billing Organization is derived from it
+ * (`workspace-billing-organization.ts`). Bindings are global and set once, so
+ * where the served realm has a billing authority, only that derived
+ * Organization may create a binding for such a reference. Another Org could
+ * otherwise bind it before the owner's first login and make that owner's
+ * issuance abort with no repair. Every other reference keeps lazy first binding.
+ */
+export const SHARED_WORKSPACE_REF = /^wrk_[0-9a-f]{32}$/u;
+
+/**
+ * Whether `org` may create the first binding of `workspaceRef`. Without a
+ * shared Workspace authority (self-host, non-canonical compositions) every
+ * reference binds lazily, as before.
+ */
+export async function workspaceBindingCreatable(
+  org: string,
+  workspaceRef: string,
+  sharedWorkspaceAuthority: string | undefined,
+): Promise<boolean> {
+  if (sharedWorkspaceAuthority === undefined || !SHARED_WORKSPACE_REF.test(workspaceRef))
+    return true;
+  return (await workspaceBillingOrganizationRef(sharedWorkspaceAuthority, workspaceRef)) === org;
+}
+
+/**
+ * Bind inside the same batch as admission, so a failed monetary write creates
+ * no binding. A reference the Org may not bind gets no INSERT at all; the
+ * admission row then requires an existing binding and aborts the whole batch.
+ */
+export function workspaceBindingStatements(
   org: string,
   workspaceRef: string,
   instant: string,
-): SqlStatement {
-  return {
-    sql: "INSERT OR IGNORE INTO org_wallet_workspace_bindings (workspace_ref, org_id, created_at) VALUES (?, ?, ?)",
-    params: [workspaceRef, org, instant],
-  };
+  creatable: boolean,
+): readonly SqlStatement[] {
+  if (!creatable) return [];
+  return [
+    {
+      sql: "INSERT OR IGNORE INTO org_wallet_workspace_bindings (workspace_ref, org_id, created_at) VALUES (?, ?, ?)",
+      params: [workspaceRef, org, instant],
+    },
+  ];
 }
+
+/**
+ * An existing binding to another Org is a conflict. An unbound reference the
+ * Org may not create is reserved for its derived shared-auth Organization.
+ */
 export async function assertWorkspaceOwner(
   sql: Sql,
   org: string,
   workspaceRef: string,
+  sharedWorkspaceAuthority?: string,
 ): Promise<void> {
   const row = (
     await sql.query("SELECT org_id FROM org_wallet_workspace_bindings WHERE workspace_ref = ?", [
       workspaceRef,
     ])
   )[0];
-  if (row && row.org_id !== org) fail("workspace_ref_conflict", 409);
+  if (row) {
+    if (row.org_id !== org) fail("workspace_ref_conflict", 409);
+    return;
+  }
+  if (!(await workspaceBindingCreatable(org, workspaceRef, sharedWorkspaceAuthority)))
+    fail("workspace_ref_reserved", 409);
 }
 
 /** A reusable read lets the pending INSERT choose its measured interval in its own atomic batch. */

@@ -11,6 +11,7 @@ import {
   createHostedBillingComposition,
   type HostedBillingComposition,
   type HostedWarningDelivery,
+  hostedSharedWorkspaceAuthority,
 } from "../src/hosted-billing-composition.ts";
 import { verifyHostedBillingFinancialRealm } from "../src/hosted-billing-realm.ts";
 import { compilePricingAuthoring } from "../src/hosted-pricing.ts";
@@ -1428,6 +1429,60 @@ describe("canonical Hosted financial composition", () => {
         [f.organization.id],
       ),
     ).toEqual([{ workspace_ref: "workspace_0" }, { workspace_ref: "workspace_1" }]);
+  });
+
+  test("canonical composition reserves shared-auth wrk_ Workspace refs for their derived Org", async () => {
+    const f = await financialFixture();
+    const hosted = await createCanonicalHostedBillingComposition(f.options);
+    expect(hostedSharedWorkspaceAuthority(hosted)).toBe(f.options.realm.billingAuthority);
+    const walletOnly = await createHostedBillingComposition({
+      sql: f.options.sql,
+      clock: f.options.clock,
+      billingConfig: f.options.billingConfig,
+      paymentActivation: false,
+      warnings: warningsUnavailable,
+    });
+    expect(hostedSharedWorkspaceAuthority(walletOnly)).toBeUndefined();
+    const app = buildApp({
+      ...f.ports,
+      billingConfig: f.options.billingConfig,
+      hostedBilling: hosted,
+    });
+    const key = await f.accounts.createApiKey({
+      actor: f.actor,
+      organizationId: f.organization.id,
+      name: "squatter",
+      scopes: ["wallet:read", "wallet:write"],
+      expiresInSeconds: 3600,
+    });
+    const post = (reference: string, workspaceRef: string) =>
+      app.fetch(
+        new Request(`https://api.example.test/v1/organizations/${f.organization.id}/wallet/holds`, {
+          method: "POST",
+          headers: { authorization: `Bearer ${key.secret}`, "content-type": "application/json" },
+          body: JSON.stringify({
+            reference,
+            workspaceRef,
+            amountMicros: "1000",
+            pricingRevision: f.options.billingConfig.revision,
+            measurementFingerprint: "estimate",
+          }),
+        }),
+      );
+    const squat = await post("squat_hold", `wrk_${"ab".repeat(16)}`);
+    expect(squat.status).toBe(409);
+    expect(((await squat.json()) as { error: { code: string } }).error.code).toBe("conflict");
+    expect(
+      await f.sql.query("SELECT ref FROM org_wallet_holds WHERE org_id = ?", [f.organization.id]),
+    ).toEqual([]);
+    expect(await f.sql.query("SELECT * FROM org_wallet_workspace_bindings")).toEqual([]);
+    expect(
+      await f.sql.query("SELECT ref FROM ledger WHERE ref = ?", ["org-hold:squat_hold"]),
+    ).toEqual([]);
+    expect((await post("opaque_hold", "workspace_route")).status).toBe(201);
+    expect(
+      await f.sql.query("SELECT workspace_ref, org_id FROM org_wallet_workspace_bindings"),
+    ).toEqual([{ workspace_ref: "workspace_route", org_id: f.organization.id }]);
   });
 });
 
