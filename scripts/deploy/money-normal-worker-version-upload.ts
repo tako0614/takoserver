@@ -62,6 +62,9 @@ import {
 const SHA = /^sha256:[0-9a-f]{64}$/u;
 const ORIGINAL_UPLOAD_ROOT = "money-inactive-normal-version";
 const REPLACEMENT_UPLOAD_ROOT = "money-inactive-normal-version-replacement-after-unknown-v1";
+// Only after the first replacement completed its upload and its live owner was
+// lost before suffix custody. Never a third root, never a resume of the second.
+const SECOND_REPLACEMENT_UPLOAD_ROOT = "money-inactive-normal-version-replacement-after-unknown-v2";
 const requestFields = [
   "targetPath",
   "originalCreateInputPath",
@@ -372,6 +375,12 @@ async function readOriginalUnknownUpload(
   selected: MoneyNormalVersionUploadRequest,
   state: CloudflareState,
   originalRoot: string,
+  /**
+   * Set to quarantine the first replacement instead: it completed its upload
+   * (receipt, selector and dispatch seal present) but its live owner object
+   * was lost before any suffix custody, so it is never resumed either.
+   */
+  completedAfter?: OriginalUnknownUpload,
 ): Promise<OriginalUnknownUpload> {
   const rootIdentity = privateDirectory(originalRoot);
   const custodyRoot = join(originalRoot, "CUSTODY");
@@ -380,6 +389,12 @@ async function readOriginalUnknownUpload(
   const buildOwnerIdentity = privateDirectory(buildOwnerRoot);
   const buildOwnerTree = inspectMoneyNativeBuildDependencyTree(buildOwnerRoot);
   const names = assertFreshSecretProfile(target);
+  const completedEntries = [
+    "REPLACEMENT-DISPATCH-SEAL.json",
+    "RESULT.json",
+    "UPLOAD-RECEIPT.json",
+    "normal-worker.selector.json",
+  ];
   const expectedEntries = [
     "CUSTODY",
     "INTENT.json",
@@ -387,12 +402,17 @@ async function readOriginalUnknownUpload(
     "SIGNING-GENESIS.json",
     "build-owner",
     "wrangler-version-upload.jsonl",
+    ...(completedAfter === undefined ? [] : completedEntries),
   ].sort();
   if (
     JSON.stringify(readdirSync(originalRoot).sort()) !== JSON.stringify(expectedEntries) ||
     JSON.stringify(readdirSync(custodyRoot).sort()) !== JSON.stringify([...names].sort())
   )
-    throw preflightError("money replacement requires the exact isolated unknown original root");
+    throw preflightError(
+      completedAfter === undefined
+        ? "money replacement requires the exact isolated unknown original root"
+        : "money second replacement requires the exact isolated completed first replacement root",
+    );
   const requestPath = join(originalRoot, "REQUEST.json");
   const intentPath = join(originalRoot, "INTENT.json");
   const genesisPath = join(originalRoot, "SIGNING-GENESIS.json");
@@ -403,6 +423,9 @@ async function readOriginalUnknownUpload(
     genesisPath,
     outputPath,
     ...names.map((name) => join(custodyRoot, name)),
+    ...(completedAfter === undefined
+      ? []
+      : completedEntries.map((name) => join(originalRoot, name))),
   ];
   const seals = paths.map((path) => [path, inputSeal(path)] as const);
   const request = parseMoneyNormalVersionUploadRequest(
@@ -470,6 +493,20 @@ async function readOriginalUnknownUpload(
     publication.versionId === facts.maintenance.versionId
   )
     throw preflightError("money replacement original unknown history differs");
+  if (completedAfter !== undefined)
+    assertCompletedReplacementRecords(originalRoot, {
+      versionId: publication.versionId,
+      accountId: target.accountId,
+      workerName: target.workerName,
+      sourceCommit: intent.sourceCommit,
+      sourceTreeDigest: intent.sourceTreeDigest,
+      moduleDigest: intent.moduleDigest,
+      publicJwkDigest: sha(new TextEncoder().encode(genesis.publicJwk)),
+      priorUnknownBindingDigest: completedAfter.bindingDigest,
+      priorUnknownVersionId: completedAfter.versionId,
+      priorUnknownPublicJwk: completedAfter.publicJwk,
+      publicJwk: genesis.publicJwk,
+    });
   await provePreparedPair(custodyRoot, genesis.publicJwk);
   const { schemaMaintenanceMode: _maintenanceMode, ...plainTarget } = target;
   const normalTarget: DeployTarget = {
@@ -562,6 +599,95 @@ async function readOriginalUnknownUpload(
     publicJwk: genesis.publicJwk,
     assertCurrent,
   });
+}
+
+/**
+ * Local records of a completed first replacement: the upload receipt (twice,
+ * byte-identical), its selector and its dispatch seal must all name the one
+ * uploaded Version, its reviewed source and module, its own fresh key and the
+ * unknown original it replaced. A missing, edited or foreign record refuses.
+ */
+export function assertCompletedReplacementRecords(
+  root: string,
+  expected: {
+    readonly versionId: string;
+    readonly accountId: string;
+    readonly workerName: string;
+    readonly sourceCommit: string;
+    readonly sourceTreeDigest: string;
+    readonly moduleDigest: string;
+    readonly publicJwkDigest: string;
+    readonly priorUnknownBindingDigest: string;
+    readonly priorUnknownVersionId: string;
+    readonly priorUnknownPublicJwk: string;
+    readonly publicJwk: string;
+  },
+): void {
+  const refuse = (): never => {
+    throw preflightError("money second replacement requires the exact completed first replacement");
+  };
+  let receipt: Record<string, unknown>;
+  let selector: Record<string, unknown>;
+  let seal: Record<string, unknown>;
+  try {
+    const receiptBytes = readFileSync(join(root, "UPLOAD-RECEIPT.json"));
+    if (!receiptBytes.equals(readFileSync(join(root, "RESULT.json")))) return refuse();
+    receipt = JSON.parse(receiptBytes.toString("utf8"));
+    selector = JSON.parse(readFileSync(join(root, "normal-worker.selector.json"), "utf8"));
+    seal = JSON.parse(readFileSync(join(root, "REPLACEMENT-DISPATCH-SEAL.json"), "utf8"));
+  } catch {
+    return refuse();
+  }
+  if (
+    !isPlainRecord(receipt) ||
+    JSON.stringify(Object.keys(receipt).sort()) !==
+      JSON.stringify(
+        [
+          "kind",
+          "modeBindingDigest",
+          "qualification",
+          "selectorPath",
+          "sourceCommit",
+          "versionId",
+        ].sort(),
+      ) ||
+    receipt.kind !== "takoserver.money-inactive-normal-version-upload@v1" ||
+    receipt.qualification !== "immutable-version-only" ||
+    receipt.selectorPath !== join(root, "normal-worker.selector.json") ||
+    receipt.versionId !== expected.versionId ||
+    receipt.sourceCommit !== expected.sourceCommit ||
+    typeof receipt.modeBindingDigest !== "string" ||
+    !SHA.test(receipt.modeBindingDigest) ||
+    !isPlainRecord(selector) ||
+    selector.versionId !== expected.versionId ||
+    selector.sourceCommit !== expected.sourceCommit ||
+    selector.moduleDigest !== expected.moduleDigest ||
+    selector.accountId !== expected.accountId ||
+    selector.workerName !== expected.workerName ||
+    !isPlainRecord(seal) ||
+    seal.kind !== "takoserver.money-inactive-version-replacement-dispatch-seal@v1" ||
+    seal.originalUnknownBindingDigest !== expected.priorUnknownBindingDigest ||
+    seal.originalCandidateDigest !==
+      sha(new TextEncoder().encode(expected.priorUnknownVersionId)) ||
+    seal.accountId !== expected.accountId ||
+    seal.workerName !== expected.workerName ||
+    seal.sourceCommit !== expected.sourceCommit ||
+    seal.sourceTreeDigest !== expected.sourceTreeDigest ||
+    seal.moduleDigest !== expected.moduleDigest ||
+    seal.publicJwkDigest !== expected.publicJwkDigest ||
+    expected.versionId === expected.priorUnknownVersionId ||
+    expected.publicJwk === expected.priorUnknownPublicJwk
+  )
+    refuse();
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    Object.getPrototypeOf(value) === Object.prototype
+  );
 }
 
 async function createFreshSigningGenesis(
@@ -714,7 +840,9 @@ export async function readMoneyNormalWorkerSigningGenesisContribution(
     !isAbsolute(selectorPath) ||
     resolve(selectorPath) !== selectorPath ||
     basename(selectorPath) !== "normal-worker.selector.json" ||
-    ![ORIGINAL_UPLOAD_ROOT, REPLACEMENT_UPLOAD_ROOT].includes(basename(dirname(selectorPath)))
+    ![ORIGINAL_UPLOAD_ROOT, REPLACEMENT_UPLOAD_ROOT, SECOND_REPLACEMENT_UPLOAD_ROOT].includes(
+      basename(dirname(selectorPath)),
+    )
   )
     throw preflightError("money signing genesis requires the original normal selector locator");
   const root = dirname(selectorPath);
@@ -950,11 +1078,52 @@ export async function uploadMoneyNormalWorkerReplacementVersionForOriginalContex
   return uploadMoneyNormalWorkerVersionOwned(request, context, "replacement-after-unknown");
 }
 
+/** What a replacement upload would do, read before any write or upload. */
+export interface MoneyNormalWorkerReplacementPreflight {
+  readonly kind: "takoserver.money-inactive-version-replacement-preflight@v1";
+  readonly attemptRoot: typeof REPLACEMENT_UPLOAD_ROOT | typeof SECOND_REPLACEMENT_UPLOAD_ROOT;
+  /** Earlier Versions quarantined read-only, oldest first; never resumed. */
+  readonly quarantinedVersionIds: readonly string[];
+}
+
+/**
+ * Every read-only check the replacement upload makes before it creates its
+ * root: the frozen target, the held convert context, the quarantined unknown
+ * original and, if present, the completed first replacement (their custody,
+ * Versions and the active maintenance deployment), and an absent next root.
+ * It writes nothing, holds no lease and never uploads.
+ */
+export async function preflightMoneyNormalWorkerReplacementVersionForOriginalContext(
+  context: MoneyUnitHeldConvertContext,
+  request: unknown,
+): Promise<Readonly<MoneyNormalWorkerReplacementPreflight>> {
+  parseMoneyNormalVersionUploadRequest(request);
+  await assertMoneyUnitHeldConvertCurrent(context);
+  return await uploadMoneyNormalWorkerVersionOwned(
+    request,
+    context,
+    "replacement-after-unknown",
+    true,
+  );
+}
+
+function uploadMoneyNormalWorkerVersionOwned(
+  request: unknown,
+  suppliedContext?: MoneyUnitHeldConvertContext,
+  attempt?: "original" | "replacement-after-unknown",
+): Promise<Readonly<MoneyNormalWorkerOwnedUpload>>;
+function uploadMoneyNormalWorkerVersionOwned(
+  request: unknown,
+  suppliedContext: MoneyUnitHeldConvertContext,
+  attempt: "replacement-after-unknown",
+  preflightOnly: true,
+): Promise<Readonly<MoneyNormalWorkerReplacementPreflight>>;
 async function uploadMoneyNormalWorkerVersionOwned(
   request: unknown,
   suppliedContext?: MoneyUnitHeldConvertContext,
   attempt: "original" | "replacement-after-unknown" = "original",
-): Promise<Readonly<MoneyNormalWorkerOwnedUpload>> {
+  preflightOnly = false,
+): Promise<Readonly<MoneyNormalWorkerOwnedUpload | MoneyNormalWorkerReplacementPreflight>> {
   const selected = parseMoneyNormalVersionUploadRequest(request);
   const inputPaths = [
     selected.targetPath,
@@ -1016,6 +1185,7 @@ async function uploadMoneyNormalWorkerVersionOwned(
   // Derive the only output root from the actual owner declaration, not a caller output/config path.
   privateDirectory(options.outputDirectory);
   let replacementUnknown: OriginalUnknownUpload | undefined;
+  let quarantinedReplacement: OriginalUnknownUpload | undefined;
   let replacementCredential: Awaited<ReturnType<typeof resolveCloudflareCredential>> | undefined;
   let replacementState: CloudflareState | undefined;
   if (attempt === "replacement-after-unknown") {
@@ -1040,11 +1210,59 @@ async function uploadMoneyNormalWorkerVersionOwned(
     );
     await replacementUnknown.assertCurrent();
     assertInputs();
+    // A first replacement that completed its upload but lost its live owner
+    // before suffix custody is quarantined read-only like the unknown original;
+    // the next attempt gets a new root and a new key, never its receipt.
+    const firstReplacement = join(options.outputDirectory, REPLACEMENT_UPLOAD_ROOT);
+    let firstReplacementExists = true;
+    try {
+      lstatSync(firstReplacement);
+    } catch {
+      firstReplacementExists = false;
+    }
+    if (firstReplacementExists) {
+      quarantinedReplacement = await readOriginalUnknownUpload(
+        context,
+        target,
+        selected,
+        replacementState,
+        firstReplacement,
+        replacementUnknown,
+      );
+      await quarantinedReplacement.assertCurrent();
+      assertInputs();
+    }
   }
   const root = join(
     options.outputDirectory,
-    attempt === "original" ? ORIGINAL_UPLOAD_ROOT : REPLACEMENT_UPLOAD_ROOT,
+    attempt === "original"
+      ? ORIGINAL_UPLOAD_ROOT
+      : quarantinedReplacement === undefined
+        ? REPLACEMENT_UPLOAD_ROOT
+        : SECOND_REPLACEMENT_UPLOAD_ROOT,
   );
+  if (preflightOnly) {
+    if (attempt !== "replacement-after-unknown" || replacementUnknown === undefined)
+      throw preflightError("money upload preflight exists only for a replacement attempt");
+    try {
+      lstatSync(root);
+    } catch {
+      return Object.freeze({
+        kind: "takoserver.money-inactive-version-replacement-preflight@v1" as const,
+        attemptRoot:
+          quarantinedReplacement === undefined
+            ? REPLACEMENT_UPLOAD_ROOT
+            : SECOND_REPLACEMENT_UPLOAD_ROOT,
+        quarantinedVersionIds: Object.freeze([
+          replacementUnknown.versionId,
+          ...(quarantinedReplacement === undefined ? [] : [quarantinedReplacement.versionId]),
+        ]),
+      });
+    }
+    throw preflightError(
+      "money inactive Version attempt already exists or is unavailable; no retry",
+    );
+  }
   try {
     mkdirSync(root, { mode: 0o700 });
   } catch {
@@ -1065,8 +1283,12 @@ async function uploadMoneyNormalWorkerVersionOwned(
   try {
     writePrivate(join(root, "REQUEST.json"), selected);
     const genesis = await createFreshSigningGenesis(context, target, root, assertInputs);
-    if (replacementUnknown !== undefined && genesis.publicJwk === replacementUnknown.publicJwk)
-      throw preflightError("money replacement cannot reuse the unknown original signing key");
+    if (
+      (replacementUnknown !== undefined && genesis.publicJwk === replacementUnknown.publicJwk) ||
+      (quarantinedReplacement !== undefined &&
+        genesis.publicJwk === quarantinedReplacement.publicJwk)
+    )
+      throw preflightError("money replacement cannot reuse an earlier attempt's signing key");
     const buildRoot = join(root, "build-owner");
     mkdirSync(buildRoot, { mode: 0o700 });
     const build = await buildClosure.bindSource(
@@ -1098,6 +1320,7 @@ async function uploadMoneyNormalWorkerVersionOwned(
     const assertMaintenance = async () => {
       assertLocal();
       await replacementUnknown?.assertCurrent();
+      await quarantinedReplacement?.assertCurrent();
       await assertMoneyUnitHeldConvertCurrent(context);
       assertLocal();
       const writer = await options.maintenanceProof();
@@ -1247,11 +1470,20 @@ async function uploadMoneyNormalWorkerVersionOwned(
       replacementDispatchPath === undefined ? undefined : sealedSecrets.digest;
     if (replacementUnknown !== undefined && replacementDispatchPath !== undefined) {
       await replacementUnknown.assertCurrent();
+      await quarantinedReplacement?.assertCurrent();
       sealedSecrets.assertUnchanged();
       writePrivate(replacementDispatchPath, {
         kind: "takoserver.money-inactive-version-replacement-dispatch-seal@v1",
         originalUnknownBindingDigest: replacementUnknown.bindingDigest,
         originalCandidateDigest: sha(new TextEncoder().encode(replacementUnknown.versionId)),
+        ...(quarantinedReplacement === undefined
+          ? {}
+          : {
+              quarantinedReplacementBindingDigest: quarantinedReplacement.bindingDigest,
+              quarantinedReplacementCandidateDigest: sha(
+                new TextEncoder().encode(quarantinedReplacement.versionId),
+              ),
+            }),
         accountId: target.accountId,
         workerName: target.workerName,
         previousWriterEpoch: context.facts.previousWriterEpoch,
@@ -1275,6 +1507,7 @@ async function uploadMoneyNormalWorkerVersionOwned(
     const assertReplacementDispatch = async () => {
       if (replacementUnknown === undefined || replacementDispatchPath === undefined) return;
       await replacementUnknown.assertCurrent();
+      await quarantinedReplacement?.assertCurrent();
       sealedSecrets.assertUnchanged();
       if (
         inputSeal(replacementDispatchPath) !== replacementDispatchSeal ||
