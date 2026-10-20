@@ -3,7 +3,7 @@ import {
   type CloudflareTopologyAuditEvidence,
   verifyCloudflareTopologyVisibility,
 } from "./cloudflare-topology-audit.ts";
-import { preflightError } from "./errors.ts";
+import { DeployError, type DeployReason, preflightError } from "./errors.ts";
 
 const API = "https://api.cloudflare.com/client/v4";
 const PAGE_SIZE = 100;
@@ -42,6 +42,7 @@ export class CloudflareState {
   readonly #fetcher: StateFetcher;
   readonly #topologyAuditCredentialPath: string;
   readonly #workerDomainServiceScope: string | undefined;
+  readonly #getRetryDelaysMs: readonly number[] | undefined;
 
   constructor(input: {
     readonly accountId: string;
@@ -50,6 +51,8 @@ export class CloudflareState {
     readonly topologyAuditCredentialPath?: string;
     /** Exact integration Workers.dev service; keeps other Workers' domains out of readback. */
     readonly workerDomainServiceScope?: string;
+    /** Test seam for the bounded GET retry waits; deploy callers keep the default. */
+    readonly getRetryDelaysMs?: readonly number[];
   }) {
     if (!/^[0-9a-f]{32}$/u.test(input.accountId)) {
       throw preflightError("Cloudflare state requires one exact account id");
@@ -67,6 +70,7 @@ export class CloudflareState {
     this.#workerDomainServiceScope = input.workerDomainServiceScope;
     this.#token = input.token;
     this.#fetcher = input.fetcher ?? ((request) => fetch(request));
+    this.#getRetryDelaysMs = input.getRetryDelaysMs;
     this.#topologyAuditCredentialPath =
       input.topologyAuditCredentialPath ??
       process.env.TAKOSERVER_CLOUDFLARE_TOPOLOGY_AUDIT_CREDENTIAL ??
@@ -144,6 +148,7 @@ export class CloudflareState {
     const url = this.#url(`/workers/dispatch/namespaces/${encodeURIComponent(name)}`);
     const { response, text } = await readCloudflareGetText({
       fetcher: this.#fetcher,
+      ...(this.#getRetryDelaysMs === undefined ? {} : { retryDelaysMs: this.#getRetryDelaysMs }),
       request: (signal) =>
         new Request(url, {
           method: "GET",
@@ -415,6 +420,9 @@ export class CloudflareState {
       get: async (url, token) => {
         const { response, text } = await readCloudflareGetText({
           fetcher: this.#fetcher,
+          ...(this.#getRetryDelaysMs === undefined
+            ? {}
+            : { retryDelaysMs: this.#getRetryDelaysMs }),
           request: (signal) =>
             new Request(url, {
               method: "GET",
@@ -460,8 +468,9 @@ export class CloudflareState {
     label: string,
     options: { readonly allowMissingWorkerDeployment?: boolean } = {},
   ): Promise<Envelope> {
-    const { response, text } = await readCloudflareGetText({
+    const { response, text, attempts } = await readCloudflareGetText({
       fetcher: this.#fetcher,
+      ...(this.#getRetryDelaysMs === undefined ? {} : { retryDelaysMs: this.#getRetryDelaysMs }),
       request: (signal) =>
         new Request(url, {
           method: "GET",
@@ -476,11 +485,22 @@ export class CloudflareState {
       maximumBytes: MAX_PROVIDER_RESPONSE_BYTES,
       label,
     });
+    // Closed, secret-free classification for callers that keep only a reason.
+    const reason = (code: "http-status" | "http-response"): DeployReason => ({
+      code,
+      operation: "provider-read",
+      attempts,
+    });
     let body: unknown;
     try {
       body = JSON.parse(text);
     } catch {
-      throw preflightError(`${label} returned malformed JSON (HTTP ${response.status})`);
+      throw new DeployError(
+        "preflight",
+        `${label} returned malformed JSON (HTTP ${response.status})`,
+        undefined,
+        reason(response.status === 429 || response.status >= 500 ? "http-status" : "http-response"),
+      );
     }
     if (
       options.allowMissingWorkerDeployment &&
@@ -490,9 +510,11 @@ export class CloudflareState {
       return body;
     }
     if (!isRecord(body) || response.ok !== true || body.success !== true) {
-      throw preflightError(
+      throw new DeployError(
+        "preflight",
         `${label} failed (HTTP ${response.status})`,
         errorSummary(isRecord(body) ? body.errors : undefined),
+        reason(response.status === 429 || response.status >= 500 ? "http-status" : "http-response"),
       );
     }
     return body;

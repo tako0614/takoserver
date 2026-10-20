@@ -113,14 +113,15 @@ describe("strict paginated Cloudflare state", () => {
     expect(requests[0]?.signal).not.toBe(requests[1]?.signal);
   });
 
-  test("retries one transient body transport failure, never a third attempt", async () => {
+  test("retries body transport failures at most twice, never a fourth attempt", async () => {
     let calls = 0;
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "operator-token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async () => {
         calls += 1;
-        if (calls < 3) {
+        if (calls < 4) {
           return new Response(
             new ReadableStream({
               pull() {
@@ -141,7 +142,12 @@ describe("strict paginated Cloudflare state", () => {
     expect(failure).toBeInstanceOf(CloudflareGetTransportError);
     expect((failure as CloudflareGetTransportError).status).toBe(200);
     expect(JSON.stringify(failure)).not.toContain("operator-token");
-    expect(calls).toBe(2);
+    expect((failure as DeployError).reason).toEqual({
+      code: "http-transport",
+      operation: "provider-read",
+      attempts: 3,
+    });
+    expect(calls).toBe(3);
   });
 
   test("retries a body transport failure and accepts the second complete envelope", async () => {
@@ -313,13 +319,14 @@ describe("strict paginated Cloudflare state", () => {
     expect((await readCloudflareGetText({ ...common, ignoreBOM: true })).text).toBe("\ufeff{}");
   });
 
-  test("bounds a stalled body, releases it, and retries only once", async () => {
+  test("bounds a stalled body, releases it, and retries", async () => {
     let calls = 0;
     let cancelled = 0;
     const started = performance.now();
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "operator-token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async () => {
         calls += 1;
         if (calls === 1) {
@@ -341,11 +348,11 @@ describe("strict paginated Cloudflare state", () => {
     expect(performance.now() - started).toBeLessThan(15_500);
   }, 20_000);
 
-  test("does not retry HTTP, redirect, malformed JSON, invalid UTF-8 or oversized body", async () => {
+  test("does not retry a refusal, redirect, malformed JSON, invalid UTF-8 or oversized body", async () => {
     const responses = [
       Response.json({ success: false, errors: [] }, { status: 401 }),
-      Response.json({ success: false, errors: [] }, { status: 429 }),
-      Response.json({ success: false, errors: [] }, { status: 500 }),
+      Response.json({ success: false, errors: [] }, { status: 403 }),
+      Response.json({ success: false, errors: [] }, { status: 404 }),
       Response.redirect("https://example.invalid", 302),
       new Response("not-json"),
       new Response(new Uint8Array([0xff])),
@@ -356,6 +363,7 @@ describe("strict paginated Cloudflare state", () => {
       const state = new CloudflareState({
         accountId: ACCOUNT,
         token: "operator-token",
+        getRetryDelaysMs: [0, 0],
         fetcher: async () => {
           calls += 1;
           return response;
@@ -368,11 +376,57 @@ describe("strict paginated Cloudflare state", () => {
     }
   });
 
-  test("does not retry a failed HTTP response even if its body transport breaks", async () => {
+  test("reads HTTP 429 and 5xx again at most twice, then judges the last answer", async () => {
+    for (const status of [429, 500, 502, 503]) {
+      let calls = 0;
+      const state = new CloudflareState({
+        accountId: ACCOUNT,
+        token: "operator-token",
+        getRetryDelaysMs: [0, 0],
+        fetcher: async () => {
+          calls += 1;
+          return Response.json(
+            { success: false, errors: [] },
+            { status, headers: { "retry-after": "0" } },
+          );
+        },
+      });
+      let failure: unknown;
+      try {
+        await state.read("/workers/scripts", "script read");
+      } catch (error) {
+        failure = error;
+      }
+      expect(failure).toBeInstanceOf(DeployError);
+      expect((failure as DeployError).reason).toEqual({
+        code: "http-status",
+        operation: "provider-read",
+        attempts: 3,
+      });
+      expect(calls).toBe(3);
+    }
+    let recovered = 0;
+    const state = new CloudflareState({
+      accountId: ACCOUNT,
+      token: "operator-token",
+      getRetryDelaysMs: [0, 0],
+      fetcher: async () => {
+        recovered += 1;
+        return recovered === 1
+          ? new Response("<html>bad gateway</html>", { status: 502 })
+          : Response.json({ success: true, result: "recovered" });
+      },
+    });
+    expect(await state.read("/workers/scripts", "script read")).toBe("recovered");
+    expect(recovered).toBe(2);
+  });
+
+  test("judges a failed HTTP response once its retries are spent, even if its body breaks", async () => {
     let calls = 0;
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "operator-token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async () => {
         calls += 1;
         return new Response(
@@ -388,7 +442,7 @@ describe("strict paginated Cloudflare state", () => {
     await expect(state.read("/workers/scripts", "script read")).rejects.toBeInstanceOf(
       CloudflareGetTransportError,
     );
-    expect(calls).toBe(1);
+    expect(calls).toBe(3);
   });
   test("uses Pages-compatible page size and reads the complete deployment history", async () => {
     const deployments = Array.from({ length: 22 }, (_, index) => ({ id: `deployment-${index}` }));
@@ -1163,6 +1217,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async (request) => {
         const url = new URL(request.url);
         if (url.pathname === "/client/v4/zones") {
@@ -1186,6 +1241,7 @@ describe("strict paginated Cloudflare state", () => {
     });
 
     await expect(state.workerRoutes()).rejects.toBeInstanceOf(DeployError);
-    expect(routeReads.filter((zoneId) => zoneId === "zone-1")).toHaveLength(1);
+    // The 503 read is repeated within its bound, then the whole inventory fails.
+    expect(routeReads.filter((zoneId) => zoneId === "zone-1")).toHaveLength(3);
   });
 });

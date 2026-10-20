@@ -32,6 +32,7 @@ import { buildD1MigrationImport } from "./d1-migration-import.ts";
 import {
   DeployError,
   type DeployPhase,
+  type DeployReason,
   mutationError,
   preflightError,
   verificationError,
@@ -2920,8 +2921,10 @@ async function providerCall<T>(
 ): Promise<T> {
   try {
     return await operation();
-  } catch {
-    throw new DeployError(phase, message);
+  } catch (error) {
+    // Keep only the provider's closed classification; never its message or detail.
+    const reason = error instanceof StorageProviderError ? error.reason : undefined;
+    throw new DeployError(phase, message, undefined, reason);
   }
 }
 
@@ -3139,11 +3142,16 @@ export class CloudflareIntegrationStorageProvider implements IntegrationStorageG
   readonly #accountId: string;
   readonly #token: string;
   readonly #fetcher: IntegrationStorageFetcher;
+  readonly #getRetryDelaysMs: readonly number[];
 
   constructor(
     accountId: string,
     token: string,
-    options: { readonly fetcher?: IntegrationStorageFetcher } = {},
+    options: {
+      readonly fetcher?: IntegrationStorageFetcher;
+      /** Test seam for the bounded GET retry; deploy callers keep the default. */
+      readonly getRetryDelaysMs?: readonly number[];
+    } = {},
   ) {
     if (!ACCOUNT_ID.test(accountId)) {
       throw preflightError("Cloudflare storage requires one account id");
@@ -3154,6 +3162,7 @@ export class CloudflareIntegrationStorageProvider implements IntegrationStorageG
     this.#accountId = accountId;
     this.#token = token;
     this.#fetcher = options.fetcher ?? ((request) => fetch(request));
+    this.#getRetryDelaysMs = options.getRetryDelaysMs ?? STORAGE_GET_RETRY_DELAYS_MS;
   }
 
   async listD1(name: string): Promise<readonly IntegrationStorageD1Database[]> {
@@ -3251,10 +3260,46 @@ export class CloudflareIntegrationStorageProvider implements IntegrationStorageG
     return new URL(`${CLOUDFLARE_API}/accounts/${encodeURIComponent(this.#accountId)}${path}`);
   }
 
+  /**
+   * A GET that fails before a response, while reading it, or with HTTP 429 or
+   * 5xx is sent again a bounded number of times: reading again changes
+   * nothing. A create (POST) is sent once, and every other answer is final.
+   */
   private async envelope(
     url: URL,
     label: string,
     method: "GET" | "POST" = "GET",
+    body?: Record<string, string>,
+  ): Promise<Record<string, unknown>> {
+    const deadline = Date.now() + STORAGE_GET_RETRY_TOTAL_MS;
+    const operation = method === "GET" ? "storage-read" : "storage-write";
+    for (let attempt = 0; ; attempt += 1) {
+      const delay = method === "GET" ? this.#getRetryDelaysMs[attempt] : undefined;
+      let wait: number;
+      try {
+        return await this.envelopeOnce(url, label, method, body);
+      } catch (error) {
+        if (!(error instanceof StorageProviderError)) throw error;
+        const reason = (code: DeployReason["code"]): DeployReason =>
+          Object.freeze({ code, operation, attempts: attempt + 1 });
+        if (!(error instanceof RetryableStorageRead))
+          throw new StorageProviderError(error.message, reason("http-response"));
+        // A bounded wait that also honours a finite Retry-After, within one total budget.
+        wait =
+          delay === undefined
+            ? Number.POSITIVE_INFINITY
+            : Math.min(Math.max(delay, error.retryAfterMs ?? 0), STORAGE_GET_RETRY_MAX_WAIT_MS);
+        if (Date.now() + wait > deadline)
+          throw new StorageProviderError(error.message, reason(error.code));
+      }
+      await Bun.sleep(wait);
+    }
+  }
+
+  private async envelopeOnce(
+    url: URL,
+    label: string,
+    method: "GET" | "POST",
     body?: Record<string, string>,
   ): Promise<Record<string, unknown>> {
     let response: Response;
@@ -3273,9 +3318,24 @@ export class CloudflareIntegrationStorageProvider implements IntegrationStorageG
         }),
       );
     } catch {
-      throw new StorageProviderError(`${label} transport failed`);
+      throw new RetryableStorageRead(`${label} transport failed`, "http-transport");
     }
-    const text = await boundedResponseText(response);
+    if (response.status === 429 || response.status >= 500) {
+      const retryAfter = Number(response.headers.get("retry-after") ?? "");
+      await response.body?.cancel().catch(() => {});
+      throw new RetryableStorageRead(
+        `${label} failed (HTTP ${response.status})`,
+        "http-status",
+        Number.isFinite(retryAfter) && retryAfter >= 0 ? retryAfter * 1000 : undefined,
+      );
+    }
+    let text: string;
+    try {
+      text = await boundedResponseText(response);
+    } catch (error) {
+      if (error instanceof StorageProviderError) throw error;
+      throw new RetryableStorageRead(`${label} transport failed`, "http-transport");
+    }
     let parsed: unknown;
     try {
       parsed = JSON.parse(text);
@@ -3294,7 +3354,30 @@ export class CloudflareIntegrationStorageProvider implements IntegrationStorageG
   }
 }
 
-class StorageProviderError extends Error {}
+/** A storage REST failure; `reason` is the closed, secret-free classification. */
+class StorageProviderError extends Error {
+  constructor(
+    message: string,
+    readonly reason?: DeployReason,
+  ) {
+    super(message);
+  }
+}
+/** A read the envelope may send again; it never leaves the envelope as itself. */
+class RetryableStorageRead extends StorageProviderError {
+  constructor(
+    message: string,
+    readonly code: "http-transport" | "http-status",
+    readonly retryAfterMs?: number,
+  ) {
+    super(message);
+  }
+}
+// At most two more GETs, each bounded by its 15 s request timeout, with waits
+// capped at 8 s and the whole read inside one 60 s budget.
+const STORAGE_GET_RETRY_DELAYS_MS: readonly number[] = [1_000, 4_000];
+const STORAGE_GET_RETRY_MAX_WAIT_MS = 8_000;
+const STORAGE_GET_RETRY_TOTAL_MS = 60_000;
 
 async function boundedResponseText(response: Response): Promise<string> {
   if (!response.body) {
