@@ -4,6 +4,7 @@ import {
   type HostDiscovery,
   type Organization,
   type Principal,
+  type SharedAuthSessionStatus,
 } from "./api.ts";
 import { signal } from "./reactive.ts";
 
@@ -16,13 +17,23 @@ import { signal } from "./reactive.ts";
  */
 
 const SESSION_KEY = "takoserver.session";
+const SESSION_KIND_KEY = "takoserver.session-kind";
 const ORG_KEY = "takoserver.organization";
 const THEME_KEY = "takoserver.theme";
 const ORIGIN_KEY = "takoserver.origin";
 
 export type Theme = "system" | "light" | "dark";
+export type SessionKind = "shared-auth" | "legacy";
 
 export const session = signal<string | null>(localStorage.getItem(SESSION_KEY));
+export const sessionKind = signal<SessionKind | null>(
+  session() === null
+    ? null
+    : localStorage.getItem(SESSION_KIND_KEY) === "shared-auth"
+      ? "shared-auth"
+      : "legacy",
+);
+export const sharedAuthAvailable = signal<boolean | null>(null);
 export const principal = signal<Principal | null>(null);
 export const organizations = signal<readonly Organization[]>([]);
 export const currentOrganizationId = signal<string | null>(localStorage.getItem(ORG_KEY));
@@ -66,18 +77,53 @@ export function setApiOrigin(origin: string): void {
 
 function clearSession(): void {
   localStorage.removeItem(SESSION_KEY);
+  localStorage.removeItem(SESSION_KIND_KEY);
   session.set(null);
+  sessionKind.set(null);
   principal.set(null);
   organizations.set([]);
 }
 
-export function signOut(): void {
-  void api.signOut().finally(clearSession);
+export async function signOut(): Promise<void> {
+  if (sessionKind() === "shared-auth") await api.sharedAuthSignOut();
+  else await api.signOut();
+  clearSession();
+  try {
+    sharedAuthAvailable.set((await api.sharedAuthSession()).available);
+  } catch {
+    sharedAuthAvailable.set(null);
+  }
 }
 
-export function adoptSession(): void {
+export function adoptSession(kind: SessionKind = "legacy"): void {
   localStorage.setItem(SESSION_KEY, "cookie");
+  localStorage.setItem(SESSION_KIND_KEY, kind);
+  sessionKind.set(kind);
   session.set("cookie");
+}
+
+/**
+ * Adopts the shared-auth browser session only after both the RP oracle and
+ * this Host's own principal lookup succeed. The latter remains the source of
+ * the Console identity and organizations.
+ */
+export async function bootstrapSharedSession(): Promise<boolean> {
+  const status: SharedAuthSessionStatus = await api.sharedAuthSession();
+  sharedAuthAvailable.set(status.available);
+  if (!status.available || !status.authenticated) return false;
+  const me = await api.me();
+  principal.set(me.principal);
+  organizations.set(me.organizations);
+  adoptSession("shared-auth");
+  return true;
+}
+
+/** A same-origin enum, never a URL, used only for the one safe billing return. */
+export function takeSharedSessionReturnPath(): "/billing" | "/" {
+  const key = "takoserver.shared-session-return";
+  const path = sessionStorage.getItem(key);
+  sessionStorage.removeItem(key);
+  return path === "billing" ? "/billing" : "/";
 }
 
 export function selectOrganization(id: string): void {

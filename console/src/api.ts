@@ -36,6 +36,10 @@ export interface Organization {
   readonly createdAt: string;
 }
 
+export type SharedAuthSessionStatus =
+  | { readonly available: true; readonly authenticated: boolean }
+  | { readonly available: false; readonly authenticated: false };
+
 /**
  * The v2 base a Host names, only in the one shape a Host builds it: an HTTPS
  * origin (plain HTTP only on this machine) and the exact v2 path. The console
@@ -658,6 +662,73 @@ export function createApi(options: ApiOptions) {
     identityProviders: () =>
       call<{ providers: readonly IdentityProvider[] }>("GET", "/v1/identity/providers"),
 
+    /**
+     * The shared-auth session oracle is a separate authentication surface.
+     * It must not receive this Console API's bearer token; the browser's
+     * HttpOnly cookie is the only credential it is allowed to inspect.
+     */
+    async sharedAuthSession(): Promise<SharedAuthSessionStatus> {
+      const path = "/auth/oidc/session";
+      let response: Response;
+      try {
+        response = await fetch(`${options.origin}${path}`, {
+          method: "GET",
+          credentials: "include",
+          cache: "no-store",
+        });
+      } catch {
+        throw new ApiError("unreachable", 0, path);
+      }
+      const payload = await response
+        .json()
+        .catch(() => null as unknown as Record<string, unknown> | null);
+      if (response.status === 404) return { available: false, authenticated: false };
+      if (response.status === 200 || response.status === 401) {
+        if (
+          isRecord(payload) &&
+          Object.keys(payload).sort().join() === "authenticated" &&
+          payload.authenticated === (response.status === 200)
+        ) {
+          return { available: true, authenticated: payload.authenticated as boolean };
+        }
+        throw new ApiError("invalid_response", response.status, path);
+      }
+      if (!response.ok) {
+        const code = isRecord(payload) && isRecord(payload.error) ? payload.error.code : null;
+        throw new ApiError(
+          typeof code === "string" ? code : `http_${response.status}`,
+          response.status,
+          path,
+        );
+      }
+      throw new ApiError("invalid_response", response.status, path);
+    },
+
+    /** Logout through the shared RP's cookie owner; only a real 204 succeeds. */
+    async sharedAuthSignOut(): Promise<void> {
+      const path = "/auth/oidc/logout";
+      let response: Response;
+      try {
+        response = await fetch(`${options.origin}${path}`, {
+          method: "POST",
+          credentials: "include",
+          cache: "no-store",
+        });
+      } catch {
+        throw new ApiError("unreachable", 0, path);
+      }
+      if (response.status === 204) return;
+      const payload = await response
+        .json()
+        .catch(() => null as unknown as Record<string, unknown> | null);
+      const code = isRecord(payload) && isRecord(payload.error) ? payload.error.code : null;
+      throw new ApiError(
+        typeof code === "string" ? code : `http_${response.status}`,
+        response.status,
+        path,
+      );
+    },
+
     signIn: (
       provider: string,
       assertion: string,
@@ -673,8 +744,48 @@ export function createApi(options: ApiOptions) {
 
     signOut: () => call<void>("DELETE", "/v1/session"),
 
-    me: () =>
-      call<{ principal: Principal; organizations: readonly Organization[] }>("GET", "/v1/me"),
+    async me(): Promise<{ principal: Principal; organizations: readonly Organization[] }> {
+      const path = "/v1/me";
+      const { payload, status } = await request<unknown>("GET", path);
+      try {
+        if (
+          !isRecord(payload) ||
+          !isRecord(payload.principal) ||
+          !Array.isArray(payload.organizations)
+        )
+          throw new TypeError("invalid identity response");
+        const identity = payload.principal;
+        if (
+          typeof identity.id !== "string" ||
+          identity.id === "" ||
+          typeof identity.provider !== "string" ||
+          identity.provider === "" ||
+          typeof identity.email !== "string" ||
+          typeof identity.displayName !== "string"
+        )
+          throw new TypeError("invalid principal");
+        const decodedOrganizations = payload.organizations.map((value) => {
+          if (
+            !isRecord(value) ||
+            typeof value.id !== "string" ||
+            value.id === "" ||
+            typeof value.name !== "string" ||
+            value.name === "" ||
+            typeof value.ownerPrincipalId !== "string" ||
+            value.ownerPrincipalId === "" ||
+            typeof value.createdAt !== "string"
+          )
+            throw new TypeError("invalid organization");
+          return value as unknown as Organization;
+        });
+        return {
+          principal: identity as unknown as Principal,
+          organizations: decodedOrganizations,
+        };
+      } catch {
+        throw new ApiError("invalid_response", status, path);
+      }
+    },
 
     createOrganization: (name: string) =>
       call<{ organization: Organization }>("POST", "/v1/organizations", { name }),

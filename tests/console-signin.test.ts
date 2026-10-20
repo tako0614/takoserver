@@ -44,6 +44,18 @@ function assertionFor(provider: string): string {
 }
 
 describe("Takoserver Console operator sign-in", () => {
+  test("shared-auth entry URL is fixed to the API origin and adds no redirect query", async () => {
+    installConsoleGlobals();
+    const { sharedSessionLoginUrl } = await import("../console/src/pages/signin.ts");
+
+    expect(sharedSessionLoginUrl("https://api.example.test")).toBe(
+      "https://api.example.test/auth/oidc/login",
+    );
+    expect(() => sharedSessionLoginUrl("https://api.example.test/path?returnTo=/billing")).toThrow(
+      "invalid shared-auth API origin",
+    );
+  });
+
   test("routes a GitHub assertion to GitHub when both descriptors are advertised", async () => {
     installConsoleGlobals();
     const { signInWithOperatorAssertion } = await import("../console/src/pages/signin.ts");

@@ -1,5 +1,5 @@
 import { type Child, h, live, text } from "./dom.ts";
-import { readGoogleReturn } from "./google.ts";
+import { type GoogleReturnResult, readGoogleReturn } from "./google.ts";
 import {
   consoleLocale,
   consoleNavigation,
@@ -21,12 +21,14 @@ import {
   adoptSession,
   api,
   applyTheme,
+  bootstrapSharedSession,
   currentOrganization,
   organizations,
   principal,
   selectOrganization,
   session,
   signOut,
+  takeSharedSessionReturnPath,
   theme,
 } from "./state.ts";
 import { readTakosIdReturn } from "./takos-id.ts";
@@ -53,30 +55,7 @@ function boot(): void {
   // It is read and cleared before anything renders, so a reload cannot replay
   // a sign-in and the token never sits in the address bar.
   const returned = readGoogleReturn();
-  if (returned.kind === "error") {
-    toast(returned.message, "bad");
-  } else if (returned.kind === "ok") {
-    api.signIn("google", returned.value.idToken, "oidc", returned.value.nonce).then(
-      () => {
-        adoptSession();
-        navigate(returned.value.from, { replace: true });
-      },
-      (error: unknown) => toast(explain(error as Error), "bad"),
-    );
-  }
-  void readTakosIdReturn().then((result) => {
-    if (result.kind === "error") {
-      toast(result.message, "bad");
-    } else if (result.kind === "ok") {
-      api.signIn("takos-id", result.idToken, "oidc").then(
-        () => {
-          adoptSession();
-          navigate(result.from, { replace: true });
-        },
-        (error: unknown) => toast(explain(error as Error), "bad"),
-      );
-    }
-  });
+  const sessionReady = signal(session() !== null);
 
   const view = h("div");
   root.append(view);
@@ -105,9 +84,65 @@ function boot(): void {
   });
 
   effect(() => {
-    const screen = session() ? shell() : signInPage();
+    const screen = !sessionReady()
+      ? h(
+          "div",
+          { class: "signin", role: "status" },
+          tr("セッションを確認しています…", "Checking your session…"),
+        )
+      : session()
+        ? shell()
+        : signInPage();
     view.replaceChildren(screen instanceof Node ? screen : document.createTextNode(""));
   });
+
+  void resolveInitialSession(returned, sessionReady);
+}
+
+/** Resolve callback work before a markerless shared-cookie probe. */
+export async function resolveInitialSession(
+  returned: GoogleReturnResult,
+  sessionReady: { set(value: boolean): void },
+): Promise<void> {
+  try {
+    const takosIdReturn = await readTakosIdReturn();
+    const hasProviderReturn = returned.kind !== "none" || takosIdReturn.kind !== "none";
+
+    if (returned.kind === "error") toast(returned.message, "bad");
+    if (returned.kind === "ok") {
+      try {
+        await api.signIn("google", returned.value.idToken, "oidc", returned.value.nonce);
+        adoptSession();
+        navigate(returned.value.from, { replace: true });
+      } catch (error) {
+        toast(explain(error as Error), "bad");
+      }
+    }
+    if (takosIdReturn.kind === "error") toast(takosIdReturn.message, "bad");
+    if (takosIdReturn.kind === "ok") {
+      try {
+        await api.signIn("takos-id", takosIdReturn.idToken, "oidc");
+        adoptSession();
+        navigate(takosIdReturn.from, { replace: true });
+      } catch (error) {
+        toast(explain(error as Error), "bad");
+      }
+    }
+
+    if (session() === null && !hasProviderReturn) {
+      try {
+        if (await bootstrapSharedSession()) {
+          navigate(takeSharedSessionReturnPath(), { replace: true });
+        }
+      } catch (error) {
+        toast(explain(error as Error), "bad");
+      }
+    }
+  } catch (error) {
+    toast(explain(error as Error), "bad");
+  } finally {
+    sessionReady.set(true);
+  }
 }
 
 function shell(): Child {
@@ -205,7 +240,9 @@ function topbar(): Child {
           type: "button",
           title: label,
           "aria-label": label,
-          onClick: signOut,
+          onClick: () => {
+            void signOut().catch((error: unknown) => toast(explain(error as Error), "bad"));
+          },
         },
         icon(ICON.signOut, 15),
         h("span", { class: "topbar__who" }, who ? who.displayName : tr("サインアウト", "Sign out")),
@@ -347,4 +384,4 @@ function page(): Child {
   }
 }
 
-boot();
+if (document.getElementById("root")) boot();

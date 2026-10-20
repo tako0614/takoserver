@@ -70,6 +70,57 @@ test("usage percent preserves the server basis points, including zero allowance 
   }
 });
 
+test("shared-auth session oracle uses only the cookie and accepts its exact status envelopes", async () => {
+  const authenticated = transport(() => Response.json({ authenticated: true }));
+  expect(await client().sharedAuthSession()).toEqual({ available: true, authenticated: true });
+  expect(new URL(authenticated[0]?.url ?? origin).pathname).toBe("/auth/oidc/session");
+  expect(new URL(authenticated[0]?.url ?? origin).search).toBe("");
+  expect(authenticated[0]?.method).toBe("GET");
+  expect(authenticated[0]?.credentials).toBe("include");
+  expect(authenticated[0]?.cache).toBe("no-store");
+  expect(authenticated[0]?.headers.has("authorization")).toBe(false);
+
+  transport(() => Response.json({ authenticated: false }, { status: 401 }));
+  expect(await client().sharedAuthSession()).toEqual({ available: true, authenticated: false });
+
+  transport(() => Response.json({ error: { code: "not_found" } }, { status: 404 }));
+  expect(await client().sharedAuthSession()).toEqual({ available: false, authenticated: false });
+
+  for (const [status, code] of [
+    [400, "session_invalid"],
+    [503, "session_unavailable"],
+  ] as const) {
+    transport(() => Response.json({ error: { code } }, { status }));
+    await expect(client().sharedAuthSession()).rejects.toMatchObject({ code, status });
+  }
+
+  for (const [status, payload] of [
+    [200, { authenticated: false }],
+    [200, { authenticated: true, subject: "must-not-be-consumed" }],
+    [401, { authenticated: true }],
+    [401, { authenticated: false, subject: "must-not-be-consumed" }],
+  ] as const) {
+    transport(() => Response.json(payload, { status }));
+    await expect(client().sharedAuthSession()).rejects.toMatchObject({ code: "invalid_response" });
+  }
+});
+
+test("shared-auth logout uses only its cookie endpoint and accepts only 204", async () => {
+  const seen = transport(() => new Response(null, { status: 204 }));
+  await client().sharedAuthSignOut();
+  expect(new URL(seen[0]?.url ?? origin).pathname).toBe("/auth/oidc/logout");
+  expect(new URL(seen[0]?.url ?? origin).search).toBe("");
+  expect(seen[0]?.method).toBe("POST");
+  expect(seen[0]?.credentials).toBe("include");
+  expect(seen[0]?.headers.has("authorization")).toBe(false);
+
+  transport(() => Response.json({ error: { code: "session_unavailable" } }, { status: 503 }));
+  await expect(client().sharedAuthSignOut()).rejects.toMatchObject({
+    code: "session_unavailable",
+    status: 503,
+  });
+});
+
 test("usage summary refuses unknown, foreign or invalid units and utilization instead of showing zero", async () => {
   const valid = {
     organizationId: org,
