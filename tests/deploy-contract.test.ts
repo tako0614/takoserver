@@ -635,6 +635,7 @@ describe("Takoserver split deploy entrypoint", () => {
         "v2-0091",
         "v2-0092",
         "v2-0100",
+        "v2-0100-money-preserved",
       ]) {
         const selected = await deploy([
           surface,

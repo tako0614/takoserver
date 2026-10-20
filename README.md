@@ -582,6 +582,9 @@ historical D1 payloads; neither can serve this Worker. The staging-only
 `--fresh-lineage=v2-0100` profile creates a new plain 0001–0100 D1 and claims
 the test realm in the same import, so this Worker starts on it; routine
 publication still needs the separate Auth103 step ([deploy guide](docs/deploy.md)).
+The staging-only `--fresh-lineage=v2-0100-money-preserved` profile creates a new
+Money-preserved 0001–0100 D1 with that claim and one fresh Writer epoch row in
+the same import; its Worker bootstrap is not yet qualified.
 Source audit does not authorize applying 0098 to a protected D1; existing-data
 cutover and old-writer quiescence require separate qualification.
 

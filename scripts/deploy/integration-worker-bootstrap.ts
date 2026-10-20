@@ -2902,6 +2902,12 @@ function readBootstrapArtifact(sourceRoot: string, target: DeployTarget): Migrat
       return projectFreshIntegrationV2MigrationArtifact0092(source);
     case "v2-0100":
       return projectFreshIntegrationV2MigrationArtifact0100(source);
+    case "v2-0100-money-preserved":
+      // Its first Host needs the selected Money writer and its retained epoch
+      // record; that publication is not qualified on this surface.
+      throw preflightError(
+        "integration Worker bootstrap does not yet serve the fresh v2-0100-money-preserved lineage",
+      );
   }
 }
 

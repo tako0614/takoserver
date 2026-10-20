@@ -280,6 +280,63 @@ bun run deploy -- takoserver-integration-storage-generation --apply --environmen
 There is no in-place route from an existing 0088/0089 D1 to this lineage. A
 new generation replaces it, and the old D1 stays protected history.
 
+#### Money-preserved serving D1 through 0100 (staging-only `v2-0100-money-preserved`)
+
+`--fresh-lineage=v2-0100-money-preserved` creates a new staging D1 with the
+exact Money-preserved 0100 shape (`moneyPost100ExpectedPreservedShape`). The
+migration payload is the same fixed audited 0001–0100 source as `v2-0100`.
+The one sealed import file is, in this order:
+
+1. The Money-preserved replay owned by Money source: 0001–0094 with a fresh
+   ledger, the `0094-fenced` freeze/epoch/permit DDL and fences, 0095–0098, the
+   owned post94 guards that 0095 removed, then 0099–0100. It is executed in
+   memory before any provider call and must leave exactly the preserved shape.
+2. Financial's `test` realm claim over that replay's own inventory (72
+   financial tables, including the three `money_cutover_*` tables).
+3. One `money_cutover_authorized_epoch` row. There is no freeze row, and the
+   permit table stays empty.
+
+The Writer epoch comes only from Financial's `mintFreshMoneyWriterEpoch`, called
+once after the new D1's identity readback and before the import is written. It
+is never derived from an old D1, an old frame or production, and never
+hard-coded. Callers can inject the mint as the `freshMoneyWriterEpoch` option;
+an explicitly absent port refuses before any provider call with "the fresh Money
+writer epoch owner is unavailable".
+
+The full epoch record holds a nonce. It is written once, mode 0600, as
+`money-fresh-writer-epoch.json` in the generation's output root (a retained
+`takoserver-integration-storage-*` temporary directory when no output directory
+is given), never in the repository or the command output.
+
+In every other respect it behaves like `v2-0100`:
+
+- Production fresh init refuses it, and applying it requires
+  `TAKOSERVER_DEPLOY_TARGET_PRODUCTION`.
+- It only creates a new `integration-takoserver-<generation>` D1, after the
+  absence fence and an empty readback of that new database.
+- An operator-provisioned staging pair is not accepted.
+
+Differences from `v2-0100`:
+
+- The data proof reads the exact preserved shape, 100 ledger rows, the seeds,
+  `money_unit_policy`, exactly one `test` pin with a canonical instant and
+  exactly one authorized-epoch row. Apply checks that row against the retained
+  record with `verifyFreshMoneyWriterEpoch`; status, which never holds the
+  record, checks only that it is one well-formed epoch. Freeze and permit hold
+  zero rows, and every other table is empty.
+- A complete schema without its pin or its epoch row is an interrupted import:
+  `--status` reports `dataReadback: "interrupted"` and quarantines it.
+- The apply record adds `moneyPreserved: { epochBindingDigest, shapeDigest }`
+  next to `stripeRealmClaim`, and `moneyWriterEpochRecord: { path, digest }`
+  for the private record. The epoch and nonce are not in the output.
+- `takoformV2.storageLineage: "v2-0100-money-preserved"` names it on a target,
+  but Worker bootstrap refuses it until its Money writer publication is
+  qualified.
+
+```sh
+bun run deploy -- takoserver-integration-storage-generation --apply --environment=integration --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-0100-money-preserved
+```
+
 #### Financial realm claim and Writer epoch for a fresh Money-preserved D1
 
 A fresh Money-preserved D1 (staging-only, for a new Container Host) adds two

@@ -764,6 +764,57 @@ export function moneyPost103ExpectedPreservedShape(files: readonly MigrationFile
 }
 
 /**
+ * The same ordered replay as `moneyPost100ExpectedPreservedShape`, as Wrangler
+ * import segments for a brand-new empty D1: 0001–0094 with a fresh ledger, the
+ * `0094-fenced` freeze/epoch/permit DDL, 0095–0098, the owned post94 guards
+ * 0095 removed, then 0099–0100. It writes no freeze, epoch, permit or realm
+ * row. Pure source DATA: it reads only the audited migration bytes.
+ */
+export function moneyPost100PreservedFreshImportSegments(
+  files: readonly MigrationFile[],
+): readonly string[] {
+  assertMoneyPost94Source(files);
+  if (
+    files.length !== 100 ||
+    files.some(
+      (file, index) =>
+        !new RegExp(`^${String(index + 1).padStart(4, "0")}_[-a-z0-9_]+\\.sql$`, "u").test(
+          file.name,
+        ),
+    )
+  )
+    throw preflightError("money preserved fresh import requires the exact 0001-0100 inventory");
+  const prefix94 = buildD1MigrationImport(files.slice(0, 94), { freshLedger: true }).sql;
+  const fence = `${FENCE_DDL};\n${MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL};\n${MONEY_CUTOVER_PERMIT_DDL};\n${MONEY_CUTOVER_PERMIT_EPOCH_GUARD_DDL};\n${moneyFenceInstallSql("0094-fenced")}`;
+  const suffix98 = buildD1MigrationImport(files.slice(94, 98), { freshLedger: false }).sql;
+  const database = new Database(":memory:");
+  const restore: string[] = [];
+  try {
+    executeMoneyHostSql(database, prefix94);
+    executeMoneyHostSql(database, fence);
+    executeMoneyHostSql(database, suffix98);
+    for (const [name, sql] of moneyPost94GuardDefinitions()) {
+      const existing = database.query("SELECT sql FROM sqlite_schema WHERE name = ?").get(name) as {
+        sql: string;
+      } | null;
+      if (existing === null) restore.push(`${sql};`);
+      else if (existing.sql !== sql)
+        throw preflightError("money post103 predecessor guard differs from owned98 source");
+    }
+  } finally {
+    database.close();
+  }
+  const successor100 = buildD1MigrationImport(files.slice(98, 100), { freshLedger: false }).sql;
+  return Object.freeze([
+    prefix94,
+    fence,
+    suffix98,
+    ...(restore.length === 0 ? [] : [restore.join("\n")]),
+    successor100,
+  ]);
+}
+
+/**
  * Select an original100 or full103 observation from the whole current checkout.
  * The audited source owner validates the complete inventory, including every
  * canonical Auth103 successor, before the Money reader takes a 100 prefix.

@@ -13,6 +13,7 @@ import {
   mkdtempSync,
   openSync,
   readdirSync,
+  readFileSync,
   readSync,
   realpathSync,
   rmSync,
@@ -28,7 +29,7 @@ import {
 } from "./application-schema-shape.ts";
 import { readAuth103CanonicalMigrationSource } from "./auth103-canonical-migration-source.ts";
 import { RemoteD1 } from "./d1.ts";
-import { buildD1MigrationImport } from "./d1-migration-import.ts";
+import { buildD1MigrationImport, type D1MigrationImportArtifact } from "./d1-migration-import.ts";
 import {
   DeployError,
   type DeployPhase,
@@ -40,11 +41,19 @@ import {
 import { readFinancial0104CanonicalMigrationSource } from "./financial0104-canonical-source.ts";
 import { financial0104SourceSchemaReady } from "./financial0104-schema-shape.ts";
 import {
+  buildFreshMoneyPreservedPreEpochImport,
+  composeFreshMoneyPreservedImport,
+  FRESH_MONEY_PRESERVED_LINEAGE,
+  FRESH_MONEY_WRITER_EPOCH_OWNER_UNAVAILABLE,
+  type FreshMoneyWriterEpochPort,
+} from "./fresh-money-preserved.ts";
+import {
   appendFreshStripeRealmClaim,
   buildFreshStripeRealmClaim,
 } from "./fresh-stripe-realm-claim.ts";
 import {
   assertFreshV2DataReadback,
+  FRESH_V2_INTERRUPTED_MONEY_PRESERVED,
   FRESH_V2_UNPINNED_0100,
   type FreshV2D1Lineage,
   type FreshV2DataReader,
@@ -55,6 +64,12 @@ import {
   readD1SchemaState,
   readMigrationArtifact,
 } from "./migrations.ts";
+import {
+  type FreshMoneyWriterEpochBinding,
+  type FreshMoneyWriterEpochRecord,
+  mintFreshMoneyWriterEpoch,
+  verifyFreshMoneyWriterEpoch,
+} from "./money-fresh-writer-epoch.ts";
 import {
   type CommandResult,
   REPOSITORY,
@@ -90,6 +105,7 @@ import {
 } from "./schema.ts";
 import {
   type MoneySchemaPhase,
+  moneyPost100ExpectedPreservedShape,
   moneyUnitCutoverExpectedShape,
   moneyUnitCutoverSchemaMatches,
   moneyUnitCutoverSourcePrefixDigest,
@@ -140,6 +156,9 @@ class MigrationApplyError extends DeployError {
  * `v2-0100` is the staging-only plain serving profile: the whole audited
  * 0001-0100 source plus the test Stripe realm claimed in the same import,
  * which is what the served Worker requires to start.
+ * `v2-0100-money-preserved` is the staging-only Money-preserved 0100 shape
+ * (fences, epoch and permit tables) in one sealed import with the test realm
+ * claim and one fresh Writer epoch row minted for the new D1 only.
  */
 export type IntegrationFreshLineage = "v2-artifacts-0075" | FreshV2D1Lineage;
 
@@ -150,6 +169,7 @@ const INTEGRATION_FRESH_LINEAGES: readonly IntegrationFreshLineage[] = [
   "v2-0091",
   "v2-0092",
   "v2-0100",
+  "v2-0100-money-preserved",
 ];
 
 /** Profiles no production surface offers; their apply requires the production target. */
@@ -157,6 +177,7 @@ const STAGING_ONLY_LINEAGES: ReadonlySet<IntegrationFreshLineage> = new Set([
   "v2-0091",
   "v2-0092",
   "v2-0100",
+  "v2-0100-money-preserved",
 ]);
 
 /** The exact production D1 a staging generation must never be. */
@@ -401,6 +422,12 @@ export interface IntegrationStorageGenerationOptions {
   readonly productionD1?: ProductionD1Identity;
   /** Dedicated new integration-ts/fresh92 path, mutually exclusive with productionD1. */
   readonly originalCreate?: IntegrationStorageOriginalCreateOptions;
+  /**
+   * `v2-0100-money-preserved` only: Financial's Writer epoch mint, called once
+   * after the new D1's identity readback. Omitted uses the real owner
+   * function; an explicitly absent port refuses before any provider call.
+   */
+  readonly freshMoneyWriterEpoch?: FreshMoneyWriterEpochPort | undefined;
 }
 
 export interface IntegrationStorageGenerationTargetProof {
@@ -502,12 +529,38 @@ export async function runIntegrationStorageGeneration(
         "so the production D1 is refused by its exact identity",
     );
   }
+  if (
+    invocation.action === "apply" &&
+    invocation.freshLineage === FRESH_MONEY_PRESERVED_LINEAGE &&
+    typeof freshMoneyWriterEpochPort(options) !== "function"
+  ) {
+    throw preflightError(FRESH_MONEY_WRITER_EPOCH_OWNER_UNAVAILABLE);
+  }
   if (invocation.action === "status") {
     const provider = await resolveProvider(target, options);
     original?.assertUnchanged();
     return await statusStorageGeneration(invocation, target, names, provider, options, original);
   }
   return await applyStorageGeneration(invocation, target, names, options, original);
+}
+
+/** The injected port, or Financial's real mint when the option is not named at all. */
+function freshMoneyWriterEpochPort(
+  options: IntegrationStorageGenerationOptions,
+): FreshMoneyWriterEpochPort | undefined {
+  return Object.hasOwn(options, "freshMoneyWriterEpoch")
+    ? options.freshMoneyWriterEpoch
+    : mintFreshMoneyWriterEpoch;
+}
+
+/** The exact application shape a fresh lineage's import leaves behind. */
+function lineageExpectedShape(
+  lineage: "apply-0066" | IntegrationFreshLineage | "applied-v2-0092" | undefined,
+  files: ReturnType<typeof selectedSourceArtifact>["files"],
+): string {
+  return lineage === FRESH_MONEY_PRESERVED_LINEAGE
+    ? moneyPost100ExpectedPreservedShape(files)
+    : deriveExpectedApplicationShape(files);
 }
 
 /**
@@ -944,7 +997,9 @@ async function verifyGeneratedStorageTarget(
       observedSource.names,
       observedSource.digest,
       moneyPhase === undefined
-        ? deriveExpectedApplicationShape(observedSource.files)
+        ? observedSource === sourceArtifact
+          ? lineageExpectedShape(lineage, observedSource.files)
+          : deriveExpectedApplicationShape(observedSource.files)
         : moneyUnitCutoverExpectedShape(currentSource?.files ?? [], moneyPhase),
       generated.databaseId,
       "preflight",
@@ -1843,12 +1898,14 @@ function generatedStorageTarget(
   if (prefixed !== null && target.takoformV2?.storageLineage !== "v2-0092") {
     throw preflightError("integration-ts readback requires its explicit fresh v2-0092 origin");
   }
-  // The plain serving lineage's realm pin exists only through this surface's
-  // own import into a D1 it created, so it has no operator-provisioned pair.
+  // The serving lineages' realm pin (and the Money-preserved Writer epoch)
+  // exist only through this surface's own import into a D1 it created, so
+  // they have no operator-provisioned pair.
   const stagingPair =
     generated === null &&
     target.takoformV2?.storageLineage !== undefined &&
     target.takoformV2.storageLineage !== "v2-0100" &&
+    target.takoformV2.storageLineage !== FRESH_MONEY_PRESERVED_LINEAGE &&
     STAGING_ONLY_LINEAGES.has(target.takoformV2.storageLineage) &&
     STAGING_PAIR_NAME.test(databaseName) &&
     !PRODUCTION_D1_NAME.test(databaseName);
@@ -2080,7 +2137,7 @@ async function statusStorageGeneration(
       options.run ?? runCommand,
       options,
     );
-    const expectedShape = deriveExpectedApplicationShape(sourceArtifact.files);
+    const expectedShape = lineageExpectedShape(invocation.freshLineage, sourceArtifact.files);
     let complete = false;
     try {
       assertCompleteDatabase(
@@ -2102,6 +2159,7 @@ async function statusStorageGeneration(
     const freshV2 = freshV2D1Lineage(invocation.freshLineage);
     let dataEmpty: boolean | null = null;
     let unpinned = false;
+    let interrupted = false;
     if (complete && freshV2 !== null) {
       try {
         await assertFreshV2DataReadback(
@@ -2119,13 +2177,23 @@ async function statusStorageGeneration(
         // A plain 0100 schema without its pin is the exception: the import
         // stopped after the migrations, so the generation is quarantined.
         unpinned = error instanceof DeployError && error.message === FRESH_V2_UNPINNED_0100;
+        // The Money-preserved import can also stop between its claim and its
+        // Writer epoch row; either way it is quarantined, never in use.
+        interrupted =
+          error instanceof DeployError && error.message === FRESH_V2_INTERRUPTED_MONEY_PRESERVED;
         dataEmpty = false;
       }
-      result.dataReadback = dataEmpty ? "empty-seeded" : unpinned ? "unpinned" : "present";
+      result.dataReadback = dataEmpty
+        ? "empty-seeded"
+        : unpinned
+          ? "unpinned"
+          : interrupted
+            ? "interrupted"
+            : "present";
     }
     original?.assertUnchanged();
     result.resume =
-      !complete || unpinned
+      !complete || unpinned || interrupted
         ? "Quarantine this generation and plan separate owner-reviewed forward repair; no SQL re-import or new generation retry."
         : dataEmpty === false
           ? "Complete schema with application data: this generation is in use. Keep it as the selected target; it is no longer a fresh candidate. No SQL re-import."
@@ -2155,6 +2223,7 @@ function selectedSourceArtifact(
     case "v2-0092":
       return projectFreshIntegrationV2MigrationArtifact0092(source);
     case "v2-0100":
+    case "v2-0100-money-preserved":
       return projectFreshIntegrationV2MigrationArtifact0100(source);
     case "applied-v2-0092":
       return projectCanonicalIntegrationV2MigrationArtifact0092(source);
@@ -2179,6 +2248,7 @@ function readSealedSelectedArtifact(
     case "v2-0092":
       return readSealedFreshIntegrationV2MigrationArtifact0092(directory);
     case "v2-0100":
+    case "v2-0100-money-preserved":
       return readSealedFreshIntegrationV2MigrationArtifact0100(directory);
   }
 }
@@ -2188,7 +2258,8 @@ function freshV2D1Lineage(lineage: IntegrationFreshLineage | undefined): FreshV2
     lineage === "v2-0089" ||
     lineage === "v2-0091" ||
     lineage === "v2-0092" ||
-    lineage === "v2-0100"
+    lineage === "v2-0100" ||
+    lineage === "v2-0100-money-preserved"
     ? lineage
     : null;
 }
@@ -2210,6 +2281,7 @@ function lineageCeiling(
     case "v2-0092":
       return "0092";
     case "v2-0100":
+    case "v2-0100-money-preserved":
       return "0100";
   }
 }
@@ -2302,7 +2374,14 @@ async function applyStorageGeneration(
     invocation.freshLineage ?? "apply-0066",
   );
   await checkedMigrationGate(run);
-  const expectedApplicationShape = deriveExpectedApplicationShape(sourceArtifact.files);
+  const expectedApplicationShape = lineageExpectedShape(
+    invocation.freshLineage,
+    sourceArtifact.files,
+  );
+  const epochPort =
+    invocation.freshLineage === FRESH_MONEY_PRESERVED_LINEAGE
+      ? freshMoneyWriterEpochPort(options)
+      : undefined;
 
   original?.assertUnchanged();
   const temporary = original === null && options.outputDirectory === undefined;
@@ -2327,6 +2406,7 @@ async function applyStorageGeneration(
   let operationFailure: unknown;
   let originalBinding: OriginalCreateBinding | null = null;
   let originalEvidence: IntegrationStorageOriginalCreateEvidence | null = null;
+  let epochRecordPath: string | null = null;
   try {
     for (const file of sourceArtifact.files) {
       copyFileSync(file.path, join(migrationOutput, file.name));
@@ -2349,22 +2429,37 @@ async function applyStorageGeneration(
       invocation.freshLineage === "v2-0100"
         ? buildFreshStripeRealmClaim(sealedArtifact.files)
         : null;
-    const migrationImport =
-      realmClaim === null
-        ? buildD1MigrationImport(sealedArtifact.files, { freshLedger: true })
-        : appendFreshStripeRealmClaim(
-            buildD1MigrationImport(sealedArtifact.files, { freshLedger: true }),
-            realmClaim,
-          );
+    // The Money-preserved replay and its realm claim are fixed now; the Writer
+    // epoch row exists only once the new D1's identity is known, so that
+    // profile writes its import after the identity readback.
+    const preservedImport =
+      invocation.freshLineage === FRESH_MONEY_PRESERVED_LINEAGE
+        ? buildFreshMoneyPreservedPreEpochImport(sealedArtifact.files)
+        : null;
+    let migrationImport: D1MigrationImportArtifact | null =
+      preservedImport !== null
+        ? null
+        : realmClaim === null
+          ? buildD1MigrationImport(sealedArtifact.files, { freshLedger: true })
+          : appendFreshStripeRealmClaim(
+              buildD1MigrationImport(sealedArtifact.files, { freshLedger: true }),
+              realmClaim,
+            );
     const importPath = join(payload, "migration-import.sql");
-    writeFileSync(importPath, migrationImport.sql, { mode: 0o600, flag: "wx" });
-    migrationSeal = sealDirectory(payload, [
-      "migration-import.sql",
-      ...sourceArtifact.names.map((name) => `migrations/${name}`),
-    ]);
+    if (migrationImport === null) {
+      migrationSeal = sealDirectory(migrationOutput, sourceArtifact.names);
+    } else {
+      writeFileSync(importPath, migrationImport.sql, { mode: 0o600, flag: "wx" });
+      migrationSeal = sealDirectory(payload, [
+        "migration-import.sql",
+        ...sourceArtifact.names.map((name) => `migrations/${name}`),
+      ]);
+    }
     const configPath = join(release, "wrangler.jsonc");
 
     if (original !== null) {
+      if (migrationImport === null)
+        throw preflightError("original fresh92 creation requires its sealed import");
       originalBinding = original.binding(
         sourceArtifact,
         migrationImport,
@@ -2439,6 +2534,36 @@ async function applyStorageGeneration(
       databaseName: names.databaseName,
       databaseId,
     };
+    let epochBinding: FreshMoneyWriterEpochBinding | null = null;
+    let epochRecord: FreshMoneyWriterEpochRecord | null = null;
+    if (preservedImport !== null) {
+      // Financial mints the Writer epoch of exactly this new D1, now that its
+      // identity is read back, and before any import byte exists.
+      if (epochPort === undefined) throw mutationError(FRESH_MONEY_WRITER_EPOCH_OWNER_UNAVAILABLE);
+      epochBinding = {
+        accountId: target.accountId,
+        databaseId,
+        databaseName: names.databaseName,
+        generation: invocation.generation,
+      };
+      const minted = await epochPort(epochBinding);
+      verifyFreshMoneyWriterEpoch(minted, {
+        binding: epochBinding,
+        epoch: minted.epoch,
+      });
+      epochRecord = minted;
+      // The record holds the nonce: operator-private beside the generation's
+      // artifact, never in the repository or the command output.
+      epochRecordPath = join(root, "money-fresh-writer-epoch.json");
+      writeFileSync(epochRecordPath, `${JSON.stringify(minted)}\n`, {
+        mode: 0o600,
+        flag: "wx",
+      });
+      migrationSeal.assertUnchanged();
+      migrationImport = composeFreshMoneyPreservedImport(preservedImport, minted);
+      writeFileSync(importPath, migrationImport.sql, { mode: 0o600, flag: "wx" });
+    }
+    if (migrationImport === null) throw mutationError("fresh import was not composed");
     // The config is written only once the provider identity is known. The
     // migration directory has stayed sealed across the create/read fence.
     writeGenerationConfig(
@@ -2510,7 +2635,13 @@ async function applyStorageGeneration(
         configPath,
         provider.environment,
         expectedApplicationShape,
-        { ...options, run },
+        {
+          ...options,
+          run,
+          ...(epochRecord === null || epochBinding === null
+            ? {}
+            : { moneyWriterEpoch: { record: epochRecord, binding: epochBinding } }),
+        },
       );
     }
 
@@ -2601,6 +2732,23 @@ async function applyStorageGeneration(
               historyTables: realmClaim.historyTables.length,
             },
           }),
+      ...(preservedImport === null || epochRecord === null || epochRecordPath === null
+        ? {}
+        : {
+            stripeRealmClaim: {
+              mode: "test",
+              placement: "same-import-after-preserved-replay",
+              historyTables: preservedImport.historyTables.length,
+            },
+            moneyPreserved: {
+              epochBindingDigest: epochRecord.bindingDigest,
+              shapeDigest: preservedImport.shapeDigest,
+            },
+            moneyWriterEpochRecord: {
+              path: epochRecordPath,
+              digest: fileDigest(epochRecordPath),
+            },
+          }),
       appliedMigrations: postMigration.applied,
       schemaShapeDigest: postMigration.shapeDigest,
       rollback: "old active target remains unchanged; repair forward from this exact generation",
@@ -2618,7 +2766,9 @@ async function applyStorageGeneration(
     if (original === null) {
       if (sealed !== null) unsealDirectory(sealed.root);
       else if (migrationSeal !== null) unsealDirectory(migrationSeal.root);
-      if (temporary) rmSync(root, { recursive: true, force: true });
+      // A minted Writer epoch record outlives the temporary release.
+      if (temporary && epochRecordPath !== null) rmSync(release, { recursive: true, force: true });
+      else if (temporary) rmSync(root, { recursive: true, force: true });
     }
     // The new path retains the original sealed artifact outside Git, including UNKNOWN.
   } catch (error) {
@@ -2871,6 +3021,10 @@ function completeDatabaseReadbackError(
     return preflightError(`Existing generated D1 schema readback ${reason}`, detail);
   }
   return verificationError(`D1 migration readback ${reason}; R2 creation is withheld`, detail);
+}
+
+function fileDigest(path: string): string {
+  return `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
 }
 
 function digestShape(shape: string): string {

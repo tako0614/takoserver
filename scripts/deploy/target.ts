@@ -44,9 +44,16 @@ import type { DeployEnvironment } from "./qualification.ts";
  * default. Every v2 Worker target is integration-only, so `v2-0091` (through the
  * Stripe event table), `v2-0092` (through the Organization wallet lifecycle
  * tables) and `v2-0100` (the plain serving lineage with its claimed test
- * Stripe realm) are staging-only lineages.
+ * Stripe realm) are staging-only lineages, as is `v2-0100-money-preserved`
+ * (the Money-preserved 0100 shape with that claim and one fresh Writer epoch).
  */
-export type TakoformV2StorageLineage = "v2-0088" | "v2-0089" | "v2-0091" | "v2-0092" | "v2-0100";
+export type TakoformV2StorageLineage =
+  | "v2-0088"
+  | "v2-0089"
+  | "v2-0091"
+  | "v2-0092"
+  | "v2-0100"
+  | "v2-0100-money-preserved";
 
 /** The exact fresh payload a v2 target's generated storage must carry. */
 export function takoformV2StorageLineage(
@@ -1743,10 +1750,11 @@ function takoformV2(value: unknown): NonNullable<DeployTarget["takoformV2"]> {
     value.storageLineage !== "v2-0089" &&
     value.storageLineage !== "v2-0091" &&
     value.storageLineage !== "v2-0092" &&
-    value.storageLineage !== "v2-0100"
+    value.storageLineage !== "v2-0100" &&
+    value.storageLineage !== "v2-0100-money-preserved"
   ) {
     throw preflightError(
-      "deploy target `takoformV2.storageLineage` must be v2-0088, v2-0089, v2-0091, v2-0092 or v2-0100 when set",
+      "deploy target `takoformV2.storageLineage` must be v2-0088, v2-0089, v2-0091, v2-0092, v2-0100 or v2-0100-money-preserved when set",
     );
   }
   if (value.appliedSchemaLineage !== undefined && value.appliedSchemaLineage !== "v2-0092") {
