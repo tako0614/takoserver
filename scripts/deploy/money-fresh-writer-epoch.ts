@@ -232,7 +232,9 @@ export function buildFreshPreservedRealmClaim(sqlBeforeClaim: string): {
     // json_group_array keeps the ORDER BY name of the inventory query.
     `  AND (SELECT json_group_array(name) FROM (${STRIPE_REALM_FINANCIAL_HISTORY_QUERY})) = '${JSON.stringify(historyTables)}'\n` +
     `  AND ${empty.join("\n  AND ")};\n` +
-    "SELECT CASE WHEN (SELECT COUNT(*) FROM stripe_mode_realm) = 1 AND " +
+    // changes() binds the check to that INSERT itself: an existing pin, even a
+    // test one, writes nothing and refuses the import.
+    "SELECT CASE WHEN changes() = 1 AND (SELECT COUNT(*) FROM stripe_mode_realm) = 1 AND " +
     "(SELECT mode FROM stripe_mode_realm WHERE singleton = 1) = 'test' " +
     "THEN 1 ELSE json('fresh preserved Stripe realm claim refused') END AS claimed;";
   return Object.freeze({ sql, historyTables: Object.freeze([...historyTables]) });

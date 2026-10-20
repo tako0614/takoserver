@@ -293,8 +293,9 @@ in this order:
      `money_cutover_*` tables that the plain `v2-0100` claim does not have.
    - The pin is inserted only when no pin exists, the live inventory is exactly
      that one and every listed table is empty.
-   - The statement after it fails the import unless exactly the `test` pin
-     exists.
+   - The statement after it fails the import unless that INSERT itself wrote
+     the row and exactly the `test` pin exists. So an existing pin, even a
+     `test` one, refuses the import.
 2. `freshMoneyWriterEpochSql(record)` writes the single
    `money_cutover_authorized_epoch` row. The statement after it fails the import
    unless that is the only epoch and no freeze or permit row exists. The row

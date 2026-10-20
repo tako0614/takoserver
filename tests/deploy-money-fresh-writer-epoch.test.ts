@@ -135,4 +135,19 @@ describe("fresh preserved realm claim", () => {
       database.close();
     }
   });
+
+  test("an existing pin, even a test one, refuses the claim", () => {
+    const claim = buildFreshPreservedRealmClaim(preservedSql);
+    const database = new Database(":memory:");
+    try {
+      run(database, preservedSql);
+      run(
+        database,
+        "INSERT INTO stripe_mode_realm (singleton, mode, pinned_at) VALUES (1, 'test', '2026-10-20T00:00:00.000Z')",
+      );
+      expect(() => run(database, claim.sql)).toThrow();
+    } finally {
+      database.close();
+    }
+  });
 });
