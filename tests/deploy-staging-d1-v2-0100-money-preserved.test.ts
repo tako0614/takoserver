@@ -1,15 +1,17 @@
 import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DEPLOY_CONTRACT } from "../scripts/deploy/contract.ts";
 import { buildD1MigrationImport } from "../scripts/deploy/d1-migration-import.ts";
+import { DeployError } from "../scripts/deploy/errors.ts";
 import {
   buildFreshMoneyPreservedPreEpochImport,
   composeFreshMoneyPreservedImport,
   FRESH_MONEY_WRITER_EPOCH_OWNER_UNAVAILABLE,
+  FRESH_MONEY_WRITER_EPOCH_RECORD_FILE,
   freshMoneyPreservedRealmClaim,
 } from "../scripts/deploy/fresh-money-preserved.ts";
 import {
@@ -19,6 +21,7 @@ import {
 import {
   assertFreshV2DataReadback,
   FRESH_V2_INTERRUPTED_MONEY_PRESERVED,
+  FRESH_V2_MONEY_WRITER_EPOCH_MISMATCH,
   type FreshV2DataReadback,
 } from "../scripts/deploy/fresh-v2-data-readback.ts";
 import {
@@ -313,7 +316,7 @@ describe("fresh Money-preserved 0100 import", () => {
       ])
         await expect(proof(interrupted)).rejects.toThrow(FRESH_V2_INTERRUPTED_MONEY_PRESERVED);
       await expect(proof(exact, mintFreshMoneyWriterEpoch(binding))).rejects.toThrow(
-        "exact empty 0100 database",
+        FRESH_V2_MONEY_WRITER_EPOCH_MISMATCH,
       );
       for (const tableCounts of [
         { ...exact.tableCounts, money_cutover_freeze: 1 },
@@ -514,6 +517,140 @@ describe("v2-0100-money-preserved storage generation", () => {
       }),
     ).rejects.toThrow("belongs to another D1");
     expect(imports).toEqual([]);
+  }, 60_000);
+
+  test("a failure after the mint names the retained record's path and digest, never its content", async () => {
+    const output = mkdtempSync(join(ROOT, "failed-"));
+    let created = false;
+    let record: FreshMoneyWriterEpochRecord | null = null;
+    const provider = {
+      async listD1(name: string) {
+        return created ? [{ name, uuid: DATABASE_ID }] : [];
+      },
+      async getD1() {
+        return { name: NAME, uuid: DATABASE_ID };
+      },
+      async createD1(name: string) {
+        created = true;
+        return { name, uuid: DATABASE_ID };
+      },
+      async listR2() {
+        return [];
+      },
+      async getR2(name: string) {
+        return { name };
+      },
+      async createR2(): Promise<never> {
+        throw new Error("no R2 after a failed import");
+      },
+    };
+    const run: IntegrationStorageGenerationProcess = async (command) => {
+      if (command.includes("execute") && command.includes("--file"))
+        return { exitCode: 1, stdout: "", stderr: "import failed" };
+      return await sourceRun(() => {})(command);
+    };
+    let error: unknown;
+    try {
+      await runIntegrationStorageGeneration(invocation, target, {
+        provider,
+        run,
+        review: "test-review",
+        productionD1: PRODUCTION_D1,
+        outputDirectory: output,
+        reader: {
+          read: async () => ({
+            applied: [],
+            shape: "[]\n",
+            shapeDigest: `sha256:${createHash("sha256").update("[]\n").digest("hex")}`,
+          }),
+        },
+        freshMoneyWriterEpoch: (selected) => {
+          record = mintFreshMoneyWriterEpoch(selected);
+          return record;
+        },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(DeployError);
+    if (record === null) throw new Error("no epoch minted");
+    const minted = record as FreshMoneyWriterEpochRecord;
+    const path = join(output, FRESH_MONEY_WRITER_EPOCH_RECORD_FILE);
+    const digest = `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
+    const detail = String((error as DeployError).detail);
+    expect(detail).toContain(`moneyWriterEpochRecordPath=${path}`);
+    expect(detail).toContain(`moneyWriterEpochRecordDigest=${digest}`);
+    const surfaced = `${(error as DeployError).message} ${detail}`;
+    expect(surfaced).not.toContain(minted.nonce);
+    expect(surfaced).not.toContain(minted.epoch);
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+  }, 60_000);
+
+  test("status verifies a retained 0600 record, refuses a mismatch and says when only the form is checked", async () => {
+    const record = mintFreshMoneyWriterEpoch(binding);
+    const database = new Database(":memory:");
+    try {
+      execute(database, composeFreshMoneyPreservedImport(preEpoch, record).sql);
+      const provider = {
+        async listD1(name: string) {
+          return [{ name, uuid: DATABASE_ID }];
+        },
+        async getD1() {
+          return { name: NAME, uuid: DATABASE_ID };
+        },
+        async createD1(): Promise<never> {
+          throw new Error("status never creates");
+        },
+        async listR2(name: string) {
+          return [{ name }];
+        },
+        async getR2(name: string) {
+          return { name };
+        },
+        async createR2(): Promise<never> {
+          throw new Error("status never creates");
+        },
+      };
+      const status = async (outputDirectory: string) =>
+        await runIntegrationStorageGeneration({ ...invocation, action: "status" }, target, {
+          provider,
+          run: sourceRun(() => {
+            throw new Error("status never imports");
+          }),
+          outputDirectory,
+          reader: { read: async () => localState(database) },
+          freshV2DataReader: { read: async () => localData(database) },
+        });
+      const retain = (value: unknown, mode = 0o600) => {
+        const directory = mkdtempSync(join(ROOT, "status-"));
+        const path = join(directory, FRESH_MONEY_WRITER_EPOCH_RECORD_FILE);
+        writeFileSync(path, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+        chmodSync(path, mode);
+        return directory;
+      };
+      expect(await status(retain(record))).toMatchObject({
+        schemaReadback: "complete-0100",
+        dataReadback: "empty-seeded",
+        writerEpochCheck: "retained-record",
+      });
+      expect(await status(mkdtempSync(join(ROOT, "status-")))).toMatchObject({
+        schemaReadback: "complete-0100",
+        dataReadback: "empty-seeded",
+        writerEpochCheck: "form-only",
+      });
+      // Another mint for the same D1 is a different epoch than the D1 holds.
+      await expect(status(retain(mintFreshMoneyWriterEpoch(binding)))).rejects.toThrow(
+        FRESH_V2_MONEY_WRITER_EPOCH_MISMATCH,
+      );
+      await expect(status(retain({ ...record, nonce: "0".repeat(64) }))).rejects.toThrow(
+        FRESH_V2_MONEY_WRITER_EPOCH_MISMATCH,
+      );
+      await expect(status(retain(record, 0o644))).rejects.toThrow(
+        "not an operator-private regular file",
+      );
+    } finally {
+      database.close();
+    }
   }, 60_000);
 
   test("an operator staging pair never stands in for the Money-preserved generation", () => {

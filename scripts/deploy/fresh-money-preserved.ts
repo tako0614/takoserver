@@ -1,5 +1,7 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { frameHostMigrationSql } from "../../src/sqlite-migration-policy.ts";
 import { canonicalApplicationShape } from "./application-schema-shape.ts";
 import type { D1MigrationImportArtifact } from "./d1-migration-import.ts";
@@ -32,6 +34,48 @@ export const FRESH_MONEY_PRESERVED_LINEAGE = "v2-0100-money-preserved" as const;
 
 export const FRESH_MONEY_WRITER_EPOCH_OWNER_UNAVAILABLE =
   "the fresh Money writer epoch owner is unavailable";
+
+/** The operator-private Writer epoch record beside the generation's output root. */
+export const FRESH_MONEY_WRITER_EPOCH_RECORD_FILE = "money-fresh-writer-epoch.json";
+const RECORD_LIMIT = 4096;
+
+/**
+ * Reads a retained Writer epoch record from `root`, or null when none exists.
+ * It is accepted only as a link-free regular file of mode 0600 and at most
+ * 4 KiB; anything else at that name is refused rather than ignored. The
+ * content is returned as untrusted data for `verifyFreshMoneyWriterEpoch`.
+ */
+export function readRetainedFreshMoneyWriterEpochRecord(root: string): unknown | null {
+  const path = join(root, FRESH_MONEY_WRITER_EPOCH_RECORD_FILE);
+  let status: ReturnType<typeof lstatSync>;
+  try {
+    status = lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw preflightError("retained fresh Money Writer epoch record is unreadable");
+  }
+  if (!status.isFile() || (status.mode & 0o777) !== 0o600 || status.size > RECORD_LIMIT)
+    throw preflightError(
+      "retained fresh Money Writer epoch record is not an operator-private regular file",
+    );
+  let fd: number | null = null;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const opened = fstatSync(fd);
+    if (
+      !opened.isFile() ||
+      opened.ino !== status.ino ||
+      opened.dev !== status.dev ||
+      opened.size > RECORD_LIMIT
+    )
+      throw new Error("record changed");
+    return JSON.parse(readFileSync(fd, "utf8")) as unknown;
+  } catch {
+    throw preflightError("retained fresh Money Writer epoch record is unreadable");
+  } finally {
+    if (fd !== null) closeSync(fd);
+  }
+}
 
 /** Financial's mint, injectable for tests. The default is the real owner function. */
 export type FreshMoneyWriterEpochPort = (

@@ -306,7 +306,9 @@ writer epoch owner is unavailable".
 The full epoch record holds a nonce. It is written once, mode 0600, as
 `money-fresh-writer-epoch.json` in the generation's output root (a retained
 `takoserver-integration-storage-*` temporary directory when no output directory
-is given), never in the repository or the command output.
+is given), never in the repository or the command output. If apply fails after
+the mint, the error detail names that record's path and file digest (never its
+content), so the operator can find it.
 
 In every other respect it behaves like `v2-0100`:
 
@@ -321,9 +323,12 @@ Differences from `v2-0100`:
 - The data proof reads the exact preserved shape, 100 ledger rows, the seeds,
   `money_unit_policy`, exactly one `test` pin with a canonical instant and
   exactly one authorized-epoch row. Apply checks that row against the retained
-  record with `verifyFreshMoneyWriterEpoch`; status, which never holds the
-  record, checks only that it is one well-formed epoch. Freeze and permit hold
-  zero rows, and every other table is empty.
+  record with `verifyFreshMoneyWriterEpoch`. Status does the same when the
+  record sits in the given output directory (a link-free regular file of mode
+  0600; anything else there is refused) and refuses a mismatch; without it,
+  status checks only that the row is one well-formed epoch. Status reports
+  which check ran as `writerEpochCheck: "retained-record" | "form-only"`.
+  Freeze and permit hold zero rows, and every other table is empty.
 - A complete schema without its pin or its epoch row is an interrupted import:
   `--status` reports `dataReadback: "interrupted"` and quarantines it.
 - The apply record adds `moneyPreserved: { epochBindingDigest, shapeDigest }`

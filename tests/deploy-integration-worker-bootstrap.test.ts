@@ -403,6 +403,31 @@ describe("Takoserver integration Worker bootstrap", () => {
       expect(fixture.commands.some((command) => command.includes("--dry-run"))).toBe(false);
     }
   });
+
+  test("the fresh Money-preserved 0100 lineage is refused by apply and published status", async () => {
+    const preserved = {
+      ...v2Target0088,
+      takoformV2: {
+        ...v2Target0088.takoformV2,
+        storageLineage: "v2-0100-money-preserved" as const,
+      },
+    } satisfies DeployTarget;
+    const refusal =
+      "integration Worker bootstrap does not yet serve the fresh v2-0100-money-preserved lineage";
+    const fixture = bootstrapFixture({ target: preserved });
+    const error = await rejectedError(apply(fixture));
+    expect(error).toBeInstanceOf(DeployError);
+    expect(error).toHaveProperty("phase", "preflight");
+    expect(error.message).toBe(refusal);
+    expect(fixture.lifecycleCalls).toHaveLength(0);
+    expect(fixture.secretReads).toBe(0);
+    expect(fixture.commands.some((command) => command.includes("--dry-run"))).toBe(false);
+    // Status of an already published Worker reads the same selected artifact;
+    // status is value-free, so the refusal surfaces as drift, never ready.
+    const published = bootstrapFixture({ target: preserved, initiallyPublished: true });
+    expect(await readPublishedStatus(published)).toMatchObject({ state: "drift", ready: false });
+    expect(published.lifecycleCalls).toHaveLength(0);
+  });
 });
 
 interface FixtureOptions {

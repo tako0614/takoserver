@@ -3,7 +3,6 @@ import { RemoteD1 } from "./d1.ts";
 import { DeployError } from "./errors.ts";
 import {
   type FreshMoneyWriterEpochBinding,
-  type FreshMoneyWriterEpochRecord,
   verifyFreshMoneyWriterEpoch,
 } from "./money-fresh-writer-epoch.ts";
 import { type CommandResult, runCommand, wranglerCommand } from "./process.ts";
@@ -72,7 +71,8 @@ export interface FreshV2DataReadbackOptions {
    * which never holds the record) the row must only be one well-formed epoch.
    */
   readonly moneyWriterEpoch?: {
-    readonly record: FreshMoneyWriterEpochRecord;
+    /** Untrusted until `verifyFreshMoneyWriterEpoch` reproduces it for `binding`. */
+    readonly record: unknown;
     readonly binding: FreshMoneyWriterEpochBinding;
   };
 }
@@ -88,6 +88,8 @@ export const FRESH_V2_UNPINNED_0100 =
   "fresh v2-0100 D1 has its schema but no claimed Stripe realm pin";
 // The Money-preserved profile also holds its one fresh Writer epoch row.
 const FRESH_V2_MONEY_PRESERVED_SEED_TABLES = ["money_cutover_authorized_epoch"] as const;
+export const FRESH_V2_MONEY_WRITER_EPOCH_MISMATCH =
+  "fresh v2-0100-money-preserved D1 Writer epoch differs from its retained mint";
 export const FRESH_V2_INTERRUPTED_MONEY_PRESERVED =
   "fresh v2-0100-money-preserved D1 has its schema but no claimed realm pin or Writer epoch";
 const PINNED_AT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
@@ -154,6 +156,20 @@ export async function assertFreshV2DataReadback(
     ((readback.stripeRealm ?? []).length === 0 || (readback.authorizedEpoch ?? []).length === 0)
   )
     throw new DeployError(phase, FRESH_V2_INTERRUPTED_MONEY_PRESERVED);
+  // With a retained mint, a record that does not reproduce for this D1 or an
+  // epoch row other than that mint is refused, never reported as in use.
+  if (moneyPreserved && options.moneyWriterEpoch !== undefined) {
+    const record = options.moneyWriterEpoch.record;
+    try {
+      verifyFreshMoneyWriterEpoch(record, {
+        binding: options.moneyWriterEpoch.binding,
+        epoch: (record as { readonly epoch?: unknown } | null)?.epoch as string,
+        readbackRows: readback.authorizedEpoch ?? [],
+      });
+    } catch {
+      throw new DeployError(phase, FRESH_V2_MONEY_WRITER_EPOCH_MISMATCH);
+    }
+  }
   // A complete plain 0100 schema without its pin is an interrupted import,
   // never an in-use generation; say so before the generic refusal.
   if (servingSeeds && (readback.stripeRealm ?? []).length === 0)
@@ -184,7 +200,7 @@ export async function assertFreshV2DataReadback(
         },
       ) ||
         !matchesClaimedTestRealm(readback.stripeRealm ?? []))) ||
-    (moneyPreserved && !matchesAuthorizedEpoch(readback.authorizedEpoch ?? [], options)) ||
+    (moneyPreserved && !matchesAuthorizedEpochForm(readback.authorizedEpoch ?? [])) ||
     !matchesFreshV2Seed(
       readback.invocationEpoch,
       ["closed_at_ms", "epoch_id", "opened_at_ms", "singleton", "state"],
@@ -204,33 +220,18 @@ export async function assertFreshV2DataReadback(
 }
 
 /**
- * Exactly one authorized Writer epoch. With the retained mint, Financial's
- * verifier proves it is that D1's minted epoch; status only sees its form.
+ * Exactly one well-formed authorized Writer epoch. Which epoch it must be is
+ * proven separately by Financial's verifier whenever the mint is retained.
  */
-function matchesAuthorizedEpoch(
-  rows: readonly Record<string, unknown>[],
-  options: FreshV2DataReadbackOptions,
-): boolean {
+function matchesAuthorizedEpochForm(rows: readonly Record<string, unknown>[]): boolean {
   const row = rows.length === 1 ? rows[0] : undefined;
-  if (
-    row === undefined ||
-    JSON.stringify(Object.keys(row).sort()) !== JSON.stringify(["singleton", "writer_epoch"]) ||
-    row.singleton !== 1 ||
-    typeof row.writer_epoch !== "string" ||
-    !MONEY_CUTOVER_WRITER_EPOCH_PATTERN.test(row.writer_epoch)
-  )
-    return false;
-  if (options.moneyWriterEpoch === undefined) return true;
-  try {
-    verifyFreshMoneyWriterEpoch(options.moneyWriterEpoch.record, {
-      binding: options.moneyWriterEpoch.binding,
-      epoch: options.moneyWriterEpoch.record.epoch,
-      readbackRows: rows,
-    });
-    return true;
-  } catch {
-    return false;
-  }
+  return (
+    row !== undefined &&
+    JSON.stringify(Object.keys(row).sort()) === JSON.stringify(["singleton", "writer_epoch"]) &&
+    row.singleton === 1 &&
+    typeof row.writer_epoch === "string" &&
+    MONEY_CUTOVER_WRITER_EPOCH_PATTERN.test(row.writer_epoch)
+  );
 }
 
 /** Exactly the one pin the import claimed: test mode with a canonical instant. */

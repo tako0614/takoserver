@@ -205,6 +205,7 @@ test("fresh v2-0100-money-preserved generation starts the current Worker with it
       schemaReadback: "complete-0100",
       dataReadback: "empty-seeded",
       readyForApply: false,
+      writerEpochCheck: "form-only",
     });
     const generatedTarget = {
       ...target,
