@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -2542,7 +2542,23 @@ describe("fixed post94 ONE Financial DATA composer", () => {
           .all() as { name: string }[]
       ).map((row) => row.name),
     );
+  // The converted94 capture and the compiled DATA are identical for every test
+  // here, so they are built once; each test mutates its own copy of the
+  // captured database and gets its own copy of the compiled values.
+  let prepared: ReturnType<typeof prepareOnce> | undefined;
+  afterAll(async () => {
+    if (prepared !== undefined) (await prepared).f.close();
+  });
   const prepare = async () => {
+    prepared ??= prepareOnce();
+    const { f, image, ...values } = await prepared;
+    const database = Database.deserialize(image);
+    return {
+      ...structuredClone(values),
+      f: { database, nextWriterEpoch: f.nextWriterEpoch, close: () => database.close() },
+    };
+  };
+  const prepareOnce = async () => {
     const base = await converted94CaptureFixture(true);
     const f = { ...base, nextWriterEpoch: sha("ONE component-only next epoch") };
     try {
@@ -2571,6 +2587,7 @@ describe("fixed post94 ONE Financial DATA composer", () => {
       };
       return {
         f,
+        image: f.database.serialize(),
         facts,
         draft,
         root,
