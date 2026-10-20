@@ -66,9 +66,10 @@ async function fixture(name: string): Promise<{ runtime: Miniflare; env: WorkerE
     ],
   });
   const database = await runtime.getD1Database("STATE_DB");
-  for (const migration of MIGRATIONS) {
-    for (const statement of splitMigration(migration.sql)) await database.prepare(statement).run();
-  }
+  for (const migration of MIGRATIONS)
+    await database.batch(
+      splitMigration(migration.sql).map((statement) => database.prepare(statement)),
+    );
   const sql = createD1Sql(database);
   const now = new Date().toISOString();
   await claimFreshStripeModeRealm(sql, "test");

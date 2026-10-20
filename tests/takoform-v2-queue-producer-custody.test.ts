@@ -20,6 +20,7 @@ import {
 } from "../src/takoform-v2/forms/worker-specs.ts";
 import { V2_QUEUE_BACKEND_ID } from "../src/takoform-v2/worker-queue-backend.ts";
 import { authorizeV2QueueBatchSend, v2QueueId } from "../src/takoform-v2/worker-queue-delivery.ts";
+import { migratedDatabase } from "./helpers/migrated-database.ts";
 
 const TARGET = "v2-queue-producer-custody";
 const QUEUE = "producer-queue";
@@ -343,9 +344,8 @@ function insertSourceInvocation(
 }
 
 test("Queue handler batch admits into its binding only while exact 0083 and 0082 source are current", async () => {
-  const db = new Database(":memory:");
+  const db = migratedDatabase();
   try {
-    for (const migration of MIGRATIONS) db.exec(migration.sql);
     seedProducerGraph(db);
     const sourceQueueBatch = await seedAuthorizedQueueBatch(db);
     const raw = createSqliteSql(db);
@@ -463,9 +463,8 @@ test("Queue handler batch admits into its binding only while exact 0083 and 0082
 });
 
 test("Queue source cannot pair a current batch with an older same-spec Version operation", async () => {
-  const db = new Database(":memory:");
+  const db = migratedDatabase();
   try {
-    for (const migration of MIGRATIONS) db.exec(migration.sql);
     seedProducerGraph(db);
     const currentOperation = completeSameSpecVersionUpdate(db);
     const sourceQueueBatch = await seedAuthorizedQueueBatch(db);
@@ -491,9 +490,8 @@ test("Queue source cannot pair a current batch with an older same-spec Version o
 });
 
 test("Queue source incarnation Operation must be the accepted current Version Operation", async () => {
-  const db = new Database(":memory:");
+  const db = migratedDatabase();
   try {
-    for (const migration of MIGRATIONS) db.exec(migration.sql);
     seedProducerGraph(db);
     const sourceQueueBatch = await seedAuthorizedQueueBatch(db, "unrelated-incarnation-op");
     const custody = createQueueCustody({ sql: createSqliteSql(db) });
@@ -515,9 +513,8 @@ test("Queue source incarnation Operation must be the accepted current Version Op
 });
 
 test("v2 producer admission is atomic with live Queue and sealed Version reference", async () => {
-  const db = new Database(":memory:");
+  const db = migratedDatabase();
   try {
-    for (const migration of MIGRATIONS) db.exec(migration.sql);
     seedProducerGraph(db);
     const raw = createSqliteSql(db);
     let raceDelete = false;
@@ -675,9 +672,8 @@ test("v2 producer admission is atomic with live Queue and sealed Version referen
 });
 
 test("v2 producer admission refuses an exact source invocation retired before the SQLite batch", async () => {
-  const db = new Database(":memory:");
+  const db = migratedDatabase();
   try {
-    for (const migration of MIGRATIONS) db.exec(migration.sql);
     seedProducerGraph(db);
     const invocationId = "source-invocation-001";
     const custodyToken = "source-custody-token-001";
@@ -738,9 +734,8 @@ test("v2 producer admission refuses an exact source invocation retired before th
 });
 
 test("v2 source admission rejects malformed, foreign, stale and terminal identities without writes", async () => {
-  const db = new Database(":memory:");
+  const db = migratedDatabase();
   try {
-    for (const migration of MIGRATIONS) db.exec(migration.sql);
     seedProducerGraph(db);
     const sourceInvocation = {
       invocationId: "source-live",

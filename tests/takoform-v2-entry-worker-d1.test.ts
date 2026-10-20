@@ -88,11 +88,10 @@ test("normal Worker entry exposes only configured artifact Forms through authent
   const runtime = await entryRuntime(config, "artifact-entry-bindings-test");
   try {
     const database = await runtime.getD1Database("STATE_DB");
-    for (const migration of MIGRATIONS) {
-      for (const statement of splitMigration(migration.sql)) {
-        await database.prepare(statement).run();
-      }
-    }
+    for (const migration of MIGRATIONS)
+      await database.batch(
+        splitMigration(migration.sql).map((statement) => database.prepare(statement)),
+      );
     const sql = createD1Sql(database);
     await claimFreshStripeModeRealm(sql, "test");
     const now = new Date().toISOString();
@@ -263,11 +262,10 @@ test("configured artifact Forms refuse incomplete 0075 or 0081 before accepting 
       ({ name }) => name === "0075_v2_artifact_progress.sql",
     );
     if (progressIndex < 0) throw new Error("missing 0075 fixture migration");
-    for (const migration of MIGRATIONS.slice(0, progressIndex)) {
-      for (const statement of splitMigration(migration.sql)) {
-        await database.prepare(statement).run();
-      }
-    }
+    for (const migration of MIGRATIONS.slice(0, progressIndex))
+      await database.batch(
+        splitMigration(migration.sql).map((statement) => database.prepare(statement)),
+      );
     const sql = createD1Sql(database);
     const now = new Date().toISOString();
     await sql.run(
@@ -347,11 +345,10 @@ test("configured artifact Forms refuse incomplete 0075 or 0081 before accepting 
     }
     const privateIndex = MIGRATIONS.findIndex(({ name }) => name === "0081_v2_private_inputs.sql");
     if (privateIndex <= progressIndex) throw new Error("missing 0081 fixture migration");
-    for (const migration of MIGRATIONS.slice(progressIndex + 1, privateIndex)) {
-      for (const statement of splitMigration(migration.sql)) {
-        await database.prepare(statement).run();
-      }
-    }
+    for (const migration of MIGRATIONS.slice(progressIndex + 1, privateIndex))
+      await database.batch(
+        splitMigration(migration.sql).map((statement) => database.prepare(statement)),
+      );
     await refuseBeforeAcceptance();
     const privateStatements = splitMigration(MIGRATIONS[privateIndex]?.sql ?? "");
     for (const statement of privateStatements.slice(0, 5)) {
@@ -375,11 +372,10 @@ test("configured artifact Forms refuse incomplete 0075 or 0081 before accepting 
       await database.prepare(definition).run();
     }
     await refuseBeforeAcceptance();
-    for (const migration of MIGRATIONS.slice(privateIndex + 1)) {
-      for (const statement of splitMigration(migration.sql)) {
-        await database.prepare(statement).run();
-      }
-    }
+    for (const migration of MIGRATIONS.slice(privateIndex + 1))
+      await database.batch(
+        splitMigration(migration.sql).map((statement) => database.prepare(statement)),
+      );
     // Only the fully restored current fixture can qualify its fresh TEST realm.
     // The incomplete historical phases above remain unqualified and refusing.
     await claimFreshStripeModeRealm(sql, "test");
@@ -480,11 +476,10 @@ test("code-selected Worker entry source acquires a new StaticAssetBundle into D1
   });
   try {
     const database = await runtime.getD1Database("STATE_DB");
-    for (const migration of MIGRATIONS) {
-      for (const statement of splitMigration(migration.sql)) {
-        await database.prepare(statement).run();
-      }
-    }
+    for (const migration of MIGRATIONS)
+      await database.batch(
+        splitMigration(migration.sql).map((statement) => database.prepare(statement)),
+      );
     const sql = createD1Sql(database);
     await claimFreshStripeModeRealm(sql, "test");
     const now = new Date().toISOString();
@@ -558,11 +553,10 @@ test("ordinary Worker entry does not fetch an unheld public StaticAssetBundle UR
   );
   try {
     const database = await runtime.getD1Database("STATE_DB");
-    for (const migration of MIGRATIONS) {
-      for (const statement of splitMigration(migration.sql)) {
-        await database.prepare(statement).run();
-      }
-    }
+    for (const migration of MIGRATIONS)
+      await database.batch(
+        splitMigration(migration.sql).map((statement) => database.prepare(statement)),
+      );
     const sql = createD1Sql(database);
     await claimFreshStripeModeRealm(sql, "test");
     const now = new Date().toISOString();
@@ -636,11 +630,10 @@ test("private artifact hook failures have payload-free Worker startup refusals",
     });
     try {
       const database = await runtime.getD1Database("STATE_DB");
-      for (const migration of MIGRATIONS) {
-        for (const statement of splitMigration(migration.sql)) {
-          await database.prepare(statement).run();
-        }
-      }
+      for (const migration of MIGRATIONS)
+        await database.batch(
+          splitMigration(migration.sql).map((statement) => database.prepare(statement)),
+        );
       // Reach the artifact hook refusal, not an unrelated missing-realm refusal.
       await claimFreshStripeModeRealm(createD1Sql(database), "test");
       const response = await runtime.dispatchFetch(

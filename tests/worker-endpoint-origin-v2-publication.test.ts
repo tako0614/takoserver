@@ -9,7 +9,6 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { canonicalJson } from "../src/json.ts";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { type JsonObject, type Sql, SqlError, type SqlStatement } from "../src/ports.ts";
 import {
   createSharedAppLedger,
@@ -42,6 +41,7 @@ import {
   type WorkerEndpointOriginV2FormRoutePreparation,
   type WorkerEndpointOriginV2PublicationPreparation,
 } from "../src/worker-endpoint-origin-v2-acceptance.ts";
+import { writeMigrateSqliteFile } from "./helpers/migrated-database.ts";
 
 const FORM = "https://forms.example.test/PublicationEndpoint/1.0.0/";
 const WORKER = "https://forms.example.test/PublicationWorker/1.0.0/";
@@ -107,8 +107,8 @@ function sharedFixtureSchema(db: Database): void {
 async function fixture() {
   const directory = mkdtempSync(join(tmpdir(), "origin-publication-"));
   const path = join(directory, "state.sqlite");
+  writeMigrateSqliteFile(path);
   let db = new Database(path);
-  migrateSqlite(db);
   sharedFixtureSchema(db);
   let raw = createSqliteSql(db);
   let loseAck = false;
@@ -1518,8 +1518,8 @@ function formRouteFixtureSchema(db: Database): void {
 async function formRouteFixture(releaseCount = 2, adopted = true) {
   const directory = mkdtempSync(join(tmpdir(), "form-route-receiver-"));
   const path = join(directory, "state.sqlite");
+  writeMigrateSqliteFile(path);
   let db = new Database(path);
-  migrateSqlite(db);
   formRouteFixtureSchema(db);
   let raw = createSqliteSql(db);
   let loseAck = false;

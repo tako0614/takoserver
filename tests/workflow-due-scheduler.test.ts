@@ -1,7 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { Sql } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createWorkflowDueScheduler } from "../src/workflow-due-scheduler.ts";
@@ -12,6 +11,7 @@ import {
 } from "../src/workflow-execution.ts";
 import { createWorkflowInstances, type WorkflowScope } from "../src/workflow-instances.ts";
 import { DURABLE_WORKFLOW_FORM_URL } from "../src/workflow-v2-resource-authority.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const START = Date.UTC(2026, 0, 1);
 const SCOPE = { tenantId: "tenant", workflowResourceUid: "workflow" };
@@ -66,8 +66,7 @@ function fixture() {
 }
 
 function v2Fixture() {
-  const db = new Database(":memory:");
-  migrateSqlite(db);
+  const db = migrateSqliteDatabase();
   databases.push(db);
   const sql = createSqliteSql(db);
   let timestamp = START;

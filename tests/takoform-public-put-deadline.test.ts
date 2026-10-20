@@ -1,11 +1,10 @@
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 import type { InstalledTakoformForm, TakoformResourceDriver } from "../src/takoform/types.ts";
 import { createStaticStableTestTakoformHost } from "./helpers/historical-takoform-host.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const LANE = "/apis/forms.takoform.com/v1";
 const TOKEN = "Bearer bounded-deadline-test";
@@ -35,8 +34,7 @@ const form: InstalledTakoformForm = {
 test("a short public PUT caller can time out before the Host operation and recover by exact replay", async () => {
   expect(CALLER_TIMEOUT_MS * 15).toBe(INLINE_BUDGET_MS * 10);
 
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   const memory = new InMemoryTakoformResourceDriver();
   const gates = [deferred<void>(), deferred<void>()];
   const entered = [deferred<void>(), deferred<void>()];

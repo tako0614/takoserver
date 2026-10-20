@@ -1,6 +1,4 @@
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject, Sql, SqlStatement } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
@@ -12,6 +10,7 @@ import {
   type V2PreparedHostAcceptance,
 } from "../src/takoform-v2/host-acceptance.ts";
 import type { V2Backend, V2Form } from "../src/takoform-v2/types.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 // A synthetic internal issuer proves the neutral Core seam only. It is not
 // Container authority, a native retirement proof, or an App composition test.
@@ -35,8 +34,7 @@ type Mode =
 function fixture(
   options: { issuer?: boolean; deleteMethod?: boolean; mode?: Mode; race?: boolean } = {},
 ) {
-  const db = new Database(":memory:");
-  migrateSqlite(db);
+  const db = migrateSqliteDatabase();
   db.exec(`CREATE TABLE neutral_delete_marker (
     operation_id TEXT PRIMARY KEY,
     resource_uid TEXT NOT NULL,

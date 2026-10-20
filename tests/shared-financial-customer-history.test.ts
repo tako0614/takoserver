@@ -28,6 +28,7 @@ import {
 } from "../src/shared-financial-customer-history.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { installFinancial0104Fences } from "./helpers/financial-0104-fenced.ts";
+import { migratedDatabase, writeMigratedDatabaseFile } from "./helpers/migrated-database.ts";
 
 const ddl = readFileSync(
   new URL("./fixtures/shared-financial-customer-history-component-schema.sql", import.meta.url),
@@ -131,9 +132,9 @@ function fixture(file = false, fenced = true) {
   const temporaryDirectory = file ? mkdtempSync(join(tmpdir(), "takoserver-history-h0-")) : null;
   if (temporaryDirectory) ownTemporaryDirectories.add(temporaryDirectory);
   const filename = temporaryDirectory ? join(temporaryDirectory, "history.sqlite") : ":memory:";
-  const db = new Database(filename),
+  if (temporaryDirectory) writeMigratedDatabaseFile(filename);
+  const db = temporaryDirectory ? new Database(filename) : migratedDatabase(),
     raw = createSqliteSql(db);
-  for (const m of MIGRATIONS) db.exec(m.sql);
   expect(MIGRATIONS).toHaveLength(100);
   db.exec(MONEY_CUTOVER_AUTHORIZED_EPOCH_DDL);
   db.exec(MONEY_CUTOVER_FREEZE_DDL);

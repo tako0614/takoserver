@@ -1,7 +1,6 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
-import { MIGRATIONS } from "../src/db-schema.ts";
 import { verifyHostedBillingFinancialRealm } from "../src/hosted-billing-realm.ts";
 import {
   createMoneyCutoverSql,
@@ -45,6 +44,7 @@ import {
   permitFramed,
   withMoneyFencesLifted,
 } from "./helpers/financial-0104-fenced.ts";
+import { migratedDatabase } from "./helpers/migrated-database.ts";
 
 const AT = "2026-10-15T00:00:00.000Z";
 const D = `sha256:${"a".repeat(64)}` as const,
@@ -110,8 +110,7 @@ function event(affectedRef = A): FinancialSourceEvent {
   };
 }
 async function fixture(options: { readonly unfenced?: boolean } = {}) {
-  const db = new Database(":memory:");
-  for (const m of MIGRATIONS) db.exec(m.sql);
+  const db = migratedDatabase();
   db.exec(
     readFileSync(
       new URL("./fixtures/shared-financial-source-component-schema.sql", import.meta.url),

@@ -4,7 +4,6 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { Sql, SqlParam } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
@@ -19,6 +18,7 @@ import {
   inspectV2WorkerNativeIdentityDomain,
   v2WorkerNativeIdentityDomainReady,
 } from "../src/takoform-v2/worker-native-identity-schema.ts";
+import { writeMigrateSqliteFile } from "./helpers/migrated-database.ts";
 
 const DIGEST = `sha256:${"a".repeat(64)}` as const;
 // Static expansion of the unchanged grant at public 83e031be/94f60b3f,
@@ -29,8 +29,8 @@ const GRANT_INSERT = "INSERT INTO tf_v2_worker_native_effects";
 async function fixture() {
   const directory = mkdtempSync(join(tmpdir(), "v2-native-effect-"));
   const path = join(directory, "db.sqlite");
+  writeMigrateSqliteFile(path);
   const db = new Database(path);
-  migrateSqlite(db);
   const sql = createSqliteSql(db);
   let nowMs = Date.now();
   const now = () => new Date(nowMs);

@@ -6,7 +6,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { canonicalJson } from "../src/json.ts";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { type JsonObject, type Sql, SqlError, type SqlStatement } from "../src/ports.ts";
 import {
   createSharedAppLedger,
@@ -39,6 +38,7 @@ import {
   createWorkerEndpointOriginV2FormRouteAcceptance,
   createWorkerEndpointOriginV2FormRoutePublication,
 } from "../src/worker-endpoint-origin-v2-acceptance.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const FORM = "https://forms.example.test/BindingAcceptance/1.0.0/";
 const BACKEND = "origin-binding-fixture";
@@ -163,8 +163,7 @@ async function fixture(
     typed?: boolean;
   } = {},
 ) {
-  const db = new Database(":memory:");
-  migrateSqlite(db);
+  const db = migrateSqliteDatabase();
   const raw = createSqliteSql(db);
   sharedSchema(db, options.bindings !== false, options.typed);
   let blocked = false;
@@ -1294,8 +1293,7 @@ test("accepted unsorted two-release Deployment publishes the canonical vector wi
   // script/digest/ETag markers are recorded by real0074 custody, not a witness.
   const nowMs = Date.now();
   const at = new Date(nowMs).toISOString();
-  const db = new Database(":memory:");
-  migrateSqlite(db);
+  const db = migrateSqliteDatabase();
   sharedSchema(db, true, true);
   const HISTORY = "shared_app_staging_route_commands";
   db.exec(`CREATE TABLE ${HISTORY} (

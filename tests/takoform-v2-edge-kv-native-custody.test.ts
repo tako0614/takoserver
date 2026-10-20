@@ -4,7 +4,6 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { Sql } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createV2EdgeKvNativeCustody } from "../src/takoform-v2/edge-kv-native-custody.ts";
@@ -12,6 +11,7 @@ import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { EDGE_KV_NAMESPACE_FORM_URL } from "../src/takoform-v2/forms/edge-kv-namespace.ts";
 import { createV2Store } from "../src/takoform-v2/store.ts";
 import type { V2Execution } from "../src/takoform-v2/types.ts";
+import { writeMigrateSqliteFile } from "./helpers/migrated-database.ts";
 
 const TITLE = "takos-owned-kv-a";
 const ID = "a".repeat(32);
@@ -20,8 +20,8 @@ const DIGEST = `sha256:${"b".repeat(64)}` as const;
 async function fixture() {
   const directory = mkdtempSync(join(tmpdir(), "v2-edge-kv-native-"));
   const path = join(directory, "state.sqlite");
+  writeMigrateSqliteFile(path);
   const db = new Database(path);
-  migrateSqlite(db);
   const sql = createSqliteSql(db);
   let nowMs = Date.now();
   const now = () => new Date(nowMs);

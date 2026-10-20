@@ -1,7 +1,5 @@
-import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { parseBillingConfig } from "../src/billing-config.ts";
-import { MIGRATIONS } from "../src/db-schema.ts";
 import { verifyHostedBillingFinancialRealm } from "../src/hosted-billing-realm.ts";
 import { createLedger } from "../src/ledger.ts";
 import {
@@ -16,6 +14,7 @@ import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
 import { createStripeBillingStore } from "../src/stripe-billing-store.ts";
 import { createStripeOnDemand } from "../src/stripe-on-demand.ts";
+import { migratedDatabase } from "./helpers/migrated-database.ts";
 
 const ORG = "org_fresh_admission";
 const CUSTOMER = "cus_fresh_admission";
@@ -44,8 +43,7 @@ const USAGE: UsageInput = {
 };
 
 async function fixture() {
-  const db = new Database(":memory:");
-  for (const migration of MIGRATIONS) db.exec(migration.sql);
+  const db = migratedDatabase();
   const base = createSqliteSql(db);
   let at = AT;
   let afterPrepare: (() => Promise<void>) | undefined;

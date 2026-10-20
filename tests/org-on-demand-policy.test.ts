@@ -1,7 +1,6 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { parseBillingConfig } from "../src/billing-config.ts";
-import { MIGRATIONS } from "../src/db-schema.ts";
 import { verifyHostedBillingFinancialRealm } from "../src/hosted-billing-realm.ts";
 import { canonicalJson } from "../src/json.ts";
 import {
@@ -17,6 +16,7 @@ import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
 import { createStripeBillingStore } from "../src/stripe-billing-store.ts";
 import { createStripeOnDemand } from "../src/stripe-on-demand.ts";
 import { verifyStripeOnDemandCard } from "../src/stripe-on-demand-verification.ts";
+import { migratedDatabase } from "./helpers/migrated-database.ts";
 
 const AT = "2026-10-15T12:00:00.000Z";
 const ORG = "org_consent";
@@ -57,8 +57,7 @@ function deferred() {
 }
 
 async function fixture() {
-  const db = new Database(":memory:");
-  for (const migration of MIGRATIONS) db.exec(migration.sql);
+  const db = migratedDatabase();
   const base = createSqliteSql(db);
   let at = AT,
     cardAvailable = true,

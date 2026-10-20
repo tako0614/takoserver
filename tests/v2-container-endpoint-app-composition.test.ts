@@ -12,7 +12,6 @@ import { createAccounts } from "../src/auth.ts";
 import type { Offering } from "../src/catalog.ts";
 import { CONTAINER_CONTRACT as C, V2_CONTAINER_F2_FORM } from "../src/container-contract.ts";
 import { STABLE_PRODUCTION_TAKOFORM_CATALOG } from "../src/generated/takoform-stable-v1-catalog.ts";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { type Sql, SqlError, type SqlStatement } from "../src/ports.ts";
 import { FakeProvider } from "../src/providers/fake.ts";
@@ -29,6 +28,7 @@ import {
 } from "../src/takoform-v2/host-acceptance.ts";
 import type { V2Form } from "../src/takoform-v2/types.ts";
 import { createWorkerEndpointOriginV2Acceptance } from "../src/worker-endpoint-origin-v2-acceptance.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const ORIGIN = "https://api.app-origin-composition.test";
 const BASE = `${ORIGIN}/apis/forms.takoform.com/v2`;
@@ -122,8 +122,7 @@ async function fixture(
     containerOwnerSchema?: boolean;
   } = {},
 ) {
-  const db = new Database(":memory:");
-  migrateSqlite(db);
+  const db = migrateSqliteDatabase();
   const raw = createSqliteSql(db);
   if (options.containerOwnerSchema) await raw.batch(v2ContainerOwnerMigrationCandidate());
   if (options.shared !== false)

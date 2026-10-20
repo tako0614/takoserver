@@ -1,4 +1,3 @@
-import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
@@ -6,7 +5,6 @@ import { compilePricingAuthoring } from "../scripts/pricing/compile.ts";
 import { buildApp } from "../src/app.ts";
 import type { ExternalIdentityVerifier } from "../src/auth.ts";
 import { parseBillingConfig } from "../src/billing-config.ts";
-import { MIGRATIONS } from "../src/db-schema.ts";
 import { createLedger } from "../src/ledger.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { createOrgBilling } from "../src/org-billing.ts";
@@ -20,6 +18,7 @@ import { createStripeBilling } from "../src/stripe-billing.ts";
 import { createStripeBillingClient } from "../src/stripe-billing-client.ts";
 import { claimFreshStripeModeRealm, type StripeMode } from "../src/stripe-mode-realm.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
+import { migratedDatabase } from "./helpers/migrated-database.ts";
 import { TEST_TAKOFORM_V2_CONFIG } from "./helpers/takoform-v2-config.ts";
 
 const ORG = "org_billing_test";
@@ -487,8 +486,7 @@ async function fixture(
   now: () => Date = () => new Date(NOW),
   mode: StripeMode = "test",
 ) {
-  const database = new Database(":memory:");
-  for (const migration of MIGRATIONS) database.exec(migration.sql);
+  const database = migratedDatabase();
   const sql = createSqliteSql(database);
   const originalPricing = hostedPricing.hostedPlanTable.plans.some(
     (plan) => plan.planId === PLAN_KEY,

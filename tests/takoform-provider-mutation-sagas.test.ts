@@ -12,6 +12,7 @@ import {
 } from "../src/takoform/import-selection.ts";
 import { OPERATION_TTL_MILLISECONDS } from "../src/takoform/limits.ts";
 import { createTakoformStore, type ProviderMutationSaga } from "../src/takoform/store.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const saga: ProviderMutationSaga = {
   operationId: "op_execution_lease",
@@ -191,8 +192,7 @@ describe("provider mutation saga execution leases", () => {
   });
 
   test("binds one immutable apply selection and requires each recovery lease to verify it", async () => {
-    const database = new Database(":memory:");
-    migrateSqlite(database);
+    const database = migrateSqliteDatabase();
     let now = 1_000;
     const store = createTakoformStore(createSqliteSql(database), () => new Date(now));
     const selectedSaga = {
@@ -599,8 +599,7 @@ describe("provider mutation saga execution leases", () => {
   });
 
   test("refuses to dispatch a current apply before its selection is bound", async () => {
-    const database = new Database(":memory:");
-    migrateSqlite(database);
+    const database = migrateSqliteDatabase();
     let now = 1_000;
     const store = createTakoformStore(createSqliteSql(database), () => new Date(now));
     const historicalSaga = {
@@ -645,8 +644,7 @@ describe("provider mutation saga execution leases", () => {
   });
 
   test("only explicit whole-operation apply proof and the current lease retire an indeterminate create", async () => {
-    const database = new Database(":memory:");
-    migrateSqlite(database);
+    const database = migrateSqliteDatabase();
     let now = 1_000;
     const store = createTakoformStore(createSqliteSql(database), () => new Date(now));
     const identity = {
@@ -757,8 +755,7 @@ describe("provider mutation saga execution leases", () => {
     database.close();
   });
   test("fences concurrent and stale executors while preserving one idempotent receipt", async () => {
-    const database = new Database(":memory:");
-    migrateSqlite(database);
+    const database = migrateSqliteDatabase();
     let now = 1_000;
     const store = createTakoformStore(createSqliteSql(database), () => new Date(now));
     await store.acceptProviderMutationSaga(saga);
@@ -936,8 +933,7 @@ describe("provider mutation saga execution leases", () => {
   });
 
   test("a lease released before provider dispatch remains an initial execution", async () => {
-    const database = new Database(":memory:");
-    migrateSqlite(database);
+    const database = migrateSqliteDatabase();
     const store = createTakoformStore(createSqliteSql(database), () => new Date(1_000));
     await store.acceptProviderMutationSaga({
       ...saga,
@@ -1020,8 +1016,7 @@ describe("provider mutation saga execution leases", () => {
   });
 
   test("a post-dispatch plan cannot be abandoned back into an initial execution", async () => {
-    const database = new Database(":memory:");
-    migrateSqlite(database);
+    const database = migrateSqliteDatabase();
     const store = createTakoformStore(createSqliteSql(database), () => new Date(1_000));
     const postDispatchSaga: ProviderMutationSaga = {
       ...saga,
@@ -1084,8 +1079,7 @@ describe("provider mutation saga execution leases", () => {
   });
 
   test("only the current exact lease settles a closed definitive import outcome", async () => {
-    const database = new Database(":memory:");
-    migrateSqlite(database);
+    const database = migrateSqliteDatabase();
     let now = 1_000;
     const store = createTakoformStore(createSqliteSql(database), () => new Date(now));
     const staleImportSaga: ProviderMutationSaga = {
@@ -1196,8 +1190,7 @@ describe("provider mutation saga execution leases", () => {
   });
 
   test("persists an opaque provider handle and indeterminate outcome across recovery", async () => {
-    const database = new Database(":memory:");
-    migrateSqlite(database);
+    const database = migrateSqliteDatabase();
     let now = 1_000;
     const store = createTakoformStore(createSqliteSql(database), () => new Date(now));
     const recoverySaga: ProviderMutationSaga = {
@@ -1301,8 +1294,7 @@ describe("provider mutation saga execution leases", () => {
   });
 
   test("terminalizes a provider precondition failure without retaining a retryable plan", async () => {
-    const database = new Database(":memory:");
-    migrateSqlite(database);
+    const database = migrateSqliteDatabase();
     const store = createTakoformStore(createSqliteSql(database), () => new Date(1_000));
     for (const [suffix, terminalKind, terminalMode] of [
       ["wrong-kind", "apply", "initial"],

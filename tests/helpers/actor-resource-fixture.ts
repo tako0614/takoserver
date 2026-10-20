@@ -1,12 +1,12 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { createActorResourceGraphReader } from "../../src/actor-resource-graph.ts";
-import { MIGRATIONS } from "../../src/db-schema.ts";
 import type { Sql } from "../../src/ports.ts";
 import { createResourceDeploymentStore } from "../../src/resource-deployments.ts";
 import { createSqliteSql } from "../../src/sql-sqlite.ts";
 import { stableProductionTakoformCatalog } from "../../src/takoform/stable-production-catalog.ts";
 import { createTakoformStore } from "../../src/takoform/store.ts";
 import type { InstalledTakoformForm, TakoformStoredResource } from "../../src/takoform/types.ts";
+import { migratedDatabase } from "./migrated-database.ts";
 
 const forms = stableProductionTakoformCatalog().forms;
 function requiredForm(kind: string): InstalledTakoformForm {
@@ -85,8 +85,7 @@ export function insert(
 export function fixture(
   change?: (source: TakoformStoredResource, target: TakoformStoredResource) => void,
 ) {
-  const database = new Database(":memory:");
-  for (const migration of MIGRATIONS) database.exec(migration.sql);
+  const database = migratedDatabase();
   const source = resource(actorForm, "counter", scope.namespaceResourceUid);
   const target = resource(workerForm, "worker", "worker-uid");
   change?.(source, target);

@@ -4,9 +4,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEphemeralSql } from "../src/compat.ts";
-import { MIGRATIONS } from "../src/db-schema.ts";
 import { createQueueCustody } from "../src/queue-custody.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { writeMigratedDatabaseFile } from "./helpers/migrated-database.ts";
 
 test("trusted transport reopens exact registered claim without caller-held body or policy", async () => {
   const sql = createEphemeralSql();
@@ -85,9 +85,9 @@ test("D1-shaped BLOB arrays reject lossy or coercible message bytes", async () =
 test("registered pending batch and terminal ACK survive real SQLite handle reopen", async () => {
   const root = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), "v2-queue-reopen-"));
   const path = join(root, "queue.sqlite");
+  writeMigratedDatabaseFile(path);
   let database = new Database(path);
   try {
-    for (const migration of MIGRATIONS) database.exec(migration.sql);
     let sql = createSqliteSql(database);
     const queue = {
       queueId: "reopen-queue",

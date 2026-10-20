@@ -11,6 +11,7 @@ import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { createTakoformV2Host } from "../src/takoform-v2/host.ts";
 import type { V2PrivateInputCustody } from "../src/takoform-v2/private-inputs.ts";
 import { TakoformV2Error, type V2Backend, type V2Form } from "../src/takoform-v2/types.ts";
+import { migrateSqliteDatabase, writeMigrateSqliteFile } from "./helpers/migrated-database.ts";
 
 const FORM = "https://forms.example.test/SecretFixture/1.0.0";
 const BASE = "https://host.example/apis/forms.takoform.com/v2";
@@ -297,9 +298,9 @@ test("v2 private map survives lost HTTP response and SQLite reopen without publi
   const directory = mkdtempSync(join(tmpdir(), "v2-private-"));
   const path = join(directory, "state.sqlite");
   const custody = await keys();
+  writeMigrateSqliteFile(path);
   let database = new Database(path);
   try {
-    migrateSqlite(database);
     let runtime = fixture(database, custody);
     const discovery = await fetch(
       runtime.host,
@@ -379,8 +380,7 @@ test("v2 private map survives lost HTTP response and SQLite reopen without publi
 });
 
 test("expired unsent transfer waits, whole-map replenishment queues the same Operation, and executes once", async () => {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   const runtime = fixture(database, await keys());
   try {
     const accepted = await fetch(runtime.host, request("/resources", "POST", createBody(), KEY));
@@ -435,8 +435,7 @@ test("expired unsent transfer waits, whole-map replenishment queues the same Ope
 });
 
 test("comparison loss is unverifiable with known operationId; revoked/read-only authority cannot replenish", async () => {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   const runtime = fixture(database, await keys());
   try {
     const accepted = await fetch(runtime.host, request("/resources", "POST", createBody(), KEY));
@@ -485,8 +484,7 @@ test("comparison loss is unverifiable with known operationId; revoked/read-only 
 });
 
 test("dispatched unknown never becomes waiting_input and reconcile cannot receive plaintext", async () => {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   const runtime = fixture(database, await keys());
   try {
     runtime.setUnknown(true);
@@ -511,8 +509,7 @@ test("dispatched unknown never becomes waiting_input and reconcile cannot receiv
 });
 
 test("missing or replaced old comparison key refuses replay while retained rotation succeeds", async () => {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   const original = await keys();
   try {
     const first = fixture(database, original);
@@ -537,8 +534,7 @@ test("missing or replaced old comparison key refuses replay while retained rotat
 });
 
 test("missing transfer key before any dispatch waits unavailable, then replenishes with rotated custody", async () => {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   const original = await keys();
   try {
     const first = fixture(database, original);
@@ -572,8 +568,7 @@ test("missing transfer key before any dispatch waits unavailable, then replenish
 });
 
 test("concurrent copies of one private create key accept one UID, Operation, and custody row", async () => {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   const runtime = fixture(database, await keys());
   try {
     const [first, second] = await Promise.all([
@@ -596,8 +591,7 @@ test("concurrent copies of one private create key accept one UID, Operation, and
 });
 
 test("private field presence, even empty, is distinct from omission and requires explicit custody", async () => {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   try {
     const disabled = fixture(database);
     const empty = await fetch(disabled.host, request("/resources", "POST", createBody({}), KEY));
@@ -649,8 +643,7 @@ test("private field presence, even empty, is distinct from omission and requires
 });
 
 test("accepted-key replay precedes changed Host or Form private capability", async () => {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   const custody = await keys();
   try {
     const original = fixture(database, custody);
@@ -724,8 +717,7 @@ test("accepted-key replay precedes changed Host or Form private capability", asy
 });
 
 test("public HTTP replay stores bounded zero-secret Create and Update fingerprints", async () => {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   const runtime = fixture(database, undefined, undefined, undefined, false);
   try {
     const body = { form: FORM, space: "one", name: "plain", spec: { mode: "secret" } };
@@ -782,8 +774,7 @@ test("public HTTP replay stores bounded zero-secret Create and Update fingerprin
 });
 
 test("omitted private field preserves the pre-private v2 replay envelope in the digest", async () => {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   try {
     const engine = createTakoformV2Engine({
       sql: createSqliteSql(database),
@@ -925,8 +916,7 @@ test("omitted private field preserves the pre-private v2 replay envelope in the 
 });
 
 test("Form-sealed configured values commit with CREATE, survive transfer erasure, and preserve omitted UPDATE", async () => {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   const configuredKey = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
     "encrypt",
     "decrypt",
@@ -1010,8 +1000,7 @@ test("Form-sealed configured values commit with CREATE, survive transfer erasure
 });
 
 test("direct engine snapshots private maps before async Form policy mutates caller aliases", async () => {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   const createMap = { password: "create-original" };
   const updateMap = { password: "update-original" };
   const sent: Array<string | undefined> = [];
@@ -1110,8 +1099,7 @@ test("direct engine snapshots private maps before async Form policy mutates call
 });
 
 test("configured custody replacement during async UPDATE policy cannot pass acceptance CAS", async () => {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   const configuredKey = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, [
     "encrypt",
     "decrypt",

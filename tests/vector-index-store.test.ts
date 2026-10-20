@@ -1,6 +1,5 @@
-import { Database } from "bun:sqlite";
+import type { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { MIGRATIONS } from "../src/db-schema.ts";
 import type { Sql, SqlParam, SqlStatement } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import {
@@ -8,6 +7,7 @@ import {
   type VectorIndexConfigInput,
   type VectorIndexStore,
 } from "../src/vector-index-store.ts";
+import { migratedDatabase } from "./helpers/migrated-database.ts";
 
 const SCOPE = { tenantId: "tenant-a", resourceUid: "resource-a" } as const;
 const OTHER_TENANT_SCOPE = { tenantId: "tenant-b", resourceUid: "resource-a" } as const;
@@ -31,8 +31,7 @@ interface SqlTrace {
 }
 
 function fixture(): Fixture {
-  const database = new Database(":memory:");
-  for (const migration of MIGRATIONS) database.exec(migration.sql);
+  const database = migratedDatabase();
   const sql = createSqliteSql(database);
   return { database, sql, store: createVectorIndexStore({ sql }) };
 }

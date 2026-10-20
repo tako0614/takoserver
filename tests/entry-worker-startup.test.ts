@@ -3,7 +3,6 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { buildD1MigrationImport } from "../scripts/deploy/d1-migration-import.ts";
 import { readMigrationArtifact } from "../scripts/deploy/migrations.ts";
 import { buildMoneyCutoverImportSql } from "../scripts/deploy/schema-money-unit-cutover.ts";
-import { MIGRATIONS } from "../src/db-schema.ts";
 import worker, {
   createWorkerEntry,
   resolvePublicWorkerImplementationIdentity,
@@ -20,6 +19,7 @@ import {
   edgeSuppliesFixture,
   objectBucketSuppliesFixture,
 } from "./helpers/hosted-supply-fixtures.ts";
+import { migratedDatabase } from "./helpers/migrated-database.ts";
 
 const ORIGIN = "https://api.integration.example.test";
 const readyDatabase = databaseThrough(98);
@@ -29,8 +29,7 @@ readyDatabase.exec(
 afterAll(() => readyDatabase.close());
 
 function databaseThrough(count: number): Database {
-  const database = new Database(":memory:");
-  for (const migration of MIGRATIONS.slice(0, count)) database.exec(migration.sql);
+  const database = migratedDatabase(count);
   return database;
 }
 

@@ -1,6 +1,4 @@
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { Sql } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import {
@@ -20,6 +18,7 @@ import type {
   WorkerdActorIncarnationRetirement,
 } from "../src/workerd-runtime.ts";
 import type { WorkerdWorkerRuntimeOwner } from "../src/workerd-worker-runtime-owner.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const PRINCIPAL = "org:actor-authority-test";
 const SPACE = "production";
@@ -35,8 +34,7 @@ const DELETE_ENDPOINT = "bb97c884-96f6-4c88-a46e-50c359db3696";
 const RUNNING_DELETE_ENDPOINT = "2d690721-7c7c-42a4-9934-760c70f234ae";
 
 function fixture(options: { namespaceReferences?: boolean } = {}) {
-  const db = new Database(":memory:");
-  migrateSqlite(db);
+  const db = migrateSqliteDatabase();
   const sql = createSqliteSql(db);
   const insert = (input: {
     uid: string;

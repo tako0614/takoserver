@@ -1,18 +1,16 @@
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { MIGRATIONS } from "../src/db-schema.ts";
 import { createLedger, stripeRefundSource, type UsageWarningPreparer } from "../src/ledger.ts";
 import { createOrgLimitPolicy } from "../src/org-limit-policy.ts";
 import { orgUsageSummaryReadStatement } from "../src/org-usage-summary.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { migratedDatabase } from "./helpers/migrated-database.ts";
 
 const ORG = "org_ledger_warnings";
 const NOW = "2026-10-15T12:00:00.000Z";
 const ALLOWANCE = 1_500_000;
 
 async function fixture() {
-  const database = new Database(":memory:");
-  for (const migration of MIGRATIONS) database.exec(migration.sql);
+  const database = migratedDatabase();
   const sql = createSqliteSql(database);
   let instant = NOW;
   let clockCalls = 0;

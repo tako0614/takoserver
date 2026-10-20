@@ -27,6 +27,7 @@ import { createV2Store } from "../src/takoform-v2/store.ts";
 import type { V2Backend, V2Execution, V2Form } from "../src/takoform-v2/types.ts";
 import { createWorkerEndpointForm } from "../src/takoform-v2/worker-endpoint-backend.ts";
 import { createV2WorkerPublicationState } from "../src/takoform-v2/worker-publication-state.ts";
+import { writeMigrateSqliteFile } from "./helpers/migrated-database.ts";
 
 const BUNDLE_FORM_URL = "https://edge.forms.takoform.com/forms/WorkerBundle/0.2.0/";
 const ACCEPTANCE_ORDER_MIGRATION = "0077_v2_operation_acceptance_order.sql";
@@ -154,6 +155,7 @@ async function insertHistoricalResource(
 function fixture(distinctFormBackends = false, legacySchema = false) {
   const root = mkdtempSync(join(tmpdir(), "v2-publication-"));
   const path = join(root, "state.sqlite");
+  if (!legacySchema) writeMigrateSqliteFile(path);
   const db = new Database(path);
   if (legacySchema) {
     db.exec(`CREATE TABLE applied_migrations (
@@ -167,8 +169,6 @@ function fixture(distinctFormBackends = false, legacySchema = false) {
         migration.name,
       );
     }
-  } else {
-    migrateSqlite(db);
   }
   const sql = createSqliteSql(db);
   // Custody write guards use SQLite's real clock; advance from that same epoch.
@@ -1588,10 +1588,10 @@ test("graph read and stillCurrent refuse a claim whose lease expires during the 
 test("a live Deployment claim rematerializes settled Version bytes from verified custody after a fresh SQL handle", async () => {
   const root = mkdtempSync(join(tmpdir(), "v2-held-version-"));
   const path = join(root, "state.sqlite");
+  writeMigrateSqliteFile(path);
   const db = new Database(path);
   let reopened: Database | undefined;
   try {
-    migrateSqlite(db);
     const sql = createSqliteSql(db);
     let nowMs = Date.now();
     const now = () => new Date(nowMs++);

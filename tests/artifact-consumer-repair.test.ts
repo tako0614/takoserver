@@ -9,6 +9,7 @@ import {
 import { MIGRATIONS } from "../src/db-schema.ts";
 import type { Sql } from "../src/ports.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { migratedDatabase } from "./helpers/migrated-database.ts";
 
 const TENANT = "org_repair";
 const MANIFEST_A = `sha256:${"a".repeat(64)}` as const;
@@ -202,7 +203,7 @@ describe("artifact consumer repair", () => {
       });
       const plan = await repair.status(TENANT, deploymentId);
 
-      expect(
+      await expect(
         repair.apply({
           tenantId: TENANT,
           deploymentId,
@@ -230,7 +231,7 @@ describe("artifact consumer repair", () => {
       randomId: () => "guard_wrong_plan",
     });
 
-    expect(
+    await expect(
       repair.apply({
         tenantId: TENANT,
         deploymentId: "dep_wrong_plan",
@@ -266,7 +267,7 @@ describe("artifact consumer repair", () => {
       randomId: () => "guard_receipt_unavailable",
     });
 
-    expect(
+    await expect(
       repair.apply({
         tenantId: TENANT,
         deploymentId: "dep_receipt_unavailable",
@@ -293,7 +294,7 @@ describe("artifact consumer repair", () => {
     });
     const plan = await repair.status(TENANT, "dep_foreign_digest");
 
-    expect(
+    await expect(
       repair.apply({
         tenantId: TENANT,
         deploymentId: "dep_foreign_digest",
@@ -333,7 +334,7 @@ describe("artifact consumer repair", () => {
         path: "retained-closed",
         action: "verify-native-absence",
       });
-      expect(
+      await expect(
         repair.apply({
           tenantId: TENANT,
           deploymentId,
@@ -605,7 +606,7 @@ describe("artifact consumer repair", () => {
     });
     const plan = await repair.status(TENANT, "dep_active_identified_race");
 
-    expect(
+    await expect(
       repair.apply({
         tenantId: TENANT,
         deploymentId: "dep_active_identified_race",
@@ -683,7 +684,7 @@ describe("artifact consumer repair", () => {
       const plan = await repair.status(TENANT, deploymentId);
       expect(plan).toMatchObject({ state: "actionable", candidateManifestCount: 0 });
 
-      expect(
+      await expect(
         repair.apply({
           tenantId: TENANT,
           deploymentId,
@@ -713,7 +714,7 @@ describe("artifact consumer repair", () => {
       });
       const plan = await repair.status(TENANT, deploymentId);
 
-      expect(
+      await expect(
         repair.apply({
           tenantId: TENANT,
           deploymentId,
@@ -742,7 +743,7 @@ describe("artifact consumer repair", () => {
       randomId: () => "guard_active_absent",
     });
     const plan = await repair.status(TENANT, "dep_active_absent");
-    expect(
+    await expect(
       repair.apply({
         tenantId: TENANT,
         deploymentId: "dep_active_absent",
@@ -804,7 +805,7 @@ describe("artifact consumer repair", () => {
     });
     const plan = await repair.status(TENANT, "dep_deleting");
     expect(plan).toMatchObject({ state: "blocked", blocker: "artifact_delete_in_progress" });
-    expect(
+    await expect(
       repair.apply({
         tenantId: TENANT,
         deploymentId: "dep_deleting",
@@ -1138,7 +1139,7 @@ describe("artifact consumer repair", () => {
         randomId: () => `guard_drift_${index}`,
       });
       const plan = await repair.status(TENANT, deploymentId);
-      expect(
+      await expect(
         repair.apply({
           tenantId: TENANT,
           deploymentId,
@@ -1192,7 +1193,7 @@ describe("artifact consumer repair", () => {
       randomId: () => "guard_concurrent_cas",
     });
     const plan = await repair.status(TENANT, "dep_cas");
-    expect(
+    await expect(
       repair.apply({
         tenantId: TENANT,
         deploymentId: "dep_cas",
@@ -1223,7 +1224,7 @@ describe("artifact consumer repair", () => {
     });
     const plan = await repair.status(TENANT, "dep_missing_trigger");
 
-    expect(
+    await expect(
       repair.apply({
         tenantId: TENANT,
         deploymentId: "dep_missing_trigger",
@@ -1372,7 +1373,7 @@ describe("artifact consumer repair", () => {
     });
     const secondPlan = await repair.status(TENANT, "dep_idempotency_second");
 
-    expect(
+    await expect(
       repair.apply({
         tenantId: TENANT,
         deploymentId: "dep_idempotency_second",
@@ -1546,8 +1547,7 @@ describe("artifact consumer repair", () => {
 });
 
 function databaseWithRepairMigration(): Database {
-  const database = new Database(":memory:");
-  for (const migration of MIGRATIONS) database.exec(migration.sql);
+  const database = migratedDatabase();
   return database;
 }
 

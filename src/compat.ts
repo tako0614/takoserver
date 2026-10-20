@@ -27,10 +27,20 @@ import type {
  * Workers bundle; the import gate enforces that.
  */
 
+// The migrated schema is the same for every ephemeral database, so the chain
+// runs once per process and each call opens its own private copy of it. No
+// migration inserts time- or random-dependent rows, and connection settings are
+// applied again by createSqliteSql.
+let migratedImage: Uint8Array | undefined;
+
 export function createEphemeralSql(): Sql {
-  const database = new Database(":memory:");
-  for (const migration of MIGRATIONS) database.exec(migration.sql);
-  return createSqliteSql(database);
+  if (migratedImage === undefined) {
+    const database = new Database(":memory:");
+    for (const migration of MIGRATIONS) database.exec(migration.sql);
+    migratedImage = database.serialize();
+    database.close();
+  }
+  return createSqliteSql(Database.deserialize(migratedImage));
 }
 
 export interface EphemeralTakoformHostOptions {

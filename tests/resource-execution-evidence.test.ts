@@ -2,7 +2,6 @@ import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import type { Accounts } from "../src/auth.ts";
 import { createControlRoutes, type ResourceInventory } from "../src/control.ts";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { Sql, SqlStatement } from "../src/ports.ts";
 import { createResourceDeploymentStore } from "../src/resource-deployments.ts";
 import { RESOURCE_EXECUTION_EVIDENCE_FORMAT } from "../src/resource-execution-evidence.ts";
@@ -18,6 +17,7 @@ import type {
   TakoformStoredResource,
   TakoformV1Alpha3FormRef,
 } from "../src/takoform/types.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const TENANT_ID = "org_evidence";
 const RESOURCE_UID = "uid_resource_evidence";
@@ -36,8 +36,7 @@ const ADDRESS = {
 } as const;
 
 function databaseWithEvidenceMigration(): Database {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   const table = database
     .query("SELECT 1 AS found FROM sqlite_master WHERE type = 'table' AND name = ?")
     .get("tf_resource_execution_evidence");

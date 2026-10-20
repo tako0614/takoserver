@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { MIGRATIONS } from "../src/db-schema.ts";
 import { migrateSqlite } from "../src/migrate-sqlite.ts";
+import { migratedDatabase as migratedCopy } from "./helpers/migrated-database.ts";
 
 const MIGRATION = "0057_cloudflare_managed_worker_version_execution_material.sql";
 const PREDECESSOR = "0056_vector_index_storage.sql";
@@ -229,8 +230,7 @@ function preservedRows(database: Database): readonly unknown[] {
 test("0057 is additive and creates only the receipt-coupled execution-material schema", () => {
   const index = migrationIndex();
   expect(MIGRATIONS[index - 1]?.name).toBe(PREDECESSOR);
-  const database = new Database(":memory:");
-  for (const migration of MIGRATIONS.slice(0, index)) database.exec(migration.sql);
+  const database = migratedCopy(index);
   insertReceipt(database, { marked: false, resourceUid: "preserved-version" });
 
   database.exec(MIGRATIONS[index]?.sql ?? "");
@@ -610,8 +610,7 @@ function migrationIndex(): number {
 }
 
 function migratedDatabase(): Database {
-  const database = new Database(":memory:");
-  for (const migration of MIGRATIONS) database.exec(migration.sql);
+  const database = migratedCopy();
   database.exec("PRAGMA foreign_keys = ON");
   return database;
 }

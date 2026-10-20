@@ -1,11 +1,10 @@
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { isV2FormUrl, parseV2BaseUrl } from "../src/takoform-v2/identity.ts";
 import { createTakoformV2Routes } from "../src/takoform-v2/routes.ts";
 import type { V2Backend, V2Form } from "../src/takoform-v2/types.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const FIXTURE_FORM = "https://Forms.Example/fixture-only/key-value/1.0.0";
 const BASE_URL = "https://host.example/custom/takoform-v2";
@@ -44,8 +43,7 @@ function fixtureBackend() {
 }
 
 function setup() {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   const { backend, calls } = fixtureBackend();
   let fixtureNow = Date.now();
   const fixtureForm: V2Form = {

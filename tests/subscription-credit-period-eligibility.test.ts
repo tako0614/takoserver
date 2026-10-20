@@ -18,6 +18,7 @@ import {
 } from "../src/shared-hosted-pricing.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { type BillingGrant, createStripeBillingStore } from "../src/stripe-billing-store.ts";
+import { migratedDatabase } from "./helpers/migrated-database.ts";
 
 const BEFORE = "2026-10-14T12:00:00.000Z";
 const START = "2026-11-01T00:00:00.000Z";
@@ -69,8 +70,7 @@ function canonicalConfig() {
 }
 
 async function fixture() {
-  const db = new Database(":memory:");
-  for (const migration of MIGRATIONS) db.exec(migration.sql);
+  const db = migratedDatabase();
   const sql = createSqliteSql(db);
   let time = START;
   const clock = () => new Date(time);

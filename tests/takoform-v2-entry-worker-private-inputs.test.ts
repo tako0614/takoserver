@@ -102,9 +102,10 @@ async function runtimeWithKey(
 
 async function seed(runtime: Miniflare): Promise<void> {
   const database = await runtime.getD1Database("STATE_DB");
-  for (const migration of MIGRATIONS) {
-    for (const statement of splitMigration(migration.sql)) await database.prepare(statement).run();
-  }
+  for (const migration of MIGRATIONS)
+    await database.batch(
+      splitMigration(migration.sql).map((statement) => database.prepare(statement)),
+    );
   const sql = createD1Sql(database);
   await claimFreshStripeModeRealm(sql, "test");
   const now = new Date().toISOString();
@@ -217,7 +218,10 @@ test("real Worker entry admits private inputs only with operator keys and truste
 }, 120_000);
 
 test("malformed private-input policy refuses Worker startup even alongside a valid private Form", async () => {
-  for (const variant of ["null", "false", "zero", "empty"]) {
+  // The engine refuses every malformed policy value (null, false, 0, "") in
+  // takoform-v2-private-inputs.test.ts. This entry-level case keeps one value
+  // to prove the Worker turns that refusal into a secret-free 503.
+  for (const variant of ["null"]) {
     const runtime = await runtimeWithKey(
       `v2-private-entry-malformed-${variant}`,
       JSON.stringify({ current: { id: "fixture-a", key: KEY_A } }),

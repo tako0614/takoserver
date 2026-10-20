@@ -1,6 +1,5 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { Sql } from "../src/ports.ts";
 import {
   cancelQueueReservationBeforeSend,
@@ -8,6 +7,7 @@ import {
   SELFHOST_QUEUE_BOOT_REFUSAL_QUERY,
 } from "../src/selfhost-v2-queue-cancel.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 /**
  * A reservation that was provably never sent is refunded by Core's
@@ -287,8 +287,7 @@ test("Host start refuses each unsent reservation and stops at the first refusal 
 
 test("the Host start scan stays an index search over Consumers, with and without statistics", async () => {
   const seeded = (): Database => {
-    const database = new Database(":memory:");
-    migrateSqlite(database);
+    const database = migrateSqliteDatabase();
     // Direct rows only: the guards that admit them are not under test here.
     for (const { name } of database
       .query(
@@ -382,8 +381,7 @@ test("the Host start scan stays an index search over Consumers, with and without
 });
 
 test("a missing open-Consumer index refuses the Host start scan instead of walking history", async () => {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   database.exec("DROP INDEX queue_v2_batch_executions_open_consumer");
   await expect(
     refuseQueueReservationsBeforeFirstDelivery({ sql: createSqliteSql(database) }),

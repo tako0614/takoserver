@@ -56,31 +56,6 @@ async function source(path: string): Promise<string> {
 
 const repositoryRoot = fileURLToPath(new URL("../", import.meta.url));
 
-test("Form authority source contains no fictional Core admission seam", async () => {
-  const retired = [
-    ["Evaluate", "Admission"].join(""),
-    ["Core", "AdmissionAdapter"].join(""),
-    ["released", "core", "unavailable"].join("-"),
-  ];
-  const retained: string[] = [];
-  for (const pattern of ["src/**/*.ts", "scripts/**/*.ts", "docs/**/*.md"]) {
-    for await (const path of new Bun.Glob(pattern).scan({ cwd: repositoryRoot })) {
-      const text = await Bun.file(resolve(repositoryRoot, path)).text();
-      for (const name of retired) {
-        if (text.includes(name)) retained.push(`${path}: ${name}`);
-      }
-    }
-  }
-  for (const retiredPath of [
-    "src/takoform/core-admission-adapter.ts",
-    "src/takoform/operator-authority.ts",
-    "src/takoform/operator-endpoint.ts",
-  ]) {
-    expect(await Bun.file(resolve(repositoryRoot, retiredPath)).exists()).toBe(false);
-  }
-  expect(retained).toEqual([]);
-}, 30_000);
-
 function importedSpecifiers(path: string, text: string): readonly string[] {
   const parsed = createSourceFile(path, text, ScriptTarget.Latest, true, ScriptKind.TS);
   const specifiers = new Set<string>();

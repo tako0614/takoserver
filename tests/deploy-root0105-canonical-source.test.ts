@@ -128,14 +128,32 @@ function state(database: Database, local: readonly string[]) {
 const count = (database: Database, table: string) =>
   database.query<{ n: number }, []>(`SELECT count(*) AS n FROM ${table}`).get()?.n ?? -1;
 
+// Each source root regenerates the same exact bytes, so the compiled shapes are
+// shared per profile and chain digest; every test still builds its own steps.
+const compiledShapes = new Map<
+  string,
+  {
+    readonly at104: ReturnType<typeof compileFinancial0104ImportShapes>;
+    readonly at105: ReturnType<typeof compileRoot0105ImportShapes>;
+  }
+>();
+
 function inputs(source: Source, profile: Profile) {
-  const at104 = compileFinancial0104ImportShapes(source.auth103, source.artifact, profile);
-  const at105 = compileRoot0105ImportShapes(
-    source.auth103,
-    source.artifact,
-    source.artifact105,
-    profile,
-  );
+  const key = `${profile}:${source.auth103.digest}:${source.artifact.digest}:${source.artifact105.digest}`;
+  let shapes = compiledShapes.get(key);
+  if (shapes === undefined) {
+    shapes = {
+      at104: compileFinancial0104ImportShapes(source.auth103, source.artifact, profile),
+      at105: compileRoot0105ImportShapes(
+        source.auth103,
+        source.artifact,
+        source.artifact105,
+        profile,
+      ),
+    };
+    compiledShapes.set(key, shapes);
+  }
+  const { at104, at105 } = shapes;
   const recipes = source.auth103Recipes;
   const common = {
     auth103CatalogJson: JSON.stringify(at104.auth103Catalog),
@@ -162,15 +180,27 @@ function inputs(source: Source, profile: Profile) {
   return { at104, at105, step104, step105 };
 }
 
+// The ordinary exact103 replay is identical for every test of one Auth103
+// artifact: it runs once and each test opens its own copy (foreign keys on).
+const ordinary103Images = new Map<string, Uint8Array>();
+
 function ordinary103(source: Source) {
-  const database = new Database(":memory:", { strict: true });
+  let image = ordinary103Images.get(source.auth103.digest);
+  if (image === undefined) {
+    const database = new Database(":memory:", { strict: true });
+    database.query("PRAGMA foreign_keys=ON").all();
+    for (const [index, file] of source.auth103.files.slice(0, 100).entries())
+      run(database, buildD1MigrationImport([file], { freshLedger: index === 0 }).sql);
+    run(
+      database,
+      buildD1MigrationImport(source.auth103.files.slice(100), { freshLedger: false }).sql,
+    );
+    image = database.serialize();
+    database.close();
+    ordinary103Images.set(source.auth103.digest, image);
+  }
+  const database = Database.deserialize(image, { strict: true });
   database.query("PRAGMA foreign_keys=ON").all();
-  for (const [index, file] of source.auth103.files.slice(0, 100).entries())
-    run(database, buildD1MigrationImport([file], { freshLedger: index === 0 }).sql);
-  run(
-    database,
-    buildD1MigrationImport(source.auth103.files.slice(100), { freshLedger: false }).sql,
-  );
   return database;
 }
 

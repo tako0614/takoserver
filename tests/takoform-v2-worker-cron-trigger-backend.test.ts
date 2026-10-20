@@ -1,6 +1,4 @@
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { WORKER_BUNDLE_FORM_URL } from "../src/takoform-v2/forms/worker-bundle.ts";
@@ -20,14 +18,14 @@ import {
   createWorkerCronTriggerForm,
   type WorkerCronTriggerCapabilityReader,
 } from "../src/takoform-v2/worker-cron-trigger-backend.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const TARGET_KEY = "fixture-cron-admission";
 const WORKER_SPEC = {};
 const CRON_SPEC = { worker: { resourceUid: "worker-fixture" }, cron: "* * * * *" };
 
 function fixture(cronCapability?: WorkerCronTriggerCapabilityReader) {
-  const db = new Database(":memory:");
-  migrateSqlite(db);
+  const db = migrateSqliteDatabase();
   let keepDeploymentPending = false;
   let activeDeploymentUid: string | null = null;
   let latestExecution: V2Execution | null = null;

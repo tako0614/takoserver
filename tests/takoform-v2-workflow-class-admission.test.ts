@@ -1,9 +1,7 @@
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { Miniflare } from "miniflare";
 import { MIGRATIONS } from "../src/db-schema.ts";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject, Sql } from "../src/ports.ts";
 import { createD1Sql } from "../src/sql-d1.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
@@ -31,6 +29,7 @@ import { createV2WorkflowClassAdmission } from "../src/takoform-v2/workflow-clas
 import { createWorkerdWorkerModuleInspector } from "../src/workerd-worker-module-inspector.ts";
 import { createWorkflowRuntime } from "../src/workflow-execution.ts";
 import { createV2WorkflowResourceAuthority } from "../src/workflow-v2-resource-authority.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 import { nativeEvidenceBinary } from "./helpers/native-evidence.ts";
 
 const PRINCIPAL = "org:workflow-admission";
@@ -39,8 +38,7 @@ const TARGET = "workflow-admission-local-target";
 const SPEC_CLASS = "ReportWorkflow";
 
 function fixture(sqlOverride?: Sql) {
-  const db = new Database(":memory:");
-  migrateSqlite(db);
+  const db = migrateSqliteDatabase();
   const sql = sqlOverride ?? createSqliteSql(db);
   const source = new Map<string, Uint8Array>();
   const bundleHost = createWorkerBundleHost({
@@ -400,7 +398,7 @@ function splitMigration(source: string): readonly string[] {
   return statements;
 }
 
-test("Miniflare D1 atomically accepts 1, 2, and 8 weighted Workflow class graphs and refuses drift", async () => {
+test("Miniflare D1 atomically accepts 1 and 8 weighted Workflow class graphs and refuses drift", async () => {
   const runtime = new Miniflare({
     workers: [
       {
@@ -426,12 +424,15 @@ test("Miniflare D1 atomically accepts 1, 2, and 8 weighted Workflow class graphs
   let f: ReturnType<typeof fixture> | undefined;
   try {
     const database = await runtime.getD1Database("STATE_DB");
-    for (const migration of MIGRATIONS) {
-      for (const statement of splitMigration(migration.sql))
-        await database.prepare(statement).run();
-    }
+    for (const migration of MIGRATIONS)
+      await database.batch(
+        splitMigration(migration.sql).map((statement) => database.prepare(statement)),
+      );
     f = fixture(createD1Sql(database));
-    for (const count of [1, 2, 8]) {
+    // Two weighted Versions take the same graph path as eight; that case runs
+    // on bun:sqlite in "all active weighted Versions use held bytes...". D1
+    // keeps the single-Version and the eight-Version graphs.
+    for (const count of [1, 8]) {
       const worker = await f.create(MODULE_WORKER_FORM_URL, `d1-worker-${count}`, {});
       const versions = [];
       for (let index = 0; index < count; index++) {

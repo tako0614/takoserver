@@ -1,10 +1,8 @@
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
 import { request as httpsRequest } from "node:https";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { Sql } from "../src/ports.ts";
 import {
   createSelfhostV2WorkerEndpointBoot,
@@ -16,6 +14,7 @@ import { WORKER_ENDPOINT_FORM_URL } from "../src/takoform-v2/forms/worker-specs.
 import type { V2Execution } from "../src/takoform-v2/types.ts";
 import { WORKER_ENDPOINT_BACKEND_ID } from "../src/takoform-v2/worker-endpoint-backend.ts";
 import { createV2WorkerPublicationState } from "../src/takoform-v2/worker-publication-state.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const ORIGIN = "https://api.example.test";
 const SUFFIX = "workers.example.test";
@@ -127,8 +126,7 @@ function endpointExecution(): V2Execution {
 }
 
 function stateFixture() {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   const sql = createSqliteSql(database);
   const publicationState = createV2WorkerPublicationState({
     sql,

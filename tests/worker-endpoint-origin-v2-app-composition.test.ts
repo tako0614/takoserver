@@ -10,7 +10,6 @@ import { type AppPorts, buildApp } from "../src/app.ts";
 import { createAccounts } from "../src/auth.ts";
 import type { Offering } from "../src/catalog.ts";
 import { STABLE_PRODUCTION_TAKOFORM_CATALOG } from "../src/generated/takoform-stable-v1-catalog.ts";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { type Sql, SqlError, type SqlStatement } from "../src/ports.ts";
 import { FakeProvider } from "../src/providers/fake.ts";
@@ -18,6 +17,7 @@ import { createSharedAppLedger } from "../src/shared-app-ledger.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { InMemoryTakoformResourceDriver } from "../src/takoform/memory-driver.ts";
 import type { V2Form } from "../src/takoform-v2/types.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const ORIGIN = "https://api.app-origin-composition.test";
 const BASE = `${ORIGIN}/apis/forms.takoform.com/v2`;
@@ -96,8 +96,7 @@ function sharedSchema(db: Database, includeBindings: boolean, typed = false): vo
 async function fixture(
   options: { shared?: boolean; bindings?: boolean; typed?: boolean; carrier?: boolean } = {},
 ) {
-  const db = new Database(":memory:");
-  migrateSqlite(db);
+  const db = migrateSqliteDatabase();
   const raw = createSqliteSql(db);
   if (options.shared !== false)
     sharedSchema(db, options.bindings !== false, options.typed === true);

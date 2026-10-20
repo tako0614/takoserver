@@ -1,12 +1,11 @@
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { keyUsage } from "../console/src/key-scopes.ts";
 import { createAccounts, type ExternalIdentityVerifier } from "../src/auth.ts";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
 import { createTakoformV2AccountAccess } from "../src/takoform-v2/accounts.ts";
 import { createTakoformV2Engine } from "../src/takoform-v2/engine.ts";
 import { createTakoformV2Routes } from "../src/takoform-v2/routes.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const V2 = "https://host.example/apis/forms.takoform.com/v2";
 
@@ -32,8 +31,7 @@ function snippetRequest(snippet: string, key: string): Request {
 }
 
 test("the console's first request with a new key is one Host API v2 answers", async () => {
-  const database = new Database(":memory:");
-  migrateSqlite(database);
+  const database = migrateSqliteDatabase();
   try {
     const sql = createSqliteSql(database);
     const accounts = createAccounts({ sql, identity });

@@ -1,4 +1,3 @@
-import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { buildApp } from "../src/app.ts";
 import type { Accounts } from "../src/auth.ts";
@@ -6,7 +5,6 @@ import { createAccounts } from "../src/auth.ts";
 import type { Offering } from "../src/catalog.ts";
 import { createControlRoutes } from "../src/control.ts";
 import { STABLE_PRODUCTION_TAKOFORM_CATALOG } from "../src/generated/takoform-stable-v1-catalog.ts";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import { createMemoryObjectStore } from "../src/objects-mem.ts";
 import { type Sql, SqlError } from "../src/ports.ts";
 import type { ProviderOffering } from "../src/provider-port.ts";
@@ -21,6 +19,7 @@ import {
   WorkerEndpointOriginReservationError,
   type WorkerEndpointOriginReservations,
 } from "../src/worker-endpoint-origin-reservations.ts";
+import { migrateSqliteDatabase } from "./helpers/migrated-database.ts";
 
 const PROJECTION = {
   format: WORKER_ENDPOINT_ORIGIN_RESERVATION_FORMAT,
@@ -139,8 +138,7 @@ function request(body: unknown, suffix = ""): Request {
 async function sharedFixture(
   options: { missingSchema?: boolean; wrongOrigin?: boolean; ambiguous?: boolean } = {},
 ) {
-  const db = new Database(":memory:");
-  migrateSqlite(db);
+  const db = migrateSqliteDatabase();
   const actual = createSqliteSql(db);
   let loseAck = false;
   let blockAfterCommit = false;
