@@ -41,6 +41,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "operator-token",
+      getRetryDelaysMs: [0, 0],
       workerDomainServiceScope: service,
       fetcher: async (request) => {
         const url = new URL(request.url);
@@ -70,6 +71,7 @@ describe("strict paginated Cloudflare state", () => {
       const state = new CloudflareState({
         accountId: ACCOUNT,
         token: "operator-token",
+        getRetryDelaysMs: [0, 0],
         workerDomainServiceScope: service,
         fetcher: async (request) => {
           requests.push(new URL(request.url));
@@ -99,6 +101,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "operator-token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async (request) => {
         requests.push(request);
         if (requests.length === 1) throw new TypeError("operator-token must stay private");
@@ -156,6 +159,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "operator-token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async () => {
         calls += 1;
         if (calls === 1) {
@@ -179,6 +183,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "operator-token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async () => {
         calls += 1;
         return Response.json({ success: true, result: true });
@@ -258,6 +263,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "operator-token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async () => {
         calls += 1;
         return new Response(
@@ -480,6 +486,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "operator-token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async (request) => {
         const url = new URL(request.url);
         requests.push(url);
@@ -510,6 +517,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "operator-token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async (request) => {
         requests.push(request);
         return Response.json({
@@ -532,6 +540,7 @@ describe("strict paginated Cloudflare state", () => {
       new CloudflareState({
         accountId: ACCOUNT,
         token: "operator-token",
+        getRetryDelaysMs: [0, 0],
         fetcher: async () => Response.json({ success: true, result }),
       });
     expect(await stateFor({ schedules: [] }).workerSchedules("host")).toEqual([]);
@@ -554,6 +563,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "operator-token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async (request) => {
         const url = new URL(request.url);
         expect(url.pathname).toBe(
@@ -585,6 +595,7 @@ describe("strict paginated Cloudflare state", () => {
       const state = new CloudflareState({
         accountId: ACCOUNT,
         token: "operator-token",
+        getRetryDelaysMs: [0, 0],
         fetcher: async () => Response.json({ success: true, result, result_info: resultInfo }),
       });
       await expect(state.workerVersions("executor")).rejects.toBeInstanceOf(DeployError);
@@ -601,6 +612,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "operator-token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async (request) => {
         requests.push(request);
         return response;
@@ -636,6 +648,7 @@ describe("strict paginated Cloudflare state", () => {
       const state = new CloudflareState({
         accountId: ACCOUNT,
         token: "operator-token",
+        getRetryDelaysMs: [0, 0],
         fetcher: async () => response,
       });
       await expect(state.dispatchNamespace("takoserver-customers")).rejects.toBeInstanceOf(
@@ -668,6 +681,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: deploymentToken,
+      getRetryDelaysMs: [0, 0],
       topologyAuditCredentialPath: auditCredentialPath,
       fetcher: async (request) => {
         auditRequests.push(request);
@@ -745,6 +759,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "operator-token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async () =>
         new Response(
           new ReadableStream({
@@ -770,6 +785,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "operator-token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async (request) => {
         requests.push(request);
         return Response.json({
@@ -799,6 +815,7 @@ describe("strict paginated Cloudflare state", () => {
       const state = new CloudflareState({
         accountId: ACCOUNT,
         token: "token",
+        getRetryDelaysMs: [0, 0],
         fetcher: async () => Response.json({ success: true, result }),
       });
 
@@ -821,6 +838,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async () => missing,
     });
     await expect(state.workerDeployments("takoserver-api-staging")).resolves.toEqual([]);
@@ -858,6 +876,7 @@ describe("strict paginated Cloudflare state", () => {
       const negative = new CloudflareState({
         accountId: ACCOUNT,
         token: "token",
+        getRetryDelaysMs: [0, 0],
         fetcher: async () => response,
       });
       await expect(negative.workerDeployments("takoserver-api-staging")).rejects.toBeInstanceOf(
@@ -882,6 +901,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "operator-token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async (request) => {
         requests.push(request);
         return Response.json({ success: true, errors: [], messages: [], result: version });
@@ -911,6 +931,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "operator-token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async (request) => {
         requests.push(request);
         return Response.json({ success: true, errors: [], messages: [], result: secrets });
@@ -931,6 +952,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "operator-token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async (request) => {
         requests.push(request);
         return Response.json({
@@ -958,6 +980,7 @@ describe("strict paginated Cloudflare state", () => {
       const state = new CloudflareState({
         accountId: ACCOUNT,
         token: "token",
+        getRetryDelaysMs: [0, 0],
         fetcher: async () => Response.json({ success: true, result }),
       });
       await expect(state.workerScripts()).rejects.toThrow();
@@ -969,6 +992,7 @@ describe("strict paginated Cloudflare state", () => {
       const state = new CloudflareState({
         accountId: ACCOUNT,
         token: "token",
+        getRetryDelaysMs: [0, 0],
         fetcher: async () => Response.json({ success: true, result }),
       });
 
@@ -983,6 +1007,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "operator-token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async () =>
         Response.json({
           success: true,
@@ -1006,6 +1031,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "operator-token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async (request) => {
         requests.push(request);
         return Response.json({
@@ -1027,6 +1053,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "operator-token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async (request) => {
         requests.push(request);
         return Response.json({
@@ -1063,6 +1090,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "operator-token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async (request) => {
         requests.push(request);
         const page = new URL(request.url).searchParams.get("page");
@@ -1086,6 +1114,7 @@ describe("strict paginated Cloudflare state", () => {
     const missing = new CloudflareState({
       accountId: ACCOUNT,
       token: "token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async () => Response.json({ success: true, result: [] }),
     });
     await expect(missing.list("/workers/domains", "domain inventory")).rejects.toThrow(
@@ -1095,6 +1124,7 @@ describe("strict paginated Cloudflare state", () => {
     const inconsistent = new CloudflareState({
       accountId: ACCOUNT,
       token: "token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async () => envelope([], 1, 1, 2),
     });
     await expect(inconsistent.list("/workers/domains", "domain inventory")).rejects.toThrow(
@@ -1113,6 +1143,7 @@ describe("strict paginated Cloudflare state", () => {
       const state = new CloudflareState({
         accountId: ACCOUNT,
         token: "token",
+        getRetryDelaysMs: [0, 0],
         fetcher: async () => envelope(result, 1, 1, result.length),
       });
       const failure = await state.workerDomainOwner("console.example").catch((error) => error);
@@ -1124,6 +1155,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async () =>
         Response.json({ success: false, errors: [{ code: 10000, message: "authentication" }] }),
     });
@@ -1136,6 +1168,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async () =>
         Response.json({
           success: true,
@@ -1153,6 +1186,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async (request) => {
         requests.push(request);
         return Response.json({ success: true, result: { subdomain: "account-owner" } });
@@ -1169,6 +1203,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async (request) => {
         requests.push(request);
         return Response.json({ success: true, result: { subdomain: "account-owner" } });
@@ -1189,6 +1224,7 @@ describe("strict paginated Cloudflare state", () => {
     const state = new CloudflareState({
       accountId: ACCOUNT,
       token: "token",
+      getRetryDelaysMs: [0, 0],
       fetcher: async (request) => {
         requests.push(request);
         const url = new URL(request.url);

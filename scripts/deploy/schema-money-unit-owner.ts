@@ -1739,6 +1739,36 @@ function custody(directory: string, originalRead = false): MoneyCutoverCustody {
   };
 }
 
+const CLOSED_REASON_CODES: readonly string[] = [
+  "d1-transport",
+  "d1-command",
+  "http-transport",
+  "http-status",
+  "http-response",
+];
+const CLOSED_REASON_OPERATIONS: readonly string[] = [
+  "d1-read",
+  "d1-statement",
+  "storage-read",
+  "storage-write",
+  "health-read",
+  "provider-read",
+];
+
+/** A copy of an error's closed DeployReason; anything else is dropped. */
+function closedReason(error: unknown): DeployReason | undefined {
+  const reason = error instanceof Error ? (error as { reason?: unknown }).reason : undefined;
+  if (reason === null || typeof reason !== "object") return undefined;
+  const { code, operation, attempts } = reason as Record<string, unknown>;
+  return typeof code === "string" &&
+    CLOSED_REASON_CODES.includes(code) &&
+    typeof operation === "string" &&
+    CLOSED_REASON_OPERATIONS.includes(operation) &&
+    Number.isSafeInteger(attempts)
+    ? Object.freeze({ code, operation, attempts } as DeployReason)
+    : undefined;
+}
+
 // At most two more reads, each bounded by a 15 s timeout, with waits capped at
 // 8 s and the whole health read inside one 60 s budget.
 const HEALTH_PROBE_RETRY_DELAYS_MS: readonly number[] = [1_000, 4_000];
@@ -1752,25 +1782,6 @@ const HEALTH_PROBE_TOTAL_MS = 60_000;
  * including the expected maintenance 503 and any non-JSON or wrong body. The
  * 15 s timeout covers both the response and reading its body.
  */
-function storageReason(error: unknown): DeployReason | undefined {
-  const reason = error instanceof Error ? (error as { reason?: unknown }).reason : undefined;
-  return reason !== null &&
-    typeof reason === "object" &&
-    ["http-transport", "http-status", "http-response"].includes(
-      (reason as { code?: unknown }).code as string,
-    ) &&
-    ["storage-read", "storage-write"].includes(
-      (reason as { operation?: unknown }).operation as string,
-    ) &&
-    Number.isSafeInteger((reason as { attempts?: unknown }).attempts)
-    ? Object.freeze({
-        code: (reason as DeployReason).code,
-        operation: (reason as DeployReason).operation,
-        attempts: (reason as DeployReason).attempts,
-      })
-    : undefined;
-}
-
 /** Exported for its retry and classification tests only. */
 export async function healthRead(
   origin: string,
@@ -4198,8 +4209,14 @@ async function loadMoneyUnitOwnerOptions(
       let result: T;
       try {
         result = await operation();
-      } catch {
-        throw preflightError("money normal Worker native/source observation failed");
+      } catch (error) {
+        // The message stays generic; only a closed reason of the failed read is kept.
+        throw new DeployError(
+          "preflight",
+          "money normal Worker native/source observation failed",
+          undefined,
+          closedReason(error),
+        );
       }
       assertLocal();
       await assertMoneyUnitHeldConvertCurrent(context);
@@ -4500,7 +4517,7 @@ async function loadMoneyUnitOwnerOptions(
           "preflight",
           "money selected staging D1/R2 native GET failed",
           undefined,
-          storageReason(error),
+          closedReason(error),
         );
       }
       if (
