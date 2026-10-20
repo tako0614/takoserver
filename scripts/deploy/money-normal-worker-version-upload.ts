@@ -623,20 +623,19 @@ export function assertCompletedReplacementRecords(
     readonly publicJwk: string;
   },
 ): void {
-  const refuse = (): never => {
-    throw preflightError("money second replacement requires the exact completed first replacement");
-  };
+  const refusal = () =>
+    preflightError("money second replacement requires the exact completed first replacement");
   let receipt: Record<string, unknown>;
   let selector: Record<string, unknown>;
   let seal: Record<string, unknown>;
   try {
     const receiptBytes = readFileSync(join(root, "UPLOAD-RECEIPT.json"));
-    if (!receiptBytes.equals(readFileSync(join(root, "RESULT.json")))) return refuse();
+    if (!receiptBytes.equals(readFileSync(join(root, "RESULT.json")))) throw refusal();
     receipt = JSON.parse(receiptBytes.toString("utf8"));
     selector = JSON.parse(readFileSync(join(root, "normal-worker.selector.json"), "utf8"));
     seal = JSON.parse(readFileSync(join(root, "REPLACEMENT-DISPATCH-SEAL.json"), "utf8"));
   } catch {
-    return refuse();
+    throw refusal();
   }
   if (
     !isPlainRecord(receipt) ||
@@ -678,7 +677,7 @@ export function assertCompletedReplacementRecords(
     expected.versionId === expected.priorUnknownVersionId ||
     expected.publicJwk === expected.priorUnknownPublicJwk
   )
-    refuse();
+    throw refusal();
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {

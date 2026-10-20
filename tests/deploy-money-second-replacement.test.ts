@@ -13,6 +13,15 @@ import { assertCompletedReplacementRecords } from "../scripts/deploy/money-norma
  */
 const ROOT = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), "money-second-replacement-"));
 afterAll(() => rmSync(ROOT, { recursive: true, force: true }));
+/** Changes one field of one fixture record; a statement, never an expression. */
+function set(
+  records: Record<string, Record<string, unknown>>,
+  record: string,
+  key: string,
+  value: unknown,
+): void {
+  (records[record] as Record<string, unknown>)[key] = value;
+}
 const sha = (value: string) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
 
 const expected = {
@@ -79,22 +88,33 @@ test("the exact completed first replacement is accepted for quarantine", () => {
 
 test("a foreign, edited or incomplete first replacement refuses the second attempt", () => {
   const refusals: [string, (records: Record<string, Record<string, unknown>>) => void][] = [
-    ["other-version", (r) => void ((r.receipt as Record<string, unknown>).versionId = "other")],
     [
-      "other-source",
-      (r) => void ((r.selector as Record<string, unknown>).sourceCommit = "d".repeat(40)),
+      "other-version",
+      (r) => {
+        (r.receipt as Record<string, unknown>).versionId = "other";
+      },
+    ],
+    ["other-source", (r) => set(r, "selector", "sourceCommit", "d".repeat(40))],
+    ["other-unknown", (r) => set(r, "seal", "originalUnknownBindingDigest", sha("x"))],
+    [
+      "other-key",
+      (r) => {
+        (r.seal as Record<string, unknown>).publicJwkDigest = sha("x");
+      },
     ],
     [
-      "other-unknown",
-      (r) => void ((r.seal as Record<string, unknown>).originalUnknownBindingDigest = sha("x")),
+      "other-worker",
+      (r) => {
+        (r.selector as Record<string, unknown>).workerName = "other";
+      },
     ],
-    ["other-key", (r) => void ((r.seal as Record<string, unknown>).publicJwkDigest = sha("x"))],
-    ["other-worker", (r) => void ((r.selector as Record<string, unknown>).workerName = "other")],
-    ["extra-field", (r) => void ((r.receipt as Record<string, unknown>).ready = true)],
     [
-      "not-immutable",
-      (r) => void ((r.receipt as Record<string, unknown>).qualification = "active"),
+      "extra-field",
+      (r) => {
+        (r.receipt as Record<string, unknown>).ready = true;
+      },
     ],
+    ["not-immutable", (r) => set(r, "receipt", "qualification", "active")],
   ];
   for (const [name, edit] of refusals)
     expect(() => assertCompletedReplacementRecords(completedRoot(name, edit), expected)).toThrow(
