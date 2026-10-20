@@ -1486,9 +1486,16 @@ export function createSharedAuthSession(options: {
         if (url.pathname === "/auth/oidc/logout" && request.method === "POST") {
           if (url.search !== "" || request.headers.get("origin") !== consoleOrigin)
             throw new SharedAuthSessionError("session_invalid");
+          const secret = cookie(request, sessionCookie);
+          if (
+            !secret &&
+            (request.headers.get("cookie") ?? "")
+              .split(";")
+              .some((part) => part.trim().split("=", 1)[0] === legacySessionCookie)
+          )
+            throw new SharedAuthSessionError("session_invalid");
           headers.set("set-cookie", setCookie(sessionCookie, "", 0));
           headers.append("set-cookie", setCookie(legacySessionCookie, "", 0));
-          const secret = cookie(request, sessionCookie);
           if (secret) await store.revokeSession(await hash(secret), now());
           // Upstream outages cannot delay the browser's local logout. The
           // owning maintenance entry drains this already durable outbox.

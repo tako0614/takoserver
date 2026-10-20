@@ -647,6 +647,86 @@ describe("staging shared session against native D1 and signed issuer HTTP", () =
     }
   }, 30_000);
 
+  test.each([
+    "takoserver_session=legacy_B",
+    "takoserver_session=",
+    "takoserver_session=%not-a-credential",
+    "takoserver_session",
+  ])(
+    "shared logout refuses a legacy-only named cookie %j without effects",
+    async (legacy) => {
+      let revocations = 0;
+      const f = await fixture({
+        wrapStore: (store) => ({
+          ...store,
+          async revokeSession(digest, stamp) {
+            revocations += 1;
+            return store.revokeSession(digest, stamp);
+          },
+        }),
+      });
+      try {
+        const signedIn = await f.signedIn();
+        const requestsBefore = f.issuer.requests.length;
+        const response = await f.request("/auth/oidc/logout", {
+          method: "POST",
+          headers: { cookie: `unrelated=value; ${legacy}`, origin: SESSION_TEST_CONSOLE },
+        });
+        expect(response.status).toBe(400);
+        expect(await response.json()).toEqual({ error: { code: "session_invalid" } });
+        expect(response.headers.has("set-cookie")).toBe(false);
+        expect(revocations).toBe(0);
+        expect((await f.d1.store.readSession(signedIn.digest))?.status).toBe("active");
+        expect(f.issuer.requests.length).toBe(requestsBefore);
+      } finally {
+        await f.dispose();
+      }
+    },
+    30_000,
+  );
+
+  test("shared logout remains idempotent without either named cookie", async () => {
+    const f = await fixture();
+    try {
+      for (const otherCookie of [
+        undefined,
+        "takoserver_session_suffix=x; prefix_takoserver_session=x",
+      ]) {
+        const headers = new Headers({ origin: SESSION_TEST_CONSOLE });
+        if (otherCookie !== undefined) headers.set("cookie", otherCookie);
+        const response = await f.request("/auth/oidc/logout", { method: "POST", headers });
+        expect(response.status).toBe(204);
+        expect(response.headers.getSetCookie()).toEqual([
+          `${SESSION_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`,
+          `${LEGACY_SESSION_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`,
+        ]);
+      }
+      expect(f.issuer.requests).toEqual([]);
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
+  test("shared-only logout still revokes its own session", async () => {
+    const f = await fixture();
+    try {
+      const signedIn = await f.signedIn();
+      const response = await f.request("/auth/oidc/logout", {
+        method: "POST",
+        headers: { cookie: signedIn.sessionCookie, origin: SESSION_TEST_CONSOLE },
+      });
+      expect(response.status).toBe(204);
+      expect(response.headers.getSetCookie()).toEqual([
+        `${SESSION_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`,
+        `${LEGACY_SESSION_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`,
+      ]);
+      expect((await f.d1.store.readSession(signedIn.digest))?.status).toBe("revocation_pending");
+      expect(await f.runtime.authenticate(f.sessionRequest(signedIn.sessionCookie))).toBeNull();
+    } finally {
+      await f.dispose();
+    }
+  }, 30_000);
+
   test("logout denies locally before unavailable issuer revocation and maintenance survives a restart", async () => {
     const f = await fixture();
     try {
