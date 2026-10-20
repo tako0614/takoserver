@@ -221,6 +221,12 @@ Known limitation: there is no owner transfer. If a subject's active binding is
 revoked and the same subject later receives a fresh principal, the Org remains
 owned by the previous principal and that issuance is refused. This fail-closed
 behavior is accepted for staging and must be revisited before production.
+A second known limitation: Workspace bindings are global and the first one
+wins. An Org with `wallet:write` that posts a hold naming another
+Workspace's `workspaceRef` before its owner's first login binds it first, and
+that owner's issuance is then refused. Accounts refs are random 128-bit values
+shown only to their owner. Reserving shared-auth Workspace refs against
+hold-time binding remains a pre-production item.
 
 ## Existing behavior that requires a separate owner change
 
