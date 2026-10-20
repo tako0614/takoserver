@@ -48,6 +48,7 @@ import {
   FRESH_MONEY_WRITER_EPOCH_OWNER_UNAVAILABLE,
   FRESH_MONEY_WRITER_EPOCH_RECORD_FILE,
   type FreshMoneyWriterEpochPort,
+  freshMoneyWriterEpochRecordPresent,
   readRetainedFreshMoneyWriterEpochRecord,
 } from "./fresh-money-preserved.ts";
 import {
@@ -560,7 +561,7 @@ export async function runIntegrationStorageGeneration(
         invocation.action === "apply" ? "create" : "read",
       ) &&
       invocation.action === "apply" &&
-      existsSync(join(options.epochRecordDirectory, FRESH_MONEY_WRITER_EPOCH_RECORD_FILE))
+      freshMoneyWriterEpochRecordPresent(options.epochRecordDirectory)
     )
       throw preflightError(
         "the epoch record directory already holds a Writer epoch record; choose a new directory",
@@ -2621,6 +2622,10 @@ async function applyStorageGeneration(
       epochRecord = minted;
       // The record holds the nonce: operator-private beside the generation's
       // artifact, never in the repository or the command output.
+      // The operator directory is checked again at the write: it must still be
+      // a canonical, link-free, operator-owned 0700 directory.
+      if (options.epochRecordDirectory !== undefined)
+        assertFreshMoneyEpochRecordDirectory(options.epochRecordDirectory, "recheck");
       const recordPath = join(
         options.epochRecordDirectory ?? root,
         FRESH_MONEY_WRITER_EPOCH_RECORD_FILE,

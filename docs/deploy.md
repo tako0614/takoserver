@@ -308,9 +308,13 @@ The full epoch record holds a nonce. Apply writes it once, mode 0600, as
 
 - With `--epoch-record-directory=<absolute-dir>` (accepted only with this
   lineage, on both `--apply` and `--status`), it goes in that operator-chosen
-  directory. Apply creates a missing directory with mode 0700; its parent must
-  exist. Apply refuses before any provider call when the directory is a link,
-  is not owned by you, allows any group or other access, or already holds a
+  directory. It must be one canonical absolute path (no trailing slash, `.` or
+  `..`) with no symbolic link in any component. Apply creates a missing
+  directory with mode 0700 under an existing link-free parent. Before any
+  provider call, apply refuses when the directory is not owned by you, allows
+  any group or other access, or already has anything at the record name (even
+  a dangling link). It checks the directory again right before writing the
+  record; if that check fails, the run stops with the new D1 identity and no
   record. Use one directory per generation.
 - Without the flag, apply keeps the record in a retained
   `takoserver-integration-storage-*` temporary directory and reports its path.

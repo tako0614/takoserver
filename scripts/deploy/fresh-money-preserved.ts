@@ -8,8 +8,9 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
 } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { frameHostMigrationSql } from "../../src/sqlite-migration-policy.ts";
 import { canonicalApplicationShape } from "./application-schema-shape.ts";
 import type { D1MigrationImportArtifact } from "./d1-migration-import.ts";
@@ -49,17 +50,33 @@ const RECORD_LIMIT = 4096;
 
 /**
  * The operator-chosen directory that holds the Writer epoch record across
- * apply and status (`--epoch-record-directory`). It must be an absolute,
- * link-free directory owned by this user with no group or other access.
- * `create` makes a missing directory 0700 (its parent must exist); `read`
- * answers false for a missing one. A looser or foreign directory is refused.
+ * apply and status (`--epoch-record-directory`). It must be one canonical
+ * absolute path (no trailing slash, `.` or `..`) with no symbolic link in any
+ * component, naming a directory owned by this user with no group or other
+ * access. `create` makes a missing directory 0700 under a canonical existing
+ * parent; `read` answers false for a missing one; `recheck` (just before the
+ * record is written) requires it to still be exactly that directory.
  */
 export function assertFreshMoneyEpochRecordDirectory(
   directory: string,
-  mode: "create" | "read",
+  mode: "create" | "read" | "recheck",
 ): boolean {
-  if (typeof directory !== "string" || !isAbsolute(directory) || /[\0\r\n]/u.test(directory))
-    throw preflightError("fresh Money Writer epoch record directory must be one absolute path");
+  if (
+    typeof directory !== "string" ||
+    !isAbsolute(directory) ||
+    /[\0\r\n]/u.test(directory) ||
+    resolve(directory) !== directory
+  )
+    throw preflightError(
+      "fresh Money Writer epoch record directory must be one canonical absolute path",
+    );
+  const unlinked = (path: string): boolean => {
+    try {
+      return realpathSync(path) === path;
+    } catch {
+      return false;
+    }
+  };
   let status: ReturnType<typeof lstatSync>;
   try {
     status = lstatSync(directory);
@@ -67,6 +84,14 @@ export function assertFreshMoneyEpochRecordDirectory(
     if ((error as NodeJS.ErrnoException).code !== "ENOENT")
       throw preflightError("fresh Money Writer epoch record directory is unreadable");
     if (mode === "read") return false;
+    if (mode === "recheck")
+      throw preflightError(
+        "fresh Money Writer epoch record directory disappeared before the write",
+      );
+    if (!unlinked(dirname(directory)))
+      throw preflightError(
+        "fresh Money Writer epoch record directory parent must be a canonical path with no symbolic link",
+      );
     try {
       mkdirSync(directory, { mode: 0o700 });
       status = lstatSync(directory);
@@ -74,6 +99,10 @@ export function assertFreshMoneyEpochRecordDirectory(
       throw preflightError("fresh Money Writer epoch record directory could not be created");
     }
   }
+  if (!unlinked(directory))
+    throw preflightError(
+      "fresh Money Writer epoch record directory must be a canonical path with no symbolic link",
+    );
   if (
     !status.isDirectory() ||
     (status.mode & 0o077) !== 0 ||
@@ -83,6 +112,20 @@ export function assertFreshMoneyEpochRecordDirectory(
       "fresh Money Writer epoch record directory must be an operator-owned 0700 directory",
     );
   return true;
+}
+
+/**
+ * Whether anything (a file, a directory or any link, even a dangling one)
+ * already occupies the record name in `directory`. Links are not followed.
+ */
+export function freshMoneyWriterEpochRecordPresent(directory: string): boolean {
+  try {
+    lstatSync(join(directory, FRESH_MONEY_WRITER_EPOCH_RECORD_FILE));
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw preflightError("fresh Money Writer epoch record name is unreadable");
+  }
 }
 
 /**

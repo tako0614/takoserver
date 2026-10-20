@@ -3,8 +3,10 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -804,6 +806,102 @@ describe("v2-0100-money-preserved storage generation", () => {
     } finally {
       database.close();
     }
+  }, 60_000);
+
+  test("a linked record directory, link in its path or occupied record name is refused before any provider call", async () => {
+    const calls = { count: 0 };
+    const refuse = async (epochRecordDirectory: string, message: string) =>
+      await expect(
+        runIntegrationStorageGeneration(invocation, target, {
+          provider: trapProvider(calls),
+          run: sourceRun(() => {}),
+          review: "test-review",
+          productionD1: PRODUCTION_D1,
+          epochRecordDirectory,
+        }),
+      ).rejects.toThrow(message);
+    const base = mkdtempSync(join(ROOT, "links-"));
+    const real = mkdtempSync(join(base, "real-"));
+    // The directory itself is a link.
+    symlinkSync(real, join(base, "linked"));
+    await refuse(join(base, "linked"), "no symbolic link");
+    // A trailing slash would make lstat follow the link; it is not canonical.
+    await refuse(`${join(base, "linked")}/`, "canonical absolute path");
+    await refuse(`${real}/.`, "canonical absolute path");
+    // A linked parent, for an existing child and for one apply would create.
+    mkdirSync(join(real, "child"), { mode: 0o700 });
+    await refuse(join(base, "linked", "child"), "no symbolic link");
+    await refuse(join(base, "linked", "new-child"), "parent must be a canonical path");
+    expect(statSync(real).isDirectory()).toBe(true);
+    expect(() => statSync(join(real, "new-child"))).toThrow();
+    // A dangling link at the record name occupies it.
+    const occupied = mkdtempSync(join(base, "occupied-"));
+    symlinkSync(join(base, "missing-target"), join(occupied, FRESH_MONEY_WRITER_EPOCH_RECORD_FILE));
+    await refuse(occupied, "already holds a Writer epoch record");
+    expect(calls.count).toBe(0);
+  });
+
+  test("the record directory is checked again right before the record is written", async () => {
+    const base = mkdtempSync(join(ROOT, "recheck-"));
+    const directory = join(base, "records");
+    const moved = join(base, "moved");
+    let created = false;
+    const imports: string[] = [];
+    const provider = {
+      async listD1(name: string) {
+        return created ? [{ name, uuid: DATABASE_ID }] : [];
+      },
+      async getD1() {
+        return { name: NAME, uuid: DATABASE_ID };
+      },
+      async createD1(name: string) {
+        created = true;
+        return { name, uuid: DATABASE_ID };
+      },
+      async listR2() {
+        return [];
+      },
+      async getR2(name: string) {
+        return { name };
+      },
+      async createR2(): Promise<never> {
+        throw new Error("no R2 after a refused record write");
+      },
+    };
+    let error: unknown;
+    try {
+      await runIntegrationStorageGeneration(invocation, target, {
+        provider,
+        run: sourceRun((path) => imports.push(path)),
+        review: "test-review",
+        productionD1: PRODUCTION_D1,
+        epochRecordDirectory: directory,
+        reader: {
+          read: async () => ({
+            applied: [],
+            shape: "[]\n",
+            shapeDigest: `sha256:${createHash("sha256").update("[]\n").digest("hex")}`,
+          }),
+        },
+        // The mint is the last step before the write: swap the directory for
+        // a link to another private directory there.
+        freshMoneyWriterEpoch: (selected) => {
+          renameSync(directory, moved);
+          symlinkSync(moved, directory);
+          return mintFreshMoneyWriterEpoch(selected);
+        },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(DeployError);
+    expect((error as DeployError).message).toContain("no symbolic link");
+    expect((error as DeployError).phase).toBe("mutation");
+    const detail = String((error as DeployError).detail);
+    expect(detail).toContain(`databaseId=${DATABASE_ID}`);
+    expect(detail).not.toContain("moneyWriterEpochRecordPath");
+    expect(() => statSync(join(moved, FRESH_MONEY_WRITER_EPOCH_RECORD_FILE))).toThrow();
+    expect(imports).toEqual([]);
   }, 60_000);
 
   test("the CLI accepts --epoch-record-directory only as one absolute path on the Money-preserved generation", async () => {
