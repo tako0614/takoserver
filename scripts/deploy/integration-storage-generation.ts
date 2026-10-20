@@ -828,18 +828,20 @@ async function verifyGeneratedStorageTarget(
     // A registered Auth103 source is a read-side successor of the SAME original
     // native D1/R2 just inspected above. It never changes the fresh92 payload or
     // grants Auth permission; original source/receipts are checked by the Worker.
+    // A Money-preserved target reads only its own exact money-preserved shape,
+    // in the Auth103 maintenance window and when serving after it.
+    const moneyPreservedAuth103 =
+      target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1" &&
+      /^sha256:[0-9a-f]{64}$/u.test(target.moneyCutoverWriterEpoch ?? "") &&
+      target.auth103NativeProfile === "root-shared-auth-staging-v1";
     if (
       options.allowCurrentAuditedSuccessor === true &&
       lineage !== "apply-0066" &&
       target.environment === "integration" &&
       target.artifactBlobIoMode === undefined &&
-      ((target.schemaMaintenanceMode === "pre-auth103-quiesced" &&
-        (target.moneyCutoverWriterPolicy === undefined ||
-          (target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1" &&
-            /^sha256:[0-9a-f]{64}$/u.test(target.moneyCutoverWriterEpoch ?? "") &&
-            target.auth103NativeProfile === "root-shared-auth-staging-v1"))) ||
-        (target.schemaMaintenanceMode === undefined &&
-          target.moneyCutoverWriterPolicy === undefined))
+      (target.schemaMaintenanceMode === "pre-auth103-quiesced" ||
+        target.schemaMaintenanceMode === undefined) &&
+      (target.moneyCutoverWriterPolicy === undefined || moneyPreservedAuth103)
     ) {
       const sourceRoot = resolve(migrationDirectory, "..");
       const complete = readMigrationArtifact(migrationDirectory);
@@ -864,9 +866,7 @@ async function verifyGeneratedStorageTarget(
             },
             sourceRoot,
             target.schemaMaintenanceMode === "pre-auth103-quiesced" ? "maintenance" : "normal",
-            target.moneyCutoverWriterPolicy === "transaction-fenced-usd-micros-v1"
-              ? "money-preserved"
-              : "ordinary",
+            moneyPreservedAuth103 ? "money-preserved" : "ordinary",
           )
         ) {
           canonical.assertCurrent();
