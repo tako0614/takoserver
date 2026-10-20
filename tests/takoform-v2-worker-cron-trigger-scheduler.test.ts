@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Miniflare } from "miniflare";
@@ -23,6 +23,7 @@ import {
   createV2WorkerInvocationLifecycle,
   type V2WorkerCronInvocationClaim,
 } from "../src/takoform-v2/worker-invocation-custody.ts";
+import { migrateSqliteDatabase, writeMigrateSqliteFile } from "./helpers/migrated-database.ts";
 
 const PRINCIPAL = "cron-scheduler-fixture";
 const SPACE = "prod";
@@ -219,6 +220,10 @@ function seedGraph(
 }
 
 function openDb(path = ":memory:") {
+  // A fresh database is copied from one migrated per run; reopening an existing
+  // file still runs the real migrator against it.
+  if (path === ":memory:") return migrateSqliteDatabase();
+  if (!existsSync(path)) writeMigrateSqliteFile(path);
   const db = new Database(path);
   migrateSqlite(db);
   return db;

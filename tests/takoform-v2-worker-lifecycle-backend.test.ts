@@ -4,7 +4,6 @@ import { createHash, randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { migrateSqlite } from "../src/migrate-sqlite.ts";
 import type { JsonObject, Sql } from "../src/ports.ts";
 import { createSelfhostV2ObjectBucketStore } from "../src/providers/selfhost-v2-object-bucket-store.ts";
 import { createSqliteSql } from "../src/sql-sqlite.ts";
@@ -56,6 +55,7 @@ import type {
   WorkerdSite,
   WorkerdStaticSite,
 } from "../src/workerd-runtime.ts";
+import { writeMigrateSqliteFile } from "./helpers/migrated-database.ts";
 
 const TARGET_KEY = "internal-static-worker-management";
 const MANIFEST_URL = "https://artifacts.example.test/static/manifest.json";
@@ -84,8 +84,8 @@ function fixture(options?: {
   ) => Promise<void>;
 }) {
   const root = mkdtempSync(join(tmpdir(), "v2-worker-lifecycle-"));
+  writeMigrateSqliteFile(join(root, "state.sqlite"));
   const db = new Database(join(root, "state.sqlite"));
-  migrateSqlite(db);
   const sql = createSqliteSql(db);
   const backendSql: Sql = options?.backendQueryHook
     ? {
