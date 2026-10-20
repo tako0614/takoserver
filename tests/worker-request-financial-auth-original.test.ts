@@ -43,6 +43,7 @@ import {
   captureWorkerRequestResolvedRpUserBindingOriginal,
   createWorkerRequestConsumersWithOriginalRpProjection,
 } from "../src/worker-request-shared-principal-issuance.ts";
+import { workspaceBillingOrganizationRef } from "../src/workspace-billing-organization.ts";
 import {
   createHostedBillingRealmTestDatabase,
   seedHostedBillingRealmTestPin,
@@ -292,7 +293,14 @@ async function fixture() {
     primarySessions,
   };
 }
-async function retained(withClass = true) {
+const RETAINED_WORKSPACE_REF = "synthetic-retained-personal-ref";
+async function retained(
+  withClass = true,
+  organizationId: Promise<string> | string = workspaceBillingOrganizationRef(
+    AUTHORITY,
+    RETAINED_WORKSPACE_REF,
+  ),
+) {
   const f = await fixture();
   const at = new Date(f.stamp).toISOString();
   await f.sql.run(
@@ -361,9 +369,9 @@ async function retained(withClass = true) {
           authTime: f.issuer.authTime,
           accountId: SESSION_TEST_ACCOUNT,
           workspaceId: session.workspaceId,
-          workspaceRef: "synthetic-retained-personal-ref",
+          workspaceRef: RETAINED_WORKSPACE_REF,
         },
-        "synthetic-retained-row-org",
+        await organizationId,
       ),
     ]);
   const request = () =>
@@ -383,7 +391,9 @@ async function retained(withClass = true) {
 }
 
 async function observed() {
-  const f = await retained();
+  return await observedFrom(await retained());
+}
+async function observedFrom(f: Awaited<ReturnType<typeof retained>>) {
   const credential = await captureWorkerRequestRetainedRpSession(
     f.optionsOriginal.connection,
     f.request(),
@@ -409,6 +419,23 @@ test("distinct actual RP originals connect to retained binding DATA without qual
   expect(Object.isFrozen(binding)).toBe(true);
   expect(Object.hasOwn(readers, "readValidatedCredential")).toBe(false);
   expect(Object.hasOwn(readers, "readValidatedPrincipalBinding")).toBe(false);
+});
+
+test("retained session naming an Organization other than the workspace-billing derivation is refused", async () => {
+  for (const organizationId of [
+    "synthetic-retained-row-org",
+    await workspaceBillingOrganizationRef("foreign-billing-authority", RETAINED_WORKSPACE_REF),
+    await workspaceBillingOrganizationRef(AUTHORITY, "foreign-workspace-ref"),
+  ]) {
+    const f = await observedFrom(await retained(true, organizationId));
+    const readers = createWorkerRequestFinancialAuthOriginalReaders(f.optionsOriginal.connection);
+    expect(readers.readCredentialOriginalData(f.credential)?.record.organizationId).toBe(
+      organizationId,
+    );
+    expect(
+      await readers.readRpVerifiedPrincipalBindingOriginalData(f.verified, f.credential),
+    ).toBeNull();
+  }
 });
 
 test("credential capture and matching DTO are not a separate original RP observation", async () => {

@@ -13,6 +13,7 @@ import {
   type WorkerRequestRetainedRpData,
   type WorkerRequestSql,
 } from "./worker-request-composition.ts";
+import { isWorkspaceBillingOrganization } from "./workspace-billing-organization.ts";
 
 /** Redacted observation failure, never positive absence or permission to resend. */
 export class WorkerRequestFinancialAuthOriginalUnavailable extends Error {
@@ -144,6 +145,17 @@ export function createWorkerRequestFinancialAuthOriginalReaders(connection: Work
             workspace.id !== credential.selectedScope.workspaceId
           )
             return null;
+          // The retained session's Organization must be the workspace-billing
+          // derivation for the served realm; a tuple naming any other (or a
+          // never-materialized) Organization stays refused.
+          if (
+            !(await isWorkspaceBillingOrganization(consumers.realm.billingAuthority, {
+              workspaceRef: r.rp.workspaceRef,
+              organizationId: r.organizationId,
+            }))
+          )
+            return null;
+          assertOriginal();
           const retained = await readWorkerRequestRetainedRpPrincipalBindingInputs(
             connection,
             originalRpCredential,

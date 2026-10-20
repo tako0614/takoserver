@@ -12,6 +12,7 @@ import {
   createWorkerRequestSharedRpIssuanceContribution,
   type FreshSharedRpIssuanceData,
 } from "../src/worker-request-shared-principal-issuance.ts";
+import { workspaceBillingOrganizationRef } from "../src/workspace-billing-organization.ts";
 
 // Synthetic storage-only cases. No verified RP/human/native/target/Clock grant.
 const opened = new Set<Database>();
@@ -291,4 +292,80 @@ test("a Sql-like DTO cannot bind the fixed contribution to an actual request ori
     } as WorkerRequestSql),
   ).toThrow();
   expect(f.calls).toHaveLength(0);
+});
+
+// The realm's billing authority selects the workspace-billing Organization
+// contract: the tuple must name the derivation, and the Organization, its owner
+// membership and the Workspace binding join the same fresh issuance batch.
+const AUTHORITY = "takoserver.hosted.staging-test.v1";
+const workspaceBindingsDdl = (() => {
+  const migration = readFileSync(
+    new URL("../migrations/0099_hosted_billing_extensions.sql", import.meta.url),
+    "utf8",
+  );
+  const start = migration.indexOf("CREATE TABLE org_wallet_workspace_bindings");
+  return migration.slice(start, migration.indexOf(");", start) + 2);
+})();
+async function organizationInput(): Promise<FreshSharedRpIssuanceData> {
+  const data = input();
+  return {
+    ...data,
+    organizationId: await workspaceBillingOrganizationRef(AUTHORITY, data.rp.workspaceRef),
+  };
+}
+
+test("fresh issuance materializes the derived workspace billing Organization after the companion", async () => {
+  const f = fixture();
+  f.db.exec(workspaceBindingsDdl);
+  const data = await organizationInput();
+  await createSharedRpPrincipalIssuanceStore({
+    sql: f.sql,
+    workspaceBillingAuthority: AUTHORITY,
+  }).issueFreshOnce(data);
+  expect(f.calls).toHaveLength(1);
+  expect(f.calls[0]).toHaveLength(9);
+  expect(f.calls[0]?.[4]?.sql).toContain("INSERT INTO credential_authority_classes");
+  expect(f.calls[0]?.[5]?.sql).toContain("INSERT INTO orgs");
+  expect(f.db.query("SELECT id, name, owner_principal_id FROM orgs").all()).toEqual([
+    { id: data.organizationId, name: "Personal workspace", owner_principal_id: "prn_fixture" },
+  ]);
+  expect(f.db.query("SELECT org_id, principal_id, role FROM org_memberships").all()).toEqual([
+    { org_id: data.organizationId, principal_id: "prn_fixture", role: "owner" },
+  ]);
+  expect(
+    f.db.query("SELECT workspace_ref, org_id FROM org_wallet_workspace_bindings").all(),
+  ).toEqual([{ workspace_ref: "workspace-ref", org_id: data.organizationId }]);
+});
+
+test("a tuple naming any other Organization is refused before the batch", async () => {
+  const f = fixture();
+  f.db.exec(workspaceBindingsDdl);
+  await expect(
+    createSharedRpPrincipalIssuanceStore({
+      sql: f.sql,
+      workspaceBillingAuthority: AUTHORITY,
+    }).issueFreshOnce(input()),
+  ).rejects.toThrow();
+  expect(f.calls).toHaveLength(0);
+  expect(f.counts().every((row) => (row as { n: number }).n === 0)).toBe(true);
+});
+
+test("an existing Organization owned by another principal aborts the whole issuance", async () => {
+  const f = fixture();
+  f.db.exec(workspaceBindingsDdl);
+  const data = await organizationInput();
+  f.db
+    .query("INSERT INTO orgs (id, name, owner_principal_id, created_at) VALUES (?, ?, ?, ?)")
+    .run(data.organizationId, "Personal workspace", "prn_other", new Date().toISOString());
+  await expect(
+    createSharedRpPrincipalIssuanceStore({
+      sql: f.sql,
+      workspaceBillingAuthority: AUTHORITY,
+    }).issueFreshOnce(data),
+  ).rejects.toThrow();
+  expect(f.counts().every((row) => (row as { n: number }).n === 0)).toBe(true);
+  expect(f.db.query("SELECT count(*) AS n FROM org_memberships").get()).toEqual({ n: 0 });
+  expect(f.db.query("SELECT count(*) AS n FROM org_wallet_workspace_bindings").get()).toEqual({
+    n: 0,
+  });
 });
