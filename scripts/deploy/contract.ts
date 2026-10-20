@@ -248,6 +248,8 @@ export const DEPLOY_CONTRACT = {
         "scripts/deploy/realized-config.ts",
         "scripts/deploy/target.ts",
         "scripts/deploy/schema-money-unit-owner.ts",
+        "scripts/deploy/money-fresh-writer-epoch.ts",
+        "scripts/deploy/fresh-v2-data-readback.ts",
         "scripts/deploy/qualification.ts",
         "scripts/deploy/worker-state.ts",
         "scripts/deploy/signing.ts",
@@ -262,6 +264,7 @@ export const DEPLOY_CONTRACT = {
         "TAKOSERVER_INTEGRATION_STORAGE_ORIGINAL_CREATE_INPUT_PATH",
         "TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_SELECTION_PATH",
         "TAKOSERVER_INTEGRATION_MONEY_MAINTENANCE_REPAIR_SELECTION_PATH",
+        "TAKOSERVER_FRESH_MONEY_WRITER_EPOCH_RECORD_PATH",
       ],
       triggers: ["irreversible", "authority"],
       obligations: {
@@ -276,7 +279,10 @@ export const DEPLOY_CONTRACT = {
           "Only integration --apply with --repair-original-money-maintenance selects same-Worker successor repair. " +
           "Its repair selection is DATA: original source commit and dispatch digest remain immutable, and the " +
           "owner captures the exact native predecessor Version/deployment and historical maintenance closure. " +
-          "The successor belongs to the selected current source commit; neither the flag nor locator JSON grants authority.",
+          "The successor belongs to the selected current source commit; neither the flag nor locator JSON grants authority. " +
+          "A fresh v2-0100-money-preserved first Host is published only with the target's transaction-fenced Money writer policy and its exact minted epoch; " +
+          "before any provider call, TAKOSERVER_FRESH_MONEY_WRITER_EPOCH_RECORD_PATH selects the owner-private 0600 mint record the storage generation retained, " +
+          "which Financial's verifyFreshMoneyWriterEpoch must reproduce for the target's account and generated D1, and the unserved readback then requires that epoch as the D1's only authorized row.",
         "post-conditions":
           "First publication: Authoritative history must identify the acknowledged first Version with no predecessor; source, " +
           "module, bindings, settings, source-declared cron schedule and secret inventory must exactly match " +

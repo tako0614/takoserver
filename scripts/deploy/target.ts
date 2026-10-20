@@ -702,8 +702,21 @@ export function parseDeployTarget(
       "wallet USD-micros maintenance requires an existing integration v2-0092 generated D1/R2 pair",
     );
   }
+  // A fresh Money-preserved generation (`v2-0100-money-preserved`) serves only
+  // through the Money writer bound to its own minted epoch: an ordinary deploy
+  // of exactly its generated `integration-takoserver-<generation>` pair, with no
+  // maintenance profile and none of the Money-original operations.
+  const freshMoneyPreservedWriter =
+    environment === "integration" &&
+    operation === "deploy" &&
+    target.takoformV2?.storageLineage === "v2-0100-money-preserved" &&
+    target.takoformV2.appliedSchemaLineage === undefined &&
+    target.schemaMaintenanceMode === undefined &&
+    /^integration-takoserver-[0-9a-f]{32}$/u.test(target.d1.databaseName) &&
+    target.r2.bucketName === target.d1.databaseName;
   if (
     target.moneyCutoverWriterPolicy !== undefined &&
+    !freshMoneyPreservedWriter &&
     (environment !== "integration" ||
       (target.takoformV2?.storageLineage !== "v2-0092" &&
         target.takoformV2?.appliedSchemaLineage !== "v2-0092") ||

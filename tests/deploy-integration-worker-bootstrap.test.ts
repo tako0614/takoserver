@@ -5,18 +5,29 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DeployError } from "../scripts/deploy/errors.ts";
+import {
+  buildFreshMoneyPreservedPreEpochImport,
+  composeFreshMoneyPreservedImport,
+} from "../scripts/deploy/fresh-money-preserved.ts";
 import type { IntegrationStorageGenerationTargetVerificationOptions } from "../scripts/deploy/integration-storage-generation.ts";
 import {
+  FRESH_MONEY_PRESERVED_HOST_REQUIRES_WRITER,
   type IntegrationWorkerBootstrapOptions,
   type IntegrationWorkerBootstrapSchemaReader,
   type IntegrationWorkerBootstrapState,
   runIntegrationWorkerBootstrap,
 } from "../scripts/deploy/integration-worker-bootstrap.ts";
-import { canonicalSchemaShape, type D1SchemaState } from "../scripts/deploy/migrations.ts";
+import {
+  canonicalSchemaShape,
+  type D1SchemaState,
+  readMigrationArtifact,
+} from "../scripts/deploy/migrations.ts";
+import { mintFreshMoneyWriterEpoch } from "../scripts/deploy/money-fresh-writer-epoch.ts";
 import type { CommandResult } from "../scripts/deploy/process.ts";
 import { expectedWorkerSecrets } from "../scripts/deploy/realized-config.ts";
+import { projectFreshIntegrationV2MigrationArtifact0100 } from "../scripts/deploy/schema.ts";
 import type { SigningDatabase, SigningPublicKeyRow } from "../scripts/deploy/signing.ts";
-import type { DeployTarget } from "../scripts/deploy/target.ts";
+import { type DeployTarget, parseDeployTarget } from "../scripts/deploy/target.ts";
 import type {
   WorkerProcess,
   WorkerProviderExecutorQualification,
@@ -27,6 +38,7 @@ import type {
   WranglerVersionPublicationLease,
 } from "../scripts/deploy/wrangler-state.ts";
 import { MIGRATIONS } from "../src/db-schema.ts";
+import { frameHostMigrationSql } from "../src/sqlite-migration-policy.ts";
 import {
   applyQualifiedMigrationNames,
   copyCurrentSchemaFixture,
@@ -404,7 +416,7 @@ describe("Takoserver integration Worker bootstrap", () => {
     }
   });
 
-  test("the fresh Money-preserved 0100 lineage is refused by apply and published status", async () => {
+  test("a fresh Money-preserved 0100 target without its selected writer is refused by apply and published status", async () => {
     const preserved = {
       ...v2Target0088,
       takoformV2: {
@@ -412,8 +424,7 @@ describe("Takoserver integration Worker bootstrap", () => {
         storageLineage: "v2-0100-money-preserved" as const,
       },
     } satisfies DeployTarget;
-    const refusal =
-      "integration Worker bootstrap does not yet serve the fresh v2-0100-money-preserved lineage";
+    const refusal = FRESH_MONEY_PRESERVED_HOST_REQUIRES_WRITER;
     const fixture = bootstrapFixture({ target: preserved });
     const error = await rejectedError(apply(fixture));
     expect(error).toBeInstanceOf(DeployError);
@@ -427,6 +438,90 @@ describe("Takoserver integration Worker bootstrap", () => {
     const published = bootstrapFixture({ target: preserved, initiallyPublished: true });
     expect(await readPublishedStatus(published)).toMatchObject({ state: "drift", ready: false });
     expect(published.lifecycleCalls).toHaveLength(0);
+  });
+});
+
+describe("fresh v2-0100-money-preserved first Host", () => {
+  test("the unserved readback requires the retained minted epoch, not any well-formed epoch", async () => {
+    const generation = "f".repeat(32);
+    const databaseName = `integration-takoserver-${generation}`;
+    const databaseId = "00000000-0000-4000-8000-0000000001d0";
+    const binding = { accountId: ACCOUNT_ID, databaseId, databaseName, generation };
+    const minted = mintFreshMoneyWriterEpoch(binding);
+    const selected = parseDeployTarget(
+      {
+        ...target,
+        d1: { databaseName, databaseId },
+        r2: { bucketName: databaseName },
+        takoformV2: { config: V2_ARTIFACT_CONFIG, storageLineage: "v2-0100-money-preserved" },
+        moneyCutoverWriterPolicy: "transaction-fenced-usd-micros-v1",
+        moneyCutoverWriterEpoch: minted.epoch,
+      },
+      "fresh money-preserved target",
+      "integration",
+    );
+    const recordDirectory = mkdtempSync(join(fixtureRoot, "epoch-record-"));
+    const recordPath = join(recordDirectory, "money-fresh-writer-epoch.json");
+    writeFileSync(recordPath, `${JSON.stringify(minted)}\n`, { mode: 0o600, flag: "wx" });
+    const preEpoch = buildFreshMoneyPreservedPreEpochImport(
+      projectFreshIntegrationV2MigrationArtifact0100(
+        readMigrationArtifact(join(sourceRoot, "migrations")),
+      ).files,
+    );
+    const unserved =
+      "fresh v2 storage generation already holds data beyond its seeds and signing registration; first Host publication refused";
+    // The D1 holds the target's minted epoch, or a different but well-formed
+    // epoch (another genuine mint for the same D1).
+    for (const [rowRecord, refused] of [
+      [mintFreshMoneyWriterEpoch(binding), true],
+      [minted, false],
+    ] as const) {
+      const database = new Database(":memory:");
+      try {
+        const sql = composeFreshMoneyPreservedImport(preEpoch, rowRecord).sql;
+        for (const statement of frameHostMigrationSql(sql)) database.exec(statement);
+        const applied = (
+          database.query("SELECT name FROM d1_migrations ORDER BY id").all() as { name: string }[]
+        ).map(({ name }) => name);
+        const state = schemaState(
+          applied,
+          canonicalSchemaShape(
+            database
+              .query(
+                "SELECT type, name, tbl_name, COALESCE(sql, '') AS sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name",
+              )
+              .all() as Record<string, unknown>[],
+          ),
+        );
+        const fixture = bootstrapFixture({ target: selected });
+        let localReads = 0;
+        // Every D1 SELECT of the unserved readback is answered by the local D1.
+        const run: WorkerProcess = async (command, input) => {
+          if (command.includes("execute") && command.includes("--command")) {
+            localReads++;
+            const query = command[command.indexOf("--command") + 1] ?? "";
+            return ok(JSON.stringify([{ success: true, results: database.query(query).all() }]));
+          }
+          return await fixture.run(command, input);
+        };
+        const outcome = await apply(fixture, {
+          run,
+          schemaReader: { read: async () => state },
+          v2StorageVerification: v2StorageOptions(selected, async () => state),
+          freshMoneyWriterEpochRecordPath: recordPath,
+        }).then(
+          () => "published",
+          (error: unknown) => (error instanceof Error ? error.message : String(error)),
+        );
+        expect(localReads).toBeGreaterThan(0);
+        if (refused) {
+          expect(outcome).toBe(unserved);
+          expect(fixture.lifecycleCalls).toHaveLength(0);
+        } else expect(outcome).not.toBe(unserved);
+      } finally {
+        database.close();
+      }
+    }
   });
 });
 
