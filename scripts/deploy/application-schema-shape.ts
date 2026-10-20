@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { memoByContent } from "./compile-memo.ts";
 import { preflightError } from "./errors.ts";
 import { canonicalSchemaShape, type D1SchemaState, type MigrationFile } from "./migrations.ts";
 
@@ -12,10 +13,20 @@ const SHA256 = /^sha256:[0-9a-f]{64}$/u;
  * migration/KV metadata rows that do not belong to the application schema.
  */
 export function deriveExpectedApplicationShape(files: readonly MigrationFile[]): string {
+  let contents: string[];
+  try {
+    contents = files.map((file) => readFileSync(file.path, "utf8"));
+  } catch {
+    throw preflightError("audited migrations could not reconstruct the expected canonical schema");
+  }
+  return memoByContent("application-schema-shape@1", contents, () => replayShape(contents));
+}
+
+function replayShape(contents: readonly string[]): string {
   const database = new Database(":memory:");
   try {
-    for (const file of files) {
-      database.exec(readFileSync(file.path, "utf8"));
+    for (const content of contents) {
+      database.exec(content);
     }
     const rows = database
       .query(

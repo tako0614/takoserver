@@ -39,6 +39,7 @@ import {
   readAuth103NativeBuildDefine,
 } from "./auth103-native-source.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
+import { memoByContent } from "./compile-memo.ts";
 import { RemoteD1, sqlLiteral } from "./d1.ts";
 import { buildD1MigrationImport, type D1MigrationImportArtifact } from "./d1-migration-import.ts";
 import {
@@ -408,14 +409,30 @@ function readAuth103RetainedWorkerArtifact(input: {
 }
 
 export function compileAuth103NativeImportShapes(artifact: MigrationArtifact) {
+  // Every file is read and verified on each call; only the replay result is reused.
+  // As before, any read, drift or engine failure surfaces as one opaque refusal.
+  let sources: Buffer[];
+  try {
+    sources = artifact.files.map((file) => {
+      const bytes = readFileSync(file.path);
+      if (bytes.byteLength !== file.bytes || digest(bytes) !== file.digest)
+        throw preflightError("Auth103 source changed while compiling its expected shape");
+      return bytes;
+    });
+  } catch {
+    throw preflightError("Auth103 expected source compilation failed");
+  }
+  return memoByContent("auth103-native-import-shapes@1", sources, () =>
+    replayAuth103NativeImportShapes(sources),
+  );
+}
+
+function replayAuth103NativeImportShapes(sources: readonly Buffer[]) {
   const database = new Database(":memory:", { strict: true });
   try {
     database.query("PRAGMA foreign_keys=ON").all();
     let prefixShape = "";
-    for (const [index, file] of artifact.files.entries()) {
-      const bytes = readFileSync(file.path);
-      if (bytes.byteLength !== file.bytes || digest(bytes) !== file.digest)
-        throw preflightError("Auth103 source changed while compiling its expected shape");
+    for (const [index, bytes] of sources.entries()) {
       database.query("BEGIN IMMEDIATE").all();
       try {
         for (const statement of frameHostMigrationSql(bytes.toString("utf8")))

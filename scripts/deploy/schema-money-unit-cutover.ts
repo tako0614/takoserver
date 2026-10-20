@@ -37,6 +37,7 @@ import {
 import { assertStripeModeRealm } from "../../src/stripe-mode-realm.ts";
 import { applicationSchemaMatches, canonicalApplicationShape } from "./application-schema-shape.ts";
 import { readAuth103CanonicalMigrationSource } from "./auth103-canonical-migration-source.ts";
+import { memoByContent } from "./compile-memo.ts";
 import { RemoteD1, sqlLiteral } from "./d1.ts";
 import { buildD1MigrationImport } from "./d1-migration-import.ts";
 import { normalizeSnapshotDump } from "./d1-snapshot-restore.ts";
@@ -637,6 +638,23 @@ function moneyPostExpectedPreservedShape(
     )
   )
     throw preflightError("money preserved shape requires the exact selected source inventory");
+  // The inputs are validated above on every call; the replay result is reused
+  // only for the identical bytes, and each replay still re-reads its files.
+  let contents: Buffer[];
+  try {
+    contents = files.map((file) => readFileSync(file.path));
+  } catch {
+    throw preflightError("money preserved shape source could not be read");
+  }
+  return memoByContent(`money-preserved-shape@1:${through}`, contents, () =>
+    replayMoneyPostExpectedPreservedShape(files, through),
+  );
+}
+
+function replayMoneyPostExpectedPreservedShape(
+  files: readonly MigrationFile[],
+  through: 100 | 103,
+): string {
   const database = new Database(":memory:", { strict: true });
   let stage = "prefix94";
   try {
