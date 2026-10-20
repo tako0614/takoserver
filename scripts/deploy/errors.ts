@@ -17,9 +17,15 @@ export const PHASE_EXIT_CODE: Readonly<Record<DeployPhase, number>> = {
  * field is a fixed vocabulary value: never a description, SQL, output or data.
  */
 export interface DeployReason {
-  readonly code: "d1-transport" | "d1-command";
-  readonly operation: "d1-read" | "d1-statement";
-  /** Wrangler invocations made for this one operation, retries included. */
+  readonly code: "d1-transport" | "d1-command" | "http-transport" | "http-status" | "http-response";
+  readonly operation:
+    | "d1-read"
+    | "d1-statement"
+    | "storage-read"
+    | "storage-write"
+    | "health-read"
+    | "provider-read";
+  /** Requests or Wrangler invocations made for this one operation, retries included. */
   readonly attempts: number;
 }
 

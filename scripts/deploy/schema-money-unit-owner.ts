@@ -19,7 +19,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type * as TypeScript from "typescript";
 import { SHARED_AUTH_STAGING_PROFILE } from "../../src/shared-auth-oidc-client.ts";
 import { CloudflareState } from "./cloudflare-state.ts";
-import { mutationError, preflightError } from "./errors.ts";
+import { DeployError, type DeployReason, mutationError, preflightError } from "./errors.ts";
 import {
   CloudflareIntegrationStorageProvider,
   type IntegrationStorageGenerationInvocation,
@@ -1739,31 +1739,128 @@ function custody(directory: string, originalRead = false): MoneyCutoverCustody {
   };
 }
 
+const CLOSED_REASON_CODES: readonly string[] = [
+  "d1-transport",
+  "d1-command",
+  "http-transport",
+  "http-status",
+  "http-response",
+];
+const CLOSED_REASON_OPERATIONS: readonly string[] = [
+  "d1-read",
+  "d1-statement",
+  "storage-read",
+  "storage-write",
+  "health-read",
+  "provider-read",
+];
+
+/** A copy of an error's closed DeployReason; anything else is dropped. */
+function closedReason(error: unknown): DeployReason | undefined {
+  const reason = error instanceof Error ? (error as { reason?: unknown }).reason : undefined;
+  if (reason === null || typeof reason !== "object") return undefined;
+  const { code, operation, attempts } = reason as Record<string, unknown>;
+  return typeof code === "string" &&
+    CLOSED_REASON_CODES.includes(code) &&
+    typeof operation === "string" &&
+    CLOSED_REASON_OPERATIONS.includes(operation) &&
+    Number.isSafeInteger(attempts)
+    ? Object.freeze({ code, operation, attempts } as DeployReason)
+    : undefined;
+}
+
+// At most two more reads, each bounded by a 15 s timeout, with waits capped at
+// 8 s and the whole health read inside one 60 s budget.
+const HEALTH_PROBE_RETRY_DELAYS_MS: readonly number[] = [1_000, 4_000];
+const HEALTH_PROBE_MAX_WAIT_MS = 8_000;
+const HEALTH_PROBE_TOTAL_MS = 60_000;
+
+/**
+ * One health read. Only a request that fails before a response, a body that
+ * fails while being read, HTTP 429, or a temporary 5xx other than 503 is read
+ * again, a bounded number of times. Every other answer is judged once,
+ * including the expected maintenance 503 and any non-JSON or wrong body. The
+ * 15 s timeout covers both the response and reading its body.
+ */
+/** Exported for its retry and classification tests only. */
+export async function healthRead(
+  origin: string,
+  fetcher: NonNullable<MoneyUnitOwnerDependencies["fetcher"]>,
+  delays: readonly number[],
+): Promise<{ readonly response: Response; readonly body: unknown }> {
+  const deadline = Date.now() + HEALTH_PROBE_TOTAL_MS;
+  for (let attempt = 1; ; attempt += 1) {
+    const delay = delays[attempt - 1];
+    const failed = (message: string, code: DeployReason["code"]): DeployError =>
+      new DeployError("preflight", message, undefined, {
+        code,
+        operation: "health-read",
+        attempts: attempt,
+      });
+    let retryable: {
+      readonly code: "http-transport" | "http-status";
+      readonly retryAfterMs?: number;
+    };
+    let response: Response | undefined;
+    try {
+      response = await fetcher(`${origin}/healthz`, {
+        method: "GET",
+        headers: { "cache-control": "no-cache" },
+        redirect: "error",
+        signal: AbortSignal.timeout(15_000),
+      });
+    } catch {
+      response = undefined;
+    }
+    if (response === undefined) retryable = { code: "http-transport" };
+    else if (response.status === 429 || (response.status >= 500 && response.status !== 503)) {
+      const retryAfter = Number(response.headers.get("retry-after") ?? "");
+      await response.body?.cancel().catch(() => {});
+      retryable = {
+        code: "http-status",
+        ...(Number.isFinite(retryAfter) && retryAfter >= 0
+          ? { retryAfterMs: retryAfter * 1000 }
+          : {}),
+      };
+    } else {
+      let text: string | undefined;
+      try {
+        text = await response.text();
+      } catch {
+        text = undefined;
+      }
+      // Only a successful answer whose body broke is read again; a 503 or 4xx
+      // whose body broke is judged now, as unavailable.
+      if (text === undefined && !response.ok)
+        throw failed("money Worker health probe is unavailable", "http-transport");
+      if (text === undefined) retryable = { code: "http-transport" };
+      else {
+        try {
+          return { response, body: JSON.parse(text) };
+        } catch {
+          throw failed("money Worker health response is malformed", "http-response");
+        }
+      }
+    }
+    const message = "money Worker health probe is unavailable";
+    if (delay === undefined) throw failed(message, retryable.code);
+    const wait = Math.min(Math.max(delay, retryable.retryAfterMs ?? 0), HEALTH_PROBE_MAX_WAIT_MS);
+    if (Date.now() + wait > deadline) throw failed(message, retryable.code);
+    await Bun.sleep(wait);
+  }
+}
+
 async function probe(
   origin: string,
   fetcher: NonNullable<MoneyUnitOwnerDependencies["fetcher"]>,
   expected: "maintenance" | "guarded" | "healthy",
+  delays: readonly number[] = HEALTH_PROBE_RETRY_DELAYS_MS,
 ): Promise<void> {
   if (expected === "guarded") {
     await probeMoneyCutoverFrozen(origin, fetcher);
     return;
   }
-  let response: Response;
-  try {
-    response = await fetcher(`${origin}/healthz`, {
-      method: "GET",
-      headers: { "cache-control": "no-cache" },
-      redirect: "error",
-    });
-  } catch {
-    throw preflightError("money Worker health probe is unavailable");
-  }
-  let body: unknown;
-  try {
-    body = await response.json();
-  } catch {
-    throw preflightError("money Worker health response is malformed");
-  }
+  const { response, body } = await healthRead(origin, fetcher, delays);
   if (expected === "maintenance") {
     if (
       response.status !== 503 ||
@@ -4112,8 +4209,14 @@ async function loadMoneyUnitOwnerOptions(
       let result: T;
       try {
         result = await operation();
-      } catch {
-        throw preflightError("money normal Worker native/source observation failed");
+      } catch (error) {
+        // The message stays generic; only a closed reason of the failed read is kept.
+        throw new DeployError(
+          "preflight",
+          "money normal Worker native/source observation failed",
+          undefined,
+          closedReason(error),
+        );
       }
       assertLocal();
       await assertMoneyUnitHeldConvertCurrent(context);
@@ -4401,10 +4504,22 @@ async function loadMoneyUnitOwnerOptions(
     ...(declaration.resumeCommit === undefined ? {} : { resumeCommit: declaration.resumeCommit }),
     stageOriginProof: readOrigin,
     async storageIdentityRead() {
-      const [d1, r2] = await Promise.all([
-        selectedStorage.getD1(target.d1.databaseId),
-        selectedStorage.getR2(target.r2.bucketName),
-      ]);
+      let d1: Awaited<ReturnType<typeof selectedStorage.getD1>>;
+      let r2: Awaited<ReturnType<typeof selectedStorage.getR2>>;
+      try {
+        [d1, r2] = await Promise.all([
+          selectedStorage.getD1(target.d1.databaseId),
+          selectedStorage.getR2(target.r2.bucketName),
+        ]);
+      } catch (error) {
+        // Keep only the provider's closed reason, never its message or response.
+        throw new DeployError(
+          "preflight",
+          "money selected staging D1/R2 native GET failed",
+          undefined,
+          closedReason(error),
+        );
+      }
       if (
         d1.uuid !== target.d1.databaseId ||
         d1.name !== target.d1.databaseName ||

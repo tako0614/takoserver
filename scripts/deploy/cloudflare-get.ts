@@ -1,6 +1,11 @@
-import { DeployError, preflightError } from "./errors.ts";
+import { DeployError, type DeployReason, preflightError } from "./errors.ts";
 
 const ATTEMPT_DEADLINE_MS = 14_900;
+// At most two more GETs after a transport failure, HTTP 429 or a 5xx, with
+// waits capped at 8 s (a finite Retry-After included) inside one 60 s budget.
+const GET_RETRY_DELAYS_MS: readonly number[] = [1_000, 4_000];
+const GET_RETRY_MAX_WAIT_MS = 8_000;
+const GET_RETRY_TOTAL_MS = 60_000;
 const CLEANUP_DEADLINE_MS = 100;
 
 type GetFetcher = (request: Request) => Promise<Response>;
@@ -13,8 +18,13 @@ export class CloudflareGetTransportError extends DeployError {
     label: string,
     readonly status: number,
     reason: string,
+    attempts = 1,
   ) {
-    super("preflight", `${label} transport failed`, reason);
+    super("preflight", `${label} transport failed`, reason, {
+      code: "http-transport",
+      operation: "provider-read",
+      attempts,
+    });
   }
 }
 
@@ -42,8 +52,9 @@ class RetryableTransportFailure extends Error {
 }
 
 /**
- * A GET-only transport boundary. HTTP status and decoded content remain the
- * caller's authority; only raw fetch/body transport failures may be retried.
+ * A GET-only transport boundary. Raw fetch/body transport failures and HTTP
+ * 429/5xx are read again a bounded number of times; the last answer, and every
+ * other status or decoded content, remains the caller's authority.
  */
 export async function readCloudflareGetText(input: {
   readonly fetcher: GetFetcher;
@@ -52,11 +63,21 @@ export async function readCloudflareGetText(input: {
   readonly label: string;
   /** Preserve a caller's existing UTF-8 BOM handling; public state defaults to false. */
   readonly ignoreBOM?: boolean;
-}): Promise<{ readonly response: Response; readonly text: string }> {
+  /** Test seam for the bounded waits; deploy callers keep the default. */
+  readonly retryDelaysMs?: readonly number[];
+}): Promise<{ readonly response: Response; readonly text: string; readonly attempts: number }> {
   if (!Number.isSafeInteger(input.maximumBytes) || input.maximumBytes < 1) {
     throw preflightError(`${input.label} response bound is invalid`);
   }
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  const budget = Date.now() + GET_RETRY_TOTAL_MS;
+  const delays = input.retryDelaysMs ?? GET_RETRY_DELAYS_MS;
+  const waitFor = (attempt: number, retryAfterMs = 0): number | undefined => {
+    const delay = delays[attempt];
+    if (delay === undefined) return undefined;
+    const wait = Math.min(Math.max(delay, retryAfterMs), GET_RETRY_MAX_WAIT_MS);
+    return Date.now() + wait > budget ? undefined : wait;
+  };
+  for (let attempt = 0; attempt <= delays.length; attempt += 1) {
     const controller = new AbortController();
     let expire: (() => void) | undefined;
     const deadline = new Promise<never>((_, reject) => {
@@ -90,7 +111,21 @@ export async function readCloudflareGetText(input: {
         if (isRawTransportFailure(error)) {
           throw new RetryableTransportFailure(safeReason(error));
         }
-        throw new CloudflareGetTransportError(input.label, 0, safeReason(error));
+        throw new CloudflareGetTransportError(input.label, 0, safeReason(error), attempt + 1);
+      }
+      if (response.status === 429 || response.status >= 500) {
+        const retryAfter = Number(response.headers.get("retry-after") ?? "");
+        const wait = waitFor(
+          attempt,
+          Number.isFinite(retryAfter) && retryAfter >= 0 ? retryAfter * 1000 : 0,
+        );
+        if (wait !== undefined) {
+          void cancelBody(response.body).catch(() => undefined);
+          if (timer !== undefined) clearTimeout(timer);
+          controller.abort();
+          await Bun.sleep(wait);
+          continue;
+        }
       }
       const text = await readBoundedResponseText(
         response,
@@ -101,19 +136,35 @@ export async function readCloudflareGetText(input: {
         input.ignoreBOM ?? false,
       );
       if (controller.signal.aborted) throw new RetryableTransportFailure("TimeoutError");
-      return { response, text };
+      return { response, text, attempts: attempt + 1 };
     } catch (error) {
       const retryable = error instanceof RetryableTransportFailure;
-      if (
-        retryable &&
-        attempt === 0 &&
-        (response === undefined || isSuccessfulResponse(response))
-      ) {
+      const wait =
+        retryable && (response === undefined || isSuccessfulResponse(response))
+          ? waitFor(attempt)
+          : undefined;
+      if (wait !== undefined) {
+        if (timer !== undefined) clearTimeout(timer);
+        controller.abort();
+        await Bun.sleep(wait);
         continue;
       }
       if (retryable) {
-        throw new CloudflareGetTransportError(input.label, response?.status ?? 0, error.reason);
+        throw new CloudflareGetTransportError(
+          input.label,
+          response?.status ?? 0,
+          error.reason,
+          attempt + 1,
+        );
       }
+      // A transport error raised inside the body reader counts this attempt too.
+      if (error instanceof CloudflareGetTransportError && error.reason?.attempts !== attempt + 1)
+        throw new CloudflareGetTransportError(
+          input.label,
+          error.status,
+          error.detail ?? "",
+          attempt + 1,
+        );
       throw error;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
