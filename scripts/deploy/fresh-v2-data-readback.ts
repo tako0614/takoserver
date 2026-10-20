@@ -75,6 +75,8 @@ export interface FreshV2DataReadbackOptions {
     readonly record: unknown;
     readonly binding: FreshMoneyWriterEpochBinding;
   };
+  /** Called once Financial's verifier has run and accepted the retained mint. */
+  readonly onWriterEpochVerified?: () => void;
 }
 
 const FRESH_V2_SEED_TABLES = [
@@ -169,6 +171,7 @@ export async function assertFreshV2DataReadback(
     } catch {
       throw new DeployError(phase, FRESH_V2_MONEY_WRITER_EPOCH_MISMATCH);
     }
+    options.onWriterEpochVerified?.();
   }
   // A complete plain 0100 schema without its pin is an interrupted import,
   // never an in-use generation; say so before the generic refusal.

@@ -1,7 +1,15 @@
 import { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+} from "node:fs";
+import { isAbsolute, join } from "node:path";
 import { frameHostMigrationSql } from "../../src/sqlite-migration-policy.ts";
 import { canonicalApplicationShape } from "./application-schema-shape.ts";
 import type { D1MigrationImportArtifact } from "./d1-migration-import.ts";
@@ -40,12 +48,52 @@ export const FRESH_MONEY_WRITER_EPOCH_RECORD_FILE = "money-fresh-writer-epoch.js
 const RECORD_LIMIT = 4096;
 
 /**
- * Reads a retained Writer epoch record from `root`, or null when none exists.
- * It is accepted only as a link-free regular file of mode 0600 and at most
- * 4 KiB; anything else at that name is refused rather than ignored. The
- * content is returned as untrusted data for `verifyFreshMoneyWriterEpoch`.
+ * The operator-chosen directory that holds the Writer epoch record across
+ * apply and status (`--epoch-record-directory`). It must be an absolute,
+ * link-free directory owned by this user with no group or other access.
+ * `create` makes a missing directory 0700 (its parent must exist); `read`
+ * answers false for a missing one. A looser or foreign directory is refused.
  */
-export function readRetainedFreshMoneyWriterEpochRecord(root: string): unknown | null {
+export function assertFreshMoneyEpochRecordDirectory(
+  directory: string,
+  mode: "create" | "read",
+): boolean {
+  if (typeof directory !== "string" || !isAbsolute(directory) || /[\0\r\n]/u.test(directory))
+    throw preflightError("fresh Money Writer epoch record directory must be one absolute path");
+  let status: ReturnType<typeof lstatSync>;
+  try {
+    status = lstatSync(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT")
+      throw preflightError("fresh Money Writer epoch record directory is unreadable");
+    if (mode === "read") return false;
+    try {
+      mkdirSync(directory, { mode: 0o700 });
+      status = lstatSync(directory);
+    } catch {
+      throw preflightError("fresh Money Writer epoch record directory could not be created");
+    }
+  }
+  if (
+    !status.isDirectory() ||
+    (status.mode & 0o077) !== 0 ||
+    (typeof process.getuid === "function" && status.uid !== process.getuid())
+  )
+    throw preflightError(
+      "fresh Money Writer epoch record directory must be an operator-owned 0700 directory",
+    );
+  return true;
+}
+
+/**
+ * Reads a retained Writer epoch record from `root`, or null when no file
+ * exists there. It is accepted only as a link-free regular file of mode 0600,
+ * at most 4 KiB, holding one plain JSON object; anything else at that name
+ * (a link, a looser mode, an oversize file, JSON `null`, an array) is
+ * refused rather than treated as absent. The object is returned as untrusted
+ * data for `verifyFreshMoneyWriterEpoch`.
+ */
+export function readRetainedFreshMoneyWriterEpochRecord(root: string): object | null {
   const path = join(root, FRESH_MONEY_WRITER_EPOCH_RECORD_FILE);
   let status: ReturnType<typeof lstatSync>;
   try {
@@ -59,6 +107,7 @@ export function readRetainedFreshMoneyWriterEpochRecord(root: string): unknown |
       "retained fresh Money Writer epoch record is not an operator-private regular file",
     );
   let fd: number | null = null;
+  let parsed: unknown;
   try {
     fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
     const opened = fstatSync(fd);
@@ -69,12 +118,20 @@ export function readRetainedFreshMoneyWriterEpochRecord(root: string): unknown |
       opened.size > RECORD_LIMIT
     )
       throw new Error("record changed");
-    return JSON.parse(readFileSync(fd, "utf8")) as unknown;
+    parsed = JSON.parse(readFileSync(fd, "utf8")) as unknown;
   } catch {
     throw preflightError("retained fresh Money Writer epoch record is unreadable");
   } finally {
     if (fd !== null) closeSync(fd);
   }
+  if (
+    parsed === null ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    Object.getPrototypeOf(parsed) !== Object.prototype
+  )
+    throw preflightError("retained fresh Money Writer epoch record is not one plain object");
+  return parsed;
 }
 
 /** Financial's mint, injectable for tests. The default is the real owner function. */

@@ -1136,7 +1136,8 @@ export const DEPLOY_CONTRACT = {
           "which inserts only when no pin and no financial history exist and fails the import otherwise. " +
           "For v2-0100-money-preserved the one sealed import is instead the Money-preserved 0001-0100 replay, Financial's test realm claim over that replay's own inventory, " +
           "then one money_cutover_authorized_epoch row; its Writer epoch is minted by the Financial owner only after the new D1 identity readback and before the import is written, " +
-          "never derived from an old D1, frame or production, and the full epoch record stays operator-private (0600) beside the generation artifact. " +
+          "never derived from an old D1, frame or production, and the full epoch record stays operator-private (0600) beside the generation artifact, " +
+          "in the operator-owned 0700 --epoch-record-directory when given (status then verifies the epoch against it). " +
           "Every newly created D1 must have its selected integration-prefixed name and never be production-named; in default mode, when " +
           "TAKOSERVER_DEPLOY_TARGET_PRODUCTION is set its exact D1 name and id are refused before creation and again once the new id " +
           "is known, and applying v2-0091, v2-0092, v2-0100 or v2-0100-money-preserved requires that production target. " +
