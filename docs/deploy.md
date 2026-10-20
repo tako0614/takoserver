@@ -303,10 +303,25 @@ hard-coded. Callers can inject the mint as the `freshMoneyWriterEpoch` option;
 an explicitly absent port refuses before any provider call with "the fresh Money
 writer epoch owner is unavailable".
 
-The full epoch record holds a nonce. It is written once, mode 0600, as
-`money-fresh-writer-epoch.json` in the generation's output root (a retained
-`takoserver-integration-storage-*` temporary directory when no output directory
-is given), never in the repository or the command output.
+The full epoch record holds a nonce. Apply writes it once, mode 0600, as
+`money-fresh-writer-epoch.json`, never in the repository or the command output:
+
+- With `--epoch-record-directory=<absolute-dir>` (accepted only with this
+  lineage, on both `--apply` and `--status`), it goes in that operator-chosen
+  directory. It must be one canonical absolute path (no trailing slash, `.` or
+  `..`) with no symbolic link in any component. Apply creates a missing
+  directory with mode 0700 under an existing link-free parent. Before any
+  provider call, apply refuses when the directory is not owned by you, allows
+  any group or other access, or already has anything at the record name (even
+  a dangling link). It checks the directory again right before writing the
+  record; if that check fails, the run stops with the new D1 identity and no
+  record. Use one directory per generation.
+- Without the flag, apply keeps the record in a retained
+  `takoserver-integration-storage-*` temporary directory and reports its path.
+
+The apply result names the record's path and file digest
+(`moneyWriterEpochRecord`). If apply fails after the mint, the error detail
+names the same path and digest, never the content, so the operator can find it.
 
 In every other respect it behaves like `v2-0100`:
 
@@ -320,10 +335,20 @@ Differences from `v2-0100`:
 
 - The data proof reads the exact preserved shape, 100 ledger rows, the seeds,
   `money_unit_policy`, exactly one `test` pin with a canonical instant and
-  exactly one authorized-epoch row. Apply checks that row against the retained
-  record with `verifyFreshMoneyWriterEpoch`; status, which never holds the
-  record, checks only that it is one well-formed epoch. Freeze and permit hold
-  zero rows, and every other table is empty.
+  exactly one authorized-epoch row. Freeze and permit hold zero rows, and
+  every other table is empty. Apply checks the epoch row against the record
+  with `verifyFreshMoneyWriterEpoch`.
+- `--status` with the same `--epoch-record-directory` reads the record from
+  there and runs the same check, refusing a mismatch. The record must be a
+  link-free regular file of mode 0600, at most 4 KiB, holding one plain JSON
+  object; anything else at that name (a link, a looser mode, an oversize file,
+  JSON `null`, an array) is refused. Only a missing directory or file means
+  absent, and then status checks only that the row is one well-formed epoch.
+  Status reports which check ran in `writerEpochCheck`:
+  - `"retained-record"`: the verifier ran and accepted the record;
+  - `"not-run"`: a record was loaded but the D1 is incomplete or interrupted,
+    so the verifier did not run;
+  - `"form-only"`: no record was found.
 - A complete schema without its pin or its epoch row is an interrupted import:
   `--status` reports `dataReadback: "interrupted"` and quarantines it.
 - The apply record adds `moneyPreserved: { epochBindingDigest, shapeDigest }`
@@ -334,7 +359,8 @@ Differences from `v2-0100`:
   qualified.
 
 ```sh
-bun run deploy -- takoserver-integration-storage-generation --apply --environment=integration --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-0100-money-preserved
+bun run deploy -- takoserver-integration-storage-generation --apply --environment=integration --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-0100-money-preserved --epoch-record-directory=<absolute-private-dir>
+bun run deploy -- takoserver-integration-storage-generation --status --environment=integration --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-0100-money-preserved --epoch-record-directory=<absolute-private-dir>
 ```
 
 #### Financial realm claim and Writer epoch for a fresh Money-preserved D1

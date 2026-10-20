@@ -83,6 +83,8 @@ const USAGE = `takoserver deploy
     v2-0091/v2-0092/v2-0100/v2-0100-money-preserved are staging-only and their apply requires TAKOSERVER_DEPLOY_TARGET_PRODUCTION to refuse the production D1;
     v2-0100 is the plain serving lineage whose import also claims the test Stripe realm;
     v2-0100-money-preserved imports the Money-preserved 0100 shape, the test realm claim and one fresh Writer epoch row)
+    [--epoch-record-directory=<absolute-dir>] (v2-0100-money-preserved only: operator-owned 0700 directory where apply
+    writes the 0600 Writer epoch record and status verifies it; omitted, apply keeps it in a retained temporary root)
   bun run deploy -- takoserver-integration-storage-disposal --<status|apply> --environment=integration --commit=<sha>
     (one exact selected D1/R2 pair only; refuses current regular/dispatch Worker bindings)
   bun run deploy -- takoserver-integration-host-retirement --<status|apply> --environment=integration --commit=<sha>
@@ -268,6 +270,7 @@ type Invocation =
         | "v2-0092"
         | "v2-0100"
         | "v2-0100-money-preserved";
+      readonly epochRecordDirectory?: string;
     })
   | (InvocationBase & {
       readonly surface: ProductionD1FreshInitSurface;
@@ -327,6 +330,7 @@ interface ParsedInvocation {
     | "v2-0092"
     | "v2-0100"
     | "v2-0100-money-preserved";
+  readonly epochRecordDirectory?: string;
   readonly protectedReferenceEnvironment?: "integration" | "production";
   readonly organizationId?: string;
   readonly keyName?: string;
@@ -406,6 +410,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     | "v2-0100-money-preserved"
     | null = null;
   let retiredTargetPath: string | null = null;
+  let epochRecordDirectory: string | null = null;
   let retiredDeploymentId: string | null = null;
   let retiredVersionId: string | null = null;
   let legacyPredecessorVersionId: string | null = null;
@@ -439,6 +444,13 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     if (flag === "--repair-original-money-maintenance") {
       if (repairOriginalMoneyMaintenance) return null;
       repairOriginalMoneyMaintenance = true;
+      continue;
+    }
+    if (flag.startsWith("--epoch-record-directory=")) {
+      const value = flag.slice("--epoch-record-directory=".length);
+      if (epochRecordDirectory !== null || !isAbsolute(value) || /[\0\r\n]/u.test(value))
+        return null;
+      epochRecordDirectory = value;
       continue;
     }
     if (flag.startsWith("--retired-target=")) {
@@ -751,10 +763,17 @@ function parseInvocation(args: readonly string[]): Invocation | null {
   )
     return null;
   if ((generation !== null) !== (storageGeneration || productionFreshInit)) return null;
+  // The epoch record directory belongs only to the Money-preserved generation.
+  if (
+    epochRecordDirectory !== null &&
+    (!storageGeneration || freshLineage !== "v2-0100-money-preserved")
+  )
+    return null;
   if (
     storageGeneration &&
     (environment !== "integration" ||
-      args.length !== (freshLineage === null ? 5 : 6) ||
+      args.length !==
+        5 + (freshLineage === null ? 0 : 1) + (epochRecordDirectory === null ? 0 : 1) ||
       (action !== "status" && action !== "apply"))
   ) {
     return null;
@@ -912,7 +931,11 @@ function parseInvocation(args: readonly string[]): Invocation | null {
       ? { surface: surfaceValue, action, environment, commit }
       : null;
   }
-  const budget = 6 + (adoptLivePath === null ? 0 : 1) + (bootstrapVerifierBridge ? 1 : 0);
+  const budget =
+    6 +
+    (adoptLivePath === null ? 0 : 1) +
+    (bootstrapVerifierBridge ? 1 : 0) +
+    (epochRecordDirectory === null ? 0 : 1);
   if (closurePredecessorVersionId === null) {
     // Every other invocation keeps the historical exact flag budget.
     if (args.length > budget || hasClosureDelta) return null;
@@ -1135,6 +1158,7 @@ function parseInvocation(args: readonly string[]): Invocation | null {
     ...(protectedReferenceEnvironment === null ? {} : { protectedReferenceEnvironment }),
     ...(generation === null ? {} : { generation }),
     ...(freshLineage === null ? {} : { freshLineage }),
+    ...(epochRecordDirectory === null ? {} : { epochRecordDirectory }),
     ...(reverse ? { reverse: true } : {}),
   } as Invocation;
 }
@@ -1653,11 +1677,12 @@ async function dispatch(invocation: Invocation): Promise<Record<string, unknown>
         productionPath === undefined || productionPath === ""
           ? undefined
           : loadTarget(productionPath, "production");
-      return await runIntegrationStorageGeneration(
-        invocation,
-        target,
-        production === undefined ? {} : { productionD1: production.d1 },
-      );
+      return await runIntegrationStorageGeneration(invocation, target, {
+        ...(production === undefined ? {} : { productionD1: production.d1 }),
+        ...(invocation.epochRecordDirectory === undefined
+          ? {}
+          : { epochRecordDirectory: invocation.epochRecordDirectory }),
+      });
     }
     case "takoserver-production-d1-fresh-init":
       return await runProductionD1FreshInit(

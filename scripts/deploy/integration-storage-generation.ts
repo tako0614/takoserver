@@ -41,11 +41,15 @@ import {
 import { readFinancial0104CanonicalMigrationSource } from "./financial0104-canonical-source.ts";
 import { financial0104SourceSchemaReady } from "./financial0104-schema-shape.ts";
 import {
+  assertFreshMoneyEpochRecordDirectory,
   buildFreshMoneyPreservedPreEpochImport,
   composeFreshMoneyPreservedImport,
   FRESH_MONEY_PRESERVED_LINEAGE,
   FRESH_MONEY_WRITER_EPOCH_OWNER_UNAVAILABLE,
+  FRESH_MONEY_WRITER_EPOCH_RECORD_FILE,
   type FreshMoneyWriterEpochPort,
+  freshMoneyWriterEpochRecordPresent,
+  readRetainedFreshMoneyWriterEpochRecord,
 } from "./fresh-money-preserved.ts";
 import {
   appendFreshStripeRealmClaim,
@@ -54,6 +58,7 @@ import {
 import {
   assertFreshV2DataReadback,
   FRESH_V2_INTERRUPTED_MONEY_PRESERVED,
+  FRESH_V2_MONEY_WRITER_EPOCH_MISMATCH,
   FRESH_V2_UNPINNED_0100,
   type FreshV2D1Lineage,
   type FreshV2DataReader,
@@ -428,6 +433,13 @@ export interface IntegrationStorageGenerationOptions {
    * function; an explicitly absent port refuses before any provider call.
    */
   readonly freshMoneyWriterEpoch?: FreshMoneyWriterEpochPort | undefined;
+  /**
+   * `v2-0100-money-preserved` only (`--epoch-record-directory`): the
+   * operator-owned 0700 directory where apply writes the 0600 Writer epoch
+   * record and where status reads it back. Omitted, apply keeps the record in
+   * its own retained temporary root and status checks only the epoch's form.
+   */
+  readonly epochRecordDirectory?: string;
 }
 
 export interface IntegrationStorageGenerationTargetProof {
@@ -535,6 +547,25 @@ export async function runIntegrationStorageGeneration(
     typeof freshMoneyWriterEpochPort(options) !== "function"
   ) {
     throw preflightError(FRESH_MONEY_WRITER_EPOCH_OWNER_UNAVAILABLE);
+  }
+  if (options.epochRecordDirectory !== undefined) {
+    if (invocation.freshLineage !== FRESH_MONEY_PRESERVED_LINEAGE)
+      throw preflightError(
+        "an epoch record directory is accepted only for the v2-0100-money-preserved lineage",
+      );
+    // Before any provider call: apply owns (or creates) one private directory
+    // that holds no earlier record; status only reads a private one.
+    if (
+      assertFreshMoneyEpochRecordDirectory(
+        options.epochRecordDirectory,
+        invocation.action === "apply" ? "create" : "read",
+      ) &&
+      invocation.action === "apply" &&
+      freshMoneyWriterEpochRecordPresent(options.epochRecordDirectory)
+    )
+      throw preflightError(
+        "the epoch record directory already holds a Writer epoch record; choose a new directory",
+      );
   }
   if (invocation.action === "status") {
     const provider = await resolveProvider(target, options);
@@ -2160,6 +2191,16 @@ async function statusStorageGeneration(
     let dataEmpty: boolean | null = null;
     let unpinned = false;
     let interrupted = false;
+    // A Money-preserved status verifies the epoch against the retained mint
+    // when it sits in this output root; otherwise only its form is visible.
+    const recordDirectory = options.epochRecordDirectory ?? options.outputDirectory;
+    const retainedRecord =
+      freshV2 === FRESH_MONEY_PRESERVED_LINEAGE &&
+      recordDirectory !== undefined &&
+      existsSync(recordDirectory)
+        ? readRetainedFreshMoneyWriterEpochRecord(recordDirectory)
+        : null;
+    let writerEpochVerified = false;
     if (complete && freshV2 !== null) {
       try {
         await assertFreshV2DataReadback(
@@ -2168,10 +2209,32 @@ async function statusStorageGeneration(
           configPath,
           provider.environment,
           expectedShape,
-          { ...options, run: options.run ?? runCommand },
+          {
+            ...options,
+            run: options.run ?? runCommand,
+            ...(retainedRecord === null
+              ? {}
+              : {
+                  onWriterEpochVerified: () => {
+                    writerEpochVerified = true;
+                  },
+                  moneyWriterEpoch: {
+                    record: retainedRecord,
+                    binding: {
+                      accountId: target.accountId,
+                      databaseId: d1.uuid,
+                      databaseName: names.databaseName,
+                      generation: invocation.generation,
+                    },
+                  },
+                }),
+          },
         );
         dataEmpty = true;
       } catch (error) {
+        // A retained mint that does not match this D1 is refused, not classified.
+        if (error instanceof DeployError && error.message === FRESH_V2_MONEY_WRITER_EPOCH_MISMATCH)
+          throw error;
         // A complete schema with application rows is a generation a Host (or
         // the signing registration) has already written, not a broken import.
         // A plain 0100 schema without its pin is the exception: the import
@@ -2191,6 +2254,11 @@ async function statusStorageGeneration(
             ? "interrupted"
             : "present";
     }
+    // "retained-record" only when Financial's verifier ran and accepted the
+    // record; a loaded record on an incomplete or interrupted D1 is "not-run".
+    if (freshV2 === FRESH_MONEY_PRESERVED_LINEAGE)
+      result.writerEpochCheck =
+        retainedRecord === null ? "form-only" : writerEpochVerified ? "retained-record" : "not-run";
     original?.assertUnchanged();
     result.resume =
       !complete || unpinned || interrupted
@@ -2554,11 +2622,16 @@ async function applyStorageGeneration(
       epochRecord = minted;
       // The record holds the nonce: operator-private beside the generation's
       // artifact, never in the repository or the command output.
-      epochRecordPath = join(root, "money-fresh-writer-epoch.json");
-      writeFileSync(epochRecordPath, `${JSON.stringify(minted)}\n`, {
-        mode: 0o600,
-        flag: "wx",
-      });
+      // The operator directory is checked again at the write: it must still be
+      // a canonical, link-free, operator-owned 0700 directory.
+      if (options.epochRecordDirectory !== undefined)
+        assertFreshMoneyEpochRecordDirectory(options.epochRecordDirectory, "recheck");
+      const recordPath = join(
+        options.epochRecordDirectory ?? root,
+        FRESH_MONEY_WRITER_EPOCH_RECORD_FILE,
+      );
+      writeFileSync(recordPath, `${JSON.stringify(minted)}\n`, { mode: 0o600, flag: "wx" });
+      epochRecordPath = recordPath;
       migrationSeal.assertUnchanged();
       migrationImport = composeFreshMoneyPreservedImport(preservedImport, minted);
       writeFileSync(importPath, migrationImport.sql, { mode: 0o600, flag: "wx" });
@@ -2767,7 +2840,8 @@ async function applyStorageGeneration(
       if (sealed !== null) unsealDirectory(sealed.root);
       else if (migrationSeal !== null) unsealDirectory(migrationSeal.root);
       // A minted Writer epoch record outlives the temporary release.
-      if (temporary && epochRecordPath !== null) rmSync(release, { recursive: true, force: true });
+      if (temporary && epochRecordPath !== null && options.epochRecordDirectory === undefined)
+        rmSync(release, { recursive: true, force: true });
       else if (temporary) rmSync(root, { recursive: true, force: true });
     }
     // The new path retains the original sealed artifact outside Git, including UNKNOWN.
@@ -2785,6 +2859,7 @@ async function applyStorageGeneration(
       knownDatabaseId,
       invocation,
       sourceArtifact.digest,
+      epochRecordPath,
     );
   }
   if (cleanupFailed) {
@@ -2794,6 +2869,7 @@ async function applyStorageGeneration(
         knownDatabaseId,
         invocation,
         sourceArtifact.digest,
+        epochRecordPath,
       );
     }
     throw cleanupFailure;
@@ -3023,6 +3099,14 @@ function completeDatabaseReadbackError(
   return verificationError(`D1 migration readback ${reason}; R2 creation is withheld`, detail);
 }
 
+function retainedRecordDigest(path: string): string {
+  try {
+    return fileDigest(path);
+  } catch {
+    return "unreadable";
+  }
+}
+
 function fileDigest(path: string): string {
   return `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
 }
@@ -3125,6 +3209,7 @@ function normalizeAfterD1Create(
   databaseId: string | null,
   invocation: IntegrationStorageGenerationInvocation,
   migrationDigest: string,
+  epochRecordPath: string | null = null,
 ): DeployError {
   const phase: DeployPhase =
     error instanceof DeployError && error.phase === "verification" ? "verification" : "mutation";
@@ -3136,6 +3221,14 @@ function normalizeAfterD1Create(
           `generation=${invocation.generation}`,
           `freshLineage=${invocation.freshLineage}`,
           `migrationDigest=${migrationDigest}`,
+          // A minted Writer epoch record outlives the failure. Its path and
+          // file digest are not secret; its content (the nonce) never leaves it.
+          ...(epochRecordPath === null
+            ? []
+            : [
+                `moneyWriterEpochRecordPath=${epochRecordPath}`,
+                `moneyWriterEpochRecordDigest=${retainedRecordDigest(epochRecordPath)}`,
+              ]),
         ];
   const detail =
     evidence === undefined

@@ -1,15 +1,27 @@
 import { Database } from "bun:sqlite";
 import { afterAll, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DEPLOY_CONTRACT } from "../scripts/deploy/contract.ts";
 import { buildD1MigrationImport } from "../scripts/deploy/d1-migration-import.ts";
+import { DeployError } from "../scripts/deploy/errors.ts";
 import {
   buildFreshMoneyPreservedPreEpochImport,
   composeFreshMoneyPreservedImport,
   FRESH_MONEY_WRITER_EPOCH_OWNER_UNAVAILABLE,
+  FRESH_MONEY_WRITER_EPOCH_RECORD_FILE,
   freshMoneyPreservedRealmClaim,
 } from "../scripts/deploy/fresh-money-preserved.ts";
 import {
@@ -19,6 +31,7 @@ import {
 import {
   assertFreshV2DataReadback,
   FRESH_V2_INTERRUPTED_MONEY_PRESERVED,
+  FRESH_V2_MONEY_WRITER_EPOCH_MISMATCH,
   type FreshV2DataReadback,
 } from "../scripts/deploy/fresh-v2-data-readback.ts";
 import {
@@ -313,7 +326,7 @@ describe("fresh Money-preserved 0100 import", () => {
       ])
         await expect(proof(interrupted)).rejects.toThrow(FRESH_V2_INTERRUPTED_MONEY_PRESERVED);
       await expect(proof(exact, mintFreshMoneyWriterEpoch(binding))).rejects.toThrow(
-        "exact empty 0100 database",
+        FRESH_V2_MONEY_WRITER_EPOCH_MISMATCH,
       );
       for (const tableCounts of [
         { ...exact.tableCounts, money_cutover_freeze: 1 },
@@ -514,6 +527,420 @@ describe("v2-0100-money-preserved storage generation", () => {
       }),
     ).rejects.toThrow("belongs to another D1");
     expect(imports).toEqual([]);
+  }, 60_000);
+
+  test("a failure after the mint names the retained record's path and digest, never its content", async () => {
+    const output = mkdtempSync(join(ROOT, "failed-"));
+    let created = false;
+    let record: FreshMoneyWriterEpochRecord | null = null;
+    const provider = {
+      async listD1(name: string) {
+        return created ? [{ name, uuid: DATABASE_ID }] : [];
+      },
+      async getD1() {
+        return { name: NAME, uuid: DATABASE_ID };
+      },
+      async createD1(name: string) {
+        created = true;
+        return { name, uuid: DATABASE_ID };
+      },
+      async listR2() {
+        return [];
+      },
+      async getR2(name: string) {
+        return { name };
+      },
+      async createR2(): Promise<never> {
+        throw new Error("no R2 after a failed import");
+      },
+    };
+    const run: IntegrationStorageGenerationProcess = async (command) => {
+      if (command.includes("execute") && command.includes("--file"))
+        return { exitCode: 1, stdout: "", stderr: "import failed" };
+      return await sourceRun(() => {})(command);
+    };
+    let error: unknown;
+    try {
+      await runIntegrationStorageGeneration(invocation, target, {
+        provider,
+        run,
+        review: "test-review",
+        productionD1: PRODUCTION_D1,
+        outputDirectory: output,
+        reader: {
+          read: async () => ({
+            applied: [],
+            shape: "[]\n",
+            shapeDigest: `sha256:${createHash("sha256").update("[]\n").digest("hex")}`,
+          }),
+        },
+        freshMoneyWriterEpoch: (selected) => {
+          record = mintFreshMoneyWriterEpoch(selected);
+          return record;
+        },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(DeployError);
+    if (record === null) throw new Error("no epoch minted");
+    const minted = record as FreshMoneyWriterEpochRecord;
+    const path = join(output, FRESH_MONEY_WRITER_EPOCH_RECORD_FILE);
+    const digest = `sha256:${createHash("sha256").update(readFileSync(path)).digest("hex")}`;
+    const detail = String((error as DeployError).detail);
+    expect(detail).toContain(`moneyWriterEpochRecordPath=${path}`);
+    expect(detail).toContain(`moneyWriterEpochRecordDigest=${digest}`);
+    const surfaced = `${(error as DeployError).message} ${detail}`;
+    expect(surfaced).not.toContain(minted.nonce);
+    expect(surfaced).not.toContain(minted.epoch);
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+  }, 60_000);
+
+  function readOnlyProvider(created: () => boolean) {
+    return {
+      async listD1(name: string) {
+        return created() ? [{ name, uuid: DATABASE_ID }] : [];
+      },
+      async getD1() {
+        return { name: NAME, uuid: DATABASE_ID };
+      },
+      async createD1(): Promise<never> {
+        throw new Error("status never creates");
+      },
+      async listR2(name: string) {
+        return created() ? [{ name }] : [];
+      },
+      async getR2(name: string) {
+        return { name };
+      },
+      async createR2(): Promise<never> {
+        throw new Error("status never creates");
+      },
+    };
+  }
+
+  async function statusWith(database: Database, epochRecordDirectory: string) {
+    return await runIntegrationStorageGeneration({ ...invocation, action: "status" }, target, {
+      provider: readOnlyProvider(() => true),
+      run: sourceRun(() => {
+        throw new Error("status never imports");
+      }),
+      epochRecordDirectory,
+      reader: { read: async () => localState(database) },
+      freshV2DataReader: { read: async () => localData(database) },
+    });
+  }
+
+  /** A fresh 0700 record directory holding `value` (raw text when a string). */
+  function retain(value: unknown, mode = 0o600): string {
+    const directory = mkdtempSync(join(ROOT, "status-"));
+    const path = join(directory, FRESH_MONEY_WRITER_EPOCH_RECORD_FILE);
+    writeFileSync(path, typeof value === "string" ? value : `${JSON.stringify(value)}\n`, {
+      mode: 0o600,
+    });
+    chmodSync(path, mode);
+    return directory;
+  }
+
+  test("status verifies a retained 0600 record, refuses a mismatch and says when only the form is checked", async () => {
+    const record = mintFreshMoneyWriterEpoch(binding);
+    const database = new Database(":memory:");
+    const interruptedDatabase = new Database(":memory:");
+    try {
+      execute(database, composeFreshMoneyPreservedImport(preEpoch, record).sql);
+      expect(await statusWith(database, retain(record))).toMatchObject({
+        schemaReadback: "complete-0100",
+        dataReadback: "empty-seeded",
+        writerEpochCheck: "retained-record",
+      });
+      for (const absent of [mkdtempSync(join(ROOT, "status-")), join(ROOT, "status-never-created")])
+        expect(await statusWith(database, absent)).toMatchObject({
+          schemaReadback: "complete-0100",
+          dataReadback: "empty-seeded",
+          writerEpochCheck: "form-only",
+        });
+      // Another mint for the same D1 is a different epoch than the D1 holds.
+      await expect(
+        statusWith(database, retain(mintFreshMoneyWriterEpoch(binding))),
+      ).rejects.toThrow(FRESH_V2_MONEY_WRITER_EPOCH_MISMATCH);
+      await expect(
+        statusWith(database, retain({ ...record, nonce: "0".repeat(64) })),
+      ).rejects.toThrow(FRESH_V2_MONEY_WRITER_EPOCH_MISMATCH);
+      // A loaded record on an interrupted import is never reported as verified.
+      execute(interruptedDatabase, composeFreshMoneyPreservedImport(preEpoch, record).sql);
+      interruptedDatabase.exec("DELETE FROM money_cutover_authorized_epoch");
+      expect(await statusWith(interruptedDatabase, retain(record))).toMatchObject({
+        schemaReadback: "complete-0100",
+        dataReadback: "interrupted",
+        writerEpochCheck: "not-run",
+      });
+    } finally {
+      database.close();
+      interruptedDatabase.close();
+    }
+  }, 60_000);
+
+  test("a record that is not one private plain JSON object is refused, never treated as absent", async () => {
+    const record = mintFreshMoneyWriterEpoch(binding);
+    const database = new Database(":memory:");
+    try {
+      execute(database, composeFreshMoneyPreservedImport(preEpoch, record).sql);
+      for (const value of ["null\n", "[]\n", "1\n", '"record"\n', "{\n"])
+        await expect(statusWith(database, retain(value))).rejects.toThrow(
+          /not one plain object|unreadable/u,
+        );
+      await expect(statusWith(database, retain(record, 0o644))).rejects.toThrow(
+        "not an operator-private regular file",
+      );
+      // Oversize: a valid record padded beyond 4 KiB.
+      await expect(
+        statusWith(database, retain(`${JSON.stringify(record)}${" ".repeat(4096)}\n`)),
+      ).rejects.toThrow("not an operator-private regular file");
+      // A symlink to a valid 0600 record is refused, not followed.
+      const real = retain(record);
+      const linked = mkdtempSync(join(ROOT, "status-"));
+      symlinkSync(
+        join(real, FRESH_MONEY_WRITER_EPOCH_RECORD_FILE),
+        join(linked, FRESH_MONEY_WRITER_EPOCH_RECORD_FILE),
+      );
+      await expect(statusWith(database, linked)).rejects.toThrow(
+        "not an operator-private regular file",
+      );
+      // A looser record directory is refused as a whole.
+      const loose = retain(record);
+      chmodSync(loose, 0o755);
+      await expect(statusWith(database, loose)).rejects.toThrow("operator-owned 0700 directory");
+    } finally {
+      database.close();
+    }
+  }, 60_000);
+
+  test("apply with --epoch-record-directory, then status with the same directory, verifies the retained record", async () => {
+    const database = new Database(":memory:");
+    const directory = join(mkdtempSync(join(ROOT, "records-")), "generation");
+    let created = false;
+    let bucket = false;
+    try {
+      const provider = {
+        async listD1(name: string) {
+          return created ? [{ name, uuid: DATABASE_ID }] : [];
+        },
+        async getD1() {
+          return { name: NAME, uuid: DATABASE_ID };
+        },
+        async createD1(name: string) {
+          created = true;
+          return { name, uuid: DATABASE_ID };
+        },
+        async listR2(name: string) {
+          return bucket ? [{ name }] : [];
+        },
+        async getR2(name: string) {
+          return { name };
+        },
+        async createR2(name: string) {
+          bucket = true;
+          return { name };
+        },
+      };
+      const options = {
+        provider,
+        review: "test-review",
+        productionD1: PRODUCTION_D1,
+        epochRecordDirectory: directory,
+        reader: { read: async () => localState(database) },
+        freshV2DataReader: { read: async () => localData(database) },
+      };
+      const applied = await runIntegrationStorageGeneration(invocation, target, {
+        ...options,
+        run: sourceRun((path) => execute(database, readFileSync(path, "utf8"))),
+      });
+      const path = join(directory, FRESH_MONEY_WRITER_EPOCH_RECORD_FILE);
+      expect(applied.moneyWriterEpochRecord).toMatchObject({ path });
+      expect(statSync(directory).mode & 0o777).toBe(0o700);
+      expect(statSync(path).mode & 0o777).toBe(0o600);
+      const status = await runIntegrationStorageGeneration(
+        { ...invocation, action: "status" },
+        target,
+        {
+          ...options,
+          run: sourceRun(() => {
+            throw new Error("status never imports");
+          }),
+        },
+      );
+      expect(status).toMatchObject({
+        schemaReadback: "complete-0100",
+        dataReadback: "empty-seeded",
+        writerEpochCheck: "retained-record",
+      });
+      // The same directory never takes a second record.
+      const calls = { count: 0 };
+      await expect(
+        runIntegrationStorageGeneration(invocation, target, {
+          ...options,
+          provider: trapProvider(calls),
+          run: sourceRun(() => {}),
+        }),
+      ).rejects.toThrow("already holds a Writer epoch record");
+      // A looser directory, or any other lineage, is refused before any provider call.
+      const loose = mkdtempSync(join(ROOT, "records-"));
+      chmodSync(loose, 0o755);
+      await expect(
+        runIntegrationStorageGeneration(invocation, target, {
+          ...options,
+          epochRecordDirectory: loose,
+          provider: trapProvider(calls),
+          run: sourceRun(() => {}),
+        }),
+      ).rejects.toThrow("operator-owned 0700 directory");
+      await expect(
+        runIntegrationStorageGeneration({ ...invocation, freshLineage: "v2-0100" }, target, {
+          ...options,
+          epochRecordDirectory: mkdtempSync(join(ROOT, "records-")),
+          provider: trapProvider(calls),
+          run: sourceRun(() => {}),
+        }),
+      ).rejects.toThrow("only for the v2-0100-money-preserved lineage");
+      expect(calls.count).toBe(0);
+    } finally {
+      database.close();
+    }
+  }, 60_000);
+
+  test("a linked record directory, link in its path or occupied record name is refused before any provider call", async () => {
+    const calls = { count: 0 };
+    const refuse = async (epochRecordDirectory: string, message: string) =>
+      await expect(
+        runIntegrationStorageGeneration(invocation, target, {
+          provider: trapProvider(calls),
+          run: sourceRun(() => {}),
+          review: "test-review",
+          productionD1: PRODUCTION_D1,
+          epochRecordDirectory,
+        }),
+      ).rejects.toThrow(message);
+    const base = mkdtempSync(join(ROOT, "links-"));
+    const real = mkdtempSync(join(base, "real-"));
+    // The directory itself is a link.
+    symlinkSync(real, join(base, "linked"));
+    await refuse(join(base, "linked"), "no symbolic link");
+    // A trailing slash would make lstat follow the link; it is not canonical.
+    await refuse(`${join(base, "linked")}/`, "canonical absolute path");
+    await refuse(`${real}/.`, "canonical absolute path");
+    // A linked parent, for an existing child and for one apply would create.
+    mkdirSync(join(real, "child"), { mode: 0o700 });
+    await refuse(join(base, "linked", "child"), "no symbolic link");
+    await refuse(join(base, "linked", "new-child"), "parent must be a canonical path");
+    expect(statSync(real).isDirectory()).toBe(true);
+    expect(() => statSync(join(real, "new-child"))).toThrow();
+    // A dangling link at the record name occupies it.
+    const occupied = mkdtempSync(join(base, "occupied-"));
+    symlinkSync(join(base, "missing-target"), join(occupied, FRESH_MONEY_WRITER_EPOCH_RECORD_FILE));
+    await refuse(occupied, "already holds a Writer epoch record");
+    expect(calls.count).toBe(0);
+  });
+
+  test("the record directory is checked again right before the record is written", async () => {
+    const base = mkdtempSync(join(ROOT, "recheck-"));
+    const directory = join(base, "records");
+    const moved = join(base, "moved");
+    let created = false;
+    const imports: string[] = [];
+    const provider = {
+      async listD1(name: string) {
+        return created ? [{ name, uuid: DATABASE_ID }] : [];
+      },
+      async getD1() {
+        return { name: NAME, uuid: DATABASE_ID };
+      },
+      async createD1(name: string) {
+        created = true;
+        return { name, uuid: DATABASE_ID };
+      },
+      async listR2() {
+        return [];
+      },
+      async getR2(name: string) {
+        return { name };
+      },
+      async createR2(): Promise<never> {
+        throw new Error("no R2 after a refused record write");
+      },
+    };
+    let error: unknown;
+    try {
+      await runIntegrationStorageGeneration(invocation, target, {
+        provider,
+        run: sourceRun((path) => imports.push(path)),
+        review: "test-review",
+        productionD1: PRODUCTION_D1,
+        epochRecordDirectory: directory,
+        reader: {
+          read: async () => ({
+            applied: [],
+            shape: "[]\n",
+            shapeDigest: `sha256:${createHash("sha256").update("[]\n").digest("hex")}`,
+          }),
+        },
+        // The mint is the last step before the write: swap the directory for
+        // a link to another private directory there.
+        freshMoneyWriterEpoch: (selected) => {
+          renameSync(directory, moved);
+          symlinkSync(moved, directory);
+          return mintFreshMoneyWriterEpoch(selected);
+        },
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(DeployError);
+    expect((error as DeployError).message).toContain("no symbolic link");
+    expect((error as DeployError).phase).toBe("mutation");
+    const detail = String((error as DeployError).detail);
+    expect(detail).toContain(`databaseId=${DATABASE_ID}`);
+    expect(detail).not.toContain("moneyWriterEpochRecordPath");
+    expect(() => statSync(join(moved, FRESH_MONEY_WRITER_EPOCH_RECORD_FILE))).toThrow();
+    expect(imports).toEqual([]);
+  }, 60_000);
+
+  test("the CLI accepts --epoch-record-directory only as one absolute path on the Money-preserved generation", async () => {
+    const deploy = (args: readonly string[]) => {
+      const child = Bun.spawnSync(["bun", "run", "--silent", "deploy", "--", ...args], {
+        cwd: resolve(import.meta.dir, ".."),
+        env: { PATH: process.env.PATH ?? "" },
+        stdin: "ignore",
+      });
+      return new TextDecoder().decode(child.stderr);
+    };
+    const base = [
+      "takoserver-integration-storage-generation",
+      "--status",
+      "--environment=integration",
+      `--commit=${"a".repeat(40)}`,
+      `--generation=${GENERATION}`,
+    ];
+    const directory = join(ROOT, "cli-records");
+    for (const action of ["--status", "--apply"]) {
+      const accepted = deploy([
+        ...base.map((flag) => (flag === "--status" ? action : flag)),
+        "--fresh-lineage=v2-0100-money-preserved",
+        `--epoch-record-directory=${directory}`,
+      ]);
+      expect(accepted).toContain("deploy target descriptor not found");
+      expect(accepted).not.toContain("no target was touched");
+    }
+    for (const extra of [
+      ["--fresh-lineage=v2-0100-money-preserved", "--epoch-record-directory=relative/records"],
+      ["--fresh-lineage=v2-0100", `--epoch-record-directory=${directory}`],
+      [`--epoch-record-directory=${directory}`],
+      [
+        "--fresh-lineage=v2-0100-money-preserved",
+        `--epoch-record-directory=${directory}`,
+        `--epoch-record-directory=${directory}`,
+      ],
+    ])
+      expect(deploy([...base, ...extra])).toContain("deploy refused: no target was touched");
   }, 60_000);
 
   test("an operator staging pair never stands in for the Money-preserved generation", () => {
