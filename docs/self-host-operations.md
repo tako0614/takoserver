@@ -27,7 +27,7 @@ A self-host runs one of two profiles, selected by configuration:
 - **Artifact profile.** The v2 Host API, operator sign-in, organizations, API
   keys, and an artifact Form for each block of the v2 config:
   `WorkerBundle 0.2.0` and `StaticAssetBundle 0.2.0` in step 3's config, and
-  `SQLiteMigrationSet 0.2.0` once step 11 seeds a migration set. These Forms
+  `SQLiteMigrationSet 0.4.0` once step 11 seeds a migration set. These Forms
   validate and retain bytes; they do not execute SQL, run a Worker, or serve
   assets. It needs Bun and the three
   required settings in step 3.
@@ -247,7 +247,7 @@ The complete local Worker profile additionally needs all of these:
 | `TAKOSERVER_WORKFLOW_EXECUTION_GUARD_BINARY` | The absolute path of the Workflow execution guard (step 1). |
 | `TAKOSERVER_V2_WORKER_RUNTIME_BOOT` | Both Actor and Workflow boot, for example `{"actor":true,"workflow":{"maximumRegistrations":64}}`. |
 | `TAKOSERVER_V2_WORKER_PRIVATE_PLANES` | All five private planes: `sqlite`, `kv`, `objectBucket`, `queue` and `queueProducer`. Each names a distinct fixed `privatePort` and its own `signingKeyFile`; `sqlite` also names an existing private `stagingRoot`. A key file holds 32 to 4,096 random bytes, is mode 0600 and lies in a directory private to the Host's user. The Host never generates these keys. |
-| `workerBundle` and `staticAssetBundle` config blocks | Both with `targetKey` `selfhost-v2-worker-primary`. An empty `heldArtifacts` list composes the Form; step 6 fills it. An optional `sqliteMigrationSet` block, with any stable `targetKey`, composes both `SQLiteMigrationSet 0.2.0` and `SQLiteMigrationApplication 0.2.0`; step 11's first seed adds it. |
+| `workerBundle` and `staticAssetBundle` config blocks | Both with `targetKey` `selfhost-v2-worker-primary`. An empty `heldArtifacts` list composes the Form; step 6 fills it. An optional `sqliteMigrationSet` block, with any stable `targetKey`, composes both `SQLiteMigrationSet 0.4.0` and `SQLiteMigrationApplication 0.4.0`; step 11's first seed adds it. |
 
 `TAKOSERVER_RUNTIME_INPUT_SEAL_KEYRING` is optional: with it, WorkerVersion
 accepts `privateInputs` (see the setup guide).
@@ -1207,12 +1207,12 @@ cannot change the schema. Schema changes come from a
 an `SQLiteDatabase`. The published Forms define each spec:
 [WorkerVersion 0.5.0](https://edge.forms.takoform.com/forms/WorkerVersion/0.5.0/),
 [SQLiteDatabase 0.2.0](https://edge.forms.takoform.com/forms/SQLiteDatabase/0.2.0/)
-and [SQLiteMigrationApplication 0.2.0](https://edge.forms.takoform.com/forms/SQLiteMigrationApplication/0.2.0/).
+and [SQLiteMigrationApplication 0.4.0](https://edge.forms.takoform.com/forms/SQLiteMigrationApplication/0.4.0/).
 
 `sqlite-migration-set` accepts only `.sql` files and applies them in the byte
 order of their paths. The first `seed --config` of a migration set adds the
-`sqliteMigrationSet` block, which composes `SQLiteMigrationSet 0.2.0` and
-`SQLiteMigrationApplication 0.2.0`; until then the Host supports neither.
+`sqliteMigrationSet` block, which composes `SQLiteMigrationSet 0.4.0` and
+`SQLiteMigrationApplication 0.4.0`; until then the Host supports neither.
 Stop the Host, then seed the migrations and a bundle whose code uses the
 Binding, here named `DB`:
 
@@ -1242,8 +1242,8 @@ bun --no-env-file scripts/selfhost-artifact.ts seed worker-bundle "$WORK/hello/v
 Start the Host and check support for the three SQLite Forms:
 
 ```sh
-for form in SQLiteDatabase/0.2.0 SQLiteMigrationSet/0.2.0 \
-  SQLiteMigrationApplication/0.2.0; do
+for form in SQLiteDatabase/0.2.0 SQLiteMigrationSet/0.4.0 \
+  SQLiteMigrationApplication/0.4.0; do
   curl -sS --fail-with-body -G "$V2/support" --data-urlencode "form=$F/$form/" \
     -H "authorization: Bearer $KEY" | jq -c --arg form "$form" '{$form, supported}'
 done
@@ -1254,11 +1254,11 @@ step 10 with the Binding in the new Version's spec:
 
 ```sh
 DATABASE=$(create SQLiteDatabase/0.2.0 hello-db '{}') &&
-MIGRATIONS=$(create SQLiteMigrationSet/0.2.0 hello-migrations-v1 \
+MIGRATIONS=$(create SQLiteMigrationSet/0.4.0 hello-migrations-v1 \
   "$(jq -c '{artifact}' "$WORK/migrations-v1.json")") &&
 spec=$(jq -nc --arg d "$DATABASE" --arg m "$MIGRATIONS" \
   '{database: {resourceUid: $d}, migrationSet: {resourceUid: $m}}') &&
-APPLICATION=$(create SQLiteMigrationApplication/0.2.0 hello-migration-application "$spec") &&
+APPLICATION=$(create SQLiteMigrationApplication/0.4.0 hello-migration-application "$spec") &&
 BUNDLE_V3=$(create WorkerBundle/0.2.0 hello-bundle-v3 "$(jq -c '{artifact}' "$WORK/hello-v3.json")") &&
 spec=$(jq -nc --arg w "$WORKER" --arg b "$BUNDLE_V3" --arg d "$DATABASE" \
   '{worker: {resourceUid: $w}, bundle: {resourceUid: $b}, handlers: ["fetch"],

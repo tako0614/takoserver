@@ -142,7 +142,7 @@ user authentication.
 
 The ordinary Bun entry composes these artifact-only Forms when their respective
 blocks are present in `TAKOSERVER_TAKOFORM_V2_CONFIG`:
-`SQLiteMigrationSet 0.2.0`, `WorkerBundle 0.2.0`, and
+`SQLiteMigrationSet 0.4.0`, `WorkerBundle 0.2.0`, and
 `StaticAssetBundle 0.2.0`. The first stores verified SQL migration files but
 does not execute them; the latter two store validated Worker or asset bytes but
 do not, by themselves, execute a Worker or serve an asset. These settings do
@@ -158,11 +158,21 @@ registers `ModuleWorker 0.3.0`, `WorkerVersion 0.5.0`,
 `WorkerDeployment 0.4.0`, `WorkerCronTrigger 0.3.0`, `SQLiteDatabase 0.2.0`,
 `EdgeKVNamespace 0.2.0`, and `ObjectBucket 0.2.0`, plus `ActorNamespace 0.3.0`,
 `DurableWorkflow 0.3.0`, `AtLeastOnceQueue 0.2.0`, and `QueueConsumer 0.3.0`.
-`SQLiteMigrationApplication 0.2.0` is added only when its separate
+`SQLiteMigrationApplication 0.4.0` is added only when its separate
 `sqliteMigrationSet` block is configured. Endpoint Form `0.3.0` is added only
 when its HTTPS listener is selected and its hostname, TLS, and route-absence
 ports are composed. If a prerequisite is missing, the Worker lifecycle map is
 not registered; support is not inferred from internal components or tests.
+
+The same `sqliteMigrationSet` block also keeps `SQLiteMigrationSet` and
+`SQLiteMigrationApplication` 0.2.0 and 0.3.0 as retained Forms. Resources and
+Operations accepted under them keep exact-key replay, read, recovery and
+reference-safe DELETE, but `/support` reports them unsupported and a fresh
+CREATE or UPDATE is refused with `unsupported_form`. For migration SQL,
+Application 0.2.0 admits no PRAGMA, 0.3.0 admits
+`PRAGMA defer_foreign_keys`, and 0.4.0 additionally admits the read-only
+`table_info`, `foreign_key_list`, `index_list` and `index_info` introspection
+PRAGMAs. An Application references the MigrationSet of its own version.
 
 WorkerVersion declarations can reference SQLite, KV, ObjectBucket, Queue
 Producer, ModuleWorker Service, Actor, and Workflow Bindings. The referenced
@@ -379,7 +389,7 @@ The implementation must not invent those names or revise the published Form in
 place; the SDK gap requires an owning successor contract decision.
 
 An artifact-only Form such as
-[`SQLiteMigrationSet 0.2.0`](https://edge.forms.takoform.com/forms/SQLiteMigrationSet/0.2.0/)
+[`SQLiteMigrationSet 0.4.0`](https://edge.forms.takoform.com/forms/SQLiteMigrationSet/0.4.0/)
 can form a smaller first real-resource journey without requiring a Worker
 runtime. The ordinary Bun self-host entry can acquire an exact manifest and
 files from anonymous public HTTPS, or from a Host-held artifact: an operator
@@ -1019,9 +1029,12 @@ that requires exact publication and TLS/route readback. Local certificate/SNI
 and route checks are not public DNS, external CA trust, or reachability
 qualification.
 
-After owner restoration, `internalFormFactoryForEndpoint(boot.endpoint)` composes
-the same internal Form map against the existing Endpoint boot. It captures the
-three Endpoint ports and retains the exact SQL, object store and clock checks.
+After owner restoration, the normal Bun entry composes the complete Form
+selection with `secretFreeFormFactory(boot.endpoint)`, or with
+`privateInputFormFactory(boot.endpoint)` when the operator runtime-input
+keyring is configured. Either one composes the same internal Form map against
+the existing Endpoint boot, captures the three Endpoint ports and retains the
+exact SQL, object store and clock checks.
 It refuses composition before restoration or after owner suspension; a closed
 boot cannot supply a positive TLS witness. This resolves the composition cycle
 without adding another frontend or Resource ledger.
