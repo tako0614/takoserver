@@ -2056,7 +2056,9 @@ export const openApiDocument = {
         description:
           "The original Server RP session cookie, when that receiver is mounted. " +
           "Requires the exact configured console Origin on every request. " +
-          "An explicit Authorization header or legacy session cookie selects that credential instead, even if invalid. " +
+          "An explicit Authorization header selects that credential, even if invalid. " +
+          "Without it, legacy and shared session cookies together are ambiguous and refused. " +
+          "A selected legacy cookie is never retried as a shared session. " +
           "It is not a Bearer token, Hosted/issuer cookie, or Org API key. " +
           "The business request itself checks current Organization ownership; a prior GET is not a grant.",
       },

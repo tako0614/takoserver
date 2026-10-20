@@ -315,17 +315,24 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
   const sharedAuth = options.sharedAuth;
   const sharedAuthenticate = sharedAuth?.authenticate;
 
-  const authorization = (request: Request): string | null =>
-    requestAuthorization(request, consoleOrigin);
-  const hasLegacySessionCookie = (request: Request): boolean =>
+  const hasNamedCookie = (request: Request, name: string): boolean =>
     (request.headers.get("cookie") ?? "")
       .split(";")
-      .some((part) => part.trim().split("=", 1)[0] === "takoserver_session");
+      .some((part) => part.trim().split("=", 1)[0] === name);
+  const authorization = (request: Request): string | null => {
+    if (request.headers.has("authorization")) return request.headers.get("authorization");
+    // Two automatic session modes cannot silently select either principal.
+    // A named cookie counts even when its value is empty or malformed.
+    if (
+      hasNamedCookie(request, "takoserver_session") &&
+      hasNamedCookie(request, "__Host-takoserver_shared_session")
+    )
+      throw new AuthError("unauthenticated");
+    return requestAuthorization(request, consoleOrigin);
+  };
 
   const requestActor = async (request: Request): Promise<Actor | null> => {
-    const credential = request.headers.has("authorization")
-      ? request.headers.get("authorization")
-      : authorization(request);
+    const credential = authorization(request);
     const actor = await accounts.authenticate(credential);
     // An explicit header (including an empty one), or a named legacy cookie
     // (including an empty first value), has already chosen its authority.
@@ -333,7 +340,7 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
       actor ||
       credential !== null ||
       request.headers.has("authorization") ||
-      hasLegacySessionCookie(request)
+      hasNamedCookie(request, "takoserver_session")
     )
       return actor;
     if (!sharedAuthenticate || !consoleOrigin || request.headers.get("origin") !== consoleOrigin)
@@ -658,14 +665,12 @@ export function createControlRoutes(options: CreateControlRoutesOptions): Contro
           : { sessionTtlSeconds: integer(body.sessionTtlSeconds) }),
       });
       if (consoleOrigin && request.headers.get("origin") === consoleOrigin) {
-        return Response.json(
-          { principal },
-          {
-            headers: {
-              "set-cookie": sessionCookie(sessionToken, secureCookies),
-            },
-          },
-        );
+        const headers = new Headers();
+        headers.append("set-cookie", sessionCookie(sessionToken, secureCookies));
+        // A successful browser switch to the local session clears only the
+        // browser's shared cookie. Its Server RP row is not revoked here.
+        if (secureCookies) headers.append("set-cookie", clearSharedSessionCookie());
+        return Response.json({ principal }, { headers });
       }
       return Response.json({ principal, sessionToken });
     }
@@ -2148,6 +2153,10 @@ function clearSessionCookie(secure: boolean): string {
   ]
     .filter(Boolean)
     .join("; ");
+}
+
+function clearSharedSessionCookie(): string {
+  return "__Host-takoserver_shared_session=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0";
 }
 
 function organizationOf(actor: Actor): string {

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { createAccounts } from "../src/auth.ts";
 import { createEphemeralSql } from "../src/compat.ts";
 import { createControlRoutes } from "../src/control.ts";
+import { GoogleIdentityError } from "../src/google-identity.ts";
 import { bytesDigest } from "../src/json.ts";
 import { createSharedAuthSession } from "../src/shared-auth-session.ts";
 import { createSharedAuthSessionStore } from "../src/shared-auth-session-store.ts";
@@ -25,7 +26,7 @@ function cookie(response: Response, name: string): string {
   return value;
 }
 
-async function fixture() {
+async function fixture(options: { distinctSharedPrincipal?: boolean } = {}) {
   const sql = createEphemeralSql();
   for (const statement of SHARED_AUTH_TEST_ONLY_DDL) await sql.run(statement);
   let now = NOW;
@@ -37,6 +38,7 @@ async function fixture() {
     clock,
     identity: {
       async verify({ assertion }) {
+        if (assertion === "refused-local") throw new GoogleIdentityError("invalid_signature");
         return {
           providerSubject: assertion,
           email: `${assertion}@local.example.test`,
@@ -46,6 +48,9 @@ async function fixture() {
     },
   });
   const signed = await accounts.signIn({ provider: "google", assertion: "retained-owner" });
+  const sharedSigned = options.distinctSharedPrincipal
+    ? await accounts.signIn({ provider: "google", assertion: "shared-owner" })
+    : signed;
   const owner = await accounts.authenticate(`Bearer ${signed.sessionToken}`);
   if (!owner) throw new Error("missing local owner");
   const organization = await accounts.createOrganization({ actor: owner, name: "Owned" });
@@ -60,7 +65,7 @@ async function fixture() {
     // Server principal. It makes no claim about a deployed Accounts binding.
     principals: {
       async resolve(input) {
-        return { accountId: input.accountId, principalId: signed.principal.id };
+        return { accountId: input.accountId, principalId: sharedSigned.principal.id };
       },
     },
     organizations: {
@@ -139,6 +144,7 @@ async function fixture() {
     sql,
     accounts,
     signed,
+    sharedSigned,
     organization,
     sharedAuth,
     issuer,
@@ -352,5 +358,111 @@ describe("same-request shared RP admission in Owner HTTP", () => {
       origin: SESSION_TEST_CONSOLE,
     });
     expect(response.status).toBe(200);
+  });
+
+  test("mode switching refuses two automatic cookies before selecting a different principal", async () => {
+    const f = await fixture({ distinctSharedPrincipal: true });
+    const shared = await f.sharedCookie();
+    const sharedOnly = await f.fetch("/v1/me", { cookie: shared, origin: SESSION_TEST_CONSOLE });
+    expect(sharedOnly.status).toBe(200);
+    expect((await sharedOnly.json()).principal.id).toBe(f.sharedSigned.principal.id);
+    expect(f.sharedSigned.principal.id).not.toBe(f.signed.principal.id);
+
+    const both = `${shared}; takoserver_session=${f.signed.sessionToken}`;
+    const mixed = await f.fetch("/v1/me", { cookie: both, origin: SESSION_TEST_CONSOLE });
+    const mixedBody = await mixed.json();
+    if (mixed.status === 200) expect(mixedBody.principal.id).toBe(f.signed.principal.id);
+    expect(mixedBody.principal?.id).toBeUndefined();
+    expect(mixed.status).toBe(401);
+    expect(mixedBody.error.code).toBe("unauthenticated");
+
+    const explicit = await f.fetch("/v1/me", {
+      cookie: both,
+      origin: SESSION_TEST_CONSOLE,
+      authorization: `Bearer ${f.signed.sessionToken}`,
+    });
+    expect(explicit.status).toBe(200);
+    expect((await explicit.json()).principal.id).toBe(f.signed.principal.id);
+  });
+
+  test("mode switching refuses both cookie names on actual checkout before either authenticator or effect", async () => {
+    const f = await fixture({ distinctSharedPrincipal: true });
+    const shared = await f.sharedCookie();
+    const issuerCalls = f.issuer.requests.length;
+    const originalAuthenticate = f.accounts.authenticate;
+    let accountsCalls = 0;
+    f.accounts.authenticate = (authorization) => {
+      accountsCalls += 1;
+      return Reflect.apply(originalAuthenticate, f.accounts, [authorization]);
+    };
+    const path = `/v1/organizations/${f.organization.id}/wallet/checkout`;
+    for (const sharedPart of [shared, `${SHARED_COOKIE}=`]) {
+      const response = await f.fetch(path, {
+        method: "POST",
+        cookie: `${sharedPart}; takoserver_session=${f.signed.sessionToken}`,
+        origin: SESSION_TEST_CONSOLE,
+        body: { reference: "mixed-cookie", amountMinor: 50 },
+      });
+      expect(f.checkoutCalls).toEqual([]);
+      expect(response.status).toBe(401);
+      expect((await response.json()).error.code).toBe("unauthenticated");
+    }
+    expect(accountsCalls).toBe(0);
+    expect(f.issuer.requests).toHaveLength(issuerCalls);
+    expect(f.checkoutCalls).toEqual([]);
+
+    const explicit = await f.fetch(path, {
+      method: "POST",
+      cookie: `${shared}; takoserver_session=${f.signed.sessionToken}`,
+      origin: SESSION_TEST_CONSOLE,
+      authorization: `Bearer ${f.signed.sessionToken}`,
+      body: { reference: "explicit-mode", amountMinor: 50 },
+    });
+    expect(explicit.status).toBe(201);
+    expect(f.checkoutCalls).toEqual([f.organization.id]);
+  });
+
+  test("mode switching expires shared cookie only after successful browser legacy sign-in", async () => {
+    const f = await fixture({ distinctSharedPrincipal: true });
+    const shared = await f.sharedCookie();
+    const browser = await f.fetch("/v1/sessions", {
+      method: "POST",
+      cookie: shared,
+      origin: SESSION_TEST_CONSOLE,
+      body: { provider: "google", assertion: "retained-owner" },
+    });
+    expect(browser.status).toBe(200);
+    expect((await browser.json()).principal.id).toBe(f.signed.principal.id);
+    const cookies = browser.headers.getSetCookie();
+    expect(cookies).toHaveLength(2);
+    expect(cookie(browser, "takoserver_session")).toStartWith("takoserver_session=");
+    expect(cookies).toContain(
+      `${SHARED_COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0`,
+    );
+    // The browser expires the cookie; the Server RP row itself is untouched.
+    const retained = await f.fetch("/v1/me", { cookie: shared, origin: SESSION_TEST_CONSOLE });
+    expect(retained.status).toBe(200);
+    expect((await retained.json()).principal.id).toBe(f.sharedSigned.principal.id);
+
+    for (const body of [
+      { provider: "google", assertion: "refused-local" },
+      { provider: "unknown", assertion: "retained-owner" },
+    ]) {
+      const refused = await f.fetch("/v1/sessions", {
+        method: "POST",
+        cookie: shared,
+        origin: SESSION_TEST_CONSOLE,
+        body,
+      });
+      expect(refused.status).toBeGreaterThanOrEqual(400);
+      expect(refused.headers.getSetCookie()).toEqual([]);
+    }
+    const nonbrowser = await f.fetch("/v1/sessions", {
+      method: "POST",
+      body: { provider: "google", assertion: "retained-owner" },
+    });
+    expect(nonbrowser.status).toBe(200);
+    expect(typeof (await nonbrowser.json()).sessionToken).toBe("string");
+    expect(nonbrowser.headers.getSetCookie()).toEqual([]);
   });
 });
