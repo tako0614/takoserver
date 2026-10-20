@@ -306,6 +306,7 @@ describe("production D1 fresh init", () => {
       // The staging-only profile never reaches production, not even as a default.
       ["--fresh-lineage=v2-0091"],
       ["--fresh-lineage=v2-0092"],
+      ["--fresh-lineage=v2-0100"],
       ["--fresh-lineage=v2-0090"],
       ["--fresh-lineage=v2-0088", "--fresh-lineage=v2-0088"],
       ["--fresh-lineage=v2-0088", "--fresh-lineage=v2-0089"],

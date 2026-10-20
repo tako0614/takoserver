@@ -224,6 +224,62 @@ either profile. For `v2-0092`, read it with these substitutions:
   refuse before upload until an independently qualified 0093/0094 cutover has
   produced the exact audited 0094 schema and money-unit policy.
 
+#### Plain serving D1 through 0100 (staging-only `v2-0100`)
+
+`--fresh-lineage=v2-0100` creates a new staging D1 on which the current Worker
+starts. The payload is the whole audited 0001–0100 source, ending in
+`0100_hosted_on_demand.sql`, with the fixed digest
+`sha256:ef9b62429718904c90f904bf10abd337fdba0d5a8cb1cee8bc50e5e6c20ed3ac`.
+
+The import also claims the 0098 Stripe realm in `test` mode. One guarded
+statement follows the last migration in the same sealed import file. It inserts
+the pin only when:
+
+- no pin exists, and
+- the financial-history inventory is exactly the one these migrations create,
+  and every one of those tables is empty.
+
+The next statement fails the import unless that INSERT itself wrote the row and
+exactly the test pin now exists. So any existing pin (even a `test` one), a
+history row or an unexpected financial table refuses the import. The pin is
+never copied from another D1 or inferred from a Stripe key.
+
+Do not rely on the remote import being atomic for this refusal. If an apply
+fails after the migrations but before the pin, the readback refuses that D1:
+`--status` reports `dataReadback: "unpinned"` and says to quarantine it. That
+generation is never retried, re-imported or adopted. A later generation is a
+separately decided new creation, not a retry of this one.
+
+In every other respect it behaves like `v2-0091`:
+
+- Production fresh init refuses it.
+- It only creates a new `integration-takoserver-<generation>` D1, after the
+  absence fence and an empty readback of that new database.
+- Applying it requires `TAKOSERVER_DEPLOY_TARGET_PRODUCTION`.
+
+Differences from `v2-0091`:
+
+- The data proof reads 100 ledger rows, the two seeds, the 0094
+  `money_unit_policy` row and exactly one `test` realm pin with a canonical
+  instant.
+- The apply record names the composed import digest and a `stripeRealmClaim`
+  entry.
+- An operator-provisioned staging pair is **not** accepted for `v2-0100`: its
+  pin can exist only through this surface's own import.
+- First publication goes through the integration Worker bootstrap. Routine
+  `takoserver-worker` publication reads the 0103 (Auth103) lineage and later,
+  so it refuses on a plain 0100 D1 until that separate step has run.
+- `takoformV2.storageLineage: "v2-0100"` selects it on a target. This is the
+  plain shape. It is not the Money-preserved 0100 shape, which carries cutover
+  fences and an epoch from its own history and stays a separate generation.
+
+```sh
+bun run deploy -- takoserver-integration-storage-generation --apply --environment=integration --commit=<40-hex-sha> --generation=<32-lowercase-hex> --fresh-lineage=v2-0100
+```
+
+There is no in-place route from an existing 0088/0089 D1 to this lineage. A
+new generation replaces it, and the old D1 stays protected history.
+
 ##### Original fresh92 creation with retained custody
 
 The same storage-generation surface can select its existing original creator by
@@ -424,11 +480,14 @@ failing with 503 after traffic moved.
 After a lost import acknowledgement or partial failure, never rerun `--apply`
 or mint a different generation as a retry. Selected `--status` reads the exact
 generated name/UUID and reports whether its ledger and canonical schema are
-complete (`complete-0075`, `complete-0088`, `complete-0089` or `complete-0091`) or
-incomplete/divergent. For v2-0088/v2-0089/v2-0091 a complete schema also reports
+complete (`complete-0075`, `complete-0088`, `complete-0089`, `complete-0091`,
+`complete-0092` or `complete-0100`) or incomplete/divergent. For
+v2-0088/v2-0089/v2-0091/v2-0092/v2-0100 a complete schema also reports
 `dataReadback`: `empty-seeded` for an untouched generation, or `present` once
 the signing registration or a Host has written rows; the latter is a generation
-in use, not a reason to quarantine it. It is diagnosis, not proof that the
+in use, not a reason to quarantine it. For v2-0100 only, `unpinned` means the
+schema is complete but its realm claim is missing: the import stopped after the
+migrations, so that generation is quarantined. It is diagnosis, not proof that the
 operator's earlier create owned that D1: correlate the original bounded
 database ID and source digest. Complete readback permits a separately reviewed
 forward continuation (for example, a missing R2); incomplete/divergent or

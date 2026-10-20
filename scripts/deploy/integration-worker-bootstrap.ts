@@ -68,6 +68,7 @@ import { expectedWorkerSecrets, writeWorkerConfig } from "./realized-config.ts";
 import {
   projectFreshIntegrationV2MigrationArtifact0091,
   projectFreshIntegrationV2MigrationArtifact0092,
+  projectFreshIntegrationV2MigrationArtifact0100,
   projectFreshProductionV2MigrationArtifact,
   projectFreshProductionV2MigrationArtifact0089,
   projectFreshV2ArtifactMigrationArtifact,
@@ -2899,6 +2900,8 @@ function readBootstrapArtifact(sourceRoot: string, target: DeployTarget): Migrat
       return projectFreshIntegrationV2MigrationArtifact0091(source);
     case "v2-0092":
       return projectFreshIntegrationV2MigrationArtifact0092(source);
+    case "v2-0100":
+      return projectFreshIntegrationV2MigrationArtifact0100(source);
   }
 }
 

@@ -422,10 +422,18 @@ const PRODUCTION_D1 = {
   databaseId: "85c5a15d-a80f-42fe-a907-7ec0d86e008e",
 } as const;
 
-for (const lineage of ["v2-0088", "v2-0089", "v2-0091", "v2-0092"] as const) {
+for (const lineage of ["v2-0088", "v2-0089", "v2-0091", "v2-0092", "v2-0100"] as const) {
   const count =
-    lineage === "v2-0092" ? 92 : lineage === "v2-0091" ? 91 : lineage === "v2-0089" ? 89 : 88;
-  test(`fresh selected ${lineage} payload remains quiesced on the current audited Host`, async () => {
+    lineage === "v2-0100"
+      ? 100
+      : lineage === "v2-0092"
+        ? 92
+        : lineage === "v2-0091"
+          ? 91
+          : lineage === "v2-0089"
+            ? 89
+            : 88;
+  test(`fresh selected ${lineage} payload ${lineage === "v2-0100" ? "starts" : "remains quiesced on"} the current audited Host`, async () => {
     const artifacts = await Promise.all(
       CASES.map(async ({ slug, path, mediaType, contents }) => {
         const fileBytes = new TextEncoder().encode(contents);
@@ -627,6 +635,8 @@ for (const lineage of ["v2-0088", "v2-0089", "v2-0091", "v2-0092"] as const) {
         d1: { databaseName: STAGING, databaseId: DATABASE_ID },
         r2: { bucketName: STAGING },
       } satisfies DeployTarget;
+      // An operator staging pair stands in only on the Money staging lineages;
+      // the plain v2-0100 pin exists only through this surface's own import.
       if (lineage === "v2-0091" || lineage === "v2-0092") {
         expect(
           await verifyFreshV2IntegrationStorageTarget(stagingTarget, "integration", lineage, {
@@ -700,7 +710,9 @@ for (const lineage of ["v2-0088", "v2-0089", "v2-0091", "v2-0092"] as const) {
         await r2.put(artifact.fileKey, artifact.fileBytes);
       }
       // The fresh generation's original schema proof remains valid, but this
-      // current Worker cannot serve its pre-0094 money unit.
+      // current Worker cannot serve its pre-0094 money unit. The plain 0100
+      // generation carries the policy and its claimed realm, so the same
+      // Worker starts on it.
       for (const [index, fixture] of CASES.entries()) {
         const artifact = artifacts[index];
         if (!artifact) throw new Error("missing artifact fixture");
@@ -709,6 +721,10 @@ for (const lineage of ["v2-0088", "v2-0089", "v2-0091", "v2-0092"] as const) {
           `${BASE}/support?form=${encodeURIComponent(fixture.form)}`,
           { headers: { authorization } },
         );
+        if (lineage === "v2-0100") {
+          expect(support.status).toBe(200);
+          continue;
+        }
         expect(support.status).toBe(503);
         const created = await runtime.dispatchFetch(`${BASE}/resources`, {
           method: "POST",
@@ -768,12 +784,29 @@ async function miniflareFreshV2Data(
       "SELECT id, last_order, last_operation_id FROM tf_v2_operation_acceptance_counter LIMIT 2",
     )
     .all<Record<string, unknown>>();
+  const serving = tables.includes("stripe_mode_realm");
   return {
     tableCounts,
     ledgerRows: ledger?.count ?? -1,
     foreignKeyViolations: foreignKeys.results.length,
     invocationEpoch: invocationEpoch.results,
     acceptanceCounter: acceptanceCounter.results,
+    ...(serving
+      ? {
+          moneyUnitPolicy: (
+            await database
+              .prepare(
+                "SELECT singleton, ledger_unit, historical_usage_unit, cash_unit FROM money_unit_policy LIMIT 2",
+              )
+              .all<Record<string, unknown>>()
+          ).results,
+          stripeRealm: (
+            await database
+              .prepare("SELECT singleton, mode, pinned_at FROM stripe_mode_realm LIMIT 2")
+              .all<Record<string, unknown>>()
+          ).results,
+        }
+      : {}),
   };
 }
 
@@ -908,6 +941,15 @@ async function applySealedD1Prefix(
     }
     await database.prepare('INSERT INTO "d1_migrations" (name) VALUES (?)').bind(name).run();
   }
+  // Anything after the last ledger insert is the import's own tail (the
+  // v2-0100 realm claim); run it as actual D1 statements too.
+  const lastLedger = [...importSql.matchAll(/values \('[0-9]{4}_[a-z0-9_]+\.sql'\);/gu)].at(-1);
+  const tail =
+    lastLedger?.index === undefined
+      ? ""
+      : importSql.slice(lastLedger.index + lastLedger[0].length).trim();
+  if (count === sealedLength)
+    for (const statement of splitMigration(tail)) await database.prepare(statement).all();
 }
 
 function splitMigration(source: string): readonly string[] {

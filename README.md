@@ -574,7 +574,10 @@ Cloudflare, the current USD-micros Worker requires the complete audited 0098
 schema, 0094 money-unit policy, and selected-mode immutable Stripe realm pin
 even when the webhook and billing options are disabled. The
 staging-only `--fresh-lineage=v2-0091` and `v2-0092` profiles prepare fixed
-historical D1 payloads; neither can serve this Worker ([deploy guide](docs/deploy.md)).
+historical D1 payloads; neither can serve this Worker. The staging-only
+`--fresh-lineage=v2-0100` profile creates a new plain 0001–0100 D1 and claims
+the test realm in the same import, so this Worker starts on it; routine
+publication still needs the separate Auth103 step ([deploy guide](docs/deploy.md)).
 Source audit does not authorize applying 0098 to a protected D1; existing-data
 cutover and old-writer quiescence require separate qualification.
 
