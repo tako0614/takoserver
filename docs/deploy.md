@@ -280,6 +280,50 @@ bun run deploy -- takoserver-integration-storage-generation --apply --environmen
 There is no in-place route from an existing 0088/0089 D1 to this lineage. A
 new generation replaces it, and the old D1 stays protected history.
 
+#### Financial realm claim and Writer epoch for a fresh Money-preserved D1
+
+A fresh Money-preserved D1 (staging-only, for a new Container Host) adds two
+Financial-owned pieces from `scripts/deploy/money-fresh-writer-epoch.ts` to the
+public storage owner's sealed import. They go after the Money-preserved replay,
+in this order:
+
+1. `buildFreshPreservedRealmClaim(sqlBeforeClaim)` claims the `test` realm.
+   - It uses the replay's own financial-history inventory, which is taken by
+     running that SQL in memory. This inventory includes the three
+     `money_cutover_*` tables that the plain `v2-0100` claim does not have.
+   - The pin is inserted only when no pin exists, the live inventory is exactly
+     that one and every listed table is empty.
+   - The statement after it fails the import unless that INSERT itself wrote
+     the row and exactly the `test` pin exists. So an existing pin, even a
+     `test` one, refuses the import.
+2. `freshMoneyWriterEpochSql(record)` writes the single
+   `money_cutover_authorized_epoch` row. The statement after it fails the import
+   unless that is the only epoch and no freeze or permit row exists. The row
+   must come after the claim, because the claim requires every financial table
+   to be empty.
+
+`mintFreshMoneyWriterEpoch({ accountId, databaseId, databaseName, generation })`
+mints the epoch of exactly that new D1.
+- **Accepted D1.** The database name must be
+  `integration-takoserver-<generation>` or `integration-ts-<generation>`.
+  Production names are refused.
+- **Derivation.** The epoch is
+  `sha256(JSON[contract, bindingDigest, nonce])`. The nonce is 32 random bytes,
+  and `bindingDigest` hashes the four binding fields.
+- **Freshness.** Every mint returns a new epoch, so it never repeats an earlier
+  database's or production's epoch.
+- **Record.** The operator keeps the returned record
+  `{kind, binding, nonce, bindingDigest, epoch}` privately. The epoch itself is
+  not a secret.
+
+`verifyFreshMoneyWriterEpoch(record, { binding, epoch, readbackRows? })` is a
+pure check for the readback and for a target's first publication.
+- **Record.** The record must reproduce its epoch.
+- **Target.** The target's served D1 binding and its `moneyCutoverWriterEpoch`
+  must equal the record.
+- **Readback.** When the rows of `money_cutover_authorized_epoch` are given,
+  they must be exactly `{singleton: 1, writer_epoch: epoch}`.
+
 ##### Original fresh92 creation with retained custody
 
 The same storage-generation surface can select its existing original creator by
