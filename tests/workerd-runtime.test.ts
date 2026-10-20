@@ -57,6 +57,7 @@ import {
   type WorkerdWorkflowForwardBinding,
   type WorkerdWorkflowForwardPublication,
 } from "../src/workerd-runtime.ts";
+import { mkdtempForSockets } from "./helpers/socket-temp-root.ts";
 
 /**
  * The generated configuration is assembled by concatenating strings, and the
@@ -3125,7 +3126,8 @@ test("rejects Workflow binding names in the complete Host-reserved namespace", a
 
 test("keeps the active graph when Workflow socket preflight rejects an update", async () => {
   const probe = createConfigProbe();
-  const socketDirectory = mkdtempSync(join(tmpdir(), "ws-"));
+  // Private socket directories must leave room for `<64 hex>.sock` (100-byte budget).
+  const socketDirectory = await mkdtempForSockets("ws-", 30);
   const sockets: ReturnType<typeof workflowForwardPublication>["sockets"] = [];
   let socketLookups = 0;
   try {
@@ -3987,7 +3989,8 @@ test("revokes Actor broker admission even when clearing a failed activation mark
 
 test("cannot turn an uncertain private socket activation into absence", async () => {
   const probe = createConfigProbe();
-  const socketDirectory = mkdtempSync(join(tmpdir(), "ws-"));
+  // Private socket directories must leave room for `<64 hex>.sock` (100-byte budget).
+  const socketDirectory = await mkdtempForSockets("ws-", 30);
   try {
     const runtime = createWorkerdRuntime({
       root,
