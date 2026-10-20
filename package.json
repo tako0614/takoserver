@@ -40,6 +40,7 @@
     "typecheck:form-authority-worker": "tsc --noEmit -p tsconfig.form-authority-worker.json && tsc --noEmit -p tsconfig.integration-form-authority-worker.json && tsc --noEmit -p tsconfig.integration-form-authority-operator-worker.json && tsc --noEmit -p tsconfig.form-authority-identity-probe.json && tsc --noEmit -p tsconfig.existing-space-operator-worker.json",
     "typecheck:exact-artifact-recovery-worker": "tsc --noEmit -p tsconfig.exact-artifact-recovery-worker.json",
     "test": "bun scripts/run-tests.ts",
+    "test:changed": "bun scripts/run-tests.ts --changed",
     "qualify:actor-cold-alarm": "bun --no-env-file scripts/qualify-actor-cold-alarm.ts",
     "test:selfhost-opentofu": "bun --no-env-file scripts/selfhost-opentofu-e2e.ts",
     "test:selfhost-docker": "bun --no-env-file scripts/selfhost-docker-smoke.ts",

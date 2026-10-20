@@ -1052,15 +1052,25 @@ bun run fmt       # the only thing that rewrites source
 `bun run check` is the gate. It is read-only and it does not skip.
 
 Its test step (`bun run test`, `scripts/run-tests.ts`) runs every test file in
-parallel worker processes. Each file gets its own
-global scope and module registry, so a module mock in one file cannot reach
-another. The step fails unless Bun's summary covers every test file.
-`TAKOSERVER_TEST_WORKERS` sets the worker count (the default is half the CPUs,
-leaving room for the workerd and Miniflare processes the tests start),
-and `tests/test-timings.json` only orders the files, slowest first. Fixtures
-that need a migrated SQLite database copy one built once per process from the
-real migration chain (`tests/helpers/migrated-database.ts`), instead of
-replaying the chain for every test.
+parallel worker processes. Each file gets its own global scope, module registry
+and TMPDIR, so a module mock or a host-wide lock in one file cannot reach
+another, and the step fails unless Bun's summary covers every test file. The
+worker count is half the CPUs the process may use (affinity and cgroup quota),
+leaving room for the workerd and Miniflare processes the tests start;
+`TAKOSERVER_TEST_WORKERS` overrides it. `tests/test-timings.json` only orders
+the files, slowest first.
+
+While developing, `bun run test:changed` runs only the files Bun's import graph
+links to your changes against `origin/main` (`bun scripts/run-tests.ts
+--changed=<ref>` picks another base). It is a fast check, not the gate.
+
+After each run the step prints the slowest files, the summed per-file time and
+how busy the workers were, flags any file far slower than its recorded time,
+and writes the run's per-file durations to a path outside the repository;
+copying that file over `tests/test-timings.json` refreshes the ordering.
+Fixtures that need a migrated SQLite database copy one built from the real
+migration chain (`tests/helpers/migrated-database.ts`) instead of replaying the
+chain for every test; built images are shared for the length of one run only.
 
 A green gate is not a rollout. `bun run check` and local native evidence do not
 show that any deployment works: not a self-host's public TLS and DNS, not the
