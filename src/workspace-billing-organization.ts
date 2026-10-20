@@ -14,6 +14,11 @@ import type { SqlStatement } from "./ports.ts";
  * same fresh principal issuance that mints the owner.
  *
  * The id locates product records. It grants no payment consent.
+ *
+ * Known limitation: there is no owner transfer. If a subject's active binding
+ * is revoked and the subject later receives a fresh principal, the Org stays
+ * owned by the old principal and the new issuance is refused (fail-closed).
+ * Accepted for staging; revisit before production.
  */
 export const WORKSPACE_BILLING_ORGANIZATION_CONTRACT =
   "takoserver.workspace-billing-organization@v1";

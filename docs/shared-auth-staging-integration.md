@@ -217,6 +217,11 @@ A different owner, a missing owner membership or a Workspace bound to another
 Org aborts the issuing batch. The id locates product records and grants no
 payment consent.
 
+Known limitation: there is no owner transfer. If a subject's active binding is
+revoked and the same subject later receives a fresh principal, the Org remains
+owned by the previous principal and that issuance is refused. This fail-closed
+behavior is accepted for staging and must be revisited before production.
+
 ## Existing behavior that requires a separate owner change
 
 The audit base is Takoserver commit
