@@ -4,6 +4,7 @@ import {
   assertMoneyNormalWorkerSigningGenesisContributionCurrent,
   moneyNormalVersionUploadArguments,
   parseMoneyNormalVersionUploadRequest,
+  preflightMoneyNormalWorkerReplacementVersionForOriginalContext,
   readMoneyNormalWorkerSigningGenesisContribution,
   uploadMoneyNormalWorkerReplacementVersionForOriginalContext,
   uploadMoneyNormalWorkerVersion,
@@ -50,6 +51,19 @@ describe("inactive original money Version upload boundary", () => {
         fields,
       ),
     ).rejects.toThrow("money held convert context or source request differs");
+    // The read-only preflight is the same owner path and refuses the same way.
+    await expect(
+      preflightMoneyNormalWorkerReplacementVersionForOriginalContext(
+        { kind: "takoserver.money-held-convert-context@v1", facts: {} } as never,
+        fields,
+      ),
+    ).rejects.toThrow("money held convert context or source request differs");
+    await expect(
+      preflightMoneyNormalWorkerReplacementVersionForOriginalContext({} as never, {
+        ...fields,
+        ready: true,
+      }),
+    ).rejects.toThrow("accepts only");
   });
   test("accessors proxies relative paths equal epochs and missing fields refuse before any native factory", () => {
     let reads = 0;

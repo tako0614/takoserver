@@ -5805,6 +5805,46 @@ export async function prepareIntegrationMoneyHeldSuffix98ReplacementUpload(
   return Object.freeze({ original, upload });
 }
 
+/**
+ * The read-only part of the replacement before it uploads: suffix custody is
+ * absent, the post94 context selection reads current, and the uploader's own
+ * preflight passes (frozen target, quarantined earlier attempts, maintenance
+ * still active, the root layout, the reviewed source). It changes no provider
+ * state and creates no root, lease or upload (only local scratch reads), so a
+ * caller runs it first and only then the upload. The attempt it selects is the
+ * last one available: a failure after its root exists is final, by design.
+ */
+export async function preflightIntegrationMoneyHeldSuffix98ReplacementUpload(
+  options: MoneyUnitOriginalCutoverOptions,
+  post94DeclarationPath: string,
+  originalUploadRequest: unknown,
+): Promise<{
+  readonly original: MoneyUnitHeldPost94ContextSelection;
+  readonly preflight: Awaited<
+    ReturnType<
+      typeof import("./money-normal-worker-version-upload.ts").preflightMoneyNormalWorkerReplacementVersionForOriginalContext
+    >
+  >;
+}> {
+  const owner = await import("./schema-money-unit-owner.ts");
+  if (
+    (await options.custody.read("suffix98")) !== null ||
+    (await options.custody.readDispatch("suffix98")) !== null
+  )
+    throw preflightError("money replacement cannot follow original suffix custody");
+  const original = await owner.readMoneyUnitHeldPost94ContextSelection(
+    options,
+    post94DeclarationPath,
+  );
+  const uploader = await import("./money-normal-worker-version-upload.ts");
+  const preflight = await uploader.preflightMoneyNormalWorkerReplacementVersionForOriginalContext(
+    original.context,
+    originalUploadRequest,
+  );
+  await owner.assertMoneyUnitHeldPost94SelectionOrigin(original.selection, original.context);
+  return Object.freeze({ original, preflight });
+}
+
 /** Sole sealed fixed95–98 import, reached ONLY through both real original producers. */
 export async function runIntegrationMoneyHeldSuffix98(
   invocation: MoneyUnitCutoverInvocation,
